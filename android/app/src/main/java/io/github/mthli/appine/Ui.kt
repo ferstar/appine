@@ -4,7 +4,9 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.Drawable
 import android.view.View
+import androidx.appcompat.app.AlertDialog
 import com.google.android.material.color.MaterialColors
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlin.math.max
 
 // Small helpers the app's screens and views share (the android/terminal map): sizes in dp and
@@ -43,3 +45,9 @@ internal fun Context.themeDrawable(attr: Int): Drawable? {
 
 /** The theme's ripple for something that can be tapped. */
 internal fun View.touchFeedback(): Drawable? = context.themeDrawable(android.R.attr.selectableItemBackground)
+
+/** Dialog windows do not inherit FLAG_SECURE from their activity. */
+internal fun MaterialAlertDialogBuilder.showPrivate(): AlertDialog = create().also {
+    Privacy.protect(it)
+    it.show()
+}

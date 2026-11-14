@@ -48,7 +48,7 @@ internal class TerminalLinks(
         thread(name = "appine-link") {
             val found = Documents.fileLink(activity, link)
             activity.runOnUiThread {
-                if (activity.isDestroyed) return@runOnUiThread
+                if (activity.isDestroyed || Privacy.locked(activity)) return@runOnUiThread
                 when (found) {
                     is Documents.FileLink.Found -> startViewer(
                         Intent(Intent.ACTION_VIEW).setDataAndType(found.uri, found.mime)
@@ -63,6 +63,7 @@ internal class TerminalLinks(
     }
 
     private fun startViewer(intent: Intent, options: Bundle? = null): Boolean {
+        if (Privacy.locked(activity)) return false
         return try {
             activity.startActivity(intent, options)
             true

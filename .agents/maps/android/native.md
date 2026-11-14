@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: provider tests cover default-off file access, disabled operations and authority-wide URI grant revocation)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: privacy lifecycle regression distinguishes pause-only visibility from stop-and-return locking)
 
 ## Responsibilities
 
@@ -23,7 +23,7 @@
   `android/licenses/`.
 
 Root: `hosts/android/` (except `src/vt.c` and `src/vt.rs`),
-`android/app/src/main/java/io/github/mthli/appine/Native.kt`, `android/app/build.gradle.kts` and
+`android/app/src/main/java/io/github/mthli/appine/Native.kt` and `MainApplication.kt`, `android/app/build.gradle.kts` and
 the other Gradle files, `android/app/src/main/AndroidManifest.xml`, `android/app/src/debug/`,
 `android/app/src/androidTest/`, `android/licenses/`, `android/app/src/main/assets/notices/`, `scripts/release-sources`,
 `scripts/fetch-ghostty`.
@@ -164,7 +164,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   and dependencies from `google()` and `mavenCentral()` (project repositories fail the build). The
   version catalog (`android/gradle/libs.versions.toml`) holds the libraries' versions, and AGP's
   is in `android/build.gradle.kts`. Android libraries: `androidx.core` 1.19.1,
-  `androidx.preference:preference` 1.2.1, `androidx.browser:browser` 1.10.0,
+  `androidx.biometric:biometric` 1.1.0 (including its merged biometric permission), `androidx.preference:preference` 1.2.1, `androidx.browser:browser` 1.10.0,
   `androidx.webkit:webkit` 1.18.0 and Material Components 1.14.0 (which
   brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
   1.3.0.
@@ -215,6 +215,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ### Manifest
 
+- Manifest application `MainApplication` lives in its own file and installs the shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.
 - Launcher, settings, licenses list and license reader activities (the application theme
   `Theme.Appine`, Material 3; the
   launcher overrides it with `Theme.Appine.Terminal`; settings and licenses leave `uiMode` out of
@@ -256,6 +257,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ### Tests
 
+- `PrivacyTest` covers default-off/mutually exclusive file access, cold and recreated locked pages, pause-only visibility versus stop-and-return locking, secure dialog flags, non-exported action targets, service/broadcast/activity routing and locked-report clipboard denial without an authentication bypass. `MachineTest.documentsShowTheHomeDirectory` also checks every provider denial with privacy on and a stale true file-access preference.
 - `BrowserTest` imports separate temporary stores and checks custom launcher preservation,
   launching without a TTY or stdio, root and `su` users, endpoint replacement with a surviving
   shell, authentication and URL validation, refusal/timeout, queued UI cancellation, and Custom Tab intents.

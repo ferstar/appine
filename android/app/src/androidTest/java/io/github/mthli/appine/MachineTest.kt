@@ -1212,6 +1212,15 @@ class MachineTest {
             assertDisabled()
             Settings.setFileAccess(context, true)
             assertEquals("hi", read("/root/dt/a.txt"))
+            val privacy = Settings.privacyMode(context)
+            try {
+                Settings.setPrivacyMode(context, true)
+                // Even a stale true preference and previously issued URIs cannot bypass privacy.
+                prefs.edit().putBoolean("file_access", true).commit()
+                assertDisabled()
+            } finally {
+                Settings.setPrivacyMode(context, privacy)
+            }
         } finally {
             prefs.edit().remove("login").remove("file_access").commit()
             sh(machine, "rm -rf /root/dt")

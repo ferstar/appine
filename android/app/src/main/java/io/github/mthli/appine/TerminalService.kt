@@ -148,6 +148,7 @@ class TerminalService : Service() {
     private val binder = LocalBinder()
     private val main = Handler(Looper.getMainLooper())
     private val notifications = Notifications(this)
+    private val privacyChanged: () -> Unit = { settingsChanged() }
 
     /**
      * Releasing caches and stopping the kernel are done in order on this thread: both take the BKL,
@@ -353,6 +354,7 @@ class TerminalService : Service() {
          * tab; Android 13 and later show the copy themselves.
          */
         override fun onClipboard(session: VtSession, text: String?) {
+            if (Privacy.locked(this@TerminalService)) return
             val clipboard = getSystemService(ClipboardManager::class.java)
             if (text == null) {
                 clipboard.clearPrimaryClip()
@@ -429,6 +431,7 @@ class TerminalService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Privacy.addListener(privacyChanged)
         notifications.createChannels()
         val notification = notification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -451,10 +454,7 @@ class TerminalService : Service() {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
-        val exit = PendingIntent.getService(
-            this, 1, Intent(this, TerminalService::class.java).setAction(ACTION_EXIT_ALL),
-            PendingIntent.FLAG_IMMUTABLE,
-        )
+        val exit = Notifications.serviceAction(this, 1, ACTION_EXIT_ALL)
         // Tabs whose shell has ended stay open but are not running
         val n = sessions.count { it.isRunning }
         val sw = switching
@@ -466,7 +466,8 @@ class TerminalService : Service() {
             n == 0 && machine != 0L -> getString(R.string.background_running)
             else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
         }
-        val text = getString(R.string.run_notification, state, getString(runPolicy.label))
+        val text = if (Settings.privacyMode(this)) getString(R.string.privacy_running)
+            else getString(R.string.run_notification, state, getString(runPolicy.label))
         val builder = Notification.Builder(this, Notifications.SESSIONS_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.app_name))
@@ -479,19 +480,15 @@ class TerminalService : Service() {
         if (sw != null) {
             // A distro switch download: progress on the second line, cancellable from the
             // notification
-            val cancel = PendingIntent.getService(
-                this, 2, Intent(this, TerminalService::class.java).setAction(ACTION_CANCEL_SWITCH),
-                PendingIntent.FLAG_IMMUTABLE,
-            )
-            builder.setSubText(getString(R.string.downloading, sw.distro.label, sw.done shr 20, sw.total shr 20))
-            if (sw.total > 0) builder.setProgress(sw.total.toInt(), sw.done.toInt(), false)
+            val cancel = Notifications.serviceAction(this, 2, ACTION_CANCEL_SWITCH)
+            if (!Settings.privacyMode(this)) {
+                builder.setSubText(getString(R.string.downloading, sw.distro.label, sw.done shr 20, sw.total shr 20))
+                if (sw.total > 0) builder.setProgress(sw.total.toInt(), sw.done.toInt(), false)
+            }
             builder.addAction(Notification.Action.Builder(null, getString(R.string.cancel_download), cancel).build())
         }
         if (!exiting) {
-            val toggle = PendingIntent.getService(
-                this, 3, Intent(this, TerminalService::class.java).setAction(ACTION_TOGGLE_KEEP_AWAKE),
-                PendingIntent.FLAG_IMMUTABLE,
-            )
+            val toggle = Notifications.serviceAction(this, 3, ACTION_TOGGLE_KEEP_AWAKE)
             val label = getString(Settings.nextRunPolicy(this).label)
             builder.addAction(Notification.Action.Builder(null, label, toggle).build())
         }
@@ -734,6 +731,7 @@ class TerminalService : Service() {
             ACTION_EXIT_ALL -> exitAll()
             ACTION_CANCEL_SWITCH -> cancelSwitch()
             ACTION_TOGGLE_KEEP_AWAKE -> setRunPolicy(Settings.nextRunPolicy(this))
+            // Legacy report PendingIntents still pass through the clipboard privacy check.
             Notifications.ACTION_COPY_REPORT -> notifications.copyReport(intent)
         }
         return START_NOT_STICKY
@@ -810,7 +808,8 @@ class TerminalService : Service() {
      * Whether [session] is the tab in front of the user: the terminal Activity shows it while
      * visible (not another tab, and not Settings in front of the terminal).
      */
-    private fun inFront(session: VtSession) = session === current && listeners.any { it is MainActivity }
+    private fun inFront(session: VtSession) = !Privacy.locked(this) &&
+        session === current && listeners.any { it is MainActivity }
 
     private fun sessionsChanged() {
         updateNotification()
@@ -1008,6 +1007,7 @@ class TerminalService : Service() {
     val fileAccess: Boolean get() = Settings.fileAccess(this)
 
     fun setFileAccess(on: Boolean) {
+        if (on && Settings.privacyMode(this)) return
         Settings.setFileAccess(this, on)
         if (!on) Documents.revokeAccess(this)
         Documents.rootsChanged(this)
@@ -1258,6 +1258,7 @@ class TerminalService : Service() {
     }
 
     override fun onDestroy() {
+        Privacy.removeListener(privacyChanged)
         destroyed = true
         browserBridge?.close()
         browserBridge = null

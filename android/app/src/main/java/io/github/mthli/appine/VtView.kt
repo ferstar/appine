@@ -1071,12 +1071,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private val inputMethod get() = context.getSystemService(InputMethodManager::class.java)
 
     private fun copySelection() {
+        if (Privacy.locked(context)) return
         val text = VtNative.copy(tab) ?: return
         clipboard.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.app_name), text))
         clearSelection()
     }
 
     private fun pasteClipboard() {
+        if (Privacy.locked(context)) return
         val clip = clipboard.primaryClip?.takeIf { it.itemCount > 0 } ?: return
         val text = clip.getItemAt(0).coerceToText(context)?.toString()
         if (!text.isNullOrEmpty()) paste(text)
@@ -1087,6 +1089,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      * without bracketed paste) is pasted only after the user agrees.
      */
     private fun paste(text: String) {
+        if (Privacy.locked(context)) return
         if (tab == 0L) return
         val bytes = VtNative.paste(tab, text, false)
         if (bytes != null) {
@@ -1101,7 +1104,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 if (tab != 0L) input(VtNative.paste(tab, text, true))
             }
             .setNegativeButton(android.R.string.cancel, null)
-            .show()
+            .showPrivate()
     }
 
     // ---- Selection ----

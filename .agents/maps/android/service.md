@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: default-off file access controls both roots and revokes URI grants when disabled)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: notification controls run directly in the service; report copying uses a receiver or the privacy authentication page)
 
 ## Responsibilities
 
@@ -65,7 +65,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   `progress`, `mirrorThread`.
 - `Notifications` — the service's notifications but the ongoing one, which the service builds
   itself: the channels, the stuck kernel, the last run's crash, boot failures, listens, kill
-  reports and their "copy report" (the bug report's text and the action the service handles), and
+  reports and their "copy report" (the report text, receiver and authenticated action), and
   each tab's notification; with their state: `stallNotified` (the stall last notified),
   `killNotifications` (the next kill notification's offset, seeded from the clock), `bellNotified`
   (when each tab's bell last notified), `statusNotified` (the program status a tab's notification
@@ -74,7 +74,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   shown in the tab); `Notifications` builds, posts and cancels.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
   tier (default 1 in all builds), login, running policy and its remembered non-always choice,
-  file access (`file_access`, default off; old `system_documents` ignored), wide cells, the
+  privacy mode (`privacy_mode`, default off), file access (`file_access`, default off and refused during privacy; old `system_documents` ignored), wide cells, the
   cursor's shape (stored as Ghostty's names) and blinking, and whether the volume keys switch tabs
   (on by default); `clearLogin` for a replaced store.
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`): `switching` is
@@ -268,6 +268,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ### What programs ask of the app
 
+- `Privacy.locked` excludes the current tab from `inFront` and drops clipboard writes while locked or with no resumed page; clipboard reads then receive an empty answer. The terminal independently guards browser requests and input. Guest programs continue running.
 - `BrowserBridge` owns a random-port IPv4 loopback listener and per-kernel UUID capability.
   Start creates it before `ensureBrowser` writes the guest configuration; failed/abandoned starts,
   detach and service destruction close it. Closed endpoints cannot dispatch queued UI work.
@@ -309,6 +310,9 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ### Reports and notifications
 
+- With privacy enabled, all notification title/body details are replaced by generic text, including ongoing start errors/download progress. Enabling removes old non-ongoing notifications and refreshes the ongoing one; tab numbers and action labels remain. The `Privacy` mode-change listener refreshes service/UI settings.
+- Exit all, cancel download and running-policy actions always target `TerminalService`, including while locked. Report-copy actions target non-exported `Notifications.ReportReceiver` normally and non-exported `NotificationActivity` during privacy mode; only the latter opens the authentication page. Both copy directly without starting the kernel, and all copy paths (including legacy service intents) check `Privacy.locked` at delivery. Reports are not copied into notification text.
+- `Privacy` owns authenticated mode changes without requiring a service binding: enabling clears file access, revokes grants and refreshes roots; disabling restores neither access nor grants. The service also refuses enabling file access while privacy is on.
 - Kill reports (one tab-separated line each: console, pid, command, `bug` or `oom`, and three
   fields: for a bug the kernel's report line, its log records and the unimplemented paths, for an
   OOM kill the limit): written as `[appine] …` into the tab whose console with that number is open,
@@ -423,8 +427,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   and notification toggling were exercised on an API 34 emulator, not across real device suspend.
 - The channel names and the ongoing notification following a language change while the service
   runs (`onConfigurationChanged`) was compiled only, not tried on a device.
-- Whether tapping "copy report" after the service stopped recreates the service (and starts a
-  kernel) through its `getService` pending intent.
+- Notification routing and stale-report clipboard denial have API 34 instrumentation coverage; privacy's generic ongoing text was checked manually. Report copying after biometric authentication and vendor notification behavior still need device checks. New copy-report actions no longer start the service.
 - Finished-command notifications were tried only on a Pixel 4a API 34 emulator (busybox ash and
   bash 5.3 from another tab, ash with the app in the background, English and Simplified Chinese),
   not on real devices or with long durations in hours.

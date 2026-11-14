@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 5 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: opt-in access gates both roots and all document operations, with authority-wide grant revocation on disable)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: privacy mode overrides file access for every provider operation)
 
 ## Responsibilities
 
@@ -49,7 +49,7 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
   exists and is not `/` (which would make the whole system writable). Home root: summary
   "account · distro", flags local-only, is-child, search, create (making it a "Save to" target),
   free space from `getAllocatableBytes`. System root `/`: same without create, with or without
-  a home root. `Settings.fileAccess` uses `file_access`, default false; old `system_documents` is ignored.
+  a home root. `Settings.fileAccess` uses `file_access`, default false, and always refuses access during privacy mode; old `system_documents` is ignored. Enabling privacy clears file access and revokes grants; disabling privacy restores neither.
 - Document IDs are absolute guest paths with `%`, control characters and non-UTF-8 bytes written
   as `%XX`; only canonical IDs (no empty, `.` or `..` components) count. With file access off,
   neither root nor any document is accessible; IDs under the home are writable when enabled, the home itself only

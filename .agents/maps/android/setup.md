@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: file access requires confirmation before enabling either home or system documents)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: authenticated privacy toggle disables external file access and protects settings dialogs)
 
 ## Responsibilities
 
@@ -57,7 +57,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   with the licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
   `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
-  reset), Android (running policy, file access), Terminal (CJK characters filling two
+  reset), Android (running policy, privacy mode, file access), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (execution
   mode, in all builds) and About (project website, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
@@ -304,6 +304,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ### Settings
 
+- Privacy mode is an authenticated exception to service-owned changes: its nonpersistent switch asks before enabling, then calls the shared `Privacy` gate; disabling also authenticates. No setting changes on cancellation or failed/unavailable authentication. File access stays disabled while privacy is on, with a localized explanation; turning privacy off leaves file access off. Material dialogs use `showPrivate`, and restored choice dialogs use `Privacy.protect`.
 - Binding: the fragment's `onStart` starts and binds the service, `onStop` unbinds; once bound it listens,
   renders, shows a pending notice and loads the regular accounts on a background thread, again
   when the kernel is ready; account loads use the application context and a generation to discard
@@ -321,7 +322,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     for Tier 0. Separate choice labels mark Tier 1 as the default and Tier 0 for troubleshooting;
   - screen-off running (Allow sleep, Run while busy or Always run, with the selected policy's
     description; BUSY explains its 30 s idle grace and network/scheduled-work limitation),
-    file access, CJK fill, cursor shape (Block, Bar or Underline, the summary
+  file access (outside privacy mode), CJK fill, cursor shape (Block, Bar or Underline, the summary
     naming the current one), cursor blink (on by default) and the volume keys switching tabs (on
     by default): usable at any time; the service gives every tab the new cursor values at once
     (android/service), and the terminal reads the CJK and volume-key values itself
@@ -338,7 +339,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - Service-dependent preferences are disabled before binding, on disconnect and on stopping;
   project website, licenses and version remain usable. All preferences have stable resource-name keys and persistence
   disabled: they render service values and their change listeners call service setters, never
-  writing a second preference store. AndroidX manages row binding, disabled states and
+  writing a second preference store (privacy uses its shared authenticated controller). AndroidX manages row binding, disabled states and
   accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
 - Login, running policy and cursor choices use `ChoiceDialog`, a `ListPreferenceDialogFragmentCompat` whose
   builder is `MaterialAlertDialogBuilder`: AndroidX keeps the entries, selection and dialog

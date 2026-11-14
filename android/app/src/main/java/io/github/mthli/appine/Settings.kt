@@ -12,8 +12,8 @@ internal enum class RunPolicy(val value: String, val label: Int, val summary: In
 
 /**
  * The settings kept in the `settings` preferences (the android/service map). Settings shows and
- * changes them through [TerminalService], which acts on each change; [Documents] and
- * [MainActivity] (before it binds the service) read them here.
+ * changes them through [TerminalService], except for authenticated changes owned by [Privacy].
+ * [Documents] and [MainActivity] (before it binds the service) read them here.
  */
 internal object Settings {
     private const val PREFS = "settings"
@@ -23,6 +23,7 @@ internal object Settings {
     private const val KEY_RUN_POLICY = "run_policy"
     private const val KEY_IDLE_POLICY = "idle_policy"
     private const val KEY_FILE_ACCESS = "file_access"
+    private const val KEY_PRIVACY_MODE = "privacy_mode"
     private const val KEY_FILL_WIDE = "fill_wide"
     private const val KEY_CURSOR_STYLE = "cursor_style"
     private const val KEY_CURSOR_BLINK = "cursor_blink"
@@ -80,7 +81,15 @@ internal object Settings {
      * the android/documents map). The old system_documents preference is intentionally ignored:
      * enabling file access now requires confirmation of the sensitive-file warning.
      */
-    fun fileAccess(context: Context): Boolean = prefs(context).getBoolean(KEY_FILE_ACCESS, false)
+    fun fileAccess(context: Context): Boolean = !privacyMode(context) && prefs(context).getBoolean(KEY_FILE_ACCESS, false)
+
+    fun privacyMode(context: Context): Boolean = prefs(context).getBoolean(KEY_PRIVACY_MODE, false)
+
+    /** Enabling privacy also forgets file access; disabling never restores old grants. */
+    fun setPrivacyMode(context: Context, on: Boolean) = prefs(context).edit {
+        putBoolean(KEY_PRIVACY_MODE, on)
+        if (on) putBoolean(KEY_FILE_ACCESS, false)
+    }
 
     fun setFileAccess(context: Context, on: Boolean) = prefs(context).edit { putBoolean(KEY_FILE_ACCESS, on) }
 

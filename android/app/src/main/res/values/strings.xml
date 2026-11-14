@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="settings_privacy">Privacy mode</string>
+    <string name="privacy_summary">Require authentication when returning to Appine</string>
+    <string name="privacy_enable_message">Require biometrics or your screen lock to open Appine. Screenshots and notification details will be hidden, and other apps will lose file access. Background programs will keep running.</string>
+    <string name="privacy_file_access">Unavailable while privacy mode is on</string>
+    <string name="privacy_locked">Appine is locked</string>
+    <string name="privacy_unlock">Unlock</string>
+    <string name="privacy_leave">Leave Appine</string>
+    <string name="privacy_authenticate">Use biometrics or your screen lock</string>
+    <string name="privacy_unavailable">Authentication is unavailable. Set up a screen lock in Android settings, or try again later.</string>
+    <string name="privacy_notification">Unlock Appine to view the terminal</string>
+    <string name="privacy_running">Privacy mode · Running in the background</string>
     <string name="app_name" translatable="false">Appine</string>
     <string name="starting">Starting…</string>
     <string name="preparing">Preparing %1$s…</string>

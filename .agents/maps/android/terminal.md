@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: localized file-access consent and disabled-file hints cover home and system directories)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: pausing no longer shows the privacy shield; the last activity stop or screen-off still locks it)
 
 ## Responsibilities
 
@@ -30,7 +30,7 @@
 
 Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `TabBarView.kt`, `TabNumber.kt`,
 `SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt`, `LicensesActivity.kt`, `LicenseActivity.kt`,
-`LicenseCatalog.kt` and `Ui.kt` in
+`LicenseCatalog.kt`, `Privacy.kt`, `NotificationActivity.kt` and `Ui.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/`.
 
 Outside the module: the terminal view (`android/vtview`); the tabs' sessions and consoles and the
@@ -44,8 +44,8 @@ notice assets and the build (`android/native`).
   adapters `Host : VtView.Host`,
   `Bar : TabBarView.Target`, `Find : SearchBarView.Target` and `Keys : ExtraKeysView.Target`; the
   current session and its index, from which its successor is taken; a tab requested by a
-  notification (`EXTRA_TAB`); Back's callback while the search bar is open (`closeSearchOnBack`,
-  Android 16 and later); the open question whether a
+  notification (`EXTRA_TAB`); AndroidX Back's callback while the search bar is open (`closeSearchOnBack`);
+  the open question whether a
   program may read the clipboard (`clipboardQuestion`).
 - `TerminalLayout` — builds the views with the activity's adapters after dynamic colours are
   applied: a black column of one bar's place (`TabBarView`, or `SearchBarView` while searching),
@@ -107,6 +107,15 @@ notice assets and the build (`android/native`).
 
 ## Data flow / lifecycle
 
+### Privacy
+
+- `MainApplication` (`android/native`) installs `Privacy` on every FragmentActivity, including Settings, licenses and the non-exported `NotificationActivity`. Default-off `privacy_mode` accepts AndroidX Biometric 1.1.0 strong biometrics or device credentials; enabling and disabling both authenticate, enabling after a confirmation.
+- Authentication lives only in memory. The last stopped activity locks and covers pages unless recreating; overlapping internal navigation preserves it. Screen-off invalidates pending authentication and locks immediately. Pausing alone leaves visible content in place; resumed locked pages authenticate or offer Unlock/Leave after cancellation or unavailability.
+- Each activity's ViewModel retains the prompt's purpose/generation through recreation, never through process death. Successful callbacks complete only when resumed with an interactive, unlocked device; report-copy/clipboard/input checks also refuse access while no page is resumed.
+- Enabled pages and all app dialogs use `FLAG_SECURE`; `showPrivate`/`Privacy.protect` track dialog windows weakly and update existing ones on changes. The shield also covers restored dialog windows. Terminal input, clipboard answers, browser launches and title toasts check the gate; pausing cancels title toasts and denies an open clipboard question.
+- `privacy_shield.xml` presents a decorative lock, heading, authentication hint, filled Unlock button and text Leave button using the covered page's theme. Its scrollable content centers within system insets, has 24 dp horizontal/32 dp vertical padding and caps the inner column at 360 dp as the window resizes; text and buttons can grow with the font scale.
+- Only report-copy actions created during privacy mode enter `NotificationActivity`, never the exported launcher. It copies after the gate opens and then finishes. Normal report copying uses a non-exported receiver; exit, download cancellation and running-policy actions run directly in the service even while locked. Background programs, saved terminals and rootfs data are retained; this is access protection, not encryption or history removal.
+
 ### Binding and choosing a tab
 
 - `onCreate` applies dynamic colours, reads `EXTRA_TAB` (only when the activity is not being
@@ -115,7 +124,7 @@ notice assets and the build (`android/native`).
   change; a pixel size an earlier version kept as `font_size` is converted at the current density
   and removed), applies the saved Keep screen on choice (off by default), builds `TerminalLayout`
   (the status line says "Starting…", insets and IME animation are wired there), installs its root
-  edge-to-edge and, on Android 13 and later, asks for the notification permission. `onStart` applies the wide-cell
+  edge-to-edge; on Android 13 and later it asks for notification permission after the privacy gate opens. `onStart` applies the wide-cell
   setting, starts and binds the service; `onServiceConnected` registers the listener and replays
   the start's result or progress and pending notices; `onStop` unregisters and unbinds.
 - When the kernel is ready the tab shown is, in order: one a notification asked for (`EXTRA_TAB`,
@@ -463,7 +472,7 @@ notice assets and the build (`android/native`).
   by a fraction of a pixel as a roll starts or ends. The blur is a `BlurMaskFilter` on the
   `TextView`'s own paint, made in the roll's update listener (`onDraw` must not allocate) and
   cleared after each draw.
-- `MainActivity` is a framework `Activity` on a Material theme: Material dialogs and AppCompat's
+- `MainActivity` is a `FragmentActivity` on a Material theme: Material dialogs and AppCompat's
   `PopupMenu` take the theme, but the views it builds or inflates from XML are the framework's (no
   AppCompat inflater), so AppCompat view attributes such as `app:tint` do nothing there. The text
   selection handles `VtView` draws and the floating text menu read framework attributes, which
@@ -491,10 +500,7 @@ notice assets and the build (`android/native`).
   `FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY`; otherwise a notification's tab would come back to the
   front. A recreated `MainActivity` starts without open dialogs, the search bar or the extra
   keys' modifiers and page.
-- Up to Android 15 Back reaches `MainActivity.onBackPressed` (the manifest does not opt in to
-  predictive back, so an `OnBackInvokedCallback` would be ignored there); from Android 16 on, the
-  app targeting it, `onBackPressed` is never called and only the callback registered while
-  searching closes the bar. Lint's GestureBackNavigation check is suppressed on the override.
+- Back uses `OnBackPressedDispatcher` with `closeSearchOnBack` enabled only during search.
 
 ## Confirmed bugs / technical debt
 
@@ -517,6 +523,7 @@ none
 
 ## To verify
 
+- Privacy credential enable/disable, background return, cancellation/retry, screen-off on Settings and notification actions were checked on API 34; cold/recreated locked pages and dialog flags have instrumentation coverage. Real biometrics, concurrent windows and vendor authentication/window behavior remain unverified.
 - Guest launcher → Chrome CustomTabActivity → Back, plus background refusal with exit 1, were
   checked on API 34; a complete Codex OAuth login and its callback remain unverified.
 - The offline license reader's renderer-exit fallback, pinch zoom, very large system fonts and

@@ -2,7 +2,6 @@ package io.github.mthli.appine
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
@@ -19,14 +18,14 @@ import android.view.Menu
 import android.view.View
 import android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
 import android.widget.Toast
-import android.window.OnBackInvokedCallback
-import android.window.OnBackInvokedDispatcher
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.view.ContextThemeWrapper
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.edit
 import androidx.core.view.WindowCompat
 import androidx.core.view.isVisible
+import androidx.fragment.app.FragmentActivity
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import io.github.mthli.appine.MainActivity.Companion.PREF_FONT_SIZE
@@ -41,9 +40,9 @@ import io.github.mthli.appine.MainActivity.Companion.PREF_FONT_SIZE
  *
  * Its dialogs and menus are Material 3 (`Theme.Appine.Terminal`, always dark); the tab bar and the
  * extra keys are black like the terminal, with labels in the theme's colours. The activity itself
- * stays a framework one, and so do the views it builds.
+ * uses FragmentActivity for AndroidX authentication, retaining framework view inflation.
  */
-class MainActivity : Activity(), TerminalService.Listener {
+class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Listener {
 
     private lateinit var layout: TerminalLayout
     private val links = TerminalLinks(this, ::showToast)
@@ -62,6 +61,7 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     /** The last toast ([showToast]), cancelled by the next. */
     private var toast: Toast? = null
+    private var requestedNotifications = false
 
     /**
      * The key of the shortcut or volume key last taken ([dispatchKeyEvent]), whose release is
@@ -76,11 +76,9 @@ class MainActivity : Activity(), TerminalService.Listener {
             window.setFlags(if (value) FLAG_KEEP_SCREEN_ON else 0, FLAG_KEEP_SCREEN_ON)
         }
 
-    /**
-     * Back's callback while the search bar is open, from Android 16 on (an OnBackInvokedCallback,
-     * kept untyped for older versions); null otherwise. See [onBackPressed].
-     */
-    private var closeSearchOnBack: Any? = null
+    private val closeSearchOnBack = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() { closeSearch() }
+    }
 
     /**
      * The question whether a program may read the clipboard ([onClipboardRead]) while it is open,
@@ -108,6 +106,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        onBackPressedDispatcher.addCallback(this, closeSearchOnBack)
         keepScreenOn = getPreferences(MODE_PRIVATE).getBoolean(PREF_KEEP_SCREEN_ON, false)
         // A notification's tab only when it starts this activity: one recreated (a configuration
         // change, or the system bringing it back after killing the app) or opened from Recents
@@ -119,30 +118,6 @@ class MainActivity : Activity(), TerminalService.Listener {
         renderTabs()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(layout.root)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
-        }
-    }
-
-    /**
-     * The terminal's font size in pixels. It is kept in dp, so that after a display size change
-     * (which recreates this activity) the text keeps its size relative to the rest; a size kept in
-     * pixels by earlier versions is taken at the current density and kept in dp from then on.
-     */
-    private fun savedFontSize(): Float {
-        val prefs = getPreferences(MODE_PRIVATE)
-        val density = resources.displayMetrics.density
-        if (prefs.contains(PREF_FONT_SIZE_PX)) {
-            val dp = prefs.getInt(PREF_FONT_SIZE_PX, 0) / density
-            prefs.edit {
-                putFloat(PREF_FONT_SIZE, dp)
-                remove(PREF_FONT_SIZE_PX)
-            }
-        }
-        return prefs.getFloat(PREF_FONT_SIZE, DEFAULT_FONT_DP) * density
     }
 
     /** A notification of a tab was tapped while this activity exists (it is `singleTask`). */
@@ -162,6 +137,14 @@ class MainActivity : Activity(), TerminalService.Listener {
         bindService(intent, connection, BIND_AUTO_CREATE)
     }
 
+    override fun onPause() {
+        if (Settings.privacyMode(this)) {
+            toast?.cancel()
+            clipboardQuestion?.dismiss()
+        }
+        super.onPause()
+    }
+
     override fun onStop() {
         service?.removeListener(this)
         unbindService(connection)
@@ -173,6 +156,19 @@ class MainActivity : Activity(), TerminalService.Listener {
         // Sessions outlive the Activity: do not leave them pointing at this view
         layout.screen.attach(null)
         super.onDestroy()
+    }
+
+    // ---- Privacy.Listener ----
+
+    /** Called by the shared gate only when this resumed page can be used. */
+    override fun onPrivacyUnlocked() {
+        onNotice()
+        if (!requestedNotifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestedNotifications = true
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
+        }
     }
 
     // ---- TerminalService.Listener ----
@@ -223,7 +219,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     /** The program in the tab shown rang the bell (the service sends only those). */
     override fun onBell() = layout.screen.bell()
 
-    override fun onOpenUrl(url: String): Boolean = hasWindowFocus() && links.openBrowser(url)
+    override fun onOpenUrl(url: String): Boolean = !Privacy.locked(this) && hasWindowFocus() && links.openBrowser(url)
 
     /**
      * A program in the tab shown asks to read the clipboard (OSC 52): the user is asked, with what
@@ -233,6 +229,10 @@ class MainActivity : Activity(), TerminalService.Listener {
      */
     override fun onClipboardRead() {
         val session = current ?: return
+        if (Privacy.locked(this)) {
+            session.answerClipboardRead(null)
+            return
+        }
         if (clipboardQuestion != null) return
         val clip = getSystemService(ClipboardManager::class.java).primaryClip?.takeIf { it.itemCount > 0 }
         val text = clip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
@@ -240,20 +240,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             session.answerClipboardRead("")
             return
         }
-        val preview = if (text.length > CLIPBOARD_PREVIEW) text.take(CLIPBOARD_PREVIEW) + "…" else text
-        var allowed = false
-        clipboardQuestion = MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.clipboard_read_title)
-            .setMessage(getString(R.string.clipboard_read, preview))
-            .setPositiveButton(R.string.allow) { _, _ -> allowed = true }
-            .setNegativeButton(R.string.deny, null)
-            .setOnDismissListener {
-                clipboardQuestion = null
-                session.answerClipboardRead(if (allowed) text else null)
-                // The terminal takes the keyboard again
-                layout.screen.requestFocus()
-            }
-            .show()
+        confirmClipboardRead(session, text)
     }
 
     /** A tab's progress or program status changed: its marks in the bar, the progress line. */
@@ -271,11 +258,12 @@ class MainActivity : Activity(), TerminalService.Listener {
      * A distro switch failed (the download failed, or the import failed and fell back to Alpine).
      */
     override fun onNotice() {
+        if (Privacy.locked(this)) return
         val text = service?.takeNotice() ?: return
         MaterialAlertDialogBuilder(this)
             .setMessage(text)
             .setPositiveButton(android.R.string.ok, null)
-            .show()
+            .showPrivate()
     }
 
     override fun onRestarting() {
@@ -288,6 +276,36 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     override fun onExitAll() {
         finish()
+    }
+
+    // ---- Clipboard and notices ----
+
+    /** Answers the requesting session even if another tab becomes current while the dialog is open. */
+    private fun confirmClipboardRead(session: VtSession, text: String) {
+        val preview = if (text.length > CLIPBOARD_PREVIEW) text.take(CLIPBOARD_PREVIEW) + "…" else text
+        var allowed = false
+        clipboardQuestion = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.clipboard_read_title)
+            .setMessage(getString(R.string.clipboard_read, preview))
+            .setPositiveButton(R.string.allow) { _, _ -> allowed = true }
+            .setNegativeButton(R.string.deny, null)
+            .setOnDismissListener {
+                clipboardQuestion = null
+                session.answerClipboardRead(if (allowed && !Privacy.locked(this)) text else null)
+                // The terminal takes the keyboard again
+                layout.screen.requestFocus()
+            }
+            .showPrivate()
+    }
+
+    /**
+     * A tab's title, a notice from the extra keys or why a link did not open, in place of the last
+     * one, so that quick long presses do not queue toasts; [long] for text that takes a while to read.
+     */
+    private fun showToast(text: String, long: Boolean = false) {
+        if (Privacy.locked(this)) return
+        toast?.cancel()
+        toast = Toast.makeText(this, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).apply { show() }
     }
 
     // ---- Sessions ----
@@ -337,6 +355,18 @@ class MainActivity : Activity(), TerminalService.Listener {
         val shown = current?.takeIf { it in sessions }
         if (shown != null) currentIndex = sessions.indexOf(shown)
         layout.tabBar.render(sessions, shown)
+    }
+
+    /**
+     * Shows the tab [delta] places after the current one, going round from the last to the first;
+     * false when there is no other tab to show.
+     */
+    private fun switchBy(delta: Int): Boolean {
+        val sessions = service?.sessions ?: return false
+        val i = sessions.indexOf(current)
+        if (i < 0 || sessions.size < 2) return false
+        show(sessions[Math.floorMod(i + delta, sessions.size)])
+        return true
     }
 
     // ---- The menu and closing tabs ----
@@ -415,7 +445,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             .setNegativeButton(android.R.string.cancel, null)
             // The terminal takes the keyboard again
             .setOnDismissListener { layout.screen.requestFocus() }
-            .show()
+            .showPrivate()
     }
 
     /**
@@ -440,11 +470,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         if (current == null) return
         layout.tabBar.isVisible = false
         layout.searchBar.open()
-        if (closeSearchOnBack == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
-            val callback = OnBackInvokedCallback { closeSearch() }
-            onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
-            closeSearchOnBack = callback
-        }
+        closeSearchOnBack.isEnabled = true
     }
 
     /** Ends the search and brings the tab bar back; the terminal takes the keyboard again. */
@@ -454,31 +480,15 @@ class MainActivity : Activity(), TerminalService.Listener {
         layout.tabBar.isVisible = true
         layout.screen.endSearch()
         layout.screen.requestFocus()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
-            (closeSearchOnBack as? OnBackInvokedCallback)?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
-        }
-        closeSearchOnBack = null
-    }
-
-    /**
-     * Back closes the search bar first. Up to Android 15 the system calls this, as the app does
-     * not opt in to predictive back in its manifest (an OnBackInvokedCallback would be ignored
-     * there); from Android 16 on, apps targeting it get predictive back anyway, never call this,
-     * and [closeSearchOnBack] is called instead.
-     */
-    @SuppressLint("GestureBackNavigation") // Android 16 and later: closeSearchOnBack
-    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
-    override fun onBackPressed() {
-        if (layout.searchBar.isVisible) {
-            closeSearch()
-            return
-        }
-        super.onBackPressed()
+        closeSearchOnBack.isEnabled = false
     }
 
     // ---- Keyboard shortcuts ----
 
+    // FragmentActivity inherits this public framework override from the restricted core base.
+    @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (Privacy.locked(this)) return true
         if (event.action == KeyEvent.ACTION_DOWN && (shortcut(event) || volumeKey(event))) {
             shortcutKey = event.keyCode
             return true
@@ -490,60 +500,6 @@ class MainActivity : Activity(), TerminalService.Listener {
             return true
         }
         return super.dispatchKeyEvent(event)
-    }
-
-    /**
-     * The shortcuts of a hardware keyboard, as in desktop terminals: Ctrl+Shift+T opens a tab,
-     * Ctrl+Shift+W closes the current one, Ctrl+Tab and Ctrl+Shift+Tab show the next and the
-     * previous one (going round), Ctrl+Shift+F finds text in it and Ctrl+Shift+↑ and ↓ scroll to
-     * the previous and the next prompt (as in Ghostty on Linux; on the alternate screen, which has
-     * no prompts, they go to the program). They are taken before the terminal sees them; false for
-     * any other key.
-     */
-    private fun shortcut(event: KeyEvent): Boolean {
-        if (!event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return false
-        // Holding Ctrl+Tab or a jump keeps going; holding the others acts once
-        val first = event.repeatCount == 0
-        when {
-            event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1)
-            !event.isShiftPressed -> return false
-            event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
-            event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
-            event.keyCode == KeyEvent.KEYCODE_F -> if (first) openSearch()
-            event.keyCode == KeyEvent.KEYCODE_DPAD_UP -> return layout.screen.jumpToPrompt(-1)
-            event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN -> return layout.screen.jumpToPrompt(1)
-            else -> return false
-        }
-        return true
-    }
-
-    /**
-     * Shows the tab [delta] places after the current one, going round from the last to the first;
-     * false when there is no other tab to show.
-     */
-    private fun switchBy(delta: Int): Boolean {
-        val sessions = service?.sessions ?: return false
-        val i = sessions.indexOf(current)
-        if (i < 0 || sessions.size < 2) return false
-        show(sessions[Math.floorMod(i + delta, sessions.size)])
-        return true
-    }
-
-    /**
-     * The volume keys switch tabs while Settings has them do so ([Settings.volumeKeysSwitchTabs], on
-     * by default): up shows the previous tab and down the next, going round, once per press (a held
-     * key's repeats are swallowed). With no other tab to show, or with the setting off, they are
-     * left to the system, which changes the volume. False for any other key.
-     */
-    private fun volumeKey(event: KeyEvent): Boolean {
-        val delta = when (event.keyCode) {
-            KeyEvent.KEYCODE_VOLUME_UP -> -1
-            KeyEvent.KEYCODE_VOLUME_DOWN -> 1
-            else -> return false
-        }
-        // Repeats follow the press: swallowed after a switch, else the volume keeps changing
-        if (event.repeatCount > 0) return shortcutKey == event.keyCode
-        return Settings.volumeKeysSwitchTabs(this) && switchBy(delta)
     }
 
     /** Lists the shortcuts in the system's keyboard shortcuts screen (Meta+/). */
@@ -573,6 +529,68 @@ class MainActivity : Activity(), TerminalService.Listener {
         )
     }
 
+    /**
+     * The shortcuts of a hardware keyboard, as in desktop terminals: Ctrl+Shift+T opens a tab,
+     * Ctrl+Shift+W closes the current one, Ctrl+Tab and Ctrl+Shift+Tab show the next and the
+     * previous one (going round), Ctrl+Shift+F finds text in it and Ctrl+Shift+↑ and ↓ scroll to
+     * the previous and the next prompt (as in Ghostty on Linux; on the alternate screen, which has
+     * no prompts, they go to the program). They are taken before the terminal sees them; false for
+     * any other key.
+     */
+    private fun shortcut(event: KeyEvent): Boolean {
+        if (!event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return false
+        // Holding Ctrl+Tab or a jump keeps going; holding the others acts once
+        val first = event.repeatCount == 0
+        when {
+            event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1)
+            !event.isShiftPressed -> return false
+            event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
+            event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
+            event.keyCode == KeyEvent.KEYCODE_F -> if (first) openSearch()
+            event.keyCode == KeyEvent.KEYCODE_DPAD_UP -> return layout.screen.jumpToPrompt(-1)
+            event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN -> return layout.screen.jumpToPrompt(1)
+            else -> return false
+        }
+        return true
+    }
+
+    /**
+     * The volume keys switch tabs while Settings has them do so ([Settings.volumeKeysSwitchTabs], on
+     * by default): up shows the previous tab and down the next, going round, once per press (a held
+     * key's repeats are swallowed). With no other tab to show, or with the setting off, they are
+     * left to the system, which changes the volume. False for any other key.
+     */
+    private fun volumeKey(event: KeyEvent): Boolean {
+        val delta = when (event.keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> -1
+            KeyEvent.KEYCODE_VOLUME_DOWN -> 1
+            else -> return false
+        }
+        // Repeats follow the press: swallowed after a switch, else the volume keeps changing
+        if (event.repeatCount > 0) return shortcutKey == event.keyCode
+        return Settings.volumeKeysSwitchTabs(this) && switchBy(delta)
+    }
+
+    // ---- Font preferences ----
+
+    /**
+     * The terminal's font size in pixels. It is kept in dp, so that after a display size change
+     * (which recreates this activity) the text keeps its size relative to the rest; a size kept in
+     * pixels by earlier versions is taken at the current density and kept in dp from then on.
+     */
+    private fun savedFontSize(): Float {
+        val prefs = getPreferences(MODE_PRIVATE)
+        val density = resources.displayMetrics.density
+        if (prefs.contains(PREF_FONT_SIZE_PX)) {
+            val dp = prefs.getInt(PREF_FONT_SIZE_PX, 0) / density
+            prefs.edit {
+                putFloat(PREF_FONT_SIZE, dp)
+                remove(PREF_FONT_SIZE_PX)
+            }
+        }
+        return prefs.getFloat(PREF_FONT_SIZE, DEFAULT_FONT_DP) * density
+    }
+
     // ---- The views' targets ----
 
     /** The [VtView]'s side: starting the shell, input, zoom and the extra keys' modifiers. */
@@ -582,6 +600,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
 
         override fun onInput(data: ByteArray) {
+            if (Privacy.locked(this@MainActivity)) return
             val session = current ?: return
             if (session.isRunning) {
                 session.write(data)
@@ -637,15 +656,6 @@ class MainActivity : Activity(), TerminalService.Listener {
         override fun text(text: String) = layout.screen.type(text)
 
         override fun notice(text: String) = showToast(text)
-    }
-
-    /**
-     * A tab's title, a notice from the extra keys or why a link did not open, in place of the last
-     * one, so that quick long presses do not queue toasts; [long] for text that takes a while to read.
-     */
-    private fun showToast(text: String, long: Boolean = false) {
-        toast?.cancel()
-        toast = Toast.makeText(this, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).apply { show() }
     }
 
     companion object {

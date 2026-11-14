@@ -118,6 +118,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(libs.androidx.biometric)
     implementation(libs.androidx.browser)
     implementation(libs.androidx.core)
     implementation(libs.androidx.preference)

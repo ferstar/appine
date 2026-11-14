@@ -33,7 +33,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlin.concurrent.thread
 
 /** Material 3 frame for the standard AndroidX settings list. */
-class SettingsActivity : AppCompatActivity() {
+class SettingsActivity : AppCompatActivity(), Privacy.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         enableEdgeToEdge()
@@ -60,12 +60,17 @@ class SettingsActivity : AppCompatActivity() {
             insets
         }
     }
+
+    override fun onPrivacyUnlocked() {
+        (supportFragmentManager.findFragmentById(R.id.content) as? SettingsFragment)?.onNotice()
+    }
 }
 
 /**
- * Settings only displays and forwards TerminalService state. Preferences never persist values:
- * service setters also update wake locks, document roots and running terminals. Destructive
- * operations still ask first and return to the terminal when replacement or restart begins.
+ * Displays service state and forwards changes to TerminalService or the authenticated Privacy
+ * controller. Preferences never persist values themselves: service setters also update wake
+ * locks, document roots and running terminals. Destructive operations still ask first and
+ * return to the terminal when replacement or restart begins.
  */
 class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
 
@@ -85,6 +90,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private lateinit var tier: Preference
     private lateinit var runPolicy: ListPreference
     private lateinit var fileAccess: SwitchPreferenceCompat
+    private lateinit var privacy: SwitchPreferenceCompat
     private lateinit var fillWide: SwitchPreferenceCompat
     private lateinit var cursorStyle: ListPreference
     private lateinit var cursorBlink: SwitchPreferenceCompat
@@ -135,6 +141,13 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
                 false
             }
         }
+        privacy = SwitchPreferenceCompat(requireContext()).configure(R.string.settings_privacy).apply {
+            widgetLayoutResource = R.layout.preference_switch
+            setOnPreferenceChangeListener { _, value ->
+                onPrivacyMode(value as Boolean)
+                false
+            }
+        }
         fillWide = toggle(R.string.settings_fill_wide, TerminalService::setFillWide)
         cursorStyle = choice(R.string.settings_cursor_style) { s, value -> s.setCursorStyle(value.toInt()) }.apply {
             entries = CURSOR_LABELS.map { getString(it) }.toTypedArray()
@@ -159,25 +172,11 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
 
         group(R.string.settings_group_system, distro, account, reset)
-        group(R.string.settings_group_android, runPolicy, fileAccess)
+        group(R.string.settings_group_android, runPolicy, privacy, fileAccess)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
         group(R.string.settings_group_debug, tier)
         group(R.string.settings_group_about, project, licenses, version)
         render()
-    }
-
-    private fun onVersion() {
-        val intent = Intent(Intent.ACTION_VIEW,
-            "https://play.google.com/store/apps/details?id=${BuildConfig.APPLICATION_ID}".toUri())
-        try {
-            startActivity(intent.setPackage("com.android.vending"))
-        } catch (e: ActivityNotFoundException) {
-            try {
-                startActivity(intent.setPackage(null))
-            } catch (e: ActivityNotFoundException) {
-                Toast.makeText(requireContext(), R.string.link_no_app, Toast.LENGTH_SHORT).show()
-            }
-        }
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
@@ -206,12 +205,6 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
                 RecyclerView.Adapter.StateRestorationPolicy.ALLOW
             }
         }
-
-    private fun allowStateRestoration() {
-        if (service != null && insetsApplied && view != null) {
-            listView.adapter?.stateRestorationPolicy = RecyclerView.Adapter.StateRestorationPolicy.ALLOW
-        }
-    }
 
     override fun onStart() {
         super.onStart()
@@ -295,6 +288,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
                 .setNegativeButton(preference.negativeButtonText, this)
             onPrepareDialogBuilder(builder)
             return builder.create().also {
+                Privacy.protect(it)
                 // Back, Cancel and an outside tap must never commit the current selection.
                 onClick(it, DialogInterface.BUTTON_NEGATIVE)
             }
@@ -324,11 +318,12 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
 
     /** The download for a distro switch failed. */
     override fun onNotice() {
+        if (Privacy.locked(requireContext())) return
         val text = service?.takeNotice() ?: return
         MaterialAlertDialogBuilder(requireContext())
             .setMessage(text)
             .setPositiveButton(android.R.string.ok, null)
-            .show()
+            .showPrivate()
     }
 
     override fun onRestarting() = requireActivity().finish()
@@ -340,7 +335,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private fun render() {
         val s = service
         if (s == null) {
-            for (row in listOf(distro, reset, account, tier, runPolicy, fileAccess,
+            for (row in listOf(distro, reset, account, tier, runPolicy, fileAccess, privacy,
                 fillWide, cursorStyle, cursorBlink, volumeKeys)) row.isEnabled = false
             return
         }
@@ -368,7 +363,9 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         // lock is held accordingly once it is up
         runPolicy.value = s.runPolicy.value
         runPolicy.set(getString(s.runPolicy.summary), true)
-        fileAccess.set(getString(R.string.file_access_summary), true, s.fileAccess)
+        val privacyEnabled = Settings.privacyMode(requireContext())
+        privacy.set(getString(R.string.privacy_summary), true, privacyEnabled)
+        fileAccess.set(getString(if (privacyEnabled) R.string.privacy_file_access else R.string.file_access_summary), !privacyEnabled, s.fileAccess)
         fillWide.set(getString(if (s.fillWide) R.string.fill_wide_on else R.string.fill_wide_off), true, s.fillWide)
         cursorStyle.value = s.cursorStyle.toString()
         cursorStyle.set(getString(CURSOR_LABELS[CURSOR_STYLES.indexOf(s.cursorStyle).coerceAtLeast(0)]), true)
@@ -379,6 +376,12 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             s.volumeKeysSwitchTabs,
         )
         allowStateRestoration()
+    }
+
+    private fun allowStateRestoration() {
+        if (service != null && insetsApplied && view != null) {
+            listView.adapter?.stateRestorationPolicy = RecyclerView.Adapter.StateRestorationPolicy.ALLOW
+        }
     }
 
     private fun Preference.set(text: CharSequence, enabled: Boolean) {
@@ -414,13 +417,26 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
 
     // ---- Actions ----
 
+    private fun onPrivacyMode(enabled: Boolean) {
+        if (enabled) {
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle(R.string.settings_privacy)
+                .setMessage(R.string.privacy_enable_message)
+                .setPositiveButton(R.string.file_access_enable) { _, _ -> Privacy.requestMode(requireActivity(), true) }
+                .setNegativeButton(android.R.string.cancel, null)
+                .showPrivate()
+        } else {
+            Privacy.requestMode(requireActivity(), false)
+        }
+    }
+
     private fun confirmFileAccess() {
         MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.file_access_title)
             .setMessage(R.string.file_access_message)
             .setPositiveButton(R.string.file_access_enable) { _, _ -> service?.setFileAccess(true) }
             .setNegativeButton(android.R.string.cancel, null)
-            .show()
+            .showPrivate()
     }
 
     private fun onDistro() {
@@ -430,7 +446,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
                 .setTitle(getString(R.string.cancel_download_title, sw.distro.label))
                 .setPositiveButton(R.string.cancel_download) { _, _ -> s.cancelSwitch() }
                 .setNegativeButton(R.string.keep_downloading, null)
-                .show()
+                .showPrivate()
             return
         }
         val distros = Rootfs.Distro.entries
@@ -443,7 +459,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
                 if (distros[i] != installed) confirmSwitch(distros[i], getString(R.string.switch_title, distros[i].label))
             }
             .setNegativeButton(android.R.string.cancel, null)
-            .show()
+            .showPrivate()
     }
 
     /** When the very first import failed (no store), resets to Alpine, as on the first run. */
@@ -468,7 +484,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             .setMessage(message)
             .setPositiveButton(R.string.switch_confirm) { _, _ -> service?.switchTo(distro) }
             .setNegativeButton(android.R.string.cancel, null)
-            .show()
+            .showPrivate()
     }
 
     private fun onTier() {
@@ -485,10 +501,24 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
                     .setMessage(R.string.restart_message)
                     .setPositiveButton(R.string.restart) { _, _ -> service?.setTier(tiers[i]) }
                     .setNegativeButton(android.R.string.cancel, null)
-                    .show()
+                    .showPrivate()
             }
             .setNegativeButton(android.R.string.cancel, null)
-            .show()
+            .showPrivate()
+    }
+
+    private fun onVersion() {
+        val intent = Intent(Intent.ACTION_VIEW,
+            "https://play.google.com/store/apps/details?id=${BuildConfig.APPLICATION_ID}".toUri())
+        try {
+            startActivity(intent.setPackage("com.android.vending"))
+        } catch (e: ActivityNotFoundException) {
+            try {
+                startActivity(intent.setPackage(null))
+            } catch (e: ActivityNotFoundException) {
+                Toast.makeText(requireContext(), R.string.link_no_app, Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     companion object {

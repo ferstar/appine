@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-13 (targeted verification only since the split; latest change: taps on the input cross the rows busybox ash breaks a long command into)
+> Maintained: 2026-11-14 (targeted verification only since the split; latest change: privacy gates copy/paste and secures paste-preview dialogs)
 
 ## Responsibilities
 
@@ -228,6 +228,7 @@ opening links (`android/terminal`).
   breaks become carriage returns; unsafe control bytes become spaces. Text that could run commands
   (line breaks without bracketed paste, or the bracketed terminator) is refused, and the view asks
   in a dialog with a preview (300 characters) before pasting it anyway.
+- Copy, clipboard reads and paste entry points refuse access while `Privacy.locked`; paste previews use `showPrivate` so their separate windows follow `FLAG_SECURE`. The activity also guards the final input sink against queued IME/paste callbacks after locking.
 - Focus: window focus changes are sent as focus events when the program asked (mode 1004); showing
   another tab sends none.
 

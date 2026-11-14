@@ -52,6 +52,7 @@ class LicenseTest {
         assertTrue(text("GNU Lesser General Public License 2.1").contains("Version 2.1, February 1999"))
         assertTrue(text("Android libraries").contains("androidx.core:core:"))
         assertTrue(text("Android libraries").contains("androidx.webkit:webkit:"))
+        assertTrue(text("Android libraries").contains("androidx.biometric:biometric:1.1.0"))
         assertTrue(text("rusqlite ").contains("Permission is hereby granted"))
         assertTrue(titles.any { it.startsWith("SQLite ") })
         assertFalse("proc macros are not in the library", titles.any { it.startsWith("syn ") || it.startsWith("thiserror-impl ") })

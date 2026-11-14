@@ -5,8 +5,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.icu.text.ListFormatter
 import android.icu.text.MeasureFormat
@@ -103,10 +105,10 @@ internal class Notifications(private val service: TerminalService) {
         // The report is in English, for whoever reads the feedback. Android's description says
         // only "crash" for crashes; for an ANR it says what timed out
         val line = "The app process (pid ${exit.pid}) $what at ${Instant.ofEpochMilli(exit.timestamp)}" +
-            (exit.description?.takeIf { anr }?.let { ": $it" } ?: "")
+                (exit.description?.takeIf { anr }?.let { ": $it" } ?: "")
         val title = service.getString(if (anr) R.string.anr_title else R.string.crashed_title)
         val notification = builder(PROBLEMS_CHANNEL_ID, title, text)
-            .addAction(copyReportAction(CRASH_NOTIFICATION_ID, bugReport(line, "")))
+            .addAction(copyReportAction(service, CRASH_NOTIFICATION_ID, bugReport(line, "")))
             .build()
         manager.notify(CRASH_NOTIFICATION_ID, notification)
     }
@@ -134,7 +136,7 @@ internal class Notifications(private val service: TerminalService) {
         val notification = builder(PROBLEMS_CHANNEL_ID, title, text)
             .setOnlyAlertOnce(true)
             // The record of its end is a kernel log line
-            .addAction(copyReportAction(STALL_NOTIFICATION_ID, bugReport(f[2], f[3])))
+            .addAction(copyReportAction(service, STALL_NOTIFICATION_ID, bugReport(f[2], f[3])))
             .build()
         manager.notify(STALL_NOTIFICATION_ID, notification)
     }
@@ -177,7 +179,7 @@ internal class Notifications(private val service: TerminalService) {
     fun kill(comm: String, text: String, bug: List<String>?) {
         val id = KILL_NOTIFICATION_BASE + killNotifications++ % KILL_NOTIFICATION_COUNT
         val builder = builder(PROBLEMS_CHANNEL_ID, service.getString(R.string.killed_title, comm), text)
-        if (bug != null) builder.addAction(copyReportAction(id, bugReport(bug[0], bug[1], bug[2])))
+        if (bug != null) builder.addAction(copyReportAction(service, id, bugReport(bug[0], bug[1], bug[2])))
         manager.notify(id, builder.build())
     }
 
@@ -194,7 +196,7 @@ internal class Notifications(private val service: TerminalService) {
         appendLine("Appine ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
         appendLine(
             "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
-                "${Build.SUPPORTED_ABIS.firstOrNull()}, page size ${Os.sysconf(OsConstants._SC_PAGESIZE)}",
+                    "${Build.SUPPORTED_ABIS.firstOrNull()}, page size ${Os.sysconf(OsConstants._SC_PAGESIZE)}",
         )
         appendLine("${Rootfs.installed(service)?.label ?: "unknown distribution"}, Tier ${Settings.tier(service)}")
         append(report)
@@ -208,31 +210,8 @@ internal class Notifications(private val service: TerminalService) {
         }
     }
 
-    /** "Copy report" for notification [id], which takes [report] to the service ([copyReport]). */
-    private fun copyReportAction(id: Int, report: String): Notification.Action {
-        val copy = Intent(service, TerminalService::class.java).setAction(ACTION_COPY_REPORT)
-            .putExtra(EXTRA_REPORT, report)
-            .putExtra(EXTRA_NOTIFICATION, id)
-        val pending = PendingIntent.getService(
-            service, id, copy, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        return Notification.Action.Builder(null, service.getString(R.string.copy_report), pending).build()
-    }
-
-    /**
-     * "Copy report" on a notification ([ACTION_COPY_REPORT]): puts it on the clipboard and
-     * dismisses that notification. Since Android 13 the system shows its own copied confirmation.
-     */
-    fun copyReport(intent: Intent) {
-        val report = intent.getStringExtra(EXTRA_REPORT).orEmpty()
-        if (report.isEmpty()) return
-        val clipboard = service.getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText(service.getString(R.string.copy_report), report))
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-            Toast.makeText(service, R.string.report_copied, Toast.LENGTH_SHORT).show()
-        }
-        manager.cancel(intent.getIntExtra(EXTRA_NOTIFICATION, 0))
-    }
+    /** Legacy service actions use the same privacy check as the receiver and activity. */
+    fun copyReport(intent: Intent) = copyReport(service, intent)
 
     /**
      * A program in [session], not the tab in front, rang the bell: the tab's notification ([tab]),
@@ -356,19 +335,30 @@ internal class Notifications(private val service: TerminalService) {
      * A notification on [channel] with [title] and all of [text], which a tap takes away, opening
      * [intent] (the terminal, unless given).
      */
-    private fun builder(channel: String, title: String, text: String, intent: PendingIntent = openApp()) =
-        Notification.Builder(service, channel)
+    private fun builder(channel: String, title: String, text: String, intent: PendingIntent = openApp()): Notification.Builder {
+        val privacyEnabled = Settings.privacyMode(service)
+        val shownTitle = if (privacyEnabled) service.getString(R.string.app_name) else title
+        val shownText = if (privacyEnabled) service.getString(R.string.privacy_notification) else text
+        return Notification.Builder(service, channel)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentTitle(shownTitle)
+            .setContentText(shownText)
+            .setStyle(Notification.BigTextStyle().bigText(shownText))
             .setContentIntent(intent)
             .setAutoCancel(true)
+    }
 
     /** Opens the terminal, for a notification's tap. */
     private fun openApp(): PendingIntent = PendingIntent.getActivity(
         service, 0, Intent(service, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
     )
+
+    /** Copies reports without starting the terminal; stale actions are checked at delivery. */
+    class ReportReceiver : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == ACTION_COPY_REPORT) copyReport(context, intent)
+        }
+    }
 
     companion object {
         /** The channel of the service's ongoing notification (id 1). */
@@ -413,9 +403,43 @@ internal class Notifications(private val service: TerminalService) {
          */
         private const val COMMAND_NOTIFY_MS = 10_000L
 
-        /** The service's action for "Copy report" ([copyReport]). */
+        /** The notification action for "Copy report" ([copyReport]). */
         const val ACTION_COPY_REPORT = "io.github.mthli.appine.COPY_REPORT"
         private const val EXTRA_REPORT = "report"
         private const val EXTRA_NOTIFICATION = "notification"
+
+        /** Only report export requires an authentication page while privacy is enabled. */
+        fun copyReportAction(context: Context, id: Int, report: String): Notification.Action {
+            val authenticate = Settings.privacyMode(context)
+            val copy = Intent(context, if (authenticate) NotificationActivity::class.java else ReportReceiver::class.java)
+                .setAction(ACTION_COPY_REPORT)
+                .putExtra(EXTRA_REPORT, report)
+                .putExtra(EXTRA_NOTIFICATION, id)
+            val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            val pending = if (authenticate) {
+                PendingIntent.getActivity(context, id, copy, flags)
+            } else {
+                PendingIntent.getBroadcast(context, id, copy, flags)
+            }
+            return Notification.Action.Builder(null, context.getString(R.string.copy_report), pending).build()
+        }
+
+        /** Copies only while unlocked, then dismisses the report notification. */
+        fun copyReport(context: Context, intent: Intent) {
+            if (Privacy.locked(context)) return
+            val report = intent.getStringExtra(EXTRA_REPORT).orEmpty()
+            if (report.isEmpty()) return
+            val clipboard = context.getSystemService(ClipboardManager::class.java)
+            clipboard.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.copy_report), report))
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                Toast.makeText(context, R.string.report_copied, Toast.LENGTH_SHORT).show()
+            }
+            context.getSystemService(NotificationManager::class.java).cancel(intent.getIntExtra(EXTRA_NOTIFICATION, 0))
+        }
+
+        /** Control actions do not export content and remain available while locked. */
+        fun serviceAction(context: Context, id: Int, action: String): PendingIntent = PendingIntent.getService(
+            context, id, Intent(context, TerminalService::class.java).setAction(action), PendingIntent.FLAG_IMMUTABLE,
+        )
     }
 }
