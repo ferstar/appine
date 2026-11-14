@@ -6,9 +6,11 @@ import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -112,6 +114,13 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         override fun onServiceDisconnected(name: ComponentName) {
             service = null
         }
+    }
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(newBase)
+        // System selection menus use night-qualified colours as well as the theme's dark palette.
+        // Override only night mode, before the window or dynamic colours access resources.
+        applyOverrideConfiguration(Configuration().apply { uiMode = Configuration.UI_MODE_NIGHT_YES })
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

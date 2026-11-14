@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: suppress keyboard opening for link taps while the program tracks the mouse)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: system selection menu uses the terminal activity's pinned night configuration)
 
 ## Responsibilities
 
@@ -422,6 +422,11 @@ select a command's output and move the cursor by taps:
 
 ## Invariants and gotchas
 
+- The inspected S23 Android 16 / One UI 8.5 ordinary floating toolbar loads its background from
+  `materialColorSurfaceContainerHighest` and text from `materialColorOnSurface`, both selected by
+  configuration night mode, while its ripple follows the theme. A fixed dark theme with a light
+  configuration mixed a light surface with a white ripple. MainActivity (android/terminal) now
+  pins its night configuration before creating the window; retain the system `TYPE_FLOATING` menu.
 - Output readiness is not an acknowledgement of SIGWINCH: even a quiet gap at parser ground
   may precede a later redraw. A partial control sequence or UTF-8 character never releases the
   preview through readiness; the 200 ms deadline still bounds it. The preview is
@@ -514,6 +519,8 @@ select a command's output and move the cursor by taps:
 
 ## To verify
 
+- S23 system-menu colours and press contrast after MainActivity's night override, including
+  opening a new menu after an in-place system dark-mode change, remain unverified on device.
 - Link taps with mouse tracking preserve the program's click and skip the explicit IME request;
   actual keyboard visibility and browser handoff still need end-to-end device verification.
 - `TerminalResizeTest` passes seven API 34 cases: pixel preservation with a queued full frame

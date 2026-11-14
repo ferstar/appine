@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: pin the terminal activity's night configuration to match its dark theme)
 
 ## Responsibilities
 
@@ -115,6 +115,9 @@ protected notification actions (`android/privacy`); the notices list and reader 
 
 ### Binding and choosing a tab
 
+- `attachBaseContext` applies an override containing only `UI_MODE_NIGHT_YES`, before the window,
+  dynamic colours or views read resources. The terminal's night-qualified resources therefore
+  match its fixed dark theme; other configuration fields and other activities remain independent.
 - `onCreate` applies dynamic colours, reads `EXTRA_TAB` (only when the activity is not being
   recreated and was not opened from Recents: such an activity still has the intent that first
   started it), reads the font size (kept in dp as `font_size_dp`, so it scales with a display size
@@ -479,8 +482,12 @@ protected notification actions (`android/privacy`); the notices list and reader 
 - `MainActivity` is a `FragmentActivity` on a Material theme: Material dialogs and AppCompat's
   `PopupMenu` take the theme, but the views it builds or inflates from XML are the framework's (no
   AppCompat inflater), so AppCompat view attributes such as `app:tint` do nothing there. The text
-  selection handles `VtView` draws and the floating text menu read framework attributes, which
-  AppCompat forwards to the Material 3 colours (the handles are the primary colour).
+  selection handles `VtView` draws read framework attributes, which AppCompat forwards to the
+  Material 3 colours (the handles are the primary colour). The system floating text menu has its
+  own theme and resources: on S23 Android 16 its surface/text follow configuration night mode
+  while its ripple follows the theme. A fixed dark theme alone does not force `uiMode` to night;
+  MainActivity's early configuration override aligns them and survives configuration updates.
+  Keep the override limited to night mode so locale, font scale, density and window size still update.
   Theme.Material3 does not set the system bars' colours, which Android applies up to version 14,
   so `Theme.Appine.Terminal` sets them black, as the framework theme had them.
 - `TerminalLayout` must be built after dynamic colours are applied and assigned before attaching
@@ -532,6 +539,9 @@ protected notification actions (`android/privacy`); the notices list and reader 
 
 ## To verify
 
+- The terminal's night override compiles and passes lint; the system selection menu's surface,
+  text and ripple on S23, including after switching system dark mode while the activity is alive,
+  still need device verification. Settings and licenses should continue following the system.
 - File import was exercised through the API 34 system picker with multiple files, cancellation,
   collision numbering and activity recreation, including redisplay of the result. Seven
   instrumentation cases cover native-store copies, read/close cleanup, guest reads, shell escaping
