@@ -27,6 +27,13 @@
     <string name="listening_mapped">Other devices connect to port %1$d: apps cannot use port %2$d on this phone, so Appine moved it there.</string>
     <string name="listening_direct">Other devices on the network can connect to it.</string>
     <string name="new_tab">New tab</string>
+    <string name="import_files">Import files</string>
+    <string name="importing_files">Importing files…</string>
+    <string name="import_file_name">Imported file</string>
+    <string name="import_file_failed">Could not import %1$s: %2$s</string>
+    <string name="import_files_saved">Saved to your home directory:\n\n^1</string>
+    <string name="import_picker_missing">No file picker is available.</string>
+    <string name="copy_paths">Copy paths</string>
     <string name="close_tab">Close tab</string>
     <string name="more_options">More options</string>
     <string name="close_tab_title">Close this tab?</string>
@@ -194,7 +201,7 @@
     <string name="paste_unsafe_title">Paste text that may run commands?</string>
     <string name="paste_as_is">Paste as is</string>
     <string name="paste_without_trailing_newlines">Drop trailing newlines</string>
-    <string name="paste_unsafe">The program will see each line break as Enter, so the lines may run as commands as soon as they are pasted:\n\n%1$s</string>
+    <string name="paste_unsafe">The program will see each line break as Enter, so the lines may run as commands as soon as they are pasted:\n\n^1</string>
     <string name="clipboard_read_title">Let the program read the clipboard?</string>
     <string name="clipboard_read">A program in this tab asks for what the clipboard holds:\n\n%1$s</string>
     <string name="allow">Allow</string>

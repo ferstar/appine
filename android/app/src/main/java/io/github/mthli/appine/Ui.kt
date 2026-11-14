@@ -3,7 +3,12 @@ package io.github.mthli.appine
 import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.Drawable
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.TextUtils
+import android.text.style.TypefaceSpan
 import android.view.View
+import androidx.annotation.StringRes
 import androidx.appcompat.app.AlertDialog
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -45,6 +50,14 @@ internal fun Context.themeDrawable(attr: Int): Drawable? {
 
 /** The theme's ripple for something that can be tapped. */
 internal fun View.touchFeedback(): Drawable? = context.themeDrawable(android.R.attr.selectableItemBackground)
+
+/** Inserts a monospace value at the localized message's ^1 placeholder, preserving its span. */
+internal fun Context.monospaceMessage(@StringRes template: Int, value: String): CharSequence {
+    val content = SpannableString(value).apply {
+        setSpan(TypefaceSpan("monospace"), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+    }
+    return TextUtils.expandTemplate(getText(template), content)
+}
 
 /** Dialog windows do not inherit FLAG_SECURE from their activity. */
 internal fun MaterialAlertDialogBuilder.showPrivate(): AlertDialog = create().also {

@@ -26,6 +26,13 @@
     <string name="listening_mapped">其他设备请连接端口 %1$d：这台手机上的 App 用不了端口 %2$d，Appine 把它换到了这里。</string>
     <string name="listening_direct">同一网络里的其他设备连得上它。</string>
     <string name="new_tab">新建标签页</string>
+    <string name="import_files">导入文件</string>
+    <string name="importing_files">正在导入文件…</string>
+    <string name="import_file_name">导入的文件</string>
+    <string name="import_file_failed">无法导入 %1$s：%2$s</string>
+    <string name="import_files_saved">已保存到主目录：\n\n^1</string>
+    <string name="import_picker_missing">没有可用的文件选择器。</string>
+    <string name="copy_paths">复制路径</string>
     <string name="close_tab">关闭标签页</string>
     <string name="more_options">更多选项</string>
     <string name="close_tab_title">关闭这个标签页？</string>
@@ -188,7 +195,7 @@
     <string name="paste_unsafe_title">要粘贴可能会执行命令的文本吗？</string>
     <string name="paste_as_is">原样粘贴</string>
     <string name="paste_without_trailing_newlines">去掉末尾换行</string>
-    <string name="paste_unsafe">程序会把每个换行当作回车，粘贴后这些行可能会立刻作为命令执行：\n\n%1$s</string>
+    <string name="paste_unsafe">程序会把每个换行当作回车，粘贴后这些行可能会立刻作为命令执行：\n\n^1</string>
     <string name="clipboard_read_title">要让程序读取剪贴板吗？</string>
     <string name="clipboard_read">此标签页中的程序请求读取剪贴板中的内容：\n\n%1$s</string>
     <string name="allow">允许</string>

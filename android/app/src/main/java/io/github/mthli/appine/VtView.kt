@@ -1117,7 +1117,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val preview = if (text.length > PASTE_PREVIEW) text.take(PASTE_PREVIEW) + "…" else text
         val dialog = MaterialAlertDialogBuilder(context)
             .setTitle(R.string.paste_unsafe_title)
-            .setMessage(context.getString(R.string.paste_unsafe, preview))
+            .setMessage(context.monospaceMessage(R.string.paste_unsafe, preview))
             .setPositiveButton(R.string.paste_as_is) { _, _ ->
                 if (tab != 0L) input(VtNative.paste(tab, text, true))
             }

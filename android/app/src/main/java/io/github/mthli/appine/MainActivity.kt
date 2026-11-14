@@ -2,6 +2,8 @@ package io.github.mthli.appine
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
@@ -10,6 +12,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.text.SpannableStringBuilder
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.KeyboardShortcutGroup
@@ -19,6 +22,7 @@ import android.view.View
 import android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.view.ContextThemeWrapper
 import androidx.appcompat.widget.PopupMenu
@@ -26,6 +30,8 @@ import androidx.core.content.edit
 import androidx.core.view.WindowCompat
 import androidx.core.view.isVisible
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModelProvider
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import io.github.mthli.appine.MainActivity.Companion.PREF_FONT_SIZE
@@ -46,6 +52,11 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     private lateinit var layout: TerminalLayout
     private val links = TerminalLinks(this, ::showToast)
+    private val files by lazy { ViewModelProvider(this)[TerminalFiles::class.java] }
+    private var importDialog: AlertDialog? = null
+    private val pickFiles = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        files.selected(uris)
+    }
 
     private var service: TerminalService? = null
     private var current: VtSession? = null
@@ -118,6 +129,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         renderTabs()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(layout.root)
+        files.changes.observe(this) { updateImport() }
     }
 
     /** A notification of a tab was tapped while this activity exists (it is `singleTask`). */
@@ -153,6 +165,8 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     }
 
     override fun onDestroy() {
+        importDialog?.setOnDismissListener(null)
+        importDialog?.dismiss()
         // Sessions outlive the Activity: do not leave them pointing at this view
         layout.screen.attach(null)
         super.onDestroy()
@@ -162,6 +176,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     /** Called by the shared gate only when this resumed page can be used. */
     override fun onPrivacyUnlocked() {
+        updateImport()
         onNotice()
         if (!requestedNotifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -308,6 +323,59 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         toast = Toast.makeText(this, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).apply { show() }
     }
 
+    // ---- Importing files ----
+
+    private fun importFiles() {
+        val s = service ?: return
+        if (Privacy.locked(this) || s.machine == 0L) return
+        if (!files.begin(Settings.login(this))) return
+        try {
+            pickFiles.launch(arrayOf("*/*"))
+        } catch (_: ActivityNotFoundException) {
+            files.selected(emptyList())
+            showToast(getString(R.string.import_picker_missing), long = true)
+        }
+    }
+
+    private fun updateImport() {
+        layout.tabBar.setImportEnabled(!files.occupied && (service?.machine ?: 0L) != 0L)
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || Privacy.locked(this)) return
+        if (files.importSelected()) showToast(getString(R.string.importing_files))
+        val result = files.result ?: return
+        if (importDialog == null) showImportResult(result)
+    }
+
+    private fun showImportResult(result: TerminalFiles.Result) {
+        val message = SpannableStringBuilder().apply {
+            if (result.paths.isNotEmpty()) {
+                append(monospaceMessage(R.string.import_files_saved, result.paths.joinToString("\n")))
+            }
+            if (result.failures.isNotEmpty()) {
+                if (isNotEmpty()) append("\n\n")
+                append(result.failures.joinToString("\n"))
+            }
+        }
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.import_files)
+            .setMessage(message)
+            .setNegativeButton(R.string.close, null)
+            .setOnDismissListener {
+                importDialog = null
+                files.dismissResult()
+                layout.screen.requestFocus()
+            }
+        if (result.paths.isNotEmpty()) {
+            dialog.setPositiveButton(R.string.copy_paths) { _, _ ->
+                if (!Privacy.locked(this)) {
+                    getSystemService(ClipboardManager::class.java).setPrimaryClip(
+                        ClipData.newPlainText(getString(R.string.import_files), TerminalFiles.clipboardPaths(result.paths)),
+                    )
+                }
+            }
+        }
+        importDialog = dialog.showPrivate()
+    }
+
     // ---- Sessions ----
 
     /**
@@ -355,6 +423,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         val shown = current?.takeIf { it in sessions }
         if (shown != null) currentIndex = sessions.indexOf(shown)
         layout.tabBar.render(sessions, shown)
+        updateImport()
     }
 
     /**
@@ -625,7 +694,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         override fun onLink(uri: String) = links.open(uri)
     }
 
-    /** Taps on the tab bar: a tab, its title, `×`, `+` and `⋮`. */
+    /** Taps on the tab bar: a tab, its title, `×`, `+`, Import and `⋮`. */
     private inner class Bar : TabBarView.Target {
         override fun show(session: VtSession) = this@MainActivity.show(session)
 
@@ -634,6 +703,8 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         }
 
         override fun newTab() = newSession()
+
+        override fun importFiles() = this@MainActivity.importFiles()
 
         override fun menu(anchor: View) = showMenu(anchor)
 

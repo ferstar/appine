@@ -22,11 +22,12 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.graphics.ColorUtils
 import androidx.core.graphics.drawable.toDrawable
+import io.github.mthli.appine.TabBarView.Companion.LEAVE_SCALE
 import kotlin.math.roundToInt
 
 /**
  * The tab bar, one row in any window: a scrolling row of tabs, each a square with its number (a
- * long press shows its title), with `×` (closes the current tab), `+` and `⋮` over its end; the
+ * long press shows its title), with `×` (closes the current tab), `+`, Import and `⋮` over its end; the
  * tabs fade out into the left part of `×` while more of them lie beyond. Scrolled away from the
  * current tab, the row brings it back into view a few seconds after it comes to rest. When tabs
  * close, the ones after them slide into their places and then roll to their new numbers. The
@@ -49,6 +50,9 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
         /** `+`. */
         fun newTab()
+
+        /** `@`: select files to import. */
+        fun importFiles()
 
         /** `⋮`: its menu, at [anchor]. */
         fun menu(anchor: View)
@@ -171,8 +175,12 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         contentDescription = context.getString(R.string.close_tab)
     }
 
+    private val importButton = button("@") { target.importFiles() }.apply {
+        contentDescription = context.getString(R.string.import_files)
+    }
+
     /**
-     * `×`, `+` and `⋮` over the row's end. Black but for the left part of × the fade reaches into,
+     * `×`, `+`, Import and `⋮` over the row's end. Black but for the left part of × the fade reaches into,
      * so the tabs under the buttons are hidden, and taking every touch there, so a tab under the
      * hidden × cannot be tapped; TalkBack skips the group and reads each button.
      */
@@ -186,6 +194,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         addView(closeButton, item())
         addView(button("+") { target.newTab() }.apply { contentDescription = context.getString(R.string.new_tab) }, item())
+        addView(importButton, item())
         addView(button("⋮") { target.menu(it) }.apply { contentDescription = context.getString(R.string.more_options) }, item())
     }
 
@@ -248,6 +257,11 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         currentTab = rowTabs.getOrNull(sessions.indexOf(current))?.view
         row.invalidate()
         if (currentTab != null) scroll.post { revealCurrentTab() }
+    }
+
+    fun setImportEnabled(enabled: Boolean) {
+        importButton.isEnabled = enabled
+        importButton.alpha = if (enabled) 1f else 0.38f
     }
 
     /**

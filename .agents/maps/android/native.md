@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: save ownership, share-pruning isolation and locked-return regression coverage)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: file-import store and lifecycle regression coverage)
 
 ## Responsibilities
 
@@ -261,6 +261,10 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ### Tests
 
+- `TerminalFilesTest` uses isolated stores for binary/empty imports, collisions, name/home
+  escaping, read/close failure cleanup and missing homes; a real guest shell checks reads and
+  clipboard quoting. A locked MainActivity checks pending-picker retention across recreation;
+  all seven cases passed on API 34.
 - `DiagnosticsTest` checks two-part byte limits and previous-run rotation, ZIP entries and
   report retention, own-PID capture excluding another process, read-only share intents and
   provider root confinement, plus rejection of locked/stale export callbacks and recreation.

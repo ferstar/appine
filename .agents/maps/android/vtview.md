@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the split; latest change: unsafe-paste dialogs offer an optional trailing-newline removal action through the Material 3 neutral button)
+> Maintained: 2026-11-14 (targeted verification only since the split; latest change: paste-confirmation previews use monospace while the explanation keeps the dialog font)
 
 ## Responsibilities
 
@@ -231,7 +231,9 @@ opening links (`android/terminal`).
 - Paste (`VtNative.paste`, through `ghostty_terminal_paste`): bracketed with mode 2004, else line
   breaks become carriage returns; unsafe control bytes become spaces. Text that could run commands
   (line breaks without bracketed paste, or the bracketed terminator) is refused, and the view asks
-  in a Material 3 dialog with a preview (300 characters), Paste as is and Cancel. A neutral
+  in a Material 3 dialog with a monospace preview (300 characters), Paste as is and Cancel.
+  `Ui.monospaceMessage` preserves the preview's TypefaceSpan through localized `^1` substitution;
+  the explanation keeps the dialog's normal font. A neutral
   Drop trailing newlines action appears only when removing the final run of CR/LF leaves
   nonempty text that the paste encoder accepts; it preserves all other whitespace. Checking
   eligibility encodes without sending input; choosing the action rechecks privacy and encodes

@@ -3,9 +3,9 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the decisions on the tabs' sessions and the terminal view made before they were split out into `android/vt` and `android/vtview`).
 >
-> Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
+> Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: archive-scoped save continuation and a locked return from the document picker)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: copied import paths use backslash escaping instead of surrounding quotes)
 
 ## Responsibilities
 
@@ -19,6 +19,8 @@
   the terminal (`ProgressLine`) and the extra keys (`ExtraKeysView`);
 - `TerminalLayout`: the view hierarchy, status visibility, insets and the IME's animation;
   `TerminalLinks`: opening web, mail and guest-file links, using the activity's shared toast queue;
+- `TerminalFiles`: importing selected Android documents into the login account's home and
+  retaining the request, copy and result across activity recreation;
 - `LicensesActivity`, `LicenseActivity` and `LicenseCatalog`: the static notices list and its offline HTML reader;
 - the app's strings (English and Simplified Chinese) and themes: `Theme.Appine` (Material 3
   DayNight, for Settings and the licenses), `Theme.Appine.Terminal` (Material 3, always dark, with
@@ -28,7 +30,7 @@
   `list_item.xml`, and `preference_switch.xml` (Settings' MaterialSwitch with the standard
   AndroidX `switchWidget` ID). Settings' categories and rows use AndroidX's layouts.
 
-Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `TabBarView.kt`, `TabNumber.kt`,
+Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `TerminalFiles.kt`, `TabBarView.kt`, `TabNumber.kt`,
 `SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt`, `LicensesActivity.kt`, `LicenseActivity.kt`,
 `LicenseCatalog.kt`, `Privacy.kt`, `NotificationActivity.kt` and `Ui.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/`.
@@ -54,14 +56,24 @@ notice assets and the build (`android/native`).
   `showTerminal`, and owns the IME animation callback `keysFollowIme`.
 - `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
   `startViewer`; keeps the activity and its toast callback, with no service or session state.
+- `TerminalFiles : AndroidViewModel` — one process-local picker request, selected URIs, worker and
+  result (successful guest paths and failures); read-only `changes` tells the activity to update
+  its import button and present the result. `importSelected` reports whether it started a worker,
+  `copySelected` performs the batch, and MainActivity's `showImportResult` builds its dialog.
+  It keeps the Application, never the activity.
+- `Privacy` — process-local authentication and epoch, with a `Gate` per FragmentActivity and a
+  `Request` ViewModel holding that activity's authentication purpose, epoch snapshot and completion.
+  `ExportAuthorization` scopes fresh log-export approval; `NotificationActivity` authenticates
+  private report-copy actions before finishing.
 - `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
   without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
   shows the count it is given (`setCount`) and sends text changes, steps and closing to a
   `Target` (`search`, `step`, `close`).
-- `TabBarView` — the tab bar (a scrolling row of numbered tabs, with `×`, `+` and `⋮` over its
+- `TabBarView` — the tab bar (a scrolling row of numbered tabs, with `×`, `+`, Import and `⋮` over its
   end): shows the sessions and the current one it is given (`render`) and sends taps on tabs and
   buttons, the ⋮ anchor and the titles long presses show to a `Target` (`show`, `closeCurrent`,
-  `newTab`, `menu`, `notice`); it draws the other tabs' progress and status marks and redraws them
+  `newTab`, `importFiles`, `menu`, `notice`); `setImportEnabled` controls the import button;
+  it draws the other tabs' progress and status marks and redraws them
   on `refreshStatus`; `Tab` (one per session: its number in the row, which slides, rolls to a new
   number and fades out when closed); `TabNumber` (in its own file: the number, a `TextView`
   drawing its digits itself so they can roll).
@@ -85,7 +97,9 @@ notice assets and the build (`android/native`).
 - `Ui.kt` — what the screens and views share (`VtView` too): `LINE_DP` and `line()` (how thick
   the indicators and the progress line are: 1 dp, at least a pixel), `dp`, `themeColor`
   (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
-  `selectableItemBackground`).
+  `selectableItemBackground`); `showPrivate` registers dialog security before showing it.
+  `monospaceMessage` substitutes a styled value into a localized `^1` template with TextUtils,
+  leaving the explanation in the dialog's normal font.
 - `LicenseCatalog` — reads `assets/notices/index.json`: stable ID, name, version, chosen license,
   HTML file, optional package count and standalone-license kind; formats localized summaries.
 - `LicensesActivity` — the Material 3 list, one `list_item.xml` per component entry (excluding
@@ -101,7 +115,8 @@ notice assets and the build (`android/native`).
   `EXTRA_TAB` (a `VtSession.id`) by a tab's notification; listener callbacks `onProgress`,
   `onMachineReady`, `onSessionsChanged`, `onBell`, `onClipboardRead`, `onTabStatus`,
   `onSettingsChanged`,
-  `onNotice`, `onRestarting`, `onExitAll`.
+  `onNotice`, `onRestarting`, `onExitAll`, `onOpenUrl`; `onPrivacyUnlocked` from the privacy gate,
+  and the `OpenMultipleDocuments` activity-result callback for import.
 - `LicensesActivity`, opened from Settings; `LicenseActivity`, opened from the list or a local
   license link with `EXTRA_ID` (unknown IDs finish without loading a URL).
 
@@ -162,7 +177,9 @@ notice assets and the build (`android/native`).
 - One 32 dp row in any window: a scrolling row of tabs across its whole width, with `×` (closes the
   current tab; hidden while there is none), `+` (opens a session while the kernel runs, in the
   current tab's directory: its console's foreground group's, read from the kernel on the main thread
-  as a spawn is; the home directory without a current tab or once its shell ended) and `⋮` (a menu:
+  as a spawn is; the home directory without a current tab or once its shell ended), Import
+  (`@`, using the shared text-button style, disabled at 38% opacity while unavailable or occupied),
+  and `⋮` (a menu:
   "Find", disabled with no current tab, "Clear screen", disabled without a current tab whose
   terminal exists or while it shows the alternate screen, "Reset terminal", disabled without such a
   tab, "Close other tabs", disabled when there is no other, "Close all tabs", disabled with no tabs,
@@ -214,6 +231,8 @@ notice assets and the build (`android/native`).
   nothing; for the
   current tab too, though only the other tabs draw marks), and the `×`, `+` and `⋮` buttons by
   name (`⋮` as "More options").
+- Import announces "Import files". The four fixed controls reserve 128 dp at the end of the
+  scrolling row; the fade still reaches into `×`.
 - `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
   they close is busy (its shell has ended, has not started, as in a restored tab never shown, or
   waits at its prompt as the prompt marks tell, `VtSession.busy`, android/vt's Shell integration),
@@ -360,12 +379,39 @@ notice assets and the build (`android/native`).
   app the system picks. A link from another host, to an existing file while file access is off,
   or to nothing in the store gets a toast instead, as does a link no app takes. The disabled-file
   hint names "Allow other apps to access files" in both locales, matching Settings' consent dialog.
-  The lookup result returns on the UI thread and is ignored if its activity has been destroyed.
+  The lookup result returns on the UI thread and is ignored if its activity is destroyed or locked.
 - A tab's clipboard read reaches the activity through the service (`onClipboardRead`; the queue and
   the answers are `VtSession`'s, android/vt). `MainActivity` reads the clipboard's first item as
   text and, when there is some, asks ("Let the program read the clipboard?", up to 300 characters
   shown, Allow and Deny), one question at a time, whose answer covers every read queued meanwhile;
   an empty clipboard, or one without text, is answered at once (`VtSession.answerClipboardRead`).
+
+### Importing files
+
+- The top-right Import button opens the system multiple-document picker for `*/*`, only while
+  the page is unlocked and the kernel runs. No storage permission or external file-access setting
+  is needed. One request, copy or undismissed result occupies the button; cancelling releases it.
+- `TerminalFiles.begin` retains the login preference. The picker callback accepts results only
+  for that process-local request and deduplicates URIs. A resumed unlocked page starts the copy;
+  the worker resolves the account once against the current store and holds `Rootfs.access`'s read
+  lock for the batch. Destination is that account's home, independent of the tab's cwd, effective
+  user and mounts. A missing home or `/` is refused.
+- Provider display names are used with a localized fallback. Controls, slash and NUL are replaced,
+  empty/dot names are sanitized, and extensions are preserved. Native browse creation assigns the
+  account's ownership and numbers collisions without overwriting. Source and destination streams
+  close, file data is synced, and `browseWritten` reports the write to the guest. Read/write/close
+  errors attempt to remove the created file; other files in the batch continue.
+- The retained result lists successful guest paths in monospace and per-file failures in a protected
+  dialog. A blank line separates the explanation from the paths; message assembly preserves spans.
+  Copy paths explicitly puts space-separated shell arguments on the clipboard, prefixing whitespace
+  and shell metacharacters with backslashes and leaving ordinary paths unquoted. It appends no
+  newline and sends no terminal input. Result display
+  requires a resumed unlocked page, and copying checks the gate again.
+- Recreation retains selection/copy/result; destruction dismisses its dialog without consuming
+  the result, so it can reappear after unlock. Process death loses this state. An already-started
+  worker continues after backgrounding or closing the activity. There is no cancellation; slow
+  document providers hold up rootfs reset/replacement. Process termination or cleanup failure can
+  leave an incomplete file; imports are not transactional across the whole batch.
 
 ### Licenses
 
@@ -374,7 +420,7 @@ notice assets and the build (`android/native`).
   Its final Version action is labeled "Version" / "版本号"; android/setup supplies the build
   version summary and Google Play navigation.
 - `notices/` is checked in (android/native): Appine, Fuchsia, libghostty-vt and its linked
-  components, JetBrains Mono, Alpine and the bundled doas/bash/procps packages, Android
+  components, JetBrains Mono, Alpine and the bundled doas/bash/procps/bubblewrap packages with libcap2, Android
   libraries, Rust crates, SQLite and standalone license texts. Subtitles show the chosen
   license; Alpine shows a localized package count and "Multiple licenses", and SQLite "Public
   domain". Standalone texts stay in the catalog and assets for links from Android libraries and
@@ -418,6 +464,8 @@ notice assets and the build (`android/native`).
   `removeSession`, `current`, `focus`, `sessions`), `Settings.fillWide` and
   `volumeKeysSwitchTabs`; `Documents.fileLink`
   (android/documents); `assets/notices`.
+- `TerminalFiles` uses ContentResolver document streams, `Rootfs` account resolution/store lock,
+  `Documents` naming/path helpers and `Native.browse*` for private copies into the home.
 - Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
   and the page layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation
   compat; androidx.browser's Custom Tabs for web links; AndroidX WebKit's asset loader for
@@ -467,7 +515,8 @@ notice assets and the build (`android/native`).
   fixed column, and a SHIFT held meanwhile is not cancelled.
 - The indicators are drawn by the containers (the tab row, each page's grid, the fixed column) in
   `dispatchDraw`, over their labels, so a change of state must invalidate the container, not the
-  label: `refresh` invalidates every grid and the fixed column, and `TabBarView.render` the tab
+  label: `refresh` invalidates the shown grid and the fixed column (turning pages refreshes the
+  newly attached grid), and `TabBarView.render` the tab
   row. The label's place is the sum of `left` and `top` up to the container:
   `offsetDescendantRectToMyCoords` subtracts each view's scroll, and a single-line `TextView` (the
   extra keys' labels) scrolls far sideways to centre its text, which also draws a foreground
@@ -499,9 +548,9 @@ notice assets and the build (`android/native`).
   there at once. The keys rising with the IME are drawn inside the root's bottom padding, which
   already holds the IME's room, so the root must not clip to its padding (`clipToPadding` off) or
   they stay hidden until they reach the terminal.
-- The tab bar's buttons are characters in the system font: `+`, `⋮` and `×` (the multiplication
+- The tab bar's buttons are characters in the system font: `+`, `@`, `⋮` and `×` (the multiplication
   sign, which Roboto draws like its `+`). `✕` (U+2715) is not in Roboto, and the fallback font's
-  glyph is larger and thinner than the others.
+  glyph is larger and thinner than the others. `@` opens file import.
 - Settings and the licenses leave `uiMode` out of their `configChanges` so that a dark-mode
   change recreates them with the other colours; an AppCompat activity that handles `uiMode`
   itself would keep the views it already made in the old ones. No activity handles `density`,
@@ -510,13 +559,14 @@ notice assets and the build (`android/native`).
   the app) or that is opened from Recents gets the intent that first started it, so `EXTRA_TAB`
   is read in `onCreate` only without a saved state and without
   `FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY`; otherwise a notification's tab would come back to the
-  front. A recreated `MainActivity` starts without open dialogs, the search bar or the extra
-  keys' modifiers and page.
+  front. A recreated `MainActivity` drops ordinary dialogs, the search bar and the extra keys'
+  modifiers/page; a retained import result is shown again after the page resumes unlocked.
 - Back uses `OnBackPressedDispatcher` with `closeSearchOnBack` enabled only during search.
 
 ## Confirmed bugs / technical debt
 
-none
+- Imports have no cancellation or process-death recovery. Killing the app during a copy can
+  leave an incomplete file, and closing its activity can lose the eventual result display.
 
 ## Open questions
 
@@ -535,6 +585,10 @@ none
 
 ## To verify
 
+- File import was exercised through the API 34 system picker with multiple files, cancellation,
+  collision numbering and activity recreation, including redisplay of the result. Seven
+  instrumentation cases cover native-store copies, read/close cleanup, guest reads, shell escaping
+  and locked-picker retention. Cloud providers, process interruption and vendor pickers remain unverified.
 - Fresh diagnostic-export credential authentication, cancellation, wrong PIN and screen-off
   invalidation were checked on API 34; ordinary unlock did not replay an export. Real biometric
   hardware and vendor prompt behavior remain unverified.
