@@ -142,6 +142,7 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
         setTextColor(mutedColor)
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, TabBarView.BAR_LABEL_DP)
         gravity = Gravity.CENTER
+        isFallbackLineSpacing = false
         background = touchFeedback()
         setOnClickListener(onClick)
     }
