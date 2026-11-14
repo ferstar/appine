@@ -1,7 +1,7 @@
 ---
 name: map-module
 description: |
-  Create, fully refresh, incrementally maintain, or split a source-verified subsystem architecture map under `.agents/maps/`. Use when the user explicitly invokes `$map-module`, asks to map or document a subsystem's current architecture or split an oversized map, or project instructions require targeted maintenance after implementation changes invalidate mapped facts. Do not use for ad hoc code explanation, a single-file question, or changes that leave the existing map accurate. Authorizes bounded, read-only explorer subagents for research and verification.
+  Create, fully refresh, incrementally maintain, or split a source-verified subsystem architecture map under `.agents/maps/`. Use when the user explicitly requests the map-module skill, asks to map or document a subsystem's current architecture or split an oversized map, or project instructions require targeted maintenance after implementation changes invalidate mapped facts. Do not use for ad hoc code explanation, a single-file question, or changes that leave the existing map accurate. Authorizes bounded, read-only explorer subagents for research and verification.
 ---
 
 # Map Module
@@ -131,7 +131,7 @@ are met.
 4. Synthesize a baseline map using the final map template. Merge overlaps, distinguish public
    names from class or package names, and place uncertainty only under `Open questions` or
    `To verify`.
-5. Write or update `.agents/maps/<module-id>.md` with `apply_patch`.
+5. Write or update `.agents/maps/<module-id>.md` using an available file-editing tool.
 
 ## Phase 2: Full adversarial verification
 
@@ -161,19 +161,19 @@ pass, and remove a stale `> Maintained:` line together with the bare `>` line ab
 genuinely open design or intent questions under `Open questions`. Do not claim full verification
 if assignments failed; state the residual explicitly.
 
-Use `apply_patch` for edits. Match punctuation exactly when replacing existing text. For large
-section rewrites, anchor on unique headings and fail on ambiguous matches.
+Keep edits scoped to the intended changes. Match punctuation exactly when replacing existing
+text. For large section rewrites, anchor on unique headings and stop if the target is ambiguous.
 
 ## Phase 4: Register, connect, and validate
 
 1. If the module is new, add it to the matching section of `.agents/MODULES.md` only after the map
    is verified. Keep the registry near its documented size and describe the verified boundary.
-2. Check whether the root `AGENTS.md` or `AGENTS.override.md` tells agents to resolve affected module IDs,
+2. Check only the root `AGENTS.md` for rules telling agents to resolve affected module IDs,
    read the matching map and decision files before editing, and conditionally run a targeted map
    refresh when implementation changes invalidate mapped facts. If those rules are missing or only
-   mention decisions, do not edit the instruction file. Tell the user that `$commit-context` will
+   mention decisions, do not edit the instruction file. Tell the user that the `commit-context` skill will
    propose the canonical Knowledge Loop Conventions upgrade when the map is staged for commit. If
-   `$commit-context` is unavailable, warn that the map will not be consumed automatically.
+   the `commit-context` skill is unavailable, warn that the map will not be consumed automatically.
 3. Confirm that the final map:
    - follows the reference template;
    - contains no source `path:line` citations;
@@ -181,11 +181,11 @@ section rewrites, anchor on unique headings and fail on ambiguous matches.
    - pairs to the same module id under `.agents/decisions/`.
 4. If this run wrote the map, measure its bytes (`wc -c`) and estimate tokens as bytes / 2.3,
    labeling that estimate as approximate. Compare with the output budget available for a single
-   file read (for example, the active shell tool's `max_output_tokens`), not the model's entire
-   context window. If it exceeds about 80% of that budget, report the size and suggest condensing
-   or `$map-module split`, without doing either unless asked. If no budget is exposed, report the
-   size without claiming a fixed limit. Continue reading required files in focused ranges when
-   needed; do not provoke truncation to measure tokens.
+   file read, not the model's entire context window. If it exceeds about 80% of that budget, report
+   the size and suggest condensing
+   or asking the `map-module` skill to split the module, without doing either unless asked. If no
+   budget is exposed, report the size without claiming a fixed limit. Continue reading required
+   files in focused ranges when needed; do not provoke truncation to measure tokens.
 5. Run `git diff --check` and inspect the focused diff for the map and registry.
 6. Do not commit or push unless the user explicitly asks. Mention confirmed risks that belong in
    a future Decision block.

@@ -1,6 +1,6 @@
 ---
 name: commit-context
-description: Create a Git commit that records the staged diff, relevant current-conversation context, and optional structured module decisions. Use only when the user explicitly invokes `$commit-context`; do not select it from natural-language commit requests alone.
+description: Create a Git commit that records the staged diff, relevant current-conversation context, and optional structured module decisions. Use only when the user explicitly requests the commit-context skill by name or selects it through the host's skill invocation mechanism. Do not select it from a generic request to create a commit.
 ---
 
 # Commit Context
@@ -61,10 +61,8 @@ under `.agents/maps/`, or a file under `.agents/decisions/`. This covers both fi
 later rule upgrades without prompting during unrelated commits. Do not run it merely because a
 registry already exists.
 
-1. Select the root project instruction file:
-   - Use `AGENTS.override.md` when a non-empty root-level override exists.
-   - Otherwise use root-level `AGENTS.md`, creating it if needed.
-2. If the selected file already contains equivalent rules for resolving affected modules, reading
+1. Use only root-level `AGENTS.md` for project instructions, proposing its creation if it is missing.
+2. If `AGENTS.md` already contains equivalent rules for resolving affected modules, reading
    their map and decision files before editing, progressively expanding source context with
    truncation safeguards, and conditionally maintaining maps afterward, do not duplicate them.
 3. Otherwise, ask separately whether to add or upgrade the block below. Show the exact target file
@@ -75,7 +73,7 @@ registry already exists.
 
 Use this block, translating its prose to match an existing instruction file when appropriate. Keep
 literal identifiers and all-uppercase field names unchanged, including `.agents/` paths and
-`$commit-context` / `$map-module` invocations. Paste it flush-left under its own top-level H2 so it
+the `commit-context` and `map-module` skill names. Paste it flush-left under its own top-level H2 so it
 does not collide with existing sections.
 
 ````markdown
@@ -90,11 +88,11 @@ does not collide with existing sections.
 
 ### After finishing a task
 
-- If implementation changes invalidate an existing module map, use `$map-module`: targeted refresh when the impact is bounded, otherwise full refresh. If unavailable, report the map as stale.
-- In every `$commit-context` Decision, fill `MODULE`, `WHY`, `ALTERNATIVES`, `CHOSEN`, `TRADEOFFS`, and `RISKS`; add `SUPERSEDES` when replacing a prior Decision.
+- If implementation changes invalidate an existing module map, use the `map-module` skill: targeted refresh when the impact is bounded, otherwise full refresh. If unavailable, report the map as stale.
+- In every Decision block created by the `commit-context` skill, fill `MODULE`, `WHY`, `ALTERNATIVES`, `CHOSEN`, `TRADEOFFS`, and `RISKS`; add `SUPERSEDES` when replacing a prior Decision.
 ````
 
-Do not otherwise edit `AGENTS.md` or `AGENTS.override.md`. This skill owns only the Knowledge Loop
+Do not otherwise edit `AGENTS.md`. This skill owns only the Knowledge Loop
 Conventions block; it does not manage general repository instructions.
 
 ## Compose the message
@@ -161,7 +159,7 @@ Apply these section rules:
 ## Commit safely
 
 1. Show the complete proposed message before committing.
-2. Treat the explicit `$commit-context` request as authorization to create the commit after any required staging or registry questions are resolved. Do not ask for a redundant final confirmation unless the proposed commit boundary changed materially.
+2. Treat an explicit request to execute this skill as authorization to create the commit after any required staging or registry questions are resolved. Mentioning, reviewing, or editing the skill does not authorize a commit. Do not ask for a redundant final confirmation unless the proposed commit boundary changed materially.
 3. Create a unique temporary directory with `mktemp -d`, write the message to a file inside it using an available file-editing tool, and pass that explicit file to `git commit -F`.
 4. Remove only that temporary directory after the commit attempt.
 5. Run:

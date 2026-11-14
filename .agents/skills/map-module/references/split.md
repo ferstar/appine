@@ -77,7 +77,7 @@ is still over, propose another cut instead of condensing facts away.
   > See `.agents/decisions/<child-id>.md` for the paired decision history (not yet created; decisions from before the split are D1, D13 and the page-table half of D4 in `.agents/decisions/<parent-id>.md`).
   ```
 
-  Do not copy or move those decisions. They keep the parent's `MODULE` tag, and `$distill-module`
+  Do not copy or move those decisions. They keep the parent's `MODULE` tag, and the `distill-module` skill
   indexes decisions by that tag, so an entry moved to the child returns to the parent on its next
   distill and the child loses it.
 - Write the `Verified` line from the parent's mapping and do not carry over a `Maintained` line:
@@ -124,9 +124,9 @@ is still over, propose another cut instead of condensing facts away.
 
 - Do not stage, commit, or push unless explicitly requested. Suggest one commit per parent,
   holding the parent and its children.
-- For `$commit-context`, suggest one Decision per affected module. Tag the parent's Decision with
+- For the `commit-context` skill, suggest one Decision per affected module. Tag the parent's Decision with
   the parent and use `SUPERSEDES` for the decision, if any, that made the moved parts part of the
   parent. Give each child a Decision of its own with what it owns, the decision IDs it inherits,
   and which changes will now read two maps.
-- A child's decision snapshot is created by a later `$distill-module` run from decisions tagged
+- A child's decision snapshot is created by a later run of the `distill-module` skill from decisions tagged
   with the child, starting with the split commit's own.

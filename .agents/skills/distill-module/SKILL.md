@@ -1,6 +1,6 @@
 ---
 name: distill-module
-description: "Distill structured `MODULE` Decision blocks from Git history into stable snapshots for registered modules under `.agents/decisions/`. Use only when the user explicitly invokes `$distill-module`; do not select it from natural-language requests alone."
+description: "Distill structured `MODULE` Decision blocks from Git history into stable snapshots for registered modules under `.agents/decisions/`. Use only when the user explicitly requests the distill-module skill by name or selects it through the host's skill invocation mechanism. Do not select it from a generic request to summarize module decisions."
 ---
 
 # Distill Module
@@ -14,7 +14,7 @@ Never amend, rebase, delete, or otherwise rewrite commits. Record corrections in
 1. Run from the repository root.
 2. Read `.agents/MODULES.md`.
    - Do not silently create the registry when it is missing.
-   - Stop and tell the user to use `$commit-context` to create the registry.
+   - Stop and tell the user to use the `commit-context` skill to create the registry.
 3. Resolve the target:
    - Use an exact registered ID when the user supplied one.
    - If the ID is unknown, list the registered IDs and ask the user to choose.
@@ -185,10 +185,10 @@ After writing:
 
 1. Show the destination path.
 2. Summarize what changed and repeat any accepted warnings.
-3. Tell the user to review the file and commit it when ready, optionally with `$commit-context`,
+3. Tell the user to review the file and commit it when ready, optionally with the `commit-context` skill,
    whose own Decision block is then tagged with the module being distilled.
-4. If the root `AGENTS.md` or `AGENTS.override.md` does not direct agents to read relevant module
-   maps and decisions, mention that `$commit-context` will propose the canonical knowledge-loop
+4. Check only the root `AGENTS.md`. If it does not direct agents to read relevant module
+   maps and decisions, mention that the `commit-context` skill will propose the canonical knowledge-loop
    rules when the snapshot is staged for commit. Do not edit instruction files from this skill.
 
 ## Guardrails
