@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: About ends with the app version and a Google Play link with a web fallback)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: new Alpine imports stage bubblewrap and libcap for offline installation at first login)
 
 ## Responsibilities
 
@@ -20,7 +20,7 @@
 - package mirrors: built-in lists, one speed probe after an import, writing the fastest into
   sources nobody has changed;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
-  admin setup, installing the bundled bash and procps-ng, and the NOPASSWD rules;
+  admin setup, installing the bundled bash, procps-ng and bubblewrap, and the NOPASSWD rules;
 - the settings screen, which only displays the service's state and forwards choices;
 - the store lock shared by the kernel start, store deletion and the Files provider.
 
@@ -74,7 +74,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`
   and `sudo-installed` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
   (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`,
-  `/var/cache/appine/bash/` and `/var/cache/appine/procps/` (packages until installed), and `/run/appine-install.lock`.
+  `/var/cache/appine/{bash,procps,bubblewrap}/` (packages until installed), and `/run/appine-install.lock`.
 
 ## Public entry points
 
@@ -97,12 +97,12 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - Alpine: `scripts/fetch-rootfs` downloads the bundled packages from the branch's `main`
   repository (doas, and bash with readline, libncursesw and ncurses-terminfo-base, each checked by
   its pinned sha256 only; also procps-ng, libproc2, libintl, utmps-libs and skalibs-libs, sharing
-  the ncurses dependencies; apk checks their signatures at install) and, unless a copy with the
+  the ncurses dependencies; also bubblewrap and libcap2; apk checks signatures at install) and, unless a copy with the
   pinned sha256 is already there, the minirootfs: its GPG signature is
   checked when both gpg and gpgv are installed (a failed signature download counts as bad; without
   gpg a warning), then its pinned sha256. Gradle bundles the newest fetched files by version
   (`BuildConfig.ALPINE_BRANCH` is taken from the name, `edge` without one) as `rootfs.tgz`,
-  `doas.apk`, `bash/<file name>` and `procps/<file name>` without checking them again, and fails without them; `prepare`
+  `doas.apk`, `{bash,procps,bubblewrap}/<file name>` without checking them again, and fails without them; `prepare`
   copies the tarball asset to the cache.
 - Debian (`download`): a cached `cacheDir/<distro>.tar.gz` with the pinned length and sha256 is
   reused; else `fetch` tries the sources in order (probed by speed when there are several; Debian
@@ -151,8 +151,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     from `/bin/sh` to `/bin/bash` (any other shell is kept). Systems imported before keep busybox
     ash; accounts busybox's `adduser` makes later take the shell of `$SHELL` or of the account
     running it, so from a root tab they get bash too; procps-ng and its six dependencies are
-    staged in `/var/cache/appine/procps/` by `cachePackages`, also used for bash. Existing stores
-    receive no procps bundle;
+    staged in `/var/cache/appine/procps/` by `cachePackages`, also used for bash and bubblewrap
+    with libcap2 (`/var/cache/appine/bubblewrap/`). Existing stores receive neither new bundle;
   - Debian: `hosts` and `resolv.conf` (the DNS stub) always.
 
 ### Before every start and boot
@@ -260,9 +260,9 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     itself among the directories the guest changed (`passwd`, `chpasswd` and `adduser` replace
     `/etc/shadow`; group changes replace `/etc/group`), so a password set in a running session
     makes escalating ask for it within about one poll (2 s);
-  - before choosing the account, when `/var/cache/appine/procps` exists: install procps-ng offline
-    under the install lock, testing `apk info -e procps-ng` (BusyBox already provides ps/top/free),
-    re-add it by name for upgrades, and delete the cache under the lock only on success. Failure
+  - before choosing the account: install procps-ng, then bubblewrap offline when their cache directories
+    exist, under the install lock, testing `apk info -e <package>` (BusyBox already provides ps/top/free),
+    re-add each by name for upgrades, and delete its cache under the lock only on success. Failure
     leaves the cache for the next login and still opens a shell; later user removal is respected.
     This works with any login shell; `--refresh-rules` returns before installing;
   - every login whose account's passwd shell is `/bin/bash` while bash is missing and
@@ -285,7 +285,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     `DPkg::Lock::Timeout`, which apt shows on the terminal), and touch the marker once the tool is
     there;
   - the install lock: a `flock` on `/run/appine-install.lock` held around each install of a bundled
-    package (`locked`), so concurrent logins install bash, doas and procps-ng one after another, each first
+    package (`locked`), so concurrent logins install bash, doas, procps-ng and bubblewrap one after another, each first
     checking whether an earlier holder installed it already; each `apk add` (`apk_add`) that fails
     on apk's own lock, held by an apk the user runs, prints that another apk is running and is
     retried with `--wait 3600`, so the login waits until that apk ends; Ctrl-C stops the wait and

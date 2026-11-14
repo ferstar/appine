@@ -204,6 +204,7 @@ internal object Rootfs {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
             useBash(context, store)
             cachePackages(context, store, "procps")
+            cachePackages(context, store, "bubblewrap")
         } else {
             // Debian's has no hosts, and resolv.conf points at 1.1.1.1. DNS must go through the
             // kernel layer's stub (the kernel/net map) for the system's Private DNS and VPNs to

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: checked-in HTML notices replace Gradle generation, with AndroidX WebKit and isolated reader tests)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: bundle bubblewrap and libcap2 with static notices and offline installation and sandbox coverage)
 
 ## Responsibilities
 
@@ -49,7 +49,8 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   runs), `newestFetched` (the newest file in `target/rootfs` whose name matches), `bashPackages`
   (the newest of bash, readline, libncursesw and ncurses-terminfo-base, null when any is missing)
   and `procpsPackages` (procps-ng, libproc2, libintl, utmps-libs, skalibs-libs and the two ncurses
-  packages, null when any is missing), and `alpineBranch` (from the tarball's name, `edge` without one).
+  packages, null when any is missing), `bubblewrapPackages` (bubblewrap and libcap2, null when either
+  is missing), and `alpineBranch` (from the tarball's name, `edge` without one).
 - `MachineTest` — kernel and app instrumentation tests; `RunPolicyTest` — isolated preferences and idle-grace tests;
   `LicenseTest` — static notice coverage and offline reader rendering/restoration, without opening the store.
 
@@ -170,7 +171,8 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
   since AAPT would unpack `.gz`), the newest `doas.apk`, and bash's four packages under `bash/`
   with their own file names, plus procps-ng's seven packages under `procps/` (including copies of
-  ncurses so either bundle installs independently; all by `byVersion`; `rootfsAsset` fails with "run
+  ncurses so either bundle installs independently), and bubblewrap/libcap2 under `bubblewrap/`
+  (all by `byVersion`; `rootfsAsset` fails with "run
   scripts/fetch-rootfs first" when any is missing), checked-in `notices/`, and
   the terminal font (`fonts/`, `android/vtview`); `BuildConfig.ALPINE_BRANCH` carries the
   branch.
@@ -194,7 +196,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   translate-c, Zig's compiler_rt, JetBrains Mono's OFL); Alpine (each package's version, licence, origin and commit
   from the tarball's `lib/apk/db/installed`, then the bundled packages' from their `.PKGINFO`, doas
   and bash's four and procps-ng's five additional packages in sections of their own (shared ncurses
-  counted only once), all counted in the entry's package count and
+  counted only once), plus bubblewrap and libcap2, all counted in the entry's package count (28) and
   licences); the Android libraries on the
   runtime classpath; the Rust crates; SQLite (its version from libsqlite3-sys's `sqlite3.h`); full
   texts of GPL-3.0, GPL-2.0, LGPL-2.1, Apache-2.0 and MPL-2.0. `LicenseCatalog` (android/terminal)
@@ -234,7 +236,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - The Alpine part takes the tarball `scripts/fetch-rootfs` prints last and the bundled packages
   it prints before it, picks packages whose licence (the tarball's `lib/apk/db/installed`, each
   package's `.PKGINFO`) contains `GPL` (LGPL included; so bash, readline, procps-ng/libproc2 and
-  libintl, not doas, ncurses, utmps-libs or skalibs-libs),
+  libintl, bubblewrap and libcap2, not doas, ncurses, utmps-libs or skalibs-libs),
   downloads each origin's
   aports directory at its commit (GitLab archive of `main/<origin>`), and for every file in the
   APKBUILD's `sha512sums` hashes the copy in that directory or fetches it from Alpine's distfiles
@@ -263,7 +265,10 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   install, the `/bin/sh` fallback, bash's marks and nested shells'). `newSystemsInstallProcpsOffline`
   uses its own store and ash, omits a dependency to check failure/retry, retries in two concurrent
   logins without repositories, runs ps/top/free/vmstat/uptime/pgrep, and checks that user removal
-  persists. Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
+  persists. `newSystemsInstallBubblewrapOffline` similarly uses its own store without bash/procps
+  or repositories, checks a missing libcap dependency, concurrent retries and user removal, and
+  runs root and unprivileged sandboxes with namespaces, read-only root and private tmpfs.
+  Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
   from the internet, behind the `network=true` argument; `routesComeFromLinkProperties` has no
   gate but fails without a default network with an IPv4 gateway.
 - The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set

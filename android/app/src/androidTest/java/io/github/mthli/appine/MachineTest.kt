@@ -483,6 +483,69 @@ class MachineTest {
         }
     }
 
+    /** Offline bubblewrap installation retries safely and works for an unprivileged user. */
+    @Test
+    fun newSystemsInstallBubblewrapOffline() {
+        val store = File(context.cacheDir, "store-bubblewrap")
+        store.deleteRecursively()
+        Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
+        val machine = Native.start(store.path, 1)
+        try {
+            // No repositories or other bundles: bubblewrap must carry its own dependencies.
+            assertEquals(0, sh(machine,
+                "sed -i 's@/bin/bash$@/bin/sh@' /etc/passwd; " +
+                    "rm -rf /var/cache/appine/bash /var/cache/appine/procps; " +
+                    "mkdir /var/cache/appine/bubblewrap.off; " +
+                    "mv /var/cache/appine/bubblewrap/libcap2-*.apk /var/cache/appine/bubblewrap.off/; " +
+                    "rm -f /etc/apk/repositories"
+            ).second)
+            val failed = plain(login(machine, "echo login-ok\nexit\n", ConsolePty.LOGIN_ROOT))
+            assertTrue(failed, failed.contains("cannot install bubblewrap now"))
+            assertTrue(failed, failed.contains("\nlogin-ok\n"))
+            assertEquals(0, sh(machine,
+                "test -d /var/cache/appine/bubblewrap && ! apk info -e bubblewrap"
+            ).second)
+            assertEquals(0, sh(machine,
+                "mv /var/cache/appine/bubblewrap.off/*.apk /var/cache/appine/bubblewrap/"
+            ).second)
+
+            val outputs = arrayOf("", "")
+            val logins = (0..1).map { i ->
+                thread { outputs[i] = login(machine, "bwrap --version\nexit\n", ConsolePty.LOGIN_ROOT) }
+            }
+            logins.forEach { it.join(120_000) }
+            assertTrue("first logins did not finish", logins.none { it.isAlive })
+            for (out in outputs) assertTrue(out, plain(out).contains("\nbubblewrap "))
+            assertEquals("" to 0, sh(machine,
+                "test ! -e /var/cache/appine/bubblewrap && grep -qx bubblewrap /etc/apk/world && " +
+                    "test ! -x /bin/bash && ! apk info -e procps-ng"
+            ))
+            val sandbox = "bwrap --unshare-all --hostname box --ro-bind / / --dev /dev " +
+                "--proc /proc --tmpfs /tmp /bin/sh -c " +
+                "'test \"\$(hostname)\" = box && touch /tmp/inside && " +
+                "test -r /proc/self/status && ! touch /etc/bwrap-readonly 2>/dev/null && echo sandbox-ok'"
+            val root = sh(machine, sandbox)
+            assertEquals(root.first, 0, root.second)
+            assertTrue(root.first, root.first.contains("sandbox-ok"))
+            assertEquals(0, sh(machine, "adduser -D -s /bin/sh bwraptest").second)
+            val quotedSandbox = "'" + sandbox.replace("'", "'\\''") + "'"
+            val unprivileged = sh(machine, "su bwraptest -s /bin/sh -c $quotedSandbox")
+            assertEquals(unprivileged.first, 0, unprivileged.second)
+            assertTrue(unprivileged.first, unprivileged.first.contains("sandbox-ok"))
+            assertEquals(0, sh(machine, "test ! -e /tmp/inside && test ! -e /etc/bwrap-readonly").second)
+
+            assertEquals(0, sh(machine, "apk del --no-network bubblewrap").second)
+            val removed = plain(login(machine, "echo login-ok\nexit\n", ConsolePty.LOGIN_ROOT))
+            assertTrue(removed, removed.contains("\nlogin-ok\n"))
+            assertEquals(0, sh(machine,
+                "! apk info -e bubblewrap && test ! -e /var/cache/appine/bubblewrap"
+            ).second)
+        } finally {
+            Native.stop(machine)
+            store.deleteRecursively()
+        }
+    }
+
     /**
      * A restored tab starts in its original directory (the android/service map): root enters it if
      * it can; if the directory is gone, the home directory; a regular user enters as itself, and

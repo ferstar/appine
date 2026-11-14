@@ -1,7 +1,7 @@
 #!/bin/sh
 # Downloads and verifies the Alpine minirootfs (design doc §11.4) and the packages bundled with the
 # app (the android/setup map): doas, installed offline when a regular user first becomes the login
-# account (§11.1), and bash and procps-ng with their missing libraries, installed offline
+# account (§11.1), and bash, procps-ng and bubblewrap with their missing libraries, installed offline
 # at the first login of a system the app imported. The versions and
 # sha256s are fixed here and changed together on upgrades. Usage:
 # scripts/fetch-rootfs [output directory], target/rootfs by default. Prints the path of each
@@ -36,6 +36,8 @@ libproc2-4.0.6-r0.apk 2dd4249ead21043f3efbab320540df1545b3793ca63bca6e003f262d8b
 libintl-1.0-r0.apk d106a13e3e68103d3a8217406aae6186289baf352d0f3d10fc21938d2dd8adb1
 utmps-libs-0.1.3.3-r0.apk d6487b6f260728969191314f6706d4cc62527370e757ec3ac6f7fee8ed38cf88
 skalibs-libs-2.15.0.0-r0.apk 7ea58fb512067402b519079fcce8a48381eb2b9c690341c4a017aa15f719c198
+bubblewrap-0.12.0-r0.apk f38670cd16e15268ab2588c6b788d380fe219de74d6430f91d102c3df1652e87
+libcap2-2.78-r0.apk e13be383f18b1fcfe895361d816ff7cfd2b3c265e442bb371c4a234b29b0e4a9
 "
 packages_url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/main/aarch64
 

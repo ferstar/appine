@@ -22,7 +22,8 @@
 # cannot be installed (Ctrl-C, below), the login uses /bin/sh, and the next one tries again.
 # procps-ng and its libraries are staged at import in /var/cache/appine/procps. Any first login
 # installs them offline and removes the cache on success, so user removal is respected.
-# apk takes its database lock without waiting, so logins install the bundled packages (doas, bash, procps-ng)
+# bubblewrap and libcap follow the same rule, with their own /var/cache/appine/bubblewrap bundle.
+# apk takes its database lock without waiting, so logins install the bundled packages
 # one at a time, and while an apk the user runs holds the lock, a login says so and waits for it;
 # Ctrl-C then skips installing until the next login. Installing sudo waits for an apt the user runs
 # in the same way.
@@ -122,6 +123,17 @@ install_procps() {
     rm -rf "$procps_bundle"
 }
 
+# Independent of bash and procps; keep failed bundles for retry and respect later user removal.
+install_bubblewrap() {
+    bubblewrap_bundle=/var/cache/appine/bubblewrap
+    [ -d "$bubblewrap_bundle" ] || return 0
+    if ! apk info -e bubblewrap >/dev/null 2>&1; then
+        apk_add "$bubblewrap_bundle"/*.apk || return 1
+    fi
+    apk_add bubblewrap || return 1
+    rm -rf "$bubblewrap_bundle"
+}
+
 # apt-get update, its progress shown as usual. apt-get fails at once when another apt holds the lock
 # of the package lists (the user's, in another tab; DPkg::Lock::Timeout does not cover that lock),
 # so this then says so and tries again every two seconds until it gets through, or until Ctrl-C.
@@ -203,6 +215,11 @@ fi
 if [ -d /var/cache/appine/procps ]; then
     locked install_procps ||
         echo "appine: cannot install procps-ng now; Appine tries again at the next login" >&2
+fi
+
+if [ -d /var/cache/appine/bubblewrap ]; then
+    locked install_bubblewrap ||
+        echo "appine: cannot install bubblewrap now; Appine tries again at the next login" >&2
 fi
 
 case $want in

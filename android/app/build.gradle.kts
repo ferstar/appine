@@ -43,6 +43,12 @@ val procpsPackages: List<File>? = listOf(
     .takeIf { null !in it }
     ?.filterNotNull()
 
+/** bubblewrap and libcap, installed offline independently of the login shell. */
+val bubblewrapPackages: List<File>? = listOf("bubblewrap", "libcap2")
+    .map { newestFetched(Regex("""$it-\d.*\.apk""")) }
+    .takeIf { null !in it }
+    ?.filterNotNull()
+
 /** For example 3.24.3 → v3.24, written into apk's repository URLs. */
 val alpineBranch: String = rootfsTarball
     ?.name?.let { Regex("""alpine-minirootfs-(\d+)\.(\d+)\.""").find(it) }
@@ -126,6 +132,7 @@ val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
     doasPackage?.let { doas.set(it) }
     bashPackages?.let { bash.from(it) }
     procpsPackages?.let { procps.from(it) }
+    bubblewrapPackages?.let { bubblewrap.from(it) }
     outputDir.set(layout.buildDirectory.dir("generated/rootfs/assets"))
 }
 
@@ -190,7 +197,8 @@ abstract class CargoNdkTask : CargoTask() {
 /**
  * Puts the rootfs tarball into the assets (imported on first start, the android/setup map), the
  * doas package (for the login account) as `doas.apk`, and bash's packages (the login shell of the
- * systems the app imports) under `bash/`, and procps-ng with its libraries under `procps/`.
+ * systems the app imports) under `bash/`, procps-ng with its libraries under `procps/`, and
+ * bubblewrap with libcap under `bubblewrap/`.
  */
 abstract class RootfsAssetTask : DefaultTask() {
     @get:InputFile
@@ -206,6 +214,9 @@ abstract class RootfsAssetTask : DefaultTask() {
 
     @get:InputFiles
     abstract val procps: ConfigurableFileCollection
+
+    @get:InputFiles
+    abstract val bubblewrap: ConfigurableFileCollection
 
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
@@ -225,6 +236,8 @@ abstract class RootfsAssetTask : DefaultTask() {
         for (apk in bash) apk.copyTo(File(out, "bash/${apk.name}"))
         if (procps.isEmpty) throw GradleException("procps-ng packages not found: run scripts/fetch-rootfs first")
         for (apk in procps) apk.copyTo(File(out, "procps/${apk.name}"))
+        if (bubblewrap.isEmpty) throw GradleException("bubblewrap packages not found: run scripts/fetch-rootfs first")
+        for (apk in bubblewrap) apk.copyTo(File(out, "bubblewrap/${apk.name}"))
     }
 }
 

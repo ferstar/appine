@@ -39,7 +39,7 @@ class LicenseTest {
         assertFalse(titles.any { it.contains("Termux") })
         val alpine = text("Alpine Linux")
         assertTrue(alpine, Regex("""busybox \S+\s+License: GPL-2.0-only\s+aports: main/busybox at [0-9a-f]{40}""").containsMatchIn(alpine))
-        // The packages bundled beside it: doas, bash and procps-ng with their libraries
+        // The packages bundled beside it: doas, bash, procps-ng and bubblewrap with their libraries
         assertTrue(alpine, Regex("""\ndoas \S+\s+License: ISC\s""").containsMatchIn(alpine))
         assertTrue(alpine, Regex("""\nbash \S+\s+License: GPL-3.0-or-later\s+aports: main/bash at [0-9a-f]{40}""").containsMatchIn(alpine))
         assertTrue(alpine, alpine.contains("\nreadline ") && alpine.contains("\nlibncursesw "))
@@ -47,6 +47,8 @@ class LicenseTest {
             assertTrue(alpine, alpine.contains("\n$name "))
         }
         assertEquals(1, Regex("""\nlibncursesw """).findAll(alpine).count())
+        assertTrue(alpine, Regex("""\nbubblewrap \S+\s+License: LGPL-2.1-or-later\s+aports: main/bubblewrap at [0-9a-f]{40}""").containsMatchIn(alpine))
+        assertTrue(alpine, Regex("""\nlibcap2 \S+\s+License: BSD-3-Clause OR GPL-2.0-only\s+aports: main/libcap at [0-9a-f]{40}""").containsMatchIn(alpine))
         assertTrue(text("GNU Lesser General Public License 2.1").contains("Version 2.1, February 1999"))
         assertTrue(text("Android libraries").contains("androidx.core:core:"))
         assertTrue(text("Android libraries").contains("androidx.webkit:webkit:"))
