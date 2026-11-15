@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -15,6 +16,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -35,7 +37,7 @@ import kotlin.math.roundToInt
  * widened to eight columns, with Shift and SYM in the last. Until it is tapped again, SYM puts
  * shell symbols in place of every other key, without duplicating the first page's symbols.
  * A long press on SYM puts the function keys there instead, with Page Up and Down beside them
- * as on fn's layer of a laptop and Shift kept,
+ * as on fn's layer of a laptop and Shift kept in two-row mode,
  * until SYM is tapped or long-pressed again. SYM is under Shift as the symbol key of a phone
  * keyboard is and fn on a laptop, and on the edge next to the IME, where a stray tap turns the
  * whole page rather than silently shifting the IME's next letter.
@@ -55,6 +57,9 @@ import kotlin.math.roundToInt
  * 360 dp on. In a narrower view the last column stays at the right edge and the first seven scroll
  * sideways under it, fading out into the blank left of SHIFT while more of them lie beyond, as the
  * tab row fades out into ×.
+ * Wide windows and short landscape windows use one row, with ESC, TAB and the arrows first and
+ * CTRL, ALT, SHIFT and SYM fixed at the right. The symbols and function pages fix only SYM there, retaining
+ * the hidden modifiers' state; % ends the symbols' scrolling row. Cells never shrink below the minimum.
  *
  * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow,
  * Page Up or Page Down repeats it. Ctrl, Alt and Shift are one-shot modifiers: tapped, they apply
@@ -98,10 +103,12 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     )
 
     /**
-     * A page: the [grid] of its first seven columns, and the [last] key, above SYM (the first
-     * page's SHIFT on the function keys' page too). Only the page shown is in the view.
+     * A page's original rows, their single-row order, and the key above SYM in two-row mode.
+     * Only the page shown has its grid attached to the scroll view.
      */
-    private class Page(val grid: LinearLayout, val last: View)
+    private class Page(val grid: LinearLayout, val rows: List<List<View>>, val upperKey: View) {
+        var singleRowKeys = rows.flatten()
+    }
 
     private val ctrlKey = Modifier()
     private val altKey = Modifier()
@@ -113,6 +120,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
     /** The keys in the pages' grids (sized in [onMeasure]). */
     private val gridKeys = mutableListOf<View>()
+    private val presses = mutableListOf<Press>()
+    private var singleRow = false
 
     /** The page shown: [KEYS], [SYMBOLS] or [FUNCTIONS]. */
     private var shown = KEYS
@@ -127,15 +136,15 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     private val fadeIntoLast = (FADE_INTO_LAST_DP * density).toInt()
 
     /**
-     * The page shown, scrolled sideways when the view is too narrow for all eight columns. It runs
-     * under the last column to the view's end; its end padding, as wide as that column, lets the
-     * grid's last column scroll out from under it. While keys lie beyond the padding, the right
-     * fading edge hints that they scroll: a padding offset carries it into the blank left of SHIFT,
+     * The page shown, scrolled sideways when its keys do not fit. It runs under the fixed keys
+     * to the view's end; its end padding lets the grid's last key scroll out from under them.
+     * While keys lie beyond the padding, the right fading edge hints that they scroll:
+     * a padding offset carries it into the blank left of the first fixed key,
      * as the tab row's into ×.
      */
     private val scroll = object : HorizontalScrollView(context) {
         // It would take any sideways slide past the touch slop, cancelling the key under the
-        // finger, even with nothing to scroll (360 dp and wider)
+        // finger, even with nothing to scroll
         override fun onInterceptTouchEvent(e: MotionEvent) = scrolls() && super.onInterceptTouchEvent(e)
 
         override fun getLeftFadingEdgeStrength() = 0f
@@ -151,7 +160,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
         override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
             super.onLayout(changed, l, t, r, b)
-            // The part beside the last column: under it, the right edge keeps its gesture
+            // The part beside the fixed keys: under them, the right edge keeps its gesture
             excluded.set(0, 0, width - paddingRight, height)
             systemGestureExclusionRects = if (scrolls()) exclusion else emptyList()
         }
@@ -167,7 +176,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     }
 
     /**
-     * The last column, fixed at the right edge over the grid's end. Black but for its left part the
+     * The fixed keys at the right edge over the grid's end. Black but for their left part the
      * fade reaches into, so the keys under it are hidden; its keys fill it and take every touch on
      * it, a key showing through the fade too.
      */
@@ -220,27 +229,43 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
                 special("→", KeyEvent.KEYCODE_DPAD_RIGHT, repeats = true),
                 char("~"),
             ),
-            last = fixedView(modifier("SHIFT", shiftKey)),
+            upperKey = fixedView(modifier("SHIFT", shiftKey)),
         )
+        // Keep navigation within reach before the less frequent symbols and Home/End.
+        pages[KEYS].let { page ->
+            val (top, bottom) = page.rows
+            page.singleRowKeys = listOf(
+                top[0], bottom[0], bottom[3], bottom[5], top[4], bottom[4], // ESC TAB ← → ↑ ↓
+                top[1], top[2], top[3], top[5], top[6], bottom[6], // / - HOME END | ~
+            )
+        }
         // Keep bracket pairs together, $ and * on the left, and the shell control operators
         // & and ; in the rightmost grid column. The other symbols retain their positions.
-        page(chars("`$*=^\\&"), chars("[]{}<>;"), last = fixedView(char("%")))
+        page(chars("`$*=^\\&"), chars("[]{}<>;"), upperKey = fixedView(char("%")))
+        pages[SYMBOLS].let { page ->
+            page.singleRowKeys += page.upperKey
+            gridKeys.add(page.upperKey)
+        }
         // F1 to F12 in order, six to a row, then Page Up and Down, which fn's arrows type on a
-        // laptop and have no other place; SHIFT stays for the shifted function keys (mc's
-        // Shift+F4 and Shift+F6)
+        // laptop and have no other place. Two-row mode keeps SHIFT for shifted function keys
+        // (mc's Shift+F4 and Shift+F6); single-row mode uses the main page's selected modifiers.
         page(
             Array(6) { function(it) } + special("PGUP", KeyEvent.KEYCODE_PAGE_UP, repeats = true),
             Array(6) { function(it + 6) } + special("PGDN", KeyEvent.KEYCODE_PAGE_DOWN, repeats = true),
-            last = pages[KEYS].last,
+            upperKey = pages[KEYS].upperKey,
         )
+        pages[FUNCTIONS].let { page ->
+            val (top, bottom) = page.rows
+            page.singleRowKeys = top.take(6) + bottom.take(6) + listOf(top.last(), bottom.last())
+        }
         symView = fixedView(
             Key("SYM", longPress = { turnTo(if (shown == FUNCTIONS) KEYS else FUNCTIONS) }) {
                 turnTo(if (shown == KEYS) SYMBOLS else KEYS)
             },
         )
-        fixed.addView(symView)
+        arrangePages()
         turnTo(KEYS)
-        // Their widths are set in onMeasure: the scroll view's end padding and the last column's
+        // Their widths and the scroll view's end padding are set in onMeasure.
         addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         addView(fixed, LayoutParams(0, LayoutParams.WRAP_CONTENT, Gravity.END))
     }
@@ -260,10 +285,10 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     private fun function(index: Int) = special("F${index + 1}", KeyEvent.KEYCODE_F1 + index)
 
     /**
-     * A page: a row of the grid for each of [rows], of [COLUMNS] − 1 keys each, and [last], the
-     * view of the key above SYM.
+     * A page: a row of the grid for each of [rows], of [COLUMNS] − 1 keys each, and [upperKey],
+     * the view of the key above SYM in two-row mode.
      */
-    private fun page(vararg rows: Array<Key>, last: View) {
+    private fun page(vararg rows: Array<Key>, upperKey: View) {
         val grid = object : LinearLayout(context) {
             // Drawn here, inside the scroll view, the indicators scroll with the keys
             override fun dispatchDraw(canvas: Canvas) {
@@ -271,18 +296,50 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
                 indicateKeys(canvas, this)
             }
         }.apply { orientation = LinearLayout.VERTICAL }
-        for (keys in rows) {
+        val views = rows.map { keys ->
             check(keys.size == COLUMNS - 1)
-            val row = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-            for (key in keys) {
-                val view = keyView(key)
-                gridKeys.add(view)
-                // Its width is set in onMeasure
-                row.addView(view, LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT))
-            }
-            grid.addView(row, LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, rowHeight))
+            keys.map { key -> keyView(key).also { gridKeys.add(it) } }
         }
-        pages.add(Page(grid, last))
+        pages.add(Page(grid, views, upperKey))
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Choose the mode during measurement, with the new inset-adjusted width, not the old bounds.
+        requestLayout()
+    }
+
+    private fun updateLayoutMode(width: Int) {
+        val config = resources.configuration
+        val useSingleRow = width >= (SINGLE_ROW_WIDTH_DP * density).roundToInt() ||
+            (config.orientation == Configuration.ORIENTATION_LANDSCAPE && config.screenHeightDp <= COMPACT_HEIGHT_DP)
+        if (useSingleRow == singleRow) return
+        // Reuse the keys so the selected page and one-shot/locked modifiers survive resizing.
+        // Cancel delayed repeats before their keys move underneath a held finger.
+        presses.forEach { it.cancel() }
+        singleRow = useSingleRow
+        arrangePages()
+        show(pages[shown])
+        scroll.scrollTo(0, 0)
+        refresh()
+    }
+
+    /** Reparents existing keys only when the window changes between one and two rows. */
+    private fun arrangePages() {
+        fixed.removeAllViews()
+        for (page in pages) {
+            for (i in 0 until page.grid.childCount) (page.grid.getChildAt(i) as ViewGroup).removeAllViews()
+            page.grid.removeAllViews()
+        }
+        for (page in pages) {
+            for (keys in if (singleRow) listOf(page.singleRowKeys) else page.rows) {
+                val row = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+                for (key in keys) row.addView(key, LinearLayout.LayoutParams(0, rowHeight))
+                page.grid.addView(row, LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, rowHeight))
+            }
+        }
+        fixed.orientation = if (singleRow) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        column = 0
     }
 
     @SuppressLint("ClickableViewAccessibility") // Press calls performClick on release
@@ -297,7 +354,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
                 true
             }
         }
-        view.setOnTouchListener(Press(key, view))
+        view.setOnTouchListener(Press(key, view).also { presses.add(it) })
     }
 
     private fun label(text: String) = TextView(context).apply {
@@ -313,16 +370,24 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         keyView(key).apply { layoutParams = LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, rowHeight) }
 
     /**
-     * Puts [page] in the view in place of the one shown, its last key above SYM. Removing a key's
-     * view cancels its touch, so a key still held on the page going away stops repeating; SHIFT,
-     * on both the first page and the function keys', stays between them.
+     * Puts [page] in the view in place of the one shown, with its fixed keys. Removing a key's
+     * view cancels its touch, so a key still held on the page going away stops repeating. In
+     * two-row mode, SHIFT stays in place between the first page and the function keys' page.
      */
     private fun show(page: Page) {
         scroll.removeAllViews()
         scroll.addView(page.grid)
-        if (fixed.getChildAt(0) !== page.last) {
-            if (fixed.childCount > 1) fixed.removeViewAt(0)
-            fixed.addView(page.last, 0)
+        val fixedKeys = when {
+            !singleRow -> listOf(page.upperKey, symView)
+            shown == KEYS -> listOf(ctrlKey.view, altKey.view, shiftKey.view, symView)
+            else -> listOf(symView)
+        }
+        // Keep shared keys attached, especially SYM while its long press changes the page.
+        for (i in fixed.childCount - 1 downTo 0) {
+            if (fixed.getChildAt(i) !in fixedKeys) fixed.removeViewAt(i)
+        }
+        for ((index, key) in fixedKeys.withIndex()) {
+            if (key.parent !== fixed) fixed.addView(key, index)
         }
     }
 
@@ -346,14 +411,16 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     }
 
     /**
-     * Shares the width out among the [COLUMNS], each at least [MIN_COLUMN_DP] wide; the last
-     * column also takes the pixels left over. When the minimum wins, the grid is wider than the
-     * room beside the last column and scrolls under it.
+     * Uses eight columns in two-row mode and sixteen on every single-row page, each at least
+     * [MIN_COLUMN_DP] wide. SYM takes the rounding remainder; the shorter function page leaves
+     * room before it. When the minimum wins, the grid scrolls under the fixed keys.
      */
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val width = MeasureSpec.getSize(widthMeasureSpec)
+        updateLayoutMode(width)
         val min = (MIN_COLUMN_DP * density).roundToInt()
-        val c = max(min, width / COLUMNS)
+        val columns = if (singleRow) 2 * COLUMNS else COLUMNS
+        val c = max(min, width / columns)
         if (c != column) {
             column = c
             for (v in gridKeys) v.layoutParams.width = c
@@ -365,9 +432,20 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
                 for (i in 0 until page.grid.childCount) page.grid.getChildAt(i).forceLayout()
             }
         }
-        val last = max(min, width - (COLUMNS - 1) * c)
-        fixed.layoutParams.width = last
-        scroll.setPadding(0, 0, last, 0)
+        val last = max(min, width - (columns - 1) * c)
+        val fixedWidth = if (singleRow) c * (fixed.childCount - 1) + last else last
+        for (i in 0 until fixed.childCount) {
+            fixed.getChildAt(i).layoutParams.apply {
+                this.width = when {
+                    !singleRow -> LayoutParams.MATCH_PARENT
+                    i == fixed.childCount - 1 -> last
+                    else -> c
+                }
+                height = rowHeight
+            }
+        }
+        fixed.layoutParams.width = fixedWidth
+        scroll.setPadding(0, 0, fixedWidth, 0)
         super.onMeasure(widthMeasureSpec, heightMeasureSpec)
     }
 
@@ -407,6 +485,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
         /** The long-press timeout passed, then every [REPEAT_MS] while a repeating key is held. */
         override fun run() {
+            if (cancelled) return
             if (!held) {
                 held = true
                 keepTouch()
@@ -427,7 +506,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         private fun outside(e: MotionEvent) =
             e.x < -slop || e.y < -slop || e.x > view.width + slop || e.y > view.height + slop
 
-        private fun cancel() {
+        fun cancel() {
             cancelled = true
             view.removeCallbacks(this)
             view.background = null
@@ -498,6 +577,12 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
         /** The number of columns: seven in the grid and the fixed one. */
         private const val COLUMNS = 8
+
+        /** Use one row from this inset-adjusted width; keys scroll until all sixteen fit. */
+        private const val SINGLE_ROW_WIDTH_DP = 600
+
+        /** Narrow landscape windows also use one row when short. IME height does not choose the mode. */
+        private const val COMPACT_HEIGHT_DP = 480
 
         /** The narrowest a column gets, so eight fit in 360 dp. */
         private const val MIN_COLUMN_DP = 45f

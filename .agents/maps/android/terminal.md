@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: configurable tab-list button visibility and reclaimed tab-row space)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: single-row extra keys selected by available width or short landscape configuration, with state retained across resizing)
 
 ## Responsibilities
 
@@ -86,14 +86,18 @@ protected notification actions (`android/privacy`); the notices list and reader 
   and callbacks tied to sessions. `refreshStatus` diffs new reports only while open.
   `open` renders and reveals the current row without moving input focus; `render` updates an open
   list; `close` hides it and clears retained rows. The activity coordinates Back and accessibility.
-- `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
+- `ExtraKeysView` — adaptive extra keys, normally Termux's default keys widened to two rows of
+  eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
   SYM (`` ` ``, `$`, `*`, `=`, `^`, `\`, `&`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `;`: shell
   symbols absent from the first page, with bracket pairs together and `&` above `;` in the
   last scrolling column) and a third of function keys for every key but SHIFT and SYM (F1–F6,
-  PGUP; F7–F12, PGDN): a `Page` is a grid of the first seven columns and the key above
-  SYM; the grid shown is in a `HorizontalScrollView` across the view, the last column (SHIFT or `%`
-  over SYM) fixed over its end. It keeps CTRL, ALT and SHIFT (one-shot or locked; `shift` reads
+  PGUP; F7–F12, PGDN): a `Page` keeps its original rows, `singleRowKeys` order, grid and
+  `upperKey` (the key above SYM in two-row mode).
+  The grid shown is in a `HorizontalScrollView`, with fixed keys over its end: SHIFT or `%`
+  above SYM in two-row mode, CTRL/ALT/SHIFT/SYM beside it on the main page in single-row mode,
+  with only SYM fixed on that layout's symbols/function pages and `%` ending the symbols' row.
+  It keeps CTRL, ALT and SHIFT (one-shot or locked; `shift` reads
   false while the symbols are shown) and the page shown (`KEYS`, `SYMBOLS` or `FUNCTIONS`), exposes
   them with `modifiersUsed`, and sends keys, text and notices (a modifier locked) to a `Target`; a
   `Key` may have a `longPress` (the modifiers' lock, SYM's function keys); `Press` handles the
@@ -328,7 +332,9 @@ protected notification actions (`android/privacy`); the notices list and reader 
 
 ### Extra keys
 
-- Rows of 32 dp with 12 dp labels (not sp, so the system font scale leaves them as they are); the
+- Rows of 32 dp with 12 dp labels (not sp, so the system font scale leaves them as they are).
+  Below 600 dp available width, portrait windows retain two rows, as do landscape windows with
+  configuration height above 480 dp. In that layout, the
   eight columns share the width, each at least 45 dp (the last one takes the pixels left over), so
   they all fit from 360 dp on. Narrower, the first seven columns of both rows scroll sideways
   together under the finger (turning the page keeps the scroll position) and under the last, which
@@ -338,6 +344,24 @@ protected notification actions (`android/privacy`); the notices list and reader 
   started on, unless that key is already held, and with gesture navigation the scrolling part is
   excluded from the system's back gesture. With nothing to scroll the keys keep every touch and the
   edge its gesture. No lines are drawn between or around the keys.
+- An available width of at least 600 dp in either orientation, or landscape with configuration
+  `screenHeightDp <= 480`, uses one 32 dp row. `onMeasure` chooses the mode from its width
+  constraint after the root's system-bar/cutout/IME side padding; keyboard height does not choose
+  the mode. Configuration changes request measurement rather than choosing from old view bounds.
+  CTRL, ALT, SHIFT and SYM stay fixed at the right on the main page;
+  the symbols and function pages fix only SYM, hiding the modifiers without clearing their state.
+  SHIFT still waits on the symbols page but applies on the function page.
+  The main scrolling row is ESC, TAB, ←, →, ↑, ↓,
+  `/`, `-`, HOME, END, `|`, `~`; the symbols are the original scrolling top row followed by the
+  bottom row and `%`, so the scrolling region ends at SYM's left edge,
+  and the function page is F1–F12 followed by PGUP/PGDN. All keys remain available, each at least
+  45 dp wide; excess keys scroll under the fixed group with the same fade and gesture exclusion.
+  Every single-row page shares the width over 16 columns, with rounding remainder in SYM, so
+  key widths and SYM's bounds stay unchanged across pages. At 600–719 dp the main and symbol
+  pages still scroll because keys retain their 45 dp minimum. When 16 columns fit, the function page
+  leaves one column empty before SYM. Mode changes during measurement reparent existing key views, retaining the
+  selected page and modifier states, cancelling pending presses/repeats and resetting horizontal
+  scroll to the start when switching layouts. They do not recreate the terminal or its IME connection.
 - A key is shaded while pressed and acts when the finger lifts (with a key-click haptic), not at
   all if the finger left it by more than the touch slop. Held past the long-press timeout, the
   arrows, PGUP and PGDN repeat every 80 ms until the finger lifts or leaves the key (no act on
@@ -351,15 +375,17 @@ protected notification actions (`android/privacy`); the notices list and reader 
   locked"), or turns a locked one off. Keys go to `VtView.press` and `type`, which read the
   modifiers through the host and report when a key took them; that clears one-shot modifiers and
   leaves locked ones on.
-- A tap on SYM shows the symbols in place of every other key (`%` in place of SHIFT), and from
-  either other page shows the first again; a long press shows the function keys in place of
-  every key but SHIFT and SYM, and from them the first page again. A page stays, for any number
+- A tap on SYM shows the symbols, and from either other page shows the first again; a long press
+  shows the function keys, and from them the first page again. Two-row mode keeps `%` above SYM
+  with symbols and SHIFT above SYM with functions; single-row mode fixes only SYM on either page.
+  A page stays, for any number
   of keys, until SYM turns it; SYM's label takes the primary colour and the indicator while another
   page than the first is shown. The function keys and PGUP/PGDN go to `VtView.press` as their key
   codes, so the modifiers apply as on a keyboard (SHIFT, F5 sends `CSI 15;2~`). Turning the page
   leaves the modifiers as they are: CTRL and ALT apply to symbols and function keys too (CTRL,
-  SYM, `]` sends Ctrl+]), though they cannot be seen on those pages, while SHIFT waits on the
-  symbols page: it applies to no key, the symbols or the IME's, and a one-shot SHIFT is not used
+  SYM, `]` sends Ctrl+]); CTRL/ALT are hidden on both alternate pages, SHIFT also on the single-row
+  function page. SHIFT waits on the symbols page: it applies to no key, the symbols or the IME's,
+  and a one-shot SHIFT is not used
   up, so it applies again once another page is back. A key still held on the page going away is
   cancelled. The page lives as long as the view: a new activity starts on the first.
 
@@ -499,15 +525,19 @@ protected notification actions (`android/privacy`); the notices list and reader 
   to scroll, cancelling the child's touch; the extra keys' scroll view intercepts only when it can
   scroll, and a held key asks its parents not to intercept.
 - Android honours at most 200 dp of back-gesture exclusion on each edge of a window; the tab
-  bar's 32 dp, the scrolling extra keys' 64 dp and a selection handle at the edge leave room
+  bar's 32 dp, the scrolling extra keys' 32 or 64 dp and a selection handle at the edge leave room
   under it.
 - The column width is set on the keys' layout params during `ExtraKeysView.onMeasure`; the rows
   and the grids inside the scroll view are measured without a width limit, so they are forced to
   measure again whenever the column width changes, the pages not shown too (each keeps the flag
   until it is added back).
-- SHIFT's view is the last key of both the first page and the function keys' (a view has one
-  parent, and a `Modifier` one view), so turning between those pages leaves it in place in the
-  fixed column, and a SHIFT held meanwhile is not cancelled.
+- SHIFT's view is the `upperKey` of both the first page and the two-row function page (a view has
+  one parent, and a `Modifier` one view), so turning between those pages in two-row mode leaves
+  it in place and a SHIFT held meanwhile is not cancelled. In single-row mode both alternate
+  pages detach all modifier views while keeping their state. `show` selects an ordered list of
+  fixed keys and only removes/adds differing views, keeping SYM attached through its long press.
+  Layout changes first detach every
+  page's rows and the fixed group before reparenting shared keys; they cancel all presses but retain modifier state.
 - The indicators are drawn by the containers (the tab row, each page's grid, the fixed column) in
   `dispatchDraw`, over their labels, so a change of state must invalidate the container, not the
   label: `refresh` invalidates the shown grid and the fixed column (turning pages refreshes the
@@ -592,6 +622,26 @@ protected notification actions (`android/privacy`); the notices list and reader 
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- Single-row extra keys passed debug assembly/lint and API 34 checks at 360 × 640 dp: three pages,
+  scrolling to PGDN, input with Shift+F5 and locked Ctrl+], and page/modifier retention through
+  portrait/landscape changes, with and without the IME. The symbols page reclaimed 90 dp from hidden CTRL/ALT, kept
+  locked CTRL and one-shot ALT across rotation, sent Ctrl+] with CTRL hidden, and restored both
+  controls on the main page. Its scrolling `%` reached SYM's left edge and typed `%`;
+  rotation restored the fixed portrait placement and the scrolling landscape placement.
+  The single-row function page hid all three modifiers, preserved a preselected SHIFT across
+  rotation for Shift+F5, scrolled PGDN to SYM's edge and restored modifiers on the main page.
+  At 840 × 400 dp, all three pages had equal ordinary-key widths above the 45 dp minimum and
+  identical SYM bounds; the function page left exactly one key width before SYM.
+  After the layout cleanup, API 34 checks confirmed two rows at 599 dp and one at 600 dp, retaining
+  the symbols/function page across repeated resizing and preselected SHIFT for Shift+F5.
+  At 560 × 360 dp, short landscape used one row with left/right/up/down arrows; at 840 × 400 dp,
+  all three pages again shared key widths and SYM bounds, with the one-column gap on the function page.
+  A 600 dp-wide tall landscape display retained two rows after its side cutout reduced available
+  width; the narrow single-row symbols/function pages scrolled `%`/PGDN to SYM's left edge.
+  Hiding the IME retained the short-landscape mode.
+  Physical touch, TalkBack and rotation during a held repeat remain
+  unverified on real devices.
 
 - The tab-list visibility switch, saved choice across launches, reclaimed row space and live
   split-screen dismissal still need device checks; debug assembly and lint cover compilation/resources.
