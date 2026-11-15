@@ -232,7 +232,7 @@ internal object Rootfs {
 
             For example, install Codex:
             $packages update
-            $install nodejs npm
+            $install git nodejs npm
             npm install -g @openai/codex
 
             Report issues at:
