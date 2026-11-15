@@ -96,7 +96,7 @@ class TerminalService : Service() {
         /** The session list, a title or a state changed. */
         fun onSessionsChanged() {}
 
-        /** A program rang the bell in the tab in front ([inFront]). */
+        /** A bell or program notification requests haptic feedback in the tab in front ([inFront]). */
         fun onBell() {}
 
         /**
@@ -367,7 +367,7 @@ class TerminalService : Service() {
         }
 
         override fun onNotification(session: VtSession, title: String, body: String) {
-            if (!inFront(session)) notifications.program(session, title, body)
+            if (inFront(session)) each { it.onBell() } else notifications.program(session, title, body)
         }
 
         /**

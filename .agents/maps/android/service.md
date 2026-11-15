@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/android/service.md` for the paired decision history.
 >
-> Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
->
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
+> Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 
 ## Responsibilities
 
@@ -17,6 +15,7 @@ outlives an Activity:
 - all terminal sessions (`VtSession`s, `android/vt`), and restoring tabs after the process
   was killed (`Tabs`);
 - the ongoing notification and its actions, the wake lock, memory trimming;
+- bounded app diagnostics retention and archive export, independent of the service's lifetime;
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
   directories, too-long holds of the BKL) and turns them into tab messages, notifications and
   lifecycle actions, and the routing of what programs ask of the app (bells, notifications,
@@ -41,12 +40,13 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 - `TerminalService` — a same-process service; `onBind` returns a `LocalBinder` whose `service` is
   the service itself.
 - `Listener` — UI callbacks with no-op defaults, always on the main thread: `onProgress`,
-  `onMachineReady(error)`, `onSessionsChanged`, `onBell` (the tab in front), `onClipboardRead`
+  `onMachineReady(error)`, `onSessionsChanged`, `onBell` (haptics for a bell or program notification
+  in the tab in front), `onClipboardRead`
   (a program in the tab in front, the current one, asks to read the clipboard), `onTabStatus` (a
   tab's progress or program status changed), `onSettingsChanged`,
   `onOpenUrl` (guest browser request; true acknowledges Android accepted it), `onNotice`, `onRestarting`, `onExitAll` (sessions redraw their view themselves). Activities
   register in `onServiceConnected` and leave in `onStop`; "UI visible" means at least one listener
-  (Settings included).
+  (the Settings fragment included).
 - `worker` — a single-thread executor (`appine-worker`) for the calls that take a kernel handle
   and the BKL in the background (the poll's fetches, `setRoutes`, `consoleCwd`, `trimMemory` with
   the tabs' scrollback compression after it, `shutdown`, `stop`), together with what must stay
@@ -62,8 +62,11 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   finished, tmux's control mode detached, the shell finished).
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace, between letting go of the old kernel and starting the new one),
+  `booting` (boot work is outstanding), `destroyed` (late completions cannot restart the service),
   `pendingReplace` (a distro download that finished during a start or restart), `startError`,
   `progress`, `mirrorThread`.
+- `GuestActivity` — the last guest CPU sample and activity timestamp used by
+  the BUSY running policy; `RunPolicy` in `Settings` defines SLEEP, BUSY and ALWAYS.
 - `Notifications` — the service's notifications but the ongoing one, which the service builds
   itself: the channels, the stuck kernel, the last run's crash, boot failures, listens, kill
   reports and their "copy report" (the report text, receiver and authenticated action), and
@@ -73,6 +76,9 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   shows, while it shows one), `channelLocales` (the languages the channels were last named in).
   The service decides what is told (the tab in front, a message
   shown in the tab); `Notifications` builds, posts and cancels.
+- `Diagnostics` — process-local log/report retention and serialized archive export;
+  `DiagnosticFiles` owns synchronized rotation and snapshots, and `DiagnosticProvider` exposes
+  only generated share archives.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
   tier (default 1 in all builds), login, running policy and its remembered non-always choice,
   privacy mode (`privacy_mode`, default off), file access (`file_access`, default off and refused during privacy; old `system_documents` ignored), wide cells, the
@@ -189,7 +195,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   cancels a distro switch still downloading, removes the pending callbacks, clears saved tabs
   unless tabs of a killed run are still waiting to be restored, unregisters the network callback,
   releases the sessions, shuts a remaining kernel down on the worker (best effort), shuts the
-  worker down and releases the wake lock.
+  worker down and releases the wake lock. A start completing after destruction closes its browser
+  bridge and shuts its returned kernel handle down on a separate `appine-stop` thread.
 
 ### Wake lock and notification
 
@@ -269,7 +276,10 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 
 ### What programs ask of the app
 
-- `Privacy.locked` excludes the current tab from `inFront` and drops clipboard writes while locked or with no resumed page; clipboard reads then receive an empty answer. The terminal independently guards browser requests and input. Guest programs continue running.
+- With privacy mode enabled, `Privacy.locked` excludes the current tab from `inFront` and drops
+  clipboard writes while locked or with no resumed page; clipboard reads then receive an empty
+  answer. With privacy mode off this gate does not restrict delivery. The terminal independently
+  guards browser requests and input. Guest programs continue running.
 - `BrowserBridge` owns a random-port IPv4 loopback listener and per-kernel UUID capability.
   Start creates it before `ensureBrowser` writes the guest configuration; failed/abandoned starts,
   detach and service destruction close it. Closed endpoints cannot dispatch queued UI work.
@@ -277,7 +287,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   this endpoint. Guest AF_UNIX stays emulated (kernel/netns, kernel/unix).
 - Its single daemon worker reads two UTF-8 lines (token, URL), bounded to 64/8192 bytes and a
   2 s total read deadline. Only authenticated HTTP(S) URLs with a host and no controls or spaces
-  reach the main thread. The callback has a 2 s wait; expired queued work is cancelled.
+  reach the main thread. The callback has a 2 s wait; expired queued work is cancelled, but a
+  callback already executing is not interrupted.
   `onOpenUrl` succeeds only with a live kernel and a listener accepting it; MainActivity requires
   window focus and reports Android intent acceptance. The reply is `OK` or an ASCII `ERROR`.
   This is kernel-wide, with no originating-tab identity: any guest process may ask while the
@@ -285,7 +296,9 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 - A bell in the tab in front (`inFront`: it is `current` and `MainActivity` is a listener, so not
   another tab and not Settings in front) goes to the listeners' `onBell`; elsewhere it becomes the
   tab's notification, at most once a second per tab and alerting only once. An OSC 9 or OSC 777
-  notification becomes the tab's notification unless the tab is in front. A change of a tab's
+  notification uses the same `onBell` haptic feedback in the tab in front, sharing the view's
+  100 ms bell throttle and system touch-feedback setting; elsewhere it becomes the tab's
+  notification. A change of a tab's
   progress or program status goes to the listeners' `onTabStatus`; a program status that is
   blocked, done or failed (`Notifications.status`) becomes the tab's notification, once per status
   (the same record again posts nothing), unless the tab is in front, where done and error count as seen
@@ -344,7 +357,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 - `Privacy` owns authenticated mode changes without requiring a service binding: enabling clears file access, revokes grants and refreshes roots; disabling restores neither access nor grants. The service also refuses enabling file access while privacy is on.
 - Kill reports (one tab-separated line each: console, pid, command, `bug` or `oom`, and three
   fields: for a bug the kernel's report line, its log records and the unimplemented paths, for an
-  OOM kill the limit): written as `[appine] …` into the tab whose console with that number is open,
+  OOM kill the cgroup path (empty for the app-wide limit), usage and limit): written as
+  `[appine] …` into the tab whose console with that number is open,
   else the newest tab that had it (ended tabs keep their number, which the kernel hands to the next
   console), when the process had one (`VtSession.showMessage`, queued until a tab's terminal exists), in yellow above the cursor line
   (skipped on the alternate screen); a notification "<command> was killed" follows unless the
@@ -392,6 +406,11 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   language: `onConfigurationChanged` names them anew when the configuration's languages have
   changed and posts the ongoing notification again; the other notifications keep the language
   they were posted in. The bug report is in English whatever the language.
+- A newly created `terminal` channel enables the system's default notification vibration.
+  Existing channels retain their settings: Android does not apply new vibration defaults after
+  channel creation, so older installations need vibration enabled in system notification settings.
+  Notification permission, channel settings and Do Not Disturb govern background alerts; there
+  is no separate vibrator call. Foreground program notifications use view haptics instead.
 
 ## Dependencies (inbound / outbound)
 
@@ -415,9 +434,10 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 
 - Debug and release builds share the saved tier preference; a Tier 0 choice from an earlier
   debug install is also honoured by a release build when that preference is retained.
-- Calls that take the BKL in the background go through the single worker, so polls and saves are
+- Normal background kernel work goes through the single worker, so polls and saves are
   ordered before stop and shutdown; `Native.start` runs on `appine-start`, the boot calls on
-  `appine-boot`, a tab's console opening on the main thread. A stale kernel handle is harmless
+  `appine-boot`, a tab's console opening on the main thread. If destruction races a start,
+  its abandoned handle is shut down on `appine-stop`. A stale kernel handle is harmless
   (the JNI table no longer finds it). A call that must answer while the BKL is stuck (`bklStall`)
   must not take it and runs on the main thread.
 - Results of a poll other than changed directories are dropped if the kernel changed meanwhile
@@ -440,6 +460,10 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 
 ## Confirmed bugs / technical debt
 
+- **A layout hash collision can skip a tab-index update:** `Tabs.writtenLayout` compares only a
+  32-bit string hash, so different metadata with the same hash can retain the old index and save
+  time. Changing only cwd from `/Aa` to `/BB` with unchanged other fields is one such collision;
+  restore then uses the stale cwd. Artifact cleanup still follows the skipped index update.
 - **A kill report of a shell can reach a new tab:** when a tab's shell itself is killed and a tab
   opened within the next poll (2 s) gets the freed console number, the report goes to the new tab,
   whose console is open, rather than the ended one.
@@ -452,6 +476,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 
 ## To verify
 
+- Foreground program-notification haptics and background notification vibration on physical
+  devices, including touch feedback disabled, channel vibration disabled and Do Not Disturb.
 - Diagnostic retention, app-only capture, archive contents and provider confinement passed API 34
   instrumentation. Abrupt native-crash capture, real ANR/native trace attachments and vendor
   logcat availability remain unverified; unavailable logs/traces are described in the ZIP.
