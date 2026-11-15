@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: initialize the tab list’s themed fading scrollbar)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: size both bar and list tab numbers at 14 dp)
 
 ## Responsibilities
 
@@ -183,7 +183,7 @@ protected notification actions (`android/privacy`); the notices list and reader 
   navigation, the bar but for its buttons is excluded from the system's back gesture.
 - The indicator is a rounded bar 16 dp wide and 1 dp high in the primary colour, centred under the
   label with its top 4 dp below the baseline, in whole pixels rounded down; the row draws it over
-  its tabs. Labels are sized in dp (numbers 12 in the default weight, buttons 14) so the system
+  its tabs. Labels are sized in dp (numbers and buttons 14, in the default weight) so the system
   font scale leaves them as they are (dialogs, menus and toasts follow it).
 - The other tabs, while their shell runs, show what their programs report (`VtSession.progress`
   and `status`; the current tab has the terminal's progress line instead): progress in the
@@ -221,8 +221,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
 - Import announces "Import files". The four fixed controls reserve 128 dp at the end of the
   scrolling row; the fade still reaches into `×`. The list button reserves another 32 dp at the left.
 - The tab list overlays the terminal in the same activity window, without regridding it, on black
-  with no gap, margins, border, rounded corners or elevation. Rows are 32 dp, labels 12 dp for the
-  number and 14 dp for the title/close button; the current row uses primary text and ended titles
+  with no gap, margins, border, rounded corners or elevation. Rows are 32 dp, labels 14 dp for the
+  number, title and close button; the current row uses primary text and ended titles
   are faded and marked. At most ten rows fit, further limited by the terminal frame’s height;
   the list scrolls and opens with the current tab visible. Its themed vertical scrollbar appears
   while scrolling and fades afterward; no thumb is drawn when all rows fit. Titles use the bar’s `sh` fallback.

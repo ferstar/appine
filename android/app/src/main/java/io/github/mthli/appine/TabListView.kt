@@ -221,7 +221,7 @@ internal class TabListView(context: Context, private val target: Target) : Frame
 
     companion object {
         private const val MAX_VISIBLE_ROWS = 10
-        private const val NUMBER_DP = 12f
+        private const val NUMBER_DP = 14f
         private const val ENDED_ALPHA = 0.38f
     }
 }

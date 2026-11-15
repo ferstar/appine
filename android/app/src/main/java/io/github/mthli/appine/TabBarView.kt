@@ -486,7 +486,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         const val BAR_LABEL_DP = 14f
 
         /** The size of the tabs' numbers (dp, like [BAR_LABEL_DP]). */
-        private const val TAB_NUMBER_DP = 12f
+        private const val TAB_NUMBER_DP = 14f
 
         /**
          * How far the fade reaches into `×`, ending in the blank before its glyph; the rest of
