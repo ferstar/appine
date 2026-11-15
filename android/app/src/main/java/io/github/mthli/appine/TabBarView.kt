@@ -11,6 +11,7 @@ import android.graphics.RectF
 import android.graphics.drawable.InsetDrawable
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -450,7 +451,10 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, TAB_NUMBER_DP)
             gravity = Gravity.CENTER
             foreground = touchFeedback()
-            setOnClickListener { target.show(session) }
+            setOnClickListener {
+                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                target.show(session)
+            }
             setOnLongClickListener {
                 target.notice(title(session))
                 true
@@ -548,7 +552,10 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         gravity = Gravity.CENTER
         isFallbackLineSpacing = false
         background = touchFeedback()
-        setOnClickListener(onClick)
+        setOnClickListener {
+            it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            onClick(it)
+        }
     }
 
     /** A tab or a button: a square as tall as the bar. */

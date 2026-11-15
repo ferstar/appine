@@ -16,6 +16,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.text.SpannableStringBuilder
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.KeyboardShortcutGroup
 import android.view.KeyboardShortcutInfo
@@ -690,7 +691,9 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         }
         // Repeats follow the press: swallowed after a switch, else the volume keeps changing
         if (event.repeatCount > 0) return shortcutKey == event.keyCode
-        return Settings.volumeKeysSwitchTabs(this) && switchBy(delta)
+        if (!Settings.volumeKeysSwitchTabs(this) || !switchBy(delta)) return false
+        layout.screen.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        return true
     }
 
     // ---- Font preferences ----

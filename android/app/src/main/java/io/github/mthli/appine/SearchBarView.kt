@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -144,7 +145,10 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
         gravity = Gravity.CENTER
         isFallbackLineSpacing = false
         background = touchFeedback()
-        setOnClickListener(onClick)
+        setOnClickListener {
+            it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            onClick(it)
+        }
     }
 
     private fun item() = LayoutParams(dp(TabBarView.BAR_DP), ViewGroup.LayoutParams.MATCH_PARENT)

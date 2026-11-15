@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: encapsulate tab-list opening and cleanup in its view)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: add a key-click haptic after volume-key tab switches)
 
 ## Responsibilities
 
@@ -201,6 +201,9 @@ protected notification actions (`android/privacy`); the notices list and reader 
   slides the indicator there the same way (200 ms) from where it is drawn; only the row's first
   layout puts it in place at once. The numbers' colours change at once, and so do TalkBack's
   descriptions.
+- Clicking a tab or a fixed bar button requests `KEYBOARD_TAP` feedback before its action,
+  matching the extra keys' tap haptic. Feedback stays in the view's click listener, so Ctrl+Tab
+  and programmatic tab changes do not request it.
 - Tapping a tab shows it; a long press shows its title in a toast: the program's title (`sh` when
   it set none), with "(ended)" once the shell ended. The activity shows one toast at a time (a
   tab's title, a locked modifier, a link that cannot be opened), cancelling the previous one.
@@ -220,6 +223,7 @@ protected notification actions (`android/privacy`); the notices list and reader 
   the list scrolls and opens with the current tab visible. Titles use the bar’s `sh` fallback.
 - Tapping a list title selects the session and closes the list. Its close button uses the existing
   busy confirmation and leaves the list open, including when the current tab’s successor is shown.
+  Both click listeners request `KEYBOARD_TAP` feedback before their action, as the bar does.
   Session/title changes update visible rows and positional numbers without resetting scroll.
   The list button toggles it; an outside terminal tap dismisses and consumes that tap. Back, Escape,
   explicit tab switching, search, the other bar actions, extra-key input, pause and restart dismiss
@@ -276,6 +280,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
   the setting off, the press, its repeats and its release go to the system, which changes the
   volume; programs never get the volume keys either way (`VtView` leaves system keys alone). Open
   dialogs and the ⋮ menu are windows of their own, where the volume keys change the volume.
+- A successful volume-key switch requests `KEYBOARD_TAP` feedback through the terminal view,
+  matching the bars. Repeats, releases and presses left to system volume control do not request it.
 
 ### Finding text
 
@@ -297,6 +303,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
 - Tapping the terminal (or pressing a mouse on it) while the bar is open gives the keyboard back to
   the terminal and leaves the bar and its marks; the extra keys always go to the terminal, the
   bar's text focused or not.
+- The search bar's `↑`, `↓` and `×` click listeners request the same `KEYBOARD_TAP` feedback
+  as the tab bar and extra keys; Enter, Escape and the IME's Search action bypass those listeners.
 
 ### Extra keys
 
@@ -562,6 +570,9 @@ protected notification actions (`android/privacy`); the notices list and reader 
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- Bar/list clicks and volume-key tab switches use the extra keys' feedback constant; their physical
+  feel and device touch-feedback settings still need real-device verification.
 
 - Tab-list identity after removal, the bounded 50-tab layout and preserving editor focus passed
   three API 34 instrumentation cases; the focus case failed against the former requestFocus path. API 34 UI checks covered flush placement with the IME, live titles, busy/current and idle/

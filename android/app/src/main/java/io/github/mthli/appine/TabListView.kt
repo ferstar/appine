@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -163,8 +164,14 @@ internal class TabListView(context: Context, private val target: Target) : Frame
             select.contentDescription = context.getString(R.string.tab_description, entry.number, entry.title)
             close.contentDescription = context.getString(R.string.close_tab_description, entry.number, entry.title)
             // Never resolve clicks through a position that may have changed since binding.
-            select.setOnClickListener { target.show(entry.session) }
-            close.setOnClickListener { target.close(entry.session) }
+            select.setOnClickListener {
+                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                target.show(entry.session)
+            }
+            close.setOnClickListener {
+                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                target.close(entry.session)
+            }
         }
     }
 
