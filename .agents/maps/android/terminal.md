@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: enable default tab-list item animations with payload-based content updates)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: configurable tab-list button visibility and reclaimed tab-row space)
 
 ## Responsibilities
 
@@ -68,11 +68,11 @@ protected notification actions (`android/privacy`); the notices list and reader 
   without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
   shows the count it is given (`setCount`) and sends text changes, steps and closing to a
   `Target` (`search`, `step`, `close`).
-- `TabBarView` — the tab bar (`⧉` fixed at the left, a scrolling row of numbered tabs, with `×`, `+`, Import and `⋮` over its
+- `TabBarView` — the tab bar (optional `⧉` fixed at the left, a scrolling row of numbered tabs, with `×`, `+`, Import and `⋮` over its
   end): shows the sessions and the current one it is given (`render`) and sends taps on tabs and
   buttons, the ⋮ anchor and the titles long presses show to a `Target` (`show`, `closeCurrent`,
   `newTab`, `importFiles`, `menu`, `notice`, `listTabs`); `setImportEnabled` controls the import button;
-  `setListOpen` highlights the list button;
+  `setListOpen` highlights the list button; `setListVisible` changes its visibility and the row's start margin;
   it draws the other tabs' progress and status marks and redraws them
   on `refreshStatus`; `Tab` (one per session: its number in the row, which slides, rolls to a new
   number and fades out when closed); `TabNumber` (in its own file: the number, a `TextView`
@@ -135,7 +135,7 @@ protected notification actions (`android/privacy`); the notices list and reader 
   and removed), applies the saved Keep screen on choice (off by default), builds `TerminalLayout`
   (the status line says "Starting…", insets and IME animation are wired there), installs its root
   edge-to-edge; on Android 13 and later it asks for notification permission after the privacy gate opens. `onStart` applies the wide-cell
-  setting, starts and binds the service; `onServiceConnected` registers the listener and replays
+  and tab-list visibility settings through `onSettingsChanged`, starts and binds the service; `onServiceConnected` registers the listener and replays
   the start's result or progress and pending notices; `onStop` unregisters and unbinds.
 - When the kernel is ready the tab shown is, in order: one a notification asked for (`EXTRA_TAB`,
   from `onCreate` or `onNewIntent`; a tab closed meanwhile is skipped), the activity's own current
@@ -157,7 +157,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
 
 ### The tab bar
 
-- One 32 dp row in any window: `⧉` fixed in the leftmost 32 dp opens the tab list, with the
+- One 32 dp row in any window: `⧉`, shown by default and controlled by Settings' Terminal switch,
+  is fixed in the leftmost 32 dp and opens the tab list, with the
   scrolling tabs starting to its right, and `×` (closes the
   current tab; hidden while there is none), `+` (opens a session while the kernel runs, in the
   current tab's directory: its console's foreground group's, read from the kernel on the main thread
@@ -219,7 +220,11 @@ protected notification actions (`android/privacy`); the notices list and reader 
   current tab too, though only the other tabs draw marks), and the `×`, `+` and `⋮` buttons by
   name (`⋮` as "More options").
 - Import announces "Import files". The four fixed controls reserve 128 dp at the end of the
-  scrolling row; the fade still reaches into `×`. The list button reserves another 32 dp at the left.
+  scrolling row; the fade still reaches into `×`. The list button reserves another 32 dp at the left
+  only while shown. Hiding it uses `GONE` and removes the row's start margin; changing visibility
+  reveals the current tab after layout, and layout updates gesture exclusion to the new row bounds.
+  `MainActivity` reads `Settings.showTabList` on start and on live settings changes, closing an open
+  list before hiding its button, including while both activities are visible in split screen.
 - The tab list overlays the terminal in the same activity window, without regridding it, on black
   with no gap, margins, border, rounded corners or elevation. Rows are 32 dp, labels 14 dp for the
   number, title and close button; the current row uses primary text and ended titles
@@ -450,8 +455,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
 - android/vt: `VtSession` (`busy`, `cwd()`, `title`, `progress`, `status`, `describe`, `clear`,
   `reset`, `answerClipboardRead`); `ProgressLine` draws the tab's `Progress`.
 - `TerminalService` (`createSession`, with the current tab's directory for a new tab,
-  `removeSession`, `current`, `focus`, `sessions`), `Settings.fillWide` and
-  `volumeKeysSwitchTabs`; `Documents.fileLink`
+  `removeSession`, `current`, `focus`, `sessions`), `Settings.fillWide`,
+  `volumeKeysSwitchTabs` and `showTabList`; `Documents.fileLink`
   (android/documents).
 - `TerminalFiles` uses ContentResolver document streams, `Rootfs` account resolution/store lock,
   `Documents` naming/path helpers and `Native.browse*` for private copies into the home.
@@ -587,6 +592,9 @@ protected notification actions (`android/privacy`); the notices list and reader 
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- The tab-list visibility switch, saved choice across launches, reclaimed row space and live
+  split-screen dismissal still need device checks; debug assembly and lint cover compilation/resources.
 
 - Tab-list item animations and payload binding compile and pass lint. Device checks remain for
   content updates, removal and movement,

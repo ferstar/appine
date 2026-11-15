@@ -120,6 +120,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private lateinit var cursorStyle: ListPreference
     private lateinit var cursorBlink: SwitchPreferenceCompat
     private lateinit var volumeKeys: SwitchPreferenceCompat
+    private lateinit var tabList: SwitchPreferenceCompat
     private lateinit var licenses: Preference
 
     private val connection = object : ServiceConnection {
@@ -186,6 +187,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
         cursorBlink = toggle(R.string.settings_cursor_blink, TerminalService::setCursorBlink)
         volumeKeys = toggle(R.string.settings_volume_keys, TerminalService::setVolumeKeysSwitchTabs)
+        tabList = toggle(R.string.settings_show_tab_list, TerminalService::setShowTabList)
         // The license page includes the full text, copyright and warranty disclaimer.
         licenses = action(R.string.settings_licenses) {
             startActivity(Intent(requireContext(), LicensesActivity::class.java))
@@ -204,7 +206,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
 
         group(R.string.settings_group_system, distro, account, reset)
         group(R.string.settings_group_android, runPolicy, privacy, fileAccess)
-        group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
+        group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, tabList, volumeKeys)
         group(R.string.settings_group_debug, tier, export)
         group(R.string.settings_group_about, project, licenses, version)
         render()
@@ -460,7 +462,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         val s = service
         if (s == null) {
             for (row in listOf(distro, reset, account, tier, runPolicy, fileAccess, privacy,
-                fillWide, cursorStyle, cursorBlink, volumeKeys)) row.isEnabled = false
+                fillWide, cursorStyle, cursorBlink, volumeKeys, tabList)) row.isEnabled = false
             return
         }
         val running = s.machine != 0L
@@ -499,6 +501,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             true,
             s.volumeKeysSwitchTabs,
         )
+        tabList.set(getString(if (s.showTabList) R.string.tab_list_on else R.string.tab_list_off), true, s.showTabList)
         allowStateRestoration()
     }
 

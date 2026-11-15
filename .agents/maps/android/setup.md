@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: bash/zsh command titles and stock-profile migration)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: tab-list button visibility switch in Terminal settings)
 
 ## Responsibilities
 
@@ -51,7 +51,7 @@ session consuming their state and events (`android/vt`).
     back to it.
 - Preferences: file `rootfs`, owned here (`distro`); the `settings`
   file is android/service's `Settings` (`tier`, default 1 in all builds; `login`, `run_policy`, `idle_policy`,
-  `file_access`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`),
+  `file_access`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`, `show_tab_list`),
   which Settings shows through the service.
 - `SettingsActivity` — an `AppCompatActivity` hosting `SettingsFragment` (in the same file), a
   `PreferenceFragmentCompat` and `TerminalService.Listener`, on the Material 3 frame it shares
@@ -59,7 +59,7 @@ session consuming their state and events (`android/vt`).
   `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
   reset), Android (running policy, privacy mode, file access), Terminal (CJK characters filling two
-  cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (execution
+  cells, the cursor's shape, whether it blinks, tab-list button visibility, the volume keys switching tabs), Debugging (execution
   mode and diagnostic export, in all builds) and About (project website, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
   without a console with `--refresh-rules`.
@@ -362,9 +362,9 @@ session consuming their state and events (`android/vt`).
   - screen-off running (Allow sleep, Run while busy or Always run, with the selected policy's
     description; BUSY explains its 30 s idle grace and network/scheduled-work limitation),
   file access (outside privacy mode), CJK fill, cursor shape (Block, Bar or Underline, the summary
-    naming the current one), cursor blink (on by default) and the volume keys switching tabs (on
-    by default): usable at any time; the service gives every tab the new cursor values at once
-    (android/service), and the terminal reads the CJK and volume-key values itself
+    naming the current one), cursor blink, the volume keys switching tabs and showing the tab-list
+    button (all three on by default): usable at any time; the service gives every tab the new cursor values at once
+    (android/service), and the terminal reads the CJK, volume-key and tab-list visibility values itself
     (android/terminal).
 - About's project website shows `https://github.com/mthli/appine` as its summary and opens it
   with AndroidX `CustomTabsIntent`, without pinning a browser package. A browser without Custom

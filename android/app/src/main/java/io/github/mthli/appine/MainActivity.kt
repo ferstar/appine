@@ -157,8 +157,8 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     override fun onStart() {
         super.onStart()
-        // Settings may have changed it while this activity was stopped
-        layout.screen.setFillWide(Settings.fillWide(this))
+        // Settings may have changed while this activity was stopped
+        onSettingsChanged()
         val intent = Intent(this, TerminalService::class.java)
         startForegroundService(intent)
         bindService(intent, connection, BIND_AUTO_CREATE)
@@ -284,6 +284,9 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     /** Settings changed while this activity is visible too (split screen). */
     override fun onSettingsChanged() {
         layout.screen.setFillWide(Settings.fillWide(this))
+        val showTabList = Settings.showTabList(this)
+        if (!showTabList) closeTabList()
+        layout.tabBar.setListVisible(showTabList)
     }
 
     /**

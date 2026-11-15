@@ -1051,6 +1051,13 @@ class TerminalService : Service() {
         settingsChanged()
     }
 
+    val showTabList: Boolean get() = Settings.showTabList(this)
+
+    fun setShowTabList(on: Boolean) {
+        Settings.setShowTabList(this, on)
+        settingsChanged()
+    }
+
     val tier: Int get() = Settings.tier(this)
 
     /** The execution tier was changed in Settings: record it and restart the kernel. */

@@ -187,6 +187,9 @@
     <string name="settings_volume_keys">音量键切换标签页</string>
     <string name="volume_keys_on">音量加减键分别切换到前后标签页，单个标签页时调节音量</string>
     <string name="volume_keys_off">正常调节音量</string>
+    <string name="settings_show_tab_list">显示标签页列表按钮</string>
+    <string name="tab_list_on">显示在标签栏最左侧</string>
+    <string name="tab_list_off">不在标签栏中显示</string>
     <string name="documents_system">整个系统（只读）· %1$s</string>
     <plurals name="sessions_running">
         <item quantity="other">%d 个会话运行中</item>

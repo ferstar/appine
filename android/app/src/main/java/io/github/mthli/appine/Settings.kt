@@ -28,6 +28,7 @@ internal object Settings {
     private const val KEY_CURSOR_STYLE = "cursor_style"
     private const val KEY_CURSOR_BLINK = "cursor_blink"
     private const val KEY_VOLUME_KEYS_SWITCH_TABS = "volume_keys_switch_tabs"
+    private const val KEY_SHOW_TAB_LIST = "show_tab_list"
 
     // The cursor shapes as recorded, Ghostty's cursor-style values
     private const val CURSOR_BLOCK = "block"
@@ -138,4 +139,10 @@ internal object Settings {
 
     fun setVolumeKeysSwitchTabs(context: Context, on: Boolean) =
         prefs(context).edit { putBoolean(KEY_VOLUME_KEYS_SWITCH_TABS, on) }
+
+    /** Whether the tab bar shows its leftmost list button (on by default). */
+    fun showTabList(context: Context): Boolean = prefs(context).getBoolean(KEY_SHOW_TAB_LIST, true)
+
+    fun setShowTabList(context: Context, on: Boolean) =
+        prefs(context).edit { putBoolean(KEY_SHOW_TAB_LIST, on) }
 }

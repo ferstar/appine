@@ -20,11 +20,12 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.graphics.drawable.toDrawable
+import androidx.core.view.updateLayoutParams
 import io.github.mthli.appine.TabBarView.Companion.LEAVE_SCALE
 
 /**
  * The tab bar, one row in any window: a scrolling row of tabs, each a square with its number (a
- * long press shows its title), with `⧉` fixed at the left and `×` (closes the current tab), `+`,
+ * long press shows its title), with an optional `⧉` fixed at the left and `×` (closes the current tab), `+`,
  * Import and `⋮` over its end. Tabs fade into the left part of `×` while more lie beyond. Scrolled away from the
  * current tab, the row brings it back into view a few seconds after it comes to rest. When tabs
  * close, the ones after them slide into their places and then roll to their new numbers. The
@@ -263,6 +264,14 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     fun setListOpen(open: Boolean) {
         listButton.isSelected = open
         listButton.setTextColor(if (open) currentColor else mutedColor)
+    }
+
+    fun setListVisible(visible: Boolean) {
+        val visibility = if (visible) View.VISIBLE else View.GONE
+        if (listButton.visibility == visibility) return
+        listButton.visibility = visibility
+        scroll.updateLayoutParams<LayoutParams> { marginStart = if (visible) dp(BAR_DP) else 0 }
+        scroll.post { revealCurrentTab() }
     }
 
     /**

@@ -190,6 +190,9 @@
     <string name="settings_volume_keys">Volume keys switch tabs</string>
     <string name="volume_keys_on">Volume up: previous tab. Volume down: next tab. With one tab, adjust volume.</string>
     <string name="volume_keys_off">Adjust volume as usual.</string>
+    <string name="settings_show_tab_list">Show tab list button</string>
+    <string name="tab_list_on">Show at the left of the tab bar.</string>
+    <string name="tab_list_off">Hidden from the tab bar.</string>
     <string name="documents_home" translatable="false">%1$s · %2$s</string>
     <string name="documents_system">The whole system (read-only) · %1$s</string>
     <plurals name="sessions_running">

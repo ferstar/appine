@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/service.md` for the paired decision history.
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
+>
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: default-on tab-list button preference)
 
 ## Responsibilities
 
@@ -23,7 +25,7 @@ outlives an Activity:
   finish;
 - the settings state that the activities only display and forward (tier in all builds,
   screen-off running policy, login account, file access, CJK characters filling two cells, the cursor's
-  shape and blinking, whether the volume keys switch tabs, distro switch), the preferences
+  shape and blinking, whether the volume keys switch tabs, tab-list button visibility, distro switch), the preferences
   kept in `Settings`.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Notifications.kt`,
@@ -83,7 +85,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   tier (default 1 in all builds), login, running policy and its remembered non-always choice,
   privacy mode (`privacy_mode`, default off), file access (`file_access`, default off and refused during privacy; old `system_documents` ignored), wide cells, the
   cursor's shape (stored as Ghostty's names) and blinking, and whether the volume keys switch tabs
-  (on by default); `clearLogin` for a replaced store.
+  (on by default), and tab-list button visibility (`show_tab_list`, on by default);
+  `clearLogin` for a replaced store.
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`): `switching` is
   the active one, `downloader` the one whose thread has not ended yet.
 - `Tabs` — the `files/tabs/` store: `running` marker (the pid of the run that left it),
@@ -104,13 +107,13 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier`,
   `setRunPolicy`, `switchTo`/`cancelSwitch`/`canSwitch`,
   `setLogin`, `setFileAccess`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
-  `setVolumeKeysSwitchTabs`, `takeNotice`; state read by them: `machine`, `startError`,
+  `setVolumeKeysSwitchTabs`, `setShowTabList`, `takeNotice`; state read by them: `machine`, `startError`,
   `progress`, `switching`, `sessions`, `focus`, the settings.
 - Settings read without the service: `Settings.login` and `fileAccess` by `Documents`,
-  `Settings.fillWide` by `MainActivity` (in `onStart` and `onSettingsChanged`) and
+  `Settings.fillWide` and `Settings.showTabList` by `MainActivity` (in `onStart` and `onSettingsChanged`) and
   `Settings.volumeKeysSwitchTabs` by it at each volume key press; the service's getters read
-  `Settings` too, and its setters write it and act on the change (`setVolumeKeysSwitchTabs` only
-  tells the listeners).
+  `Settings` too, and its setters write it and act on the change (`setVolumeKeysSwitchTabs` and `setShowTabList` only
+  tell the listeners).
 - `setFileAccess` saves the gate, revokes all provider URI grants when disabling via
   `Documents.revokeAccess`, refreshes roots and tells listeners. Settings confirms before enabling.
 
