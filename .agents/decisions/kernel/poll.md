@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/poll"`
 >
-> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D6 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 >
@@ -57,7 +57,7 @@
 - **Why**: The retired design doc's multiplexing section described EPOLLET, nesting and exclusive wakeups but not the readiness contract, select semantics or signal-driven I/O permissions, and timerfd, which left kernel/vfs with inotify, AIO and loop devices, is an anonymous readiness file like eventfd.
 - **Tradeoffs**: The readiness sources stay in their own modules and are only described here as a contract, and timerfd's clocks, Expiry and worker belong to kernel/time, BKL and generic waits to kernel/process, and ProcEvent producers span kernel/procfs and kernel/cgroup.
 - **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them exclusive gates that ignore direction and order, epoll results lost on `EFAULT` and pipe `POLLOUT` counting bytes rather than buffers.
-- **Source**: c3df5d3, cc160c1 (bug list since updated by 09188ec, 4e64e74, ce8a9ce, f6a82cc and 5d7b936, and shortened by D4); cf029f9a; 8a17e4a9
+- **Source**: c3df5d3, cc160c1 (bug list since updated by 09188ec, 4e64e74, ce8a9ce, f6a82cc and 5d7b936, and shortened by D4); cf029f9a; 8a17e4a9; d053be24
 
 ### D8: select waits only for what its sets ask and clamps nfds to Linux's table size
 - **What**: nfds is clamped to an estimate of Linux's fd table size from the highest open fd (64, then 128 · 2^k), bits above it are neither read nor written back, only events in an fd's masks end the wait, and all three masks include `POLLNVAL` as native select does.

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/netns"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -64,12 +64,12 @@
 - **Watch out**: Wide UDP sockets must keep both paths usable.
 - **Source**: rounds 182 (`182-outer-prerouting`), 183 (`183-udp-wide-first`)
 
-### D9: Network namespaces, virtual devices, nftables and forwarding are one kernel/netns module
-- **What**: kernel/netns covers `netns.rs`, `netdev.rs`, `nft.rs`, `forward.rs` and `netconf.rs`, keeping the nftables control plane and its evaluation in one map.
-- **Why**: The retired design doc's network-namespace section summarised address translation, devices, nftables and forwarding in five bullets, without their isolation limits.
-- **Tradeoffs**: The module is large (about 10k lines) and its map is dense.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them no TUN/TAP device (so rootless podman's pasta and slirp4netns cannot start), per-key rate limits doing nothing, the initial namespace reaching containers' loopback sockets, same-port binds judged by host address, ephemeral ports aliasing explicit ones, connected UDP escaping namespace checks, nat drops becoming `EPERM`, dual-stack listeners not forwarded and route requests whose address sizes, gateway devices and next hops are checked unlike Linux 6.1's.
-- **Source**: c3df5d3 (bug list since updated by ce8a9ce, ac5da40, b43ff37 and 5d7b936)
+### D9: Network namespaces own packet paths and forwarding; nftables has its own module
+- **What**: kernel/netns owns netns.rs, netdev.rs, forward.rs and netconf.rs, including namespace packet paths and hook selection, while nft.rs rulesets and expression evaluation belong to kernel/nft.
+- **Why**: Separating independently maintained subsystems makes the oversized parent map practical to read and maintain.
+- **Tradeoffs**: Cross-boundary work follows child maps, while historical decisions keep their original parent tags and stable IDs.
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them no TUN/TAP device (so rootless podman's pasta and slirp4netns cannot start), per-key rate limits doing nothing, the initial namespace reaching containers' loopback sockets, same-port binds judged by host address, ephemeral ports aliasing explicit ones, connected UDP escaping namespace checks, nat drops becoming `EPERM`, dual-stack listeners not forwarded and route requests whose address sizes, gateway devices and next hops are checked unlike Linux 6.1's; these pre-split qualifications remain discoverable through the child maps and are not resolved by the ownership split.
+- **Source**: c3df5d3 (bug list since updated by ce8a9ce, ac5da40, b43ff37 and 5d7b936); 60790c14
 
 ### D10: `nft flush ruleset` flushes tables as Linux's `nf_tables_deltable` does
 - **What**: DELTABLE and DESTROYTABLE with family 0, or with neither a name nor a handle, remove every table of the family (all families for 0), only those with the given name if one is present, checked before the family validation; matching nothing succeeds.
@@ -105,3 +105,6 @@
 - **Tradeoffs**: The value is still only recorded, since ping sockets are handed to the host and Android allows all groups.
 - **Watch out**: Writers of IDs unmapped in their namespace now get `EINVAL`, as on Linux.
 - **Source**: 2aca260
+
+## Superseded
+- ~~D9 combined ownership of the newly extracted child modules~~ → replaced by **D9** in 60790c14 (2026-11-15; scope only, inherited implementation decisions remain here)

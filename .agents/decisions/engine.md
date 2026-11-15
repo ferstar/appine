@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D18 were seeded by hand from the retired design
+> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D18 were seeded by hand from the retired design
 > doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -137,9 +137,9 @@
 ### D19: The engine module is `core/engine` without the page table and TLB fill
 - **What**: engine covers instruction execution, translation, CPU features, the fault guard, C/Rust bindings and `tests/lockstep`, while page tables and TLB fill/flush belong to kernel/mmu; the translator points readers to `.agents/maps/engine.md`.
 - **Why**: The retired design doc's §4 was the only current-state description of the CPU engine and had drifted from the source (precise state, indirect-branch lookup, flush triggers, feature gating).
-- **Tradeoffs**: D1–D18 cite rounds rather than commits, and rounds keep § references to the deleted section.
+- **Tradeoffs**: D1–D18 cite rounds rather than commits, and rounds keep § references to the deleted section; host-vDSO CPU-feature dependencies belong to kernel/vdso.
 - **Watch out**: Bugs confirmed at the split stay open in the map, among them `ic ivau` on guest page 0 being lost, conditional-branch relinking racing a new thread and unallocated ID registers reading 0 where Linux delivers `SIGILL`.
-- **Source**: f9edf81 (bug list since updated by e5922b1, 6d1d9c0 and b43ff37); 44a21b (MMU split); 36083476; 20137e4c
+- **Source**: f9edf81 (bug list since updated by e5922b1, 6d1d9c0 and b43ff37); 44a21b (MMU split); 36083476; 20137e4c; d053be24; 60790c14
 
 ### D20: Engine files read in the order their code runs
 - **What**: lib.rs is sectioned into the page table, CPU state and exits, Tier 1 and process-wide calls (`Cpu::reset` after `tlb_flush`, as at execve); in tests a helper used by one test follows it and shared helpers follow all tests; lockstep's class functions follow the `CLASSES` table and its runner goes from its types through `run` and `run_class` to the helpers in call order.

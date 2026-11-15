@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -59,9 +59,9 @@
 ### D9: kernel/procfs owns synthetic filesystem views and cgroup node adapters
 - **What**: kernel/procfs owns pseudo.rs and shared synthetic-node contracts, while cgroup tree policy, interface behavior and device BPF belong to kernel/cgroup.
 - **Why**: Synthetic filesystem views and the substantial cgroup policy implementation need separate maintenance boundaries.
-- **Tradeoffs**: Adapter and policy changes require both maps, and pre-split cgroup decisions remain here under their original tags.
+- **Tradeoffs**: Adapter and policy changes require both maps, and pre-split cgroup decisions remain here under their original tags; tracing implementation belongs to kernel/ptrace while procfs memory-file handling remains here.
 - **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them per-thread fd views showing the leader's table, access checks under `task/<tid>` using the main thread's credentials, pagemap following the tid rather than the address space opened, writes that never advance a file's position, `/sys/class/net` statistics leaking the initial namespace's counters, partial change notifications, regeneration in the current reader's namespaces and no zoneinfo, pressure or kallsyms files.
-- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8); 45be9fae; 20137e4c; cf029f9a
+- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8); 45be9fae; 20137e4c; cf029f9a; d053be24; 60790c14
 
 ### D16: Common sysctls exist, and root can write the read-only ones
 - **What**: 40 recorded sysctls with 6.1's ranges are kept in `Kernel::sysctls`, with kernel.modprobe, kernel.tainted and vm.overcommit_memory (kernel/mm D24) handled on their own and kptr_restrict, drop_caches and mmap_rnd_bits given Linux's permissions; debug.exception-trace starts at arm64's 0 and is read through `recorded_value` by kernel/signal's unhandled-exception reports (kernel/signal D23), and writing 2 or 3 to drop_caches requests a FUSE node sweep while the host keeps the page cache (kernel/fuse D2).
@@ -167,7 +167,7 @@
 - **Why**: Multibyte tokens could panic the kernel, and quota-only updates lost the period.
 - **Tradeoffs**: Extra words and nonnumeric periods still fail where Linux’s sscanf can ignore them.
 - **Watch out**: Native comparison requires the container to expose and enable the CPU controller.
-- **Source**: 45be9fae; 20137e4c
+- **Source**: 45be9fae; 20137e4c; d053be24
 
 ## Superseded
 

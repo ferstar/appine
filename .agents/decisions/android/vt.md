@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/vt"`
 >
-> Last distilled: 2026-11-15 (HEAD = 221a89b1)
+> Last distilled: 2026-11-16 (HEAD = 5bd37526)
 >
 > Decisions on the tabs' sessions made before android/vt was split from android/terminal keep their `android/terminal` tags and live in `.agents/decisions/android/terminal.md`: D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49.
 
@@ -13,7 +13,7 @@
 - **Why**: The session map mixed Kotlin lifecycle with native protocol, parsing and locking details.
 - **Tradeoffs**: Session/native changes require both maps, while frame encoding and rendering stay in android/vtrender and interaction in android/vtview.
 - **Watch out**: Preserve callback threading, exactly-once console closing and snapshot-result contracts across the boundary.
-- **Source**: d42013d; 9015b244, 81f60bef
+- **Source**: d42013d; 9015b244, 81f60bef; d053be24
 
 ### D2: A tab keeps only the part of its transcript a save keeps
 - **What**: `transcriptText` takes the last `Tabs.MAX_TRANSCRIPT` characters, keeps them and returns them, so a kept and a fresh transcript of the same screen are the same string, and `Tabs` makes the constant `internal` for it while still cutting what it saves.
@@ -35,7 +35,7 @@
 - **Why**: Repeated numeric cursor definitions could drift.
 - **Tradeoffs**: Two frame-only values are not accepted by setCursor.
 - **Watch out**: Keep the numbers aligned with GhosttyCursorStyle and vt.c’s lock value.
-- **Source**: aaa1e7d5; 20137e4c
+- **Source**: aaa1e7d5; 20137e4c; d053be24
 
 ### D5: Fish and nushell use their own prompt marks and inherited environment
 
@@ -43,7 +43,7 @@
 - **Why**: The maps incorrectly grouped fish with unmarked shells and implied it needed environment injection.
 - **Tradeoffs**: Shells bypassing the profile show no motd, and nushell declares no tap-cursor behavior.
 - **Watch out**: Marks were observed in containers and environment propagation was verified by code, not in the app.
-- **Source**: a7d8c9f5; 20137e4c
+- **Source**: a7d8c9f5; 20137e4c; d053be24
 
 ### D6: Ash continuation parsing excludes background writer runs
 
@@ -51,7 +51,7 @@
 - **Why**: Long command rows and background job output otherwise incorrectly changed prompt state and busy/timing behavior.
 - **Tradeoffs**: Parsing depends on busybox row breaks and ONLCR, and taps above the resumed row after background output still count incorrectly.
 - **Watch out**: OSC/DCS strings are tracked but split CSI sequences remain a risk, old edited profiles keep I marks, and no-job-control writers cannot be distinguished by process group.
-- **Source**: a809c5a8, daab4446; 20137e4c
+- **Source**: a809c5a8, daab4446; 20137e4c; d053be24
 
 ### D7: Bash hooks move to a companion script without changing terminal parsing
 
@@ -59,7 +59,7 @@
 - **Why**: New Alpine bash defaults need prompt recognition and nested interactive-shell timing.
 - **Tradeoffs**: Nested bash depends on Alpine’s hook and remains unmarked on Debian.
 - **Watch out**: PROMPT_COMMAND replacement or edited profiles can prevent integration; broader prompt and redraw checks remain outstanding.
-- **Source**: 7aa817af; 20137e4c
+- **Source**: 7aa817af; 20137e4c; d053be24
 
 ### D8: Sessions expose a stable BROWSER launcher without transport state
 
@@ -67,7 +67,7 @@
 - **Why**: CLI discovery needs a conventional launcher independent of a tab's lifetime.
 - **Tradeoffs**: Programs may ignore or override BROWSER.
 - **Watch out**: A preserved custom launcher can behave differently from the Appine client.
-- **Source**: 8e211142
+- **Source**: 8e211142; d053be24
 
 ## Superseded
 - ~~Background output at an ash prompt ending input like Enter (a809c5a8)~~ → replaced by **D6** in daab4446 (2026-11-13)

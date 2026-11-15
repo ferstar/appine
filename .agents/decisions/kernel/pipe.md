@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/pipe"`
 >
-> Last distilled: 2026-11-15 (HEAD = 221a89b1)
+> Last distilled: 2026-11-16 (HEAD = 5bd37526)
 >
 > Pipe and splice decisions made before kernel/pipe was split from kernel/vfs keep their `kernel/vfs` tags and live in `.agents/decisions/kernel/vfs.md`: D31 and D54.
 
@@ -13,7 +13,7 @@
 - **Why**: Pipes and splice are Linux's `fs/pipe.c` and `fs/splice.c` and are changed on their own, and the vfs map was still 54.3 KB after overlay and locks left.
 - **Tradeoffs**: A splice into or out of a file or socket uses kernel/files's read and write paths, so such changes read both maps.
 - **Watch out**: Code that takes data out of a pipe without waiting for `wait_splice_done`, now that the rule lives here.
-- **Source**: 5f327de; ce193253 (module boundary); 20137e4c
+- **Source**: 5f327de; ce193253 (module boundary); 20137e4c; d053be24
 
 ### D2: splice and sendfile share directional support predicates
 
@@ -21,4 +21,4 @@
 - **Why**: One kind list incorrectly permitted reading `/dev/null` and writing `/dev/full` through splice.
 - **Tradeoffs**: Procfs and sysfs remain broadly treated as splice-capable, including per-process files Linux rejects.
 - **Watch out**: The `/dev/zero` and `/dev/full` read behavior follows native 6.8 and may differ from the 6.1 contract.
-- **Source**: 01bfd882; 20137e4c
+- **Source**: 01bfd882; 20137e4c; d053be24

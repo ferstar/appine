@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -81,9 +81,9 @@
 ### D14: kernel/process owns task execution, dispatch, the BKL, waits and accounting
 - **What**: kernel/process keeps tasks, dispatch, the BKL and watchdog, fast paths, waits, accounting and diagnostics; time and periodic checks belong to kernel/time, machine lifecycle and PID 1 to kernel/boot, with the existing exec, namespace, futex and credential boundaries retained.
 - **Why**: The process map still mixed task execution with independently maintained timers and boot policy after its earlier splits.
-- **Tradeoffs**: Shared-file boundaries remain explicit in the registry, cross-boundary changes require several maps, and earlier decisions keep their parent tags and IDs.
+- **Tradeoffs**: Shared-file boundaries remain explicit in the registry, cross-boundary changes require several maps, and earlier decisions keep their parent tags and IDs; vDSO construction belongs to kernel/vdso while clone and fast-dispatch integration remain here.
 - **Watch out**: Preserve fast_sleep deadline handover, BKL charging and vfork freezer accounting; sched_setattr still changes policy before validating nice and BKL-release wake-up matching still runs outside bug::catch, while the exited-leader CPU-clock debt is inherited by kernel/time.
-- **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53 and D54); cf029f9a, 8a17e4a9
+- **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53 and D54); cf029f9a, 8a17e4a9; d053be24; 60790c14
 
 ### D18: Process files read in the order their code runs
 - **What**: kernel.rs runs global state, the BKL and the syscall context before waiting and waking; syscall/proc.rs follows the module docs from clone and execve through exit and reaping to pidfds, unshare and sessions; `impl Machine` follows a machine's life; syscall/mod.rs puts dispatch first and the shared argument helpers last; the other files move single helpers after their callers, bug.rs and debug.rs included (the registry now puts debug.rs in kernel/signal).
@@ -168,7 +168,7 @@
 - **Why**: The retained TCP-filter path needs deterministic coverage on hosts that accept filters.
 - **Tradeoffs**: The hook persists until explicitly disabled.
 - **Watch out**: Tests must turn it off before later sockets in the same run.
-- **Source**: 52dcc177; 20137e4c
+- **Source**: 52dcc177; 20137e4c; d053be24
 
 ### D57: Guest CPU samples combine live and exited threads
 
@@ -176,7 +176,7 @@
 - **Why**: The screen-off policy needs guest activity without counting the UI or host polling.
 - **Tradeoffs**: Each sample takes the BKL and visits the live threads.
 - **Watch out**: An exit-stage panic can skip CPU credit, so consumers must compare changes rather than assume monotonicity.
-- **Source**: 1e5de64e; 20137e4c
+- **Source**: 1e5de64e; 20137e4c; d053be24
 
 ## Superseded
 

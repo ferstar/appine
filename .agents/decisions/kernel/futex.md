@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/futex"`
 >
-> Last distilled: 2026-11-15 (HEAD = 221a89b1)
+> Last distilled: 2026-11-16 (HEAD = 5bd37526)
 >
 > Futex decisions made before kernel/futex was split from kernel/process keep their `kernel/process` tags and live in `.agents/decisions/kernel/process.md`: D26, D44 and the futex halves of D32, D33 and D37.
 
@@ -13,4 +13,4 @@
 - **Why**: The process map was still 52.4 KB after exec and ns left, and futexes are self-contained, as Linux's `kernel/futex` is.
 - **Tradeoffs**: Fast-path waits and deadline handover stay in kernel/process, while Expiry and clock jumps belong to kernel/time, so timed futex changes read both maps.
 - **Watch out**: Low risk beyond the small map going stale.
-- **Source**: b320f8e; 8a17e4a9
+- **Source**: b320f8e; 8a17e4a9; d053be24

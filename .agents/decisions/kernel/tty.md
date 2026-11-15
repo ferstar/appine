@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -67,9 +67,9 @@
 ### D9: PTYs, the line discipline, job control and the host console are one kernel/tty module
 - **What**: kernel/tty covers `tty.rs`, `syscall/tty.rs` and `terminal.rs` (PTY pairs, the line discipline, termios2, packet mode, job control and the host console), while setsid/setpgid and exit-time signals stay in kernel/process and stop rules in kernel/signal.
 - **Why**: The retired design doc's §9 summarised the terminal layer in five bullets that missed its limits and differences from Linux.
-- **Tradeoffs**: Job control is split across three modules, and the map's Linux comparisons come from knowledge of the kernel sources rather than a checkout.
+- **Tradeoffs**: Job control is split across three modules, and the map's Linux comparisons come from knowledge of the kernel sources rather than a checkout; host CLI integration belongs to harness/cli and notice packaging to android/build.
 - **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them one slave write overshooting the output limit by its expansion, `TIOCSCTTY` returning 0 to a non-leader, `TIOCSPGRP` error codes, console input accepted after its session ended and `/dev/tty` and `/dev/console` reporting a pts device number instead of 5:0 and 5:1.
-- **Source**: 5d21cc4 (bug list since updated by 24ecd25, 4e64e74, 5d23297, 5d7b936, d9e1f0c, e5aae61 and ae1b507)
+- **Source**: 5d21cc4 (bug list since updated by 24ecd25, 4e64e74, 5d23297, 5d7b936, d9e1f0c, e5aae61 and ae1b507); 60790c14
 
 ### D10: TIOCGPGRP and TIOCGSID on a master skip the controlling-terminal check
 - **What**: On a master, TIOCGPGRP and TIOCGSID answer without the ctty check (no session is still `ENOTTY` for TIOCGSID, no foreground group reads 0) and TIOCNOTTY is always `ENOTTY`, while the slave keeps the check, as on Linux.
@@ -175,7 +175,7 @@
 - **Why**: Only the kernel can tell a background job’s bytes from shell output at a prompt.
 - **Tradeoffs**: Alternating writers shorten host reads and use a deque bounded by the 64 KiB output queue.
 - **Watch out**: Jobs without job control share the shell’s group, and a shell writing before reclaiming the terminal is classified as background; native interpretation belongs to android/vtcore.
-- **Source**: daab4446; 20137e4c; 81f60bef
+- **Source**: daab4446; 20137e4c; 81f60bef; d053be24
 
 ## Superseded
 

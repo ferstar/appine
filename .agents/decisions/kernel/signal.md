@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
 >
-> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D11 were seeded by hand from the retired design
+> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D11 were seeded by hand from the retired design
 > doc §7 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -85,12 +85,12 @@
 - **Watch out**: On Android the synthesized state is unsynchronized, which is the real state there (Android sets time with `settimeofday` and runs no kernel NTP adjustment).
 - **Source**: round 140 (`140-ioprio-syslog-adjtimex`)
 
-### D12: Signals, ptrace, core dumps, the kernel log and the ABI contract are one kernel/signal module
-- **What**: kernel/signal covers signal generation and delivery, frames and sigreturn, the vDSO, ptrace, core dumps, the kernel log, the Linux 6.1 ABI contract (uname, Linux's errno numbers, the ENOSYS policy and the count of unimplemented paths, clock setting) and the debug log and syscall trace, leaving host-side signal handling to engine, auxv to kernel/exec and virtual PID 1 power policy to kernel/boot while retaining signal call sites here.
-- **Why**: The retired design doc's §7 was the only current-state description of signals, ptrace, core dumps and the ABI contract, and it said nothing about generation and delivery semantics.
-- **Tradeoffs**: The project-wide ABI contract lives in a module map rather than a design section, rounds keep § references to the deleted section, and the harness map also lists the debug log's environment variables.
-- **Watch out**: Bugs confirmed at the split or found by Starnix's and gVisor's tests stay open in the map, among them an early `CLD_STOPPED`, late single-step reports, unforced ptrace reads, no `PTRACE_EVENT_EXIT` for threads ended by another thread, a repeated stop report after detaching at an attach-time group stop, `SIGILL` frames carrying an `esr_context` with EC 0 where Linux 6.1 emits none, and synthesized abort ESRs that differ from Linux's.
-- **Source**: 9e5be2b, d2b1dc3 (bug list since updated by 4e64e74, ce8a9ce, 5d7b936 and 7b7f73b, and shortened by D17–D21 and D25); 8a17e4a9
+### D12: Signal delivery and the Linux ABI remain separate from tracing and vDSO construction
+- **What**: kernel/signal owns signals, frames, restart, faults, core dumps, kernel logging and Linux ABI policy; tracing implementation belongs to kernel/ptrace and vDSO image construction to kernel/vdso, with integration call sites retaining their existing owners.
+- **Why**: Separating independently maintained subsystems makes the oversized parent map practical to read and maintain.
+- **Tradeoffs**: Cross-boundary work follows child maps, while historical decisions keep their original parent tags and stable IDs.
+- **Watch out**: Bugs confirmed at the split or found by Starnix's and gVisor's tests stay open in the map, among them an early `CLD_STOPPED`, late single-step reports, unforced ptrace reads, no `PTRACE_EVENT_EXIT` for threads ended by another thread, a repeated stop report after detaching at an attach-time group stop, `SIGILL` frames carrying an `esr_context` with EC 0 where Linux 6.1 emits none, and synthesized abort ESRs that differ from Linux's; these pre-split qualifications remain discoverable through the child maps and are not resolved by the ownership split.
+- **Source**: 9e5be2b, d2b1dc3 (bug list since updated by 4e64e74, ce8a9ce, 5d7b936 and 7b7f73b, and shortened by D17–D21 and D25); 8a17e4a9; d053be24; 60790c14
 
 ### D13: pidfd_send_signal through a `/proc/<tid>` directory signals the thread group
 - **What**: A `/proc/<tid>` directory fd finds its process with `group_of` and the signal goes to its tgid, as `kill_pid_info` does for such an fd up to Linux 6.8.
@@ -200,3 +200,4 @@
 ## Superseded
 
 - ~~vDSO time functions are `svc` stubs served without the BKL, with no vvar page (D4, rounds 25, 38)~~ → replaced by **D4** in 16364c0 (2026-11-08)
+- ~~D12 combined ownership of the newly extracted child modules~~ → replaced by **D12** in 60790c14 (2026-11-15; scope only, inherited implementation decisions remain here)
