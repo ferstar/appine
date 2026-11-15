@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/tabbar.md` for the paired decision history (not yet created; pre-split decisions D4, D18–D24, D27, the drawing half of D39, D51 and D54 stay in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: tab-list placement and dismissal above the extra keys)
 
 ## Responsibilities
 
@@ -29,7 +31,7 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 - `TabMarks` — shared progress/status drawing and accessible status text for the bar and list;
   draws over a direct child number, following its translation and opacity, and reports whether
   a sweep needs another frame. Each container owns the redraw scheduling.
-- `TabListView` — a full-width overlay at the top of the terminal frame, flush below the bar. Its
+- `TabListView` — a full-width overlay above the terminal and extra keys, flush below the bar. Its
   RecyclerView shows session numbers, single-line ellipsized titles and independent close buttons;
   immutable row snapshots (including progress and status) and stable session IDs keep updates
   and callbacks tied to sessions. `refreshStatus` diffs new reports only while open.
@@ -117,10 +119,10 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   reveals the current tab after layout, and layout updates gesture exclusion to the new row bounds.
   `MainActivity` reads `Settings.showTabList` on start and on live settings changes, closing an open
   list before hiding its button, including while both activities are visible in split screen.
-- The tab list overlays the terminal in the same activity window, without regridding it, on black
+- The tab list overlays the terminal and extra keys in the same activity window, without regridding it, on black
   with no gap, margins, border, rounded corners or elevation. Rows are 32 dp, labels 14 dp for the
   number, title and close button; the current row uses primary text and ended titles
-  are faded and marked. At most ten rows fit, further limited by the terminal frame’s height;
+  are faded and marked. At most ten rows fit, further limited by the combined terminal and extra-key height;
   the list scrolls and opens with the current tab visible. Its themed vertical scrollbar appears
   while scrolling and fades afterward; no thumb is drawn when all rows fit. Titles use the bar’s `sh` fallback.
   Every running row, including the current tab, draws the shared progress bar and status dot
@@ -137,10 +139,11 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   retain their animations. Partial binding compares the last bound snapshot with the latest entry,
   skipping unchanged labels and styling while refreshing marks and accessible descriptions.
   Empty payloads perform a full bind, including for recycled rows whose payloads were dropped.
-  The list button toggles it; an outside terminal tap dismisses and consumes that tap. Back, Escape,
+  The list button toggles it; a tap outside its rows over the terminal or extra keys dismisses
+  and consumes that tap. Back, Escape,
   explicit tab switching, search, the other bar actions, extra-key input, pause and restart dismiss
   it too. Touch opening and scrolling preserve terminal input focus and its IME connection;
-  the terminal is hidden from accessibility while the list is open. Closing restores terminal
+  the terminal and extra keys are hidden from accessibility while the list is open. Closing restores terminal
   focus only if a list control had it; close confirmations return focus to the terminal.
   It lives under the activity’s privacy shield and secure-window policy, rather than in a separate popup.
 
@@ -224,6 +227,12 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   looks like the current tab's indicator, told apart only by the numbers' colours.
 
 ## To verify
+
+- After moving the list above the extra keys, debug assembly and lint passed, and the three
+  existing TabListTest cases passed on API 34 and S23 API 36. API 34 checks confirmed rows cover
+  and receive taps over the keys in a short viewport, outside taps on the keys only dismiss,
+  and the terminal input connection survives opening the list and hiding the IME. TalkBack
+  traversal and frame-by-frame IME animation clipping remain unverified.
 
 - The tab-list visibility switch, saved choice across launches, reclaimed row space and live
   split-screen dismissal still need device checks; debug assembly and lint cover compilation/resources.

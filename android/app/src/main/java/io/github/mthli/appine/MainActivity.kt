@@ -461,6 +461,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         if (sessions.isEmpty()) return
         layout.tabList.open(sessions, current)
         layout.screen.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        layout.keys.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         layout.tabBar.setListOpen(true)
         closeTabListOnBack.isEnabled = true
     }
@@ -470,6 +471,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         val hadFocus = layout.tabList.hasFocus()
         layout.tabList.close()
         layout.screen.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        layout.keys.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
         layout.tabBar.setListOpen(false)
         closeTabListOnBack.isEnabled = false
         if (hadFocus) layout.screen.requestFocus()

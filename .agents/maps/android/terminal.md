@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: split tab controls, extra keys and retained file import into separate maps)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: raise the tab list above the terminal and extra keys)
 
 ## Responsibilities
 
@@ -41,7 +41,8 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   program may read the clipboard (`clipboardQuestion`).
 - `TerminalLayout` — builds the views with the activity's adapters after dynamic colours are
   applied: a black column of one bar's place (`TabBarView`, or `SearchBarView` while searching),
-  a frame with `VtView`, the status text, `ProgressLine` along its top and the `TabListView` overlay, and `ExtraKeysView`;
+  a shared overlay frame containing a column of the terminal body (`VtView`, status text and
+  `ProgressLine` along its top) and `ExtraKeysView`, with `TabListView` above that column;
   exposes the root and interactive views, keeps the status view private behind `showStatus` and
   `showTerminal`, and owns the IME animation callback `keysFollowIme`.
 - `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
@@ -109,6 +110,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   coordinates focus, Back and accessibility, and performs session/menu actions.
 - The list closes on tab switching, search, other bar actions, extra-key input, pause and restart;
   list close buttons retain it while using the existing busy confirmation.
+- The list overlays both the terminal and extra keys below the top bar; its rows may cover the
+  keys in short viewports. Taps outside its rows dismiss and are consumed, including over the keys.
+  Both the terminal and extra keys are hidden from accessibility while it is open.
 
 - The list’s close buttons, `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
   they close is busy (its shell has ended, has not started, as in a restored tab never shown, or
@@ -295,7 +299,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   as well as when it shows, so without a `WindowInsetsAnimation` callback the extra keys jump
   there at once. The keys rising with the IME are drawn inside the root's bottom padding, which
   already holds the IME's room, so the root must not clip to its padding (`clipToPadding` off) or
-  they stay hidden until they reach the terminal.
+  they stay hidden until they reach the terminal. The content column and shared overlay frame
+  also disable `clipChildren` so translated keys can pass their bottom edges; the tab list is
+  drawn after the column and stays above the keys wherever they overlap.
 - No activity handles `density`: every view is sized in dp when built. Settings and the license
   pages also recreate for dark mode (android/setup and android/licenses).
 - The privacy gate is android/privacy's. Keep checks at the final input and clipboard sinks,
@@ -326,6 +332,12 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- Tab-list coverage and hit routing over the extra keys passed API 34 checks in a short viewport;
+  a tap on exposed keys below a shorter list dismisses without activating the key. Opening the
+  list with the IME visible and then hiding the IME retained the terminal input connection.
+  Debug assembly and lint passed; frame-by-frame IME animation clipping and TalkBack traversal
+  after the hierarchy change remain unverified.
 
 - Bar/list clicks and volume-key tab switches use the extra keys' feedback constant; their physical
   feel and device touch-feedback settings still need real-device verification.

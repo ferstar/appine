@@ -59,7 +59,7 @@ internal class TerminalLayout(
         /** The IME animation being followed; an earlier one ending late leaves the keys alone. */
         private var following: WindowInsetsAnimationCompat? = null
 
-        /** The keys' bottom on screen before the change (relative to the root). */
+        /** The keys' bottom before the change, relative to the content column. */
         private var startBottom = 0f
 
         /** How far from their place the keys start: below it as the IME shows, above as it hides. */
@@ -114,6 +114,18 @@ internal class TerminalLayout(
             addView(screen)
             addView(status)
             addView(progressLine, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, context.line(), Gravity.TOP))
+        }
+        val content = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            // Let the keys follow the IME beyond this column's bottom edge.
+            clipChildren = false
+            addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(keys)
+        }
+        val overlay = FrameLayout(context).apply {
+            clipChildren = false
+            addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            // The list covers both the terminal and the keys, including during IME animation.
             addView(tabList, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         root = LinearLayout(context).apply {
@@ -122,8 +134,7 @@ internal class TerminalLayout(
             // The extra keys are drawn in the IME's room while they follow it up (keysFollowIme)
             clipToPadding = false
             addView(bars, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(keys)
+            addView(overlay, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         }
         // Leave room for the system bars, the display cutout and the IME. In landscape the
         // cutout can be at a side, over the terminal's first or last columns.
