@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: size both bar and list tab numbers at 14 dp)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: enable default tab-list item animations with payload-based content updates)
 
 ## Responsibilities
 
@@ -235,6 +235,11 @@ protected notification actions (`android/privacy`); the notices list and reader 
   busy confirmation and leaves the list open, including when the current tab’s successor is shown.
   Both click listeners request `KEYBOARD_TAP` feedback before their action, as the bar does.
   Session/title changes update visible rows and positional numbers without resetting scroll.
+  RecyclerView's `DefaultItemAnimator` retains its default settings. Content changes carry a
+  non-empty payload so it reuses the row without cross-fading; additions, removals and moves
+  retain their animations. Partial binding compares the last bound snapshot with the latest entry,
+  skipping unchanged labels and styling while refreshing marks and accessible descriptions.
+  Empty payloads perform a full bind, including for recycled rows whose payloads were dropped.
   The list button toggles it; an outside terminal tap dismisses and consumes that tap. Back, Escape,
   explicit tab switching, search, the other bar actions, extra-key input, pause and restart dismiss
   it too. Touch opening and scrolling preserve terminal input focus and its IME connection;
@@ -582,6 +587,11 @@ protected notification actions (`android/privacy`); the notices list and reader 
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- Tab-list item animations and payload binding compile and pass lint. Device checks remain for
+  content updates, removal and movement,
+  especially bottom-row removal while the short list's viewport shrinks, rapid closes and dismissal
+  during an animation.
 
 - Bar/list clicks and volume-key tab switches use the extra keys' feedback constant; their physical
   feel and device touch-feedback settings still need real-device verification.

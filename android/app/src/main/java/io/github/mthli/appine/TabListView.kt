@@ -14,6 +14,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.view.ViewCompat
+import androidx.recyclerview.widget.DefaultItemAnimator
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -46,7 +47,7 @@ internal class TabListView(context: Context, private val target: Target) : Frame
     private val list = RecyclerView(context).apply {
         layoutManager = manager
         adapter = rows
-        itemAnimator = null
+        itemAnimator = DefaultItemAnimator()
         setBackgroundColor(Color.BLACK)
         isVerticalScrollBarEnabled = true
         isScrollbarFadingEnabled = true
@@ -126,6 +127,8 @@ internal class TabListView(context: Context, private val target: Target) : Frame
                 override fun getNewListSize() = next.size
                 override fun areItemsTheSame(old: Int, new: Int) = previous[old].session === next[new].session
                 override fun areContentsTheSame(old: Int, new: Int) = previous[old] == next[new]
+                // A non-empty payload lets DefaultItemAnimator reuse the row without a cross-fade.
+                override fun getChangePayload(old: Int, new: Int) = Unit
             })
             items = next
             diff.dispatchUpdatesTo(this)
@@ -135,6 +138,8 @@ internal class TabListView(context: Context, private val target: Target) : Frame
         override fun getItemId(position: Int) = items[position].session.id.toLong()
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) = Row()
         override fun onBindViewHolder(holder: Row, position: Int) = holder.bind(items[position])
+        override fun onBindViewHolder(holder: Row, position: Int, payloads: MutableList<Any>) =
+            holder.bind(items[position], partial = payloads.isNotEmpty())
     }
 
     private inner class Row : RecyclerView.ViewHolder(LinearLayout(context)) {
@@ -189,15 +194,19 @@ internal class TabListView(context: Context, private val target: Target) : Frame
             }
         }
 
-        fun bind(entry: Entry) {
+        fun bind(entry: Entry, partial: Boolean = false) {
+            // Compare with the last bound snapshot so merged payloads use the latest state.
+            val previous = if (partial) this.entry else null
             this.entry = entry
-            number.text = "%d".format(entry.number)
-            title.text = entry.title
-            val color = if (entry.selected) primary else muted
-            number.setTextColor(color)
-            title.setTextColor(color)
-            select.isSelected = entry.selected
-            select.alpha = if (entry.running) 1f else ENDED_ALPHA
+            if (previous?.number != entry.number) number.text = "%d".format(entry.number)
+            if (previous?.title != entry.title) title.text = entry.title
+            if (previous?.selected != entry.selected) {
+                val color = if (entry.selected) primary else muted
+                number.setTextColor(color)
+                title.setTextColor(color)
+                select.isSelected = entry.selected
+            }
+            if (previous?.running != entry.running) select.alpha = if (entry.running) 1f else ENDED_ALPHA
             val status = marks.describe(entry.running, entry.progress, entry.status)
             select.contentDescription = if (status == null) {
                 context.getString(R.string.tab_description, entry.number, entry.title)
