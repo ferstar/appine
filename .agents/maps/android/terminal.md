@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: let the tab list cover the notification banner)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: dismissible notification banner and shared authorization from Settings)
 
 ## Responsibilities
 
@@ -14,7 +14,7 @@ terminals (`android/vtcore`), interaction (`android/vtview`) and rendering (`and
 It owns activity lifecycle, choosing/closing tabs, shortcuts, search UI, link routing, clipboard
 questions, insets and IME animation, plus shared UI helpers, strings and themes.
 
-Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `SearchBarView.kt` and `Ui.kt`
+Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `NotificationPermission.kt`, `SearchBarView.kt` and `Ui.kt`
 in `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/` except
 android/privacy's `layout/privacy_shield.xml`, `drawable/privacy_emblem.xml` and `drawable/ic_lock.xml`,
 and android/licenses' `layout/list_item.xml` and `values/ids.xml`.
@@ -46,6 +46,8 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   with `TabListView` above that column;
   exposes the root and interactive views, keeps the status view private behind `showStatus` and
   `showTerminal`, and owns the IME animation callback `keysFollowIme`.
+- `NotificationPermission` — shared notification availability, request history and system-settings
+  navigation for MainActivity and SettingsFragment; callers own their result launchers and visibility.
 - `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
   `startViewer`; keeps the activity and its toast callback, with no service or session state.
 - `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
@@ -143,24 +145,30 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ### Notification permission
 
-- `NotificationManager.areNotificationsEnabled()` controls a 32 dp banner below the top bar,
-  also while searching. The whole banner is a button with a centered, localized 14 dp message
-  explaining background activity and command alerts; the message ellipsizes in narrow windows. It uses the
-  theme's surface-container background, muted text, full-row touch feedback and a tap haptic.
-  The background layers the surface colour under `selectableItemBackground`, with Button's
-  background tint cleared. The former foreground ripple received pressed state but showed no
-  visible feedback on API 34; background-layer feedback was checked with held-touch screenshots.
-- Startup and privacy unlock never request permission. Tapping the banner checks the privacy gate and
-  closes the tab list. On Android 13+, a first request uses the activity-result API; a prior
-  attempt persisted as `requested_notifications`, or the system's denial rationale state,
-  routes to app notification settings. Android 11–12 also use settings when notifications are off.
-  On migration, an installation updated since its first install is treated as already requested,
-  since older versions asked at startup without saving history and may have a permanent denial.
-  A dismissed dialog also counts as an attempt; only another button click opens settings.
-- Settings uses `ACTION_APP_NOTIFICATION_SETTINGS` with `EXTRA_APP_PACKAGE`, falling back to
-  `ACTION_APPLICATION_DETAILS_SETTINGS` if the first activity is missing. The permission result
-  and every `onResume` refresh visibility, so enabling notifications removes the banner and
-  returns its space to the terminal. Individual disabled channels do not show the banner.
+- A 32 dp banner below the top bar, also while searching, appears when app notifications are
+  disabled and the user has not dismissed it. Its localized 14 dp message is start-aligned with
+  10 dp horizontal padding and fallback line spacing disabled. It ellipsizes in narrow windows
+  and fills the clickable space before a separate 32 dp close button.
+  Both buttons use background touch feedback with tint cleared over the container's surface colour,
+  muted text and tap haptics. The close button has a localized accessibility description.
+- Closing the banner persists `dismissed_notification_prompt` in MainActivity preferences;
+  recreating or relaunching the activity does not show it again. Closing does not request
+  permission or alter authorization history. The tab list hides both buttons from accessibility
+  while covering the banner through the existing container-level policy.
+- `NotificationPermission` shares the authorization flow between the banner and Settings' Android
+  notification action (android/setup). It retains `requested_notifications` in the original
+  `MainActivity` preference file, so requests from either page and prior versions share history.
+  Startup and privacy unlock never request permission. Tapping either entry checks the privacy gate.
+  On Android 13+, a first request uses the caller's activity-result launcher; a prior attempt
+  or the system's denial rationale state routes to app notification settings. Android 11–12 use
+  settings when notifications are off. An updated installation without request history is treated
+  as already requested, preserving older versions' possible permanent denial. A dismissed
+  permission dialog also counts as an attempt; only another tap opens settings.
+- Navigation uses `ACTION_APP_NOTIFICATION_SETTINGS` with `EXTRA_APP_PACKAGE`, falling back to
+  `ACTION_APPLICATION_DETAILS_SETTINGS` if the first activity is missing. Permission results and
+  `onResume` refresh each entry's visibility. Granting removes both entries; revoking restores the
+  Settings entry and restores the banner only if it was never dismissed. Individual disabled
+  channels do not show either entry.
 
 ### Extra-key integration
 
@@ -268,7 +276,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - android/vtview: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`,
   `shift` and `modifiersUsed`, `onLink`, `onSearchCount`).
 - android/setup and android/licenses use the shared page frame, themes and view helpers;
-  Settings also uses the preference switch widget. android/privacy uses the shared theme and helpers.
+  Settings also uses the preference switch widget and NotificationPermission authorization helper. android/privacy uses the shared theme and helpers.
 - android/privacy: `onPrivacyUnlocked` resumes deferred terminal UI work.
 
 ### Outbound
@@ -362,13 +370,13 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   The covered banner is excluded from the compressed accessibility tree; TalkBack speech remains
   unverified. Debug assembly and lint passed.
 
-- Notification permission passed debug assembly, lint and API 34 emulator checks: no startup
-  dialog, button-triggered request, denial followed by relaunch and settings navigation,
-  legacy permanent denial, dialog dismissal, and banner removal after granting in either place.
-  The full-width 32 dp row was checked visually and exposed as one clickable, focusable button;
-  taps on its text and right-side blank area both opened notification settings on API 34.
-  Vendor settings screens, the missing-handler fallback,
-  Android 11–12 and TalkBack remain unverified for this flow.
+- Notification permission and the dismissible banner: debug assembly and lint passed.
+  API 34 covered start-aligned layout, separate accessible close action, persisted dismissal
+  after relaunch/revocation, Settings first request and denial, system-settings grants and return,
+  shared banner routing, direct dialog grants and tab-list suppression of both banner actions
+  in the compressed accessibility tree. Held-touch screenshots confirmed feedback on each button.
+  Vendor settings screens, the missing-handler fallback, Android 11–12 and TalkBack remain
+  unverified for this flow.
 
 - Tab-list coverage and hit routing over the extra keys passed API 34 checks in a short viewport;
   a tap on exposed keys below a shorter list dismisses without activating the key. Opening the

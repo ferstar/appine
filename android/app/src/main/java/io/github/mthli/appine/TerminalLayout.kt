@@ -3,7 +3,6 @@ package io.github.mthli.appine
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.LayerDrawable
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
@@ -14,7 +13,6 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.core.graphics.drawable.toDrawable
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
@@ -33,6 +31,7 @@ internal class TerminalLayout(
     find: SearchBarView.Target,
     extraKeys: ExtraKeysView.Target,
     enableNotifications: () -> Unit,
+    dismissNotificationPrompt: () -> Unit,
 ) {
     val screen = VtView(context, host).apply {
         setFontSize(fontSize)
@@ -54,30 +53,40 @@ internal class TerminalLayout(
     val searchBar = SearchBarView(context, find).apply { isVisible = false }
     val keys = ExtraKeysView(context, extraKeys)
 
-    val notificationPrompt = Button(context).apply {
+    val notificationPrompt = LinearLayout(context).apply {
         isVisible = false
-        setText(R.string.notification_prompt)
-        setTextColor(context.themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant))
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14f)
-        typeface = Typeface.DEFAULT
-        isAllCaps = false
-        isSingleLine = true
-        ellipsize = TextUtils.TruncateAt.END
-        gravity = Gravity.CENTER
-        minWidth = 0
-        minimumWidth = 0
-        minHeight = 0
-        minimumHeight = 0
-        setPadding(context.dp(12), 0, context.dp(12), 0)
-        backgroundTintList = null
-        background = LayerDrawable(arrayOf(
-            context.themeColor(com.google.android.material.R.attr.colorSurfaceContainer).toDrawable(),
-            touchFeedback(),
-        ))
-        setOnClickListener {
-            it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-            enableNotifications()
+        orientation = LinearLayout.HORIZONTAL
+        setBackgroundColor(context.themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
+        fun button(action: () -> Unit) = Button(context).apply {
+            setTextColor(context.themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant))
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14f)
+            typeface = Typeface.DEFAULT
+            isAllCaps = false
+            isSingleLine = true
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 0)
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            backgroundTintList = null
+            background = touchFeedback()
+            setOnClickListener {
+                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                action()
+            }
         }
+        addView(button(enableNotifications).apply {
+            setText(R.string.notification_prompt)
+            ellipsize = TextUtils.TruncateAt.END
+            isFallbackLineSpacing = false
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(context.dp(10), 0, context.dp(10), 0)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+        addView(button(dismissNotificationPrompt).apply {
+            text = "×"
+            contentDescription = context.getString(R.string.notification_prompt_dismiss)
+        }, LinearLayout.LayoutParams(context.dp(32), ViewGroup.LayoutParams.MATCH_PARENT))
     }
 
     val root: LinearLayout

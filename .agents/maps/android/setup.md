@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: conditional notification authorization entry in the Android group)
 
 ## Responsibilities
 
@@ -21,7 +21,8 @@
   sources nobody has changed;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
   admin setup, installing the bundled bash, procps-ng and bubblewrap, and the NOPASSWD rules;
-- the settings screen, which only displays the service's state and forwards choices;
+- the settings screen, which displays service state and forwards choices, plus shared privacy
+  and notification authorization actions;
 - the store lock shared by the kernel start, store deletion and the Files provider.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
@@ -58,7 +59,7 @@ session consuming their state and events (`android/vt`).
   with android/licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
   `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
-  reset), Android (running policy, privacy mode, file access), Terminal (CJK characters filling two
+  reset), Android (notification authorization when disabled, running policy, privacy mode, file access), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, tab-list button visibility, the volume keys switching tabs), Debugging (execution
   mode and diagnostic export, in all builds) and About (project website, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
@@ -323,6 +324,13 @@ session consuming their state and events (`android/vt`).
 
 ### Settings
 
+- The Android group starts with an Enable notifications action only while app notifications are
+  disabled, regardless of whether the terminal banner was dismissed. It uses android/terminal's
+  `NotificationPermission` helper and shared request history: request once on Android 13+, then
+  open system notification settings. The action checks privacy and works without service binding.
+  The fragment refreshes visibility when creating preferences, after permission results and on
+  resume, including return from system settings. Granting removes it; revoking restores it.
+
 - Diagnostic export is independent of service binding and kernel readiness. Its protected dialog
   offers Save to file or Share. Both call `Privacy.requestLogExport` before generating a ZIP;
   privacy mode requires fresh authentication even when Settings is already unlocked.
@@ -350,7 +358,7 @@ session consuming their state and events (`android/vt`).
   results after stopping or a newer load. `onSettingsChanged` renders; `onProgress`, `onRestarting` and
   `onExitAll` finish the screen, so a switch, reset or restart goes back to the terminal, which
   shows the progress.
-- Every row reads the service's state and calls it:
+- Service-owned rows read the service's state and call it:
   - distro: usable during a switch (it then cancels the download, after a confirmation) or when a
     switch is possible, a start failure included; choosing another distro or Reset asks first;
   - login account: whenever a store is installed and no switch runs, with a toast naming the
@@ -376,9 +384,9 @@ session consuming their state and events (`android/vt`).
   without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
   The link can be built before publication, but the store listing is unavailable until published.
 - Service-dependent preferences are disabled before binding, on disconnect and on stopping;
-  diagnostic export, project website, licenses and version remain usable. All preferences have stable resource-name keys and persistence
+  notification authorization, diagnostic export, project website, licenses and version remain usable. All preferences have stable resource-name keys and persistence
   disabled: they render service values and their change listeners call service setters, never
-  writing a second preference store (privacy uses its shared authenticated controller). AndroidX manages row binding, disabled states and
+  writing a second preference store (privacy and notification authorization use shared controllers). AndroidX manages row binding, disabled states and
   accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
 - Login, running policy and cursor choices use `ChoiceDialog`, a `ListPreferenceDialogFragmentCompat` whose
   builder is `MaterialAlertDialogBuilder`: AndroidX keeps the entries, selection and dialog
@@ -411,7 +419,8 @@ session consuming their state and events (`android/vt`).
   proxy); `BuildConfig` (Alpine branch, app version and application ID); the assets; `TerminalService` and its
   `Listener` (Settings); `LicensesActivity` (android/licenses); android/privacy's mode changes,
   export authorization and dialog protection; Material Components and AndroidX (Settings),
-  including AndroidX Browser for the project website.
+  including AndroidX Browser for the project website; android/terminal's NotificationPermission
+  for shared authorization history and settings navigation.
 
 ## Invariants and gotchas
 
@@ -486,6 +495,11 @@ session consuming their state and events (`android/vt`).
   deleted?
 
 ## To verify
+
+- Notification authorization passed debug assembly, lint and API 34 checks: visibility after
+  banner dismissal, first request, denial then system settings, and removal after granting in
+  system settings and returning or directly in the permission dialog. Android 11–12, vendor
+  settings and TalkBack remain unverified.
 
 - Two shell-title tests and two existing bash/ash prompt/login tests passed on API 34, including
   bash command titles, pipelines, literal/control text, history fallback, status preservation and

@@ -113,6 +113,10 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             saveLogs(archive, uri)
         }
     }
+    private lateinit var notifications: Preference
+    private val requestNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        updateNotifications()
+    }
     private lateinit var runPolicy: ListPreference
     private lateinit var fileAccess: SwitchPreferenceCompat
     private lateinit var privacy: SwitchPreferenceCompat
@@ -159,6 +163,11 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             setSummary(R.string.export_logs_summary)
             isEnabled = !logSave.pending
         }
+        NotificationPermission.initialize(requireContext())
+        notifications = action(R.string.settings_notifications) {
+            NotificationPermission.enable(requireActivity(), requestNotifications)
+        }.apply { setSummary(R.string.notification_prompt) }
+        updateNotifications()
         runPolicy = choice(R.string.settings_run_policy) { s, value ->
             s.setRunPolicy(RunPolicy.entries.first { it.value == value })
         }.apply {
@@ -205,7 +214,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
 
         group(R.string.settings_group_system, distro, account, reset)
-        group(R.string.settings_group_android, runPolicy, privacy, fileAccess)
+        group(R.string.settings_group_android, notifications, runPolicy, privacy, fileAccess)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, tabList, volumeKeys)
         group(R.string.settings_group_debug, tier, export)
         group(R.string.settings_group_about, project, licenses, version)
@@ -245,6 +254,15 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         val intent = Intent(context, TerminalService::class.java)
         context.startForegroundService(intent)
         context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateNotifications()
+    }
+
+    private fun updateNotifications() {
+        notifications.isVisible = !NotificationPermission.enabled(requireContext())
     }
 
     private fun chooseLogExport() {
