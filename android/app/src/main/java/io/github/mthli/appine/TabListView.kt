@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Canvas
 import android.graphics.Color
 import android.text.TextUtils
 import android.util.TypedValue
@@ -33,10 +34,13 @@ internal class TabListView(context: Context, private val target: Target) : Frame
         val title: String,
         val running: Boolean,
         val selected: Boolean,
+        val progress: VtSession.Progress?,
+        val status: VtSession.Status?,
     )
 
     private val muted = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
     private val primary = themeColor(androidx.appcompat.R.attr.colorPrimary)
+    private val marks = TabMarks(context)
     private val rows = Rows()
     private val manager = LinearLayoutManager(context)
     private val list = RecyclerView(context).apply {
@@ -45,6 +49,8 @@ internal class TabListView(context: Context, private val target: Target) : Frame
         itemAnimator = null
         setBackgroundColor(Color.BLACK)
         isVerticalScrollBarEnabled = true
+        isScrollbarFadingEnabled = true
+        verticalScrollbarThumbDrawable = context.themeDrawable(android.R.attr.scrollbarThumbVertical)
         isFocusableInTouchMode = false
     }
 
@@ -75,10 +81,20 @@ internal class TabListView(context: Context, private val target: Target) : Frame
                 title = if (running) title else context.getString(R.string.tab_ended, title),
                 running = running,
                 selected = session === current,
+                progress = session.progress,
+                status = session.status,
             )
         }
         rows.replace(next)
         requestLayout()
+    }
+
+    /** Update immutable reports without moving the list or rebuilding unchanged rows. */
+    fun refreshStatus() {
+        if (visibility != VISIBLE) return
+        rows.replace(rows.items.map { entry ->
+            entry.copy(progress = entry.session.progress, status = entry.session.status)
+        })
     }
 
     /** Hide the list and drop references to sessions other controls may later close. */
@@ -122,13 +138,22 @@ internal class TabListView(context: Context, private val target: Target) : Frame
     }
 
     private inner class Row : RecyclerView.ViewHolder(LinearLayout(context)) {
+        private var entry: Entry? = null
         private val number = label(NUMBER_DP).apply { gravity = Gravity.CENTER }
         private val title = label(TabBarView.BAR_LABEL_DP).apply {
             gravity = Gravity.CENTER_VERTICAL
             ellipsize = TextUtils.TruncateAt.END
             setPadding(0, 0, dp(8), 0)
         }
-        private val select = LinearLayout(context).apply {
+        private val select = object : LinearLayout(context) {
+            override fun dispatchDraw(canvas: Canvas) {
+                super.dispatchDraw(canvas)
+                val shown = entry ?: return
+                if (shown.running && marks.draw(canvas, this, number, shown.progress, shown.status)) {
+                    postInvalidateOnAnimation()
+                }
+            }
+        }.apply {
             orientation = LinearLayout.HORIZONTAL
             background = touchFeedback()
             isFocusable = true
@@ -151,9 +176,21 @@ internal class TabListView(context: Context, private val target: Target) : Frame
                 addView(select, LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f))
                 addView(close, square())
             }
+            // Use the bound session even when adapter positions change before the next bind.
+            select.setOnClickListener {
+                val session = entry?.session ?: return@setOnClickListener
+                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                target.show(session)
+            }
+            close.setOnClickListener {
+                val session = entry?.session ?: return@setOnClickListener
+                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                target.close(session)
+            }
         }
 
         fun bind(entry: Entry) {
+            this.entry = entry
             number.text = "%d".format(entry.number)
             title.text = entry.title
             val color = if (entry.selected) primary else muted
@@ -161,17 +198,14 @@ internal class TabListView(context: Context, private val target: Target) : Frame
             title.setTextColor(color)
             select.isSelected = entry.selected
             select.alpha = if (entry.running) 1f else ENDED_ALPHA
-            select.contentDescription = context.getString(R.string.tab_description, entry.number, entry.title)
+            val status = marks.describe(entry.running, entry.progress, entry.status)
+            select.contentDescription = if (status == null) {
+                context.getString(R.string.tab_description, entry.number, entry.title)
+            } else {
+                context.getString(R.string.tab_description_status, entry.number, entry.title, status)
+            }
+            select.invalidate()
             close.contentDescription = context.getString(R.string.close_tab_description, entry.number, entry.title)
-            // Never resolve clicks through a position that may have changed since binding.
-            select.setOnClickListener {
-                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                target.show(entry.session)
-            }
-            close.setOnClickListener {
-                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                target.close(entry.session)
-            }
         }
     }
 

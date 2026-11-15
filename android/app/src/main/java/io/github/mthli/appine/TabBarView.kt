@@ -5,9 +5,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
 import android.graphics.Rect
-import android.graphics.RectF
 import android.graphics.drawable.InsetDrawable
 import android.util.TypedValue
 import android.view.Gravity
@@ -21,10 +19,8 @@ import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.core.graphics.ColorUtils
 import androidx.core.graphics.drawable.toDrawable
 import io.github.mthli.appine.TabBarView.Companion.LEAVE_SCALE
-import kotlin.math.roundToInt
 
 /**
  * The tab bar, one row in any window: a scrolling row of tabs, each a square with its number (a
@@ -94,8 +90,6 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     /** Brings the current tab back into view a while after the row was scrolled away from it. */
     private val returnToCurrentTab = Runnable { revealCurrentTab() }
 
-    private val density = resources.displayMetrics.density
-
     // On black like the terminal; the theme's colours, from the wallpaper on Android 12 and later,
     // as the extra keys'
 
@@ -106,16 +100,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     private val currentColor = themeColor(androidx.appcompat.R.attr.colorPrimary)
     private val indicatorPaint = ExtraKeysView.indicatorPaint(currentColor)
 
-    // The other tabs' marks ([drawMarks]): their progress in the colours of the terminal's
-    // progress line, and a dot for a status
-    private val progressColors = ProgressLine.Colors(context)
-    private val errorColor = themeColor(androidx.appcompat.R.attr.colorError)
-    private val markPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val markBounds = RectF()
-
-    /** Where a digit's ink lies around its baseline, for the dot's height (empty until drawn). */
-    private val digitBounds = Rect()
+    private val marks = TabMarks(context)
 
     /**
      * The tabs, with the current one's indicator and the others' marks drawn over them, as the
@@ -375,66 +360,16 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         row.invalidate()
     }
 
-    /**
-     * Draws the marks of the tabs not shown (the one shown has the indicator, and the terminal its
-     * progress line), for a running program that reported its progress (OSC 9;4) or status
-     * (OSC 7501): its progress where the indicator goes, as a short track filled to the percentage
-     * or with a part sweeping across (progress reports, and working statuses; blocked ones with a
-     * percentage), and a dot at the top right of the number for a status that needs the user or
-     * has news: blocked in the primary colour, failed in the error colour, done in the muted one
-     * until the tab is seen. They follow a sliding tab and fade with its number. Returns whether
-     * one moves (a sweep).
-     */
+    /** Background tabs keep their marks separate from the current tab's selection indicator. */
     private fun drawMarks(canvas: Canvas): Boolean {
         var moving = false
         for (tab in rowTabs) {
             val session = tab.session
             if (session === current || !session.isRunning) continue
-            val view = tab.view
-            val progress = session.progress
-            val status = session.status
-            // The progress line's state and fraction (negative: a sweep), the state -1 for none
-            var state = -1
-            var fraction = 0f
-            when {
-                progress != null -> {
-                    state = progress.state
-                    fraction = ProgressLine.fractionOf(progress)
-                }
-                status?.state == VtSession.STATUS_WORKING -> {
-                    state = VtSession.PROGRESS_SET
-                    fraction = if (status.percent >= 0) status.percent / 100f else -1f
-                }
-                status?.state == VtSession.STATUS_BLOCKED && status.percent >= 0 -> {
-                    state = VtSession.PROGRESS_SET
-                    fraction = status.percent / 100f
-                }
-            }
-            if (state >= 0 && ExtraKeysView.indicatorBounds(row, view, view.translationX, markBounds)) {
-                val color = progressColors.of(state)
-                markPaint.color = faded(color, view.alpha)
-                trackPaint.color = faded(ColorUtils.setAlphaComponent(color, ProgressLine.TRACK_ALPHA), view.alpha)
-                moving = ProgressLine.draw(canvas, markBounds, fraction, markPaint, trackPaint, rounded = true) || moving
-            }
-            val dot = when (status?.state) {
-                VtSession.STATUS_BLOCKED -> currentColor
-                VtSession.STATUS_ERROR -> errorColor
-                VtSession.STATUS_DONE -> mutedColor
-                else -> continue
-            }
-            val text = view.text
-            if (digitBounds.isEmpty) view.paint.getTextBounds("0", 0, 1, digitBounds)
-            val radius = DOT_RADIUS_DP * density
-            val textRight = view.left + view.translationX + (view.width + view.paint.measureText(text, 0, text.length)) / 2
-            markPaint.color = faded(dot, view.alpha)
-            canvas.drawCircle(textRight + DOT_GAP_DP * density + radius, (view.top + view.baseline + digitBounds.top).toFloat(), radius, markPaint)
+            moving = marks.draw(canvas, row, tab.view, session.progress, session.status) || moving
         }
         return moving
     }
-
-    /** [color] as drawn [shown] opaque. */
-    private fun faded(color: Int, shown: Float) =
-        ColorUtils.setAlphaComponent(color, (Color.alpha(color) * shown).roundToInt())
 
     /**
      * A tab in the row: its number (from [i]) in a square as tall as the bar, the current one in
@@ -480,7 +415,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
         /** What TalkBack reads for it as the [i]th tab: its number, title and status. */
         fun describe(i: Int) {
-            val status = statusText(session)
+            val status = marks.describe(session.isRunning, session.progress, session.status)
             view.contentDescription = if (status == null) {
                 context.getString(R.string.tab_description, i + 1, title(session))
             } else {
@@ -523,27 +458,6 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         return if (session.isRunning) text else context.getString(R.string.tab_ended, text)
     }
 
-    /**
-     * What TalkBack adds to a tab's title for its program's progress or status: what it says it
-     * is doing or needs ([VtSession.describe]), working for progress (failed or paused as
-     * reported), with the percentage when there is one; null with nothing to say.
-     */
-    private fun statusText(session: VtSession): String? {
-        if (!session.isRunning) return null
-        val status = session.status?.takeIf { it.state != VtSession.STATUS_IDLE }
-        val progress = session.progress
-        val what = when {
-            status != null && status.state != VtSession.STATUS_WORKING -> VtSession.describe(context, status)
-            progress?.state == VtSession.PROGRESS_ERROR -> context.getString(R.string.status_error)
-            progress?.state == VtSession.PROGRESS_PAUSE -> context.getString(R.string.status_paused)
-            progress != null || status != null -> context.getString(R.string.status_working)
-            else -> return null
-        }
-        val percent = progress?.takeIf { it.state != VtSession.PROGRESS_INDETERMINATE }?.percent?.takeIf { it >= 0 }
-            ?: status?.percent?.takeIf { it >= 0 }
-        return if (percent == null) what else context.getString(R.string.status_percent, what, percent)
-    }
-
     /** A button: a square as tall as the bar ([item]) with its label centred. */
     private fun button(label: String, onClick: (View) -> Unit) = TextView(context).apply {
         text = label
@@ -582,13 +496,6 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
         /** The opacity of an ended tab's number (Material's disabled content). */
         private const val ENDED_ALPHA = 0.38f
-
-        /**
-         * A status dot's radius, and the room between the number's ink and the dot (dp): a dot
-         * by the top right of the digits, as a badge on an icon.
-         */
-        private const val DOT_RADIUS_DP = 1.5f
-        private const val DOT_GAP_DP = 2f
 
         /**
          * How long the row rests, with no finger on it, before it brings a current tab it was

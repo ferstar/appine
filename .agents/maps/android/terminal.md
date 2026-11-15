@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: add a key-click haptic after volume-key tab switches)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: initialize the tab list’s themed fading scrollbar)
 
 ## Responsibilities
 
@@ -29,7 +29,7 @@ terminals in `android/vtcore`, shown by `android/vtview` using android/vtrender)
   `preference_switch.xml` (Settings' MaterialSwitch with the standard AndroidX `switchWidget` ID). Settings' categories and rows use AndroidX's layouts.
 
 Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `TerminalFiles.kt`, `TabBarView.kt`,
-`TabListView.kt`, `TabNumber.kt`, `SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt` and `Ui.kt` in
+`TabListView.kt`, `TabNumber.kt`, `TabMarks.kt`, `SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt` and `Ui.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/` except
 android/privacy's `layout/privacy_shield.xml`, `drawable/privacy_emblem.xml` and `drawable/ic_lock.xml`,
 and android/licenses' `layout/list_item.xml` and `values/ids.xml`. Shared strings, themes,
@@ -77,9 +77,13 @@ protected notification actions (`android/privacy`); the notices list and reader 
   on `refreshStatus`; `Tab` (one per session: its number in the row, which slides, rolls to a new
   number and fades out when closed); `TabNumber` (in its own file: the number, a `TextView`
   drawing its digits itself so they can roll).
+- `TabMarks` — shared progress/status drawing and accessible status text for the bar and list;
+  draws over a direct child number, following its translation and opacity, and reports whether
+  a sweep needs another frame. Each container owns the redraw scheduling.
 - `TabListView` — a full-width overlay at the top of the terminal frame, flush below the bar. Its
   RecyclerView shows session numbers, single-line ellipsized titles and independent close buttons;
-  immutable row snapshots and stable session IDs keep updates and callbacks tied to sessions.
+  immutable row snapshots (including progress and status) and stable session IDs keep updates
+  and callbacks tied to sessions. `refreshStatus` diffs new reports only while open.
   `open` renders and reveals the current row without moving input focus; `render` updates an open
   list; `close` hides it and clears retained rows. The activity coordinates Back and accessibility.
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
@@ -220,7 +224,13 @@ protected notification actions (`android/privacy`); the notices list and reader 
   with no gap, margins, border, rounded corners or elevation. Rows are 32 dp, labels 12 dp for the
   number and 14 dp for the title/close button; the current row uses primary text and ended titles
   are faded and marked. At most ten rows fit, further limited by the terminal frame’s height;
-  the list scrolls and opens with the current tab visible. Titles use the bar’s `sh` fallback.
+  the list scrolls and opens with the current tab visible. Its themed vertical scrollbar appears
+  while scrolling and fades afterward; no thumb is drawn when all rows fit. Titles use the bar’s `sh` fallback.
+  Every running row, including the current tab, draws the shared progress bar and status dot
+  around its number. Primary text alone marks selection in the list; ended rows show no marks.
+  `MainActivity.onTabStatus` refreshes the open list's report snapshots and accessible descriptions
+  alongside the bar and progress line, without resetting scroll. Only rows drawing a sweep request
+  another frame; closing the list detaches and clears its rows.
 - Tapping a list title selects the session and closes the list. Its close button uses the existing
   busy confirmation and leaves the list open, including when the current tab’s successor is shown.
   Both click listeners request `KEYBOARD_TAP` feedback before their action, as the bar does.
@@ -541,6 +551,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
   `FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY`; otherwise a notification's tab would come back to the
   front. A recreated `MainActivity` drops ordinary dialogs, the search bar and the extra keys'
   modifiers/page; a retained import result is shown again after the page resumes unlocked.
+- The programmatically built tab list must assign `verticalScrollbarThumbDrawable` from the
+  theme, as the terminal view does; enabling the scrollbar alone does not initialize its drawable.
 - Back uses `OnBackPressedDispatcher` with `closeSearchOnBack` enabled only during search and
   `closeTabListOnBack` only while the tab list is open. List callbacks carry the session, never
   a position; the activity checks it still exists before selecting or confirming its close. Dismissing
@@ -578,7 +590,13 @@ protected notification actions (`android/privacy`); the notices list and reader 
   three API 34 instrumentation cases; the focus case failed against the former requestFocus path. API 34 UI checks covered flush placement with the IME, live titles, busy/current and idle/
   background closes, switching, Back, Escape and outside dismissal. Opening/dismissing with the IME
   visible or hidden retains the same terminal input connection and visibility. Physical touch targets, TalkBack
-  traversal and vendor glyph rendering remain unverified.
+  traversal and vendor glyph rendering remain unverified. A 14-tab API 34 check reproduced the
+  missing scrollbar before assigning its theme drawable, then confirmed it appears during scrolling
+  and fades afterward; debug assembly and lint passed.
+- Shared bar/list marks pass debug assembly and lint. API 34 checks covered live progress changes
+  and clearing while the list stayed open, the current row's indeterminate sweep, and background
+  blocked/error/done dots with matching accessible descriptions. TalkBack speech and real-device
+  rendering remain unverified.
 
 - The terminal's night override compiles and passes lint; the system selection menu's surface,
   text and ripple on S23, including after switching system dark mode while the activity is alive,

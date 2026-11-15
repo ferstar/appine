@@ -274,9 +274,10 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         confirmClipboardRead(session, text)
     }
 
-    /** A tab's progress or program status changed: its marks in the bar, the progress line. */
+    /** A tab's reports changed: refresh the bar, the open list and the progress line. */
     override fun onTabStatus() {
         layout.tabBar.refreshStatus()
+        layout.tabList.refreshStatus()
         layout.progressLine.show(current?.progress, jump = false)
     }
 
