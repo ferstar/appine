@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the DNS stub takes only UDP sockets, gives them a host local end, and bounds queries and answers)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: link the nftables evaluator split from kernel/netns)
 
 ## Responsibilities
 
@@ -424,7 +424,7 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `Watch`); `kernel/netns` (`to_host`, `from_host`, `implicit_bind`, nat, filter, listener
   registration), `nft`, `netdev`, `forward`; `kernel/netlink` (netlink sockets dispatched there,
   `rtnl_watched`/`rtnl_notify` around changing ioctls, `message` and `attr` for route messages);
-  `kernel/unix`; credentials (`ns_capable`); `kernel/netns`'s `netdev::request` for the route
+  `kernel/unix`; `kernel/nft` (NAT/conntrack presence and verdict types); credentials (`ns_capable`); `kernel/netns`'s `netdev::request` for the route
   ioctls; the
   kernel's waits (`wait_objects`, `unlocked`), wake objects; signals (`SIGPIPE`); the kernel log;
   the table of unimplemented paths; the test hooks (`kernel/process`, host-refused TCP filters).

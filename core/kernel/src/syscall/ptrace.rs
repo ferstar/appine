@@ -1,4 +1,4 @@
-//! The tracer side of ptrace(2), plus process_vm_readv and process_vm_writev (the kernel/signal
+//! The tracer side of ptrace(2), plus process_vm_readv and process_vm_writev (the kernel/ptrace
 //! map). The tracee side is in [`crate::ptrace`].
 
 use std::rc::Rc;

@@ -9,7 +9,7 @@
 //! the cache with what is needed.
 //!
 //! Clock reads (`clock_gettime`, `gettimeofday`) are here too. The host's vDSO reads most clocks
-//! without entering the kernel layer (the kernel/signal map), but they come here from its svc
+//! without entering the kernel layer (the kernel/vdso map), but they come here from its svc
 //! stubs (the built vDSO, a time namespace with offsets), from what the vDSO leaves to the kernel
 //! (CPU-time clocks), and from programs making the syscall themselves; with stubs only, one go
 //! build made 2.18 million of them, and the few threads queuing for the BKL waited 2.5 s in total.

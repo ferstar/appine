@@ -33,7 +33,7 @@ import io.github.mthli.appine.TabBarView.Companion.LEAVE_SCALE
  * that waits for the user, failed or is done ([drawMarks]).
  *
  * It shows the sessions it is given ([render]) and passes taps on to a [Target]: the sessions,
- * and which of them is current, belong to the activity. The android/terminal map.
+ * and which of them is current, belong to the activity. The android/tabbar map.
  */
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
 internal class TabBarView(context: Context, private val target: Target) : FrameLayout(context) {

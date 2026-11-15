@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/boot.md` for the paired decision history (not yet created; decisions from before the split are D9, D35, D53, the host-stop part of D30 and the host-spawn part of D43 in `.agents/decisions/kernel/process.md`; the process reaping contract remains D16 there).
 >
 > Verified: 2026-11-14 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -101,7 +103,7 @@ namespace creation (`kernel/ns`); console and terminal bridge behaviour (`kernel
 ### Inbound
 
 - `android/native` and `android/service`: machine start, per-tab spawn, boot, shutdown and
-  power requests; `harness`: `run` and direct Machine integration tests.
+  power requests; `harness/cli`: `run` and direct Machine integration tests.
 - `kernel/signal`: signals to virtual PID 1 request power through the shared boot state.
 - `kernel/process`: reparenting falls back to the virtual init and reaps its children at once.
 

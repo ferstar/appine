@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -25,7 +25,7 @@ Root: `core/kernel/src/cred.rs` (except user namespaces), `syscall/cred.rs`, `se
 
 Outside the module: user namespace creation, id maps and namespace entry (`kernel/ns`); the syscalls
 that call the access helpers and their error ordering, xattr storage of `security.capability`
-(`kernel/vfs`, `kernel/files`, `kernel/xattr`); signal delivery and ptrace stops (`kernel/signal`);
+(`kernel/vfs`, `kernel/files`, `kernel/xattr`); signal delivery (`kernel/signal`) and ptrace stops (`kernel/ptrace`);
 procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/cgroup`).
 
 ## Key types
@@ -189,7 +189,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 - At syscall entry (after a `PTRACE_SYSCALL` entry stop): disabled, `PTRACE_O_SUSPEND_SECCOMP` and
   the vDSO clock stubs (an svc from a stub at a vDSO clock entry, for gettimeofday and the clocks
   Linux's vDSO reads in user space; the host's vDSO code makes only real syscalls,
-  `kernel/signal`) skip; strict mode allows read, write, exit and rt_sigreturn and kills otherwise;
+  `kernel/vdso`) skip; strict mode allows read, write, exit and rt_sigreturn and kills otherwise;
   in filter mode a number in the top filter's bitmap runs at once, otherwise every filter runs
   (newest first) on `seccomp_data` (nr, `AUDIT_ARCH_AARCH64`, pc, original x0 and x1..x5) and the
   most severe action wins (ties: the newer filter). Actions: ERRNO (capped at 4095), TRAP (`SIGSYS`
@@ -216,14 +216,14 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 - `kernel/vfs` and `kernel/files` (every permission and ownership check, file-cap removal),
   `kernel/xattr` (xattr capability rules), `kernel/process` (fork/clone copies, setpriority/ioprio
   `PRIO_USER`, `RLIMIT_NPROC`), `kernel/exec` (execve), `kernel/ns` (namespaces), `kernel/signal`
-  (kill, ptrace access), `kernel/procfs` (status lines, ownership, sysctls), `kernel/unix`
-  (credentials), `kernel/net`/`kernel/netns` (capability checks), the syscall dispatcher and fast
+  (kill), `kernel/ptrace` (ptrace access), `kernel/procfs` (status lines, ownership, sysctls), `kernel/unix`
+  (credentials), `kernel/net`/`kernel/netns`/`kernel/nft` (capability checks), the syscall dispatcher and fast
   path (seccomp).
 
 ### Outbound
 
-- User namespaces and id maps (`kernel/ns`); `Stat` and modes (`kernel/store`); ptrace stops,
-  `signal::force`/`force_fatal` (`kernel/signal`); the vDSO stub check; fd tables; the kernel's
+- User namespaces and id maps (`kernel/ns`); `Stat` and modes (`kernel/store`); ptrace stops (`kernel/ptrace`),
+  `signal::force`/`force_fatal` (`kernel/signal`); the vDSO stub check (`kernel/vdso`); fd tables; the kernel's
   waits and wake objects; `appine_hal::fill_random` (notification ids); the debug log.
 
 ## Invariants and gotchas

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: settle resize output at parser ground before releasing the view's preview)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -26,8 +26,7 @@ Taps on the prompt and Search sections (android/vtview).
 Outside the module: Kotlin sessions and console/login lifecycle (`android/vt`); session ownership,
 save files, notifications and memory policy (`android/service`); the screen (`android/terminal`);
 view interactions (`android/vtview`); frame encoding and drawing (`android/vtrender`);
-the host console (`kernel/tty`); the JNI crate, `guarded!`, kernel handle table and build
-(`android/native`); the shell hooks producing prompt marks (`android/setup`).
+the host console (`kernel/tty`); `guarded!` and the kernel handle table (`android/native`), build/linking (`android/build`); the shell hooks producing prompt marks (`android/setup`).
 
 ## Key types
 
@@ -341,7 +340,7 @@ the host console (`kernel/tty`); the JNI crate, `guarded!`, kernel handle table 
   APC strings, its log, scrollback compression, snapshots with continuation tracking, Kitty
   graphics with their render-state image list and animation), and the Wuffs PNG decoder it
   carries, linked into
-  `libappine.so` (`android/native`); the system's libjnigraphics (bitmap locking for images'
+  `libappine.so` (`android/build`); the system's libjnigraphics (bitmap locking for images'
   pixels, used by android/vtrender); `Machine::read_console_run`,
   `write_console`, `resize_console`, `console_foreground` and `console_password_input`
   (kernel/tty) and the

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroups and device BPF split into kernel/cgroup; synthetic node adapters remain here)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -30,7 +30,7 @@ open/read/write contracts remain here; cgroup policy is described in that map.
 Outside the module: the `Pseudo` trait, the walker, mounts and mountinfo order and magic-link
 resolution (`kernel/vfs`); open/read/write dispatch for pseudo nodes (`kernel/files`, whose
 `open_pseudo` and `refresh_pseudo` behaviour this map describes as procfs sees it); maps and
-`/proc/<pid>/mem` semantics (`kernel/mm`, `kernel/signal`); smaps, pagemap and the Rss figures
+`/proc/<pid>/mem` semantics (`kernel/mm`, `kernel/ptrace`); smaps, pagemap and the Rss figures
 (`kernel/oom`); id maps, `setgroups`, `timens_offsets`, `ns/*` and namespaces (`kernel/ns`);
 `children`, state letters and the kernel-entry record behind `syscall` (`kernel/process`);
 `/proc/kmsg`, `/proc/version` and ABI sysctls (`kernel/signal`); terminal behaviour (`kernel/tty`);

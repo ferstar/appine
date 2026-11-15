@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: tab-list button visibility switch in Terminal settings)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -31,7 +31,7 @@ Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsAct
 
 Outside the module: when imports, switches, restarts and logins happen, and the `settings`
 preferences (`android/service`); the import and `write_file`/`read_file` implementations
-(`kernel/store`, `kernel/vfs`); bundling the assets (`android/native`); the shared page layouts
+(`kernel/store`, `kernel/vfs`); bundling the assets (`android/build`); the shared page layouts
 (`android/terminal`), the licences (`android/licenses`) and the authentication gate (`android/privacy`);
 what the terminal does with the prompt marks (`android/vtcore`, `android/vtview`) and the Kotlin
 session consuming their state and events (`android/vt`).

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Downloads and verifies the libghostty-vt source release that the terminal of the app's tabs is
-# built from (android/native and android/vt maps), with the release's dependency tarball:
+# built from (android/build and android/vtcore maps), with the release's dependency tarball:
 # the Zig packages its build uses, unpacked in Zig's package layout, which the cargo build
 # (hosts/android/build.rs) passes to `zig build --system` so that it runs offline. The version and
 # both sha256s are fixed here and changed together on upgrades; libghostty-vt 1.0.0 needs Zig

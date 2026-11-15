@@ -1,5 +1,5 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add SYS_TIME --security-opt apparmor=unconfined
-# The vDSO (the kernel/signal map): its clock functions agree with the syscalls clock by clock (a
+# The vDSO (the kernel/vdso map): its clock functions agree with the syscalls clock by clock (a
 # clock read alternately both ways never goes back, resolutions and gettimeofday's timezone are
 # the same); its four symbols; [vvar] right below [vdso], readable, and neither writable,
 # executable nor growable; tracers and seccomp see only the clocks Linux's vDSO leaves to the

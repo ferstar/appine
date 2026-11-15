@@ -66,7 +66,7 @@ import kotlin.math.roundToInt
  * to the next key typed, which reads them ([ctrl], [alt], [shift]) and reports taking them
  * ([modifiersUsed]); held, they stay on until tapped again. SYM is no modifier: turning the page
  * leaves them as they are, and Ctrl and Alt apply to a symbol or a function key too, while Shift,
- * not shown with the symbols, waits there for another page. The android/terminal map.
+ * not shown with the symbols, waits there for another page. The android/keys map.
  */
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
 internal class ExtraKeysView(context: Context, private val target: Target) : FrameLayout(context) {

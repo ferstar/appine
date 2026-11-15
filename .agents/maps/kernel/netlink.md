@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/netlink.md` for the paired decision history; decisions from before the split are D3, D24, D26 and the netlink halves of D19 and D23 in `.agents/decisions/kernel/net.md`.
 >
 > Verified: 2026-11-11 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -28,7 +30,7 @@ and the `Socket::Netlink` arms of the socket calls.
 Outside the module: the socket syscalls' dispatch, the generic `SOL_SOCKET` options (`SockOpts`),
 the routing table with its route and rule messages and `ip route get` (`route.rs`), traffic
 counters, the timeout parser and the ioctls that changing ioctls wrap (`kernel/net`); the device
-layer, namespace ids and nftables (`kernel/netns`); mq_notify (`kernel/ipc`); readiness plumbing
+layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`kernel/ipc`); readiness plumbing
 (`kernel/poll`). `net.rs`'s unit-test module, which also tests netlink, stays with `kernel/net`.
 
 ## Key types
@@ -153,7 +155,7 @@ layer, namespace ids and nftables (`kernel/netns`); mq_notify (`kernel/ipc`); re
   `ENOENT`; other types `EINVAL`; each as an error ack honouring `NETLINK_CAP_ACK`, non-requests
   and control messages acked only on `NLM_F_ACK`. iproute2's ss takes `ENOENT`/`EOPNOTSUPP` there
   silently and reads `/proc/net` instead.
-- `NETLINK_NETFILTER` goes to nftables (`kernel/netns`). `NETLINK_KOBJECT_UEVENT` never receives.
+- `NETLINK_NETFILTER` goes to nftables (`kernel/nft`). `NETLINK_KOBJECT_UEVENT` never receives.
 
 ## Dependencies (inbound / outbound)
 
@@ -163,7 +165,7 @@ layer, namespace ids and nftables (`kernel/netns`); mq_notify (`kernel/ipc`); re
   send, recv, readiness), and its ioctl path runs the changing ioctls between `rtnl_watched` and
   `rtnl_notify`.
 - `kernel/netns`: the device layer calls `configure_host_link` and builds netlink messages with
-  `message` and `attr`.
+  `message` and `attr`; `kernel/nft` uses the same encoding for ruleset replies.
 - `kernel/net`: `route.rs` encodes route messages with `message` and `attr`.
 - `kernel/ipc`: mq_notify queues `SIGEV_THREAD` cookies on a netlink socket.
 - `kernel/poll` through `kernel/net`'s readiness.
@@ -173,8 +175,8 @@ layer, namespace ids and nftables (`kernel/netns`); mq_notify (`kernel/ipc`); re
 - `kernel/net`: the routing table's `route_message`, `get` and `rule_messages`, `SockOpts`, the
   timeout parser, traffic counters for link statistics, and the inbound forwarding hooks
   (`forward_all`) after an initial-namespace ruleset change.
-- `kernel/netns`: `netdev::{request, base, views, tables, interfaces, nsid, nsid_alloc}` and
-  `nft::handle`.
+- `kernel/netns`: `netdev::{request, base, views, tables, interfaces, nsid, nsid_alloc}`.
+- `kernel/nft`: `nft::handle`.
 - `appine_hal::net` (`interfaces` through `getifaddrs`, `tx_queue_len`); credentials
   (`ns_capable`); the kernel's waits and wake objects.
 

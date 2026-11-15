@@ -486,7 +486,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         ns.time = ns.time_for_children.clone();
         ns.time.frozen.set(true);
         // With offsets, the child's vDSO clock functions must enter the kernel layer, which adds
-        // them (the kernel/signal map)
+        // them (the kernel/vdso map)
         if ns.time.offsets_ns() != [0, 0] {
             mm.borrow_mut().vdso_syscalls()?;
         }

@@ -1,11 +1,11 @@
 # kernel/signal Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/kernel/signal.md` for the paired decision history.
+> See `.agents/decisions/kernel/signal.md` for the paired decision history, including pre-split decisions for kernel/ptrace and kernel/vdso.
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: split kernel/ptrace and kernel/vdso into separate maps)
 
 ## Responsibilities
 
@@ -15,8 +15,7 @@ user-visible ABI contract:
 - signal state, generation and delivery (handlers, masks, queues, job control);
 - the arm64 Linux signal frame, `rt_sigreturn`, syscall restart, and mapping synchronous engine
   exits to signals;
-- the vDSO image;
-- ptrace (tracer and tracee sides) and `process_vm_readv/writev`;
+- integration with `kernel/vdso`'s sigreturn trampoline and `kernel/ptrace`'s delivery stops;
 - core dumps;
 - the kernel log (`/dev/kmsg`, `syslog(2)`, `/proc/kmsg`);
 - the kernel-version contract, Linux's errno numbers, the `ENOSYS` policy for unimplemented
@@ -24,7 +23,7 @@ user-visible ABI contract:
   changes;
 - the local debug log and syscall trace on the host's stderr (`APPINE_LOG`, `APPINE_STRACE`).
 
-Root: `core/kernel/src/signal.rs`, `syscall/sig.rs`, `vdso.rs`, `ptrace.rs`, `syscall/ptrace.rs`,
+Root: `core/kernel/src/signal.rs`, `syscall/sig.rs`,
 `coredump.rs`, `klog.rs`, `errno.rs`, `debug.rs`, signalfd (in `fd.rs`/`syscall/sig.rs`), and in
 `syscall/misc.rs`:
 `uname`, `syslog`, `adjtimex`, clock setting, `restart_syscall`; the dispatcher's restart and
@@ -34,7 +33,8 @@ in `task.rs`.
 
 Outside the module: waking (`kernel/process`), namespace translation (`kernel/ns`), CPU state, kicks
 and the host fault guard (`engine`), page-fault classification (`kernel/mm`), seccomp (with
-credentials), procfs.
+credentials), procfs; ptrace and process_vm requests (`kernel/ptrace`); vDSO image
+construction and clock-stub detection (`kernel/vdso`).
 
 ## Key types
 
@@ -48,14 +48,6 @@ credentials), procfs.
 - Thread state: `pending`, `sigmask`, `saved_sigmask`, `killed`; group state: `pending`,
   `sighand`, `stopped`, `stop_signal`, stop/continue reports, `exiting`.
 - `SignalFd` — mask and the creating group.
-- `vdso::Image` — the image every process maps, chosen once per kernel: its bytes, the same with svc
-  stubs at the clock functions' entries, the sigreturn offset, the clock functions' offsets with
-  their syscalls, and for the host's vDSO a `Vvar` (the length of `[vvar]`, the host address of
-  its start, and how many bytes of it the guest may read).
-- `ptrace::Trace` — per-thread tracing state: tracer tgid, seized, options, run mode
-  (`Cont`/`Syscall`/`Step`), current `Stop` (`Signal`, `Group`, `Syscall(entry)`, `Event`), the saved
-  `Regs` copy, siginfo, event message, syscall number, `HwDebug` slots.
-- `TraceExit`, `leader_tracer`, `exit_tracer` — tracee exits held back for the tracer.
 - `coredump::ThreadCore`, `CoreWriter` — per-thread state collected for a core file, and its writer.
 - `klog::Klog`, `Record`, `KmsgFile` — the ring buffer, its records, one `/dev/kmsg` open.
 - `stub::Stub` — an unimplemented path with the value that reached it (syscall number, prctl
@@ -78,8 +70,6 @@ credentials), procfs.
   `force` (synchronous faults), `force_fatal` (seccomp), `group_exit`; `wake`, `interrupted`, `take`.
 - **Delivery**: `signal::deliver(cx, cpu, syscall)` after each syscall, kick, fault handling,
   sigreturn and exec.
-- **ptrace**: `ptrace(2)` requests, `process_vm_readv`/`writev`; tracee hooks called from the
-  dispatcher, delivery, clone/exec/exit, seccomp and wait.
 - **Core dumps**: `coredump::dump` from the default-action path.
 - **Kernel log**: `klog::printk`/`emit` (used by OOM, bug kills, cgroups, networking), `/dev/kmsg`,
   `/proc/kmsg`, `syslog(2)`; `show_unhandled` (with `abort_name` and the `trap` names) from the
@@ -226,91 +216,6 @@ credentials), procfs.
 - clone: the child inherits the mask with nothing pending; `CLONE_SIGHAND` shares handlers,
   `CLONE_CLEAR_SIGHAND` resets them; a `CLONE_VM` child without vfork gets no altstack.
 
-### vDSO
-
-- The image is chosen at its first use and kept for the kernel's life. Preferred is the host
-  kernel's own vDSO: a copy of the host's `[vdso]` mapping (found through `AT_SYSINFO_EHDR` and
-  `/proc/self/maps`), whose clock functions read the counter (`CNTVCT_EL0`, or `CNTVCTSS_EL0` on
-  hosts with ECV, both read natively by the engine) and the host's vvar data, so `clock_gettime`,
-  `gettimeofday` and `clock_getres` run in guest code without entering the kernel layer and return
-  exactly what the host's syscalls return; what they leave to the kernel (CPU-time clocks, invalid
-  clocks, a host whose counter is unusable) is a real syscall, as on Linux. The loader maps the
-  host's vvar pages read-only as `[vvar]` right below the copy, at the distance the host's code
-  expects (`kernel/mm`): the guest can read the first host page, or the first two when the host
-  itself runs in a time namespace (its first page's clock mode is `VDSO_CLOCKMODE_TIMENS`; the
-  real data is then on the second).
-- The copy is used only if musl's lookup finds the four symbols with version `LINUX_2.6.39`,
-  `__kernel_rt_sigreturn` is exactly `mov x8, #139; svc #0`, and each clock function is at least
-  12 bytes long. It is changed only where Appine's contract needs it: every other defined symbol is
-  made undefined (newer kernels' `__kernel_getrandom` reads vvar pages the guest does not get), and
-  the `Linux` version note says 6.1.0. Its clock functions then run once in the interpreter, in a
-  private address space with the vvar data mapped as in a guest, and every result must lie between
-  host readings taken just before and after (realtime, monotonic, raw, both coarse clocks,
-  boottime, TAI), with the same resolutions and timezone; syscalls they make are answered by the
-  host, and anything else, or more than 100000 instructions, fails it.
-- Otherwise (no host vDSO, a check failing, a non-arm64 build) the image is built at runtime as a
-  one-page minimal real ELF shared object (`ET_DYN`, a loadable segment and a dynamic segment,
-  `DT_HASH`, symbol versions with `LINUX_2.6.39`, soname `linux-vdso.so.1`), with
-  `__kernel_rt_sigreturn` preceded by a `nop` and the clock functions as `mov x8, #nr; svc #0; ret`
-  stubs. With `APPINE_LOG=1` the reason the host's was not used is logged.
-- Either is passed through `AT_SYSINFO_EHDR`. Each process maps a private anonymous copy (debuggers
-  can set breakpoints in it); `MADV_DONTNEED` over it brings back the image (`kernel/mm`), as
-  Linux's special mapping faults its pages back.
-- In a time namespace with offsets the host's code would return the host's clocks, so the clock
-  functions' entries of the host's image are overwritten with the same svc stubs (`Mm::vdso_syscalls`)
-  when such a namespace is entered (`kernel/ns`), and the kernel layer adds the offsets; this
-  is never undone. An svc from a stub (the svc right after a clock entry, with that entry's
-  syscall) takes the no-BKL fast path and skips ptrace and seccomp stops, but only for
-  `gettimeofday` and the clocks Linux's vDSO reads in user space (realtime, monotonic, raw, the two
-  coarse clocks, boottime, TAI); other clocks, and every syscall the host's code makes, are
-  ordinary syscalls that tracers and seccomp see, as on Linux.
-
-### ptrace
-
-- Tracees are threads; the tracer is a process (any of its threads may issue requests; tracees are
-  released only when the whole tracer process exits). No Yama restrictions. Tracing pid 1 is
-  `ESRCH`; `PTRACE_TRACEME` under init is `EPERM`. Access needs the same user (and dumpable, with a
-  capability subset) or `CAP_SYS_PTRACE` against the target thread's own credentials. The
-  credentials of whoever asked for the relationship are kept as the tracer's (Linux's
-  `ptracer_cred` through `ptrace_link`): the attaching thread's for `ATTACH`/`SEIZE`, the tracee's
-  own for `TRACEME` (since the fix for CVE-2019-13272, so an unprivileged child of a privileged
-  parent gains nothing from a setuid program), inherited by auto-attached children; they are
-  judged later with `CAP_SYS_PTRACE` over the relevant user namespace.
-- Attaching: `ATTACH` sends `SIGSTOP`; `SEIZE` takes options and never stops. Requests other than
-  `KILL` and `INTERRUPT` need the tracee in a ptrace stop (else `ESRCH`); unknown requests are `EIO`.
-- Every ptrace stop saves a copy of the registers; the tracer reads and writes the copy and it is
-  written back on resume. Stopping notifies the tracer (`CLD_STOPPED` or `CLD_TRAPPED`, `SIGCHLD`
-  unless suppressed) and waits until resumed, detached or killed.
-- Signal-delivery stops: resuming with 0 suppresses the signal, another number replaces it (as
-  `SI_USER` unless `SETSIGINFO` was used); blocked replacements are re-queued.
-- Group stops: non-seized tracees report `Group` (no siginfo); seized ones report `EVENT_STOP`;
-  `LISTEN` and `INTERRUPT` need `SEIZE`.
-- Syscall stops (`PTRACE_SYSCALL`): x7 is 0 at entry and 1 at exit (restored afterwards); the
-  tracer may change the number through `NT_ARM_SYSTEM_CALL` (-1 skips the call); seccomp runs after
-  the entry stop; the no-BKL fast path is off while tracing syscalls or stepping. Detaching (or the
-  tracer exiting) at an entry or seccomp stop keeps the syscall number, so the call goes on as
-  made.
-- Event stops: fork, vfork, clone, exec (message: former tid), exit (message: wait status),
-  vfork-done, seccomp. `CLONE_PTRACE` forces and `CLONE_UNTRACED` prevents tracing of children.
-  A non-seized tracee exec without `TRACEEXEC` gets `SIGTRAP`.
-- Single-step: the interpreter executes one instruction (`Cpu::step`) and the tracee reports
-  `SIGTRAP`/`TRAP_TRACE`; a stepped `svc` reports after the syscall.
-- Register sets: `NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`,
-  `NT_ARM_HW_BREAK` (6 slots), `NT_ARM_HW_WATCH` (4 slots); nothing for SVE, PAC, MTE, SME. Debug
-  slots are handed to the engine (`set_hw_debug`) when the tracee resumes: breakpoints force Tier
-  0, watchpoints keep Tier 1 with watched pages out of the TLB. As on arm64 Linux, whose
-  `ptrace_disable` leaves them, detaching and the tracer's exit keep the slots (still applied if
-  set during the last stop) and a later attach finds them; only execve clears them.
-- Memory: `PEEK*`/`POKE*` on a tracee that is not dumpable are `EIO` unless the tracer had
-  `CAP_SYS_PTRACE` over the tracee's user namespace when it attached (`ptrace_access_vm`).
-  `POKETEXT`/`POKEDATA` and `/proc/<pid>/mem` writes use forced writes (private copies of
-  non-writable mappings, translation invalidation; written mappings stop being trusted translation
-  sources). `process_vm_writev` uses plain writes.
-- wait: the tracer finds its tracees without `WUNTRACED`; a stop reports `code << 8 | 0x7f`. A
-  traced leader's zombie is hidden from its parent until the tracer reaps it. When the tracer
-  process exits, tracees are killed with `EXITKILL`, otherwise detached; detaching a tracee in a
-  stopped group returns it to the group stop.
-
 ### Core dumps
 
 - Written when a core-generating signal (`SIGQUIT`, `SIGILL`, `SIGTRAP`, `SIGABRT`, `SIGBUS`,
@@ -405,9 +310,9 @@ credentials), procfs.
 ### Inbound
 
 - The run loop and dispatcher (`kernel/process`): delivery after every syscall, kick and fault;
-  syscall-entry/exit ptrace stops; `orig_x0`; restart handling.
+  `orig_x0`; restart handling.
 - Timers, the TTY layer (job-control signals to process groups), process exit (child status),
-  seccomp (`force_fatal`, `SECCOMP` event stops), procfs (signal state, `/proc/<pid>/mem`), the OOM
+  seccomp (`force_fatal`), procfs (signal state), the OOM
   killer, bug handling and the BKL watchdog (kernel log; bug kill reports read `stub::top`).
 - Default arms reporting unimplemented paths: prctl (`kernel/process`), futex (`kernel/futex`),
   fcntl, file ioctls and device opens (`kernel/files`), terminal ioctls (`kernel/tty`), socket
@@ -417,14 +322,17 @@ credentials), procfs.
 
 - `kernel/process`: `request_wake*`, `signal_later`, group exit, wait; `kernel/ns`: namespace
   translation.
-- `kernel/mm`: `read`/`write`/`write_force`, `grow_stack`, `dump_regions`/`dump_page`/`residency`,
+- `kernel/mm`: `read`/`write`, `grow_stack`, `dump_regions`/`dump_page`/`residency`,
   `regions` (the mapping named in unhandled-exception reports).
-- `engine`: CPU state (registers, FP, DIT), `set_hw_debug`, `Cpu::step`, the `Kicker`; a private
-  `Mmu` and `Cpu` for the host vDSO's check.
-- vfs (core files, `/dev/kmsg`), credentials (`may_signal`, `may_ptrace`, `CAP_SYSLOG`),
-  `appine_hal` (clocks, `adjtimex` query, `host_vdso`, `timezone`), procfs (`debug.exception-trace` through
+- `engine`: CPU state (registers, FP, DIT) and the `Kicker`.
+- vfs (core files, `/dev/kmsg`), credentials (`may_signal`, `CAP_SYSLOG`),
+  `appine_hal` (clocks, `adjtimex` query, `timezone`), procfs (`debug.exception-trace` through
   `recorded_value`, ` (deleted)` names through `mark_deleted`, `comm_str` for a path's first
   caller).
+- `kernel/ptrace`: group/signal stops, fatal-exit hooks and shared register helpers; delivery
+  must preserve stop ordering and skip signal stops for immutable actions.
+- `kernel/vdso`: the fixed sigreturn trampoline offset; its clock-stub integration is handled
+  by `kernel/process`, `kernel/ns` and `kernel/mm`.
 
 ## Invariants and gotchas
 
@@ -433,15 +341,6 @@ credentials), procfs.
 - `SIGKILL` and `SIGSTOP` can never be blocked, caught or ignored; `SA_IMMUTABLE` actions skip
   ptrace signal-delivery stops.
 - The sigreturn trampoline's bytes are part of the ABI and must not change.
-- The host's vDSO code is run unchanged except for its symbols and notes: the engine must execute
-  whatever the host kernel put there (alternatives such as ECV's counter included), which the
-  check at first use guards; the time-namespace detection relies on the clock mode being the
-  second word of the host's vvar data (Linux 5.6 on).
-- The tracer works on the saved register copy; changes made directly to the CPU state during a
-  stop would be overwritten on resume.
-- Only threads calling `exit`/`exit_group` or taking the fatal signal report
-  `PTRACE_EVENT_EXIT`.
-
 - `ERESTARTNOINTR` is recognised by delivery but nothing produces it.
 - `LOG_CONT` is never set (no `KERN_CONT` merging); `/dev/kmsg` writes always carry a facility, so
   this is not visible to users.
@@ -451,21 +350,8 @@ credentials), procfs.
 - **`CLD_STOPPED` is reported early:** the parent is notified as soon as the first thread starts a
   group stop, while siblings may still be running (Linux notifies once the last thread has
   stopped).
-- **Single-step over some syscalls reports one instruction late:** after `rt_sigreturn`, execve or a
-  skipped syscall (number -1), the step is not reported at syscall return.
-- **ptrace reads are not forced:** `PTRACE_PEEK*` and `/proc/<pid>/mem` reads fail on `PROT_NONE`
-  pages Linux can read; `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
 - **`SIGILL` frames carry an `esr_context` with EC 0:** Linux 6.1 emits none for undefined
   instructions.
-- **Threads ended by another thread report no `PTRACE_EVENT_EXIT`:** only threads calling
-  `exit`/`exit_group` or taking the fatal signal stop there, so the other threads of an
-  `exit_group`, and the leader killed by a non-leader's execve, exit without the stop Linux 6.1
-  gives them (there the execve waits for it); a tracer that collects state at exit misses them.
-- **Detaching at an attach-time group stop reports the stop again:** after `PTRACE_ATTACH` to a
-  stopped process and a detach during its group-stop report, the thread takes the `SIGSTOP` that
-  ATTACH queued, so the parent gets a second `CLD_STOPPED`/`SIGCHLD` and waitpid stop report,
-  where Linux 6.1 re-enters the stop silently; a shell whose stopped job was briefly attached by
-  gdb or strace sees a duplicate stop.
 - **Synthesized abort ESRs differ from Linux's:** every translation fault is reported at level 3
   and every fault inside a mapping as a permission fault, where Linux names the table level its
   walk stopped at (often level 2 for an address with no page tables) and reports a never-touched
@@ -473,9 +359,8 @@ credentials), procfs.
   unhandled-exception reports show the difference, which only tools decoding the ESR notice.
 - **Minor divergences:** `settimeofday` skips argument validation and `clock_settime`
   returns `EINVAL` for CPU clocks where Linux returns `EPERM`; sigreturn silently drops DAIF bits
-  Linux would reject; kernel-generated real-time signals lose their siginfo when the queue is full;
-  `process_vm_readv`/`writev` with a non-empty local vector but no remote bytes look up the pid and
-  check access (`ESRCH`, `EPERM`) where Linux 6.1 returns 0 first.
+  Linux would reject; kernel-generated real-time signals lose their siginfo when the queue is full.
+
 
 ## Open questions
 
@@ -485,6 +370,6 @@ credentials), procfs.
 ## To verify
 
 - The Linux 6.1 behaviours used for comparison above (`legacy_queue`, `retarget_shared_pending`,
-  `force_sigsegv`, `do_undefinstr`, `UAPI_SA_FLAGS`, FOLL_FORCE reads, `PTRACE_MODE_FSCREDS`,
+  `force_sigsegv`, `do_undefinstr`, `UAPI_SA_FLAGS`,
   `format_corename`, sysctl `test_perm`, the order of checks in time-setting syscalls) were checked
   from knowledge of the kernel, not against its source.

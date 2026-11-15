@@ -13,7 +13,7 @@ SKIP="$SKIP:$P.PrctlSetPtracerDoesNotPersistPastTracerThreadExit"
 SKIP="$SKIP:$P.PrctlSetPtracerRespectsTracerThreadID:$P.PrctlClearPtracerDoesNotAffectCurrentTracer"
 SKIP="$SKIP:$P.PrctlNotInherited:$P.TraceParentNotAllowed:$P.TraceNonDescendantNotAllowed"
 SKIP="$SKIP:$P.ExecvePtraceLockStress"
-# kernel/signal: threads killed by another thread's execve report no PTRACE_EVENT_EXIT; detaching
+# kernel/ptrace: threads killed by another thread's execve report no PTRACE_EVENT_EXIT; detaching
 # at an attach-time group stop reports the stop again (the second fails only when the whole case
 # runs, not on its own)
 SKIP="$SKIP:TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/*"

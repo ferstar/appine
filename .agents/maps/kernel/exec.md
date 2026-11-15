@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -30,7 +30,7 @@ the run loop that re-attaches the translator (`kernel/process`), POSIX timers (`
 and host spawn (`kernel/boot`); the credential
 transition and file capabilities (`kernel/cred`); entering the time namespace for children
 (`kernel/ns`); building and laying out the address space (`kernel/mm`); signal handler reset,
-forced fatal signals, the ptrace exec event and the vDSO image (`kernel/signal`); close-on-exec and
+forced fatal signals (`kernel/signal`), the ptrace exec event (`kernel/ptrace`) and the vDSO image (`kernel/vdso`); close-on-exec and
 writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE programs (`kernel/fuse`).
 
 ## Key types
@@ -112,7 +112,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 - A position-independent main program loads at `0x5555_5555_0000` (at its own addresses when
   they start above that); the interpreter and then the vDSO are placed top-down below the mmap
   area (so the vDSO is below the interpreter), with the host's `[vvar]` right below the vDSO when
-  the vDSO is the host's (`kernel/signal`). There is no ASLR (`engine`'s shared translations rely
+  the vDSO is the host's (`kernel/vdso`). There is no ASLR (`engine`'s shared translations rely
   on that).
 - Segments are mapped in order, each over what earlier ones mapped, as since 6.7's `elf_load`
   (which the differential tests' native side runs; 6.1 maps a page of the file even for a
@@ -154,7 +154,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   `set_brk`, `map_stack`, `set_start_stack`, `label`, `write_kernel` (segments, `.bss`).
 - `kernel/cred` (set-id bits, file capabilities, unsafe execs, `mm_user_ns`, personality),
   `kernel/ns` (the time namespace for children and its vDSO stubs), `kernel/signal` (handler reset,
-  `force_fatal`, the ptrace exec event, the vDSO image), `kernel/vfs`, `kernel/files` and
+  `force_fatal`), `kernel/ptrace` (exec event), `kernel/vdso` (image), `kernel/vfs`, `kernel/files` and
   `kernel/mount` (resolution, noexec and nosuid, writers, close-on-exec), `kernel/fuse`
   (`open_fuse`, the close-on-exec flush), `kernel/aio`, `kernel/ipc` and `kernel/unix` (released at
   exec), `engine` (the Go register set).

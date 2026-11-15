@@ -21,7 +21,7 @@ import io.github.mthli.appine.ProgressLine.Companion.SWEEP_MS
  * colour, the error colour for an error, the muted colour while paused (full when a pause gives
  * no percentage); with no percentage, a quarter of its width sweeps across and back over a faint
  * track. It fades in and out, and a new percentage slides there. It takes no touches. The
- * android/terminal map.
+ * android/tabbar map.
  *
  * The companion draws progress into any rectangle, for the tab bar's marks too.
  */

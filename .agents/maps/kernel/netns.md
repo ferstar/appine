@@ -1,11 +1,11 @@
 # kernel/netns Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/kernel/netns.md` for the paired decision history.
+> See `.agents/decisions/kernel/netns.md` for the paired decision history, including pre-split decisions for kernel/nft.
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: route ioctls from kernel/net reach `netdev::request`)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: split kernel/nft into separate maps)
 
 ## Responsibilities
 
@@ -17,13 +17,14 @@ provides:
 - namespace-local ports and listener registration (`ECONNREFUSED`, UDP drops);
 - virtual devices (bridge, veth, dummy) with addresses, routes and sysctls, and the mapping of
   their IPv4 addresses to host loopback addresses;
-- nftables: the ruleset over `NETLINK_NETFILTER` and its evaluation at connect/sendto;
+- namespace-path construction and socket-boundary integration for `kernel/nft` evaluation;
 - forwarding of connections from outside Appine to published (DNAT) ports.
 
-Root: `core/kernel/src/netns.rs`, `netdev.rs`, `nft.rs`, `forward.rs`, `netconf.rs`.
+Root: `core/kernel/src/netns.rs`, `netdev.rs`, `forward.rs`, `netconf.rs`.
 
 Outside the module: the socket syscalls that call into it, host interfaces, routes and low-port
 mapping in the initial namespace (`kernel/net`); netlink socket mechanics (`kernel/netlink`);
+nftables rulesets, requests and expression evaluation (`kernel/nft`, `nft.rs`);
 creating and entering namespaces, nsproxy and `/proc/<pid>/ns` (`kernel/ns`); `/proc/net` and sysfs
 file structure (`kernel/procfs`); host sockets (`hal`).
 
@@ -42,13 +43,10 @@ file structure (`kernel/procfs`); host sockets (`hal`).
   per-device settings, carrier counters); `View` (read-only snapshot for netlink, procfs, sysfs).
 - `NetConf` / `Conf` — interface and namespace sysctls (`all`, `default`, per device; host
   interfaces and lo keyed by index).
-- `Nft` — generation and tables; `Table`, `Chain`/`Base` (hook, priority, type, policy), `Rule`
-  (raw expression attributes), `Set` (key length, flags, raw elements).
-- `nft::Packet` (fake IP/TCP/UDP packet built from the socket), `Iif`, `Outcome` (accept, drop,
-  reject with errno, dnat), `Eval`; `netns::NatPacket`, `Flow`, `Step`.
 - `forward::Forwarder` (per kernel; one host thread), `Shared`, `Target` (protocol, host
   destination, source address), `Handle` (in `InetSocket::fwd`), `Conn`, `Relay`, the global
   `OUTSIDE` registry (127.254.x.y → real client address and port).
+- `netns::NatPacket`, `Flow`, `Step` — synthetic packet construction and hook routing into `kernel/nft`.
 
 ## Public entry points
 
@@ -59,11 +57,10 @@ file structure (`kernel/procfs`); host sockets (`hal`).
   `nsid_alloc`, `ioctl`, `ifconf`, readers (`views`, `interfaces`, `base`, `tables`, `entries`,
   `local_v4`, `route_v4`, `routes_v6`, `first_v4`), sysctls (`conf_dirs`, `conf_read`,
   `conf_write`, `ip_forward`), `Devices::for_new_ns`.
-- nftables: `nft::handle` (control plane); evaluation `Nft::nat`, `Nft::filter`, `has_nat`,
-  `tracks`, and the glue `output_nat`, `prerouting_nat`, `path_filter`, `external_nat`,
-  `external_filter`.
 - Forwarding: `forward_target`/`forward_socket`/`forward_all` (in the socket layer),
   `Forwarder::add`, `forward::run`, `outside_peer`.
+- nftables integration: `output_nat`, `prerouting_nat`, `path_filter`, `external_nat`,
+  `external_filter` call `kernel/nft` with the namespace path and synthetic packet.
 
 ## Data flow / lifecycle
 
@@ -165,32 +162,7 @@ file structure (`kernel/procfs`); host sockets (`hal`).
 - ioctls: get/set flags, MTU, name, hardware address, txqlen, and the address getters; address
   setters `EPERM`. Statistics of virtual devices are zero.
 
-### nftables control plane
-
-- One ruleset per namespace; every request (queries too) needs `CAP_NET_ADMIN` over the
-  namespace owner. Changes come in `BATCH_BEGIN`/`END` pairs within one datagram: the batch runs
-  on a clone, every error is reported, and the clone replaces the ruleset only if all succeeded;
-  `NFNL_BATCH_GENID` mismatches `ERESTART`; the generation increases per committed batch.
-- Tables (families inet, ip, ip6, arp, bridge, netdev; only `DORMANT` flag, `OWNER` `EOPNOTSUPP`),
-  chains (base chains with hook, priority, type filter/nat/route, policy; existing chains can only
-  change policy and userdata; rename is silently ignored; `EBUSY` when referenced), rules (raw
-  expressions; position, append, replace — a replaced rule gets a new handle), sets and elements
-  (key length 1..64, `%d` names, anonymous sets dropped when unused; `EBUSY` while referenced).
-  Stateful objects and flowtables `EOPNOTSUPP`; `DESTROY*` maps to delete ignoring `ENOENT`.
-  `DELTABLE`/`DESTROYTABLE` with family 0 or without a name and handle flush instead (Linux's
-  `nft_flush`, what `nft flush ruleset` sends): every table of the family, of all families for 0,
-  only those with the name when one is given; matching nothing succeeds. Other requests with
-  family 0 are `EAFNOSUPPORT`. `DELTABLE` ignores `NLM_F_NONREC`; verdict-map references are not
-  counted as chain uses.
-- Validation: expression names must be known (39); jump targets must exist and not be base chains;
-  loops `EMLINK`; set references rewritten to names. Arguments are not validated.
-- Queries outside batches: `GETGEN`, dumps of tables, chains, rules (filters by table and chain),
-  sets and elements in 6.8's format, packed into 8 KiB datagrams (a single larger message, and a
-  set-element dump, which is one message, go out unbounded); `nft_compat` revision queries;
-  empty ctnetlink dumps. No `NLM_F_ECHO`, no monitor notifications. Base-chain counters are 0.
-- An initial-namespace commit re-evaluates port forwarding.
-
-### nftables evaluation
+### nftables integration
 
 - At connect and at every sendto with an address (connected UDP: once at connect), the socket
   layer builds a fake packet (addresses, protocol, ports, uid/gid, mark, interfaces, ct state) and
@@ -203,19 +175,6 @@ file structure (`kernel/procfs`); host sockets (`hal`).
      namespace's INPUT or FORWARD, the target's INPUT; the mark is cleared outside the sender.
   POSTROUTING (nat and filter), INPUT-hook nat and arp/bridge/netdev tables are never evaluated.
   (Inbound forwarding's probe can evaluate IPv6 PREROUTING nat.)
-- Expressions: `meta` (len, protocol, mark get/set, iif/oif and names, skuid/skgid on OUTPUT,
-  nfproto, l4proto, pkttype), `payload`, `cmp`, `bitwise`, `lookup`, `immediate`, `ct` (state is
-  NEW, or ESTABLISHED for UDP to a peer already heard from; others no match), `fib` (address type
-  only), `nat` (DNAT, range minimum; SNAT no-op), `redir` (127.0.0.1/`::1` on OUTPUT, the input
-  interface's address on PREROUTING), `reject`, `queue` (drop), `limit` (a token bucket per rule
-  expression, packets or bytes, `over` inverting) and `quota` (bytes counted per rule expression,
-  `over` inverting); a packet's length, for them as for `meta len`, is its headers only. `counter`,
-  `log`, `notrack`, `dynset`, `objref`, `last`, `masq`, `connlimit`, `dup` always match without
-  effect. xt targets DNAT, REDIRECT, MARK, ACCEPT, DROP, REJECT (others no-ops) and matches
-  comment, mark, owner, conntrack, state, addrtype, tcp, udp, limit (the same bucket from avg and
-  burst; others never match). Unknown or
-  unevaluable expressions break the rule. Jumps to missing chains or deeper than 16 drop; 100,000
-  steps accept; chains end in their policy.
 - Effects: a nat drop or reject is `EPERM` at connect/sendto (also for drops in a remote
   namespace's PREROUTING); a TCP filter reject returns its errno at once (RST →
   `ECONNREFUSED`, ICMP codes mapped), a TCP filter drop connects to a blackhole listener so it
@@ -223,6 +182,8 @@ file structure (`kernel/procfs`); host sockets (`hal`).
   elsewhere; DNAT rewrites the destination (and may move it to another namespace); `meta mark set`
   updates the mark.
 - `tracks()` (any conntrack-using table) decides whether `SO_ORIGINAL_DST` answers.
+- Expression and control-plane details are in `kernel/nft`; initial-namespace commits
+  trigger the socket layer's forwarding refresh.
 
 ### Forwarding from outside
 
@@ -256,7 +217,7 @@ file structure (`kernel/procfs`); host sockets (`hal`).
 
 - `kernel/net` (bind, listen, connect, accept, send, recv, getsockname/getpeername, forward targets,
   `SO_ORIGINAL_DST`, `SIOCADDRT`/`SIOCDELRT` through `netdev::request`); `kernel/netlink`
-  (configure and netfilter); `kernel/ns` (clone/unshare/setns
+  (device configuration); `kernel/ns` (clone/unshare/setns
   create and enter namespaces); `kernel/procfs` (`/proc/net`, `/proc/sys/net`, `/sys/class/net`);
   the machine (the forwarder per kernel).
 
@@ -266,6 +227,8 @@ file structure (`kernel/procfs`); host sockets (`hal`).
   and routes (`route::merge`, `attrs`); `kernel/netlink`'s encoding (`message`, `attr`,
   `configure_host_link`); credentials (`ns_capable`); the kernel
   log; `std::thread` for the forwarder.
+- `kernel/nft` owns each namespace's ruleset; this module builds packets and selects hooks,
+  applies verdicts and translates DNAT destinations. Forwarding probes use the same evaluator.
 
 ## Invariants and gotchas
 
@@ -285,9 +248,6 @@ file structure (`kernel/procfs`); host sockets (`hal`).
   device to), so pasta and slirp4netns cannot start: rootless podman's default network, its port
   publishing and `--network slirp4netns` fail, and rootless containers work only with
   `--network host` (the Android app makes that rootless podman's default, `android/setup`).
-- **Per-key rate limits do nothing:** meters (`dynset` with a limit per key) always match, and the
-  xt `hashlimit` and `recent` matches never match, so ufw's `limit` rules (built on `recent`) never
-  trigger; byte limits and quotas count headers only, so they let through more than Linux.
 - **Namespace isolation is guest-side only:** the initial namespace passes 127.x through, so its
   guests (and other apps on the device) reach a container's host sockets directly, including
   services bound only to the container's 127.0.0.1.
@@ -311,14 +271,10 @@ file structure (`kernel/procfs`); host sockets (`hal`).
 - **Forwarded peers revert to 127.254.x.y:** the real-client record is removed when the forwarder
   closes the connection, so a container still holding the socket (CLOSE_WAIT) sees the raw
   address in getpeername.
-- **nft control-plane gaps:** a replaced rule gets a new handle; chain rename is ignored;
-  `DELTABLE` ignores `NLM_F_NONREC`; chains used only from verdict maps can be deleted (their jumps
-  then drop); no `NLM_F_ECHO` and no monitor notifications; set-element dumps are one unbounded
-  message.
 - **Smaller deviations:** only 127.0.0.0/24 works as loopback in a namespace (Linux: 127/8); IPv6 on
   virtual devices is unusable and on-link IPv6 is handed to the host; `hostmap` entries are never
   freed and collide once 65534 are used; PREROUTING filter chains see the post-DNAT destination at
-  every priority; POSTROUTING, SNAT and MASQUERADE do nothing.
+  every priority. `kernel/nft` records the unsupported POSTROUTING, SNAT and MASQUERADE effects.
 - **Route requests insist on exact address sizes:** `RTA_DST`, `RTA_GATEWAY` and `RTA_PREFSRC` in
   `RTM_NEWROUTE`/`RTM_DELROUTE` must be exactly 4 or 16 bytes, otherwise `EINVAL`; Linux 6.1
   answers `ERANGE` for a short IPv4 attribute or IPv6 gateway, uses the first 4 bytes of a longer
@@ -342,7 +298,5 @@ file structure (`kernel/procfs`); host sockets (`hal`).
 
 ## To verify
 
-- Linux 6.1's results for `NLM_F_NONREC` on `DELTABLE` and generation bumps for no-op batches (taken
-  from knowledge, not a source checkout).
 - How docker (with and without docker-proxy) and podman listeners interact with the dual-stack
   forwarding gap on a real device.

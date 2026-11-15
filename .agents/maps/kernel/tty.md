@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -26,7 +26,7 @@ Outside the module: devpts as a filesystem, instances, and the owner, mode and t
 `/dev/pts/N` (`kernel/procfs`); device-number dispatch on open (`kernel/files`); signal delivery,
 stops and orphaned-group stop rules (`kernel/signal`); `setsid`/`setpgid`, process exit and the
 exit-time orphan signals (`kernel/process`); the host terminal's raw mode and signal pipes
-(`harness`, `hal`); the Android terminal UI (`android`).
+(`harness/cli`, `hal`); the Android terminal UI (`android`).
 
 ## Key types
 
@@ -345,7 +345,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   signal, and `new_pty` prunes the dead table entry later.
 - The echo queue (`Echo`, `commit_echoes`), erasing (`erase`, `echo_erased`) and output processing
   (`output_char`) are adapted from Starnix's `lib/line_discipline` and carry The Fuchsia Authors'
-  BSD-style notice in `tty.rs`'s module docs, matched by the app's notices (`android/native`).
+  BSD-style notice in `tty.rs`'s module docs, matched by the app's notices (`android/build`).
   Code moved out of those parts takes the notice along; only a rewrite that no longer derives from
   Starnix drops it, from both places.
 

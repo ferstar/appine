@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale source comments fixed; failed internal checks under the guard; the stale kicker after an exit panic; guard lock registration and pc 0 lookups; ECV's counter last)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -365,7 +365,7 @@ Tier 1, only CPUID advertised).
   BF16, FRINT) is intersected with the host's and offered only if the host has FP and ASIMD and
   native stubs work. FlagM, FlagM2, SB, DCPOP, DCPODP, DIT and ECV (HWCAP2, the self-synchronized
   counter `CNTVCTSS_EL0`, which the host's vDSO reads instead of `CNTVCT_EL0` on hosts that have
-  it; guests run that code, `kernel/signal`) are offered from host support regardless of that gate.
+  it; guests run that code, `kernel/vdso`) are offered from host support regardless of that gate.
 - Dependencies: SHA3 and SHA512 only together and with SHA2; FPHP and ASIMDHP together; FHM needs
   FPHP; LRCPC2 needs LRCPC; FlagM2 needs FlagM; DCPODP needs DCPOP. Not implemented: LSE2, SM3/SM4,
   SVE/SME, PAC (PACA/PACG), BTI, MTE.

@@ -1,5 +1,5 @@
-//! vDSO (the kernel/signal map). Every process maps a private copy of one image, chosen once per
-//! kernel ([`get`]):
+//! vDSO (the kernel/vdso map). Every process maps a private copy of one image, chosen once per
+//! host process ([`get`]):
 //!
 //! - The host kernel's own vDSO, when it can be used ([`from_host`]). Its clock functions read the
 //!   counter (`CNTVCT_EL0`, which the engine reads natively) and the host's vvar data page, mapped

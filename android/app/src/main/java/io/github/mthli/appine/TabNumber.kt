@@ -13,7 +13,7 @@ import androidx.core.graphics.ColorUtils
 import kotlin.math.roundToInt
 
 /**
- * A tab's number in the tab bar ([TabBarView], the android/terminal map), which rolls to a new
+ * A tab's number in the tab bar ([TabBarView], the android/tabbar map), which rolls to a new
  * one ([roll]) like SwiftUI's numeric text: each digit that changes moves out, fading and
  * blurring, as the new one moves in from the other side and sharpens; a lower number comes in
  * from above, a higher one from below. Digits that stay the same in place stay still, and a

@@ -1,4 +1,4 @@
-//! The tracee side of ptrace (the kernel/signal map): stopping in a ptrace-stop, waiting for the
+//! The tracee side of ptrace (the kernel/ptrace map): stopping in a ptrace-stop, waiting for the
 //! tracer to read and write its registers and memory, then resuming. The tracer side's requests
 //! are in `syscall::ptrace`.
 //!

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: default-on tab-list button preference)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -32,7 +32,7 @@ Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `No
 `Settings.kt`, `Tabs.kt`, `BrowserBridge.kt`, `Diagnostics.kt`.
 
 Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); the screen
-and its tab bar (`android/terminal`); the view (`android/vtview`) and rendering (`android/vtrender`);
+(`android/terminal`) and its tab bar (`android/tabbar`); the view (`android/vtview`) and rendering (`android/vtrender`);
 sessions' internals and the console adapter (`android/vt`), native terminals and compression
 (`android/vtcore`); the Files app provider
 (`android/documents`); JNI and the kernel API (`android/native`, `kernel/boot`, `kernel/process`).

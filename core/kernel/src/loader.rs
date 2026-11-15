@@ -665,7 +665,7 @@ pub fn load_prepared(
         return Ok(Image::doomed());
     };
 
-    // The vDSO, and below it the host's vvar pages when the vDSO is the host's (the kernel/signal
+    // The vDSO, and below it the host's vvar pages when the vDSO is the host's (the kernel/vdso
     // map): its code finds its data at the distance it has in the host
     let vdso = crate::vdso::image();
     let vdso_len = (vdso.len() as u64).next_multiple_of(PAGE_SIZE);

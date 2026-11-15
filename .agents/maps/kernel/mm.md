@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -34,7 +34,7 @@ Outside the module (dependencies only): the page table, TLB, entry population, s
 groups (`kernel/mmu`); resident-memory measures, the OOM killer and process_mrelease (`kernel/oom`);
 the CPU engine and the Tier 1 translator (`engine`), SysV IPC objects (`kernel/ipc`), futexes
 (`kernel/futex`), the ELF loader (`kernel/exec`), the timer thread (`kernel/time`), procfs
-(`kernel/procfs`) and the cgroup files (`kernel/cgroup`), core dumps and the vDSO image (`kernel/signal`), FUSE reads
+(`kernel/procfs`) and the cgroup files (`kernel/cgroup`), core dumps (`kernel/signal`) and the vDSO image (`kernel/vdso`), FUSE reads
 (`kernel/fuse`) and the host abstraction layer (`core/hal`).
 
 ## Key types
@@ -171,7 +171,7 @@ the CPU engine and the Tier 1 translator (`engine`), SysV IPC objects (`kernel/i
 
 ### vDSO and `[vvar]`
 
-- The loader maps the vDSO image (`kernel/signal`) as private anonymous memory written by the
+- The loader maps the vDSO image (`kernel/vdso`) as private anonymous memory written by the
   kernel. When the image is the host's vDSO, `map_vvar` first maps `[vvar]` right below it, as
   long as the host's vvar mappings and at the same distance, since the host's code addresses its
   data relative to itself: a `Shared` VMA, readable only (`may_write` and `may_exec` false, so
@@ -533,7 +533,7 @@ signals may still be delivered).
   with host-page alignment, `map_file_over`, discard, remove, populate), `fstat`, `msync`,
   `mincore`-based residency, pagemap reads (`touched_pages`, `has_private_pages`), memfds,
   `ram_and_swap`, `page_size`.
-- `kernel/signal`'s vDSO: the image to refill (`image`, `svc_image`), the clock entries and their
+- `kernel/vdso`: the image to refill (`image`, `svc_image`), the clock entries and their
   stubs (`clocks`, `svc_bytes`), the host's vvar, and its identity as a trusted translation source.
 - `kernel/fuse` through `Fill::source` (the open file a `Fill` keeps open; reading is the
   caller's).

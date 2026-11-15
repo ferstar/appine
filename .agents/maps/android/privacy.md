@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/privacy.md` for the paired decision history (not yet created; the pre-split boundary is D4 in `.agents/decisions/android/terminal.md`; privacy decisions not yet distilled into that snapshot remain in f61072f3 Decision 1 and c7309c0c Decision 3 with their android/terminal tags).
 >
 > Verified: 2026-11-14 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -16,8 +18,8 @@ Root: `Privacy.kt` and `NotificationActivity.kt` in
 `drawable/privacy_emblem.xml` and `drawable/ic_lock.xml` under `android/app/src/main/res/`.
 
 Outside the module: shared strings, themes and `Ui.kt` (including the `showPrivate` wrapper)
-remain android/terminal's; the application registration, manifest, authentication dependency
-and instrumentation tests are android/native's. Settings' controls and export handoff are
+remain android/terminal's; application startup is android/native's; manifest and authentication dependency are
+android/build's, instrumentation tests belong to android/tests. Settings' controls and export handoff are
 android/setup's; preferences, notification redaction/routing and diagnostic archives are
 android/service's; provider denial and grant revocation are android/documents'. Call sites keep
 their own last-moment input, clipboard, browser and export checks.
@@ -69,7 +71,7 @@ their own last-moment input, clipboard, browser and export checks.
 
 ### Inbound
 
-- android/native: `MainApplication` installs the gate; the manifest registers the action activity.
+- android/native: `MainApplication` installs the gate; android/build registers the action activity.
 - android/terminal: `MainActivity` and `TerminalLinks` check the gate; `Ui.showPrivate` registers
   dialogs before showing them; the activity resumes deferred work through `onPrivacyUnlocked`.
 - android/setup: Settings requests mode changes and fresh export authorization, rechecks it

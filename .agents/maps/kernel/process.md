@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: clocks and timers split into kernel/time, and machine boot and PID 1 into kernel/boot)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
 
 ## Responsibilities
 
@@ -351,7 +351,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
   and the credentials can skip search-permission checks).
 - It is off while strace-tracing, under `PTRACE_SYSCALL`, single-stepping, or with a pending
   `ivau_page`; with seccomp only for numbers the filter always allows, and for the vDSO stubs'
-  reads of clocks Linux's vDSO reads in user space (`kernel/signal`).
+  reads of clocks Linux's vDSO reads in user space (`kernel/vdso`).
 - The per-thread record is built under the BKL and rebuilt when a global epoch moves, bumped by
   `fast_changed` (chdir, chroot, credential and fs changes, mounts, setns, execve, time-namespace
   entry); a call that cannot complete falls back to the BKL path (writes to guest memory it made
