@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/android/setup.md` for the paired decision history.
 >
-> Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
->
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
+> Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 
 ## Responsibilities
 
@@ -188,6 +186,14 @@ session consuming their state and events (`android/vt`).
 
 ### Prompt marks
 
+- Integrated bash, ash and zsh set OSC 2 to the full current `$PWD` at each primary prompt, with
+  control characters replaced by `?`. Programs can set OSC 0/2 titles between prompts; the next
+  primary prompt restores the directory. Bash sends it from `__appine_prompt`, zsh from precmd,
+  and ash after the visible PS1 and B mark. Secondary prompts do not replace the title.
+  The tab bar still shows numbers; these titles are available through long presses and TalkBack.
+  Existing shells retain their loaded hooks until a new shell starts or the full profile is
+  reloaded. Sourcing ashrc alone into an already-marked old PS1 skips its existing-mark guard.
+
 - For the terminal's shell integration (android/vtcore) the profile has login shells mark their
   prompts with OSC 133:
   - bash: the profile sets the coloured PS1 and reads `appine.bashrc`, whose `__appine_prompt`
@@ -236,8 +242,9 @@ session consuming their state and events (`android/vt`).
 
 - Each distro has built-in mirrors (official, Tsinghua, USTC, Aliyun). After every import, and
   only then, on the `appine-mirrors` thread, `chooseMirror` probes every mirror at once (one
-  thread each, up to 512 KB or 5 s each, waiting at most 10 s for each result) and takes the
-  highest throughput (ties to the earlier mirror); if every probe failed it does nothing.
+  thread each, checking 512 KiB and 5 s thresholds between reads, waiting at most 10 s for each result) and takes the
+  highest throughput (ties to the earlier mirror); if every probe failed it does nothing. A read
+  can overshoot either probe threshold; these are not hard byte or elapsed-time caps.
 - Writing (`useMirror`): only while the distro's sources file (`/etc/apk/repositories` or
   `debian.sources`) is byte for byte what the import wrote, with the official mirror, it is
   written again from the same template with the winner (nothing is written when the official
@@ -443,6 +450,14 @@ session consuming their state and events (`android/vt`).
 
 ## Confirmed bugs / technical debt
 
+- Mirror template comparison and replacement are separate operations: a guest edit between
+  them can be overwritten.
+- `locked` runs the install command even when `flock 9` fails. The unchecked return is confirmed;
+  consequences under lock errors or interruption have not been reproduced.
+- Busybox ash can emit literal path controls through the visible prompt's `\w`. The directory
+  title is sanitized and restored after that prompt, but other terminal effects in visible
+  prompt text are not sanitized.
+
 - **The rules miss changes that rename nothing in `/etc`.** A shadow or group file edited in place
   (an append, a text editor writing the file itself) changes no entry of `/etc`, a burst of more
   than 256 changed directories between two polls stops recording the rest, and changes before the
@@ -458,6 +473,10 @@ session consuming their state and events (`android/vt`).
   deleted?
 
 ## To verify
+
+- Two shell-title tests and two existing bash/ash prompt/login tests passed on API 34; host PTY
+  checks also covered zsh title restoration and Unicode paths. Custom prompt frameworks and live
+  upgrades of already-running shells remain limited.
 
 - Diagnostic export was exercised on API 34 with privacy off and with device credentials:
   success, cancellation, wrong PIN, screen-off invalidation and no replay after unlock.

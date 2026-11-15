@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: isolated terminal resize readiness and pixel regression tests)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: isolated shell-title restoration regression tests)
 
 ## Responsibilities
 
@@ -261,6 +261,10 @@ terminal's emulator shim and JNI functions (`android/vtcore`), Kotlin sessions (
   A timeout means no acknowledgment: it cannot prove no launch occurred or cancel buffered TCP requests.
 
 ### Tests
+
+- `ShellTitleTest` uses separate stores for two cases: real bash/ash title restoration after
+  a program exits, including directory changes and Unicode/control paths.
+  These and the two existing prompt-mark/login tests passed on API 34.
 
 - `TerminalResizeTest` uses isolated stores and shell-free terminals for seven API 34 checks:
   preview pixels under full-frame requests and subrow layouts, split control sequences, quiet

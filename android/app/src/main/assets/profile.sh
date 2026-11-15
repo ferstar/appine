@@ -11,6 +11,8 @@
 # reads, and on Alpine every interactive bash too (/etc/bash/appine.sh), so nested ones are marked;
 # ash gets them from /etc/profile.d/appine.ashrc, which ENV names so that ash reads it again after
 # ~/.profile and in nested shells.
+# Before each primary prompt the title returns to the current directory; a running program can
+# replace it with OSC 0/2 until the next prompt. Control characters in paths are replaced by ?.
 cat /etc/motd 2>/dev/null
 export TERM=xterm-256color
 export LANG=C.UTF-8
@@ -43,6 +45,7 @@ elif [ -n "${ZSH_VERSION-}" ]; then
         local ret=$?
         emulate -L zsh
         printf '\033]133;D;%s\007' "$ret"
+        printf '\033]2;%s\007' "${PWD//[[:cntrl:]]/?}"
         case $PS1 in *'133;B'*) ;; *) PS1=$'%{\e]133;A;cl=line\a%}'$PS1$'%{\e]133;B\a%}' ;; esac
         case $PS2 in *'133;B'*) ;; *) PS2=$'%{\e]133;P;k=s\a%}'$PS2$'%{\e]133;B\a%}' ;; esac
         eval '[[ $precmd_functions[-1] == __appine_precmd ]] ||

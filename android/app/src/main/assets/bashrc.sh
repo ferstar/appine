@@ -14,6 +14,8 @@ if [ -n "${BASH_VERSION-}" ]; then
     __appine_prompt() {
         local status=$?
         printf '\033]133;D;%s\007\033]133;A;redraw=last;cl=line\007' "$status"
+        # Restore the directory after a program's title, without letting path controls end OSC.
+        printf '\033]2;%s\007' "${PWD//[[:cntrl:]]/?}"
         case $PS1 in *'133;B'*) ;; *) PS1='\[\e]133;P;k=i\a\]'$PS1'\[\e]133;B\a\]' ;; esac
         case ${PS2-} in *'133;B'*) ;; *) PS2='\[\e]133;P;k=s\a\]'${PS2-}'\[\e]133;B\a\]' ;; esac
         case ${PS0-} in *'133;C'*) ;; *) PS0=${PS0-}'\e]133;C\a' ;; esac
