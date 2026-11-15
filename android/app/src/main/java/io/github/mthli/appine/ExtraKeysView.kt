@@ -57,7 +57,7 @@ import kotlin.math.roundToInt
  * 360 dp on. In a narrower view the last column stays at the right edge and the first seven scroll
  * sideways under it, fading out into the blank left of SHIFT while more of them lie beyond, as the
  * tab row fades out into ×.
- * Wide windows and short landscape windows use one row, with ESC, TAB and the arrows first and
+ * Wide windows and short landscape windows use one row, with ESC, TAB, / and - before navigation and
  * CTRL, ALT, SHIFT and SYM fixed at the right. The symbols and function pages fix only SYM there, retaining
  * the hidden modifiers' state; % ends the symbols' scrolling row. Cells never shrink below the minimum.
  *
@@ -231,12 +231,13 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
             ),
             upperKey = fixedView(modifier("SHIFT", shiftKey)),
         )
-        // Keep navigation within reach before the less frequent symbols and Home/End.
+        // Put ESC, TAB, / and - first, then up/down followed by left/right and Home/End, before | and ~.
         pages[KEYS].let { page ->
             val (top, bottom) = page.rows
             page.singleRowKeys = listOf(
-                top[0], bottom[0], bottom[3], bottom[5], top[4], bottom[4], // ESC TAB ← → ↑ ↓
-                top[1], top[2], top[3], top[5], top[6], bottom[6], // / - HOME END | ~
+                top[0], bottom[0], top[1], top[2], // ESC TAB / -
+                top[4], bottom[4], bottom[3], bottom[5], top[3], top[5], // ↑ ↓ ← → HOME END
+                top[6], bottom[6], // | ~
             )
         }
         // Keep bracket pairs together, $ and * on the left, and the shell control operators

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: single-row extra keys selected by available width or short landscape configuration, with state retained across resizing)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: the main single-row extra keys put up/down before left/right and HOME/END)
 
 ## Responsibilities
 
@@ -351,8 +351,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
   CTRL, ALT, SHIFT and SYM stay fixed at the right on the main page;
   the symbols and function pages fix only SYM, hiding the modifiers without clearing their state.
   SHIFT still waits on the symbols page but applies on the function page.
-  The main scrolling row is ESC, TAB, ←, →, ↑, ↓,
-  `/`, `-`, HOME, END, `|`, `~`; the symbols are the original scrolling top row followed by the
+  The main scrolling row is ESC, TAB, `/`, `-`, ↑, ↓, ←, →,
+  HOME, END, `|`, `~`; the symbols are the original scrolling top row followed by the
   bottom row and `%`, so the scrolling region ends at SYM's left edge,
   and the function page is F1–F12 followed by PGUP/PGDN. All keys remain available, each at least
   45 dp wide; excess keys scroll under the fixed group with the same fade and gesture exclusion.
