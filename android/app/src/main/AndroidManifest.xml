@@ -16,6 +16,7 @@
     <!-- PARTIAL_WAKE_LOCK follows the screen-off running policy (the android/service map). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- localeConfig enables the system language picker on Android 13+; older versions ignore it. -->
     <application
             android:name=".MainApplication"
             android:icon="@mipmap/ic_launcher"
@@ -23,7 +24,9 @@
             android:allowBackup="false"
             android:dataExtractionRules="@xml/data_extraction_rules"
             android:fullBackupContent="false"
-            android:theme="@style/Theme.Appine">
+            android:localeConfig="@xml/locale_config"
+            android:theme="@style/Theme.Appine"
+            tools:ignore="UnusedAttribute">
 
         <!-- Settings and the license pages leave out uiMode: they follow the system's dark mode,
              so a change recreates them with the other colours. No activity handles density: a

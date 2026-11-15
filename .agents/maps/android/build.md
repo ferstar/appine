@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/build.md` for the paired decision history (not yet created; pre-split decisions D2–D7, D10, D12–D14, D20–D22, D24–D26 and D28 stay in `.agents/decisions/android/native.md`).
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: system per-app language declaration)
 
 ## Responsibilities
 
@@ -120,6 +122,11 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ### Manifest
 
+- The application declares `android:localeConfig="@xml/locale_config"` for Android 13+'s
+  system per-app language picker. The explicit list is English (`en`) and Simplified Chinese
+  (`zh-CN`), matching the app's resources rather than dependency translations. Android 11–12
+  ignore the attribute and keep following the system language; the application suppresses
+  lint's `UnusedAttribute` for this intentional version-specific behavior.
 - Manifest application `MainApplication` lives in its own file and installs android/privacy's shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` (android/privacy) authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.
 - `MainApplication` also installs `Diagnostics` after the privacy gate. Non-exported
   `DiagnosticProvider` uses the existing AndroidX FileProvider with manifest path metadata,

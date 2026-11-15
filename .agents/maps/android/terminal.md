@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: dismissible notification banner and shared authorization from Settings)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: system per-app language selection and locale recreation)
 
 ## Responsibilities
 
@@ -76,6 +76,10 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ### Binding and choosing a tab
 
+- `res/xml/locale_config.xml` lists English (`en`, default strings) and Simplified Chinese
+  (`zh-CN`, `values-zh-rCN`) for the manifest's Android 13+ system language picker. There is
+  no in-app picker; Android 11–12 keep following the system language. Locale changes use
+  normal activity recreation and the existing service-current tab fallback below.
 - `attachBaseContext` applies an override containing only `UI_MODE_NIGHT_YES`, before the window,
   dynamic colours or views read resources. The terminal's night-qualified resources therefore
   match its fixed dark theme; other configuration fields and other activities remain independent.
@@ -363,6 +367,10 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- System per-app language selection: verify English, Simplified Chinese and returning to the
+  system default on Android 13+, including retaining the current terminal tab across recreation.
+  Device switching and vendor settings UI remain unverified.
 
 - Tab-list coverage of the notification banner passed API 34 checks with notifications disabled
   and enabled: the first row stays flush below the top bar, taps over the banner select a row
