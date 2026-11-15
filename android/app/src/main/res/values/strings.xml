@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="settings_privacy">Privacy mode</string>
-    <string name="privacy_summary">Require authentication when returning to Appine</string>
+    <string name="privacy_summary">Require unlock on return</string>
     <string name="privacy_enable_message">Require biometrics or your screen lock to open Appine. Screenshots and notification details will be hidden, and other apps will lose file access. Background programs will keep running.</string>
     <string name="privacy_file_access">Unavailable while privacy mode is on</string>
     <string name="privacy_locked">Appine is locked</string>
@@ -128,9 +128,9 @@
     <string name="restart_message">All sessions end and the system restarts with the new execution mode.</string>
     <string name="restart">Restart</string>
     <string name="settings_run_policy">Screen-off running</string>
-    <string name="run_sleep_summary">Allow sleep. Programs may pause with the screen off.</string>
-    <string name="run_busy_summary">Run while busy. Allow sleep after 30 seconds of inactivity. For long network waits or scheduled tasks, choose Always run.</string>
-    <string name="run_always_summary">Always run with the screen off. Uses more battery.</string>
+    <string name="run_sleep_summary">Allow sleep, programs may pause</string>
+    <string name="run_busy_summary">Run while busy, allow sleep after 30 seconds idle</string>
+    <string name="run_always_summary">Always run, uses more battery</string>
     <string name="run_busy">Run while busy</string>
     <string name="run_always">Always run</string>
     <string name="allow_sleep">Allow sleep</string>
@@ -176,26 +176,26 @@
     <string name="report_copied">Report copied</string>
     <string name="boot_failed_text">%1$s. The boot output is in /var/log/boot.log.</string>
     <string name="settings_file_access">Allow other apps to access files</string>
-    <string name="file_access_summary">Access Appine files through the system file picker. Your home directory is writable; other directories are read-only.</string>
+    <string name="file_access_summary">HOME directory is writable, others are read-only</string>
     <string name="file_access_title">Allow other apps to access files?</string>
-    <string name="file_access_message">Your home and system directories will appear in the system file picker. Apps you authorize can read or copy SSH private keys, passwords and other sensitive information stored there, even from read-only files.</string>
+    <string name="file_access_message">Your HOME and system directories will appear in the system file picker. Apps you authorize can read or copy SSH private keys, passwords and other sensitive information stored there, even from read-only files.</string>
     <string name="file_access_enable">Enable</string>
     <string name="settings_fill_wide">Enlarge CJK characters</string>
-    <string name="fill_wide_on">Scale proportionally to fill two cells, reducing gaps between characters.</string>
-    <string name="fill_wide_off">Keep the original size, centred within two cells.</string>
+    <string name="fill_wide_on">Scale proportionally to fill two cells</string>
+    <string name="fill_wide_off">Original size, centred in two cells</string>
     <string name="settings_cursor_style">Cursor shape</string>
     <string name="cursor_block">Block</string>
     <string name="cursor_bar">Bar</string>
     <string name="cursor_underline">Underline</string>
     <string name="settings_cursor_blink">Blinking cursor</string>
-    <string name="cursor_blink_on">Blinks by default. Programs can override this.</string>
-    <string name="cursor_blink_off">Steady by default. Programs can override this.</string>
+    <string name="cursor_blink_on">Blinks by default, programs can override</string>
+    <string name="cursor_blink_off">Steady by default, programs can override</string>
     <string name="settings_volume_keys">Volume keys switch tabs</string>
-    <string name="volume_keys_on">Volume up: previous tab. Volume down: next tab. With one tab, adjust volume.</string>
-    <string name="volume_keys_off">Adjust volume as usual.</string>
+    <string name="volume_keys_on">Up to previous tab, down to next tab, adjust volume with one tab</string>
+    <string name="volume_keys_off">Adjust volume as usual</string>
     <string name="settings_show_tab_list">Show tab list button</string>
-    <string name="tab_list_on">Show at the left of the tab bar.</string>
-    <string name="tab_list_off">Hidden from the tab bar.</string>
+    <string name="tab_list_on">Shown on the left of the tab bar</string>
+    <string name="tab_list_off">Hidden from the tab bar</string>
     <string name="documents_home" translatable="false">%1$s · %2$s</string>
     <string name="documents_system">The whole system (read-only) · %1$s</string>
     <plurals name="sessions_running">

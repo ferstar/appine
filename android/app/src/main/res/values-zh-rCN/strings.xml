@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="settings_privacy">隐私模式</string>
-    <string name="privacy_summary">返回 Appine 时需要验证身份</string>
+    <string name="privacy_summary">返回时需要解锁</string>
     <string name="privacy_enable_message">打开 Appine 时需要通过生物识别或锁屏密码验证。开启后将禁止截屏、隐藏通知详情，并关闭其他应用的文件访问权限。后台程序会继续运行。</string>
     <string name="privacy_file_access">隐私模式下不可用</string>
     <string name="privacy_locked">Appine 已锁定</string>
@@ -126,9 +126,9 @@
     <string name="restart_message">所有会话都会结束，系统将以新的执行模式重新启动。</string>
     <string name="restart">重启</string>
     <string name="settings_run_policy">熄屏运行策略</string>
-    <string name="run_sleep_summary">允许休眠，熄屏后程序可能暂停</string>
-    <string name="run_busy_summary">忙时保持运行，连续空闲 30 秒后允许休眠。长时间等待网络或定时执行的任务，请选择「始终运行」</string>
-    <string name="run_always_summary">始终运行，熄屏后继续运行，更耗电</string>
+    <string name="run_sleep_summary">允许休眠，程序可能暂停</string>
+    <string name="run_busy_summary">忙时保持运行，空闲 30 秒后允许休眠</string>
+    <string name="run_always_summary">始终运行，更耗电</string>
     <string name="run_busy">忙时运行</string>
     <string name="run_always">始终运行</string>
     <string name="allow_sleep">允许休眠</string>
@@ -173,13 +173,13 @@
     <string name="report_copied">已复制报告</string>
     <string name="boot_failed_text">%1$s。开机的输出在 /var/log/boot.log。</string>
     <string name="settings_file_access">允许其他应用访问文件</string>
-    <string name="file_access_summary">通过系统文件选择器访问 Appine 文件，home 目录可读写，其他目录只读</string>
+    <string name="file_access_summary">HOME 目录可读写，其他目录只读</string>
     <string name="file_access_title">允许其他应用访问文件？</string>
-    <string name="file_access_message">开启后，home 和系统目录会出现在系统文件选择器中。获准访问的应用可读取或复制其中的 SSH 私钥、密码等敏感信息，即使文件只读。</string>
+    <string name="file_access_message">开启后，HOME 目录和系统目录会出现在系统文件选择器中。获准访问的应用可读取或复制其中的 SSH 私钥、密码等敏感信息，即使文件只读。</string>
     <string name="file_access_enable">开启</string>
     <string name="settings_fill_wide">放大中日韩文字</string>
-    <string name="fill_wide_on">等比放大至两格宽，减少字间留白</string>
-    <string name="fill_wide_off">保持原始大小，在两格内居中显示</string>
+    <string name="fill_wide_on">等比放大至两格宽</string>
+    <string name="fill_wide_off">原始大小，两格内居中</string>
     <string name="settings_cursor_style">光标形状</string>
     <string name="cursor_block">方块</string>
     <string name="cursor_bar">竖线</string>
@@ -188,7 +188,7 @@
     <string name="cursor_blink_on">默认闪烁，程序可自行调整</string>
     <string name="cursor_blink_off">默认不闪烁，程序可自行调整</string>
     <string name="settings_volume_keys">音量键切换标签页</string>
-    <string name="volume_keys_on">音量加减键分别切换到前后标签页，单个标签页时调节音量</string>
+    <string name="volume_keys_on">加减键切换前后标签页，单个标签页时调节音量</string>
     <string name="volume_keys_off">正常调节音量</string>
     <string name="settings_show_tab_list">显示标签页列表按钮</string>
     <string name="tab_list_on">显示在标签栏最左侧</string>
