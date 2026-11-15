@@ -18,6 +18,10 @@ cat /etc/motd 2>/dev/null
 export TERM=xterm-256color
 export LANG=C.UTF-8
 export NMAP_UNPRIVILEGED=1
+# Login switches such as su - clear the console's environment; restore the browser default.
+if [ -z "${BROWSER-}" ] && [ -x /usr/local/bin/xdg-open ]; then
+    export BROWSER=/usr/local/bin/xdg-open
+fi
 # Interactive ash (and dash, which the file ignores) reads the file ENV names; one already set is
 # the user's
 if [ -z "${ENV-}" ] && [ -r /etc/profile.d/appine.ashrc ]; then

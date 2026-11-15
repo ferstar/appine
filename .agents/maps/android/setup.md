@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: conditional notification authorization entry in the Android group)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: browser defaults after login environment resets and stock-profile migration)
 
 ## Responsibilities
 
@@ -143,8 +143,8 @@ session consuming their state and events (`android/vt`).
     http for trixie, -updates, -security), `hostname` (`localhost`), `motd`, and
     `/etc/profile.d/appine.ashrc`, `/etc/profile.d/appine.bashrc`, on Alpine
     `/etc/bash/appine.sh`, and then `/etc/profile.d/appine.sh` (the assets' `ashrc.sh`,
-    `bashrc.sh` and `profile.sh`: motd, `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, `ENV` naming the ash
-    file unless one is set or the file is unreadable, and for bash, busybox ash and zsh only a
+    `bashrc.sh` and `profile.sh`: motd, `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, the browser default below,
+    `ENV` naming the ash file unless one is set or the file is unreadable, and for bash, busybox ash and zsh only a
     coloured prompt with prompt marks, below; other shells keep the distro's prompt);
   - Alpine: `hosts` only when absent (the minirootfs ships one, so nothing is written), and no
     `resolv.conf` (the kernel writes one pointing at the DNS stub at every start when it is
@@ -164,6 +164,10 @@ session consuming their state and events (`android/vt`).
   Before every kernel start it refreshes the static `/usr/local/libexec/appine-open-url` (0755)
   and `/etc/appine/browser` (0644: current loopback port and capability, shared by guest users).
   The shim execs that client; `ConsolePty` sets `BROWSER` to the shim (android/vt).
+  The login profile also exports that default when `BROWSER` is unset or empty and the shim is
+  executable, restoring browser discovery after `su -` clears the inherited environment.
+  Nonempty custom values are preserved. This requires a shell that reads `/etc/profile`;
+  shells such as fish and Debian's zsh need their own login configuration.
   Each invocation rereads the configuration and sends one HTTP(S) URL without using a TTY or
   inherited tab token; success acknowledges Android intent acceptance, not page loading or login.
 - On the start thread, after an import and the start of its mirror probe when there is one, in
@@ -495,6 +499,12 @@ session consuming their state and events (`android/vt`).
   deleted?
 
 ## To verify
+
+- Browser defaults passed interactive `su -` checks for root and a regular user with Alpine
+  ash/bash and Debian dash/bash in container PTYs, including launcher invocation with an intact
+  URL, custom/empty values and a non-executable launcher. Debug assembly passed. The updated
+  profile and Codex authorization flow have not been retested on Android; existing stores receive
+  the change at kernel restart only when their old Appine profile is recognized and unedited.
 
 - Notification authorization passed debug assembly, lint and API 34 checks: visibility after
   banner dismissal, first request, denial then system settings, and removal after granting in
