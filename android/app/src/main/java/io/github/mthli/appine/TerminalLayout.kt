@@ -2,12 +2,19 @@ package io.github.mthli.appine
 
 import android.content.Context
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.LayerDrawable
+import android.text.TextUtils
+import android.util.TypedValue
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.graphics.drawable.toDrawable
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
@@ -25,6 +32,7 @@ internal class TerminalLayout(
     tabs: TabListView.Target,
     find: SearchBarView.Target,
     extraKeys: ExtraKeysView.Target,
+    enableNotifications: () -> Unit,
 ) {
     val screen = VtView(context, host).apply {
         setFontSize(fontSize)
@@ -45,6 +53,32 @@ internal class TerminalLayout(
     /** In the tab bar's place while the current tab is searched. */
     val searchBar = SearchBarView(context, find).apply { isVisible = false }
     val keys = ExtraKeysView(context, extraKeys)
+
+    val notificationPrompt = Button(context).apply {
+        isVisible = false
+        setText(R.string.notification_prompt)
+        setTextColor(context.themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant))
+        setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14f)
+        typeface = Typeface.DEFAULT
+        isAllCaps = false
+        isSingleLine = true
+        ellipsize = TextUtils.TruncateAt.END
+        gravity = Gravity.CENTER
+        minWidth = 0
+        minimumWidth = 0
+        minHeight = 0
+        minimumHeight = 0
+        setPadding(context.dp(12), 0, context.dp(12), 0)
+        backgroundTintList = null
+        background = LayerDrawable(arrayOf(
+            context.themeColor(com.google.android.material.R.attr.colorSurfaceContainer).toDrawable(),
+            touchFeedback(),
+        ))
+        setOnClickListener {
+            it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            enableNotifications()
+        }
+    }
 
     val root: LinearLayout
 
@@ -119,13 +153,14 @@ internal class TerminalLayout(
             orientation = LinearLayout.VERTICAL
             // Let the keys follow the IME beyond this column's bottom edge.
             clipChildren = false
+            addView(notificationPrompt, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, context.dp(32)))
             addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(keys)
         }
         val overlay = FrameLayout(context).apply {
             clipChildren = false
             addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-            // The list covers both the terminal and the keys, including during IME animation.
+            // The list covers the banner, terminal and keys, including during IME animation.
             addView(tabList, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         root = LinearLayout(context).apply {

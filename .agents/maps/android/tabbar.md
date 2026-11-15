@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: tab-list placement and dismissal above the extra keys)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: tab-list coverage above the notification banner)
 
 ## Responsibilities
 
@@ -31,8 +31,8 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 - `TabMarks` — shared progress/status drawing and accessible status text for the bar and list;
   draws over a direct child number, following its translation and opacity, and reports whether
   a sweep needs another frame. Each container owns the redraw scheduling.
-- `TabListView` — a full-width overlay above the terminal and extra keys, flush below the bar. Its
-  RecyclerView shows session numbers, single-line ellipsized titles and independent close buttons;
+- `TabListView` — a full-width overlay above the notification banner, terminal and extra keys,
+  flush below the bar. Its RecyclerView shows session numbers, single-line ellipsized titles and independent close buttons;
   immutable row snapshots (including progress and status) and stable session IDs keep updates
   and callbacks tied to sessions. `refreshStatus` diffs new reports only while open.
   `open` renders and reveals the current row without moving input focus; `render` updates an open
@@ -119,11 +119,13 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   reveals the current tab after layout, and layout updates gesture exclusion to the new row bounds.
   `MainActivity` reads `Settings.showTabList` on start and on live settings changes, closing an open
   list before hiding its button, including while both activities are visible in split screen.
-- The tab list overlays the terminal and extra keys in the same activity window, without regridding it, on black
-  with no gap, margins, border, rounded corners or elevation. Rows are 32 dp, labels 14 dp for the
+- The tab list overlays the notification banner, terminal and extra keys in the same activity
+  window, without regridding it, on black with no gap, margins, border, rounded corners or elevation.
+  Rows are 32 dp, labels 14 dp for the
   number, title and close button; the current row uses primary text and ended titles
-  are faded and marked. At most ten rows fit, further limited by the combined terminal and extra-key height;
-  the list scrolls and opens with the current tab visible. Its themed vertical scrollbar appears
+  are faded and marked. At most ten rows fit, further limited by the content height below the top bar
+  (including the notification banner when visible); the list scrolls and opens with the current
+  tab visible. Its themed vertical scrollbar appears
   while scrolling and fades afterward; no thumb is drawn when all rows fit. Titles use the bar’s `sh` fallback.
   Every running row, including the current tab, draws the shared progress bar and status dot
   around its number. Primary text alone marks selection in the list; ended rows show no marks.
@@ -143,8 +145,9 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   and consumes that tap. Back, Escape,
   explicit tab switching, search, the other bar actions, extra-key input, pause and restart dismiss
   it too. Touch opening and scrolling preserve terminal input focus and its IME connection;
-  the terminal and extra keys are hidden from accessibility while the list is open. Closing restores terminal
-  focus only if a list control had it; close confirmations return focus to the terminal.
+  the notification banner, terminal and extra keys are hidden from accessibility while the list
+  is open. Closing restores terminal focus only if a list control had it; close confirmations
+  return focus to the terminal.
   It lives under the activity’s privacy shield and secure-window policy, rather than in a separate popup.
 
 ### The progress line
@@ -227,6 +230,11 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   looks like the current tab's indicator, told apart only by the numbers' colours.
 
 ## To verify
+
+- Notification-banner coverage passed API 34 visual and touch checks with the banner visible
+  and absent: the list starts directly below the bar, covered-banner taps select a row without
+  requesting permission, and dismissal restores the banner. The covered banner is excluded
+  from important accessibility nodes; TalkBack speech remains unverified. Debug assembly and lint passed.
 
 - After moving the list above the extra keys, debug assembly and lint passed, and the three
   existing TabListTest cases passed on API 34 and S23 API 36. API 34 checks confirmed rows cover

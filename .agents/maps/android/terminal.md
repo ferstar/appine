@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: raise the tab list above the terminal and extra keys)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: let the tab list cover the notification banner)
 
 ## Responsibilities
 
@@ -41,8 +41,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   program may read the clipboard (`clipboardQuestion`).
 - `TerminalLayout` — builds the views with the activity's adapters after dynamic colours are
   applied: a black column of one bar's place (`TabBarView`, or `SearchBarView` while searching),
-  a shared overlay frame containing a column of the terminal body (`VtView`, status text and
-  `ProgressLine` along its top) and `ExtraKeysView`, with `TabListView` above that column;
+  a shared overlay frame containing a column of the optional notification-permission banner,
+  the terminal body (`VtView`, status text and `ProgressLine` along its top) and `ExtraKeysView`,
+  with `TabListView` above that column;
   exposes the root and interactive views, keeps the status view private behind `showStatus` and
   `showTerminal`, and owns the IME animation callback `keysFollowIme`.
 - `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
@@ -82,7 +83,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   change; a pixel size an earlier version kept as `font_size` is converted at the current density
   and removed), applies the saved Keep screen on choice (off by default), builds `TerminalLayout`
   (the status line says "Starting…", insets and IME animation are wired there), installs its root
-  edge-to-edge; on Android 13 and later it asks for notification permission after the privacy gate opens. `onStart` applies the wide-cell
+  edge-to-edge and updates the notification banner without requesting permission. `onStart` applies the wide-cell
   and tab-list visibility settings through `onSettingsChanged`, starts and binds the service; `onServiceConnected` registers the listener and replays
   the start's result or progress and pending notices; `onStop` unregisters and unbinds.
 - When the kernel is ready the tab shown is, in order: one a notification asked for (`EXTRA_TAB`,
@@ -110,9 +111,10 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   coordinates focus, Back and accessibility, and performs session/menu actions.
 - The list closes on tab switching, search, other bar actions, extra-key input, pause and restart;
   list close buttons retain it while using the existing busy confirmation.
-- The list overlays both the terminal and extra keys below the top bar; its rows may cover the
-  keys in short viewports. Taps outside its rows dismiss and are consumed, including over the keys.
-  Both the terminal and extra keys are hidden from accessibility while it is open.
+- The list starts directly below the top bar and overlays the notification banner, terminal
+  and extra keys; its rows may cover the keys in short viewports. Taps outside its rows dismiss
+  and are consumed, including over the keys. The banner, terminal and extra keys are hidden
+  from accessibility while the list is open, and restored when it closes.
 
 - The list’s close buttons, `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
   they close is busy (its shell has ended, has not started, as in a restored tab never shown, or
@@ -138,6 +140,27 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   It is independent of the service's screen-off run policy and partial wake lock. The popup's
   context uses `ThemeOverlay.Appine.CheckPopup`, removing the checkbox's own background while
   retaining the menu row's press feedback and the overflow menu's placement.
+
+### Notification permission
+
+- `NotificationManager.areNotificationsEnabled()` controls a 32 dp banner below the top bar,
+  also while searching. The whole banner is a button with a centered, localized 14 dp message
+  explaining background activity and command alerts; the message ellipsizes in narrow windows. It uses the
+  theme's surface-container background, muted text, full-row touch feedback and a tap haptic.
+  The background layers the surface colour under `selectableItemBackground`, with Button's
+  background tint cleared. The former foreground ripple received pressed state but showed no
+  visible feedback on API 34; background-layer feedback was checked with held-touch screenshots.
+- Startup and privacy unlock never request permission. Tapping the banner checks the privacy gate and
+  closes the tab list. On Android 13+, a first request uses the activity-result API; a prior
+  attempt persisted as `requested_notifications`, or the system's denial rationale state,
+  routes to app notification settings. Android 11–12 also use settings when notifications are off.
+  On migration, an installation updated since its first install is treated as already requested,
+  since older versions asked at startup without saving history and may have a permanent denial.
+  A dismissed dialog also counts as an attempt; only another button click opens settings.
+- Settings uses `ACTION_APP_NOTIFICATION_SETTINGS` with `EXTRA_APP_PACKAGE`, falling back to
+  `ACTION_APPLICATION_DETAILS_SETTINGS` if the first activity is missing. The permission result
+  and every `onResume` refresh visibility, so enabling notifications removes the banner and
+  returns its space to the terminal. Individual disabled channels do not show the banner.
 
 ### Extra-key integration
 
@@ -332,6 +355,20 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- Tab-list coverage of the notification banner passed API 34 checks with notifications disabled
+  and enabled: the first row stays flush below the top bar, taps over the banner select a row
+  without opening settings, and dismissal restores the banner's action and accessibility node.
+  The covered banner is excluded from the compressed accessibility tree; TalkBack speech remains
+  unverified. Debug assembly and lint passed.
+
+- Notification permission passed debug assembly, lint and API 34 emulator checks: no startup
+  dialog, button-triggered request, denial followed by relaunch and settings navigation,
+  legacy permanent denial, dialog dismissal, and banner removal after granting in either place.
+  The full-width 32 dp row was checked visually and exposed as one clickable, focusable button;
+  taps on its text and right-side blank area both opened notification settings on API 34.
+  Vendor settings screens, the missing-handler fallback,
+  Android 11–12 and TalkBack remain unverified for this flow.
 
 - Tab-list coverage and hit routing over the extra keys passed API 34 checks in a short viewport;
   a tap on exposed keys below a shorter list dismisses without activating the key. Opening the

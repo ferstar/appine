@@ -65,6 +65,7 @@
     <string name="tab_description">Tab %1$d: %2$s</string>
     <string name="tab_number">Tab %1$d</string>
     <string name="channel_terminal">Bells, notifications from programs and finished commands</string>
+    <string name="notification_prompt">Enable notifications for background activity</string>
     <string name="bell_rang">The terminal bell rang</string>
     <string name="program_copied">A program copied text to the clipboard</string>
     <string name="tab_description_status">Tab %1$d: %2$s (%3$s)</string>

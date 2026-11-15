@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.NotificationManager
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -11,6 +12,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -38,6 +40,7 @@ import androidx.lifecycle.ViewModelProvider
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import io.github.mthli.appine.MainActivity.Companion.PREF_FONT_SIZE
+import android.provider.Settings as SystemSettings
 
 /**
  * The terminal screen: the tab bar ([TabBarView]) on top, the terminal ([VtView]) in the middle,
@@ -60,6 +63,9 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     private val pickFiles = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         files.selected(uris)
     }
+    private val requestNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        updateNotificationPrompt()
+    }
 
     private var service: TerminalService? = null
     private var current: VtSession? = null
@@ -75,7 +81,6 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     /** The last toast ([showToast]), cancelled by the next. */
     private var toast: Toast? = null
-    private var requestedNotifications = false
 
     /**
      * The key of the shortcut or volume key last taken ([dispatchKeyEvent]), whose release is
@@ -133,6 +138,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         super.onCreate(savedInstanceState)
         onBackPressedDispatcher.addCallback(this, closeSearchOnBack)
         onBackPressedDispatcher.addCallback(this, closeTabListOnBack)
+        initializeNotificationRequest()
         keepScreenOn = getPreferences(MODE_PRIVATE).getBoolean(PREF_KEEP_SCREEN_ON, false)
         // A notification's tab only when it starts this activity: one recreated (a configuration
         // change, or the system bringing it back after killing the app) or opened from Recents
@@ -140,7 +146,8 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         if (savedInstanceState == null && intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0) {
             requestedTab = intent.getIntExtra(EXTRA_TAB, -1)
         }
-        layout = TerminalLayout(this, savedFontSize(), Host(), Bar(), Tabs(), Find(), Keys())
+        layout = TerminalLayout(this, savedFontSize(), Host(), Bar(), Tabs(), Find(), Keys(), ::enableNotifications)
+        updateNotificationPrompt()
         renderTabs()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(layout.root)
@@ -162,6 +169,11 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         val intent = Intent(this, TerminalService::class.java)
         startForegroundService(intent)
         bindService(intent, connection, BIND_AUTO_CREATE)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateNotificationPrompt()
     }
 
     override fun onPause() {
@@ -194,11 +206,53 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     override fun onPrivacyUnlocked() {
         updateImport()
         onNotice()
-        if (!requestedNotifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+    }
+
+    // ---- Notification permission ----
+
+    private fun initializeNotificationRequest() {
+        val preferences = getPreferences(MODE_PRIVATE)
+        if (preferences.contains(PREF_REQUESTED_NOTIFICATIONS)) return
+        // Older versions requested on startup without saving the attempt. An upgrade may
+        // inherit a permanent denial, indistinguishable from a first request via rationale.
+        val installed = packageManager.getPackageInfo(packageName, 0)
+        preferences.edit {
+            putBoolean(PREF_REQUESTED_NOTIFICATIONS, installed.lastUpdateTime > installed.firstInstallTime)
+        }
+    }
+
+    private fun updateNotificationPrompt() {
+        val enabled = getSystemService(NotificationManager::class.java).areNotificationsEnabled()
+        layout.notificationPrompt.isVisible = !enabled
+    }
+
+    private fun enableNotifications() {
+        if (Privacy.locked(this)) return
+        closeTabList()
+        val preferences = getPreferences(MODE_PRIVATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !preferences.getBoolean(PREF_REQUESTED_NOTIFICATIONS, false) &&
+            !shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)
         ) {
-            requestedNotifications = true
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
+            // Keep the attempt across recreation; a later click opens settings instead of asking again.
+            preferences.edit { putBoolean(PREF_REQUESTED_NOTIFICATIONS, true) }
+            requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        openNotificationSettings()
+    }
+
+    private fun openNotificationSettings() {
+        val intent = Intent(SystemSettings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(SystemSettings.EXTRA_APP_PACKAGE, packageName)
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            startActivity(Intent(
+                SystemSettings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", packageName, null),
+            ))
         }
     }
 
@@ -460,6 +514,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         val sessions = service?.sessions.orEmpty().toList()
         if (sessions.isEmpty()) return
         layout.tabList.open(sessions, current)
+        layout.notificationPrompt.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         layout.screen.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         layout.keys.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         layout.tabBar.setListOpen(true)
@@ -470,6 +525,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         if (!layout.tabList.isVisible) return
         val hadFocus = layout.tabList.hasFocus()
         layout.tabList.close()
+        layout.notificationPrompt.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
         layout.screen.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
         layout.keys.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
         layout.tabBar.setListOpen(false)
@@ -830,6 +886,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         private const val PREF_FONT_SIZE_PX = "font_size"
 
         private const val PREF_KEEP_SCREEN_ON = "keep_screen_on"
+        private const val PREF_REQUESTED_NOTIFICATIONS = "requested_notifications"
 
         private const val DEFAULT_FONT_DP = 12f
 

@@ -63,6 +63,7 @@
     <string name="tab_description">标签页 %1$d：%2$s</string>
     <string name="tab_number">标签页 %1$d</string>
     <string name="channel_terminal">响铃、程序的通知和命令结束</string>
+    <string name="notification_prompt">开启通知，查看后台状态与命令提醒</string>
     <string name="bell_rang">终端响铃了</string>
     <string name="program_copied">程序把文本复制到了剪贴板</string>
     <string name="tab_description_status">标签页 %1$d：%2$s（%3$s）</string>
