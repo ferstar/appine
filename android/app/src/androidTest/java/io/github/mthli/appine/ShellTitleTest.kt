@@ -10,7 +10,7 @@ import java.lang.reflect.Proxy
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
-/** Real shell title restoration in isolated stores. */
+/** Real shell command titles and directory restoration in isolated stores. */
 @RunWith(AndroidJUnit4::class)
 class ShellTitleTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -66,6 +66,41 @@ class ShellTitleTest {
             awaitTitle("/root")
             send("cd /tmp\n")
             awaitTitle("/tmp")
+            if (!ash) {
+                fun commandTitle(command: String, title: String = command) {
+                    // Bracketed paste preserves literal controls without invoking readline keys.
+                    send("\u001b[200~$command\u001b[201~\n")
+                    awaitTitle(title)
+                    send("\n")
+                    awaitTitle("/tmp")
+                }
+                send("sleep 0.1\n")
+                awaitTitle("sleep 0.1")
+                awaitTitle("/tmp")
+                commandTitle("read -r answer")
+                commandTitle(":; read -r answer")
+                commandTitle("printf '' | { read -r answer </dev/tty; }")
+                commandTitle("read -r answer # 中文\u0007\u001b]2;Injected",
+                    "read -r answer # 中文??]2;Injected")
+                commandTitle("read -r answer # \$(printf wrong) `printf wrong` \\a")
+                send("false\n")
+                awaitTitle("/tmp")
+                send("printf '\\033]2;status=%s\\007' \"\$?\"; read -r answer\n")
+                awaitTitle("status=1")
+                send("\n")
+                awaitTitle("/tmp")
+                send("HISTCONTROL=ignoreboth\n")
+                awaitTitle("/tmp")
+                commandTitle(" read -r answer", "bash")
+                send("set +o history\n")
+                awaitTitle("/tmp")
+                commandTitle("read -r answer", "bash")
+                send("set -o history; unset HISTCONTROL\n")
+                awaitTitle("/tmp")
+                send(". /etc/profile.d/appine.bashrc; . /etc/profile.d/appine.bashrc\n")
+                awaitTitle("/tmp")
+                commandTitle("read -r answer")
+            }
             send("sh -c 'printf \"\\033]2;Building\\007\"; read -r answer'\n")
             awaitTitle("Building")
             send("\n")

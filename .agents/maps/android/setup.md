@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/setup.md` for the paired decision history.
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
+>
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: bash/zsh command titles and stock-profile migration)
 
 ## Responsibilities
 
@@ -187,9 +189,17 @@ session consuming their state and events (`android/vt`).
 ### Prompt marks
 
 - Integrated bash, ash and zsh set OSC 2 to the full current `$PWD` at each primary prompt, with
-  control characters replaced by `?`. Programs can set OSC 0/2 titles between prompts; the next
-  primary prompt restores the directory. Bash sends it from `__appine_prompt`, zsh from precmd,
+  control characters replaced by `?`. Before execution, bash and zsh set OSC 2 to the submitted
+  command line, also sanitized, once for the whole pipeline or compound command. This is input
+  text, not tracking of the foreground executable or its children. Programs can replace it with
+  OSC 0/2 between prompts; the next primary prompt restores the directory.
+  Bash sends the directory from `__appine_prompt`, zsh from precmd,
   and ash after the visible PS1 and B mark. Secondary prompts do not replace the title.
+  Bash appends `$(__appine_preexec)` to PS0 once and snapshots `HISTCMD` at each prompt. The
+  preexec function reads `history 1` with no timestamp only when history is enabled and its
+  counter advanced; otherwise it reports `bash`, including ignored duplicate/space-prefixed
+  commands, HISTIGNORE matches and disabled history. It does not install a DEBUG trap or
+  change history settings. Zsh uses preexec's command argument, independent of history storage.
   The tab bar still shows numbers; these titles are available through long presses and TalkBack.
   Existing shells retain their loaded hooks until a new shell starts or the full profile is
   reloaded. Sourcing ashrc alone into an already-marked old PS1 skips its existing-mark guard.
@@ -220,7 +230,8 @@ session consuming their state and events (`android/vt`).
     prompt, wraps PS1 (A with `cl=line` … B) and PS2 (P with `k=s` … B) in `%{ %}` whenever the
     marks are missing, and moves itself last in `precmd_functions`, so a PS1 that `~/.zshrc` or a
     theme's own hook sets is wrapped (a theme setting PS1 before each prompt gets its first prompt
-    unmarked); `__appine_preexec`, appended to `preexec_functions`, prints the output's start (C).
+    unmarked); `__appine_preexec`, appended to `preexec_functions`, prints the output's start (C)
+    and the command title. Reloading the profile deduplicates both hook registrations.
     A and B are in PS1, so every redraw by zle sends them again; D is sent once per prompt.
   - `cl=line` tells the terminal that the three line editors move the cursor with the left and
     right arrows, so a tap on the typed command moves the cursor there.
@@ -457,6 +468,8 @@ session consuming their state and events (`android/vt`).
 - Busybox ash can emit literal path controls through the visible prompt's `\w`. The directory
   title is sanitized and restored after that prompt, but other terminal effects in visible
   prompt text are not sanitized.
+- Automatic command titles cover bash and zsh only. Busybox ash has no preexec hook; it still
+  needs terminal-side or foreground-process detection to report commands that set no title.
 
 - **The rules miss changes that rename nothing in `/etc`.** A shadow or group file edited in place
   (an append, a text editor writing the file itself) changes no entry of `/etc`, a burst of more
@@ -474,9 +487,11 @@ session consuming their state and events (`android/vt`).
 
 ## To verify
 
-- Two shell-title tests and two existing bash/ash prompt/login tests passed on API 34; host PTY
-  checks also covered zsh title restoration and Unicode paths. Custom prompt frameworks and live
-  upgrades of already-running shells remain limited.
+- Two shell-title tests and two existing bash/ash prompt/login tests passed on API 34, including
+  bash command titles, pipelines, literal/control text, history fallback, status preservation and
+  hook reloads. Host PTYs covered bash 5.2 and zsh, including history exclusions, existing DEBUG
+  traps and single title emission after reload. Custom prompt frameworks, history changes in
+  later PROMPT_COMMAND entries and live upgrades of already-running shells remain limited.
 
 - Diagnostic export was exercised on API 34 with privacy off and with device credentials:
   success, cancellation, wrong PIN, screen-off invalidation and no replay after unlock.

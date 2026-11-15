@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: isolated shell-title restoration regression tests)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: bash command-title and history-fallback regression coverage)
 
 ## Responsibilities
 
@@ -263,7 +263,8 @@ terminal's emulator shim and JNI functions (`android/vtcore`), Kotlin sessions (
 ### Tests
 
 - `ShellTitleTest` uses separate stores for two cases: real bash/ash title restoration after
-  a program exits, including directory changes and Unicode/control paths.
+  a program exits, directory changes and Unicode/control paths; bash also covers command titles,
+  pipelines, literal/control text, history fallback, exit-status preservation and hook reloads.
   These and the two existing prompt-mark/login tests passed on API 34.
 
 - `TerminalResizeTest` uses isolated stores and shell-free terminals for seven API 34 checks:

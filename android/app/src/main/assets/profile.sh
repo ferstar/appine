@@ -11,8 +11,9 @@
 # reads, and on Alpine every interactive bash too (/etc/bash/appine.sh), so nested ones are marked;
 # ash gets them from /etc/profile.d/appine.ashrc, which ENV names so that ash reads it again after
 # ~/.profile and in nested shells.
-# Before each primary prompt the title returns to the current directory; a running program can
-# replace it with OSC 0/2 until the next prompt. Control characters in paths are replaced by ?.
+# Before each primary prompt the title returns to the current directory. bash and zsh report the
+# submitted command before execution; ash has no preexec hook. A program can replace the title
+# with OSC 0/2 until the next prompt. Control characters in paths and commands are replaced by ?.
 cat /etc/motd 2>/dev/null
 export TERM=xterm-256color
 export LANG=C.UTF-8
@@ -51,9 +52,12 @@ elif [ -n "${ZSH_VERSION-}" ]; then
         eval '[[ $precmd_functions[-1] == __appine_precmd ]] ||
             precmd_functions=(${precmd_functions:#__appine_precmd} __appine_precmd)'
     }
-    # Before each command: the start of its output (C)
+    # Before each command: the start of its output (C), then the literal submitted command.
     __appine_preexec() {
+        emulate -L zsh
         printf '\033]133;C\007'
+        printf '\033]2;%s\007' "${1//[[:cntrl:]]/?}"
     }
-    eval 'precmd_functions+=(__appine_precmd) preexec_functions+=(__appine_preexec)'
+    eval 'precmd_functions=(${precmd_functions:#__appine_precmd} __appine_precmd)
+        preexec_functions=(${preexec_functions:#__appine_preexec} __appine_preexec)'
 fi
