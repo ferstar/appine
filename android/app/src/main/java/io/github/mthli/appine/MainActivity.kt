@@ -358,8 +358,8 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     }
 
     /**
-     * A tab's title, a notice from the extra keys or why a link did not open, in place of the last
-     * one, so that quick long presses do not queue toasts; [long] for text that takes a while to read.
+     * A notice from the extra keys, links or file import, replacing the previous toast;
+     * [long] for text that takes a while to read.
      */
     private fun showToast(text: String, long: Boolean = false) {
         if (Privacy.locked(this)) return
@@ -781,7 +781,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         override fun onLink(uri: String) = links.open(uri)
     }
 
-    /** Taps on the tab bar: a tab, its title, `⧉`, `×`, `+`, Import and `⋮`. */
+    /** Taps on the tab bar: a tab, `⧉`, `×`, `+`, Import and `⋮`. */
     private inner class Bar : TabBarView.Target {
         override fun listTabs() = toggleTabList()
 
@@ -800,8 +800,6 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         }
 
         override fun menu(anchor: View) = showMenu(anchor)
-
-        override fun notice(text: String) = showToast(text)
     }
 
     /** List rows retain session identity while updates can change their positions. */

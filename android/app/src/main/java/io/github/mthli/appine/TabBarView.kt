@@ -57,9 +57,6 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
         /** `⋮`: its menu, at [anchor]. */
         fun menu(anchor: View)
-
-        /** A tab's title, from a long press on it. */
-        fun notice(text: String)
     }
 
     /** The current tab's session, as last rendered; null with none. */
@@ -159,6 +156,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
     private val listButton = button("⧉") { target.listTabs() }.apply {
         contentDescription = context.getString(R.string.tab_list)
+        tooltipText = contentDescription
     }
 
     /**
@@ -167,10 +165,12 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
      */
     private val closeButton = button("×") { target.closeCurrent() }.apply {
         contentDescription = context.getString(R.string.close_tab)
+        tooltipText = contentDescription
     }
 
     private val importButton = button("@") { target.importFiles() }.apply {
         contentDescription = context.getString(R.string.import_files)
+        tooltipText = contentDescription
     }
 
     /**
@@ -187,9 +187,15 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         isClickable = true
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         addView(closeButton, item())
-        addView(button("+") { target.newTab() }.apply { contentDescription = context.getString(R.string.new_tab) }, item())
+        addView(button("+") { target.newTab() }.apply {
+            contentDescription = context.getString(R.string.new_tab)
+            tooltipText = contentDescription
+        }, item())
         addView(importButton, item())
-        addView(button("⋮") { target.menu(it) }.apply { contentDescription = context.getString(R.string.more_options) }, item())
+        addView(button("⋮") { target.menu(it) }.apply {
+            contentDescription = context.getString(R.string.more_options)
+            tooltipText = contentDescription
+        }, item())
     }
 
     // With gesture navigation, a slide from the screen's left edge over the tabs scrolls them
@@ -399,10 +405,6 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
                 it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                 target.show(session)
             }
-            setOnLongClickListener {
-                target.notice(title(session))
-                true
-            }
         }
 
         /**
@@ -417,6 +419,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
          */
         fun update(i: Int) {
             describe(i)
+            view.tooltipText = title(session)
             view.alpha = if (session.isRunning) 1f else ENDED_ALPHA
             if (slideFrom?.containsKey(this) != true) view.text = number(i)
             view.setTextColor(if (session === current) currentColor else mutedColor)

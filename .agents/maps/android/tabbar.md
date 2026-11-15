@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: tab-list coverage above the notification banner)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: native tooltips for fixed buttons and numbered-tab titles)
 
 ## Responsibilities
 
@@ -21,8 +21,8 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 
 - `TabBarView` — the tab bar (optional `⧉` fixed at the left, a scrolling row of numbered tabs, with `×`, `+`, Import and `⋮` over its
   end): shows the sessions and the current one it is given (`render`) and sends taps on tabs and
-  buttons, the ⋮ anchor and the titles long presses show to a `Target` (`show`, `closeCurrent`,
-  `newTab`, `importFiles`, `menu`, `notice`, `listTabs`); `setImportEnabled` controls the import button;
+  buttons and the ⋮ anchor to a `Target` (`show`, `closeCurrent`,
+  `newTab`, `importFiles`, `menu`, `listTabs`); `setImportEnabled` controls the import button;
   `setListOpen` highlights the list button; `setListVisible` changes its visibility and the row's start margin;
   it draws the other tabs' progress and status marks and redraws them
   on `refreshStatus`; `Tab` (one per session: its number in the row, which slides, rolls to a new
@@ -103,9 +103,9 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 - Clicking a tab or a fixed bar button requests `KEYBOARD_TAP` feedback before its action,
   matching the extra keys' tap haptic. Feedback stays in the view's click listener, so Ctrl+Tab
   and programmatic tab changes do not request it.
-- Tapping a tab shows it; a long press shows its title in a toast: the program's title (`sh` when
-  it set none), with "(ended)" once the shell ended. The activity shows one toast at a time (a
-  tab's title, a locked modifier, a link that cannot be opened), cancelling the previous one.
+- Tapping a tab shows it; a long press shows its title in a native Android tooltip: the program's
+  title (`sh` when it set none), with "(ended)" once the shell ended. `Tab.update` refreshes the
+  tooltip text when sessions or titles change; title display stays in the view without an activity callback.
   TalkBack reads "Tab N: title", followed for a running program that reported something by what
   it reported in parentheses (`VtSession.describe`'s words: "Waiting for your approval", "Waiting
   for your answer", "Waiting for credentials", "Waiting for you", "Done", "Failed", "Working", or
@@ -113,6 +113,9 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   nothing; for the
   current tab too, though only the other tabs draw marks), and the `×`, `+` and `⋮` buttons by
   name (`⋮` as "More options").
+- The five fixed buttons (`⧉`, `×`, `+`, `@`, `⋮`) use native Android tooltips with the same
+  localized names as their accessibility descriptions. Long presses show the name without
+  running the click action, as for numbered tabs' title tooltips.
 - Import announces "Import files". The four fixed controls reserve 128 dp at the end of the
   scrolling row; the fade still reaches into `×`. The list button reserves another 32 dp at the left
   only while shown. Hiding it uses `GONE` and removes the row's start margin; changing visibility
@@ -171,7 +174,7 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 
 ### Outbound
 
-- Target callbacks reach `android/terminal` for session, menu, import and toast actions.
+- Target callbacks reach `android/terminal` for session, menu and import actions.
 - `android/vt` supplies session identity, title, progress/status and accessible descriptions.
 - `android/keys` provides indicator geometry/paint helpers and fade size; `android/terminal`
   provides dp/theme helpers and shared resources. `TabListView` uses RecyclerView 1.2.1.
@@ -230,6 +233,10 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   looks like the current tab's indicator, told apart only by the numbers' colours.
 
 ## To verify
+
+- Fixed-button and numbered-tab tooltips pass debug assembly and lint. Device checks remain for
+  long-title wrapping and edge placement, long-press release without switching tabs or clicking,
+  and coexistence with the keyboard, tab list and privacy transitions.
 
 - Notification-banner coverage passed API 34 visual and touch checks with the banner visible
   and absent: the list starts directly below the bar, covered-banner taps select a row without

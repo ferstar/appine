@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: system per-app language selection and locale recreation)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: tab titles move from the activity toast callback to native view tooltips)
 
 ## Responsibilities
 
@@ -115,6 +115,8 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - `android/tabbar` owns bar/list rendering, animations and progress marks. `MainActivity`
   implements their targets, validates session identity and privacy, opens/closes the list,
   coordinates focus, Back and accessibility, and performs session/menu actions.
+- Numbered-tab titles use native tooltips owned by `TabBarView`; the activity's shared toast
+  helper remains for extra-key notices, link failures and file-import feedback.
 - The list closes on tab switching, search, other bar actions, extra-key input, pause and restart;
   list close buttons retain it while using the existing busy confirmation.
 - The list starts directly below the top bar and overlays the notification banner, terminal
@@ -295,7 +297,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   (android/documents).
 - `android/file-import`: retained `TerminalFiles` request/copy/result and shell-escaped paths.
 - `android/tabbar`: tab bar/list and `ProgressLine`; `android/keys`: extra keys and modifiers.
-- android/privacy: `Privacy.locked` guards input, clipboard, imports, browser launches and title
+- android/privacy: `Privacy.locked` guards input, clipboard, imports, browser launches and
   toasts; `Ui.showPrivate` delegates dialog-window security to `Privacy.protect`.
 - Material Components 1.14.0 with AppCompat and androidx.activity (the shared themes and page
   layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation compat;
@@ -340,7 +342,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - No activity handles `density`: every view is sized in dp when built. Settings and the license
   pages also recreate for dark mode (android/setup and android/licenses).
 - The privacy gate is android/privacy's. Keep checks at the final input and clipboard sinks,
-  including delayed IME/paste callbacks; pausing cancels title toasts and denies the open clipboard
+  including delayed IME/paste callbacks; pausing cancels activity toasts and denies the open clipboard
   question. Dialogs use `showPrivate`, and deferred import results require a resumed unlocked page.
 - An activity the system recreates (a configuration change it does not handle, or after killing
   the app) or that is opened from Recents gets the intent that first started it, so `EXTRA_TAB`
