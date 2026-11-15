@@ -22,6 +22,7 @@ internal class TerminalLayout(
     fontSize: Float,
     host: VtView.Host,
     bar: TabBarView.Target,
+    tabs: TabListView.Target,
     find: SearchBarView.Target,
     extraKeys: ExtraKeysView.Target,
 ) {
@@ -39,6 +40,7 @@ internal class TerminalLayout(
     /** The current tab's progress (OSC 9;4), along the top of the terminal. */
     val progressLine = ProgressLine(context)
     val tabBar = TabBarView(context, bar)
+    val tabList = TabListView(context, tabs)
 
     /** In the tab bar's place while the current tab is searched. */
     val searchBar = SearchBarView(context, find).apply { isVisible = false }
@@ -112,6 +114,7 @@ internal class TerminalLayout(
             addView(screen)
             addView(status)
             addView(progressLine, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, context.line(), Gravity.TOP))
+            addView(tabList, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         root = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL

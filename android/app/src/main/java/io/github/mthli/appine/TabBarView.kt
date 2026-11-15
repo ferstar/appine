@@ -27,8 +27,8 @@ import kotlin.math.roundToInt
 
 /**
  * The tab bar, one row in any window: a scrolling row of tabs, each a square with its number (a
- * long press shows its title), with `×` (closes the current tab), `+`, Import and `⋮` over its end; the
- * tabs fade out into the left part of `×` while more of them lie beyond. Scrolled away from the
+ * long press shows its title), with `⧉` fixed at the left and `×` (closes the current tab), `+`,
+ * Import and `⋮` over its end. Tabs fade into the left part of `×` while more lie beyond. Scrolled away from the
  * current tab, the row brings it back into view a few seconds after it comes to rest. When tabs
  * close, the ones after them slide into their places and then roll to their new numbers. The
  * other tabs show what their programs report: progress under the number, a dot for a program
@@ -42,6 +42,9 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
     /** Where taps on the bar go: the activity, which owns the sessions. */
     interface Target {
+        /** `⧉`: toggle the list of tab titles. */
+        fun listTabs()
+
         /** A tab was tapped. */
         fun show(session: VtSession)
 
@@ -167,6 +170,10 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         addView(row, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
     }
 
+    private val listButton = button("⧉") { target.listTabs() }.apply {
+        contentDescription = context.getString(R.string.tab_list)
+    }
+
     /**
      * `×`, hidden while there is no current tab. The multiplication sign, which Roboto draws like
      * its +; U+2715 (✕) is not in Roboto, and the fallback font's is larger and thinner than + and ⋮.
@@ -208,7 +215,8 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     init {
         setBackgroundColor(Color.BLACK)
         scroll.setPadding(0, 0, buttons.childCount * dp(BAR_DP), 0)
-        addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT).apply { marginStart = dp(BAR_DP) })
+        addView(listButton, LayoutParams(dp(BAR_DP), LayoutParams.MATCH_PARENT, Gravity.START))
         addView(buttons, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT, Gravity.END))
     }
 
@@ -219,7 +227,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
     override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
         super.onLayout(changed, l, t, r, b)
-        excluded.set(0, 0, width - scroll.paddingRight, height)
+        excluded.set(scroll.left, 0, width - scroll.paddingRight, height)
         systemGestureExclusionRects = exclusion
     }
 
@@ -249,6 +257,8 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
             rowTabs[i].update(i)
         }
         closeButton.visibility = if (current == null) View.INVISIBLE else View.VISIBLE
+        listButton.isEnabled = sessions.isNotEmpty()
+        listButton.alpha = if (sessions.isEmpty()) 0.38f else 1f
 
         // Indicate the current tab (the row draws the indicator), and bring it into view once the
         // new row is laid out (this runs after the layout pass that changing the tabs requested).
@@ -262,6 +272,11 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     fun setImportEnabled(enabled: Boolean) {
         importButton.isEnabled = enabled
         importButton.alpha = if (enabled) 1f else 0.38f
+    }
+
+    fun setListOpen(open: Boolean) {
+        listButton.isSelected = open
+        listButton.setTextColor(if (open) currentColor else mutedColor)
     }
 
     /**

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: bash command-title and history-fallback regression coverage)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: cover preservation of editor focus while the tab list opens and scrolls)
 
 ## Responsibilities
 
@@ -166,7 +166,7 @@ terminal's emulator shim and JNI functions (`android/vtcore`), Kotlin sessions (
   version catalog (`android/gradle/libs.versions.toml`) holds the libraries' versions, and AGP's
   is in `android/build.gradle.kts`. Android libraries: `androidx.core` 1.19.1,
   `androidx.biometric:biometric` 1.1.0 (including its merged biometric permission), `androidx.preference:preference` 1.2.1, `androidx.browser:browser` 1.10.0,
-  `androidx.webkit:webkit` 1.18.0 and Material Components 1.14.0 (which
+  `androidx.webkit:webkit` 1.18.0, `androidx.recyclerview:recyclerview` 1.2.1 and Material Components 1.14.0 (which
   brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
   1.3.0.
 - Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
@@ -261,6 +261,9 @@ terminal's emulator shim and JNI functions (`android/vtcore`), Kotlin sessions (
   A timeout means no acknowledgment: it cannot prove no launch occurred or cancel buffered TCP requests.
 
 ### Tests
+
+- `TabListTest` checks session identity across removal/rebinding, a bounded, scrollable 50-tab list
+  and preserved editor focus during opening/scrolling/dismissal; all three cases passed on API 34.
 
 - `ShellTitleTest` uses separate stores for two cases: real bash/ash title restoration after
   a program exits, directory changes and Unicode/control paths; bash also covers command titles,

@@ -122,6 +122,7 @@ dependencies {
     implementation(libs.androidx.browser)
     implementation(libs.androidx.core)
     implementation(libs.androidx.preference)
+    implementation(libs.androidx.recyclerview)
     implementation(libs.androidx.webkit)
     implementation(libs.material)
     androidTestImplementation(libs.androidx.runner)

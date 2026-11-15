@@ -93,6 +93,10 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         override fun handleOnBackPressed() { closeSearch() }
     }
 
+    private val closeTabListOnBack = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() { closeTabList() }
+    }
+
     /**
      * The question whether a program may read the clipboard ([onClipboardRead]) while it is open,
      * which answers the reads that come meanwhile too.
@@ -127,6 +131,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
         onBackPressedDispatcher.addCallback(this, closeSearchOnBack)
+        onBackPressedDispatcher.addCallback(this, closeTabListOnBack)
         keepScreenOn = getPreferences(MODE_PRIVATE).getBoolean(PREF_KEEP_SCREEN_ON, false)
         // A notification's tab only when it starts this activity: one recreated (a configuration
         // change, or the system bringing it back after killing the app) or opened from Recents
@@ -134,7 +139,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         if (savedInstanceState == null && intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0) {
             requestedTab = intent.getIntExtra(EXTRA_TAB, -1)
         }
-        layout = TerminalLayout(this, savedFontSize(), Host(), Bar(), Find(), Keys())
+        layout = TerminalLayout(this, savedFontSize(), Host(), Bar(), Tabs(), Find(), Keys())
         renderTabs()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(layout.root)
@@ -159,6 +164,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     }
 
     override fun onPause() {
+        closeTabList()
         if (Settings.privacyMode(this)) {
             toast?.cancel()
             clipboardQuestion?.dismiss()
@@ -228,7 +234,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
             // The current tab was closed: show the one after it, now in its place (the one before
             // when it was the last)
             current = null
-            s.sessions.getOrNull(currentIndex.coerceAtMost(s.sessions.lastIndex))?.let { show(it) }
+            s.sessions.getOrNull(currentIndex.coerceAtMost(s.sessions.lastIndex))?.let { show(it, keepTabList = true) }
         }
         if (s.sessions.isEmpty() && s.machine != 0L) {
             // The last tab was closed: the UI exits. The service stays in the background while it
@@ -291,6 +297,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     }
 
     override fun onRestarting() {
+        closeTabList()
         closeSearch()
         current = null
         layout.progressLine.show(null, jump = true)
@@ -407,11 +414,12 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         if (requestedTab < 0 || s.machine == 0L) return false
         val session = s.sessions.firstOrNull { it.id == requestedTab }
         requestedTab = -1
-        session?.let(::show)
+        session?.let { show(it) }
         return session != null
     }
 
-    private fun show(session: VtSession) {
+    private fun show(session: VtSession, keepTabList: Boolean = false) {
+        if (!keepTabList) closeTabList()
         // A search belongs to the tab it was opened in
         closeSearch()
         current = session
@@ -432,7 +440,34 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         val shown = current?.takeIf { it in sessions }
         if (shown != null) currentIndex = sessions.indexOf(shown)
         layout.tabBar.render(sessions, shown)
+        if (layout.tabList.isVisible) {
+            if (sessions.isEmpty()) closeTabList() else layout.tabList.render(sessions, shown)
+        }
         updateImport()
+    }
+
+    private fun toggleTabList() {
+        if (layout.tabList.isVisible) {
+            closeTabList()
+            return
+        }
+        if (Privacy.locked(this)) return
+        val sessions = service?.sessions.orEmpty().toList()
+        if (sessions.isEmpty()) return
+        layout.tabList.open(sessions, current)
+        layout.screen.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        layout.tabBar.setListOpen(true)
+        closeTabListOnBack.isEnabled = true
+    }
+
+    private fun closeTabList() {
+        if (!layout.tabList.isVisible) return
+        val hadFocus = layout.tabList.hasFocus()
+        layout.tabList.close()
+        layout.screen.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        layout.tabBar.setListOpen(false)
+        closeTabListOnBack.isEnabled = false
+        if (hadFocus) layout.screen.requestFocus()
     }
 
     /**
@@ -456,6 +491,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
      * them, keeping the screen on, and Settings.
      */
     private fun showMenu(anchor: View) {
+        closeTabList()
         val sessions = service?.sessions.orEmpty().toList()
         val others = sessions.filter { it != current }
         val context = ContextThemeWrapper(this, R.style.ThemeOverlay_Appine_CheckPopup)
@@ -546,6 +582,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
      */
     private fun openSearch() {
         if (current == null) return
+        closeTabList()
         layout.tabBar.isVisible = false
         layout.searchBar.open()
         closeSearchOnBack.isEnabled = true
@@ -567,6 +604,13 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (Privacy.locked(this)) return true
+        if (event.keyCode == KeyEvent.KEYCODE_ESCAPE && (layout.tabList.isVisible || shortcutKey == KeyEvent.KEYCODE_ESCAPE)) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                closeTabList()
+                shortcutKey = event.keyCode
+            } else if (event.action == KeyEvent.ACTION_UP) shortcutKey = 0
+            return true
+        }
         if (event.action == KeyEvent.ACTION_DOWN && (shortcut(event) || volumeKey(event))) {
             shortcutKey = event.keyCode
             return true
@@ -703,21 +747,43 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         override fun onLink(uri: String) = links.open(uri)
     }
 
-    /** Taps on the tab bar: a tab, its title, `×`, `+`, Import and `⋮`. */
+    /** Taps on the tab bar: a tab, its title, `⧉`, `×`, `+`, Import and `⋮`. */
     private inner class Bar : TabBarView.Target {
+        override fun listTabs() = toggleTabList()
+
         override fun show(session: VtSession) = this@MainActivity.show(session)
 
         override fun closeCurrent() {
+            closeTabList()
             current?.let { confirmClose(listOf(it)) }
         }
 
         override fun newTab() = newSession()
 
-        override fun importFiles() = this@MainActivity.importFiles()
+        override fun importFiles() {
+            closeTabList()
+            this@MainActivity.importFiles()
+        }
 
         override fun menu(anchor: View) = showMenu(anchor)
 
         override fun notice(text: String) = showToast(text)
+    }
+
+    /** List rows retain session identity while updates can change their positions. */
+    private inner class Tabs : TabListView.Target {
+        override fun show(session: VtSession) {
+            if (canUse(session)) this@MainActivity.show(session)
+        }
+
+        override fun close(session: VtSession) {
+            if (canUse(session)) confirmClose(listOf(session))
+        }
+
+        override fun dismiss() = closeTabList()
+
+        private fun canUse(session: VtSession) =
+            !Privacy.locked(this@MainActivity) && service?.sessions?.contains(session) == true
     }
 
     /** The search bar's text and buttons go to the view, which searches the current tab. */
@@ -731,9 +797,15 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     /** The extra keys go to the view, which reads the one-shot modifiers through [Host]. */
     private inner class Keys : ExtraKeysView.Target {
-        override fun key(keyCode: Int) = layout.screen.press(keyCode)
+        override fun key(keyCode: Int) {
+            closeTabList()
+            layout.screen.press(keyCode)
+        }
 
-        override fun text(text: String) = layout.screen.type(text)
+        override fun text(text: String) {
+            closeTabList()
+            layout.screen.type(text)
+        }
 
         override fun notice(text: String) = showToast(text)
     }

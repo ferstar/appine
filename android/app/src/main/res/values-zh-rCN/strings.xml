@@ -34,6 +34,8 @@
     <string name="import_picker_missing">没有可用的文件选择器。</string>
     <string name="copy_paths">复制路径</string>
     <string name="close_tab">关闭标签页</string>
+    <string name="tab_list">标签页列表</string>
+    <string name="close_tab_description">关闭标签页 %1$d：%2$s</string>
     <string name="more_options">更多选项</string>
     <string name="close_tab_title">关闭这个标签页？</string>
     <string name="close_tab_message">关闭会挂断它的 shell，其中运行的程序通常也会随之结束。</string>

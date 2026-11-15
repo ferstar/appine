@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: pin the terminal activity's night configuration to match its dark theme)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: encapsulate tab-list opening and cleanup in its view)
 
 ## Responsibilities
 
@@ -29,7 +29,7 @@ terminals in `android/vtcore`, shown by `android/vtview` using android/vtrender)
   `preference_switch.xml` (Settings' MaterialSwitch with the standard AndroidX `switchWidget` ID). Settings' categories and rows use AndroidX's layouts.
 
 Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `TerminalFiles.kt`, `TabBarView.kt`,
-`TabNumber.kt`, `SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt` and `Ui.kt` in
+`TabListView.kt`, `TabNumber.kt`, `SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt` and `Ui.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/` except
 android/privacy's `layout/privacy_shield.xml`, `drawable/privacy_emblem.xml` and `drawable/ic_lock.xml`,
 and android/licenses' `layout/list_item.xml` and `values/ids.xml`. Shared strings, themes,
@@ -47,14 +47,14 @@ protected notification actions (`android/privacy`); the notices list and reader 
 
 - `MainActivity` — a `TerminalService.Listener` with a `TerminalLayout` and `TerminalLinks`;
   adapters `Host : VtView.Host`,
-  `Bar : TabBarView.Target`, `Find : SearchBarView.Target` and `Keys : ExtraKeysView.Target`; the
+  `Bar : TabBarView.Target`, `Tabs : TabListView.Target`, `Find : SearchBarView.Target` and `Keys : ExtraKeysView.Target`; the
   current session and its index, from which its successor is taken; a tab requested by a
   notification (`EXTRA_TAB`); AndroidX Back's callback while the search bar is open (`closeSearchOnBack`);
   the open question whether a
   program may read the clipboard (`clipboardQuestion`).
 - `TerminalLayout` — builds the views with the activity's adapters after dynamic colours are
   applied: a black column of one bar's place (`TabBarView`, or `SearchBarView` while searching),
-  a frame with `VtView`, the status text and `ProgressLine` along its top, and `ExtraKeysView`;
+  a frame with `VtView`, the status text, `ProgressLine` along its top and the `TabListView` overlay, and `ExtraKeysView`;
   exposes the root and interactive views, keeps the status view private behind `showStatus` and
   `showTerminal`, and owns the IME animation callback `keysFollowIme`.
 - `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
@@ -68,14 +68,20 @@ protected notification actions (`android/privacy`); the notices list and reader 
   without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
   shows the count it is given (`setCount`) and sends text changes, steps and closing to a
   `Target` (`search`, `step`, `close`).
-- `TabBarView` — the tab bar (a scrolling row of numbered tabs, with `×`, `+`, Import and `⋮` over its
+- `TabBarView` — the tab bar (`⧉` fixed at the left, a scrolling row of numbered tabs, with `×`, `+`, Import and `⋮` over its
   end): shows the sessions and the current one it is given (`render`) and sends taps on tabs and
   buttons, the ⋮ anchor and the titles long presses show to a `Target` (`show`, `closeCurrent`,
-  `newTab`, `importFiles`, `menu`, `notice`); `setImportEnabled` controls the import button;
+  `newTab`, `importFiles`, `menu`, `notice`, `listTabs`); `setImportEnabled` controls the import button;
+  `setListOpen` highlights the list button;
   it draws the other tabs' progress and status marks and redraws them
   on `refreshStatus`; `Tab` (one per session: its number in the row, which slides, rolls to a new
   number and fades out when closed); `TabNumber` (in its own file: the number, a `TextView`
   drawing its digits itself so they can roll).
+- `TabListView` — a full-width overlay at the top of the terminal frame, flush below the bar. Its
+  RecyclerView shows session numbers, single-line ellipsized titles and independent close buttons;
+  immutable row snapshots and stable session IDs keep updates and callbacks tied to sessions.
+  `open` renders and reveals the current row without moving input focus; `render` updates an open
+  list; `close` hides it and clears retained rows. The activity coordinates Back and accessibility.
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
   SYM (`` ` ``, `$`, `*`, `=`, `^`, `\`, `&`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `;`: shell
@@ -147,7 +153,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
 
 ### The tab bar
 
-- One 32 dp row in any window: a scrolling row of tabs across its whole width, with `×` (closes the
+- One 32 dp row in any window: `⧉` fixed in the leftmost 32 dp opens the tab list, with the
+  scrolling tabs starting to its right, and `×` (closes the
   current tab; hidden while there is none), `+` (opens a session while the kernel runs, in the
   current tab's directory: its console's foreground group's, read from the kernel on the main thread
   as a spawn is; the home directory without a current tab or once its shell ended), Import
@@ -205,8 +212,22 @@ protected notification actions (`android/privacy`); the notices list and reader 
   current tab too, though only the other tabs draw marks), and the `×`, `+` and `⋮` buttons by
   name (`⋮` as "More options").
 - Import announces "Import files". The four fixed controls reserve 128 dp at the end of the
-  scrolling row; the fade still reaches into `×`.
-- `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
+  scrolling row; the fade still reaches into `×`. The list button reserves another 32 dp at the left.
+- The tab list overlays the terminal in the same activity window, without regridding it, on black
+  with no gap, margins, border, rounded corners or elevation. Rows are 32 dp, labels 12 dp for the
+  number and 14 dp for the title/close button; the current row uses primary text and ended titles
+  are faded and marked. At most ten rows fit, further limited by the terminal frame’s height;
+  the list scrolls and opens with the current tab visible. Titles use the bar’s `sh` fallback.
+- Tapping a list title selects the session and closes the list. Its close button uses the existing
+  busy confirmation and leaves the list open, including when the current tab’s successor is shown.
+  Session/title changes update visible rows and positional numbers without resetting scroll.
+  The list button toggles it; an outside terminal tap dismisses and consumes that tap. Back, Escape,
+  explicit tab switching, search, the other bar actions, extra-key input, pause and restart dismiss
+  it too. Touch opening and scrolling preserve terminal input focus and its IME connection;
+  the terminal is hidden from accessibility while the list is open. Closing restores terminal
+  focus only if a list control had it; close confirmations return focus to the terminal.
+  It lives under the activity’s privacy shield and secure-window policy, rather than in a separate popup.
+- The list’s close buttons, `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
   they close is busy (its shell has ended, has not started, as in a restored tab never shown, or
   waits at its prompt as the prompt marks tell, `VtSession.busy`, android/vt's Shell integration),
   else after a confirmation dialog ("Close this tab?" for one tab, else "Close N tabs?", counting
@@ -415,7 +436,7 @@ protected notification actions (`android/privacy`); the notices list and reader 
   toasts; `Ui.showPrivate` delegates dialog-window security to `Privacy.protect`.
 - Material Components 1.14.0 with AppCompat and androidx.activity (the shared themes and page
   layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation compat;
-  androidx.browser's Custom Tabs for web links; the app the system picks for a link.
+  RecyclerView 1.2.1 for the tab list; androidx.browser's Custom Tabs for web links; the app the system picks for a link.
 
 ## Invariants and gotchas
 
@@ -498,7 +519,7 @@ protected notification actions (`android/privacy`); the notices list and reader 
   there at once. The keys rising with the IME are drawn inside the root's bottom padding, which
   already holds the IME's room, so the root must not clip to its padding (`clipToPadding` off) or
   they stay hidden until they reach the terminal.
-- The tab bar's buttons are characters in the system font: `+`, `@`, `⋮` and `×` (the multiplication
+- The tab bar's buttons are characters in the system font: `⧉`, `+`, `@`, `⋮` and `×` (the multiplication
   sign, which Roboto draws like its `+`). `✕` (U+2715) is not in Roboto, and the fallback font's
   glyph is larger and thinner than the others. `@` opens file import.
 - No activity handles `density`: every view is sized in dp when built. Settings and the license
@@ -512,7 +533,10 @@ protected notification actions (`android/privacy`); the notices list and reader 
   `FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY`; otherwise a notification's tab would come back to the
   front. A recreated `MainActivity` drops ordinary dialogs, the search bar and the extra keys'
   modifiers/page; a retained import result is shown again after the page resumes unlocked.
-- Back uses `OnBackPressedDispatcher` with `closeSearchOnBack` enabled only during search.
+- Back uses `OnBackPressedDispatcher` with `closeSearchOnBack` enabled only during search and
+  `closeTabListOnBack` only while the tab list is open. List callbacks carry the session, never
+  a position; the activity checks it still exists before selecting or confirming its close. Dismissing
+  the list clears its data and recycled rows so it does not retain sessions closed through other controls.
 
 ## Confirmed bugs / technical debt
 
@@ -538,6 +562,12 @@ protected notification actions (`android/privacy`); the notices list and reader 
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- Tab-list identity after removal, the bounded 50-tab layout and preserving editor focus passed
+  three API 34 instrumentation cases; the focus case failed against the former requestFocus path. API 34 UI checks covered flush placement with the IME, live titles, busy/current and idle/
+  background closes, switching, Back, Escape and outside dismissal. Opening/dismissing with the IME
+  visible or hidden retains the same terminal input connection and visibility. Physical touch targets, TalkBack
+  traversal and vendor glyph rendering remain unverified.
 
 - The terminal's night override compiles and passes lint; the system selection menu's surface,
   text and ripple on S23, including after switching system dark mode while the activity is alive,
