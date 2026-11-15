@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: the main single-row extra keys put up/down before left/right and HOME/END)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: the single-row symbols put % after & and before the bracket pairs)
 
 ## Responsibilities
 
@@ -96,7 +96,7 @@ protected notification actions (`android/privacy`); the notices list and reader 
   `upperKey` (the key above SYM in two-row mode).
   The grid shown is in a `HorizontalScrollView`, with fixed keys over its end: SHIFT or `%`
   above SYM in two-row mode, CTRL/ALT/SHIFT/SYM beside it on the main page in single-row mode,
-  with only SYM fixed on that layout's symbols/function pages and `%` ending the symbols' row.
+  with only SYM fixed on that layout's symbols/function pages and `%` following `&` before the bracket pairs.
   It keeps CTRL, ALT and SHIFT (one-shot or locked; `shift` reads
   false while the symbols are shown) and the page shown (`KEYS`, `SYMBOLS` or `FUNCTIONS`), exposes
   them with `modifiersUsed`, and sends keys, text and notices (a modifier locked) to a `Target`; a
@@ -352,8 +352,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
   the symbols and function pages fix only SYM, hiding the modifiers without clearing their state.
   SHIFT still waits on the symbols page but applies on the function page.
   The main scrolling row is ESC, TAB, `/`, `-`, ↑, ↓, ←, →,
-  HOME, END, `|`, `~`; the symbols are the original scrolling top row followed by the
-  bottom row and `%`, so the scrolling region ends at SYM's left edge,
+  HOME, END, `|`, `~`; the symbols are the original scrolling top row followed by `%` and the
+  bottom row, placing `%` after `&` and ending with `;` at SYM's left edge,
   and the function page is F1–F12 followed by PGUP/PGDN. All keys remain available, each at least
   45 dp wide; excess keys scroll under the fixed group with the same fade and gesture exclusion.
   Every single-row page shares the width over 16 columns, with rounding remainder in SYM, so
@@ -627,7 +627,7 @@ protected notification actions (`android/privacy`); the notices list and reader 
   scrolling to PGDN, input with Shift+F5 and locked Ctrl+], and page/modifier retention through
   portrait/landscape changes, with and without the IME. The symbols page reclaimed 90 dp from hidden CTRL/ALT, kept
   locked CTRL and one-shot ALT across rotation, sent Ctrl+] with CTRL hidden, and restored both
-  controls on the main page. Its scrolling `%` reached SYM's left edge and typed `%`;
+  controls on the main page. Before the symbol reorder, its scrolling `%` reached SYM's left edge and typed `%`;
   rotation restored the fixed portrait placement and the scrolling landscape placement.
   The single-row function page hid all three modifiers, preserved a preselected SHIFT across
   rotation for Shift+F5, scrolled PGDN to SYM's edge and restored modifiers on the main page.
@@ -638,7 +638,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
   At 560 × 360 dp, short landscape used one row with left/right/up/down arrows; at 840 × 400 dp,
   all three pages again shared key widths and SYM bounds, with the one-column gap on the function page.
   A 600 dp-wide tall landscape display retained two rows after its side cutout reduced available
-  width; the narrow single-row symbols/function pages scrolled `%`/PGDN to SYM's left edge.
+  width; before the symbol reorder, the narrow single-row symbols/function pages scrolled `%`/PGDN to SYM's left edge.
+  The new `%` position after `&` and trailing `;` still need device verification.
   Hiding the IME retained the short-landscape mode.
   Physical touch, TalkBack and rotation during a held repeat remain
   unverified on real devices.
