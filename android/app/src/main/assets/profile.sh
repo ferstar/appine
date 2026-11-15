@@ -10,7 +10,7 @@
 # around whatever PS1 is before each prompt: bash from /etc/profile.d/appine.bashrc, which this file
 # reads, and on Alpine every interactive bash too (/etc/bash/appine.sh), so nested ones are marked;
 # ash gets them from /etc/profile.d/appine.ashrc, which ENV names so that ash reads it again after
-# ~/.profile and in nested shells.
+# ~/.profile and in nested shells; zsh gets them from /etc/profile.d/appine.zshrc, read here.
 # Before each primary prompt the title returns to the current directory. bash and zsh report the
 # submitted command before execution; ash has no preexec hook. A program can replace the title
 # with OSC 0/2 until the next prompt. Control characters in paths and commands are replaced by ?.
@@ -38,30 +38,7 @@ elif [ -n "${BB_ASH_VERSION-}" ]; then
     if [ -r /etc/profile.d/appine.ashrc ]; then . /etc/profile.d/appine.ashrc; fi
 elif [ -n "${ZSH_VERSION-}" ]; then
     # zsh reads this file where its /etc/zsh/zprofile sources /etc/profile (Alpine's does, in sh
-    # emulation; Debian's does not). The other shells parse this branch too, so what only zsh
-    # understands (arrays) is inside eval
+    # emulation; Debian's does not). Its hooks come from appine.zshrc
     PS1='%B%F{green}%n@%m%f%b:%B%F{blue}%~%f%b%(!.#.$) '
-    # Before each prompt: the end of the last command with its status (D); the marks around PS1
-    # (A: the prompt starts, its cursor moved with the arrows; B: the input starts) and PS2 are
-    # added again whenever something replaced them (~/.zshrc, a theme), and are sent again at
-    # each redraw, as zle redraws the whole prompt. The function moves itself last, to run after
-    # the hooks of themes that set PS1 before each prompt
-    __appine_precmd() {
-        local ret=$?
-        emulate -L zsh
-        printf '\033]133;D;%s\007' "$ret"
-        printf '\033]2;%s\007' "${PWD//[[:cntrl:]]/?}"
-        case $PS1 in *'133;B'*) ;; *) PS1=$'%{\e]133;A;cl=line\a%}'$PS1$'%{\e]133;B\a%}' ;; esac
-        case $PS2 in *'133;B'*) ;; *) PS2=$'%{\e]133;P;k=s\a%}'$PS2$'%{\e]133;B\a%}' ;; esac
-        eval '[[ $precmd_functions[-1] == __appine_precmd ]] ||
-            precmd_functions=(${precmd_functions:#__appine_precmd} __appine_precmd)'
-    }
-    # Before each command: the start of its output (C), then the literal submitted command.
-    __appine_preexec() {
-        emulate -L zsh
-        printf '\033]133;C\007'
-        printf '\033]2;%s\007' "${1//[[:cntrl:]]/?}"
-    }
-    eval 'precmd_functions=(${precmd_functions:#__appine_precmd} __appine_precmd)
-        preexec_functions=(${preexec_functions:#__appine_preexec} __appine_preexec)'
+    if [ -r /etc/profile.d/appine.zshrc ]; then . /etc/profile.d/appine.zshrc; fi
 fi

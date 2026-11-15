@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: browser defaults after login environment resets and stock-profile migration)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: zsh companion hooks, local emulation and stock-profile migration)
 
 ## Responsibilities
 
@@ -15,7 +15,7 @@
   importing them into a new store, and writing first-boot configuration, which on Alpine makes
   bash, bundled with the app, the login shell;
 - files refreshed before every kernel start (network interfaces, rootless podman's network, the
-  bundled doas package, the profile script and the files of ash's and bash's prompt marks for the
+  bundled doas package, the profile script and the files of ash's, bash's and zsh's prompt marks for the
   terminal's shell integration), the osclock script run before boot and the boot log's failed services;
 - package mirrors: built-in lists, one speed probe after an import, writing the fastest into
   sources nobody has changed;
@@ -28,7 +28,7 @@
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
 `android/app/src/main/assets/login.sh`, `android/app/src/main/assets/profile.sh`,
 `android/app/src/main/assets/ashrc.sh`, `android/app/src/main/assets/bashrc.sh`,
-`android/app/src/main/assets/xdg-open.sh`, `scripts/fetch-rootfs`.
+`android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `scripts/fetch-rootfs`.
 
 Outside the module: when imports, switches, restarts and logins happen, and the `settings`
 preferences (`android/service`); the import and `write_file`/`read_file` implementations
@@ -72,7 +72,11 @@ session consuming their state and events (`android/vt`).
   `/etc/profile` does not read it): ash's prompt marks, read through `ENV`.
 - `bashrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.bashrc`: bash's prompt
   marks, read by the profile and, on Alpine, by `/etc/bash/appine.sh` (`BASH_HOOK`, a line sourcing
-  it). `Rootfs.writeProfile(context, store, distro)` writes these files and then the profile.
+  it).
+- `zshrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.zshrc`, read by the
+  profile only in zsh. Its anonymous function registers the hooks in local zsh emulation,
+  preserving the caller's options. `Rootfs.writeProfile(context, store, distro)` writes all three
+  companion files and then the profile.
 - Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`
   and `sudo-installed` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
   (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`,
@@ -141,9 +145,9 @@ session consuming their state and events (`android/vt`).
   existing entry that is not a regular file fails the import):
   - always: package sources from the first mirror (apk `main` and `community`; Debian deb822 over
     http for trixie, -updates, -security), `hostname` (`localhost`), `motd`, and
-    `/etc/profile.d/appine.ashrc`, `/etc/profile.d/appine.bashrc`, on Alpine
+    `/etc/profile.d/appine.ashrc`, `/etc/profile.d/appine.bashrc`, `/etc/profile.d/appine.zshrc`, on Alpine
     `/etc/bash/appine.sh`, and then `/etc/profile.d/appine.sh` (the assets' `ashrc.sh`,
-    `bashrc.sh` and `profile.sh`: motd, `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, the browser default below,
+    `bashrc.sh`, `zshrc.sh` and `profile.sh`: motd, `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, the browser default below,
     `ENV` naming the ash file unless one is set or the file is unreadable, and for bash, busybox ash and zsh only a
     coloured prompt with prompt marks, below; other shells keep the distro's prompt);
   - Alpine: `hosts` only when absent (the minirootfs ships one, so nothing is written), and no
@@ -177,7 +181,7 @@ session consuming their state and events (`android/vt`).
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
   `doas.apk` into `/var/cache/appine/`, rewritten at every start; a profile left exactly as an
   earlier version wrote it (with `cd "$HOME"`, without prompt marks, or with marks that do not
-  declare `cl=line`, or with ash's or bash's marks in itself) replaced by the current one, with
+  declare `cl=line`, or with ash's, bash's or zsh's marks in itself) replaced by the current one, with
   the mark files written before it (`/etc/bash/appine.sh` on Alpine stores, bash installed or
   not); an edited one is kept and a missing one not recreated, and then the mark files are not
   written either. The first two apply to every distro. A failed write in any of them fails the start.
@@ -231,12 +235,14 @@ session consuming their state and events (`android/vt`).
     sources it after setting its coloured PS1, and every interactive ash reads it again through
     `ENV`, a login shell after `/etc/profile` and `~/.profile`, so a PS1 that `~/.profile` sets is
     marked; one set later (typed, or by a file the user's own `ENV` names) goes without.
-  - zsh: `__appine_precmd`, appended to `precmd_functions`, prints D with the status before each
+  - zsh: the profile sets the coloured PS1 and reads `appine.zshrc`. Its `__appine_precmd`,
+    appended to `precmd_functions`, prints D with the status before each
     prompt, wraps PS1 (A with `cl=line` … B) and PS2 (P with `k=s` … B) in `%{ %}` whenever the
     marks are missing, and moves itself last in `precmd_functions`, so a PS1 that `~/.zshrc` or a
     theme's own hook sets is wrapped (a theme setting PS1 before each prompt gets its first prompt
     unmarked); `__appine_preexec`, appended to `preexec_functions`, prints the output's start (C)
-    and the command title. Reloading the profile deduplicates both hook registrations.
+    and the command title. Reloading the profile or companion file deduplicates both hook
+    registrations while preserving other hooks, including when sourced in sh emulation.
     A and B are in PS1, so every redraw by zle sends them again; D is sent once per prompt.
   - `cl=line` tells the terminal that the three line editors move the cursor with the left and
     right arrows, so a tap on the typed command moves the cursor there.
@@ -251,8 +257,10 @@ session consuming their state and events (`android/vt`).
   other shells get no marks from it (fish and nushell send their own, android/vtcore), and shells that
   do not read it still have `TERM`, `LANG` and `NMAP_UNPRIVILEGED` from the console's fixed login
   environment (android/vt), but show no motd.
-- ash, bash and dash parse the zsh branch too, so what only zsh understands (the hook arrays) is
-  inside `eval`.
+- The shared profile contains no zsh array syntax; only zsh sources `appine.zshrc`. The companion
+  uses an anonymous function with `emulate -L zsh` for registration, so Alpine's sh emulation
+  does not change array filtering or indexing and the caller's options are restored afterwards.
+  Both hooks also use local zsh emulation when invoked.
 
 ### Mirrors
 
@@ -453,8 +461,8 @@ session consuming their state and events (`android/vt`).
 - `updateProfile` replaces only the versions it knows, compared whole (`OLD_PROFILE` and
   `UNMARKED_PROFILE` by text, later ones by sha256 in `REPLACED_PROFILES`): changing `profile.sh`
   must add the sha256 of the text it replaces (the committed asset, byte for byte), or stores keep
-  the version they have; `ashrc.sh` and `bashrc.sh` are written only with the profile, so a change
-  to either alone reaches no existing store (change `profile.sh` with it); and the motd is written only at import, so it is never updated.
+  the version they have; `ashrc.sh`, `bashrc.sh` and `zshrc.sh` are written only with the profile,
+  so a change to any companion alone reaches no existing store (change `profile.sh` with it); and the motd is written only at import, so it is never updated.
 - apk takes its database lock without waiting unless given `--wait` (which apk 3 accepts though
   its help does not list it): hence the install lock and the retry with `--wait`; a tab whose login
   waits for an apk the user runs shows only that line until the apk ends or Ctrl-C. apt 3's
@@ -499,6 +507,12 @@ session consuming their state and events (`android/vt`).
   deleted?
 
 ## To verify
+
+- The zsh companion extraction passed host zsh checks in native and sh emulation: byte-identical
+  prompt/status/title output to the prior profile, repeated loading, existing-hook preservation,
+  theme-like hook ordering and caller-option restoration. BusyBox ash and Debian dash parse and
+  source the shared profile. Debug assembly and packaged-asset checks passed; the prior
+  stock-profile hash is registered for migration. Android device execution and end-to-end migration of this extraction remain unverified.
 
 - Browser defaults passed interactive `su -` checks for root and a regular user with Alpine
   ash/bash and Debian dash/bash in container PTYs, including launcher invocation with an intact

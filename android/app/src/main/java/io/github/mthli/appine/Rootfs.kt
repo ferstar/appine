@@ -306,7 +306,8 @@ internal object Rootfs {
      * which the profile names in `ENV`, so that every interactive ash reads it (a login shell after
      * `~/.profile`); bash's in `/etc/profile.d/appine.bashrc`, the assets' `bashrc.sh`, which the
      * profile reads, and on Alpine every interactive bash through `/etc/bash/appine.sh`
-     * ([BASH_HOOK]). They are written first, as the profile uses them only when they are there, and
+     * ([BASH_HOOK]); zsh's in `/etc/profile.d/appine.zshrc`, the assets' `zshrc.sh`, read by the
+     * profile. They are written first, as the profile uses them only when they are there, and
      * their names do not end in `.sh`, so `/etc/profile` does not read them. Which directory the shell starts in is decided by the assets'
      * `login.sh` (restored tabs start in their original directory, the android/service map, new
      * tabs in the current tab's, the android/terminal map).
@@ -315,6 +316,7 @@ internal object Rootfs {
     private fun writeProfile(context: Context, store: String, distro: Distro) {
         write(store, "/etc/profile.d/appine.ashrc", asset(context, "ashrc.sh"))
         write(store, "/etc/profile.d/appine.bashrc", asset(context, "bashrc.sh"))
+        write(store, "/etc/profile.d/appine.zshrc", asset(context, "zshrc.sh"))
         if (distro == Distro.ALPINE) write(store, "/etc/bash/appine.sh", BASH_HOOK)
         write(store, "/etc/profile.d/appine.sh", asset(context, "profile.sh"))
     }
@@ -539,7 +541,7 @@ netns = "host"
      * code full of `$`) are not kept here: the first with prompt marks, until taps on the prompt
      * moved the cursor, the one that marked them for bash and busybox ash only, until zsh got
      * its marks, the one with ash's marks in itself, until `ashrc.sh` took them, and the one with
-     * bash's marks in itself, until `bashrc.sh` took them. A change to
+     * bash's and zsh's marks in itself, until `bashrc.sh` and `zshrc.sh` took them. A change to
      * `profile.sh` adds the sha256 of the text it replaces
      * (`git show HEAD:android/app/src/main/assets/profile.sh | shasum -a 256` before committing).
      */
@@ -551,12 +553,13 @@ netns = "host"
         "747208df567cbf62252e21522712b96acb79564eafa8062ce08a1b159e1e4835",
         "2085a60332217920354a7979b98becad8a114e413724c1180954e3424d7157c5",
         "921a9cbb766e8427950aa5ff7a55e253f7e62b3b25997fcad6410beabb62643c",
+        "3257013eafeb90230ae0d6772e73d8af87be62f8d6f74460dd4189ea56271021",
     )
 
     /**
      * Replaces the profile the app wrote into a previously imported store with the current one
-     * ([writeProfile], with the files of ash's and bash's marks), if it is an earlier version left
-     * unchanged. A change to `ashrc.sh` or `bashrc.sh` alone reaches no existing store: change
+     * ([writeProfile], with the files of ash's, bash's and zsh's marks), if it is an earlier version left
+     * unchanged. A change to `ashrc.sh`, `bashrc.sh` or `zshrc.sh` alone reaches no existing store: change
      * `profile.sh` with it.
      */
     @Throws(IOException::class)
