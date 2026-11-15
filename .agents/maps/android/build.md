@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: system per-app language declaration)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: system language list includes Traditional Chinese, Korean and Japanese)
 
 ## Responsibilities
 
@@ -123,8 +123,9 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 ### Manifest
 
 - The application declares `android:localeConfig="@xml/locale_config"` for Android 13+'s
-  system per-app language picker. The explicit list is English (`en`) and Simplified Chinese
-  (`zh-CN`), matching the app's resources rather than dependency translations. Android 11–12
+  system per-app language picker. The explicit list is English (`en`), Simplified Chinese
+  (`zh-CN`), Traditional Chinese (`zh-Hant`), Korean (`ko`) and Japanese (`ja`), matching
+  the app's resources rather than dependency translations. Android 11–12
   ignore the attribute and keep following the system language; the application suppresses
   lint's `UnusedAttribute` for this intentional version-specific behavior.
 - Manifest application `MainApplication` lives in its own file and installs android/privacy's shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` (android/privacy) authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.

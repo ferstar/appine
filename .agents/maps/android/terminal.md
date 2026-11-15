@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: tab titles move from the activity toast callback to native view tooltips)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: Traditional Chinese, Korean and Japanese UI resources and system language choices)
 
 ## Responsibilities
 
@@ -76,9 +76,13 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ### Binding and choosing a tab
 
-- `res/xml/locale_config.xml` lists English (`en`, default strings) and Simplified Chinese
-  (`zh-CN`, `values-zh-rCN`) for the manifest's Android 13+ system language picker. There is
-  no in-app picker; Android 11–12 keep following the system language. Locale changes use
+- `res/xml/locale_config.xml` lists English (`en`, default strings), Simplified Chinese
+  (`zh-CN`, `values-zh-rCN`), Traditional Chinese (`zh-Hant`, `values-b+zh+Hant`), Korean
+  (`ko`, `values-ko`) and Japanese (`ja`, `values-ja`) for the manifest's Android 13+ system
+  language picker. Traditional Chinese uses Taiwan terminology with a script-wide qualifier.
+  All translated string files follow the default file's sections and resource order, omit
+  non-translatable resources and use only `other` for plurals. There is no in-app picker;
+  Android 11–12 keep following the system language. Locale changes use
   normal activity recreation and the existing service-current tab fallback below.
 - `attachBaseContext` applies an override containing only `UI_MODE_NIGHT_YES`, before the window,
   dynamic colours or views read resources. The terminal's night-qualified resources therefore
@@ -264,7 +268,8 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   document, typed by it and with read access granted: a directory in the Files app, a file in the
   app the system picks. A link from another host, to an existing file while file access is off,
   or to nothing in the store gets a toast instead, as does a link no app takes. The disabled-file
-  hint names "Allow other apps to access files" in both locales, matching Settings' consent dialog.
+  hint names the localized "Allow other apps to access files" setting in all five locales,
+  matching Settings' consent dialog.
   The lookup result returns on the UI thread and is ignored if its activity is destroyed or locked.
 - A tab's clipboard read reaches the activity through the service (`onClipboardRead`; the queue and
   the answers are `VtSession`'s, android/vt). `MainActivity` reads the clipboard's first item as
@@ -370,9 +375,11 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ## To verify
 
-- System per-app language selection: verify English, Simplified Chinese and returning to the
-  system default on Android 13+, including retaining the current terminal tab across recreation.
-  Device switching and vendor settings UI remain unverified.
+- System per-app language selection: verify all five languages and returning to the system
+  default on Android 13+, including retaining the current terminal tab across recreation.
+  Resource compilation, lint and translation key/placeholder checks passed for the three added
+  locales. Native-speaker review, device layout checks, language switching and vendor settings
+  UI remain unverified.
 
 - Tab-list coverage of the notification banner passed API 34 checks with notifications disabled
   and enabled: the first row stays flush below the top bar, taps over the banner select a row
