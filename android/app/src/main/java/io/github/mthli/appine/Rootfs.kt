@@ -214,17 +214,29 @@ internal object Rootfs {
             write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
         }
         writeProfile(context, store, distro)
-        val install = when (distro) {
-            Distro.ALPINE -> "apk add git python3"
-            Distro.DEBIAN -> "apt update && apt install git python3"
+        val (packages, install) = when (distro) {
+            Distro.ALPINE -> "apk" to "apk add"
+            Distro.DEBIAN -> "apt" to "apt install"
         }
         write(
             store, "/etc/motd",
             """
-            Welcome to Appine: ${distro.label}, running inside an Android app.
+            Welcome to Appine!
+            ${distro.label}, running on Android.
 
-            Install packages with ${install.substringBefore(' ')}, for example:  $install
+            Working with packages:
+            - Update index:     $packages update
+            - Search packages:  $packages search <package>
+            - Install packages: $install <package>
+            - Show help:        $packages --help
 
+            For example, install Codex:
+            $packages update
+            $install nodejs npm
+            npm install -g @openai/codex
+
+            Report issues at:
+            https://github.com/mthli/appine/issues
             """.trimIndent(),
         )
     }
