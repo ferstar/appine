@@ -1,8 +1,11 @@
 package io.github.mthli.appine
 
+import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.Drawable
+import android.net.Uri
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.TextUtils
@@ -50,6 +53,11 @@ internal fun Context.themeDrawable(attr: Int): Drawable? {
 
 /** The theme's ripple for something that can be tapped. */
 internal fun View.touchFeedback(): Drawable? = context.themeDrawable(android.R.attr.selectableItemBackground)
+
+/** Opens a system settings action that takes the app's package URI. */
+internal fun Activity.openPackageSettings(action: String) {
+    startActivity(Intent(action, Uri.fromParts("package", packageName, null)))
+}
 
 /** Inserts a monospace value at the localized message's ^1 placeholder, preserving its span. */
 internal fun Context.monospaceMessage(@StringRes template: Int, value: String): CharSequence {

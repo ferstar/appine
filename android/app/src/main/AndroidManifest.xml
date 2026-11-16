@@ -16,6 +16,8 @@
     <!-- PARTIAL_WAKE_LOCK follows the screen-off running policy (the android/service map). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- localeConfig enables the system language picker on Android 13+; older versions ignore it. -->
     <application
             android:name=".MainApplication"

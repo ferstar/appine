@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: system language list includes Traditional Chinese, Korean and Japanese)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: manifest permission for user-requested battery optimization exemption)
 
 ## Responsibilities
 
@@ -139,8 +139,9 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   their configuration changes; the non-exported reader handles no configuration changes itself),
   the `specialUse` foreground service with its subtype property, the
   documents provider, backup turned off (`allowBackup`, `fullBackupContent`, data extraction
-  rules), normal permissions plus `POST_NOTIFICATIONS`, which `MainActivity` requests at run time;
-  no storage permission. The debug source set's network security config allows cleartext to
+  rules), normal permissions plus `POST_NOTIFICATIONS`, which `MainActivity` and Settings can request at run time,
+  and `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` for the terminal banner’s user-initiated system dialog.
+  The app requests no storage permission. The debug source set's network security config allows cleartext to
   127.0.0.1 only (for the download tests).
 
 ### Released sources

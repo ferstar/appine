@@ -136,6 +136,8 @@
     <!-- Settings: Android and screen-off running -->
     <string name="settings_group_android">Android</string>
     <string name="settings_notifications">通知を有効にする</string>
+    <string name="settings_notifications_summary">バックグラウンドの動作を確認</string>
+    <string name="settings_battery_usage">アプリのバッテリー使用量</string>
 
     <string name="settings_run_policy">画面オフ時の動作</string>
     <string name="allow_sleep">スリープを許可</string>
@@ -234,6 +236,8 @@
     <!-- Notifications and background service -->
     <string name="notification_prompt">通知を有効にしてバックグラウンドの動作を確認</string>
     <string name="notification_prompt_dismiss">通知の案内を閉じる</string>
+    <string name="battery_prompt">バックグラウンドのバッテリー使用を制限しない</string>
+    <string name="battery_prompt_dismiss">バッテリー使用量の案内を閉じる</string>
 
     <string name="channel_sessions">ターミナルセッション</string>
     <plurals name="sessions_running">

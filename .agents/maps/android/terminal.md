@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: Traditional Chinese, Korean and Japanese UI resources and system language choices)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: battery exemption banner, dismissal and system settings navigation)
 
 ## Responsibilities
 
@@ -14,7 +14,7 @@ terminals (`android/vtcore`), interaction (`android/vtview`) and rendering (`and
 It owns activity lifecycle, choosing/closing tabs, shortcuts, search UI, link routing, clipboard
 questions, insets and IME animation, plus shared UI helpers, strings and themes.
 
-Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `NotificationPermission.kt`, `SearchBarView.kt` and `Ui.kt`
+Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `NotificationPermission.kt`, `BatteryOptimization.kt`, `SearchBarView.kt` and `Ui.kt`
 in `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/` except
 android/privacy's `layout/privacy_shield.xml`, `drawable/privacy_emblem.xml` and `drawable/ic_lock.xml`,
 and android/licenses' `layout/list_item.xml` and `values/ids.xml`.
@@ -41,13 +41,15 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   program may read the clipboard (`clipboardQuestion`).
 - `TerminalLayout` — builds the views with the activity's adapters after dynamic colours are
   applied: a black column of one bar's place (`TabBarView`, or `SearchBarView` while searching),
-  a shared overlay frame containing a column of the optional notification-permission banner,
+  a shared overlay frame containing a column of optional permission banners (notifications, then battery usage),
   the terminal body (`VtView`, status text and `ProgressLine` along its top) and `ExtraKeysView`,
   with `TabListView` above that column;
   exposes the root and interactive views, keeps the status view private behind `showStatus` and
   `showTerminal`, and owns the IME animation callback `keysFollowIme`.
 - `NotificationPermission` — shared notification availability, request history and system-settings
   navigation for MainActivity and SettingsFragment; callers own their result launchers and visibility.
+- `BatteryOptimization` — checks the package’s Doze exemption, requests it from the terminal
+  and opens system app details from Settings.
 - `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
   `startViewer`; keeps the activity and its toast callback, with no service or session state.
 - `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
@@ -93,7 +95,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   change; a pixel size an earlier version kept as `font_size` is converted at the current density
   and removed), applies the saved Keep screen on choice (off by default), builds `TerminalLayout`
   (the status line says "Starting…", insets and IME animation are wired there), installs its root
-  edge-to-edge and updates the notification banner without requesting permission. `onStart` applies the wide-cell
+  edge-to-edge and updates the permission banners without opening system dialogs. `onStart` applies the wide-cell
   and tab-list visibility settings through `onSettingsChanged`, starts and binds the service; `onServiceConnected` registers the listener and replays
   the start's result or progress and pending notices; `onStop` unregisters and unbinds.
 - When the kernel is ready the tab shown is, in order: one a notification asked for (`EXTRA_TAB`,
@@ -123,9 +125,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   helper remains for extra-key notices, link failures and file-import feedback.
 - The list closes on tab switching, search, other bar actions, extra-key input, pause and restart;
   list close buttons retain it while using the existing busy confirmation.
-- The list starts directly below the top bar and overlays the notification banner, terminal
+- The list starts directly below the top bar and overlays both permission banners, terminal
   and extra keys; its rows may cover the keys in short viewports. Taps outside its rows dismiss
-  and are consumed, including over the keys. The banner, terminal and extra keys are hidden
+  and are consumed, including over the keys. The whole content column is hidden
   from accessibility while the list is open, and restored when it closes.
 
 - The list’s close buttons, `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
@@ -153,15 +155,15 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   context uses `ThemeOverlay.Appine.CheckPopup`, removing the checkbox's own background while
   retaining the menu row's press feedback and the overflow menu's placement.
 
-### Notification permission
+### Permission banners
 
-- A 32 dp banner below the top bar, also while searching, appears when app notifications are
-  disabled and the user has not dismissed it. Its localized 14 dp message is start-aligned with
+- The notification and battery banners share a 32 dp row design below the top bar, including
+  during search. Each localized 14 dp message is start-aligned with
   10 dp horizontal padding and fallback line spacing disabled. It ellipsizes in narrow windows
   and fills the clickable space before a separate 32 dp close button.
   Both buttons use background touch feedback with tint cleared over the container's surface colour,
   muted text and tap haptics. The close button has a localized accessibility description.
-- Closing the banner persists `dismissed_notification_prompt` in MainActivity preferences;
+- The notification banner appears while notifications are disabled. Closing it persists `dismissed_notification_prompt` in MainActivity preferences;
   recreating or relaunching the activity does not show it again. Closing does not request
   permission or alter authorization history. The tab list hides both buttons from accessibility
   while covering the banner through the existing container-level policy.
@@ -179,6 +181,13 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   `onResume` refresh each entry's visibility. Granting removes both entries; revoking restores the
   Settings entry and restores the banner only if it was never dismissed. Individual disabled
   channels do not show either entry.
+- The battery banner appears while `PowerManager.isIgnoringBatteryOptimizations` is false and
+  disappears on dismissal or grant. Its separate `dismissed_battery_prompt` preference leaves
+  the notification banner and Settings action available under their own visibility rules.
+  A tap requests the exemption with `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` and the package
+  URI. If that activity is missing, it opens app details, the same destination as the Settings
+  action. Both paths check privacy and the live exemption before launch. Resume rereads the
+  system state. The guest screen-off policy remains a separate preference.
 
 ### Extra-key integration
 
@@ -287,7 +296,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - android/vtview: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`,
   `shift` and `modifiersUsed`, `onLink`, `onSearchCount`).
 - android/setup and android/licenses use the shared page frame, themes and view helpers;
-  Settings also uses the preference switch widget and NotificationPermission authorization helper. android/privacy uses the shared theme and helpers.
+  Settings also uses the preference switch widget, NotificationPermission and BatteryOptimization. android/privacy uses the shared theme and helpers.
 - android/privacy: `onPrivacyUnlocked` resumes deferred terminal UI work.
 
 ### Outbound

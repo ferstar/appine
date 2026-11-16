@@ -7,7 +7,6 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import androidx.activity.result.ActivityResultLauncher
 import androidx.core.content.edit
@@ -51,10 +50,7 @@ internal object NotificationPermission {
         try {
             activity.startActivity(intent)
         } catch (_: ActivityNotFoundException) {
-            activity.startActivity(Intent(
-                SystemSettings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                Uri.fromParts("package", activity.packageName, null),
-            ))
+            activity.openPackageSettings(SystemSettings.ACTION_APPLICATION_DETAILS_SETTINGS)
         }
     }
 

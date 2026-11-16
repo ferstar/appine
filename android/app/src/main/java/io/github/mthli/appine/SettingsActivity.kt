@@ -113,9 +113,10 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             saveLogs(archive, uri)
         }
     }
+    private lateinit var batteryUsage: Preference
     private lateinit var notifications: Preference
     private val requestNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-        updateNotifications()
+        updatePermissionActions()
     }
     private lateinit var runPolicy: ListPreference
     private lateinit var fileAccess: SwitchPreferenceCompat
@@ -166,8 +167,11 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         NotificationPermission.initialize(requireContext())
         notifications = action(R.string.settings_notifications) {
             NotificationPermission.enable(requireActivity(), requestNotifications)
-        }.apply { setSummary(R.string.notification_prompt) }
-        updateNotifications()
+        }.apply { setSummary(R.string.settings_notifications_summary) }
+        batteryUsage = action(R.string.settings_battery_usage) {
+            BatteryOptimization.openAppSettings(requireActivity())
+        }.apply { setSummary(R.string.battery_prompt) }
+        updatePermissionActions()
         runPolicy = choice(R.string.settings_run_policy) { s, value ->
             s.setRunPolicy(RunPolicy.entries.first { it.value == value })
         }.apply {
@@ -214,7 +218,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
 
         group(R.string.settings_group_system, distro, account, reset)
-        group(R.string.settings_group_android, notifications, runPolicy, privacy, fileAccess)
+        group(R.string.settings_group_android, notifications, batteryUsage, runPolicy, privacy, fileAccess)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, tabList, volumeKeys)
         group(R.string.settings_group_debug, tier, export)
         group(R.string.settings_group_about, project, licenses, version)
@@ -258,11 +262,12 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
 
     override fun onResume() {
         super.onResume()
-        updateNotifications()
+        updatePermissionActions()
     }
 
-    private fun updateNotifications() {
+    private fun updatePermissionActions() {
         notifications.isVisible = !NotificationPermission.enabled(requireContext())
+        batteryUsage.isVisible = !BatteryOptimization.isExempt(requireContext())
     }
 
     private fun chooseLogExport() {

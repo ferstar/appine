@@ -13,6 +13,7 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.annotation.StringRes
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
@@ -32,6 +33,8 @@ internal class TerminalLayout(
     extraKeys: ExtraKeysView.Target,
     enableNotifications: () -> Unit,
     dismissNotificationPrompt: () -> Unit,
+    requestBatteryExemption: () -> Unit,
+    dismissBatteryPrompt: () -> Unit,
 ) {
     val screen = VtView(context, host).apply {
         setFontSize(fontSize)
@@ -53,7 +56,24 @@ internal class TerminalLayout(
     val searchBar = SearchBarView(context, find).apply { isVisible = false }
     val keys = ExtraKeysView(context, extraKeys)
 
-    val notificationPrompt = LinearLayout(context).apply {
+    val notificationPrompt = permissionPrompt(
+        context, R.string.notification_prompt, R.string.notification_prompt_dismiss,
+        enableNotifications, dismissNotificationPrompt,
+    )
+    val batteryPrompt = permissionPrompt(
+        context, R.string.battery_prompt, R.string.battery_prompt_dismiss,
+        requestBatteryExemption, dismissBatteryPrompt,
+    )
+
+    private fun permissionPrompt(
+        context: Context,
+        @StringRes message: Int,
+        @StringRes dismissLabel: Int,
+        enable: () -> Unit,
+        dismiss: () -> Unit,
+    ) = LinearLayout(context).apply {
+        val rowHeight = context.dp(32)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, rowHeight)
         isVisible = false
         orientation = LinearLayout.HORIZONTAL
         setBackgroundColor(context.themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
@@ -76,19 +96,20 @@ internal class TerminalLayout(
                 action()
             }
         }
-        addView(button(enableNotifications).apply {
-            setText(R.string.notification_prompt)
+        addView(button(enable).apply {
+            setText(message)
             ellipsize = TextUtils.TruncateAt.END
             isFallbackLineSpacing = false
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
             setPadding(context.dp(10), 0, context.dp(10), 0)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
-        addView(button(dismissNotificationPrompt).apply {
+        addView(button(dismiss).apply {
             text = "×"
-            contentDescription = context.getString(R.string.notification_prompt_dismiss)
-        }, LinearLayout.LayoutParams(context.dp(32), ViewGroup.LayoutParams.MATCH_PARENT))
+            contentDescription = context.getString(dismissLabel)
+        }, LinearLayout.LayoutParams(rowHeight, ViewGroup.LayoutParams.MATCH_PARENT))
     }
 
+    private val content: LinearLayout
     val root: LinearLayout
 
     /**
@@ -158,18 +179,19 @@ internal class TerminalLayout(
             addView(status)
             addView(progressLine, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, context.line(), Gravity.TOP))
         }
-        val content = LinearLayout(context).apply {
+        content = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             // Let the keys follow the IME beyond this column's bottom edge.
             clipChildren = false
-            addView(notificationPrompt, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, context.dp(32)))
+            addView(notificationPrompt)
+            addView(batteryPrompt)
             addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(keys)
         }
         val overlay = FrameLayout(context).apply {
             clipChildren = false
             addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-            // The list covers the banner, terminal and keys, including during IME animation.
+            // The list covers the banners, terminal and keys, including during IME animation.
             addView(tabList, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         root = LinearLayout(context).apply {
@@ -191,6 +213,16 @@ internal class TerminalLayout(
             WindowInsetsCompat.CONSUMED
         }
         ViewCompat.setWindowInsetsAnimationCallback(root, keysFollowIme)
+    }
+
+    fun updateTabListControls() {
+        val open = tabList.isVisible
+        content.importantForAccessibility = if (open) {
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        } else {
+            View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        }
+        tabBar.setListOpen(open)
     }
 
     fun showStatus(text: String) {

@@ -136,6 +136,8 @@
     <!-- Settings: Android and screen-off running -->
     <string name="settings_group_android">Android</string>
     <string name="settings_notifications">開啟通知</string>
+    <string name="settings_notifications_summary">查看背景活動</string>
+    <string name="settings_battery_usage">電池用量</string>
 
     <string name="settings_run_policy">螢幕關閉時的執行方式</string>
     <string name="allow_sleep">允許休眠</string>
@@ -234,6 +236,8 @@
     <!-- Notifications and background service -->
     <string name="notification_prompt">開啟通知以查看背景活動</string>
     <string name="notification_prompt_dismiss">關閉通知提示</string>
+    <string name="battery_prompt">允許背景工作不受電池最佳化限制</string>
+    <string name="battery_prompt_dismiss">關閉電池用量提示</string>
 
     <string name="channel_sessions">終端機工作階段</string>
     <plurals name="sessions_running">

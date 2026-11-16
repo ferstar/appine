@@ -136,6 +136,8 @@
     <!-- Settings: Android and screen-off running -->
     <string name="settings_group_android">Android</string>
     <string name="settings_notifications">알림 켜기</string>
+    <string name="settings_notifications_summary">백그라운드 활동 확인</string>
+    <string name="settings_battery_usage">앱 배터리 사용량</string>
 
     <string name="settings_run_policy">화면이 꺼졌을 때 실행 방식</string>
     <string name="allow_sleep">절전 허용</string>
@@ -234,6 +236,8 @@
     <!-- Notifications and background service -->
     <string name="notification_prompt">알림을 켜서 백그라운드 활동 확인</string>
     <string name="notification_prompt_dismiss">알림 안내 닫기</string>
+    <string name="battery_prompt">백그라운드 작업에 배터리 사용 제한 해제</string>
+    <string name="battery_prompt_dismiss">배터리 사용량 안내 닫기</string>
 
     <string name="channel_sessions">터미널 세션</string>
     <plurals name="sessions_running">

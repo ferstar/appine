@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: zsh companion hooks, local emulation and stock-profile migration)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: conditional battery usage action in Android settings)
 
 ## Responsibilities
 
@@ -22,7 +22,7 @@
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
   admin setup, installing the bundled bash, procps-ng and bubblewrap, and the NOPASSWD rules;
 - the settings screen, which displays service state and forwards choices, plus shared privacy
-  and notification authorization actions;
+  and notification authorization actions and navigation to system battery settings;
 - the store lock shared by the kernel start, store deletion and the Files provider.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
@@ -59,7 +59,7 @@ session consuming their state and events (`android/vt`).
   with android/licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
   `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
-  reset), Android (notification authorization when disabled, running policy, privacy mode, file access), Terminal (CJK characters filling two
+  reset), Android (conditional notification and battery usage actions, running policy, privacy mode, file access), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, tab-list button visibility, the volume keys switching tabs), Debugging (execution
   mode and diagnostic export, in all builds) and About (project website, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
@@ -342,6 +342,9 @@ session consuming their state and events (`android/vt`).
   open system notification settings. The action checks privacy and works without service binding.
   The fragment refreshes visibility when creating preferences, after permission results and on
   resume, including return from system settings. Granting removes it; revoking restores it.
+- App battery usage follows notifications and precedes the screen-off policy. It opens the
+  system app details for this package. The row reads the system Doze exemption on creation and
+  resume, remains available after banner dismissal, and disappears when the package is exempt.
 
 - Diagnostic export is independent of service binding and kernel readiness. Its protected dialog
   offers Save to file or Share. Both call `Privacy.requestLogExport` before generating a ZIP;
@@ -396,9 +399,9 @@ session consuming their state and events (`android/vt`).
   without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
   The link can be built before publication, but the store listing is unavailable until published.
 - Service-dependent preferences are disabled before binding, on disconnect and on stopping;
-  notification authorization, diagnostic export, project website, licenses and version remain usable. All preferences have stable resource-name keys and persistence
+  notification authorization, battery usage, diagnostic export, project website, licenses and version remain usable. All preferences have stable resource-name keys and persistence
   disabled: they render service values and their change listeners call service setters, never
-  writing a second preference store (privacy and notification authorization use shared controllers). AndroidX manages row binding, disabled states and
+  writing a second preference store (privacy, notification authorization and battery usage use shared controllers). AndroidX manages row binding, disabled states and
   accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
 - Login, running policy and cursor choices use `ChoiceDialog`, a `ListPreferenceDialogFragmentCompat` whose
   builder is `MaterialAlertDialogBuilder`: AndroidX keeps the entries, selection and dialog
@@ -432,7 +435,7 @@ session consuming their state and events (`android/vt`).
   `Listener` (Settings); `LicensesActivity` (android/licenses); android/privacy's mode changes,
   export authorization and dialog protection; Material Components and AndroidX (Settings),
   including AndroidX Browser for the project website; android/terminal's NotificationPermission
-  for shared authorization history and settings navigation.
+  for shared authorization history and settings navigation, and BatteryOptimization for exemption status and app details.
 
 ## Invariants and gotchas
 

@@ -58,7 +58,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         files.selected(uris)
     }
     private val requestNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-        updateNotificationPrompt()
+        updatePermissionPrompts()
     }
 
     private var service: TerminalService? = null
@@ -143,9 +143,11 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         layout = TerminalLayout(
             this, savedFontSize(), Host(), Bar(), Tabs(), Find(), Keys(),
             enableNotifications = ::enableNotifications,
-            dismissNotificationPrompt = ::dismissNotificationPrompt,
+            dismissNotificationPrompt = { dismissPrompt(PREF_DISMISSED_NOTIFICATION_PROMPT) },
+            requestBatteryExemption = { BatteryOptimization.requestExemption(this) },
+            dismissBatteryPrompt = { dismissPrompt(PREF_DISMISSED_BATTERY_PROMPT) },
         )
-        updateNotificationPrompt()
+        updatePermissionPrompts()
         renderTabs()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(layout.root)
@@ -171,7 +173,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     override fun onResume() {
         super.onResume()
-        updateNotificationPrompt()
+        updatePermissionPrompts()
     }
 
     override fun onPause() {
@@ -206,17 +208,20 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         onNotice()
     }
 
-    // ---- Notification permission ----
+    // ---- Permission prompts ----
 
-    private fun updateNotificationPrompt() {
+    private fun updatePermissionPrompts() {
+        val preferences = getPreferences(MODE_PRIVATE)
         layout.notificationPrompt.isVisible = !NotificationPermission.enabled(this) &&
-            !getPreferences(MODE_PRIVATE).getBoolean(PREF_DISMISSED_NOTIFICATION_PROMPT, false)
+            !preferences.getBoolean(PREF_DISMISSED_NOTIFICATION_PROMPT, false)
+        layout.batteryPrompt.isVisible = !BatteryOptimization.isExempt(this) &&
+            !preferences.getBoolean(PREF_DISMISSED_BATTERY_PROMPT, false)
     }
 
-    private fun dismissNotificationPrompt() {
+    private fun dismissPrompt(key: String) {
         if (Privacy.locked(this)) return
-        getPreferences(MODE_PRIVATE).edit { putBoolean(PREF_DISMISSED_NOTIFICATION_PROMPT, true) }
-        updateNotificationPrompt()
+        getPreferences(MODE_PRIVATE).edit { putBoolean(key, true) }
+        updatePermissionPrompts()
     }
 
     private fun enableNotifications() {
@@ -483,10 +488,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         val sessions = service?.sessions.orEmpty().toList()
         if (sessions.isEmpty()) return
         layout.tabList.open(sessions, current)
-        layout.notificationPrompt.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-        layout.screen.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-        layout.keys.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-        layout.tabBar.setListOpen(true)
+        layout.updateTabListControls()
         closeTabListOnBack.isEnabled = true
     }
 
@@ -494,10 +496,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         if (!layout.tabList.isVisible) return
         val hadFocus = layout.tabList.hasFocus()
         layout.tabList.close()
-        layout.notificationPrompt.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
-        layout.screen.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
-        layout.keys.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
-        layout.tabBar.setListOpen(false)
+        layout.updateTabListControls()
         closeTabListOnBack.isEnabled = false
         if (hadFocus) layout.screen.requestFocus()
     }
@@ -853,6 +852,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         private const val PREF_FONT_SIZE_PX = "font_size"
 
         private const val PREF_KEEP_SCREEN_ON = "keep_screen_on"
+        private const val PREF_DISMISSED_BATTERY_PROMPT = "dismissed_battery_prompt"
         private const val PREF_DISMISSED_NOTIFICATION_PROMPT = "dismissed_notification_prompt"
 
         private const val DEFAULT_FONT_DP = 12f
