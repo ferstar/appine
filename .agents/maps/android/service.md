@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: separate the ongoing notification's state title from its running-policy body)
 
 ## Responsibilities
 
@@ -213,14 +213,16 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   delivery delayed by 2 s renews grace, and a new kernel, completed boot or policy change resets it.
   Release/reacquisition happens on a completed poll; polling cannot wake a suspended device.
   CPU inactivity can include network waits and scheduled work, which need ALWAYS for continuity.
-- The ongoing notification (id 1) shows, by precedence: "Stopping services…" while exiting; the
+- The ongoing notification (id 1) title shows, by precedence: "Stopping services…" while exiting; the
   import or download progress while no kernel runs; "Cannot start: …" after a failed start;
   "Running in the background" while a kernel runs and no tab does; else the count of running
   sessions ("0 sessions running" while a start is under way, except that a start after an exit,
   because a listener came back, keeps "Stopping services…" until it ends under SLEEP,
   as nothing refreshes the notification). A switch adds its progress, subtext
-  and a cancel action. Text includes the selected policy without the instantaneous wake-lock state;
-  expanded text wraps. The single toggle names its target: ALWAYS from either non-always policy,
+  and a cancel action. The body shows the selected policy without the instantaneous wake-lock state;
+  expanded body text wraps. Privacy mode uses "Privacy mode" as the title, hiding the state
+  while keeping the selected policy in the body.
+  The single toggle names its target: ALWAYS from either non-always policy,
   otherwise the saved `idle_policy` (SLEEP until chosen). Settings and notification stay in sync.
   The toggle is hidden while exiting, and "Exit all" is always there.
 
@@ -355,7 +357,7 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   while pending, or completed transfer deletes it. `install` attempts to delete save orphans from
   the previous process. Settings authenticates and prepares before opening SAF, then consumes
   the pending reference once to copy only that ZIP to the selected document on a separate thread.
-- With privacy enabled, all notification title/body details are replaced by generic text, including ongoing start errors/download progress. Enabling removes old non-ongoing notifications and refreshes the ongoing one; tab numbers and action labels remain. The `Privacy` mode-change listener refreshes service/UI settings.
+- With privacy enabled, notification event and session details are hidden, including ongoing start errors/download progress. Non-ongoing titles/bodies use generic text; the ongoing title says "Privacy mode" and its body retains the selected running policy. Enabling removes old non-ongoing notifications and refreshes the ongoing one; tab numbers and action labels remain. The `Privacy` mode-change listener refreshes service/UI settings.
 - Exit all, cancel download and running-policy actions always target `TerminalService`, including while locked. Report-copy actions target non-exported `Notifications.ReportReceiver` normally and non-exported `NotificationActivity` during privacy mode; only the latter opens the authentication page. Both copy directly without starting the kernel, and all copy paths (including legacy service intents) check `Privacy.locked` at delivery. Reports are not copied into notification text.
 - `Privacy` owns authenticated mode changes without requiring a service binding: enabling clears file access, revokes grants and refreshes roots; disabling restores neither access nor grants. The service also refuses enabling file access while privacy is on.
 - Kill reports (one tab-separated line each: console, pid, command, `bug` or `oom`, and three
@@ -479,6 +481,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 
 ## To verify
 
+- The ongoing notification's state title and running-policy body have not been checked on a device,
+  including long startup errors and privacy mode.
 - Foreground program-notification haptics and background notification vibration on physical
   devices, including touch feedback disabled, channel vibration disabled and Do Not Disturb.
 - Diagnostic retention, app-only capture, archive contents and provider confinement passed API 34

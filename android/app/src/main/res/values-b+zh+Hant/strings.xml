@@ -160,7 +160,6 @@
     <string name="privacy_unavailable">目前無法驗證身分。請在 Android 設定中設定螢幕鎖定，或稍後再試。</string>
 
     <string name="privacy_notification">解鎖 Appine 以查看終端機</string>
-    <string name="privacy_running">隱私模式 · 正在背景執行</string>
 
     <!-- File access and document roots -->
     <string name="settings_file_access">允許其他應用程式存取檔案</string>

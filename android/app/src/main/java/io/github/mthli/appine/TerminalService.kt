@@ -466,11 +466,11 @@ class TerminalService : Service() {
             n == 0 && machine != 0L -> getString(R.string.background_running)
             else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
         }
-        val text = if (Settings.privacyMode(this)) getString(R.string.privacy_running)
-            else getString(R.string.run_notification, state, getString(runPolicy.label))
+        val privacyEnabled = Settings.privacyMode(this)
+        val text = getString(runPolicy.label)
         val builder = Notification.Builder(this, Notifications.SESSIONS_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.app_name))
+            .setContentTitle(if (privacyEnabled) getString(R.string.settings_privacy) else state)
             .setContentText(text)
             .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(open)
@@ -481,7 +481,7 @@ class TerminalService : Service() {
             // A distro switch download: progress on the second line, cancellable from the
             // notification
             val cancel = Notifications.serviceAction(this, 2, ACTION_CANCEL_SWITCH)
-            if (!Settings.privacyMode(this)) {
+            if (!privacyEnabled) {
                 builder.setSubText(getString(R.string.downloading, sw.distro.label, sw.done shr 20, sw.total shr 20))
                 if (sw.total > 0) builder.setProgress(sw.total.toInt(), sw.done.toInt(), false)
             }

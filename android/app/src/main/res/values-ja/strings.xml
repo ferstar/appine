@@ -160,7 +160,6 @@
     <string name="privacy_unavailable">認証を利用できません。Androidの設定で画面ロックを設定するか、しばらくしてから再試行してください。</string>
 
     <string name="privacy_notification">Appineのロックを解除してターミナルを表示</string>
-    <string name="privacy_running">プライバシーモード · バックグラウンドで実行中</string>
 
     <!-- File access and document roots -->
     <string name="settings_file_access">他のアプリによるファイルへのアクセスを許可</string>

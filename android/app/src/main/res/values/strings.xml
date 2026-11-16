@@ -162,7 +162,6 @@
     <string name="privacy_unavailable">Authentication is unavailable. Set up a screen lock in Android settings, or try again later.</string>
 
     <string name="privacy_notification">Unlock Appine to view the terminal</string>
-    <string name="privacy_running">Privacy mode · Running in the background</string>
 
     <!-- File access and document roots -->
     <string name="settings_file_access">Allow other apps to access files</string>
