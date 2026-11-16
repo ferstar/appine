@@ -80,10 +80,10 @@ internal class Notifications(private val service: TerminalService) {
             NETWORK_CHANNEL_ID, service.getString(R.string.channel_network), NotificationManager.IMPORTANCE_DEFAULT,
         )
         val problems = NotificationChannel(
-            PROBLEMS_CHANNEL_ID, service.getString(R.string.channel_problems), NotificationManager.IMPORTANCE_DEFAULT,
+            PROBLEMS_CHANNEL_ID, service.getString(R.string.channel_problems), NotificationManager.IMPORTANCE_HIGH,
         )
         val terminal = NotificationChannel(
-            TERMINAL_CHANNEL_ID, service.getString(R.string.channel_terminal), NotificationManager.IMPORTANCE_DEFAULT,
+            TERMINAL_CHANNEL_ID, service.getString(R.string.channel_terminal), NotificationManager.IMPORTANCE_HIGH,
         ).apply {
             // Only sets the default for a new channel; existing channels keep the user's settings.
             enableVibration(true)

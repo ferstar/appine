@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: show startup error details in the ongoing notification body while preserving privacy redaction)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: enable heads-up alerts by default for new terminal and problems notification channels)
 
 ## Responsibilities
 
@@ -407,15 +407,16 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   app's language: hours and minutes, minutes and seconds, or seconds). Tapping
   one opens the activity on that tab (`EXTRA_TAB` with the session id); showing the tab or closing
   it takes it away.
-- Channels: `sessions` (low), `network`, `problems`, `terminal` (named "Bells, notifications from
+- Channels: `sessions` (low), `network` (default), `problems` (high), `terminal` (high, named "Bells, notifications from
   programs and finished commands"); kill reports take ids from 100000,
   counting up from a clock-seeded start and wrapping after 100000. Their names are in the app's
   language: `onConfigurationChanged` names them anew when the configuration's languages have
   changed and posts the ongoing notification again; the other notifications keep the language
   they were posted in. The bug report is in English whatever the language.
-- A newly created `terminal` channel enables the system's default notification vibration.
-  Existing channels retain their settings: Android does not apply new vibration defaults after
-  channel creation, so older installations need vibration enabled in system notification settings.
+- Newly created `terminal` and `problems` channels use `IMPORTANCE_HIGH` for heads-up alerts;
+  `terminal` also enables the system's default notification vibration. Existing channels retain their settings: Android
+  does not apply increased importance or new vibration defaults after channel creation, so older
+  installations need heads-up alerts and vibration enabled in system notification settings.
   Notification permission, channel settings and Do Not Disturb govern background alerts; there
   is no separate vibrator call. Foreground program notifications use view haptics instead.
 
@@ -487,6 +488,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   been checked on a device, including long startup errors and privacy mode.
 - Foreground program-notification haptics and background notification vibration on physical
   devices, including touch feedback disabled, channel vibration disabled and Do Not Disturb.
+- Heads-up alerts for terminal events and problem reports, including other tabs, the app in
+  the background, new channels, existing channels adjusted in system settings, and vendor-specific suppression.
 - Diagnostic retention, app-only capture, archive contents and provider confinement passed API 34
   instrumentation. Abrupt native-crash capture, real ANR/native trace attachments and vendor
   logcat availability remain unverified; unavailable logs/traces are described in the ZIP.
