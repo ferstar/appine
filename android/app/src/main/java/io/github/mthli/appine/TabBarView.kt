@@ -476,7 +476,6 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         setTextColor(mutedColor)
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, BAR_LABEL_DP)
         gravity = Gravity.CENTER
-        isFallbackLineSpacing = false
         background = touchFeedback()
         setOnClickListener {
             it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)

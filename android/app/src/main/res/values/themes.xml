@@ -16,6 +16,8 @@
         <item name="android:statusBarColor">@android:color/black</item>
         <item name="android:navigationBarColor">@android:color/black</item>
         <item name="android:windowBackground">@android:color/black</item>
+        <!-- Keep CJK and other fallback glyphs from changing line height in controls and tooltips. -->
+        <item name="android:fallbackLineSpacing">false</item>
     </style>
 
     <!-- The menu row handles presses; its checkbox needs no separate ripple background. -->

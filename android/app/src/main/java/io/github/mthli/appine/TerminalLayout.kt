@@ -99,7 +99,6 @@ internal class TerminalLayout(
         addView(button(enable).apply {
             setText(message)
             ellipsize = TextUtils.TruncateAt.END
-            isFallbackLineSpacing = false
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
             setPadding(context.dp(10), 0, context.dp(10), 0)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))

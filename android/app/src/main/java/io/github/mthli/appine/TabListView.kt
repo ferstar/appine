@@ -224,7 +224,6 @@ internal class TabListView(context: Context, private val target: Target) : Frame
     private fun label(size: Float) = TextView(context).apply {
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, size)
         setSingleLine()
-        isFallbackLineSpacing = false
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
     }
 

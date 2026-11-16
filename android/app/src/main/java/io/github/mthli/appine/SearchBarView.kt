@@ -58,9 +58,6 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
         setHintTextColor(mutedColor)
         setHint(R.string.find)
         isSingleLine = true
-        // The line stays as tall as the bar's font when a character comes from a fallback font
-        // (CJK text to find), so the text does not move in the bar as it is typed
-        isFallbackLineSpacing = false
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         imeOptions = EditorInfo.IME_ACTION_SEARCH or EditorInfo.IME_FLAG_NO_EXTRACT_UI or
             EditorInfo.IME_FLAG_NO_FULLSCREEN
@@ -143,7 +140,6 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
         setTextColor(mutedColor)
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, TabBarView.BAR_LABEL_DP)
         gravity = Gravity.CENTER
-        isFallbackLineSpacing = false
         background = touchFeedback()
         setOnClickListener {
             it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
