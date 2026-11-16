@@ -46,7 +46,7 @@ import kotlin.math.roundToInt
  * ESC  /   -  HOME  ↑  END  |  │ SHIFT
  * TAB CTRL ALT  ←   ↓   →   ~  │ SYM
  *
- *  `   $   *   =   ^   \   &   │  %
+ *  `   $   *   =   ^   \   &   │  !
  *  [   ]   {   }   <   >   ;   │ SYM
  *
  *  F1  F2  F3  F4  F5  F6 PGUP │ SHIFT
@@ -59,7 +59,7 @@ import kotlin.math.roundToInt
  * tab row fades out into ×.
  * Wide windows and short landscape windows use one row, with ESC, TAB, / and - before navigation and
  * CTRL, ALT, SHIFT and SYM fixed at the right. The symbols and function pages fix only SYM there, retaining
- * the hidden modifiers' state; % follows & before the bracket pairs. Cells never shrink below the minimum.
+ * the hidden modifiers' state; ! follows & before the bracket pairs. Cells never shrink below the minimum.
  *
  * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow,
  * Page Up or Page Down repeats it. Ctrl, Alt and Shift are one-shot modifiers: tapped, they apply
@@ -242,7 +242,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         }
         // Keep bracket pairs together, $ and * on the left, and the shell control operators
         // & and ; in the rightmost grid column. The other symbols retain their positions.
-        page(chars("`$*=^\\&"), chars("[]{}<>;"), upperKey = fixedView(char("%")))
+        page(chars("`$*=^\\&"), chars("[]{}<>;"), upperKey = fixedView(char("!")))
         pages[SYMBOLS].let { page ->
             val (top, bottom) = page.rows
             page.singleRowKeys = top + page.upperKey + bottom
