@@ -4,8 +4,6 @@
 > See `.agents/decisions/android/keys.md` for the paired decision history (not yet created; pre-split decisions D4, D12, D14, D15 and D19–D23 stay in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
->
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: replace the caret key with an at sign on the symbols page)
 
 ## Responsibilities
 
@@ -19,14 +17,14 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
 - `ExtraKeysView` — adaptive extra keys, normally Termux's default keys widened to two rows of
   eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
-  SYM (`` ` ``, `$`, `*`, `=`, `@`, `\`, `&`, `!`; `[`, `]`, `{`, `}`, `<`, `>`, `;`: shell
+  SYM (`` ` ``, `$`, `*`, `=`, `^`, `\`, `&`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `;`: shell
   symbols absent from the first page, with bracket pairs together and `&` above `;` in the
   last scrolling column) and a third of function keys for every key but SHIFT and SYM (F1–F6,
   PGUP; F7–F12, PGDN): a `Page` keeps its original rows, `singleRowKeys` order, grid and
   `upperKey` (the key above SYM in two-row mode).
-  The grid shown is in a `HorizontalScrollView`, with fixed keys over its end: SHIFT or `!`
+  The grid shown is in a `HorizontalScrollView`, with fixed keys over its end: SHIFT or `%`
   above SYM in two-row mode, CTRL/ALT/SHIFT/SYM beside it on the main page in single-row mode,
-  with only SYM fixed on that layout's symbols/function pages and `!` following `&` before the bracket pairs.
+  with only SYM fixed on that layout's symbols/function pages and `%` following `&` before the bracket pairs.
   It keeps CTRL, ALT and SHIFT (one-shot or locked; `shift` reads
   false while the symbols are shown) and the page shown (`KEYS`, `SYMBOLS` or `FUNCTIONS`), exposes
   them with `modifiersUsed`, and sends keys, text and notices (a modifier locked) to a `Target`; a
@@ -64,8 +62,8 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   the symbols and function pages fix only SYM, hiding the modifiers without clearing their state.
   SHIFT still waits on the symbols page but applies on the function page.
   The main scrolling row is ESC, TAB, `/`, `-`, ↑, ↓, ←, →,
-  HOME, END, `|`, `~`; the symbols are the original scrolling top row followed by `!` and the
-  bottom row, placing `!` after `&` and ending with `;` at SYM's left edge,
+  HOME, END, `|`, `~`; the symbols are the original scrolling top row followed by `%` and the
+  bottom row, placing `%` after `&` and ending with `;` at SYM's left edge,
   and the function page is F1–F12 followed by PGUP/PGDN. All keys remain available, each at least
   45 dp wide; excess keys scroll under the fixed group with the same fade and gesture exclusion.
   Every single-row page shares the width over 16 columns, with rounding remainder in SYM, so
@@ -88,7 +86,7 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   modifiers through the host and report when a key took them; that clears one-shot modifiers and
   leaves locked ones on.
 - A tap on SYM shows the symbols, and from either other page shows the first again; a long press
-  shows the function keys, and from them the first page again. Two-row mode keeps `!` above SYM
+  shows the function keys, and from them the first page again. Two-row mode keeps `%` above SYM
   with symbols and SHIFT above SYM with functions; single-row mode fixes only SYM on either page.
   A page stays, for any number
   of keys, until SYM turns it; SYM's label takes the primary colour and the indicator while another
@@ -172,9 +170,7 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   all three pages again shared key widths and SYM bounds, with the one-column gap on the function page.
   A 600 dp-wide tall landscape display retained two rows after its side cutout reduced available
   width; before the symbol reorder, the narrow single-row symbols/function pages scrolled `%`/PGDN to SYM's left edge.
-  The replacement `!` key (above SYM in two-row mode and after `&` in single-row mode) and trailing
-  `;` still need device verification. The replacement `@` key in the former caret position also
-  needs device verification in both layouts.
+  The new `%` position after `&` and trailing `;` still need device verification.
   Hiding the IME retained the short-landscape mode.
   Physical touch, TalkBack and rotation during a held repeat remain
   unverified on real devices.
