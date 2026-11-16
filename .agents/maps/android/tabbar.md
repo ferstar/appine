@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: native tooltips for fixed buttons and numbered-tab titles)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: shared terminal control colours with stronger state contrast)
 
 ## Responsibilities
 
@@ -69,14 +69,17 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   and an end padding as wide as the buttons lets the last tab scroll out from under them; while more
   tabs lie beyond, the row fades out over 32 dp ending 12 dp inside `×`, in the blank before its
   glyph (the scroll view's right fading edge; the left edge does not fade).
-- A tab shows its number (from 1, by position): the current one in the primary colour above the
+- Ui.kt's `terminalControlColor` supplies ordinary labels (on-surface-variant blended with 40%
+  black) and selected labels/indicators (primary blended with 25% white). The bar, open-list
+  button and list rows use the same palette as the extra keys; progress/status colours are unchanged.
+- A tab shows its number (from 1, by position): the current one in the selected colour above the
   indicator, the others muted, an ended one faded (38% opacity, its indicator too). The current
   tab is scrolled into view after each change, clear of the fade, or to the row's end when less
   than a fade's width of tabs would be left beyond the padding; scrolled away from it, the row
   brings it back the same way 3 s after coming to rest: a finger on the row holds that off, and
   each later move without one (a fling, TalkBack's scrolling) starts the wait again. With gesture
   navigation, the bar but for its buttons is excluded from the system's back gesture.
-- The indicator is a rounded bar 16 dp wide and 1 dp high in the primary colour, centred under the
+- The indicator is a rounded bar 16 dp wide and 1 dp high in the selected colour, centred under the
   label with its top 4 dp below the baseline, in whole pixels rounded down; the row draws it over
   its tabs. Labels are sized in dp (numbers and buttons 14, in the default weight) so the system
   font scale leaves them as they are (dialogs, menus and toasts follow it).
@@ -125,13 +128,13 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 - The tab list overlays the notification banner, terminal and extra keys in the same activity
   window, without regridding it, on black with no gap, margins, border, rounded corners or elevation.
   Rows are 32 dp, labels 14 dp for the
-  number, title and close button; the current row uses primary text and ended titles
+  number, title and close button; the current row uses selected text and ended titles
   are faded and marked. At most ten rows fit, further limited by the content height below the top bar
   (including the notification banner when visible); the list scrolls and opens with the current
   tab visible. Its themed vertical scrollbar appears
   while scrolling and fades afterward; no thumb is drawn when all rows fit. Titles use the bar’s `sh` fallback.
   Every running row, including the current tab, draws the shared progress bar and status dot
-  around its number. Primary text alone marks selection in the list; ended rows show no marks.
+  around its number. Selected text colour alone marks selection in the list; ended rows show no marks.
   `MainActivity.onTabStatus` refreshes the open list's report snapshots and accessible descriptions
   alongside the bar and progress line, without resetting scroll. Only rows drawing a sweep request
   another frame; closing the list detaches and clears its rows.
@@ -233,6 +236,9 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   looks like the current tab's indicator, told apart only by the numbers' colours.
 
 ## To verify
+
+- The shared control palette passes debug assembly and lint; device checks remain for tab/list
+  selection, ended-tab fading and wallpaper palettes. Progress/status colours and animations are unchanged.
 
 - Fixed-button and numbered-tab tooltips pass debug assembly and lint. Device checks remain for
   long-title wrapping and edge placement, long-press release without switching tabs or clicking,

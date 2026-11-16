@@ -92,10 +92,10 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     // as the extra keys'
 
     /** The buttons and the other tabs' numbers. */
-    private val mutedColor = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
+    private val mutedColor = terminalControlColor(selected = false)
 
     /** The current tab's number and indicator. */
-    private val currentColor = themeColor(androidx.appcompat.R.attr.colorPrimary)
+    private val currentColor = terminalControlColor(selected = true)
     private val indicatorPaint = ExtraKeysView.indicatorPaint(currentColor)
 
     private val marks = TabMarks(context)

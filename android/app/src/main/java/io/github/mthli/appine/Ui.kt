@@ -13,6 +13,7 @@ import android.text.style.TypefaceSpan
 import android.view.View
 import androidx.annotation.StringRes
 import androidx.appcompat.app.AlertDialog
+import androidx.core.graphics.ColorUtils
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlin.math.max
@@ -40,6 +41,13 @@ internal fun View.line(): Int = context.line()
 internal fun Context.themeColor(attr: Int): Int = MaterialColors.getColor(this, attr, Color.WHITE)
 
 internal fun View.themeColor(attr: Int): Int = context.themeColor(attr)
+
+/** Separate control states on black; the dark theme's primary and muted labels share a tone. */
+internal fun View.terminalControlColor(selected: Boolean): Int = if (selected) {
+    ColorUtils.blendARGB(themeColor(androidx.appcompat.R.attr.colorPrimary), Color.WHITE, 0.25f)
+} else {
+    ColorUtils.blendARGB(themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant), Color.BLACK, 0.4f)
+}
 
 /** The theme's drawable [attr], null when the theme has none. */
 internal fun Context.themeDrawable(attr: Int): Drawable? {

@@ -200,8 +200,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
     // On black like the terminal and the tab bar; the theme's colours, as the tab bar's, for the
     // labels, a key that is on and its indicator, and a key while pressed
-    private val labelColor = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
-    private val onColor = themeColor(androidx.appcompat.R.attr.colorPrimary)
+    private val labelColor = terminalControlColor(selected = false)
+    private val onColor = terminalControlColor(selected = true)
     private val indicatorPaint = indicatorPaint(onColor)
     private val pressedColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainerHighest)
 

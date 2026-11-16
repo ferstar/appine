@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: battery exemption banner, dismissal and system settings navigation)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: stronger contrast between selected and ordinary terminal controls)
 
 ## Responsibilities
 
@@ -60,6 +60,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   the indicators and the progress line are: 1 dp, at least a pixel), `dp`, `themeColor`
   (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
   `selectableItemBackground`); `showPrivate` registers dialog security with android/privacy before showing it.
+  `terminalControlColor` separates states on black: ordinary labels blend on-surface-variant
+  with 40% black, selected labels and indicators blend primary with 25% white. Tab controls
+  and extra keys share it; progress/status marks keep their own theme colours.
   `monospaceMessage` substitutes a styled value into a localized `^1` template with TextUtils,
   leaving the explanation in the dialog's normal font.
 
@@ -144,8 +147,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   `PopupMenu` placed like a
   toolbar's overflow menu) are Material 3 in the theme's dark colours, from the wallpaper on
   Android 12 and later (`DynamicColors`). The tab bar, the extra keys and what lies under the
-  system bars are black like the terminal; their labels, buttons and the status text take the
-  muted on-surface-variant colour, and the current tab's number and indicator the primary one.
+  system bars are black like the terminal; tab/list controls and extra keys use
+  `terminalControlColor` for stronger state contrast while preserving wallpaper hues.
+  Status text, permission banners and search controls retain their original theme colours.
 - "Keep screen on" is available even without a current tab and applies to the whole terminal
   window. Its right-side checkbox reflects the activity's choice, persisted as `keep_screen_on`
   in the activity's private preferences, so recreating or reopening the activity keeps it.
@@ -383,6 +387,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- Control contrast passes debug assembly and lint. Device checks remain for wallpaper palettes,
+  small-label readability and selected/ordinary/locked states; indicator geometry is unchanged.
 
 - System per-app language selection: verify all five languages and returning to the system
   default on Android 13+, including retaining the current terminal tab across recreation.

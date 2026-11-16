@@ -39,8 +39,8 @@ internal class TabListView(context: Context, private val target: Target) : Frame
         val status: VtSession.Status?,
     )
 
-    private val muted = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
-    private val primary = themeColor(androidx.appcompat.R.attr.colorPrimary)
+    private val muted = terminalControlColor(selected = false)
+    private val primary = terminalControlColor(selected = true)
     private val marks = TabMarks(context)
     private val rows = Rows()
     private val manager = LinearLayoutManager(context)

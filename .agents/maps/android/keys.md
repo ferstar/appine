@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/keys.md` for the paired decision history (not yet created; pre-split decisions D4, D12, D14, D15 and D19–D23 stay in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: shared terminal control colours with stronger state contrast)
 
 ## Responsibilities
 
@@ -79,8 +81,10 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   not again on release; other keys still act once on release. No key has a swipe or popup. Keys
   with a long press also answer an accessibility service's long click (the touch never reaches
   the view's own long-press detection).
-- CTRL, ALT and SHIFT: a tap turns them on for the next key (primary colour only) or off, a locked
-  one too; a long press locks them on (primary colour and the
+- Labels use Ui.kt's `terminalControlColor`: ordinary labels blend on-surface-variant with 40%
+  black, while active labels and indicators blend primary with 25% white, retaining wallpaper hues.
+- CTRL, ALT and SHIFT: a tap turns them on for the next key (active colour only) or off, a locked
+  one too; a long press locks them on (active colour and the
   indicator) until tapped, one a tap turned on included, with a toast naming the key ("CTRL
   locked"), or turns a locked one off. Keys go to `VtView.press` and `type`, which read the
   modifiers through the host and report when a key took them; that clears one-shot modifiers and
@@ -89,7 +93,7 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   shows the function keys, and from them the first page again. Two-row mode keeps `%` above SYM
   with symbols and SHIFT above SYM with functions; single-row mode fixes only SYM on either page.
   A page stays, for any number
-  of keys, until SYM turns it; SYM's label takes the primary colour and the indicator while another
+  of keys, until SYM turns it; SYM's label takes the active colour and the indicator while another
   page than the first is shown. The function keys and PGUP/PGDN go to `VtView.press` as their key
   codes, so the modifiers apply as on a keyboard (SHIFT, F5 sends `CSI 15;2~`). Turning the page
   leaves the modifiers as they are: CTRL and ALT apply to symbols and function keys too (CTRL,
@@ -153,6 +157,9 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
 - Search focus still sends extra keys to the terminal; the policy question is in `android/terminal`.
 
 ## To verify
+
+- The shared control palette passes debug assembly and lint; device checks remain for one-shot,
+  locked and SYM states across wallpaper palettes. State transitions and indicator geometry are unchanged.
 
 - Single-row extra keys passed debug assembly/lint and API 34 checks at 360 × 640 dp: three pages,
   scrolling to PGDN, input with Shift+F5 and locked Ctrl+], and page/modifier retention through
