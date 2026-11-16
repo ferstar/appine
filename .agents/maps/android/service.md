@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: separate the ongoing notification's state title from its running-policy body)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: show startup error details in the ongoing notification body while preserving privacy redaction)
 
 ## Responsibilities
 
@@ -141,7 +141,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   notification, `onMachineReady(null)`.
 - On failure: a failed import of a downloaded distro (not Alpine, store not ready) falls back to
   Alpine with a notice; with a `pendingReplace` the store is replaced; any other failure sets
-  `startError`, updates the wake lock and notification ("Cannot start: …"), reports it to the
+  `startError`, updates the wake lock and notification ("Cannot start" with the error in its body,
+  unless privacy mode hides it), reports it to the
   listeners, and stops the service as soon as no UI is left and no distro switch is downloading
   (there is no kernel, so no poll would end it; opening the app tries again).
 - Which start: when no store is ready (`startOrImport`, at creation and when an exit finishes with
@@ -214,14 +215,15 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   Release/reacquisition happens on a completed poll; polling cannot wake a suspended device.
   CPU inactivity can include network waits and scheduled work, which need ALWAYS for continuity.
 - The ongoing notification (id 1) title shows, by precedence: "Stopping services…" while exiting; the
-  import or download progress while no kernel runs; "Cannot start: …" after a failed start;
+  import or download progress while no kernel runs; "Cannot start" after a failed start;
   "Running in the background" while a kernel runs and no tab does; else the count of running
   sessions ("0 sessions running" while a start is under way, except that a start after an exit,
   because a listener came back, keeps "Stopping services…" until it ends under SLEEP,
   as nothing refreshes the notification). A switch adds its progress, subtext
-  and a cancel action. The body shows the selected policy without the instantaneous wake-lock state;
-  expanded body text wraps. Privacy mode uses "Privacy mode" as the title, hiding the state
-  while keeping the selected policy in the body.
+  and a cancel action. The body shows the error reason when the title is "Cannot start", otherwise
+  the selected policy without the instantaneous wake-lock state; expanded body text wraps.
+  Privacy mode uses "Privacy mode" as the title and the selected policy in the body, hiding
+  both the state and error details, including in the expanded body.
   The single toggle names its target: ALWAYS from either non-always policy,
   otherwise the saved `idle_policy` (SLEEP until chosen). Settings and notification stay in sync.
   The toggle is hidden while exiting, and "Exit all" is always there.
@@ -481,8 +483,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 
 ## To verify
 
-- The ongoing notification's state title and running-policy body have not been checked on a device,
-  including long startup errors and privacy mode.
+- The ongoing notification's state title, error or running-policy body and expanded text have not
+  been checked on a device, including long startup errors and privacy mode.
 - Foreground program-notification haptics and background notification vibration on physical
   devices, including touch feedback disabled, channel vibration disabled and Do Not Disturb.
 - Diagnostic retention, app-only capture, archive contents and provider confinement passed API 34

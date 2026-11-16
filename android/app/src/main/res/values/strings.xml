@@ -16,6 +16,7 @@
     <string name="downloading">Downloading %1$s… %2$d / %3$d MB</string>
     <string name="restarting">Restarting…</string>
     <string name="stopping">Stopping services…</string>
+    <string name="start_failed_title">Cannot start</string>
     <string name="start_failed">Cannot start: %1$s</string>
 
     <!-- Tabs and terminal controls -->
@@ -78,7 +79,7 @@
     <string name="open_link">Open link</string>
     <string name="link_no_app">No app can open this link</string>
     <string name="link_remote_file">This file is on %1$s, not in Appine</string>
-    <string name="link_hidden_file">File access is disabled. Enable in Settings: “Allow other apps to access files”</string>
+    <string name="link_hidden_file">File access is disabled. Enable in Settings: \"Allow other apps to access files\"</string>
     <string name="link_missing_file">Cannot find this file</string>
 
     <!-- File import -->
@@ -248,7 +249,6 @@
         <item quantity="other">%d sessions running</item>
     </plurals>
     <string name="background_running">Running in the background</string>
-    <string name="run_notification">%1$s · %2$s</string>
     <string name="exit_all">Exit all</string>
 
     <string name="channel_terminal">Bells, notifications from programs and finished commands</string>
@@ -278,14 +278,14 @@
     <string name="anr_text">The previous session ended at %1$s because Appine stopped responding. This is a bug in Appine; copy the report to include it in your feedback.</string>
 
     <string name="killed_title">%1$s was killed</string>
-    <string name="killed_oom_app">%1$s (pid %2$d) was killed: the app’s memory reached its limit (%3$s of %4$s), and the out-of-memory killer chose it.</string>
+    <string name="killed_oom_app">%1$s (pid %2$d) was killed: the app\'s memory reached its limit (%3$s of %4$s), and the out-of-memory killer chose it.</string>
     <string name="killed_oom_cgroup">%1$s (pid %2$d) was killed: cgroup %3$s reached its memory.max (%4$s of %5$s).</string>
     <string name="killed_bug">%1$s (pid %2$d) was ended by an internal error in Appine. This is a bug in Appine; copy the report from the notification, or see it with dmesg.</string>
 
-    <string name="stall_title">Appine’s kernel is stuck</string>
-    <string name="stall_text">One operation in Appine’s kernel has been running for %1$d s, and every program waits for it to finish. This is a bug in Appine; copy the report to include it in your feedback.</string>
-    <string name="stall_ended_title">Appine’s kernel was stuck</string>
-    <string name="stall_ended_text">One operation in Appine’s kernel ran for %1$d s, and every program waited for it to finish. This is a bug in Appine; copy the report to include it in your feedback.</string>
+    <string name="stall_title">Appine\'s kernel is stuck</string>
+    <string name="stall_text">One operation in Appine\'s kernel has been running for %1$d s, and every program waits for it to finish. This is a bug in Appine; copy the report to include it in your feedback.</string>
+    <string name="stall_ended_title">Appine\'s kernel was stuck</string>
+    <string name="stall_ended_text">One operation in Appine\'s kernel ran for %1$d s, and every program waited for it to finish. This is a bug in Appine; copy the report to include it in your feedback.</string>
 
     <plurals name="boot_failed_title">
         <item quantity="one">%d service did not start</item>

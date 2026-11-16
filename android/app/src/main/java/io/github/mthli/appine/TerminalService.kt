@@ -458,16 +458,16 @@ class TerminalService : Service() {
         // Tabs whose shell has ended stay open but are not running
         val n = sessions.count { it.isRunning }
         val sw = switching
-        val error = startError
+        val error = startError.takeIf { !exiting && machine == 0L && progress == null }
         val state = when {
             exiting -> getString(R.string.stopping)
             machine == 0L && progress != null -> progress
-            machine == 0L && error != null -> getString(R.string.start_failed, error)
+            error != null -> getString(R.string.start_failed_title)
             n == 0 && machine != 0L -> getString(R.string.background_running)
             else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
         }
         val privacyEnabled = Settings.privacyMode(this)
-        val text = getString(runPolicy.label)
+        val text = if (!privacyEnabled && error != null) error else getString(runPolicy.label)
         val builder = Notification.Builder(this, Notifications.SESSIONS_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(if (privacyEnabled) getString(R.string.settings_privacy) else state)

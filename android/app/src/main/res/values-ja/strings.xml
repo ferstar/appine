@@ -15,6 +15,7 @@
     <string name="downloading">%1$sをダウンロード中… %2$d / %3$d MB</string>
     <string name="restarting">再起動中…</string>
     <string name="stopping">サービスを停止中…</string>
+    <string name="start_failed_title">起動できません</string>
     <string name="start_failed">起動できません：%1$s</string>
 
     <!-- Tabs and terminal controls -->
@@ -243,7 +244,6 @@
         <item quantity="other">%d個のセッションが実行中</item>
     </plurals>
     <string name="background_running">バックグラウンドで実行中</string>
-    <string name="run_notification">%1$s · %2$s</string>
     <string name="exit_all">すべて終了</string>
 
     <string name="channel_terminal">ベル、プログラムからの通知、コマンドの完了</string>

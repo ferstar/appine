@@ -342,7 +342,7 @@ internal class Notifications(private val service: TerminalService) {
      */
     private fun builder(channel: String, title: String, text: String, intent: PendingIntent = openApp()): Notification.Builder {
         val privacyEnabled = Settings.privacyMode(service)
-        val shownTitle = if (privacyEnabled) service.getString(R.string.app_name) else title
+        val shownTitle = if (privacyEnabled) service.getString(R.string.settings_privacy) else title
         val shownText = if (privacyEnabled) service.getString(R.string.privacy_notification) else text
         return Notification.Builder(service, channel)
             .setSmallIcon(R.drawable.ic_notification)

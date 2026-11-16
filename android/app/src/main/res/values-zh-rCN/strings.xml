@@ -15,6 +15,7 @@
     <string name="downloading">正在下载 %1$s：%2$d / %3$d MB</string>
     <string name="restarting">正在重启…</string>
     <string name="stopping">正在停止服务…</string>
+    <string name="start_failed_title">无法启动</string>
     <string name="start_failed">无法启动：%1$s</string>
 
     <!-- Tabs and terminal controls -->
@@ -243,7 +244,6 @@
         <item quantity="other">%d 个会话运行中</item>
     </plurals>
     <string name="background_running">在后台运行</string>
-    <string name="run_notification">%1$s · %2$s</string>
     <string name="exit_all">全部退出</string>
 
     <string name="channel_terminal">响铃、程序的通知和命令结束</string>
