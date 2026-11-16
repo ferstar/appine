@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: replace the percent key with an exclamation mark on the symbols page)
+> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: replace the caret key with an at sign on the symbols page)
 
 ## Responsibilities
 
@@ -19,7 +19,7 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
 - `ExtraKeysView` — adaptive extra keys, normally Termux's default keys widened to two rows of
   eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
-  SYM (`` ` ``, `$`, `*`, `=`, `^`, `\`, `&`, `!`; `[`, `]`, `{`, `}`, `<`, `>`, `;`: shell
+  SYM (`` ` ``, `$`, `*`, `=`, `@`, `\`, `&`, `!`; `[`, `]`, `{`, `}`, `<`, `>`, `;`: shell
   symbols absent from the first page, with bracket pairs together and `&` above `;` in the
   last scrolling column) and a third of function keys for every key but SHIFT and SYM (F1–F6,
   PGUP; F7–F12, PGDN): a `Page` keeps its original rows, `singleRowKeys` order, grid and
@@ -173,7 +173,8 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   A 600 dp-wide tall landscape display retained two rows after its side cutout reduced available
   width; before the symbol reorder, the narrow single-row symbols/function pages scrolled `%`/PGDN to SYM's left edge.
   The replacement `!` key (above SYM in two-row mode and after `&` in single-row mode) and trailing
-  `;` still need device verification.
+  `;` still need device verification. The replacement `@` key in the former caret position also
+  needs device verification in both layouts.
   Hiding the IME retained the short-landscape mode.
   Physical touch, TalkBack and rotation during a held repeat remain
   unverified on real devices.
