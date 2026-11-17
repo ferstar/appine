@@ -206,13 +206,8 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             startActivity(Intent(requireContext(), LicensesActivity::class.java))
         }
         licenses.setSummary(R.string.licenses_summary)
-        val project = action(R.string.settings_project) {
-            try {
-                CustomTabsIntent.Builder().build().launchUrl(requireContext(), PROJECT_URL.toUri())
-            } catch (e: ActivityNotFoundException) {
-                Toast.makeText(requireContext(), R.string.link_no_app, Toast.LENGTH_SHORT).show()
-            }
-        }.apply { summary = PROJECT_URL }
+        val telegram = link(R.string.settings_telegram, TELEGRAM_URL)
+        val project = link(R.string.settings_project, PROJECT_URL)
         val version = action(R.string.settings_version) { onVersion() }.apply {
             summary = BuildConfig.VERSION_NAME
         }
@@ -221,7 +216,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         group(R.string.settings_group_android, notifications, batteryUsage, runPolicy, privacy, fileAccess)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, tabList, volumeKeys)
         group(R.string.settings_group_debug, tier, export)
-        group(R.string.settings_group_about, project, licenses, version)
+        group(R.string.settings_group_about, telegram, project, licenses, version)
         render()
     }
 
@@ -388,6 +383,14 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
                 true
             }
         }
+
+    private fun link(title: Int, url: String): Preference = action(title) {
+        try {
+            CustomTabsIntent.Builder().build().launchUrl(requireContext(), url.toUri())
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(requireContext(), R.string.link_no_app, Toast.LENGTH_SHORT).show()
+        }
+    }.apply { summary = url }
 
     private fun toggle(title: Int, change: (TerminalService, Boolean) -> Unit): SwitchPreferenceCompat =
         SwitchPreferenceCompat(requireContext()).configure(title).apply {
@@ -672,6 +675,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     }
 
     companion object {
+        private const val TELEGRAM_URL = "https://t.me/appinesh"
         private const val PROJECT_URL = "https://github.com/mthli/appine"
         private const val CHOICE_DIALOG = "settings.choice"
 

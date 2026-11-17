@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: conditional battery usage action in Android settings)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: Telegram link in Settings About)
 
 ## Responsibilities
 
@@ -61,7 +61,7 @@ session consuming their state and events (`android/vt`).
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
   reset), Android (conditional notification and battery usage actions, running policy, privacy mode, file access), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, tab-list button visibility, the volume keys switching tabs), Debugging (execution
-  mode and diagnostic export, in all builds) and About (project website, licenses, version).
+  mode and diagnostic export, in all builds) and About (Telegram, project website, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
   without a console with `--refresh-rules`.
 - `profile.sh` — copied verbatim, comments included, into the guest as
@@ -389,8 +389,10 @@ session consuming their state and events (`android/vt`).
     button (all three on by default): usable at any time; the service gives every tab the new cursor values at once
     (android/service), and the terminal reads the CJK, volume-key and tab-list visibility values itself
     (android/terminal).
-- About's project website shows `https://github.com/mthli/appine` as its summary and opens it
-  with AndroidX `CustomTabsIntent`, without pinning a browser package. A browser without Custom
+- About starts with Telegram (`https://t.me/appinesh`), followed by the project website
+  (`https://github.com/mthli/appine`). Both use the shared `link` preference helper, show their URL
+  as the summary and open it with AndroidX `CustomTabsIntent`, without pinning a browser package.
+  Telegram uses a non-translatable brand label in every locale. A browser without Custom
   Tabs can handle the same VIEW intent; no handler produces the shared `link_no_app` toast.
   The licenses summary names GNU AGPL 3.0 or later; the full copyright, warranty disclaimer and
   license text remain in the Appine notice on the license page.
@@ -399,7 +401,7 @@ session consuming their state and events (`android/vt`).
   without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
   The link can be built before publication, but the store listing is unavailable until published.
 - Service-dependent preferences are disabled before binding, on disconnect and on stopping;
-  notification authorization, battery usage, diagnostic export, project website, licenses and version remain usable. All preferences have stable resource-name keys and persistence
+  notification authorization, battery usage, diagnostic export, Telegram, project website, licenses and version remain usable. All preferences have stable resource-name keys and persistence
   disabled: they render service values and their change listeners call service setters, never
   writing a second preference store (privacy, notification authorization and battery usage use shared controllers). AndroidX manages row binding, disabled states and
   accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
@@ -434,7 +436,7 @@ session consuming their state and events (`android/vt`).
   proxy); `BuildConfig` (Alpine branch, app version and application ID); the assets; `TerminalService` and its
   `Listener` (Settings); `LicensesActivity` (android/licenses); android/privacy's mode changes,
   export authorization and dialog protection; Material Components and AndroidX (Settings),
-  including AndroidX Browser for the project website; android/terminal's NotificationPermission
+  including AndroidX Browser for Telegram and the project website; android/terminal's NotificationPermission
   for shared authorization history and settings navigation, and BatteryOptimization for exemption status and app details.
 
 ## Invariants and gotchas
@@ -545,7 +547,7 @@ session consuming their state and events (`android/vt`).
   Back/outside dismissal, recreation, enabling and immediate disabling; build and lint passed.
 - About's version row and Play Store navigation on a device, including web fallback, missing
   handlers and returning to Settings; `assembleDebug` and `lintDebug` passed.
-- About's project link and return to Settings on a device, including Custom Tabs, a browser
+- About's Telegram and project links and return to Settings on a device, including Custom Tabs, a browser
   without Custom Tabs and no URL handler; this change was checked by build and lint only.
 - That Alpine's doas reads `/etc/doas.d/*.conf` in lexical order (the NOPASSWD file relies on coming
   after `20-wheel.conf`), and that doas reads only `*.conf` and sudo skips names with a dot (the

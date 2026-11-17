@@ -225,6 +225,7 @@
 
     <!-- Settings: about and licenses -->
     <string name="settings_group_about">About</string>
+    <string name="settings_telegram" translatable="false">Telegram</string>
     <string name="settings_project">Project website</string>
     <string name="settings_version">Version</string>
 
