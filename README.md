@@ -1,32 +1,83 @@
-# Appine
+# <img src="website/dist/favicon.svg" width="36" height="36" align="absmiddle" alt=""> Appine
 
-Run Alpine Linux as Android App 🤖
+Appine is a high-performance Linux terminal for Android. Install packages, edit
+code and build projects on your phone or tablet without rooting it. Alpine Linux
+comes bundled with the app. Debian is available from **Settings**.
 
-**UNDER DEVELOPMENT.**
+**[Get Appine on Google Play](https://play.google.com/store/apps/details?id=io.github.mthli.appine)** · **[Download the APK from GitHub Releases](https://github.com/mthli/appine/releases)**
+
+Requires Android 11 or later on a 64-bit ARM device.
+
+With Appine, you can:
+
+- Use **Codex CLI** to work on a local project from your Android terminal.
+- Open source files and configuration in **Vim**.
+- Run Python scripts, compile C and C++, or develop with Java, Node.js, Go and Rust.
+- Run **Docker** containers on your device, for example an Nginx web server.
+- View images in terminal programs that use the **Kitty graphics protocol**.
+- And more...
+
+## Try Codex CLI
+
+**Alpine Linux** (default)
+
+```sh
+apk update
+apk add nodejs npm
+npm install -g @openai/codex
+```
+
+**Debian**
+
+```sh
+apt update
+apt install nodejs npm
+npm install -g @openai/codex
+```
+
+## How it works
+
+Appine runs unmodified ARM64 Linux binaries inside the Android app process.
+Its CPU engine translates ARM64 instructions into ARM64 code and uses an
+interpreter for instructions it does not translate. A user-space kernel handles
+Linux system calls, and the Android terminal uses Ghostty's libghostty-vt.
+The Linux command-line runner uses the same engine and kernel.
 
 ## Development
 
-Coding agents should start with [AGENTS.md](AGENTS.md). Shared module knowledge lives in
-[.agents](.agents).
+### Build the Android app
 
-The architecture and the milestone plan are described in [docs/design](docs/design/README.md);
-how each subsystem works today is described in its map under [.agents/maps](.agents/maps)
-(modules are listed in [.agents/MODULES.md](.agents/MODULES.md)), and its design rationale in
-[.agents/decisions](.agents/decisions). Historical rounds through round 208 are preserved in
-[docs/rounds](docs/rounds), indexed in [docs/milestones.md](docs/milestones.md); later changes
-are recorded in commits and module maps.
-
-The primary development host is Linux arm64. On macOS, `scripts/dev` runs a command in an
-arm64 Linux container (colima, OrbStack or Docker Desktop):
+Install JDK 17 or later, Android SDK Platform 37, NDK 29.0.14206865, Rust
+with rustup, and Zig 0.17.0. From the repository root, fetch the build inputs
+and install a debug build on a connected ARM64 device or emulator.
 
 ```sh
-scripts/dev cargo test --workspace     # unit tests, guest programs and instruction lockstep
-scripts/dev cargo run --release -p appine-lockstep -- --iterations 1000000
-
-# performance probe: native vs. interpreter (tier 0) vs. binary translator (tier 1)
-scripts/dev sh -c 'cargo build --release -p appine-run -p appine-bench &&
-                   target/linux-arm64/release/appine-bench'
+rustup target add aarch64-linux-android
+cargo install cargo-ndk --locked
+scripts/fetch-rootfs
+scripts/fetch-ghostty
+cd android
+./gradlew installDebug
 ```
+
+Run `./gradlew connectedDebugAndroidTest` from the same directory for the
+instrumentation tests. See the [Android build guide](android/README.md#building)
+for Android Studio setup, release builds and device tests.
+
+### Develop and test the runtime
+
+The primary development host is ARM64 Linux. On macOS, start a Docker-compatible
+runtime such as Colima, OrbStack or Docker Desktop. From the repository root,
+`scripts/dev` runs each command in the project's ARM64 Linux container.
+
+```sh
+scripts/fetch-rootfs
+scripts/dev cargo test --workspace
+```
+
+The workspace tests cover the kernel, guest programs and CPU instruction execution.
+
+#### Run a guest program or an Alpine shell
 
 To run a hand-written guest program:
 
@@ -42,7 +93,7 @@ To run busybox from the Alpine minirootfs (the rootfs tests in `cargo test` need
 tarball too, and are skipped without it):
 
 ```sh
-scripts/fetch-rootfs                   # downloads and verifies target/rootfs/alpine-minirootfs-*.tar.gz
+scripts/fetch-rootfs # downloads and verifies target/rootfs/alpine-minirootfs-*.tar.gz
 scripts/dev sh -c 'cargo build -q -p appine-run && run=target/linux-arm64/debug/appine-run &&
                    $run --rootfs target/store --import target/rootfs/alpine-minirootfs-*.tar.gz &&
                    $run --rootfs target/store /bin/busybox ls -l / &&
@@ -70,16 +121,48 @@ scripts/dev sh -c 'target/linux-arm64/debug/appine-run --rootfs target/store \
 
 The tests that need the internet run only with `APPINE_NETWORK_TESTS=1`.
 
-### LTP
+#### Run Linux Test Project syscall tests
 
 The syscall tests of the [Linux Test Project](https://github.com/linux-test-project/ltp)
 are built natively in an `alpine` arm64 container and run inside Appine, one fresh
 `appine-run` per test:
 
 ```sh
-scripts/build-ltp                      # builds target/ltp/ltp-<version>.tar (needs Docker)
-scripts/dev scripts/ltp -j 8           # all syscall tests; results in target/ltp/results.txt
-scripts/dev scripts/ltp 'fcntl.*|mmap.*'   # only the tests whose name matches
+scripts/dev cargo build --release -p appine-run
+scripts/build-ltp                        # builds target/ltp/ltp-<version>.tar (needs Docker)
+scripts/dev scripts/ltp -j 8             # all syscall tests; results in target/ltp/results.txt
+scripts/dev scripts/ltp 'fcntl.*|mmap.*' # only the tests whose name matches
+```
+
+#### Compare Appine with native Linux
+
+`scripts/difftest` runs each script in `tests/diff` both in Appine and in a native arm64
+Docker container, and compares their output and exit status. The container runs without
+Docker's seccomp profile, which changes what some syscalls return (`clone3`, `pidfd_getfd`).
+Both sides run the same files: the first run creates a store in `target/difftest/store` (minirootfs plus python3,
+gcc, Lua, SQLite, Go, Node.js, OpenJDK 21, strace and gdb from `apk`, so it needs the internet), exports its
+root filesystem from Appine and imports it as a Docker image. A store made before a package was
+added lacks it: install the package into the store with `apk add`, or delete the store, and pass
+`-r` to export it again:
+
+```sh
+scripts/fetch-rootfs
+scripts/dev cargo build --release -p appine-run
+scripts/difftest              # all cases on tier 1
+scripts/difftest -t 0 signals # one case on the interpreter
+```
+
+Run it on the host, not in `scripts/dev`; on macOS it calls `scripts/dev` itself.
+
+#### Benchmark, trace and profile the runtime
+
+For a longer lockstep comparison, run `appine-lockstep`. To compare
+the interpreter and binary translator against native execution, run `appine-bench`.
+
+```sh
+scripts/dev cargo run --release -p appine-lockstep -- --iterations 1000000
+scripts/dev sh -c 'cargo build --release -p appine-run -p appine-bench &&
+                   target/linux-arm64/release/appine-bench'
 ```
 
 `APPINE_STRACE=1` makes `appine-run` print every syscall with its arguments and result,
@@ -100,58 +183,24 @@ only the guest process that hit it in release builds, with a report on stderr; a
 `--memory-limit` (default: half the RAM), the guest process using the most memory is killed
 with SIGKILL, like the Linux OOM killer.
 
-### Differential tests
+## Project documentation
 
-`scripts/difftest` runs each script in `tests/diff` both in Appine and in a native arm64
-Docker container, and compares their output and exit status. The container runs without
-Docker's seccomp profile, which changes what some syscalls return (`clone3`, `pidfd_getfd`).
-Both sides run the same files: the first run creates a store in `target/difftest/store` (minirootfs plus python3,
-gcc, Lua, SQLite, Go, Node.js, OpenJDK 21, strace and gdb from `apk`, so it needs the internet), exports its
-root filesystem from Appine and imports it as a Docker image. A store made before a package was
-added lacks it: install the package into the store with `apk add`, or delete the store, and pass
-`-r` to export it again:
-
-```sh
-scripts/fetch-rootfs
-scripts/difftest                       # all cases on tier 1
-scripts/difftest -t 0 signals          # one case on the interpreter
-```
-
-Run it on the host, not in `scripts/dev`; on macOS it calls `scripts/dev` itself.
-
-## Android app
-
-The app in [android/](android) runs the same kernel inside an Android app: each tab is a
-login shell on an in-process terminal. It needs the Android SDK with NDK 29.0.14206865,
-`rustup target add aarch64-linux-android` and `cargo install cargo-ndk`:
-
-```sh
-scripts/fetch-rootfs
-cd android
-./gradlew installDebug                 # on a connected arm64 device or emulator (Android 11+)
-./gradlew connectedDebugAndroidTest    # instrumentation tests, on the same kind of device
-```
-
-The native library is always a release build. In the debug app it also has the test hooks
-(the `test-hooks` feature), which the instrumentation tests use to simulate kernel and engine
-bugs inside the app process; they do nothing unless `APPINE_TEST_HOOKS=1` is set.
+- [Architecture overview](docs/design/README.md#3-overall-architecture) and
+  [module index](.agents/MODULES.md) for navigating the source.
+- [Module maps](.agents/maps) for current behavior and tests, and
+  [design decisions](.agents/decisions) for the reasoning behind changes.
+- [Development milestones](docs/milestones.md) for earlier measurements and
+  implementation history. Coding agents should start with [AGENTS.md](AGENTS.md).
 
 ## License
 
-Appine is free software: you can redistribute it and/or modify it under the terms of the
-GNU Affero General Public License as published by the Free Software Foundation, either
-version 3 of the License, or (at your option) any later version. See [LICENSE](LICENSE).
+Copyright (C) 2026 Matthew Lee. Appine is licensed under the
+[GNU Affero General Public License, version 3 or later](LICENSE).
 
-```
-Copyright (C) 2026 Matthew Lee
-```
+Parts of the terminal line discipline in `core/kernel/src/tty.rs` are adapted
+from Fuchsia's Starnix and retain [The Fuchsia Authors' BSD-style license](android/licenses/fuchsia-LICENSE).
 
-Parts of the terminal line discipline in `core/kernel/src/tty.rs` are adapted from Fuchsia's
-Starnix; they keep The Fuchsia Authors' copyright notice and BSD-style license
-(`android/licenses/fuchsia-LICENSE`).
-
-The Android app also contains code under other licenses: Ghostty's libghostty-vt and the
-libraries it links (MIT, BSD 3-Clause, Unicode), the JetBrains Mono font (OFL 1.1), the Alpine
-Linux minirootfs (busybox, apk-tools and others under the GPL 2.0), AndroidX and Kotlin
-(Apache 2.0), and the Rust crates in `Cargo.lock` (MIT and other permissive licenses). The app lists them all under
-Settings → Open source licenses; see `android/README.md`.
+The app includes separate notices for libghostty-vt and its dependencies,
+JetBrains Mono, Alpine Linux packages, Android libraries and Rust crates.
+Read them in **Settings → Open source licenses** or browse the
+[bundled notices](android/app/src/main/assets/notices).
