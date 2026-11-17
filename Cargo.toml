@@ -27,3 +27,9 @@ flate2 = "1"
 libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 tar = "0.4"
+
+# Only the Android release APK pays the cost of linking across crates.
+[profile.android-release]
+inherits = "release"
+lto = true
+codegen-units = 1

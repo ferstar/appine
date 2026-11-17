@@ -87,7 +87,9 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // Installed locally only: signed with the debug key
             signingConfig = signingConfigs.getByName("debug")
         }
@@ -161,7 +163,11 @@ androidComponents {
             workspace.set(repoRoot)
             zig.set(zigExecutable)
             ndkDirectory.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.path })
-            features.set(if (variant.buildType == "debug") listOf("test-hooks", "borrow-check") else emptyList())
+            when (variant.buildType) {
+                "debug" -> cargoArgs.addAll("--profile", "release", "--features", "test-hooks,borrow-check")
+                "release" -> cargoArgs.addAll("--profile", "android-release")
+                else -> cargoArgs.addAll("--profile", "release")
+            }
             outputDir.set(layout.buildDirectory.dir("generated/rust/${variant.name}/jniLibs"))
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, CargoNdkTask::outputDir)
@@ -201,11 +207,8 @@ abstract class BrowserAssetTask : DefaultTask() {
 }
 
 /**
- * Builds libappine.so (hosts/android) with cargo-ndk. The Rust part is always a release build: the
- * interpreter of a debug build is too slow. The debug app turns on the `test-hooks` feature, so
- * instrumentation tests use the test hooks to simulate kernel-layer and engine bugs in the app
- * process (effective only when `APPINE_TEST_HOOKS=1` is set); it also turns on `borrow-check`,
- * which checks that no kernel object is borrowed when the BKL is released.
+ * Builds libappine.so with cargo-ndk. Both APKs need an optimized interpreter.
+ * The debug APK enables kernel test hooks and borrow checks for instrumentation.
  */
 abstract class CargoNdkTask : DefaultTask() {
     @get:Internal
@@ -218,7 +221,7 @@ abstract class CargoNdkTask : DefaultTask() {
     abstract val ndkDirectory: Property<String>
 
     @get:Input
-    abstract val features: ListProperty<String>
+    abstract val cargoArgs: ListProperty<String>
 
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
@@ -240,9 +243,9 @@ abstract class CargoNdkTask : DefaultTask() {
             args(
                 "ndk", "-t", "arm64-v8a", "--platform", "30",
                 "-o", outputDir.get().asFile.path,
-                "build", "--release", "-p", "appine-android",
+                "build", "-p", "appine-android",
             )
-            if (features.get().isNotEmpty()) args("--features", features.get().joinToString(","))
+            args(cargoArgs.get())
             // Set both: with only one set, when the other one in the environment points at another
             // NDK (GitHub's runners preset ANDROID_NDK_ROOT), cargo-ndk warns, and which one it
             // uses depends on its order of precedence.

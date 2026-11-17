@@ -41,10 +41,17 @@ zig.path=/opt/homebrew/bin/zig
 ```sh
 ./gradlew installDebug                 # build and install on a connected arm64 device
 ./gradlew connectedDebugAndroidTest    # instrumentation tests on a device or emulator
+./gradlew assembleRelease              # build app/build/outputs/apk/release/app-release.apk
 ```
 
-The native library is always built in release mode: the interpreter is too slow in a
-debug build. Only `arm64-v8a` is built. Run the instrumentation tests on both a 4K-page
+Both APKs build `libappine.so` for `arm64-v8a`. Debug uses Cargo's `release` profile to keep
+the interpreter fast. Release uses `android-release` for cross-crate LTO and a smaller library.
+
+The release APK uses R8 and resource shrinking and is signed with the local debug key.
+`app/proguard-rules.pro` preserves JNI methods and the `VtSession.on*` callbacks Rust looks up
+by name. Archive `app/build/outputs/mapping/release/mapping.txt` with its APK to decode stack traces.
+
+Run the instrumentation tests on both a 4K-page
 and a 16K-page system image. `downloadedDistributionsRun` downloads Debian
 (about 50 MB) and the browser bridge test installs tmux/screen in a separate temporary store. Both require
 `-Pandroid.testInstrumentationRunnerArguments.network=true`. An emulator started

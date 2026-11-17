@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: shared package-group lookup and self-contained CargoNdkTask)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: release shrinking, JNI keep rules and the Android release Cargo profile)
 
 ## Responsibilities
 
@@ -34,7 +34,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Public entry points
 
-- Build: `./gradlew assembleDebug lintDebug` (what CI runs), `connectedDebugAndroidTest` (with
+- Build: `./gradlew assembleDebug lintDebug` (what CI runs), `assembleRelease` (the optimized APK), `connectedDebugAndroidTest` (with
   `-Pandroid.testInstrumentationRunnerArguments.network=true` for the download of a distribution),
   `scripts/fetch-ghostty [dir]` (default `target/ghostty`), `scripts/release-sources [dir]` (default
   `target/release-sources`).
@@ -44,10 +44,11 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 ### Build
 
 - `CargoNdkTask` runs `cargo ndk -t arm64-v8a --platform 30 -o <build/generated/rust/<variant>/jniLibs>
-  build --release -p appine-android`, with `CARGO_TARGET_DIR=target/android` and both
+  build -p appine-android --profile <profile>`, with `CARGO_TARGET_DIR=target/android` and both
   `ANDROID_NDK_HOME` and `ANDROID_NDK_ROOT` set to AGP's NDK, using `~/.cargo/bin/cargo` when it is
   executable; it is never up to date. Debug variants add the `test-hooks` and `borrow-check`
-  features; the Rust side is always a release build.
+  features and use Cargo's `release` profile. The release APK selects the workspace's
+  `android-release` profile, which inherits `release` and enables cross-crate LTO.
 - Gradle resolves Zig from a nonblank, trimmed `zig.path` in `android/local.properties`, then the
   `ZIG` environment variable, then `zig` on `PATH`. `BrowserAssetTask` invokes that executable;
   `CargoNdkTask` passes the same value as `ZIG` to cargo and its build script. The local file is
@@ -96,7 +97,11 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   included) treats compiler warnings as errors, and lint treats its warnings as errors, except
   `GradleDependency`, `AndroidGradlePluginVersion`, `OldTargetApi`, `ExpiringTargetSdkVersion` and
   `OutdatedLibrary`, which follow data outside the repository and are informational.
-- Release: signed with the debug key, not minified, versionCode 1 and versionName 1.0.0.
+- Release: signed with the debug key, versionCode 1 and versionName 1.0.0. R8 uses the
+  optimized Android defaults and shrinks unused resources. `app/proguard-rules.pro` keeps app
+  JNI declarations and the public void `VtSession.on*` callbacks looked up by the native pump;
+  callbacks outside that pattern need a matching keep rule. The release mapping is under
+  `app/build/outputs/mapping/release/`.
 
 ### Notices
 
@@ -211,7 +216,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Confirmed bugs / technical debt
 
-- The release build is signed with the debug key and not minified; the Alpine tarball's checksum
+- The release build is signed with the debug key; the Alpine tarball's checksum
   is checked only in `scripts/fetch-rootfs`.
 - `scripts/fetch-ghostty` checks only the pinned sha256s; the release's minisign signatures are to
   be checked by hand once when upgrading, before pinning the new sha256s.
@@ -223,8 +228,3 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 ## Open questions
 
 - Is the release variant meant to ship as configured?
-
-## To verify
-
-- That NDK 29's default really gives 16 KB-aligned `LOAD` segments in `libappine.so`;
-  device-suite coverage is tracked in `android/tests`.
