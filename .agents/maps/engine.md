@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: scalar accesses, integer vector stubs, FPCR reads and invalidation buckets)
 
 ## Responsibilities
 
@@ -112,6 +112,9 @@ Tier 1, only CPUID advertised).
 - Data addresses have the top byte ignored (TBI); PC and branch targets are not untagged.
 - Memory accesses check every page touched before copying anything, so a fault has no side
   effects; SP-based accesses require 16-byte SP alignment; watchpoints are checked on every access.
+- Ordinary single-register integer loads and stores use fixed-width copies on same-page data TLB hits
+  when the thread has no watchpoints. Misses, cross-page accesses and watched threads use the
+  shared memory helpers.
 - System registers: NZCV, FPCR (writes masked to AHP, DN, FZ, RMode and, with FP16, FZ16), FPSR
   (cumulative flags only) and TPIDR_EL0 are read-write; TPIDRRO_EL0 reads 0; DCZID_EL0 reads 4
   (64-byte blocks); CTR_EL0 reads `0x8444c004` (DIC = IDC = 0, so guests must issue `ic ivau`);
@@ -131,9 +134,11 @@ Tier 1, only CPUID advertised).
 - The stub cache is one process-global 2 MB code region (W^X double mapping) with a 4096-slot
   table; it is flushed entirely when half full or out of space. Stubs run under a read lock
   (registered with the fault guard); generating a stub takes the write lock.
-- FP stubs save host d8–d15 and FPCR, load the guest FPCR, FPSR, NZCV and V0–V31, execute, write
-  V, FPSR and NZCV back, and restore the host FPCR. In Tier 0 the FPCR swap therefore happens per FP
-  instruction.
+- Vector ADD/SUB and the three-register bitwise instructions use caller-saved V0–V2 for their
+  operands. BSL, BIT and BIF also load the old destination. Each writes back the full destination
+  vector, including the cleared upper half for 64-bit forms.
+- The other SIMD/FP stubs save host d8–d15 and FPCR, load guest FPCR, FPSR, NZCV and V0–V31,
+  execute one instruction, write V, FPSR and NZCV back, and restore the host FPCR.
 - Tier 1's enter routine does the same for a whole run (saves host d8–d15 and FPCR, loads guest
   FPCR, FPSR, NZCV, V0–V31); its exit routine stores V0–V31, FPSR and NZCV and restores host state.
 - SIMD and FP loads and stores are implemented in C through the soft-MMU, checking every page first.
@@ -186,9 +191,9 @@ Tier 1, only CPUID advertised).
   - loads and stores get the inline TLB path (section 8); PRFM emits nothing;
   - `svc #0` exits to the kernel inline; other `svc` immediates, BRK, and PSTATE writes other than
     FlagM go to Tier 0;
-  - `mrs`/`msr tpidr_el0` use the CPU state, `mrs dczid_el0` becomes the constant 4; NZCV, CNTVCT,
-    CNTVCTSS and CNTFRQ accesses run natively (Tier 0 has already accepted them); every other system register (including FPCR and FPSR) goes
-    to Tier 0;
+  - `mrs fpcr` and `mrs`/`msr tpidr_el0` use the guest CPU state. `mrs dczid_el0` becomes the
+    constant 4. NZCV, CNTVCT, CNTVCTSS and CNTFRQ accesses run natively after the Tier 0 whitelist
+    check. FPCR writes, FPSR accesses and other system registers go to Tier 0;
   - HINT space, including PAC and BTI hints, emits nothing; authenticated branches go to Tier 0;
   - DC CVAC/CVAU/CIVAC/CVAP/CVADP and `ic ivau` only check read access; `ic ivau` records its page
     in `ivau_page` (a second, different page exits to Tier 0); `dc zva` zeroes via the translated
@@ -351,6 +356,8 @@ Tier 1, only CPUID advertised).
   Without a CPU every block in the range is retired and parked ones are killed. Ranges spanning more
   than 256 pages (or wrapping) scan every block; blocks of every group member are compared against
   the caller's memory (no tag filter).
+- A small-range invalidation unlinks dead block records from each page bucket it visits. Parked
+  blocks stay in the bucket for revival. Compaction reclaims dead records in the block log.
 - `ic ivau` in Tier 1 records the page (Tier 0 handles it if a different page is already
   recorded); after the next `dsb`/`isb` exit the dispatcher invalidates that page in place
   (without the kernel's log). An `ivau_page` left at another exit is collected by the kernel.

@@ -282,6 +282,16 @@ static inline uint32_t enc_lslv(unsigned rd, unsigned rn, unsigned rm)
 
 /* ---- SIMD&FP and system registers ---- */
 
+static inline uint32_t enc_ldr_q(unsigned rt, unsigned rn, size_t off)
+{
+    return 0x3dc00000u | (uint32_t)(off / 16) << 10 | rn << 5 | rt;
+}
+
+static inline uint32_t enc_str_q(unsigned rt, unsigned rn, size_t off)
+{
+    return 0x3d800000u | (uint32_t)(off / 16) << 10 | rn << 5 | rt;
+}
+
 /* LDP/STP Qt1, Qt2, [Xn, #off] (off a multiple of 16, range ±1008) */
 static inline uint32_t enc_ldp_q(unsigned rt, unsigned rt2, unsigned rn, int off)
 {

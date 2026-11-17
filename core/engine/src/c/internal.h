@@ -140,8 +140,9 @@ static inline uint64_t untag(uint64_t va)
     return va & UINT64_C(0x00ffffffffffffff);
 }
 
-
-static inline void *tlb_lookup(struct appine_cpu *cpu, uint64_t va, uint32_t access)
+/* Compute the candidate address alongside the tag check so the host can load tag and addend
+ * together. Only a hit makes *host usable. */
+static inline bool tlb_probe(const struct appine_cpu *cpu, uint64_t va, uint32_t access, void **host)
 {
     uint64_t vpn = va >> APPINE_PAGE_SHIFT;
     unsigned idx = (unsigned)(vpn & (APPINE_TLB_ENTRIES - 1));
@@ -156,8 +157,15 @@ static inline void *tlb_lookup(struct appine_cpu *cpu, uint64_t va, uint32_t acc
         tag = cpu->tlb[idx].tag_write;
         addend = cpu->tlb[idx].addend_write;
     }
-    if (LIKELY(tag == ~vpn))
-        return (void *)(uintptr_t)(va + addend);
+    *host = (void *)(uintptr_t)(va + addend);
+    return tag == ~vpn;
+}
+
+static inline void *tlb_lookup(struct appine_cpu *cpu, uint64_t va, uint32_t access)
+{
+    void *host;
+    if (LIKELY(tlb_probe(cpu, va, access, &host)))
+        return host;
     return appine_tlb_fill(cpu, va, access);
 }
 
@@ -285,8 +293,7 @@ bool appine_id_register(unsigned key, uint64_t *value);
 /*
  * A native stub executes one guest instruction on the host CPU (the engine map): general-register
  * fields are replaced with host temporaries, loaded from the cpu struct before execution and
- * written back after it. When fp is true it also loads and writes back V0–V31, FPCR, FPSR and
- * NZCV.
+ * written back after it. Vector operations specify the register and flag state they need.
  */
 struct native_operand {
     uint8_t pos;   /* start bit of the register field */
@@ -295,8 +302,15 @@ struct native_operand {
     uint8_t store; /* write back after execution */
 };
 
+enum native_vectors {
+    NATIVE_NO_VECTORS,
+    NATIVE_FULL_FP,
+    NATIVE_VN_VM,     /* Vd = op(Vn, Vm), no flag effects */
+    NATIVE_VD_VN_VM,  /* Vd = op(Vd, Vn, Vm), no flag effects */
+};
+
 struct native_desc {
-    uint8_t fp;
+    uint8_t vectors;  /* enum native_vectors */
     uint8_t addr_pos; /* start bit of the address register field, NATIVE_NO_ADDR if none */
     uint8_t n;
     struct native_operand gpr[3];

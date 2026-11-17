@@ -193,6 +193,26 @@ fn pooled_instances_keep_translations_of_the_same_program() {
 }
 
 #[test]
+fn fpcr_reads_use_the_guest_state_inside_translated_code() {
+    let mut g = Guest::new();
+    g.code(CODE, &[0xd53b_4410, 0xd53b_4415, 0xd53b_441f, SVC]); // mrs x16/x21/xzr, fpcr
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        // Signal and ptrace restores can supply bits the host FPCR does not retain.
+        let fpcr = 0x0040_8000;
+        let s = g.cpu.state_mut();
+        s.fpcr = fpcr;
+        s.x[16] = 0;
+        s.x[21] = 0;
+        g.run(&mut dbt);
+        assert_eq!((g.cpu.state().x[16], g.cpu.state().x[21]), (fpcr, fpcr));
+        assert_eq!(dbt.stats().exits_interp, 0);
+    }
+}
+
+#[test]
 fn both_register_sets_run_the_same_code() {
     if Dbt::new().is_none() {
         return;
@@ -364,6 +384,12 @@ fn invalidation_keeps_blocks_whose_code_did_not_change() {
     let after = dbt.stats();
     assert_eq!(after.invalidated - before.invalidated, 1);
     assert_eq!(after.blocks - before.blocks, 1);
+    // The retired record for `other` is between the new block and the live block at CODE.
+    g.code(CODE, &[movz_x0(10), SVC]);
+    dbt.invalidate(&g.cpu, CODE, PAGE_SIZE);
+    assert_eq!(g.run(&mut dbt), 10);
+    assert_eq!(g.run_at(&mut dbt, other), 9);
+    assert_eq!(dbt.stats().invalidated - after.invalidated, 1);
 }
 
 #[test]

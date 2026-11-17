@@ -151,6 +151,7 @@ _Static_assert((MAX_BLOCK_WORDS & BRANCH_MASK) == 0 && MAX_BLOCK_WORDS << REASON
                "the conditional branch's distance to the stub and LINK_SHARED must fit in a movz immediate");
 
 #define SYSREG_NZCV 0xda10
+#define SYSREG_FPCR 0xda20
 #define SYSREG_TPIDR_EL0 0xde82
 #define SYSREG_DCZID_EL0 0xd807
 #define SYSREG_CNTFRQ_EL0 0xdf00
@@ -2058,7 +2059,8 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     if ((insn & 0xffd00000) == 0xd5100000) { /* MRS/MSR */
         bool read = BIT(insn, 21);
         unsigned rt = insn & 31;
-        switch (FIELD(insn, 20, 5)) {
+        unsigned sysreg = FIELD(insn, 20, 5);
+        switch (sysreg) {
         case SYSREG_NZCV:
         /* Timers are read-only, and writes have already been rejected by tier0_defined; read
          * as is on the host */
@@ -2068,8 +2070,12 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
             struct operands o = {.n = 1, .pos = {0}, .sp = {false}, .writes_rd = read};
             return emit_operands(x, insn, &o) || fallback(x, pc);
         }
+        case SYSREG_FPCR:
         case SYSREG_TPIDR_EL0: {
-            size_t off = offsetof(struct appine_cpu, tpidr_el0);
+            bool fpcr = sysreg == SYSREG_FPCR;
+            if (fpcr && !read)
+                return fallback(x, pc);
+            size_t off = fpcr ? offsetof(struct appine_cpu, fpcr) : offsetof(struct appine_cpu, tpidr_el0);
             unsigned h = is_stolen(rt) ? T0 : rt;
             if (read) {
                 if (rt != 31) {
@@ -2844,9 +2850,16 @@ static void invalidate_locked(struct appine_dbt *d, const struct appine_mmu *mmu
         return;
     }
     for (uint64_t page = first; page <= last; page++) {
-        for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
-            struct block *b = &d->blocks[i - 1];
-            if (!b->code || b->pc >> APPINE_PAGE_SHIFT != page)
+        uint32_t *link = &d->page_head[page_bucket(page)];
+        while (*link) {
+            struct block *b = &d->blocks[*link - 1];
+            /* A JIT may rewrite one block thousands of times between compactions. */
+            if (!b->code) {
+                *link = b->next;
+                continue;
+            }
+            link = &b->next;
+            if (b->pc >> APPINE_PAGE_SHIFT != page)
                 continue;
             if (b->parked) {
                 if (!mmu)

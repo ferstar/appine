@@ -21,14 +21,14 @@
 
 static bool only_v(struct native_desc *d)
 {
-    *d = (struct native_desc){.fp = 1, .addr_pos = NATIVE_NO_ADDR};
+    *d = (struct native_desc){.vectors = NATIVE_FULL_FP, .addr_pos = NATIVE_NO_ADDR};
     return true;
 }
 
 /* With one general register operand: pos = 0 means Rd (written), pos = 5 means Rn (read) */
 static bool with_gpr(struct native_desc *d, unsigned pos)
 {
-    *d = (struct native_desc){.fp = 1, .addr_pos = NATIVE_NO_ADDR, .n = 1};
+    *d = (struct native_desc){.vectors = NATIVE_FULL_FP, .addr_pos = NATIVE_NO_ADDR, .n = 1};
     d->gpr[0] = (struct native_operand){.pos = (uint8_t)pos, .load = pos != 0, .store = pos == 0};
     return true;
 }
@@ -84,7 +84,7 @@ static bool fp_type_ok(unsigned type)
 
 /* ---- Advanced SIMD: vector ---- */
 
-static bool vec_three_same(uint32_t insn)
+static bool vec_three_same(uint32_t insn, struct native_desc *d)
 {
     unsigned q = BIT(insn, 30), u = BIT(insn, 29), size = FIELD(insn, 23, 22);
     unsigned opcode = FIELD(insn, 15, 11);
@@ -120,10 +120,13 @@ static bool vec_three_same(uint32_t insn)
     case 0x09: /* SQSHL/UQSHL */
     case 0x0a: /* SRSHL/URSHL */
     case 0x0b: /* SQRSHL/UQRSHL */
-    case 0x10: /* ADD/SUB */
     case 0x11: /* CMTST/CMEQ */
         return q64;
+    case 0x10: /* ADD/SUB */
+        d->vectors = NATIVE_VN_VM;
+        return q64;
     case 0x03: /* AND/BIC/ORR/ORN, EOR/BSL/BIT/BIF: size selects the instruction */
+        d->vectors = u && size != 0 ? NATIVE_VD_VN_VM : NATIVE_VN_VM;
         return true;
     case 0x13: /* MUL / PMUL */
         return u ? size == 0 : size != 3;
@@ -760,7 +763,7 @@ bool appine_simd_dp_decode(uint32_t insn, struct native_desc *d)
         if ((insn & 0x9f7e0c00) == 0x0e780800)
             return vec_two_reg_misc_fp16(insn);
         if ((insn & 0x9f200400) == 0x0e200400)
-            return vec_three_same(insn);
+            return vec_three_same(insn, d);
         if ((insn & 0x9f208400) == 0x0e008400)
             return vec_three_extra(insn);
         if ((insn & 0x9f200c00) == 0x0e200000)

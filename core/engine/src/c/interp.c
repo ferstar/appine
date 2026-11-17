@@ -622,12 +622,6 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
         else
             c->nzcv = v & UINT64_C(0xf0000000);
         return next(c);
-    case SYSREG_FPCR:
-        if (read)
-            wx(c, rt, c->fpcr);
-        else
-            c->fpcr = v & (FPCR_MASK | (appine_has(APPINE_HWCAP_FPHP) ? FPCR_FZ16 : 0));
-        return next(c);
     case SYSREG_FPSR:
         if (read)
             wx(c, rt, c->fpsr);
@@ -755,6 +749,15 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         c->pc += take ? (uint64_t)(sext(FIELD(insn, 23, 5), 19) * 4) : 4;
         return APPINE_EXIT_NONE;
     }
+    /* Decimal parsers read FPCR for each conversion. */
+    if ((insn & 0xffdfffe0) == (0xd5000000u | SYSREG_FPCR << 5)) {
+        unsigned rt = insn & 31;
+        if (BIT(insn, 21))
+            wx(c, rt, c->fpcr);
+        else
+            c->fpcr = rx(c, rt) & (FPCR_MASK | (appine_has(APPINE_HWCAP_FPHP) ? FPCR_FZ16 : 0));
+        return next(c);
+    }
     if ((insn & 0xffe0001f) == 0xd4000001) { /* SVC: exception return clears the exclusive mark */
         c->exit_info = FIELD(insn, 20, 5);
         c->excl_size = 0;
@@ -864,22 +867,70 @@ static enum ldst_kind ldst_kind(unsigned size, unsigned opc)
     }
 }
 
-/* Performs one single-register access; on failure Rt is not modified */
-static bool ldst_access(cpu_t *c, enum ldst_kind kind, unsigned size, uint64_t addr, unsigned rt)
+/* Constant sizes compile to unaligned scalar loads, with zero extension from the source width. */
+static inline uint64_t load_scalar(const void *src, unsigned size)
+{
+    uint8_t b;
+    uint16_t h;
+    uint32_t w;
+    uint64_t x;
+    switch (size) {
+    case 0: memcpy(&b, src, sizeof(b)); return b;
+    case 1: memcpy(&h, src, sizeof(h)); return h;
+    case 2: memcpy(&w, src, sizeof(w)); return w;
+    default: memcpy(&x, src, sizeof(x)); return x;
+    }
+}
+
+static inline void store_scalar(void *dst, unsigned size, uint64_t value)
+{
+    switch (size) {
+    case 0: memcpy(dst, &value, 1); break;
+    case 1: memcpy(dst, &value, 2); break;
+    case 2: memcpy(dst, &value, 4); break;
+    default: memcpy(dst, &value, 8); break;
+    }
+}
+
+static inline uint64_t extend_load(enum ldst_kind kind, uint64_t value, unsigned size)
+{
+    if (kind == K_LOAD_S64)
+        return (uint64_t)sext(value, 8u << size);
+    if (kind == K_LOAD_S32)
+        return (uint32_t)sext(value, 8u << size);
+    return value;
+}
+
+/* Keeping this out of line lets scalar TLB hits run without a stack frame. */
+static __attribute__((noinline)) bool ldst_slow(cpu_t *c, enum ldst_kind kind, unsigned size,
+                                               uint64_t va, unsigned rt)
 {
     unsigned n = 1u << size;
     if (kind == K_STORE) {
-        uint64_t v = rx(c, rt);
-        return mem_write(c, addr, &v, n);
+        uint64_t value = rx(c, rt);
+        return mem_write(c, va, &value, n);
     }
-    uint64_t v = 0;
-    if (!mem_read(c, addr, &v, n))
+    uint64_t value = 0;
+    if (!mem_read(c, va, &value, n))
         return false;
-    if (kind == K_LOAD_S64)
-        v = (uint64_t)sext(v, n * 8);
-    else if (kind == K_LOAD_S32)
-        v = (uint32_t)sext(v, n * 8);
-    wx(c, rt, v);
+    wx(c, rt, extend_load(kind, value, size));
+    return true;
+}
+
+/* Performs one single-register access; on failure Rt is not modified */
+static bool ldst_access(cpu_t *c, enum ldst_kind kind, unsigned size, uint64_t addr, unsigned rt)
+{
+    uint64_t va = untag(addr);
+    unsigned access = kind == K_STORE ? APPINE_ACCESS_WRITE : APPINE_ACCESS_READ;
+    void *host;
+    if (UNLIKELY(c->nwatch || (va & PAGE_MASK) + (1u << size) > APPINE_PAGE_SIZE ||
+                 !tlb_probe(c, va, access, &host)))
+        return ldst_slow(c, kind, size, va, rt);
+
+    if (kind == K_STORE)
+        store_scalar(host, size, rx(c, rt));
+    else
+        wx(c, rt, extend_load(kind, load_scalar(host, size), size));
     return true;
 }
 

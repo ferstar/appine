@@ -321,6 +321,29 @@ fn simd_and_fp_round_trip() {
 }
 
 #[test]
+fn integer_vector_stubs_preserve_flags_and_other_registers() {
+    if !has_simd() {
+        return;
+    }
+    let mut g = Guest::new();
+    let s = g.cpu.state_mut();
+    s.fpcr = 1 << 22;
+    s.fpsr = 1 << 27;
+    s.nzcv = 0xb000_0000;
+    let mut expected = std::array::from_fn(|i| [0x1111 * i as u64, u64::MAX - i as u64]);
+    s.v = expected;
+    g.step(0x2e69_1fec); // bsl v12.8b, v31.8b, v9.8b: old Vd supplies the mask
+    let mask = expected[12][0];
+    expected[12] = [(mask & expected[31][0]) | (!mask & expected[9][0]), 0];
+    assert_eq!(g.cpu.state().v, expected);
+    g.step(0x4eec_858c); // add v12.2d, v12.2d, v12.2d: all operands alias
+    expected[12][0] *= 2;
+    let s = g.cpu.state();
+    assert_eq!(s.v, expected);
+    assert_eq!((s.fpcr, s.fpsr, s.nzcv), (1 << 22, 1 << 27, 0xb000_0000));
+}
+
+#[test]
 fn id_registers_match_hwcap() {
     let mut g = Guest::new();
     g.step(0xd5380600); // mrs x0, id_aa64isar0_el1

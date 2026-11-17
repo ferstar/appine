@@ -9,7 +9,8 @@
  *   void stub(struct appine_cpu *cpu, void *host_addr);
  *
  * General register fields are replaced with host x2–x7 (a register pair takes two), and the
- * address field with x1; x9 and x10 are the stub's own temporaries. FP stubs also save host
+ * address field with x1; x9 and x10 are the stub's own temporaries. Integer vector add/subtract
+ * and logical operations use caller-saved v0–v2. Full FP stubs also save host
  * d8–d15 and FPCR, load the guest's FPCR/FPSR/NZCV and V0–V31, and write them back after
  * executing.
  *
@@ -127,7 +128,22 @@ static void generate(struct buf *b, uint32_t insn, const struct native_desc *d)
     uint32_t out = insn;
     unsigned host[3];
 
-    if (d->fp) {
+    if (d->vectors == NATIVE_VN_VM || d->vectors == NATIVE_VD_VN_VM) {
+        unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
+        put_add(b, VBASE, CPU, v_off);
+        if (d->vectors == NATIVE_VD_VN_VM)
+            put(b, enc_ldr_q(0, VBASE, 16 * rd));
+        put(b, enc_ldr_q(1, VBASE, 16 * rn));
+        put(b, enc_ldr_q(2, VBASE, 16 * rm));
+        /* Execute Vd, Vn, Vm as v0, v1, v2, even when guest operands alias. */
+        const uint32_t operand_mask = 31u | (31u << 5) | (31u << 16);
+        put(b, (insn & ~operand_mask) | (1u << 5) | (2u << 16));
+        put(b, enc_str_q(0, VBASE, 16 * rd));
+        put(b, enc_ret());
+        return;
+    }
+
+    if (d->vectors == NATIVE_FULL_FP) {
         put(b, enc_stp_d_pre(8, 9, 31, -80));
         put(b, enc_stp_d(10, 11, 31, 16));
         put(b, enc_stp_d(12, 13, 31, 32));
@@ -178,7 +194,7 @@ static void generate(struct buf *b, uint32_t insn, const struct native_desc *d)
             put(b, enc_str_x(host[i] + 1, CPU, x_off(r + 1)));
     }
 
-    if (d->fp) {
+    if (d->vectors == NATIVE_FULL_FP) {
         for (unsigned q = 0; q < 32; q += 2)
             put(b, enc_stp_q(q, q + 1, VBASE, (int)(16 * q)));
         put(b, enc_mrs_fpsr(TMP));
