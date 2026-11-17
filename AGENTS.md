@@ -3,19 +3,14 @@
 These instructions apply to the whole repository, regardless of the coding agent used.
 See `README.md` for development commands and `android/README.md` for Android-specific setup.
 
-## Repository knowledge
-
-- `.agents/MODULES.md` defines module IDs and their source boundaries.
-- `.agents/maps/<module>.md` describes the current implementation, invariants, verification paths and open issues.
-- `.agents/decisions/<module>.md` summarizes design decisions from commit history.
-- These paths are the repository's shared knowledge store. Use them even if a tool defaults to a different directory.
-
 ## Language
 
 - Write code comments, doc comments and developer-facing messages (assertions, panics, logs, script output) in English, using the terms of the module's map.
 - `docs/rounds/` (frozen, see Records below) is in Chinese; user-facing Android strings are localized in `res/values*/strings.xml`.
 
 ## Knowledge Loop Conventions
+
+Use the repository's `.agents/` paths for the module registry, maps, and decision summaries, even when a tool defaults to another directory.
 
 ### Before editing code
 
@@ -31,8 +26,8 @@ See `README.md` for development commands and `android/README.md` for Android-spe
 
 ### Records
 
-- A change is recorded in its commit (Decision blocks; measurements, survey results and how it was tested go in the body) and in the module maps. `docs/rounds/` is frozen after round 208: do not add rounds, index rows or "→" marks.
+- In the commit body, describe how the change was tested and include any relevant measurements or survey results. `docs/rounds/` is frozen after round 208: do not add rounds, index rows or "→" marks.
 - Deferred work and problems found but not fixed go into the affected map's "Confirmed bugs / technical debt" or "Open questions", and are removed from it when done; pitfalls worth knowing later go into its "Invariants and gotchas".
-- A deferred item from an old round that comes up again: check it against the current code, and if it is still open, move it into its module's map.
+- When a deferred item from an old round comes up again, check it against the current code. If it is still open, record it in its module's map.
 - Cross-change reference (measurement conditions, R1 measurements, known flaky tests) stays in `docs/milestones.md`. Work with no diff (surveys, investigations) gets a short doc under `docs/` only when worth keeping.
 - Historical records may name `/commit-context` or `/map-module`; these refer to the commit and map workflows described above. Pinned `git show <commit>:<path>` references retain the path that existed in that commit.
