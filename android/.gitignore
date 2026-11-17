@@ -4,3 +4,4 @@
 *.iml
 local.properties
 captures/
+/app/release/
