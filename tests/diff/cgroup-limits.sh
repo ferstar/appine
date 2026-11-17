@@ -14,6 +14,7 @@ cd /sys/fs/cgroup
 mkdir init
 for p in $(cat cgroup.procs); do echo $p > init/cgroup.procs 2>/dev/null; done
 echo "+pids +memory" > cgroup.subtree_control && echo "root subtree: $(cat cgroup.subtree_control)"
+
 mkdir t
 echo "t controllers: $(cat t/cgroup.controllers)"
 echo "+pids +memory" > t/cgroup.subtree_control
@@ -92,6 +93,61 @@ kill $(cat t/p/cgroup.procs)
 # Disable and re-enable pids: the limit and events return to the defaults
 echo "-pids" > t/cgroup.subtree_control && echo "+pids" > t/cgroup.subtree_control
 echo "p after re-enable: max $(cat t/p/pids.max) $(pev t/p)"
+
+# Keep one watch on the child across controller enable, disable and re-enable.
+# O_PATH pins the new pids.events dentry without opening it for poll.
+mkdir watch watch/child
+python3 - <<'PY' || exit 1
+import ctypes, errno, os, select, struct, time
+from pathlib import Path
+
+IN_MODIFY = 0x2
+event_header = struct.Struct('iIII')
+
+def hit_pids_max():
+    try:
+        pid = os.fork()
+    except OSError as e:
+        if e.errno == errno.EAGAIN:
+            return
+        raise
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+    raise AssertionError('pids.max allowed the fork')
+
+def wait_for_modify(fd, name):
+    deadline = time.monotonic() + 2
+    while select.select([fd], [], [], max(0, deadline - time.monotonic()))[0]:
+        events = os.read(fd, 4096)
+        offset = 0
+        while offset < len(events):
+            _, mask, _, size = event_header.unpack_from(events, offset)
+            offset += event_header.size
+            if mask & IN_MODIFY and events[offset:offset + size].rstrip(b'\0') == name:
+                return
+            offset += size
+    raise TimeoutError(f'no IN_MODIFY for {name!r}')
+
+libc = ctypes.CDLL(None, use_errno=True)
+child = Path('watch/child')
+control = child.parent / 'cgroup.subtree_control'
+fd = libc.inotify_init1(os.O_NONBLOCK)
+if fd < 0 or libc.inotify_add_watch(fd, os.fsencode(child), IN_MODIFY) < 0:
+    raise OSError(ctypes.get_errno(), 'cannot watch the child cgroup')
+for phase in ('enable', 're-enable'):
+    control.write_text('+pids')
+    pin = os.open(child / 'pids.events', os.O_PATH)
+    (child / 'pids.max').write_text('1')
+    (child / 'cgroup.procs').write_text('0')
+    hit_pids_max()
+    wait_for_modify(fd, b'pids.events')
+    print(phase, 'pids.events directory notification received')
+    os.close(pin)
+    Path('init/cgroup.procs').write_text('0')
+    control.write_text('-pids')
+PY
+rmdir watch/child watch
 
 # memory.max: exceeding it kills the process (swap.max is set to 0, so nothing is swapped out even
 # on hosts with swap)

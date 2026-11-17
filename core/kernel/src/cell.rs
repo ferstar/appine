@@ -35,15 +35,16 @@ impl Held {
     #[inline]
     fn new() -> Held {
         #[cfg(any(debug_assertions, feature = "borrow-check"))]
-        BORROWS.set(BORROWS.get() + 1);
+        BORROWS.with(|count| count.set(count.get() + 1));
         Held
     }
 }
 
 #[cfg(any(debug_assertions, feature = "borrow-check"))]
 impl Drop for Held {
+    #[inline]
     fn drop(&mut self) {
-        BORROWS.set(BORROWS.get() - 1);
+        BORROWS.with(|count| count.set(count.get() - 1));
     }
 }
 

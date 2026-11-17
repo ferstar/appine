@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: marking affected cgroup files at state changes and checking watch lifetimes)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: directory watches follow controller files added after registration)
 
 ## Responsibilities
 
@@ -157,7 +157,8 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 - A task starting, exiting, migrating or changing its freezer participation marks
   `cgroup.events` in the affected groups and their ancestors. Freeze requests also mark
   observed descendants. Pids and memory events mark the files whose counters they change;
-  controller disable and rmdir mark observations whose files disappear.
+  controller disable and rmdir mark observations whose files disappear. Enabling pids or
+  memory registers the newly visible files for existing watches on the child directories.
 - A per-kernel flag lets `notify_changes` skip the observation table when clean. Otherwise it
   compares only marked files, after BKL syscalls, thread exits,
   freezer stops and timer-thread checks. Multiple changes to a file between checks yield at
@@ -237,8 +238,6 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 
 ## Open questions
 
-- Why did median `getppid` time with no observers rise from 156.5 to 169.9 ns per call
-  in the arm64 release CLI after selective cgroup notification checks?
 - Whether `meminfo`/`sysinfo` should be clamped to the cgroup memory limit remains an open
   question in `kernel/procfs`.
 

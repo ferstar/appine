@@ -973,17 +973,23 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
     }
     let g = k.cgroups.map.get_mut(&id).unwrap();
     g.subtree_control = (g.subtree_control | enable) & !disable;
-    // The disabled controller's state in child cgroups (Linux's css) is dropped, and is back to
-    // the defaults when enabled again
-    for c in children {
+    let adds_event_files = enable & ((1 << MEMORY) | (1 << PIDS)) != 0;
+    for child_id in children {
+        if adds_event_files && k.inotify.borrow().watches(key(child_id, b"")) {
+            observe_all(k, child_id);
+        }
+        if disable == 0 {
+            continue;
+        }
+        // Drop the disabled controllers' state (Linux's css) and retire their observations.
         if disable & (1 << PIDS) != 0 {
-            k.cgroups.mark_dirty(c, b"pids.events");
+            k.cgroups.mark_dirty(child_id, b"pids.events");
         }
         if disable & (1 << MEMORY) != 0 {
-            k.cgroups.mark_dirty(c, b"memory.events");
-            k.cgroups.mark_dirty(c, b"memory.events.local");
+            k.cgroups.mark_dirty(child_id, b"memory.events");
+            k.cgroups.mark_dirty(child_id, b"memory.events.local");
         }
-        let Some(child) = k.cgroups.map.get_mut(&c) else {
+        let Some(child) = k.cgroups.map.get_mut(&child_id) else {
             continue;
         };
         child.values.retain(|name, _| {
