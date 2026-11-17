@@ -661,6 +661,7 @@ pub(crate) fn group_exit(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, status: E
     if g.exiting.is_none() {
         g.exiting = Some(status);
     }
+    k.cgroups.task_changed(g.cgroup);
     for tid in &g.threads {
         if let Some(t) = k.tasks.get(tid) {
             t.killed.set(true);
@@ -1284,15 +1285,18 @@ fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
         if !stopped && !frozen {
             break Flow::Continue;
         }
-        cx.task.frozen.set(frozen);
         // The last thread stopping completes the freeze (cgroup.events' frozen)
         if frozen {
+            crate::cgroup::enter_frozen(cx);
             crate::cgroup::notify_changes(cx.k());
+        } else {
+            cx.task.frozen.set(false);
         }
         // Only SIGCONT, SIGKILL and thawing can make it leave here, so other signals are not
         // checked
         let _ = cx.wait(None, &mut []);
     };
+    // A killed task still counts as frozen. Otherwise its group has thawed.
     cx.task.frozen.set(false);
     flow
 }

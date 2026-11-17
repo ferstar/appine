@@ -465,6 +465,10 @@ impl Default for Registry {
 }
 
 impl Registry {
+    pub(crate) fn watches(&self, ino: Ino) -> bool {
+        self.by_ino.contains_key(&ino)
+    }
+
     /// The inodes (and node keys) with watches on them.
     pub(crate) fn watched(&self) -> impl Iterator<Item = Ino> + '_ {
         self.by_ino.keys().copied()

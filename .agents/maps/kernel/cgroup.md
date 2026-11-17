@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: marking affected cgroup files at state changes and checking watch lifetimes)
 
 ## Responsibilities
 
@@ -154,14 +154,20 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   from the start and, for `cgroup.events`, `memory.events`, `memory.events.local` and
   `pids.events`, after a content change until read again. `kernel/files` attaches the counter
   returned by `observe` to `fd::ProcEvent`; `kernel/poll` consumes its readiness state.
-- Those four files are compared with what they showed while an open file or an inotify watch
-  observes them (`observe`, `observe_all`, `notify_changes`, after BKL syscalls, thread exits,
-  freezer stops and timer-thread checks). A change wakes pollers and reports `IN_MODIFY` to
-  watches on the file and its directory. A write to any cgroup2 file reports `IN_MODIFY` too,
+- A task starting, exiting, migrating or changing its freezer participation marks
+  `cgroup.events` in the affected groups and their ancestors. Freeze requests also mark
+  observed descendants. Pids and memory events mark the files whose counters they change;
+  controller disable and rmdir mark observations whose files disappear.
+- A per-kernel flag lets `notify_changes` skip the observation table when clean. Otherwise it
+  compares only marked files, after BKL syscalls, thread exits,
+  freezer stops and timer-thread checks. Multiple changes to a file between checks yield at
+  most one counter increase. A change wakes pollers and reports `IN_MODIFY` to watches
+  on the file and its directory. A write to any cgroup2 file reports `IN_MODIFY` too,
   from the file-syscall adapter.
 - `key` gives cgroup2 files and directories inotify keys with top bits 01; store inodes, overlay
   keys (10) and FUSE keys (11) do not collide with them. Removed or no-longer-observed files
-  are forgotten by the observation table.
+  are forgotten at the next check of that file. Until then a closed file may retain a snapshot;
+  a new observer reuses it only if an open fd or a watch on the file or directory still exists.
 
 ## Dependencies (inbound / outbound)
 
@@ -205,15 +211,18 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 - Call sites in `kernel/files` and `kernel/vfs` must run the device check at the documented
   opens and mknod paths. Pseudo-node adapters must keep directory search permissions and
   controller-dependent file visibility; they do not own cgroup policy.
-- New paths changing cgroup state must reach `notify_changes`; otherwise poll and inotify
-  observers wait until another notification checkpoint.
+- A mutation that can change a notifying file must mark it before a checkpoint can run.
+  Membership changes affect ancestors on both sides of a move. A vfork wait or a change
+  in a task's killed flag can affect freeze completion without changing membership.
 
 ## Confirmed bugs / technical debt
 
 - **Change notifications are partial:** a cgroup2 change is noticed when the next syscall,
   thread exit, freezer stop or timer-thread pass looks, and changes that come and go between
   two looks are missed; `cgroup.stat` and other files Linux notifies in later kernels are not
-  watched.
+  watched. A directory watch can also receive an inherited freeze notification for a child
+  event file never looked up, where the native 6.8 VM reported it only with the child dentry
+  instantiated.
 - **Delegation and controller gaps:** cgroup directories cannot be chmod'ed or chown'ed;
   threaded cgroups are unavailable; limits such as `cpu.max`, `cpu.weight`, `cpuset.cpus` and
   `memory.high` are stored without enforcement.
@@ -228,8 +237,10 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 
 ## Open questions
 
-None specific to this boundary. Whether `meminfo`/`sysinfo` should be clamped to the cgroup
-memory limit remains an open question in `kernel/procfs`.
+- Why did median `getppid` time with no observers rise from 156.5 to 169.9 ns per call
+  in the arm64 release CLI after selective cgroup notification checks?
+- Whether `meminfo`/`sysinfo` should be clamped to the cgroup memory limit remains an open
+  question in `kernel/procfs`.
 
 ## To verify
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: direct file and directory watch lookup for cgroup notifications)
 
 ## Responsibilities
 
@@ -56,7 +56,7 @@ opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 
   `dir_event`, `cookie`, `opened`, `renamed`, `deleted`, `watched_at`, `key_of`.
 - `host_change` (the Files app's changes, from the machine's `store_changed`), `kernfs_modified`
   (cgroup2 file changes).
-- `Registry::watched` (the overlay sweep, FUSE's `in_use`, cgroup observation);
+- `Registry::watched` (the overlay sweep and FUSE's `in_use`), `Registry::watches` (cgroup observation);
   `Inotify::ready`, `queued`, `pending` and `fdinfo` (`kernel/poll`, `kernel/procfs`).
 
 ## Data flow / lifecycle

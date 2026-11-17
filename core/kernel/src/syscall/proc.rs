@@ -596,7 +596,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         // frozen state for it: a child frozen before its execve would otherwise keep a freezing
         // cgroup from ever reporting frozen (runc pause waits for that). While the cgroup is
         // freezing the thread stays counted until it stops on its way out (cgroup_leave_frozen)
-        cx.task.frozen.set(true);
+        crate::cgroup::enter_frozen(cx);
         let waited = loop {
             if done.get() || cx.task.killed.get() {
                 break Ok(());
@@ -1183,6 +1183,7 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
     if others.is_empty() {
         return Ok(());
     }
+    cx.kr().cgroups.task_changed(cx.t.group.borrow().cgroup);
     for tid in &others {
         if let Some(t) = cx.kr().tasks.get(tid) {
             t.killed.set(true);

@@ -166,7 +166,37 @@ int main(void)
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     wait_change("the process left", ep, ev, dir_in, file_in);
+    close(ep);
     close(ev);
+    close(dir_in);
+    close(file_in);
+
+    /* Inherited freeze on empty children. Each child has only one kind of inotify
+     * watch. Keep the directory watch's child dentry instantiated for kernfs;
+     * O_PATH does not open the file for poll. */
+    const char *dir_child = "/sys/fs/cgroup/n/d", *file_child = "/sys/fs/cgroup/n/f";
+    mkdir(dir_child, 0755);
+    mkdir(file_child, 0755);
+    dir_in = inotify_init1(IN_NONBLOCK);
+    file_in = inotify_init1(IN_NONBLOCK);
+    int pathfd = open("/sys/fs/cgroup/n/d/cgroup.events", O_PATH);
+    inotify_add_watch(dir_in, dir_child, IN_MODIFY);
+    inotify_add_watch(file_in, "/sys/fs/cgroup/n/f/cgroup.events", IN_MODIFY);
+    freeze = open("/sys/fs/cgroup/n/cgroup.freeze", O_WRONLY);
+    write(freeze, "1", 1);
+    struct pollfd dw = {.fd = dir_in, .events = POLLIN};
+    struct pollfd fw = {.fd = file_in, .events = POLLIN};
+    poll(&dw, 1, 2000);
+    poll(&fw, 1, 2000);
+    show_events("inherited freeze, directory alone", dir_in);
+    show_events("inherited freeze, file alone", file_in);
+    close(dir_in);
+    close(file_in);
+    write(freeze, "0", 1);
+    close(freeze);
+    close(pathfd);
+    rmdir(dir_child);
+    rmdir(file_child);
     rmdir("/sys/fs/cgroup/n");
     return 0;
 }

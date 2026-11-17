@@ -43,7 +43,7 @@ use crate::errno::Errno;
 use std::rc::Rc;
 
 use crate::cell::RefCell;
-use crate::kernel::{INIT, Kernel, Tid};
+use crate::kernel::{Cx, INIT, Kernel, Tid};
 use crate::oom::Events;
 use crate::process::ThreadGroup;
 
@@ -188,16 +188,30 @@ impl Cgroup {
 pub(crate) struct Cgroups {
     pub map: BTreeMap<u64, Cgroup>,
     next: u64,
-    /// The notifying files something watches (an open file or an inotify watch), by cgroup and
-    /// name ([`observe`], [`notify_changes`]).
+    /// Last observation by cgroup and file. Replaced at the next open/watch or pruned
+    /// on the next relevant change if the last observer went away.
     observed: HashMap<(u64, &'static [u8]), Observed>,
+    /// At least one observed file needs checking.
+    pending: Cell<bool>,
 }
 
 /// A notifying cgroup file being watched: what it showed when last looked at, and the counter its
 /// changes bump ([`crate::fd::ProcEvent`]).
 struct Observed {
+    dirty: Cell<bool>,
     content: Option<String>,
     counter: Rc<Cell<u64>>,
+}
+
+impl Observed {
+    /// An open fd holds a counter reference. Inotify can watch the file or its directory.
+    fn is_watched(&self, k: &Kernel, id: u64, name: &[u8]) -> bool {
+        if Rc::strong_count(&self.counter) > 1 {
+            return true;
+        }
+        let watches = k.inotify.borrow();
+        watches.watches(key(id, name)) || watches.watches(key(id, b""))
+    }
 }
 
 impl Default for Cgroups {
@@ -207,6 +221,7 @@ impl Default for Cgroups {
             map: BTreeMap::from([(ROOT, root)]),
             next: ROOT + 1,
             observed: HashMap::new(),
+            pending: Cell::new(false),
         }
     }
 }
@@ -240,14 +255,17 @@ pub(crate) fn observe(k: &mut Kernel, id: u64, name: &'static [u8]) -> Option<Rc
     if !NOTIFYING.contains(&name) {
         return None;
     }
-    if let Some(o) = k.cgroups.observed.get(&(id, name)) {
-        return Some(o.counter.clone());
+    if let Some(observed) = k.cgroups.observed.get(&(id, name))
+        && observed.is_watched(k, id, name)
+    {
+        return Some(observed.counter.clone());
     }
     let content = file(k, id, name, &|t| t);
     let counter = Rc::new(Cell::new(1));
     k.cgroups.observed.insert(
         (id, name),
         Observed {
+            dirty: Cell::new(false),
             content,
             counter: counter.clone(),
         },
@@ -267,42 +285,70 @@ pub(crate) fn observe_all(k: &mut Kernel, id: u64) {
     }
 }
 
-/// Looks for changes in the watched notifying files, as Linux's `cgroup_file_notify` reports
-/// them where they happen: each whose contents differ from what it showed last bumps its counter
-/// (pollers see `POLLPRI` and are woken) and reports `IN_MODIFY` to inotify watches on it and on
-/// its directory (`kernfs_notify`). Called after syscalls, thread exits, freezer stops and the
-/// timer thread's checks (the OOM killer); does nothing while nothing is watched. A file nothing
-/// watches any more, or whose cgroup is gone, is forgotten.
+/// Processes pending changes at the existing syscall, exit, freezer and timer checkpoints.
+/// Several changes to the same file before a checkpoint produce at most one notification.
+#[inline]
 pub(crate) fn notify_changes(k: &mut Kernel) {
-    if k.cgroups.observed.is_empty() {
-        return;
+    if k.cgroups.pending.get() {
+        flush_changes(k);
     }
-    let watched: std::collections::HashSet<u64> = k.inotify.borrow().watched().collect();
-    let keys: Vec<(u64, &'static [u8])> = k.cgroups.observed.keys().copied().collect();
-    let mut changed = Vec::new();
-    for (id, name) in keys {
-        let held = Rc::strong_count(&k.cgroups.observed[&(id, name)].counter) > 1;
-        let now = file(k, id, name, &|t| t);
-        if now.is_none()
-            || !held && !watched.contains(&key(id, name)) && !watched.contains(&key(id, b""))
-        {
-            k.cgroups.observed.remove(&(id, name));
-            continue;
-        }
-        let o = k.cgroups.observed.get_mut(&(id, name)).unwrap();
-        if now != o.content {
-            o.content = now;
-            o.counter.set(o.counter.get() + 1);
-            crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*o.counter));
-            changed.push((id, name));
-        }
-    }
-    for (id, name) in changed {
+}
+
+fn flush_changes(k: &mut Kernel) {
+    let mut files: Vec<_> = k
+        .cgroups
+        .observed
+        .iter()
+        .filter_map(|(&key, observed)| observed.dirty.get().then_some(key))
+        .collect();
+    files.retain(|&(id, name)| refresh_observed(k, id, name));
+    // If reading a file panics, the next checkpoint retries the remaining files.
+    k.cgroups.pending.set(false);
+
+    // Deliver after refreshing all counters, since delivery can consume a one-shot watch.
+    for (id, name) in files {
         crate::syscall::kernfs_modified(k, key(id, name), key(id, b""), name);
     }
 }
 
+/// Refreshes a dirty file's poll counter and reports whether to send IN_MODIFY.
+fn refresh_observed(k: &mut Kernel, id: u64, name: &'static [u8]) -> bool {
+    let key = (id, name);
+    if k.cgroups.observed[&key].is_watched(k, id, name)
+        && let Some(content) = file(k, id, name, &|tid| tid)
+    {
+        let observed = k.cgroups.observed.get_mut(&key).unwrap();
+        observed.dirty.set(false);
+        if observed.content.as_ref() == Some(&content) {
+            return false;
+        }
+        observed.content = Some(content);
+        observed.counter.set(observed.counter.get() + 1);
+        crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*observed.counter));
+        return true;
+    }
+    k.cgroups.observed.remove(&key);
+    false
+}
+
 impl Cgroups {
+    fn mark_dirty(&self, id: u64, name: &'static [u8]) {
+        if let Some(observed) = self.observed.get(&(id, name)) {
+            observed.dirty.set(true);
+            self.pending.set(true);
+        }
+    }
+
+    /// A member arrived, left or changed whether it counts as frozen. Its ancestors
+    /// include the same task in their populated and frozen values.
+    pub(crate) fn task_changed(&self, id: u64) {
+        if !self.observed.is_empty() {
+            for ancestor in self.ancestors(id) {
+                self.mark_dirty(ancestor, b"cgroup.events");
+            }
+        }
+    }
+
     /// Creates child cgroup `name` under `parent` (Linux's `cgroup_mkdir`), owned by `cred`'s
     /// fsuid and fsgid, with permission bits `mode` (umask applied). An existing name is EEXIST; a
     /// newline in the name is EINVAL; exceeding an ancestor's `cgroup.max.depth` or
@@ -443,6 +489,9 @@ pub(crate) fn rmdir(k: &mut Kernel, id: u64) -> Result<(), Errno> {
         return Err(Errno::EBUSY);
     }
     let name = g.name.clone();
+    for name in NOTIFYING {
+        k.cgroups.mark_dirty(id, name);
+    }
     k.cgroups.map.remove(&id);
     if let Some(p) = k.cgroups.map.get_mut(&parent) {
         p.children.remove(&name);
@@ -620,6 +669,13 @@ fn frozen(k: &Kernel, id: u64) -> bool {
         })
 }
 
+/// Freezer stops and vfork waits both contribute to the subtree's frozen state.
+pub(crate) fn enter_frozen(cx: &Cx<'_>) {
+    if !cx.task.frozen.replace(true) {
+        cx.kr().cgroups.task_changed(cx.t.group.borrow().cgroup);
+    }
+}
+
 /// The contents of `memory.events` (low and high are always 0: there is no reclaim).
 fn events(e: &Events) -> String {
     format!(
@@ -782,6 +838,12 @@ pub(crate) fn write(
                 _ => return Err(Errno::ERANGE),
             };
             k.cgroups.map.get_mut(&id).ok_or(Errno::ENOENT)?.freeze = freeze;
+            // Descendants inherit the request, including empty cgroups with observers.
+            for &(child, name) in k.cgroups.observed.keys() {
+                if name == b"cgroup.events" && k.cgroups.is_within(child, id) {
+                    k.cgroups.mark_dirty(child, name);
+                }
+            }
             let groups: Vec<_> = k
                 .groups
                 .iter()
@@ -856,6 +918,8 @@ fn migrate(
         return Err(Errno::EBUSY);
     }
     g.borrow_mut().cgroup = dst;
+    k.cgroups.task_changed(src);
+    k.cgroups.task_changed(dst);
     // Migrating into a frozen cgroup stops the process, and migrating out lets it run on (Linux's
     // cgroup_freezer_migrate_task)
     refreeze(k, &g);
@@ -912,6 +976,13 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
     // The disabled controller's state in child cgroups (Linux's css) is dropped, and is back to
     // the defaults when enabled again
     for c in children {
+        if disable & (1 << PIDS) != 0 {
+            k.cgroups.mark_dirty(c, b"pids.events");
+        }
+        if disable & (1 << MEMORY) != 0 {
+            k.cgroups.mark_dirty(c, b"memory.events");
+            k.cgroups.mark_dirty(c, b"memory.events.local");
+        }
         let Some(child) = k.cgroups.map.get_mut(&c) else {
             continue;
         };
@@ -1150,6 +1221,7 @@ pub(crate) fn pids_charge(k: &mut Kernel, dst: u64) -> Result<(), Errno> {
             format_args!("cgroup: fork rejected by pids controller in {path}"),
         );
     }
+    k.cgroups.mark_dirty(css, b"pids.events");
     Err(Errno::EAGAIN)
 }
 
@@ -1184,7 +1256,9 @@ pub(crate) fn memory_event(k: &mut Kernel, id: u64, f: impl Fn(&mut Events)) {
             f(&mut g.mem_events);
             if c == id {
                 f(&mut g.mem_events_local);
+                k.cgroups.mark_dirty(c, b"memory.events.local");
             }
+            k.cgroups.mark_dirty(c, b"memory.events");
         }
     }
 }
@@ -1305,6 +1379,45 @@ fn members(k: &Kernel) -> impl Iterator<Item = (Tid, u64)> + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_notifications_follow_the_file_and_its_lifetime() {
+        let shared = crate::kernel::Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let child = k.cgroups.mkdir(ROOT, b"t", &Cred::root(), 0o755).unwrap();
+        subtree_control(&mut k, ROOT, "+memory +pids").unwrap();
+        let root_events = observe(&mut k, ROOT, b"memory.events").unwrap();
+        let root_local = observe(&mut k, ROOT, b"memory.events.local").unwrap();
+        let local = observe(&mut k, child, b"memory.events.local").unwrap();
+        let pids = observe(&mut k, child, b"pids.events").unwrap();
+
+        memory_event(&mut k, child, |e| e.oom += 1);
+        memory_event(&mut k, child, |e| e.oom += 1);
+        notify_changes(&mut k);
+        assert_eq!(
+            (root_events.get(), root_local.get(), local.get()),
+            (2, 1, 2)
+        );
+        assert_eq!(pids.get(), 1);
+
+        k.cgroups
+            .map
+            .get_mut(&child)
+            .unwrap()
+            .values
+            .insert(b"pids.max", "0".into());
+        assert_eq!(pids_charge(&mut k, child), Err(Errno::EAGAIN));
+        notify_changes(&mut k);
+        assert_eq!(pids.get(), 2);
+
+        subtree_control(&mut k, ROOT, "-memory").unwrap();
+        notify_changes(&mut k);
+        subtree_control(&mut k, ROOT, "+memory").unwrap();
+        let reopened = observe(&mut k, child, b"memory.events.local").unwrap();
+        memory_event(&mut k, child, |e| e.max += 1);
+        notify_changes(&mut k);
+        assert_eq!((local.get(), reopened.get(), root_events.get()), (2, 2, 3));
+    }
 
     /// Creating child cgroups: duplicate names (including this cgroup's interface files) are
     /// EEXIST, newlines EINVAL; a child cgroup's files follow its parent's subtree_control; paths

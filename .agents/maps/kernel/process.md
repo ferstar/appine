@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: task membership and freezer changes mark affected cgroup observations)
 
 ## Responsibilities
 
@@ -208,7 +208,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
   sweep can tell which syscalls began before a removal.
 - After the handler: released FUSE files are flushed, the FUSE node cache may be swept
   (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall let go of are collected
-  and removed overlay nodes swept (`kernel/overlay`), and watched cgroup2 files compared for changes
+  and removed overlay nodes swept (`kernel/overlay`), and pending cgroup2 file changes checked
   (`cgroup::notify_changes`, also run at thread exit, freezer stops and by the timer thread); then
   results are translated out (invisible pids become 0), edge-triggered readiness is re-armed after
   reads, x0 is set, `Mm::sync` runs, then the exit stop and signal delivery. `exit`, `exit_group`,
@@ -269,7 +269,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
   thread finishes the group; flush message-queue notifications, reset its namespaces and drop
   references under the BKL; flush released FUSE files; collect unix sockets in flight (last
   thread), IPC namespaces and the mounts of dead mount namespaces or detached mounts the thread was
-  the last user of; compare watched cgroup files; request an `EXITED` wake. The engine CPU state is
+  the last user of; check pending cgroup file changes; request an `EXITED` wake. The engine CPU state is
   freed after the BKL is released.
 - `finish_group`, each step contained: release AIO; reparent children to the nearest
   `PR_SET_CHILD_SUBREAPER` ancestor in the same pid-namespace level that still has live threads

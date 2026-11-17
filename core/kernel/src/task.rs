@@ -466,7 +466,9 @@ pub(crate) fn start(
     .map_err(|_| Errno::EAGAIN)?;
     {
         let st = task.state.borrow();
-        st.group.borrow_mut().threads.push(tid);
+        let mut group = st.group.borrow_mut();
+        group.threads.push(tid);
+        k.cgroups.task_changed(group.cgroup);
         st.mm.borrow_mut().add_user(task.sync.clone());
     }
     k.tasks.insert(tid, task);
@@ -1099,6 +1101,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     let last = {
         let mut g = group.borrow_mut();
         g.threads.retain(|&t| t != tid);
+        k.cgroups.task_changed(g.cgroup);
         g.threads.is_empty()
     };
     // The child processes this thread created go to a live thread of the process (Linux's
