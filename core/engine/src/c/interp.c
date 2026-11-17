@@ -44,9 +44,6 @@
 /* Block size zeroed by DC ZVA: DCZID_EL0.BS = 4, i.e. 2^4 words, as on common arm64 cores */
 #define DCZ_BLOCK 64
 
-/* FPCR bits writable from AArch64 user mode: AHP, DN, FZ, RMode; with FP16 also FZ16 */
-#define FPCR_MASK UINT64_C(0x07c00000)
-#define FPCR_FZ16 (UINT64_C(1) << 19)
 /* Cumulative exception bits in FPSR: QC, IDC, IXC, UFC, OFC, DZC, IOC */
 #define FPSR_MASK UINT64_C(0x0800009f)
 
@@ -754,7 +751,7 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         if (BIT(insn, 21))
             wx(c, rt, c->fpcr);
         else
-            c->fpcr = rx(c, rt) & (FPCR_MASK | (appine_has(APPINE_HWCAP_FPHP) ? FPCR_FZ16 : 0));
+            c->fpcr = rx(c, rt) & fpcr_write_mask();
         return next(c);
     }
     if ((insn & 0xffe0001f) == 0xd4000001) { /* SVC: exception return clears the exclusive mark */

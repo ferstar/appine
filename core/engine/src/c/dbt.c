@@ -114,11 +114,11 @@ static const struct regs reg_sets[] = {
  * addresses strictly increase along forward edges, so every loop has at least one edge that passes
  * a check. R_UNGROUP is a group of accesses sharing one check that failed it (see plan_group);
  * as with R_INTERP, Tier 0 executes this one instruction */
-enum { R_CHAIN = 1, R_CHAIN_FWD, R_LOOKUP, R_INTERP, R_SVC, R_KICK, R_UNGROUP };
+enum { R_CODE, R_CHAIN, R_CHAIN_FWD, R_LOOKUP, R_INTERP, R_SVC, R_KICK, R_UNGROUP };
 
 /* The other kind of stub besides exit stubs: on a TLB miss it enters the refill routine and exits
  * only if the refill fails (R_INTERP or R_UNGROUP) */
-#define STUB_REFILL 0
+#define STUB_REFILL (R_UNGROUP + 1)
 
 /* The most words one stub takes: a link stub takes 5 words (6 when the pc does not fit in 48
  * bits), an exit stub 4 (5), a refill stub 5 */
@@ -1724,16 +1724,19 @@ static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, i
 static void emit_atomic_address_off(struct xlate *x, unsigned rn, int64_t off, unsigned bytes,
                                     bool write, uint64_t pc)
 {
-    if (rn == 31) {
-        emit(x, enc_mov(T0, SP_HOST));
+    unsigned base = rn == 31 ? SP_HOST : rn;
+    if (rn == 31)
         emit_sp_check(x, pc);
-    } else if (is_stolen(rn)) {
+    else if (is_stolen(rn)) {
         emit_load_guest(x, T0, rn);
-    } else {
-        emit(x, enc_mov(T0, rn));
+        base = T0;
     }
-    if (off) /* LRCPC2's 9-bit offset, which fits in a 12-bit immediate */
-        emit(x, off < 0 ? enc_sub_imm(T0, T0, (uint32_t)-off, 0) : enc_add_imm(T0, T0, (uint32_t)off, 0));
+    if (off) {
+        emit_add_const(x, T0, base, off);
+        base = T0;
+    }
+    /* Match Tier 0's exclusive monitor even if LDXR and STXR use different tags. */
+    emit(x, enc_and_low(T0, base, DATA_TAG_SHIFT));
     if (bytes > 1) {
         emit(x, enc_and_low(T1, T0, (unsigned)__builtin_ctz(bytes)));
         emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
@@ -2007,6 +2010,27 @@ static uint32_t branch_operand(struct xlate *x, uint32_t insn)
     return (insn & ~31u) | T0;
 }
 
+/* Copy an X register operand to T0. Register 31 denotes XZR here. */
+static void emit_xreg_to_t0(struct xlate *x, unsigned reg)
+{
+    if (reg == 31)
+        emit(x, enc_movz(T0, 0, 0));
+    else if (is_stolen(reg))
+        emit_load_guest(x, T0, reg);
+    else
+        emit(x, enc_mov(T0, reg));
+}
+
+/* A changed FPCR needs Tier 0 to set the guest mode for the next entry. */
+static void emit_fpcr_write_check(struct xlate *x, unsigned src, uint64_t pc)
+{
+    emit_mov_const(x, T1, fpcr_write_mask());
+    emit(x, enc_and_reg(T1, src, T1));
+    emit(x, enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, fpcr)));
+    emit(x, enc_eor_lsr(T1, T1, T0, 0));
+    emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
+}
+
 static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     if ((insn & 0x7c000000) == 0x14000000) { /* B / BL */
@@ -2042,18 +2066,18 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     }
     /* Barriers (including SB): the whitelist has already been confirmed by Tier 0 */
     if ((insn & 0xfffff01f) == 0xd503301f) {
-        if (FIELD(insn, 7, 5) == 2) { /* CLREX: clear the guest's exclusive marker */
+        unsigned op2 = FIELD(insn, 7, 5);
+        if (op2 == 2) { /* CLREX: clear the guest's exclusive marker */
             emit(x, enc_str_w(31, CTX, offsetof(struct appine_cpu, excl_size)));
             x->st->insns_remapped++;
             return true;
         }
-        unsigned op2 = FIELD(insn, 7, 5);
-        /* DSB, ISB: if ic ivau recorded a page, first exit so that dbt_run invalidates it */
+        /* Complete the barrier before resuming at pc + 4 with any changed blocks retired. */
+        emit(x, insn);
         if (op2 == 4 || op2 == 6) {
             emit(x, enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, ivau_page)));
-            emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_INTERP, pc);
+            emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_CODE, pc + 4);
         }
-        emit(x, insn);
         x->st->insns_copied++;
         return true;
     }
@@ -2078,20 +2102,19 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         case SYSREG_FPCR:
         case SYSREG_TPIDR_EL0: {
             bool fpcr = sysreg == SYSREG_FPCR;
-            if (fpcr && !read)
-                return fallback(x, pc);
             size_t off = fpcr ? offsetof(struct appine_cpu, fpcr) : offsetof(struct appine_cpu, tpidr_el0);
             unsigned h = is_stolen(rt) ? T0 : rt;
-            if (read) {
-                if (rt != 31) {
-                    emit(x, enc_ldr_x(h, CTX, off));
-                    if (h == T0)
-                        emit_store_guest(x, T0, rt);
-                }
-            } else {
+            if (!read) {
                 if (h == T0)
                     emit_load_guest(x, T0, rt);
-                emit(x, enc_str_x(h, CTX, off));
+                if (fpcr)
+                    emit_fpcr_write_check(x, h, pc);
+                else
+                    emit(x, enc_str_x(h, CTX, off));
+            } else if (rt != 31) {
+                emit(x, enc_ldr_x(h, CTX, off));
+                if (h == T0)
+                    emit_store_guest(x, T0, rt);
             }
             x->st->insns_remapped++;
             return true;
@@ -2111,13 +2134,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     }
     /* DC ZVA: zero the whole block containing the address; a block is always within one page */
     if ((insn & 0xffffffe0) == 0xd50b7420) {
-        unsigned rt = insn & 31;
-        if (rt == 31)
-            emit(x, enc_movz(T0, 0, 0));
-        else if (is_stolen(rt))
-            emit_load_guest(x, T0, rt);
-        else
-            emit(x, enc_mov(T0, rt));
+        emit_xreg_to_t0(x, insn & 31);
         emit(x, enc_and_clear_low(T0, T0, 6));
         _Static_assert(DCZ_BLOCK == 64, "the block size of DC ZVA");
         emit_tlb_check(x, pc, DCZ_BLOCK, true, false, false, R_INTERP);
@@ -2138,21 +2155,19 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     uint32_t cmo = insn & 0xffffffe0;
     if (cmo == 0xd50b7a20 || cmo == 0xd50b7b20 || cmo == 0xd50b7e20 || cmo == 0xd50b7520 ||
         cmo == 0xd50b7c20 || cmo == 0xd50b7d20) {
-        unsigned rt = insn & 31;
-        if (rt == 31)
-            emit(x, enc_movz(T0, 0, 0));
-        else if (is_stolen(rt))
-            emit_load_guest(x, T0, rt);
-        else
-            emit(x, enc_mov(T0, rt));
+        emit_xreg_to_t0(x, insn & 31);
         emit_tlb_check(x, pc, 1, false, true, false, R_INTERP);
         if (cmo == 0xd50b7520) {
-            emit(x, enc_and_clear_low(T0, T0, APPINE_PAGE_SHIFT));
+            emit(x, enc_and_ror(T0, T0, DATA_TAG_SHIFT - APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT));
+            /* Zero means no pending page. Tier 0 returns this address explicitly. */
+            emit_to_stub(x, enc_cbz_x(T0), FIX_IMM19, R_INTERP, pc);
             emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, ivau_page)));
             emit(x, enc_eor_lsr(T2, T1, T0, 0));
-            emit(x, enc_cbz_x(T2) | 3u << 5); /* same page: skip the next two instructions */
+            uint32_t *same_page = here(x);
+            emit(x, enc_cbz_x(T2));
             emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
             emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, ivau_page)));
+            patch_local(x, same_page, here(x));
         }
         x->st->insns_memory++;
         return true;
@@ -2163,12 +2178,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         unsigned rn = FIELD(insn, 9, 5);
         if (reg_branch == 0xd65f0000 && rn == 30)
             emit_predicted_return(x);
-        if (rn == 31)
-            emit(x, enc_movz(T0, 0, 0));
-        else if (is_stolen(rn))
-            emit_load_guest(x, T0, rn);
-        else
-            emit(x, enc_mov(T0, rn));
+        emit_xreg_to_t0(x, rn);
         if (reg_branch == 0xd63f0000)
             emit_call(x, pc);
         emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
@@ -3392,10 +3402,9 @@ static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct sync
     return code;
 }
 
-/* Branches to the refill routine's failure path, all patched at the end: MMU_LEVELS for each of
- * the three fills, plus three more */
+/* Each of three page walks can fail at any level or on the extra permission check for writes. */
 struct refill_fails {
-    uint32_t *site[3 * MMU_LEVELS + 3];
+    uint32_t *site[3 * (MMU_LEVELS + 1) + 3];
     unsigned n;
 };
 
@@ -3428,7 +3437,9 @@ static void emit_fill(struct xlate *x, unsigned a, bool write, struct refill_fai
     }
     /* Leaf entry = host page address | permission bits; an unmapped one is 0, which the permission
      * check rules out as well */
-    emit_to_fail(x, f, enc_tbz(0, write ? 1 : 0));
+    emit_to_fail(x, f, enc_tbz(0, 0));
+    if (write) /* the write half also serves atomic and grouped reads */
+        emit_to_fail(x, f, enc_tbz(0, 1));
     _Static_assert(APPINE_PROT_READ == 1 && APPINE_PROT_WRITE == 2, "the positions of the permission bits");
     emit(x, enc_and_clear_low(1, a, APPINE_PAGE_SHIFT));
     emit(x, enc_and_clear_low(2, 0, APPINE_PAGE_SHIFT));
@@ -3479,9 +3490,11 @@ static uint32_t *emit_probe(struct xlate *x, unsigned a, unsigned addend, bool w
  * have the same addend; all pages in one host mapping do), and then the whole access is still
  * done on the host in one go: when both pages are in the TLB only the two entries are compared,
  * and a page that is not is filled first. A function whose stack frame crosses a page accesses it
- * this way on every call, so this cannot fall back to Tier 0. Fails if the address is tagged,
- * beyond the address space, unmapped or lacks the permission, or if the host addresses are not
- * contiguous.
+ * this way on every call, so this cannot fall back to Tier 0.
+ *
+ * The page-table indices ignore the top byte. Keep it in the TLB tag and subtract the full guest
+ * page base in the addend. A hit for this tag then yields an untagged host address. A different top
+ * byte at the same slot misses. Bits 55:48 must still be zero at both ends of the access.
  *
  * Borrows the x0–x4 slots in the cpu struct to save host x0–x4: while translated code runs these
  * slots do not hold the guest's values, and the exit routine writes them again.
@@ -3505,10 +3518,9 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     emit(x, enc_ldr_w(3, T1, 0));
     emit(x, enc_ubfx(3, 3, 0, REFILL_REASON_SHIFT));
     emit(x, enc_add_lsl(3, T0, 3, 0)); /* last byte */
-    /* The high bits of both ends must be 0: looking only at x3 would miss an address that wraps
-     * around after adding the byte count */
+    /* Check both ends: adding the byte count can carry into or out of the address space. */
     emit(x, enc_orr_reg(0, T0, 3));
-    emit(x, enc_ubfx(0, 0, APPINE_VA_BITS, 64 - APPINE_VA_BITS));
+    emit(x, enc_ubfx(0, 0, APPINE_VA_BITS, DATA_TAG_SHIFT - APPINE_VA_BITS));
     emit_to_fail(x, &f, enc_cbnz_x(0));
     emit(x, enc_eor_lsr(0, T0, 3, 0));
     emit(x, enc_ubfx(0, 0, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT));
@@ -4690,9 +4702,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             t->stats.exits_interp++;
             enum appine_exit r = appine_interp_step(c);
             /*
-             * The page recorded by ic ivau (at dsb or isb, or when Tier 0 executed an ic ivau on a
-             * page other than the recorded one): the translations are shared by this address
-             * space's threads, so invalidating once in place by content is enough, without
+             * When Tier 0 executes ic ivau on a second page, invalidate both pages. The
+             * translations are shared, so invalidating once in place by content is enough, without
              * exiting to the caller. The invalidated blocks' entries jump to the forwarding
              * stubs, and other threads see that the next time they enter them (on hardware they
              * may likewise still execute old instructions before a context synchronization).
@@ -4700,18 +4711,18 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
              * build, and exiting for each one would take the BKL and log the change before coming
              * back to invalidate
              */
-            if (r == APPINE_EXIT_CODE) {
+            if (r == APPINE_EXIT_CODE)
                 code_changed(t, c, c->fault_addr);
-                r = APPINE_EXIT_NONE;
-            }
-            if (r != APPINE_EXIT_NONE)
+            else if (r != APPINE_EXIT_NONE)
                 return r;
-            if (UNLIKELY(c->ivau_page)) {
-                code_changed(t, c, c->ivau_page);
-                c->ivau_page = 0;
-            }
-            break;
+            if (LIKELY(!c->ivau_page))
+                break;
         }
+        /* fallthrough */
+        case R_CODE:
+            code_changed(t, c, c->ivau_page);
+            c->ivau_page = 0;
+            break;
         case R_SVC:
             t->stats.exits_svc++;
             c->exit_info = 0;

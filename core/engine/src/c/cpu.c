@@ -119,10 +119,11 @@ void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access)
         uint32_t watched = UNLIKELY(cpu->nwatch) ? watched_page(cpu, vpn) : 0;
         unsigned idx = (unsigned)(vpn & (APPINE_TLB_ENTRIES - 1));
         cpu->tlb_used[idx / 64] |= UINT64_C(1) << (idx % 64);
+        uint32_t rw = APPINE_PROT_READ | APPINE_PROT_WRITE;
         cpu->tlb[idx] = (struct appine_tlb_entry){
             (prot & APPINE_PROT_READ) && !(watched & APPINE_WATCH_LOAD) ? ~vpn : TLB_INVALID,
             addend,
-            (prot & APPINE_PROT_WRITE) && !watched ? ~vpn : TLB_INVALID,
+            (prot & rw) == rw && !watched ? ~vpn : TLB_INVALID,
             addend,
         };
     }

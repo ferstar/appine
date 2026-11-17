@@ -213,6 +213,44 @@ fn fpcr_reads_use_the_guest_state_inside_translated_code() {
 }
 
 #[test]
+fn unchanged_fpcr_writes_stay_in_the_block() {
+    let mut g = Guest::new();
+    let fz16 = if appine_engine::guest_hwcap() & appine_engine::hwcap::FPHP != 0 {
+        1 << 19
+    } else {
+        0
+    };
+    let mode = (1 << 22) | fz16;
+    g.code(
+        CODE,
+        &[
+            0xd51b_4410, // msr fpcr, x16
+            0xd51b_4415, // msr fpcr, x21
+            0xd53b_4400, // mrs x0, fpcr
+            0xd51b_441f, // msr fpcr, xzr
+            SVC,
+        ],
+    );
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        for (initial, exits) in [(mode, 1), (mode | 1, 2)] {
+            let s = g.cpu.state_mut();
+            s.fpcr = initial;
+            s.nzcv = 0xa000_0000;
+            s.x[16] = mode | 1 | (1 << 19);
+            s.x[21] = mode;
+            let before = dbt.stats().exits_interp;
+            assert_eq!(g.run(&mut dbt), mode);
+            assert_eq!(g.cpu.state().fpcr, 0);
+            assert_eq!(g.cpu.state().nzcv, 0xa000_0000);
+            assert_eq!(dbt.stats().exits_interp - before, exits);
+        }
+    }
+}
+
+#[test]
 fn fpsr_reads_observe_exceptions_raised_inside_translated_code() {
     const IOC: u64 = 1 << 0; // Invalid operation
     const IXC: u64 = 1 << 4; // Inexact result
@@ -388,6 +426,52 @@ fn members_share_file_code_and_keep_jit_code_apart() {
     assert!(
         matches!(dbt.run(&mut g.cpu), Exit::Fault { addr, access: Access::Exec, .. } if addr == forged)
     );
+}
+
+#[test]
+fn barriers_resume_in_rewritten_code() {
+    for barrier in [0xd503_3b9f, 0xd503_3fdf] {
+        // dsb ish, isb
+        let Some(mut dbt) = Dbt::new() else {
+            return;
+        };
+        let mut g = Guest::new();
+        let next = CODE + 8;
+        g.code(CODE, &[0xd50b_7521, barrier, movz_x0(1), SVC]); // ic ivau, x1
+        assert_eq!(g.run_at(&mut dbt, next), 1);
+        g.code(next, &[movz_x0(2)]);
+        g.cpu.state_mut().x[1] = (0xab << 56) | CODE;
+        assert_eq!(g.run(&mut dbt), 2);
+        assert_eq!(g.cpu.state().ivau_page, 0);
+        assert_eq!(dbt.stats().exits_interp, 0);
+        assert!(dbt.stats().invalidated > 0);
+    }
+}
+
+#[test]
+fn ic_ivau_invalidates_page_zero() {
+    let Some(mut dbt) = Dbt::new() else { return };
+    let mut g = Guest::with_pages(4);
+    let page = &mut g.pages[3].0;
+    page[..4].copy_from_slice(&movz_x0(1).to_le_bytes());
+    page[4..8].copy_from_slice(&SVC.to_le_bytes());
+    unsafe {
+        g.mmu
+            .map(
+                0,
+                NonNull::new(page.as_mut_ptr()).unwrap(),
+                PAGE_SIZE,
+                prot::READ | prot::EXEC,
+            )
+            .unwrap();
+    }
+    g.code(CODE, &[0xd50b_7521, 0xd503_3b9f, 0xd61f_0040]); // ic ivau, x1; dsb ish; br x2
+    assert_eq!(g.run_at(&mut dbt, 0), 1);
+    for (tag, value) in [(0xab << 56, 2), (0, 3)] {
+        g.pages[3].0[..4].copy_from_slice(&movz_x0(value).to_le_bytes());
+        g.cpu.state_mut().x[1] = tag;
+        assert_eq!(g.run(&mut dbt), u64::from(value));
+    }
 }
 
 #[test]
@@ -667,15 +751,15 @@ fn cross_page_accesses_stay_in_translated_code() {
     };
     let mut g = Guest::with_data();
     g.code(CODE, &[LDR_X0_X2, STR_X3_X4, LDP_X5_X6_X7, SVC]);
-    // Adjacent host pages: the first time neither page is in the TLB and both are filled in; the
-    // second time only the entries are compared. Neither falls back to Tier 0
-    for round in 0..2u64 {
-        let value = 0x1122_3344_5566_7788 + round;
+    // Each new top byte refills both pages. Repeating it exercises the cached pair.
+    for (round, top_byte) in [0, 0, 0xab, 0xab, 0xff].into_iter().enumerate() {
+        let tag = top_byte << 56;
+        let value = 0x1122_3344_5566_7788 + round as u64;
         let s = g.cpu.state_mut();
-        s.x[2] = before_page(1, 4);
+        s.x[2] = tag | before_page(1, 4);
         s.x[3] = value;
-        s.x[4] = before_page(1, 2);
-        s.x[7] = before_page(1, 12);
+        s.x[4] = tag | before_page(1, 2);
+        s.x[7] = tag | before_page(1, 12);
         let expect = crossing(&g, 1, 4);
         g.run(&mut dbt);
         let s = g.cpu.state();
@@ -686,6 +770,67 @@ fn cross_page_accesses_stay_in_translated_code() {
         assert_eq!(s.x[5], g.data(0, 4096 - 12));
     }
     assert_eq!(dbt.stats().exits_interp, 0);
+}
+
+#[test]
+fn tagged_group_writeback_and_exclusive_aliases() {
+    let Some(mut dbt) = Dbt::new() else { return };
+    let mut g = Guest::with_data();
+    let f = CODE + 0x900;
+    g.code(
+        f,
+        &[
+            LDR_X0_X2,
+            0xf800_8443, // str x3, [x2], #8
+            0xc85f_7c85, // ldxr x5, [x4]
+            0xc806_7ce3, // stxr w6, x3, [x7]
+            SVC,
+        ],
+    );
+    let s = g.cpu.state_mut();
+    s.x[2] = (0xab << 56) | DATA;
+    s.x[3] = 12345;
+    s.x[4] = (0xcd << 56) | (DATA + 8);
+    s.x[7] = DATA + 8;
+    let pair = (g.data(0, 0), g.data(0, 8));
+    g.run_at(&mut dbt, f);
+    let s = g.cpu.state();
+    assert_eq!((s.x[0], s.x[5]), pair);
+    assert_eq!(s.x[2], (0xab << 56) | (DATA + 8));
+    assert_eq!(s.x[6], 0);
+    assert_eq!((g.data(0, 0), g.data(0, 8)), (12345, 12345));
+    assert!(dbt.stats().insns_grouped > 0);
+    assert_eq!(dbt.stats().exits_interp, 0);
+}
+
+#[test]
+fn a_write_only_mapping_cannot_authorize_a_grouped_read() {
+    let Some(mut dbt) = Dbt::new() else { return };
+    let mut g = Guest::with_data();
+    // The raw MMU can represent write-only pages even though Linux adds read permission.
+    g.mmu.protect(DATA, PAGE_SIZE, prot::WRITE).unwrap();
+    let f = CODE + 0xb00;
+    g.code(CODE, &[STR_X3_X4, SVC]);
+    g.code(f, &[LDR_X0_X2, 0xf900_0443, SVC]); // ldr x0, [x2]; str x3, [x2, #8]
+    for tag in [0xab << 56, 0] {
+        let s = g.cpu.state_mut();
+        s.x[2] = tag | DATA;
+        s.x[4] = s.x[2];
+        s.x[3] = 99;
+        g.run(&mut dbt);
+        assert_eq!(g.data(0, 0), 99);
+        let before = g.data(0, 8);
+        assert_eq!(
+            go(&mut g, &mut dbt, f),
+            Exit::Fault {
+                addr: DATA,
+                access: Access::Read,
+                kind: FaultKind::Page
+            }
+        );
+        assert_eq!(g.cpu.state().pc, f);
+        assert_eq!(g.data(0, 8), before);
+    }
 }
 
 #[test]
@@ -714,6 +859,13 @@ fn cross_page_faults_are_precise() {
         (STR_X3_X4, 4, before_page(5, 4), DATA + 5 * PAGE_SIZE),
         (LDR_X0_X2, 2, before_page(6, 4), DATA + 6 * PAGE_SIZE),
         (LDR_X0_X2, 2, u64::MAX - 3, 0),
+        (LDR_X0_X2, 2, (0xab01u64 << 48) | DATA, (1 << 48) | DATA),
+        (
+            STR_X3_X4,
+            4,
+            (0xab << 56) | before_page(5, 4),
+            DATA + 5 * PAGE_SIZE,
+        ),
     ];
     for (insn, reg, addr, fault) in cases {
         g.code(CODE, &[insn, SVC]);
@@ -891,7 +1043,7 @@ fn watchpoints_send_only_watched_pages_to_tier0() {
     // has already executed
     let old = g.data(4, 0x100);
     let s = g.cpu.state_mut();
-    (s.x[0], s.x[4]) = (0, watched + 4);
+    (s.x[0], s.x[4]) = (0, (0xab << 56) | (watched + 4));
     let hit = Exit::Fault {
         addr: watched + 4,
         access: Access::Write,

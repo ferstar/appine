@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: Tier 1 reads of the live FPSR)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: FPCR writes, code invalidation at barriers and tagged data TLB entries)
 
 ## Responsibilities
 
@@ -193,7 +193,7 @@ Tier 1, only CPUID advertised).
   accepted ends the block with an exit to Tier 0.
 - Handling:
   - register-only ALU, FP and NEON instructions and barriers are copied verbatim (operands renamed
-    when stolen); DSB and ISB are preceded by a check of `ivau_page`;
+    when stolen); DSB and ISB check `ivau_page` after executing the barrier;
   - ADR/ADRP and literal loads become constants based on the guest PC; registers set by ADR/ADRP
     (plus immediate adds) are tracked as known constants within the block, cleared conservatively;
   - loads and stores get the inline TLB path (section 8); PRFM emits nothing;
@@ -202,10 +202,11 @@ Tier 1, only CPUID advertised).
   - `mrs fpcr` and `mrs`/`msr tpidr_el0` use the guest CPU state. `mrs dczid_el0` becomes the
     constant 4. `mrs fpsr` reads the host FPSR, including flags raised earlier in the block.
     NZCV, CNTVCT, CNTVCTSS and CNTFRQ accesses also run natively after the Tier 0 whitelist
-    check. FPCR and FPSR writes and other system registers go to Tier 0;
+    check. An FPCR write stays in the block if its masked value equals the saved guest FPCR.
+    Changed FPCR writes, FPSR writes and other system registers go to Tier 0;
   - HINT space, including PAC and BTI hints, emits nothing; authenticated branches go to Tier 0;
   - DC CVAC/CVAU/CIVAC/CVAP/CVADP and `ic ivau` only check read access; `ic ivau` records its page
-    in `ivau_page` (a second, different page exits to Tier 0); `dc zva` zeroes via the translated
+    in `ivau_page` (page zero or a second, different page exits to Tier 0); `dc zva` zeroes via the translated
     address; CLREX clears `excl_size`.
 - Exit stubs carry the guest pc, the patch site and a packed reason word back to the dispatcher.
 
@@ -238,9 +239,12 @@ Tier 1, only CPUID advertised).
 - A miss branches to a per-access 5-word refill stub (`adr`, branch to the routine, an info word
   with size, failure reason and resume offset, and the guest pc), then to a shared refill routine in
   the code cache. The routine borrows the CPU state's X0–X4 slots as scratch, fails whenever any
-  watchpoint is set or the address (or its last byte) is beyond 48 bits, walks the page table with
-  plain loads, fills both TLB halves and `tlb_used`, and resumes. A cross-page access succeeds only
-  if both pages are permitted and have the same addend (contiguous host memory).
+  watchpoint is set or either endpoint exceeds 48 bits after ignoring its top byte. The page-table
+  walk uses plain loads and low address bits. The TLB tag and addend use the full guest page base,
+  so another access with the same top byte can hit inline. Atomics untag their effective address
+  before lookup. Filling a write entry requires read and write permission because grouped accesses
+  and atomics can also read. The refill records the slot in `tlb_used` and resumes. A cross-page
+  access succeeds only if both pages are permitted and have the same addend (contiguous host memory).
 - On failure the stub exits to the dispatcher and Tier 0 executes the instruction. Nothing guest
   visible has happened before the exit, so exceptions are precise.
 - Grouped checks: several accesses in a block with the same base share one check. The leader checks
@@ -288,7 +292,8 @@ Tier 1, only CPUID advertised).
   lock, revive parked blocks of that page if any, otherwise translate and install, then enter.
 - Exit reasons: chain (patch the link point), lookup (fill the jump cache), ungroup (record the group
   failure, then run Tier 0), interp (run one instruction in Tier 0, then invalidate any recorded
-  `ivau_page` in place), svc (clear the monitor, return `Svc`), kick (loop). Tier 0's own exits are
+  `ivau_page` in place), code (invalidate the pending page after a translated DSB/ISB, then look up
+  the next PC), svc (clear the monitor, return `Svc`), kick (loop). Tier 0's own exits are
   returned to the kernel, except `ic ivau`, which is absorbed in place.
 - A host fault inside the run marks the instance poisoned and clears the template arena.
 
@@ -367,10 +372,10 @@ Tier 1, only CPUID advertised).
   the caller's memory (no tag filter).
 - A small-range invalidation unlinks dead block records from each page bucket it visits. Parked
   blocks stay in the bucket for revival. Compaction reclaims dead records in the block log.
-- `ic ivau` in Tier 1 records the page (Tier 0 handles it if a different page is already
-  recorded); after the next `dsb`/`isb` exit the dispatcher invalidates that page in place
-  (without the kernel's log). An `ivau_page` left at another exit is collected by the kernel.
-  Page 0 doubles as "none" (see bugs).
+- `ic ivau` in Tier 1 records the untagged page. Tier 0 handles page zero (the pending-page
+  sentinel) or a second, different page and returns its address explicitly to the dispatcher.
+  After a translated `dsb`/`isb`, a dedicated exit invalidates any pending page in place before
+  resuming at the following PC. The kernel collects a pending page left at another exit.
 - `retire_outside` (first join of a group) and `ungroup` also retire blocks.
 
 ### CPU features and ID registers
@@ -453,8 +458,9 @@ Tier 1, only CPUID advertised).
   Hardware breakpoints are checked only in Tier 0.
 - Code memory is reclaimed only by a full flush, which happens only after every other thread has
   left translated code.
-- Translated code never writes FPCR: `msr fpcr`/`fpsr` always run in Tier 0 (which updates the CPU
-  state), so Tier 1's exit does not save FPCR. The host FPSR is left holding the guest's value.
+- Guest FPCR stays constant until translated code exits. A changed masked FPCR write takes an
+  interpreter exit, so Tier 1's exit does not save FPCR. Tier 0 handles all FPSR writes. The host FPSR is
+  left holding the guest's value.
 - `Kicker::kick` is the only operation allowed from other threads; it is safe only while the `Cpu`
   is alive. The kernel guarantees this by kicking only under the BKL, only tasks it still lists or
   registered users of an address space, and by removing a thread from both before its `Cpu` is
@@ -472,9 +478,10 @@ Tier 1, only CPUID advertised).
 
 ## Confirmed bugs / technical debt
 
-- **`ic ivau` on guest page 0 is lost:** page 0 doubles as "no page recorded" in Tier 1, and the
-  kernel's invalidation also drops page 0, so rewritten code mapped at address 0 (possible through
-  `MAP_FIXED`) keeps running its stale translation.
+- **The kernel drops page-zero invalidation from pure Tier 0:** its code-change path filters out
+  zero even for an explicit `InvalidateCode` exit. A single-stepped write and cache flush on
+  page zero can therefore leave stale code when execution returns to Tier 1. Tier 1's own
+  dispatcher handles page zero directly.
 - **Lock-free conditional-branch relinking races a new thread:** the `nthreads == 1` check is not
   serialized with `attach`, and the kernel attaches new threads and code-group members without
   stopping running ones, so a conditional branch can be rewritten while another thread executes it
@@ -486,8 +493,6 @@ Tier 1, only CPUID advertised).
 
 ## Open questions
 
-- Do workloads using top-byte-tagged data pointers fall back often enough to justify handling
-  those addresses in the Tier 1 refill routine?
 - Is it intended that FAULT, KICK and signal exits leave the exclusive monitor set (architecturally
   an exception return clears it)? The compare-and-swap semantics make this mostly harmless.
 - Should FPCR written by sigreturn or ptrace be masked like `msr fpcr` in Tier 0?

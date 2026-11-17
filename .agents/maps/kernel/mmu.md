@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/mmu.md` for the paired decision history (decisions from before the split are D1, D13, D16, D39 and the page-table half of D4 in `.agents/decisions/kernel/mm.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: data TLB tags and write-entry permissions)
 
 ## Responsibilities
 
@@ -98,9 +100,12 @@ Tier 1 translator with its inline TLB fast path and refill (`engine`).
 - Tier 0 looks up the data TLB in C (data addresses untagged first) and calls `appine_tlb_fill` on
   a miss. The fill fails if the entry is absent or lacks the needed bit. A data fill sets both
   halves at once, leaving the read half invalid on pages with a load watchpoint and the write half
-  invalid on pages with any watchpoint; it records the slot in `tlb_used` and stores `addend =
+  invalid on pages with any watchpoint or without read permission (Tier 1 can use a write entry
+  for a group that also reads). It records the slot in `tlb_used` and stores `addend =
   host page − guest page base`. Exec fills only the ITLB. Tier 1's refill defers to Tier 0
-  whenever any watchpoint is set.
+  whenever any watchpoint is set. Its data entries can include the guest pointer's top byte in
+  both the inverted page number and the page base used for the addend. Tier 0's untagged lookup
+  then misses and refills the same slot.
 - Cross-page accesses of up to 16 bytes look up both pages before copying anything; a failing
   second page reports the start of that page as the fault address.
 - A TLB flush clears only the slots marked in `tlb_used`, plus the whole ITLB; CPU states kept

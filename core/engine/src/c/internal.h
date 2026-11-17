@@ -135,9 +135,11 @@ uintptr_t appine_mmu_lookup_pte(const struct appine_mmu *mmu, uint64_t gva);
 void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access);
 
 /* Linux enables TBI for EL0: data accesses ignore the top 8 bits of the address */
+#define DATA_TAG_SHIFT 56
+
 static inline uint64_t untag(uint64_t va)
 {
-    return va & UINT64_C(0x00ffffffffffffff);
+    return va & ((UINT64_C(1) << DATA_TAG_SHIFT) - 1);
 }
 
 /* Compute the candidate address alongside the tag check so the host can load tag and addend
@@ -281,6 +283,13 @@ bool appine_has(uint64_t hwcap);
 
 /* Same, for AT_HWCAP2 bits */
 bool appine_has2(uint64_t hwcap2);
+
+/* FPCR bits writable by MSR: AHP, DN, FZ, RMode and, with FP16, FZ16. */
+static inline uint64_t fpcr_write_mask(void)
+{
+    return UINT64_C(0x07c00000) | (appine_has(APPINE_HWCAP_FPHP) ? UINT64_C(1) << 19 : 0);
+}
+
 /* Make the host thread's PSTATE.DIT follow the guest's (cpu.c) */
 void appine_sync_dit(struct appine_cpu *cpu);
 
