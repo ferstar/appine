@@ -1,11 +1,9 @@
 //! I/O multiplexing (the kernel/poll map): ppoll, pselect6 and epoll, plus eventfd.
 //!
-//! ppoll and pselect6 share [`wait_ready`], and epoll_pwait scans its interests the same way
-//! ([`Epoll::ready`], [`Waits`]): the readiness of in-process objects (pipes, PTYs, eventfds...)
-//! is checked first, and each host fd (host sockets, host stdio) with a non-waiting host poll;
-//! when nothing is ready, the host fds are waited on together with the thread's own wake event
-//! (the unified wait mechanism in the kernel/process map). epoll is implemented in-process and is
-//! level-triggered by default.
+//! ppoll and pselect6 scan files with [`wait_ready`]. epoll_pwait scans its interests with
+//! [`Epoll::ready`], batching level-triggered host fds in a zero-timeout poll. In-process
+//! objects (pipes, PTYs, eventfds...) supply their readiness directly. When nothing is ready,
+//! [`Waits`] waits on the host fds together with the thread's own wake event (kernel/process).
 //!
 //! `EPOLLET`: every time Linux wakes a file's wait queue (data arrives, a new connection, an
 //! eventfd is written, a timerfd expires...), edge-triggered interests report once more, even
@@ -66,6 +64,9 @@ const POLLHUP: i16 = 0x010;
 const POLLNVAL: i16 = 0x020;
 const POLLRDNORM: i16 = 0x040;
 const POLLWRNORM: i16 = 0x100;
+
+/// Events a poll reports regardless of the requested mask.
+const ALWAYS_REPORTED: i16 = POLLERR | POLLHUP | POLLNVAL;
 
 /// Readiness bits of the write direction; all others count as the read direction.
 const WRITE_BITS: u32 = (POLLOUT | POLLWRNORM) as u32 | 0x200; // POLLWRBAND
@@ -397,6 +398,41 @@ pub(crate) struct Epoll {
     waiters: Vec<Arc<appine_hal::Event>>,
 }
 
+/// Level-triggered host fds in cursor order and the events already known inside the guest kernel.
+#[derive(Default)]
+struct HostPollBatch {
+    fds: Vec<(i32, i16, i16)>,
+    interests: Vec<(usize, i16)>,
+}
+
+impl HostPollBatch {
+    fn push(&mut self, index: usize, fd: i32, wanted: i16, known: i16) {
+        self.fds.push((fd, wanted, 0));
+        self.interests.push((index, known));
+    }
+
+    fn report(&mut self, out: &mut Vec<(usize, u32)>) {
+        if self.fds.is_empty() {
+            return;
+        }
+        if appine_hal::poll(&mut self.fds, Some(Duration::ZERO)).is_err() {
+            // Interests can share a host fd. If the batch exceeds the host's RLIMIT_NOFILE
+            // (or the poll was interrupted), one failed call must not hide other ready fds.
+            for fd in &mut self.fds {
+                let _ = appine_hal::poll(std::slice::from_mut(fd), Some(Duration::ZERO));
+            }
+        }
+        for ((index, known), (_, wanted, revents)) in
+            self.interests.drain(..).zip(self.fds.drain(..))
+        {
+            let ev = (known | revents) & (wanted | ALWAYS_REPORTED);
+            if ev != 0 {
+                out.push((index, ev as u16 as u32));
+            }
+        }
+    }
+}
+
 impl Epoll {
     /// Removes interests whose file has been closed.
     fn prune(&mut self) {
@@ -423,6 +459,7 @@ impl Epoll {
     /// being reported).
     fn ready(&self, depth: u32, max: usize) -> Vec<(usize, u32)> {
         let mut out = Vec::new();
+        let mut batch = HostPollBatch::default();
         let n = self.interests.len();
         let start = if n == 0 { 0 } else { self.cursor % n };
         for i in (start..n).chain(0..start) {
@@ -438,7 +475,24 @@ impl Epoll {
             if claimed(int, &f, self as *const Epoll as usize) {
                 continue;
             }
-            let ev = poll_now(&f, int.events as i16, depth) as u16 as u32;
+            let wanted = int.events as i16;
+            let ev = if max > 1
+                && int.events & (EPOLLET | EPOLLEXCLUSIVE) == 0
+                && f.host_edges.is_none()
+            {
+                let (known, host) = readiness(&f, depth);
+                if let Some(fd) = host {
+                    batch.push(i, fd, wanted, known);
+                    // Even if every fd is ready, keep this scan within the caller's output limit.
+                    if batch.fds.len() == max - out.len() {
+                        batch.report(&mut out);
+                    }
+                    continue;
+                }
+                known & (wanted | ALWAYS_REPORTED)
+            } else {
+                poll_now(&f, wanted, depth)
+            } as u16 as u32;
             if int.events & EPOLLET != 0 {
                 // The program used up the data in some direction, or another event arrived in
                 // that direction: the events last reported in this direction are void, and are
@@ -463,9 +517,12 @@ impl Epoll {
                 }
             }
             if ev != 0 {
+                // Report preceding host fds first. Idle guest objects leave the batch open.
+                batch.report(&mut out);
                 out.push((i, ev));
             }
         }
+        batch.report(&mut out);
         out
     }
 
@@ -1337,7 +1394,7 @@ fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
             }
         }
     }
-    ev & (wanted | POLLERR | POLLHUP | POLLNVAL)
+    ev & (wanted | ALWAYS_REPORTED)
 }
 
 /// The current readiness of an open file: (events already known, host fd to ask).
@@ -1740,6 +1797,52 @@ pub(super) fn eventfd_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_triggered_host_fds_share_the_cursor_with_guest_interests() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let host = OpenFile::new(FileKind::Host(socket.as_raw_fd()), oflags::O_RDWR);
+        let event = OpenFile::new(
+            FileKind::EventFd(Rc::new(RefCell::new(EventFd {
+                count: 1,
+                semaphore: false,
+                writes: 1,
+                reads: 0,
+            }))),
+            oflags::O_RDWR,
+        );
+        let mut ep = Epoll::default();
+        let read = POLLIN as u32;
+        let write = POLLOUT as u32;
+        // Duplicated guest descriptors can watch the same host socket with different masks.
+        for (file, events) in [
+            (&host, read),
+            (&host, write | EPOLLONESHOT),
+            (&event, read | EPOLLET),
+            (&host, write),
+            (&host, write),
+        ] {
+            let fd = ep.interests.len() as i32 + 3;
+            ep.interests.push(Interest::new(fd, file, events, 0));
+        }
+        for expected in [[(1, write), (2, read)], [(3, write), (4, write)]] {
+            let ready = ep.ready(0, 2);
+            assert_eq!(ready, expected);
+            for (i, ev) in ready {
+                ep.reported(i, ev);
+            }
+        }
+        assert_eq!(ep.ready(0, 4), [(3, write), (4, write)]);
+        drop(peer);
+        let hup = POLLHUP as u32;
+        assert_eq!(
+            ep.ready(0, 4),
+            [(0, read | hup), (3, write | hup), (4, write | hup)]
+        );
+    }
 
     #[test]
     fn edge_triggered_interests_fire_on_new_readiness() {

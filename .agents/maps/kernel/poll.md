@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/poll.md` for the paired decision history (timerfd's decisions from before it moved here are D23 and the timerfd halves of D16 and D41 in `.agents/decisions/kernel/vfs.md`).
 >
-> Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
->
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Verified: 2026-11-17 (full mapping: 3 research concerns, 14 claims checked by 2 independent verifiers)
 
 ## Responsibilities
 
@@ -36,6 +34,7 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   `seen`/`drained`/`arrivals` snapshots for edge triggering, nested-generation share.
 - `Epoll` — interests (no ready list), round-robin `cursor`, `base` generation, sticky
   `edge_watched`, waiters.
+- `HostPollBatch` — host poll slots paired with interest indices and guest-known bits for one scan.
 - `HostEdges` (on `OpenFile`) — a private edge-triggered host epoll on one host fd, accumulating
   read/write arrivals.
 - `OpenFile` fields used here: `drained` (per direction), `reads`, `exclusive_claim`, `owner`,
@@ -46,10 +45,10 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   (`Kernel::fasync`).
 - `EventFd` (in `fd.rs`) — counter, semaphore flag, `writes`/`reads` generations.
 - `TimerFd` (in `fd.rs`) — clock, the next expiration (`itimer::Expiry` on the clock's base; None
-  when not armed), interval, expirations not yet read, `fired` (every expiration, the `EPOLLET`
-  generation), the `TFD_TIMER_CANCEL_ON_SET` state (the wall-clock jump count when set and whether
-  a jump is pending) and the last settime flags (fdinfo); `update` adds the expirations that have
-  passed, lazily, whenever it is read, polled or asked.
+  when not armed), interval, unread expirations, `fired` (the edge generation, incremented once
+  per due update and once per newly observed cancellation), the `TFD_TIMER_CANCEL_ON_SET` state
+  (the wall-clock jump count when set and whether a jump is pending) and the last settime flags
+  (fdinfo). `update` adds elapsed expirations when the timer is read, polled or queried.
 
 ## Public entry points
 
@@ -68,8 +67,10 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ### The readiness contract
 
-- `readiness(file)` is one `match` over `FileKind` returning known events and, for host-backed
-  files (host stdio, inet sockets other than ICMP), the host fd: pipes (a write end `POLLOUT` with
+- `readiness(file)` is one `match` over `FileKind` returning known events and an optional host fd.
+  Host stdio and ordinary inet sockets supply an fd. Queued DNS answers on an untapped UDP socket
+  supply guest bits alone. A tapped UDP socket can supply both guest bits and its host fd. Other
+  readiness sources include pipes (a write end `POLLOUT` with
   `PIPE_BUF` free, plus `POLLERR` without readers, as `pipe_poll`) and eventfd inline; timerfd
   (expirations), inotify, signalfd, pidfd (exited), epoll (nested, up to 4 levels), PTYs
   (`tty::readiness`), sockets (`net::readiness` → unix, netlink, inet, raw ICMP), message queues,
@@ -126,9 +127,10 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   files, directories, synthetic files without a Linux poll operation (`pseudo::pollable`),
   `/dev/null|zero|full`, loop devices and `/dev/loop-control` — `EPERM`; epfd not an epoll, or the target itself, `EINVAL`;
   `EPOLLEXCLUSIVE` only on ADD, not on epolls, and not with ONESHOT/RDHUP/PRI (`EINVAL`); on ADD
-  loops or depth over 4 `ELOOP`. Interests are keyed by (fd, open file);
+  a cycle or excessive depth in the target's subtree gives `ELOOP`. Interests are keyed by (fd, open file);
   ADD `EEXIST`, MOD replaces (re-arms; MOD of an exclusive interest `EINVAL`), DEL, missing
-  `ENOENT`. Every call prunes dead interests and wakes the epoll's waiters.
+  `ENOENT`. After initial validation, ctl prunes dead interests and signals waiters before
+  checking whether the requested entry exists.
 - Interests hold weak references: they live while any fd or fork copy holds the open file and are
   skipped once it is gone (removed at the next `epoll_ctl`). Fork shares the epoll.
 - `epoll_pwait`/`epoll_pwait2`: `maxevents` ≤ 0 or too large `EINVAL`; an events buffer reaching
@@ -137,6 +139,12 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   no ready list); return if anything is ready or past the deadline; interrupted → `EINTR` (never
   restarted; the temporary mask is kept); otherwise wait. Reports are marked (ONESHOT disarmed,
   exclusive claim taken) before the events are copied out.
+- With `maxevents > 1`, a scan collects level-triggered host fds without `EPOLLEXCLUSIVE` or
+  file-level `HostEdges` in a zero-timeout poll. Each interest keeps its own mask and guest-known
+  bits, including when registrations share a host fd. Pending entries are reported in cursor
+  order when they could fill the remaining output slots, before another event is appended, or
+  at scan end. A failed batch retries its fds individually. Single-event probes, including the
+  readiness check on an inner epoll, use the scalar path.
 - Edge triggering: each interest compares the file's per-direction drain counts and arrival
   generations with its snapshots; a direction that was drained or received new data clears its
   reported bits; an interest fires only for bits not yet reported. Host fds with edge-triggered
@@ -148,14 +156,16 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   read, readv, accept, recv* and write, writev, send*, sendfile, splice, tee when they return
   `EAGAIN`, and for short read, write, recvfrom and sendto (pread/pwrite and their vector forms
   never count; tee's write-side entry reads the length argument instead of `fd_out`).
-- Nested epolls: an inner epoll's generation is its `base` plus the shares of its armed
-  interests, read side only, growing monotonically; edge-watching an inner epoll propagates host
+- Nested epolls: an inner epoll's generation is its `base` plus every interest's share. Only live,
+  armed entries refresh their shares, and removal transfers the previous share to `base`. The
+  generation counts on the read side only. Edge-watching an inner epoll propagates host
   edge watching inward. An epoll fd reports `POLLIN|POLLRDNORM` (6.1's ep_eventpoll_poll).
 - `EPOLLEXCLUSIVE`: an edge is the file's drain and arrival counts; each edge is claimed by one
   epoll (level-triggered exclusive interests keep reporting to the claiming epoll). Exclusive
-  waiters do not wait on the file: they queue on its `ExGate`, and the timer thread (subscribed to
+  waiters queue on the file's `ExGate`, and the timer thread (subscribed to
   every kernel change while gates exist, to the host edges, and woken at the next expiry of a gated
-  timerfd) wakes only the first waiter when a new edge appears; woken waiters requeue at the back.
+  timerfd) wakes only the first waiter when a new edge appears. Woken waiters requeue at the back.
+  A host fd for which edge tracking could not be installed uses the direct wait path.
 
 ### eventfd
 
@@ -164,6 +174,8 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   8 bytes or `u64::MAX` `EINVAL`; blocks or `EAGAIN` until the sum fits below `u64::MAX`; writing 0
   still counts as an arrival. Readiness: `POLLIN` when nonzero, `POLLOUT` below `u64::MAX - 1`
   (no `RDNORM`/`WRNORM`, as eventfd_poll); never `POLLERR`. Generations `[writes, reads]`.
+- An AIO completion with `IOCB_FLAG_RESFD` increments the counter up to `u64::MAX - 1`, advances
+  the write generation even at that cap, and wakes the object.
 
 ### timerfd
 
@@ -181,8 +193,8 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   wakes the timer's object, so waits using the old deadline compute it again.
 - `TFD_TIMER_CANCEL_ON_SET` applies only to an absolute realtime timer: it records the wall-clock
   jump count; after a jump (the host's clock set, or the device resuming) the timer counts one
-  expiration and the next read is `ECANCELED` (the count dropped, the timer still armed). The
-  guest cannot set the clock itself.
+  expiration. The next read drops unread expirations, preserves any future deadline and returns
+  `ECANCELED`. The guest cannot set the clock itself.
 - read: a buffer under 8 bytes is `EINVAL`; returns the expirations passed (taking them), or waits
   on the timer's object with its deadline as the timeout (`EAGAIN` when nonblocking,
   `ERESTARTSYS` on a signal). A periodic timer advances by whole intervals, counting each.
@@ -214,7 +226,8 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 - The syscall dispatcher (also the drain hook after I/O syscalls; timerfd reads through
   `kernel/files`' read path); `kernel/procfs` (timerfd fdinfo); `kernel/aio` (`poll_once`,
   `wait_aio_polls`, `watch_aio_poll`, masks, resfd eventfds); the timer thread (`check_exclusive`,
-  `check_fasync`); fcntl/ioctl (`register_fasync`); pipe writes (`arrived`); fdinfo and kcmp.
+  `check_fasync`); fcntl/ioctl (`register_fasync`); pipe writes (`arrived`); lease breaks
+  (`send_to_owner`); fdinfo and kcmp.
 
 ### Outbound
 
@@ -227,7 +240,9 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ## Invariants and gotchas
 
-- Readiness must be cheap and side-effect free except for edge snapshots kept in `Cell`s.
+- Readiness checks can update timerfd expirations, rebase the shared syslog cursor after records
+  were overwritten, and dispatch host errors on tapped UDP sockets. A scan must preserve any
+  guest-known readiness bits returned alongside a host fd.
 - Generation counters only grow; anything that changes readiness must bump a counter and wake its
   object, or edge-triggered waiters miss events.
 - Without `HostEdges` (host regular files) only drains re-arm host-fd edges.
@@ -246,13 +261,16 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 - **Pipe `POLLOUT` counts bytes, not buffers:** a pipe write end is reported writable once
   `PIPE_BUF` bytes are free, while Linux needs a free page buffer, so after partial reads leave
   buffers partly used, poll and epoll report a pipe writable earlier than Linux.
-- **Per-scan cost:** every scan holds the BKL and makes one zero-timeout host poll per host fd (and
-  computes readiness twice per file); epoll has no ready list.
+- **Per-scan cost:** epoll still scans under the BKL without a ready list. ppoll, pselect6 and
+  epoll's scalar probes issue a separate poll per host-backed item. Building a blocking wait
+  recomputes readiness.
+- **Nesting limit can be bypassed by extending a leaf:** ADD checks the target's descendants
+  without counting the receiving epoll's ancestors. A chain built from the top down can extend
+  past the depth the readiness scan follows.
 
 ## Open questions
 
-- Is the cost of one host poll per host fd per scan, under the BKL, accepted, or should scans batch
-  host fds?
+- Would batching the initial ppoll and pselect6 scans repay its cost on their workloads?
 - Should exclusive waiters keep Linux's stable queue order instead of rotating?
 
 ## To verify
