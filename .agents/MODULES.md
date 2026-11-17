@@ -60,6 +60,7 @@ Registry of module IDs used by `.agents/maps/`, `.agents/decisions/` and `MODULE
 - `harness` — development orchestration and standalone test tools: `tests/bench/`, `tests/survey/`, `tests/crash/`, `scripts/dev`, `scripts/dev.Dockerfile`, `scripts/build-ltp`, `scripts/ltp`, `scripts/survey`, `.github/workflows/`; benchmarks, LTP, workload surveys, power-loss tests, development container and CI. CLI/integration tests are harness/cli's and differential/upstream suites harness/diff's.
 - `harness/cli` — host CLI and cargo integration: `hosts/cli/`, `tests/guest/`; appine-run options, terminal setup and reporting, guest programs and guest_programs/rootfs_programs/bench_programs integration tests. Kernel run/boot/console semantics remain kernel/boot/kernel/tty's; benchmark workloads remain harness's.
 - `harness/diff` — differential and upstream syscall suites: `scripts/difftest`, `tests/diff/`, `scripts/build-starnix-tests`, `tests/starnix/`, `scripts/build-gvisor-tests`, `tests/gvisor/`; native comparison, stores/lanes/locking, case inputs and skips, suite builders and gtest runner. Prebuilt appine-run is harness/cli's; development container, LTP and CI are harness's.
+- `website` — the static website: `website/`; minimal homepage, document styling and English privacy-policy page. Android permission enforcement stays with the Android modules.
 
 ## Cross-cutting concerns
 

@@ -223,6 +223,7 @@
     <!-- Settings: about and licenses -->
     <string name="settings_group_about">정보</string>
     <string name="settings_project">프로젝트 웹사이트</string>
+    <string name="settings_privacy_policy">개인정보 처리방침</string>
     <string name="settings_version">버전</string>
 
     <string name="settings_licenses">오픈소스 라이선스</string>

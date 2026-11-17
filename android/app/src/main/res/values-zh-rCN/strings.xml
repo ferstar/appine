@@ -223,6 +223,7 @@
     <!-- Settings: about and licenses -->
     <string name="settings_group_about">关于</string>
     <string name="settings_project">项目地址</string>
+    <string name="settings_privacy_policy">隐私政策</string>
     <string name="settings_version">版本号</string>
 
     <string name="settings_licenses">开源许可</string>

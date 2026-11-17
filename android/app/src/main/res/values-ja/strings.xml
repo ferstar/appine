@@ -223,6 +223,7 @@
     <!-- Settings: about and licenses -->
     <string name="settings_group_about">このアプリについて</string>
     <string name="settings_project">プロジェクトのウェブサイト</string>
+    <string name="settings_privacy_policy">プライバシーポリシー</string>
     <string name="settings_version">バージョン</string>
 
     <string name="settings_licenses">オープンソースライセンス</string>

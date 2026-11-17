@@ -208,6 +208,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         licenses.setSummary(R.string.licenses_summary)
         val telegram = link(R.string.settings_telegram, TELEGRAM_URL)
         val project = link(R.string.settings_project, PROJECT_URL)
+        val privacyPolicy = link(R.string.settings_privacy_policy, PRIVACY_POLICY_URL)
         val version = action(R.string.settings_version) { onVersion() }.apply {
             summary = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
         }
@@ -216,7 +217,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         group(R.string.settings_group_android, notifications, batteryUsage, runPolicy, privacy, fileAccess)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, tabList, volumeKeys)
         group(R.string.settings_group_debug, tier, export)
-        group(R.string.settings_group_about, telegram, project, licenses, version)
+        group(R.string.settings_group_about, telegram, project, privacyPolicy, licenses, version)
         render()
     }
 
@@ -677,6 +678,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     companion object {
         private const val TELEGRAM_URL = "https://t.me/appinesh"
         private const val PROJECT_URL = "https://github.com/mthli/appine"
+        private const val PRIVACY_POLICY_URL = "https://appine.sh/privacy"
         private const val CHOICE_DIALOG = "settings.choice"
 
         /** The cursor shapes offered, in order, and their names. */
