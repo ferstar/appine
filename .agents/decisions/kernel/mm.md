@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D17 were seeded by hand from the retired design
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D17 were seeded by hand from the retired design
 > doc §5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -60,7 +60,7 @@
 - **Why**: The retired design doc's §5 was the only current-state description of guest memory and had drifted from the code, and by 2026-11-11 the map (69.6 KB) could not be read in one Read while the soft-MMU and the OOM killer sit below and above the VMA code most mm changes do not touch.
 - **Tradeoffs**: Copy-on-write and FUSE mappings stay because they run through mprotect, mremap, madvise and fork; the fault order stays here though its `fault_in` step is kernel/mmu's; boundaries inside `mm.rs` exist only in the registry's wording; decisions made before the split keep their kernel/mm tags here (listed in the kernel/mmu and kernel/oom preambles), cgroup files belong to kernel/cgroup, procfs views to kernel/procfs and the timer worker to kernel/time; vDSO image construction belongs to kernel/vdso while memory mapping remains here.
 - **Watch out**: Bugs still open in the map include ignored `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*`, past-EOF faults ignoring permissions, approximated Linux VMA boundaries, mlock succeeding on inaccessible ranges, ranges with gaps failing as a whole, stale addresses after mremap moves a SysV segment or the vDSO and FUSE short reads taken as whole windows, and a VMA change must still record what kernel/mmu's `sync` acts on; module documentation points to `.agents/maps/kernel/mm.md`, so future directory moves must update it.
-- **Source**: cd53f35, 44a21b7 (scope since extended by 3f3db11 and d2b1dc3; bug list since updated by 3f3db11, 1459292, 4e64e74, 400817d, 5d23297, d9e1f0c and 5760479); 36083476; 20137e4c; cf029f9a; 8a17e4a9; d053be24; 60790c14
+- **Source**: cd53f35, 44a21b7 (scope since extended by 3f3db11 and d2b1dc3; bug list since updated by 3f3db11, 1459292, 4e64e74, 400817d, 5d23297, d9e1f0c and 5760479); 36083476; 20137e4c; cf029f9a; 8a17e4a9; d053be24; 60790c14; 39e55b4b
 
 ### D22: Linux VMA boundaries are computed over unmerged pieces
 - **What**: `same_vma` decides which adjacent pieces form one Linux VMA (contents source, backing, protection, flags, grows-down and an `anon` identity that fork renews per parent VMA) for maps, mremap's one-VMA rule and `PROT_GROWSDOWN`; mprotect follows `do_mprotect_pkey`; a guard gap below grows-down VMAs and `MMAP_MIN_ADDR` (32768) bound placement; and failed kernel accesses grow stacks.

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/netns"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -69,7 +69,7 @@
 - **Why**: Separating independently maintained subsystems makes the oversized parent map practical to read and maintain.
 - **Tradeoffs**: Cross-boundary work follows child maps, while historical decisions keep their original parent tags and stable IDs.
 - **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them no TUN/TAP device (so rootless podman's pasta and slirp4netns cannot start), per-key rate limits doing nothing, the initial namespace reaching containers' loopback sockets, same-port binds judged by host address, ephemeral ports aliasing explicit ones, connected UDP escaping namespace checks, nat drops becoming `EPERM`, dual-stack listeners not forwarded and route requests whose address sizes, gateway devices and next hops are checked unlike Linux 6.1's; these pre-split qualifications remain discoverable through the child maps and are not resolved by the ownership split.
-- **Source**: c3df5d3 (bug list since updated by ce8a9ce, ac5da40, b43ff37 and 5d7b936); 60790c14
+- **Source**: c3df5d3 (bug list since updated by ce8a9ce, ac5da40, b43ff37 and 5d7b936); 60790c14; 39e55b4b
 
 ### D10: `nft flush ruleset` flushes tables as Linux's `nf_tables_deltable` does
 - **What**: DELTABLE and DESTROYTABLE with family 0, or with neither a name nor a handle, remove every table of the family (all families for 0), only those with the given name if one is present, checked before the family validation; matching nothing succeeds.

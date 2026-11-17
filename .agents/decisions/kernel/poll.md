@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/poll"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D6 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 >
@@ -13,9 +13,9 @@
 ### D1: poll, select and epoll are implemented in process over one wait mechanism
 - **What**: Every multiplexer scans readiness of guest files (host fds polled with zero timeout) and waits through the kernel's wait, which puts host fds and the thread's wake event in one host poll; the guest epoll is not a host epoll.
 - **Why**: Guest files mix host fds and in-process objects (pipes, PTYs, eventfds, AF_UNIX); one wait covering both is simpler, and a host epoll would only cover host fds.
-- **Tradeoffs**: Each wait scans all interests (no ready list) and costs a host poll per host fd; a host-epoll-backed design remains the option when fd counts grow.
-- **Watch out**: Waits must release the BKL and include the thread's own event so signals interrupt them.
-- **Source**: design review 2026-10-24 (§10), round 06 (`06-m4`)
+- **Tradeoffs**: Epoll still traverses interests and needs temporary storage for eligible level-triggered host fds, which are polled in cursor order with scalar retry on batch failure.
+- **Watch out**: Preserve per-registration guest masks and report order under maxevents, keep single-event, edge-tracked and exclusive probes scalar, and release the BKL and include the thread wake event when waiting.
+- **Source**: design review 2026-10-24 (§10), round 06 (`06-m4`); 5b5ee4b6, 123ddb76
 
 ### D2: `EPOLLET` fires on every new arrival, as Linux's wait-queue wakeups do
 - **What**: Per-direction data generations (bumped at each event) and drain counts decide when an edge-triggered interest reports again; host sockets get a private edge-triggered host epoll so each host arrival counts.
@@ -57,7 +57,7 @@
 - **Why**: The retired design doc's multiplexing section described EPOLLET, nesting and exclusive wakeups but not the readiness contract, select semantics or signal-driven I/O permissions, and timerfd, which left kernel/vfs with inotify, AIO and loop devices, is an anonymous readiness file like eventfd.
 - **Tradeoffs**: The readiness sources stay in their own modules and are only described here as a contract, and timerfd's clocks, Expiry and worker belong to kernel/time, BKL and generic waits to kernel/process, and ProcEvent producers span kernel/procfs and kernel/cgroup.
 - **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them exclusive gates that ignore direction and order, epoll results lost on `EFAULT` and pipe `POLLOUT` counting bytes rather than buffers.
-- **Source**: c3df5d3, cc160c1 (bug list since updated by 09188ec, 4e64e74, ce8a9ce, f6a82cc and 5d7b936, and shortened by D4); cf029f9a; 8a17e4a9; d053be24
+- **Source**: c3df5d3, cc160c1 (bug list since updated by 09188ec, 4e64e74, ce8a9ce, f6a82cc and 5d7b936, and shortened by D4); cf029f9a; 8a17e4a9; d053be24; 39e55b4b
 
 ### D8: select waits only for what its sets ask and clamps nfds to Linux's table size
 - **What**: nfds is clamped to an estimate of Linux's fd table size from the highest open fd (64, then 128 · 2^k), bits above it are neither read nor written back, only events in an fd's masks end the wait, and all three masks include `POLLNVAL` as native select does.
@@ -135,3 +135,7 @@
 - **Tradeoffs**: A poll that does not ask for `POLLPRI` still takes the change in through the `POLLERR` it always reports, as on Linux.
 - **Watch out**: A new report path that returns events without calling `took_change` would report a mount change forever.
 - **Source**: affb1e2
+
+## Superseded
+
+- ~~One host probe per fd during an ordinary level-triggered epoll scan under D1~~ → replaced by **D1** in 123ddb76 (2026-11-17).

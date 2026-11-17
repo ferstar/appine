@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -12,7 +12,7 @@
 
 > Full text of D27–D32: `git show 260512d530d136e70f10564e248f7db876f07062:.claude/decisions/kernel/process.md`
 
-> Full text of D33–D37 and D39–D48: `git show 0553229be58764ca5a42f2ea64949373e99d9553:.claude/decisions/kernel/process.md`
+> Full text of D33–D37, D39–D46 and D48: `git show 0553229be58764ca5a42f2ea64949373e99d9553:.claude/decisions/kernel/process.md`
 
 - **D1** — Each guest thread is a host pthread scheduled by the host and pooled with its engine CPU state, so every guest thread costs a host thread and an eventfd, and a pooled host thread keeps the previous guest thread's nice, affinity and I/O priority until they are re-applied (rounds 04, 28)
 - **D2** — All kernel-layer state sits behind one big kernel lock that guest code runs without and only waits and `Cx::unlocked` release mid-syscall, so kernel objects use non-atomic `Rc`/`RefCell` and nothing may hold them across a release (rounds 04, 29, 36, 38, 109, 189)
@@ -52,7 +52,6 @@
 - **D44** — PI futexes keep `PiWaiter`s in the futex queue and the word as the owner record, following `futex_lock_pi_atomic` without priority inheritance or ordering, with the requeue-PI commands `ENOSYS`, no hand-over at execve, and `pi_owners_exited` giving a gone owner's locks to their first waiter with `FUTEX_OWNER_DIED` (edd7f95)
 - **D45** — `InSyscall` stamps each BKL syscall's global number on `Task::syscall` from after the entry stop and seccomp until the end-of-syscall sweeps, cleared on every way out of dispatch before stops and signal delivery, so anything waiting inside dispatch after the sweeps must come after the guard is dropped or it holds back the overlay sweep (0d82807)
 - **D46** — `ExeFile::ovl` keeps the (mount, node, `Hold`) of a program run through an overlay, so `open_exe_file` can run a removed one from its store inode with the overlay mount's noexec and nosuid, until the overlay instance is gone (`ENOENT`) (9590431)
-- **D47** — `cgroup::notify_changes` runs after each BKL syscall's sweeps, at the end of `task::exit`, before a freezer wait and after the timer thread's OOM check, returning at once while nothing observes a cgroup2 file (affb1e2)
 - **D48** — Each thread carries its own credentials: clone sets the creating thread's, execve sets both of the main thread's copies, and the scheduling, ioprio, `PRIO_USER` and `RLIMIT_NPROC` checks use the target thread's, so code writing `Task.cred` or `ThreadGroup.cred` directly leaves the two apart (1be1142)
 
 ## Active (full detail)
@@ -83,7 +82,7 @@
 - **Why**: The process map still mixed task execution with independently maintained timers and boot policy after its earlier splits.
 - **Tradeoffs**: Shared-file boundaries remain explicit in the registry, cross-boundary changes require several maps, and earlier decisions keep their parent tags and IDs; vDSO construction belongs to kernel/vdso while clone and fast-dispatch integration remain here.
 - **Watch out**: Preserve fast_sleep deadline handover, BKL charging and vfork freezer accounting; sched_setattr still changes policy before validating nice and BKL-release wake-up matching still runs outside bug::catch, while the exited-leader CPU-clock debt is inherited by kernel/time.
-- **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53 and D54); cf029f9a, 8a17e4a9; d053be24; 60790c14
+- **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53 and D54); cf029f9a, 8a17e4a9; d053be24; 60790c14; 39e55b4b
 
 ### D18: Process files read in the order their code runs
 - **What**: kernel.rs runs global state, the BKL and the syscall context before waiting and waking; syscall/proc.rs follows the module docs from clone and execve through exit and reaping to pidfds, unshare and sessions; `impl Machine` follows a machine's life; syscall/mod.rs puts dispatch first and the shared argument helpers last; the other files move single helpers after their callers, bug.rs and debug.rs included (the registry now puts debug.rs in kernel/signal).
@@ -168,7 +167,7 @@
 - **Why**: The retained TCP-filter path needs deterministic coverage on hosts that accept filters.
 - **Tradeoffs**: The hook persists until explicitly disabled.
 - **Watch out**: Tests must turn it off before later sockets in the same run.
-- **Source**: 52dcc177; 20137e4c; d053be24
+- **Source**: 52dcc177; 20137e4c; d053be24; 39e55b4b
 
 ### D57: Guest CPU samples combine live and exited threads
 
@@ -176,7 +175,22 @@
 - **Why**: The screen-off policy needs guest activity without counting the UI or host polling.
 - **Tradeoffs**: Each sample takes the BKL and visits the live threads.
 - **Watch out**: An exit-stage panic can skip CPU credit, so consumers must compare changes rather than assume monotonicity.
-- **Source**: 1e5de64e; 20137e4c; d053be24
+- **Source**: 1e5de64e; 20137e4c; d053be24; 39e55b4b
+
+### D47: Watched cgroup2 files are compared where cgroups change
+- **What**: `cgroup::notify_changes` runs after each BKL syscall's sweeps, at the end of `task::exit`, before a thread waits in the freezer and in the timer thread after the OOM check, returning immediately unless an observation is pending (kernel/procfs D38).
+- **Why**: cgroup2 changes happen in syscalls, thread exits, freezer stops and the OOM killer, and the comparison that wakes pollers and inotify watches must run after them.
+- **Tradeoffs**: Start, exit, vfork waits and sibling kills during exec can walk the cgroup ancestor chain while observations exist.
+- **Watch out**: Mark membership and freezer changes before a checkpoint so dirty observations reach poll and inotify (kernel/cgroup D2).
+- **Source**: affb1e2; 0f5c5132
+
+### D58: Borrow accounting updates its thread-local count in one access
+
+- **What**: The borrow guard updates the count within one TLS access and its destructor may inline.
+- **Why**: Profiling found measurable TLS overhead even with no cgroup observers.
+- **Tradeoffs**: Only builds that count borrows benefit.
+- **Watch out**: The measured saving depends on compiler code generation.
+- **Source**: b65799c8
 
 ## Superseded
 
@@ -186,3 +200,4 @@
 - ~~The futex handler re-reads the timeout of an interrupted wait, and only relative deadlines are handed over (9593bae's tradeoff)~~ → replaced by **D52** in 27609fe (2026-11-10, no SUPERSEDES declared)
 - ~~kernel/process also covers execve and the ELF loader, futexes and namespaces (D14, dd6c288, d2b1dc3)~~ → replaced by **D14** in b320f8e (2026-11-11)
 - ~~D14 ownership of timers, periodic checks and PID 1~~ → replaced by **D14** in 8a17e4a9 (2026-11-14)
+- ~~Comparing observations at each checkpoint under D47~~ → narrowed by **D47 and kernel/cgroup D2** in 0f5c5132 (2026-11-17).

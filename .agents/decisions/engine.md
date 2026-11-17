@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D18 were seeded by hand from the retired design
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D18 were seeded by hand from the retired design
 > doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -30,11 +30,11 @@
 - **Source**: design review 2026-10-24 (§4.2)
 
 ### D4: SIMD/FP, CRC32 and LSE run in Tier 0 as native single-instruction stubs
-- **What**: C does the whitelist check, address translation and register moves; a cached host stub executes the same instruction.
+- **What**: C does the whitelist check, address translation and register moves; a cached host stub executes the instruction, specializing integer ADD/SUB and logical vector operations by which operands they read.
 - **Why**: Results are bit-identical to hardware (NaN propagation, rounding, FZ/DN, FPSR flags) without reimplementing floating point.
 - **Tradeoffs**: Tier 0 is no longer independent of the hardware for SIMD/FP, needs executable memory (Android allows JIT), and only works on aarch64 Linux hosts.
-- **Watch out**: Without native stubs no SIMD/FP (or other implemented) feature can be advertised.
-- **Source**: rounds 02 (`02-m1a`), 09 (`09-m7`)
+- **Watch out**: Specialized stubs must preserve flags, aliased operands, old destinations when read, and upper-lane clearing. Without native stubs no SIMD/FP (or other implemented) feature can be advertised.
+- **Source**: rounds 02 (`02-m1a`), 09 (`09-m7`); 16914003
 
 ### D5: Exclusives are emulated as value compare-and-swap in both tiers
 - **What**: LDXR records address, size and value; STXR does a compare-and-swap against the recorded value on the host address.
@@ -61,8 +61,8 @@
 - **What**: The TLB slot is chosen by the page of the access's last byte and its tag compared with the first byte's page.
 - **Why**: One compare rejects both misses and cross-page accesses, and TLB checks dominated translated code.
 - **Tradeoffs**: Cross-page accesses always take the out-of-line refill routine.
-- **Watch out**: Tier 1 depends on the TLB layout owned by `kernel/mm`.
-- **Source**: rounds 09 (`09-m7`), 23 (`23-tlb-checks`), 30 (`30-translated-access`)
+- **Watch out**: Tier 1 depends on the TLB layout owned by `kernel/mmu`, whose D3 covers tagged data pointers and cached write permissions.
+- **Source**: rounds 09 (`09-m7`), 23 (`23-tlb-checks`), 30 (`30-translated-access`); 8bc0e63b
 
 ### D9: Blocks continue past conditional branches, but not across calls or jumps
 - **What**: A conditional branch becomes a side exit linked directly to its target block, and translation continues on the fall-through path; blocks still end at unconditional branches and calls.
@@ -128,18 +128,18 @@
 - **Source**: rounds 09 (`09-m7`), 106 (`106-code-cache-rss`)
 
 ### D18: Invalidation is by content, and retired blocks forward to their replacement
-- **What**: Only blocks whose guest words changed are retired; a retired block's entry jumps to a forwarding stub, and re-translation patches the old entry to the new block.
+- **What**: Only blocks whose guest words changed are retired; a retired block's entry jumps to a forwarding stub, and re-translation patches the old entry to the new block, while small-range invalidation unlinks dead page-bucket records and keeps parked blocks available for revival.
 - **Why**: A JIT rewriting one spot should not invalidate other methods' blocks on the same page, and forwarding avoids rewriting every link into the old entry.
 - **Tradeoffs**: Retired code is reclaimed only by a full flush.
 - **Watch out**: Jump-cache entries are not cleared and rely on forwarders.
-- **Source**: rounds 11 (`11-m8-jvm`), 24 (`24-shared-translation`), 35 (`35-jit`)
+- **Source**: rounds 11 (`11-m8-jvm`), 24 (`24-shared-translation`), 35 (`35-jit`); 16914003
 
 ### D19: The engine module is `core/engine` without the page table and TLB fill
 - **What**: engine covers instruction execution, translation, CPU features, the fault guard, C/Rust bindings and `tests/lockstep`, while page tables and TLB fill/flush belong to kernel/mmu; the translator points readers to `.agents/maps/engine.md`.
 - **Why**: The retired design doc's §4 was the only current-state description of the CPU engine and had drifted from the source (precise state, indirect-branch lookup, flush triggers, feature gating).
 - **Tradeoffs**: D1–D18 cite rounds rather than commits, and rounds keep § references to the deleted section; host-vDSO CPU-feature dependencies belong to kernel/vdso.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them `ic ivau` on guest page 0 being lost, conditional-branch relinking racing a new thread and unallocated ID registers reading 0 where Linux delivers `SIGILL`.
-- **Source**: f9edf81 (bug list since updated by e5922b1, 6d1d9c0 and b43ff37); 44a21b (MMU split); 36083476; 20137e4c; d053be24; 60790c14
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them Tier 0 losing pending `ic ivau` on guest page 0 (the Tier 1 dispatcher now handles it directly), conditional-branch relinking racing a new thread and unallocated ID registers reading 0 where Linux delivers `SIGILL`.
+- **Source**: f9edf81 (bug list since updated by e5922b1, 6d1d9c0 and b43ff37); 44a21b (MMU split); 36083476; 20137e4c; d053be24; 60790c14; 39e55b4b; 8bc0e63b
 
 ### D20: Engine files read in the order their code runs
 - **What**: lib.rs is sectioned into the page table, CPU state and exits, Tier 1 and process-wide calls (`Cpu::reset` after `tlb_flush`, as at execve); in tests a helper used by one test follows it and shared helpers follow all tests; lockstep's class functions follow the `CLASSES` table and its runner goes from its types through `run` and `run_class` to the helpers in call order.
@@ -175,3 +175,31 @@
 - **Tradeoffs**: Guests on ECV hosts see `ecv` in `HWCAP2` and `/proc/cpuinfo`.
 - **Watch out**: The path is untested on ECV hardware, since colima and both emulators lack ECV.
 - **Source**: 16364c0
+
+### D25: Translated FPCR and FPSR reads use different sources
+
+- **What**: Tier 1 reads the saved guest FPCR and the live FPSR through register remapping, and keeps FPCR writes in the block when the masked value is unchanged.
+- **Why**: FPCR stays constant during a translated run, while instructions in that run can raise FPSR flags before the saved copy is refreshed.
+- **Tradeoffs**: A changed FPCR or any FPSR write still exits to Tier 0 for masking.
+- **Watch out**: Keep both FPCR masks identical and preserve NZCV, newly raised FPSR flags and reads targeting a stolen register.
+- **Source**: 16914003, 26ceb37c, 8bc0e63b
+
+### D26: Tier 0 reuses fetch translations and skips work with no architectural effect
+
+- **What**: Within a run, fetches on the same executable page reuse its offset, arithmetic skips unused NZCV calculations and contiguous vector transfers copy by register after probing the full range.
+- **Why**: Repeated page probes, flag calculations and per-lane copies slowed common interpreter loops.
+- **Tradeoffs**: Two arithmetic branches preserve Clang performance, and interleaved vector transfers still use the general loop.
+- **Watch out**: Check kicks at every instruction, discard the offset on exit, and preserve breakpoint priority, SP/ZR semantics and faults before writeback.
+- **Source**: 7bc780ca
+
+### D27: Translated barriers finish pending code invalidation before the next lookup
+
+- **What**: Tier 1 executes DSB and ISB in the block and sends pending invalidation to the dispatcher before looking up the following PC.
+- **Why**: Interpreting barriers after guest code changes repeatedly interrupted translated execution.
+- **Tradeoffs**: A pending page still requires a state transfer and a page check.
+- **Watch out**: Page zero needs its own path because zero is the empty pending-page sentinel.
+- **Source**: 8bc0e63b
+
+## Superseded
+
+- ~~Every FPCR write exits to Tier 0 in 16914003~~ → narrowed by **D25** in 8bc0e63b (2026-11-17).

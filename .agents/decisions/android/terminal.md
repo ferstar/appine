@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/terminal"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D3 were seeded by hand from the retired design
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D3 were seeded by hand from the retired design
 > doc §11.5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -10,7 +10,7 @@
 
 > Full text of D51–D52: `git show 410ef192ce13aa39fc4661c0cfa032f917066801:.agents/decisions/android/terminal.md`
 
-> Full text of D2, D6, D9, D11, D12, D16–D17, D20, D22 and D23: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/android/terminal.md`
+> Full text of D2, D6, D9, D11, D12, D16–D17, D22 and D23: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/android/terminal.md`
 
 > Full text of D19, D21, D24, D26–D29, D33–D35 and D37: `git show c1a37da58eada92fc78df580db7b870071cab435:.claude/decisions/android/terminal.md`
 
@@ -20,7 +20,6 @@
 - **D11** — Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab and Ctrl+Shift+Tab open, close and cycle tabs (listed by `onProvideKeyboardShortcuts`) and never reach programs, and Ctrl+Shift+W closes a running tab without ×'s confirmation (2af55e2)
 - **D16** — Terminal Kotlin files read in execution order (types first, callbacks as they fire, each helper after its first caller, companion last) and vt.rs follows VtNative.kt's order, and reorders must keep initialised properties in their textual order, which is the order Kotlin initialises them in (a546fea, 3511da5)
 - **D17** — Drawing and preference writes use androidx.core's KTX helpers (`edit { }`, `createBitmap`, `Canvas.withClip`, `withScale`) because lint's UseKtx warnings fail the build (android/native D10) (4c1a3ce)
-- **D20** — A rounded 16 × 1 dp primary-colour bar 4 dp below the label's baseline, drawn by the containers in `dispatchDraw` through `ExtraKeysView.drawIndicator`, marks the current tab, locked modifiers and SYM, so a state change must invalidate the drawing container and fading a label fades its indicator too (d48dd10)
 - **D21** — The tab row and the extra keys scroll under their fixed buttons with an end padding as wide as them and `clipToPadding` off, fading over `ExtraKeysView.FADE_DP` (32 dp) up to a blank strip, so `ExtraKeysView.scrolls` must compare the grid with the room between the paddings and an OEM font or label change can put the fade over a glyph (a75981b, db4f809)
 - **D22** — `revealCurrentTab` brings the current tab back into view `RETURN_TO_CURRENT_TAB_MS` (3 s) after the tab row rests, a touch on the row cancelling the wait and a release or finger-less scroll restarting it, while a tab change still scrolls at once (1118f81)
 - **D23** — The tab bar less its buttons and, while it can scroll, the extra keys up to the last column are excluded from the left-edge back gesture, within Android's 200 dp per window edge, which the selection handles' rectangles (D34) share (ced9f06, 9f21a29)
@@ -40,17 +39,22 @@
 
 > Full text of D45, D47, D49, D53, D54: `git show 221a89b12e1dffa7b1432b9076078c1bffde46cb:.agents/decisions/android/terminal.md`
 
-- **D45** — Clear screen follows Ghostty on the primary screen only, Reset terminal clears both screens, scrollback and modes while keeping Appine options and OSC 10–12 colors, and an at-prompt shell receives form feed; reset retains progress/status records and forgets prompt cursor movement until the next mark (600700b, 5256ae2; d053be24)
-- **D47** — Cursor blinking defaults on and shape/blink settings reach every session, while DECSCUSR and mode 12 still override them, settle preserves modes 12/1001, focused blinking redraws twice per second, changing shape under mode 1049 misses the primary screen, and raw cursor enum values must stay aligned across JNI (5256ae2, 77d7f36; d053be24)
-- **D49** — vt.c detects tmux control-mode DCS 1000p, sends a carriage return to detach and reports the ST end to the service; control mode has no support or retry, DCS parsing adds two stops, and the behavior depends on tmux accepting the blank command (verified with 3.5a/3.7c) (77d7f36; d053be24)
-- **D53** — The default-enabled volume shortcut reads its preference per press, switches once only when another tab exists, consumes repeats/releases only after switching, ends search and otherwise preserves system volume, with dialogs retaining volume behavior; adb-only tests leave IME/accessibility interception and lost-release state unverified (61df6915; 20137e4c; d053be24)
+- **D45** — Clear screen follows Ghostty on the primary screen only, Reset terminal clears both screens, scrollback and modes while keeping Appine options and OSC 10–12 colors, and an at-prompt shell receives form feed; reset retains progress/status records and forgets prompt cursor movement until the next mark (600700b, 5256ae2; d053be24, 39e55b4b)
+- **D47** — Cursor blinking defaults on and shape/blink settings reach every session, while DECSCUSR and mode 12 still override them, settle preserves modes 12/1001, focused blinking redraws twice per second, changing shape under mode 1049 misses the primary screen, and raw cursor enum values must stay aligned across JNI (5256ae2, 77d7f36; d053be24, 39e55b4b)
+- **D49** — vt.c detects tmux control-mode DCS 1000p, sends a carriage return to detach and reports the ST end to the service; control mode has no support or retry, DCS parsing adds two stops, and the behavior depends on tmux accepting the blank command (verified with 3.5a/3.7c) (77d7f36; d053be24, 39e55b4b)
+- **D53** — The default-enabled volume shortcut reads its preference per press, switches once only when another tab exists, consumes repeats/releases only after switching, ends search and otherwise preserves system volume, with dialogs retaining volume behavior; adb-only tests leave IME/accessibility interception and lost-release state unverified (61df6915; 20137e4c; d053be24, 39e55b4b)
 
 > Full text of D8, D38, D42, D44: `git show 5bd37526030bd7d7f70d048c38917b27d83f8c4b:.agents/decisions/android/terminal.md`
 
-- **D8** — TerminalService owns view-independent VtSessions with pump/writer/waiter threads, starts shells after a view supplies the grid and restores queued screen/messages first, uses consoleOpen rather than the retained console number for kill routing, and attaches one activity VtView; Termux is removed, builds require Zig/libghostty-vt, focus highlighting is off, and real devices, 16 KB pages and CJK IMEs remain unverified (6ffb912, b38d29c; 62f6092 and f77b591 (drags, double taps and edge-aware handles since added, D25 and D34); d89b5fa (the bell since wired, D36); 6560af6 (`consoleOpen`, for a bug d9e1f0c recorded); ddbfb9b (triple taps and rectangles, D40); 600700b (snapshots, D44))
-- **D38** — Scrollback stops at 10,000 lines or 10 MiB, whichever comes first, with white-on-black defaults and a foreground-colored cursor, DA1 52 only when clipboard writes are allowed, and whole-write EFBIG above 1 MiB for every OSC 5522 representation; full reset keeps OSC 10–12 colors, wide grids retain fewer rows, memory is reclaimed by compression, and the measured 3.5–10 MiB per tab was not verified on devices or 16 KB pages (b5980ae, 90911a2, 755a96b)
-- **D42** — TermGuard schedules compression after activity or restored-page reads with 250 ms quiet time, a 5 s maximum wait and incremental locked steps 1 ms apart, while memory trim runs a full pass and NULL transcripts preserve the prior copy; constant output can take the lock for 5 ms, virtual memory stays reserved, compress_touched/transcribed and guarded locking must track every read/write, and 16 KB devices and battery cost remain untested (3f45ad0)
-- **D44** — Changed terminals save version-tagged snapshots up to 16 MiB with 64 KiB continuation tracking, restore through shared options and settle to the primary screen with program modes, Kitty flags, links and title reset, and fall back to transcripts on a version mismatch; upgrades lose rich restoration once, settle must track new modes, same-version compatibility is not guaranteed, and image/bash/device restoration remains untried (600700b, 172be7c)
+- **D8** — TerminalService owns view-independent VtSessions with pump/writer/waiter threads, starts shells after a view supplies the grid and restores queued screen/messages first, uses consoleOpen rather than the retained console number for kill routing, and attaches one activity VtView; Termux is removed, builds require Zig/libghostty-vt, focus highlighting is off, and real devices, 16 KB pages and CJK IMEs remain unverified (6ffb912, b38d29c; 62f6092 and f77b591 (drags, double taps and edge-aware handles since added, D25 and D34); d89b5fa (the bell since wired, D36); 6560af6 (`consoleOpen`, for a bug d9e1f0c recorded); ddbfb9b (triple taps and rectangles, D40); 600700b (snapshots, D44), 39e55b4b)
+- **D38** — Scrollback stops at 10,000 lines or 10 MiB, whichever comes first, with white-on-black defaults and a foreground-colored cursor, DA1 52 only when clipboard writes are allowed, and whole-write EFBIG above 1 MiB for every OSC 5522 representation; full reset keeps OSC 10–12 colors, wide grids retain fewer rows, memory is reclaimed by compression, and the measured 3.5–10 MiB per tab was not verified on devices or 16 KB pages (b5980ae, 90911a2, 755a96b, 39e55b4b)
+- **D42** — TermGuard schedules compression after activity or restored-page reads with 250 ms quiet time, a 5 s maximum wait and incremental locked steps 1 ms apart, while memory trim runs a full pass and NULL transcripts preserve the prior copy; constant output can take the lock for 5 ms, virtual memory stays reserved, compress_touched/transcribed and guarded locking must track every read/write, and 16 KB devices and battery cost remain untested (3f45ad0, 39e55b4b)
+- **D44** — Changed terminals save version-tagged snapshots up to 16 MiB with 64 KiB continuation tracking, restore through shared options and settle to the primary screen with program modes, Kitty flags, links and title reset, and fall back to transcripts on a version mismatch; upgrades lose rich restoration once, settle must track new modes, same-version compatibility is not guaranteed, and image/bash/device restoration remains untried (600700b, 172be7c, 39e55b4b)
+
+> Full text of D57, D59: `git show ec9ad94b862479935821fbfad2affa7bbdba355e:.agents/decisions/android/terminal.md`
+
+- **D57** — The default-off overflow checkbox above Settings persists FLAG_KEEP_SCREEN_ON for every tab across launches, independently of service screen-off policy, with higher visible-terminal power use and vendor behavior and accessibility still unverified. (5d82c4c3; d053be24; 39e55b4b)
+- **D59** — Construct TerminalLayout and TerminalLinks after dynamic colors and assign them before attaching the root, leaving insets and IME animation with Layout, routing and its toast with Links, and lifecycle, session detachment and destroyed-activity checks with MainActivity, with device navigation and IME regressions still unverified. (b58c6494; d053be24; 39e55b4b)
 
 ## Active (full detail)
 
@@ -59,35 +63,35 @@
 - **Why**: Terminal links and guest browser requests should share the project-link browsing experience with a meaningful launch result.
 - **Tradeoffs**: Installed handlers choose Custom Tabs, browsers or associated apps, background guest requests fail immediately, and acceptance does not prove page load or OAuth completion.
 - **Watch out**: Verify device navigation, App Links, alternate handlers, missing handlers and complete OAuth callbacks; guest files still require the provider access gate.
-- **Source**: 1cc504b; d8dfedb2, 8e211142; d053be24
+- **Source**: 1cc504b; d8dfedb2, 8e211142; d053be24; 39e55b4b
 
 ### D15: A SYM page swaps the scrolling keys for ASCII symbols
 - **What**: SYM toggles the symbol page with $, *, & and ; replacing duplicate /, -, | and ~ keys, retaining brackets and a fixed % in two-row mode but placing scrolling % after & and before the bracket pairs in single-row mode.
 - **Why**: The symbols retain additional shell characters while the single-row sequence follows two-row reading order.
 - **Tradeoffs**: The single-row semicolon is the final scrolling key, removed duplicates remain on the main page, and users must learn the new positions.
-- **Watch out**: A held key still depends on view-removal touch cancellation; device interaction with the new layout remains unverified.
-- **Source**: 2c024c1, d70ee01; 34df148a; d053be24; 7690ee7f; 5576cc1d
+- **Watch out**: A held key still depends on view-removal touch cancellation; android/keys D2 records the temporary ! and @ replacements and the restoration of % and ^, with device interaction still unverified.
+- **Source**: 2c024c1, d70ee01; 34df148a; d053be24; 7690ee7f; 5576cc1d; 39e55b4b; 7c3725c1, 718d7f26, d3723ec7
 
 ### D13: The app is Material 3 with dynamic colours, the terminal always dark
-- **What**: Activities use Material 3 dynamic colors with a dark terminal theme; MainActivity now extends FragmentActivity for AndroidX authentication and Back dispatch while retaining Material dialogs and AppCompat menus and applying only UI_MODE_NIGHT_YES in attachBaseContext before resource access.
+- **What**: Activities use Material 3 dynamic colors with a dark terminal theme whose shared control palette blends selected primary with 25% white and ordinary on-surface-variant with 40% black; MainActivity now extends FragmentActivity for AndroidX authentication and Back dispatch while retaining Material dialogs and AppCompat menus and applying only UI_MODE_NIGHT_YES in attachBaseContext before resource access.
 - **Why**: The user asked for Material 3, starting with Settings and then the terminal's dialogs, menus, list of tabs, tab bar and extra keys, and the Material classes need a Material theme on the activity.
 - **Tradeoffs**: Views `MainActivity` inflates are the framework's, so AppCompat attributes such as `app:tint` do nothing there; the selection handles take the primary colour instead of cyan; Android 11 gets Material's baseline purple and MainActivity night-qualified resources stay dark; and the bars have no Material elevation, their indicator (D20) being drawn by hand.
-- **Watch out**: Apply dynamic colors before constructing views, retain secure windows, keep locale/font-scale/density/window fields out of the night override, and verify live system-mode changes, insets, keys and OEM menus.
-- **Source**: 55be399, 97707b7, d16025a; 883e652, d48dd10; f61072f3; 0709982; d053be24; 4c639565
+- **Watch out**: Apply dynamic colors before constructing views, retain secure windows, keep locale/font-scale/density/window fields out of the night override, and verify live system-mode changes, insets, keys and OEM menus, small-label readability and dynamic wallpaper palettes.
+- **Source**: 55be399, 97707b7, d16025a; 883e652, d48dd10; f61072f3; 0709982; d053be24; 4c639565; 39e55b4b; 71e94b55
 
 ### D3: License notices are checked-in offline assets
 - **What**: Settings exposes the AGPL statement and license navigation backed by a static catalog and HTML notices, with packaging in android/build and the reader now in android/licenses.
 - **Why**: License attribution must remain available offline while notice resources are maintained explicitly in the repository.
 - **Tradeoffs**: Dependency and bundled-package changes require manual notice updates rather than automatic build discovery.
 - **Watch out**: Keep versions, attribution and full texts synchronized with packaged dependencies and upstream reference copies.
-- **Source**: round 192 (`192-license`); list updated in b38d29c (android/native D6); bd580227, 9c6c51a7; d053be24; 60790c14
+- **Source**: round 192 (`192-license`); list updated in b38d29c (android/native D6); bd580227, 9c6c51a7; d053be24; 60790c14; 39e55b4b
 
 ### D4: The terminal activity coordinates controls with separate view and import owners
 - **What**: android/terminal owns MainActivity, TerminalLayout, TerminalLinks, NotificationPermission, SearchBarView, Ui.kt and shared resources; tab controls belong to android/tabbar, extra keys to android/keys and retained imports to android/file-import, alongside the existing privacy, license and terminal implementation modules.
 - **Why**: Separating independently maintained subsystems makes the oversized parent map practical to read and maintain.
 - **Tradeoffs**: Cross-boundary work follows child maps, while shared page/string/theme resources and Ui.showPrivate remain here and historical decisions retain parent tags and IDs.
 - **Watch out**: Preserve final input and clipboard checks, explicit shared-file exclusions and the distinction between frame-driven search highlights and view overlays; these pre-split qualifications remain discoverable through the child maps and are not resolved by the ownership split.
-- **Source**: 12c4afa, d42013d (file list since updated by 394aecf, 6ffb912, b38d29c, d965886 and 4311150; map fully refreshed in d9e1f0c; debts since closed by 22c8ab0, ddbfb9b, 3f45ad0, 600700b and e12f560); b58c6494, 165b5f99, 9c6c51a7, 9015b244, 81f60bef; d053be24; 60790c14
+- **Source**: 12c4afa, d42013d (file list since updated by 394aecf, 6ffb912, b38d29c, d965886 and 4311150; map fully refreshed in d9e1f0c; debts since closed by 22c8ab0, ddbfb9b, 3f45ad0, 600700b and e12f560); b58c6494, 165b5f99, 9c6c51a7, 9015b244, 81f60bef; d053be24; 60790c14; 39e55b4b
 
 ### D5: Terminal state lives in libghostty-vt inside the native library, drawn by Appine's own view
 - **What**: Each tab has one libghostty-vt 1.0.0 terminal in the native library, fed straight from the kernel console by a pump thread that writes the terminal's replies back and asks for one frame of dirty rows per burst; `VtView` mirrors the frames onto an integer cell grid in JetBrains Mono (glyphs scaled evenly, never stretched, with wide cells filled as in D9; box drawing, blocks and Powerline triangles as shapes; ligatures off), keys go through libghostty-vt's encoder, grapheme clustering (mode 2027) is on and synchronized output holds the screen for at most 1 s.
@@ -108,7 +112,7 @@
 - **Why**: Numbered tabs provide quick switching while a title list and anchored tooltips make sessions easier to identify.
 - **Tradeoffs**: Tabs cannot be renamed or swiped, controls remain 32 dp, long titles need the list or a tooltip, and shells without prompt marks still count as busy.
 - **Watch out**: Preserve close policy and input focus; compact targets, large numbers, OEM fonts and tooltip behavior across IME/privacy transitions need device checks.
-- **Source**: a8bdaa2, 1eac62e, 7c35183; 6c5f921 (closing at the prompt and new tabs' directory); ddbfb9b, 600700b (Find, Clear screen and Reset terminal in ⋮); 34348eda; 655d37ec
+- **Source**: a8bdaa2, 1eac62e, 7c35183; 6c5f921 (closing at the prompt and new tabs' directory); ddbfb9b, 600700b (Find, Clear screen and Reset terminal in ⋮); 34348eda; 655d37ec; 39e55b4b
 
 ### D25: Mice select as on a desktop; mouse-tracking programs get drags, hover and real clicks
 - **What**: Under mouse tracking without Shift, a long press selects the word and becomes a left-button drag past the touch slop, mouse and touchpad presses go to the program with their buttons and modifiers, hover goes as button-less motion and vt.c deduplicates motion per cell except in SGR-Pixels; otherwise a mouse press takes a pointer path through libghostty-vt's selection gesture with timed presses (clicks counting to words and lines, Ctrl for a command's output, Ctrl+Alt for rectangles, Shift extending), a right click selects the word unless a selection holds the cell and pins the floating menu there, Ctrl+click opens a link, a plain click moves the prompt's cursor and shows the IME, and touchpad swipes and pinches stay finger gestures.
@@ -156,15 +160,15 @@
 - **What**: `SearchBarView` stands in for `TabBarView` (Find in ⋮ or Ctrl+Shift+F; Enter or ↑ for older, Shift+Enter or ↓ for newer, nothing selected until a step; AndroidX Back, ×, Esc or another tab closing it, the last text kept); vt.c drives one `GhosttySearch` from `appine_vt_frame` for at most 4 ms per frame, marks the viewport's matches in cell attribute bits 14–15 with the count in the header and steps back to the selected match's place after a resize, and `appine_vt_search_rows` gives the matches' rows for 2 dp marks under the scroll bar's thumb, taken again when the count or the selected match changes or every 500 ms while frames change.
 - **Why**: There was no way to find text in the scrollback, though libghostty-vt searches the screen and scrollback and lists every match.
 - **Tradeoffs**: The tab bar is hidden while searching, so Ctrl+Tab or enabled volume-key switching ends the search; the extra keys still type into the terminal; a resize with a match selected blocks on finishing the search; vt.c keeps a copy of all matches (about 64 bytes each) while searching, and marks may lag a pruned scrollback by up to 500 ms.
-- **Watch out**: The frame format changes in vt.c and `VtFrame` together; reselecting by place could pick another match if a resize changed which exist; libghostty-vt's search (case-insensitive for ASCII only) may change with an upgrade; the Android 16 Back path is untried on a device; the field disables fallback line spacing and the count uses 14 dp labels, risking tall-glyph clipping and less input width on narrow screens.
-- **Source**: ddbfb9b, 48982fe; 49e8b08 (read by `VtFrame`); 61df6915; dfbf8eab; 5e1f851d; 20137e4c; f61072f3; d053be24
+- **Watch out**: The frame format changes in vt.c and `VtFrame` together; reselecting by place could pick another match if a resize changed which exist; libghostty-vt's search (case-insensitive for ASCII only) may change with an upgrade; the Android 16 Back path is untried on a device; native tooltips, permission banners and the search field inherit disabled fallback line spacing from the terminal theme, and the count uses 14 dp labels, risking tall-glyph clipping and less input width on narrow screens.
+- **Source**: ddbfb9b, 48982fe; 49e8b08 (read by `VtFrame`); 61df6915; dfbf8eab; 5e1f851d; 20137e4c; f61072f3; d053be24; 39e55b4b; b5303dd3
 
 ### D43: Prompt marks let tabs close at the prompt, jump between commands, select output and time commands
 - **What**: vt.c reads libghostty-vt's prompt state only: `appine_vt_at_prompt` makes `VtSession.busy` false so closing does not ask (D18), `appine_vt_jump_prompt` serves Ctrl+Shift+Up/Down on the primary screen (passed to the program on the alternate one), `appine_vt_output_at` backs the menu's Select output, new tabs start in the current tab's foreground-group directory (`consoleCwd`), and `on_semantic_prompt` times a command from the C mark (for busybox ash, from the cursor leaving the prompt) to the next D for `VtSession.onCommandFinished` (android/service D21); OSC 7 stays unwired.
 - **Why**: Every × on a live tab asked even with the shell idle at its prompt, there was no way to move between commands or take one command's output, new tabs always started at home and long commands ended unnoticed, though libghostty-vt tracks prompts, input and output once shells mark them (android/setup D20).
 - **Tradeoffs**: Unmarked shells still ask on close and lack prompt features, but zsh, fish/nushell and supported nested bash/ash now have integration (android/setup D20 and android/vt D5–D7); Ctrl+Shift+Up/Down remain reserved on the primary screen and consoleCwd takes the BKL on tab creation.
 - **Watch out**: With marks libghostty-vt clears the prompt's rows on every resize and relies on the shell to redraw them; `busy` follows whatever the shell sends, so a user's own prompt changes it; bash in the app on Debian, real devices, hardware keyboards and TalkBack are untried.
-- **Source**: 6c5f921, 5256ae2; a7d8c9f5; a809c5a8; daab4446; 7aa817af (child-module refinements); 20137e4c; d053be24
+- **Source**: 6c5f921, 5256ae2; a7d8c9f5; a809c5a8; daab4446; 7aa817af (child-module refinements); 20137e4c; d053be24; 39e55b4b
 
 ### D46: Touch scrolls by pixels and settles on a row; library logs, unknown sequences and the sideways wheel are wired
 - **What**: The render state asks for one overscan row below (header byte 58, row `y == rows`), `VtView` draws the grid up to a row higher (`scrollPx`), scrolls the viewport by pixels and settles on the nearest row in 150 ms through the fling's `OverScroller`, a tap during settling still acting; `AXIS_HSCROLL` reaches mouse-tracking programs as buttons 6 and 7; `on_log` (warnings and errors) and `on_unknown_sequence` (an OSC's number or an APC's letter) share 20 log lines a second; KAM stays ignored, as Ghostty ignores it by default.
@@ -178,7 +182,7 @@
 - **Why**: After comparing libghostty-vt 1.0.0's C API with vt.c, the user chose three Ghostty behaviours the tabs lacked: taps on the prompt moving the shell's cursor (most useful on a touch screen), the lock cursor at password prompts with the IME's password mode as the counterpart of macOS secure input, and OSC 22 pointers.
 - **Tradeoffs**: Taps move nothing for shells that declare no `cl=` or `click_events` while marked ash continuation rows now work (android/vtview D6); after background output, earlier-row movement remains limited (android/vt D6); a program that turns echo off without printing shows no lock until its next output; each password prompt restarts the IME, ending a composition and changing Gboard's layout; hovering calls `VtNative.link` once per cell; Ghostty's modifier pointers have no counterpart.
 - **Watch out**: The frame format changed on both sides (cursor style 4, byte 59); `onResolvePointerIcon`'s handling of non-mouse events was seen on API 34 only, and the IME restart is untried with CJK IMEs and hardware keyboards.
-- **Source**: 2b04a43; a809c5a8; daab4446 (child-module refinements); 20137e4c; d053be24
+- **Source**: 2b04a43; a809c5a8; daab4446 (child-module refinements); 20137e4c; d053be24; 39e55b4b
 
 ### D50: A recreated `MainActivity` keeps its tab, and a display size change recreates it
 - **What**: `onMachineReady` shows the activity's own current tab, else the service's `current`, else `focus`, else the last; `onCreate` reads `EXTRA_TAB` only without a saved state and not from history; `MainActivity` and the licences leave `density` out of `configChanges` (Settings too, android/setup D22), and the font size is kept as `font_size_dp`, an old pixel `font_size` being converted at the current density on first read.
@@ -193,7 +197,7 @@
 - **Why**: Adaptive rows reclaim scarce height while the revised main order groups command entry and cursor movement.
 - **Tradeoffs**: Pages still scroll at 600–719 dp, alternate pages hide modifiers, the fully fitting function page leaves a blank column, SYM has no one-shot/lock state or page hint and users must learn the new order.
 - **Watch out**: Layout changes preserve page/modifier state but cancel pending presses and reset scrolling; touch accuracy, TalkBack and rotation during repeats remain unverified on physical devices.
-- **Source**: 883e652, 969e714, 394cd83, d70ee01, a8bdaa2, ed8c208a, b79baa10; 20137e4c; d053be24; 7690ee7f; eae9a4b2
+- **Source**: 883e652, 969e714, 394cd83, d70ee01, a8bdaa2, ed8c208a, b79baa10; 20137e4c; d053be24; 7690ee7f; eae9a4b2; 39e55b4b
 
 ### D55: Settings and licenses share a frame but use distinct rows
 
@@ -201,7 +205,7 @@
 - **Why**: Standard Preferences replace custom Settings rows, and license creation/transition code repeated responsibilities.
 - **Tradeoffs**: License asset reads remain synchronous, and the screens no longer share row implementations.
 - **Watch out**: Preference upgrades must preserve switch binding; license navigation, restoration and theme recreation were not exercised on a device.
-- **Source**: 55be399, d35669e1, f8822b8b; 20137e4c; bd580227; d053be24
+- **Source**: 55be399, d35669e1, f8822b8b; 20137e4c; bd580227; d053be24; 39e55b4b
 
 ### D56: Settings labels distinguish choices, current values and screen-off policy
 
@@ -209,15 +213,7 @@
 - **Why**: Settings and paste actions need concise labels that describe the actual choice and access boundary.
 - **Tradeoffs**: Summaries omit tutorials, performance ratios, wraparound examples and instantaneous lock status, revocation limits stay in developer documentation, and long English paste buttons stack while the checked Chinese layout uses one row.
 - **Watch out**: Preserve placeholders and confirmation meaning; final copy, vendor fonts and larger accessibility scales still need visual checks.
-- **Source**: b2f96a63, 75123eef, cf4f5e20, 1e5de64e; 20137e4c; d0a74e94, 0b3c5d8a, d0ddf170, 6f5be4da; d053be24
-
-### D57: Keep screen on is a persistent activity preference
-
-- **What**: A default-off overflow toggle above Settings persists in MainActivity preferences and applies FLAG_KEEP_SCREEN_ON with a themed standard checkbox.
-- **Why**: Watching logs or long output should not require repeated touches to avoid timeout.
-- **Tradeoffs**: The choice covers every tab and survives launches, increasing battery use while the terminal is visible.
-- **Watch out**: Keep it distinct from the service screen-off run policy; vendor behavior, power use and accessibility remain unverified.
-- **Source**: 5d82c4c3; d053be24
+- **Source**: b2f96a63, 75123eef, cf4f5e20, 1e5de64e; 20137e4c; d0a74e94, 0b3c5d8a, d0ddf170, 6f5be4da; d053be24; 39e55b4b
 
 ### D58: License lists open a dedicated offline reader
 
@@ -225,15 +221,7 @@
 - **Why**: The former same-activity fixed-column reader made navigation and reading awkward.
 - **Tradeoffs**: The reader adds a WebView lifecycle and WebKit dependency, catalog reads stay synchronous and full license texts are reached through related components.
 - **Watch out**: Renderer recovery, zoom, large fonts and tablets need more device coverage; reader ownership is now android/licenses but its pre-split history stays here.
-- **Source**: bd580227, 9c6c51a7; d053be24
-
-### D59: Layout and link handling are cohesive helpers beside MainActivity
-
-- **What**: TerminalLayout owns the hierarchy, status visibility, insets and IME animation, while TerminalLinks owns routing with the shared toast callback and MainActivity retains lifecycle and session coordination.
-- **Why**: Construction, animation and routing obscured activity lifecycle, search and shortcuts.
-- **Tradeoffs**: Two internal classes replace one large activity and expose interactive views to its coordinator.
-- **Watch out**: Construct after dynamic colors and assign before root attachment; preserve session detachment and destroyed-activity guards, with IME/navigation device regressions still unverified.
-- **Source**: b58c6494; d053be24
+- **Source**: bd580227, 9c6c51a7; d053be24; 39e55b4b
 
 ### D60: A shared lifecycle gate protects activities without stopping workloads
 
@@ -241,7 +229,7 @@
 - **Why**: Returning to terminal or secondary pages must not reveal protected content before authentication.
 - **Tradeoffs**: Visible paused pages may remain visible while protected operations are denied, and access protection neither encrypts stored data nor stops guest programs.
 - **Watch out**: Real biometric lockout/enrollment changes, overlapping windows, vendor credential screens and Back behavior need device coverage; gate ownership is now android/privacy.
-- **Source**: f61072f3, 9c6c51a7; d053be24
+- **Source**: f61072f3, 9c6c51a7; d053be24; 39e55b4b
 
 ### D61: Diagnostic export authorizes a specific handoff with fresh authentication
 
@@ -249,7 +237,7 @@
 - **Why**: An authorized save should finish without a second prompt while ordinary protected content stays locked.
 - **Tradeoffs**: An intentional archive transfer can finish while the page is locked and the user must explicitly unlock to return to protected content.
 - **Watch out**: Prompt deferral belongs to the current activity gate; real biometric and vendor prompt behavior remain unverified, and this pre-split contract stays here after android/privacy takes ownership.
-- **Source**: c7309c0c, 9c6c51a7; d053be24
+- **Source**: c7309c0c, 9c6c51a7; d053be24; 39e55b4b
 
 ### D62: The file button imports copies into the resolved login home
 
@@ -257,15 +245,15 @@
 - **Why**: CLI users need a direct file picker and usable paths to the imported copies.
 - **Tradeoffs**: The target ignores the tab cwd and effective user, a batch holds the rootfs read lock, and import has neither cancellation nor process-death recovery.
 - **Watch out**: Slow providers delay replacement, interruption or cleanup failure can leave partial files, and cloud/vendor pickers remain unverified; displayed paths use monospace after a blank line.
-- **Source**: 165b5f99; d053be24
+- **Source**: 165b5f99; d053be24; 39e55b4b
 
 ### D63: A title list overlays the complete terminal content column
 
 - **What**: TabListView renders session-identity snapshots in a black RecyclerView overlay with 32 dp rows and at most ten visible rows, layered after the terminal/keys/banner column under the separate top bar; disabling its button removes the reserved margin, closes the list and reveals the current tab after layout.
 - **Why**: Titles and status need to be accessible without sacrificing terminal focus or allowing bottom keys to cover the list.
-- **Tradeoffs**: The list covers content, ellipsizes titles and temporarily hides covered controls from accessibility; taps on exposed keys dismiss it without sending input.
+- **Tradeoffs**: The list covers content, uses the shared selected color for list labels (android/tabbar D4), ellipsizes titles and temporarily hides covered controls from accessibility; taps on exposed keys dismiss it without sending input.
 - **Watch out**: Preserve focus, close policy and unclipped IME-translated keys; animation clipping, TalkBack and live split-screen dismissal remain incompletely verified.
-- **Source**: 34348eda, 5c49c5a7, 562f2d78, 4918eabc
+- **Source**: 34348eda, 5c49c5a7, 562f2d78, 4918eabc; 39e55b4b; 71e94b55
 
 ### D64: Navigation haptics occur at explicit input boundaries
 
@@ -273,7 +261,7 @@
 - **Why**: Terminal controls should provide the tactile feedback already used by extra keys.
 - **Tradeoffs**: Each input boundary repeats a small call so programmatic switches and Ctrl+Tab receive no added vibration.
 - **Watch out**: Volume repeats, releases and system-volume fallback stay outside this path, and physical/vendor feedback remains unverified.
-- **Source**: 8c5f43fb
+- **Source**: 8c5f43fb; 39e55b4b
 
 ### D65: Tab-list rows animate structural changes and update content in place
 
@@ -281,7 +269,7 @@
 - **Why**: Closing tabs should animate without cross-fading progress, status or renumbering updates.
 - **Tradeoffs**: Row binding must distinguish structural animation from partial content updates.
 - **Watch out**: Verify rapid closes, dismissal during animations and bottom-row removal as a short viewport shrinks.
-- **Source**: 3cdebc8f
+- **Source**: 3cdebc8f; 39e55b4b
 
 ### D12: Extra keys provide release haptics, repeat and modifier feedback
 
@@ -289,7 +277,7 @@
 - **Why**: Modifier feedback remains useful after the title-only activity toast adapter is removed.
 - **Tradeoffs**: Keys send presses only, so Kitty-protocol programs receive no releases.
 - **Watch out**: Retain toast handling for extra keys, links and import results; tooltip focus/privacy behavior still needs device checks.
-- **Source**: c3c3b38, ba60e25, 655d37ec
+- **Source**: c3c3b38, ba60e25, 655d37ec; 39e55b4b
 
 ### D19: Tab numbers use 14 dp without following font scale
 
@@ -297,7 +285,7 @@
 - **Why**: Tab numbers should match list-title size while fixed-size bars avoid font-scale clipping.
 - **Tradeoffs**: Larger digits have less room in 32 dp cells, while dialogs, menus and toasts still follow font scale.
 - **Watch out**: Multi-digit numbers and OEM fonts need visual verification.
-- **Source**: 4aa2abf, 6254c6a8
+- **Source**: 4aa2abf, 6254c6a8; 39e55b4b
 
 ### D54: Shared TabMarks renders progress and status for both tab views
 
@@ -305,7 +293,7 @@
 - **Why**: The list needs the same status visibility as the bar without duplicate rendering logic.
 - **Tradeoffs**: Open lists diff status snapshots and animate visible sweeps, show the current row status and omit marks for ended sessions.
 - **Watch out**: Preserve report precedence, last-bound snapshots, primary selection text, fading scrollbar thumb and cleanup when hiding the list; TalkBack and OEM fonts need device checks.
-- **Source**: 807e9ba1, 20137e4c, d053be24, d729eaf1
+- **Source**: 807e9ba1, 20137e4c, d053be24, d729eaf1; 39e55b4b
 
 ### D66: Notification authorization is explicit and the banner can stay dismissed
 
@@ -313,15 +301,15 @@
 - **Why**: Users should choose when to authorize notifications and be able to reclaim terminal space afterward.
 - **Tradeoffs**: Dismissal survives permission revocation, upgraded installations without request history may go straight to settings, and disabled individual channels do not trigger the banner.
 - **Watch out**: Keep the original MainActivity preference file and refresh on results/resume; Android 11–12, vendor settings, fallback navigation, TalkBack and final spacing remain unverified.
-- **Source**: f61072f3, 4918eabc, ce38e763
+- **Source**: f61072f3, 4918eabc, ce38e763; 39e55b4b
 
 ### D67: Locale resources share feature ordering and expose five app languages
 
-- **What**: One resource file per locale uses matching feature sections for en, zh-CN, zh-Hant, ko and ja, with 208 entries per added locale, Taiwan terminology for script-wide Traditional Chinese, preserved format/plural rules and locale-specific punctuation.
+- **What**: One resource file per locale uses matching feature sections for en, zh-CN, zh-Hant, ko and ja, with 208 entries per added locale, Taiwan terminology for script-wide Traditional Chinese, preserved format/plural rules and locale-specific punctuation, including five localized Privacy policy labels, while Telegram uses one non-translatable brand resource.
 - **Why**: Broader language coverage needs complete translations and a consistent structure.
 - **Tradeoffs**: Translations and ordering need manual synchronization, one Traditional Chinese variant serves multiple regions, and Android 11–12 keep system-language selection.
 - **Watch out**: Native-speaker review, long labels, accessibility sizes and device language/default/current-tab restoration remain unverified; the Android 13+ declaration is in android/build D2.
-- **Source**: e406fc21, 5bd37526
+- **Source**: e406fc21, 5bd37526; 39e55b4b; 5f950434, 5b213f09
 
 ### D68: Settings summaries use concise localized wording
 
@@ -329,7 +317,30 @@
 - **Why**: Settings should be easier to scan across locales.
 - **Tradeoffs**: Shorter copy removes long-wait advice, file-picker repetition and the CJK-spacing explanation.
 - **Watch out**: Device wrapping/readability remain unverified and users receive less guidance about Always run.
-- **Source**: 84866dc1, 5bd37526
+- **Source**: 84866dc1, 5bd37526; 39e55b4b
+
+### D20: An indicator bar marks the current tab, locked modifiers and SYM
+- **What**: A rounded 16 × 1 dp bar in the selected terminal control colour, centred 4 dp below the label's baseline (whole pixels, rounded down), is drawn by the containers in `dispatchDraw` through `ExtraKeysView.drawIndicator` under the current tab, a locked modifier and SYM while the symbols show; numbers use the default weight, and one-shot modifiers use the selected colour alone (android/keys D3, android/tabbar D4).
+- **Why**: The current tab's 2 dp box looked heavy, bold numbers outweighed every other label, the primary colour cannot be told from muted labels in grayscale (both tone 80 in Material 3's dark scheme), and a locked modifier's underline matched nothing in the tab bar.
+- **Tradeoffs**: A one-shot modifier still relies on colour alone, a state change must invalidate the drawing container rather than the label, and the bar is 2 px at densities from 2 to 3.
+- **Watch out**: Seen only on an API 34 emulator at density 2.75 with Roboto; the 4 dp gap assumes labels without descenders; changing a label's opacity (as D24's renumbering might) would fade the indicator too.
+- **Source**: d48dd10; 71e94b55
+
+### D69: The terminal can request a battery optimization exemption
+
+- **What**: Show a 32 dp banner below notifications while the exemption is missing, check the privacy gate on tap, launch the system request and remember dismissal separately.
+- **Why**: Background command users need a discoverable way to request unrestricted battery use.
+- **Tradeoffs**: The two banners can occupy 64 dp together, and Settings provides another route after dismissal.
+- **Watch out**: Vendor confirmation dialogs and missing-handler behavior still need device checks.
+- **Source**: 7a931d97
+
+### D70: Ongoing notifications use separate localized state and failure text
+
+- **What**: The five locales drop privacy_running and run_notification, keep the detailed activity error, and add start_failed_title for the short notification title.
+- **Why**: Separate text lets notifications show a short title with the reason in the body while privacy uses the running policy.
+- **Tradeoffs**: The detailed activity string and short notification title need parallel maintenance, including locale-specific punctuation.
+- **Watch out**: Resource compilation and lint were recorded for c97b00bf, while notification typography still needs device checks.
+- **Source**: c7e338a5, c97b00bf
 
 ## Superseded
 
@@ -380,3 +391,5 @@
 - ~~D18 title toasts and D12 sharing their activity callback~~ → replaced by **D18, D12 and android/tabbar D3** in 655d37ec (2026-11-16; cross-module replacement, unrelated toasts retained)
 - ~~Automatic permission prompting after unlock in f61072f3 and the persistent centered banner in 4918eabc~~ → replaced by **D66** in 4918eabc and ce38e763 (2026-11-15; privacy gating retained)
 - ~~English/Simplified-Chinese-only locale coverage in e406fc21~~ → replaced by **D67** in 5bd37526 (2026-11-16; system picker and recreation behavior retained)
+- ~~Direct theme colors for terminal controls in D13 and primary-color selection under D20 and D63~~ → replaced by **D13, android/keys D3 and android/tabbar D4** in 71e94b55 (2026-11-17).
+- ~~The search field sets fallback line spacing itself under D41~~ → replaced by the terminal-theme setting in **D41** in b5303dd3 (2026-11-16).

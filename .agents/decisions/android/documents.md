@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/documents"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D6 were seeded by hand from the retired design doc
 > §11.3 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -26,7 +26,7 @@
 - **Why**: Copying files in and editing them with Android apps is the common use, and files must be editable by the same account in the terminal.
 - **Tradeoffs**: There is no home-only mode or guest permission enforcement, copies use create-and-write, and users whose home is / get only the read-only system root.
 - **Watch out**: A home that is a symlink to `/` passes the Kotlin check (its flags are only a hint), and only the store's check (kernel/store D9) refuses its writes.
-- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`); d5dbe29; d0ddf170; d053be24
+- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`); d5dbe29; d0ddf170; d053be24; 39e55b4b
 
 ### D4: Changes reach the other side in both directions
 - **What**: Provider changes are replayed under each running kernel's lock as inotify events; write fds are wrapped by `ParcelFileDescriptor.wrap` with a close listener on the documents-close thread that reports `IN_MODIFY`/`IN_CLOSE_WRITE`; directories the guest changed are polled by the service and notified to the Files app in one `notifyChange` call.
@@ -45,7 +45,7 @@
 - **What**: v1 asks for no storage permission: files move through this provider ("Copy to…") or the terminal import action (android/terminal D62). Planned for v1.x and not implemented: SAF directories mounted at `/mnt/<name>`, with synthetic modes (directories 0755, files 0644), `chmod`/`chown` succeeding silently, `symlink`/`link` returning `EPERM`, directory listings cached in memory, and case-insensitivity documented.
 - **Why**: Play does not approve `MANAGE_EXTERNAL_STORAGE` for terminal apps (design doc §15).
 - **Tradeoffs**: Until then guest programs cannot open files in Android's shared storage directly.
-- **Source**: design doc §11.3, §15; 165b5f99; d053be24
+- **Source**: design doc §11.3, §15; 165b5f99; d053be24; 39e55b4b
 
 ### D7: The Files app provider is a module of its own
 - **What**: android/documents covers `Documents.kt`, while the store-side browse API stays in kernel/store.
@@ -59,14 +59,14 @@
 - **Why**: Execution order was hard to follow and decoding/containment logic was duplicated.
 - **Tradeoffs**: Moved lines need blame -M, and the shared companion helper remains public despite only provider use.
 - **Watch out**: Device checks did not cover navigation/decoding and visibility after the deduplication.
-- **Source**: a546fea; 9d485e6e; 20137e4c; d053be24
+- **Source**: a546fea; 9d485e6e; 20137e4c; d053be24; 39e55b4b
 
 ### D9: `file:` links open as the provider's documents
 - **What**: `Documents.fileLink` maps a `file:` URI whose host is empty, `localhost` or the name in `/etc/hostname` to the document with the same guest path (percent-decoded, written back as an ID, empty and `.` components dropped, `..` refused), typed by the provider's own `getType` so its visibility rules apply; the terminal resolves it off the main thread and grants the viewer read access only (android/terminal D31), `findDocumentPath` lets the Files app open a directory it is sent to, and remote, hidden and missing files get their own toasts.
 - **Why**: `ls --hyperlink` and similar tools write `file:` links to guest paths, which have no host file, and a `file://` URI cannot be handed to another app (`FileUriExposedException`).
 - **Tradeoffs**: Every file link requires external file access, and privacy mode denies it; viewers can read but not save, so edits go through the Files app; `/proc`, `/dev` and other mounts are not in the store, so links into them count as missing.
 - **Watch out**: The Kotlin ID encoding must change together with the native `encode_path` (D2); the host is matched against `/etc/hostname`, not the running host name; `findDocumentPath` now also serves the Files app's own navigation.
-- **Source**: 1cc504b; d0ddf170; f61072f3; d053be24
+- **Source**: 1cc504b; d0ddf170; f61072f3; d053be24; 39e55b4b
 
 ### D10: Moving or deleting a directory revokes the persisted grants below it
 - **What**: `revokeTree` revokes the source document's ID and then every persisted outgoing grant on this provider whose document (a tree URI by its tree's document) is the path or lies below it (`Documents.grantedUnder`).
@@ -80,7 +80,7 @@
 - **Why**: All provider operations and terminal file links need the same explicit access boundary independently of service startup.
 - **Tradeoffs**: Enabling privacy clears prior consent and requires another opt-in afterward.
 - **Watch out**: All future provider operations must retain the common gate even when an obsolete saved preference is true.
-- **Source**: 0553229; d0ddf170, f61072f3; d053be24
+- **Source**: 0553229; d0ddf170, f61072f3; d053be24; 39e55b4b
 
 ### D12: Both roots and every provider operation share the access gate
 
@@ -88,7 +88,7 @@
 - **Why**: The old visibility switch left sensitive home files exposed even with the system root hidden.
 - **Tradeoffs**: There is no home-only mode, terminal file links require consent and guest symlink reads still bypass guest permission checks.
 - **Watch out**: Already-open descriptors, calls past the gate and copied data can survive revocation; persisted picker-grant behavior still needs device verification.
-- **Source**: d0ddf170, f61072f3; d053be24
+- **Source**: d0ddf170, f61072f3; d053be24; 39e55b4b
 
 ## Superseded
 

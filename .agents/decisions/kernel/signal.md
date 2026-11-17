@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D11 were seeded by hand from the retired design
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D11 were seeded by hand from the retired design
 > doc §7 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -90,7 +90,7 @@
 - **Why**: Separating independently maintained subsystems makes the oversized parent map practical to read and maintain.
 - **Tradeoffs**: Cross-boundary work follows child maps, while historical decisions keep their original parent tags and stable IDs.
 - **Watch out**: Bugs confirmed at the split or found by Starnix's and gVisor's tests stay open in the map, among them an early `CLD_STOPPED`, late single-step reports, unforced ptrace reads, no `PTRACE_EVENT_EXIT` for threads ended by another thread, a repeated stop report after detaching at an attach-time group stop, `SIGILL` frames carrying an `esr_context` with EC 0 where Linux 6.1 emits none, and synthesized abort ESRs that differ from Linux's; these pre-split qualifications remain discoverable through the child maps and are not resolved by the ownership split.
-- **Source**: 9e5be2b, d2b1dc3 (bug list since updated by 4e64e74, ce8a9ce, 5d7b936 and 7b7f73b, and shortened by D17–D21 and D25); 8a17e4a9; d053be24; 60790c14
+- **Source**: 9e5be2b, d2b1dc3 (bug list since updated by 4e64e74, ce8a9ce, 5d7b936 and 7b7f73b, and shortened by D17–D21 and D25); 8a17e4a9; d053be24; 60790c14; 39e55b4b
 
 ### D13: pidfd_send_signal through a `/proc/<tid>` directory signals the thread group
 - **What**: A `/proc/<tid>` directory fd finds its process with `group_of` and the signal goes to its tgid, as `kill_pid_info` does for such an fd up to Linux 6.8.
@@ -196,6 +196,14 @@
 - **Tradeoffs**: Every BKL-path syscall pays the record's stores once more, and the difference shows only while the thread waits inside `deliver` (stops, and ptrace stops after this point).
 - **Watch out**: A ptrace stop placed later in `deliver` shows -1 where Linux might still show the syscall.
 - **Source**: f1212d8
+
+### D28: Freezer entry and group kills mark cgroup observations
+
+- **What**: Use the same freezer-entry transition as vfork and mark the group when setting killed flags.
+- **Why**: Entering a freezer stop or killing tasks can complete a subtree freeze.
+- **Tradeoffs**: Group exit can mark observations whose contents stay unchanged.
+- **Watch out**: Stop, thaw and kill paths must agree on which tasks contribute to freeze completion.
+- **Source**: 0f5c5132
 
 ## Superseded
 

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -61,7 +61,7 @@
 - **Why**: Synthetic filesystem views and the substantial cgroup policy implementation need separate maintenance boundaries.
 - **Tradeoffs**: Adapter and policy changes require both maps, and pre-split cgroup decisions remain here under their original tags; tracing implementation belongs to kernel/ptrace while procfs memory-file handling remains here.
 - **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them per-thread fd views showing the leader's table, access checks under `task/<tid>` using the main thread's credentials, pagemap following the tid rather than the address space opened, writes that never advance a file's position, `/sys/class/net` statistics leaking the initial namespace's counters, partial change notifications, regeneration in the current reader's namespaces and no zoneinfo, pressure or kallsyms files.
-- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8); 45be9fae; 20137e4c; cf029f9a; d053be24; 60790c14
+- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8); 45be9fae; 20137e4c; cf029f9a; d053be24; 60790c14; 39e55b4b
 
 ### D16: Common sysctls exist, and root can write the read-only ones
 - **What**: 40 recorded sysctls with 6.1's ranges are kept in `Kernel::sysctls`, with kernel.modprobe, kernel.tainted and vm.overcommit_memory (kernel/mm D24) handled on their own and kptr_restrict, drop_caches and mmap_rnd_bits given Linux's permissions; debug.exception-trace starts at arm64's 0 and is read through `recorded_value` by kernel/signal's unhandled-exception reports (kernel/signal D23), and writing 2 or 3 to drop_caches requests a FUSE node sweep while the host keeps the page cache (kernel/fuse D2).
@@ -141,11 +141,11 @@
 - **Source**: f5c09f7
 
 ### D38: Mounts, mountinfo and four cgroup2 files report changes to poll and inotify
-- **What**: Open synthetic files carry an `fd::ProcEvent` (a shared counter, what the file last saw and when its contents were made), `pseudo::pollable` lets epoll accept the files Linux polls (procfs's global files, `/proc/sys`, `/proc/<pid>/net`, mounts, mountinfo, sysfs and cgroup2), `Vfs::mount_events` counts mount-table changes, and while an open file or an inotify watch names them `cgroup::observe` keeps cgroup.events, memory.events, memory.events.local and pids.events, whose changes `cgroup::notify_changes` turns into a counter bump, a poller wake-up and `IN_MODIFY` (keys in kernel/vfs D51); contents made before a change are made again at the next read from the start.
+- **What**: Open files carry an fd::ProcEvent counter and read snapshot, pseudo::pollable admits the supported procfs, sysfs and cgroup2 files, Vfs::mount_events counts mount changes, and cgroup::notify_changes compares dirty observations of cgroup.events, memory.events, memory.events.local and pids.events, updating poll counters before IN_MODIFY and regenerating stale contents at the next read from offset zero (kernel/vfs D51, kernel/cgroup D2–D3).
 - **Why**: These files could not be epoll'ed and never reported a change, so mount monitors and cgroup event watchers (OOM reporting, freezer state) never woke.
 - **Tradeoffs**: One mount counter serves every namespace, so any mount or propagation-type change marks every mountinfo reader; cgroup changes are seen at the next syscall, thread exit, freezer stop or timer pass, so a change undone in between is missed; other synthetic files still report no inotify events.
 - **Watch out**: `notify_changes` regenerates the observed files after every BKL syscall while anything observes them, a process scan for cgroup.events, and a new place that changes a cgroup outside those points delays its notification until the next one.
-- **Source**: affb1e2
+- **Source**: affb1e2; 0f5c5132, b65799c8
 
 ### D39: Per-thread entries show the thread's credentials, and the reader is the reading thread
 - **What**: status ids and the owners of per-process entries come from the thread under `task/<tid>` or the main thread (`Kernel::cred_of`, kernel/cred D1), the reader's credentials are the reading thread's, `may_read`'s access checks use the directory pid's (the main thread's) credentials except `syscall`'s (D40), and socket owners in `/proc/net` use the holding thread's fsuid.
@@ -167,7 +167,7 @@
 - **Why**: Multibyte tokens could panic the kernel, and quota-only updates lost the period.
 - **Tradeoffs**: Extra words and nonnumeric periods still fail where Linux’s sscanf can ignore them.
 - **Watch out**: Native comparison requires the container to expose and enable the CPU controller.
-- **Source**: 45be9fae; 20137e4c; d053be24
+- **Source**: 45be9fae; 20137e4c; d053be24; 39e55b4b
 
 ## Superseded
 
@@ -178,3 +178,4 @@
 - ~~`memory.current` counts shared pages once per process (D5's tradeoff, round 164)~~ → replaced by **D5** in 1d3d559 (2026-11-10, no SUPERSEDES declared)
 - ~~`may_read`'s access checks go by the target thread (D39 in part, 1be1142)~~ → corrected in f1212d8 (2026-11-11): they use the main thread's credentials (a bug in the map), and only **D40**'s `syscall` checks the thread
 - ~~D9 combined ownership of procfs, cgroup policy and device BPF~~ → replaced by **D9** in cf029f9a (2026-11-14)
+- ~~Comparing every observed cgroup file at every checkpoint under D38~~ → replaced by **kernel/cgroup D2** in 0f5c5132 (2026-11-17), preserving poll and inotify delivery.

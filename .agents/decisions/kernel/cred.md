@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D6 were seeded by hand from the retired design doc
 > §11.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -55,7 +55,7 @@
 - **Why**: §11.1's credential and seccomp design had to leave the retired design doc, and the user asked for a module of its own.
 - **Tradeoffs**: User namespaces sit in kernel/ns although their code is in `cred.rs`, and the Linux 6.1 comparisons rest on the verifiers' knowledge of the kernel source rather than a side-by-side reading; tracing, vDSO construction and nftables dependencies belong to kernel/ptrace, kernel/vdso and kernel/nft.
 - **Watch out**: Divergences recorded at the split or found since stay open in the map, among them incomplete seccomp logging, `for_access` ignoring `SECBIT_NO_SETUID_FIXUP`, errno-order differences in setgroups, capset and `PR_CAPBSET_DROP`, and setns into a foreign user namespace keeping dumpable.
-- **Source**: 12c4afa (bug list since updated by 4e64e74, and shortened by D1, D4, D5, D9–D11, D13 and kernel/process D33); cf029f9a; d053be24; 60790c14
+- **Source**: 12c4afa (bug list since updated by 4e64e74, and shortened by D1, D4, D5, D9–D11, D13 and kernel/process D33); cf029f9a; d053be24; 60790c14; 39e55b4b
 
 ### D8: Credential and seccomp files read in the order their code runs
 - **What**: cred.rs runs credentials and file capabilities with the user namespace types (owned by kernel/process) last and `impl Cred`'s entry points before id translation and scope checks; syscall/cred.rs runs id syscalls, capabilities, then committing; seccomp.rs goes from installing filters through syscall entry, the sysctls, user notifications, ptrace and thread exit to the always-allow cache, cBPF and shared helpers; constants several sections use stay at the top.
@@ -112,7 +112,7 @@
 - **Why**: Supervisor-context close used the wrong mqueue notification and FUSE lock ownership.
 - **Tradeoffs**: The path now shares the fd-replacement helper with normal replacement operations.
 - **Watch out**: New replacement paths must also close in the target process context.
-- **Source**: 01bfd882; 20137e4c; d053be24
+- **Source**: 01bfd882; 20137e4c; d053be24; 39e55b4b
 
 ## Superseded
 

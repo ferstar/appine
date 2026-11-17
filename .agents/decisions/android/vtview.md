@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/vtview"`
 >
-> Last distilled: 2026-11-16 (HEAD = 5bd37526)
+> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
 >
 > Decisions on the terminal view made before android/vtview was split from android/terminal keep their `android/terminal` tags and live in `.agents/decisions/android/terminal.md`: D5, D7, D9, D16, D17, D25, D30–D32, D34, D36, D37, D40, D41, D43 and D46–D48.
 
@@ -13,7 +13,7 @@
 - **Why**: Interaction and rendering had identifiable boundaries but shared an oversized map.
 - **Tradeoffs**: VtView orchestration and overlays stay here, sessions in android/vt and JNI, terminal locking and prompt parsing in android/vtcore.
 - **Watch out**: Preserve full-frame requests, overscan, image lifetimes and search coordination, and do not move native interaction sections into vtcore.
-- **Source**: d42013d (files since added by 49e8b08, D3); 9015b244, 81f60bef; d053be24
+- **Source**: d42013d (files since added by 49e8b08, D3); 9015b244, 81f60bef; d053be24; 39e55b4b
 
 ### D2: The view drops its image bitmaps while its window is hidden
 - **What**: `onWindowVisibilityChanged` calls `dropImages` when the window is not visible, and the next frame finds the placements' pictures missing, copies them from libghostty-vt and asks for a full frame, while the backing bitmap keeps showing the rows already painted.
@@ -35,7 +35,7 @@
 - **Why**: A first unmatched query otherwise left the count blank.
 - **Tradeoffs**: There is one extra count callback per query change, with the old count visible until the frame.
 - **Watch out**: A frame preceding library search progress can briefly report the prior count before correcting it.
-- **Source**: 5e1f851d; 20137e4c; d053be24
+- **Source**: 5e1f851d; 20137e4c; d053be24; 39e55b4b
 
 ### D5: View members follow their event flows and frame logging is removed
 
@@ -43,7 +43,7 @@
 - **Why**: Following an event required jumps between unrelated sections.
 - **Tradeoffs**: The large file and gesture properties remain, and frame timing now needs a profiler or temporary logging.
 - **Watch out**: Kotlin gesture/scaler initializers must remain after the state they read.
-- **Source**: aaa1e7d5; 20137e4c; d053be24
+- **Source**: aaa1e7d5; 20137e4c; d053be24; 39e55b4b
 
 ### D6: Prompt taps cross rows broken by ash
 
@@ -51,7 +51,7 @@
 - **Why**: Taps on later rows of long ash commands previously did nothing.
 - **Tradeoffs**: PS2 prompts remain separate lines and other shells need their own declared behavior.
 - **Watch out**: Arrow counts were tested with the host program rather than touch input; background-output limitations remain in android/vt D6.
-- **Source**: a809c5a8; 20137e4c; d053be24
+- **Source**: a809c5a8; 20137e4c; d053be24; 39e55b4b
 
 ### D7: Clipboard and delayed input obey the shared privacy gate
 
@@ -59,7 +59,7 @@
 - **Why**: A visible shield alone cannot prevent queued IME or dialog callbacks from sending input.
 - **Tradeoffs**: Operations while locked or without a resumed page are discarded instead of replayed.
 - **Watch out**: Every new clipboard/input path and delayed callback must retain the final checks.
-- **Source**: f61072f3; d053be24
+- **Source**: f61072f3; d053be24; 39e55b4b
 
 ### D8: IME replacement and completed composition use the checked commit path
 
@@ -67,7 +67,7 @@
 - **Why**: Replacement and composition paths could delay clipboard delivery or bypass unsafe-paste confirmation.
 - **Tradeoffs**: Offsets cannot edit input already sent, safe pastes stay immediate and optional-action validation encodes without sending.
 - **Watch out**: Recheck privacy and terminal modes when the user acts; real Gboard suggestions/history, other IMEs and older Android versions still need end-to-end device coverage.
-- **Source**: 6f5be4da; d053be24
+- **Source**: 6f5be4da; d053be24; 39e55b4b
 
 ### D9: Paste previews style only the inserted command as monospace
 
@@ -75,7 +75,7 @@
 - **Why**: Commands should remain visually distinct from explanatory text, as imported paths do.
 - **Tradeoffs**: Templates must use TextUtils placeholders and long lines still wrap.
 - **Watch out**: Preserve the placeholder and spans in future translations without changing paste authorization or encoding.
-- **Source**: 165b5f99; d053be24
+- **Source**: 165b5f99; d053be24; 39e55b4b
 
 ### D10: Height shrink briefly preserves the last painted frame
 
@@ -83,7 +83,7 @@
 - **Why**: Old rows can shift visibly before a CLI redraw arrives.
 - **Tradeoffs**: One temporary bitmap delays resized display briefly, while width changes, growth and interactive history render immediately.
 - **Watch out**: Track painted state independently of full-frame requests; slow redraws can exceed the deadline and vendor IME interruption coverage remains limited.
-- **Source**: 2e73a06a
+- **Source**: 2e73a06a; 39e55b4b
 
 ### D11: The system selection menu inherits the terminal night override
 
@@ -91,7 +91,7 @@
 - **Why**: Selection needs consistent colors without replacing system interaction.
 - **Tradeoffs**: The OS still determines layout and appearance.
 - **Watch out**: Verify OEM/version differences and menu reopening after system dark-mode changes.
-- **Source**: 4c639565
+- **Source**: 4c639565; 39e55b4b
 
 ## Superseded
 - ~~D1 ownership of frame encoding, mirrors, drawing, images, glyphs and fonts~~ → replaced by **D1** in 9015b244 (2026-11-14)
