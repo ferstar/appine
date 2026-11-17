@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: manifest permission for user-requested battery optimization exemption)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: shared package-group lookup and self-contained CargoNdkTask)
 
 ## Responsibilities
 
@@ -21,10 +21,11 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Key types
 
-- Gradle tasks: `CargoNdkTask` (one per variant, `buildRust<Variant>`), `RootfsAssetTask` (one
-  `rootfsAsset` shared by all variants), the first on `CargoTask` (the workspace and which cargo
-  to run); helpers `byVersion` (compares file names by their runs of digits, then by how many
-  runs), `newestFetched` (the newest file in `target/rootfs` whose name matches), `bashPackages`
+- Gradle tasks: `CargoNdkTask` (one per variant, `buildRust<Variant>`, owning the workspace,
+  process execution and cargo lookup), `RootfsAssetTask` (one `rootfsAsset` shared by all variants);
+  helpers `byVersion` (compares file names by their runs of digits, then by how many runs),
+  `newestFetched` (the newest file in `target/rootfs` whose name matches), `fetchedPackages`
+  (the newest APK for each requested name, null if any is missing), used by `bashPackages`
   (the newest of bash, readline, libncursesw and ncurses-terminfo-base, null when any is missing)
   and `procpsPackages` (procps-ng, libproc2, libintl, utmps-libs, skalibs-libs and the two ncurses
   packages, null when any is missing), `bubblewrapPackages` (bubblewrap and libcap2, null when either
@@ -47,6 +48,11 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   `ANDROID_NDK_HOME` and `ANDROID_NDK_ROOT` set to AGP's NDK, using `~/.cargo/bin/cargo` when it is
   executable; it is never up to date. Debug variants add the `test-hooks` and `borrow-check`
   features; the Rust side is always a release build.
+- Gradle resolves Zig from a nonblank, trimmed `zig.path` in `android/local.properties`, then the
+  `ZIG` environment variable, then `zig` on `PATH`. `BrowserAssetTask` invokes that executable;
+  `CargoNdkTask` passes the same value as `ZIG` to cargo and its build script. The local file is
+  ignored by Git, and its contents are read through a Gradle file provider for configuration-cache
+  tracking; both tasks declare the selected executable as an input.
 - On an Android target `build.rs` asserts the libghostty-vt source (`build.zig` in
   `target/ghostty/libghostty-vt-1.0.0`, or `APPINE_GHOSTTY_SRC`) and the release's Zig packages
   beside it (the same path with `-deps`), panics on any architecture but aarch64, and runs `$ZIG`

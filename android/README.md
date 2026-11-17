@@ -29,6 +29,15 @@ with its Zig packages (`scripts/fetch-ghostty`), both run from the repository ro
 build then runs offline. Zig also builds the static Linux browser launcher from
 `hosts/android/open-url.c`; its musl libc notice is included in the APK.
 
+Gradle resolves Zig from `zig.path` in `android/local.properties` first, then the `ZIG`
+environment variable, then `zig` on `PATH`. A missing or blank local value falls back to
+the environment. Both the browser launcher and Rust native build use this setting.
+For Android Studio on a Mac with Homebrew, add this to the ignored `local.properties`:
+
+```properties
+zig.path=/opt/homebrew/bin/zig
+```
+
 ```sh
 ./gradlew installDebug                 # build and install on a connected arm64 device
 ./gradlew connectedDebugAndroidTest    # instrumentation tests on a device or emulator

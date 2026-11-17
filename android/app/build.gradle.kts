@@ -1,9 +1,21 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
 }
 
 /** Repository root: the Cargo workspace and the rootfs from `scripts/fetch-rootfs` are here. */
 val repoRoot: Directory = rootProject.layout.projectDirectory.dir("..")
+
+/** Both Zig builds use the local toolchain override before the environment and PATH. */
+val zigExecutable = providers.fileContents(rootProject.layout.projectDirectory.file("local.properties"))
+    .asText.orElse("")
+    .map { text ->
+        Properties().apply { load(text.reader()) }
+            .getProperty("zig.path")?.trim()?.takeIf { it.isNotEmpty() }
+    }
+    .orElse(providers.environmentVariable("ZIG"))
+    .orElse("zig")
 
 /** Orders file names by the numbers in them, so that 3.10 comes after 3.9 and r10 after r9. */
 val byVersion: Comparator<File> = Comparator { a, b ->
@@ -16,6 +28,12 @@ val byVersion: Comparator<File> = Comparator { a, b ->
 fun newestFetched(name: Regex): File? = repoRoot.dir("target/rootfs").asFile
     .listFiles { f -> f.name.matches(name) }
     ?.maxWithOrNull(byVersion)
+
+/** The newest package for each name, or null when any package is missing. */
+fun fetchedPackages(vararg names: String): List<File>? = names
+    .map { newestFetched(Regex("""$it-\d.*\.apk""")) }
+    .takeIf { null !in it }
+    ?.filterNotNull()
 
 /** Alpine minirootfs tarball. */
 val rootfsTarball: File? = newestFetched(Regex("""alpine-minirootfs-.*-aarch64\.tar\.gz"""))
@@ -31,23 +49,15 @@ val doasPackage: File? = newestFetched(Regex("""doas-.*\.apk"""))
  * offline at the first login of a system the app imported, whose login shell bash is; null when
  * any of them is missing.
  */
-val bashPackages: List<File>? = listOf("bash", "readline", "libncursesw", "ncurses-terminfo-base")
-    .map { newestFetched(Regex("""$it-\d.*\.apk""")) }
-    .takeIf { null !in it }
-    ?.filterNotNull()
+val bashPackages: List<File>? = fetchedPackages("bash", "readline", "libncursesw", "ncurses-terminfo-base")
 
 /** procps-ng and its missing libraries, installed offline on the first login of a new Alpine system. */
-val procpsPackages: List<File>? = listOf(
+val procpsPackages: List<File>? = fetchedPackages(
     "procps-ng", "libproc2", "libintl", "utmps-libs", "skalibs-libs", "libncursesw", "ncurses-terminfo-base",
-).map { newestFetched(Regex("""$it-\d.*\.apk""")) }
-    .takeIf { null !in it }
-    ?.filterNotNull()
+)
 
 /** bubblewrap and libcap, installed offline independently of the login shell. */
-val bubblewrapPackages: List<File>? = listOf("bubblewrap", "libcap2")
-    .map { newestFetched(Regex("""$it-\d.*\.apk""")) }
-    .takeIf { null !in it }
-    ?.filterNotNull()
+val bubblewrapPackages: List<File>? = fetchedPackages("bubblewrap", "libcap2")
 
 /** For example 3.24.3 → v3.24, written into apk's repository URLs. */
 val alpineBranch: String = rootfsTarball
@@ -140,7 +150,7 @@ val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
 
 val browserAsset = tasks.register<BrowserAssetTask>("browserAsset") {
     source.set(repoRoot.file("hosts/android/open-url.c"))
-    zig.set(providers.environmentVariable("ZIG").orElse("zig"))
+    zig.set(zigExecutable)
     outputDir.set(layout.buildDirectory.dir("generated/browser/assets"))
 }
 
@@ -149,6 +159,7 @@ androidComponents {
         val suffix = variant.name.replaceFirstChar(Char::uppercase)
         val buildRust = tasks.register<CargoNdkTask>("buildRust$suffix") {
             workspace.set(repoRoot)
+            zig.set(zigExecutable)
             ndkDirectory.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.path })
             features.set(if (variant.buildType == "debug") listOf("test-hooks", "borrow-check") else emptyList())
             outputDir.set(layout.buildDirectory.dir("generated/rust/${variant.name}/jniLibs"))
@@ -196,7 +207,13 @@ abstract class BrowserAssetTask : DefaultTask() {
  * process (effective only when `APPINE_TEST_HOOKS=1` is set); it also turns on `borrow-check`,
  * which checks that no kernel object is borrowed when the BKL is released.
  */
-abstract class CargoNdkTask : CargoTask() {
+abstract class CargoNdkTask : DefaultTask() {
+    @get:Internal
+    abstract val workspace: DirectoryProperty
+
+    @get:Input
+    abstract val zig: Property<String>
+
     @get:Input
     abstract val ndkDirectory: Property<String>
 
@@ -205,6 +222,9 @@ abstract class CargoNdkTask : CargoTask() {
 
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
+
+    @get:Inject
+    abstract val exec: ExecOperations
 
     init {
         // cargo does its own incremental builds
@@ -228,9 +248,14 @@ abstract class CargoNdkTask : CargoTask() {
             // uses depends on its order of precedence.
             environment("ANDROID_NDK_HOME", ndkDirectory.get())
             environment("ANDROID_NDK_ROOT", ndkDirectory.get())
+            environment("ZIG", zig.get())
             environment("CARGO_TARGET_DIR", File(root, "target/android").path)
         }
     }
+
+    /** The cargo under `~/.cargo/bin` when there is one, else the one in `PATH`. */
+    private fun cargo(): String = File(System.getProperty("user.home"), ".cargo/bin/cargo")
+        .takeIf { it.canExecute() }?.path ?: "cargo"
 }
 
 /**
@@ -278,17 +303,4 @@ abstract class RootfsAssetTask : DefaultTask() {
         if (bubblewrap.isEmpty) throw GradleException("bubblewrap packages not found: run scripts/fetch-rootfs first")
         for (apk in bubblewrap) apk.copyTo(File(out, "bubblewrap/${apk.name}"))
     }
-}
-
-/** A task that runs cargo in the Cargo workspace. */
-abstract class CargoTask : DefaultTask() {
-    @get:Internal
-    abstract val workspace: DirectoryProperty
-
-    @get:Inject
-    abstract val exec: ExecOperations
-
-    /** The cargo under `~/.cargo/bin` when there is one, else the one in `PATH`. */
-    protected fun cargo(): String = File(System.getProperty("user.home"), ".cargo/bin/cargo")
-        .takeIf { it.canExecute() }?.path ?: "cargo"
 }
