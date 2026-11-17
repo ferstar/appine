@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: Tier 0 instruction fetch, ADD/SUB and contiguous SIMD structure accesses)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: Tier 1 reads of the live FPSR)
 
 ## Responsibilities
 
@@ -200,8 +200,9 @@ Tier 1, only CPUID advertised).
   - `svc #0` exits to the kernel inline; other `svc` immediates, BRK, and PSTATE writes other than
     FlagM go to Tier 0;
   - `mrs fpcr` and `mrs`/`msr tpidr_el0` use the guest CPU state. `mrs dczid_el0` becomes the
-    constant 4. NZCV, CNTVCT, CNTVCTSS and CNTFRQ accesses run natively after the Tier 0 whitelist
-    check. FPCR writes, FPSR accesses and other system registers go to Tier 0;
+    constant 4. `mrs fpsr` reads the host FPSR, including flags raised earlier in the block.
+    NZCV, CNTVCT, CNTVCTSS and CNTFRQ accesses also run natively after the Tier 0 whitelist
+    check. FPCR and FPSR writes and other system registers go to Tier 0;
   - HINT space, including PAC and BTI hints, emits nothing; authenticated branches go to Tier 0;
   - DC CVAC/CVAU/CIVAC/CVAP/CVADP and `ic ivau` only check read access; `ic ivau` records its page
     in `ivau_page` (a second, different page exits to Tier 0); `dc zva` zeroes via the translated
@@ -485,6 +486,8 @@ Tier 1, only CPUID advertised).
 
 ## Open questions
 
+- Do workloads using top-byte-tagged data pointers fall back often enough to justify handling
+  those addresses in the Tier 1 refill routine?
 - Is it intended that FAULT, KICK and signal exits leave the exclusive monitor set (architecturally
   an exception return clears it)? The compare-and-swap semantics make this mostly harmless.
 - Should FPCR written by sigreturn or ptrace be masked like `msr fpcr` in Tier 0?

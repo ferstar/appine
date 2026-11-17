@@ -152,6 +152,7 @@ _Static_assert((MAX_BLOCK_WORDS & BRANCH_MASK) == 0 && MAX_BLOCK_WORDS << REASON
 
 #define SYSREG_NZCV 0xda10
 #define SYSREG_FPCR 0xda20
+#define SYSREG_FPSR 0xda21
 #define SYSREG_TPIDR_EL0 0xde82
 #define SYSREG_DCZID_EL0 0xd807
 #define SYSREG_CNTFRQ_EL0 0xdf00
@@ -2061,9 +2062,13 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         unsigned rt = insn & 31;
         unsigned sysreg = FIELD(insn, 20, 5);
         switch (sysreg) {
+        case SYSREG_FPSR:
+            /* Read the flags raised by translated FP instructions. Tier 0 masks writes. */
+            if (!read)
+                return fallback(x, pc);
+            /* fallthrough */
         case SYSREG_NZCV:
-        /* Timers are read-only, and writes have already been rejected by tier0_defined; read
-         * as is on the host */
+        /* tier0_defined rejects writes to the timers. */
         case SYSREG_CNTFRQ_EL0:
         case SYSREG_CNTVCT_EL0:
         case SYSREG_CNTVCTSS_EL0: {

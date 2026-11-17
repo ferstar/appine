@@ -213,6 +213,33 @@ fn fpcr_reads_use_the_guest_state_inside_translated_code() {
 }
 
 #[test]
+fn fpsr_reads_observe_exceptions_raised_inside_translated_code() {
+    const IOC: u64 = 1 << 0; // Invalid operation
+    const IXC: u64 = 1 << 4; // Inexact result
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::new();
+        g.cpu.state_mut().fpsr = IXC;
+        g.code(
+            CODE,
+            &[
+                0x1e60_1800, // fdiv d0, d0, d0: 0 / 0 sets IOC
+                0xd53b_4430, // mrs x16, fpsr (stolen in the default set)
+                0xd53b_4435, // mrs x21, fpsr (stolen in the Go set)
+                0xd53b_443f, // mrs xzr, fpsr
+                SVC,
+            ],
+        );
+        g.run(&mut dbt);
+        let s = g.cpu.state();
+        assert_eq!([s.x[16], s.x[21], s.fpsr], [IXC | IOC; 3]);
+        assert_eq!(dbt.stats().exits_interp, 0);
+    }
+}
+
+#[test]
 fn both_register_sets_run_the_same_code() {
     if Dbt::new().is_none() {
         return;
