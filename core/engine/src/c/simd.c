@@ -873,22 +873,25 @@ static enum appine_exit ldst_multiple(struct appine_cpu *c, uint32_t insn)
         return undef(c, insn);
 
     uint32_t access = load ? APPINE_ACCESS_READ : APPINE_ACCESS_WRITE;
-    unsigned esize = 1u << size, elements = (q ? 16u : 8u) >> size;
-    uint64_t addr = base_reg(c, rn), total = (uint64_t)rpt * selem * elements * esize;
+    /* LD1/ST1 lay out each whole register contiguously in memory. */
+    unsigned reg_bytes = 8u << q;
+    unsigned copy_bytes = selem == 1 ? reg_bytes : 1u << size;
+    unsigned copies = selem == 1 ? 1 : reg_bytes >> size;
+    uint64_t addr = base_reg(c, rn), total = (uint64_t)rpt * selem * reg_bytes;
     if (!check_sp(c, rn, access) || !probe(c, addr, total, access))
         return APPINE_EXIT_FAULT;
 
     uint8_t regs[4][16] = {{0}};
     uint64_t offs = 0;
     for (unsigned r = 0; r < rpt; r++) {
-        for (unsigned e = 0; e < elements; e++) {
+        for (unsigned e = 0; e < copies; e++) {
             for (unsigned s = 0; s < selem; s++) {
-                uint8_t *elem = &regs[r + s][e * esize];
+                uint8_t *elem = &regs[r + s][e * copy_bytes];
                 if (load)
-                    copy_in(c, addr + offs, elem, esize);
+                    copy_in(c, addr + offs, elem, copy_bytes);
                 else
-                    copy_out(c, addr + offs, vreg(c, rt + r + s) + e * esize, esize);
-                offs += esize;
+                    copy_out(c, addr + offs, vreg(c, rt + r + s) + e * copy_bytes, copy_bytes);
+                offs += copy_bytes;
             }
         }
     }

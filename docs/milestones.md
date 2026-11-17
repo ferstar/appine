@@ -265,6 +265,9 @@ In `namespaces`, Appine's side failed once on CI on 2026-11-11 (a manual full ru
 
 In `gvisor-process` and `gvisor-fs`, Appine's side of a test was killed by the runner's 60 s timeout (`exit 137`) in two manual full runs on CI on 2026-11-11: `ExecTest.OneEnv` and `ExecTest.InterpreterScriptTrailingWhitespace` in the first, `FcntlLockTest.SetLockDroppedOnClose` in the second. Each forks and execs a child and waits for it; neither run's appine stderr had a BKL watchdog report, so no syscall held the BKL that long, which points to a wait that was never woken. They did not recur on the development VM. Since then the gtest runner follows a test killed by its timeout with each thread of its processes and the syscall it waits in (`hang:` lines, from Appine's `/proc/<pid>/task/<tid>/syscall`), which full.yml uploads with the failed outputs.
 
+On 2026-11-17, `vfs::store::tests::inode_numbers_reused_after_boot_keep_their_objects` failed once
+in the Linux arm64 workspace suite. After reopening the store, the test counted 60 objects handed
+to the reaper where it expected zero. It passed on its own and on a full rerun. The cause is unknown.
 
 ## R1 measurements
 

@@ -129,16 +129,45 @@ void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access)
     return (void *)(host_page + (va & PAGE_MASK));
 }
 
+static inline enum appine_exit fetch_fault(struct appine_cpu *cpu, uint64_t pc, uint32_t kind)
+{
+    raise_fault(cpu, pc, APPINE_ACCESS_EXEC, kind);
+    return APPINE_EXIT_FAULT;
+}
+
+static inline enum appine_exit exec_at(struct appine_cpu *cpu, const void *host)
+{
+    uint32_t insn;
+    memcpy(&insn, host, sizeof(insn));
+    return appine_interp_exec(cpu, insn);
+}
+
 static enum appine_exit cpu_run(void *ctx, struct appine_cpu *cpu)
 {
     (void)ctx;
+    /* A kick ends this run before the kernel can reclaim the page. Recheck execute permission
+     * on the next run, even if it starts at the same PC. */
+    uint64_t last_page = UINT64_MAX, addend = 0;
     for (;;) {
         /* Check quickly with a plain load first, and clear with an atomic exchange only when there
          * really is a request, so a concurrently arriving kick is not swallowed */
         if (UNLIKELY(__atomic_load_n(&cpu->pending, __ATOMIC_RELAXED)) &&
             __atomic_exchange_n(&cpu->pending, 0, __ATOMIC_ACQUIRE))
             return APPINE_EXIT_KICK;
-        enum appine_exit r = appine_interp_step(cpu);
+        uint64_t pc = cpu->pc, page = pc >> APPINE_PAGE_SHIFT;
+        enum appine_exit r;
+        if (UNLIKELY((pc & 3) || cpu->nbrk)) {
+            r = appine_interp_step(cpu);
+        } else {
+            if (UNLIKELY(last_page != page)) {
+                void *host = tlb_lookup(cpu, pc, APPINE_ACCESS_EXEC);
+                if (!host)
+                    return fetch_fault(cpu, pc, APPINE_FAULT_PAGE);
+                last_page = page;
+                addend = (uintptr_t)host - pc;
+            }
+            r = exec_at(cpu, (const void *)(uintptr_t)(pc + addend));
+        }
         if (r != APPINE_EXIT_NONE)
             return r;
     }
@@ -190,23 +219,15 @@ static bool brk_hit(const struct appine_cpu *cpu, uint64_t pc)
 enum appine_exit appine_interp_step(struct appine_cpu *cpu)
 {
     uint64_t pc = cpu->pc;
-    if (UNLIKELY(pc & 3)) {
-        raise_fault(cpu, pc, APPINE_ACCESS_EXEC, APPINE_FAULT_ALIGN);
-        return APPINE_EXIT_FAULT;
-    }
+    if (UNLIKELY(pc & 3))
+        return fetch_fault(cpu, pc, APPINE_FAULT_ALIGN);
     /* As on hardware, before executing this instruction */
-    if (UNLIKELY(cpu->nbrk) && brk_hit(cpu, pc)) {
-        raise_fault(cpu, pc, APPINE_ACCESS_EXEC, APPINE_FAULT_BREAK);
-        return APPINE_EXIT_FAULT;
-    }
+    if (UNLIKELY(cpu->nbrk) && brk_hit(cpu, pc))
+        return fetch_fault(cpu, pc, APPINE_FAULT_BREAK);
     void *p = tlb_lookup(cpu, pc, APPINE_ACCESS_EXEC);
-    if (UNLIKELY(!p)) {
-        raise_fault(cpu, pc, APPINE_ACCESS_EXEC, APPINE_FAULT_PAGE);
-        return APPINE_EXIT_FAULT;
-    }
-    uint32_t insn;
-    memcpy(&insn, p, sizeof(insn));
-    return appine_interp_exec(cpu, insn);
+    if (UNLIKELY(!p))
+        return fetch_fault(cpu, pc, APPINE_FAULT_PAGE);
+    return exec_at(cpu, p);
 }
 
 enum appine_exit appine_cpu_exec_insn(struct appine_cpu *cpu, uint32_t insn)

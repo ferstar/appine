@@ -85,6 +85,21 @@ impl Guest {
 }
 
 #[test]
+fn add_sub_distinguishes_sp_from_zr_and_preserves_flags() {
+    let mut g = Guest::new();
+    g.cpu.state_mut().sp = 0x1234_5678_ffff_fff8;
+    g.cpu.state_mut().nzcv = 0x9000_0000;
+    g.set_x(0, 1);
+    g.step(0x1100_43ff); // add wsp, wsp, #16
+    assert_eq!(g.cpu.state().sp, 8);
+    g.step(0xcb20_4bff); // sub sp, sp, w0, uxtw #2
+    g.step(0x8b00_043f); // add xzr, x1, x0, lsl #1
+    assert_eq!((g.cpu.state().sp, g.cpu.state().nzcv), (4, 0x9000_0000));
+    g.step(0xf100_13ff); // cmp sp, #4
+    assert_eq!((g.cpu.state().sp, g.cpu.state().nzcv), (4, 0x6000_0000));
+}
+
+#[test]
 fn load_store_immediate_forms() {
     let mut g = Guest::new();
     g.put_u64(DATA + 8, 0x1122_3344_5566_7788);
@@ -318,6 +333,55 @@ fn simd_and_fp_round_trip() {
     let v = g.cpu.state().v;
     assert_eq!(v[0][0].to_le_bytes(), [0, 1, 2, 3, 4, 5, 6, 7]);
     assert_eq!(v[1][1].to_le_bytes(), [24, 25, 26, 27, 28, 29, 30, 31]);
+}
+
+#[test]
+fn contiguous_vectors_wrap_and_probe_before_writeback() {
+    if !has_simd() {
+        return;
+    }
+    let mut g = Guest::new();
+    let end = DATA + 2 * PAGE_SIZE;
+    let addr = end - 16;
+    g.put_u64(addr, 1);
+    g.put_u64(addr + 8, 2);
+    g.set_x(1, addr);
+    g.cpu.state_mut().v[31] = [0, u64::MAX];
+    g.cpu.state_mut().v[0] = [0, u64::MAX];
+    g.step(0x0cdf_a03f); // ld1 {v31.8b, v0.8b}, [x1], #16
+    assert_eq!(g.cpu.state().v[31], [1, 0]);
+    assert_eq!(g.cpu.state().v[0], [2, 0]);
+    assert_eq!(g.x(1), end);
+
+    const ST1_POST: u32 = 0x0c9f_a03f; // st1 {v31.8b, v0.8b}, [x1], #16
+    let pc = g.pc();
+    g.set_x(1, end - 8);
+    assert_eq!(
+        g.cpu.exec_insn(ST1_POST),
+        Some(Exit::Fault {
+            addr: end,
+            access: Access::Write,
+            kind: FaultKind::Page
+        })
+    );
+    assert_eq!(g.get_u64(end - 8), 2);
+    assert_eq!((g.pc(), g.x(1)), (pc, end - 8));
+
+    g.set_x(1, addr);
+    g.cpu
+        .state_mut()
+        .set_hw_debug(&[], &[(end - 1, end, appine_engine::WATCH_STORE)]);
+    g.cpu.state_mut().v[31] = [3, 4];
+    assert_eq!(
+        g.cpu.exec_insn(ST1_POST),
+        Some(Exit::Fault {
+            addr,
+            access: Access::Write,
+            kind: FaultKind::Watchpoint
+        })
+    );
+    assert_eq!(g.get_u64(addr), 1);
+    assert_eq!((g.pc(), g.x(1)), (pc, addr));
 }
 
 #[test]
@@ -976,6 +1040,20 @@ fn run_fetches_through_the_tlb() {
     assert_eq!(g.cpu.run(), Exit::Svc { imm: 0 });
     assert_eq!(g.x(0), 42);
 
+    // Falling through from the last word must check the new page before fetching.
+    let last = CODE + PAGE_SIZE - 4;
+    g.bytes(last)[..4].copy_from_slice(&0xd503_201fu32.to_le_bytes()); // nop
+    g.cpu.state_mut().pc = last;
+    assert_eq!(
+        g.cpu.run(),
+        Exit::Fault {
+            addr: last + 4,
+            access: Access::Exec,
+            kind: FaultKind::Page
+        }
+    );
+    assert_eq!(g.pc(), last + 4);
+
     // Misaligned pc
     g.cpu.state_mut().pc = CODE + 2;
     assert!(matches!(
@@ -1009,6 +1087,22 @@ fn run_fetches_through_the_tlb() {
             ..
         }
     ));
+}
+
+#[test]
+fn run_stops_at_a_breakpoint_on_the_current_page() {
+    let mut g = Guest::new();
+    g.bytes(CODE)[..4].copy_from_slice(&0xd503_201fu32.to_le_bytes()); // nop
+    g.cpu.state_mut().set_hw_debug(&[CODE + 4], &[]);
+    assert_eq!(
+        g.cpu.run(),
+        Exit::Fault {
+            addr: CODE + 4,
+            access: Access::Exec,
+            kind: FaultKind::HwBreakpoint
+        }
+    );
+    assert_eq!(g.pc(), CODE + 4);
 }
 
 /// SIMD&FP and native stubs are available only on aarch64 Linux hosts (HWCAP reflects this

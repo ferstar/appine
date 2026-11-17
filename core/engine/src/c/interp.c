@@ -254,15 +254,14 @@ static enum appine_exit dp_imm(cpu_t *c, uint32_t insn)
         if (BIT(insn, 22))
             imm <<= 12;
         uint64_t n = rx_sp(c, rn), nzcv, r;
-        if (BIT(insn, 30))
-            r = add_with_carry(n, ~imm, 1, sf, &nzcv);
-        else
-            r = add_with_carry(n, imm, 0, sf, &nzcv);
-        if (BIT(insn, 29)) {
+        if (!BIT(insn, 29)) {
+            r = narrow(BIT(insn, 30) ? n - imm : n + imm, sf);
+            wx_sp(c, rd, r);
+        } else {
+            r = BIT(insn, 30) ? add_with_carry(n, ~imm, 1, sf, &nzcv)
+                              : add_with_carry(n, imm, 0, sf, &nzcv);
             c->nzcv = nzcv;
             wx(c, rd, r);
-        } else {
-            wx_sp(c, rd, r);
         }
         return next(c);
     }
@@ -420,16 +419,16 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
             m = extend_reg(rx(c, rm), FIELD(insn, 15, 13), imm3, sf);
             n = rx_sp(c, rn);
         }
-        if (BIT(insn, 30))
-            r = add_with_carry(n, ~m, 1, sf, &nzcv);
-        else
-            r = add_with_carry(n, m, 0, sf, &nzcv);
-        if (BIT(insn, 29)) {
-            c->nzcv = nzcv;
-            wx(c, rd, r);
-        } else if (op2 & 1) {
-            wx_sp(c, rd, r);
+        if (!BIT(insn, 29)) {
+            r = narrow(BIT(insn, 30) ? n - m : n + m, sf);
+            if (op2 & 1)
+                wx_sp(c, rd, r);
+            else
+                wx(c, rd, r);
         } else {
+            r = BIT(insn, 30) ? add_with_carry(n, ~m, 1, sf, &nzcv)
+                              : add_with_carry(n, m, 0, sf, &nzcv);
+            c->nzcv = nzcv;
             wx(c, rd, r);
         }
         return next(c);

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: scalar accesses, integer vector stubs, FPCR reads and invalidation buckets)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: Tier 0 instruction fetch, ADD/SUB and contiguous SIMD structure accesses)
 
 ## Responsibilities
 
@@ -103,10 +103,16 @@ Tier 1, only CPUID advertised).
 ### Tier 0 execution
 
 - Step order: PC alignment (alignment fault), hardware breakpoint (before executing), instruction
-  fetch through the ITLB (exec page fault), then decode.
+  fetch through the ITLB (exec page fault), then decode. During a run, an aligned PC with no
+  hardware breakpoints can reuse the last code page's address offset. The run loop still checks
+  for a kick before fetching each instruction word from guest memory. Every exit discards the
+  offset so the next run observes any intervening TLB flush.
 - Decoding is hand-written mask tests and `switch` on encoding fields, dispatching first on bits
   28:25 (data processing immediate, branches and system, data processing register, loads and
   stores, SIMD and FP data processing); everything else is undefined.
+- ADD/SUB immediate and shifted or extended register forms compute NZCV only when the S bit is
+  set. With S clear, immediate and extended forms can write SP and shifted forms discard a write
+  to register 31.
 - A failing or undefined instruction leaves PC and registers untouched; only `svc` and `ic ivau`
   exits advance PC.
 - Data addresses have the top byte ignored (TBI); PC and branch targets are not untagged.
@@ -142,6 +148,8 @@ Tier 1, only CPUID advertised).
 - Tier 1's enter routine does the same for a whole run (saves host d8–d15 and FPCR, loads guest
   FPCR, FPSR, NZCV, V0–V31); its exit routine stores V0–V31, FPSR and NZCV and restores host state.
 - SIMD and FP loads and stores are implemented in C through the soft-MMU, checking every page first.
+  Multiple-structure LD1/ST1 copy one 8- or 16-byte register at a time after checking the whole
+  range for page faults and watchpoints. Interleaved LD2–LD4/ST2–ST4 copy one element at a time.
 - If native stubs are unavailable, those instructions are undefined and no SIMD or FP feature is
   advertised.
 
