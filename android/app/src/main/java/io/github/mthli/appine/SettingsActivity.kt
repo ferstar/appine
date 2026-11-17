@@ -209,7 +209,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         val telegram = link(R.string.settings_telegram, TELEGRAM_URL)
         val project = link(R.string.settings_project, PROJECT_URL)
         val version = action(R.string.settings_version) { onVersion() }.apply {
-            summary = BuildConfig.VERSION_NAME
+            summary = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
         }
 
         group(R.string.settings_group_system, distro, account, reset)

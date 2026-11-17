@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: Telegram link in Settings About)
+> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: version name and code in Settings About)
 
 ## Responsibilities
 
@@ -396,7 +396,8 @@ session consuming their state and events (`android/vt`).
   Tabs can handle the same VIEW intent; no handler produces the shared `link_no_app` toast.
   The licenses summary names GNU AGPL 3.0 or later; the full copyright, warranty disclaimer and
   license text remain in the Appine notice on the license page.
-- About's final Version action shows `BuildConfig.VERSION_NAME`. It opens the HTTPS Google Play
+- About's final Version action shows `BuildConfig.VERSION_NAME` followed by `BuildConfig.VERSION_CODE`
+  in parentheses (`1.0.0 (1)`). It opens the HTTPS Google Play
   details URL for `BuildConfig.APPLICATION_ID`, first restricted to `com.android.vending`, then
   without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
   The link can be built before publication, but the store listing is unavailable until published.
