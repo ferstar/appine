@@ -12,32 +12,33 @@ Requires Android 11 or later on a 64-bit ARM device.
 
 ## Features
 
+<!-- The 128px dividers give all five columns the same minimum width on narrow screens. -->
 <table>
   <tr>
     <td width="20%" align="center" valign="top">
       <a href="docs/screenshots/codex-cli.png"><img src="docs/screenshots/codex-cli.png" width="160" alt="Codex CLI open in the Appine project directory"></a>
       <hr width="128">
-      Use <strong>Codex CLI</strong> to work on a local project from your Android terminal.
+      <p>Use <strong>Codex CLI</strong> to work on a local project from your Android terminal.</p>
     </td>
     <td width="20%" align="center" valign="top">
       <a href="docs/screenshots/vim.png"><img src="docs/screenshots/vim.png" width="160" alt="Vim welcome screen in the second terminal tab"></a>
       <hr width="128">
-      Edit code and configuration files in <strong>Vim</strong>.
+      <p>Edit code and configuration files in <strong>Vim</strong>.</p>
     </td>
     <td width="20%" align="center" valign="top">
       <a href="docs/screenshots/languages.png"><img src="docs/screenshots/languages.png" width="160" alt="Version output for Python, Clang, Java, Node.js, Go, and Rust"></a>
       <hr width="128">
-      Run Python scripts, compile C and C++, or develop with Java, Node.js, Go, and Rust.
+      <p>Run Python scripts, compile C and C++, or develop with Java, Node.js, Go, and Rust.</p>
     </td>
     <td width="20%" align="center" valign="top">
       <a href="docs/screenshots/docker.png"><img src="docs/screenshots/docker.png" width="160" alt="A running Nginx container serving its welcome page on port 8080"></a>
       <hr width="128">
-      Run <strong>Docker</strong> containers on your device, for example to host an Nginx web server.
+      <p>Run <strong>Docker</strong> containers on your device, for example to host an Nginx web server.</p>
     </td>
     <td width="20%" align="center" valign="top">
       <a href="docs/screenshots/kitty-graphics.png"><img src="docs/screenshots/kitty-graphics.png" width="160" alt="Two landscape photos displayed inline by chafa"></a>
       <hr width="128">
-      View images in terminal programs that use the <strong>Kitty graphics protocol</strong>.
+      <p>View images in terminal programs that use the <strong>Kitty graphics protocol</strong>.</p>
     </td>
   </tr>
 </table>
