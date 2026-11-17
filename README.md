@@ -88,7 +88,9 @@ which helps when a test fails.
 To profile, run `appine-run` under `perf record` with `APPINE_PERF_MAP=1`: tier 1 then writes
 `/tmp/perf-<pid>.map`, and `perf report` attributes samples in translated code to guest
 addresses (`g_<pc>`). `--stats` prints how many blocks were translated and why translated code
-exited.
+exited. `tier 0 fallback` counts instructions the translator leaves to the interpreter.
+The `interp` count on the `exits` line records each runtime exit to the interpreter,
+including exits caused by failed grouped memory checks.
 
 A bug in the kernel layer or the engine (a panic, or the engine faulting on host memory) kills
 only the guest process that hit it in release builds, with a report on stderr; a panic in a
