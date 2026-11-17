@@ -12,11 +12,9 @@ Requires Android 11 or later on a 64-bit ARM device.
 
 ## Features
 
-- Use **Codex CLI** to work on a local project from your Android terminal.
-- Edit code and configuration files in **Vim**.
-- Run Python scripts, compile C and C++, or develop with Java, Node.js, Go, and Rust.
-- Run **Docker** containers on your device, for example to host an Nginx web server.
-- View images in terminal programs that use the **Kitty graphics protocol**.
+| [<img src="docs/screenshots/codex-cli.png" width="160" alt="Codex CLI open in the Appine project directory">](docs/screenshots/codex-cli.png) | [<img src="docs/screenshots/vim.png" width="160" alt="Vim welcome screen in the second terminal tab">](docs/screenshots/vim.png) | [<img src="docs/screenshots/languages.png" width="160" alt="Version output for Python, Clang, Java, Node.js, Go, and Rust">](docs/screenshots/languages.png) | [<img src="docs/screenshots/docker.png" width="160" alt="A running Nginx container serving its welcome page on port 8080">](docs/screenshots/docker.png) | [<img src="docs/screenshots/kitty-graphics.png" width="160" alt="Two landscape photos displayed inline by chafa">](docs/screenshots/kitty-graphics.png) |
+| :---: | :---: | :---: | :---: | :---: |
+| Use **Codex CLI** to work on a local project from your Android terminal. | Edit code and configuration files in **Vim**. | Run Python scripts, compile C and C++, or develop with Java, Node.js, Go, and Rust. | Run **Docker** containers on your device, for example to host an Nginx web server. | View images in terminal programs that use the **Kitty graphics protocol**. |
 
 ## Try Codex CLI
 
