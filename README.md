@@ -165,8 +165,9 @@ scripts/dev sh -c 'cargo build --release -p appine-run -p appine-bench &&
                    target/linux-arm64/release/appine-bench'
 ```
 
-`APPINE_STRACE=1` makes `appine-run` print every syscall with its arguments and result,
-which helps when a test fails.
+To debug a failing test, rerun it with `APPINE_STRACE=1`. `appine-run` prints each syscall
+with its arguments and result, so you can check which calls failed or returned unexpected
+values.
 
 To profile, run `appine-run` under `perf record` with `APPINE_PERF_MAP=1`: tier 1 then writes
 `/tmp/perf-<pid>.map`, and `perf report` attributes samples in translated code to guest
@@ -189,13 +190,14 @@ with SIGKILL, like the Linux OOM killer.
   [module index](.agents/MODULES.md) for navigating the source.
 - [Module maps](.agents/maps) for current behavior and tests, and
   [design decisions](.agents/decisions) for the reasoning behind changes.
-- [Development milestones](docs/milestones.md) for earlier measurements and
-  implementation history. Coding agents should start with [AGENTS.md](AGENTS.md).
+- [Development milestones](docs/milestones.md) for earlier measurements and implementation history.
+- Coding agents should start with [AGENTS.md](AGENTS.md).
 
 ## License
 
-Copyright (C) 2026 Matthew Lee. Appine is licensed under the
-[GNU Affero General Public License, version 3 or later](LICENSE).
+Copyright (C) 2026 Matthew Lee.
+
+Appine is licensed under the [GNU Affero General Public License, version 3 or later](LICENSE).
 
 Parts of the terminal line discipline in `core/kernel/src/tty.rs` are adapted
 from Fuchsia's Starnix and retain [The Fuchsia Authors' BSD-style license](android/licenses/fuchsia-LICENSE).
