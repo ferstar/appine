@@ -588,6 +588,7 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
                 Rootfs.ensureLoginTools(this)
+                Rootfs.ensureGpuCommand(this)
                 startKernel(tier, importing = distro != null)
             }
             main.post {
