@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: split harness/cli and harness/diff into separate maps)
+> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: Android capability probe, distribution fixtures and compute survey)
 
 ## Responsibilities
 
@@ -73,6 +73,10 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
 
 ### Survey and crash
 
+- `tests/survey/gpu/` contains the native Vulkan Android instrumentation probe and an ARM64
+  distribution fixture builder. The compute sample checks each shader result and reports stage timings.
+  The DRM lifetime sample exercises shared mapping access after GEM close, fd close and fork.
+
 - `survey` keeps a store with 36 packages (network needed to build it; one whose creation did not
   finish, marked by `<store>.partial`, is made again; a store is never re-provisioned when the
   package list changes) and uses a prebuilt `appine-run` (`APPINE_RUN`, else the
@@ -103,8 +107,8 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   or `android/`: Linux arm64 (`ubuntu-24.04-arm`) fmt, clippy (`-D warnings`), fetch the rootfs
   and `cargo test --workspace` with the require switches.
 - `android.yml`, on pushes and pull requests that change `core/`, `hosts/android/`, `android/`,
-  the Cargo files or the rootfs and Ghostty scripts (or on demand), on x86_64 (`ubuntu-24.04`,
-  for aapt2): NDK 29.0.14206865, Java 21, cargo-ndk (unpinned), the rootfs, Zig 0.17.0 (from
+  the Cargo files or the rootfs, Ghostty and virglrenderer fetch scripts (or on demand), on x86_64 (`ubuntu-24.04`,
+  for aapt2): NDK 29.0.14206865, SDK CMake 3.22.1, the pinned Venus source, Java 21, cargo-ndk (unpinned), the rootfs, Zig 0.17.0 (from
   ziglang.org, checked against a pinned sha256) and `scripts/fetch-ghostty` (with
   `target/ghostty` and Zig's global cache cached by the script's hash), then cargo-ndk clippy at
   API level 30, `assembleDebug lintDebug`, the APK as an artifact. Both quick workflows cancel a

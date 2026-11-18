@@ -1,0 +1,214 @@
+--- a/vkr_device.c
++++ b/vkr_device.c
+@@ -130,6 +130,7 @@
+    /* append extensions for our own use */
+    const char **exts = NULL;
+    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
++   ext_count++; /* Appine exports ordinary buffer allocations as Android BLOBs. */
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+    ext_count += physical_dev->KHR_external_fence_fd;
+@@ -143,6 +144,7 @@
+          exts[i] = args->pCreateInfo->ppEnabledExtensionNames[i];
+ 
+       ext_count = args->pCreateInfo->enabledExtensionCount;
++      exts[ext_count++] = "VK_ANDROID_external_memory_android_hardware_buffer";
+       if (physical_dev->KHR_external_memory_fd)
+          exts[ext_count++] = "VK_KHR_external_memory_fd";
+       if (physical_dev->EXT_external_memory_dma_buf)
+--- a/vkr_buffer.c
++++ b/vkr_buffer.c
+@@ -37,6 +37,16 @@
+     * vkr_physical_device_init_memory_properties as well.
+     */
+ 
++   VkBufferCreateInfo info = *args->pCreateInfo;
++   VkExternalMemoryBufferCreateInfo external = {
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
++      .pNext = info.pNext,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++   };
++   if (!vkr_find_struct(info.pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO)) {
++      info.pNext = &external;
++      args->pCreateInfo = &info;
++   }
+    vkr_buffer_create_and_add(dispatch->data, args);
+ }
+ 
+--- a/vkr_device_memory.h
++++ b/vkr_device_memory.h
+@@ -15,6 +15,7 @@
+ 
+    struct vkr_device *device;
+ 
++   bool android_blob;
+    bool might_export;
+ 
+    uint32_t property_flags;
+--- a/vkr_device_memory.c
++++ b/vkr_device_memory.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "vkr_device_memory.h"
++#include "android_blob.h"
+ 
+ #include "venus-protocol/vn_protocol_renderer_transport.h"
+ 
+@@ -281,7 +282,23 @@
+    int udmabuf_fd = -1;
+    void *gbm_bo = NULL;
+    VkExportMemoryAllocateInfo local_export_info;
+-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
++   const bool android_blob = !res_info && !might_export &&
++      (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++      !vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
++   if (android_blob) {
++      const uint64_t page = getpagesize();
++      if (!alloc_info->allocationSize || alloc_info->allocationSize > UINT32_MAX - page) {
++         args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         return;
++      }
++      alloc_info->allocationSize = align(alloc_info->allocationSize, page);
++      local_export_info = (VkExportMemoryAllocateInfo){
++         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++         .pNext = alloc_info->pNext,
++         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++      };
++      alloc_info->pNext = &local_export_info;
++   } else if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+       /* An implementation can support dma_buf import along with opaque fd export/import.
+        * If the client driver is using external memory and requesting dma_buf, without
+        * dma_buf fd export support, we must use gbm bo import path instead of forcing
+@@ -375,6 +392,7 @@
+    }
+ 
+    mem->device = dev;
++   mem->android_blob = android_blob;
+    mem->might_export = might_export;
+    mem->property_flags = property_flags;
+    mem->valid_fd_types = valid_fd_types;
+@@ -525,6 +543,28 @@
+                                       : VIRGL_RENDERER_MAP_CACHE_WC;
+    }
+ 
++   if (mem->android_blob) {
++      if (blob_size > mem->allocation_size ||
++          (blob_flags & (VIRGL_RENDERER_BLOB_FLAG_USE_SHAREABLE | VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE)))
++         return false;
++      const int fd = appine_export_android_blob(mem->device->base.handle.device,
++                                                 mem->base.handle.device_memory);
++      if (fd < 0)
++         return false;
++      *out_blob = (struct virgl_context_blob){
++         .type = VIRGL_RESOURCE_FD_OPAQUE,
++         .u.fd = fd,
++         .map_info = map_info,
++         .vulkan_info = {
++            .allocation_size = mem->allocation_size,
++            .memory_type_index = mem->memory_type_index,
++         },
++      };
++      memcpy(out_blob->vulkan_info.device_uuid, mem->device->physical_device->id_properties.deviceUUID, VK_UUID_SIZE);
++      mem->exported = true;
++      return true;
++   }
++
+    const bool can_export_dma_buf = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_DMABUF);
+    const bool can_export_opaque = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_OPAQUE);
+    enum virgl_resource_fd_type fd_type;
+--- a/vkr_device.c
++++ b/vkr_device.c
+@@ -324,8 +324,6 @@
+          vkr_log("vkDeviceWaitIdle(%p) failed(%d)", dev, (int32_t)result);
+    }
+ 
+-   mtx_destroy(&dev->object_mutex);
+-
+    if (!list_is_empty(&dev->objects)) {
+       list_for_each_entry_safe (struct vkr_object, obj, &dev->objects, track_head)
+          vkr_device_object_destroy(ctx, dev, obj);
+@@ -339,6 +337,7 @@
+       free(sync);
+    }
+ 
++   mtx_destroy(&dev->object_mutex);
+    mtx_destroy(&dev->free_sync_mutex);
+ 
+    if (destroy_vk || ctx->on_worker_thread)
+--- a/vkr_context.c
++++ b/vkr_context.c
+@@ -528,7 +528,7 @@
+ 
+    struct timespec ts;
+    int ret = thrd_busy;
+-   assert(ctx->ring_monitor.started);
++   mtx_lock(&ctx->ring_monitor.mutex);
+    while (ctx->ring_monitor.started) {
+       /* only notify at the configured rate, not faster. */
+       if (ret == thrd_busy) {
+@@ -542,9 +542,7 @@
+       } else if (ret)
+          break;
+ 
+-      mtx_lock(&ctx->ring_monitor.mutex);
+       if ((ret = clock_gettime(CLOCK_REALTIME, &ts))) {
+-         mtx_unlock(&ctx->ring_monitor.mutex);
+          break;
+       }
+ 
+@@ -552,8 +550,8 @@
+       ts = timespec_add(
+          ts, (struct timespec){ period_us / 1000000, (period_us % 1000000) * 1000 });
+       ret = cnd_timedwait(&ctx->ring_monitor.cond, &ctx->ring_monitor.mutex, &ts);
+-      mtx_unlock(&ctx->ring_monitor.mutex);
+-   }
++   }
++   mtx_unlock(&ctx->ring_monitor.mutex);
+ 
+    return ret;
+ }
+@@ -604,6 +602,9 @@
+ void
+ vkr_context_destroy(struct vkr_context *ctx)
+ {
++   if (ctx->ring_monitor.started)
++      vkr_context_ring_monitor_fini(ctx);
++
+    /* TODO Move the entire teardown process to a separate thread so that the main thread
+     * cannot get blocked by the vkDeviceWaitIdle upon device destruction.
+     */
+@@ -614,9 +615,6 @@
+    mtx_destroy(&ctx->ring_mutex);
+ 
+    vkr_context_wait_ring_fini(ctx);
+-
+-   if (ctx->ring_monitor.started)
+-      vkr_context_ring_monitor_fini(ctx);
+ 
+    if (ctx->instance) {
+       vkr_log("destroying context %d (%s) with a valid instance", ctx->ctx_id,
+--- a/vkr_physical_device.c
++++ b/vkr_physical_device.c
+@@ -170,6 +170,13 @@
+ 
+    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
+    vk->GetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
++
++   /* CPU mappings share an independently imported coherent allocation. */
++   for (uint32_t i = 0; i < physical_dev->memory_properties.memoryTypeCount; i++) {
++      VkMemoryType *type = &physical_dev->memory_properties.memoryTypes[i];
++      if (!(type->propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
++         type->propertyFlags &= ~(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
++   }
+ 
+    /* XXX When a VkMemoryType has VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, we
+     * assume any VkDeviceMemory with the memory type can be made external and
+@@ -686,6 +693,7 @@
+       vn_replace_vkGetPhysicalDeviceMemoryProperties2_args_handle(args);
+       vk->GetPhysicalDeviceMemoryProperties2(args->physicalDevice,
+                                              args->pMemoryProperties);
++      args->pMemoryProperties->memoryProperties = physical_dev->memory_properties;
+    }
+ }
+ 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: per-open Venus render contexts and DRM buffer handles)
 
 ## Responsibilities
 
@@ -332,6 +332,12 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   lower object in place, and rehomes the lower file's descriptions open for writing.
 
 ### Character devices
+
+- `syscall/gpu.rs` handles render node 226:128. Each open file description owns its context,
+  ring count and GEM handle table. Dup and fork share them. DRM version and capset queries precede
+  context initialization. Blob creation provides an opaque mmap offset, execbuffer captures the
+  command and referenced mappings before unlocking, and GEM close removes the guest handle.
+  Host operations use the `Renderer`, `Context` and `Mapping` interfaces in `gpu.rs`.
 
 - Opening dispatches by device number for store and overlay nodes anywhere and handle opens (device
   nodes in FUSE filesystems are `ENXIO`), after nodev (`EACCES`), permission and the cgroup BPF

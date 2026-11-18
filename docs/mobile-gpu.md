@@ -1,36 +1,64 @@
 # Mobile GPU support for Alpine and Debian guests
 
-The goal is for unmodified programs from Alpine and Debian to use the phone's GPU. The proposed first milestone is **headless Vulkan compute**. After installing the distribution's driver, an unprivileged guest user should be able to run an existing binary from the shell. The Vulkan loader should discover the driver automatically. Window presentation and input, OpenGL, and OpenCL each need their own integration and acceptance tests.
+On a Samsung Galaxy S23, an unprivileged Alpine or Debian shell can run headless Vulkan buffer compute on the Adreno 740 using the distribution's unmodified Mesa Venus driver. Appine provides the DRM render node and the Android renderer. The loader discovers the driver through the distribution's normal ICD manifest.
 
-As of 2026-11-18, the investigation covered Appine's source, both distributions' driver packages, and Mesa's device discovery code. No physical device was connected over ADB during the investigation. Android renderer compatibility, device coverage, and performance still need hardware measurements.
+## Run it
 
-## Proposed architecture
+Install the packages as the guest administrator. In Alpine use `apk add mesa-vulkan-virtio vulkan-tools`. In Debian use `apt-get install mesa-vulkan-drivers vulkan-tools`. Then run `vulkaninfo --summary` from the regular user's shell. Look for `Virtio-GPU Venus (Adreno (TM) 740)`, `PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU` and `DRIVER_ID_MESA_VENUS`. If the distribution also installed Lavapipe, the tool lists a second device named llvmpipe. Headless runs may print warnings about the display.
 
-A guest program calls the distribution's Vulkan loader, which loads the Mesa Venus installable client driver (ICD). Venus submits commands through a virtual DRM render node. Appine's user-space kernel implements the Linux interface for that node. On Android, a Venus-enabled `virglrenderer` decodes the commands and submits them to the phone's driver through the system Vulkan loader. Appine's ARM64 engine continues to execute guest CPU instructions. [Mesa Venus protocol](https://docs.mesa3d.org/drivers/venus.html) · [Android Vulkan loader](https://source.android.com/docs/core/graphics/implement-vulkan)
+The tested workload uses ordinary storage buffers, a compute shader and a fence. Window presentation, OpenGL, OpenCL, external image sharing and PRIME fd exchange require additional interfaces.
 
-Both distributions already ship the guest side of this protocol. Alpine 3.24 aarch64's `mesa-vulkan-virtio` 26.1.6-r0 contains `libvulkan_virtio.so` and `virtio_icd.aarch64.json`. Debian trixie arm64's `mesa-vulkan-drivers` contains the same library and `virtio_icd.json`. [Alpine package index](https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/APKINDEX.tar.gz) · [Debian package contents](https://packages.debian.org/trixie/arm64/mesa-vulkan-drivers/filelist)
+## How a submission reaches the phone
 
-Appine's browser bridge uses loopback TCP with a purpose-built guest client. Mesa's vtest can exercise the renderer in isolation. Connecting vtest to Appine would require a transport for its Unix socket and file descriptors: Appine implements guest Unix sockets internally, and `SCM_RIGHTS` transfers guest open files. For distribution drivers, the proposed integration point is the DRM syscall interface. This lets Appine reach the renderer without emulating PCI, virtqueues, or an entire virtual machine. [Browser bridge](../android/app/src/main/java/io/github/mthli/appine/BrowserBridge.kt) · [Guest Unix sockets](../core/kernel/src/syscall/unix.rs)
+1. At machine startup the private Android `:venus` service tests Vulkan export, reimport, GPU copy, fence completion and CPU readback. Appine registers `/dev/dri/renderD128` (226:128, mode 0666) and the platform device in sysfs when the probe and mapper initialization succeed. The CLI starts without a renderer. Both packaged libdrm versions inspect `/sys/dev/char/226:128/device/drm`, its sibling `subsystem` link and the device's `uevent`.
+2. Each open file description has a Venus context, a private handle table and its own command connection. Duplicated descriptors share them. The kernel implements the DRM version, parameter, capset, context, blob, map, resource-info, execbuffer and GEM-close requests. The two packaged ICDs emulate sync objects with output fences, poll and fd duplication. Appine returns the decoder's Venus capset and reports zero PRIME, cross-device and kernel syncobj support. [Mesa Venus documentation](https://docs.mesa3d.org/drivers/venus.html) · [Kernel ioctl implementation](../core/kernel/src/syscall/gpu.rs)
+3. A dedicated service thread decodes each connection using virglrenderer 1.3.0 and the system Vulkan loader. The service is nonexported and runs in a separate process under Appine's ordinary Android UID. On the S23, a service using an Android isolated UID received `EACCES` when the vendor Vulkan implementation opened its GPU device. [Android service](../android/app/src/main/java/io/github/mthli/appine/GpuService.kt) · [Renderer worker](../hosts/android/gpu/worker.c)
+4. Venus command and reply rings use shared memory. For host-visible ordinary buffer allocations, the patched decoder requests an exportable Android Hardware Buffer BLOB. The application receives its native handle over a Unix socket, checks its format, size, memory type and physical-device UUID, imports it on a second logical device, and maps coherent memory into the guest page table. The decoder hides host-visible memory types that this mapper cannot keep coherent. This path supports multiple buffers bound at different offsets in one allocation. [Decoder patch](../hosts/android/gpu/android-blob.patch) · [Mapper](../hosts/android/gpu/mapper.c) · [Vulkan device memory](https://docs.vulkan.org/spec/latest/chapters/memory.html)
+5. A guest VMA keeps its mapping through GEM close, descriptor close and fork. Execbuffer retains its referenced buffers until the ring fence retires. Fence waits and driver cleanup run outside the big kernel lock. Context shutdown stops the command rings and drains outstanding GPU work before destroying Vulkan objects. [Host lifetimes](../hosts/android/src/gpu.rs) · [Guest mappings](../core/kernel/src/mm.rs)
 
-## Implementation scope
+## Measurements on the Galaxy S23
 
-**Device discovery.** Expose `/dev/dri/renderD128` with permissions for an unprivileged guest user and provide the sysfs entries that libdrm reads during enumeration. Alpine's Mesa version calls `drmGetDevices2()`, accepts a render node on the platform bus, and checks for the DRM driver name `virtio_gpu` and major version 0. Trace the packaged drivers on both distributions to determine the exact sysfs paths each one needs. [Device registration](../core/kernel/src/vfs/dev.rs) · [Synthetic sysfs](../core/kernel/src/pseudo.rs) · [Mesa 26.1.6 discovery code](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-26.1.6/src/virtio/vulkan/vn_renderer_virtgpu.c#L1660)
+SM-S9110, firmware `S9110ZCS8FZJ1`, Android API 36, 4,096-byte host pages (the firmware reports `ro.product.cpu.pagesize.max=4096`), Adreno 740, Vulkan 1.3.128, vendor driver `0x802a4001`. The native probe ran with ordinary app privileges. DMA-BUF failed at the missing `VK_EXT_external_memory_dma_buf` extension. Generic opaque-fd export required a dedicated resource. Its dedicated-buffer control passed. Android Hardware Buffer export/import reported feature bits `0x6` and passed a two-buffer, two-device copy with all 1,024 words verified.
 
-**DRM files and command submission.** Give each open file description its own context and buffer handles so that descriptors created by `dup` share that state. Implement capability queries, context initialization, blob allocation and mapping, command submission, and handle closure. Trace both driver versions to determine which synchronization-object operations and file descriptor imports and exports they use. Advertise only implemented capabilities. [Open files](../core/kernel/src/fd.rs) · [ioctl dispatch](../core/kernel/src/syscall/fs.rs) · [Mesa ioctl calls](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-26.1.6/src/virtio/vulkan/vn_renderer_virtgpu.c#L578)
+The guest tests ran with Tier 1 in independent temporary stores as UID 1000. Both the packaged `vulkaninfo --summary` and the compute executable ran without driver-selection or debug environment overrides. The sample uploads 256 KiB, dispatches 1,024 workgroups, waits for a fence and checks all 65,536 output words. End-to-end time includes loader, device and pipeline setup through final verification. These are individual measured runs.
 
-**Memory and completion.** A guest `mmap` at the offset returned by `VIRTGPU_MAP` must map the corresponding buffer. Access guest addresses through `Mm`. Make CPU writes visible to the GPU before it reads them, and GPU writes visible to the CPU after synchronization. Release the big kernel lock while waiting on a fence. Track mapping and submission lifetimes so a mapping survives closure of its file descriptor and an exiting process's buffers remain valid until in-flight work completes. [Guest address access](../core/kernel/src/uaccess.rs) · [mmap dispatch](../core/kernel/src/syscall/mem.rs) · [Polling and wakeups](../core/kernel/src/syscall/poll.rs)
+| Guest | ICD manifest | Mesa | Upload | Queue submit | Fence wait | Invalidate and check | End to end |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Alpine 3.24 | `virtio_icd.aarch64.json` | 26.1.6-r0 | 0.071 ms | 0.581 ms | 9.353 ms | 0.200 ms | 287.975 ms |
+| Debian trixie | `virtio_icd.json` | 25.0.7-2+deb13u1 | 0.069 ms | 0.427 ms | 0.629 ms | 0.161 ms | 203.833 ms |
 
-**Android backend.** Integrate a Venus-enabled `virglrenderer` into the Android native layer and tie its lifetime to the guest machine. Register the virtual device after the host capability probe succeeds. Mesa lists Vulkan 1.1 and the Android driver extensions `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`, and `VK_EXT_queue_family_foreign`. Memory mapping also depends on driver-specific behavior, which makes a buffer round trip on physical hardware the first test. [Android native entry point](../hosts/android/src/lib.rs) · [Mesa host requirements and mapping limitations](https://docs.mesa3d.org/drivers/venus.html#requirements)
+Both distributions also passed packaged discovery and the compute check against the R8-shrunk release APK. Both passed the shared-mapping test after GEM close, descriptor close and fork. With two concurrent clients, one process received SIGKILL after confirming its submitted fence was unsignaled. The shell stayed responsive, the survivor verified all words, and a fresh machine completed the same computation. The instrumentation checked the main process for leftover Venus shared mappings and retirement threads after shutdown.
 
-## Verification order and acceptance criteria
+Separate guest `strace` runs on the S23 release APK verified all 65,536 words in both distributions. Each trace showed five blob creations, five map ioctls and five GEM closes. Alpine made 43 execbuffer calls, duplicated a fence fd with `F_DUPFD_CLOEXEC` and observed `POLLIN` on the duplicate through `ppoll`. Debian made 26 execbuffer calls and completed this run without a `ppoll` call. Neither run issued a DRM syncobj or PRIME ioctl. The timing table uses the untraced runs.
 
-1. **Probe the phone driver.** Run a small native probe with ordinary Android app privileges on target Adreno and Mali phones. Allocate, export, and map a buffer through the path Venus requires. Have the GPU write a known pattern, wait for completion, and verify the contents on the CPU. Record the GPU, driver version, host page size, extensions, and first failing operation. Use these results to select devices for guest integration.
-2. **Verify discovery with distribution packages.** Run the packaged `vulkaninfo --summary` as an unprivileged user in Alpine and Debian. Record the ICD, device name, driver, and device type. A result listing only Lavapipe indicates CPU rendering. Use syscall traces to locate the first failed discovery, ioctl, or mapping request.
-3. **Verify a compute submission.** Build the same ordinary Vulkan sample in both distributions. Upload input, dispatch a compute shader, wait for its fence, and compare every output element with the expected result. Then run a distribution-packaged Vulkan tool from a normal shell with no driver-selection or debug environment overrides. Record transfer, submission, and end-to-end times separately.
-4. **Exercise concurrent use and teardown.** On devices with 4 KB and 16 KB host pages, access a mapping after closing its descriptor, submit work from two processes, and kill one process while its work is in flight. Check the surviving process's result, terminal responsiveness, and resource reclamation after a guest machine restart. [Android device testing](../android/README.md#building)
+On the API 37, 16,384-byte-page emulator, Goldfish GFXStream reported zero Android Hardware Buffer external-buffer features with both llvmpipe and host acceleration on an Apple M2 Pro. The negative test confirmed that the guest could start and both the render node and corresponding sysfs path were absent. Physical Mali and positive hardware-backed 16 KiB results remain unverified.
 
-## Suggested skills
+## Reproduce
 
-- **fable-mind** for debugging host memory mapping, guest device discovery, and GPU submission independently.
-- **map-module** when implementation changes invalidate an existing map. Identify the affected maps through the [module registry](../.agents/MODULES.md).
-- **commit-context** when a commit is requested. Record the interfaces implemented, devices tested, and outstanding hardware limitations.
+Build the Android app using the [Android build guide](../android/README.md#building). The disposable fixture builder uses ARM64 Docker images and the pinned DRM headers for the low-level lifetime test. The Vulkan sample links the selected distribution's own loader. From the repository root with a debug build installed on the selected device:
+
+```sh
+scripts/fetch-virglrenderer
+android/gradlew -p android installDebug installDebugAndroidTest
+mkdir -p target/gpu-survey
+for distro in alpine debian; do
+    tests/survey/gpu/fixture "$distro" "target/gpu-survey/venus-$distro.tgz"
+    adb push "target/gpu-survey/venus-$distro.tgz" "/data/local/tmp/venus-$distro.tgz"
+    adb shell run-as io.github.mthli.appine mkdir -p cache
+    adb shell run-as io.github.mthli.appine cp "/data/local/tmp/venus-$distro.tgz" cache/
+    adb shell am instrument --user 0 -w -r -e gpuDistro "$distro" \
+        -e class io.github.mthli.appine.GpuTest#distributionVenus \
+        io.github.mthli.appine.test/androidx.test.runner.AndroidJUnitRunner
+done
+adb logcat -d -s appine-gpu-test:I
+```
+
+For the native driver probe, set `ANDROID_HOME` to the Android SDK directory. Each invocation reports the device, extensions, first failing operation or verified word count.
+
+```sh
+android/gradlew -p tests/survey/gpu/android assembleDebug
+adb install -r --user 0 tests/survey/gpu/android/build/outputs/apk/debug/gpu-probe-debug.apk
+for path in dma-buf opaque-fd dedicated-control android-blob; do
+    adb shell am instrument --user 0 -w -r -e path "$path" io.github.mthli.appine.gpuprobe/.Probe
+done
+```

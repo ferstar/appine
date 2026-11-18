@@ -913,6 +913,10 @@ impl Vfs {
     /// the store: no tmpfs used to be mounted on them, and the shared memory and pid files left
     /// there must not stay.
     pub fn open(dir: &Path) -> Result<Vfs, Errno> {
+        Self::open_with_gpu(dir, false)
+    }
+
+    pub(crate) fn open_with_gpu(dir: &Path, gpu: bool) -> Result<Vfs, Errno> {
         let store = Store::open(dir, &[b"dev/shm", b"run"])?;
         if let Err(e) = dev::ensure_dev_nodes(&store) {
             crate::debug::log(format_args!("cannot create the device nodes: {e}"));
@@ -989,6 +993,13 @@ impl Vfs {
                 }
             }
         });
+        if gpu {
+            if let Some(Node::Store(DEV_MOUNT, ino)) = &dev {
+                dev::populate_gpu(&store, *ino)?;
+            } else {
+                return Err(Errno::ENODEV);
+            }
+        }
         mounts.boot(
             PTS_MOUNT,
             pseudo(PTS_MOUNT, Fs::Pts),
