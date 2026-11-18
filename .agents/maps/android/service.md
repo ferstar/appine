@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: enable heads-up alerts by default for new terminal and problems notification channels)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: install the guest GPU launcher before kernel start)
 
 ## Responsibilities
 
@@ -130,7 +130,7 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 - `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
   notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
-  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`, `updateProfile`, then
+  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureGpuCommand`, `ensureBrowser`, `updateProfile`, then
   `Native.start(store, tier)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
   all builds, defaulting to 1).
 - Back on the main thread it clears `starting`; if "exit all" came meanwhile it finishes the exit

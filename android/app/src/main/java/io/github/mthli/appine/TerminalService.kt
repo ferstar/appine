@@ -559,6 +559,7 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
                 Rootfs.ensureLoginTools(this)
+                Rootfs.ensureGpuCommand(this)
                 val browser = BrowserBridge { url ->
                     machine != 0L && !destroyed && listeners.any { it.onOpenUrl(url) }
                 }

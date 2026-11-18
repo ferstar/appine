@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -33,6 +34,10 @@ class GpuTest {
         } finally {
             Native.closeConsole(machine, console)
         }
+    }
+
+    private fun assertOutputContains(output: String, vararg expected: String) {
+        for (text in expected) assertTrue("Missing '$text' in guest output:\n$output", text in output)
     }
 
     private fun reclaimed() {
@@ -70,8 +75,8 @@ class GpuTest {
 
     @Test(timeout = 300000)
     fun distributionVenus() {
-        val registry = InstrumentationRegistry.getInstrumentation()
-        val cache = registry.targetContext.cacheDir
+        val app = InstrumentationRegistry.getInstrumentation().targetContext
+        val cache = app.cacheDir
         val distro = InstrumentationRegistry.getArguments().getString("gpuDistro")
         assumeTrue(distro == "alpine" || distro == "debian")
         val tar = File(cache, "venus-$distro.tgz")
@@ -81,25 +86,28 @@ class GpuTest {
         var machine = 0L
         try {
             Native.importRootfs(dir.path, tar.path)
+            Rootfs.ensureGpuCommand(app, dir.path)
             machine = Native.start(dir.path, 1)
-            val out = run(machine, "set -e; id; /tmp/lifetime; vulkaninfo --summary; /tmp/compute")
-            for (expected in listOf("uid=1000", "DRIVER_ID_MESA_VENUS", "verified=65536")) assertTrue(out, expected in out)
+            val discovery = run(machine, "set -e; id; /tmp/lifetime; vulkaninfo --summary; /tmp/compute")
+            assertOutputContains(discovery, "uid=1000", "DRIVER_ID_MESA_VENUS", "llvmpipe", "verified=65536")
+            val hardware = run(machine, "appine-gpu /tmp/compute")
+            assertOutputContains(hardware, "driver=venus", "verified=65536")
+            assertFalse(hardware, "llvmpipe" in hardware)
 
             val concurrent = run(machine, """
-                /tmp/compute --kill-in-flight & victim=$!
-                /tmp/compute & survivor=$!
+                appine-gpu /tmp/compute --kill-in-flight & victim=$!
+                appine-gpu /tmp/compute & survivor=$!
                 echo terminal-responsive
                 wait ${'$'}victim
                 test $? -eq 137 || exit 1
                 wait ${'$'}survivor
             """.trimIndent())
-            for (expected in listOf("terminal-responsive", "unsignaled submission fence", "verified=65536"))
-                assertTrue(concurrent, expected in concurrent)
+            assertOutputContains(concurrent, "terminal-responsive", "unsignaled submission fence", "verified=65536")
             Native.stop(machine)
             machine = 0
             reclaimed()
             machine = Native.start(dir.path, 1)
-            assertTrue("Restarted machine", "verified=65536" in run(machine, "/tmp/compute"))
+            assertOutputContains(run(machine, "/tmp/compute"), "verified=65536")
         } finally {
             if (machine != 0L) Native.stop(machine)
             dir.deleteRecursively()

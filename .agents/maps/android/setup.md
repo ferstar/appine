@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: localized privacy-policy entry in Settings About using the shared web-link action)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: per-command guest Venus launcher)
 
 ## Responsibilities
 
@@ -28,7 +28,7 @@
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
 `android/app/src/main/assets/login.sh`, `android/app/src/main/assets/profile.sh`,
 `android/app/src/main/assets/ashrc.sh`, `android/app/src/main/assets/bashrc.sh`,
-`android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `scripts/fetch-rootfs`.
+`android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `android/app/src/main/assets/appine-gpu.sh`, `scripts/fetch-rootfs`.
 
 Outside the module: when imports, switches, restarts and logins happen, and the `settings`
 preferences (`android/service`); the import and `write_file`/`read_file` implementations
@@ -86,7 +86,7 @@ session consuming their state and events (`android/vt`).
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
   `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
-- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`,
+- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureGpuCommand`, `ensureBrowser`,
   `updateProfile`; around boot: `PREFER_OSCLOCK`, `failedServices`.
 - Mirrors: `chooseMirror`, `useMirror`.
 - Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
@@ -162,6 +162,10 @@ session consuming their state and events (`android/vt`).
   - Debian: `hosts` and `resolv.conf` (the DNS stub) always.
 
 ### Before every start and boot
+
+- `ensureGpuCommand` installs `/usr/local/bin/appine-gpu` (0755) when missing. The launcher
+  finds the packaged Alpine or Debian Venus manifest and execs the supplied command with
+  `VK_DRIVER_FILES` set for that invocation.
 
 - `ensureBrowser` installs `xdg-open.sh` as `/usr/local/bin/xdg-open` (0755) on either distro.
   It preserves custom launchers, replacing only the known previous Appine OSC helper by SHA-256.

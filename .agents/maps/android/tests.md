@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: optional distribution GPU and unsupported-driver instrumentation)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: exercise per-command Venus selection alongside default discovery)
 
 ## Responsibilities
 
@@ -31,7 +31,8 @@ debug variant, manifest and network-security configuration belong to `android/bu
 ### Tests
 
 - `GpuTest.distributionVenus` takes `gpuDistro=alpine|debian` and a survey rootfs in app cache.
-  It imports a temporary store, runs packaged discovery, verifies compute, mapping lifetime,
+  It imports a temporary store, installs the guest GPU launcher, checks default discovery of
+  both Venus and llvmpipe, and verifies Venus-only compute through the launcher, mapping lifetime,
   concurrent exit and restart, and checks for retained mappings and retirement threads.
   `unsupportedDriver` uses the bundled rootfs with `gpuUnsupported=true` to check absent device paths.
 

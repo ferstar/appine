@@ -6,6 +6,8 @@ On a Samsung Galaxy S23, an unprivileged Alpine or Debian shell can run headless
 
 Install the packages as the guest administrator. In Alpine use `apk add mesa-vulkan-virtio vulkan-tools`. In Debian use `apt-get install mesa-vulkan-drivers vulkan-tools`. Then run `vulkaninfo --summary` from the regular user's shell. Look for `Virtio-GPU Venus (Adreno (TM) 740)`, `PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU` and `DRIVER_ID_MESA_VENUS`. If the distribution also installed Lavapipe, the tool lists a second device named llvmpipe. Headless runs may print warnings about the display.
 
+For a short command that requires the hardware GPU, prefix the command with `appine-gpu`. For example, `appine-gpu vulkaninfo --summary` lists the Venus device. The launcher sets `VK_DRIVER_FILES` to the packaged Venus manifest for that invocation. Run `vulkaninfo --summary` directly to list all installed drivers. Appine installs the launcher in new and existing guests at machine startup.
+
 The tested workload uses ordinary storage buffers, a compute shader and a fence. Window presentation, OpenGL, OpenCL, external image sharing and PRIME fd exchange require additional interfaces.
 
 ## How a submission reaches the phone
@@ -26,6 +28,10 @@ The guest tests ran with Tier 1 in independent temporary stores as UID 1000. Bot
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | Alpine 3.24 | `virtio_icd.aarch64.json` | 26.1.6-r0 | 0.071 ms | 0.581 ms | 9.353 ms | 0.200 ms | 287.975 ms |
 | Debian trixie | `virtio_icd.json` | 25.0.7-2+deb13u1 | 0.069 ms | 0.427 ms | 0.629 ms | 0.161 ms | 203.833 ms |
+
+A separate comparison timed the same workload in fresh processes in a warmed guest, from Vulkan instance creation through result verification. With Lavapipe also installed, median time fell from 132 to 68 ms on Debian and from 106 to 56 ms on Alpine when the process selected only the Venus manifest. Each median covers 12 runs with the configuration order reversed between two guest starts. The comparison set `VK_DRIVER_FILES` directly and timed the compute program itself.
+
+A second test on the debug APK timed each command from fork through process exit, including the launcher. After four warm-up runs, 12 runs per mode gave medians of 117.2 ms directly and 57.9 ms with `appine-gpu` on Debian, and 113.4 ms directly and 54.1 ms with the launcher on Alpine. All runs verified 65,536 words.
 
 Both distributions also passed packaged discovery and the compute check against the R8-shrunk release APK. Both passed the shared-mapping test after GEM close, descriptor close and fork. With two concurrent clients, one process received SIGKILL after confirming its submitted fence was unsignaled. The shell stayed responsive, the survivor verified all words, and a fresh machine completed the same computation. The instrumentation checked the main process for leftover Venus shared mappings and retirement threads after shutdown.
 
