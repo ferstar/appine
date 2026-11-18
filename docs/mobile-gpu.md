@@ -1,0 +1,36 @@
+# Mobile GPU support for Alpine and Debian guests
+
+The goal is for unmodified programs from Alpine and Debian to use the phone's GPU. The proposed first milestone is **headless Vulkan compute**. After installing the distribution's driver, an unprivileged guest user should be able to run an existing binary from the shell. The Vulkan loader should discover the driver automatically. Window presentation and input, OpenGL, and OpenCL each need their own integration and acceptance tests.
+
+As of 2026-11-18, the investigation covered Appine's source, both distributions' driver packages, and Mesa's device discovery code. No physical device was connected over ADB during the investigation. Android renderer compatibility, device coverage, and performance still need hardware measurements.
+
+## Proposed architecture
+
+A guest program calls the distribution's Vulkan loader, which loads the Mesa Venus installable client driver (ICD). Venus submits commands through a virtual DRM render node. Appine's user-space kernel implements the Linux interface for that node. On Android, a Venus-enabled `virglrenderer` decodes the commands and submits them to the phone's driver through the system Vulkan loader. Appine's ARM64 engine continues to execute guest CPU instructions. [Mesa Venus protocol](https://docs.mesa3d.org/drivers/venus.html) · [Android Vulkan loader](https://source.android.com/docs/core/graphics/implement-vulkan)
+
+Both distributions already ship the guest side of this protocol. Alpine 3.24 aarch64's `mesa-vulkan-virtio` 26.1.6-r0 contains `libvulkan_virtio.so` and `virtio_icd.aarch64.json`. Debian trixie arm64's `mesa-vulkan-drivers` contains the same library and `virtio_icd.json`. [Alpine package index](https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/APKINDEX.tar.gz) · [Debian package contents](https://packages.debian.org/trixie/arm64/mesa-vulkan-drivers/filelist)
+
+Appine's browser bridge uses loopback TCP with a purpose-built guest client. Mesa's vtest can exercise the renderer in isolation. Connecting vtest to Appine would require a transport for its Unix socket and file descriptors: Appine implements guest Unix sockets internally, and `SCM_RIGHTS` transfers guest open files. For distribution drivers, the proposed integration point is the DRM syscall interface. This lets Appine reach the renderer without emulating PCI, virtqueues, or an entire virtual machine. [Browser bridge](../android/app/src/main/java/io/github/mthli/appine/BrowserBridge.kt) · [Guest Unix sockets](../core/kernel/src/syscall/unix.rs)
+
+## Implementation scope
+
+**Device discovery.** Expose `/dev/dri/renderD128` with permissions for an unprivileged guest user and provide the sysfs entries that libdrm reads during enumeration. Alpine's Mesa version calls `drmGetDevices2()`, accepts a render node on the platform bus, and checks for the DRM driver name `virtio_gpu` and major version 0. Trace the packaged drivers on both distributions to determine the exact sysfs paths each one needs. [Device registration](../core/kernel/src/vfs/dev.rs) · [Synthetic sysfs](../core/kernel/src/pseudo.rs) · [Mesa 26.1.6 discovery code](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-26.1.6/src/virtio/vulkan/vn_renderer_virtgpu.c#L1660)
+
+**DRM files and command submission.** Give each open file description its own context and buffer handles so that descriptors created by `dup` share that state. Implement capability queries, context initialization, blob allocation and mapping, command submission, and handle closure. Trace both driver versions to determine which synchronization-object operations and file descriptor imports and exports they use. Advertise only implemented capabilities. [Open files](../core/kernel/src/fd.rs) · [ioctl dispatch](../core/kernel/src/syscall/fs.rs) · [Mesa ioctl calls](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-26.1.6/src/virtio/vulkan/vn_renderer_virtgpu.c#L578)
+
+**Memory and completion.** A guest `mmap` at the offset returned by `VIRTGPU_MAP` must map the corresponding buffer. Access guest addresses through `Mm`. Make CPU writes visible to the GPU before it reads them, and GPU writes visible to the CPU after synchronization. Release the big kernel lock while waiting on a fence. Track mapping and submission lifetimes so a mapping survives closure of its file descriptor and an exiting process's buffers remain valid until in-flight work completes. [Guest address access](../core/kernel/src/uaccess.rs) · [mmap dispatch](../core/kernel/src/syscall/mem.rs) · [Polling and wakeups](../core/kernel/src/syscall/poll.rs)
+
+**Android backend.** Integrate a Venus-enabled `virglrenderer` into the Android native layer and tie its lifetime to the guest machine. Register the virtual device after the host capability probe succeeds. Mesa lists Vulkan 1.1 and the Android driver extensions `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`, and `VK_EXT_queue_family_foreign`. Memory mapping also depends on driver-specific behavior, which makes a buffer round trip on physical hardware the first test. [Android native entry point](../hosts/android/src/lib.rs) · [Mesa host requirements and mapping limitations](https://docs.mesa3d.org/drivers/venus.html#requirements)
+
+## Verification order and acceptance criteria
+
+1. **Probe the phone driver.** Run a small native probe with ordinary Android app privileges on target Adreno and Mali phones. Allocate, export, and map a buffer through the path Venus requires. Have the GPU write a known pattern, wait for completion, and verify the contents on the CPU. Record the GPU, driver version, host page size, extensions, and first failing operation. Use these results to select devices for guest integration.
+2. **Verify discovery with distribution packages.** Run the packaged `vulkaninfo --summary` as an unprivileged user in Alpine and Debian. Record the ICD, device name, driver, and device type. A result listing only Lavapipe indicates CPU rendering. Use syscall traces to locate the first failed discovery, ioctl, or mapping request.
+3. **Verify a compute submission.** Build the same ordinary Vulkan sample in both distributions. Upload input, dispatch a compute shader, wait for its fence, and compare every output element with the expected result. Then run a distribution-packaged Vulkan tool from a normal shell with no driver-selection or debug environment overrides. Record transfer, submission, and end-to-end times separately.
+4. **Exercise concurrent use and teardown.** On devices with 4 KB and 16 KB host pages, access a mapping after closing its descriptor, submit work from two processes, and kill one process while its work is in flight. Check the surviving process's result, terminal responsiveness, and resource reclamation after a guest machine restart. [Android device testing](../android/README.md#building)
+
+## Suggested skills
+
+- **fable-mind** for debugging host memory mapping, guest device discovery, and GPU submission independently.
+- **map-module** when implementation changes invalidate an existing map. Identify the affected maps through the [module registry](../.agents/MODULES.md).
+- **commit-context** when a commit is requested. Record the interfaces implemented, devices tested, and outstanding hardware limitations.
