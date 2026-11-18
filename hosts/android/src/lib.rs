@@ -59,6 +59,7 @@ macro_rules! guarded {
     }};
 }
 
+mod gpu;
 mod vt;
 
 /// A JNI function's body panicked ([`guarded`]): logs it, and when Kotlin expects an exception
@@ -680,7 +681,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
             // Guest crashes are reported in the kernel log, which the app's bug reports carry
             exception_trace: true,
         };
-        match Machine::start(&options) {
+        match Machine::start_with_renderer(&options, gpu::renderer(&mut env)) {
             Ok(m) => {
                 let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
                 machines().insert(handle, Arc::new(m));

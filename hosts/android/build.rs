@@ -24,6 +24,7 @@ fn main() {
     }
 
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    build_venus(&manifest);
     let src = env::var_os("APPINE_GHOSTTY_SRC").map_or_else(
         || manifest.join("../../target/ghostty").join(GHOSTTY),
         PathBuf::from,
@@ -119,4 +120,50 @@ fn wuffs(src: &Path, deps: &Path) -> PathBuf {
         dir.display()
     );
     dir
+}
+
+fn build_venus(manifest: &Path) {
+    let ndk = PathBuf::from(env::var_os("ANDROID_NDK_HOME").expect("Android NDK directory"));
+    let bin = ndk.join("../../cmake/3.22.1/bin");
+    let build = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("venus");
+    let cmake = bin.join("cmake");
+    let status = Command::new(&cmake)
+        .arg("-S")
+        .arg(manifest.join("gpu"))
+        .arg("-B")
+        .arg(&build)
+        .args([
+            "-G",
+            "Ninja",
+            "-DANDROID_ABI=arm64-v8a",
+            "-DANDROID_PLATFORM=30",
+            "-DCMAKE_BUILD_TYPE=Release",
+        ])
+        .arg(format!(
+            "-DCMAKE_TOOLCHAIN_FILE={}",
+            ndk.join("build/cmake/android.toolchain.cmake").display()
+        ))
+        .arg(format!(
+            "-DCMAKE_MAKE_PROGRAM={}",
+            bin.join("ninja").display()
+        ))
+        .status()
+        .expect("install the Android SDK cmake;3.22.1 package");
+    assert!(status.success(), "configuring the Venus decoder failed");
+    assert!(
+        Command::new(cmake)
+            .arg("--build")
+            .arg(&build)
+            .arg("--parallel")
+            .arg(env::var("NUM_JOBS").unwrap_or_else(|_| "4".into()))
+            .status()
+            .unwrap()
+            .success(),
+        "building the Venus decoder failed"
+    );
+    println!("cargo:rerun-if-changed=gpu");
+    println!("cargo:rustc-link-search=native={}", build.display());
+    for lib in ["static=appine_venus", "vulkan", "android", "log", "dl", "m"] {
+        println!("cargo:rustc-link-lib={lib}");
+    }
 }

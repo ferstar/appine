@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: conditional DRM device in boot devtmpfs)
 
 ## Responsibilities
 
@@ -282,6 +282,9 @@ capabilities (`kernel/cred`).
   `protected_fifos` do not.
 
 ### Devices
+
+- On renderer-enabled machines `populate_gpu` creates `dri/renderD128` as character device
+  226:128, mode 0666, in the boot devtmpfs. Each machine gets a fresh mount.
 
 - `ensure_dev_nodes` creates missing `/proc` and `/sys` (0555) and `/run` (0755) in the store root
   and a missing `/dev` (0755), then, when `/dev` is a directory, `dev::populate`, which (also for

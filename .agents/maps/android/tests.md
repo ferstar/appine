@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/tests.md` for the paired decision history (not yet created; pre-split decisions D5, D8, the test portions of D9, D12–D14, D16, D19 and D23–D29 stay in `.agents/decisions/android/native.md`).
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: optional distribution GPU and unsupported-driver instrumentation)
 
 ## Responsibilities
 
@@ -27,6 +29,11 @@ debug variant, manifest and network-security configuration belong to `android/bu
 ## Data flow / lifecycle
 
 ### Tests
+
+- `GpuTest.distributionVenus` takes `gpuDistro=alpine|debian` and a survey rootfs in app cache.
+  It imports a temporary store, runs packaged discovery, verifies compute, mapping lifetime,
+  concurrent exit and restart, and checks for retained mappings and retirement threads.
+  `unsupportedDriver` uses the bundled rootfs with `gpuUnsupported=true` to check absent device paths.
 
 - `TabListTest` checks session identity across removal/rebinding, a bounded, scrollable 50-tab list
   and preserved editor focus during opening/scrolling/dismissal; all three cases passed on API 34.

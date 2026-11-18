@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: conditional render-node platform discovery in sysfs)
 
 ## Responsibilities
 
@@ -325,6 +325,10 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
   the initial namespace (new namespaces show zeros); `arp` is a header line.
 
 ### sysfs
+
+- `SYS_GPU` supplies the platform bus and `dev/char/226:128/device` paths on renderer-enabled kernels.
+  libdrm enumerates `drm/renderD128`, reads the `subsystem` link to `/sys/bus/platform`, and reads
+  the device-tree name and compatible string from `uevent`.
 
 - Tree: `block/`, `class/net/`, `devices/system/cpu/` (`online`, `possible`, `present`,
   `offline`, one `cpu<n>/` per guest CPU with synthesized `topology/` — each CPU its own core, one

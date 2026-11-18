@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: release shrinking, JNI keep rules and the Android release Cargo profile)
+> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: pinned Venus decoder build, service packaging and notices)
 
 ## Responsibilities
 
@@ -54,6 +54,9 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   `CargoNdkTask` passes the same value as `ZIG` to cargo and its build script. The local file is
   ignored by Git, and its contents are read through a Gradle file provider for configuration-cache
   tracking; both tasks declare the selected executable as an input.
+- `scripts/fetch-virglrenderer` checks the 1.3.0 source archive against its SHA-256. SDK CMake
+  3.22.1, Ninja, Python and patch build the Venus decoder in Cargo’s output directory. The static
+  archive and Android Vulkan, log and Hardware Buffer libraries link into `libappine.so`.
 - On an Android target `build.rs` asserts the libghostty-vt source (`build.zig` in
   `target/ghostty/libghostty-vt-1.0.0`, or `APPINE_GHOSTTY_SRC`) and the release's Zig packages
   beside it (the same path with `-deps`), panics on any architecture but aarch64, and runs `$ZIG`
@@ -99,16 +102,18 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   `OutdatedLibrary`, which follow data outside the repository and are informational.
 - Release: signed with the debug key, versionCode 1 and versionName 1.0.0. R8 uses the
   optimized Android defaults and shrinks unused resources. `app/proguard-rules.pro` keeps app
-  JNI declarations and the public void `VtSession.on*` callbacks looked up by the native pump;
+  JNI declarations, the GPU service connection lookup and the public void `VtSession.on*` callbacks looked up by the native pump;
   callbacks outside that pattern need a matching keep rule. The release mapping is under
   `app/build/outputs/mapping/release/`.
 
 ### Notices
 
+- The virglrenderer notice covers the pinned decoder, Mesa utilities, xxHash and Khronos headers.
+
 - `app/src/main/assets/notices/` holds static HTML, a shared stylesheet and `index.json`, packaged
   without a Gradle generation task. The catalog lists, in order: Appine (its notice and the
   repository's `LICENSE`); Fuchsia's
-  BSD-style licence for the line-discipline parts adapted from Starnix (`kernel/tty`); the
+  BSD-style licence for the line-discipline parts adapted from Starnix (`kernel/tty`); virglrenderer; the
   terminal's components with their texts from `android/licenses/` (libghostty-vt 1.0.0, uucode
   with the Unicode and Hoehrmann licences, simdutf, Highway and Wuffs under their MIT or BSD option,
   translate-c, Zig's compiler_rt, JetBrains Mono's OFL); Alpine (each package's version, licence, origin and commit
@@ -159,7 +164,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 - `scripts/release-sources` refuses to run with tracked changes in the work tree and writes, under
   the short `HEAD` revision: `appine-<rev>.tar.gz` (`git archive HEAD`), `appine-<rev>-vendor.tar.gz`
-  (`cargo vendor --locked` of the whole workspace), `libghostty-vt-<version>.tar.gz` and
+  (`cargo vendor --locked` of the whole workspace), `virglrenderer-1.3.0.tar.gz`, `libghostty-vt-<version>.tar.gz` and
   `libghostty-vt-<version>-deps.tar.gz` (the release and its Zig packages, copied as
   `fetch-ghostty` checked them; together about 10 MB), and
   `alpine-<version>-gpl-sources.tar` (uncompressed, with a README listing the packages).
@@ -201,7 +206,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 - The global cache a `--system` build uses must never have held a package's archive: the user's
   `~/.cache/zig` usually has, and Zig 0.17 then panics ("reached unreachable code"), so `build.rs`
   gives the source a cache of its own, which nothing fetches into.
-- `build.rs` reruns only when `vt.c`, the source's `LIB_VERSION` or `build.zig.zon`,
+- `build.rs` reruns when the `gpu/` sources, `vt.c`, the source's `LIB_VERSION` or `build.zig.zon`,
   `APPINE_GHOSTTY_SRC` or `ZIG` change, not for other libghostty-vt files or `ANDROID_NDK_HOME`.
 - vt.c's Wuffs header is found through the release's layout: the dependency named `wuffs` in
   `pkg/wuffs/build.zig.zon`, the dependency tarball's `<hash>` directories and the file

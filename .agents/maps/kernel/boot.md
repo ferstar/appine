@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: optional host renderer at machine startup)
 
 ## Responsibilities
 
@@ -50,6 +50,9 @@ namespace creation (`kernel/ns`); console and terminal bridge behaviour (`kernel
 ## Data flow / lifecycle
 
 ### Machine start and host spawn
+
+- `Machine::start_with_renderer` passes the optional renderer to the kernel and its presence to
+  `Vfs::open_with_gpu` during store setup. Existing `Machine::start` callers pass no renderer.
 
 - `Machine::start` creates PID 1, the timer thread and the BKL watchdog; a contained panic is
   an internal error. Options configure the store, memory and low-port policy, with

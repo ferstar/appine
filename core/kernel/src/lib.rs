@@ -16,6 +16,7 @@ pub mod errno;
 mod fd;
 mod forward;
 mod futex;
+pub mod gpu;
 mod inittab;
 mod ipc;
 mod itimer;
