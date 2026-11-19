@@ -5821,7 +5821,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
     match node {
         Node::Store(_, ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, vfs.dev_of(node))),
         Node::Overlay(_, o) => Ok(encode_stat(&vfs.overlay_stat(*o)?, vfs.dev_of(node))),
-        Node::Fuse(..) => super::fuse::stat(&vfs, &cx.cred(), node),
+        Node::Fuse(..) => super::fuse::stat(&vfs, &cx.cred(), node, None),
         // Namespaces are in nsfs
         Node::Pseudo(_, p @ PseudoNode::NsFile(..)) => {
             Ok(encode_stat(&pseudo::stat(&view, p)?, Fs::Nsfs.dev()))
@@ -5933,6 +5933,11 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
                 st.ino = vfs.overlay().shown_ino(o);
             }
             Ok(encode_stat(&st, dev))
+        }
+        FileKind::Fuse(handle) => {
+            let vfs = cx.vfs()?;
+            let node = Node::Fuse(f.mnt, handle.id);
+            super::fuse::stat(&vfs, &cx.cred(), &node, Some(handle))
         }
         _ => {
             let node = f.node().ok_or(Errno::EBADF)?;

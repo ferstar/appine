@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: fetch stat information for backed root-share files by open handle)
 
 ## Responsibilities
 
@@ -157,6 +157,8 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   on the shared object, marked `cow`. Then by type: regular files open the host object, character
   devices by device number (Character devices below), block devices as loop devices (major 7,
   `kernel/loop`; others `ENXIO`), FIFOs the shared pipe (access mode 3 `EINVAL`), sockets `ENXIO`.
+- Backed root-share descriptors use their open handle for descriptor stat. Pathname stat
+  continues to use node attributes.
 - FUSE nodes are opened and created by `kernel/fuse` (the daemon's open and create); a file
   created that way is not checked again.
 - Pseudo nodes: nsfs writes `EPERM` first; permission from the synthetic stat, except `/proc/sys`

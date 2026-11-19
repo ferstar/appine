@@ -567,6 +567,18 @@ impl Machine {
         });
     }
 
+    /// Registers or revokes the backing for a read-only share source on this machine.
+    pub fn set_fuse_backing(
+        &self,
+        source: String,
+        backing: Option<Arc<dyn crate::FuseBacking>>,
+    ) -> bool {
+        let k = self.shared.lock();
+        let Some(vfs) = &k.vfs else { return false };
+        vfs.fuse_mut().set_backing(source.into_bytes(), backing);
+        true
+    }
+
     /// Commits the inode store's deferred write transactions (when the app goes to the background,
     /// [`crate::vfs::store`]).
     pub fn sync(&self) {
