@@ -588,14 +588,7 @@ impl Conn {
     /// IDs are all the mounter's (root included).
     pub fn allows(&self, cred: &Cred) -> bool {
         if self.opts.allow_other {
-            let mut ns = Some(cred.user_ns.clone());
-            while let Some(n) = ns {
-                if Rc::ptr_eq(&n, &self.user_ns) {
-                    return true;
-                }
-                ns = n.parent.clone();
-            }
-            return false;
+            return self.user_ns.is_ancestor_of(&cred.user_ns);
         }
         let (u, g) = (self.opts.user_id, self.opts.group_id);
         [cred.euid, cred.suid, cred.ruid]
@@ -2418,6 +2411,29 @@ mod tests {
 
     fn conn(opts: Options) -> Conn {
         Conn::new(0x30, opts, &Cred::root(), crate::pidns::PidNs::init())
+    }
+
+    #[test]
+    fn allow_other_compares_user_namespace_identity() {
+        let mounter = Cred::root();
+        let mut peer = Cred::root();
+        let opts = Options {
+            allow_other: true,
+            ..Options::default()
+        };
+        let mount = Conn::new(0x30, opts.clone(), &mounter, crate::pidns::PidNs::init());
+
+        // Independently launched processes hold separate copies of the initial namespace.
+        assert!(!Rc::ptr_eq(&mounter.user_ns, &peer.user_ns));
+        assert!(mount.allows(&peer));
+
+        let child = UserNs::child(&peer.user_ns, 0, true);
+        peer.user_ns = child.clone();
+        assert!(mount.allows(&peer));
+
+        let child_mount = Conn::new(0x30, opts, &peer, crate::pidns::PidNs::init());
+        peer.user_ns = UserNs::child(&mounter.user_ns, 0, true);
+        assert!(!child_mount.allows(&peer));
     }
 
     /// A `struct fuse_attr` with mode `mode` and owner `uid`.

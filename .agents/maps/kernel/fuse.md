@@ -222,7 +222,7 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 ### Permission
 
 - `fuse_permission` (6.1's `fuse_permission`): EACCES, root included, unless the mount allows the
-  process (with `allow_other`, anyone in the mounter's user namespace or one below; otherwise only
+  process (with `allow_other`, anyone in the mounter's user namespace or one below, compared by namespace ID; otherwise only
   a process whose real, effective and saved user and group IDs are the mounter's). Then with
   `default_permissions` the cached attributes decide (fetched again when out of date; callers able
   to search everything need none for a search); without it only executing a regular file is
