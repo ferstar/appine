@@ -215,7 +215,10 @@ class TerminalService : Service() {
                             Native.POWER_HALT, Native.POWER_OFF -> exitAll()
                             // Tabs whose shell has ended do not count (restored ones not shown yet
                             // do: their shell has not started)
-                            else -> if (sessions.none { it.isRunning } && listeners.isEmpty() && processes == 0) exitAll()
+                            else -> if (!booting && !GuestCommands.hasActiveRequests &&
+                                sampledAt >= commandLaunchUntil &&
+                                sessions.none { it.isRunning } && listeners.isEmpty() && processes == 0
+                            ) exitAll()
                         }
                     }
                 }
@@ -302,6 +305,30 @@ class TerminalService : Service() {
      * replaced as soon as the new kernel is up or has failed.
      */
     private var pendingReplace: Rootfs.Distro? = null
+
+    @Volatile internal var commandMachine = 0L
+        private set
+    @Volatile internal var commandBlocked = false
+        private set
+    private var commandBridge: CommandBridge? = null
+    private var commandLaunchUntil = 0L
+
+    internal fun setCommandAccess(enabled: Boolean) {
+        if (enabled && Settings.privacyMode(this)) return
+        Settings.setTerminalAccess(this, enabled)
+        settingsChanged()
+    }
+
+    private fun updateCommandAccess() {
+        commandBlocked = destroyed || exiting || startError != null || !Settings.terminalAccess(this)
+        commandMachine = if (commandBlocked || booting) 0 else machine
+        if (commandBlocked) {
+            commandBridge?.close()
+            commandBridge = null
+        } else if (commandBridge == null) {
+            commandBridge = CommandBridge.open(applicationContext)
+        }
+    }
 
     /** The kernel handle, 0 before the start. */
     var machine = 0L
@@ -483,6 +510,8 @@ class TerminalService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        GuestCommands.service = this
+        updateCommandAccess()
         Privacy.addListener(privacyChanged)
         notifications.createChannels()
         val notification = notification()
@@ -703,6 +732,7 @@ class TerminalService : Service() {
             main.post {
                 if (machine != m) return@post
                 booting = false
+                updateCommandAccess()
                 guestActivity.reset(SystemClock.elapsedRealtime())
                 updateWakeLock()
                 if (failed.isNotEmpty()) notifications.bootFailures(failed)
@@ -742,6 +772,7 @@ class TerminalService : Service() {
             } else {
                 progress = null
                 startError = error
+                updateCommandAccess()
                 updateWakeLock()
                 updateNotification()
                 each { l -> l.onMachineReady(error) }
@@ -803,6 +834,7 @@ class TerminalService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_EXIT_ALL -> exitAll()
+            ACTION_START_COMMAND -> commandLaunchUntil = SystemClock.elapsedRealtime() + 5_000L
             ACTION_CANCEL_SWITCH -> cancelSwitch()
             ACTION_TOGGLE_KEEP_AWAKE -> setRunPolicy(Settings.nextRunPolicy(this))
             // Legacy report PendingIntents still pass through the clipboard privacy check.
@@ -1141,6 +1173,7 @@ class TerminalService : Service() {
     }
 
     private fun settingsChanged() {
+        updateCommandAccess()
         updateNotification()
         each { it.onSettingsChanged() }
     }
@@ -1311,6 +1344,7 @@ class TerminalService : Service() {
      * kernel still there when the sessions end, the Activity would think the last tab was closed.
      */
     private fun detach(): Long {
+        commandMachine = 0
         androidShare.update(0, emptyList())
         browserBridge?.close()
         browserBridge = null
@@ -1342,6 +1376,10 @@ class TerminalService : Service() {
     override fun onDestroy() {
         Privacy.removeListener(privacyChanged)
         destroyed = true
+        commandMachine = 0
+        commandBridge?.close()
+        commandBridge = null
+        if (GuestCommands.service === this) GuestCommands.service = null
         androidShare.close()
         browserBridge?.close()
         browserBridge = null
@@ -1391,6 +1429,7 @@ class TerminalService : Service() {
         /** The ongoing notification (the other ids are [Notifications]'). */
         private const val NOTIFICATION_ID = 1
         private const val POLL_MS = GuestActivity.SAMPLE_MS
+        internal const val ACTION_START_COMMAND = "io.github.mthli.appine.START_COMMAND"
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"
         private const val ACTION_CANCEL_SWITCH = "io.github.mthli.appine.CANCEL_SWITCH"
         private const val ACTION_TOGGLE_KEEP_AWAKE = "io.github.mthli.appine.TOGGLE_KEEP_AWAKE"

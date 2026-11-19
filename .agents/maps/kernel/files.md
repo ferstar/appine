@@ -52,6 +52,8 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   directory is a Directory with the daemon's handle). Regular carries `cow`: writable, but the
   handle only reads because the file shares its object, so its first change gives the file an
   object of its own; set at open, by `rehome` and by `follow_copy_up`, cleared by `rehome`.
+- HostFd stores either an inherited raw descriptor or an owned descriptor closed when its last
+  reference is dropped.
 - `ProcEvent` — change counters given at open to mounts, mountinfo, cgroup2 and sysfs files.
 - `IoPath` — the route of one I/O call, chosen so no borrow of the open file is held during I/O
   (`Local`: regular files through `unlocked_io`; other local files, and `O_APPEND` writes to

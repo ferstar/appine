@@ -10,6 +10,7 @@ on:
       - "hosts/android/**"
       - "android/**"
       - "contrib/android-share-rust/**"
+      - "contrib/android-exec/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -22,6 +23,7 @@ on:
       - "hosts/android/**"
       - "android/**"
       - "contrib/android-share-rust/**"
+      - "contrib/android-exec/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -72,6 +74,11 @@ jobs:
           cache-dependency-path: |
             android/**/*.gradle*
             android/gradle/wrapper/gradle-wrapper.properties
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: contrib/android-exec/go.mod
+          cache-dependency-path: contrib/android-exec/go.sum
 
       - name: Install the NDK
         run: |

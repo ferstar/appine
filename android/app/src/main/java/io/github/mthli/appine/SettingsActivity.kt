@@ -136,6 +136,9 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private lateinit var runPolicy: ListPreference
     private lateinit var fileAccess: SwitchPreferenceCompat
     private lateinit var androidShare: Preference
+    private lateinit var commandAccess: SwitchPreferenceCompat
+    private lateinit var commandClient: Preference
+    private var checkingCommandClientModule = false
     private var shareListDialog: AlertDialog? = null
     private var shareListRows: List<AndroidShare.Config> = emptyList()
     private var pendingEditTarget: String? = null
@@ -222,6 +225,8 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             }
         }
         androidShare = action(R.string.share_title) { chooseAndroidShare() }
+        commandAccess = toggle(R.string.command_access, TerminalService::setCommandAccess)
+        commandClient = action(R.string.command_client_title) { chooseCommandClient() }
         privacy = SwitchPreferenceCompat(requireContext()).configure(R.string.settings_privacy).apply {
             widgetLayoutResource = R.layout.preference_switch
             setOnPreferenceChangeListener { _, value ->
@@ -250,7 +255,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
 
         group(R.string.settings_group_system, distro, account, reset)
-        group(R.string.settings_group_android, notifications, batteryUsage, runPolicy, privacy, fileAccess, androidShare)
+        group(R.string.settings_group_android, notifications, batteryUsage, runPolicy, privacy, fileAccess, androidShare, commandAccess, commandClient)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, tabList, volumeKeys)
         group(R.string.settings_group_debug, tier, export)
         group(R.string.settings_group_about, telegram, project, privacyPolicy, licenses, version)
@@ -535,7 +540,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private fun render() {
         val s = service
         if (s == null) {
-            for (row in listOf(distro, reset, account, tier, runPolicy, fileAccess, privacy, androidShare,
+            for (row in listOf(distro, reset, account, tier, runPolicy, fileAccess, privacy, androidShare, commandAccess, commandClient,
                 fillWide, cursorStyle, cursorBlink, volumeKeys, tabList)) row.isEnabled = false
             return
         }
@@ -566,6 +571,18 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         val privacyEnabled = Settings.privacyMode(requireContext())
         privacy.set(getString(R.string.privacy_summary), true, privacyEnabled)
         fileAccess.set(getString(if (privacyEnabled) R.string.privacy_file_access else R.string.file_access_summary), !privacyEnabled, s.fileAccess)
+        commandAccess.set(
+            getString(if (privacyEnabled) R.string.command_access_paused else R.string.command_access_summary),
+            !privacyEnabled, Settings.terminalAccessEnabled(requireContext()),
+        )
+        commandClient.set(
+            getString(when {
+                privacyEnabled -> R.string.command_access_paused
+                TerminalClient.isModifying -> R.string.command_client_working
+                else -> R.string.command_client_summary
+            }),
+            !privacyEnabled && !TerminalClient.isModifying && !checkingCommandClientModule,
+        )
         val shares = Settings.androidShares(requireContext())
         val shareSummary = if (shares.isEmpty()) {
             getString(R.string.share_off)
@@ -694,6 +711,101 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             .setPositiveButton(R.string.switch_confirm) { _, _ -> service?.switchTo(distro) }
             .setNegativeButton(android.R.string.cancel, null)
             .showPrivate()
+    }
+
+    private fun chooseCommandClient() {
+        val activity = requireActivity()
+        val context = activity.applicationContext
+        if (Settings.privacyMode(context) || TerminalClient.isModifying || checkingCommandClientModule) return
+        checkingCommandClientModule = true
+        commandClient.isEnabled = false
+        thread(name = "appine-cli-status") {
+            val state = TerminalClient.moduleState(context)
+            activity.runOnUiThread {
+                checkingCommandClientModule = false
+                if (isAdded) render()
+                if (isResumed && !Settings.privacyMode(context)) showCommandClient(state)
+            }
+        }
+    }
+
+    private fun showCommandClient(state: TerminalClient.ModuleState) {
+        val dialog = MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.command_client_title)
+            .setNegativeButton(android.R.string.cancel, null)
+        if (state == TerminalClient.ModuleState.REMOVAL_PENDING) {
+            dialog.setMessage(R.string.command_client_removal_pending)
+                .setPositiveButton(R.string.command_client_copy_shell) { _, _ -> copyCommandClientShell() }
+                .showPrivate()
+            return
+        }
+        val installed = state == TerminalClient.ModuleState.INSTALLED
+        val choices = arrayOf(
+            getString(if (installed) R.string.command_client_uninstall else R.string.command_client_install),
+            getString(R.string.command_client_copy_shell),
+        )
+        dialog.setItems(choices) { _, which ->
+            when {
+                which == 1 -> copyCommandClientShell()
+                installed -> confirmCommandClientUninstall()
+                else -> changeCommandClientModule(uninstall = false)
+            }
+        }.showPrivate()
+    }
+
+    private fun confirmCommandClientUninstall() {
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.command_client_uninstall)
+            .setMessage(R.string.command_client_confirm_uninstall)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.command_client_uninstall) { _, _ -> changeCommandClientModule(uninstall = true) }
+            .showPrivate()
+    }
+
+    private fun changeCommandClientModule(uninstall: Boolean) {
+        val activity = requireActivity()
+        val context = activity.applicationContext
+        if (Settings.privacyMode(context) || TerminalClient.isModifying) return
+        commandClient.set(getString(R.string.command_client_working), false)
+        thread(name = "appine-cli-module") {
+            val result = if (uninstall) TerminalClient.uninstall(context) else TerminalClient.install(context)
+            activity.runOnUiThread {
+                if (result.installed) {
+                    val runtime = GuestCommands.service
+                    if (runtime == null || Settings.privacyMode(context)) {
+                        Settings.setTerminalAccess(context, true)
+                    } else {
+                        runtime.setCommandAccess(true)
+                    }
+                }
+                if (isAdded) render()
+                if (!isResumed || Settings.privacyMode(context)) return@runOnUiThread
+                when (result) {
+                    TerminalClient.Result.KSU_INSTALLED -> MaterialAlertDialogBuilder(requireContext())
+                        .setTitle(R.string.command_client_installed_title)
+                        .setMessage(result.message)
+                        .setPositiveButton(android.R.string.ok, null)
+                        .showPrivate()
+                    TerminalClient.Result.ALREADY_INSTALLED -> showCommandClient(TerminalClient.ModuleState.INSTALLED)
+                    else -> Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun copyCommandClientShell() {
+        val s = service ?: return
+        val context = requireContext()
+        if (Settings.privacyMode(context)) return
+        val command = TerminalClient.interactiveCommand(context)
+        if (command == null) {
+            Toast.makeText(context, R.string.command_client_unavailable, Toast.LENGTH_SHORT).show()
+            return
+        }
+        context.getSystemService(ClipboardManager::class.java)
+            .setPrimaryClip(ClipData.newPlainText(getString(R.string.command_client_copy_shell), command))
+        s.setCommandAccess(true)
+        Toast.makeText(context, R.string.command_client_copied, Toast.LENGTH_SHORT).show()
     }
 
     private fun chooseAndroidShare() {

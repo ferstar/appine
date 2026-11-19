@@ -841,6 +841,85 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_spawn<'l>(
     })
 }
 
+/// Starts a process in the current machine with Android-owned pipes as guest stdio.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_spawnRedirected<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    program: JString<'l>,
+    argv: JObjectArray<'l>,
+    envp: JObjectArray<'l>,
+    stdin: jint,
+    stdout: jint,
+    stderr: jint,
+) -> jint {
+    guarded!("Native.spawnRedirected", throws env, -1, {
+        use std::os::fd::{BorrowedFd, OwnedFd};
+
+        let (Some(program), Some(argv), Some(envp)) = (
+            string(&mut env, &program),
+            strings(&mut env, &argv),
+            strings(&mut env, &envp),
+        ) else {
+            return -1;
+        };
+        let Some(m) = machine(handle) else {
+            throw(&mut env, "the machine is stopped");
+            return -1;
+        };
+        let dup = |fd: jint| -> std::io::Result<OwnedFd> {
+            if fd < 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+            }
+            // SAFETY: Kotlin owns all three ParcelFileDescriptors for the duration of this call.
+            unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
+        };
+        let result = (|| {
+            let fds = [dup(stdin)?, dup(stdout)?, dup(stderr)?];
+            m.spawn(program.as_bytes(), &argv, &envp, Stdio::Redirect(fds))
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        })();
+        match result {
+            Ok(pid) => pid as jint,
+            Err(_) => {
+                throw(&mut env, "cannot start the guest command");
+                -1
+            }
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_waitCommand(
+    _: JNIEnv,
+    _: JClass,
+    handle: jlong,
+    pid: jint,
+) -> jint {
+    guarded!("Native.waitCommand", -9, {
+        match machine(handle).and_then(|m| m.wait_once(pid as u32)) {
+            Some(ExitStatus::Exited(code)) => code,
+            Some(ExitStatus::Signaled { signal, .. }) => -signal.number(),
+            None => -9,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_cancelCommand(
+    _: JNIEnv,
+    _: JClass,
+    handle: jlong,
+    pid: jint,
+) {
+    guarded!("Native.cancelCommand", (), {
+        if let Some(m) = machine(handle) {
+            m.cancel_watched(pid as u32);
+        }
+    })
+}
+
 /// Reads console output: returns the number of bytes read, 0 when the session ended, -1 when the
 /// console is closed.
 #[unsafe(no_mangle)]
@@ -850,6 +929,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_read<'l>(
     handle: jlong,
     console: jint,
     buffer: JByteArray<'l>,
+    timeout_ms: jint,
 ) -> jint {
     guarded!("Native.read", -1, {
         let Ok(len) = env.get_array_length(&buffer) else {
@@ -859,8 +939,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_read<'l>(
             return -1;
         };
         let mut buf = vec![0u8; len as usize];
-        match m.read_console(console as u32, &mut buf) {
-            Ok(n) => {
+        let deadline = (timeout_ms > 0).then(|| {
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64)
+        });
+        match m.read_console_until(console as u32, &mut buf, deadline) {
+            Ok(Some(n)) => {
                 // SAFETY: u8 and i8 have the same layout
                 let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<i8>(), n) };
                 match env.set_byte_array_region(&buffer, 0, bytes) {
@@ -868,6 +951,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_read<'l>(
                     Err(_) => -1,
                 }
             }
+            Ok(None) => -2,
             Err(_) => -1,
         }
     })
@@ -884,6 +968,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_write<'l>(
     buffer: JByteArray<'l>,
     offset: jint,
     length: jint,
+    timeout_ms: jint,
 ) -> jint {
     guarded!("Native.write", -1, {
         let mut data = vec![0i8; length.max(0) as usize];
@@ -898,6 +983,14 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_write<'l>(
         let Some(m) = machine(handle) else {
             return -1;
         };
+        if timeout_ms > 0 {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+            return m
+                .write_console_until(console as u32, data, Some(deadline))
+                .map(|result| result.unwrap_or(0) as jint)
+                .unwrap_or(-1);
+        }
         let mut done = 0;
         while done < data.len() {
             match m.write_console(console as u32, &data[done..]) {

@@ -26,6 +26,8 @@ internal object Settings {
     private const val KEY_IDLE_POLICY = "idle_policy"
     private const val KEY_ANDROID_SHARE = "android_share"
     private const val KEY_ANDROID_SHARES = "android_shares"
+    private const val KEY_TERMINAL_ACCESS = "terminal_access"
+    private const val KEY_COMMAND_CLIENT_MODULE_KNOWN = "command_client_module_known"
     private const val KEY_FILE_ACCESS = "file_access"
     private const val KEY_PRIVACY_MODE = "privacy_mode"
     private const val KEY_FILL_WIDE = "fill_wide"
@@ -115,6 +117,25 @@ internal object Settings {
         }
         putString(KEY_ANDROID_SHARES, array.toString())
         remove(KEY_ANDROID_SHARE)
+    }
+
+    fun terminalAccessEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_TERMINAL_ACCESS, false)
+
+    fun terminalAccess(context: Context): Boolean =
+        terminalAccessEnabled(context) && !privacyMode(context)
+
+    fun setTerminalAccess(context: Context, enabled: Boolean) = prefs(context).edit {
+        putBoolean(KEY_TERMINAL_ACCESS, enabled)
+        // An older pairing grant never enables the device-wide switch.
+        remove("external_command_key")
+    }
+
+    fun commandClientModuleKnown(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_COMMAND_CLIENT_MODULE_KNOWN, false)
+
+    fun setCommandClientModuleKnown(context: Context, known: Boolean) = prefs(context).edit {
+        putBoolean(KEY_COMMAND_CLIENT_MODULE_KNOWN, known)
     }
 
     fun privacyMode(context: Context): Boolean = prefs(context).getBoolean(KEY_PRIVACY_MODE, false)
