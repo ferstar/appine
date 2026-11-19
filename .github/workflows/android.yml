@@ -9,6 +9,7 @@ on:
       - "core/**"
       - "hosts/android/**"
       - "android/**"
+      - "contrib/android-share-rust/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -20,6 +21,7 @@ on:
       - "core/**"
       - "hosts/android/**"
       - "android/**"
+      - "contrib/android-share-rust/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -53,7 +55,7 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml and the Android target
         run: |
           rustup toolchain install
-          rustup target add aarch64-linux-android
+          rustup target add aarch64-linux-android aarch64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
 

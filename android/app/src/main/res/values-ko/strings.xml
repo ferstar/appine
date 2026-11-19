@@ -291,4 +291,39 @@
     <string name="copy_report">보고서 복사</string>
     <string name="report_copied">보고서를 복사했습니다</string>
 
+
+    <!-- Android directory mount -->
+    <string name="share_title">폴더 공유</string>
+    <string name="share_off">공유 안 함</string>
+    <string name="share_starting">공유 시작 중…</string>
+    <string name="share_android_folder">휴대전화 폴더</string>
+    <string name="share_android_folder_unknown">선택한 폴더</string>
+    <string name="share_mode_read_only">읽기 전용</string>
+    <string name="share_mode_read_write">읽기/쓰기</string>
+    <string name="share_mount_point">마운트 지점</string>
+    <string name="share_copy_path">경로 복사</string>
+    <string name="share_path_copied">경로를 복사했습니다</string>
+    <string name="share_root_failed">Android 경로를 열 수 없습니다. 경로를 확인하고 root를 허용하세요.</string>
+    <string name="share_tree_failed">선택한 폴더를 읽을 수 없습니다. 폴더를 다시 선택하세요.</string>
+    <string name="share_mount_failed">폴더를 공유할 수 없습니다. 다시 선택하세요.</string>
+    <string name="share_pick">폴더 선택</string>
+    <string name="share_change">폴더 변경</string>
+    <string name="share_root">경로로 이동</string>
+    <string name="share_confirm">폴더 공유</string>
+    <string name="share_access_write">Linux에서 파일을 만들고 수정하고 삭제할 수 있습니다</string>
+    <string name="share_disconnect">공유 중지</string>
+    <string name="share_writable">원본 파일 변경 허용</string>
+    <string name="share_mount">공유 시작</string>
+    <string name="share_invalid_path">Android 절대 경로를 입력하세요</string>
+    <string name="share_parent">상위 폴더</string>
+    <string name="share_folder_read_failed">이 폴더를 열 수 없습니다.</string>
+    <plurals name="share_count">
+        <item quantity="other">폴더 %d개</item>
+    </plurals>
+    <string name="share_add">폴더 추가</string>
+    <string name="share_edit">편집</string>
+    <string name="share_save">저장</string>
+    <string name="share_target_helper">비워 두면 %1$s를 사용합니다.</string>
+    <string name="share_invalid_target">절대 경로를 입력하세요</string>
+    <string name="share_target_conflict">다른 마운트 지점과 겹칩니다</string>
 </resources>

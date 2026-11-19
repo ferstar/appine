@@ -104,9 +104,9 @@ android {
     }
 
     packaging {
-        // Native libraries are stored uncompressed and page-aligned in the APK and mapped directly
-        // from it (also on 16K-page devices)
-        jniLibs.useLegacyPackaging = false
+        // The share helper runs from the installed native library directory.
+        jniLibs.useLegacyPackaging = true
+        jniLibs.keepDebugSymbols.add("**/libappine-share.so")
     }
 
     lint {
@@ -160,6 +160,14 @@ val browserAsset = tasks.register<BrowserAssetTask>("browserAsset") {
     outputDir.set(layout.buildDirectory.dir("generated/browser/assets"))
 }
 
+val androidShare = tasks.register<AndroidShareTask>("androidShare") {
+    sourceDirectory.set(repoRoot.dir("contrib/android-share-rust"))
+    sources.from(fileTree(repoRoot.dir("contrib/android-share-rust")) {
+        include("src/**/*.rs", "Cargo.toml", "Cargo.lock")
+    })
+    outputDir.set(layout.buildDirectory.dir("generated/androidShare/jniLibs"))
+}
+
 androidComponents {
     onVariants { variant ->
         val suffix = variant.name.replaceFirstChar(Char::uppercase)
@@ -175,8 +183,40 @@ androidComponents {
             outputDir.set(layout.buildDirectory.dir("generated/rust/${variant.name}/jniLibs"))
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, CargoNdkTask::outputDir)
+        variant.sources.jniLibs?.addGeneratedSourceDirectory(androidShare, AndroidShareTask::outputDir)
         variant.sources.assets?.addGeneratedSourceDirectory(rootfsAsset, RootfsAssetTask::outputDir)
         variant.sources.assets?.addGeneratedSourceDirectory(browserAsset, BrowserAssetTask::outputDir)
+    }
+}
+
+/** The optional root storage bridge, executable from Android's installed native library path. */
+abstract class AndroidShareTask : DefaultTask() {
+    @get:Internal
+    abstract val sourceDirectory: DirectoryProperty
+
+    @get:InputFiles
+    abstract val sources: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @get:Inject
+    abstract val exec: ExecOperations
+
+    @TaskAction
+    fun build() {
+        val directory = outputDir.get().dir("arm64-v8a").asFile.apply { mkdirs() }
+        val build = temporaryDir.resolve("cargo")
+        val target = "aarch64-unknown-linux-musl"
+        exec.exec {
+            workingDir = sourceDirectory.get().asFile
+            environment("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", "rust-lld")
+            val cargo = File(System.getProperty("user.home"), ".cargo/bin/cargo")
+                .takeIf { it.canExecute() }?.path ?: "cargo"
+            commandLine(cargo, "build", "--locked", "--release", "--target", target,
+                "--target-dir", build.path)
+        }
+        build.resolve("$target/release/appine-share").copyTo(File(directory, "libappine-share.so"), overwrite = true)
     }
 }
 

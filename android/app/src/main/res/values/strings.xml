@@ -298,4 +298,40 @@
     <string name="copy_report">Copy report</string>
     <string name="report_copied">Report copied</string>
 
+
+    <!-- Android directory mount -->
+    <string name="share_title">Folder sharing</string>
+    <string name="share_off">Not shared</string>
+    <string name="share_starting">Sharing…</string>
+    <string name="share_android_folder">Phone folder</string>
+    <string name="share_android_folder_unknown">Selected folder</string>
+    <string name="share_mode_read_only">Read-only</string>
+    <string name="share_mode_read_write">Read-write</string>
+    <string name="share_mount_point">Mount point</string>
+    <string name="share_copy_path">Copy path</string>
+    <string name="share_path_copied">Path copied</string>
+    <string name="share_root_failed">Could not open the Android path. Check the path and approve root access.</string>
+    <string name="share_tree_failed">Could not read the selected folder. Try sharing it again.</string>
+    <string name="share_mount_failed">Could not share the folder. Choose it again to retry.</string>
+    <string name="share_pick">Choose folder</string>
+    <string name="share_change">Change folder</string>
+    <string name="share_root">Go to path</string>
+    <string name="share_confirm">Share folder</string>
+    <string name="share_access_write">Linux can create, edit, and delete files.</string>
+    <string name="share_disconnect">Stop sharing</string>
+    <string name="share_writable">Allow changes to original files</string>
+    <string name="share_mount">Share folder</string>
+    <string name="share_invalid_path">Enter an absolute Android path</string>
+    <string name="share_parent">Parent folder</string>
+    <string name="share_folder_read_failed">Could not open this folder.</string>
+    <plurals name="share_count">
+        <item quantity="one">%d folder</item>
+        <item quantity="other">%d folders</item>
+    </plurals>
+    <string name="share_add">Add folder</string>
+    <string name="share_edit">Edit</string>
+    <string name="share_save">Save</string>
+    <string name="share_target_helper">Leave blank to use %1$s.</string>
+    <string name="share_invalid_target">Enter an absolute path</string>
+    <string name="share_target_conflict">This mount point overlaps another mount point</string>
 </resources>

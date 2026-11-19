@@ -229,6 +229,58 @@ class TerminalService : Service() {
 
     /** The browser endpoint for the current kernel, independent of terminal sessions. */
     private var browserBridge: BrowserBridge? = null
+    internal var androidShareStatuses: Map<String, AndroidShare.Status> = emptyMap()
+        private set
+    private val androidShare by lazy {
+        AndroidShare(this) { states ->
+            androidShareStatuses = states
+            each { it.onSettingsChanged() }
+        }
+    }
+
+    internal fun saveAndroidShare(previousTarget: String?, source: AndroidShare.Source, target: String): Int? {
+        val normalized = AndroidShare.normalizeTarget(target) ?: return R.string.share_invalid_target
+        val previous = Settings.androidShares(this)
+        if (previousTarget != null && previous.none { it.target == previousTarget }) return R.string.share_mount_failed
+        if (previous.any { it.target != previousTarget && AndroidShare.targetsConflict(it.target, normalized) }) {
+            return R.string.share_target_conflict
+        }
+        if (source is AndroidShare.Source.Tree &&
+            contentResolver.persistedUriPermissions.none { it.uri == source.uri && it.isReadPermission }
+        ) {
+            try {
+                contentResolver.takePersistableUriPermission(source.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: SecurityException) {
+                return R.string.share_tree_failed
+            }
+        }
+        val config = AndroidShare.Config(source, normalized)
+        val shares = if (previousTarget == null) previous + config else {
+            previous.map { if (it.target == previousTarget) config else it }
+        }
+        updateAndroidShares(previous, shares)
+        return null
+    }
+
+    internal fun removeAndroidShare(target: String) {
+        val previous = Settings.androidShares(this)
+        updateAndroidShares(previous, previous.filterNot { it.target == target })
+    }
+
+    private fun updateAndroidShares(previous: List<AndroidShare.Config>, shares: List<AndroidShare.Config>) {
+        Settings.setAndroidShares(this, shares)
+        val retainedTrees = shares.mapNotNull { (it.source as? AndroidShare.Source.Tree)?.uri }.toSet()
+        for (uri in previous.mapNotNull { (it.source as? AndroidShare.Source.Tree)?.uri }.toSet() - retainedTrees) {
+            runCatching { contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        }
+        val previousByTarget = previous.associateBy { it.target }
+        androidShareStatuses = shares.associate { share ->
+            val status = androidShareStatuses[share.target]?.takeIf { previousByTarget[share.target] == share }
+            share.target to (status ?: AndroidShare.Status.STARTING)
+        }
+        androidShare.update(if (booting) 0 else machine, shares)
+        each { it.onSettingsChanged() }
+    }
 
     /**
      * [onDestroy] has run: a thread that outlives the service (a download) must not
@@ -588,6 +640,8 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
                 Rootfs.ensureLoginTools(this)
+                runCatching { Rootfs.ensureShareClient(this) }
+                    .onFailure { Log.w(TAG, "cannot stage the phone file sharing client", it) }
                 startKernel(tier, importing = distro != null)
             }
             main.post {
@@ -652,6 +706,7 @@ class TerminalService : Service() {
                 guestActivity.reset(SystemClock.elapsedRealtime())
                 updateWakeLock()
                 if (failed.isNotEmpty()) notifications.bootFailures(failed)
+                androidShare.update(m, Settings.androidShares(this))
             }
         }
         getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
@@ -1256,6 +1311,7 @@ class TerminalService : Service() {
      * kernel still there when the sessions end, the Activity would think the last tab was closed.
      */
     private fun detach(): Long {
+        androidShare.update(0, emptyList())
         browserBridge?.close()
         browserBridge = null
         val m = machine
@@ -1286,6 +1342,7 @@ class TerminalService : Service() {
     override fun onDestroy() {
         Privacy.removeListener(privacyChanged)
         destroyed = true
+        androidShare.close()
         browserBridge?.close()
         browserBridge = null
         // A download still under way has nothing left to replace

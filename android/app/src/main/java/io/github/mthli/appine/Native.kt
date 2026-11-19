@@ -152,6 +152,10 @@ internal object Native {
     @JvmStatic
     external fun setRoutes(machine: Long, routes: Array<String>?)
 
+    /** Takes ownership of the socket, or revokes the share's authorization when fd is -1. */
+    @JvmStatic
+    external fun setFuseBacking(machine: Long, device: String, fd: Int, protocol: Int = 0): Boolean
+
     /** Creates a console (an in-process PTY) and returns its number. */
     @JvmStatic
     @Throws(IOException::class)

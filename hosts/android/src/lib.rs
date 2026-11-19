@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
@@ -59,6 +60,7 @@ macro_rules! guarded {
     }};
 }
 
+mod share_fd;
 mod vt;
 
 /// A JNI function's body panicked ([`guarded`]): logs it, and when Kotlin expects an exception
@@ -1199,6 +1201,36 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_stop<'l>(
         if let Some(m) = m {
             m.kill_all();
         }
+    })
+}
+
+/// Registers or revokes a read-only share's backing socket. Consumes any nonnegative fd.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_setFuseBacking<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    device: JString<'l>,
+    fd: jint,
+    protocol: jint,
+) -> jboolean {
+    guarded!("Native.setFuseBacking", 0, {
+        // SAFETY: Kotlin detached this descriptor from a ParcelFileDescriptor.
+        let fd = (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) });
+        let Some(name) = string(&mut env, &device) else {
+            return 0;
+        };
+        let Some(machine) = machine(handle) else {
+            return 0;
+        };
+        let backing = match fd {
+            Some(fd) => match share_fd::ShareFd::new(fd, protocol) {
+                Ok(backing) => Some(Arc::new(backing) as Arc<dyn appine_kernel::FuseBacking>),
+                Err(_) => return 0,
+            },
+            None => None,
+        };
+        machine.set_fuse_backing(name, backing).into()
     })
 }
 
