@@ -536,10 +536,12 @@ class TerminalService : Service() {
      */
     private fun startOrImport() = start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
 
-    private class StartedKernel(val handle: Long, val browser: BrowserBridge, val booted: Boolean)
+    private class StartedKernel(
+        val handle: Long, val browser: BrowserBridge, val booted: Boolean, val setupError: String?,
+    )
 
     /** Owns the new handle and browser endpoint until both can be handed to the main thread. */
-    private fun startKernel(tier: Int): StartedKernel {
+    private fun startKernel(tier: Int, importing: Boolean): StartedKernel {
         val browser = BrowserBridge { url ->
             machine != 0L && !destroyed && listeners.any { it.onOpenUrl(url) }
         }
@@ -550,7 +552,13 @@ class TerminalService : Service() {
             val store = Rootfs.store(this).path
             // Exclude DocumentsProvider opens while the kernel opens the store.
             handle = Rootfs.access.write { Native.start(store, tier) }
-            return StartedKernel(handle, browser, Rootfs.bootNewAlpine(handle, store))
+            var setupError: String? = null
+            val booted = Rootfs.installed(this) == Rootfs.Distro.ALPINE && Rootfs.ensureOpenRc(this, handle, store) { e ->
+                if (importing) throw e
+                Log.w(TAG, "OpenRC setup will retry at the next start", e)
+                setupError = e.message ?: e.toString()
+            }
+            return StartedKernel(handle, browser, booted, setupError)
         } catch (e: Throwable) {
             browser.close()
             if (handle != 0L) Native.stop(handle)
@@ -580,7 +588,7 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
                 Rootfs.ensureLoginTools(this)
-                startKernel(tier)
+                startKernel(tier, importing = distro != null)
             }
             main.post {
                 starting = false
@@ -592,7 +600,7 @@ class TerminalService : Service() {
                     return@post
                 }
                 if (exiting) {
-                    // A new Alpine store may already have booted while the handle was private.
+                    // OpenRC setup may already have booted this kernel.
                     progress = null
                     val kernel = result.getOrNull()
                     kernel?.browser?.close()
@@ -625,6 +633,7 @@ class TerminalService : Service() {
             return
         }
         updateWakeLock()
+        kernel.setupError?.let(::tell)
         Tabs.markRunning(this)
         restore?.let { saved -> restoreTabs(saved) }
         restore = null

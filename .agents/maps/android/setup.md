@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: first-boot offline OpenRC installation on new Alpine imports)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: one-time offline OpenRC setup on new and existing Alpine stores)
 
 ## Responsibilities
 
@@ -13,10 +13,10 @@
 
 - the distributions (Alpine from the APK, Debian downloaded), downloading and verifying tarballs,
   importing them into a new store, and writing first-boot configuration, which on Alpine makes
-  bash the login shell and installs OpenRC before the first terminal opens;
+  bash the login shell;
 - files refreshed before every kernel start (network interfaces, rootless podman's network, the
   bundled doas package, the profile script and the files of ash's, bash's and zsh's prompt marks for the
-  terminal's shell integration), the first-boot OpenRC installer, the osclock script run before boot and the boot log's failed services;
+  terminal's shell integration), one-time OpenRC setup on Alpine, the osclock script run before boot and the boot log's failed services;
 - package mirrors: built-in lists, one speed probe after an import, writing the fastest into
   sources nobody has changed;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
@@ -87,7 +87,7 @@ session consuming their state and events (`android/vt`).
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
   `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
 - Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`,
-  `updateProfile`; around boot: `bootNewAlpine`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
+  `updateProfile`; around boot: `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
 - Mirrors: `chooseMirror`, `useMirror`.
 - Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
@@ -158,8 +158,7 @@ session consuming their state and events (`android/vt`).
     ash; accounts busybox's `adduser` makes later take the shell of `$SHELL` or of the account
     running it, so from a root tab they get bash too; procps-ng and its six dependencies are
     staged in `/var/cache/appine/procps/` by `cachePackages`, also used for bash and bubblewrap
-    with libcap2 (`/var/cache/appine/bubblewrap/`). The import also stages the four OpenRC packages and the installer at
-    `/var/cache/appine/install-openrc.sh`. Existing stores do not receive these import-time files;
+    with libcap2 (`/var/cache/appine/bubblewrap/`). Existing stores do not receive these import-time files;
   - Debian: `hosts` and `resolv.conf` (the DNS stub) always.
 
 ### Before every start and boot
@@ -189,12 +188,16 @@ session consuming their state and events (`android/vt`).
 - Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
   snapshotter run on the kernel's overlayfs, rootful and rootless. A `storage.conf` choosing vfs or
   a `daemon.json` choosing native that an earlier build wrote stays until the user removes it.
-- When the staged installer exists, `bootNewAlpine` runs it before publishing the kernel handle.
-  It uses apk offline with the local packages and the staged bubblewrap libcap2. A temporary
-  virtual package holds the files until apk records openrc by name; its dependencies can upgrade.
-  After inittab finishes, the guest must have the OpenRC lock directory and default runlevel.
-  Only then are the OpenRC bundle and installer removed. On failure the startup error is surfaced
-  and the next launch retries. After successful setup a later removal of OpenRC is respected.
+- On Alpine, `ensureOpenRc` checks the per-store marker `/var/lib/appine/openrc-setup-done`.
+  On an unmarked store it checks apk offline. If OpenRC is already installed, it writes only the
+  marker and leaves boot asynchronous. A staged `/var/cache/appine/install-openrc.sh` (including
+  one left by an older app) resumes an incomplete installation even if the package is present.
+- For a missing or pending install, setup rebuilds its private package cache from the APK's
+  OpenRC bundle and libcap2 from its bubblewrap assets. The installer uses a temporary virtual
+  package for missing dependencies, records openrc by name in world and removes the virtual package.
+  Setup runs inittab before tabs open, verifies the lock directory and default runlevel, removes the
+  cache and installer and writes the marker. Later removal persists. A failed migration on an
+  existing store reports the error and allows a login for repairs. The next start retries.
 - Both first and subsequent boots run `PREFER_OSCLOCK` without a console. It adds osclock to the boot runlevel when
   `rc-update` and the osclock service exist and no runlevel has hwclock, osclock or swclock (a
   dangling link counts); the thread waits for it, ignores its exit status and only logs an

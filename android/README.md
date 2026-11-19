@@ -12,7 +12,10 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
   switches the distribution, resets the rootfs, chooses the package mirror, the login
   account and the execution mode (Tier 1 by default; Tier 0 for troubleshooting in both debug
   and release builds).
-  A new Alpine system installs OpenRC offline and completes its first boot before opening a tab.
+  On the first launch of a new or upgraded Alpine system, Appine checks for OpenRC.
+  If it is missing, Appine installs it offline and boots it before opening a tab. An existing
+  installation keeps its configuration. After setup, users can remove OpenRC with `apk del`.
+  If setup fails on an upgrade, the terminal opens for repairs and the next start retries.
   Each tab runs `assets/login.sh` as root: it picks the
   login account (the first regular user by default), gives a regular user doas or sudo the
   first time it logs in (the doas package from `scripts/fetch-rootfs` is in the assets),

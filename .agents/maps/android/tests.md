@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: first Alpine boot coverage for offline OpenRC installation, retry and service management)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: OpenRC upgrade, recovery and user-removal coverage)
 
 ## Responsibilities
 
@@ -89,9 +89,12 @@ debug variant, manifest and network-security configuration belong to `android/bu
   persists. `newSystemsInstallBubblewrapOffline` similarly uses its own store without bash/procps
   or repositories, checks a missing libcap dependency, concurrent retries and user removal, and
   runs root and unprivileged sandboxes with namespaces, read-only root and private tmpfs.
-  `newSystemsBootOpenRcBeforeLogin` removes a dependency from a fresh store, retries offline,
-  checks the default runlevel and manages osclock from the first login, then checks world entries,
-  cache cleanup and user removal.
+  `newSystemsBootOpenRcBeforeLogin` removes the apk trust keys from a fresh store and retries
+  offline after restoring them. It checks the default runlevel, first-login osclock management,
+  world, cache cleanup and user removal. Two upgrade cases cover an older Alpine without login
+  caches and an existing dependency-only OpenRC installation with custom configuration.
+  `interruptedOpenRcSetupKeepsTheUpgradeRecoverable` restarts between apk transactions, repairs
+  a custom inittab from a login after verification fails, and finishes setup on the next start.
   Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
   from the internet, behind the `network=true` argument; `routesComeFromLinkProperties` has no
   gate but fails without a default network with an IPv4 gateway.
