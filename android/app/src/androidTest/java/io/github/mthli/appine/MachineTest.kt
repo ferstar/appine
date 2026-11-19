@@ -483,6 +483,34 @@ class MachineTest {
         }
     }
 
+    @Test
+    fun newSystemsBootOpenRcBeforeLogin() {
+        val store = File(context.cacheDir, "store-openrc")
+        store.deleteRecursively()
+        Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
+        val machine = Native.start(store.path, 1)
+        try {
+            val bundle = "/var/cache/appine/openrc"
+            assertEquals(0, sh(machine, "rm -f /etc/apk/repositories; mv $bundle/bridge-*.apk /tmp/").second)
+            assertThrows(IOException::class.java) { Rootfs.bootNewAlpine(machine, store.path) }
+            assertEquals(0, sh(machine, "mv /tmp/bridge-*.apk $bundle/").second)
+            assertTrue(Rootfs.bootNewAlpine(machine, store.path))
+
+            val firstLogin = plain(login(machine,
+                "cat /run/openrc/softlevel; echo\nrc-service osclock stop && rc-service osclock start && echo service-ready\nexit\n"))
+            assertTrue(firstLogin, firstLogin.contains("\ndefault\n"))
+            assertTrue(firstLogin, firstLogin.contains("\nservice-ready\n"))
+            assertEquals(0, sh(machine, "test ! -e $bundle && grep -qx openrc /etc/apk/world && " +
+                "! grep -E '^([.]appine-openrc|bridge|ifupdown-ng|openrc-user)' /etc/apk/world").second)
+            assertEquals(0, sh(machine, "apk del --no-network openrc").second)
+            assertFalse(Rootfs.bootNewAlpine(machine, store.path))
+            assertEquals(0, sh(machine, "! apk info -e openrc").second)
+        } finally {
+            Native.stop(machine)
+            store.deleteRecursively()
+        }
+    }
+
     /** Offline bubblewrap installation retries safely and works for an unprivileged user. */
     @Test
     fun newSystemsInstallBubblewrapOffline() {

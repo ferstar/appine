@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-16 (targeted verification only since the full mapping; latest change: enable heads-up alerts by default for new terminal and problems notification channels)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: new Alpine stores finish their first OpenRC boot before the kernel handle reaches tabs)
 
 ## Responsibilities
 
@@ -132,9 +132,11 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
   `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`, `updateProfile`, then
   `Native.start(store, tier)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
-  all builds, defaulting to 1).
+  all builds, defaulting to 1). When a new Alpine store still has its staged installer,
+  `Rootfs.bootNewAlpine` installs OpenRC and runs inittab on this thread. The handle stays private
+  until setup is complete, including on retry after a killed launch. Failure stops the private kernel.
 - Back on the main thread it clears `starting`; if "exit all" came meanwhile it finishes the exit
-  with the new kernel (`Native.stop`, not booted). On success: set `machine`, clear `progress`,
+  with the new kernel (shutdown after the first Alpine boot, stop if still unbooted). On success: set `machine`, clear `progress`,
   refresh Files roots; a `pendingReplace` replaces the store at once; otherwise update the wake
   lock, write the running marker, restore the killed run's tabs (once), schedule periodic saves,
   start the boot thread, register a default-network callback (routes), post the poll, update the
@@ -148,7 +150,7 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 - Which start: when no store is ready (`startOrImport`, at creation and when an exit finishes with
   a UI back) the distro the last import was started for is imported first, otherwise the store
   starts as it is.
-- Boot (`appine-boot` thread): run the osclock script without a console (failures only logged),
+- Boot (`appine-boot` thread): unless the start thread already booted the kernel, run the osclock script without a console (exceptions logged, exit status ignored),
   `Native.boot` (blocks until inittab's boot entries finish), then notify OpenRC services that
   failed to start, if the kernel is still the same.
 
@@ -443,8 +445,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 - Debug and release builds share the saved tier preference; a Tier 0 choice from an earlier
   debug install is also honoured by a release build when that preference is retained.
 - Normal background kernel work goes through the single worker, so polls and saves are
-  ordered before stop and shutdown; `Native.start` runs on `appine-start`, the boot calls on
-  `appine-boot`, a tab's console opening on the main thread. If destruction races a start,
+  ordered before stop and shutdown; `Native.start` runs on `appine-start`, the first Alpine boot on
+  that same thread and ordinary boots on `appine-boot`, a tab's console opening on the main thread. If destruction races a start,
   its abandoned handle is shut down on `appine-stop`. A stale kernel handle is harmless
   (the JNI table no longer finds it). A call that must answer while the BKL is stuck (`bklStall`)
   must not take it and runs on the main thread.

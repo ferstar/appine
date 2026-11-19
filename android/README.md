@@ -12,6 +12,7 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
   switches the distribution, resets the rootfs, chooses the package mirror, the login
   account and the execution mode (Tier 1 by default; Tier 0 for troubleshooting in both debug
   and release builds).
+  A new Alpine system installs OpenRC offline and completes its first boot before opening a tab.
   Each tab runs `assets/login.sh` as root: it picks the
   login account (the first regular user by default), gives a regular user doas or sudo the
   first time it logs in (the doas package from `scripts/fetch-rootfs` is in the assets),
@@ -86,9 +87,9 @@ Keep notices in the same change as dependency updates:
   simultaneously linked versions, such as jni-sys 0.3 and 0.4.
 - `android.html` lists the resolved Android runtime libraries, including transitive ones;
   check both debug and release runtime classpaths when changing the version catalog.
-- `alpine.html` records the bundled rootfs and doas/bash/procps/bubblewrap packages, with versions,
+- `alpine.html` records the bundled rootfs and doas/bash/procps/bubblewrap/OpenRC packages, with versions,
   license expressions and aports commits. Compare with the artifacts Gradle selects in
-  `target/rootfs`, and count shared ncurses packages only once.
+  `target/rootfs`, and count shared packages only once.
 - Preserve license wording, copyright notices and all required component notices when
   editing HTML. Use paragraphs and headings for reflow; do not shrink fixed-width text.
   Keep IDs stable across upgrades, and update the separate source bundles as before

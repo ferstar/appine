@@ -206,6 +206,8 @@ internal object Rootfs {
             useBash(context, store)
             cachePackages(context, store, "procps")
             cachePackages(context, store, "bubblewrap")
+            cachePackages(context, store, "openrc")
+            write(store, OPENRC_INSTALL, asset(context, "install-openrc.sh"))
         } else {
             // Debian's has no hosts, and resolv.conf points at 1.1.1.1. DNS must go through the
             // kernel layer's stub (the kernel/net map) for the system's Private DNS and VPNs to
@@ -263,7 +265,7 @@ internal object Rootfs {
             """.trimIndent()
     }
 
-    /** Stages a bundled package set only at import; login removes it after a successful install. */
+    /** Stages offline packages only at import. First boot or login consumes the bundle. */
     @Throws(IOException::class)
     private fun cachePackages(context: Context, store: String, bundle: String): Boolean {
         val packages = context.assets.list(bundle).orEmpty()
@@ -335,7 +337,7 @@ if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
 """
 
     private fun asset(context: Context, name: String): String =
-        context.assets.open(name).bufferedReader().readText()
+        context.assets.open(name).bufferedReader().use { it.readText() }
 
     private fun write(store: String, path: String, text: String, overwrite: Boolean = true) =
         write(store, path, text.toByteArray(), overwrite)
@@ -584,6 +586,48 @@ netns = "host"
         "for s in hwclock osclock swclock; do for l in /etc/runlevels/*/\$s; do " +
         "[ -e \"\$l\" ] || [ -L \"\$l\" ] && exit 0; done; done; " +
         "exec /sbin/rc-update -q add osclock boot >/dev/null 2>&1"
+
+    private const val OPENRC_INSTALL = "/var/cache/appine/install-openrc.sh"
+
+    private fun runBootCommand(machine: Long, command: String): Int {
+        val argv = arrayOf("sh", "-c", command)
+        val pid = Native.spawn(machine, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+        return Native.waitFor(machine, pid)
+    }
+
+    /** Prefers the guest clock and runs the existing inittab. */
+    fun boot(machine: Long) {
+        runCatching { runBootCommand(machine, PREFER_OSCLOCK) }
+            .onFailure { Log.w(TAG, "cannot prefer osclock", it) }
+        Native.boot(machine)
+    }
+
+    /**
+     * Boots a newly imported Alpine system before tabs can consume the login bundles. The staged
+     * installer survives a failed or killed first launch and is removed once OpenRC is ready.
+     */
+    fun bootNewAlpine(machine: Long, store: String): Boolean {
+        if (Native.readFile(store, OPENRC_INSTALL) == null) return false
+        val logPath = "/var/log/appine-openrc.log"
+        val status = runBootCommand(machine, "sh $OPENRC_INSTALL >$logPath 2>&1")
+        if (status != 0) {
+            val log = Native.readFile(store, logPath)?.decodeToString()?.trim().orEmpty()
+            throw IOException("Cannot install OpenRC (exit $status)\n$log".trimEnd())
+        }
+
+        boot(machine)
+        val finish = """
+            set -e
+            test -d /run/openrc/exclusive
+            test "$(cat /run/openrc/softlevel)" = default
+            rm -rf /var/cache/appine/openrc
+            rm -f $OPENRC_INSTALL
+        """.trimIndent()
+        if (runBootCommand(machine, finish) != 0) {
+            throw IOException("Cannot finish the first OpenRC boot. See /var/log/boot.log")
+        }
+        return true
+    }
 
     /**
      * The services that did not start at this boot: OpenRC writes

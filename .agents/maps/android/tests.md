@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/tests.md` for the paired decision history (not yet created; pre-split decisions D5, D8, the test portions of D9, D12–D14, D16, D19 and D23–D29 stay in `.agents/decisions/android/native.md`).
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: first Alpine boot coverage for offline OpenRC installation, retry and service management)
 
 ## Responsibilities
 
@@ -87,6 +89,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
   persists. `newSystemsInstallBubblewrapOffline` similarly uses its own store without bash/procps
   or repositories, checks a missing libcap dependency, concurrent retries and user removal, and
   runs root and unprivileged sandboxes with namespaces, read-only root and private tmpfs.
+  `newSystemsBootOpenRcBeforeLogin` removes a dependency from a fresh store, retries offline,
+  checks the default runlevel and manages osclock from the first login, then checks world entries,
+  cache cleanup and user removal.
   Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
   from the internet, behind the `network=true` argument; `routesComeFromLinkProperties` has no
   gate but fails without a default network with an IPv4 gateway.
