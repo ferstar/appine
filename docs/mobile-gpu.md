@@ -60,6 +60,17 @@ With the CPU mapping on the exporting device (type 0) and GPU commands on the im
 
 On the debug APK, Alpine 3.24 (Mesa 26.1.6) and Debian trixie (Mesa 25.0.7) both discovered `Virtio-GPU Venus (Mali-G715)` as UID 1000. Each verified 65,536 words with default discovery, with `appine-gpu`, after a concurrent client died with an unsignaled fence, and after a machine restart. Both passed the shared-mapping lifetime and shutdown checks. With the R8-shrunk release APK, both guests also passed the mapping lifetime test, discovered Venus and verified all 65,536 words with only the packaged Venus ICD selected.
 
+Five runs of `GpuTest#distributionVenus` per distribution used the debug APK and a fresh Tier 1 guest store each time. As on the Pixel 11 Pro, the test ran `vulkaninfo --summary`, then the compute sample with default discovery, then the same sample with `appine-gpu`. Both invocations dispatched 1,024 workgroups on the Mali GPU and verified all 65,536 words. The fixed order gives the second invocation a warm guest, so the difference includes any warm-up effects.
+
+| Guest | Discovery | Upload | Queue submit | Fence wait | Invalidate and check | End to end (min–max) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Alpine 3.24 | Default | 0.385 | 3.797 | 7.505 | 44.524 | 644.3 (530.7–898.1) |
+| Alpine 3.24 | `appine-gpu` | 0.217 | 2.891 | 2.589 | 35.816 | 275.0 (247.2–284.3) |
+| Debian trixie | Default | 0.452 | 2.767 | 7.169 | 46.001 | 609.5 (530.3–680.5) |
+| Debian trixie | `appine-gpu` | 0.313 | 2.564 | 2.662 | 41.129 | 252.8 (235.2–260.1) |
+
+All times are medians in milliseconds, with the end-to-end range in parentheses. The compute program times Vulkan instance creation through CPU verification, including device and pipeline setup. With `appine-gpu`, the median fence wait was about 2.6 ms in both guests. Invalidating the mapped buffer and checking its 256 KiB on the guest CPU took 35.8 ms on Alpine and 41.1 ms on Debian.
+
 ## Reproduce
 
 Build the Android app using the [Android build guide](../android/README.md#building). The disposable fixture builder uses ARM64 Docker images and the pinned DRM headers for the low-level lifetime test. The Vulkan sample links the selected distribution's own loader. From the repository root with a debug build installed on the selected device:
