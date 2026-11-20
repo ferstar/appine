@@ -157,7 +157,7 @@ fn answer(host: &mut Host, opcode: u32, id: u64, args: &[u8]) -> io::Result<Vec<
             dirent(&mut out, 0, id, true, ".");
             dirent(&mut out, 1, u64::from_le_bytes(bytes), true, "..");
             for (i, entry) in host.list(share_path(path)?)?.into_iter().enumerate() {
-                dirent(&mut out, i + 2, 0, entry.dir, &entry.name);
+                dirent(&mut out, i + 2, u32::MAX as u64, entry.dir, &entry.name);
                 if out.len() > MAX_REPLY {
                     return Err(errno(libc::EOPNOTSUPP));
                 }

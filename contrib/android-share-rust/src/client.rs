@@ -508,7 +508,20 @@ impl Filesystem for Share {
                 (ino, FileType::Directory, ".".into()),
                 (parent, FileType::Directory, "..".into()),
             ];
-            values.extend(entries.into_iter().map(|e| (INodeNo(0), e.kind(), e.name)));
+            const FUSE_UNKNOWN_INO: INodeNo = INodeNo(u32::MAX as u64);
+            values.extend(entries.into_iter().map(|e| {
+                let child = if path == "/" {
+                    format!("/{}", e.name)
+                } else {
+                    format!("{}/{}", path, e.name)
+                };
+                let entry_ino = s
+                    .nodes
+                    .iter()
+                    .find(|(_, n)| n.path.as_deref() == Some(child.as_str()))
+                    .map_or(FUSE_UNKNOWN_INO, |(&n, _)| n);
+                (entry_ino, e.kind(), e.name)
+            }));
             let fh = FileHandle(s.id());
             s.dirs.insert(fh, values);
             Ok(fh)
