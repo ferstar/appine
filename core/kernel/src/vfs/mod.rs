@@ -1138,7 +1138,31 @@ impl Vfs {
         flags: u64,
     ) -> Result<(Node, Option<Dentry>), Errno> {
         self.store
-            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, flags))
+            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, flags, None))
+    }
+
+    /// Like [`walk_resolve`](Self::walk_resolve), but when the final component is missing (and
+    /// there is no trailing slash), returns `Ok(Err((parent_dir, name)))` so `openat(O_CREAT)`
+    /// does not need to re-walk the path from scratch via `resolve_parent_with`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn walk_resolve_open(
+        &self,
+        ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
+        cwd: &Node,
+        path: &[u8],
+        follow: bool,
+        flags: u64,
+    ) -> Result<Result<(Node, Option<Dentry>), (Node, Vec<u8>)>, Errno> {
+        self.store.snapshot(|_| {
+            let mut missing = None;
+            match self.walk_in(ps, cred, root, cwd, path, follow, flags, Some(&mut missing)) {
+                Ok(found) => Ok(Ok(found)),
+                Err(Errno::ENOENT) if missing.is_some() => Ok(Err(missing.unwrap())),
+                Err(e) => Err(e),
+            }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1151,6 +1175,7 @@ impl Vfs {
         path: &[u8],
         follow: bool,
         flags: u64,
+        mut missing_parent: Option<&mut Option<(Node, Vec<u8>)>>,
     ) -> Result<(Node, Option<Dentry>), Errno> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
@@ -1205,6 +1230,12 @@ impl Vfs {
             }
             let node = match self.lookup(ps, &dir, &comp) {
                 Err(e) if e == Errno::ENOENT => {
+                    if last && !path.ends_with(b"/") {
+                        if let Some(slot) = missing_parent.as_deref_mut() {
+                            *slot = Some((dir, comp));
+                            return Err(e);
+                        }
+                    }
                     ps.missing(&dir, &comp);
                     return Err(e);
                 }

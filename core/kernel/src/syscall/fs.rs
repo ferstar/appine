@@ -399,7 +399,12 @@ fn open_path_with(
     let follow = flags & oflags::O_NOFOLLOW == 0 && !excl;
     let cred = cx.cred();
 
-    let resolved = vfs.walk_resolve(&cx.view(&vfs), &cred, &root, &start, &path, follow, res);
+    let resolved = if create {
+        vfs.walk_resolve_open(&cx.view(&vfs), &cred, &root, &start, &path, follow, res)
+    } else {
+        vfs.walk_resolve(&cx.view(&vfs), &cred, &root, &start, &path, follow, res)
+            .map(Ok)
+    };
     // A queue was created in the mqueue filesystem (open permission is not checked again, as for
     // files just created in the store)
     let mut mq_created = false;
@@ -407,9 +412,10 @@ fn open_path_with(
     let mut fuse_created = None;
     // parent is the last directory and name passed through, for reporting inotify events
     let (node, created, parent) = match resolved {
-        Ok(_) if excl => return Err(Errno::EEXIST),
-        Ok((node, found)) => (node, None, found),
-        Err(e) if e == Errno::ENOENT && create => {
+        Ok(Ok(_)) if excl => return Err(Errno::EEXIST),
+        Ok(Ok((node, found))) => (node, None, found),
+        Ok(Err((fast_dir, fast_name))) => {
+            let mut fast = Some((fast_dir, fast_name));
             // When the last component is a dangling symlink, follow it and create the target
             // file, as on Linux
             let mut root_set = path.first() == Some(&b'/')
@@ -418,8 +424,18 @@ fn open_path_with(
             let (mut start, mut path) = (start.clone(), path.clone());
             let mut links = 0;
             loop {
-                let (dir, name) =
-                    vfs.resolve_parent_with(&cx.view(&vfs), &cred, &root, &start, &path, res)?;
+                let (dir, name_owned);
+                let name: &[u8];
+                if let Some((d, n)) = fast.take() {
+                    dir = d;
+                    name_owned = n;
+                    name = &name_owned;
+                } else {
+                    let (d, n) =
+                        vfs.resolve_parent_with(&cx.view(&vfs), &cred, &root, &start, &path, res)?;
+                    dir = d;
+                    name = n;
+                }
                 if path.ends_with(b"/") || name == b"." || name == b".." {
                     return Err(Errno::EISDIR);
                 }
