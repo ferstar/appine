@@ -162,9 +162,12 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   never builds one.
 - CI's clang step relies on the runner image's clang; CI installs only llvm and musl-tools.
 
+## Confirmed bugs / technical debt
+
+- On Pixel 11 Pro, Alpine llama.cpp b9564 selects incompatible matrix-multiply and Flash Attention tiles for the PowerVR GPU's 128-lane subgroups. Full offload with `-fa off -ub 16` passed both surveyed Qwen2.5 prompts. The native driver also signals zero-batch submission fences early. The [device survey](../../docs/mobile-gpu.md#powervr-correctness) records the independent controls.
+
 ## Open questions
 
-- What causes the Pixel 11 Pro Vulkan runs to generate incorrect text for both Qwen2.5-Instruct Q4_0 models while their CPU controls answer correctly? The [llama.cpp survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the workloads, layer counts and throughput.
 - Should partial LTP runs merge into `results.txt` as the durations do?
 
 ## To verify

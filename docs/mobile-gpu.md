@@ -80,7 +80,22 @@ Both phones ran Qwen2.5-Instruct Q4_0 with full Vulkan offload (25/25 layers at 
 | Pixel 11 Pro · PowerVR | Unrelated text and repeated question marks | Unrelated text |
 | Pixel 8 · Mali-G715 | “一个GPU可以同时处理许多任务。” | Answered 15 correctly |
 
-The Pixel 11 Pro CPU answered both prompts correctly. Selecting `--device Vulkan0 -ngl 99` explicitly reproduced the translation failure. With `GGML_VK_DISABLE_COOPMAT=1`, the translation timed out after 120 seconds. The cause remains open.
+The Pixel 11 Pro CPU answered both prompts correctly. Selecting `--device Vulkan0 -ngl 99` explicitly reproduced the translation failure. With `GGML_VK_DISABLE_COOPMAT=1`, the translation timed out after 120 seconds.
+
+### PowerVR correctness
+
+On the stock debug APK and Alpine packages, adding `-fa off -ub 16` to the full-offload command produced “一个GPU可以同时处理许多任务。” at 0.5B and “15” at 1.5B. The logs confirmed 25/25 and 29/29 layers on Vulkan. Both answers repeated with warm-up disabled. A microbatch of one also passed both prompts with warm-up disabled. For the same 47-token translation prompt, changing only the microbatch from 32 to 33 with Flash Attention off changed a correct translation into whitespace. At a microbatch of 16, enabling automatic Flash Attention produced unrelated text. The throughput table below uses the original settings.
+
+An Android-native build of the same llama.cpp revision used the SPIR-V extracted from Alpine’s Vulkan package. The tensor comparisons used explicit fence synchronization to isolate numerical errors. Reading back the 0.5B model’s first layer exposed two problems with the backend’s 128-lane subgroup configuration, independently of Appine and Venus.
+
+| Operation | Native PowerVR observation | Cause and control |
+| --- | --- | --- |
+| Q4_0 query projection, Flash Attention off | With token IDs starting at 1234, the first-layer query tensor had RMS 0.62405 at 32 tokens (CPU 0.62397). At 33 tokens it was all zeros (CPU 0.62961). | The trace switched from the small to the medium matrix-multiply tile. The medium tile sets `BM=64` and `WM=128`. The shader uses the integer quotient `BM / WM` as a divisor and modulus for subgroup coordinates. Forcing the small tile for the same 33 tokens restored RMS 0.62966. |
+| Cooperative-matrix Flash Attention | For token 1234 alone, grouped-query attention selected a 512-thread workgroup, four subgroups and 64 columns. The first four output values were about −3.4 × 10³⁸. The CPU values were −0.01025, −0.01495, −0.02132 and −0.01427. | Each subgroup gets 128 lanes. The shader assigns `64 / (512 / 4) = 0` columns per thread, skipping both the row-maximum and attention-weight loops. Disabling Flash Attention restored the first-layer attention output to RMS 0.02374 (CPU 0.02375). |
+
+With the fence control below and the small matrix tile forced, the native build translated the prompt correctly using either ordinary attention or the scalar Flash Attention shader with 32-lane subgroups. Both runs retained full GPU offload. [Tile selection](https://github.com/ggml-org/llama.cpp/blob/3b3da01dc21dc68e958efb898ab739c65ed08ca2/ggml/src/ggml-vulkan/ggml-vulkan.cpp#L7800) · [Matrix shader](https://github.com/ggml-org/llama.cpp/blob/3b3da01dc21dc68e958efb898ab739c65ed08ca2/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp#L193) · [Attention shader](https://github.com/ggml-org/llama.cpp/blob/3b3da01dc21dc68e958efb898ab739c65ed08ca2/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp#L349)
+
+A separate native driver check held a compute submission behind a timeline semaphore. In three paired runs, a later `vkQueueSubmit(queue, 0, NULL, fence)` signaled its fence while the work fence was still unsignaled. Submitting one empty `VkSubmitInfo` instead kept the fence pending until the host released the semaphore. All six dispatches then verified 65,536 words. Vulkan requires the fence to cover earlier commands on the same queue. Changing the zero-batch call in native llama.cpp raised the 64 × 5 × 4 × 3 RMSNorm CPU comparisons from 3/11 to 11/11 in one paired run. Applying the same substitution to the renderer’s fence submissions alone still produced incorrect text. [Vulkan fence signal scope](https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-fences-signaling)
 
 ### Throughput
 
