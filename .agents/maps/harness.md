@@ -165,7 +165,7 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
 ## Confirmed bugs / technical debt
 
 - On Pixel 11 Pro, Alpine llama.cpp b9564 selects incompatible matrix-multiply and Flash Attention tiles for the PowerVR GPU's 128-lane subgroups. Full offload with `-fa off -ub 16` passed both surveyed Qwen2.5 prompts. The native driver also signals zero-batch submission fences early. The [device survey](../../docs/mobile-gpu.md#powervr-correctness) records the independent controls.
-- On Galaxy S23 firmware `S9110ZCS8FZJ1`, Alpine llama.cpp b9564 loads both surveyed Qwen2.5 models onto Adreno 740, then the driver fails to link compute shaders during warm-up. The failing shader has not been identified. The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and Vulkan results.
+- On Galaxy S23 firmware `S9110ZCS8FZJ1`, llama.cpp b9564 reproduces the Adreno 740 shader link failure during warm-up in both Alpine and native Android. Native runs identify `quantize_q8_1_x4` for both surveyed Qwen2.5 models. The guest logs do not name the shader. The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
 - On Galaxy S25 Ultra firmware `S9380ZCS8BZA1`, Alpine llama.cpp b9564 completes full Vulkan offload on Adreno 830 but produces incorrect text for both surveyed Qwen2.5 prompts. The cause remains open. The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
 
 ## Open questions
