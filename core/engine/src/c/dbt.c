@@ -3312,7 +3312,8 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
         }
     }
     if (memop_kind) {
-        if (memop_kind != APPINE_MEMOP_STRLEN) {
+        if (memop_kind != APPINE_MEMOP_STRLEN && memop_kind != APPINE_MEMOP_STRCHR &&
+            memop_kind != APPINE_MEMOP_STRCMP) {
             emit(x, enc_ubfx(T0, 2, 7, 57));
             emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_INTERP, pc);
         } else {
@@ -4578,6 +4579,91 @@ static bool exec_memop(struct appine_cpu *c, uint32_t kind)
             total += chunk;
         }
         return false;
+    }
+    case APPINE_MEMOP_MEMCHR: {
+        uint64_t cur = c->x[0], rem = c->x[2];
+        int ch = (int)(c->x[1] & 0xff);
+        if (rem > (64u << 20))
+            return false;
+        while (rem > 0) {
+            uint64_t off = cur & PAGE_MASK;
+            uint64_t chunk = APPINE_PAGE_SIZE - off;
+            if (chunk > rem)
+                chunk = rem;
+            uint8_t *hp = (uint8_t *)appine_mmu_translate(mmu, cur & ~PAGE_MASK, APPINE_PROT_READ);
+            if (!hp)
+                return false;
+            uint8_t *f = (uint8_t *)memchr(hp + off, ch, chunk);
+            if (f) {
+                c->x[0] = cur + (uint64_t)(f - (hp + off));
+                return true;
+            }
+            cur += chunk;
+            rem -= chunk;
+        }
+        c->x[0] = 0;
+        return true;
+    }
+    case APPINE_MEMOP_STRCHR: {
+        uint64_t cur = c->x[0], total = 0;
+        int ch = (int)(c->x[1] & 0xff);
+        while (total < (64u << 20)) {
+            uint64_t off = cur & PAGE_MASK;
+            uint64_t chunk = APPINE_PAGE_SIZE - off;
+            uint8_t *hp = (uint8_t *)appine_mmu_translate(mmu, cur & ~PAGE_MASK, APPINE_PROT_READ);
+            if (!hp)
+                return false;
+            uint8_t *z = (uint8_t *)memchr(hp + off, 0, chunk);
+            uint64_t span = z ? (uint64_t)(z - (hp + off)) + 1 : chunk;
+            uint8_t *f = (uint8_t *)memchr(hp + off, ch, span);
+            if (f) {
+                c->x[0] = cur + (uint64_t)(f - (hp + off));
+                return true;
+            }
+            if (z) {
+                c->x[0] = 0;
+                return true;
+            }
+            cur += chunk;
+            total += chunk;
+        }
+        return false;
+    }
+    case APPINE_MEMOP_STRCMP:
+    case APPINE_MEMOP_STRNCMP: {
+        uint64_t a_cur = c->x[0], b_cur = c->x[1];
+        uint64_t rem = (kind == APPINE_MEMOP_STRNCMP) ? c->x[2] : (64u << 20);
+        if (rem > (64u << 20))
+            return false;
+        while (rem > 0) {
+            uint64_t a_off = a_cur & PAGE_MASK;
+            uint64_t b_off = b_cur & PAGE_MASK;
+            uint64_t chunk = APPINE_PAGE_SIZE - a_off;
+            if (APPINE_PAGE_SIZE - b_off < chunk)
+                chunk = APPINE_PAGE_SIZE - b_off;
+            if (chunk > rem)
+                chunk = rem;
+            uint8_t *ah = (uint8_t *)appine_mmu_translate(mmu, a_cur & ~PAGE_MASK, APPINE_PROT_READ);
+            uint8_t *bh = (uint8_t *)appine_mmu_translate(mmu, b_cur & ~PAGE_MASK, APPINE_PROT_READ);
+            if (!ah || !bh)
+                return false;
+            uint8_t *za = (uint8_t *)memchr(ah + a_off, 0, chunk);
+            uint64_t span = za ? (uint64_t)(za - (ah + a_off)) + 1 : chunk;
+            int r = memcmp(ah + a_off, bh + b_off, span);
+            if (r != 0) {
+                c->x[0] = (uint64_t)(int64_t)r;
+                return true;
+            }
+            if (za) {
+                c->x[0] = 0;
+                return true;
+            }
+            a_cur += chunk;
+            b_cur += chunk;
+            rem -= chunk;
+        }
+        c->x[0] = 0;
+        return true;
     }
     default:
         return false;

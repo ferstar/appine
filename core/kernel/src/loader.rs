@@ -1434,6 +1434,10 @@ fn scan_elf_memops(exe: &Executable, bias: u64, out: &mut Vec<appine_engine::Dbt
                 b"memmove" => appine_engine::MEMOP_MEMMOVE,
                 b"memcmp" => appine_engine::MEMOP_MEMCMP,
                 b"strlen" => appine_engine::MEMOP_STRLEN,
+                b"memchr" => appine_engine::MEMOP_MEMCHR,
+                b"strchr" => appine_engine::MEMOP_STRCHR,
+                b"strcmp" => appine_engine::MEMOP_STRCMP,
+                b"strncmp" => appine_engine::MEMOP_STRNCMP,
                 _ => 0,
             };
             if kind != 0 {
@@ -1569,6 +1573,10 @@ pub(crate) fn scan_fd_memops(
                 }
                 b"memcmp" | b"__memcmp_generic" => appine_engine::MEMOP_MEMCMP,
                 b"strlen" | b"__strlen_generic" | b"__strlen_asimd" => appine_engine::MEMOP_STRLEN,
+                b"memchr" | b"__memchr_generic" => appine_engine::MEMOP_MEMCHR,
+                b"strchr" | b"__strchr_generic" => appine_engine::MEMOP_STRCHR,
+                b"strcmp" | b"__strcmp_generic" => appine_engine::MEMOP_STRCMP,
+                b"strncmp" | b"__strncmp_generic" => appine_engine::MEMOP_STRNCMP,
                 _ => 0,
             };
             if kind != 0 && !out.iter().any(|m| m.pc == pc) {

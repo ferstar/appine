@@ -394,9 +394,13 @@ enum appine_memop_kind {
     APPINE_MEMOP_MEMMOVE = 3,
     APPINE_MEMOP_MEMCMP = 4,
     APPINE_MEMOP_STRLEN = 5,
+    APPINE_MEMOP_MEMCHR = 6,
+    APPINE_MEMOP_STRCHR = 7,
+    APPINE_MEMOP_STRCMP = 8,
+    APPINE_MEMOP_STRNCMP = 9,
 };
 
-#define APPINE_DBT_MEMOPS 16
+#define APPINE_DBT_MEMOPS 32
 struct appine_dbt_memop {
     uint64_t pc;
     uint32_t kind;
