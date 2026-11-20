@@ -1,6 +1,6 @@
 # Mobile GPU support for Alpine and Debian guests
 
-On a Samsung Galaxy S23, an unprivileged Alpine or Debian shell can run headless Vulkan buffer compute on the Adreno 740 using the distribution's unmodified Mesa Venus driver. Appine provides the DRM render node and the Android renderer. The loader discovers the driver through the distribution's normal ICD manifest.
+On the Samsung Galaxy S23 (Adreno 740) and Google Pixel 11 Pro (PowerVR C-Series CXTP-48-1536 MC1), an unprivileged Alpine or Debian shell can run headless Vulkan buffer compute using the distribution's unmodified Mesa Venus driver. Appine provides the DRM render node and the Android renderer. The loader discovers the driver through the distribution's normal ICD manifest.
 
 ## Run it
 
@@ -38,6 +38,19 @@ Both distributions also passed packaged discovery and the compute check against 
 Separate guest `strace` runs on the S23 release APK verified all 65,536 words in both distributions. Each trace showed five blob creations, five map ioctls and five GEM closes. Alpine made 43 execbuffer calls, duplicated a fence fd with `F_DUPFD_CLOEXEC` and observed `POLLIN` on the duplicate through `ppoll`. Debian made 26 execbuffer calls and completed this run without a `ppoll` call. Neither run issued a DRM syncobj or PRIME ioctl. The timing table uses the untraced runs.
 
 On the API 37, 16,384-byte-page emulator, Goldfish GFXStream reported zero Android Hardware Buffer external-buffer features with both llvmpipe and host acceleration on an Apple M2 Pro. The negative test confirmed that the guest could start and both the render node and corresponding sysfs path were absent. Physical Mali and positive hardware-backed 16 KiB results remain unverified.
+
+## Measurements on the Pixel 11 Pro
+
+Firmware `CD1A.261005.003`, Android API 37, 4,096-byte host pages, Vulkan 1.4.317, vendor driver `0x696bd0`. The Android Hardware Buffer probe reported external-memory feature bits `0x6` and verified all 1,024 words after a two-device GPU copy. Both opaque-fd probes (ordinary and dedicated allocations) also passed. The DMA-BUF probe reported zero external-memory features for the tested buffer and stopped at the export capability check.
+
+On the debug APK, both Tier 1 guests discovered `Virtio-GPU Venus (PowerVR C-Series CXTP-48-1536 MC1)` as UID 1000. Each verified all 65,536 output words in four runs: default driver discovery, Venus selected with `appine-gpu`, a surviving client after its peer was killed with an unsignaled fence, and a fresh guest start. Both also passed the shared-mapping lifetime and shutdown cleanup checks.
+
+| Guest | Mesa | Default discovery | With `appine-gpu` |
+| --- | --- | ---: | ---: |
+| Alpine 3.24 | 26.1.6 | 258.0 ms | 84.3 ms |
+| Debian trixie | 25.0.7-2+deb13u1 | 424.0 ms | 226.1 ms |
+
+Each cell is one end-to-end measurement inside the compute program. The default invocation ran first, followed by the launcher invocation in the same guest.
 
 ## Reproduce
 
