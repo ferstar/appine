@@ -99,7 +99,7 @@ fn attr(reply: &mut Vec<u8>, id: u64, entry: &Entry) {
         u32_out(reply, (mtime % 1000) as u32 * 1_000_000);
     }
     let (mode, nlink) = if entry.dir {
-        (libc::S_IFDIR | 0o555, 2)
+        (libc::S_IFDIR | 0o555, 1)
     } else {
         (libc::S_IFREG | 0o444, 1)
     };

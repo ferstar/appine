@@ -54,7 +54,7 @@ impl Entry {
                 (false, true) => 0o666,
                 (false, false) => 0o444,
             },
-            nlink: if self.dir { 2 } else { 1 },
+            nlink: 1,
             uid: 0,
             gid: 0,
             rdev: 0,
