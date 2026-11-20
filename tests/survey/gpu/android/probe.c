@@ -5,7 +5,7 @@
 JNIEXPORT jstring JNICALL Java_io_github_mthli_appine_gpuprobe_Probe_roundTrip(JNIEnv *env, jclass cls,
                                                                                jint path) {
     (void)cls;
-    if (path < DMA_BUF || path > ANDROID_BLOB)
+    if (path < DMA_BUF || path > CPU_EXPORT_BLOB)
         return (*env)->NewStringUTF(env, "Unknown GPU probe path");
     char *report = NULL;
     size_t size = 0;

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: Venus service, Hardware Buffer mapping and fence retirement)
+> Maintained: 2026-11-20 (targeted verification of coherent CPU export, renderer import and allocation lifetime)
 
 ## Responsibilities
 
@@ -13,7 +13,7 @@
 entry points, error and panic handling, stderr to logcat, the guest browser client and the Venus renderer.
 
 Root: `hosts/android/src/lib.rs`, `hosts/android/open-url.c`,
-`hosts/android/src/gpu.rs`, the native sources and decoder patch in `hosts/android/gpu/`, and the Kotlin
+`hosts/android/src/gpu.rs`, the native sources, Android buffer patch and Venus teardown patch in `hosts/android/gpu/`, and the Kotlin
 files `Native.kt`, `GpuService.kt` and `MainApplication.kt`.
 
 The build, manifests, assets and release packaging are `android/build`; instrumentation is
@@ -58,8 +58,12 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 - At startup the nonexported `:venus` service probes the hardware under the app UID. On success
   `Native.start` supplies an Android renderer to the machine. Each DRM context uses a seqpacket
-  connection to a service thread. The application imports coherent Android Hardware Buffers on its
-  mapping device. A retirement thread holds submitted buffers through their fence and handles
+  connection to a service thread. The application normally imports coherent Android Hardware Buffers on its
+  mapping device. If that probe fails, a second two-device copy tests CPU export. On success the machine
+  process maps the original coherent allocation and sends its AHB to the service on a per-context allocation
+  socket. The decoder exposes the probed GPU with the CPU mapping flags at the GPU import index.
+  Pending exports are keyed by Venus memory ID until DRM blob creation takes the mapping, Vulkan frees it,
+  or the context disconnects. A retirement thread holds submitted buffers through their fence and handles
   memory release and Binder unbinding. Context teardown waits for the GPU in the service process.
 
 - `start` builds `MachineOptions` (tier, exception trace), starts a `Machine` and registers it;
@@ -164,8 +168,7 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 ## Open questions
 
-- Physical Mali and hardware-backed 16 KiB-page operation await device tests. The tested mapper
-  uses one physical device and its coherent buffer memory types.
+- Successful hardware-backed 16 KiB-page operation still awaits a device test. Both tested AHB paths use one physical device.
 
 - Should browse errors other than a missing file (`EEXIST`, `EACCES`, `ENOSPC`) surface as
   `FileNotFoundException`?

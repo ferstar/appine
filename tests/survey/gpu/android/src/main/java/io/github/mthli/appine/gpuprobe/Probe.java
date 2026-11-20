@@ -23,6 +23,7 @@ public final class Probe extends Instrumentation {
             case "opaque-fd": report = roundTrip(1); break;
             case "dedicated-control": report = roundTrip(2); break;
             case "android-blob": report = roundTrip(3); break;
+            case "cpu-export-blob": report = roundTrip(4); break;
             default: report = "Unknown path: " + path;
         }
         Bundle result = new Bundle();

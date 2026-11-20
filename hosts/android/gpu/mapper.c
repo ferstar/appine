@@ -10,9 +10,9 @@
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 #include "virgl_resource.h"
+#include "android_blob.h"
 
-// Only the mapping device touches imported memory in the machine process. The
-// decoder, queues, command pools and guest-selected shaders live in the worker.
+// The machine process maps coherent memory. The worker submits the guest's GPU commands.
 struct gpu_mapper {
     VkInstance instance;
     VkDevice device;
@@ -28,7 +28,7 @@ void appine_mapper_destroy(struct gpu_mapper *m) {
     free(m);
 }
 
-struct gpu_mapper *appine_mapper_create(void) {
+struct gpu_mapper *appine_mapper_create(const struct gpu_route *route) {
     struct gpu_mapper *m = calloc(1, sizeof(*m));
     if (!m)
         return NULL;
@@ -52,8 +52,11 @@ struct gpu_mapper *appine_mapper_create(void) {
             if (props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ||
                 props.properties.apiVersion < VK_API_VERSION_1_1)
                 continue;
+            if (route && memcmp(id.deviceUUID, route->uuid, sizeof(id.deviceUUID)))
+                continue;
             float priority = 1;
-            // Queue family zero exists on every physical device. This device submits no work.
+            // Queue family zero exists on every physical device. This device submits
+            // no work.
             VkDeviceQueueCreateInfo queue = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                              .queueCount = 1,
                                              .pQueuePriorities = &priority};
@@ -77,10 +80,20 @@ struct gpu_mapper *appine_mapper_create(void) {
         }
     }
     free(gpus);
-    if (m->device && m->coherent_types)
+    if (m->device && m->coherent_types &&
+        (!route || (route->cpu_type < 32 && (m->coherent_types & (1u << route->cpu_type)))))
         return m;
 fail:
     appine_mapper_destroy(m);
+    return NULL;
+}
+
+static void *map_allocated_memory(VkDevice device, VkDeviceMemory *memory, uint64_t size) {
+    void *base;
+    if (vkMapMemory(device, *memory, 0, size, 0, &base) == VK_SUCCESS)
+        return base;
+    vkFreeMemory(device, *memory, NULL);
+    *memory = VK_NULL_HANDLE;
     return NULL;
 }
 
@@ -109,31 +122,17 @@ void *appine_gpu_map(struct gpu_mapper *m, int fd, uint64_t blob, uint64_t size,
     AHardwareBuffer *buffer;
     if (AHardwareBuffer_recvHandleFromUnixSocket(fd, &buffer))
         return NULL;
-    void *base = NULL;
     AHardwareBuffer_Desc desc;
     AHardwareBuffer_describe(buffer, &desc);
-    VkAndroidHardwareBufferPropertiesANDROID props = {
-        .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
-    PFN_vkGetAndroidHardwareBufferPropertiesANDROID get =
-        (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(
-            m->device, "vkGetAndroidHardwareBufferPropertiesANDROID");
-    if (desc.format == AHARDWAREBUFFER_FORMAT_BLOB && desc.layers == 1 && desc.height == 1 &&
-        desc.width >= size && get && get(m->device, buffer, &props) == VK_SUCCESS &&
-        props.allocationSize >= size && (props.memoryTypeBits & (1u << index))) {
-        VkImportAndroidHardwareBufferInfoANDROID import = {
-            .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .buffer = buffer};
-        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                   .pNext = &import,
-                                   .allocationSize = props.allocationSize,
-                                   .memoryTypeIndex = index};
-        if (vkAllocateMemory(m->device, &ai, NULL, memory) == VK_SUCCESS &&
-            vkMapMemory(m->device, *memory, 0, size, 0, &base) != VK_SUCCESS) {
-            vkFreeMemory(m->device, *memory, NULL);
-            *memory = VK_NULL_HANDLE;
-        }
+    if (desc.format != AHARDWAREBUFFER_FORMAT_BLOB || desc.layers != 1 || desc.height != 1 ||
+        desc.width < size) {
+        AHardwareBuffer_release(buffer);
+        return NULL;
     }
-    AHardwareBuffer_release(buffer);
-    return base;
+    VkMemoryAllocateInfo alloc = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = size};
+    if (appine_import_blob(m->device, buffer, index, &alloc, memory) != VK_SUCCESS)
+        return NULL;
+    return map_allocated_memory(m->device, memory, size);
 }
 
 void appine_gpu_unmap(struct gpu_mapper *m, VkDeviceMemory memory, void *base, size_t size) {
@@ -143,4 +142,26 @@ void appine_gpu_unmap(struct gpu_mapper *m, VkDeviceMemory memory, void *base, s
     } else {
         munmap(base, size);
     }
+}
+
+void *appine_gpu_allocate_export(struct gpu_mapper *m, const struct gpu_route *route, uint64_t size,
+                                 VkDeviceMemory *memory) {
+    const uint64_t page = (uint64_t)getpagesize();
+    if (!size || size > UINT32_MAX || size % page || route->cpu_type >= 32 ||
+        memcmp(m->uuid, route->uuid, sizeof(m->uuid)) || !(m->coherent_types & (1u << route->cpu_type)))
+        return NULL;
+    VkExportMemoryAllocateInfo export = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+    VkMemoryAllocateInfo alloc = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                  .pNext = &export,
+                                  .allocationSize = size,
+                                  .memoryTypeIndex = route->cpu_type};
+    if (vkAllocateMemory(m->device, &alloc, NULL, memory) != VK_SUCCESS)
+        return NULL;
+    return map_allocated_memory(m->device, memory, size);
+}
+
+int appine_gpu_send_export(struct gpu_mapper *m, VkDeviceMemory memory, int fd) {
+    return appine_send_blob(fd, m->device, memory);
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: exercise per-command Venus selection alongside default discovery)
+> Maintained: 2026-11-20 (targeted verification of Venus allocator and retirement thread shutdown)
 
 ## Responsibilities
 
@@ -33,7 +33,7 @@ debug variant, manifest and network-security configuration belong to `android/bu
 - `GpuTest.distributionVenus` takes `gpuDistro=alpine|debian` and a survey rootfs in app cache.
   It imports a temporary store, installs the guest GPU launcher, checks default discovery of
   both Venus and llvmpipe, and verifies Venus-only compute through the launcher, mapping lifetime,
-  concurrent exit and restart, and checks for retained mappings and retirement threads.
+  concurrent exit and restart, and checks for retained mappings, allocation threads and retirement threads.
   `unsupportedDriver` uses the bundled rootfs with `gpuUnsupported=true` to check absent device paths.
 
 - `TabListTest` checks session identity across removal/rebinding, a bounded, scrollable 50-tab list

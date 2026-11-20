@@ -16,6 +16,7 @@ static int request(int fd, const struct gpu_request *req, const uint8_t *cmd, st
         if (TEMP_FAILURE_RETRY(send(fd, cmd + i, n, MSG_NOSIGNAL)) != (ssize_t)n)
             goto broken;
     }
+    memset(reply, 0, sizeof(*reply));
     struct iovec vec = {.iov_base = reply, .iov_len = sizeof(*reply)};
     union {
         struct cmsghdr alignment;
@@ -39,8 +40,9 @@ static int request(int fd, const struct gpu_request *req, const uint8_t *cmd, st
                 close(handle);
         }
     }
+    const bool local_blob = req->op == GPU_CREATE && req->blob && reply->type == VIRGL_RESOURCE_OPAQUE_HANDLE;
     if (n != sizeof(*reply) || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
-        count != (received && !reply->error)) {
+        count != (received && !reply->error && !local_blob)) {
         if (result >= 0)
             close(result);
         goto broken;
@@ -60,9 +62,22 @@ broken:
     return EIO;
 }
 
-int appine_gpu_open(int fd, int probe) {
+int appine_gpu_open(int fd, int probe, struct gpu_route *route) {
     struct gpu_reply reply;
-    return request(fd, &(struct gpu_request){.op = GPU_OPEN, .probe = probe != 0}, NULL, &reply, NULL);
+    int error = request(fd, &(struct gpu_request){.op = GPU_OPEN, .probe = probe != 0}, NULL, &reply, NULL);
+    if (error)
+        return -1;
+    *route = reply.route;
+    return reply.type;
+}
+
+int appine_gpu_reverse_allocator(int fd, const struct gpu_route *route) {
+    struct gpu_reply reply;
+    int socket = -1;
+    if (request(fd, &(struct gpu_request){.op = GPU_REVERSE_ALLOCATOR, .route = *route}, NULL, &reply,
+                &socket))
+        return -1;
+    return socket;
 }
 
 int appine_gpu_submit(int fd, uint32_t ring, const uint8_t *cmd, size_t len, int *fence) {

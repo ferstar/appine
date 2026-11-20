@@ -1,6 +1,6 @@
 # Mobile GPU support for Alpine and Debian guests
 
-On the Samsung Galaxy S23 (Adreno 740) and Google Pixel 11 Pro (PowerVR C-Series CXTP-48-1536 MC1), an unprivileged Alpine or Debian shell can run headless Vulkan buffer compute using the distribution's unmodified Mesa Venus driver. Appine provides the DRM render node and the Android renderer. The loader discovers the driver through the distribution's normal ICD manifest.
+On the Samsung Galaxy S23 (Adreno 740), Google Pixel 8 (Mali-G715) and Google Pixel 11 Pro (PowerVR C-Series CXTP-48-1536 MC1), an unprivileged Alpine or Debian shell can run headless Vulkan buffer compute using the distribution's unmodified Mesa Venus driver. Appine provides the DRM render node and the Android renderer. The loader discovers the driver through the distribution's normal ICD manifest.
 
 ## Run it
 
@@ -15,7 +15,7 @@ The tested workload uses ordinary storage buffers, a compute shader and a fence.
 1. At machine startup the private Android `:venus` service tests Vulkan export, reimport, GPU copy, fence completion and CPU readback. Appine registers `/dev/dri/renderD128` (226:128, mode 0666) and the platform device in sysfs when the probe and mapper initialization succeed. The CLI starts without a renderer. Both packaged libdrm versions inspect `/sys/dev/char/226:128/device/drm`, its sibling `subsystem` link and the device's `uevent`.
 2. Each open file description has a Venus context, a private handle table and its own command connection. Duplicated descriptors share them. The kernel implements the DRM version, parameter, capset, context, blob, map, resource-info, execbuffer and GEM-close requests. The two packaged ICDs emulate sync objects with output fences, poll and fd duplication. Appine returns the decoder's Venus capset and reports zero PRIME, cross-device and kernel syncobj support. [Mesa Venus documentation](https://docs.mesa3d.org/drivers/venus.html) · [Kernel ioctl implementation](../core/kernel/src/syscall/gpu.rs)
 3. A dedicated service thread decodes each connection using virglrenderer 1.3.0 and the system Vulkan loader. The service is nonexported and runs in a separate process under Appine's ordinary Android UID. On the S23, a service using an Android isolated UID received `EACCES` when the vendor Vulkan implementation opened its GPU device. [Android service](../android/app/src/main/java/io/github/mthli/appine/GpuService.kt) · [Renderer worker](../hosts/android/gpu/worker.c)
-4. Venus command and reply rings use shared memory. For host-visible ordinary buffer allocations, the patched decoder requests an exportable Android Hardware Buffer BLOB. The application receives its native handle over a Unix socket, checks its format, size, memory type and physical-device UUID, imports it on a second logical device, and maps coherent memory into the guest page table. The decoder hides host-visible memory types that this mapper cannot keep coherent. This path supports multiple buffers bound at different offsets in one allocation. [Decoder patch](../hosts/android/gpu/android-blob.patch) · [Mapper](../hosts/android/gpu/mapper.c) · [Vulkan device memory](https://docs.vulkan.org/spec/latest/chapters/memory.html)
+4. Venus command and reply rings use shared memory. For host-visible ordinary buffer allocations, the patched decoder requests an exportable Android Hardware Buffer BLOB. The application receives its native handle over a Unix socket, checks its format, size, memory type and physical-device UUID, imports it on a second logical device, and maps coherent memory into the guest page table. If that import cannot provide a coherent CPU mapping, Appine probes the opposite direction. On the Pixel 8 the machine process maps its original coherent allocation and exports it to the renderer, which imports it for GPU use. A per-context socket handles allocation requests from Venus rings. The guest sees the CPU mapping properties at the memory index used for GPU binding. The decoder hides host-visible memory types that the mapper cannot keep coherent. This path supports multiple buffers bound at different offsets in one allocation. [Decoder patch](../hosts/android/gpu/android-blob.patch) · [Mapper](../hosts/android/gpu/mapper.c) · [Vulkan device memory](https://docs.vulkan.org/spec/latest/chapters/memory.html)
 5. A guest VMA keeps its mapping through GEM close, descriptor close and fork. Execbuffer retains its referenced buffers until the ring fence retires. Fence waits and driver cleanup run outside the big kernel lock. Context shutdown stops the command rings and drains outstanding GPU work before destroying Vulkan objects. [Host lifetimes](../hosts/android/src/gpu.rs) · [Guest mappings](../core/kernel/src/mm.rs)
 
 ## Measurements on the Galaxy S23
@@ -37,7 +37,7 @@ Both distributions also passed packaged discovery and the compute check against 
 
 Separate guest `strace` runs on the S23 release APK verified all 65,536 words in both distributions. Each trace showed five blob creations, five map ioctls and five GEM closes. Alpine made 43 execbuffer calls, duplicated a fence fd with `F_DUPFD_CLOEXEC` and observed `POLLIN` on the duplicate through `ppoll`. Debian made 26 execbuffer calls and completed this run without a `ppoll` call. Neither run issued a DRM syncobj or PRIME ioctl. The timing table uses the untraced runs.
 
-On the API 37, 16,384-byte-page emulator, Goldfish GFXStream reported zero Android Hardware Buffer external-buffer features with both llvmpipe and host acceleration on an Apple M2 Pro. The negative test confirmed that the guest could start and both the render node and corresponding sysfs path were absent. Physical Mali and positive hardware-backed 16 KiB results remain unverified.
+On the API 37, 16,384-byte-page emulator, Goldfish GFXStream reported zero Android Hardware Buffer external-buffer features with both llvmpipe and host acceleration on an Apple M2 Pro. The negative test confirmed that the guest could start and both the render node and corresponding sysfs path were absent. A successful hardware-backed run with 16 KiB host pages remains unverified.
 
 ## Measurements on the Pixel 11 Pro
 
@@ -51,6 +51,14 @@ On the debug APK, both Tier 1 guests discovered `Virtio-GPU Venus (PowerVR C-Ser
 | Debian trixie | 25.0.7-2+deb13u1 | 424.0 ms | 226.1 ms |
 
 Each cell is one end-to-end measurement inside the compute program. The default invocation ran first, followed by the launcher invocation in the same guest.
+
+## Measurements on the Pixel 8
+
+Firmware `CP31.260623.005`, Android API 37, 4,096-byte host pages, Mali-G715, Vulkan 1.4.343, vendor driver `0xd803000`. The original Android Hardware Buffer probe reported import and export support (`0x6`), but the buffer exported from coherent type 0 could only be imported as noncoherent type 1 (mask `0x2`). The import size was 20,480 bytes for a 16,384-byte request. DMA-BUF reported import-only support (`0x4`), and both opaque-fd probes reported zero external-memory features for the tested buffer.
+
+With the CPU mapping on the exporting device (type 0) and GPU commands on the importing device (type 1), the native probe verified all 1,024 words without explicit cache maintenance. The runtime uses the same direction across the machine process and the private renderer service. The probe selects the physical device and memory types at startup.
+
+On the debug APK, Alpine 3.24 (Mesa 26.1.6) and Debian trixie (Mesa 25.0.7) both discovered `Virtio-GPU Venus (Mali-G715)` as UID 1000. Each verified 65,536 words with default discovery, with `appine-gpu`, after a concurrent client died with an unsignaled fence, and after a machine restart. Both passed the shared-mapping lifetime and shutdown checks. With the R8-shrunk release APK, both guests also passed the mapping lifetime test, discovered Venus and verified all 65,536 words with only the packaged Venus ICD selected.
 
 ## Reproduce
 
@@ -77,7 +85,7 @@ For the native driver probe, set `ANDROID_HOME` to the Android SDK directory. Ea
 ```sh
 android/gradlew -p tests/survey/gpu/android assembleDebug
 adb install -r --user 0 tests/survey/gpu/android/build/outputs/apk/debug/gpu-probe-debug.apk
-for path in dma-buf opaque-fd dedicated-control android-blob; do
+for path in dma-buf opaque-fd dedicated-control android-blob cpu-export-blob; do
     adb shell am instrument --user 0 -w -r -e path "$path" io.github.mthli.appine.gpuprobe/.Probe
 done
 ```

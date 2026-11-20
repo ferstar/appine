@@ -17,9 +17,11 @@ foreach(source IN LISTS venus_sources venus_headers)
     get_filename_component(name "${source}" NAME)
     configure_file("${source}" "${gen}/${name}" COPYONLY)
 endforeach()
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/android-blob.patch")
-execute_process(COMMAND patch -s -p1 -i "${CMAKE_CURRENT_SOURCE_DIR}/android-blob.patch"
-    WORKING_DIRECTORY "${gen}" COMMAND_ERROR_IS_FATAL ANY)
+foreach(patch_file IN ITEMS android-blob.patch venus-teardown.patch)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${patch_file}")
+    execute_process(COMMAND patch -s -p1 -i "${CMAKE_CURRENT_SOURCE_DIR}/${patch_file}"
+        WORKING_DIRECTORY "${gen}" COMMAND_ERROR_IS_FATAL ANY)
+endforeach()
 execute_process(COMMAND "${Python3_EXECUTABLE}" "${src}/venus/vkr_device_object.py" -o "${gen}"
     "${src}/venus/vkr_device_object.json" COMMAND_ERROR_IS_FATAL ANY)
 set(VIRGL_MAJOR_VERSION 1)

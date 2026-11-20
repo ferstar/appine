@@ -59,7 +59,7 @@ tar -czf "$out/appine-$rev-vendor.tar.gz" -C "$work" vendor
 rm -rf "$work/vendor"
 echo "$out/appine-$rev-vendor.tar.gz"
 
-# The Android build applies the decoder patch from the Appine source archive.
+# The Android build applies the decoder patches from the Appine source archive.
 venus=$("$root/scripts/fetch-virglrenderer" | sed -n 's/^fetch-virglrenderer: //p')
 cp "$venus.tar.gz" "$out/"
 echo "$out/$(basename "$venus").tar.gz"

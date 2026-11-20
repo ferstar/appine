@@ -48,9 +48,9 @@ static bool has_extension(VkExtensionProperties *props, uint32_t count, const ch
     return false;
 }
 
-static bool probe_device(FILE *out, VkPhysicalDevice gpu, enum path path) {
+static bool probe_device(FILE *out, VkPhysicalDevice gpu, enum path path, struct gpu_route *reverse) {
     const bool dedicated = path == DEDICATED_CONTROL;
-    const bool blob = path == ANDROID_BLOB;
+    const bool blob = path == ANDROID_BLOB || path == CPU_EXPORT_BLOB;
     const bool gpu_mapping = path != DMA_BUF;
     bool passed = false;
     const VkExternalMemoryHandleTypeFlagBits type =
@@ -171,17 +171,23 @@ static bool probe_device(FILE *out, VkPhysicalDevice gpu, enum path path) {
                                   .pNext = &export,
                                   .allocationSize = allocation,
                                   .memoryTypeIndex = index};
-    CHECK(vkAllocateMemory(device, &alloc, NULL, &memory));
-    CHECK(vkBindBufferMemory(device, buffer, memory, 0));
+    if (reverse)
+        CHECK(vkCreateDevice(gpu, &dci, NULL, &mapper));
+    VkDevice exporter = reverse ? mapper : device;
+    VkDeviceMemory *export_memory = reverse ? &imported : &memory;
+    CHECK(vkAllocateMemory(exporter, &alloc, NULL, export_memory));
+    if (!reverse)
+        CHECK(vkBindBufferMemory(device, buffer, memory, 0));
     if (blob) {
-        CHECK(vkBindBufferMemory(device, second, memory, allocation / 2));
+        if (!reverse)
+            CHECK(vkBindBufferMemory(device, second, memory, allocation / 2));
         PFN_vkGetMemoryAndroidHardwareBufferANDROID get_ahb =
             (PFN_vkGetMemoryAndroidHardwareBufferANDROID)vkGetDeviceProcAddr(
-                device, "vkGetMemoryAndroidHardwareBufferANDROID");
+                exporter, "vkGetMemoryAndroidHardwareBufferANDROID");
         REQUIRE(get_ahb, "vkGetMemoryAndroidHardwareBufferANDROID entry point");
         VkMemoryGetAndroidHardwareBufferInfoANDROID info = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .memory = memory};
-        CHECK(get_ahb(device, &info, &ahb));
+            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .memory = *export_memory};
+        CHECK(get_ahb(exporter, &info, &ahb));
     } else {
         PFN_vkGetMemoryFdKHR get_fd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR");
         REQUIRE(get_fd, "vkGetMemoryFdKHR entry point");
@@ -190,7 +196,9 @@ static bool probe_device(FILE *out, VkPhysicalDevice gpu, enum path path) {
         CHECK(get_fd(device, &fdinfo, &fd));
     }
     if (gpu_mapping) {
-        CHECK(vkCreateDevice(gpu, &dci, NULL, &mapper));
+        if (!reverse)
+            CHECK(vkCreateDevice(gpu, &dci, NULL, &mapper));
+        VkDevice importer = reverse ? device : mapper;
         VkImportMemoryFdInfoKHR import = {
             .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .handleType = type, .fd = fd};
         VkImportAndroidHardwareBufferInfoANDROID import_ahb = {
@@ -198,12 +206,26 @@ static bool probe_device(FILE *out, VkPhysicalDevice gpu, enum path path) {
         if (blob) {
             PFN_vkGetAndroidHardwareBufferPropertiesANDROID get_props =
                 (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(
-                    mapper, "vkGetAndroidHardwareBufferPropertiesANDROID");
+                    importer, "vkGetAndroidHardwareBufferPropertiesANDROID");
             REQUIRE(get_props, "vkGetAndroidHardwareBufferPropertiesANDROID entry point");
             VkAndroidHardwareBufferPropertiesANDROID props = {
                 .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
-            CHECK(get_props(mapper, ahb, &props));
-            REQUIRE(props.allocationSize >= allocation && (props.memoryTypeBits & (1u << index)),
+            CHECK(get_props(importer, ahb, &props));
+            if (reverse) {
+                uint32_t types = req.memoryTypeBits & props.memoryTypeBits;
+                REQUIRE(types, "GPU import memory type");
+                alloc.memoryTypeIndex = (uint32_t)__builtin_ctz(types);
+                VkPhysicalDeviceIDProperties id = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+                VkPhysicalDeviceProperties2 properties = {
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &id};
+                vkGetPhysicalDeviceProperties2(gpu, &properties);
+                memcpy(reverse->uuid, id.deviceUUID, sizeof(reverse->uuid));
+                reverse->cpu_type = index;
+                reverse->gpu_type = alloc.memoryTypeIndex;
+                fprintf(out, "CPU export type=%u, GPU import type=%u\n", index, alloc.memoryTypeIndex);
+            }
+            REQUIRE(props.allocationSize >= allocation &&
+                        (props.memoryTypeBits & (1u << alloc.memoryTypeIndex)),
                     "AHB import memory properties");
             alloc.allocationSize = props.allocationSize;
         }
@@ -213,8 +235,12 @@ static bool probe_device(FILE *out, VkPhysicalDevice gpu, enum path path) {
             import.pNext = &dedicate;
         }
         alloc.pNext = blob ? (void *)&import_ahb : (void *)&import;
-        CHECK(vkAllocateMemory(mapper, &alloc, NULL, &imported));
+        CHECK(vkAllocateMemory(importer, &alloc, NULL, reverse ? &memory : &imported));
         fd = -1;
+        if (reverse) {
+            CHECK(vkBindBufferMemory(device, buffer, memory, 0));
+            CHECK(vkBindBufferMemory(device, second, memory, allocation / 2));
+        }
         if (dedicated)
             CHECK(vkBindBufferMemory(mapper, import_buffer, imported, 0));
         CHECK(vkMapMemory(mapper, imported, 0, allocation, 0, &mapping));
@@ -313,10 +339,10 @@ done:
     return passed;
 }
 
-bool appine_gpu_probe(FILE *out, enum path path) {
+static bool probe(FILE *out, enum path path, struct gpu_route *reverse) {
     bool passed = false;
     fprintf(out, "uid=%u page=%d path=%s\n", getuid(), getpagesize(),
-            (const char *[]){"dma-buf", "opaque-fd", "dedicated-control", "android-blob"}[path]);
+            (const char *[]){"dma-buf", "opaque-fd", "dedicated-control", "android-blob", "cpu-export-blob"}[path]);
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_1};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
     VkInstance instance = VK_NULL_HANDLE;
@@ -329,7 +355,7 @@ bool appine_gpu_probe(FILE *out, enum path path) {
     REQUIRE(devices, "physical device list allocation");
     CHECK(vkEnumeratePhysicalDevices(instance, &n, devices));
     for (uint32_t i = 0; i < n; i++) {
-        if (probe_device(out, devices[i], path)) {
+        if (probe_device(out, devices[i], path, reverse)) {
             passed = true;
             fputs("PASS\n", out);
             break;
@@ -341,3 +367,10 @@ done:
         vkDestroyInstance(instance, NULL);
     return passed;
 }
+
+bool appine_gpu_probe(FILE *out, enum path path) {
+    struct gpu_route route;
+    return probe(out, path, path == CPU_EXPORT_BLOB ? &route : NULL);
+}
+
+bool appine_gpu_probe_reverse(FILE *out, struct gpu_route *route) { return probe(out, CPU_EXPORT_BLOB, route); }

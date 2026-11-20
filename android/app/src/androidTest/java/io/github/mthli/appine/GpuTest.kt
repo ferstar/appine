@@ -45,12 +45,12 @@ class GpuTest {
         do {
             val memory = File("/proc/self/maps").useLines { lines -> lines.count { "vkr-shmem" in it } }
             val workers = File("/proc/self/task").listFiles().orEmpty().count {
-                runCatching { File(it, "comm").readText().trim() }.getOrNull() == "venus-retire"
+                runCatching { File(it, "comm").readText().trim() }.getOrNull() in setOf("venus-retire", "venus-allocate")
             }
             if (memory == 0 && workers == 0) return
             SystemClock.sleep(25)
         } while (SystemClock.uptimeMillis() < deadline)
-        throw AssertionError("Renderer mappings or retirement threads survived machine shutdown")
+        throw AssertionError("Renderer mappings or workers survived machine shutdown")
     }
 
     @Test(timeout = 60000)

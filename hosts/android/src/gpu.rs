@@ -1,4 +1,5 @@
 //! Android Hardware Buffer mapping and private Venus worker connections.
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr::{self, NonNull};
@@ -9,10 +10,26 @@ use appine_kernel::gpu::{Context, Mapping, Renderer};
 use jni::objects::{GlobalRef, JClass, JValue};
 use jni::{JNIEnv, JavaVM};
 
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct GpuRoute {
+    uuid: [u8; 16],
+    cpu_type: u32,
+    gpu_type: u32,
+}
+
 unsafe extern "C" {
     fn appine_gpu_capset(caps: *mut u8) -> usize;
     fn appine_venus_worker(fd: i32);
-    fn appine_gpu_open(fd: i32, probe: i32) -> i32;
+    fn appine_gpu_open(fd: i32, probe: i32, route: *mut GpuRoute) -> i32;
+    fn appine_gpu_reverse_allocator(fd: i32, route: *const GpuRoute) -> i32;
+    fn appine_gpu_allocate_export(
+        mapper: *mut c_void,
+        route: *const GpuRoute,
+        size: u64,
+        memory: *mut u64,
+    ) -> *mut u8;
+    fn appine_gpu_send_export(mapper: *mut c_void, memory: u64, fd: i32) -> i32;
     fn appine_gpu_submit(fd: i32, ring: u32, cmd: *const u8, len: usize, fence: *mut i32) -> i32;
     fn appine_gpu_create(
         fd: i32,
@@ -26,7 +43,7 @@ unsafe extern "C" {
         handle: *mut i32,
     ) -> i32;
     fn appine_gpu_release(fd: i32, resource: u32);
-    fn appine_mapper_create() -> *mut c_void;
+    fn appine_mapper_create(route: *const GpuRoute) -> *mut c_void;
     fn appine_mapper_destroy(mapper: *mut c_void);
     fn appine_gpu_map(
         mapper: *mut c_void,
@@ -63,6 +80,7 @@ struct Channel {
     fd: OwnedFd,
     service: Arc<Service>,
     connection: GlobalRef,
+    reverse: Option<GpuRoute>,
 }
 
 impl Service {
@@ -118,13 +136,17 @@ impl Service {
         if connection.as_obj().is_null() {
             return Err(Errno::ENODEV);
         }
-        let channel = Channel {
+        let mut channel = Channel {
             fd,
             connection,
             service: self.clone(),
+            reverse: None,
         };
-        if unsafe { appine_gpu_open(channel.fd.as_raw_fd(), i32::from(probe)) } != 0 {
-            return Err(Errno::ENODEV);
+        let mut route = GpuRoute::default();
+        match unsafe { appine_gpu_open(channel.fd.as_raw_fd(), i32::from(probe), &mut route) } {
+            0 => (),
+            1 if probe => channel.reverse = Some(route),
+            _ => return Err(Errno::ENODEV),
         }
         Ok(channel)
     }
@@ -162,6 +184,7 @@ struct AndroidRenderer {
     service: Arc<Service>,
     mapper: Arc<Mapper>,
     caps: Vec<u8>,
+    reverse: Option<GpuRoute>,
 }
 
 pub(super) fn renderer(env: &mut JNIEnv) -> Option<Arc<dyn Renderer>> {
@@ -172,8 +195,10 @@ pub(super) fn renderer(env: &mut JNIEnv) -> Option<Arc<dyn Renderer>> {
     });
     // The probe runs in the private renderer process. The socket deadline also
     // bounds a driver stall during probe cleanup.
-    let _probe = service.connect(true).ok()?;
-    let mapper = Arc::new(Mapper(NonNull::new(unsafe { appine_mapper_create() })?));
+    let reverse = service.connect(true).ok()?.reverse;
+    let mapper = Arc::new(Mapper(NonNull::new(unsafe {
+        appine_mapper_create(reverse.as_ref().map_or(ptr::null(), ptr::from_ref))
+    })?));
     let mut caps = vec![0; unsafe { appine_gpu_capset(ptr::null_mut()) }];
     unsafe {
         appine_gpu_capset(caps.as_mut_ptr());
@@ -182,6 +207,7 @@ pub(super) fn renderer(env: &mut JNIEnv) -> Option<Arc<dyn Renderer>> {
         service,
         mapper,
         caps,
+        reverse,
     }))
 }
 
@@ -193,6 +219,10 @@ impl Renderer for AndroidRenderer {
         let channel = self.service.connect(false)?;
         let fd = channel.fd.try_clone().map_err(|_| Errno::EMFILE)?;
         let lock = Arc::new(Mutex::new(()));
+        let exports = self
+            .reverse
+            .map(|route| CpuExports::start(&channel, self.mapper.clone(), route))
+            .transpose()?;
         let worker_lock = lock.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -203,12 +233,109 @@ impl Renderer for AndroidRenderer {
             fd,
             lock,
             mapper: self.mapper.clone(),
+            exports,
             tx,
         }))
     }
 }
 
+// Allocations exist before Venus creates the DRM blob. Transfer the CPU mapping
+// to the VMA on create, or free it on vkFreeMemory / context disconnect.
+struct CpuExports {
+    pending: Arc<Mutex<HashMap<u64, Arc<Backing>>>>,
+    socket: OwnedFd,
+}
+
+impl CpuExports {
+    fn start(channel: &Channel, mapper: Arc<Mapper>, route: GpuRoute) -> Result<Self, Errno> {
+        let socket = unsafe { appine_gpu_reverse_allocator(channel.fd.as_raw_fd(), &route) };
+        if socket < 0 {
+            return Err(Errno::EIO);
+        }
+        let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+        let worker = socket.try_clone().map_err(|_| Errno::EMFILE)?;
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let table = pending.clone();
+        std::thread::Builder::new()
+            .name("venus-allocate".into())
+            .spawn(move || Self::serve(worker, mapper, route, table))
+            .map_err(|_| Errno::EAGAIN)?;
+        Ok(Self { pending, socket })
+    }
+
+    fn serve(
+        socket: OwnedFd,
+        mapper: Arc<Mapper>,
+        route: GpuRoute,
+        pending: Arc<Mutex<HashMap<u64, Arc<Backing>>>>,
+    ) {
+        let fd = socket.as_raw_fd();
+        let mut request = [0u64; 2];
+        loop {
+            let count = unsafe {
+                libc::recv(
+                    fd,
+                    request.as_mut_ptr().cast(),
+                    size_of_val(&request),
+                    libc::MSG_TRUNC,
+                )
+            };
+            if count < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            if count != size_of_val(&request) as isize {
+                break;
+            }
+            let [id, size] = request;
+            if size == 0 {
+                pending.lock().unwrap().remove(&id);
+                continue;
+            }
+            let mut memory = 0;
+            let base =
+                unsafe { appine_gpu_allocate_export(mapper.0.as_ptr(), &route, size, &mut memory) };
+            let backing = NonNull::new(base).map(|base| {
+                Arc::new(Backing {
+                    base,
+                    memory,
+                    size: size as usize,
+                    mapper: mapper.clone(),
+                })
+            });
+            if let Some(backing) = &backing {
+                let mut entries = pending.lock().unwrap();
+                if entries.insert(id, backing.clone()).is_some() {
+                    break;
+                }
+            }
+            // Retain our own mapping until the driver finishes exporting it.
+            let ready = u8::from(backing.is_some());
+            if unsafe { libc::send(fd, (&raw const ready).cast(), 1, libc::MSG_NOSIGNAL) } != 1
+                || backing.is_some()
+                    && unsafe { appine_gpu_send_export(mapper.0.as_ptr(), memory, fd) } != 0
+            {
+                break;
+            }
+        }
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_RDWR);
+        }
+        pending.lock().unwrap().clear();
+    }
+}
+
+impl Drop for CpuExports {
+    fn drop(&mut self) {
+        unsafe {
+            libc::shutdown(self.socket.as_raw_fd(), libc::SHUT_RDWR);
+        }
+    }
+}
+
 struct AndroidContext {
+    exports: Option<CpuExports>,
     fd: OwnedFd,
     lock: Arc<Mutex<()>>,
     mapper: Arc<Mapper>,
@@ -227,7 +354,7 @@ impl Drop for AndroidContext {
 
 enum Deferred {
     Fence(OwnedFd, Vec<Arc<dyn Mapping>>),
-    Release(Backing),
+    Release(u32, Arc<Backing>),
     Disconnect,
 }
 fn retire(channel: Channel, lock: &Mutex<()>, rx: mpsc::Receiver<Deferred>) {
@@ -246,12 +373,12 @@ fn retire(channel: Channel, lock: &Mutex<()>, rx: mpsc::Receiver<Deferred>) {
                 }
                 drop(buffers);
             }
-            Deferred::Release(backing) => {
+            Deferred::Release(id, backing) => {
                 if let Some(channel) = &channel
                     && let Ok(_guard) = lock.lock()
                 {
                     unsafe {
-                        appine_gpu_release(channel.fd.as_raw_fd(), backing.id);
+                        appine_gpu_release(channel.fd.as_raw_fd(), id);
                     }
                 }
                 drop(backing);
@@ -264,7 +391,6 @@ fn retire(channel: Channel, lock: &Mutex<()>, rx: mpsc::Receiver<Deferred>) {
 }
 
 struct Backing {
-    id: u32,
     mapper: Arc<Mapper>,
     memory: u64,
     base: NonNull<u8>,
@@ -286,7 +412,9 @@ impl Drop for Backing {
     }
 }
 struct AndroidMapping {
-    backing: Option<Backing>,
+    resource: u32,
+    size: usize,
+    backing: Option<Arc<Backing>>,
     tx: mpsc::Sender<Deferred>,
 }
 unsafe impl Mapping for AndroidMapping {
@@ -294,13 +422,13 @@ unsafe impl Mapping for AndroidMapping {
         self.backing.as_ref().unwrap().base
     }
     fn size(&self) -> usize {
-        self.backing.as_ref().unwrap().size
+        self.size
     }
 }
 impl Drop for AndroidMapping {
     fn drop(&mut self) {
         if let Some(backing) = self.backing.take() {
-            let _ = self.tx.send(Deferred::Release(backing));
+            let _ = self.tx.send(Deferred::Release(self.resource, backing));
         }
     }
 }
@@ -327,39 +455,45 @@ impl Context for AndroidContext {
         if result != 0 {
             return Err(Errno(result));
         }
-        let handle = unsafe { OwnedFd::from_raw_fd(handle) };
-        let mut memory = 0;
-        let base = unsafe {
-            appine_gpu_map(
-                self.mapper.0.as_ptr(),
-                handle.as_raw_fd(),
-                blob,
-                size,
-                kind,
-                uuid.as_ptr(),
-                index,
-                allocation,
-                &mut memory,
-            )
-        };
-        if let Some(base) = NonNull::new(base)
-            && (base.as_ptr() as usize).is_multiple_of(4096)
-        {
-            return Ok(Arc::new(AndroidMapping {
-                tx: self.tx.clone(),
-                backing: Some(Backing {
-                    id: resource,
+        let backing = if handle < 0 {
+            self.exports
+                .as_ref()
+                .and_then(|exports| exports.pending.lock().ok()?.remove(&blob))
+        } else {
+            let handle = unsafe { OwnedFd::from_raw_fd(handle) };
+            let mut memory = 0;
+            let base = unsafe {
+                appine_gpu_map(
+                    self.mapper.0.as_ptr(),
+                    handle.as_raw_fd(),
+                    blob,
+                    size,
+                    kind,
+                    uuid.as_ptr(),
+                    index,
+                    allocation,
+                    &mut memory,
+                )
+            };
+            NonNull::new(base).map(|base| {
+                Arc::new(Backing {
                     mapper: self.mapper.clone(),
                     memory,
                     base,
                     size: size as usize,
-                }),
+                })
+            })
+        };
+        if let Some(backing) = backing
+            && size <= backing.size as u64
+            && (backing.base.as_ptr() as usize).is_multiple_of(4096)
+        {
+            return Ok(Arc::new(AndroidMapping {
+                resource,
+                size: size as usize,
+                backing: Some(backing),
+                tx: self.tx.clone(),
             }));
-        }
-        if !base.is_null() {
-            unsafe {
-                appine_gpu_unmap(self.mapper.0.as_ptr(), memory, base, size as usize);
-            }
         }
         unsafe {
             appine_gpu_release(fd, resource);
