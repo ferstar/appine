@@ -73,12 +73,15 @@ All times are medians in milliseconds, with the end-to-end range in parentheses.
 
 ## llama.cpp on Alpine 3.24
 
-Both phones ran Qwen2.5-Instruct Q4_0 with full Vulkan offload (25/25 layers at 0.5B and 29/29 at 1.5B). The same two prompts checked whether each GPU produced usable text.
+All three phones loaded Qwen2.5-Instruct Q4_0 with full Vulkan offload (25/25 layers at 0.5B and 29/29 at 1.5B). The same two prompts checked whether each GPU produced usable text with the default inference settings.
 
 | Device | 0.5B · English-to-Chinese translation | 1.5B · Seven plus eight |
 | --- | --- | --- |
 | Pixel 11 Pro · PowerVR | Unrelated text and repeated question marks | Unrelated text |
 | Pixel 8 · Mali-G715 | “一个GPU可以同时处理许多任务。” | Answered 15 correctly |
+| Galaxy S23 · Adreno 740 | Shader link failed during warm-up | Shader link failed during warm-up |
+
+On the Galaxy S23, the CPU translated the sentence as “GPU可以并行处理许多任务。” and answered “十五” (15). With Vulkan, the Adreno driver logged `Failed to link shaders` and Venus then reported a command-stream error at `vkCmdBindPipeline`. Neither prompt produced a token. Disabling Flash Attention alone reproduced the failure on both models. The 0.5B translation also failed with `-fa off --no-warmup` at microbatch sizes 16 and 1. At size 1 the renderer process exited on SIGSEGV after the shader link error.
 
 The Pixel 11 Pro CPU answered both prompts correctly. Selecting `--device Vulkan0 -ngl 99` explicitly reproduced the translation failure. With `GGML_VK_DISABLE_COOPMAT=1`, the translation timed out after 120 seconds.
 
@@ -99,20 +102,24 @@ A separate native driver check held a compute submission behind a timeline semap
 
 ### Throughput
 
-Both phones used the debug APK, a Tier 1 Alpine 3.24.3 guest and UID 1000. Each cell shows the two pass means in tokens per second. `llama-bench -t 4 -p 128 -n 32 -r 3` ran 0.5B CPU, 1.5B Vulkan, 1.5B CPU and 0.5B Vulkan, then repeated the sequence in reverse. CPU used `-dev none -ngl 0` and Vulkan used `-dev Vulkan0 -ngl 99`. The PowerVR Vulkan timings include the configuration that failed both text checks.
+All three phones used a debug APK, a Tier 1 Alpine 3.24.3 guest and UID 1000. Each numeric cell shows the two pass means in tokens per second. `llama-bench -t 4 -p 128 -n 32 -r 3` ran 0.5B CPU, 1.5B Vulkan, 1.5B CPU and 0.5B Vulkan, then repeated the sequence in reverse. CPU used `-dev none -ngl 0` and Vulkan used `-dev Vulkan0 -ngl 99`. The PowerVR Vulkan timings include the configuration that failed both text checks.
 
 | Device | Model | Prompt, CPU | Prompt, Vulkan | Generation, CPU | Generation, Vulkan |
 | --- | --- | ---: | ---: | ---: | ---: |
 | Pixel 11 Pro | 0.5B | 341.32 / 441.35 | 180.92 / 179.38 | 70.73 / 94.60 | 6.97 / 6.64 |
 | Pixel 8 | 0.5B | 320.55 / 298.86 | 44.63 / 44.68 | 68.28 / 63.63 | 27.14 / 26.30 |
+| Galaxy S23 | 0.5B | 195.33 / 156.39 | Failed | 55.84 / 48.73 | Failed |
 | Pixel 11 Pro | 1.5B | 75.75 / 67.87 | 71.93 / 72.58 | 27.23 / 20.65 | 3.64 / 3.63 |
 | Pixel 8 | 1.5B | 100.69 / 90.57 | 12.63 / 12.57 | 22.54 / 20.30 | 11.94 / 11.94 |
+| Galaxy S23 | 1.5B | 67.81 / 59.98 | Failed | 18.19 / 18.60 | Failed |
+
+The S23 used a separate application ID and restarted the guest for each benchmark invocation. Both Vulkan passes for each model were stopped after the same pipeline error, before `llama-bench` reported a rate. During the two passes, the battery temperature ranged from 36.9 to 38.3 °C and all 11 thermal-status samples were 0.
 
 At 1.5B, Vulkan prompt throughput was within 1% of CPU on the Pixel 11 Pro. On the Pixel 8, the CPU processed prompts 7.59× as fast as Vulkan. For generation, the CPU lead narrowed from 12.15× at 0.5B to 6.59× at 1.5B on the Pixel 11 Pro and from 2.47× to 1.79× on the Pixel 8. Both phones reported thermal status 0 throughout sampling. Battery temperatures were 27.5–30.2 °C on the Pixel 11 Pro and 32.9–34.5 °C on the Pixel 8.
 
 ### Packages and model files
 
-Both guests used Alpine's `llama.cpp` and `llama.cpp-vulkan` 0.0.9564-r0 with `mesa-vulkan-virtio` 26.1.6-r0. To run the translation check with the GGUF in the current directory:
+All three guests used Alpine's `llama.cpp` and `llama.cpp-vulkan` 0.0.9564-r0 with `mesa-vulkan-virtio` 26.1.6-r0. To run the translation check with the GGUF in the current directory:
 
 ```sh
 doas apk add llama.cpp llama.cpp-vulkan mesa-vulkan-virtio
