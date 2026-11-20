@@ -386,6 +386,23 @@ struct appine_dbt_source {
  * mappings the translations come from, at most APPINE_DBT_SOURCES ranges */
 #define APPINE_DBT_SOURCES 64
 void appine_dbt_set_sources(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
+
+enum appine_memop_kind {
+    APPINE_MEMOP_NONE = 0,
+    APPINE_MEMOP_MEMCPY = 1,
+    APPINE_MEMOP_MEMSET = 2,
+    APPINE_MEMOP_MEMMOVE = 3,
+    APPINE_MEMOP_MEMCMP = 4,
+    APPINE_MEMOP_STRLEN = 5,
+};
+
+#define APPINE_DBT_MEMOPS 16
+struct appine_dbt_memop {
+    uint64_t pc;
+    uint32_t kind;
+    uint32_t reserved;
+};
+void appine_dbt_set_memops(struct appine_dbt *dbt, const struct appine_dbt_memop *ops, size_t n);
 /*
  * Before an instance taken from the pool first runs in a new address space: blocks in mappings of
  * the new address space that are exactly the same as the recorded ones need not be checked block

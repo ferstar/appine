@@ -200,6 +200,7 @@ unsafe extern "C" {
     fn appine_dbt_written_bytes() -> u64;
     fn appine_dbt_free(dbt: *mut RawDbt, key: u64);
     fn appine_dbt_set_sources(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
+    fn appine_dbt_set_memops(dbt: *mut RawDbt, ops: *const DbtMemop, n: usize);
     fn appine_dbt_trust(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
     fn appine_dbt_retire_outside(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
     fn appine_dbt_share(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
@@ -686,6 +687,20 @@ pub enum DbtRegs {
     Go,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DbtMemop {
+    pub pc: u64,
+    pub kind: u32,
+    pub reserved: u32,
+}
+
+pub const MEMOP_MEMCPY: u32 = 1;
+pub const MEMOP_MEMSET: u32 = 2;
+pub const MEMOP_MEMMOVE: u32 = 3;
+pub const MEMOP_MEMCMP: u32 = 4;
+pub const MEMOP_STRLEN: u32 = 5;
+
 /// A mapping that translations come from ([`DbtSpace::set_sources`]): a guest address range, and
 /// an identity (the file and its version) from which identical content can be concluded.
 #[repr(C)]
@@ -759,6 +774,10 @@ impl DbtSpace {
     /// guarantees that mappings with the same identity have the same content.
     pub fn set_sources(&self, sources: &[DbtSource]) {
         unsafe { appine_dbt_set_sources(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
+    }
+
+    pub fn set_memops(&self, ops: &[DbtMemop]) {
+        unsafe { appine_dbt_set_memops(self.raw.as_ptr(), ops.as_ptr(), ops.len()) }
     }
 }
 
