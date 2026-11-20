@@ -50,6 +50,6 @@ add_library(appine_venus STATIC ${venus_sources} ${mesa_sources} "${src}/virgl_u
 target_include_directories(appine_venus PUBLIC "${gen}" "${src}" "${src}/venus"
     "${src}/gallium/include" "${src}/gallium/auxiliary" "${src}/mesa" "${src}/mesa/compat"
     "${src}/mesa/pipe" "${src}/mesa/util" "${src}/drm/drm-uapi" "${CMAKE_CURRENT_SOURCE_DIR}" "${VIRGL_ROOT}/server")
-target_compile_options(appine_venus PRIVATE -include "${gen}/config.h" -fvisibility=hidden)
+target_compile_options(appine_venus PRIVATE -Oz -flto=full -include "${gen}/config.h" -fvisibility=hidden)
 target_compile_definitions(appine_venus PRIVATE _GNU_SOURCE NDEBUG)
 target_link_libraries(appine_venus PUBLIC android vulkan log dl m)
