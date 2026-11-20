@@ -514,6 +514,7 @@ pub struct Mm {
     /// Which register set Tier 1 uses when translating this program, chosen per program at
     /// execve (Go gets a different one).
     pub dbt_regs: appine_engine::DbtRegs,
+    pub memops: Vec<appine_engine::DbtMemop>,
     /// Load address of the vDSO (signal handlers return to the sigreturn trampoline in it by
     /// default).
     pub vdso: u64,
@@ -588,6 +589,7 @@ impl Mm {
             lock_onfault: false,
             exe: None,
             dbt_regs: appine_engine::DbtRegs::Default,
+            memops: Vec::new(),
             vdso: 0,
             vdso_svc: false,
             code: (0, 0),
@@ -802,6 +804,9 @@ impl Mm {
                     let space = appine_engine::DbtSpace::new(self.exe.unwrap_or(0), self.dbt_regs)?;
                     // With translations a previous user left in the pool, blocks in program files
                     // of the same version need no further check
+                    if !self.memops.is_empty() {
+                        space.set_memops(&self.memops);
+                    }
                     space.trust(&self.code_sources());
                     self.found_group(groups, &space);
                     space
@@ -1773,6 +1778,17 @@ impl Mm {
         v.fill = fill;
         if backing == Backing::Shared && may_write {
             self.note_shared_maps(false);
+        }
+        if (prot & prot::EXEC) != 0
+            && let Some((fd, offset, _)) = file
+        {
+            let before = self.memops.len();
+            crate::loader::scan_fd_memops(fd, offset, start, len, &mut self.memops);
+            if self.memops.len() != before
+                && let Some(cs) = &self.code_space
+            {
+                cs.space.set_memops(&self.memops);
+            }
         }
         Ok(start)
     }
@@ -3149,6 +3165,7 @@ impl Mm {
         child.auxv = self.auxv.clone();
         child.exe = self.exe;
         child.dbt_regs = self.dbt_regs;
+        child.memops = self.memops.clone();
         child.mmap_top = self.mmap_top;
         child.fills = self.fills;
         child.start_stack = self.start_stack;
