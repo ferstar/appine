@@ -71,9 +71,33 @@ Five runs of `GpuTest#distributionVenus` per distribution used the debug APK and
 
 All times are medians in milliseconds, with the end-to-end range in parentheses. The compute program times Vulkan instance creation through CPU verification, including device and pipeline setup. With `appine-gpu`, the median fence wait was about 2.6 ms in both guests. Invalidating the mapped buffer and checking its 256 KiB on the guest CPU took 35.8 ms on Alpine and 41.1 ms on Debian.
 
-### llama.cpp on Alpine 3.24
+## llama.cpp on Alpine 3.24
 
-On the same Pixel 8, a Tier 1 Alpine 3.24.3 guest ran the distribution's `llama.cpp` and `llama.cpp-vulkan` packages (both `0.0.9564-r0`) with `mesa-vulkan-virtio` 26.1.6-r0 in the debug APK. The test installed signed APKs from a local cache and ran inference as UID 1000. To try the same packages from the Alpine repositories, with the GGUF in the current directory:
+Both phones ran Qwen2.5-Instruct Q4_0 with full Vulkan offload (25/25 layers at 0.5B and 29/29 at 1.5B). The same two prompts checked whether each GPU produced usable text.
+
+| Device | 0.5B · English-to-Chinese translation | 1.5B · Seven plus eight |
+| --- | --- | --- |
+| Pixel 11 Pro · PowerVR | Unrelated text and repeated question marks | Unrelated text |
+| Pixel 8 · Mali-G715 | “一个GPU可以同时处理许多任务。” | Answered 15 correctly |
+
+The Pixel 11 Pro CPU answered both prompts correctly. Selecting `--device Vulkan0 -ngl 99` explicitly reproduced the translation failure. With `GGML_VK_DISABLE_COOPMAT=1`, the translation timed out after 120 seconds. The cause remains open.
+
+### Throughput
+
+Both phones used the debug APK, a Tier 1 Alpine 3.24.3 guest and UID 1000. Each cell shows the two pass means in tokens per second. `llama-bench -t 4 -p 128 -n 32 -r 3` ran 0.5B CPU, 1.5B Vulkan, 1.5B CPU and 0.5B Vulkan, then repeated the sequence in reverse. CPU used `-dev none -ngl 0` and Vulkan used `-dev Vulkan0 -ngl 99`. The PowerVR Vulkan timings include the configuration that failed both text checks.
+
+| Device | Model | Prompt, CPU | Prompt, Vulkan | Generation, CPU | Generation, Vulkan |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Pixel 11 Pro | 0.5B | 341.32 / 441.35 | 180.92 / 179.38 | 70.73 / 94.60 | 6.97 / 6.64 |
+| Pixel 8 | 0.5B | 320.55 / 298.86 | 44.63 / 44.68 | 68.28 / 63.63 | 27.14 / 26.30 |
+| Pixel 11 Pro | 1.5B | 75.75 / 67.87 | 71.93 / 72.58 | 27.23 / 20.65 | 3.64 / 3.63 |
+| Pixel 8 | 1.5B | 100.69 / 90.57 | 12.63 / 12.57 | 22.54 / 20.30 | 11.94 / 11.94 |
+
+At 1.5B, Vulkan prompt throughput was within 1% of CPU on the Pixel 11 Pro. On the Pixel 8, the CPU processed prompts 7.59× as fast as Vulkan. For generation, the CPU lead narrowed from 12.15× at 0.5B to 6.59× at 1.5B on the Pixel 11 Pro and from 2.47× to 1.79× on the Pixel 8. Both phones reported thermal status 0 throughout sampling. Battery temperatures were 27.5–30.2 °C on the Pixel 11 Pro and 32.9–34.5 °C on the Pixel 8.
+
+### Packages and model files
+
+Both guests used Alpine's `llama.cpp` and `llama.cpp-vulkan` 0.0.9564-r0 with `mesa-vulkan-virtio` 26.1.6-r0. To run the translation check with the GGUF in the current directory:
 
 ```sh
 doas apk add llama.cpp llama.cpp-vulkan mesa-vulkan-virtio
@@ -82,25 +106,10 @@ llama-cli -m ./qwen2.5-0.5b-instruct-q4_0.gguf -t 4 -c 512 -n 64 --temp 0 -st \
     -p '翻译成中文，只输出译文：A GPU can process many tasks in parallel.'
 ```
 
-With default device selection, `llama-cli` selected `Virtio-GPU Venus (Mali-G715)`, reported `offloaded 25/25 layers to GPU` and generated “一个GPU可以同时处理许多任务。” The CPU control (`--device none -ngl 0`) reported 0/25 layers offloaded. The Q4_0 model file had SHA-256 `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed`.
-
-`llama-bench -t 4 -p 128 -n 32 -r 3` used the same weights in four passes, in CPU, Vulkan, Vulkan, CPU order. Each column gives the two pass means in tokens per second. On this device and model the CPU was faster for both workloads.
-
-| Workload | CPU (`-dev none -ngl 0`) | Mali-G715 (`-dev Vulkan0 -ngl 99`) |
-| --- | ---: | ---: |
-| Prompt processing, 128 tokens | 320.60 / 316.67 | 44.65 / 44.69 |
-| Generation, 32 tokens | 67.65 / 66.30 | 26.26 / 25.37 |
-
-#### Effect of model size
-
-A second session used Qwen's Qwen2.5-Instruct Q4_0 weights for both sizes and the same benchmark settings. The first pass ran 0.5B CPU, 1.5B Vulkan, 1.5B CPU, then 0.5B Vulkan. The second pass reversed that order. Each cell gives the mean tokens per second over three repeats in each pass. Android reported thermal status 0 at every sample; the battery temperature rose from 32.9 to 34.5 °C.
-
-| Model | Prompt, CPU | Prompt, Vulkan | Generation, CPU | Generation, Vulkan |
-| --- | ---: | ---: | ---: | ---: |
-| 0.5B | 320.55 / 298.86 | 44.63 / 44.68 | 68.28 / 63.63 | 27.14 / 26.30 |
-| 1.5B | 100.69 / 90.57 | 12.63 / 12.57 | 22.54 / 20.30 | 11.94 / 11.94 |
-
-Using the mean across both passes, the CPU lead narrowed from 2.47× to 1.79× for generation and widened from 6.94× to 7.59× for prompt processing. A separate 1.5B chat run reported 29/29 layers offloaded to the Mali GPU and answered seven plus eight correctly. The 1.5B GGUF had SHA-256 `dcd819ff094852c38faba6873d8ff0c9d51eadb2844539e52042ae5d647bbfdb`.
+| Model | GGUF SHA-256 |
+| --- | --- |
+| 0.5B | `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed` |
+| 1.5B | `dcd819ff094852c38faba6873d8ff0c9d51eadb2844539e52042ae5d647bbfdb` |
 
 ## Reproduce
 

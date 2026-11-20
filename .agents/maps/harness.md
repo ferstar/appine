@@ -164,6 +164,7 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
 
 ## Open questions
 
+- What causes the Pixel 11 Pro Vulkan runs to generate incorrect text for both Qwen2.5-Instruct Q4_0 models while their CPU controls answer correctly? The [llama.cpp survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the workloads, layer counts and throughput.
 - Should partial LTP runs merge into `results.txt` as the durations do?
 
 ## To verify
