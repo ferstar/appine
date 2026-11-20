@@ -1356,6 +1356,18 @@ mod tests {
     }
 }
 
+type MemopCache = std::sync::Mutex<std::collections::HashMap<(u64, u64), Vec<(u64, u32)>>>;
+
+fn memop_cache() -> &'static MemopCache {
+    static CACHE: OnceLock<MemopCache> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn memop_cache_key(fd: i32) -> Option<(u64, u64)> {
+    let st = appine_hal::fstat(fd).ok()?;
+    Some((st.st_dev, st.st_ino))
+}
+
 fn exe_read_range(exe: &Executable, off: usize, len: usize) -> Option<Vec<u8>> {
     let end = off.checked_add(len)?;
     if end > exe.len {
@@ -1481,6 +1493,28 @@ pub(crate) fn scan_fd_memops(
     map_len: u64,
     out: &mut Vec<appine_engine::DbtMemop>,
 ) {
+    let key = memop_cache_key(fd);
+    if let Some(k) = key
+        && let Some(cached) = memop_cache().lock().unwrap().get(&k).cloned()
+    {
+        if cached.is_empty() {
+            return;
+        }
+        let bias = map_start.wrapping_sub(map_off);
+        let map_end = map_start.saturating_add(map_len);
+        for (st_value, kind) in cached {
+            let pc = bias.wrapping_add(st_value);
+            if pc >= map_start && pc < map_end && !out.iter().any(|m| m.pc == pc) {
+                out.push(appine_engine::DbtMemop {
+                    pc,
+                    kind,
+                    reserved: 0,
+                });
+            }
+        }
+        return;
+    }
+    let mut discovered = Vec::new();
     let Some(ehdr) = fd_read_exact(fd, 0, 64) else {
         return;
     };
@@ -1579,13 +1613,19 @@ pub(crate) fn scan_fd_memops(
                 b"strncmp" | b"__strncmp_generic" => appine_engine::MEMOP_STRNCMP,
                 _ => 0,
             };
-            if kind != 0 && !out.iter().any(|m| m.pc == pc) {
-                out.push(appine_engine::DbtMemop {
-                    pc,
-                    kind,
-                    reserved: 0,
-                });
+            if kind != 0 {
+                discovered.push((st_value, kind));
+                if !out.iter().any(|m| m.pc == pc) {
+                    out.push(appine_engine::DbtMemop {
+                        pc,
+                        kind,
+                        reserved: 0,
+                    });
+                }
             }
         }
+    }
+    if let Some(k) = key {
+        memop_cache().lock().unwrap().insert(k, discovered);
     }
 }
