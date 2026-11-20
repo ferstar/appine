@@ -71,6 +71,37 @@ Five runs of `GpuTest#distributionVenus` per distribution used the debug APK and
 
 All times are medians in milliseconds, with the end-to-end range in parentheses. The compute program times Vulkan instance creation through CPU verification, including device and pipeline setup. With `appine-gpu`, the median fence wait was about 2.6 ms in both guests. Invalidating the mapped buffer and checking its 256 KiB on the guest CPU took 35.8 ms on Alpine and 41.1 ms on Debian.
 
+### llama.cpp on Alpine 3.24
+
+On the same Pixel 8, a Tier 1 Alpine 3.24.3 guest ran the distribution's `llama.cpp` and `llama.cpp-vulkan` packages (both `0.0.9564-r0`) with `mesa-vulkan-virtio` 26.1.6-r0 in the debug APK. The test installed signed APKs from a local cache and ran inference as UID 1000. To try the same packages from the Alpine repositories, with the GGUF in the current directory:
+
+```sh
+doas apk add llama.cpp llama.cpp-vulkan mesa-vulkan-virtio
+llama-cli --list-devices
+llama-cli -m ./qwen2.5-0.5b-instruct-q4_0.gguf -t 4 -c 512 -n 64 --temp 0 -st \
+    -p '翻译成中文，只输出译文：A GPU can process many tasks in parallel.'
+```
+
+With default device selection, `llama-cli` selected `Virtio-GPU Venus (Mali-G715)`, reported `offloaded 25/25 layers to GPU` and generated “一个GPU可以同时处理许多任务。” The CPU control (`--device none -ngl 0`) reported 0/25 layers offloaded. The Q4_0 model file had SHA-256 `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed`.
+
+`llama-bench -t 4 -p 128 -n 32 -r 3` used the same weights in four passes, in CPU, Vulkan, Vulkan, CPU order. Each column gives the two pass means in tokens per second. On this device and model the CPU was faster for both workloads.
+
+| Workload | CPU (`-dev none -ngl 0`) | Mali-G715 (`-dev Vulkan0 -ngl 99`) |
+| --- | ---: | ---: |
+| Prompt processing, 128 tokens | 320.60 / 316.67 | 44.65 / 44.69 |
+| Generation, 32 tokens | 67.65 / 66.30 | 26.26 / 25.37 |
+
+#### Effect of model size
+
+A second session used Qwen's Qwen2.5-Instruct Q4_0 weights for both sizes and the same benchmark settings. The first pass ran 0.5B CPU, 1.5B Vulkan, 1.5B CPU, then 0.5B Vulkan. The second pass reversed that order. Each cell gives the mean tokens per second over three repeats in each pass. Android reported thermal status 0 at every sample; the battery temperature rose from 32.9 to 34.5 °C.
+
+| Model | Prompt, CPU | Prompt, Vulkan | Generation, CPU | Generation, Vulkan |
+| --- | ---: | ---: | ---: | ---: |
+| 0.5B | 320.55 / 298.86 | 44.63 / 44.68 | 68.28 / 63.63 | 27.14 / 26.30 |
+| 1.5B | 100.69 / 90.57 | 12.63 / 12.57 | 22.54 / 20.30 | 11.94 / 11.94 |
+
+Using the mean across both passes, the CPU lead narrowed from 2.47× to 1.79× for generation and widened from 6.94× to 7.59× for prompt processing. A separate 1.5B chat run reported 29/29 layers offloaded to the Mali GPU and answered seven plus eight correctly. The 1.5B GGUF had SHA-256 `dcd819ff094852c38faba6873d8ff0c9d51eadb2844539e52042ae5d647bbfdb`.
+
 ## Reproduce
 
 Build the Android app using the [Android build guide](../android/README.md#building). The disposable fixture builder uses ARM64 Docker images and the pinned DRM headers for the low-level lifetime test. The Vulkan sample links the selected distribution's own loader. From the repository root with a debug build installed on the selected device:
