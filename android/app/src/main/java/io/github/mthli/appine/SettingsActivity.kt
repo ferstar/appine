@@ -662,8 +662,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     }
 
     private fun onVersion() {
-        val intent = Intent(Intent.ACTION_VIEW,
-            "https://play.google.com/store/apps/details?id=${BuildConfig.APPLICATION_ID}".toUri())
+        val intent = Intent(Intent.ACTION_VIEW, PLAY_STORE_URL.toUri())
         try {
             startActivity(intent.setPackage("com.android.vending"))
         } catch (e: ActivityNotFoundException) {
@@ -679,6 +678,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         private const val TELEGRAM_URL = "https://t.me/appinesh"
         private const val PROJECT_URL = "https://github.com/mthli/appine"
         private const val PRIVACY_POLICY_URL = "https://appine.sh/privacy"
+        private const val PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=io.github.mthli.appine"
         private const val CHOICE_DIALOG = "settings.choice"
 
         /** The cursor shapes offered, in order, and their names. */

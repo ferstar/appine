@@ -49,7 +49,9 @@ zig.path=/opt/homebrew/bin/zig
 ```
 
 Both APKs build `libappine.so` for `arm64-v8a`. Debug uses Cargo's `release` profile to keep
-the interpreter fast. Release uses `android-release` for cross-crate LTO and a smaller library.
+the interpreter fast, appends `.debug` to the application ID (`io.github.mthli.appine.debug`),
+and uses a yellow launcher icon outline (`#FFD600`) so it can be installed alongside release.
+Release uses `android-release` for cross-crate LTO and a smaller library.
 
 The release APK uses R8 and resource shrinking and is signed with the local debug key.
 `app/proguard-rules.pro` preserves JNI methods and the `VtSession.on*` callbacks Rust looks up

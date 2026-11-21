@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: one-time offline OpenRC setup on new and existing Alpine stores)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: Play Store link pinned to release application ID)
 
 ## Responsibilities
 
@@ -408,7 +408,8 @@ session consuming their state and events (`android/vt`).
   license text remain in the Appine notice on the license page.
 - About's final Version action shows `BuildConfig.VERSION_NAME` followed by `BuildConfig.VERSION_CODE`
   in parentheses (`1.0.0 (1)`). It opens the HTTPS Google Play
-  details URL for `BuildConfig.APPLICATION_ID`, first restricted to `com.android.vending`, then
+  details URL for `io.github.mthli.appine` (regardless of the debug `.debug` application ID suffix),
+  first restricted to `com.android.vending`, then
   without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
   The link can be built before publication, but the store listing is unavailable until published.
 - Service-dependent preferences are disabled before binding, on disconnect and on stopping;
@@ -444,7 +445,7 @@ session consuming their state and events (`android/vt`).
 
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
   symlinks), `readFile` (null when missing), `spawn` and `waitFor`; `HttpURLConnection` (system
-  proxy); `BuildConfig` (Alpine branch, app version and application ID); the assets; `TerminalService` and its
+  proxy); `BuildConfig` (Alpine branch and app version); the assets; `TerminalService` and its
   `Listener` (Settings); `LicensesActivity` (android/licenses); android/privacy's mode changes,
   export authorization and dialog protection; Material Components and AndroidX (Settings),
   including AndroidX Browser for Telegram, the project website and privacy policy; android/terminal's NotificationPermission
