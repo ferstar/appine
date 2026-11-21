@@ -9,5 +9,5 @@
 | R5 | `apk add` speed with one SQLite transaction per metadata operation | ✅ Closed: the bottleneck was the engine, not the transactions; once the engine got faster, commits were deferred by up to 5 ms and batched ([kernel/store map](../../.agents/maps/kernel/store.md)) | — |
 | R6 | Whether Tier 1 can use the host's X18 as a scratch register on Android | ✅ Resolved: it does not; translated code never touches X18 and uses X27 as the scratch register instead ([engine/dbt map](../../.agents/maps/engine/dbt.md)) | — |
 | A1 | Go on linux/arm64 does not set `SA_RESTORER` and relies on the sigreturn trampoline in the vDSO | ✅ Confirmed: Go on arm64 has `_SA_RESTORER = 0`, and signal handlers return through the vDSO's `__kernel_rt_sigreturn` | — |
-| A2 | Android GKI commonly uses 4K pages + a 39-bit VA | ✅ Confirmed: the emulator's GKI kernel does ([kernel/mm map](../../.agents/maps/kernel/mm.md)) | — |
+| A2 | Android GKI commonly uses 4K pages + a 39-bit VA | ✅ Confirmed: the emulator's GKI kernel does ([kernel/hostmem map](../../.agents/maps/kernel/hostmem.md)) | — |
 | A3 | dynarmic's memory callbacks cannot get precise guest state (inferred from the interface signatures) | Not validated; it only affects the argument for rejecting dynarmic in §15 | — |

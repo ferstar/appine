@@ -1,6 +1,8 @@
 //! Guest address spaces (the kernel/mm map: `.agents/maps/kernel/mm.md`): a VMA table plus a
 //! soft-MMU page table. Filling entries, keeping threads consistent and code groups are described
-//! by the kernel/mmu map, the resident-memory measures and `Mm::release` by the kernel/oom map.
+//! by the kernel/mmu map, the resident-memory measures and `Mm::release` by the kernel/oom map,
+//! fork and copy-on-write by the kernel/cow map, and host backing and deferred release by the
+//! kernel/hostmem map.
 //!
 //! Every VMA points at a piece of host memory (an anonymous or a file mapping), and several VMAs
 //! can share one piece (after munmap/mprotect splits them, or shared mappings after fork). Host
@@ -19,7 +21,7 @@
 //! [`CodeLog`] and the code generation is bumped; each thread invalidates translations page by
 //! page over the ranges it missed.
 //!
-//! On fork, private anonymous memory is copy-on-write (the kernel/mm map), other private mappings
+//! On fork, private anonymous memory is copy-on-write (the kernel/cow map), other private mappings
 //! are copied, and shared mappings are shared with the child. Copy-on-write is per page: pages
 //! written before fork are not copied; the page tables of parent and child both point at the
 //! parent's host page, without write permission. The side whose VMA holds the host page is its
@@ -4981,7 +4983,7 @@ struct Cow {
     borrowed: BTreeMap<u64, Borrowed>,
 }
 
-/// Copy-on-write (module docs, the kernel/mm map). Done through shared borrows: when the kernel
+/// Copy-on-write (module docs, the kernel/cow map). Done through shared borrows: when the kernel
 /// writes into guest memory it has only `&Mm`, and an owner recalling pages must also change its
 /// borrowers' page tables.
 impl Mm {

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: conditional render-node platform discovery in sysfs)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint fork commit check reference to kernel/cow)
 
 ## Responsibilities
 
@@ -315,7 +315,7 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
   forget the FUSE nodes nothing uses at the end of the syscall (the host keeps the page cache);
   `drop_caches` is write-only (reads `EINVAL`). `kernel.modprobe` keeps a string, `kernel.tainted`
   only gains flags (of the 19 defined), and `vm.overcommit_memory` (0 to 2) is used: 1 turns off
-  fork's commit check (`kernel/mm`). Constants: `file-max`, `cap_last_cap` 40, `ngroups_max`,
+  fork's commit check (`kernel/cow`). Constants: `file-max`, `cap_last_cap` 40, `ngroups_max`,
   `pid_max` 4194304, `osrelease` `6.1.0-appine`; `random/uuid` is fresh per read, `boot_id` fixed
   per boot, the entropy values 256.
 - `/proc/<pid>/net/*` (`arp`, `dev`, `icmp`, `icmp6`, `if_inet6`, `ipv6_route`, `netstat`, `raw`,

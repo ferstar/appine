@@ -10,7 +10,7 @@
 2. [Hard constraints](#2-hard-constraints)
 3. [Overall architecture](#3-overall-architecture)
 4. CPU engine, moved to the [engine map](../../.agents/maps/engine.md)
-5. Memory: a lightweight user-space soft-MMU, moved to the [kernel/mm map](../../.agents/maps/kernel/mm.md)
+5. Memory: a lightweight user-space soft-MMU, moved to the [kernel/mm](../../.agents/maps/kernel/mm.md), [kernel/mmu](../../.agents/maps/kernel/mmu.md), [kernel/oom](../../.agents/maps/kernel/oom.md), [kernel/cow](../../.agents/maps/kernel/cow.md) and [kernel/hostmem](../../.agents/maps/kernel/hostmem.md) maps
 6. Processes, threads and scheduling, moved to the [kernel/process](../../.agents/maps/kernel/process.md), [kernel/time](../../.agents/maps/kernel/time.md) and [kernel/boot](../../.agents/maps/kernel/boot.md) maps
 7. Signals and ABI, moved to the [kernel/signal map](../../.agents/maps/kernel/signal.md), [kernel/ptrace map](../../.agents/maps/kernel/ptrace.md) and [kernel/vdso map](../../.agents/maps/kernel/vdso.md)
 8. File system, moved to the [kernel/store](../../.agents/maps/kernel/store.md), [kernel/vfs](../../.agents/maps/kernel/vfs.md), [kernel/procfs](../../.agents/maps/kernel/procfs.md) and [kernel/cgroup](../../.agents/maps/kernel/cgroup.md) maps

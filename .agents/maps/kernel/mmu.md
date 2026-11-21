@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: memop pruning and CodeGroup memop syncing)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint copy-on-write and host-backing references to kernel/cow and kernel/hostmem)
 
 ## Responsibilities
 
@@ -32,9 +32,10 @@ Root:
   entries (`map_pages`, `fault_in`) and keep threads consistent (`add_user`, `remove_user`,
   `generations`, `code_space`, `invalidate_code`, `sync`, `quiesce`, `shootdown`).
 
-Outside the module: VMAs, host backing, the fault policy, copy-on-write and what each change
-records for `sync` (`kernel/mm`); the run loop that reads the counters (`kernel/process`); the
-Tier 1 translator with its inline TLB fast path and refill (`engine/dbt`).
+Outside the module: VMAs, the fault policy and what each change records for `sync` (`kernel/mm`);
+`fork` and copy-on-write (`kernel/cow`); host backing and deferred unmapping (`kernel/hostmem`);
+the run loop that reads the counters (`kernel/process`); the Tier 1 translator with its inline TLB
+fast path and refill (`engine/dbt`).
 
 ## Key types
 
@@ -170,8 +171,9 @@ Tier 1 translator with its inline TLB fast path and refill (`engine/dbt`).
 ### Inbound
 
 - `kernel/mm`: every VMA change (`map_pages`, the recorded `dirty`, `graveyard`, `code_ranges`
-  and `exec_changed`), CoW (`shootdown`, `fill_shared`, `map_shared`, `protect_shared`), the fault
-  path (`fault_in`), `Mm` drop (leaving the code group).
+  and `exec_changed`), the fault path (`fault_in`), `Mm` drop (leaving the code group);
+  `kernel/cow`: CoW (`shootdown`, `fill_shared`, `map_shared`, `protect_shared`); `kernel/hostmem`:
+  deferred `Mmu` destruction (`Unmapped::mmus`).
 - `kernel/process`: the run loop (`in_guest`, `generations`, TLB flushes, code invalidation, `ic
   ivau`), the dispatcher (`sync` after BKL syscalls), membarrier (`quiesce`), users at thread start
   and exit.

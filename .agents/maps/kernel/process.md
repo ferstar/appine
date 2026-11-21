@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: split bug containment, kill reports, test hooks and the BKL watchdog into kernel/bug)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint fork/copy-on-write and host-backing references to kernel/cow and kernel/hostmem)
 
 ## Responsibilities
 
@@ -38,7 +38,8 @@ Outside the module: kernel bug containment, kill reports, test hooks and the BKL
 (`kernel/bug`); clocks, sleeps, timers and periodic checks (`kernel/time`); machine startup, host
 spawn, inittab, PID 1 power requests and teardown (`kernel/boot`); execve and the ELF loader
 (`kernel/exec`), namespaces, unshare, setns and ID translation (`kernel/ns`), futexes and robust
-lists (`kernel/futex`), address spaces and fork copy-on-write (`kernel/mm`), CPU state (`engine`)
+lists (`kernel/futex`), address spaces (`kernel/mm`), fork copy-on-write (`kernel/cow`), host
+backing and deferred unmapping (`kernel/hostmem`), CPU state (`engine`)
 and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount trees
 (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`kernel/cgroup`), procfs files
 (`kernel/procfs`), the OOM policy (`kernel/oom`).
@@ -145,7 +146,7 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
   limit, at least 20, 4096 if memory is unknown; writable in 20..=0x3fffffff); the cgroup
   `pids.max` and freezer are checked; then a pid is chosen. Host-launched processes
   (`Machine::spawn`) are a trusted path and skip these limits.
-- The child's address space is shared (`CLONE_VM`) or quiesced and forked (`kernel/mm`); fds and fs
+- The child's address space is shared (`CLONE_VM`) or quiesced and forked (`kernel/cow`); fds and fs
   are shared or copied. A new process gets `ppid` and `parent_thread` from the caller (or the
   caller's parent with `CLONE_PARENT`, which also gives it the caller's process's exit signal, as
   Linux's `copy_process` does). A fresh CPU state copies the parent's registers (x0 = 0), the new
@@ -174,7 +175,7 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
   entry for `kernel/bug`'s watchdog, takes the BKL and is handled: a killed thread exits; code
   invalidations are applied; syscalls are dispatched; kicks deliver signals; undefined instructions
   raise `SIGILL`, breakpoints and watchpoints `SIGTRAP`, alignment faults `SIGBUS`, host faults
-  kill the process (`kernel/bug`); page faults go to `kernel/mm` (copy-on-write break, already
+  kill the process (`kernel/bug`); page faults go to `kernel/mm` (`kernel/cow`'s copy-on-write break, already
   present, fault in, FUSE fill, past-EOF `SIGBUS` or remap, stack growth, else `SIGSEGV`). A panic
   on either path kills the process (`kernel/bug`) and the thread exits.
 - The result (`Continue`, `Exec`, `Exit`) decides the next step; `Exec` re-attaches the translator
@@ -280,11 +281,11 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
   reading only the `held` flag; the rest sleep on the mutex (a poisoned one is accepted). The new
   holder sets `held`, records itself in `Hold` (`kernel/bug`: relaxed stores on the same cache line,
   no clock read), marks the thread as holding this kernel's BKL and starts deferring host unmaps
-  (`kernel/mm`).
+  (`kernel/hostmem`).
 - Release (`Drop for Bkl`), in order: hang up closed terminals (contained), match pending wake
   requests against waiters, clear `held`, unlock, clear the thread's held marker, notify pooled
   host threads, signal the matched events, release deferred host memory and refill fork spares
-  (`kernel/mm`).
+  (`kernel/hostmem`).
 - Waits outside a syscall context (the timer thread, `Machine::wait_*`, the terminal bridge) call
   `block`/`block_for` directly; they hold no kernel objects while the BKL is released.
 - Borrow checks: the kernel's `RefCell` counts borrows per thread; every `block_for` (also the
@@ -415,7 +416,8 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
   list; `engine/dbt`: `Dbt::attach`/`run`.
 - `kernel/bug`: `bug::catch`, `bug::kill`, `bug::fails`, `bug::test_hook`, `Hold::record`,
   `kernel::doing`/`done`.
-- `kernel/mm`: `fork`, `translate`, `defer_unmaps`/`release_unmapped`/`spare::refill`;
+- `kernel/mm`: `translate`; `kernel/cow`: `fork`, `cow_break`; `kernel/hostmem`: `defer_unmaps`/
+  `release_unmapped`/`spare::refill`;
   `kernel/mmu`: `quiesce`, users, `Mm::sync`, generations and code spaces in the run loop.
 - `kernel/exec` (execve), `kernel/ns` (namespaces at clone,
   pid translation at dispatch and wait), `kernel/futex` (the futex syscalls and their fast path,
