@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: task membership and freezer changes mark affected cgroup observations)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: BKL watchdog end-of-hold records queue to a single on-demand bkl-watchdog-log drainer thread for FIFO kernel-log order)
 
 ## Responsibilities
 
@@ -416,11 +416,12 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
   thread name and activity (running, in host syscall n, or its scheduler state); the same line
   becomes the latest `Stall` (ids count from 1 per kernel; seconds updated at each look).
 - When a later look sees the lock free or another hold: at once a line naming the holder and the
-  total seconds on stderr and in the `Stall`, and the same line as a KERN_ERR kernel log record,
-  which a short-lived thread (`bkl-watchdog-log`) writes once it gets the BKL, so the watchdog
-  goes on looking, and reports the next hold, while that holder keeps it (a panic writing it is
-  only reported; when the thread cannot start the record is lost). Durations count from the first
-  look, so they are right to within one look. Nothing is ended.
+  total seconds on stderr and in the `Stall`, and the same line queued for a single on-demand
+  thread (`bkl-watchdog-log`) that drains queued records as KERN_ERR entries in FIFO order once it
+  gets the BKL, so the watchdog goes on looking, and reports the next hold, while that holder keeps
+  it (a panic writing it is only reported; when the thread cannot start the queued records are
+  dropped). Durations count from the first look, so they are right to within one look. Nothing is
+  ended.
 - `Machine::stall` returns the latest `Stall` without the BKL; the watchdog is stopped and joined
   last in `Machine`'s drop.
 
