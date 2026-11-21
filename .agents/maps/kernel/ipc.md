@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint SharedMemory host backing to kernel/hostmem)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint IPC and mqueue sysctl references to kernel/sysctl)
 
 ## Responsibilities
 
@@ -28,8 +28,8 @@ Root: `core/kernel/src/ipc.rs` (object model), `syscall/ipc.rs` (SysV syscalls),
 Outside the module: creating, entering and collecting IPC namespaces (`IpcNs`, and `Kernel::ipcs`,
 `new_ipc_ns` and `collect_ipc` in `kernel.rs`) and clone/unshare/setns (`kernel/process`); host
 shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `detach_shm`,
-`shm_attachments`, `kernel/mm`); the mqueue filesystem's node views, the `/proc/sysvipc` files and sysctl plumbing
-(`kernel/procfs`); mqueue mounts and the generic file syscalls that dispatch to queues
+`shm_attachments`, `kernel/mm`); the mqueue filesystem's node views and `/proc/sysvipc` files
+(`kernel/procfs`), and IPC/mqueue sysctl plumbing (`kernel/sysctl`); mqueue mounts and the generic file syscalls that dispatch to queues
 (`kernel/vfs`, `kernel/files`); readiness and epoll of queue fds (`kernel/poll`); signal delivery
 (`kernel/signal`); the netlink sockets used by `SIGEV_THREAD` (`kernel/netlink`); credentials
 (`kernel/cred`).
@@ -233,8 +233,8 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 - `kernel/vfs` and `kernel/files`: open, create, unlink, read, lseek, fstat, fstatfs, chmod, chown
   and utimensat on the mqueue filesystem (`new_queue`, `insert_queue`, `remove_queue`, `find`, the
   `MessageQueue` accessors).
-- `kernel/procfs`: `/proc/sysvipc/*` (`proc_listing`), the IPC and mqueue sysctls, mqueue node
-  views (`find`, `MqDir`, `MessageQueue::stat`).
+- `kernel/procfs`: `/proc/sysvipc/*` (`proc_listing`), mqueue node views (`find`, `MqDir`,
+  `MessageQueue::stat`); `kernel/sysctl`: the IPC and mqueue sysctls.
 - `kernel/poll`: readiness, arrivals and the wake object of queue fds.
 
 ### Outbound

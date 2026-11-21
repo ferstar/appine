@@ -1,4 +1,5 @@
-//! Synthetic filesystems (the kernel/procfs map): procfs, devpts, sysfs (CPU topology, network
+//! Synthetic filesystems (the kernel/procfs map; `/proc/sys` sysctls are the kernel/sysctl map and
+//! sysfs is the kernel/sysfs map): procfs, devpts, sysfs (CPU topology, network
 //! interfaces) and cgroup2, mounted at boot on `/proc`, `/dev/pts`, `/sys` and `/sys/fs/cgroup`.
 //!
 //! Nodes are [`PseudoNode`]s, and the directory structure implements [`Pseudo`] through [`View`]

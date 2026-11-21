@@ -570,7 +570,7 @@ impl Machine {
         self.sync();
     }
 
-    /// The host's network changed (the kernel/net map): the routes in the main table become
+    /// The host's network changed (the kernel/route map): the routes in the main table become
     /// `routes`, which the guest's `ip route`, `/proc/net/route` and so on then see
     /// ([`crate::route`]). On Android the app cannot read the host routing table, so it takes the
     /// routes from the default network's `LinkProperties` and passes them in; None switches back to

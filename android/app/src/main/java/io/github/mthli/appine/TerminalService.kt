@@ -419,7 +419,7 @@ class TerminalService : Service() {
     private val saveSoon = Runnable { saveTabs() }
 
     /**
-     * The default network's routes go to the guest (the kernel/net map): since Android 10 apps
+     * The default network's routes go to the guest (the kernel/route map): since Android 10 apps
      * cannot read the host's routing table, and the guest's `ip route` and `/proc/net/route` rely
      * on this. Callbacks come on system threads and are handed to [worker] to run in order.
      */

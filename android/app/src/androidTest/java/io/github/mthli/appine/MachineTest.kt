@@ -1248,7 +1248,7 @@ class MachineTest {
     }
 
     /**
-     * The guest's routing table (the kernel/net map): the app cannot read the host's
+     * The guest's routing table (the kernel/route map): the app cannot read the host's
      * `/proc/net/route`; until the default network's `LinkProperties` are handed in, the table is
      * synthesised from the interfaces' addresses (the default route has no gateway), and afterwards
      * it has a gateway; the host chooses the source address of `ip route get`.

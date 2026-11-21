@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: conditional DRM device in boot devtmpfs)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint sysctl and sysfs references to kernel/sysctl and kernel/sysfs)
 
 ## Responsibilities
 
@@ -34,8 +34,8 @@ syscalls and mount namespaces (`kernel/mount`); overlayfs mounts, lookups, copy-
 and rename (`kernel/overlay`, branched to from here); advisory locks and leases (`kernel/locks`);
 pipes, FIFOs and splice (`kernel/pipe`); extended attributes (`kernel/xattr`); store semantics
 (`kernel/store`); FUSE connections, their node cache and the file syscalls on FUSE nodes
-(`kernel/fuse`, dispatched to from here); procfs/sysfs/devpts content and cgroup2 node adapters
-(`kernel/procfs`); cgroup policy and device BPF (`kernel/cgroup`);
+(`kernel/fuse`, dispatched to from here); procfs/devpts content and cgroup2 node adapters
+(`kernel/procfs`), `/proc/sys` sysctls (`kernel/sysctl`) and sysfs (`kernel/sysfs`); cgroup policy and device BPF (`kernel/cgroup`);
 terminals (`kernel/tty`); sockets (`kernel/net`, `kernel/unix`); poll/epoll, eventfd and timerfd
 (`kernel/poll`); inotify instances, watches and event rules (`kernel/inotify`); native AIO
 (`kernel/aio`); loop devices (`kernel/loop`); message queues (`kernel/ipc`); the BKL and the no-BKL
@@ -307,7 +307,7 @@ capabilities (`kernel/cred`).
 - `kernel/overlay`: the tmpfs instances its layers are in; `kernel/xattr`: resolution and mount
   flags.
 - `kernel/mm`: mmap `PROT_EXEC` on noexec.
-- `kernel/procfs`: sysctls for `protected_*`; `kernel/unix`: AF_UNIX bind creating store nodes.
+- `kernel/sysctl`: sysctls for `protected_*`; `kernel/unix`: AF_UNIX bind creating store nodes.
 - `kernel/poll`: `dev_ino`; `kernel/inotify`: overlay keys, second walks; `kernel/fuse`: the walk.
 - The machine at boot (`/dev` nodes).
 

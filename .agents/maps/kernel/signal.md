@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: split kernel/ptrace and kernel/vdso into separate maps)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint sysctl and sysfs references to kernel/sysctl and kernel/sysfs)
 
 ## Responsibilities
 
@@ -227,7 +227,7 @@ construction and clock-stub detection (`kernel/vdso`).
   `%E`, `%c`, `%d` the dumpable mode, 1); `core_uses_pid` appends `.pid` when the pattern has no pid. The file is
   created relative to the cwd (any old file unlinked first) with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode
   0600. `core_pattern` itself (at most 127 bytes) is a root-owned 0644 sysctl, writable by euid 0
-  only (`kernel/procfs`'s `/proc/sys` rule). `dumpable` is a flag (`PR_SET_DUMPABLE` 0 or 1; no
+  only (`kernel/sysctl`'s `/proc/sys` rule). `dumpable` is a flag (`PR_SET_DUMPABLE` 0 or 1; no
   `suid_dumpable`).
 - Format: arm64 Linux ELF core — `PT_NOTE` with per-thread `NT_PRSTATUS`, `NT_PRFPREG`,
   `NT_ARM_TLS`, `NT_ARM_HW_BREAK`, `NT_ARM_HW_WATCH`, `NT_ARM_SYSTEM_CALL`, plus `NT_PRPSINFO`,
@@ -279,7 +279,7 @@ construction and clock-stub detection (`kernel/vdso`).
   kinds and host fds not in the passthrough list, terminals, and sockets: requests the interface
   passthrough does not take, on any family, and those of a new network namespace), names path
   resolution does not find where Linux would have them (`/proc`, `/sys`, the boot `/dev`; the
-  rules are `kernel/procfs`'s) and device nodes without a driver (`ENXIO`). `stub::ioctl` leaves
+  rules are `kernel/procfs`'s, `kernel/sysctl`'s and `kernel/sysfs`'s) and device nodes without a driver (`ENXIO`). `stub::ioctl` leaves
   out requests of type `'T'` on files that are not terminals, which Linux refuses there too,
   except TIOCOUTQ (SIOCOUTQ) on sockets and FIOQSIZE on regular files and directories. Values no
   Linux defines are counted like the others.
@@ -316,7 +316,8 @@ construction and clock-stub detection (`kernel/vdso`).
   and the BKL watchdog: kernel log; bug kill reports read `stub::top`).
 - Default arms reporting unimplemented paths: prctl (`kernel/process`), futex (`kernel/futex`),
   fcntl, file ioctls and device opens (`kernel/files`), terminal ioctls (`kernel/tty`), socket
-  ioctls (`kernel/net`), madvise (`kernel/mm`); missing names from procfs views (`kernel/procfs`).
+  ioctls (`kernel/net`), madvise (`kernel/mm`); missing names from procfs/sysctl/sysfs views
+  (`kernel/procfs`, `kernel/sysctl`, `kernel/sysfs`).
 
 ### Outbound
 
@@ -326,8 +327,9 @@ construction and clock-stub detection (`kernel/vdso`).
   `regions` (the mapping named in unhandled-exception reports).
 - `engine`: CPU state (registers, FP, DIT) and the `Kicker`.
 - vfs (core files, `/dev/kmsg`), credentials (`may_signal`, `CAP_SYSLOG`),
-  `appine_hal` (clocks, `adjtimex` query, `timezone`), procfs (`debug.exception-trace` through
-  `recorded_value`, ` (deleted)` names through `mark_deleted`, `comm_str` for a path's first
+  `appine_hal` (clocks, `adjtimex` query, `timezone`), `kernel/sysctl` (`debug.exception-trace`
+  through `recorded_value`), `kernel/procfs` (` (deleted)` names through `mark_deleted`, `comm_str`
+  for a path's first
   caller).
 - `kernel/ptrace`: group/signal stops, fatal-exit hooks and shared register helpers; delivery
   must preserve stop ordering and skip signal stops for immutable actions.
