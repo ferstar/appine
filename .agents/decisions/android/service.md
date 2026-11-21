@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -66,11 +66,11 @@
 - **Source**: rounds 195 (`195-kill-reports`), 205 (`205-copy-bug-report`), 207 (`207-report-kernel-log`); 99b4216; f61072f3; d053be24; 39e55b4b
 
 ### D7: The service is a module of its own, split from the app by responsibility
-- **What**: android/service holds `TerminalService.kt`, `BrowserBridge.kt`, `Notifications.kt`, `Settings.kt`, `Tabs.kt` and `Diagnostics.kt`; the app is split into service, setup, documents, terminal and native modules by responsibility, in the maps only.
-- **Why**: §11.2's lifecycle table had to leave the retired design doc, and the user asked for the app to be split.
-- **Tradeoffs**: The code stays in one Gradle module, with kernel lifecycle in kernel/boot, sessions in android/vt, native mechanisms in android/vtcore, interaction in android/vtview and rendering in android/vtrender; tab rendering belongs to android/tabbar while session ownership remains here.
-- **Watch out**: A shell's kill report can reach a tab opened within the next poll that took the freed console number (open in the map); the switch-after-failed-start crash, notifications posted after `onDestroy` and reports sent to ended tabs, recorded by the full refresh d9e1f0c, were fixed in 6560af6 (D8, D9, D16).
-- **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038, d9e1f0c, 6560af6); 0553229 (files, D23); 8e211142; 9015b244; c7309c0c, 8a17e4a9, 81f60bef; d053be24; 60790c14; 39e55b4b
+- **What**: android/service holds `TerminalService.kt`, `BrowserBridge.kt`, `Settings.kt` and `Tabs.kt` (keeping ongoing foreground notification id 1 and routing decisions), while `Notifications.kt` and `Diagnostics.kt` belong to `android/reports` and the remaining app areas stay in their responsibility-based modules.
+- **Why**: `android/service.md` reached 41,395 B (89.8% of one read) while mixing foreground-service lifecycle with notification rendering and independent diagnostic retention.
+- **Tradeoffs**: Notification-policy changes touching both routing in `TerminalService` and formatting in `Notifications` span two maps, pre-split report/diagnostic decisions remain here, and sibling responsibilities stay in `kernel/boot`, `android/vt`, `android/vtcore`, `android/vtview`, `android/vtrender` and `android/tabbar`.
+- **Watch out**: Ongoing notification id 1 in `TerminalService` must stay disjoint from `android/reports`'s notification ID ranges, and a shell's kill report can still reach a newly opened tab that reused the freed console number before the next poll.
+- **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038, d9e1f0c, 6560af6); 0553229 (files, D23); 8e211142; 9015b244; c7309c0c, 8a17e4a9, 81f60bef; d053be24; 60790c14; 39e55b4b; e4d7bbe5
 
 ### D8: The service holds `VtSession`s and releases them before the kernel stops
 - **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports go to the tab whose console with that number is still open (`VtSession.consoleOpen`, android/terminal D8), else the newest tab that had it; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`; `releaseSessions` centralizes detach/onDestroy release, notification removal and clearing `sessions` and `unshown`.
@@ -232,3 +232,4 @@
 - ~~The generic privacy body under D28~~ → replaced by **D28 and D31** in c7e338a5 (2026-11-17).
 - ~~Always showing the policy body for a non-private startup failure in c7e338a5~~ → replaced by **D31** in c97b00bf (2026-11-17, recovered headingless block).
 - ~~Unconditionally calling `Rootfs.ensureGpuCommand` during every per-start guest setup in 9cafc90b~~ → narrowed by **D32** in b605a0a3 (2026-11-21, implicit refinement).
+- ~~D7 combined ownership of TerminalService, Notifications.kt and Diagnostics.kt (12c4afa, 0553229, c7309c0c)~~ → replaced by **D7** and android/reports **D1** in e4d7bbe5 (2026-11-22).

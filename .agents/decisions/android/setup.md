@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D8 were seeded by hand from the retired design doc
 > §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
 > entries cite commits.
 
@@ -63,12 +63,12 @@
 - **Tradeoffs**: Two distros cannot be used side by side or share files (that would need mounts across stores).
 - **Source**: round 99 (`99-choose-rootfs`); design doc §11.4; 8e211142; d053be24; 39e55b4b
 
-### D9: Distributions, first boot, logins and Settings are one android/setup module
-- **What**: android/setup covers Rootfs, SettingsActivity/SettingsFragment, login, shell-integration and browser-launcher assets, and fetch-rootfs, while service lifecycle stays in android/service.
-- **Why**: §11.1's login account and §11.4's first boot and settings needed a home when the design doc was retired.
-- **Tradeoffs**: The service drives imports, android/privacy owns authentication, android/licenses owns notices navigation, android/terminal owns the shared page frame, android/vtcore parses prompt marks and android/vt owns the login environment; asset packaging belongs to android/build.
-- **Watch out**: The 2026-11-12 full verification corrected import/login behavior and recorded mirror defects subsequently removed by import-only selection; in-place shadow edits can still delay NOPASSWD refresh, and shell-hook/device checks remain open.
-- **Source**: 12c4afa (bug list since updated by 237d663, d03c9b6); 5d506bfb; a1367531; 7aa817af; f8822b8b; 20137e4c; 8e211142; 9c6c51a7; 81f60bef; d053be24; 60790c14; 39e55b4b
+### D9: Distributions, first boot, logins and guest shell integration form android/setup
+- **What**: android/setup covers `Rootfs.kt`, guest login/OpenRC/shell-integration/browser-launcher/GPU-launcher assets and `scripts/fetch-rootfs`, with `To verify` kept to unverified residuals, while `SettingsActivity.kt` belongs to `android/settings` and service lifecycle stays in `android/service`.
+- **Why**: `android/setup.md` reached 49,174 B (106.7% of one read) while mixing guest rootfs/shell setup with the Settings UI.
+- **Tradeoffs**: Changes spanning both rootfs/account logic and the Settings UI touch both `android/setup` and `android/settings`, pre-split Settings decisions remain here, and sibling concerns stay in `android/privacy`, `android/licenses`, `android/terminal`, `android/vtcore`, `android/vt` and `android/build`.
+- **Watch out**: Changes to `Distro` metadata or `regularAccounts` must check `android/settings` consumers, while in-place shadow edits can still delay NOPASSWD refresh and shell-hook/device checks remain open.
+- **Source**: 12c4afa (bug list since updated by 237d663, d03c9b6); 5d506bfb; a1367531; 7aa817af; f8822b8b; 20137e4c; 8e211142; 9c6c51a7; 81f60bef; d053be24; 60790c14; 39e55b4b; e4d7bbe5
 
 ### D12: Settings uses service-driven AndroidX Preferences in a Material page
 - **What**: SettingsActivity supplies the frame and targets the preference RecyclerView for app-bar lift, while SettingsFragment builds stable-key nonpersistent categories, switches and lists driven by service setters, discards stale account loads and restores scrolling only after state and insets are ready.
@@ -258,3 +258,4 @@
 - ~~Stage OpenRC exclusively during import of a new Alpine store in d0ff9a31~~ → replaced by **D40** in 7e85e8dc (2026-11-19).
 - ~~Open the HTTPS Google Play details URL for `BuildConfig.APPLICATION_ID` in About's Version action in 0b3c5d8a~~ → replaced by **D28** in 1afcffbc (2026-11-21).
 - ~~Leave pre-existing regular Alpine accounts untouched during one-time bash startup seeding in 9f3e93ed~~ → replaced by **D42** in 125f3d00 (2026-11-21).
+- ~~D9 combined ownership of Rootfs and SettingsActivity (12c4afa)~~ → replaced by **D9** and android/settings **D1** in e4d7bbe5 (2026-11-22).
