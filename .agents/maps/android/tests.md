@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: cover Alpine .bash_profile/.bashrc seeding for new and existing stores in MachineTest)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: cover existing regular bash account seeding and ownership in MachineTest)
 
 ## Responsibilities
 
@@ -99,8 +99,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
   install, the `/bin/sh` fallback, bash's marks and nested shells', root and `adduser`-copied
   `.bash_profile`/`.bashrc` loading and ownership, and non-interactive `bash -lc` skipping
   `.bashrc`), and one-time Alpine bash startup seeding (`existingAlpineStoresSeedBashStartupFilesOnce`:
-  existing `.bashrc` preservation, deletion persistence, symlinked `.profile` non-shadowing, and
-  pre-bash `/bin/sh` stores). `newSystemsInstallProcpsOffline`
+  existing root and regular-account `.bashrc` preservation, account ownership and login loading,
+  missing-home safety, deletion persistence, symlinked `.profile` non-shadowing, and `/bin/sh`
+  accounts/stores). `newSystemsInstallProcpsOffline`
   uses its own store and ash, omits a dependency to check failure/retry, retries in two concurrent
   logins without repositories, runs ps/top/free/vmstat/uptime/pgrep, and checks that user removal
   persists. `newSystemsInstallBubblewrapOffline` similarly uses its own store without bash/procps

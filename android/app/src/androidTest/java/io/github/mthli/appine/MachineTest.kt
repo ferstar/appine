@@ -478,9 +478,10 @@ class MachineTest {
     }
 
     /**
-     * Existing Alpine stores receive `.bash_profile` and `.bashrc` once in `/etc/skel` and (when
-     * root uses `/bin/bash`) in `/root` without overwriting existing files, shadowing `.profile`
-     * or `.bash_login`, or recreating files deleted later.
+     * Existing Alpine stores receive `.bash_profile` and `.bashrc` once in `/etc/skel` and in the
+     * existing homes of root and regular `/bin/bash` accounts (owned by each account) without
+     * overwriting existing files, shadowing `.profile` or `.bash_login`, creating missing home
+     * directories, or recreating files deleted later.
      */
     @Test
     fun existingAlpineStoresSeedBashStartupFilesOnce() {
@@ -489,11 +490,28 @@ class MachineTest {
         Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
         val machine = Native.start(store.path, 1, false)
         try {
-            // Simulate an older Alpine bash store with a user-created ~/.bashrc and no ~/.bash_profile.
+            // Install bash first so we can exercise an upgraded regular user's login end to end.
+            val installed = plain(login(machine, "echo ready=\$BASH_VERSION\nexit\n", ConsolePty.LOGIN_ROOT))
+            assertTrue(installed, installed.contains("\nready=5."))
+
+            // Simulate an older Alpine bash store before /etc/skel existed, with:
+            // - root having a custom ~/.bashrc and no ~/.bash_profile;
+            // - alice (bash, existing home) having a custom ~/.bashrc and no ~/.bash_profile;
+            // - carol (bash, missing home);
+            // - dave (bash, existing home with symlinked ~/.profile);
+            // - erin (/bin/sh, existing home).
             checkedShell(
                 machine,
                 "rm -rf /var/lib/appine/bash-startup-done /etc/skel /root/.bash_profile /root/.bashrc && " +
-                    "printf 'export CUSTOM_RC=kept\\n' > /root/.bashrc",
+                    "printf 'export CUSTOM_RC=kept\\n' > /root/.bashrc && " +
+                    "adduser -D -s /bin/bash alice && " +
+                    "printf 'export ALICE_RC=from-alice\\n' > /home/alice/.bashrc && " +
+                    "chown alice:alice /home/alice/.bashrc && " +
+                    "adduser -D -H -s /bin/bash carol && " +
+                    "adduser -D -s /bin/bash dave && " +
+                    "printf 'export DAVE_PROFILE=1\\n' > /home/dave/.profile-target && " +
+                    "ln -s /home/dave/.profile-target /home/dave/.profile && " +
+                    "adduser -D -s /bin/sh erin",
             )
             Rootfs.ensureBashStartup(store.path)
             assertEquals("export CUSTOM_RC=kept\n", String(Native.readFile(store.path, "/root/.bashrc")!!))
@@ -501,13 +519,36 @@ class MachineTest {
             assertTrue(String(Native.readFile(store.path, "/etc/skel/.bash_profile")!!).contains(". ~/.bashrc"))
             assertTrue(String(Native.readFile(store.path, "/etc/skel/.bashrc")!!).contains("case \$- in"))
 
+            // Existing regular bash account alice gets ~/.bash_profile owned by alice:alice while
+            // keeping her ~/.bashrc, and logging in as alice loads it.
+            assertEquals("export ALICE_RC=from-alice\n", String(Native.readFile(store.path, "/home/alice/.bashrc")!!))
+            assertTrue(String(Native.readFile(store.path, "/home/alice/.bash_profile")!!).contains(". ~/.bashrc"))
+            assertEquals(
+                "alice:alice",
+                checkedShell(machine, "stat -c '%U:%G' /home/alice/.bash_profile").trim(),
+            )
+            val aliceLogin = plain(login(machine, "echo alice_rc=\$ALICE_RC\nexit\n", "alice"))
+            assertTrue(aliceLogin, aliceLogin.contains("\nalice_rc=from-alice\n"))
+
+            // Missing home (carol), symlinked .profile (dave), and /bin/sh account (erin).
+            assertEquals("missing", checkedShell(machine, "[ -e /home/carol ] && echo exists || echo missing").trim())
+            assertEquals(null, Native.readFile(store.path, "/home/dave/.bash_profile"))
+            assertTrue(Native.readFile(store.path, "/home/dave/.bashrc") != null)
+            assertEquals(
+                "dave:dave",
+                checkedShell(machine, "stat -c '%U:%G' /home/dave/.bashrc").trim(),
+            )
+            assertEquals(null, Native.readFile(store.path, "/home/erin/.bash_profile"))
+            assertEquals(null, Native.readFile(store.path, "/home/erin/.bashrc"))
+
             // Deleting seeded files persists across subsequent starts.
-            checkedShell(machine, "rm -f /root/.bash_profile /etc/skel/.bashrc")
+            checkedShell(machine, "rm -f /root/.bash_profile /home/alice/.bash_profile /etc/skel/.bashrc")
             Rootfs.ensureBashStartup(store.path)
             assertEquals(null, Native.readFile(store.path, "/root/.bash_profile"))
+            assertEquals(null, Native.readFile(store.path, "/home/alice/.bash_profile"))
             assertEquals(null, Native.readFile(store.path, "/etc/skel/.bashrc"))
 
-            // An existing ~/.profile (including a symlink) must not be shadowed by ~/.bash_profile.
+            // An existing ~/.profile (including a symlink) on root must not be shadowed by ~/.bash_profile.
             checkedShell(
                 machine,
                 "rm -rf /var/lib/appine/bash-startup-done /root/.bash_profile /root/.bashrc && " +

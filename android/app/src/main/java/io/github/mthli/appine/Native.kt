@@ -36,10 +36,21 @@ internal object Native {
     @Throws(IOException::class)
     external fun syncRootfs(store: String)
 
-    /** Writes a file in the store; with [overwrite] false, an existing file is left alone. */
+    /**
+     * Writes a file in the store; with [overwrite] false, an existing file is left alone. New files
+     * are owned by [uid] and [gid].
+     */
     @JvmStatic
     @Throws(IOException::class)
-    external fun writeFile(store: String, path: String, data: ByteArray, mode: Int, overwrite: Boolean)
+    external fun writeFile(
+        store: String,
+        path: String,
+        data: ByteArray,
+        mode: Int,
+        overwrite: Boolean,
+        uid: Int = 0,
+        gid: Int = 0,
+    )
 
     /** Reads a regular file in the store (null when missing); also works while the kernel runs. */
     @JvmStatic

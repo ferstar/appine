@@ -367,9 +367,10 @@ esac
     /**
      * Seeds Alpine's user-level bash startup files once per store so login shells (`bash -l`) read
      * `~/.bashrc`: writes `/etc/skel/.bash_profile` and `/etc/skel/.bashrc` (copied by `adduser`
-     * for accounts created later) and, when root's login shell is `/bin/bash`, writes root's copies
-     * without overwriting existing files or shadowing an existing `~/.profile` or `~/.bash_login`.
-     * Records completion so later deletions persist.
+     * for accounts created later) and, for root and pre-existing regular accounts (UID 1000–65533)
+     * whose login shell is `/bin/bash` and whose home directory exists, writes copies owned by each
+     * account without overwriting existing files or shadowing an existing `~/.profile` or
+     * `~/.bash_login`. Records completion so later deletions persist.
      */
     @Throws(IOException::class)
     fun ensureBashStartup(context: Context) {
@@ -383,36 +384,64 @@ esac
         if (Native.readFile(store, BASH_STARTUP_DONE) != null) return
         write(store, "/etc/skel/.bash_profile", BASH_PROFILE, overwrite = false)
         write(store, "/etc/skel/.bashrc", BASHRC, overwrite = false)
-        val root = accounts(store).firstOrNull { it.first.name == ConsolePty.LOGIN_ROOT }
-        if (root != null && root.second == "/bin/bash") {
-            val home = root.first.home.trimEnd('/')
-            if (home.startsWith("/") && home.isNotEmpty()) {
-                val hasLoginFile = listOf(".bash_profile", ".bash_login", ".profile")
-                    .any { exists(store, "$home/$it") }
-                if (!hasLoginFile) {
-                    write(store, "$home/.bash_profile", BASH_PROFILE, overwrite = false)
-                }
-                write(store, "$home/.bashrc", BASHRC, overwrite = false)
+        for ((account, shell) in accounts(store)) {
+            if (shell != "/bin/bash" || account.gid < 0) continue
+            if (account.name == ConsolePty.LOGIN_ROOT || account.uid in 1000..65533) {
+                seedBashHome(store, account)
             }
         }
         write(store, BASH_STARTUP_DONE, "")
     }
 
+    private fun seedBashHome(store: String, account: Account) {
+        val home = account.home.trimEnd('/')
+        if (!home.startsWith("/") || home.isEmpty()) return
+        // Do not create missing home directories as root; symlinks are rejected below by `exists`.
+        if (!hasNonRegularEntry(store, home)) return
+        val hasLoginFile = listOf(".bash_profile", ".bash_login", ".profile")
+            .any { exists(store, "$home/$it") }
+        if (!hasLoginFile) {
+            write(store, "$home/.bash_profile", BASH_PROFILE, overwrite = false, uid = account.uid, gid = account.gid)
+        }
+        if (!exists(store, "$home/.bashrc")) {
+            write(store, "$home/.bashrc", BASHRC, overwrite = false, uid = account.uid, gid = account.gid)
+        }
+    }
+
+    private fun hasNonRegularEntry(store: String, path: String): Boolean = try {
+        Native.readFile(store, path)
+        false
+    } catch (_: IOException) {
+        true
+    }
+
     private fun exists(store: String, path: String): Boolean = try {
         Native.readFile(store, path) != null
     } catch (_: IOException) {
-        // Non-regular entries (such as symlinks) still exist and must not be shadowed.
+        // Non-regular entries (such as symlinks) or non-directory parents must not be overwritten.
         true
     }
 
     private fun asset(context: Context, name: String): String =
         context.assets.open(name).bufferedReader().use { it.readText() }
 
-    private fun write(store: String, path: String, text: String, overwrite: Boolean = true) =
-        write(store, path, text.toByteArray(), overwrite)
+    private fun write(
+        store: String,
+        path: String,
+        text: String,
+        overwrite: Boolean = true,
+        uid: Int = 0,
+        gid: Int = 0,
+    ) = write(store, path, text.toByteArray(), overwrite, uid, gid)
 
-    private fun write(store: String, path: String, data: ByteArray, overwrite: Boolean = true) =
-        Native.writeFile(store, path, data, 420 /* 0644 */, overwrite)
+    private fun write(
+        store: String,
+        path: String,
+        data: ByteArray,
+        overwrite: Boolean = true,
+        uid: Int = 0,
+        gid: Int = 0,
+    ) = Native.writeFile(store, path, data, 420 /* 0644 */, overwrite, uid, gid)
 
     /** Makes renames and deletions in directory [dir] durable. */
     private fun syncDir(dir: File) {

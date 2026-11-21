@@ -173,6 +173,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_writeFile<'l>(
     data: JByteArray<'l>,
     mode: jint,
     overwrite: jboolean,
+    uid: jint,
+    gid: jint,
 ) {
     guarded!("Native.writeFile", throws env, (), {
         let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
@@ -181,7 +183,15 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_writeFile<'l>(
         let Ok(data) = env.convert_byte_array(&data) else {
             return;
         };
-        let r = appine_kernel::write_file(store.as_ref(), &path, &data, mode as u32, overwrite != 0);
+        let r = appine_kernel::write_file(
+            store.as_ref(),
+            &path,
+            &data,
+            mode as u32,
+            overwrite != 0,
+            uid as u32,
+            gid as u32,
+        );
         if let Err(e) = r {
             throw(&mut env, format!("cannot write {path}: {e}"));
         }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: one-time Alpine bash startup files (.bash_profile and .bashrc) in /etc/skel and /root)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: one-time Alpine bash startup files (.bash_profile and .bashrc) for /etc/skel, root and existing regular bash accounts)
 
 ## Responsibilities
 
@@ -190,11 +190,12 @@ session consuming their state and events (`android/vt`).
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
   `doas.apk` into `/var/cache/appine/`, rewritten at every start; on Alpine, `ensureBashStartup`
   once per store (gated by `/var/lib/appine/bash-startup-done`): writes `/etc/skel/.bash_profile`
-  and `/etc/skel/.bashrc` when missing and, when root's `/etc/passwd` shell is `/bin/bash` and
-  root's home is a non-root absolute path, writes `.bash_profile` only if none of `.bash_profile`,
-  `.bash_login` or `.profile` (including symlinks) exists and writes `.bashrc` when missing, then
-  writes the marker so later user deletions persist (pre-existing regular accounts keep their homes
-  untouched); a profile left exactly as an
+  and `/etc/skel/.bashrc` when missing and, for root and pre-existing regular accounts (UID
+  1000–65533) whose `/etc/passwd` shell is `/bin/bash` and whose non-root home directory already
+  exists, writes `.bash_profile` only if none of `.bash_profile`, `.bash_login` or `.profile`
+  (including symlinks) exists and writes `.bashrc` when missing, owned by each account (`uid:gid`,
+  0644), then writes the marker so later user deletions persist (missing or symlinked homes are
+  skipped without creating directories); a profile left exactly as an
   earlier version wrote it (with `cd "$HOME"`, without prompt marks, or with marks that do not
   declare `cl=line`, or with ash's, bash's or zsh's marks in itself) replaced by the current one, with
   the mark files written before it (`/etc/bash/appine.sh` on Alpine stores, bash installed or
@@ -544,13 +545,14 @@ session consuming their state and events (`android/vt`).
 
 ## To verify
 
-- Alpine `.bash_profile`/`.bashrc` seeding passed debug/test assembly, lint, and six
-  instrumentation tests (`MachineTest`: `newSystemsLogInWithBash`,
-  `existingAlpineStoresSeedBashStartupFilesOnce`, `profileMarksPrompts`,
-  `loginShellComesFromPasswd`; `ShellTitleTest`) on SM-S9110 (Android 16 / API 36, 4 KB pages),
-  covering root and `adduser` `/etc/skel` ownership/loading, non-interactive `bash -lc` skipping
-  `.bashrc`, and one-time existing-store migration; 16 KB-page devices and live
-  `TerminalService` upgrade cold starts remain unverified.
+- Alpine `.bash_profile`/`.bashrc` seeding (including owned writes for pre-existing regular
+  `/bin/bash` accounts) passed debug/test assembly, lint, and 13 instrumentation tests
+  (`MachineTest`: `newSystemsLogInWithBash`, `existingAlpineStoresSeedBashStartupFilesOnce`,
+  `profileMarksPrompts`, `loginShellComesFromPasswd`; `ShellTitleTest`; `TerminalFilesTest`) on
+  SM-S9110 (Android 16 / API 36, 4 KB pages), covering root, `adduser` `/etc/skel` and upgraded
+  regular-account ownership/loading, missing/symlinked home safety, non-interactive `bash -lc`
+  skipping `.bashrc`, and deletion persistence; 16 KB-page devices and live `TerminalService`
+  upgrade cold starts remain unverified.
 
 - The zsh companion extraction passed host zsh checks in native and sh emulation: byte-identical
   prompt/status/title output to the prior profile, repeated loading, existing-hook preservation,

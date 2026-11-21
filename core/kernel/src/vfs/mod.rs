@@ -3456,15 +3456,29 @@ fn ensure_resolv_conf(store: &Store) -> Result<(), Errno> {
 }
 
 /// Writes a regular file in the store (for the host to prepare configuration files): missing
-/// parent directories are created too (0755), and symlinks in the path are not followed. When
-/// the file already exists, it is left alone if `overwrite` is false, otherwise its contents
-/// are replaced (permission bits unchanged).
+/// parent directories are created too (0755, owned by root), and symlinks in the path are not
+/// followed. When the file already exists, it is left alone if `overwrite` is false, otherwise its
+/// contents are replaced (permission bits and owner unchanged). New files are owned by root.
 pub fn write_file(
     store: &Store,
     path: &[u8],
     data: &[u8],
     mode: u32,
     overwrite: bool,
+) -> Result<(), Errno> {
+    write_file_owned(store, path, data, mode, overwrite, 0, 0)
+}
+
+/// Like [`write_file`], creating a new regular file owned by `uid` and `gid` (missing parent
+/// directories still belong to root).
+pub fn write_file_owned(
+    store: &Store,
+    path: &[u8],
+    data: &[u8],
+    mode: u32,
+    overwrite: bool,
+    uid: u32,
+    gid: u32,
 ) -> Result<(), Errno> {
     use std::io::Write;
     let comps: Vec<Vec<u8>> = split(path).collect();
@@ -3484,7 +3498,7 @@ pub fn write_file(
             store.open_object(ino, true)?
         }
         Some(_) => return Err(Errno::EEXIST),
-        None => store.create_file(dir, name, mode & 0o7777, 0, 0)?.1,
+        None => store.create_file(dir, name, mode & 0o7777, uid, gid)?.1,
     };
     file.write_all(data)
         .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))
