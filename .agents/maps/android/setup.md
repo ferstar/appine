@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: default-off Vulkan GPU toggle in Debugging with restart confirmation)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: one-time Alpine bash startup files (.bash_profile and .bashrc) in /etc/skel and /root)
 
 ## Responsibilities
 
@@ -77,8 +77,8 @@ session consuming their state and events (`android/vt`).
   profile only in zsh. Its anonymous function registers the hooks in local zsh emulation,
   preserving the caller's options. `Rootfs.writeProfile(context, store, distro)` writes all three
   companion files and then the profile.
-- Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`
-  and `sudo-installed` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
+- Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`,
+  `sudo-installed` and `bash-startup-done` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
   (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`,
   `/var/cache/appine/{bash,procps,bubblewrap,openrc}/` (packages until installed), and `/run/appine-install.lock`.
 
@@ -86,8 +86,9 @@ session consuming their state and events (`android/vt`).
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
   `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
-- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureGpuCommand`, `ensureBrowser`,
-  `updateProfile`; around boot: `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
+- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
+  `ensureBashStartup`, `ensureGpuCommand`, `ensureBrowser`, `updateProfile`; around boot:
+  `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
 - Mirrors: `chooseMirror`, `useMirror`.
 - Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
@@ -154,9 +155,12 @@ session consuming their state and events (`android/vt`).
     `resolv.conf` (the kernel writes one pointing at the DNS stub at every start when it is
     missing); bash as the login shell (`useBash`): the bundled packages from the assets' `bash/`
     into `/var/cache/appine/bash/`, and, when there were any, root's `/etc/passwd` shell changed
-    from `/bin/sh` to `/bin/bash` (any other shell is kept). Systems imported before keep busybox
-    ash; accounts busybox's `adduser` makes later take the shell of `$SHELL` or of the account
-    running it, so from a root tab they get bash too; procps-ng and its six dependencies are
+    from `/bin/sh` to `/bin/bash` (any other shell is kept) and `ensureBashStartup` run so
+    `/etc/skel` and `/root` receive `.bash_profile` (sourcing `~/.bashrc`) and `.bashrc` (an
+    interactive guard leaving `PS1` and history unchanged) and `/var/lib/appine/bash-startup-done`
+    is recorded. Systems imported before keep busybox ash; accounts busybox's `adduser` makes
+    later take the shell of `$SHELL` or of the account running it (so from a root tab they get
+    bash too) and copy `/etc/skel`; procps-ng and its six dependencies are
     staged in `/var/cache/appine/procps/` by `cachePackages`, also used for bash and bubblewrap
     with libcap2 (`/var/cache/appine/bubblewrap/`). Existing stores do not receive these import-time files;
   - Debian: `hosts` and `resolv.conf` (the DNS stub) always.
@@ -184,7 +188,13 @@ session consuming their state and events (`android/vt`).
   `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
   (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
-  `doas.apk` into `/var/cache/appine/`, rewritten at every start; a profile left exactly as an
+  `doas.apk` into `/var/cache/appine/`, rewritten at every start; on Alpine, `ensureBashStartup`
+  once per store (gated by `/var/lib/appine/bash-startup-done`): writes `/etc/skel/.bash_profile`
+  and `/etc/skel/.bashrc` when missing and, when root's `/etc/passwd` shell is `/bin/bash` and
+  root's home is a non-root absolute path, writes `.bash_profile` only if none of `.bash_profile`,
+  `.bash_login` or `.profile` (including symlinks) exists and writes `.bashrc` when missing, then
+  writes the marker so later user deletions persist (pre-existing regular accounts keep their homes
+  untouched); a profile left exactly as an
   earlier version wrote it (with `cd "$HOME"`, without prompt marks, or with marks that do not
   declare `cl=line`, or with ash's, bash's or zsh's marks in itself) replaced by the current one, with
   the mark files written before it (`/etc/bash/appine.sh` on Alpine stores, bash installed or
@@ -533,6 +543,14 @@ session consuming their state and events (`android/vt`).
   deleted?
 
 ## To verify
+
+- Alpine `.bash_profile`/`.bashrc` seeding passed debug/test assembly, lint, and six
+  instrumentation tests (`MachineTest`: `newSystemsLogInWithBash`,
+  `existingAlpineStoresSeedBashStartupFilesOnce`, `profileMarksPrompts`,
+  `loginShellComesFromPasswd`; `ShellTitleTest`) on SM-S9110 (Android 16 / API 36, 4 KB pages),
+  covering root and `adduser` `/etc/skel` ownership/loading, non-interactive `bash -lc` skipping
+  `.bashrc`, and one-time existing-store migration; 16 KB-page devices and live
+  `TerminalService` upgrade cold starts remain unverified.
 
 - The zsh companion extraction passed host zsh checks in native and sh emulation: byte-identical
   prompt/status/title output to the prior profile, repeated loading, existing-hook preservation,

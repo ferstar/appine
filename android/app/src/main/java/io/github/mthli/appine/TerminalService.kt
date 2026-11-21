@@ -595,6 +595,7 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
                 Rootfs.ensureLoginTools(this)
+                Rootfs.ensureBashStartup(this)
                 if (gpu) Rootfs.ensureGpuCommand(this)
                 startKernel(tier, gpu, importing = distro != null)
             }

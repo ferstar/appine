@@ -282,10 +282,11 @@ internal object Rootfs {
      * Makes bash the login shell of a system imported from Alpine instead of busybox ash: puts the
      * packages bundled with the app (bash and the libraries it needs that the minirootfs lacks) into
      * `/var/cache/appine/bash/`, from which the login script installs them offline at the first
-     * login (using `/bin/sh` until they are installed), and has root's entry in `/etc/passwd` name
-     * `/bin/bash`. Accounts made later with busybox's `adduser` get bash too, as it gives them the
-     * shell of the account running it (`$SHELL`, which the login script sets). Systems imported
-     * before keep their shells.
+     * login (using `/bin/sh` until they are installed), has root's entry in `/etc/passwd` name
+     * `/bin/bash`, and seeds `/etc/skel` and `/root` with `.bash_profile` and `.bashrc` so login
+     * shells (`bash -l`) read `~/.bashrc`. Accounts made later with busybox's `adduser` get bash
+     * too, as it gives them the shell of the account running it (`$SHELL`, which the login script
+     * sets), and copy `/etc/skel`. Systems imported before keep their shells.
      */
     @Throws(IOException::class)
     private fun useBash(context: Context, store: String) {
@@ -300,6 +301,7 @@ internal object Rootfs {
             }
         }
         write(store, "/etc/passwd", lines.joinToString("\n"))
+        ensureBashStartup(store)
     }
 
     /**
@@ -337,6 +339,71 @@ internal object Rootfs {
 # -l) marks its prompts too.
 if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
 """
+
+    private const val BASH_STARTUP_DONE = "/var/lib/appine/bash-startup-done"
+
+    /**
+     * `/etc/skel/.bash_profile` and `/root/.bash_profile` on Alpine: bash login shells (`bash -l`,
+     * which Appine's tabs start) do not read `~/.bashrc` on their own, so source it here.
+     */
+    private const val BASH_PROFILE = """# Written by Appine for login bash shells.
+if [ -f ~/.bashrc ] && [ -r ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+"""
+
+    /**
+     * `/etc/skel/.bashrc` and `/root/.bashrc` on Alpine: interactive guard so user additions do not
+     * run in non-interactive login shells (`bash -lc`), while leaving `PS1` and history settings to
+     * `/etc/profile.d/appine.sh` and `/etc/bash/bashrc`.
+     */
+    private const val BASHRC = """# Written by Appine for interactive bash shells.
+case ${'$'}- in
+    *i*) ;;
+    *) return ;;
+esac
+"""
+
+    /**
+     * Seeds Alpine's user-level bash startup files once per store so login shells (`bash -l`) read
+     * `~/.bashrc`: writes `/etc/skel/.bash_profile` and `/etc/skel/.bashrc` (copied by `adduser`
+     * for accounts created later) and, when root's login shell is `/bin/bash`, writes root's copies
+     * without overwriting existing files or shadowing an existing `~/.profile` or `~/.bash_login`.
+     * Records completion so later deletions persist.
+     */
+    @Throws(IOException::class)
+    fun ensureBashStartup(context: Context) {
+        if (installed(context) != Distro.ALPINE) return
+        ensureBashStartup(store(context).path)
+    }
+
+    /** Seeds Alpine's bash startup files in [store] once (used at import and by tests). */
+    @Throws(IOException::class)
+    fun ensureBashStartup(store: String) {
+        if (Native.readFile(store, BASH_STARTUP_DONE) != null) return
+        write(store, "/etc/skel/.bash_profile", BASH_PROFILE, overwrite = false)
+        write(store, "/etc/skel/.bashrc", BASHRC, overwrite = false)
+        val root = accounts(store).firstOrNull { it.first.name == ConsolePty.LOGIN_ROOT }
+        if (root != null && root.second == "/bin/bash") {
+            val home = root.first.home.trimEnd('/')
+            if (home.startsWith("/") && home.isNotEmpty()) {
+                val hasLoginFile = listOf(".bash_profile", ".bash_login", ".profile")
+                    .any { exists(store, "$home/$it") }
+                if (!hasLoginFile) {
+                    write(store, "$home/.bash_profile", BASH_PROFILE, overwrite = false)
+                }
+                write(store, "$home/.bashrc", BASHRC, overwrite = false)
+            }
+        }
+        write(store, BASH_STARTUP_DONE, "")
+    }
+
+    private fun exists(store: String, path: String): Boolean = try {
+        Native.readFile(store, path) != null
+    } catch (_: IOException) {
+        // Non-regular entries (such as symlinks) still exist and must not be shadowed.
+        true
+    }
 
     private fun asset(context: Context, name: String): String =
         context.assets.open(name).bufferedReader().use { it.readText() }
@@ -717,8 +784,10 @@ netns = "host"
     }.sortedBy { it.uid }
 
     /** The accounts in `/etc/passwd`, empty when it cannot be read. */
-    private fun accounts(context: Context): List<Pair<Account, String>> {
-        val passwd = runCatching { Native.readFile(store(context).path, "/etc/passwd") }.getOrNull()
+    private fun accounts(context: Context): List<Pair<Account, String>> = accounts(store(context).path)
+
+    private fun accounts(store: String): List<Pair<Account, String>> {
+        val passwd = runCatching { Native.readFile(store, "/etc/passwd") }.getOrNull()
             ?: return emptyList()
         return String(passwd).lines().mapNotNull { line ->
             val f = line.split(':')

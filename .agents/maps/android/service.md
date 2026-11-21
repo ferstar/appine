@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: default-off Vulkan GPU setting, conditional launcher install and renderer availability state)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: call Rootfs.ensureBashStartup before kernel start)
 
 ## Responsibilities
 
@@ -130,7 +130,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 - `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
   notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
-  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureGpuCommand` (only when `gpu` is enabled), `ensureBrowser`, `updateProfile`, then
+  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBashStartup`,
+  `ensureGpuCommand` (only when `gpu` is enabled), `ensureBrowser`, `updateProfile`, then
   `Native.start(store, tier, gpu)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
   all builds, defaulting to 1; `gpu` defaults to false) and `Native.hasGpu(handle)` recorded as `gpuAvailable`. On Alpine, `Rootfs.ensureOpenRc` checks the store and installs a missing OpenRC
   before publishing the kernel handle. If it installs or resumes, it runs inittab on this thread.
