@@ -328,6 +328,9 @@ struct appine_dbt {
      * read without the lock. A replaced old array hangs off the new one's older and is freed when
      * the instance returns to the pool */
     struct shared_ranges *shared;
+    /* Registered libc memop entry PCs (appine_dbt_set_memops), sorted by pc; read without the lock
+     * and retired onto older like shared */
+    struct memop_table *memops;
     unsigned next_tag; /* next tag that can be allocated (appine_dbt_new_tag) */
     uint64_t nogroup[NOGROUP_MAX];
     unsigned nogroup_count;
@@ -356,6 +359,13 @@ struct shared_ranges {
     uint64_t r[][2];
 };
 
+/* Registered memop entry PCs, sorted by pc */
+struct memop_table {
+    struct memop_table *older;
+    unsigned n;
+    struct appine_dbt_memop ops[];
+};
+
 /* Whether pc is in a registered mapping (without the lock) */
 static bool in_shared(const struct appine_dbt *d, uint64_t pc)
 {
@@ -373,6 +383,25 @@ static bool in_shared(const struct appine_dbt *d, uint64_t pc)
             return true;
     }
     return false;
+}
+
+/* Registered memop kind for pc, or APPINE_MEMOP_NONE (without the lock) */
+static uint32_t find_memop(const struct appine_dbt *d, uint64_t pc)
+{
+    const struct memop_table *m = __atomic_load_n(&d->memops, __ATOMIC_ACQUIRE);
+    if (!m || !m->n)
+        return APPINE_MEMOP_NONE;
+    unsigned lo = 0, hi = m->n;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) / 2;
+        if (pc < m->ops[mid].pc)
+            hi = mid;
+        else if (pc > m->ops[mid].pc)
+            lo = mid + 1;
+        else
+            return m->ops[mid].kind;
+    }
+    return APPINE_MEMOP_NONE;
 }
 
 /* The part a thread uses to run in an address space: jump cache, shadow return stack and
@@ -3044,6 +3073,7 @@ static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64
 struct prep {
     uint64_t pc;
     unsigned tag; /* private block: tag of the member it belongs to (TAG_SHIFT) */
+    uint32_t memop_kind; /* registration observed while translating */
     const uint32_t *guest; /* host location of the guest words: compared again before installing */
     uint32_t nguest;
     uint32_t words[MAX_BLOCK_INSNS]; /* guest instruction words read at translation */
@@ -3270,8 +3300,13 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     /* Read the grouping records without the lock: reading stale ones only affects grouping, which
      * is undone again when a check fails (ungroup) */
     uint64_t key = d->nogroup_count ? nogroup_key(d, pc) : 0;
+    /* Blocks at registered memop entry PCs emit a threshold check and bypass the process-global
+     * template arena so they never pollute other address spaces or miss the check. In a code group,
+     * only shared (tag 0) mappings carry group-admitted memops. */
+    uint32_t memop_kind = p->tag ? APPINE_MEMOP_NONE : find_memop(d, pc);
+    p->memop_kind = memop_kind;
     t->stats.blocks++;
-    if (template_fetch(pc, guest, key, d->r, !p->tag, p, t->scratch, &t->stats))
+    if (!memop_kind && template_fetch(pc, guest, key, d->r, !p->tag, p, t->scratch, &t->stats))
         return true;
 
     struct appine_dbt_stats before = t->stats;
@@ -3300,6 +3335,13 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     emit(x, enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, pending)));
     emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_KICK, pc);
     _Static_assert(ENTRY_CHECK_WORDS == 2, "the length of the block entry check");
+
+    if (memop_kind) {
+        /* All registered memops take byte count n in X2; route n >= 128 to the dispatcher while
+         * preserving NZCV and keeping small operations inline in Tier 1. */
+        emit(x, enc_ubfx(T0, 2, 7, 57));
+        emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_INTERP, pc);
+    }
 
     uint32_t nguest = 0;
     for (;; nguest++) {
@@ -3352,7 +3394,8 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
 
     if (x->nrelocs > MAX_RELOCS)
         appine_guard_fail();
-    template_store(pc, guest, nguest, key, x, &before, p->links, p->nlinks);
+    if (!memop_kind)
+        template_store(pc, guest, nguest, key, x, &before, p->links, p->nlinks);
     p->nguest = nguest;
     p->host = x->buf;
     p->nhost = (uint32_t)x->n;
@@ -3369,9 +3412,10 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
  */
 static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct syncs *sync, struct fresh *f)
 {
-    /* Another thread rewrote this code during translation (this block was not in the table yet
-     * when it invalidated): retranslate */
-    if (memcmp(p->guest, p->words, p->nguest * 4) != 0)
+    /* This block was not in the cache when another thread changed its code or registration.
+     * Recheck both under the lock before publishing it. */
+    uint32_t memop_kind = p->tag ? APPINE_MEMOP_NONE : find_memop(d, p->pc);
+    if (memop_kind != p->memop_kind || memcmp(p->guest, p->words, p->nguest * 4) != 0)
         return STALE;
     /* When three quarters of the table are non-empty, rebuild it at the same size if tombstones
      * are at least half, otherwise double it; when blocks is full, remove the invalidated blocks'
@@ -3818,9 +3862,39 @@ static void drop_shared(struct appine_dbt *d)
     d->shared = NULL;
 }
 
+/* Free the registered memop tables (appine_dbt_set_memops) and clear d->memops; no thread is using
+ * this instance */
+static void drop_memops(struct appine_dbt *d)
+{
+    for (struct memop_table *m = d->memops, *older; m; m = older) {
+        older = m->older;
+        free(m);
+    }
+    d->memops = NULL;
+}
+
+/* Retire every live or parked block starting at `pc`. Returns false if the code cache has no room
+ * for a forwarding stub. Lock held (or no threads attached). */
+static bool retire_pc(struct appine_dbt *d, struct retire_batch *r, uint64_t pc)
+{
+    uint64_t page = pc >> APPINE_PAGE_SHIFT;
+    for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
+        struct block *b = &d->blocks[i - 1];
+        if (!b->code || b->pc != pc)
+            continue;
+        if (b->parked) {
+            kill_parked(d, b);
+        } else if (!retire_add(d, r, b, false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void release(struct appine_dbt *d)
 {
     drop_shared(d);
+    drop_memops(d);
     pthread_mutex_lock(&pool.lock);
     if (d->prev_instance) {
         *d->prev_instance = d->next_instance;
@@ -3948,6 +4022,24 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
         pthread_mutex_unlock(&pool.lock);
     }
     drop_shared(d);
+    /* Retire any memop-specialized blocks before returning the instance to the pool so the next
+     * user never inherits memop checks from the previous address space. */
+    if (keep && d->memops && d->memops->n) {
+        struct retire_batch r = {.n = 0};
+        for (unsigned i = 0; i < d->memops->n; i++) {
+            if (!retire_pc(d, &r, d->memops->ops[i].pc)) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            retire_flush(d, &r);
+            words = d->used_words - d->routine_words;
+            if (words > POOL_KEEP_WORDS)
+                keep = false;
+        }
+    }
+    drop_memops(d);
     if (keep) {
         drop_private(d);
         d->stale = d->table_count > 0;
@@ -4401,6 +4493,269 @@ void appine_dbt_set_sources(struct appine_dbt *d, const struct appine_dbt_source
     pthread_mutex_unlock(&d->lock);
 }
 
+static int memop_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const struct appine_dbt_memop *)a)->pc;
+    uint64_t y = ((const struct appine_dbt_memop *)b)->pc;
+    return x < y ? -1 : x > y;
+}
+
+void appine_dbt_set_memops(struct appine_dbt *d, const struct appine_dbt_memop *ops, size_t n)
+{
+    if (!d)
+        return;
+    struct appine_dbt_memop sorted[APPINE_DBT_MEMOPS];
+    unsigned count = 0;
+    for (size_t i = 0; i < n && count < APPINE_DBT_MEMOPS; i++) {
+        uint64_t pc = ops[i].pc;
+        uint32_t kind = ops[i].kind;
+        if (!kind || kind > APPINE_MEMOP_STRNCMP || (pc & (3 | ~PC_MASK)))
+            continue;
+        sorted[count++] = (struct appine_dbt_memop){.pc = pc, .kind = kind, .reserved = 0};
+    }
+    if (count > 1) {
+        qsort(sorted, count, sizeof(sorted[0]), memop_cmp);
+        unsigned unique = 1;
+        for (unsigned i = 1; i < count; i++) {
+            if (sorted[i].pc != sorted[unique - 1].pc)
+                sorted[unique++] = sorted[i];
+        }
+        count = unique;
+    }
+    struct memop_table *m = malloc(sizeof(*m) + count * sizeof(m->ops[0]));
+    if (!m)
+        return;
+    m->n = count;
+    if (count)
+        memcpy(m->ops, sorted, count * sizeof(m->ops[0]));
+
+    pthread_mutex_lock(&d->lock);
+    struct memop_table *old = d->memops;
+    unsigned old_n = old ? old->n : 0;
+    if (old_n == count && (!count || memcmp(old->ops, m->ops, count * sizeof(m->ops[0])) == 0)) {
+        pthread_mutex_unlock(&d->lock);
+        free(m);
+        return;
+    }
+    /* Publish the new table before retiring changed blocks so any thread retranslating a retired
+     * block sees the updated registrations, and any in-flight R_INTERP at a removed PC sees NONE. */
+    m->older = old;
+    __atomic_store_n(&d->memops, m, __ATOMIC_RELEASE);
+    d->st = &spare_stats;
+    struct retire_batch r = {.n = 0};
+    unsigned oi = 0, ni = 0;
+    bool ok = true;
+    while (ok && (oi < old_n || ni < count)) {
+        uint64_t pc;
+        if (oi < old_n && ni < count && old->ops[oi].pc == m->ops[ni].pc) {
+            bool same = old->ops[oi].kind == m->ops[ni].kind;
+            pc = m->ops[ni].pc;
+            oi++;
+            ni++;
+            if (same)
+                continue;
+        } else if (ni >= count || (oi < old_n && old->ops[oi].pc < m->ops[ni].pc)) {
+            pc = old->ops[oi++].pc;
+        } else {
+            pc = m->ops[ni++].pc;
+        }
+        ok = retire_pc(d, &r, pc);
+    }
+    if (!ok)
+        __atomic_store_n(&d->flush_wanted, true, __ATOMIC_SEQ_CST);
+    retire_flush(d, &r);
+    pthread_mutex_unlock(&d->lock);
+}
+
+#define MEMOP_MAX_BYTES (UINT64_C(64) << 20)
+
+static bool memop_check_range(const struct appine_mmu *mmu, uint64_t addr, uint64_t n, uint32_t prot)
+{
+    if (n == 0)
+        return true;
+    if (addr + n < addr)
+        return false;
+    uint64_t p = addr & ~PAGE_MASK;
+    uint64_t end = (addr + n - 1) & ~PAGE_MASK;
+    for (;;) {
+        if (!appine_mmu_translate(mmu, p, prot))
+            return false;
+        if (p == end)
+            return true;
+        p += APPINE_PAGE_SIZE;
+    }
+}
+
+static bool exec_memop(struct appine_cpu *c, uint32_t kind)
+{
+    if (UNLIKELY(c->nwatch != 0))
+        return false;
+    const struct appine_mmu *mmu = c->mmu;
+    switch (kind) {
+    case APPINE_MEMOP_MEMSET: {
+        uint64_t dst = untag(c->x[0]), n = c->x[2];
+        int val = (int)(c->x[1] & 0xff);
+        if (n > MEMOP_MAX_BYTES || !memop_check_range(mmu, dst, n, APPINE_PROT_WRITE))
+            return false;
+        uint64_t cur = dst, rem = n;
+        while (rem > 0) {
+            uint64_t off = cur & PAGE_MASK;
+            uint64_t chunk = APPINE_PAGE_SIZE - off;
+            if (chunk > rem)
+                chunk = rem;
+            uint8_t *hp = (uint8_t *)appine_mmu_translate(mmu, cur & ~PAGE_MASK, APPINE_PROT_WRITE);
+            if (UNLIKELY(!hp))
+                return false;
+            memset(hp + off, val, chunk);
+            cur += chunk;
+            rem -= chunk;
+        }
+        return true;
+    }
+    case APPINE_MEMOP_MEMCPY:
+    case APPINE_MEMOP_MEMMOVE: {
+        uint64_t dst = untag(c->x[0]), src = untag(c->x[1]), n = c->x[2];
+        if (n > MEMOP_MAX_BYTES)
+            return false;
+        if (dst == src || n == 0)
+            return true;
+        if (!memop_check_range(mmu, dst, n, APPINE_PROT_WRITE) ||
+            !memop_check_range(mmu, src, n, APPINE_PROT_READ))
+            return false;
+        if (dst > src && dst < src + n) {
+            uint64_t rem = n;
+            while (rem > 0) {
+                uint64_t d_end = dst + rem;
+                uint64_t s_end = src + rem;
+                uint64_t d_off = (d_end - 1) & PAGE_MASK;
+                uint64_t s_off = (s_end - 1) & PAGE_MASK;
+                uint64_t chunk = d_off + 1;
+                if (s_off + 1 < chunk)
+                    chunk = s_off + 1;
+                if (chunk > rem)
+                    chunk = rem;
+                uint64_t d_cur = d_end - chunk;
+                uint64_t s_cur = s_end - chunk;
+                uint8_t *dh = (uint8_t *)appine_mmu_translate(mmu, d_cur & ~PAGE_MASK, APPINE_PROT_WRITE);
+                uint8_t *sh = (uint8_t *)appine_mmu_translate(mmu, s_cur & ~PAGE_MASK, APPINE_PROT_READ);
+                if (UNLIKELY(!dh || !sh))
+                    return false;
+                memmove(dh + (d_cur & PAGE_MASK), sh + (s_cur & PAGE_MASK), chunk);
+                rem -= chunk;
+            }
+        } else {
+            uint64_t d_cur = dst, s_cur = src, rem = n;
+            while (rem > 0) {
+                uint64_t d_off = d_cur & PAGE_MASK;
+                uint64_t s_off = s_cur & PAGE_MASK;
+                uint64_t chunk = APPINE_PAGE_SIZE - d_off;
+                if (APPINE_PAGE_SIZE - s_off < chunk)
+                    chunk = APPINE_PAGE_SIZE - s_off;
+                if (chunk > rem)
+                    chunk = rem;
+                uint8_t *dh = (uint8_t *)appine_mmu_translate(mmu, d_cur & ~PAGE_MASK, APPINE_PROT_WRITE);
+                uint8_t *sh = (uint8_t *)appine_mmu_translate(mmu, s_cur & ~PAGE_MASK, APPINE_PROT_READ);
+                if (UNLIKELY(!dh || !sh))
+                    return false;
+                memmove(dh + d_off, sh + s_off, chunk);
+                d_cur += chunk;
+                s_cur += chunk;
+                rem -= chunk;
+            }
+        }
+        return true;
+    }
+    case APPINE_MEMOP_MEMCMP: {
+        uint64_t a_cur = untag(c->x[0]), b_cur = untag(c->x[1]), rem = c->x[2];
+        if (rem > MEMOP_MAX_BYTES)
+            return false;
+        while (rem > 0) {
+            uint64_t a_off = a_cur & PAGE_MASK;
+            uint64_t b_off = b_cur & PAGE_MASK;
+            uint64_t chunk = APPINE_PAGE_SIZE - a_off;
+            if (APPINE_PAGE_SIZE - b_off < chunk)
+                chunk = APPINE_PAGE_SIZE - b_off;
+            if (chunk > rem)
+                chunk = rem;
+            uint8_t *ah = (uint8_t *)appine_mmu_translate(mmu, a_cur & ~PAGE_MASK, APPINE_PROT_READ);
+            uint8_t *bh = (uint8_t *)appine_mmu_translate(mmu, b_cur & ~PAGE_MASK, APPINE_PROT_READ);
+            if (UNLIKELY(!ah || !bh))
+                return false;
+            int r = memcmp(ah + a_off, bh + b_off, chunk);
+            if (r != 0) {
+                c->x[0] = (uint64_t)(int64_t)r;
+                return true;
+            }
+            a_cur += chunk;
+            b_cur += chunk;
+            rem -= chunk;
+        }
+        c->x[0] = 0;
+        return true;
+    }
+    case APPINE_MEMOP_MEMCHR: {
+        uint64_t base = c->x[0], start = untag(base), cur = start, rem = c->x[2];
+        int ch = (int)(c->x[1] & 0xff);
+        if (rem > MEMOP_MAX_BYTES)
+            return false;
+        while (rem > 0) {
+            uint64_t off = cur & PAGE_MASK;
+            uint64_t chunk = APPINE_PAGE_SIZE - off;
+            if (chunk > rem)
+                chunk = rem;
+            uint8_t *hp = (uint8_t *)appine_mmu_translate(mmu, cur & ~PAGE_MASK, APPINE_PROT_READ);
+            if (UNLIKELY(!hp))
+                return false;
+            uint8_t *f = (uint8_t *)memchr(hp + off, ch, chunk);
+            if (f) {
+                c->x[0] = base + (cur - start) + (uint64_t)(f - (hp + off));
+                return true;
+            }
+            cur += chunk;
+            rem -= chunk;
+        }
+        c->x[0] = 0;
+        return true;
+    }
+    case APPINE_MEMOP_STRNCMP: {
+        uint64_t a_cur = untag(c->x[0]), b_cur = untag(c->x[1]), rem = c->x[2];
+        if (rem > MEMOP_MAX_BYTES)
+            return false;
+        while (rem > 0) {
+            uint64_t a_off = a_cur & PAGE_MASK;
+            uint64_t b_off = b_cur & PAGE_MASK;
+            uint64_t chunk = APPINE_PAGE_SIZE - a_off;
+            if (APPINE_PAGE_SIZE - b_off < chunk)
+                chunk = APPINE_PAGE_SIZE - b_off;
+            if (chunk > rem)
+                chunk = rem;
+            uint8_t *ah = (uint8_t *)appine_mmu_translate(mmu, a_cur & ~PAGE_MASK, APPINE_PROT_READ);
+            uint8_t *bh = (uint8_t *)appine_mmu_translate(mmu, b_cur & ~PAGE_MASK, APPINE_PROT_READ);
+            if (UNLIKELY(!ah || !bh))
+                return false;
+            uint8_t *za = (uint8_t *)memchr(ah + a_off, 0, chunk);
+            uint64_t span = za ? (uint64_t)(za - (ah + a_off)) + 1 : chunk;
+            int r = memcmp(ah + a_off, bh + b_off, span);
+            if (r != 0) {
+                c->x[0] = (uint64_t)(int64_t)r;
+                return true;
+            }
+            if (za) {
+                c->x[0] = 0;
+                return true;
+            }
+            a_cur += chunk;
+            b_cur += chunk;
+            rem -= chunk;
+        }
+        c->x[0] = 0;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 void appine_dbt_trust(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
 {
     pthread_mutex_lock(&d->lock);
@@ -4699,6 +5054,21 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             }
             /* fallthrough */
         case R_INTERP: {
+            if ((reason & REASON_MASK) == R_INTERP && (!t->tag || in_shared(d, c->pc))) {
+                uint32_t kind = find_memop(d, c->pc);
+                if (kind && exec_memop(c, kind)) {
+                    /* Pop the caller's predicted return if it matches X30, keeping the shadow
+                     * return stack aligned after bypassing the guest RET. */
+                    uint64_t *top = (uint64_t *)c->dbt_rs;
+                    if (top && top[0] == c->x[30]) {
+                        uintptr_t p = (uintptr_t)top;
+                        uintptr_t mask = (1u << RS_SHIFT) - 1;
+                        c->dbt_rs = (void *)((p & ~mask) | ((p - 16) & mask));
+                    }
+                    c->pc = c->x[30];
+                    break;
+                }
+            }
             t->stats.exits_interp++;
             enum appine_exit r = appine_interp_step(c);
             /*
@@ -4797,6 +5167,13 @@ void appine_dbt_set_sources(struct appine_dbt *d, const struct appine_dbt_source
 {
     (void)d;
     (void)s;
+    (void)n;
+}
+
+void appine_dbt_set_memops(struct appine_dbt *d, const struct appine_dbt_memop *ops, size_t n)
+{
+    (void)d;
+    (void)ops;
     (void)n;
 }
 

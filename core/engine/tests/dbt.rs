@@ -6,8 +6,9 @@
 use std::ptr::NonNull;
 
 use appine_engine::{
-    Access, Cpu, Dbt, DbtRegs, DbtSource, DbtSpace, Exit, FaultKind, Mmu, PAGE_SIZE, WATCH_LOAD,
-    WATCH_STORE, prot,
+    Access, Cpu, Dbt, DbtMemop, DbtRegs, DbtSource, DbtSpace, Exit, FaultKind, MEMOP_MEMCHR,
+    MEMOP_MEMCMP, MEMOP_MEMCPY, MEMOP_MEMMOVE, MEMOP_MEMSET, MEMOP_STRNCMP, Mmu, PAGE_SIZE,
+    WATCH_LOAD, WATCH_STORE, prot,
 };
 
 #[repr(C, align(4096))]
@@ -1138,6 +1139,422 @@ fn watchpoints_stop_inside_shared_checks_and_atomics() {
     );
     assert_eq!(g.cpu.state().pc, f);
     assert_eq!(g.data(4, 0x200), after);
+}
+
+#[test]
+fn memops_accelerate_large_and_preserve_small_and_fallbacks() {
+    let Some(space) = DbtSpace::new(0, DbtRegs::Default) else {
+        return;
+    };
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
+    let mut g = Guest::with_data();
+
+    // Stub functions at distinct entry PCs: if guest code runs (small n < 128 or fallback), they
+    // return sentinel 0x7777; if exec_memop runs, it completes the operation and returns via x30.
+    let f_memset = CODE + 0x100;
+    let f_memcpy = CODE + 0x120;
+    let f_memmove = CODE + 0x140;
+    let f_memcmp = CODE + 0x160;
+    let f_memchr = CODE + 0x180;
+    let f_strncmp = CODE + 0x1a0;
+    for pc in [f_memset, f_memcpy, f_memmove, f_memcmp, f_memchr, f_strncmp] {
+        g.code(pc, &[movz_x0(0x7777), RET]);
+    }
+    space.set_memops(&[
+        DbtMemop {
+            pc: f_memset,
+            kind: MEMOP_MEMSET,
+            reserved: 0,
+        },
+        DbtMemop {
+            pc: f_memcpy,
+            kind: MEMOP_MEMCPY,
+            reserved: 0,
+        },
+        DbtMemop {
+            pc: f_memmove,
+            kind: MEMOP_MEMMOVE,
+            reserved: 0,
+        },
+        DbtMemop {
+            pc: f_memcmp,
+            kind: MEMOP_MEMCMP,
+            reserved: 0,
+        },
+        DbtMemop {
+            pc: f_memchr,
+            kind: MEMOP_MEMCHR,
+            reserved: 0,
+        },
+        DbtMemop {
+            pc: f_strncmp,
+            kind: MEMOP_STRNCMP,
+            reserved: 0,
+        },
+    ]);
+
+    let caller = CODE + 0x40;
+    g.code(caller, &[0xd63f_0120, SVC]); // blr x9; svc #0
+    let call = |g: &mut Guest, dbt: &mut Dbt, target: u64, x0: u64, x1: u64, x2: u64| -> u64 {
+        let s = g.cpu.state_mut();
+        s.x[9] = target;
+        s.x[0] = x0;
+        s.x[1] = x1;
+        s.x[2] = x2;
+        g.run_at(dbt, caller)
+    };
+
+    // Small operations (n < 128) stay inline in Tier 1 and execute the guest stub.
+    assert_eq!(call(&mut g, &mut dbt, f_memset, DATA, 0x5a, 127), 0x7777);
+    assert_eq!(
+        call(&mut g, &mut dbt, f_memcpy, DATA, DATA + 0x100, 64),
+        0x7777
+    );
+
+    // Cross-page memset across scattered host pages (DATA + 2*4096 and DATA + 3*4096 are reversed
+    // in host memory).
+    let p2_end = before_page(3, 64);
+    assert_eq!(call(&mut g, &mut dbt, f_memset, p2_end, 0xa5, 256), p2_end);
+    assert!(g.pages[6].0[4096 - 64..].iter().all(|&b| b == 0xa5));
+    assert!(g.pages[5].0[..192].iter().all(|&b| b == 0xa5));
+
+    // Cross-page memcpy from DATA + 0 (pages 3, 4) into DATA + 2*4096 (scattered pages 6, 5).
+    for (i, b) in g.pages[3].0[4096 - 100..].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(3).wrapping_add(1);
+    }
+    for (i, b) in g.pages[4].0[..200].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(5).wrapping_add(7);
+    }
+    let src = before_page(1, 100);
+    let dst = before_page(3, 100);
+    assert_eq!(call(&mut g, &mut dbt, f_memcpy, dst, src, 300), dst);
+    assert_eq!(&g.pages[6].0[4096 - 100..], &g.pages[3].0[4096 - 100..]);
+    assert_eq!(&g.pages[5].0[..200], &g.pages[4].0[..200]);
+
+    // Overlapping memmove in both directions across a scattered page boundary.
+    let expected: Vec<u8> = g.pages[6].0[4096 - 100..]
+        .iter()
+        .chain(&g.pages[5].0[..156])
+        .copied()
+        .collect();
+    // Backward copy: dst > src, overlapping across page 2 -> page 3.
+    let dst_fwd = dst + 32;
+    assert_eq!(
+        call(&mut g, &mut dbt, f_memmove, dst_fwd, dst, 256),
+        dst_fwd
+    );
+    let moved_fwd: Vec<u8> = g.pages[6].0[4096 - 68..]
+        .iter()
+        .chain(&g.pages[5].0[..188])
+        .copied()
+        .collect();
+    assert_eq!(moved_fwd, expected);
+    // Forward copy: dst < src, moving back to dst.
+    assert_eq!(call(&mut g, &mut dbt, f_memmove, dst, dst_fwd, 256), dst);
+    let moved_back: Vec<u8> = g.pages[6].0[4096 - 100..]
+        .iter()
+        .chain(&g.pages[5].0[..156])
+        .copied()
+        .collect();
+    assert_eq!(moved_back, expected);
+
+    // memcmp equal and differing across pages.
+    assert_eq!(call(&mut g, &mut dbt, f_memcmp, src, dst, 256), 0);
+    g.pages[5].0[10] = g.pages[4].0[10].wrapping_add(1);
+    let cmp = call(&mut g, &mut dbt, f_memcmp, src, dst, 256) as i64;
+    assert!(cmp < 0, "expected negative memcmp result, got {cmp}");
+
+    // memchr across pages, preserving a TBI top-byte tag on the returned pointer.
+    g.pages[6].0[4096 - 100..].fill(b'x');
+    g.pages[5].0[..200].fill(b'x');
+    g.pages[5].0[42] = b'Z';
+    let tagged_dst = dst | (0xab_u64 << 56);
+    assert_eq!(
+        call(&mut g, &mut dbt, f_memchr, tagged_dst, b'Z' as u64, 300),
+        tagged_dst + 142
+    );
+    assert_eq!(
+        call(&mut g, &mut dbt, f_memchr, tagged_dst, b'Q' as u64, 300),
+        0
+    );
+
+    // strncmp stops at NUL before n and distinguishes differing bytes.
+    g.pages[3].0[4096 - 100..].fill(b'a');
+    g.pages[4].0[..200].fill(b'a');
+    g.pages[6].0[4096 - 100..].fill(b'a');
+    g.pages[5].0[..200].fill(b'a');
+    g.pages[4].0[50] = 0;
+    g.pages[5].0[50] = 0;
+    g.pages[4].0[51] = b'1';
+    g.pages[5].0[51] = b'2';
+    assert_eq!(call(&mut g, &mut dbt, f_strncmp, src, dst, 256), 0);
+    g.pages[4].0[49] = b'b';
+    assert!((call(&mut g, &mut dbt, f_strncmp, src, dst, 256) as i64) > 0);
+
+    // Watchpoint active: exec_memop must decline and fall back to guest code.
+    let watched = DATA + 4 * PAGE_SIZE;
+    g.cpu
+        .state_mut()
+        .set_hw_debug(&[], &[(watched, watched + 8, WATCH_STORE)]);
+    assert_eq!(call(&mut g, &mut dbt, f_memset, watched, 0x33, 256), 0x7777);
+    g.cpu.state_mut().set_hw_debug(&[], &[]);
+
+    // Precise fault pre-validation: a memset crossing from writable page 4 into read-only page 5
+    // must leave page 4 untouched and fall back to guest code.
+    g.pages[7].0[4096 - 64..].fill(0x11);
+    let ro_cross = before_page(5, 64);
+    assert_eq!(
+        call(&mut g, &mut dbt, f_memset, ro_cross, 0xee, 256),
+        0x7777
+    );
+    assert!(g.pages[7].0[4096 - 64..].iter().all(|&b| b == 0x11));
+
+    // Shadow return stack stays aligned across a nested caller -> memop call -> caller ret.
+    let outer = CODE + 0x200;
+    let inner = CODE + 0x220;
+    g.code(outer, &[bl(outer, inner), SVC]);
+    g.code(
+        inner,
+        &[STP_FP_LR_PRE, bl(inner + 4, f_memset), LDP_FP_LR_POST, RET],
+    );
+    let s = g.cpu.state_mut();
+    s.x[0] = DATA + 4 * PAGE_SIZE;
+    s.x[1] = 0x42;
+    s.x[2] = 256;
+    assert_eq!(g.run_at(&mut dbt, outer), DATA + 4 * PAGE_SIZE);
+    assert!(g.pages[7].0[..256].iter().all(|&b| b == 0x42));
+}
+
+#[test]
+fn memops_bypass_templates_retire_on_update_and_clear_on_pool_reuse() {
+    let Some(space_a) = DbtSpace::new(0xfeed_cafe, DbtRegs::Default) else {
+        return;
+    };
+    let mut g = Guest::with_data();
+    let f = CODE + 0x300;
+    let caller = CODE + 0x340;
+    g.code(f, &[movz_x0(0x5555), RET]);
+    g.code(caller, &[bl(caller, f), SVC]);
+
+    // 1. Populate the global template arena from an instance WITHOUT memops first.
+    {
+        let space_plain = DbtSpace::new(0, DbtRegs::Default).unwrap();
+        let mut dbt_plain = Dbt::attach(&space_plain, 0).unwrap();
+        let s = g.cpu.state_mut();
+        s.x[0] = DATA;
+        s.x[1] = 0x99;
+        s.x[2] = 256;
+        assert_eq!(g.run_at(&mut dbt_plain, caller), 0x5555);
+    }
+
+    // 2. Register memop on space_a: must NOT reuse the plain template from above, and must retire
+    //    existing translations on live updates.
+    {
+        let mut dbt_a = Dbt::attach(&space_a, 0).unwrap();
+        // Translate f before registering memop.
+        let s = g.cpu.state_mut();
+        s.x[0] = DATA;
+        s.x[1] = 0x99;
+        s.x[2] = 256;
+        assert_eq!(g.run_at(&mut dbt_a, caller), 0x5555);
+
+        // Register memop dynamically: existing block at f must be retired.
+        space_a.set_memops(&[DbtMemop {
+            pc: f,
+            kind: MEMOP_MEMSET,
+            reserved: 0,
+        }]);
+        let s = g.cpu.state_mut();
+        s.x[0] = DATA;
+        s.x[1] = 0x99;
+        s.x[2] = 256;
+        assert_eq!(g.run_at(&mut dbt_a, caller), DATA);
+        assert!(g.pages[3].0[..256].iter().all(|&b| b == 0x99));
+
+        // Remove memop dynamically: must immediately revert to guest code.
+        space_a.set_memops(&[]);
+        g.pages[3].0[..256].fill(0);
+        let s = g.cpu.state_mut();
+        s.x[0] = DATA;
+        s.x[1] = 0x88;
+        s.x[2] = 256;
+        assert_eq!(g.run_at(&mut dbt_a, caller), 0x5555);
+        assert!(g.pages[3].0[..256].iter().all(|&b| b == 0));
+
+        // Re-register before returning space_a to the pool.
+        space_a.set_memops(&[DbtMemop {
+            pc: f,
+            kind: MEMOP_MEMSET,
+            reserved: 0,
+        }]);
+        let s = g.cpu.state_mut();
+        s.x[0] = DATA;
+        s.x[1] = 0x77;
+        s.x[2] = 256;
+        assert_eq!(g.run_at(&mut dbt_a, caller), DATA);
+    }
+
+    // 3. Another fresh space without memops must NOT be polluted by space_a's memop translation.
+    {
+        let space_other = DbtSpace::new(0, DbtRegs::Default).unwrap();
+        let mut dbt_other = Dbt::attach(&space_other, 0).unwrap();
+        let s = g.cpu.state_mut();
+        s.x[0] = DATA;
+        s.x[1] = 0x66;
+        s.x[2] = 256;
+        assert_eq!(g.run_at(&mut dbt_other, caller), 0x5555);
+    }
+
+    // 4. Pool reuse: dropping space_a returns it to the pool under key 0xfeed_cafe; the next
+    //    instance taking it without calling set_memops must NOT inherit space_a's memops.
+    drop(space_a);
+    let space_reused = DbtSpace::new(0xfeed_cafe, DbtRegs::Default).unwrap();
+    let mut dbt_reused = Dbt::attach(&space_reused, 0).unwrap();
+    g.pages[3].0[..256].fill(0);
+    let s = g.cpu.state_mut();
+    s.x[0] = DATA;
+    s.x[1] = 0x55;
+    s.x[2] = 256;
+    assert_eq!(g.run_at(&mut dbt_reused, caller), 0x5555);
+    assert!(g.pages[3].0[..256].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn memops_in_code_group_ignore_private_mappings() {
+    let Some(space) = DbtSpace::new(0, DbtRegs::Default) else {
+        return;
+    };
+    let mut g = Guest::with_data();
+    let f = CODE + 0x400;
+    let caller = CODE + 0x440;
+    g.code(f, &[movz_x0(0x4444), RET]);
+    g.code(caller, &[bl(caller, f), SVC]);
+
+    let tag = space.new_tag().unwrap();
+    // Register a shared range that does NOT cover f, and register f as a memop.
+    space.share(&[DbtSource {
+        start: CODE + PAGE_SIZE,
+        len: PAGE_SIZE,
+        id: [1, 2, 0, 3, 4],
+    }]);
+    space.set_memops(&[DbtMemop {
+        pc: f,
+        kind: MEMOP_MEMSET,
+        reserved: 0,
+    }]);
+
+    let mut dbt = Dbt::attach(&space, tag).unwrap();
+    let s = g.cpu.state_mut();
+    s.x[0] = DATA;
+    s.x[1] = 0x22;
+    s.x[2] = 256;
+    // f is outside shared ranges (private to this tag), so it must not use the shared memop.
+    assert_eq!(g.run_at(&mut dbt, caller), 0x4444);
+}
+
+#[test]
+fn memops_concurrent_set_memops_keeps_translations_consistent() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let Some(space) = DbtSpace::new(0, DbtRegs::Default) else {
+        return;
+    };
+    const N: usize = 16;
+    let ops: Vec<DbtMemop> = (0..N)
+        .map(|i| DbtMemop {
+            pc: CODE + 0x10 * i as u64,
+            kind: MEMOP_MEMSET,
+            reserved: 0,
+        })
+        .collect();
+    let setup = |g: &mut Guest| {
+        for i in 0..N {
+            let f = CODE + 0x10 * i as u64;
+            let caller = CODE + 0x200 + 0x10 * i as u64;
+            g.code(f, &[movz_x0(0x5555), RET]);
+            g.code(caller, &[bl(caller, f), SVC]);
+        }
+    };
+
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
+    let mut g = Guest::with_data();
+    setup(&mut g);
+
+    for final_enabled in [true, false] {
+        space.set_memops(if final_enabled { &[] } else { &ops });
+        dbt.flush();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let (space, stop, done) = (space.clone(), stop.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut dbt = Dbt::attach(&space, 0).unwrap();
+                    let mut g = Guest::with_data();
+                    setup(&mut g);
+                    let mut i = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        let caller = CODE + 0x200 + 0x10 * (i % N) as u64;
+                        g.pages[3].0[..256].fill(0);
+                        let s = g.cpu.state_mut();
+                        s.pc = caller;
+                        s.x[0] = DATA;
+                        s.x[1] = 0x7a;
+                        s.x[2] = 256;
+                        run_to_svc(&mut dbt, &mut g.cpu);
+                        let ret = g.cpu.state().x[0];
+                        if ret == DATA {
+                            assert!(g.pages[3].0[..256].iter().all(|&b| b == 0x7a));
+                        } else {
+                            assert_eq!(ret, 0x5555);
+                            assert!(g.pages[3].0[..256].iter().all(|&b| b == 0));
+                        }
+                        i += 1;
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for round in 0..32 {
+            space.set_memops(if final_enabled { &[] } else { &ops });
+            if round % 4 == 0 {
+                dbt.flush();
+            }
+            space.set_memops(if final_enabled { &ops } else { &[] });
+        }
+        // Let workers finish any in-flight translations racing the final update.
+        let target = done.load(Ordering::Relaxed) + 64;
+        while done.load(Ordering::Relaxed) < target {
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+
+        // Verify directly without calling set_memops again so any stale block installed across
+        // the final registration change is caught.
+        for i in 0..N {
+            let caller = CODE + 0x200 + 0x10 * i as u64;
+            g.pages[3].0[..256].fill(0);
+            let s = g.cpu.state_mut();
+            s.pc = caller;
+            s.x[0] = DATA;
+            s.x[1] = 0x7a;
+            s.x[2] = 256;
+            run_to_svc(&mut dbt, &mut g.cpu);
+            if final_enabled {
+                assert_eq!(g.cpu.state().x[0], DATA);
+                assert!(g.pages[3].0[..256].iter().all(|&b| b == 0x7a));
+            } else {
+                assert_eq!(g.cpu.state().x[0], 0x5555);
+                assert!(g.pages[3].0[..256].iter().all(|&b| b == 0));
+            }
+        }
+    }
 }
 
 fn bl(from: u64, to: u64) -> u32 {

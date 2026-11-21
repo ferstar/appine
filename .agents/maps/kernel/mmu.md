@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: data TLB tags and write-entry permissions)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: memop pruning and CodeGroup memop syncing)
 
 ## Responsibilities
 
@@ -64,8 +64,8 @@ Tier 1 translator with its inline TLB fast path and refill (`engine`).
   code generation applied to that space.
 - `CodeGroup` / `CodeGroups` — groups of address spaces running the same executable that share one
   `DbtSpace` (at most 256 registered trusted ranges, which only grow; each member's private
-  executable ranges as claims under its tag); the kernel keeps a list of weak references, pruned
-  when a group is founded.
+  executable ranges as claims under its tag; admitted shared `memops`); the kernel keeps a list of
+  weak references, pruned when a group is founded.
 - `Mm`'s consistency fields (`kernel/mm`): `dirty`, the `graveyard`, `code_ranges`,
   `exec_changed`, the users and the code-group membership.
 
@@ -122,10 +122,11 @@ Tier 1 translator with its inline TLB fast path and refill (`engine`).
   `rt_sigreturn`, a successful execve or execveat, a syscall a tracer or seccomp skipped, and a
   kill at the entry stop; the no-BKL fast path never changes the mm), on `ic ivau` exits (and any
   exit with an `ivau` page pending), after `write_force`, and on every address space a truncation
-  or file move changed. It re-checks the code group; returns when nothing is dirty and no code
-  changed; publishes `code_ranges` to the `CodeLog` and bumps the code generation; returns if
-  nothing is dirty and the graveyard is empty; otherwise bumps the TLB generation (when dirty),
-  runs `quiesce`, and clears the graveyard.
+  or file move changed. It re-checks the code group, prunes `Mm::memops` against invalidated or
+  non-exec/writable/written ranges and syncs group-admitted or sole-space memops to
+  `DbtSpace::set_memops`; returns when nothing is dirty and no code changed; publishes `code_ranges`
+  to the `CodeLog` and bumps the code generation; returns if nothing is dirty and the graveyard is
+  empty; otherwise bumps the TLB generation (when dirty), runs `quiesce`, and clears the graveyard.
 - `quiesce` kicks every other user of the mm and spins until none is in guest code. The kick is
   sticky, so a thread returning from a no-BKL fast syscall stops at its next guest entry. fork and
   membarrier quiesce too.

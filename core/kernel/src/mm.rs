@@ -514,6 +514,10 @@ pub struct Mm {
     /// Which register set Tier 1 uses when translating this program, chosen per program at
     /// execve (Go gets a different one).
     pub dbt_regs: appine_engine::DbtRegs,
+    /// Known libc memop entry PCs discovered in unmodified read-only executable mappings.
+    pub memops: Vec<appine_engine::DbtMemop>,
+    /// `memops` changed and must be pushed to the active `DbtSpace` at the next [`Mm::sync`].
+    memops_dirty: bool,
     /// Load address of the vDSO (signal handlers return to the sigreturn trampoline in it by
     /// default).
     pub vdso: u64,
@@ -588,6 +592,8 @@ impl Mm {
             lock_onfault: false,
             exe: None,
             dbt_regs: appine_engine::DbtRegs::Default,
+            memops: Vec::new(),
+            memops_dirty: false,
             vdso: 0,
             vdso_svc: false,
             code: (0, 0),
@@ -812,6 +818,8 @@ impl Mm {
                 tag: self.code_tag,
                 seen: Mutex::new(self.code_generation.load(Ordering::SeqCst)),
             }));
+            self.memops_dirty = true;
+            self.sync_memops();
         }
         self.code_space.clone()
     }
@@ -895,6 +903,7 @@ impl Mm {
             members: Cell::new(1),
             ranges: RefCell::new(layout),
             claims: RefCell::new(private.iter().map(|&(s, e)| (tag, s, e)).collect()),
+            memops: RefCell::new(Vec::new()),
             closed: Cell::new(false),
             shared: Cell::new(false),
         });
@@ -911,6 +920,58 @@ impl Mm {
         self.code_ranges.push((start, len));
     }
 
+    /// Drops any recorded memop entry whose PC falls in an invalidated range or no longer lies in
+    /// an unmodified read-only executable mapping.
+    pub(crate) fn prune_memops(&mut self, invalidated: &[(u64, u64)]) {
+        let before = self.memops.len();
+        self.memops.retain(|m| {
+            let hit = invalidated
+                .iter()
+                .any(|&(s, len)| m.pc >= s && m.pc - s < len);
+            if hit {
+                return false;
+            }
+            let Some((&s, v)) = self.vmas.range(..=m.pc).next_back() else {
+                return false;
+            };
+            m.pc < s + v.len
+                && (v.prot & prot::EXEC) != 0
+                && (v.prot & prot::WRITE) == 0
+                && v.backing != Backing::Shared
+                && !v.written.get()
+        });
+        if self.memops.len() != before {
+            self.memops_dirty = true;
+        }
+    }
+
+    /// Publishes discovered memop entry PCs to the active `DbtSpace`. In a `CodeGroup`, only PCs
+    /// inside the group's admitted shared ranges are merged so one member's private mappings cannot
+    /// affect another member.
+    fn sync_memops(&mut self) {
+        if !std::mem::take(&mut self.memops_dirty) {
+            return;
+        }
+        if let Some(group) = &self.code_group {
+            let ranges = group.ranges.borrow();
+            let mut gops = group.memops.borrow_mut();
+            let before = gops.len();
+            for &m in &self.memops {
+                let in_group = ranges
+                    .iter()
+                    .any(|r| m.pc >= r.start && m.pc - r.start < r.len);
+                if in_group && !gops.iter().any(|existing| existing.pc == m.pc) {
+                    gops.push(m);
+                }
+            }
+            if gops.len() != before {
+                group.space.set_memops(&gops);
+            }
+        } else if let Some(cs) = &self.code_space {
+            cs.space.set_memops(&self.memops);
+        }
+    }
+
     /// If mappings were torn down or lost permissions, does a TLB shootdown and then releases the
     /// unmapped host memory; when only code must be invalidated, it only records the ranges and
     /// bumps the generation.
@@ -918,8 +979,13 @@ impl Mm {
     /// The caller holds the BKL; `current` is the calling thread, which flushes by itself before
     /// re-entering guest code.
     pub fn sync(&mut self, current: &Arc<TaskSync>) {
+        let exec_changed = self.exec_changed;
         self.check_code_group();
         let code = std::mem::take(&mut self.code_ranges);
+        if !self.memops.is_empty() && (!code.is_empty() || exec_changed) {
+            self.prune_memops(&code);
+        }
+        self.sync_memops();
         let dirty = std::mem::take(&mut self.dirty);
         if !dirty && code.is_empty() {
             return;
@@ -980,6 +1046,7 @@ impl Mm {
             // invalidate those blocks and keep only the ones consistent with its mappings
             group.closed.set(true);
             group.space.retire_outside(&group.consistent(&layout));
+            self.memops_dirty = true;
             return;
         }
         group.members.set(group.members.get() - 1);
@@ -1676,6 +1743,16 @@ impl Mm {
             (Some(s), Some((dev, ino, _))) if !shared => content::version(s, dev, ino),
             _ => None,
         };
+        #[allow(clippy::unnecessary_cast)]
+        let bundled_libc = if !shared && prot & prot::EXEC != 0 && prot & prot::WRITE == 0 {
+            file.zip(file_id).zip(content).and_then(
+                |(((fd, _, _), (dev, ino, _)), (ctime, size))| {
+                    crate::loader::bundled_libc(fd, (dev as u64, ino as u64, ctime, size))
+                },
+            )
+        } else {
+            None
+        };
         // The host mapping is shared with other address spaces (FileMaps)
         let mut cached = false;
         let (backing, may_write, region, host) = match file {
@@ -1708,23 +1785,32 @@ impl Mm {
                     Backing::PrivateFile
                 };
                 // A read-only private mapping with a trusted version: all address spaces share one
-                // host mapping (FileMaps)
-                let key = st
-                    .as_ref()
-                    .zip(content)
-                    .filter(|_| !shared && prot & prot::WRITE == 0)
-                    .map(|(s, (ctime, size))| {
-                        #[allow(clippy::unnecessary_cast)]
-                        let (dev, ino) = (s.st_dev as u64, s.st_ino as u64);
-                        [dev, ino, offset, len, ctime, size]
-                    });
+                // host mapping (FileMaps). Verified bundled musl maps its immutable memfd snapshot
+                // under the snapshot's own (dev, ino) so it never aliases unverified mappings of
+                // the original file.
+                let key = if let Some(libc) = &bundled_libc {
+                    let (dev, ino) = libc.snapshot_id();
+                    Some([dev, ino, offset, len, 0, libc.size()])
+                } else {
+                    st.as_ref()
+                        .zip(content)
+                        .filter(|_| !shared && prot & prot::WRITE == 0)
+                        .map(|(s, (ctime, size))| {
+                            #[allow(clippy::unnecessary_cast)]
+                            let (dev, ino) = (s.st_dev as u64, s.st_ino as u64);
+                            [dev, ino, offset, len, ctime, size]
+                        })
+                };
                 if let Some((region, host)) = key.as_ref().and_then(|k| self.files.get(k)) {
                     cached = true;
                     (backing, true, region, host)
                 } else {
-                    let m = match key {
-                        Some(_) => appine_hal::map_file_read_only(fd, offset, host_len),
-                        None => appine_hal::map_file(fd, offset, host_len, shared, writable),
+                    let m = match (&bundled_libc, key) {
+                        (Some(libc), _) => libc.map(offset, host_len),
+                        (None, Some(_)) => appine_hal::map_file_read_only(fd, offset, host_len),
+                        (None, None) => {
+                            appine_hal::map_file(fd, offset, host_len, shared, writable)
+                        }
                     }
                     .map_err(Errno)?;
                     let region = Arc::new(HostRegion {
@@ -1763,7 +1849,8 @@ impl Mm {
             _ => None,
         };
         self.insert(start, len, file_len, prot, backing, may_write, region, host)?;
-        self.fills |= fill.is_some();
+        let has_fill = fill.is_some();
+        self.fills |= has_fill;
         let v = self.vmas.get_mut(&start).unwrap();
         v.file_id = file_id;
         v.content = content;
@@ -1773,6 +1860,11 @@ impl Mm {
         v.fill = fill;
         if backing == Backing::Shared && may_write {
             self.note_shared_maps(false);
+        }
+        if let (Some(libc), Some((_, offset, _))) = (bundled_libc, file) {
+            let before = self.memops.len();
+            libc.register(offset, start, len, &mut self.memops);
+            self.memops_dirty |= self.memops.len() != before;
         }
         Ok(start)
     }
@@ -3149,6 +3241,7 @@ impl Mm {
         child.auxv = self.auxv.clone();
         child.exe = self.exe;
         child.dbt_regs = self.dbt_regs;
+        child.memops = self.memops.clone();
         child.mmap_top = self.mmap_top;
         child.fills = self.fills;
         child.start_stack = self.start_stack;
@@ -4617,6 +4710,8 @@ pub struct CodeGroup {
     ranges: RefCell<Vec<appine_engine::DbtSource>>,
     /// Executable memory private to a member, `(tag, start, end)` ([`CodeGroup::admit`]).
     claims: RefCell<Vec<(u16, u64, u64)>>,
+    /// Known libc memop entry PCs inside `ranges` published to `space`.
+    memops: RefCell<Vec<appine_engine::DbtMemop>>,
     /// No longer accepts new members.
     closed: Cell<bool>,
     /// Has had more than one member: blocks outside the registered ranges have been invalidated.
@@ -6038,6 +6133,7 @@ mod tests {
             members: Cell::new(1),
             ranges: RefCell::new(vec![src(lib, 0x22000, 5, 0)]),
             claims: RefCell::new(Vec::new()),
+            memops: RefCell::new(Vec::new()),
             closed: Cell::new(false),
             shared: Cell::new(false),
         };
@@ -6098,6 +6194,7 @@ mod tests {
             members: Cell::new(1),
             ranges: RefCell::new(vec![src(lib, 0x10000, 5)]),
             claims: RefCell::new(vec![(1, 0x9000_0000, 0x9010_0000)]),
+            memops: RefCell::new(Vec::new()),
             closed: Cell::new(false),
             shared: Cell::new(false),
         };
@@ -7583,5 +7680,59 @@ mod tests {
         // The child keeps MAP_NORESERVE too
         let child = mm.fork().unwrap();
         assert!(child.borrow().vmas[&(base + 4 * mb)].noreserve);
+    }
+
+    #[test]
+    fn memops_pruned_on_unmap_mprotect_and_write_force() {
+        let mut mm = Mm::new();
+        let base = 0x2000_0000;
+        let rx = prot::READ | prot::EXEC;
+        mm.map_anonymous(base, 3 * PAGE_SIZE, rx).unwrap();
+        let pc0 = base + 0x100;
+        let pc1 = base + PAGE_SIZE + 0x100;
+        let pc2 = base + 2 * PAGE_SIZE + 0x100;
+        mm.memops = vec![
+            appine_engine::DbtMemop {
+                pc: pc0,
+                kind: appine_engine::MEMOP_MEMCPY,
+                reserved: 0,
+            },
+            appine_engine::DbtMemop {
+                pc: pc1,
+                kind: appine_engine::MEMOP_MEMSET,
+                reserved: 0,
+            },
+            appine_engine::DbtMemop {
+                pc: pc2,
+                kind: appine_engine::MEMOP_MEMMOVE,
+                reserved: 0,
+            },
+        ];
+        let cpu = unsafe { appine_engine::Cpu::new(mm.mmu()) };
+        let sync = Arc::new(TaskSync {
+            in_guest: std::sync::atomic::AtomicBool::new(false),
+            kicker: cpu.kicker(),
+            entry: crate::task::KernelEntry::default(),
+        });
+        // Removing EXEC on page 0 prunes pc0.
+        mm.mprotect(base, PAGE_SIZE, prot::READ).unwrap();
+        mm.sync(&sync);
+        assert_eq!(
+            mm.memops.iter().map(|m| m.pc).collect::<Vec<_>>(),
+            vec![pc1, pc2]
+        );
+
+        // Unmapping page 1 prunes pc1.
+        mm.munmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+        mm.sync(&sync);
+        assert_eq!(
+            mm.memops.iter().map(|m| m.pc).collect::<Vec<_>>(),
+            vec![pc2]
+        );
+
+        // Forcing a write (ptrace breakpoint) into page 2 prunes pc2.
+        mm.write_force(pc2, &0xd420_0000u32.to_le_bytes(), &sync)
+            .unwrap();
+        assert!(mm.memops.is_empty());
     }
 }
