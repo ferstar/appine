@@ -106,17 +106,30 @@ thread_local! {
 impl Machine {
     /// Creates a kernel instance: opens the inode store and creates the built-in init (pid 1).
     pub fn start(options: &MachineOptions) -> Result<Machine, RunError> {
-        crate::bug::host_call("Machine::start", || Self::start_kernel(options))
+        Self::start_with_renderer(options, None)
+    }
+
+    /// Starts a machine with a render node when the host supplied a probed renderer.
+    pub fn start_with_renderer(
+        options: &MachineOptions,
+        gpu: Option<Arc<dyn crate::gpu::Renderer>>,
+    ) -> Result<Machine, RunError> {
+        crate::bug::host_call("Machine::start", || Self::start_kernel(options, gpu))
             .unwrap_or(Err(RunError::Internal))
     }
 
-    fn start_kernel(options: &MachineOptions) -> Result<Machine, RunError> {
+    fn start_kernel(
+        options: &MachineOptions,
+        gpu: Option<Arc<dyn crate::gpu::Renderer>>,
+    ) -> Result<Machine, RunError> {
         crate::bug::install_panic_hook();
         if options.tier == Tier::Dbt && Dbt::new().is_none() {
             return Err(RunError::TierUnavailable);
         }
         let vfs = match &options.rootfs {
-            Some(dir) => Some(Rc::new(Vfs::open(dir).map_err(RunError::Rootfs)?)),
+            Some(dir) => Some(Rc::new(
+                Vfs::open_with_gpu(dir, gpu.is_some()).map_err(RunError::Rootfs)?,
+            )),
             None => None,
         };
         appine_hal::raise_fd_limit();
@@ -136,6 +149,7 @@ impl Machine {
                 vfs.store().guard_with_bkl(shared.id());
             }
             k.vfs = vfs;
+            k.gpu = gpu;
             k.oom.limit = options
                 .memory_limit
                 .unwrap_or_else(crate::oom::default_limit);

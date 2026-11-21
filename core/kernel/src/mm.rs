@@ -669,6 +669,7 @@ impl Mm {
             anonymous: None,
             reserved: false,
             foreign: true,
+            gpu: None,
         });
         self.insert(
             start,
@@ -1688,22 +1689,44 @@ impl Mm {
         self.map(addr, len, prot, flags, file, Some(fill))
     }
 
-    fn map(
+    /// Maps a range owned by the GPU backend directly into the guest page table.
+    pub(crate) fn mmap_gpu(
         &mut self,
         addr: u64,
         len: u64,
         prot: u32,
         flags: u32,
-        file: Option<(i32, u64, bool)>,
-        fill: Option<Rc<Fill>>,
+        mapping: Arc<dyn crate::gpu::Mapping>,
     ) -> Result<u64, Errno> {
-        let len = page_up(len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
-        let shared = flags & 3 == flags::MAP_SHARED;
-        if !shared && flags & 3 != flags::MAP_PRIVATE {
+        let len = page_up(len).filter(|&n| n != 0).ok_or(Errno::EINVAL)?;
+        if len > mapping.size() as u64
+            || !mapping
+                .base()
+                .as_ptr()
+                .addr()
+                .is_multiple_of(PAGE_SIZE as usize)
+        {
             return Err(Errno::EINVAL);
         }
+        let start = self.mapping_address(addr, len, flags)?;
+        let host = mapping.base();
+        let region = Arc::new(HostRegion {
+            base: host,
+            len: len as usize,
+            anonymous: None,
+            reserved: false,
+            foreign: false,
+            gpu: Some(mapping),
+        });
+        self.insert(start, len, len, prot, Backing::Shared, true, region, host)?;
+        self.deny_exec(start, len);
+        self.note_shared_maps(false);
+        Ok(start)
+    }
+
+    fn mapping_address(&mut self, addr: u64, len: u64, flags: u32) -> Result<u64, Errno> {
         let fixed = flags & (flags::MAP_FIXED | flags::MAP_FIXED_NOREPLACE) != 0;
-        let start = if fixed {
+        Ok(if fixed {
             if !addr.is_multiple_of(PAGE_SIZE)
                 || addr.checked_add(len).is_none_or(|e| e > 1 << VA_BITS)
             {
@@ -1727,7 +1750,24 @@ impl Mm {
             } else {
                 self.find_free(len).ok_or(Errno::ENOMEM)?
             }
-        };
+        })
+    }
+
+    fn map(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u32,
+        flags: u32,
+        file: Option<(i32, u64, bool)>,
+        fill: Option<Rc<Fill>>,
+    ) -> Result<u64, Errno> {
+        let len = page_up(len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
+        let shared = flags & 3 == flags::MAP_SHARED;
+        if !shared && flags & 3 != flags::MAP_PRIVATE {
+            return Err(Errno::EINVAL);
+        }
+        let start = self.mapping_address(addr, len, flags)?;
 
         let st = file.and_then(|(fd, ..)| appine_hal::fstat(fd).ok());
         let file_id = st
@@ -1819,6 +1859,7 @@ impl Mm {
                         anonymous: None,
                         reserved: false,
                         foreign: false,
+                        gpu: None,
                     });
                     if let Some(key) = key {
                         self.files.insert(key, region.clone(), m.ptr);
@@ -2140,7 +2181,7 @@ impl Mm {
             }
             self.munmap(dst, new_len)?;
         }
-        if v.backing != Backing::Shared || v.foreign() {
+        if v.backing != Backing::Shared || v.foreign() || v.region.gpu.is_some() {
             return Err(Errno::EINVAL);
         }
         let dst = match fixed {
@@ -2181,7 +2222,7 @@ impl Mm {
         len: u64,
         file: Option<i32>,
     ) -> Result<Vma, Errno> {
-        if template.foreign() {
+        if template.foreign() || template.region.gpu.is_some() {
             return Err(Errno::EFAULT);
         }
         // (host memory, host address, fd kept for a shared mapping, bytes with file contents)
@@ -2207,6 +2248,7 @@ impl Mm {
                     anonymous: None,
                     reserved: false,
                     foreign: false,
+                    gpu: None,
                 });
                 let file_len = file_extent(raw, file_offset, len);
                 (region, m.ptr, Some((fd.clone(), file_offset)), file_len)
@@ -2225,6 +2267,7 @@ impl Mm {
                     anonymous: None,
                     reserved: false,
                     foreign: false,
+                    gpu: None,
                 });
                 (region, m.ptr, None, file_extent(fd, file_offset, len))
             }
@@ -2280,6 +2323,7 @@ impl Mm {
             anonymous: None,
             reserved: false,
             foreign: false,
+            gpu: None,
         });
         Ok((region, m.ptr))
     }
@@ -2752,7 +2796,7 @@ impl Mm {
                 .filter(move |(s, v)| *s + v.len > addr)
         };
         for (_, v) in overlapping() {
-            if v.locked || v.backing == Backing::Anonymous {
+            if v.locked || v.backing == Backing::Anonymous || v.region.gpu.is_some() {
                 return Err(Errno::EINVAL);
             }
             if v.backing != Backing::Shared || !v.may_write {
@@ -4301,6 +4345,7 @@ impl Mm {
                 anonymous: Some(reserve),
                 reserved: false,
                 foreign: false,
+                gpu: None,
             }),
             base,
         ))
@@ -5543,6 +5588,7 @@ struct HostRegion {
     /// Host memory the kernel layer does not own and only reads: the host's vvar page
     /// ([`Mm::map_vvar`]). Never unmapped or reused, and not counted as anyone's memory.
     foreign: bool,
+    gpu: Option<Arc<dyn crate::gpu::Mapping>>,
 }
 
 impl HostRegion {
@@ -5560,6 +5606,7 @@ impl HostRegion {
             anonymous: None,
             reserved: true,
             foreign: false,
+            gpu: None,
         })
     }
 }
@@ -5570,7 +5617,7 @@ unsafe impl Sync for HostRegion {}
 
 impl Drop for HostRegion {
     fn drop(&mut self) {
-        if self.reserved || self.foreign {
+        if self.reserved || self.foreign || self.gpu.is_some() {
             return;
         }
         let (base, len, anonymous) = (self.base, self.len, self.anonymous);
@@ -5807,6 +5854,7 @@ pub(crate) mod spare {
                 anonymous: Some(false),
                 reserved: false,
                 foreign: false,
+                gpu: None,
             }),
             base,
         ))

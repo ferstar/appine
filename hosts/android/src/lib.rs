@@ -59,6 +59,7 @@ macro_rules! guarded {
     }};
 }
 
+mod gpu;
 mod vt;
 
 /// A JNI function's body panicked ([`guarded`]): logs it, and when Kotlin expects an exception
@@ -652,8 +653,13 @@ fn not_found(env: &mut JNIEnv<'_>, what: &str, path: &str, e: appine_kernel::err
 
 // ---- The kernel ----
 
+struct RegisteredMachine {
+    machine: Arc<Machine>,
+    has_gpu: bool,
+}
+
 /// Handle → Machine (module docs).
-static MACHINES: Mutex<BTreeMap<jlong, Arc<Machine>>> = Mutex::new(BTreeMap::new());
+static MACHINES: Mutex<BTreeMap<jlong, RegisteredMachine>> = Mutex::new(BTreeMap::new());
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
 
 #[unsafe(no_mangle)]
@@ -662,6 +668,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
     _: JClass<'l>,
     store: JString<'l>,
     tier: jint,
+    gpu: jboolean,
 ) -> jlong {
     guarded!("Native.start", throws env, 0, {
         let Some(store) = string(&mut env, &store) else {
@@ -680,10 +687,22 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
             // Guest crashes are reported in the kernel log, which the app's bug reports carry
             exception_trace: true,
         };
-        match Machine::start(&options) {
+        let renderer = if gpu != 0 {
+            gpu::renderer(&mut env)
+        } else {
+            None
+        };
+        let has_gpu = renderer.is_some();
+        match Machine::start_with_renderer(&options, renderer) {
             Ok(m) => {
                 let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-                machines().insert(handle, Arc::new(m));
+                machines().insert(
+                    handle,
+                    RegisteredMachine {
+                        machine: Arc::new(m),
+                        has_gpu,
+                    },
+                );
                 handle
             }
             Err(e) => {
@@ -691,6 +710,18 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
                 0
             }
         }
+    })
+}
+
+/// Whether the running kernel has a probed GPU renderer registered.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_hasGpu<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jboolean {
+    guarded!("Native.hasGpu", 0, {
+        jboolean::from(machines().get(&handle).is_some_and(|e| e.has_gpu))
     })
 }
 
@@ -1197,17 +1228,17 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_stop<'l>(
         // Remove first, then kill: kill_all waits, so the table's lock must not be held
         let m = machines().remove(&handle);
         if let Some(m) = m {
-            m.kill_all();
+            m.machine.kill_all();
         }
     })
 }
 
 /// The Machine of a handle, holding a reference for the duration of the call; None once stopped.
 fn machine(handle: jlong) -> Option<Arc<Machine>> {
-    machines().get(&handle).cloned()
+    machines().get(&handle).map(|entry| entry.machine.clone())
 }
 
-fn machines() -> std::sync::MutexGuard<'static, BTreeMap<jlong, Arc<Machine>>> {
+fn machines() -> std::sync::MutexGuard<'static, BTreeMap<jlong, RegisteredMachine>> {
     MACHINES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 

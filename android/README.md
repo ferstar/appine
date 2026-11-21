@@ -26,10 +26,10 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
 
 ## Building
 
-Requirements: the Android SDK with NDK 29.0.14206865, JDK 17 or later,
+Requirements: the Android SDK with NDK 29.0.14206865 and CMake 3.22.1, Python 3, patch, JDK 17 or later,
 `rustup target add aarch64-linux-android`, `cargo install cargo-ndk`, Zig 0.17.0 on `PATH`
 (or in `ZIG`), the rootfs tarball (`scripts/fetch-rootfs`) and the libghostty-vt source release
-with its Zig packages (`scripts/fetch-ghostty`), both run from the repository root. The Zig
+with its Zig packages (`scripts/fetch-ghostty`), and the pinned Venus decoder (`scripts/fetch-virglrenderer`). Run the fetch scripts from the repository root. The Zig
 build then runs offline. Zig also builds the static Linux browser launcher from
 `hosts/android/open-url.c`; its musl libc notice is included in the APK.
 
@@ -49,7 +49,9 @@ zig.path=/opt/homebrew/bin/zig
 ```
 
 Both APKs build `libappine.so` for `arm64-v8a`. Debug uses Cargo's `release` profile to keep
-the interpreter fast. Release uses `android-release` for cross-crate LTO and a smaller library.
+the interpreter fast, appends `.debug` to the application ID (`io.github.mthli.appine.debug`),
+and uses a lemon yellow launcher icon outline (`#F5DF4D`) to distinguish it from release.
+Release uses `android-release` for cross-crate LTO and a smaller library.
 
 The release APK uses R8 and resource shrinking and is signed with the local debug key.
 `app/proguard-rules.pro` preserves JNI methods and the `VtSession.on*` callbacks Rust looks up

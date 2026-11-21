@@ -89,6 +89,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Separate package ID so debug and release can be installed side by side
+            applicationIdSuffix = ".debug"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true

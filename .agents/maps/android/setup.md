@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: one-time offline OpenRC setup on new and existing Alpine stores)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: default-off Vulkan GPU toggle in Debugging with restart confirmation)
 
 ## Responsibilities
 
@@ -28,7 +28,7 @@
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
 `android/app/src/main/assets/login.sh`, `android/app/src/main/assets/install-openrc.sh`, `android/app/src/main/assets/profile.sh`,
 `android/app/src/main/assets/ashrc.sh`, `android/app/src/main/assets/bashrc.sh`,
-`android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `scripts/fetch-rootfs`.
+`android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `android/app/src/main/assets/appine-gpu.sh`, `scripts/fetch-rootfs`.
 
 Outside the module: when imports, switches, restarts and logins happen, and the `settings`
 preferences (`android/service`); the import and `write_file`/`read_file` implementations
@@ -51,7 +51,7 @@ session consuming their state and events (`android/vt`).
   - The first mirror of each list is the official one: the import writes it, and probing falls
     back to it.
 - Preferences: file `rootfs`, owned here (`distro`); the `settings`
-  file is android/service's `Settings` (`tier`, default 1 in all builds; `login`, `run_policy`, `idle_policy`,
+  file is android/service's `Settings` (`tier`, default 1 in all builds; `gpu`, default off; `login`, `run_policy`, `idle_policy`,
   `file_access`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`, `show_tab_list`),
   which Settings shows through the service.
 - `SettingsActivity` — an `AppCompatActivity` hosting `SettingsFragment` (in the same file), a
@@ -61,7 +61,7 @@ session consuming their state and events (`android/vt`).
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
   reset), Android (conditional notification and battery usage actions, running policy, privacy mode, file access), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, tab-list button visibility, the volume keys switching tabs), Debugging (execution
-  mode and diagnostic export, in all builds) and About (Telegram, project website, privacy policy, licenses, version).
+  mode, Vulkan GPU toggle and diagnostic export, in all builds) and About (Telegram, project website, privacy policy, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
   without a console with `--refresh-rules`.
 - `profile.sh` — copied verbatim, comments included, into the guest as
@@ -86,7 +86,7 @@ session consuming their state and events (`android/vt`).
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
   `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
-- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`,
+- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureGpuCommand`, `ensureBrowser`,
   `updateProfile`; around boot: `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
 - Mirrors: `chooseMirror`, `useMirror`.
 - Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
@@ -162,6 +162,11 @@ session consuming their state and events (`android/vt`).
   - Debian: `hosts` and `resolv.conf` (the DNS stub) always.
 
 ### Before every start and boot
+
+- `ensureGpuCommand` installs `/usr/local/bin/appine-gpu` (0755) when missing, called before
+  kernel start only when Vulkan GPU is enabled. The launcher
+  finds the packaged Alpine or Debian Venus manifest and execs the supplied command with
+  `VK_DRIVER_FILES` set for that invocation.
 
 - `ensureBrowser` installs `xdg-open.sh` as `/usr/local/bin/xdg-open` (0755) on either distro.
   It preserves custom launchers, replacing only the known previous Appine OSC helper by SHA-256.
@@ -391,6 +396,10 @@ session consuming their state and events (`android/vt`).
   - execution mode (tier, in all builds): while the kernel runs with no switch, a different tier
     asking to restart; the summary names the current mode and Tier number, with a slower hint
     for Tier 0. Separate choice labels mark Tier 1 as the default and Tier 0 for troubleshooting;
+  - Vulkan GPU (default off, in all builds): while the kernel runs with no switch, toggling either
+    way shows a protected restart confirmation (`showPrivate`) before calling `service.setGpu`;
+    the summary notes experimental device-dependent compatibility, switching to "Unavailable on this
+    device" when enabled on a running kernel whose host probe registered no renderer;
   - screen-off running (Allow sleep, Run while busy or Always run, with the selected policy's
     description; BUSY explains its 30 s idle grace and network/scheduled-work limitation),
   file access (outside privacy mode), CJK fill, cursor shape (Block, Bar or Underline, the summary
@@ -408,7 +417,8 @@ session consuming their state and events (`android/vt`).
   license text remain in the Appine notice on the license page.
 - About's final Version action shows `BuildConfig.VERSION_NAME` followed by `BuildConfig.VERSION_CODE`
   in parentheses (`1.0.0 (1)`). It opens the HTTPS Google Play
-  details URL for `BuildConfig.APPLICATION_ID`, first restricted to `com.android.vending`, then
+  details URL for `io.github.mthli.appine` (regardless of the debug `.debug` application ID suffix),
+  first restricted to `com.android.vending`, then
   without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
   The link can be built before publication, but the store listing is unavailable until published.
 - Service-dependent preferences are disabled before binding, on disconnect and on stopping;
@@ -444,7 +454,7 @@ session consuming their state and events (`android/vt`).
 
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
   symlinks), `readFile` (null when missing), `spawn` and `waitFor`; `HttpURLConnection` (system
-  proxy); `BuildConfig` (Alpine branch, app version and application ID); the assets; `TerminalService` and its
+  proxy); `BuildConfig` (Alpine branch and app version); the assets; `TerminalService` and its
   `Listener` (Settings); `LicensesActivity` (android/licenses); android/privacy's mode changes,
   export authorization and dialog protection; Material Components and AndroidX (Settings),
   including AndroidX Browser for Telegram, the project website and privacy policy; android/terminal's NotificationPermission

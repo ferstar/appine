@@ -494,18 +494,27 @@ if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
 netns = "host"
 """
 
+    /** Installs the per-command Venus launcher on new and existing stores. */
+    @Throws(IOException::class)
+    fun ensureGpuCommand(context: Context, store: String = store(context).path) =
+        installExecutable(context, store, "appine-gpu.sh", "/usr/local/bin/appine-gpu", overwrite = false)
+
     /** Refreshes the bridge before kernel start, preserving user-provided local launchers. */
     @Throws(IOException::class)
     fun ensureBrowser(context: Context, configuration: String, store: String = store(context).path) {
-        val binary = context.assets.open("appine-open-url").use { it.readBytes() }
-        Native.writeFile(store, "/usr/local/libexec/appine-open-url", binary, 493 /* 0755 */, true)
+        installExecutable(context, store, "appine-open-url", "/usr/local/libexec/appine-open-url", overwrite = true)
         Native.writeFile(store, BrowserBridge.CONFIG_PATH, configuration.toByteArray(), 420 /* 0644 */, true)
         val path = "/usr/local/bin/xdg-open"
         val old = try { Native.readFile(store, path) } catch (_: IOException) { null }
         // Replace the previous Appine OSC helper, but leave a user's own launcher alone.
         val replace = old != null && hex(MessageDigest.getInstance("SHA-256").digest(old)) ==
             "abaf8d811e48df794b931f2fd5876e255c2c430464081e0d9fe880b80a3a1d76"
-        Native.writeFile(store, path, asset(context, "xdg-open.sh").toByteArray(), 493 /* 0755 */, replace)
+        installExecutable(context, store, "xdg-open.sh", path, overwrite = replace)
+    }
+
+    private fun installExecutable(context: Context, store: String, assetName: String, path: String, overwrite: Boolean) {
+        val bytes = context.assets.open(assetName).use { it.readBytes() }
+        Native.writeFile(store, path, bytes, 493 /* 0755 */, overwrite)
     }
 
     /**

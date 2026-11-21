@@ -131,10 +131,14 @@ internal object Native {
     @JvmStatic
     external fun browseWritten(store: String, top: String, path: String)
 
-    /** Starts the kernel; [tier] 0 is the interpreter, 1 is the DBT. */
+    /** Starts the kernel; [tier] 0 is the interpreter, 1 is the DBT; [gpu] probes the Venus renderer. */
     @JvmStatic
     @Throws(IOException::class)
-    external fun start(store: String, tier: Int): Long
+    external fun start(store: String, tier: Int, gpu: Boolean): Long
+
+    /** Whether the running kernel registered a host GPU renderer. */
+    @JvmStatic
+    external fun hasGpu(machine: Long): Boolean
 
     /**
      * Boots by `/etc/inittab` (the kernel/process map; OpenRC on Alpine): blocks until the sysinit

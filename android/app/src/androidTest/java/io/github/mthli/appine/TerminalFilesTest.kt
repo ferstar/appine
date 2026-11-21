@@ -109,7 +109,7 @@ class TerminalFilesTest {
     fun guestCanReadImportedFilesAndClipboardPathsAreLiteralShellArguments() {
         assertEquals("/root/photo.png /root/中文.txt", TerminalFiles.clipboardPaths(listOf("/root/photo.png", "/root/中文.txt")))
         assertEquals("/root/my\\ photo.png", TerminalFiles.clipboardPaths(listOf("/root/my photo.png")))
-        val machine = Native.start(store, 1)
+        val machine = Native.start(store, 1, false)
         try {
             val name = "quote' and \$dollar.txt"
             val path = TerminalFiles.copyIntoHome(store, account, name, "imported".toByteArray().inputStream())

@@ -5,15 +5,16 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: split android/build and android/tests into separate maps)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: gate Venus probe on Native.start gpu flag, expose Native.hasGpu and wait for OEM-delayed GpuService binds)
 
 ## Responsibilities
 
 `android/native` connects the Kotlin app to the Rust kernel: the kernel handle table, JNI
-entry points, error and panic handling, stderr to logcat, and the guest browser client.
+entry points, error and panic handling, stderr to logcat, the guest browser client and the Venus renderer.
 
 Root: `hosts/android/src/lib.rs`, `hosts/android/open-url.c`,
-`android/app/src/main/java/io/github/mthli/appine/Native.kt` and `MainApplication.kt`.
+`hosts/android/src/gpu.rs`, the native sources, Android buffer patch and Venus teardown patch in `hosts/android/gpu/`, and the Kotlin
+files `Native.kt`, `GpuService.kt` and `MainApplication.kt`.
 
 The build, manifests, assets and release packaging are `android/build`; instrumentation is
 `android/tests`. `Machine` lifecycle belongs to `kernel/boot`, process API to `kernel/process`
@@ -23,9 +24,9 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 ## Key types
 
 - `MACHINES` — a mutex-protected map from handle (`jlong`, from `NEXT_HANDLE`, counting up from 1
-  and never reused in a process) to `Arc<Machine>`; a poisoned lock is recovered. `vt.rs` looks
-  kernels up in the same table.
-- `Native` — `internal object` with 37 `@JvmStatic external` functions, 17 of them
+  and never reused in a process) to `RegisteredMachine` (`Arc<Machine>` plus `has_gpu: bool`); a poisoned lock is recovered. `vt.rs` looks
+  kernels up in the same table through `machine(handle)`.
+- `Native` — `internal object` with 38 `@JvmStatic external` functions, 17 of them
   `@Throws(IOException::class)`; its initialiser loads the library and calls the private
   `init(BuildConfig.DEBUG)`.
 - `guarded!` — the macro every JNI body runs in: `(name, fallback, body)`, or
@@ -38,9 +39,9 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 - Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch` (read);
   `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
   (through the store's change path; `browseWritten` is not `@Throws` and ignores every error).
-- Kernel: `start(store, tier)` (1 = Tier 1, else Tier 0; the kernel starts with
+- Kernel: `start(store, tier, gpu)` (1 = Tier 1, else Tier 0; when `gpu` is true, probes `:venus` and attaches the Android renderer if supported, otherwise starts with `None` without binding `:venus`; the kernel starts with
   `debug.exception-trace` at 1, so guest crashes reach the kernel log and with it the bug reports;
-  0 and an `IOException("cannot start: …")` on failure), `boot`, `setRoutes`, `takeListens`,
+  0 and an `IOException("cannot start: …")` on failure), `hasGpu(machine)` (whether the registered handle has a host GPU renderer; false if stopped or panicked; does not take the BKL), `boot`, `setRoutes`, `takeListens`,
   `takeKills`, `bklStall` (the latest too-long hold of the BKL as
   `<id>\t<seconds>\t<report>\t<end record or empty>`, tabs and line breaks in the last two turned
   into spaces, or null; it does not take the BKL), `takePower`, `processes`, `guestCpuTime`
@@ -54,6 +55,16 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 ## Data flow / lifecycle
 
 ### Handles
+
+- When `Native.start` receives `gpu = true`, the nonexported `:venus` service probes the hardware under the app UID. `GpuService.connect` binds with `BIND_AUTO_CREATE | BIND_IMPORTANT`, transfers the socket descriptor at most once via an `AtomicReference`, awaits up to 3 s for `onServiceConnected` when OEM schedulers (such as Samsung `FreecessController` during activity switches) return false from `bindService` while delivering the binding asynchronously, and calls `close()` (including `unbindService`) on failure. On success
+  `Native.start` supplies an Android renderer to the machine and records `has_gpu = true`; when `gpu = false`, `:venus` is not bound and `has_gpu` is false. Each DRM context uses a seqpacket
+  connection to a service thread. The application normally imports coherent Android Hardware Buffers on its
+  mapping device. If that probe fails, a second two-device copy tests CPU export. On success the machine
+  process maps the original coherent allocation and sends its AHB to the service on a per-context allocation
+  socket. The decoder exposes the probed GPU with the CPU mapping flags at the GPU import index.
+  Pending exports are keyed by Venus memory ID until DRM blob creation takes the mapping, Vulkan frees it,
+  or the context disconnects. A retirement thread holds submitted buffers through their fence and handles
+  memory release and Binder unbinding. Context teardown waits for the GPU in the service process.
 
 - `start` builds `MachineOptions` (tier, exception trace), starts a `Machine` and registers it;
   every call clones the `Arc` under the table lock and releases the lock before working, so a
@@ -76,8 +87,8 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 ### Callers
 
-- All callers are JVM threads; the bridge attaches no native thread to the JVM, and guest and timer
-  threads never call into Java. The main thread (`bklStall`, and `openConsole`/`spawn` from a tab's
+- GPU context setup attaches its caller to the JVM to bind the service. The retirement thread attaches
+  to release the binding. Other runtime JNI callers include the main thread (`bklStall`, and `openConsole`/`spawn` from a tab's
   start), `appine-start` (`start`), the service's worker (the poll's calls, `setRoutes`,
   `consoleCwd`, `trimMemory`, `stop`, `shutdown`, the rules refresh's `spawn`), `appine-boot`
   (`spawn`, `waitFor`, `boot`), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`), the
@@ -108,7 +119,8 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 ### Application startup
 
-- `MainApplication.onCreate` installs `Privacy` first, then `Diagnostics`. Manifest registration
+- `MainApplication.onCreate` skips app-wide setup in `:venus`. The main process registers the GPU
+  application context and installs `Privacy` and `Diagnostics`. Manifest registration
   and provider configuration are in `android/build`.
 
 ### Guest browser client
@@ -155,6 +167,8 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
   to start, fd 2 is already the pipe and nobody reads it, so stderr writes block once it fills.
 
 ## Open questions
+
+- Successful hardware-backed 16 KiB-page operation still awaits a device test. Both tested AHB paths use one physical device.
 
 - Should browse errors other than a missing file (`EEXIST`, `EACCES`, `ENOSPC`) surface as
   `FileNotFoundException`?

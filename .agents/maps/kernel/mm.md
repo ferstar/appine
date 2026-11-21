@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: bundled musl snapshot sharing through FileMaps)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: bundled musl snapshot sharing through FileMaps and shared Venus mappings)
 
 ## Responsibilities
 
@@ -76,6 +76,10 @@ the CPU engine and the Tier 1 translator (`engine`), SysV IPC objects (`kernel/i
 - `UserSlice` — an unchecked guest range passed to kernel-side accessors.
 
 ### Host backing
+
+- `Mm::mmap_gpu` installs a shared, non-executable guest VMA over a page-aligned host mapping.
+  Its `HostRegion` retains the mapping through fork, VMA splits, GEM close and TLB shootdown.
+  The mapping owner releases the storage. Growth and hole punching are refused.
 
 - `HostRegion` — owns one host range (`base`, `len`). `anonymous: Some(reserve)` marks a range that
   is recycled on drop. `reserved` marks a placeholder with no host memory, whose base is the fake

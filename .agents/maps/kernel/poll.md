@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/poll.md` for the paired decision history (timerfd's decisions from before it moved here are D23 and the timerfd halves of D16 and D41 in `.agents/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-17 (full mapping: 3 research concerns, 14 claims checked by 2 independent verifiers)
+>
+> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: DRM output fence readiness)
 
 ## Responsibilities
 
@@ -66,6 +68,10 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 ## Data flow / lifecycle
 
 ### The readiness contract
+
+- `GpuFence` carries the host read end of a completion pipe. Poll and epoll monitor it through
+  the same host-fd wait path as sockets. A retirement byte signals completion. Closing the writer
+  before retirement reports hangup without readable data.
 
 - `readiness(file)` is one `match` over `FileKind` returning known events and an optional host fd.
   Host stdio and ordinary inet sockets supply an fd. Queued DNS answers on an untapped UDP socket
