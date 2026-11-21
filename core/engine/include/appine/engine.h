@@ -387,17 +387,19 @@ struct appine_dbt_source {
 #define APPINE_DBT_SOURCES 64
 void appine_dbt_set_sources(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
 
+/*
+ * Known libc memory primitives whose large operations (n >= 128 B in guest X2) Tier 1 accelerates
+ * with a page-validated host libc call. Small operations stay inline in translated code, and any
+ * watchpoint or missing page permission falls back to guest execution.
+ */
 enum appine_memop_kind {
     APPINE_MEMOP_NONE = 0,
     APPINE_MEMOP_MEMCPY = 1,
     APPINE_MEMOP_MEMSET = 2,
     APPINE_MEMOP_MEMMOVE = 3,
     APPINE_MEMOP_MEMCMP = 4,
-    APPINE_MEMOP_STRLEN = 5,
-    APPINE_MEMOP_MEMCHR = 6,
-    APPINE_MEMOP_STRCHR = 7,
-    APPINE_MEMOP_STRCMP = 8,
-    APPINE_MEMOP_STRNCMP = 9,
+    APPINE_MEMOP_MEMCHR = 5,
+    APPINE_MEMOP_STRNCMP = 6,
 };
 
 #define APPINE_DBT_MEMOPS 32
@@ -406,6 +408,8 @@ struct appine_dbt_memop {
     uint32_t kind;
     uint32_t reserved;
 };
+/* Replaces the registered memop entry PCs on this instance (at most APPINE_DBT_MEMOPS) and retires
+ * any existing translation at a PC whose registration changed. Other threads may be running. */
 void appine_dbt_set_memops(struct appine_dbt *dbt, const struct appine_dbt_memop *ops, size_t n);
 /*
  * Before an instance taken from the pool first runs in a new address space: blocks in mappings of

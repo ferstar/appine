@@ -690,6 +690,7 @@ pub fn load_prepared(
     if let Some((_, data)) = &prepared.interp {
         scan_elf_memops(data, interp_base, &mut mm.memops);
     }
+    mm.prune_memops(&[]);
 
     mm.set_brk(main.end);
     (mm.code, mm.data) = exe.code_and_data(main.bias);
@@ -957,76 +958,140 @@ fn bytes_at<const N: usize>(file: &[u8], off: usize) -> Result<[u8; N], LoadErro
     .ok_or(LoadError::Malformed("truncated"))
 }
 
-type MemopCache = std::sync::Mutex<std::collections::HashMap<(u64, u64), Vec<(u64, u32)>>>;
+/// Cached `(file_offset, memop_kind)` entries per host file version `(dev, ino, ctime, size)` so
+/// repeated `mmap(PROT_EXEC)` of shared libraries such as `libc.so.6` avoid re-reading ELF symbol
+/// tables. Storing file offsets rather than `st_value` keeps mapped PCs exact even when a segment's
+/// `p_vaddr` differs from `p_offset`.
+type MemopCacheKey = (u64, u64, u64, u64);
+type MemopCache = Mutex<std::collections::HashMap<MemopCacheKey, Vec<(u64, u32)>>>;
+
+const MEMOP_CACHE_MAX: usize = 256;
+const ELF64_EHDR_SIZE: usize = 64;
+const ELF64_SHDR_SIZE: usize = 64;
+const ELF64_SYM_SIZE: usize = 24;
+const MAX_MEMOP_SHDRS: usize = 4096;
+const MAX_MEMOP_TABLE_BYTES: usize = 4 << 20;
+const SHT_SYMTAB: u32 = 2;
+const SHT_DYNSYM: u32 = 11;
+const STT_FUNC: u8 = 2;
+const STB_GLOBAL: u8 = 1;
+const STB_WEAK: u8 = 2;
 
 fn memop_cache() -> &'static MemopCache {
     static CACHE: OnceLock<MemopCache> = OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-fn memop_cache_key(fd: i32) -> Option<(u64, u64)> {
-    let st = appine_hal::fstat(fd).ok()?;
-    Some((st.st_dev, st.st_ino))
+fn memop_kind_for(name: &[u8], bind: u8) -> u32 {
+    if bind == STB_GLOBAL || bind == STB_WEAK {
+        match name {
+            b"memcpy" => return appine_engine::MEMOP_MEMCPY,
+            b"memset" => return appine_engine::MEMOP_MEMSET,
+            b"memmove" => return appine_engine::MEMOP_MEMMOVE,
+            b"memcmp" => return appine_engine::MEMOP_MEMCMP,
+            b"memchr" => return appine_engine::MEMOP_MEMCHR,
+            b"strncmp" => return appine_engine::MEMOP_STRNCMP,
+            _ => {}
+        }
+    }
+    // Internal glibc IFUNC target implementations may have local binding in `.symtab`.
+    match name {
+        b"__memcpy_generic" | b"__memcpy_simd" => appine_engine::MEMOP_MEMCPY,
+        b"__memset_generic" | b"__memset_zva64" => appine_engine::MEMOP_MEMSET,
+        b"__memmove_generic" | b"__memmove_simd" => appine_engine::MEMOP_MEMMOVE,
+        b"__memcmp_generic" => appine_engine::MEMOP_MEMCMP,
+        b"__memchr_generic" => appine_engine::MEMOP_MEMCHR,
+        b"__strncmp_generic" => appine_engine::MEMOP_STRNCMP,
+        _ => 0,
+    }
 }
 
-fn exe_read_range(exe: &Executable, off: usize, len: usize) -> Option<Vec<u8>> {
-    let end = off.checked_add(len)?;
-    if end > exe.len {
-        return None;
+/// Parses an aarch64 ELF64 image via `read_exact` and returns `(st_value, file_offset, kind)` for
+/// every recognized libc memop `STT_FUNC` symbol inside an executable `PT_LOAD` segment.
+fn parse_elf_memops(read_exact: impl Fn(u64, usize) -> Option<Vec<u8>>) -> Vec<(u64, u64, u32)> {
+    let Some(ehdr) = read_exact(0, ELF64_EHDR_SIZE) else {
+        return Vec::new();
+    };
+    if &ehdr[0..4] != b"\x7fELF"
+        || ehdr[4] != 2
+        || ehdr[5] != 1
+        || u16::from_le_bytes(ehdr[18..20].try_into().unwrap()) != EM_AARCH64
+    {
+        return Vec::new();
     }
-    if end <= exe.head.len() {
-        return Some(exe.head[off..end].to_vec());
+    let phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
+    let phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as usize;
+    if phoff == 0 || phentsize != PHDR_SIZE as usize || phnum == 0 || phnum > 128 {
+        return Vec::new();
     }
-    let file = exe.file.as_ref()?;
-    let mut buf = vec![0u8; len];
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(&mut buf, off as u64).ok()?;
-    Some(buf)
-}
-
-fn scan_elf_memops(exe: &Executable, bias: u64, out: &mut Vec<appine_engine::DbtMemop>) {
-    let ehdr = &exe.head;
-    if ehdr.len() < 64 || &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 || ehdr[5] != 1 {
-        return;
+    let Some(phdrs) = read_exact(phoff, phentsize * phnum) else {
+        return Vec::new();
+    };
+    // Executable PT_LOAD segments: (p_vaddr, p_offset, p_filesz).
+    let mut exec_loads = Vec::new();
+    for i in 0..phnum {
+        let off = i * phentsize;
+        let p_type = u32::from_le_bytes(phdrs[off..off + 4].try_into().unwrap());
+        let p_flags = u32::from_le_bytes(phdrs[off + 4..off + 8].try_into().unwrap());
+        let p_offset = u64::from_le_bytes(phdrs[off + 8..off + 16].try_into().unwrap());
+        let p_vaddr = u64::from_le_bytes(phdrs[off + 16..off + 24].try_into().unwrap());
+        let p_filesz = u64::from_le_bytes(phdrs[off + 32..off + 40].try_into().unwrap());
+        if p_type == PT_LOAD && (p_flags & PF_X) != 0 && p_filesz > 0 {
+            exec_loads.push((p_vaddr, p_offset, p_filesz));
+        }
     }
-    let shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap()) as usize;
+    if exec_loads.is_empty() {
+        return Vec::new();
+    }
+    let shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap());
     let shentsize = u16::from_le_bytes(ehdr[58..60].try_into().unwrap()) as usize;
     let shnum = u16::from_le_bytes(ehdr[60..62].try_into().unwrap()) as usize;
-    if shoff == 0 || shentsize < 64 || shnum == 0 || shnum > 4096 {
-        return;
+    if shoff == 0 || shentsize != ELF64_SHDR_SIZE || shnum == 0 || shnum > MAX_MEMOP_SHDRS {
+        return Vec::new();
     }
-    let Some(shdrs) = exe_read_range(exe, shoff, shentsize.saturating_mul(shnum)) else {
-        return;
+    let Some(shdrs) = read_exact(shoff, shentsize * shnum) else {
+        return Vec::new();
     };
-    let read_sh = |idx: usize| -> Option<(u32, usize, usize, usize, usize)> {
+    let read_sh = |idx: usize| -> Option<(u32, u64, usize, usize, usize)> {
         if idx >= shnum {
             return None;
         }
         let off = idx * shentsize;
         let sh_type = u32::from_le_bytes(shdrs[off + 4..off + 8].try_into().ok()?);
-        let sh_offset = u64::from_le_bytes(shdrs[off + 24..off + 32].try_into().ok()?) as usize;
-        let sh_size = u64::from_le_bytes(shdrs[off + 32..off + 40].try_into().ok()?) as usize;
+        let sh_offset = u64::from_le_bytes(shdrs[off + 24..off + 32].try_into().ok()?);
+        let sh_size = usize::try_from(u64::from_le_bytes(
+            shdrs[off + 32..off + 40].try_into().ok()?,
+        ))
+        .ok()?;
         let sh_link = u32::from_le_bytes(shdrs[off + 40..off + 44].try_into().ok()?) as usize;
-        let sh_entsize = u64::from_le_bytes(shdrs[off + 56..off + 64].try_into().ok()?) as usize;
+        let sh_entsize = usize::try_from(u64::from_le_bytes(
+            shdrs[off + 56..off + 64].try_into().ok()?,
+        ))
+        .ok()?;
         Some((sh_type, sh_offset, sh_size, sh_link, sh_entsize))
     };
+    let mut found = Vec::new();
     for i in 0..shnum {
         let Some((sh_type, sym_off, sym_size, str_idx, entsize)) = read_sh(i) else {
             continue;
         };
-        if (sh_type != 2 && sh_type != 11) || entsize < 24 || sym_size > (16 << 20) {
+        if (sh_type != SHT_SYMTAB && sh_type != SHT_DYNSYM)
+            || entsize != ELF64_SYM_SIZE
+            || sym_size == 0
+            || sym_size > MAX_MEMOP_TABLE_BYTES
+        {
             continue;
         }
         let Some((_, str_off, str_size, _, _)) = read_sh(str_idx) else {
             continue;
         };
-        if str_size > (16 << 20) {
+        if str_size == 0 || str_size > MAX_MEMOP_TABLE_BYTES {
             continue;
         }
-        let (Some(syms), Some(strtab)) = (
-            exe_read_range(exe, sym_off, sym_size),
-            exe_read_range(exe, str_off, str_size),
-        ) else {
+        let (Some(syms), Some(strtab)) =
+            (read_exact(sym_off, sym_size), read_exact(str_off, str_size))
+        else {
             continue;
         };
         let mut cur = 0;
@@ -1036,53 +1101,64 @@ fn scan_elf_memops(exe: &Executable, bias: u64, out: &mut Vec<appine_engine::Dbt
             let st_shndx = u16::from_le_bytes(syms[cur + 6..cur + 8].try_into().unwrap());
             let st_value = u64::from_le_bytes(syms[cur + 8..cur + 16].try_into().unwrap());
             cur += entsize;
-            if (st_info & 0xf) != 2 || st_shndx == 0 || st_value == 0 || st_name >= strtab.len() {
+            if (st_info & 0xf) != STT_FUNC
+                || st_shndx == 0
+                || st_value == 0
+                || st_name >= strtab.len()
+            {
                 continue;
             }
             let tail = &strtab[st_name..];
             let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-            let kind = match &tail[..nul] {
-                b"memcpy" => appine_engine::MEMOP_MEMCPY,
-                b"memset" => appine_engine::MEMOP_MEMSET,
-                b"memmove" => appine_engine::MEMOP_MEMMOVE,
-                b"memcmp" => appine_engine::MEMOP_MEMCMP,
-                b"strlen" => appine_engine::MEMOP_STRLEN,
-                b"memchr" => appine_engine::MEMOP_MEMCHR,
-                b"strchr" => appine_engine::MEMOP_STRCHR,
-                b"strcmp" => appine_engine::MEMOP_STRCMP,
-                b"strncmp" => appine_engine::MEMOP_STRNCMP,
-                _ => 0,
-            };
-            if kind != 0 {
-                let pc = bias.wrapping_add(st_value);
-                if !out.iter().any(|m| m.pc == pc) {
-                    out.push(appine_engine::DbtMemop {
-                        pc,
-                        kind,
-                        reserved: 0,
-                    });
-                }
+            let kind = memop_kind_for(&tail[..nul], st_info >> 4);
+            if kind == 0 {
+                continue;
             }
+            let Some(&(p_vaddr, p_offset, _)) = exec_loads
+                .iter()
+                .find(|&&(vaddr, _, filesz)| st_value >= vaddr && st_value - vaddr < filesz)
+            else {
+                continue;
+            };
+            let Some(file_off) = p_offset.checked_add(st_value - p_vaddr) else {
+                continue;
+            };
+            if !found.iter().any(|&(v, _, _)| v == st_value) {
+                found.push((st_value, file_off, kind));
+            }
+        }
+    }
+    found
+}
+
+fn scan_elf_memops(exe: &Executable, bias: u64, out: &mut Vec<appine_engine::DbtMemop>) {
+    let found = parse_elf_memops(|off, len| {
+        exe.read(off, len as u64)
+            .ok()
+            .flatten()
+            .map(|c| c.into_owned())
+    });
+    for (st_value, _, kind) in found {
+        let pc = bias.wrapping_add(st_value);
+        if !out.iter().any(|m| m.pc == pc) {
+            out.push(appine_engine::DbtMemop {
+                pc,
+                kind,
+                reserved: 0,
+            });
         }
     }
 }
 
-fn fd_read_exact(fd: i32, off: usize, len: usize) -> Option<Vec<u8>> {
+fn fd_read_exact(fd: i32, off: u64, len: usize) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; len];
     let mut done = 0;
     while done < len {
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buf[done..].as_mut_ptr().cast(),
-                len - done,
-                (off + done) as libc::off_t,
-            )
-        };
-        if n <= 0 {
+        let n = appine_hal::pread(fd, &mut buf[done..], off.checked_add(done as u64)?).ok()?;
+        if n == 0 {
             return None;
         }
-        done += n as usize;
+        done += n;
     }
     Some(buf)
 }
@@ -1092,20 +1168,31 @@ pub(crate) fn scan_fd_memops(
     map_off: u64,
     map_start: u64,
     map_len: u64,
+    version: Option<MemopCacheKey>,
     out: &mut Vec<appine_engine::DbtMemop>,
 ) {
-    let key = memop_cache_key(fd);
-    if let Some(k) = key
+    let entries = if let Some(k) = version
         && let Some(cached) = memop_cache().lock().unwrap().get(&k).cloned()
     {
-        if cached.is_empty() {
-            return;
+        cached
+    } else {
+        let entries: Vec<(u64, u32)> = parse_elf_memops(|off, len| fd_read_exact(fd, off, len))
+            .into_iter()
+            .map(|(_, file_off, kind)| (file_off, kind))
+            .collect();
+        if let Some(k) = version {
+            let mut cache = memop_cache().lock().unwrap();
+            if cache.len() >= MEMOP_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(k, entries.clone());
         }
-        let bias = map_start.wrapping_sub(map_off);
-        let map_end = map_start.saturating_add(map_len);
-        for (st_value, kind) in cached {
-            let pc = bias.wrapping_add(st_value);
-            if pc >= map_start && pc < map_end && !out.iter().any(|m| m.pc == pc) {
+        entries
+    };
+    for (file_off, kind) in entries {
+        if file_off >= map_off && file_off - map_off < map_len {
+            let pc = map_start.wrapping_add(file_off - map_off);
+            if !out.iter().any(|m| m.pc == pc) {
                 out.push(appine_engine::DbtMemop {
                     pc,
                     kind,
@@ -1113,121 +1200,6 @@ pub(crate) fn scan_fd_memops(
                 });
             }
         }
-        return;
-    }
-    let mut discovered = Vec::new();
-    let Some(ehdr) = fd_read_exact(fd, 0, 64) else {
-        return;
-    };
-    if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 || ehdr[5] != 1 {
-        return;
-    }
-    let phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap()) as usize;
-    let phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as usize;
-    let phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as usize;
-    let mut bias = map_start.wrapping_sub(map_off);
-    if phoff > 0
-        && phentsize >= 56
-        && phnum > 0
-        && phnum <= 128
-        && let Some(phdrs) = fd_read_exact(fd, phoff, phentsize * phnum)
-    {
-        for i in 0..phnum {
-            let off = i * phentsize;
-            let p_type = u32::from_le_bytes(phdrs[off..off + 4].try_into().unwrap());
-            let p_offset = u64::from_le_bytes(phdrs[off + 8..off + 16].try_into().unwrap());
-            let p_vaddr = u64::from_le_bytes(phdrs[off + 16..off + 24].try_into().unwrap());
-            if p_type == 1 && (p_offset & !0xfff) == map_off {
-                bias = map_start.wrapping_sub(p_vaddr & !0xfff);
-                break;
-            }
-        }
-    }
-    let shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap()) as usize;
-    let shentsize = u16::from_le_bytes(ehdr[58..60].try_into().unwrap()) as usize;
-    let shnum = u16::from_le_bytes(ehdr[60..62].try_into().unwrap()) as usize;
-    if shoff == 0 || shentsize < 64 || shnum == 0 || shnum > 4096 {
-        return;
-    }
-    let Some(shdrs) = fd_read_exact(fd, shoff, shentsize * shnum) else {
-        return;
-    };
-    let read_sh = |idx: usize| -> Option<(u32, usize, usize, usize, usize)> {
-        if idx >= shnum {
-            return None;
-        }
-        let off = idx * shentsize;
-        let sh_type = u32::from_le_bytes(shdrs[off + 4..off + 8].try_into().ok()?);
-        let sh_offset = u64::from_le_bytes(shdrs[off + 24..off + 32].try_into().ok()?) as usize;
-        let sh_size = u64::from_le_bytes(shdrs[off + 32..off + 40].try_into().ok()?) as usize;
-        let sh_link = u32::from_le_bytes(shdrs[off + 40..off + 44].try_into().ok()?) as usize;
-        let sh_entsize = u64::from_le_bytes(shdrs[off + 56..off + 64].try_into().ok()?) as usize;
-        Some((sh_type, sh_offset, sh_size, sh_link, sh_entsize))
-    };
-    let map_end = map_start.saturating_add(map_len);
-    for i in 0..shnum {
-        let Some((sh_type, sym_off, sym_size, str_idx, entsize)) = read_sh(i) else {
-            continue;
-        };
-        if (sh_type != 2 && sh_type != 11) || entsize < 24 || sym_size > (16 << 20) {
-            continue;
-        }
-        let Some((_, str_off, str_size, _, _)) = read_sh(str_idx) else {
-            continue;
-        };
-        if str_size > (16 << 20) {
-            continue;
-        }
-        let (Some(syms), Some(strtab)) = (
-            fd_read_exact(fd, sym_off, sym_size),
-            fd_read_exact(fd, str_off, str_size),
-        ) else {
-            continue;
-        };
-        let mut cur = 0;
-        while cur + entsize <= syms.len() {
-            let st_name = u32::from_le_bytes(syms[cur..cur + 4].try_into().unwrap()) as usize;
-            let st_info = syms[cur + 4];
-            let st_shndx = u16::from_le_bytes(syms[cur + 6..cur + 8].try_into().unwrap());
-            let st_value = u64::from_le_bytes(syms[cur + 8..cur + 16].try_into().unwrap());
-            cur += entsize;
-            if (st_info & 0xf) != 2 || st_shndx == 0 || st_value == 0 || st_name >= strtab.len() {
-                continue;
-            }
-            let pc = bias.wrapping_add(st_value);
-            if pc < map_start || pc >= map_end {
-                continue;
-            }
-            let tail = &strtab[st_name..];
-            let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-            let kind = match &tail[..nul] {
-                b"memcpy" | b"__memcpy_generic" | b"__memcpy_simd" => appine_engine::MEMOP_MEMCPY,
-                b"memset" | b"__memset_generic" | b"__memset_zva64" => appine_engine::MEMOP_MEMSET,
-                b"memmove" | b"__memmove_generic" | b"__memmove_simd" => {
-                    appine_engine::MEMOP_MEMMOVE
-                }
-                b"memcmp" | b"__memcmp_generic" => appine_engine::MEMOP_MEMCMP,
-                b"strlen" | b"__strlen_generic" | b"__strlen_asimd" => appine_engine::MEMOP_STRLEN,
-                b"memchr" | b"__memchr_generic" => appine_engine::MEMOP_MEMCHR,
-                b"strchr" | b"__strchr_generic" => appine_engine::MEMOP_STRCHR,
-                b"strcmp" | b"__strcmp_generic" => appine_engine::MEMOP_STRCMP,
-                b"strncmp" | b"__strncmp_generic" => appine_engine::MEMOP_STRNCMP,
-                _ => 0,
-            };
-            if kind != 0 {
-                discovered.push((st_value, kind));
-                if !out.iter().any(|m| m.pc == pc) {
-                    out.push(appine_engine::DbtMemop {
-                        pc,
-                        kind,
-                        reserved: 0,
-                    });
-                }
-            }
-        }
-    }
-    if let Some(k) = key {
-        memop_cache().lock().unwrap().insert(k, discovered);
     }
 }
 
@@ -1627,5 +1599,169 @@ mod tests {
             )),
             Err(LoadError::BadInterpreter(_))
         ));
+    }
+
+    /// Builds a minimal ELF64 aarch64 shared object whose executable PT_LOAD has `p_vaddr != p_offset`
+    /// and a `.symtab` containing global/local/ifunc/internal symbols, to verify exact file-offset
+    /// mapping across cache miss and cache hit.
+    #[test]
+    fn scan_fd_memops_preserves_segment_offset_across_cache_hit_and_filters_bindings() {
+        let p_offset: u64 = 0x1000;
+        let p_vaddr: u64 = 0x11000;
+        let p_filesz: u64 = 0x1000;
+
+        // String table: NUL + symbol names.
+        let mut strtab = vec![0u8];
+        let mut add_str = |s: &[u8]| -> u32 {
+            let off = strtab.len() as u32;
+            strtab.extend_from_slice(s);
+            strtab.push(0);
+            off
+        };
+        let s_memcpy = add_str(b"memcpy");
+        let s_memset_local = add_str(b"memset");
+        let s_memset_generic = add_str(b"__memset_generic");
+        let s_memmove_ifunc = add_str(b"memmove");
+        let s_strlen = add_str(b"strlen");
+
+        let mut symtab = vec![0u8; 24]; // STN_UNDEF
+        let mut add_sym = |name: u32, bind: u8, typ: u8, value: u64| {
+            let mut e = [0u8; 24];
+            e[0..4].copy_from_slice(&name.to_le_bytes());
+            e[4] = (bind << 4) | (typ & 0xf);
+            e[6..8].copy_from_slice(&1u16.to_le_bytes()); // st_shndx != 0
+            e[8..16].copy_from_slice(&value.to_le_bytes());
+            symtab.extend_from_slice(&e);
+        };
+        // Global STT_FUNC memcpy -> accepted at file offset 0x1100.
+        add_sym(s_memcpy, STB_GLOBAL, STT_FUNC, p_vaddr + 0x100);
+        // Local STT_FUNC memset -> must be ignored (user static function).
+        add_sym(s_memset_local, 0, STT_FUNC, p_vaddr + 0x200);
+        // Local glibc internal __memset_generic -> accepted at file offset 0x1300.
+        add_sym(s_memset_generic, 0, STT_FUNC, p_vaddr + 0x300);
+        // Global STT_GNU_IFUNC (10) memmove -> must be ignored.
+        add_sym(s_memmove_ifunc, STB_GLOBAL, 10, p_vaddr + 0x400);
+        // Global strlen -> not in the length-gated memop set, must be ignored.
+        add_sym(s_strlen, STB_GLOBAL, STT_FUNC, p_vaddr + 0x500);
+
+        let sym_off: u64 = 0x2000;
+        let str_off: u64 = 0x2400;
+        let shoff: u64 = 0x2800;
+        let total = (shoff as usize) + 3 * ELF64_SHDR_SIZE;
+        let mut img = vec![0u8; total];
+
+        // ELF64 aarch64 header.
+        img[0..4].copy_from_slice(b"\x7fELF");
+        img[4] = 2;
+        img[5] = 1;
+        img[6] = 1;
+        img[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+        img[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        img[20..24].copy_from_slice(&1u32.to_le_bytes());
+        img[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        img[40..48].copy_from_slice(&shoff.to_le_bytes()); // e_shoff
+        img[52..54].copy_from_slice(&64u16.to_le_bytes());
+        img[54..56].copy_from_slice(&(PHDR_SIZE as u16).to_le_bytes());
+        img[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        img[58..60].copy_from_slice(&(ELF64_SHDR_SIZE as u16).to_le_bytes());
+        img[60..62].copy_from_slice(&3u16.to_le_bytes()); // e_shnum: NULL, symtab, strtab
+
+        // PT_LOAD (PF_R | PF_X) with p_vaddr != p_offset.
+        let ph = 64;
+        img[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        img[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+        img[ph + 8..ph + 16].copy_from_slice(&p_offset.to_le_bytes());
+        img[ph + 16..ph + 24].copy_from_slice(&p_vaddr.to_le_bytes());
+        img[ph + 32..ph + 40].copy_from_slice(&p_filesz.to_le_bytes());
+        img[ph + 40..ph + 48].copy_from_slice(&p_filesz.to_le_bytes());
+
+        img[sym_off as usize..sym_off as usize + symtab.len()].copy_from_slice(&symtab);
+        img[str_off as usize..str_off as usize + strtab.len()].copy_from_slice(&strtab);
+
+        // Section 1: SHT_SYMTAB linked to section 2.
+        let s1 = shoff as usize + ELF64_SHDR_SIZE;
+        img[s1 + 4..s1 + 8].copy_from_slice(&SHT_SYMTAB.to_le_bytes());
+        img[s1 + 24..s1 + 32].copy_from_slice(&sym_off.to_le_bytes());
+        img[s1 + 32..s1 + 40].copy_from_slice(&(symtab.len() as u64).to_le_bytes());
+        img[s1 + 40..s1 + 44].copy_from_slice(&2u32.to_le_bytes());
+        img[s1 + 56..s1 + 64].copy_from_slice(&(ELF64_SYM_SIZE as u64).to_le_bytes());
+
+        // Section 2: SHT_STRTAB.
+        let s2 = shoff as usize + 2 * ELF64_SHDR_SIZE;
+        img[s2 + 4..s2 + 8].copy_from_slice(&3u32.to_le_bytes());
+        img[s2 + 24..s2 + 32].copy_from_slice(&str_off.to_le_bytes());
+        img[s2 + 32..s2 + 40].copy_from_slice(&(strtab.len() as u64).to_le_bytes());
+
+        let fd = appine_hal::memfd(c"test-memop-so").unwrap();
+        use std::os::fd::AsRawFd;
+        let raw = fd.as_raw_fd();
+        let mut written = 0;
+        while written < img.len() {
+            let n = appine_hal::pwrite(raw, &img[written..], written as u64).unwrap();
+            written += n;
+        }
+
+        let ver = Some((0xdead, 0xbeef, 12345, img.len() as u64));
+        // First call: cache miss.
+        let mut first = Vec::new();
+        scan_fd_memops(raw, p_offset, 0x7000_0000, p_filesz, ver, &mut first);
+        assert_eq!(
+            first,
+            vec![
+                appine_engine::DbtMemop {
+                    pc: 0x7000_0100,
+                    kind: appine_engine::MEMOP_MEMCPY,
+                    reserved: 0,
+                },
+                appine_engine::DbtMemop {
+                    pc: 0x7000_0300,
+                    kind: appine_engine::MEMOP_MEMSET,
+                    reserved: 0,
+                },
+            ]
+        );
+
+        // Second call at a different mapping address: cache hit must compute the exact same offset.
+        let mut second = Vec::new();
+        scan_fd_memops(raw, p_offset, 0x7100_0000, p_filesz, ver, &mut second);
+        assert_eq!(
+            second,
+            vec![
+                appine_engine::DbtMemop {
+                    pc: 0x7100_0100,
+                    kind: appine_engine::MEMOP_MEMCPY,
+                    reserved: 0,
+                },
+                appine_engine::DbtMemop {
+                    pc: 0x7100_0300,
+                    kind: appine_engine::MEMOP_MEMSET,
+                    reserved: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_elf_memops_rejects_oversized_shentsize() {
+        let mut hdr = vec![0u8; 64 + 56];
+        hdr[0..4].copy_from_slice(b"\x7fELF");
+        hdr[4] = 2;
+        hdr[5] = 1;
+        hdr[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        hdr[32..40].copy_from_slice(&64u64.to_le_bytes());
+        hdr[40..48].copy_from_slice(&128u64.to_le_bytes());
+        hdr[54..56].copy_from_slice(&56u16.to_le_bytes());
+        hdr[56..58].copy_from_slice(&1u16.to_le_bytes());
+        hdr[58..60].copy_from_slice(&u16::MAX.to_le_bytes()); // invalid e_shentsize
+        hdr[60..62].copy_from_slice(&4096u16.to_le_bytes());
+        hdr[64..68].copy_from_slice(&PT_LOAD.to_le_bytes());
+        hdr[68..72].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+        hdr[96..104].copy_from_slice(&4096u64.to_le_bytes());
+        let found = parse_elf_memops(|off, len| {
+            let start = usize::try_from(off).ok()?;
+            let end = start.checked_add(len)?;
+            hdr.get(start..end).map(|s| s.to_vec())
+        });
+        assert!(found.is_empty());
     }
 }

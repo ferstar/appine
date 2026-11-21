@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: ELF memop symbol discovery and file-offset cache)
 
 ## Responsibilities
 
@@ -131,6 +131,13 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   `end_data` from its segments) are recorded in the address space for `/proc/<pid>/stat`.
 - A Go build-ID note in the main program selects the translator's Go register set (`engine`;
   `APPINE_DBT_REGS` overrides it).
+- `scan_elf_memops` scans `.symtab` and `.dynsym` of the main executable and interpreter for
+  `STB_GLOBAL`/`STB_WEAK` `STT_FUNC` symbols of the length-gated libc memops (`memcpy`, `memset`,
+  `memmove`, `memcmp`, `memchr`, `strncmp`) plus glibc internal IFUNC targets inside executable
+  `PT_LOAD` segments, recording them on `Mm::memops`. `scan_fd_memops` performs the same scan for
+  read-only private `PROT_EXEC` file mappings in `kernel/mm` via `appine_hal::pread`, caching
+  `(file_offset, kind)` entries keyed by host file version `(dev, ino, ctime, size)` (capped at 256
+  entries) so mapped PCs stay exact when `p_vaddr != p_offset`.
 - Opened store and overlay executables are cached (32 entries, checked against the host file's
   device, inode, ctime and size; forgotten when rehomed, cleared under memory pressure).
   `Machine::spawn` loads through `loader::load`.

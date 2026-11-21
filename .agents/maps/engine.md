@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: FPCR writes, code invalidation at barriers and tagged data TLB entries)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: page-validated host memop fast path on Tier 1)
 
 ## Responsibilities
 
@@ -49,8 +49,11 @@ Tier 1, only CPUID advertised).
 
 - `DbtSpace` (`struct appine_dbt`) — one translation instance: 128 MB code cache with the shared
   routines at its start, the lock-free translation table, block records, saved guest words, per-page
-  block buckets, the shared-range list, the register set, the lock, flush state, trust sources, and
-  the poisoned flag. Shared by every thread of an address space and by every member of a code group.
+  block buckets, the shared-range list, the immutable sorted memop table (`memop_table`), the
+  register set, the lock, flush state, trust sources, and the poisoned flag. Shared by every thread
+  of an address space and by every member of a code group.
+- `DbtMemop` (`struct appine_dbt_memop`) — a registered libc memop entry `(pc, kind)` (`memcpy`,
+  `memset`, `memmove`, `memcmp`, `memchr`, `strncmp`; up to `APPINE_DBT_MEMOPS` = 32).
 - `Dbt` (`struct appine_dbt_thread`) — one thread's attachment: its tag, 4096-entry jump cache,
   64-entry shadow return stack, statistics, and a private translation workspace.
 - `struct block` — guest pc, entry in the code cache (NULL when dead), saved guest words, parked
@@ -69,8 +72,8 @@ Tier 1, only CPUID advertised).
 - **CPU**: `Cpu::new`, `reset`, `run` (guarded loop until an exit), `step` (one instruction, ignores
   kicks), `exec_insn` (run a given word; tests and lockstep only), `translate`, `tlb_flush`,
   `state`/`state_mut`, `kicker`; `CpuState::set_hw_debug`, `hw_breakpoints_active`.
-- **Tier 1**: `DbtSpace::new(key, regs)`, `set_sources`, `trust`, `retire_outside`, `share`,
-  `new_tag`; `Dbt::new`, `with_regs`, `attach(space, tag)`, `run(cpu)`, `flush`, `recheck`,
+- **Tier 1**: `DbtSpace::new(key, regs)`, `set_sources`, `set_memops`, `trust`, `retire_outside`,
+  `share`, `new_tag`; `Dbt::new`, `with_regs`, `attach(space, tag)`, `run(cpu)`, `flush`, `recheck`,
   `invalidate(cpu, start, len)`, `stats`; `trim_dbt_pool`, `unmap_written_code`,
   `written_code_bytes`.
 - **Process-wide**: `install_fault_guard`, `guest_hwcap`, `guest_hwcap2`, `guest_midr`,
@@ -291,10 +294,13 @@ Tier 1, only CPUID advertised).
   the return stack, clear the jump cache), return `Kick` if pending, look up the block without a
   lock, revive parked blocks of that page if any, otherwise translate and install, then enter.
 - Exit reasons: chain (patch the link point), lookup (fill the jump cache), ungroup (record the group
-  failure, then run Tier 0), interp (run one instruction in Tier 0, then invalidate any recorded
-  `ivau_page` in place), code (invalidate the pending page after a translated DSB/ISB, then look up
-  the next PC), svc (clear the monitor, return `Svc`), kick (loop). Tier 0's own exits are
-  returned to the kernel, except `ic ivau`, which is absorbed in place.
+  failure, then run Tier 0), interp (for a pure `R_INTERP` exit at a registered memop PC on a shared
+  or ungrouped block, run `exec_memop`: pre-validating guest pages with TBI untagged, capping at
+  64 MB, skipping on watchpoints or missing permissions, popping the shadow return stack when its
+  top matches `x30`, and returning to `x30`; otherwise run one instruction in Tier 0, then
+  invalidate any recorded `ivau_page` in place), code (invalidate the pending page after a
+  translated DSB/ISB, then look up the next PC), svc (clear the monitor, return `Svc`), kick (loop).
+  Tier 0's own exits are returned to the kernel, except `ic ivau`, which is absorbed in place.
 - A host fault inside the run marks the instance poisoned and clears the template arena.
 
 ### Code cache, table and memory
@@ -334,8 +340,11 @@ Tier 1, only CPUID advertised).
 ### Sharing translations
 
 - A block's translation depends only on its guest pc, its guest instruction words, the register set
-  and whether it is shared; the words are saved and re-compared at install, recheck, revive and
-  content-based invalidation.
+  and whether it is shared (except blocks at registered memop PCs, which emit a 2-instruction
+  `x2 >= 128` threshold exit to `R_INTERP` preserving NZCV, bypass both `template_fetch` and
+  `template_store`, are retired on `set_memops` changes and before pooling in `appine_dbt_free`, and
+  are ignored for private tagged blocks in a code group); the words are saved and re-compared at
+  install, recheck, revive and content-based invalidation.
 - Threads of one address space share one instance; each has its own jump cache, return stack,
   statistics and workspace.
 - Code groups (engine side): members share one instance. Blocks in ranges registered with `share`
