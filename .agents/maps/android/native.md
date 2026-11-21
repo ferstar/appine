@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: gate Venus probe on Native.start gpu flag, expose Native.hasGpu and wait for OEM-delayed GpuService binds)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: list android/vtgestures alongside android/vtview and android/vtrender)
 
 ## Responsibilities
 
@@ -19,7 +19,8 @@ files `Native.kt`, `GpuService.kt` and `MainApplication.kt`.
 The build, manifests, assets and release packaging are `android/build`; instrumentation is
 `android/tests`. `Machine` lifecycle belongs to `kernel/boot`, process API to `kernel/process`
 and store calls to `kernel/store`. Terminal shim/JNI ownership remains `android/vtcore`,
-with view and rendering portions in `android/vtview` and `android/vtrender`.
+with view, gesture and rendering portions in `android/vtview`, `android/vtgestures` and
+`android/vtrender`.
 
 ## Key types
 

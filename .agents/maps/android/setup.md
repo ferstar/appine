@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: split the Settings screen into android/settings and condensed verified-item recaps in To verify)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint prompt-tap consumer reference to android/vtgestures)
 
 ## Responsibilities
 
@@ -31,8 +31,8 @@ Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`,
 Outside the module: the settings screen (`android/settings`); when imports, switches, restarts and
 logins happen, and the `settings` preferences (`android/service`); the import and
 `write_file`/`read_file` implementations (`kernel/store`, `kernel/vfs`); bundling the assets
-(`android/build`); what the terminal does with the prompt marks (`android/vtcore`, `android/vtview`)
-and the Kotlin session consuming their state and events (`android/vt`).
+(`android/build`); what the terminal does with the prompt marks (`android/vtcore`, `android/vtview`,
+`android/vtgestures`) and the Kotlin session consuming their state and events (`android/vt`).
 
 ## Key types
 

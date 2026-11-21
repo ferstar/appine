@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint gestures, selection, links and prompt-tap references to android/vtgestures)
 
 ## Responsibilities
 
@@ -20,12 +20,14 @@
 
 Root: `VtNative.kt` in `android/app/src/main/java/io/github/mthli/appine/`,
 `hosts/android/src/vt.rs`, and `hosts/android/src/vt.c` except its frame-format specification
-and Frames section (android/vtrender) and its Input, Paste, Mouse and focus, Selection, Links,
-Taps on the prompt and Search sections (android/vtview).
+and Frames section (`android/vtrender`), its Input, Paste, `appine_vt_focus` (in Mouse and focus)
+and Search sections (`android/vtview`), and `appine_vt_mouse` (in Mouse and focus) plus its
+Selection, Links and Taps on the prompt sections (`android/vtgestures`).
 
 Outside the module: Kotlin sessions and console/login lifecycle (`android/vt`); session ownership,
 save files, notifications and memory policy (`android/service`); the screen (`android/terminal`);
-view interactions (`android/vtview`); frame encoding and drawing (`android/vtrender`);
+view lifecycle, input and search (`android/vtview`); touch/mouse gestures, scrolling, selection,
+links and prompt taps (`android/vtgestures`); frame encoding and drawing (`android/vtrender`);
 the host console (`kernel/tty`); `guarded!` and the kernel handle table (`android/native`), build/linking (`android/build`); the shell hooks producing prompt marks (`android/setup`).
 
 ## Key types
@@ -313,8 +315,9 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   resize, messages and clear/reset. The session closes the console to end a pump read.
 - android/service: `VtNative.compressAll` and `dropImages` on its worker; `Tabs` reads
   `VtNative.version` for snapshot compatibility.
-- android/vtview: `VtNative` frame, input, selection, links, prompt taps and search functions
-  using the attached session's handle. The JNI calls take the terminal lock before entering
+- android/vtview: `VtNative` frame, password, key/paste/focus, prompt-jump and search functions
+  using the attached session's handle; android/vtgestures: `VtNative` mouse, scroll, selection,
+  output, copy, link and prompt-tap functions. The JNI calls take the terminal lock before entering
   vt.c's interaction sections.
 - android/vtrender: `VtImages` uses `VtNative.image`; frame and image calls enter its native
   Frames section through this module's JNI under the tab lock.
@@ -324,8 +327,8 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 - android/vt through `VtSession.on*` callbacks on the pump thread; the session marshals events
   to the main thread and owns clipboard responses and progress/status lifetime. android/setup
   provides the prompt marks whose parsing is described here.
-- android/vtview and android/vtrender own the excluded vt.c sections; their implementations
-  share `AppineVt` and obey this module's lock, buffer and compression contracts.
+- android/vtview, android/vtgestures and android/vtrender own the excluded vt.c sections; their
+  implementations share `AppineVt` and obey this module's lock, buffer and compression contracts.
 - libghostty-vt 1.0.0, Ghostty's terminal library released apart from the app (the terminal
   state and its full reset, the default cursor's shape and blinking, writes that stop at OSC and
   DCS strings' starts and ends, render state with one overscan row, key and mouse encoders, paste,

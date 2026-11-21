@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: split notifications, fault reports and diagnostics into android/reports)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: list android/vtgestures alongside android/vtview and android/vtrender)
 
 ## Responsibilities
 
@@ -33,8 +33,8 @@ Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Se
 Outside the module: non-ongoing notifications, channels, copyable fault reports and diagnostic
 retention/export (`android/reports`); rootfs import, downloads, mirrors and `login.sh`
 (`android/setup`); the Settings screen (`android/settings`); the terminal screen
-(`android/terminal`) and its tab bar (`android/tabbar`); the view (`android/vtview`) and rendering
-(`android/vtrender`); sessions' internals and the console adapter (`android/vt`), native terminals
+(`android/terminal`) and its tab bar (`android/tabbar`); the view (`android/vtview`), gestures
+and selection (`android/vtgestures`) and rendering (`android/vtrender`); sessions' internals and the console adapter (`android/vt`), native terminals
 and compression (`android/vtcore`); the Files app provider (`android/documents`); JNI and the
 kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 

@@ -1,16 +1,17 @@
 # android/terminal Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtcore`, `android/vtview`, `android/vtrender`, `android/licenses`, `android/tabbar`, `android/keys` and `android/file-import`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
+> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtcore`, `android/vtview`, `android/vtgestures`, `android/vtrender`, `android/licenses`, `android/tabbar`, `android/keys` and `android/file-import`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: stronger contrast between selected and ordinary terminal controls)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint link, zoom and gesture references to android/vtgestures)
 
 ## Responsibilities
 
 `android/terminal` coordinates the terminal screen around sessions (`android/vt`), native
-terminals (`android/vtcore`), interaction (`android/vtview`) and rendering (`android/vtrender`).
+terminals (`android/vtcore`), view lifecycle/input/search (`android/vtview`), gestures/selection/
+links (`android/vtgestures`) and rendering (`android/vtrender`).
 It owns activity lifecycle, choosing/closing tabs, shortcuts, search UI, link routing, clipboard
 questions, insets and IME animation, plus shared UI helpers, strings and themes.
 
@@ -272,7 +273,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   With window focus it calls `TerminalLinks.openBrowser`; otherwise it returns false. Its Boolean
   acknowledges Android accepting the intent; the guest receives a failure when it is refused.
 - The view reports a link to open (`Host.onLink`: a tap or Ctrl+click on one, or the menu's Open
-  link; which links count and which schemes open are android/vtview's). The activity delegates to
+  link; which links count and which schemes open are `android/vtgestures`'s). The activity delegates to
   `TerminalLinks.open`, which opens HTTP and HTTPS links with AndroidX Custom Tabs, without binding
   a browser package or session, and other
   non-file schemes (such as mail) with plain `ACTION_VIEW`; both carry `CATEGORY_BROWSABLE`.
@@ -298,8 +299,8 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - `TerminalService`: listener callbacks (`onProgress`, `onMachineReady`, `onSessionsChanged`,
   `onBell`, `onClipboardRead`, `onTabStatus`, `onSettingsChanged`, `onNotice`, `onRestarting`,
   `onExitAll`) and the notification intent with `EXTRA_TAB`.
-- android/vtview: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`,
-  `shift` and `modifiersUsed`, `onLink`, `onSearchCount`).
+- android/vtview and android/vtgestures: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra
+  keys' `ctrl`, `alt`, `shift` and `modifiersUsed`, `onLink`, `onSearchCount`).
 - android/settings and android/licenses use the shared page frame, themes and view helpers;
   Settings also uses the preference switch widget, NotificationPermission and BatteryOptimization. android/privacy uses the shared theme and helpers.
 - android/privacy: `onPrivacyUnlocked` resumes deferred terminal UI work.
