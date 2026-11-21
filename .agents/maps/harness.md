@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: Android capability probe, distribution fixtures and compute survey)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: cache target/virglrenderer in android.yml and record the rust-cache target-cleaning gotcha)
 
 ## Responsibilities
 
@@ -108,9 +108,10 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   and `cargo test --workspace` with the require switches.
 - `android.yml`, on pushes and pull requests that change `core/`, `hosts/android/`, `android/`,
   the Cargo files or the rootfs, Ghostty and virglrenderer fetch scripts (or on demand), on x86_64 (`ubuntu-24.04`,
-  for aapt2): NDK 29.0.14206865, SDK CMake 3.22.1, the pinned Venus source, Java 21, cargo-ndk (unpinned), the rootfs, Zig 0.17.0 (from
-  ziglang.org, checked against a pinned sha256) and `scripts/fetch-ghostty` (with
-  `target/ghostty` and Zig's global cache cached by the script's hash), then cargo-ndk clippy at
+  for aapt2): NDK 29.0.14206865, SDK CMake 3.22.1, Java 21, cargo-ndk (unpinned), the rootfs, Zig 0.17.0 (from
+  ziglang.org, checked against a pinned sha256), `scripts/fetch-ghostty` (with
+  `target/ghostty` and Zig's global cache cached by the script's hash) and `scripts/fetch-virglrenderer`
+  (with `target/virglrenderer` cached by the script's hash), then cargo-ndk clippy at
   API level 30, `assembleDebug lintDebug`, the APK as an artifact. Both quick workflows cancel a
   run in progress when the same branch is pushed again.
 - `full.yml`, nightly at 18:00 UTC on develop when its tip was committed in the last 25 hours, on
@@ -161,6 +162,7 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   there makes it (cargo test builds debug, lockstep builds only `appine-lockstep`), and difftest
   never builds one.
 - CI's clang step relies on the runner image's clang; CI installs only llvm and musl-tools.
+- `Swatinem/rust-cache@v2` caches all of `target/` and cleans non-Cargo files before saving, which can leave empty subdirectories behind; fetched asset trees under `target/` need their own `actions/cache` step after `rust-cache` and sentinel-file checks rather than bare directory-existence checks.
 
 ## Confirmed bugs / technical debt
 

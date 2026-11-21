@@ -13,8 +13,11 @@ if ! echo "$digest  $out/$name.tar.gz" | shasum -a 256 -c --status 2>/dev/null; 
     echo "$digest  $work/$name.tar.gz" | shasum -a 256 -c
     mv "$work/$name.tar.gz" "$out/"
 fi
-if [ ! -d "$out/$name" ]; then
+# Unpack whenever a key source file is missing (e.g. rust-cache strips files from target/ while
+# leaving empty directories behind).
+if [ ! -f "$out/$name/src/venus/vkr_renderer.c" ]; then
     tar xzf "$out/$name.tar.gz" -C "$work"
+    rm -rf "$out/$name"
     mv "$work/$name" "$out/"
 fi
 echo "fetch-virglrenderer: $out/$name"

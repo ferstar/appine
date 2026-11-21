@@ -114,6 +114,11 @@ jobs:
       - name: Fetch libghostty-vt
         run: scripts/fetch-ghostty
 
+      - uses: actions/cache@v6
+        with:
+          path: target/virglrenderer
+          key: virglrenderer-${{ hashFiles('scripts/fetch-virglrenderer') }}
+
       - name: Fetch Venus decoder
         run: scripts/fetch-virglrenderer
 
