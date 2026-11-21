@@ -344,7 +344,8 @@ Tier 1, only CPUID advertised).
   `x2 >= 128` threshold exit to `R_INTERP` preserving NZCV, bypass both `template_fetch` and
   `template_store`, are retired on `set_memops` changes and before pooling in `appine_dbt_free`, and
   are ignored for private tagged blocks in a code group); the words are saved and re-compared at
-  install, recheck, revive and content-based invalidation.
+  install, recheck, revive and content-based invalidation. Installation also compares the memop
+  registration captured during preparation with the current registration under the DBT lock.
 - Threads of one address space share one instance; each has its own jump cache, return stack,
   statistics and workspace.
 - Code groups (engine side): members share one instance. Blocks in ranges registered with `share`

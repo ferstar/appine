@@ -3073,6 +3073,7 @@ static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64
 struct prep {
     uint64_t pc;
     unsigned tag; /* private block: tag of the member it belongs to (TAG_SHIFT) */
+    uint32_t memop_kind; /* registration observed while translating */
     const uint32_t *guest; /* host location of the guest words: compared again before installing */
     uint32_t nguest;
     uint32_t words[MAX_BLOCK_INSNS]; /* guest instruction words read at translation */
@@ -3303,6 +3304,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
      * template arena so they never pollute other address spaces or miss the check. In a code group,
      * only shared (tag 0) mappings carry group-admitted memops. */
     uint32_t memop_kind = p->tag ? APPINE_MEMOP_NONE : find_memop(d, pc);
+    p->memop_kind = memop_kind;
     t->stats.blocks++;
     if (!memop_kind && template_fetch(pc, guest, key, d->r, !p->tag, p, t->scratch, &t->stats))
         return true;
@@ -3410,9 +3412,10 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
  */
 static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct syncs *sync, struct fresh *f)
 {
-    /* Another thread rewrote this code during translation (this block was not in the table yet
-     * when it invalidated): retranslate */
-    if (memcmp(p->guest, p->words, p->nguest * 4) != 0)
+    /* This block was not in the cache when another thread changed its code or registration.
+     * Recheck both under the lock before publishing it. */
+    uint32_t memop_kind = p->tag ? APPINE_MEMOP_NONE : find_memop(d, p->pc);
+    if (memop_kind != p->memop_kind || memcmp(p->guest, p->words, p->nguest * 4) != 0)
         return STALE;
     /* When three quarters of the table are non-empty, rebuild it at the same size if tombstones
      * are at least half, otherwise double it; when blocks is full, remove the invalidated blocks'
