@@ -660,6 +660,7 @@ pub fn load_prepared(
 ) -> Result<Image, LoadError> {
     let exe = &prepared.exe;
     mm.set_layout(args.stack_limit);
+    mm.memops.clear();
     let Some((main, interp_base, interp_range, entry)) = map_programs(mm, prepared, args.execfn)
     else {
         return Ok(Image::doomed());
@@ -685,11 +686,6 @@ pub fn load_prepared(
     mm.vdso = vdso_base;
     mm.vdso_svc = !crate::vdso::host();
     mm.dbt_regs = dbt_regs(exe.go);
-    mm.memops.clear();
-    scan_elf_memops(prepared.exe.exe, main.bias, &mut mm.memops);
-    if let Some((_, data)) = &prepared.interp {
-        scan_elf_memops(data, interp_base, &mut mm.memops);
-    }
     mm.prune_memops(&[]);
 
     mm.set_brk(main.end);
@@ -958,12 +954,20 @@ fn bytes_at<const N: usize>(file: &[u8], off: usize) -> Result<[u8; N], LoadErro
     .ok_or(LoadError::Malformed("truncated"))
 }
 
-/// Cached `(file_offset, memop_kind)` entries per host file version `(dev, ino, ctime, size)` so
-/// repeated `mmap(PROT_EXEC)` of shared libraries such as `libc.so.6` avoid re-reading ELF symbol
-/// tables. Storing file offsets rather than `st_value` keeps mapped PCs exact even when a segment's
-/// `p_vaddr` differs from `p_offset`.
+// ld-musl-aarch64.so.1 from the SHA-256-pinned Alpine 3.24.3 archive in scripts/fetch-rootfs.
+const BUNDLED_LIBC_SIZE: usize = 723_480;
+const BUNDLED_LIBC_SHA256: [u8; 32] = [
+    0x53, 0x28, 0x2a, 0xcc, 0x2b, 0xe8, 0xa0, 0x8a, 0x9f, 0xdc, 0xf8, 0x80, 0x33, 0x4b, 0xf3, 0x5b,
+    0xbf, 0xd0, 0xa1, 0x38, 0x62, 0xb7, 0xf3, 0x61, 0x6b, 0xe3, 0x91, 0x9f, 0xcd, 0xa1, 0x17, 0x93,
+];
+
 type MemopCacheKey = (u64, u64, u64, u64);
-type MemopCache = Mutex<std::collections::HashMap<MemopCacheKey, Vec<(u64, u32)>>>;
+type MemopCache = Mutex<std::collections::HashMap<MemopCacheKey, Option<Arc<BundledLibc>>>>;
+
+pub(crate) struct BundledLibc {
+    snapshot: File,
+    entries: Vec<(u64, u32)>,
+}
 
 const MEMOP_CACHE_MAX: usize = 256;
 const ELF64_EHDR_SIZE: usize = 64;
@@ -1131,23 +1135,50 @@ fn parse_elf_memops(read_exact: impl Fn(u64, usize) -> Option<Vec<u8>>) -> Vec<(
     found
 }
 
-fn scan_elf_memops(exe: &Executable, bias: u64, out: &mut Vec<appine_engine::DbtMemop>) {
-    let found = parse_elf_memops(|off, len| {
-        exe.read(off, len as u64)
-            .ok()
-            .flatten()
-            .map(|c| c.into_owned())
-    });
-    for (st_value, _, kind) in found {
-        let pc = bias.wrapping_add(st_value);
-        if !out.iter().any(|m| m.pc == pc) {
-            out.push(appine_engine::DbtMemop {
-                pc,
-                kind,
-                reserved: 0,
-            });
-        }
+/// Uses the same bytes for verification, symbol discovery and executable mapping. A private
+/// file mapping of the original can still see subsequent writes to that file.
+pub(crate) fn bundled_libc(fd: i32, version: MemopCacheKey) -> Option<Arc<BundledLibc>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    if version.3 != BUNDLED_LIBC_SIZE as u64 {
+        return None;
     }
+    if let Some(cached) = memop_cache().lock().unwrap().get(&version).cloned() {
+        return cached;
+    }
+    let image = fd_read_exact(fd, 0, BUNDLED_LIBC_SIZE)?;
+    let verified = if Sha256::digest(&image)[..] == BUNDLED_LIBC_SHA256 {
+        static SNAPSHOT: OnceLock<Arc<BundledLibc>> = OnceLock::new();
+        if let Some(libc) = SNAPSHOT.get() {
+            Some(libc.clone())
+        } else {
+            let entries = parse_elf_memops(|off, len| {
+                let start = usize::try_from(off).ok()?;
+                image
+                    .get(start..start.checked_add(len)?)
+                    .map(<[u8]>::to_vec)
+            })
+            .into_iter()
+            .map(|(_, offset, kind)| (offset, kind))
+            .collect();
+            let mut snapshot = appine_hal::memfd(c"appine-bundled-libc").ok()?;
+            snapshot.write_all(&image).ok()?;
+            Some(
+                SNAPSHOT
+                    .get_or_init(|| Arc::new(BundledLibc { snapshot, entries }))
+                    .clone(),
+            )
+        }
+    } else {
+        None
+    };
+    let mut cache = memop_cache().lock().unwrap();
+    if cache.len() >= MEMOP_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(version, verified.clone());
+    verified
 }
 
 fn fd_read_exact(fd: i32, off: u64, len: usize) -> Option<Vec<u8>> {
@@ -1163,41 +1194,28 @@ fn fd_read_exact(fd: i32, off: u64, len: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-pub(crate) fn scan_fd_memops(
-    fd: i32,
-    map_off: u64,
-    map_start: u64,
-    map_len: u64,
-    version: Option<MemopCacheKey>,
-    out: &mut Vec<appine_engine::DbtMemop>,
-) {
-    let entries = if let Some(k) = version
-        && let Some(cached) = memop_cache().lock().unwrap().get(&k).cloned()
-    {
-        cached
-    } else {
-        let entries: Vec<(u64, u32)> = parse_elf_memops(|off, len| fd_read_exact(fd, off, len))
-            .into_iter()
-            .map(|(_, file_off, kind)| (file_off, kind))
-            .collect();
-        if let Some(k) = version {
-            let mut cache = memop_cache().lock().unwrap();
-            if cache.len() >= MEMOP_CACHE_MAX {
-                cache.clear();
-            }
-            cache.insert(k, entries.clone());
-        }
-        entries
-    };
-    for (file_off, kind) in entries {
-        if file_off >= map_off && file_off - map_off < map_len {
-            let pc = map_start.wrapping_add(file_off - map_off);
-            if !out.iter().any(|m| m.pc == pc) {
-                out.push(appine_engine::DbtMemop {
-                    pc,
-                    kind,
-                    reserved: 0,
-                });
+impl BundledLibc {
+    pub(crate) fn map(&self, offset: u64, len: usize) -> Result<appine_hal::FileMapping, i32> {
+        appine_hal::map_file_read_only(self.snapshot.as_raw_fd(), offset, len)
+    }
+
+    pub(crate) fn register(
+        &self,
+        map_off: u64,
+        map_start: u64,
+        map_len: u64,
+        out: &mut Vec<appine_engine::DbtMemop>,
+    ) {
+        for &(file_off, kind) in &self.entries {
+            if file_off >= map_off && file_off - map_off < map_len {
+                let pc = map_start + (file_off - map_off);
+                if !out.iter().any(|m| m.pc == pc) {
+                    out.push(appine_engine::DbtMemop {
+                        pc,
+                        kind,
+                        reserved: 0,
+                    });
+                }
             }
         }
     }
@@ -1602,10 +1620,9 @@ mod tests {
     }
 
     /// Builds a minimal ELF64 aarch64 shared object whose executable PT_LOAD has `p_vaddr != p_offset`
-    /// and a `.symtab` containing global/local/ifunc/internal symbols, to verify exact file-offset
-    /// mapping across cache miss and cache hit.
+    /// and libc-like symbol names. Neither the name nor a matching file size identifies libc.
     #[test]
-    fn scan_fd_memops_preserves_segment_offset_across_cache_hit_and_filters_bindings() {
+    fn unverified_elf_with_libc_symbols_is_not_registered() {
         let p_offset: u64 = 0x1000;
         let p_vaddr: u64 = 0x11000;
         let p_filesz: u64 = 0x1000;
@@ -1692,53 +1709,72 @@ mod tests {
         img[s2 + 24..s2 + 32].copy_from_slice(&str_off.to_le_bytes());
         img[s2 + 32..s2 + 40].copy_from_slice(&(strtab.len() as u64).to_le_bytes());
 
-        let fd = appine_hal::memfd(c"test-memop-so").unwrap();
+        // The guest implementation returns a marker instead of copying bytes.
+        let entry = p_vaddr + 0x100;
+        img[24..32].copy_from_slice(&entry.to_le_bytes());
+        let code_at = (p_offset + 0x100) as usize;
+        img[code_at..code_at + 4].copy_from_slice(&0xd28a_aaa0u32.to_le_bytes()); // mov x0, #0x5555
+        img[code_at + 4..code_at + 8].copy_from_slice(&0xd400_0001u32.to_le_bytes()); // svc #0
+
+        // Make this a same-size candidate and verify that the symbols would otherwise match.
+        img.resize(BUNDLED_LIBC_SIZE, 0);
+        let found = parse_elf_memops(|off, len| {
+            let start = off as usize;
+            img.get(start..start + len).map(<[u8]>::to_vec)
+        });
+        assert_eq!(
+            found,
+            vec![
+                (
+                    p_vaddr + 0x100,
+                    p_offset + 0x100,
+                    appine_engine::MEMOP_MEMCPY
+                ),
+                (
+                    p_vaddr + 0x300,
+                    p_offset + 0x300,
+                    appine_engine::MEMOP_MEMSET
+                ),
+            ]
+        );
+
+        use std::io::Write;
         use std::os::fd::AsRawFd;
+        let mut fd = appine_hal::memfd(c"test-memop-so").unwrap();
+        fd.write_all(&img).unwrap();
         let raw = fd.as_raw_fd();
-        let mut written = 0;
-        while written < img.len() {
-            let n = appine_hal::pwrite(raw, &img[written..], written as u64).unwrap();
-            written += n;
-        }
+        let stat = appine_hal::fstat(raw).unwrap();
+        #[allow(clippy::unnecessary_cast)]
+        let version = (stat.st_dev as u64, stat.st_ino as u64, 0, img.len() as u64);
+        assert!(bundled_libc(raw, version).is_none());
+        assert!(bundled_libc(raw, version).is_none());
 
-        let ver = Some((0xdead, 0xbeef, 12345, img.len() as u64));
-        // First call: cache miss.
-        let mut first = Vec::new();
-        scan_fd_memops(raw, p_offset, 0x7000_0000, p_filesz, ver, &mut first);
-        assert_eq!(
-            first,
-            vec![
-                appine_engine::DbtMemop {
-                    pc: 0x7000_0100,
-                    kind: appine_engine::MEMOP_MEMCPY,
-                    reserved: 0,
-                },
-                appine_engine::DbtMemop {
-                    pc: 0x7000_0300,
-                    kind: appine_engine::MEMOP_MEMSET,
-                    reserved: 0,
-                },
-            ]
-        );
-
-        // Second call at a different mapping address: cache hit must compute the exact same offset.
-        let mut second = Vec::new();
-        scan_fd_memops(raw, p_offset, 0x7100_0000, p_filesz, ver, &mut second);
-        assert_eq!(
-            second,
-            vec![
-                appine_engine::DbtMemop {
-                    pc: 0x7100_0100,
-                    kind: appine_engine::MEMOP_MEMCPY,
-                    reserved: 0,
-                },
-                appine_engine::DbtMemop {
-                    pc: 0x7100_0300,
-                    kind: appine_engine::MEMOP_MEMSET,
-                    reserved: 0,
-                },
-            ]
-        );
+        let args = Args {
+            argv: &[],
+            envp: &[],
+            execfn: b"/bin/custom",
+            ids: [0; 4],
+            secure: false,
+            stack_limit: STACK_SIZE,
+        };
+        let mut mm = Mm::new();
+        let image = load(&mut mm, &exe(&img), &args, &mut no_interp).unwrap();
+        assert_ne!(image.entry, 0);
+        assert!(mm.memops.is_empty());
+        let dbt = mm
+            .code_space(&Default::default())
+            .and_then(|cs| appine_engine::Dbt::attach(&cs.space, cs.tag));
+        // SAFETY: the address space outlives the CPU.
+        let mut cpu = unsafe { appine_engine::Cpu::new(mm.mmu()) };
+        cpu.state_mut().pc = image.entry;
+        cpu.state_mut().x[2] = 256;
+        let exit = if let Some(mut dbt) = dbt {
+            dbt.run(&mut cpu)
+        } else {
+            cpu.run()
+        };
+        assert!(matches!(exit, appine_engine::Exit::Svc { imm: 0 }));
+        assert_eq!(cpu.state().x[0], 0x5555);
     }
 
     #[test]

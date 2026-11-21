@@ -1743,6 +1743,16 @@ impl Mm {
             (Some(s), Some((dev, ino, _))) if !shared => content::version(s, dev, ino),
             _ => None,
         };
+        #[allow(clippy::unnecessary_cast)]
+        let bundled_libc = if !shared && prot & prot::EXEC != 0 && prot & prot::WRITE == 0 {
+            file.zip(file_id).zip(content).and_then(
+                |(((fd, _, _), (dev, ino, _)), (ctime, size))| {
+                    crate::loader::bundled_libc(fd, (dev as u64, ino as u64, ctime, size))
+                },
+            )
+        } else {
+            None
+        };
         // The host mapping is shared with other address spaces (FileMaps)
         let mut cached = false;
         let (backing, may_write, region, host) = match file {
@@ -1779,7 +1789,7 @@ impl Mm {
                 let key = st
                     .as_ref()
                     .zip(content)
-                    .filter(|_| !shared && prot & prot::WRITE == 0)
+                    .filter(|_| !shared && prot & prot::WRITE == 0 && bundled_libc.is_none())
                     .map(|(s, (ctime, size))| {
                         #[allow(clippy::unnecessary_cast)]
                         let (dev, ino) = (s.st_dev as u64, s.st_ino as u64);
@@ -1789,9 +1799,12 @@ impl Mm {
                     cached = true;
                     (backing, true, region, host)
                 } else {
-                    let m = match key {
-                        Some(_) => appine_hal::map_file_read_only(fd, offset, host_len),
-                        None => appine_hal::map_file(fd, offset, host_len, shared, writable),
+                    let m = match (&bundled_libc, key) {
+                        (Some(libc), _) => libc.map(offset, host_len),
+                        (None, Some(_)) => appine_hal::map_file_read_only(fd, offset, host_len),
+                        (None, None) => {
+                            appine_hal::map_file(fd, offset, host_len, shared, writable)
+                        }
                     }
                     .map_err(Errno)?;
                     let region = Arc::new(HostRegion {
@@ -1803,8 +1816,8 @@ impl Mm {
                     });
                     if let Some(key) = key {
                         self.files.insert(key, region.clone(), m.ptr);
-                        cached = true;
                     }
+                    cached = key.is_some() || bundled_libc.is_some();
                     (backing, !shared || writable, region, m.ptr)
                 }
             }
@@ -1842,25 +1855,10 @@ impl Mm {
         if backing == Backing::Shared && may_write {
             self.note_shared_maps(false);
         }
-        if (prot & prot::EXEC) != 0
-            && (prot & prot::WRITE) == 0
-            && backing == Backing::PrivateFile
-            && !has_fill
-            && let Some((fd, offset, _)) = file
-            && let Some(((dev, ino, _), (ctime, size))) = file_id.zip(content)
-        {
+        if let (Some(libc), Some((_, offset, _))) = (bundled_libc, file) {
             let before = self.memops.len();
-            crate::loader::scan_fd_memops(
-                fd,
-                offset,
-                start,
-                len,
-                Some((dev, ino, ctime, size)),
-                &mut self.memops,
-            );
-            if self.memops.len() != before {
-                self.memops_dirty = true;
-            }
+            libc.register(offset, start, len, &mut self.memops);
+            self.memops_dirty |= self.memops.len() != before;
         }
         Ok(start)
     }
