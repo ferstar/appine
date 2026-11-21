@@ -437,10 +437,17 @@ pub fn source_for(dst: &[u8]) -> Result<Vec<u8>, i32> {
 // ---- DNS ----
 
 #[cfg(target_os = "android")]
+type AndroidResNsend = unsafe extern "C" fn(u64, *const u8, usize, u32) -> i32;
+#[cfg(target_os = "android")]
+type AndroidResNresult = unsafe extern "C" fn(i32, *mut i32, *mut u8, usize) -> i32;
+#[cfg(target_os = "android")]
+type AndroidResCancel = unsafe extern "C" fn(i32);
+
+#[cfg(target_os = "android")]
 struct AndroidResolver {
-    send: unsafe extern "C" fn(u64, *const u8, usize, u32) -> i32,
-    result: unsafe extern "C" fn(i32, *mut i32, *mut u8, usize) -> i32,
-    cancel: unsafe extern "C" fn(i32),
+    send: AndroidResNsend,
+    result: AndroidResNresult,
+    cancel: AndroidResCancel,
 }
 
 #[cfg(target_os = "android")]
@@ -462,9 +469,9 @@ impl AndroidResolver {
             }
             // These public NDK symbols use the C signatures declared above.
             Ok(Self {
-                send: std::mem::transmute(send),
-                result: std::mem::transmute(result),
-                cancel: std::mem::transmute(cancel),
+                send: std::mem::transmute::<*mut libc::c_void, AndroidResNsend>(send),
+                result: std::mem::transmute::<*mut libc::c_void, AndroidResNresult>(result),
+                cancel: std::mem::transmute::<*mut libc::c_void, AndroidResCancel>(cancel),
             })
         }
     }
