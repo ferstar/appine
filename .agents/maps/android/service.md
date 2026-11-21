@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: install the guest GPU launcher before kernel start)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: default-off Vulkan GPU setting, conditional launcher install and renderer availability state)
 
 ## Responsibilities
 
@@ -23,7 +23,7 @@ outlives an Activity:
   lifecycle actions, and the routing of what programs ask of the app (bells, notifications,
   program statuses, clipboard writes and reads) and of commands the shells' prompt marks see
   finish;
-- the settings state that the activities only display and forward (tier in all builds,
+- the settings state that the activities only display and forward (tier and Vulkan GPU in all builds,
   screen-off running policy, login account, file access, CJK characters filling two cells, the cursor's
   shape and blinking, whether the volume keys switch tabs, tab-list button visibility, distro switch), the preferences
   kept in `Settings`.
@@ -82,7 +82,7 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   `DiagnosticFiles` owns synchronized rotation and snapshots, and `DiagnosticProvider` exposes
   only generated share archives.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
-  tier (default 1 in all builds), login, running policy and its remembered non-always choice,
+  tier (default 1 in all builds), Vulkan GPU (`gpu`, default off), login, running policy and its remembered non-always choice,
   privacy mode (`privacy_mode`, default off), file access (`file_access`, default off and refused during privacy; old `system_documents` ignored), wide cells, the
   cursor's shape (stored as Ghostty's names) and blinking, and whether the volume keys switch tabs
   (on by default), and tab-list button visibility (`show_tab_list`, on by default);
@@ -104,10 +104,10 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 - Lifecycle: `onCreate`, `onStartCommand` (EXIT_ALL, CANCEL_SWITCH, TOGGLE_KEEP_AWAKE, COPY_REPORT;
   `START_NOT_STICKY`), `onBind`, `onTrimMemory`, `onDestroy`.
 - Called by activities: `addListener`/`removeListener`, `createSession(account = login setting,
-  cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier`,
+  cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier`, `setGpu`,
   `setRunPolicy`, `switchTo`/`cancelSwitch`/`canSwitch`,
   `setLogin`, `setFileAccess`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
-  `setVolumeKeysSwitchTabs`, `setShowTabList`, `takeNotice`; state read by them: `machine`, `startError`,
+  `setVolumeKeysSwitchTabs`, `setShowTabList`, `takeNotice`; state read by them: `machine`, `gpuAvailable`, `startError`,
   `progress`, `switching`, `sessions`, `focus`, the settings.
 - Settings read without the service: `Settings.login` and `fileAccess` by `Documents`,
   `Settings.fillWide` and `Settings.showTabList` by `MainActivity` (in `onStart` and `onSettingsChanged`) and
@@ -130,9 +130,9 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 - `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
   notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
-  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureGpuCommand`, `ensureBrowser`, `updateProfile`, then
-  `Native.start(store, tier)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
-  all builds, defaulting to 1). On Alpine, `Rootfs.ensureOpenRc` checks the store and installs a missing OpenRC
+  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureGpuCommand` (only when `gpu` is enabled), `ensureBrowser`, `updateProfile`, then
+  `Native.start(store, tier, gpu)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
+  all builds, defaulting to 1; `gpu` defaults to false) and `Native.hasGpu(handle)` recorded as `gpuAvailable`. On Alpine, `Rootfs.ensureOpenRc` checks the store and installs a missing OpenRC
   before publishing the kernel handle. If it installs or resumes, it runs inittab on this thread.
   A setup I/O failure during import stops the private kernel. On an existing store the service
   presents the error and allows a terminal for repairs. The boot thread runs inittab only if
@@ -183,9 +183,9 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   not treat it as the last tab closing), update the wake lock, cancel the poll and saves, release
   (hang up and free) every session and take its notification away, clear `sessions` and
   `unshown`; it runs before the kernel is shut down or stopped.
-- `setTier` ignores the current value; otherwise it saves the choice and calls `restart` in all
-  builds. `restart` (guest reboot or tier change; nothing without a kernel):
-  `transitioning`, `detach`, `onRestarting`, shutdown on the worker, then `start(null)` (or, after
+- `setTier` and `setGpu` ignore unchanged values; otherwise they save the choice and call `restart` in all
+  builds. `restart` (guest reboot, tier or GPU change; nothing without a kernel):
+  `transitioning`, `detach` (which also clears `gpuAvailable`), `onRestarting`, shutdown on the worker, then `start(null)` (or, after
   "exit all" meanwhile, finish the exit); the UI opens a new tab when the new kernel is ready and
   no sessions exist.
 - Distro switch/reset (`switchTo`, allowed while no switch or download is under way and either a
@@ -377,7 +377,7 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   always for an Appine bug. OOM kills say whether the app's limit or a cgroup's `memory.max` (in
   MiB or GiB) was reached.
 - Bugs always notify with "copy report": app version and build, device (Android release and API,
-  maker and model, ABI, page size), distro and the saved tier, the kernel's
+  maker and model, ABI, page size), distro, saved tier and (when enabled) Vulkan GPU, the kernel's
   report line, its kernel log records (up to 10 earlier ones and the report's own, one per line of
   it), and under
   "Unimplemented paths reached" the 10 the guest reached most since boot, with a line for the rest

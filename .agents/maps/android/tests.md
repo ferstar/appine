@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification of Venus allocator and retirement thread shutdown)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: pass explicit gpu flag to Native.start and add GpuTest.disabledByDefault and toggleRestartsKernel)
 
 ## Responsibilities
 
@@ -30,11 +30,18 @@ debug variant, manifest and network-security configuration belong to `android/bu
 
 ### Tests
 
-- `GpuTest.distributionVenus` takes `gpuDistro=alpine|debian` and a survey rootfs in app cache.
-  It imports a temporary store, installs the guest GPU launcher, checks default discovery of
+- `GpuTest.disabledByDefault` verifies `Settings.gpu` defaults false and `Native.start(..., gpu = false)`
+  reports `Native.hasGpu == false` with absent `/dev/dri/renderD128` and `/sys/dev/char/226:128`.
+  `GpuTest.toggleRestartsKernel` drives `SettingsActivity` and `TerminalService` end to end: cancellation
+  leaves the kernel untouched, confirming enable restarts the kernel with `appine-gpu` and matching
+  render-node/summary/diagnostics state, and confirming disable restarts without `/dev/dri/renderD128`
+  and reclaims Venus mappings and workers.
+  `GpuTest.distributionVenus` takes `gpuDistro=alpine|debian` and a survey rootfs in app cache.
+  It imports a temporary store, installs the guest GPU launcher, starts with `gpu = true` (asserting `Native.hasGpu`), checks default discovery of
   both Venus and llvmpipe, and verifies Venus-only compute through the launcher, mapping lifetime,
   concurrent exit and restart, and checks for retained mappings, allocation threads and retirement threads.
-  `unsupportedDriver` uses the bundled rootfs with `gpuUnsupported=true` to check absent device paths.
+  `unsupportedDriver` uses the bundled rootfs with `gpuUnsupported=true` and `gpu = true` to check `Native.hasGpu == false` and absent device paths.
+  Other instrumentation tests pass `gpu = false` to `Native.start`.
 
 - `TabListTest` checks session identity across removal/rebinding, a bounded, scrollable 50-tab list
   and preserved editor focus during opening/scrolling/dismissal; all three cases passed on API 34.

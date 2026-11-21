@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: per-command guest Venus launcher)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: default-off Vulkan GPU toggle in Debugging with restart confirmation)
 
 ## Responsibilities
 
@@ -51,7 +51,7 @@ session consuming their state and events (`android/vt`).
   - The first mirror of each list is the official one: the import writes it, and probing falls
     back to it.
 - Preferences: file `rootfs`, owned here (`distro`); the `settings`
-  file is android/service's `Settings` (`tier`, default 1 in all builds; `login`, `run_policy`, `idle_policy`,
+  file is android/service's `Settings` (`tier`, default 1 in all builds; `gpu`, default off; `login`, `run_policy`, `idle_policy`,
   `file_access`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`, `show_tab_list`),
   which Settings shows through the service.
 - `SettingsActivity` — an `AppCompatActivity` hosting `SettingsFragment` (in the same file), a
@@ -61,7 +61,7 @@ session consuming their state and events (`android/vt`).
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
   reset), Android (conditional notification and battery usage actions, running policy, privacy mode, file access), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, tab-list button visibility, the volume keys switching tabs), Debugging (execution
-  mode and diagnostic export, in all builds) and About (Telegram, project website, privacy policy, licenses, version).
+  mode, Vulkan GPU toggle and diagnostic export, in all builds) and About (Telegram, project website, privacy policy, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
   without a console with `--refresh-rules`.
 - `profile.sh` — copied verbatim, comments included, into the guest as
@@ -163,7 +163,8 @@ session consuming their state and events (`android/vt`).
 
 ### Before every start and boot
 
-- `ensureGpuCommand` installs `/usr/local/bin/appine-gpu` (0755) when missing. The launcher
+- `ensureGpuCommand` installs `/usr/local/bin/appine-gpu` (0755) when missing, called before
+  kernel start only when Vulkan GPU is enabled. The launcher
   finds the packaged Alpine or Debian Venus manifest and execs the supplied command with
   `VK_DRIVER_FILES` set for that invocation.
 
@@ -395,6 +396,10 @@ session consuming their state and events (`android/vt`).
   - execution mode (tier, in all builds): while the kernel runs with no switch, a different tier
     asking to restart; the summary names the current mode and Tier number, with a slower hint
     for Tier 0. Separate choice labels mark Tier 1 as the default and Tier 0 for troubleshooting;
+  - Vulkan GPU (default off, in all builds): while the kernel runs with no switch, toggling either
+    way shows a protected restart confirmation (`showPrivate`) before calling `service.setGpu`;
+    the summary notes experimental device-dependent compatibility, switching to "Unavailable on this
+    device" when enabled on a running kernel whose host probe registered no renderer;
   - screen-off running (Allow sleep, Run while busy or Always run, with the selected policy's
     description; BUSY explains its 30 s idle grace and network/scheduled-work limitation),
   file access (outside privacy mode), CJK fill, cursor shape (Block, Bar or Underline, the summary

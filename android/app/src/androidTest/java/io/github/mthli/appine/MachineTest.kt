@@ -50,7 +50,7 @@ class MachineTest {
         machines.forEach(Native::stop)
     }
 
-    private fun start(tier: Int) = Native.start(Rootfs.store(context).path, tier).also { machines.add(it) }
+    private fun start(tier: Int) = Native.start(Rootfs.store(context).path, tier, false).also { machines.add(it) }
 
     private fun withAlpineStore(name: String, test: (String) -> Unit) {
         val store = File(context.cacheDir, name)
@@ -64,7 +64,7 @@ class MachineTest {
     }
 
     private fun <T> withMachine(store: String, test: (Long) -> T): T {
-        val machine = Native.start(store, 1)
+        val machine = Native.start(store, 1, false)
         return try {
             test(machine)
         } finally {
@@ -425,7 +425,7 @@ class MachineTest {
         val store = File(context.cacheDir, "store-bash")
         store.deleteRecursively()
         Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
-        val machine = Native.start(store.path, 1)
+        val machine = Native.start(store.path, 1, false)
         try {
             assertEquals("" to 0, sh(machine, "mv /var/cache/appine/bash /var/cache/appine/bash.off"))
             val fallback = plain(login(machine, "echo shell=\$0\nexit\n", ConsolePty.LOGIN_ROOT))
@@ -461,7 +461,7 @@ class MachineTest {
         val store = File(context.cacheDir, "store-procps")
         store.deleteRecursively()
         Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
-        val machine = Native.start(store.path, 1)
+        val machine = Native.start(store.path, 1, false)
         try {
             // Keep ash as the login shell and omit a required library for the first attempt.
             assertEquals(0, sh(machine,
@@ -605,7 +605,7 @@ class MachineTest {
         val store = File(context.cacheDir, "store-bubblewrap")
         store.deleteRecursively()
         Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
-        val machine = Native.start(store.path, 1)
+        val machine = Native.start(store.path, 1, false)
         try {
             // No repositories or other bundles: bubblewrap must carry its own dependencies.
             assertEquals(0, sh(machine,
@@ -1041,7 +1041,7 @@ class MachineTest {
             val store = File(context.cacheDir, "store-${distro.name.lowercase()}")
             store.deleteRecursively()
             Rootfs.prepare(context, distro, store = store)
-            val machine = Native.start(store.path, 1)
+            val machine = Native.start(store.path, 1, false)
             try {
                 val out = login(
                     machine,
