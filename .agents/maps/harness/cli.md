@@ -45,6 +45,9 @@ benchmarks are `harness`, differential testing `harness/diff`.
 - A PTY is used by default when fds 0 and 1 are both terminals (then the host terminal goes raw,
   continuing with a message if it cannot, and `SIGWINCH` resizes the guest console); `--pty`
   forces one (24×80 unless both are terminals), `--no-pty` gives the guest the host's stdio.
+- On Android, a recognized interactive shell with a PTY starts the system DNS loader in a
+  background thread. Command and script invocations load it on demand. Set
+  `APPINE_PRELOAD_ANDROID_DNS=0` to disable preloading.
   Through the PTY, guest stdout and stderr both reach fd 1.
 - The kernel's `run` starts a machine, opens the console, boots by inittab with `--init`, spawns
   the program and bridges the terminal; afterwards it shuts down by inittab (`--init`; a reboot

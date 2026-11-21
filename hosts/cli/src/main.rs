@@ -199,6 +199,16 @@ fn main() -> ExitCode {
     }
     // Without the pipe the signals keep their default action
     options.stop = appine_hal::stop_notifier().ok();
+    #[cfg(target_os = "android")]
+    if options.terminal.is_some()
+        && interactive_shell(&args, on_tty)
+        && !matches!(env::var("APPINE_PRELOAD_ANDROID_DNS").as_deref(), Ok("0"))
+    {
+        // Starting the guest never waits for this worker. A concurrent query uses the same loader.
+        let _ = std::thread::Builder::new()
+            .name("dns-preload".into())
+            .spawn(appine_hal::net::preload_android_resolver);
+    }
     let result = appine_kernel::run(&program, &argv, &envp, &options);
     // Restore the host terminal first, then print the message
     drop(raw);
@@ -234,6 +244,51 @@ fn main() -> ExitCode {
             }
             ExitCode::from((128 + signal.number()) as u8)
         }
+    }
+}
+
+// Scope speculative DNS loading to a recognized shell with no command or script operand.
+#[cfg(any(target_os = "android", test))]
+fn interactive_shell(args: &[OsString], on_tty: bool) -> bool {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    let Some((program, flags)) = args.split_first() else {
+        return false;
+    };
+    let shell = Path::new(program).file_name().and_then(OsStr::to_str);
+    if !matches!(
+        shell,
+        Some("sh" | "ash" | "bash" | "dash" | "zsh" | "ksh" | "fish")
+    ) {
+        return false;
+    }
+    let mut interactive = on_tty;
+    for flag in flags {
+        match flag.to_str() {
+            Some("-i" | "-il" | "-li" | "--interactive") => interactive = true,
+            Some("-l" | "--login") => {}
+            _ => return false,
+        }
+    }
+    interactive
+}
+
+#[cfg(test)]
+#[test]
+fn dns_preload_requires_an_interactive_shell() {
+    for (args, on_tty, expected) in [
+        (&["/bin/sh"][..], true, true),
+        (&["/bin/sh"], false, false),
+        (&["/bin/sh", "-i"], false, true),
+        (&["/bin/bash", "-li"], false, true),
+        (&["/bin/ash", "-c", "echo hello"], true, false),
+        (&["/bin/sh", "-i", "-c", "echo hello"], true, false),
+        (&["/bin/sh", "script.sh"], true, false),
+        (&["/bin/cat"], true, false),
+    ] {
+        let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(interactive_shell(&args, on_tty), expected, "{args:?}");
     }
 }
 
