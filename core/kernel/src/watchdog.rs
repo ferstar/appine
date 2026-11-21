@@ -1,4 +1,4 @@
-//! The BKL watchdog (the kernel/process map): a host thread that never takes the BKL and reports
+//! The BKL watchdog (the kernel/bug map): a host thread that never takes the BKL and reports
 //! a hold of it that lasts too long. While one thread holds the BKL, every other guest thread
 //! stops at its next kernel entry, so a hold that does not end (a loop in kernel code, a host call
 //! that blocks with the lock held) freezes every guest process and the app's tabs, and the app's

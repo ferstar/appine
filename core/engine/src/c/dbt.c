@@ -1,5 +1,5 @@
 /*
- * Tier 1: a same-ISA pass-through DBT (the engine map: `.agents/maps/engine.md`).
+ * Tier 1: a same-ISA pass-through DBT (the engine/dbt map: `.agents/maps/engine/dbt.md`).
  *
  * Register convention while translated code runs (this is the default set; Go programs use
  * another set, see struct regs):
@@ -27,7 +27,7 @@
  * block links; indirect branches first look up the jump cache. Function calls push the shadow
  * return stack, and RET looks at the top of the stack first (emit_call). Instructions Tier 0 does
  * not recognize are likewise handed to Tier 0, which keeps the two tiers' whitelists exactly the
- * same (the engine map).
+ * same (the engine and engine/dbt maps).
  *
  * Translations never invalidate themselves; see appine_dbt_invalidate(). The code cache is
  * double-mapped W^X.
@@ -1742,7 +1742,7 @@ static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, i
     emit_member(x, lead, g->off[0]);
 }
 
-/* ---- Exclusive accesses, acquire/release, LSE atomics (the engine map) ---- */
+/* ---- Exclusive accesses, acquire/release, LSE atomics (the engine/dbt map) ---- */
 
 /*
  * Address of an atomic access, the same as Tier 0's atomic_target: natural alignment is required
@@ -2224,7 +2224,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
 
 /*
  * Ask Tier 0 whether it recognizes this instruction (the two tiers' whitelists must agree, see
- * the engine map). The answer depends only on the instruction word and is cached by it in `cache`
+ * the engine and engine/dbt maps). The answer depends only on the instruction word and is cached by it in `cache`
  * (direct-mapped, each entry is 1 << 40 | instruction word << 1 | answer): Tier 0 has to execute
  * the instruction to find out, and asking once for every instruction translated at java startup
  * took two percentage points.
@@ -2955,7 +2955,7 @@ static void ungroup(struct appine_dbt *d, uint64_t pc)
     retire_flush(d, &r);
 }
 
-/* ---- Translation templates: shared by all instances (the engine map) ---- */
+/* ---- Translation templates: shared by all instances (the engine/dbt map) ---- */
 
 /*
  * A block's translation depends only on its guest pc and the instruction words it translated
@@ -3737,7 +3737,7 @@ static void emit_routines(struct appine_dbt *d)
     emit(x, enc_str_x(T1, 31, 104));
     emit(x, enc_mov(CTX, 0));
     emit(x, enc_mov(T0, 1));
-    /* The guest's FP state stays in host registers throughout translated code (the engine map) */
+    /* The guest's FP state stays in host registers throughout translated code (the engine/dbt map) */
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
     emit(x, enc_msr_fpcr(T1));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpsr)));

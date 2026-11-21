@@ -27,7 +27,8 @@ and system bars. Shared resources include `Widget.Appine.MorePopup`,
 and `preference_switch.xml` (MaterialSwitch at AndroidX's `switchWidget` ID). Settings uses
 AndroidX category/row layouts.
 
-Session ownership, saving, reports and event routing are `android/service`; build and notice
+Session ownership, saving and event routing are `android/service`; notifications, fault reports and
+diagnostics are `android/reports`; the Settings screen is `android/settings`; build and notice
 assets are `android/build`; authentication is `android/privacy`, notice UI `android/licenses`.
 
 ## Key types
@@ -299,7 +300,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   `onExitAll`) and the notification intent with `EXTRA_TAB`.
 - android/vtview: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`,
   `shift` and `modifiersUsed`, `onLink`, `onSearchCount`).
-- android/setup and android/licenses use the shared page frame, themes and view helpers;
+- android/settings and android/licenses use the shared page frame, themes and view helpers;
   Settings also uses the preference switch widget, NotificationPermission and BatteryOptimization. android/privacy uses the shared theme and helpers.
 - android/privacy: `onPrivacyUnlocked` resumes deferred terminal UI work.
 

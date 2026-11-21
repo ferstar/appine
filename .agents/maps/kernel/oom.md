@@ -183,9 +183,9 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 - `kernel/mm`: VMAs, CoW sets and loans, `FileMaps`, `UNMAPPING`, `shmem_like`; `shootdown`
   (`kernel/mmu`) for borrowed pages a release re-points.
 - `appine_hal` (`memory_usage` from `/proc/self/status`, `memory_info`, `mincore` and pagemap
-  reads), `appine_engine` (`written_code_bytes`, `unmap_written_code`), `kernel/cgroup` (`memory_limits`,
+  reads), `engine/dbt` (`written_code_bytes`, `unmap_written_code`), `kernel/cgroup` (`memory_limits`,
   `measure_memory`, `memory_event`, `oom_group`), `signal::group_exit`, the kernel log (`printk`)
-  and kill reports (`bug::record_kill`).
+  and kill reports (`bug::record_kill`, `kernel/bug`).
 
 ## Invariants and gotchas
 

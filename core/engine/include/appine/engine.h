@@ -310,7 +310,7 @@ int appine_cpu_layout_check(size_t size, size_t off_x, size_t off_pc, size_t off
                             size_t off_pending, size_t off_mmu, size_t off_jump_cache,
                             size_t off_tlb, size_t off_v);
 
-/* ---- Tier 1: a same-ISA pass-through DBT (the engine map) ---- */
+/* ---- Tier 1: a same-ISA pass-through DBT (the engine/dbt map) ---- */
 
 struct appine_dbt;
 

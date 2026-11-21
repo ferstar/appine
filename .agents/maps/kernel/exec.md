@@ -129,7 +129,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   the strings passed.
 - The main program's code and data bounds (Linux 6.1's `start_code`, `end_code`, `start_data`,
   `end_data` from its segments) are recorded in the address space for `/proc/<pid>/stat`.
-- A Go build-ID note in the main program selects the translator's Go register set (`engine`;
+- A Go build-ID note in the main program selects the translator's Go register set (`engine/dbt`;
   `APPINE_DBT_REGS` overrides it).
 - Tier 1 discovers length-gated libc memops only in the exact AArch64 musl from the pinned
   Alpine rootfs (`scripts/fetch-rootfs`). An executable private mapping uses a read-only snapshot

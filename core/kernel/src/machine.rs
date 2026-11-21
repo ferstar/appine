@@ -784,7 +784,7 @@ impl Machine {
 
     /// Takes the guest processes the kernel layer ended (kernel bug, engine host fault, OOM
     /// killer): the app explains the reason in their tabs, and posts a notification for those not
-    /// in a tab (the android/service map).
+    /// in a tab (the android/service and android/reports maps).
     pub fn take_kills(&self) -> Vec<crate::KillReport> {
         crate::bug::host_call("Machine::take_kills", || {
             std::mem::take(&mut *self.shared.lock().kills.borrow_mut())

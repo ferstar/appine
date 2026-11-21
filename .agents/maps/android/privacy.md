@@ -74,16 +74,17 @@ their own last-moment input, clipboard, browser and export checks.
 - android/native: `MainApplication` installs the gate; android/build registers the action activity.
 - android/terminal: `MainActivity` and `TerminalLinks` check the gate; `Ui.showPrivate` registers
   dialogs before showing them; the activity resumes deferred work through `onPrivacyUnlocked`.
-- android/setup: Settings requests mode changes and fresh export authorization, rechecks it
+- android/settings: Settings requests mode changes and fresh export authorization, rechecks it
   before collection/handoff and protects restored dialogs.
 - android/vtview: copy/paste access and preview dialogs. android/licenses' activities receive
   the same automatic lifecycle protection as every other FragmentActivity.
-- android/service: mode listeners, clipboard guards and private report-copy action intents.
+- android/service: mode listeners and clipboard guards; android/reports: private report-copy
+  action intents and non-ongoing notification redaction.
 
 ### Outbound
 
-- android/service: `Settings.privacyMode`/`setPrivacyMode` and `Notifications.copyReport`;
-  android/documents: `revokeAccess` and `rootsChanged` when mode changes.
+- android/service: `Settings.privacyMode`/`setPrivacyMode`; android/reports:
+  `Notifications.copyReport`; android/documents: `revokeAccess` and `rootsChanged` when mode changes.
 - android/terminal: shared localized strings, themes, `dp` and `themeColor` helpers.
 - AndroidX Biometric 1.1.0, FragmentActivity/ViewModel lifecycle, Android's device-lock and
   interactive-state checks, secure window flags and notification manager.

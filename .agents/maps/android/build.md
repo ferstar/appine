@@ -147,9 +147,9 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   the app's resources rather than dependency translations. Android 11–12
   ignore the attribute and keep following the system language; the application suppresses
   lint's `UnusedAttribute` for this intentional version-specific behavior.
-- Manifest application `MainApplication` lives in its own file and installs android/privacy's shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` (android/privacy) authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.
-- `MainApplication` also installs `Diagnostics` after the privacy gate. Non-exported
-  `DiagnosticProvider` uses the existing AndroidX FileProvider with manifest path metadata,
+- Manifest application `MainApplication` lives in its own file and installs android/privacy's shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` (android/privacy) authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` (android/reports) copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.
+- `MainApplication` also installs `Diagnostics` (android/reports) after the privacy gate. Non-exported
+  `DiagnosticProvider` (android/reports) uses the existing AndroidX FileProvider with manifest path metadata,
   granting only generated archives from `cache/diagnostic-exports`; no new permission or
   dependency is required. Retained diagnostic files use the app's no-backup directory.
 - Launcher, settings, licenses list and license reader activities (the application theme

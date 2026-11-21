@@ -34,7 +34,7 @@ Root:
 
 Outside the module: VMAs, host backing, the fault policy, copy-on-write and what each change
 records for `sync` (`kernel/mm`); the run loop that reads the counters (`kernel/process`); the
-Tier 1 translator with its inline TLB fast path and refill (`engine`).
+Tier 1 translator with its inline TLB fast path and refill (`engine/dbt`).
 
 ## Key types
 
@@ -179,8 +179,8 @@ Tier 1 translator with its inline TLB fast path and refill (`engine`).
 
 ### Outbound
 
-- `appine_engine`: `Mmu`, `Cpu::tlb_flush`, `Kicker`, `DbtSpace`/`Dbt` (trust, new_tag, share,
-  retire_outside, set_sources, invalidate, flush).
+- `appine_engine` (`engine` and `engine/dbt`): `Mmu`, `Cpu::tlb_flush`, `Kicker`, `DbtSpace`/`Dbt`
+  (trust, new_tag, share, retire_outside, set_sources, set_memops, invalidate, flush).
 - The Tier 1 translator depends on the page-table geometry, the PTE bit layout, the TLB entry
   layout and offsets, `tlb_used`, and the watchpoint count.
 

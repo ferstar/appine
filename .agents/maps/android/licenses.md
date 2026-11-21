@@ -41,9 +41,9 @@ instrumentation tests belong to android/tests. This module consumes those assets
 
 ### Catalog, navigation and reading
 
-- Settings' About group has a separate localized Project website action (android/setup); the
+- Settings' About group has a separate localized Project website action (android/settings); the
   license summary names GNU AGPL 3.0 or later, with copyright and warranty details in the Appine notice.
-  Its final Version action is labeled "Version" / "版本号"; android/setup supplies the build
+  Its final Version action is labeled "Version" / "版本号"; android/settings supplies the build
   version summary and Google Play navigation.
 - `notices/` is checked in (android/build): Appine, Fuchsia, libghostty-vt and its linked
   components, JetBrains Mono, Alpine and the bundled doas/bash/procps/bubblewrap packages with libcap2, Android
@@ -73,7 +73,7 @@ instrumentation tests belong to android/tests. This module consumes those assets
 
 ### Inbound
 
-- android/setup: Settings' About action opens the list without requiring a running kernel.
+- android/settings: Settings' About action opens the list without requiring a running kernel.
 - android/build: bundled catalog and HTML assets and manifest registration; android/tests: `LicenseTest`.
 - android/privacy: automatic lifecycle protection installed on both activities.
 

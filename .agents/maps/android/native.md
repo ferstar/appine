@@ -120,8 +120,8 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 ### Application startup
 
 - `MainApplication.onCreate` skips app-wide setup in `:venus`. The main process registers the GPU
-  application context and installs `Privacy` and `Diagnostics`. Manifest registration
-  and provider configuration are in `android/build`.
+  application context and installs `Privacy` (`android/privacy`) and `Diagnostics`
+  (`android/reports`). Manifest registration and provider configuration are in `android/build`.
 
 ### Guest browser client
 

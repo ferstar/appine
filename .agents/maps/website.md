@@ -62,8 +62,10 @@ user-directed sharing and network traffic from guest programs.
 ### Inbound
 
 - `android/build`: source/merged permissions, dependencies and backup exclusions.
-- `android/setup`: mirrors, system downloads, repository protocols and Settings.
-- `android/service`: diagnostics, terminal restoration and background execution.
+- `android/setup`: mirrors, system downloads and repository protocols.
+- `android/settings`: Settings screen links and diagnostic export UI.
+- `android/service`: terminal restoration and background execution.
+- `android/reports`: local diagnostics retention, archive export and fault notifications.
 - `android/privacy`, `android/documents`, `android/file-import`, `android/terminal`:
   authentication, file grants, selected imports and clipboard interactions.
 - Maintainer-supplied developer identity/contact and actual support-mail handling.

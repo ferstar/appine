@@ -241,7 +241,7 @@ construction and clock-stub detection (`kernel/vdso`).
   carry sequence, monotonic timestamp, facility, level and text (truncated to 991 bytes).
 - Writers: guest `/dev/kmsg` writes (prefix parsing, ratelimit 10 per 5 s by default, drops
   reported at close), the OOM killer, bug kills, unhandled-exception reports, the BKL watchdog
-  (a too-long hold once it ended, `kernel/process`), cgroup fork rejections, low-port remapping,
+  (a too-long hold once it ended, `kernel/bug`), cgroup fork rejections, low-port remapping,
   permission warnings. The host kernel's log is not included.
 - Readers: `/dev/kmsg` (a sequence per open, one record per read, `EPIPE` after records were
   dropped, seeks to start, data or end), `syslog(2)` and `/proc/kmsg` (a shared read position;
@@ -312,8 +312,8 @@ construction and clock-stub detection (`kernel/vdso`).
 - The run loop and dispatcher (`kernel/process`): delivery after every syscall, kick and fault;
   `orig_x0`; restart handling.
 - Timers, the TTY layer (job-control signals to process groups), process exit (child status),
-  seccomp (`force_fatal`), procfs (signal state), the OOM
-  killer, bug handling and the BKL watchdog (kernel log; bug kill reports read `stub::top`).
+  seccomp (`force_fatal`), procfs (signal state), the OOM killer, and `kernel/bug` (bug handling
+  and the BKL watchdog: kernel log; bug kill reports read `stub::top`).
 - Default arms reporting unimplemented paths: prctl (`kernel/process`), futex (`kernel/futex`),
   fcntl, file ioctls and device opens (`kernel/files`), terminal ioctls (`kernel/tty`), socket
   ioctls (`kernel/net`), madvise (`kernel/mm`); missing names from procfs views (`kernel/procfs`).

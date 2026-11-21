@@ -631,7 +631,7 @@ impl Kicker {
 
 // ---- Tier 1 ----
 
-/// Tier 1 translation and run statistics (the engine map).
+/// Tier 1 translation and run statistics (the engine/dbt map).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DbtStats {
