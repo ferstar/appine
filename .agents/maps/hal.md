@@ -69,7 +69,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `clock_getres`, `timezone`, `host_vdso` (`HostVdso`), `adjtimex_query`, `RawMode`, `sigwinch_notifier`, `stop_notifier`.
 - Network (`net`): `socket`, `close`, `bind`, `connect`, `listen`, `accept`, `sockname`,
   `setsockopt`, `getsockopt`, `get_filter`, `shutdown`, `sendmsg`, `recvmsg`, `interfaces`, `routes`,
-  `tx_queue_len`, `source_for`, `sockaddr`, `dns_query`.
+  `tx_queue_len`, `source_for`, `sockaddr`, `dns_query`, `preload_android_resolver` (Android).
 
 ## Data flow / lifecycle
 
@@ -180,7 +180,8 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 ### Inbound
 
 - `core/kernel` throughout (mm, store, VFS, syscalls, timer thread, forwarder, raw ICMP, terminal,
-  procfs, OOM); `hosts/cli` (`RawMode`, `sigwinch_notifier`, `isatty`, tests).
+  procfs, OOM); `hosts/cli` (`RawMode`, `sigwinch_notifier`, `stop_notifier`, `isatty`,
+  `net::preload_android_resolver` on Android, tests).
 
 ### Outbound
 

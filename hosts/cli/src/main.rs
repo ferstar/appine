@@ -200,18 +200,25 @@ fn main() -> ExitCode {
     // Without the pipe the signals keep their default action
     options.stop = appine_hal::stop_notifier().ok();
     #[cfg(target_os = "android")]
-    if options.terminal.is_some()
-        && interactive_shell(&args, on_tty)
-        && !matches!(env::var("APPINE_PRELOAD_ANDROID_DNS").as_deref(), Ok("0"))
-    {
+    let dns_preload = (options.terminal.is_some()
+        && interactive_shell(&args)
+        && !matches!(env::var("APPINE_PRELOAD_ANDROID_DNS").as_deref(), Ok("0")))
+    .then(|| {
         // Starting the guest never waits for this worker. A concurrent query uses the same loader.
-        let _ = std::thread::Builder::new()
+        // Joined before process exit so dlopen never races with libc::exit() teardown.
+        std::thread::Builder::new()
             .name("dns-preload".into())
-            .spawn(appine_hal::net::preload_android_resolver);
-    }
+            .spawn(appine_hal::net::preload_android_resolver)
+            .ok()
+    })
+    .flatten();
     let result = appine_kernel::run(&program, &argv, &envp, &options);
     // Restore the host terminal first, then print the message
     drop(raw);
+    #[cfg(target_os = "android")]
+    if let Some(handle) = dns_preload {
+        let _ = handle.join();
+    }
     let report = match result {
         Ok(report) => report,
         Err(err) => {
@@ -247,9 +254,10 @@ fn main() -> ExitCode {
     }
 }
 
-// Scope speculative DNS loading to a recognized shell with no command or script operand.
+// Scope speculative DNS loading to a recognized shell running on a PTY with no command or script
+// operand.
 #[cfg(any(target_os = "android", test))]
-fn interactive_shell(args: &[OsString], on_tty: bool) -> bool {
+fn interactive_shell(args: &[OsString]) -> bool {
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -263,32 +271,29 @@ fn interactive_shell(args: &[OsString], on_tty: bool) -> bool {
     ) {
         return false;
     }
-    let mut interactive = on_tty;
-    for flag in flags {
-        match flag.to_str() {
-            Some("-i" | "-il" | "-li" | "--interactive") => interactive = true,
-            Some("-l" | "--login") => {}
-            _ => return false,
-        }
-    }
-    interactive
+    flags.iter().all(|flag| {
+        matches!(
+            flag.to_str(),
+            Some("-i" | "-il" | "-li" | "--interactive" | "-l" | "--login")
+        )
+    })
 }
 
 #[cfg(test)]
 #[test]
 fn dns_preload_requires_an_interactive_shell() {
-    for (args, on_tty, expected) in [
-        (&["/bin/sh"][..], true, true),
-        (&["/bin/sh"], false, false),
-        (&["/bin/sh", "-i"], false, true),
-        (&["/bin/bash", "-li"], false, true),
-        (&["/bin/ash", "-c", "echo hello"], true, false),
-        (&["/bin/sh", "-i", "-c", "echo hello"], true, false),
-        (&["/bin/sh", "script.sh"], true, false),
-        (&["/bin/cat"], true, false),
+    for (args, expected) in [
+        (&["/bin/sh"][..], true),
+        (&["/bin/sh", "-i"], true),
+        (&["/bin/sh", "-l"], true),
+        (&["/bin/bash", "-li"], true),
+        (&["/bin/ash", "-c", "echo hello"], false),
+        (&["/bin/sh", "-i", "-c", "echo hello"], false),
+        (&["/bin/sh", "script.sh"], false),
+        (&["/bin/cat"], false),
     ] {
         let args = args.iter().map(OsString::from).collect::<Vec<_>>();
-        assert_eq!(interactive_shell(&args, on_tty), expected, "{args:?}");
+        assert_eq!(interactive_shell(&args), expected, "{args:?}");
     }
 }
 
