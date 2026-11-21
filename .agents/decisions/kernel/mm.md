@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D17 were seeded by hand from the retired design
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D17 were seeded by hand from the retired design
 > doc §5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -195,6 +195,27 @@
 - **Watch out**: The OOM check now sorts every member's spans each round, bounded by its 20-times-the-measurement interval, and a new kind of shared host memory with distinct host addresses per process would count once per process again.
 - **Source**: 1d3d559
 
+### D45: GPU mappings retain coherent renderer storage in shared VMAs
+- **What**: Guest GPU mappings keep the coherent renderer backing in a shared VMA across fork, VMA splits and TLB invalidation, so closing a GEM handle leaves live guest mappings intact.
+- **Why**: Packaged Vulkan drivers expect mapped GPU buffers to outlive closing their GEM handles without copying guest buffers.
+- **Tradeoffs**: GPU mappings require alignment and cannot grow or be executable.
+- **Watch out**: Real 16 KiB-page hardware still needs GPU mapping coverage.
+- **Source**: 87c7d9db
+
+### D46: `Mm::memops` tracks read-only executable file mappings and prunes centrally in `Mm::sync`
+- **What**: `Mm` stores discovered `DbtMemop` entries across fork, scans only read-only, non-FUSE, versioned `Backing::PrivateFile` executable mappings in `Mm::map` (later narrowed to the verified bundled musl snapshot by kernel/exec D2 and kernel/mmu D5), marks `memops_dirty`, and prunes `Mm::memops` centrally in `Mm::sync` whenever executable ranges are invalidated or lose read-only exec status (including `write_force`).
+- **Why**: Runtime-mapped shared libraries need memop registration in `Mm::map`, while direct unpruned pushes left stale memop entries after `munmap`, `mprotect`, `mremap`, `write_force` breakpoints or `ic ivau`.
+- **Tradeoffs**: Newly mapped memops activate at `Mm::sync` (syscall exit) rather than mid-syscall.
+- **Watch out**: Internal callers of `Mm::map` that skip `Mm::sync` do not publish new memops until the next `sync` or `code_space` creation.
+- **Source**: f2690b02, 9b3b6860
+
+### D47: Verified bundled musl snapshots share host mappings through `FileMaps`
+- **What**: `BundledLibc` records its memfd snapshot's `(st_dev, st_ino)` at creation and `Mm::map` keys `FileMaps` by `[snap_dev, snap_ino, offset, len, 0, size]` so dynamic Alpine processes share host mappings of the verified snapshot.
+- **Why**: Bypassing `FileMaps` forced every dynamic Alpine process to create and unmap its own host `mmap`, fault host page tables separately and lose single-counted shared host-address accounting.
+- **Tradeoffs**: Adds one `fstat` at one-time snapshot creation and holds one `FileMaps` slot per distinct mapped slice until memory trim.
+- **Watch out**: Relies on the global `OnceLock<Arc<BundledLibc>>` keeping the snapshot memfd open so its `(st_dev, st_ino)` cannot be reused.
+- **Source**: c8f01dbf
+
 ## Superseded
 
 - ~~Adjacent VMAs joined only for display in maps and in fork's commit estimate (D7 in part, rounds 17, 18)~~ → replaced by **D22** in e03c0cc (2026-11-07)
@@ -202,3 +223,5 @@
 - ~~process_mrelease stays `ENOSYS` until earlyoom and oom_score make it worth doing (b141001 in part)~~ → replaced by **D35** in 39ea702 (2026-11-08)
 - ~~FUSE mappings copy the whole range into a memfd at mmap (c008749)~~ → replaced by **D40** in 3957a03 (2026-11-09)
 - ~~Guest memory, with the page table, software TLB and OOM killer, is one kernel/mm module (D18, cd53f35)~~ → replaced by **D18** in 44a21b7 (2026-11-11)
+- ~~Direct unpruned `Mm::map` memop registration in f2690b02~~ → replaced by **D46** in 9b3b6860 (2026-11-21).
+- ~~Bypassing `FileMaps` for `bundled_libc` mappings in 6b59a1b4~~ → replaced by **D47** in c8f01dbf (2026-11-21, cross-module predecessor tagged under kernel/mmu and kernel/exec).

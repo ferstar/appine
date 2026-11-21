@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -168,6 +168,14 @@
 - **Tradeoffs**: Extra words and nonnumeric periods still fail where Linux’s sscanf can ignore them.
 - **Watch out**: Native comparison requires the container to expose and enable the CPU controller.
 - **Source**: 45be9fae; 20137e4c; d053be24; 39e55b4b
+
+### D42: Synthetic sysfs publishes the conditional platform DRM render-node hierarchy
+
+- **What**: Synthetic sysfs conditionally exposes the DRM render-node device, subsystem link and uevent when a GPU renderer is enabled.
+- **Why**: Packaged `libdrm` traverses sysfs links to identify `/dev/dri/renderD128`.
+- **Tradeoffs**: Only the discovery paths required by the tested Alpine and Debian guests are implemented.
+- **Watch out**: Other `libdrm` versions may require additional sysfs attributes, and device numbers must agree with kernel/vfs D57.
+- **Source**: 87c7d9db
 
 ## Superseded
 

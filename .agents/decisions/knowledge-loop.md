@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: knowledge-loop"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-21 (HEAD = 125f3d00)
 
 ## Active
 
@@ -86,6 +86,22 @@
 - **Tradeoffs**: Per-workload comparisons require opening the historical survey files.
 - **Watch out**: Use the original compiler, workload and run conditions when comparing measurements.
 - **Source**: 426949bb
+
+### D12: Mobile GPU design evidence and hardware acceptance criteria live in `docs/mobile-gpu.md`
+
+- **What**: Record the candidate Venus architecture, distribution package evidence, hardware validation plan and device survey results in standalone English `docs/mobile-gpu.md`.
+- **Why**: Implementation and cross-device GPU evaluation need package evidence and acceptance criteria preserved together in the repository rather than chat.
+- **Tradeoffs**: Package and source references describe the specific versions examined.
+- **Watch out**: Android driver memory mapping and vendor shader defects can limit device coverage and must stay tied to tested hardware.
+- **Source**: ab1c4a7e
+
+### D13: Mobile GPU sources belong to existing module owners rather than a dedicated GPU module
+
+- **What**: Assign mobile GPU implementation, build and test sources across the existing kernel, Android and harness modules in `.agents/MODULES.md` and record measured hardware limits in their maps.
+- **Why**: GPU support integrates into boot, open files, mm, poll, procfs, vfs, native, build, tests and harness rather than forming an isolated subsystem.
+- **Tradeoffs**: Changing the device contract can touch several module maps.
+- **Watch out**: Hardware capability claims in maps must track only the devices actually tested.
+- **Source**: 87c7d9db
 
 ## Superseded
 

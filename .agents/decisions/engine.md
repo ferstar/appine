@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D18 were seeded by hand from the retired design
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D18 were seeded by hand from the retired design
 > doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -200,6 +200,24 @@
 - **Watch out**: Page zero needs its own path because zero is the empty pending-page sentinel.
 - **Source**: 8bc0e63b
 
+### D28: Tier 1 accelerates six length-gated libc memops through an atomic table and install-time check
+
+- **What**: Tier 1 emits an inline NZCV-preserving `x2 >= 128` gate (`ubfx + cbnz`) for registered `memcpy`, `memset`, `memmove`, `memcmp`, `memchr` and `strncmp` entry PCs via an atomically published sorted `memop_table`, rechecks the observed kind under the DBT lock before installing untagged blocks, bypasses global templates, retires affected PCs on update and before `DbtSpace` pooling, ignores private tagged code-group blocks, untags TBI pointers with NULL checks in `exec_memop`, pops matching shadow return-stack entries on return and falls back to guest code on watchpoints or missing permissions.
+- **Why**: Tight libc memory loops paid per-iteration soft-TLB checks in Tier 1, while earlier unconditional string hooks regressed short-string workloads 2.9x and unsynchronized mutable/templated registrations caused stale-block and cross-process races.
+- **Tradeoffs**: Unbounded `strlen`, `strchr` and `strcmp` stay in guest code, small calls (< 128 B) pay two entry instructions, memop entry blocks (~6–12 per process) skip global templates, and each untagged block install performs one table lookup.
+- **Watch out**: Keep the install-time kind check before code publication, note that a concurrent `munmap` mid-`memmove` falls back after partial writes (matching a hardware race), and a full code cache during `set_memops` triggers a full flush.
+- **Source**: aad49bdd, dc43dc57, 9b3b6860, 39db4760
+
+### D29: Concurrent memop-registration races are tested in Cargo integration tests
+
+- **What**: `memops_concurrent_set_memops_keeps_translations_consistent` in `core/engine/tests/dbt.rs` replaces the standalone `core/engine/tests/memop_update.c` by racing worker translations against `set_memops` and `flush` across 64 rounds and 16 PCs and asserting post-race cache consistency.
+- **Why**: The standalone C test included `../src/c/dbt.c` directly and was neither compiled nor executed by `cargo test` or CI, inviting silent bit-rot.
+- **Tradeoffs**: Trades deterministic white-box single-step interleaving for a stochastic multi-threaded test that runs on every `cargo test` and CI build.
+- **Watch out**: Very rare interleavings may not fire on every single run despite repeated concurrent rounds.
+- **Source**: c8f01dbf
+
 ## Superseded
 
 - ~~Every FPCR write exits to Tier 0 in 16914003~~ → narrowed by **D25** in 8bc0e63b (2026-11-17).
+- ~~Unconditional `strlen`/`strchr`/`strcmp` dispatch and unsynchronized `d->memops` storage in aad49bdd and dc43dc57~~ → replaced by **D28** in 9b3b6860 (2026-11-21).
+- ~~Standalone C test `core/engine/tests/memop_update.c` in 39db4760~~ → replaced by **D29** in c8f01dbf (2026-11-21, implicit refinement).

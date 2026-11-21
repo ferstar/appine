@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -106,11 +106,11 @@
 - **Source**: bc44b65, e43c40c
 
 ### D38: A watchdog thread reports long BKL holds without waiting for the BKL
-- **What**: Every BKL acquisition records its holder (count, host tid, guest tid, tgid, comm, `Doing` and pc) in the cache-line `Hold`; a `bkl-watchdog` thread samples it every fifth of the threshold (10 s by default, `APPINE_BKL_WATCHDOG` in seconds, 0 off), reports a hold unchanged that long on stderr and in `Shared::stall` (which `Machine::stall` reads without the BKL), and at the hold's end spawns a `bkl-watchdog-log` thread that writes the KERN_ERR record under the BKL; nothing is killed.
-- **Why**: A hold that never ended (a loop in kernel code, a host call blocking with the lock held) froze everything without saying where, and the first version's `ended` took the BKL itself to log, blocking the only watcher behind the next holder.
-- **Tradeoffs**: Each acquisition pays a few relaxed stores and each entry a 40-byte thread-local write, durations are right only to one look (2 s by default), a thread releasing and retaking the lock in a loop is not caught, and the kernel-log record may arrive well after the stall or be lost if its thread cannot start.
-- **Watch out**: Anything added to `Hold` must stay on its cache line as a plain store, a logger waiting for a BKL that is never released stays blocked and may outlive its `Machine`, and a hold that never ends still blocks `Machine`'s drop.
-- **Source**: 64a6107, d20fd3c (the blocking `ended` recorded in d9e1f0c)
+- **What**: Every BKL acquisition records its holder (count, host tid, guest tid, tgid, comm, `Doing` and pc) in the cache-line `Hold`; a `bkl-watchdog` thread samples it every fifth of the threshold (10 s by default, `APPINE_BKL_WATCHDOG` in seconds, 0 off), reports a hold unchanged that long on stderr and in `Shared::stall` (which `Machine::stall` reads without the BKL), and queues end-of-hold lines in `Mutex<PendingLog>` for at most one on-demand `bkl-watchdog-log` drainer thread that acquires the BKL, writes all queued KERN_ERR records to `klog::printk` in FIFO order under `bug::catch`, and exits when empty; nothing is killed.
+- **Why**: A hold that never ended froze everything without saying where, taking the BKL inside `ended` blocked the watcher, and spawning a separate logger thread per ended stall let consecutive loggers race for the BKL and write kernel log records out of order.
+- **Tradeoffs**: Each acquisition pays a few relaxed stores and each entry a 40-byte thread-local write, durations are accurate only to one look (2 s by default), release-and-retake loops are not caught, and a failed drainer spawn clears and drops queued kernel-log records (while stderr and `Machine::stall` still carry the line).
+- **Watch out**: Anything added to `Hold` must stay on its cache line as a plain store, a drainer blocked on an unreleased BKL holds `Arc<Shared>` until freed, a stall storm queues lines in memory while the BKL is contended, and an unending hold still blocks `Machine`'s drop.
+- **Source**: 64a6107, d20fd3c (the blocking `ended` recorded in d9e1f0c), 1e6c63a9
 
 ### D49: sched_yield runs without the BKL and yields the host thread
 - **What**: The fast path (D6) handles sched_yield by clearing `in_guest` and calling `std::thread::yield_now`, and when the fast path is off (tracing, a seccomp filter that does not always allow it) the BKL path yields inside `Cx::unlocked`.
@@ -201,3 +201,4 @@
 - ~~kernel/process also covers execve and the ELF loader, futexes and namespaces (D14, dd6c288, d2b1dc3)~~ → replaced by **D14** in b320f8e (2026-11-11)
 - ~~D14 ownership of timers, periodic checks and PID 1~~ → replaced by **D14** in 8a17e4a9 (2026-11-14)
 - ~~Comparing observations at each checkpoint under D47~~ → narrowed by **D47 and kernel/cgroup D2** in 0f5c5132 (2026-11-17).
+- ~~Spawning a separate `bkl-watchdog-log` thread per ended stall under D38 in d20fd3c~~ → replaced by **D38** in 1e6c63a9 (2026-11-21).
