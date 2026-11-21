@@ -1452,6 +1452,111 @@ fn memops_in_code_group_ignore_private_mappings() {
     assert_eq!(g.run_at(&mut dbt, caller), 0x4444);
 }
 
+#[test]
+fn memops_concurrent_set_memops_keeps_translations_consistent() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let Some(space) = DbtSpace::new(0, DbtRegs::Default) else {
+        return;
+    };
+    const N: usize = 16;
+    let ops: Vec<DbtMemop> = (0..N)
+        .map(|i| DbtMemop {
+            pc: CODE + 0x10 * i as u64,
+            kind: MEMOP_MEMSET,
+            reserved: 0,
+        })
+        .collect();
+    let setup = |g: &mut Guest| {
+        for i in 0..N {
+            let f = CODE + 0x10 * i as u64;
+            let caller = CODE + 0x200 + 0x10 * i as u64;
+            g.code(f, &[movz_x0(0x5555), RET]);
+            g.code(caller, &[bl(caller, f), SVC]);
+        }
+    };
+
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
+    let mut g = Guest::with_data();
+    setup(&mut g);
+
+    for final_enabled in [true, false] {
+        space.set_memops(if final_enabled { &[] } else { &ops });
+        dbt.flush();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let (space, stop, done) = (space.clone(), stop.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut dbt = Dbt::attach(&space, 0).unwrap();
+                    let mut g = Guest::with_data();
+                    setup(&mut g);
+                    let mut i = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        let caller = CODE + 0x200 + 0x10 * (i % N) as u64;
+                        g.pages[3].0[..256].fill(0);
+                        let s = g.cpu.state_mut();
+                        s.pc = caller;
+                        s.x[0] = DATA;
+                        s.x[1] = 0x7a;
+                        s.x[2] = 256;
+                        run_to_svc(&mut dbt, &mut g.cpu);
+                        let ret = g.cpu.state().x[0];
+                        if ret == DATA {
+                            assert!(g.pages[3].0[..256].iter().all(|&b| b == 0x7a));
+                        } else {
+                            assert_eq!(ret, 0x5555);
+                            assert!(g.pages[3].0[..256].iter().all(|&b| b == 0));
+                        }
+                        i += 1;
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for round in 0..32 {
+            space.set_memops(if final_enabled { &[] } else { &ops });
+            if round % 4 == 0 {
+                dbt.flush();
+            }
+            space.set_memops(if final_enabled { &ops } else { &[] });
+        }
+        // Let workers finish any in-flight translations racing the final update.
+        let target = done.load(Ordering::Relaxed) + 64;
+        while done.load(Ordering::Relaxed) < target {
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+
+        // Verify directly without calling set_memops again so any stale block installed across
+        // the final registration change is caught.
+        for i in 0..N {
+            let caller = CODE + 0x200 + 0x10 * i as u64;
+            g.pages[3].0[..256].fill(0);
+            let s = g.cpu.state_mut();
+            s.pc = caller;
+            s.x[0] = DATA;
+            s.x[1] = 0x7a;
+            s.x[2] = 256;
+            run_to_svc(&mut dbt, &mut g.cpu);
+            if final_enabled {
+                assert_eq!(g.cpu.state().x[0], DATA);
+                assert!(g.pages[3].0[..256].iter().all(|&b| b == 0x7a));
+            } else {
+                assert_eq!(g.cpu.state().x[0], 0x5555);
+                assert!(g.pages[3].0[..256].iter().all(|&b| b == 0));
+            }
+        }
+    }
+}
+
 fn bl(from: u64, to: u64) -> u32 {
     0x9400_0000 | (((to as i64 - from as i64) / 4) as u32 & 0x3ff_ffff)
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: bundled musl snapshot sharing through FileMaps)
 
 ## Responsibilities
 
@@ -220,7 +220,9 @@ the CPU engine and the Tier 1 translator (`engine`), SysV IPC objects (`kernel/i
   - other private anonymous, shared anonymous and SysV shm → the `recycled` pool, else a new host
     private anonymous mapping;
   - read-only private file with a trusted content version → a `FileMaps` hit (VMA marked `cow`),
-    or a new read-only host mapping inserted into the cache;
+    or a new read-only host mapping inserted into the cache (verified bundled musl executable
+    mappings map their immutable `memfd` snapshot and share it through `FileMaps` under the
+    snapshot's own device and inode);
   - other file mappings → host `mmap` of the store file's host object (read-write for private
     mappings);
   - a FUSE file → host `mmap` of its `Fill`'s memfd, empty at first (`mmap_fill`): no content

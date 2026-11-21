@@ -966,6 +966,7 @@ type MemopCache = Mutex<std::collections::HashMap<MemopCacheKey, Option<Arc<Bund
 
 pub(crate) struct BundledLibc {
     snapshot: File,
+    snapshot_id: (u64, u64),
     entries: Vec<(u64, u32)>,
 }
 
@@ -987,25 +988,16 @@ fn memop_cache() -> &'static MemopCache {
 }
 
 fn memop_kind_for(name: &[u8], bind: u8) -> u32 {
-    if bind == STB_GLOBAL || bind == STB_WEAK {
-        match name {
-            b"memcpy" => return appine_engine::MEMOP_MEMCPY,
-            b"memset" => return appine_engine::MEMOP_MEMSET,
-            b"memmove" => return appine_engine::MEMOP_MEMMOVE,
-            b"memcmp" => return appine_engine::MEMOP_MEMCMP,
-            b"memchr" => return appine_engine::MEMOP_MEMCHR,
-            b"strncmp" => return appine_engine::MEMOP_STRNCMP,
-            _ => {}
-        }
+    if bind != STB_GLOBAL && bind != STB_WEAK {
+        return 0;
     }
-    // Internal glibc IFUNC target implementations may have local binding in `.symtab`.
     match name {
-        b"__memcpy_generic" | b"__memcpy_simd" => appine_engine::MEMOP_MEMCPY,
-        b"__memset_generic" | b"__memset_zva64" => appine_engine::MEMOP_MEMSET,
-        b"__memmove_generic" | b"__memmove_simd" => appine_engine::MEMOP_MEMMOVE,
-        b"__memcmp_generic" => appine_engine::MEMOP_MEMCMP,
-        b"__memchr_generic" => appine_engine::MEMOP_MEMCHR,
-        b"__strncmp_generic" => appine_engine::MEMOP_STRNCMP,
+        b"memcpy" => appine_engine::MEMOP_MEMCPY,
+        b"memset" => appine_engine::MEMOP_MEMSET,
+        b"memmove" => appine_engine::MEMOP_MEMMOVE,
+        b"memcmp" => appine_engine::MEMOP_MEMCMP,
+        b"memchr" => appine_engine::MEMOP_MEMCHR,
+        b"strncmp" => appine_engine::MEMOP_STRNCMP,
         _ => 0,
     }
 }
@@ -1164,9 +1156,18 @@ pub(crate) fn bundled_libc(fd: i32, version: MemopCacheKey) -> Option<Arc<Bundle
             .collect();
             let mut snapshot = appine_hal::memfd(c"appine-bundled-libc").ok()?;
             snapshot.write_all(&image).ok()?;
+            let st = appine_hal::fstat(snapshot.as_raw_fd()).ok()?;
+            #[allow(clippy::unnecessary_cast)]
+            let snapshot_id = (st.st_dev as u64, st.st_ino as u64);
             Some(
                 SNAPSHOT
-                    .get_or_init(|| Arc::new(BundledLibc { snapshot, entries }))
+                    .get_or_init(|| {
+                        Arc::new(BundledLibc {
+                            snapshot,
+                            snapshot_id,
+                            entries,
+                        })
+                    })
                     .clone(),
             )
         }
@@ -1195,6 +1196,14 @@ fn fd_read_exact(fd: i32, off: u64, len: usize) -> Option<Vec<u8>> {
 }
 
 impl BundledLibc {
+    pub(crate) fn snapshot_id(&self) -> (u64, u64) {
+        self.snapshot_id
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        BUNDLED_LIBC_SIZE as u64
+    }
+
     pub(crate) fn map(&self, offset: u64, len: usize) -> Result<appine_hal::FileMapping, i32> {
         appine_hal::map_file_read_only(self.snapshot.as_raw_fd(), offset, len)
     }
@@ -1636,8 +1645,7 @@ mod tests {
             off
         };
         let s_memcpy = add_str(b"memcpy");
-        let s_memset_local = add_str(b"memset");
-        let s_memset_generic = add_str(b"__memset_generic");
+        let s_memset = add_str(b"memset");
         let s_memmove_ifunc = add_str(b"memmove");
         let s_strlen = add_str(b"strlen");
 
@@ -1653,9 +1661,9 @@ mod tests {
         // Global STT_FUNC memcpy -> accepted at file offset 0x1100.
         add_sym(s_memcpy, STB_GLOBAL, STT_FUNC, p_vaddr + 0x100);
         // Local STT_FUNC memset -> must be ignored (user static function).
-        add_sym(s_memset_local, 0, STT_FUNC, p_vaddr + 0x200);
-        // Local glibc internal __memset_generic -> accepted at file offset 0x1300.
-        add_sym(s_memset_generic, 0, STT_FUNC, p_vaddr + 0x300);
+        add_sym(s_memset, 0, STT_FUNC, p_vaddr + 0x200);
+        // Weak STT_FUNC memset -> accepted at file offset 0x1300.
+        add_sym(s_memset, STB_WEAK, STT_FUNC, p_vaddr + 0x300);
         // Global STT_GNU_IFUNC (10) memmove -> must be ignored.
         add_sym(s_memmove_ifunc, STB_GLOBAL, 10, p_vaddr + 0x400);
         // Global strlen -> not in the length-gated memop set, must be ignored.
@@ -1779,7 +1787,7 @@ mod tests {
 
     #[test]
     fn parse_elf_memops_rejects_oversized_shentsize() {
-        let mut hdr = vec![0u8; 64 + 56];
+        let mut hdr = [0u8; 64 + 56];
         hdr[0..4].copy_from_slice(b"\x7fELF");
         hdr[4] = 2;
         hdr[5] = 1;

@@ -1785,16 +1785,22 @@ impl Mm {
                     Backing::PrivateFile
                 };
                 // A read-only private mapping with a trusted version: all address spaces share one
-                // host mapping (FileMaps)
-                let key = st
-                    .as_ref()
-                    .zip(content)
-                    .filter(|_| !shared && prot & prot::WRITE == 0 && bundled_libc.is_none())
-                    .map(|(s, (ctime, size))| {
-                        #[allow(clippy::unnecessary_cast)]
-                        let (dev, ino) = (s.st_dev as u64, s.st_ino as u64);
-                        [dev, ino, offset, len, ctime, size]
-                    });
+                // host mapping (FileMaps). Verified bundled musl maps its immutable memfd snapshot
+                // under the snapshot's own (dev, ino) so it never aliases unverified mappings of
+                // the original file.
+                let key = if let Some(libc) = &bundled_libc {
+                    let (dev, ino) = libc.snapshot_id();
+                    Some([dev, ino, offset, len, 0, libc.size()])
+                } else {
+                    st.as_ref()
+                        .zip(content)
+                        .filter(|_| !shared && prot & prot::WRITE == 0)
+                        .map(|(s, (ctime, size))| {
+                            #[allow(clippy::unnecessary_cast)]
+                            let (dev, ino) = (s.st_dev as u64, s.st_ino as u64);
+                            [dev, ino, offset, len, ctime, size]
+                        })
+                };
                 if let Some((region, host)) = key.as_ref().and_then(|k| self.files.get(k)) {
                     cached = true;
                     (backing, true, region, host)
@@ -1816,8 +1822,8 @@ impl Mm {
                     });
                     if let Some(key) = key {
                         self.files.insert(key, region.clone(), m.ptr);
+                        cached = true;
                     }
-                    cached = key.is_some() || bundled_libc.is_some();
                     (backing, !shared || writable, region, m.ptr)
                 }
             }
