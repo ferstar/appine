@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: the pinned Venus build, service packaging and notices for release 1.0.1)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: Android and Cargo release versions)
 
 ## Responsibilities
 
@@ -103,7 +103,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   included) treats compiler warnings as errors, and lint treats its warnings as errors, except
   `GradleDependency`, `AndroidGradlePluginVersion`, `OldTargetApi`, `ExpiringTargetSdkVersion` and
   `OutdatedLibrary`, which follow data outside the repository and are informational.
-- Release: signed with the debug key, versionCode 2 and versionName 1.0.1. The Cargo workspace shares the release version. R8 uses the
+- Release: signed with the debug key, versionCode 3 and versionName 1.1.0. The Cargo workspace shares the release version. R8 uses the
   optimized Android defaults and shrinks unused resources. `app/proguard-rules.pro` keeps app
   JNI declarations, the GPU service connection lookup and the public void `VtSession.on*` callbacks looked up by the native pump;
   callbacks outside that pattern need a matching keep rule. The release mapping is under
