@@ -50,7 +50,7 @@ zig.path=/opt/homebrew/bin/zig
 
 Both APKs build `libappine.so` for `arm64-v8a`. Debug uses Cargo's `release` profile to keep
 the interpreter fast, appends `.debug` to the application ID (`io.github.mthli.appine.debug`),
-and uses a yellow launcher icon outline (`#FFD600`) so it can be installed alongside release.
+and uses a lemon yellow launcher icon outline (`#F5DF4D`) to distinguish it from release.
 Release uses `android-release` for cross-crate LTO and a smaller library.
 
 The release APK uses R8 and resource shrinking and is signed with the local debug key.

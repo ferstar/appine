@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: debug applicationIdSuffix and yellow launcher outline)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: lemon yellow debug launcher outline)
 
 ## Responsibilities
 
@@ -49,7 +49,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   executable; it is never up to date. Debug variants add the `test-hooks` and `borrow-check`
   features, use Cargo's `release` profile, append `.debug` to the application ID
   (`io.github.mthli.appine.debug`) while keeping `namespace` at `io.github.mthli.appine`, and
-  override `ic_foreground_stroke_color` to `#FFD600` so debug installs alongside release
+  override `ic_foreground_stroke_color` to `#F5DF4D` to distinguish the two launcher icons
   (manifest provider authorities use `${applicationId}`). The release APK selects the workspace's
   `android-release` profile, which inherits `release` and enables cross-crate LTO.
 - Gradle resolves Zig from a nonblank, trimmed `zig.path` in `android/local.properties`, then the
@@ -156,7 +156,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   rules), normal permissions plus `POST_NOTIFICATIONS`, which `MainActivity` and Settings can request at run time,
   and `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` for the terminal banner’s user-initiated system dialog.
   The app requests no storage permission. The debug source set's network security config allows cleartext to
-  127.0.0.1 only (for the download tests), and its `colors.xml` overrides `ic_foreground_stroke_color` to `#FFD600`.
+  127.0.0.1 only (for the download tests), and its `colors.xml` overrides `ic_foreground_stroke_color` to `#F5DF4D`.
 
 ### Released sources
 
