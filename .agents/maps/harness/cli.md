@@ -46,6 +46,9 @@ benchmarks are `harness`, differential testing `harness/diff`.
   continuing with a message if it cannot, and `SIGWINCH` resizes the guest console); `--pty`
   forces one (24×80 unless both are terminals), `--no-pty` gives the guest the host's stdio.
   Through the PTY, guest stdout and stderr both reach fd 1.
+- On Android, a recognized interactive shell with a PTY starts the system DNS loader in a
+  background thread (joined before exit). Command and script invocations load it on demand. Set
+  `APPINE_PRELOAD_ANDROID_DNS=0` to disable preloading.
 - The kernel's `run` starts a machine, opens the console, boots by inittab with `--init`, spawns
   the program and bridges the terminal; afterwards it shuts down by inittab (`--init`; a reboot
   request is only a shutdown) or kills everything, then joins the bridge.
@@ -101,7 +104,8 @@ benchmarks are `harness`, differential testing `harness/diff`.
 ### Outbound
 
 - `appine_kernel` provides run/options/reports, Machine, store import and sync.
-- `hal` provides RawMode, isatty, SIGWINCH and stop notifiers.
+- `hal` provides RawMode, isatty, SIGWINCH and stop notifiers, and `net::preload_android_resolver`
+  on Android.
 - `harness` supplies `appine-bench` as a dev-dependency and development container/CI.
 - `android/setup` fetches rootfs artifacts; guest builds use cc/musl-gcc.
 
