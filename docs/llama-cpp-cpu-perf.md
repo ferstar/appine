@@ -1,6 +1,6 @@
 # Optimizing CPU Performance for `llama.cpp`
 
-> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, and post-2A prefill diagnosis completed 2026-11-22; Phase 2B and Step 3 pending).
+> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, and Phase 2B-1 completed 2026-11-22; Phase 2B-2 and Step 3 pending).
 > Grounded in `core/engine/src/c/dbt.c`, `core/engine/include/appine/engine.h`,
 > `core/engine/src/c/features.c`, `core/engine/src/c/mmu.c`, `core/kernel/src/mm.rs`,
 > `core/kernel/src/syscall/mem.rs`, `core/kernel/src/syscall/fast.rs`,
@@ -481,26 +481,29 @@ handful of strided NEON compute loops (`ggml_vec_dot_*`, `ggml_gemm_*`, `rms_nor
        (`1,624 → ~3,400+` samples, `~+1,800 ms` = **~62%** of the remaining gap), and all other
        code (`softmax`, `quantize`, `swiglu`, `rms_norm`, `refill`, host/kernel) accounts for
        `911 → ~1,630` samples (`~24%` of the gap).
-   - **Phase 2B (pending)** — split into two verified sub-phases from hot-loop disassembly:
-     - **Phase 2B-1 (single-block Q4_0 `flash_attn` loops — highest remaining Q4_0 prefill ROI)**:
-       - `0x6f260` (13.94% of `pp512 -t 1`): `M_REG` with induction base + loop-invariant index
-         (`ldr s23, [x2, x28, lsl #2]`, stolen `x28`).
-       - `0x6f5a0` (9.49%): loop-invariant register stride (`add x4, x4, x26`; prologue validates
-         `0 < stride <= 4096 - span` and computes `page_iters` via `udiv`).
-       - `0x6ed64` (4.74%): `M_REG` with loop-invariant base + induction index
-         (`ldr h31, [x1, x6, lsl #1]`, `str s31, [x2, x6, lsl #2]`) plus loop-local
-         write-before-read NZCV (`fcmp` + `cset`, safe because fast-loop `T2` counter is
-         NZCV-free and loop-closing `cmp` follows `cset`).
-     - **Phase 2B-2 (`tinyBLAS::gemm_bloc` — 78.0% of F16 prefill)**:
-       - Derived shifted indices (`add tmp, row_off, x0; lsl tmp, tmp, #1`) and derived compare
-         operand (`x3 = x0 + 15; cmp x11, x3`).
-       - Same-base multi-row addend sharing: 10–11 memory streams share only **3 base registers**
-         (`x1`, `x2`, `sp`); verifying all rows of a base hit TLB with the same `addend` stays
-         well within `FAST_LOOP_MAX_PTRS = 7`.
-       - Zero-stride `sp` base (`[sp, #0..352]`), also eliminating F16 prefill's 3.33% cross-page
-         `refill[1]` overhead.
-       - Cross-4 KiB-code-page 2-block loop support for `gemm_bloc<4, 6>` (`0x9dff0..0x9e104`;
-         `gemm_bloc<4, 5>` at `0x9e600..0x9e6f0` is single-page).
+   - **Phase 2B-1 (completed 2026-11-22 — Q4_0 `flash_attn` single-block loops + stolen-register pinning)**:
+     - Extended `analyze_fast_loop` / `emit_fast_loop` in `core/engine/src/c/dbt.c` with:
+       - Multi-stream access tracking (`FAST_LOOP_MAX_STREAMS = 12`) over root base pointers (`FAST_LOOP_MAX_PTRS = 7`), verifying shared `addend` across same-base streams (`[x2]` + `[x2, x28, lsl #2]` in `0x6f260`, and read+write `[x14, x0]` in `0x6f804`).
+       - `M_REG` support for both induction base + loop-invariant index (`0x6f260`, any extend option) and loop-invariant base + 64-bit `LSL`/`SXTX` induction index (`0x6ed64`, `0x6f804`), plus 64-bit `ADD Xc, Xc, #imm` counters with 32-bit `CMP Wb, Wc`.
+       - Loop-invariant register strides (`ADD Xd, Xd, Xm` in `0x6f5a0`, `0x6f608`, `0x6f7a0`), using AArch64 `UDIV` in the prologue so zero, negative, and `> avail` strides bail via `cbz` with zero extra branches.
+       - Loop-local write-before-read NZCV (`FCMP`/`FCMPE` + `CSET`/`FCSEL` in `0x6ed64` and `0x6f3a0`), keeping `SUBS` flags intact and re-emitting the omitted `FL_CMP_INC` `CMP` once in the epilogue so pre-`fcmp` faults observe exact iteration-end NZCV.
+       - Loop-wide pinning of `<= 2` distinct stolen GPRs into `{T0, T1}` across the fast body (load once in commit, flush only written regs in epilogue), removing all per-iteration `CTX` loads/stores in `0x6f260` (`x17`, `x28`), `0x6f5a0` (`x26`), and `ggml_gemm_q4_0_4x4_q8_0` (`x28`).
+     - All 5 `flash_attn` loops (`0x6ed64`, `0x6f260`, `0x6f3a0`, `0x6f5a0`, `0x6f804`) match (`fast loops`: `56 → 64` on Q4_0 `pp512`).
+     - **Same-session alternating A/B results vs. Phase 2A** (2 rounds × `-r 3`, `appine-run --tier 1` on `/bench/store`):
+       - Qwen2.5-0.5B Q4_0 `pp128 -t 1`: `263.97 → 282.39 t/s` (**+7.0%**); `pp512 -t 1`: `201.10 → 231.85 t/s` (**+15.3%**, now **1.23×** native vs. 1.51× in Step 0); `tg128 -t 1`: `96.66 → 97.86 t/s` (**+1.2%**).
+       - Qwen2.5-0.5B Q4_0 `pp128 -t 4`: `895.64 → 980.02 t/s` (**+9.4%**, now **1.18×** native vs. 1.37× in Step 0); `pp512 -t 4`: `737.88 → 844.46 t/s` (**+14.4%**, now **1.22×** native vs. 1.45× in Step 0); `tg128 -t 4`: `183.83 → 184.88 t/s` (+0.6%).
+       - Qwen2.5-0.5B F16 `pp128 -t 4`: `228.86 → 235.85 t/s` (**+3.1%**); `tg32 -t 4`: flat (`74.29 → 72.63 t/s`, within ±2.5 t/s run noise).
+       - **Verification & non-ML regression**: `appine-engine` 80/80, `guest_programs` 26/26, `rootfs_programs` 73/73, 200k-iteration `appine-lockstep` under both `Default` and `Go` (0 mismatches), `appine-bench` Tier 1 geomean **1.69×** (unchanged vs. Phase 2A).
+   - **Phase 2B-2 (pending — `tinyBLAS::gemm_bloc`, 78.0% of F16 prefill)**:
+     - Derived shifted indices (`add tmp, row_off, x0; lsl tmp, tmp, #1`) and derived compare
+       operand (`x3 = x0 + 15; cmp x11, x3`).
+     - Same-base multi-row addend sharing (already supported by Phase 2B-1's `fast_stream` /
+       `first_for_ptr` mechanism; raise `FAST_LOOP_MAX_STREAMS` if needed): 10–11 memory streams
+       share only **3 base registers** (`x1`, `x2`, `sp`), staying within `FAST_LOOP_MAX_PTRS = 7`.
+     - Zero-stride `sp` base (`[sp, #0..352]`), also eliminating F16 prefill's 3.33% cross-page
+       `refill[1]` overhead.
+     - Cross-4 KiB-code-page 2-block loop support for `gemm_bloc<4, 6>` (`0x9dff0..0x9e104`;
+       `gemm_bloc<4, 5>` at `0x9e600..0x9e6f0` is single-page).
 4. **Step 3 — Deferred / optional secondary work**
    - **Direction 3B** (unlocked `madvise` forwarding + widened read-only file `fault_in`): small
      independent change for cold-start TTFT on flash storage; can land anytime.

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-21 (split out of the engine full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: strip-mined in-page fast loops for single-block constant-stride self-loops and DbtStats::fast_loops)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: extended strip-mined fast loops with multi-stream M_REG, register strides, write-before-read NZCV and loop-wide stolen-register pinning)
 
 ## Responsibilities
 
@@ -177,22 +177,29 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
   following 256 bytes (64-entry ring; templates are versioned by it). Failures while watchpoints
   are set are not counted.
 - Strip-mined in-page fast loops: for non-memop blocks whose prefix `0..back_idx` is a single-block
-  constant-stride self-loop (no internal branches, calls, syscalls, atomics, SP bases, `M_REG`,
-  `M_LITERAL`, NZCV-reading/extra flag-writing ops, or >2 distinct stolen GPRs per instruction) with
-  a countdown (`SUBS`/`SUB` + `B.NE`/`B.HI`/`B.GT`/`B.GE`/`B.PL`/`CBNZ`) or incrementing compare
-  (`CMP` reg/imm + `B.NE`/`B.GT`/`B.LT`/`B.GE`/`B.LE`/`B.HI`/`B.LO`/`B.HS`/`B.LS`) exit and up to
-  7 pointer-opaque induction pointers (at least one positive stride, plus any live end-of-iteration
-  derived affine aliases not read before write), `prepare` emits a guarded native fast loop right
+  self-loop (no internal branches, calls, syscalls, atomics, SP bases, `M_LITERAL`, FlagM,
+  read-before-write NZCV, or >2 distinct stolen GPRs per instruction) with a countdown
+  (`SUBS`/`SUB` + `B.NE`/`B.HI`/`B.GT`/`B.GE`/`B.PL`/`CBNZ`) or incrementing compare (`CMP`
+  reg/imm + `B.NE`/`B.GT`/`B.LT`/`B.GE`/`B.LE`/`B.HI`/`B.LO`/`B.HS`/`B.LS`, including 64-bit
+  `ADD` counters with 32-bit compares) exit, up to 7 pointer-opaque root base pointers (plus live
+  end-of-iteration derived affine aliases not read before write) and up to 12 access streams
+  covering plain offset/pre/post-index accesses, `M_REG` accesses (induction base with
+  loop-invariant index, or 64-bit `LSL`/`SXTX` induction index), and loop-invariant register
+  strides (`ADD Xd, Xd, Xm` after the accesses to that base), `prepare` emits a guarded native fast loop right
   after the 2-word entry kick check. The NZCV-free prologue checks `nwatch == 0`, computes a
   conservative lower bound on remaining back-edges clamped to `KICK_BUDGET` (`32..256`), probes
-  each pointer's TLB entry (saving addends in `dbt_groups[0..6]` and `safe_iters` in
-  `dbt_groups[7]`) before verifying 4 KiB page bounds, and bails straight to the standard checked
-  loop if `safe_iters < 2` or any probe misses. On entry it adds each addend to its induction
-  pointer (in host reg or `cpu->x`), runs the native body for `safe_iters` iterations counted in
-  `T2` (omitting `CMP` / converting `SUBS` to `SUB`), subtracts each addend from the root pointer
-  and its live aliases, and falls through to the standard checked loop for at least one
-  final/boundary iteration so exit NZCV, page crossings and faults remain exact. Matched blocks
-  increment `DbtStats::fast_loops` (preserved in templates).
+  each stream's TLB entry before checking 4 KiB page bounds (saving each root's addend in
+  `dbt_groups[0..6]`, verifying equal addends for additional streams on the same root, dividing
+  register strides via `UDIV`, and tracking `safe_iters` in `dbt_groups[7]`), and bails straight
+  to the standard checked loop if `safe_iters < 2`, any probe misses, or a stride fails. On entry
+  it adds each addend to its root pointer (pinning up to 2 loop-wide stolen GPRs in `T0`/`T1` to
+  avoid per-iteration `CTX` traffic), runs the native body for `safe_iters` iterations counted in
+  `T2` (omitting the loop-closing `CMP` while allowing loop-local write-before-read NZCV ops such
+  as `FCMP`/`CSET`/`FCSEL`), flushes written pinned registers, subtracts addends from roots and
+  live aliases, re-emits any omitted `FL_CMP_INC` compare once so iteration-end NZCV is exact, and
+  falls through to the standard checked loop for at least one final/boundary iteration so exit
+  NZCV, page crossings and faults remain exact. Matched blocks increment `DbtStats::fast_loops`
+  (preserved in templates).
 
 ### Control flow
 

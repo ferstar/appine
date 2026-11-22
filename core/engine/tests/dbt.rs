@@ -2862,6 +2862,562 @@ fn fast_loop_rejects_unsafe_patterns() {
         g.run_at(&mut dbt, f4);
         assert_eq!(dbt.stats().fast_loops, before, "SP loop must not fast-loop ({regs:?})");
         g.cpu.state_mut().sp = STACK;
+
+        // 5. M_REG with UXTW (option=2) and advancing index must be rejected (32-bit wrap hazard).
+        let f5 = CODE + 0xb80;
+        g.code(
+            f5,
+            &[
+                0xf866_582a,                      // ldr x10, [x1, w6, uxtw #3]
+                0x8b0a_0000,                      // add x0, x0, x10
+                0x9100_04c6,                      // add x6, x6, #1
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f5 + 16, f5, 1),           // b.ne f5
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA;
+            s.x[6] = 0;
+            s.x[3] = 8;
+        }
+        let before = dbt.stats().fast_loops;
+        g.run_at(&mut dbt, f5);
+        assert_eq!(dbt.stats().fast_loops, before, "UXTW induction index must be rejected ({regs:?})");
+
+        // 6. M_REG with 32-bit index update (add w6, w6, #1) must be rejected (clears upper 32 bits).
+        let f6 = CODE + 0xbc0;
+        g.code(
+            f6,
+            &[
+                0xf866_782a,                      // ldr x10, [x1, x6, lsl #3]
+                0x8b0a_0000,                      // add x0, x0, x10
+                0x1100_04c6,                      // add w6, w6, #1
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f6 + 16, f6, 1),           // b.ne f6
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA;
+            s.x[6] = 0;
+            s.x[3] = 8;
+        }
+        let before = dbt.stats().fast_loops;
+        g.run_at(&mut dbt, f6);
+        assert_eq!(dbt.stats().fast_loops, before, "32-bit index add must be rejected ({regs:?})");
+
+        // 7. M_REG with rn == rm must be rejected (shifting rn would double-shift the address).
+        let f7 = CODE + 0xc00;
+        g.code(
+            f7,
+            &[
+                0xf862_684a,                      // ldr x10, [x2, x2]
+                0x9100_2042,                      // add x2, x2, #8
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f7 + 12, f7, 1),           // b.ne f7
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[2] = DATA / 2;
+            s.x[3] = 4;
+        }
+        let before = dbt.stats().fast_loops;
+        g.run_at(&mut dbt, f7);
+        assert_eq!(dbt.stats().fast_loops, before, "rn==rm M_REG must be rejected ({regs:?})");
+
+        // 8. Loop-local NZCV read-before-write (cset before any flag writer) must be rejected.
+        let f8 = CODE + 0xc40;
+        g.code(
+            f8,
+            &[
+                0xf840_842a,                      // ldr x10, [x1], #8
+                0x1a9f_47e7,                      // cset w7, pl  (reads pre-loop/prev-iter NZCV!)
+                0x8b07_0000,                      // add x0, x0, x7
+                0xeb04_003f,                      // cmp x1, x4
+                b_cond(f8 + 16, f8, 1),           // b.ne f8
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA;
+            s.x[4] = DATA + 64;
+            s.nzcv = 0x8000_0000; // N=1 (pl is false on iter 0, then true after cmp x1, x4!)
+        }
+        let before = dbt.stats().fast_loops;
+        let res8 = g.run_at(&mut dbt, f8);
+        assert_eq!(dbt.stats().fast_loops, before, "RBW NZCV must be rejected ({regs:?})");
+        assert_eq!(res8, 0, "{regs:?}"); // N=1 before loop and N=1 on every cmp x1 < x4
+
+        // 9. Inner CMP comparing a shifted pointer must be rejected (pointer opacity).
+        let f9 = CODE + 0xc80;
+        g.code(
+            f9,
+            &[
+                0xf840_842a,                      // ldr x10, [x1], #8
+                0xeb05_003f,                      // cmp x1, x5  (reads shifted x1!)
+                0x1a9f_17e7,                      // cset w7, eq
+                0x8b07_0000,                      // add x0, x0, x7
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f9 + 20, f9, 1),           // b.ne f9
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA;
+            s.x[5] = DATA + 32;
+            s.x[3] = 8;
+        }
+        let before = dbt.stats().fast_loops;
+        assert_eq!(g.run_at(&mut dbt, f9), 1, "{regs:?}");
+        assert_eq!(dbt.stats().fast_loops, before, "inner CMP on shifted ptr must be rejected ({regs:?})");
+
+        // 10. Register-stride pointer with non-invariant stride register must be rejected.
+        let f10 = CODE + 0xcc0;
+        g.code(
+            f10,
+            &[
+                0xf940_008a,                      // ldr x10, [x4]
+                0x8b09_0084,                      // add x4, x4, x9
+                0x9100_2129,                      // add x9, x9, #8 (mutates stride reg!)
+                0x8b0a_0000,                      // add x0, x0, x10
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f10 + 20, f10, 1),         // b.ne f10
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[4] = DATA;
+            s.x[9] = 8;
+            s.x[3] = 6;
+        }
+        let before = dbt.stats().fast_loops;
+        g.run_at(&mut dbt, f10);
+        assert_eq!(dbt.stats().fast_loops, before, "non-invariant stride reg must be rejected ({regs:?})");
+
+        // 11. Register-stride pointer accessed AFTER `add x4, x4, x9` must be rejected.
+        let f11 = CODE + 0xd00;
+        g.code(
+            f11,
+            &[
+                0x8b09_0084,                      // add x4, x4, x9
+                0xf940_008a,                      // ldr x10, [x4]
+                0x8b0a_0000,                      // add x0, x0, x10
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f11 + 16, f11, 1),         // b.ne f11
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[4] = DATA;
+            s.x[9] = 8;
+            s.x[3] = 6;
+        }
+        let before = dbt.stats().fast_loops;
+        g.run_at(&mut dbt, f11);
+        assert_eq!(dbt.stats().fast_loops, before, "access after reg-stride add must be rejected ({regs:?})");
+    }
+}
+
+#[test]
+fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::with_data();
+
+        // Populate data pages 0..4 with finite floats (1.0 + idx * 0.25) and page 0..1 with
+        // small f16 values for exact float/NZCV verification.
+        for p in 0..5usize {
+            let host = [3, 4, 6, 5, 7][p];
+            for k in 0..1024usize {
+                let f = ((p * 1024 + k) % 64) as f32 * 0.25 - 4.0;
+                g.pages[host].0[k * 4..k * 4 + 4].copy_from_slice(&f.to_le_bytes());
+            }
+        }
+        let read_f32 = |g: &Guest, addr: u64| -> f32 {
+            let off = (addr - DATA) as usize;
+            let host = [3, 4, 6, 5, 7, 8][off / 4096];
+            let p = off % 4096;
+            f32::from_le_bytes(g.pages[host].0[p..p + 4].try_into().unwrap())
+        };
+
+        // 1. Loop 0x6f260 shape: induction base x2 with both plain [x2] and M_REG [x2, x28, lsl #2]
+        //    (x28 is stolen in Default!), plus stolen post-index ldp [x17], #256.
+        let f1 = CODE + 0xd60;
+        g.code(
+            f1,
+            &[
+                0xacc8_7e3c,                      // ldp q28, q31, [x17], #256
+                0xbc7c_7857,                      // ldr s23, [x2, x28, lsl #2]
+                0x4d40_c85d,                      // ld1r {v29.4s}, [x2]
+                0x9100_1042,                      // add x2, x2, #4
+                0x4f97_139b,                      // fmla v27.4s, v28.4s, v23.s[0]
+                0x4e3d_cf99,                      // fmla v25.4s, v28.4s, v29.4s
+                0x4e3d_cff8,                      // fmla v24.4s, v31.4s, v29.4s
+                0x4f97_13fa,                      // fmla v26.4s, v31.4s, v23.s[0]
+                0xeb03_005f,                      // cmp x2, x3
+                b_cond(f1 + 36, f1, 1),           // b.ne f1
+                SVC,
+            ],
+        );
+        // 1a. Contiguous host pages (page 0 + page 1 share addend): x28 = 1024 floats (4096 B) ->
+        //     [x2] is on page 0 and [x2, x28, lsl #2] is on page 1 with the SAME addend!
+        let run_f1 = |g: &mut Guest, dbt: &mut Dbt, x2_start: u64, x28_floats: u64, n: usize| -> [f32; 4] {
+            let s = g.cpu.state_mut();
+            s.x[17] = DATA;
+            s.x[2] = x2_start;
+            s.x[3] = x2_start + (n * 4) as u64;
+            s.x[28] = x28_floats;
+            for v in [24usize, 25, 26, 27] {
+                s.v[v] = [0, 0];
+            }
+            g.run_at(dbt, f1);
+            let s = g.cpu.state();
+            assert_eq!(s.x[2], x2_start + (n * 4) as u64);
+            assert_eq!(s.x[17], DATA + (n * 256) as u64);
+            assert_eq!(s.nzcv, 0x6000_0000);
+            let lo = s.v[27][0].to_le_bytes();
+            let hi = s.v[27][1].to_le_bytes();
+            [
+                f32::from_le_bytes(lo[0..4].try_into().unwrap()),
+                f32::from_le_bytes(lo[4..8].try_into().unwrap()),
+                f32::from_le_bytes(hi[0..4].try_into().unwrap()),
+                f32::from_le_bytes(hi[4..8].try_into().unwrap()),
+            ]
+        };
+        let exp_f1 = |g: &Guest, x2_start: u64, x28_floats: u64, n: usize| -> [f32; 4] {
+            let mut acc = [0.0f32; 4];
+            for k in 0..n {
+                let s23 = read_f32(g, x2_start + (k * 4) as u64 + x28_floats * 4);
+                for lane in 0..4 {
+                    let v28 = read_f32(g, DATA + (k * 256 + lane * 4) as u64);
+                    acc[lane] = v28.mul_add(s23, acc[lane]);
+                }
+            }
+            acc
+        };
+        let before = dbt.stats();
+        let got_same = run_f1(&mut g, &mut dbt, DATA + 0x100, 1024, 24);
+        assert_eq!(got_same, exp_f1(&g, DATA + 0x100, 1024, 24), "same-addend M_REG ({regs:?})");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+        assert_eq!(dbt.stats().exits_interp, before.exits_interp, "{regs:?}");
+
+        // 1b. Scattered non-contiguous host pages (page 2 -> page 3 have DIFFERENT host addends!):
+        //     prologue addend-equality check must bail cleanly and produce the exact same result!
+        let got_diff = run_f1(&mut g, &mut dbt, DATA + 2 * PAGE_SIZE + 0x100, 1024, 24);
+        assert_eq!(
+            got_diff,
+            exp_f1(&g, DATA + 2 * PAGE_SIZE + 0x100, 1024, 24),
+            "mismatched-addend M_REG must bail cleanly ({regs:?})"
+        );
+
+        // 2. Loop 0x6f5a0 shape: loop-invariant register stride `add x4, x4, x26` (stolen in Default!).
+        let f2 = CODE + 0xda0;
+        g.code(
+            f2,
+            &[
+                0xad40_7c9c,                      // ldp q28, q31, [x4]
+                0x8b1a_0084,                      // add x4, x4, x26
+                0xbd41_0037,                      // ldr s23, [x1, #256]
+                0x4d40_c83d,                      // ld1r {v29.4s}, [x1]
+                0x9100_1021,                      // add x1, x1, #4
+                0x4f97_139b,                      // fmla v27.4s, v28.4s, v23.s[0]
+                0x4e3d_cf99,                      // fmla v25.4s, v28.4s, v29.4s
+                0x4e3d_cff8,                      // fmla v24.4s, v31.4s, v29.4s
+                0x4f97_13fa,                      // fmla v26.4s, v31.4s, v23.s[0]
+                0xeb14_003f,                      // cmp x1, x20
+                b_cond(f2 + 40, f2, 1),           // b.ne f2
+                SVC,
+            ],
+        );
+        let run_f2 = |g: &mut Guest, dbt: &mut Dbt, x4_start: u64, stride: u64, n: usize| -> f32 {
+            let s = g.cpu.state_mut();
+            s.x[4] = x4_start;
+            s.x[26] = stride;
+            s.x[1] = DATA;
+            s.x[20] = DATA + (n * 4) as u64;
+            for v in [24usize, 25, 26, 27] {
+                s.v[v] = [0, 0];
+            }
+            g.run_at(dbt, f2);
+            let s = g.cpu.state();
+            assert_eq!(s.x[1], DATA + (n * 4) as u64);
+            assert_eq!(s.x[4], x4_start.wrapping_add(stride.wrapping_mul(n as u64)));
+            f32::from_le_bytes(s.v[27][0].to_le_bytes()[0..4].try_into().unwrap())
+        };
+        let exp_f2 = |g: &Guest, x4_start: u64, stride: u64, n: usize| -> f32 {
+            let mut acc = 0.0f32;
+            for k in 0..n {
+                let s23 = read_f32(g, DATA + 256 + (k * 4) as u64);
+                let v28 = read_f32(g, x4_start.wrapping_add(stride.wrapping_mul(k as u64)));
+                acc = v28.mul_add(s23, acc);
+            }
+            acc
+        };
+        let before = dbt.stats();
+        // 2a. Normal positive stride (256 B) crossing page 0 -> page 1 (24 iters).
+        assert_eq!(run_f2(&mut g, &mut dbt, DATA + 0x200, 256, 24), exp_f2(&g, DATA + 0x200, 256, 24), "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+        // 2b. Zero stride (bails cleanly via udiv -> 0).
+        assert_eq!(run_f2(&mut g, &mut dbt, DATA + 0x200, 0, 10), exp_f2(&g, DATA + 0x200, 0, 10), "{regs:?}");
+        // 2c. Negative stride (-32 B, bails cleanly via udiv -> 0).
+        let neg32 = (-32i64) as u64;
+        assert_eq!(run_f2(&mut g, &mut dbt, DATA + 0x800, neg32, 10), exp_f2(&g, DATA + 0x800, neg32, 10), "{regs:?}");
+        // 2d. Stride >= 4096 (bails cleanly via udiv -> 0).
+        assert_eq!(run_f2(&mut g, &mut dbt, DATA, 4096, 4), exp_f2(&g, DATA, 4096, 4), "{regs:?}");
+
+        // 3. Loop 0x6ed64 shape: M_REG with loop-invariant bases x1/x2 + 64-bit induction index x6
+        //    + 32-bit compare `cmp w10, w6; b.gt` + loop-local write-before-read NZCV (`fcmp`+`cset`).
+        //    Store half-precision 0x3c00 (+1.0) and 0xbc00 (-1.0) in page 0..1.
+        for k in 0..128usize {
+            let h: u16 = if k == 99 { 0xbc00 } else { 0x3c00 }; // -1.0 at k=99, +1.0 elsewhere
+            g.pages[3].0[k * 2..k * 2 + 2].copy_from_slice(&h.to_le_bytes());
+        }
+        let f3 = CODE + 0xde0;
+        g.code(
+            f3,
+            &[
+                0x7c66_783f,                      // ldr h31, [x1, x6, lsl #1]
+                0x1ee2_43ff,                      // fcvt s31, h31
+                0x1e28_0bff,                      // fmul s31, s31, s8
+                0x1e2e_23e0,                      // fcmp s31, s14
+                0xbc26_785f,                      // str s31, [x2, x6, lsl #2]
+                0x9100_04c6,                      // add x6, x6, #1
+                0x1a9f_47e7,                      // cset w7, pl
+                0x5200_00e7,                      // eor w7, w7, #1
+                0x0a07_0000,                      // and w0, w0, w7
+                0x6b06_015f,                      // cmp w10, w6
+                b_cond(f3 + 40, f3, 12),          // b.gt f3
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 1;
+            s.x[1] = DATA;
+            s.x[2] = DATA + PAGE_SIZE; // RW page 1
+            s.x[6] = 0;
+            s.x[10] = 100;
+            s.v[8] = [2.0f32.to_bits() as u64, 0];  // s8 = 2.0
+            s.v[14] = [3.0f32.to_bits() as u64, 0]; // s14 = 3.0 -> +2.0 < 3.0 (MI -> pl=0 -> eor=1)
+        }
+        let before = dbt.stats();
+        assert_eq!(g.run_at(&mut dbt, f3), 1, "all 100 elems < 3.0 ({regs:?})");
+        let s = g.cpu.state();
+        assert_eq!(s.x[1], DATA, "{regs:?}");
+        assert_eq!(s.x[2], DATA + PAGE_SIZE, "{regs:?}");
+        assert_eq!(s.x[6], 100, "{regs:?}");
+        assert_eq!(s.nzcv, 0x6000_0000, "{regs:?}");
+        assert_eq!(read_f32(&g, DATA + PAGE_SIZE + 98 * 4), 2.0, "{regs:?}");
+        assert_eq!(read_f32(&g, DATA + PAGE_SIZE + 99 * 4), -2.0, "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+
+        // 3b. Hostile fault check on 0x6ed64: place output near end of RW page 4 so iteration 8
+        //     faults at `str s31, [x2, x6, lsl #2]` on RO page 5, and place input near end of page 5
+        //     so iteration 8 faults at `ldr h31, [x1, x6, lsl #1]` (BEFORE `fcmp`!) on unmapped
+        //     page 6 — verify exact guest x1, x2, x6 AND exact NZCV from `cmp w10, w6` of iter 7!
+        for k in 0..8usize {
+            let off = 4096 - 16 + k * 2;
+            g.pages[8].0[off..off + 2].copy_from_slice(&0x3c00u16.to_le_bytes()); // +1.0 in page 5
+        }
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 1;
+            s.x[1] = DATA + 6 * PAGE_SIZE - 16; // 8 f16s in page 5, 9th faults on unmapped page 6!
+            s.x[2] = DATA + 4 * PAGE_SIZE;      // RW page 4
+            s.x[6] = 0;
+            s.x[10] = 20;
+            s.v[8] = [2.0f32.to_bits() as u64, 0];
+            s.v[14] = [0.0f32.to_bits() as u64, 0]; // +2.0 > 0.0 -> fcmp sets C=1,N=0,Z=0,V=0 (0x2000_0000)
+        }
+        // `cmp w10=20, w6=8` sets C=1 (20 >= 8), N=0, Z=0, V=0 (0x2000_0000). To distinguish fcmp
+        // from cmp, use s14 = +5.0 (+2.0 < +5.0 -> fcmp sets N=1, C=0 = 0x8000_0000, whereas
+        // `cmp w10=20, w6=8` sets N=0, C=1 = 0x2000_0000!).
+        g.cpu.state_mut().v[14] = [5.0f32.to_bits() as u64, 0];
+        assert_eq!(
+            go(&mut g, &mut dbt, f3),
+            Exit::Fault {
+                addr: DATA + 6 * PAGE_SIZE,
+                access: Access::Read,
+                kind: FaultKind::Page,
+            },
+            "{regs:?}"
+        );
+        let s = g.cpu.state();
+        assert_eq!(s.pc, f3, "fault must land on ldr h31 ({regs:?})");
+        assert_eq!(s.x[1], DATA + 6 * PAGE_SIZE - 16, "x1 restored ({regs:?})");
+        assert_eq!(s.x[2], DATA + 4 * PAGE_SIZE, "x2 restored ({regs:?})");
+        assert_eq!(s.x[6], 8, "8 iterations completed before fault ({regs:?})");
+        assert_eq!(
+            s.nzcv, 0x2000_0000,
+            "NZCV at pre-fcmp fault must match cmp w10, w6 from iter 7, not fcmp ({regs:?})"
+        );
+
+        // 4. Loop 0x6f3a0 (fcmpe + fcsel max-reduce) and 0x6f804 (M_REG read+write on same base).
+        let f4 = CODE + 0xe20;
+        g.code(
+            f4,
+            &[
+                0xbc40_441e,                      // ldr s30, [x0], #4
+                0x1e3f_23d0,                      // fcmpe s30, s31
+                0x1e3e_4fff,                      // fcsel s31, s31, s30, mi
+                0xeb18_001f,                      // cmp x0, x24
+                b_cond(f4 + 16, f4, 1),           // b.ne f4
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = DATA;
+            s.x[24] = DATA + 64 * 4;
+            s.v[31] = [(-1000.0f32).to_bits() as u64, 0];
+        }
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f4);
+        let max_got = f32::from_le_bytes(g.cpu.state().v[31][0].to_le_bytes()[0..4].try_into().unwrap());
+        let max_exp = (0..64)
+            .map(|k| read_f32(&g, DATA + k * 4))
+            .fold(-1000.0f32, f32::max);
+        assert_eq!(max_got, max_exp, "fcmpe+fcsel max ({regs:?})");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+
+        let f5 = CODE + 0xe40;
+        g.code(
+            f5,
+            &[
+                0x3ce0_685f,                      // ldr q31, [x2, x0]
+                0x3ce0_69dd,                      // ldr q29, [x14, x0]
+                0x4e3d_d7ff,                      // fadd v31.4s, v31.4s, v29.4s
+                0x3ca0_69df,                      // str q31, [x14, x0]
+                0x9100_4000,                      // add x0, x0, #16
+                0xeb01_001f,                      // cmp x0, x1
+                b_cond(f5 + 24, f5, 1),           // b.ne f5
+                SVC,
+            ],
+        );
+        let dst_base = DATA + 4 * PAGE_SIZE;
+        let expected_first = read_f32(&g, DATA) + read_f32(&g, dst_base);
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = 32 * 16;
+            s.x[2] = DATA;
+            s.x[14] = dst_base;
+        }
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f5);
+        assert_eq!(read_f32(&g, dst_base), expected_first, "M_REG rw stream ({regs:?})");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+
+        // 5. Loop-wide stolen-register pinning edge cases:
+        //    5a. Unwritten stolen base [xS0, x6, lsl #3] + written stolen counter xS1 (npin == 2).
+        //    5b. Written stolen alias mov xS0, x2 + written stolen counter xS1 (npin == 2).
+        //    5c. 3 distinct stolen registers across separate instructions (npin == 0 fallback path).
+        let (s0, s1, s2): (u32, u32, u32) = match regs {
+            DbtRegs::Default => (16, 17, 28),
+            DbtRegs::Go => (21, 22, 23),
+        };
+        let f6 = CODE + 0xe80;
+        g.code(
+            f6,
+            &[
+                0xf866_780a | (s0 << 5),          // ldr x10, [xS0, x6, lsl #3] (xS0 unwritten base)
+                0x8b0a_0000,                      // add x0, x0, x10
+                0x9100_04c6,                      // add x6, x6, #1
+                0xf100_0400 | (s1 << 5) | s1,     // subs xS1, xS1, #1 (xS1 written non-ptr)
+                b_cond(f6 + 16, f6, 1),           // b.ne f6
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[s0 as usize] = DATA + 0x100;
+            s.x[6] = 0;
+            s.x[s1 as usize] = 24;
+        }
+        let mut exp6 = 0u64;
+        for k in 0..24usize {
+            exp6 = exp6.wrapping_add(g.data(0, 0x100 + k * 8));
+        }
+        let before = dbt.stats();
+        assert_eq!(g.run_at(&mut dbt, f6), exp6, "pinned unwritten stolen base ({regs:?})");
+        assert_eq!(g.cpu.state().x[s0 as usize], DATA + 0x100, "xS0 must stay guest VA ({regs:?})");
+        assert_eq!(g.cpu.state().x[s1 as usize], 0, "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+
+        let f7 = CODE + 0xec0;
+        g.code(
+            f7,
+            &[
+                0xaa02_03e0 | s0,                 // mov xS0, x2 (written stolen alias of x2!)
+                0xf940_000a | (s0 << 5),          // ldr x10, [xS0]
+                0x8b0a_0000,                      // add x0, x0, x10
+                0x9100_2042,                      // add x2, x2, #8
+                0xf100_0400 | (s1 << 5) | s1,     // subs xS1, xS1, #1
+                b_cond(f7 + 20, f7, 1),           // b.ne f7
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = DATA + 0x100;
+            s.x[s0 as usize] = 0;
+            s.x[s1 as usize] = 24;
+        }
+        let before = dbt.stats();
+        assert_eq!(g.run_at(&mut dbt, f7), exp6, "pinned written stolen alias ({regs:?})");
+        assert_eq!(g.cpu.state().x[2], DATA + 0x100 + 24 * 8, "{regs:?}");
+        assert_eq!(
+            g.cpu.state().x[s0 as usize],
+            DATA + 0x100 + 23 * 8,
+            "pinned stolen alias must be restored to guest VA ({regs:?})"
+        );
+        assert_eq!(g.cpu.state().x[s1 as usize], 0, "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+
+        let f8 = CODE + 0xf00;
+        g.code(
+            f8,
+            &[
+                0xf860_780a | (s1 << 16) | (s0 << 5), // ldr x10, [xS0, xS1, lsl #3] (2 stolen)
+                0x8b0a_0000,                          // add x0, x0, x10
+                0x9100_2000 | (s0 << 5) | s0,         // add xS0, xS0, #8
+                0xf100_0400 | (s2 << 5) | s2,         // subs xS2, xS2, #1 (3rd stolen -> npin=0)
+                b_cond(f8 + 16, f8, 1),               // b.ne f8
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[s0 as usize] = DATA + 0x80;
+            s.x[s1 as usize] = 16; // +128 bytes -> starts at DATA + 0x100
+            s.x[s2 as usize] = 24;
+        }
+        let before = dbt.stats();
+        assert_eq!(g.run_at(&mut dbt, f8), exp6, "3-stolen fallback M_REG ({regs:?})");
+        assert_eq!(g.cpu.state().x[s0 as usize], DATA + 0x80 + 24 * 8, "{regs:?}");
+        assert_eq!(g.cpu.state().x[s1 as usize], 16, "{regs:?}");
+        assert_eq!(g.cpu.state().x[s2 as usize], 0, "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
     }
 }
 
