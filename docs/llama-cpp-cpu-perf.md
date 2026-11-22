@@ -1,6 +1,6 @@
 # Optimizing CPU Performance for `llama.cpp`
 
-> Handoff / future-work design note (no code changes yet).
+> Handoff / future-work design note (no code changes yet; Step 0 profiling completed 2026-11-22).
 > Grounded in `core/engine/src/c/dbt.c`, `core/engine/include/appine/engine.h`,
 > `core/engine/src/c/features.c`, `core/engine/src/c/mmu.c`, `core/kernel/src/mm.rs`,
 > `core/kernel/src/syscall/mem.rs`, `core/kernel/src/syscall/fast.rs`,
@@ -66,6 +66,126 @@ evaluated under a strict non-regression constraint: general workloads (`gcc`, `p
     in 2 MiB chunks via `Mm::fault_in` under the BKL (`core/kernel/src/mm.rs`).
   - Length-gated `memop` acceleration currently matches only the pinned Alpine musl SHA-256
     (`.agents/maps/kernel/exec.md`).
+
+---
+
+## Step 0 profiling baseline (2026-11-22)
+
+Measured on the development ARM64 Linux VM (Apple Silicon host, 8 vCPUs, kernel `6.8.0-117-generic`)
+using `llama.cpp` v0.8.0 multi-variant build (`GGML_CPU_ALL_VARIANTS=ON`, Alpine musl, release
+`appine-run --tier 1` on `/bench/store` vs. native `appine-difftest:latest` Alpine container).
+
+### 1. Native vs. Appine Tier 1 throughput (`libggml-cpu-armv8.2_2.so`)
+
+| Model & workload | Native (t/s) | Appine Tier 1 (t/s) | Slowdown (Native / Appine) |
+|---|---:|---:|---:|
+| Qwen2.5-0.5B Q4_0 `pp512` `-t 1` | 285.42 ± 1.44 | 189.26 ± 1.31 | **1.51×** |
+| Qwen2.5-0.5B Q4_0 `tg128` `-t 1` | 110.07 ± 0.11 | 81.95 ± 0.92 | **1.34×** |
+| Qwen2.5-0.5B Q4_0 `pp128` `-t 4` | 1159.98 ± 0.41 | 847.70 ± 3.72 | **1.37×** |
+| Qwen2.5-0.5B Q4_0 `pp512` `-t 4` | 1027.65 ± 3.47 | 707.10 ± 3.75 | **1.45×** |
+| Qwen2.5-0.5B Q4_0 `tg32` `-t 4` | 226.78 ± 4.10 | 188.01 ± 10.04 | **1.21×** |
+| Qwen2.5-0.5B Q4_0 `tg128` `-t 4` | 225.25 ± 0.46 | 177.91 ± 10.12 (186.74 in perf run) | **1.21–1.27×** |
+| Qwen2.5-0.5B F16 `pp128` `-t 4` | 377.45 ± 2.07 | 225.43 ± 1.71 (230.02 in perf run) | **1.64–1.67×** |
+| Qwen2.5-0.5B F16 `tg32` `-t 4` | 91.13 ± 0.52 | 72.09 ± 0.23 (80.74 in perf run) | **1.13–1.26×** |
+
+### 2. CPU time breakdown (`APPINE_PERF_MAP=1 perf record -e task-clock -F 999` + `perf script`)
+
+| Workload | `dbt_blocks` | `dbt_shared_routines` (`emit_refill` etc.) | Linux kernel | Host (`appine-run` / libc) |
+|---|---:|---:|---:|---:|
+| Q4_0 prefill (`pp512 -t 4 -r 3`, 12,087 samples) | **95.15%** | 2.57% | 1.42% | 0.85% |
+| Q4_0 decode (`tg128 -t 4 -r 3`, 8,197 samples) | **95.21%** | **1.99%** | 1.68% | 1.12% |
+| F16 prefill (`pp128 -t 4 -r 3`, 9,333 samples) | **92.75%** | 4.96% (`refill[1]` write cross-page = 3.33%) | 0.96% | 1.33% |
+| F16 decode (`tg32 -t 4 -r 3`, 1.17 GiB, 5,151 samples) | **94.18%** | **2.62%** | 1.75% | 1.46% |
+
+Key `--stats` and startup observations across all 7 baseline runs:
+
+- **Tier 0 / syscall overhead is negligible**: `tier 0 fallback` is 38–40 instructions (`0.0%`),
+  `exits: interp` is 47–263, `code cache flushes` is 0, `groups undone` is 3–7. `exits: svc` is
+  virtually identical between `-t 1` (8,484 / 8,579) and `-t 4` (8,515 / 8,614), confirming that
+  with `llama.cpp`'s default `--poll 50`, `futex`/`sched_yield` syscalls are not a bottleneck.
+- **Static grouping coverage**: `memory (inline)` is ~34.0–34.5% of translated guest instructions,
+  with `sharing a check` at 14.4–15.3% (~44% of memory instructions grouped).
+- **`emit_refill` is minor even on 1.17 GiB streaming decode**: `dbt_shared_routines` totals only
+  1.99% on Q4_0 decode and 2.62% on 1.17 GiB F16 decode (read refill ~1.8–2.3%). The 3.33% write
+  refill (`+0x440..+0x57f`) in F16 prefill is not streaming weight misses; it comes from
+  `tinyBLAS::gemm_bloc` spilling 384 B (`stp q0..q31, [sp, #0..352]`) on every inner iteration when
+  that grouped stack frame straddles a 4 KiB page boundary.
+- **Startup / `fault_in`**: End-to-end wall time for `-p 1 -n 0 -t 4 -r 1` on the 1.17 GiB F16
+  model is 392–401 ms (cold vs. warm), with host userspace (`appine-run` including `fault_in`,
+  `dbt_run`, `prepare`, `sqlite3`) totaling 0.85–1.46% across the benchmark runs.
+
+### 3. Hot translated block disassembly (`libggml-cpu-armv8.2_2.so`, guest base `0x7fffbe594000`)
+
+Over **75–85%** of total runtime concentrates in 7 concrete inner loops:
+
+1. **Q4_0 prefill #1 — `ggml_gemm_q4_0_4x4_q8_0` (`0xba094..0xba490`, 49.2% of total CPU)**:
+   - One **256-instruction** straight-line inner loop (`subs x24, x24, #1; b.gt ba094`), currently
+     split into **5 blocks** (`ba094` 14.3%, `ba194` 11.7%, `ba294` 10.3%, `ba394` 12.7%, `ba494`
+     0.7%) by `MAX_BLOCK_INSNS = 64`, severing `[x23]`, `[x22]`, and `[x21]` groups across block
+     boundaries.
+   - Hits **all four** Direction 1 limits simultaneously:
+     - 256-insn body > `MAX_BLOCK_INSNS` (64);
+     - 5 live base pointers (`x28`, `x25`, `x23`, `x22`, `x21`) > `GROUP_SLOTS` (4);
+     - Activation pointer lives in stolen register **`x28` (`CTX`)** (`ldr q, [x28, #0/16/32/48]`),
+       preventing grouping and forcing 5 redundant `ctx->x[28]` loads + TLB checks;
+     - Scale load uses a derived pointer **`sub x20, x28, #8; ldr d17, [x20]`**.
+   - Pure read-only constant-stride self-loop (`x28 += 0x48`, `x25/x23/x22/x21 += 0x88`).
+2. **Q4_0 prefill #2 — `ggml_compute_forward_flash_attn_ext_tiled` (28.7% total)**:
+   - Three compact 10–11 instruction strided self-loops: `0x6f260` (12.7%, stolen `x17` post-index
+     `ldp q28, q31, [x17], #256` + `M_REG` `ldr s23, [x2, x28, lsl #2]` with stolen `x28` +
+     `ld1r [x2]`), `0x6f5a0` (8.8%, `add x4, x4, x26` with stolen `x26`), and `0x6ed64` (4.2%,
+     `M_REG` `ldr h31, [x1, x6, lsl #1]` + `str s31, [x2, x6, lsl #2]`).
+   - Too short and heterogeneous for `plan_group` alone; requires **Direction 4**.
+3. **Q4_0 decode #1 — `ggml_gemv_q4_0_4x4_q8_0` (`0xb5c00..0xb5c84`, 39.7% of total CPU)**:
+   - 34-instruction single-block self-loop (`x2 += 34` with 3 loads, `x0 += 72` with 5 loads,
+     `cmp w6, w5; b.gt`).
+   - **Already fully grouped today** (2 bases, no stolen regs, non-interleaved, <64 insns).
+     Direction 1 gives essentially zero gain here; remaining overhead (~16 extra host insns per
+     34-insn iteration from 2 group TLB checks + 1 kick check) requires **Direction 4**.
+4. **Q4_0 decode #2 — `ggml_gemv_q8_0_4x4_q8_0` (`0xb9480..0xb94e4`, 21.9% of total CPU)**:
+   - 26-instruction single-block self-loop (Qwen 0.5B's `output.weight` is `Q8_0`): `x0 += 0x22`,
+     `x2 += 0x88`, with **`mov x5, x2`** aliasing `x2` for `ld1 {v28..v31}, [x5], #64` and
+     `ld1 {v24..v27}, [x5]`.
+   - Extending Direction 1.3 to track **`MOV Xd, Xn`** (`ORR Xd, XZR, Xn`, zero-offset affine
+     alias) merges `[x2, #-8]` with both `[x5]` `ld1`s immediately; **Direction 4** removes the
+     remaining per-iteration TLB and kick checks.
+5. **All workloads — `ggml_barrier` (`0x152f8`, 14.3% Q4_0 decode, 5.3% F16 decode, 2.2% Q4_0
+   prefill, 1.5% F16 prefill)**:
+   - Exact 4-instruction spin loop: `152f8: yield; ldr w0, [x1]; cmp w3, w0; b.eq 152f8`. Dropping
+     `yield` (`0xd503203f`) directly matches Direction 5.1.
+6. **F16 prefill — `tinyBLAS::gemm_bloc<4, 6>` (`0x9dff0..0x9e104`, 65.1%) + `<4, 5>`
+   (`0x9e600..0x9e6f0`, 12.9%), 78.0% total**:
+   - 69-instruction inner loop (`9dff0..9e104`): split at the 4 KiB code page boundary `9e000`
+     (2.6% + 56.9%) and again at `9e100` (5.7%, just `cmp x11, x3; b.gt`!) by `MAX_BLOCK_INSNS = 64`.
+   - Loads 10 distinct matrix rows via `M_REG` (`ldr q, [x2, x3/x6/x5/x4]` and `[x1, x7/x3/x6/x5/x4]`,
+     each advancing +16 B/iter via `x0 += 8` shifted `<< 1`, using stolen `x16`/`x17`/`x18`), plus
+     12 `stp q, [sp, #0..352]` stores per iteration (triggering the 3.33% `refill[1]` cross-page
+     overhead). Direction 1.1 fixes the 2-insn tail split; eliminating the 10 per-row TLB checks
+     requires **Direction 4**.
+7. **F16 decode — `ggml_vec_dot_f16` (`0x67de0..0x67e0c`, 72.1% of total CPU)**:
+   - 12-instruction single-block self-loop (`ldp`×2 on `x2 += 64` interleaved with `ldp`×2 on
+     `x4 += 64`, 4× `fmla v*.8h`, `cmp x6, x2; b.ne`).
+   - Already grouped, yet interleaving forces `dbt_groups` spill/reload + 2 group TLB checks + kick
+     check (~20 extra host instructions on top of 12 guest instructions). Ideal **Direction 4**
+     target (up to 64 native iterations per 4 KiB page).
+
+### 4. ISA tier (Direction 2) & real-device big.LITTLE audit (Direction 5.2)
+
+- **ISA tier**: `GGML_BACKEND_DEBUG=1` confirms both native and Appine load
+  `libggml-cpu-armv8.2_2.so`. In upstream `ggml/src/CMakeLists.txt` (`CMAKE_SYSTEM_NAME MATCHES
+  "Linux"`), `armv8.6_1` requires `DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8` (there is no
+  non-SVE `MATMUL_INT8` Linux variant, whereas Android defines `android_armv8.6_1` without `SVE`).
+  Neither the Apple Silicon Linux VM nor the tested Galaxy S23 (`SM-S9110`, Snapdragon 8 Gen 2)
+  exposes `sve` in host `/proc/cpuinfo` (both expose `i8mm bf16` only). This confirms **no SVE
+  implementation is needed**; unlocking `I8MM` is a build/packaging choice (`-DGGML_NATIVE=ON` or a
+  non-SVE `I8MM` backend variant).
+- **Android big.LITTLE (`SM-S9110`, Snapdragon 8 Gen 2)**: Host topology is 3× Cortex-A510
+  (`cpu0–2`, `cpu_capacity=266`, 2.02 GHz) + 4× Cortex-A715/A710 (`cpu3–6`, `cpu_capacity=811`,
+  2.80 GHz) + 1× Cortex-X3 (`cpu7`, `cpu_capacity=1024`, 3.36 GHz); `cpu_capacity` and
+  `cpufreq/cpuinfo_max_freq` carry SELinux label `u:object_r:sysfs_devices_system_cpu:s0`.
+  Upstream `llama.cpp` (`common/common.cpp`'s `common_cpu_get_num_math()`) only reads
+  `/sys/devices/system/cpu/cpuN/topology/thread_siblings` on ARM Linux to count physical cores and
+  does not read `cpu_capacity` or `midr_el1` to pin threads.
 
 ---
 
@@ -303,29 +423,31 @@ handful of strided NEON compute loops (`ggml_vec_dot_*`, `ggml_gemm_*`, `rms_nor
 
 ## Recommended execution order & verification
 
-1. **Step 0 — Profile first (no code changes)**
-   - Run `GGML_BACKEND_DEBUG=1 llama-bench -p 128,512 -n 32,128 -t 1,4` on both `Q4_0`/`Q4_K_M` and
-     `F16` (0.5B and 1.5B models) to verify the selected `ggml-cpu` variant.
-   - Run under `appine-run --stats` and `APPINE_PERF_MAP=1 perf record` (splitting prefill and decode
-     runs) to measure:
-     1. `% CPU` in `emit_refill` (single-page misses vs. cross-page checks);
-     2. `% CPU` in the top 5 `g_<pc>` blocks, disassembling them to inspect `insns_grouped /
-        insns_memory`, `insns_remapped`, 64-instruction block splits, >4 concurrent bases,
-        `add reg, base, #imm` derived pointers, and `M_REG`/stolen bases;
-     3. `exits_interp`, `exits_svc` (`futex`/`sched_yield`), and cold-start `fault_in` BKL time;
-     4. On real Android devices, verify `/sys/devices/system/cpu/` visibility and thread placement
-        across big/mid/LITTLE cores.
-2. **Step 1 — Low-risk quick wins**
-   - Implement **Direction 1** (budget-based block length limit, `GROUP_SLOTS` 4→8, affine
-     `ADD Xd, Xn, #imm` tracking, `M_REG`/stolen-base grouping as confirmed by Step 0),
-     **Direction 3B** (unlocked `madvise` forwarding + widened read-only file `fault_in`), and
-     **Direction 5A** (verbatim `yield`).
-3. **Step 2 — Data-driven deep optimization**
-   - If Step 0/1 shows `emit_refill` still taking a significant share (especially on 1.5B–7B decode):
-     implement **Direction 3A** (sequential TLB prefill + L2 2 MiB superpages).
-   - If Step 0/1 shows inline TLB checks inside hot `ggml` loops still dominating prefill or decode:
-     implement **Direction 4** (strip-mined in-page / contiguous-range fast loops).
-4. **Verification & non-regression gates**
+1. **Step 0 — Profile first (completed 2026-11-22, see *Step 0 profiling baseline* above)**
+   - Established that 92.8–95.2% of CPU time sits inside 7 translated hot loops, `emit_refill` is
+     only 2.0–2.6% on decode (even for 1.17 GiB F16), `futex`/Tier 0 exits are negligible, and
+     `libggml-cpu-armv8.2_2.so` is selected identically on native and Appine because host CPUs lack
+     `sve`.
+2. **Step 1 — Low-risk quick wins (immediate impact on Q4_0 prefill & barrier spin)**
+   - **Direction 5.1**: Emit host `yield` (`0xd503203f`) verbatim (1-line change; directly targets
+     `ggml_barrier` at 5.3–14.3% decode time).
+   - **Direction 1 (full)**: Budget-based block length limit (1.1), `GROUP_SLOTS` 4→8 (1.2),
+     block-local affine alias tracking for `ADD`/`SUB #imm` **and** `MOV Xd, Xn` (1.3), and
+     stolen-register base grouping (1.4). Directly targets `ggml_gemm_q4_0_4x4_q8_0` (49.2% of
+     Q4_0 prefill, which hits all four ceilings), `ggml_gemv_q8_0_4x4_q8_0` (21.9% of Q4_0 decode,
+     `mov x5, x2`), and `tinyBLAS::gemm_bloc` tail splits.
+3. **Step 2 — High-ceiling core optimization: Direction 4 (strip-mined fast loops)**
+   - Promoted ahead of Direction 3A based on Step 0: `ggml_vec_dot_f16` (72.1% F16 decode),
+     `ggml_gemv_q4_0_4x4_q8_0` (39.7% Q4_0 decode), `ggml_gemv_q8_0_4x4_q8_0` (21.9% Q4_0 decode),
+     `flash_attn_ext_tiled` (28.7% Q4_0 prefill), and `tinyBLAS::gemm_bloc` (78.0% F16 prefill)
+     cannot be fully accelerated by `plan_group` alone, and all are constant-stride self-loops.
+4. **Step 3 — Deferred / optional secondary work**
+   - **Direction 3B** (unlocked `madvise` forwarding + widened read-only file `fault_in`): small
+     independent change for cold-start TTFT on flash storage; can land anytime.
+   - **Direction 3A** (sequential TLB prefill + L2 2 MiB superpages): deprioritized while
+     `dbt_shared_routines` is only 2.0–2.6% on decode; revisit after Step 1+2 shrink in-block time
+     (or when profiling 3B–7B models where streaming refill share grows).
+5. **Verification & non-regression gates**
    - Unit/integration tests in `core/engine/tests/dbt.rs` (block length boundary, 5–8 interleaved
      groups, derived pointers, `M_REG`/stolen groups, cross-page faults, watchpoints, TBI tags,
      L2 superpage demotion on `mprotect`/`munmap`/CoW, strip-mined loop exact faults & kick
