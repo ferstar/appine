@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-21 (split out of the engine full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: L2 2 MiB superpage refill with sequential 4 KiB batch prefill, 2 MiB fast-loop STLB probe with MUL register-stride fast path, and bulk superpage exec_memop spans)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: Phase 2B-2 fast loops with derived shifted indices, derived compares, zero-stride SP streams, cross-page fast-loop lifecycle, generalized stolen-register pinning, and pool nogroup reset)
 
 ## Responsibilities
 
@@ -84,9 +84,11 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
 ### Blocks and instruction handling
 
 - A block starts with a two-word kick check, holds up to 256 guest instructions (stopping earlier
-  before exceeding the 4096-word host buffer or stub, fixup and relocation budgets), and never
-  crosses a guest page (a forward chain exit to the next pc ends it). Guest instruction words are
-  snapshotted lazily from the guest page (32 words initially, extended in 64-word chunks on demand).
+  before exceeding the 4096-word host buffer or stub, fixup and relocation budgets), and its normal
+  translated body never crosses a guest page (a forward chain exit to the next pc ends it; a
+  matched cross-page fast loop may additionally cover words from the immediately following
+  executable page, recorded in `block::nguest`). Guest instruction words are snapshotted lazily
+  from the guest page (32 words initially, extended in 64-word chunks on demand).
   A block ends at B, BL, SVC, BR/BLR/RET and at any instruction handed to Tier 0; conditional
   branches become side exits and translation continues on the fall-through path.
 - Every non-SIMD instruction must first be accepted by Tier 0 (`tier0_defined`, which runs the word
@@ -179,33 +181,41 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
   requests a full flush if a retirement cannot be placed) and stops grouping for leaders in the
   following 256 bytes (64-entry ring; templates are versioned by it). Failures while watchpoints
   are set are not counted.
-- Strip-mined in-page fast loops: for non-memop blocks whose prefix `0..back_idx` is a single-block
-  self-loop (no internal branches, calls, syscalls, atomics, SP bases, `M_LITERAL`, FlagM,
-  read-before-write NZCV, or >2 distinct stolen GPRs per instruction) with a countdown
-  (`SUBS`/`SUB` + `B.NE`/`B.HI`/`B.GT`/`B.GE`/`B.PL`/`CBNZ`) or incrementing compare (`CMP`
-  reg/imm + `B.NE`/`B.GT`/`B.LT`/`B.GE`/`B.LE`/`B.HI`/`B.LO`/`B.HS`/`B.LS`, including 64-bit
-  `ADD` counters with 32-bit compares) exit, up to 7 pointer-opaque root base pointers (plus live
-  end-of-iteration derived affine aliases not read before write) and up to 12 access streams
-  covering plain offset/pre/post-index accesses, `M_REG` accesses (induction base with
-  loop-invariant index, or 64-bit `LSL`/`SXTX` induction index), and loop-invariant register
-  strides (`ADD Xd, Xd, Xm` after the accesses to that base), `prepare` emits a guarded native fast loop right
-  after the 2-word entry kick check. The NZCV-free prologue checks `nwatch == 0`, computes a
-  conservative lower bound on remaining back-edges clamped to `KICK_BUDGET` (`32..256`), probes
-  each stream's 2 MB `stlb` entry first (falling back to the 4 KB `tlb` for non-superpage ranges)
-  before checking 2 MB or 4 KB span bounds (saving each root's addend in `dbt_groups[0..6]`,
-  verifying equal addends for additional streams on the same root, checking register strides against
-  `(safe_iters - 1) * sr <= avail` via `MUL` before falling back to `UDIV` on boundary crossings,
-  using 34-bit reciprocal multiplication for non-power-of-2 constant strides, and tracking
-  `safe_iters` in `dbt_groups[7]`), and bails straight to the standard checked loop if
-  `safe_iters < 2`, both probes miss, or a stride fails. On entry
-  it adds each addend to its root pointer (pinning up to 2 loop-wide stolen GPRs in `T0`/`T1` to
-  avoid per-iteration `CTX` traffic), runs the native body for `safe_iters` iterations counted in
-  `T2` (omitting the loop-closing `CMP` while allowing loop-local write-before-read NZCV ops such
-  as `FCMP`/`CSET`/`FCSEL`), flushes written pinned registers, subtracts addends from roots and
-  live aliases, re-emits any omitted `FL_CMP_INC` compare once so iteration-end NZCV is exact, and
-  falls through to the standard checked loop for at least one final/boundary iteration so exit
-  NZCV, page crossings and faults remain exact. Matched blocks increment `DbtStats::fast_loops`
-  (preserved in templates).
+- Strip-mined in-page fast loops: for non-memop blocks whose prefix `0..back_idx` is a self-loop
+  within one page or crossing at most one 4 KiB code page boundary when the next page is mapped
+  executable and matches shared-group status (no internal branches, calls, syscalls, atomics,
+  `M_LITERAL`, FlagM, read-before-write NZCV, or >2 distinct stolen GPRs per instruction) with a
+  countdown (`SUBS`/`SUB` + `B.NE`/`B.HI`/`B.GT`/`B.GE`/`B.PL`/`CBNZ`) or incrementing compare
+  (`CMP` reg/imm + `B.NE`/`B.GT`/`B.LT`/`B.GE`/`B.LE`/`B.HI`/`B.LO`/`B.HS`/`B.LS`, including
+  64-bit `ADD` counters with 32-bit compares and 64-bit affine-derived compare operands
+  `d = c + cmp_off`) exit, up to 7 pointer-opaque root base pointers (including zero-stride
+  `M_OFFSET` `SP` bases and live end-of-iteration derived affine aliases not read before write) and
+  up to 16 access streams covering plain offset/pre/post-index accesses, `M_REG` accesses
+  (induction base with loop-invariant index, 64-bit `LSL`/`SXTX` induction index, or derived
+  64-bit shifted-sum indices `(r0 + r1 + off) << sh` from `ADD` + `LSL #1..4`), and loop-invariant
+  register strides (`ADD Xd, Xd, Xm` after the accesses to that base), `prepare` emits a guarded
+  native fast loop right after the 2-word entry kick check (the fallback slow body stays
+  single-page). The NZCV-free prologue checks `nwatch == 0` (and 16-byte `SP` alignment when `SP`
+  is accessed), computes a conservative lower bound on remaining back-edges clamped to `KICK_BUDGET`
+  (`32..256`, capped at 12,288 guest instructions), validates zero-stride streams with a
+  dual-endpoint 4 KiB TLB contiguity check (allowing cross-4 KiB stack frames to run natively) and
+  probes positive-stride streams in the 2 MB `stlb` first (falling back to the 4 KB `tlb` for
+  non-superpage ranges) before checking 2 MB or 4 KB span bounds (saving each root's addend in
+  `dbt_groups[0..6]`, verifying equal addends for additional streams on the same root, checking
+  register strides against `(safe_iters - 1) * sr <= avail` via `MUL` before falling back to `UDIV`
+  on boundary crossings, using 34-bit reciprocal multiplication for non-power-of-2 constant strides,
+  and tracking `safe_iters` in `dbt_groups[7]`), and bails straight to the standard checked loop if
+  `safe_iters < 2`, a probe misses, or a stride fails. On entry it adds each addend to its root
+  pointer (`SP_HOST` for `SP`), pins all stolen GPRs touched in the body (first 2 in `T0`/`T1`,
+  additional ones borrowing unused non-stolen host registers saved/restored in their dead
+  `cpu->x[]` slots when available, else falling back to per-instruction `T0`/`T1` loads skipping
+  write-only `Rd`), runs the native body for `safe_iters` iterations counted in `T2` (omitting the
+  loop-closing `CMP` while allowing loop-local write-before-read NZCV ops such as
+  `FCMP`/`CSET`/`FCSEL`), flushes written pinned registers, restores borrowed host registers,
+  subtracts addends from roots and live aliases, re-emits any omitted `FL_CMP_INC` compare once so
+  iteration-end NZCV is exact, and falls through to the standard checked loop for at least one
+  final/boundary iteration so exit NZCV, page crossings and faults remain exact. Matched blocks
+  increment `DbtStats::fast_loops` (preserved in templates).
 
 ### Control flow
 
@@ -310,28 +320,32 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
   and re-points only the branches to routines. The arena is cleared when full and on a host fault.
 - Pool: a dropped instance that is not poisoned is kept (marked stale, private blocks dropped) if it
   has a key, at most 131072 block records (dead ones included) and 64 MB of code, no pending flush,
-  and, above 32 MB, fits in the remaining 64 MB code budget; otherwise it is flushed. A poisoned
-  instance is released. The pool holds 16 instances, evicting empty ones first, then the least
-  recently used. `DbtSpace::new` takes the newest pooled instance with the same key and register
-  set, else the first emptied one (regenerating routines if the register set differs), else a new
-  one.
+  and, above 32 MB, fits in the remaining 64 MB code budget; otherwise it is flushed (clearing
+  `nogroup_count` and `strikes` so emptied instances do not leak ungroup state to future users). A
+  poisoned instance is released. The pool holds 16 instances, evicting empty ones first, then the
+  least recently used. `DbtSpace::new` takes the newest pooled instance with the same key and
+  register set, else the first emptied one (regenerating routines if the register set differs),
+  else a new one.
 - Reuse of a stale instance: `trust` (only on a stale instance) marks ranges whose start, length and
   identity match exactly as trusted, and makes the previous user's `set_sources` ranges parkable.
-  On the first run `recheck` skips trusted blocks and compares the rest. A mismatching block whose
-  page has no executable mapping and that lies within a parkable range is parked, and revived
-  (whole page re-checked) the first time that page is executed; other mismatches are retired; if
-  non-parkable mismatches exceed half of the live blocks, nothing is retired and a full flush is
-  requested instead.
+  On the first run `recheck` skips trusted blocks and compares the rest (across both pages for
+  cross-page fast-loop blocks). A single-page mismatching block whose page has no executable mapping
+  and that lies within a parkable range is parked, and revived (whole page re-checked) the first
+  time that page is executed; cross-page and other mismatches are retired; if non-parkable
+  mismatches exceed half of the live blocks, nothing is retired and a full flush is requested
+  instead.
 
 ### Invalidation
 
 - The kernel replays its code-change log through `Dbt::invalidate(cpu, start, len)`, or calls
   `Dbt::flush` when the log no longer covers what the thread missed (`kernel/mmu`).
 - Invalidation with a CPU is by content: blocks whose saved words differ from current memory, or
-  whose page no longer has an executable mapping, are retired; parked blocks are left alone.
-  Without a CPU every block in the range is retired and parked ones are killed. Ranges spanning more
-  than 256 pages (or wrapping) scan every block; blocks of every group member are compared against
-  the caller's memory (no tag filter).
+  whose page (or second page for cross-page fast-loop blocks) no longer has an executable mapping,
+  are retired; parked blocks are left alone. Without a CPU every block in the range is retired and
+  parked ones are killed. Ranges spanning more than 256 pages (or wrapping) scan every block
+  overlapping the page range; small ranges also check bucket `first - 1` whenever
+  `cross_page_blocks > 0` so modifying or unmapping page 1 retires any cross-page block starting in
+  page 0; blocks of every group member are compared against the caller's memory (no tag filter).
 - A small-range invalidation unlinks dead block records from each page bucket it visits. Parked
   blocks stay in the bucket for revival. Compaction reclaims dead records in the block log.
 - `ic ivau` in Tier 1 records the untagged page. Tier 0 handles page zero (the pending-page

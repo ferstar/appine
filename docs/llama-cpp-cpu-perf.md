@@ -1,6 +1,6 @@
 # Optimizing CPU Performance for `llama.cpp`
 
-> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, Phase 2B-1, Post-2B-1 profiling, and Direction 3A completed 2026-11-22–23; Phase 2B-2 and Direction 3B pending).
+> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, Phase 2B-1, Post-2B-1 profiling, Direction 3A, and Phase 2B-2 completed 2026-11-22–23; Direction 3B pending).
 > Grounded in `core/engine/src/c/dbt.c`, `core/engine/include/appine/engine.h`,
 > `core/engine/src/c/features.c`, `core/engine/src/c/mmu.c`, `core/kernel/src/mm.rs`,
 > `core/kernel/src/syscall/mem.rs`, `core/kernel/src/syscall/fast.rs`,
@@ -502,20 +502,18 @@ handful of strided NEON compute loops (`ggml_vec_dot_*`, `ggml_gemm_*`, `rms_nor
        - Remaining non-fast-loop kernels are small and fragmented (`rms_norm_mul_fused` `+70` [+3.9%, `0x7c34c` blocked only by `ldr x0, [sp, #192]`], `swiglu` `+35` [+2.0%, mid-loop overflow branch], `rope` `+22` [+1.2%], `repack_q8_0` `+14` [+0.8%]; `soft_max` `0.97×` and `quantize_mat_q8_0` `1.03×` are already at native speed).
      - **Decode (`q4_tg128 -t 1`/`-t 4`, `f16_tg32 -t 4`)**: Core GEMV/dot kernels are already at native speed (`gemv_q4_0` `0.94×` at `-t 4` / `1.08×` at `-t 1`, `gemv_q8_0` `0.96×` / `1.01×`, `vec_dot_f16` `0.98×`). The largest single Appine-side overhead is now `dbt_shared_routines` (`emit_refill`: 2.71% / `+210` samples = **23.5%** of `q4_tg128 -t 4` gap; 3.45% / `+146` = 18.4% at `-t 1`; 2.65% / `+135` = **21.3%** of `f16_tg32 -t 4` gap), followed by non-tiled `flash_attn_ext` (`+91`/`+99`), `ggml_barrier` (`+143` at `-t 4`), and outer dispatch/startup.
      - **F16 prefill (`f16_pp128 -t 4`: `5,583 → 8,987`, `+3,404` samples, `1.61×`)**: Concentrated in `tinyBLAS::gemm_bloc<4,6>` (`4,133 → 6,136`, `+2,003` = **58.8%** of gap, `1.48×`), `tinyBLAS::gemm_bloc<4,5>` (`733 → 1,196`, `+463` = **13.6%**, `1.63×`), and `dbt_shared_routines` (`+498` = 14.6%, of which `328` samples [3.65% total CPU, **9.6%** of gap] are `refill[1]` cross-page writes from `gemm_bloc`'s `stp q, [sp, #0..352]`) — **~82%** of the F16 prefill gap combined.
-   - **Phase 2B-2 (pending — `tinyBLAS::gemm_bloc`, ~82% of F16 prefill gap)**:
-     - Derived shifted indices (`add tmp, row_off, x0; lsl tmp, tmp, #1`) and derived compare
-       operand (`x3 = x0 + 15; cmp x11, x3`).
-     - Same-base multi-row addend sharing (already supported by Phase 2B-1's `fast_stream` /
-       `first_for_ptr` mechanism; raise `FAST_LOOP_MAX_STREAMS` if needed): 10–11 memory streams
-       share only **3 base registers** (`x1`, `x2`, `sp`), staying within `FAST_LOOP_MAX_PTRS = 7`.
-     - Disassembly note: `<4,6>` (`0x9dff0..0x9e104`) reads 3 loop-invariant stolen GPRs
-       (`x16`/`x17`/`x18`), while `<4,5>` (`0x9e600..0x9e6f0`) uses 4 stolen GPRs
-       (`x16`/`x17` read-only + `x27`/`x28` scratch temps), exceeding the current 2-reg pinning
-       cap unless widened or handled selectively.
-     - Zero-stride `sp` base (`[sp, #0..352]`), also eliminating F16 prefill's 3.65% cross-page
-       `refill[1]` overhead.
-     - Cross-4 KiB-code-page 2-block loop support for `gemm_bloc<4, 6>` (`0x9dff0..0x9e104`;
-       `gemm_bloc<4, 5>` at `0x9e600..0x9e6f0` is single-page).
+   - **Phase 2B-2 (completed 2026-11-23 — `tinyBLAS::gemm_bloc` fast loops, ~82% of F16 prefill gap)**:
+     - Extended `analyze_fast_loop` / `emit_fast_loop` and cross-page block lifecycle in `core/engine/src/c/dbt.c`:
+       - Symbolic derived 64-bit shifted-sum indices (`ADD Xd, Xn, Xm` + `LSL Xd, Xn, #1..4` -> `idx_reg`/`idx_reg2`/`idx_shift` in `fast_stream`), raising `FAST_LOOP_MAX_STREAMS` from 12 to 16 so all 11 streams of `gemm_bloc<4,6>` (4 on `x2`, 6 on `x1`, 1 on `sp`) share only 3 base pointers (`x1`, `x2`, `sp`).
+       - Derived 64-bit `FL_CMP_INC` compare operands (`add x3, x0, #15; add x0, x0, #8; ... cmp x11, x3; b.gt`), computing `v_0 = cnt_reg + cmp_off` in the prologue for unified exact wraparound semantics.
+       - Zero-stride `M_OFFSET` `sp` root pointers (`[sp, #0..352]`) with a 2-instruction 16-byte SP alignment check and a dual-endpoint 4 KiB TLB contiguity check (`first` + `last` with identical addend), running cross-4 KiB stack frames natively and eliminating F16 prefill's 3.65% `refill[1]` cross-page write overhead.
+       - Generalized loop-wide stolen-register pinning: pins up to 6 stolen GPRs (first 2 in `T0`/`T1`, additional ones borrowing unused non-stolen host registers saved/restored in their dead `cpu->x[]` slots — covering `gemm_bloc<4,6>`'s 3 read-only stolen GPRs `x16/x17/x18` and `<4,5>`'s 4 stolen GPRs `x16/x17/x27/x28` with zero inner-loop `CTX` traffic), plus skipping write-only `Rd` loads in `emit_fast_operands` and raising the `KICK_BUDGET` instruction cap from 8,192 to 12,288 so `K = 896` (112 iters) runs in one fast-loop pass.
+       - Cross-4 KiB-code-page fast-loop support (`gemm_bloc<4,6>` at `0x9dff0..0x9e104` crossing `0x9e000`): slow body stays strictly single-page while `fetch_guest_fast` peeks lazily into the next executable page (matching shared-group status), and `install`, `template_fetch`, `block_matches`, `recheck`, `appine_dbt_retire_outside`, and `invalidate_locked` (checking bucket `first - 1` when `cross_page_blocks > 0`) maintain exact page-1 invalidation and template reuse. Also fixed a pre-existing pool hygiene bug in `appine_dbt_free` where emptied instances did not clear `nogroup_count`/`strikes`.
+     - Matched `gemm_bloc<4,6>` and `gemm_bloc<4,5>` (`fast loops`: `46 → 121` on F16 `pp128`, `64 → 129` on Q4_0).
+     - **Same-session alternating A/B results vs. Direction 3A** (2 rounds × `-r 3`, `appine-run --tier 1` on `/bench/store`):
+       - Qwen2.5-0.5B F16 `pp128 -t 1`: `53.88 → 84.44 t/s` (**+56.7%**); `pp128 -t 4`: `233.81 → 323.96 t/s` (**+38.6%**, now **1.16×** native vs. 1.64–1.67× in Step 0); `pp512 -t 4`: `235.15 → 328.79 t/s` (**+39.8%**); `tg32 -t 1`: flat (`34.26 → 34.20 t/s`); `tg32 -t 4`: `74.89 → 72.66 t/s` (within run noise).
+       - Qwen2.5-0.5B Q4_0: `pp128 -t 4`: `965.66 → 968.70 t/s` (+0.3%); `pp512 -t 4`: `951.17 → 954.70 t/s` (+0.4%); `tg128 -t 4`: `179.84 → 181.28 t/s` (+0.8%); `pp512 -t 1`: flat (`256.35 → 255.68 t/s`); `tg128 -t 1`: `95.41 → 93.45 t/s`.
+       - **Verification & non-ML regression**: `appine-engine` 83/83 (including new `fast_loop_gemm_bloc_derived_index_sp_and_cross_page` covering derived shifted indices, derived compares, >2 stolen GPRs with borrowed-reg preservation, contiguous/scattered/misaligned/RO SP, non-contiguous cross-code-page loops, template reuse, page-1 data fault, page-1 code rewrite invalidation, and page-1 unmap invalidation), `guest_programs` 26/26, `rootfs_programs` 73/73, 200k-iteration `appine-lockstep` under both `Default` and `Go` (0 mismatches), idle `appine-bench` Tier 1 geomean **1.68×** (vs. 1.69× in Direction 3A), `python3` noise-identical.
 4. **Step 3 — Superpages & secondary work**
    - **Direction 3A (completed 2026-11-23 — L2 2 MiB superpages, 2 MiB fast-loop span, sequential TLB prefill, and bulk `exec_memop`)**:
      - `kernel/mmu` (`core/engine/src/c/mmu.c`, `internal.h`, `cpu.c`, `engine.h`, `lib.rs`):

@@ -341,6 +341,7 @@ struct appine_dbt {
     bool poisoned;
     uint32_t *page_head;  /* hash of a guest page → list head in blocks (index plus 1) */
     uint32_t *page_parked; /* same hash: parked count, read lock-free if a lookup fails (revive) */
+    size_t cross_page_blocks; /* live blocks whose fast-loop words cross into the next guest page */
     /* The group's registered mappings (appine_dbt_share), sorted by start and non-overlapping;
      * read without the lock. A replaced old array hangs off the new one's older and is freed when
      * the instance returns to the pool */
@@ -525,11 +526,14 @@ struct xlate {
     unsigned nrelocs;
     /* The block being translated: start pc, guest instruction source (in mapped guest page),
      * lazily snapshotted words in prep->words (first `copied` words valid), index of the current
-     * instruction, and the most instructions the block may have */
+     * instruction, and the most instructions the block may have in the first page */
     uint64_t pc;
     const uint32_t *src;
+    const struct appine_mmu *mmu; /* for lazy next-page fetch in cross-page fast loops */
+    const uint32_t *src1;         /* second guest page (pc & ~PAGE_MASK) + 4096, or NULL */
     uint32_t *words;
     unsigned copied, idx, limit;
+    bool tried_src1;
     /* This block goes into the translation table by pc (TAG_SHIFT), and its link stubs carry
      * LINK_SHARED */
     bool shared;
@@ -578,6 +582,46 @@ static inline uint32_t fetch_guest(struct xlate *x, unsigned idx)
         x->copied = want;
     }
     return x->words[idx];
+}
+
+/* Same as fetch_guest, allowing analyze_fast_loop to peek across at most one 4 KiB guest page
+ * boundary when the next page is mapped executable and shares the block's code-group status. */
+static inline bool fetch_guest_fast(struct xlate *x, unsigned idx, uint32_t *out)
+{
+    if (LIKELY(idx < x->limit)) {
+        *out = fetch_guest(x, idx);
+        return true;
+    }
+    if (idx >= MAX_BLOCK_INSNS)
+        return false;
+    if (!x->tried_src1) {
+        x->tried_src1 = true;
+        uint64_t next_page = (x->pc & ~PAGE_MASK) + APPINE_PAGE_SIZE;
+        if (next_page > x->pc && next_page < (UINT64_C(1) << APPINE_VA_BITS) &&
+            (!x->shared || !__atomic_load_n(&x->d->shared, __ATOMIC_ACQUIRE) ||
+             in_shared(x->d, next_page)))
+            x->src1 = appine_mmu_translate(x->mmu, next_page, APPINE_PROT_EXEC);
+    }
+    if (!x->src1)
+        return false;
+    if (x->copied < x->limit) {
+        memcpy(x->words + x->copied, x->src + x->copied, (x->limit - x->copied) * 4);
+        x->copied = x->limit;
+    }
+    if (idx >= x->copied) {
+        unsigned want = x->copied + 64;
+        if (want > MAX_BLOCK_INSNS)
+            want = MAX_BLOCK_INSNS;
+        memcpy(x->words + x->copied, x->src1 + (x->copied - x->limit), (want - x->copied) * 4);
+        x->copied = want;
+    }
+    *out = x->words[idx];
+    return true;
+}
+
+static inline bool block_cross_page(uint64_t pc, uint32_t nguest)
+{
+    return nguest > 0 && ((pc + 4ull * nguest - 1) >> APPINE_PAGE_SHIFT) != (pc >> APPINE_PAGE_SHIFT);
 }
 
 /* Write address of code (the writable alias of the W^X double mapping) */
@@ -3071,6 +3115,8 @@ static void table_insert(struct appine_dbt *d, uint64_t pc, unsigned tag, uint32
     d->blocks[d->table_count] =
         (struct block){pc, code, d->page_head[h], (uint32_t)d->words_used, nguest, 0, (uint16_t)tag, 0};
     d->words_used += nguest;
+    if (block_cross_page(pc, nguest))
+        d->cross_page_blocks++;
     d->table_used[d->table_count++] = (uint32_t)i;
     d->page_head[h] = (uint32_t)d->table_count;
 }
@@ -3145,7 +3191,7 @@ static bool compact_blocks(struct appine_dbt *d)
     struct table *table = table_new(d->table->bits);
     if (!table)
         return false;
-    size_t n = 0, words = 0;
+    size_t n = 0, words = 0, cross = 0;
     memset(d->page_head, 0, sizeof(*d->page_head) << PAGE_BUCKET_BITS);
     for (size_t k = 0; k < d->table_count; k++) {
         struct block b = d->blocks[k];
@@ -3154,6 +3200,8 @@ static bool compact_blocks(struct appine_dbt *d)
         memmove(d->words + words, d->words + b.words, b.nguest * 4);
         b.words = (uint32_t)words;
         words += b.nguest;
+        if (block_cross_page(b.pc, b.nguest))
+            cross++;
         unsigned h = page_bucket(b.pc >> APPINE_PAGE_SHIFT);
         b.next = d->page_head[h];
         d->blocks[n++] = b;
@@ -3161,6 +3209,7 @@ static bool compact_blocks(struct appine_dbt *d)
     }
     d->table_count = n;
     d->words_used = words;
+    d->cross_page_blocks = cross;
     d->blocks_dead = 0;
     table_rebuild(d, table);
     return true;
@@ -3184,6 +3233,7 @@ static void flush_locked(struct appine_dbt *d)
     }
     d->table_count = d->table_occupied = d->table_dead = d->blocks_dead = d->nparked = 0;
     d->words_used = 0;
+    d->cross_page_blocks = 0;
     d->stale = false;
     d->nsources = d->ntrusted = d->nparkable = 0;
     d->flush_wanted = false;
@@ -3320,8 +3370,11 @@ static void invalidate_locked(struct appine_dbt *d, const struct appine_mmu *mmu
     if (end < start || last - first >= INVALIDATE_MAX_PAGES) {
         for (size_t i = 0; i < d->table_count; i++) {
             struct block *b = &d->blocks[i];
-            uint64_t page = b->pc >> APPINE_PAGE_SHIFT;
-            if (!b->code || page < first || page > last)
+            if (!b->code)
+                continue;
+            uint64_t b_first = b->pc >> APPINE_PAGE_SHIFT;
+            uint64_t b_last = (b->pc + 4ull * b->nguest - 1) >> APPINE_PAGE_SHIFT;
+            if (b_last < first || b_first > last)
                 continue;
             if (b->parked) {
                 if (!mmu)
@@ -3334,6 +3387,29 @@ static void invalidate_locked(struct appine_dbt *d, const struct appine_mmu *mmu
         }
         retire_flush(d, &r);
         return;
+    }
+    if (first > 0 && d->cross_page_blocks > 0) {
+        uint64_t prev = first - 1;
+        uint32_t *link = &d->page_head[page_bucket(prev)];
+        while (*link) {
+            struct block *b = &d->blocks[*link - 1];
+            if (!b->code) {
+                *link = b->next;
+                continue;
+            }
+            link = &b->next;
+            if (b->pc >> APPINE_PAGE_SHIFT != prev ||
+                ((b->pc + 4ull * b->nguest - 1) >> APPINE_PAGE_SHIFT) < first)
+                continue;
+            if (b->parked) {
+                if (!mmu)
+                    kill_parked(d, b);
+            } else if (mmu && block_matches(d, mmu, b, &seen, &host)) {
+                continue;
+            } else if (!retire_add(d, &r, b, false)) {
+                goto full;
+            }
+        }
     }
     for (uint64_t page = first; page <= last; page++) {
         uint32_t *link = &d->page_head[page_bucket(page)];
@@ -3495,11 +3571,11 @@ static uint64_t nogroup_key(const struct appine_dbt *d, uint64_t pc)
 }
 
 /* The caller holds the lock of pc's shard */
-static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64_t key, const struct regs *r,
-                                      bool shared)
+static struct template *template_find(uint64_t pc, const uint32_t *guest, uint32_t nguest, uint64_t key,
+                                      const struct regs *r, bool shared)
 {
     for (struct template *t = *template_bucket(pc); t; t = t->next) {
-        if (t->pc == pc && t->key == key && t->r == r && t->shared == shared &&
+        if (t->pc == pc && t->nguest == nguest && t->key == key && t->r == r && t->shared == shared &&
             memcmp(t->words, guest, t->nguest * 4) == 0)
             return t;
     }
@@ -3507,21 +3583,50 @@ static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64
 }
 
 /* Same as template_find, extending the caller's snapshot in `words` lazily past 64 words only when
- * a longer template exists at `pc` */
+ * a longer template exists at `pc` (and into the next page when a cross-page fast-loop template
+ * exists at `pc`). */
 static struct template *template_find_fetch(uint64_t pc, const uint32_t *src, uint32_t *words,
-                                            unsigned *copied, unsigned limit, uint64_t key,
+                                            unsigned *copied, unsigned limit0,
+                                            const struct appine_mmu *mmu, const struct appine_dbt *d,
+                                            const uint32_t **guest1_out, uint64_t key,
                                             const struct regs *r, bool shared)
 {
+    const uint32_t *src1 = NULL;
+    bool tried_src1 = false;
     for (struct template *t = *template_bucket(pc); t; t = t->next) {
-        if (t->pc != pc || t->key != key || t->r != r || t->shared != shared || t->nguest > limit)
+        if (t->pc != pc || t->key != key || t->r != r || t->shared != shared ||
+            t->nguest > MAX_BLOCK_INSNS)
             continue;
-        if (t->nguest > *copied) {
+        if (t->nguest > limit0) {
+            if (!tried_src1) {
+                tried_src1 = true;
+                uint64_t next_page = (pc & ~PAGE_MASK) + APPINE_PAGE_SIZE;
+                if (next_page > pc && next_page < (UINT64_C(1) << APPINE_VA_BITS) &&
+                    (!shared || !__atomic_load_n(&d->shared, __ATOMIC_ACQUIRE) ||
+                     in_shared(d, next_page)))
+                    src1 = appine_mmu_translate(mmu, next_page, APPINE_PROT_EXEC);
+            }
+            if (!src1)
+                continue;
+            if (*copied < limit0) {
+                memcpy(words + *copied, src + *copied, (limit0 - *copied) * 4);
+                *copied = limit0;
+            }
+            if (t->nguest > *copied) {
+                memcpy(words + *copied, src1 + (*copied - limit0), (t->nguest - *copied) * 4);
+                *copied = t->nguest;
+            }
+        } else if (t->nguest > *copied) {
             memcpy(words + *copied, src + *copied, (t->nguest - *copied) * 4);
             *copied = t->nguest;
         }
-        if (memcmp(t->words, words, t->nguest * 4) == 0)
+        if (memcmp(t->words, words, t->nguest * 4) == 0) {
+            *guest1_out = t->nguest > limit0 ? src1 : NULL;
             return t;
+        }
     }
+    if (*copied > limit0)
+        *copied = limit0;
     return NULL;
 }
 
@@ -3535,7 +3640,8 @@ struct prep {
     uint64_t pc;
     unsigned tag; /* private block: tag of the member it belongs to (TAG_SHIFT) */
     uint32_t memop_kind; /* registration observed while translating */
-    const uint32_t *guest; /* host location of the guest words: compared again before installing */
+    const uint32_t *guest;  /* host location of page 0 guest words: compared again before installing */
+    const uint32_t *guest1; /* host location of page 1 guest words when nguest crosses a page, else NULL */
     uint32_t nguest;
     uint32_t words[MAX_BLOCK_INSNS]; /* guest instruction words read at translation */
     const uint32_t *host;
@@ -3546,18 +3652,23 @@ struct prep {
     unsigned nlinks;
 };
 
-/* If there is a template matching `words` (lazily extended from `src` up to `limit`), copy it
- * into the thread's scratch area and record it in p */
+/* If there is a template matching `words` (lazily extended from `src` up to `limit0`, or into
+ * page 1 for cross-page fast-loop templates), copy it into the thread's scratch area and record
+ * it in p */
 static bool template_fetch(uint64_t pc, const uint32_t *src, uint32_t *words, unsigned *copied,
-                           unsigned limit, uint64_t key, const struct regs *r, bool shared,
-                           struct prep *p, uint32_t *scratch, struct appine_dbt_stats *st)
+                           unsigned limit0, const struct appine_mmu *mmu, const struct appine_dbt *d,
+                           uint64_t key, const struct regs *r, bool shared, struct prep *p,
+                           uint32_t *scratch, struct appine_dbt_stats *st)
 {
     pthread_mutex_t *lock = template_lock(pc);
-    struct template *t = template_find_fetch(pc, src, words, copied, limit, key, r, shared);
+    const uint32_t *guest1 = NULL;
+    struct template *t =
+        template_find_fetch(pc, src, words, copied, limit0, mmu, d, &guest1, key, r, shared);
     if (t) {
         const uint32_t *host = t->words + t->nguest, *relocs = host + t->nhost;
         memcpy(scratch, host, t->nhost * 4);
         memcpy(p->relocs, relocs, t->nrelocs * 4);
+        p->guest1 = guest1;
         p->host = scratch;
         p->nhost = t->nhost;
         p->nrelocs = t->nrelocs;
@@ -3637,7 +3748,8 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
     size_t bytes = sizeof(struct template) + 4 * (nguest + x->n + x->nrelocs + 4 * nlinks);
     bytes = (bytes + 7) & ~(size_t)7;
     pthread_mutex_t *lock = template_lock(pc);
-    struct template *t = template_find(pc, guest, key, x->d->r, x->shared) ? NULL : template_alloc(bytes);
+    struct template *t =
+        template_find(pc, guest, nguest, key, x->d->r, x->shared) ? NULL : template_alloc(bytes);
     if (t) {
         *t = (struct template){
             .pc = pc,
@@ -3754,7 +3866,7 @@ struct fresh {
  * loop afterward, producing exact exit NZCV and precise faults on any page boundary or mismatch.
  */
 #define FAST_LOOP_MAX_PTRS 7
-#define FAST_LOOP_MAX_STREAMS 12
+#define FAST_LOOP_MAX_STREAMS 16
 #define FAST_LOOP_MAX_WORDS 1500
 _Static_assert(FAST_LOOP_MAX_PTRS < GROUP_SLOTS, "dbt_groups[7] holds safe_iters during prologue");
 
@@ -3762,15 +3874,16 @@ enum fast_loop_kind { FL_COUNTDOWN, FL_CMP_INC };
 enum fast_cmp_kind { FL_NE, FL_SLT, FL_SLE, FL_ULT, FL_ULE };
 
 struct fast_ptr {
-    uint8_t reg;
+    uint8_t reg;         /* 0..30 = guest Xr; 31 = guest SP (SP_HOST) */
     uint32_t alias_mask; /* regs (a != reg) holding reg + const at end of iteration */
 };
 
 struct fast_stream {
     uint8_t ptr_idx;    /* index into fast_loop::ptrs */
     uint8_t idx_reg;    /* 31 = none (plain offset); 0..30 = M_REG index register */
+    uint8_t idx_reg2;   /* 31 = none; 0..30 = second 64-bit index reg added before idx_shift */
     uint8_t idx_opt;    /* M_REG option (2, 3, 6, 7) */
-    uint8_t idx_shift;  /* M_REG shift (0..4) */
+    uint8_t idx_shift;  /* M_REG / derived left shift (0..4) */
     uint8_t stride_reg; /* 31 = constant stride; 0..30 = loop-invariant register stride */
     bool write;
     bool first_for_ptr; /* true saves addend in dbt_groups[ptr_idx]; false checks equality */
@@ -3787,15 +3900,18 @@ struct fast_loop {
     uint32_t bound_imm;
     bool bound_is_imm;
     bool is_64;
+    bool uses_sp;
     uint32_t step;
+    int64_t cmp_off; /* for FL_CMP_INC: iter-0 compared value is cnt_reg + cmp_off */
     enum fast_cmp_kind cmp;
     unsigned cd_cond; /* B.cond code for FL_COUNTDOWN */
     unsigned kick_log2;
     unsigned nptrs;
     unsigned nstreams;
     unsigned npin;
-    uint8_t pin_reg[2];
-    bool pin_written[2];
+    uint8_t pin_reg[6];
+    uint8_t pin_host[6];
+    bool pin_written[6];
     struct fast_ptr ptrs[FAST_LOOP_MAX_PTRS];
     struct fast_stream streams[FAST_LOOP_MAX_STREAMS];
 };
@@ -3892,13 +4008,19 @@ static void fl_mark_read(unsigned r, const int8_t sym_root[31], uint32_t written
 
 static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
 {
-    if (x->limit < 2)
+    if (x->limit == 0)
         return false;
 
     int8_t sym_root[31], sym_sreg[31];
     int64_t sym_off[31];
+    /* Block-local derived 64-bit index expressions: (reg0 + reg1 + off) << shift (reg1 == -1 if single). */
+    struct sym_idx {
+        int8_t reg0, reg1;
+        int64_t off;
+        uint8_t shift;
+    } sym_idx[31];
     struct raw_stream {
-        uint8_t root, idx_reg, idx_opt, idx_shift;
+        uint8_t root, idx_reg, idx_reg2, idx_opt, idx_shift;
         bool write;
         int32_t lo, hi;
     } raw[FAST_LOOP_MAX_STREAMS];
@@ -3920,14 +4042,17 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
         sym_root[r] = (int8_t)r;
         sym_sreg[r] = -1;
         sym_off[r] = 0;
+        sym_idx[r] = (struct sym_idx){.reg0 = (int8_t)r, .reg1 = -1, .off = 0, .shift = 0};
     }
 
     unsigned back_idx = 0;
     uint32_t back_insn = 0;
     bool found_back = false;
 
-    for (unsigned i = 0; i < x->limit; i++) {
-        uint32_t insn = fetch_guest(x, i);
+    for (unsigned i = 0; i < MAX_BLOCK_INSNS; i++) {
+        uint32_t insn;
+        if (!fetch_guest_fast(x, i, &insn))
+            return false;
         uint64_t va = x->pc + 4ull * i;
         unsigned top = FIELD(insn, 28, 25);
 
@@ -3982,6 +4107,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                     if (r < 31) {
                         sym_root[r] = -1;
                         sym_sreg[r] = -1;
+                        sym_idx[r].reg0 = -1;
                         w32_valid &= ~(1u << r);
                         written |= 1u << r;
                         write_count[r]++;
@@ -4002,37 +4128,56 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 return false;
             if (m.prefetch)
                 continue;
-            if (m.mode == M_LITERAL || m.wb_reg || m.rn == 31)
+            if (m.mode == M_LITERAL || m.wb_reg || (m.rn == 31 && m.mode != M_OFFSET))
                 return false;
             if ((m.mode == M_PRE || m.mode == M_POST) && !m.simd &&
                 (m.rt == m.rn || (m.pair && m.rt2 == m.rn)))
                 return false;
             if (m.pair && !m.simd && m.load && m.rt == m.rt2)
                 return false;
-            if (sym_root[m.rn] < 0 || sym_sreg[m.rn] >= 0)
+            if (m.rn < 31 && (sym_root[m.rn] < 0 || sym_sreg[m.rn] >= 0))
                 return false;
 
-            unsigned idx_reg = 31, idx_opt = 0, idx_shift = 0;
+            unsigned idx_reg = 31, idx_reg2 = 31, idx_opt = 0, idx_shift = 0;
             int64_t idx_cur_off = 0;
             if (m.mode == M_REG && m.rm < 31) {
-                if (sym_root[m.rm] != (int8_t)m.rm || sym_sreg[m.rm] >= 0)
+                if (sym_root[m.rm] == (int8_t)m.rm && sym_sreg[m.rm] < 0) {
+                    if (sym_off[m.rm] != 0 && m.option != 3 && m.option != 7)
+                        return false;
+                    idx_reg = m.rm;
+                    idx_opt = m.option;
+                    idx_shift = m.shift;
+                    idx_cur_off = sym_off[m.rm] * (int64_t)(1u << m.shift);
+                    fl_mark_read(m.rm, sym_root, written, &read_before_write, &used_as_nonptr);
+                } else if ((m.option == 3 || m.option == 7) && sym_idx[m.rm].reg0 >= 0 &&
+                           sym_idx[m.rm].shift + m.shift <= 4) {
+                    unsigned tot_shift = sym_idx[m.rm].shift + m.shift;
+                    idx_reg = (unsigned)sym_idx[m.rm].reg0;
+                    idx_reg2 = sym_idx[m.rm].reg1 >= 0 ? (unsigned)sym_idx[m.rm].reg1 : 31;
+                    if (idx_reg2 < 31 && idx_reg > idx_reg2) {
+                        unsigned tmp = idx_reg;
+                        idx_reg = idx_reg2;
+                        idx_reg2 = tmp;
+                    }
+                    idx_opt = m.option;
+                    idx_shift = tot_shift;
+                    idx_cur_off = sym_idx[m.rm].off * (int64_t)(1u << tot_shift);
+                    fl_mark_read(m.rm, sym_root, written, &read_before_write, &used_as_nonptr);
+                    used_as_nonptr |= 1u << idx_reg;
+                    if (idx_reg2 < 31)
+                        used_as_nonptr |= 1u << idx_reg2;
+                } else {
                     return false;
-                if (sym_off[m.rm] != 0 && m.option != 3 && m.option != 7)
-                    return false;
-                idx_reg = m.rm;
-                idx_opt = m.option;
-                idx_shift = m.shift;
-                idx_cur_off = sym_off[m.rm] * (int64_t)(1u << m.shift);
-                fl_mark_read(m.rm, sym_root, written, &read_before_write, &used_as_nonptr);
+                }
             }
 
             unsigned seen[2], ns = 0;
-            if (is_stolen(m.rn))
+            if (m.rn < 31 && is_stolen(m.rn))
                 seen[ns++] = m.rn;
-            if (idx_reg < 31 && is_stolen(idx_reg) && (ns == 0 || seen[0] != idx_reg)) {
+            if (m.mode == M_REG && m.rm < 31 && is_stolen(m.rm) && (ns == 0 || seen[0] != m.rm)) {
                 if (ns == 2)
                     return false;
-                seen[ns++] = idx_reg;
+                seen[ns++] = m.rm;
             }
             if (!m.simd) {
                 if (m.rt < 31 && is_stolen(m.rt)) {
@@ -4056,12 +4201,14 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                     }
                 }
             }
-            body_words += 1 + ns * 2 + ((m.mode == M_PRE || m.mode == M_POST) && is_stolen(m.rn) ? 1 : 0);
+            body_words +=
+                1 + ns * 2 + ((m.mode == M_PRE || m.mode == M_POST) && m.rn < 31 && is_stolen(m.rn) ? 1 : 0);
 
-            if (!(written & (1u << m.rn)))
+            if (m.rn < 31 && !(written & (1u << m.rn)))
                 read_before_write |= 1u << m.rn;
-            unsigned root = (unsigned)sym_root[m.rn];
-            int64_t start = sym_off[m.rn] + idx_cur_off +
+            unsigned root = m.rn == 31 ? 31 : (unsigned)sym_root[m.rn];
+            int64_t base_off = m.rn == 31 ? 0 : sym_off[m.rn];
+            int64_t start = base_off + idx_cur_off +
                             (m.mode == M_POST || m.mode == M_REG ? 0 : m.imm);
             int64_t end = start + (int64_t)memop_bytes(&m);
             if (start < -4095 || start > 4095 || end < -4095 || end > 8192)
@@ -4069,7 +4216,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
             used_as_ptr |= 1u << root;
             unsigned si;
             for (si = 0; si < nraw; si++) {
-                if (raw[si].root == root && raw[si].idx_reg == idx_reg &&
+                if (raw[si].root == root && raw[si].idx_reg == idx_reg && raw[si].idx_reg2 == idx_reg2 &&
                     raw[si].idx_opt == idx_opt && raw[si].idx_shift == idx_shift)
                     break;
             }
@@ -4079,6 +4226,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 raw[nraw++] = (struct raw_stream){
                     .root = (uint8_t)root,
                     .idx_reg = (uint8_t)idx_reg,
+                    .idx_reg2 = (uint8_t)idx_reg2,
                     .idx_opt = (uint8_t)idx_opt,
                     .idx_shift = (uint8_t)idx_shift,
                     .write = !m.load,
@@ -4100,6 +4248,10 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
             }
             if (m.mode == M_PRE || m.mode == M_POST) {
                 sym_off[m.rn] += m.imm;
+                if (sym_idx[m.rn].reg0 >= 0 && sym_idx[m.rn].shift == 0)
+                    sym_idx[m.rn].off += m.imm;
+                else
+                    sym_idx[m.rn].reg0 = -1;
                 w32_valid &= ~(1u << m.rn);
                 written |= 1u << m.rn;
                 write_count[m.rn]++;
@@ -4109,6 +4261,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 if (m.rt < 31) {
                     sym_root[m.rt] = -1;
                     sym_sreg[m.rt] = -1;
+                    sym_idx[m.rt].reg0 = -1;
                     w32_valid &= ~(1u << m.rt);
                     written |= 1u << m.rt;
                     write_count[m.rt]++;
@@ -4117,6 +4270,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 if (m.pair && m.rt2 < 31) {
                     sym_root[m.rt2] = -1;
                     sym_sreg[m.rt2] = -1;
+                    sym_idx[m.rt2].reg0 = -1;
                     w32_valid &= ~(1u << m.rt2);
                     written |= 1u << m.rt2;
                     write_count[m.rt2]++;
@@ -4164,6 +4318,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 int64_t imm = (int64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0);
                 if (op == 0xd1000000)
                     imm = -imm;
+                struct sym_idx idx_in = sym_idx[rn];
                 if (sym_root[rn] >= 0) {
                     sym_root[rd] = sym_root[rn];
                     sym_sreg[rd] = sym_sreg[rn];
@@ -4171,6 +4326,12 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 } else {
                     sym_root[rd] = -1;
                     sym_sreg[rd] = -1;
+                }
+                if (idx_in.reg0 >= 0 && idx_in.shift == 0) {
+                    idx_in.off += imm;
+                    sym_idx[rd] = idx_in;
+                } else {
+                    sym_idx[rd].reg0 = -1;
                 }
                 w32_valid &= ~(1u << rd);
                 written |= 1u << rd;
@@ -4184,6 +4345,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 if (rm < 31 && !(written & (1u << rm)))
                     read_before_write |= 1u << rm;
                 if (rd < 31) {
+                    struct sym_idx idx_in = rm < 31 ? sym_idx[rm] : (struct sym_idx){.reg0 = -1};
                     if (rm < 31 && sym_root[rm] >= 0) {
                         sym_root[rd] = sym_root[rm];
                         sym_sreg[rd] = sym_sreg[rm];
@@ -4192,6 +4354,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                         sym_root[rd] = -1;
                         sym_sreg[rd] = -1;
                     }
+                    sym_idx[rd] = idx_in;
                     w32_valid &= ~(1u << rd);
                     written |= 1u << rd;
                     write_count[rd]++;
@@ -4199,7 +4362,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 }
                 continue;
             }
-            /* 64-bit ADD Xd, Xd, Xm (unshifted): tracks loop-invariant register stride */
+            /* 64-bit ADD Xd, Xn, Xm (unshifted): tracks register stride (in-place) or derived sum index */
             if ((insn & 0xffe0fc00) == 0x8b000000) {
                 unsigned rm = FIELD(insn, 20, 16);
                 unsigned sreg = (rd == rn) ? rm : (rd == rm ? rn : 31);
@@ -4209,11 +4372,51 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                         read_before_write |= 1u << rd;
                     fl_mark_read(sreg, sym_root, written, &read_before_write, &used_as_nonptr);
                     sym_sreg[rd] = (int8_t)sreg;
+                    sym_idx[rd].reg0 = -1;
                     w32_valid &= ~(1u << rd);
                     written |= 1u << rd;
                     write_count[rd]++;
                     last_write_idx[rd] = i;
                     continue;
+                }
+                if (rd < 31 && rn < 31 && rm < 31 && sym_root[rn] >= 0 && sym_sreg[rn] < 0 &&
+                    sym_root[rm] >= 0 && sym_sreg[rm] < 0) {
+                    struct sym_idx s = {
+                        .reg0 = sym_root[rn],
+                        .reg1 = sym_root[rm],
+                        .off = sym_off[rn] + sym_off[rm],
+                        .shift = 0,
+                    };
+                    fl_mark_read(rn, sym_root, written, &read_before_write, &used_as_nonptr);
+                    fl_mark_read(rm, sym_root, written, &read_before_write, &used_as_nonptr);
+                    sym_root[rd] = -1;
+                    sym_sreg[rd] = -1;
+                    sym_idx[rd] = s;
+                    w32_valid &= ~(1u << rd);
+                    written |= 1u << rd;
+                    write_count[rd]++;
+                    last_write_idx[rd] = i;
+                    continue;
+                }
+            }
+            /* 64-bit LSL Xd, Xn, #sh (UBFM Xd, Xn, #64-sh, #63-sh, 1 <= sh <= 4): shifts derived index */
+            if ((insn & 0xffc00000) == 0xd3400000 && rd < 31 && rn < 31) {
+                unsigned immr = FIELD(insn, 21, 16), imms = FIELD(insn, 15, 10);
+                if (imms != 63 && immr == imms + 1) {
+                    unsigned sh = 64 - immr;
+                    if (sh >= 1 && sh <= 4 && sym_idx[rn].reg0 >= 0 && sym_idx[rn].shift + sh <= 4) {
+                        struct sym_idx s = sym_idx[rn];
+                        s.shift += (uint8_t)sh;
+                        fl_mark_read(rn, sym_root, written, &read_before_write, &used_as_nonptr);
+                        sym_root[rd] = -1;
+                        sym_sreg[rd] = -1;
+                        sym_idx[rd] = s;
+                        w32_valid &= ~(1u << rd);
+                        written |= 1u << rd;
+                        write_count[rd]++;
+                        last_write_idx[rd] = i;
+                        continue;
+                    }
                 }
             }
             /* 32-bit ADD Wd, Wd, #imm (non-flag-setting): tracks 32-bit loop counter step */
@@ -4222,6 +4425,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 fl_mark_read(rn, sym_root, written, &read_before_write, &used_as_nonptr);
                 sym_root[rd] = -1;
                 sym_sreg[rd] = -1;
+                sym_idx[rd].reg0 = -1;
                 if (imm > 0 && w32_step[rd] + imm <= 4096)
                     w32_step[rd] += imm;
                 else
@@ -4269,6 +4473,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
             if (o.writes_rd && rd < 31) {
                 sym_root[rd] = -1;
                 sym_sreg[rd] = -1;
+                sym_idx[rd].reg0 = -1;
                 w32_valid &= ~(1u << rd);
                 written |= 1u << rd;
                 write_count[rd]++;
@@ -4293,7 +4498,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
         bool is64 = BIT(back_insn, 31);
         if (c < 31 && write_count[c] == 1 && !(used_as_ptr & (1u << c))) {
             unsigned ci = last_write_idx[c];
-            uint32_t ci_insn = fetch_guest(x, ci);
+            uint32_t ci_insn = x->words[ci];
             uint32_t expect = is64 ? 0xd1000000u : 0x51000000u;
             if ((ci_insn & 0xff800000) == expect && (ci_insn & 31) == c && FIELD(ci_insn, 9, 5) == c) {
                 uint32_t imm = FIELD(ci_insn, 21, 10) << (BIT(ci_insn, 22) ? 12 : 0);
@@ -4312,7 +4517,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                !nzcv_read_after_last_write) {
         unsigned cond = back_insn & 15;
         unsigned flag_idx = last_flag_idx;
-        uint32_t fi_insn = fetch_guest(x, flag_idx);
+        uint32_t fi_insn = x->words[flag_idx];
         /* Pattern 1: SUBS Xc/Wc, Xc/Wc, #imm + B.NE/HI/GT/GE/PL */
         if (((fi_insn & 0x7f800000) == 0x71000000) && (fi_insn & 31) < 31 &&
             (fi_insn & 31) == FIELD(fi_insn, 9, 5) &&
@@ -4329,48 +4534,58 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 matched_ctrl = true;
             }
         }
-        /* Pattern 2: CMP reg, reg or CMP reg, #imm + B.cond */
+        /* Pattern 2: CMP reg, reg or CMP reg, #imm + B.cond (direct or affine-derived operand) */
         if (!matched_ctrl &&
             ((fi_insn & 0x7fe0fc1f) == 0x6b00001f || (fi_insn & 0x7f80001f) == 0x7100001f)) {
             bool is64 = BIT(fi_insn, 31);
             bool is_imm = (fi_insn & 0x7f80001f) == 0x7100001f;
             unsigned rn = FIELD(fi_insn, 9, 5);
             unsigned rm = is_imm ? 31 : FIELD(fi_insn, 20, 16);
-            /* Try both orientations for register compare: (B=rn, C=rm) vs (C=rn, B=rm).
-             * Immediate compare always has (C=rn, B=imm). */
+            /* Try both orientations for register compare: (B=rn, D=rm) vs (D=rn, B=rm).
+             * Immediate compare always has (D=rn, B=imm). */
             for (unsigned side = 0; side < (is_imm ? 1u : 2u) && !matched_ctrl; side++) {
                 bool cnt_first = is_imm || side == 1;
-                unsigned c = cnt_first ? rn : rm;
+                unsigned d = cnt_first ? rn : rm;
                 unsigned b = cnt_first ? rm : rn;
-                if (c >= 31)
+                if (d >= 31)
                     continue;
-                if (!is_imm && (b >= 31 || b == c || (written & (1u << b)) || (used_as_ptr & (1u << b))))
+                if (!is_imm && (b >= 31 || b == d || (written & (1u << b)) || (used_as_ptr & (1u << b))))
                     continue;
-                /* Counter must be updated strictly before flag_idx and not afterward */
-                if (!(written & (1u << c)) || last_write_idx[c] >= flag_idx)
+                /* Compared register must be written strictly before flag_idx and not afterward */
+                if (!(written & (1u << d)) || last_write_idx[d] >= flag_idx)
                     continue;
+                unsigned c = d;
                 uint32_t step = 0;
+                int64_t cmp_off = 0;
                 if (is64) {
-                    if (sym_root[c] != (int8_t)c || sym_sreg[c] >= 0 || sym_off[c] <= 0 ||
-                        sym_off[c] > 4096)
+                    if (sym_root[d] < 0 || sym_sreg[d] >= 0)
+                        continue;
+                    c = (unsigned)sym_root[d];
+                    if ((!is_imm && c == b) || sym_root[c] != (int8_t)c || sym_sreg[c] >= 0 ||
+                        sym_off[c] <= 0 || sym_off[c] > 4096)
+                        continue;
+                    if (d != c && ((used_as_ptr & (1u << c)) || (used_as_ptr & (1u << d)) ||
+                                   sym_off[d] < -4095 || sym_off[d] > 4095))
                         continue;
                     step = (uint32_t)sym_off[c];
+                    cmp_off = sym_off[d];
                 } else {
-                    if (used_as_ptr & (1u << c))
+                    if (used_as_ptr & (1u << d))
                         continue;
-                    if (((w32_valid >> c) & 1) && w32_step[c] > 0)
-                        step = w32_step[c];
-                    else if (sym_root[c] == (int8_t)c && sym_sreg[c] < 0 && sym_off[c] > 0 &&
-                             sym_off[c] <= 4096)
-                        step = (uint32_t)sym_off[c];
+                    if (((w32_valid >> d) & 1) && w32_step[d] > 0)
+                        step = w32_step[d];
+                    else if (sym_root[d] == (int8_t)d && sym_sreg[d] < 0 && sym_off[d] > 0 &&
+                             sym_off[d] <= 4096)
+                        step = (uint32_t)sym_off[d];
                     else
                         continue;
+                    cmp_off = (int64_t)step;
                 }
                 enum fast_cmp_kind ck;
                 bool cond_ok = true;
                 if (cond == 1) {
                     ck = FL_NE;
-                } else if (!cnt_first) { /* CMP B, C */
+                } else if (!cnt_first) { /* CMP B, D */
                     if (cond == 12)
                         ck = FL_SLT;
                     else if (cond == 10)
@@ -4381,7 +4596,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                         ck = FL_ULE;
                     else
                         cond_ok = false;
-                } else { /* CMP C, B */
+                } else { /* CMP D, B */
                     if (cond == 11)
                         ck = FL_SLT;
                     else if (cond == 13)
@@ -4403,6 +4618,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 fl->bound_imm = is_imm ? (FIELD(fi_insn, 21, 10) << (BIT(fi_insn, 22) ? 12 : 0)) : 0;
                 fl->is_64 = is64;
                 fl->step = step;
+                fl->cmp_off = cmp_off;
                 fl->cmp = ck;
                 matched_ctrl = true;
             }
@@ -4421,14 +4637,20 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
             used_as_nonptr |= 1u << (unsigned)deferred_cmp_root1;
     }
 
-    /* Validate every root base pointer and collect live end-of-iteration derived aliases */
-    int8_t ptr_map[31];
-    for (unsigned r = 0; r < 31; r++)
+    /* Validate every root base pointer (0..30 or 31 = SP) and collect live end-of-iteration aliases */
+    int8_t ptr_map[32];
+    for (unsigned r = 0; r < 32; r++)
         ptr_map[r] = -1;
     for (uint32_t bits = used_as_ptr; bits; bits &= bits - 1) {
         unsigned r = (unsigned)__builtin_ctz(bits);
         if (fl->nptrs >= FAST_LOOP_MAX_PTRS)
             return false;
+        if (r == 31) {
+            fl->uses_sp = true;
+            ptr_map[31] = (int8_t)fl->nptrs;
+            fl->ptrs[fl->nptrs++] = (struct fast_ptr){.reg = 31, .alias_mask = 0};
+            continue;
+        }
         if (used_as_nonptr & (1u << r))
             return false;
         if (sym_root[r] != (int8_t)r)
@@ -4466,11 +4688,12 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
         uint32_t span = (uint32_t)(raw[s].hi - raw[s].lo);
         if (span == 0 || span > APPINE_PAGE_SIZE)
             return false;
-        uint8_t sreg = sym_sreg[r] >= 0 ? (uint8_t)sym_sreg[r] : 31;
-        uint64_t cstride = sreg < 31 ? 0 : (uint64_t)sym_off[r];
-        if (raw[s].idx_reg < 31) {
-            unsigned ir = raw[s].idx_reg;
-            if (written & (1u << ir)) {
+        uint8_t sreg = (r < 31 && sym_sreg[r] >= 0) ? (uint8_t)sym_sreg[r] : 31;
+        uint64_t cstride = (r == 31 || sreg < 31) ? 0 : (uint64_t)sym_off[r];
+        unsigned idx_regs[2] = {raw[s].idx_reg, raw[s].idx_reg2};
+        for (unsigned k = 0; k < 2; k++) {
+            unsigned ir = idx_regs[k];
+            if (ir < 31 && (written & (1u << ir))) {
                 /* Induction index: must be 64-bit LSL/SXTX with positive constant step */
                 if (sreg < 31 || (raw[s].idx_opt != 3 && raw[s].idx_opt != 7))
                     return false;
@@ -4494,6 +4717,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
         fl->streams[fl->nstreams++] = (struct fast_stream){
             .ptr_idx = (uint8_t)pi,
             .idx_reg = raw[s].idx_reg,
+            .idx_reg2 = raw[s].idx_reg2,
             .idx_opt = raw[s].idx_opt,
             .idx_shift = raw[s].idx_shift,
             .stride_reg = sreg,
@@ -4510,25 +4734,30 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
 
     /* Pick a power-of-2 KICK_BUDGET in [32, 256] so kick latency stays within a few microseconds */
     unsigned budget_log2 = 8; /* 256 */
-    while (budget_log2 > 5 && ((1u << budget_log2) * back_idx > 8192))
+    while (budget_log2 > 5 && ((1u << budget_log2) * back_idx > 12288))
         budget_log2--;
     fl->kick_log2 = budget_log2;
 
-    /* If the entire fast body touches at most 2 distinct stolen GPRs, pin them in T0/T1 across the
-     * loop so the native inner body has zero CTX loads/stores. */
-    uint32_t body_stolen = 0;
+    /* Pin all stolen GPRs touched in the fast body so the native inner body has zero CTX traffic:
+     * the first 2 use T0/T1 directly, and any additional stolen GPRs borrow unused non-stolen
+     * guest registers (saved/restored across the fast loop in their dead cpu->x[] slots). */
+    uint32_t body_stolen = 0, body_used = 0;
     for (unsigned i = 0; i < back_idx; i++) {
-        uint32_t insn = fetch_guest(x, i);
-        if (insn == 0xd503201f || (fl->kind == FL_CMP_INC && i == fl->ctrl_idx))
+        uint32_t insn = x->words[i];
+        if (insn == 0xd503201f)
             continue;
+        bool omitted_cmp = fl->kind == FL_CMP_INC && i == fl->ctrl_idx;
         unsigned top = FIELD(insn, 28, 25);
         if ((top & 7) == 7) {
             struct native_desc nd;
             appine_simd_dp_decode(insn, &nd);
             for (unsigned k = 0; k < nd.n; k++) {
                 unsigned r = (insn >> nd.gpr[k].pos) & 31;
-                if (r < 31 && is_stolen(r))
-                    body_stolen |= 1u << r;
+                if (r < 31) {
+                    body_used |= 1u << r;
+                    if (!omitted_cmp && is_stolen(r))
+                        body_stolen |= 1u << r;
+                }
             }
         } else if (top == 0x4 || top == 0x6 || top == 0xc || top == 0xe) {
             struct memop m;
@@ -4539,38 +4768,94 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
                 decode_memop(insn, va, &m);
             if (m.prefetch)
                 continue;
-            if (is_stolen(m.rn))
-                body_stolen |= 1u << m.rn;
-            if (m.mode == M_REG && m.rm < 31 && is_stolen(m.rm))
-                body_stolen |= 1u << m.rm;
+            if (m.rn < 31) {
+                body_used |= 1u << m.rn;
+                if (is_stolen(m.rn))
+                    body_stolen |= 1u << m.rn;
+            }
+            if (m.mode == M_REG && m.rm < 31) {
+                body_used |= 1u << m.rm;
+                if (is_stolen(m.rm))
+                    body_stolen |= 1u << m.rm;
+            }
             if (!m.simd) {
-                if (m.rt < 31 && is_stolen(m.rt))
-                    body_stolen |= 1u << m.rt;
-                if (m.pair && m.rt2 < 31 && is_stolen(m.rt2))
-                    body_stolen |= 1u << m.rt2;
+                if (m.rt < 31) {
+                    body_used |= 1u << m.rt;
+                    if (is_stolen(m.rt))
+                        body_stolen |= 1u << m.rt;
+                }
+                if (m.pair && m.rt2 < 31) {
+                    body_used |= 1u << m.rt2;
+                    if (is_stolen(m.rt2))
+                        body_stolen |= 1u << m.rt2;
+                }
             }
         } else {
             struct operands o;
             dp_operands(insn, &o);
             for (unsigned k = 0; k < o.n; k++) {
                 unsigned r = (insn >> o.pos[k]) & 31;
-                if (r < 31 && is_stolen(r))
-                    body_stolen |= 1u << r;
+                if (r < 31) {
+                    body_used |= 1u << r;
+                    if (!omitted_cmp && is_stolen(r))
+                        body_stolen |= 1u << r;
+                }
             }
         }
     }
-    if (body_stolen && __builtin_popcount(body_stolen) <= 2) {
+    if (body_stolen) {
+        if (fl->cnt_reg < 31)
+            body_used |= 1u << fl->cnt_reg;
+        if (fl->kind == FL_CMP_INC && !fl->bound_is_imm && fl->bound_reg < 31)
+            body_used |= 1u << fl->bound_reg;
+        for (unsigned i = 0; i < fl->nptrs; i++) {
+            if (fl->ptrs[i].reg < 31)
+                body_used |= 1u << fl->ptrs[i].reg;
+            body_used |= fl->ptrs[i].alias_mask;
+        }
+        unsigned n = 0;
+        uint8_t preg[6], phost[6];
+        bool pwr[6];
+        bool ok = true;
+        const unsigned base_pool[2] = {T0, T1};
+        uint32_t avail = ((1u << 31) - 1) & ~body_used;
         for (uint32_t bits = body_stolen; bits; bits &= bits - 1) {
             unsigned r = (unsigned)__builtin_ctz(bits);
-            fl->pin_reg[fl->npin] = (uint8_t)r;
-            fl->pin_written[fl->npin] = ((written >> r) & 1) != 0;
-            fl->npin++;
+            unsigned hr = 31;
+            if (n < 2) {
+                hr = base_pool[n];
+            } else {
+                for (uint32_t cand = avail; cand; cand &= cand - 1) {
+                    unsigned c = (unsigned)__builtin_ctz(cand);
+                    if (!is_stolen(c)) {
+                        hr = c;
+                        avail &= ~(1u << c);
+                        break;
+                    }
+                }
+            }
+            if (hr >= 31 || n >= 6) {
+                ok = false;
+                break;
+            }
+            preg[n] = (uint8_t)r;
+            phost[n] = (uint8_t)hr;
+            pwr[n] = ((written >> r) & 1) != 0;
+            n++;
         }
-        body_words = back_idx;
+        if (ok) {
+            fl->npin = n;
+            for (unsigned k = 0; k < n; k++) {
+                fl->pin_reg[k] = preg[k];
+                fl->pin_host[k] = phost[k];
+                fl->pin_written[k] = pwr[k];
+            }
+            body_words = back_idx;
+        }
     }
 
     /* Worst-case host words for prologue + fast body + epilogue must leave ample room for slow_loop */
-    unsigned est_words = 32 + fl->nstreams * 42 + fl->nptrs * 10 + body_words + 64;
+    unsigned est_words = 36 + fl->nstreams * 48 + fl->nptrs * 10 + fl->npin * 6 + body_words + 64;
     if (est_words > FAST_LOOP_MAX_WORDS)
         return false;
 
@@ -4586,12 +4871,11 @@ static bool fast_is_pinned(const struct fast_loop *fl, unsigned r)
     return false;
 }
 
-static unsigned fast_pin_host(const struct xlate *x, const struct fast_loop *fl, unsigned r)
+static unsigned fast_pin_host(const struct fast_loop *fl, unsigned r)
 {
-    const unsigned pool[2] = {T0, T1};
     for (unsigned k = 0; k < fl->npin; k++) {
         if (fl->pin_reg[k] == r)
-            return pool[k];
+            return fl->pin_host[k];
     }
     return r;
 }
@@ -4616,10 +4900,11 @@ static int fast_ptr_or_alias_index(const struct fast_loop *fl, unsigned r)
 
 /* Emit a data-processing / SIMD-DP instruction inside fast_loop_body using only T0 and T1 (T2 holds
  * the strip-mine trip counter) */
-static void emit_fast_operands(struct xlate *x, uint32_t insn, const struct operands *o)
+static void emit_fast_operands(struct xlate *x, uint32_t insn, const struct operands *o, bool reads_rd)
 {
     const unsigned pool[2] = {T0, T1};
     unsigned guest[2], nmap = 0, rd_host = 0, rd_guest = 0;
+    bool need_load[2] = {false, false};
     bool rd_stolen = false;
     uint32_t out = insn;
     for (unsigned i = 0; i < o->n; i++) {
@@ -4639,24 +4924,31 @@ static void emit_fast_operands(struct xlate *x, uint32_t insn, const struct oper
             rd_stolen = true;
             rd_host = pool[k];
             rd_guest = r;
+            if (reads_rd)
+                need_load[k] = true;
+        } else {
+            need_load[k] = true;
         }
     }
-    for (unsigned k = 0; k < nmap; k++)
-        emit_load_guest(x, pool[k], guest[k]);
+    for (unsigned k = 0; k < nmap; k++) {
+        if (need_load[k])
+            emit_load_guest(x, pool[k], guest[k]);
+    }
     emit(x, out);
     if (rd_stolen)
         emit_store_guest(x, rd_host, rd_guest);
 }
 
-/* Emit a direct host memory access inside fast_loop_body (Rn already holds a host address, or is
- * stolen in cpu->x[Rn]); uses only T0 and T1 so T2 stays intact */
+/* Emit a direct host memory access inside fast_loop_body (Rn already holds a host address in its
+ * register / SP_HOST, or is stolen in cpu->x[Rn]); uses only T0 and T1 so T2 stays intact */
 static void emit_fast_memop(struct xlate *x, uint32_t insn, const struct memop *m)
 {
-    bool rn_s = is_stolen(m->rn);
+    bool rn_sp = m->rn == 31;
+    bool rn_s = !rn_sp && is_stolen(m->rn);
     bool rm_s = m->mode == M_REG && m->rm < 31 && is_stolen(m->rm);
     bool rt_s = !m->simd && m->rt < 31 && is_stolen(m->rt);
     bool rt2_s = m->pair && !m->simd && m->rt2 < 31 && is_stolen(m->rt2);
-    if (!rn_s && !rm_s && !rt_s && !rt2_s) {
+    if (!rn_sp && !rn_s && !rm_s && !rt_s && !rt2_s) {
         emit(x, insn);
         return;
     }
@@ -4703,14 +4995,16 @@ static void emit_fast_memop(struct xlate *x, uint32_t insn, const struct memop *
         return;
     }
     if (m->simd) {
-        emit_load_guest(x, T0, m->rn);
-        emit(x, (insn & ~(31u << 5)) | (T0 << 5));
-        if (m->mode == M_PRE || m->mode == M_POST)
+        unsigned hrn = rn_sp ? SP_HOST : T0;
+        if (rn_s)
+            emit_load_guest(x, T0, m->rn);
+        emit(x, (insn & ~(31u << 5)) | (hrn << 5));
+        if (rn_s && (m->mode == M_PRE || m->mode == M_POST))
             emit_store_guest(x, T0, m->rn);
         return;
     }
     if (!m->pair) {
-        unsigned hrn = rn_s ? T0 : m->rn;
+        unsigned hrn = rn_sp ? SP_HOST : rn_s ? T0 : m->rn;
         unsigned hrt = rt_s ? T1 : m->rt;
         if (rn_s)
             emit_load_guest(x, T0, m->rn);
@@ -4724,7 +5018,7 @@ static void emit_fast_memop(struct xlate *x, uint32_t insn, const struct memop *
         return;
     }
     /* Integer LDP/STP/LDPSW with <= 2 distinct stolen GPRs */
-    unsigned hrn = rn_s ? T0 : m->rn;
+    unsigned hrn = rn_sp ? SP_HOST : rn_s ? T0 : m->rn;
     unsigned hrt = m->rt, hrt2 = m->rt2;
     if (rn_s) {
         emit_load_guest(x, T0, m->rn);
@@ -4755,10 +5049,12 @@ static void emit_fast_memop(struct xlate *x, uint32_t insn, const struct memop *
     }
 }
 
-/* Add or subtract T0 to/from guest register r (stolen or in host register) */
+/* Add or subtract T0 to/from guest register r (0..30 or 31 = SP) */
 static void emit_adjust_reg(struct xlate *x, unsigned r, bool sub)
 {
-    if (!is_stolen(r)) {
+    if (r == 31) {
+        emit(x, sub ? enc_sub_reg(SP_HOST, SP_HOST, T0) : enc_add_lsl(SP_HOST, SP_HOST, T0, 0));
+    } else if (!is_stolen(r)) {
         emit(x, sub ? enc_sub_reg(r, r, T0) : enc_add_lsl(r, r, T0, 0));
     } else {
         emit_load_guest(x, T1, r);
@@ -4769,17 +5065,22 @@ static void emit_adjust_reg(struct xlate *x, unsigned r, bool sub)
 
 static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
 {
-    uint32_t *bails[96];
+    uint32_t *bails[128];
     unsigned nbails = 0;
     size_t grp_off = offsetof(struct appine_cpu, dbt_groups);
     size_t iters_off = grp_off + 8 * 7;
 
-    /* 1. Never bypass active hardware watchpoints */
+    /* 1. Never bypass active hardware watchpoints; if SP is accessed, require 16-byte alignment */
     size_t nwatch = offsetof(struct appine_cpu, nwatch);
     emit_add_const(x, T0, CTX, (int64_t)(nwatch & ~(size_t)0xfff));
     emit(x, enc_ldr_w(T0, T0, nwatch & 0xfff));
     bails[nbails++] = here(x);
     emit(x, enc_cbnz_x(T0));
+    if (fl->uses_sp) {
+        emit(x, enc_and_low(T0, SP_HOST, 4));
+        bails[nbails++] = here(x);
+        emit(x, enc_cbnz_x(T0));
+    }
 
     /* 2. Compute rem_backedges into T2 (NZCV-free), clamp to KICK_BUDGET, require >= 2 */
     if (fl->kind == FL_COUNTDOWN) {
@@ -4802,9 +5103,28 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
             emit(x, enc_cbz_x(T2));
             emit(x, enc_sub_imm(T2, T2, 1, 0));
         }
-    } else { /* FL_CMP_INC */
+        if (fl->step > 1) {
+            if ((fl->step & (fl->step - 1)) == 0) {
+                unsigned sh = (unsigned)__builtin_ctz(fl->step);
+                emit(x, enc_ubfx(T2, T2, sh, 64 - sh));
+            } else {
+                emit_mov_const(x, T0, fl->step);
+                emit(x, enc_udiv(T2, T2, T0));
+            }
+        }
+        /* Clamp T2 to KICK_BUDGET = 1 << fl->kick_log2 */
+        emit(x, enc_ubfx(T0, T2, fl->kick_log2, 64 - fl->kick_log2));
+        uint32_t *no_clamp = here(x);
+        emit(x, enc_cbz_x(T0));
+        emit(x, enc_movz(T2, 1u << fl->kick_log2, 0));
+        patch_local(x, no_clamp, here(x));
+        /* Bail if safe_iters < 2 */
+        emit(x, enc_ubfx(T0, T2, 1, 63));
+        bails[nbails++] = here(x);
+        emit(x, enc_cbz_x(T0));
+    } else { /* FL_CMP_INC: iter j compares v_j = cnt_reg + cmp_off + j * step against bound */
         bool is_signed = fl->cmp == FL_SLT || fl->cmp == FL_SLE;
-        /* Load bound into T0 and counter into T1 */
+        /* Load bound into T0 and v_0 = cnt_reg + cmp_off into T1 */
         if (fl->bound_is_imm) {
             emit_mov_const(x, T0, fl->bound_imm);
         } else {
@@ -4823,12 +5143,11 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
             emit_load_guest(x, T1, c);
             c = T1;
         }
+        emit_add_const(x, T1, c, fl->cmp_off);
         if (!fl->is_64)
-            emit(x, is_signed ? enc_sbfx(T1, c, 0, 32) : enc_ubfx(T1, c, 0, 32));
-        else if (c != T1)
-            emit(x, enc_mov(T1, c));
+            emit(x, is_signed ? enc_sbfx(T1, T1, 0, 32) : enc_ubfx(T1, T1, 0, 32));
 
-        emit(x, enc_sub_reg(T2, T0, T1)); /* diff = B - C */
+        emit(x, enc_sub_reg(T2, T0, T1)); /* diff = B - v_0 */
         if (!fl->is_64) {
             if (fl->cmp == FL_NE) {
                 emit(x, enc_ubfx(T2, T2, 0, 32));
@@ -4863,50 +5182,105 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
         }
         if (fl->cmp == FL_NE || fl->cmp == FL_SLT || fl->cmp == FL_ULT)
             emit(x, enc_sub_imm(T2, T2, 1, 0));
-    }
-
-    if (fl->step > 1) {
-        if ((fl->step & (fl->step - 1)) == 0) {
-            unsigned sh = (unsigned)__builtin_ctz(fl->step);
-            emit(x, enc_ubfx(T2, T2, sh, 64 - sh));
-        } else {
-            emit_mov_const(x, T0, fl->step);
-            emit(x, enc_udiv(T2, T2, T0));
+        if (fl->step > 1) {
+            if ((fl->step & (fl->step - 1)) == 0) {
+                unsigned sh = (unsigned)__builtin_ctz(fl->step);
+                emit(x, enc_ubfx(T2, T2, sh, 64 - sh));
+            } else {
+                emit_mov_const(x, T0, fl->step);
+                emit(x, enc_udiv(T2, T2, T0));
+            }
         }
+        /* Now T2 = q = rem_backedges - 1. Bail if q == 0 (rem_backedges < 2), clamp q to
+         * (1 << kick_log2) - 1, then add 1 so safe_iters is in [2, 1 << kick_log2]. */
+        bails[nbails++] = here(x);
+        emit(x, enc_cbz_x(T2));
+        emit(x, enc_ubfx(T0, T2, fl->kick_log2, 64 - fl->kick_log2));
+        uint32_t *no_clamp = here(x);
+        emit(x, enc_cbz_x(T0));
+        emit(x, enc_movz(T2, (1u << fl->kick_log2) - 1, 0));
+        patch_local(x, no_clamp, here(x));
+        emit(x, enc_add_imm(T2, T2, 1, 0));
     }
-    /* Clamp T2 to KICK_BUDGET = 1 << fl->kick_log2 */
-    emit(x, enc_ubfx(T0, T2, fl->kick_log2, 64 - fl->kick_log2));
-    uint32_t *no_clamp = here(x);
-    emit(x, enc_cbz_x(T0));
-    emit(x, enc_movz(T2, 1u << fl->kick_log2, 0));
-    patch_local(x, no_clamp, here(x));
-    /* Bail if safe_iters < 2 */
-    emit(x, enc_ubfx(T0, T2, 1, 63));
-    bails[nbails++] = here(x);
-    emit(x, enc_cbz_x(T0));
     emit(x, enc_str_x(T2, CTX, iters_off));
 
-    /* 3. For each access stream: probe the 2 MiB superpage TLB first (giving a 2 MiB runway),
-     *    falling back to the 4 KiB data TLB for non-superpage mappings; verify shared addends for
-     *    multi-stream bases, then verify span bounds and shrink safe_iters. */
+    /* 3. For each access stream: verify TLB/STLB hits, shared addends for multi-stream bases, and
+     *    span bounds (shrinking safe_iters for positive-stride streams; dual-endpoint 4 KiB TLB
+     *    check for zero-stride streams so cross-4 KiB stack frames never bail). */
     for (unsigned i = 0; i < fl->nstreams; i++) {
         const struct fast_stream *s = &fl->streams[i];
         unsigned base = fl->ptrs[s->ptr_idx].reg;
-        if (is_stolen(base)) {
-            emit_load_guest(x, T0, base);
-            base = T0;
-        }
-        if (s->idx_reg < 31) {
-            unsigned idx = s->idx_reg;
-            if (is_stolen(idx)) {
-                emit_load_guest(x, T1, idx);
-                idx = T1;
+        if (s->idx_reg2 < 31) {
+            unsigned ir1 = s->idx_reg, ir2 = s->idx_reg2;
+            if (is_stolen(ir1)) {
+                emit_load_guest(x, T1, ir1);
+                ir1 = T1;
             }
-            emit(x, enc_add_ext(T0, base, idx, s->idx_opt, s->idx_shift));
-            base = T0;
+            if (is_stolen(ir2)) {
+                emit_load_guest(x, T2, ir2);
+                ir2 = T2;
+            }
+            emit(x, enc_add_lsl(T1, ir1, ir2, 0));
+            if (base == 31) {
+                base = SP_HOST;
+            } else if (is_stolen(base)) {
+                emit_load_guest(x, T0, base);
+                base = T0;
+            }
+            emit(x, enc_add_lsl(T0, base, T1, s->idx_shift));
+            emit_add_const(x, T0, T0, s->lo);
+        } else {
+            if (base == 31) {
+                base = SP_HOST;
+            } else if (is_stolen(base)) {
+                emit_load_guest(x, T0, base);
+                base = T0;
+            }
+            if (s->idx_reg < 31) {
+                unsigned idx = s->idx_reg;
+                if (is_stolen(idx)) {
+                    emit_load_guest(x, T1, idx);
+                    idx = T1;
+                }
+                emit(x, enc_add_ext(T0, base, idx, s->idx_opt, s->idx_shift));
+                base = T0;
+            }
+            emit_add_const(x, T0, base, s->lo); /* T0 = first = G_eff + lo */
         }
-        emit_add_const(x, T0, base, s->lo); /* T0 = first = G_eff + lo */
         uint32_t span = (uint32_t)(s->hi - s->lo);
+
+        if (s->stride_reg == 31 && s->stride == 0) {
+            /* Zero-stride stream (span <= 4 KiB): check first byte and last byte in 4 KiB TLB and
+             * require identical addends so even cross-page stack frames run natively. */
+            emit(x, enc_ubfx(T1, T0, APPINE_PAGE_SHIFT, TLB_BITS));
+            emit(x, enc_add_lsl(T1, CTX, T1, 5));
+            emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF + (s->write ? 16 : 0)));
+            emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT));
+            bails[nbails++] = here(x);
+            emit(x, enc_cbnz_x(T1));
+            if (s->first_for_ptr) {
+                emit(x, enc_str_x(T2, CTX, grp_off + 8 * (size_t)s->ptr_idx));
+            } else {
+                emit(x, enc_ldr_x(T1, CTX, grp_off + 8 * (size_t)s->ptr_idx));
+                emit(x, enc_eor_lsr(T1, T1, T2, 0));
+                bails[nbails++] = here(x);
+                emit(x, enc_cbnz_x(T1));
+            }
+            if (span > 1) {
+                emit_add_const(x, T0, T0, (int64_t)(span - 1));
+                emit(x, enc_ubfx(T1, T0, APPINE_PAGE_SHIFT, TLB_BITS));
+                emit(x, enc_add_lsl(T1, CTX, T1, 5));
+                emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF + (s->write ? 16 : 0)));
+                emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT));
+                bails[nbails++] = here(x);
+                emit(x, enc_cbnz_x(T1));
+                emit(x, enc_ldr_x(T0, CTX, grp_off + 8 * (size_t)s->ptr_idx));
+                emit(x, enc_eor_lsr(T0, T0, T2, 0));
+                bails[nbails++] = here(x);
+                emit(x, enc_cbnz_x(T0));
+            }
+            continue;
+        }
 
         /* Fast path: 2 MiB superpage TLB (cpu->stlb) */
         emit(x, enc_add_imm(T1, CTX, (uint32_t)(STLB_OFF >> 12), 1));
@@ -4946,67 +5320,68 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
             emit(x, enc_cbnz_x(T0));
         }
 
-        if (s->stride_reg < 31 || s->stride > 0) {
-            if (s->stride_reg < 31) {
-                /* Runtime register stride: reject negative or >= 2 MiB strides, then check if all
-                 * safe_iters fit via MUL (avoiding UDIV on the common 2 MiB superpage fast path).
-                 * Only on a boundary crossing fall through to UDIV to shrink safe_iters. */
-                unsigned sr = s->stride_reg;
-                if (is_stolen(sr)) {
-                    emit_load_guest(x, T0, sr);
-                    sr = T0;
-                }
-                emit(x, enc_ubfx(T2, sr, MMU_SUPER_SHIFT, 64 - MMU_SUPER_SHIFT));
-                bails[nbails++] = here(x);
-                emit(x, enc_cbnz_x(T2));
-                emit(x, enc_ldr_x(T2, CTX, iters_off));
-                emit(x, enc_sub_imm(T2, T2, 1, 0));
-                emit(x, enc_mul(T2, T2, sr));
-                emit(x, enc_sub_reg(T2, T1, T2)); /* avail - (safe_iters - 1) * sr */
-                uint32_t *fits_all = here(x);
-                emit(x, enc_tbz(T2, 63));
-                emit(x, enc_udiv(T1, T1, sr));
-                bails[nbails++] = here(x);
-                emit(x, enc_cbz_x(T1));
-                emit(x, enc_add_imm(T1, T1, 1, 0));
-                emit(x, enc_str_x(T1, CTX, iters_off));
-                patch_local(x, fits_all, here(x));
-            } else {
-                if ((s->stride & (s->stride - 1)) == 0) {
-                    unsigned sh = (unsigned)__builtin_ctz(s->stride);
-                    emit(x, enc_ubfx(T1, T1, sh, 64 - sh));
-                } else {
-                    /* Exact floor(avail / stride) for 0 <= avail < 2 MiB, 1 <= stride <= 4095 */
-                    uint64_t mul = ((UINT64_C(1) << 34) + s->stride - 1) / s->stride;
-                    emit_mov_const(x, T2, mul);
-                    emit(x, enc_mul(T1, T1, T2));
-                    emit(x, enc_ubfx(T1, T1, 34, 30));
-                }
-                /* page_iters = avail / stride + 1; if avail / stride == 0 then page_iters == 1 < 2 */
-                bails[nbails++] = here(x);
-                emit(x, enc_cbz_x(T1));
-                emit(x, enc_add_imm(T1, T1, 1, 0));
-                emit(x, enc_ldr_x(T2, CTX, iters_off));
-                emit(x, enc_sub_reg(T2, T1, T2));
-                uint32_t *keep = here(x);
-                emit(x, enc_tbz(T2, 63));
-                emit(x, enc_str_x(T1, CTX, iters_off));
-                patch_local(x, keep, here(x));
+        if (s->stride_reg < 31) {
+            /* Runtime register stride: reject negative or >= 2 MiB strides, then check if all
+             * safe_iters fit via MUL (avoiding UDIV on the common 2 MiB superpage fast path).
+             * Only on a boundary crossing fall through to UDIV to shrink safe_iters. */
+            unsigned sr = s->stride_reg;
+            if (is_stolen(sr)) {
+                emit_load_guest(x, T0, sr);
+                sr = T0;
             }
+            emit(x, enc_ubfx(T2, sr, MMU_SUPER_SHIFT, 64 - MMU_SUPER_SHIFT));
+            bails[nbails++] = here(x);
+            emit(x, enc_cbnz_x(T2));
+            emit(x, enc_ldr_x(T2, CTX, iters_off));
+            emit(x, enc_sub_imm(T2, T2, 1, 0));
+            emit(x, enc_mul(T2, T2, sr));
+            emit(x, enc_sub_reg(T2, T1, T2)); /* avail - (safe_iters - 1) * sr */
+            uint32_t *fits_all = here(x);
+            emit(x, enc_tbz(T2, 63));
+            emit(x, enc_udiv(T1, T1, sr));
+            bails[nbails++] = here(x);
+            emit(x, enc_cbz_x(T1));
+            emit(x, enc_add_imm(T1, T1, 1, 0));
+            emit(x, enc_str_x(T1, CTX, iters_off));
+            patch_local(x, fits_all, here(x));
+        } else {
+            if ((s->stride & (s->stride - 1)) == 0) {
+                unsigned sh = (unsigned)__builtin_ctz(s->stride);
+                emit(x, enc_ubfx(T1, T1, sh, 64 - sh));
+            } else {
+                /* Exact floor(avail / stride) for 0 <= avail < 2 MiB, 1 <= stride <= 4095 */
+                uint64_t mul = ((UINT64_C(1) << 34) + s->stride - 1) / s->stride;
+                emit_mov_const(x, T2, mul);
+                emit(x, enc_mul(T1, T1, T2));
+                emit(x, enc_ubfx(T1, T1, 34, 30));
+            }
+            /* page_iters = avail / stride + 1; if avail / stride == 0 then page_iters == 1 < 2 */
+            bails[nbails++] = here(x);
+            emit(x, enc_cbz_x(T1));
+            emit(x, enc_add_imm(T1, T1, 1, 0));
+            emit(x, enc_ldr_x(T2, CTX, iters_off));
+            emit(x, enc_sub_reg(T2, T1, T2));
+            uint32_t *keep = here(x);
+            emit(x, enc_tbz(T2, 63));
+            emit(x, enc_str_x(T1, CTX, iters_off));
+            patch_local(x, keep, here(x));
         }
     }
+    if (nbails > sizeof(bails) / sizeof(bails[0]))
+        appine_guard_fail();
 
-    /* 4. Commit: convert induction pointers to host pointers, load any loop-wide pinned stolen
-     *    registers into T0/T1, and load safe_iters into T2 */
+    /* 4. Commit: convert induction pointers to host pointers, save any borrowed non-stolen host
+     *    registers, load loop-wide pinned stolen registers into pin_host[], and load safe_iters into T2 */
     for (unsigned i = 0; i < fl->nptrs; i++) {
-        if (fast_is_pinned(fl, fl->ptrs[i].reg))
+        if (fl->ptrs[i].reg < 31 && fast_is_pinned(fl, fl->ptrs[i].reg))
             continue;
         emit(x, enc_ldr_x(T0, CTX, grp_off + 8 * (size_t)i));
         emit_adjust_reg(x, fl->ptrs[i].reg, false);
     }
-    const unsigned pin_pool[2] = {T0, T1};
+    for (unsigned k = 2; k < fl->npin; k++)
+        emit_store_guest(x, fl->pin_host[k], fl->pin_host[k]);
     for (unsigned k = 0; k < fl->npin; k++) {
-        unsigned gr = fl->pin_reg[k], hr = pin_pool[k];
+        unsigned gr = fl->pin_reg[k], hr = fl->pin_host[k];
         emit_load_guest(x, hr, gr);
         int pi = fast_ptr_index(fl, gr);
         if (pi >= 0) {
@@ -5019,7 +5394,7 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
     /* 5. Native inner loop body (zero TLB checks, zero kick checks) */
     uint32_t *loop_head = here(x);
     for (unsigned i = 0; i < fl->back_idx; i++) {
-        uint32_t insn = fetch_guest(x, i);
+        uint32_t insn = x->words[i];
         if (insn == 0xd503201f)
             continue;
         if (fl->kind == FL_CMP_INC && i == fl->ctrl_idx)
@@ -5029,20 +5404,24 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
             struct native_desc nd;
             appine_simd_dp_decode(insn, &nd);
             struct operands o = {.n = 0, .writes_rd = false};
+            bool reads_rd = false;
             for (unsigned k = 0; k < nd.n; k++) {
                 add_operand(&o, nd.gpr[k].pos, false);
-                if (nd.gpr[k].pos == 0 && nd.gpr[k].store)
+                if (nd.gpr[k].pos == 0 && nd.gpr[k].store) {
                     o.writes_rd = true;
+                    if (nd.gpr[k].load)
+                        reads_rd = true;
+                }
             }
             if (fl->npin) {
                 uint32_t out = insn;
                 for (unsigned k = 0; k < o.n; k++) {
                     unsigned r = (insn >> o.pos[k]) & 31;
-                    out = (out & ~(31u << o.pos[k])) | (fast_pin_host(x, fl, r) << o.pos[k]);
+                    out = (out & ~(31u << o.pos[k])) | (fast_pin_host(fl, r) << o.pos[k]);
                 }
                 emit(x, out);
             } else {
-                emit_fast_operands(x, insn, &o);
+                emit_fast_operands(x, insn, &o, reads_rd);
             }
         } else if (top == 0x4 || top == 0x6 || top == 0xc || top == 0xe) {
             struct memop m;
@@ -5053,14 +5432,15 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
                 decode_memop(insn, va, &m);
             if (!m.prefetch) {
                 if (fl->npin) {
-                    uint32_t out = (insn & ~(31u << 5)) | (fast_pin_host(x, fl, m.rn) << 5);
+                    unsigned hrn = m.rn == 31 ? SP_HOST : fast_pin_host(fl, m.rn);
+                    uint32_t out = (insn & ~(31u << 5)) | (hrn << 5);
                     if (m.mode == M_REG && m.rm < 31)
-                        out = (out & ~(31u << 16)) | (fast_pin_host(x, fl, m.rm) << 16);
+                        out = (out & ~(31u << 16)) | (fast_pin_host(fl, m.rm) << 16);
                     if (!m.simd) {
                         if (m.rt < 31)
-                            out = (out & ~31u) | fast_pin_host(x, fl, m.rt);
+                            out = (out & ~31u) | fast_pin_host(fl, m.rt);
                         if (m.pair && m.rt2 < 31)
-                            out = (out & ~(31u << 10)) | (fast_pin_host(x, fl, m.rt2) << 10);
+                            out = (out & ~(31u << 10)) | (fast_pin_host(fl, m.rt2) << 10);
                     }
                     emit(x, out);
                 } else {
@@ -5074,11 +5454,11 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
                 uint32_t out = insn;
                 for (unsigned k = 0; k < o.n; k++) {
                     unsigned r = (insn >> o.pos[k]) & 31;
-                    out = (out & ~(31u << o.pos[k])) | (fast_pin_host(x, fl, r) << o.pos[k]);
+                    out = (out & ~(31u << o.pos[k])) | (fast_pin_host(fl, r) << o.pos[k]);
                 }
                 emit(x, out);
             } else {
-                emit_fast_operands(x, insn, &o);
+                emit_fast_operands(x, insn, &o, dp_reads_rd(insn));
             }
         }
     }
@@ -5087,13 +5467,14 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
     emit(x, enc_cbnz_x(T2));
     patch_local(x, back, loop_head);
 
-    /* 6. Epilogue: flush written pinned registers (restoring guest VA if shifted), restore
-     *    non-pinned root pointers and live end-of-iteration affine aliases to guest VAs, and
-     *    restore exact iteration-end NZCV for omitted FL_CMP_INC compares. */
+    /* 6. Epilogue: flush written pinned registers (restoring guest VA if shifted), restore any
+     *    borrowed non-stolen host registers, restore non-pinned root pointers and live
+     *    end-of-iteration affine aliases to guest VAs, and restore exact iteration-end NZCV for
+     *    omitted FL_CMP_INC compares. */
     for (unsigned k = 0; k < fl->npin; k++) {
         if (!fl->pin_written[k])
             continue;
-        unsigned gr = fl->pin_reg[k], hr = pin_pool[k];
+        unsigned gr = fl->pin_reg[k], hr = fl->pin_host[k];
         int pi = fast_ptr_or_alias_index(fl, gr);
         if (pi >= 0) {
             emit(x, enc_ldr_x(T2, CTX, grp_off + 8 * (size_t)pi));
@@ -5101,9 +5482,11 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
         }
         emit_store_guest(x, hr, gr);
     }
+    for (unsigned k = 2; k < fl->npin; k++)
+        emit_load_guest(x, fl->pin_host[k], fl->pin_host[k]);
     for (unsigned i = 0; i < fl->nptrs; i++) {
         const struct fast_ptr *p = &fl->ptrs[i];
-        bool load_needed = !fast_is_pinned(fl, p->reg);
+        bool load_needed = p->reg == 31 || !fast_is_pinned(fl, p->reg);
         uint32_t nonpin_aliases = 0;
         for (uint32_t aliases = p->alias_mask; aliases; aliases &= aliases - 1) {
             unsigned a = (unsigned)__builtin_ctz(aliases);
@@ -5119,10 +5502,10 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
             emit_adjust_reg(x, (unsigned)__builtin_ctz(aliases), true);
     }
     if (fl->kind == FL_CMP_INC) {
-        uint32_t cmp_insn = fetch_guest(x, fl->ctrl_idx);
+        uint32_t cmp_insn = x->words[fl->ctrl_idx];
         struct operands o;
         dp_operands(cmp_insn, &o);
-        emit_fast_operands(x, cmp_insn, &o);
+        emit_fast_operands(x, cmp_insn, &o, false);
     }
 
     uint32_t *slow = here(x);
@@ -5157,6 +5540,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
      * member (TAG_SHIFT) */
     p->tag = t->tag && !in_shared(d, pc) ? t->tag : 0;
     p->guest = page + (pc & PAGE_MASK) / 4;
+    p->guest1 = NULL;
     unsigned copied = limit < 32 ? limit : 32;
     memcpy(p->words, p->guest, copied * 4);
     p->nlinks = 0;
@@ -5170,7 +5554,8 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     p->memop_kind = memop_kind;
     t->stats.blocks++;
     if (!memop_kind &&
-        template_fetch(pc, p->guest, p->words, &copied, limit, key, d->r, !p->tag, p, t->scratch, &t->stats))
+        template_fetch(pc, p->guest, p->words, &copied, limit, c->mmu, d, key, d->r, !p->tag, p,
+                       t->scratch, &t->stats))
         return true;
 
     struct appine_dbt_stats before = t->stats;
@@ -5187,9 +5572,12 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     x->nrelocs = 0;
     x->pc = pc;
     x->src = p->guest;
+    x->mmu = c->mmu;
+    x->src1 = NULL;
     x->words = p->words;
     x->copied = copied;
     x->limit = limit;
+    x->tried_src1 = false;
     x->shared = !p->tag;
     x->sp_aligned = false;
     x->konst = 0;
@@ -5203,10 +5591,16 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_KICK, pc);
     _Static_assert(ENTRY_CHECK_WORDS == 2, "the length of the block entry check");
 
+    uint32_t fl_nguest = 0;
     if (!memop_kind) {
         struct fast_loop fl;
-        if (analyze_fast_loop(x, &fl))
+        if (analyze_fast_loop(x, &fl)) {
             emit_fast_loop(x, &fl);
+            if (fl.back_idx >= limit) {
+                p->guest1 = x->src1;
+                fl_nguest = fl.back_idx + 1;
+            }
+        }
     }
 
     if (memop_kind) {
@@ -5312,9 +5706,10 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
 
     if (x->nrelocs > MAX_RELOCS)
         appine_guard_fail();
+    uint32_t total_nguest = fl_nguest > nguest ? fl_nguest : nguest;
     if (!memop_kind)
-        template_store(pc, p->words, nguest, key, x, &before, p->links, p->nlinks);
-    p->nguest = nguest;
+        template_store(pc, p->words, total_nguest, key, x, &before, p->links, p->nlinks);
+    p->nguest = total_nguest;
     p->host = x->buf;
     p->nhost = (uint32_t)x->n;
     memcpy(p->relocs, x->relocs, x->nrelocs * 4);
@@ -5333,7 +5728,12 @@ static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct sync
     /* This block was not in the cache when another thread changed its code or registration.
      * Recheck both under the lock before publishing it. */
     uint32_t memop_kind = p->tag ? APPINE_MEMOP_NONE : find_memop(d, p->pc);
-    if (memop_kind != p->memop_kind || memcmp(p->guest, p->words, p->nguest * 4) != 0)
+    unsigned n0 = (unsigned)((APPINE_PAGE_SIZE - (p->pc & PAGE_MASK)) / 4);
+    bool words_match = p->nguest <= n0
+                           ? memcmp(p->guest, p->words, p->nguest * 4) == 0
+                           : (p->guest1 != NULL && memcmp(p->guest, p->words, n0 * 4) == 0 &&
+                              memcmp(p->guest1, p->words + n0, (p->nguest - n0) * 4) == 0);
+    if (memop_kind != p->memop_kind || !words_match)
         return STALE;
     /* When three quarters of the table are non-empty, rebuild it at the same size if tombstones
      * are at least half, otherwise double it; when blocks is full, remove the invalidated blocks'
@@ -5364,7 +5764,7 @@ static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct sync
     link_block(d, code, p->pc, p->tag, p->links, p->nlinks);
     perf_map(code, p->nhost * 4, p->pc);
     sync_add(sync, code, code + p->nhost);
-    *f = (struct fresh){p->pc, p->tag, code, p->guest, p->nguest};
+    *f = (struct fresh){p->pc, p->tag, code, p->words, p->nguest};
     return code;
 }
 
@@ -6544,6 +6944,8 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
         words = 0;
         size_t nblocks = d->table_count, nguest = d->words_used;
         flush_locked(d);
+        d->nogroup_count = 0;
+        memset(d->strikes, 0, sizeof(d->strikes));
         if (d->table->bits > TABLE_MIN_BITS) /* next user is most likely a short-lived process */
             table_resize(d, TABLE_MIN_BITS);
         /* Block records and instruction words are mapped in advance at their limits, and the used
@@ -6802,11 +7204,22 @@ static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *m
                           const struct block *b, uint64_t *page, const uint32_t **host)
 {
     uint64_t p = b->pc & ~PAGE_MASK;
+    unsigned off = (unsigned)((b->pc & PAGE_MASK) / 4);
+    unsigned n0 = (unsigned)(APPINE_PAGE_SIZE / 4) - off;
     if (p != *page) {
         *page = p;
         *host = appine_mmu_translate(mmu, p, APPINE_PROT_EXEC);
     }
-    return *host && memcmp(*host + (b->pc & PAGE_MASK) / 4, d->words + b->words, b->nguest * 4) == 0;
+    if (!*host)
+        return false;
+    if (LIKELY(b->nguest <= n0))
+        return memcmp(*host + off, d->words + b->words, b->nguest * 4) == 0;
+    if (memcmp(*host + off, d->words + b->words, n0 * 4) != 0)
+        return false;
+    uint64_t p1 = p + APPINE_PAGE_SIZE;
+    *page = p1;
+    *host = appine_mmu_translate(mmu, p1, APPINE_PROT_EXEC);
+    return *host && memcmp(*host, d->words + b->words + n0, (b->nguest - n0) * 4) == 0;
 }
 
 /* The block lies entirely within one of the previous user's file mappings (recorded by
@@ -6850,7 +7263,7 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
         if (b->code && !b->parked) {
             live++;
             if (!block_trusted(d, b) && !block_matches(d, c->mmu, b, &page, &host)) {
-                bool park = !host && block_parkable(d, b);
+                bool park = !host && !block_cross_page(b->pc, b->nguest) && block_parkable(d, b);
                 bad += !park;
                 unmapped += park;
             }
@@ -6871,7 +7284,7 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
         struct block *b = &d->blocks[i];
         if (b->code && !b->parked && !block_trusted(d, b) &&
             !block_matches(d, c->mmu, b, &page, &host)) {
-            bool park = !host && block_parkable(d, b);
+            bool park = !host && !block_cross_page(b->pc, b->nguest) && block_parkable(d, b);
             if (!retire_add(d, &r, b, park)) {
                 d->flush_wanted = true;
                 break;
@@ -7336,7 +7749,7 @@ void appine_dbt_retire_outside(struct appine_dbt *d, const struct appine_dbt_sou
             continue;
         bool inside = false;
         for (size_t j = 0; j < n && !inside; j++)
-            inside = b->pc - s[j].start < s[j].len;
+            inside = b->pc >= s[j].start && b->pc + (uint64_t)b->nguest * 4 <= s[j].start + s[j].len;
         if (inside)
             continue;
         if (b->parked) {

@@ -3770,6 +3770,347 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
     assert_eq!(g.run_at(&mut dbt, fn_strncmp), 0);
 }
 
+#[test]
+fn fast_loop_gemm_bloc_derived_index_sp_and_cross_page() {
+    let add_x = |rd: u32, rn: u32, rm: u32| 0x8b00_0000u32 | (rm << 16) | (rn << 5) | rd;
+    let lsl1 = |rd: u32, rn: u32| 0xd37f_f800u32 | (rn << 5) | rd;
+    let ldr_q_reg = |rt: u32, rn: u32, rm: u32| 0x3ce0_6800u32 | (rm << 16) | (rn << 5) | rt;
+    let stp_q_sp = |rt1: u32, rt2: u32, off: u32| {
+        0xad00_03e0u32 | (((off / 16) & 0x7f) << 15) | (rt2 << 10) | rt1
+    };
+    let fmla_8h = |rd: u32, rn: u32, rm: u32| 0x4e40_0c00u32 | (rm << 16) | (rn << 5) | rd;
+
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::with_data();
+
+        // Populate data pages 0..4 with exact IEEE-754 f16 values (+1.0 = 0x3c00, +0.5 = 0x3800)
+        // so fmla v.8h accumulates exact integers with zero rounding ambiguity.
+        for p in 0..5usize {
+            let host = [3, 4, 6, 5, 7][p];
+            for k in 0..2048usize {
+                let h: u16 = if (p + k) & 1 == 0 { 0x3c00 } else { 0x3800 };
+                g.pages[host].0[k * 2..k * 2 + 2].copy_from_slice(&h.to_le_bytes());
+            }
+        }
+        let read_u64 = |g: &Guest, addr: u64| -> u64 {
+            let off = (addr - DATA) as usize;
+            let host = [3, 4, 6, 5, 7, 8][off / 4096];
+            let p = off % 4096;
+            u64::from_le_bytes(g.pages[host].0[p..p + 8].try_into().unwrap())
+        };
+
+        // 1. Single-page tinyBLAS::gemm_bloc<4,5>-shaped kernel:
+        //    - Derived shifted indices `add tmp, row_off, x0; lsl tmp, tmp, #1`
+        //    - > 2 stolen GPRs in Default (x16/x17 read-only + x27/x28 written scratch!)
+        //    - Zero-stride SP stores `stp q0..q3, [sp, #0..352]`
+        //    - Derived compare `add x3, x0, #15; add x0, x0, #8; cmp x11, x3; b.gt`
+        let f_single = CODE + 0x100;
+        let single_insns = [
+            add_x(7, 10, 0),            // add x7, x10, x0
+            add_x(6, 17, 0),            // add x6, x17, x0 (stolen x17 read)
+            add_x(28, 16, 0),           // add x28, x16, x0 (2 stolen: x16 read, x28 write)
+            add_x(27, 15, 0),           // add x27, x15, x0 (stolen x27 write)
+            lsl1(7, 7),                 // lsl x7, x7, #1
+            lsl1(6, 6),                 // lsl x6, x6, #1
+            lsl1(5, 28),                // lsl x5, x28, #1 (stolen x28 read)
+            lsl1(4, 27),                // lsl x4, x27, #1 (stolen x27 read)
+            ldr_q_reg(15, 2, 7),        // ldr q15, [x2, x7]
+            ldr_q_reg(11, 1, 6),        // ldr q11, [x1, x6]
+            fmla_8h(0, 11, 15),         // fmla v0.8h, v11.8h, v15.8h
+            ldr_q_reg(11, 1, 5),        // ldr q11, [x1, x5]
+            fmla_8h(1, 11, 15),         // fmla v1.8h, v11.8h, v15.8h
+            ldr_q_reg(11, 1, 4),        // ldr q11, [x1, x4]
+            fmla_8h(2, 11, 15),         // fmla v2.8h, v11.8h, v15.8h
+            0x9100_3c03,                // add x3, x0, #15
+            0x9100_2000,                // add x0, x0, #8
+            stp_q_sp(0, 1, 0),          // stp q0, q1, [sp, #0]
+            stp_q_sp(2, 3, 352),        // stp q2, q3, [sp, #352] (384 B stack span)
+            0xeb03_017f,                // cmp x11, x3
+            b_cond(f_single + 20 * 4, f_single, 12), // b.gt f_single
+            SVC,
+        ];
+        g.code(f_single, &single_insns);
+
+        let run_gemm = |g: &mut Guest, dbt: &mut Dbt, pc: u64, sp: u64, n: i64| -> (u64, u64, u64, u64) {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA;
+            s.x[2] = DATA;
+            s.x[10] = 0;
+            s.x[11] = n as u64;
+            s.x[15] = 256;
+            s.x[16] = 512;
+            s.x[17] = 768;
+            s.x[18] = 1024;
+            s.x[9] = 128;
+            s.x[12] = 256;
+            s.x[13] = 384;
+            for r in 19..=25usize {
+                s.x[r] = 0xfeed_0000_0000_0000u64 + r as u64;
+            }
+            s.sp = sp;
+            for v in 0..4usize {
+                s.v[v] = [0, 0];
+            }
+            g.run_at(dbt, pc);
+            let s = g.cpu.state();
+            assert_eq!(s.sp, sp, "SP restored exactly ({regs:?})");
+            assert_eq!(s.x[1], DATA, "x1 restored ({regs:?})");
+            assert_eq!(s.x[2], DATA, "x2 restored ({regs:?})");
+            for r in 19..=25usize {
+                assert_eq!(
+                    s.x[r],
+                    0xfeed_0000_0000_0000u64 + r as u64,
+                    "borrowed non-stolen x{r} must be preserved ({regs:?})"
+                );
+            }
+            (s.x[0], s.x[3], s.v[0][0], s.nzcv)
+        };
+
+        // 1a. SP inside a single page + derived-compare boundary counts (0, 1, 2, 16 iters).
+        let before = dbt.stats();
+        let (x0_15, x3_15, _, _) = run_gemm(&mut g, &mut dbt, f_single, STACK - 512, 15);
+        assert_eq!((x0_15, x3_15), (8, 15), "N=15 -> 1 iter, 0 back-edges ({regs:?})");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "gemm_bloc<4,5> matched ({regs:?})");
+
+        let (x0_16, x3_16, _, _) = run_gemm(&mut g, &mut dbt, f_single, STACK - 512, 16);
+        assert_eq!((x0_16, x3_16), (16, 23), "N=16 -> 2 iters, 1 back-edge ({regs:?})");
+
+        let (x0_23, x3_23, _, _) = run_gemm(&mut g, &mut dbt, f_single, STACK - 512, 23);
+        assert_eq!((x0_23, x3_23), (16, 23), "N=23 -> 2 iters, 1 back-edge ({regs:?})");
+
+        let (x0_24, x3_24, v0_24, _) = run_gemm(&mut g, &mut dbt, f_single, STACK - 512, 24);
+        assert_eq!((x0_24, x3_24), (24, 31), "N=24 -> 3 iters, 2 back-edges ({regs:?})");
+
+        // Compare N=128 against Tier 0 (interpreter) for exact v0..v2, x27, x28, nzcv, and stack!
+        let sp_in = DATA + 4 * PAGE_SIZE + 0x200;
+        let (x0_128, x3_128, v0_128, nzcv_128) = run_gemm(&mut g, &mut dbt, f_single, sp_in, 128);
+        assert_eq!((x0_128, x3_128), (128, 135), "{regs:?}");
+        assert_eq!(g.cpu.state().x[28], 512 + 120, "x28 scratch preserved ({regs:?})");
+        assert_eq!(g.cpu.state().x[27], 256 + 120, "x27 scratch preserved ({regs:?})");
+        assert_eq!(read_u64(&g, sp_in), v0_128, "spilled q0 matches v0 ({regs:?})");
+        assert_eq!(read_u64(&g, sp_in + 352), g.cpu.state().v[2][0], "spilled q2 matches v2 ({regs:?})");
+        assert_ne!(v0_128, v0_24);
+        assert_eq!(nzcv_128, 0x8000_0000, "cmp 128, 135 sets N=1 ({regs:?})");
+
+        // 1b. SP straddling a 4 KiB boundary across CONTIGUOUS host pages (page 0 -> page 1):
+        //     must run in fast loop with zero Tier 0 exits and write exact values across the seam!
+        let sp_cross = DATA + PAGE_SIZE - 128;
+        let before_interp = dbt.stats().exits_interp;
+        let (x0_c, _, v0_c, _) = run_gemm(&mut g, &mut dbt, f_single, sp_cross, 128);
+        assert_eq!((x0_c, v0_c), (128, v0_128), "cross-page contiguous SP ({regs:?})");
+        assert_eq!(read_u64(&g, sp_cross), v0_128);
+        assert_eq!(read_u64(&g, sp_cross + 352), g.cpu.state().v[2][0]);
+        assert_eq!(dbt.stats().exits_interp, before_interp, "no tier0 exits on contiguous cross-page SP ({regs:?})");
+
+        // 1c. SP straddling NON-CONTIGUOUS host pages (page 2 -> page 3 have swapped host pages!):
+        //     prologue must detect addend mismatch and bail cleanly to slow loop!
+        let sp_scat = DATA + 3 * PAGE_SIZE - 128;
+        let (x0_s, _, v0_s, _) = run_gemm(&mut g, &mut dbt, f_single, sp_scat, 128);
+        assert_eq!((x0_s, v0_s), (128, v0_128), "scattered cross-page SP bails cleanly ({regs:?})");
+        assert_eq!(read_u64(&g, sp_scat), v0_128);
+        assert_eq!(read_u64(&g, sp_scat + 352), g.cpu.state().v[2][0]);
+
+        // 1d. Hostile misaligned SP -> prologue bails, exact FaultKind::Align!
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA;
+            s.x[2] = DATA;
+            s.x[10] = 0;
+            s.x[11] = 128;
+            s.x[15] = 256;
+            s.x[16] = 512;
+            s.x[17] = 768;
+            s.sp = sp_in + 8; // misaligned!
+        }
+        assert_eq!(
+            go(&mut g, &mut dbt, f_single),
+            Exit::Fault {
+                addr: sp_in + 8,
+                access: Access::Write,
+                kind: FaultKind::StackAlignment,
+            },
+            "misaligned SP must fault precisely ({regs:?})"
+        );
+
+        // 1e. Hostile read-only SP page (page 5 is RO) -> exact write page fault!
+        let sp_ro = DATA + 5 * PAGE_SIZE + 0x100;
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA;
+            s.x[2] = DATA;
+            s.x[10] = 0;
+            s.x[11] = 128;
+            s.x[15] = 256;
+            s.x[16] = 512;
+            s.x[17] = 768;
+            s.sp = sp_ro;
+        }
+        assert_eq!(
+            go(&mut g, &mut dbt, f_single),
+            Exit::Fault {
+                addr: sp_ro,
+                access: Access::Write,
+                kind: FaultKind::Page,
+            },
+            "read-only SP must fault on write ({regs:?})"
+        );
+
+        // 2. Cross-4 KiB-code-page tinyBLAS::gemm_bloc<4,6>-shaped loop:
+        //    4 instructions at end of page 0 (CODE + 0xff0..0x1000) and body + back-edge in page 1
+        //    (CODE + 0x1000..), mapped from NON-CONTIGUOUS host pages so any contiguous-code bug fails.
+        let mut g2 = Guest::with_pages(10);
+        // Remap CODE + PAGE_SIZE to host page 9 (far from host page 0) so page 0 and page 1 are
+        // non-contiguous in host memory!
+        let base2 = NonNull::new(g2.pages.as_mut_ptr().cast::<u8>()).unwrap();
+        let rw = prot::READ | prot::WRITE;
+        unsafe {
+            g2.mmu.unmap(CODE + PAGE_SIZE, PAGE_SIZE).unwrap();
+            g2.mmu
+                .map(CODE + PAGE_SIZE, base2.add(9 * 4096), PAGE_SIZE, prot::READ | prot::EXEC)
+                .unwrap();
+            for (p, host, perm) in [(0, 3, rw), (1, 4, rw), (2, 6, rw), (3, 5, rw), (4, 7, rw), (5, 8, prot::READ)] {
+                g2.mmu.map(DATA + p * PAGE_SIZE, base2.add(host * 4096), PAGE_SIZE, perm).unwrap();
+            }
+        }
+        for p in 0..5usize {
+            let host = [3, 4, 6, 5, 7][p];
+            for k in 0..2048usize {
+                let h: u16 = if (p + k) & 1 == 0 { 0x3c00 } else { 0x3800 };
+                g2.pages[host].0[k * 2..k * 2 + 2].copy_from_slice(&h.to_le_bytes());
+            }
+        }
+        let f_cross = CODE + 0xff0; // 4 instructions on page 0, rest on page 1!
+        let cross_insns = [
+            // Page 0 (0xff0..0x1000)
+            add_x(3, 10, 0),            // 0xff0: add x3, x10, x0
+            add_x(7, 18, 0),            // 0xff4: add x7, x18, x0 (stolen x18)
+            add_x(6, 9, 0),             // 0xff8: add x6, x9, x0
+            add_x(5, 12, 0),            // 0xffc: add x5, x12, x0
+            // Page 1 (0x1000..)
+            lsl1(3, 3),                 // 0x1000: lsl x3, x3, #1
+            lsl1(7, 7),                 // 0x1004: lsl x7, x7, #1
+            lsl1(6, 6),                 // 0x1008: lsl x6, x6, #1
+            lsl1(5, 5),                 // 0x100c: lsl x5, x5, #1
+            ldr_q_reg(15, 2, 3),        // 0x1010: ldr q15, [x2, x3]
+            add_x(3, 17, 0),            // 0x1014: add x3, x17, x0 (stolen x17)
+            ldr_q_reg(14, 2, 6),        // 0x1018: ldr q14, [x2, x6]
+            lsl1(3, 3),                 // 0x101c: lsl x3, x3, #1
+            ldr_q_reg(13, 2, 5),        // 0x1020: ldr q13, [x2, x5]
+            ldr_q_reg(11, 1, 7),        // 0x1024: ldr q11, [x1, x7]
+            add_x(7, 16, 0),            // 0x1028: add x7, x16, x0 (stolen x16)
+            lsl1(7, 7),                 // 0x102c: lsl x7, x7, #1
+            fmla_8h(0, 11, 15),         // 0x1030: fmla v0.8h, v11.8h, v15.8h
+            ldr_q_reg(11, 1, 3),        // 0x1034: ldr q11, [x1, x3]
+            0x9100_3c03,                // 0x1038: add x3, x0, #15
+            0x9100_2000,                // 0x103c: add x0, x0, #8
+            fmla_8h(1, 11, 14),         // 0x1040: fmla v1.8h, v11.8h, v14.8h
+            ldr_q_reg(11, 1, 7),        // 0x1044: ldr q11, [x1, x7]
+            fmla_8h(2, 11, 13),         // 0x1048: fmla v2.8h, v11.8h, v13.8h
+            stp_q_sp(0, 1, 0),          // 0x104c: stp q0, q1, [sp, #0]
+            stp_q_sp(2, 3, 352),        // 0x1050: stp q2, q3, [sp, #352]
+            0xeb03_017f,                // 0x1054: cmp x11, x3
+            b_cond(f_cross + 26 * 4, f_cross, 12), // 0x1058: b.gt f_cross
+            SVC,
+        ];
+        // Write first 4 insns to host page 0 (0xff0..0x1000) and remaining to host page 9 (0x0..)!
+        for (i, insn) in cross_insns.iter().enumerate() {
+            let bytes = insn.to_le_bytes();
+            if i < 4 {
+                let off = 0xff0 + i * 4;
+                g2.pages[0].0[off..off + 4].copy_from_slice(&bytes);
+            } else {
+                let off = (i - 4) * 4;
+                g2.pages[9].0[off..off + 4].copy_from_slice(&bytes);
+            }
+        }
+
+        let mut dbt2 = Dbt::with_regs(regs).unwrap();
+        let before2 = dbt2.stats();
+        let (x0_x, x3_x, v0_x, nzcv_x) = run_gemm(&mut g2, &mut dbt2, f_cross, DATA + 4 * PAGE_SIZE + 0x100, 128);
+        assert_eq!((x0_x, x3_x, nzcv_x), (128, 135, 0x8000_0000), "cross-page fast loop ({regs:?})");
+        assert!(dbt2.stats().fast_loops > before2.fast_loops, "cross-page fast loop matched ({regs:?})");
+        assert_eq!(v0_x, v0_128, "cross-page fast loop value matches ({regs:?})");
+
+        // 2b. Template reuse across instances for the cross-page fast loop
+        let mut dbt3 = Dbt::with_regs(regs).unwrap();
+        let (x0_t, _, v0_t, _) = run_gemm(&mut g2, &mut dbt3, f_cross, DATA + 4 * PAGE_SIZE + 0x100, 128);
+        assert_eq!((x0_t, v0_t), (128, v0_128), "cross-page template reuse ({regs:?})");
+        assert!(dbt3.stats().blocks_shared > 0, "cross-page template hit ({regs:?})");
+        assert!(dbt3.stats().fast_loops > 0, "cross-page template preserved fast_loops stat ({regs:?})");
+
+        // 2c. Exact data fault inside page 1 of cross-page fast loop (at 0x1010: ldr q15, [x2, x3]):
+        //     place x2 so iter 4 (x0 = 32 -> offset 64 B) hits unmapped DATA + 6 * PAGE_SIZE.
+        {
+            let s = g2.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA;
+            s.x[2] = DATA + 6 * PAGE_SIZE - 64; // 4 iters (64 B) in page 5, iter 4 faults on page 6!
+            s.x[10] = 0;
+            s.x[11] = 128;
+            s.x[9] = 0;
+            s.x[12] = 0;
+            s.x[16] = 0;
+            s.x[17] = 0;
+            s.x[18] = 0;
+            s.sp = DATA + 4 * PAGE_SIZE + 0x100;
+        }
+        assert_eq!(
+            go(&mut g2, &mut dbt2, f_cross),
+            Exit::Fault {
+                addr: DATA + 6 * PAGE_SIZE,
+                access: Access::Read,
+                kind: FaultKind::Page,
+            },
+            "cross-page data fault ({regs:?})"
+        );
+        assert_eq!(g2.cpu.state().pc, CODE + 0x1010, "exact fault PC in page 1 ({regs:?})");
+        assert_eq!(g2.cpu.state().x[0], 32, "4 iters completed before fault ({regs:?})");
+        assert_eq!(g2.cpu.state().x[2], DATA + 6 * PAGE_SIZE - 64, "x2 restored ({regs:?})");
+        assert_eq!(g2.cpu.state().sp, DATA + 4 * PAGE_SIZE + 0x100, "SP restored ({regs:?})");
+
+        // 2d. Hostile page-1 code modification + invalidate(CODE + PAGE_SIZE, PAGE_SIZE) ONLY:
+        //     change `add x0, x0, #8` (at page 1 offset 0x3c) to `add x0, x0, #16` (`0x9100_4000`)
+        //     and verify the cross-page block starting in page 0 IS invalidated!
+        g2.pages[9].0[0x3c..0x40].copy_from_slice(&0x9100_4000u32.to_le_bytes());
+        dbt2.invalidate(&g2.cpu, CODE + PAGE_SIZE, PAGE_SIZE);
+        let (x0_mod, _, _, _) = run_gemm(&mut g2, &mut dbt2, f_cross, DATA + 4 * PAGE_SIZE + 0x100, 128);
+        assert_eq!(x0_mod, 144, "modified page-1 step=16 runs 9 iters (0..=128 -> 144) ({regs:?})");
+        assert_eq!(g2.cpu.state().x[3], 128 + 15, "iter 8 saw x0=128 -> x3=143, then x0=144 ({regs:?})");
+        // Verify it truly ran 9 iters (not 16): v0_x had 16 iters of +1.0*+1.0, new has 9 iters!
+        assert_ne!(g2.cpu.state().v[0][0], v0_x, "page-1 rewrite observed by page-0 block ({regs:?})");
+
+        // 2e. Hostile page-1 unmap + invalidate(CODE + PAGE_SIZE, PAGE_SIZE):
+        //     re-running from f_cross must execute page 0 and fault cleanly at CODE + PAGE_SIZE!
+        g2.mmu.unmap(CODE + PAGE_SIZE, PAGE_SIZE).unwrap();
+        g2.cpu.tlb_flush();
+        dbt2.invalidate(&g2.cpu, CODE + PAGE_SIZE, PAGE_SIZE);
+        {
+            let s = g2.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA;
+            s.x[2] = DATA;
+            s.x[10] = 0;
+            s.x[11] = 128;
+            s.sp = DATA + 4 * PAGE_SIZE + 0x100;
+        }
+        assert_eq!(
+            go(&mut g2, &mut dbt2, f_cross),
+            Exit::Fault {
+                addr: CODE + PAGE_SIZE,
+                access: Access::Exec,
+                kind: FaultKind::Page,
+            },
+            "unmapped page 1 must invalidate cross-page block and fault at page 1 ({regs:?})"
+        );
+    }
+}
+
 fn b_cond(from: u64, to: u64, cond: u32) -> u32 {
     0x5400_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5) | (cond & 15)
 }
