@@ -4,6 +4,8 @@
 > See `.agents/decisions/harness/diff.md` for the paired decision history (not yet created; pre-split decisions D1–D3, D5, D9, D11–D14, D17–D20, D23, D27, D29, D31, D33, D34, D36–D41 stay in `.agents/decisions/harness.md`).
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-22 (targeted verification only since the split; latest change: emit gtest.out size, captured length and head on unexpected exit 0/1 in tests/diff/gtest/run.sh)
 
 ## Responsibilities
 
@@ -130,7 +132,9 @@ benchmarks, surveys and crash testing remain `harness`.
   ones) and runs each in its own process under `timeout -s KILL 60`, stdin from `/dev/null` and
   its output in a file (a crash or hang, a test ignoring `SIGTERM`, a child keeping the output open
   or a test reading stdin does not take the rest with it), printing `<test> ok|failed|skipped|exit
-  <code>`, with core files off, the shell's crash reports filtered out and `/tmp` set back to 1777
+  <code>` (when a test exits 0 or 1 without matching a gtest result line, it follows with `out:`
+  lines giving the on-disk byte count, captured length and first 30 lines of `gtest.out`), with
+  core files off, the shell's crash reports filtered out and `/tmp` set back to 1777
   at the end. Tests stay in the foreground (a background one would inherit `SIGINT` and `SIGQUIT`
   ignored); a background watcher checks the current test (named in `/tmp/gtest.cur`) every 5 s,
   and one running 45 to 50 s gets one `hang:` line per thread of its process tree (found by the

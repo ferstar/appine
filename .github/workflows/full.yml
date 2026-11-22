@@ -148,11 +148,39 @@ jobs:
           sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
           rm -rf target/difftest
           vmstat -t 10 > target/vmstat.log 2>&1 &
-          trap "kill $!" EXIT
+          vmstat_pid=$!
+          # Sample the top host threads and appine-run's running threads (with syscall and kernel
+          # stack) every 30 s to diagnose CI-only high-sy slowdowns that do not trip the BKL
+          # watchdog.
+          (
+            while sleep 30; do
+              pids=$(pgrep -x appine-run || true)
+              [ -n "$pids" ] || continue
+              echo "=== $(date -u +%FT%TZ) ==="
+              ps -eLo pid,tid,pcpu,stat,comm,wchan:32 --sort=-pcpu 2>/dev/null | head -n 6 || true
+              for p in $pids; do
+                ps -L -p "$p" -o tid,pcpu,stat,comm,wchan:32 2>/dev/null || continue
+                for t in /proc/"$p"/task/*; do
+                  [ -d "$t" ] || continue
+                  tid=${t##*/}
+                  stat=$(cat "$t/stat" 2>/dev/null) || continue
+                  state=${stat##*) }
+                  state=${state%% *}
+                  [ "$state" = R ] || continue
+                  comm=$(cat "$t/comm" 2>/dev/null || true)
+                  sys=$(sudo -n cat "$t/syscall" 2>/dev/null || true)
+                  echo "  R tid=$tid comm=$comm syscall=$sys"
+                  sudo -n cat "$t/stack" 2>/dev/null | sed 's/^/    /' || true
+                done
+              done
+            done
+          ) > target/sy-sample.log 2>&1 &
+          sample_pid=$!
+          trap 'kill "$vmstat_pid" "$sample_pid" 2>/dev/null; pkill -P "$sample_pid" 2>/dev/null || true' EXIT
           scripts/difftest -R
 
       # Every case's appine-run stderr (internal errors, BKL watchdog reports), the outputs of
-      # failed cases and the vmstat samples, whether the cases passed or not
+      # failed cases and the vmstat/thread samples, whether the cases passed or not
       - if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -161,11 +189,12 @@ jobs:
             target/difftest/*.appine.err
             target/difftest/failed/
             target/vmstat.log
+            target/sy-sample.log
           if-no-files-found: ignore
 
       - name: Remove the differential tests' store
         if: always()
-        run: rm -rf target/difftest target/vmstat.log
+        run: rm -rf target/difftest target/vmstat.log target/sy-sample.log
 
       # The Android NDK compiles the C engine with clang: run its tests built that way too
       - name: Engine and oracle with clang

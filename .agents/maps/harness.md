@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: cache target/virglrenderer in android.yml and record the rust-cache target-cleaning gotcha)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: add 30 s host thread/stack sampling to full.yml's difftest artifact)
 
 ## Responsibilities
 
@@ -121,7 +121,8 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   `tests/gvisor` and its program list), both caches restored and saved in steps of their own so
   that a build is saved even when a later step fails, a release build of `appine-run`,
   `scripts/difftest -R` at Tier 1 with one lane (`ping_group_range` opened, `vmstat` sampling the
-  runner every 10 s, `target/difftest` deleted before and after, so every run imports the store and
+  runner every 10 s and a 30 s host-thread/stack sampler writing `target/sy-sample.log` while
+  `appine-run` runs, `target/difftest` deleted before and after, so every run imports the store and
   installs its packages again; every case's `.appine.err`, the failed cases' outputs and the
   samples uploaded as the `difftest` artifact whatever the result), and the engine tests built
   with clang. No workflow sets a timeout, and `full.yml` has no concurrency group.
