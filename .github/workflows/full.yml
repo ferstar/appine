@@ -213,6 +213,11 @@ jobs:
       - name: Mark appine-run executable
         run: chmod +x target/release/appine-run
 
+      # strace and gdb let the 30 s sampler inspect a guest thread stuck in the CI-only high-sy
+      # regime, where /proc/<tid>/stack on an actively running thread returns only [<0>] 0x0
+      - name: Install strace and gdb
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends strace gdb
+
       - uses: actions/cache/restore@v6
         with:
           path: target/rootfs
@@ -285,30 +290,60 @@ jobs:
           [ "${#cases[@]}" -gt 0 ]
           vmstat -t 10 > target/vmstat.log 2>&1 &
           vmstat_pid=$!
-          # Sample the top host threads and appine-run's running threads (with syscall and kernel
-          # stack) every 30 s to diagnose CI-only high-sy slowdowns that do not trip the BKL
-          # watchdog.
+          # Sample the top host threads and appine-run's running threads every 30 s to diagnose
+          # CI-only high-sy slowdowns that do not trip the BKL watchdog. When the same (pid, tid,
+          # comm) stays R across two consecutive samples, capture 1 s stat deltas (minflt/majflt/
+          # utime/stime), a 2 s strace -c summary, 40 raw strace lines and a gdb backtrace (up to
+          # twice per stuck thread).
           (
+            set +e
+            prev_r=""
+            probed=""
             while sleep 30; do
               pids=$(pgrep -x appine-run || true)
-              [ -n "$pids" ] || continue
+              [ -n "$pids" ] || { prev_r=""; continue; }
               echo "=== $(date -u +%FT%TZ) ==="
               ps -eLo pid,tid,pcpu,stat,comm,wchan:32 --sort=-pcpu 2>/dev/null | head -n 6 || true
+              cur_r=""
               for p in $pids; do
                 ps -L -p "$p" -o tid,pcpu,stat,comm,wchan:32 2>/dev/null || continue
                 for t in /proc/"$p"/task/*; do
                   [ -d "$t" ] || continue
                   tid=${t##*/}
                   stat=$(cat "$t/stat" 2>/dev/null) || continue
-                  state=${stat##*) }
-                  state=${state%% *}
+                  tail_stat=${stat##*) }
+                  state=${tail_stat%% *}
                   [ "$state" = R ] || continue
                   comm=$(cat "$t/comm" 2>/dev/null || true)
                   sys=$(sudo -n cat "$t/syscall" 2>/dev/null || true)
                   echo "  R tid=$tid comm=$comm syscall=$sys"
                   sudo -n cat "$t/stack" 2>/dev/null | sed 's/^/    /' || true
+                  key="$p:$tid:$comm"
+                  cur_r="$cur_r $key "
+                  case "$prev_r" in
+                    *" $key "*)
+                      cnt=$(printf '%s\n' $probed | grep -Fx -c "$key" || true)
+                      if [ "$cnt" -lt 2 ]; then
+                        probed="$probed $key"
+                        echo "  --- deep probe #$((cnt + 1)) for $key ---"
+                        s1=$(awk '{print $8,$10,$12,$13}' <<<"$tail_stat" 2>/dev/null || true)
+                        sleep 1
+                        stat2=$(cat "$t/stat" 2>/dev/null || true)
+                        s2=$(awk '{print $8,$10,$12,$13}' <<<"${stat2##*) }" 2>/dev/null || true)
+                        echo "  stat(minflt majflt utime stime): t0=($s1) t1=($s2)"
+                        grep -E '^(State|SigPnd|ShdPnd|SigBlk|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):' "$t/status" 2>/dev/null | sed 's/^/    /' || true
+                        echo "  strace -c (2s):"
+                        sudo -n timeout -s INT 2 strace -c -p "$tid" 2>&1 | sed 's/^/    /' || true
+                        echo "  strace sample (40 lines):"
+                        (sudo -n timeout -s INT 1 strace -y -p "$tid" 2>&1 || true) | head -n 40 | sed 's/^/    /' || true
+                        echo "  gdb backtrace:"
+                        sudo -n timeout 10 gdb -batch -ex "set pagination off" -ex "info threads" -ex "thread apply all bt 15" -p "$p" target/release/appine-run 2>&1 | sed 's/^/    /' || true
+                      fi
+                      ;;
+                  esac
                 done
               done
+              prev_r="$cur_r"
             done
           ) > target/sy-sample.log 2>&1 &
           sample_pid=$!
