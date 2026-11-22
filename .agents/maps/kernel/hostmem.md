@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/hostmem.md` for the paired decision history (not yet created; decisions from before the split are D2, D3, D12, D14, D15, D17, D30, D45, D47 and the host-backing parts of D4, D18, D20, D27, D33 and D38 in `.agents/decisions/kernel/mm.md`).
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-22 (targeted verification: HostRegion used-range tracking for oversized stack/heap reservations and recycled's `< 2 MB` `MAX_DISCARD` cap)
 
 ## Responsibilities
 
@@ -38,7 +40,11 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 ## Key types
 
 - `HostRegion` — owns one host range (`base`, `len`). `anonymous: Some(reserve)` marks a private
-  anonymous range that is recycled on drop. `reserved` marks a `PROT_NONE` placeholder with no
+  anonymous range that is recycled on drop; `used_start`/`used_end` (`AtomicUsize`) track the
+  monotonic byte-offset hull of slices exposed to any VMA (full `0..len` by default, empty
+  `len..0` for oversized stack/heap reservations via `new_anonymous_reserved` /
+  `spare::anonymous_reserved`, widened by `note_used` on `insert`, `place_vma`, `extend_down` and
+  `grow_heap`). `reserved` marks a `PROT_NONE` placeholder with no
   host memory, whose base is the fake address `RESERVED_HOST` (bit 55 set, in the host kernel
   half) and is never dereferenced. `foreign` marks host memory the kernel layer does not own and
   only reads (the host's vvar pages behind `[vvar]`): never unmapped or recycled. `gpu` holds an
@@ -52,8 +58,10 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
   mapped shared from a writably opened descriptor (never cleared), plus `content_version` checking
   ctime stability.
 - `recycled` — process-wide reuse pool of private anonymous host ranges keyed by `(len, reserve)`:
-  at most 256 MB in total and 32 ranges per key, a range kept only when host `MADV_DONTNEED`
-  succeeds.
+  at most 256 MB in total and 32 ranges per key; on return (`recycled::put`), discards only the
+  host-page-aligned `[used_start, used_end)` sub-range (skipping `MADV_DONTNEED` if nothing was
+  exposed) and keeps the range only when that host-aligned discard span is strictly below
+  `MAX_DISCARD` (2 MB, one 4 KB-page arm64 PMD) and `MADV_DONTNEED` succeeds (otherwise unmaps).
 - `spare` — pre-mapped `MAP_NORESERVE` host pieces that `kernel/cow`'s `fork` takes while holding
   the BKL: two per length, at most eight lengths (least recently wanted evicted), falling back to
   `recycled` and then a host mmap.
@@ -71,9 +79,9 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 - **SysV shm** (`kernel/ipc`): `SharedMemory::new`, `SharedMemory::len`.
 - **Code groups and files** (`kernel/mm`, `kernel/mmu`): `content_version`,
   `FileMaps::get`/`insert`, `UNMAPPING` (read by `kernel/oom`).
-- **Internal mm / cow primitives**: `HostRegion::reserved`, `spare::anonymous`,
-  `recycled::take`/`put`, `discard_host`, `discard_file_host`, `remove_host`, `copy_nonzero_pages`,
-  `Mm::mmap_gpu`.
+- **Internal mm / cow primitives**: `HostRegion::reserved`, `spare::anonymous` /
+  `spare::anonymous_reserved`, `recycled::take`/`put`, `discard_host`, `discard_file_host`,
+  `remove_host`, `copy_nonzero_pages`, `Mm::mmap_gpu`.
 
 ## Data flow / lifecycle
 
@@ -125,10 +133,11 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 - A `HostRegion` dropped while the BKL is held is queued in `UNMAPPED` and counted in `UNMAPPING`
   (`reserved`, `foreign` and `gpu` regions return immediately without unmapping or recycling).
 - When the BKL is released (`release_unmapped`), deferred page tables (`Mmu`) are freed first,
-  anonymous ranges go back to `recycled::put` one at a time (discarded with host `MADV_DONTNEED`
-  and kept within the 256 MB / 32-per-key caps, otherwise unmapped), file ranges are sorted and
-  unmapped in coalesced contiguous runs, `UNMAPPING` is decremented with `Release` ordering, and
-  then `spare::refill` tops the fork pool back up.
+  anonymous ranges go back to `recycled::put` one at a time (discarding only their host-aligned
+  `[used_start, used_end)` sub-range with host `MADV_DONTNEED` and keeping them when that discard
+  is strictly below 2 MB and within the 256 MB / 32-per-key caps, otherwise unmapping), file ranges
+  are sorted and unmapped in coalesced contiguous runs, `UNMAPPING` is decremented with `Release`
+  ordering, and then `spare::refill` tops the fork pool back up.
 - Under the BKL, `kernel/cow`'s `fork` still calls host mmap when a needed length is missing from
   both `spare` and `recycled` (and for private mappings over 1 MB or growsdown VMAs without
   reserved room when `recycled` has no match), and `spare::anonymous` still unmaps inline the
@@ -163,8 +172,15 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 - `foreign` (`[vvar]`) and `gpu` regions must never be unmapped, recycled or discarded on drop,
   and any path touching a `Shared` VMA's host memory must respect `foreign` and `gpu`
   restrictions.
-- Anonymous regions placed in `recycled` must succeed at host `MADV_DONTNEED` first so guests
-  never observe stale data from a prior process; a failed discard unmaps instead.
+- Anonymous regions placed in `recycled` must succeed at host `MADV_DONTNEED` over their entire
+  exposed `[used_start, used_end)` range first so guests never observe stale data from a prior
+  process; a failed discard unmaps instead. Any path that allocates an oversized reservation with
+  an empty used range (`new_anonymous_reserved` / `spare::anonymous_reserved`) or grows into one
+  in place must call `HostRegion::note_used` before exposing or touching those pages.
+- `recycled::put` keeps the host-page-aligned `MADV_DONTNEED` span strictly below `MAX_DISCARD`
+  (2 MB, one 4 KB-page arm64 PMD) and unmaps regions at or above that threshold, avoiding a
+  Linux 6.18–7.x arm64 minor page-fault livelock when full-PMD `MADV_DONTNEED` reclaims empty
+  PTE tables on reused stack/heap regions.
 - Any new path that frees host memory under the BKL must drop `HostRegion` (so `UNMAPPED` /
   `UNMAPPING` tracks it); `kernel/oom` relies on `UNMAPPING` to avoid killing while releases are
   still pending.
