@@ -153,7 +153,7 @@ struct appine_cpu {
     uint64_t ivau_page;
     /* Host base addresses of several access groups, kept by Tier 1 while a block runs (dbt.c's
      * plan_group) */
-    uint64_t dbt_groups[4];
+    uint64_t dbt_groups[8];
     /* Tier 1 addresses entries as "ldp [cpu + index * 32 + offset]", so the offset of tlb must
      * not exceed the range of ldp's immediate */
     struct appine_tlb_entry tlb[APPINE_TLB_ENTRIES];

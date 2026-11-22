@@ -1892,6 +1892,373 @@ fn memops_in_cache_same_page_fast_path_and_sizemax() {
     }
 }
 
+#[test]
+fn yield_is_emitted_verbatim_and_preserves_state() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::new();
+        let f = CODE + 0x100;
+        g.code(
+            f,
+            &[
+                0xd503_201f, // nop (emits nothing)
+                0xd503_203f, // yield (copied verbatim)
+                SVC,
+            ],
+        );
+        g.cpu.state_mut().x[0] = 0x1234_5678;
+        g.cpu.state_mut().nzcv = 0x9000_0000;
+        assert_eq!(g.run_at(&mut dbt, f), 0x1234_5678);
+        assert_eq!(g.cpu.state().nzcv, 0x9000_0000);
+        let st = dbt.stats();
+        assert_eq!(st.insns_copied, 1, "{regs:?}");
+        assert_eq!(st.exits_interp, 0, "{regs:?}");
+    }
+}
+
+#[test]
+fn long_blocks_run_past_64_insns_and_stop_on_host_budget() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::with_data();
+
+        // 1. A 256-instruction block (255 ALU instructions + SVC) fits in a single block and
+        //    reuses cleanly via the template cache in a second instance. Use the second code page
+        //    so nogroup marks recorded by other tests in page CODE do not split the template key.
+        let long_pc = CODE + PAGE_SIZE;
+        let mut long_code = vec![0x9100_0400u32; 255]; // add x0, x0, #1
+        long_code.push(SVC);
+        g.code(long_pc, &long_code);
+        g.cpu.state_mut().x[0] = 10;
+        assert_eq!(g.run_at(&mut dbt, long_pc), 265, "{regs:?}");
+        assert_eq!(dbt.stats().blocks, 1, "{regs:?}");
+        assert_eq!(dbt.stats().insns, 256, "{regs:?}");
+
+        // Second fresh instance hits the >64-insn template cleanly (testing lazy word snapshot).
+        let mut dbt2 = Dbt::with_regs(regs).unwrap();
+        g.cpu.state_mut().x[0] = 100;
+        assert_eq!(g.run_at(&mut dbt2, long_pc), 355, "{regs:?}");
+        assert_eq!(dbt2.stats().blocks, 1, "{regs:?}");
+        assert_eq!(dbt2.stats().blocks_shared, 1, "{regs:?}");
+
+        // 2. 256 heavy ungrouped exclusive instructions exceed MAX_BLOCK_WORDS / MAX_STUBS if not
+        //    split by the host budget; must split cleanly without triggering a guard failure.
+        let heavy_pc = CODE + PAGE_SIZE + 0x800;
+        let mut heavy_code = Vec::with_capacity(256);
+        for _ in 0..127 {
+            heavy_code.push(0xc85f_7c41); // ldxr x1, [x2]
+            heavy_code.push(0xc803_7c41); // stxr w3, x1, [x2]
+        }
+        heavy_code.push(0x9100_0400); // add x0, x0, #1
+        heavy_code.push(SVC);
+        g.code(heavy_pc, &heavy_code);
+        g.cpu.state_mut().x[0] = 41;
+        g.cpu.state_mut().x[2] = DATA;
+        let before_blocks = dbt.stats().blocks;
+        assert_eq!(g.run_at(&mut dbt, heavy_pc), 42, "{regs:?}");
+        assert!(
+            dbt.stats().blocks - before_blocks >= 2,
+            "heavy block should split on host budget ({regs:?})"
+        );
+        assert_eq!(dbt.stats().exits_interp, 0, "{regs:?}");
+    }
+}
+
+#[test]
+fn eight_interleaved_groups_share_checks() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::with_data();
+        let f = CODE + 0x100;
+        // 8 distinct base registers (x1..x8), each accessed twice in interleaved order:
+        // round 0: ldr x10, [xi, #0]; add x0, x0, x10
+        // round 1: ldr x10, [xi, #8]; add x0, x0, x10
+        let mut code = Vec::new();
+        for off_idx in [0u32, 1u32] {
+            for base in 1u32..=8 {
+                code.push(0xf940_000a | (off_idx << 10) | (base << 5)); // ldr x10, [x{base}, #{off}]
+                code.push(0x8b0a_0000); // add x0, x0, x10
+            }
+        }
+        code.push(SVC);
+        g.code(f, &code);
+
+        let mut expected = 0u64;
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            for i in 0..8usize {
+                s.x[i + 1] = DATA + (i * 16) as u64;
+            }
+        }
+        for i in 0..8usize {
+            expected = expected
+                .wrapping_add(g.data(0, i * 16))
+                .wrapping_add(g.data(0, i * 16 + 8));
+        }
+        assert_eq!(g.run_at(&mut dbt, f), expected, "{regs:?}");
+        let st = dbt.stats();
+        assert_eq!(st.insns_grouped, 8, "{regs:?}");
+        assert_eq!(st.exits_interp, 0, "{regs:?}");
+    }
+}
+
+#[test]
+fn affine_aliases_group_before_and_after_leader() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::with_data();
+
+        // 1. Pre-leader SUB #8 from a stolen base (x28 in Default, x25 in Go):
+        //    sub x20, xBase, #8; ldr x0, [x20]; ldr x1, [xBase, #0]; ldr x2, [xBase, #16]
+        let base_reg: u32 = match regs {
+            DbtRegs::Default => 28,
+            DbtRegs::Go => 25,
+        };
+        let f1 = CODE + 0x200;
+        g.code(
+            f1,
+            &[
+                0xd100_2014 | (base_reg << 5), // sub x20, xBase, #8
+                0xf940_0280,                   // ldr x0, [x20]
+                0xf940_0001 | (base_reg << 5), // ldr x1, [xBase, #0]
+                0xf940_0802 | (base_reg << 5), // ldr x2, [xBase, #16]
+                SVC,
+            ],
+        );
+        g.cpu.state_mut().x[base_reg as usize] = DATA + 0x40;
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f1);
+        let s = g.cpu.state();
+        assert_eq!(s.x[0], g.data(0, 0x38), "{regs:?}");
+        assert_eq!(s.x[1], g.data(0, 0x40), "{regs:?}");
+        assert_eq!(s.x[2], g.data(0, 0x50), "{regs:?}");
+        assert_eq!(
+            dbt.stats().insns_grouped - before.insns_grouped,
+            2,
+            "{regs:?}"
+        );
+        assert_eq!(dbt.stats().exits_interp, 0, "{regs:?}");
+
+        // 2. Pre-leader MOV X5, X2 + post-index LD1 on X5 + offset load on X2
+        //    (matching ggml_gemv_q8_0_4x4_q8_0):
+        let f2 = CODE + 0x280;
+        g.code(
+            f2,
+            &[
+                0xaa02_03e5, // mov x5, x2
+                0x4cdf_70a0, // ld1 {v0.16b}, [x5], #16
+                0x4c40_70a1, // ld1 {v1.16b}, [x5]
+                0xf85f_8040, // ldur x0, [x2, #-8]
+                SVC,
+            ],
+        );
+        g.cpu.state_mut().x[2] = DATA + 0x80;
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f2);
+        let s = g.cpu.state();
+        assert_eq!(s.x[0], g.data(0, 0x78), "{regs:?}");
+        assert_eq!(s.x[2], DATA + 0x80, "{regs:?}");
+        assert_eq!(s.x[5], DATA + 0x90, "{regs:?}");
+        assert_eq!(s.v[0], [g.data(0, 0x80), g.data(0, 0x88)], "{regs:?}");
+        assert_eq!(s.v[1], [g.data(0, 0x90), g.data(0, 0x98)], "{regs:?}");
+        assert_eq!(
+            dbt.stats().insns_grouped - before.insns_grouped,
+            2,
+            "{regs:?}"
+        );
+        assert_eq!(dbt.stats().exits_interp, 0, "{regs:?}");
+
+        // 3. Mid-group MOV X5, X2 + ADD X6, X5, #16:
+        let f3 = CODE + 0x300;
+        g.code(
+            f3,
+            &[
+                0xf85f_8040, // ldur x0, [x2, #-8]
+                0xaa02_03e5, // mov x5, x2
+                0x9100_40a6, // add x6, x5, #16
+                0xf940_00a1, // ldr x1, [x5]
+                0xf940_00c3, // ldr x3, [x6]
+                SVC,
+            ],
+        );
+        g.cpu.state_mut().x[2] = DATA + 0x100;
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f3);
+        let s = g.cpu.state();
+        assert_eq!(s.x[0], g.data(0, 0xf8), "{regs:?}");
+        assert_eq!(s.x[1], g.data(0, 0x100), "{regs:?}");
+        assert_eq!(s.x[3], g.data(0, 0x110), "{regs:?}");
+        assert_eq!(
+            dbt.stats().insns_grouped - before.insns_grouped,
+            2,
+            "{regs:?}"
+        );
+        assert_eq!(dbt.stats().exits_interp, 0, "{regs:?}");
+
+        // 4. Non-SP leader derived from misaligned SP must NOT suppress SP alignment fault on a
+        //    later [sp] access.
+        let f4 = CODE + 0x380;
+        g.code(
+            f4,
+            &[
+                0x9100_23e9, // add x9, sp, #8
+                0xf940_0120, // ldr x0, [x9]
+                0xf940_0521, // ldr x1, [x9, #8]
+                0xf940_03e2, // ldr x2, [sp]
+                SVC,
+            ],
+        );
+        g.cpu.state_mut().sp = STACK - 24; // misaligned (mod 16 == 8)
+        assert_eq!(
+            go(&mut g, &mut dbt, f4),
+            Exit::Fault {
+                addr: STACK - 24,
+                access: Access::Read,
+                kind: FaultKind::StackAlignment,
+            },
+            "{regs:?}"
+        );
+        assert_eq!(g.cpu.state().pc, f4 + 12, "{regs:?}");
+        g.cpu.state_mut().sp = STACK;
+
+        // 5. Overlapping out-of-span alias (`add x3, x2, #1024`) must not collide across groups.
+        let f5 = CODE + 0x400;
+        g.code(
+            f5,
+            &[
+                0xf940_0040, // ldr x0, [x2]
+                0x9110_0043, // add x3, x2, #1024
+                0xf940_0061, // ldr x1, [x3]
+                0xf940_0464, // ldr x4, [x3, #8]
+                0xf940_0445, // ldr x5, [x2, #8]
+                SVC,
+            ],
+        );
+        g.cpu.state_mut().x[2] = DATA + 0x20;
+        g.run_at(&mut dbt, f5);
+        let s = g.cpu.state();
+        assert_eq!(s.x[0], g.data(0, 0x20), "{regs:?}");
+        assert_eq!(s.x[1], g.data(0, 0x420), "{regs:?}");
+        assert_eq!(s.x[4], g.data(0, 0x428), "{regs:?}");
+        assert_eq!(s.x[5], g.data(0, 0x28), "{regs:?}");
+    }
+}
+
+#[test]
+fn stolen_base_and_mreg_accesses_group_correctly() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::with_data();
+        let (stolen_a, stolen_b): (u32, u32) = match regs {
+            DbtRegs::Default => (28, 16),
+            DbtRegs::Go => (25, 21),
+        };
+
+        // 1. Stolen base with negative g->lo, post-index writeback, and TBI tag.
+        let f1 = CODE + 0x500;
+        g.code(
+            f1,
+            &[
+                0xf85f_8000 | (stolen_a << 5), // ldur x0, [xStolen, #-8]
+                0xf841_0401 | (stolen_a << 5), // ldr x1, [xStolen], #16
+                0xf940_0002 | (stolen_a << 5), // ldr x2, [xStolen]
+                SVC,
+            ],
+        );
+        let tagged = (0xab_u64 << 56) | (DATA + 0x60);
+        g.cpu.state_mut().x[stolen_a as usize] = tagged;
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f1);
+        let s = g.cpu.state();
+        assert_eq!(s.x[0], g.data(0, 0x58), "{regs:?}");
+        assert_eq!(s.x[1], g.data(0, 0x60), "{regs:?}");
+        assert_eq!(s.x[2], g.data(0, 0x70), "{regs:?}");
+        assert_eq!(s.x[stolen_a as usize], tagged + 16, "{regs:?}");
+        assert_eq!(
+            dbt.stats().insns_grouped - before.insns_grouped,
+            2,
+            "{regs:?}"
+        );
+        assert_eq!(dbt.stats().exits_interp, 0, "{regs:?}");
+
+        // 2. M_REG grouping with stolen base + stolen index advancing via ADD #imm (LSL #3),
+        //    plus a store back through the same M_REG address.
+        let f2 = CODE + 0x580;
+        g.code(
+            f2,
+            &[
+                // ldr x0, [xStolenA, xStolenB, lsl #3]
+                0xf860_7800 | (stolen_b << 16) | (stolen_a << 5),
+                // add xStolenB, xStolenB, #1
+                0x9100_0400 | (stolen_b << 5) | stolen_b,
+                // ldr x1, [xStolenA, xStolenB, lsl #3]
+                0xf860_7801 | (stolen_b << 16) | (stolen_a << 5),
+                // str x3, [xStolenA, xStolenB, lsl #3]
+                0xf820_7803 | (stolen_b << 16) | (stolen_a << 5),
+                SVC,
+            ],
+        );
+        let s = g.cpu.state_mut();
+        s.x[stolen_a as usize] = DATA + 0x100;
+        s.x[stolen_b as usize] = 2;
+        s.x[3] = 0xdead_beef_cafe_babe;
+        let expect0 = g.data(0, 0x110);
+        let expect1 = g.data(0, 0x118);
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f2);
+        let s = g.cpu.state();
+        assert_eq!(s.x[0], expect0, "{regs:?}");
+        assert_eq!(s.x[1], expect1, "{regs:?}");
+        assert_eq!(s.x[stolen_b as usize], 3, "{regs:?}");
+        assert_eq!(g.data(0, 0x118), 0xdead_beef_cafe_babe, "{regs:?}");
+        assert_eq!(
+            dbt.stats().insns_grouped - before.insns_grouped,
+            2,
+            "{regs:?}"
+        );
+        assert_eq!(dbt.stats().exits_interp, 0, "{regs:?}");
+
+        // 3. M_REG with UXTW (option=2) must NOT treat `add xIndex, xIndex, #1` as +8 across a
+        //    32-bit wrap: start at x3 = 0xffff_ffff with base chosen so the first load hits
+        //    DATA + 0x200, and after add x3, #1 the wrapped w3 == 0 loads from unmapped base_uxtw.
+        let f3 = CODE + 0x600;
+        g.code(
+            f3,
+            &[
+                0xf863_5840, // ldr x0, [x2, w3, uxtw #3]
+                0x9100_0463, // add x3, x3, #1
+                0xf863_5841, // ldr x1, [x2, w3, uxtw #3]
+                SVC,
+            ],
+        );
+        let s = g.cpu.state_mut();
+        let base_uxtw = (DATA + 0x200).wrapping_sub(0xffff_ffffu64 << 3);
+        s.x[2] = base_uxtw;
+        s.x[3] = 0xffff_ffff;
+        assert!(matches!(
+            go(&mut g, &mut dbt, f3),
+            Exit::Fault {
+                access: Access::Read,
+                kind: FaultKind::Page,
+                ..
+            }
+        ));
+        assert_eq!(g.cpu.state().pc, f3 + 8, "{regs:?}");
+        assert_eq!(g.cpu.state().x[0], g.data(0, 0x200), "{regs:?}");
+    }
+}
+
 fn bl(from: u64, to: u64) -> u32 {
     0x9400_0000 | (((to as i64 - from as i64) / 4) as u32 & 0x3ff_ffff)
 }

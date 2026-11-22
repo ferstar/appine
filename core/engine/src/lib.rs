@@ -104,7 +104,7 @@ pub struct CpuState {
     /// means none). [`Dbt::run`] invalidates it in place at the next dsb or isb; when an exit
     /// leaves it set, the caller collects and invalidates it.
     pub ivau_page: u64,
-    dbt_groups: [u64; 4],
+    dbt_groups: [u64; 8],
     tlb: [TlbEntry; TLB_ENTRIES],
     itlb: [ItlbEntry; ITLB_ENTRIES],
     /// V0–V31, the low 64 bits of each register first.

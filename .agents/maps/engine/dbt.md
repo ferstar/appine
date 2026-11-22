@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-21 (split out of the engine full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: in-cache same-page memop fast paths, memchr/strncmp budget handling, and 4-bit routine relocations)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: verbatim YIELD, budget-bounded 256-insn blocks, 8 group slots, affine alias tracking, and stolen-base and M_REG grouping)
 
 ## Responsibilities
 
@@ -82,10 +82,12 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
 
 ### Blocks and instruction handling
 
-- A block starts with a two-word kick check, holds at most 64 guest instructions, and never crosses
-  a guest page (a forward chain exit to the next pc ends it). It ends at B, BL, SVC, BR/BLR/RET and
-  at any instruction handed to Tier 0; conditional branches become side exits and translation
-  continues on the fall-through path.
+- A block starts with a two-word kick check, holds up to 256 guest instructions (stopping earlier
+  before exceeding the 4096-word host buffer or stub, fixup and relocation budgets), and never
+  crosses a guest page (a forward chain exit to the next pc ends it). Guest instruction words are
+  snapshotted lazily from the guest page (32 words initially, extended in 64-word chunks on demand).
+  A block ends at B, BL, SVC, BR/BLR/RET and at any instruction handed to Tier 0; conditional
+  branches become side exits and translation continues on the fall-through path.
 - Every non-SIMD instruction must first be accepted by Tier 0 (`tier0_defined`, which runs the word
   on a probe CPU with no page table and caches the answer per instruction word in a 4096-entry
   per-thread cache); SIMD data processing uses Tier 0's whitelist decoder directly (`engine`).
@@ -103,7 +105,8 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
     NZCV, CNTVCT, CNTVCTSS and CNTFRQ accesses also run natively after the Tier 0 whitelist
     check. An FPCR write stays in the block if its masked value equals the saved guest FPCR.
     Changed FPCR writes, FPSR writes and other system registers go to Tier 0;
-  - HINT space, including PAC and BTI hints, emits nothing; authenticated branches go to Tier 0;
+  - HINT space, including PAC and BTI hints, emits nothing, except `yield` (`0xd503203f`), which
+    is copied verbatim; authenticated branches go to Tier 0;
   - DC CVAC/CVAU/CIVAC/CVAP/CVADP and `ic ivau` only check read access; `ic ivau` records its page
     in `ivau_page` (page zero or a second, different page exits to Tier 0); `dc zva` zeroes via the
     translated address; CLREX clears `excl_size`;
@@ -152,14 +155,21 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
   access succeeds only if both pages are permitted and have the same addend (contiguous host memory).
 - On failure the stub exits to the dispatcher and Tier 0 executes the instruction. Nothing guest
   visible has happened before the exit, so exceptions are precise.
-- Grouped checks: several accesses in a block with the same base share one check. The leader checks
-  the whole range (at most 512 bytes, at most 16 members) and leaves the host base in a temporary;
-  members access `[T2, #offset]`. Between members only instructions that do not write the base
-  (constant adjustments are tracked), SIMD data processing, conditional branches, hints, barriers,
-  CLREX and accesses on other bases are allowed; an access on another base makes the next member
-  reload the host base from one of four slots in the CPU state. Atomics, unconditional branches and
-  other system instructions end a group; literal, register-offset, register-writeback and
-  stolen-base accesses cannot lead; a register-writeback member must be last.
+- Grouped checks: several accesses in a block with the same or affine-aliased base share one check.
+  The leader checks the whole range (at most 512 bytes, at most 32 members) and leaves the host
+  base in a temporary; members access `[T2, #offset]` directly (subtracting `g->lo` when the
+  leader computed the base in `T0`). Block-local affine relations (`ADD`/`SUB` immediate, `MOV`
+  between X registers, and immediate pre/post-index writebacks) are tracked before and after the
+  leader so derived pointers share the group; SP-based members join only an SP-led group while SP
+  remains 16-byte aligned. Register-offset (`M_REG`) accesses with matching `(rn, rm, option,
+  shift)` also group (tracking constant `rn` updates and 64-bit `LSL`/`SXTX` `rm` updates).
+  Between members only instructions that keep at least one live alias, SIMD data processing,
+  conditional branches, hints, barriers, CLREX and accesses on other bases are allowed; an access
+  on another base makes the next member reload the host base from one of eight slots in the CPU
+  state (`dbt_groups[8]`). Atomics, unconditional branches and other system instructions end a
+  group; literal accesses cannot lead, and stolen-register bases and register-writeback accesses
+  are handled inline. An active-group bitmask and 256-bit instruction bitmap prevent overlapping
+  groups from claiming the same instruction.
 - A group check failure exits to Tier 0, which runs the leader. The first failure of a leader is
   recorded (64-entry direct map keyed by pc); the second retires the blocks containing it (or
   requests a full flush if a retirement cannot be placed) and stops grouping for leaders in the

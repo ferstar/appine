@@ -57,12 +57,17 @@
  * thousand live blocks. A block's jumps to the routines at the start of the cache and the links
  * between blocks are each one b, whose range is ±128 MB, so it cannot be larger */
 #define CODE_CACHE_BYTES (UINT64_C(128) << 20)
-#define MAX_BLOCK_INSNS 64
+#define MAX_BLOCK_INSNS 256
 _Static_assert(CODE_CACHE_BYTES <= (UINT64_C(128) << 20), "the offset range of b");
-/* One guest instruction expands to at most about 40 host instructions, plus exit stubs */
-#define MAX_BLOCK_WORDS (MAX_BLOCK_INSNS * 64)
-#define MAX_STUBS (MAX_BLOCK_INSNS * 2 + 4)
-#define MAX_FIXUPS (MAX_BLOCK_INSNS * 4 + 4)
+/* Host code buffer is fixed at 4096 words so conditional-branch stub distances fit in BRANCH_MASK
+ * and TBZ/TBNZ imm14; prepare() stops adding guest instructions before the worst-case margin would
+ * exceed MAX_BLOCK_WORDS, MAX_STUBS, MAX_FIXUPS or MAX_RELOCS. */
+#define MAX_BLOCK_WORDS 4096
+#define MAX_STUBS 256
+#define MAX_FIXUPS 512
+#define INSN_MAX_WORDS 64
+#define INSN_MAX_STUBS 2
+#define INSN_MAX_FIXUPS 4
 /* The translation table starts at 2^12 entries, doubles when three quarters full, and has at most
  * 2^19 entries: the table is spread by hash, so if a short-lived process's few hundred blocks were
  * put in the largest table, every block would touch a new page of memory. All threads of an
@@ -230,14 +235,15 @@ struct block {
     uint32_t *code;  /* NULL once invalidated */
     uint32_t next;   /* previous block in the same bucket (index plus 1), 0 if none */
     uint32_t words;  /* where the guest words at translation time sit in words (for recheck) */
-    uint8_t nguest;  /* number of guest instructions */
+    uint32_t nguest : 11; /* number of guest instructions (1..1024) */
     /* Parked (revive): the entry jumps to the forwarding stub like an invalidated block's, and the
      * code is still there */
-    uint8_t parked;
-    uint16_t tag;    /* tag of the member owning a private block; 0 for shared ones (TAG_SHIFT) */
-    uint32_t first;  /* the instruction after the entry check, which is rewritten when parked */
+    uint32_t parked : 1;
+    uint32_t tag : 16; /* tag of the member owning a private block; 0 for shared ones (TAG_SHIFT) */
+    uint32_t first;    /* the instruction after the entry check, which is rewritten when parked */
 };
-_Static_assert(MAX_BLOCK_INSNS <= UINT8_MAX, "nguest of struct block");
+_Static_assert(MAX_BLOCK_INSNS <= 1024, "nguest of struct block");
+_Static_assert(sizeof(struct block) == 32, "struct block layout");
 
 /* A block's key in the translation table */
 static uint64_t tagged(uint64_t pc, unsigned tag)
@@ -255,11 +261,12 @@ static uint64_t block_key(const struct block *b)
  * any more; when full, the oldest entries are overwritten first. A first failure is only recorded
  * in strikes (direct-mapped by pc) */
 #define NOGROUP_MAX 64
+#define NOGROUP_SPAN 256 /* bytes after a failed leader where grouping stays disabled */
 #define STRIKES 64
 
-/* The most words the guest instruction words of all blocks can take (from the block count limit
- * and the per-block instruction limit) */
-#define WORDS_LIMIT ((size_t)TABLE_LIMIT * MAX_BLOCK_INSNS)
+/* Capacity of d->words (guest words kept for recheck/invalidation); kept fixed so longer blocks do
+ * not bloat VA reservations, and checked in install() before appending */
+#define WORDS_LIMIT ((size_t)TABLE_LIMIT * 64)
 /* The most blocks kept when returning to the pool: checking is much cheaper than copying templates
  * and linking again (one node startup has about 50,000 blocks); beyond that they are mostly
  * JIT-generated code that will most likely not match next time */
@@ -490,8 +497,8 @@ enum {
 /* The most bytes and the most accesses one group of accesses sharing a check may cover, and the
  * most groups at once (plan_group) */
 #define GROUP_SPAN 512
-#define GROUP_MAX 16
-#define GROUP_SLOTS 4
+#define GROUP_MAX 32
+#define GROUP_SLOTS 8
 _Static_assert(sizeof(((struct appine_cpu *)0)->dbt_groups) == GROUP_SLOTS * 8, "one slot per group");
 #define MAX_RELOCS (MAX_STUBS * 2 + 4)
 
@@ -511,11 +518,13 @@ struct xlate {
     unsigned nfixups;
     uint32_t relocs[MAX_RELOCS]; /* index << 4 | TO_* */
     unsigned nrelocs;
-    /* The block being translated: start pc, guest instruction words, index of the current
+    /* The block being translated: start pc, guest instruction source (in mapped guest page),
+     * lazily snapshotted words in prep->words (first `copied` words valid), index of the current
      * instruction, and the most instructions the block may have */
     uint64_t pc;
-    const uint32_t *guest;
-    unsigned idx, limit;
+    const uint32_t *src;
+    uint32_t *words;
+    unsigned copied, idx, limit;
     /* This block goes into the translation table by pc (TAG_SHIFT), and its link stubs carry
      * LINK_SHARED */
     bool shared;
@@ -527,6 +536,12 @@ struct xlate {
      * (konst_update) */
     uint32_t konst;
     uint64_t kval[31];
+    /* Block-local affine relations: when bit r of affine_valid is set (0..30 = X0..X30, 31 = SP),
+     * register r equals root register affine_base[r] + affine_off[r] (depth-1 tree; affine_update).
+     * Used by plan_group so derived pointers created before a leader still share its TLB check. */
+    uint32_t affine_valid;
+    uint8_t affine_base[32];
+    int64_t affine_off[32];
     /* Groups of accesses sharing a check (plan_group): the members not translated yet. A group's
      * host base is in T2, or spilled to the cpu's dbt_groups[group index] */
     struct group {
@@ -539,8 +554,26 @@ struct xlate {
         bool write;
         bool spill; /* some member reloads: the leader stores the host base in the slot */
     } groups[GROUP_SLOTS];
+    uint8_t active_groups;    /* bit i set => groups[i] still has untranslated members */
+    uint64_t grouped_bits[4]; /* bit j set => guest instruction j belongs to an active group */
     int t2_group; /* which group's host base T2 holds now, -1 for none */
 };
+_Static_assert(GROUP_SLOTS <= 8, "active_groups bitmask");
+_Static_assert(MAX_BLOCK_INSNS <= 256, "grouped_bits bitmask");
+
+/* Return guest instruction `idx` of the block, lazily extending the snapshot in x->words in
+ * 64-word chunks so short blocks do not copy 256 words up front */
+static inline uint32_t fetch_guest(struct xlate *x, unsigned idx)
+{
+    if (UNLIKELY(idx >= x->copied)) {
+        unsigned want = x->copied + 64;
+        if (want > x->limit)
+            want = x->limit;
+        memcpy(x->words + x->copied, x->src + x->copied, (want - x->copied) * 4);
+        x->copied = want;
+    }
+    return x->words[idx];
+}
 
 /* Write address of code (the writable alias of the W^X double mapping) */
 static uint32_t *rw(const struct appine_dbt *d, const uint32_t *p)
@@ -1525,100 +1558,191 @@ static bool member_fits(const struct xlate *x, const struct memop *m, int64_t of
     return !(m->pair && !m->simd && is_stolen(m->rt) && is_stolen(m->rt2));
 }
 
-/* Whether the access at pc may lead a group: a recorded leader and anything within one block's
- * length after it may not, since its former members would most likely fail the check for the same
+/* Whether the access at pc may lead a group: a recorded leader and anything within NOGROUP_SPAN
+ * bytes after it may not, since its former members would most likely fail the check for the same
  * reason */
 static bool nogroup(const struct appine_dbt *d, uint64_t pc)
 {
     unsigned n = d->nogroup_count < NOGROUP_MAX ? d->nogroup_count : NOGROUP_MAX;
     for (unsigned i = 0; i < n; i++) {
-        if (pc - d->nogroup[i] < 4 * MAX_BLOCK_INSNS)
+        if (pc - d->nogroup[i] < NOGROUP_SPAN)
             return true;
     }
     return false;
 }
 
-/*
- * Instructions that do not write the base and do not end the block may sit between members:
- * returns 1, or 2 if it uses T2, otherwise 0. An ADD/SUB (immediate) that adds a constant to or
- * subtracts one from the base records the change in `delta`.
- */
-static int keeps_group(const struct xlate *x, uint32_t insn, unsigned rn, int64_t *delta)
+/* Whether instruction j is already claimed by an active group in x->groups */
+static inline bool is_grouped_idx(const struct xlate *x, unsigned j)
 {
-    unsigned top = FIELD(insn, 28, 25), stolen[3], nstolen = 0;
-    struct operands o = {.n = 0};
-    if ((top & 7) == 7) { /* SIMD&FP data processing: only general-register operands matter */
-        struct native_desc nd;
-        if (!appine_simd_dp_decode(insn, &nd))
-            return false;
-        for (unsigned i = 0; i < nd.n; i++) {
-            add_operand(&o, nd.gpr[i].pos, false);
-            if (nd.gpr[i].store && ((insn >> nd.gpr[i].pos) & 31) == rn && rn != 31)
-                return false;
-        }
-    } else if (top == 0x8 || top == 0x9 || top == 0x5 || top == 0xd) {
-        if (FIELD(insn, 28, 24) == 0x10) /* ADR/ADRP: a stolen Rd only uses T0 */
-            return (insn & 31) != rn || rn == 31;
-        if (!dp_operands(insn, &o))
-            return false;
-        uint32_t op = insn & 0xff800000;
-        if ((op == 0x91000000 || op == 0xd1000000) && (insn & 31) == rn && FIELD(insn, 9, 5) == rn) {
-            int64_t imm = (int64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0);
-            *delta += op == 0xd1000000 ? -imm : imm;
-            return true;
-        }
-        unsigned rd = insn & 31;
-        if (o.writes_rd && (rn == 31 ? rd == 31 && o.sp[0] : rd == rn))
-            return false;
-    } else {
-        return (insn & 0xff000010) == 0x54000000 || /* B.cond */
-               (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
-               (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
-               (insn & 0xfffff01f) == 0xd503201f || /* HINT */
-               (insn & 0xfffff01f) == 0xd503301f;   /* barriers, CLREX */
-    }
-    /* Stolen registers are replaced by T0, T1, T2 in turn (emit_operands): three of them use T2 */
-    for (unsigned i = 0; i < o.n; i++) {
-        unsigned r = (insn >> o.pos[i]) & 31, k;
-        if ((r == 31 && o.sp[i]) || !is_stolen(r))
+    return ((x->grouped_bits[j >> 6] >> (j & 63)) & 1) != 0;
+}
+
+/* Stolen registers are replaced by T0, T1, T2 in turn (emit_operands): three of them use T2 */
+static bool uses_t2(const struct xlate *x, uint32_t insn, const struct operands *o)
+{
+    unsigned stolen[3], nstolen = 0;
+    for (unsigned i = 0; i < o->n; i++) {
+        unsigned r = (insn >> o->pos[i]) & 31, k;
+        if ((r == 31 && o->sp[i]) || !is_stolen(r))
             continue;
         for (k = 0; k < nstolen && stolen[k] != r; k++)
             ;
         if (k == nstolen && nstolen++ == 2)
-            return 2;
+            return true;
         stolen[k] = r;
     }
-    return 1;
+    return false;
+}
+
+/*
+ * Advance affine alias tracking (bit r set in *alias_mask => register r equals leader's base +
+ * alias_off[r], with bit 31 = SP) across a non-memory instruction. Returns 0 if the instruction
+ * ends the group or leaves no live aliases, 1 if allowed without touching T2, or 2 if it uses T2.
+ */
+static int keeps_group_step(const struct xlate *x, uint32_t insn, uint32_t *alias_mask,
+                            int64_t alias_off[32])
+{
+    unsigned top = FIELD(insn, 28, 25);
+    struct operands o = {.n = 0};
+    if ((top & 7) == 7) { /* SIMD&FP data processing: only general-register operands matter */
+        struct native_desc nd;
+        if (!appine_simd_dp_decode(insn, &nd))
+            return 0;
+        for (unsigned i = 0; i < nd.n; i++) {
+            add_operand(&o, nd.gpr[i].pos, false);
+            if (nd.gpr[i].store) {
+                unsigned r = (insn >> nd.gpr[i].pos) & 31;
+                if (r < 31)
+                    *alias_mask &= ~(1u << r);
+            }
+        }
+        return *alias_mask ? (uses_t2(x, insn, &o) ? 2 : 1) : 0;
+    }
+    if (top == 0x8 || top == 0x9 || top == 0x5 || top == 0xd) {
+        if (FIELD(insn, 28, 24) == 0x10) { /* ADR/ADRP: a stolen Rd only uses T0 */
+            unsigned rd = insn & 31;
+            if (rd < 31)
+                *alias_mask &= ~(1u << rd);
+            return *alias_mask != 0;
+        }
+        if (!dp_operands(insn, &o))
+            return 0;
+        uint32_t op = insn & 0xff800000;
+        unsigned rd = insn & 31;
+        if (op == 0x91000000 || op == 0xd1000000) { /* ADD/SUB Xd, Xn, #imm{, lsl #12} (31 = SP) */
+            unsigned src = FIELD(insn, 9, 5);
+            if ((*alias_mask >> src) & 1) {
+                int64_t imm = (int64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0);
+                alias_off[rd] = alias_off[src] + (op == 0xd1000000 ? -imm : imm);
+                *alias_mask |= 1u << rd;
+            } else {
+                *alias_mask &= ~(1u << rd);
+            }
+        } else if ((insn & 0xffe0ffe0) == 0xaa0003e0) { /* MOV Xd, Xm (ORR Xd, XZR, Xm; 31 = XZR) */
+            unsigned rm = FIELD(insn, 20, 16);
+            if (rd < 31) {
+                if (rm < 31 && ((*alias_mask >> rm) & 1)) {
+                    alias_off[rd] = alias_off[rm];
+                    *alias_mask |= 1u << rd;
+                } else {
+                    *alias_mask &= ~(1u << rd);
+                }
+            }
+        } else if (o.writes_rd && (rd < 31 || o.sp[0])) {
+            *alias_mask &= ~(1u << rd);
+        }
+        return *alias_mask ? (uses_t2(x, insn, &o) ? 2 : 1) : 0;
+    }
+    return (insn & 0xff000010) == 0x54000000 || /* B.cond */
+           (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
+           (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
+           (insn & 0xfffff01f) == 0xd503201f || /* HINT */
+           (insn & 0xfffff01f) == 0xd503301f;   /* barriers, CLREX */
+}
+
+/* Same as keeps_group_step, for register-offset (M_REG) groups with fixed (rn, rm, option, shift) */
+static int keeps_group_reg(const struct xlate *x, uint32_t insn, unsigned rn, unsigned rm,
+                           unsigned option, unsigned shift, int64_t *delta)
+{
+    unsigned top = FIELD(insn, 28, 25);
+    struct operands o = {.n = 0};
+    if ((top & 7) == 7) {
+        struct native_desc nd;
+        if (!appine_simd_dp_decode(insn, &nd))
+            return 0;
+        for (unsigned i = 0; i < nd.n; i++) {
+            add_operand(&o, nd.gpr[i].pos, false);
+            if (nd.gpr[i].store) {
+                unsigned r = (insn >> nd.gpr[i].pos) & 31;
+                if (r < 31 && (r == rn || r == rm))
+                    return 0;
+            }
+        }
+        return uses_t2(x, insn, &o) ? 2 : 1;
+    }
+    if (top == 0x8 || top == 0x9 || top == 0x5 || top == 0xd) {
+        if (FIELD(insn, 28, 24) == 0x10) {
+            unsigned rd = insn & 31;
+            return (rd == 31 || (rd != rn && rd != rm)) ? 1 : 0;
+        }
+        if (!dp_operands(insn, &o))
+            return 0;
+        uint32_t op = insn & 0xff800000;
+        unsigned rd = insn & 31;
+        if ((op == 0x91000000 || op == 0xd1000000) && FIELD(insn, 9, 5) == rd) {
+            int64_t imm = (int64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0);
+            if (op == 0xd1000000)
+                imm = -imm;
+            if (rd == rn && rn != rm) {
+                if (rn == 31 && (imm & 15))
+                    return 0;
+                *delta += imm;
+                return uses_t2(x, insn, &o) ? 2 : 1;
+            }
+            if (rd == rm && rm != 31 && rn != rm && (option == 3 || option == 7)) {
+                *delta += (int64_t)((uint64_t)imm << shift);
+                return uses_t2(x, insn, &o) ? 2 : 1;
+            }
+        }
+        if (o.writes_rd) {
+            if (rn == 31 ? (rd == 31 && o.sp[0]) : rd == rn)
+                return 0;
+            if (rm < 31 && rd == rm)
+                return 0;
+        }
+        return uses_t2(x, insn, &o) ? 2 : 1;
+    }
+    return (insn & 0xff000010) == 0x54000000 || /* B.cond */
+           (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
+           (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
+           (insn & 0xfffff01f) == 0xd503201f || /* HINT */
+           (insn & 0xfffff01f) == 0xd503301f;   /* barriers, CLREX */
 }
 
 /* When access `m` executes, the base is `delta` more than before the leader executed: the start
  * of the access range (relative to the base before the leader) */
 static int64_t member_start(const struct memop *m, int64_t delta)
 {
-    return delta + (m->mode == M_POST ? 0 : m->imm);
+    return delta + (m->mode == M_POST || m->mode == M_REG ? 0 : m->imm);
 }
 
 /* Starting from access `lead` (instruction x->idx of the block), look ahead for members with the
- * same base; if there is at least one member, fill in this group in a free slot and return the
- * slot's index, otherwise return -1 */
+ * same (or affine-aliased) base, or matching M_REG (rn, rm, option, shift); if there is at least
+ * one member, fill in this group in a free slot and return the slot's index, otherwise return -1 */
 static int plan_group(struct xlate *x, const struct memop *lead)
 {
-    int slot = -1;
-    for (int i = 0; i < GROUP_SLOTS && slot < 0; i++) {
-        if (x->groups[i].next >= x->groups[i].n)
-            slot = i;
-    }
-    if (slot < 0)
+    uint8_t free_slots = (uint8_t)~x->active_groups;
+    if (!free_slots)
         return -1;
+    int slot = __builtin_ctz(free_slots);
     struct group *g = &x->groups[slot];
     unsigned rn = lead->rn;
     uint64_t pc0 = x->pc + 4ull * x->idx;
     g->n = g->next = 0;
     g->spill = false;
-    if (lead->mode == M_LITERAL || lead->mode == M_REG || lead->wb_reg || (rn != 31 && is_stolen(rn)) ||
-        nogroup(x->d, pc0))
+    if (lead->mode == M_LITERAL || nogroup(x->d, pc0))
         return -1;
-    int64_t delta = 0, lo = member_start(lead, 0), hi = lo + memop_bytes(lead);
+    int64_t lo = member_start(lead, 0), hi = lo + memop_bytes(lead);
     bool write = !lead->load;
     if (!member_fits(x, lead, lo))
         return -1;
@@ -1626,55 +1750,152 @@ static int plan_group(struct xlate *x, const struct memop *lead)
     g->off[0] = (int32_t)lo;
     g->reload[0] = false;
     g->n = 1;
-    if (lead->mode != M_OFFSET)
-        delta = lead->imm;
-    bool overwritten = lead->load && !lead->simd && (lead->rt == rn || (lead->pair && lead->rt2 == rn));
     bool clobbered = false; /* an instruction used T2 after the previous member */
-    for (unsigned j = x->idx + 1; !overwritten && j < x->limit && g->n < GROUP_MAX; j++) {
-        uint32_t insn = x->guest[j];
-        unsigned top = FIELD(insn, 28, 25);
-        if (top != 0x4 && top != 0x6 && top != 0xc && top != 0xe) {
-            int keep = keeps_group(x, insn, rn, &delta);
-            if (!keep)
+
+    if (lead->mode == M_REG) {
+        unsigned rm = lead->rm, opt = lead->option, sh = lead->shift;
+        int64_t delta = 0;
+        bool overwritten = lead->load && !lead->simd &&
+                           ((rn < 31 && lead->rt == rn) || (rm < 31 && lead->rt == rm));
+        for (unsigned j = x->idx + 1; !overwritten && j < x->limit && g->n < GROUP_MAX; j++) {
+            uint32_t insn = fetch_guest(x, j);
+            unsigned top = FIELD(insn, 28, 25);
+            if (top != 0x4 && top != 0x6 && top != 0xc && top != 0xe) {
+                int keep = keeps_group_reg(x, insn, rn, rm, opt, sh, &delta);
+                if (!keep)
+                    break;
+                clobbered |= keep == 2;
+                continue;
+            }
+            struct memop m;
+            uint64_t pc = x->pc + 4ull * j;
+            if (is_atomic(insn) || !(BIT(insn, 26) ? decode_simd_memop(insn, pc, &m) : decode_memop(insn, pc, &m)))
                 break;
-            clobbered |= keep == 2;
-            continue;
-        }
-        struct memop m;
-        uint64_t pc = x->pc + 4ull * j;
-        if (is_atomic(insn) || !(BIT(insn, 26) ? decode_simd_memop(insn, pc, &m) : decode_memop(insn, pc, &m)))
-            break;
-        if (m.prefetch) /* generates no code */
-            continue;
-        if (m.rn != rn) {
-            /* An access on another base uses T2; stop here if the loaded value overwrites the
-             * base */
-            if (m.load && !m.simd && (m.rt == rn || (m.pair && m.rt2 == rn)))
+            if (m.prefetch)
+                continue;
+            if (is_grouped_idx(x, j) || m.mode != M_REG || m.rn != rn || m.rm != rm ||
+                m.option != opt || m.shift != sh) {
+                if (m.load && !m.simd &&
+                    ((rn < 31 && (m.rt == rn || (m.pair && m.rt2 == rn))) ||
+                     (rm < 31 && (m.rt == rm || (m.pair && m.rt2 == rm)))))
+                    break;
+                if ((m.mode == M_PRE || m.mode == M_POST) && (m.rn == rn || (rm < 31 && m.rn == rm)))
+                    break;
+                clobbered = true;
+                continue;
+            }
+            int64_t start = delta, end = start + memop_bytes(&m);
+            int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
+            if (nhi - nlo > GROUP_SPAN || start <= -(1 << 23) || start >= (1 << 23) ||
+                nlo <= -(1 << 23) || nlo >= (1 << 23) || !member_fits(x, &m, start))
                 break;
-            clobbered = true;
-            continue;
+            lo = nlo;
+            hi = nhi;
+            write |= !m.load;
+            g->idx[g->n] = j;
+            g->off[g->n] = (int32_t)start;
+            g->reload[g->n] = clobbered;
+            g->spill |= clobbered;
+            clobbered = false;
+            g->n++;
+            overwritten = m.load && !m.simd && ((rn < 31 && m.rt == rn) || (rm < 31 && m.rt == rm));
         }
-        if (m.mode == M_LITERAL || m.mode == M_REG || (rn == 31 && (delta & 15)))
-            break;
-        int64_t start = member_start(&m, delta), end = start + memop_bytes(&m);
-        int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
-        if (nhi - nlo > GROUP_SPAN || !member_fits(x, &m, start))
-            break;
-        lo = nlo;
-        hi = nhi;
-        write |= !m.load;
-        g->idx[g->n] = j;
-        g->off[g->n] = (int32_t)start;
-        g->reload[g->n] = clobbered;
-        g->spill |= clobbered;
-        clobbered = false;
-        g->n++;
-        if (m.mode != M_OFFSET) {
-            if (m.wb_reg)
+    } else {
+        uint32_t alias_mask = 1u << rn;
+        int64_t alias_off[32];
+        alias_off[rn] = 0;
+        /* Seed with any block-local affine aliases already established before the leader */
+        if (x->affine_valid) {
+            unsigned root = ((x->affine_valid >> rn) & 1) ? x->affine_base[rn] : rn;
+            int64_t lead_off = ((x->affine_valid >> rn) & 1) ? x->affine_off[rn] : 0;
+            if (root != rn) {
+                alias_mask |= 1u << root;
+                alias_off[root] = -lead_off;
+            }
+            for (uint32_t bits = x->affine_valid; bits; bits &= bits - 1) {
+                unsigned r = (unsigned)__builtin_ctz(bits);
+                if (r != rn && x->affine_base[r] == root) {
+                    alias_mask |= 1u << r;
+                    alias_off[r] = x->affine_off[r] - lead_off;
+                }
+            }
+        }
+        if (lead->mode == M_PRE || lead->mode == M_POST) {
+            if (lead->wb_reg)
+                alias_mask &= ~(1u << rn);
+            else
+                alias_off[rn] += lead->imm;
+        }
+        if (lead->load && !lead->simd) {
+            if (lead->rt < 31)
+                alias_mask &= ~(1u << lead->rt);
+            if (lead->pair && lead->rt2 < 31)
+                alias_mask &= ~(1u << lead->rt2);
+        }
+        for (unsigned j = x->idx + 1; alias_mask && j < x->limit && g->n < GROUP_MAX; j++) {
+            uint32_t insn = fetch_guest(x, j);
+            unsigned top = FIELD(insn, 28, 25);
+            if (top != 0x4 && top != 0x6 && top != 0xc && top != 0xe) {
+                int keep = keeps_group_step(x, insn, &alias_mask, alias_off);
+                if (!keep)
+                    break;
+                clobbered |= keep == 2;
+                continue;
+            }
+            struct memop m;
+            uint64_t pc = x->pc + 4ull * j;
+            if (is_atomic(insn) || !(BIT(insn, 26) ? decode_simd_memop(insn, pc, &m) : decode_memop(insn, pc, &m)))
                 break;
-            delta += m.imm;
+            if (m.prefetch) /* generates no code */
+                continue;
+            bool can_join = !is_grouped_idx(x, j) && m.mode != M_LITERAL && m.mode != M_REG &&
+                            ((alias_mask >> m.rn) & 1) &&
+                            (m.rn != 31 || (rn == 31 && (alias_off[31] & 15) == 0));
+            if (!can_join) {
+                if (m.load && !m.simd) {
+                    if (m.rt < 31)
+                        alias_mask &= ~(1u << m.rt);
+                    if (m.pair && m.rt2 < 31)
+                        alias_mask &= ~(1u << m.rt2);
+                }
+                if (m.mode == M_PRE || m.mode == M_POST) {
+                    if (m.wb_reg)
+                        alias_mask &= ~(1u << m.rn);
+                    else if ((alias_mask >> m.rn) & 1)
+                        alias_off[m.rn] += m.imm;
+                }
+                if (!alias_mask)
+                    break;
+                clobbered = true;
+                continue;
+            }
+            int64_t start = member_start(&m, alias_off[m.rn]), end = start + memop_bytes(&m);
+            int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
+            if (nhi - nlo > GROUP_SPAN || start <= -(1 << 23) || start >= (1 << 23) ||
+                nlo <= -(1 << 23) || nlo >= (1 << 23) || !member_fits(x, &m, start))
+                break;
+            lo = nlo;
+            hi = nhi;
+            write |= !m.load;
+            g->idx[g->n] = j;
+            g->off[g->n] = (int32_t)start;
+            g->reload[g->n] = clobbered;
+            g->spill |= clobbered;
+            clobbered = false;
+            g->n++;
+            if (m.mode == M_PRE || m.mode == M_POST) {
+                if (m.wb_reg)
+                    alias_mask &= ~(1u << m.rn);
+                else
+                    alias_off[m.rn] += m.imm;
+            }
+            if (m.load && !m.simd) {
+                if (m.rt < 31)
+                    alias_mask &= ~(1u << m.rt);
+                if (m.pair && m.rt2 < 31)
+                    alias_mask &= ~(1u << m.rt2);
+            }
         }
-        overwritten = m.load && !m.simd && (m.rt == rn || (m.pair && m.rt2 == rn));
     }
     if (g->n < 2) {
         g->n = 0;
@@ -1684,13 +1905,15 @@ static int plan_group(struct xlate *x, const struct memop *lead)
     g->lo = (int32_t)lo;
     g->bytes = (unsigned)(hi - lo);
     g->write = write;
+    for (unsigned k = 1; k < g->n; k++)
+        x->grouped_bits[g->idx[k] >> 6] |= UINT64_C(1) << (g->idx[k] & 63);
     return slot;
 }
 
 /* A member's (including the leader's) access: host address = T2 + off, then base writeback */
 static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
 {
-    unsigned rn = m->rn == 31 ? REG_SP : m->rn, base = rn == REG_SP ? SP_HOST : rn, addr = T2;
+    unsigned rn = m->rn == 31 ? REG_SP : m->rn, addr = T2;
     bool s1 = !m->simd && is_stolen(m->rt), s2 = m->pair && !m->simd && is_stolen(m->rt2);
     uint32_t insn = 0;
     if (!member_insn(m, off, &insn)) {
@@ -1724,16 +1947,23 @@ static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
         }
     }
     if (m->mode == M_PRE || m->mode == M_POST) {
+        unsigned dst = rn == REG_SP ? SP_HOST : is_stolen(rn) ? T0 : rn;
         if (m->wb_reg) {
             unsigned inc = m->rm;
             if (is_stolen(inc)) {
                 emit_load_guest(x, T1, inc);
                 inc = T1;
             }
-            emit(x, enc_add_lsl(base, base, inc, 0));
+            if (dst == T0)
+                emit_load_guest(x, T0, rn);
+            emit(x, enc_add_lsl(dst, dst, inc, 0));
         } else {
-            emit_add_const(x, base, base, m->imm);
+            if (dst == T0)
+                emit_load_guest(x, T0, rn);
+            emit_add_const(x, dst, dst, m->imm);
         }
+        if (dst == T0)
+            emit_store_guest(x, T0, rn);
         if (rn == REG_SP)
             sp_moved(x, m->wb_reg ? 1 : m->imm);
     }
@@ -1745,22 +1975,47 @@ static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
 static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, int slot)
 {
     struct group *g = &x->groups[slot];
-    unsigned rn = lead->rn == 31 ? REG_SP : lead->rn, base = rn == REG_SP ? SP_HOST : rn;
+    unsigned rn = lead->rn == 31 ? REG_SP : lead->rn;
     if (rn == REG_SP)
         emit_sp_check(x, pc);
-    bool in_granule = rn == REG_SP && (g->lo & 15) + g->bytes <= 16;
+    bool base_in_t0 = false;
+    unsigned base = rn == REG_SP ? SP_HOST : rn;
+    if (rn != REG_SP && is_stolen(rn)) {
+        emit_load_guest(x, T0, rn);
+        base = T0;
+        base_in_t0 = true;
+    }
+    if (lead->mode == M_REG) {
+        unsigned idx = lead->rm;
+        if (idx != 31 && is_stolen(idx)) {
+            emit_load_guest(x, T1, idx);
+            idx = T1;
+        }
+        emit(x, enc_add_ext(T0, base, idx, lead->option, lead->shift));
+        base = T0;
+        base_in_t0 = true;
+    }
+    bool in_granule = rn == REG_SP && lead->mode != M_REG && (g->lo & 15) + g->bytes <= 16;
     uint64_t addr;
-    if (known_address(x, rn, g->lo, g->bytes, &addr)) {
+    if (lead->mode != M_REG && known_address(x, rn, g->lo, g->bytes, &addr)) {
         emit_add_const(x, T0, base, g->lo);
         emit_tlb_check_known(x, pc, addr, g->bytes, g->write, R_UNGROUP);
     } else {
         bool last_ready = emit_address_imm(x, base, g->lo, g->bytes, in_granule);
         emit_tlb_check(x, pc, g->bytes, g->write, in_granule, last_ready, R_UNGROUP);
     }
-    emit(x, enc_add_lsl(T2, T2, base, 0));
+    if (base_in_t0) {
+        /* T0 now holds base + g->lo (preserved across refill), so subtract g->lo to recover
+         * host(base) for members. */
+        emit(x, enc_add_lsl(T2, T2, T0, 0));
+        emit_add_const(x, T2, T2, -g->lo);
+    } else {
+        emit(x, enc_add_lsl(T2, T2, base, 0));
+    }
     if (g->spill)
         emit(x, enc_str_x(T2, CTX, offsetof(struct appine_cpu, dbt_groups) + 8 * (size_t)slot));
     x->t2_group = slot;
+    x->active_groups |= (uint8_t)(1u << slot);
     g->next = 1;
     emit_member(x, lead, g->off[0]);
 }
@@ -2109,8 +2364,13 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         emit_exit_stub(x, R_SVC, pc + 4);
         return false;
     }
-    if ((insn & 0xfffff01f) == 0xd503201f) /* HINT: a NOP, as in Tier 0 */
+    if ((insn & 0xfffff01f) == 0xd503201f) { /* HINT: NOP, except YIELD which runs verbatim */
+        if (insn == 0xd503203f) {
+            emit(x, insn);
+            x->st->insns_copied++;
+        }
         return true;
+    }
     if (is_flagm(insn)) { /* CFINV, XAFLAG, AXFLAG: whitelist already confirmed by Tier 0 */
         emit(x, insn);
         x->st->insns_copied++;
@@ -2361,10 +2621,159 @@ static void konst_update(struct xlate *x, uint32_t insn, uint64_t pc)
     x->konst &= ~kill;
 }
 
+static void affine_kill(struct xlate *x, unsigned r)
+{
+    x->affine_valid &= ~(1u << r);
+    for (uint32_t bits = x->affine_valid; bits; bits &= bits - 1) {
+        unsigned k = (unsigned)__builtin_ctz(bits);
+        if (x->affine_base[k] == r)
+            x->affine_valid &= ~(1u << k);
+    }
+}
+
+static void affine_add_inplace(struct xlate *x, unsigned r, int64_t imm)
+{
+    if ((x->affine_valid >> r) & 1) {
+        x->affine_off[r] += imm;
+        return;
+    }
+    for (uint32_t bits = x->affine_valid; bits; bits &= bits - 1) {
+        unsigned k = (unsigned)__builtin_ctz(bits);
+        if (x->affine_base[k] == r)
+            x->affine_off[k] -= imm;
+    }
+}
+
+static void affine_set(struct xlate *x, unsigned rd, unsigned rn, int64_t imm)
+{
+    unsigned base = ((x->affine_valid >> rn) & 1) ? x->affine_base[rn] : rn;
+    int64_t off = ((x->affine_valid >> rn) & 1) ? x->affine_off[rn] + imm : imm;
+    if (base == rd) {
+        affine_add_inplace(x, rd, off);
+        return;
+    }
+    affine_kill(x, rd);
+    x->affine_base[rd] = (uint8_t)base;
+    x->affine_off[rd] = off;
+    x->affine_valid |= 1u << rd;
+}
+
+/* Maintain block-local affine register relations (ADD/SUB #imm, MOV Xd, Xm, immediate writeback);
+ * bit 31 represents SP. Anything uncertain clears all relations conservatively. */
+static void affine_update(struct xlate *x, uint32_t insn, uint64_t pc)
+{
+    unsigned rd = insn & 31, rn = FIELD(insn, 9, 5);
+    uint32_t op = insn & 0xff800000;
+    if (op == 0x91000000 || op == 0xd1000000) { /* ADD/SUB Xd, Xn, #imm{, lsl #12} (31 = SP) */
+        int64_t imm = (int64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0);
+        if (op == 0xd1000000)
+            imm = -imm;
+        if (rd == rn) {
+            if (x->affine_valid)
+                affine_add_inplace(x, rd, imm);
+        } else {
+            affine_set(x, rd, rn, imm);
+        }
+        return;
+    }
+    if ((insn & 0xffe0ffe0) == 0xaa0003e0) { /* MOV Xd, Xm (ORR Xd, XZR, Xm; 31 = XZR) */
+        unsigned rm = FIELD(insn, 20, 16);
+        if (rd < 31) {
+            if (rm < 31) {
+                if (rd != rm)
+                    affine_set(x, rd, rm, 0);
+            } else if (x->affine_valid) {
+                affine_kill(x, rd);
+            }
+        }
+        return;
+    }
+    if (!x->affine_valid || is_flagm(insn))
+        return;
+    if (FIELD(insn, 28, 24) == 0x10) { /* ADR/ADRP */
+        if (rd < 31)
+            affine_kill(x, rd);
+        return;
+    }
+    switch (FIELD(insn, 28, 25)) {
+    case 0x8:
+    case 0x9:
+    case 0x5:
+    case 0xd: {
+        struct operands o;
+        if (!dp_operands(insn, &o))
+            x->affine_valid = 0;
+        else if (o.writes_rd && (rd < 31 || o.sp[0]))
+            affine_kill(x, rd);
+        break;
+    }
+    case 0x7:
+    case 0xf: {
+        struct native_desc nd;
+        if (!appine_simd_dp_decode(insn, &nd)) {
+            x->affine_valid = 0;
+        } else {
+            for (unsigned i = 0; i < nd.n; i++) {
+                if (nd.gpr[i].store) {
+                    unsigned r = (insn >> nd.gpr[i].pos) & 31;
+                    if (r < 31)
+                        affine_kill(x, r);
+                }
+            }
+        }
+        break;
+    }
+    case 0x4:
+    case 0x6:
+    case 0xc:
+    case 0xe: {
+        struct memop m;
+        if (is_atomic(insn)) {
+            unsigned rs = FIELD(insn, 20, 16);
+            if (rd < 31)
+                affine_kill(x, rd);
+            if (rd + 1 < 31)
+                affine_kill(x, rd + 1);
+            if (rs < 31)
+                affine_kill(x, rs);
+            if (rs + 1 < 31)
+                affine_kill(x, rs + 1);
+            break;
+        }
+        if (!(BIT(insn, 26) ? decode_simd_memop(insn, pc, &m) : decode_memop(insn, pc, &m))) {
+            x->affine_valid = 0;
+            break;
+        }
+        if (m.prefetch)
+            break;
+        if (m.load && !m.simd) {
+            if (m.rt < 31)
+                affine_kill(x, m.rt);
+            if (m.pair && m.rt2 < 31)
+                affine_kill(x, m.rt2);
+        }
+        if (m.mode == M_PRE || m.mode == M_POST) {
+            if (m.wb_reg)
+                affine_kill(x, m.rn);
+            else
+                affine_add_inplace(x, m.rn, m.imm);
+        }
+        break;
+    }
+    default:
+        if (!((insn & 0xff000010) == 0x54000000 || (insn & 0x7e000000) == 0x34000000 ||
+              (insn & 0x7e000000) == 0x36000000 || (insn & 0xfffff01f) == 0xd503201f ||
+              (insn & 0xfffff01f) == 0xd503301f))
+            x->affine_valid = 0;
+        break;
+    }
+}
+
 static bool translate_insn(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     bool r = translate_insn_body(x, insn, pc);
     konst_update(x, insn, pc);
+    affine_update(x, insn, pc);
     return r;
 }
 
@@ -2407,21 +2816,26 @@ static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc)
             return fallback(x, pc);
         if (m.prefetch)
             return true;
-        for (int i = 0; i < GROUP_SLOTS; i++) {
-            struct group *g = &x->groups[i];
-            if (g->next >= g->n || x->idx != g->idx[g->next])
-                continue;
-            if (g->reload[g->next]) {
-                size_t off = offsetof(struct appine_cpu, dbt_groups) + 8 * (size_t)i;
-                emit(x, enc_ldr_x(T2, CTX, off));
-                x->t2_group = i;
-            } else if (x->t2_group != i) {
-                appine_guard_fail(); /* plan_group ensures nothing used T2 before a member not
-                                      * marked reload */
+        if (x->active_groups && is_grouped_idx(x, x->idx)) {
+            for (unsigned mask = x->active_groups; mask; mask &= mask - 1) {
+                int i = __builtin_ctz(mask);
+                struct group *g = &x->groups[i];
+                if (x->idx != g->idx[g->next])
+                    continue;
+                if (g->reload[g->next]) {
+                    size_t off = offsetof(struct appine_cpu, dbt_groups) + 8 * (size_t)i;
+                    emit(x, enc_ldr_x(T2, CTX, off));
+                    x->t2_group = i;
+                } else if (x->t2_group != i) {
+                    appine_guard_fail(); /* plan_group ensures nothing used T2 before a member not
+                                          * marked reload */
+                }
+                emit_member(x, &m, g->off[g->next++]);
+                if (g->next >= g->n)
+                    x->active_groups &= (uint8_t)~(1u << i);
+                x->st->insns_grouped++;
+                return true;
             }
-            emit_member(x, &m, g->off[g->next++]);
-            x->st->insns_grouped++;
-            return true;
         }
         emit_memop(x, &m, pc);
         return true;
@@ -2650,7 +3064,7 @@ static void table_insert(struct appine_dbt *d, uint64_t pc, unsigned tag, uint32
     unsigned h = page_bucket(pc >> APPINE_PAGE_SHIFT);
     memcpy(d->words + d->words_used, guest, nguest * 4);
     d->blocks[d->table_count] =
-        (struct block){pc, code, d->page_head[h], (uint32_t)d->words_used, (uint8_t)nguest, 0, (uint16_t)tag, 0};
+        (struct block){pc, code, d->page_head[h], (uint32_t)d->words_used, nguest, 0, (uint16_t)tag, 0};
     d->words_used += nguest;
     d->table_used[d->table_count++] = (uint32_t)i;
     d->page_head[h] = (uint32_t)d->table_count;
@@ -3069,7 +3483,7 @@ static uint64_t nogroup_key(const struct appine_dbt *d, uint64_t pc)
     unsigned n = d->nogroup_count < NOGROUP_MAX ? d->nogroup_count : NOGROUP_MAX;
     for (unsigned i = 0; i < n; i++) {
         uint64_t q = d->nogroup[i];
-        if (q + 4 * MAX_BLOCK_INSNS > pc && q < end)
+        if (q + NOGROUP_SPAN > pc && q < end)
             key += (q * UINT64_C(0x9e3779b97f4a7c15)) | 1;
     }
     return key;
@@ -3082,6 +3496,25 @@ static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64
     for (struct template *t = *template_bucket(pc); t; t = t->next) {
         if (t->pc == pc && t->key == key && t->r == r && t->shared == shared &&
             memcmp(t->words, guest, t->nguest * 4) == 0)
+            return t;
+    }
+    return NULL;
+}
+
+/* Same as template_find, extending the caller's snapshot in `words` lazily past 64 words only when
+ * a longer template exists at `pc` */
+static struct template *template_find_fetch(uint64_t pc, const uint32_t *src, uint32_t *words,
+                                            unsigned *copied, unsigned limit, uint64_t key,
+                                            const struct regs *r, bool shared)
+{
+    for (struct template *t = *template_bucket(pc); t; t = t->next) {
+        if (t->pc != pc || t->key != key || t->r != r || t->shared != shared || t->nguest > limit)
+            continue;
+        if (t->nguest > *copied) {
+            memcpy(words + *copied, src + *copied, (t->nguest - *copied) * 4);
+            *copied = t->nguest;
+        }
+        if (memcmp(t->words, words, t->nguest * 4) == 0)
             return t;
     }
     return NULL;
@@ -3108,13 +3541,14 @@ struct prep {
     unsigned nlinks;
 };
 
-/* If there is a template matching `guest` (the instruction words read at translation), copy it
+/* If there is a template matching `words` (lazily extended from `src` up to `limit`), copy it
  * into the thread's scratch area and record it in p */
-static bool template_fetch(uint64_t pc, const uint32_t *guest, uint64_t key, const struct regs *r,
-                           bool shared, struct prep *p, uint32_t *scratch, struct appine_dbt_stats *st)
+static bool template_fetch(uint64_t pc, const uint32_t *src, uint32_t *words, unsigned *copied,
+                           unsigned limit, uint64_t key, const struct regs *r, bool shared,
+                           struct prep *p, uint32_t *scratch, struct appine_dbt_stats *st)
 {
     pthread_mutex_t *lock = template_lock(pc);
-    struct template *t = template_find(pc, guest, key, r, shared);
+    struct template *t = template_find_fetch(pc, src, words, copied, limit, key, r, shared);
     if (t) {
         const uint32_t *host = t->words + t->nguest, *relocs = host + t->nhost;
         memcpy(scratch, host, t->nhost * 4);
@@ -3317,9 +3751,9 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
      * member (TAG_SHIFT) */
     p->tag = t->tag && !in_shared(d, pc) ? t->tag : 0;
     p->guest = page + (pc & PAGE_MASK) / 4;
-    memcpy(p->words, p->guest, limit * 4);
+    unsigned copied = limit < 32 ? limit : 32;
+    memcpy(p->words, p->guest, copied * 4);
     p->nlinks = 0;
-    const uint32_t *guest = p->words;
     /* Read the grouping records without the lock: reading stale ones only affects grouping, which
      * is undone again when a check fails (ungroup) */
     uint64_t key = d->nogroup_count ? nogroup_key(d, pc) : 0;
@@ -3329,7 +3763,8 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     uint32_t memop_kind = p->tag ? APPINE_MEMOP_NONE : find_memop(d, pc);
     p->memop_kind = memop_kind;
     t->stats.blocks++;
-    if (!memop_kind && template_fetch(pc, guest, key, d->r, !p->tag, p, t->scratch, &t->stats))
+    if (!memop_kind &&
+        template_fetch(pc, p->guest, p->words, &copied, limit, key, d->r, !p->tag, p, t->scratch, &t->stats))
         return true;
 
     struct appine_dbt_stats before = t->stats;
@@ -3345,13 +3780,16 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     x->nfixups = 0;
     x->nrelocs = 0;
     x->pc = pc;
-    x->guest = guest;
+    x->src = p->guest;
+    x->words = p->words;
+    x->copied = copied;
     x->limit = limit;
     x->shared = !p->tag;
     x->sp_aligned = false;
     x->konst = 0;
-    for (unsigned i = 0; i < GROUP_SLOTS; i++)
-        x->groups[i].n = x->groups[i].next = 0;
+    x->affine_valid = 0;
+    x->active_groups = 0;
+    memset(x->grouped_bits, 0, sizeof(x->grouped_bits));
     x->t2_group = -1;
 
     /* Check for a kick at the block entry, so that linked loops can be kicked too */
@@ -3408,13 +3846,19 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     uint32_t nguest = 0;
     for (;; nguest++) {
         uint64_t va = pc + 4ull * nguest;
-        if (nguest == MAX_BLOCK_INSNS || (nguest > 0 && (va & PAGE_MASK) == 0)) {
+        bool budget_full =
+            nguest > 0 &&
+            (x->n + (size_t)(x->nstubs + INSN_MAX_STUBS) * MAX_STUB_WORDS + INSN_MAX_WORDS > MAX_BLOCK_WORDS ||
+             x->nstubs + INSN_MAX_STUBS > MAX_STUBS ||
+             x->nfixups + INSN_MAX_FIXUPS > MAX_FIXUPS ||
+             x->nrelocs + x->nstubs + INSN_MAX_STUBS + 2 > MAX_RELOCS);
+        if (nguest == MAX_BLOCK_INSNS || budget_full || (nguest > 0 && (va & PAGE_MASK) == 0)) {
             emit_exit_stub(x, R_CHAIN_FWD, va);
             break;
         }
         x->st->insns++;
         x->idx = nguest;
-        if (!translate_insn(x, guest[nguest], va)) {
+        if (!translate_insn(x, fetch_guest(x, nguest), va)) {
             nguest++;
             break;
         }
@@ -3457,7 +3901,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     if (x->nrelocs > MAX_RELOCS)
         appine_guard_fail();
     if (!memop_kind)
-        template_store(pc, guest, nguest, key, x, &before, p->links, p->nlinks);
+        template_store(pc, p->words, nguest, key, x, &before, p->links, p->nlinks);
     p->nguest = nguest;
     p->host = x->buf;
     p->nhost = (uint32_t)x->n;
@@ -3484,6 +3928,10 @@ static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct sync
      * records, or do a full flush if few are invalidated */
     if (d->table_count == TABLE_LIMIT &&
         (d->blocks_dead * 8 < d->table_count || !compact_blocks(d)))
+        return NEED_FLUSH;
+    if (d->words_used + p->nguest > WORDS_LIMIT &&
+        (d->blocks_dead * 8 < d->table_count || !compact_blocks(d) ||
+         d->words_used + p->nguest > WORDS_LIMIT))
         return NEED_FLUSH;
     unsigned bits = d->table->bits;
     if (d->table_occupied >= ((size_t)3 << bits) / 4) {

@@ -1,6 +1,6 @@
 # Optimizing CPU Performance for `llama.cpp`
 
-> Handoff / future-work design note (no code changes yet; Step 0 profiling completed 2026-11-22).
+> Handoff / future-work design note (Step 0 profiling and Step 1 implemented 2026-11-22; Step 2+ pending).
 > Grounded in `core/engine/src/c/dbt.c`, `core/engine/include/appine/engine.h`,
 > `core/engine/src/c/features.c`, `core/engine/src/c/mmu.c`, `core/kernel/src/mm.rs`,
 > `core/kernel/src/syscall/mem.rs`, `core/kernel/src/syscall/fast.rs`,
@@ -428,14 +428,25 @@ handful of strided NEON compute loops (`ggml_vec_dot_*`, `ggml_gemm_*`, `rms_nor
      only 2.0–2.6% on decode (even for 1.17 GiB F16), `futex`/Tier 0 exits are negligible, and
      `libggml-cpu-armv8.2_2.so` is selected identically on native and Appine because host CPUs lack
      `sve`.
-2. **Step 1 — Low-risk quick wins (immediate impact on Q4_0 prefill & barrier spin)**
-   - **Direction 5.1**: Emit host `yield` (`0xd503203f`) verbatim (1-line change; directly targets
-     `ggml_barrier` at 5.3–14.3% decode time).
-   - **Direction 1 (full)**: Budget-based block length limit (1.1), `GROUP_SLOTS` 4→8 (1.2),
-     block-local affine alias tracking for `ADD`/`SUB #imm` **and** `MOV Xd, Xn` (1.3), and
-     stolen-register base grouping (1.4). Directly targets `ggml_gemm_q4_0_4x4_q8_0` (49.2% of
-     Q4_0 prefill, which hits all four ceilings), `ggml_gemv_q8_0_4x4_q8_0` (21.9% of Q4_0 decode,
-     `mov x5, x2`), and `tinyBLAS::gemm_bloc` tail splits.
+2. **Step 1 — Low-risk quick wins (completed 2026-11-22)**
+   - Implemented Direction 5.1 (verbatim `yield`) and full Direction 1 (`MAX_BLOCK_INSNS = 256` with
+     budget-based stopping and lazy 32/64-word guest snapshotting, `GROUP_SLOTS` 4→8 and `GROUP_MAX`
+     16→32, block-local affine alias tracking for `ADD`/`SUB #imm` and `MOV Xd, Xm` before and after
+     leaders, stolen-register base grouping, and `M_REG` grouping).
+   - **Same-session alternating A/B results** (2 rounds × `-r 3`, `appine-run --tier 1` on
+     `/bench/store`):
+     - Static check-sharing jumped from ~44–45% to **48–51%** of inline memory instructions across
+       all runs (`23,661→27,618` on Q4_0 `-t 1`, `28,796→34,911` on Q4_0 `-t 4`, `27,529→32,933` on
+       F16 `-t 4`).
+     - Qwen2.5-0.5B Q4_0 `pp512 -t 1`: `190.7 → 197.8 t/s` (**+3.7%**); `pp128 -t 4`: `849.9 → 871.8 t/s` (**+2.6%**); `pp512 -t 4`: `718.9 → 727.3 t/s` (**+1.2%**); `tg32 -t 4`: `180.6 → 184.2 t/s` (**+2.0%**); `tg128 -t 4`: `178.9 → 180.4 t/s` (**+0.8%**).
+     - Qwen2.5-0.5B F16 `pp128 -t 4`: `224.5 → 228.6 t/s` (**+1.8%**); `tg32 -t 4`: flat (`73.9 → 72.9 t/s`, within run-to-run noise).
+     - **Non-ML A/B**: `appine-bench` Tier 1 geomean `1.71× → 1.70×` (`vm` `1.89× → 1.80×`);
+       `gcc-lua`, `python-loop`, `spawnbench`, and `gobuild` all noise-identical or slightly faster
+       (lazy `fetch_guest`, `affine_valid == 0` fast return, and `active_groups`/`grouped_bits`
+       eliminated cold-translation overhead on `gcc-lua`).
+   - **Takeaway**: Confirms Step 0's diagnosis — on wide Apple Silicon cores, removing remaining
+     grouping gaps inside compute-bound loops delivers modest (+1–4%) gains, and breaking past the
+     remaining 1.2–1.6× gap requires **Step 2 (Direction 4: strip-mined in-page fast loops)**.
 3. **Step 2 — High-ceiling core optimization: Direction 4 (strip-mined fast loops)**
    - Promoted ahead of Direction 3A based on Step 0: `ggml_vec_dot_f16` (72.1% F16 decode),
      `ggml_gemv_q4_0_4x4_q8_0` (39.7% Q4_0 decode), `ggml_gemv_q8_0_4x4_q8_0` (21.9% Q4_0 decode),

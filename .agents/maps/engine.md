@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: split the Tier 1 dynamic binary translator into engine/dbt)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: expanded struct appine_cpu::dbt_groups from 4 to 8 slots)
 
 ## Responsibilities
 
@@ -41,7 +41,7 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 - `struct appine_cpu` / `CpuState` — one per guest thread: X0–X30, SP, PC, NZCV, FPCR, FPSR,
   TPIDR_EL0, exit and fault information, the `pending` kick flag, the bound page table, the
   exclusive monitor (`excl_addr`, `excl_value`, `excl_size`; size 0 means none), Tier 1 scratch and
-  group slots (`dbt_groups[4]`), `ivau_page`, the data TLB (4096) and ITLB (512), V0–V31,
+  group slots (`dbt_groups[8]`), `ivau_page`, the data TLB (4096) and ITLB (512), V0–V31,
   `tlb_used`, DIT, and 16 hardware breakpoint and 16 watchpoint slots. Fields before the TLB are
   addressed by `engine/dbt` with immediate offsets.
 - `Cpu` — owns one state (pooled: up to 8 spares); `Send`, not `Sync`.
