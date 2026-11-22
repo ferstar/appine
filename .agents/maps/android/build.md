@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: Android and Cargo release versions)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: isolate libghostty-vt's Zig build from Appine's Git repository with GIT_CEILING_DIRECTORIES)
 
 ## Responsibilities
 
@@ -209,6 +209,11 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 - The global cache a `--system` build uses must never have held a package's archive: the user's
   `~/.cache/zig` usually has, and Zig 0.17 then panics ("reached unreachable code"), so `build.rs`
   gives the source a cache of its own, which nothing fetches into.
+- `libghostty-vt`'s `build.zig` invokes `git` to compute Ghostty's app version even under
+  `-Demit-lib-vt`, and panics if `HEAD` has a tag outside Ghostty's `vX.Y.Z` format. Because
+  `target/ghostty/libghostty-vt-*` lives inside Appine's repository, `build.rs` clears `GIT_DIR` /
+  `GIT_WORK_TREE` and sets `GIT_CEILING_DIRECTORIES` to the canonical parent of the source tree so
+  Appine's commits and release tags (e.g. `v1.1.0-3`) never leak into the Zig build.
 - `build.rs` reruns when the `gpu/` sources, `vt.c`, the source's `LIB_VERSION` or `build.zig.zon`,
   `APPINE_GHOSTTY_SRC` or `ZIG` change, not for other libghostty-vt files or `ANDROID_NDK_HOME`.
 - vt.c's Wuffs header is found through the release's layout: the dependency named `wuffs` in

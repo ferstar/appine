@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the split; latest change: emit gtest.out size, captured length and head on unexpected exit 0/1 in tests/diff/gtest/run.sh)
+> Maintained: 2026-11-22 (targeted verification only since the split; latest change: retry `apk add` up to 3 times during difftest store creation)
 
 ## Responsibilities
 
@@ -54,7 +54,8 @@ benchmarks, surveys and crash testing remain `harness`.
   back to `target/release/appine-run` when the chosen one is not executable; elsewhere always
   `target/linux-arm64/release/appine-run`. Only `APPINE_DBT_REGS` is passed through.
 - A store (`target/difftest/store`, inside the work tree, since both containers mount only the
-  repository) is imported once and gets 22 packages (fuse3, fuse-overlayfs, sshfs, rclone and
+  repository) is imported once and gets 22 packages (retried up to 3 times on transient `apk add`
+  failures; fuse3, fuse-overlayfs, sshfs, rclone and
   openssh-sftp-server among them, for the `fuse` and `fuse-tools` cases, whose native side needs
   `--device /dev/fuse`); a tool check on every top-level run (`command -v` of each of 17 commands,
   and util-linux's `nsenter` and `dmesg`) aborts if one is missing.

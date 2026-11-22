@@ -63,8 +63,8 @@ fn main() {
     // builds of every profile share it: one that holds a package's archive, as the user's
     // ~/.cache/zig may, crashes Zig 0.17's build with "reached unreachable code"
     // (PACKAGING-LIBGHOSTTY.md)
-    let status = Command::new(&zig)
-        .current_dir(&src)
+    let mut cmd = Command::new(&zig);
+    cmd.current_dir(&src)
         .args([
             "build",
             "-Demit-lib-vt",
@@ -77,6 +77,18 @@ fn main() {
         .arg("--prefix")
         .arg(&prefix)
         .env("ZIG_GLOBAL_CACHE_DIR", src.join(".zig-global-cache"))
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE");
+    // libghostty-vt's build.zig runs git to detect Ghostty's app version even under -Demit-lib-vt.
+    // When unpacked under target/ghostty/ inside Appine's repository, git walks up to Appine's
+    // .git and panics on Appine release tags (e.g. v1.1.0-3) that do not match Ghostty's vX.Y.Z.
+    if let Some(ceiling) = fs::canonicalize(&src)
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        cmd.env("GIT_CEILING_DIRECTORIES", ceiling);
+    }
+    let status = cmd
         .status()
         .unwrap_or_else(|e| panic!("cannot run {}: {e}", zig.to_string_lossy()));
     assert!(
