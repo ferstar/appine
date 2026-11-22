@@ -1,6 +1,6 @@
 # Optimizing CPU Performance for `llama.cpp`
 
-> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, and Phase 2B-1 completed 2026-11-22; Phase 2B-2 and Step 3 pending).
+> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, Phase 2B-1, and Post-2B-1 profiling completed 2026-11-22; Direction 3A superpages/2 MiB fast-loop span, Phase 2B-2, and Direction 3B pending).
 > Grounded in `core/engine/src/c/dbt.c`, `core/engine/include/appine/engine.h`,
 > `core/engine/src/c/features.c`, `core/engine/src/c/mmu.c`, `core/kernel/src/mm.rs`,
 > `core/kernel/src/syscall/mem.rs`, `core/kernel/src/syscall/fast.rs`,
@@ -494,24 +494,39 @@ handful of strided NEON compute loops (`ggml_vec_dot_*`, `ggml_gemm_*`, `rms_nor
        - Qwen2.5-0.5B Q4_0 `pp128 -t 4`: `895.64 → 980.02 t/s` (**+9.4%**, now **1.18×** native vs. 1.37× in Step 0); `pp512 -t 4`: `737.88 → 844.46 t/s` (**+14.4%**, now **1.22×** native vs. 1.45× in Step 0); `tg128 -t 4`: `183.83 → 184.88 t/s` (+0.6%).
        - Qwen2.5-0.5B F16 `pp128 -t 4`: `228.86 → 235.85 t/s` (**+3.1%**); `tg32 -t 4`: flat (`74.29 → 72.63 t/s`, within ±2.5 t/s run noise).
        - **Verification & non-ML regression**: `appine-engine` 80/80, `guest_programs` 26/26, `rootfs_programs` 73/73, 200k-iteration `appine-lockstep` under both `Default` and `Go` (0 mismatches), `appine-bench` Tier 1 geomean **1.69×** (unchanged vs. Phase 2A).
-   - **Phase 2B-2 (pending — `tinyBLAS::gemm_bloc`, 78.0% of F16 prefill)**:
+   - **Post-2B-1 profiling diagnosis (2026-11-22)** (`perf record -e task-clock -F 999`, Native vs. Appine Phase 2B-1 across all 6 Qwen2.5-0.5B workloads):
+     - **Q4_0 prefill (`pp512 -t 1`: `7,317 → 9,111`, `+1,794` samples; `pp512 -t 4`: `8,232 → 10,304`, `+2,072` samples)**: ~75–80% of the remaining gap is caused by the **4 KiB page boundary**, not un-matched loops:
+       - `ggml_compute_forward_flash_attn_ext_tiled` (`1,598 → 2,220`, `+622` = **+34.7%** of `-t 1` gap, `1.39×`; `-t 4`: `+706` = **+34.1%**, `1.42×`): 32 B offset histograms show `0x6f5a0` (838 samples) spends **35.9%** (301 samples) in its `UDIV` prologue and `0x6f260` (764 samples) spends **29.5%** (225 samples) in prologue + **20.8%** (159 samples) in epilogue/slow loop. Both loops (and `0x6f1a0`, 117 samples) stride by **256 B/iter** over a 64-iter inner loop, forcing a 4 KiB page-crossing bail every **16 iterations** (4× per call).
+       - `ggml_gemm_q4_0_4x4_q8_0` (`4,842 → 5,362`, `+520` = **+29.0%** of `-t 1` gap, `1.11×`; `-t 4`: `+635` = **+30.6%**, `1.12×`): `0xba094` (5,144 samples) still spends **30.2%** outside its fast body (`1,059` slow loop [20.6%] + `333` prologue [6.5%] + `162` epilogue [3.1%]) because 5 pointers (`4×136 B + 1×72 B`) cross a 4 KiB page every ~6.6 iterations.
+       - `dbt_shared_routines` (`emit_refill`): `+230` (**+12.8%** of `-t 1` gap, 2.52% total) and `+308` (**+14.9%** of `-t 4` gap, 2.99% total).
+       - Remaining non-fast-loop kernels are small and fragmented (`rms_norm_mul_fused` `+70` [+3.9%, `0x7c34c` blocked only by `ldr x0, [sp, #192]`], `swiglu` `+35` [+2.0%, mid-loop overflow branch], `rope` `+22` [+1.2%], `repack_q8_0` `+14` [+0.8%]; `soft_max` `0.97×` and `quantize_mat_q8_0` `1.03×` are already at native speed).
+     - **Decode (`q4_tg128 -t 1`/`-t 4`, `f16_tg32 -t 4`)**: Core GEMV/dot kernels are already at native speed (`gemv_q4_0` `0.94×` at `-t 4` / `1.08×` at `-t 1`, `gemv_q8_0` `0.96×` / `1.01×`, `vec_dot_f16` `0.98×`). The largest single Appine-side overhead is now `dbt_shared_routines` (`emit_refill`: 2.71% / `+210` samples = **23.5%** of `q4_tg128 -t 4` gap; 3.45% / `+146` = 18.4% at `-t 1`; 2.65% / `+135` = **21.3%** of `f16_tg32 -t 4` gap), followed by non-tiled `flash_attn_ext` (`+91`/`+99`), `ggml_barrier` (`+143` at `-t 4`), and outer dispatch/startup.
+     - **F16 prefill (`f16_pp128 -t 4`: `5,583 → 8,987`, `+3,404` samples, `1.61×`)**: Concentrated in `tinyBLAS::gemm_bloc<4,6>` (`4,133 → 6,136`, `+2,003` = **58.8%** of gap, `1.48×`), `tinyBLAS::gemm_bloc<4,5>` (`733 → 1,196`, `+463` = **13.6%**, `1.63×`), and `dbt_shared_routines` (`+498` = 14.6%, of which `328` samples [3.65% total CPU, **9.6%** of gap] are `refill[1]` cross-page writes from `gemm_bloc`'s `stp q, [sp, #0..352]`) — **~82%** of the F16 prefill gap combined.
+   - **Phase 2B-2 (pending — `tinyBLAS::gemm_bloc`, ~82% of F16 prefill gap)**:
      - Derived shifted indices (`add tmp, row_off, x0; lsl tmp, tmp, #1`) and derived compare
        operand (`x3 = x0 + 15; cmp x11, x3`).
      - Same-base multi-row addend sharing (already supported by Phase 2B-1's `fast_stream` /
        `first_for_ptr` mechanism; raise `FAST_LOOP_MAX_STREAMS` if needed): 10–11 memory streams
        share only **3 base registers** (`x1`, `x2`, `sp`), staying within `FAST_LOOP_MAX_PTRS = 7`.
-     - Zero-stride `sp` base (`[sp, #0..352]`), also eliminating F16 prefill's 3.33% cross-page
+     - Disassembly note: `<4,6>` (`0x9dff0..0x9e104`) reads 3 loop-invariant stolen GPRs
+       (`x16`/`x17`/`x18`), while `<4,5>` (`0x9e600..0x9e6f0`) uses 4 stolen GPRs
+       (`x16`/`x17` read-only + `x27`/`x28` scratch temps), exceeding the current 2-reg pinning
+       cap unless widened or handled selectively.
+     - Zero-stride `sp` base (`[sp, #0..352]`), also eliminating F16 prefill's 3.65% cross-page
        `refill[1]` overhead.
      - Cross-4 KiB-code-page 2-block loop support for `gemm_bloc<4, 6>` (`0x9dff0..0x9e104`;
        `gemm_bloc<4, 5>` at `0x9e600..0x9e6f0` is single-page).
-4. **Step 3 — Deferred / optional secondary work**
+4. **Step 3 — Re-prioritized superpages & secondary work**
+   - **Direction 3A (re-prioritized ahead of / alongside Phase 2B-2 based on Post-2B-1 profiling)**
+     (L2 2 MiB superpages + fast-loop 2 MiB `safe_iters` + sequential TLB prefill):
+     - No longer decode-only: Post-2B-1 profiling shows raising fast-loop `safe_iters` from 4 KiB
+       to 2 MiB directly attacks **~75–80% of the remaining Q4_0 prefill gap** (eliminating 4×
+       per-call 256 B-stride page-crossing prologue exits in `flash_attn` `0x6f5a0`/`0x6f260`/
+       `0x6f1a0` and 30.2% off-fast-body time in 5-pointer `ggml_gemm_q4_0_4x4_q8_0`), cuts
+       decode's #1 remaining Appine overhead (`emit_refill`, 21–24% of decode gap, larger on
+       1.5B–7B models), and also gives Phase 2B-2's 10-row `gemm_bloc` loops a 2 MiB runway.
    - **Direction 3B** (unlocked `madvise` forwarding + widened read-only file `fault_in`): small
      independent change for cold-start TTFT on flash storage; can land anytime.
-   - **Direction 3A** (sequential TLB prefill + L2 2 MiB superpages): deprioritized while
-     `dbt_shared_routines` is only 2.0–2.6% on decode; revisit after Phase 2B shrinks in-block
-     time (or on 3B–7B models) — note that 2 MiB superpages would also raise multi-pointer
-     fast-loop `safe_iters` from 4 KiB to 2 MiB, recapturing the ~25% slow-loop / ~6% prologue
-     page-crossing overhead seen in 5-pointer `ggml_gemm_q4_0_4x4_q8_0`.
 5. **Verification & non-regression gates**
    - Unit/integration tests in `core/engine/tests/dbt.rs` (block length boundary, 5–8 interleaved
      groups, derived pointers, `M_REG`/stolen groups, cross-page faults, watchpoints, TBI tags,
