@@ -1,6 +1,6 @@
 # Optimizing CPU Performance for `llama.cpp`
 
-> Handoff / future-work design note (Step 0 profiling, Step 1, and Step 2 Phase 2A implemented 2026-11-22; Phase 2B and Step 3 pending).
+> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, and post-2A prefill diagnosis completed 2026-11-22; Phase 2B and Step 3 pending).
 > Grounded in `core/engine/src/c/dbt.c`, `core/engine/include/appine/engine.h`,
 > `core/engine/src/c/features.c`, `core/engine/src/c/mmu.c`, `core/kernel/src/mm.rs`,
 > `core/kernel/src/syscall/mem.rs`, `core/kernel/src/syscall/fast.rs`,
@@ -468,16 +468,47 @@ handful of strided NEON compute loops (`ggml_vec_dot_*`, `ggml_gemm_*`, `rms_nor
        bandwidth-bound): `83.50 → 87.21 t/s` (**+4.4%**, now **1.05×** native).
      - **Non-ML regression**: `appine-bench` Tier 1 geomean `1.69×` (vs. `1.70×` in Step 1);
        200,000-iteration `appine-lockstep` passed under both `Default` and `Go` register sets.
-   - **Phase 2B (pending)**: Extend strip-mined fast loops to `M_REG` indexed strides, stolen-base
-     `M_REG`, and 2-block loops crossing a 4 KiB code page boundary to cover
-     `ggml_compute_forward_flash_attn_ext_tiled` (28.7% Q4_0 prefill) and `tinyBLAS::gemm_bloc`
-     (78.0% F16 prefill).
+   - **Post-2A prefill diagnosis** (`perf record -e task-clock -F 999`, Native vs. Appine Phase 2A on
+     Qwen2.5-0.5B Q4_0 `pp512 -t 1 -r 3`, `7,434` vs. `10,325` samples, `284.0` vs. `208.0 t/s`):
+     - **`ggml_gemm_q4_0_4x4_q8_0` is already `1.08×` native** (`4,899 → 5,295` samples, only
+       `+396 ms` = **13.7%** of the `+2,891 ms` total gap). Its 5 bases were already grouped in
+       Step 1 behind ~190 heavy NEON `sdot`/`fmla` ops, leaving little headroom on Apple Silicon.
+       Host-offset histogram of `0xba094` (761 words, 5,098 samples) splits into ~68% fast loop
+       body, ~25% slow loop body, and ~6% prologue/epilogue because 5 independent pointers
+       (`4×136 B + 1×72 B` per iter) cross a 4 KiB page boundary every ~6.6 iterations on average
+       (`K = 896 → 28` iters).
+     - **`ggml_compute_forward_flash_attn_ext_tiled` is `~2.1×` slower than native**
+       (`1,624 → ~3,400+` samples, `~+1,800 ms` = **~62%** of the remaining gap), and all other
+       code (`softmax`, `quantize`, `swiglu`, `rms_norm`, `refill`, host/kernel) accounts for
+       `911 → ~1,630` samples (`~24%` of the gap).
+   - **Phase 2B (pending)** — split into two verified sub-phases from hot-loop disassembly:
+     - **Phase 2B-1 (single-block Q4_0 `flash_attn` loops — highest remaining Q4_0 prefill ROI)**:
+       - `0x6f260` (13.94% of `pp512 -t 1`): `M_REG` with induction base + loop-invariant index
+         (`ldr s23, [x2, x28, lsl #2]`, stolen `x28`).
+       - `0x6f5a0` (9.49%): loop-invariant register stride (`add x4, x4, x26`; prologue validates
+         `0 < stride <= 4096 - span` and computes `page_iters` via `udiv`).
+       - `0x6ed64` (4.74%): `M_REG` with loop-invariant base + induction index
+         (`ldr h31, [x1, x6, lsl #1]`, `str s31, [x2, x6, lsl #2]`) plus loop-local
+         write-before-read NZCV (`fcmp` + `cset`, safe because fast-loop `T2` counter is
+         NZCV-free and loop-closing `cmp` follows `cset`).
+     - **Phase 2B-2 (`tinyBLAS::gemm_bloc` — 78.0% of F16 prefill)**:
+       - Derived shifted indices (`add tmp, row_off, x0; lsl tmp, tmp, #1`) and derived compare
+         operand (`x3 = x0 + 15; cmp x11, x3`).
+       - Same-base multi-row addend sharing: 10–11 memory streams share only **3 base registers**
+         (`x1`, `x2`, `sp`); verifying all rows of a base hit TLB with the same `addend` stays
+         well within `FAST_LOOP_MAX_PTRS = 7`.
+       - Zero-stride `sp` base (`[sp, #0..352]`), also eliminating F16 prefill's 3.33% cross-page
+         `refill[1]` overhead.
+       - Cross-4 KiB-code-page 2-block loop support for `gemm_bloc<4, 6>` (`0x9dff0..0x9e104`;
+         `gemm_bloc<4, 5>` at `0x9e600..0x9e6f0` is single-page).
 4. **Step 3 — Deferred / optional secondary work**
    - **Direction 3B** (unlocked `madvise` forwarding + widened read-only file `fault_in`): small
      independent change for cold-start TTFT on flash storage; can land anytime.
    - **Direction 3A** (sequential TLB prefill + L2 2 MiB superpages): deprioritized while
-     `dbt_shared_routines` is only 2.0–2.6% on decode; revisit after Step 1+2 shrink in-block time
-     (or when profiling 3B–7B models where streaming refill share grows).
+     `dbt_shared_routines` is only 2.0–2.6% on decode; revisit after Phase 2B shrinks in-block
+     time (or on 3B–7B models) — note that 2 MiB superpages would also raise multi-pointer
+     fast-loop `safe_iters` from 4 KiB to 2 MiB, recapturing the ~25% slow-loop / ~6% prologue
+     page-crossing overhead seen in 5-pointer `ggml_gemm_q4_0_4x4_q8_0`.
 5. **Verification & non-regression gates**
    - Unit/integration tests in `core/engine/tests/dbt.rs` (block length boundary, 5–8 interleaved
      groups, derived pointers, `M_REG`/stolen groups, cross-page faults, watchpoints, TBI tags,
