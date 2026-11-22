@@ -671,6 +671,8 @@ pub struct DbtStats {
     /// Times a shared check failed and the block was invalidated and retranslated without
     /// grouping.
     pub ungrouped: u64,
+    /// Blocks compiled with a strip-mined in-page fast loop.
+    pub fast_loops: u64,
 }
 
 /// Which host registers Tier 1's translated code takes for itself (the guest registers with the

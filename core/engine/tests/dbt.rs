@@ -2259,6 +2259,620 @@ fn stolen_base_and_mreg_accesses_group_correctly() {
     }
 }
 
+#[test]
+fn fast_loop_accelerates_canonical_strided_loops() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::with_data();
+
+        // 1. Loop 1 shape (ggml_vec_dot_f16): 2 pointers += 64, cmp x6, x2; b.ne across two
+        //    adjacent pages (DATA + 0x40 .. DATA + 0x1840 = 96 iterations, crossing page 0 -> 1).
+        let f1 = CODE + 0x700;
+        g.code(
+            f1,
+            &[
+                0xad40_5854,                      // ldp q20, q22, [x2]
+                0xad40_5c95,                      // ldp q21, q23, [x4]
+                0xad41_6858,                      // ldp q24, q26, [x2, #32]
+                0x9101_0042,                      // add x2, x2, #0x40
+                0xad41_6c99,                      // ldp q25, q27, [x4, #32]
+                0x9101_0084,                      // add x4, x4, #0x40
+                0x4ef5_87bd,                      // add v29.2d, v29.2d, v21.2d
+                0x4ef4_87bd,                      // add v29.2d, v29.2d, v20.2d
+                0x4ef8_87bd,                      // add v29.2d, v29.2d, v24.2d
+                0x4ef9_87bd,                      // add v29.2d, v29.2d, v25.2d
+                0xeb02_00df,                      // cmp x6, x2
+                b_cond(f1 + 44, f1, 1),           // b.ne f1
+                SVC,
+            ],
+        );
+        let n1 = 96usize;
+        let off1 = 0x40usize;
+        {
+            let s = g.cpu.state_mut();
+            s.x[2] = DATA + off1 as u64;
+            s.x[4] = DATA + off1 as u64;
+            s.x[6] = DATA + (off1 + n1 * 64) as u64;
+            s.v[29] = [0, 0];
+            s.nzcv = 0x8000_0000;
+        }
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f1);
+        let mut exp_v29 = [0u64; 2];
+        for iter in 0..n1 {
+            let base = off1 + iter * 64;
+            for delta in [0usize, 32] {
+                let addr = base + delta;
+                let lo = g.data(addr / 4096, addr % 4096);
+                let hi = g.data((addr + 8) / 4096, (addr + 8) % 4096);
+                exp_v29[0] = exp_v29[0].wrapping_add(lo).wrapping_add(lo);
+                exp_v29[1] = exp_v29[1].wrapping_add(hi).wrapping_add(hi);
+            }
+        }
+        let s = g.cpu.state();
+        assert_eq!(s.v[29], exp_v29, "{regs:?}");
+        assert_eq!(s.x[2], DATA + (off1 + n1 * 64) as u64, "{regs:?}");
+        assert_eq!(s.x[4], DATA + (off1 + n1 * 64) as u64, "{regs:?}");
+        assert_eq!(s.nzcv, 0x6000_0000, "{regs:?}"); // cmp equal: Z=1, C=1
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+        assert_eq!(dbt.stats().exits_interp, before.exits_interp, "{regs:?}");
+
+        // 2. Loop 2 shape (ggml_gemv_q4_0): non-pow2 post-index strides (+34, +72), 32-bit signed
+        //    counter starting negative (w5 = -5 -> w6 = 95, 100 iters across pages 0 -> 1).
+        let f2 = CODE + 0x760;
+        g.code(
+            f2,
+            &[
+                0x3cc0_2057,                      // ldur q23, [x2, #2]
+                0x1100_04a5,                      // add w5, w5, #1
+                0x3cc1_2056,                      // ldur q22, [x2, #18]
+                0x7c42_2459,                      // ldr h25, [x2], #34
+                0x3cc0_801c,                      // ldur q28, [x0, #8]
+                0xfc44_8418,                      // ldr d24, [x0], #72
+                0x4ef7_879d,                      // add v29.2d, v28.2d, v23.2d
+                0x4ef6_87bd,                      // add v29.2d, v29.2d, v22.2d
+                0x4efd_87de,                      // add v30.2d, v30.2d, v29.2d
+                0x6b05_00df,                      // cmp w6, w5
+                b_cond(f2 + 40, f2, 12),          // b.gt f2
+                SVC,
+            ],
+        );
+        let n2 = 100usize;
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = DATA + 16;
+            s.x[2] = DATA + 32;
+            s.x[5] = (-5i32) as u32 as u64;
+            s.x[6] = 95;
+            s.v[30] = [0, 0];
+        }
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f2);
+        let read_u64 = |off: usize| -> u64 {
+            let mut b = [0u8; 8];
+            for k in 0..8 {
+                let p = (off + k) / 4096;
+                let host = [3, 4, 6, 5, 7, 8][p];
+                b[k] = g.pages[host].0[(off + k) % 4096];
+            }
+            u64::from_le_bytes(b)
+        };
+        let mut exp_v30 = [0u64; 2];
+        for iter in 0..n2 {
+            let p0 = 16 + iter * 72;
+            let p2 = 32 + iter * 34;
+            for lane in 0..2 {
+                let a = read_u64(p0 + 8 + lane * 8);
+                let b = read_u64(p2 + 2 + lane * 8);
+                let c = read_u64(p2 + 18 + lane * 8);
+                exp_v30[lane] = exp_v30[lane].wrapping_add(a).wrapping_add(b).wrapping_add(c);
+            }
+        }
+        let s = g.cpu.state();
+        assert_eq!(s.v[30], exp_v30, "{regs:?}");
+        assert_eq!(s.x[0], DATA + 16 + (n2 * 72) as u64, "{regs:?}");
+        assert_eq!(s.x[2], DATA + 32 + (n2 * 34) as u64, "{regs:?}");
+        assert_eq!(s.x[5], 95, "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+        assert_eq!(dbt.stats().exits_interp, before.exits_interp, "{regs:?}");
+
+        // 3. Loop 3 shape (ggml_gemv_q8_0): negative offsets [-2]/[-8], derived alias mov x5, x2
+        //    with post-index ld1 [x5], #64 and ld1 [x5], verifying exact restored guest x5!
+        let f3 = CODE + 0x7c0;
+        g.code(
+            f3,
+            &[
+                0x7c5f_e000,                      // ldur h0, [x0, #-2]
+                0xaa02_03e5,                      // mov x5, x2
+                0xfc5f_8053,                      // ldur d19, [x2, #-8]
+                0x1100_04c6,                      // add w6, w6, #1
+                0x9102_2042,                      // add x2, x2, #0x88
+                0x4cdf_20bc,                      // ld1 {v28.16b-v31.16b}, [x5], #64
+                0x4c40_a016,                      // ld1 {v22.16b-v23.16b}, [x0]
+                0x9100_8800,                      // add x0, x0, #0x22
+                0x4c40_20b8,                      // ld1 {v24.16b-v27.16b}, [x5]
+                0x4efc_86d4,                      // add v20.2d, v22.2d, v28.2d
+                0x4ef8_8694,                      // add v20.2d, v20.2d, v24.2d
+                0x4ef4_86b5,                      // add v21.2d, v21.2d, v20.2d
+                0x6b06_00ff,                      // cmp w7, w6
+                b_cond(f3 + 52, f3, 12),          // b.gt f3
+                SVC,
+            ],
+        );
+        let n3 = 50usize;
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = DATA + 16;
+            s.x[2] = DATA + 16;
+            s.x[5] = 0;
+            s.x[6] = 0;
+            s.x[7] = n3 as u64;
+            s.v[21] = [0, 0];
+        }
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f3);
+        let s = g.cpu.state();
+        assert_eq!(s.x[0], DATA + 16 + (n3 * 0x22) as u64, "{regs:?}");
+        assert_eq!(s.x[2], DATA + 16 + (n3 * 0x88) as u64, "{regs:?}");
+        assert_eq!(s.x[5], DATA + 16 + ((n3 - 1) * 0x88 + 64) as u64, "{regs:?}");
+        assert_eq!(s.x[6], n3 as u64, "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+        assert_eq!(dbt.stats().exits_interp, before.exits_interp, "{regs:?}");
+
+        // 4. Loop 4 shape (ggml_gemm_q4_0): 5 pointers including stolen base (x28 in Default, x25
+        //    in Go), derived alias sub x20, xBase, #8, mid-body subs x24, x24, #1 + b.gt.
+        let base_s: u32 = match regs {
+            DbtRegs::Default => 28,
+            DbtRegs::Go => 25,
+        };
+        let f4 = CODE + 0x820;
+        g.code(
+            f4,
+            &[
+                0x3dc0_0003 | (base_s << 5),      // ldr q3, [xBase]
+                0x3dc0_029f,                      // ldr q31, [x20] -- wait: set x20 first below
+                0xd100_2014 | (base_s << 5),      // sub x20, xBase, #8
+                0xfd40_0291,                      // ldr d17, [x20]
+                0xf100_0718,                      // subs x24, x24, #1
+                0x9101_2000 | (base_s << 5) | base_s, // add xBase, xBase, #0x48
+                0x3dc0_02a4,                      // ldr q4, [x21]
+                0x9102_22b5,                      // add x21, x21, #0x88
+                0x3dc0_02c5,                      // ldr q5, [x22]
+                0x9102_22d6,                      // add x22, x22, #0x88
+                0x3dc0_02e6,                      // ldr q6, [x23]
+                0x9102_22f7,                      // add x23, x23, #0x88
+                0x3dc0_0127,                      // ldr q7, [x9]
+                0x9102_2129,                      // add x9, x9, #0x88
+                0x4ee3_8484,                      // add v4.2d, v4.2d, v3.2d
+                0x4ee5_8484,                      // add v4.2d, v4.2d, v5.2d
+                0x4ee6_8484,                      // add v4.2d, v4.2d, v6.2d
+                0x4ee7_8484,                      // add v4.2d, v4.2d, v7.2d
+                0x4ee4_8508,                      // add v8.2d, v8.2d, v4.2d
+                b_cond(f4 + 76, f4, 12),          // b.gt f4
+                SVC,
+            ],
+        );
+        // Replace slot 1 with NOP (0xd503201f) so x20 is written before read!
+        g.code(f4 + 4, &[0xd503_201f]);
+        let n4 = 40usize;
+        {
+            let s = g.cpu.state_mut();
+            s.x[base_s as usize] = DATA + 16;
+            s.x[21] = DATA + 32;
+            s.x[22] = DATA + 48;
+            s.x[23] = DATA + 64;
+            s.x[9] = DATA + 80;
+            s.x[24] = n4 as u64;
+            s.v[8] = [0, 0];
+        }
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f4);
+        let s = g.cpu.state();
+        assert_eq!(s.x[base_s as usize], DATA + 16 + (n4 * 0x48) as u64, "{regs:?}");
+        assert_eq!(s.x[20], DATA + 16 + ((n4 - 1) * 0x48) as u64 - 8, "{regs:?}");
+        assert_eq!(s.x[21], DATA + 32 + (n4 * 0x88) as u64, "{regs:?}");
+        assert_eq!(s.x[24], 0, "{regs:?}");
+        assert_eq!(s.nzcv, 0x6000_0000, "{regs:?}"); // subs 1 - 1 -> Z=1, C=1
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+        assert_eq!(dbt.stats().exits_interp, before.exits_interp, "{regs:?}");
+
+        // 5. Write loop with overlapping src/dst on the same page + CBNZ countdown.
+        let f5 = CODE + 0x8a0;
+        g.code(
+            f5,
+            &[
+                0xf840_842a,                      // ldr x10, [x1], #8
+                0x9100_054a,                      // add x10, x10, #1
+                0xf800_844a,                      // str x10, [x2], #8
+                0xd100_0463,                      // sub x3, x3, #1
+                cbnz_x(f5 + 16, f5, 3),           // cbnz x3, f5
+                SVC,
+            ],
+        );
+        // Copy 32 u64s from DATA+0x100 to DATA+0x108 (overlapping forward shift by 8 bytes:
+        // every element propagates the first word + iter!).
+        let init_word = g.data(0, 0x100);
+        {
+            let s = g.cpu.state_mut();
+            s.x[1] = DATA + 0x100;
+            s.x[2] = DATA + 0x108;
+            s.x[3] = 32;
+            s.nzcv = 0x9000_0000;
+        }
+        let before = dbt.stats();
+        g.run_at(&mut dbt, f5);
+        for k in 1..=32usize {
+            assert_eq!(
+                g.data(0, 0x100 + k * 8),
+                init_word.wrapping_add(k as u64),
+                "overlap iter {k} ({regs:?})"
+            );
+        }
+        // CBNZ loop does not touch NZCV at all.
+        assert_eq!(g.cpu.state().nzcv, 0x9000_0000, "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+
+        // 6. Immediate compare (cmp x4, #60; b.lo) with non-power-of-2 counter step (+3).
+        let f6 = CODE + 0x8e0;
+        g.code(
+            f6,
+            &[
+                0xf840_842a,                      // ldr x10, [x1], #8
+                0x8b0a_0000,                      // add x0, x0, x10
+                0x9100_0c84,                      // add x4, x4, #3
+                0xf100_f09f,                      // cmp x4, #60
+                b_cond(f6 + 16, f6, 3),           // b.lo f6
+                SVC,
+            ],
+        );
+        let mut exp6 = 0u64;
+        for k in 0..20usize {
+            exp6 = exp6.wrapping_add(g.data(0, 0x400 + k * 8));
+        }
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA + 0x400;
+            s.x[4] = 0;
+        }
+        let before = dbt.stats();
+        assert_eq!(g.run_at(&mut dbt, f6), exp6, "{regs:?}");
+        assert_eq!(g.cpu.state().x[4], 60, "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+    }
+}
+
+#[test]
+fn fast_loop_preserves_exact_faults_tbi_watchpoints_and_kicks() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::with_data();
+
+        // 1. Precise fault when a fast-loop write crosses from RW page 4 into RO page 5, with a
+        //    derived alias x5 that must hold the exact guest address at the faulting PC!
+        let f1 = CODE + 0x920;
+        g.code(
+            f1,
+            &[
+                0xaa02_03e5,                      // mov x5, x2
+                0xf840_842a,                      // ldr x10, [x1], #8
+                0xf900_00aa,                      // str x10, [x5]
+                0x9100_2042,                      // add x2, x2, #8
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f1 + 20, f1, 1),           // b.ne f1
+                SVC,
+            ],
+        );
+        // Start 10 u64s before end of RW page 4, try to write 16 u64s -> 10 succeed, 11th faults
+        // on RO page 5 at `str x10, [x5]` (f1 + 8).
+        let start_dst = DATA + 5 * PAGE_SIZE - 80;
+        {
+            let s = g.cpu.state_mut();
+            s.x[1] = DATA + 0x100;
+            s.x[2] = start_dst;
+            s.x[3] = 16;
+            s.x[5] = 0;
+        }
+        let before = dbt.stats();
+        assert_eq!(
+            go(&mut g, &mut dbt, f1),
+            Exit::Fault {
+                addr: DATA + 5 * PAGE_SIZE,
+                access: Access::Write,
+                kind: FaultKind::Page,
+            },
+            "{regs:?}"
+        );
+        let s = g.cpu.state();
+        assert_eq!(s.pc, f1 + 8, "{regs:?}");
+        assert_eq!(s.x[2], DATA + 5 * PAGE_SIZE, "{regs:?}");
+        assert_eq!(s.x[5], DATA + 5 * PAGE_SIZE, "alias must be guest VA ({regs:?})");
+        assert_eq!(s.x[3], 6, "{regs:?}");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+
+        // 2. Scattered host pages (DATA + 2*PAGE_SIZE -> DATA + 3*PAGE_SIZE are mapped in reverse
+        //    host order!) + TBI tag (0xab << 56) + negative offset [-8].
+        let f2 = CODE + 0x960;
+        g.code(
+            f2,
+            &[
+                0xaa02_03e5,                      // mov x5, x2
+                0xf85f_804a,                      // ldur x10, [x2, #-8]
+                0xf940_00ab,                      // ldr x11, [x5]
+                0x8b0a_0000,                      // add x0, x0, x10
+                0x8b0b_0000,                      // add x0, x0, x11
+                0x9100_2042,                      // add x2, x2, #8
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f2 + 28, f2, 1),           // b.ne f2
+                SVC,
+            ],
+        );
+        let tag = 0xab_u64 << 56;
+        let base_va = DATA + 3 * PAGE_SIZE - 64; // 8 u64s in page 2, then 8 u64s in page 3
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = tag | base_va;
+            s.x[3] = 16;
+            s.x[5] = 0;
+        }
+        let mut exp2 = 0u64;
+        for k in 0..16usize {
+            let a1 = (base_va + (k * 8) as u64 - 8) - DATA;
+            let a2 = (base_va + (k * 8) as u64) - DATA;
+            exp2 = exp2
+                .wrapping_add(g.data((a1 / 4096) as usize, (a1 % 4096) as usize))
+                .wrapping_add(g.data((a2 / 4096) as usize, (a2 % 4096) as usize));
+        }
+        assert_eq!(g.run_at(&mut dbt, f2), exp2, "{regs:?}");
+        assert_eq!(g.cpu.state().x[2], tag | (base_va + 128), "{regs:?}");
+        assert_eq!(g.cpu.state().x[5], tag | (base_va + 120), "{regs:?}");
+
+        // 3. Hardware watchpoint inside a warmed page must NOT be bypassed by the fast loop.
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = DATA + 0x200;
+            s.x[3] = 20;
+        }
+        g.run_at(&mut dbt, f2); // warm TLB for page 0
+        g.cpu.tlb_flush();
+        g.cpu
+            .state_mut()
+            .set_hw_debug(&[], &[(DATA + 0x240, DATA + 0x248, WATCH_LOAD)]);
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = DATA + 0x200;
+            s.x[3] = 20;
+        }
+        assert_eq!(
+            go(&mut g, &mut dbt, f2),
+            Exit::Fault {
+                addr: DATA + 0x240,
+                access: Access::Read,
+                kind: FaultKind::Watchpoint,
+            },
+            "{regs:?}"
+        );
+        g.cpu.state_mut().set_hw_debug(&[], &[]);
+        g.cpu.tlb_flush();
+
+        // 4. Boundary counter edge cases (cnt = 1, signed/unsigned B <= C, non-multiple B.NE,
+        //    and NZCV preservation when fast loop bails).
+        let f4 = CODE + 0x9c0;
+        g.code(
+            f4,
+            &[
+                0xf840_842a,                      // ldr x10, [x1], #8
+                0x8b0a_0000,                      // add x0, x0, x10
+                0xeb01_00df,                      // cmp x6, x1
+                b_cond(f4 + 12, f4, 1),           // b.ne f4
+                SVC,
+            ],
+        );
+        // Single iteration (diff == 8 -> rem_backedges == 0 -> bails cleanly to slow loop).
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA + 0x100;
+            s.x[6] = DATA + 0x108;
+        }
+        assert_eq!(g.run_at(&mut dbt, f4), g.data(0, 0x100), "{regs:?}");
+
+        // 64-bit signed compare with INT64_MIN / negative counters (`cmp x6, x4; b.gt`).
+        let f5 = CODE + 0x9e0;
+        g.code(
+            f5,
+            &[
+                0xf840_842a,                      // ldr x10, [x1], #8
+                0x8b0a_0000,                      // add x0, x0, x10
+                0x9100_0484,                      // add x4, x4, #1
+                0xeb04_00df,                      // cmp x6, x4
+                b_cond(f5 + 16, f5, 12),          // b.gt f5
+                SVC,
+            ],
+        );
+        // x4 = 10, x6 = -1 (signed B < C -> 1 iteration only, must not enter fast loop).
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA + 0x100;
+            s.x[4] = 10;
+            s.x[6] = u64::MAX;
+        }
+        assert_eq!(g.run_at(&mut dbt, f5), g.data(0, 0x100), "{regs:?}");
+        assert_eq!(g.cpu.state().x[4], 11, "{regs:?}");
+        // x4 = -3, x6 = 5 (signed B > C crossing 0 -> 8 iterations).
+        let mut exp5 = 0u64;
+        for k in 0..8usize {
+            exp5 = exp5.wrapping_add(g.data(0, 0x100 + k * 8));
+        }
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[1] = DATA + 0x100;
+            s.x[4] = (-3i64) as u64;
+            s.x[6] = 5;
+        }
+        assert_eq!(g.run_at(&mut dbt, f5), exp5, "{regs:?}");
+        assert_eq!(g.cpu.state().x[4], 5, "{regs:?}");
+
+        // 5. Kick responsiveness: a long-running fast loop exits with Exit::Kick promptly.
+        let f6 = CODE + 0xa20;
+        g.code(
+            f6,
+            &[
+                0xf940_002a,                      // ldr x10, [x1]   (stride 0)
+                0xf840_844b,                      // ldr x11, [x2], #8 (would cross if unbounded, reset via sub)
+                0xd100_2042,                      // sub x2, x2, #8  -- net stride 0
+                SVC,
+            ],
+        );
+        // Use a real strided loop over page 0 (500 iters) with kick set before entry & from thread.
+        let _ = f6;
+        let f_kick = CODE + 0xa40;
+        g.code(
+            f_kick,
+            &[
+                0xf940_002a,                      // ldr x10, [x1]
+                0xf940_004b,                      // ldr x11, [x2]
+                0x9100_0442,                      // add x2, x2, #1
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f_kick + 16, f_kick, 1),   // b.ne f_kick
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[1] = DATA;
+            s.x[2] = DATA;
+            s.x[3] = 3000;
+        }
+        let kicker = g.cpu.kicker();
+        unsafe { kicker.kick() };
+        assert_eq!(go(&mut g, &mut dbt, f_kick), Exit::Kick, "{regs:?}");
+    }
+}
+
+#[test]
+fn fast_loop_rejects_unsafe_patterns() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::with_data();
+
+        // 1. Pointer opacity violation: storing an induction pointer's numeric value to memory.
+        let f1 = CODE + 0xa80;
+        g.code(
+            f1,
+            &[
+                0xf940_004a,                      // ldr x10, [x2]  (x2 is an induction pointer)
+                0xf900_0082,                      // str x2, [x4]   (stores x2's address value!)
+                0x9100_2042,                      // add x2, x2, #8
+                0x9100_2084,                      // add x4, x4, #8
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f1 + 20, f1, 1),           // b.ne f1
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[2] = DATA + 0x100;
+            s.x[4] = DATA + 0x200;
+            s.x[3] = 8;
+        }
+        let before = dbt.stats().fast_loops;
+        g.run_at(&mut dbt, f1);
+        assert_eq!(dbt.stats().fast_loops, before, "pointer store must not fast-loop ({regs:?})");
+        assert_eq!(g.data(0, 0x200), DATA + 0x100, "{regs:?}");
+        assert_eq!(g.data(0, 0x208), DATA + 0x108, "{regs:?}");
+
+        // 2. Read-before-write cross-iteration alias: `add x0, x0, x5` before `mov x5, x2`.
+        let f2 = CODE + 0xac0;
+        g.code(
+            f2,
+            &[
+                0x8b05_0000,                      // add x0, x0, x5
+                0xaa02_03e5,                      // mov x5, x2
+                0xf940_00aa,                      // ldr x10, [x5]
+                0x9100_2042,                      // add x2, x2, #8
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f2 + 20, f2, 1),           // b.ne f2
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = DATA + 0x100;
+            s.x[5] = 7;
+            s.x[3] = 4;
+        }
+        let before = dbt.stats().fast_loops;
+        let expected = 7 + (DATA + 0x100) + (DATA + 0x108) + (DATA + 0x110);
+        assert_eq!(g.run_at(&mut dbt, f2), expected, "{regs:?}");
+        assert_eq!(dbt.stats().fast_loops, before, "RBW alias must not fast-loop ({regs:?})");
+
+        // 3. Atomic load inside loop must be rejected.
+        let f3 = CODE + 0xb00;
+        g.code(
+            f3,
+            &[
+                0xc8df_fc4a,                      // ldar x10, [x2]
+                0x9100_2042,                      // add x2, x2, #8
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f3 + 12, f3, 1),           // b.ne f3
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[2] = DATA + 0x100;
+            s.x[3] = 4;
+        }
+        let before = dbt.stats().fast_loops;
+        g.run_at(&mut dbt, f3);
+        assert_eq!(dbt.stats().fast_loops, before, "atomic loop must not fast-loop ({regs:?})");
+
+        // 4. SP-based loop must be rejected.
+        let f4 = CODE + 0xb40;
+        g.code(
+            f4,
+            &[
+                0xf841_07ea,                      // ldr x10, [sp], #16
+                0x8b0a_0000,                      // add x0, x0, x10
+                0xf100_0463,                      // subs x3, x3, #1
+                b_cond(f4 + 12, f4, 1),           // b.ne f4
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.sp = STACK - 128;
+            s.x[3] = 4;
+        }
+        let before = dbt.stats().fast_loops;
+        g.run_at(&mut dbt, f4);
+        assert_eq!(dbt.stats().fast_loops, before, "SP loop must not fast-loop ({regs:?})");
+        g.cpu.state_mut().sp = STACK;
+    }
+}
+
+fn b_cond(from: u64, to: u64, cond: u32) -> u32 {
+    0x5400_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5) | (cond & 15)
+}
+
+fn cbnz_x(from: u64, to: u64, rt: u32) -> u32 {
+    0xb500_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5) | (rt & 31)
+}
+
 fn bl(from: u64, to: u64) -> u32 {
     0x9400_0000 | (((to as i64 - from as i64) / 4) as u32 & 0x3ff_ffff)
 }

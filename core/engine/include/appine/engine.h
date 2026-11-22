@@ -332,6 +332,7 @@ struct appine_dbt_stats {
     uint64_t blocks_shared; /* blocks among blocks obtained by copying a translation template */
     uint64_t insns_grouped; /* of insns_memory, those sharing one TLB check with an earlier one */
     uint64_t ungrouped;     /* times a shared check failed and it was retranslated ungrouped */
+    uint64_t fast_loops;    /* blocks compiled with a strip-mined in-page fast loop */
 };
 
 /*

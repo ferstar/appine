@@ -1222,6 +1222,7 @@ fn add_stats(total: &mut DbtStats, s: &DbtStats) {
     total.blocks_shared += s.blocks_shared;
     total.insns_grouped += s.insns_grouped;
     total.ungrouped += s.ungrouped;
+    total.fast_loops += s.fast_loops;
 }
 
 /// The thread leaves its address space (exit, execve): processes the robust futex list, zeroes

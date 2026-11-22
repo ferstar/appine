@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-21 (split out of the engine full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: verbatim YIELD, budget-bounded 256-insn blocks, 8 group slots, affine alias tracking, and stolen-base and M_REG grouping)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: strip-mined in-page fast loops for single-block constant-stride self-loops and DbtStats::fast_loops)
 
 ## Responsibilities
 
@@ -13,8 +13,9 @@
 
 - translating guest basic blocks into a shared W^X code cache: most ALU, FP, NEON and barrier
   instructions are copied verbatim (renaming stolen registers), memory accesses get inline
-  soft-TLB checks with grouped same-base checks and a shared out-of-line refill routine, and
-  blocks are linked directly or through jump caches and a shadow return stack;
+  soft-TLB checks with grouped same-base checks and a shared out-of-line refill routine, canonical
+  constant-stride self-loops get guarded strip-mined in-page native fast loops, and blocks are
+  linked directly or through jump caches and a shadow return stack;
 - executing translated code under `engine`'s host fault guard, handling length-gated libc memops,
   re-entering Tier 0 for any instruction Tier 1 does not translate, and keeping exceptions precise;
 - lock-free translation-table lookups, content-based invalidation and forwarding stubs, the
@@ -175,6 +176,23 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
   requests a full flush if a retirement cannot be placed) and stops grouping for leaders in the
   following 256 bytes (64-entry ring; templates are versioned by it). Failures while watchpoints
   are set are not counted.
+- Strip-mined in-page fast loops: for non-memop blocks whose prefix `0..back_idx` is a single-block
+  constant-stride self-loop (no internal branches, calls, syscalls, atomics, SP bases, `M_REG`,
+  `M_LITERAL`, NZCV-reading/extra flag-writing ops, or >2 distinct stolen GPRs per instruction) with
+  a countdown (`SUBS`/`SUB` + `B.NE`/`B.HI`/`B.GT`/`B.GE`/`B.PL`/`CBNZ`) or incrementing compare
+  (`CMP` reg/imm + `B.NE`/`B.GT`/`B.LT`/`B.GE`/`B.LE`/`B.HI`/`B.LO`/`B.HS`/`B.LS`) exit and up to
+  7 pointer-opaque induction pointers (at least one positive stride, plus any live end-of-iteration
+  derived affine aliases not read before write), `prepare` emits a guarded native fast loop right
+  after the 2-word entry kick check. The NZCV-free prologue checks `nwatch == 0`, computes a
+  conservative lower bound on remaining back-edges clamped to `KICK_BUDGET` (`32..256`), probes
+  each pointer's TLB entry (saving addends in `dbt_groups[0..6]` and `safe_iters` in
+  `dbt_groups[7]`) before verifying 4 KiB page bounds, and bails straight to the standard checked
+  loop if `safe_iters < 2` or any probe misses. On entry it adds each addend to its induction
+  pointer (in host reg or `cpu->x`), runs the native body for `safe_iters` iterations counted in
+  `T2` (omitting `CMP` / converting `SUBS` to `SUB`), subtracts each addend from the root pointer
+  and its live aliases, and falls through to the standard checked loop for at least one
+  final/boundary iteration so exit NZCV, page crossings and faults remain exact. Matched blocks
+  increment `DbtStats::fast_loops` (preserved in templates).
 
 ### Control flow
 

@@ -1,6 +1,6 @@
 # Optimizing CPU Performance for `llama.cpp`
 
-> Handoff / future-work design note (Step 0 profiling and Step 1 implemented 2026-11-22; Step 2+ pending).
+> Handoff / future-work design note (Step 0 profiling, Step 1, and Step 2 Phase 2A implemented 2026-11-22; Phase 2B and Step 3 pending).
 > Grounded in `core/engine/src/c/dbt.c`, `core/engine/include/appine/engine.h`,
 > `core/engine/src/c/features.c`, `core/engine/src/c/mmu.c`, `core/kernel/src/mm.rs`,
 > `core/kernel/src/syscall/mem.rs`, `core/kernel/src/syscall/fast.rs`,
@@ -448,10 +448,30 @@ handful of strided NEON compute loops (`ggml_vec_dot_*`, `ggml_gemm_*`, `rms_nor
      grouping gaps inside compute-bound loops delivers modest (+1–4%) gains, and breaking past the
      remaining 1.2–1.6× gap requires **Step 2 (Direction 4: strip-mined in-page fast loops)**.
 3. **Step 2 — High-ceiling core optimization: Direction 4 (strip-mined fast loops)**
-   - Promoted ahead of Direction 3A based on Step 0: `ggml_vec_dot_f16` (72.1% F16 decode),
-     `ggml_gemv_q4_0_4x4_q8_0` (39.7% Q4_0 decode), `ggml_gemv_q8_0_4x4_q8_0` (21.9% Q4_0 decode),
-     `flash_attn_ext_tiled` (28.7% Q4_0 prefill), and `tinyBLAS::gemm_bloc` (78.0% F16 prefill)
-     cannot be fully accelerated by `plan_group` alone, and all are constant-stride self-loops.
+   - **Phase 2A (completed 2026-11-22)**: Implemented single-block constant-stride self-loop
+     recognition (`analyze_fast_loop` / `emit_fast_loop` in `core/engine/src/c/dbt.c`), covering
+     countdown loops (`SUBS`/`SUB` + `B.NE`/`B.HI`/`B.GT`/`B.GE`/`B.PL`/`CBNZ`) and incrementing
+     compare loops (`CMP` reg/imm + `B.NE`/`B.GT`/`B.LT`/`B.GE`/`B.LE`/`B.HI`/`B.LO`/`B.HS`/`B.LS`),
+     up to 7 induction pointers (including stolen-register bases, negative offsets, non-power-of-2
+     strides, and live end-of-iteration affine aliases restored on exit), probing TLB before page
+     division, preserving exact NZCV/TBI/watchpoints/faults/kick latency (`KICK_BUDGET` 32–256),
+     and recording `fast_loops` in `DbtStats`/templates/`appine-run --stats`. All 4 target kernels
+     (`ggml_vec_dot_f16`, `ggml_gemv_q4_0_4x4_q8_0`, `ggml_gemv_q8_0_4x4_q8_0`,
+     `ggml_gemm_q4_0_4x4_q8_0`) match (56 fast loops on Q4_0, 46 on F16).
+   - **Same-session alternating A/B results vs. Step 1** (2 rounds × `-r 3`, `appine-run --tier 1`
+     on `/bench/store`):
+     - Qwen2.5-0.5B Q4_0 `tg128 -t 1`: `88.56 → 101.41 t/s` (**+14.5%**, now **1.09×** native
+       vs. 1.34× in Step 0); `tg128 -t 4`: `209.10 → 212.19 t/s` (**+1.5%**, **1.06×** native);
+       `pp128 -t 4`: `893.3 → 905.3 t/s` (**+1.3%**); `pp512 -t 4`: `743.3 → 759.3 t/s`
+       (**+2.2%**); `pp512 -t 1`: `202.3 → 204.8 t/s` (**+1.2%**).
+     - Qwen2.5-0.5B F16 `tg32 -t 1`: `29.57 → 35.31 t/s` (**+19.4%**); `tg32 -t 4` (1.17 GiB,
+       bandwidth-bound): `83.50 → 87.21 t/s` (**+4.4%**, now **1.05×** native).
+     - **Non-ML regression**: `appine-bench` Tier 1 geomean `1.69×` (vs. `1.70×` in Step 1);
+       200,000-iteration `appine-lockstep` passed under both `Default` and `Go` register sets.
+   - **Phase 2B (pending)**: Extend strip-mined fast loops to `M_REG` indexed strides, stolen-base
+     `M_REG`, and 2-block loops crossing a 4 KiB code page boundary to cover
+     `ggml_compute_forward_flash_attn_ext_tiled` (28.7% Q4_0 prefill) and `tinyBLAS::gemm_bloc`
+     (78.0% F16 prefill).
 4. **Step 3 — Deferred / optional secondary work**
    - **Direction 3B** (unlocked `madvise` forwarding + widened read-only file `fault_in`): small
      independent change for cold-start TTFT on flash storage; can land anytime.

@@ -355,4 +355,5 @@ fn print_stats(s: &DbtStats) {
     eprintln!("  code cache flushes  {:>12}", s.flushes);
     eprintln!("  blocks invalidated  {:>12}", s.invalidated);
     eprintln!("  groups undone       {:>12}", s.ungrouped);
+    eprintln!("  fast loops          {:>12}", s.fast_loops);
 }
