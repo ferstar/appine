@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: add strace, gdb and stat-delta deep probes for stuck R-state threads in full.yml's sy-sample sampler)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: remove temporary strace/gdb and sy-sample.log diagnostic probes from full.yml's difftest shards)
 
 ## Responsibilities
 
@@ -127,13 +127,11 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   - `difftest` (`needs: [changed, build]`, `fail-fast: false`): five independent single-lane
     shards (`gvisor-process`, `gvisor`, `starnix`, `core-1`, `core-2`) that partition
     `tests/diff/*.sh` deterministically without installing Rust. Each shard downloads and
-    `chmod +x`s `appine-run`, installs `strace` and `gdb`, restores `target/rootfs` and (if
-    needed) its suite cache with the builder script as fallback, opens `ping_group_range`, runs
-    `scripts/difftest -R` on its slice with 10 s `vmstat` and 30 s sampling (`target/sy-sample.log`,
-    which also runs up to two `stat`-delta, `strace` and `gdb` deep probes when the same
-    `(pid, tid, comm)` stays `R` across consecutive samples), and uploads
-    `difftest-<shard>-attempt-<run_attempt>` (`*.appine.err`, `failed/`, `vmstat.log`,
-    `sy-sample.log`) on `always()`.
+    `chmod +x`s `appine-run`, restores `target/rootfs` and (if needed) its suite cache with the
+    builder script as fallback, opens `ping_group_range`, runs `scripts/difftest -R` on its slice
+    with 10 s `vmstat` logging (`target/vmstat.log`), and uploads
+    `difftest-<shard>-attempt-<run_attempt>` (`*.appine.err`, `failed/`, `vmstat.log`) on
+    `always()`.
   No workflow sets a timeout, and `full.yml` has no concurrency group.
 - Not in CI: LTP, the survey, instrumentation tests (no KVM), Tier 0 difftest, parallel lanes,
   the performance probe (`appine-bench`).
