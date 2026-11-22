@@ -4,6 +4,8 @@
 > See `.agents/decisions/engine/dbt.md` for the paired decision history (not yet created; decisions from before the split are D6–D10, D13–D16, D18, D23, D25, D27–D29, and the Tier 1 halves of D2, D5, D17, D20, D22 and D24 in `.agents/decisions/engine.md`).
 >
 > Verified: 2026-11-21 (split out of the engine full mapping of 2026-11-03; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: in-cache same-page memop fast paths, memchr/strncmp budget handling, and 4-bit routine relocations)
 
 ## Responsibilities
 
@@ -196,8 +198,10 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
   lock, revive parked blocks of that page if any, otherwise translate and install, then enter.
 - Exit reasons: chain (patch the link point), lookup (fill the jump cache), ungroup (record the group
   failure, then run Tier 0), interp (for a pure `R_INTERP` exit at a registered memop PC on a shared
-  or ungrouped block, run `exec_memop`: pre-validating guest pages with TBI untagged, capping at
-  64 MB, skipping on watchpoints or missing permissions, popping the shadow return stack when its
+  or ungrouped block, run `exec_memop`: pre-validating guest pages with TBI untagged, capping
+  mutating/fixed-length ops at 64 MB while scanning `memchr`/`strncmp` up to a 64 MB budget even
+  for `SIZE_MAX`, skipping on watchpoints or missing permissions, warming the data TLB for untagged
+  addresses so subsequent same-page calls stay in-cache, popping the shadow return stack when its
   top matches `x30`, and returning to `x30`; otherwise run one instruction in Tier 0, then
   invalidate any recorded `ivau_page` in place), code (invalidate the pending page after a
   translated DSB/ISB, then look up the next PC), svc (clear the monitor, return `Svc`), kick (loop).
@@ -241,12 +245,17 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
 ### Sharing translations
 
 - A block's translation depends only on its guest pc, its guest instruction words, the register set
-  and whether it is shared (except blocks at registered memop PCs, which emit a 2-instruction
-  `x2 >= 128` threshold exit to `R_INTERP` preserving NZCV, bypass both `template_fetch` and
-  `template_store`, are retired on `set_memops` changes and before pooling in `appine_dbt_free`, and
-  are ignored for private tagged blocks in a code group); the words are saved and re-compared at
-  install, recheck, revive and content-based invalidation. Installation also compares the memop
-  registration captured during preparation with the current registration under the DBT lock.
+  and whether it is shared (except blocks at registered memop PCs, which dispatch same-page calls to
+  in-cache helpers at the head of the code cache — `memset` and overlap-safe `memcpy`/`memmove` for
+  `x2 >= 32`, 8-byte `memcmp` for `x2 >= 8`, and first-page SWAR `memchr` for `x2 >= 1` — preserving
+  non-return guest registers and NZCV and returning through a shared predicted-return tail, falling
+  back on cross-page spans, TLB misses or watchpoints to an `x2 >= 128` `R_INTERP` exit or guest
+  code, while `strncmp` uses the `x2 >= 128` gate directly; all memop blocks bypass both
+  `template_fetch` and `template_store`, are retired on `set_memops` changes and before pooling in
+  `appine_dbt_free`, and are ignored for private tagged blocks in a code group); the words are saved
+  and re-compared at install, recheck, revive and content-based invalidation. Installation also
+  compares the memop registration captured during preparation with the current registration under
+  the DBT lock.
 - Threads of one address space share one instance; each has its own jump cache, return stack,
   statistics and workspace.
 - Code groups (engine side): members share one instance. Blocks in ranges registered with `share`
@@ -319,7 +328,7 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
   fallback), not from host signals: a host fault in translated code is never mapped back to guest
   state.
 - While translated code runs, `struct appine_cpu` does not hold the guest's registers (routines
-  also borrow its X0–X4 slots); it is consistent only after an exit.
+  also borrow its X0–X9 slots); it is consistent only after an exit.
 - Fields before the TLB in `struct appine_cpu` (`engine`) must stay within immediate reach of
   Tier 1 loads, and the TLB must stay 16-byte aligned.
 - Tier 1's refill fails while any watchpoint is set, so all watched accesses run in Tier 0;

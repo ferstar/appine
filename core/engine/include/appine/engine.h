@@ -388,9 +388,11 @@ struct appine_dbt_source {
 void appine_dbt_set_sources(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
 
 /*
- * Known libc memory primitives whose large operations (n >= 128 B in guest X2) Tier 1 accelerates
- * with a page-validated host libc call. Small operations stay inline in translated code, and any
- * watchpoint or missing page permission falls back to guest execution.
+ * Known libc memory primitives accelerated by Tier 1: same-page calls use in-cache helpers with
+ * inline TLB checks (n >= 32 B for memset/memcpy/memmove, n >= 8 B for memcmp, first page for
+ * memchr), while cross-page or cold-TLB large calls (n >= 128 B in guest X2) fall back to a
+ * page-validated host libc call. Tiny operations stay inline in translated guest code, and any
+ * watchpoint or missing page permission falls back to guest execution with precise faults.
  */
 enum appine_memop_kind {
     APPINE_MEMOP_NONE = 0,
