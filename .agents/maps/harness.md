@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: add 30 s host thread/stack sampling to full.yml's difftest artifact)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: split full.yml into build, parallel checks and five sharded difftest jobs)
 
 ## Responsibilities
 
@@ -115,17 +115,24 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   API level 30, `assembleDebug lintDebug`, the APK as an artifact. Both quick workflows cancel a
   run in progress when the same branch is pushed again.
 - `full.yml`, nightly at 18:00 UTC on develop when its tip was committed in the last 25 hours, on
-  pushes to master and on demand: the network test, a lockstep run of 200,000 iterations,
-  `scripts/build-starnix-tests` (its tarball cached by the hash of the script and
-  `tests/starnix/compat`) and `scripts/build-gvisor-tests` (cached by the hash of the script,
-  `tests/gvisor` and its program list), both caches restored and saved in steps of their own so
-  that a build is saved even when a later step fails, a release build of `appine-run`,
-  `scripts/difftest -R` at Tier 1 with one lane (`ping_group_range` opened, `vmstat` sampling the
-  runner every 10 s and a 30 s host-thread/stack sampler writing `target/sy-sample.log` while
-  `appine-run` runs, `target/difftest` deleted before and after, so every run imports the store and
-  installs its packages again; every case's `.appine.err`, the failed cases' outputs and the
-  samples uploaded as the `difftest` artifact whatever the result), and the engine tests built
-  with clang. No workflow sets a timeout, and `full.yml` has no concurrency group.
+  pushes to master and on demand, splits its work after the `changed` gate into three parallel
+  paths on `ubuntu-24.04-arm`:
+  - `build`: restores/builds/saves `scripts/build-starnix-tests` (keyed on the script and
+    `tests/starnix/compat`) and `scripts/build-gvisor-tests` (keyed on the script, `tests/gvisor`
+    and its program list) in separate restore/save steps so misses persist even if a later step
+    fails, exports both cache keys, builds release `appine-run`, and uploads it as the
+    `appine-run` artifact (`retention-days: 7`, `overwrite: true`).
+  - `checks`: runs in parallel with `build` and `difftest` — the network test, a 200,000-iteration
+    lockstep run, and the engine/lockstep tests built with clang.
+  - `difftest` (`needs: [changed, build]`, `fail-fast: false`): five independent single-lane
+    shards (`gvisor-process`, `gvisor`, `starnix`, `core-1`, `core-2`) that partition
+    `tests/diff/*.sh` deterministically without installing Rust. Each shard downloads and
+    `chmod +x`s `appine-run`, restores `target/rootfs` and (if needed) its suite cache with the
+    builder script as fallback, opens `ping_group_range`, runs `scripts/difftest -R` on its slice
+    with 10 s `vmstat` and 30 s host-thread/stack sampling (`target/sy-sample.log`), and uploads
+    `difftest-<shard>-attempt-<run_attempt>` (`*.appine.err`, `failed/`, `vmstat.log`,
+    `sy-sample.log`) on `always()`.
+  No workflow sets a timeout, and `full.yml` has no concurrency group.
 - Not in CI: LTP, the survey, instrumentation tests (no KVM), Tier 0 difftest, parallel lanes,
   the performance probe (`appine-bench`).
 
@@ -159,9 +166,10 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   guest `timeout`; only killing `appine-run` ends it.
 - GitHub runs scheduled workflows only from the default branch (master): the nightly `full.yml`
   uses master's copy of the workflow while checking out develop.
-- `full.yml` must build release `appine-run` itself before the differential tests: no other step
-  there makes it (cargo test builds debug, lockstep builds only `appine-lockstep`), and difftest
-  never builds one.
+- `full.yml`'s `build` job must build release `appine-run` and pass it to the `difftest` shards
+  via artifact (`chmod +x` after download, since `actions/download-artifact` strips execute bits):
+  no other job builds it (`checks` builds debug tests and `appine-lockstep`), and difftest never
+  builds one.
 - CI's clang step relies on the runner image's clang; CI installs only llvm and musl-tools.
 - `Swatinem/rust-cache@v2` caches all of `target/` and cleans non-Cargo files before saving, which can leave empty subdirectories behind; fetched asset trees under `target/` need their own `actions/cache` step after `rust-cache` and sentinel-file checks rather than bare directory-existence checks.
 
