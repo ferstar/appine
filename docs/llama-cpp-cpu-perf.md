@@ -1,6 +1,6 @@
 # Optimizing CPU Performance for `llama.cpp`
 
-> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, Phase 2B-1, and Post-2B-1 profiling completed 2026-11-22; Direction 3A superpages/2 MiB fast-loop span, Phase 2B-2, and Direction 3B pending).
+> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, Phase 2B-1, Post-2B-1 profiling, and Direction 3A completed 2026-11-22–23; Phase 2B-2 and Direction 3B pending).
 > Grounded in `core/engine/src/c/dbt.c`, `core/engine/include/appine/engine.h`,
 > `core/engine/src/c/features.c`, `core/engine/src/c/mmu.c`, `core/kernel/src/mm.rs`,
 > `core/kernel/src/syscall/mem.rs`, `core/kernel/src/syscall/fast.rs`,
@@ -516,16 +516,24 @@ handful of strided NEON compute loops (`ggml_vec_dot_*`, `ggml_gemm_*`, `rms_nor
        `refill[1]` overhead.
      - Cross-4 KiB-code-page 2-block loop support for `gemm_bloc<4, 6>` (`0x9dff0..0x9e104`;
        `gemm_bloc<4, 5>` at `0x9e600..0x9e6f0` is single-page).
-4. **Step 3 — Re-prioritized superpages & secondary work**
-   - **Direction 3A (re-prioritized ahead of / alongside Phase 2B-2 based on Post-2B-1 profiling)**
-     (L2 2 MiB superpages + fast-loop 2 MiB `safe_iters` + sequential TLB prefill):
-     - No longer decode-only: Post-2B-1 profiling shows raising fast-loop `safe_iters` from 4 KiB
-       to 2 MiB directly attacks **~75–80% of the remaining Q4_0 prefill gap** (eliminating 4×
-       per-call 256 B-stride page-crossing prologue exits in `flash_attn` `0x6f5a0`/`0x6f260`/
-       `0x6f1a0` and 30.2% off-fast-body time in 5-pointer `ggml_gemm_q4_0_4x4_q8_0`), cuts
-       decode's #1 remaining Appine overhead (`emit_refill`, 21–24% of decode gap, larger on
-       1.5B–7B models), and also gives Phase 2B-2's 10-row `gemm_bloc` loops a 2 MiB runway.
-   - **Direction 3B** (unlocked `madvise` forwarding + widened read-only file `fault_in`): small
+4. **Step 3 — Superpages & secondary work**
+   - **Direction 3A (completed 2026-11-23 — L2 2 MiB superpages, 2 MiB fast-loop span, sequential TLB prefill, and bulk `exec_memop`)**:
+     - `kernel/mmu` (`core/engine/src/c/mmu.c`, `internal.h`, `cpu.c`, `engine.h`, `lib.rs`):
+       - Tagged L2 2 MiB leaf entries (`PTE_SUPER` = bit 3; table pointers guaranteed ≥16-byte aligned; host base only needs 4 KiB alignment), created automatically in `store_range` for aligned 2 MiB spans (and promoting all-zero L3 tables left behind by earlier small unmaps, keeping up to 256 retired L3 tables alive until `appine_mmu_free` for lock-free walker safety).
+       - Transparent lock-free demotion (`demote_l2`) on partial `unmap`/`protect`/`map`/`move`, and whole-2 MiB fast paths for aligned `unmap`/`protect`/`move`.
+       - Per-CPU 1024-entry direct-mapped 2 MiB superpage TLB (`cpu->stlb`, 2 GiB coverage, 4 KiB-aligned, tracked via `stlb_used[16]` so unused pages take 0 RSS), populated in `appine_tlb_fill` and `emit_fill` when `nwatch == 0` and flushed alongside `tlb`.
+     - `kernel/mm` (`core/kernel/src/mm.rs`):
+       - `Mm::find_free` 2 MiB-aligns mappings of length `>= LEAF_SPAN` (2 MiB) when VA space permits (falling back to 4 KiB alignment if fragmented), preventing unaligned VMA heads (notably `ggml`'s 2.52 MiB `work_data` buffer) from falling into 4 KiB L3 tables.
+     - `engine/dbt` (`core/engine/src/c/dbt.c`):
+       - `emit_fill` stops at L2 on `PTE_SUPER`, populates `cpu->stlb`, and when the preceding 4 KiB TLB slot holds `(vpn - 1)` with the same addend, batch-prefills up to 8 contiguous 4 KiB slots inside the same 64-entry `tlb_used` word (single `tlb_used` RMW). Ordinary inline 4 KiB TLB hit path is completely untouched.
+       - `emit_fast_loop` probes `cpu->stlb` first for a 2 MiB `avail` runway (falling back to the 4 KiB `cpu->tlb` for non-superpage ranges), adds a `MUL` fast path for register strides (`(safe_iters - 1) * sr <= avail`, eliminating `UDIV` on the ~99% non-boundary case), and widens non-power-of-2 constant-stride reciprocal division to 34-bit shift (exact for `avail < 2 MiB`, `stride <= 4095`).
+       - `memop_check_range` / `exec_memop` check and copy/scan in up to 2 MiB superpage spans.
+     - **Same-session alternating A/B results vs. Phase 2B-1** (2 rounds × `-r 3`, `appine-run --tier 1` on `/bench/store`, `-p 128,512 -n 128` for Q4_0 and `-p 128 -n 32` / `-p 0 -n 32` for F16):
+       - Qwen2.5-0.5B Q4_0 `pp512 -t 1`: `230.70 → 259.52 t/s` (**+12.5%**, now **1.10×** native vs. 1.51× in Step 0); `pp512 -t 4`: `876.84 → 978.24 t/s` (**+11.6%**, now **1.05×** native vs. 1.45× in Step 0); `tg128 -t 1`: `97.94 → 101.63 t/s` (**+3.8%**, now **1.08×** native); `tg128 -t 4`: `201.65 → 207.10 t/s` (**+2.7%**, peak `213.14 t/s` = **1.06×** native).
+       - Qwen2.5-0.5B Q4_0 `pp128`: flat (`-t 1`: `284.43 → 286.17`, `-t 4`: `985.63 → 980.51`; `pp128`'s `work_data` is `< 2 MiB` so it uses the 4 KiB fallback).
+       - Qwen2.5-0.5B F16 `tg32 -t 4`: `81.06 → 86.45 t/s` (now **1.05×** native); `tg32 -t 1`: `35.04 → 35.29 t/s` (up to `35.90 t/s`); `pp128 -t 4`: flat (`240.28 → 238.45 t/s`, still waiting on Phase 2B-2 for `tinyBLAS::gemm_bloc`).
+       - **Verification & non-ML regression**: `appine-engine` 82/82 (including new L2 superpage/demotion/promotion and Tier 1 superpage/prefill/fast-loop/memop tests), `appine-kernel` `mm::tests` 46/46, `guest_programs` 26/26, `rootfs_programs` 73/73, 200k-iteration `appine-lockstep` under both `Default` and `Go` (0 mismatches), `appine-bench` Tier 1 geomean **1.69×** (unchanged vs. Phase 2B-1), `python3`/`gcc`/`gobuild` noise-identical.
+   - **Direction 3B (pending)** (unlocked `madvise` forwarding + widened read-only file `fault_in`): small
      independent change for cold-start TTFT on flash storage; can land anytime.
 5. **Verification & non-regression gates**
    - Unit/integration tests in `core/engine/tests/dbt.rs` (block length boundary, 5–8 interleaved

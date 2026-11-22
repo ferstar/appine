@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-21 (split out of the engine full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: extended strip-mined fast loops with multi-stream M_REG, register strides, write-before-read NZCV and loop-wide stolen-register pinning)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: L2 2 MiB superpage refill with sequential 4 KiB batch prefill, 2 MiB fast-loop STLB probe with MUL register-stride fast path, and bulk superpage exec_memop spans)
 
 ## Responsibilities
 
@@ -147,13 +147,16 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
 - SP alignment is checked once per block and not again while SP only changes by multiples of 16.
 - A miss branches to a per-access 5-word refill stub (`adr`, branch to the routine, an info word
   with size, failure reason and resume offset, and the guest pc), then to a shared refill routine in
-  the code cache. The routine borrows the CPU state's X0–X4 slots as scratch, fails whenever any
+  the code cache. The routine borrows the CPU state's X0–X5 slots as scratch, fails whenever any
   watchpoint is set or either endpoint exceeds 48 bits after ignoring its top byte. The page-table
-  walk uses plain loads and low address bits. The TLB tag and addend use the full guest page base,
-  so another access with the same top byte can hit inline. Atomics untag their effective address
-  before lookup. Filling a write entry requires read and write permission because grouped accesses
-  and atomics can also read. The refill records the slot in `tlb_used` and resumes. A cross-page
-  access succeeds only if both pages are permitted and have the same addend (contiguous host memory).
+  walk uses plain loads and low address bits; when an L2 entry carries `PTE_SUPER`, it skips L3,
+  populates the 2 MB `stlb` slot (`stlb_used`), and if the preceding 4 KB TLB slot holds `(vpn - 1)`
+  with the same addend, batch-prefills up to 8 contiguous 4 KB slots within the same 64-entry
+  `tlb_used` word. The TLB and STLB tags and addends use the full guest page base, so another access
+  with the same top byte can hit inline. Atomics untag their effective address before lookup.
+  Filling a write entry requires read and write permission because grouped accesses and atomics can
+  also read. The refill records filled slots in `tlb_used` and resumes. A cross-page access succeeds
+  only if both pages are permitted and have the same addend (contiguous host memory).
 - On failure the stub exits to the dispatcher and Tier 0 executes the instruction. Nothing guest
   visible has happened before the exit, so exceptions are precise.
 - Grouped checks: several accesses in a block with the same or affine-aliased base share one check.
@@ -188,10 +191,13 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
   strides (`ADD Xd, Xd, Xm` after the accesses to that base), `prepare` emits a guarded native fast loop right
   after the 2-word entry kick check. The NZCV-free prologue checks `nwatch == 0`, computes a
   conservative lower bound on remaining back-edges clamped to `KICK_BUDGET` (`32..256`), probes
-  each stream's TLB entry before checking 4 KiB page bounds (saving each root's addend in
-  `dbt_groups[0..6]`, verifying equal addends for additional streams on the same root, dividing
-  register strides via `UDIV`, and tracking `safe_iters` in `dbt_groups[7]`), and bails straight
-  to the standard checked loop if `safe_iters < 2`, any probe misses, or a stride fails. On entry
+  each stream's 2 MB `stlb` entry first (falling back to the 4 KB `tlb` for non-superpage ranges)
+  before checking 2 MB or 4 KB span bounds (saving each root's addend in `dbt_groups[0..6]`,
+  verifying equal addends for additional streams on the same root, checking register strides against
+  `(safe_iters - 1) * sr <= avail` via `MUL` before falling back to `UDIV` on boundary crossings,
+  using 34-bit reciprocal multiplication for non-power-of-2 constant strides, and tracking
+  `safe_iters` in `dbt_groups[7]`), and bails straight to the standard checked loop if
+  `safe_iters < 2`, both probes miss, or a stride fails. On entry
   it adds each addend to its root pointer (pinning up to 2 loop-wide stolen GPRs in `T0`/`T1` to
   avoid per-iteration `CTX` traffic), runs the native body for `safe_iters` iterations counted in
   `T2` (omitting the loop-closing `CMP` while allowing loop-local write-before-read NZCV ops such
@@ -233,11 +239,12 @@ table, TLB layout and code-group policy (`kernel/mmu`); tier selection and the g
   lock, revive parked blocks of that page if any, otherwise translate and install, then enter.
 - Exit reasons: chain (patch the link point), lookup (fill the jump cache), ungroup (record the group
   failure, then run Tier 0), interp (for a pure `R_INTERP` exit at a registered memop PC on a shared
-  or ungrouped block, run `exec_memop`: pre-validating guest pages with TBI untagged, capping
-  mutating/fixed-length ops at 64 MB while scanning `memchr`/`strncmp` up to a 64 MB budget even
-  for `SIZE_MAX`, skipping on watchpoints or missing permissions, warming the data TLB for untagged
-  addresses so subsequent same-page calls stay in-cache, popping the shadow return stack when its
-  top matches `x30`, and returning to `x30`; otherwise run one instruction in Tier 0, then
+  or ungrouped block, run `exec_memop`: pre-validating and copying/scanning contiguous spans of up
+  to 2 MB on L2 superpages or 4 KB on L3 pages with TBI untagged, capping mutating/fixed-length ops
+  at 64 MB while scanning `memchr`/`strncmp` up to a 64 MB budget even for `SIZE_MAX`, skipping on
+  watchpoints or missing permissions, warming the data TLB and `stlb` for untagged addresses so
+  subsequent calls stay fast, popping the shadow return stack when its top matches `x30`, and
+  returning to `x30`; otherwise run one instruction in Tier 0, then
   invalidate any recorded `ivau_page` in place), code (invalidate the pending page after a
   translated DSB/ISB, then look up the next PC), svc (clear the monitor, return `Svc`), kick (loop).
   Tier 0's own exits are returned to the kernel, except `ic ivau`, which is absorbed in place.

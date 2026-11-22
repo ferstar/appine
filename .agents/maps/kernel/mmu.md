@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint copy-on-write and host-backing references to kernel/cow and kernel/hostmem)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: L2 2 MiB superpages with lock-free demotion and empty-L3 retirement, and per-CPU 1024-entry 2 MiB superpage TLB)
 
 ## Responsibilities
 
@@ -42,15 +42,23 @@ fast path and refill (`engine/dbt`).
 ### Translation
 
 - `struct appine_mmu` / `Mmu` — 4-level radix tree, 512 entries per level, covering 48-bit guest
-  addresses; each leaf table spans 2 MB. A leaf entry is a 4 KB-aligned host page address ORed with
-  R/W/X bits; 0 means absent, and prot 0 with a nonzero address means "present, no access". `Mmu`
-  is neither `Send` nor `Sync`; `map`/`unmap`/`protect`/`move_entries` take `&mut`, while
+  addresses; each leaf table spans 2 MB. An L2 entry can also be a 2 MB leaf superpage
+  (`4 KB-aligned host base | R/W/X | PTE_SUPER`, bit 3; intermediate table pointers are at least
+  16-byte aligned so bits 3..0 are 0). Whole 2 MB spans written to empty L2 slots, existing
+  superpages, or all-zero L3 tables (up to 256 retired L3 tables kept alive per `appine_mmu` until
+  destruction for concurrent walkers) become superpages; partial `unmap`/`protect`/`map`/`move`
+  demote an L2 superpage atomically into a populated 512-entry L3 table before modifying it. A 4 KB
+  leaf entry is a 4 KB-aligned host page address ORed with R/W/X bits; 0 means absent, and prot 0
+  with a nonzero address means "present, no access". `Mmu` is neither `Send` nor `Sync`;
+  `map`/`unmap`/`protect`/`move_entries` take `&mut`, while
   `fill_shared`/`map_shared`/`protect_shared`/`next_present`/`translate` take `&self` so CoW can
   edit another address space's table. Guest address spaces only fill empty slots (`fill_shared`,
   `map_shared` for CoW); the replacing `map` serves the vDSO's own probe table.
 - `struct appine_tlb_entry` — data TLB entry `{read tag, read addend, write tag, write addend}`,
-  4096 direct-mapped entries per thread; tag is the inverted page number and 0 is invalid, so
-  zeroed memory is an empty TLB. A `tlb_used` bitmap records filled slots.
+  4096 direct-mapped 4 KB entries (`tlb`, tracked by `tlb_used`) plus 1024 direct-mapped 2 MB
+  superpage entries (`stlb`, 4 KB-aligned, covering 2 GB, tracked by `stlb_used`) per thread; tag
+  is the inverted page (or 2 MB superpage) number and 0 is invalid, so zeroed memory is an empty
+  TLB.
 - `struct appine_itlb_entry` — 512-entry instruction TLB, used only by Tier 0 instruction fetch.
 
 ### Consistency and code
@@ -102,15 +110,16 @@ fast path and refill (`engine/dbt`).
   a miss. The fill fails if the entry is absent or lacks the needed bit. A data fill sets both
   halves at once, leaving the read half invalid on pages with a load watchpoint and the write half
   invalid on pages with any watchpoint or without read permission (Tier 1 can use a write entry
-  for a group that also reads). It records the slot in `tlb_used` and stores `addend =
-  host page − guest page base`. Exec fills only the ITLB. Tier 1's refill defers to Tier 0
-  whenever any watchpoint is set. Its data entries can include the guest pointer's top byte in
-  both the inverted page number and the page base used for the addend. Tier 0's untagged lookup
-  then misses and refills the same slot.
+  for a group that also reads). It records the slot in `tlb_used`, stores `addend =
+  host page − guest page base`, and when the lookup hit an L2 superpage with no watchpoints active,
+  also populates `stlb` and `stlb_used` (consumed by Tier 1 fast loops). Exec fills only the ITLB.
+  Tier 1's refill defers to Tier 0 whenever any watchpoint is set. Its data entries (and `stlb`
+  entries) can include the guest pointer's top byte in both the inverted page number and the page
+  base used for the addend. Tier 0's untagged lookup then misses and refills the same slot.
 - Cross-page accesses of up to 16 bytes look up both pages before copying anything; a failing
   second page reports the start of that page as the fault address.
-- A TLB flush clears only the slots marked in `tlb_used`, plus the whole ITLB; CPU states kept
-  for reuse (up to 8) are cleared the same way.
+- A TLB flush clears only the slots marked in `tlb_used` and `stlb_used`, plus the whole ITLB; CPU
+  states kept for reuse (up to 8) are cleared the same way.
 
 ### Consistency: shootdown and code invalidation
 

@@ -170,9 +170,14 @@ _Static_assert((MAX_BLOCK_WORDS & BRANCH_MASK) == 0 && MAX_BLOCK_WORDS << REASON
 
 #define TLB_BITS 12
 #define TLB_OFF offsetof(struct appine_cpu, tlb)
+#define STLB_BITS 10
+#define STLB_OFF offsetof(struct appine_cpu, stlb)
 _Static_assert(APPINE_TLB_ENTRIES == 1u << TLB_BITS, "the TLB index is fixed at 12 bits in generated code");
+_Static_assert(APPINE_STLB_ENTRIES == 1u << STLB_BITS, "the STLB index is fixed at 10 bits in generated code");
 _Static_assert(sizeof(struct appine_tlb_entry) == 32, "generated code addresses TLB entries as 32 bytes each");
 _Static_assert(TLB_OFF % 16 == 0 && TLB_OFF + 16 <= 504, "the TLB must be addressable by ldp's 7-bit scaled immediate");
+_Static_assert((STLB_OFF & 0xfff) == 0 && (STLB_OFF >> 12) <= 0xfff,
+               "STLB must be 4 KB-aligned within one shifted add immediate");
 _Static_assert(offsetof(struct appine_cpu, dbt_rs) < TLB_OFF, "dbt_rs is also read and written directly with ldr/str");
 _Static_assert(offsetof(struct appine_cpu, dbt_jump_cache) < TLB_OFF,
                "fields that generated code reads and writes directly with ldr/str must precede the TLB");
@@ -4565,7 +4570,7 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
     }
 
     /* Worst-case host words for prologue + fast body + epilogue must leave ample room for slow_loop */
-    unsigned est_words = 32 + fl->nstreams * 32 + fl->nptrs * 10 + body_words + 64;
+    unsigned est_words = 32 + fl->nstreams * 42 + fl->nptrs * 10 + body_words + 64;
     if (est_words > FAST_LOOP_MAX_WORDS)
         return false;
 
@@ -4764,7 +4769,7 @@ static void emit_adjust_reg(struct xlate *x, unsigned r, bool sub)
 
 static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
 {
-    uint32_t *bails[64];
+    uint32_t *bails[96];
     unsigned nbails = 0;
     size_t grp_off = offsetof(struct appine_cpu, dbt_groups);
     size_t iters_off = grp_off + 8 * 7;
@@ -4881,9 +4886,9 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
     emit(x, enc_cbz_x(T0));
     emit(x, enc_str_x(T2, CTX, iters_off));
 
-    /* 3. For each access stream: probe TLB first (hides L1 latency and bails fast on cold
-     *    pages), verify shared addends for multi-stream bases, then verify page bounds and shrink
-     *    safe_iters */
+    /* 3. For each access stream: probe the 2 MiB superpage TLB first (giving a 2 MiB runway),
+     *    falling back to the 4 KiB data TLB for non-superpage mappings; verify shared addends for
+     *    multi-stream bases, then verify span bounds and shrink safe_iters. */
     for (unsigned i = 0; i < fl->nstreams; i++) {
         const struct fast_stream *s = &fl->streams[i];
         unsigned base = fl->ptrs[s->ptr_idx].reg;
@@ -4901,57 +4906,93 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
             base = T0;
         }
         emit_add_const(x, T0, base, s->lo); /* T0 = first = G_eff + lo */
+        uint32_t span = (uint32_t)(s->hi - s->lo);
+
+        /* Fast path: 2 MiB superpage TLB (cpu->stlb) */
+        emit(x, enc_add_imm(T1, CTX, (uint32_t)(STLB_OFF >> 12), 1));
+        emit(x, enc_ubfx(T2, T0, MMU_SUPER_SHIFT, STLB_BITS));
+        emit(x, enc_add_lsl(T1, T1, T2, 5));
+        emit(x, enc_ldp_x(T1, T2, T1, s->write ? 16 : 0));
+        emit(x, enc_eon_lsr(T1, T1, T0, MMU_SUPER_SHIFT));
+        uint32_t *try_4k = here(x);
+        emit(x, enc_cbnz_x(T1));
+        emit(x, enc_and_low(T1, T0, MMU_SUPER_SHIFT));
+        emit_mov_const(x, T0, MMU_SUPER_SIZE - span);
+        emit(x, enc_sub_reg(T1, T0, T1)); /* avail = (2 MiB - span) - super_off */
+        uint32_t *got_super = here(x);
+        emit(x, enc_b(0));
+
+        /* Fallback: 4 KiB data TLB (cpu->tlb) */
+        patch_local(x, try_4k, here(x));
         emit(x, enc_ubfx(T1, T0, APPINE_PAGE_SHIFT, TLB_BITS));
         emit(x, enc_add_lsl(T1, CTX, T1, 5));
         emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF + (s->write ? 16 : 0)));
         emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT));
         bails[nbails++] = here(x);
         emit(x, enc_cbnz_x(T1));
+        emit(x, enc_and_low(T1, T0, APPINE_PAGE_SHIFT));
+        emit(x, enc_movz(T0, (uint32_t)(APPINE_PAGE_SIZE - span), 0));
+        emit(x, enc_sub_reg(T1, T0, T1)); /* avail = (4 KiB - span) - page_off */
+
+        patch_local(x, got_super, here(x));
+        bails[nbails++] = here(x);
+        emit(x, enc_tbnz(T1, 63));
         if (s->first_for_ptr) {
             emit(x, enc_str_x(T2, CTX, grp_off + 8 * (size_t)s->ptr_idx));
         } else {
-            emit(x, enc_ldr_x(T1, CTX, grp_off + 8 * (size_t)s->ptr_idx));
-            emit(x, enc_eor_lsr(T1, T1, T2, 0));
+            emit(x, enc_ldr_x(T0, CTX, grp_off + 8 * (size_t)s->ptr_idx));
+            emit(x, enc_eor_lsr(T0, T0, T2, 0));
             bails[nbails++] = here(x);
-            emit(x, enc_cbnz_x(T1));
+            emit(x, enc_cbnz_x(T0));
         }
 
-        uint32_t span = (uint32_t)(s->hi - s->lo);
-        emit(x, enc_and_low(T1, T0, APPINE_PAGE_SHIFT));
-        emit(x, enc_movz(T2, (uint32_t)(APPINE_PAGE_SIZE - span), 0));
-        emit(x, enc_sub_reg(T1, T2, T1)); /* avail = (4096 - span) - page_off */
-        bails[nbails++] = here(x);
-        emit(x, enc_tbnz(T1, 63));
         if (s->stride_reg < 31 || s->stride > 0) {
             if (s->stride_reg < 31) {
-                /* Runtime register stride: AArch64 UDIV returns 0 for stride == 0 and for any
-                 * stride > avail (including negative / >= 4096), so cbz T1 bails safely. */
+                /* Runtime register stride: reject negative or >= 2 MiB strides, then check if all
+                 * safe_iters fit via MUL (avoiding UDIV on the common 2 MiB superpage fast path).
+                 * Only on a boundary crossing fall through to UDIV to shrink safe_iters. */
                 unsigned sr = s->stride_reg;
                 if (is_stolen(sr)) {
-                    emit_load_guest(x, T2, sr);
-                    sr = T2;
+                    emit_load_guest(x, T0, sr);
+                    sr = T0;
                 }
+                emit(x, enc_ubfx(T2, sr, MMU_SUPER_SHIFT, 64 - MMU_SUPER_SHIFT));
+                bails[nbails++] = here(x);
+                emit(x, enc_cbnz_x(T2));
+                emit(x, enc_ldr_x(T2, CTX, iters_off));
+                emit(x, enc_sub_imm(T2, T2, 1, 0));
+                emit(x, enc_mul(T2, T2, sr));
+                emit(x, enc_sub_reg(T2, T1, T2)); /* avail - (safe_iters - 1) * sr */
+                uint32_t *fits_all = here(x);
+                emit(x, enc_tbz(T2, 63));
                 emit(x, enc_udiv(T1, T1, sr));
-            } else if ((s->stride & (s->stride - 1)) == 0) {
-                unsigned sh = (unsigned)__builtin_ctz(s->stride);
-                emit(x, enc_ubfx(T1, T1, sh, 64 - sh));
+                bails[nbails++] = here(x);
+                emit(x, enc_cbz_x(T1));
+                emit(x, enc_add_imm(T1, T1, 1, 0));
+                emit(x, enc_str_x(T1, CTX, iters_off));
+                patch_local(x, fits_all, here(x));
             } else {
-                /* Exact floor(avail / stride) for 0 <= avail <= 4095, 1 <= stride <= 4095 */
-                uint64_t mul = ((UINT64_C(1) << 25) + s->stride - 1) / s->stride;
-                emit_mov_const(x, T2, mul);
-                emit(x, enc_mul(T1, T1, T2));
-                emit(x, enc_ubfx(T1, T1, 25, 39));
+                if ((s->stride & (s->stride - 1)) == 0) {
+                    unsigned sh = (unsigned)__builtin_ctz(s->stride);
+                    emit(x, enc_ubfx(T1, T1, sh, 64 - sh));
+                } else {
+                    /* Exact floor(avail / stride) for 0 <= avail < 2 MiB, 1 <= stride <= 4095 */
+                    uint64_t mul = ((UINT64_C(1) << 34) + s->stride - 1) / s->stride;
+                    emit_mov_const(x, T2, mul);
+                    emit(x, enc_mul(T1, T1, T2));
+                    emit(x, enc_ubfx(T1, T1, 34, 30));
+                }
+                /* page_iters = avail / stride + 1; if avail / stride == 0 then page_iters == 1 < 2 */
+                bails[nbails++] = here(x);
+                emit(x, enc_cbz_x(T1));
+                emit(x, enc_add_imm(T1, T1, 1, 0));
+                emit(x, enc_ldr_x(T2, CTX, iters_off));
+                emit(x, enc_sub_reg(T2, T1, T2));
+                uint32_t *keep = here(x);
+                emit(x, enc_tbz(T2, 63));
+                emit(x, enc_str_x(T1, CTX, iters_off));
+                patch_local(x, keep, here(x));
             }
-            /* page_iters = avail / stride + 1; if avail / stride == 0 then page_iters == 1 < 2 */
-            bails[nbails++] = here(x);
-            emit(x, enc_cbz_x(T1));
-            emit(x, enc_add_imm(T1, T1, 1, 0));
-            emit(x, enc_ldr_x(T2, CTX, iters_off));
-            emit(x, enc_sub_reg(T2, T1, T2));
-            uint32_t *keep = here(x);
-            emit(x, enc_tbz(T2, 63));
-            emit(x, enc_str_x(T1, CTX, iters_off));
-            patch_local(x, keep, here(x));
         }
     }
 
@@ -5327,14 +5368,16 @@ static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct sync
     return code;
 }
 
-/* Each of three page walks can fail at any level or on the extra permission check for writes. */
+/* Each of three page walks can fail at any level or on the permission checks (4 KiB or 2 MiB). */
 struct refill_fails {
-    uint32_t *site[3 * (MMU_LEVELS + 1) + 3];
+    uint32_t *site[3 * (MMU_LEVELS + 3) + 4];
     unsigned n;
 };
 
 static void emit_to_fail(struct xlate *x, struct refill_fails *f, uint32_t insn)
 {
+    if (f->n >= sizeof(f->site) / sizeof(f->site[0]))
+        appine_guard_fail();
     f->site[f->n++] = here(x);
     emit(x, insn);
 }
@@ -5343,23 +5386,32 @@ static void emit_to_fail(struct xlate *x, struct refill_fails *f, uint32_t insn)
  * Walk the page table with mmu.c's structure and fill the page containing address `a` (T0 or x3)
  * into the TLB: the tags of the read and write halves are filled separately according to the leaf
  * entry's permissions, and tlb_used is recorded at the same time, as in Tier 0's appine_tlb_fill.
+ * For 2 MiB L2 superpages (PTE_SUPER_BIT), skips L3, populates cpu->stlb, and when the preceding
+ * 4 KiB TLB slot holds (vpn - 1) with the same addend, batch-prefills up to 8 contiguous 4 KiB
+ * slots within the same 64-entry tlb_used word.
  * Jumps to failure if unmapped or lacking the permission this access needs. Afterwards
- * x2 = addend; uses up x0, x1, x4 and T2, and preserves x3, T0 and T1.
+ * x2 = addend; uses up x0, x1, x4, x5 and T2, and preserves x3, T0 and T1.
  */
 static void emit_fill(struct xlate *x, unsigned a, bool write, struct refill_fails *f)
 {
     size_t used = offsetof(struct appine_cpu, tlb_used);
+    size_t sused = offsetof(struct appine_cpu, stlb_used);
     emit(x, enc_ldr_x(0, CTX, offsetof(struct appine_cpu, mmu)));
     emit(x, enc_ldr_x(0, 0, offsetof(struct appine_mmu, root)));
     /* An intermediate entry is the address of the next level's table; loads through the address
      * dependency are ordered just like mmu.c's acquire loads */
-    for (unsigned level = 0; level < MMU_LEVELS; level++) {
+    for (unsigned level = 0; level < MMU_LEVELS - 1; level++) {
         emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT + MMU_LEVEL_BITS * (MMU_LEVELS - 1 - level),
                          MMU_LEVEL_BITS));
         emit(x, enc_ldr_x_index(0, 0, 1));
-        if (level < MMU_LEVELS - 1)
-            emit_to_fail(x, f, enc_cbz_x(0));
+        emit_to_fail(x, f, enc_cbz_x(0));
     }
+    uint32_t *is_super = here(x);
+    emit(x, enc_tbnz(0, PTE_SUPER_BIT));
+
+    /* Standard 4 KiB L3 leaf lookup */
+    emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT, MMU_LEVEL_BITS));
+    emit(x, enc_ldr_x_index(0, 0, 1));
     /* Leaf entry = host page address | permission bits; an unmapped one is 0, which the permission
      * check rules out as well */
     emit_to_fail(x, f, enc_tbz(0, 0));
@@ -5389,6 +5441,107 @@ static void emit_fill(struct xlate *x, unsigned a, bool write, struct refill_fai
     emit(x, enc_lslv(0, 0, 4));
     emit(x, enc_orr_reg(T2, T2, 0));
     emit(x, enc_str_x(T2, 1, used & 0xfff));
+    uint32_t *done_4k = here(x);
+    emit(x, enc_b(0));
+
+    /* L2 2 MiB superpage leaf: skip L3, populate cpu->stlb, and prefill sequentially */
+    patch_branch(x->wdelta, is_super, here(x));
+    emit_to_fail(x, f, enc_tbz(0, 0));
+    if (write)
+        emit_to_fail(x, f, enc_tbz(0, 1));
+    emit(x, enc_and_clear_low(1, a, MMU_SUPER_SHIFT));
+    emit(x, enc_and_clear_low(2, 0, APPINE_PAGE_SHIFT));
+    emit(x, enc_sub_reg(2, 2, 1)); /* addend for entire 2 MiB superpage */
+    emit(x, enc_ubfx(T2, 0, 1, 1));
+    emit(x, enc_sub_reg(T2, 31, T2)); /* w_mask: all-1s if writable, else 0 */
+
+    /* Populate cpu->stlb[sidx] and stlb_used */
+    emit(x, enc_ubfx(4, a, MMU_SUPER_SHIFT, 64 - MMU_SUPER_SHIFT)); /* svpn (keeps top byte) */
+    emit(x, enc_eon_lsr(5, 31, 4, 0));                              /* stag_read = ~svpn */
+    emit(x, enc_and_low(4, 4, STLB_BITS));                          /* sidx */
+    emit(x, enc_add_imm(1, CTX, (uint32_t)(STLB_OFF >> 12), 1));
+    emit(x, enc_add_lsl(1, 1, 4, 5));
+    emit(x, enc_stp_x(5, 2, 1, 0));
+    emit(x, enc_and_reg(5, 5, T2));
+    emit(x, enc_stp_x(5, 2, 1, 16));
+    emit(x, enc_ubfx(1, 4, 6, STLB_BITS - 6));
+    emit(x, enc_add_lsl(1, CTX, 1, 3));
+    emit_add_const(x, 1, 1, (int64_t)(sused & ~(size_t)0xfff));
+    emit(x, enc_ldr_x(5, 1, sused & 0xfff));
+    emit(x, enc_and_low(4, 4, 6));
+    emit(x, enc_movz(0, 1, 0));
+    emit(x, enc_lslv(0, 0, 4));
+    emit(x, enc_orr_reg(5, 5, 0));
+    emit(x, enc_str_x(5, 1, sused & 0xfff));
+
+    /* Detect sequential streaming: preceding 4 KiB slot holds (vpn - 1) with the same addend */
+    emit(x, enc_ubfx(4, a, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT)); /* vpn */
+    emit(x, enc_eon_lsr(5, 31, 4, 0));                                  /* r_tag = ~vpn */
+    emit(x, enc_sub_imm(1, 4, 1, 0));
+    emit(x, enc_and_low(1, 1, TLB_BITS));
+    emit(x, enc_add_lsl(1, CTX, 1, 5));
+    emit(x, enc_ldp_x(0, 1, 1, (int)TLB_OFF)); /* prev_tag_read, prev_addend_read */
+    emit(x, enc_sub_imm(0, 0, 1, 0));
+    emit(x, enc_eor_lsr(0, 0, 5, 0));
+    emit(x, enc_eor_lsr(1, 1, 2, 0));
+    emit(x, enc_orr_reg(0, 0, 1));
+    uint32_t *non_seq = here(x);
+    emit(x, enc_cbnz_x(0));
+
+    /* Sequential batch prefill: up to 8 contiguous 4 KiB slots inside the same 64-entry tlb_used
+     * word (strictly within this 2 MiB superpage) */
+    emit(x, enc_and_low(0, 4, 6)); /* bit = idx & 63 */
+    emit(x, enc_movz(1, 64, 0));
+    emit(x, enc_sub_reg(1, 1, 0)); /* rem = 64 - bit (1..64) */
+    emit(x, enc_sub_imm(0, 1, 9, 0));
+    uint32_t *keep_rem = here(x);
+    emit(x, enc_tbnz(0, 63));
+    emit(x, enc_movz(1, 8, 0));
+    patch_branch(x->wdelta, keep_rem, here(x));
+    emit(x, enc_and_low(0, 4, TLB_BITS));
+    emit(x, enc_add_lsl(0, CTX, 0, 5));
+    uint32_t *batch_loop = here(x);
+    emit(x, enc_and_reg(4, 5, T2));
+    emit(x, enc_stp_x(5, 2, 0, (int)TLB_OFF));
+    emit(x, enc_stp_x(4, 2, 0, (int)(TLB_OFF + 16)));
+    emit(x, enc_add_imm(0, 0, 32, 0));
+    emit(x, enc_sub_imm(5, 5, 1, 0));
+    emit(x, enc_sub_imm(1, 1, 1, 0));
+    uint32_t *batch_back = here(x);
+    emit(x, enc_cbnz_x(1));
+    patch_branch(x->wdelta, batch_back, batch_loop);
+    emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT + 6, TLB_BITS - 6));
+    emit(x, enc_add_lsl(1, CTX, 1, 3));
+    emit_add_const(x, 1, 1, (int64_t)(used & ~(size_t)0xfff));
+    emit(x, enc_ldr_x(T2, 1, used & 0xfff));
+    emit(x, enc_ubfx(4, a, APPINE_PAGE_SHIFT, 6));
+    emit(x, enc_movz(0, 0xff, 0));
+    emit(x, enc_lslv(0, 0, 4));
+    emit(x, enc_orr_reg(T2, T2, 0));
+    emit(x, enc_str_x(T2, 1, used & 0xfff));
+    uint32_t *done_batch = here(x);
+    emit(x, enc_b(0));
+
+    /* Non-sequential superpage miss: fill only the accessed 4 KiB slot */
+    patch_branch(x->wdelta, non_seq, here(x));
+    emit(x, enc_and_low(1, 4, TLB_BITS));
+    emit(x, enc_add_lsl(1, CTX, 1, 5));
+    emit(x, enc_and_reg(4, 5, T2));
+    emit(x, enc_stp_x(5, 2, 1, (int)TLB_OFF));
+    emit(x, enc_stp_x(4, 2, 1, (int)(TLB_OFF + 16)));
+    emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT + 6, TLB_BITS - 6));
+    emit(x, enc_add_lsl(1, CTX, 1, 3));
+    emit_add_const(x, 1, 1, (int64_t)(used & ~(size_t)0xfff));
+    emit(x, enc_ldr_x(T2, 1, used & 0xfff));
+    emit(x, enc_ubfx(4, a, APPINE_PAGE_SHIFT, 6));
+    emit(x, enc_movz(0, 1, 0));
+    emit(x, enc_lslv(0, 0, 4));
+    emit(x, enc_orr_reg(T2, T2, 0));
+    emit(x, enc_str_x(T2, 1, used & 0xfff));
+
+    uint32_t *done_fill = here(x);
+    patch_branch(x->wdelta, done_4k, done_fill);
+    patch_branch(x->wdelta, done_batch, done_fill);
 }
 
 /* Look up the page of address `a` in the TLB: on a hit the `addend` register = addend, otherwise
@@ -5432,7 +5585,7 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
 
     emit(x, enc_stp_x(0, 1, CTX, (int)x0));
     emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
-    emit(x, enc_str_x(4, CTX, x0 + 32));
+    emit(x, enc_stp_x(4, 5, CTX, (int)x0 + 32));
     /* With watchpoints (set by ptrace), do not fill from the page table: watched pages must not
      * enter the TLB. Tier 0 executes this instruction instead; it checks the watchpoints and fills
      * the TLB by appine_tlb_fill's rules, so unwatched pages hit as usual afterwards */
@@ -5460,7 +5613,7 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     emit(x, enc_add_lsl(T1, T1, 0, 2));
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
-    emit(x, enc_ldr_x(4, CTX, x0 + 32));
+    emit(x, enc_ldp_x(4, 5, CTX, (int)x0 + 32));
     emit(x, enc_br(T1));
 
     /* Cross-page: x1, x2 = the two pages' addends */
@@ -5486,7 +5639,7 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     emit(x, enc_ldur_x(T0, T1, 4));
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
-    emit(x, enc_ldr_x(4, CTX, x0 + 32));
+    emit(x, enc_ldp_x(4, 5, CTX, (int)x0 + 32));
     emit(x, enc_b((intptr_t)x->d->exit - (intptr_t)here(x)));
     return entry;
 }
@@ -6143,6 +6296,8 @@ static void emit_routines(struct appine_dbt *d)
     d->memop_memcmp = emit_memop_memcmp(x, d);
     d->memop_memchr = emit_memop_memchr(x, d);
 
+    if (x->n >= MAX_BLOCK_WORDS)
+        appine_guard_fail();
     d->routine_words = d->used_words = x->n;
     sync_range(d, d->cache, d->cache + x->n);
 }
@@ -6910,21 +7065,60 @@ void appine_dbt_set_memops(struct appine_dbt *d, const struct appine_dbt_memop *
 
 #define MEMOP_MAX_BYTES (UINT64_C(64) << 20)
 
+static uint8_t *memop_translate_span(const struct appine_mmu *mmu, uint64_t addr, uint32_t prot,
+                                     uint64_t *span_out)
+{
+    bool is_super = false;
+    uintptr_t pte = appine_mmu_lookup_super(mmu, addr, &is_super);
+    if (!(pte & PTE_PROT_MASK) || (pte & prot) != prot)
+        return NULL;
+    uintptr_t base = pte & ~(uintptr_t)PAGE_MASK;
+    if (is_super) {
+        uint64_t off = addr & MMU_SUPER_MASK;
+        *span_out = MMU_SUPER_SIZE - off;
+        return (uint8_t *)(base + off);
+    }
+    uint64_t off = addr & PAGE_MASK;
+    *span_out = APPINE_PAGE_SIZE - off;
+    return (uint8_t *)(base + off);
+}
+
+static uint8_t *memop_translate_span_back(const struct appine_mmu *mmu, uint64_t end_addr,
+                                          uint32_t prot, uint64_t *span_out)
+{
+    uint64_t last = end_addr - 1;
+    bool is_super = false;
+    uintptr_t pte = appine_mmu_lookup_super(mmu, last, &is_super);
+    if (!(pte & PTE_PROT_MASK) || (pte & prot) != prot)
+        return NULL;
+    uintptr_t base = pte & ~(uintptr_t)PAGE_MASK;
+    if (is_super) {
+        uint64_t off = last & MMU_SUPER_MASK;
+        *span_out = off + 1;
+        return (uint8_t *)(base + off + 1);
+    }
+    uint64_t off = last & PAGE_MASK;
+    *span_out = off + 1;
+    return (uint8_t *)(base + off + 1);
+}
+
 static bool memop_check_range(const struct appine_mmu *mmu, uint64_t addr, uint64_t n, uint32_t prot)
 {
     if (n == 0)
         return true;
     if (addr + n < addr)
         return false;
-    uint64_t p = addr & ~PAGE_MASK;
-    uint64_t end = (addr + n - 1) & ~PAGE_MASK;
-    for (;;) {
-        if (!appine_mmu_translate(mmu, p, prot))
+    uint64_t cur = addr, rem = n;
+    while (rem > 0) {
+        uint64_t span = 0;
+        if (!memop_translate_span(mmu, cur, prot, &span))
             return false;
-        if (p == end)
+        if (span >= rem)
             return true;
-        p += APPINE_PAGE_SIZE;
+        cur += span;
+        rem -= span;
     }
+    return true;
 }
 
 static inline void memop_warm_tlb(struct appine_cpu *c, uint64_t raw_va, uint32_t access)
@@ -6948,14 +7142,13 @@ static bool exec_memop(struct appine_cpu *c, uint32_t kind)
             return false;
         uint64_t cur = dst, rem = n;
         while (rem > 0) {
-            uint64_t off = cur & PAGE_MASK;
-            uint64_t chunk = APPINE_PAGE_SIZE - off;
-            if (chunk > rem)
-                chunk = rem;
-            uint8_t *hp = (uint8_t *)appine_mmu_translate(mmu, cur & ~PAGE_MASK, APPINE_PROT_WRITE);
+            uint64_t chunk = 0;
+            uint8_t *hp = memop_translate_span(mmu, cur, APPINE_PROT_WRITE, &chunk);
             if (UNLIKELY(!hp))
                 return false;
-            memset(hp + off, val, chunk);
+            if (chunk > rem)
+                chunk = rem;
+            memset(hp, val, chunk);
             cur += chunk;
             rem -= chunk;
         }
@@ -6977,39 +7170,29 @@ static bool exec_memop(struct appine_cpu *c, uint32_t kind)
         if (dst > src && dst < src + n) {
             uint64_t rem = n;
             while (rem > 0) {
-                uint64_t d_end = dst + rem;
-                uint64_t s_end = src + rem;
-                uint64_t d_off = (d_end - 1) & PAGE_MASK;
-                uint64_t s_off = (s_end - 1) & PAGE_MASK;
-                uint64_t chunk = d_off + 1;
-                if (s_off + 1 < chunk)
-                    chunk = s_off + 1;
+                uint64_t d_span = 0, s_span = 0;
+                uint8_t *dh_end = memop_translate_span_back(mmu, dst + rem, APPINE_PROT_WRITE, &d_span);
+                uint8_t *sh_end = memop_translate_span_back(mmu, src + rem, APPINE_PROT_READ, &s_span);
+                if (UNLIKELY(!dh_end || !sh_end))
+                    return false;
+                uint64_t chunk = d_span < s_span ? d_span : s_span;
                 if (chunk > rem)
                     chunk = rem;
-                uint64_t d_cur = d_end - chunk;
-                uint64_t s_cur = s_end - chunk;
-                uint8_t *dh = (uint8_t *)appine_mmu_translate(mmu, d_cur & ~PAGE_MASK, APPINE_PROT_WRITE);
-                uint8_t *sh = (uint8_t *)appine_mmu_translate(mmu, s_cur & ~PAGE_MASK, APPINE_PROT_READ);
-                if (UNLIKELY(!dh || !sh))
-                    return false;
-                memmove(dh + (d_cur & PAGE_MASK), sh + (s_cur & PAGE_MASK), chunk);
+                memmove(dh_end - chunk, sh_end - chunk, chunk);
                 rem -= chunk;
             }
         } else {
             uint64_t d_cur = dst, s_cur = src, rem = n;
             while (rem > 0) {
-                uint64_t d_off = d_cur & PAGE_MASK;
-                uint64_t s_off = s_cur & PAGE_MASK;
-                uint64_t chunk = APPINE_PAGE_SIZE - d_off;
-                if (APPINE_PAGE_SIZE - s_off < chunk)
-                    chunk = APPINE_PAGE_SIZE - s_off;
-                if (chunk > rem)
-                    chunk = rem;
-                uint8_t *dh = (uint8_t *)appine_mmu_translate(mmu, d_cur & ~PAGE_MASK, APPINE_PROT_WRITE);
-                uint8_t *sh = (uint8_t *)appine_mmu_translate(mmu, s_cur & ~PAGE_MASK, APPINE_PROT_READ);
+                uint64_t d_span = 0, s_span = 0;
+                uint8_t *dh = memop_translate_span(mmu, d_cur, APPINE_PROT_WRITE, &d_span);
+                uint8_t *sh = memop_translate_span(mmu, s_cur, APPINE_PROT_READ, &s_span);
                 if (UNLIKELY(!dh || !sh))
                     return false;
-                memmove(dh + d_off, sh + s_off, chunk);
+                uint64_t chunk = d_span < s_span ? d_span : s_span;
+                if (chunk > rem)
+                    chunk = rem;
+                memmove(dh, sh, chunk);
                 d_cur += chunk;
                 s_cur += chunk;
                 rem -= chunk;
@@ -7025,18 +7208,15 @@ static bool exec_memop(struct appine_cpu *c, uint32_t kind)
         if (rem > MEMOP_MAX_BYTES)
             return false;
         while (rem > 0) {
-            uint64_t a_off = a_cur & PAGE_MASK;
-            uint64_t b_off = b_cur & PAGE_MASK;
-            uint64_t chunk = APPINE_PAGE_SIZE - a_off;
-            if (APPINE_PAGE_SIZE - b_off < chunk)
-                chunk = APPINE_PAGE_SIZE - b_off;
-            if (chunk > rem)
-                chunk = rem;
-            uint8_t *ah = (uint8_t *)appine_mmu_translate(mmu, a_cur & ~PAGE_MASK, APPINE_PROT_READ);
-            uint8_t *bh = (uint8_t *)appine_mmu_translate(mmu, b_cur & ~PAGE_MASK, APPINE_PROT_READ);
+            uint64_t a_span = 0, b_span = 0;
+            uint8_t *ah = memop_translate_span(mmu, a_cur, APPINE_PROT_READ, &a_span);
+            uint8_t *bh = memop_translate_span(mmu, b_cur, APPINE_PROT_READ, &b_span);
             if (UNLIKELY(!ah || !bh))
                 return false;
-            int r = memcmp(ah + a_off, bh + b_off, chunk);
+            uint64_t chunk = a_span < b_span ? a_span : b_span;
+            if (chunk > rem)
+                chunk = rem;
+            int r = memcmp(ah, bh, chunk);
             if (r != 0) {
                 memop_warm_tlb(c, raw_a, APPINE_ACCESS_READ);
                 memop_warm_tlb(c, raw_b, APPINE_ACCESS_READ);
@@ -7061,17 +7241,16 @@ static bool exec_memop(struct appine_cpu *c, uint32_t kind)
          * fall back to guest code if the budget is exhausted without finding a match. */
         uint64_t rem = total > MEMOP_MAX_BYTES ? MEMOP_MAX_BYTES : total;
         while (rem > 0) {
-            uint64_t off = cur & PAGE_MASK;
-            uint64_t chunk = APPINE_PAGE_SIZE - off;
-            if (chunk > rem)
-                chunk = rem;
-            uint8_t *hp = (uint8_t *)appine_mmu_translate(mmu, cur & ~PAGE_MASK, APPINE_PROT_READ);
+            uint64_t chunk = 0;
+            uint8_t *hp = memop_translate_span(mmu, cur, APPINE_PROT_READ, &chunk);
             if (UNLIKELY(!hp))
                 return false;
-            uint8_t *f = (uint8_t *)memchr(hp + off, ch, chunk);
+            if (chunk > rem)
+                chunk = rem;
+            uint8_t *f = (uint8_t *)memchr(hp, ch, chunk);
             if (f) {
                 memop_warm_tlb(c, base, APPINE_ACCESS_READ);
-                c->x[0] = base + (cur - start) + (uint64_t)(f - (hp + off));
+                c->x[0] = base + (cur - start) + (uint64_t)(f - hp);
                 return true;
             }
             cur += chunk;
@@ -7088,20 +7267,17 @@ static bool exec_memop(struct appine_cpu *c, uint32_t kind)
         uint64_t a_cur = untag(c->x[0]), b_cur = untag(c->x[1]), total = c->x[2];
         uint64_t rem = total > MEMOP_MAX_BYTES ? MEMOP_MAX_BYTES : total;
         while (rem > 0) {
-            uint64_t a_off = a_cur & PAGE_MASK;
-            uint64_t b_off = b_cur & PAGE_MASK;
-            uint64_t chunk = APPINE_PAGE_SIZE - a_off;
-            if (APPINE_PAGE_SIZE - b_off < chunk)
-                chunk = APPINE_PAGE_SIZE - b_off;
-            if (chunk > rem)
-                chunk = rem;
-            uint8_t *ah = (uint8_t *)appine_mmu_translate(mmu, a_cur & ~PAGE_MASK, APPINE_PROT_READ);
-            uint8_t *bh = (uint8_t *)appine_mmu_translate(mmu, b_cur & ~PAGE_MASK, APPINE_PROT_READ);
+            uint64_t a_span = 0, b_span = 0;
+            uint8_t *ah = memop_translate_span(mmu, a_cur, APPINE_PROT_READ, &a_span);
+            uint8_t *bh = memop_translate_span(mmu, b_cur, APPINE_PROT_READ, &b_span);
             if (UNLIKELY(!ah || !bh))
                 return false;
-            uint8_t *za = (uint8_t *)memchr(ah + a_off, 0, chunk);
-            uint64_t span = za ? (uint64_t)(za - (ah + a_off)) + 1 : chunk;
-            int r = memcmp(ah + a_off, bh + b_off, span);
+            uint64_t chunk = a_span < b_span ? a_span : b_span;
+            if (chunk > rem)
+                chunk = rem;
+            uint8_t *za = (uint8_t *)memchr(ah, 0, chunk);
+            uint64_t span = za ? (uint64_t)(za - ah) + 1 : chunk;
+            int r = memcmp(ah, bh, span);
             if (r != 0) {
                 c->x[0] = (uint64_t)(int64_t)r;
                 return true;

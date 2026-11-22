@@ -23,6 +23,7 @@
 #define APPINE_VA_BITS 48
 #define APPINE_TLB_ENTRIES 4096 /* data TLB, direct-mapped */
 #define APPINE_ITLB_ENTRIES 512 /* instruction-fetch TLB, used only by Tier 0 */
+#define APPINE_STLB_ENTRIES 1024 /* 2 MiB superpage data TLB, direct-mapped (2 GiB) */
 
 /* Page permissions, with the same values as Linux's PROT_* */
 enum {
@@ -173,6 +174,10 @@ struct appine_cpu {
     uint32_t reserved;
     uint64_t brk[APPINE_HW_SLOTS];
     struct appine_watch watch[APPINE_HW_SLOTS];
+    /* 2 MiB superpage data TLB, populated from L2 superpage entries when nwatch == 0 and flushed
+     * via stlb_used alongside tlb; 4 KB-aligned so generated code addresses it in one add */
+    uint64_t stlb_used[APPINE_STLB_ENTRIES / 64];
+    _Alignas(4096) struct appine_tlb_entry stlb[APPINE_STLB_ENTRIES];
 };
 
 /* ---- Guest-visible CPU features (the engine map), with the same values as Linux's HWCAP_* ---- */
@@ -308,7 +313,7 @@ void appine_host_fault_last(struct appine_host_fault *out);
 /* Checks the struct layout mirrored on the Rust side; returns 1 when it matches */
 int appine_cpu_layout_check(size_t size, size_t off_x, size_t off_pc, size_t off_tpidr,
                             size_t off_pending, size_t off_mmu, size_t off_jump_cache,
-                            size_t off_tlb, size_t off_v);
+                            size_t off_tlb, size_t off_v, size_t off_stlb);
 
 /* ---- Tier 1: a same-ISA pass-through DBT (the engine/dbt map) ---- */
 

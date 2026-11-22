@@ -3421,6 +3421,355 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
     }
 }
 
+#[test]
+fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
+    const SUPER: u64 = PAGE_SIZE << 9; // 2 MiB
+    const RW: u32 = prot::READ | prot::WRITE;
+    // Map two contiguous 2 MiB superpages at a 2 MiB-aligned guest VA backed by a non-2 MiB-aligned
+    // (4 KiB-aligned) host allocation, plus one extra page for CoW demotion testing.
+    let mut backing = vec![0u8; (2 * SUPER + 2 * PAGE_SIZE) as usize + 4096];
+    let align_off = (4096 - (backing.as_ptr() as usize & 4095)) & 4095;
+    let base_ptr = unsafe { backing.as_mut_ptr().add(align_off) };
+    // Start at +4 KiB so the host pointer is guaranteed 4 KiB-aligned and not 2 MiB-aligned when
+    // the allocator returned a 2 MiB-aligned buffer.
+    let super_host = unsafe { NonNull::new_unchecked(base_ptr.add(PAGE_SIZE as usize)) };
+    let alt_host = unsafe { NonNull::new_unchecked(base_ptr) };
+    let buf_va = 0x2000_0000u64; // 2 MiB-aligned, 4 MiB total
+
+    // Fill backing memory with deterministic u64 values (8-byte word index + 1).
+    let words = unsafe { std::slice::from_raw_parts_mut(super_host.as_ptr().cast::<u64>(), (2 * SUPER / 8) as usize) };
+    for (i, w) in words.iter_mut().enumerate() {
+        *w = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+    }
+
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let mut g = Guest::new();
+        let mut dbt = Dbt::with_regs(regs).expect("tier 1");
+        unsafe {
+            g.mmu.map(buf_va, super_host, 2 * SUPER, RW).unwrap();
+        }
+        let s0: u32 = match regs {
+            DbtRegs::Default => 16,
+            DbtRegs::Go => 21,
+        };
+
+        // 1. Sequential scan across 80 pages (320 KiB, crossing a 256 KiB tlb_used word boundary
+        //    and a 2 MiB superpage boundary) via plain non-fast-loop code: exercises superpage
+        //    emit_fill + sequential batch prefill (8 slots at a time) + cross-superpage refill.
+        //    Use SP-relative/branchy block or simple strided scan with a conditional branch so it
+        //    goes through normal inline TLB + emit_refill (not fast loop).
+        let f_seq = CODE + 0x100;
+        let start_off = SUPER - 20 * PAGE_SIZE; // crosses 2 MiB boundary after 20 pages
+        g.code(
+            f_seq,
+            &[
+                0xf940_0043,                     // ldr x3, [x2]
+                0x8b03_0000,                     // add x0, x0, x3
+                0x9140_0442,                     // add x2, x2, #4096
+                0xb400_0024,                     // cbz x4, +4 (prevents fast-loop match)
+                0xf100_0484,                     // subs x4, x4, #1
+                b_cond(f_seq + 20, f_seq, 1),    // b.ne f_seq
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = buf_va + start_off;
+            s.x[4] = 80;
+        }
+        let mut exp_seq = 0u64;
+        for k in 0..80u64 {
+            exp_seq = exp_seq.wrapping_add(words[((start_off + k * PAGE_SIZE) / 8) as usize]);
+        }
+        let before = dbt.stats();
+        assert_eq!(g.run_at(&mut dbt, f_seq), exp_seq, "superpage sequential prefill ({regs:?})");
+        assert_eq!(dbt.stats().exits_interp, before.exits_interp, "no tier0 exits ({regs:?})");
+
+        // 2. Constant-stride fast loops spanning multiple 4 KiB pages inside a 2 MiB superpage:
+        //    (a) 256 B stride x 80 iters = 20 KiB (5x 4 KiB pages, like flash_attn 0x6f260)
+        //    (b) 136 B non-pow2 stride x 120 iters = 16,320 B (like ggml_gemm_q4_0_4x4_q8_0),
+        //        also run crossing the 2 MiB boundary!
+        let f_256 = CODE + 0x200;
+        g.code(
+            f_256,
+            &[
+                0xf940_0043,                     // ldr x3, [x2]
+                0x8b03_0000,                     // add x0, x0, x3
+                0x9104_0042,                     // add x2, x2, #256
+                0xf100_0484,                     // subs x4, x4, #1
+                b_cond(f_256 + 16, f_256, 1),    // b.ne f_256
+                SVC,
+            ],
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = buf_va + 0x300;
+            s.x[4] = 80;
+        }
+        let mut exp_256 = 0u64;
+        for k in 0..80u64 {
+            exp_256 = exp_256.wrapping_add(words[((0x300 + k * 256) / 8) as usize]);
+        }
+        let before = dbt.stats();
+        assert_eq!(g.run_at(&mut dbt, f_256), exp_256, "2 MiB 256B fast loop ({regs:?})");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+
+        // TBI top-byte tag on 2 MiB superpage fast loop
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = (0xab_u64 << 56) | (buf_va + 0x300);
+            s.x[4] = 80;
+        }
+        assert_eq!(g.run_at(&mut dbt, f_256), exp_256, "TBI 2 MiB fast loop ({regs:?})");
+        assert_eq!(g.cpu.state().x[2], (0xab_u64 << 56) | (buf_va + 0x300 + 80 * 256));
+
+        // Non-pow2 136 B stride crossing the 2 MiB superpage boundary
+        let f_136 = CODE + 0x240;
+        g.code(
+            f_136,
+            &[
+                0xf940_0043,                     // ldr x3, [x2]
+                0x8b03_0000,                     // add x0, x0, x3
+                0x9102_2042,                     // add x2, x2, #136
+                0xf100_0484,                     // subs x4, x4, #1
+                b_cond(f_136 + 16, f_136, 1),    // b.ne f_136
+                SVC,
+            ],
+        );
+        let off_136 = SUPER - 1000;
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = buf_va + off_136;
+            s.x[4] = 120;
+        }
+        let mut exp_136 = 0u64;
+        for k in 0..120u64 {
+            exp_136 = exp_136.wrapping_add(words[((off_136 + k * 136) / 8) as usize]);
+        }
+        let before = dbt.stats();
+        assert_eq!(g.run_at(&mut dbt, f_136), exp_136, "2 MiB 136B boundary-crossing ({regs:?})");
+        assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
+
+        // 3. Register-stride fast loop (like flash_attn 0x6f5a0):
+        //    (a) stride_reg = 256 (fits in 2 MiB via MUL without UDIV)
+        //    (b) stride_reg = 4096 (>= 4 KiB, still runs in 2 MiB superpage!)
+        //    (c) stride_reg = 256 crossing 2 MiB boundary (exercises UDIV shrink path)
+        //    (d) stride_reg = 0 (repeats same address safely)
+        //    (e) stride_reg = -256 (negative, bails cleanly to slow loop)
+        let f_rstr = CODE + 0x280;
+        g.code(
+            f_rstr,
+            &[
+                0xf940_0043,                      // ldr x3, [x2]
+                0x8b03_0000,                      // add x0, x0, x3
+                0x8b00_0042 | (s0 << 16),         // add x2, x2, xS0 (stolen stride reg)
+                0xf100_0484,                      // subs x4, x4, #1
+                b_cond(f_rstr + 16, f_rstr, 1),   // b.ne f_rstr
+                SVC,
+            ],
+        );
+        for (start, stride, iters, label) in [
+            (0x1000u64, 256i64, 64u64, "regstride 256 in 2M"),
+            (0x1000u64, 4096i64, 32u64, "regstride 4096 in 2M"),
+            (SUPER - 1024, 256i64, 64u64, "regstride 256 crossing 2M"),
+            (0x1000u64, 0i64, 16u64, "regstride 0"),
+            (0x8000u64, -256i64, 32u64, "regstride -256"),
+        ] {
+            let mut exp = 0u64;
+            for k in 0..iters {
+                let off = (start as i64 + (k as i64) * stride) as u64;
+                exp = exp.wrapping_add(words[(off / 8) as usize]);
+            }
+            {
+                let s = g.cpu.state_mut();
+                s.x[0] = 0;
+                s.x[2] = buf_va + start;
+                s.x[s0 as usize] = stride as u64;
+                s.x[4] = iters;
+            }
+            assert_eq!(g.run_at(&mut dbt, f_rstr), exp, "{label} ({regs:?})");
+        }
+
+        // 4. Watchpoint inside a 2 MiB superpage must stop precisely at the watched address
+        //    even after cpu->stlb was populated by previous runs.
+        let watch_va = buf_va + 0x300 + 40 * 256;
+        g.cpu.state_mut().set_hw_debug(&[], &[(watch_va, watch_va + 8, WATCH_LOAD)]);
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = buf_va + 0x300;
+            s.x[4] = 80;
+            s.pc = f_256;
+        }
+        assert_eq!(
+            dbt.run(&mut g.cpu),
+            Exit::Fault {
+                addr: watch_va,
+                access: Access::Read,
+                kind: FaultKind::Watchpoint,
+            },
+            "watchpoint inside 2 MiB superpage ({regs:?})"
+        );
+        g.cpu.state_mut().set_hw_debug(&[], &[]);
+
+        // 5. Demotion + tlb_flush must invalidate cpu->stlb so a replaced/unmapped/RO page inside
+        //    the former 2 MiB superpage is observed immediately.
+        //    First warm stlb again on buf_va, then replace page 10 with alt_host (different data),
+        //    flush TLB, and verify the loop reads alt_host's value.
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = buf_va + 0x300;
+            s.x[4] = 80;
+        }
+        assert_eq!(g.run_at(&mut dbt, f_256), exp_256);
+
+        let alt_val = 0xdead_beef_cafe_babe_u64;
+        unsafe {
+            alt_host.as_ptr().cast::<u64>().add(0x300 / 8).write(alt_val);
+            g.mmu
+                .map_shared(buf_va + 10 * PAGE_SIZE, alt_host, PAGE_SIZE, prot::READ)
+                .unwrap();
+        }
+        g.cpu.tlb_flush();
+        let mut exp_200 = 0u64;
+        for k in 0..200u64 {
+            let off = 0x300 + k * 256;
+            if off >= 10 * PAGE_SIZE && off < 11 * PAGE_SIZE {
+                let in_page = (off - 10 * PAGE_SIZE) as usize;
+                let v = unsafe { alt_host.as_ptr().add(in_page).cast::<u64>().read() };
+                exp_200 = exp_200.wrapping_add(v);
+            } else {
+                exp_200 = exp_200.wrapping_add(words[(off / 8) as usize]);
+            }
+        }
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = buf_va + 0x300;
+            s.x[4] = 200;
+        }
+        assert_eq!(g.run_at(&mut dbt, f_256), exp_200, "demoted page observed after flush ({regs:?})");
+
+        // Unmap page 11 and confirm exact fault at buf_va + 11 * PAGE_SIZE + 0x000
+        g.mmu.unmap(buf_va + 11 * PAGE_SIZE, PAGE_SIZE).unwrap();
+        g.cpu.tlb_flush();
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = buf_va + 0x300;
+            s.x[4] = 200;
+            s.pc = f_256;
+        }
+        assert_eq!(
+            dbt.run(&mut g.cpu),
+            Exit::Fault {
+                addr: buf_va + 11 * PAGE_SIZE,
+                access: Access::Read,
+                kind: FaultKind::Page,
+            },
+            "exact fault on unmapped demoted page ({regs:?})"
+        );
+    }
+
+    // 6. exec_memop bulk span paths across > 2 MiB superpages (memset, memcpy/memmove forward &
+    //    backward overlap, memcmp, memchr, strncmp).
+    let mut g = Guest::new();
+    let space = DbtSpace::new(0, DbtRegs::Default).unwrap();
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
+    unsafe {
+        g.mmu.map(buf_va, super_host, 2 * SUPER, RW).unwrap();
+    }
+    let fn_memset = CODE + 0x400;
+    let fn_memmove = CODE + 0x410;
+    let fn_memcmp = CODE + 0x420;
+    let fn_memchr = CODE + 0x430;
+    let fn_strncmp = CODE + 0x440;
+    for pc in [fn_memset, fn_memmove, fn_memcmp, fn_memchr, fn_strncmp] {
+        g.code(pc, &[0xd65f_03c0]); // ret (never reached on memop hit)
+    }
+    space.set_memops(&[
+        DbtMemop { pc: fn_memset, kind: MEMOP_MEMSET, reserved: 0 },
+        DbtMemop { pc: fn_memmove, kind: MEMOP_MEMMOVE, reserved: 0 },
+        DbtMemop { pc: fn_memcmp, kind: MEMOP_MEMCMP, reserved: 0 },
+        DbtMemop { pc: fn_memchr, kind: MEMOP_MEMCHR, reserved: 0 },
+        DbtMemop { pc: fn_strncmp, kind: MEMOP_STRNCMP, reserved: 0 },
+    ]);
+    let ret_svc = CODE + 0x480;
+    g.code(ret_svc, &[SVC]);
+
+    let bytes = unsafe { std::slice::from_raw_parts_mut(super_host.as_ptr(), (2 * SUPER) as usize) };
+    let len = (SUPER + 0x12345) as usize; // > 2 MiB, crosses superpage boundary
+
+    // memset > 2 MiB
+    {
+        let s = g.cpu.state_mut();
+        s.x[0] = buf_va + 0x100;
+        s.x[1] = 0x5a;
+        s.x[2] = len as u64;
+        s.x[30] = ret_svc;
+    }
+    assert_eq!(g.run_at(&mut dbt, fn_memset), buf_va + 0x100);
+    assert!(bytes[0x100..0x100 + len].iter().all(|&b| b == 0x5a));
+
+    // Seed pattern and test backward overlapping memmove across 2 MiB boundary
+    for (i, b) in bytes[0x100..0x100 + len].iter_mut().enumerate() {
+        *b = ((i * 7 + 3) & 0xff) as u8;
+    }
+    let shift = 0x500usize;
+    let expected_copy: Vec<u8> = bytes[0x100..0x100 + len].to_vec();
+    {
+        let s = g.cpu.state_mut();
+        s.x[0] = buf_va + (0x100 + shift) as u64;
+        s.x[1] = buf_va + 0x100;
+        s.x[2] = len as u64;
+        s.x[30] = ret_svc;
+    }
+    assert_eq!(g.run_at(&mut dbt, fn_memmove), buf_va + (0x100 + shift) as u64);
+    assert_eq!(&bytes[0x100 + shift..0x100 + shift + len], &expected_copy[..]);
+
+    // memcmp equal across > 2 MiB (using two non-overlapping superpage ranges)
+    let dst2 = (SUPER + 0x2000) as usize;
+    let cmp_len = (SUPER - 0x4000) as usize;
+    bytes.copy_within(0x100..0x100 + cmp_len, dst2);
+    {
+        let s = g.cpu.state_mut();
+        s.x[0] = buf_va + 0x100;
+        s.x[1] = buf_va + dst2 as u64;
+        s.x[2] = cmp_len as u64;
+        s.x[30] = ret_svc;
+    }
+    assert_eq!(g.run_at(&mut dbt, fn_memcmp), 0);
+
+    // memchr finding a byte past the 2 MiB superpage boundary
+    bytes[0..0x220000].fill(b'A');
+    bytes[0x215432] = b'Z';
+    {
+        let s = g.cpu.state_mut();
+        s.x[0] = buf_va + 0x10;
+        s.x[1] = b'Z' as u64;
+        s.x[2] = 0x220000;
+        s.x[30] = ret_svc;
+    }
+    assert_eq!(g.run_at(&mut dbt, fn_memchr), buf_va + 0x215432);
+
+    // strncmp crossing the 2 MiB superpage boundary
+    bytes[0..0x201000].fill(b'x');
+    bytes[0x200500] = 0;
+    {
+        let s = g.cpu.state_mut();
+        s.x[0] = buf_va;
+        s.x[1] = buf_va;
+        s.x[2] = 0x201000;
+        s.x[30] = ret_svc;
+    }
+    assert_eq!(g.run_at(&mut dbt, fn_strncmp), 0);
+}
+
 fn b_cond(from: u64, to: u64, cond: u32) -> u32 {
     0x5400_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5) | (cond & 15)
 }

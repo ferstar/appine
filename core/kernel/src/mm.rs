@@ -4220,22 +4220,42 @@ impl Mm {
     }
 
     /// Finds a free range of length `len`, top down, leaving the guard gap below grows-down
-    /// mappings free as Linux's `vm_unmapped_area` does.
+    /// mappings free as Linux's `vm_unmapped_area` does. Mappings of at least one 2 MiB leaf span
+    /// are 2 MiB-aligned when space permits (like Linux's THP alignment) so their interior and head
+    /// pages form L2 superpages in the soft-MMU.
     pub fn find_free(&self, len: u64) -> Option<u64> {
-        let mut top = self.mmap_top;
-        for (&s, v) in self.vmas.range(..self.mmap_top).rev() {
-            let end = s + v.len;
-            if end <= top && top - end >= len {
-                return Some(top - len);
+        let search = |align: u64| -> Option<u64> {
+            let mask = align - 1;
+            let mut top = self.mmap_top;
+            for (&s, v) in self.vmas.range(..self.mmap_top).rev() {
+                let end = s + v.len;
+                if end <= top && top - end >= len {
+                    let cand = (top - len) & !mask;
+                    if cand >= end {
+                        return Some(cand);
+                    }
+                }
+                let low = if v.growsdown {
+                    s.saturating_sub(STACK_GUARD_GAP)
+                } else {
+                    s
+                };
+                top = top.min(low);
             }
-            let low = if v.growsdown {
-                s.saturating_sub(STACK_GUARD_GAP)
-            } else {
-                s
-            };
-            top = top.min(low);
+            if top >= mmap_min().saturating_add(len) {
+                let cand = (top - len) & !mask;
+                if cand >= mmap_min() {
+                    return Some(cand);
+                }
+            }
+            None
+        };
+        if len >= LEAF_SPAN
+            && let Some(addr) = search(LEAF_SPAN)
+        {
+            return Some(addr);
         }
-        (top >= mmap_min().saturating_add(len)).then(|| top - len)
+        search(PAGE_SIZE)
     }
 
     /// Host memory for a new private anonymous mapping: a `PROT_NONE` one is only a reservation
@@ -8009,5 +8029,49 @@ mod tests {
                 .load(Ordering::Relaxed),
             heap_len
         );
+    }
+
+    #[test]
+    fn find_free_aligns_large_mappings_to_superpage() {
+        let mut mm = Mm::new();
+        // A small mapping first shifts the top-down frontier off a 2 MiB boundary.
+        let small = mm
+            .mmap(
+                0,
+                PAGE_SIZE,
+                prot::READ | prot::WRITE,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        assert_ne!(small % LEAF_SPAN, 0);
+        // A >= 2 MiB mapping is still placed on an exact 2 MiB boundary.
+        let big = mm
+            .mmap(
+                0,
+                LEAF_SPAN + 0x86000,
+                prot::READ | prot::WRITE,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        assert_eq!(big % LEAF_SPAN, 0);
+        // Fragmented fallback: if the only gap is >= LEAF_SPAN wide but contains no 2 MiB-aligned
+        // range of length LEAF_SPAN, find_free still returns a page-aligned address.
+        let base = (mmap_min() + LEAF_SPAN) & !(LEAF_SPAN - 1);
+        mm.mmap_top = base + LEAF_SPAN + PAGE_SIZE;
+        mm.vmas.clear();
+        let _ = mm
+            .mmap(
+                mmap_min(),
+                (base + PAGE_SIZE) - mmap_min(),
+                0,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED | flags::MAP_NORESERVE,
+                None,
+            )
+            .unwrap();
+        let fallback = mm.find_free(LEAF_SPAN).unwrap();
+        assert_eq!(fallback, base + PAGE_SIZE);
+        assert_ne!(fallback % LEAF_SPAN, 0);
     }
 }

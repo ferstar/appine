@@ -18,6 +18,8 @@ pub const VA_BITS: u32 = 48;
 pub const TLB_ENTRIES: usize = 4096;
 /// Number of software instruction-fetch TLB entries per CPU.
 pub const ITLB_ENTRIES: usize = 512;
+/// Number of software 2 MiB superpage data TLB entries per CPU.
+pub const STLB_ENTRIES: usize = 1024;
 
 /// Page permissions, with the same values as Linux's `PROT_*`.
 pub mod prot {
@@ -49,6 +51,10 @@ struct ItlbEntry {
     tag: u64,
     addend: u64,
 }
+
+#[repr(C, align(4096))]
+#[derive(Clone, Copy)]
+struct Stlb([TlbEntry; STLB_ENTRIES]);
 
 /// Maximum number of hardware breakpoints, and of watchpoints (C's `APPINE_HW_SLOTS`).
 pub const HW_SLOTS: usize = 16;
@@ -117,6 +123,8 @@ pub struct CpuState {
     reserved: u32,
     brk: [u64; HW_SLOTS],
     watch: [WatchSlot; HW_SLOTS],
+    stlb_used: [u64; STLB_ENTRIES / 64],
+    stlb: Stlb,
 }
 
 impl CpuState {
@@ -185,6 +193,7 @@ unsafe extern "C" {
         off_jump_cache: usize,
         off_tlb: usize,
         off_v: usize,
+        off_stlb: usize,
     ) -> c_int;
 
     fn appine_fault_guard_install();
@@ -1009,6 +1018,7 @@ pub fn layout_matches() -> bool {
             offset_of!(CpuState, dbt_jump_cache),
             offset_of!(CpuState, tlb),
             offset_of!(CpuState, v),
+            offset_of!(CpuState, stlb),
         ) == 1
     }
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: split fork/copy-on-write into kernel/cow and host backing/release into kernel/hostmem)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: 2 MiB-align top-down find_free allocations of at least LEAF_SPAN when space permits)
 
 ## Responsibilities
 
@@ -113,9 +113,11 @@ reads (`kernel/fuse`) and the host abstraction layer (`core/hal`).
   exec): `STACK_TOP` minus the limit plus the stack guard gap, clamped between 1 GB + 8 MB and 5/6
   of the address space. An unlimited stack still gives a top-down layout with the largest gap.
 - `STACK_TOP` is `1 << 47`. A position-independent main program loads at `0x5555_5555_0000`.
-  Non-fixed `mmap` allocates top-down from `mmap_top` (`find_free`), skipping the guard gap
-  (`stack_guard_gap`, 256 pages) below every grows-down VMA, with a floor of `vm.mmap_min_addr`
-  (`MMAP_MIN_ADDR`, 32768 as on distribution and GKI arm64 kernels; at least one page). The sysctl
+  Non-fixed `mmap` allocates top-down from `mmap_top` (`find_free`), 2 MB-aligning mappings of at
+  least `LEAF_SPAN` (2 MB) when VA space permits (falling back to page alignment if fragmented) so
+  large mappings form L2 superpages in `kernel/mmu`, skipping the guard gap (`stack_guard_gap`, 256
+  pages) below every grows-down VMA, with a floor of `vm.mmap_min_addr` (`MMAP_MIN_ADDR`, 32768 as
+  on distribution and GKI arm64 kernels; at least one page). The sysctl
   is global and writable with `CAP_SYS_RAWIO`.
 - `map_stack` maps the arguments and auxv plus 128 KB (capped at the page-aligned limit, never
   below what the arguments use) at the top of one `MAP_NORESERVE` host region of
