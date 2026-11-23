@@ -2273,18 +2273,18 @@ fn fast_loop_accelerates_canonical_strided_loops() {
         g.code(
             f1,
             &[
-                0xad40_5854,                      // ldp q20, q22, [x2]
-                0xad40_5c95,                      // ldp q21, q23, [x4]
-                0xad41_6858,                      // ldp q24, q26, [x2, #32]
-                0x9101_0042,                      // add x2, x2, #0x40
-                0xad41_6c99,                      // ldp q25, q27, [x4, #32]
-                0x9101_0084,                      // add x4, x4, #0x40
-                0x4ef5_87bd,                      // add v29.2d, v29.2d, v21.2d
-                0x4ef4_87bd,                      // add v29.2d, v29.2d, v20.2d
-                0x4ef8_87bd,                      // add v29.2d, v29.2d, v24.2d
-                0x4ef9_87bd,                      // add v29.2d, v29.2d, v25.2d
-                0xeb02_00df,                      // cmp x6, x2
-                b_cond(f1 + 44, f1, 1),           // b.ne f1
+                0xad40_5854,            // ldp q20, q22, [x2]
+                0xad40_5c95,            // ldp q21, q23, [x4]
+                0xad41_6858,            // ldp q24, q26, [x2, #32]
+                0x9101_0042,            // add x2, x2, #0x40
+                0xad41_6c99,            // ldp q25, q27, [x4, #32]
+                0x9101_0084,            // add x4, x4, #0x40
+                0x4ef5_87bd,            // add v29.2d, v29.2d, v21.2d
+                0x4ef4_87bd,            // add v29.2d, v29.2d, v20.2d
+                0x4ef8_87bd,            // add v29.2d, v29.2d, v24.2d
+                0x4ef9_87bd,            // add v29.2d, v29.2d, v25.2d
+                0xeb02_00df,            // cmp x6, x2
+                b_cond(f1 + 44, f1, 1), // b.ne f1
                 SVC,
             ],
         );
@@ -2325,17 +2325,17 @@ fn fast_loop_accelerates_canonical_strided_loops() {
         g.code(
             f2,
             &[
-                0x3cc0_2057,                      // ldur q23, [x2, #2]
-                0x1100_04a5,                      // add w5, w5, #1
-                0x3cc1_2056,                      // ldur q22, [x2, #18]
-                0x7c42_2459,                      // ldr h25, [x2], #34
-                0x3cc0_801c,                      // ldur q28, [x0, #8]
-                0xfc44_8418,                      // ldr d24, [x0], #72
-                0x4ef7_879d,                      // add v29.2d, v28.2d, v23.2d
-                0x4ef6_87bd,                      // add v29.2d, v29.2d, v22.2d
-                0x4efd_87de,                      // add v30.2d, v30.2d, v29.2d
-                0x6b05_00df,                      // cmp w6, w5
-                b_cond(f2 + 40, f2, 12),          // b.gt f2
+                0x3cc0_2057,             // ldur q23, [x2, #2]
+                0x1100_04a5,             // add w5, w5, #1
+                0x3cc1_2056,             // ldur q22, [x2, #18]
+                0x7c42_2459,             // ldr h25, [x2], #34
+                0x3cc0_801c,             // ldur q28, [x0, #8]
+                0xfc44_8418,             // ldr d24, [x0], #72
+                0x4ef7_879d,             // add v29.2d, v28.2d, v23.2d
+                0x4ef6_87bd,             // add v29.2d, v29.2d, v22.2d
+                0x4efd_87de,             // add v30.2d, v30.2d, v29.2d
+                0x6b05_00df,             // cmp w6, w5
+                b_cond(f2 + 40, f2, 12), // b.gt f2
                 SVC,
             ],
         );
@@ -2363,11 +2363,11 @@ fn fast_loop_accelerates_canonical_strided_loops() {
         for iter in 0..n2 {
             let p0 = 16 + iter * 72;
             let p2 = 32 + iter * 34;
-            for lane in 0..2 {
+            for (lane, acc) in exp_v30.iter_mut().enumerate() {
                 let a = read_u64(p0 + 8 + lane * 8);
                 let b = read_u64(p2 + 2 + lane * 8);
                 let c = read_u64(p2 + 18 + lane * 8);
-                exp_v30[lane] = exp_v30[lane].wrapping_add(a).wrapping_add(b).wrapping_add(c);
+                *acc = acc.wrapping_add(a).wrapping_add(b).wrapping_add(c);
             }
         }
         let s = g.cpu.state();
@@ -2384,20 +2384,20 @@ fn fast_loop_accelerates_canonical_strided_loops() {
         g.code(
             f3,
             &[
-                0x7c5f_e000,                      // ldur h0, [x0, #-2]
-                0xaa02_03e5,                      // mov x5, x2
-                0xfc5f_8053,                      // ldur d19, [x2, #-8]
-                0x1100_04c6,                      // add w6, w6, #1
-                0x9102_2042,                      // add x2, x2, #0x88
-                0x4cdf_20bc,                      // ld1 {v28.16b-v31.16b}, [x5], #64
-                0x4c40_a016,                      // ld1 {v22.16b-v23.16b}, [x0]
-                0x9100_8800,                      // add x0, x0, #0x22
-                0x4c40_20b8,                      // ld1 {v24.16b-v27.16b}, [x5]
-                0x4efc_86d4,                      // add v20.2d, v22.2d, v28.2d
-                0x4ef8_8694,                      // add v20.2d, v20.2d, v24.2d
-                0x4ef4_86b5,                      // add v21.2d, v21.2d, v20.2d
-                0x6b06_00ff,                      // cmp w7, w6
-                b_cond(f3 + 52, f3, 12),          // b.gt f3
+                0x7c5f_e000,             // ldur h0, [x0, #-2]
+                0xaa02_03e5,             // mov x5, x2
+                0xfc5f_8053,             // ldur d19, [x2, #-8]
+                0x1100_04c6,             // add w6, w6, #1
+                0x9102_2042,             // add x2, x2, #0x88
+                0x4cdf_20bc,             // ld1 {v28.16b-v31.16b}, [x5], #64
+                0x4c40_a016,             // ld1 {v22.16b-v23.16b}, [x0]
+                0x9100_8800,             // add x0, x0, #0x22
+                0x4c40_20b8,             // ld1 {v24.16b-v27.16b}, [x5]
+                0x4efc_86d4,             // add v20.2d, v22.2d, v28.2d
+                0x4ef8_8694,             // add v20.2d, v20.2d, v24.2d
+                0x4ef4_86b5,             // add v21.2d, v21.2d, v20.2d
+                0x6b06_00ff,             // cmp w7, w6
+                b_cond(f3 + 52, f3, 12), // b.gt f3
                 SVC,
             ],
         );
@@ -2416,7 +2416,11 @@ fn fast_loop_accelerates_canonical_strided_loops() {
         let s = g.cpu.state();
         assert_eq!(s.x[0], DATA + 16 + (n3 * 0x22) as u64, "{regs:?}");
         assert_eq!(s.x[2], DATA + 16 + (n3 * 0x88) as u64, "{regs:?}");
-        assert_eq!(s.x[5], DATA + 16 + ((n3 - 1) * 0x88 + 64) as u64, "{regs:?}");
+        assert_eq!(
+            s.x[5],
+            DATA + 16 + ((n3 - 1) * 0x88 + 64) as u64,
+            "{regs:?}"
+        );
         assert_eq!(s.x[6], n3 as u64, "{regs:?}");
         assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
         assert_eq!(dbt.stats().exits_interp, before.exits_interp, "{regs:?}");
@@ -2431,26 +2435,26 @@ fn fast_loop_accelerates_canonical_strided_loops() {
         g.code(
             f4,
             &[
-                0x3dc0_0003 | (base_s << 5),      // ldr q3, [xBase]
-                0x3dc0_029f,                      // ldr q31, [x20] -- wait: set x20 first below
-                0xd100_2014 | (base_s << 5),      // sub x20, xBase, #8
-                0xfd40_0291,                      // ldr d17, [x20]
-                0xf100_0718,                      // subs x24, x24, #1
+                0x3dc0_0003 | (base_s << 5),          // ldr q3, [xBase]
+                0x3dc0_029f,                          // ldr q31, [x20] -- wait: set x20 first below
+                0xd100_2014 | (base_s << 5),          // sub x20, xBase, #8
+                0xfd40_0291,                          // ldr d17, [x20]
+                0xf100_0718,                          // subs x24, x24, #1
                 0x9101_2000 | (base_s << 5) | base_s, // add xBase, xBase, #0x48
-                0x3dc0_02a4,                      // ldr q4, [x21]
-                0x9102_22b5,                      // add x21, x21, #0x88
-                0x3dc0_02c5,                      // ldr q5, [x22]
-                0x9102_22d6,                      // add x22, x22, #0x88
-                0x3dc0_02e6,                      // ldr q6, [x23]
-                0x9102_22f7,                      // add x23, x23, #0x88
-                0x3dc0_0127,                      // ldr q7, [x9]
-                0x9102_2129,                      // add x9, x9, #0x88
-                0x4ee3_8484,                      // add v4.2d, v4.2d, v3.2d
-                0x4ee5_8484,                      // add v4.2d, v4.2d, v5.2d
-                0x4ee6_8484,                      // add v4.2d, v4.2d, v6.2d
-                0x4ee7_8484,                      // add v4.2d, v4.2d, v7.2d
-                0x4ee4_8508,                      // add v8.2d, v8.2d, v4.2d
-                b_cond(f4 + 76, f4, 12),          // b.gt f4
+                0x3dc0_02a4,                          // ldr q4, [x21]
+                0x9102_22b5,                          // add x21, x21, #0x88
+                0x3dc0_02c5,                          // ldr q5, [x22]
+                0x9102_22d6,                          // add x22, x22, #0x88
+                0x3dc0_02e6,                          // ldr q6, [x23]
+                0x9102_22f7,                          // add x23, x23, #0x88
+                0x3dc0_0127,                          // ldr q7, [x9]
+                0x9102_2129,                          // add x9, x9, #0x88
+                0x4ee3_8484,                          // add v4.2d, v4.2d, v3.2d
+                0x4ee5_8484,                          // add v4.2d, v4.2d, v5.2d
+                0x4ee6_8484,                          // add v4.2d, v4.2d, v6.2d
+                0x4ee7_8484,                          // add v4.2d, v4.2d, v7.2d
+                0x4ee4_8508,                          // add v8.2d, v8.2d, v4.2d
+                b_cond(f4 + 76, f4, 12),              // b.gt f4
                 SVC,
             ],
         );
@@ -2470,8 +2474,16 @@ fn fast_loop_accelerates_canonical_strided_loops() {
         let before = dbt.stats();
         g.run_at(&mut dbt, f4);
         let s = g.cpu.state();
-        assert_eq!(s.x[base_s as usize], DATA + 16 + (n4 * 0x48) as u64, "{regs:?}");
-        assert_eq!(s.x[20], DATA + 16 + ((n4 - 1) * 0x48) as u64 - 8, "{regs:?}");
+        assert_eq!(
+            s.x[base_s as usize],
+            DATA + 16 + (n4 * 0x48) as u64,
+            "{regs:?}"
+        );
+        assert_eq!(
+            s.x[20],
+            DATA + 16 + ((n4 - 1) * 0x48) as u64 - 8,
+            "{regs:?}"
+        );
         assert_eq!(s.x[21], DATA + 32 + (n4 * 0x88) as u64, "{regs:?}");
         assert_eq!(s.x[24], 0, "{regs:?}");
         assert_eq!(s.nzcv, 0x6000_0000, "{regs:?}"); // subs 1 - 1 -> Z=1, C=1
@@ -2483,11 +2495,11 @@ fn fast_loop_accelerates_canonical_strided_loops() {
         g.code(
             f5,
             &[
-                0xf840_842a,                      // ldr x10, [x1], #8
-                0x9100_054a,                      // add x10, x10, #1
-                0xf800_844a,                      // str x10, [x2], #8
-                0xd100_0463,                      // sub x3, x3, #1
-                cbnz_x(f5 + 16, f5, 3),           // cbnz x3, f5
+                0xf840_842a,            // ldr x10, [x1], #8
+                0x9100_054a,            // add x10, x10, #1
+                0xf800_844a,            // str x10, [x2], #8
+                0xd100_0463,            // sub x3, x3, #1
+                cbnz_x(f5 + 16, f5, 3), // cbnz x3, f5
                 SVC,
             ],
         );
@@ -2519,11 +2531,11 @@ fn fast_loop_accelerates_canonical_strided_loops() {
         g.code(
             f6,
             &[
-                0xf840_842a,                      // ldr x10, [x1], #8
-                0x8b0a_0000,                      // add x0, x0, x10
-                0x9100_0c84,                      // add x4, x4, #3
-                0xf100_f09f,                      // cmp x4, #60
-                b_cond(f6 + 16, f6, 3),           // b.lo f6
+                0xf840_842a,            // ldr x10, [x1], #8
+                0x8b0a_0000,            // add x0, x0, x10
+                0x9100_0c84,            // add x4, x4, #3
+                0xf100_f09f,            // cmp x4, #60
+                b_cond(f6 + 16, f6, 3), // b.lo f6
                 SVC,
             ],
         );
@@ -2558,12 +2570,12 @@ fn fast_loop_preserves_exact_faults_tbi_watchpoints_and_kicks() {
         g.code(
             f1,
             &[
-                0xaa02_03e5,                      // mov x5, x2
-                0xf840_842a,                      // ldr x10, [x1], #8
-                0xf900_00aa,                      // str x10, [x5]
-                0x9100_2042,                      // add x2, x2, #8
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f1 + 20, f1, 1),           // b.ne f1
+                0xaa02_03e5,            // mov x5, x2
+                0xf840_842a,            // ldr x10, [x1], #8
+                0xf900_00aa,            // str x10, [x5]
+                0x9100_2042,            // add x2, x2, #8
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f1 + 20, f1, 1), // b.ne f1
                 SVC,
             ],
         );
@@ -2590,7 +2602,11 @@ fn fast_loop_preserves_exact_faults_tbi_watchpoints_and_kicks() {
         let s = g.cpu.state();
         assert_eq!(s.pc, f1 + 8, "{regs:?}");
         assert_eq!(s.x[2], DATA + 5 * PAGE_SIZE, "{regs:?}");
-        assert_eq!(s.x[5], DATA + 5 * PAGE_SIZE, "alias must be guest VA ({regs:?})");
+        assert_eq!(
+            s.x[5],
+            DATA + 5 * PAGE_SIZE,
+            "alias must be guest VA ({regs:?})"
+        );
         assert_eq!(s.x[3], 6, "{regs:?}");
         assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
 
@@ -2600,14 +2616,14 @@ fn fast_loop_preserves_exact_faults_tbi_watchpoints_and_kicks() {
         g.code(
             f2,
             &[
-                0xaa02_03e5,                      // mov x5, x2
-                0xf85f_804a,                      // ldur x10, [x2, #-8]
-                0xf940_00ab,                      // ldr x11, [x5]
-                0x8b0a_0000,                      // add x0, x0, x10
-                0x8b0b_0000,                      // add x0, x0, x11
-                0x9100_2042,                      // add x2, x2, #8
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f2 + 28, f2, 1),           // b.ne f2
+                0xaa02_03e5,            // mov x5, x2
+                0xf85f_804a,            // ldur x10, [x2, #-8]
+                0xf940_00ab,            // ldr x11, [x5]
+                0x8b0a_0000,            // add x0, x0, x10
+                0x8b0b_0000,            // add x0, x0, x11
+                0x9100_2042,            // add x2, x2, #8
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f2 + 28, f2, 1), // b.ne f2
                 SVC,
             ],
         );
@@ -2668,10 +2684,10 @@ fn fast_loop_preserves_exact_faults_tbi_watchpoints_and_kicks() {
         g.code(
             f4,
             &[
-                0xf840_842a,                      // ldr x10, [x1], #8
-                0x8b0a_0000,                      // add x0, x0, x10
-                0xeb01_00df,                      // cmp x6, x1
-                b_cond(f4 + 12, f4, 1),           // b.ne f4
+                0xf840_842a,            // ldr x10, [x1], #8
+                0x8b0a_0000,            // add x0, x0, x10
+                0xeb01_00df,            // cmp x6, x1
+                b_cond(f4 + 12, f4, 1), // b.ne f4
                 SVC,
             ],
         );
@@ -2689,11 +2705,11 @@ fn fast_loop_preserves_exact_faults_tbi_watchpoints_and_kicks() {
         g.code(
             f5,
             &[
-                0xf840_842a,                      // ldr x10, [x1], #8
-                0x8b0a_0000,                      // add x0, x0, x10
-                0x9100_0484,                      // add x4, x4, #1
-                0xeb04_00df,                      // cmp x6, x4
-                b_cond(f5 + 16, f5, 12),          // b.gt f5
+                0xf840_842a,             // ldr x10, [x1], #8
+                0x8b0a_0000,             // add x0, x0, x10
+                0x9100_0484,             // add x4, x4, #1
+                0xeb04_00df,             // cmp x6, x4
+                b_cond(f5 + 16, f5, 12), // b.gt f5
                 SVC,
             ],
         );
@@ -2727,9 +2743,9 @@ fn fast_loop_preserves_exact_faults_tbi_watchpoints_and_kicks() {
         g.code(
             f6,
             &[
-                0xf940_002a,                      // ldr x10, [x1]   (stride 0)
-                0xf840_844b,                      // ldr x11, [x2], #8 (would cross if unbounded, reset via sub)
-                0xd100_2042,                      // sub x2, x2, #8  -- net stride 0
+                0xf940_002a, // ldr x10, [x1]   (stride 0)
+                0xf840_844b, // ldr x11, [x2], #8 (would cross if unbounded, reset via sub)
+                0xd100_2042, // sub x2, x2, #8  -- net stride 0
                 SVC,
             ],
         );
@@ -2739,11 +2755,11 @@ fn fast_loop_preserves_exact_faults_tbi_watchpoints_and_kicks() {
         g.code(
             f_kick,
             &[
-                0xf940_002a,                      // ldr x10, [x1]
-                0xf940_004b,                      // ldr x11, [x2]
-                0x9100_0442,                      // add x2, x2, #1
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f_kick + 16, f_kick, 1),   // b.ne f_kick
+                0xf940_002a,                    // ldr x10, [x1]
+                0xf940_004b,                    // ldr x11, [x2]
+                0x9100_0442,                    // add x2, x2, #1
+                0xf100_0463,                    // subs x3, x3, #1
+                b_cond(f_kick + 16, f_kick, 1), // b.ne f_kick
                 SVC,
             ],
         );
@@ -2772,12 +2788,12 @@ fn fast_loop_rejects_unsafe_patterns() {
         g.code(
             f1,
             &[
-                0xf940_004a,                      // ldr x10, [x2]  (x2 is an induction pointer)
-                0xf900_0082,                      // str x2, [x4]   (stores x2's address value!)
-                0x9100_2042,                      // add x2, x2, #8
-                0x9100_2084,                      // add x4, x4, #8
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f1 + 20, f1, 1),           // b.ne f1
+                0xf940_004a,            // ldr x10, [x2]  (x2 is an induction pointer)
+                0xf900_0082,            // str x2, [x4]   (stores x2's address value!)
+                0x9100_2042,            // add x2, x2, #8
+                0x9100_2084,            // add x4, x4, #8
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f1 + 20, f1, 1), // b.ne f1
                 SVC,
             ],
         );
@@ -2789,7 +2805,11 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         g.run_at(&mut dbt, f1);
-        assert_eq!(dbt.stats().fast_loops, before, "pointer store must not fast-loop ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "pointer store must not fast-loop ({regs:?})"
+        );
         assert_eq!(g.data(0, 0x200), DATA + 0x100, "{regs:?}");
         assert_eq!(g.data(0, 0x208), DATA + 0x108, "{regs:?}");
 
@@ -2798,12 +2818,12 @@ fn fast_loop_rejects_unsafe_patterns() {
         g.code(
             f2,
             &[
-                0x8b05_0000,                      // add x0, x0, x5
-                0xaa02_03e5,                      // mov x5, x2
-                0xf940_00aa,                      // ldr x10, [x5]
-                0x9100_2042,                      // add x2, x2, #8
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f2 + 20, f2, 1),           // b.ne f2
+                0x8b05_0000,            // add x0, x0, x5
+                0xaa02_03e5,            // mov x5, x2
+                0xf940_00aa,            // ldr x10, [x5]
+                0x9100_2042,            // add x2, x2, #8
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f2 + 20, f2, 1), // b.ne f2
                 SVC,
             ],
         );
@@ -2817,17 +2837,21 @@ fn fast_loop_rejects_unsafe_patterns() {
         let before = dbt.stats().fast_loops;
         let expected = 7 + (DATA + 0x100) + (DATA + 0x108) + (DATA + 0x110);
         assert_eq!(g.run_at(&mut dbt, f2), expected, "{regs:?}");
-        assert_eq!(dbt.stats().fast_loops, before, "RBW alias must not fast-loop ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "RBW alias must not fast-loop ({regs:?})"
+        );
 
         // 3. Atomic load inside loop must be rejected.
         let f3 = CODE + 0xb00;
         g.code(
             f3,
             &[
-                0xc8df_fc4a,                      // ldar x10, [x2]
-                0x9100_2042,                      // add x2, x2, #8
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f3 + 12, f3, 1),           // b.ne f3
+                0xc8df_fc4a,            // ldar x10, [x2]
+                0x9100_2042,            // add x2, x2, #8
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f3 + 12, f3, 1), // b.ne f3
                 SVC,
             ],
         );
@@ -2838,17 +2862,21 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         g.run_at(&mut dbt, f3);
-        assert_eq!(dbt.stats().fast_loops, before, "atomic loop must not fast-loop ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "atomic loop must not fast-loop ({regs:?})"
+        );
 
         // 4. SP-based loop must be rejected.
         let f4 = CODE + 0xb40;
         g.code(
             f4,
             &[
-                0xf841_07ea,                      // ldr x10, [sp], #16
-                0x8b0a_0000,                      // add x0, x0, x10
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f4 + 12, f4, 1),           // b.ne f4
+                0xf841_07ea,            // ldr x10, [sp], #16
+                0x8b0a_0000,            // add x0, x0, x10
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f4 + 12, f4, 1), // b.ne f4
                 SVC,
             ],
         );
@@ -2860,7 +2888,11 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         g.run_at(&mut dbt, f4);
-        assert_eq!(dbt.stats().fast_loops, before, "SP loop must not fast-loop ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "SP loop must not fast-loop ({regs:?})"
+        );
         g.cpu.state_mut().sp = STACK;
 
         // 5. M_REG with UXTW (option=2) and advancing index must be rejected (32-bit wrap hazard).
@@ -2868,11 +2900,11 @@ fn fast_loop_rejects_unsafe_patterns() {
         g.code(
             f5,
             &[
-                0xf866_582a,                      // ldr x10, [x1, w6, uxtw #3]
-                0x8b0a_0000,                      // add x0, x0, x10
-                0x9100_04c6,                      // add x6, x6, #1
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f5 + 16, f5, 1),           // b.ne f5
+                0xf866_582a,            // ldr x10, [x1, w6, uxtw #3]
+                0x8b0a_0000,            // add x0, x0, x10
+                0x9100_04c6,            // add x6, x6, #1
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f5 + 16, f5, 1), // b.ne f5
                 SVC,
             ],
         );
@@ -2885,18 +2917,22 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         g.run_at(&mut dbt, f5);
-        assert_eq!(dbt.stats().fast_loops, before, "UXTW induction index must be rejected ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "UXTW induction index must be rejected ({regs:?})"
+        );
 
         // 6. M_REG with 32-bit index update (add w6, w6, #1) must be rejected (clears upper 32 bits).
         let f6 = CODE + 0xbc0;
         g.code(
             f6,
             &[
-                0xf866_782a,                      // ldr x10, [x1, x6, lsl #3]
-                0x8b0a_0000,                      // add x0, x0, x10
-                0x1100_04c6,                      // add w6, w6, #1
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f6 + 16, f6, 1),           // b.ne f6
+                0xf866_782a,            // ldr x10, [x1, x6, lsl #3]
+                0x8b0a_0000,            // add x0, x0, x10
+                0x1100_04c6,            // add w6, w6, #1
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f6 + 16, f6, 1), // b.ne f6
                 SVC,
             ],
         );
@@ -2909,17 +2945,21 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         g.run_at(&mut dbt, f6);
-        assert_eq!(dbt.stats().fast_loops, before, "32-bit index add must be rejected ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "32-bit index add must be rejected ({regs:?})"
+        );
 
         // 7. M_REG with rn == rm must be rejected (shifting rn would double-shift the address).
         let f7 = CODE + 0xc00;
         g.code(
             f7,
             &[
-                0xf862_684a,                      // ldr x10, [x2, x2]
-                0x9100_2042,                      // add x2, x2, #8
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f7 + 12, f7, 1),           // b.ne f7
+                0xf862_684a,            // ldr x10, [x2, x2]
+                0x9100_2042,            // add x2, x2, #8
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f7 + 12, f7, 1), // b.ne f7
                 SVC,
             ],
         );
@@ -2930,18 +2970,22 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         g.run_at(&mut dbt, f7);
-        assert_eq!(dbt.stats().fast_loops, before, "rn==rm M_REG must be rejected ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "rn==rm M_REG must be rejected ({regs:?})"
+        );
 
         // 8. Loop-local NZCV read-before-write (cset before any flag writer) must be rejected.
         let f8 = CODE + 0xc40;
         g.code(
             f8,
             &[
-                0xf840_842a,                      // ldr x10, [x1], #8
-                0x1a9f_47e7,                      // cset w7, pl  (reads pre-loop/prev-iter NZCV!)
-                0x8b07_0000,                      // add x0, x0, x7
-                0xeb04_003f,                      // cmp x1, x4
-                b_cond(f8 + 16, f8, 1),           // b.ne f8
+                0xf840_842a,            // ldr x10, [x1], #8
+                0x1a9f_47e7,            // cset w7, pl  (reads pre-loop/prev-iter NZCV!)
+                0x8b07_0000,            // add x0, x0, x7
+                0xeb04_003f,            // cmp x1, x4
+                b_cond(f8 + 16, f8, 1), // b.ne f8
                 SVC,
             ],
         );
@@ -2954,7 +2998,11 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         let res8 = g.run_at(&mut dbt, f8);
-        assert_eq!(dbt.stats().fast_loops, before, "RBW NZCV must be rejected ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "RBW NZCV must be rejected ({regs:?})"
+        );
         assert_eq!(res8, 0, "{regs:?}"); // N=1 before loop and N=1 on every cmp x1 < x4
 
         // 9. Inner CMP comparing a shifted pointer must be rejected (pointer opacity).
@@ -2962,12 +3010,12 @@ fn fast_loop_rejects_unsafe_patterns() {
         g.code(
             f9,
             &[
-                0xf840_842a,                      // ldr x10, [x1], #8
-                0xeb05_003f,                      // cmp x1, x5  (reads shifted x1!)
-                0x1a9f_17e7,                      // cset w7, eq
-                0x8b07_0000,                      // add x0, x0, x7
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f9 + 20, f9, 1),           // b.ne f9
+                0xf840_842a,            // ldr x10, [x1], #8
+                0xeb05_003f,            // cmp x1, x5  (reads shifted x1!)
+                0x1a9f_17e7,            // cset w7, eq
+                0x8b07_0000,            // add x0, x0, x7
+                0xf100_0463,            // subs x3, x3, #1
+                b_cond(f9 + 20, f9, 1), // b.ne f9
                 SVC,
             ],
         );
@@ -2980,19 +3028,23 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         assert_eq!(g.run_at(&mut dbt, f9), 1, "{regs:?}");
-        assert_eq!(dbt.stats().fast_loops, before, "inner CMP on shifted ptr must be rejected ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "inner CMP on shifted ptr must be rejected ({regs:?})"
+        );
 
         // 10. Register-stride pointer with non-invariant stride register must be rejected.
         let f10 = CODE + 0xcc0;
         g.code(
             f10,
             &[
-                0xf940_008a,                      // ldr x10, [x4]
-                0x8b09_0084,                      // add x4, x4, x9
-                0x9100_2129,                      // add x9, x9, #8 (mutates stride reg!)
-                0x8b0a_0000,                      // add x0, x0, x10
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f10 + 20, f10, 1),         // b.ne f10
+                0xf940_008a,              // ldr x10, [x4]
+                0x8b09_0084,              // add x4, x4, x9
+                0x9100_2129,              // add x9, x9, #8 (mutates stride reg!)
+                0x8b0a_0000,              // add x0, x0, x10
+                0xf100_0463,              // subs x3, x3, #1
+                b_cond(f10 + 20, f10, 1), // b.ne f10
                 SVC,
             ],
         );
@@ -3005,18 +3057,22 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         g.run_at(&mut dbt, f10);
-        assert_eq!(dbt.stats().fast_loops, before, "non-invariant stride reg must be rejected ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "non-invariant stride reg must be rejected ({regs:?})"
+        );
 
         // 11. Register-stride pointer accessed AFTER `add x4, x4, x9` must be rejected.
         let f11 = CODE + 0xd00;
         g.code(
             f11,
             &[
-                0x8b09_0084,                      // add x4, x4, x9
-                0xf940_008a,                      // ldr x10, [x4]
-                0x8b0a_0000,                      // add x0, x0, x10
-                0xf100_0463,                      // subs x3, x3, #1
-                b_cond(f11 + 16, f11, 1),         // b.ne f11
+                0x8b09_0084,              // add x4, x4, x9
+                0xf940_008a,              // ldr x10, [x4]
+                0x8b0a_0000,              // add x0, x0, x10
+                0xf100_0463,              // subs x3, x3, #1
+                b_cond(f11 + 16, f11, 1), // b.ne f11
                 SVC,
             ],
         );
@@ -3029,7 +3085,11 @@ fn fast_loop_rejects_unsafe_patterns() {
         }
         let before = dbt.stats().fast_loops;
         g.run_at(&mut dbt, f11);
-        assert_eq!(dbt.stats().fast_loops, before, "access after reg-stride add must be rejected ({regs:?})");
+        assert_eq!(
+            dbt.stats().fast_loops,
+            before,
+            "access after reg-stride add must be rejected ({regs:?})"
+        );
     }
 }
 
@@ -3063,58 +3123,63 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         g.code(
             f1,
             &[
-                0xacc8_7e3c,                      // ldp q28, q31, [x17], #256
-                0xbc7c_7857,                      // ldr s23, [x2, x28, lsl #2]
-                0x4d40_c85d,                      // ld1r {v29.4s}, [x2]
-                0x9100_1042,                      // add x2, x2, #4
-                0x4f97_139b,                      // fmla v27.4s, v28.4s, v23.s[0]
-                0x4e3d_cf99,                      // fmla v25.4s, v28.4s, v29.4s
-                0x4e3d_cff8,                      // fmla v24.4s, v31.4s, v29.4s
-                0x4f97_13fa,                      // fmla v26.4s, v31.4s, v23.s[0]
-                0xeb03_005f,                      // cmp x2, x3
-                b_cond(f1 + 36, f1, 1),           // b.ne f1
+                0xacc8_7e3c,            // ldp q28, q31, [x17], #256
+                0xbc7c_7857,            // ldr s23, [x2, x28, lsl #2]
+                0x4d40_c85d,            // ld1r {v29.4s}, [x2]
+                0x9100_1042,            // add x2, x2, #4
+                0x4f97_139b,            // fmla v27.4s, v28.4s, v23.s[0]
+                0x4e3d_cf99,            // fmla v25.4s, v28.4s, v29.4s
+                0x4e3d_cff8,            // fmla v24.4s, v31.4s, v29.4s
+                0x4f97_13fa,            // fmla v26.4s, v31.4s, v23.s[0]
+                0xeb03_005f,            // cmp x2, x3
+                b_cond(f1 + 36, f1, 1), // b.ne f1
                 SVC,
             ],
         );
         // 1a. Contiguous host pages (page 0 + page 1 share addend): x28 = 1024 floats (4096 B) ->
         //     [x2] is on page 0 and [x2, x28, lsl #2] is on page 1 with the SAME addend!
-        let run_f1 = |g: &mut Guest, dbt: &mut Dbt, x2_start: u64, x28_floats: u64, n: usize| -> [f32; 4] {
-            let s = g.cpu.state_mut();
-            s.x[17] = DATA;
-            s.x[2] = x2_start;
-            s.x[3] = x2_start + (n * 4) as u64;
-            s.x[28] = x28_floats;
-            for v in [24usize, 25, 26, 27] {
-                s.v[v] = [0, 0];
-            }
-            g.run_at(dbt, f1);
-            let s = g.cpu.state();
-            assert_eq!(s.x[2], x2_start + (n * 4) as u64);
-            assert_eq!(s.x[17], DATA + (n * 256) as u64);
-            assert_eq!(s.nzcv, 0x6000_0000);
-            let lo = s.v[27][0].to_le_bytes();
-            let hi = s.v[27][1].to_le_bytes();
-            [
-                f32::from_le_bytes(lo[0..4].try_into().unwrap()),
-                f32::from_le_bytes(lo[4..8].try_into().unwrap()),
-                f32::from_le_bytes(hi[0..4].try_into().unwrap()),
-                f32::from_le_bytes(hi[4..8].try_into().unwrap()),
-            ]
-        };
+        let run_f1 =
+            |g: &mut Guest, dbt: &mut Dbt, x2_start: u64, x28_floats: u64, n: usize| -> [f32; 4] {
+                let s = g.cpu.state_mut();
+                s.x[17] = DATA;
+                s.x[2] = x2_start;
+                s.x[3] = x2_start + (n * 4) as u64;
+                s.x[28] = x28_floats;
+                for v in [24usize, 25, 26, 27] {
+                    s.v[v] = [0, 0];
+                }
+                g.run_at(dbt, f1);
+                let s = g.cpu.state();
+                assert_eq!(s.x[2], x2_start + (n * 4) as u64);
+                assert_eq!(s.x[17], DATA + (n * 256) as u64);
+                assert_eq!(s.nzcv, 0x6000_0000);
+                let lo = s.v[27][0].to_le_bytes();
+                let hi = s.v[27][1].to_le_bytes();
+                [
+                    f32::from_le_bytes(lo[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(lo[4..8].try_into().unwrap()),
+                    f32::from_le_bytes(hi[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(hi[4..8].try_into().unwrap()),
+                ]
+            };
         let exp_f1 = |g: &Guest, x2_start: u64, x28_floats: u64, n: usize| -> [f32; 4] {
             let mut acc = [0.0f32; 4];
             for k in 0..n {
                 let s23 = read_f32(g, x2_start + (k * 4) as u64 + x28_floats * 4);
-                for lane in 0..4 {
+                for (lane, slot) in acc.iter_mut().enumerate() {
                     let v28 = read_f32(g, DATA + (k * 256 + lane * 4) as u64);
-                    acc[lane] = v28.mul_add(s23, acc[lane]);
+                    *slot = v28.mul_add(s23, *slot);
                 }
             }
             acc
         };
         let before = dbt.stats();
         let got_same = run_f1(&mut g, &mut dbt, DATA + 0x100, 1024, 24);
-        assert_eq!(got_same, exp_f1(&g, DATA + 0x100, 1024, 24), "same-addend M_REG ({regs:?})");
+        assert_eq!(
+            got_same,
+            exp_f1(&g, DATA + 0x100, 1024, 24),
+            "same-addend M_REG ({regs:?})"
+        );
         assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
         assert_eq!(dbt.stats().exits_interp, before.exits_interp, "{regs:?}");
 
@@ -3132,17 +3197,17 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         g.code(
             f2,
             &[
-                0xad40_7c9c,                      // ldp q28, q31, [x4]
-                0x8b1a_0084,                      // add x4, x4, x26
-                0xbd41_0037,                      // ldr s23, [x1, #256]
-                0x4d40_c83d,                      // ld1r {v29.4s}, [x1]
-                0x9100_1021,                      // add x1, x1, #4
-                0x4f97_139b,                      // fmla v27.4s, v28.4s, v23.s[0]
-                0x4e3d_cf99,                      // fmla v25.4s, v28.4s, v29.4s
-                0x4e3d_cff8,                      // fmla v24.4s, v31.4s, v29.4s
-                0x4f97_13fa,                      // fmla v26.4s, v31.4s, v23.s[0]
-                0xeb14_003f,                      // cmp x1, x20
-                b_cond(f2 + 40, f2, 1),           // b.ne f2
+                0xad40_7c9c,            // ldp q28, q31, [x4]
+                0x8b1a_0084,            // add x4, x4, x26
+                0xbd41_0037,            // ldr s23, [x1, #256]
+                0x4d40_c83d,            // ld1r {v29.4s}, [x1]
+                0x9100_1021,            // add x1, x1, #4
+                0x4f97_139b,            // fmla v27.4s, v28.4s, v23.s[0]
+                0x4e3d_cf99,            // fmla v25.4s, v28.4s, v29.4s
+                0x4e3d_cff8,            // fmla v24.4s, v31.4s, v29.4s
+                0x4f97_13fa,            // fmla v26.4s, v31.4s, v23.s[0]
+                0xeb14_003f,            // cmp x1, x20
+                b_cond(f2 + 40, f2, 1), // b.ne f2
                 SVC,
             ],
         );
@@ -3172,15 +3237,31 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         };
         let before = dbt.stats();
         // 2a. Normal positive stride (256 B) crossing page 0 -> page 1 (24 iters).
-        assert_eq!(run_f2(&mut g, &mut dbt, DATA + 0x200, 256, 24), exp_f2(&g, DATA + 0x200, 256, 24), "{regs:?}");
+        assert_eq!(
+            run_f2(&mut g, &mut dbt, DATA + 0x200, 256, 24),
+            exp_f2(&g, DATA + 0x200, 256, 24),
+            "{regs:?}"
+        );
         assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
         // 2b. Zero stride (bails cleanly via udiv -> 0).
-        assert_eq!(run_f2(&mut g, &mut dbt, DATA + 0x200, 0, 10), exp_f2(&g, DATA + 0x200, 0, 10), "{regs:?}");
+        assert_eq!(
+            run_f2(&mut g, &mut dbt, DATA + 0x200, 0, 10),
+            exp_f2(&g, DATA + 0x200, 0, 10),
+            "{regs:?}"
+        );
         // 2c. Negative stride (-32 B, bails cleanly via udiv -> 0).
         let neg32 = (-32i64) as u64;
-        assert_eq!(run_f2(&mut g, &mut dbt, DATA + 0x800, neg32, 10), exp_f2(&g, DATA + 0x800, neg32, 10), "{regs:?}");
+        assert_eq!(
+            run_f2(&mut g, &mut dbt, DATA + 0x800, neg32, 10),
+            exp_f2(&g, DATA + 0x800, neg32, 10),
+            "{regs:?}"
+        );
         // 2d. Stride >= 4096 (bails cleanly via udiv -> 0).
-        assert_eq!(run_f2(&mut g, &mut dbt, DATA, 4096, 4), exp_f2(&g, DATA, 4096, 4), "{regs:?}");
+        assert_eq!(
+            run_f2(&mut g, &mut dbt, DATA, 4096, 4),
+            exp_f2(&g, DATA, 4096, 4),
+            "{regs:?}"
+        );
 
         // 3. Loop 0x6ed64 shape: M_REG with loop-invariant bases x1/x2 + 64-bit induction index x6
         //    + 32-bit compare `cmp w10, w6; b.gt` + loop-local write-before-read NZCV (`fcmp`+`cset`).
@@ -3193,17 +3274,17 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         g.code(
             f3,
             &[
-                0x7c66_783f,                      // ldr h31, [x1, x6, lsl #1]
-                0x1ee2_43ff,                      // fcvt s31, h31
-                0x1e28_0bff,                      // fmul s31, s31, s8
-                0x1e2e_23e0,                      // fcmp s31, s14
-                0xbc26_785f,                      // str s31, [x2, x6, lsl #2]
-                0x9100_04c6,                      // add x6, x6, #1
-                0x1a9f_47e7,                      // cset w7, pl
-                0x5200_00e7,                      // eor w7, w7, #1
-                0x0a07_0000,                      // and w0, w0, w7
-                0x6b06_015f,                      // cmp w10, w6
-                b_cond(f3 + 40, f3, 12),          // b.gt f3
+                0x7c66_783f,             // ldr h31, [x1, x6, lsl #1]
+                0x1ee2_43ff,             // fcvt s31, h31
+                0x1e28_0bff,             // fmul s31, s31, s8
+                0x1e2e_23e0,             // fcmp s31, s14
+                0xbc26_785f,             // str s31, [x2, x6, lsl #2]
+                0x9100_04c6,             // add x6, x6, #1
+                0x1a9f_47e7,             // cset w7, pl
+                0x5200_00e7,             // eor w7, w7, #1
+                0x0a07_0000,             // and w0, w0, w7
+                0x6b06_015f,             // cmp w10, w6
+                b_cond(f3 + 40, f3, 12), // b.gt f3
                 SVC,
             ],
         );
@@ -3214,7 +3295,7 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
             s.x[2] = DATA + PAGE_SIZE; // RW page 1
             s.x[6] = 0;
             s.x[10] = 100;
-            s.v[8] = [2.0f32.to_bits() as u64, 0];  // s8 = 2.0
+            s.v[8] = [2.0f32.to_bits() as u64, 0]; // s8 = 2.0
             s.v[14] = [3.0f32.to_bits() as u64, 0]; // s14 = 3.0 -> +2.0 < 3.0 (MI -> pl=0 -> eor=1)
         }
         let before = dbt.stats();
@@ -3240,7 +3321,7 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
             let s = g.cpu.state_mut();
             s.x[0] = 1;
             s.x[1] = DATA + 6 * PAGE_SIZE - 16; // 8 f16s in page 5, 9th faults on unmapped page 6!
-            s.x[2] = DATA + 4 * PAGE_SIZE;      // RW page 4
+            s.x[2] = DATA + 4 * PAGE_SIZE; // RW page 4
             s.x[6] = 0;
             s.x[10] = 20;
             s.v[8] = [2.0f32.to_bits() as u64, 0];
@@ -3274,11 +3355,11 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         g.code(
             f4,
             &[
-                0xbc40_441e,                      // ldr s30, [x0], #4
-                0x1e3f_23d0,                      // fcmpe s30, s31
-                0x1e3e_4fff,                      // fcsel s31, s31, s30, mi
-                0xeb18_001f,                      // cmp x0, x24
-                b_cond(f4 + 16, f4, 1),           // b.ne f4
+                0xbc40_441e,            // ldr s30, [x0], #4
+                0x1e3f_23d0,            // fcmpe s30, s31
+                0x1e3e_4fff,            // fcsel s31, s31, s30, mi
+                0xeb18_001f,            // cmp x0, x24
+                b_cond(f4 + 16, f4, 1), // b.ne f4
                 SVC,
             ],
         );
@@ -3290,7 +3371,11 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         }
         let before = dbt.stats();
         g.run_at(&mut dbt, f4);
-        let max_got = f32::from_le_bytes(g.cpu.state().v[31][0].to_le_bytes()[0..4].try_into().unwrap());
+        let max_got = f32::from_le_bytes(
+            g.cpu.state().v[31][0].to_le_bytes()[0..4]
+                .try_into()
+                .unwrap(),
+        );
         let max_exp = (0..64)
             .map(|k| read_f32(&g, DATA + k * 4))
             .fold(-1000.0f32, f32::max);
@@ -3301,13 +3386,13 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         g.code(
             f5,
             &[
-                0x3ce0_685f,                      // ldr q31, [x2, x0]
-                0x3ce0_69dd,                      // ldr q29, [x14, x0]
-                0x4e3d_d7ff,                      // fadd v31.4s, v31.4s, v29.4s
-                0x3ca0_69df,                      // str q31, [x14, x0]
-                0x9100_4000,                      // add x0, x0, #16
-                0xeb01_001f,                      // cmp x0, x1
-                b_cond(f5 + 24, f5, 1),           // b.ne f5
+                0x3ce0_685f,            // ldr q31, [x2, x0]
+                0x3ce0_69dd,            // ldr q29, [x14, x0]
+                0x4e3d_d7ff,            // fadd v31.4s, v31.4s, v29.4s
+                0x3ca0_69df,            // str q31, [x14, x0]
+                0x9100_4000,            // add x0, x0, #16
+                0xeb01_001f,            // cmp x0, x1
+                b_cond(f5 + 24, f5, 1), // b.ne f5
                 SVC,
             ],
         );
@@ -3322,7 +3407,11 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         }
         let before = dbt.stats();
         g.run_at(&mut dbt, f5);
-        assert_eq!(read_f32(&g, dst_base), expected_first, "M_REG rw stream ({regs:?})");
+        assert_eq!(
+            read_f32(&g, dst_base),
+            expected_first,
+            "M_REG rw stream ({regs:?})"
+        );
         assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
 
         // 5. Loop-wide stolen-register pinning edge cases:
@@ -3337,11 +3426,11 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         g.code(
             f6,
             &[
-                0xf866_780a | (s0 << 5),          // ldr x10, [xS0, x6, lsl #3] (xS0 unwritten base)
-                0x8b0a_0000,                      // add x0, x0, x10
-                0x9100_04c6,                      // add x6, x6, #1
-                0xf100_0400 | (s1 << 5) | s1,     // subs xS1, xS1, #1 (xS1 written non-ptr)
-                b_cond(f6 + 16, f6, 1),           // b.ne f6
+                0xf866_780a | (s0 << 5), // ldr x10, [xS0, x6, lsl #3] (xS0 unwritten base)
+                0x8b0a_0000,             // add x0, x0, x10
+                0x9100_04c6,             // add x6, x6, #1
+                0xf100_0400 | (s1 << 5) | s1, // subs xS1, xS1, #1 (xS1 written non-ptr)
+                b_cond(f6 + 16, f6, 1),  // b.ne f6
                 SVC,
             ],
         );
@@ -3357,8 +3446,16 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
             exp6 = exp6.wrapping_add(g.data(0, 0x100 + k * 8));
         }
         let before = dbt.stats();
-        assert_eq!(g.run_at(&mut dbt, f6), exp6, "pinned unwritten stolen base ({regs:?})");
-        assert_eq!(g.cpu.state().x[s0 as usize], DATA + 0x100, "xS0 must stay guest VA ({regs:?})");
+        assert_eq!(
+            g.run_at(&mut dbt, f6),
+            exp6,
+            "pinned unwritten stolen base ({regs:?})"
+        );
+        assert_eq!(
+            g.cpu.state().x[s0 as usize],
+            DATA + 0x100,
+            "xS0 must stay guest VA ({regs:?})"
+        );
         assert_eq!(g.cpu.state().x[s1 as usize], 0, "{regs:?}");
         assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
 
@@ -3366,12 +3463,12 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
         g.code(
             f7,
             &[
-                0xaa02_03e0 | s0,                 // mov xS0, x2 (written stolen alias of x2!)
-                0xf940_000a | (s0 << 5),          // ldr x10, [xS0]
-                0x8b0a_0000,                      // add x0, x0, x10
-                0x9100_2042,                      // add x2, x2, #8
-                0xf100_0400 | (s1 << 5) | s1,     // subs xS1, xS1, #1
-                b_cond(f7 + 20, f7, 1),           // b.ne f7
+                0xaa02_03e0 | s0,             // mov xS0, x2 (written stolen alias of x2!)
+                0xf940_000a | (s0 << 5),      // ldr x10, [xS0]
+                0x8b0a_0000,                  // add x0, x0, x10
+                0x9100_2042,                  // add x2, x2, #8
+                0xf100_0400 | (s1 << 5) | s1, // subs xS1, xS1, #1
+                b_cond(f7 + 20, f7, 1),       // b.ne f7
                 SVC,
             ],
         );
@@ -3383,7 +3480,11 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
             s.x[s1 as usize] = 24;
         }
         let before = dbt.stats();
-        assert_eq!(g.run_at(&mut dbt, f7), exp6, "pinned written stolen alias ({regs:?})");
+        assert_eq!(
+            g.run_at(&mut dbt, f7),
+            exp6,
+            "pinned written stolen alias ({regs:?})"
+        );
         assert_eq!(g.cpu.state().x[2], DATA + 0x100 + 24 * 8, "{regs:?}");
         assert_eq!(
             g.cpu.state().x[s0 as usize],
@@ -3413,8 +3514,16 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
             s.x[s2 as usize] = 24;
         }
         let before = dbt.stats();
-        assert_eq!(g.run_at(&mut dbt, f8), exp6, "3-stolen fallback M_REG ({regs:?})");
-        assert_eq!(g.cpu.state().x[s0 as usize], DATA + 0x80 + 24 * 8, "{regs:?}");
+        assert_eq!(
+            g.run_at(&mut dbt, f8),
+            exp6,
+            "3-stolen fallback M_REG ({regs:?})"
+        );
+        assert_eq!(
+            g.cpu.state().x[s0 as usize],
+            DATA + 0x80 + 24 * 8,
+            "{regs:?}"
+        );
         assert_eq!(g.cpu.state().x[s1 as usize], 16, "{regs:?}");
         assert_eq!(g.cpu.state().x[s2 as usize], 0, "{regs:?}");
         assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
@@ -3437,9 +3546,13 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
     let buf_va = 0x2000_0000u64; // 2 MiB-aligned, 4 MiB total
 
     // Fill backing memory with deterministic u64 values (8-byte word index + 1).
-    let words = unsafe { std::slice::from_raw_parts_mut(super_host.as_ptr().cast::<u64>(), (2 * SUPER / 8) as usize) };
+    let words = unsafe {
+        std::slice::from_raw_parts_mut(super_host.as_ptr().cast::<u64>(), (2 * SUPER / 8) as usize)
+    };
     for (i, w) in words.iter_mut().enumerate() {
-        *w = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+        *w = (i as u64)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(1);
     }
 
     for regs in [DbtRegs::Default, DbtRegs::Go] {
@@ -3463,12 +3576,12 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
         g.code(
             f_seq,
             &[
-                0xf940_0043,                     // ldr x3, [x2]
-                0x8b03_0000,                     // add x0, x0, x3
-                0x9140_0442,                     // add x2, x2, #4096
-                0xb400_0024,                     // cbz x4, +4 (prevents fast-loop match)
-                0xf100_0484,                     // subs x4, x4, #1
-                b_cond(f_seq + 20, f_seq, 1),    // b.ne f_seq
+                0xf940_0043,                  // ldr x3, [x2]
+                0x8b03_0000,                  // add x0, x0, x3
+                0x9140_0442,                  // add x2, x2, #4096
+                0xb400_0024,                  // cbz x4, +4 (prevents fast-loop match)
+                0xf100_0484,                  // subs x4, x4, #1
+                b_cond(f_seq + 20, f_seq, 1), // b.ne f_seq
                 SVC,
             ],
         );
@@ -3483,8 +3596,16 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
             exp_seq = exp_seq.wrapping_add(words[((start_off + k * PAGE_SIZE) / 8) as usize]);
         }
         let before = dbt.stats();
-        assert_eq!(g.run_at(&mut dbt, f_seq), exp_seq, "superpage sequential prefill ({regs:?})");
-        assert_eq!(dbt.stats().exits_interp, before.exits_interp, "no tier0 exits ({regs:?})");
+        assert_eq!(
+            g.run_at(&mut dbt, f_seq),
+            exp_seq,
+            "superpage sequential prefill ({regs:?})"
+        );
+        assert_eq!(
+            dbt.stats().exits_interp,
+            before.exits_interp,
+            "no tier0 exits ({regs:?})"
+        );
 
         // 2. Constant-stride fast loops spanning multiple 4 KiB pages inside a 2 MiB superpage:
         //    (a) 256 B stride x 80 iters = 20 KiB (5x 4 KiB pages, like flash_attn 0x6f260)
@@ -3494,11 +3615,11 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
         g.code(
             f_256,
             &[
-                0xf940_0043,                     // ldr x3, [x2]
-                0x8b03_0000,                     // add x0, x0, x3
-                0x9104_0042,                     // add x2, x2, #256
-                0xf100_0484,                     // subs x4, x4, #1
-                b_cond(f_256 + 16, f_256, 1),    // b.ne f_256
+                0xf940_0043,                  // ldr x3, [x2]
+                0x8b03_0000,                  // add x0, x0, x3
+                0x9104_0042,                  // add x2, x2, #256
+                0xf100_0484,                  // subs x4, x4, #1
+                b_cond(f_256 + 16, f_256, 1), // b.ne f_256
                 SVC,
             ],
         );
@@ -3513,7 +3634,11 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
             exp_256 = exp_256.wrapping_add(words[((0x300 + k * 256) / 8) as usize]);
         }
         let before = dbt.stats();
-        assert_eq!(g.run_at(&mut dbt, f_256), exp_256, "2 MiB 256B fast loop ({regs:?})");
+        assert_eq!(
+            g.run_at(&mut dbt, f_256),
+            exp_256,
+            "2 MiB 256B fast loop ({regs:?})"
+        );
         assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
 
         // TBI top-byte tag on 2 MiB superpage fast loop
@@ -3523,19 +3648,26 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
             s.x[2] = (0xab_u64 << 56) | (buf_va + 0x300);
             s.x[4] = 80;
         }
-        assert_eq!(g.run_at(&mut dbt, f_256), exp_256, "TBI 2 MiB fast loop ({regs:?})");
-        assert_eq!(g.cpu.state().x[2], (0xab_u64 << 56) | (buf_va + 0x300 + 80 * 256));
+        assert_eq!(
+            g.run_at(&mut dbt, f_256),
+            exp_256,
+            "TBI 2 MiB fast loop ({regs:?})"
+        );
+        assert_eq!(
+            g.cpu.state().x[2],
+            (0xab_u64 << 56) | (buf_va + 0x300 + 80 * 256)
+        );
 
         // Non-pow2 136 B stride crossing the 2 MiB superpage boundary
         let f_136 = CODE + 0x240;
         g.code(
             f_136,
             &[
-                0xf940_0043,                     // ldr x3, [x2]
-                0x8b03_0000,                     // add x0, x0, x3
-                0x9102_2042,                     // add x2, x2, #136
-                0xf100_0484,                     // subs x4, x4, #1
-                b_cond(f_136 + 16, f_136, 1),    // b.ne f_136
+                0xf940_0043,                  // ldr x3, [x2]
+                0x8b03_0000,                  // add x0, x0, x3
+                0x9102_2042,                  // add x2, x2, #136
+                0xf100_0484,                  // subs x4, x4, #1
+                b_cond(f_136 + 16, f_136, 1), // b.ne f_136
                 SVC,
             ],
         );
@@ -3551,7 +3683,11 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
             exp_136 = exp_136.wrapping_add(words[((off_136 + k * 136) / 8) as usize]);
         }
         let before = dbt.stats();
-        assert_eq!(g.run_at(&mut dbt, f_136), exp_136, "2 MiB 136B boundary-crossing ({regs:?})");
+        assert_eq!(
+            g.run_at(&mut dbt, f_136),
+            exp_136,
+            "2 MiB 136B boundary-crossing ({regs:?})"
+        );
         assert!(dbt.stats().fast_loops > before.fast_loops, "{regs:?}");
 
         // 3. Register-stride fast loop (like flash_attn 0x6f5a0):
@@ -3564,11 +3700,11 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
         g.code(
             f_rstr,
             &[
-                0xf940_0043,                      // ldr x3, [x2]
-                0x8b03_0000,                      // add x0, x0, x3
-                0x8b00_0042 | (s0 << 16),         // add x2, x2, xS0 (stolen stride reg)
-                0xf100_0484,                      // subs x4, x4, #1
-                b_cond(f_rstr + 16, f_rstr, 1),   // b.ne f_rstr
+                0xf940_0043,                    // ldr x3, [x2]
+                0x8b03_0000,                    // add x0, x0, x3
+                0x8b00_0042 | (s0 << 16),       // add x2, x2, xS0 (stolen stride reg)
+                0xf100_0484,                    // subs x4, x4, #1
+                b_cond(f_rstr + 16, f_rstr, 1), // b.ne f_rstr
                 SVC,
             ],
         );
@@ -3597,7 +3733,9 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
         // 4. Watchpoint inside a 2 MiB superpage must stop precisely at the watched address
         //    even after cpu->stlb was populated by previous runs.
         let watch_va = buf_va + 0x300 + 40 * 256;
-        g.cpu.state_mut().set_hw_debug(&[], &[(watch_va, watch_va + 8, WATCH_LOAD)]);
+        g.cpu
+            .state_mut()
+            .set_hw_debug(&[], &[(watch_va, watch_va + 8, WATCH_LOAD)]);
         {
             let s = g.cpu.state_mut();
             s.x[0] = 0;
@@ -3630,7 +3768,11 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
 
         let alt_val = 0xdead_beef_cafe_babe_u64;
         unsafe {
-            alt_host.as_ptr().cast::<u64>().add(0x300 / 8).write(alt_val);
+            alt_host
+                .as_ptr()
+                .cast::<u64>()
+                .add(0x300 / 8)
+                .write(alt_val);
             g.mmu
                 .map_shared(buf_va + 10 * PAGE_SIZE, alt_host, PAGE_SIZE, prot::READ)
                 .unwrap();
@@ -3639,7 +3781,7 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
         let mut exp_200 = 0u64;
         for k in 0..200u64 {
             let off = 0x300 + k * 256;
-            if off >= 10 * PAGE_SIZE && off < 11 * PAGE_SIZE {
+            if (10 * PAGE_SIZE..11 * PAGE_SIZE).contains(&off) {
                 let in_page = (off - 10 * PAGE_SIZE) as usize;
                 let v = unsafe { alt_host.as_ptr().add(in_page).cast::<u64>().read() };
                 exp_200 = exp_200.wrapping_add(v);
@@ -3653,7 +3795,11 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
             s.x[2] = buf_va + 0x300;
             s.x[4] = 200;
         }
-        assert_eq!(g.run_at(&mut dbt, f_256), exp_200, "demoted page observed after flush ({regs:?})");
+        assert_eq!(
+            g.run_at(&mut dbt, f_256),
+            exp_200,
+            "demoted page observed after flush ({regs:?})"
+        );
 
         // Unmap page 11 and confirm exact fault at buf_va + 11 * PAGE_SIZE + 0x000
         g.mmu.unmap(buf_va + 11 * PAGE_SIZE, PAGE_SIZE).unwrap();
@@ -3693,16 +3839,37 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
         g.code(pc, &[0xd65f_03c0]); // ret (never reached on memop hit)
     }
     space.set_memops(&[
-        DbtMemop { pc: fn_memset, kind: MEMOP_MEMSET, reserved: 0 },
-        DbtMemop { pc: fn_memmove, kind: MEMOP_MEMMOVE, reserved: 0 },
-        DbtMemop { pc: fn_memcmp, kind: MEMOP_MEMCMP, reserved: 0 },
-        DbtMemop { pc: fn_memchr, kind: MEMOP_MEMCHR, reserved: 0 },
-        DbtMemop { pc: fn_strncmp, kind: MEMOP_STRNCMP, reserved: 0 },
+        DbtMemop {
+            pc: fn_memset,
+            kind: MEMOP_MEMSET,
+            reserved: 0,
+        },
+        DbtMemop {
+            pc: fn_memmove,
+            kind: MEMOP_MEMMOVE,
+            reserved: 0,
+        },
+        DbtMemop {
+            pc: fn_memcmp,
+            kind: MEMOP_MEMCMP,
+            reserved: 0,
+        },
+        DbtMemop {
+            pc: fn_memchr,
+            kind: MEMOP_MEMCHR,
+            reserved: 0,
+        },
+        DbtMemop {
+            pc: fn_strncmp,
+            kind: MEMOP_STRNCMP,
+            reserved: 0,
+        },
     ]);
     let ret_svc = CODE + 0x480;
     g.code(ret_svc, &[SVC]);
 
-    let bytes = unsafe { std::slice::from_raw_parts_mut(super_host.as_ptr(), (2 * SUPER) as usize) };
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(super_host.as_ptr(), (2 * SUPER) as usize) };
     let len = (SUPER + 0x12345) as usize; // > 2 MiB, crosses superpage boundary
 
     // memset > 2 MiB
@@ -3729,8 +3896,14 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
         s.x[2] = len as u64;
         s.x[30] = ret_svc;
     }
-    assert_eq!(g.run_at(&mut dbt, fn_memmove), buf_va + (0x100 + shift) as u64);
-    assert_eq!(&bytes[0x100 + shift..0x100 + shift + len], &expected_copy[..]);
+    assert_eq!(
+        g.run_at(&mut dbt, fn_memmove),
+        buf_va + (0x100 + shift) as u64
+    );
+    assert_eq!(
+        &bytes[0x100 + shift..0x100 + shift + len],
+        &expected_copy[..]
+    );
 
     // memcmp equal across > 2 MiB (using two non-overlapping superpage ranges)
     let dst2 = (SUPER + 0x2000) as usize;
@@ -3809,90 +3982,126 @@ fn fast_loop_gemm_bloc_derived_index_sp_and_cross_page() {
         //    - Derived compare `add x3, x0, #15; add x0, x0, #8; cmp x11, x3; b.gt`
         let f_single = CODE + 0x100;
         let single_insns = [
-            add_x(7, 10, 0),            // add x7, x10, x0
-            add_x(6, 17, 0),            // add x6, x17, x0 (stolen x17 read)
-            add_x(28, 16, 0),           // add x28, x16, x0 (2 stolen: x16 read, x28 write)
-            add_x(27, 15, 0),           // add x27, x15, x0 (stolen x27 write)
-            lsl1(7, 7),                 // lsl x7, x7, #1
-            lsl1(6, 6),                 // lsl x6, x6, #1
-            lsl1(5, 28),                // lsl x5, x28, #1 (stolen x28 read)
-            lsl1(4, 27),                // lsl x4, x27, #1 (stolen x27 read)
-            ldr_q_reg(15, 2, 7),        // ldr q15, [x2, x7]
-            ldr_q_reg(11, 1, 6),        // ldr q11, [x1, x6]
-            fmla_8h(0, 11, 15),         // fmla v0.8h, v11.8h, v15.8h
-            ldr_q_reg(11, 1, 5),        // ldr q11, [x1, x5]
-            fmla_8h(1, 11, 15),         // fmla v1.8h, v11.8h, v15.8h
-            ldr_q_reg(11, 1, 4),        // ldr q11, [x1, x4]
-            fmla_8h(2, 11, 15),         // fmla v2.8h, v11.8h, v15.8h
-            0x9100_3c03,                // add x3, x0, #15
-            0x9100_2000,                // add x0, x0, #8
-            stp_q_sp(0, 1, 0),          // stp q0, q1, [sp, #0]
-            stp_q_sp(2, 3, 352),        // stp q2, q3, [sp, #352] (384 B stack span)
-            0xeb03_017f,                // cmp x11, x3
+            add_x(7, 10, 0),                         // add x7, x10, x0
+            add_x(6, 17, 0),                         // add x6, x17, x0 (stolen x17 read)
+            add_x(28, 16, 0),    // add x28, x16, x0 (2 stolen: x16 read, x28 write)
+            add_x(27, 15, 0),    // add x27, x15, x0 (stolen x27 write)
+            lsl1(7, 7),          // lsl x7, x7, #1
+            lsl1(6, 6),          // lsl x6, x6, #1
+            lsl1(5, 28),         // lsl x5, x28, #1 (stolen x28 read)
+            lsl1(4, 27),         // lsl x4, x27, #1 (stolen x27 read)
+            ldr_q_reg(15, 2, 7), // ldr q15, [x2, x7]
+            ldr_q_reg(11, 1, 6), // ldr q11, [x1, x6]
+            fmla_8h(0, 11, 15),  // fmla v0.8h, v11.8h, v15.8h
+            ldr_q_reg(11, 1, 5), // ldr q11, [x1, x5]
+            fmla_8h(1, 11, 15),  // fmla v1.8h, v11.8h, v15.8h
+            ldr_q_reg(11, 1, 4), // ldr q11, [x1, x4]
+            fmla_8h(2, 11, 15),  // fmla v2.8h, v11.8h, v15.8h
+            0x9100_3c03,         // add x3, x0, #15
+            0x9100_2000,         // add x0, x0, #8
+            stp_q_sp(0, 1, 0),   // stp q0, q1, [sp, #0]
+            stp_q_sp(2, 3, 352), // stp q2, q3, [sp, #352] (384 B stack span)
+            0xeb03_017f,         // cmp x11, x3
             b_cond(f_single + 20 * 4, f_single, 12), // b.gt f_single
             SVC,
         ];
         g.code(f_single, &single_insns);
 
-        let run_gemm = |g: &mut Guest, dbt: &mut Dbt, pc: u64, sp: u64, n: i64| -> (u64, u64, u64, u64) {
-            let s = g.cpu.state_mut();
-            s.x[0] = 0;
-            s.x[1] = DATA;
-            s.x[2] = DATA;
-            s.x[10] = 0;
-            s.x[11] = n as u64;
-            s.x[15] = 256;
-            s.x[16] = 512;
-            s.x[17] = 768;
-            s.x[18] = 1024;
-            s.x[9] = 128;
-            s.x[12] = 256;
-            s.x[13] = 384;
-            for r in 19..=25usize {
-                s.x[r] = 0xfeed_0000_0000_0000u64 + r as u64;
-            }
-            s.sp = sp;
-            for v in 0..4usize {
-                s.v[v] = [0, 0];
-            }
-            g.run_at(dbt, pc);
-            let s = g.cpu.state();
-            assert_eq!(s.sp, sp, "SP restored exactly ({regs:?})");
-            assert_eq!(s.x[1], DATA, "x1 restored ({regs:?})");
-            assert_eq!(s.x[2], DATA, "x2 restored ({regs:?})");
-            for r in 19..=25usize {
-                assert_eq!(
-                    s.x[r],
-                    0xfeed_0000_0000_0000u64 + r as u64,
-                    "borrowed non-stolen x{r} must be preserved ({regs:?})"
-                );
-            }
-            (s.x[0], s.x[3], s.v[0][0], s.nzcv)
-        };
+        let run_gemm =
+            |g: &mut Guest, dbt: &mut Dbt, pc: u64, sp: u64, n: i64| -> (u64, u64, u64, u64) {
+                let s = g.cpu.state_mut();
+                s.x[0] = 0;
+                s.x[1] = DATA;
+                s.x[2] = DATA;
+                s.x[10] = 0;
+                s.x[11] = n as u64;
+                s.x[15] = 256;
+                s.x[16] = 512;
+                s.x[17] = 768;
+                s.x[18] = 1024;
+                s.x[9] = 128;
+                s.x[12] = 256;
+                s.x[13] = 384;
+                for r in 19..=25usize {
+                    s.x[r] = 0xfeed_0000_0000_0000u64 + r as u64;
+                }
+                s.sp = sp;
+                for v in 0..4usize {
+                    s.v[v] = [0, 0];
+                }
+                g.run_at(dbt, pc);
+                let s = g.cpu.state();
+                assert_eq!(s.sp, sp, "SP restored exactly ({regs:?})");
+                assert_eq!(s.x[1], DATA, "x1 restored ({regs:?})");
+                assert_eq!(s.x[2], DATA, "x2 restored ({regs:?})");
+                for r in 19..=25usize {
+                    assert_eq!(
+                        s.x[r],
+                        0xfeed_0000_0000_0000u64 + r as u64,
+                        "borrowed non-stolen x{r} must be preserved ({regs:?})"
+                    );
+                }
+                (s.x[0], s.x[3], s.v[0][0], s.nzcv)
+            };
 
         // 1a. SP inside a single page + derived-compare boundary counts (0, 1, 2, 16 iters).
         let before = dbt.stats();
         let (x0_15, x3_15, _, _) = run_gemm(&mut g, &mut dbt, f_single, STACK - 512, 15);
-        assert_eq!((x0_15, x3_15), (8, 15), "N=15 -> 1 iter, 0 back-edges ({regs:?})");
-        assert!(dbt.stats().fast_loops > before.fast_loops, "gemm_bloc<4,5> matched ({regs:?})");
+        assert_eq!(
+            (x0_15, x3_15),
+            (8, 15),
+            "N=15 -> 1 iter, 0 back-edges ({regs:?})"
+        );
+        assert!(
+            dbt.stats().fast_loops > before.fast_loops,
+            "gemm_bloc<4,5> matched ({regs:?})"
+        );
 
         let (x0_16, x3_16, _, _) = run_gemm(&mut g, &mut dbt, f_single, STACK - 512, 16);
-        assert_eq!((x0_16, x3_16), (16, 23), "N=16 -> 2 iters, 1 back-edge ({regs:?})");
+        assert_eq!(
+            (x0_16, x3_16),
+            (16, 23),
+            "N=16 -> 2 iters, 1 back-edge ({regs:?})"
+        );
 
         let (x0_23, x3_23, _, _) = run_gemm(&mut g, &mut dbt, f_single, STACK - 512, 23);
-        assert_eq!((x0_23, x3_23), (16, 23), "N=23 -> 2 iters, 1 back-edge ({regs:?})");
+        assert_eq!(
+            (x0_23, x3_23),
+            (16, 23),
+            "N=23 -> 2 iters, 1 back-edge ({regs:?})"
+        );
 
         let (x0_24, x3_24, v0_24, _) = run_gemm(&mut g, &mut dbt, f_single, STACK - 512, 24);
-        assert_eq!((x0_24, x3_24), (24, 31), "N=24 -> 3 iters, 2 back-edges ({regs:?})");
+        assert_eq!(
+            (x0_24, x3_24),
+            (24, 31),
+            "N=24 -> 3 iters, 2 back-edges ({regs:?})"
+        );
 
         // Compare N=128 against Tier 0 (interpreter) for exact v0..v2, x27, x28, nzcv, and stack!
         let sp_in = DATA + 4 * PAGE_SIZE + 0x200;
         let (x0_128, x3_128, v0_128, nzcv_128) = run_gemm(&mut g, &mut dbt, f_single, sp_in, 128);
         assert_eq!((x0_128, x3_128), (128, 135), "{regs:?}");
-        assert_eq!(g.cpu.state().x[28], 512 + 120, "x28 scratch preserved ({regs:?})");
-        assert_eq!(g.cpu.state().x[27], 256 + 120, "x27 scratch preserved ({regs:?})");
-        assert_eq!(read_u64(&g, sp_in), v0_128, "spilled q0 matches v0 ({regs:?})");
-        assert_eq!(read_u64(&g, sp_in + 352), g.cpu.state().v[2][0], "spilled q2 matches v2 ({regs:?})");
+        assert_eq!(
+            g.cpu.state().x[28],
+            512 + 120,
+            "x28 scratch preserved ({regs:?})"
+        );
+        assert_eq!(
+            g.cpu.state().x[27],
+            256 + 120,
+            "x27 scratch preserved ({regs:?})"
+        );
+        assert_eq!(
+            read_u64(&g, sp_in),
+            v0_128,
+            "spilled q0 matches v0 ({regs:?})"
+        );
+        assert_eq!(
+            read_u64(&g, sp_in + 352),
+            g.cpu.state().v[2][0],
+            "spilled q2 matches v2 ({regs:?})"
+        );
         assert_ne!(v0_128, v0_24);
         assert_eq!(nzcv_128, 0x8000_0000, "cmp 128, 135 sets N=1 ({regs:?})");
 
@@ -3901,16 +4110,28 @@ fn fast_loop_gemm_bloc_derived_index_sp_and_cross_page() {
         let sp_cross = DATA + PAGE_SIZE - 128;
         let before_interp = dbt.stats().exits_interp;
         let (x0_c, _, v0_c, _) = run_gemm(&mut g, &mut dbt, f_single, sp_cross, 128);
-        assert_eq!((x0_c, v0_c), (128, v0_128), "cross-page contiguous SP ({regs:?})");
+        assert_eq!(
+            (x0_c, v0_c),
+            (128, v0_128),
+            "cross-page contiguous SP ({regs:?})"
+        );
         assert_eq!(read_u64(&g, sp_cross), v0_128);
         assert_eq!(read_u64(&g, sp_cross + 352), g.cpu.state().v[2][0]);
-        assert_eq!(dbt.stats().exits_interp, before_interp, "no tier0 exits on contiguous cross-page SP ({regs:?})");
+        assert_eq!(
+            dbt.stats().exits_interp,
+            before_interp,
+            "no tier0 exits on contiguous cross-page SP ({regs:?})"
+        );
 
         // 1c. SP straddling NON-CONTIGUOUS host pages (page 2 -> page 3 have swapped host pages!):
         //     prologue must detect addend mismatch and bail cleanly to slow loop!
         let sp_scat = DATA + 3 * PAGE_SIZE - 128;
         let (x0_s, _, v0_s, _) = run_gemm(&mut g, &mut dbt, f_single, sp_scat, 128);
-        assert_eq!((x0_s, v0_s), (128, v0_128), "scattered cross-page SP bails cleanly ({regs:?})");
+        assert_eq!(
+            (x0_s, v0_s),
+            (128, v0_128),
+            "scattered cross-page SP bails cleanly ({regs:?})"
+        );
         assert_eq!(read_u64(&g, sp_scat), v0_128);
         assert_eq!(read_u64(&g, sp_scat + 352), g.cpu.state().v[2][0]);
 
@@ -3972,10 +4193,29 @@ fn fast_loop_gemm_bloc_derived_index_sp_and_cross_page() {
         unsafe {
             g2.mmu.unmap(CODE + PAGE_SIZE, PAGE_SIZE).unwrap();
             g2.mmu
-                .map(CODE + PAGE_SIZE, base2.add(9 * 4096), PAGE_SIZE, prot::READ | prot::EXEC)
+                .map(
+                    CODE + PAGE_SIZE,
+                    base2.add(9 * 4096),
+                    PAGE_SIZE,
+                    prot::READ | prot::EXEC,
+                )
                 .unwrap();
-            for (p, host, perm) in [(0, 3, rw), (1, 4, rw), (2, 6, rw), (3, 5, rw), (4, 7, rw), (5, 8, prot::READ)] {
-                g2.mmu.map(DATA + p * PAGE_SIZE, base2.add(host * 4096), PAGE_SIZE, perm).unwrap();
+            for (p, host, perm) in [
+                (0, 3, rw),
+                (1, 4, rw),
+                (2, 6, rw),
+                (3, 5, rw),
+                (4, 7, rw),
+                (5, 8, prot::READ),
+            ] {
+                g2.mmu
+                    .map(
+                        DATA + p * PAGE_SIZE,
+                        base2.add(host * 4096),
+                        PAGE_SIZE,
+                        perm,
+                    )
+                    .unwrap();
             }
         }
         for p in 0..5usize {
@@ -3988,33 +4228,33 @@ fn fast_loop_gemm_bloc_derived_index_sp_and_cross_page() {
         let f_cross = CODE + 0xff0; // 4 instructions on page 0, rest on page 1!
         let cross_insns = [
             // Page 0 (0xff0..0x1000)
-            add_x(3, 10, 0),            // 0xff0: add x3, x10, x0
-            add_x(7, 18, 0),            // 0xff4: add x7, x18, x0 (stolen x18)
-            add_x(6, 9, 0),             // 0xff8: add x6, x9, x0
-            add_x(5, 12, 0),            // 0xffc: add x5, x12, x0
+            add_x(3, 10, 0), // 0xff0: add x3, x10, x0
+            add_x(7, 18, 0), // 0xff4: add x7, x18, x0 (stolen x18)
+            add_x(6, 9, 0),  // 0xff8: add x6, x9, x0
+            add_x(5, 12, 0), // 0xffc: add x5, x12, x0
             // Page 1 (0x1000..)
-            lsl1(3, 3),                 // 0x1000: lsl x3, x3, #1
-            lsl1(7, 7),                 // 0x1004: lsl x7, x7, #1
-            lsl1(6, 6),                 // 0x1008: lsl x6, x6, #1
-            lsl1(5, 5),                 // 0x100c: lsl x5, x5, #1
-            ldr_q_reg(15, 2, 3),        // 0x1010: ldr q15, [x2, x3]
-            add_x(3, 17, 0),            // 0x1014: add x3, x17, x0 (stolen x17)
-            ldr_q_reg(14, 2, 6),        // 0x1018: ldr q14, [x2, x6]
-            lsl1(3, 3),                 // 0x101c: lsl x3, x3, #1
-            ldr_q_reg(13, 2, 5),        // 0x1020: ldr q13, [x2, x5]
-            ldr_q_reg(11, 1, 7),        // 0x1024: ldr q11, [x1, x7]
-            add_x(7, 16, 0),            // 0x1028: add x7, x16, x0 (stolen x16)
-            lsl1(7, 7),                 // 0x102c: lsl x7, x7, #1
-            fmla_8h(0, 11, 15),         // 0x1030: fmla v0.8h, v11.8h, v15.8h
-            ldr_q_reg(11, 1, 3),        // 0x1034: ldr q11, [x1, x3]
-            0x9100_3c03,                // 0x1038: add x3, x0, #15
-            0x9100_2000,                // 0x103c: add x0, x0, #8
-            fmla_8h(1, 11, 14),         // 0x1040: fmla v1.8h, v11.8h, v14.8h
-            ldr_q_reg(11, 1, 7),        // 0x1044: ldr q11, [x1, x7]
-            fmla_8h(2, 11, 13),         // 0x1048: fmla v2.8h, v11.8h, v13.8h
-            stp_q_sp(0, 1, 0),          // 0x104c: stp q0, q1, [sp, #0]
-            stp_q_sp(2, 3, 352),        // 0x1050: stp q2, q3, [sp, #352]
-            0xeb03_017f,                // 0x1054: cmp x11, x3
+            lsl1(3, 3),                            // 0x1000: lsl x3, x3, #1
+            lsl1(7, 7),                            // 0x1004: lsl x7, x7, #1
+            lsl1(6, 6),                            // 0x1008: lsl x6, x6, #1
+            lsl1(5, 5),                            // 0x100c: lsl x5, x5, #1
+            ldr_q_reg(15, 2, 3),                   // 0x1010: ldr q15, [x2, x3]
+            add_x(3, 17, 0),                       // 0x1014: add x3, x17, x0 (stolen x17)
+            ldr_q_reg(14, 2, 6),                   // 0x1018: ldr q14, [x2, x6]
+            lsl1(3, 3),                            // 0x101c: lsl x3, x3, #1
+            ldr_q_reg(13, 2, 5),                   // 0x1020: ldr q13, [x2, x5]
+            ldr_q_reg(11, 1, 7),                   // 0x1024: ldr q11, [x1, x7]
+            add_x(7, 16, 0),                       // 0x1028: add x7, x16, x0 (stolen x16)
+            lsl1(7, 7),                            // 0x102c: lsl x7, x7, #1
+            fmla_8h(0, 11, 15),                    // 0x1030: fmla v0.8h, v11.8h, v15.8h
+            ldr_q_reg(11, 1, 3),                   // 0x1034: ldr q11, [x1, x3]
+            0x9100_3c03,                           // 0x1038: add x3, x0, #15
+            0x9100_2000,                           // 0x103c: add x0, x0, #8
+            fmla_8h(1, 11, 14),                    // 0x1040: fmla v1.8h, v11.8h, v14.8h
+            ldr_q_reg(11, 1, 7),                   // 0x1044: ldr q11, [x1, x7]
+            fmla_8h(2, 11, 13),                    // 0x1048: fmla v2.8h, v11.8h, v13.8h
+            stp_q_sp(0, 1, 0),                     // 0x104c: stp q0, q1, [sp, #0]
+            stp_q_sp(2, 3, 352),                   // 0x1050: stp q2, q3, [sp, #352]
+            0xeb03_017f,                           // 0x1054: cmp x11, x3
             b_cond(f_cross + 26 * 4, f_cross, 12), // 0x1058: b.gt f_cross
             SVC,
         ];
@@ -4032,17 +4272,49 @@ fn fast_loop_gemm_bloc_derived_index_sp_and_cross_page() {
 
         let mut dbt2 = Dbt::with_regs(regs).unwrap();
         let before2 = dbt2.stats();
-        let (x0_x, x3_x, v0_x, nzcv_x) = run_gemm(&mut g2, &mut dbt2, f_cross, DATA + 4 * PAGE_SIZE + 0x100, 128);
-        assert_eq!((x0_x, x3_x, nzcv_x), (128, 135, 0x8000_0000), "cross-page fast loop ({regs:?})");
-        assert!(dbt2.stats().fast_loops > before2.fast_loops, "cross-page fast loop matched ({regs:?})");
-        assert_eq!(v0_x, v0_128, "cross-page fast loop value matches ({regs:?})");
+        let (x0_x, x3_x, v0_x, nzcv_x) = run_gemm(
+            &mut g2,
+            &mut dbt2,
+            f_cross,
+            DATA + 4 * PAGE_SIZE + 0x100,
+            128,
+        );
+        assert_eq!(
+            (x0_x, x3_x, nzcv_x),
+            (128, 135, 0x8000_0000),
+            "cross-page fast loop ({regs:?})"
+        );
+        assert!(
+            dbt2.stats().fast_loops > before2.fast_loops,
+            "cross-page fast loop matched ({regs:?})"
+        );
+        assert_eq!(
+            v0_x, v0_128,
+            "cross-page fast loop value matches ({regs:?})"
+        );
 
         // 2b. Template reuse across instances for the cross-page fast loop
         let mut dbt3 = Dbt::with_regs(regs).unwrap();
-        let (x0_t, _, v0_t, _) = run_gemm(&mut g2, &mut dbt3, f_cross, DATA + 4 * PAGE_SIZE + 0x100, 128);
-        assert_eq!((x0_t, v0_t), (128, v0_128), "cross-page template reuse ({regs:?})");
-        assert!(dbt3.stats().blocks_shared > 0, "cross-page template hit ({regs:?})");
-        assert!(dbt3.stats().fast_loops > 0, "cross-page template preserved fast_loops stat ({regs:?})");
+        let (x0_t, _, v0_t, _) = run_gemm(
+            &mut g2,
+            &mut dbt3,
+            f_cross,
+            DATA + 4 * PAGE_SIZE + 0x100,
+            128,
+        );
+        assert_eq!(
+            (x0_t, v0_t),
+            (128, v0_128),
+            "cross-page template reuse ({regs:?})"
+        );
+        assert!(
+            dbt3.stats().blocks_shared > 0,
+            "cross-page template hit ({regs:?})"
+        );
+        assert!(
+            dbt3.stats().fast_loops > 0,
+            "cross-page template preserved fast_loops stat ({regs:?})"
+        );
 
         // 2c. Exact data fault inside page 1 of cross-page fast loop (at 0x1010: ldr q15, [x2, x3]):
         //     place x2 so iter 4 (x0 = 32 -> offset 64 B) hits unmapped DATA + 6 * PAGE_SIZE.
@@ -4069,21 +4341,54 @@ fn fast_loop_gemm_bloc_derived_index_sp_and_cross_page() {
             },
             "cross-page data fault ({regs:?})"
         );
-        assert_eq!(g2.cpu.state().pc, CODE + 0x1010, "exact fault PC in page 1 ({regs:?})");
-        assert_eq!(g2.cpu.state().x[0], 32, "4 iters completed before fault ({regs:?})");
-        assert_eq!(g2.cpu.state().x[2], DATA + 6 * PAGE_SIZE - 64, "x2 restored ({regs:?})");
-        assert_eq!(g2.cpu.state().sp, DATA + 4 * PAGE_SIZE + 0x100, "SP restored ({regs:?})");
+        assert_eq!(
+            g2.cpu.state().pc,
+            CODE + 0x1010,
+            "exact fault PC in page 1 ({regs:?})"
+        );
+        assert_eq!(
+            g2.cpu.state().x[0],
+            32,
+            "4 iters completed before fault ({regs:?})"
+        );
+        assert_eq!(
+            g2.cpu.state().x[2],
+            DATA + 6 * PAGE_SIZE - 64,
+            "x2 restored ({regs:?})"
+        );
+        assert_eq!(
+            g2.cpu.state().sp,
+            DATA + 4 * PAGE_SIZE + 0x100,
+            "SP restored ({regs:?})"
+        );
 
         // 2d. Hostile page-1 code modification + invalidate(CODE + PAGE_SIZE, PAGE_SIZE) ONLY:
         //     change `add x0, x0, #8` (at page 1 offset 0x3c) to `add x0, x0, #16` (`0x9100_4000`)
         //     and verify the cross-page block starting in page 0 IS invalidated!
         g2.pages[9].0[0x3c..0x40].copy_from_slice(&0x9100_4000u32.to_le_bytes());
         dbt2.invalidate(&g2.cpu, CODE + PAGE_SIZE, PAGE_SIZE);
-        let (x0_mod, _, _, _) = run_gemm(&mut g2, &mut dbt2, f_cross, DATA + 4 * PAGE_SIZE + 0x100, 128);
-        assert_eq!(x0_mod, 144, "modified page-1 step=16 runs 9 iters (0..=128 -> 144) ({regs:?})");
-        assert_eq!(g2.cpu.state().x[3], 128 + 15, "iter 8 saw x0=128 -> x3=143, then x0=144 ({regs:?})");
+        let (x0_mod, _, _, _) = run_gemm(
+            &mut g2,
+            &mut dbt2,
+            f_cross,
+            DATA + 4 * PAGE_SIZE + 0x100,
+            128,
+        );
+        assert_eq!(
+            x0_mod, 144,
+            "modified page-1 step=16 runs 9 iters (0..=128 -> 144) ({regs:?})"
+        );
+        assert_eq!(
+            g2.cpu.state().x[3],
+            128 + 15,
+            "iter 8 saw x0=128 -> x3=143, then x0=144 ({regs:?})"
+        );
         // Verify it truly ran 9 iters (not 16): v0_x had 16 iters of +1.0*+1.0, new has 9 iters!
-        assert_ne!(g2.cpu.state().v[0][0], v0_x, "page-1 rewrite observed by page-0 block ({regs:?})");
+        assert_ne!(
+            g2.cpu.state().v[0][0],
+            v0_x,
+            "page-1 rewrite observed by page-0 block ({regs:?})"
+        );
 
         // 2e. Hostile page-1 unmap + invalidate(CODE + PAGE_SIZE, PAGE_SIZE):
         //     re-running from f_cross must execute page 0 and fault cleanly at CODE + PAGE_SIZE!

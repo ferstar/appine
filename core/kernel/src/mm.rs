@@ -8243,10 +8243,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ro_priv % LEAF_SPAN, 0);
-        assert_eq!(mm.mmu().next_present(ro_priv, ro_priv + map_len), ro_priv + map_len);
+        assert_eq!(
+            mm.mmu().next_present(ro_priv, ro_priv + map_len),
+            ro_priv + map_len
+        );
         assert!(mm.fault_in(ro_priv + PAGE_SIZE, prot::READ));
         let first_end = ((ro_priv + PAGE_SIZE) | (FILE_FAULT_SPAN - 1)) + 1;
-        assert!(mm.mmu().translate(first_end - PAGE_SIZE, prot::READ).is_some());
+        assert!(
+            mm.mmu()
+                .translate(first_end - PAGE_SIZE, prot::READ)
+                .is_some()
+        );
         assert_eq!(
             mm.mmu().next_present(first_end, ro_priv + map_len),
             ro_priv + map_len
@@ -8259,8 +8266,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            mm.mmu()
-                .next_present(ro_priv + file_len, ro_priv + map_len),
+            mm.mmu().next_present(ro_priv + file_len, ro_priv + map_len),
             ro_priv + map_len
         );
 
@@ -8276,7 +8282,11 @@ mod tests {
             .unwrap();
         assert!(mm.fault_in(ro_shared + PAGE_SIZE, prot::READ));
         let shared_end = ((ro_shared + PAGE_SIZE) | (FILE_FAULT_SPAN - 1)) + 1;
-        assert!(mm.mmu().translate(shared_end - PAGE_SIZE, prot::READ).is_some());
+        assert!(
+            mm.mmu()
+                .translate(shared_end - PAGE_SIZE, prot::READ)
+                .is_some()
+        );
         assert_eq!(
             mm.mmu().next_present(shared_end, ro_shared + file_len),
             ro_shared + file_len
@@ -8299,7 +8309,8 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            mm.mmu().next_present(rw_priv + LEAF_SPAN, rw_priv + file_len),
+            mm.mmu()
+                .next_present(rw_priv + LEAF_SPAN, rw_priv + file_len),
             rw_priv + file_len
         );
     }
@@ -8373,8 +8384,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            mm.mmu()
-                .next_present(ro_file + file_len, ro_file + map_len),
+            mm.mmu().next_present(ro_file + file_len, ro_file + map_len),
             ro_file + map_len
         );
 
@@ -8398,13 +8408,22 @@ mod tests {
         for r in file_ranges {
             r.apply(libc::MADV_SEQUENTIAL);
         }
-        assert!(mm.advise_ranges(anon_untouched, 2 * LEAF_SPAN, true).is_empty());
-        assert!(mm.advise_ranges(anon_written, 2 * LEAF_SPAN, true).is_empty());
+        assert!(
+            mm.advise_ranges(anon_untouched, 2 * LEAF_SPAN, true)
+                .is_empty()
+        );
+        assert!(
+            mm.advise_ranges(anon_written, 2 * LEAF_SPAN, true)
+                .is_empty()
+        );
         assert!(mm.advise_ranges(reserved, 2 * LEAF_SPAN, true).is_empty());
 
         // advise_ranges(file_only = false): includes file and written anonymous VMAs, skips
         // untouched anonymous and reserved VMAs, and applies MADV_WILLNEED cleanly.
-        assert!(mm.advise_ranges(anon_untouched, 2 * LEAF_SPAN, false).is_empty());
+        assert!(
+            mm.advise_ranges(anon_untouched, 2 * LEAF_SPAN, false)
+                .is_empty()
+        );
         assert!(mm.advise_ranges(reserved, 2 * LEAF_SPAN, false).is_empty());
         let written_ranges = mm.advise_ranges(anon_written, 2 * LEAF_SPAN, false);
         assert_eq!(written_ranges.len(), 1);
