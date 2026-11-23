@@ -7,7 +7,8 @@ devices	cgroup2_ebpf_test	14	EbpfTest.AttachAllowMulti:EbpfTest.AttachSucceeds:E
 devices	cgroup2_test	1	Cgroup2Test.DetachedMountBindFails	-
 devices	concurrency_test	1	ConcurrencyTest.MultiProcessMultithreaded	-
 devices	dev_test	17	*	-
-devices	fuse_test	18	FuseCheckpointTest.*:FuseInterruptTest.Fatal*:FuseInterruptTest.Interrupt*:FuseTest.AccessUnsupported:FuseTest.AioRead:FuseTest.Clone*:FuseTest.FlushUnsupported:FuseTest.RequestUsesFilesystemIDs	-
+# Unattached FUSE clone errno varies across native kernels. linux61.c checks EINVAL on Appine.
+devices	fuse_test	17	FuseCheckpointTest.*:FuseInterruptTest.Fatal*:FuseInterruptTest.Interrupt*:FuseTest.AccessUnsupported:FuseTest.AioRead:FuseTest.Clone*:FuseTest.FlushUnsupported:FuseTest.RequestUsesFilesystemIDs	FuseTest.CloneFromUnconnectedDeviceFails
 devices	mknod_test	9	*	-
 devices	mount_fd_test	8	MoveMountTest.MoveMountAttachedFileOntoFile:MoveMountTest.MoveMountDirOntoFileFails:MoveMountTest.MoveMountFileOntoDirFails:OpenTreeTest.OpenTreeCloneFile:OpenTreeTest.OpenTreeCloneRequiresCapSysAdmin:OpenTreeTest.OpenTreeInvalidFlags:OpenTreeTest.OpenTreeNoCloneSuccess:OpenTreeTest.OpenTreeRecursiveRequiresClone	-
 devices	mq_test	18	*	MqTest.OpenInvalidArgs
@@ -138,7 +139,8 @@ syscalls	proc_net_unix_test	9	*	-
 syscalls	proc_pid_coredump_test	5	*	-
 syscalls	proc_pid_oomscore_test	4	*	-
 syscalls	proc_pid_smaps_test	2	ProcPidSmapsTest.PrivateAnon:ProcPidSmapsTest.SharedAnon	-
-syscalls	proc_test	16	ProcPidCmdline.*:ProcSelfAuxv.*:ProcSelfCwd.Absolute:ProcSelfExe.Absolute:ProcSelfFd.NoncanonicalNames:ProcSelfFd.OpenFd:ProcSelfFdInfo.CorrectFds:ProcSelfFdInfo.Flags:ProcTest.NotFoundInRoot:ProcTest.RootInodeNumber:ProcThreadSelfTest.*	-
+# EntryValues fails on the hosted arm64 runner. mm_mount_pseudo.c compares both auxv copies on Appine.
+syscalls	proc_test	15	ProcPidCmdline.*:ProcSelfAuxv.*:ProcSelfCwd.Absolute:ProcSelfExe.Absolute:ProcSelfFd.NoncanonicalNames:ProcSelfFd.OpenFd:ProcSelfFdInfo.CorrectFds:ProcSelfFdInfo.Flags:ProcTest.NotFoundInRoot:ProcTest.RootInodeNumber:ProcThreadSelfTest.*	ProcSelfAuxv.EntryValues
 syscalls	pselect_test	9	*	PselectTest.Signal*
 syscalls	pwrite64_test	10	*	Pwrite64.AppendOnly
 syscalls	read_test	8	*	-

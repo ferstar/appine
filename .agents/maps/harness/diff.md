@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the split; latest change: gVisor selection, pass-count checks and suite image and lane reuse)
+> Maintained: 2026-11-24 (targeted verification only since the split; latest change: gVisor failure diagnostics and cases excluded from native comparison)
 
 ## Responsibilities
 
@@ -151,8 +151,10 @@ benchmarks, surveys and crash testing remain `harness`.
 - Nine further gVisor cases select program-specific `ONLY` and `SKIP` filters from
   `gvisor.filters`. Each group sets its measured native Docker options. The seven regular groups
   and two slow groups run through `selected.sh`, which prints each program name and checks its
-  expected pass count. An empty group, missing binary, skip or failure makes the selection fail,
-  even when native Linux and Appine print identical output. The program list across all fifteen
+  expected pass count. For a failed assertion it also prints the first 30 lines of the captured
+  GoogleTest output. The pass-count check excludes these diagnostic lines. An empty group,
+  missing binary, skip or failure makes the selection fail even when native Linux and Appine
+  print identical output. The program list across all fifteen
   gVisor groups determines the selected tarball.
 - Legacy skips are a negative gtest filter in each case, grouped by reason: a deviation recorded in a
   kernel map (named with its module), a feature decided against, or a test that cannot be compared
@@ -221,6 +223,9 @@ benchmarks, surveys and crash testing remain `harness`.
 
 ## Open questions
 
+- Which auxv assertion in gVisor's `ProcSelfAuxv.EntryValues` failed on the hosted arm64 runner?
+  The test is excluded from the shared selection. The guest suite checks the initial stack
+  against `/proc/self/auxv` on both Appine tiers.
 - Should difftest pass `APPINE_ON_BUG` and `APPINE_LOG` through, as it does `APPINE_DBT_REGS`?
 
 ## To verify

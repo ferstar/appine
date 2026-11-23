@@ -20,9 +20,11 @@
  * 13. process_mrelease handles pending deliverable fatal signals (SIGTERM) and rejects single-thread
  *     exit in a zombie-leader thread group (matching Linux 6.1);
  * 14. Secure exec computes the argument limit before clamping the 8 MiB stack limit (up to 6 MiB).
+ * 15. /proc/self/auxv matches the auxiliary vector on the initial stack through AT_NULL.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -1047,8 +1049,29 @@ static void test_secure_exec_arg_limit(const char *self_path)
     unlink("/tmp/suid_exec");
 }
 
-int main(int argc, char **argv)
+static void test_proc_self_auxv(char **envp)
 {
+    while (*envp)
+        envp++;
+    const Elf64_auxv_t *stack = (const Elf64_auxv_t *)(envp + 1);
+    FILE *proc = fopen("/proc/self/auxv", "rb");
+    CHECK(proc != NULL, "open /proc/self/auxv");
+    Elf64_auxv_t entry;
+    do {
+        CHECK(fread(&entry, sizeof entry, 1, proc) == 1, "read auxv entry");
+        CHECK(entry.a_type == stack->a_type && entry.a_un.a_val == stack->a_un.a_val,
+              "auxv mismatch: proc (%lu, %#lx), stack (%lu, %#lx)",
+              (unsigned long)entry.a_type, (unsigned long)entry.a_un.a_val,
+              (unsigned long)stack->a_type, (unsigned long)stack->a_un.a_val);
+        stack++;
+    } while (entry.a_type != AT_NULL);
+    CHECK(fgetc(proc) == EOF && !ferror(proc), "expected EOF after AT_NULL");
+    fclose(proc);
+}
+
+int main(int argc, char **argv, char **envp)
+{
+    test_proc_self_auxv(envp);
     if (argc >= 2 && strcmp(argv[1], "--check-secure") == 0) {
         CHECK(geteuid() == 0, "setuid helper expected euid 0, got %d", (int)geteuid());
         CHECK(getauxval(AT_SECURE) == 1, "expected AT_SECURE == 1");

@@ -9,13 +9,15 @@ while read -r name program expected only skip; do
     found=1
     [ "$skip" != - ] || skip=""
     echo "@ $program"
-    ONLY="$only" sh "$dir/run.sh" gvisor "$skip" "$program" </dev/null |
+    GTEST_FAILURE_DETAILS=1 ONLY="$only" sh "$dir/run.sh" gvisor "$skip" "$program" </dev/null |
         awk -v program="$program" -v expected="$expected" '
             { print }
+            /^  out: / { next }
+            { results++ }
             NF == 2 && $2 == "ok" { passed++ }
             END {
-                if (NR != expected || passed != expected) {
-                    printf "%s: expected %d passes, got %d in %d lines\n", program, expected, passed, NR
+                if (results != expected || passed != expected) {
+                    printf "%s: expected %d passes, got %d in %d result lines\n", program, expected, passed, results
                     exit 1
                 }
             }' || failed=1
