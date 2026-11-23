@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the split; latest change: gvisor-mm covers cross-process memory transfers and remapping)
+> Maintained: 2026-11-23 (targeted verification only since the split; latest change: gVisor memory management, file range copies and vectored I/O coverage)
 
 ## Responsibilities
 
@@ -70,7 +70,7 @@ benchmarks, surveys and crash testing remain `harness`.
 - Each case script runs with stderr merged into stdout on both sides, after `/root` (`$HOME`) and
   `/tmp` are removed and made again empty (modes 700 and 1777), so caches and files earlier runs
   left in the store do not make the sides differ: natively with `docker run` (seccomp unconfined,
-  `PATH`, `HOME=/root`) plus the case's `# docker-run-options:` (65 of the 98 cases, 43 of them
+  `PATH`, `HOME=/root`) plus the case's `# docker-run-options:` (65 of the 99 cases, 43 of them
   `--privileged`), and as `/bin/sh -c` under `appine-run` plus its `# appine-options:` (two
   cases); an `exit N` line is appended to each output. A case passes when the two outputs are
   byte-identical and `appine-run`'s own stderr has no `appine: internal error` line; scripts
@@ -80,7 +80,7 @@ benchmarks, surveys and crash testing remain `harness`.
   base64-encoded, unpacked by the guest's busybox into `/tmp/difftest-files/<dir>` before the case
   runs on either side. `line-discipline` uses it for Starnix's PTY scenarios and trace generator
   (`tests/diff/line-discipline`, BSD-licensed, copied unchanged with its source commit in a
-  README) and runs all 83 of them, each under a 300 s timeout; the twelve suite cases use it for
+  README) and runs all 83 of them, each under a 300 s timeout; the thirteen suite cases use it for
   the shared gtest runner.
 - Lanes (`-j`, default 4 on macOS, 1 elsewhere): each lane claims a slot and uses that slot's store
   clone (APFS clone, or a copy with `--reflink=auto`; remade only when unmarked or on a rebuild),
@@ -126,8 +126,9 @@ benchmarks, surveys and crash testing remain `harness`.
 - Seven Starnix cases cover 66 of its built programs by subsystem (`starnix-mm`, `-process`,
   `-signal`, `-fs`, `-proc`, `-io`, and `-overlay`, which runs overlayfs_test and fs_test's
   `OverlayFs` tests with `TEST_TMPDIR` on a tmpfs, since Linux refuses docker's overlay root as an
-  upper layer), and five gVisor cases cover 45 programs (`gvisor-process`, `-fs`, `-net`,
-  `-unix`, and `-mm` for process_vm_readv/writev and mremap). Each calls the shipped
+  upper layer), and six gVisor cases cover 53 programs (`gvisor-process`, `-fs`, `-net`,
+  `-unix`, `-mm` for cross-process transfers and memory management, and `-io` for copy_file_range,
+  preadv2 and pwritev2). Each calls the shipped
   `tests/diff/gtest/run.sh` once (difftest reads the suite from
   that one call) with the suite, its skip filter and its program list, and optionally `ONLY`, a
   gtest filter of the only tests to run; the runner lists each program's tests (minus disabled

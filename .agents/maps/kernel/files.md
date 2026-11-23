@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve O_DIRECT/O_NOATIME/O_ASYNC/O_DIRECTORY/O_NOFOLLOW in F_GETFL and enforce nr_open in CLOSE_RANGE_UNSHARE)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: seal queries on ordinary tmpfs files)
 
 ## Responsibilities
 
@@ -274,6 +274,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 ## Confirmed bugs / technical debt
 
 - **Fidelity gaps**, one per line:
+  - `F_GET_SEALS` on an ordinary tmpfs file returns `EINVAL` because only memfds have a seal
+    entry. Linux returns `F_SEAL_SEAL` (gVisor's `MemfdTest.TmpfsFilesHaveSealSeal`);
   - no `O_TMPFILE`;
   - a write open on a read-only instance is `EROFS` only after permission (6.1's `sb_permission`
     comes first; overlay opens already do);

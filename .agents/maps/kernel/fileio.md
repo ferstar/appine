@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: lock file positions on lseek/writev/copies, sync O_SYNC copies and FUSE writes, support preadv2/pwritev2 RWF_NOWAIT and RWF_APPEND, and align write remove_privs with chown)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: maximum memfd length on the development store)
 
 ## Responsibilities
 
@@ -266,6 +266,9 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 ## Confirmed bugs / technical debt
 
 - **Fidelity gaps**, one per line:
+  - a memfd uses an unlinked store object. Extending it to `INT64_MAX` with `ftruncate`
+    returns `EFBIG` on the development store, while native Linux accepts that length
+    (gVisor's `Pread64Test.Overflow`);
   - read, write, their vector forms and the chunked copies are not capped at `MAX_RW_COUNT`;
   - host stdio: positional I/O is `ESPIPE` on a regular host file, and a blocked write cannot be
     interrupted;

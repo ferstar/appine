@@ -74,8 +74,9 @@ in the module maps, not here.
 - **gVisor's syscall tests** (Apache-2.0), taken after this survey recommended them:
   - `scripts/build-gvisor-tests` builds them without Bazel against the abseil, googletest and
     google benchmark versions gVisor pins; 264 of the 266 programs build for arm64 (the other two
-    have x86 sources only). Five `gvisor-*` cases cover processes, signals and ptrace, files,
-    terminals and mounts, inet sockets and netlink, AF_UNIX, and memory transfers and remapping.
+    have x86 sources only). Six `gvisor-*` cases cover processes, signals and ptrace, files,
+    terminals and mounts, inet sockets and netlink, AF_UNIX, memory management and cross-process
+    transfers, and file range copies and vectored I/O.
     The harness/diff map has the details.
   - A full run at gVisor 9ee2906 (2026-11-07): of about 14,500 tests, about 11,200 passed on both
     sides and about 2,500 only natively, many of them one cause repeated over parameters (the
