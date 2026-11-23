@@ -277,23 +277,14 @@ fn read_write(
     (buf, len, offset): (u64, u64, i64),
     rw_flags: u32,
 ) -> i64 {
-    // Files that cannot seek (pipes, sockets) ignore the offset; with RWF_NOWAIT, do not wait
+    // Files that cannot seek (pipes, sockets) ignore the offset; RWF_NOWAIT and RWF_APPEND apply
+    // per request without mutating the shared OpenFile::flags
     let at = super::fs::seekable(&file.borrow()).then_some(offset as u64);
-    let saved = file.borrow().flags;
-    let mut f = saved;
-    if rw_flags & RWF_NOWAIT != 0 {
-        f |= oflags::O_NONBLOCK;
-    }
-    if rw_flags & RWF_APPEND != 0 {
-        f |= oflags::O_APPEND;
-    }
-    file.borrow_mut().flags = f;
-    let r = transfer(cx, file, fd, op, (buf, len as usize, at), rw_flags);
-    // Restore only the two flags added temporarily: other threads may have changed other flags
-    // while the request ran
-    let temp = oflags::O_NONBLOCK | oflags::O_APPEND;
-    let restored = (file.borrow().flags & !temp) | (saved & temp);
-    file.borrow_mut().flags = restored;
+    let io = super::fs::IoFlags {
+        nowait: rw_flags & RWF_NOWAIT != 0,
+        append: rw_flags & RWF_APPEND != 0,
+    };
+    let r = transfer(cx, file, fd, op, (buf, len as usize, at), rw_flags, io);
     match r {
         Ok(n) => n as i64,
         // A request interrupted by a signal cannot be restarted with the others already done
@@ -308,10 +299,10 @@ fn read_write(
     }
 }
 
-/// The transfer itself, with `RWF_APPEND` already set as `O_APPEND`. A write to an `O_APPEND`
-/// regular file goes to its end whatever the offset (Linux's `IOCB_APPEND` in
-/// generic_write_checks), and `RWF_DSYNC`/`RWF_SYNC` wait for the data to reach disk after it, as
-/// pwritev2 does (generic_write_sync).
+/// The transfer itself. A write to an `O_APPEND` regular file, or with `RWF_APPEND`, goes to its
+/// end whatever the offset (Linux's `IOCB_APPEND` in generic_write_checks), and
+/// `RWF_DSYNC`/`RWF_SYNC` wait for the data to reach disk after it, as pwritev2 does
+/// (generic_write_sync).
 fn transfer(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -319,16 +310,17 @@ fn transfer(
     op: u16,
     (buf, len, at): (u64, usize, Option<u64>),
     rw_flags: u32,
+    io: super::fs::IoFlags,
 ) -> Result<u64, Errno> {
     let n = match op {
-        IOCB_CMD_PREAD => super::fs::read_file(cx, file, buf, len, at)?,
-        IOCB_CMD_PREADV => super::fs::vectored(cx, fd, buf, len, at, false)?,
+        IOCB_CMD_PREAD => super::fs::read_file_with(cx, file, buf, len, at, io)?,
+        IOCB_CMD_PREADV => super::fs::vectored_with(cx, fd, buf, len, at, false, io)?,
         _ => {
-            let at = super::fs::append_offset(file, at)?;
+            let at = super::fs::append_offset(file, at, io.append)?;
             if op == IOCB_CMD_PWRITE {
-                super::fs::write_file(cx, file, buf, len, at)?
+                super::fs::write_file_with(cx, file, buf, len, at, io)?
             } else {
-                super::fs::vectored(cx, fd, buf, len, at, true)?
+                super::fs::vectored_with(cx, fd, buf, len, at, true, io)?
             }
         }
     };
@@ -363,6 +355,7 @@ pub(super) fn io_cancel(cx: &mut Cx<'_>, ctx: u64, iocb: u64, _result: u64) -> S
     };
     request_wake_object(wake::of(&c));
     notify_resfd(p.resfd.as_ref());
+    crate::unix::released(cx.k(), vec![p.file]);
     Err(Errno::EINPROGRESS)
 }
 
@@ -398,7 +391,9 @@ pub(super) fn io_getevents(
             break if have > 0 { Ok(()) } else { Err(Errno::EINVAL) };
         }
         if cx.interrupted() {
-            break Err(Errno::EINTR);
+            // As Linux's read_events: when some events are already queued (fewer than min_nr),
+            // return them rather than EINTR
+            break if have > 0 { Ok(()) } else { Err(Errno::EINTR) };
         }
         let polls: Vec<(FileRef, i16)> = c
             .borrow()
@@ -437,6 +432,7 @@ pub(super) fn io_getevents(
 /// thread uses it too.
 fn complete_polls(c: &Rc<RefCell<AioContext>>) {
     let mut done = Vec::new();
+    let mut dropped_unix = false;
     {
         let mut c = c.borrow_mut();
         let mut i = 0;
@@ -446,11 +442,15 @@ fn complete_polls(c: &Rc<RefCell<AioContext>>) {
             if ready != 0 {
                 let p = c.polls.remove(i);
                 c.events.push_back(event(p.data, p.obj, ready as i64));
+                dropped_unix |= crate::unix::is_unix_file(&p.file);
                 done.push(p.resfd);
             } else {
                 i += 1;
             }
         }
+    }
+    if dropped_unix {
+        crate::unix::defer_collect();
     }
     if done.is_empty() {
         return;
@@ -481,6 +481,7 @@ pub(crate) fn check_polls(k: &mut Kernel) -> (Vec<(i32, i16, i16)>, Option<Insta
         }
         watched
     });
+    crate::unix::collect_deferred(k);
     (host, timer)
 }
 
@@ -517,6 +518,7 @@ pub(crate) fn released(
     k: &mut Kernel,
     contexts: impl IntoIterator<Item = (u64, Rc<RefCell<AioContext>>)>,
 ) {
+    let mut files = Vec::new();
     for (_, c) in contexts {
         let polls = {
             let mut c = c.borrow_mut();
@@ -525,9 +527,13 @@ pub(crate) fn released(
         };
         for p in polls {
             notify_resfd(p.resfd.as_ref());
+            files.push(p.file);
         }
         request_wake_object(wake::of(&c));
         k.aio_nr = k.aio_nr.saturating_sub(c.borrow().max as u64);
+    }
+    if !files.is_empty() {
+        crate::unix::released(k, files);
     }
 }
 

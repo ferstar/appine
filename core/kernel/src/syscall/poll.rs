@@ -383,6 +383,9 @@ impl Interest {
 #[derive(Default)]
 pub(crate) struct Epoll {
     interests: Vec<Interest>,
+    /// Outer epolls that currently watch this epoll (one entry per `EPOLL_CTL_ADD` interest),
+    /// used to enforce `MAX_NESTS` when extending a leaf top-down.
+    parents: Vec<Weak<RefCell<Epoll>>>,
     /// Which interest to start checking from next time: as Linux moves reported entries to the
     /// end of the ready list, interests take turns being reported when more are ready than
     /// maxevents.
@@ -648,9 +651,13 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     {
         return Err(Errno::EINVAL);
     }
-    // Adding another epoll: no loops, and nesting no deeper than EP_MAX_NESTS levels
-    if op == EPOLL_CTL_ADD && nesting(&file, &ep, 0).is_none_or(|d| d > MAX_NESTS) {
-        return Err(Errno::ELOOP);
+    // Adding another epoll: no loops, and total nesting depth (ancestors of `ep` plus the
+    // target's subtree) no deeper than EP_MAX_NESTS levels
+    if op == EPOLL_CTL_ADD && matches!(file.borrow().kind, FileKind::Epoll(_)) {
+        let ancestors = ancestor_depth(&ep, 0);
+        if nesting(&file, &ep, 0).is_none_or(|d| ancestors.saturating_add(d) > MAX_NESTS) {
+            return Err(Errno::ELOOP);
+        }
     }
     if op != EPOLL_CTL_DEL {
         if events & (EPOLLET | EPOLLEXCLUSIVE) != 0 || ep.borrow().edge_watched.get() {
@@ -670,6 +677,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     let ready_now = op != EPOLL_CTL_DEL
         && ep.borrow().edge_watched.get()
         && poll_now(&file.borrow(), events as i16, 0) != 0;
+    let ep_rc = ep.clone();
     let mut ep = ep.borrow_mut();
     ep.prune();
     let pos = ep
@@ -686,6 +694,10 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         (EPOLL_CTL_ADD, None) => {
             ep.interests.push(Interest::new(fd, &file, events, data));
             ep.base.set(ep.base.get() + ready_now as u64);
+            drop(ep);
+            if let FileKind::Epoll(inner) = &file.borrow().kind {
+                inner.borrow_mut().parents.push(Rc::downgrade(&ep_rc));
+            }
             request_wake_object(key);
             Ok(0)
         }
@@ -705,11 +717,39 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         }
         (EPOLL_CTL_DEL, Some(i)) => {
             ep.remove(i);
+            drop(ep);
+            if let FileKind::Epoll(inner) = &file.borrow().kind {
+                let mut inner = inner.borrow_mut();
+                if let Some(p) = inner
+                    .parents
+                    .iter()
+                    .position(|w| w.as_ptr() == Rc::as_ptr(&ep_rc))
+                {
+                    inner.parents.swap_remove(p);
+                }
+            }
             Ok(0)
         }
         (EPOLL_CTL_MOD | EPOLL_CTL_DEL, None) => Err(Errno::ENOENT),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// How many levels of outer epolls currently watch `ep` (0 when none do).
+fn ancestor_depth(ep: &Rc<RefCell<Epoll>>, level: u32) -> u32 {
+    if level > MAX_NESTS {
+        return level;
+    }
+    let parents: Vec<Rc<RefCell<Epoll>>> = {
+        let mut ep = ep.borrow_mut();
+        ep.parents.retain(|w| w.strong_count() > 0);
+        ep.parents.iter().filter_map(Weak::upgrade).collect()
+    };
+    let mut depth = 0;
+    for parent in parents {
+        depth = depth.max(1 + ancestor_depth(&parent, level + 1));
+    }
+    depth
 }
 
 /// How many levels of epoll are nested in `file` (0 when it is not an epoll, 1 for an epoll that
@@ -841,21 +881,40 @@ pub(super) fn epoll_pwait(
     })();
     restore_mask(cx, &r);
     let ready = r?;
-    let mut out = Vec::with_capacity(ready.len() * 16);
-    {
-        let mut ep = ep.borrow_mut();
-        for &(i, ev) in &ready {
-            out.extend_from_slice(&ev.to_le_bytes());
-            out.extend_from_slice(&[0; 4]);
-            out.extend_from_slice(&ep.interests[i].data.to_le_bytes());
-            ep.reported(i, ev);
+    // Copy each event to userspace before marking it reported (ONESHOT disarmed, edge seen,
+    // exclusive claim taken), so a faulting buffer leaves unreported events available to a later
+    // wait and returns the partial count already copied (Linux's ep_try_send_events)
+    let entries: Vec<(usize, u32, u64)> = {
+        let ep = ep.borrow();
+        ready
+            .iter()
+            .map(|&(i, ev)| (i, ev, ep.interests[i].data))
+            .collect()
+    };
+    let mut written = 0u64;
+    for (i, ev, data) in entries {
+        let mut entry = [0u8; 16];
+        entry[..4].copy_from_slice(&ev.to_le_bytes());
+        entry[8..].copy_from_slice(&data.to_le_bytes());
+        let addr = events + written * 16;
+        if let Err(e) = cx.mm().write(UserSlice::new(addr, 16), &entry) {
+            return if written > 0 { Ok(written) } else { Err(e) };
         }
+        ep.borrow_mut().reported(i, ev);
+        written += 1;
     }
-    cx.mm().write(UserSlice::new(events, out.len()), &out)?;
-    Ok(ready.len() as u64)
+    Ok(written)
 }
 
 // ---- Waiting ----
+
+/// An `EPOLLEXCLUSIVE` file to register on its [`ExGate`], paired with the caller's requested
+/// events and already-seen `EPOLLET` bits.
+struct GatedFile {
+    file: FileRef,
+    wanted: i16,
+    seen: i16,
+}
 
 /// What to wait for together: host fds, and the earliest timerfd expiration (including those in
 /// nested epolls).
@@ -877,7 +936,7 @@ struct Waits {
     files: bool,
     /// Files of `EPOLLEXCLUSIVE` interests: not waited on directly, but registered on their
     /// exclusive gates ([`ExGate`]).
-    gated: Vec<FileRef>,
+    gated: Vec<GatedFile>,
 }
 
 impl Waits {
@@ -959,7 +1018,18 @@ impl Waits {
                     && (host_fd(&f).is_none() || f.host_edges.is_some())
             };
             if gate {
-                self.gated.push(file);
+                let wanted = int.events as i16;
+                let seen = if int.events & EPOLLET != 0 {
+                    int.seen.get() as i16
+                } else {
+                    0
+                };
+                if let Some(g) = self.gated.iter_mut().find(|g| Rc::ptr_eq(&g.file, &file)) {
+                    g.wanted |= wanted;
+                    g.seen &= seen;
+                } else {
+                    self.gated.push(GatedFile { file, wanted, seen });
+                }
                 continue;
             }
             let mut wanted = int.events as i16;
@@ -1076,59 +1146,92 @@ fn claimed(int: &Interest, f: &OpenFile, owner: usize) -> bool {
         })
 }
 
+/// One sleeping waiter on an exclusive gate ([`ExGate`]): its wake event, requested mask, and
+/// `EPOLLET` bits already seen before sleeping (0 for level-triggered interests).
+struct GateWaiter {
+    event: Arc<appine_hal::Event>,
+    wanted: i16,
+    seen: i16,
+}
+
 /// Threads waiting on a file of `EPOLLEXCLUSIVE` interests (the exclusive entries in a Linux wait
 /// queue). Waiters do not wait on the file themselves (the host poll and FILE-channel broadcasts
 /// would wake every thread waiting on it); they register here, and the timer thread watches the
 /// file for them ([`check_exclusive`]): when the data generation has changed, the file is ready
-/// and this edge has not been reported by any epoll, only the first in the queue is woken, as
-/// Linux wakes only one exclusive waiter per wakeup.
+/// and this edge has not been reported by any epoll, only the first matching waiter in the queue
+/// is woken, as Linux wakes only one exclusive waiter per wakeup.
 pub(crate) struct ExGate {
     file: Weak<RefCell<OpenFile>>,
     /// Waiting threads, earliest first.
-    sleepers: Vec<Arc<appine_hal::Event>>,
+    sleepers: Vec<GateWaiter>,
     /// The file's data generation at the last check ([`edge`]).
     last: [u64; 4],
 }
 
 impl ExGate {
     /// Looks at file `f`: when the data generation has changed, the file is ready and this edge
-    /// has not been reported by any epoll, takes out the first waiter in the queue (to be woken).
+    /// has not been reported by any epoll, takes out the first waiter whose interest mask and
+    /// edge state match the ready events.
     fn next_waiter(&mut self, f: &OpenFile) -> Option<Arc<appine_hal::Event>> {
         let now = edge(f);
         if now == self.last || self.sleepers.is_empty() {
             return None;
         }
+        let read_changed = now[0] != self.last[0] || now[2] != self.last[2];
+        let write_changed = now[1] != self.last[1] || now[3] != self.last[3];
         self.last = now;
-        let ready = poll_now(f, POLLIN | POLLOUT | POLLPRI | POLLRDNORM | POLLWRNORM, 0) != 0;
-        let claimed = f.exclusive_claim.get().is_some_and(|(e, _)| e == now);
-        (ready && !claimed).then(|| self.sleepers.remove(0))
+        if f.exclusive_claim.get().is_some_and(|(e, _)| e == now) {
+            return None;
+        }
+        let all = self.sleepers.iter().fold(0i16, |m, w| m | w.wanted);
+        let ready = poll_now(f, all, 0);
+        if ready == 0 {
+            return None;
+        }
+        let i = self.sleepers.iter().position(|w| {
+            let mut seen = w.seen;
+            if read_changed {
+                seen &= WRITE_BITS as i16;
+            }
+            if write_changed {
+                seen &= !(WRITE_BITS as i16);
+            }
+            let ev = ready & (w.wanted | ALWAYS_REPORTED);
+            ev & !seen != 0
+        })?;
+        Some(self.sleepers.remove(i).event)
     }
 
     /// Wakes all waiting threads (when a check fails, better to wake too many).
     pub(crate) fn wake_all(&self) {
-        for e in &self.sleepers {
-            crate::kernel::signal_later(e);
+        for w in &self.sleepers {
+            crate::kernel::signal_later(&w.event);
         }
     }
 }
 
 /// Before waiting: registers `event` on the exclusive gate of each of `files`. When a gate is
 /// new, wakes the timer thread so that it starts watching that file.
-fn gate_enter(cx: &mut Cx<'_>, files: &[FileRef], event: &Arc<appine_hal::Event>) {
+fn gate_enter(cx: &mut Cx<'_>, files: &[GatedFile], event: &Arc<appine_hal::Event>) {
     let mut created = false;
-    for file in files {
+    for gf in files {
+        let waiter = GateWaiter {
+            event: event.clone(),
+            wanted: gf.wanted,
+            seen: gf.seen,
+        };
         let k = cx.k();
         match k
             .ex_gates
             .iter_mut()
-            .find(|g| g.file.as_ptr() == Rc::as_ptr(file))
+            .find(|g| g.file.as_ptr() == Rc::as_ptr(&gf.file))
         {
-            Some(g) => g.sleepers.push(event.clone()),
+            Some(g) => g.sleepers.push(waiter),
             None => {
                 k.ex_gates.push(ExGate {
-                    file: Rc::downgrade(file),
-                    sleepers: vec![event.clone()],
-                    last: edge(&file.borrow()),
+                    file: Rc::downgrade(&gf.file),
+                    sleepers: vec![waiter],
+                    last: edge(&gf.file.borrow()),
                 });
                 created = true;
             }
@@ -1173,10 +1276,13 @@ pub(crate) fn check_exclusive(
 
 /// After waiting: removes `event` from the exclusive gates of `files` (a woken one has already
 /// been removed).
-fn gate_leave(cx: &mut Cx<'_>, files: &[FileRef], event: &Arc<appine_hal::Event>) {
+fn gate_leave(cx: &mut Cx<'_>, files: &[GatedFile], event: &Arc<appine_hal::Event>) {
     for g in cx.k().ex_gates.iter_mut() {
-        if files.iter().any(|f| g.file.as_ptr() == Rc::as_ptr(f)) {
-            g.sleepers.retain(|e| !Arc::ptr_eq(e, event));
+        if files
+            .iter()
+            .any(|gf| g.file.as_ptr() == Rc::as_ptr(&gf.file))
+        {
+            g.sleepers.retain(|w| !Arc::ptr_eq(&w.event, event));
         }
     }
 }
@@ -2083,7 +2189,14 @@ mod tests {
             .collect();
         let mut gate = ExGate {
             file: Rc::downgrade(&file),
-            sleepers: sleepers.clone(),
+            sleepers: sleepers
+                .iter()
+                .map(|e| GateWaiter {
+                    event: e.clone(),
+                    wanted: POLLIN,
+                    seen: 0,
+                })
+                .collect(),
             last: edge(&file.borrow()),
         };
         let write = || {
@@ -2108,6 +2221,76 @@ mod tests {
         let w = gate.next_waiter(&file.borrow()).unwrap();
         assert!(Arc::ptr_eq(&w, &sleepers[1]));
         assert_eq!(gate.sleepers.len(), 1);
+    }
+
+    #[test]
+    fn exclusive_gates_match_direction_and_wanted_mask() {
+        let efd = Rc::new(RefCell::new(EventFd {
+            count: 0,
+            semaphore: false,
+            writes: 0,
+            reads: 0,
+        }));
+        let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
+        let out_waiter = Arc::new(appine_hal::Event::new().unwrap());
+        let in_waiter = Arc::new(appine_hal::Event::new().unwrap());
+        let mut gate = ExGate {
+            file: Rc::downgrade(&file),
+            sleepers: vec![
+                GateWaiter {
+                    event: out_waiter.clone(),
+                    wanted: POLLOUT,
+                    seen: POLLOUT,
+                },
+                GateWaiter {
+                    event: in_waiter.clone(),
+                    wanted: POLLIN,
+                    seen: 0,
+                },
+            ],
+            last: edge(&file.borrow()),
+        };
+        // A read-side arrival must skip the EPOLLET POLLOUT waiter and wake the POLLIN waiter
+        {
+            let mut e = efd.borrow_mut();
+            e.count = 1;
+            e.writes += 1;
+        }
+        let w = gate.next_waiter(&file.borrow()).unwrap();
+        assert!(Arc::ptr_eq(&w, &in_waiter));
+        assert_eq!(gate.sleepers.len(), 1);
+        assert!(Arc::ptr_eq(&gate.sleepers[0].event, &out_waiter));
+        // A write-side edge (draining count) wakes the waiting POLLOUT sleeper
+        {
+            let mut e = efd.borrow_mut();
+            e.count = 0;
+            e.reads += 1;
+        }
+        let w = gate.next_waiter(&file.borrow()).unwrap();
+        assert!(Arc::ptr_eq(&w, &out_waiter));
+        assert!(gate.sleepers.is_empty());
+    }
+
+    #[test]
+    fn ancestor_depth_tracks_top_down_nesting() {
+        let n = MAX_NESTS as usize;
+        let epolls: Vec<Rc<RefCell<Epoll>>> = (0..=n + 1)
+            .map(|_| Rc::new(RefCell::new(Epoll::default())))
+            .collect();
+        // Build top-down chain e0 -> e1 -> e2 -> e3 -> e4 (depth 4 at e4)
+        for i in 0..n {
+            epolls[i + 1]
+                .borrow_mut()
+                .parents
+                .push(Rc::downgrade(&epolls[i]));
+        }
+        assert_eq!(ancestor_depth(&epolls[0], 0), 0);
+        assert_eq!(ancestor_depth(&epolls[n], 0), MAX_NESTS);
+        // Adding one more nested epoll (subtree depth 1) under e4 exceeds MAX_NESTS
+        assert!(ancestor_depth(&epolls[n], 0).saturating_add(1) > MAX_NESTS);
+        // Removing the top link lowers the ancestor depth by one
+        epolls[1].borrow_mut().parents.clear();
+        assert_eq!(ancestor_depth(&epolls[n], 0), MAX_NESTS - 1);
     }
 
     #[test]

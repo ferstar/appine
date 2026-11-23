@@ -906,7 +906,11 @@ pub(crate) fn hand_thread_children(k: &Kernel, parent: &RefCell<ThreadGroup>, fr
 /// affected: the parent and the host can always wait for it to end, and the cleanup of its
 /// children, its tracees, orphaned process groups and SysV IPC does not get stuck because an
 /// earlier step failed.
-pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+pub(crate) fn finish_group(
+    k: &mut Kernel,
+    group: &Rc<RefCell<ThreadGroup>>,
+    sem_undo: Option<Rc<crate::ipc::SemUndo>>,
+) {
     let (tgid, pgid, sid) = {
         let g = group.borrow();
         (g.tgid, g.pgid, g.sid)
@@ -999,7 +1003,11 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         send_pdeath(k, orphaned, tgid, ruid)
     });
     step(k, tgid, 4, "releasing SysV IPC", |k| {
-        crate::ipc::exit(k, tgid)
+        if let Some(undo) = sem_undo
+            && Rc::strong_count(&undo) == 1
+        {
+            crate::ipc::exit(k, undo.id, tgid);
+        }
     });
     step(k, tgid, 5, "releasing the controlling terminal", |k| {
         release_ctty(k, group)

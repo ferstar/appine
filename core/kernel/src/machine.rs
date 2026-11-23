@@ -387,6 +387,7 @@ impl Machine {
             vfork_done: None,
             restart: None,
             fast_sleep: None,
+            sem_undo: Rc::new(crate::ipc::SemUndo::new()),
         };
         let ns = k.init_ns.clone();
         let started = Task::new(tid, tid, &cpu, state, ns, 0, comm_of(program))

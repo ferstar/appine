@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: update mremap shm/vdso/DONTUNMAP flags and reap, check mmap_min_addr in shmat, track Vma::mnt, and fix Fill short-read recording)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: remove unused Mm::can_write)
 
 ## Responsibilities
 
@@ -74,7 +74,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `is_mapped` (`cow_break` is `kernel/cow`'s; `mmu().translate`/`fault_in` `kernel/mmu`'s).
 - **FUSE fills & kernel access**: `Fill::new`/`size`/`has`/`window`/`window_from`/`store`/`fd`,
   `take_wanted`, `has_fills`, `first_unread`; `read`, `write` (breaks CoW via `kernel/cow`),
-  `translate` (no CoW break), `read_cstr`, `write_kernel`, `write_force`, `can_write`, `populate`,
+  `translate` (no CoW break), `read_cstr`, `write_kernel`, `write_force`, `populate`,
   `mapped_above`, `check_mapped`.
 - **Files, shm, futex & introspection**: `futex_key`, `shared_maps`, `id`; `file_truncated`,
   `writably_maps`, `maps_file`, `maps_ino`, `mapped_inos`, `set_mnt`, `mapped_mounts`,
@@ -351,8 +351,8 @@ signals may still be delivered).
   `prefault`), `kernel/process`/`kernel/exec`/`kernel/ns`/`kernel/signal` (execve, setns
   `vdso_syscalls`, faults, `Cx` stack growth, signal frames), `kernel/ptrace` (`write_force`),
   `kernel/futex` (`futex_key`, `translate`, `id`, `shared_maps`), `kernel/ipc` (`attach/detach_shm`),
-  `kernel/files`/`kernel/fileio` (`ETXTBSY`, seals, truncation, clones, unsharing), `kernel/unix`
-  (`can_write`), `kernel/procfs`, `kernel/oom`, `kernel/mmu` (VMAs/EOF/sync inputs), `kernel/cow`.
+  `kernel/files`/`kernel/fileio` (`ETXTBSY`, seals, truncation, clones, unsharing), `kernel/procfs`,
+  `kernel/oom`, `kernel/mmu` (VMAs/EOF/sync inputs), `kernel/cow`.
 
 ### Outbound
 

@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/fileio.md` for the paired decision history (not yet created; decisions from before the split are D3, D4 and the truncate-through-fd-link half of D2 in `.agents/decisions/kernel/files.md`, plus D11, D22, D24, D29, D33, D45, the `write_sync` half of D17, the write-path half of D41 and the file I/O halves of D36 and D37 in `.agents/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: add per-request IoFlags helpers for AIO RWF_NOWAIT and RWF_APPEND)
 
 ## Responsibilities
 
@@ -53,8 +55,9 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   `sync_file_range` (`cache_hint`), `readahead`, `cachestat` (a 6.5 call), `fsync`/`fdatasync`,
   `sync`, `syncfs`.
 - **Kernel-internal**: `write_at` (core dumps), `prepare_write`, `make_private`, `host_unshared`
-  (from `kernel/inotify`'s `host_change`), `read_file`, `write_file`, `read_bytes`, `write_bytes`,
-  `write_sync`, `vectored`, `fsync`, `has_fsync`, `seekable`, `append_offset` (`kernel/aio`,
+  (from `kernel/inotify`'s `host_change`), `IoFlags`, `read_file`/`read_file_with`,
+  `write_file`/`write_file_with`, `read_bytes`, `write_bytes`, `write_sync`,
+  `vectored`/`vectored_with`, `fsync`, `has_fsync`, `seekable`, `append_offset` (`kernel/aio`,
   `kernel/loop`), `check_fsize`, `fsize_room` (`kernel/fuse`), `check_seals`, `seals_permit`,
   `remove_privs`, `truncating` (`kernel/files`'s `O_TRUNC` and `kernel/vfs`), `opens_of`.
 
@@ -212,10 +215,10 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   privileges rule.
 - `kernel/overlay`: `prepare_write`, `rehome` after copy-up; `kernel/pipe`: file checks and the
   read and write paths of a splice's other end; `kernel/mm`: `prepare_write` for shared mappings.
-- `kernel/inotify`: `host_unshared`; `kernel/aio` and `kernel/loop`: `read_file`, `write_file`,
-  `read_bytes`, `write_bytes`, `write_sync`, `vectored`, `fsync`, `has_fsync`, `seekable`,
-  `append_offset`; `kernel/fuse`: `check_fsize`, `fsize_room`, `take_pos`/`release_pos`; core dumps
-  (`write_at`).
+- `kernel/inotify`: `host_unshared`; `kernel/aio` and `kernel/loop`: `IoFlags`, `read_file`/
+  `read_file_with`, `write_file`/`write_file_with`, `read_bytes`, `write_bytes`, `write_sync`,
+  `vectored`/`vectored_with`, `fsync`, `has_fsync`, `seekable`, `append_offset`; `kernel/fuse`:
+  `check_fsize`, `fsize_room`, `take_pos`/`release_pos`; core dumps (`write_at`).
 
 ### Outbound
 

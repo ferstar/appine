@@ -2557,9 +2557,17 @@ pub(super) fn pread(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64)
     read_file(cx, &file, buf, len, checked_offset(offset)?)
 }
 
+/// Per-request I/O flags (`RWF_NOWAIT`, `RWF_APPEND`) that override `OpenFile::flags` for a
+/// single transfer without mutating the shared open file description.
+#[derive(Clone, Copy, Default)]
+pub(super) struct IoFlags {
+    pub nowait: bool,
+    pub append: bool,
+}
+
 pub(super) fn pwrite(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64) -> SysResult {
     let file = cx.fds().get(fd)?;
-    let offset = append_offset(&file, checked_offset(offset)?)?;
+    let offset = append_offset(&file, checked_offset(offset)?, false)?;
     write_file(cx, &file, buf, len, offset)
 }
 
@@ -2594,7 +2602,7 @@ pub(super) fn pvectored(
         _ => checked_offset(offset)?,
     };
     if write && flags.is_none_or(|f| f & RWF_NOAPPEND == 0) {
-        offset = append_offset(&cx.fds().get(fd)?, offset)?;
+        offset = append_offset(&cx.fds().get(fd)?, offset, false)?;
     }
     let n = vectored(cx, fd, iov, count, offset, write)?;
     if let Some(rwf) = flags.filter(|_| write && n > 0) {
@@ -2608,14 +2616,21 @@ fn checked_offset(offset: i64) -> Result<Option<u64>, Errno> {
     u64::try_from(offset).map(Some).map_err(|_| Errno::EINVAL)
 }
 
-/// A write with an offset on an `O_APPEND` regular file still writes at the end, leaving the
-/// file position unchanged (Linux's generic_write_checks, the BUGS section of pwrite(2)); only
-/// pwritev2's `RWF_NOAPPEND` writes at the given offset. Such writes are done with the BKL held
-/// ([`write_bytes`]), so they never write at the same place as other appends.
-pub(super) fn append_offset(file: &FileRef, offset: Option<u64>) -> Result<Option<u64>, Errno> {
+/// A write with an offset on an `O_APPEND` regular file (or with per-request `append`, e.g.
+/// `RWF_APPEND`) still writes at the end, leaving the file position unchanged (Linux's
+/// generic_write_checks, the BUGS section of pwrite(2)); only pwritev2's `RWF_NOAPPEND` writes at
+/// the given offset. Such writes are done with the BKL held ([`write_bytes_with`]), so they never
+/// write at the same place as other appends.
+pub(super) fn append_offset(
+    file: &FileRef,
+    offset: Option<u64>,
+    append: bool,
+) -> Result<Option<u64>, Errno> {
     let f = file.borrow();
     match &f.kind {
-        FileKind::Regular { file, .. } if offset.is_some() && f.flags & oflags::O_APPEND != 0 => {
+        FileKind::Regular { file, .. }
+            if offset.is_some() && (append || f.flags & oflags::O_APPEND != 0) =>
+        {
             Ok(Some(file.metadata().map_err(host_errno)?.len()))
         }
         _ => Ok(offset),
@@ -3108,6 +3123,18 @@ pub(super) fn vectored(
     offset: Option<u64>,
     write: bool,
 ) -> SysResult {
+    vectored_with(cx, fd, iov, count, offset, write, IoFlags::default())
+}
+
+pub(super) fn vectored_with(
+    cx: &mut Cx<'_>,
+    fd: i32,
+    iov: u64,
+    count: usize,
+    offset: Option<u64>,
+    write: bool,
+    io: IoFlags,
+) -> SysResult {
     let file = cx.fds().get(fd)?;
     // /dev/kmsg's write_iter: the whole writev is one record (systemd logs this way)
     if write && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
@@ -3144,13 +3171,19 @@ pub(super) fn vectored(
         }
         return Ok(0);
     }
-    if let Some(r) = stream_vectored(cx, &file, &vecs, offset, write) {
+    if let Some(r) = stream_vectored(cx, &file, &vecs, offset, write, io) {
         return r;
     }
     // A writev checks RLIMIT_FSIZE once for all its iovecs (generic_write_checks), so one that
     // ends at the limit only shortens it
     let room = match write {
-        true => fsize_allowed(cx, &file.borrow(), offset, vecs.iter().map(|v| v.1).sum())?,
+        true => fsize_allowed(
+            cx,
+            &file.borrow(),
+            offset,
+            vecs.iter().map(|v| v.1).sum(),
+            io.append,
+        )?,
         false => usize::MAX,
     };
     let mut total = 0;
@@ -3161,9 +3194,9 @@ pub(super) fn vectored(
         let len = len.min(room - total as usize);
         let at = offset.map(|o| o + total);
         let r = if write {
-            write_file(cx, &file, base, len, at)
+            write_file_with(cx, &file, base, len, at, io)
         } else {
-            read_file(cx, &file, base, len, at)
+            read_file_with(cx, &file, base, len, at, io)
         };
         match r {
             Ok(n) => {
@@ -3193,6 +3226,7 @@ fn stream_vectored(
     vecs: &[(u64, usize)],
     offset: Option<u64>,
     write: bool,
+    io: IoFlags,
 ) -> Option<SysResult> {
     let path = match positional(&file.borrow(), offset) {
         Ok(p) => p,
@@ -3200,22 +3234,22 @@ fn stream_vectored(
     };
     Some(match path {
         IoPath::Socket(s) => {
-            let nonblock = file.borrow().nonblocking();
+            let nonblock = file.borrow().nonblocking() || io.nowait;
             super::net::rw(cx, &s, nonblock, vecs, write)
         }
-        IoPath::Pipe(_) | IoPath::Pty(..) if write => write_gathered(cx, file, vecs, IO_CHUNK),
+        IoPath::Pipe(_) | IoPath::Pty(..) if write => write_gathered(cx, file, vecs, IO_CHUNK, io),
         IoPath::Pipe(_) | IoPath::Pty(..) | IoPath::EventFd(_) if !write => {
-            read_scattered(cx, file, vecs, IO_CHUNK)
+            read_scattered(cx, file, vecs, IO_CHUNK, io)
         }
         // A FUSE message is read and written whole (fuse_dev_read and fuse_dev_write take an
         // iov_iter): libfuse writes a reply's header and data as separate iovecs
-        IoPath::FuseDev if write => write_gathered(cx, file, vecs, FUSE_CHUNK),
-        IoPath::FuseDev => read_scattered(cx, file, vecs, FUSE_CHUNK),
+        IoPath::FuseDev if write => write_gathered(cx, file, vecs, FUSE_CHUNK, io),
+        IoPath::FuseDev => read_scattered(cx, file, vecs, FUSE_CHUNK, io),
         IoPath::Host(fd) if !host_regular(fd) => {
             if write {
-                write_gathered(cx, file, vecs, IO_CHUNK)
+                write_gathered(cx, file, vecs, IO_CHUNK, io)
             } else {
-                read_scattered(cx, file, vecs, IO_CHUNK)
+                read_scattered(cx, file, vecs, IO_CHUNK, io)
             }
         }
         _ => return None,
@@ -3235,6 +3269,7 @@ fn read_scattered(
     file: &FileRef,
     vecs: &[(u64, usize)],
     step: usize,
+    io: IoFlags,
 ) -> SysResult {
     if !file.borrow().readable() {
         return Err(Errno::EBADF);
@@ -3244,7 +3279,7 @@ fn read_scattered(
         return Ok(0);
     }
     let mut buf = vec![0u8; total.min(step)];
-    let k = read_bytes(cx, file, &mut buf, None)?;
+    let k = read_bytes_with(cx, file, &mut buf, None, io)?;
     note_read(cx, file, k);
     let mut done = 0;
     for &(base, len) in vecs {
@@ -3272,6 +3307,7 @@ fn write_gathered(
     file: &FileRef,
     vecs: &[(u64, usize)],
     step: usize,
+    io: IoFlags,
 ) -> SysResult {
     if !file.borrow().writable() {
         return Err(Errno::EBADF);
@@ -3305,7 +3341,7 @@ fn write_gathered(
                 _ => Ok(done as u64),
             };
         }
-        match write_bytes(cx, file, &chunk, None) {
+        match write_bytes_with(cx, file, &chunk, None, io) {
             Ok(k) => {
                 done += k;
                 if k < chunk.len() || fault.is_some() {
@@ -3767,7 +3803,7 @@ fn copy_regular(
     if cx.kr().seals.contains_key(&ino) || in_tmpfs {
         return None;
     }
-    let len = match fsize_allowed(cx, &output.borrow(), dst, len.min(MAX_COPY)) {
+    let len = match fsize_allowed(cx, &output.borrow(), dst, len.min(MAX_COPY), false) {
         Ok(n) => n,
         Err(e) => return Some(Err(e)),
     };
@@ -3833,12 +3869,23 @@ pub(super) fn read_file(
     len: usize,
     offset: Option<u64>,
 ) -> SysResult {
+    read_file_with(cx, file, buf, len, offset, IoFlags::default())
+}
+
+pub(super) fn read_file_with(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    buf: u64,
+    len: usize,
+    offset: Option<u64>,
+    io: IoFlags,
+) -> SysResult {
     // A socket receives one message of up to the whole length (super::net::rw). The borrow must
     // end before: receiving may wait with the BKL released
     let sock = socket(&file.borrow());
     if let Some(s) = sock {
         positional(&file.borrow(), offset)?;
-        let nonblock = file.borrow().nonblocking();
+        let nonblock = file.borrow().nonblocking() || io.nowait;
         return super::net::rw(cx, &s, nonblock, &[(buf, len)], false);
     }
     // Each read of a terminal or pipe returns only data already ready and must not block again
@@ -3859,7 +3906,13 @@ pub(super) fn read_file(
     while done < len {
         let n = (len - done).min(step);
         let before = file.borrow().pos;
-        let k = match read_bytes(cx, file, &mut chunk[..n], offset.map(|o| o + done as u64)) {
+        let k = match read_bytes_with(
+            cx,
+            file,
+            &mut chunk[..n],
+            offset.map(|o| o + done as u64),
+            io,
+        ) {
             Ok(k) => k,
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
@@ -3926,6 +3979,17 @@ pub(super) fn write_file(
     len: usize,
     offset: Option<u64>,
 ) -> SysResult {
+    write_file_with(cx, file, buf, len, offset, IoFlags::default())
+}
+
+pub(super) fn write_file_with(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    buf: u64,
+    len: usize,
+    offset: Option<u64>,
+    io: IoFlags,
+) -> SysResult {
     // ESPIPE and EBADF are reported before an unreadable buffer
     positional(&file.borrow(), offset)?;
     if !file.borrow().writable() {
@@ -3939,12 +4003,12 @@ pub(super) fn write_file(
     // (super::net::rw)
     let sock = socket(&file.borrow());
     if let Some(s) = sock {
-        let nonblock = file.borrow().nonblocking();
+        let nonblock = file.borrow().nonblocking() || io.nowait;
         return super::net::rw(cx, &s, nonblock, &[(buf, len)], true);
     }
     // RLIMIT_FSIZE is checked once for the whole write, as generic_write_checks does: a piece
     // that ends at the limit only shortens it, without SIGXFSZ for the next
-    let len = fsize_allowed(cx, &file.borrow(), offset, len)?;
+    let len = fsize_allowed(cx, &file.borrow(), offset, len, io.append)?;
     let step = io_chunk(&file.borrow());
     let mut chunk = vec![0u8; len.min(step)];
     let mut done = 0;
@@ -3954,8 +4018,9 @@ pub(super) fn write_file(
             UserSlice::new(buf.wrapping_add(done as u64), n),
             &mut chunk[..n],
         );
-        let step = copied
-            .and_then(|()| write_bytes(cx, file, &chunk[..n], offset.map(|o| o + done as u64)));
+        let step = copied.and_then(|()| {
+            write_bytes_with(cx, file, &chunk[..n], offset.map(|o| o + done as u64), io)
+        });
         match step {
             Ok(k) => {
                 done += k;
@@ -4007,13 +4072,23 @@ pub(super) fn read_bytes(
     buf: &mut [u8],
     offset: Option<u64>,
 ) -> Result<usize, Errno> {
+    read_bytes_with(cx, file, buf, offset, IoFlags::default())
+}
+
+fn read_bytes_with(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    buf: &mut [u8],
+    offset: Option<u64>,
+    io: IoFlags,
+) -> Result<usize, Errno> {
     let (path, nonblock) = {
         let f = file.borrow();
         let path = positional(&f, offset)?;
         if !f.readable() {
             return Err(Errno::EBADF);
         }
-        (path, f.nonblocking())
+        (path, f.nonblocking() || io.nowait)
     };
     match path {
         IoPath::Host(fd) => {
@@ -4328,13 +4403,23 @@ pub(super) fn write_bytes(
     data: &[u8],
     offset: Option<u64>,
 ) -> Result<usize, Errno> {
+    write_bytes_with(cx, file, data, offset, IoFlags::default())
+}
+
+fn write_bytes_with(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    data: &[u8],
+    offset: Option<u64>,
+    io: IoFlags,
+) -> Result<usize, Errno> {
     let (path, nonblock) = {
         let f = file.borrow();
         let path = positional(&f, offset)?;
         if !f.writable() {
             return Err(Errno::EBADF);
         }
-        (path, f.nonblocking())
+        (path, f.nonblocking() || io.nowait)
     };
     match path {
         IoPath::Host(fd) => match cx.unlocked(|| appine_hal::write(fd, data)) {
@@ -4353,8 +4438,8 @@ pub(super) fn write_bytes(
         // Opened for writing by root: proc_reg_write without a proc_write
         IoPath::ProcKmsg(_) => Err(Errno::EIO),
         IoPath::Loop(dev) => super::loopdev::write(cx, file, &dev, data, offset),
-        IoPath::Fuse(io) => {
-            let n = super::fuse::write(cx, file, &io, data, offset)?;
+        IoPath::Fuse(fio) => {
+            let n = super::fuse::write(cx, file, &fio, data, offset, io.append)?;
             if n > 0 {
                 inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
             }
@@ -4376,14 +4461,13 @@ pub(super) fn write_bytes(
         IoPath::Local => {
             // A write at the position of a regular file holds the position from its checks to
             // its end, so they see where it writes (Linux takes f_pos_lock before
-            // generic_write_checks); an O_APPEND one is checked and written under the BKL
-            let held = offset.is_none()
-                && regular_fd(&file.borrow()).is_some()
-                && file.borrow().flags & oflags::O_APPEND == 0;
+            // generic_write_checks); an O_APPEND/RWF_APPEND one is checked and written under the BKL
+            let append = io.append || file.borrow().flags & oflags::O_APPEND != 0;
+            let held = offset.is_none() && regular_fd(&file.borrow()).is_some() && !append;
             if held {
                 take_pos(cx, file)?;
             }
-            let r = write_local(cx, file, data, (offset, held));
+            let r = write_local(cx, file, data, (offset, held, append));
             if held {
                 release_pos(file);
             }
@@ -4392,22 +4476,22 @@ pub(super) fn write_bytes(
     }
 }
 
-/// [`write_bytes`] to the files written here (`IoPath::Local`): regular and synthetic files.
-/// `held`: the caller holds the position ([`take_pos`]).
+/// [`write_bytes_with`] to the files written here (`IoPath::Local`): regular and synthetic files.
+/// `held`: the caller holds the position ([`take_pos`]). `append`: `O_APPEND` or `RWF_APPEND`.
 fn write_local(
     cx: &mut Cx<'_>,
     file: &FileRef,
     data: &[u8],
-    (offset, held): (Option<u64>, bool),
+    (offset, held, append): (Option<u64>, bool, bool),
 ) -> Result<usize, Errno> {
-    let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len())?];
-    let (n, tmpfs) = tmpfs_write_room(cx, &file.borrow(), offset, data.len())?;
+    let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len(), append)?];
+    let (n, tmpfs) = tmpfs_write_room(cx, &file.borrow(), offset, data.len(), append)?;
     let data = &data[..n];
     check_seals(cx, &file.borrow(), true, |size| {
         let f = file.borrow();
         let pos = match offset {
             Some(off) => off,
-            None if f.flags & oflags::O_APPEND != 0 => size,
+            None if append => size,
             None => f.pos,
         };
         size.max(pos + data.len() as u64)
@@ -4446,16 +4530,15 @@ fn write_local(
         prepare_write(cx, file, None)?;
         remove_privs(cx, ino)?;
     }
-    // Regular files are written without the BKL; O_APPEND ones are still written with the lock
-    // held (including writes with an offset, [`append_offset`]), so several processes appending
-    // at once do not overwrite each other
-    let regular =
-        regular_fd(&file.borrow()).filter(|_| file.borrow().flags & oflags::O_APPEND == 0);
+    // Regular files are written without the BKL; O_APPEND/RWF_APPEND ones are still written with
+    // the lock held (including writes with an offset, [`append_offset`]), so several processes
+    // appending at once do not overwrite each other
+    let regular = regular_fd(&file.borrow()).filter(|_| !append);
     let n = match regular {
         Some(fd) => unlocked_io(cx, file, fd, (offset, held), |fd, pos| {
             appine_hal::pwrite(fd, data, pos)
         })?,
-        None => local_write(&mut file.borrow_mut(), data, offset)?.min(written),
+        None => local_write(&mut file.borrow_mut(), data, offset, append)?.min(written),
     };
     if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind) {
         tmpfs_resized(&*cx.vfs()?, Some(t), host);
@@ -4560,6 +4643,7 @@ fn fsize_allowed(
     f: &OpenFile,
     offset: Option<u64>,
     len: usize,
+    append: bool,
 ) -> Result<usize, Errno> {
     let FileKind::Regular { file, .. } = &f.kind else {
         return Ok(len);
@@ -4570,7 +4654,9 @@ fn fsize_allowed(
     }
     let pos = match offset {
         Some(off) => off,
-        None if f.flags & oflags::O_APPEND != 0 => file.metadata().map_err(host_errno)?.len(),
+        None if append || f.flags & oflags::O_APPEND != 0 => {
+            file.metadata().map_err(host_errno)?.len()
+        }
         None => f.pos,
     };
     if pos >= limit {
@@ -4579,12 +4665,17 @@ fn fsize_allowed(
     Ok(len.min((limit - pos) as usize))
 }
 
-fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usize, Errno> {
+fn local_write(
+    f: &mut OpenFile,
+    data: &[u8],
+    offset: Option<u64>,
+    append: bool,
+) -> Result<usize, Errno> {
     match &f.kind {
         FileKind::Regular { file, .. } => {
             let pos = match offset {
                 Some(off) => off,
-                None if f.flags & oflags::O_APPEND != 0 => {
+                None if append || f.flags & oflags::O_APPEND != 0 => {
                     file.metadata().map_err(host_errno)?.len()
                 }
                 None => f.pos,
@@ -6375,8 +6466,11 @@ fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Res
         if rmdir {
             // rmdir checks the sticky bit first (may_delete); a queue is not a directory
             let q = ipc.mqueues[name].borrow().stat();
-            let dir_uid = ipc.mq_dir.borrow().uid;
-            if cred.fsuid != q.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&q, cap::FOWNER) {
+            if dir_st.mode & mode::S_ISVTX != 0
+                && cred.fsuid != q.uid
+                && cred.fsuid != dir_st.uid
+                && !cred.capable_wrt(&q, cap::FOWNER)
+            {
                 return Err(Errno::EPERM);
             }
             return Err(Errno::ENOTDIR);
@@ -8045,7 +8139,7 @@ fn writable_dir(vfs: &Vfs, (mnt, dir): (MountId, Ino)) -> Result<(), Errno> {
 
 /// What is being created is not a directory but its name ends in `/`: EEXIST when it exists,
 /// otherwise ENOENT (as in Linux's `filename_create`).
-fn reject_trailing_slash(
+pub(super) fn reject_trailing_slash(
     vfs: &Vfs,
     dir: (MountId, Ino),
     name: &[u8],
@@ -8221,6 +8315,7 @@ fn tmpfs_write_room(
     f: &OpenFile,
     offset: Option<u64>,
     len: usize,
+    append: bool,
 ) -> Result<(usize, Option<TmpfsFile>), Errno> {
     let FileKind::Regular { ino, file, .. } = &f.kind else {
         return Ok((len, None));
@@ -8236,7 +8331,7 @@ fn tmpfs_write_room(
     let size = file.metadata().map_err(host_errno)?.len();
     let pos = match offset {
         Some(off) => off,
-        None if f.flags & oflags::O_APPEND != 0 => size,
+        None if append || f.flags & oflags::O_APPEND != 0 => size,
         None => f.pos,
     };
     let end = pos.saturating_add(len as u64);

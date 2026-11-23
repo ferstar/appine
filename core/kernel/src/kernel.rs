@@ -110,13 +110,6 @@ pub(crate) mod wake {
     }
 }
 
-/// Wake-ups requested without the BKL (there should be none; kept as a fallback): handed to the
-/// next thread that releases any BKL. Normal requests are recorded per thread ([`PENDING`]).
-static WAKE: AtomicU32 = AtomicU32::new(0);
-
-/// Objects requested to be woken without the BKL (the fallback of [`WAKE`]).
-static WAKE_OBJECTS: Mutex<Vec<wake::Object>> = Mutex::new(Vec::new());
-
 thread_local! {
     /// Events to signal, recorded while holding the BKL ([`signal_later`]).
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
@@ -702,13 +695,7 @@ impl Kernel {
     }
 
     fn flush_wakeups(&self) {
-        let (mut channels, mut objects) = PENDING.with_borrow_mut(std::mem::take);
-        let stray = WAKE.swap(0, Ordering::AcqRel);
-        if stray != 0 {
-            channels |= stray;
-            let mut more = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
-            objects.append(&mut more);
-        }
+        let (channels, objects) = PENDING.with_borrow_mut(std::mem::take);
         if channels == 0 {
             return;
         }
@@ -931,7 +918,15 @@ impl Drop for Bkl<'_> {
         if crate::bug::catch(|| crate::syscall::hang_up_closed(k)).is_none() {
             crate::bug::report(format_args!("kernel panic while hanging up terminals"));
         }
-        self.0.flush_wakeups();
+        // Contain wake-up matching so a panic can never skip releasing the BKL; on failure, wake
+        // all waiters directly so none remain parked forever
+        let k: &Kernel = &self.0;
+        if crate::bug::catch(|| k.flush_wakeups()).is_none() {
+            crate::bug::report(format_args!("kernel panic while flushing wake-ups"));
+            for (event, ..) in &k.waiters {
+                signal_later(event);
+            }
+        }
         self.1.held.store(false, Ordering::Relaxed);
         // SAFETY: self.0 is not used after this
         unsafe { ManuallyDrop::drop(&mut self.0) };
@@ -1631,27 +1626,21 @@ pub(crate) fn request_wake_object(object: wake::Object) {
     note_wake(wake::OBJECTS, Some(object));
 }
 
-/// Records a wake request ([`request_wake`] and the like): on this thread while holding the BKL,
-/// otherwise (which should not happen) in the global fallback.
+/// Records a wake request ([`request_wake`] and the like) on the current thread while holding the
+/// BKL. Requests made without the BKL (standalone unit tests exercising kernel objects directly)
+/// are ignored rather than stored in a cross-kernel global fallback.
 fn note_wake(channels: u32, object: Option<wake::Object>) {
-    if HELD.get() != 0 {
-        PENDING.with_borrow_mut(|(c, objects)| {
-            *c |= channels;
-            if let Some(o) = object
-                && !objects.contains(&o)
-            {
-                objects.push(o);
-            }
-        });
+    if HELD.get() == 0 {
         return;
     }
-    if let Some(o) = object {
-        let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
-        if !objects.contains(&o) {
+    PENDING.with_borrow_mut(|(c, objects)| {
+        *c |= channels;
+        if let Some(o) = object
+            && !objects.contains(&o)
+        {
             objects.push(o);
         }
-    }
-    WAKE.fetch_or(channels, Ordering::Relaxed);
+    });
 }
 
 /// Signals `event` only after the BKL is released. The woken thread will take the BKL right away:
@@ -1695,9 +1684,11 @@ mod tests {
         let b = Shared::new(Kernel::new(Tier::Interpreter));
         let event = Arc::new(Event::new().unwrap());
         a.lock().waiters.push((event.clone(), wake::LOCK, None));
-        // Releasing the lock may also have processed requests other tests made without the BKL
-        // (the global fallback), so count from here
-        event.clear();
+        // Requests made without holding the BKL are ignored rather than leaking into a later
+        // kernel's lock release
+        request_wake_on(wake::LOCK);
+        drop(a.lock());
+        assert!(!event.is_signaled());
         let k = a.lock();
         request_wake_on(wake::LOCK);
         std::thread::scope(|s| {

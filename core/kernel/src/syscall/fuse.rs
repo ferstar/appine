@@ -528,9 +528,10 @@ pub(super) fn write(
     io: &Io,
     data: &[u8],
     offset: Option<u64>,
+    append: bool,
 ) -> Result<usize, Errno> {
-    // As fcntl may have changed it since the open
-    let append = file.borrow().flags & oflags::O_APPEND != 0;
+    // As fcntl may have changed it since the open, or a per-request flag (RWF_APPEND) asked for it
+    let append = append || file.borrow().flags & oflags::O_APPEND != 0;
     let offset = if io.stream { Some(0) } else { offset };
     let start = take_pos(cx, file, offset)?;
     let vfs = cx.vfs()?;

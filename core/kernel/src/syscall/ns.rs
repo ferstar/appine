@@ -434,8 +434,7 @@ fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
         cx.shared.fast_changed();
     }
     if set.ipc.is_some() {
-        let tgid = cx.tgid();
-        cx.ipc_mut().exit(tgid);
+        crate::ipc::leave_undo(cx);
     }
     {
         let mut p = cx.task.ns.borrow_mut();

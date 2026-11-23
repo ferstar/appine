@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{SysResult, get, put, read_timespec};
 use crate::cell::RefCell;
-use crate::cred::{Cred, MAY_READ, MAY_WRITE, cap};
+use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Tid, request_wake_object, wake};
@@ -358,6 +358,9 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         return Err(Errno::EINVAL);
     }
     let cred = cx.cred();
+    let dir_st = cx.ipc().mq_dir.borrow().stat(cx.ipc().mqueues.len());
+    // Lookup in the internal mqueue root directory requires search permission (do_mq_open)
+    cred.permission(&dir_st, MAY_EXEC)?;
     let existing = cx.ipc().mqueues.get(&name).cloned();
     let queue = match existing {
         Some(_)
@@ -377,6 +380,7 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         }
         None if flags & oflags::O_CREAT == 0 => return Err(Errno::ENOENT),
         None => {
+            cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
             let privileged = cred.capable(cap::SYS_RESOURCE);
             let mut size = None;
             if attr != 0 {
@@ -469,18 +473,24 @@ pub(super) fn mq_unlink(cx: &mut Cx<'_>, name: u64) -> SysResult {
 }
 
 /// Removes queue `name` (mq_unlink, and unlink in the mqueue filesystem, both Linux's
-/// `vfs_unlink`): the root directory has the sticky bit, so the caller must own the queue or the
-/// root directory, or have `CAP_FOWNER` over the queue; otherwise EPERM (libc's mq_unlink turns
-/// that into EACCES).
+/// `vfs_unlink`): checks search and write permission on the mqueue root directory, and enforces
+/// the sticky-bit owner rule only when the root directory has `S_ISVTX` set (libc's mq_unlink
+/// turns `EPERM` into `EACCES`).
 pub(crate) fn remove_queue(
     ipc: &mut crate::ipc::Ipc,
     cred: &Cred,
     name: &[u8],
 ) -> Result<(), Errno> {
+    let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
+    cred.permission(&dir_st, MAY_EXEC)?;
     let q = ipc.mqueues.get(name).ok_or(Errno::ENOENT)?;
+    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
     let st = q.borrow().stat();
-    let dir_uid = ipc.mq_dir.borrow().uid;
-    if cred.fsuid != st.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&st, cap::FOWNER) {
+    if dir_st.mode & mode::S_ISVTX != 0
+        && cred.fsuid != st.uid
+        && cred.fsuid != dir_st.uid
+        && !cred.capable_wrt(&st, cap::FOWNER)
+    {
         return Err(Errno::EPERM);
     }
     ipc.mqueues.remove(name);

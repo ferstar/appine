@@ -1983,6 +1983,7 @@ mod tests {
                     vfork_done: None,
                     restart: None,
                     fast_sleep: None,
+                    sem_undo: Rc::new(crate::ipc::SemUndo::new()),
                 };
                 let task =
                     Task::new(tid, 10, &cpu, state, k.init_ns.clone(), mask, [0; 16]).unwrap();

@@ -4752,28 +4752,6 @@ impl Mm {
         self.vmas.insert(start, v);
     }
 
-    /// Whether `[addr, addr + len)` lies in mappings that allow writing (an empty range always
-    /// does), for a kernel write that must not fail halfway; mapped pages and stack growth are not
-    /// looked at.
-    pub fn can_write(&self, addr: u64, len: u64) -> bool {
-        let Some(end) = addr.checked_add(len) else {
-            return false;
-        };
-        let mut cursor = addr;
-        while cursor < end {
-            match self
-                .vmas
-                .range(..=cursor)
-                .next_back()
-                .filter(|&(&s, v)| s + v.len > cursor)
-            {
-                Some((&s, v)) if v.prot & prot::WRITE != 0 => cursor = s + v.len,
-                _ => return false,
-            }
-        }
-        true
-    }
-
     /// The range check of msync(2): the range must be fully mapped.
     pub fn check_mapped(&self, addr: u64, len: u64) -> Result<(), Errno> {
         let end = page_up(len)

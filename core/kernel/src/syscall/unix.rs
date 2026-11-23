@@ -138,6 +138,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
                 return Err(Errno::EADDRINUSE);
             }
             let vfs = cx.vfs()?;
+            super::fs::reject_trailing_slash(&vfs, (mnt, dir), name, p).map_err(in_use)?;
             let cred = cx.cred();
             let dir_st = super::fs::may_create(&vfs, &cred, (mnt, dir), name).map_err(in_use)?;
             let (uid, gid, perm) = cred.new_owner(&dir_st, 0o777, cx.umask(), false);
@@ -371,9 +372,10 @@ pub(super) fn send(
                 if data.is_empty() && files.is_empty() {
                     return Ok(0);
                 }
-                // A stream socket may queue only part of it; open files go with the first part
+                // A stream socket may queue only part of it; open files go with the first part.
+                // Even a zero-byte send carrying SCM_RIGHTS must wait when the channel is full.
                 let n = c.space().min(data.len() - done);
-                if n > 0 || data.is_empty() {
+                if n > 0 || (data.is_empty() && c.space() > 0) {
                     if !files.is_empty() {
                         crate::unix::note_inflight(cx.k(), &tx);
                     }
@@ -498,7 +500,13 @@ fn send_dgram(
         Errno::ECONNREFUSED
     };
     let rx: ChannelRef = if let Some(tx) = connected.as_ref().filter(|_| addr.is_empty()) {
-        tx.upgrade().ok_or_else(|| disconnect(tx))?
+        let rx = tx.upgrade().ok_or_else(|| disconnect(tx))?;
+        // unix_may_send: even for a previously connected peer, if it has since connected to a
+        // third socket it rejects datagrams from this one
+        if !rx.borrow().may_receive_from(&own_rx) {
+            return Err(Errno::EPERM);
+        }
+        rx
     } else if addr.is_empty() {
         return Err(Errno::ENOTCONN);
     } else {
@@ -569,81 +577,258 @@ pub(super) fn recv(
     control_len: usize,
     flags: u32,
 ) -> Result<Message, Errno> {
+    let (_, m) = recv_inner(cx, sock, nonblock, max, None, control_len, flags)?;
+    Ok(m)
+}
+
+/// Receives from an AF_UNIX socket directly into guest `iovecs`: stream bytes are copied to user
+/// memory before being consumed from the channel so a copy fault never loses stream data, while a
+/// faulting datagram/seqpacket is dropped (as Linux's `unix_dgram_recvmsg` does) unless the fault
+/// is `FUSE_RETRY`. Returns `(copied_bytes, message)` with `message.data` empty and `message.len`
+/// holding the untruncated length for `MSG_TRUNC`.
+pub(super) fn recv_into(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    nonblock: bool,
+    iovecs: &[(u64, usize)],
+    control_len: usize,
+    flags: u32,
+) -> Result<(usize, Message), Errno> {
+    let total: usize = iovecs.iter().map(|v| v.1).sum();
+    let max = total.min(super::net::MSG_MAX);
+    recv_inner(cx, sock, nonblock, max, Some(iovecs), control_len, flags)
+}
+
+fn recv_inner(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    nonblock: bool,
+    max: usize,
+    iovecs: Option<&[(u64, usize)]>,
+    control_len: usize,
+    flags: u32,
+) -> Result<(usize, Message), Errno> {
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let peek = flags & MSG_PEEK != 0;
     let (ty, timeout, passcred) = with(sock, |u| (u.ty, u.rcvtimeo, u.passcred));
     let deadline = deadline(timeout);
-    let wait_all = flags & MSG_WAITALL != 0 && ty == SOCK_STREAM && !peek;
-    // The part already read under MSG_WAITALL
+    if ty == SOCK_STREAM {
+        recv_stream(
+            cx,
+            sock,
+            (nonblock, peek, passcred, deadline),
+            max,
+            iovecs,
+            control_len,
+            flags,
+        )
+    } else {
+        recv_packet(
+            cx,
+            sock,
+            (ty, nonblock, peek, passcred, deadline),
+            max,
+            iovecs,
+            control_len,
+            flags,
+        )
+    }
+}
+
+fn empty_message() -> Message {
+    Message {
+        data: Vec::new(),
+        len: 0,
+        addr: Vec::new(),
+        control: Vec::new(),
+        flags: 0,
+    }
+}
+
+fn rx_channel(sock: &SocketRef) -> Result<ChannelRef, Errno> {
+    with(sock, |u| match &u.link {
+        Link::Stream { rx, .. } => Ok(rx.clone()),
+        Link::Listening { .. } => Err(Errno::EINVAL),
+        Link::None if u.ty != SOCK_DGRAM => Err(Errno::ENOTCONN),
+        _ => Ok(u.rx.clone()),
+    })
+}
+
+fn recv_stream(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    (nonblock, peek, passcred, deadline): (bool, bool, bool, Option<Instant>),
+    max: usize,
+    iovecs: Option<&[(u64, usize)]>,
+    control_len: usize,
+    flags: u32,
+) -> Result<(usize, Message), Errno> {
+    let wait_all = flags & MSG_WAITALL != 0 && !peek;
+    // The part already read under MSG_WAITALL (and total bytes copied so far)
     let mut part: Option<Received> = None;
+    let mut copied = 0usize;
+    let finish = |cx: &mut Cx<'_>, r: Received, copied: usize| {
+        Ok((copied, deliver(cx, r, false, passcred, control_len, flags)))
+    };
     loop {
-        let rx = with(sock, |u| match &u.link {
-            Link::Stream { rx, .. } => Ok(rx.clone()),
-            Link::Listening { .. } => Err(Errno::EINVAL),
-            Link::None if u.ty != SOCK_DGRAM => Err(Errno::ENOTCONN),
-            _ => Ok(u.rx.clone()),
-        })?;
-        let (got, eof, reset) = {
+        let rx = rx_channel(sock)?;
+        let room = max - copied;
+        let (preview, cred_break, eof, reset) = {
             let mut c = rx.borrow_mut();
-            // A connection reset by the peer (Linux's sk_err): a seqpacket socket reports it
-            // before what is queued (__skb_try_recv_datagram), a stream socket once it has read
-            // everything (unix_stream_read_generic)
-            if ty == SOCK_SEQPACKET && c.take_reset() {
-                return Err(Errno::ECONNRESET);
-            }
-            let room = max - part.as_ref().map_or(0, |p| p.data.len());
-            let got = if ty == SOCK_STREAM {
-                // A read of nothing returns 0 at once when something is queued, taking the first
-                // message's files (Linux's unix_stream_read_generic with size 0)
-                let queued = !c.packets.is_empty();
-                Some(c.read_stream(room, peek))
-                    .filter(|r| !r.data.is_empty() || !r.fds.is_empty() || (room == 0 && queued))
+            let queued = !c.packets.is_empty();
+            let cred_break = part
+                .as_ref()
+                .is_some_and(|p| c.packets.front().is_some_and(|h| h.cred != p.cred));
+            let preview = if cred_break {
+                None
             } else {
-                c.read_packet(room, peek)
+                Some(c.read_stream(room, true))
+                    .filter(|r| !r.data.is_empty() || !r.fds.is_empty() || (room == 0 && queued))
             };
-            let reset = got.is_none() && c.take_reset();
-            (got, c.eof, reset)
+            // Keep a pending ECONNRESET intact when returning partial MSG_WAITALL data so the
+            // next read reports it instead of seeing EOF
+            let reset = preview.is_none()
+                && !cred_break
+                && if part.is_some() {
+                    c.reset
+                } else {
+                    c.take_reset()
+                };
+            (preview, cred_break, c.eof, reset)
         };
-        if let Some(r) = got {
+        if cred_break {
+            return finish(cx, part.take().unwrap(), copied);
+        }
+        if let Some(mut pre) = preview {
+            let (mut taken, short_fault) = if let Some(vecs) = iovecs {
+                match super::net::scatter_partial(cx, vecs, copied, &pre.data) {
+                    Ok(wrote) => {
+                        let short = wrote < pre.data.len();
+                        let mut r = if peek {
+                            pre.data.truncate(wrote);
+                            pre.len = wrote;
+                            pre
+                        } else {
+                            drop(pre);
+                            let take_max = if short { wrote } else { room };
+                            rx.borrow_mut().read_stream(take_max, false)
+                        };
+                        copied += r.data.len();
+                        r.data.clear();
+                        (r, short)
+                    }
+                    Err(e) => {
+                        return match part.take() {
+                            Some(r) => finish(cx, r, copied),
+                            None => Err(e),
+                        };
+                    }
+                }
+            } else {
+                let r = if peek {
+                    pre
+                } else {
+                    drop(pre);
+                    rx.borrow_mut().read_stream(room, false)
+                };
+                copied += r.data.len();
+                (r, false)
+            };
+            taken.len = copied;
             let r = match part.take() {
                 Some(mut p) => {
-                    p.data.extend_from_slice(&r.data);
-                    p.len = p.data.len();
-                    p.fds.extend(r.fds);
+                    p.data.extend_from_slice(&taken.data);
+                    p.len = copied;
+                    p.fds.extend(taken.fds);
                     p
                 }
-                None => r,
+                None => taken,
             };
-            if !wait_all || r.data.len() >= max || !r.fds.is_empty() {
-                return Ok(deliver(cx, r, passcred, control_len, flags));
+            if short_fault || !wait_all || copied >= max || !r.fds.is_empty() {
+                return finish(cx, r, copied);
             }
             part = Some(r);
             continue;
         }
         if reset {
             return match part.take() {
-                Some(r) => Ok(deliver(cx, r, passcred, control_len, flags)),
+                Some(r) => finish(cx, r, copied),
                 None => Err(Errno::ECONNRESET),
             };
         }
         if eof {
-            return Ok(match part.take() {
-                Some(r) => deliver(cx, r, passcred, control_len, flags),
-                None => Message {
-                    data: Vec::new(),
-                    len: 0,
-                    addr: Vec::new(),
-                    control: Vec::new(),
-                    flags: 0,
-                },
-            });
+            return match part.take() {
+                Some(r) => finish(cx, r, copied),
+                None => Ok((0, empty_message())),
+            };
         }
         if let Err(e) = block(cx, nonblock, deadline, &rx) {
             return match part.take() {
-                Some(r) => Ok(deliver(cx, r, passcred, control_len, flags)),
+                Some(r) => finish(cx, r, copied),
                 None => Err(e),
             };
         }
+    }
+}
+
+fn recv_packet(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    (ty, nonblock, peek, passcred, deadline): (i32, bool, bool, bool, Option<Instant>),
+    max: usize,
+    iovecs: Option<&[(u64, usize)]>,
+    control_len: usize,
+    flags: u32,
+) -> Result<(usize, Message), Errno> {
+    loop {
+        let rx = rx_channel(sock)?;
+        let (preview, eof, reset) = {
+            let mut c = rx.borrow_mut();
+            // A connection reset by the peer (Linux's sk_err): a seqpacket socket reports it
+            // before what is queued (__skb_try_recv_datagram)
+            if ty == SOCK_SEQPACKET && c.take_reset() {
+                return Err(Errno::ECONNRESET);
+            }
+            let preview = c.read_packet(max, true);
+            let reset = preview.is_none() && c.take_reset();
+            (preview, c.eof, reset)
+        };
+        if let Some(pre) = preview {
+            if let Some(vecs) = iovecs
+                && let Err(e) = super::net::scatter(cx, vecs, 0, &pre.data)
+            {
+                if e == Errno::FUSE_RETRY {
+                    return Err(Errno::FUSE_RETRY);
+                }
+                drop(pre);
+                if !peek
+                    && let Some(dropped) = rx.borrow_mut().read_packet(0, false)
+                    && !dropped.fds.is_empty()
+                {
+                    crate::unix::released(cx.k(), dropped.fds);
+                }
+                return Err(e);
+            }
+            let mut r = if peek {
+                pre
+            } else {
+                drop(pre);
+                rx.borrow_mut().read_packet(max, false).unwrap()
+            };
+            let n = r.data.len();
+            let truncated = r.len > n;
+            if iovecs.is_some() {
+                r.data.clear();
+            }
+            return Ok((n, deliver(cx, r, truncated, passcred, control_len, flags)));
+        }
+        if reset {
+            return Err(Errno::ECONNRESET);
+        }
+        if eof {
+            return Ok((0, empty_message()));
+        }
+        block(cx, nonblock, deadline, &rx)?;
     }
 }
 
@@ -654,13 +839,14 @@ pub(super) fn recv(
 fn deliver(
     cx: &mut Cx<'_>,
     r: Received,
+    truncated: bool,
     passcred: bool,
     control_len: usize,
     flags: u32,
 ) -> Message {
     let mut control = Vec::new();
     let mut room = control_len;
-    let mut out_flags = if r.len > r.data.len() { MSG_TRUNC } else { 0 };
+    let mut out_flags = if truncated { MSG_TRUNC } else { 0 };
     if passcred {
         // pid and IDs as the receiver sees them (Linux's scm_recv uses pid_vnr, from_kuid_munged)
         let me = cx.cred();
@@ -684,11 +870,23 @@ fn deliver(
         let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
         let mut fds = Vec::new();
         let total = r.fds.len();
-        for file in r.fds.into_iter().take(fit) {
+        let mut iter = r.fds.into_iter();
+        let mut dropped_unix = false;
+        for file in (&mut iter).take(fit) {
+            let unix = crate::unix::is_unix_file(&file);
             match cx.fds_mut().install(file, cloexec, 0) {
                 Ok(fd) => fds.extend_from_slice(&fd.to_le_bytes()),
-                Err(_) => break,
+                Err(_) => {
+                    dropped_unix |= unix;
+                    break;
+                }
             }
+        }
+        let rest: Vec<FileRef> = iter.collect();
+        dropped_unix |= rest.iter().any(crate::unix::is_unix_file);
+        drop(rest);
+        if dropped_unix {
+            crate::unix::collect(cx.k());
         }
         if fds.len() / 4 < total {
             out_flags |= MSG_CTRUNC;
@@ -869,19 +1067,25 @@ fn find(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<SocketRef, Errno> 
         Addr::Path(p) => {
             let node = lookup_at(cx, AT_FDCWD, p, true)?;
             let vfs = cx.vfs()?;
+            // Linux's unix_find_bsd checks MAY_WRITE before S_ISSOCK (EACCES before ECONNREFUSED)
+            let st = match &node {
+                Node::Store(_, ino) => vfs.store().stat(*ino)?,
+                Node::Overlay(_, o) => vfs.store().stat(vfs.overlay().node(*o).real())?,
+                Node::Pseudo(_, p) => crate::pseudo::stat(&cx.view(&vfs), p)?,
+                Node::Fuse(_, f) => vfs.fuse().get(*f).ok_or(Errno::ENOTCONN)?.attr.stat(),
+            };
+            cx.cred().permission(&st, crate::cred::MAY_WRITE)?;
+            if st.mode & mode::S_IFMT != mode::S_IFSOCK {
+                return Err(Errno::ECONNREFUSED);
+            }
             match node {
-                Node::Store(..) | Node::Overlay(..)
-                    if vfs.kind(&cx.view(&vfs), &node)? == mode::S_IFSOCK =>
-                {
+                Node::Store(..) | Node::Overlay(..) => {
                     // The socket file behind an overlay's node (in the upper layer when it was
                     // bound through the overlay)
                     let ino = match node {
                         Node::Overlay(_, o) => vfs.overlay().node(o).real(),
                         _ => node.ino().unwrap_or(0),
                     };
-                    // Connecting to a path address requires write permission on the socket file
-                    cx.cred()
-                        .permission(&vfs.store().stat(ino)?, crate::cred::MAY_WRITE)?;
                     Name::Path(ino)
                 }
                 _ => return Err(Errno::ECONNREFUSED),

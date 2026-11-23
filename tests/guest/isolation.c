@@ -808,13 +808,13 @@ static void test_fuse_mknod_bpf_and_block_zero(void)
     int devfd = open("/dev/fuse", O_RDWR);
     CHECK(devfd >= 0, "open /dev/fuse");
 
-    struct fuse_daemon_ctx ctx = {.devfd = devfd, .mknod_count = 0, .stop = 0};
-    pthread_t th;
-    CHECK(pthread_create(&th, NULL, fuse_daemon, &ctx) == 0, "start fuse daemon");
-
     char opts[128];
     snprintf(opts, sizeof(opts), "fd=%d,rootmode=40777,user_id=0,group_id=0,allow_other", devfd);
     CHECK(mount("testfuse", mnt, "fuse", 0, opts) == 0, "mount fuse");
+
+    struct fuse_daemon_ctx ctx = {.devfd = devfd, .mknod_count = 0, .stop = 0};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, fuse_daemon, &ctx) == 0, "start fuse daemon");
 
     /* Part A: unprivileged user without CAP_MKNOD:
      * - S_IFBLK 0:0 must be EPERM (not exempted as whiteout)

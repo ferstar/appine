@@ -435,6 +435,11 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         cx.t.altstack
     };
     let vfork_done = (flags & CLONE_VFORK != 0).then(|| Rc::new(Cell::new(false)));
+    let sem_undo = if flags & CLONE_SYSVSEM != 0 {
+        cx.t.sem_undo.clone()
+    } else {
+        Rc::new(crate::ipc::SemUndo::new())
+    };
     let state = TaskState {
         mm: mm.clone(),
         fds,
@@ -450,6 +455,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         vfork_done: vfork_done.clone().map(|d| (d, cx.task.event.clone())),
         restart: None,
         fast_sleep: None,
+        sem_undo,
     };
     let tgid = if thread { cx.tgid() } else { tid };
     let mut ns = cx.ns();
@@ -1029,6 +1035,9 @@ fn exec(
     }
     let task = cx.task.clone();
     task::release_mm(cx.shared, &task, cx.t);
+    // Hand over any PI futexes this thread held (robust locks just marked owner-died, plus any
+    // non-robust PI locks with waiters) before switching address spaces (Linux's futex_exec_release)
+    crate::futex::pi_owners_exited(cx.kr(), &mut cx.shared.futexes(), Some(task.tid.get()));
     let mm = mm.into_shared();
     mm.borrow_mut().add_user(task.sync.clone());
     // SAFETY: the new address space is held by the TaskState; the old one may be released by this
@@ -1901,11 +1910,10 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
         super::ns::count(cx.k(), Counted::Pid, &new_cred.user_ns, euid, ns.clone());
         *cx.task.pid_ns_children.borrow_mut() = Some(ns);
     }
-    // As with Linux's exit_sem, apply and drop the SysV semaphore undos; this is also needed when
-    // switching IPC namespaces (the old namespace's semaphores can no longer be reached)
+    // As with Linux's exit_sem / unshare_sysvsem: leave the shared undo list, applying and
+    // dropping its adjustments only when this thread was its last sharer
     if flags & (CLONE_SYSVSEM | CLONE_NEWIPC) != 0 {
-        let tgid = cx.tgid();
-        cx.ipc_mut().exit(tgid);
+        crate::ipc::leave_undo(cx);
     }
     // A new UTS namespace copies the old names, a new IPC namespace is empty, and a new network
     // namespace has only lo, down; a new time namespace is only for later children, copying the
@@ -2122,6 +2130,8 @@ mod tests {
             let _fds_share = fds.clone();
             let _fs_share = fs.clone();
             let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+            let sem_undo = Rc::new(crate::ipc::SemUndo::new());
+            let undo_id = sem_undo.id;
             let make_state = || TaskState {
                 mm: mm.clone(),
                 fds: fds.clone(),
@@ -2133,6 +2143,7 @@ mod tests {
                 vfork_done: None,
                 restart: None,
                 fast_sleep: None,
+                sem_undo: sem_undo.clone(),
             };
             let task =
                 Task::new(10, 10, &cpu, make_state(), k.init_ns.clone(), 0, [0; 16]).unwrap();
@@ -2142,7 +2153,7 @@ mod tests {
 
             // Seed a SysV SEM_UNDO record to confirm CLONE_SYSVSEM does not run before ENOMEM
             let ipc_id = k.init_ns.ipc.id;
-            k.ipc_mut(ipc_id).undo.insert((10, 1), vec![1]);
+            k.ipc_mut(ipc_id).undo.insert((undo_id, 1), vec![1]);
 
             let orig_user_id = task.cred.borrow().user_ns.id;
             let orig_mnt_id = fs.borrow().mnt_ns.id;
@@ -2168,7 +2179,7 @@ mod tests {
             assert_eq!(cx.cred().user_ns.id, orig_user_id);
             assert_eq!(cx.t.fs.borrow().mnt_ns.id, orig_mnt_id);
             assert!(cx.task.pid_ns_children.borrow().is_none());
-            assert!(cx.kr().ipc(ipc_id).undo.contains_key(&(10, 1)));
+            assert!(cx.kr().ipc(ipc_id).undo.contains_key(&(undo_id, 1)));
             drop(cx);
             cpu
         };

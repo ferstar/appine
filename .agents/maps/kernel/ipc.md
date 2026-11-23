@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: translate /proc/sysvipc pids and show SHM_LOCKED, pin mqueue Notify registrant by weak ThreadGroup)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: share SEM_UNDO via CLONE_SYSVSEM, enforce semmns/shmall, check mqueue root perms and S_ISVTX)
 
 ## Responsibilities
 
@@ -39,8 +39,9 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 ### SysV objects
 
 - `Ipc` — one IPC namespace's objects: the `msg`, `sem` and `shm` tables; `undo`, the `SEM_UNDO`
-  adjustments keyed by `(tgid, semid)`; `tunables`; and the POSIX side: `mqueues` (name to queue),
-  `mq_limits`, `mq_dir`. `Kernel::ipcs` keeps one per namespace id, next to a weak `IpcNs`.
+  adjustments keyed by `(undo_id, semid)` (where `SemUndo { id }` is shared across tasks via
+  `Rc<SemUndo>` on `TaskState::sem_undo`); `tunables`; and the POSIX side: `mqueues` (name to
+  queue), `mq_limits`, `mq_dir`. `Kernel::ipcs` keeps one per namespace id, next to a weak `IpcNs`.
 - `Table<T>` — slots of `(Perm, T)` with a sequence number per slot; an id is
   `seq * 32768 + index` (IPCMNI 32768).
 - `Perm` — `ipc_perm`: key, uid/gid, cuid/cgid, mode (permission bits plus `SHM_DEST` and
@@ -134,8 +135,9 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 
 ### Semaphores
 
-- semget: nsems at most `semmsl` and nonzero for a new set (allocated fallibly, `ENOMEM`); an
-  existing set with fewer semaphores is `EINVAL`. `semmns` is only reported (IPC_INFO, SEM_INFO, the sysctl), never enforced.
+- semget: nsems at most `semmsl` and nonzero for a new set (allocated fallibly, `ENOMEM`), and
+  total semaphores in the namespace plus `nsems` must not exceed `semmns` (`ENOSPC`); an
+  existing set with fewer semaphores is `EINVAL`.
 - semtimedop: nsops (an unsigned int, as in Linux's prototype) 1 to `semopm` (`E2BIG` above),
   read into a fallibly allocated buffer; a semaphore number out of range is `EFBIG`;
   write permission if any op is nonzero, else read. `SemSet::apply` works on copies of the values
@@ -152,8 +154,9 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 ### Shared memory
 
 - shmget: destroyed segments are reaped first; a new segment needs a size from `SHMMIN` to
-  `shmmax` and no `SHM_HUGETLB`, and gets page-rounded host shared memory; an existing smaller
-  segment is `EINVAL`. `shmall` is only reported, never enforced.
+  `shmmax`, total namespace shm pages (guest 4 KiB pages) plus the new segment's pages within
+  `shmall` (`ENOSPC`), and no `SHM_HUGETLB`, and gets page-rounded host shared memory; an existing
+  smaller segment is `EINVAL`.
 - shmat: alignment (`SHM_RND` rounds down to 4096), `SHM_RDONLY`, `SHM_EXEC`, `SHM_REMAP`, then
   permission, then `Mm::attach_shm`, which tags the VMA with the `ShmKey` and its base. shmdt needs
   a shm VMA starting at the address, and updates the segment in the namespace recorded at attach
@@ -178,24 +181,28 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 
 ### Process exit and namespace changes
 
-- At group exit, `ipc::exit` applies the process's undo adjustments in every namespace (values
-  clamped to 0 to `SEMVMX`) and removes them.
-- unshare with `CLONE_SYSVSEM` or `CLONE_NEWIPC`, and setns into an IPC namespace, first apply and
-  drop the whole process's undo records in the old namespace. clone otherwise ignores
-  `CLONE_SYSVSEM`: undo records are per process whatever the flag says.
+- Each task holds an `Rc<SemUndo>` (`TaskState::sem_undo`). `clone` shares it iff `CLONE_SYSVSEM`
+  is set, else allocates a fresh `SemUndo` (so forked children start with empty undo state).
+- `unshare` with `CLONE_SYSVSEM` or `CLONE_NEWIPC`, and `setns` into an IPC namespace, replace
+  the caller's `sem_undo` with a fresh one and apply `Ipc::exit` on the old list only when
+  `Rc::strong_count == 1` (last sharer leaving), leaving sibling threads' shared adjustments intact.
+- At thread exit, `ipc::exit` applies the task's `sem_undo` adjustments in every namespace (values
+  clamped to 0 to `SEMVMX`) and removes them only when that task was the last holder
+  (`Rc::strong_count == 1`, inside `finish_group` for the last thread or directly on non-last
+  thread exit).
 
 ### POSIX message queues
 
 - mq_open: the name (one leading `/` stripped) must be 1 to 255 bytes without `/`, `.` or `..`;
-  access mode 3 is `EINVAL`. An existing queue is `EEXIST` with `O_CREAT|O_EXCL`, else permission
-  by access mode. A new one: attr's `mq_maxmsg` and `mq_msgsize` must be positive and within
+  access mode 3 is `EINVAL`; checks `MAY_EXEC` on `mq_dir` before lookup. An existing queue is
+  `EEXIST` with `O_CREAT|O_EXCL`, else permission by access mode. A new one: checks
+  `MAY_WRITE|MAY_EXEC` on `mq_dir`; attr's `mq_maxmsg` and `mq_msgsize` must be positive and within
   `msg_max` and `msgsize_max` (the hard limits 65536 and 16 MiB with `CAP_SYS_RESOURCE`), the
   defaults capped by `msg_max` and `msgsize_max` without attr (`mqueue_get_inode`); at most
   `queues_max` named queues (`ENOSPC`, unless `CAP_SYS_RESOURCE`); owner fsuid/fsgid and mode
   `perm & ~umask & 0o777`. The fd (always close-on-exec) is installed
   before the name is entered, so a failed install leaves nothing; opening an existing queue also
-  touches the root directory's times. Neither mq_open nor mq_unlink checks permission on the root
-  directory.
+  touches the root directory's times.
 - Through a mounted mqueue filesystem the same objects are created by open with `O_CREAT`, removed
   by unlink (both check write and search permission on the root directory), read as a status line
   (`QSIZE`, `NOTIFY`, `SIGNO`, `NOTIFY_PID`) and changed by chmod, chown and utimensat; write is
@@ -226,8 +233,9 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   after the registrant is gone or a zombie. A `SIGEV_THREAD` registration that ends without firing
   queues its cookie marked `NOTIFY_REMOVED`, which ends musl's helper thread. mq_getsetattr changes
   only the fd's `O_NONBLOCK`.
-- mq_unlink and filesystem unlink remove only the name (the queue's owner, the root directory's
-  owner, or `CAP_FOWNER`); open fds keep the queue.
+- mq_unlink and filesystem unlink check `MAY_EXEC`, `ENOENT`, and `MAY_WRITE|MAY_EXEC` on `mq_dir`,
+  enforce the sticky check (queue owner, root directory owner, or `CAP_FOWNER`) only when `mq_dir`
+  has `S_ISVTX` set, and remove only the name; open fds keep the queue.
 
 ## Dependencies (inbound / outbound)
 
@@ -275,15 +283,8 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 
 ## Confirmed bugs / technical debt
 
-- **unshare and setns drop sibling threads' undo:** undo records are per process, so one thread's
-  `unshare(CLONE_SYSVSEM|CLONE_NEWIPC)` or IPC setns applies and discards the `SEM_UNDO`
-  adjustments of every thread in the process (Linux applies a shared undo list only when its last
-  sharer leaves, and threads share one only with `CLONE_SYSVSEM`).
-- **`semmns` and `shmall` are not enforced:** semget and shmget never fail with `ENOSPC` for the
-  total number of semaphores or shm pages; both values are only reported.
-- **mqueue limits and root permissions are partly missing:** `RLIMIT_MSGQUEUE` is not enforced; mq_open and mq_unlink skip the root directory's permission check that the filesystem
-  paths make (it matters once the 01777 root is chmod'ed), and unlink applies the sticky rule even
-  when the root has lost `S_ISVTX`.
+- **`RLIMIT_MSGQUEUE` is not enforced:** `queues_max` and per-queue limits apply, but
+  `RLIMIT_MSGQUEUE` is not enforced.
 
 ## Open questions
 

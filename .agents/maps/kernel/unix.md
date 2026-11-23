@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 10 confirmed and 2 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: pin FileRef across socket syscalls, drop SCM_RIGHTS on any recvmsg EFAULT and omit SIGPIPE on partial stream send)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: check unix_may_send on connected dgrams, copy-fault-safe recv, trailing-slash bind & connect order, full zero-byte SCM_RIGHTS, deferred GC)
 
 ## Responsibilities
 
@@ -40,10 +40,11 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   `Dgram { tx: Weak<RefCell<Channel>>, peer_addr }`.
 - `Channel` (`ChannelRef = Rc<RefCell<Channel>>`) — one direction: `packets: VecDeque<Packet>`,
   `bytes` (capacity `CAPACITY = 212_992`), `eof`, `closed`, `arrivals`/`taken`, `max_qlen`
-  (datagram queue cap, default `10`), `peer: Weak<RefCell<Channel>>` (set by `set_dgram_link`),
-  and `reset` (one-shot pending `ECONNRESET`). `Packet` holds `data`, `off`, `fds: Vec<FileRef>`,
-  `cred: Ucred` and `from: Vec<u8>`. `Received` holds `data`, untruncated `len`, `fds`, `cred`
-  and `from`.
+  (datagram queue cap, default `10`), `peer: Option<Weak<RefCell<Channel>>>` (set by
+  `set_dgram_link`; `None` unconnected, `Some` connected so `may_receive_from` distinguishes
+  unconnected from connected to a dead third socket), and `reset` (one-shot pending `ECONNRESET`).
+  `Packet` holds `data`, `off`, `fds: Vec<FileRef>`, `cred: Ucred` and `from: Vec<u8>`. `Received`
+  holds `data`, untruncated `len`, `fds`, `cred` and `from`.
 - `Ucred` — kernel-space `(pid, uid, gid)` (global tgid, kuid, kgid) with 12-byte LE encoding.
 - `Name` — `Path(Ino)` or `Abstract(net_id, ty, bytes)`; `Names` (`Kernel::unix`) maps `Name` to
   `Weak<RefCell<Socket>>` plus kernel-wide `next_auto` counter.
@@ -52,14 +53,16 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 ## Public entry points
 
 - `syscall::unix::{socket, pair, max_dgram_qlen, bind, listen, accept, connect, send, recv,
-  drop_passed_files, setsockopt, getsockopt, sockname, shutdown}`, dispatched from `kernel/net`'s
-  socket syscalls and socket read/write/splice paths.
-- `UnixSocket::{readiness, wake_objects, arrivals, unread}` for `kernel/poll`, `FIONREAD` and
-  `recvmsg`'s pre-fault iovec check.
+  recv_into, drop_passed_files, setsockopt, getsockopt, sockname, shutdown}`, dispatched from
+  `kernel/net`'s socket syscalls and socket read/write/splice paths.
+- `UnixSocket::{readiness, wake_objects, arrivals, unread}` for `kernel/poll` and `FIONREAD`.
 - `unix::released` (from `close`, `close_range`, `dup3`, `close_replaced`/seccomp `addfd`,
-  `execve`/`execveat`), `unix::collect` (also at a group's last-thread `task::exit`),
-  `unix::proc_listing`, `unix::inflight_sockets` (`/proc/net/unix`) and `unix::inflight_files`
-  (`sb_busy` remount checks and `opens_of` host-unshare rehoming).
+  `execve`/`execveat`, `deliver` `MSG_CTRUNC`/`EMFILE`, AIO `io_cancel`/`released`),
+  `unix::defer_collect`/`take_deferred`/`collect_deferred`/`is_unix_file` (`UnixSocket::drop`,
+  AIO `complete_polls`/`check_polls`, syscall dispatch end), `unix::collect` (also at `task::exit`
+  when `last || fds_gone || take_deferred()`), `unix::proc_listing`, `unix::inflight_sockets`
+  (`/proc/net/unix`) and `unix::inflight_files` (`sb_busy` remount checks and `opens_of`
+  host-unshare rehoming).
 
 ## Data flow / lifecycle
 
@@ -79,7 +82,8 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
     per `(net_id, ty)`, returning `EADDRINUSE` when exhausted.
   - Abstract: inserts `Name::Abstract(net_id, ty, bytes)` (`EADDRINUSE` while a live socket of
     the same namespace and type holds it).
-  - Pathname: resolves parent via `create_parent_at` (copying up overlay parent if needed), rejects
+  - Pathname: calls `reject_trailing_slash` (`ENOENT` if missing, `EADDRINUSE` if existing),
+    resolves parent via `create_parent_at` (copying up overlay parent if needed), rejects
     `.`/`..` (`EADDRINUSE`), runs `may_create` (`MAY_EXEC`, `!exists_in` -> `EADDRINUSE`, `!ro` ->
     `EROFS`, `MAY_WRITE|MAY_EXEC`), computes `0o777 & ~umask` with setgid-dir rules, reserves
     tmpfs room (`ENOSPC`), creates an `S_IFSOCK` inode, emits `IN_CREATE` (including on overlay
@@ -94,8 +98,8 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   (negative -> 4096). Records `cx.ucred()` on every call; re-listening with a larger backlog wakes
   blocked connectors on `u.rx`.
 - `connect` (stream/seqpacket): listening -> `EINVAL`, already connected -> `EISCONN`. Resolves
-  target by abstract `(net_id, ty, bytes)` or by pathname (following symlinks; non-socket nodes
-  return `ECONNREFUSED` before checking `MAY_WRITE` `EACCES`; wrong Unix type -> `EPROTOTYPE`;
+  target by abstract `(net_id, ty, bytes)` or by pathname (following symlinks; checks `MAY_WRITE`
+  `EACCES` before `S_IFSOCK` `ECONNREFUSED`; wrong Unix type -> `EPROTOTYPE`;
   self or not listening -> `ECONNREFUSED`). When `pending.len() <= backlog` (capacity `backlog +
   1`), creates a server embryo (`embryo = true`, inheriting the *client's* `net`, listener's
   `addr`, and exchanging `cx.ucred()`/`server_cred`), pushes it onto `pending`, bumps
@@ -132,31 +136,37 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 - Send paths (sender's bound `addr` snapshotted at send entry):
   - `SOCK_STREAM`: destination address -> `EISCONN` (connected) or `EOPNOTSUPP` (unconnected);
     peer gone -> `epipe` (`EPIPE` + `SIGPIPE` unless `MSG_NOSIGNAL`) or partial count; loops pushing
-    available space (files attached to first chunk; zero-byte send with files still queues even
-    when full) and blocking on `tx`.
+    available space (files attached to first chunk; a zero-byte send carrying files requires
+    `c.space() > 0`, waiting or returning `EAGAIN` when full) and blocking on `tx`.
   - `SOCK_SEQPACKET`: ignores destination address; peer gone -> `epipe` (raises `SIGPIPE` unless
     `MSG_NOSIGNAL`); `len > CAPACITY (212_992)` -> `EMSGSIZE`; waits until whole packet fits.
   - `SOCK_DGRAM` (never raises `SIGPIPE`): local `shut_wr` -> `EPIPE`; dead connected peer
-    disconnects (`ECONNREFUSED`, then `ENOTCONN`); addressed send checks `unix_may_send` (`EPERM`);
+    disconnects (`ECONNREFUSED`, then `ENOTCONN`); both addressed and connected unaddressed sends
+    check `unix_may_send` (`c.may_receive_from(&own_rx)`, `EPERM`);
     target `c.eof` (`SHUT_RD`) -> `EPIPE`; `len > CAPACITY` -> `EMSGSIZE`; waits until `c.space() >=
     len` and `!c.holds_back(&own_rx)` (holding more than `max_qlen` packets unless target is
     connected back to sender, so `max_qlen + 1` queue and the next waits).
 - Receive paths:
-  - `net::recvmsg` pre-checks `Mm::can_write` across `total.min(u.unread())` bytes before calling
-    `unix::recv` (`EFAULT` leaves queued data intact).
+  - `SOCK_STREAM` (`unix::recv_into`, used by `recvmsg`, `recvfrom`, `read` and `readv`): peeks from
+    `Channel` and copies into guest iovecs via `net::scatter_partial` *before* consuming, consuming
+    only the copied byte count on partial copy fault (leaving unread bytes intact) or `EFAULT` when
+    nothing was copied; `MSG_WAITALL` loops until full (capped at 1 MiB), files, credential change,
+    reset (left pending when returning partial bytes), EOF or error/timeout.
   - `Channel::read_stream` merges packets in order, taking `from` from the first packet, stopping
     after a packet with `fds` and before a packet whose `cred` differs (unconditionally, even
     without `SO_PASSCRED`). Zero-length non-`MSG_PEEK` `recv*` on a non-empty queue returns 0
     immediately while taking the head packet's `fds` (whereas zero-length `read` short-circuits in
     `net::rw` and zero-length `readv` short-circuits earlier in `fs::vectored`). `MSG_PEEK` clones
-    `fds` without consuming or waking writers. `MSG_WAITALL` loops until full (capped at 1 MiB),
-    files, reset, EOF or error/timeout.
-  - `Channel::read_packet` pops/peeks one packet, sets `MSG_TRUNC` when truncated, and returns full
-    `m.len` when input `flags & MSG_TRUNC != 0`.
+    `fds` without consuming or waking writers.
+  - `SOCK_DGRAM` / `SOCK_SEQPACKET` (`Channel::read_packet`): peeks/copies into user iovecs, setting
+    `MSG_TRUNC` when truncated and returning full `m.len` when input `flags & MSG_TRUNC != 0`; on
+    `EFAULT` consumes and drops the packet (releasing any `fds` via `unix::released`), while
+    `FUSE_RETRY` leaves it queued for retry.
 - Ancillary delivery (`deliver` / `put_cmsg`): `SCM_CREDENTIALS` first when `passcred` is set
   (translated via `pid_out`, `uid_out`/`gid_out` with overflow 65534; truncated with `MSG_CTRUNC`
   if buffer is 16..27 B), then `SCM_RIGHTS` installing as many fds as fit (`MSG_CMSG_CLOEXEC`,
-  stopping on buffer/EMFILE with `MSG_CTRUNC` and dropping remaining files). A NULL control buffer
+  stopping on buffer/EMFILE with `MSG_CTRUNC`, dropping remaining files and calling `unix::collect`
+  when any was an AF_UNIX socket). A NULL control buffer
   forces `room = 0`; an unwritable control buffer in `recvmsg` closes installed fds via
   `drop_passed_files` (which calls `unix::released`), sets `MSG_CTRUNC` and `msg_controllen = 0`,
   and still returns received data bytes; any other `EFAULT` in `recvmsg` after `recv` likewise
@@ -194,8 +204,14 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 
 - Channels carrying `SCM_RIGHTS` register weak refs in `Kernel::unix_inflight` via `note_inflight`.
 - `unix::released` drops closed files and runs `unix::collect` when any was an AF_UNIX socket
-  (called from `close`, `close_range`, `dup3`, `close_replaced`/seccomp `addfd`, `exec`);
-  `task::exit` also runs `collect` on a group's last thread exit when `unix_inflight` is non-empty.
+  (called from `close`, `close_range`, `dup3`, `close_replaced`/seccomp `addfd`, `exec`, AIO
+  `io_cancel`/`released`, `deliver` truncation, datagram `EFAULT` drop). `UnixSocket::drop` (when
+  dropping packets carrying `fds` or pending embryos) and AIO `complete_polls` set a thread-local
+  `DEFERRED_COLLECT` flag (`defer_collect`), drained via `collect_deferred` at the end of syscall
+  dispatch (covering `accept4` address-write failures and socket drops) and in AIO `check_polls`;
+  `task::exit` runs `collect` whenever `(last || fds_gone || take_deferred()) && !unix_inflight.is_empty()`
+  (covering non-last thread exit after `unshare(CLONE_FILES)`), and `collect` loops while
+  `take_deferred()` handles cascading drops.
 - Algorithm: prunes dead/fd-free channels; counts in-flight references per `FileRef`; selects
   AF_UNIX candidates where `Rc::strong_count(f) == inflight_count + 1`; subtracts references from
   candidates' own `inboxes` (`u.rx`, `Stream::rx`, and pending embryos' `Stream::rx`); marks
@@ -247,26 +263,10 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 
 ## Confirmed bugs / technical debt
 
-- **Connected datagram sends skip `unix_may_send`:** an unaddressed send to a connected peer that
-  has since connected to a third socket succeeds instead of returning `EPERM` (connect and
-  addressed sends do check).
-- **Stream reads split and merge at the wrong places:** `read_stream` splits at credential changes
-  even without `SO_PASSCRED` (every packet stamps sender creds unconditionally, so enabling
-  `SO_PASSCRED` later also reveals real creds for earlier messages instead of `(0, 65534, 65534)`),
-  while `MSG_WAITALL` merges chunks across writers/credentials (keeping only the first chunk's
-  creds/address, capped at 1 MiB, and silently consuming a pending `reset` if partial data exists).
-  A zero-byte stream send carrying files still queues even when the channel is full.
-- **Error order on pathname `connect` and trailing slash on `bind`:** `connect` checks socket node
-  kind (`ECONNREFUSED`) before `MAY_WRITE` (`EACCES`), and pathname `bind` does not call
-  `reject_trailing_slash` (creating the stripped path while storing the trailing-slash address).
-- **Delayed cycle collection on non-GC drop paths:** files dropped by `MSG_CTRUNC`/`EMFILE`,
-  `UnixSocket::drop`, `accept4` address-write failure, AIO `PendingPoll`
-  teardown, or non-last thread exit after `unshare(CLONE_FILES)` do not trigger `unix::collect`,
-  leaving cycles alive until a later AF_UNIX close or last-thread exit.
-- **`recvmsg` copy faults can still lose data:** `can_write` checks only `total.min(queued)` VMA
-  flags before blocking, so data arriving while waiting, concurrent unmaps, `MSG_WAITALL` beyond
-  initial `queued`, or file-EOF faults lose dequeued stream data; `recvfrom` and `read`/`readv`
-  skip the pre-check; a faulting datagram is kept where Linux drops it.
+- **Eager credential stamping and splitting on stream reads:** `read_stream` splits at credential
+  changes even without `SO_PASSCRED`, and every packet stamps sender creds unconditionally, so
+  enabling `SO_PASSCRED` later reveals real creds for earlier messages instead of
+  `(0, 65534, 65534)`.
 - **Smaller Linux divergences:** `SIOCOUTQ` unimplemented (`ENOTTY`); `setsockopt` silently accepts
   read-only `SO_SNDLOWAT`, `SO_ACCEPTCONN` and `SO_PEERCRED` instead of `ENOPROTOOPT`; sender
   addresses are snapshotted at send time rather than receive time; connected datagram sockets are

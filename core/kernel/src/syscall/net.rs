@@ -81,7 +81,7 @@ const POLLERR: i16 = 0x008;
 /// The largest sockaddr length (`sockaddr_storage`).
 const SOCKADDR_MAX: usize = 128;
 /// The most bytes per send or receive.
-const MSG_MAX: usize = 1 << 20;
+pub(super) const MSG_MAX: usize = 1 << 20;
 
 // ---- Creating sockets ----
 
@@ -1971,16 +1971,22 @@ pub(super) fn recvfrom(
     addrlen: u64,
 ) -> SysResult {
     let (_file, sock, nonblock) = socket_of(cx, fd)?;
-    let m = recv(cx, &sock, nonblock, len, 0, flags)?;
-    cx.mm().write(UserSlice::new(buf, m.data.len()), &m.data)?;
-    let more = recv_rest(cx, &sock, nonblock, m.len, len, flags, |cx, off, d| {
-        cx.mm().write(UserSlice::new(buf + off as u64, d.len()), d)
-    });
+    let (copied, m, more) = if is_unix(&sock) {
+        let (copied, m) = unix::recv_into(cx, &sock, nonblock, &[(buf, len)], 0, flags)?;
+        (copied, m, 0)
+    } else {
+        let m = recv(cx, &sock, nonblock, len, 0, flags)?;
+        cx.mm().write(UserSlice::new(buf, m.data.len()), &m.data)?;
+        let more = recv_rest(cx, &sock, nonblock, m.len, len, flags, |cx, off, d| {
+            cx.mm().write(UserSlice::new(buf + off as u64, d.len()), d)
+        });
+        (m.data.len(), m, more)
+    };
     write_addr(cx, addr, addrlen, &m.addr)?;
     Ok((if flags & MSG_TRUNC != 0 {
         m.len
     } else {
-        m.data.len()
+        copied
     } + more) as u64)
 }
 
@@ -2105,24 +2111,6 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         controllen,
     } = read_msghdr(cx, msg)?;
     let total: usize = iovecs.iter().map(|v| v.1).sum();
-    // AF_UNIX data is taken off its queue: when the part of the iovecs that the queued data
-    // would fill cannot take it, fail first, leaving the data queued (Linux keeps a stream's
-    // message when copying it faults)
-    let queued = match &*sock.borrow() {
-        Socket::Unix(u) => u.unread().unwrap_or(0),
-        _ => 0,
-    };
-    let mut need = total.min(queued);
-    for &(base, len) in &iovecs {
-        if need == 0 {
-            break;
-        }
-        let n = len.min(need);
-        if !cx.mm().can_write(base, n as u64) {
-            return Err(Errno::EFAULT);
-        }
-        need -= n;
-    }
     // A NULL control buffer holds nothing whatever its length (scm_recv): control messages are
     // cut (MSG_CTRUNC) and passed files dropped
     let room = if control == 0 {
@@ -2130,14 +2118,23 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
     } else {
         controllen.min(4096)
     };
-    let mut m = recv(cx, &sock, nonblock, total, room, flags)?;
     let unix_sock = is_unix(&sock);
+    let (copied, mut m) = if unix_sock {
+        unix::recv_into(cx, &sock, nonblock, &iovecs, room, flags)?
+    } else {
+        let m = recv(cx, &sock, nonblock, total, room, flags)?;
+        (m.data.len(), m)
+    };
     let mut dropped = false;
     let res = (|| {
-        scatter(cx, &iovecs, 0, &m.data)?;
-        let more = recv_rest(cx, &sock, nonblock, m.len, total, flags, |cx, off, d| {
-            scatter(cx, &iovecs, off, d)
-        });
+        let more = if unix_sock {
+            0
+        } else {
+            scatter(cx, &iovecs, 0, &m.data)?;
+            recv_rest(cx, &sock, nonblock, m.len, total, flags, |cx, off, d| {
+                scatter(cx, &iovecs, off, d)
+            })
+        };
         // Write msg_namelen, msg_controllen, msg_flags back to the msghdr
         if name != 0 {
             let n = (namelen as usize).min(m.addr.len());
@@ -2171,7 +2168,7 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         Ok((if flags & MSG_TRUNC != 0 {
             m.len
         } else {
-            m.data.len()
+            copied
         } + more) as u64)
     })();
     if res.is_err() && unix_sock && !dropped {
@@ -2181,7 +2178,12 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
 }
 
 /// Writes `data` over the iovecs in order, starting `off` bytes into them.
-fn scatter(cx: &mut Cx<'_>, iovecs: &[(u64, usize)], off: usize, data: &[u8]) -> Result<(), Errno> {
+pub(super) fn scatter(
+    cx: &mut Cx<'_>,
+    iovecs: &[(u64, usize)],
+    off: usize,
+    data: &[u8],
+) -> Result<(), Errno> {
     let mut skip = off;
     let mut done = 0;
     for &(base, len) in iovecs {
@@ -2201,6 +2203,57 @@ fn scatter(cx: &mut Cx<'_>, iovecs: &[(u64, usize)], off: usize, data: &[u8]) ->
     Ok(())
 }
 
+/// Writes `data` over `iovecs` starting at byte offset `off`, returning how many bytes were
+/// written before any fault (`Ok(n)` with `n < data.len()` on a partial copy, or `Err(e)` when
+/// nothing could be written at all, preserving `EFAULT` and `FUSE_RETRY`).
+pub(super) fn scatter_partial(
+    cx: &mut Cx<'_>,
+    iovecs: &[(u64, usize)],
+    off: usize,
+    data: &[u8],
+) -> Result<usize, Errno> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let mut skip = off;
+    let mut done = 0;
+    for &(base, len) in iovecs {
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        let n = (len - skip).min(data.len() - done);
+        if n == 0 {
+            break;
+        }
+        let dst = base.wrapping_add(skip as u64);
+        let slice = &data[done..done + n];
+        if cx.write_user(UserSlice::new(dst, n), slice).is_err() {
+            let mut part = 0;
+            while part < n {
+                let at = dst.wrapping_add(part as u64);
+                let step = ((appine_engine::PAGE_SIZE - at % appine_engine::PAGE_SIZE) as usize)
+                    .min(n - part);
+                match cx
+                    .mm()
+                    .write(UserSlice::new(at, step), &slice[part..part + step])
+                {
+                    Ok(()) => part += step,
+                    Err(e) => {
+                        done += part;
+                        return if done > 0 { Ok(done) } else { Err(e) };
+                    }
+                }
+            }
+            done += part;
+        } else {
+            done += n;
+        }
+        skip = 0;
+    }
+    Ok(done)
+}
+
 /// read, readv, write and writev on a socket (Linux's `sock_read_iter` and `sock_write_iter`): a
 /// recvmsg or sendmsg without an address, control data or flags over all the iovecs, so a
 /// datagram is one message whatever the iovecs or the buffer size. A stream socket is written
@@ -2218,17 +2271,12 @@ pub(super) fn rw(
         if total == 0 {
             return Ok(0);
         }
-        let m = recv(cx, sock, nonblock, total, 0, 0)?;
-        let mut off = 0;
-        for &(base, len) in iovecs {
-            let n = len.min(m.data.len() - off);
-            if n == 0 {
-                break;
-            }
-            cx.mm()
-                .write(UserSlice::new(base, n), &m.data[off..off + n])?;
-            off += n;
+        if is_unix(sock) {
+            let (copied, _) = unix::recv_into(cx, sock, nonblock, iovecs, 0, 0)?;
+            return Ok(copied as u64);
         }
+        let m = recv(cx, sock, nonblock, total, 0, 0)?;
+        scatter(cx, iovecs, 0, &m.data)?;
         return Ok(m.data.len() as u64);
     }
     let stream = match &*sock.borrow() {

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: validate sched_setattr policy before nice check and commit atomically)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: contain BKL-release wake panics, drop unlocked global wake fallback, track per-task SemUndo and deferred unix GC)
 
 ## Responsibilities
 
@@ -39,8 +39,8 @@ and `kernel/oom`.
   `killed`/`frozen`/`pdeathsig`/exit status/`vfork`/`syscall` (`SYSCALLS` seq + nr), CPU/ctx-switch
   bases + host tid, scheduling params (nice/policy/deadline/uclamp/timer-slack/affinity/ioprio),
   wake `event`/`sleeping`, `pid_ns_children`/`NsProxy`, `TaskRes` (procfs snapshot of mm/fds/fs),
-  and thread-private `TaskState` (mm, fds, `FsContext`, group, altstack, `clear_child_tid`, vfork
-  completion, restart block, `fast_sleep`).
+  and thread-private `TaskState` (mm, fds, `FsContext`, group, `sem_undo`, altstack,
+  `clear_child_tid`, vfork completion, restart block, `fast_sleep`).
 - `TaskSync` — lock-free `in_guest` flag, engine `Kicker` (`kernel/mmu` shootdowns), and atomic
   `KernelEntry` (last syscall nr or -1, x0–x5, sp, pc; read by `/proc/<pid>/syscall`).
 - `ThreadGroup` — one process: tgid, ppid, `parent_thread` (the creating thread, Linux
@@ -166,7 +166,8 @@ and `kernel/oom`.
 - From the token until the sweeps the thread records the syscall in `Task::syscall`
   (`InSyscall`, numbered by the global `SYSCALLS` count, cleared on every way out), so the overlay
   sweep can tell which syscalls began before a removal.
-- After the handler: released FUSE files are flushed, the FUSE node cache may be swept
+- After the handler: released FUSE files are flushed, deferred AF_UNIX cycle collection runs
+  (`unix::collect_deferred`), the FUSE node cache may be swept
   (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall let go of are collected
   and removed overlay nodes swept (`kernel/overlay`), and pending cgroup2 file changes checked
   (`cgroup::notify_changes`, also run at thread exit, freezer stops and by the timer thread); then
@@ -186,10 +187,11 @@ and `kernel/oom`.
   `leader_exit`, last-thread RSS sample, `release_mm` (robust list, shared-mm `clear_child_tid` wake,
   vfork completion, leave mm users; on panic vfork completion and user removal re-run idempotently
   before killing the process), ptrace/seccomp cleanup, task/pid removal, `futex::pi_owners_exited`,
-  SysV shm reap (`kernel/ipc`), non-last thread child handoff (`pdeathsig`) + signal retargeting or
-  last-thread `finish_group`, mqueue notification flush, namespace reset/drop under BKL, FUSE flush,
-  unix-GC (last thread) + IPC/mount collection, cgroup change checks, and `EXITED` wake; CPU state
-  frees after BKL release.
+  SysV shm reap (`kernel/ipc`), non-last thread `sem_undo` release (if last holder) and child
+  handoff (`pdeathsig`) + signal retargeting or last-thread `finish_group`, mqueue notification
+  flush, namespace reset/drop under BKL, FUSE flush, unix-GC (when `last || fds_gone ||
+  unix::take_deferred()`) + IPC/mount collection, cgroup change checks, and `EXITED` wake; CPU
+  state frees after BKL release.
 - `finish_group`, each step contained: release AIO; reparent children to the nearest
   `PR_SET_CHILD_SUBREAPER` ancestor in the same pid-namespace level that still has live threads
   (one in the middle of exiting can be chosen, as on Linux), else the pid-namespace init while it
@@ -245,7 +247,8 @@ and `kernel/oom`.
   holder sets `held`, updates `Hold` (`kernel/bug`, relaxed same-cache-line stores, no clock read),
   marks BKL ownership and defers host unmaps (`kernel/hostmem`).
 - Release (`Drop for Bkl`), in order: hang up closed terminals (contained), match pending wake
-  requests against waiters, clear `held`, unlock, clear the thread's held marker, notify pooled
+  requests against waiters (inside `bug::catch`; on panic, wakes all waiters directly so the BKL is
+  always unlocked), clear `held`, unlock, clear the thread's held marker, notify pooled
   host threads, signal the matched events, release deferred host memory and refill fork spares
   (`kernel/hostmem`).
 - Waits outside a syscall context (the timer thread, `Machine::wait_*`, the terminal bridge) call
@@ -290,7 +293,8 @@ and `kernel/oom`.
   the BKL, clear the event, deregister. Host `EINTR` counts as a wake. Callers re-check their
   condition, deadline and interruption. Guest time validation/saturation belongs to `kernel/time`.
 - Wake requests made under the BKL are recorded per thread (several kernel instances may share the
-  host process) as channels and objects; requests made without the BKL go to a global fallback.
+  host process) as channels and objects; requests made without holding the BKL (`HELD == 0`, e.g.
+  standalone unit tests) are ignored rather than stored in a cross-kernel global fallback.
   At BKL release, a waiter fires if its interest shares a channel with the request, or if objects
   changed and it is `FILE`-interested with no object list or a matching object. Matched events are
   signalled after unlocking, so woken threads do not immediately sleep on the BKL (a wall-clock
@@ -400,8 +404,7 @@ and `kernel/oom`.
 
 ## Confirmed bugs / technical debt
 
-- **Latent hazards:** BKL-release wake matching runs outside `bug::catch` (`kernel/bug`, panic leaves
-  BKL locked); unlocked wake requests use a global fallback consumable by any kernel instance.
+- None recorded.
 
 ## Open questions
 

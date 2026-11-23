@@ -583,6 +583,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     };
     // Releases of FUSE files dropped while their connection was borrowed
     crate::vfs::fuse::flush_released();
+    // AF_UNIX cycles left by drops that had no &mut Kernel (UnixSocket::drop, AIO polls, accept4)
+    crate::unix::collect_deferred(cx.k());
     // Between syscalls nothing holds a FUSE node but what in_use finds
     fuse::sweep(cx);
     // A detached mount whose last open file or directory this syscall let go of

@@ -288,6 +288,8 @@ pub(crate) struct TaskState {
     /// reading the time argument again, and computes what remains from it when a signal
     /// interrupts. Cleared once the locked path has dispatched that call.
     pub fast_sleep: Option<crate::itimer::Expiry>,
+    /// Shared SysV `SEM_UNDO` list identity (`CLONE_SYSVSEM`).
+    pub sem_undo: Rc<crate::ipc::SemUndo>,
 }
 
 impl Task {
@@ -1096,7 +1098,9 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     k.tasks.remove(&tid);
     k.release_pid(tid);
     // PI locks this thread held with waiters go to their first waiter (exit_pi_state_list)
-    if crate::bug::catch(|| crate::futex::pi_owners_exited(&k, &mut shared.futexes())).is_none() {
+    if crate::bug::catch(|| crate::futex::pi_owners_exited(&k, &mut shared.futexes(), None))
+        .is_none()
+    {
         crate::bug::report(format_args!(
             "kernel panic while thread {tid} handed over its PI futexes"
         ));
@@ -1146,16 +1150,33 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
             crate::bug::kill_process(k, tgid, what);
         }
     };
+    // Take this thread's SysV SEM_UNDO handle; when it is the last sharer (either on group exit or
+    // after unshare(CLONE_SYSVSEM) / clone without CLONE_SYSVSEM), apply its adjustments
+    let sem_undo = crate::bug::catch(|| {
+        std::mem::replace(
+            &mut task.state.borrow_mut().sem_undo,
+            Rc::new(crate::ipc::SemUndo::new()),
+        )
+    });
     // finish_group contains bugs step by step itself; only the few lines reading process state
     // are left for this catch
-    if last && crate::bug::catch(|| crate::process::finish_group(&mut k, &group)).is_none() {
-        failed(&k, "finishing the process");
+    if last {
+        if crate::bug::catch(|| crate::process::finish_group(&mut k, &group, sem_undo)).is_none() {
+            failed(&k, "finishing the process");
+        }
+    } else if let Some(undo) = sem_undo
+        && Rc::strong_count(&undo) == 1
+        && crate::bug::catch(|| crate::ipc::exit(&mut k, undo.id, tgid)).is_none()
+    {
+        failed(&k, "releasing SysV IPC");
     }
     // The fd table goes with its last thread (each holds two references): its message-queue
     // registrations end as its descriptors close (Linux's mqueue_flush_file at exit)
+    let mut fds_gone = false;
     let mq_flush = || {
         let fds = task.res.borrow().fds.clone();
         if Rc::strong_count(&fds) <= 3 {
+            fds_gone = true;
             let t = fds.borrow();
             let files: Vec<_> = t
                 .open_fds()
@@ -1179,8 +1200,9 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     if crate::bug::catch(crate::vfs::fuse::flush_released).is_none() {
         failed(&k, "releasing FUSE files");
     }
-    // After the fd table's unix sockets are closed, only in-flight cycles may remain
-    if last
+    // After the fd table's unix sockets are closed (including a non-last thread that called
+    // unshare(CLONE_FILES)), collect any remaining in-flight cycles
+    if (last || fds_gone || crate::unix::take_deferred())
         && !k.unix_inflight.is_empty()
         && crate::bug::catch(|| crate::unix::collect(&mut k)).is_none()
     {

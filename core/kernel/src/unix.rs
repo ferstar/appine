@@ -158,11 +158,11 @@ impl UnixSocket {
     }
 
     /// Connects a datagram socket (`Link::Dgram`) or disconnects it (`Link::None`), noting the
-    /// peer in its own queue for senders ([`Channel::holds_back`]).
+    /// peer in its own queue for senders ([`Channel::holds_back`], [`Channel::may_receive_from`]).
     pub fn set_dgram_link(&mut self, link: Link) {
         self.rx.borrow_mut().peer = match &link {
-            Link::Dgram { tx, .. } => tx.clone(),
-            _ => Weak::new(),
+            Link::Dgram { tx, .. } => Some(tx.clone()),
+            _ => None,
         };
         self.link = link;
     }
@@ -404,6 +404,8 @@ impl Drop for UnixSocket {
     /// report `ECONNRESET` (Linux's `unix_release_sock`).
     fn drop(&mut self) {
         self.wake();
+        let had_pending =
+            matches!(&self.link, Link::Listening { pending, .. } if !pending.is_empty());
         let stale = match &self.link {
             Link::Stream { rx, tx, .. } => {
                 let mut t = tx.borrow_mut();
@@ -414,7 +416,11 @@ impl Drop for UnixSocket {
             }
             _ => self.rx.borrow_mut().discard(),
         };
+        let had_fds = stale.iter().any(|p| !p.fds.is_empty());
         drop(stale);
+        if had_fds || had_pending {
+            defer_collect();
+        }
     }
 }
 
@@ -528,8 +534,8 @@ pub(crate) struct Channel {
     /// its own peer ([`Channel::holds_back`]); None for stream channels.
     pub max_qlen: Option<usize>,
     /// The receive queue of the socket this one's datagram socket is connected to (Linux's
-    /// `unix_peer`).
-    pub peer: Weak<RefCell<Channel>>,
+    /// `unix_peer`), `None` when unconnected.
+    pub peer: Option<Weak<RefCell<Channel>>>,
     /// The sending end of a connection closed without reading everything sent to it, or before
     /// it was accepted: the receiver's pending `ECONNRESET` (its `sk_err`), cleared once reported
     /// ([`Channel::take_reset`]).
@@ -660,11 +666,18 @@ impl Channel {
         self.bytes * 4 <= CAPACITY
     }
 
+    /// Whether a datagram from the socket receiving into `sender` is allowed by `unix_may_send`:
+    /// a datagram socket connected to a specific peer accepts datagrams only from that peer.
+    pub fn may_receive_from(&self, sender: &Weak<RefCell<Channel>>) -> bool {
+        self.peer.as_ref().is_none_or(|p| Weak::ptr_eq(p, sender))
+    }
+
     /// Whether a datagram from the socket receiving into `sender` must wait (Linux's
     /// `unix_recvq_full` for a receiver whose peer is not that socket): this queue holds more than
     /// its limit.
     pub fn holds_back(&self, sender: &Weak<RefCell<Channel>>) -> bool {
-        self.max_qlen.is_some_and(|m| self.packets.len() > m) && !Weak::ptr_eq(&self.peer, sender)
+        self.max_qlen.is_some_and(|m| self.packets.len() > m)
+            && !self.peer.as_ref().is_some_and(|p| Weak::ptr_eq(p, sender))
     }
 
     /// The receiver closed: discard the buffered messages. The messages are handed to the caller
@@ -756,6 +769,35 @@ fn line(s: &mut String, flags: u32, ty: i32, state: u32, ino: u64, addr: &[u8]) 
 
 // ---- Garbage collection ----
 
+thread_local! {
+    /// An AF_UNIX socket or packet carrying open files was dropped on a path without `&mut Kernel`
+    /// (`UnixSocket::drop`, AIO poll completion, etc.); collect cycles at the next sweep.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static DEFERRED_COLLECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Schedules an AF_UNIX cycle collection on the current thread's next sweep (`collect_deferred`).
+pub(crate) fn defer_collect() {
+    DEFERRED_COLLECT.set(true);
+}
+
+/// Takes and clears the deferred cycle-collection flag.
+pub(crate) fn take_deferred() -> bool {
+    DEFERRED_COLLECT.replace(false)
+}
+
+/// Runs [`collect`] if a drop path scheduled one and any in-flight channels remain.
+pub(crate) fn collect_deferred(k: &mut Kernel) {
+    if take_deferred() && !k.unix_inflight.is_empty() {
+        collect(k);
+    }
+}
+
+/// Whether `f` is an AF_UNIX socket open file.
+pub(crate) fn is_unix_file(f: &FileRef) -> bool {
+    unix_socket(f).is_some()
+}
+
 /// Records a channel whose messages carry open files; [`collect`] finds in-flight sockets here.
 pub(crate) fn note_inflight(k: &mut Kernel, c: &ChannelRef) {
     let weak = Rc::downgrade(c);
@@ -767,9 +809,9 @@ pub(crate) fn note_inflight(k: &mut Kernel, c: &ChannelRef) {
 /// Some open files were closed (close, dup2 over an fd, execve and so on): releases them, and
 /// collects in-flight cycles when any of them is a unix socket.
 pub(crate) fn released(k: &mut Kernel, files: Vec<FileRef>) {
-    let unix = files.iter().any(|f| unix_socket(f).is_some());
+    let unix = files.iter().any(is_unix_file);
     drop(files);
-    if unix {
+    if unix || take_deferred() {
         collect(k);
     }
 }
@@ -782,6 +824,18 @@ pub(crate) fn released(k: &mut Kernel, files: Vec<FileRef>) {
 /// held elsewhere (such as by a thread blocked on it) is not a candidate, so this can only collect
 /// too little, never wrongly.
 pub(crate) fn collect(k: &mut Kernel) {
+    loop {
+        take_deferred();
+        if !collect_once(k) {
+            return;
+        }
+        if !take_deferred() || k.unix_inflight.is_empty() {
+            return;
+        }
+    }
+}
+
+fn collect_once(k: &mut Kernel) -> bool {
     type Key = *const RefCell<OpenFile>;
     k.unix_inflight.retain(|w| {
         w.upgrade()
@@ -806,7 +860,7 @@ pub(crate) fn collect(k: &mut Kernel) {
         .map(|(&key, &(_, n))| (key, n))
         .collect();
     if candidates.is_empty() {
-        return;
+        return false;
     }
     let children = |key: Key| -> Vec<Key> {
         let Some(s) = unix_socket(&inflight[&key].0) else {
@@ -855,8 +909,10 @@ pub(crate) fn collect(k: &mut Kernel) {
             }
         }
     }
+    let freed = !garbage.is_empty();
     drop(inflight);
     drop(garbage);
+    freed
 }
 
 /// The channels holding messages sent to `u`: a datagram socket's receive queue, the receive
@@ -1029,5 +1085,42 @@ mod tests {
         assert!(names.lookup(&name).is_none());
         let t = Rc::new(RefCell::new(Socket::Unix(UnixSocket::new(SOCK_STREAM))));
         assert!(names.insert(name, &t));
+    }
+
+    #[test]
+    fn dgram_may_receive_from_tracks_peer_reconnection() {
+        let a = Rc::new(RefCell::new(Channel::default()));
+        let b = Rc::new(RefCell::new(Channel::default()));
+        let c = Rc::new(RefCell::new(Channel::default()));
+        let wa = Rc::downgrade(&a);
+        let wc = Rc::downgrade(&c);
+        assert!(b.borrow().may_receive_from(&wa));
+        b.borrow_mut().peer = Some(wa.clone());
+        assert!(b.borrow().may_receive_from(&wa));
+        assert!(!b.borrow().may_receive_from(&wc));
+        b.borrow_mut().peer = Some(wc.clone());
+        assert!(!b.borrow().may_receive_from(&wa));
+        assert!(b.borrow().may_receive_from(&wc));
+        drop(c);
+        // Peer socket closed after reconnect: still not connected back to `a`
+        assert!(!b.borrow().may_receive_from(&wa));
+    }
+
+    #[test]
+    fn socket_drop_schedules_deferred_cycle_collection() {
+        let _ = take_deferred();
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let (outer_a, outer_b, to_outer_b) = pair();
+        let (cyc_a, cyc_b, to_cyc_b) = pair();
+        send(&mut k, &to_cyc_b, &cyc_b);
+        send(&mut k, &to_outer_b, &cyc_b);
+        let gone = Rc::downgrade(&cyc_b);
+        drop((cyc_a, cyc_b, to_cyc_b, to_outer_b));
+        // Closing the outer socket drops its queued packet holding `cyc_b` and schedules GC
+        drop((outer_a, outer_b));
+        assert!(gone.upgrade().is_some());
+        collect_deferred(&mut k);
+        assert!(gone.upgrade().is_none());
+        assert!(inflight_sockets(&k).is_empty());
     }
 }
