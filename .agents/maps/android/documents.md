@@ -3,154 +3,231 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/android/documents.md` for the paired decision history.
 >
-> Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 5 confirmed; bugs and debts recorded)
->
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: privacy mode overrides file access for every provider operation)
+> Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 
 ## Responsibilities
 
-`android/documents` is the `DocumentsProvider` that shows the guest's files in the system Files
-app and in other apps' pickers:
+`android/documents` is the exported `DocumentsProvider` (`${applicationId}.documents`) that exposes
+the guest rootfs store to Android's Storage Access Framework (Files app and pickers) and resolves
+terminal `file:` links:
 
-- the roots, both behind default-off file access: the login account's home (writable) and the
-  whole system (read-only outside the home);
-- document IDs, columns, flags and MIME types;
-- reading, writing, creating, deleting, renaming, moving and searching through the store's browse
-  API, without the kernel;
-- change notifications in both directions;
-- the documents that the terminal's `file:` links name.
+- up to two roots, both gated behind default-off `Settings.fileAccess` (overridden by privacy
+  mode): the login account's home (writable) and the whole system (read-only outside home);
+- canonical guest-path document IDs, `%XX` encoding/decoding matching native `browse`, columns,
+  literal-path flags, containment/path queries (`isChildDocument`, `findDocumentPath`), and MIME
+  detection with batched UTF-8 content sniffing;
+- direct store reads, home-confined writes/creates/deletes/renames/moves and breadth-first search
+  via `Native.browse*` under `Rootfs.access.read`, without starting a kernel;
+- URI grant revocation (`revokeAccess`, `revokeTree`/`grantedUnder`) and bidirectional change
+  notifications (provider -> running kernel inotify, kernel/lifecycle -> Files app);
+- resolving terminal OSC 8 `file:` hyperlinks (`Documents.fileLink`).
 
-Root: `android/app/src/main/java/io/github/mthli/appine/Documents.kt` (and its manifest entry).
+Root: `android/app/src/main/java/io/github/mthli/appine/Documents.kt` (and its `<provider>` entry
+in `android/app/src/main/AndroidManifest.xml`).
 
-Outside the module: the store-side browse implementation, real-path checks, naming and ownership
-of new files (`kernel/store`); the poll that delivers guest changes (`android/service`); account
-resolution and the store lock (`android/setup`); the JNI calls (`android/native`).
+Outside the module: the store-side browse implementation, real-path confinement, collision
+numbering and ownership (`kernel/store`); the 2 s poll that delivers guest directory changes
+(`android/service`); account resolution and the store lock (`android/setup`); JNI wrappers
+(`android/native`); `TerminalLinks` UI dispatch (`android/terminal`); terminal file import
+(`android/file-import`); privacy mode orchestration (`android/privacy`).
 
 ## Key types
 
-- `Documents : DocumentsProvider` — roots `home` and `system`; search limit 200.
-- `Home(account, uid, gid, path)` — the resolved home root, cached 5 s per login setting.
+- `Documents : DocumentsProvider` — exported SAF provider (`MANAGE_DOCUMENTS`,
+  `grantUriPermissions="true"`, `DOCUMENTS_PROVIDER` intent filter); roots `home` and `system`,
+  `SEARCH_LIMIT = 200`, `CACHE_MS = 5_000L`, lazy `closer: Handler` on
+  `HandlerThread("documents-close")`, and `@Volatile cache: Triple<Long, String, Home?>?`.
+- `Documents.Home(account, uid, gid, path)` — resolved login account and non-`/` canonical home
+  document ID, cached 5 s per `Settings.login` value.
+- `Documents.FileLink` — sealed interface returned by `fileLink`: `Found(uri, mime)`,
+  `Remote(host)`, `Hidden`, `Missing`.
 
 ## Public entry points
 
-- Framework: `queryRoots`, `queryDocument`, `queryChildDocuments`, `openDocument`,
-  `createDocument`, `deleteDocument`, `renameDocument`, `moveDocument`, `isChildDocument`,
-  `findDocumentPath`, `querySearchDocuments` (no `copyDocument`, `removeDocument`, recents or
-  thumbnails).
-- Static, for the service: `rootsChanged`, `dirsChanged`, `revokeAccess`; for the terminal: `fileLink`, with its
-  result `FileLink` (`Found` with the document's URI and MIME type, `Remote`, `Hidden`, `Missing`).
+- Framework overrides: `onCreate`, `queryRoots`, `queryDocument`, `queryChildDocuments`,
+  `querySearchDocuments`, `isChildDocument`, `findDocumentPath`, `openDocument`, `createDocument`,
+  `deleteDocument`, `renameDocument`, `moveDocument`. (`getDocumentType`, `copyDocument`,
+  `removeDocument`, `queryRecentDocuments` and `openDocumentThumbnail` are not overridden;
+  `getType` delegates to `queryDocument`.)
+- Companion APIs: `authority`, `rootsChanged`, `revokeAccess`, `dirsChanged`, `fileLink`,
+  `grantedUnder`, `canonical`, `child`, `parent`, `within`, `fileName`, `displayName`, `mimeType`,
+  `guessType`.
 
 ## Data flow / lifecycle
 
-### Roots and IDs
+### Roots, IDs, flags and MIME detection
 
-- With file access enabled and a ready rootfs, the home comes from the login setting through `Rootfs.loginAccount`
-  (`/etc/passwd` read from the store; root with `/root` when unreadable) and is shown only if it
-  exists and is not `/` (which would make the whole system writable). Home root: summary
-  "account · distro", flags local-only, is-child, search, create (making it a "Save to" target),
-  free space from `getAllocatableBytes`. System root `/`: same without create, with or without
-  a home root. `Settings.fileAccess` uses `file_access`, default false, and always refuses access during privacy mode; old `system_documents` is ignored. Enabling privacy clears file access and revokes grants; disabling privacy restores neither.
-- Document IDs are absolute guest paths with `%`, control characters and non-UTF-8 bytes written
-  as `%XX`; only canonical IDs (no empty, `.` or `..` components) count. With file access off,
-  neither root nor any document is accessible; IDs under the home are writable when enabled, the home itself only
-  as a create or move target.
-- Columns: ID, display name (decoded, U+FFFD for bad bytes), MIME type, size (files), modified
-  time, flags from the literal path (home: create; under home: delete, rename, move, plus write or
-  create; elsewhere none).
-- MIME: by extension (`MimeTypeMap`); files without a known extension are sniffed in one batch
-  (first 4 KB without NUL and valid UTF-8 → `text/plain`, at most 1000 per call); otherwise
-  `application/octet-stream`.
-- Document paths (`findDocumentPath`, which the Files app needs to open a directory it is sent
-  to): the IDs from the home root's document down to a visible document under it, else from the
-  system root's `/`, or from a given parent; a document not under the parent is not found.
+- **Access gate**: `Settings.fileAccess` (`!privacyMode && file_access`, default false; old
+  `system_documents` ignored) gates every operation. When disabled (or privacy mode is on),
+  `queryRoots` returns an empty cursor, `isChildDocument` returns `false`, and all other provider
+  methods throw `FileNotFoundException`. Enabling privacy clears `file_access` and revokes grants;
+  disabling privacy restores neither.
+- **Home resolution and roots**: `home(context)` returns `null` when `!Rootfs.isReady(context)`
+  (`meta.db` absent); otherwise checks the 5 s cache keyed by `Settings.login` (caching `null`
+  too). On miss, under `Rootfs.access.read`, it calls `Rootfs.loginAccount` (reading `/etc/passwd`
+  from the store; falling back to `root`/`/root`), rejects `/` (so the whole system cannot become
+  writable) and non-canonical paths, and confirms existence via `Native.browseStat`. `queryRoots`
+  adds `home` (`"account · distro"`, flags local-only, is-child, search, create) when `home`
+  resolves, and always adds `system` (`"/"`, same flags without create) with free space from
+  `StorageManager.getAllocatableBytes`, setting the roots notification URI (early empty returns
+  when disabled or unready skip `setNotificationUri`).
+- **Document IDs**: canonical absolute guest paths (`"/"` or leading `"/"`, no trailing `"/"`, no
+  empty, `"."` or `".."` segments). `documentId` + `utf8Length` mirror native `browse::encode_path`:
+  valid UTF-8 passes literally except `%` and ISO control characters (`U+0000..001F`,
+  `U+007F..009F`), which along with invalid UTF-8 bytes become uppercase `%XX`. `displayName`
+  decodes the last segment via `percentDecode` (invalid UTF-8 -> `U+FFFD`).
+- **Columns and flags**: ID, display name, MIME type, size (`null` for dirs), last-modified ms,
+  and literal-path flags (`home == null` -> 0; `path == home` -> `FLAG_DIR_SUPPORTS_CREATE` only;
+  strict child of `home` -> delete, rename, move, plus create for dirs or write for files;
+  elsewhere 0). `queryChildDocuments` ignores `sortOrder` (SQLite `ORDER BY d.name`) and sets the
+  child-documents notification URI.
+- **MIME detection**: directories are `MIME_TYPE_DIR`; files check `MimeTypeMap` by lowercased
+  extension after the last `.` (dotfiles like `.bashrc` usually miss). Unknown-extension files are
+  batched in one `Native.browseSniff` call (first 1000 files only; reads up to 4 KB following
+  symlinks; no NUL and valid UTF-8 -> `text/plain`, else `application/octet-stream`).
+- **Ancestry and paths**: `isChildDocument` checks `fileAccess`, canonical IDs and `doc != parent
+  && within(parent, doc)` without store I/O. `findDocumentPath` returns the ancestor ID list from
+  a supplied `parentDocumentId`, else from `home` if `within(home, child)`, else from `system`
+  (`"/"`), throwing `FileNotFoundException` if `child` is not under `top`.
 
-### Operations
+### Operations, locking and grant revocation
 
-- Every call holds `Rootfs.access`'s read lock and opens the store afresh per JNI call; errors
-  surface as `FileNotFoundException`.
-- Read: the host object file opened read-only and adopted as the returned fd.
-- Disabling gates queries, search, ancestry/path lookup, opens and changes even for old URIs.
-  The service calls `revokeAccess` on the authority URI to revoke persisted and transient document/tree
-  grants, then refreshes roots. Already-open fds and copied data cannot be recalled; calls already
-  past the access check may finish. Re-enabling does not restore revoked grants.
-- Write modes: the native side checks the real path against the home, truncates if asked, opens
-  with `O_APPEND` for append modes and returns an fd; the provider hands that fd out wrapped with a
-  close listener (`ParcelFileDescriptor.wrap`, run on a `documents-close` thread) that reports the
-  write, so the kernel sees `IN_MODIFY` and `IN_CLOSE_WRITE`; data goes directly into the host
-  object.
-- Create: names sanitised (`/` and NUL to `_`; empty, `.`, `..` to `_`), an extension added from
-  the MIME type for files; owned by the home account, 0644/0755, numbered on collision. Delete,
-  rename (no overwrite, no extension added) and move are limited to the home by real path; each
-  revokes grants on the source ID and, among the persisted grants other apps hold on this
-  provider (`getOutgoingPersistedUriPermissions`), those on documents below it (`grantedUnder`: a
-  tree URI by its tree's document), and notifies the affected directories. The framework revokes
-  a URI with those below it by path segment, and an ID is a single segment, hence the listing.
-- Search: by name under the root, breadth first (200 results, 50,000 entries).
+- **Locking and errors**: every `Native.browse*` call runs inside `Rootfs.access.read` and opens a
+  fresh `Store` connection per JNI call (forcing a running kernel to flush deferred commits, then
+  closing immediately). Native `Errno` maps to `FileNotFoundException`; non-`FileNotFoundException`
+  `IOException`s are rethrown as `FileNotFoundException`; writes outside `home` (or targeting
+  `home` itself when `top = false`) throw `UnsupportedOperationException`. During `Rootfs.reset`,
+  `Rootfs.access.write` blocks provider calls until the store is removed.
+- **`openDocument`**: read-only (`MODE_READ_ONLY`) checks visibility and adopts the host object fd
+  from `Native.browseOpen` (follows symlinks without home confinement; regular files only). Any
+  non-read-only mode requires a strict child of `home`, passes `truncate` (`MODE_TRUNCATE`) and
+  `append` (`MODE_APPEND`) to `Native.browseOpenWrite` (`MODE_CREATE` ignored; real path confined
+  strictly inside `home`, unshares held objects, records `HOST_WRITERS`, replays `Change::Opened`),
+  and wraps the adopted fd with `ParcelFileDescriptor.wrap(..., closer)` on `documents-close` so
+  closing invokes `Native.browseWritten` (clears `HOST_WRITERS` and replays `Change::Written` ->
+  `IN_MODIFY` + `IN_CLOSE_WRITE`). If `wrap` throws `IOException`, the already-detached fd is
+  re-adopted by number without close notifications (leaving `HOST_WRITERS` set for that object).
+- **Mutations and search**:
+  - `createDocument`: allowed under `home` (`top = true`); `fileName` replaces `/` and NUL with `_`,
+    maps empty/`.``/..` to `_`, and appends a `MimeTypeMap` extension for non-octet-stream files
+    when the name's MIME differs; native `browse::create` creates 0644/0755 owned by `(uid, gid)`
+    with collision numbering up to 100 (`name (1).ext`).
+  - `deleteDocument`: strict child of `home`; native `browse::remove` confines parent by real path,
+    does not follow a final symlink, and removes trees recursively.
+  - `renameDocument`: strict child of `home`; `fileName(displayName, "", true)` adds no extension;
+    native `browse::rename` never overwrites (`noreplace = true`).
+  - `moveDocument`: strict child of `home` into `home` (`top = true`, ignoring
+    `sourceParentDocumentId`); native `browse::move_to` refuses overwrites and moving a directory
+    into itself.
+  - `querySearchDocuments`: breadth-first case-insensitive substring search under `home` or
+    `system` (`SEARCH_LIMIT = 200`, native `SEARCH_BUDGET = 50,000` entries; does not descend into
+    symlinked dirs; batch-sniffs unknown extensions).
+- **Grant revocation**:
+  - `revokeAccess(context)` calls `revokeUriPermission` on `content://<authority>` for read+write
+    (revoking persisted and transient document/tree grants provider-wide; called by
+    `TerminalService.setFileAccess(false)` and `Privacy.changeMode(true)`). Already-open fds and
+    copied data survive; re-enabling does not restore revoked grants.
+  - `deleteDocument`, `renameDocument` (when path changed) and `moveDocument` call `revokeTree`:
+    revokes the source ID directly and enumerates `outgoingPersistedUriPermissions` through
+    `grantedUnder` (checking `getTreeDocumentId` for tree URIs and `getDocumentId` for document
+    URIs) to revoke persisted grants on descendants, because SAF document IDs occupy a single URI
+    path segment.
 
-### Links from the terminal
+### Terminal `file:` links
 
-- `fileLink` (called off the main thread) takes a `file:` URI from a program's OSC 8 link. Its host
-  must be empty, `localhost` or the name in the store's `/etc/hostname` (any case), else `Remote`.
-  The path's `%XX` escapes become bytes, written back as an ID the way the native side writes
-  paths, empty and `.` components dropped; a relative path or one with `..` is `Missing`. The
-  document's type comes from the provider itself (`getType`, so what is shown now applies and
-  extensionless text is sniffed): `Found`; otherwise `Hidden` when the store has a directory or
-  regular file there, else `Missing`.
+- `Documents.fileLink(context, link)` (called off the main thread by `TerminalLinks` on
+  `"appine-link"`):
+  1. Checks `link.host`: empty or `"localhost"` (any case) passes; otherwise reads `/etc/hostname`
+     from the store under `Rootfs.access.read` and matches case-insensitively, else returns
+     `FileLink.Remote(host)` (before checking `fileAccess`).
+  2. Decodes `link.encodedPath` (must start with `'/'`) via `percentDecode` -> `documentId`, drops
+     empty and `"."` segments, rejects `".."` (`Missing`), and validates via `canonical`.
+  3. Queries `contentResolver.getType(uri)` (which runs `queryDocument` + `sniff`, applying
+     `fileAccess` and visibility): non-null -> `FileLink.Found(uri, mime)`; null -> falls back to
+     direct `Native.browseStat` under `Rootfs.access.read`: exists -> `FileLink.Hidden`, else
+     `FileLink.Missing`.
 
-### Notifications
+### Bidirectional notifications
 
-- Provider to kernel: the store's change path replays the changes under each running kernel's lock
-  (guest inotify events).
-- Kernel to Files app: the service's 2 s poll passes directories the guest changed to
-  `dirsChanged`, which notifies their child-document URIs in one call; `rootsChanged` follows
-  login and setting changes and each successful kernel start.
-- With no rootfs `queryRoots` returns nothing and other calls fail; during a rootfs replacement the
-  write lock holds provider calls until the store is gone.
+- **Provider -> kernel**: mutating `Native.browse*` calls run inside `appine_kernel::browse_changing`,
+  which replays collected `Change` records into every live kernel sharing that store path under its
+  BKL (`machine::store_changed` -> `inotify::host_change`, updating open-file renames/unshares and
+  emitting inotify events).
+- **Provider -> Files app**: `createDocument`, `deleteDocument`, `renameDocument` and
+  `moveDocument` call `childrenChanged` on affected parent directory URI(s).
+- **Kernel/lifecycle -> Files app**: `TerminalService`'s 2 s poll drains `Native.takeChangedDirs`
+  (lazy recording, capped at 256 dirs per window) and passes encoded IDs to `Documents.dirsChanged`,
+  which issues one batched `contentResolver.notifyChange(uris, null, 0)` call. `rootsChanged` is
+  called on kernel start, login change, file-access toggle and privacy-mode toggle.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- The framework (manifest provider: exported, grant URI permissions, `MANAGE_DOCUMENTS`);
-  `TerminalService` (`rootsChanged`, `dirsChanged`); `MainActivity` (`fileLink`, granting the
-  viewer read access to a `Found` document); `MachineTest`.
+- Android SAF / Files app (manifest `<provider>`, `MANAGE_DOCUMENTS`, `DOCUMENTS_PROVIDER`).
+- `android/service` (`TerminalService`: `dirsChanged`, `rootsChanged`, `revokeAccess`).
+- `android/privacy` (`Privacy.changeMode`: `revokeAccess`, `rootsChanged`).
+- `android/terminal` (`TerminalLinks`: `fileLink`, `FileLink`, read-only `ACTION_VIEW` grant).
+- `android/file-import` (`TerminalFiles`: reuses `canonical`, `fileName`, `child`, `displayName`).
+- `android/tests` (`MachineTest`).
 
 ### Outbound
 
-- `Native.browse*`; `Rootfs` (`isReady`, `installed`, `access`, `loginAccount`); `Settings`
-  (`login`, `fileAccess`; android/service).
+- `android/native` -> `kernel/store`: `Native.browse*`, `Native.readFile`.
+- `android/setup`: `Rootfs` (`isReady`, `installed`, `store`, `access`, `loginAccount`).
+- `android/service`: `Settings` (`fileAccess`, `login`).
+- `android/terminal`: shared string/icon resources (`app_name`, `documents_home`,
+  `documents_system`, `ic_launcher`).
 
 ## Invariants and gotchas
 
-- When enabled, writes are limited by real path; reads follow
-  symlinks wherever they point, so an app holding a grant on the home tree can read outside it
-  through a link the guest user made (an accepted limitation: no guest permission checks apply).
-- Flags shown in the Files app are a hint; the real write check is in the native code.
-- `fileLink` writes IDs in Kotlin by the same rules as the native `encode_path` (`%`, Unicode
-  control characters and bytes outside well-formed UTF-8 as `%XX`); the two change together. A
-  differing ID would still reach the file (the native side decodes any `%XX`) but not compare
-  equal to the home's ID for write flags and path lookup.
-- A link's host is matched against `/etc/hostname` in the store, not the running system's name:
-  after `hostname` alone, without the file, the machine's own links count as `Remote`.
-- If wrapping a write fd fails (the socket pair that carries the close cannot be created), the
-  plain fd is handed out and the guest gets no `IN_MODIFY`/`IN_CLOSE_WRITE` for that write (the
-  data still lands). `wrap` detaches the fd before creating that pair, so after a failure the fd
-  is still open and is adopted again by number.
+- Read-only `openDocument` follows symlinks without home confinement (accepted limitation: no guest
+  permission checks apply), whereas all writes/mutations enforce real-path home confinement in
+  native `browse.rs` (Kotlin `flags`/`writable` check literal paths only).
+- `Documents.documentId` + `utf8Length` match native `browse::encode_path` and must change
+  together; `fileLink` relies on `percentDecode` + `documentId` running before `/` splitting so
+  `%2F` and `%2E%2E` are caught. Note that native `browse::decode_path` uses `u8::from_str_radix`
+  (accepting leading `'+'` such as `%+a`), whereas Kotlin `percentDecode` strictly requires two
+  ASCII hex digits.
+- `fileLink` checks `/etc/hostname` in the store (not the running UTS hostname) before checking
+  `fileAccess`, and infers `Hidden` whenever `getType` returns null while direct `browseStat`
+  succeeds (including when privacy mode forces `fileAccess` false).
+- `ParcelFileDescriptor.wrap` detaches `fd` before creating its socket pair; on `IOException`,
+  re-adopting `fd` keeps the write working but skips `browseWritten` (no `IN_MODIFY`/`IN_CLOSE_WRITE`
+  and `HOST_WRITERS` stays marked until exit).
+- `queryRoots` returns early before `setNotificationUri` when `fileAccess` is off or rootfs is not
+  ready.
 
 ## Confirmed bugs / technical debt
 
-- **Transient grants outlive moved or deleted directories.** Grants given for an activity (opening
-  a file in another app) cannot be listed, so those on a moved or deleted directory's descendants
-  last until that activity ends, and since IDs are paths they cover a file created at the same
-  path meanwhile; persisted grants are revoked.
+- **Transient grants outlive moved or deleted directories:** `outgoingPersistedUriPermissions`
+  exposes only persisted grants; transient (activity-scoped) grants on descendants of a deleted,
+  renamed or moved directory cannot be listed and last until that activity ends, covering any new
+  file created at the same path meanwhile.
+- **`canonical()` accepts `%2E`/`%2F` sequences decoded by native `browse::decode_path`:**
+  `canonical()` validates raw string segments without decoding `%XX`, whereas `browse::decode_path`
+  decodes arbitrary `%XX` before `walk()` splits on `/`. A crafted document ID containing
+  `%2e%2e` or `%2f` passes `canonical()`, `visible()` and `isChildDocument`, bypassing tree-URI
+  descendant confinement both on reads anywhere in the rootfs and on writes to sibling/ancestor
+  paths within `home` (native real-path checks confine writes only to `home`, not to a narrower
+  granted subtree, whereas `fileLink` decodes and re-encodes before splitting).
+- **Rootfs replacement does not revoke existing URI grants:** `TerminalService.replace` deletes and
+  reimports the store without calling `Documents.revokeAccess`, so existing path-based URI grants
+  survive into matching paths of the replacement rootfs if `fileAccess` stays enabled.
+- **`home(context)` 5 s cache is not cleared by `rootsChanged` and skips directory check:** the
+  cache is keyed only by `Settings.login` (so a same-login store reset/reimport can briefly return
+  a stale `Home?` within 5 s), and `home(context)` checks only that `browseStat` succeeds without
+  verifying `meta.startsWith("d\t")` or the resolved real path (native `top_of` still blocks writes).
+- **Terminal file imports do not refresh open Files app listings:** `TerminalFiles.copyIntoHome`
+  mutates the home directory through `Native.browse*` directly (a separate store connection with
+  `changed_dirs = None`) without calling `Documents.dirsChanged`.
 
 ## Open questions
 
-- Should `/etc/passwd` changes (an `adduser` while the login is "auto") refresh the roots?
+- Should `/etc/passwd` changes (such as `adduser` while `login` is `"auto"`) refresh the roots?
 
 ## To verify
 
-- Persisted and picker-issued grant revocation on a device; explicit document/tree grants were
-  revoked on API 34, with all six provider tests passing, including disabled queries, reads and changes.
-- `fileLink` and `findDocumentPath` on real devices and other file managers; tried only on a Pixel
-  4a API 34 emulator with Google's Files app, HTML Viewer and Chrome.
+- Persisted and picker-issued grant revocation, `fileLink`, `findDocumentPath`, and empty
+  `queryRoots` without `setNotificationUri` across real devices, OEM file managers and Android
+  versions (exercised on a Pixel 4a API 34 emulator with Google Files, HTML Viewer and Chrome).
