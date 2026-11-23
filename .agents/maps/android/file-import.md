@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/file-import.md` for the paired decision history (not yet created; pre-split decisions D4 and D62 stay in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: notify Documents.dirsChanged after home imports)
 
 ## Responsibilities
 
@@ -40,8 +42,10 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
 - Provider display names are used with a localized fallback. Controls, slash and NUL are replaced,
   empty/dot names are sanitized, and extensions are preserved. Native browse creation assigns the
   account's ownership and numbers collisions without overwriting. Source and destination streams
-  close, file data is synced, and `browseWritten` reports the write to the guest. Read/write/close
-  errors attempt to remove the created file; other files in the batch continue.
+  close, file data is synced, `browseWritten` reports the write to the guest, and when a `Context`
+  is supplied (`copySelected`), `Documents.dirsChanged` refreshes the modified home directory in
+  open Files app listings. Read/write/close errors attempt to remove the created file (notifying
+  `Documents.dirsChanged` if cleanup fails); other files in the batch continue.
 - The retained result lists successful guest paths in monospace and per-file failures in a protected
   dialog. A blank line separates the explanation from the paths; message assembly preserves spans.
   Copy paths explicitly puts space-separated shell arguments on the clipboard, prefixing whitespace
@@ -64,7 +68,8 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
 ### Outbound
 
 - ContentResolver supplies Android document streams; `android/setup` resolves accounts and
-  holds the Rootfs store read lock. `android/documents` supplies naming/path helpers.
+  holds the Rootfs store read lock. `android/documents` supplies naming/path helpers and
+  `dirsChanged` notifications.
 - `android/native` browse calls create, sync, notify and remove partial guest files.
 - `android/terminal` supplies localized resources and privacy-protected presentation.
 

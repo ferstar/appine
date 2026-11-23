@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: list android/vtgestures alongside android/vtview and android/vtrender)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: spawn stderr-log thread before dup2 on fd 2)
 
 ## Responsibilities
 
@@ -99,9 +99,11 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 
 ### stderr and panics
 
-- `init` redirects stderr once: fd 2 becomes a pipe read by a `stderr-log` thread that writes each
-  line to logcat (tag `appine`, priority INFO; lines containing NUL are dropped); a failing `pipe`
-  or `dup2` leaves stderr as it was. `verbose` sets `APPINE_LOG=1`.
+- `init` redirects stderr once: creates a pipe, spawns the `stderr-log` thread first (writing each
+  line to logcat with tag `appine`, priority INFO; lines containing NUL are dropped), and only then
+  redirects fd 2 via `dup2` (closing `write_end` if `write_end != 2`). A failing `pipe` or thread
+  spawn closes any open pipe ends without touching fd 2; a failing `dup2` closes `write_end` so the
+  reader exits cleanly while fd 2 stays as it was. `verbose` sets `APPINE_LOG=1`.
 - Panics are contained at two layers. The kernel wraps most `Machine` methods in `host_call`,
   which turns a panic into an error of the call when containment is on (`APPINE_ON_BUG=kill`, or
   by default whenever debug assertions are off, which is always on Android) and aborts the process
@@ -164,8 +166,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 - Local references are never deleted in lib.rs's loops that build or read arrays (`string_array`,
   `takeListens`, `takeKills`, `strings`; harmless with ART's large table on every supported
   version); a failed string conversion with no pending exception makes void calls return silently
-  (unreachable from the non-null Kotlin signatures). If the `stderr-log` thread fails
-  to start, fd 2 is already the pipe and nobody reads it, so stderr writes block once it fills.
+  (unreachable from the non-null Kotlin signatures).
 
 ## Open questions
 

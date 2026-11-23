@@ -1,6 +1,7 @@
 package io.github.mthli.appine
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -84,7 +85,7 @@ internal class TerminalFiles(application: Application) : AndroidViewModel(applic
                         }
                         val input = resolver.openInputStream(uri)
                             ?: throw IOException("Cannot open the selected file")
-                        paths += copyIntoHome(store, account, name, input)
+                        paths += copyIntoHome(store, account, name, input, context)
                     } catch (e: Exception) {
                         failures += context.getString(R.string.import_file_failed, name, e.message ?: e.javaClass.simpleName)
                     }
@@ -105,9 +106,15 @@ internal class TerminalFiles(application: Application) : AndroidViewModel(applic
 
     companion object {
         /** Owns [input]; a failed copy or close removes only the file it created. */
-        internal fun copyIntoHome(store: String, account: Rootfs.Account, displayName: String, input: InputStream): String {
+        internal fun copyIntoHome(
+            store: String,
+            account: Rootfs.Account,
+            displayName: String,
+            input: InputStream,
+            context: Context? = null,
+        ): String {
             var createdFile: Pair<String, String>? = null
-            return try {
+            val (top, imported) = try {
                 input.use {
                     val top = Documents.documentId(account.home)?.takeIf { it != "/" }
                         ?: throw IOException("The login account has no home directory")
@@ -127,7 +134,7 @@ internal class TerminalFiles(application: Application) : AndroidViewModel(applic
                     } finally {
                         Native.browseWritten(store, top, path)
                     }
-                    Documents.child(home, Documents.displayName(created))
+                    top to Documents.child(home, Documents.displayName(created))
                 }
             } catch (e: Exception) {
                 createdFile?.let { (top, path) ->
@@ -135,10 +142,13 @@ internal class TerminalFiles(application: Application) : AndroidViewModel(applic
                         Native.browseRemove(store, top, path)
                     } catch (cleanup: Exception) {
                         e.addSuppressed(cleanup)
+                        context?.let { runCatching { Documents.dirsChanged(it, arrayOf(top)) } }
                     }
                 }
                 throw e
             }
+            context?.let { Documents.dirsChanged(it, arrayOf(top)) }
+            return imported
         }
 
         /** Escapes imported absolute paths as shell arguments without appending a newline. */

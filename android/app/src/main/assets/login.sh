@@ -76,8 +76,7 @@ ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -Fqx "$group"; }
 # before has installed it already
 locked() {
     (
-        flock 9
-        "$@"
+        flock 9 && "$@"
     ) 9>/run/appine-install.lock
 }
 

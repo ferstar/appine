@@ -92,6 +92,19 @@ internal class VtSession(
     /** The console is open: started and not closed yet. */
     val consoleOpen: Boolean get() = pty.console >= 0 && !hungUp.get()
 
+    /**
+     * Whether this tab owned [console] when kill reports were taken at [epoch]: each tracked
+     * console lifetime has a disjoint `[openedEpoch, closedEpoch]` interval (`closedEpoch == 0`
+     * while open).
+     */
+    fun ownedConsoleAt(console: Int, epoch: Long): Boolean {
+        if (console < 0 || pty.console != console) return false
+        val opened = pty.openedEpoch
+        if (opened <= 0L || epoch < opened) return false
+        val closed = pty.closedEpoch
+        return closed == 0L || epoch <= closed
+    }
+
     /** The login account setting the tab was opened with ([ConsolePty.login]). */
     val login: String get() = pty.login
 
@@ -538,12 +551,15 @@ internal class VtSession(
     /** Input for the program, written on the tab's writer thread; dropped once the shell exited. */
     fun write(data: ByteArray) {
         val w = writer ?: return
-        if (!isRunning) return
+        if (!isRunning || hungUp.get()) return
         val console = pty.console
+        if (console < 0) return
         try {
-            w.execute { Native.write(machine, console, data, 0, data.size) }
+            w.execute {
+                if (!hungUp.get()) Native.write(machine, console, data, 0, data.size)
+            }
         } catch (_: RejectedExecutionException) {
-            // Released meanwhile
+            // Released or hung up meanwhile
         }
     }
 
@@ -563,30 +579,40 @@ internal class VtSession(
 
     /**
      * Resets the terminal as Ghostty's reset does (⋮); a shell at its prompt gets a form feed (^L)
-     * to draw the prompt again on the empty screen.
+     * to draw the prompt again on the empty screen. Also drops progress and program-status state,
+     * matching a program's RIS.
      */
     fun reset() {
-        if (tab == 0L) return
+        if (tab == 0L || released) return
         if (VtNative.reset(tab)) write(FORM_FEED)
+        clearStatus()
         view?.invalidate()
         // The title a program set is gone
         events.onTitleChanged(this)
+    }
+
+    /** Drops progress, its timeout and all status records; notifies the service when any were shown. */
+    private fun clearStatus() {
+        main.removeCallbacks(dropProgress)
+        synchronized(reports) { reports.clear() }
+        val had = progress != null || status != null
+        progress = null
+        records.clear()
+        status = null
+        if (had) events.onStatusChanged(this)
     }
 
     private fun exited(code: Int) {
         if (exit != null) return
         exit = code
         hangUp()
-        writer?.shutdown()
-        main.removeCallbacks(dropProgress)
-        if (released) return
-        // Nothing runs any more to work, wait or have finished: an ended tab shows none of it
-        if (progress != null || status != null) {
-            progress = null
-            records.clear()
-            status = null
-            events.onStatusChanged(this)
+        writer?.shutdownNow()
+        if (released) {
+            main.removeCallbacks(dropProgress)
+            return
         }
+        // Nothing runs any more to work, wait or have finished: an ended tab shows none of it
+        clearStatus()
         if (tab != 0L) {
             val reason = when {
                 code > 0 -> " (code $code)"
@@ -604,7 +630,7 @@ internal class VtSession(
         if (released) return
         released = true
         finishIfRunning()
-        writer?.shutdown()
+        writer?.shutdownNow()
         main.removeCallbacks(dropProgress)
         // A running pump keeps the terminal until it returns
         if (tab != 0L) VtNative.destroy(tab)
@@ -617,7 +643,12 @@ internal class VtSession(
 
     /** Closes the console once, so a later close cannot hang up a tab that reused its number. */
     private fun hangUp() {
-        if (hungUp.compareAndSet(false, true)) pty.close()
+        if (hungUp.compareAndSet(false, true)) {
+            // Cancel queued writes before closing so draining tasks cannot write into a newly
+            // opened tab if the kernel immediately reuses the console number.
+            writer?.shutdownNow()
+            pty.close()
+        }
     }
 
     companion object {

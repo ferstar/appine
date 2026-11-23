@@ -2,7 +2,11 @@ package io.github.mthli.appine
 
 import android.content.Context
 import android.content.Intent
+import android.database.ContentObserver
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.provider.DocumentsContract
 import androidx.core.content.edit
 import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
@@ -24,6 +28,8 @@ import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /** Real store copies, including failures, with no dependency on the app's running rootfs. */
 @RunWith(AndroidJUnit4::class)
@@ -53,6 +59,23 @@ class TerminalFilesTest {
         assertEquals("/root/资料 100% (1).bin", second)
         assertArrayEquals(bytes, Native.readFile(store, first))
         assertArrayEquals(byteArrayOf(9), Native.readFile(store, second))
+    }
+
+    @Test
+    fun copyIntoHomeNotifiesDocumentsProvider() {
+        val uri = DocumentsContract.buildChildDocumentsUri(Documents.authority(context), "/root")
+        val notified = CountDownLatch(1)
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) { notified.countDown() }
+        }
+        context.contentResolver.registerContentObserver(uri, false, observer)
+        try {
+            val imported = TerminalFiles.copyIntoHome(store, account, "notify.txt", "hello".toByteArray().inputStream(), context)
+            assertEquals("/root/notify.txt", imported)
+            assertTrue("Expected Files app child listing notification for /root", notified.await(5, TimeUnit.SECONDS))
+        } finally {
+            context.contentResolver.unregisterContentObserver(observer)
+        }
     }
 
     @Test

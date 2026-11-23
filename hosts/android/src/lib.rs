@@ -105,12 +105,13 @@ fn redirect_stderr() {
         }
         const ANDROID_LOG_INFO: i32 = 4;
         let mut fds = [0; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 || unsafe { libc::dup2(fds[1], 2) } < 0 {
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return;
         }
-        unsafe { libc::close(fds[1]) };
-        let read_end = fds[0];
-        let _ = std::thread::Builder::new()
+        let [read_end, write_end] = fds;
+        // Spawn the reader before redirecting fd 2 so a spawn failure never leaves stderr pointing
+        // at an unread pipe; write_end stays open across spawn so the reader cannot see EOF early.
+        let spawned = std::thread::Builder::new()
             .name("stderr-log".into())
             .spawn(move || {
                 use std::io::{BufRead, BufReader};
@@ -125,6 +126,21 @@ fn redirect_stderr() {
                     }
                 }
             });
+        if spawned.is_err() {
+            unsafe {
+                libc::close(read_end);
+                libc::close(write_end);
+            }
+            return;
+        }
+        if unsafe { libc::dup2(write_end, 2) } < 0 {
+            // Closing write_end delivers EOF to stderr-log so it exits cleanly.
+            unsafe { libc::close(write_end) };
+            return;
+        }
+        if write_end != 2 {
+            unsafe { libc::close(write_end) };
+        }
     });
 }
 

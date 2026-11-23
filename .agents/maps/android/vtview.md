@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/vtview.md` for the paired decision history (decisions from before the split are D5, D7, D9, D16, D17, D25, D30–D32, D34, D36, D37, D40, D41, D43 and D46–D48 in `.agents/decisions/android/terminal.md`; this snapshot also keeps the decisions on rendering and gestures/selection/scrolling made before `android/vtrender` and `android/vtgestures` were split out).
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 9 confirmed and 3 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: stop blink and clear preedit/IME on attach, send mode 1004 focus without scrolling, and sync preedit on composing deletes)
 
 ## Responsibilities
 
@@ -67,10 +69,12 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
 - `attach(s)` ignores an unchanged session. When switching or detaching, it clears any resize
   preview, ends search, detaches `session.view`, finishes the floating action menu and any active
   native selection gesture (`VtNative.gestureEnd`), cancels autoscroll and flings, stops
-  `passwordCheck`, resets `imePassword` (calling `restartInput()` synchronously if it was on),
-  clears hover/selection/scroll state, and drops `VtImages` bitmaps and `animationTick`. For the
-  new session it clears `hasFrame`, binds `s.view = this`, calls `s.resize` and `host.onGrid` when
-  the grid is already known (starting an unstarted shell), sets `full = true` and invalidates.
+  `passwordCheck`, resets `imePassword`, clears `preedit` (`setPreedit("")`), calls `restartInput()`
+  synchronously when switching/detaching tabs or when `imePassword`/`preedit` was active, clears
+  hover/selection/scroll state, and drops `VtImages` bitmaps and `animationTick`. For the new
+  session it clears `hasFrame`, binds `s.view = this`, calls `s.resize` and `host.onGrid` when the
+  grid is already known (starting an unstarted shell), calls `updateBlink()` (stopping `blinkTick`
+  whenever `tab == 0L`), sets `full = true` and invalidates.
 - `setFontSize` clamps to 6–32 dp, clears any resize preview, updates `VtRenderer` and regrids;
   `zoom` (called from `android/vtgestures`'s scale detector) steps by density and notifies
   `host.onZoom`. `setFillWide` clears any resize preview, updates `VtRenderer`, sets `full = true`
@@ -101,10 +105,10 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
   `passwordCheck` and clears any resize preview when hidden; becoming visible invalidates so images
   and password checks resume. `onDetachedFromWindow` clears the resize preview, stops
   `passwordCheck`, and clears blink state directly (since `isAttachedToWindow` is still true).
-- Cursor blinking runs on a 500 ms half-period (`BLINK_MS`) only while requested by the frame,
-  cursor is shown, and the view is attached with view and window focus; cursor movement or sent
-  input restarts the visible phase. Native frames force `cursorBlinking = false` on the lock
-  cursor.
+- Cursor blinking runs on a 500 ms half-period (`BLINK_MS`) only while `tab != 0L`, requested by
+  the frame, cursor is shown, and the view is attached with view and window focus; cursor movement
+  or sent input restarts the visible phase. Native frames force `cursorBlinking = false` on the
+  lock cursor.
 - Password mode: when a frame shows `VtNative.CURSOR_LOCK`, `apply` starts a 200 ms poll
   (`passwordCheck` -> `VtNative.passwordInput`) while the window is visible until echo returns, and
   posts `restartInput()` whenever `imePassword` changes so the IME switches input connection types
@@ -173,9 +177,10 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
   clearing the editable so IME clipboard pastes cannot bypass paste safety or replay later;
   replacement offsets cover only the local preedit. `performContextMenuAction` routes `paste` and
   `pasteAsPlainText` to `pasteClipboard()`. `performEditorAction` sends Enter; `setComposingText`
-  updates `preedit` drawn at the cursor; `deleteSurroundingText` (and `InCodePoints`) sends DEL
-  `beforeLength` times when the editable is empty (ignoring `afterLength`) and delegates to `super`
-  while composing. `requestCursorUpdates` tracks `monitorCursor` and pushes `CursorAnchorInfo`
+  updates `preedit` drawn at the cursor; `deleteSurroundingText` and
+  `deleteSurroundingTextInCodePoints` send DEL `beforeLength` times when the editable is empty
+  (ignoring `afterLength`) and delegate to `super` while composing before calling `setPreedit` with
+  the updated editable text. `requestCursorUpdates` tracks `monitorCursor` and pushes `CursorAnchorInfo`
   (offset by `-scrollPx`) immediately and on subsequent cursor or preedit moves (not on scroll-only
   changes).
 - Paste (`pasteClipboard`, `paste`, `appine_vt_paste`): `copySelection`, `pasteClipboard` and
@@ -189,11 +194,12 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
   `text.trimEnd('\r', '\n')` is shorter, non-empty, and passes a probe `VtNative.paste(..., false)`;
   choosing it re-calls `paste(trimmed)` to re-check privacy and current terminal modes.
 - Focus: `onWindowFocusChanged` finishes flings and calls `settle()` if `scrollPx != 0` on focus
-  loss, sends `VtNative.focus(tab, hasWindowFocus)` (encoded via `ghostty_focus_encode` into a
-  16-byte buffer only when mode 1004 is enabled, queried directly by `appine_vt_focus` via
-  `mode_on`, while `FLAG_FOCUS_EVENTS` in the frame header goes unread by `VtFrame`) through
-  `send`, updates cursor blinking and invalidates. Switching tabs (`attach`) sends no focus events.
-  `onFocusChanged` only updates blink.
+  loss, sends non-empty `VtNative.focus(tab, hasWindowFocus)` bytes (encoded via
+  `ghostty_focus_encode` into a 16-byte buffer only when mode 1004 is enabled, queried directly by
+  `appine_vt_focus` via `mode_on`, while `FLAG_FOCUS_EVENTS` in the frame header goes unread by
+  `VtFrame`) directly to `host.onInput` without calling `send(...)` (preserving `settle()` and
+  scrolled-back viewports), updates cursor blinking and invalidates. Switching tabs (`attach`) sends
+  no focus events. `onFocusChanged` only updates blink.
 
 ### Search and prompt jumps
 
@@ -288,8 +294,8 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
 - The unsafe-paste dialog's "Paste as is" lambda checks `tab != 0L` without re-checking
   `Privacy.locked` directly (relying on `MainActivity.Host.onInput`'s final privacy gate), whereas
   "Drop trailing newlines" calls `paste(trimmed)` and re-checks both privacy and terminal modes.
-- When mode 1004 is active, `onWindowFocusChanged` sends focus bytes via `send(...)`, which scrolls
-  a scrolled-back viewport to the bottom on focus gain or loss.
+- When mode 1004 is active, `onWindowFocusChanged` sends focus bytes directly to `host.onInput`
+  rather than `send(...)`, preserving `settle()` and any scrolled-back viewport position.
 - With IME shown, a hardware Esc press is consumed by the IME (e.g. Gboard hides itself), so a
   Kitty-protocol program receives only the `ACTION_UP` release.
 - Scroll bar metrics (`computeVerticalScroll*`) return pixels with `scrollPx` added to offset so
@@ -311,17 +317,7 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
 
 ## Confirmed bugs / technical debt
 
-- **`attach` leaves `blinkTick` running and `preedit` uncleared:** `attach(null)` does not call
-  `updateBlink()` or cancel `blinkTick` (and `updateBlink()` does not check `tab != 0L`), so
-  detaching a session while focused keeps invalidating every 500 ms; `attach` also does not clear
-  `preedit` or restart input unless `imePassword` was true, so an active composition can remain
-  visible after switching tabs.
-- **Mode 1004 focus events jump a scrolled-back viewport to the bottom:** `onWindowFocusChanged`
-  routes focus-gain/loss bytes through `send(...)`, which cancels any in-progress `settle()` and
-  scrolls the viewport to the bottom whenever `!atBottom`.
-- **Composing `deleteSurroundingText` leaves `preedit` stale:** when `editable` is non-empty,
-  `Connection.deleteSurroundingText` delegates to `super` without calling `setPreedit`, leaving
-  stale preedit drawn and reported in `CursorAnchorInfo` until the next IME callback.
+None.
 
 ## Open questions
 

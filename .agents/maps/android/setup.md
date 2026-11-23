@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint prompt-tap consumer reference to android/vtgestures)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: check flock exit status before running locked install commands)
 
 ## Responsibilities
 
@@ -333,7 +333,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     `DPkg::Lock::Timeout`, which apt shows on the terminal), and touch the marker once the tool is
     there;
   - the install lock: a `flock` on `/run/appine-install.lock` held around each install of a bundled
-    package (`locked`), so concurrent logins install bash, doas, procps-ng and bubblewrap one after another, each first
+    package (`locked` runs `flock 9 && "$@"` so commands never run if acquiring the lock fails), so concurrent logins install bash, doas, procps-ng and bubblewrap one after another, each first
     checking whether an earlier holder installed it already; each `apk add` (`apk_add`) that fails
     on apk's own lock, held by an apk the user runs, prints that another apk is running and is
     retried with `--wait 3600`, so the login waits until that apk ends; Ctrl-C stops the wait and
@@ -407,8 +407,6 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 - Mirror template comparison and replacement are separate operations: a guest edit between
   them can be overwritten.
-- `locked` runs the install command even when `flock 9` fails. The unchecked return is confirmed;
-  consequences under lock errors or interruption have not been reproduced.
 - Busybox ash can emit literal path controls through the visible prompt's `\w`. The directory
   title is sanitized and restored after that prompt, but other terminal effects in visible
   prompt text are not sanitized.

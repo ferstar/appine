@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: revoke Documents URI grants and refresh roots during rootfs replacement)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: compare exact tab-index layout string and route kill reports by console-lifetime epoch)
 
 ## Responsibilities
 
@@ -70,6 +70,9 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   `progress`, `mirrorThread`.
 - `GuestActivity` — the last guest CPU sample and activity timestamp used by
   the BUSY running policy; `RunPolicy` in `Settings` defines SLEEP, BUSY and ALWAYS.
+- `ConsoleTracker` — per-kernel monitor serializing console opens/closes with `Native.takeKills`
+  under a monotonic epoch so each console lifetime owns a disjoint `[openedEpoch, closedEpoch]`
+  interval; `close` drains remaining kills before advancing the epoch past the closed console.
 - `BrowserBridge` — per-kernel random-port IPv4 loopback listener with a UUID capability that
   relays guest HTTP(S) open requests to the focused UI.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
@@ -160,12 +163,14 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 - Changed directories are handled on the worker straight away: `Documents.dirsChanged`, then
   `Rootfs.dirsChanged` (a change in `/etc` rewrites the login's NOPASSWD rules, android/setup).
 - The rest is applied on the main thread only if the kernel is still the same: listens (to
-  `Notifications`), kills (in-tab `[appine]` message into the tab whose console with that number
-  is open, else the newest tab that had it, in yellow above the cursor line and skipped on the
-  alternate screen; then `Notifications` unless shown in the tab in front, and always for an Appine
-  bug), then power. Reboot → `restart()`; halt/poweroff → `exitAll()`; no running sessions (tabs
-  whose shell ended do not count; restored tabs not shown yet do), no listeners and no guest
-  processes (init and zombies excluded) → `exitAll()`.
+  `Notifications`), kills (taken with their `ConsoleTracker` epoch by the poll or drained on
+  console close, routed via `sessionForKill` -> `VtSession.ownedConsoleAt` to the unique tab whose
+  `[openedEpoch, closedEpoch]` interval held that console, shown as an in-tab `[appine]` message
+  in yellow above the cursor line and skipped on the alternate screen; then `Notifications` unless
+  shown in the tab in front, and always for an Appine bug), then power. Reboot → `restart()`;
+  halt/poweroff → `exitAll()`; no running sessions (tabs whose shell ended do not count; restored
+  tabs not shown yet do), no listeners and no guest processes (init and zombies excluded) →
+  `exitAll()`.
 
 ### Stopping, restarting, replacing
 
@@ -270,11 +275,11 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   restored tab logs in as the same user. Restored tabs not shown yet keep their saved transcript,
   snapshot and cwd; the saved current tab is an index among the running tabs (0 when none is current).
 - `Tabs.save` writes temp-then-rename, as `writeSnapshot` did before it; a transcript's or
-  snapshot's name is its content digest, so unchanged ones are not rewritten; the index (with the time) is skipped when its tabs and current tab hash the
-  same as the last one this process wrote, so the saved time is that of the last save that found a
-  change or was its process's first; transcripts and snapshots no index names any more (and their
-  leftover temporary files) are deleted only after the index step (a kill at any point leaves a
-  consistent set). A
+  snapshot's name is its content digest, so unchanged ones are not rewritten; the index (with the
+  time) is skipped when its exact serialized layout (`"$current:$entries"`) matches
+  `writtenLayout`, so the saved time is that of the last save that found a change or was its
+  process's first; transcripts and snapshots no index names any more (and their leftover temporary
+  files) are deleted only after the index step (a kill at any point leaves a consistent set). A
   `name` key in an index from versions that could rename tabs is ignored. Triggers: every 60 s, 2 s
   after a tab opens, closes or its shell ends, when the last listener leaves, on memory trim.
 - The `running` marker, holding the process's pid, is written after each successful start and
@@ -392,13 +397,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 
 ## Confirmed bugs / technical debt
 
-- **A layout hash collision can skip a tab-index update:** `Tabs.writtenLayout` compares only a
-  32-bit string hash, so different metadata with the same hash can retain the old index and save
-  time. Changing only cwd from `/Aa` to `/BB` with unchanged other fields is one such collision;
-  restore then uses the stale cwd. Artifact cleanup still follows the skipped index update.
-- **A kill report of a shell can reach a new tab:** when a tab's shell itself is killed and a tab
-  opened within the next poll (2 s) gets the freed console number, the report goes to the new tab,
-  whose console is open, rather than the ended one.
+None.
 
 ## Open questions
 

@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.os.Build
 import android.os.SystemClock
 import android.view.ContextThemeWrapper
@@ -13,11 +14,13 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inspector.WindowInspector
 import android.widget.TextView
+import androidx.core.graphics.createBitmap
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -25,6 +28,11 @@ import org.junit.runner.RunWith
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.lang.reflect.Proxy
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Exercises the real input connection and paste encoder without sending input to a shell. */
 @RunWith(AndroidJUnit4::class)
@@ -51,7 +59,19 @@ class TerminalInputTest {
         fun text() = bytes.toString("UTF-8")
     }
 
-    private fun withConnection(test: (InputConnection, Host, Long) -> Unit) {
+    private data class Fixture(
+        val view: VtView,
+        val connection: InputConnection,
+        val host: Host,
+        val tab: Long,
+        val session: VtSession,
+        val statusChanges: AtomicInteger,
+    )
+
+    private fun withConnection(test: (InputConnection, Host, Long) -> Unit) =
+        withFixture { test(it.connection, it.host, it.tab) }
+
+    private fun withFixture(test: (Fixture) -> Unit) {
         val root = File(context.cacheDir, "terminal-input-test").apply { mkdirs() }
         val tar = File(root, "rootfs.tgz")
         context.assets.open("rootfs.tgz").use { input -> tar.outputStream().use(input::copyTo) }
@@ -63,13 +83,18 @@ class TerminalInputTest {
             ActivityScenario.launch<LicensesActivity>(Intent(context, LicensesActivity::class.java)).use { scenario ->
                 lateinit var view: VtView
                 lateinit var connection: InputConnection
+                lateinit var session: VtSession
                 val host = Host()
+                val statusChanges = AtomicInteger()
                 scenario.onActivity { activity ->
                     assertFalse("Tests require an unlocked page", Privacy.locked(activity))
                     val events = Proxy.newProxyInstance(
                         VtSession.Events::class.java.classLoader, arrayOf(VtSession.Events::class.java),
-                    ) { _, _, _ -> null } as VtSession.Events
-                    val session = VtSession(1, ConsolePty(machine, "", "root"), machine, events)
+                    ) { _, method, _ ->
+                        if (method.name == "onStatusChanged") statusChanges.incrementAndGet()
+                        null
+                    } as VtSession.Events
+                    session = VtSession(1, ConsolePty(machine, "", "root"), machine, events)
                     // Supply only the terminal; starting a session would also start shell threads.
                     VtSession::class.java.getDeclaredField("tab").apply { isAccessible = true }.setLong(session, tab)
                     view = VtView(ContextThemeWrapper(activity, R.style.Theme_Appine_Terminal), host)
@@ -85,7 +110,7 @@ class TerminalInputTest {
                         if (!focused) SystemClock.sleep(20)
                     }
                     assertTrue("The test page must have window focus", focused)
-                    test(connection, host, tab)
+                    test(Fixture(view, connection, host, tab, session, statusChanges))
                 } finally {
                     onMain {
                         button(android.R.id.button2)?.performClick()
@@ -273,6 +298,122 @@ class TerminalInputTest {
                 assertTrue("The bracketed paste terminator must require confirmation", hasPreview())
                 assertEquals("", host.text())
             }
+        }
+    }
+
+    @Test
+    fun composingDeleteSurroundingTextUpdatesPreedit() {
+        withFixture { f ->
+            val preeditField = VtView::class.java.getDeclaredField("preedit").apply { isAccessible = true }
+            onMain {
+                f.connection.setComposingText("abc", 1)
+                assertEquals("abc", preeditField.get(f.view))
+                f.connection.deleteSurroundingText(1, 0)
+                assertEquals("ab", preeditField.get(f.view))
+                f.connection.deleteSurroundingTextInCodePoints(1, 0)
+                assertEquals("a", preeditField.get(f.view))
+                f.connection.deleteSurroundingText(1, 0)
+                assertEquals("", preeditField.get(f.view))
+                assertEquals("", f.host.text())
+            }
+        }
+    }
+
+    @Test
+    fun attachClearsPreeditAndStopsBlink() {
+        withFixture { f ->
+            val preeditField = VtView::class.java.getDeclaredField("preedit").apply { isAccessible = true }
+            val blinkField = VtView::class.java.getDeclaredField("blinkRunning").apply { isAccessible = true }
+            onMain {
+                f.connection.setComposingText("hello", 1)
+                blinkField.setBoolean(f.view, true)
+                assertEquals("hello", preeditField.get(f.view))
+                f.view.attach(null)
+                assertEquals("", preeditField.get(f.view))
+                assertFalse("Detaching must stop cursor blink", blinkField.getBoolean(f.view))
+            }
+        }
+    }
+
+    @Test
+    fun mode1004FocusEventsDoNotJumpScrolledBackViewport() {
+        withFixture { f ->
+            val atBottomField = VtView::class.java.getDeclaredField("atBottom").apply { isAccessible = true }
+            onMain {
+                f.view.layout(0, 0, 640, 384)
+                VtNative.print(f.tab, ("\u001b[?1004h" + (1..60).joinToString("\r\n") { "line $it" }).toByteArray())
+                val bitmap = createBitmap(f.view.width, f.view.height)
+                try {
+                    f.view.draw(Canvas(bitmap))
+                    VtNative.scroll(f.tab, -5)
+                    f.view.draw(Canvas(bitmap))
+                    assertFalse("Viewport must be scrolled back before focus events", atBottomField.getBoolean(f.view))
+
+                    f.view.onWindowFocusChanged(false)
+                    f.view.onWindowFocusChanged(true)
+                    assertEquals("\u001b[O\u001b[I", f.host.text())
+
+                    f.view.draw(Canvas(bitmap))
+                    assertFalse("Focus events must not jump viewport to bottom", atBottomField.getBoolean(f.view))
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun sessionResetClearsProgressAndStatus() {
+        withFixture { f ->
+            onMain {
+                f.session.onProgress(VtSession.PROGRESS_SET, 40)
+                f.session.onStatus(VtSession.STATUS_WORKING, VtSession.KIND_NONE, 40, "job", "Build", "Running")
+            }
+            onMain {
+                assertEquals(VtSession.Progress(VtSession.PROGRESS_SET, 40), f.session.progress)
+                assertEquals("job", f.session.status?.id)
+                val before = f.statusChanges.get()
+                f.session.reset()
+                assertNull(f.session.progress)
+                assertNull(f.session.status)
+                assertTrue("Reset must notify status change when clearing progress/status", f.statusChanges.get() > before)
+            }
+        }
+    }
+
+    @Test
+    fun sessionHangUpDropsQueuedWrites() {
+        val blockerStarted = CountDownLatch(1)
+        val releaseBlocker = CountDownLatch(1)
+        val executor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, LinkedBlockingQueue())
+        val events = Proxy.newProxyInstance(
+            VtSession.Events::class.java.classLoader, arrayOf(VtSession.Events::class.java),
+        ) { _, _, _ -> null } as VtSession.Events
+        val pty = ConsolePty(0L, "", "root")
+        ConsolePty::class.java.getDeclaredField("console").apply { isAccessible = true }.setInt(pty, 0)
+        val session = VtSession(1, pty, 0L, events)
+        VtSession::class.java.getDeclaredField("writer").apply { isAccessible = true }.set(session, executor)
+        try {
+            executor.execute {
+                blockerStarted.countDown()
+                try {
+                    releaseBlocker.await(5, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                    // shutdownNow interrupts the running task while dropping queued writes.
+                }
+            }
+            assertTrue(blockerStarted.await(5, TimeUnit.SECONDS))
+            session.write("queued".toByteArray())
+            assertEquals(1, executor.queue.size)
+            session.finishIfRunning()
+            assertEquals("Queued writes must be cancelled on hangup", 0, executor.queue.size)
+            assertTrue(executor.isShutdown)
+            releaseBlocker.countDown()
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS))
+            assertEquals(1L, executor.completedTaskCount)
+        } finally {
+            releaseBlocker.countDown()
+            executor.shutdownNow()
         }
     }
 }

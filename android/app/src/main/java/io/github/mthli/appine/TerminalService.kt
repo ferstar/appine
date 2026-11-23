@@ -67,6 +67,46 @@ internal class GuestActivity {
 }
 
 /**
+ * Serializes console opens and closes with [Native.takeKills] using a monotonic epoch so each
+ * console lifetime owns a disjoint `[openedEpoch, closedEpoch]` interval and a kill report from
+ * an ended tab cannot be delivered to a newer tab that reused its console number.
+ */
+internal class ConsoleTracker(
+    private val takeKills: () -> Array<String>?,
+    private val onDrainedKills: (Array<String>, Long) -> Unit,
+) {
+    private var epoch = 0L
+
+    /** Opens a console and returns `(console, openedEpoch)`. */
+    fun open(open: () -> Int): Pair<Int, Long> = synchronized(this) {
+        val opened = ++epoch
+        val console = open()
+        console to opened
+    }
+
+    /**
+     * Closes a console, drains any kills recorded before the close, records the closing epoch via
+     * [onClosed], and advances the epoch past it before another console can reuse the number.
+     */
+    fun close(close: () -> Unit, onClosed: (Long) -> Unit) {
+        val (drained, closed) = synchronized(this) {
+            close()
+            val kills = takeKills()
+            val closed = epoch
+            onClosed(closed)
+            epoch++
+            kills to closed
+        }
+        if (drained != null && drained.isNotEmpty()) onDrainedKills(drained, closed)
+    }
+
+    /** Takes pending kills together with the epoch at which they were observed. */
+    fun take(): Pair<Array<String>?, Long> = synchronized(this) {
+        takeKills() to epoch
+    }
+}
+
+/**
  * The foreground service that holds the guest kernel and all terminal sessions (the android/service
  * map). The sessions' lifecycle hangs on the service, not on an Activity: shells keep running after
  * the Activity is closed. The notification shows the number of sessions and offers "Exit all".
@@ -191,11 +231,12 @@ class TerminalService : Service() {
         override fun run() {
             val m = machine
             if (m == 0L) return
+            val tracker = consoleTracker
             Native.bklStall(m)?.let { notifications.stall(m, it) }
             runCatching {
                 worker.execute {
                     val lines = Native.takeListens(m)
-                    val kills = Native.takeKills(m)
+                    val (kills, killsEpoch) = tracker?.take() ?: (Native.takeKills(m) to 0L)
                     val power = Native.takePower(m)
                     val processes = Native.processes(m)
                     Native.takeChangedDirs(m)?.let {
@@ -209,7 +250,7 @@ class TerminalService : Service() {
                         guestActivity.sample(cpu, sampledAt, SystemClock.elapsedRealtime())
                         updateWakeLock()
                         lines?.forEach(notifications::listen)
-                        kills?.forEach(::reportKill)
+                        kills?.forEach { reportKill(it, killsEpoch) }
                         when (power) {
                             Native.POWER_REBOOT -> restart()
                             Native.POWER_HALT, Native.POWER_OFF -> exitAll()
@@ -229,6 +270,9 @@ class TerminalService : Service() {
 
     /** The browser endpoint for the current kernel, independent of terminal sessions. */
     private var browserBridge: BrowserBridge? = null
+
+    /** Console-lifetime epoch tracker for the current kernel's kill reports. */
+    private var consoleTracker: ConsoleTracker? = null
 
     /**
      * [onDestroy] has run: a thread that outlives the service (a download) must not
@@ -628,6 +672,15 @@ class TerminalService : Service() {
     private fun started(kernel: StartedKernel) {
         val m = kernel.handle
         browserBridge = kernel.browser
+        consoleTracker = ConsoleTracker(
+            takeKills = { Native.takeKills(m) },
+            onDrainedKills = { kills, epoch ->
+                main.post {
+                    if (machine != m) return@post
+                    kills.forEach { reportKill(it, epoch) }
+                }
+            },
+        )
         machine = m
         gpuAvailable = kernel.gpuAvailable
         booting = true
@@ -816,7 +869,7 @@ class TerminalService : Service() {
      * (null is the home directory). The shell starts when the window size is first known.
      */
     internal fun createSession(account: String = login, cwd: String? = null): VtSession {
-        val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd)
+        val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd, consoleTracker)
         val session = VtSession(nextSessionId++, pty, machine, sessionEvents)
         session.setCursor(cursorStyle, cursorBlink)
         sessions.add(session)
@@ -931,7 +984,7 @@ class TerminalService : Service() {
      * posted. Appine's own bugs always get a notification, with "Copy report" on it
      * ([Notifications.kill]).
      */
-    private fun reportKill(line: String) {
+    private fun reportKill(line: String, epoch: Long) {
         val f = line.split('\t')
         if (f.size != 7) return
         val console = f[0].toIntOrNull() ?: return
@@ -953,10 +1006,7 @@ class TerminalService : Service() {
             }
             else -> getString(R.string.killed_bug, comm, pid)
         }
-        // An ended tab keeps its console's number, which the kernel may have given to a newer tab's
-        // console since: the tab whose console is open has it, else the newest one that had it
-        val session = sessions.firstOrNull { it.console == console && it.consoleOpen }
-            ?: sessions.lastOrNull { it.console == console && console >= 0 }
+        val session = sessionForKill(sessions, console, epoch)
         val shown = session?.showMessage("[appine] $text") == true
         // Enough only when that tab is the one in front of the user
         if (shown && inFront(session) && !bug) return
@@ -1294,6 +1344,7 @@ class TerminalService : Service() {
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
         releaseSessions()
+        consoleTracker = null
         sessionsChanged()
         return m
     }
@@ -1325,10 +1376,11 @@ class TerminalService : Service() {
         // here
         if (restore == null) Tabs.clear(this)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
-        releaseSessions()
         val m = machine
         machine = 0
         gpuAvailable = false
+        releaseSessions()
+        consoleTracker = null
         // Stopped without going through exitAll: shut down anyway, best effort. It has to wait for
         // guest threads to exit, so not on the main thread
         if (m != 0L) worker.execute { Native.shutdown(m) }
@@ -1340,6 +1392,16 @@ class TerminalService : Service() {
 
     companion object {
         private const val TAG = "TerminalService"
+
+        /**
+         * Finds the tab that owned [console] when kill reports were taken at [epoch]; disjoint
+         * `[openedEpoch, closedEpoch]` intervals prevent misdelivery when a new tab reuses a freed
+         * console number.
+         */
+        internal fun sessionForKill(sessions: List<VtSession>, console: Int, epoch: Long): VtSession? {
+            if (console < 0) return null
+            return sessions.firstOrNull { it.ownedConsoleAt(console, epoch) }
+        }
 
         /**
          * The format of [Native.setRoutes]. Before Android 13 the route type cannot be told, so all

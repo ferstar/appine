@@ -970,6 +970,12 @@ class MachineTest {
         assertEquals(1, saved?.current)
         assertTrue(saved!!.time > 0)
         assertEquals(tabs, Tabs.takeKilled(context)?.saved?.tabs)
+        // Two distinct layouts whose JSON strings share the same 32-bit String.hashCode()
+        assertEquals("/Aa".hashCode(), "/BB".hashCode())
+        Tabs.save(context, listOf(tabs[0].copy(cwd = "/Aa")), 0)
+        assertEquals(listOf("/Aa"), Tabs.takeKilled(context)?.saved?.tabs?.map { it.cwd })
+        Tabs.save(context, listOf(tabs[0].copy(cwd = "/BB")), 0)
+        assertEquals(listOf("/BB"), Tabs.takeKilled(context)?.saved?.tabs?.map { it.cwd })
         Tabs.save(context, listOf(tabs[0].copy(transcript = "line 3")), 0)
         assertEquals(listOf("line 3"), Tabs.takeKilled(context)?.saved?.tabs?.map { it.transcript })
         val transcripts = File(context.filesDir, "tabs").list()!!.filter { it.endsWith(".txt") }

@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/vt.md` for the paired decision history (it still holds the pre-split decisions for `android/vtcore`; earlier decisions remain D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49 in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 9 confirmed; bugs and debts recorded)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: cancel queued writes on hangup/exit/release, clear progress/status on reset, and track console epochs)
 
 ## Responsibilities
 
@@ -49,14 +51,15 @@ login script and prompt-mark producers (`android/setup`).
   message)` — value types for OSC 9;4 progress and OSC 7501 status; companion defines protocol
   constants (`PROGRESS_*`, `STATUS_*`, `KIND_*`) and localized `describe(context, status)`.
 - `ConsolePty` — per-tab kernel PTY handle and login-shell launcher (`machine`, `script`, `login`,
-  `cwd`, `@Volatile console` starting at `-1` and retained after `close`, `pid`). Companion holds
-  `LOGIN_AUTO`, `LOGIN_ROOT`, cached `script(context)` (`login.sh`), `argv(script, login, cwd)`
-  and `ENVIRONMENT`.
+  `cwd`, optional `ConsoleTracker`, `@Volatile console` starting at `-1` and retained after
+  `close`, `@Volatile openedEpoch`, `@Volatile closedEpoch`, `pid`). Companion holds `LOGIN_AUTO`,
+  `LOGIN_ROOT`, cached `script(context)` (`login.sh`), `argv(script, login, cwd)` and `ENVIRONMENT`.
 
 ## Public entry points
 
-- Lifecycle: `VtSession.start`, `resize`, `write`, `finishIfRunning`, `release`; `ConsolePty.start`,
-  `waitFor`, `close`, `script`, `argv`, `ENVIRONMENT`, `LOGIN_AUTO`, `LOGIN_ROOT`.
+- Lifecycle: `VtSession.start`, `resize`, `write`, `finishIfRunning`, `release`, `ownedConsoleAt`;
+  `ConsolePty.start`, `waitFor`, `close`, `script`, `argv`, `ENVIRONMENT`, `LOGIN_AUTO`,
+  `LOGIN_ROOT`.
 - State and saving: `id`, `login`, `resolvedLogin`, `savedSnapshot`, `tab`, `view`, `console`,
   `consoleOpen`, `title`, `isRunning`, `busy`, `cwd`, `setRestored`, `transcriptText`,
   `takeSnapshot`, `showMessage`, `setCursor`, `clear`, `reset`.
@@ -93,14 +96,17 @@ login script and prompt-mark producers (`android/setup`).
   6. **Normal start**: starts `vt-writer` (single-thread `ExecutorService`), non-daemon `vt-pump`
      (`VtNative.pump(t, this)`), and non-daemon `vt-waiter` (`pty.waitFor()`, `pump.join(500)`,
      then posts `exited(code)` on `main`), and calls `view?.onStarted()`.
-- `exited(code)` (main thread, idempotent on `exit != null`): sets `exit = code`, calls `hangUp()`,
-  calls `writer?.shutdown()` (draining queued writes), cancels `dropProgress`, returns early if
-  `released`, else clears `progress`/`records`/`status` (firing `onStatusChanged` if any existed),
-  prints `"[Process completed (code N | signal N) - press Enter]"` (omitting reason for exit 0),
+- `exited(code)` (main thread, idempotent on `exit != null`): sets `exit = code`, calls `hangUp()`
+  (cancelling queued `vt-writer` tasks via `shutdownNow()` before closing the console), calls
+  `writer?.shutdownNow()`, cancels `dropProgress`, returns early if `released`, else calls
+  `clearStatus()` (cancelling `dropProgress`, clearing buffered `reports`/`records`, zeroing
+  `progress`/`status`, and firing `onStatusChanged` if any existed), prints
+  `"[Process completed (code N | signal N) - press Enter]"` (omitting reason for exit 0),
   invalidates `view`, and fires `events.onFinished(this)`.
 - `release()` (idempotent on `released`): sets `released = true`, calls `finishIfRunning()` ->
-  `hangUp()` (`AtomicBoolean.compareAndSet(false, true)` guarding `pty.close()` so a closed console
-  number reused by the kernel can never be closed twice), calls `writer?.shutdown()`, cancels
+  `hangUp()` (`AtomicBoolean.compareAndSet(false, true)` cancelling queued writes with
+  `writer?.shutdownNow()` before `pty.close()` so a closed console number reused by the kernel
+  can never be closed twice or receive drained writes), calls `writer?.shutdownNow()`, cancels
   `dropProgress`, and calls `VtNative.destroy(tab)` (removing the handle from native `TABS` while
   any running `vt-pump` retains its `Arc<Tab>` until return).
 
@@ -154,11 +160,15 @@ login script and prompt-mark producers (`android/setup`).
 - `resize(cols, rows, cellWidth, cellHeight)` skips unchanged dimensions or `tab == 0L`, calls
   `VtNative.resize` (reflow + console `SIGWINCH`), and immediately passes any non-empty replies
   (e.g. mode 2048 size reports) to `write(replies)`. `write(data)` queues `Native.write` on
-  `vt-writer` while `writer != null && isRunning` (swallowing `RejectedExecutionException`).
+  `vt-writer` while `writer != null && isRunning && !hungUp.get() && pty.console >= 0`, rechecking
+  `!hungUp.get()` inside the write runnable before calling `Native.write` (swallowing
+  `RejectedExecutionException`).
 - `clear()` calls `VtNative.clear(tab)`: `-1` (alt screen / gone) is a no-op; `0` invalidates
-  `view`; `1` (at prompt) writes `^L` (`0x0c`) and invalidates. `reset()` calls `VtNative.reset`,
-  writes `^L` if at prompt, invalidates `view`, and emits `events.onTitleChanged(this)` — leaving
-  `progress`, `records` and `status` intact.
+  `view`; `1` (at prompt) writes `^L` (`0x0c`) and invalidates. `reset()` returns early if
+  `tab == 0L || released`, calls `VtNative.reset`, writes `^L` if at prompt, calls `clearStatus()`
+  (cancelling `dropProgress`, clearing buffered `reports`/`records`, zeroing `progress`/`status`,
+  and firing `onStatusChanged` when any existed), invalidates `view`, and emits
+  `events.onTitleChanged(this)`.
 - `busy` is `isRunning && tab != 0L && !VtNative.atPrompt(tab)` (unmarked shells stay busy while
   running). `cwd()` calls `Native.consoleCwd(machine, pty.console)` only when `isRunning &&
   consoleOpen` (taking the kernel BKL on the caller's thread).
@@ -168,8 +178,9 @@ login script and prompt-mark producers (`android/setup`).
 ### Inbound
 
 - `android/service` (`TerminalService`, `Notifications`): constructs/restores/saves/releases
-  sessions, implements `Events`, reads `isRunning`/`transcriptText`/`console`/`consoleOpen`/`tab`/
-  `id`/`title`/`progress`/`status`, mutates `resolvedLogin`/`savedSnapshot`, calls `setCursor`,
+  sessions (passing `ConsoleTracker` to `ConsolePty`), implements `Events`, reads
+  `isRunning`/`transcriptText`/`console`/`consoleOpen`/`tab`/`id`/`title`/`progress`/`status`,
+  calls `ownedConsoleAt`, mutates `resolvedLogin`/`savedSnapshot`, calls `setCursor`,
   `setRestored`, `showMessage`, `takeSnapshot`, `answerClipboardRead`, `statusSeen` and `describe`.
 - `android/terminal` (`MainActivity`): calls `start`, `cwd`, `clear`, `reset`, `write`,
   `answerClipboardRead`; reads `id`, `tab`, `busy`, `isRunning`, `progress`, `status`.
@@ -194,10 +205,12 @@ login script and prompt-mark producers (`android/setup`).
 
 - `ConsolePty.start(columns, rows)` swaps argument order to `Native.openConsole(machine, rows,
   columns)`.
-- `ConsolePty.console` retains its integer after `close()` (for kill-report routing to ended tabs);
-  active-ownership checks must use `consoleOpen` (`pty.console >= 0 && !hungUp.get()`), and
-  `hangUp()`'s `AtomicBoolean` guarantees `closeConsole` runs at most once so a reused console
-  number is never closed for another tab.
+- `ConsolePty.console` retains its integer after `close()` (for kill-report routing to ended tabs
+  via disjoint `[openedEpoch, closedEpoch]` lifetimes recorded through `ConsoleTracker` and checked
+  by `ownedConsoleAt`); active-ownership checks must use `consoleOpen` (`pty.console >= 0 &&
+  !hungUp.get()`), and `hangUp()`'s `AtomicBoolean` cancels queued writes (`shutdownNow()`) before
+  closing the console at most once so a reused console number is never closed or written by another
+  tab.
 - `VtSession.tab` is never zeroed on `release()`; subsequent `VtNative.*` calls rely on `vt.rs`'s
   `TABS` lookup returning `None`.
 - `openConsole`, `spawn`, `closeConsole`, `VtNative.resize` and `VtSession.cwd()` take the kernel
@@ -212,8 +225,8 @@ login script and prompt-mark producers (`android/setup`).
 - Re-entrant `statusSeen()`: when a `STATUS_DONE`/`STATUS_ERROR` report arrives for the foreground
   tab, `updateStatus()` -> `onStatusChanged` -> `Notifications.status` calls `statusSeen()`
   synchronously and re-enters `updateStatus()` (terminating on the second pass).
-- A program's RIS emits `PROGRESS_REMOVE` and `STATUS_CLEAR(id="")` via libghostty-vt callbacks,
-  whereas `VtSession.reset()` leaves `progress`/`records`/`status` untouched.
+- Both a program's RIS (via libghostty-vt callbacks) and `VtSession.reset()` clear `progress`,
+  `dropProgress`, buffered `reports`, `records` and `status`.
 - Same-read OSC 52 `?` requests collapse to the last clipboard target's `kind` in `vt.c`; separate
   reads preserve individual targets in `clipboardReads`. Clipboard answers must always go through
   `answerClipboardRead` -> `vt-writer`, never synchronously under native terminal locks.
@@ -226,14 +239,6 @@ login script and prompt-mark producers (`android/setup`).
   records clear on foreground process-group changes rather than OSC 133 prompt marks (even though
   `android/vtcore` installs the OSC 133 callback for command timing), so reports from an
   already-exited command or a background job can outlive their command.
-- **Graceful `vt-writer` shutdown races console-number reuse:** `exited()` and `release()` call
-  `writer?.shutdown()` rather than cancelling queued tasks after `hangUp()` closes the console;
-  queued write runnables capture `pty.console` at submit time without rechecking `hungUp`, so a
-  write draining after close can inject bytes into a newly opened tab if the kernel immediately
-  reuses that console number.
-- **`VtSession.reset()` leaves progress, status and `dropProgress` active:** unlike a program's
-  RIS (which emits `PROGRESS_REMOVE` and `STATUS_CLEAR`), the menu's Reset terminal action leaves
-  stale progress/status records and any active 15 s `dropProgress` timer in place.
 - **Shell mark coverage debt inherited from `android/vtcore`:** `busy` and command-completion
   events inherit `android/vtcore`'s prompt-marking and ash/bash parsing limitations.
 

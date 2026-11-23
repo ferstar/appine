@@ -400,6 +400,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     fun attach(s: VtSession?) {
         if (s === session) return
+        val hadSession = session != null
+        val hadIme = imePassword || preedit.isNotEmpty()
         clearResizePreview()
         endSearch()
         session?.let { if (it.view === this) it.view = null }
@@ -411,11 +413,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         autoscroll = 0
         removeCallbacks(autoscrollTick)
         stopPasswordCheck()
-        if (imePassword) {
-            // The other tab's frames say whether it reads one too
-            imePassword = false
-            restartInput()
-        }
+        // Drop any active composition and password mode when switching or detaching tabs.
+        imePassword = false
+        setPreedit("")
+        if (hadSession || hadIme) restartInput()
         hoverCell = -1
         hoverLink = false
         scroller.forceFinished(true)
@@ -433,6 +434,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             // A tab whose shell has not started yet starts on this grid
             host.onGrid(cols, rows, cellWidth, cellHeight)
         }
+        updateBlink()
         full = true
         invalidate()
     }
@@ -804,7 +806,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      * otherwise no timer runs and the cursor stays shown (hollow without the focus).
      */
     private fun updateBlink() {
-        val blinking = screen.cursorBlinking && screen.cursorShown && hasFocus() && hasWindowFocus() && isAttachedToWindow
+        val blinking = tab != 0L && screen.cursorBlinking && screen.cursorShown && hasFocus() && hasWindowFocus() && isAttachedToWindow
         if (blinking == blinkRunning) return
         blinkRunning = blinking
         removeCallbacks(blinkTick)
@@ -838,8 +840,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             scroller.forceFinished(true)
             if (scrollPx != 0) settle()
         }
-        // Focus events (mode 1004): editors reload changed files when they regain focus
-        if (tab != 0L) send(VtNative.focus(tab, hasWindowFocus))
+        // Focus events (mode 1004): editors reload changed files when they regain focus. Sent
+        // directly so losing or regaining focus does not cancel settle() or jump a scrolled-back
+        // viewport to the bottom.
+        if (tab != 0L) {
+            VtNative.focus(tab, hasWindowFocus)?.takeIf { it.isNotEmpty() }?.let(host::onInput)
+        }
         updateBlink()
         invalidate()
     }
@@ -1102,11 +1108,20 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 repeat(beforeLength) { press(KeyEvent.KEYCODE_DEL) }
                 return true
             }
-            return super.deleteSurroundingText(beforeLength, afterLength)
+            val result = super.deleteSurroundingText(beforeLength, afterLength)
+            setPreedit(editable?.toString().orEmpty())
+            return result
         }
 
-        override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
-            deleteSurroundingText(beforeLength, afterLength)
+        override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean {
+            if (editable.isNullOrEmpty()) {
+                repeat(beforeLength) { press(KeyEvent.KEYCODE_DEL) }
+                return true
+            }
+            val result = super.deleteSurroundingTextInCodePoints(beforeLength, afterLength)
+            setPreedit(editable?.toString().orEmpty())
+            return result
+        }
 
         override fun performEditorAction(editorAction: Int): Boolean {
             press(KeyEvent.KEYCODE_ENTER)

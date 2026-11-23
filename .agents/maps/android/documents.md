@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: enforce canonical `%XX` validation, clear and directory-check the home cache, revoke grants on rootfs replacement)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: notify dirsChanged from TerminalFiles.copyIntoHome)
 
 ## Responsibilities
 
@@ -176,7 +176,8 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
 - `android/service` (`TerminalService`: `dirsChanged`, `rootsChanged`, `revokeAccess`).
 - `android/privacy` (`Privacy.changeMode`: `revokeAccess`, `rootsChanged`).
 - `android/terminal` (`TerminalLinks`: `fileLink`, `FileLink`, read-only `ACTION_VIEW` grant).
-- `android/file-import` (`TerminalFiles`: reuses `documentId`, `fileName`, `child`, `displayName`).
+- `android/file-import` (`TerminalFiles`: reuses `documentId`, `fileName`, `child`, `displayName`,
+  and calls `dirsChanged`).
 - `android/tests` (`MachineTest`).
 
 ### Outbound
@@ -211,9 +212,6 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   exposes only persisted grants; transient (activity-scoped) grants on descendants of a deleted,
   renamed or moved directory cannot be listed and last until that activity ends, covering any new
   file created at the same path meanwhile.
-- **Terminal file imports do not refresh open Files app listings:** `TerminalFiles.copyIntoHome`
-  mutates the home directory through `Native.browse*` directly (a separate store connection with
-  `changed_dirs = None`) without calling `Documents.dirsChanged`.
 
 ## Open questions
 

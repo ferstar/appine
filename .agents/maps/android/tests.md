@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: cover percent-encoded document ID rejection, regular-file homes and rootsChanged cache invalidation in MachineTest)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: cover tab-layout hash collisions, epoch-based kill routing, VtView preedit/blink/focus, VtSession reset/write cancellation, and file-import provider notifications)
 
 ## Responsibilities
 
@@ -55,9 +55,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
   preview pixels under full-frame requests and subrow layouts, split control sequences, quiet
   output, timeout, complete repaint and detach cleanup. It drives layout/draw directly, not the IME.
 - `TerminalFilesTest` uses isolated stores for binary/empty imports, collisions, name/home
-  escaping, read/close failure cleanup and missing homes; a real guest shell checks reads and
-  clipboard quoting. A locked MainActivity checks pending-picker retention across recreation;
-  all seven cases passed on API 34.
+  escaping, read/close failure cleanup, missing homes and `Documents.dirsChanged` provider
+  notifications; a real guest shell checks reads and
+  clipboard quoting. A locked MainActivity checks pending-picker retention across recreation.
 - `DiagnosticsTest` checks two-part byte limits and previous-run rotation, ZIP entries and
   report retention, own-PID capture excluding another process, read-only share intents and
   provider root confinement, plus rejection of locked/stale export callbacks and recreation.
@@ -67,8 +67,11 @@ debug variant, manifest and network-security configuration belong to `android/bu
 - `TerminalInputTest` uses an isolated store and native terminal, a shell-free session and a
   capturing view host to exercise IME replacement/commit/composition and clipboard menu callbacks.
   It checks confirmation and cancellation, no delayed replay, bracketed paste and its terminator,
-  ordinary Chinese composition/Enter, and trailing-newline removal without trimming other
-  whitespace (including unsafe/empty remainders and changed terminal modes) on API 34. The
+  ordinary Chinese composition/Enter, trailing-newline removal without trimming other
+  whitespace (including unsafe/empty remainders and changed terminal modes), composing
+  `deleteSurroundingText`/`InCodePoints` preedit updates, `attach(null)` preedit/blink cleanup,
+  mode 1004 focus events preserving scrolled-back viewports, `VtSession.reset` progress/status
+  clearing, and `VtSession` queued-write cancellation on hangup. The
   `screenshots=true` runner argument saves `cache/paste-preview.png` for visual inspection of
   the terminal-themed dialog; the tests do not drive Gboard's UI.
 - `PrivacyTest` covers default-off/mutually exclusive file access, cold and recreated locked pages, pause-only visibility versus stop-and-return locking, secure dialog flags, non-exported action targets, service/broadcast/activity routing and locked-report clipboard denial without an authentication bypass. `MachineTest.documentsShowTheHomeDirectory` also checks every provider denial with privacy on and a stale true file-access preference.
@@ -78,7 +81,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
   Its `network=true` test installs tmux/screen and checks reattach on another console and nesting.
   It does not perform a real OAuth login.
 - `RunPolicyTest` uses a separate preference file for legacy migration and remembered toggle
-  targets, and checks idle expiry, activity, failed samples and delayed delivery with a fake clock.
+  targets, checks idle expiry, activity, failed samples and delayed delivery with a fake clock,
+  and checks `ConsoleTracker`/`TerminalService.sessionForKill` routing across reused console
+  numbers.
   `MachineTest.guestCpuTimeTracksRunningAndExitedThreads` checks both tiers, exited and pooled
   threads, idle stability and stopped handles.
 - `MachineTest` runs in the debug app's own process against the app's real store and
@@ -87,7 +92,8 @@ debug variant, manifest and network-security configuration belong to `android/bu
   them back in `finally`. It covers both tiers (guest page size 4096), calls after stop, memory
   trim, boot and shutdown by inittab (under 10 s), osclock, consoles (input, Ctrl-C, concurrency,
   the foreground cwd), login from `/etc/passwd`, the saved directory, accounts and doas (two logins installing it at once, and one waiting for apk's lock, included), NOPASSWD
-  rules following a password set later, saved tabs, the Files provider (default-off access including
+  rules following a password set later, saved tabs (including 32-bit hash-colliding `/Aa` vs `/BB`
+  cwd layouts), the Files provider (default-off access including
   legacy preferences, disabled queries/reads/changes and file links, authority-wide grant revocation,
   canonical `%XX` validation and `%2E`/`%2F` tree-grant rejection, home, no home including regular-file
   homes and `rootsChanged` cache invalidation, writes,
