@@ -534,6 +534,11 @@ static void test_sysctl_namespace_pinning(void)
         struct stat st;
         CHECK(stat("/proc/sys/fs/mqueue", &st) == 0 && S_ISDIR(st.st_mode),
               "/proc/sys/fs/mqueue must remain a directory");
+        CHECK(chdir("/proc/sys/net") == 0, "chdir /proc/sys/net");
+
+        write_str("ipv4/tcp_keepalive_time", "600\n");
+        int keepalive_fd = open("ipv4/tcp_keepalive_time", O_RDWR);
+        CHECK(keepalive_fd >= 0, "open relative ipv4/tcp_keepalive_time in ns A");
 
         int fds[4];
         for (size_t i = 0; i < ncases; i++) {
@@ -542,12 +547,26 @@ static void test_sysctl_namespace_pinning(void)
             CHECK(fds[i] >= 0, "open %s in ns A", cases[i].path);
         }
 
-        /* Switch into a new netns and ipcns with distinct values */
+        /* Switch into a new netns and ipcns while keeping cwd = /proc/sys/net */
         CHECK(unshare(CLONE_NEWNET | CLONE_NEWIPC) == 0, "unshare ns B");
+
+        char buf[128];
+        /* Relative lookups from /proc/sys/net must resolve in ns B, not ns A */
+        read_str("ipv4/tcp_keepalive_time", buf, sizeof(buf));
+        CHECK(strcmp(buf, "7200\n") == 0,
+              "relative ipv4/tcp_keepalive_time in ns B must be default 7200, got %s", buf);
+        pread_str(keepalive_fd, buf, sizeof(buf));
+        CHECK(strcmp(buf, "600\n") == 0,
+              "pinned ipv4/tcp_keepalive_time fd must stay 600, got %s", buf);
+        close(keepalive_fd);
+
         for (size_t i = 0; i < ncases; i++)
             write_str(cases[i].path, cases[i].val_b);
 
-        char buf[128];
+        read_str("core/somaxconn", buf, sizeof(buf));
+        CHECK(strcmp(buf, "4096\n") == 0,
+              "relative core/somaxconn in ns B must be 4096, got %s", buf);
+
         for (size_t i = 0; i < ncases; i++) {
             pread_str(fds[i], buf, sizeof(buf));
             CHECK(strcmp(buf, cases[i].val_a) == 0, "pinned %s expected %s, got %s",

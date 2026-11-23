@@ -875,6 +875,13 @@ impl Hash for PinnedIpc {
     }
 }
 
+/// Whether `path` in [`STATIC`] is a per-network-namespace sysctl file; excludes the
+/// `/proc/sys/net/` directories themselves so relative lookups after `unshare(CLONE_NEWNET)`
+/// resolve in the caller's current network namespace (matching Linux's `net_ctl_header_lookup`).
+fn is_net_sysctl_path(path: &[u8]) -> bool {
+    !path.ends_with(b"/") && path.starts_with(b"sys/net/")
+}
+
 /// Whether `path` in [`STATIC`] is a per-IPC-namespace sysctl file (SysV IPC or POSIX mqueue
 /// limits); excludes the `sys/fs/mqueue/` directory itself.
 fn is_ipc_sysctl_path(path: &[u8]) -> bool {
@@ -914,7 +921,7 @@ pub(crate) enum PseudoNode {
     /// Per-network-namespace and per-IPC-namespace sysctl paths use [`NetStatic`] and
     /// [`IpcSysctl`] so their namespace stays pinned to the lookup/open namespace.
     Static(&'static [u8]),
-    /// A static directory or file under `/proc/sys/net/`, pinned to its lookup network namespace.
+    /// A static file under `/proc/sys/net/`, pinned to its lookup network namespace.
     NetStatic(&'static [u8], PinnedNet),
     /// A per-IPC-namespace sysctl under `/proc/sys/kernel/` or `/proc/sys/fs/mqueue/`, pinned to
     /// its lookup IPC namespace.
@@ -1139,9 +1146,9 @@ impl<'a> View<'a> {
     }
 
     /// Wraps a [`STATIC`] path, pinning the lookup's network or IPC namespace when the entry is
-    /// scoped to one.
+    /// a per-namespace sysctl file.
     fn static_node(&self, path: &'static [u8]) -> PseudoNode {
-        if path.starts_with(b"sys/net/") {
+        if is_net_sysctl_path(path) {
             PseudoNode::NetStatic(path, PinnedNet(self.ns().net))
         } else if is_ipc_sysctl_path(path) {
             PseudoNode::IpcSysctl(path, PinnedIpc(self.ns().ipc))
@@ -1221,16 +1228,9 @@ impl Pseudo for View<'_> {
             Mq(ns, _) => MqRoot(*ns),
             Pts(fs, _) | PtsPtmx(fs) => PtsRoot(*fs),
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
-            Static(path) | IpcSysctl(path, _) => {
+            Static(path) | NetStatic(path, _) | IpcSysctl(path, _) => {
                 tree_parent(&STATIC, path).map_or(ProcRoot, Static)
             }
-            NetStatic(path, net) => tree_parent(&STATIC, path).map_or(ProcRoot, |p| {
-                if p.starts_with(b"sys/net/") {
-                    NetStatic(p, net.clone())
-                } else {
-                    Static(p)
-                }
-            }),
             Sys(path) => tree_parent(&SYS_STATIC, path)
                 .or_else(|| tree_parent(SYS_GPU, path))
                 .map_or(SysRoot, Sys),
@@ -1249,13 +1249,11 @@ impl Pseudo for View<'_> {
                 tree_parent(&BLOCK_FILES, path).map_or(SysBlock(*n, b""), |p| SysBlock(*n, p))
             }
             Cgroup(id, _) => Cgroup(*id, b""),
-            NetConf(v6, _, b"", net) => {
-                NetStatic(if *v6 { NET_CONF6 } else { NET_CONF4 }, net.clone())
-            }
-            NetSysctl(path, net) => {
+            NetConf(v6, _, b"", _) => Static(if *v6 { NET_CONF6 } else { NET_CONF4 }),
+            NetSysctl(path, _) => {
                 let dir = &path[..=path.find('/').unwrap_or(0)];
                 tree_lookup(&STATIC, b"sys/net/", dir.trim_end_matches('/').as_bytes())
-                    .map_or(ProcRoot, |p| NetStatic(p, net.clone()))
+                    .map_or(ProcRoot, Static)
             }
             NetConf(v6, dir, _, net) => NetConf(*v6, *dir, b"", net.clone()),
             Pid(proc, Some(_)) => Entry(*proc, None, self::Entry::Task),
@@ -1385,20 +1383,21 @@ impl Pseudo for View<'_> {
                         Some(Pid(ProcId::of(pid, &g.borrow()), None))
                     }),
             },
-            Static(path) => tree_lookup(&STATIC, path, name).map(|p| self.static_node(p)),
-            NetStatic(path, net) if *path == NET_CONF4 || *path == NET_CONF6 => {
-                crate::netdev::conf_dirs(&net.0)
+            Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
+                let net = self.ns().net;
+                crate::netdev::conf_dirs(&net)
                     .into_iter()
                     .find(|(n, _)| n == name)
-                    .map(|(_, d)| NetConf(*path == NET_CONF6, d, b"", net.clone()))
+                    .map(|(_, d)| NetConf(*path == NET_CONF6, d, b"", PinnedNet(net)))
             }
-            NetStatic(path, net) => tree_lookup(&STATIC, path, name)
-                .map(|p| NetStatic(p, net.clone()))
+            Static(path) => tree_lookup(&STATIC, path, name)
+                .map(|p| self.static_node(p))
                 .or_else(|| {
                     let rest = path.strip_prefix(b"sys/net/")?;
                     let full = [rest, name].concat();
-                    let init = net.0.host_net.is_none();
-                    crate::netconf::sysctl(&full, init).map(|e| NetSysctl(e.0, net.clone()))
+                    let net = self.ns().net;
+                    let init = net.host_net.is_none();
+                    crate::netconf::sysctl(&full, init).map(|e| NetSysctl(e.0, PinnedNet(net)))
                 }),
             NetConf(v6, dir, b"", net) => crate::netconf::table(*v6)
                 .iter()
@@ -1520,12 +1519,12 @@ impl Pseudo for View<'_> {
             PtsRoot(_) | ProcRoot | Pid(..) | SysRoot | MqRoot(_) => mode::S_IFDIR,
             Mq(..) => mode::S_IFREG,
             Sys(b"dev/char/226:128/device/subsystem") => mode::S_IFLNK,
-            Static(p) | NetStatic(p, _) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
+            Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) | SysNet(_, p) | SysBlock(_, p) if p.is_empty() || p.ends_with(b"/") => {
                 mode::S_IFDIR
             }
             Cgroup(_, b"") => mode::S_IFDIR,
-            NetSysctl(..) | IpcSysctl(..) => mode::S_IFREG,
+            NetStatic(..) | NetSysctl(..) | IpcSysctl(..) => mode::S_IFREG,
             NetConf(_, dir, name, net) => {
                 if !Self::conf_dir_exists_in(&net.0, *dir) {
                     return Err(Errno::ENOENT);
@@ -1798,10 +1797,10 @@ impl View<'_> {
             ProcRoot if numbered(b"") => return None,
             ProcRoot => format!("/proc/{name_text}"),
             // Interfaces
-            Static(path) | NetStatic(path, _) if *path == NET_CONF4 || *path == NET_CONF6 => {
+            Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
                 return None;
             }
-            Static(path) | NetStatic(path, _) => format!("/proc/{}{name_text}", text(path)),
+            Static(path) => format!("/proc/{}{name_text}", text(path)),
             NetConf(v6, _, b"", _) => {
                 let v = if *v6 { 6 } else { 4 };
                 format!("/proc/sys/net/ipv{v}/conf/<interface>/{name_text}")
@@ -2170,22 +2169,21 @@ pub(crate) fn readdir(
             pids.sort_unstable_by_key(|&(vnr, _)| vnr);
             nodes.extend(pids.into_iter().map(|(_, proc)| Pid(proc, None)));
         }
-        Static(path) => {
-            nodes.extend(tree_children(&STATIC, path).map(|p| ps.static_node(p)));
-        }
-        NetStatic(path, net) if *path == NET_CONF4 || *path == NET_CONF6 => {
+        Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
             let v6 = *path == NET_CONF6;
+            let net = ps.ns().net;
             nodes.extend(
-                crate::netdev::conf_dirs(&net.0)
+                crate::netdev::conf_dirs(&net)
                     .into_iter()
-                    .map(|(_, d)| NetConf(v6, d, b"", net.clone())),
+                    .map(|(_, d)| NetConf(v6, d, b"", PinnedNet(net.clone()))),
             );
         }
-        NetStatic(path, net) => {
-            nodes.extend(tree_children(&STATIC, path).map(|p| NetStatic(p, net.clone())));
+        Static(path) => {
+            nodes.extend(tree_children(&STATIC, path).map(|p| ps.static_node(p)));
             // The sysctls under /proc/sys/net/core, ipv4, ipv6 and unix
             if let Some(dir) = path.strip_prefix(b"sys/net/") {
-                let init = net.0.host_net.is_none();
+                let net = ps.ns().net;
+                let init = net.host_net.is_none();
                 nodes.extend(
                     crate::netconf::SYSCTLS
                         .iter()
@@ -2194,7 +2192,7 @@ pub(crate) fn readdir(
                                 && p.as_bytes().starts_with(dir)
                                 && !p.as_bytes()[dir.len()..].contains(&b'/')
                         })
-                        .map(|e| NetSysctl(e.0, net.clone())),
+                        .map(|e| NetSysctl(e.0, PinnedNet(net.clone()))),
                 );
             }
         }
@@ -5305,11 +5303,19 @@ mod tests {
     }
 
     #[test]
-    fn ipc_sysctl_path_excludes_mqueue_directory() {
+    fn ipc_and_net_sysctl_paths_exclude_directories() {
         assert!(!is_ipc_sysctl_path(b"sys/fs/mqueue/"));
         assert!(is_ipc_sysctl_path(b"sys/fs/mqueue/queues_max"));
         assert!(is_ipc_sysctl_path(b"sys/fs/mqueue/msg_max"));
         assert!(is_ipc_sysctl_path(b"sys/kernel/shmmax"));
         assert!(!is_ipc_sysctl_path(b"sys/kernel/"));
+
+        assert!(!is_net_sysctl_path(b"sys/net/"));
+        assert!(!is_net_sysctl_path(b"sys/net/core/"));
+        assert!(!is_net_sysctl_path(b"sys/net/ipv4/"));
+        assert!(!is_net_sysctl_path(b"sys/net/ipv4/conf/"));
+        assert!(!is_net_sysctl_path(b"sys/net/unix/"));
+        assert!(is_net_sysctl_path(b"sys/net/core/somaxconn"));
+        assert!(is_net_sysctl_path(b"sys/net/ipv4/ip_forward"));
     }
 }

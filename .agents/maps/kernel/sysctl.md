@@ -153,7 +153,10 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
 ## Invariants and gotchas
 
 - `/proc/sys` lookups use the reader's namespaces (unlike `/proc/<pid>/net`, which uses the
-  target's).
+  target's). Static `/proc/sys/net/` directories (`sys/net/`, `sys/net/ipv4/`, `sys/net/ipv4/conf/`,
+  etc.) must remain unpinned `PseudoNode::Static` nodes so relative lookups from a held cwd or dirfd
+  after `unshare(CLONE_NEWNET)` resolve in the caller's current network namespace; only leaf files
+  (`NetStatic`, `NetSysctl`) and `NetConf` entries pin `PinnedNet`.
 - `recorded_value` panics on a path missing from `RECORDED`, so callers (such as `kernel/signal`'s
   `EXCEPTION_TRACE`) must match its exact path string.
 - A node classified by path prefix (`sys/net/`) in `sysctl_kind` / `is_net_sysctl` must stay
