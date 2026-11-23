@@ -168,6 +168,43 @@ pub struct Reread {
     pub offset: u64,
 }
 
+/// Non-lock VMA flags preserved on the remnant left at the old address by `mremap(MREMAP_DONTUNMAP)`.
+#[derive(Clone, Copy)]
+pub struct VmaFlags {
+    may_exec: bool,
+    dontdump: bool,
+    wipeonfork: bool,
+    dontfork: bool,
+    growsdown: bool,
+    noreserve: bool,
+    anon: u64,
+}
+
+impl VmaFlags {
+    fn of(v: &Vma) -> Self {
+        Self {
+            may_exec: v.may_exec,
+            dontdump: v.dontdump,
+            wipeonfork: v.wipeonfork,
+            dontfork: v.dontfork,
+            growsdown: v.growsdown,
+            noreserve: v.noreserve,
+            anon: v.anon,
+        }
+    }
+
+    fn apply_to(self, v: &mut Vma) {
+        v.locked = false;
+        v.may_exec = self.may_exec;
+        v.dontdump = self.dontdump;
+        v.wipeonfork = self.wipeonfork;
+        v.dontfork = self.dontfork;
+        v.growsdown = self.growsdown;
+        v.noreserve = self.noreserve;
+        v.anon = self.anon;
+    }
+}
+
 /// A piece of a file to map again at the old address after mremap(`MREMAP_DONTUNMAP`): it was a
 /// private file mapping, and on Linux its pages are read from the file again afterwards.
 pub struct Refill {
@@ -178,6 +215,8 @@ pub struct Refill {
     pub ino: u64,
     pub offset: u64,
     pub name: Option<Rc<[u8]>>,
+    pub mnt: Option<crate::vfs::MountId>,
+    pub flags: VmaFlags,
 }
 
 /// A host-page-aligned slice of a live [`HostRegion`] retained across a BKL release so
@@ -261,8 +300,13 @@ impl Fill {
         std::os::fd::AsRawFd::as_raw_fd(&self.host)
     }
 
+    /// The file size recorded when this on-demand mapping was created.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Whether file page `page` has been read.
-    fn has(&self, page: u64) -> bool {
+    pub fn has(&self, page: u64) -> bool {
         self.filled
             .borrow()
             .range(..=page)
@@ -331,11 +375,41 @@ impl Fill {
         Some((lo * PAGE_SIZE, (hi - lo) * PAGE_SIZE))
     }
 
-    /// Stores what was read for [`Fill::window`] `(offset, len)` (`data`, shorter at the end of
-    /// the file): only pages still not read, as another thread may have read some meanwhile.
-    pub fn store(&self, (offset, len): (u64, u64), data: &[u8]) -> Result<(), Errno> {
+    /// Like [`Fill::window`], but always starts at `page` (no backward read-around): used when a
+    /// read-around short reply stopped before reaching `page`.
+    pub fn window_from(&self, page: u64) -> Option<(u64, u64)> {
+        let last = self.size.div_ceil(PAGE_SIZE);
+        if page >= last || self.has(page) {
+            return None;
+        }
+        let filled = self.filled.borrow();
+        let hi = filled
+            .range(page..)
+            .next()
+            .map_or(page + FILL_PAGES, |(&s, _)| (page + FILL_PAGES).min(s))
+            .min(last);
+        Some((page * PAGE_SIZE, (hi - page) * PAGE_SIZE))
+    }
+
+    /// Stores what was read for [`Fill::window`] `(offset, len)` (`data`): only pages still not
+    /// read, as another thread may have read some meanwhile. When `data` is shorter than `len`
+    /// before the recorded end of the file, only completely read whole pages are recorded unless
+    /// `eof` is true (the daemon returned 0 bytes at the requested offset, confirming early EOF),
+    /// in which case only the partial/empty EOF page is marked filled rather than the whole window.
+    pub fn store(&self, (offset, len): (u64, u64), data: &[u8], eof: bool) -> Result<(), Errno> {
         use std::os::unix::fs::FileExt;
-        let (lo, hi) = (offset / PAGE_SIZE, (offset + len) / PAGE_SIZE);
+        let lo = offset / PAGE_SIZE;
+        let max_hi = (offset + len) / PAGE_SIZE;
+        let hi = if offset.saturating_add(data.len() as u64) >= self.size {
+            max_hi
+        } else if eof {
+            (lo + (data.len() as u64).div_ceil(PAGE_SIZE).max(1)).min(max_hi)
+        } else {
+            (lo + (data.len() as u64) / PAGE_SIZE).min(max_hi)
+        };
+        if hi <= lo {
+            return Ok(());
+        }
         let mut at = lo;
         for (s, e) in self.runs(lo, hi).into_iter().chain([(hi, hi)]) {
             // [at, s) is still missing
@@ -366,6 +440,17 @@ impl Fill {
     }
 }
 
+/// Mount reference held by a file-backed VMA: keeps the mount busy for `umount2` and reports its
+/// release when the VMA is unmapped or the address space is dropped ([`crate::vfs::released`]).
+#[derive(Clone)]
+struct MountPin(crate::vfs::MountId);
+
+impl Drop for MountPin {
+    fn drop(&mut self) {
+        crate::vfs::released(self.0);
+    }
+}
+
 #[derive(Clone)]
 struct Vma {
     len: u64,
@@ -382,6 +467,8 @@ struct Vma {
     /// The name shown in `/proc/<pid>/maps` (the mapped file or program) and the file's inode.
     name: Option<Rc<[u8]>>,
     ino: u64,
+    /// The mount the mapped file was opened through (None for anonymous, memfd, vvar, SysV shm).
+    mnt: Option<MountPin>,
     /// The host address of this VMA's start.
     host: NonNull<u8>,
     /// Bytes from the start that have file contents (rounded up to 4K); equal to `len` for
@@ -797,6 +884,57 @@ impl Mm {
                 v.ino = ino;
             }
         }
+    }
+
+    /// Records the mount through which the file mapped at `[start, start + len)` was opened
+    /// (keeps the mount busy for `umount2` and reports its release when unmapped).
+    pub fn set_mnt(&mut self, start: u64, len: u64, mnt: crate::vfs::MountId) {
+        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
+            if v.file_id.is_some() || v.region.gpu.is_some() {
+                v.mnt = Some(MountPin(mnt));
+            }
+        }
+    }
+
+    /// Inserts the mounts of all file-backed VMAs in this address space into `out` (for `umount2`
+    /// busy checks and detached-mount collection).
+    pub fn mapped_mounts(&self, out: &mut std::collections::HashSet<crate::vfs::MountId>) {
+        for v in self.vmas.values() {
+            if let Some(m) = &v.mnt {
+                out.insert(m.0);
+            }
+        }
+    }
+
+    /// Inserts the store inode numbers of file-backed VMAs in this address space into `out`
+    /// (keeps unlinked tmpfs files charged while still mapped).
+    pub fn mapped_inos(&self, out: &mut std::collections::HashMap<u64, Option<u64>>) {
+        for v in self.vmas.values() {
+            if v.ino != 0 && v.fill.is_none() {
+                out.entry(v.ino).or_insert(None);
+            }
+        }
+    }
+
+    /// Whether any non-FUSE file-backed VMA in this address space maps store inode `ino`.
+    pub fn maps_ino(&self, ino: u64) -> bool {
+        ino != 0 && self.vmas.values().any(|v| v.ino == ino && v.fill.is_none())
+    }
+
+    /// Restores the non-lock VMA flags on a private-file remnant recreated at the old address
+    /// after `mremap(MREMAP_DONTUNMAP)`.
+    pub fn apply_refill_flags(&mut self, r: &Refill) {
+        if let Some(v) = self.vmas.get_mut(&r.start) {
+            r.flags.apply_to(v);
+        }
+    }
+
+    /// Guest range `[start, end)` of the mapped vDSO, if still recorded.
+    fn vdso_range(&self) -> Option<(u64, u64)> {
+        (self.vdso != 0).then(|| {
+            let len = (crate::vdso::image().len() as u64).next_multiple_of(PAGE_SIZE);
+            (self.vdso, self.vdso + len)
+        })
     }
 
     /// Puts it into an `Rc<RefCell<..>>` (the form `TaskState` holds) and records its own handle:
@@ -2025,7 +2163,7 @@ impl Mm {
         let (mut empty, mut alias, mut refill) = (Vec::new(), Vec::new(), Vec::new());
         for (&s, v) in self.vmas.range(old..end) {
             match v.backing {
-                Backing::Anonymous => empty.push((s, v.len, v.prot)),
+                Backing::Anonymous => empty.push((s, v.len, v.prot, VmaFlags::of(v))),
                 Backing::Shared => {
                     let mut v = v.clone();
                     v.locked = false;
@@ -2046,13 +2184,15 @@ impl Mm {
                     ino: v.ino,
                     offset: v.file_id.map_or(0, |f| f.2),
                     name: v.name.clone(),
+                    mnt: v.mnt.as_ref().map(|m| m.0),
+                    flags: VmaFlags::of(v),
                 }),
             }
         }
         self.move_range(old, len, dst)?;
-        for (start, len, prot) in empty {
+        for (start, len, prot, flags) in empty {
             self.map_anonymous(start, len, prot)?;
-            self.vmas.get_mut(&start).unwrap().locked = false;
+            flags.apply_to(self.vmas.get_mut(&start).unwrap());
         }
         for (start, v) in alias {
             self.insert_vma(start, v)?;
@@ -2313,6 +2453,7 @@ impl Mm {
             region,
             name: template.name.clone(),
             ino: template.ino,
+            mnt: template.mnt.clone(),
             host,
             file_len,
             cow: false,
@@ -2380,9 +2521,9 @@ impl Mm {
         let starts: Vec<u64> = self.vmas.range(old..old + len).map(|(&s, _)| s).collect();
         let mut moved = Vec::with_capacity(starts.len());
         for s in starts {
-            let v = self.vmas.remove(&s).unwrap();
+            let mut v = self.vmas.remove(&s).unwrap();
             // Move the entries along: in large on-demand mappings every page with contents has an
-            // entry (Mm::touched_windows), and after the move insert_vma leaves existing entries
+            // entry (Mm::touched_windows), and after the move prefill_pages leaves existing entries
             // alone. The caller guarantees the two ranges do not overlap
             self.mmu
                 .move_entries(s, dst + (s - old), v.len)
@@ -2390,12 +2531,25 @@ impl Mm {
             if v.prot & prot::EXEC != 0 {
                 self.code_ranges.push((s, v.len));
             }
+            if let Some((id, _)) = v.shm {
+                v.shm = Some((id, dst));
+            }
             moved.push((dst + (s - old), v));
         }
+        // Keep the recorded vDSO address in sync when the vDSO moves (Linux's arch_remap), and
+        // clear it if only part of the vDSO was moved out.
+        if let Some((vdso, vdso_end)) = self.vdso_range() {
+            if old <= vdso && vdso_end <= old + len {
+                self.vdso = dst + (vdso - old);
+            } else if old < vdso_end && vdso < old + len {
+                self.vdso = 0;
+            }
+        }
         // The pieces only move, so they take no room under `vm.max_map_count` (beyond the
-        // splits, which the callers' margins cover)
+        // splits, which the callers' margins cover); existing entries were already moved by
+        // `move_entries`, so an eager-prefill allocation failure must not drop the moved VMAs.
         for (s, v) in moved {
-            self.place_vma(s, v)?;
+            self.place_moved_vma(s, v);
         }
         self.dirty = true;
         Ok(())
@@ -2418,12 +2572,13 @@ impl Mm {
         let Some((fd, _)) = v.file.clone() else {
             return Err(Errno::EINVAL);
         };
-        let (prot, may_write, may_exec, name, ino, locked) = (
+        let (prot, may_write, may_exec, name, ino, mnt, locked) = (
             v.prot,
             v.may_write,
             v.may_exec,
             v.name.clone(),
             v.ino,
+            v.mnt.as_ref().map(|m| m.0),
             v.locked,
         );
         // The same file: compared by the host (device, inode)
@@ -2445,6 +2600,9 @@ impl Mm {
             self.deny_exec(start, len);
         }
         self.label(start, len, name, ino);
+        if let Some(mnt) = mnt {
+            self.set_mnt(start, len, mnt);
+        }
         if locked {
             self.set_locked(start, len, true)?;
         }
@@ -2775,9 +2933,10 @@ impl Mm {
                 Self::cow_entries(&self.mmu, &cow, s, v, &cow_pages, first);
             }
             if old == 0 && new != 0 {
-                // Fills only pages without entries, so copy-on-write pages keep theirs
+                // Fills only pages without entries, so copy-on-write and pre-existing prot-0 pages
+                // keep theirs; a host allocation failure must not unmap existing entries.
                 let file = v.backing != Backing::Anonymous;
-                Self::map_pages(&mut self.mmu, s, v.host, v.file_len, prot, file)?;
+                Self::prefill_pages(&mut self.mmu, s, v.host, v.file_len, prot, file);
             }
             if first != new {
                 Self::write_around(&mut self.mmu, s, v.len, &cow_pages, new)?;
@@ -3343,6 +3502,12 @@ impl Mm {
             }
             self.graveyard.push(vma.region);
             self.dirty = true;
+        }
+        if let Some((vdso, vdso_end)) = self.vdso_range()
+            && addr < vdso_end
+            && vdso < end
+        {
+            self.vdso = 0;
         }
         self.give_back(borrowed);
         Ok(())
@@ -4064,9 +4229,17 @@ impl Mm {
                 }
             }
         }
+        let cow = self.cow.borrow();
         // Borrowed pages are resident, but not mapped only once
-        for (&page, _) in self.cow.borrow().borrowed.range(addr..end) {
+        for (&page, _) in cow.borrowed.range(addr..end) {
             out[((page - addr) / PAGE_SIZE) as usize] = PRESENT;
+        }
+        // Lent pages are shared with borrowers, so they are not mapped exclusively
+        for &page in cow.lent.range(addr..end) {
+            let slot = &mut out[((page - addr) / PAGE_SIZE) as usize];
+            if *slot & PRESENT != 0 {
+                *slot &= !EXCLUSIVE;
+            }
         }
         out
     }
@@ -4535,6 +4708,7 @@ impl Mm {
                 region,
                 name: None,
                 ino: 0,
+                mnt: None,
                 host,
                 file_len,
                 cow: false,
@@ -4559,18 +4733,23 @@ impl Mm {
     /// Puts a whole VMA at `start`; the caller guarantees the range is free.
     fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
         self.room_for(1)?;
-        self.place_vma(start, v)
-    }
-
-    /// [`Mm::insert_vma`] without the `vm.max_map_count` check, for a VMA that moves rather than
-    /// adds one.
-    fn place_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
         v.region.note_used(v.host, v.file_len as usize);
         let file = v.backing != Backing::Anonymous;
         Self::map_pages(&mut self.mmu, start, v.host, v.file_len, v.prot, file)?;
         self.exec_changed |= v.prot & prot::EXEC != 0;
         self.vmas.insert(start, v);
         Ok(())
+    }
+
+    /// [`Mm::insert_vma`] without the `vm.max_map_count` check, for a VMA whose entries were
+    /// already moved by [`Mmu::move_entries`]: best-effort prefill so an allocation failure never
+    /// drops the moved VMA or its existing entries.
+    fn place_moved_vma(&mut self, start: u64, v: Vma) {
+        v.region.note_used(v.host, v.file_len as usize);
+        let file = v.backing != Backing::Anonymous;
+        Self::prefill_pages(&mut self.mmu, start, v.host, v.file_len, v.prot, file);
+        self.exec_changed |= v.prot & prot::EXEC != 0;
+        self.vmas.insert(start, v);
     }
 
     /// Whether `[addr, addr + len)` lies in mappings that allow writing (an empty range always
@@ -4677,14 +4856,14 @@ impl Mm {
     /// translations are shared, guest instruction words are checked against the page table (the
     /// DBT's recheck), and blocks without entries must be parked and restored page by page on
     /// first execution. For a file mapping their size is bounded by the file size.
-    fn map_pages(
+    fn fill_eager(
         mmu: &mut Mmu,
         start: u64,
         host: NonNull<u8>,
         len: u64,
         prot: u32,
         file: bool,
-    ) -> Result<(), Errno> {
+    ) -> Result<(), appine_engine::MapError> {
         if mmu_prot(prot) == 0 || len == 0 {
             return Ok(());
         }
@@ -4693,11 +4872,36 @@ impl Mm {
         }
         // SAFETY: the VMA holds the host memory, which lives at least as long as the mapping in
         // the page table
-        if let Err(e) = unsafe { mmu.fill_shared(start, host, len, mmu_prot(prot)) } {
+        unsafe { mmu.fill_shared(start, host, len, mmu_prot(prot)) }
+    }
+
+    fn map_pages(
+        mmu: &mut Mmu,
+        start: u64,
+        host: NonNull<u8>,
+        len: u64,
+        prot: u32,
+        file: bool,
+    ) -> Result<(), Errno> {
+        if let Err(e) = Self::fill_eager(mmu, start, host, len, prot, file) {
             let _ = mmu.unmap(start, len);
             return Err(map_err(e));
         }
         Ok(())
+    }
+
+    /// Best-effort eager entry fill for a VMA that already exists or already had its entries moved:
+    /// leaves existing entries (such as prot-0 entries holding contents) intact on allocation
+    /// failure, letting any unfilled pages fault in on demand ([`Mm::fault_in`]).
+    fn prefill_pages(
+        mmu: &mut Mmu,
+        start: u64,
+        host: NonNull<u8>,
+        len: u64,
+        prot: u32,
+        file: bool,
+    ) {
+        let _ = Self::fill_eager(mmu, start, host, len, prot, file);
     }
 
     /// The ranges (guest addresses) of private anonymous VMA `start` that may have contents and may
@@ -6771,7 +6975,8 @@ mod tests {
         let f = Fill::new(host, 2048 * PAGE_SIZE, source);
         let window = |page: u64| {
             let (off, len) = f.window(page).unwrap();
-            f.store((off, len), &[]).unwrap();
+            f.store((off, len), &vec![0u8; len as usize], false)
+                .unwrap();
             (off / PAGE_SIZE, len / PAGE_SIZE)
         };
         // Around the first fault, then twice as much where it ended
@@ -6788,6 +6993,128 @@ mod tests {
     }
 
     #[test]
+    fn fill_short_read_records_only_complete_pages() {
+        let size = 16 * PAGE_SIZE;
+        let host = appine_hal::memfd(c"appine-mm-fill-short").unwrap();
+        host.set_len(size).unwrap();
+        let source = crate::fd::OpenFile::new(crate::fd::FileKind::Host(-1), 0);
+        let f = Fill::new(host, size, source);
+        let window = f.window(0).unwrap();
+        assert_eq!(window, (0, 16 * PAGE_SIZE));
+        // Short reply (2 pages + 500 bytes, not at EOF): only pages 0 and 1 become filled
+        let short = vec![0x42u8; (2 * PAGE_SIZE + 500) as usize];
+        f.store(window, &short, false).unwrap();
+        assert!(f.has(0));
+        assert!(f.has(1));
+        assert!(!f.has(2));
+        assert!(!f.has(15));
+        assert_eq!(f.window_from(2), Some((2 * PAGE_SIZE, 14 * PAGE_SIZE)));
+        // Partial-page reply with confirmed EOF marks only that page, not the rest of the window
+        f.store((2 * PAGE_SIZE, 14 * PAGE_SIZE), &[0x77u8; 100], true)
+            .unwrap();
+        assert!(f.has(2));
+        assert!(!f.has(3));
+    }
+
+    #[test]
+    fn mremap_updates_shm_base_and_vdso_address() {
+        let mut mm = Mm::new();
+        let mem = SharedMemory::new(PAGE_SIZE).unwrap();
+        let a = mm.attach_shm(None, &mem, RW, false, (1, 7)).unwrap();
+        let dst = a - 4 * PAGE_SIZE;
+        let moved = mm
+            .mremap(a, PAGE_SIZE, PAGE_SIZE, true, Some(dst), None)
+            .unwrap();
+        assert_eq!(moved, dst);
+        assert_eq!(mm.detach_shm(a), Err(Errno::EINVAL));
+        assert_eq!(mm.detach_shm(dst), Ok((1, 7)));
+
+        let vdso_len = (crate::vdso::image().len() as u64).next_multiple_of(PAGE_SIZE);
+        let v0 = mm
+            .mmap(
+                0,
+                vdso_len,
+                prot::READ | prot::EXEC,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        mm.vdso = v0;
+        let v1 = v0 - 4 * vdso_len;
+        assert_eq!(
+            mm.mremap(v0, vdso_len, vdso_len, true, Some(v1), None)
+                .unwrap(),
+            v1
+        );
+        assert_eq!(mm.vdso, v1);
+        assert!(
+            mm.regions()
+                .iter()
+                .any(|r| r.start == v1 && r.name.as_deref() == Some(b"[vdso]".as_slice()))
+        );
+        mm.munmap(v1, vdso_len).unwrap();
+        assert_eq!(mm.vdso, 0);
+    }
+
+    #[test]
+    fn prefill_pages_preserves_existing_entries_on_failure() {
+        let mut mm = Mm::new();
+        let a = mm
+            .mmap(
+                0,
+                2 * PAGE_SIZE,
+                RW,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        mm.write(UserSlice::new(a, 4), b"keep").unwrap();
+        mm.mprotect(a, 2 * PAGE_SIZE, 0).unwrap();
+        // Simulate a failing prefill (unaligned host pointer returns EINVAL from fill_shared)
+        let bad_host = NonNull::dangling();
+        Mm::prefill_pages(&mut mm.mmu, a, bad_host, 2 * PAGE_SIZE, RW, false);
+        // Existing prot-0 entry must still be in the page table (protect updates only present entries)
+        mm.mmu
+            .protect(a, 2 * PAGE_SIZE, appine_engine::prot::READ)
+            .unwrap();
+        assert!(mm.mmu().translate(a, appine_engine::prot::READ).is_some());
+        mm.mprotect(a, 2 * PAGE_SIZE, prot::READ).unwrap();
+        let mut buf = [0u8; 4];
+        mm.read(UserSlice::new(a, 4), &mut buf).unwrap();
+        assert_eq!(&buf, b"keep");
+    }
+
+    #[test]
+    fn pagemap_marks_cow_lent_pages_non_exclusive() {
+        const PRESENT: u64 = 1 << 63;
+        const EXCLUSIVE: u64 = 1 << 56;
+        let parent = Mm::new().into_shared();
+        let a = parent
+            .borrow_mut()
+            .mmap(
+                0,
+                PAGE_SIZE,
+                RW,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        parent
+            .borrow()
+            .write(UserSlice::new(a, 4), b"abcd")
+            .unwrap();
+        assert_eq!(parent.borrow().pagemap(a, 1)[0], PRESENT | EXCLUSIVE);
+        let child = parent.borrow_mut().fork().unwrap();
+        // While lent to child, parent's pagemap entry must not report EXCLUSIVE
+        let entry = parent.borrow().pagemap(a, 1)[0];
+        assert_eq!(entry & PRESENT, PRESENT);
+        assert_eq!(entry & EXCLUSIVE, 0);
+        // Once child breaks CoW (writes its own copy), parent's page is exclusive again
+        child.borrow().write(UserSlice::new(a, 4), b"wxyz").unwrap();
+        assert_eq!(parent.borrow().pagemap(a, 1)[0], PRESENT | EXCLUSIVE);
+    }
+
+    #[test]
     fn mappings_read_on_demand_map_only_pages_read() {
         let size = 100 * PAGE_SIZE + 100;
         let host = appine_hal::memfd(c"appine-mm-fill").unwrap();
@@ -6801,7 +7128,7 @@ mod tests {
                 .flat_map(|p| [(p + 1) as u8; PAGE_SIZE as usize])
                 .collect();
             data.truncate((size - off).min(len) as usize);
-            f.store((off, len), &data).unwrap();
+            f.store((off, len), &data, false).unwrap();
         };
         let mut mm = Mm::new();
         let len = 103 * PAGE_SIZE;

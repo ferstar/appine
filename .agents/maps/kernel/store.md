@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: boot cleanup numbers; browse writes refusing the root as `top`; memfd owners; no links to unlinked inodes; host block counts; shared objects; host writers; boot mounts in kernel/mount last)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: unlink created objects on savepoint rollback and wrap import_rootfs with ensure_dev_nodes in one transaction)
 
 ## Responsibilities
 
@@ -35,8 +35,9 @@ provider and rootfs installation UI (`android`).
 ## Key types
 
 - `Store` — one SQLite connection with transaction state: pending deferred transaction, `writing`
-  flag, `doomed` objects to delete after commit, `replaced` files to flush before commit, the
-  waker, the read-snapshot state, the owning kernel id, changed directories.
+  flag, `doomed` objects to delete after commit, `replaced` files to flush before commit, `created`
+  objects to unlink on savepoint rollback, the waker, the read-snapshot state, the owning kernel
+  id, changed directories.
 - `Meta` — state shared with readers and the reaper thread: the cache behind an `RwLock`, the
   commit counter, the reaper queue, the WAL path and durability watermark.
 - `Stat`, `DirEntry`, `FileTime` (`Now` or `At(ns)`), the `mode` constants; `Ino = u64`, `ROOT = 1`.
@@ -50,7 +51,8 @@ provider and rootfs installation UI (`android`).
   new one open for writing, the length to copy, and both numbers.
 - `Fill` — an entry created by an operation, inserted into the cache only if the operation
   succeeds (at most 64 per operation).
-- `Op` — savepoint guard; rolls back and discards fills on failure or unwinding.
+- `Op` — savepoint guard; rolls back, discards fills, truncates `replaced`, and unlinks `created`
+  objects on failure or unwinding.
 - `Reader` — a read-locked view of the cache for threads without the BKL.
 - `Reaper` — the background thread that deletes objects and checkpoints the WAL.
 - `ImportReport`; `browse::Change` (created, removed, moved, opened, written), `browse::Entry`.
@@ -252,15 +254,16 @@ provider and rootfs installation UI (`android`).
 
 ### Import
 
-- `import_rootfs` creates a new store and imports a gzip-compressed tar in one transaction: paths are
-  normalised (`..` is `EINVAL`), missing parents created as 0755 root, directories' attributes
-  applied (also onto an existing non-directory of that name) and their mtimes set last; files,
-  symlinks, hardlinks (to earlier entries), device nodes and FIFOs are created with their mode bits
-  (setuid included), numeric owner and whole-second mtime; a non-directory entry whose name already
-  exists aborts with `EEXIST`; xattrs (and file capabilities), pax metadata and whiteouts are not
-  imported. Then the device and mount-point skeleton (`/proc`, `/sys`, `/run`, `/dev`) is added and
-  the host calls `sync_store` (host `syncfs`). The Android caller imports into a temporary store
-  directory that is discarded before a retry.
+- `import_rootfs` creates a new store and imports a gzip-compressed tar together with the device
+  and mount-point skeleton (`/proc`, `/sys`, `/run`, `/dev`) in one `Store::transaction` (so a
+  failure in either rolls back the whole import and unlinks created objects): paths are normalised
+  (`..` is `EINVAL`), missing parents created as 0755 root, directories' attributes applied (also
+  onto an existing non-directory of that name) and their mtimes set last; files, symlinks,
+  hardlinks (to earlier entries), device nodes and FIFOs are created with their mode bits (setuid
+  included), numeric owner and whole-second mtime; a non-directory entry whose name already exists
+  aborts with `EEXIST`; xattrs (and file capabilities), pax metadata and whiteouts are not
+  imported. Afterwards the host calls `sync_store` (host `syncfs`). The Android caller imports into
+  a temporary store directory that is discarded before a retry.
 
 ### Browse API
 
@@ -331,16 +334,9 @@ provider and rootfs installation UI (`android`).
 - **Whole-file sharing:** the first change to a file sharing its object copies all of it, where
   btrfs and XFS copy only the extents written.
 
-- **Storage leaks:** objects created inside a rolled-back savepoint (an operation that fails after
-  creating a regular file) are dropped from the uncommitted range by the next commit and stay on
-  disk until their number is reused by a regular file (forever if reused by another kind); a failed
-  `import_rootfs` is not affected in practice, as the Android caller discards that new store
-  before a retry; the shared `lock` header is not
-  ordered against the WAL, so after power loss a cleared range can be durable while the commit is
-  not, leaking objects the same way.
-- **Import error reporting:** if adding the device skeleton fails after a successful import,
-  `import_rootfs` returns an error while the imported tree is committed (the comment promises an
-  empty store on failure).
+- **Storage leaks:** the shared `lock` header is not ordered against the WAL, so after power loss a
+  cleared range can be durable while the commit is not, leaving uncommitted objects on disk until
+  their inode number is reused by a regular file (or forever if reused by another kind).
 
 ## Open questions
 

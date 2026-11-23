@@ -583,6 +583,9 @@ pub(super) fn shmat(cx: &mut Cx<'_>, id: i32, addr: u64, flags: i32) -> SysResul
     if addr == 0 && flags & SHM_REMAP != 0 {
         return Err(Errno::EINVAL);
     }
+    if addr != 0 && super::mem::below_min_addr(cx, addr) {
+        return Err(Errno::EPERM);
+    }
     let (mut want, mut prot) = if flags & SHM_RDONLY != 0 {
         (READ, prot::READ)
     } else {

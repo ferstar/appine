@@ -963,6 +963,11 @@ fn isolation_regressions() {
 }
 
 #[test]
+fn fs_mm_regressions() {
+    run_guest_in_empty_rootfs("fs_mm");
+}
+
+#[test]
 fn doomed_elf_fails_to_spawn() {
     // Minimal 64-bit aarch64 ET_EXEC whose PT_LOAD has p_offset != p_vaddr (mod page),
     // which loader::load marks as Image::doomed.

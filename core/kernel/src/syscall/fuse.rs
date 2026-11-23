@@ -1399,15 +1399,39 @@ pub(super) fn map_fill(
 /// Reads into an on-demand mapping of a FUSE file ([`Fill`]) the pages missing around file page
 /// `page` (Linux's `filemap_fault` read-around), the BKL released while the daemon answers.
 pub(crate) fn fill(cx: &mut Cx<'_>, (fill, page): (Rc<Fill>, u64)) -> Result<(), Errno> {
-    let Some(window) = fill.window(page) else {
-        return Ok(());
-    };
+    use appine_engine::PAGE_SIZE;
     let io = match &fill.source.borrow().kind {
         FileKind::Fuse(h) => Io::of(h),
         _ => return Err(Errno::EIO),
     };
-    let data = fuse::read(cx, io.handle(), window.0, window.1 as usize)?;
-    fill.store(window, &data)
+    let Some(mut window) = fill.window(page) else {
+        return Ok(());
+    };
+    let mut data = fuse::read(cx, io.handle(), window.0, window.1 as usize)?;
+    if window.0 < page * PAGE_SIZE {
+        fill.store(window, &data, false)?;
+        if fill.has(page) {
+            return Ok(());
+        }
+        let Some(next) = fill.window_from(page) else {
+            return Ok(());
+        };
+        window = next;
+        data = fuse::read(cx, io.handle(), window.0, window.1 as usize)?;
+    }
+    // Reading from `page`: if a short reply stopped before filling one whole page before the
+    // recorded EOF, keep reading until we have a full page or the daemon confirms EOF (0 bytes).
+    let mut eof = data.is_empty();
+    while !eof && data.len() < PAGE_SIZE as usize && window.0 + (data.len() as u64) < fill.size() {
+        let want = (PAGE_SIZE as usize) - data.len();
+        let more = fuse::read(cx, io.handle(), window.0 + data.len() as u64, want)?;
+        if more.is_empty() {
+            eof = true;
+        } else {
+            data.extend_from_slice(&more);
+        }
+    }
+    fill.store(window, &data, eof)
 }
 
 /// Before a read or write syscall (`nr`, arguments `a`): the pages of its buffers in on-demand

@@ -849,7 +849,12 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     // without an ESR
     let (sig, info, esr, what) = match exit {
         Exit::InvalidateCode { addr } => {
-            invalidate_code(cx, &[addr & !(PAGE_SIZE - 1), ivau]);
+            let page = addr & !(PAGE_SIZE - 1);
+            if ivau != 0 && ivau != page {
+                invalidate_code(cx, &[page, ivau]);
+            } else {
+                invalidate_code(cx, &[page]);
+            }
             return signal::deliver(cx, cpu, false);
         }
         _ if ivau != 0 => {
@@ -1015,12 +1020,12 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     signal::deliver(cx, cpu, false)
 }
 
-/// Invalidates the translations of each page in `pages` (0 is skipped), and lets the other
-/// threads sharing the address space know.
+/// Invalidates the translations of each page in `pages`, and lets the other threads sharing the
+/// address space know.
 fn invalidate_code(cx: &mut Cx<'_>, pages: &[u64]) {
     let sync = cx.task.sync.clone();
     let mut mm = cx.mm_mut();
-    for &page in pages.iter().filter(|&&p| p != 0) {
+    for &page in pages {
         mm.invalidate_code(page, PAGE_SIZE);
     }
     mm.sync(&sync);

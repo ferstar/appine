@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: open_pseudo uses ProcId/group_of_id and pins Mm weakly for pagemap too)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: release node.mnt and open_tree namespaces on OpenFile drop, mark mq_open fds pseudo, and set mount on mqueue-mount opens)
 
 ## Responsibilities
 
@@ -43,7 +43,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   mount (the root mount unless
   the open set one), `F_SETOWN*` owner with the setter's uids, `F_SETSIG` signal, poll bookkeeping
   (`kernel/poll`), the inotify `Opened` record, lock ownership, open_tree namespace (`tree`),
-  `pseudo` (a memfd: not a writer; seals in `Kernel::seals`), `ovl` and `ovl_holds` (the overlay
+  `pseudo` (a memfd or `mq_open` descriptor: not a writer or mount holder; memfd seals in
+  `Kernel::seals`), `ovl` and `ovl_holds` (the overlay
   node behind a file opened through an overlay, and its `Hold`s), and old host handles kept until
   close: `ovl_lower` (after a copy-up) and `retired` (after `rehome`).
 - `FileKind` — Host, Regular, Directory, Path, Pipe, Device, Render, Pty, Socket, Epoll, EventFd,
@@ -91,7 +92,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 - Closing (close, dup3 over an fd, close_range, close-on-exec) removes the slot, runs
   `locks::closed`, `mqueue_closed`, flushes a FUSE file (close returns the flush's error, the
   others ignore it) and `unix::released`; the last reference's `Drop` tells `vfs::released` its
-  mount (and a pinned PTY's devpts mount), wakes host-socket (not AF_UNIX) waiters, wakes lock
+  mount, its node's mount when different, `ANY_MOUNT` when `tree` was set (and a pinned PTY's
+  devpts mount), wakes host-socket (not AF_UNIX) waiters, wakes lock
   waiters when the file held locks, and drops the `Opened` record (`IN_CLOSE_*` when any watch
   exists). A table's drop wakes lock waiters when it held locks. A file seccomp's
   `SECCOMP_ADDFD_FLAG_SETFD` replaces in another process's table is closed as that process's (its
@@ -135,8 +137,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   `EROFS`, write+search) and create with the mode `new_owner` makes of the requested one and the
   umask (`kernel/cred`: setgid stripped before the umask, setgid directories); a just-created file
   skips permission checks and truncation. `O_PATH` gives a `FileKind::Path` (`O_DIRECTORY` on a
-  non-directory `ENOTDIR`). Only store, overlay and FUSE nodes set the file's mount; others keep
-  the root mount.
+  non-directory `ENOTDIR`). Store, overlay, FUSE and mqueue-mount nodes (`PseudoNode::Mq`) set the
+  file's mount (`mq_open` marks its descriptor `pseudo` instead); others keep the root mount.
 - Store nodes (`open_store`), unless just created: symlink `ELOOP`; a directory with write access,
   `O_CREAT` or `O_TRUNC` `EISDIR`; a regular file with `O_TRUNC` `EROFS` on ro, else it adds
   `MAY_WRITE`; devices on nodev `EACCES`; permission; the cgroup BPF device filter (not for device

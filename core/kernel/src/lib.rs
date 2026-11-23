@@ -84,8 +84,11 @@ pub fn import_rootfs(store: &Path, tarball: &Path) -> Result<ImportReport, Errno
         let file = std::fs::File::open(tarball)
             .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
         let store = Store::create(store)?;
-        let report = vfs::import::import_tar_gz(&store, std::io::BufReader::new(file))?;
-        vfs::dev::ensure_dev_nodes(&store)?;
+        let report = store.transaction(|store| {
+            let report = vfs::import::import_tar_gz(store, std::io::BufReader::new(file))?;
+            vfs::dev::ensure_dev_nodes(store)?;
+            Ok(report)
+        })?;
         Ok(report)
     })
     .unwrap_or(Err(Errno::EIO))

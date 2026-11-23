@@ -326,6 +326,9 @@ pub struct Store {
     /// Regular files in the write transaction that were renamed over other files: their data is
     /// made durable before the commit ([`Store::flush_replaced`]).
     replaced: RefCell<Vec<Ino>>,
+    /// Objects created inside the active savepoint ([`Op`]): unlinked on savepoint rollback so
+    /// failed operations do not leak orphan object files on disk.
+    created: RefCell<Vec<Ino>>,
     /// Directories whose dentries changed ([`Store::take_changed_dirs`]); not recorded when None.
     changed_dirs: RefCell<Option<std::collections::BTreeSet<Ino>>>,
     /// Called when a commit starts being deferred: wakes the thread that commits when it is due
@@ -471,6 +474,7 @@ impl Store {
             delay: COMMIT_DELAY,
             doomed: RefCell::default(),
             replaced: RefCell::default(),
+            created: RefCell::default(),
             changed_dirs: RefCell::new(None),
             waker: RefCell::new(None),
             fills: RefCell::default(),
@@ -1179,7 +1183,11 @@ impl Store {
     /// Creates an empty object for a new inode. An existing one was left by an inode lost before
     /// it could be committed (the inode number was allocated again), and is emptied and reused.
     fn new_object(&self, ino: Ino) -> Result<File, Errno> {
-        self.open_number(ino, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)
+        let file = self.open_number(ino, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)?;
+        if self.writing.get() {
+            self.created.borrow_mut().push(ino);
+        }
+        Ok(file)
     }
 
     /// Changes the permission bits (keeping the type bits).
@@ -1770,6 +1778,7 @@ impl Store {
                 store: self,
                 savepoint,
                 doomed: self.doomed.borrow().len(),
+                replaced: self.replaced.borrow().len(),
                 done: false,
             };
             self.writing.set(true);
@@ -2378,6 +2387,7 @@ struct Op<'a> {
     store: &'a Store,
     savepoint: bool,
     doomed: usize,
+    replaced: usize,
     done: bool,
 }
 
@@ -2392,11 +2402,16 @@ impl Drop for Op<'_> {
         let s = self.store;
         s.writing.set(false);
         let fills = std::mem::take(&mut *s.fills.borrow_mut());
+        let created = std::mem::take(&mut *s.created.borrow_mut());
         if !self.done {
             if self.savepoint {
                 let _ = s.exec("ROLLBACK TO op");
                 let _ = s.exec("RELEASE op");
                 s.doomed.borrow_mut().truncate(self.doomed);
+                s.replaced.borrow_mut().truncate(self.replaced);
+                for ino in created {
+                    let _ = s.remove_object(ino);
+                }
             }
             return;
         }
@@ -3860,6 +3875,65 @@ mod tests {
         assert!(!dir.join("objects").join(copy.to_string()).exists());
         assert!(s.held(b).unwrap());
         assert_eq!(s.data(b).unwrap().object, a);
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rolled_back_savepoint_deletes_created_objects() {
+        let (s, dir) = temp_store("savepoint-rollback");
+        let mut rolled_back_ino = 0u64;
+        let r: Result<(), Errno> = s.transaction(|s| {
+            let (ino, mut f) = s.create_file(ROOT, b"doomed", 0o644, 0, 0)?;
+            f.write_all(b"temp payload").unwrap();
+            rolled_back_ino = ino;
+            Err(Errno::EIO)
+        });
+        assert_eq!(r, Err(Errno::EIO));
+        assert_ne!(rolled_back_ino, 0);
+        // The rolled-back object must be unlinked right away, even before the next commit
+        assert!(
+            !dir.join("objects")
+                .join(rolled_back_ino.to_string())
+                .exists()
+        );
+        assert_eq!(s.lookup(ROOT, b"doomed").unwrap(), None);
+        // A later successful commit must not leave any orphan objects behind
+        let (ok_ino, _) = s.create_file(ROOT, b"kept", 0o644, 0, 0).unwrap();
+        s.commit().unwrap();
+        let objs: Vec<_> = fs::read_dir(dir.join("objects"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(objs, vec![ok_ino.to_string()]);
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_import_rollback_leaves_store_empty() {
+        let (s, dir) = temp_store("import-rollback");
+        let mut tar_gz = Vec::new();
+        {
+            let gz = flate2::write::GzEncoder::new(&mut tar_gz, flate2::Compression::default());
+            let mut ar = tar::Builder::new(gz);
+            let mut h = tar::Header::new_gnu();
+            let body = b"hello rootfs";
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append_data(&mut h, "etc/hello", &body[..]).unwrap();
+            ar.finish().unwrap();
+        }
+        let r: Result<(), Errno> = s.transaction(|s| {
+            crate::vfs::import::import_tar_gz(s, &tar_gz[..])?;
+            Err(Errno::EIO)
+        });
+        assert_eq!(r, Err(Errno::EIO));
+        s.commit().unwrap();
+        assert_eq!(s.lookup(ROOT, b"etc").unwrap(), None);
+        let objs: Vec<_> = fs::read_dir(dir.join("objects")).unwrap().collect();
+        assert!(objs.is_empty(), "rolled-back import leaked objects");
         drop(s);
         let _ = fs::remove_dir_all(&dir);
     }

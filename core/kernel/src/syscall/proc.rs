@@ -631,7 +631,7 @@ pub(super) fn execve(
     path: u64,
     argv: u64,
     envp: u64,
-) -> Result<(), Errno> {
+) -> Result<bool, Errno> {
     let path = read_path(cx, path)?;
     exec(cx, cpu, AT_FDCWD, path, argv, envp, 0)
 }
@@ -645,7 +645,7 @@ pub(super) fn execveat(
     path: u64,
     (argv, envp): (u64, u64),
     flags: u32,
-) -> Result<(), Errno> {
+) -> Result<bool, Errno> {
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -661,7 +661,7 @@ fn exec(
     argv: u64,
     envp: u64,
     flags: u32,
-) -> Result<(), Errno> {
+) -> Result<bool, Errno> {
     let mut stack_limit = cx.t.group.borrow().rlimits[process::RLIMIT_STACK as usize].0;
     let limit = loader::arg_limit(stack_limit);
     let mut total = 0;
@@ -750,9 +750,9 @@ fn exec(
         (None, None) => process::open_node(&vfs, &cred, &node)?,
     };
     let script = parse_shebang(file.head()).is_some();
-    // A file open for writing cannot be executed, a script included (do_open_execat's
-    // deny_write_access, before its interpreter is looked at)
-    if script && super::fs::open_for_write(cx, st.ino) {
+    // A file open for writing cannot be executed, every nested `#!` script included
+    // (do_open_execat's deny_write_access, before its interpreter is looked at)
+    if super::fs::open_for_write(cx, st.ino) {
         return Err(Errno::ETXTBSY);
     }
 
@@ -777,12 +777,11 @@ fn exec(
         new_argv.extend(argv.into_iter().skip(1));
         argv = new_argv;
         (file, st, nosuid) = process::open_executable(&vfs, &view, &cred, &root, &cwd, &interp)?;
+        if super::fs::open_for_write(cx, st.ino) {
+            return Err(Errno::ETXTBSY);
+        }
         exe_at = (cwd.clone(), interp.clone());
         file_path = interp;
-    }
-    // A program open for writing cannot be executed
-    if super::fs::open_for_write(cx, st.ino) {
-        return Err(Errno::ETXTBSY);
     }
     // The absolute path shown in /proc/<pid>/exe and maps, with every symlink resolved: musl
     // expands the main program's `$ORIGIN` from it, and programs started through links such as
@@ -872,6 +871,9 @@ fn exec(
     let interp_unreadable = std::cell::Cell::new(None);
     let mut read_interp = |p: &[u8]| {
         let (exe, st, _) = process::open_executable(&vfs, &view, &cred, &root, &cwd, p)?;
+        if super::fs::open_for_write(cx, st.ino) {
+            return Err(Errno::ETXTBSY);
+        }
         if cred.permission(&st, crate::cred::MAY_READ).is_err() {
             interp_unreadable.set(Some((st.uid, st.gid)));
         }
@@ -895,7 +897,12 @@ fn exec(
     let (mut mm, image) = built.map_err(load_error)?;
     let view = cx.view(&vfs);
     let interp = interp_label(Some(&*vfs), &view, &cred, &root, &cwd, &image);
-    label_image(&mut mm, &image, (&exe, st.ino), interp);
+    let main_mnt = walked
+        .as_ref()
+        .map(|(n, _)| n.mnt())
+        .or_else(|| (!script).then_some(node.mnt()))
+        .or_else(|| from.as_deref().filter(|_| !script).and_then(|e| e.mnt()));
+    label_image(&mut mm, &image, (&exe, st.ino, main_mnt), interp);
     mm.exe = Some(st.ino);
     // The process runs in the time namespace for children from here on (entered below); with
     // offsets, the vDSO's clock functions must enter the kernel layer, which adds them
@@ -931,6 +938,7 @@ fn exec(
     super::mqueue_closed(&cx.t.group, &closed);
     super::fuse::flush_all(cx, &closed);
     crate::unix::released(cx.k(), closed);
+    super::fs::evict_unlinked_tmpfs(cx.kr(), &vfs);
     {
         let group = cx.t.group.clone();
         let mut g = group.borrow_mut();
@@ -1046,7 +1054,7 @@ fn exec(
         // SAFETY: cpu belongs to the current thread, which is running
         unsafe { cx.task.sync.kicker.kick() };
     }
-    Ok(())
+    Ok(image.doomed)
 }
 
 /// Reads execve's argv or envp: a NULL-terminated array of string pointers. Returns E2BIG when the
@@ -1132,39 +1140,41 @@ pub(crate) fn interp_label(
     root: &Node,
     cwd: &Node,
     image: &loader::Image,
-) -> Option<(Rc<[u8]>, u64)> {
+) -> Option<(Rc<[u8]>, u64, Option<crate::vfs::MountId>)> {
     let (path, ..) = image.interp.as_ref()?;
     let walked = vfs.and_then(|vfs| Some((vfs, vfs.walk(ps, cred, root, cwd, path, true).ok()?)));
     let Some((vfs, (node, found))) = walked else {
-        return Some((Rc::from(path.as_slice()), 0));
+        return Some((Rc::from(path.as_slice()), 0, None));
     };
     let name = vfs
         .found_path(ps, root, &node, found.as_ref())
         .unwrap_or_else(|_| path.clone());
     let ino = node.ino().unwrap_or(0);
-    Some((Rc::from(name), ino))
+    Some((Rc::from(name), ino, Some(node.mnt())))
 }
 
-/// Names the program's and interpreter's mappings (`/proc/<pid>/maps`). `exe` and `interp` are
-/// the names and the inodes in the store (0 when unknown); for the interpreter's see
-/// [`interp_label`].
+/// Names the program's and interpreter's mappings (`/proc/<pid>/maps`) and records their mounts.
+/// `exe` and `interp` carry the name, the store inode (0 when unknown), and the mount when known;
+/// for the interpreter's see [`interp_label`].
 pub(crate) fn label_image(
     mm: &mut Mm,
     image: &loader::Image,
-    exe: (&Rc<[u8]>, u64),
-    interp: Option<(Rc<[u8]>, u64)>,
+    exe: (&Rc<[u8]>, u64, Option<crate::vfs::MountId>),
+    interp: Option<(Rc<[u8]>, u64, Option<crate::vfs::MountId>)>,
 ) {
-    if image.main.1 <= image.main.0 {
-        return;
+    if image.main.1 > image.main.0 {
+        let len = image.main.1 - image.main.0;
+        mm.label(image.main.0, len, Some(exe.0.clone()), exe.1);
+        if let Some(mnt) = exe.2 {
+            mm.set_mnt(image.main.0, len, mnt);
+        }
     }
-    mm.label(
-        image.main.0,
-        image.main.1 - image.main.0,
-        Some(exe.0.clone()),
-        exe.1,
-    );
-    if let (Some((_, start, end)), Some((name, ino))) = (&image.interp, interp) {
-        mm.label(*start, end - start, Some(name), ino);
+    if let (Some((_, start, end)), Some((name, ino, mnt))) = (&image.interp, interp) {
+        let len = end - start;
+        mm.label(*start, len, Some(name), ino);
+        if let Some(mnt) = mnt {
+            mm.set_mnt(*start, len, mnt);
+        }
     }
 }
 

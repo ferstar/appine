@@ -461,10 +461,19 @@ impl Drop for OpenFile {
     /// was in may have been detached and now be unused ([`crate::vfs::released`]).
     fn drop(&mut self) {
         crate::vfs::released(self.mnt);
+        if let Some(node) = self.node() {
+            let mnt = node.mnt();
+            if mnt != self.mnt {
+                crate::vfs::released(mnt);
+            }
+        }
         if let FileKind::Pty(end) = &self.kind
             && end.pin
         {
             crate::vfs::released(end.mnt);
+        }
+        if self.tree.is_some() {
+            crate::vfs::released(crate::vfs::ANY_MOUNT);
         }
         match &self.kind {
             FileKind::Socket(s)

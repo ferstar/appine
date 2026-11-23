@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint copy-on-write and host-backing references to kernel/cow and kernel/hostmem)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: clear MAP_EXCLUSIVE on CoW-lent pages in pagemap)
 
 ## Responsibilities
 
@@ -84,9 +84,10 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   are resident instead of measuring them; it is sampled at last-thread exit, before execve (cheaply
   for a process younger than a tick that has not execed), on getrusage (at most every 10 ms, not
   for `RUSAGE_CHILDREN`) and on process_mrelease.
-- `pagemap` marks resident private anonymous pages present and exclusive, borrowed pages present
-  only, every other mapping's pages (shared anonymous, shm, memfd, written private file pages
-  included) present by `mincore` and file-backed, and reports no frame numbers.
+- `pagemap` marks resident private anonymous pages present and exclusive unless CoW-lent
+  (`cow.lent`, present only), borrowed pages present only, every other mapping's pages (shared
+  anonymous, shm, memfd, written private file pages included) present by `mincore` and file-backed,
+  and reports no frame numbers.
 
 ### OOM killer
 
@@ -205,8 +206,6 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 
 - **OOM scores omit swap and page tables:** a mostly swapped-out process ranks low although the
   root's usage counts VmSwap (Linux adds swap entries and page-table pages to `oom_badness`).
-- **pagemap reports lent pages as exclusive:** they are mapped by several address spaces, contrary
-  to Linux and the function's own description of the bit.
 - **process_mrelease judges "exiting" by `ThreadGroup::exiting`:** a fatal signal other than
   SIGKILL sets it only when a thread takes the signal (Linux's `complete_signal` starts the group
   exit when it is sent), so a release right after kill with SIGTERM is `EINVAL`; and when a main

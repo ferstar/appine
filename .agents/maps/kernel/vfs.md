@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint sysctl and sysfs references to kernel/sysctl and kernel/sysfs)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: track unlinked open tmpfs files until eviction, enforce protected_symlinks on trailing slash, and honor noexec in faccessat)
 
 ## Responsibilities
 
@@ -56,8 +56,9 @@ capabilities (`kernel/cred`).
 - `Vfs` — the store handle, the mount table (`kernel/mount`'s `Mount`, `Mounts`, `Fs`, `MntNs`,
   `Index`, `GroupAlloc`), the no-BKL resolver state, the executable cache, the namespaces, the
   overlay and FUSE tables and the mount event counter.
-- `TmpfsParams` / `Tmpfs` — options, and usage in pages and inodes (`None` until first counted)
-  with a changed mark.
+- `TmpfsParams` / `Tmpfs` — options, usage in pages and inodes (`None` until first counted) with a
+  changed mark, and `unlinked: HashMap<Ino, u64>` tracking the last known page count of unlinked
+  regular files still open, mapped or executing.
 - `Cached` / `Pending` — the fast-path stat resolver without the BKL (reads the store's metadata
   cache under its read lock; 64-component stack), with the store inodes that are mount points.
 - `Device` — Null, Zero, Full, Random, Kmsg, LoopControl, Loop (`kernel/loop`'s; tty, ptmx, pts
@@ -92,8 +93,9 @@ capabilities (`kernel/cred`).
   inodes, message queues) `ENOTDIR`. `AT_EMPTY_PATH` takes the fd's node or the cwd (`EBADF`
   without a node); stat with an empty path stats the fd itself.
 - `walk_resolve` runs `walk_in` in one store read snapshot. Empty components are dropped; a
-  trailing `/` appends `.`, forcing a directory and following a trailing symlink as an
-  intermediate one.
+  trailing `/` appends a `Step::TrailingSlash` sentinel (an empty slice in `Cached`), forcing a
+  directory and following a trailing symlink while still classifying it as trailing for
+  `protected_symlinks`.
 - Per component, in order: over 255 bytes `ENAMETOOLONG`; not a directory `ENOTDIR`; search
   permission, also for `.` and `..`: on store directories and the store directory behind an overlay
   one unless the credentials have `CAP_DAC_READ_SEARCH` or `CAP_DAC_OVERRIDE` in the initial user
@@ -110,7 +112,8 @@ capabilities (`kernel/cred`).
   fixed names Linux has under `/proc` and `/sys` and names directly in the boot `/dev`
   (`kernel/signal`'s unimplemented paths).
 - Symlinks (intermediate, or last with `follow`): over 40 `ELOOP`; `protected_symlinks` (default
-  on) for a last-component store link in a store directory (`EACCES`); `NO_SYMLINKS` or
+  on) for a last-component or trailing-slash (`link/`) store link in a store directory (`EACCES`);
+  `NO_SYMLINKS` or
   nosymfollow `ELOOP`; then procfs's `follow`, which refuses magic links to readers failing the
   access check (`EACCES`; `fd/` and `fdinfo/` also refuse lookup and listing); for magic links
   (`/proc/<pid>/fd/*`, `cwd`, `root`, `exe`, `ns/*`) `NO_MAGICLINKS` `ELOOP`, `NO_XDEV` to another
@@ -170,9 +173,10 @@ capabilities (`kernel/cred`).
   after the `.`/`..` checks, before lookup; in rename after `EXDEV` and the `.`/`..` checks; in
   attribute changes before permission; in truncate after the type checks; in write opens of
   regular files after permission and `O_NOATIME` (`O_TRUNC` before permission; overlay opens before
-  permission). noexec: exec `EACCES` after the execute check, `PROT_EXEC` mmap `EPERM` (a memfd
-  checked against the root mount), and such a mapping cannot gain `PROT_EXEC` through mprotect
-  (`EACCES`); exec never treats memfds as noexec. nosuid: exec ignores set-id bits and file caps
+  permission). noexec: exec `EACCES` after the execute check, `access`/`faccessat(X_OK)` on a
+  regular non-memfd file `EACCES`, `PROT_EXEC` mmap `EPERM` (a memfd checked against the root
+  mount), and such a mapping cannot gain `PROT_EXEC` through mprotect (`EACCES`); exec never treats
+  memfds as noexec. nosuid: exec ignores set-id bits and file caps
   (always for FUSE programs). nodev: device opens `EACCES` (store, overlay, FUSE and devpts
   nodes); mknod is unaffected. nosymfollow: `ELOOP`, and on the root filesystem it turns off
   `Cached`. Atime flags and the sync, dirsync, mand and lazytime superblock flags are only recorded
@@ -208,8 +212,12 @@ capabilities (`kernel/cred`).
   `may_create`); a write needs room only for its pages holding no data yet (found with the host's
   `SEEK_DATA`/`SEEK_HOLE` when they might not fit, less pages reserved and unwritten) and is clipped
   where room ends; fallocate reservations need room for the whole range or fail; truncation is
-  never limited; a removal gives back one inode, and the pages at the last link. statfs and
-  remount recount the tree; a create, write or reservation about to be refused or cut recounts once
+  never limited; a removal gives back one inode and its pages at the last link, unless the regular
+  file is still open, mapped or executing (`file_in_use`), in which case its pages and inode stay
+  charged in `Tmpfs::unlinked` (updated on subsequent writes/truncates, included in counts and
+  recounts, and evicted by `evict_unlinked_tmpfs` at syscall/thread release, execve close-on-exec,
+  statfs and remount). statfs and remount recount the tree; a create, write or reservation about to
+  be refused or cut recounts once
   when usage changed since the last count. The mount's filesystem decides what is charged, so
   changes through an overlay, memfds and the loop nodes `kernel/loop` adds to the boot `/dev` are
   never checked or charged as they happen; a full count still sees them.
@@ -234,7 +242,8 @@ capabilities (`kernel/cred`).
   filesystem's figures.
 - access/faccessat: real IDs unless `AT_EACCESS` (capabilities only when the real uid is root in
   the caller's namespace); FUSE nodes ask `kernel/fuse` even for `F_OK`; otherwise `F_OK` returns
-  right after the lookup; `EROFS` for `W_OK` after the permission check, on regular files,
+  right after the lookup; `EACCES` for `X_OK` on regular files (excluding memfds) in a `noexec`
+  mount (FUSE and non-FUSE); `EROFS` for `W_OK` after the permission check, on regular files,
   directories and symlinks only.
 - chmod drops `S_ISGID` when the caller is outside the file's group without `CAP_FSETID` over
   it; on a memfd sealed with `F_SEAL_EXEC` changing an execute bit is `EPERM` after the owner check
@@ -363,10 +372,6 @@ capabilities (`kernel/cred`).
 
 ## Confirmed bugs / technical debt
 
-- **tmpfs charges drift for unlinked open files:** writes through a description still open after
-  the last unlink are charged and never given back (nothing uncharges at close; recounts skip
-  unlinked files), while truncating or punching one uncharges pages already given back, so writes
-  can pass the limit until the next recount. Linux charges until eviction at the last close.
 - **No inode flags:** `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` are unsupported, while 6.1's tmpfs has
   append-only, immutable, nodump and noatime (LTP unlink09, copy_file_range02).
 - **atime ignores the guest:** a regular file's atime is its host object's, updated by the host's
@@ -375,8 +380,6 @@ capabilities (`kernel/cred`).
 - **Fidelity gaps**, one per line:
   - statx: no btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`;
   - no `protected_regular` or `protected_fifos`;
-  - `protected_symlinks` is not applied to a link followed by a trailing `/` (`link/`);
-  - access with `X_OK` ignores noexec;
   - a fault on a mapping of a full tmpfs never raises `SIGBUS`, and shared-mapping writes are
     counted only at a recount;
   - newfstatat refuses `AT_NO_AUTOMOUNT` and the `AT_STATX_*` sync flags;

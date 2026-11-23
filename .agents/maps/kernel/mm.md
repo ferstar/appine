@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: condense map in place and repoint object-unsharing reference to kernel/fileio)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: update mremap shm/vdso/DONTUNMAP flags and reap, check mmap_min_addr in shmat, track Vma::mnt, and fix Fill short-read recording)
 
 ## Responsibilities
 
@@ -35,8 +35,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `mlockall` metadata, and per-mm handles for `kernel/mmu`, `kernel/cow` and `kernel/hostmem`.
 - `Vma` — one guest mapping: range, guest prot, `Backing`, `may_write`/`may_exec`,
   `Arc<HostRegion>` (`kernel/hostmem`) + host pointer, file metadata (`file_len`, identity/version,
-  shared-file fd, display `name`/`ino`), SysV `shm`, optional `Fill`, and Linux VMA flags (locked,
-  sticky `written`, growsdown, dump/fork/noreserve, `anon`).
+  shared-file fd, display `name`/`ino`, optional `MountPin` `mnt` whose drop reports to
+  `vfs::released`), SysV `shm`, optional `Fill`, and Linux VMA flags (locked, sticky `written`,
+  growsdown, dump/fork/noreserve, `anon`).
 - `Fill` (`Rc`) — a FUSE file mapping read on demand: a sparse host file (memfd) as long as the
   file was when mapped, holding what was read at the file's own offsets; the open file to read
   from (kept open while mapped); the runs of file pages read; and the read-ahead state. Every VMA
@@ -71,14 +72,14 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `map_anonymous`, `map_vvar`, `find_free`, `set_brk`, `map_stack`, `set_start_stack`, `label`,
   `vdso_syscalls`; `fill_wanted`, `fault_past_eof`, `Cx::grow_stack`/`grow_stack_to`/`grow_for`,
   `is_mapped` (`cow_break` is `kernel/cow`'s; `mmu().translate`/`fault_in` `kernel/mmu`'s).
-- **FUSE fills & kernel access**: `Fill::new`/`window`/`store`/`fd`, `take_wanted`, `has_fills`,
-  `first_unread`; `read`, `write` (breaks CoW via `kernel/cow`), `translate` (no CoW break),
-  `read_cstr`, `write_kernel`, `write_force`, `can_write`, `populate`, `mapped_above`,
-  `check_mapped`.
+- **FUSE fills & kernel access**: `Fill::new`/`size`/`has`/`window`/`window_from`/`store`/`fd`,
+  `take_wanted`, `has_fills`, `first_unread`; `read`, `write` (breaks CoW via `kernel/cow`),
+  `translate` (no CoW break), `read_cstr`, `write_kernel`, `write_force`, `can_write`, `populate`,
+  `mapped_above`, `check_mapped`.
 - **Files, shm, futex & introspection**: `futex_key`, `shared_maps`, `id`; `file_truncated`,
-  `writably_maps`, `maps_file`, `file_moving`, `file_moved`, `shared_file_ranges`; `attach_shm`/
-  `detach_shm`/`shm_attachments`; `regions`, `residency`, `size`, `locked_bytes`/`locked_in`,
-  `dump_regions`, `dump_page`.
+  `writably_maps`, `maps_file`, `maps_ino`, `mapped_inos`, `set_mnt`, `mapped_mounts`,
+  `file_moving`, `file_moved`, `shared_file_ranges`; `attach_shm`/`detach_shm`/`shm_attachments`;
+  `regions`, `residency`, `size`, `locked_bytes`/`locked_in`, `dump_regions`, `dump_page`.
 
 ## Data flow / lifecycle
 
@@ -170,7 +171,10 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   (normally 32 starting 16 before it; from it, twice the last read when it continues that read or
   twice the run read just before it, between 32 and 512), clipped to the runs already read and
   EOF; the daemon is asked with the BKL released, and `store` writes the pages still missing into
-  the memfd with `pwrite` and records the window as read. A page not read has no private copy
+  the memfd with `pwrite`, recording the whole window only when the reply reaches `Fill::size`,
+  the single page on confirmed 0-byte EOF, and otherwise only complete pages returned (`kernel/fuse`
+  retries from `window_from(page)` when backward read-around stopped short and loops on partial-page
+  replies until a full page or EOF). A page not read has no private copy
   anywhere (no entry, no kernel write), so the host file reaches every mapping of it, shared or
   private.
 - A kernel access (`read`, `write`, `read_cstr`, `write_kernel`) meeting a page of a `Fill` mapping
@@ -203,8 +207,9 @@ signals may still be delivered).
   `same_vma` tells which pieces Linux would have as one VMA.
 - `munmap`: an unaligned address, zero or overflowing length or an end past 2^48 is `EINVAL`;
   `ENOMEM` only when one VMA would split in three at `vm.max_map_count`. It moves removed host
-  regions to the `graveyard`, sets `dirty`, records executable ranges in `code_ranges`, returns
-  borrowed pages (`kernel/cow`), and the syscall reaps SysV segments left without attachments.
+  regions to the `graveyard`, clears `vdso` when overlapping it, sets `dirty`, records executable
+  ranges in `code_ranges`, returns borrowed pages (`kernel/cow`), and the syscall reaps SysV
+  segments left without attachments.
 - `mprotect` (`protect`, Linux's `do_mprotect_pkey`): unknown prot bits (`PROT_SEM` included) or
   both grows bits are `EINVAL` at once; an unaligned address is `EINVAL`; then a length of 0
   succeeds and an overflowing one is `ENOMEM`. The VMAs from the first one ending above the
@@ -228,7 +233,8 @@ signals may still be delivered).
   and room for one more VMA (the grown part is a separate VMA with the same lock, dump, fork,
   `noreserve` and `anon` flags; a `Fill` VMA's maps more of its host file, sharing the fill); a
   locked VMA's grown part is neither charged nor populated. A move settles CoW (`kernel/cow`),
-  re-points host memory and moves PTEs (SysV shm keeps its attach base; vDSO keeps its address).
+  re-points host memory, moves PTEs, updates SysV shm attach bases (`v.shm`), and updates `vdso`
+  when the whole vDSO moves (or clears it on a partial move).
 - A move (growing with `MREMAP_MAYMOVE` and no room in place, `MREMAP_FIXED`,
   `MREMAP_DONTUNMAP`) is `ENOMEM` before anything changes unless the address space stays more
   than three VMAs below `vm.max_map_count` (`move_room`, 6.1's `move_vma`), with two more for a
@@ -238,10 +244,11 @@ signals may still be delivered).
   `EINVAL`, the margin `ENOMEM`, the target unmapped, the one-VMA rule `EFAULT`; it splits nothing
   before these, and then also needs room for the splits and for one VMA per piece left at the old
   address. What it leaves there: for anonymous memory a new empty VMA, for a private file a
-  `Refill` that the syscall maps from the store object (both without the old piece's dump, fork,
-  grows-down, `noreserve` and `anon` flags), and for shared memory and a `Fill` VMA a copy of the
-  old VMA (unlocked; a `Fill` one on its host file mapped privately again); that path reaps no SysV
-  segments, though unmapping its target can end a segment's last attachment.
+  `Refill` that the syscall maps from the store object (both keeping `may_exec`, dump, fork,
+  grows-down, `noreserve`, `anon` and `mnt`), and for shared memory and a `Fill` VMA a copy of the
+  old VMA (unlocked; a `Fill` one on its host file mapped privately again); the syscall then calls
+  `reap_shm`. `shmat` also refuses non-zero fixed addresses below `vm.mmap_min_addr` without
+  `CAP_SYS_RAWIO` (`EPERM`).
 - `mremap` with an old length of 0 duplicates (6.1's "duplicate shm area"): the VMA holding the
   address (`EFAULT` if none) must be shared (`EINVAL`; a `MREMAP_FIXED` target is validated and
   unmapped before this check), and without `MREMAP_MAYMOVE` it is `ENOMEM`; no margin is asked. A
@@ -399,12 +406,7 @@ signals may still be delivered).
   `SIGBUS` instead of `SIGSEGV`/`SEGV_ACCERR`, and private file mappings never see file growth.
 - **Approximate Linux VMA boundaries:** anonymous pieces join ignoring page offsets (mremap-moved
   VMAs join new neighbours); `MREMAP_DONTUNMAP` of a multi-piece VMA needs one VMA slot per piece,
-  in-place growth adds a VMA, and `shmat` below `vm.mmap_min_addr` is not refused.
-- **mremap moves leave stale addresses:** a moved SysV segment keeps its old attach base (shmdt at
-  its new address is `EINVAL`), and a moved vDSO keeps its recorded address (the default signal
-  restorer, the vDSO's refill after `MADV_DONTNEED`, its `[vdso]` label and the time-namespace
-  stubs use the old one); `MREMAP_DONTUNMAP`'s anonymous and private-file remnants lose the old
-  VMA's flags, and a segment it detaches is reaped only by a later munmap, mremap or mmap.
+  and in-place growth adds a VMA.
 - **mlock never fails on inaccessible ranges:** `mlock`/`mlock2` over a range that includes a
   `PROT_NONE` mapping succeeds and keeps populating the mappings after it, where Linux 6.1 locks the
   whole range but stops populating at the `PROT_NONE` mapping and returns `ENOMEM`.
@@ -415,9 +417,6 @@ signals may still be delivered).
   pages are written.
 - **Ranges with gaps fail as a whole:** madvise, msync, mlock and mincore refuse a range that is not
   fully mapped before doing anything (`ENOMEM`), where Linux acts on the mapped parts first.
-- **A FUSE mapping's short read is taken as a whole window:** `store` records the whole window as
-  read even when the daemon returned less (a short reply, or an error after the first chunk), so
-  the rest stays zeros and is never asked for again.
 
 ## Open questions
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: clear TaskState::restart on execve and fail Machine::spawn on doomed images)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: enforce ETXTBSY on nested scripts and PT_INTERP, and skip ptrace exec/syscall-exit on doomed images)
 
 ## Responsibilities
 
@@ -38,7 +38,8 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 - `loader::Executable`, `ExeCache` (32 opened executables, least recently used dropped), `Args`,
   `Prepared` (the hand-off between the locked and unlocked exec phases), `Image` (with `doomed`);
   `process::ExeFile` (the process's `exe_file`: path, store mount and inode, dentry, host file, and
-  for a program found through an overlay its overlay node, held while recorded).
+  for a program found through an overlay its overlay node, held while recorded; its `Drop` reports
+  its mount to `vfs::released`).
 - `loader::LoadError` — why loading failed, turned into an errno by `load_error`.
 
 ## Public entry points
@@ -64,8 +65,9 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 - `#!` scripts: the interpreter line is parsed (up to 256 bytes) and the interpreter resolved
   relative to the cwd; five nested scripts run, a sixth is `ELOOP` (Linux 6.1's `exec_binprm`); a
   script run by fd through a close-on-exec directory is `ENOENT`.
-- `ETXTBSY` if a writable open file refers to a `#!` script being run (checked before its
-  interpreter is opened) or to the final executable (memfds never count as writers).
+- `ETXTBSY` if a writable open file refers to the initial file, any nested `#!` script being run
+  (checked before its interpreter is opened), the final executable, or its ELF `PT_INTERP`
+  interpreter (memfds never count as writers).
 - Credentials: setuid and setgid (the latter with group execute) apply unless `no_new_privs`,
   nosuid, or the owner/group are unmapped; file capabilities come from the xattr; a tracer without
   `CAP_SYS_PTRACE` or a fs context shared with another process makes the execution unsafe, so it
@@ -89,8 +91,9 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   `clear_child_tid`, vfork) and install the new one with the CPU state reset, reaping shm
   segments marked for removal it held last; reset the alternate stack, `TaskState::restart` and
   comm; set PC and SP;
-  force the `SIGSEGV` of a doomed image; re-kick if interrupted. The run loop then re-attaches the
-  translator.
+  force the `SIGSEGV` of a doomed image; re-kick if interrupted. For a doomed image, `exec_done`
+  flushes ptrace hardware debug state, skips `PTRACE_EVENT_EXEC` and `ptrace::syscall_exit`, and
+  delivers the fatal signal immediately; otherwise the run loop re-attaches the translator.
 
 ### ELF loader
 
@@ -178,14 +181,8 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 
 ## Confirmed bugs / technical debt
 
-- **`ETXTBSY` misses the ELF interpreter and nested scripts:** the script itself and the final
-  program are checked, but running a program whose `PT_INTERP` interpreter is open for writing, or
-  a script whose interpreter is another script open for writing, succeeds where Linux returns
-  `ETXTBSY`.
 - **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
   whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
-- **Doomed images:** execve reports its ptrace exec event (and a successful syscall exit) for a
-  doomed image, where Linux fails the exec before the event.
 
 ## Open questions
 

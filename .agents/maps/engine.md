@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: expanded struct appine_cpu::dbt_groups from 4 to 8 slots)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve guest page 0 on explicit Tier 0 InvalidateCode exits)
 
 ## Responsibilities
 
@@ -227,10 +227,6 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 ## Confirmed bugs / technical debt
 
-- **The kernel drops page-zero invalidation from pure Tier 0:** its code-change path filters out
-  zero even for an explicit `InvalidateCode` exit. A single-stepped write and cache flush on
-  page zero can therefore leave stale code when execution returns to Tier 1 (`engine/dbt`'s own
-  dispatcher handles page zero directly).
 - **Unallocated ID registers read 0:** `mrs` of CRm=1 and unallocated CRm=0 registers returns 0
   where Linux 6.1 delivers `SIGILL`.
 

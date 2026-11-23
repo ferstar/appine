@@ -576,6 +576,10 @@ struct Mounts {
     /// instance was mounted, changed by a remount without `MS_BIND`; absent is none (the boot
     /// instances).
     sb_flags: std::collections::HashMap<u64, u64>,
+    /// Detached mounts need collection on the next syscall/exit pass (set when removing a mount
+    /// point detaches mounts in other namespaces, or when an earlier collection found tables
+    /// borrowed). Stored kernel-wide so a retiring pool thread never loses the retry.
+    collect_pending: bool,
 }
 
 impl Mounts {
@@ -639,6 +643,7 @@ impl Mounts {
                 params,
                 used,
                 changed,
+                unlinked: Default::default(),
             },
         );
         Ok(root)
@@ -749,9 +754,13 @@ pub(crate) struct Tmpfs {
     /// Recorded usage (pages, inodes), updated on create, delete, write and truncate, and counted
     /// afresh at statfs ([`Vfs::count_tmpfs`]); None means count it the next time it is needed.
     used: Option<(u64, u64)>,
-    /// The recorded usage changed since it was last counted, so it may have drifted (writes to
-    /// deleted files still open are charged and never given back): [`Vfs::tmpfs_recount`].
+    /// The recorded usage changed since it was last counted, so it may have drifted (for example
+    /// through shared mappings): [`Vfs::tmpfs_recount`].
     changed: bool,
+    /// Regular files whose last link was removed while still open or mapped, mapped to their last
+    /// known page count: their pages and one inode stay charged until their last user closes them
+    /// ([`Vfs::evict_tmpfs`]), matching Linux's `shmem_evict_inode`.
+    unlinked: std::collections::HashMap<Ino, u64>,
 }
 
 /// What no-BKL path resolution needs (`syscall::fast`): the store's metadata cache and the mount
@@ -804,7 +813,14 @@ impl Cached {
         pending.push(path)?;
         let mut links = 0;
         while let Some(comp) = pending.pop() {
+            if comp.is_empty() {
+                if r.kind(dir)? != mode::S_IFDIR {
+                    return Some(Err(Errno::ENOTDIR));
+                }
+                continue;
+            }
             let last = pending.is_empty();
+            let trailing = last || (pending.len == 1 && pending.comps[0].is_empty());
             if comp.len() > NAME_MAX {
                 return Some(Err(Errno::ENAMETOOLONG));
             }
@@ -838,9 +854,9 @@ impl Cached {
                 }
                 // fs.protected_symlinks depends on the credentials ([`Vfs::may_follow_link`]):
                 // links in sticky, world-writable directories whose owner differs from the
-                // directory's are left to normal resolution
+                // directory's are left to normal resolution (including trailing `/` like `link/`)
                 let sticky_shared = mode::S_ISVTX | 0o002;
-                if last
+                if trailing
                     && r.stat(dir)?.mode & sticky_shared == sticky_shared
                     && r.stat(dir)?.uid != r.stat(node)?.uid
                 {
@@ -876,10 +892,12 @@ impl Default for Pending<'_> {
 }
 
 impl<'p> Pending<'p> {
-    /// Puts `path`'s components at the front; returns None when they do not fit.
+    /// Puts `path`'s components at the front; returns None when they do not fit. An empty slice
+    /// marks a trailing `/` (forcing a directory while keeping the preceding component trailing
+    /// for `protected_symlinks`).
     fn push(&mut self, path: &'p [u8]) -> Option<()> {
         if path.ends_with(b"/") {
-            self.push_one(b".")?;
+            self.push_one(b"")?;
         }
         for c in path.rsplit(|&b| b == b'/').filter(|c| !c.is_empty()) {
             self.push_one(c)?;
@@ -953,6 +971,7 @@ impl Vfs {
             mq_dev: Default::default(),
             devpts: Default::default(),
             sb_flags: Default::default(),
+            collect_pending: false,
         };
         // The directory named `name` under directory `dir` in mount `mnt`
         let subdir = |dir: Option<&Node>, name: &[u8]| -> Option<Node> {
@@ -1184,8 +1203,20 @@ impl Vfs {
         let mut found = None;
         let mut pending = components(path);
         let mut links = 0;
-        while let Some(comp) = pending.pop_front() {
+        while let Some(step) = pending.pop_front() {
+            let comp = match step {
+                Step::TrailingSlash => {
+                    if !self.is_dir(ps, &dir)? {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    self.may_search(ps, cred, &dir)?;
+                    continue;
+                }
+                Step::Name(comp) => comp,
+            };
             let last = pending.is_empty();
+            let trailing =
+                last || (pending.len() == 1 && matches!(pending[0], Step::TrailingSlash));
             if comp.len() > NAME_MAX {
                 return Err(Errno::ENAMETOOLONG);
             }
@@ -1230,9 +1261,9 @@ impl Vfs {
                 if links > MAX_SYMLINKS {
                     return Err(Errno::ELOOP);
                 }
-                // fs.protected_symlinks applies only to the last component (pick_link's
-                // WALK_TRAILING), before nosymfollow
-                if last
+                // fs.protected_symlinks applies to the last component, including one followed by
+                // trailing `/` (pick_link's WALK_TRAILING), before nosymfollow
+                if trailing
                     && ps.protected_symlinks()
                     && let (Node::Store(_, link), Node::Store(_, parent)) = (&node, &dir)
                 {
@@ -2130,7 +2161,8 @@ impl Vfs {
     }
 
     /// `name` (inode `ino`) in store directory `dir` was deleted (rmdir, unlink, overwritten by
-    /// rename): all mounts on it in other namespaces are detached (Linux's `detach_mounts`).
+    /// rename): all mounts on it in other namespaces are detached (Linux's `detach_mounts`), and
+    /// scheduled for collection at the end of the syscall.
     pub(crate) fn detach_store_point(&self, (ino, dir, name): (Ino, Ino, &[u8])) {
         let ids: Vec<MountId> = self
             .mounts
@@ -2140,9 +2172,13 @@ impl Vfs {
             .filter(|m| on_entry(m, (ino, dir, name)))
             .map(|m| m.id)
             .collect();
+        if ids.is_empty() {
+            return;
+        }
         for id in ids {
             self.remove_mount(id);
         }
+        self.mounts.borrow_mut().collect_pending = true;
     }
 
     /// `name` (inode `ino`) in store directory `dir` was deleted: the mounts, in any namespace or
@@ -2261,6 +2297,68 @@ impl Vfs {
         }
     }
 
+    /// Regular file `ino` in tmpfs instance `dev` lost its last link while still open or mapped:
+    /// keeps its `pages` and one inode charged until its last user goes away
+    /// ([`Vfs::evict_tmpfs`]).
+    pub(crate) fn tmpfs_unlinked(&self, dev: u64, ino: Ino, pages: u64) {
+        if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
+            t.unlinked.insert(ino, pages);
+        }
+    }
+
+    /// Updates the recorded page count of unlinked-but-open tmpfs file `ino` after a write,
+    /// truncation or hole punch.
+    pub(crate) fn tmpfs_update_unlinked(&self, dev: u64, ino: Ino, pages: u64) {
+        if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev)
+            && let Some(p) = t.unlinked.get_mut(&ino)
+        {
+            *p = pages;
+        }
+    }
+
+    /// Whether any tmpfs instance currently tracks unlinked regular files still held open or
+    /// mapped.
+    pub(crate) fn has_unlinked_tmpfs(&self) -> bool {
+        self.mounts
+            .borrow()
+            .tmpfs
+            .values()
+            .any(|t| !t.unlinked.is_empty())
+    }
+
+    /// Updates live unlinked tmpfs files' page counts from open descriptors and evicts those no
+    /// longer in `live`, releasing their pages and inode charges.
+    pub(crate) fn evict_tmpfs(&self, live: &std::collections::HashMap<Ino, Option<u64>>) {
+        let mut mounts = self.mounts.borrow_mut();
+        for t in mounts.tmpfs.values_mut() {
+            if t.unlinked.is_empty() {
+                continue;
+            }
+            let mut drop_inodes = 0u64;
+            let mut delta_pages = 0i64;
+            t.unlinked.retain(|ino, pages| match live.get(ino) {
+                Some(Some(actual)) => {
+                    delta_pages += *actual as i64 - *pages as i64;
+                    *pages = *actual;
+                    true
+                }
+                Some(None) => true,
+                None => {
+                    delta_pages -= *pages as i64;
+                    drop_inodes += 1;
+                    false
+                }
+            });
+            if (delta_pages != 0 || drop_inodes != 0)
+                && let Some((p, i)) = &mut t.used
+            {
+                *p = p.saturating_add_signed(delta_pages);
+                *i = i.saturating_sub(drop_inodes);
+                t.changed = true;
+            }
+        }
+    }
+
     /// Changes the parameters of tmpfs instance `dev` on remount: `f` gets the parameters and
     /// the current usage (pages, inodes); on error nothing changes.
     pub(crate) fn tmpfs_reconfigure(
@@ -2288,15 +2386,15 @@ impl Vfs {
         dev: u64,
         fresh: bool,
     ) -> Result<(TmpfsParams, u64, u64), Errno> {
-        let (params, root, used) = {
+        let (params, root, used, unlinked) = {
             let mounts = self.mounts.borrow();
             let t = mounts.tmpfs.get(&dev).ok_or(Errno::EINVAL)?;
-            (t.params.clone(), t.root, t.used)
+            (t.params.clone(), t.root, t.used, t.unlinked.clone())
         };
         let (pages, inodes) = match used {
             Some(u) if !fresh => u,
             _ => {
-                let u = self.count_tmpfs(root)?;
+                let u = self.count_tmpfs(root, &unlinked)?;
                 if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
                     t.used = Some(u);
                     t.changed = false;
@@ -2307,10 +2405,13 @@ impl Vfs {
         Ok((params, pages, inodes))
     }
 
-    /// Counts the usage of the tmpfs rooted at `root` (pages, inodes; see
-    /// [`Vfs::tmpfs_usage`]). Files still open after deletion do not count (Linux frees them
-    /// only at close).
-    fn count_tmpfs(&self, root: Ino) -> Result<(u64, u64), Errno> {
+    /// Counts the usage of the tmpfs rooted at `root` (pages, inodes; see [`Vfs::tmpfs_usage`]),
+    /// including unlinked regular files still held open or mapped (`unlinked`).
+    fn count_tmpfs(
+        &self,
+        root: Ino,
+        unlinked: &std::collections::HashMap<Ino, u64>,
+    ) -> Result<(u64, u64), Errno> {
         let (mut pages, mut inodes) = (0, 1);
         let mut seen = std::collections::HashSet::new();
         let mut dirs = vec![root];
@@ -2329,6 +2430,8 @@ impl Vfs {
                 }
             }
         }
+        inodes += unlinked.len() as u64;
+        pages += unlinked.values().sum::<u64>();
         Ok((pages, inodes))
     }
 
@@ -2539,6 +2642,7 @@ impl Vfs {
                 // Only the root directory
                 used: Some((0, 1)),
                 changed: false,
+                unlinked: Default::default(),
             },
         );
         Ok(id)
@@ -2864,16 +2968,26 @@ impl Vfs {
         self.mounts_changed();
     }
 
-    /// Whether a mount this thread let go of since the last call ([`released`]) is detached, so
-    /// that [`Vfs::collect`] may now drop it.
+    /// Marks that detached mounts need collection on the next pass (used when a collection found
+    /// task tables borrowed).
+    pub(crate) fn defer_collect(&self) {
+        self.mounts.borrow_mut().collect_pending = true;
+    }
+
+    /// Whether a mount this thread let go of since the last call ([`released`]) is detached, or a
+    /// kernel-wide collection retry was scheduled, so that [`Vfs::collect`] may now drop it.
     pub(crate) fn released_detached(&self) -> bool {
         let released = RELEASED.with(|r| std::mem::take(&mut *r.borrow_mut()));
+        let mut mounts = self.mounts.borrow_mut();
+        let pending = std::mem::take(&mut mounts.collect_pending);
+        if pending {
+            return true;
+        }
         if released.is_empty() {
             return false;
         }
         let any = released[0] == ANY_MOUNT;
-        self.mounts
-            .borrow()
+        mounts
             .detached
             .iter()
             .any(|m| any || released.contains(&m.id))
@@ -2883,6 +2997,7 @@ impl Vfs {
     /// open file is in them) and not connected below one that is. tmpfs instances no mount can
     /// see any more are deleted with their files.
     pub(crate) fn collect(&self, in_use: &std::collections::HashSet<MountId>) {
+        self.mounts.borrow_mut().collect_pending = false;
         // Mount namespaces nobody uses: all their mounts are detached
         self.namespaces
             .borrow_mut()
@@ -3069,6 +3184,20 @@ impl Vfs {
             .map_or_else(Propagation::default, |m| m.prop)
     }
 
+    /// Builds a propagation [`Index`] over `list`, excluding mounts in live anonymous namespaces
+    /// (unattached `open_tree(OPEN_TREE_CLONE)` trees, Linux's `IS_MNT_NEW`).
+    fn prop_index(&self, list: &[Mount]) -> Index {
+        let anon: std::collections::HashSet<u64> = self
+            .namespaces
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .filter(|ns| ns.anon)
+            .map(|ns| ns.id)
+            .collect();
+        Index::of(list, &anon)
+    }
+
     // ---- Propagation of mount events (fs/pnode.c) ----
 
     /// The mounts a tree attached on `point` (`at` when it is a file in the store) gets copied to
@@ -3084,7 +3213,7 @@ impl Vfs {
     ) -> Vec<Target> {
         let planned: Vec<(MountId, u64, Node, u32, Vec<u32>)> = {
             let mounts = self.mounts.borrow();
-            let index = Index::of(&mounts.list);
+            let index = self.prop_index(&mounts.list);
             index
                 .propagation_of(&mounts.list, point.mnt())
                 .into_iter()
@@ -3155,7 +3284,7 @@ impl Vfs {
             })
             .collect();
         // What is on each place now: a copy goes under it
-        let index = Index::of(&mounts.list);
+        let index = self.prop_index(&mounts.list);
         // The groups of the copies made in each group of the propagation tree, by position in
         // the tree; the parent's own group has the original
         let top = tree[0]
@@ -3246,7 +3375,7 @@ impl Vfs {
         in_use: &std::collections::HashSet<MountId>,
     ) -> bool {
         let mounts = self.mounts.borrow();
-        let index = Index::of(&mounts.list);
+        let index = self.prop_index(&mounts.list);
         let Some(m) = index.pos.get(&id).map(|&i| &mounts.list[i]) else {
             return false;
         };
@@ -3276,7 +3405,7 @@ impl Vfs {
     pub(crate) fn umount_tree(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
         let list = &mounts.list;
-        let index = Index::of(list);
+        let index = self.prop_index(list);
         let order = tree_of(list, id);
         let gone: std::collections::HashSet<MountId> = order.iter().copied().collect();
         // The mounts on the same places elsewhere, each place of a peer group visited once
@@ -3527,17 +3656,24 @@ pub fn read_file(store: &Store, path: &[u8]) -> Result<Vec<u8>, Errno> {
     Ok(data)
 }
 
-/// Components for path resolution: `.` is kept, and with a trailing `/` one more `.` is added,
-/// so the preceding node must be a directory and a symlink in the last component is followed
-/// too (as on Linux).
-fn components(path: &[u8]) -> VecDeque<Vec<u8>> {
-    let mut comps: VecDeque<Vec<u8>> = path
+enum Step {
+    Name(Vec<u8>),
+    /// Synthetic step for a trailing `/` (forces a directory and follows a trailing symlink while
+    /// preserving `WALK_TRAILING` for `fs.protected_symlinks`).
+    TrailingSlash,
+}
+
+/// Components for path resolution: `.` is kept, and with a trailing `/` a [`Step::TrailingSlash`]
+/// is added so the preceding node must be a directory and a symlink in the last component is
+/// followed too (as on Linux) while still treated as trailing for `protected_symlinks`.
+fn components(path: &[u8]) -> VecDeque<Step> {
+    let mut comps: VecDeque<Step> = path
         .split(|&b| b == b'/')
         .filter(|c| !c.is_empty())
-        .map(<[u8]>::to_vec)
+        .map(|c| Step::Name(c.to_vec()))
         .collect();
     if path.ends_with(b"/") {
-        comps.push_back(b".".to_vec());
+        comps.push_back(Step::TrailingSlash);
     }
     comps
 }
@@ -3783,7 +3919,7 @@ struct Index {
 }
 
 impl Index {
-    fn of(list: &[Mount]) -> Index {
+    fn of(list: &[Mount], anon: &std::collections::HashSet<u64>) -> Index {
         let mut index = Index {
             pos: HashMap::with_capacity(list.len()),
             members: HashMap::new(),
@@ -3793,11 +3929,13 @@ impl Index {
         };
         for (i, m) in list.iter().enumerate() {
             index.pos.insert(m.id, i);
-            if m.prop.group != 0 {
-                index.members.entry(m.prop.group).or_default().push(i);
-            }
-            if m.prop.master != 0 {
-                index.slaves.entry(m.prop.master).or_default().push(i);
+            if !anon.contains(&m.ns) {
+                if m.prop.group != 0 {
+                    index.members.entry(m.prop.group).or_default().push(i);
+                }
+                if m.prop.master != 0 {
+                    index.slaves.entry(m.prop.master).or_default().push(i);
+                }
             }
             if let Some(parent) = m.parent().filter(|&p| p != m.id) {
                 index.children.entry(parent).or_default().push(i);
@@ -4804,6 +4942,166 @@ mod tests {
         assert_eq!(shrink(2), Err(Errno::EINVAL));
         assert_eq!(shrink(3), Ok(()));
         assert_eq!(vfs.sb_options(&m), ",size=12k,nr_inodes=5,inode64");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anonymous_ns_mounts_are_skipped_by_propagation() {
+        let (vfs, dir) = sample("anon-prop");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let usr = vfs
+            .resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/usr", true)
+            .unwrap();
+        let sub = vfs
+            .store()
+            .mkdir(usr.ino().unwrap(), b"sub", 0o755, 0, 0)
+            .unwrap();
+        let point = Node::Store(ROOT_MOUNT, sub);
+        // Make / shared and clone it into an anonymous open_tree namespace
+        vfs.set_propagation(ROOT_MOUNT, PropagationType::Shared, false);
+        let anon = vfs.anon_ns(crate::cred::UserNs::init());
+        let cloned = vfs.clone_mount(&Node::ROOT, None, anon.id).unwrap();
+        assert!(vfs.propagation(cloned).group != 0);
+        // Mounting under / must NOT propagate into the unattached anonymous clone
+        assert!(vfs.propagation_targets(ps, (&point, None)).is_empty());
+        // Mounting on /usr/sub in INIT_MNT_NS and unmounting must NOT touch the clone
+        let sub_mnt = vfs.add_mount(
+            Fs::Store,
+            point.clone(),
+            (point.clone(), None),
+            0,
+            Vec::new(),
+            None,
+        );
+        let in_use = std::collections::HashSet::from([cloned]);
+        assert!(!vfs.propagated_busy(sub_mnt, &in_use));
+        vfs.umount_tree(sub_mnt);
+        assert!(vfs.mount(cloned).is_some());
+        drop(anon);
+        assert!(vfs.has_dead_ns());
+        vfs.collect(&std::collections::HashSet::new());
+        assert!(vfs.mount(cloned).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detach_store_point_and_defer_collect_schedule_collection() {
+        let (vfs, dir) = sample("detach-collect");
+        let point_ino = vfs.store().mkdir(ROOT, b"mp", 0o755, 0, 0).unwrap();
+        let (ns, map) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
+        let other_root = map[&ROOT_MOUNT];
+        let mp = Node::Store(other_root, point_ino);
+        let params = TmpfsParams {
+            perm: 0o1777,
+            uid: 0,
+            gid: 0,
+            blocks: 4,
+            inodes: 4,
+            inode64: true,
+        };
+        let t = vfs
+            .new_tmpfs(
+                (mp, Some((Node::Store(other_root, ROOT), b"mp".to_vec()))),
+                0,
+                Vec::new(),
+                params,
+            )
+            .unwrap();
+        assert!(!vfs.released_detached());
+        vfs.detach_store_point((point_ino, ROOT, b"mp"));
+        assert!(vfs.released_detached());
+        vfs.collect(&std::collections::HashSet::new());
+        assert!(vfs.mount(t).is_none());
+        // defer_collect works across threads (kernel-wide flag, not thread-local)
+        vfs.defer_collect();
+        assert!(vfs.released_detached());
+        assert!(!vfs.released_detached());
+        drop(ns);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn protected_symlinks_applies_to_trailing_slash() {
+        struct Protected;
+        impl Pseudo for Protected {
+            fn parent(&self, node: &PseudoNode) -> Option<PseudoNode> {
+                Empty.parent(node)
+            }
+            fn name(&self, mnt: MountId, node: &PseudoNode) -> Vec<u8> {
+                Empty.name(mnt, node)
+            }
+            fn lookup(
+                &self,
+                mnt: MountId,
+                dir: &PseudoNode,
+                name: &[u8],
+            ) -> Result<PseudoNode, Errno> {
+                Empty.lookup(mnt, dir, name)
+            }
+            fn kind(&self, node: &PseudoNode) -> Result<u32, Errno> {
+                Empty.kind(node)
+            }
+            fn readlink(&self, mnt: MountId, node: &PseudoNode) -> Result<Vec<u8>, Errno> {
+                Empty.readlink(mnt, node)
+            }
+            fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {
+                Empty.follow(mnt, node)
+            }
+            fn protected_symlinks(&self) -> bool {
+                true
+            }
+        }
+        let (vfs, dir) = sample("prot-sym-slash");
+        let tmp = vfs.store().mkdir(ROOT, b"sticky", 0o1777, 0, 0).unwrap();
+        vfs.store()
+            .symlink(tmp, b"link", b"/usr", 1000, 1000)
+            .unwrap();
+        let mut other = Cred::root();
+        other.fsuid = 2000;
+        other.fsgid = 2000;
+        other.cap_effective = 0;
+        // Both `/sticky/link` and `/sticky/link/` must be refused with EACCES
+        assert_eq!(
+            vfs.resolve(
+                &Protected,
+                &other,
+                &Node::ROOT,
+                &Node::ROOT,
+                b"/sticky/link",
+                true
+            ),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            vfs.resolve(
+                &Protected,
+                &other,
+                &Node::ROOT,
+                &Node::ROOT,
+                b"/sticky/link/",
+                false
+            ),
+            Err(Errno::EACCES)
+        );
+        // Fast-path Cached::stat must also defer `/sticky/link/` to normal resolution (None)
+        let _ = vfs.store().stat(tmp);
+        let cached = vfs.cached();
+        assert!(cached.stat(ROOT, ROOT, b"/sticky/link/", false).is_none());
+        // Owner can still follow `/sticky/link/`
+        let mut owner = other.clone();
+        owner.fsuid = 1000;
+        assert!(
+            vfs.resolve(
+                &Protected,
+                &owner,
+                &Node::ROOT,
+                &Node::ROOT,
+                b"/sticky/link/",
+                false
+            )
+            .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

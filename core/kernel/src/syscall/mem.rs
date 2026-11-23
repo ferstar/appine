@@ -99,8 +99,9 @@ pub(super) fn mmap(
     }
     // A shared mapping of /dev/zero opened read-only: no write permission, now or later
     let mut deny_write = false;
-    // The path and inode shown for a file mapping in /proc/<pid>/maps
+    // The path and inode shown for a file mapping in /proc/<pid>/maps, and the mount it came from
     let mut label = None;
+    let mut file_mnt = None;
     let mut deny_exec = false;
     let low =
         flags & (flags::MAP_FIXED | flags::MAP_FIXED_NOREPLACE) != 0 && below_min_addr(cx, addr);
@@ -148,6 +149,9 @@ pub(super) fn mmap(
                     return Err(Errno::EACCES);
                 }
                 label = Some((f.path.clone(), *ino));
+                if !f.pseudo {
+                    file_mnt = Some(f.mnt);
+                }
                 if shared_write && !f.writable() {
                     return Err(Errno::EACCES);
                 }
@@ -183,6 +187,9 @@ pub(super) fn mmap(
                 }
                 gpu_mapping = Some(file.mapping(offset, len)?);
                 label = Some((f.path.clone(), *ino));
+                if !f.pseudo {
+                    file_mnt = Some(f.mnt);
+                }
                 deny_write = !f.writable();
                 None
             }
@@ -222,6 +229,7 @@ pub(super) fn mmap(
                 };
                 let ino = cx.vfs()?.fuse().get(h.id).map_or(0, |n| n.attr.ino);
                 label = Some((f.path.clone(), ino));
+                file_mnt = Some(f.mnt);
                 Some((fill.fd(), offset, false))
             }
             FileKind::Path(_) => return Err(Errno::EBADF),
@@ -254,6 +262,9 @@ pub(super) fn mmap(
     }
     if let Some((name, ino)) = label {
         cx.mm_mut().label(start, len, name, ino);
+    }
+    if let Some(mnt) = file_mnt {
+        cx.mm_mut().set_mnt(start, len, mnt);
     }
     if deny_write {
         cx.mm_mut().deny_write(start, len);
@@ -327,6 +338,8 @@ fn remap(
     }
     if flags & MREMAP_DONTUNMAP != 0 {
         let (new, refill) = cx.mm_mut().mremap_dontunmap(old, old_len, fixed)?;
+        // MREMAP_FIXED may have unmapped a destroyed SysV segment's last attachment
+        crate::ipc::reap_shm(cx.k());
         // Map the store file again at the old address of a private file mapping; if it cannot be
         // opened (for example deleted and reclaimed), empty anonymous memory is all that is left
         let vfs = cx.vfs()?;
@@ -340,11 +353,14 @@ fn remap(
                     let flags = flags::MAP_PRIVATE | flags::MAP_FIXED;
                     let src = Some((f.as_raw_fd(), r.offset, false));
                     mm.mmap(r.start, r.len, r.prot, flags, src)?;
-                    mm.label(r.start, r.len, r.name, r.ino);
+                    mm.label(r.start, r.len, r.name.clone(), r.ino);
+                    if let Some(mnt) = r.mnt {
+                        mm.set_mnt(r.start, r.len, mnt);
+                    }
                 }
                 None => mm.map_anonymous(r.start, r.len, r.prot)?,
             }
-            mm.set_locked(r.start, r.len, false)?;
+            mm.apply_refill_flags(&r);
         }
         return Ok(new);
     }
@@ -452,7 +468,7 @@ fn on_noexec(cx: &Cx<'_>, f: &OpenFile) -> bool {
 
 /// Whether mapping at `addr` is refused: below `vm.mmap_min_addr` without `CAP_SYS_RAWIO`
 /// (Linux's cap_mmap_addr, EPERM).
-fn below_min_addr(cx: &Cx<'_>, addr: u64) -> bool {
+pub(super) fn below_min_addr(cx: &Cx<'_>, addr: u64) -> bool {
     use std::sync::atomic::Ordering;
     addr < crate::mm::MMAP_MIN_ADDR.load(Ordering::Relaxed) && !cx.cred().capable(cap::SYS_RAWIO)
 }

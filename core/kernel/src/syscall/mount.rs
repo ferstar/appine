@@ -750,6 +750,7 @@ fn remount(
     if let Some((data, _)) = data
         && m.fs == Fs::Tmpfs
     {
+        super::fs::evict_unlinked_tmpfs(cx.kr(), &vfs);
         remount_tmpfs(&vfs, m.dev, data)?;
     }
     if let Some((_, sb)) = data {
@@ -1347,7 +1348,7 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
     }
     let path = read_path(cx, target)?;
     let node = lookup_at(cx, AT_FDCWD, &path, flags & UMOUNT_NOFOLLOW == 0)?;
-    if !may_mount(cx) {
+    if !may_mount(cx) || (flags & MNT_FORCE != 0 && !cx.cred().capable(cap::SYS_ADMIN)) {
         return Err(Errno::EPERM);
     }
     let vfs = cx.vfs()?;
@@ -1400,16 +1401,19 @@ fn busy(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> bool {
 /// takes its mounts down, and the detached mounts whose last use were the thread's files or
 /// directories go ([`collect_released`]).
 pub(crate) fn collect_unused(k: &crate::kernel::Kernel, vfs: &Vfs) {
+    super::fs::evict_unlinked_tmpfs(k, vfs);
     if vfs.released_detached() || vfs.has_dead_ns() {
         collect_now(k, vfs);
     }
 }
 
-/// At the end of a syscall: a detached mount this thread let go of the last use of goes
+/// At the end of a syscall: a detached mount this thread let go of the last use of, or an
+/// unattached anonymous mount namespace whose last open_tree fd closed, goes
 /// ([`crate::vfs::released`]; a lazily unmounted FUSE mount then aborts its connection, so its
 /// daemon exits).
 pub(super) fn collect_released(k: &crate::kernel::Kernel, vfs: &Vfs) {
-    if vfs.released_detached() {
+    super::fs::evict_unlinked_tmpfs(k, vfs);
+    if vfs.released_detached() || vfs.has_dead_ns() {
         collect_now(k, vfs);
     }
 }
@@ -1476,19 +1480,22 @@ fn waits_on_files_only(nr: u64) -> bool {
 fn collect_now(k: &crate::kernel::Kernel, vfs: &Vfs) {
     match try_in_use(k) {
         Some(used) => vfs.collect(&used),
-        // Something is borrowed (not expected between syscalls): another time
-        None => crate::vfs::released(crate::vfs::ANY_MOUNT),
+        // Something is borrowed (not expected between syscalls): retry on the next pass on any
+        // thread
+        None => vfs.defer_collect(),
     }
 }
 
-/// The mounts that processes' root directories, cwds and open files are in.
+/// The mounts that processes' root directories, cwds, open files, mappings and executables are in.
 fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
-    try_in_use(k).expect("a task's directories or fd table are borrowed")
+    try_in_use(k).expect("a task's directories, address space or fd table are borrowed")
 }
 
-/// [`in_use`], or None when some task's directories, fd table or open file is borrowed.
+/// [`in_use`], or None when some task's directories, address space, fd table or open file is
+/// borrowed.
 fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
     let mut used = HashSet::new();
+    let mut seen_mm = HashSet::new();
     for task in k.tasks.values() {
         let res = task.res.try_borrow().ok()?;
         {
@@ -1496,17 +1503,32 @@ fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
             used.insert(fs.root.mnt());
             used.insert(fs.cwd.mnt());
         }
+        if seen_mm.insert(Rc::as_ptr(&res.mm) as usize) {
+            let mm = res.mm.try_borrow().ok()?;
+            mm.mapped_mounts(&mut used);
+        }
         let fds = res.fds.try_borrow().ok()?;
         for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
             let file = file.try_borrow().ok()?;
             if let Some(node) = file.node() {
                 used.insert(node.mnt());
+            } else if matches!(file.kind, FileKind::MessageQueue(_)) && !file.pseudo {
+                used.insert(file.mnt);
             }
             if let crate::fd::FileKind::Pty(end) = &file.kind
                 && end.pin
             {
                 used.insert(end.mnt);
             }
+        }
+    }
+    for group in k.groups.values() {
+        let g = group.try_borrow().ok()?;
+        if !g.threads.is_empty()
+            && let Some(exe) = &g.exe
+            && let Some(mnt) = exe.mnt()
+        {
+            used.insert(mnt);
         }
     }
     Some(used)

@@ -404,6 +404,9 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         accmode | (flags & oflags::O_NONBLOCK),
         Some(path),
     );
+    // Opened via mq_open on the IPC namespace's internal mqueue instance (Linux's alloc_file_pseudo),
+    // not through a user-visible mqueue mount.
+    file.borrow_mut().pseudo = true;
     // Always close-on-exec, as on Linux; when out of fds (EMFILE) the new queue is not left behind
     let fd = cx.fds_mut().install(file, true, 0)?;
     insert_queue(cx.ipc_mut(), name, queue);

@@ -698,6 +698,21 @@ impl ExeFile {
             ovl: ovl.map(|(mnt, o)| (mnt, o, Hold::new(o))),
         }
     }
+
+    /// The mount the program file was executed through (store or overlay), when known.
+    pub(crate) fn mnt(&self) -> Option<MountId> {
+        self.node
+            .map(|(mnt, _)| mnt)
+            .or_else(|| self.ovl.as_ref().map(|(mnt, _, _)| *mnt))
+    }
+}
+
+impl Drop for ExeFile {
+    fn drop(&mut self) {
+        if let Some(mnt) = self.mnt() {
+            crate::vfs::released(mnt);
+        }
+    }
 }
 
 /// A deleted program file ([`crate::pseudo::PseudoNode::OpenExe`], obtained by following

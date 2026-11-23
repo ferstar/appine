@@ -203,14 +203,14 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             221 => {
                 let tid = cx.tid();
                 match proc::execve(cx, cpu, a[0], a[1], a[2]) {
-                    Ok(()) => return exec_done(cx, cpu, tid),
+                    Ok(doomed) => return exec_done(cx, cpu, tid, doomed),
                     Err(e) => Err(e),
                 }
             }
             281 => {
                 let tid = cx.tid();
                 match proc::execveat(cx, cpu, a[0] as i32, a[1], (a[2], a[3]), a[4] as u32) {
-                    Ok(()) => return exec_done(cx, cpu, tid),
+                    Ok(doomed) => return exec_done(cx, cpu, tid, doomed),
                     Err(e) => Err(e),
                 }
             }
@@ -722,9 +722,16 @@ fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
 
 /// execve succeeded (`old_tid` is the tid before): when traced, reports the exec
 /// (`PTRACE_EVENT_EXEC` or SIGTRAP) and the system call exit, and delivers signals before the
-/// first instruction of the new program runs.
-fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid) -> Flow {
+/// first instruction of the new program runs. A doomed image failed after the point of no return
+/// and dies by forced `SIGSEGV` without reporting a successful exec or syscall exit.
+fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid, doomed: bool) -> Flow {
     crate::ptrace::exec_hw_flush(cx, cpu);
+    if doomed {
+        return match signal::deliver(cx, cpu, false) {
+            Flow::Exit => Flow::Exit,
+            _ => Flow::Exec,
+        };
+    }
     if !crate::ptrace::traced(cx.task) {
         return Flow::Exec;
     }

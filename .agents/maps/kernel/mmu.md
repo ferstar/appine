@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: widen fault_in soft-PTE fill span to 16 MiB for read-only non-FUSE file mappings and prefill on MADV_WILLNEED/MADV_POPULATE_READ)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve existing soft-PTE entries on allocation failure via prefill_pages)
 
 ## Responsibilities
 
@@ -29,8 +29,8 @@ Root:
 - `core/engine/src/c/cpu.c` and `core/engine/src/c/internal.h` — the per-thread software TLB and
   Tier 0 refill.
 - In `core/kernel/src/mm.rs`: the `Consistency and code` section, and the `Mm` methods that fill
-  entries (`map_pages`, `fault_in`) and keep threads consistent (`add_user`, `remove_user`,
-  `generations`, `code_space`, `invalidate_code`, `sync`, `quiesce`, `shootdown`).
+  entries (`map_pages`, `prefill_pages`, `fault_in`) and keep threads consistent (`add_user`,
+  `remove_user`, `generations`, `code_space`, `invalidate_code`, `sync`, `quiesce`, `shootdown`).
 
 Outside the module: VMAs, the fault policy and what each change records for `sync` (`kernel/mm`);
 `fork` and copy-on-write (`kernel/cow`); host backing and deferred unmapping (`kernel/hostmem`);
@@ -84,16 +84,20 @@ fast path and refill (`engine/dbt`).
   `invalidate_code`; `Cpu::tlb_flush`.
 - **After changes**: `sync` (after BKL syscalls, `ic ivau` exits, `write_force`, truncation and
   file moves), `quiesce` (fork, membarrier, `sync`), `shootdown` (CoW re-pointing an entry).
-- **Entries**: `fault_in` (the fault path), `mmu().translate`, `map_pages` (inside `kernel/mm`).
+- **Entries**: `fault_in` (the fault path), `mmu().translate`, `map_pages` and `prefill_pages`
+  (inside `kernel/mm`).
 - **Tier 0**: `appine_tlb_fill` on a TLB miss.
 
 ## Data flow / lifecycle
 
 ### Page-table entries
 
-- `map_pages` builds entries eagerly when the part of the VMA before EOF is at most 1 MB, or when
-  the mapping is executable and not private anonymous (file mappings, shared anonymous, SysV shm).
-  `PROT_NONE` mappings get none. If building them fails it removes every entry of the range.
+- `map_pages` builds entries eagerly for new mappings when the part of the VMA before EOF is at
+  most 1 MB, or when the mapping is executable and not private anonymous (file mappings, shared
+  anonymous, SysV shm). `PROT_NONE` mappings get none. If building them fails it removes every
+  entry of the range. For existing or already-moved VMAs (`mprotect` out of `PROT_NONE`, `mremap`
+  moves), `prefill_pages` performs the same eager `fill_shared` as best-effort without unmapping
+  on failure, leaving existing entries intact so any unfilled pages fault in on demand.
 - Larger mappings are filled on demand by `fault_in`. It fails if no VMA covers the page, the page
   is at or past EOF, the VMA prot (with write implying read) lacks the access, or the page already
   has an entry (including a prot-0 one). Otherwise it fills every empty slot of the 2 MB leaf range
@@ -222,10 +226,7 @@ fast path and refill (`engine/dbt`).
 
 ## Confirmed bugs / technical debt
 
-- **A failed page-table allocation drops entries with contents:** `map_pages` removes every entry
-  of its range when building them fails, so an mprotect making a small `PROT_NONE` anonymous VMA
-  accessible again can lose the entries kept for its pages (fork and RSS then miss them), and a
-  move failing there loses the moved VMA; this needs a host allocation failure.
+- None.
 
 ## Open questions
 

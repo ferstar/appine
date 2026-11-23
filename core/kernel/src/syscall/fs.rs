@@ -586,6 +586,10 @@ fn open_path_with(
         Node::Overlay(mnt, o) => Some((*mnt, *o)),
         _ => None,
     };
+    let mq_mnt = match &node {
+        Node::Pseudo(mnt, PseudoNode::Mq(..)) => Some(*mnt),
+        _ => None,
+    };
     let kind = if flags & oflags::O_PATH != 0 {
         if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
@@ -646,6 +650,9 @@ fn open_path_with(
         file.borrow_mut().mnt = mnt;
     }
     if let Some(mnt) = fuse_mnt {
+        file.borrow_mut().mnt = mnt;
+    }
+    if let Some(mnt) = mq_mnt {
         file.borrow_mut().mnt = mnt;
     }
     if let Some((mnt, o)) = overlay {
@@ -5402,8 +5409,11 @@ pub(super) fn faccessat(
     )?;
     if let Node::Fuse(_, f) = node {
         let vfs = cx.vfs()?;
-        super::fuse::access(cx, &vfs, &cred, f, amode)?;
         let kind = vfs.kind(&cx.view(&vfs), &node)?;
+        if access_noexec(&vfs, &node, amode, kind) {
+            return Err(Errno::EACCES);
+        }
+        super::fuse::access(cx, &vfs, &cred, f, amode)?;
         if amode & MAY_WRITE != 0
             && matches!(kind, mode::S_IFREG | mode::S_IFDIR | mode::S_IFLNK)
             && vfs.readonly(&node)
@@ -5423,6 +5433,12 @@ pub(super) fn faccessat(
         gid: word(28),
         ..Stat::default()
     };
+    // Asking whether a regular file on a noexec mount can be executed is EACCES (Linux's
+    // do_faccessat path_noexec check; memfds live on an internal tmpfs and ignore noexec)
+    let is_memfd = matches!(node, Node::Store(_, ino) if cx.kr().seals.contains_key(&ino));
+    if !is_memfd && access_noexec(&*cx.vfs()?, &node, amode, st.mode & mode::S_IFMT) {
+        return Err(Errno::EACCES);
+    }
     // R_OK, W_OK, X_OK have the same values as MAY_READ, MAY_WRITE, MAY_EXEC
     cred.permission(&st, amode)?;
     // Asking whether a regular file, directory or symlink in a read-only mount can be written is
@@ -5734,6 +5750,7 @@ fn statfs_of(cx: &mut Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
     // tmpfs reports by pages and inodes (Linux's shmem_statfs): an unlimited item is all 0s;
     // usage is counted afresh
     if let Some(dev) = vfs.tmpfs_dev(node) {
+        evict_unlinked_tmpfs(cx.kr(), &vfs);
         let (p, pages, inodes) = vfs.tmpfs_usage(dev, true)?;
         let free = p.blocks.saturating_sub(pages);
         let s = appine_hal::FsStats {
@@ -6202,7 +6219,7 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
                 let gone = not_mount_point(cx, &store_vfs, dir, name)?;
                 let tmpfs = tmpfs_victim(&store_vfs, (mnt, dir), name)?;
                 store.rmdir(dir, name)?;
-                tmpfs_removed(&store_vfs, tmpfs);
+                tmpfs_removed(cx, &store_vfs, tmpfs);
                 detach_points(cx, &store_vfs, gone, (dir, name));
             }
         }
@@ -6231,7 +6248,7 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
         let tmpfs = tmpfs_victim(&store_vfs, (mnt, dir), name)?;
         let held = gone.filter(|&ino| store.held(ino).unwrap_or(false));
         store.unlink(dir, name)?;
-        tmpfs_removed(&store_vfs, tmpfs);
+        tmpfs_removed(cx, &store_vfs, tmpfs);
         release_if_closed(cx, &store_vfs, held);
         detach_points(cx, &store_vfs, gone, (dir, name));
         if let Some(ino) = victim {
@@ -6729,7 +6746,7 @@ pub(super) fn renameat2(
         flags & RENAME_NOREPLACE != 0,
         exchange,
     )?;
-    tmpfs_removed(&vfs, replaced);
+    tmpfs_removed(cx, &vfs, replaced);
     // Detach the mounts of other namespaces on the overwritten target
     if !exchange && overwritten != moving {
         release_if_closed(cx, &vfs, held);
@@ -7709,18 +7726,18 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     check_seals(cx, &f, zero, |size| if keep { size } else { size.max(end) })?;
     // In tmpfs the pages of the range that have none must all fit (Linux's shmem_fallocate gets
     // them one by one and undoes them on ENOSPC); punching needs none
-    if let Some((dev, own)) = tmpfs
+    if let Some(t) = tmpfs
         && mode & FALLOC_FL_PUNCH_HOLE == 0
     {
         let fits = || -> Result<bool, Errno> {
-            let Some(room) = vfs.tmpfs_room(dev, own)? else {
+            let Some(room) = vfs.tmpfs_room(t.dev, t.pages)? else {
                 return Ok(true);
             };
-            let free = room.saturating_sub(own) + reserved_unwritten(host, size, own);
+            let free = room.saturating_sub(t.pages) + reserved_unwritten(host, size, t.pages);
             Ok(pages_needed(host, size, offset, end, free).is_ok())
         };
         // A recorded usage that may have drifted is counted again before refusing
-        let room = fits()? || vfs.tmpfs_recount(dev)? && fits()?;
+        let room = fits()? || vfs.tmpfs_recount(t.dev)? && fits()?;
         if !room {
             return Err(Errno::ENOSPC);
         }
@@ -8171,24 +8188,48 @@ pub(super) fn tmpfs_created(vfs: &Vfs, dev: Option<u64>, pages: u64) {
     }
 }
 
+/// Whether `faccessat` is asking for `X_OK` on a regular file in a `noexec` mount.
+fn access_noexec(vfs: &Vfs, node: &Node, amode: u32, kind: u32) -> bool {
+    amode & MAY_EXEC != 0
+        && kind == mode::S_IFREG
+        && vfs.mount_flags(node).is_some_and(|m| m & ms::NOEXEC != 0)
+}
+
+/// Snapshot of a tmpfs regular file before a size change, passed to [`tmpfs_resized`].
+#[derive(Clone, Copy)]
+struct TmpfsFile {
+    dev: u64,
+    ino: Ino,
+    pages: u64,
+}
+
+/// Snapshot of a tmpfs entry about to be removed, passed to [`tmpfs_removed`].
+struct TmpfsVictim {
+    dev: u64,
+    ino: Ino,
+    pages: u64,
+    last_reg: bool,
+}
+
 /// Writing a regular file in tmpfs: writes until the instance is full (Linux's
 /// `shmem_write_begin` asks page by page and returns what was already written when it cannot get
 /// one), ENOSPC when not even a page can be written; pages that already hold data need nothing.
-/// Returns the number of bytes allowed, plus the device number and the page count before the
-/// write that the accounting needs afterwards ([`tmpfs_resized`]).
+/// Returns the number of bytes allowed, plus the file snapshot that the accounting needs
+/// afterwards ([`tmpfs_resized`]).
 fn tmpfs_write_room(
     cx: &Cx<'_>,
     f: &OpenFile,
     offset: Option<u64>,
     len: usize,
-) -> Result<(usize, Option<(u64, u64)>), Errno> {
+) -> Result<(usize, Option<TmpfsFile>), Errno> {
     let FileKind::Regular { ino, file, .. } = &f.kind else {
         return Ok((len, None));
     };
     let vfs = cx.vfs()?;
-    let Some(t @ (dev, own)) = tmpfs_size(&vfs, &Node::Store(f.mnt, *ino), file)? else {
+    let Some(t) = tmpfs_size(&vfs, &Node::Store(f.mnt, *ino), file)? else {
         return Ok((len, None));
     };
+    let (dev, own) = (t.dev, t.pages);
     if len == 0 || vfs.tmpfs_room(dev, own)?.is_none() {
         return Ok((len, Some(t)));
     }
@@ -8285,14 +8326,20 @@ fn reserved_unwritten(host: &std::fs::File, size: u64, own: u64) -> u64 {
     own.saturating_sub(data)
 }
 
-/// When `node` (a regular file, `host` on the host) is in tmpfs, that instance's device number
-/// and the pages the file's object takes: after it changes, they go to [`tmpfs_resized`] for
-/// accounting.
-fn tmpfs_size(vfs: &Vfs, node: &Node, host: &std::fs::File) -> Result<Option<(u64, u64)>, Errno> {
+/// When `node` (a regular file, `host` on the host) is in tmpfs, records its instance device,
+/// inode and host page count: after it changes, they go to [`tmpfs_resized`] for accounting.
+fn tmpfs_size(vfs: &Vfs, node: &Node, host: &std::fs::File) -> Result<Option<TmpfsFile>, Errno> {
     let Some(dev) = vfs.tmpfs_dev(node) else {
         return Ok(None);
     };
-    Ok(Some((dev, object_pages(host)?)))
+    let Some(ino) = node.ino() else {
+        return Ok(None);
+    };
+    Ok(Some(TmpfsFile {
+        dev,
+        ino,
+        pages: object_pages(host)?,
+    }))
 }
 
 /// The pages a regular file's object takes on the host (holes take none).
@@ -8303,24 +8350,25 @@ fn object_pages(host: &std::fs::File) -> Result<u64, Errno> {
 }
 
 /// A regular file in tmpfs was written, truncated, reserved or punched: accounts the difference
-/// in pages ([`tmpfs_size`] recorded the old count).
-fn tmpfs_resized(vfs: &Vfs, tmpfs: Option<(u64, u64)>, host: &std::fs::File) {
-    if let Some((dev, own)) = tmpfs
+/// in pages ([`tmpfs_size`] recorded the old count) and keeps any unlinked-open record in sync.
+fn tmpfs_resized(vfs: &Vfs, tmpfs: Option<TmpfsFile>, host: &std::fs::File) {
+    if let Some(t) = tmpfs
         && let Ok(pages) = object_pages(host)
     {
-        vfs.tmpfs_charge(dev, pages as i64 - own as i64, 0);
+        vfs.tmpfs_charge(t.dev, pages as i64 - t.pages as i64, 0);
+        vfs.tmpfs_update_unlinked(t.dev, t.ino, pages);
     }
 }
 
 /// Before deleting `name` in directory `dir` (unlink, rmdir, overwritten by rename): in tmpfs,
-/// records what it takes: one inode for the name, plus its pages when the last link is deleted
-/// (Linux frees them only at the last close; here they are freed at deletion). Handed to
+/// records the instance device, inode, pages and whether this removes the last link of a regular
+/// file (which stays charged until its last open descriptor or mapping closes). Handed to
 /// [`tmpfs_removed`] after the deletion.
 fn tmpfs_victim(
     vfs: &Vfs,
     (mnt, dir): (MountId, Ino),
     name: &[u8],
-) -> Result<Option<(u64, u64)>, Errno> {
+) -> Result<Option<TmpfsVictim>, Errno> {
     let Some(dev) = vfs.tmpfs_dev(&Node::Store(mnt, dir)) else {
         return Ok(None);
     };
@@ -8328,19 +8376,123 @@ fn tmpfs_victim(
         return Ok(None);
     };
     let st = vfs.store().stat(ino)?;
+    let last_reg = st.kind() == mode::S_IFREG && st.nlink <= 1;
     let pages = if st.is_dir() || st.nlink <= 1 {
         crate::vfs::tmpfs_pages(&st)
     } else {
         0
     };
-    Ok(Some((dev, pages)))
+    Ok(Some(TmpfsVictim {
+        dev,
+        ino,
+        pages,
+        last_reg,
+    }))
 }
 
-/// The name [`tmpfs_victim`] recorded has been deleted: accounts it.
-fn tmpfs_removed(vfs: &Vfs, victim: Option<(u64, u64)>) {
-    if let Some((dev, pages)) = victim {
-        vfs.tmpfs_charge(dev, -(pages as i64), -1);
+/// The name [`tmpfs_victim`] recorded has been deleted: accounts it, keeping an unlinked regular
+/// file's pages and one inode charged while open or mapped (Linux's `shmem_evict_inode`).
+fn tmpfs_removed(cx: &Cx<'_>, vfs: &Vfs, victim: Option<TmpfsVictim>) {
+    if let Some(v) = victim {
+        if v.last_reg && file_in_use(cx.kr(), v.ino) {
+            vfs.tmpfs_unlinked(v.dev, v.ino, v.pages);
+        } else {
+            vfs.tmpfs_charge(v.dev, -(v.pages as i64), -1);
+        }
     }
+}
+
+/// Whether regular store inode `ino` is still held open (fd table, AF_UNIX inflight, loop
+/// backing), mapped, or running as an executable.
+fn file_in_use(k: &crate::kernel::Kernel, ino: Ino) -> bool {
+    let has_reg = |files: &[FileRef]| {
+        files.iter().any(|f| {
+            f.try_borrow()
+                .is_ok_and(|f| matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino))
+        })
+    };
+    if !opens_of(k, ino).is_empty()
+        || has_reg(&crate::unix::inflight_files(k))
+        || has_reg(&k.loops.backing_files())
+    {
+        return true;
+    }
+    if k.tasks
+        .values()
+        .any(|t| t.res.borrow().mm.borrow().maps_ino(ino))
+    {
+        return true;
+    }
+    k.groups.values().any(|g| {
+        let g = g.borrow();
+        !g.threads.is_empty()
+            && g.exe
+                .as_ref()
+                .is_some_and(|e| e.node.is_some_and(|(_, i)| i == ino))
+    })
+}
+
+/// Releases tmpfs page and inode charges for unlinked regular files whose last descriptor,
+/// mapping or executable reference has gone away (and refreshes page counts of live ones).
+pub(crate) fn evict_unlinked_tmpfs(k: &crate::kernel::Kernel, vfs: &Vfs) {
+    if !vfs.has_unlinked_tmpfs() {
+        return;
+    }
+    let mut live: std::collections::HashMap<Ino, Option<u64>> = std::collections::HashMap::new();
+    let record =
+        |live: &mut std::collections::HashMap<Ino, Option<u64>>, file: &FileRef| -> Option<()> {
+            let f = file.try_borrow().ok()?;
+            if let FileKind::Regular { ino, file, .. } = &f.kind {
+                let pages = object_pages(file).ok();
+                let entry = live.entry(*ino).or_insert(None);
+                if entry.is_none() {
+                    *entry = pages;
+                }
+            }
+            Some(())
+        };
+    let mut seen_mm = std::collections::HashSet::new();
+    for task in k.tasks.values() {
+        let Ok(res) = task.res.try_borrow() else {
+            return;
+        };
+        if seen_mm.insert(Rc::as_ptr(&res.mm) as usize) {
+            let Ok(mm) = res.mm.try_borrow() else {
+                return;
+            };
+            mm.mapped_inos(&mut live);
+        }
+        let Ok(fds) = res.fds.try_borrow() else {
+            return;
+        };
+        for fd in fds.open_fds() {
+            if let Ok(file) = fds.get(fd)
+                && record(&mut live, &file).is_none()
+            {
+                return;
+            }
+        }
+    }
+    for file in crate::unix::inflight_files(k)
+        .into_iter()
+        .chain(k.loops.backing_files())
+    {
+        if record(&mut live, &file).is_none() {
+            return;
+        }
+    }
+    for group in k.groups.values() {
+        let Ok(g) = group.try_borrow() else {
+            return;
+        };
+        if !g.threads.is_empty()
+            && let Some(exe) = &g.exe
+            && let Some((_, ino)) = exe.node
+        {
+            live.entry(ino).or_insert(None);
+        }
+    }
+    vfs.evict_tmpfs(&live);
 }
 
 // ---- Shared helpers ----

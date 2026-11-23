@@ -322,7 +322,8 @@ impl Machine {
             &root,
             &image,
         );
-        crate::syscall::label_image(&mut mm, &image, (&exe, ino_of(program)), interp);
+        let main_mnt = walked.as_ref().map(|(n, _)| n.mnt());
+        crate::syscall::label_image(&mut mm, &image, (&exe, ino_of(program), main_mnt), interp);
         // Record the program file as execve does (ETXTBSY, the key of pooled translations, the
         // group sharing translations)
         mm.exe = Some(ino_of(program)).filter(|&ino| ino != 0);
