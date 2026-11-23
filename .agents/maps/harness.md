@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: open ping_group_range before cargo test in ci.yml)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: Full tests shards for gVisor socket and long-running selections)
 
 ## Responsibilities
 
@@ -124,8 +124,9 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
     `appine-run` artifact (`retention-days: 7`, `overwrite: true`).
   - `checks`: runs in parallel with `build` and `difftest` — the network test, a 200,000-iteration
     lockstep run, and the engine/lockstep tests built with clang.
-  - `difftest` (`needs: [changed, build]`, `fail-fast: false`): five independent single-lane
-    shards (`gvisor-process`, `gvisor`, `starnix`, `core-1`, `core-2`) that partition
+  - `difftest` (`needs: [changed, build]`, `fail-fast: false`): nine independent single-lane
+    shards (`gvisor-process`, `gvisor`, `gvisor-inet`, `gvisor-unix-address`, `gvisor-unix-pairs`,
+    `gvisor-slow`, `starnix`, `core-1`, `core-2`) that partition
     `tests/diff/*.sh` deterministically without installing Rust. Each shard downloads and
     `chmod +x`s `appine-run`, restores `target/rootfs` and (if needed) its suite cache with the
     builder script as fallback, opens `ping_group_range`, runs `scripts/difftest -R` on its slice

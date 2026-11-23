@@ -118,7 +118,11 @@ for bin in "$@"; do
         code=$?
         out=$(cat gtest.out)
         case $out in
-        *"[       OK ] $t"*) r=ok ;;
+        *"[       OK ] $t"*)
+            # Teardown can fail after GoogleTest prints the case result.
+            r=ok
+            [ "$code" = 0 ] || r="exit $code"
+            ;;
         *"[  SKIPPED ] $t"*) r=skipped ;;
         *"[  FAILED  ] $t"*) r=failed ;;
         *) r="exit $code" ;;
