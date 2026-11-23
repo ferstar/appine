@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: 2 MiB-align top-down find_free allocations of at least LEAF_SPAN when space permits)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: forward non-destructive madvise hints outside BKL via AdviseRange and prefill read-only file soft PTEs on MADV_WILLNEED/MADV_POPULATE_READ)
 
 ## Responsibilities
 
@@ -68,7 +68,9 @@ reads (`kernel/fuse`) and the host abstraction layer (`core/hal`).
   `[vvar]`, whose host memory is shared with forked children).
 - `flags` — guest ABI values of the `MAP_*` flags the mm interprets.
 - `Refill` — the private-file piece re-mapped at the old address after `MREMAP_DONTUNMAP`;
-  `Reread` — a written private-file piece the syscall reads back after `MADV_DONTNEED`.
+  `Reread` — a written private-file piece the syscall reads back after `MADV_DONTNEED`;
+  `AdviseRange` — a host-page-aligned slice of a retained `Arc<HostRegion>` passed outside the BKL
+  for non-destructive `madvise` hints.
 - `WANTED` (thread-local) — the page of a `Fill` a kernel access found not read, for the syscall
   dispatcher (`take_wanted`).
 - `UserSlice` — an unchecked guest range passed to kernel-side accessors.
@@ -296,7 +298,14 @@ signals may still be delivered).
   `DONTFORK`/`DOFORK`) needs the range fully mapped (`ENOMEM`), splits the VMAs at its ends and
   sets the flag. Whether the range is locked (`MADV_DONTNEED` is `EINVAL`) or all private anonymous
   (`MADV_FREE` and `MADV_WIPEONFORK` otherwise `EINVAL`) is judged over the VMAs overlapping it
-  only. Advice not listed here returns 0 and does nothing.
+  only. Non-destructive access hints (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`,
+  `MADV_WILLNEED`, `MADV_POPULATE_READ`) are forwarded to host `madvise` (`appine_hal::advise`)
+  with the BKL released while retaining each VMA's `Arc<HostRegion>` (`AdviseRange`, skipping
+  reserved, foreign, GPU and FUSE `Fill` VMAs, clipping to `file_len` and coalescing adjacent
+  slices of one region; `NORMAL`/`RANDOM`/`SEQUENTIAL` apply only to file-backed host mappings so
+  anonymous/recycled host VMAs are not split; `WILLNEED`/`POPULATE_READ` skip untouched anonymous
+  VMAs, pass `MADV_WILLNEED` to the host and prefill read-only non-FUSE file soft PTEs up to 4 GB
+  per call without touching host pages). Other advice not listed here returns 0 and does nothing.
 - `MADV_DONTNEED` (`discard`): private anonymous memory goes back to the host and reads zero
   (CoW pages settled first via `kernel/cow`); the written pages of a private file mapping before
   EOF go back to the file's contents: whole host pages through `kernel/hostmem`'s
@@ -396,7 +405,7 @@ signals may still be delivered).
 - `kernel/mmu`: page-table entries (`map_pages`, `fill_shared`, `map_shared`, `protect_shared`,
   `move_entries`), `sync`, `quiesce`, `shootdown`, code groups.
 - `appine_hal`: host `mmap`/`munmap` wrappers (`map_file_over`, `populate`), `fstat`, `msync`,
-  `mincore`-based residency, memfds, `page_size`.
+  `advise`, `mincore`-based residency, memfds, `page_size`.
 - `kernel/vdso`: the image to refill (`image`, `svc_image`), the clock entries and their stubs
   (`clocks`, `svc_bytes`), the host's vvar, and its identity as a trusted translation source.
 - `kernel/fuse` through `Fill::source` (the open file a `Fill` keeps open; reading is the
@@ -443,8 +452,11 @@ signals may still be delivered).
   access to an unread page reruns the whole syscall, so a syscall other than read/write, pread,
   pwrite and the vector forms (whose buffers the dispatcher reads in first) repeats what it did
   before the copy, or returns a short count after a partial transfer.
-- **Some madvise advice is ignored:** `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*` are accepted
-  but do nothing, and `MADV_FREE`, `MADV_COLD` and `MADV_PAGEOUT` are not refused on locked ranges.
+- **Some madvise advice is ignored or approximate:** `MADV_DONTNEED_LOCKED` and
+  `MADV_POPULATE_WRITE` are accepted but do nothing, `MADV_POPULATE_READ` runs advisory host
+  readahead and read-only file soft-PTE prefill rather than faulting pages or failing on
+  inaccessible ranges, and `MADV_FREE`, `MADV_COLD` and `MADV_PAGEOUT` are not refused on locked
+  ranges.
 - **Past-EOF faults ignore permissions:** a `PROT_NONE` or write-to-read-only access past EOF gets
   `SIGBUS` instead of `SIGSEGV`/`SEGV_ACCERR`, and private file mappings never see file growth.
 - **Linux VMA boundaries are approximated:** anonymous pieces join regardless of Linux's page

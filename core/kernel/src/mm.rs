@@ -130,6 +130,15 @@ const EAGER_MAX: u64 = 1 << 20;
 /// ([`Mm::touched_windows`]).
 const LEAF_SPAN: u64 = PAGE_SIZE << 9;
 
+/// On-demand filling span for large read-only file mappings (16 MiB = 8 leaf tables): aligned
+/// 2 MiB chunks become L2 superpages without touching host pages, reducing BKL serialization when
+/// multiple threads stream through a large file (such as model weights).
+const FILE_FAULT_SPAN: u64 = 8 * LEAF_SPAN;
+
+/// Cap on soft page-table prefill per `madvise(MADV_WILLNEED | MADV_POPULATE_READ)` call
+/// (4 GiB = at most 2048 L2 superpage entries, ~16 KiB of L2 tables).
+const FILE_PREFILL_MAX: u64 = 4 << 30;
+
 /// The largest span [`Mm::touched_windows`] reports, so per-page records (pagemap, mincore) stay
 /// small.
 const WINDOW_MAX: u64 = 1 << 30;
@@ -169,6 +178,28 @@ pub struct Refill {
     pub ino: u64,
     pub offset: u64,
     pub name: Option<Rc<[u8]>>,
+}
+
+/// A host-page-aligned slice of a live [`HostRegion`] retained across a BKL release so
+/// non-destructive `madvise(2)` hints can run without holding the BKL.
+pub struct AdviseRange {
+    _region: Arc<HostRegion>,
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: `_region` keeps the host mapping alive for the lifetime of `AdviseRange`, and
+// `AdviseRange` is only used for non-destructive `madvise(2)` hints on `[ptr, ptr + len)`.
+unsafe impl Send for AdviseRange {}
+
+impl AdviseRange {
+    /// Forwards non-destructive `advice` to host `madvise(2)` while retaining the backing host
+    /// mapping.
+    pub fn apply(self, advice: i32) {
+        // SAFETY: `self._region` keeps `[self.ptr, self.ptr + self.len)` mapped and
+        // host-page-aligned for the duration of the call.
+        let _ = unsafe { appine_hal::advise(self.ptr, self.len, advice) };
+    }
 }
 
 /// A file mapping whose pages are read from the file only when first touched (a FUSE file: there
@@ -1136,11 +1167,12 @@ impl Mm {
 
     /// On-demand filling ([`EAGER_MAX`]): called when a guest access to `addr` faults, or when the
     /// kernel layer reads or writes it. If the page has no entry yet and its VMA allows the access
-    /// (`need`), builds the entries of every page in the same leaf table (2 MB) that belongs to
-    /// this VMA and has none yet, and returns true; retrying the access then works. Pages of a
-    /// file mapping past the end of the file get none ([`Mm::fault_past_eof`]). Needs only a
-    /// shared borrow: it is also called when the kernel layer reads or writes another process's
-    /// memory (ptrace, process_vm_readv), and it only adds entries, so no TLB flush is needed.
+    /// (`need`), builds the entries of every page in the same leaf table (2 MB, or
+    /// [`FILE_FAULT_SPAN`] for read-only non-FUSE file mappings) that belongs to this VMA and has
+    /// none yet, and returns true; retrying the access then works. Pages of a file mapping past
+    /// the end of the file get none ([`Mm::fault_past_eof`]). Needs only a shared borrow: it is
+    /// also called when the kernel layer reads or writes another process's memory (ptrace,
+    /// process_vm_readv), and it only adds entries, so no TLB flush is needed.
     pub fn fault_in(&self, addr: u64, need: u32) -> bool {
         let page = addr & !(PAGE_SIZE - 1);
         let Some((&s, v)) = self.vmas.range(..=page).next_back() else {
@@ -1154,8 +1186,13 @@ impl Mm {
         if self.mmu.next_present(page, page + PAGE_SIZE) == page {
             return false;
         }
-        let lo = (page & !(LEAF_SPAN - 1)).max(s);
-        let hi = ((page | (LEAF_SPAN - 1)) + 1).min(end);
+        let span = if v.file_id.is_some() && v.fill.is_none() && v.prot & prot::WRITE == 0 {
+            FILE_FAULT_SPAN
+        } else {
+            LEAF_SPAN
+        };
+        let lo = (page & !(span - 1)).max(s);
+        let hi = ((page | (span - 1)) + 1).min(end);
         let Some(fill) = &v.fill else {
             // SAFETY: [lo, hi) is inside the part of this VMA with contents, and it holds the host
             // memory
@@ -2824,6 +2861,116 @@ impl Mm {
             anon &= v.backing == Backing::Anonymous;
         }
         Ok((locked, anon))
+    }
+
+    /// Prefills soft page-table entries for read-only non-FUSE file mappings in `[addr, addr + len)`
+    /// (`MADV_WILLNEED`, `MADV_POPULATE_READ`), capped at [`FILE_PREFILL_MAX`] bytes per call.
+    /// Touches no host pages and leaves existing entries and pages past EOF untouched.
+    pub fn prefill_file_ptes(&self, addr: u64, len: u64) {
+        let end = addr.saturating_add(len);
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        let mut budget = FILE_PREFILL_MAX;
+        for (&s, v) in self
+            .vmas
+            .range(first..end)
+            .filter(|&(&s, v)| s + v.len > addr)
+        {
+            if budget == 0 {
+                break;
+            }
+            if v.file_id.is_none()
+                || v.fill.is_some()
+                || v.foreign()
+                || v.region.gpu.is_some()
+                || v.prot & prot::READ == 0
+                || v.prot & prot::WRITE != 0
+            {
+                continue;
+            }
+            let from = addr.max(s) & !(PAGE_SIZE - 1);
+            let to = page_up(end.min(s + v.file_len))
+                .unwrap_or(s + v.file_len)
+                .min(s + v.file_len);
+            if from >= to {
+                continue;
+            }
+            let span = (to - from).min(budget);
+            // SAFETY: [from, from + span) is inside this VMA before EOF, which holds the host
+            // memory.
+            let host = unsafe { v.host.add((from - s) as usize) };
+            if unsafe { self.mmu.fill_shared(from, host, span, mmu_prot(v.prot)) }.is_err() {
+                break;
+            }
+            budget -= span;
+        }
+    }
+
+    /// Collects host-page-aligned slices of live host regions overlapping `[addr, addr + len)` for
+    /// non-destructive `madvise(2)` hints executed after releasing the BKL.
+    ///
+    /// Skips reserved (`PROT_NONE`), foreign (`[vvar]`), GPU, and FUSE on-demand mappings, and
+    /// clips ranges to `file_len` so pages past EOF are never advised. When `file_only` is true
+    /// (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`), only file-backed host mappings are
+    /// included so anonymous and recycled host VMAs are never split; otherwise (`MADV_WILLNEED`,
+    /// `MADV_POPULATE_READ`), untouched anonymous VMAs are still skipped.
+    pub fn advise_ranges(&self, addr: u64, len: u64, file_only: bool) -> Vec<AdviseRange> {
+        let end = addr.saturating_add(len);
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        let page = appine_hal::page_size();
+        let mut out: Vec<AdviseRange> = Vec::new();
+        for (&s, v) in self
+            .vmas
+            .range(first..end)
+            .filter(|&(&s, v)| s + v.len > addr)
+        {
+            if v.reserved() || v.foreign() || v.region.gpu.is_some() || v.fill.is_some() {
+                continue;
+            }
+            if file_only {
+                if v.file_id.is_none() || v.region.anonymous.is_some() {
+                    continue;
+                }
+            } else if v.backing == Backing::Anonymous && !v.written.get() {
+                continue;
+            }
+            let from = addr.max(s);
+            let to = end.min(s + v.file_len);
+            if from >= to {
+                continue;
+            }
+            let reg_start = v.region.base.as_ptr() as usize;
+            let reg_end = reg_start + v.region.len.next_multiple_of(page);
+            let host_from = v.host.as_ptr() as usize + (from - s) as usize;
+            let host_to = v.host.as_ptr() as usize + (to - s) as usize;
+            let start = (host_from & !(page - 1)).max(reg_start);
+            let stop = host_to.next_multiple_of(page).min(reg_end);
+            if start >= stop {
+                continue;
+            }
+            if let Some(last) = out.last_mut()
+                && Arc::ptr_eq(&last._region, &v.region)
+                && start >= last.ptr.as_ptr() as usize
+                && start <= last.ptr.as_ptr() as usize + last.len
+            {
+                let new_end = (last.ptr.as_ptr() as usize + last.len).max(stop);
+                last.len = new_end - last.ptr.as_ptr() as usize;
+            } else {
+                out.push(AdviseRange {
+                    _region: v.region.clone(),
+                    ptr: NonNull::new(start as *mut u8).unwrap(),
+                    len: stop - start,
+                });
+            }
+        }
+        out
     }
 
     /// madvise(MADV_DONTNEED): anonymous memory goes back to the host (reading zero afterwards);
@@ -8073,5 +8220,202 @@ mod tests {
         let fallback = mm.find_free(LEAF_SPAN).unwrap();
         assert_eq!(fallback, base + PAGE_SIZE);
         assert_ne!(fallback % LEAF_SPAN, 0);
+    }
+
+    #[test]
+    fn fault_in_widens_read_only_file_mappings_only() {
+        use std::os::fd::AsRawFd;
+
+        let file = appine_hal::memfd(c"mm-fault-span").unwrap();
+        let file_len = 20 * LEAF_SPAN; // 40 MiB
+        file.set_len(file_len).unwrap();
+        let map_len = file_len + 2 * LEAF_SPAN; // 4 MiB past EOF
+
+        let mut mm = Mm::new();
+        // Read-only PrivateFile: fault_in fills a full FILE_FAULT_SPAN (16 MiB) and stops at EOF.
+        let ro_priv = mm
+            .mmap(
+                0,
+                map_len,
+                prot::READ,
+                flags::MAP_PRIVATE,
+                Some((file.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        assert_eq!(ro_priv % LEAF_SPAN, 0);
+        assert_eq!(mm.mmu().next_present(ro_priv, ro_priv + map_len), ro_priv + map_len);
+        assert!(mm.fault_in(ro_priv + PAGE_SIZE, prot::READ));
+        let first_end = ((ro_priv + PAGE_SIZE) | (FILE_FAULT_SPAN - 1)) + 1;
+        assert!(mm.mmu().translate(first_end - PAGE_SIZE, prot::READ).is_some());
+        assert_eq!(
+            mm.mmu().next_present(first_end, ro_priv + map_len),
+            ro_priv + map_len
+        );
+        // Faulting near EOF clips strictly at file_len (pages past EOF remain unmapped).
+        assert!(mm.fault_in(ro_priv + file_len - PAGE_SIZE, prot::READ));
+        assert!(
+            mm.mmu()
+                .translate(ro_priv + file_len - PAGE_SIZE, prot::READ)
+                .is_some()
+        );
+        assert_eq!(
+            mm.mmu()
+                .next_present(ro_priv + file_len, ro_priv + map_len),
+            ro_priv + map_len
+        );
+
+        // Read-only Shared file: also fills FILE_FAULT_SPAN.
+        let ro_shared = mm
+            .mmap(
+                0,
+                file_len,
+                prot::READ,
+                flags::MAP_SHARED,
+                Some((file.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        assert!(mm.fault_in(ro_shared + PAGE_SIZE, prot::READ));
+        let shared_end = ((ro_shared + PAGE_SIZE) | (FILE_FAULT_SPAN - 1)) + 1;
+        assert!(mm.mmu().translate(shared_end - PAGE_SIZE, prot::READ).is_some());
+        assert_eq!(
+            mm.mmu().next_present(shared_end, ro_shared + file_len),
+            ro_shared + file_len
+        );
+
+        // Writable PrivateFile: keeps 2 MiB LEAF_SPAN granularity.
+        let rw_priv = mm
+            .mmap(
+                0,
+                file_len,
+                RW,
+                flags::MAP_PRIVATE,
+                Some((file.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        assert!(mm.fault_in(rw_priv + PAGE_SIZE, prot::READ));
+        assert!(
+            mm.mmu()
+                .translate(rw_priv + LEAF_SPAN - PAGE_SIZE, prot::WRITE)
+                .is_some()
+        );
+        assert_eq!(
+            mm.mmu().next_present(rw_priv + LEAF_SPAN, rw_priv + file_len),
+            rw_priv + file_len
+        );
+    }
+
+    #[test]
+    fn madvise_prefill_and_ranges_respect_vma_kinds_and_eof() {
+        use std::os::fd::AsRawFd;
+
+        let file = appine_hal::memfd(c"mm-advise").unwrap();
+        let file_len = 12 * LEAF_SPAN; // 24 MiB
+        file.set_len(file_len).unwrap();
+        let map_len = file_len + 2 * LEAF_SPAN; // 4 MiB past EOF
+
+        let mut mm = Mm::new();
+        let ro_file = mm
+            .mmap(
+                0,
+                map_len,
+                prot::READ,
+                flags::MAP_PRIVATE,
+                Some((file.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        // Split the read-only file mapping with set_dontdump so two adjacent VMAs share one
+        // HostRegion and must coalesce in advise_ranges.
+        mm.set_dontdump(ro_file, 2 * LEAF_SPAN, true).unwrap();
+
+        let rw_file = mm
+            .mmap(
+                0,
+                4 * LEAF_SPAN,
+                RW,
+                flags::MAP_PRIVATE,
+                Some((file.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        let anon_untouched = mm
+            .mmap(
+                0,
+                2 * LEAF_SPAN,
+                prot::READ,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        let anon_written = mm
+            .mmap(
+                0,
+                2 * LEAF_SPAN,
+                RW,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        let reserved = mm
+            .mmap(
+                0,
+                2 * LEAF_SPAN,
+                0,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+
+        // prefill_file_ptes fills only read-only non-FUSE file VMAs up to file_len.
+        mm.prefill_file_ptes(ro_file, map_len);
+        assert!(mm.mmu().translate(ro_file, prot::READ).is_some());
+        assert!(
+            mm.mmu()
+                .translate(ro_file + file_len - PAGE_SIZE, prot::READ)
+                .is_some()
+        );
+        assert_eq!(
+            mm.mmu()
+                .next_present(ro_file + file_len, ro_file + map_len),
+            ro_file + map_len
+        );
+
+        mm.prefill_file_ptes(rw_file, 4 * LEAF_SPAN);
+        assert_eq!(
+            mm.mmu().next_present(rw_file, rw_file + 4 * LEAF_SPAN),
+            rw_file + 4 * LEAF_SPAN
+        );
+        mm.prefill_file_ptes(anon_untouched, 2 * LEAF_SPAN);
+        assert_eq!(
+            mm.mmu()
+                .next_present(anon_untouched, anon_untouched + 2 * LEAF_SPAN),
+            anon_untouched + 2 * LEAF_SPAN
+        );
+
+        // advise_ranges(file_only = true): coalesces the split read-only file VMAs into one host
+        // slice clipped at file_len, and skips anonymous and reserved VMAs.
+        let file_ranges = mm.advise_ranges(ro_file, map_len, true);
+        assert_eq!(file_ranges.len(), 1);
+        assert_eq!(file_ranges[0].len, file_len as usize);
+        for r in file_ranges {
+            r.apply(libc::MADV_SEQUENTIAL);
+        }
+        assert!(mm.advise_ranges(anon_untouched, 2 * LEAF_SPAN, true).is_empty());
+        assert!(mm.advise_ranges(anon_written, 2 * LEAF_SPAN, true).is_empty());
+        assert!(mm.advise_ranges(reserved, 2 * LEAF_SPAN, true).is_empty());
+
+        // advise_ranges(file_only = false): includes file and written anonymous VMAs, skips
+        // untouched anonymous and reserved VMAs, and applies MADV_WILLNEED cleanly.
+        assert!(mm.advise_ranges(anon_untouched, 2 * LEAF_SPAN, false).is_empty());
+        assert!(mm.advise_ranges(reserved, 2 * LEAF_SPAN, false).is_empty());
+        let written_ranges = mm.advise_ranges(anon_written, 2 * LEAF_SPAN, false);
+        assert_eq!(written_ranges.len(), 1);
+        for r in written_ranges {
+            r.apply(libc::MADV_WILLNEED);
+        }
+        let willneed_file = mm.advise_ranges(ro_file, map_len, false);
+        assert_eq!(willneed_file.len(), 1);
+        assert_eq!(willneed_file[0].len, file_len as usize);
+        for r in willneed_file {
+            r.apply(libc::MADV_WILLNEED);
+        }
     }
 }

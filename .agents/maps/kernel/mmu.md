@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: L2 2 MiB superpages with lock-free demotion and empty-L3 retirement, and per-CPU 1024-entry 2 MiB superpage TLB)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: widen fault_in soft-PTE fill span to 16 MiB for read-only non-FUSE file mappings and prefill on MADV_WILLNEED/MADV_POPULATE_READ)
 
 ## Responsibilities
 
@@ -97,8 +97,11 @@ fast path and refill (`engine/dbt`).
 - Larger mappings are filled on demand by `fault_in`. It fails if no VMA covers the page, the page
   is at or past EOF, the VMA prot (with write implying read) lacks the access, or the page already
   has an entry (including a prot-0 one). Otherwise it fills every empty slot of the 2 MB leaf range
-  clipped to the VMA and EOF; existing entries are left alone and no flush is needed. A `Fill` VMA
-  gets entries only for pages already read (`kernel/mm`).
+  — or 16 MB (`FILE_FAULT_SPAN`, 8 leaf spans) for read-only non-FUSE file mappings — clipped to
+  the VMA and EOF; existing entries are left alone and no flush is needed. A `Fill` VMA gets
+  entries only for pages already read (`kernel/mm`). `MADV_WILLNEED` and `MADV_POPULATE_READ` also
+  prefill read-only non-FUSE file soft PTEs (up to 4 GB per call) via `fill_shared` without
+  touching host pages.
 - `mprotect` to `PROT_NONE` keeps entries with prot 0 (the host page keeps its content); changing
   back rewrites the kept entries and fills the rest under the eager rule above, otherwise on demand.
 - Execute-only mappings (`PROT_EXEC` without `PROT_READ`) do not gain read permission: data loads

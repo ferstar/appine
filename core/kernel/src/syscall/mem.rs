@@ -42,6 +42,10 @@ const MAP_VALIDATE_KNOWN: u32 = MAP_TYPE
     | 0xfc00_0000; // page-size bits above MAP_HUGE_SHIFT
 const F_SEAL_WRITE: u32 = 0x8;
 const F_SEAL_FUTURE_WRITE: u32 = 0x10;
+const MADV_NORMAL: i32 = 0;
+const MADV_RANDOM: i32 = 1;
+const MADV_SEQUENTIAL: i32 = 2;
+const MADV_WILLNEED: i32 = 3;
 const MADV_DONTNEED: i32 = 4;
 const MADV_REMOVE: i32 = 9;
 const MADV_DONTFORK: i32 = 10;
@@ -51,6 +55,7 @@ const MADV_DONTDUMP: i32 = 16;
 const MADV_DODUMP: i32 = 17;
 const MADV_WIPEONFORK: i32 = 18;
 const MADV_KEEPONFORK: i32 = 19;
+const MADV_POPULATE_READ: i32 = 22;
 const MCL_CURRENT: u32 = 1;
 const MCL_FUTURE: u32 = 2;
 const MCL_ONFAULT: u32 = 4;
@@ -496,6 +501,34 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
             .mm_mut()
             .set_dontdump(addr, len, advice == MADV_DONTDUMP)
             .map(|()| 0),
+        // Forward readahead/access-pattern hints to the host outside the BKL so host readahead
+        // never stalls other guest threads, and prefill soft PTEs for read-only file mappings.
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_POPULATE_READ => {
+            let prefill = matches!(advice, MADV_WILLNEED | MADV_POPULATE_READ);
+            let file_only = !prefill;
+            let ranges = {
+                let mm = cx.mm();
+                if prefill {
+                    mm.prefill_file_ptes(addr, len);
+                }
+                mm.advise_ranges(addr, len, file_only)
+            };
+            if !ranges.is_empty() {
+                // Use MADV_WILLNEED on the host for MADV_POPULATE_READ so older host kernels
+                // (< 5.14) still perform readahead without failing with EINVAL or inflating RSS.
+                let host_advice = if advice == MADV_POPULATE_READ {
+                    MADV_WILLNEED
+                } else {
+                    advice
+                };
+                cx.unlocked(move || {
+                    for range in ranges {
+                        range.apply(host_advice);
+                    }
+                });
+            }
+            Ok(0)
+        }
         _ => Ok(0),
     }
 }

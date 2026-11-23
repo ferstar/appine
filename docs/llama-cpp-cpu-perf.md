@@ -1,6 +1,6 @@
 # Optimizing CPU Performance for `llama.cpp`
 
-> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, Phase 2B-1, Post-2B-1 profiling, Direction 3A, and Phase 2B-2 completed 2026-11-22–23; Direction 3B pending).
+> Handoff / future-work design note (Step 0 profiling, Step 1, Step 2 Phase 2A, Phase 2B-1, Post-2B-1 profiling, Direction 3A, Phase 2B-2, and Direction 3B completed 2026-11-22–23).
 > Grounded in `core/engine/src/c/dbt.c`, `core/engine/include/appine/engine.h`,
 > `core/engine/src/c/features.c`, `core/engine/src/c/mmu.c`, `core/kernel/src/mm.rs`,
 > `core/kernel/src/syscall/mem.rs`, `core/kernel/src/syscall/fast.rs`,
@@ -531,8 +531,12 @@ handful of strided NEON compute loops (`ggml_vec_dot_*`, `ggml_gemm_*`, `rms_nor
        - Qwen2.5-0.5B Q4_0 `pp128`: flat (`-t 1`: `284.43 → 286.17`, `-t 4`: `985.63 → 980.51`; `pp128`'s `work_data` is `< 2 MiB` so it uses the 4 KiB fallback).
        - Qwen2.5-0.5B F16 `tg32 -t 4`: `81.06 → 86.45 t/s` (now **1.05×** native); `tg32 -t 1`: `35.04 → 35.29 t/s` (up to `35.90 t/s`); `pp128 -t 4`: flat (`240.28 → 238.45 t/s`, still waiting on Phase 2B-2 for `tinyBLAS::gemm_bloc`).
        - **Verification & non-ML regression**: `appine-engine` 82/82 (including new L2 superpage/demotion/promotion and Tier 1 superpage/prefill/fast-loop/memop tests), `appine-kernel` `mm::tests` 46/46, `guest_programs` 26/26, `rootfs_programs` 73/73, 200k-iteration `appine-lockstep` under both `Default` and `Go` (0 mismatches), `appine-bench` Tier 1 geomean **1.69×** (unchanged vs. Phase 2B-1), `python3`/`gcc`/`gobuild` noise-identical.
-   - **Direction 3B (pending)** (unlocked `madvise` forwarding + widened read-only file `fault_in`): small
-     independent change for cold-start TTFT on flash storage; can land anytime.
+   - **Direction 3B (completed 2026-11-23 — unlocked `madvise` forwarding + widened read-only file `fault_in` & soft-PTE prefill)**:
+     - `hal` (`core/hal/src/lib.rs`): added `appine_hal::advise(ptr, len, advice)` wrapping non-destructive host `madvise(2)` hints on host-page-aligned slices.
+     - `kernel/mm` & `kernel/mmu` (`core/kernel/src/mm.rs`, `core/kernel/src/syscall/mem.rs`):
+       - `madvise` forwards `MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`, `MADV_WILLNEED`, and `MADV_POPULATE_READ` (mapped to host `MADV_WILLNEED` for compatibility with older Android `< 5.14` kernels without inflating anonymous RSS) to `appine_hal::advise` **after releasing the BKL** (`Cx::unlocked`), retaining each VMA's `Arc<HostRegion>` in `AdviseRange` so concurrent unmaps cannot invalidate host ranges mid-call. Skips reserved, foreign (`[vvar]`), GPU, and FUSE `Fill` VMAs, clips file ranges to `file_len`, coalesces adjacent slices sharing one `HostRegion`, restricts `NORMAL`/`RANDOM`/`SEQUENTIAL` to file-backed host mappings (never splitting anonymous/recycled host VMAs), and skips untouched anonymous VMAs on `WILLNEED`/`POPULATE_READ`.
+       - Widened `Mm::fault_in` from 2 MiB (`LEAF_SPAN`) to **16 MiB** (`FILE_FAULT_SPAN = 8 * LEAF_SPAN`) for read-only non-FUSE file mappings (both `PrivateFile` and `Shared` — `llama-bench` maps GGUF weights `MAP_SHARED | PROT_READ`), leaving anonymous and writable mappings at 2 MiB; also added `Mm::prefill_file_ptes` on `MADV_WILLNEED` / `MADV_POPULATE_READ` (capped at 4 GiB per call, filling aligned 2 MiB L2 superpage entries without touching host pages or mapping past EOF).
+     - **Verification**: `cargo clippy -p appine-hal -p appine-kernel -p appine-run --all-targets -- -D warnings`, `appine-kernel` 272/272 (including 48/48 `mm::tests` with new `fault_in_widens_read_only_file_mappings_only` and `madvise_prefill_and_ranges_respect_vma_kinds_and_eof`), `guest_programs` 26/26, `rootfs_programs` 73/73, `scripts/difftest` (`compat`, `compat4`, `compat6`, `edge-cases`, `fork`, `fuse`), and `llama-bench` on `/bench/store` (`APPINE_STRACE=1` confirmed `madvise(MADV_WILLNEED)` on 1.17 GiB F16 completes in `<0.1 ms`; F16 `pp128 -t 4` `329.6 t/s`, `tg32 -t 4` `86.9 t/s`; Q4_0 `pp128/pp512/tg128 -t 4` `973.6 / 958.2 / 208.0 t/s`).
 5. **Verification & non-regression gates**
    - Unit/integration tests in `core/engine/tests/dbt.rs` (block length boundary, 5–8 interleaved
      groups, derived pointers, `M_REG`/stolen groups, cross-page faults, watchpoints, TBI tags,

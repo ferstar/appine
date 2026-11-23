@@ -96,6 +96,20 @@ pub unsafe fn remove(ptr: NonNull<u8>, len: usize) -> Result<(), i32> {
     Ok(())
 }
 
+/// Forwards a non-destructive memory access hint (`MADV_NORMAL`, `MADV_RANDOM`,
+/// `MADV_SEQUENTIAL`, `MADV_WILLNEED`) to host `madvise(2)`.
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` is aligned to host pages and lies within host memory owned by this process
+/// that remains mapped for the duration of the call.
+pub unsafe fn advise(ptr: NonNull<u8>, len: usize, advice: i32) -> Result<(), i32> {
+    if unsafe { libc::madvise(ptr.as_ptr().cast(), len, advice) } != 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
 /// A host file mapping: `ptr` points at the requested file offset, and `base`/`len` are the range
 /// actually mapped, passed to [`unmap`] on release.
 pub struct FileMapping {
