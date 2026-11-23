@@ -93,31 +93,78 @@ impl Default for Limits {
     }
 }
 
+/// The process holding an `mq_notify` registration (Linux holds its `struct pid`): pinning the
+/// `ThreadGroup` weakly ensures an exited registrant whose fd table lives on via `CLONE_FILES`
+/// cannot match a new process that later reuses the same tgid.
+struct Registrant {
+    tgid: Tid,
+    group: Weak<RefCell<crate::process::ThreadGroup>>,
+}
+
+impl Registrant {
+    fn of(group: &Rc<RefCell<crate::process::ThreadGroup>>) -> Registrant {
+        Registrant {
+            tgid: group.borrow().tgid,
+            group: Rc::downgrade(group),
+        }
+    }
+
+    fn is_group(&self, group: &Rc<RefCell<crate::process::ThreadGroup>>) -> bool {
+        self.group.upgrade().is_some_and(|g| Rc::ptr_eq(&g, group))
+    }
+
+    fn live_group(
+        &self,
+        k: &crate::kernel::Kernel,
+    ) -> Option<Rc<RefCell<crate::process::ThreadGroup>>> {
+        let g = self.group.upgrade()?;
+        k.groups
+            .get(&self.tgid)
+            .filter(|cur| Rc::ptr_eq(cur, &g) && g.borrow().zombie.is_none())
+            .map(|_| g)
+    }
+
+    fn is_live(&self, k: &crate::kernel::Kernel) -> bool {
+        self.live_group(k).is_some()
+    }
+
+    /// The registrant's tgid while it is still alive (not exited or reaped), else 0 for status.
+    fn live_tgid(&self) -> Tid {
+        if self
+            .group
+            .upgrade()
+            .is_some_and(|g| g.borrow().zombie.is_none())
+        {
+            self.tgid
+        } else {
+            0
+        }
+    }
+}
+
 /// An mq_notify registration.
 enum Notify {
     Signal {
-        tgid: Tid,
+        owner: Registrant,
         sig: Signal,
         value: u64,
     },
     /// Does nothing, only holding the notification (`SIGEV_NONE`).
-    None {
-        tgid: Tid,
-    },
+    None { owner: Registrant },
     /// Delivers the cookie to a netlink socket (`SIGEV_THREAD`).
     Socket {
-        tgid: Tid,
+        owner: Registrant,
         sock: Weak<RefCell<Socket>>,
         cookie: [u8; 32],
     },
 }
 
 impl Notify {
-    fn tgid(&self) -> Tid {
+    fn owner(&self) -> &Registrant {
         match self {
-            Notify::Signal { tgid, .. } | Notify::None { tgid } | Notify::Socket { tgid, .. } => {
-                *tgid
-            }
+            Notify::Signal { owner, .. }
+            | Notify::None { owner }
+            | Notify::Socket { owner, .. } => owner,
         }
     }
 }
@@ -234,9 +281,11 @@ impl MessageQueue {
     pub fn status(&self) -> Vec<u8> {
         let qsize: usize = self.messages.iter().map(|(_, m)| m.len()).sum();
         let (notify, signo, pid) = match &self.notify {
-            Some(Notify::Signal { tgid, sig, .. }) => (SIGEV_SIGNAL, sig.number(), *tgid),
-            Some(Notify::None { tgid }) => (SIGEV_NONE, 0, *tgid),
-            Some(Notify::Socket { tgid, .. }) => (SIGEV_THREAD, 0, *tgid),
+            Some(Notify::Signal { owner, sig, .. }) => {
+                (SIGEV_SIGNAL, sig.number(), owner.live_tgid())
+            }
+            Some(Notify::None { owner }) => (SIGEV_NONE, 0, owner.live_tgid()),
+            Some(Notify::Socket { owner, .. }) => (SIGEV_THREAD, 0, owner.live_tgid()),
             None => (0, 0, 0),
         };
         format!("QSIZE:{qsize:<10} NOTIFY:{notify:<5} SIGNO:{signo:<5} NOTIFY_PID:{pid:<6}\n")
@@ -517,28 +566,29 @@ pub(super) fn mq_timedsend(
         }
     };
     match notify {
-        Some(Notify::Signal { tgid, sig, value }) => {
-            // si_pid and si_uid are as the registering process sees them (Linux's __do_notify
-            // uses the user namespace at registration; here its current one is used), and after
-            // that, like any other signal, they are translated once more as sent by the sender
-            let cred = cx.cred();
-            let uid = cx
-                .kr()
-                .groups
-                .get(&tgid)
-                .map_or(cred.ruid, |g| g.borrow().cred.uid_out(cred.ruid));
-            let info = SigInfo {
-                code: SI_MESGQ,
-                fields: InfoFields::Queue {
-                    pid: cx.kr().pid_seen_by(tgid, cx.tgid()),
-                    uid,
-                    value,
-                },
-                sender: cx.tgid(),
-                ..SigInfo::default()
+        Some(Notify::Signal { owner, sig, value }) => {
+            // Only signal if the registering ThreadGroup itself is still live (not a new process
+            // that later reused the same tgid after the registrant exited with shared CLONE_FILES)
+            if let Some(group) = owner.live_group(cx.kr()) {
+                let tgid = owner.tgid;
+                // si_pid and si_uid are as the registering process sees them (Linux's __do_notify
+                // uses the user namespace at registration; here its current one is used), and after
+                // that, like any other signal, they are translated once more as sent by the sender
+                let cred = cx.cred();
+                let uid = group.borrow().cred.uid_out(cred.ruid);
+                let info = SigInfo {
+                    code: SI_MESGQ,
+                    fields: InfoFields::Queue {
+                        pid: cx.kr().pid_seen_by(tgid, cx.tgid()),
+                        uid,
+                        value,
+                    },
+                    sender: cx.tgid(),
+                    ..SigInfo::default()
+                }
+                .sent_by(&cred);
+                signal::send_to_group(cx.kr(), tgid, sig, info);
             }
-            .sent_by(&cred);
-            signal::send_to_group(cx.kr(), tgid, sig, info);
         }
         Some(Notify::Socket { sock, cookie, .. }) => send_cookie(&sock, cookie, NOTIFY_WOKENUP),
         _ => {}
@@ -629,23 +679,26 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
         None
     };
     let (q, _) = queue_of(cx, fd)?;
-    let tgid = cx.tgid();
     let Some(b) = sev else {
         // Cancel one's own registration
         let mut q = q.borrow_mut();
-        if q.notify.as_ref().is_some_and(|n| n.tgid() == tgid) {
+        if q.notify
+            .as_ref()
+            .is_some_and(|n| n.owner().is_group(&cx.t.group))
+        {
             remove_notification(&mut q);
             q.touch_read();
         }
         return Ok(0);
     };
+    let owner = Registrant::of(&cx.t.group);
     let value = u64::from_le_bytes(b[..8].try_into().unwrap());
     let signo = i32::from_le_bytes(b[8..12].try_into().unwrap());
     let how = i32::from_le_bytes(b[12..16].try_into().unwrap());
     let notify = match how {
-        SIGEV_NONE => Notify::None { tgid },
+        SIGEV_NONE => Notify::None { owner },
         SIGEV_SIGNAL => Notify::Signal {
-            tgid,
+            owner,
             sig: Signal::new(signo).ok_or(Errno::EINVAL)?,
             value,
         },
@@ -660,18 +713,19 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
                 _ => return Err(Errno::ENOTSOCK),
             };
             let cookie: [u8; 32] = get(cx, value)?;
-            Notify::Socket { tgid, sock, cookie }
+            Notify::Socket {
+                owner,
+                sock,
+                cookie,
+            }
         }
         _ => return Err(Errno::EINVAL),
     };
     let mut q = q.borrow_mut();
     // A queue can have only one registered process; a registrant that has exited does not count
+    // (even if a new process has since reused its tgid)
     if let Some(n) = &q.notify
-        && cx
-            .kr()
-            .groups
-            .get(&n.tgid())
-            .is_some_and(|g| g.borrow().zombie.is_none())
+        && n.owner().is_live(cx.kr())
     {
         return Err(Errno::EBUSY);
     }
@@ -681,14 +735,17 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
     Ok(0)
 }
 
-/// Files that process `tgid` closed (close, dup3 over a descriptor, close_range, close-on-exec,
+/// Files that process `group` closed (close, dup3 over a descriptor, close_range, close-on-exec,
 /// its last thread's exit): its registrations on their queues end, whatever other descriptors
 /// remain (Linux's `mqueue_flush_file`).
-pub(crate) fn closed(tgid: Tid, files: &[crate::fd::FileRef]) {
+pub(crate) fn closed(
+    group: &Rc<RefCell<crate::process::ThreadGroup>>,
+    files: &[crate::fd::FileRef],
+) {
     for f in files {
         if let FileKind::MessageQueue(q) = &f.borrow().kind {
             let mut q = q.borrow_mut();
-            if q.notify.as_ref().is_some_and(|n| n.tgid() == tgid) {
+            if q.notify.as_ref().is_some_and(|n| n.owner().is_group(group)) {
                 remove_notification(&mut q);
             }
         }

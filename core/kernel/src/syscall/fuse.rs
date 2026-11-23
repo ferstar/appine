@@ -1045,11 +1045,14 @@ pub(super) fn mknod(
         0 => mode::S_IFREG,
         k => k,
     };
-    if matches!(kind, mode::S_IFCHR | mode::S_IFBLK)
-        && dev & 0xffff_ffff != 0
-        && !cred.capable(crate::cred::cap::MKNOD)
-    {
-        return Err(Errno::EPERM);
+    // A whiteout (character device 0:0) needs no CAP_MKNOD and does not go through the device
+    // filter (Linux's vfs_mknod); block device 0:0 is not a whiteout and is still checked
+    let whiteout = kind == mode::S_IFCHR && dev & 0xffff_ffff == 0;
+    if matches!(kind, mode::S_IFCHR | mode::S_IFBLK) && !whiteout {
+        if !cred.capable(crate::cred::cap::MKNOD) {
+            return Err(Errno::EPERM);
+        }
+        super::bpf::check_device(cx, kind, dev & 0xffff_ffff, crate::bpf::ACC_MKNOD)?;
     }
     let (conn, _) = fuse::target(&vfs, at.1)?;
     let perm = masked(&conn, mode_arg & 0o7777, cx.umask());

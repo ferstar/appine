@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: split file data I/O, clones/unsharing, size changes, cache hints and syncing out into kernel/fileio)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: open_pseudo uses ProcId/group_of_id and pins Mm weakly for pagemap too)
 
 ## Responsibilities
 
@@ -155,8 +155,9 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 - Pseudo nodes: nsfs writes `EPERM` first; permission from the synthetic stat, except `/proc/sys`
   (`kernel/sysctl`'s `test_perm` and `net.*`/`user.max_*` rules); `O_TRUNC` asks
   for write; the ptrace read check for `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup`
-  and `pagemap` (the process found through `pseudo::group_of`, so `/proc/<tid>` works; `mem` and
-  `pagemap` of a gone thread `ESRCH`); `setgroups` writes also need `CAP_SYS_ADMIN` over the
+  and `pagemap` (the process found through `pseudo::group_of_id` matching the pinned `ProcId`, so
+  `/proc/<tid>` works and a reused pid does not match; `mem` and `pagemap` of a gone thread `ESRCH`,
+  both pinning a weak `Mm` at open); `setgroups` writes also need `CAP_SYS_ADMIN` over the
   target's user namespace; nodev and the device filter for PTYs; `O_DIRECT` `EINVAL`;
   `EISDIR`/`ENOTDIR`/`EROFS`; `EACCES` for writes the filesystem does not allow except read-only
   procfs files outside `/proc/sys`, which root opens and whose writes fail (`kernel/procfs`).

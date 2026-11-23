@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint unprivileged_bpf_disabled sysctl and sysfs mount-point references to kernel/sysctl and kernel/sysfs)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: run cgroup device BPF on FUSE mknod and exempt only char 0:0 whiteout)
 
 ## Responsibilities
 
@@ -126,8 +126,8 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   pointer); pointer arithmetic is limited to constant offsets; R0 must be 0 or 1 at exit; seven
   helpers. The interpreter treats any out-of-range access as returning 0 (deny).
 - Programs live while an fd or a cgroup holds them (rmdir drops a cgroup's). At device open
-  (except rdev 0), devpts terminal and `ptmx` opens by path and mknod (after `CAP_MKNOD`,
-  whiteouts exempt), the effective programs of the caller's cgroup run with its real uid and gid:
+  (except rdev 0), devpts terminal and `ptmx` opens by path and mknod (including FUSE mknod, after
+  `CAP_MKNOD`; only character 0:0 whiteouts are exempt), the effective programs of the caller's cgroup run with its real uid and gid:
   walking up from the cgroup, the first programs found (its own, or else the nearest ancestor's,
   whatever its flags), then those of further ancestors that attached with `MULTI` (Linux's
   `compute_effective_progs`); every one must return 1, else `EPERM`. `TIOCGPTPEER` runs none, as
@@ -176,7 +176,7 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 
 - `kernel/procfs`: synthetic node lookup, metadata and listing; cgroup interface content and
   writes; `/proc/<pid>/cgroup` and `/proc/cgroups`.
-- `kernel/vfs`: cgroup mkdir/rmdir and device checks at mknod; `kernel/files`: device checks at
+- `kernel/vfs` and `kernel/fuse`: cgroup mkdir/rmdir and device checks at mknod; `kernel/files`: device checks at
   opens (including devpts) and file-change observation; `kernel/fileio`: write notifications.
 - `kernel/process`: clone/clone3 placement, pids charge, inherited freezer state, change checks
   after BKL syscalls and at thread exit; `kernel/time`: change checks on the timer thread;
@@ -232,9 +232,6 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   controller was disabled still stores a value (which returns when the controller is re-enabled;
   a `memory.max` one runs the OOM check) where Linux gives `ENODEV`; a regenerating read of a
   removed cgroup's file is `EINVAL` (Linux `ENODEV`).
-- **mknod on FUSE skips the device programs:** it returns to `kernel/fuse` before the cgroup device
-  check, which checks `CAP_MKNOD` itself but exempts every device 0:0, block ones included (Linux
-  exempts only the character whiteout).
 
 ## Open questions
 

@@ -88,8 +88,9 @@ impl KernelEntry {
 
 /// The root directory, current directory and file-creation mask (the part `CLONE_FS` shares),
 /// plus the mount namespace. On Linux the mount namespace is in the nsproxy, but `CLONE_NEWNS`
-/// cannot be combined with `CLONE_FS` and setns requires the fs not to be shared, so tasks sharing
-/// one fs are always in the same mount namespace and keeping them together is equivalent.
+/// cannot be combined with `CLONE_FS`, `unshare(CLONE_NEWNS)` implies `CLONE_FS`, and `setns`
+/// unshares a shared `FsContext` before switching mount namespaces, so tasks sharing one fs are
+/// always in the same mount namespace and keeping them together is equivalent.
 pub(crate) struct FsContext {
     /// Root directory (chroot).
     pub root: Node,
@@ -1156,7 +1157,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
                 .into_iter()
                 .filter_map(|fd| t.get(fd).ok())
                 .collect();
-            crate::syscall::mqueue_closed(tgid, &files);
+            crate::syscall::mqueue_closed(&group, &files);
         }
     };
     if crate::bug::catch(mq_flush).is_none() {

@@ -208,7 +208,7 @@ pub(crate) struct Kernel {
     pub bpf: crate::bpf::Registry,
     /// Newly created network namespaces ([`crate::nsproxy::NetNs`]): host loopback addresses still
     /// in use are avoided when allocating.
-    net_nss: Vec<Weak<crate::nsproxy::NetNs>>,
+    pub(crate) net_nss: Vec<Weak<crate::nsproxy::NetNs>>,
     /// Addresses bound by AF_UNIX sockets.
     pub unix: crate::unix::Names,
     /// AF_UNIX channels with open files in their messages (for `unix::collect`).
@@ -543,7 +543,7 @@ impl Kernel {
         owner: Rc<crate::cred::UserNs>,
     ) -> Result<Rc<crate::nsproxy::NetNs>, Errno> {
         self.net_nss.retain(|w| w.strong_count() > 0);
-        let used: Vec<[u8; 2]> = self
+        let used: std::collections::HashSet<[u8; 2]> = self
             .net_nss
             .iter()
             .filter_map(|w| w.upgrade().and_then(|n| n.host_net))

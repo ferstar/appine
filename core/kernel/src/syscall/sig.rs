@@ -152,7 +152,7 @@ pub(super) fn pidfd_send_signal(
         FileKind::Pidfd(p) => p.group(cx.kr()).map(|_| p.tgid).ok_or(Errno::ESRCH)?,
         // The process that was opened has been reaped: the pid may already belong to a new one
         FileKind::Directory {
-            node: Node::Pseudo(_, PseudoNode::Pid(pid, None)),
+            node: Node::Pseudo(_, PseudoNode::Pid(proc, None)),
             process,
             ..
         } => {
@@ -163,7 +163,7 @@ pub(super) fn pidfd_send_signal(
                     .is_some_and(|p| Rc::ptr_eq(&p, g))
             };
             // /proc/<tid> of any thread names its process
-            match crate::pseudo::group_of(cx.kr(), *pid) {
+            match crate::pseudo::group_of_id(cx.kr(), *proc) {
                 Some(g) if same(g) => g.borrow().tgid,
                 _ => return Err(Errno::ESRCH),
             }

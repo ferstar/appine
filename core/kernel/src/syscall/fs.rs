@@ -553,8 +553,8 @@ fn open_path_with(
     // (`/memfd:<name> (deleted)`, `pipe:[<n>]`). Being opened, it counts as a writer
     // ([`OpenFile::pseudo`] stays unset)
     let reopened = match &node {
-        Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) if flags & oflags::O_PATH == 0 => {
-            cx.view(&vfs).open_file(*pid, *fd).map(|f| {
+        Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) if flags & oflags::O_PATH == 0 => {
+            cx.view(&vfs).open_file(*proc, *tid, *fd).map(|f| {
                 let f = f.borrow();
                 let ino = match f.kind {
                     FileKind::Regular { ino, .. } => Some(ino),
@@ -563,8 +563,8 @@ fn open_path_with(
                 (f.mnt, f.path.clone(), ino)
             })
         }
-        Node::Pseudo(_, PseudoNode::OpenExe(pid)) if flags & oflags::O_PATH == 0 => {
-            exe_file(cx, *pid).ok().and_then(|e| {
+        Node::Pseudo(_, PseudoNode::OpenExe(proc)) if flags & oflags::O_PATH == 0 => {
+            exe_file(cx, *proc).ok().and_then(|e| {
                 let (mnt, ino) = e.node?;
                 Some((mnt, Some(e.path.clone()), Some(ino)))
             })
@@ -780,7 +780,7 @@ fn open_pseudo(
     // PTRACE_MODE_FSCREDS)
     let mut mm = None;
     if let PseudoNode::Entry(
-        pid,
+        proc,
         tid,
         e @ (pseudo::Entry::Mem
         | pseudo::Entry::Auxv
@@ -791,31 +791,27 @@ fn open_pseudo(
         | pseudo::Entry::Pagemap),
     ) = node
     {
-        // pid may name any thread (/proc/<tid>, pseudo::group_of): the check is on that thread
-        pseudo::group_of(cx.kr(), pid).ok_or(Errno::ESRCH)?;
-        if !super::proc::may_ptrace_fs(cx, tid.unwrap_or(pid)) {
+        // proc.pid may name any thread (/proc/<tid>, pseudo::group_of_id): the check is on that
+        // thread
+        pseudo::group_of_id(cx.kr(), proc).ok_or(Errno::ESRCH)?;
+        let thread = tid.unwrap_or(proc.pid);
+        if !super::proc::may_ptrace_fs(cx, thread) {
             return Err(Errno::EACCES);
         }
-        // mem and pagemap work on the named thread's address space: one that has exited (a
-        // zombie, a main thread whose process lives on) has none, ESRCH at open as on Linux
+        // mem and pagemap pin the named thread's address space at open (Linux's proc_mem_open /
+        // pagemap_open): one that has exited (a zombie, a main thread whose process lives on) has
+        // none, ESRCH at open as on Linux
         if matches!(e, pseudo::Entry::Mem | pseudo::Entry::Pagemap) {
-            let task = cx
-                .kr()
-                .tasks
-                .get(&tid.unwrap_or(pid))
-                .cloned()
-                .ok_or(Errno::ESRCH)?;
-            if e == pseudo::Entry::Mem {
-                mm = Some(Rc::downgrade(&task.res.borrow().mm));
-            }
+            let task = cx.kr().tasks.get(&thread).cloned().ok_or(Errno::ESRCH)?;
+            mm = Some(Rc::downgrade(&task.res.borrow().mm));
         }
     }
     // Writing setgroups needs CAP_SYS_ADMIN in the process's user namespace, checked at open
     // (proc_setgroups_open)
-    if let PseudoNode::Entry(pid, _, pseudo::Entry::Setgroups) = node
+    if let PseudoNode::Entry(proc, _, pseudo::Entry::Setgroups) = node
         && mask & MAY_WRITE != 0
     {
-        let group = pseudo::group_of(cx.kr(), pid).ok_or(Errno::ESRCH)?;
+        let group = pseudo::group_of_id(cx.kr(), proc).ok_or(Errno::ESRCH)?;
         if !cred.ns_capable(&group.borrow().cred.user_ns, cap::SYS_ADMIN) {
             return Err(Errno::EACCES);
         }
@@ -849,8 +845,8 @@ fn open_pseudo(
         PseudoNode::PtsPtmx(fs) => {
             return tty::open_ptmx(cx.k(), (fs, mnt, true), (cred.fsuid, cred.fsgid));
         }
-        PseudoNode::OpenFd(pid, fd) => return reopen(cx, cred, vfs, pid, fd, flags),
-        PseudoNode::OpenExe(pid) => return reopen_exe(cx, cred, vfs, pid, flags),
+        PseudoNode::OpenFd(proc, tid, fd) => return reopen(cx, cred, vfs, (proc, tid), fd, flags),
+        PseudoNode::OpenExe(proc) => return reopen_exe(cx, cred, vfs, proc, flags),
         _ => {}
     }
     let view = cx.view(vfs);
@@ -867,7 +863,7 @@ fn open_pseudo(
         // so after the process is reaped, using it as a pidfd is ESRCH even if the pid has been
         // given to a new process
         let process = match node {
-            PseudoNode::Pid(pid, None) => pseudo::group_of(cx.kr(), pid).map(Rc::downgrade),
+            PseudoNode::Pid(proc, None) => pseudo::group_of_id(cx.kr(), proc).map(Rc::downgrade),
             _ => None,
         };
         return Ok(FileKind::Directory {
@@ -965,12 +961,12 @@ fn reopen(
     cx: &mut Cx<'_>,
     cred: &Cred,
     vfs: &Vfs,
-    pid: i32,
+    (proc, tid): (pseudo::ProcId, Option<Tid>),
     fd: i32,
     flags: u32,
 ) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
-    let file = cx.view(vfs).open_file(pid, fd).ok_or(Errno::ENOENT)?;
+    let file = cx.view(vfs).open_file(proc, tid, fd).ok_or(Errno::ENOENT)?;
     let f = file.borrow();
     if let FileKind::Regular {
         ino, file: host, ..
@@ -1020,10 +1016,10 @@ fn reopen_exe(
     cx: &mut Cx<'_>,
     cred: &Cred,
     vfs: &Vfs,
-    pid: i32,
+    proc: pseudo::ProcId,
     flags: u32,
 ) -> Result<FileKind, Errno> {
-    let exe = exe_file(cx, pid)?;
+    let exe = exe_file(cx, proc)?;
     // A removed overlay program has no store node: it can be run (process::open_exe_file) but not
     // opened, since a descriptor of the store inode behind it would bypass the overlay
     let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
@@ -1615,7 +1611,7 @@ pub(super) fn close(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     let file = r?;
     let fds = cx.t.fds.clone();
     locks::closed(cx.k(), &fds, std::slice::from_ref(&file));
-    super::mqueue_closed(cx.tgid(), std::slice::from_ref(&file));
+    super::mqueue_closed(&cx.t.group, std::slice::from_ref(&file));
     // A FUSE file is flushed, and the error is close's (6.1's filp_close)
     let flushed = super::fuse::flush(cx, &file);
     crate::unix::released(cx.k(), vec![file]);
@@ -1640,7 +1636,7 @@ pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) ->
     );
     let fds = cx.t.fds.clone();
     locks::closed(cx.k(), &fds, &closed);
-    super::mqueue_closed(cx.tgid(), &closed);
+    super::mqueue_closed(&cx.t.group, &closed);
     super::fuse::flush_all(cx, &closed);
     crate::unix::released(cx.k(), closed);
     Ok(0)
@@ -1660,7 +1656,7 @@ pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult
     let fds = cx.t.fds.clone();
     let replaced: Vec<_> = replaced?.into_iter().collect();
     locks::closed(cx.k(), &fds, &replaced);
-    super::mqueue_closed(cx.tgid(), &replaced);
+    super::mqueue_closed(&cx.t.group, &replaced);
     super::fuse::flush_all(cx, &replaced);
     crate::unix::released(cx.k(), replaced);
     Ok(new as u64)
@@ -1676,7 +1672,9 @@ pub(crate) fn close_replaced(
     replaced: Vec<FileRef>,
 ) {
     locks::closed(cx.k(), fds, &replaced);
-    super::mqueue_closed(tgid, &replaced);
+    if let Some(group) = cx.kr().groups.get(&tgid).cloned() {
+        super::mqueue_closed(&group, &replaced);
+    }
     for f in &replaced {
         let _ = super::fuse::flush_as(cx, f, Rc::as_ptr(fds) as usize);
     }
@@ -2511,9 +2509,9 @@ enum IoPath {
     TimerFd(Rc<RefCell<TimerFd>>),
     SignalFd(Rc<RefCell<crate::fd::SignalFd>>),
     Inotify(Rc<RefCell<super::Inotify>>),
-    /// `/proc/<pid>/pagemap` (or a task's): computed on the fly from the read position, from the
-    /// address space of that thread.
-    Pagemap(Tid),
+    /// `/proc/<pid>/pagemap`: computed on the fly from the read position, from the address space
+    /// pinned at open (None once it has been released).
+    Pagemap(Option<Rc<RefCell<crate::mm::Mm>>>),
     /// `/proc/<pid>/mem`: the position is the address.
     /// The address space of `/proc/<pid>/mem` at open, None when it has been released.
     Mem(Option<Rc<RefCell<crate::mm::Mm>>>),
@@ -4026,9 +4024,9 @@ pub(super) fn read_bytes(
         IoPath::TimerFd(t) => super::timerfd::read(cx, &t, nonblock, buf),
         IoPath::SignalFd(s) => super::sig::signalfd_read(cx, &s, nonblock, buf),
         IoPath::Inotify(i) => super::inotify::read(cx, &i, nonblock, buf),
-        IoPath::Pagemap(pid) => {
+        IoPath::Pagemap(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
-            let n = pseudo::read_pagemap(cx.kr(), pid, buf, pos)?;
+            let n = pseudo::read_pagemap(mm, buf, pos)?;
             if offset.is_none() {
                 file.borrow_mut().pos = pos + n as u64;
             }
@@ -4239,7 +4237,7 @@ fn refresh_pseudo(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Resul
                     }
                     e.generated.replace(now) == now
                 });
-                if std::mem::take(fresh) && current {
+                if std::mem::take(fresh) && current && !pseudo::gone(cx.kr(), node) {
                     return Ok(());
                 }
                 (*mnt, node.clone(), opener.clone())
@@ -4649,9 +4647,10 @@ fn io_path(f: &OpenFile) -> IoPath {
         FileKind::SignalFd(s) => IoPath::SignalFd(s.clone()),
         FileKind::Inotify(i) => IoPath::Inotify(i.clone()),
         FileKind::Proc {
-            node: PseudoNode::Entry(pid, tid, pseudo::Entry::Pagemap),
+            node: PseudoNode::Entry(_, _, pseudo::Entry::Pagemap),
+            mm,
             ..
-        } => IoPath::Pagemap(tid.unwrap_or(*pid)),
+        } => IoPath::Pagemap(mm.as_ref().and_then(std::rc::Weak::upgrade)),
         FileKind::Proc {
             node: PseudoNode::Entry(_, _, pseudo::Entry::Mem),
             mm,
@@ -5009,7 +5008,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         let view = cx.view(&vfs);
         let ino_of = |n: &Node| match n {
             Node::Store(_, i) => Ok(*i),
-            Node::Pseudo(_, p) => Ok(pseudo::node_ino(view.k, p)),
+            Node::Pseudo(_, p) => Ok(pseudo::node_ino(p)),
             Node::Overlay(_, o) => vfs.overlay_stat(*o).map(|st| st.ino),
             Node::Fuse(_, f) => Ok(vfs.fuse().get(*f).map_or(0, |n| n.attr.ino)),
         };
@@ -5842,13 +5841,13 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
             Ok(encode_stat(&pseudo::stat(&view, p)?, Fs::Nsfs.dev()))
         }
         // The open file a magic link points at: report that file itself
-        Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
-            let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
+        Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
+            let file = view.open_file(*proc, *tid, *fd).ok_or(Errno::ENOENT)?;
             file_stat(cx, &file)
         }
         // A deleted program file
-        Node::Pseudo(_, PseudoNode::OpenExe(pid)) => {
-            let exe = exe_file(cx, *pid)?;
+        Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
+            let exe = exe_file(cx, *proc)?;
             let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
                 return Err(Errno::ENOENT);
             };
@@ -6492,15 +6491,18 @@ pub(super) fn linkat(
     // (follow_fd); Linux finds its dentry on the mount it was opened through, so the link is EXDEV
     // into another mount and refused as unlinked (ENOENT, below) in the same one
     let src = match src {
-        Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
-            let file = cx.view(&vfs).open_file(pid, fd).ok_or(Errno::ENOENT)?;
+        Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
+            let file = cx
+                .view(&vfs)
+                .open_file(proc, tid, fd)
+                .ok_or(Errno::ENOENT)?;
             let f = file.borrow();
             match &f.kind {
                 // A memfd is on no mount of the caller's (Linux's internal shm mount): EXDEV
                 FileKind::Regular { ino, .. } if !f.pseudo && f.ovl.is_none() => {
                     Node::Store(f.mnt, *ino)
                 }
-                _ => Node::Pseudo(f.mnt, PseudoNode::OpenFd(pid, fd)),
+                _ => Node::Pseudo(f.mnt, PseudoNode::OpenFd(proc, tid, fd)),
             }
         }
         src => src,
@@ -7509,8 +7511,11 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
     // through. A memfd's internal mount is never read-only, and its object is only its open
     // files' (Store::create_anonymous), so their handle is used
     let (node, memfd, nameless) = match node {
-        Node::Pseudo(proc, PseudoNode::OpenFd(pid, fd)) => {
-            let file = cx.view(&vfs).open_file(pid, fd).ok_or(Errno::ENOENT)?;
+        Node::Pseudo(proc_mnt, PseudoNode::OpenFd(proc, tid, fd)) => {
+            let file = cx
+                .view(&vfs)
+                .open_file(proc, tid, fd)
+                .ok_or(Errno::ENOENT)?;
             let f = file.borrow();
             match &f.kind {
                 FileKind::Regular {
@@ -7519,7 +7524,11 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
                     let host = host.try_clone().map_err(host_errno)?;
                     (Node::Store(f.mnt, *ino), f.pseudo, Some(host))
                 }
-                _ => (Node::Pseudo(proc, PseudoNode::OpenFd(pid, fd)), false, None),
+                _ => (
+                    Node::Pseudo(proc_mnt, PseudoNode::OpenFd(proc, tid, fd)),
+                    false,
+                    None,
+                ),
             }
         }
         node => (node, false, None),
@@ -8336,9 +8345,12 @@ fn tmpfs_removed(vfs: &Vfs, victim: Option<(u64, u64)>) {
 
 // ---- Shared helpers ----
 
-/// The program file process `pid` is executing (`/proc/<pid>/exe`).
-pub(super) fn exe_file(cx: &Cx<'_>, pid: i32) -> Result<Rc<crate::process::ExeFile>, Errno> {
-    let group = pseudo::group_of(cx.kr(), pid)
+/// The program file process `proc` is executing (`/proc/<pid>/exe`).
+pub(super) fn exe_file(
+    cx: &Cx<'_>,
+    proc: pseudo::ProcId,
+) -> Result<Rc<crate::process::ExeFile>, Errno> {
+    let group = pseudo::group_of_id(cx.kr(), proc)
         .cloned()
         .ok_or(Errno::ENOENT)?;
     group.borrow().exe.clone().ok_or(Errno::ENOENT)

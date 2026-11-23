@@ -401,16 +401,36 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
 /// be changed (Linux's `timens_commit`).
 fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
     if let Some(ns) = set.user {
-        let mut cred = cx.cred();
+        let old = cx.cred();
+        let mut cred = old.clone();
         cred.enter_user_ns(ns);
+        // Linux's commit_creds clears dumpable and pdeathsig when entering a user namespace not
+        // owned by the caller's euid (!cred_cap_issubset(old, new))
+        if !cred.caps_subset_of(&old) {
+            cx.t.group.borrow_mut().dumpable = false;
+            cx.task.pdeathsig.set(0);
+        }
         cx.set_cred(cred);
     }
     if let (Some(ns), Some(root)) = (set.mnt, root) {
-        let mut fs = cx.t.fs.borrow_mut();
-        fs.set_root(root.clone());
-        fs.set_cwd(root);
-        fs.mnt_ns = ns;
-        drop(fs);
+        // When a pidfd setns combines CLONE_NEWNS with other namespace types while the fs context
+        // is shared (Linux's prepare_nsset copies fs_struct), switch only the caller's own copy
+        // rather than mutating the shared FsContext seen by other tasks
+        if Rc::strong_count(&cx.t.fs) > 2 {
+            let umask = cx.t.fs.borrow().umask;
+            let copy = FsContext {
+                root: root.clone(),
+                cwd: root,
+                umask,
+                mnt_ns: ns,
+            };
+            cx.set_fs(Rc::new(crate::cell::RefCell::new(copy)));
+        } else {
+            let mut fs = cx.t.fs.borrow_mut();
+            fs.set_root(root.clone());
+            fs.set_cwd(root);
+            fs.mnt_ns = ns;
+        }
         cx.shared.fast_changed();
     }
     if set.ipc.is_some() {

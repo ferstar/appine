@@ -577,17 +577,38 @@ impl Cred {
         Ok(())
     }
 
-    /// The credentials access(2) uses: checks with the real user and group IDs, and capabilities
-    /// depend on whether the real user ID is root (in our own namespace).
+    /// Whether `self`'s capabilities are a subset of `other`'s (Linux 6.1's
+    /// `cred_cap_issubset(other, self)`): within the same user namespace `self.cap_permitted` must
+    /// be contained in `other.cap_permitted`; across user namespaces `other` must be in an
+    /// ancestor whose direct child on the path to `self.user_ns` is owned by `other.euid`.
+    pub fn caps_subset_of(&self, other: &Cred) -> bool {
+        if self.user_ns.id == other.user_ns.id {
+            return self.cap_permitted & !other.cap_permitted == 0;
+        }
+        let mut ns = self.user_ns.clone();
+        while let Some(parent) = ns.parent.clone() {
+            if parent.id == other.user_ns.id && ns.owner == other.euid {
+                return true;
+            }
+            ns = parent;
+        }
+        false
+    }
+
+    /// The credentials access(2) uses (Linux 6.1's `access_override_creds`): checks with the real
+    /// user and group IDs, and unless `SECBIT_NO_SETUID_FIXUP` is set, capabilities depend on
+    /// whether the real user ID is root (in our own namespace).
     pub fn for_access(&self) -> Cred {
         let mut c = self.clone();
         c.fsuid = self.ruid;
         c.fsgid = self.rgid;
-        c.cap_effective = if Some(self.ruid) == self.root_uid() {
-            self.cap_permitted
-        } else {
-            0
-        };
+        if self.securebits & secbit::NO_SETUID_FIXUP == 0 {
+            c.cap_effective = if Some(self.ruid) == self.root_uid() {
+                self.cap_permitted
+            } else {
+                0
+            };
+        }
         c
     }
 
@@ -1506,5 +1527,49 @@ mod tests {
             (1000, 100, 0o1755)
         );
         assert_eq!(u.new_owner(&dir, 0o6777, 0, true), (1000, 50, 0o2777));
+    }
+
+    #[test]
+    fn for_access_honours_no_setuid_fixup() {
+        let mut c = Cred::root();
+        c.set_securebits(secbit::NO_SETUID_FIXUP).unwrap();
+        c.setresuid(Some(1000), Some(1000), Some(1000)).unwrap();
+        c.cap_effective = 1 << cap::DAC_OVERRIDE;
+        c.cap_permitted = 1 << cap::DAC_OVERRIDE;
+        // With SECBIT_NO_SETUID_FIXUP, access(2) keeps cap_effective for a non-root real uid
+        let acc = c.for_access();
+        assert_eq!(acc.fsuid, 1000);
+        assert_eq!(acc.cap_effective, 1 << cap::DAC_OVERRIDE);
+
+        // Without SECBIT_NO_SETUID_FIXUP, non-root real uid clears cap_effective
+        c.securebits = 0;
+        assert_eq!(c.for_access().cap_effective, 0);
+    }
+
+    #[test]
+    fn caps_subset_of_distinguishes_owned_and_foreign_user_namespaces() {
+        let init = UserNs::init();
+        let child_u1000 = UserNs::child(&init, 1000, false);
+        let grandchild = UserNs::child(&child_u1000, 2000, false);
+
+        let root_init = Cred::root();
+        let u1000_init = user(1000, 1000);
+
+        let mut in_child = u1000_init.clone();
+        in_child.enter_user_ns(child_u1000.clone());
+        let mut in_grandchild = u1000_init.clone();
+        in_grandchild.enter_user_ns(grandchild);
+
+        // Owner entering its own child or descendant namespace is a subset (keeps dumpable)
+        assert!(in_child.caps_subset_of(&u1000_init));
+        assert!(in_grandchild.caps_subset_of(&u1000_init));
+
+        // Foreign euid (root entering uid 1000's namespace) is NOT a subset (clears dumpable)
+        let mut root_in_child = root_init.clone();
+        root_in_child.enter_user_ns(child_u1000);
+        assert!(!root_in_child.caps_subset_of(&root_init));
+
+        // Entering a parent user namespace is NOT a subset
+        assert!(!root_init.caps_subset_of(&in_child));
     }
 }

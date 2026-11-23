@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint drop_caches sysctl reference to kernel/sysctl)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: FUSE mknod checks cgroup device BPF and exempts only char 0:0 whiteout)
 
 ## Responsibilities
 
@@ -273,7 +273,8 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ### Namespace changes
 
-- mkdir, mknod (devices need `CAP_MKNOD` unless 0:0), symlink: `.`, `..` or an existing name
+- mkdir, mknod (devices need `CAP_MKNOD` and the cgroup device BPF filter unless character 0:0
+  whiteout), symlink: `.`, `..` or an existing name
   EEXIST, then EROFS, then the directory's permission; the reply's type must be the one asked
   (EIO). mkdir keeps the permission and sticky bits.
 - link (6.1's `do_linkat`): EEXIST, EROFS, EXDEV unless both on one mount, `protected_hardlinks`
@@ -357,7 +358,7 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   `kernel/fileio`: `check_fsize`.
 - `kernel/inotify`: the hooks for FUSE namespace changes.
 - `kernel/cred`: `Cred`, user namespace ID maps, `permission`, `owns`, `may_delete`,
-  `capable_wrt`.
+  `capable_wrt`; `kernel/cgroup`: `check_device` for `mknod`.
 - `kernel/signal`: `SIGXFSZ` through the VFS's `file_too_big`.
 - `hal`: `memfd` for program copies and mapping fills.
 - `kernel/mm`: `Fill` (`window`, `store`, `first_unread`, `has_fills`).

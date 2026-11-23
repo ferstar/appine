@@ -904,15 +904,14 @@ fn missing_program_exits_127() {
     assert_eq!(out.status.code(), Some(127));
 }
 
-#[test]
-fn stability_regressions() {
-    let Some(program) = build_c_guest("stability") else {
+fn run_guest_in_empty_rootfs(name: &str) {
+    let Some(program) = build_c_guest(name) else {
         return;
     };
     let bytes = std::fs::read(&program).unwrap();
-    let (_, store) = output("stability-store");
-    let (_, empty_dir) = output("stability-empty");
-    let (_, tar_path) = output("stability-empty.tar.gz");
+    let (_, store) = output(&format!("{name}-store"));
+    let (_, empty_dir) = output(&format!("{name}-empty"));
+    let (_, tar_path) = output(&format!("{name}-empty.tar.gz"));
     let _ = std::fs::remove_dir_all(&store);
     let _ = std::fs::remove_dir_all(&empty_dir);
     std::fs::create_dir_all(&empty_dir).unwrap();
@@ -926,12 +925,13 @@ fn stability_regressions() {
         .expect("tar failed");
     assert!(tar.success());
     appine_kernel::import_rootfs(&store, &tar_path).unwrap();
-    appine_kernel::write_file(&store, "/stability", &bytes, 0o755, true, 0, 0).unwrap();
+    let guest_path = format!("/{name}");
+    appine_kernel::write_file(&store, &guest_path, &bytes, 0o755, true, 0, 0).unwrap();
     for tier in TIERS {
         let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
             .args(["--rootfs"])
             .arg(&store)
-            .args(["--tier", tier, "/stability"])
+            .args(["--tier", tier, &guest_path])
             .output()
             .expect("failed to run appine-run");
         assert_eq!(
@@ -950,6 +950,16 @@ fn stability_regressions() {
     let _ = std::fs::remove_dir_all(&store);
     let _ = std::fs::remove_dir_all(&empty_dir);
     let _ = std::fs::remove_file(&tar_path);
+}
+
+#[test]
+fn stability_regressions() {
+    run_guest_in_empty_rootfs("stability");
+}
+
+#[test]
+fn isolation_regressions() {
+    run_guest_in_empty_rootfs("isolation");
 }
 
 #[test]

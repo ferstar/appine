@@ -161,9 +161,10 @@ pub enum FileKind {
         /// `data` was just generated at open and has not been read or written yet: the first
         /// read from 0 need not regenerate it.
         fresh: bool,
-        /// `/proc/<pid>/mem`: the address space of that process at open time. As on Linux, after
-        /// the process execs, reads and writes still go to it (EOF once it has been freed), not
-        /// to the new program's.
+        /// `/proc/<pid>/mem` and `/proc/<pid>/pagemap`: the address space of that process at open
+        /// time. As on Linux, after the process execs or exits (even if its pid is reused), reads
+        /// and writes still go to this address space (EOF once it has been freed), not to the new
+        /// program's.
         mm: Option<std::rc::Weak<RefCell<crate::mm::Mm>>>,
         /// A namespace file (nsfs): keeps that namespace alive while open; used by setns and
         /// `NS_GET_*`.

@@ -722,8 +722,8 @@ fn exec(
         match vfs.resolve(&view, &cred, &root, &start, &path, follow)? {
             // An open file not in the store that /proc/<pid>/fd/<n> leads to: deleted files and
             // memfds can be executed, pipes and the like are EACCES
-            Node::Pseudo(_, crate::pseudo::PseudoNode::OpenFd(pid, fd)) => {
-                let file = view.open_file(pid, fd).ok_or(Errno::ENOENT)?;
+            Node::Pseudo(_, crate::pseudo::PseudoNode::OpenFd(proc, tid, fd)) => {
+                let file = view.open_file(proc, tid, fd).ok_or(Errno::ENOENT)?;
                 let f = file.borrow();
                 let node = f.node().ok_or(Errno::EACCES)?;
                 let shown = f.path.as_deref().unwrap_or_default();
@@ -739,8 +739,8 @@ fn exec(
     // Executing a deleted program through /proc/<pid>/exe (re-execing oneself): open the host
     // file that process recorded
     let from = match &node {
-        Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(pid)) => {
-            Some(super::fs::exe_file(cx, *pid)?)
+        Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(proc)) => {
+            Some(super::fs::exe_file(cx, *proc)?)
         }
         _ => None,
     };
@@ -928,7 +928,7 @@ fn exec(
     let closed = cx.fds_mut().close_on_exec();
     let fds = cx.t.fds.clone();
     crate::locks::closed(cx.k(), &fds, &closed);
-    super::mqueue_closed(cx.tgid(), &closed);
+    super::mqueue_closed(&cx.t.group, &closed);
     super::fuse::flush_all(cx, &closed);
     crate::unix::released(cx.k(), closed);
     {
@@ -1816,8 +1816,8 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_NEW_MASK & !CLONE_NEW_DONE != 0 {
         return Err(Errno::EPERM);
     }
-    // Compute the new credentials and every check first, and change things only when all pass
-    // (Linux's ksys_unshare commits only at the end)
+    // Compute the new credentials and every fallible check/allocation first, and mutate state only
+    // once all pass (Linux's ksys_unshare commits only at the end)
     let mut new_cred = cx.cred();
     let euid = new_cred.euid;
     if flags & CLONE_NEWUSER != 0 {
@@ -1832,21 +1832,36 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     // be unshared again before it is entered
     let pid_ns = if flags & CLONE_NEWPID != 0 {
         let owner = new_cred.user_ns.clone();
-        let ns = super::ns::new_pid_ns(&cx.pid_ns(), &cx.pid_ns_children(), owner)?;
-        super::ns::count(cx.k(), Counted::Pid, &new_cred.user_ns, euid, ns.clone());
-        Some(ns)
+        Some(super::ns::new_pid_ns(
+            &cx.pid_ns(),
+            &cx.pid_ns_children(),
+            owner,
+        )?)
     } else {
         None
     };
     // Each thread's TaskState and TaskRes each hold one reference
     let others = |count: usize| count > 2;
-    if flags & CLONE_FILES != 0 && others(Rc::strong_count(&cx.t.fds)) {
+    let copy_fds = if flags & CLONE_FILES != 0 && others(Rc::strong_count(&cx.t.fds)) {
         // As with Linux's dup_fd: copying fails when the highest open fd (rounded up to 64)
         // exceeds nr_open
         let highest = cx.fds().open_fds().last().map_or(0, |&fd| fd as usize + 1);
         if highest.next_multiple_of(64) > cx.kr().nr_open {
             return Err(Errno::EMFILE);
         }
+        true
+    } else {
+        false
+    };
+    // Allocate the new network namespace before committing anything, so ENOMEM (no free loopback
+    // block) leaves fd tables, fs, credentials, mounts, pid-for-children and semaphores untouched
+    let net_ns = if flags & CLONE_NEWNET != 0 {
+        Some(cx.k().new_net_ns(new_cred.user_ns.clone())?)
+    } else {
+        None
+    };
+    // All fallible checks and allocations succeeded; commit everything now
+    if copy_fds {
         let copy = cx.fds().clone();
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }
@@ -1872,8 +1887,9 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
         super::ns::count(cx.k(), Counted::Mnt, &new_cred.user_ns, euid, ns);
         cx.shared.fast_changed();
     }
-    if pid_ns.is_some() {
-        *cx.task.pid_ns_children.borrow_mut() = pid_ns;
+    if let Some(ns) = pid_ns {
+        super::ns::count(cx.k(), Counted::Pid, &new_cred.user_ns, euid, ns.clone());
+        *cx.task.pid_ns_children.borrow_mut() = Some(ns);
     }
     // As with Linux's exit_sem, apply and drop the SysV semaphore undos; this is also needed when
     // switching IPC namespaces (the old namespace's semaphores can no longer be reached)
@@ -1897,8 +1913,8 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
             ns.cgroup = super::ns::new_cgroup_ns(owner.clone(), root);
             super::ns::count(cx.k(), Counted::Cgroup, owner, euid, ns.cgroup.clone());
         }
-        if flags & CLONE_NEWNET != 0 {
-            ns.net = cx.k().new_net_ns(owner.clone())?;
+        if let Some(net) = net_ns {
+            ns.net = net;
             super::ns::count(cx.k(), Counted::Net, owner, euid, ns.net.clone());
         }
         if flags & CLONE_NEWUTS != 0 {
@@ -2034,5 +2050,118 @@ mod tests {
             core_dumped: false,
         };
         assert_eq!(killed.wait_status(), 15);
+    }
+
+    #[test]
+    fn unshare_net_enomem_is_atomic() {
+        use std::sync::Arc;
+
+        use crate::fd::FdTable;
+        use crate::kernel::{Kernel, Shared};
+        use crate::mm::Mm;
+        use crate::nsproxy::NetNs;
+        use crate::signal::SigHandlers;
+        use crate::task::{FsContext, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+        let shared = Arc::new(Shared::new(Kernel::new(crate::process::Tier::Interpreter)));
+        // Exhaust every loopback block so Kernel::new_net_ns returns ENOMEM
+        let mut pins = Vec::new();
+        let owner = crate::cred::UserNs::init();
+        let _cpu = {
+            let mut k = shared.lock();
+            for n in 1..=u16::MAX {
+                let bytes = n.to_be_bytes();
+                if bytes[0] == crate::netns::INIT_BLOCK || bytes[0] == crate::forward::OUTSIDE_BLOCK
+                {
+                    continue;
+                }
+                let ns = Rc::new(NetNs {
+                    id: crate::vfs::new_ns_id(),
+                    owner: owner.clone(),
+                    host_net: Some(bytes),
+                    lo: Default::default(),
+                    devs: RefCell::new(crate::netdev::Devices::for_new_ns(
+                        &k.init_ns.net.devs.borrow().conf,
+                    )),
+                    nft: Default::default(),
+                    listeners: Default::default(),
+                });
+                k.net_nss.push(Rc::downgrade(&ns));
+                pins.push(ns);
+            }
+
+            let group = Rc::new(RefCell::new(ThreadGroup::new(
+                10,
+                1,
+                Rc::new(RefCell::new(SigHandlers::default())),
+            )));
+            let mm = Mm::new().into_shared();
+            let fds = Rc::new(RefCell::new(FdTable::new()));
+            let fs = Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: Rc::new(MntNs {
+                    id: INIT_MNT_NS,
+                    owner: owner.clone(),
+                    anon: false,
+                }),
+            }));
+            // Hold extra references to fds and fs so unshare would clone them if it mutated early
+            let _fds_share = fds.clone();
+            let _fs_share = fs.clone();
+            let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+            let make_state = || TaskState {
+                mm: mm.clone(),
+                fds: fds.clone(),
+                fs: fs.clone(),
+                group: group.clone(),
+                vfs: None,
+                altstack: Default::default(),
+                clear_child_tid: 0,
+                vfork_done: None,
+                restart: None,
+                fast_sleep: None,
+            };
+            let task =
+                Task::new(10, 10, &cpu, make_state(), k.init_ns.clone(), 0, [0; 16]).unwrap();
+            group.borrow_mut().threads.push(10);
+            k.groups.insert(10, group.clone());
+            k.tasks.insert(10, task.clone());
+
+            // Seed a SysV SEM_UNDO record to confirm CLONE_SYSVSEM does not run before ENOMEM
+            let ipc_id = k.init_ns.ipc.id;
+            k.ipc_mut(ipc_id).undo.insert((10, 1), vec![1]);
+
+            let orig_user_id = task.cred.borrow().user_ns.id;
+            let orig_mnt_id = fs.borrow().mnt_ns.id;
+            let orig_fds_ptr = Rc::as_ptr(&fds);
+            let orig_fs_ptr = Rc::as_ptr(&fs);
+
+            let mut t = make_state();
+            let mut cx = Cx::new(&shared, k, &task, &mut t);
+            let err = unshare(
+                &mut cx,
+                CLONE_FILES
+                    | CLONE_FS
+                    | CLONE_NEWUSER
+                    | CLONE_NEWNS
+                    | CLONE_NEWPID
+                    | CLONE_SYSVSEM
+                    | CLONE_NEWNET,
+            )
+            .unwrap_err();
+            assert_eq!(err, Errno::ENOMEM);
+            assert_eq!(Rc::as_ptr(&cx.t.fds), orig_fds_ptr);
+            assert_eq!(Rc::as_ptr(&cx.t.fs), orig_fs_ptr);
+            assert_eq!(cx.cred().user_ns.id, orig_user_id);
+            assert_eq!(cx.t.fs.borrow().mnt_ns.id, orig_mnt_id);
+            assert!(cx.task.pid_ns_children.borrow().is_none());
+            assert!(cx.kr().ipc(ipc_id).undo.contains_key(&(10, 1)));
+            drop(cx);
+            cpu
+        };
+        drop(pins);
     }
 }

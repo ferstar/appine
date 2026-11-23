@@ -601,10 +601,18 @@ pub(crate) fn exit(k: &mut Kernel, tgid: Tid) {
 }
 
 /// The contents of `/proc/sysvipc/{msg,sem,shm}` for IPC namespace `ns`, with owners and groups
-/// translated into the user namespace of the reader `reader` (Linux's `seq_user_ns`).
-pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8], reader: &Cred) -> String {
+/// translated into the user namespace of `reader` (Linux's `seq_user_ns`) and pids into the
+/// reader's pid namespace `pid_ns` (`pid_vnr`).
+pub(crate) fn proc_listing(
+    k: &Kernel,
+    ns: u64,
+    which: &[u8],
+    reader: &Cred,
+    pid_ns: &crate::pidns::PidNs,
+) -> String {
     use std::fmt::Write;
     let ipc = k.ipc(ns);
+    let pid = |p: Tid| pid_ns.vnr(p).unwrap_or(0);
     let mut s = String::new();
     match which {
         b"msg" => {
@@ -618,8 +626,8 @@ pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8], reader: &Cred) -> 
                     p.mode & 0o777,
                     q.cbytes,
                     q.msgs.len(),
-                    q.lspid,
-                    q.lrpid,
+                    pid(q.lspid),
+                    pid(q.lrpid),
                     reader.uid_out(p.uid),
                     reader.gid_out(p.gid),
                     reader.uid_out(p.cuid),
@@ -657,7 +665,7 @@ pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8], reader: &Cred) -> 
                 writeln!(
                     s,
                     "{:10} {:10} {:5o} {:21} {:5} {:5} {:6} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}",
-                    p.key, id, p.mode & 0o1777, seg.size, seg.cpid, seg.lpid, nattch(k, (ns, id)),
+                    p.key, id, p.mode & (0o777 | SHM_DEST | SHM_LOCKED), seg.size, pid(seg.cpid), pid(seg.lpid), nattch(k, (ns, id)),
                     reader.uid_out(p.uid), reader.gid_out(p.gid), reader.uid_out(p.cuid), reader.gid_out(p.cgid), seg.atime, seg.dtime, seg.ctime,
                     seg.mem.len(), 0
                 )
@@ -830,5 +838,71 @@ mod tests {
         assert_eq!(t.sem, [i32::MAX as u64, 2, 3, 4]);
         // Unsigned longs on Linux too
         assert_eq!(t.write(b"shmmax", b"18446744073709551615"), Ok(()));
+    }
+
+    #[test]
+    fn proc_listing_translates_pids_and_shows_shm_locked() {
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let ns_id = k.init_ns.ipc.id;
+        let root = Cred::root();
+        let user_ns = root.user_ns.clone();
+
+        let msg_id = k
+            .ipc_mut(ns_id)
+            .msg
+            .get_or_create(
+                111,
+                IPC_CREAT | 0o600,
+                (&root, &user_ns),
+                16,
+                |_| Ok(()),
+                || Ok(MsgQueue::new(16384)),
+            )
+            .unwrap();
+        {
+            let (_, q) = k.ipc_mut(ns_id).msg.get_mut(msg_id).unwrap();
+            q.lspid = 42;
+            q.lrpid = 99;
+        }
+
+        let shm_id = k
+            .ipc_mut(ns_id)
+            .shm
+            .get_or_create(
+                222,
+                IPC_CREAT | 0o600,
+                (&root, &user_ns),
+                16,
+                |_| Ok(()),
+                || {
+                    Ok(ShmSeg {
+                        mem: SharedMemory::new(4096)?,
+                        size: 4096,
+                        atime: 0,
+                        dtime: 0,
+                        ctime: 0,
+                        cpid: 42,
+                        lpid: 99,
+                    })
+                },
+            )
+            .unwrap();
+        k.ipc_mut(ns_id).shm.get_mut(shm_id).unwrap().0.mode |= SHM_LOCKED;
+
+        // Global tid 42 is local pid 7 in child_ns; global tid 99 is invisible (0)
+        let init_pid_ns = crate::pidns::PidNs::init();
+        let child_pid_ns = crate::pidns::PidNs::child(&init_pid_ns, user_ns);
+        crate::pidns::PidNs::register(&child_pid_ns, 42, &[7]).unwrap();
+
+        let msg_out = proc_listing(&k, ns_id, b"msg", &root, &child_pid_ns);
+        let msg_cols: Vec<&str> = msg_out.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(msg_cols[5], "7");
+        assert_eq!(msg_cols[6], "0");
+
+        let shm_out = proc_listing(&k, ns_id, b"shm", &root, &child_pid_ns);
+        let shm_cols: Vec<&str> = shm_out.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(shm_cols[2], "2600");
+        assert_eq!(shm_cols[4], "7");
+        assert_eq!(shm_cols[5], "0");
     }
 }

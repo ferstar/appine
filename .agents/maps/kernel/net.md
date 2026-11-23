@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: split raw ICMP into kernel/rawicmp and the routing table into kernel/route)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: drop resolved new-netns loopback statistics leak entry now fixed in kernel/sysfs)
 
 ## Responsibilities
 
@@ -408,10 +408,6 @@ listen notifications (`android/service`).
 - **`/proc/net/snmp` departs from the namespace's state:** `Forwarding` is always 2 although each
   namespace has `ip_forward` (Linux shows 1 when it is on), and MPTCP sockets are left out of the
   Tcp counters and `CurrEstab`, where Linux counts their subflows.
-- **New-namespace loopback statistics leak the initial namespace's:** sysfs `lo/statistics/*`
-  (`kernel/sysfs`) in a new network namespace reads the initial namespace's counters for `lo` (and
-  `tx_queue_len` the host's real value), while `/proc/net/dev` and netlink show zeros (and 1000)
-  there.
 - **A wildcard connect from a bound IPv4 socket reports the loopback:** connecting to `0.0.0.0`
   gives getpeername `127.0.0.1` even when the socket is bound to an address of its own, which
   Linux's route lookup would take instead.

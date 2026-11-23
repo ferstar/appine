@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/sysfs.md` for the paired decision history (not yet created; decisions from before the split are D14, D29, D42 and the sysfs parts of D2, D3, D9, D25 and D31 in `.agents/decisions/kernel/procfs.md`).
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: gate /sys/class/net statistics and tx_queue_len to initial network namespace)
 
 ## Responsibilities
 
@@ -80,8 +82,10 @@ CPU and `tx_queue_len` helpers (`hal`).
   and cgroup `cpuset`; guest CPU `i` is host CPU `host_cpus()[i]`.
 - `/sys/class/net/<if>/` follows the reader thread's network namespace; interfaces are directories
   (Linux uses symlinks into `/sys/devices`); bridges have `bridge/` and `brif/` (symlinks to the
-  ports' `brport/`), ports `brport/`; only byte and packet counters of host interfaces and `lo` are
-  real; `carrier` of a down interface is `EINVAL`, a removed interface `ENODEV`.
+  ports' `brport/`), ports `brport/`; byte and packet counters from `k.traffic` and host
+  `tx_queue_len` are read only in the initial network namespace (`ns.host_net.is_none()`), while new
+  network namespaces report zero statistics and `tx_queue_len` 1000; `carrier` of a down interface
+  is `EINVAL`, a removed interface `ENODEV`.
 - `/sys/block/loop<n>/` exists for every loop device (`kernel/loop`): `dev`, `removable`, `ro`,
   `size` (sectors), `queue/` (logical, physical, minimum and hardware sector sizes, optimal I/O 0,
   `dma_alignment` 511, `rotational`, `read_ahead_kb`, `max_sectors_kb`, `rq_affinity`), and while
@@ -120,10 +124,6 @@ CPU and `tx_queue_len` helpers (`hal`).
 - **No `/sys/dev/block` or block `uevent`s:** tools that go from a device number to sysfs
   (`tst_find_backing_dev`, so LTP ioctl_loop05; udev-style lookups) find nothing, and the root
   filesystem has no block device behind it at all.
-- **`/sys/class/net/<if>/statistics` leaks the initial namespace's counters:** host-interface and
-  `lo` counters are read by name from the kernel-wide traffic table without a namespace check, so a
-  new namespace's `lo` shows the initial loopback's counts, while `/proc/net/dev` and netlink show
-  zeros there.
 - **Fidelity gaps:** `/sys/class/net` follows the reader rather than the mounter's network
   namespace; interfaces and loop devices are directories rather than symlinks into `/sys/devices`;
   `kernel/`, other modules, `firmware/`, `power/` and NUMA nodes are absent.

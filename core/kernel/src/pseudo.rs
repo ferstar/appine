@@ -806,6 +806,24 @@ const HOST_CPU_FILES: [&[u8]; 68] = [
     b"cpufreq/scaling_setspeed",
 ];
 
+/// A process identity pinned by procfs nodes: `pid` (a thread id, usually the tgid) plus the
+/// thread group's non-reusable [`ThreadGroup::serial`], so a held `/proc/<pid>` directory or
+/// open file never resolves to a new process that later reuses the same pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ProcId {
+    pub pid: Tid,
+    pub serial: u64,
+}
+
+impl ProcId {
+    fn of(pid: Tid, group: &ThreadGroup) -> ProcId {
+        ProcId {
+            pid,
+            serial: group.serial,
+        }
+    }
+}
+
 /// A node in a synthetic filesystem.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PseudoNode {
@@ -827,22 +845,22 @@ pub(crate) enum PseudoNode {
     /// A directory or file under `/proc/sys` or `/proc/sysvipc`, with values from [`STATIC`].
     Static(&'static [u8]),
     /// `/proc/<pid>`; with `Some(tid)` as the second item it is `/proc/<pid>/task/<tid>`.
-    Pid(Tid, Option<Tid>),
+    Pid(ProcId, Option<Tid>),
     /// `/proc/<pid>/<entry>` (including those in the task subdirectories).
-    Entry(Tid, Option<Tid>, Entry),
+    Entry(ProcId, Option<Tid>, Entry),
     /// `/proc/<pid>/net/<name>` (including those in the task subdirectories), with names from
     /// [`PROC_NET`].
-    Net(Tid, Option<Tid>, &'static [u8]),
-    /// `/proc/<pid>/fd/<n>`.
-    Fd(Tid, i32),
+    Net(ProcId, Option<Tid>, &'static [u8]),
+    /// `/proc/<pid>/fd/<n>` (or `/proc/<pid>/task/<tid>/fd/<n>`).
+    Fd(ProcId, Option<Tid>, i32),
     /// The open file reached by following `/proc/<pid>/fd/<n>` (for those not in the store:
     /// pipes, host fds).
-    OpenFd(Tid, i32),
+    OpenFd(ProcId, Option<Tid>, i32),
     /// The program file reached by following `/proc/<pid>/exe`, when it has been deleted and
     /// cannot be opened by inode ([`crate::process::ExeFile`]).
-    OpenExe(Tid),
-    /// `/proc/<pid>/fdinfo/<n>`.
-    FdInfo(Tid, i32),
+    OpenExe(ProcId),
+    /// `/proc/<pid>/fdinfo/<n>` (or `/proc/<pid>/task/<tid>/fdinfo/<n>`).
+    FdInfo(ProcId, Option<Tid>, i32),
     /// `/sys`.
     SysRoot,
     /// A directory or file under `/sys`, with values from [`SYS_STATIC`].
@@ -864,7 +882,7 @@ pub(crate) enum PseudoNode {
     Cgroup(u64, &'static [u8]),
     /// `/proc/<pid>/ns/<kind>` (including those in the task subdirectories): a magic link to a
     /// namespace.
-    Ns(Tid, Option<Tid>, NsKind),
+    Ns(ProcId, Option<Tid>, NsKind),
     /// The namespace reached by following `/proc/<pid>/ns/<kind>` (a file in Linux's nsfs), by id.
     NsFile(NsKind, u64),
     /// The root directory of an mqueue filesystem: the POSIX message queues of an IPC namespace
@@ -973,19 +991,19 @@ impl<'a> View<'a> {
             .map_or(Node::ROOT, |t| t.res.borrow().fs.borrow().root.clone())
     }
 
-    fn group(&self, pid: Tid) -> Option<Rc<RefCell<ThreadGroup>>> {
-        group_of(self.k, pid).cloned()
+    fn group(&self, proc: ProcId) -> Option<Rc<RefCell<ThreadGroup>>> {
+        group_of_id(self.k, proc).cloned()
     }
 
-    /// The thread a pid directory stands for: the thread itself when `pid` is a thread id, so the
-    /// main thread for a process, and none once that has exited (procfs then shows it as a
+    /// The thread a pid directory stands for: the thread itself when `proc.pid` is a thread id, so
+    /// the main thread for a process, and none once that has exited (procfs then shows it as a
     /// zombie).
-    fn leader(&self, pid: Tid) -> Option<Rc<Task>> {
-        let g = self.group(pid)?;
+    fn leader(&self, proc: ProcId) -> Option<Rc<Task>> {
+        let g = self.group(proc)?;
         let threads = g.borrow().threads.clone();
         threads
             .iter()
-            .find(|&&t| t == pid)
+            .find(|&&t| t == proc.pid)
             .and_then(|t| self.k.tasks.get(t).cloned())
     }
 
@@ -1073,31 +1091,28 @@ impl<'a> View<'a> {
     }
 
     /// `/proc/<pid>/task/<tid>` uses the given thread, otherwise the representative thread.
-    fn task(&self, pid: Tid, tid: Option<Tid>) -> Option<Rc<Task>> {
+    fn task(&self, proc: ProcId, tid: Option<Tid>) -> Option<Rc<Task>> {
         match tid {
             Some(t) => {
-                let tgid = self.group(pid)?.borrow().tgid;
+                let tgid = self.group(proc)?.borrow().tgid;
                 self.k.tasks.get(&t).cloned().filter(|t| t.tgid == tgid)
             }
-            None => self.leader(pid),
+            None => self.leader(proc),
         }
     }
 
-    fn pid_exists(&self, pid: Tid, tid: Option<Tid>) -> bool {
-        match (self.group(pid), tid) {
-            (None, _) => false,
-            (Some(_), None) => true,
-            // An exited main thread stays, as a zombie, until the process is reaped
-            (Some(g), Some(t)) => {
-                let g = g.borrow();
-                g.threads.contains(&t) || (t == g.tgid && g.leader_exit.is_some())
-            }
-        }
+    fn pid_exists(&self, proc: ProcId, tid: Option<Tid>) -> bool {
+        pid_exists_in(self.k, proc, tid)
     }
 
-    /// An open file of some process.
-    pub(crate) fn open_file(&self, pid: Tid, fd: i32) -> Option<crate::fd::FileRef> {
-        let task = self.leader(pid)?;
+    /// An open file of thread `tid` (or the representative thread of `proc`).
+    pub(crate) fn open_file(
+        &self,
+        proc: ProcId,
+        tid: Option<Tid>,
+        fd: i32,
+    ) -> Option<crate::fd::FileRef> {
+        let task = self.task(proc, tid)?;
         let res = task.res.borrow();
         res.fds.borrow().get(fd).ok()
     }
@@ -1143,13 +1158,13 @@ impl Pseudo for View<'_> {
                     .map_or(ProcRoot, Static)
             }
             NetConf(v6, dir, _) => NetConf(*v6, *dir, b""),
-            Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
-            Entry(pid, tid, _) => Pid(*pid, *tid),
-            Net(pid, tid, _) => Entry(*pid, *tid, self::Entry::Net),
-            Fd(pid, _) | OpenFd(pid, _) => Entry(*pid, None, self::Entry::Fd),
-            OpenExe(pid) => Pid(*pid, None),
-            FdInfo(pid, _) => Entry(*pid, None, self::Entry::FdInfo),
-            Ns(pid, tid, _) => Entry(*pid, *tid, self::Entry::Ns),
+            Pid(proc, Some(_)) => Entry(*proc, None, self::Entry::Task),
+            Entry(proc, tid, _) => Pid(*proc, *tid),
+            Net(proc, tid, _) => Entry(*proc, *tid, self::Entry::Net),
+            Fd(proc, tid, _) | OpenFd(proc, tid, _) => Entry(*proc, *tid, self::Entry::Fd),
+            OpenExe(proc) => Pid(*proc, None),
+            FdInfo(proc, tid, _) => Entry(*proc, *tid, self::Entry::FdInfo),
+            Ns(proc, tid, _) => Entry(*proc, *tid, self::Entry::Ns),
             NsFile(..) => return None,
         })
     }
@@ -1198,9 +1213,9 @@ impl Pseudo for View<'_> {
                 .get(*id)
                 .map_or_else(|| id.to_string().into_bytes(), |g| g.name.clone()),
             Cgroup(_, name) => name.to_vec(),
-            Pid(pid, None) => self
+            Pid(proc, None) => self
                 .pid_ns(mnt)
-                .vnr(*pid)
+                .vnr(proc.pid)
                 .unwrap_or(0)
                 .to_string()
                 .into_bytes(),
@@ -1212,7 +1227,7 @@ impl Pseudo for View<'_> {
                 .into_bytes(),
             Entry(_, _, e) => ENTRIES.iter().find(|(_, x)| x == e).unwrap().0.to_vec(),
             Net(_, _, name) => name.to_vec(),
-            Fd(_, fd) | OpenFd(_, fd) | FdInfo(_, fd) => fd.to_string().into_bytes(),
+            Fd(_, _, fd) | OpenFd(_, _, fd) | FdInfo(_, _, fd) => fd.to_string().into_bytes(),
             OpenExe(_) => b"exe".to_vec(),
             Ns(_, _, k) => k.name().as_bytes().to_vec(),
             NsFile(k, id) => format!("{}:[{id}]", k.type_name()).into_bytes(),
@@ -1222,9 +1237,11 @@ impl Pseudo for View<'_> {
     fn lookup(&self, mnt: MountId, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno> {
         use PseudoNode::*;
         // fd and fdinfo of another process are open only to readers that pass the ptrace-read
-        // check (Linux's 0500 directories with proc_fd_permission, and proc_fd_access_allowed)
-        if let Entry(pid, _, self::Entry::Fd | self::Entry::FdInfo) = dir
-            && !self.may_read(*pid)
+        // check (Linux's 0500 directories with proc_fd_permission, and proc_fd_access_allowed);
+        // a reaped process's directory falls through to ENOENT rather than EACCES
+        if let Entry(proc, tid, self::Entry::Fd | self::Entry::FdInfo) = dir
+            && self.pid_exists(*proc, *tid)
+            && !self.may_read(*proc, *tid)
         {
             return Err(Errno::EACCES);
         }
@@ -1262,7 +1279,8 @@ impl Pseudo for View<'_> {
                     .map(|(_, g)| Global(*g))
                     .or_else(|| {
                         let pid = global(name)?;
-                        self.pid_exists(pid, None).then_some(Pid(pid, None))
+                        let g = group_of(self.k, pid)?;
+                        Some(Pid(ProcId::of(pid, &g.borrow()), None))
                     }),
             },
             Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
@@ -1349,36 +1367,36 @@ impl Pseudo for View<'_> {
                         .or_else(|| tree_lookup(&PORT_FILES, path, name).filter(|_| port))
                 })
                 .map(|p| SysNet(*n, p)),
-            Pid(pid, tid) => {
+            Pid(proc, tid) => {
                 let allowed = |e: &self::Entry| in_pid_dir(*tid, e);
                 ENTRIES
                     .iter()
                     .find(|(n, e)| *n == name && allowed(e))
-                    .map(|(_, e)| Entry(*pid, *tid, *e))
-                    .filter(|_| self.pid_exists(*pid, *tid))
+                    .map(|(_, e)| Entry(*proc, *tid, *e))
+                    .filter(|_| self.pid_exists(*proc, *tid))
             }
-            // fd and fdinfo in a thread directory are the process's open files too (the fd table
-            // is kept per process)
-            Entry(pid, _, e @ (self::Entry::Fd | self::Entry::FdInfo)) => parse_num(name)
+            // fd and fdinfo follow the thread's own fd table (which may differ from the group
+            // leader's after clone without CLONE_FILES or unshare(CLONE_FILES))
+            Entry(proc, tid, e @ (self::Entry::Fd | self::Entry::FdInfo)) => parse_num(name)
                 .map(|fd| fd as i32)
-                .filter(|&fd| self.open_file(*pid, fd).is_some())
+                .filter(|&fd| self.open_file(*proc, *tid, fd).is_some())
                 .map(|fd| match e {
-                    self::Entry::Fd => Fd(*pid, fd),
-                    _ => FdInfo(*pid, fd),
+                    self::Entry::Fd => Fd(*proc, *tid, fd),
+                    _ => FdInfo(*proc, *tid, fd),
                 }),
-            Entry(pid, None, self::Entry::Task) => global(name)
-                .filter(|&t| self.pid_exists(*pid, Some(t)))
-                .map(|t| Pid(*pid, Some(t))),
-            Entry(pid, tid, self::Entry::Net) => PROC_NET
+            Entry(proc, None, self::Entry::Task) => global(name)
+                .filter(|&t| self.pid_exists(*proc, Some(t)))
+                .map(|t| Pid(*proc, Some(t))),
+            Entry(proc, tid, self::Entry::Net) => PROC_NET
                 .iter()
                 .find(|n| **n == name)
-                .filter(|_| self.pid_exists(*pid, *tid))
-                .map(|n| Net(*pid, *tid, n)),
-            Entry(pid, tid, self::Entry::Ns) => NsKind::ALL
+                .filter(|_| self.pid_exists(*proc, *tid))
+                .map(|n| Net(*proc, *tid, n)),
+            Entry(proc, tid, self::Entry::Ns) => NsKind::ALL
                 .into_iter()
                 .find(|k| k.name().as_bytes() == name)
-                .filter(|_| self.pid_exists(*pid, *tid))
-                .map(|k| Ns(*pid, *tid, k)),
+                .filter(|_| self.pid_exists(*proc, *tid))
+                .map(|k| Ns(*proc, *tid, k)),
             _ => return Err(Errno::ENOTDIR),
         };
         found.ok_or(Errno::ENOENT)
@@ -1426,8 +1444,8 @@ impl Pseudo for View<'_> {
             SelfLink | ThreadSelf | Fd(..) | Ns(..) | SysBrif(..) => mode::S_IFLNK,
             Global(self::Global::Mounts | self::Global::Net) => mode::S_IFLNK,
             Entry(_, _, self::Entry::Cwd | self::Entry::Exe | self::Entry::Root) => mode::S_IFLNK,
-            OpenFd(pid, fd) => {
-                let file = self.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
+            OpenFd(proc, tid, fd) => {
+                let file = self.open_file(*proc, *tid, *fd).ok_or(Errno::ENOENT)?;
                 let f = file.borrow();
                 match &f.kind {
                     FileKind::Pipe(_) => mode::S_IFIFO,
@@ -1463,9 +1481,9 @@ impl Pseudo for View<'_> {
             }
             Global(self::Global::Mounts) => Ok(b"self/mounts".to_vec()),
             Global(self::Global::Net) => Ok(b"self/net".to_vec()),
-            Entry(pid, tid, self::Entry::Root) => {
-                let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Entry(proc, tid, self::Entry::Root) => {
+                let task = self.task(*proc, *tid).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 let root = task.res.borrow().fs.borrow().root.clone();
@@ -1474,14 +1492,14 @@ impl Pseudo for View<'_> {
             // As with root and cwd, the reader must be able to see that process (Linux's
             // proc_pid_readlink and proc_pid_get_link both check proc_fd_access_allowed first).
             // After the program file is deleted it gets ` (deleted)`, as with fds
-            Entry(pid, tid, self::Entry::Exe) => {
-                let g = self.group(*pid).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Entry(proc, tid, self::Entry::Exe) => {
+                let g = self.group(*proc).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 // The program is the thread's address space's: an exited thread (the main thread
                 // of a process living on, a zombie) has none
-                if self.task(*pid, *tid).is_none() {
+                if self.task(*proc, *tid).is_none() {
                     return Err(Errno::ENOENT);
                 }
                 let exe = g.borrow().exe.clone().ok_or(Errno::ENOENT)?;
@@ -1493,17 +1511,17 @@ impl Pseudo for View<'_> {
                     _ => path,
                 })
             }
-            Entry(pid, tid, self::Entry::Cwd) => {
-                let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Entry(proc, tid, self::Entry::Cwd) => {
+                let task = self.task(*proc, *tid).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 let cwd = task.res.borrow().fs.borrow().cwd.clone();
                 self.vfs.path_of(self, &self.root(), &cwd)
             }
-            Fd(pid, fd) => {
-                let file = self.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Fd(proc, tid, fd) => {
+                let file = self.open_file(*proc, *tid, *fd).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 let f = file.borrow();
@@ -1513,9 +1531,9 @@ impl Pseudo for View<'_> {
                     _ => name,
                 })
             }
-            Ns(pid, tid, k) => {
-                let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Ns(proc, tid, k) => {
+                let task = self.task(*proc, *tid).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 let id = k.id_of(self.k, &task).ok_or(Errno::ENOENT)?;
@@ -1530,13 +1548,13 @@ impl Pseudo for View<'_> {
     }
 
     fn follow_dentry(&self, node: &PseudoNode) -> Option<crate::vfs::Dentry> {
-        if let PseudoNode::Entry(pid, _, Entry::Exe) = node {
-            return self.group(*pid)?.borrow().exe.as_ref()?.dentry.clone();
+        if let PseudoNode::Entry(proc, _, Entry::Exe) = node {
+            return self.group(*proc)?.borrow().exe.as_ref()?.dentry.clone();
         }
-        let PseudoNode::Fd(pid, fd) = node else {
+        let PseudoNode::Fd(proc, tid, fd) = node else {
             return None;
         };
-        let file = self.open_file(*pid, *fd)?;
+        let file = self.open_file(*proc, *tid, *fd)?;
         let f = file.borrow();
         // Only files that are not directories want it (a directory's path is derived from its
         // parent)
@@ -1571,9 +1589,9 @@ impl Pseudo for View<'_> {
 
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {
         match node {
-            PseudoNode::Ns(pid, tid, k) => {
-                let task = self.task(*pid, *tid)?;
-                if !self.may_read(*pid) {
+            PseudoNode::Ns(proc, tid, k) => {
+                let task = self.task(*proc, *tid)?;
+                if !self.may_read(*proc, *tid) {
                     return Some(Err(Errno::EACCES));
                 }
                 let Some(id) = k.id_of(self.k, &task) else {
@@ -1584,9 +1602,9 @@ impl Pseudo for View<'_> {
             // The root and current directories point straight at that process's nodes (Linux's
             // proc_root_link, proc_cwd_link): through them one can get into other mount
             // namespaces and outside a chroot
-            PseudoNode::Entry(pid, tid, e @ (Entry::Root | Entry::Cwd)) => {
-                let task = self.task(*pid, *tid)?;
-                if !self.may_read(*pid) {
+            PseudoNode::Entry(proc, tid, e @ (Entry::Root | Entry::Cwd)) => {
+                let task = self.task(*proc, *tid)?;
+                if !self.may_read(*proc, *tid) {
                     return Some(Err(Errno::EACCES));
                 }
                 let res = task.res.borrow();
@@ -1600,13 +1618,13 @@ impl Pseudo for View<'_> {
             // renamed, deleted or replaced. A deleted one's object in the store is deleted too,
             // so it is opened through the recorded host file (OpenExe). Without a store (host
             // files for development) it is followed by the path read back
-            PseudoNode::Entry(pid, tid, Entry::Exe) => {
-                let g = self.group(*pid)?;
-                if !self.may_read(*pid) {
+            PseudoNode::Entry(proc, tid, Entry::Exe) => {
+                let g = self.group(*proc)?;
+                if !self.may_read(*proc, *tid) {
                     return Some(Err(Errno::EACCES));
                 }
                 let exe = g.borrow().exe.clone();
-                let Some(exe) = exe.filter(|_| self.task(*pid, *tid).is_some()) else {
+                let Some(exe) = exe.filter(|_| self.task(*proc, *tid).is_some()) else {
                     return Some(Err(Errno::ENOENT));
                 };
                 // A program found through an overlay: its node while its name lasts. Once removed
@@ -1617,7 +1635,7 @@ impl Pseudo for View<'_> {
                     return Some(if self.vfs.overlay().linked(*o) {
                         Ok(Node::Overlay(*m, *o))
                     } else if exe.host.is_some() {
-                        Ok(Node::Pseudo(mnt, PseudoNode::OpenExe(*pid)))
+                        Ok(Node::Pseudo(mnt, PseudoNode::OpenExe(*proc)))
                     } else {
                         Err(Errno::ENOENT)
                     });
@@ -1625,12 +1643,16 @@ impl Pseudo for View<'_> {
                 let (m, ino) = exe.node?;
                 let deleted = self.vfs.store().attrs(ino).map_or(true, |st| st.nlink == 0);
                 return Some(Ok(if deleted && exe.host.is_some() {
-                    Node::Pseudo(mnt, PseudoNode::OpenExe(*pid))
+                    Node::Pseudo(mnt, PseudoNode::OpenExe(*proc))
                 } else {
                     Node::Store(m, ino)
                 }));
             }
-            PseudoNode::Fd(pid, _) if !self.may_read(*pid) => return Some(Err(Errno::EACCES)),
+            PseudoNode::Fd(proc, tid, _)
+                if self.pid_exists(*proc, *tid) && !self.may_read(*proc, *tid) =>
+            {
+                return Some(Err(Errno::EACCES));
+            }
             _ => {}
         }
         self.follow_fd(mnt, node).map(Ok)
@@ -1702,31 +1724,32 @@ impl View<'_> {
         })
     }
 
-    /// Whether the reader may look at the root directory, current directory, program file and
-    /// namespaces of thread or process `pid` (Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`
-    /// on the thread, or the main thread).
-    fn may_read(&self, pid: Tid) -> bool {
-        self.may_read_as(pid, &self.reader())
+    /// Whether the reader may look at the root directory, current directory, program file, fds and
+    /// namespaces of thread `tid` (or `proc.pid`) (Linux's
+    /// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`).
+    fn may_read(&self, proc: ProcId, tid: Option<Tid>) -> bool {
+        self.may_read_as(proc, tid, &self.reader())
     }
 
     /// [`View::may_read`] with the credentials `reader`.
-    fn may_read_as(&self, pid: Tid, reader: &Cred) -> bool {
-        self.group(pid).is_some_and(|g| {
+    fn may_read_as(&self, proc: ProcId, tid: Option<Tid>, reader: &Cred) -> bool {
+        let target = tid.unwrap_or(proc.pid);
+        self.group(proc).is_some_and(|g| {
             let g = g.borrow();
             g.tgid == self.tgid
                 || self
                     .k
-                    .cred_of(pid)
+                    .cred_of(target)
                     .is_some_and(|c| reader.may_ptrace(&c, g.dump_scope(), true))
         })
     }
 
     /// The node reached by following `/proc/<pid>/fd/<n>` ([`Pseudo::follow`]).
     fn follow_fd(&self, mnt: MountId, node: &PseudoNode) -> Option<Node> {
-        let PseudoNode::Fd(pid, fd) = node else {
+        let PseudoNode::Fd(proc, tid, fd) = node else {
             return None;
         };
-        let file = self.open_file(*pid, *fd)?;
+        let file = self.open_file(*proc, *tid, *fd)?;
         let f = file.borrow();
         // A file opened through an overlay leads back to its overlay node, never to the store
         // inode behind it (which may be in a lower layer)
@@ -1743,7 +1766,7 @@ impl View<'_> {
                     .stat_open(*ino, file)
                     .is_ok_and(|st| st.nlink == 0) =>
             {
-                Node::Pseudo(mnt, PseudoNode::OpenFd(*pid, *fd))
+                Node::Pseudo(mnt, PseudoNode::OpenFd(*proc, *tid, *fd))
             }
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
                 Node::Store(f.mnt, *ino)
@@ -1755,7 +1778,7 @@ impl View<'_> {
                 let t = end.tty.borrow();
                 Node::Pseudo(end.mnt, PseudoNode::Pts(t.fs, t.index))
             }
-            _ => Node::Pseudo(mnt, PseudoNode::OpenFd(*pid, *fd)),
+            _ => Node::Pseudo(mnt, PseudoNode::OpenFd(*proc, *tid, *fd)),
         })
     }
 }
@@ -1836,7 +1859,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         (mode::S_IFDIR, _) => 0o555,
         // proc_fd_instantiate: read and search bits for a readable file, write and search for a
         // writable one (none for O_PATH)
-        (_, PseudoNode::Fd(pid, fd)) => ps.open_file(*pid, *fd).map_or(0, |f| {
+        (_, PseudoNode::Fd(proc, tid, fd)) => ps.open_file(*proc, *tid, *fd).map_or(0, |f| {
             let f = f.borrow();
             (if f.readable() { 0o500 } else { 0 }) | if f.writable() { 0o300 } else { 0 }
         }),
@@ -1895,7 +1918,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         _ => 1,
     };
     Ok(Stat {
-        ino: node_ino(ps.k, node),
+        ino: node_ino(node),
         mode: kind | perm,
         nlink,
         uid,
@@ -1957,20 +1980,20 @@ fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
     match node {
         // Files of a non-dumpable process belong to root in its user namespace (Linux's
         // task_dump_owner)
-        PseudoNode::Pid(pid, tid) | PseudoNode::Entry(pid, tid, _) => {
-            dump_owner(k, tid.unwrap_or(*pid))
-        }
-        PseudoNode::Fd(pid, _) => dump_owner(k, *pid),
+        PseudoNode::Pid(proc, tid)
+        | PseudoNode::Entry(proc, tid, _)
+        | PseudoNode::Fd(proc, tid, _) => dump_owner(k, *proc, *tid),
         PseudoNode::Pts(fs, n) => pty(k, *fs, *n).map_or((0, 0), |t| t.borrow().owner),
         PseudoNode::Cgroup(id, _) => k.cgroups.get(*id).map_or((0, 0), |g| (g.uid, g.gid)),
         _ => (0, 0),
     }
 }
 
-/// The owner of thread `tid`'s procfs files (Linux's `task_dump_owner`): its effective user and
-/// group IDs, root in its user namespace when the process is not dumpable.
-fn dump_owner(k: &Kernel, tid: Tid) -> (u32, u32) {
-    match (group_of(k, tid), k.cred_of(tid)) {
+/// The owner of thread `tid` (or `proc.pid`)'s procfs files (Linux's `task_dump_owner`): its
+/// effective user and group IDs, root in its user namespace when the process is not dumpable.
+fn dump_owner(k: &Kernel, proc: ProcId, tid: Option<Tid>) -> (u32, u32) {
+    let target = tid.unwrap_or(proc.pid);
+    match (group_of_id(k, proc), k.cred_of(target)) {
         (Some(g), Some(c)) if g.borrow().dumpable => (c.euid, c.egid),
         (Some(_), Some(c)) => (c.uid_in(0).unwrap_or(0), c.gid_in(0).unwrap_or(0)),
         _ => (0, 0),
@@ -2016,13 +2039,13 @@ pub(crate) fn readdir(
             nodes.extend(tree_children(&STATIC, b"").map(Static));
             nodes.extend(GLOBALS.iter().map(|(_, g)| Global(*g)));
             // Processes visible in the mount's pid namespace, sorted by their numbers there
-            let mut pids: Vec<(Tid, Tid)> =
+            let mut pids: Vec<(Tid, ProcId)> =
                 ps.k.groups
-                    .keys()
-                    .filter_map(|&pid| Some((ns.vnr(pid)?, pid)))
+                    .iter()
+                    .filter_map(|(&pid, g)| Some((ns.vnr(pid)?, ProcId::of(pid, &g.borrow()))))
                     .collect();
-            pids.sort_unstable();
-            nodes.extend(pids.into_iter().map(|(_, pid)| Pid(pid, None)));
+            pids.sort_unstable_by_key(|&(vnr, _)| vnr);
+            nodes.extend(pids.into_iter().map(|(_, proc)| Pid(proc, None)));
         }
         Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
             let v6 = *path == NET_CONF6;
@@ -2114,41 +2137,54 @@ pub(crate) fn readdir(
                     .map(|p| SysCpu(*n, p)),
             );
         }
-        Entry(pid, tid, self::Entry::Net) => {
-            nodes.extend(PROC_NET.iter().map(|n| Net(*pid, *tid, n)));
+        Entry(proc, tid, self::Entry::Net) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ENOENT);
+            }
+            nodes.extend(PROC_NET.iter().map(|n| Net(*proc, *tid, n)));
         }
-        Entry(pid, tid, self::Entry::Ns) => {
-            nodes.extend(NsKind::ALL.iter().map(|k| Ns(*pid, *tid, *k)));
+        Entry(proc, tid, self::Entry::Ns) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ENOENT);
+            }
+            nodes.extend(NsKind::ALL.iter().map(|k| Ns(*proc, *tid, *k)));
         }
-        Pid(pid, tid) => nodes.extend(
-            ENTRIES
-                .iter()
-                .filter(|(_, e)| in_pid_dir(*tid, e))
-                .map(|(_, e)| Entry(*pid, *tid, *e)),
-        ),
-        Entry(pid, _, e @ (self::Entry::Fd | self::Entry::FdInfo)) => {
-            if ps.group(*pid).is_some() && !ps.may_read(*pid) {
+        Pid(proc, tid) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ENOENT);
+            }
+            nodes.extend(
+                ENTRIES
+                    .iter()
+                    .filter(|(_, e)| in_pid_dir(*tid, e))
+                    .map(|(_, e)| Entry(*proc, *tid, *e)),
+            );
+        }
+        Entry(proc, tid, e @ (self::Entry::Fd | self::Entry::FdInfo)) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ENOENT);
+            }
+            if !ps.may_read(*proc, *tid) {
                 return Err(Errno::EACCES);
             }
-            if let Some(task) = ps.leader(*pid) {
+            if let Some(task) = ps.task(*proc, *tid) {
                 let fds = task.res.borrow().fds.borrow().open_fds();
                 nodes.extend(fds.into_iter().map(|fd| match e {
-                    self::Entry::Fd => Fd(*pid, fd),
-                    _ => FdInfo(*pid, fd),
+                    self::Entry::Fd => Fd(*proc, *tid, fd),
+                    _ => FdInfo(*proc, *tid, fd),
                 }));
             }
         }
-        Entry(pid, None, self::Entry::Task) => {
-            if let Some(g) = ps.group(*pid) {
-                let g = g.borrow();
-                let zombie = g.leader_exit.is_some().then_some(g.tgid);
-                nodes.extend(
-                    zombie
-                        .into_iter()
-                        .chain(g.threads.iter().copied())
-                        .map(|t| Pid(*pid, Some(t))),
-                );
-            }
+        Entry(proc, None, self::Entry::Task) => {
+            let g = ps.group(*proc).ok_or(Errno::ENOENT)?;
+            let g = g.borrow();
+            let zombie = g.leader_exit.is_some().then_some(g.tgid);
+            nodes.extend(
+                zombie
+                    .into_iter()
+                    .chain(g.threads.iter().copied())
+                    .map(|t| Pid(*proc, Some(t))),
+            );
         }
         _ => return Err(Errno::ENOTDIR),
     }
@@ -2157,7 +2193,7 @@ pub(crate) fn readdir(
         .map(|n| {
             Ok(DirEntry {
                 name: ps.name(mnt, &n),
-                ino: node_ino(ps.k, &n),
+                ino: node_ino(&n),
                 mode: ps.kind(&n).unwrap_or(mode::S_IFREG),
             })
         })
@@ -2173,29 +2209,15 @@ fn in_pid_dir(tid: Option<Tid>, e: &Entry) -> bool {
     }
 }
 
-/// The inode given by stat and readdir: for `/proc/<pid>` and the entries under it it also
-/// depends on which process it is, so as on Linux the inode differs after a new process reuses
-/// the pid.
-pub(crate) fn node_ino(k: &Kernel, node: &PseudoNode) -> u64 {
-    let pid = match node {
+/// The inode given by stat and readdir: for `/proc/<pid>` and the entries under it, [`ProcId`]
+/// already carries the thread group's serial, so as on Linux the inode differs after a new
+/// process reuses the pid and stays stable for a held fd after reap.
+pub(crate) fn node_ino(node: &PseudoNode) -> u64 {
+    match node {
         // A namespace's inode number is its id
-        PseudoNode::NsFile(_, id) => return *id,
-        PseudoNode::Pid(pid, _)
-        | PseudoNode::Entry(pid, ..)
-        | PseudoNode::Net(pid, ..)
-        | PseudoNode::Fd(pid, _)
-        | PseudoNode::OpenFd(pid, _)
-        | PseudoNode::OpenExe(pid)
-        | PseudoNode::FdInfo(pid, _) => *pid,
-        _ => return ino_of(node),
-    };
-    let Some(g) = group_of(k, pid) else {
-        return ino_of(node);
-    };
-    let mut h = std::hash::DefaultHasher::new();
-    node.hash(&mut h);
-    g.borrow().serial.hash(&mut h);
-    h.finish() | 1
+        PseudoNode::NsFile(_, id) => *id,
+        _ => ino_of(node),
+    }
 }
 
 /// The inode number of a synthetic node: a hash of the node (stable within one run), avoiding 0.
@@ -2409,9 +2431,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         // Those of the network namespace that process is in: the interfaces are the host's (lo in
         // a new one) plus virtual devices (crate::netdev), and only sockets created in it are
         // listed; in a new one the traffic and protocol counters are all 0 (crate::netns)
-        Net(pid, tid, name) => {
+        Net(proc, tid, name) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ESRCH);
+            }
             let full = ps
-                .task(*pid, *tid)
+                .task(*proc, *tid)
                 .map_or_else(|| ps.k.init_ns.net.clone(), |t| t.ns.borrow().net.clone());
             let net = Some(full.clone()).filter(|n| n.host_net.is_some());
             let id = net.as_ref().map_or(crate::nsproxy::INIT_NET_NS, |n| n.id);
@@ -2521,9 +2546,13 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 let ns = ps.ns().ipc.id;
                 ps.k.ipc(ns).tunables.read(&path[11..]).unwrap()
             }
-            b"sysvipc/msg" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"msg", &ps.reader()),
-            b"sysvipc/sem" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"sem", &ps.reader()),
-            b"sysvipc/shm" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"shm", &ps.reader()),
+            b"sysvipc/msg" | b"sysvipc/sem" | b"sysvipc/shm" => ipc::proc_listing(
+                ps.k,
+                ps.ns().ipc.id,
+                &path[8..],
+                &ps.reader(),
+                &ps.k.pid_ns_of(ps.tgid),
+            ),
             b"sys/kernel/tainted" => format!("{}\n", ps.k.tainted),
             b"sys/kernel/modprobe" => format!("{}\n", String::from_utf8_lossy(&ps.k.modprobe)),
             // Write-only (reading is EINVAL, `unreadable`)
@@ -2587,27 +2616,30 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             p if recorded(p).is_some() => format!("{}\n", recorded_value(ps.k, p)),
             _ => return Err(Errno::EISDIR),
         },
-        Entry(pid, tid, e) => {
-            let task = ps.task(*pid, *tid);
+        Entry(proc, tid, e) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ESRCH);
+            }
+            let task = ps.task(*proc, *tid);
             match e {
                 // These carry the thread's name as its bytes, which need not be UTF-8
-                self::Entry::Stat => return pid_stat(ps, &ns, *pid, *tid),
-                self::Entry::Status => return pid_status(ps, &ns, *pid, *tid),
+                self::Entry::Stat => return pid_stat(ps, &ns, *proc, *tid),
+                self::Entry::Status => return pid_status(ps, &ns, *proc, *tid),
                 self::Entry::Statm => {
                     let (vsize, rss) = mem_of(task.as_deref());
                     format!("{} {rss} 0 0 0 {rss} 0\n", vsize / 4096)
                 }
                 self::Entry::Comm => {
-                    let g = ps.group(*pid).ok_or(Errno::ENOENT)?;
-                    let mut name = comm_of(&g.borrow(), task.as_deref(), *pid, *tid);
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
+                    let mut name = comm_of(&g.borrow(), task.as_deref(), proc.pid, *tid);
                     name.push(b'\n');
                     return Ok(name);
                 }
                 // The thread's child processes not yet reaped, each followed by a space, with no
                 // newline (Linux's children_seq_show)
                 self::Entry::Children => {
-                    let g = ps.group(*pid).ok_or(Errno::ENOENT)?;
-                    let me = tid.unwrap_or(*pid);
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
+                    let me = tid.unwrap_or(proc.pid);
                     let mut s = String::new();
                     for c in &g.borrow().children {
                         if ps
@@ -2623,7 +2655,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 }
                 // Relative to the root of the reader's cgroup namespace
                 self::Entry::Cgroup => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     let cgroup = g.borrow().cgroup;
                     crate::cgroup::proc_cgroup(ps.k, cgroup, ps.cgroup_root())
                 }
@@ -2634,7 +2666,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.env)));
                 }
                 self::Entry::Limits => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     limits(&g.borrow().rlimits)
                 }
                 self::Entry::Maps => task.map_or(String::new(), |t| maps(ps.vfs.store(), &t)),
@@ -2672,18 +2704,18 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 // generates nothing) with the reader's own credentials rather than the opener's
                 self::Entry::Syscall => {
                     let me = ps.k.cred_of(ps.tid).unwrap_or_else(Cred::root);
-                    let thread = tid.unwrap_or(*pid);
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let thread = tid.unwrap_or(proc.pid);
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     if task.is_none() && thread != g.borrow().tgid {
                         return Err(Errno::ESRCH);
                     }
-                    if !ps.may_read_as(thread, &me) {
+                    if !ps.may_read_as(*proc, *tid, &me) {
                         return Err(Errno::EPERM);
                     }
                     let own = thread == ps.tid;
                     let running = task.is_some()
                         && !own
-                        && state_of(ps, &g.borrow(), *pid, *tid).0 == 'R';
+                        && state_of(ps, &g.borrow(), *proc, *tid).0 == 'R';
                     match task.as_deref().and_then(|t| t.sync.entry.get()) {
                         _ if running => "running\n".to_owned(),
                         Some([nr, a0, a1, a2, a3, a4, a5, sp, pc]) => {
@@ -2702,16 +2734,16 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     }
                 }
                 self::Entry::OomScore => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     format!("{}\n", crate::oom::proc_score(ps.k, &g.borrow()))
                 }
                 self::Entry::OomScoreAdj => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     format!("{}\n", g.borrow().oom_score_adj)
                 }
                 // Linux's proc_timens_show_offsets: the one for children
                 self::Entry::TimensOffsets => {
-                    let t = ps.k.tasks.get(pid).ok_or(Errno::ESRCH)?;
+                    let t = task.ok_or(Errno::ESRCH)?;
                     let [mono, boot] = t.ns.borrow().time_for_children.offsets.get();
                     format!(
                         "{:<10} {:>10} {:>9}\n{:<10} {:>10} {:>9}\n",
@@ -2719,23 +2751,23 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     )
                 }
                 e @ (self::Entry::UidMap | self::Entry::GidMap | self::Entry::ProjidMap) => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     let ns = g.borrow().cred.user_ns.clone();
                     id_map(&ps.reader(), &ns, *e)
                 }
                 self::Entry::Setgroups => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     let allow = g.borrow().cred.user_ns.setgroups.get();
                     format!("{}\n", if allow { "allow" } else { "deny" })
                 }
                 self::Entry::CoredumpFilter => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     format!("{:08x}\n", g.borrow().coredump_filter)
                 }
                 _ => return Err(Errno::EINVAL),
             }
         }
-        FdInfo(pid, fd) => fdinfo(ps, &ns, *pid, *fd)?,
+        FdInfo(proc, tid, fd) => fdinfo(ps, &ns, *proc, *tid, *fd)?,
         Sys(path) => match &path[..] {
             b"dev/char/226:128/device/uevent" => "OF_FULLNAME=/appine-gpu\nOF_COMPATIBLE_N=1\nOF_COMPATIBLE_0=virtio,mmio\n".to_owned(),
             b"devices/system/cpu/online"
@@ -2774,12 +2806,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
 
 // ---- Per-process files ----
 
-fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
-    let g = ps.group(pid).ok_or(Errno::ENOENT)?;
+fn pid_stat(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
+    let g = ps.group(proc).ok_or(Errno::ESRCH)?;
     let g = g.borrow();
-    let task = ps.task(pid, tid);
+    let task = ps.task(proc, tid);
     let nice = task.as_ref().map_or(0, |t| t.nice.get());
-    let (state, _) = state_of(ps, &g, pid, tid);
+    let (state, _) = state_of(ps, &g, proc, tid);
     let (tty_nr, tpgid) = ctty_info(ns, &g);
     let v = |p: Tid| ns.vnr(p).unwrap_or(0);
     let cpu = match (tid, &task, g.leader_exit) {
@@ -2795,7 +2827,7 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec
     });
     // The layout goes only to readers passing the ptrace read check (6.1's do_task_stat):
     // others see 1 for the code's bounds and 0 for the rest
-    let permitted = ps.may_read(pid);
+    let permitted = ps.may_read(proc, tid);
     let layout = task.as_ref().map(|t| {
         let res = t.res.borrow();
         let mm = res.mm.borrow();
@@ -2812,8 +2844,8 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec
         None => ((0, 0), 0, [0; 7]),
     };
     // The name as raw bytes, as Linux's proc_task_name without escaping
-    let mut out = format!("{} (", v(tid.unwrap_or(pid))).into_bytes();
-    out.extend(comm_of(&g, task.as_deref(), pid, tid));
+    let mut out = format!("{} (", v(tid.unwrap_or(proc.pid))).into_bytes();
+    out.extend(comm_of(&g, task.as_deref(), proc.pid, tid));
     let mut s = String::new();
     write!(
         s,
@@ -2860,11 +2892,11 @@ fn ctty_info(ns: &PidNs, g: &ThreadGroup) -> (u64, i64) {
     }
 }
 
-fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
-    let g = ps.group(pid).ok_or(Errno::ENOENT)?;
+fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
+    let g = ps.group(proc).ok_or(Errno::ESRCH)?;
     let g = g.borrow();
-    let task = ps.task(pid, tid);
-    let (state, state_name) = state_of(ps, &g, pid, tid);
+    let task = ps.task(proc, tid);
+    let (state, state_name) = state_of(ps, &g, proc, tid);
     // The size only: the resident pages are measured below, split by kind
     let vsize = task
         .as_ref()
@@ -2881,7 +2913,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
     // The name as its bytes with only a newline and a backslash escaped (Linux's
     // proc_task_name with seq_escape_str(.., "\n\\"))
     let mut out = b"Name:\t".to_vec();
-    for b in comm_of(&g, task.as_deref(), pid, tid) {
+    for b in comm_of(&g, task.as_deref(), proc.pid, tid) {
         match b {
             b'\n' => out.extend(b"\\n"),
             b'\\' => out.extend(b"\\\\"),
@@ -2893,7 +2925,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
     writeln!(s, "Umask:\t{umask:04o}").unwrap();
     writeln!(s, "State:\t{state} ({state_name})").unwrap();
     let v = |p: Tid| ns.vnr(p).unwrap_or(0);
-    let tid = tid.unwrap_or(pid);
+    let tid = tid.unwrap_or(proc.pid);
     writeln!(s, "Tgid:\t{}\nNgid:\t0\nPid:\t{}", v(g.tgid), v(tid)).unwrap();
     let tracer = task.as_ref().and_then(|t| t.trace.borrow().tracer);
     writeln!(
@@ -3029,14 +3061,19 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
 
 /// The process state letter and name: Z zombie, t in a ptrace-stop, T stopped, S waiting in the
 /// kernel, and R otherwise (running guest code or handling a syscall).
-fn state_of(ps: &View<'_>, g: &ThreadGroup, pid: Tid, tid: Option<Tid>) -> (char, &'static str) {
+fn state_of(
+    ps: &View<'_>,
+    g: &ThreadGroup,
+    proc: ProcId,
+    tid: Option<Tid>,
+) -> (char, &'static str) {
     // The whole process, or its main thread once that has exited (Linux keeps it as a zombie
     // task, and the process directory shows it)
-    if g.zombie.is_some() || (tid.unwrap_or(pid) == g.tgid && g.leader_exit.is_some()) {
+    if g.zombie.is_some() || (tid.unwrap_or(proc.pid) == g.tgid && g.leader_exit.is_some()) {
         return ('Z', "zombie");
     }
     // Stopped in a ptrace-stop (also under PTRACE_LISTEN, as on Linux)
-    if let Some(t) = ps.task(pid, tid)
+    if let Some(t) = ps.task(proc, tid)
         && t.trace.borrow().stop.is_some()
     {
         return ('t', "tracing stop");
@@ -3047,7 +3084,7 @@ fn state_of(ps: &View<'_>, g: &ThreadGroup, pid: Tid, tid: Option<Tid>) -> (char
     // As on Linux, the state is the thread's (the main thread's for the process directory):
     // waiting in the kernel is S, and everything else (running guest code, handling a syscall,
     // just created and not yet run, woken but not yet running) is R
-    if ps.task(pid, tid).is_some_and(|t| t.asleep()) {
+    if ps.task(proc, tid).is_some_and(|t| t.asleep()) {
         ('S', "sleeping")
     } else {
         ('R', "running")
@@ -3391,23 +3428,26 @@ fn with_deleted(mut name: Vec<u8>) -> Vec<u8> {
     name
 }
 
-/// Reads `/proc/<pid>/pagemap`: 8 bytes per page; the position and length must both be
-/// multiples of 8.
-pub(crate) fn read_pagemap(k: &Kernel, tid: Tid, buf: &mut [u8], pos: u64) -> Result<usize, Errno> {
+/// Reads `/proc/<pid>/pagemap` (`mm` is the address space pinned at open; once it is released
+/// reads get EOF): 8 bytes per page; the position and length must both be multiples of 8.
+pub(crate) fn read_pagemap(
+    mm: Option<Rc<RefCell<crate::mm::Mm>>>,
+    buf: &mut [u8],
+    pos: u64,
+) -> Result<usize, Errno> {
     if !pos.is_multiple_of(8) || !buf.len().is_multiple_of(8) {
         return Err(Errno::EINVAL);
     }
-    // The thread exited after the open (which refuses one already gone, ESRCH): its address space
-    // is gone, end of file, rather than another thread's (a reader going to the end would walk
-    // all 48 bits)
-    let Some(task) = k.tasks.get(&tid).cloned() else {
+    // The address space was released (process execed or exited after open): return EOF rather
+    // than looking up a new image or a reused pid
+    let Some(mm) = mm else {
         return Ok(0);
     };
     // The user address space is 48 bits
     let pages_total = 1u64 << (48 - 12);
     let first = pos / 8;
     let n = (buf.len() as u64 / 8).min(pages_total.saturating_sub(first)) as usize;
-    let entries = task.res.borrow().mm.borrow().pagemap(first * 4096, n);
+    let entries = mm.borrow().pagemap(first * 4096, n);
     for (i, e) in entries.iter().enumerate() {
         buf[i * 8..i * 8 + 8].copy_from_slice(&e.to_le_bytes());
     }
@@ -3663,8 +3703,17 @@ fn id_map(reader: &Cred, ns: &Rc<crate::cred::UserNs>, e: Entry) -> String {
 /// `/proc/<pid>/fdinfo/<n>`: position, flags (plus close-on-exec; files opened with open carry
 /// `O_LARGEFILE`), mount id, inode, the locks held through it, and the extra lines of eventfd,
 /// inotify, pidfd, epoll, timerfd and signalfd.
-fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno> {
-    let task = ps.leader(pid).ok_or(Errno::ENOENT)?;
+fn fdinfo(
+    ps: &View<'_>,
+    ns: &PidNs,
+    proc: ProcId,
+    tid: Option<Tid>,
+    fd: i32,
+) -> Result<String, Errno> {
+    if !ps.pid_exists(proc, tid) {
+        return Err(Errno::ESRCH);
+    }
+    let task = ps.task(proc, tid).ok_or(Errno::ENOENT)?;
     let res = task.res.borrow();
     let fds = res.fds.borrow();
     let file = fds.get(fd).map_err(|_| Errno::ENOENT)?;
@@ -4102,7 +4151,15 @@ fn net_file(
         let hex: Vec<String> = m.iter().map(|b| format!("{b:02x}")).collect();
         format!("{}\n", hex.join(":"))
     };
-    let st = k.traffic.get(&i.name);
+    // Host traffic counters and host tx_queue_len belong only to the initial network namespace;
+    // a new network namespace's `lo` starts with zero counters and Linux's default txqlen 1000
+    // (matching `/proc/net/dev` and rtnetlink)
+    let init_ns = ns.host_net.is_none();
+    let st = if init_ns {
+        k.traffic.get(&i.name)
+    } else {
+        crate::traffic::IfStats::default()
+    };
     Ok(match path {
         b"addr_len" => "6\n".to_owned(),
         b"address" => mac(i.mac.unwrap_or([0; 6])),
@@ -4121,7 +4178,11 @@ fn net_file(
         .to_owned(),
         b"tx_queue_len" => format!(
             "{}\n",
-            appine_hal::net::tx_queue_len(&i.name).unwrap_or(1000)
+            if init_ns {
+                appine_hal::net::tx_queue_len(&i.name).unwrap_or(1000)
+            } else {
+                1000
+            }
         ),
         b"type" => format!("{}\n", if loopback { 772 } else { 1 }),
         b"statistics/rx_bytes" => format!("{}\n", st.rx_bytes),
@@ -4306,14 +4367,14 @@ pub(crate) fn write(
             };
             return crate::cgroup::write(k, &writer, (*id, name), data);
         }
-        PseudoNode::Entry(pid, _, e @ (Entry::UidMap | Entry::GidMap)) => {
-            return write_id_map(k, (cred, opener), *pid, *e == Entry::GidMap, data);
+        PseudoNode::Entry(proc, _, e @ (Entry::UidMap | Entry::GidMap)) => {
+            return write_id_map(k, (cred, opener), *proc, *e == Entry::GidMap, data);
         }
-        PseudoNode::Entry(pid, _, Entry::Setgroups) => {
-            return write_setgroups(k, opener, *pid, data);
+        PseudoNode::Entry(proc, _, Entry::Setgroups) => {
+            return write_setgroups(k, opener, *proc, data);
         }
-        PseudoNode::Entry(pid, None, Entry::TimensOffsets) => {
-            return write_timens_offsets(k, opener, *pid, data);
+        PseudoNode::Entry(proc, None, Entry::TimensOffsets) => {
+            return write_timens_offsets(k, opener, *proc, data);
         }
         // Network namespace sysctls: the writer's namespace (crate::netconf)
         PseudoNode::NetConf(v6, dir, name) => {
@@ -4504,13 +4565,13 @@ pub(crate) fn write(
             .max(crate::pipe::PIPE_BUF)
             .next_power_of_two();
     }
-    if let PseudoNode::Entry(pid, _, Entry::OomScoreAdj) = node {
+    if let PseudoNode::Entry(proc, _, Entry::OomScoreAdj) = node {
         let value = kstrto(proc_number(data)?, true)?;
         if !(-1000..=1000).contains(&value) {
             return Err(Errno::EINVAL);
         }
         let value = value as i32;
-        let group = group_of(k, *pid).ok_or(Errno::ESRCH)?;
+        let group = group_of_id(k, *proc).ok_or(Errno::ESRCH)?;
         let mut g = group.borrow_mut();
         // As on Linux: going below the minimum needs CAP_SYS_RESOURCE, and with it the value
         // written also becomes the new minimum
@@ -4656,9 +4717,9 @@ pub(crate) fn write(
     }
     // Parsed the C way, as on Linux (0x prefix is hexadecimal, 0 prefix octal), keeping only 9
     // bits
-    if let PseudoNode::Entry(pid, _, Entry::CoredumpFilter) = node {
+    if let PseudoNode::Entry(proc, _, Entry::CoredumpFilter) = node {
         let value = kstrto(proc_number(data)?, false)?;
-        let group = group_of(k, *pid).ok_or(Errno::ESRCH)?;
+        let group = group_of_id(k, *proc).ok_or(Errno::ESRCH)?;
         group.borrow_mut().coredump_filter = value as u32 & 0x1ff;
     }
     Ok(())
@@ -4678,11 +4739,11 @@ pub(crate) fn write(
 fn write_id_map(
     k: &Kernel,
     (writer, opener): (&Cred, &Cred),
-    pid: Tid,
+    proc: ProcId,
     gid: bool,
     data: &[u8],
 ) -> Result<(), Errno> {
-    let g = group_of(k, pid).ok_or(Errno::ESRCH)?;
+    let g = group_of_id(k, proc).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
     let parent = ns.parent.clone().ok_or(Errno::EPERM)?;
     if opener.user_ns.id != ns.id && opener.user_ns.id != parent.id {
@@ -4733,8 +4794,8 @@ fn write_id_map(
 /// at open as Linux's `proc_setgroups_open` does, `EACCES`, and again here in case the process has
 /// moved to another namespace since, EPERM). Once denied it cannot be allowed again, and it cannot
 /// be denied after gid_map has been written (EPERM).
-fn write_setgroups(k: &Kernel, opener: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
-    let g = group_of(k, pid).ok_or(Errno::ESRCH)?;
+fn write_setgroups(k: &Kernel, opener: &Cred, proc: ProcId, data: &[u8]) -> Result<(), Errno> {
+    let g = group_of_id(k, proc).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
     if !opener.ns_capable(&ns, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
@@ -4768,7 +4829,7 @@ fn write_setgroups(k: &Kernel, opener: &Cred, pid: Tid, data: &[u8]) -> Result<(
 /// process uses for children: the opener needs `CAP_SYS_TIME` in its owner (EPERM; Linux's
 /// `file_ns_capable`), the clocks with the offsets added must be within [0, KTIME_SEC_MAX / 2]
 /// (ERANGE), and once a process has entered it is EACCES.
-fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
+fn write_timens_offsets(k: &Kernel, cred: &Cred, proc: ProcId, data: &[u8]) -> Result<(), Errno> {
     const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
     if data.len() >= 4096 {
         return Err(Errno::EINVAL);
@@ -4796,7 +4857,13 @@ fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Resul
             break;
         }
     }
-    let task = k.tasks.get(&pid).ok_or(Errno::ESRCH)?;
+    let g = group_of_id(k, proc).ok_or(Errno::ESRCH)?;
+    let tgid = g.borrow().tgid;
+    let task = k
+        .tasks
+        .get(&proc.pid)
+        .filter(|t| t.tgid == tgid)
+        .ok_or(Errno::ESRCH)?;
     let ns = task.ns.borrow().time_for_children.clone();
     if !cred.ns_capable(&ns.owner, cap::SYS_TIME) {
         return Err(Errno::EPERM);
@@ -4877,6 +4944,41 @@ pub(crate) fn group_of(k: &Kernel, pid: Tid) -> Option<&Rc<RefCell<ThreadGroup>>
     k.groups
         .get(&pid)
         .or_else(|| k.groups.get(&k.tasks.get(&pid)?.tgid))
+}
+
+/// Like [`group_of`], additionally requiring the thread group's non-reusable serial to match
+/// `proc.serial` so a held `/proc/<pid>` node never resolves to a new process reusing the pid.
+pub(crate) fn group_of_id(k: &Kernel, proc: ProcId) -> Option<&Rc<RefCell<ThreadGroup>>> {
+    group_of(k, proc.pid).filter(|g| g.borrow().serial == proc.serial)
+}
+
+fn pid_exists_in(k: &Kernel, proc: ProcId, tid: Option<Tid>) -> bool {
+    match (group_of_id(k, proc), tid) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        // An exited main thread stays, as a zombie, until the process is reaped
+        (Some(g), Some(t)) => {
+            let g = g.borrow();
+            g.threads.contains(&t) || (t == g.tgid && g.leader_exit.is_some())
+        }
+    }
+}
+
+/// Whether `node` refers to a process or thread that has been reaped (or exited, for a non-leader
+/// thread): reads at offset 0 of an already-open per-process file must fail with `ESRCH` instead
+/// of returning a cached open-time snapshot.
+pub(crate) fn gone(k: &Kernel, node: &PseudoNode) -> bool {
+    match node {
+        PseudoNode::Pid(proc, tid)
+        | PseudoNode::Entry(proc, tid, _)
+        | PseudoNode::Net(proc, tid, _)
+        | PseudoNode::Fd(proc, tid, _)
+        | PseudoNode::OpenFd(proc, tid, _)
+        | PseudoNode::FdInfo(proc, tid, _)
+        | PseudoNode::Ns(proc, tid, _) => !pid_exists_in(k, *proc, *tid),
+        PseudoNode::OpenExe(proc) => group_of_id(k, *proc).is_none(),
+        _ => false,
+    }
 }
 
 fn cpus() -> usize {

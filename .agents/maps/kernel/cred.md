@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint sysctl references to kernel/sysctl)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: honour SECBIT_NO_SETUID_FIXUP in for_access and clear dumpable/pdeathsig on foreign userns setns)
 
 ## Responsibilities
 
@@ -52,9 +52,9 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   forms, `getgroups`, `setgroups`; `capget`, `capset`; prctl `PR_*KEEPCAPS`, `PR_*SECUREBITS`,
   `PR_CAPBSET_READ/DROP`, `PR_CAP_AMBIENT`, `PR_*NO_NEW_PRIVS`.
 - Checks: `Cred::capable` (initial namespace), `capable_here` (own namespace), `ns_capable`,
-  `capable_wrt` (with respect to an inode's owner), `permission`, `owns`, `may_delete`,
-  `new_owner`, `for_access`, `searches_all`, `in_group`, `may_signal`, `may_ptrace`; id
-  translation `uid_in`/`uid_out`/`gid_in`/`gid_out`.
+  `capable_wrt` (with respect to an inode's owner), `caps_subset_of`, `permission`, `owns`,
+  `may_delete`, `new_owner`, `for_access`, `searches_all`, `in_group`, `may_signal`, `may_ptrace`;
+  id translation `uid_in`/`uid_out`/`gid_in`/`gid_out`.
 - Exec: `Cred::exec` with `FileCaps` from the program file.
 - Seccomp: `seccomp(2)` (277), prctl `PR_SET/GET_SECCOMP`, `seccomp::check` (syscall entry),
   `always_allowed` (fast path), the notify-fd ioctls, `get_filter`/`get_metadata` (ptrace),
@@ -87,8 +87,10 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   own namespace), and commit through `update`, which — like `commit_creds` — clears the process's
   dumpable flag and the calling thread's pdeathsig when effective or filesystem ids change or
   permitted grows. The capability prctls commit without these side effects, as Linux's do not
-  trigger them. `unshare(CLONE_NEWUSER)` and setns into a user namespace (both single-threaded
-  only) replace the credential without them either (correct for unshare, as in Linux).
+  trigger them. `unshare(CLONE_NEWUSER)` (single-threaded only) replaces the credential without
+  them (as in Linux); `setns` into a user namespace clears `dumpable` and `pdeathsig` when the new
+  credentials' capabilities are not a subset of the old ones (`!new.caps_subset_of(&old)`, i.e.
+  entering a foreign user namespace, matching Linux's `commit_creds`).
 - Capability fixups on uid changes (`cap_emulate_setxuid`, root meaning uid 0 of the credential's
   namespace): leaving root on all three uids clears permitted and effective unless `KEEP_CAPS`
   and always clears ambient; euid root → non-root clears effective, non-root → root sets
@@ -159,8 +161,9 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   and the umask: uid fsuid; gid the directory's when it is setgid, else fsgid; in a setgid
   directory a non-member without `CAP_FSETID` loses `S_ISGID` on a group-executable file before
   the umask applies; a directory keeps only its permissions and the sticky bit and inherits the
-  setgid bit of a setgid parent. `for_access`: filesystem ids set to the real ids, effective capabilities
-  to permitted only when the real uid is root in the namespace. `searches_all`: `CAP_DAC_READ_SEARCH`
+  setgid bit of a setgid parent. `for_access`: filesystem ids set to the real ids; unless
+  `SECBIT_NO_SETUID_FIXUP` is set, effective capabilities become permitted when the real uid is
+  root in the namespace and 0 otherwise (Linux's `access_override_creds`). `searches_all`: `CAP_DAC_READ_SEARCH`
   or `CAP_DAC_OVERRIDE` in the initial namespace (gates the no-BKL resolver).
 - `may_signal` (Linux `kill_ok_by_cred`): sender's real or effective uid equals the target's real
   or saved uid, or `CAP_KILL` over the target's namespace; callers add same group and SIGCONT
@@ -245,13 +248,9 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 - **seccomp logging is incomplete.** Logged actions reach only Appine's debug stderr (not the guest
   kernel log, where Linux's audit records appear without auditd), and USER_NOTIF is never logged
   although `SECCOMP_FILTER_FLAG_LOG` asks for it.
-- **`for_access` ignores `SECBIT_NO_SETUID_FIXUP`**, so access(2) answers differ for
-  capability-only sandboxes.
 - **Errno order differences.** setgroups reports `EINVAL`/`EFAULT` before the permission check's
   `EPERM`; capset does not mask bits above `CAP_LAST_CAP` (`EPERM` instead of silently ignoring
   them); `PR_CAPBSET_DROP` beyond 40 is `EINVAL` before `EPERM`.
-- **setns into a foreign user namespace keeps dumpable.** Entering a namespace not owned by the
-  caller's euid skips Linux's dumpable and pdeathsig reset (until the next execve).
 
 ## Open questions
 

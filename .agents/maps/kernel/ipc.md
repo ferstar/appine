@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint IPC and mqueue sysctl references to kernel/sysctl)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: translate /proc/sysvipc pids and show SHM_LOCKED, pin mqueue Notify registrant by weak ThreadGroup)
 
 ## Responsibilities
 
@@ -61,8 +61,10 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   times, `maxmsg`, `msgsize`, messages as `(priority, bytes)`, at most one `Notify` registration,
   the count of blocked receivers, and `sent`/`received` counters for edge-triggered polling. Its
   fd kind is `FileKind::MessageQueue`.
-- `Notify` — `Signal { tgid, sig, value }`, `None { tgid }` (`SIGEV_NONE`) or
-  `Socket { tgid, netlink socket, cookie }` (`SIGEV_THREAD` as musl and glibc implement it).
+- `Notify` — `Signal { owner, sig, value }`, `None { owner }` (`SIGEV_NONE`) or
+  `Socket { owner, netlink socket, cookie }` (`SIGEV_THREAD` as musl and glibc implement it),
+  where `owner` is a `Registrant { tgid, group: Weak<RefCell<ThreadGroup>> }` pinning the
+  registering process instance rather than a bare tgid.
 - `Limits` (`MqLimits`) — `queues_max`, `msg_max`, `msgsize_max`, `msg_default`,
   `msgsize_default` (defaults 256, 10, 8192, 10, 8192).
 - `MqDir` — a namespace's mqueue root: owner (the namespace's creator), mode 01777, times.
@@ -112,7 +114,9 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 - The `*ctl` calls strip `IPC_64` from cmd. `IPC_STAT` and the `*_STAT`/`*_STAT_ANY` forms encode
   the 64-bit layouts with ids mapped into the caller's user namespace and pids into its pid
   namespace; the `*_STAT` forms take an index and return the full id, and `*_STAT_ANY` skips the
-  read check. `IPC_INFO` and `*_INFO` return the highest used index.
+  read check. `IPC_INFO` and `*_INFO` return the highest used index. `/proc/sysvipc/{msg,sem,shm}`
+  (`proc_listing`) likewise translates stored global pids into the reader's pid namespace (0 when
+  invisible) and preserves `SHM_DEST` and `SHM_LOCKED` in `shm` perms.
 
 ### SysV message queues
 
@@ -211,8 +215,11 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   wall clock.
 - Senders, receivers and poll/epoll wait on the queue object; both directions wake it.
 - mq_notify validates the sigevent before the fd; NULL cancels the caller's own registration;
-  `SIGEV_THREAD` takes a netlink socket fd and a 32-byte cookie. While the registrant's process is
-  alive, any new registration is `EBUSY`, the registrant's own included; a registration ends when
+  `SIGEV_THREAD` takes a netlink socket fd and a 32-byte cookie. Registrant identity and liveness
+  are checked through `Registrant`'s weak `ThreadGroup` reference, so while the registering process
+  instance is alive, any new registration is `EBUSY`, the registrant's own included, and an exited
+  registrant whose fd table survives via `CLONE_FILES` neither blocks new registrations nor delivers
+  notifications to a later process reusing its tgid. A registration ends when
   it fires, when its registrant cancels it, when the registrant's process closes any descriptor of
   the queue (close, dup3 over it, close_range, close-on-exec, seccomp addfd replacing it, or its fd
   table going with its last thread; Linux's `mqueue_flush_file`), or when another process registers
@@ -272,14 +279,8 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   `unshare(CLONE_SYSVSEM|CLONE_NEWIPC)` or IPC setns applies and discards the `SEM_UNDO`
   adjustments of every thread in the process (Linux applies a shared undo list only when its last
   sharer leaves, and threads share one only with `CLONE_SYSVSEM`).
-- **`/proc/sysvipc` leaks global pids:** the listings print stored global pids without translating
-  them into the reader's pid namespace (the `*_STAT` syscalls do translate), and the shm listing
-  masks the mode with `0o1777`, hiding `SHM_LOCKED`.
 - **`semmns` and `shmall` are not enforced:** semget and shmget never fail with `ENOSPC` for the
   total number of semaphores or shm pages; both values are only reported.
-- **mqueue registrations are keyed by tgid alone:** one whose process exited while its fd table
-  lives on in another process (`CLONE_FILES`) stays registered, and a reused tgid looks alive and
-  would get the signal (Linux holds the registrant's `struct pid`).
 - **mqueue limits and root permissions are partly missing:** `RLIMIT_MSGQUEUE` is not enforced; mq_open and mq_unlink skip the root directory's permission check that the filesystem
   paths make (it matters once the 01777 root is chmod'ed), and unlink applies the sticky rule even
   when the root has lost `S_ISVTX`.
