@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: run cgroup device BPF on FUSE mknod and exempt only char 0:0 whiteout)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: return ENODEV on writes and reads of disabled-controller or removed-cgroup files)
 
 ## Responsibilities
 
@@ -85,9 +85,10 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   0 for ones it cannot see (Linux's task_pid_vnr). `cgroup.threads` only accepts moves within the
   same cgroup (`EOPNOTSUPP` otherwise); `cgroup.type` is always `domain` (`threaded` is
   `EOPNOTSUPP`).
-- Writes, in order: a removed cgroup `ENODEV`; on the root and on the writer's namespace root only
-  `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable (`EPERM`); a
-  read-only file `EINVAL`. `cgroup.subtree_control`: `+name`/`-name` tokens (anything else,
+- Writes, in order: a removed cgroup or a file whose controller is no longer enabled on that
+  cgroup `ENODEV` (`k.cgroups.get(id)` and `k.cgroups.files(id)`); on the root and on the writer's
+  namespace root only `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable
+  (`EPERM`); a read-only file `EINVAL`. `cgroup.subtree_control`: `+name`/`-name` tokens (anything else,
   including a token starting with a multi-byte character, `EINVAL`); enabling a
   controller not in `cgroup.controllers` `ENOENT`; enabling while the cgroup has processes `EBUSY`
   (except at the real root); disabling one a child still delegates `EBUSY`; disabling clears the
@@ -141,9 +142,11 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 - The file syscalls check mount flags and DAC. Read-only cgroup files can still open for root
   in a write mode, with writes failing `EINVAL`; write-only files cannot be read (`EINVAL`).
 - The shared synthetic-file path generates content at open (empty for write-only files). The
-  first read from offset 0 keeps that fresh snapshot unless the change counter moved; later
-  reads from offset 0 regenerate with the opener's credentials and the current reader's
-  namespaces and cgroup root. Other reads use the snapshot. `pseudo::content` delegates to
+  first read from offset 0 keeps that fresh snapshot unless the change counter moved or
+  `pseudo::gone` reports the cgroup or controller file gone; later reads from offset 0 regenerate
+  with the opener's credentials and the current reader's namespaces and cgroup root, with `file`
+  returning `ENODEV` when the cgroup or controller file is gone and `EINVAL` for write-only files.
+  Other reads use the snapshot. `pseudo::content` delegates to
   `file`, `proc_cgroup` and `proc_cgroups`; `pseudo::write` delegates to `write`, supplying the writer's pid namespace
   and cgroup root plus the opener's credentials for migration. Writes apply each buffer
   separately, do not advance the position and mark the snapshot stale.
@@ -227,11 +230,6 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 - **Delegation and controller gaps:** cgroup directories cannot be chmod'ed or chown'ed;
   threaded cgroups are unavailable; limits such as `cpu.max`, `cpu.weight`, `cpuset.cpus` and
   `memory.high` are stored without enforcement.
-- **cgroup write and read edge cases differ from kernfs:** writes are checked against
-  the global file table, not the cgroup's current files, so a descriptor opened before a
-  controller was disabled still stores a value (which returns when the controller is re-enabled;
-  a `memory.max` one runs the OOM check) where Linux gives `ENODEV`; a regenerating read of a
-  removed cgroup's file is `EINVAL` (Linux `ENODEV`).
 
 ## Open questions
 

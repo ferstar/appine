@@ -330,6 +330,10 @@ pub(crate) struct ThreadGroup {
     pub rlimits: [(u64, u64); RLIM_NLIMITS],
     /// How it ends while exiting as a whole (exit_group, fatal signal).
     pub exiting: Option<ExitStatus>,
+    /// `exiting` was set by [`crate::task::Task::begin_exit`] (all remaining live threads entered
+    /// single-thread `exit(2)` rather than `exit_group` or a fatal signal): needed by
+    /// `process_mrelease` to match Linux 6.1's `SIGNAL_GROUP_EXIT` vs `thread_group_empty`.
+    pub single_exit: bool,
     /// How the leader itself ended, a fallback for abnormal cleanup; on a normal exit the last
     /// thread to enter the exit path decides `exiting` (task::Task::begin_exit).
     pub leader_status: ExitStatus,
@@ -344,6 +348,10 @@ pub(crate) struct ThreadGroup {
     /// `leader_exit` so that CPU-clock reads and POSIX timers on the zombie leader's thread clock
     /// stay valid (stopped) until the process is reaped or a non-leader execve replaces it.
     pub leader_serial: Option<u64>,
+    /// Weak reference to the main thread's network namespace captured when it exits, so
+    /// `/proc/<pid>/net/*` keeps resolving to the process's network namespace while other threads
+    /// run or while that namespace lives.
+    pub leader_net: Option<std::rc::Weak<crate::nsproxy::NetNs>>,
     /// The signal sent to the parent on exit (the low 8 bits of clone, usually SIGCHLD), 0 meaning
     /// none.
     pub exit_signal: i32,
@@ -467,10 +475,12 @@ impl ThreadGroup {
             sighand,
             rlimits: default_rlimits(),
             exiting: None,
+            single_exit: false,
             leader_status: ExitStatus::Exited(0),
             zombie: None,
             leader_exit: None,
             leader_serial: None,
+            leader_net: None,
             exit_signal: Signal::CHLD.number(),
             ctty: None,
             tty_old_pgrp: None,

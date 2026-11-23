@@ -871,6 +871,7 @@ fn exec(
         ],
         secure,
         stack_limit,
+        arg_limit: limit,
     };
     // An interpreter the caller cannot read makes the process non-dumpable too (would_dump): its
     // owner and group
@@ -1232,6 +1233,7 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
             g.leader_exit = None;
             g.leader_serial = None;
             g.leader_tracer = None;
+            g.leader_net = None;
             g.children.clone()
         };
         // Children created by other threads were handed to this thread when they exited, and

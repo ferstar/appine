@@ -379,8 +379,10 @@ impl Task {
         if g.threads
             .iter()
             .all(|tid| k.tasks.get(tid).is_none_or(|t| t.exit_started.get()))
+            && g.exiting.is_none()
         {
-            g.exiting.get_or_insert(status);
+            g.exiting = Some(status);
+            g.single_exit = true;
         }
     }
 
@@ -967,7 +969,7 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             let past_eof = if unreadable {
                 Some(true)
             } else {
-                cx.mm_mut().fault_past_eof(addr)
+                cx.mm_mut().fault_past_eof(addr, need)
             };
             if past_eof == Some(false) {
                 // The file of a shared mapping grew and the new contents are mapped in: re-execute
@@ -1086,6 +1088,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
             let mut g = group.borrow_mut();
             g.leader_exit = Some((task.comm.get(), cpu));
             g.leader_serial = Some(task.serial);
+            g.leader_net = Some(Rc::downgrade(&task.ns.borrow().net));
         }
         let mut st = task.state.borrow_mut();
         // The process's last thread: sample the peak resident memory once before exiting

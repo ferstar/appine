@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: enforce ETXTBSY on nested scripts and PT_INTERP, and skip ptrace exec/syscall-exit on doomed images)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: compute secure exec argument limit before clamping the 8 MB stack limit)
 
 ## Responsibilities
 
@@ -72,7 +72,8 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   nosuid, or the owner/group are unmapped; file capabilities come from the xattr; a tracer without
   `CAP_SYS_PTRACE` or a fs context shared with another process makes the execution unsafe, so it
   gains nothing (`kernel/cred`). A secure exec clamps the stack limit to 8 MB (written back to
-  `RLIMIT_STACK`).
+  `RLIMIT_STACK`) after computing `Args::arg_limit` from the pre-clamp limit (allowing up to 6 MB
+  per Linux 6.1).
 - Under the BKL the main ELF is parsed and the interpreter file opened, read and its headers
   checked; then the BKL is released while a new address space (sharing the kernel's read-only file
   mappings, the vDSO image, host random bytes) and initial stack are built. Back under the BKL, a
@@ -181,8 +182,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 
 ## Confirmed bugs / technical debt
 
-- **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
-  whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
+None.
 
 ## Open questions
 

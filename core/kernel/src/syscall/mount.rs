@@ -1049,8 +1049,8 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
 /// move_mount(2) (Linux 6.1): needs `CAP_SYS_ADMIN`; source and target are each resolved from a
 /// directory fd (with `F_EMPTY_PATH`/`T_EMPTY_PATH` they may be the fd itself, with
 /// `F_SYMLINKS`/`T_SYMLINKS` the last symlink is followed), and the move works as `MS_MOVE`
-/// ([`move_tree`]). `MOVE_MOUNT_SET_GROUP` (putting the target in the source's peer group) is not
-/// implemented and always EINVAL, which Linux answers only when the source is not shared.
+/// ([`move_tree`]). With `MOVE_MOUNT_SET_GROUP` it instead copies `from`'s peer/slave sharing
+/// group to private mount `to` (Linux 6.1's `do_set_group`).
 pub(super) fn sys_move_mount(
     cx: &mut Cx<'_>,
     from: (i32, u64),
@@ -1067,9 +1067,55 @@ pub(super) fn sys_move_mount(
     let (src, _) = walk_at(cx, from, flags & F_EMPTY_PATH != 0, flags & F_SYMLINKS != 0)?;
     let target = walk_at(cx, to, flags & T_EMPTY_PATH != 0, flags & T_SYMLINKS != 0)?;
     if flags & SET_GROUP != 0 {
-        return Err(Errno::EINVAL);
+        return set_group(cx, &src, &target.0);
     }
     move_tree(cx, &src, target)
+}
+
+/// `move_mount(MOVE_MOUNT_SET_GROUP)` (Linux 6.1's `do_set_group`): copies the propagation peer
+/// group (or slave relationship, including shared-to-slave across different owning user
+/// namespaces) from attached shared/slave mount `src` to attached private mount `target` on the
+/// same filesystem instance whose root lies at or under `src`'s root.
+fn set_group(cx: &mut Cx<'_>, src: &Node, target: &Node) -> SysResult {
+    let vfs = cx.vfs()?;
+    let view = cx.view(&vfs);
+    let from_id = vfs.mount_root(src).ok_or(Errno::EINVAL)?;
+    let to_id = vfs.mount_root(target).ok_or(Errno::EINVAL)?;
+    let (Some(from), Some(to)) = (vfs.mount(from_id), vfs.mount(to_id)) else {
+        return Err(Errno::EINVAL);
+    };
+    let (Some(from_ns), Some(to_ns)) = (vfs.find_ns(from.ns), vfs.find_ns(to.ns)) else {
+        return Err(Errno::EINVAL);
+    };
+    if from_ns.anon || to_ns.anon {
+        return Err(Errno::EINVAL);
+    }
+    if !cx.cred().ns_capable(&from_ns.owner, cap::SYS_ADMIN)
+        || !cx.cred().ns_capable(&to_ns.owner, cap::SYS_ADMIN)
+    {
+        return Err(Errno::EPERM);
+    }
+    if from.fs != to.fs || from.dev != to.dev {
+        return Err(Errno::EINVAL);
+    }
+    let to_in_from = to.root.clone().in_mount(from.id);
+    if to_in_from != from.root && !vfs.is_under(&view, &to_in_from, &from.root) {
+        return Err(Errno::EINVAL);
+    }
+    if to.prop.group != 0 || to.prop.master != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if from.prop.group == 0 && from.prop.master == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let prop = if from_ns.owner.id == to_ns.owner.id {
+        from.prop.of_bind()
+    } else {
+        from.prop.of_slave_copy()
+    };
+    vfs.update_mount(to_id, |m| m.prop = prop);
+    cx.shared.fast_changed();
+    Ok(0)
 }
 
 /// mount_setattr(2) (Linux 6.1's `mount_setattr`, `build_mount_kattr`): changes the flags of a
@@ -1157,11 +1203,13 @@ pub(super) fn mount_setattr(
     )?;
     let vfs = cx.vfs()?;
     let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
-    // In the caller's namespace, or copied by open_tree and not yet attached
+    // In the caller's namespace, or the root of a tree copied by open_tree and not yet attached
+    // (Linux 6.1's do_mount_setattr: exempt only a mount without a parent in an anonymous ns)
     let anon = vfs
         .mount_ns(id)
         .and_then(|ns| vfs.find_ns(ns))
-        .is_some_and(|ns| ns.anon);
+        .is_some_and(|ns| ns.anon)
+        && vfs.mount(id).is_some_and(|m| m.point.is_none());
     if !anon {
         check_mnt(cx, &vfs, id)?;
     }
@@ -1347,11 +1395,19 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, target)?;
-    let node = lookup_at(cx, AT_FDCWD, &path, flags & UMOUNT_NOFOLLOW == 0)?;
+    let start = start_dir(cx, AT_FDCWD, &path)?;
+    let vfs = cx.vfs()?;
+    let node = vfs.resolve_mountpoint(
+        &cx.view(&vfs),
+        &cx.cred(),
+        &cx.root(),
+        &start,
+        &path,
+        flags & UMOUNT_NOFOLLOW == 0,
+    )?;
     if !may_mount(cx) || (flags & MNT_FORCE != 0 && !cx.cred().capable(cap::SYS_ADMIN)) {
         return Err(Errno::EPERM);
     }
-    let vfs = cx.vfs()?;
     // Paths such as `.` and the cwd also unmount what is mounted on them (LOOKUP_MOUNTPOINT)
     let node = vfs.mounted(node);
     let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
@@ -1369,10 +1425,10 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
         if busy(cx, &vfs, id) {
             return Err(Errno::EBUSY);
         }
-        // The first time only marks it; if nobody has used it, the next time unmounts it. Linux
-        // removes the mark once somebody has used it; here it is not removed
+        // The first time only marks it; if nobody has accessed it since (clearing the mark in
+        // Vfs::touch_mount), the next time unmounts it
         if !vfs.mount(id).is_some_and(|m| m.expiring) {
-            vfs.update_mount(id, |m| m.expiring = true);
+            vfs.set_expiring(id);
             return Err(Errno::EAGAIN);
         }
     }
@@ -1767,9 +1823,10 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     {
         return Err(Errno::EINVAL);
     }
+    let anon_ns = anon.then(|| vfs.mount_ns(id)).flatten();
     // An attached tree is in the namespace already; its copies count anyway
-    let targets = if anon {
-        let size = vfs.mount_ns(id).map_or(0, |ns| vfs.count_in(ns));
+    let targets = if let Some(ns_id) = anon_ns {
+        let size = vfs.count_in(ns_id);
         plan_attach(cx, &vfs, (&target, at.as_ref()), size, size)?
     } else {
         if vfs.is_under(&view, &target, src) {
@@ -1778,14 +1835,32 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
         let size = vfs.subtree(id).len();
         plan_attach(cx, &vfs, (&target, at.as_ref()), 0, size)?
     };
-    if anon {
+    if let Some(ns_id) = anon_ns {
         vfs.attach_tree(id, (target, at), cx.mnt_ns());
+        // Free the emptied anonymous namespace immediately (Linux 6.1's do_move_mount calls
+        // put_mnt_ns) so it stops counting against max_mnt_namespaces while the open_tree fd
+        // stays open
+        release_anon_ns(cx.kr(), ns_id);
     } else {
         vfs.move_mount(id, Some((target, at)));
     }
     vfs.attached(id);
     propagate(cx, &vfs, id, &targets);
     Ok(0)
+}
+
+/// Drops the anonymous mount namespace `ns_id` from any open `open_tree(OPEN_TREE_CLONE)` file
+/// once its mounts have been attached into a real namespace.
+fn release_anon_ns(k: &crate::kernel::Kernel, ns_id: u64) {
+    let mut files = k.open_files();
+    files.extend(crate::unix::inflight_files(k));
+    for file in files {
+        if let Ok(mut f) = file.try_borrow_mut()
+            && f.tree.as_ref().is_some_and(|ns| ns.id == ns_id)
+        {
+            f.tree = None;
+        }
+    }
 }
 
 /// Whether mounts may be changed (Linux's `may_mount`): `CAP_SYS_ADMIN` in the owner (a user

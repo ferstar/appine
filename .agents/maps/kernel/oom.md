@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: clear MAP_EXCLUSIVE on CoW-lent pages in pagemap)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: refine process_mrelease exiting check for deliverable fatal signals and zombie-leader thread groups, avoid RO-anon/CoW RSS inflation in resident_in)
 
 ## Responsibilities
 
@@ -73,7 +73,9 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   writable nor written by the kernel, measures private anonymous VMAs over 1 MB only over windows
   with entries, and uses the 1 s file-residency cache for unwritten private file mappings and all
   shared mappings with a file identity (so they can lag by a second). `resident_in` (smaps, OOM
-  kill log) uses the same windows but no skip and no cache.
+  kill log) uses the same windows, skips never-written private anonymous VMAs, excludes
+  `cow.borrowed` pages from the VMA's own host mincore pass so borrowed pages are never
+  double-counted, and uses no cache.
 - `Usage` (child cgroups' usage) measures address spaces as `resident_pages` does, but together:
   each file piece measured from the page cache counts once (device, inode, offset and length, so
   overlapping but different pieces of one file count separately), and the other spans, with every
@@ -152,9 +154,11 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 - The syscall (Linux 6.1's `mm/oom_kill.c`): any flag is `EINVAL`; the fd must be a pidfd (a
   `/proc/<pid>` directory is `EBADF`, unlike pidfd_send_signal), whose process has not been
   reaped and still has a thread in the task table (`ESRCH` otherwise: zombies, Linux's
-  `find_lock_task_mm`); that process must be exiting (`ThreadGroup::exiting` set: exit_group, a
-  fatal signal taken or SIGKILL sent, an OOM or host kill, or every thread in the exit path) and
-  not writing a core file, and so must every other process whose first live thread uses the same
+  `find_lock_task_mm`); that process must satisfy `will_free_mem` (not writing a core file, and
+  either group exit started via `exit_group`/`SIGKILL`/fatal signal/OOM kill, a single-thread
+  `exit(2)` with no zombie leader and `threads.len() == 1`, or a deliverable non-coredumping fatal
+  signal pending for an unblocked untraced thread as Linux's `complete_signal` starts group exit on
+  send), and so must every other process whose first live thread uses the same
   address space (`task_will_free_mem`), else `EINVAL`. It succeeds again on a second call. The
   process's peak resident memory is sampled first, so its `ru_maxrss` keeps what it used; if its
   address space is borrowed elsewhere at that moment nothing is released and 0 is returned.
@@ -206,12 +210,8 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 
 - **OOM scores omit swap and page tables:** a mostly swapped-out process ranks low although the
   root's usage counts VmSwap (Linux adds swap entries and page-table pages to `oom_badness`).
-- **process_mrelease judges "exiting" by `ThreadGroup::exiting`:** a fatal signal other than
-  SIGKILL sets it only when a thread takes the signal (Linux's `complete_signal` starts the group
-  exit when it is sent), so a release right after kill with SIGTERM is `EINVAL`; and when a main
-  thread has exited on its own, the last thread calling exit(2) counts as exiting, where Linux,
-  still seeing the zombie leader in the thread list, answers `EINVAL`. The OOM killer does not
-  release its victims' memory itself (Linux's oom_reaper does).
+- **OOM killer does not reap victims itself:** the OOM killer does not release its victims' memory
+  itself (Linux's oom_reaper does); only `process_mrelease` triggers `Mm::release`.
 
 ## Open questions
 

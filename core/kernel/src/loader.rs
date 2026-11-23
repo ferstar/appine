@@ -142,9 +142,12 @@ pub struct Args<'a> {
     /// A privileged exec (setuid, setgid, file capabilities, [`crate::cred::Cred::exec`]): sets
     /// `AT_SECURE`.
     pub secure: bool,
-    /// The stack size limit (the soft limit of `RLIMIT_STACK`): decides the address-space layout,
-    /// how much the arguments may take, and how large the initial stack mapping is.
+    /// The stack size limit (the soft limit of `RLIMIT_STACK`, already clamped to [`STACK_SIZE`]
+    /// for a secure exec): decides the address-space layout and initial stack mapping.
     pub stack_limit: u64,
+    /// Maximum stack space for argv/envp strings and pointers (`bprm_stack_limits`), computed
+    /// before clamping `RLIMIT_STACK` for a secure exec (so a secure exec still allows up to 6 MB).
+    pub arg_limit: usize,
 }
 
 /// The load result: pc and sp when the guest starts running, and the address ranges of the program
@@ -831,7 +834,7 @@ fn build_stack(
         + extra.iter().map(|s| s.len() + 1).sum::<usize>()
         + random.len();
     let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * (auxv.len() + 1);
-    if strings + words * 8 > arg_limit(args.stack_limit) {
+    if strings + words * 8 > args.arg_limit {
         return Err(LoadError::ArgumentsTooLong);
     }
 
@@ -1430,6 +1433,7 @@ mod tests {
                 ids: [0; 4],
                 secure: false,
                 stack_limit: STACK_SIZE,
+                arg_limit: arg_limit(STACK_SIZE),
             };
             load(&mut mm, &exe(&elf), &args, &mut no_interp).unwrap();
             mm.dbt_regs
@@ -1458,6 +1462,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         let image = load(
             &mut mm,
@@ -1545,6 +1550,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         let image = load(&mut mm, &exe(&main), &args, &mut read_interp).unwrap();
         assert_eq!(requested, b"/lib/ld.so");
@@ -1598,6 +1604,7 @@ mod tests {
                 ids: [0; 4],
                 secure: false,
                 stack_limit: STACK_SIZE,
+                arg_limit: arg_limit(STACK_SIZE),
             };
             let image = load(&mut mm, &file, &args, &mut no_interp).unwrap();
             assert!(mm.mmu().translate(0x41ffe8, prot::WRITE).is_some());
@@ -1621,6 +1628,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         assert_eq!(
             load(&mut mm, &exe(b"#!/bin/sh\n"), &args, &mut no_interp),
@@ -1645,6 +1653,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         let load_one = |f: &[u8]| load(&mut Mm::new(), &exe(f), &args, &mut no_interp);
         let ph = 64;
@@ -1846,6 +1855,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         let mut mm = Mm::new();
         let image = load(&mut mm, &exe(&img), &args, &mut no_interp).unwrap();
@@ -1923,5 +1933,36 @@ mod tests {
         for &(input, expected) in vectors {
             assert_eq!(sha256(input), expected);
         }
+    }
+
+    #[test]
+    fn secure_exec_keeps_preclamp_arg_limit_up_to_six_mb() {
+        let elf = tiny_elf(ET_EXEC, &[0; 4]);
+        // 3 MiB exceeds arg_limit(STACK_SIZE = 8 MiB) == 2 MiB, but fits within arg_limit(32 MiB) == 6 MiB.
+        let arg_chunk = vec![b'x'; 64 * 1024];
+        let argv_3m: Vec<Vec<u8>> = (0..48).map(|_| arg_chunk.clone()).collect();
+        let args_ok = Args {
+            argv: &argv_3m,
+            envp: &[],
+            execfn: b"/bin/suid",
+            ids: [1000, 0, 1000, 0],
+            secure: true,
+            stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(32 << 20),
+        };
+        let mut mm = Mm::new();
+        let image = load(&mut mm, &exe(&elf), &args_ok, &mut no_interp).unwrap();
+        assert_eq!(auxv(&mm, image.sp)[&AT_SECURE], 1);
+
+        // Over 6 MiB still fails with ArgumentsTooLong.
+        let argv_7m: Vec<Vec<u8>> = (0..112).map(|_| arg_chunk.clone()).collect();
+        let args_too_big = Args {
+            argv: &argv_7m,
+            ..args_ok
+        };
+        assert_eq!(
+            load(&mut Mm::new(), &exe(&elf), &args_too_big, &mut no_interp),
+            Err(LoadError::ArgumentsTooLong)
+        );
     }
 }

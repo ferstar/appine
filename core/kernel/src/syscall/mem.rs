@@ -578,7 +578,7 @@ pub(super) fn mlock(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32, lock: bool
     }
     cx.mm_mut().set_locked(start, span, lock)?;
     if lock && flags & MLOCK_ONFAULT == 0 {
-        cx.mm().populate(start, span);
+        cx.mm().populate_mlock(start, span)?;
     }
     Ok(0)
 }
@@ -718,7 +718,7 @@ pub(super) fn process_mrelease(cx: &mut Cx<'_>, pidfd: i32, flags: u32) -> SysRe
             .map(|t| t.res.borrow().mm.clone())
     };
     let mm = mm_of(&group.borrow()).ok_or(Errno::ESRCH)?;
-    let dying = |g: &crate::process::ThreadGroup| g.exiting.is_some() && g.core.is_none();
+    let dying = |g: &crate::process::ThreadGroup| will_free_mem(k, g);
     let sharers_dying = k
         .groups
         .values()
@@ -739,4 +739,64 @@ pub(super) fn process_mrelease(cx: &mut Cx<'_>, pidfd: i32, flags: u32) -> SysRe
         m.release();
     }
     Ok(0)
+}
+
+/// Linux 6.1's `task_will_free_mem`: true when the thread group is not writing a core file and
+/// either group exit has started (by `exit_group`, `SIGKILL`, fatal signal delivery, OOM kill,
+/// or a non-coredumping fatal signal pending for an unblocked, untraced thread as Linux's
+/// `complete_signal` sets `SIGNAL_GROUP_EXIT` on send), or it is a single-thread group (no
+/// zombie leader and only one thread) whose thread has entered `exit(2)`.
+fn will_free_mem(k: &crate::kernel::Kernel, g: &crate::process::ThreadGroup) -> bool {
+    if g.core.is_some() {
+        return false;
+    }
+    if g.exiting.is_some() {
+        let killed = g
+            .threads
+            .iter()
+            .any(|tid| k.tasks.get(tid).is_some_and(|t| t.killed.get()));
+        if !g.single_exit || killed || (g.leader_exit.is_none() && g.threads.len() == 1) {
+            return true;
+        }
+    }
+    has_fatal_pending(k, g)
+}
+
+/// Whether `g` has a pending non-coredumping fatal signal that Linux 6.1's `complete_signal`
+/// turns into `SIGNAL_GROUP_EXIT` immediately when sent: default action is terminate (not
+/// ignored, stop, continue, or coredump), the process is not an unkillable pid-namespace init,
+/// and a live, untraced thread does not block it.
+fn has_fatal_pending(k: &crate::kernel::Kernel, g: &crate::process::ThreadGroup) -> bool {
+    let unkillable = g.pid_ns.level > 0 && g.pid_ns.reaper.get() == Some(g.tgid) && !g.killable;
+    if unkillable {
+        return false;
+    }
+    let sighand = g.sighand.borrow();
+    let is_fatal_no_core = |sig: crate::process::Signal| {
+        sighand.get(sig).handler == crate::signal::SigAction::DEFAULT
+            && !sig.ignored_by_default()
+            && !sig.is_stop()
+            && sig != crate::process::Signal::CONT
+            && !crate::coredump::dumps_core(sig)
+    };
+    let group_pending = g.pending.set();
+    for tid in &g.threads {
+        let Some(t) = k.tasks.get(tid) else {
+            continue;
+        };
+        if t.trace.borrow().tracer.is_some() {
+            continue;
+        }
+        let mut bits = (group_pending | t.pending.borrow().set()) & !t.sigmask.get();
+        while bits != 0 {
+            let bit = bits.trailing_zeros();
+            bits &= bits - 1;
+            if let Some(sig) = crate::process::Signal::new(bit as i32 + 1)
+                && is_fatal_no_core(sig)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }

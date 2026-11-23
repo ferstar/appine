@@ -824,6 +824,74 @@ impl ProcId {
     }
 }
 
+/// A network namespace pinned on a `/proc/sys/net/*` node at lookup time (Linux's
+/// `sysctl_table_root::lookup`), so an open descriptor keeps reading and writing that namespace
+/// even after the process changes network namespaces or passes the fd across namespaces.
+#[derive(Clone)]
+pub(crate) struct PinnedNet(pub(crate) Rc<crate::nsproxy::NetNs>);
+
+impl std::fmt::Debug for PinnedNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PinnedNet").field(&self.0.id).finish()
+    }
+}
+
+impl PartialEq for PinnedNet {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+
+impl Eq for PinnedNet {}
+
+impl Hash for PinnedNet {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.id.hash(state);
+    }
+}
+
+/// An IPC namespace pinned on a SysV/mqueue sysctl node at lookup time, so an open descriptor
+/// keeps reading and writing that namespace even when read or written from another IPC namespace.
+#[derive(Clone)]
+pub(crate) struct PinnedIpc(pub(crate) Rc<crate::nsproxy::IpcNs>);
+
+impl std::fmt::Debug for PinnedIpc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PinnedIpc").field(&self.0.id).finish()
+    }
+}
+
+impl PartialEq for PinnedIpc {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+
+impl Eq for PinnedIpc {}
+
+impl Hash for PinnedIpc {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.id.hash(state);
+    }
+}
+
+/// Whether `path` in [`STATIC`] is a per-IPC-namespace sysctl file (SysV IPC or POSIX mqueue
+/// limits); excludes the `sys/fs/mqueue/` directory itself.
+fn is_ipc_sysctl_path(path: &[u8]) -> bool {
+    !path.ends_with(b"/")
+        && (path.starts_with(b"sys/fs/mqueue/")
+            || matches!(
+                path,
+                b"sys/kernel/msgmax"
+                    | b"sys/kernel/msgmnb"
+                    | b"sys/kernel/msgmni"
+                    | b"sys/kernel/sem"
+                    | b"sys/kernel/shmall"
+                    | b"sys/kernel/shmmax"
+                    | b"sys/kernel/shmmni"
+            ))
+}
+
 /// A node in a synthetic filesystem.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PseudoNode {
@@ -843,7 +911,14 @@ pub(crate) enum PseudoNode {
     /// `/proc/thread-self`.
     ThreadSelf,
     /// A directory or file under `/proc/sys` or `/proc/sysvipc`, with values from [`STATIC`].
+    /// Per-network-namespace and per-IPC-namespace sysctl paths use [`NetStatic`] and
+    /// [`IpcSysctl`] so their namespace stays pinned to the lookup/open namespace.
     Static(&'static [u8]),
+    /// A static directory or file under `/proc/sys/net/`, pinned to its lookup network namespace.
+    NetStatic(&'static [u8], PinnedNet),
+    /// A per-IPC-namespace sysctl under `/proc/sys/kernel/` or `/proc/sys/fs/mqueue/`, pinned to
+    /// its lookup IPC namespace.
+    IpcSysctl(&'static [u8], PinnedIpc),
     /// `/proc/<pid>`; with `Some(tid)` as the second item it is `/proc/<pid>/task/<tid>`.
     Pid(ProcId, Option<Tid>),
     /// `/proc/<pid>/<entry>` (including those in the task subdirectories).
@@ -891,12 +966,12 @@ pub(crate) enum PseudoNode {
     /// A queue in an mqueue filesystem: the IPC namespace and the queue's inode number.
     Mq(u64, u64),
     /// `/proc/sys/net/ipv4/conf/<dir>` (first item false) or `ipv6/conf/<dir>` (empty name), or an
-    /// entry under it (names from the [`crate::netconf`] tables); follows the reader's network
+    /// entry under it (names from the [`crate::netconf`] tables), pinned to its lookup network
     /// namespace ([`crate::netdev::conf_read`]).
-    NetConf(bool, crate::netdev::ConfDir, &'static [u8]),
+    NetConf(bool, crate::netdev::ConfDir, &'static [u8], PinnedNet),
     /// A sysctl under `/proc/sys/net/` (one in [`crate::netconf::SYSCTLS`], with paths like
-    /// `ipv4/tcp_keepalive_time`), following the reader's network namespace.
-    NetSysctl(&'static str),
+    /// `ipv4/tcp_keepalive_time`), pinned to its lookup network namespace.
+    NetSysctl(&'static str, PinnedNet),
 }
 
 /// The cgroup2 mount point `fs/cgroup` in sysfs (an empty directory when nothing is mounted).
@@ -1052,12 +1127,26 @@ impl<'a> View<'a> {
             })
     }
 
-    /// The directory under `/proc/sys/net/ipv*/conf` still exists (the interface was not
+    /// The directory under `/proc/sys/net/ipv*/conf` still exists in `net` (the interface was not
     /// removed).
-    fn conf_dir_exists(&self, dir: crate::netdev::ConfDir) -> bool {
+    fn conf_dir_exists_in(net: &crate::nsproxy::NetNs, dir: crate::netdev::ConfDir) -> bool {
         match dir {
-            crate::netdev::ConfDir::Dev(i) => self.interface(i).is_some(),
+            crate::netdev::ConfDir::Dev(i) => crate::netdev::interfaces(net)
+                .into_iter()
+                .any(|iface| iface.index == i),
             _ => true,
+        }
+    }
+
+    /// Wraps a [`STATIC`] path, pinning the lookup's network or IPC namespace when the entry is
+    /// scoped to one.
+    fn static_node(&self, path: &'static [u8]) -> PseudoNode {
+        if path.starts_with(b"sys/net/") {
+            PseudoNode::NetStatic(path, PinnedNet(self.ns().net))
+        } else if is_ipc_sysctl_path(path) {
+            PseudoNode::IpcSysctl(path, PinnedIpc(self.ns().ipc))
+        } else {
+            PseudoNode::Static(path)
         }
     }
 
@@ -1132,7 +1221,16 @@ impl Pseudo for View<'_> {
             Mq(ns, _) => MqRoot(*ns),
             Pts(fs, _) | PtsPtmx(fs) => PtsRoot(*fs),
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
-            Static(path) => tree_parent(&STATIC, path).map_or(ProcRoot, Static),
+            Static(path) | IpcSysctl(path, _) => {
+                tree_parent(&STATIC, path).map_or(ProcRoot, Static)
+            }
+            NetStatic(path, net) => tree_parent(&STATIC, path).map_or(ProcRoot, |p| {
+                if p.starts_with(b"sys/net/") {
+                    NetStatic(p, net.clone())
+                } else {
+                    Static(p)
+                }
+            }),
             Sys(path) => tree_parent(&SYS_STATIC, path)
                 .or_else(|| tree_parent(SYS_GPU, path))
                 .map_or(SysRoot, Sys),
@@ -1151,13 +1249,15 @@ impl Pseudo for View<'_> {
                 tree_parent(&BLOCK_FILES, path).map_or(SysBlock(*n, b""), |p| SysBlock(*n, p))
             }
             Cgroup(id, _) => Cgroup(*id, b""),
-            NetConf(v6, _, b"") => Static(if *v6 { NET_CONF6 } else { NET_CONF4 }),
-            NetSysctl(path) => {
+            NetConf(v6, _, b"", net) => {
+                NetStatic(if *v6 { NET_CONF6 } else { NET_CONF4 }, net.clone())
+            }
+            NetSysctl(path, net) => {
                 let dir = &path[..=path.find('/').unwrap_or(0)];
                 tree_lookup(&STATIC, b"sys/net/", dir.trim_end_matches('/').as_bytes())
-                    .map_or(ProcRoot, Static)
+                    .map_or(ProcRoot, |p| NetStatic(p, net.clone()))
             }
-            NetConf(v6, dir, _) => NetConf(*v6, *dir, b""),
+            NetConf(v6, dir, _, net) => NetConf(*v6, *dir, b"", net.clone()),
             Pid(proc, Some(_)) => Entry(*proc, None, self::Entry::Task),
             Entry(proc, tid, _) => Pid(*proc, *tid),
             Net(proc, tid, _) => Entry(*proc, *tid, self::Entry::Net),
@@ -1179,7 +1279,9 @@ impl Pseudo for View<'_> {
             Global(g) => GLOBALS.iter().find(|(_, x)| x == g).unwrap().0.to_vec(),
             SelfLink => b"self".to_vec(),
             ThreadSelf => b"thread-self".to_vec(),
-            Static(path) | Sys(path) => tree_name(path).to_vec(),
+            Static(path) | NetStatic(path, _) | IpcSysctl(path, _) | Sys(path) => {
+                tree_name(path).to_vec()
+            }
             SysRoot => b"sys".to_vec(),
             MqRoot(_) => b"mqueue".to_vec(),
             Mq(ns, ino) => self
@@ -1194,11 +1296,11 @@ impl Pseudo for View<'_> {
                 .interface(*n)
                 .map_or_else(|| n.to_string(), |i| i.name)
                 .into_bytes(),
-            NetConf(_, dir, b"") => {
-                crate::netdev::conf_dir_name(&self.ns().net, *dir).unwrap_or_else(|| b"?".to_vec())
+            NetConf(_, dir, b"", net) => {
+                crate::netdev::conf_dir_name(&net.0, *dir).unwrap_or_else(|| b"?".to_vec())
             }
-            NetConf(_, _, name) => name.to_vec(),
-            NetSysctl(path) => tree_name(path.as_bytes()).to_vec(),
+            NetConf(_, _, name, _) => name.to_vec(),
+            NetSysctl(path, _) => tree_name(path.as_bytes()).to_vec(),
             SysNet(_, path) => tree_name(path).to_vec(),
             SysBlock(n, b"") => format!("loop{n}").into_bytes(),
             SysBlock(_, path) => tree_name(path).to_vec(),
@@ -1283,23 +1385,26 @@ impl Pseudo for View<'_> {
                         Some(Pid(ProcId::of(pid, &g.borrow()), None))
                     }),
             },
-            Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
-                crate::netdev::conf_dirs(&self.ns().net)
+            Static(path) => tree_lookup(&STATIC, path, name).map(|p| self.static_node(p)),
+            NetStatic(path, net) if *path == NET_CONF4 || *path == NET_CONF6 => {
+                crate::netdev::conf_dirs(&net.0)
                     .into_iter()
                     .find(|(n, _)| n == name)
-                    .map(|(_, d)| NetConf(*path == NET_CONF6, d, b""))
+                    .map(|(_, d)| NetConf(*path == NET_CONF6, d, b"", net.clone()))
             }
-            Static(path) => tree_lookup(&STATIC, path, name).map(Static).or_else(|| {
-                let rest = path.strip_prefix(b"sys/net/")?;
-                let full = [rest, name].concat();
-                let init = self.ns().net.host_net.is_none();
-                crate::netconf::sysctl(&full, init).map(|e| NetSysctl(e.0))
-            }),
-            NetConf(v6, dir, b"") => crate::netconf::table(*v6)
+            NetStatic(path, net) => tree_lookup(&STATIC, path, name)
+                .map(|p| NetStatic(p, net.clone()))
+                .or_else(|| {
+                    let rest = path.strip_prefix(b"sys/net/")?;
+                    let full = [rest, name].concat();
+                    let init = net.0.host_net.is_none();
+                    crate::netconf::sysctl(&full, init).map(|e| NetSysctl(e.0, net.clone()))
+                }),
+            NetConf(v6, dir, b"", net) => crate::netconf::table(*v6)
                 .iter()
                 .find(|(n, ..)| n.as_bytes() == name)
-                .filter(|_| self.conf_dir_exists(*dir))
-                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes())),
+                .filter(|_| Self::conf_dir_exists_in(&net.0, *dir))
+                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes(), net.clone())),
             SysRoot => tree_lookup(&SYS_STATIC, b"", name)
                 .or_else(|| {
                     self.k
@@ -1415,14 +1520,14 @@ impl Pseudo for View<'_> {
             PtsRoot(_) | ProcRoot | Pid(..) | SysRoot | MqRoot(_) => mode::S_IFDIR,
             Mq(..) => mode::S_IFREG,
             Sys(b"dev/char/226:128/device/subsystem") => mode::S_IFLNK,
-            Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
+            Static(p) | NetStatic(p, _) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) | SysNet(_, p) | SysBlock(_, p) if p.is_empty() || p.ends_with(b"/") => {
                 mode::S_IFDIR
             }
             Cgroup(_, b"") => mode::S_IFDIR,
-            NetSysctl(_) => mode::S_IFREG,
-            NetConf(_, dir, name) => {
-                if !self.conf_dir_exists(*dir) {
+            NetSysctl(..) | IpcSysctl(..) => mode::S_IFREG,
+            NetConf(_, dir, name, net) => {
+                if !Self::conf_dir_exists_in(&net.0, *dir) {
                     return Err(Errno::ENOENT);
                 }
                 if name.is_empty() {
@@ -1693,9 +1798,11 @@ impl View<'_> {
             ProcRoot if numbered(b"") => return None,
             ProcRoot => format!("/proc/{name_text}"),
             // Interfaces
-            Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => return None,
-            Static(path) => format!("/proc/{}{name_text}", text(path)),
-            NetConf(v6, _, b"") => {
+            Static(path) | NetStatic(path, _) if *path == NET_CONF4 || *path == NET_CONF6 => {
+                return None;
+            }
+            Static(path) | NetStatic(path, _) => format!("/proc/{}{name_text}", text(path)),
+            NetConf(v6, _, b"", _) => {
                 let v = if *v6 { 6 } else { 4 };
                 format!("/proc/sys/net/ipv{v}/conf/<interface>/{name_text}")
             }
@@ -1872,7 +1979,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
                 .map_or(0o666, |v| v.devpts_options(*fs).ptmxmode)
         }
         (_, PseudoNode::Entry(_, _, Entry::Mem)) => 0o600,
-        (_, PseudoNode::NetSysctl(path)) => {
+        (_, PseudoNode::NetSysctl(path, _)) => {
             u32::from(crate::netconf::sysctl(path.as_bytes(), true).map_or(0o444, |e| e.2))
         }
         (_, PseudoNode::Static(p)) if recorded(p).is_some() => recorded(p).map_or(0o444, |e| e.1),
@@ -1895,9 +2002,14 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         _ => None,
     };
     let (atime_ns, mtime_ns, ctime_ns) = times.unwrap_or((now, now, now));
-    // net.* sysctls belong to root of the user namespace owning the network namespace, when it
-    // maps one (net_ctl_set_ownership)
-    let (uid, gid) = if is_net_sysctl(node) {
+    // net.* sysctls belong to root of the user namespace owning the pinned network namespace,
+    // when it maps one (net_ctl_set_ownership)
+    let (uid, gid) = if let Some(net) = pinned_net(node) {
+        let owner = &net.0.owner;
+        let uid = owner.uid_map.borrow().down(0).unwrap_or(0);
+        let gid = owner.gid_map.borrow().down(0).unwrap_or(0);
+        (uid, gid)
+    } else if is_net_sysctl(node) {
         let owner = ps.ns().net.owner.clone();
         let uid = owner.uid_map.borrow().down(0).unwrap_or(0);
         let gid = owner.gid_map.borrow().down(0).unwrap_or(0);
@@ -1954,21 +2066,34 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
     }
 }
 
-/// For a node under `/proc/sys`, whether it is a `net.*` one of the reader's network namespace;
-/// `None` for the rest of procfs. Opening one follows `proc_sys_permission`'s rules.
+/// For a node under `/proc/sys`, whether it is a `net.*` one; `None` for the rest of procfs.
+/// Opening one follows `proc_sys_permission`'s rules.
 pub(crate) fn sysctl_kind(node: &PseudoNode) -> Option<bool> {
     match node {
         PseudoNode::Static(p) if p.starts_with(b"sys/") => Some(is_net_sysctl(node)),
-        PseudoNode::NetSysctl(_) | PseudoNode::NetConf(..) => Some(true),
+        PseudoNode::IpcSysctl(..) => Some(false),
+        PseudoNode::NetStatic(..) | PseudoNode::NetSysctl(..) | PseudoNode::NetConf(..) => {
+            Some(true)
+        }
         _ => None,
     }
 }
 
-/// A `net.*` sysctl (or directory) of the reader's network namespace.
+/// The pinned network namespace of a `net.*` sysctl node, if any.
+fn pinned_net(node: &PseudoNode) -> Option<&PinnedNet> {
+    match node {
+        PseudoNode::NetStatic(_, net)
+        | PseudoNode::NetSysctl(_, net)
+        | PseudoNode::NetConf(_, _, _, net) => Some(net),
+        _ => None,
+    }
+}
+
+/// A `net.*` sysctl (or directory) of a network namespace.
 fn is_net_sysctl(node: &PseudoNode) -> bool {
     match node {
         PseudoNode::Static(p) => p.starts_with(b"sys/net/"),
-        PseudoNode::NetSysctl(_) | PseudoNode::NetConf(..) => true,
+        PseudoNode::NetStatic(..) | PseudoNode::NetSysctl(..) | PseudoNode::NetConf(..) => true,
         _ => false,
     }
 }
@@ -2047,19 +2172,22 @@ pub(crate) fn readdir(
             pids.sort_unstable_by_key(|&(vnr, _)| vnr);
             nodes.extend(pids.into_iter().map(|(_, proc)| Pid(proc, None)));
         }
-        Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
+        Static(path) => {
+            nodes.extend(tree_children(&STATIC, path).map(|p| ps.static_node(p)));
+        }
+        NetStatic(path, net) if *path == NET_CONF4 || *path == NET_CONF6 => {
             let v6 = *path == NET_CONF6;
             nodes.extend(
-                crate::netdev::conf_dirs(&ps.ns().net)
+                crate::netdev::conf_dirs(&net.0)
                     .into_iter()
-                    .map(|(_, d)| NetConf(v6, d, b"")),
+                    .map(|(_, d)| NetConf(v6, d, b"", net.clone())),
             );
         }
-        Static(path) => {
-            nodes.extend(tree_children(&STATIC, path).map(Static));
+        NetStatic(path, net) => {
+            nodes.extend(tree_children(&STATIC, path).map(|p| NetStatic(p, net.clone())));
             // The sysctls under /proc/sys/net/core, ipv4, ipv6 and unix
             if let Some(dir) = path.strip_prefix(b"sys/net/") {
-                let init = ps.ns().net.host_net.is_none();
+                let init = net.0.host_net.is_none();
                 nodes.extend(
                     crate::netconf::SYSCTLS
                         .iter()
@@ -2068,14 +2196,14 @@ pub(crate) fn readdir(
                                 && p.as_bytes().starts_with(dir)
                                 && !p.as_bytes()[dir.len()..].contains(&b'/')
                         })
-                        .map(|e| NetSysctl(e.0)),
+                        .map(|e| NetSysctl(e.0, net.clone())),
                 );
             }
         }
-        NetConf(v6, dir, b"") => nodes.extend(
+        NetConf(v6, dir, b"", net) => nodes.extend(
             crate::netconf::table(*v6)
                 .iter()
-                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes())),
+                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes(), net.clone())),
         ),
         SysRoot => {
             nodes.extend(tree_children(&SYS_STATIC, b"").map(Sys));
@@ -2259,11 +2387,24 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
     if let PseudoNode::Cgroup(_, name) = node {
         return crate::cgroup::file_mode(name).is_some_and(|m| m & 0o200 != 0);
     }
-    if let PseudoNode::NetConf(_, _, name) = node {
+    if let PseudoNode::NetConf(_, _, name, _) = node {
         return !name.is_empty() && !crate::netconf::read_only(name);
     }
-    if let PseudoNode::NetSysctl(path) = node {
+    if let PseudoNode::NetSysctl(path, _) = node {
         return crate::netconf::sysctl(path.as_bytes(), true).is_some_and(|e| e.2 & 0o200 != 0);
+    }
+    if let PseudoNode::NetStatic(p, _) = node {
+        return matches!(
+            *p,
+            b"sys/net/core/somaxconn"
+                | b"sys/net/ipv4/ip_forward"
+                | b"sys/net/ipv4/ip_local_port_range"
+                | b"sys/net/ipv4/ip_unprivileged_port_start"
+                | b"sys/net/ipv4/ping_group_range"
+        );
+    }
+    if matches!(node, PseudoNode::IpcSysctl(..)) {
+        return true;
     }
     matches!(
         node,
@@ -2287,20 +2428,8 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/fs/protected_symlinks"
                     | b"sys/kernel/printk"
                     | b"sys/kernel/printk_devkmsg"
-                    | b"sys/kernel/msgmax"
-                    | b"sys/kernel/msgmnb"
-                    | b"sys/kernel/msgmni"
-                    | b"sys/kernel/sem"
-                    | b"sys/kernel/shmall"
-                    | b"sys/kernel/shmmax"
-                    | b"sys/kernel/shmmni"
                     | b"sys/fs/lease-break-time"
                     | b"sys/fs/aio-max-nr"
-                    | b"sys/fs/mqueue/msg_default"
-                    | b"sys/fs/mqueue/msg_max"
-                    | b"sys/fs/mqueue/msgsize_default"
-                    | b"sys/fs/mqueue/msgsize_max"
-                    | b"sys/fs/mqueue/queues_max"
                     | b"sys/fs/mount-max"
                     | b"sys/fs/nr_open"
                     | b"sys/fs/pipe-max-size"
@@ -2309,11 +2438,6 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/fs/inotify/max_user_watches"
                     | b"sys/vm/max_map_count"
                     | b"sys/vm/mmap_min_addr"
-                    | b"sys/net/core/somaxconn"
-                    | b"sys/net/ipv4/ip_forward"
-                    | b"sys/net/ipv4/ip_local_port_range"
-                    | b"sys/net/ipv4/ip_unprivileged_port_start"
-                    | b"sys/net/ipv4/ping_group_range"
                     | b"sys/kernel/tainted"
                     | b"sys/kernel/modprobe"
                     | b"sys/vm/overcommit_memory"
@@ -2351,7 +2475,10 @@ pub(crate) fn unwritable_error(node: &PseudoNode) -> Option<Errno> {
 pub(crate) fn open_unwritable(node: &PseudoNode, for_write: bool) -> Result<(), Errno> {
     match node {
         PseudoNode::Static(p) if p.starts_with(b"sys/") => Err(Errno::EACCES),
-        PseudoNode::NetConf(..) | PseudoNode::NetSysctl(_) => Err(Errno::EACCES),
+        PseudoNode::NetStatic(..)
+        | PseudoNode::IpcSysctl(..)
+        | PseudoNode::NetConf(..)
+        | PseudoNode::NetSysctl(..) => Err(Errno::EACCES),
         _ if unwritable_error(node).is_some() || !for_write => Ok(()),
         _ => Err(Errno::EACCES),
     }
@@ -2367,9 +2494,11 @@ pub(crate) fn pollable(node: &PseudoNode) -> bool {
         node,
         Global(_)
             | Static(_)
+            | NetStatic(..)
+            | IpcSysctl(..)
             | Net(..)
             | NetConf(..)
-            | NetSysctl(_)
+            | NetSysctl(..)
             | Entry(_, _, self::Entry::Mounts | self::Entry::MountInfo)
             | Sys(_)
             | SysCpu(..)
@@ -2377,6 +2506,38 @@ pub(crate) fn pollable(node: &PseudoNode) -> bool {
             | SysBlock(..)
             | Cgroup(..)
     )
+}
+
+/// Whether Linux 6.1 gives synthetic file `node` a `read_iter` (or, with `write`, a `write_iter`)
+/// operation, required by native AIO (`io_submit` returns `EINVAL` without). Sysfs, cgroup2 and
+/// `/proc/sys` (`kernfs_file_fops`, `proc_sys_file_operations`) implement both; procfs `seq_file`
+/// views implement `read_iter` (`seq_read_iter`) only; `/proc/kmsg`, nsfs and custom procfs files
+/// (`/proc/<pid>/mem`, `pagemap`, `cmdline`, `environ`, `auxv`, `oom_score_adj`,
+/// `coredump_filter`) implement neither.
+pub(crate) fn has_iter(node: &PseudoNode, write: bool) -> bool {
+    use PseudoNode::*;
+    match node {
+        Sys(_) | SysCpu(..) | SysNet(..) | SysBlock(..) | Cgroup(..) | NetStatic(..)
+        | IpcSysctl(..) | NetConf(..) | NetSysctl(..) => true,
+        Static(p) if p.starts_with(b"sys/") => true,
+        Static(p) if p.starts_with(b"sysvipc/") => !write,
+        Global(self::Global::Kmsg | self::Global::Mounts | self::Global::Net) => false,
+        Global(_) | Net(..) | FdInfo(..) => !write,
+        Entry(
+            _,
+            _,
+            self::Entry::Mem
+            | self::Entry::Pagemap
+            | self::Entry::Cmdline
+            | self::Entry::Environ
+            | self::Entry::Auxv
+            | self::Entry::OomScoreAdj
+            | self::Entry::CoredumpFilter,
+        ) => false,
+        Entry(..) => !write,
+        NsFile(..) => false,
+        _ => false,
+    }
 }
 
 /// Files that cannot be read: write-only cgroup files (`cgroup.kill`); as on Linux this is not
@@ -2437,7 +2598,24 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             }
             let full = ps
                 .task(*proc, *tid)
-                .map_or_else(|| ps.k.init_ns.net.clone(), |t| t.ns.borrow().net.clone());
+                .map(|t| t.ns.borrow().net.clone())
+                .or_else(|| {
+                    let g = ps.group(*proc)?;
+                    let g = g.borrow();
+                    // Zombie leader: keep using the process's netns (prefer the leader's netns
+                    // if still alive, else any live thread in the thread group) rather than
+                    // falling back to the initial namespace.
+                    g.leader_net
+                        .as_ref()
+                        .and_then(std::rc::Weak::upgrade)
+                        .or_else(|| {
+                            g.threads
+                                .iter()
+                                .find_map(|t| ps.k.tasks.get(t))
+                                .map(|t| t.ns.borrow().net.clone())
+                        })
+                })
+                .unwrap_or_else(|| ps.k.init_ns.net.clone());
             let net = Some(full.clone()).filter(|n| n.host_net.is_some());
             let id = net.as_ref().map_or(crate::nsproxy::INIT_NET_NS, |n| n.id);
             // The uid column is translated through the reader's user namespace (Linux's
@@ -2464,7 +2642,16 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 b"arp" => crate::net::PROC_ARP.to_owned(),
                 b"dev" => net_dev(ps.k, &ifaces, net.is_none()),
                 b"netstat" => crate::net::proc_netstat(protocols),
-                b"snmp" => crate::net::proc_snmp(&socks, protocols),
+                b"snmp" => {
+                    let mut s = crate::net::proc_snmp(&socks, protocols);
+                    // RFC 1213 ipForwarding: 1 when ip_forward is enabled in this netns, 2 when off
+                    if crate::netdev::ip_forward(&full) != 0
+                        && let Some(pos) = s.find("\nIp: 2 ")
+                    {
+                        s.replace_range(pos + 5..pos + 6, "1");
+                    }
+                    s
+                }
                 b"if_inet6" => net_if_inet6(&ifaces),
                 b"route" => crate::route::proc_route(&tables()),
                 b"ipv6_route" => crate::route::proc_ipv6_route(&tables()),
@@ -2482,15 +2669,38 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 _ => return Err(Errno::ENOENT),
             }
         }
+        NetStatic(path, net) => match &path[..] {
+            b"sys/net/core/somaxconn" => format!("{}\n", net.0.devs.borrow().conf.somaxconn),
+            b"sys/net/ipv4/ip_forward" => format!("{}\n", crate::netdev::ip_forward(&net.0)),
+            b"sys/net/ipv4/ip_local_port_range" => {
+                let (lo, hi) = net.0.devs.borrow().conf.port_range;
+                format!("{lo}\t{hi}\n")
+            }
+            b"sys/net/ipv4/ip_unprivileged_port_start" => {
+                format!("{}\n", net.0.devs.borrow().conf.prot_sock)
+            }
+            b"sys/net/ipv4/ping_group_range" => {
+                // Kernel IDs, shown in the reader's namespace (65534 when unmapped)
+                let (lo, hi) = net.0.devs.borrow().conf.ping_group;
+                let r = ps.reader();
+                format!("{}\t{}\n", r.gid_out(lo as u32), r.gid_out(hi as u32))
+            }
+            _ => return Err(Errno::EISDIR),
+        },
+        IpcSysctl(path, ipc) => match &path[..] {
+            p if p.starts_with(b"sys/fs/mqueue/") => {
+                format!("{}\n", ps.k.ipc(ipc.0.id).mq_limits.get(&p[14..]).unwrap_or(0))
+            }
+            b"sys/kernel/msgmax" | b"sys/kernel/msgmnb" | b"sys/kernel/msgmni"
+            | b"sys/kernel/sem" | b"sys/kernel/shmall" | b"sys/kernel/shmmax"
+            | b"sys/kernel/shmmni" => ps.k.ipc(ipc.0.id).tunables.read(&path[11..]).unwrap(),
+            _ => return Err(Errno::EISDIR),
+        },
         Static(path) => match &path[..] {
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
             b"sys/fs/lease-break-time" => format!("{}\n", ps.k.lease_break_time),
             b"sys/fs/aio-max-nr" => format!("{}\n", ps.k.aio_max_nr),
             b"sys/fs/aio-nr" => format!("{}\n", ps.k.aio_nr),
-            p if p.starts_with(b"sys/fs/mqueue/") => {
-                let ns = ps.ns().ipc.id;
-                format!("{}\n", ps.k.ipc(ns).mq_limits.get(&p[14..]).unwrap_or(0))
-            }
             b"sys/fs/inotify/max_queued_events" => {
                 format!("{}\n", ps.k.inotify.borrow().max_queued)
             }
@@ -2506,23 +2716,6 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
             b"sys/fs/pipe-user-pages-soft" => "16384\n".to_owned(),
             b"sys/kernel/cap_last_cap" => "40\n".to_owned(),
-            b"sys/net/core/somaxconn" => {
-                format!("{}\n", ps.ns().net.devs.borrow().conf.somaxconn)
-            }
-            b"sys/net/ipv4/ip_forward" => format!("{}\n", crate::netdev::ip_forward(&ps.ns().net)),
-            b"sys/net/ipv4/ip_local_port_range" => {
-                let (lo, hi) = ps.ns().net.devs.borrow().conf.port_range;
-                format!("{lo}\t{hi}\n")
-            }
-            b"sys/net/ipv4/ip_unprivileged_port_start" => {
-                format!("{}\n", ps.ns().net.devs.borrow().conf.prot_sock)
-            }
-            b"sys/net/ipv4/ping_group_range" => {
-                // Kernel IDs, shown in the reader's namespace (65534 when unmapped)
-                let (lo, hi) = ps.ns().net.devs.borrow().conf.ping_group;
-                let r = ps.reader();
-                format!("{}\t{}\n", r.gid_out(lo as u32), r.gid_out(hi as u32))
-            }
             b"sys/kernel/core_pattern" => {
                 format!("{}\n", String::from_utf8_lossy(&ps.k.core_pattern))
             }
@@ -2540,12 +2733,6 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 )
             }
             b"sys/kernel/sched_rr_timeslice_ms" => "100\n".to_owned(),
-            b"sys/kernel/msgmax" | b"sys/kernel/msgmnb" | b"sys/kernel/msgmni"
-            | b"sys/kernel/sem" | b"sys/kernel/shmall" | b"sys/kernel/shmmax"
-            | b"sys/kernel/shmmni" => {
-                let ns = ps.ns().ipc.id;
-                ps.k.ipc(ns).tunables.read(&path[11..]).unwrap()
-            }
             b"sysvipc/msg" | b"sysvipc/sem" | b"sysvipc/shm" => ipc::proc_listing(
                 ps.k,
                 ps.ns().ipc.id,
@@ -2784,18 +2971,16 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         SysCpu(n, path) => cpu_file(*n as usize, path)?,
         SysNet(n, path) => net_file(ps.k, &ps.ns().net, *n, path)?,
         SysBlock(n, path) => ps.k.loops.sysfs_read(*n, path).ok_or(Errno::EISDIR)?,
-        NetConf(v6, dir, name) => {
-            crate::netdev::conf_read(&ps.ns().net, *v6, *dir, name)?
-        }
-        NetSysctl(path) => crate::netconf::sysctl_read(&ps.ns().net.devs.borrow().conf, path),
-        // Write-only ones (cgroup.kill) are EINVAL to read
+        NetConf(v6, dir, name, net) => crate::netdev::conf_read(&net.0, *v6, *dir, name)?,
+        NetSysctl(path, net) => crate::netconf::sysctl_read(&net.0.devs.borrow().conf, path),
+        // Removed cgroups / disabled controllers are ENODEV; write-only files are EINVAL
         Cgroup(_, b"") => return Err(Errno::EISDIR),
         Cgroup(id, name) => {
             // Ids as the reader's pid namespace sees them (task_pid_vnr: current's, not the
             // mount's)
             let ns = ps.k.pid_ns_of(ps.tgid);
             let vnr = |t| ns.vnr(t).unwrap_or(0);
-            crate::cgroup::file(ps.k, *id, name, &vnr).ok_or(Errno::EINVAL)?
+            crate::cgroup::file(ps.k, *id, name, &vnr)?
         }
         // A namespace is opened only for setns; nothing can be read
         NsFile(..) => String::new(),
@@ -4376,52 +4561,65 @@ pub(crate) fn write(
         PseudoNode::Entry(proc, None, Entry::TimensOffsets) => {
             return write_timens_offsets(k, opener, *proc, data);
         }
-        // Network namespace sysctls: the writer's namespace (crate::netconf)
-        PseudoNode::NetConf(v6, dir, name) => {
-            return crate::netdev::conf_write(&ns.net, *v6, *dir, name, data);
+        // Network namespace sysctls: the pinned lookup namespace (crate::netconf)
+        PseudoNode::NetConf(v6, dir, name, net) => {
+            return crate::netdev::conf_write(&net.0, *v6, *dir, name, data);
         }
-        PseudoNode::NetSysctl(path) => {
-            return crate::netconf::sysctl_write(&mut ns.net.devs.borrow_mut().conf, path, data);
+        PseudoNode::NetSysctl(path, net) => {
+            return crate::netconf::sysctl_write(&mut net.0.devs.borrow_mut().conf, path, data);
         }
-        PseudoNode::Static(b"sys/net/ipv4/ip_forward") => {
+        PseudoNode::NetStatic(b"sys/net/ipv4/ip_forward", net) => {
             return crate::netdev::conf_write(
-                &ns.net,
+                &net.0,
                 false,
                 crate::netdev::ConfDir::All,
                 b"forwarding",
                 data,
             );
         }
-        PseudoNode::Static(b"sys/net/core/somaxconn") => {
+        PseudoNode::NetStatic(b"sys/net/core/somaxconn", net) => {
             let v = crate::netconf::parse_int(data)?;
             if !(0..=i32::MAX as i64).contains(&v) {
                 return Err(Errno::EINVAL);
             }
-            ns.net.devs.borrow_mut().conf.somaxconn = v;
+            net.0.devs.borrow_mut().conf.somaxconn = v;
             return Ok(());
         }
-        PseudoNode::Static(b"sys/net/ipv4/ip_local_port_range") => {
-            let mut d = ns.net.devs.borrow_mut();
+        PseudoNode::NetStatic(b"sys/net/ipv4/ip_local_port_range", net) => {
+            let mut d = net.0.devs.borrow_mut();
             d.conf.port_range = crate::netconf::parse_port_range(data, d.conf.prot_sock)?;
             return Ok(());
         }
-        PseudoNode::Static(b"sys/net/ipv4/ip_unprivileged_port_start") => {
-            let mut d = ns.net.devs.borrow_mut();
+        PseudoNode::NetStatic(b"sys/net/ipv4/ip_unprivileged_port_start", net) => {
+            let mut d = net.0.devs.borrow_mut();
             d.conf.prot_sock = crate::netconf::parse_prot_sock(data, d.conf.port_range.0)?;
             return Ok(());
         }
-        PseudoNode::Static(b"sys/net/ipv4/ping_group_range") => {
+        PseudoNode::NetStatic(b"sys/net/ipv4/ping_group_range", net) => {
             let r = crate::netconf::parse_ping_group(data, cred)?;
-            ns.net.devs.borrow_mut().conf.ping_group = r;
+            net.0.devs.borrow_mut().conf.ping_group = r;
             return Ok(());
         }
+        // IPC namespace sysctls: the pinned lookup namespace
+        PseudoNode::IpcSysctl(path, ipc) => {
+            if let Some(name) = path.strip_prefix(b"sys/kernel/")
+                && k.ipc(ipc.0.id).tunables.read(name).is_some()
+            {
+                return k.ipc_mut(ipc.0.id).tunables.write(name, data);
+            }
+            if let Some(name) = path.strip_prefix(b"sys/fs/mqueue/")
+                && let Some(slot) = k.ipc_mut(ipc.0.id).mq_limits.slot(name)
+            {
+                *slot = std::str::from_utf8(data)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .filter(|&v: &u64| v > 0)
+                    .ok_or(Errno::EINVAL)?;
+                return Ok(());
+            }
+            return Err(Errno::EINVAL);
+        }
         _ => {}
-    }
-    if let PseudoNode::Static(path) = node
-        && let Some(name) = path.strip_prefix(b"sys/kernel/")
-        && k.ipc(ns.ipc.id).tunables.read(name).is_some()
-    {
-        return k.ipc_mut(ns.ipc.id).tunables.write(name, data);
     }
     if let PseudoNode::Static(path @ (b"sys/kernel/hostname" | b"sys/kernel/domainname")) = node {
         let name = data.strip_suffix(b"\n").unwrap_or(data);
@@ -4463,16 +4661,6 @@ pub(crate) fn write(
             .filter(|&n| n <= i32::MAX as usize)
             .ok_or(Errno::EINVAL)?;
         crate::mm::MAX_MAP_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
-    }
-    if let PseudoNode::Static(path) = node
-        && let Some(name) = path.strip_prefix(b"sys/fs/mqueue/")
-        && let Some(slot) = k.ipc_mut(ns.ipc.id).mq_limits.slot(name)
-    {
-        *slot = std::str::from_utf8(data)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .filter(|&v: &u64| v > 0)
-            .ok_or(Errno::EINVAL)?;
     }
     // Between 0 and INT_MAX, as on Linux; the writer's user namespace's own limit
     if let PseudoNode::Static(path) = node
@@ -4965,8 +5153,9 @@ fn pid_exists_in(k: &Kernel, proc: ProcId, tid: Option<Tid>) -> bool {
 }
 
 /// Whether `node` refers to a process or thread that has been reaped (or exited, for a non-leader
-/// thread): reads at offset 0 of an already-open per-process file must fail with `ESRCH` instead
-/// of returning a cached open-time snapshot.
+/// thread), or to a cgroup file whose cgroup was removed or whose controller was disabled: reads
+/// at offset 0 of an already-open file must fail with `ESRCH`/`ENODEV` instead of returning a
+/// cached open-time snapshot.
 pub(crate) fn gone(k: &Kernel, node: &PseudoNode) -> bool {
     match node {
         PseudoNode::Pid(proc, tid)
@@ -4977,6 +5166,9 @@ pub(crate) fn gone(k: &Kernel, node: &PseudoNode) -> bool {
         | PseudoNode::FdInfo(proc, tid, _)
         | PseudoNode::Ns(proc, tid, _) => !pid_exists_in(k, *proc, *tid),
         PseudoNode::OpenExe(proc) => group_of_id(k, *proc).is_none(),
+        PseudoNode::Cgroup(id, name) if !name.is_empty() => {
+            k.cgroups.get(*id).is_none() || !k.cgroups.files(*id).any(|f| f == *name)
+        }
         _ => false,
     }
 }
@@ -5077,5 +5269,50 @@ mod tests {
         assert_eq!(cpu_list_of(&[0, 1, 2, 5, 7, 8]), "0-2,5,7-8\n");
         assert_eq!(cpu_list_of(&[3]), "3\n");
         assert_eq!(cpu_list_of(&[]), "\n");
+    }
+
+    #[test]
+    fn aio_has_iter_matches_linux_procfs_and_kernfs() {
+        // procfs non-seq_file entries refuse both read and write AIO.
+        for e in [
+            Entry::Mem,
+            Entry::Pagemap,
+            Entry::Cmdline,
+            Entry::Environ,
+            Entry::Auxv,
+            Entry::OomScoreAdj,
+            Entry::CoredumpFilter,
+        ] {
+            let node = PseudoNode::Entry(ProcId { pid: 1, serial: 1 }, None, e);
+            assert!(!has_iter(&node, false), "{e:?} read");
+            assert!(!has_iter(&node, true), "{e:?} write");
+        }
+        assert!(!has_iter(&PseudoNode::Global(Global::Kmsg), false));
+        assert!(!has_iter(&PseudoNode::Global(Global::Kmsg), true));
+
+        // procfs seq_file entries allow AIO read and refuse AIO write.
+        let cpuinfo = PseudoNode::Global(Global::Cpuinfo);
+        assert!(has_iter(&cpuinfo, false));
+        assert!(!has_iter(&cpuinfo, true));
+        let status = PseudoNode::Entry(ProcId { pid: 1, serial: 1 }, None, Entry::Status);
+        assert!(has_iter(&status, false));
+        assert!(!has_iter(&status, true));
+
+        // sysctl, sysfs, and cgroup2 (kernfs) allow both AIO read and write.
+        let sysctl = PseudoNode::Static(b"sys/kernel/ostype");
+        assert!(has_iter(&sysctl, false));
+        assert!(has_iter(&sysctl, true));
+        let cg = PseudoNode::Cgroup(1, b"memory.max");
+        assert!(has_iter(&cg, false));
+        assert!(has_iter(&cg, true));
+    }
+
+    #[test]
+    fn ipc_sysctl_path_excludes_mqueue_directory() {
+        assert!(!is_ipc_sysctl_path(b"sys/fs/mqueue/"));
+        assert!(is_ipc_sysctl_path(b"sys/fs/mqueue/queues_max"));
+        assert!(is_ipc_sysctl_path(b"sys/fs/mqueue/msg_max"));
+        assert!(is_ipc_sysctl_path(b"sys/kernel/shmmax"));
+        assert!(!is_ipc_sysctl_path(b"sys/kernel/"));
     }
 }

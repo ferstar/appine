@@ -271,6 +271,7 @@ impl Machine {
             ids: [0; 4],
             secure: false,
             stack_limit: loader::STACK_SIZE,
+            arg_limit: loader::arg_limit(loader::STACK_SIZE),
         };
         let mut mm = Mm::new();
         mm.share_files(&k.file_maps);

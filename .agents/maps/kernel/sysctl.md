@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/sysctl.md` for the paired decision history (not yet created; decisions from before the split are D16, D22 and the sysctl parts of D8, D9, D15, D21, D25, D28 and D31 in `.agents/decisions/kernel/procfs.md`).
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: pin network and IPC namespaces on open /proc/sys/net/* and IPC sysctl nodes at lookup time)
 
 ## Responsibilities
 
@@ -31,12 +33,17 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
 
 ## Key types
 
-- `PseudoNode::Static(b"sys/...")` — fixed `/proc/sys` directories and files from `STATIC` (the
-  non-`sysvipc/` portion of `STATIC`).
-- `PseudoNode::NetConf(v6, dir, name)` — `/proc/sys/net/ipv4/conf/<dir>` and `ipv6/conf/<dir>`
-  per-interface directories and entries (`NET_CONF4`, `NET_CONF6`, backed by `kernel/netns`).
-- `PseudoNode::NetSysctl(path)` — 145 per-network-namespace sysctls backed by `netconf::SYSCTLS`
-  (`kernel/netns`).
+- `PseudoNode::Static(b"sys/...")` — fixed `/proc/sys` directories and kernel-wide/UTS/pid/user
+  files from `STATIC` (the non-`sysvipc/` portion of `STATIC`).
+- `PseudoNode::NetStatic(path, PinnedNet)` — static `/proc/sys/net/*` files pinned to the
+  `Rc<NetNs>` captured at lookup time.
+- `PseudoNode::IpcSysctl(path, PinnedIpc)` — SysV IPC and `fs/mqueue/*` sysctl files pinned to
+  the `Rc<IpcNs>` captured at lookup time.
+- `PseudoNode::NetConf(v6, dir, name, PinnedNet)` — `/proc/sys/net/ipv4/conf/<dir>` and
+  `ipv6/conf/<dir>` per-interface directories and entries (`NET_CONF4`, `NET_CONF6`, backed by
+  `kernel/netns`) pinned to their lookup `Rc<NetNs>`.
+- `PseudoNode::NetSysctl(path, PinnedNet)` — 145 per-network-namespace sysctls backed by
+  `netconf::SYSCTLS` (`kernel/netns`), pinned to their lookup `Rc<NetNs>`.
 - `RECORDED` — 40 kernel-wide sysctls with Linux 6.1 modes, defaults and accepted ranges, stored in
   `Kernel::sysctls`.
 
@@ -72,13 +79,16 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
 
 ### Namespace scoping and capability checks
 
-- Reads follow the reading thread's namespaces and writes the writer's:
-  - SysV IPC limits and `fs/mqueue/*` per IPC namespace;
+- Reads and writes scope by namespace:
+  - SysV IPC limits and `fs/mqueue/*` per IPC namespace, pinned at lookup time (`IpcSysctl`) so
+    offset-0 rereads and writes through an open descriptor keep targeting the lookup namespace;
   - `hostname`/`domainname` per UTS namespace (one trailing newline stripped, over 64 bytes
     `EINVAL`);
   - `ns_last_pid` per pid namespace (the process's, not the mount's);
-  - `net.*` per network namespace (`ip_forward` aliases `conf/all/forwarding`; `NetConf` directories
-    per interface; entries flagged init-only exist only in the initial namespace);
+  - `net.*` per network namespace, pinned at lookup time (`NetStatic`, `NetConf`, `NetSysctl`) so
+    offset-0 rereads and writes keep targeting the lookup namespace (`ip_forward` aliases
+    `conf/all/forwarding`; `NetConf` directories per interface; entries flagged init-only exist
+    only in the initial namespace);
   - `user/max_*_namespaces` per user namespace (the reader's or writer's: the limits of
     `kernel/ns`'s namespace counts, `INT_MAX` by default in a new one, 0 to `INT_MAX`);
   - everything else kernel-wide (`max_map_count`, `mmap_min_addr`, inotify limits, `aio-max-nr`,
@@ -151,10 +161,9 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
 
 ## Confirmed bugs / technical debt
 
-- **Regeneration uses the current reader's namespaces:** a file reread from offset 0 is generated in
-  the reading task's namespaces, while Linux binds a network or IPC sysctl to the namespace it was
-  looked up in, so a descriptor of `/proc/sys/net/*` or an IPC limit passed to a process in another
-  namespace shows that namespace's value.
+- **UTS/pid/user regeneration uses the current reader's namespaces:** network and IPC sysctls pin
+  the namespace captured at lookup time, while UTS, pid and user-namespace sysctls reread from
+  offset 0 still read the current reader's namespace.
 - **Sysctl poll never reports `POLLPRI`:** `hostname` and `domainname` never wake pollers on
   change.
 - **Writes never advance a sysctl file's position:** repeated writes on one descriptor keep taking

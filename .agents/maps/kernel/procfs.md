@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: pin ProcId in pid nodes, pin pagemap Mm at open, per-thread task/<tid> fd/cred views)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve zombie-leader netns for /proc/<pid>/net/*, reflect ip_forward in /proc/net/snmp, add pseudo::has_iter for AIO, mark gone cgroup files)
 
 ## Responsibilities
 
@@ -69,7 +69,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - `Pseudo for View`: `lookup`, `missing`, `parent`, `name`, `kind`, `readlink`, `follow`,
   `follow_dentry`, `magic`, `protected_symlinks`, `searched`.
 - `pseudo::stat`, `node_ino`, `ino_of`, `fs_of`, `readdir`, `content`, `writable`, `unwritable_error`,
-  `open_unwritable`, `unreadable`, `pollable`, `write`, `written`, `read_pagemap`,
+  `open_unwritable`, `unreadable`, `pollable`, `has_iter`, `write`, `written`, `read_pagemap`,
   `read_mem`, `write_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `group_of_id`,
   `gone`, `comm_str`, `mark_deleted`, `uptime_ns`. (`sysctl_kind`/`recorded_value`/`RECORDED`
   belong to `kernel/sysctl`; `CGROUP_POINT` belongs to `kernel/sysfs`.)
@@ -284,9 +284,12 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `sysrq-trigger`, `zoneinfo`, `pressure/*`, `kallsyms`.
 - `/proc/<pid>/net/*` (`arp`, `dev`, `icmp`, `icmp6`, `if_inet6`, `ipv6_route`, `netstat`, `raw`,
   `raw6`, `route`, `snmp`, `sockstat`, `sockstat6`, `tcp`, `tcp6`, `udp`, `udp6`, `unix`) uses the
-  target task's network namespace: sockets from every fd table plus in-flight AF_UNIX sockets,
+  target task's network namespace (falling back to `ThreadGroup::leader_net` or a live thread's
+  network namespace when the main thread has exited as a zombie leader, before the initial
+  namespace): sockets from every fd table plus in-flight AF_UNIX sockets,
   filtered by namespace, uids mapped for the reader; host interface counters and routes only in
-  the initial namespace (new namespaces show zeros); `arp` is a header line.
+  the initial namespace (new namespaces show zeros); `snmp` reflects the namespace's IPv4
+  `ip_forward` (`1` enabled, `2` disabled); `arp` is a header line.
 
 ### devpts, nsfs and mqueue nodes
 
@@ -378,9 +381,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
   and symbol lookups (perf, bpftrace) find nothing.
 - **Per-thread values that are the process's:** `task/<tid>/stat`'s start time is the process's
-  (Appine keeps none per thread); `/proc/<pid>/net/*` of a process whose main thread has gone (a
-  zombie, or one whose other threads live) shows the initial network namespace rather than the
-  process's.
+  (Appine keeps none per thread).
 - **Writes never advance a synthetic file's position** (except `mem`): repeated writes on one
   descriptor keep taking effect, where Linux refuses a second id-map write (`EINVAL`; Appine's is
   `EPERM`, the map being set).

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: SO_ATTACH_BPF guest fd check, MSG_WAITALL pending_err preservation, sendto destination validation, bound IPv4 wildcard getpeername)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: SO_ATTACH_BPF guest fd check, MSG_WAITALL pending_err preservation, sendto destination validation, bound IPv4 wildcard getpeername, /proc/net/snmp Forwarding reflects ip_forward)
 
 ## Responsibilities
 
@@ -334,7 +334,8 @@ listen notifications (`android/service`).
   estimated from the MSS for streams, one per datagram; `Protocols` feed `/proc/net/snmp` and
   `netstat` (IP/UDP/ICMP IPv4 only, ICMP for ping echoes only, TCP both families but only
   `IPPROTO_TCP`, not MPTCP; `CurrEstab` live from `TCP_INFO`, ActiveOpens and AttemptFails from
-  connect, PassiveOpens from accept; `Forwarding` fixed at 2; error and retransmission counters
+  connect, PassiveOpens from accept; `Forwarding` is 1 when the namespace's `ip_forward` is on
+  (patched in `kernel/procfs`), else 2; error and retransmission counters
   0; `TcpExt` all 0). DNS stub and AF_UNIX traffic are not counted; `/proc/net/dev` and netlink
   statistics show zeros in new namespaces, while `CurrEstab` there counts that namespace's
   connections. Counters are plain fields under the BKL.
@@ -411,9 +412,8 @@ listen notifications (`android/service`).
   is only kept in Appine, so a drop-everything filter (dockerd's on each port it publishes, until
   its DNAT rules are in place) still lets connections through and other programs see unfiltered
   data; a guest filter that the host accepts on an older kernel does filter.
-- **`/proc/net/snmp` departs from the namespace's state:** `Forwarding` is always 2 although each
-  namespace has `ip_forward` (Linux shows 1 when it is on), and MPTCP sockets are left out of the
-  Tcp counters and `CurrEstab`, where Linux counts their subflows.
+- **`/proc/net/snmp` omits MPTCP sockets:** MPTCP sockets are left out of the Tcp counters and
+  `CurrEstab`, where Linux counts their subflows.
 
 ## Open questions
 

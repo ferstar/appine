@@ -260,7 +260,7 @@ pub(crate) fn observe(k: &mut Kernel, id: u64, name: &'static [u8]) -> Option<Rc
     {
         return Some(observed.counter.clone());
     }
-    let content = file(k, id, name, &|t| t);
+    let content = file(k, id, name, &|t| t).ok();
     let counter = Rc::new(Cell::new(1));
     k.cgroups.observed.insert(
         (id, name),
@@ -315,7 +315,7 @@ fn flush_changes(k: &mut Kernel) {
 fn refresh_observed(k: &mut Kernel, id: u64, name: &'static [u8]) -> bool {
     let key = (id, name);
     if k.cgroups.observed[&key].is_watched(k, id, name)
-        && let Some(content) = file(k, id, name, &|tid| tid)
+        && let Ok(content) = file(k, id, name, &|tid| tid)
     {
         let observed = k.cgroups.observed.get_mut(&key).unwrap();
         observed.dirty.set(false);
@@ -519,18 +519,19 @@ pub(crate) fn proc_cgroups(k: &Kernel) -> String {
     s
 }
 
-/// The contents of `<name>` in cgroup `id`; None when it is not one of its files. `vnr` turns a
-/// global id into the reader's (0 for one its pid namespace cannot see, as Linux's task_pid_vnr
-/// prints in `cgroup.procs` and `cgroup.threads`).
+/// The contents of `<name>` in cgroup `id`; `ENODEV` when the cgroup has been removed or its
+/// controller has been disabled (Linux's `kernfs_get_active`), and `EINVAL` for a write-only file
+/// (`cgroup.kill`). `vnr` turns a global id into the reader's (0 for one its pid namespace cannot
+/// see, as Linux's `task_pid_vnr` prints in `cgroup.procs` and `cgroup.threads`).
 pub(crate) fn file(
     k: &Kernel,
     id: u64,
     name: &[u8],
     vnr: &dyn Fn(crate::kernel::Tid) -> crate::kernel::Tid,
-) -> Option<String> {
-    let g = k.cgroups.get(id)?;
+) -> Result<String, Errno> {
+    let g = k.cgroups.get(id).ok_or(Errno::ENODEV)?;
     if !k.cgroups.files(id).any(|f| f == name) {
-        return None;
+        return Err(Errno::ENODEV);
     }
     let root = g.parent.is_none();
     let max = |v: u64| {
@@ -550,13 +551,13 @@ pub(crate) fn file(
             .filter(move |(_, t)| t.tgid != INIT && group_cgroup(k, t.tgid).is_some_and(in_tree))
     };
     if let Some(v) = g.values.get(name) {
-        return Some(format!("{v}\n"));
+        return Ok(format!("{v}\n"));
     }
     let s = match name {
         b"cgroup.controllers" => names(k.cgroups.controllers(id)),
         // A controller list ends with a newline only when it lists names (Linux's
         // cgroup_print_ss_mask)
-        b"cgroup.subtree_control" if g.subtree_control == 0 => return Some(String::new()),
+        b"cgroup.subtree_control" if g.subtree_control == 0 => return Ok(String::new()),
         b"cgroup.subtree_control" => names(g.subtree_control),
         b"cgroup.type" => "domain".to_owned(),
         b"cgroup.procs" => list(procs().map(vnr)),
@@ -633,9 +634,9 @@ pub(crate) fn file(
         b"pids.current" => pids_current(k, id).to_string(),
         b"pids.events" => format!("max {}", g.pids_events),
         // Write-only ones (cgroup.kill)
-        _ => return None,
+        _ => return Err(Errno::EINVAL),
     };
-    Some(s + "\n")
+    Ok(s + "\n")
 }
 
 /// Lists the names in a controller bitmask in [`CONTROLLERS`] order, separated by spaces.
@@ -788,9 +789,9 @@ pub(crate) fn write(
     (id, name): (u64, &[u8]),
     data: &[u8],
 ) -> Result<(), Errno> {
-    // A file of a removed cgroup still open: every write is ENODEV (kernfs_get_active fails),
-    // which container managers take as "cgroup gone"
-    if k.cgroups.get(id).is_none() {
+    // A file of a removed cgroup or a disabled controller still open: every write is ENODEV
+    // (kernfs_get_active fails), which container managers take as "cgroup/file gone"
+    if k.cgroups.get(id).is_none() || !k.cgroups.files(id).any(|f| f == name) {
         return Err(Errno::ENODEV);
     }
     // On a namespace root only cgroup.procs, cgroup.threads and cgroup.subtree_control may be
@@ -1517,6 +1518,51 @@ mod tests {
         assert_eq!(
             parse_value(b"memory.current", "1", None),
             Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn disabled_controller_and_removed_cgroup_return_enodev() {
+        let shared = crate::kernel::Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let cred = Cred::root();
+        let pid_ns = crate::pidns::PidNs::init();
+        let writer = Writer {
+            tid: 0,
+            pid_ns: &pid_ns,
+            ns_root: ROOT,
+            opener: &cred,
+        };
+        let child = k.cgroups.mkdir(ROOT, b"c", &cred, 0o755).unwrap();
+        subtree_control(&mut k, ROOT, "+memory +pids").unwrap();
+        assert!(file(&k, child, b"memory.max", &|t| t).is_ok());
+        assert_eq!(
+            file(&k, child, b"cgroup.kill", &|t| t),
+            Err(Errno::EINVAL),
+            "write-only cgroup file stays EINVAL"
+        );
+
+        // Disabling a controller rejects writes and reads on held fds with ENODEV and stores nothing.
+        subtree_control(&mut k, ROOT, "-memory").unwrap();
+        assert_eq!(
+            write(&mut k, &writer, (child, b"memory.max"), b"4096\n"),
+            Err(Errno::ENODEV)
+        );
+        assert_eq!(file(&k, child, b"memory.max", &|t| t), Err(Errno::ENODEV));
+        assert!(
+            !k.cgroups
+                .get(child)
+                .unwrap()
+                .values
+                .contains_key(&b"memory.max"[..])
+        );
+
+        // Removing the cgroup causes reads/writes on existing files to return ENODEV.
+        rmdir(&mut k, child).unwrap();
+        assert_eq!(file(&k, child, b"pids.max", &|t| t), Err(Errno::ENODEV));
+        assert_eq!(
+            write(&mut k, &writer, (child, b"pids.max"), b"10\n"),
+            Err(Errno::ENODEV)
         );
     }
 }

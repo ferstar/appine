@@ -421,13 +421,16 @@ impl Propagation {
 
     /// A copy into a less privileged mount namespace (`CL_SHARED_TO_SLAVE`): a shared mount's
     /// copy is a slave of its peer group.
-    fn of_slave_copy(self) -> Propagation {
+    pub(crate) fn of_slave_copy(self) -> Propagation {
         match self.group {
-            0 => self,
+            0 => Propagation {
+                unbindable: false,
+                ..self
+            },
             g => Propagation {
                 group: 0,
                 master: g,
-                ..self
+                unbindable: false,
             },
         }
     }
@@ -543,6 +546,9 @@ pub struct Vfs {
     /// Bumped at each change of the mount table (Linux's `touch_mnt_namespace`), for the poll of
     /// mounts and mountinfo ([`crate::fd::ProcEvent`]).
     mount_events: std::rc::Rc<std::cell::Cell<u64>>,
+    /// Number of attached mounts currently carrying an `MNT_EXPIRE` mark; avoids borrowing the
+    /// mount table on path lookups when none are marked.
+    expiring: std::cell::Cell<usize>,
 }
 
 struct Mounts {
@@ -1089,6 +1095,7 @@ impl Vfs {
             overlays: Default::default(),
             fuse: Default::default(),
             mount_events: std::rc::Rc::new(std::cell::Cell::new(1)),
+            expiring: std::cell::Cell::new(0),
         })
     }
 
@@ -1154,6 +1161,22 @@ impl Vfs {
         self.walk_resolve(ps, cred, root, cwd, path, follow, 0)
     }
 
+    /// [`resolve`](Self::resolve) for `umount2` (Linux's `LOOKUP_MOUNTPOINT` + `mntput_no_expire`):
+    /// resolves the target path without clearing `MNT_EXPIRE` marks on the looked-up mount.
+    pub(crate) fn resolve_mountpoint(
+        &self,
+        ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
+        cwd: &Node,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<Node, Errno> {
+        self.store
+            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, 0, false))
+            .map(|(node, _)| node)
+    }
+
     /// [`walk`](Self::walk) with openat2's restrictions ([`resolve`]). With a scope (`BENEATH`,
     /// `IN_ROOT`) `root` is the start.
     #[allow(clippy::too_many_arguments)]
@@ -1168,7 +1191,7 @@ impl Vfs {
         flags: u64,
     ) -> Result<(Node, Option<Dentry>), Errno> {
         self.store
-            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, flags))
+            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, flags, true))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1181,6 +1204,7 @@ impl Vfs {
         path: &[u8],
         follow: bool,
         flags: u64,
+        touch: bool,
     ) -> Result<(Node, Option<Dentry>), Errno> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
@@ -1195,6 +1219,9 @@ impl Vfs {
         } else {
             cwd.clone()
         };
+        if touch {
+            self.touch_mount(dir.mnt());
+        }
         // Whether Linux's nd->root has been taken: absolute paths and scoped resolution take it
         // at the start, otherwise it is taken at the first `..` or the first jump to the root.
         // Under NO_XDEV a jump to the root (a symlink to an absolute path) before it is taken is
@@ -1242,6 +1269,9 @@ impl Vfs {
                     return Err(Errno::EXDEV);
                 }
                 dir = up;
+                if touch {
+                    self.touch_mount(dir.mnt());
+                }
                 found = None;
                 continue;
             }
@@ -1252,6 +1282,9 @@ impl Vfs {
                 }
                 r => r?,
             };
+            if touch {
+                self.touch_mount(node.mnt());
+            }
             // Something is mounted on the name: enter that mount (traverse_mounts)
             if flags & resolve::NO_XDEV != 0 && node.mnt() != dir.mnt() {
                 return Err(Errno::EXDEV);
@@ -1301,6 +1334,9 @@ impl Vfs {
                 }
                 if let (Node::Pseudo(_, p), Some(target)) = (&node, jump) {
                     dir = target;
+                    if touch {
+                        self.touch_mount(dir.mnt());
+                    }
                     found = if last { ps.follow_dentry(p) } else { None };
                     continue;
                 }
@@ -1771,7 +1807,9 @@ impl Vfs {
             }
         }
         // A deep stack (propagation can pile thousands of mounts on one directory) is climbed
-        // through an index built once, the later mount on a point winning as above
+        // through an index built once, the later mount on a point winning as above.
+        // PinnedNet/PinnedIpc inside PseudoNode hash and compare only by immutable namespace id.
+        #[allow(clippy::mutable_key_type)]
         let mut tops: HashMap<&Node, &Node> = HashMap::new();
         for m in mounts.detached.iter().chain(&mounts.list) {
             if let Some(point) = &m.point {
@@ -3408,7 +3446,9 @@ impl Vfs {
         let index = self.prop_index(list);
         let order = tree_of(list, id);
         let gone: std::collections::HashSet<MountId> = order.iter().copied().collect();
-        // The mounts on the same places elsewhere, each place of a peer group visited once
+        // The mounts on the same places elsewhere, each place of a peer group visited once.
+        // PinnedNet/PinnedIpc inside PseudoNode hash and compare only by immutable namespace id.
+        #[allow(clippy::mutable_key_type)]
         let mut visited = std::collections::HashSet::new();
         let mut candidates: Vec<usize> = Vec::new();
         let mut is_candidate = std::collections::HashSet::new();
@@ -3517,6 +3557,31 @@ impl Vfs {
         mounts.all().find(|m| m.root == *node).map(|m| m.id)
     }
 
+    /// Marks attached mount `id` as expiring (`umount2(MNT_EXPIRE)`).
+    pub(crate) fn set_expiring(&self, id: MountId) {
+        let mut mounts = self.mounts.borrow_mut();
+        if let Some(m) = mounts.list.iter_mut().find(|m| m.id == id)
+            && !m.expiring
+        {
+            m.expiring = true;
+            self.expiring.set(self.expiring.get() + 1);
+        }
+    }
+
+    /// Clears the `MNT_EXPIRE` mark on attached mount `id` when accessed (Linux's `mntput`).
+    pub(crate) fn touch_mount(&self, id: MountId) {
+        if self.expiring.get() == 0 {
+            return;
+        }
+        let mut mounts = self.mounts.borrow_mut();
+        if let Some(m) = mounts.list.iter_mut().find(|m| m.id == id)
+            && m.expiring
+        {
+            m.expiring = false;
+            self.expiring.set(self.expiring.get().saturating_sub(1));
+        }
+    }
+
     /// Changes attached mount `id` through `f` (its flags, the MNT_EXPIRE mark, its locks and the
     /// like), keeping only per-mount flags, and reports a mount change.
     pub(crate) fn update_mount(&self, id: MountId, f: impl FnOnce(&mut Mount)) {
@@ -3548,10 +3613,15 @@ impl Vfs {
     /// match (the caller separately makes each thread fetch them again,
     /// [`Shared::fast_changed`](crate::kernel::Shared::fast_changed)).
     fn mounts_changed(&self) {
-        let (points, usable) = {
+        let (points, usable, expiring) = {
             let mounts = self.mounts.borrow();
-            (mounts.store_points(), mounts.fast_usable())
+            (
+                mounts.store_points(),
+                mounts.fast_usable(),
+                mounts.list.iter().filter(|m| m.expiring).count(),
+            )
         };
+        self.expiring.set(expiring);
         let mut cached = self.cached.borrow_mut();
         cached.mounts = points;
         cached.usable = usable;
@@ -5110,5 +5180,36 @@ mod tests {
         assert_eq!(normalize(b"/a/./b//../c"), b"/a/c");
         assert_eq!(normalize(b"/../.."), b"/");
         assert_eq!(normalize(b"/tmp/x/"), b"/tmp/x");
+    }
+
+    #[test]
+    fn mnt_expire_preserved_by_mountpoint_lookup_and_cleared_by_normal_access() {
+        let (vfs, dir) = sample("mnt-expire");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let mp = vfs.store().mkdir(ROOT, b"mp", 0o755, 0, 0).unwrap();
+        let point = Node::Store(ROOT_MOUNT, mp);
+        let id = vfs
+            .new_tmpfs((point, None), 0, Vec::new(), TmpfsParams::boot(0o1777))
+            .unwrap();
+        assert!(!vfs.mount(id).unwrap().expiring);
+        vfs.set_expiring(id);
+        assert!(vfs.mount(id).unwrap().expiring);
+
+        // umount2's mountpoint lookup must not clear the MNT_EXPIRE mark.
+        let resolved = vfs
+            .resolve_mountpoint(ps, cred, &Node::ROOT, &Node::ROOT, b"/mp", true)
+            .unwrap();
+        assert_eq!(resolved.mnt(), id);
+        assert!(vfs.mount(id).unwrap().expiring);
+
+        // Normal path lookup touching the mount clears the MNT_EXPIRE mark.
+        let accessed = vfs
+            .resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/mp", true)
+            .unwrap();
+        assert_eq!(accessed.mnt(), id);
+        assert!(!vfs.mount(id).unwrap().expiring);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

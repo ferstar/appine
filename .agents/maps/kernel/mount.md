@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: enforce CAP_SYS_ADMIN on MNT_FORCE, count mappings/executables/mqueue fds in umount busy checks, skip anon-ns mounts in propagation, and fix detached mount collection)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: enforce mount_setattr anon-child check, release open_tree anon ns on attach, clear MNT_EXPIRE on mount access, implement MOVE_MOUNT_SET_GROUP)
 
 ## Responsibilities
 
@@ -84,7 +84,8 @@ Outside the module:
   and mountinfo).
 - **Changes**: `clone_mount`, `attach_tree`, `add_mount`, `add_copies`, `move_mount`,
   `set_root_at`, `remove_mount`, `umount_tree`, `propagation_targets`, `propagate`,
-  `propagated_busy`, `set_propagation`, `attached`, `propagation`, `update_mount`.
+  `propagated_busy`, `set_propagation`, `attached`, `propagation`, `update_mount`, `set_expiring`,
+  `resolve_mountpoint`.
 - **Instances**: `sb_flags`/`set_sb_flags`, `sb_readonly`, `readonly`, `mount_flags` (read by
   `kernel/vfs`'s checks), `dev_of`, `mount_dev` (None for a mount that is gone), `fs_of`,
   `proc_pid_ns`/`set_proc_pid_ns`, `devpts_options`/`set_devpts_options` (`kernel/tty`), `mq_dev`
@@ -232,25 +233,32 @@ Outside the module:
   clone in a new anonymous namespace held by the fd, which counts against `max_mnt_namespaces`
   (`ENOSPC`, `kernel/ns`); without `AT_RECURSIVE` a source with a locked mount under it is
   `EINVAL`, and the clone's root is not locked in place), `move_mount` (shares `move_tree` with
-  `MS_MOVE`; attaching a clone moves its mounts into the caller's namespace;
-  `MOVE_MOUNT_SET_GROUP` is always `EINVAL`), `mount_setattr` (size and flag checks per
-  `build_mount_kattr`; per-mount flags, `AT_RECURSIVE` over the subtree, `EPERM` before any change
-  when a mount would lose a locked flag, then `EBUSY` for one going read-only with writers;
+  `MS_MOVE`; attaching a clone moves its mounts into the caller's namespace and releases
+  `OpenFile::tree` on any open/in-flight file holding that emptied anonymous namespace so its
+  `max_mnt_namespaces` count drops immediately per `do_move_mount`; with `MOVE_MOUNT_SET_GROUP`,
+  `set_group` copies the peer/slave group of an attached non-anonymous shared or slave mount to an
+  attached non-anonymous private mount on the same filesystem instance at or under the source's
+  root — shared-to-slave across different owning user namespaces, `EPERM` without `CAP_SYS_ADMIN`
+  in both namespace owners, per Linux 6.1's `do_set_group`), `mount_setattr` (size and flag checks
+  per `build_mount_kattr`; per-mount flags, `AT_RECURSIVE` over the subtree, `EPERM` before any
+  change when a mount would lose a locked flag, then `EBUSY` for one going read-only with writers;
   idmapped mounts end in `EINVAL` after the userns fd checks — `EBADF` for a bad fd, `EPERM` for
   the initial namespace — all before the path walk; set, clear and propagation all zero is a
-  no-op; the caller's-namespace check is skipped for every mount of an anonymous namespace, not
-  only a clone's root). open_tree, both paths of move_mount and mount_setattr walk with `walk_at`,
+  no-op; the caller's-namespace check exempts only a parentless mount of an anonymous namespace
+  (`point.is_none()`), enforcing it on child mounts per `do_mount_setattr`). open_tree, both paths
+  of move_mount and mount_setattr walk with `walk_at`,
   which always lifts the result to the topmost mount; the ordinary walk already lifts after each
   named component and `..`, so this changes only results reached without a lookup (an empty path,
   `.`, `/`, magic links such as `/proc/<pid>/root`, symlinks to `/`), while mount(2)'s `MS_MOVE`
   source is not lifted. open_tree has no namespace-file path: a clone takes the filesystem, flags
   and pin of the mount the node was reached through, so cloning `/proc/<pid>/ns/*` gives a procfs
   mount pinning nothing.
-- `umount2`: unknown flags `EINVAL`; lookup; `may_mount` (`EPERM`); not a mount root, not in
+- `umount2`: unknown flags `EINVAL`; lookup via `Vfs::resolve_mountpoint` (which does not clear
+  `MNT_EXPIRE`, matching `mntput_no_expire`); `may_mount` (`EPERM`); not a mount root, not in
   the caller's namespace or locked in place `EINVAL`; `MNT_EXPIRE` (with `MNT_FORCE`/
-  `MNT_DETACH` or on the caller's root `EINVAL`, busy `EBUSY`, otherwise marks then `EAGAIN`;
-  the mark is never cleared, and copies of a mount start unmarked, as Linux's `clone_mnt` leaves
-  them); the tree root `EBUSY` (`EINVAL` with `MNT_DETACH`); `MNT_FORCE` needs `CAP_SYS_ADMIN` in
+  `MNT_DETACH` or on the caller's root `EINVAL`, busy `EBUSY`, otherwise marks via `set_expiring`
+  then `EAGAIN`; normal path lookup/access clears the mark via `Vfs::touch_mount`, and copies of a
+  mount start unmarked, as Linux's `clone_mnt` leaves them); the tree root `EBUSY` (`EINVAL` with `MNT_DETACH`); `MNT_FORCE` needs `CAP_SYS_ADMIN` in
   the initial user namespace (`EPERM`, 6.1's `can_umount`) and otherwise has no extra effect;
   without `MNT_DETACH`, the caller's root or a busy mount `EBUSY` (busy means submounts, task
   roots/cwds, nodes of open fds, fds opened through an mqueue mount, pinned PTYs, mappings via
@@ -392,16 +400,9 @@ Outside the module:
   and `propagation_targets` checks each target with `is_under`, which scans the table at each
   step.
 - **Mount fidelity gaps:**
-  - `MNT_EXPIRE` marks are never cleared by an access to the mount, and LTP umount2_02's
-    mark-then-expire sequences fail;
   - `umount2` with `MNT_FORCE` does nothing beyond its `CAP_SYS_ADMIN` check (no FUSE abort);
-  - `MOVE_MOUNT_SET_GROUP` is always `EINVAL` although peer groups now exist;
   - `walk_at` lifts the source of open_tree, move_mount and mount_setattr reached without a lookup
     (an `AT_EMPTY_PATH` fd, `.`, `/`), where 6.1's `user_path_at` stays on the mount it has;
-  - `mount_setattr` skips the caller's-namespace check for every mount of an anonymous namespace,
-    where 6.1's `do_mount_setattr` exempts only a mount without a parent;
-  - an attached open_tree clone's emptied anonymous namespace keeps counting against
-    `max_mnt_namespaces` until the open file goes (6.1's `do_move_mount` frees it at attach);
   - an open_tree clone of `/proc/<pid>/ns/*` is a procfs mount pinning nothing, not an nsfs mount
     keeping the namespace;
   - turning an instance read-only (`sb_busy`) still ignores deleted files that are only mapped and

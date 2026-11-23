@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: remove unused Mm::can_write)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: check VMA permissions before past-EOF SIGBUS, fix mlock PROT_NONE/RO-anon/CoW population, unshare cow private file VMAs on MADV_DONTNEED)
 
 ## Responsibilities
 
@@ -75,7 +75,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 - **FUSE fills & kernel access**: `Fill::new`/`size`/`has`/`window`/`window_from`/`store`/`fd`,
   `take_wanted`, `has_fills`, `first_unread`; `read`, `write` (breaks CoW via `kernel/cow`),
   `translate` (no CoW break), `read_cstr`, `write_kernel`, `write_force`, `populate`,
-  `mapped_above`, `check_mapped`.
+  `populate_mlock`, `mapped_above`, `check_mapped`.
 - **Files, shm, futex & introspection**: `futex_key`, `shared_maps`, `id`; `file_truncated`,
   `writably_maps`, `maps_file`, `maps_ino`, `mapped_inos`, `set_mnt`, `mapped_mounts`,
   `file_moving`, `file_moved`, `shared_file_ranges`; `attach_shm`/`detach_shm`/`shm_attachments`;
@@ -192,9 +192,10 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 4. A page of a `Fill` mapping not yet read and allowing the access (`fill_wanted`) → read it through
    the daemon (above) and re-execute; a signal arriving before the daemon took the read is
    delivered first and the access faults again; a read error → `SIGBUS` / `BUS_ADRERR`.
-5. `fault_past_eof`: past EOF in a shared file mapping whose file has grown → map the new part and
-   re-execute (not a `Fill` mapping, which keeps its size); otherwise past EOF → `SIGBUS` /
-   `BUS_ADRERR`.
+5. `fault_past_eof`: checks VMA permissions first (`v.prot & need == 0` falls through to step 7's
+   `SIGSEGV` / `SEGV_ACCERR`); otherwise past EOF in a shared file mapping whose file has grown →
+   map the new part and re-execute (not a `Fill` mapping, which keeps its size); otherwise past EOF
+   → `SIGBUS` / `BUS_ADRERR`.
 6. Stack growth (`grow_down`) succeeds → re-execute.
 7. Otherwise `SIGSEGV`: `SEGV_ACCERR` if the address is mapped, else `SEGV_MAPERR`.
 
@@ -267,8 +268,11 @@ signals may still be delivered).
 - `mlock`/`mlock2`/`munlock` follow `do_mlock`: the length plus the offset in the page is
   page-aligned with wrapping arithmetic; after mlock's `RLIMIT_MEMLOCK` check (`EPERM` with a limit
   of 0, `ENOMEM` above it; skipped with `CAP_IPC_LOCK`) a range that wraps past the end is `EINVAL`
-  and an empty one succeeds; the range must be fully mapped (`ENOMEM`) and is populated unless
-  `MLOCK_ONFAULT`. `mlockall(MCL_CURRENT)` checks the whole size (`PROT_NONE` reservations
+  and an empty one succeeds; the range must be fully mapped (`ENOMEM`) and is populated via
+  `populate_mlock` unless `MLOCK_ONFAULT` (stopping at the first `PROT_NONE` VMA and returning
+  `ENOMEM` while leaving the range locked; skipping read-only private anonymous VMAs so RSS stays 0
+  and CoW stays intact; settling CoW and atomically write-faulting writable private anonymous VMAs
+  so real private host pages are resident). `mlockall(MCL_CURRENT)` checks the whole size (`PROT_NONE` reservations
   included) against the limit, locks every VMA and populates unless `MCL_ONFAULT`; `MCL_FUTURE`
   makes new VMAs locked, uncharged.
 - `madvise`: alignment/length/unknown advice (counted as unimplemented) `EINVAL`; length 0 succeeds.
@@ -281,10 +285,11 @@ signals may still be delivered).
   `POPULATE_READ` skip untouched anon, pass `MADV_WILLNEED`, and prefill read-only non-FUSE file soft
   PTEs up to 4 GB/call). Other unlisted advice returns 0.
 - `MADV_DONTNEED` (`discard`): private anon returns to host and zeroes (CoW settled via `kernel/cow`);
-  written private file pages before EOF revert via `kernel/hostmem`'s `discard_file_host` (whole host
+  written private file pages before EOF unshare first if marked `cow` (so reverting never corrupts a
+  fork peer), then revert via `kernel/hostmem`'s `discard_file_host` (whole host
   pages) and `Reread`s read from the store (`fill_private`, zeros past EOF or open failure; `Fill`
   partial host pages reread from its memfd so entries stay). Executable ranges queue code
-  invalidation; shared/unwritten/`cow` VMAs untouched; vDSO refills from kernel image (with svc stubs
+  invalidation; shared/unwritten VMAs untouched; vDSO refills from kernel image (with svc stubs
   when `vdso_svc`).
 - `MADV_REMOVE` (`remove`): fully mapped; locked or private anon `EINVAL`, other private or
   never-writable `EACCES` (6.7); shared parts before EOF freed via `kernel/hostmem`'s `remove_host`,
@@ -402,19 +407,10 @@ signals may still be delivered).
 - **Approximate madvise:** `MADV_DONTNEED_LOCKED`/`MADV_POPULATE_WRITE` are no-ops;
   `MADV_POPULATE_READ` runs advisory host readahead + RO file soft-PTE prefill without faulting or
   failing on inaccessible ranges; `MADV_FREE`/`COLD`/`PAGEOUT` are not refused on locked ranges.
-- **Past-EOF faults ignore permissions:** a `PROT_NONE` or write-to-read-only access past EOF gets
-  `SIGBUS` instead of `SIGSEGV`/`SEGV_ACCERR`, and private file mappings never see file growth.
+- **Private file mappings never see file growth** past the length recorded at mmap.
 - **Approximate Linux VMA boundaries:** anonymous pieces join ignoring page offsets (mremap-moved
   VMAs join new neighbours); `MREMAP_DONTUNMAP` of a multi-piece VMA needs one VMA slot per piece,
   and in-place growth adds a VMA.
-- **mlock never fails on inaccessible ranges:** `mlock`/`mlock2` over a range that includes a
-  `PROT_NONE` mapping succeeds and keeps populating the mappings after it, where Linux 6.1 locks the
-  whole range but stops populating at the `PROT_NONE` mapping and returns `ENOMEM`.
-- **mlock population inflates RSS:** locking read-only private anonymous pages makes them count as
-  resident (Linux maps the zero page, which is not counted), and locking written private memory in
-  a forked child does not break copy-on-write (Linux 6.1 copies the pages at mlock time) but
-  touches the child's own, still unused host pages, so smaps counts the range twice until the
-  pages are written.
 - **Ranges with gaps fail as a whole:** madvise, msync, mlock and mincore refuse a range that is not
   fully mapped before doing anything (`ENOMEM`), where Linux acts on the mapped parts first.
 

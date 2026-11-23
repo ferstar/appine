@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/cow.md` for the paired decision history (not yet created; decisions from before the split are D6, D10, D11, D19, D24, D25 and the fork/copy-on-write parts of D15, D16, D18, D20, D22, D31 and D39 in `.agents/decisions/kernel/mm.md`).
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: replace return_loans try_borrow guard with direct borrow and debug_assert on lend, unshare cow private file VMAs on MADV_DONTNEED)
 
 ## Responsibilities
 
@@ -151,8 +153,9 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   no borrow is held across a BKL release.
 - CoW never mutably borrows two address spaces at once: borrower-side loan returns run inside the
   borrower's own operation or drop, and owner-side `recall` only takes shared borrows of
-  borrowers. The `try_borrow` guard in `return_loans` is therefore defensive (see the latent
-  hazard below).
+  borrowers. `return_loans` therefore borrows the owner directly (`owner.borrow().repossess`) so a
+  violation fails loudly instead of silently leaking a loan-less lent entry, and `lend`
+  debug-asserts that any re-lent page still has a live loan entry.
 - Host `mincore` reports pages swapped to zram as absent, which is why `fork`'s touched-page check
   reads `/proc/self/pagemap` instead.
 - `fork` cannot fail after lending starts; all host allocations (`carve`, `spare::anonymous`,
@@ -160,13 +163,6 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 
 ## Confirmed bugs / technical debt
 
-- **Latent CoW leak:** if `return_loans` ever ran while the owner was mutably borrowed, the page
-  would stay in the owner's `lent` set without a loan; a fork in that state would give the child a
-  loan-less borrowed entry and the owner's next write would show in the child. Unreachable today,
-  and the guard's comment cites a path (`recall`) that never reaches it.
-- **A written private file mapping marked `cow` at fork is not reverted by `MADV_DONTNEED`:** fork
-  marks every read-only private file VMA `cow`, written or not, and `kernel/mm`'s `discard` skips
-  `cow` VMAs, so the written data stays in both processes.
 - **`anon_vma` and commit approximation at fork:** anonymous memory that has been writable counts
   as having an `anon_vma` although Linux creates one only at the first write fault, and
   `commit_too_big` checks only current permissions rather than Linux's sticky `VM_ACCOUNT`.

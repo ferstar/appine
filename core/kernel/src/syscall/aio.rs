@@ -233,7 +233,8 @@ fn submit_one(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>, obj: u64) -> Result<
 /// which AIO reads and writes need (`EINVAL` without). Files with only `read`/`write`, or none:
 /// directories, the read side of `/dev/kmsg`, the write side of `/dev/full` and of eventfds,
 /// `/dev/loop-control`, epoll, timerfd, signalfd, inotify, pidfd, message queues, seccomp
-/// notification and bpf fds. Synthetic files count as having both.
+/// notification and bpf fds, and procfs/nsfs files without `read_iter`/`write_iter` (such as
+/// `/proc/<pid>/mem`, `pagemap`, `/proc/kmsg`, and writes to `seq_file` entries).
 fn has_iter(f: &OpenFile, write: bool) -> bool {
     match &f.kind {
         FileKind::Directory { .. }
@@ -252,6 +253,7 @@ fn has_iter(f: &OpenFile, write: bool) -> bool {
             Device::LoopControl => false,
             _ => true,
         },
+        FileKind::Proc { node, .. } => crate::pseudo::has_iter(node, write),
         _ => true,
     }
 }

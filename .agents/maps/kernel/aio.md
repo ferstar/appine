@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose AIO claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: deliver queued events on io_getevents EINTR, pass per-request IoFlags without mutating file flags, and run AF_UNIX GC on PendingPoll teardown)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: refuse AIO read/write with EINVAL on procfs files lacking read_iter/write_iter via pseudo::has_iter)
 
 ## Responsibilities
 
@@ -71,7 +71,10 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 - Reads and writes: unknown `aio_rw_flags` bits `EOPNOTSUPP`, then the open mode (`EBADF`), then a
   file without Linux's `read_iter`/`write_iter` `EINVAL` (`has_iter`: directories, epoll, timerfd,
   signalfd, inotify, pidfd, message queue, seccomp and bpf fds, `/dev/loop-control`, reads of
-  `/dev/kmsg`, writes of `/dev/full` and of eventfds), then a negative `aio_offset` `EINVAL`, also
+  `/dev/kmsg`, writes of `/dev/full` and of eventfds, and synthetic files rejected by
+  `pseudo::has_iter` — `/proc/<pid>/{mem,pagemap,cmdline,environ,auxv,oom_score_adj,coredump_filter}`,
+  `/proc/kmsg`, nsfs files, and writes to procfs `seq_file` entries; sysfs, cgroup2 and
+  `/proc/sys` allow both), then a negative `aio_offset` `EINVAL`, also
   on a file that ignores the offset (`rw_verify_area`). Fsyncs: a nonzero `aio_buf`,
   `aio_offset`, `aio_nbytes` or `aio_rw_flags`, or a file fsync refuses (`has_fsync`), is
   `EINVAL`. Polls: events beyond 16 bits or a nonzero `aio_offset`, `aio_nbytes` or
@@ -123,7 +126,8 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 
 ### Outbound
 
-- `kernel/files`: fd lookup, `FileKind` for `has_iter`; `kernel/fileio`: `IoFlags`,
+- `kernel/files`: fd lookup, `FileKind` for `has_iter`; `kernel/procfs`: `pseudo::has_iter`;
+  `kernel/fileio`: `IoFlags`,
   `read_file_with`, `write_file_with`, `vectored_with`, `fsync`, `has_fsync`, `seekable`,
   `append_offset`, `write_sync`; `kernel/vfs`: `Device` for `has_iter`; `kernel/unix`: `released`,
   `defer_collect`, `collect_deferred`, `is_unix_file`.
@@ -149,9 +153,7 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 
 ## Confirmed bugs / technical debt
 
-- **Synthetic files all take reads and writes:** they are taken to have `read_iter` and
-  `write_iter`, which holds for sysfs, cgroup2 and `/proc/sys` but not for every procfs file
-  (`/proc/<pid>/mem`, `pagemap`), which Linux refuses with `EINVAL`.
+None.
 
 ## To verify
 
