@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: FUSE mknod checks cgroup device BPF and exempts only char 0:0 whiteout)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: emit inotify events for FUSE attrib/modify/O_TRUNC/xattr and avoid double IN_CREATE on MKNOD fallback, mark unlinked dentries, sync O_SYNC FUSE writes, and lock lseek position)
 
 ## Responsibilities
 
@@ -261,8 +261,10 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   and writes there, one append per node at a time from the size to the write (the node's
   `appending`, waited for on the lock channel, as 6.1 holds the inode lock); `RLIMIT_FSIZE` cuts
   writes (`SIGXFSZ` and EFBIG at the limit).
-- lseek: `SEEK_END` from the daemon's size, `SEEK_DATA`/`SEEK_HOLE` through `FUSE_LSEEK` (a daemon
-  without it has data up to the end).
+- lseek takes `pos_busy` (`PosGuard`): `SEEK_END` from the daemon's size, `SEEK_DATA`/`SEEK_HOLE`
+  through `FUSE_LSEEK` (a daemon without it has data up to the end).
+- `O_SYNC`/`O_DSYNC`/`RWF_SYNC`/`RWF_DSYNC` writes (including `sendfile`, `copy_file_range` and
+  `splice`) sync via `FUSE_FSYNC` (`write_sync`).
 - copy_file_range and splice treat FUSE files like regular ones and copy block by block.
 
 ### Directories
@@ -327,10 +329,14 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ### inotify
 
-- Watches key FUSE nodes by `key`; reads and writes report `IN_ACCESS`/`IN_MODIFY`, opens and
-  closes through the open file's record, creations `IN_CREATE`, removals `IN_ATTRIB`, delete-self
-  and `IN_DELETE`, renames the moved pair and move-self (a replaced name's delete-self only for its
-  last link). Only changes made through this kernel are seen.
+- Watches key FUSE nodes by `key`; reads and writes report `IN_ACCESS`/`IN_MODIFY`, opens (with
+  `IN_MODIFY` on `O_TRUNC`) and closes through the open file's record, creations `IN_CREATE` (once
+  even on the MKNOD fallback via `make_node`), attribute and xattr changes (`chmod`, `chown`,
+  `utimensat`, `setxattr`, `removexattr`) `IN_ATTRIB`/`IN_ACCESS`/`IN_MODIFY`, truncations and
+  `fallocate` `IN_MODIFY`, removals `IN_ATTRIB`, delete-self and `IN_DELETE`, renames the moved
+  pair and move-self (a replaced name's delete-self only for its last link). Unlinks and
+  overwriting renames call `inotify::unlinked` so `IN_EXCL_UNLINK` filters unlinked FUSE names
+  without dropping linked child events. Only changes made through this kernel are seen.
 
 ## Dependencies (inbound / outbound)
 
@@ -410,9 +416,6 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   in a FUSE directory is EXDEV (Linux makes the socket with `FUSE_MKNOD`).
 - **Programs:** set-id bits and file capabilities of FUSE programs never apply (even on a mount
   without nosuid), `/proc/<pid>/exe` is followed by path, and maps show the node's key as inode.
-- **inotify gaps:** path-based chmod, chown, utimensat, truncate, ftruncate and xattr changes
-  report no `IN_ATTRIB`/`IN_MODIFY`, an `O_TRUNC` open no `IN_MODIFY`, and creating through the
-  MKNOD fallback reports `IN_CREATE` twice.
 - **Directory changes run concurrently:** creations, removals and renames in one directory reach
   the daemon in parallel where Linux serializes them under the directory's lock; only the
   create-after-create race is handled (EEXIST without `O_EXCL` opens the file).

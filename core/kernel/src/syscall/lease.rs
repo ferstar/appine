@@ -55,16 +55,21 @@ impl Lease {
 
 /// fcntl(`F_SETLEASE`).
 pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<(), Errno> {
-    let (ino, writable) = {
+    super::fs::follow_copy_up(cx, file)?;
+    let (ino, store_ino, writable) = {
         let f = file.borrow();
-        (ino_of(&f).ok_or(Errno::EINVAL)?, f.writable())
+        let key = key_of(&f).ok_or(Errno::EINVAL)?;
+        let FileKind::Regular { ino, .. } = f.kind else {
+            return Err(Errno::EINVAL);
+        };
+        (key, ino, f.writable())
     };
     if !matches!(arg, F_RDLCK | F_WRLCK | F_UNLCK) {
         return Err(Errno::EINVAL);
     }
     // Only the file's owner (or a holder of CAP_LEASE) may set a lease
     let st = cx.vfs()?.store().stat_open(
-        ino,
+        store_ino,
         match &file.borrow().kind {
             FileKind::Regular { file, .. } => file,
             _ => unreachable!("checked above"),
@@ -159,7 +164,7 @@ fn opens(k: &Kernel, ino: Ino, except: &FileRef) -> (usize, usize) {
     let mine: Vec<_> = files
         .iter()
         .map(|f| f.borrow())
-        .filter(|f| ino_of(f) == Some(ino))
+        .filter(|f| key_of(f) == Some(ino))
         .map(|f| f.writable())
         .collect();
     let writers = mine.iter().filter(|&&w| w).count();
@@ -168,7 +173,7 @@ fn opens(k: &Kernel, ino: Ino, except: &FileRef) -> (usize, usize) {
 
 /// fcntl(`F_GETLEASE`): while being broken, the type it is to be downgraded to.
 pub(super) fn get(cx: &mut Cx<'_>, file: &FileRef) -> i16 {
-    let Some(ino) = ino_of(&file.borrow()) else {
+    let Some(ino) = key_of(&file.borrow()) else {
         return F_UNLCK;
     };
     prune(cx.k(), ino);
@@ -285,10 +290,11 @@ pub(super) fn break_leases(
     }
 }
 
-/// The inode of a regular file.
-fn ino_of(f: &OpenFile) -> Option<Ino> {
+/// The lease key of a regular file: its store inode, or its overlay node's key when opened
+/// through an overlay (Linux keys leases on the overlay inode, which copy-up does not change).
+pub(super) fn key_of(f: &OpenFile) -> Option<Ino> {
     match f.kind {
-        FileKind::Regular { ino, .. } => Some(ino),
+        FileKind::Regular { ino, .. } => Some(f.ovl.map_or(ino, crate::vfs::overlay::key)),
         _ => None,
     }
 }

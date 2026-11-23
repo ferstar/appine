@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: add per-request IoFlags helpers for AIO RWF_NOWAIT and RWF_APPEND)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: lock file positions on lseek/writev/copies, sync O_SYNC copies and FUSE writes, support preadv2/pwritev2 RWF_NOWAIT and RWF_APPEND, and align write remove_privs with chown)
 
 ## Responsibilities
 
@@ -73,28 +73,29 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - `/dev/zero`, `/dev/full` and the random devices fill the whole buffer per read; randomness comes
   from the host's `getrandom(2)` with no flags; writes to the random devices are discarded, to
   `/dev/full` `ENOSPC`.
-- Without an explicit offset, regular files take `pos_busy` per 64 KiB piece in `unlocked_io`,
-  emulating `f_pos_lock`: wait while it is set, take it, snapshot the position, run host
-  `pread`/`pwrite` with the BKL released, advance, release. The BKL is kept between pieces, so
-  another position-based I/O cannot slip between the pieces of one call (only between the iovecs
-  of a synchronous writev). FUSE files take it per 8 MiB piece in `kernel/fuse`, and
-  `copy_regular` for its host copy. lseek, `O_APPEND` writes, sendfile's and `copy_data`'s
-  rollbacks, copy_file_range's shared path, `read_file`'s fault fix-up, loop devices and synthetic
-  files move the position without it.
+- Without an explicit offset, regular and FUSE files serialize position updates with `pos_busy`
+  (`PosGuard`/`TwoPosGuard`, emulating `f_pos_lock`): `read_file`/`write_file` loops, synchronous
+  `writev`, `lseek` (store regular and FUSE), `sendfile`, `copy_file_range` (including `try_share`
+  and `copy_regular`), and `splice` into a file hold `pos_busy` across their position work so
+  unlocked I/O cannot overwrite a sought or advanced position. Loop devices and synthetic files
+  move their position without it.
 - write and writev check `RLIMIT_FSIZE` once for the whole call (cut, or `SIGXFSZ` and `EFBIG` at
   or past it), so a piece or iovec ending at the limit only shortens the call. A write at the
   position of a regular file (not `O_APPEND`) takes `pos_busy` before its checks and holds it to
   the end (`write_local`); each piece checks `RLIMIT_FSIZE`, tmpfs room and seals at its position,
   calls `prepare_write` and `remove_privs`, writes, and charges tmpfs. Writes and truncation call
-  `remove_privs` (`CAP_FSETID` checked in the initial namespace), which clears setgid only with
-  group exec (6.1).
+  `remove_privs` (`CAP_FSETID` checked via `capable_wrt`), which clears setgid with group exec or
+  when the caller is not in the file's group and lacks `CAP_FSETID` (Linux 6.2+, aligned with
+  chown).
 - `O_APPEND` writes run under the BKL at the current host length; `pwrite` on an `O_APPEND` file
   appends too unless `RWF_NOAPPEND` (6.9's flag, honoured only with an explicit offset; FUSE files
-  ignore it). preadv2/pwritev2 refuse unknown flags, `RWF_NOWAIT` and `RWF_APPEND` included
-  (`EOPNOTSUPP`, before the fd lookup). After each write call `write_sync` syncs a regular store
-  file's object (BKL released) for `O_DSYNC` (fdatasync), `O_SYNC` (fsync) or
-  `RWF_DSYNC`/`RWF_SYNC`, so writev syncs once per iovec and pwritev2 once more at the end; FUSE
-  files, host fds, sendfile, copy_file_range, splice, core dumps and loop writes are not synced.
+  ignore it). `preadv2`/`pwritev2` support `RWF_HIPRI`, `RWF_DSYNC`, `RWF_SYNC`, `RWF_NOWAIT`,
+  `RWF_APPEND` and `RWF_NOAPPEND` (per-request via `IoFlags`, without mutating the open file's
+  status flags) and refuse unknown flags (`EOPNOTSUPP`, before the fd lookup). After each write,
+  `writev` (once after all iovecs rather than per-iovec), `sendfile`, `copy_file_range` and
+  `splice` call, `write_sync` syncs a regular store file's object (fdatasync for `O_DSYNC`/
+  `RWF_DSYNC`, fsync for `O_SYNC`/`RWF_SYNC`, BKL released) or a FUSE file (`FUSE_FSYNC`); a sync
+  error after writing is propagated cleanly. Host fds, core dumps and loop writes are not synced.
 - A zero-length `read` or `pread` of anything but a socket returns 0 after the fd lookup, before
   the readable, `ESPIPE` and directory checks (zero-length readv and write check first).
 - Host stdio fds (`FileKind::Host`): reads poll the host fd (`EAGAIN` when nonblocking,
@@ -264,15 +265,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 
 ## Confirmed bugs / technical debt
 
-- **Writes keep a setgid bit chown would clear:** `remove_privs` clears setgid only with group
-  exec (6.1), while chown follows 6.2; since 6.2 Linux's writes match its chown.
-- **File position races:** lseek and the other paths that move the position without `pos_busy` can
-  be overwritten by a piece finishing without the BKL (Linux's lseek takes `f_pos_lock`), and a
-  synchronous writev releases the position between iovecs.
 - **Fidelity gaps**, one per line:
-  - sendfile, copy_file_range and splice into an `O_SYNC`/`O_DSYNC` file do not sync it, nor do
-    FUSE writes;
-  - preadv2/pwritev2 refuse `RWF_NOWAIT` and `RWF_APPEND` (6.1 supports both);
   - read, write, their vector forms and the chunked copies are not capped at `MAX_RW_COUNT`;
   - host stdio: positional I/O is `ESPIPE` on a regular host file, and a blocked write cannot be
     interrupted;
@@ -281,8 +274,6 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   for epoll), `ESPIPE` and `EISDIR` checks; pread and pwrite look up the fd before refusing a
   negative offset; fallocate checks its arguments before the fd, its mode after the fd's type, and
   on a socket is `ESPIPE` where 6.1 says `ENODEV`.
-- **writev to a synchronous file syncs per iovec** (slower, same durability), and a sync failing
-  on a later iovec returns the earlier total, leaving out bytes already written.
 - **Private mappings do not follow a file to its own object:** a private mapping made while the
   file shared an object keeps the shared data in pages it has not copied after a write through
   another descriptor. Shared mappings follow, unless an address space was busy then or the Files

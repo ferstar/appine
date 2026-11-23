@@ -60,7 +60,7 @@ pub(super) fn setxattr(
     cx.mm().read(UserSlice::new(value, size), &mut v)?;
     let node = node_of(cx, target)?;
     if let Node::Fuse(_, f) = node {
-        return fuse_change(cx, &node, f, &name, Some((&v, flags)));
+        return fuse_change(cx, target, &node, f, &name, Some((&v, flags)));
     }
     if name.starts_with(b"system.") {
         return change_acl(cx, target, node, &name, Some(&v));
@@ -182,7 +182,7 @@ pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResu
     let name = read_name(cx, name)?;
     let node = node_of(cx, target)?;
     if let Node::Fuse(_, f) = node {
-        return fuse_change(cx, &node, f, &name, None);
+        return fuse_change(cx, target, &node, f, &name, None);
     }
     if name.starts_with(b"system.") {
         return change_acl(cx, target, node, &name, None);
@@ -403,6 +403,7 @@ fn acl_encode(entries: &[AclEntry]) -> Vec<u8> {
 /// namespaced capabilities first).
 fn fuse_change(
     cx: &mut Cx<'_>,
+    target: Target,
     node: &Node,
     id: crate::vfs::fuse::FuseId,
     name: &[u8],
@@ -414,6 +415,7 @@ fn fuse_change(
     }
     super::fuse::xattr_permission(&vfs, &cx.cred(), id, name, true)?;
     super::fuse::set_xattr(cx, &vfs, id, name, value)?;
+    attrib(cx, target, crate::vfs::fuse::key(id));
     Ok(0)
 }
 

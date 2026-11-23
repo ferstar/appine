@@ -43,7 +43,7 @@ use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Kernel, request_wake_object, wake};
 use crate::vfs::browse::Change;
 use crate::vfs::store::Ino;
-use crate::vfs::{Node, Vfs, overlay};
+use crate::vfs::{Node, overlay};
 
 pub(crate) const IN_ACCESS: u32 = 0x1;
 pub(crate) const IN_MODIFY: u32 = 0x2;
@@ -144,20 +144,12 @@ impl Default for Inotify {
 
 impl Inotify {
     fn push(&mut self, wd: i32, mask: u32, cookie: u32, name: &[u8]) {
-        let event = Event {
-            wd,
-            mask,
-            cookie,
-            name: name.to_vec(),
-        };
-        if self.queue.back() == Some(&event) {
-            return;
-        }
-        let event = if self.queue.len() < self.max_queued {
-            event
-        } else if self.overflowed {
-            return;
-        } else {
+        // Check queue overflow before tail merging, as Linux's fsnotify_add_event does: when the
+        // queue is already full, even an event identical to the last one queues IN_Q_OVERFLOW.
+        let event = if self.queue.len() >= self.max_queued {
+            if self.overflowed {
+                return;
+            }
             self.overflowed = true;
             Event {
                 wd: -1,
@@ -165,6 +157,17 @@ impl Inotify {
                 cookie: 0,
                 name: Vec::new(),
             }
+        } else {
+            let event = Event {
+                wd,
+                mask,
+                cookie,
+                name: name.to_vec(),
+            };
+            if self.queue.back() == Some(&event) {
+                return;
+            }
+            event
         };
         self.bytes += event.len();
         self.queue.push_back(event);
@@ -231,6 +234,7 @@ impl Drop for Inotify {
                 list.retain(|(weak, _)| weak.strong_count() > 0);
                 if list.is_empty() {
                     r.by_ino.remove(&ino);
+                    r.doomed.remove(&ino);
                 }
             }
         }
@@ -342,7 +346,6 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
         },
     );
     if let Some(ino) = key_of(&node) {
-        r.vfs = Rc::downgrade(&vfs);
         r.by_ino
             .entry(ino)
             .or_default()
@@ -364,6 +367,7 @@ pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
         list.retain(|(weak, w)| !(*w == wd && weak.ptr_eq(&Rc::downgrade(&inotify))));
         if list.is_empty() {
             r.by_ino.remove(&ino);
+            r.doomed.remove(&ino);
         }
     }
     Ok(0)
@@ -431,13 +435,11 @@ type Watcher = (Weak<RefCell<Inotify>>, i32);
 
 /// All watches, by watched inode.
 pub struct Registry {
-    /// The (instance, wd) pairs on each inode: a store inode number, or an overlay node's
-    /// [`overlay::key`]. The weak references die once the instance is closed and are cleared the
+    /// The (instance, wd) pairs on each inode: a store inode number, or an overlay, FUSE or
+    /// cgroup2 node key. The weak references die once the instance is closed and are cleared the
     /// next time they are come across.
     by_ino: HashMap<Ino, Vec<Watcher>>,
     last_cookie: u32,
-    /// The store the watches are in: `IN_EXCL_UNLINK` must check whether a child still has links.
-    vfs: Weak<Vfs>,
     /// Instance and watch counts per user (effective uid).
     users: HashMap<u32, (usize, usize)>,
     /// The three limits under `/proc/sys/fs/inotify/`.
@@ -454,7 +456,6 @@ impl Default for Registry {
         Registry {
             by_ino: HashMap::new(),
             last_cookie: 0,
-            vfs: Weak::new(),
             users: HashMap::new(),
             max_queued: MAX_QUEUED,
             max_instances: MAX_INSTANCES,
@@ -475,44 +476,24 @@ impl Registry {
     }
 
     /// An event of `ino` itself: reported first to the watches of its directory `parent` (with
-    /// the name), then to its own. Each instance that got an event requests a wakeup
-    /// (`Inotify::push`).
-    fn notify(&mut self, ino: Ino, parent: Option<(Ino, &[u8])>, mask: u32) {
+    /// the name), then to its own. When `unlinked` is true, watches with `IN_EXCL_UNLINK` skip
+    /// the event. Each instance that got an event requests a wakeup (`Inotify::push`).
+    fn notify(&mut self, ino: Ino, parent: Option<(Ino, &[u8])>, mask: u32, unlinked: bool) {
         if let Some((dir, name)) = parent
             && mask & SELF_EVENTS == 0
         {
-            self.deliver(dir, mask, 0, name, Some(ino));
+            self.deliver(dir, mask, 0, name, unlinked);
         }
-        self.deliver(ino, mask, 0, b"", None);
+        self.deliver(ino, mask, 0, b"", unlinked);
     }
 
     /// Hands an event to the watches on `ino` that want it; returns whether any event was queued
-    /// (instances that queue an event request a wakeup, see `Inotify::push`). `child` is the
-    /// child when a directory gets a child's own event: watches with `IN_EXCL_UNLINK` do not want
-    /// events of children that have been deleted.
-    fn deliver(
-        &mut self,
-        ino: Ino,
-        mask: u32,
-        cookie: u32,
-        name: &[u8],
-        child: Option<Ino>,
-    ) -> bool {
-        let vfs = self.vfs.clone();
+    /// (instances that queue an event request a wakeup, see `Inotify::push`). When `unlinked` is
+    /// true, watches with `IN_EXCL_UNLINK` ignore the event (Linux's `d_unlinked` check on
+    /// path-based open/access/modify/close events).
+    fn deliver(&mut self, ino: Ino, mask: u32, cookie: u32, name: &[u8], unlinked: bool) -> bool {
         let Some(list) = self.by_ino.get_mut(&ino) else {
             return false;
-        };
-        let mut unlinked = None;
-        // An overlay node is unlinked once its directory no longer has it; cgroup2 files never
-        // are
-        let mut is_unlinked = |child: Ino| {
-            *unlinked.get_or_insert_with(|| {
-                !crate::cgroup::is_key(child)
-                    && vfs.upgrade().is_some_and(|v| match overlay::of_key(child) {
-                        Some(o) => !v.overlay().linked(o),
-                        None => v.store().stat(child).map_or(true, |st| st.nlink == 0),
-                    })
-            })
         };
         let mut queued = false;
         let mut gone = Vec::new();
@@ -526,7 +507,7 @@ impl Registry {
             let Some(wmask) = inotify.watches.get(wd).map(|w| w.mask) else {
                 return false;
             };
-            let excluded = wmask & IN_EXCL_UNLINK != 0 && child.is_some_and(&mut is_unlinked);
+            let excluded = wmask & IN_EXCL_UNLINK != 0 && unlinked && !crate::cgroup::is_key(ino);
             let wanted = mask & wmask & IN_ALL_EVENTS != 0 && !excluded;
             if wanted {
                 inotify.push(*wd, mask, cookie, name);
@@ -545,6 +526,7 @@ impl Registry {
         });
         if list.is_empty() {
             self.by_ino.remove(&ino);
+            self.doomed.remove(&ino);
         }
         for uid in gone {
             self.uncharge(uid);
@@ -568,29 +550,40 @@ impl Registry {
         list.retain(|f| f.strong_count() > 0);
         if list.is_empty() {
             self.doomed.remove(&ino);
-            self.notify(ino, None, IN_DELETE_SELF);
+            self.notify(ino, None, IN_DELETE_SELF, false);
         }
     }
 }
 
-/// Carried by an open store file: fd-based events are reported to its directory through it, and
+/// Carried by an open store, overlay or FUSE file: fd-based events are reported to its directory
+/// through it, `unlinked` tracks whether its dentry was unlinked (`IN_EXCL_UNLINK`), and
 /// `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` is reported when the last reference is released.
 pub struct Opened {
     registry: Weak<RefCell<Registry>>,
     ino: Ino,
     parent: Option<(Ino, Vec<u8>)>,
     close: u32,
+    unlinked: bool,
+}
+
+impl Opened {
+    pub(crate) fn is_unlinked(&self) -> bool {
+        self.unlinked
+    }
 }
 
 impl Drop for Opened {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade()
             && let Ok(mut r) = registry.try_borrow_mut()
-            && !r.by_ino.is_empty()
         {
-            let parent = self.parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
-            r.notify(self.ino, parent, self.close);
-            r.closed(self.ino);
+            if !r.by_ino.is_empty() {
+                let parent = self.parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
+                r.notify(self.ino, parent, self.close, self.unlinked);
+            }
+            if !r.doomed.is_empty() {
+                r.closed(self.ino);
+            }
         }
     }
 }
@@ -620,13 +613,13 @@ pub(crate) fn key_of(node: &Node) -> Option<Ino> {
 /// the watches on the directory (with the name) and on the file, as `kernfs_notify` reports it.
 pub(crate) fn kernfs_modified(k: &Kernel, key: Ino, dir: Ino, name: &[u8]) {
     if let Ok(mut r) = k.inotify.try_borrow_mut() {
-        r.notify(key, Some((dir, name)), IN_MODIFY);
+        r.notify(key, Some((dir, name)), IN_MODIFY, false);
     }
 }
 
 /// What events of a path-based operation go to: `ino`, the store inode it changed, or the
-/// overlay node the path names (whose change went to its upper inode), and the directory and
-/// name (for the directory's watches). The path is resolved again only when there are watches.
+/// overlay/FUSE node the path names, and the directory and name (for the directory's watches).
+/// The path is resolved again only when there are watches.
 pub(crate) fn watched_at(
     cx: &Cx<'_>,
     ino: Ino,
@@ -643,10 +636,21 @@ pub(crate) fn watched_at(
             .ok()
     })();
     let Some((node, dentry)) = found else {
+        // After a FUSE change that staled cached attributes, fall back to the node's recorded
+        // parent and name so the directory watch still receives the event.
+        if let Some(f) = crate::vfs::fuse::id_of(ino)
+            && let Ok(vfs) = cx.vfs()
+            && let Some(n) = vfs.fuse().get(f)
+            && n.parent != f
+            && !n.name.is_empty()
+        {
+            return (ino, Some((crate::vfs::fuse::key(n.parent), n.name.clone())));
+        }
         return (ino, None);
     };
     let target = match node {
         Node::Overlay(_, o) => overlay::key(o),
+        Node::Fuse(_, f) => crate::vfs::fuse::key(f),
         _ => ino,
     };
     let parent = dentry.and_then(|(dir, name)| Some((key_of(&dir)?, name)));
@@ -656,13 +660,39 @@ pub(crate) fn watched_at(
 /// An event of the object `ino` itself in a path-based operation; `parent` is its directory and
 /// name.
 pub(crate) fn path_event(k: &Kernel, ino: Ino, parent: Option<(Ino, &[u8])>, mask: u32) {
+    path_event_unlinked(k, ino, parent, mask, false);
+}
+
+/// Like [`path_event`], but honours `IN_EXCL_UNLINK` when `unlinked` is true (e.g. `IN_OPEN` of
+/// an unlinked file reopened through `/proc/<pid>/fd/N`).
+pub(crate) fn path_event_unlinked(
+    k: &Kernel,
+    ino: Ino,
+    parent: Option<(Ino, &[u8])>,
+    mask: u32,
+    unlinked: bool,
+) {
     if !idle(k) {
-        k.inotify.borrow_mut().notify(ino, parent, mask);
+        k.inotify.borrow_mut().notify(ino, parent, mask, unlinked);
     }
 }
 
-/// An event on an open file in an fd-based operation.
+/// A metadata or truncation event on an open file (`fchmod`, `fchown`, `futimens`, `ftruncate`,
+/// `fsetxattr`, `fremovexattr`): Linux's `fsnotify_change`/`fsnotify_xattr` pass the inode rather
+/// than the path, so `IN_EXCL_UNLINK` does not filter them.
 pub(crate) fn file_event(k: &Kernel, f: &OpenFile, mask: u32) {
+    file_event_inner(k, f, mask, false);
+}
+
+/// A file-I/O event on an open file (`read`, `write`, `getdents64`, `fallocate`, copies): Linux's
+/// `fsnotify_access`/`fsnotify_modify` pass the open file's dentry, so watches with
+/// `IN_EXCL_UNLINK` (both directory and file watches) skip events on an unlinked name.
+pub(crate) fn file_io_event(k: &Kernel, f: &OpenFile, mask: u32) {
+    let unlinked = f.watch.as_ref().is_some_and(Opened::is_unlinked);
+    file_event_inner(k, f, mask, unlinked);
+}
+
+fn file_event_inner(k: &Kernel, f: &OpenFile, mask: u32, unlinked: bool) {
     if idle(k) {
         return;
     }
@@ -675,7 +705,7 @@ pub(crate) fn file_event(k: &Kernel, f: &OpenFile, mask: u32) {
         .as_ref()
         .and_then(|w| w.parent.as_ref())
         .map(|(d, n)| (*d, n.as_slice()));
-    k.inotify.borrow_mut().notify(ino, parent, mask);
+    k.inotify.borrow_mut().notify(ino, parent, mask, unlinked);
 }
 
 /// A child named `name` in directory `dir` was created, deleted, moved in or moved out.
@@ -683,7 +713,7 @@ pub(crate) fn dir_event(k: &Kernel, dir: Ino, name: &[u8], mask: u32, cookie: u3
     if !idle(k) {
         k.inotify
             .borrow_mut()
-            .deliver(dir, mask, cookie, name, None);
+            .deliver(dir, mask, cookie, name, false);
     }
 }
 
@@ -708,9 +738,14 @@ fn file_key(f: &OpenFile) -> Option<(Ino, u32)> {
     }
 }
 
-/// The [`Opened`] a newly opened store or overlay file carries. `parent` is the directory and name
-/// the open went through.
-pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, Vec<u8>)>) -> Option<Opened> {
+/// The [`Opened`] a newly opened store, overlay or FUSE file carries. `parent` is the directory
+/// and name the open went through; `unlinked` is true when reopened from an already-unlinked file.
+pub(crate) fn opened(
+    k: &Kernel,
+    f: &OpenFile,
+    parent: Option<(Ino, Vec<u8>)>,
+    unlinked: bool,
+) -> Option<Opened> {
     let (ino, dir) = file_key(f)?;
     Some(Opened {
         registry: Rc::downgrade(&k.inotify),
@@ -722,7 +757,27 @@ pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, Vec<u8>)>) -
             } else {
                 IN_CLOSE_NOWRITE
             },
+        unlinked,
     })
+}
+
+/// The name `(dir, name)` of `ino` was unlinked, rmdir'd or replaced by a rename: mark every open
+/// file opened through that name as unlinked (`d_unlinked`) so `IN_EXCL_UNLINK` filters its
+/// open/access/modify/close events even when another hard link remains or watches are added later.
+pub(crate) fn unlinked(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
+    for f in k.open_files() {
+        let Ok(mut f) = f.try_borrow_mut() else {
+            continue;
+        };
+        if let Some(w) = f.watch.as_mut()
+            && w.ino == ino
+            && w.parent
+                .as_ref()
+                .is_some_and(|(d, n)| *d == dir && n == name)
+        {
+            w.unlinked = true;
+        }
+    }
 }
 
 /// rename moved dentry `from` to `to`: files opened through it report later fd-based events to
@@ -753,7 +808,7 @@ pub(crate) fn renamed(
     };
     for f in files {
         let mut f = f.borrow_mut();
-        if let Some(w) = f.watch.as_mut().filter(|w| w.ino == ino) {
+        if let Some(w) = f.watch.as_mut().filter(|w| w.ino == ino && !w.unlinked) {
             w.parent = Some((to.0, to.1.to_vec()));
         }
     }
@@ -799,9 +854,15 @@ pub(crate) fn deleted(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
 pub(crate) fn host_change(k: &Kernel, c: &Change) {
     let isdir = |d: bool| if d { IN_ISDIR } else { 0 };
     // Files open through the moved name follow the rename, even with no watches (later watches
-    // need it)
-    if let Change::Moved { from, to, ino, .. } = c {
-        renamed(k, (from.0, &from.1), (to.0, &to.1), || Some(*ino));
+    // need it); removed names are marked unlinked for IN_EXCL_UNLINK
+    match c {
+        Change::Moved { from, to, ino, .. } => {
+            renamed(k, (from.0, &from.1), (to.0, &to.1), || Some(*ino));
+        }
+        Change::Removed { dir, name, ino, .. } => {
+            unlinked(k, *ino, *dir, name);
+        }
+        _ => {}
     }
     // A held file the host made private as it opened it for writing: the kernel's open files of it
     // move to its new object, even with no watches
@@ -912,11 +973,11 @@ mod tests {
         let i = Rc::new(RefCell::new(Inotify::default()));
         let dir = watch(&mut r, &i, 1, IN_MODIFY | IN_CREATE);
         let file = watch(&mut r, &i, 2, IN_MODIFY | IN_DELETE_SELF);
-        r.notify(2, Some((1, b"f")), IN_MODIFY);
+        r.notify(2, Some((1, b"f")), IN_MODIFY, false);
         // Compared only with the event at the tail: only identical ones merge
-        r.notify(2, None, IN_MODIFY);
-        r.notify(2, Some((1, b"f")), IN_ATTRIB);
-        r.notify(2, Some((1, b"f")), IN_DELETE_SELF);
+        r.notify(2, None, IN_MODIFY, false);
+        r.notify(2, Some((1, b"f")), IN_ATTRIB, false);
+        r.notify(2, Some((1, b"f")), IN_DELETE_SELF, false);
         assert_eq!(
             events(&i),
             vec![
@@ -928,7 +989,7 @@ mod tests {
         );
         // The file's watch goes away with IN_DELETE_SELF; the directory's stays
         assert!(!r.by_ino.contains_key(&2));
-        assert!(r.deliver(1, IN_CREATE | IN_ISDIR, 0, b"d", None));
+        assert!(r.deliver(1, IN_CREATE | IN_ISDIR, 0, b"d", false));
         assert_eq!(events(&i), vec![(dir, IN_CREATE | IN_ISDIR, b"d".to_vec())]);
     }
 
@@ -937,8 +998,8 @@ mod tests {
         let mut r = Registry::default();
         let i = Rc::new(RefCell::new(Inotify::default()));
         let wd = watch(&mut r, &i, 5, IN_OPEN | IN_ONESHOT);
-        r.notify(5, None, IN_OPEN);
-        r.notify(5, None, IN_OPEN | IN_ISDIR);
+        r.notify(5, None, IN_OPEN, false);
+        r.notify(5, None, IN_OPEN | IN_ISDIR, false);
         assert_eq!(
             events(&i),
             vec![(wd, IN_OPEN, vec![]), (wd, IN_IGNORED, vec![])]
@@ -946,7 +1007,7 @@ mod tests {
         assert!(r.by_ino.is_empty());
         watch(&mut r, &i, 6, IN_OPEN);
         drop(i);
-        assert!(!r.deliver(6, IN_OPEN, 0, b"", None));
+        assert!(!r.deliver(6, IN_OPEN, 0, b"", false));
         assert!(r.by_ino.is_empty());
     }
 
@@ -965,6 +1026,7 @@ mod tests {
                 ino: 7,
                 parent: Some((1, b"f".to_vec())),
                 close: IN_CLOSE_NOWRITE,
+                unlinked: false,
             });
             file
         };
@@ -988,6 +1050,40 @@ mod tests {
     }
 
     #[test]
+    fn delete_self_entry_clears_when_watches_disappear_before_close() {
+        let registry = Rc::new(RefCell::new(Registry::default()));
+        let i = Rc::new(RefCell::new(Inotify::default()));
+        i.borrow_mut().registry = Rc::downgrade(&registry);
+        watch(&mut registry.borrow_mut(), &i, 9, IN_ALL_EVENTS);
+        let file = OpenFile::new(
+            FileKind::Path(Node::Store(crate::vfs::ROOT_MOUNT, 9)),
+            oflags::O_RDONLY,
+        );
+        file.borrow_mut().watch = Some(Opened {
+            registry: Rc::downgrade(&registry),
+            ino: 9,
+            parent: Some((1, b"g".to_vec())),
+            close: IN_CLOSE_NOWRITE,
+            unlinked: true,
+        });
+        registry
+            .borrow_mut()
+            .doomed
+            .insert(9, vec![Rc::downgrade(&file)]);
+        // Dropping the inotify instance removes the last watch on inode 9 and cleans doomed
+        drop(i);
+        assert!(registry.borrow().by_ino.is_empty());
+        assert!(registry.borrow().doomed.is_empty());
+        // Even if a doomed entry remained with no watches left, dropping the last open file clears it
+        registry
+            .borrow_mut()
+            .doomed
+            .insert(9, vec![Rc::downgrade(&file)]);
+        drop(file);
+        assert!(registry.borrow().doomed.is_empty());
+    }
+
+    #[test]
     fn queue_overflows_once() {
         let mut i = Inotify::default();
         for n in 0..MAX_QUEUED + 10 {
@@ -996,6 +1092,14 @@ mod tests {
         assert_eq!(i.queue.len(), MAX_QUEUED + 1);
         assert_eq!(i.queue.back().unwrap().mask, IN_Q_OVERFLOW);
         assert_eq!(i.pending(), (MAX_QUEUED + 1) * 16);
+        // When full, an event identical to the tail must still queue IN_Q_OVERFLOW instead of merging
+        let mut small = Inotify::default();
+        small.max_queued = 2;
+        small.push(1, IN_OPEN, 0, b"");
+        small.push(1, IN_MODIFY, 0, b"");
+        small.push(1, IN_MODIFY, 0, b"");
+        assert_eq!(small.queue.len(), 3);
+        assert_eq!(small.queue.back().unwrap().mask, IN_Q_OVERFLOW);
         assert_eq!(
             Event {
                 wd: 1,
@@ -1005,6 +1109,41 @@ mod tests {
             }
             .len(),
             32
+        );
+    }
+
+    #[test]
+    fn excl_unlink_filters_unlinked_events_on_both_dir_and_file_watches() {
+        let mut r = Registry::default();
+        let i = Rc::new(RefCell::new(Inotify::default()));
+        let fuse_dir = crate::vfs::fuse::key(10);
+        let fuse_file = crate::vfs::fuse::key(11);
+        let d_wd = watch(
+            &mut r,
+            &i,
+            fuse_dir,
+            IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_EXCL_UNLINK,
+        );
+        let f_wd = watch(
+            &mut r,
+            &i,
+            fuse_file,
+            IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_EXCL_UNLINK,
+        );
+        // Linked FUSE child: events are delivered to both directory and file watches
+        r.notify(fuse_file, Some((fuse_dir, b"f")), IN_MODIFY, false);
+        assert_eq!(
+            events(&i),
+            vec![(d_wd, IN_MODIFY, b"f".to_vec()), (f_wd, IN_MODIFY, vec![]),]
+        );
+        // Unlinked name: I/O and close are excluded on both watches, while metadata (unlinked=false) is kept
+        r.notify(fuse_file, Some((fuse_dir, b"f")), IN_MODIFY, true);
+        r.notify(fuse_file, Some((fuse_dir, b"f")), IN_CLOSE_WRITE, true);
+        assert!(events(&i).is_empty());
+        r.notify(fuse_file, Some((fuse_dir, b"f")), IN_ATTRIB, false);
+        assert_eq!(
+            events(&i),
+            vec![(d_wd, IN_ATTRIB, b"f".to_vec()), (f_wd, IN_ATTRIB, vec![]),]
         );
     }
 }

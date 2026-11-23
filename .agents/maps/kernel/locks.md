@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint lease-break-time sysctl reference to kernel/sysctl)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: key overlay leases on overlay node identity and break leases before copy-up)
 
 ## Responsibilities
 
@@ -45,7 +45,9 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
 
 - All in-process. Locks key on the store inode (bind mounts share them), on an overlay node with
   the top bit set, or on a FUSE node's key (top two bits; `OpenFile::lock_ino`), the daemon never
-  asked; leases key on the store inode behind a regular file (FUSE files `EINVAL`). The host
+  asked; leases key on `lease::key_of` — the overlay node's key (`overlay::key`) for overlay
+  regular files so leases survive copy-up and break before copy-up on write opens and truncations,
+  or the store inode otherwise (FUSE files `EINVAL`). The host
   `flock` is used only by the store itself. `flock` and fcntl locks are separate tables.
 - `flock`: one entry per open file; relocking converts; `LOCK_NB` `EAGAIN`; released on `LOCK_UN`
   or when the open file goes. On an `O_PATH` fd it is `EBADF`.
@@ -104,11 +106,6 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
 
 ## Confirmed bugs / technical debt
 
-- **Leases are lost across an overlay copy-up:** a lease taken through an overlay before copy-up
-  sits on the lower inode; the write open or truncate that copies up breaks leases on the upper
-  inode without notifying the holder, and once `follow_copy_up` moves the holder's description,
-  `F_GETLEASE` reports `F_UNLCK` while `F_SETLEASE(F_UNLCK)` fails with `EAGAIN` until close.
-  Linux keys leases on the overlay file's own inode.
 - **Locks on inode-less files are no-ops:** `flock` and `F_SETLK` on anonymous pipes, sockets and
   PTYs succeed without locking, though processes sharing an inherited fd can coordinate with them
   on Linux.

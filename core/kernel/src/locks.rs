@@ -346,26 +346,25 @@ fn shown(k: &Kernel, only: Option<Ino>) -> Vec<Shown> {
             });
         }
     }
-    // Leases are keyed by the store inode, also behind an overlay node
-    for lease in k.leases.values().flatten() {
-        let Some((file, write, breaking, pid)) = lease.shown() else {
-            continue;
-        };
-        if only.is_some() && file.borrow().lock_ino() != only {
-            continue;
+    // Leases are keyed by the store inode, or by an overlay node's key (same as lock_ino)
+    for (_, leases) in k.leases.iter().filter(|(i, _)| wanted(i)) {
+        for lease in leases {
+            let Some((file, write, breaking, pid)) = lease.shown() else {
+                continue;
+            };
+            out.push(Shown {
+                kind: if breaking {
+                    "LEASE  BREAKING  "
+                } else {
+                    "LEASE  ACTIVE    "
+                },
+                write,
+                pid,
+                file,
+                range: "0 EOF".into(),
+                table: None,
+            });
         }
-        out.push(Shown {
-            kind: if breaking {
-                "LEASE  BREAKING  "
-            } else {
-                "LEASE  ACTIVE    "
-            },
-            write,
-            pid,
-            file,
-            range: "0 EOF".into(),
-            table: None,
-        });
     }
     out
 }

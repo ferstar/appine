@@ -215,14 +215,19 @@ const KEPT_AT_OPEN: u32 = oflags::O_ACCMODE
     | oflags::O_NONBLOCK
     | oflags::O_PATH
     | oflags::O_DSYNC
-    | oflags::O_SYNC_BIT;
+    | oflags::O_SYNC_BIT
+    | oflags::O_ASYNC
+    | oflags::O_DIRECT
+    | oflags::O_NOATIME
+    | oflags::O_DIRECTORY
+    | oflags::O_NOFOLLOW;
 
-/// The status flags an open file keeps from `flags`: with `O_PATH` only `O_PATH` (Linux's
-/// build_open_how drops the access mode and every other flag but `O_DIRECTORY`, `O_NOFOLLOW` and
+/// The status flags an open file keeps from `flags`: with `O_PATH` only `O_PATH`, `O_DIRECTORY`
+/// and `O_NOFOLLOW` (Linux's `build_open_flags` drops the access mode and every other flag but
 /// `O_CLOEXEC`), otherwise [`KEPT_AT_OPEN`].
 fn kept(flags: u32) -> u32 {
     if flags & oflags::O_PATH != 0 {
-        oflags::O_PATH
+        oflags::O_PATH | oflags::O_DIRECTORY | oflags::O_NOFOLLOW
     } else {
         KEPT_AT_OPEN
     }
@@ -507,10 +512,23 @@ fn open_path_with(
                         Some((dir.clone(), name.to_vec())),
                     );
                 }
-                let (mnt, d) = create_dir(&vfs, &dir)?;
-                let dir_st = may_create(&vfs, &cred, (mnt, d), name)?;
+                // Check permissions and tmpfs room before copying up an overlay parent directory
+                let (mnt, d, dir_st) = match &dir {
+                    Node::Overlay(mnt, o) => {
+                        let dir_st =
+                            may_create_overlay(&vfs, &cred, &cx.view(&vfs), (*mnt, *o), name)?;
+                        check_overlay_create_tmpfs(&vfs, *mnt, *o, name, 0)?;
+                        let (mnt, d) = create_dir(&vfs, &dir)?;
+                        (mnt, d, dir_st)
+                    }
+                    _ => {
+                        let (mnt, d) = store_dir(&vfs, &dir)?;
+                        let dir_st = may_create(&vfs, &cred, (mnt, d), name)?;
+                        (mnt, d, dir_st)
+                    }
+                };
                 let (uid, gid, perm) = cred.new_owner(&dir_st, perm, cx.umask(), false);
-                let tmpfs = tmpfs_reserve(&vfs, (mnt, d), 0)?;
+                let tmpfs = tmpfs_reserve_name(&vfs, (mnt, d), name, 0)?;
                 let (ino, file) = create_in(
                     &vfs,
                     (mnt, d),
@@ -518,7 +536,7 @@ fn open_path_with(
                     || vfs.store().create_file(d, name, perm, uid, gid),
                     |(ino, _)| *ino,
                 )?;
-                tmpfs_created(&vfs, tmpfs, 0);
+                tmpfs_created_name(&vfs, tmpfs, 0);
                 // In an overlay the new file is the overlay's node of that name
                 if let Node::Overlay(mnt, o) = dir {
                     break (
@@ -560,18 +578,22 @@ fn open_path_with(
                     FileKind::Regular { ino, .. } => Some(ino),
                     _ => None,
                 };
-                (f.mnt, f.path.clone(), ino)
+                let unlinked = f.watch.as_ref().is_some_and(inotify::Opened::is_unlinked)
+                    || ino.is_some_and(|i| vfs.store().attrs(i).is_ok_and(|st| st.nlink == 0));
+                (f.mnt, f.path.clone(), ino, unlinked)
             })
         }
         Node::Pseudo(_, PseudoNode::OpenExe(proc)) if flags & oflags::O_PATH == 0 => {
             exe_file(cx, *proc).ok().and_then(|e| {
                 let (mnt, ino) = e.node?;
-                Some((mnt, Some(e.path.clone()), Some(ino)))
+                let unlinked = vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0);
+                Some((mnt, Some(e.path.clone()), Some(ino), unlinked))
             })
         }
         _ => None,
     };
-    if let Some((mnt, path, ino)) = &reopened {
+    let reopened_unlinked = reopened.as_ref().is_some_and(|r| r.3);
+    if let Some((mnt, path, ino, _)) = &reopened {
         display = path.clone();
         opened_ino = ino.and_then(|ino| inotify::key_of(&Node::Store(*mnt, ino)));
     }
@@ -666,7 +688,15 @@ fn open_path_with(
     }
     file.borrow_mut().dentry = parent.clone();
     if let Some(ino) = opened_ino {
-        open_events(cx, &file, ino, parent, was_created, flags);
+        open_events(
+            cx,
+            &file,
+            ino,
+            parent,
+            was_created,
+            flags,
+            reopened_unlinked,
+        );
     }
     Ok(file)
 }
@@ -1065,6 +1095,7 @@ fn open_events(
     parent: Option<(Node, Vec<u8>)>,
     created: bool,
     flags: u32,
+    unlinked: bool,
 ) {
     let k = cx.kr();
     // A file created through an overlay was created in its upper directory first, which reports it
@@ -1080,9 +1111,9 @@ fn open_events(
         if let (Some(up), Some((_, name))) = (upper, &parent) {
             inotify::dir_event(k, up, name, inotify::IN_CREATE, 0);
         }
-        open_notify(k, file, ino, parent.as_ref(), created, flags);
+        open_notify(k, file, ino, parent.as_ref(), created, flags, unlinked);
     }
-    let watch = inotify::opened(k, &file.borrow(), parent);
+    let watch = inotify::opened(k, &file.borrow(), parent, unlinked);
     file.borrow_mut().watch = watch;
 }
 
@@ -1093,13 +1124,16 @@ fn open_notify(
     parent: Option<&(Ino, Vec<u8>)>,
     created: bool,
     flags: u32,
+    unlinked: bool,
 ) {
     let parent = parent.map(|(d, n)| (*d, n.as_slice()));
     let (dir, truncated) = {
         let f = file.borrow();
-        let regular = matches!(f.kind, FileKind::Regular { .. });
+        let regular = matches!(f.kind, FileKind::Regular { .. } | FileKind::Fuse(_));
         let dir = matches!(f.kind, FileKind::Directory { .. });
-        let truncated = regular && f.writable() && flags & oflags::O_TRUNC != 0;
+        // O_TRUNC truncates regular files even with O_RDONLY (open_store / fuse::open), emitting
+        // IN_MODIFY unless the file was just created
+        let truncated = regular && !created && flags & oflags::O_TRUNC != 0;
         (if dir { inotify::IN_ISDIR } else { 0 }, truncated)
     };
     match parent {
@@ -1107,7 +1141,7 @@ fn open_notify(
         _ if truncated => inotify::path_event(k, ino, parent, inotify::IN_MODIFY),
         _ => {}
     }
-    inotify::path_event(k, ino, parent, inotify::IN_OPEN | dir);
+    inotify::path_event_unlinked(k, ino, parent, inotify::IN_OPEN | dir, unlinked);
 }
 
 /// name_to_handle_at: the handle of a file in the store is its inode number; synthetic
@@ -1251,7 +1285,9 @@ impl<'a> StoreOpen<'a> {
     }
 }
 
-/// Opens a store inode reached through mount `mnt`.
+/// Opens a store inode reached through mount `mnt`. When opened through an overlay, `lease_ino`
+/// is the overlay node's key so leases are broken on the overlay identity rather than the layer
+/// inode.
 fn open_store(
     cx: &mut Cx<'_>,
     cred: &Cred,
@@ -1259,6 +1295,18 @@ fn open_store(
     (mnt, ino): (MountId, Ino),
     flags: u32,
     how: StoreOpen<'_>,
+) -> Result<FileKind, Errno> {
+    open_store_with(cx, cred, vfs, (mnt, ino), flags, how, ino)
+}
+
+fn open_store_with(
+    cx: &mut Cx<'_>,
+    cred: &Cred,
+    vfs: &Vfs,
+    (mnt, ino): (MountId, Ino),
+    flags: u32,
+    how: StoreOpen<'_>,
+    lease_ino: Ino,
 ) -> Result<FileKind, Errno> {
     let (created, beside, check, memfd) = match how {
         StoreOpen::Found(beside) => (None, beside, true, false),
@@ -1349,7 +1397,7 @@ fn open_store(
             // only with write leases
             if check {
                 let nonblock = flags & oflags::O_NONBLOCK != 0;
-                super::lease::break_leases(cx, ino, write, nonblock, None)?;
+                super::lease::break_leases(cx, lease_ino, write, nonblock, None)?;
             }
             // A held file shares its object: truncating it first gives it an empty one of its
             // own; otherwise a description opened for writing gets a read-only handle on the
@@ -1375,7 +1423,7 @@ fn open_store(
                     _ => None,
                 };
                 let target = writable.as_ref().unwrap_or(&file);
-                let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), target)?;
+                let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), ino, target)?;
                 truncating(cx, target, 0);
                 target.set_len(0).map_err(host_errno)?;
                 tmpfs_resized(vfs, tmpfs, target);
@@ -1446,6 +1494,7 @@ fn open_overlay(
 ) -> Result<FileKind, Errno> {
     let mut real = vfs.overlay().node(o).real();
     let st = vfs.store().attrs(real)?;
+    let lease_ino = overlay::key(o);
     let write = flags & oflags::O_ACCMODE != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0;
     if write && created.is_none() && st.kind() == mode::S_IFREG {
         if vfs.readonly(&Node::Overlay(mnt, o)) {
@@ -1454,9 +1503,19 @@ fn open_overlay(
         let truncate = flags & oflags::O_TRUNC != 0;
         let mask = open_mask(flags) | if truncate { MAY_WRITE } else { 0 };
         cred.permission(&st, mask)?;
+        if flags & oflags::O_NOATIME != 0 && !cred.owns(&st) {
+            return Err(Errno::EPERM);
+        }
+        if flags & oflags::O_DIRECTORY != 0 {
+            return Err(Errno::ENOTDIR);
+        }
         if executing(cx, real) {
             return Err(Errno::ETXTBSY);
         }
+        // Break leases on the overlay node identity before copying up so a nonblocking open
+        // failing with EAGAIN does not copy up, and holders on the lower inode are notified
+        let nonblock = flags & oflags::O_NONBLOCK != 0;
+        super::lease::break_leases(cx, lease_ino, true, nonblock, None)?;
         let what = if truncate {
             CopyUp::NoData
         } else {
@@ -1465,13 +1524,14 @@ fn open_overlay(
         real = copy_up(cx, vfs, o, what)?;
     }
     Ok(
-        match open_store(
+        match open_store_with(
             cx,
             cred,
             vfs,
             (mnt, real),
             flags,
             StoreOpen::by_path(created, beside),
+            lease_ino,
         )? {
             FileKind::Directory { process, .. } => FileKind::Directory {
                 node: Node::Overlay(mnt, o),
@@ -1631,8 +1691,16 @@ pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) ->
     }
     // Only when the table is shared with another thread or process (each thread holds two
     // references): copying an unshared one would make a new lock owner and drop the POSIX record
-    // locks held through it
+    // locks held through it. Enforce nr_open just as unshare(CLONE_FILES) / dup_fd does: when
+    // closing through the end of the table without CLOEXEC, fds from `first` onward are not copied.
     if flags & CLOSE_RANGE_UNSHARE != 0 && Rc::strong_count(&cx.t.fds) > 2 {
+        let mut highest = cx.fds().open_fds().last().map_or(0, |&fd| fd as usize + 1);
+        if flags & CLOSE_RANGE_CLOEXEC == 0 && (last as usize).saturating_add(1) >= highest {
+            highest = (first as usize).min(highest);
+        }
+        if highest.next_multiple_of(64) > cx.kr().nr_open {
+            return Err(Errno::EMFILE);
+        }
         let copy = cx.fds().clone();
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }
@@ -1807,9 +1875,8 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
         F_SETFL => {
             let async_on = {
                 let mut f = file.borrow_mut();
-                let was = f.flags & oflags::O_ASYNC != 0;
                 f.flags = (f.flags & !oflags::SETFL_MASK) | (arg as u32 & oflags::SETFL_MASK);
-                !was && f.flags & oflags::O_ASYNC != 0
+                f.flags & oflags::O_ASYNC != 0
             };
             if async_on {
                 super::poll::register_fasync(cx, &file, fd);
@@ -1858,14 +1925,18 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             if cmd == F_GETPIPE_SZ {
                 return Ok(p.capacity as u64);
             }
-            // Round up by pages to a power of two; exceeding pipe-max-size requires
-            // CAP_SYS_RESOURCE, and it cannot be smaller than the data already buffered
+            // Round up by pages to a power of two; growing past pipe-max-size requires
+            // CAP_SYS_RESOURCE (shrinking or keeping the current size is allowed even when above
+            // pipe-max-size), and it cannot be smaller than the data already buffered
             let size = (arg as u32 as usize)
                 .max(PIPE_BUF)
                 .checked_next_power_of_two()
                 .filter(|&n| n <= 1 << 31)
                 .ok_or(Errno::EINVAL)?;
-            if size > cx.kr().pipe_max_size && !cx.cred().capable(cap::SYS_RESOURCE) {
+            if size > cx.kr().pipe_max_size
+                && size > p.capacity
+                && !cx.cred().capable(cap::SYS_RESOURCE)
+            {
                 return Err(Errno::EPERM);
             }
             if size < p.buf.len() {
@@ -2486,8 +2557,8 @@ fn clone_range(
     }
     let whole = pos_in == 0 && pos_out == 0 && count == size_in && size_out <= size_in;
     if whole && try_share(cx, input, output)? {
-        inotify::file_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
-        inotify::file_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
+        inotify::file_io_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
+        inotify::file_io_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
         return Ok(0);
     }
     let mut done = 0;
@@ -2591,25 +2662,30 @@ pub(super) fn pvectored(
     write: bool,
 ) -> SysResult {
     // RWF_HIPRI does not affect the result; RWF_DSYNC and RWF_SYNC wait for the write to reach
-    // disk ([`write_sync`]); RWF_NOAPPEND (since Linux 6.9, used by musl's pwrite) makes a write
-    // with an offset on an O_APPEND file also write at the given offset; RWF_NOWAIT and
-    // RWF_APPEND are not supported, and as on Linux every unknown flag is EOPNOTSUPP
+    // disk ([`write_sync`]); RWF_NOWAIT makes blocking files return EAGAIN without mutating
+    // O_NONBLOCK; RWF_APPEND appends per request without mutating O_APPEND; RWF_NOAPPEND (since
+    // Linux 6.9, used by musl's pwrite) writes at the given offset on an O_APPEND file. Unknown
+    // flags are EOPNOTSUPP.
+    const RWF_NOWAIT: u32 = 0x8;
+    const RWF_APPEND: u32 = 0x10;
     const RWF_NOAPPEND: u32 = 0x20;
-    const RWF_SUPPORTED: u32 = 0x7 | RWF_NOAPPEND;
+    const RWF_SUPPORTED: u32 = 0x7 | RWF_NOWAIT | RWF_APPEND | RWF_NOAPPEND;
     let mut offset = match flags {
         Some(f) if f & !RWF_SUPPORTED != 0 => return Err(Errno::EOPNOTSUPP),
         Some(_) if offset == -1 => None,
         _ => checked_offset(offset)?,
     };
-    if write && flags.is_none_or(|f| f & RWF_NOAPPEND == 0) {
-        offset = append_offset(&cx.fds().get(fd)?, offset, false)?;
+    let rwf = flags.unwrap_or(0);
+    let append = write && rwf & RWF_APPEND != 0;
+    let noappend = rwf & RWF_NOAPPEND != 0;
+    if write && (append || !noappend) {
+        offset = append_offset(&cx.fds().get(fd)?, offset, append)?;
     }
-    let n = vectored(cx, fd, iov, count, offset, write)?;
-    if let Some(rwf) = flags.filter(|_| write && n > 0) {
-        let file = cx.fds().get(fd)?;
-        write_sync(cx, &file, rwf)?;
-    }
-    Ok(n)
+    let io = IoFlags {
+        nowait: rwf & RWF_NOWAIT != 0,
+        append,
+    };
+    vectored_inner(cx, fd, iov, count, offset, write, io, rwf)
 }
 
 fn checked_offset(offset: i64) -> Result<Option<u64>, Errno> {
@@ -2717,17 +2793,48 @@ pub(super) fn splice(
                 let n = data.len() as u32;
                 data[..4].copy_from_slice(&n.to_le_bytes());
             }
-            let n = write_bytes(cx, &output, &data, dst)?;
-            let mut p = pipe.borrow_mut();
-            let before = p.space();
-            debug_assert!(
-                n <= p.buf.len(),
-                "spliced data left the pipe while being written"
-            );
-            let n = n.min(p.buf.len());
-            p.buf.drain(..n);
-            if p.drained(before) {
-                request_wake_object(crate::pipe::object(&pipe));
+            let file_out = needs_pos_lock(&output.borrow());
+            let _out_pos = if dst.is_none() && file_out {
+                Some(PosGuard::lock(cx, &output)?)
+            } else {
+                None
+            };
+            let pos_held = _out_pos.is_some();
+            // For regular and FUSE files, loop while bytes remain in `data` as Linux's
+            // iter_file_splice_write does: a short write at RLIMIT_FSIZE then attempts the next
+            // slice at the limit, raising SIGXFSZ while still returning the bytes already written.
+            let mut n = 0;
+            loop {
+                let at = dst.map(|d| d + n as u64);
+                match write_bytes_inner(cx, &output, &data[n..], at, IoFlags::default(), pos_held) {
+                    Ok(0) => break,
+                    Ok(k) => {
+                        n += k;
+                        if n >= data.len() || !file_out {
+                            break;
+                        }
+                    }
+                    Err(_) if n > 0 => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            {
+                let mut p = pipe.borrow_mut();
+                let before = p.space();
+                debug_assert!(
+                    n <= p.buf.len(),
+                    "spliced data left the pipe while being written"
+                );
+                let drained = n.min(p.buf.len());
+                p.buf.drain(..drained);
+                if p.drained(before) {
+                    request_wake_object(crate::pipe::object(&pipe));
+                }
+                n = drained;
+            }
+            drop(_out_pos);
+            if n > 0 {
+                write_sync(cx, &output, 0)?;
             }
             n
         }
@@ -3002,29 +3109,7 @@ pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: 
     };
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
     if !write {
-        if !pipe_wait_data(cx, &pipe, nonblock)? {
-            return Ok(0);
-        }
-        // Data is there now, so the read through the open file does not wait
-        let mut buf = vec![0u8; total.min(IO_CHUNK)];
-        let k = pipe_read(cx, &pipe, true, &mut buf)?;
-        note_read(cx, &file, k);
-        let mut done = 0;
-        for (base, len) in iovecs {
-            let n = len.min(k - done);
-            if n == 0 {
-                break;
-            }
-            let copied = cx.write_user_partial(base, &buf[done..done + n]);
-            done += copied;
-            if copied < n {
-                break;
-            }
-        }
-        if done == 0 {
-            return Err(Errno::EFAULT);
-        }
-        return Ok(done as u64);
+        return pipe_read_user(cx, &file, &pipe, nonblock, &iovecs);
     }
     let room = wait_room(cx, &pipe, nonblock)?;
     let mut data = Vec::new();
@@ -3135,6 +3220,20 @@ pub(super) fn vectored_with(
     write: bool,
     io: IoFlags,
 ) -> SysResult {
+    vectored_inner(cx, fd, iov, count, offset, write, io, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vectored_inner(
+    cx: &mut Cx<'_>,
+    fd: i32,
+    iov: u64,
+    count: usize,
+    offset: Option<u64>,
+    write: bool,
+    io: IoFlags,
+    rwf: u32,
+) -> SysResult {
     let file = cx.fds().get(fd)?;
     // /dev/kmsg's write_iter: the whole writev is one record (systemd logs this way)
     if write && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
@@ -3174,6 +3273,14 @@ pub(super) fn vectored_with(
     if let Some(r) = stream_vectored(cx, &file, &vecs, offset, write, io) {
         return r;
     }
+    // Hold f_pos_lock across all iovecs (and the final sync on synchronous writev) so another
+    // thread's I/O or lseek cannot interleave between iovecs
+    let _pos = if offset.is_none() && needs_pos_lock(&file.borrow()) {
+        Some(PosGuard::lock_with(cx, &file, io.nowait)?)
+    } else {
+        None
+    };
+    let pos_held = _pos.is_some();
     // A writev checks RLIMIT_FSIZE once for all its iovecs (generic_write_checks), so one that
     // ends at the limit only shortens it
     let room = match write {
@@ -3194,9 +3301,9 @@ pub(super) fn vectored_with(
         let len = len.min(room - total as usize);
         let at = offset.map(|o| o + total);
         let r = if write {
-            write_file_with(cx, &file, base, len, at, io)
+            write_file_inner(cx, &file, base, len, at, io, pos_held, true, 0)
         } else {
-            read_file_with(cx, &file, base, len, at, io)
+            read_file_inner(cx, &file, base, len, at, io, pos_held)
         };
         match r {
             Ok(n) => {
@@ -3208,6 +3315,9 @@ pub(super) fn vectored_with(
             Err(_) if total > 0 => break,
             Err(e) => return Err(e),
         }
+    }
+    if write && total > 0 {
+        write_sync(cx, &file, rwf)?;
     }
     Ok(total)
 }
@@ -3277,6 +3387,10 @@ fn read_scattered(
     let total: usize = vecs.iter().map(|v| v.1).sum();
     if total == 0 {
         return Ok(0);
+    }
+    if let Some((pipe, _)) = pipe_of(file) {
+        let nonblock = file.borrow().nonblocking() || io.nowait;
+        return pipe_read_user(cx, file, &pipe, nonblock, vecs);
     }
     let mut buf = vec![0u8; total.min(step)];
     let k = read_bytes_with(cx, file, &mut buf, None, io)?;
@@ -3415,23 +3529,43 @@ pub(super) fn sendfile(
     };
     if let Some(r) = copy_regular(cx, &input, off, &output, None, count) {
         let n = r?;
+        if n > 0 {
+            write_sync(cx, &output, 0)?;
+        }
         if let Some(o) = off {
             put(cx, offset, (o + n as u64).to_le_bytes())?;
         }
         return Ok(n as u64);
     }
+    let lock_in = off.is_none() && needs_pos_lock(&input.borrow());
+    let lock_out = needs_pos_lock(&output.borrow());
+    let _pos = TwoPosGuard::lock(cx, (&input, lock_in), (&output, lock_out))?;
     let mut chunk = vec![0u8; count.min(IO_CHUNK)];
     let mut done = 0;
     while done < count {
         let n = (count - done).min(IO_CHUNK);
         let before = input.borrow().pos;
-        let got = match read_bytes(cx, &input, &mut chunk[..n], off) {
+        let got = match read_bytes_inner(
+            cx,
+            &input,
+            &mut chunk[..n],
+            off,
+            IoFlags::default(),
+            lock_in,
+        ) {
             Ok(0) => break,
             Ok(k) => k,
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
         };
-        let wrote = match write_bytes(cx, &output, &chunk[..got], None) {
+        let wrote = match write_bytes_inner(
+            cx,
+            &output,
+            &chunk[..got],
+            None,
+            IoFlags::default(),
+            lock_out,
+        ) {
             Ok(k) => k,
             Err(_) if done > 0 => 0,
             Err(e) => {
@@ -3450,6 +3584,10 @@ pub(super) fn sendfile(
         if wrote < got || got < n {
             break;
         }
+    }
+    drop(_pos);
+    if done > 0 {
+        write_sync(cx, &output, 0)?;
     }
     if let Some(o) = off {
         put(cx, offset, o.to_le_bytes())?;
@@ -3499,22 +3637,35 @@ pub(super) fn copy_file_range(
     // Linux's vfs_copy_file_range tries remap_file_range first on filesystems with reflinks. All
     // of it is shared at once, beyond the MAX_RW_COUNT Linux remaps per call: copying the rest
     // would first make a private copy of the part already shared
-    let pos_in = src.unwrap_or_else(|| input.borrow().pos);
-    let pos_out = dst.unwrap_or_else(|| output.borrow().pos);
-    let n = if whole_copy(cx, &input, pos_in, &output, pos_out, len as u64)?
-        && try_share(cx, &input, &output)?
-    {
-        for (f, given) in [(&input, src), (&output, dst)] {
-            if given.is_none() {
-                f.borrow_mut().pos += len as u64;
+    let shared = {
+        let lock_in = src.is_none() && needs_pos_lock(&input.borrow());
+        let lock_out = dst.is_none() && needs_pos_lock(&output.borrow());
+        let _pos = TwoPosGuard::lock(cx, (&input, lock_in), (&output, lock_out))?;
+        let pos_in = src.unwrap_or_else(|| input.borrow().pos);
+        let pos_out = dst.unwrap_or_else(|| output.borrow().pos);
+        if whole_copy(cx, &input, pos_in, &output, pos_out, len as u64)?
+            && try_share(cx, &input, &output)?
+        {
+            for (f, given) in [(&input, src), (&output, dst)] {
+                if given.is_none() {
+                    f.borrow_mut().pos += len as u64;
+                }
             }
+            inotify::file_io_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
+            inotify::file_io_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
+            true
+        } else {
+            false
         }
-        inotify::file_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
-        inotify::file_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
+    };
+    let n = if shared {
         len
     } else {
         copy_data(cx, &input, src, &output, dst, len)?
     };
+    if n > 0 {
+        write_sync(cx, &output, 0)?;
+    }
     if let Some(s) = src {
         put(cx, off_in, (s + n as u64).to_le_bytes())?;
     }
@@ -3538,30 +3689,35 @@ fn copy_data(
     if let Some(r) = copy_regular(cx, input, src, output, dst, len) {
         return r;
     }
+    let lock_in = src.is_none() && needs_pos_lock(&input.borrow());
+    let lock_out = dst.is_none() && needs_pos_lock(&output.borrow());
+    let _pos = TwoPosGuard::lock(cx, (input, lock_in), (output, lock_out))?;
     // As with sendfile, an error after some bytes were copied returns those bytes
     let mut chunk = vec![0u8; len.min(IO_CHUNK)];
     let mut done = 0;
     while done < len {
         let n = (len - done).min(IO_CHUNK);
         let before = input.borrow().pos;
-        let got = match read_bytes(cx, input, &mut chunk[..n], src) {
-            Ok(0) => break,
-            Ok(k) => k,
-            Err(_) if done > 0 => break,
-            Err(e) => return Err(e),
-        };
-        let wrote = match write_bytes(cx, output, &chunk[..got], dst) {
-            Ok(k) => k,
-            Err(e) => {
-                if src.is_none() {
-                    give_back(input, before, got);
+        let got =
+            match read_bytes_inner(cx, input, &mut chunk[..n], src, IoFlags::default(), lock_in) {
+                Ok(0) => break,
+                Ok(k) => k,
+                Err(_) if done > 0 => break,
+                Err(e) => return Err(e),
+            };
+        let wrote =
+            match write_bytes_inner(cx, output, &chunk[..got], dst, IoFlags::default(), lock_out) {
+                Ok(k) => k,
+                Err(e) => {
+                    if src.is_none() {
+                        give_back(input, before, got);
+                    }
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(e);
                 }
-                if done > 0 {
-                    break;
-                }
-                return Err(e);
-            }
-        };
+            };
         if let Some(s) = &mut src {
             *s += wrote as u64;
         } else {
@@ -3796,10 +3952,9 @@ fn copy_regular(
     };
     // Seals must be checked block by block; tmpfs must be accounted block by block and stop when
     // full (write_bytes)
-    let in_tmpfs = cx.vfs().is_ok_and(|v| {
-        v.tmpfs_dev(&Node::Store(output.borrow().mnt, ino))
-            .is_some()
-    });
+    let in_tmpfs = cx
+        .vfs()
+        .is_ok_and(|v| backing_tmpfs_dev(&v, &Node::Store(output.borrow().mnt, ino)).is_some());
     if cx.kr().seals.contains_key(&ino) || in_tmpfs {
         return None;
     }
@@ -3853,8 +4008,8 @@ fn copy_regular(
         Err(e) => Some(Err(e)),
         Ok(n) => {
             if n > 0 {
-                inotify::file_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
-                inotify::file_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
+                inotify::file_io_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
+                inotify::file_io_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
             }
             Some(Ok(n))
         }
@@ -3880,6 +4035,18 @@ pub(super) fn read_file_with(
     offset: Option<u64>,
     io: IoFlags,
 ) -> SysResult {
+    read_file_inner(cx, file, buf, len, offset, io, false)
+}
+
+fn read_file_inner(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    buf: u64,
+    len: usize,
+    offset: Option<u64>,
+    io: IoFlags,
+    pos_held: bool,
+) -> SysResult {
     // A socket receives one message of up to the whole length (super::net::rw). The borrow must
     // end before: receiving may wait with the BKL released
     let sock = socket(&file.borrow());
@@ -3888,6 +4055,26 @@ pub(super) fn read_file_with(
         let nonblock = file.borrow().nonblocking() || io.nowait;
         return super::net::rw(cx, &s, nonblock, &[(buf, len)], false);
     }
+    // Pipe reads peek and copy into user memory before draining so an EFAULT never consumes bytes
+    if len > 0
+        && let Some((pipe, _)) = pipe_of(file)
+    {
+        let nonblock = {
+            let f = file.borrow();
+            positional(&f, offset)?;
+            if !f.readable() {
+                return Err(Errno::EBADF);
+            }
+            f.nonblocking() || io.nowait
+        };
+        return pipe_read_user(cx, file, &pipe, nonblock, &[(buf, len)]);
+    }
+    let _pos = if len > 0 && !pos_held && offset.is_none() && needs_pos_lock(&file.borrow()) {
+        Some(PosGuard::lock_with(cx, file, io.nowait)?)
+    } else {
+        None
+    };
+    let held = pos_held || _pos.is_some();
     // Each read of a terminal or pipe returns only data already ready and must not block again
     // to fill the buffer; /dev/zero and /dev/urandom fill it in one read as on Linux
     // (`dd bs=256M` reads whole blocks)
@@ -3906,12 +4093,13 @@ pub(super) fn read_file_with(
     while done < len {
         let n = (len - done).min(step);
         let before = file.borrow().pos;
-        let k = match read_bytes_with(
+        let k = match read_bytes_inner(
             cx,
             file,
             &mut chunk[..n],
             offset.map(|o| o + done as u64),
             io,
+            held,
         ) {
             Ok(k) => k,
             Err(_) if done > 0 => break,
@@ -3990,6 +4178,21 @@ pub(super) fn write_file_with(
     offset: Option<u64>,
     io: IoFlags,
 ) -> SysResult {
+    write_file_inner(cx, file, buf, len, offset, io, false, false, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_file_inner(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    buf: u64,
+    len: usize,
+    offset: Option<u64>,
+    io: IoFlags,
+    pos_held: bool,
+    defer_sync: bool,
+    rwf: u32,
+) -> SysResult {
     // ESPIPE and EBADF are reported before an unreadable buffer
     positional(&file.borrow(), offset)?;
     if !file.borrow().writable() {
@@ -4006,6 +4209,12 @@ pub(super) fn write_file_with(
         let nonblock = file.borrow().nonblocking() || io.nowait;
         return super::net::rw(cx, &s, nonblock, &[(buf, len)], true);
     }
+    let _pos = if !pos_held && offset.is_none() && needs_pos_lock(&file.borrow()) {
+        Some(PosGuard::lock_with(cx, file, io.nowait)?)
+    } else {
+        None
+    };
+    let held = pos_held || _pos.is_some();
     // RLIMIT_FSIZE is checked once for the whole write, as generic_write_checks does: a piece
     // that ends at the limit only shortens it, without SIGXFSZ for the next
     let len = fsize_allowed(cx, &file.borrow(), offset, len, io.append)?;
@@ -4019,7 +4228,14 @@ pub(super) fn write_file_with(
             &mut chunk[..n],
         );
         let step = copied.and_then(|()| {
-            write_bytes_with(cx, file, &chunk[..n], offset.map(|o| o + done as u64), io)
+            write_bytes_inner(
+                cx,
+                file,
+                &chunk[..n],
+                offset.map(|o| o + done as u64),
+                io,
+                held,
+            )
         });
         match step {
             Ok(k) => {
@@ -4033,35 +4249,47 @@ pub(super) fn write_file_with(
             Err(e) => return Err(e),
         }
     }
-    if done > 0 {
-        write_sync(cx, file, 0)?;
+    if done > 0 && !defer_sync {
+        write_sync(cx, file, rwf)?;
     }
     Ok(done as u64)
 }
 
-/// Regular files opened with `O_DSYNC` or `O_SYNC`, or pwritev2 with `RWF_DSYNC` or `RWF_SYNC`
-/// (`rwf`): after the write, wait for it to reach disk as fdatasync and fsync do (Linux's
-/// generic_write_sync). Data, length and times are all in the host object, so the host flushes
-/// them, waited for with the BKL released; names are not among them, and on Linux the directory
-/// also needs a separate fsync.
+/// Regular and FUSE files opened with `O_DSYNC` or `O_SYNC`, or pwritev2/AIO with `RWF_DSYNC` or
+/// `RWF_SYNC` (`rwf`): after the write, wait for it to reach disk as fdatasync and fsync do
+/// (Linux's generic_write_sync). Data, length and times are all in the host object, so the host
+/// flushes them, waited for with the BKL released; FUSE files send `FUSE_FSYNC` (a daemon without
+/// it succeeds silently).
 pub(super) fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
     use oflags::{O_DSYNC, O_SYNC_BIT};
     const RWF_DSYNC: u32 = 2;
     const RWF_SYNC: u32 = 4;
-    let (fd, data_only) = {
+    enum SyncTarget {
+        Regular(i32),
+        Fuse(super::fuse::Io),
+    }
+    let (target, data_only) = {
         let f = file.borrow();
-        let FileKind::Regular { file: host, .. } = &f.kind else {
-            return Ok(());
-        };
         if f.flags & O_DSYNC == 0 && rwf & (RWF_DSYNC | RWF_SYNC) == 0 {
             return Ok(());
         }
+        let target = match &f.kind {
+            FileKind::Regular { file: host, .. } => {
+                SyncTarget::Regular(std::os::fd::AsRawFd::as_raw_fd(host))
+            }
+            FileKind::Fuse(h) => SyncTarget::Fuse(super::fuse::Io::of(h)),
+            _ => return Ok(()),
+        };
         let full = f.flags & O_SYNC_BIT != 0 || rwf & RWF_SYNC != 0;
-        (std::os::fd::AsRawFd::as_raw_fd(host), !full)
+        (target, !full)
     };
-    // The open file is kept alive by file and not touched while the BKL is released
-    cx.unlocked(|| appine_hal::fsync(fd, data_only))
-        .map_err(Errno)
+    match target {
+        // The open file is kept alive by file and not touched while the BKL is released
+        SyncTarget::Regular(fd) => cx
+            .unlocked(|| appine_hal::fsync(fd, data_only))
+            .map_err(Errno),
+        SyncTarget::Fuse(io) => super::fuse::fsync(cx, &io, false, data_only),
+    }
 }
 
 /// Does one read from an open file into a host buffer. With `offset` None the file position is
@@ -4081,6 +4309,17 @@ fn read_bytes_with(
     buf: &mut [u8],
     offset: Option<u64>,
     io: IoFlags,
+) -> Result<usize, Errno> {
+    read_bytes_inner(cx, file, buf, offset, io, false)
+}
+
+fn read_bytes_inner(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    buf: &mut [u8],
+    offset: Option<u64>,
+    io: IoFlags,
+    pos_held: bool,
 ) -> Result<usize, Errno> {
     let (path, nonblock) = {
         let f = file.borrow();
@@ -4117,10 +4356,10 @@ fn read_bytes_with(
         IoPath::Kmsg => kmsg_read(cx, file, nonblock, buf),
         IoPath::ProcKmsg(log) => proc_kmsg_read(cx, &log, nonblock, buf),
         IoPath::Loop(dev) => super::loopdev::read(cx, file, &dev, buf, offset),
-        IoPath::Fuse(io) => {
-            let n = super::fuse::read(cx, file, &io, buf, offset)?;
+        IoPath::Fuse(fio) => {
+            let n = super::fuse::read(cx, file, &fio, buf, offset, pos_held)?;
             if n > 0 {
-                inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
+                inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
             }
             Ok(n)
         }
@@ -4141,7 +4380,7 @@ fn read_bytes_with(
             follow_copy_up(cx, file)?;
             let regular = regular_fd(&file.borrow());
             let n = match regular {
-                Some(fd) => unlocked_io(cx, file, fd, (offset, false), |fd, pos| {
+                Some(fd) => unlocked_io(cx, file, fd, (offset, pos_held), |fd, pos| {
                     appine_hal::pread(fd, buf, pos)
                 })?,
                 None => {
@@ -4150,7 +4389,7 @@ fn read_bytes_with(
                 }
             };
             if n > 0 {
-                inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
+                inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
             }
             Ok(n)
         }
@@ -4179,6 +4418,69 @@ fn wait_host(cx: &mut Cx<'_>, fd: i32, events: i16, nonblock: bool) -> Result<()
             return Ok(());
         }
     }
+}
+
+/// Reads from a pipe directly into guest buffers `vecs` (read, readv, read-side vmsplice): peeks
+/// the pipe buffer and copies into user memory before draining, so a fault (EFAULT) leaves
+/// uncopied bytes in the pipe and wakes no writers when nothing was copied.
+fn pipe_read_user(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    pipe: &Rc<RefCell<Pipe>>,
+    nonblock: bool,
+    vecs: &[(u64, usize)],
+) -> SysResult {
+    let total: usize = vecs.iter().map(|v| v.1).sum::<usize>().min(IO_CHUNK);
+    if total == 0 {
+        return Ok(0);
+    }
+    loop {
+        if wait_splice_done(cx, pipe)? {
+            continue;
+        }
+        {
+            let p = pipe.borrow();
+            if !p.buf.is_empty() {
+                break;
+            }
+            if p.writers == 0 {
+                return Ok(0);
+            }
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_object(crate::pipe::object(pipe))?;
+    }
+    let data: Vec<u8> = pipe.borrow().buf.iter().take(total).copied().collect();
+    let mut done = 0;
+    for &(base, len) in vecs {
+        let n = len.min(data.len() - done);
+        if n == 0 {
+            continue;
+        }
+        let copied = cx.write_user_partial(base, &data[done..done + n]);
+        done += copied;
+        if copied < n {
+            break;
+        }
+    }
+    if done == 0 {
+        return Err(Errno::EFAULT);
+    }
+    {
+        let mut p = pipe.borrow_mut();
+        let before = p.space();
+        p.buf.drain(..done);
+        if p.drained(before) {
+            request_wake_object(crate::pipe::object(pipe));
+        }
+    }
+    note_read(cx, file, done);
+    Ok(done as u64)
 }
 
 fn pipe_read(
@@ -4413,6 +4715,17 @@ fn write_bytes_with(
     offset: Option<u64>,
     io: IoFlags,
 ) -> Result<usize, Errno> {
+    write_bytes_inner(cx, file, data, offset, io, false)
+}
+
+fn write_bytes_inner(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    data: &[u8],
+    offset: Option<u64>,
+    io: IoFlags,
+    pos_held: bool,
+) -> Result<usize, Errno> {
     let (path, nonblock) = {
         let f = file.borrow();
         let path = positional(&f, offset)?;
@@ -4439,9 +4752,9 @@ fn write_bytes_with(
         IoPath::ProcKmsg(_) => Err(Errno::EIO),
         IoPath::Loop(dev) => super::loopdev::write(cx, file, &dev, data, offset),
         IoPath::Fuse(fio) => {
-            let n = super::fuse::write(cx, file, &fio, data, offset, io.append)?;
+            let n = super::fuse::write(cx, file, &fio, data, offset, io.append, pos_held)?;
             if n > 0 {
-                inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+                inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
             }
             Ok(n)
         }
@@ -4459,19 +4772,17 @@ fn write_bytes_with(
             Ok(n)
         }
         IoPath::Local => {
-            // A write at the position of a regular file holds the position from its checks to
-            // its end, so they see where it writes (Linux takes f_pos_lock before
-            // generic_write_checks); an O_APPEND/RWF_APPEND one is checked and written under the BKL
+            // A write at the position of a regular file (including O_APPEND/RWF_APPEND) holds the
+            // position from its checks to its end, so concurrent unlocked reads or seeks cannot
+            // overwrite or interleave with it (Linux takes f_pos_lock before generic_write_checks).
             let append = io.append || file.borrow().flags & oflags::O_APPEND != 0;
-            let held = offset.is_none() && regular_fd(&file.borrow()).is_some() && !append;
-            if held {
-                take_pos(cx, file)?;
-            }
-            let r = write_local(cx, file, data, (offset, held, append));
-            if held {
-                release_pos(file);
-            }
-            r
+            let _pos = if !pos_held && offset.is_none() && regular_fd(&file.borrow()).is_some() {
+                Some(PosGuard::lock_with(cx, file, io.nowait)?)
+            } else {
+                None
+            };
+            let held = pos_held || _pos.is_some();
+            write_local(cx, file, data, (offset, held, append))
         }
     }
 }
@@ -4544,7 +4855,7 @@ fn write_local(
         tmpfs_resized(&*cx.vfs()?, Some(t), host);
     }
     if n > 0 {
-        inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+        inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
     }
     Ok(n)
 }
@@ -4802,11 +5113,12 @@ pub(super) fn follow_copy_up(cx: &Cx<'_>, file: &FileRef) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Copies overlay node `o` up ([`Vfs::overlay_upper`]) and returns its upper inode. A regular
-/// file's copy shares the lower file's object until either is written, so nothing may still write
-/// that object in place, as for [`try_share`]: when something could (a writable shared mapping of
-/// the lower file, the Files app writing it) the data is copied instead, and descriptions of the
-/// lower file open for writing move to the shared object read-only, marked `cow` ([`rehome`]).
+/// Copies overlay node `o` up ([`Vfs::overlay_upper`]) and returns its upper inode, charging the
+/// upper layer's tmpfs instance when it is on tmpfs. A regular file's copy shares the lower file's
+/// object until either is written, so nothing may still write that object in place, as for
+/// [`try_share`]: when something could (a writable shared mapping of the lower file, the Files app
+/// writing it) the data is copied instead, and descriptions of the lower file open for writing
+/// move to the shared object read-only, marked `cow` ([`rehome`]).
 pub(super) fn copy_up(cx: &Cx<'_>, vfs: &Vfs, o: OvlId, what: CopyUp) -> Result<Ino, Errno> {
     use std::os::unix::fs::MetadataExt;
     let (upper, lower) = {
@@ -4818,7 +5130,7 @@ pub(super) fn copy_up(cx: &Cx<'_>, vfs: &Vfs, o: OvlId, what: CopyUp) -> Result<
         return Ok(up);
     }
     if what != CopyUp::All || vfs.store().attrs(lower)?.kind() != mode::S_IFREG {
-        return vfs.overlay_upper(o, what);
+        return overlay_upper_charged(vfs, o, what);
     }
     let k = cx.kr();
     let host = vfs.store().open_object(lower, false)?;
@@ -4831,9 +5143,9 @@ pub(super) fn copy_up(cx: &Cx<'_>, vfs: &Vfs, o: OvlId, what: CopyUp) -> Result<
             .writably_maps(host.dev(), host.ino())
     });
     if mapped || vfs.store().host_writing(lower)? {
-        return vfs.overlay_upper(o, CopyUp::Copied);
+        return overlay_upper_charged(vfs, o, CopyUp::Copied);
     }
-    let up = vfs.overlay_upper(o, CopyUp::All)?;
+    let up = overlay_upper_charged(vfs, o, CopyUp::All)?;
     let writer = |f: &FileRef| {
         f.try_borrow()
             .is_ok_and(|f| f.writable() && matches!(f.kind, FileKind::Regular { cow: false, .. }))
@@ -5056,10 +5368,95 @@ fn unlocked_io(
     r.map_err(Errno)
 }
 
-/// Takes `file`'s position for one read or write by position (Linux's `f_pos_lock`), waiting
+/// Whether `f` performs unlocked I/O on its position and must serialize position readers/writers
+/// with `pos_busy` (regular files and FUSE files).
+fn needs_pos_lock(f: &OpenFile) -> bool {
+    matches!(f.kind, FileKind::Regular { .. } | FileKind::Fuse(_))
+}
+
+/// RAII guard holding `OpenFile::pos_busy` (Linux's `f_pos_lock`).
+pub(super) struct PosGuard(FileRef);
+
+impl PosGuard {
+    pub(super) fn lock(cx: &mut Cx<'_>, file: &FileRef) -> Result<PosGuard, Errno> {
+        Self::lock_with(cx, file, false)
+    }
+
+    fn lock_with(cx: &mut Cx<'_>, file: &FileRef, nowait: bool) -> Result<PosGuard, Errno> {
+        take_pos_with(cx, file, nowait)?;
+        Ok(PosGuard(file.clone()))
+    }
+}
+
+impl Drop for PosGuard {
+    fn drop(&mut self) {
+        release_pos(&self.0);
+    }
+}
+
+/// RAII guard holding `pos_busy` on up to two files simultaneously without deadlock (waits until
+/// neither needed file is busy, then claims both atomically under the BKL).
+struct TwoPosGuard {
+    first: Option<FileRef>,
+    second: Option<FileRef>,
+}
+
+impl TwoPosGuard {
+    fn lock(
+        cx: &mut Cx<'_>,
+        (a, need_a): (&FileRef, bool),
+        (b, need_b): (&FileRef, bool),
+    ) -> Result<TwoPosGuard, Errno> {
+        let same = Rc::ptr_eq(a, b);
+        let need_b = need_b && !(same && need_a);
+        let busy = |f: &FileRef, need: bool| need && f.borrow().pos_busy != 0;
+        while busy(a, need_a) || busy(b, need_b) {
+            if cx.task.killed.get() {
+                return Err(Errno::EINTR);
+            }
+            if busy(a, need_a) {
+                a.borrow_mut().pos_busy = 2;
+            }
+            if busy(b, need_b) {
+                b.borrow_mut().pos_busy = 2;
+            }
+            cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
+        }
+        if need_a {
+            a.borrow_mut().pos_busy = 1;
+        }
+        if need_b {
+            b.borrow_mut().pos_busy = 1;
+        }
+        Ok(TwoPosGuard {
+            first: need_a.then(|| a.clone()),
+            second: need_b.then(|| b.clone()),
+        })
+    }
+}
+
+impl Drop for TwoPosGuard {
+    fn drop(&mut self) {
+        if let Some(f) = self.first.take() {
+            release_pos(&f);
+        }
+        if let Some(f) = self.second.take() {
+            release_pos(&f);
+        }
+    }
+}
+
+/// Takes `file`'s position for one read, write or seek by position (Linux's `f_pos_lock`), waiting
 /// while another has it; [`release_pos`] gives it back.
-fn take_pos(cx: &mut Cx<'_>, file: &FileRef) -> Result<(), Errno> {
+pub(super) fn take_pos(cx: &mut Cx<'_>, file: &FileRef) -> Result<(), Errno> {
+    take_pos_with(cx, file, false)
+}
+
+fn take_pos_with(cx: &mut Cx<'_>, file: &FileRef, nowait: bool) -> Result<(), Errno> {
     while file.borrow().pos_busy != 0 {
+        if nowait {
+            return Err(Errno::EAGAIN);
+        }
         if cx.task.killed.get() {
             return Err(Errno::EINTR);
         }
@@ -5070,7 +5467,7 @@ fn take_pos(cx: &mut Cx<'_>, file: &FileRef) -> Result<(), Errno> {
     Ok(())
 }
 
-fn release_pos(file: &FileRef) {
+pub(super) fn release_pos(file: &FileRef) {
     if std::mem::take(&mut file.borrow_mut().pos_busy) == 2 {
         request_wake_locks();
     }
@@ -5169,7 +5566,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         out.truncate(ends[whole - 1]);
     }
     *pos = next as u64;
-    inotify::file_event(cx.kr(), &f, inotify::IN_ACCESS);
+    inotify::file_io_event(cx.kr(), &f, inotify::IN_ACCESS);
     Ok(out.len() as u64)
 }
 
@@ -5179,6 +5576,12 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
         return super::fuse::lseek(cx, &file, offset, whence);
     }
     follow_copy_up(cx, &file)?;
+    // Serialize regular-file seeks against unlocked I/O using pos_busy (Linux's f_pos_lock)
+    let _pos = if matches!(file.borrow().kind, FileKind::Regular { .. }) {
+        Some(PosGuard::lock(cx, &file)?)
+    } else {
+        None
+    };
     let mut f = file.borrow_mut();
     let OpenFile { kind, pos, .. } = &mut *f;
     let base = match kind {
@@ -5994,13 +6397,18 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
     };
     match &f.kind {
         FileKind::Host(fd) => host_stat(*fd),
-        FileKind::Pipe(end) => match end.pipe.borrow().fifo {
-            Some(ino) => {
+        FileKind::Pipe(end) => match (f.ovl, end.pipe.borrow().fifo) {
+            (Some(o), Some(_)) => {
+                let vfs = cx.vfs()?;
+                let node = Node::Overlay(f.mnt, o);
+                Ok(encode_stat(&vfs.overlay_stat(o)?, vfs.dev_of(&node)))
+            }
+            (None, Some(ino)) => {
                 let vfs = cx.vfs()?;
                 let dev = vfs.dev_of(&Node::Store(f.mnt, ino));
                 Ok(encode_stat(&vfs.store().stat(ino)?, dev))
             }
-            None => Ok(anon(
+            (_, None) => Ok(anon(
                 end.pipe.borrow().ino,
                 mode::S_IFIFO | 0o600,
                 0,
@@ -6159,15 +6567,32 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
     if let Some((mnt, dir, name)) = super::fuse::parent(cx, dirfd, &path)? {
         return super::fuse::mkdir(cx, (mnt, dir), name, perm).map(|()| 0);
     }
-    let (mnt, dir, name, ovl) = create_parent_at(cx, dirfd, &path)?;
+    let start = start_dir(cx, dirfd, &path)?;
+    let vfs = cx.vfs()?;
+    let cred = cx.cred();
+    let view = cx.view(&vfs);
+    let (parent, name) = vfs.resolve_parent(&view, &cred, &cx.root(), &start, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
-    let vfs = cx.vfs()?;
-    let cred = cx.cred();
-    let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
+    if matches!(parent, Node::Pseudo(..)) && vfs.has_child(&view, &parent, name) {
+        return Err(Errno::EEXIST);
+    }
+    let (mnt, dir, dir_st, ovl) = match &parent {
+        Node::Overlay(mnt, o) => {
+            let dir_st = may_create_overlay(&vfs, &cred, &view, (*mnt, *o), name)?;
+            check_overlay_create_tmpfs(&vfs, *mnt, *o, name, 0)?;
+            let (mnt, dir) = create_dir(&vfs, &parent)?;
+            (mnt, dir, dir_st, Some(*o))
+        }
+        _ => {
+            let (mnt, dir) = store_dir(&vfs, &parent)?;
+            let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
+            (mnt, dir, dir_st, None)
+        }
+    };
     let (uid, gid, perm) = cred.new_owner(&dir_st, perm, cx.umask(), true);
-    let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
+    let tmpfs = tmpfs_reserve_name(&vfs, (mnt, dir), name, 0)?;
     create_in(
         &vfs,
         (mnt, dir),
@@ -6175,7 +6600,7 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
         || vfs.store().mkdir(dir, name, perm, uid, gid),
         |&ino| ino,
     )?;
-    tmpfs_created(&vfs, tmpfs, 0);
+    tmpfs_created_name(&vfs, tmpfs, 0);
     created_events(cx.kr(), (dir, ovl), name, inotify::IN_ISDIR);
     Ok(0)
 }
@@ -6223,8 +6648,15 @@ pub(super) fn mknodat(
         }
         return super::fuse::mknod(cx, (mnt, dir), name, mode_arg, dev).map(|()| 0);
     }
-    let (mnt, dir, name, ovl) = create_parent_at(cx, dirfd, &path)?;
+    let start = start_dir(cx, dirfd, &path)?;
+    let vfs = cx.vfs()?;
+    let cred = cx.cred();
+    let view = cx.view(&vfs);
+    let (parent, name) = vfs.resolve_parent(&view, &cred, &cx.root(), &start, &path)?;
     if name == b"." || name == b".." {
+        return Err(Errno::EEXIST);
+    }
+    if matches!(parent, Node::Pseudo(..)) && vfs.has_child(&view, &parent, name) {
         return Err(Errno::EEXIST);
     }
     match kind {
@@ -6232,10 +6664,23 @@ pub(super) fn mknodat(
         mode::S_IFDIR => return Err(Errno::EPERM),
         _ => return Err(Errno::EINVAL),
     }
-    let vfs = cx.vfs()?;
-    let cred = cx.cred();
-    reject_trailing_slash(&vfs, (mnt, dir), name, &path)?;
-    let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
+    let dir_st = match &parent {
+        Node::Overlay(mnt, o) => {
+            if path.ends_with(b"/") {
+                return Err(if vfs.has_child(&view, &parent, name) {
+                    Errno::EEXIST
+                } else {
+                    Errno::ENOENT
+                });
+            }
+            may_create_overlay(&vfs, &cred, &view, (*mnt, *o), name)?
+        }
+        _ => {
+            let (mnt, dir) = store_dir(&vfs, &parent)?;
+            reject_trailing_slash(&vfs, (mnt, dir), name, &path)?;
+            may_create(&vfs, &cred, (mnt, dir), name)?
+        }
+    };
     // A whiteout (character device 0:0) needs no CAP_MKNOD and does not go through the device
     // filter (Linux's vfs_mknod)
     let whiteout = kind == mode::S_IFCHR && dev & 0xffff_ffff == 0;
@@ -6246,11 +6691,22 @@ pub(super) fn mknodat(
         super::bpf::check_device(cx, kind, dev & 0xffff_ffff, crate::bpf::ACC_MKNOD)?;
     }
     // An overlay does not make whiteouts for others (6.1's ovl_mknod)
-    if whiteout && vfs.overlay_prefix(mnt).is_some() {
+    if whiteout && vfs.overlay_prefix(parent.mnt()).is_some() {
         return Err(Errno::EPERM);
     }
+    let (mnt, dir, ovl) = match &parent {
+        Node::Overlay(mnt, o) => {
+            check_overlay_create_tmpfs(&vfs, *mnt, *o, name, 0)?;
+            let (mnt, dir) = create_dir(&vfs, &parent)?;
+            (mnt, dir, Some(*o))
+        }
+        _ => {
+            let (mnt, dir) = store_dir(&vfs, &parent)?;
+            (mnt, dir, None)
+        }
+    };
     let (uid, gid, perm) = cred.new_owner(&dir_st, mode_arg, cx.umask(), false);
-    let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
+    let tmpfs = tmpfs_reserve_name(&vfs, (mnt, dir), name, 0)?;
     let made = || {
         if kind == 0 || kind == mode::S_IFREG {
             vfs.store()
@@ -6262,7 +6718,7 @@ pub(super) fn mknodat(
         }
     };
     create_in(&vfs, (mnt, dir), name, made, |&ino| ino)?;
-    tmpfs_created(&vfs, tmpfs, 0);
+    tmpfs_created_name(&vfs, tmpfs, 0);
     created_events(cx.kr(), (dir, ovl), name, 0);
     Ok(0)
 }
@@ -6312,6 +6768,9 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
                 store.rmdir(dir, name)?;
                 tmpfs_removed(cx, &store_vfs, tmpfs);
                 detach_points(cx, &store_vfs, gone, (dir, name));
+                if let Some(ino) = gone {
+                    inotify::unlinked(cx.kr(), ino, dir, name);
+                }
             }
         }
         if let Some(ino) = victim {
@@ -6342,6 +6801,9 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
         tmpfs_removed(cx, &store_vfs, tmpfs);
         release_if_closed(cx, &store_vfs, held);
         detach_points(cx, &store_vfs, gone, (dir, name));
+        if let Some(ino) = gone {
+            inotify::unlinked(cx.kr(), ino, dir, name);
+        }
         if let Some(ino) = victim {
             unlinked_events(cx, store, ino, (dir, name));
             inotify::dir_event(cx.kr(), dir, name, inotify::IN_DELETE, 0);
@@ -6408,12 +6870,58 @@ fn unlink_overlay(
         if rmdir && !vfs.overlay_readdir(c)?.is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
+        // Account upper-layer tmpfs changes: parent dir copy-up, removed upper entry (and
+        // whiteouts inside a removed upper dir), plus a new whiteout when a lower layer has it.
+        let tmpfs = if let Some(dev) = overlay_upper_tmpfs_dev(&vfs, vfs.dev_of(&dir)) {
+            let dir_inodes = overlay_uncopied_dirs(&vfs, &[d]);
+            let lower = vfs.overlay().lower_has(vfs.store(), d, name)?;
+            let child_upper = vfs.overlay().node(c).upper;
+            let mut dir_whiteouts = 0u64;
+            let mut victim = None;
+            if let Some(u) = child_upper {
+                if rmdir {
+                    dir_whiteouts = vfs.store().readdir(u)?.len() as u64;
+                } else {
+                    victim = tmpfs_victim_ino(&vfs, dev, u)?;
+                }
+            }
+            let keeps_upper = child_upper.is_none()
+                || victim
+                    .as_ref()
+                    .is_some_and(|v| v.last_reg && file_in_use(cx.kr(), v.ino));
+            let need_inodes = dir_inodes + u64::from(lower && keeps_upper);
+            vfs.tmpfs_check(dev, 0, need_inodes)?;
+            Some((
+                dev,
+                dir_inodes,
+                child_upper.is_some(),
+                dir_whiteouts,
+                victim,
+                lower,
+            ))
+        } else {
+            None
+        };
         vfs.overlay_remove(d, name, rmdir)?;
+        if let Some((dev, dir_inodes, had_upper, dir_whiteouts, victim, lower)) = tmpfs {
+            if dir_inodes > 0 {
+                vfs.tmpfs_charge(dev, 0, dir_inodes as i64);
+            }
+            if rmdir && had_upper {
+                vfs.tmpfs_charge(dev, 0, -(1 + dir_whiteouts as i64));
+            } else {
+                tmpfs_removed(cx, &vfs, victim);
+            }
+            if lower {
+                vfs.tmpfs_charge(dev, 0, 1);
+            }
+        }
         // As the store's removals report: a file's link count changed, the node is deleted with
         // its last link (once the files opened through it have closed), then the directory's
         // entry goes
         let k = cx.kr();
         let (key, dir) = (overlay::key(c), overlay::key(d));
+        inotify::unlinked(k, key, dir, name);
         if rmdir {
             inotify::deleted(k, key, dir, name);
             inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
@@ -6545,18 +7053,42 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
     if let Some((mnt, dir, name)) = super::fuse::parent(cx, dirfd, &path)? {
         return super::fuse::symlink(cx, (mnt, dir), name, &target).map(|()| 0);
     }
-    let (mnt, dir, name, ovl) = create_parent_at(cx, dirfd, &path)?;
+    let start = start_dir(cx, dirfd, &path)?;
+    let vfs = cx.vfs()?;
+    let cred = cx.cred();
+    let view = cx.view(&vfs);
+    let (parent, name) = vfs.resolve_parent(&view, &cred, &cx.root(), &start, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
-    let vfs = cx.vfs()?;
-    let cred = cx.cred();
-    reject_trailing_slash(&vfs, (mnt, dir), name, &path)?;
-    let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
-    let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, 0, false);
+    if matches!(parent, Node::Pseudo(..)) && vfs.has_child(&view, &parent, name) {
+        return Err(Errno::EEXIST);
+    }
     // A long symlink takes an extra page in tmpfs (Linux's SHORT_SYMLINK_LEN)
     let pages = u64::from(target.len() >= 128);
-    let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), pages)?;
+    let (mnt, dir, dir_st, ovl) = match &parent {
+        Node::Overlay(mnt, o) => {
+            if path.ends_with(b"/") {
+                return Err(if vfs.has_child(&view, &parent, name) {
+                    Errno::EEXIST
+                } else {
+                    Errno::ENOENT
+                });
+            }
+            let dir_st = may_create_overlay(&vfs, &cred, &view, (*mnt, *o), name)?;
+            check_overlay_create_tmpfs(&vfs, *mnt, *o, name, pages)?;
+            let (mnt, dir) = create_dir(&vfs, &parent)?;
+            (mnt, dir, dir_st, Some(*o))
+        }
+        _ => {
+            let (mnt, dir) = store_dir(&vfs, &parent)?;
+            reject_trailing_slash(&vfs, (mnt, dir), name, &path)?;
+            let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
+            (mnt, dir, dir_st, None)
+        }
+    };
+    let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, 0, false);
+    let tmpfs = tmpfs_reserve_name(&vfs, (mnt, dir), name, pages)?;
     create_in(
         &vfs,
         (mnt, dir),
@@ -6564,7 +7096,7 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
         || vfs.store().symlink(dir, name, &target, uid, gid),
         |&ino| ino,
     )?;
-    tmpfs_created(&vfs, tmpfs, pages);
+    tmpfs_created_name(&vfs, tmpfs, pages);
     created_events(cx.kr(), (dir, ovl), name, 0);
     Ok(0)
 }
@@ -6711,8 +7243,10 @@ fn link_overlay(
     if st.is_dir() {
         return Err(Errno::EPERM);
     }
+    check_overlay_create_tmpfs(vfs, mnt, d, name, 0)?;
     let file = copy_up(cx, vfs, so, CopyUp::All)?;
     let (mnt, up) = create_dir(vfs, dir)?;
+    let tmpfs = tmpfs_reserve_name(vfs, (mnt, up), name, 0)?;
     create_in(
         vfs,
         (mnt, up),
@@ -6720,6 +7254,7 @@ fn link_overlay(
         || vfs.store().link(up, name, file).map(|()| file),
         |&ino| ino,
     )?;
+    tmpfs_created_name(vfs, tmpfs, 0);
     // The new name in the upper directory, then as 6.1's `fsnotify_link` reports the link through
     // the overlay: the file's link count changed, then the name
     let k = cx.kr();
@@ -6842,12 +7377,15 @@ pub(super) fn renameat2(
     )?;
     tmpfs_removed(cx, &vfs, replaced);
     // Detach the mounts of other namespaces on the overwritten target
+    let k = cx.kr();
     if !exchange && overwritten != moving {
         release_if_closed(cx, &vfs, held);
         detach_points(cx, &vfs, overwritten, (new_dir, new_name));
+        if let Some(ino) = overwritten {
+            inotify::unlinked(k, ino, new_dir, new_name);
+        }
     }
     // Files open through the moved name follow the rename
-    let k = cx.kr();
     let store = vfs.store();
     let lookup = |dir, name| move || store.lookup(dir, name).ok().flatten();
     inotify::renamed(
@@ -6949,6 +7487,10 @@ fn rename_overlay(
     if busy(src) || dst.as_ref().is_some_and(|d| busy(d.0)) {
         return Err(Errno::EBUSY);
     }
+    // Renaming a name to itself changes nothing
+    if dst.as_ref().is_some_and(|d| d.0 == src) {
+        return Ok(0);
+    }
     // Files that move are copied up here, as copy_up copies them, before the rename finds them up
     let moved = [
         Some((src, &src_st)),
@@ -6959,19 +7501,79 @@ fn rename_overlay(
             copy_up(cx, &vfs, o, CopyUp::All)?;
         }
     }
+    let tmpfs = if let Some(dev) = overlay_upper_tmpfs_dev(&vfs, vfs.dev_of(&old_parent)) {
+        let dir_inodes = overlay_uncopied_dirs(&vfs, &[od, nd]);
+        let dst_whiteout =
+            dst.is_none()
+                && vfs.overlay().node(nd).upper.is_some_and(|u| {
+                    overlay::whiteout_at(vfs.store(), u, new_name).unwrap_or(false)
+                });
+        let old_lower = !exchange && vfs.overlay().lower_has(vfs.store(), od, old_name)?;
+        let mut dst_dir_whiteouts = 0u64;
+        let mut dst_dir_had_upper = false;
+        let mut replaced_victim = None;
+        if !exchange
+            && let Some((d, d_st)) = &dst
+            && let Some(du) = vfs.overlay().node(*d).upper
+        {
+            if d_st.is_dir() {
+                dst_dir_had_upper = true;
+                dst_dir_whiteouts = vfs.store().readdir(du)?.len() as u64;
+            } else {
+                replaced_victim = tmpfs_victim_ino(&vfs, dev, du)?;
+            }
+        }
+        let need_inodes = dir_inodes + u64::from(old_lower && !dst_whiteout);
+        vfs.tmpfs_check(dev, 0, need_inodes)?;
+        Some((
+            dev,
+            dir_inodes,
+            dst_whiteout,
+            dst_dir_had_upper,
+            dst_dir_whiteouts,
+            replaced_victim,
+            old_lower,
+        ))
+    } else {
+        None
+    };
     vfs.overlay_rename(
         (od, old_name),
         (nd, new_name),
         (flags & RENAME_NOREPLACE != 0, exchange),
     )?;
-    // Renaming a name to itself changes nothing
-    if dst.as_ref().is_some_and(|d| d.0 == src) {
-        return Ok(0);
+    if let Some((
+        dev,
+        dir_inodes,
+        dst_whiteout,
+        dst_dir_had_upper,
+        dst_dir_whiteouts,
+        replaced_victim,
+        old_lower,
+    )) = tmpfs
+    {
+        if dir_inodes > 0 {
+            vfs.tmpfs_charge(dev, 0, dir_inodes as i64);
+        }
+        if dst_whiteout {
+            vfs.tmpfs_charge(dev, 0, -1);
+        }
+        if dst_dir_had_upper {
+            vfs.tmpfs_charge(dev, 0, -(1 + dst_dir_whiteouts as i64));
+        } else {
+            tmpfs_removed(cx, &vfs, replaced_victim);
+        }
+        if old_lower {
+            vfs.tmpfs_charge(dev, 0, 1);
+        }
     }
-    // As the store's rename reports, on the overlay's nodes: files open through a moved name
-    // follow it, then fsnotify_move's order
+    // As the store's rename reports, on the overlay's nodes: mark an overwritten destination
+    // unlinked first, then files open through a moved name follow it, then fsnotify_move's order
     let k = cx.kr();
     let (old, new) = ((overlay::key(od), old_name), (overlay::key(nd), new_name));
+    if !exchange && let Some((d, _)) = &dst {
+        inotify::unlinked(k, overlay::key(*d), new.0, new.1);
+    }
     inotify::renamed(k, old, new, || Some(overlay::key(src)));
     if exchange && let Some(d) = dst.as_ref().map(|d| d.0) {
         inotify::renamed(k, new, old, || Some(overlay::key(d)));
@@ -7185,12 +7787,13 @@ impl Attrs {
         }
     }
 
-    /// The store inode a change by path went to, for inotify ([`attrib_at`], which finds an
-    /// overlay node again by its path): an overlay node's topmost inode.
+    /// The inotify key a change by path went to ([`attrib_at`], which finds an overlay or FUSE
+    /// node again by its path): a store inode, an overlay node's topmost inode, or a FUSE key.
     fn ino(&self, cx: &Cx<'_>) -> Option<Ino> {
         match self {
             Attrs::Store(ino) => Some(*ino),
             Attrs::Overlay(o) => Some(cx.vfs().ok()?.overlay().node(*o).real()),
+            Attrs::Fuse(id, _) => Some(crate::vfs::fuse::key(*id)),
             _ => None,
         }
     }
@@ -7326,26 +7929,29 @@ pub(super) fn fchownat(
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     let node = lookup_at_or_fd(cx, &cx.cred(), dirfd, &path, flags, follow)?;
     let target = Attrs::of(cx, &node)?;
-    chown(cx, &target, uid, gid)?;
-    if path.is_empty() {
-        attrib_fd(cx, dirfd);
-    } else if let Some(ino) = target.ino(cx) {
-        attrib_at(cx, ino, dirfd, &path, follow);
+    if chown(cx, &target, uid, gid)? {
+        if path.is_empty() {
+            attrib_fd(cx, dirfd);
+        } else if let Some(ino) = target.ino(cx) {
+            attrib_at(cx, ino, dirfd, &path, follow);
+        }
     }
     Ok(0)
 }
 
 pub(super) fn fchown(cx: &mut Cx<'_>, fd: i32, uid: u32, gid: u32) -> SysResult {
     let target = Attrs::of_fd(cx, fd)?;
-    chown(cx, &target, uid, gid)?;
-    attrib_fd(cx, fd);
+    if chown(cx, &target, uid, gid)? {
+        attrib_fd(cx, fd);
+    }
     Ok(0)
 }
 
 /// Without `CAP_CHOWN`, the owner can only change the group to one it is in, and cannot change
 /// the owner. IDs are in the caller's user namespace, and unmapped ones are EINVAL; `CAP_CHOWN`
-/// requires the file's current owner and group to be mapped there.
-fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
+/// requires the file's current owner and group to be mapped there. Returns whether any attribute
+/// changed (so a no-op `chown(-1, -1)` that clears nothing does not emit `IN_ATTRIB`).
+fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> Result<bool, Errno> {
     let cred = cx.cred();
     let uid = owner_arg(uid)
         .map(|u| cred.uid_in(u).ok_or(Errno::EINVAL))
@@ -7365,7 +7971,7 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
             }
         }
         if uid.is_none() && gid.is_none() {
-            return Ok(0);
+            return Ok(false);
         }
         let set = super::fuse::SetAttr {
             uid,
@@ -7373,7 +7979,7 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
             ..Default::default()
         };
         super::fuse::setattr(cx, &*cx.vfs()?, *id, &set, *fh)?;
-        return Ok(0);
+        return Ok(true);
     }
     let st = target.stat(cx)?;
     let owner = cred.fsuid == st.uid;
@@ -7388,13 +7994,35 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
     // CAP_FOWNER may make (notify_change adds ATTR_MODE, checked by inode_owner_or_capable).
     // Otherwise anyone could disable root's set-id programs (su, doas)
     let keep_sgid = cred.in_group(st.gid) || cred.capable_wrt(&st, cap::FSETID);
-    if let Attrs::Store(_) | Attrs::Overlay(_) = target
-        && !st.is_dir()
+    let clears_setid = !st.is_dir()
         && (st.mode & mode::S_ISUID != 0
-            || st.mode & mode::S_ISGID != 0 && (st.mode & 0o010 != 0 || !keep_sgid))
-        && !cred.owns(&st)
-    {
+            || st.mode & mode::S_ISGID != 0 && (st.mode & 0o010 != 0 || !keep_sgid));
+    if matches!(target, Attrs::Store(_) | Attrs::Overlay(_)) && clears_setid && !cred.owns(&st) {
         return Err(Errno::EPERM);
+    }
+    if uid.is_none() && gid.is_none() {
+        let clears_caps = match target {
+            Attrs::Store(ino) if !st.is_dir() => {
+                match cx.vfs()?.store().get_xattr(*ino, b"security.capability") {
+                    Ok(_) => true,
+                    Err(Errno::ENODATA) => false,
+                    Err(e) => return Err(e),
+                }
+            }
+            Attrs::Overlay(o) if !st.is_dir() => {
+                let vfs = cx.vfs()?;
+                let real = vfs.overlay().node(*o).real();
+                match vfs.store().get_xattr(real, b"security.capability") {
+                    Ok(_) => true,
+                    Err(Errno::ENODATA) => false,
+                    Err(e) => return Err(e),
+                }
+            }
+            _ => false,
+        };
+        if !clears_setid && !clears_caps {
+            return Ok(false);
+        }
     }
     match target {
         Attrs::Store(ino) => cx.vfs()?.store().set_owner(*ino, uid, gid, keep_sgid)?,
@@ -7418,7 +8046,7 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
         }
         Attrs::Fuse(..) => unreachable!("handled above"),
     }
-    Ok(0)
+    Ok(true)
 }
 
 fn owner_arg(id: u32) -> Option<u32> {
@@ -7542,6 +8170,16 @@ pub(super) fn utimensat(
                 ..Default::default()
             };
             super::fuse::setattr(cx, &*cx.vfs()?, id, &set, fh)?;
+            let event = match (atime, mtime) {
+                (Some(_), None) => inotify::IN_ACCESS,
+                (None, Some(_)) => inotify::IN_MODIFY,
+                _ => inotify::IN_ATTRIB,
+            };
+            if path.is_empty() {
+                event_fd(cx, dirfd, event);
+            } else {
+                event_at(cx, crate::vfs::fuse::key(id), dirfd, &path, follow, event);
+            }
             return Ok(0);
         }
     };
@@ -7581,15 +8219,22 @@ pub(super) fn attrib_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: 
     event_at(cx, ino, dirfd, path, follow, inotify::IN_ATTRIB);
 }
 
-/// Reports `event` for a change made by path to store inode `ino` (also to the containing
-/// directory); through an overlay, to the overlay's node the path names.
+/// Reports `event` for a change made by path to store inode or FUSE key `ino` (also to the
+/// containing directory); through an overlay, to the overlay's node the path names.
 fn event_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool, event: u32) {
     if inotify::active(cx.kr()) {
         let (target, parent) = inotify::watched_at(cx, ino, (dirfd, path), follow);
         let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
-        let dir = match cx.vfs().map(|v| v.store().kind(ino)) {
-            Ok(Ok(mode::S_IFDIR)) => inotify::IN_ISDIR,
-            _ => 0,
+        let dir = if let Some(f) = crate::vfs::fuse::id_of(ino) {
+            match cx.vfs().and_then(|v| crate::vfs::fuse::cached_attr(&v, f)) {
+                Ok(a) if a.mode & mode::S_IFMT == mode::S_IFDIR => inotify::IN_ISDIR,
+                _ => 0,
+            }
+        } else {
+            match cx.vfs().map(|v| v.store().kind(ino)) {
+                Ok(Ok(mode::S_IFDIR)) => inotify::IN_ISDIR,
+                _ => 0,
+            }
         };
         inotify::path_event(cx.kr(), target, parent, event | dir);
     }
@@ -7614,8 +8259,17 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
     let path = read_path(cx, path)?;
     let vfs = cx.vfs()?;
     let node = lookup_at(cx, AT_FDCWD, &path, true)?;
-    if let Node::Fuse(..) = node {
-        return super::fuse::truncate(cx, &node, len).map(|()| 0);
+    if let Node::Fuse(_, id) = node {
+        super::fuse::truncate(cx, &node, len)?;
+        event_at(
+            cx,
+            crate::vfs::fuse::key(id),
+            AT_FDCWD,
+            &path,
+            true,
+            inotify::IN_MODIFY,
+        );
+        return Ok(0);
     }
     // A regular file without a name reached through /proc/<pid>/fd/N (deleted, or a memfd) is
     // truncated itself, as Linux follows the magic link to its dentry on the mount it was opened
@@ -7665,8 +8319,9 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
         // it and do nothing)
         return Ok(0);
     }
-    // In an overlay the checks are made on what the overlay shows; then the file is copied up
-    // (without its data when truncated to 0) and truncated there
+    // In an overlay the checks are made on what the overlay shows, leases on the overlay node are
+    // broken before copy-up, and then the file is copied up (without its data when truncated to 0)
+    // and truncated there
     let node = match node {
         Node::Overlay(mnt, o) => {
             let real = vfs.overlay().node(o).real();
@@ -7683,6 +8338,8 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             if executing(cx, real) {
                 return Err(Errno::ETXTBSY);
             }
+            check_fsize(cx, len)?;
+            super::lease::break_leases(cx, overlay::key(o), true, false, None)?;
             let what = if len == 0 {
                 CopyUp::NoData
             } else {
@@ -7713,7 +8370,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             make_private(cx, ino, Some(len))?;
             remove_privs(cx, ino)?;
             let host = object(ino)?;
-            let tmpfs = tmpfs_size(&vfs, &node, &host)?;
+            let tmpfs = tmpfs_size(&vfs, &node, ino, &host)?;
             truncating(cx, &host, len);
             host.set_len(len).map_err(host_errno)?;
             tmpfs_resized(&vfs, tmpfs, &host);
@@ -7736,18 +8393,21 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
             return Err(Errno::EINVAL);
         }
         check_fsize(cx, len)?;
-        return super::fuse::ftruncate(cx, &io, len).map(|()| 0);
+        super::fuse::ftruncate(cx, &io, len)?;
+        inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+        return Ok(0);
     }
     // The borrow ends before the lease break, which can wait with the BKL released
-    let leased = match &*file.borrow() {
-        f @ OpenFile {
-            kind: FileKind::Regular { ino, .. },
-            ..
-        } if f.writable() => Some(*ino),
-        _ => None,
+    let leased = {
+        let f = file.borrow();
+        if f.writable() {
+            super::lease::key_of(&f)
+        } else {
+            None
+        }
     };
-    if let Some(ino) = leased {
-        super::lease::break_leases(cx, ino, true, false, Some(&file))?;
+    if let Some(key) = leased {
+        super::lease::break_leases(cx, key, true, false, Some(&file))?;
     }
     prepare_write(cx, &file, Some(len))?;
     let f = file.borrow();
@@ -7757,7 +8417,10 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
             check_seals(cx, &f, false, |_| len)?;
             remove_privs(cx, *ino)?;
             let vfs = cx.vfs()?;
-            let tmpfs = tmpfs_size(&vfs, &Node::Store(f.mnt, *ino), file)?;
+            let tmpfs_node = f
+                .ovl
+                .map_or(Node::Store(f.mnt, *ino), |o| Node::Overlay(f.mnt, o));
+            let tmpfs = tmpfs_size(&vfs, &tmpfs_node, *ino, file)?;
             truncating(cx, file, len);
             file.set_len(len).map_err(host_errno)?;
             tmpfs_resized(&vfs, tmpfs, file);
@@ -7789,7 +8452,9 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         if !file.borrow().writable() {
             return Err(Errno::EBADF);
         }
-        return super::fuse::fallocate(cx, &io, mode, offset, len).map(|()| 0);
+        super::fuse::fallocate(cx, &io, mode, offset, len)?;
+        inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+        return Ok(0);
     }
     prepare_write(cx, &file, None)?;
     let f = file.borrow();
@@ -7805,7 +8470,10 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     let size = host.metadata().map_err(host_errno)?.len();
     let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
     let vfs = cx.vfs()?;
-    let tmpfs = tmpfs_size(&vfs, &Node::Store(f.mnt, ino), host)?;
+    let tmpfs_node = f
+        .ovl
+        .map_or(Node::Store(f.mnt, ino), |o| Node::Overlay(f.mnt, o));
+    let tmpfs = tmpfs_size(&vfs, &tmpfs_node, ino, host)?;
     // Store files stand in for ext4's, which can also zero a range; tmpfs only reserves and
     // punches (shmem_fallocate)
     let zero = match mode & !FALLOC_FL_KEEP_SIZE {
@@ -7860,7 +8528,7 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         Err(e) => return Err(Errno(e)),
     }
     tmpfs_resized(&vfs, tmpfs, host);
-    inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
+    inotify::file_io_event(cx.kr(), &f, inotify::IN_MODIFY);
     Ok(0)
 }
 
@@ -7991,11 +8659,10 @@ fn rename_synthetic(
 /// the overlay directory it was reached as, if any.
 pub(super) type CreateParent<'p> = (MountId, Ino, &'p [u8], Option<OvlId>);
 
-/// The parent directory of a name to create ([`parent_at`]): in a directory of a synthetic
-/// filesystem an existing name is EEXIST, ahead of the error that the directory cannot be
-/// modified (Linux's `filename_create`: `mkdir -p /sys/fs/cgroup/x` relies on `mkdir /sys/fs`
-/// being EEXIST). In an overlay it is the upper directory, copied up, and the overlay's directory
-/// comes too (for [`created_events`]).
+/// The parent directory of a non-directory name to create ([`parent_at`], used by `unix::bind`):
+/// in a directory of a synthetic filesystem an existing name is EEXIST, ahead of the error that
+/// the directory cannot be modified. In an overlay, permissions, trailing slash and tmpfs room are
+/// checked before copying up parent directories.
 pub(super) fn create_parent_at<'p>(
     cx: &Cx<'_>,
     dirfd: i32,
@@ -8003,11 +8670,25 @@ pub(super) fn create_parent_at<'p>(
 ) -> Result<CreateParent<'p>, Errno> {
     let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
-    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
-    if matches!(dir, Node::Pseudo(..) | Node::Overlay(..))
-        && vfs.has_child(&cx.view(&vfs), &dir, name)
-    {
+    let cred = cx.cred();
+    let view = cx.view(&vfs);
+    let (dir, name) = vfs.resolve_parent(&view, &cred, &cx.root(), &start, path)?;
+    if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
+    }
+    if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&view, &dir, name) {
+        return Err(Errno::EEXIST);
+    }
+    if let Node::Overlay(mnt, o) = dir {
+        if path.ends_with(b"/") {
+            return Err(if vfs.has_child(&view, &dir, name) {
+                Errno::EEXIST
+            } else {
+                Errno::ENOENT
+            });
+        }
+        may_create_overlay(&vfs, &cred, &view, (mnt, o), name)?;
+        check_overlay_create_tmpfs(&vfs, mnt, o, name, 0)?;
     }
     let ovl = match dir {
         Node::Overlay(_, o) => Some(o),
@@ -8073,17 +8754,42 @@ fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
 }
 
 /// The store directory something is created in: a store directory as [`store_dir`] gives it,
-/// or the upper directory of an overlay one, copied up first (EROFS in a read-only overlay).
+/// or the upper directory of an overlay one, copied up first and charged to tmpfs when the upper
+/// layer is on tmpfs (EROFS in a read-only overlay).
 fn create_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
     match dir {
         Node::Overlay(mnt, o) => {
             if vfs.readonly(dir) {
                 return Err(Errno::EROFS);
             }
-            Ok((*mnt, vfs.overlay_upper(*o, CopyUp::All)?))
+            Ok((*mnt, overlay_upper_charged(vfs, *o, CopyUp::All)?))
         }
         _ => store_dir(vfs, dir),
     }
+}
+
+/// Checks before creating `name` in overlay directory `(mnt, o)`, before copying up any parent
+/// directories: directory search permission, `EEXIST` on the merged view, read-only mount
+/// (`EROFS`), and write permission (`EACCES`). Returns the directory's metadata.
+fn may_create_overlay(
+    vfs: &Vfs,
+    cred: &Cred,
+    view: &crate::pseudo::View<'_>,
+    (mnt, o): (MountId, OvlId),
+    name: &[u8],
+) -> Result<Stat, Errno> {
+    let dir = Node::Overlay(mnt, o);
+    let real = vfs.overlay().node(o).real();
+    let st = vfs.store().stat(real)?;
+    cred.permission(&st, MAY_EXEC)?;
+    if vfs.has_child(view, &dir, name) {
+        return Err(Errno::EEXIST);
+    }
+    if vfs.readonly(&dir) {
+        return Err(Errno::EROFS);
+    }
+    cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
+    Ok(st)
 }
 
 /// The queue with inode number `ino` in the mqueue filesystem of IPC namespace `ns`; a deleted
@@ -8259,16 +8965,134 @@ fn display_path(
 
 // ---- tmpfs accounting ----
 
+/// When overlay instance `ovl_dev`'s upper layer is on tmpfs, returns that tmpfs instance's device
+/// number (`overlay_layers` pins the upper layer's tmpfs first in `Instance::pins`).
+fn overlay_upper_tmpfs_dev(vfs: &Vfs, ovl_dev: u64) -> Option<u64> {
+    let (upper, first_pin) = {
+        let ovl = vfs.overlay();
+        let inst = ovl.instance(ovl_dev)?;
+        (inst.upper?, *inst.pins.first()?)
+    };
+    let store = vfs.store();
+    let mut cur = upper;
+    while let Ok(p) = store.parent(cur) {
+        if p == cur {
+            break;
+        }
+        cur = p;
+    }
+    // Detached store roots belong exclusively to tmpfs instances
+    (cur != crate::vfs::store::ROOT).then_some(first_pin)
+}
+
+/// When changes to `node` land on a tmpfs instance — either directly or through an overlay whose
+/// upper layer is on tmpfs — returns that tmpfs instance's device number.
+fn backing_tmpfs_dev(vfs: &Vfs, node: &Node) -> Option<u64> {
+    match vfs.fs_of(node) {
+        Fs::Tmpfs => Some(vfs.dev_of(node)),
+        Fs::Overlay => overlay_upper_tmpfs_dev(vfs, vfs.dev_of(node)),
+        _ => None,
+    }
+}
+
+/// Counts distinct uncopied overlay nodes along the ancestor chains of `nodes`.
+fn overlay_uncopied_dirs(vfs: &Vfs, nodes: &[OvlId]) -> u64 {
+    let ovl = vfs.overlay();
+    let mut seen = Vec::new();
+    for &start in nodes {
+        let mut cur = start;
+        loop {
+            let n = ovl.node(cur);
+            if n.upper.is_some() {
+                break;
+            }
+            if !seen.contains(&cur) {
+                seen.push(cur);
+            }
+            if n.parent == cur {
+                break;
+            }
+            cur = n.parent;
+        }
+    }
+    seen.len() as u64
+}
+
+/// Pages and inodes copying up overlay node `o` (and its uncopied ancestor directories) will add
+/// to its upper layer.
+fn overlay_copy_up_cost(vfs: &Vfs, o: OvlId, what: CopyUp) -> Result<(u64, u64), Errno> {
+    let (has_upper, lower) = {
+        let ovl = vfs.overlay();
+        let n = ovl.node(o);
+        (n.upper.is_some(), n.real())
+    };
+    if has_upper {
+        return Ok((0, 0));
+    }
+    let inodes = overlay_uncopied_dirs(vfs, &[o]);
+    let st = vfs.store().stat(lower)?;
+    let pages = match st.kind() {
+        mode::S_IFREG if what == CopyUp::NoData => 0,
+        _ => crate::vfs::tmpfs_pages(&st),
+    };
+    Ok((pages, inodes))
+}
+
+/// Copies overlay node `o` up ([`Vfs::overlay_upper`]), checking and charging the upper layer's
+/// tmpfs instance when the upper layer is on tmpfs.
+fn overlay_upper_charged(vfs: &Vfs, o: OvlId, what: CopyUp) -> Result<Ino, Errno> {
+    let dev = overlay_upper_tmpfs_dev(vfs, vfs.overlay().node(o).dev);
+    let cost = if let Some(dev) = dev {
+        let (pages, inodes) = overlay_copy_up_cost(vfs, o, what)?;
+        if pages > 0 || inodes > 0 {
+            vfs.tmpfs_check(dev, pages, inodes)?;
+        }
+        Some((dev, pages, inodes))
+    } else {
+        None
+    };
+    let ino = vfs.overlay_upper(o, what)?;
+    if let Some((dev, pages, inodes)) = cost
+        && (pages > 0 || inodes > 0)
+    {
+        vfs.tmpfs_charge(dev, pages as i64, inodes as i64);
+    }
+    Ok(ino)
+}
+
+/// Before copying up overlay directory `o` to create `name` (taking `pages` pages): verifies that
+/// the upper layer's tmpfs instance has room for both the uncopied parent directories and the new
+/// entry (replacing an existing upper whiteout takes no additional inode).
+fn check_overlay_create_tmpfs(
+    vfs: &Vfs,
+    mnt: MountId,
+    o: OvlId,
+    name: &[u8],
+    pages: u64,
+) -> Result<(), Errno> {
+    let Some(dev) = overlay_upper_tmpfs_dev(vfs, vfs.dev_of(&Node::Overlay(mnt, o))) else {
+        return Ok(());
+    };
+    let dir_inodes = overlay_uncopied_dirs(vfs, &[o]);
+    let replaces_whiteout = vfs
+        .overlay()
+        .node(o)
+        .upper
+        .is_some_and(|u| overlay::whiteout_at(vfs.store(), u, name).unwrap_or(false));
+    let new_inodes = u64::from(!replaces_whiteout);
+    vfs.tmpfs_check(dev, pages, dir_inodes + new_inodes)
+}
+
 /// Before creating a name (a new inode, or a hard link) in directory `dir` (the mount reached
-/// through and the inode): in tmpfs, checks whether it fits, ENOSPC when it does not (Linux's
-/// `shmem_reserve_inode`; `pages` is the page a long symlink needs). Returns the instance's
-/// device number, handed to [`tmpfs_created`] once created.
+/// through and the inode): in tmpfs (or an overlay whose upper layer is on tmpfs), checks whether
+/// it fits, ENOSPC when it does not (Linux's `shmem_reserve_inode`; `pages` is the page a long
+/// symlink needs). Returns the instance's device number, handed to [`tmpfs_created`] once created.
 pub(super) fn tmpfs_reserve(
     vfs: &Vfs,
     (mnt, dir): (MountId, Ino),
     pages: u64,
 ) -> Result<Option<u64>, Errno> {
-    let Some(dev) = vfs.tmpfs_dev(&Node::Store(mnt, dir)) else {
+    let Some(dev) = backing_tmpfs_dev(vfs, &Node::Store(mnt, dir)) else {
         return Ok(None);
     };
     vfs.tmpfs_check(dev, pages, 1)?;
@@ -8279,6 +9103,32 @@ pub(super) fn tmpfs_reserve(
 pub(super) fn tmpfs_created(vfs: &Vfs, dev: Option<u64>, pages: u64) {
     if let Some(dev) = dev {
         vfs.tmpfs_charge(dev, pages as i64, 1);
+    }
+}
+
+/// Like [`tmpfs_reserve`], accounting for an overlay upper whiteout replaced by `name` (net 0
+/// inodes).
+fn tmpfs_reserve_name(
+    vfs: &Vfs,
+    (mnt, dir): (MountId, Ino),
+    name: &[u8],
+    pages: u64,
+) -> Result<Option<(u64, i64)>, Errno> {
+    let node = Node::Store(mnt, dir);
+    let Some(dev) = backing_tmpfs_dev(vfs, &node) else {
+        return Ok(None);
+    };
+    let replaces_whiteout =
+        vfs.overlay_prefix(mnt).is_some() && overlay::whiteout_at(vfs.store(), dir, name)?;
+    let inodes = u64::from(!replaces_whiteout);
+    vfs.tmpfs_check(dev, pages, inodes)?;
+    Ok(Some((dev, inodes as i64)))
+}
+
+/// A name [`tmpfs_reserve_name`] found room for has been created: accounts it.
+fn tmpfs_created_name(vfs: &Vfs, reserved: Option<(u64, i64)>, pages: u64) {
+    if let Some((dev, inodes)) = reserved {
+        vfs.tmpfs_charge(dev, pages as i64, inodes);
     }
 }
 
@@ -8321,7 +9171,10 @@ fn tmpfs_write_room(
         return Ok((len, None));
     };
     let vfs = cx.vfs()?;
-    let Some(t) = tmpfs_size(&vfs, &Node::Store(f.mnt, *ino), file)? else {
+    let tmpfs_node = f
+        .ovl
+        .map_or(Node::Store(f.mnt, *ino), |o| Node::Overlay(f.mnt, o));
+    let Some(t) = tmpfs_size(&vfs, &tmpfs_node, *ino, file)? else {
         return Ok((len, None));
     };
     let (dev, own) = (t.dev, t.pages);
@@ -8421,13 +9274,16 @@ fn reserved_unwritten(host: &std::fs::File, size: u64, own: u64) -> u64 {
     own.saturating_sub(data)
 }
 
-/// When `node` (a regular file, `host` on the host) is in tmpfs, records its instance device,
-/// inode and host page count: after it changes, they go to [`tmpfs_resized`] for accounting.
-fn tmpfs_size(vfs: &Vfs, node: &Node, host: &std::fs::File) -> Result<Option<TmpfsFile>, Errno> {
-    let Some(dev) = vfs.tmpfs_dev(node) else {
-        return Ok(None);
-    };
-    let Some(ino) = node.ino() else {
+/// When `node` (a regular file with backing store inode `ino` and host object `host`) is in tmpfs
+/// or on an overlay whose upper layer is on tmpfs, records its instance device, inode and host
+/// page count: after it changes, they go to [`tmpfs_resized`] for accounting.
+fn tmpfs_size(
+    vfs: &Vfs,
+    node: &Node,
+    ino: Ino,
+    host: &std::fs::File,
+) -> Result<Option<TmpfsFile>, Errno> {
+    let Some(dev) = backing_tmpfs_dev(vfs, node) else {
         return Ok(None);
     };
     Ok(Some(TmpfsFile {
@@ -8464,12 +9320,16 @@ fn tmpfs_victim(
     (mnt, dir): (MountId, Ino),
     name: &[u8],
 ) -> Result<Option<TmpfsVictim>, Errno> {
-    let Some(dev) = vfs.tmpfs_dev(&Node::Store(mnt, dir)) else {
+    let Some(dev) = backing_tmpfs_dev(vfs, &Node::Store(mnt, dir)) else {
         return Ok(None);
     };
     let Some(ino) = vfs.store().lookup(dir, name)? else {
         return Ok(None);
     };
+    tmpfs_victim_ino(vfs, dev, ino)
+}
+
+fn tmpfs_victim_ino(vfs: &Vfs, dev: u64, ino: Ino) -> Result<Option<TmpfsVictim>, Errno> {
     let st = vfs.store().stat(ino)?;
     let last_reg = st.kind() == mode::S_IFREG && st.nlink <= 1;
     let pages = if st.is_dir() || st.nlink <= 1 {
@@ -8665,11 +9525,16 @@ fn seals_permit(
 }
 
 /// Removes the privileges of regular file `ino` before writing or truncating it
-/// ([`Store::remove_privs`]): the setuid and setgid bits are removed when the caller lacks
-/// `CAP_FSETID`, and file capabilities are always removed.
+/// ([`Store::remove_privs`]): without `CAP_FSETID`, removes the setuid bit, and removes the setgid
+/// bit when group-executable or when the caller is not in the file's group (Linux 6.2+
+/// `setattr_should_drop_sgid`, aligned with `chown`); file capabilities are always removed.
 fn remove_privs(cx: &Cx<'_>, ino: Ino) -> Result<(), Errno> {
-    let keep_setid = cx.cred().capable(cap::FSETID);
-    cx.vfs()?.store().remove_privs(ino, keep_setid)
+    let cred = cx.cred();
+    let vfs = cx.vfs()?;
+    let st = vfs.store().attrs(ino)?;
+    let keep_setid = cred.capable_wrt(&st, cap::FSETID);
+    let keep_sgid = keep_setid || cred.in_group(st.gid);
+    vfs.store().remove_privs(ino, keep_setid, keep_sgid)
 }
 
 /// Called before a file is cut to `len` bytes: in every address space, pages mapping it beyond

@@ -1238,11 +1238,13 @@ impl Store {
         })
     }
 
-    /// Removes a regular file's privileges before it is written or truncated (Linux's
-    /// `file_remove_privs`): without `CAP_FSETID` (`keep_setid` false), removes the setuid bit,
-    /// and the setgid bit when the group execute bit is set; file capabilities are removed
-    /// whoever writes. Does not touch the database when there is nothing to remove.
-    pub fn remove_privs(&self, ino: Ino, keep_setid: bool) -> Result<(), Errno> {
+    /// Removes a regular file's privileges before it is written or truncated (Linux 6.2+'s
+    /// `file_remove_privs` / `setattr_should_drop_sgid`): without `CAP_FSETID` (`keep_setid`
+    /// false), removes the setuid bit, and removes the setgid bit when the group execute bit is
+    /// set or `keep_sgid` is false (the caller is neither in the file's group nor has
+    /// `CAP_FSETID`); file capabilities are removed whoever writes. Does not touch the database
+    /// when there is nothing to remove.
+    pub fn remove_privs(&self, ino: Ino, keep_setid: bool, keep_sgid: bool) -> Result<(), Errno> {
         let st = self.stat_row(ino)?;
         if st.kind() != mode::S_IFREG {
             return Ok(());
@@ -1250,7 +1252,7 @@ impl Store {
         let mut perm = st.mode & 0o7777;
         if !keep_setid {
             perm &= !mode::S_ISUID;
-            if perm & 0o010 != 0 {
+            if perm & 0o010 != 0 || !keep_sgid {
                 perm &= !mode::S_ISGID;
             }
         }
@@ -3359,16 +3361,20 @@ mod tests {
         let other = Store::open(&dir, &[]).unwrap();
         assert!(other.has_file_caps(f).unwrap());
         // A write with CAP_FSETID: only the file capabilities are removed
-        other.remove_privs(f, true).unwrap();
+        other.remove_privs(f, true, true).unwrap();
         other.commit().unwrap();
         assert!(!s.has_file_caps(f).unwrap());
         assert_eq!(s.attrs(f).unwrap().mode & 0o7777, 0o6755);
         // Without CAP_FSETID: setuid and (when group-executable) setgid are removed
-        s.remove_privs(f, false).unwrap();
+        s.remove_privs(f, false, true).unwrap();
         assert_eq!(s.attrs(f).unwrap().mode & 0o7777, 0o755);
+        // Without group exec: setgid stays for a writer in the file's group, and is cleared
+        // otherwise (Linux 6.2+'s setattr_should_drop_sgid)
         let (g, _) = s.create_file(ROOT, b"lock", 0o2644, 0, 0).unwrap();
-        s.remove_privs(g, false).unwrap();
+        s.remove_privs(g, false, true).unwrap();
         assert_eq!(s.attrs(g).unwrap().mode & 0o7777, 0o2644);
+        s.remove_privs(g, false, false).unwrap();
+        assert_eq!(s.attrs(g).unwrap().mode & 0o7777, 0o644);
         // chown also removes file capabilities
         s.set_xattr(f, XATTR_NAME_CAPS, &caps, false, false)
             .unwrap();

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-12 (targeted verification only since the split; latest change: copy-ups go through `copy_up`, which copies when the lower object could change in place)
+> Maintained: 2026-11-23 (targeted verification only since the split; latest change: key overlay leases on overlay nodes, charge upper-layer tmpfs accounting, check creation permissions before parent copy-up, and align overlay FIFO fstat with stat)
 
 ## Responsibilities
 
@@ -128,37 +128,47 @@ holding its node (`kernel/exec`).
 
 ### Creating, removing and renaming
 
-- Creating (`create_dir`, `create_in`): the directory is copied up, a whiteout of the name does not
-  count as existing and is replaced in the same transaction, and a directory made in its place is
-  opaque (`ovl_create_over_whiteout`); this covers open with `O_CREAT` (the new file is the
-  overlay's node, so it locks with later opens), mkdir, mknod, symlink, link (the file copied up
-  and linked there) and AF_UNIX bind (connect finds the upper inode). mknod of a whiteout through
-  an overlay is `EPERM` (`ovl_mknod`).
+- Creating (`may_create_overlay`, `check_overlay_create_tmpfs`, `create_dir`, `create_in`):
+  permissions, `EEXIST`, trailing slash, whiteout/`CAP_MKNOD` and upper-layer tmpfs room are
+  checked before copying up parent directories, so refused creations leave parents uncopied. Then
+  the directory is copied up (charging upper-layer tmpfs when applicable via
+  `overlay_upper_charged`), a whiteout of the name does not count as existing and is replaced in
+  the same transaction (net zero tmpfs inodes), and a directory made in its place is opaque
+  (`ovl_create_over_whiteout`); this covers open with `O_CREAT` (the new file is the overlay's
+  node, so it locks with later opens), mkdir, mknod, symlink, link (the file copied up and linked
+  there) and AF_UNIX bind (connect finds the upper inode). mknod of a whiteout through an overlay
+  is `EPERM` (`ovl_mknod`).
 - Removing (`unlink_overlay`, `Overlays::remove`; do_unlinkat's and do_rmdir's order, `may_delete`
   on what the overlay shows, a mount of the caller's namespace on it `EBUSY`, rmdir of a directory
-  not shown empty `ENOTEMPTY`): the upper inode goes with the whiteouts left in a directory, and a
-  whiteout owned by the mounter replaces it when a lower layer has the name.
+  not shown empty `ENOTEMPTY`): upper-layer tmpfs room for parent copy-up and any new whiteout is
+  checked before removal and charged/refunded afterwards (keeping unlinked-open regular files
+  charged until close); the upper inode goes with the whiteouts left in a directory, and a whiteout
+  owned by the mounter replaces it when a lower layer has the name.
 - Renaming (`rename_overlay`, `Overlays::rename`; may_rename's checks on what the overlay shows,
   mount points `EBUSY`, then `ENOENT`, `EEXIST`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY` on the merged
   view): a directory with lower layers (merged or lower only) is `EXDEV` (6.1 without
   `redirect_dir`; with `RENAME_EXCHANGE` the destination too), so tools fall back to copying;
-  otherwise both sides are copied up and renamed in the upper layer, a whiteout at the new name or
+  otherwise both sides are copied up and renamed in the upper layer (with upper-layer tmpfs
+  accounting for parent copy-ups, replaced entries and whiteouts), a whiteout at the new name or
   left in a replaced directory is removed first, a whiteout is left at the old name when a lower
   layer has it, and a directory moved into a merged one becomes opaque (with exchange, the other
   too).
 
 ### Opening
 
-- Opening goes through `open_store` on the topmost inode; a directory stays an overlay node for
-  getdents, fchdir and `*at` calls, and regular files, devices and FIFOs record the node in
+- Opening goes through `open_store_with` on the topmost inode; a directory stays an overlay node
+  for getdents, fchdir and `*at` calls, and regular files, devices and FIFOs record the node in
   `OpenFile::ovl`, so `OpenFile::node`, fchmod-like calls and `/proc/<pid>/fd` give the overlay
-  node; fstat of a regular file shows the node's inode number, of a device the node's stat, of a
-  FIFO its layer inode and attributes. `O_DIRECT` is decided by the mount's filesystem, so overlay
-  files pass it even with the upper layer on a tmpfs. A file opened before its copy-up switches to
-  the upper object on its next read, fstat, lseek or copy out (`follow_copy_up`,
-  `ovl_real_fdget`; a writable one marked `cow` while the upper file is held), keeping the lower
-  object open until close (`OpenFile::ovl_lower`). Locks key on the node (`lock_ino`), leases on
-  the store inode behind it.
+  node; fstat of a regular file shows the node's inode number, and of a device or FIFO shows the
+  overlay node's stat and device (`overlay_stat` and `dev_of`, consistent with `stat` across
+  copy-up). `O_DIRECT` is decided by the mount's filesystem, so overlay files pass it even with
+  the upper layer on a tmpfs. A file opened before its copy-up switches to the upper object on its
+  next read, fstat, lseek or copy out (`follow_copy_up`, `ovl_real_fdget`; a writable one marked
+  `cow` while the upper file is held), keeping the lower object open until close
+  (`OpenFile::ovl_lower`). Both locks (`lock_ino`) and leases (`lease::key_of`) key on the overlay
+  node (`overlay::key`), with write opens and truncations breaking leases before copy-up. Writes,
+  truncations, fallocate and copy-ups whose upper layer is on tmpfs (`backing_tmpfs_dev`) are
+  checked and charged against that tmpfs instance.
 
 ## Dependencies (inbound / outbound)
 
@@ -205,18 +215,12 @@ holding its node (`kernel/exec`).
   - nodes of existing names are never freed while mounted (one per name looked up), and removed
     ones stay while a path-based syscall begun before their removal runs in another thread;
   - the no-BKL stat never serves overlay paths;
-  - a FIFO opened through an overlay fstats as its layer inode, so after a copy-up fstat and stat
-    disagree;
   - no `trusted.overlay.origin`, `impure` or shared whiteout inode: a copied-up file's inode
     number changes at the next mount, and a hard link through the overlay shows the upper number;
-  - changes through an overlay whose upper layer is on a tmpfs are not charged to it;
   - a mapping made from a file opened before its copy-up keeps the lower object;
-  - parents are copied up before a creation's permission check, so a refused creation leaves them
-    copied;
   - other namespaces' mounts on a removed or renamed overlay name are not detached;
   - a lower layer's `trusted.overlay.redirect` is not followed, though sysfs shows
     `redirect_always_follow` as Y (nothing Appine runs writes one).
-- Leases taken before a copy-up are lost (`kernel/locks`).
 
 ## Open questions
 

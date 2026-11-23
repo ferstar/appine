@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint pipe-max-size sysctl references to kernel/sysctl)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve pipe bytes on read/readv/vmsplice EFAULT, raise SIGXFSZ on splice RLIMIT_FSIZE, and allow F_SETPIPE_SZ shrink above pipe-max-size)
 
 ## Responsibilities
 
@@ -46,7 +46,11 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 - Data lives in process memory. `pipe2` accepts `O_CLOEXEC|O_NONBLOCK|O_DIRECT` (`O_DIRECT`
   ignored: no packet mode, not in `F_GETFL`). Capacity 64 KiB, capped at `pipe-max-size` (1 MiB)
   without `CAP_SYS_RESOURCE`; `F_SETPIPE_SZ` rounds up to a power of two of at least a page
-  (`EPERM` over the max, `EBUSY` below the buffered bytes).
+  (`EPERM` over the max only when growing past the current capacity, `EBUSY` below the buffered
+  bytes).
+- Pipe reads (`read`, `readv`, read-side `vmsplice`) peek and copy into guest memory via
+  `pipe_read_user` (`write_user_partial`), draining only the bytes actually copied so a faulting
+  user buffer (`EFAULT`) leaves unread bytes in the pipe.
 - A write wakes readers only when the pipe was empty; a read wakes writers only when it crosses
   `PIPE_BUF` of free room or meets the room a blocked writer asked for (`writer_need`).
 - FIFO open: one `Pipe` per inode; write-only nonblocking without a reader `ENXIO`; read-only
@@ -122,18 +126,14 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
   (`ESPIPE`), where 6.1 returns `ESPIPE` first; an offset on an unseekable non-pipe is `ESPIPE`
   (after waiting for room) instead of `EINVAL`; one with an AF_UNIX stream input is ignored and
   written back advanced.
-- **splice into a file stops quietly at `RLIMIT_FSIZE`:** it returns the short count without
-  `SIGXFSZ`, which Linux raises on its next write while still returning the count.
-- **Pipe I/O with faulting buffers:** a pipe read, readv or read-side vmsplice whose buffer faults
-  consumes what it took (Linux leaves a short-copied buffer in the pipe); a writev whose later
-  iovec faults still writes what precedes it (Linux commits only whole copied pages; a sub-page
-  writev writes nothing); a write copies 64 KiB at a time, so a fault in the first 64 KiB is
-  `EFAULT` and a later one returns a multiple of 64 KiB (Linux returns the bytes up to the fault).
+- **Pipe write I/O with faulting buffers:** a writev whose later iovec faults still writes what
+  precedes it (Linux commits only whole copied pages; a sub-page writev writes nothing); a write
+  copies 64 KiB at a time, so a fault in the first 64 KiB is `EFAULT` and a later one returns a
+  multiple of 64 KiB (Linux returns the bytes up to the fault).
 - **Fidelity gaps**, one per line:
   - `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues);
   - vmsplice copies at the call, so later changes to the buffer are not seen by the reader;
-  - `F_SETPIPE_SZ` is `EPERM` over `pipe-max-size` even when not growing, and checks `EBUSY`
-    against bytes rather than occupied pages;
+  - `F_SETPIPE_SZ` checks `EBUSY` against bytes rather than occupied pages;
   - every procfs and sysfs file is taken as splicing both ways, so splice reads a per-process
     file such as `/proc/<pid>/status` into a pipe, which has no `splice_read` on Linux (`EINVAL`
     on a native 6.8 kernel).

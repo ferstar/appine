@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: release node.mnt and open_tree namespaces on OpenFile drop, mark mq_open fds pseudo, and set mount on mqueue-mount opens)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve O_DIRECT/O_NOATIME/O_ASYNC/O_DIRECTORY/O_NOFOLLOW in F_GETFL and enforce nr_open in CLOSE_RANGE_UNSHARE)
 
 ## Responsibilities
 
@@ -87,8 +87,10 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   copies the slots and the limit and resets `holds_locks`. Every thread holds two references to its
   table: `unshare(CLONE_FILES)`, execve (after the other threads are gone) and
   `CLOSE_RANGE_UNSHARE` copy only when there are more; a copy is a new owner of POSIX locks, so an
-  unshared table keeps its locks. `unshare(CLONE_FILES)` is also `EMFILE` when the highest fd,
-  rounded up to 64, passes `nr_open`. execve then applies close-on-exec.
+  unshared table keeps its locks. Both `unshare(CLONE_FILES)` and `CLOSE_RANGE_UNSHARE` return
+  `EMFILE` when the highest fd copied (excluding fds from `first` onward when `CLOSE_RANGE_UNSHARE`
+  closes through the end without `CLOSE_RANGE_CLOEXEC`), rounded up to 64, passes `nr_open`. execve
+  then applies close-on-exec.
 - Closing (close, dup3 over an fd, close_range, close-on-exec) removes the slot, runs
   `locks::closed`, `mqueue_closed`, flushes a FUSE file (close returns the flush's error, the
   others ignore it) and `unix::released`; the last reference's `Drop` tells `vfs::released` its
@@ -98,11 +100,12 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   exists). A table's drop wakes lock waiters when it held locks. A file seccomp's
   `SECCOMP_ADDFD_FLAG_SETFD` replaces in another process's table is closed as that process's (its
   locks, message-queue notifications and FUSE flush; `close_replaced`).
-- Open keeps only the access mode, `O_APPEND`, `O_NONBLOCK`, `O_PATH`, `O_DSYNC` and `__O_SYNC`
-  (`kept`; with `O_PATH` only `O_PATH`), and every other open adds `O_LARGEFILE`. An `O_PATH` fd
+- Open keeps the access mode, `O_APPEND`, `O_NONBLOCK`, `O_PATH`, `O_DSYNC`, `__O_SYNC`,
+  `O_ASYNC`, `O_DIRECT`, `O_NOATIME`, `O_DIRECTORY` and `O_NOFOLLOW` (`kept`; with `O_PATH` only
+  `O_PATH|O_DIRECTORY|O_NOFOLLOW`), and every other open adds `O_LARGEFILE`. An `O_PATH` fd
   takes only `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD` and `F_GETFL` (else `EBADF`), and
   flock on it is `EBADF`. `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME`
-  (registering fasync when `O_ASYNC` turns on for pipes, sockets, PTYs, inotify and host fds; no
+  (registering fasync whenever `O_ASYNC` is set for pipes, sockets, PTYs, inotify and host fds; no
   `O_NOATIME` ownership or `O_DIRECT` check). Access mode 3 needs read and write permission but
   makes the file neither readable nor writable (`OPEN_FMODE`). Unknown fcntl commands are `EINVAL`,
   counted as unimplemented paths.
@@ -274,12 +277,9 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   - no `O_TMPFILE`;
   - a write open on a read-only instance is `EROFS` only after permission (6.1's `sb_permission`
     comes first; overlay opens already do);
-  - `F_GETFL` never shows `O_DIRECT`, `O_NOATIME`, `O_ASYNC`, `O_DIRECTORY` or `O_NOFOLLOW` given at
-    open (`F_SETFL` can set the first three);
   - open_by_handle_at and memfds report no `IN_OPEN`, and cgroup2 files no `IN_CLOSE_*`; handles
     open a store inode through any store mount;
-  - `RLIMIT_NOFILE` from prlimit applies to the whole shared fd table, and `CLOSE_RANGE_UNSHARE`
-    skips `unshare`'s `nr_open` check;
+  - `RLIMIT_NOFILE` from prlimit applies to the whole shared fd table;
   - FIONREAD on a FUSE regular file is `ENOTTY`.
 
 ## Open questions

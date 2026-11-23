@@ -206,7 +206,9 @@ pub(super) fn create(
             Err(e) => return Err(e),
         }
     }
-    let made = make(cx, vfs, dir, name, Make::Node(mode, 0));
+    // open_path_with emits IN_CREATE + IN_OPEN for newly created files, so the MKNOD fallback
+    // uses make_node to avoid emitting IN_CREATE twice.
+    let made = make_node(cx, vfs, dir, name, Make::Node(mode, 0));
     let id = match made {
         Err(Errno::EEXIST) if flags & oflags::O_EXCL == 0 => {
             vfs.fuse_mut().forget_child(dir, name);
@@ -240,9 +242,39 @@ pub(super) enum Make<'a> {
     Link(u64),
 }
 
-/// Creates `name` in FUSE directory `dir` (6.1's `create_new_entry`): the reply's entry must be
-/// of the type asked for (EIO). The new entry is cached, and the directory's attributes go stale.
+/// Creates `name` in FUSE directory `dir` (6.1's `create_new_entry`) and emits the directory
+/// `IN_CREATE` (and `IN_ATTRIB` on link) inotify events.
 pub(super) fn make(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    dir: FuseId,
+    name: &[u8],
+    what: Make<'_>,
+) -> Result<FuseId, Errno> {
+    let kind = match what {
+        Make::Node(mode, _) => mode & mode::S_IFMT,
+        Make::Dir(_) => mode::S_IFDIR,
+        Make::Symlink(_) => mode::S_IFLNK,
+        Make::Link(_) => 0,
+    };
+    let id = make_node(cx, vfs, dir, name, what)?;
+    // As the VFS reports creations on any filesystem: a link first changes the file's link count
+    if kind == 0 {
+        inotify::path_event(cx.kr(), fuse::key(id), None, inotify::IN_ATTRIB);
+    }
+    let isdir = if kind == mode::S_IFDIR {
+        inotify::IN_ISDIR
+    } else {
+        0
+    };
+    inotify::dir_event(cx.kr(), fuse::key(dir), name, inotify::IN_CREATE | isdir, 0);
+    Ok(id)
+}
+
+/// Creates `name` in FUSE directory `dir` (6.1's `create_new_entry`) without emitting inotify
+/// events: the reply's entry must be of the type asked for (EIO). The new entry is cached, and the
+/// directory's attributes go stale.
+fn make_node(
     cx: &mut Cx<'_>,
     vfs: &Vfs,
     dir: FuseId,
@@ -280,22 +312,9 @@ pub(super) fn make(
         Ok(e) if kind == 0 || e.attr.mode & mode::S_IFMT == kind => e,
         _ => return Err(Errno::EIO),
     };
-    let id = {
-        let mut f = vfs.fuse_mut();
-        f.stale(dir);
-        f.enter(dir, name, &e)?
-    };
-    // As the VFS reports creations on any filesystem: a link first changes the file's link count
-    if kind == 0 {
-        inotify::path_event(cx.kr(), fuse::key(id), None, inotify::IN_ATTRIB);
-    }
-    let isdir = if kind == mode::S_IFDIR {
-        inotify::IN_ISDIR
-    } else {
-        0
-    };
-    inotify::dir_event(cx.kr(), fuse::key(dir), name, inotify::IN_CREATE | isdir, 0);
-    Ok(id)
+    let mut f = vfs.fuse_mut();
+    f.stale(dir);
+    f.enter(dir, name, &e)
 }
 
 /// Removes `name` from FUSE directory `dir` (`FUSE_UNLINK`, or `FUSE_RMDIR` for a directory):
@@ -318,10 +337,11 @@ pub(super) fn remove(
         f.stale(child);
         rmdir || f.get(child).is_none_or(|n| n.attr.nlink <= 1)
     };
-    // As the store's removals report: the file's link count, its deletion with its last link,
-    // then the directory's entry
+    // As the store's removals report: mark open descriptions unlinked, then report the file's
+    // link count, its deletion with its last link, and the directory's entry
     let k = cx.kr();
     let (key, dkey) = (fuse::key(child), fuse::key(dir));
+    inotify::unlinked(k, key, dkey, name);
     if rmdir {
         inotify::deleted(k, key, dkey, name);
         inotify::dir_event(k, dkey, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
@@ -469,59 +489,59 @@ pub(super) fn setattr(
 
 /// Takes the position of open file `file` for a read or write without an offset, as
 /// [`super::fs`]'s unlocked I/O does (Linux's `f_pos_lock`): waits while another one is in
-/// progress.
-fn take_pos(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Result<u64, Errno> {
+/// progress, unless `held` says the caller already holds it.
+fn take_pos(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    offset: Option<u64>,
+    held: bool,
+) -> Result<u64, Errno> {
     if let Some(off) = offset {
         return Ok(off);
     }
-    while file.borrow().pos_busy != 0 {
-        if cx.task.killed.get() {
-            return Err(Errno::EINTR);
-        }
-        file.borrow_mut().pos_busy = 2;
-        cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
+    if !held {
+        super::fs::take_pos(cx, file)?;
     }
-    let mut f = file.borrow_mut();
-    f.pos_busy = 1;
-    Ok(f.pos)
+    Ok(file.borrow().pos)
 }
 
 /// Gives the position back after [`take_pos`], advanced past what was transferred.
-fn put_pos(file: &FileRef, offset: Option<u64>, start: u64, r: &Result<usize, Errno>) {
+fn put_pos(file: &FileRef, offset: Option<u64>, held: bool, start: u64, r: &Result<usize, Errno>) {
     if offset.is_some() {
         return;
     }
-    let mut f = file.borrow_mut();
     if let Ok(n) = r {
-        f.pos = start + *n as u64;
+        file.borrow_mut().pos = start + *n as u64;
     }
-    if std::mem::take(&mut f.pos_busy) == 2 {
-        crate::kernel::request_wake_locks();
+    if !held {
+        super::fs::release_pos(file);
     }
 }
 
 /// read(2) and its relatives on an open FUSE file: `FUSE_READ` from the position (0 for a
-/// stream).
+/// stream). `pos_held` is true when the caller already holds `file`'s `pos_busy`.
 pub(super) fn read(
     cx: &mut Cx<'_>,
     file: &FileRef,
     io: &Io,
     buf: &mut [u8],
     offset: Option<u64>,
+    pos_held: bool,
 ) -> Result<usize, Errno> {
     let offset = if io.stream { Some(0) } else { offset };
-    let start = take_pos(cx, file, offset)?;
+    let start = take_pos(cx, file, offset, pos_held)?;
     let r = fuse::read(cx, io.handle(), start, buf.len()).map(|data| {
         buf[..data.len()].copy_from_slice(&data);
         data.len()
     });
-    put_pos(file, offset, start, &r);
+    put_pos(file, offset, pos_held, start, &r);
     r
 }
 
 /// write(2) and its relatives on an open FUSE file: `FUSE_WRITE` at the position, or with
 /// `O_APPEND` at the size the daemon reports first (6.1's `fuse_cache_write_iter` refreshes it
-/// the same way). The node's attributes go stale.
+/// the same way). The node's attributes go stale. `pos_held` is true when the caller already
+/// holds `file`'s `pos_busy`.
 pub(super) fn write(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -529,16 +549,17 @@ pub(super) fn write(
     data: &[u8],
     offset: Option<u64>,
     append: bool,
+    pos_held: bool,
 ) -> Result<usize, Errno> {
     // As fcntl may have changed it since the open, or a per-request flag (RWF_APPEND) asked for it
     let append = append || file.borrow().flags & oflags::O_APPEND != 0;
     let offset = if io.stream { Some(0) } else { offset };
-    let start = take_pos(cx, file, offset)?;
+    let start = take_pos(cx, file, offset, pos_held)?;
     let vfs = cx.vfs()?;
     // Appends to one node go one at a time from asking for the size to writing there
     let appending = append
         && take_append(cx, &vfs, io.id).inspect_err(|e| {
-            put_pos(file, offset, start, &Err(*e));
+            put_pos(file, offset, pos_held, start, &Err(*e));
         })?;
     let r = (|| {
         let at = if append {
@@ -560,11 +581,11 @@ pub(super) fn write(
     }
     match r {
         Ok((n, at)) => {
-            put_pos(file, offset, at, &Ok(n));
+            put_pos(file, offset, pos_held, at, &Ok(n));
             Ok(n)
         }
         Err(e) => {
-            put_pos(file, offset, start, &Err(e));
+            put_pos(file, offset, pos_held, start, &Err(e));
             Err(e)
         }
     }
@@ -591,7 +612,8 @@ fn take_append(cx: &mut Cx<'_>, vfs: &Vfs, id: FuseId) -> Result<bool, Errno> {
 
 /// lseek on an open FUSE file (6.1's `fuse_file_llseek`): `SEEK_END` from the size the daemon
 /// reports, `SEEK_DATA` and `SEEK_HOLE` through `FUSE_LSEEK` (a daemon without it has data up to
-/// the end); a file opened nonseekable is ESPIPE.
+/// the end); a file opened nonseekable is ESPIPE. Holds `pos_busy` so concurrent FUSE I/O cannot
+/// overwrite the sought position.
 pub(super) fn lseek(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -603,16 +625,18 @@ pub(super) fn lseek(
     const SEEK_END: u32 = 2;
     const SEEK_DATA: u32 = 3;
     const SEEK_HOLE: u32 = 4;
-    let (io, seekable, pos) = {
+    let (io, seekable) = {
         let f = file.borrow();
         let FileKind::Fuse(h) = &f.kind else {
             return Err(Errno::EBADF);
         };
-        (Io::of(h), seekable(h), f.pos)
+        (Io::of(h), seekable(h))
     };
     if !seekable {
         return Err(Errno::ESPIPE);
     }
+    let _pos = super::fs::PosGuard::lock(cx, file)?;
+    let pos = file.borrow().pos;
     let vfs = cx.vfs()?;
     let new = match whence {
         SEEK_SET => offset,
@@ -1286,11 +1310,23 @@ pub(super) fn rename_at(
             f.moved(d, from, old);
         }
     }
-    // fsnotify_move: the pair of moves with one cookie, then the moved file's own event; a
-    // replaced file is deleted, an exchanged one moves too
+    // fsnotify_move: mark any replaced target unlinked, move open files to their new names, then
+    // emit the pair of moves with one cookie, the replaced file's events and the moved file's own
+    // event
     let k = cx.kr();
     let isdir = |dir: bool| if dir { inotify::IN_ISDIR } else { 0 };
     let (fk, tk) = (fuse::key(from), fuse::key(to));
+    if flags & RENAME_EXCHANGE == 0
+        && let Some((d, _, _)) = dst_seen
+    {
+        inotify::unlinked(k, fuse::key(d), tk, new);
+    }
+    inotify::renamed(k, (fk, old), (tk, new), || Some(fuse::key(src)));
+    if flags & RENAME_EXCHANGE != 0
+        && let Some((d, _, _)) = dst_seen
+    {
+        inotify::renamed(k, (tk, new), (fk, old), || Some(fuse::key(d)));
+    }
     let cookie = inotify::cookie(k);
     inotify::dir_event(k, fk, old, inotify::IN_MOVED_FROM | isdir(src_dir), cookie);
     inotify::dir_event(k, tk, new, inotify::IN_MOVED_TO | isdir(src_dir), cookie);

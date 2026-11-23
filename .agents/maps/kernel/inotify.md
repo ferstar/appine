@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint inotify sysctl references to kernel/sysctl)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: align IN_EXCL_UNLINK with dentry unlinking across store/overlay/FUSE, fix full-queue overflow precedence, clean up doomed entries, and fix O_RDONLY|O_TRUNC and no-op chown events)
 
 ## Responsibilities
 
@@ -39,11 +39,12 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
   weak reference to the `Registry`, from which closing it removes its watches.
 - `Event` — descriptor, mask, cookie and name (padded to 16 bytes).
 - `Registry` (`Kernel::inotify`, one per kernel) — the (instance, descriptor) pairs on each key,
-  the last rename cookie, the `Vfs` (for `IN_EXCL_UNLINK`'s link checks), instance and watch
-  counts per user, the three limits under `/proc/sys/fs/inotify/`, and the removed inodes whose
-  `IN_DELETE_SELF` waits for files still open through the removed name.
-- `Opened` (on `OpenFile`) — the file's key, the directory key and name it was opened through, and
-  the close mask; its drop reports `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` (Linux's fput).
+  the last rename cookie, instance and watch counts per user, the three limits under
+  `/proc/sys/fs/inotify/`, and the removed inodes whose `IN_DELETE_SELF` waits for files still open
+  through the removed name (cleaned up when all watches on the key disappear).
+- `Opened` (on `OpenFile`) — the file's key, the directory key and name it was opened through, the
+  close mask, and `unlinked` (whether its dentry was unlinked or reopened from an unlinked fd, for
+  `IN_EXCL_UNLINK`); its drop reports `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` (Linux's fput).
 - Keys: store inode numbers stay below 2^62; overlay nodes take top bits 10 (`overlay::key`, also
   the lock tables' key), FUSE nodes 11 (`fuse::key`), cgroup2 files and directories 01
   (`cgroup::key`).
@@ -52,8 +53,9 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
 
 - Syscalls `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`; `read` through
   `kernel/fileio`'s `IoPath::Inotify`; `FIONREAD` in `kernel/files`' ioctl dispatch.
-- Hooks for the file syscalls: `active` (whether any watch exists), `path_event`, `file_event`,
-  `dir_event`, `cookie`, `opened`, `renamed`, `deleted`, `watched_at`, `key_of`.
+- Hooks for the file syscalls: `active` (whether any watch exists), `path_event`,
+  `path_event_unlinked`, `file_event`, `file_io_event`, `dir_event`, `cookie`, `opened`,
+  `unlinked`, `renamed`, `deleted`, `watched_at`, `key_of`.
 - `host_change` (the Files app's changes, from the machine's `store_changed`), `kernfs_modified`
   (cgroup2 file changes).
 - `Registry::watched` (the overlay sweep and FUSE's `in_use`), `Registry::watches` (cgroup observation);
@@ -78,35 +80,44 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
 ### Reporting
 
 - With no watches every hook costs one emptiness check. An event goes first to the parent
-  directory's watches with the name (not for `*_SELF`), then to the inode's own. Identical
-  consecutive events merge; a full queue drops events and queues one `IN_Q_OVERFLOW`.
-  `IN_IGNORED` follows removal, `IN_DELETE_SELF` and a matching `IN_ONESHOT`. Directory events
-  carry `IN_ISDIR`, `IN_DELETE_SELF` and `IN_MOVE_SELF` never do.
-- Hooks follow the fsnotify call sites: open (`IN_CREATE`, or `IN_MODIFY` for a truncating open
-  for writing, then `IN_OPEN`), mkdir, mknod, symlink and AF_UNIX bind, link (`IN_ATTRIB` on the
-  source, then `IN_CREATE`), unlink (`IN_ATTRIB`, delete-self, `IN_DELETE`), rmdir (delete-self,
-  `IN_DELETE`), rename (a cookie pair, then as `fsnotify_move`: a replaced object's `IN_ATTRIB`,
-  with `IN_ISDIR` for a directory, the moved one's `IN_MOVE_SELF`, the replaced one's
-  delete-self; exchange reported both ways), attribute changes (`IN_ATTRIB`, also for utimensat
-  changing both times; `IN_ACCESS` or `IN_MODIFY` when only the access or the modification time
-  changes, as `fsnotify_change`), writes, truncation and fallocate (`IN_MODIFY`), reads and
-  getdents (`IN_ACCESS`), the last close of an open file (`IN_CLOSE_*`).
+  directory's watches with the name (not for `*_SELF`), then to the inode's own. A full queue
+  drops events and queues one `IN_Q_OVERFLOW` before checking duplicate tail merges; otherwise
+  identical consecutive events merge. `IN_IGNORED` follows removal, `IN_DELETE_SELF` and a matching
+  `IN_ONESHOT`. Directory events carry `IN_ISDIR`, `IN_DELETE_SELF` and `IN_MOVE_SELF` never do.
+- Hooks follow the fsnotify call sites: open (`IN_CREATE`, or `IN_MODIFY` for any truncating open
+  including `O_RDONLY|O_TRUNC`, then `IN_OPEN`), mkdir, mknod, symlink and AF_UNIX bind, link
+  (`IN_ATTRIB` on the source, then `IN_CREATE`), unlink (`IN_ATTRIB`, delete-self, `IN_DELETE`),
+  rmdir (delete-self, `IN_DELETE`), rename (a cookie pair, then as `fsnotify_move`: a replaced
+  object's `IN_ATTRIB`, with `IN_ISDIR` for a directory, the moved one's `IN_MOVE_SELF`, the
+  replaced one's delete-self; exchange reported both ways), attribute changes (`IN_ATTRIB`,
+  skipped for a no-op `chown(-1, -1)` that clears nothing; also for utimensat changing both times,
+  `IN_ACCESS` or `IN_MODIFY` when only access or modification time changes, as `fsnotify_change`),
+  writes, truncation and fallocate (`IN_MODIFY`), reads and getdents (`IN_ACCESS`), the last close
+  of an open file (`IN_CLOSE_*`).
+- `IN_EXCL_UNLINK` filters path-based open/access/modify/close events (`path_event_unlinked`,
+  `file_io_event`, `Opened::drop`) on both directory and file watches when `Opened::unlinked` is
+  set (marked by `unlinked` on unlink, rmdir, overwriting rename, or host removal across store,
+  overlay and FUSE, or when reopened from an unlinked fd); metadata and truncation calls
+  (`file_event`: fchmod, fchown, futimens, ftruncate, fsetxattr/fremovexattr) are not filtered.
+  cgroup2 nodes are never excluded.
 - Path-based operations resolve the path a second time to find the directory, only when watches
-  exist (`watched_at`). fd-based events (I/O, truncation, close) go to the directory and name the
-  open went through, recorded in `Opened` (the dentry a Linux open file references): every
-  non-`O_PATH` open of a regular file, device or directory (store, overlay, FUSE, cgroup2
-  directories) or FUSE file records one, whether or not watches exist; store FIFOs and cgroup2
-  files get none, so they report `IN_OPEN` and never `IN_CLOSE_*`. Renames update the records of
-  open files, scanning all open files even with no watches; after a deletion the records stay, so
-  events still go to the original directory.
-- `IN_DELETE_SELF` waits until the last open file of the removed name closes (`deleted`).
+  exist (`watched_at`, falling back to a FUSE node's recorded parent/name if cached attrs staled).
+  fd-based events (I/O, truncation, close) go to the directory and name the open went through,
+  recorded in `Opened` (the dentry a Linux open file references): every non-`O_PATH` open of a
+  regular file, device or directory (store, overlay, FUSE, cgroup2 directories) or FUSE file
+  records one, whether or not watches exist; store FIFOs and cgroup2 files get none, so they
+  report `IN_OPEN` and never `IN_CLOSE_*`. Unlinks and renames update the records of open files,
+  scanning all open files even with no watches; after a deletion the records stay (marked
+  unlinked), so non-excluded events still go to the original directory.
+- `IN_DELETE_SELF` waits until the last open file of the removed name closes (`deleted`); removing
+  the last watch on a key (`inotify_rm_watch`, instance drop, or one-shot/`IN_DELETE_SELF`
+  delivery) removes any pending `doomed` entry.
 - Through an overlay the hooks report to the overlay's nodes, as Linux's VFS reports on overlay
   inodes and dentries: the node and its overlay directory with its name (an open file's events
   through the node it was opened through, whose upper inode copying up changes; path-based
   attribute changes and truncation find the node by resolving the path again), not the layers'
   inodes behind them, so changes made in a layer directly do not reach them. Removal deletes the
-  node when it was a directory or had one link; `IN_EXCL_UNLINK` takes a node its directory no
-  longer has as unlinked (`Overlays::linked`). Creations through an overlay (open with `O_CREAT`,
+  node when it was a directory or had one link. Creations through an overlay (open with `O_CREAT`,
   mkdir, mknod, symlink, link, AF_UNIX bind) also report `IN_CREATE` to the upper directory first,
   where Linux's overlay makes them through the VFS.
 - Files app changes (`host_change`, under the target kernel's BKL) map `Created`, `Removed`,
@@ -133,9 +144,8 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
 
 ### Outbound
 
-- `kernel/vfs`: `Node`, path resolution (`read_path`, `watched_at`'s second walk), overlay keys
-  and `Overlays::linked`, the store's link counts for `IN_EXCL_UNLINK`; `kernel/files`: `OpenFile`;
-  `kernel/fileio`: `host_unshared`.
+- `kernel/vfs`: `Node`, path resolution (`read_path`, `watched_at`'s second walk), overlay and
+  FUSE keys; `kernel/files`: `OpenFile`; `kernel/fileio`: `host_unshared`.
 - `kernel/store`: the `Change` records of the browse API.
 - Credentials: `MAY_READ` permission on the watched node.
 - The kernel's wake objects (`request_wake_object`).
@@ -156,22 +166,10 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
 
 ## Confirmed bugs / technical debt
 
-- **Small leaks and ordering:** a delayed delete-self entry is never removed if every watch
-  disappears before the last close; an event identical to the last one is merged even when the
-  queue is full, where Linux queues `IN_Q_OVERFLOW`.
 - **Identity and event gaps:** a watch is identified by its node, mount included, so one inode
   watched through two bind mounts gives two descriptors and each event twice (Linux keeps one mark
-  per inode per instance); `IN_EXCL_UNLINK` on a FUSE directory drops every child event (the
-  unlinked check asks the store about a FUSE key); fdinfo shows device 8:1 for every store-node
-  watch, tmpfs files included; an `O_RDONLY|O_TRUNC` open truncates without `IN_MODIFY`;
-  `chown(-1, -1)` that clears nothing still reports `IN_ATTRIB`; store FIFOs and cgroup2 files
-  report `IN_OPEN` but never `IN_CLOSE_*`.
-- **`IN_EXCL_UNLINK` filters the wrong events:** only directory watches honour it, keyed on the
-  child's link count, so a file's own watch keeps reporting writes and closes after an unlink, a
-  directory watch keeps reporting I/O through an unlinked name while another link remains, and a
-  directory watch loses `IN_ATTRIB`/`IN_MODIFY` from fchmod, futimes and ftruncate of an unlinked
-  child. Linux excludes exactly the open, access, modify and close events of an unlinked name, on
-  both watches.
+  per inode per instance); fdinfo shows device 8:1 for every store-node watch, tmpfs files
+  included; store FIFOs and cgroup2 files report `IN_OPEN` but never `IN_CLOSE_*`.
 - **Executing a file reports nothing:** execve opens and reads the program (and a script's
   interpreter) without `IN_OPEN`, `IN_ACCESS` or `IN_CLOSE_NOWRITE`.
 - **Overlay layers see little:** watches on a layer's own directories and files see, of what is
