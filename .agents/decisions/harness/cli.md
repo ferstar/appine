@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness/cli"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00)
+> Last distilled: 2026-11-23 (HEAD = cc72b093)
 >
 > Decisions on harness/cli made before it was split from harness keep their `harness` tags and live in `.agents/decisions/harness.md`: D5, D6, D9, D11, D15, D20, D21, D25, D28, D32, D35 and the guest-test portions of D36, D40 and D41.
 
@@ -23,6 +23,14 @@
 - **Tradeoffs**: Interactive shells may load `libandroid.so` without querying DNS, and fast failures or very short shells wait for an in-flight `dlopen` before exiting.
 - **Watch out**: Unrecognized shell launch forms fall back to on-demand loading, and an unexpected hang inside Android's `dlopen` would delay CLI exit.
 - **Source**: 86d7523c, 73394ffd
+
+### D3: `appine-run --stats` reports compiled strip-mined fast loops
+
+- **What**: `print_stats` in `hosts/cli/src/main.rs` prints the `fast loops` counter from `DbtStats::fast_loops`.
+- **Why**: Profiling and benchmarking runs need visibility into how many strip-mined fast loops Tier 1 compiled.
+- **Tradeoffs**: Adds one line to `--stats` stderr output.
+- **Watch out**: Scripts that strictly check `--stats` line counts will see one additional line.
+- **Source**: 49585f4e
 
 ## Superseded
 

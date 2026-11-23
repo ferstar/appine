@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D17 were seeded by hand from the retired design
+> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D17 were seeded by hand from the retired design
 > doc §5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -215,6 +215,22 @@
 - **Tradeoffs**: Adds one `fstat` at one-time snapshot creation and holds one `FileMaps` slot per distinct mapped slice until memory trim.
 - **Watch out**: Relies on the global `OnceLock<Arc<BundledLibc>>` keeping the snapshot memfd open so its `(st_dev, st_ino)` cannot be reused.
 - **Source**: c8f01dbf
+
+### D48: `Mm::find_free` prefers 2 MiB alignment for large mappings with page-aligned fallback
+
+- **What**: When `len >= LEAF_SPAN` (2 MiB), `Mm::find_free` searches top-down for a 2 MiB-aligned gap first and falls back to `PAGE_SIZE` alignment if none fits.
+- **Why**: Page-only top-down placement shifted large buffers like ggml's `work_data` off 2 MiB boundaries, forcing L3 leaf tables and preventing `stlb` superpage hits.
+- **Tradeoffs**: Can leave up to 2 MiB of virtual address space unused above aligned large mappings without consuming extra physical memory.
+- **Watch out**: Preserve the explicit fallback to `PAGE_SIZE` alignment so fragmented or tightly constrained address spaces still succeed.
+- **Source**: 42d49fc0
+
+### D49: Non-destructive `madvise` hints forward unlocked with retained host regions and prefill file PTEs
+
+- **What**: `madvise` collects coalesced host-page-aligned `AdviseRange` slices holding `Arc<HostRegion>` (skipping reserved, foreign, GPU, FUSE `Fill` and untouched anonymous VMAs, clipping to `file_len`, and restricting `MADV_NORMAL`/`RANDOM`/`SEQUENTIAL` to file-backed host mappings), prefills read-only non-FUSE file soft PTEs up to 4 GiB per call, and forwards hints via `appine_hal::advise` inside `Cx::unlocked` (mapping `MADV_POPULATE_READ` to host `MADV_WILLNEED`).
+- **Why**: Ignoring `MADV_WILLNEED`, `MADV_SEQUENTIAL`, `MADV_RANDOM` and `MADV_POPULATE_READ` blocked host page-cache readahead on large model files and left soft page tables empty until per-fault BKL entries.
+- **Tradeoffs**: `MADV_POPULATE_READ` stays advisory without synchronously faulting host pages or returning `EFAULT` on inaccessible mappings, and anonymous VMAs do not receive host `MADV_SEQUENTIAL`/`MADV_RANDOM` flags so recycled regions are not split.
+- **Watch out**: If another thread unmaps the last VMA while `AdviseRange` is held across `Cx::unlocked`, `HostRegion::drop` runs outside the BKL, so any future `HostRegion` kind requiring BKL-only drop must be excluded or handled.
+- **Source**: d0945a96
 
 ## Superseded
 

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -191,6 +191,14 @@
 - **Tradeoffs**: Only builds that count borrows benefit.
 - **Watch out**: The measured saving depends on compiler code generation.
 - **Source**: b65799c8
+
+### D59: Thread-exit DBT stat aggregation sums `DbtStats::fast_loops`
+
+- **What**: `add_stats` in `core/kernel/src/task.rs` sums `DbtStats::fast_loops` alongside the other Tier 1 counters when a thread exits.
+- **Why**: Process-wide Tier 1 statistics must include strip-mined fast loops compiled on exiting threads.
+- **Tradeoffs**: None beyond one addition per exiting thread.
+- **Watch out**: Keep `add_stats` updated whenever new fields are added to `DbtStats`.
+- **Source**: 49585f4e
 
 ## Superseded
 
