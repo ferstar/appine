@@ -213,7 +213,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ### Inbound
 
-- `kernel/vfs` and `kernel/files` (every permission and ownership check, file-cap removal),
+- `kernel/vfs`, `kernel/files` and `kernel/fileio` (permission/ownership checks and file-cap removal),
   `kernel/xattr` (xattr capability rules), `kernel/process` (fork/clone copies, setpriority/ioprio
   `PRIO_USER`, `RLIMIT_NPROC`), `kernel/exec` (execve), `kernel/ns` (namespaces), `kernel/signal`
   (kill), `kernel/ptrace` (ptrace access), `kernel/procfs` (status lines, ownership), `kernel/sysctl`

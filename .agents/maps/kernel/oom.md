@@ -175,7 +175,7 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 - `kernel/procfs`: status, statm, stat, smaps, pagemap and `oom_score`.
 - `kernel/cgroup`: the cgroup files (`measure`, `limit`, peak, `app_memory`, `Events`,
   `out_of_memory` for a lowered `memory.max`).
-- `kernel/files`: the write path's `recheck` after writing cgroup `memory.max`.
+- `kernel/fileio`: the write path's `recheck` after writing cgroup `memory.max`.
 - rusage and exit (`peak_resident_pages`), `Machine` (the memory limit at start), the
   process_mrelease syscall.
 

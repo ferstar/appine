@@ -28,7 +28,7 @@ Root: `core/kernel/src/vfs/fuse.rs` (connection, device, cache, retries, request
 `core/kernel/src/syscall/fuse.rs` (the file syscalls on FUSE nodes).
 
 Outside the module: the walker, mount table, fd tables and the dispatch of every file syscall
-(`kernel/vfs` and `kernel/files`, which hand FUSE nodes and files to this module), the syscall
+(`kernel/vfs`, `kernel/files` and `kernel/fileio`, which hand FUSE nodes and files to this module), the syscall
 dispatcher's retry loop (`kernel/process`), execve (`kernel/exec`), poll and epoll (`kernel/poll`),
 the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
@@ -338,8 +338,8 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - `kernel/mount`: mount(2) (`fuse_mount`) and collection.
 - `kernel/vfs`: the walk (`fuse_child`, `fuse_permission`, kind, readlink, parents) and the FUSE
   branches of getdents, stat, statfs, access, chdir and the attribute and namespace syscalls.
-- `kernel/files`: opening `/dev/fuse` and the FUSE branches of open, the I/O routes, readv/writev,
-  lseek, the close paths, fsync and copy_file_range; `kernel/pipe` and `kernel/xattr`: those of
+- `kernel/files`: opening `/dev/fuse`, the FUSE branches of open and the close paths;
+  `kernel/fileio`: the I/O routes, readv/writev, lseek, fsync and copy_file_range; `kernel/pipe` and `kernel/xattr`: those of
   splice and the xattr calls.
 - `kernel/process`: the dispatcher's retry loop (`new_syscall`, `serve`), thread exit
   (`flush_at_exit`).
@@ -353,8 +353,8 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - `kernel/process`: the wait API (`wait_object`, wake objects), `interrupted`, `killed`,
   `stopping`.
 - `kernel/mount`: the mount table (`readonly`, `mount_flags`, `is_point_in`, `dev_of`).
-- `kernel/vfs`: `resolve_parent`, `encode_stat`; `kernel/files`: `open_mask`, `executing`,
-  `check_fsize`.
+- `kernel/vfs`: `resolve_parent`, `encode_stat`; `kernel/files`: `open_mask`, `executing`;
+  `kernel/fileio`: `check_fsize`.
 - `kernel/inotify`: the hooks for FUSE namespace changes.
 - `kernel/cred`: `Cred`, user namespace ID maps, `permission`, `owns`, `may_delete`,
   `capable_wrt`.

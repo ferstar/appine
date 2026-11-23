@@ -1,7 +1,7 @@
 # kernel/vfs Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/kernel/vfs.md` for the paired decision history (it still holds the decisions on mounts, inotify, AIO, loop devices, timerfd, overlayfs, locks, pipes, xattrs and open files made before they were split out; the last are listed in `kernel/files`'s map).
+> See `.agents/decisions/kernel/vfs.md` for the paired decision history (it still holds the decisions on mounts, inotify, AIO, loop devices, timerfd, overlayfs, locks, pipes, xattrs, open files and file I/O made before they were split out; the last two are listed in `kernel/files`'s and `kernel/fileio`'s maps).
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
@@ -23,13 +23,13 @@ store and the synthetic filesystems):
 - calling the inotify hooks where Linux's fsnotify does.
 
 Root: `core/kernel/src/vfs/mod.rs` (except the mount table and the overlay methods), `vfs/dev.rs`,
-`syscall/fs.rs` (except `kernel/files`' parts, its overlay functions, `flock`, the fcntl lock
+`syscall/fs.rs` (except `kernel/files`' and `kernel/fileio`'s parts, its overlay functions, `flock`, the fcntl lock
 commands and the pipe, FIFO and splice code: what remains is `getdents64`, the sections Metadata,
 stat, Changing the namespace, chmod, chown and utimensat, Paths and tmpfs accounting, and the other
 shared helpers), and in `syscall/mount.rs` the tmpfs options.
 
-Outside the module: fd tables, open files, opening (devices by number included), data I/O, clones
-and unsharing, truncation, lseek, cache hints and syncing (`kernel/files`); the mount table, mount
+Outside the module: fd tables, open files and opening including devices by number (`kernel/files`);
+data I/O, clones and unsharing, truncation, lseek, cache hints and syncing (`kernel/fileio`); the mount table, mount
 syscalls and mount namespaces (`kernel/mount`); overlayfs mounts, lookups, copy-up and its removal
 and rename (`kernel/overlay`, branched to from here); advisory locks and leases (`kernel/locks`);
 pipes, FIFOs and splice (`kernel/pipe`); extended attributes (`kernel/xattr`); store semantics
@@ -79,8 +79,8 @@ capabilities (`kernel/cred`).
   `chroot`.
 - **Devices**: `dev::ensure_dev_nodes` (store `/dev`, at import and every boot), `dev::populate`
   (boot `/dev` tmpfs), `Device::from_rdev`.
-- **Kernel-internal**: `dev_ino` (epoll's fdinfo); for `kernel/files`, `may_create`,
-  `display_path`, `file_stat` and the tmpfs hooks.
+- **Kernel-internal**: `dev_ino` (epoll's fdinfo); for `kernel/files` and `kernel/fileio`,
+  `may_create`, `display_path`, `file_stat` and the tmpfs hooks.
 
 ## Data flow / lifecycle
 
@@ -244,7 +244,7 @@ capabilities (`kernel/cred`).
   the file's group without `CAP_FSETID` (6.2's `setattr_should_drop_sgid`), and file caps; when a
   set-id bit would go the caller must be the owner or have `CAP_FOWNER` (`EPERM`, bits kept), so
   `chown(-1, -1)` by another user fails on `su` but succeeds on a file with only caps (which lose
-  them, as on Linux). Writes and truncation clear set-id bits through `kernel/files`'
+  them, as on Linux). Writes and truncation clear set-id bits through `kernel/fileio`'s
   `remove_privs`.
 - utimensat: explicit times need the owner or `CAP_FOWNER`; `UTIME_NOW`/`UTIME_OMIT` only (one of
   each included) also accept write permission; the both-`UTIME_OMIT` shortcut runs after
@@ -275,7 +275,7 @@ capabilities (`kernel/cred`).
   lseek lands on 0; `d_off` is index+1. `O_PATH` `EBADF`, a non-directory `ENOTDIR`, a removed
   store directory `ENOENT`; while entries remain, a count above `INT_MAX` or a buffer too small for
   the next entry `EINVAL`; an unwritable buffer returns the whole entries before it (`EFAULT` when
-  none). Seeking a directory is `kernel/files`' lseek.
+  none). Seeking a directory is `kernel/fileio`'s lseek.
 - chdir/fchdir/chroot check search on store, overlay, FUSE and cgroup directories; chroot then
   needs `CAP_SYS_CHROOT` in the caller's user namespace. umask lives in the fs context.
 - `protected_symlinks` and `protected_hardlinks` exist (default 1); `protected_regular` and
@@ -292,15 +292,16 @@ capabilities (`kernel/cred`).
   `urandom`, `tty`, `ptmx`, `fuse` 0666, `kmsg` 0644, `console` 0600, `loop-control` and
   `loop0`–`loop7` 0660 group `disk` (gid 6), the `fd`/`stdin`/`stdout`/`stderr` links into
   `/proc/self/fd`, and `pts` (0755), `shm` (1777) and `mqueue` (0755).
-- Opening devices by number and their reads, writes and ioctls are `kernel/files`'.
+- Opening devices by number and their ioctls are `kernel/files`'; their reads and writes are
+  `kernel/fileio`'s.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
 - The syscall dispatcher.
-- `kernel/files`: resolution and creation (`start_dir`, `lookup_at`, `may_create`), mount-flag
-  checks, the tmpfs hooks, `released`, `display_path`, `Device` and `file_stat`.
+- `kernel/files` and `kernel/fileio`: resolution and creation (`start_dir`, `lookup_at`,
+  `may_create`), mount-flag checks, the tmpfs hooks, `released`, `display_path`, `Device` and `file_stat`.
 - `kernel/process`: fs contexts at clone, the fast-path `Cached` resolver; `kernel/ns`: fs-context
   copies at unshare; `kernel/exec`: mount-flag checks.
 - `kernel/mount`: walks; new tmpfs and FUSE instances and tmpfs reconfiguration.
@@ -318,8 +319,8 @@ capabilities (`kernel/cred`).
   or root in a detached mount goes.
 - `kernel/store`: lookups, snapshots, namespace changes, detached directories, `fs_stats`, the
   metadata cache reader.
-- `kernel/files`: open files and fd tables behind fd-based calls and dirfds, and `opens_of` before
-  an unlinked file's object is released; `kernel/mm`'s `maps_file` for the same check.
+- `kernel/files`: open files and fd tables behind fd-based calls and dirfds; `kernel/fileio`:
+  `opens_of` before an unlinked file's object is released; `kernel/mm`'s `maps_file` for the same check.
 - `kernel/inotify` (the hooks, `renamed`, `deleted`), `kernel/overlay` (overlay nodes in every file
   operation; the sweep at syscall end), and `kernel/fuse` (everything on FUSE nodes).
 - `kernel/procfs` (the `Pseudo` views, `pseudo::stat`, writability), `kernel/tty` (devpts),
@@ -352,7 +353,7 @@ capabilities (`kernel/cred`).
   moves open files scans them all, even with no watches.
 - A path that changes a store regular file or creates or removes a name must call the tmpfs hooks
   (`tmpfs_size`/`tmpfs_resized`, `tmpfs_reserve`/`tmpfs_created`, `tmpfs_victim`/`tmpfs_removed`),
-  or usage drifts until the next full count; this binds `kernel/files`' writes and size changes
+  or usage drifts until the next full count; this binds `kernel/fileio`'s writes and size changes
   too.
 - Calls here that borrow an open file (fd-based metadata, dirfds) follow `kernel/files`' rule: no
   borrow of an open file is held across a BKL release or a wait.

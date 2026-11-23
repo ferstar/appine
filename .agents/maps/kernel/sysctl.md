@@ -23,8 +23,8 @@ Root: in `core/kernel/src/pseudo.rs`, the `sys/*` entries of `STATIC`, `RECORDED
 `pollable`, `unreadable`, `content` and `write`.
 
 Outside the module: the shared `Pseudo` / `View` / `FileKind::Proc` snapshot and regeneration
-machinery, per-process/system-wide procfs files and `/proc/sysvipc` (`kernel/procfs`); open/read/
-write dispatch (`kernel/files`); backing `netconf::SYSCTLS` and per-device conf storage
+machinery, per-process/system-wide procfs files and `/proc/sysvipc` (`kernel/procfs`); open
+dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `netconf::SYSCTLS` and per-device conf storage
 (`kernel/netns`); the subsystem limits and flags each sysctl mutates (`kernel/mm`, `kernel/mount`,
 `kernel/ns`, `kernel/ipc`, `kernel/inotify`, `kernel/aio`, `kernel/locks`, `kernel/pipe`,
 `kernel/process`, `kernel/signal`, `kernel/vfs`, `kernel/fuse`, `kernel/cgroup`).

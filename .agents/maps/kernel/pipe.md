@@ -21,8 +21,8 @@ Root: `core/kernel/src/pipe.rs`; in `syscall/fs.rs` `pipe2`, `open_fifo`, the pi
 commands, `pipe_read`, `pipe_write` and `broken_pipe`, and the splice block from `splice` to
 `wait_splice_done`.
 
-Outside the module: fd tables, open files and the read, write and vectored paths that reach pipes
-(`kernel/files`); the wait mechanism and wake objects (`kernel/process`); readiness and `EPOLLET`
+Outside the module: fd tables and open files (`kernel/files`); the read, write and vectored paths
+that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel/process`); readiness and `EPOLLET`
 (`kernel/poll`); `/dev/fuse` and AF_UNIX sockets as splice ends (`kernel/fuse`, `kernel/unix`); the
 `pipe-max-size` sysctl (`kernel/sysctl`).
 
@@ -88,20 +88,21 @@ Outside the module: fd tables, open files and the read, write and vectored paths
   opened read-write too), reads otherwise, and waits unless `SPLICE_F_NONBLOCK`, whatever the
   pipe's `O_NONBLOCK`. Room is the free space in whole pages, as Linux counts free page buffers.
 - vmsplice's write side reads guest memory directly; every other copy to or from a guest buffer
-  first grows a grows-down mapping below it (`kernel/files`).
+  first grows a grows-down mapping below it (`kernel/fileio`).
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/files`: opening FIFO nodes, the read, write and vectored paths, fcntl, ioctl, close;
-  sendfile asks `splice_reads`/`splice_writes` about its ends.
+- `kernel/files`: opening FIFO nodes, fcntl, ioctl, close; `kernel/fileio`: the read, write and
+  vectored paths, and sendfile asking `splice_reads`/`splice_writes` about its ends.
 - `kernel/poll` (pipe readiness, `EPOLLET` counters), `kernel/fuse` (`/dev/fuse` as a splice end),
   `kernel/unix` (stream sockets as splice inputs).
 
 ### Outbound
 
-- `kernel/files` (the read and write paths of the other end, file checks, `RLIMIT_FSIZE`),
+- `kernel/fileio` (the read and write paths of the other end, file checks, `RLIMIT_FSIZE`),
+  `kernel/files` (fd tables and `FileKind::Pipe`),
   `kernel/process` (waits and wake objects), `kernel/signal` (`SIGPIPE`), `kernel/sysctl`
   (`pipe-max-size`), `kernel/cred` (`CAP_SYS_RESOURCE`).
 

@@ -31,8 +31,8 @@ contracts remain here.
 
 Outside the module: `/proc/sys` sysctls (`kernel/sysctl`); `/sys` (`kernel/sysfs`); the `Pseudo`
 trait, the walker, mounts and mountinfo order and magic-link resolution (`kernel/vfs`);
-open/read/write dispatch for pseudo nodes (`kernel/files`, whose `open_pseudo` and `refresh_pseudo`
-behaviour this map describes as procfs sees it); maps and `/proc/<pid>/mem` semantics
+open dispatch (`kernel/files`, `open_pseudo`) and read/write/lseek dispatch (`kernel/fileio`,
+`refresh_pseudo`) for pseudo nodes (whose behaviour this map describes as procfs sees it); maps and `/proc/<pid>/mem` semantics
 (`kernel/mm`, `kernel/ptrace`); smaps, pagemap and the Rss figures (`kernel/oom`); id maps,
 `setgroups`, `timens_offsets`, `ns/*` and namespaces (`kernel/ns`); `children`, state letters and
 the kernel-entry record behind `syscall` (`kernel/process`); `/proc/kmsg`, `/proc/version` and ABI
@@ -306,7 +306,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 ### Inbound
 
-- `kernel/files` (pseudo open/read/write/lseek); `kernel/vfs` (walker and magic links, pseudo
+- `kernel/files` (pseudo open) and `kernel/fileio` (pseudo read/write/lseek); `kernel/vfs` (walker and magic links, pseudo
   stat/getdents, chmod/chown/utimensat on devpts nodes); `kernel/mount` (synthetic mounts, devpts
   options and `mount_events`); `kernel/ns` (unshare/setns, nsfs files); `kernel/poll` (epoll
   refusal and readiness); the machine (`Offline` before boot); `kernel/signal` (`mark_deleted` for

@@ -312,8 +312,8 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 ### Inbound
 
-- `kernel/files` (open by device number, `devpts_beside`, read/write/ioctl dispatch, devpts
-  `nodev`), poll/epoll (`readiness`, `arrivals`), `kernel/process` (fork copying the ctty, setsid,
+- `kernel/files` (open by device number, `devpts_beside`, ioctl dispatch, devpts `nodev`),
+  `kernel/fileio` (read/write dispatch), poll/epoll (`readiness`, `arrivals`), `kernel/process` (fork copying the ctty, setsid,
   exit releasing the ctty, spawn with `Stdio::Console`), `Bkl::drop` (`hang_up_closed`), the
   machine and JNI/CLI hosts (console API, bridge), the bug reporter (console of a killed process),
   procfs (stat of `/dev/pts/N`, `tty_nr`/`tpgid`).

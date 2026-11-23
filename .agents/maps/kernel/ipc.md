@@ -30,7 +30,7 @@ Outside the module: creating, entering and collecting IPC namespaces (`IpcNs`, a
 shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `detach_shm`,
 `shm_attachments`, `kernel/mm`); the mqueue filesystem's node views and `/proc/sysvipc` files
 (`kernel/procfs`), and IPC/mqueue sysctl plumbing (`kernel/sysctl`); mqueue mounts and the generic file syscalls that dispatch to queues
-(`kernel/vfs`, `kernel/files`); readiness and epoll of queue fds (`kernel/poll`); signal delivery
+(`kernel/vfs`, `kernel/files`, `kernel/fileio`); readiness and epoll of queue fds (`kernel/poll`); signal delivery
 (`kernel/signal`); the netlink sockets used by `SIGEV_THREAD` (`kernel/netlink`); credentials
 (`kernel/cred`).
 
@@ -230,7 +230,7 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 - `kernel/process`: group exit (`ipc::exit`).
 - `kernel/ns`: unshare and setns (`Ipc::exit`), namespace creation (`MqDir::new`, default
   `Tunables` and `Limits`).
-- `kernel/vfs` and `kernel/files`: open, create, unlink, read, lseek, fstat, fstatfs, chmod, chown
+- `kernel/vfs`, `kernel/files` and `kernel/fileio`: open, create, unlink, read, lseek, fstat, fstatfs, chmod, chown
   and utimensat on the mqueue filesystem (`new_queue`, `insert_queue`, `remove_queue`, `find`, the
   `MessageQueue` accessors).
 - `kernel/procfs`: `/proc/sysvipc/*` (`proc_listing`), mqueue node views (`find`, `MqDir`,

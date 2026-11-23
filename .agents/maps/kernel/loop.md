@@ -26,8 +26,8 @@ Appine has no disk filesystems.
 
 Root: `core/kernel/src/syscall/loopdev.rs`.
 
-Outside the module: device-number dispatch at open, nodev and the cgroup device filter, fd tables,
-the read/write paths of the backing file and the `IoPath` routing (`kernel/files`); the `Device`
+Outside the module: device-number dispatch at open, nodev and the cgroup device filter, fd tables
+(`kernel/files`), the read/write paths of the backing file and `IoPath` routing (`kernel/fileio`); the `Device`
 kinds and the boot `/dev` nodes (`kernel/vfs`); the `/sys/block` directory itself (`kernel/sysfs`);
 remount's writer check over backing files (`kernel/mount`); epoll's refusal of the device
 (`kernel/poll`).
@@ -43,11 +43,11 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
 
 ## Public entry points
 
-- From `kernel/files`: `open` (a block node of major 7), `read`, `write`, `seek`, `flush_target`
-  (fsync), `ioctl` (the loop and block requests), `control_ioctl` (`LOOP_CTL_*` on
-  `/dev/loop-control`).
+- From `kernel/files`: `open` (a block node of major 7), `ioctl` (the loop and block requests),
+  `control_ioctl` (`LOOP_CTL_*` on
+  `/dev/loop-control`). From `kernel/fileio`: `read`, `write`, `seek`, `flush_target` (fsync).
 - `Loops::numbers`, `sysfs_exists`, `sysfs_read` (`kernel/sysfs`'s `/sys/block` view);
-  `Loops::backing_files` (remount's writer check, `kernel/files`' `opens_of`).
+  `Loops::backing_files` (remount's writer check, `kernel/fileio`'s `opens_of`).
 
 ## Data flow / lifecycle
 
@@ -109,15 +109,16 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
 
 ### Inbound
 
-- `kernel/files`: open of block nodes, the read, write, lseek, fsync and ioctl dispatch
-  (`IoPath::Loop`, `kernel/vfs`'s `Device::Loop` and `Device::LoopControl`), `rehome` and
+- `kernel/files`: open of block nodes and ioctl dispatch (`kernel/vfs`'s `Device::Loop` and
+  `Device::LoopControl`); `kernel/fileio`: read, write, lseek and fsync dispatch (`IoPath::Loop`),
+  `rehome` and
   `opens_of` over backing files.
 - `kernel/sysfs`: `/sys/block/loop<N>/`.
 - `kernel/mount`: `backing_files` for the read-only remount's writer check.
 
 ### Outbound
 
-- `kernel/files`: the backing file's read and write paths, fd lookup; `kernel/vfs`: the `Device`
+- `kernel/files`: fd lookup; `kernel/fileio`: the backing file's read and write paths; `kernel/vfs`: the `Device`
   numbers and `/dev` node creation in the boot `/dev`, stat of the backing file.
 - Credentials: `CAP_SYS_ADMIN` checks.
 

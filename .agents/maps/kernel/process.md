@@ -5,63 +5,44 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint fork/copy-on-write and host-backing references to kernel/cow and kernel/hostmem)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: condense map in place)
 
 ## Responsibilities
 
-`kernel/process` runs guest threads and processes inside the app's single host process:
+`kernel/process` runs guest threads and processes inside the app's single host process: task/group
+lifecycle (`clone`/`clone3`, run loop, exit, reaping, `wait`, process groups/sessions, pidfds), the
+BKL and borrow checks, syscall dispatch hooks, the no-BKL fast path, unified wait/wake-up,
+host-facing `Machine` process stats/signals/waits, scheduling parameters on host threads, and the
+remaining process-wide calls in `syscall/misc.rs` (CPU accounting, rusage/rlimits, host/domain
+names, sysinfo, getcpu, getrandom).
 
-- guest tasks (threads) and thread groups (processes): creation (`clone`/`clone3`), the run loop,
-  exit, reaping and `wait`, process groups and sessions, pidfds;
-- the big kernel lock (BKL) that serialises the kernel layer, its borrow checks, the syscall
-  dispatcher's hooks and the no-BKL fast path;
-- the unified wait and wake-up mechanism;
-- the host-facing process statistics, signals and wait helpers on `Machine`;
-- scheduling parameters applied to host threads;
-- the other process-wide calls in `syscall/misc.rs` (CPU accounting, resource use and
-  limits, host and domain names, sysinfo, getcpu, getrandom).
+Root: `core/kernel/src/task.rs`, `process.rs`, `kernel.rs` (excluding `kernel/boot`'s `INIT`,
+`kernel/time`'s `stop_checks`/`resume_checks`, and `kernel/bug`'s `Hold`/`HoldSample`/`Entry`/
+`Doing`/`doing`/`done`), `cell.rs`, `syscall/proc.rs` (excluding execve/unshare), `syscall/fast.rs`
+(excluding futex), `machine.rs` (excluding `kernel/boot`'s lifecycle, `kernel/time`'s `timers`,
+`kernel/bug`'s `take_kills`/`stall`), `syscall/sched.rs`, `syscall/mod.rs` dispatcher (excluding
+`kernel/signal`'s restart/ENOSYS, `kernel/time`'s time helpers, `kernel/bug`'s `TEST_SYSCALL`), and
+`syscall/misc.rs`'s remaining process-wide calls (excluding `kernel/time`, `kernel/boot`,
+`kernel/signal`, `kernel/futex`, `kernel/ns`; membarrier/umask/cap-seccomp prctls live in
+`kernel/mmu`/`kernel/vfs`/`kernel/cred`).
 
-Root: `core/kernel/src/task.rs`, `process.rs`, `kernel.rs` (`Kernel`, `Shared`, `Bkl`, `Cx`,
-the `wake` module, except `kernel/boot`'s `INIT`, `kernel/time`'s
-`Shared::stop_checks`/`resume_checks`, and `kernel/bug`'s `Hold`/`HoldSample`/`Entry`/`Doing`/
-`doing`/`done`), `cell.rs`, `syscall/proc.rs` (except its execve and unshare sections),
-`syscall/fast.rs` (except the futex call), `machine.rs` except `kernel/boot`'s lifecycle types and
-functions, `kernel/time`'s `timers`, and `kernel/bug`'s `take_kills`/`stall`, `syscall/sched.rs`,
-and the dispatcher in `syscall/mod.rs` (except `kernel/signal`'s restart and unimplemented-syscall
-handling, `kernel/time`'s `read_timespec`, `timespec`, `KTIME_MAX`, and `kernel/bug`'s
-`TEST_SYSCALL` arm). In `syscall/misc.rs`, the remaining process-wide calls exclude
-`kernel/time`'s clocks, sleeps and interval timers, `kernel/boot`'s `reboot`, and what
-`kernel/signal`, `kernel/futex` and `kernel/ns` list there. Of the rest, membarrier is described
-in `kernel/mmu`, umask in `kernel/vfs`, and capability and seccomp prctls in `kernel/cred`.
-
-Outside the module: kernel bug containment, kill reports, test hooks and the BKL watchdog
-(`kernel/bug`); clocks, sleeps, timers and periodic checks (`kernel/time`); machine startup, host
-spawn, inittab, PID 1 power requests and teardown (`kernel/boot`); execve and the ELF loader
-(`kernel/exec`), namespaces, unshare, setns and ID translation (`kernel/ns`), futexes and robust
-lists (`kernel/futex`), address spaces (`kernel/mm`), fork copy-on-write (`kernel/cow`), host
-backing and deferred unmapping (`kernel/hostmem`), CPU state (`engine`)
-and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount trees
-(`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`kernel/cgroup`), procfs files
-(`kernel/procfs`), the OOM policy (`kernel/oom`).
+Outside the module: `kernel/bug`, `kernel/time`, `kernel/boot`, `kernel/exec`, `kernel/ns`,
+`kernel/futex`, `kernel/mm`, `kernel/cow`, `kernel/hostmem`, `engine`, `engine/dbt`, `kernel/signal`,
+`kernel/ptrace`, `kernel/cred`, `kernel/mount`, `kernel/netns`, `kernel/cgroup`, `kernel/procfs`
+and `kernel/oom`.
 
 ## Key types
 
 ### Tasks and processes
 
-- `Task` — one guest thread: tid (a `Cell`, since a non-leader's execve takes over the tgid), a
-  serial number never reused (as `ThreadGroup`'s), its own credentials (`kernel/cred`), `killed`,
-  `frozen`, `pdeathsig`, exit status and whether its exit started, `vfork` (its vfork completion is
-  still pending, for the OOM killer), `syscall` (the BKL syscall it is in: its number in the global
-  `SYSCALLS` count and the syscall number), CPU-time and context-switch bases and its host tid,
-  nice, scheduling policy, deadline, uclamp, timer slack, affinity, I/O priority, its wake `event`,
-  `sleeping`, `pid_ns_children`, `NsProxy`; `TaskRes` (a copy of its address space, fd table and fs
-  that other threads read, for procfs); thread-private `TaskState` (address space, fd table and
-  `FsContext`, each shared or not per clone flags; thread group; alternate stack; `clear_child_tid`;
-  vfork completion; restart block; `fast_sleep`).
-- `TaskSync` — lock-free `in_guest` flag and the engine `Kicker` (used by `kernel/mmu` shootdowns),
-  and `KernelEntry`: atomics holding the syscall number (-1 for any other exit), x0 to x5, sp and
-  pc the thread last entered the kernel with, valid until it runs guest code again; procfs reads
-  it for `/proc/<pid>/syscall`.
+- `Task` — per-thread state: `tid` (`Cell`, changed by non-leader execve), unique serial, creds,
+  `killed`/`frozen`/`pdeathsig`/exit status/`vfork`/`syscall` (`SYSCALLS` seq + nr), CPU/ctx-switch
+  bases + host tid, scheduling params (nice/policy/deadline/uclamp/timer-slack/affinity/ioprio),
+  wake `event`/`sleeping`, `pid_ns_children`/`NsProxy`, `TaskRes` (procfs snapshot of mm/fds/fs),
+  and thread-private `TaskState` (mm, fds, `FsContext`, group, altstack, `clear_child_tid`, vfork
+  completion, restart block, `fast_sleep`).
+- `TaskSync` — lock-free `in_guest` flag, engine `Kicker` (`kernel/mmu` shootdowns), and atomic
+  `KernelEntry` (last syscall nr or -1, x0–x5, sp, pc; read by `/proc/<pid>/syscall`).
 - `ThreadGroup` — one process: tgid, ppid, `parent_thread` (the creating thread, Linux
   `real_parent`), pgid, sid, live `threads` (leader first while alive), `children` (zombies
   included), `exiting` / `leader_status` / `zombie` / `leader_exit`, `exit_signal`, own and
@@ -77,13 +58,10 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
   `getrusage` (the calling thread) or the host's `/proc` (another thread), each kept monotonic.
 - `task::pool` — pooled host threads (at most 8 idle, kept 5 s; work handed out under the BKL
   starts after it is released).
-- `Kernel` — the global state behind the BKL: tasks, groups, waiters, pid allocator, namespaces,
-  init state, power requests, watched processes, kill reports (`kernel/bug`).
-- `Shared` — the BKL mutex, its holder record (`Hold`, `kernel/bug`) and spinner counter, the
-  latest stall (`kernel/bug`), the fast-path epoch, the futex lock and queue, the timer thread's
-  event, DNS answers waiting for it, the periodic checks' idle flag.
-- `Bkl` — the held-lock guard; its `Drop` performs release-time work.
-- `Cx` — the context of one syscall or signal delivery; holds the `Bkl` (absent while released).
+- `Kernel` — BKL-guarded global state (tasks, groups, waiters, pid allocator, namespaces, init,
+  power, watched processes, `kernel/bug` kill reports); `Shared` — BKL mutex, `Hold`/spinner/stall
+  (`kernel/bug`), fast-path epoch, futex lock/queue, timer event, DNS answers, idle-check flag;
+  `Bkl` — lock guard running release-time work on `Drop`; `Cx` — syscall/signal context holding `Bkl`.
 
 ### Waiting and the fast path
 
@@ -97,27 +75,22 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
 ## Public entry points
 
 - **Syscalls**: `clone` (220), `clone3`, `exit`, `exit_group`, `set_tid_address`, `wait4`, `waitid`,
-  `getpriority`/`setpriority`,
-  `ioprio_*`, `sched_*`, `setsid`/`setpgid`/`getpgid`/`getsid`, `pidfd_open`, `pidfd_getfd`, `kcmp`,
-  `prctl` (`PR_SET/GET_PDEATHSIG`, `PR_SET/GET_CHILD_SUBREAPER`), `times`, `getrusage`, `prlimit`,
-  `personality`, `sethostname`/`setdomainname`, `getcpu`, `sysinfo`, `getrandom`.
-- **Kernel-internal**: `task::start`, `thread_main` → `run` → `exit`, `process::finish_group`,
-  `Shared::lock`, `block`/`block_for`, `Cx::wait*`, `Cx::unlocked`, `request_wake*`,
-  `signal_later`/`flush_signals`, `Shared::fast_changed`.
-- **Host-facing** (`Machine`): `processes`, `cpu_time_ns`, `wait`/`try_wait`/`wait_or_power`,
-  `signal` (a host signal to a guest process, `SI_KERNEL`). Machine start, host spawn, boot,
-  shutdown, power requests and `run` are `kernel/boot`'s lifecycle (its blocking calls use these
-  wait helpers); `take_kills` and `stall` are `kernel/bug`'s.
-- **procfs**: `threads-max`, `/proc/<pid>/task/<tid>/children`.
+  `getpriority`/`setpriority`, `ioprio_*`, `sched_*`, `setsid`/`setpgid`/`getpgid`/`getsid`,
+  `pidfd_open`/`pidfd_getfd`, `kcmp`, `prctl` (`PDEATHSIG`, `CHILD_SUBREAPER`), `times`, `getrusage`,
+  `prlimit`, `personality`, `sethostname`/`setdomainname`, `getcpu`, `sysinfo`, `getrandom`.
+- **Internal & host (`Machine`)**: `task::start`, `thread_main` → `run` → `exit`, `finish_group`,
+  `Shared::lock`, `block`/`block_for`, `Cx::wait*`/`unlocked`, `request_wake*`,
+  `signal_later`/`flush_signals`, `Shared::fast_changed`; `Machine::{processes, cpu_time_ns, wait,
+  try_wait, wait_or_power, signal}` (lifecycle in `kernel/boot`; `take_kills`/`stall` in
+  `kernel/bug`); procfs `threads-max`, `/proc/<pid>/task/<tid>/children`.
 
 ## Data flow / lifecycle
 
 ### Tasks and host threads
 
-- `Machine::cpu_time_ns` sums `Kernel.cpu.total_ns` (exited threads) and live tasks' `cpu_ns`
-  under the BKL, without reading `/proc` or adding hot-loop instrumentation. Android polls it
-  for activity; host UI/timer CPU is excluded. An exit-stage panic can skip the existing exit
-  credit, so consumers compare changes rather than require a strictly increasing counter.
+- `Machine::cpu_time_ns` sums `Kernel.cpu.total_ns` (exited) and live tasks' `cpu_ns` under the BKL
+  without `/proc` or hot-loop instrumentation (UI/timer CPU excluded; exit-stage panics can skip
+  credit, so callers compare deltas).
 - Each guest thread runs on its own host pthread, scheduled by the host kernel. A finished thread's
   host thread is pooled (at most 8 idle, 5 s) and its engine CPU state goes to the engine's spare
   list (up to 8), so creating threads rarely creates host threads.
@@ -165,19 +138,15 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
 
 ### Run loop
 
-- Each pass: let the periodic checks resume, mark the thread in guest code (also clearing its
-  `KernelEntry`, which every exit records before the fast path runs), act on generation
-  changes (a new code space re-attaches the translator, a TLB generation flushes the TLB, a code
-  generation invalidates translations), then run: `Cpu::step` while single-stepping, the
-  translator (`engine/dbt`) when attached and no hardware breakpoints are set, else `Cpu::run`
-  (`engine`).
-- An `Svc` exit first tries the fast path (below) without the BKL; everything else records its
-  entry for `kernel/bug`'s watchdog, takes the BKL and is handled: a killed thread exits; code
-  invalidations are applied; syscalls are dispatched; kicks deliver signals; undefined instructions
-  raise `SIGILL`, breakpoints and watchpoints `SIGTRAP`, alignment faults `SIGBUS`, host faults
-  kill the process (`kernel/bug`); page faults go to `kernel/mm` (`kernel/cow`'s copy-on-write break, already
-  present, fault in, FUSE fill, past-EOF `SIGBUS` or remap, stack growth, else `SIGSEGV`). A panic
-  on either path kills the process (`kernel/bug`) and the thread exits.
+- Each pass: resume periodic checks, mark in-guest (clearing `KernelEntry`, recorded on every exit
+  before the fast path), handle generation changes (re-attach DBT on code-space change, flush TLB,
+  invalidate translations), then execute via `Cpu::step` (single-step), `engine/dbt` (attached, no
+  HW breakpoints), or `Cpu::run` (`engine`).
+- `Svc` tries the fast path unlocked first; all other exits record `Entry` for `kernel/bug`, take
+  the BKL, and dispatch: killed exits, code invalidations, syscalls, kicks (signals), undef
+  (`SIGILL`), breakpoints/watchpoints (`SIGTRAP`), alignment (`SIGBUS`), host faults/panics
+  (`kernel/bug` kills process), and page faults (`kernel/mm`: CoW break, already present, fault in,
+  FUSE fill, past-EOF `SIGBUS`/remap, stack growth, else `SIGSEGV`).
 - The result (`Continue`, `Exec`, `Exit`) decides the next step; `Exec` re-attaches the translator
   for the new address space. After each BKL-path handling the fast-path record is rebuilt if the
   epoch moved. On `Exit`, still under the BKL, the last thread using its fd table flushes the FUSE
@@ -213,20 +182,14 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
   fatal signals set the group's `exiting` status once, mark every thread killed and wake them.
   Before any `PTRACE_EVENT_EXIT`, `begin_exit` (idempotent) makes the last thread to start exiting
   fill in the group status (Linux 6.1 `synchronize_group_exit`).
-- `task::exit` runs in stages, each contained by `bug::catch` (`kernel/bug`): core-dump registers,
-  statistics and CPU time, the leader's `leader_exit`, sample RSS if last, release the address
-  space (robust list, `clear_child_tid` wake when the address space is shared, vfork completion,
-  leave its users), ptrace and seccomp cleanup; when that stage panics, vfork completion and
-  leaving the users run again on their own (both are idempotent) before the process is killed, so
-  no stale user is kicked and no vfork parent waits; remove the task and its pid, hand PI locks it
-  owned with waiters to their first waiters (`futex::pi_owners_exited`), and reap SysV shm segments
-  marked for removal whose last attachment that was (`kernel/ipc`); a non-last thread hands its
-  children to another live thread (sending their pdeath signals) and retargets pending group
-  signals, the last thread finishes the group; flush message-queue notifications, reset its
-  namespaces and drop references under the BKL; flush released FUSE files; collect unix sockets in
-  flight (last thread), IPC namespaces and the mounts of dead mount namespaces or detached mounts
-  the thread was the last user of; check pending cgroup file changes; request an `EXITED` wake.
-  The engine CPU state is freed after the BKL is released.
+- `task::exit` runs in `bug::catch`-contained stages (`kernel/bug`): core-dump regs, stats/CPU time,
+  `leader_exit`, last-thread RSS sample, `release_mm` (robust list, shared-mm `clear_child_tid` wake,
+  vfork completion, leave mm users; on panic vfork completion and user removal re-run idempotently
+  before killing the process), ptrace/seccomp cleanup, task/pid removal, `futex::pi_owners_exited`,
+  SysV shm reap (`kernel/ipc`), non-last thread child handoff (`pdeathsig`) + signal retargeting or
+  last-thread `finish_group`, mqueue notification flush, namespace reset/drop under BKL, FUSE flush,
+  unix-GC (last thread) + IPC/mount collection, cgroup change checks, and `EXITED` wake; CPU state
+  frees after BKL release.
 - `finish_group`, each step contained: release AIO; reparent children to the nearest
   `PR_SET_CHILD_SUBREAPER` ancestor in the same pid-namespace level that still has live threads
   (one in the middle of exiting can be chosen, as on Linux), else the pid-namespace init while it
@@ -279,9 +242,8 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
   on return and on unwinding.
 - Acquisition: try once; otherwise up to half the host CPUs (1 to 4) spin for at most about 30 µs,
   reading only the `held` flag; the rest sleep on the mutex (a poisoned one is accepted). The new
-  holder sets `held`, records itself in `Hold` (`kernel/bug`: relaxed stores on the same cache line,
-  no clock read), marks the thread as holding this kernel's BKL and starts deferring host unmaps
-  (`kernel/hostmem`).
+  holder sets `held`, updates `Hold` (`kernel/bug`, relaxed same-cache-line stores, no clock read),
+  marks BKL ownership and defers host unmaps (`kernel/hostmem`).
 - Release (`Drop for Bkl`), in order: hang up closed terminals (contained), match pending wake
   requests against waiters, clear `held`, unlock, clear the thread's held marker, notify pooled
   host threads, signal the matched events, release deferred host memory and refill fork spares
@@ -298,9 +260,8 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
 - Without the BKL, a thread can run `futex` (WAIT, WAKE and the BITSET forms with a non-zero
   bitset, `FUTEX_CLOCK_REALTIME` only with WAIT_BITSET, on a 4-byte-aligned address that
   translates writable and is not in a shared mapping that may be written), `nanosleep`,
-  `clock_nanosleep` (REALTIME, MONOTONIC, BOOTTIME), `clock_gettime` (host clocks, with the time
-  namespace's offsets, or its own CPU clock, whose id holds its tid as its own pid namespace
-  numbers it), `clock_getres`, `gettimeofday`, `sched_yield`
+  `clock_nanosleep` (REALTIME, MONOTONIC, BOOTTIME), `clock_gettime` (host clocks with time-ns
+  offsets, or own CPU clock by namespace tid), `clock_getres`, `gettimeofday`, `sched_yield`
   (yields the host thread, not counted as running guest code meanwhile), and `newfstatat`/`statx`
   (absolute or `AT_FDCWD`-relative paths, when the root is the root mount's store directory, the
   root mount is usable, the walk stays in the store's metadata cache and crosses no other mount,
@@ -311,14 +272,11 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
 - The per-thread record is built under the BKL and rebuilt when a global epoch moves, bumped by
   `fast_changed` (chdir, chroot, credential and fs changes, mounts, setns, execve, time-namespace
   entry); a call that cannot complete falls back to the BKL path (writes to guest memory it made
-  stay). A panic on the fast path kills the process (`kernel/bug`).
-- Fast futex (`kernel/futex`): it shares the BKL path's queue and lock. A timed wait
-  woken early (futex, `nanosleep`, `clock_nanosleep`; relative or absolute) hands its deadline over
-  in `fast_sleep`: the BKL handler takes it instead of reading the time argument again (Linux's
-  restart never reads it again either, and the memory may be gone), and a relative sleep's
-  remaining time comes from it; the run loop clears it once the BKL path has dispatched that same
-  call, so a deadline its handler never took (the call skipped or renumbered by seccomp or a
-  tracer) is dropped. Wakes are signalled through the deferred list and flushed at once.
+  stay). Panics kill the process (`kernel/bug`).
+- Fast futex (`kernel/futex`) shares the BKL queue/lock; wakes flush immediately. Early-woken timed
+  waits (`futex`, `nanosleep`, `clock_nanosleep`) pass their deadline in `fast_sleep` so BKL
+  fallback reuses it (and computes remaining time) without re-reading guest memory; the run loop
+  clears it after BKL dispatch even if skipped/renumbered by seccomp or ptrace.
 
 ### Waiting and waking
 
@@ -330,9 +288,7 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
   relative `CLOCK_BOOTTIME` sleeps count the time the device slept.
 - `block_for`: register the waiter (unless its interest is empty), release the BKL, poll, re-take
   the BKL, clear the event, deregister. Host `EINTR` counts as a wake. Callers re-check their
-  condition, deadline and interruption.
-- Guest time validation and saturation at `KTIME_MAX` are `kernel/time`'s shared contract;
-  waits here consume its `Expiry` deadlines.
+  condition, deadline and interruption. Guest time validation/saturation belongs to `kernel/time`.
 - Wake requests made under the BKL are recorded per thread (several kernel instances may share the
   host process) as channels and objects; requests made without the BKL go to a global fallback.
   At BKL release, a waiter fires if its interest shares a channel with the request, or if objects
@@ -390,47 +346,31 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
 
 ### Other calls in `syscall/misc.rs`
 
-- `sethostname`/`setdomainname` change the caller's UTS namespace: `CAP_SYS_ADMIN` over its owner
-  (`EPERM`), then a negative length or one over 64 is `EINVAL`, then the name is copied in.
-- `getcpu` reports the lowest CPU in the thread's affinity mask (not where its host thread runs)
-  and node 0, skipping null pointers.
-- `getrandom`: flags other than `GRND_NONBLOCK`, `GRND_RANDOM` and `GRND_INSECURE`, or `RANDOM`
-  with `INSECURE`, are `EINVAL`; the bytes come from the host (`fill_random`) 64 KiB at a time,
-  never blocking, and a fault in a later piece returns the bytes of the pieces before it.
+- `sethostname`/`setdomainname` update the caller's UTS namespace (`CAP_SYS_ADMIN` over owner →
+  `EPERM`, length not in 0..=64 → `EINVAL`); `getcpu` returns the lowest affinity CPU and node 0
+  (skipping null pointers); `getrandom` accepts `GRND_NONBLOCK`/`RANDOM`/`INSECURE` (not `RANDOM`|
+  `INSECURE`, else `EINVAL`), copying 64 KiB host chunks nonblockingly (partial count on later fault).
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- Syscall dispatch (`syscall/mod.rs`), `kernel/boot` (machine lifecycle and host spawn),
-  `kernel/time` (timer thread, waits and CPU accounting), `kernel/bug` (`Shared::lock`, `Kernel`,
-  `Task`, `ThreadGroup`), and the hosts (CLI, Android JNI: stats, waits), signals and ptrace
-  (group exit, delivery, exit hooks), procfs, every blocking syscall (via the wait API),
-  `kernel/mmu` (kicks through `TaskSync`, `quiesce`), `kernel/mount` (`fast_changed`),
-  `kernel/exec` (killing the other threads, the tgid takeover, vfork completion), `kernel/ns`
-  (thread groups, ptrace access for setns), the terminal bridge (`block_for`).
+- `syscall/mod.rs`, `kernel/boot`, `kernel/time`, `kernel/bug`, CLI/Android hosts (`Machine` stats/
+  waits), `kernel/signal`/`kernel/ptrace`, `kernel/procfs`, blocking syscalls (wait API),
+  `kernel/mmu` (`TaskSync` kicks, `quiesce`), `kernel/mount` (`fast_changed`), `kernel/exec`,
+  `kernel/ns`, and `kernel/tty`'s terminal bridge (`block_for`).
 
 ### Outbound
 
-- `engine`: `Cpu::new`/`run`/`step`/`reset`/`translate`, `Kicker`, `guest_hwcap`, the spare CPU
-  list; `engine/dbt`: `Dbt::attach`/`run`.
-- `kernel/bug`: `bug::catch`, `bug::kill`, `bug::fails`, `bug::test_hook`, `Hold::record`,
-  `kernel::doing`/`done`.
-- `kernel/mm`: `translate`; `kernel/cow`: `fork`, `cow_break`; `kernel/hostmem`: `defer_unmaps`/
-  `release_unmapped`/`spare::refill`;
-  `kernel/mmu`: `quiesce`, users, `Mm::sync`, generations and code spaces in the run loop.
-- `kernel/exec` (execve), `kernel/ns` (namespaces at clone,
-  pid translation at dispatch and wait), `kernel/futex` (the futex syscalls and their fast path,
-  robust lists and PI owners at exit).
-- vfs (resolution, store, the metadata cache's `Cached`), `kernel/mount` (mount flags),
-  `kernel/fuse` (serving retries, prefault, sweeps, the exit flush), credentials, `kernel/cgroup`
-  (charging, freezer, `notify_changes`), SysV IPC (`kernel/ipc`), AIO (`kernel/aio`), the OOM
-  killer (`kernel/oom`), signals (`send_to_group`, `force_fatal`), the kernel log.
-- `kernel/time`: clocks, sleep and timer handlers, deadline helpers and the periodic-check
-  idle handshake; `kernel/boot`: virtual init as the fallback reaper, with general process
-  exit and adoption still implemented here.
-- `appine_hal`: `poll`, `Event`, thread CPU clocks and system time, host thread
-  nice/affinity/ioprio, host CPUs, random bytes; `std::thread`, `std::sync::Mutex`.
+- `engine`/`engine/dbt` (`Cpu`, `Kicker`, `guest_hwcap`, spare CPUs, `Dbt`); `kernel/bug` (`catch`,
+  `kill`, `fails`, `test_hook`, `Hold`, `doing`/`done`); `kernel/mm`/`kernel/cow`/`kernel/hostmem`/
+  `kernel/mmu` (`translate`, `fork`, `cow_break`, `defer_unmaps`/`release_unmapped`/`spare::refill`,
+  `quiesce`, `sync`, generations); `kernel/exec`, `kernel/ns`, `kernel/futex`, `kernel/time`,
+  `kernel/boot` (virtual init fallback reaper).
+- `kernel/vfs` (`Cached` resolver), `kernel/mount`, `kernel/fuse` (retries, prefault, sweeps, exit
+  flush), `kernel/cred`, `kernel/cgroup`, `kernel/ipc`, `kernel/aio`, `kernel/oom`, `kernel/signal`;
+  `appine_hal` (`poll`, `Event`, thread clocks/rusage, nice/affinity/ioprio, CPUs, random),
+  `std::thread`/`Mutex`.
 
 ## Invariants and gotchas
 
@@ -446,31 +386,24 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
 - The fast path must leave guest memory untouched after it stops being "in guest", because
   `Mm::sync` waits only for threads in guest code; the futex and clock fast paths do not check the
   epoch, relying on the thread that changed state being the one that refreshes.
-- Every BKL-path entry must record its `Entry` via `kernel::doing` (and clear it with `done` at
-  thread finish), and BKL acquisition must keep updating `Hold` on its single cache line for
-  `kernel/bug`'s watchdog.
-- New readers of guest times must use `kernel/time`'s shared `timespec` helper in
-  `syscall/mod.rs`, so guest durations cannot overflow host instants. The run loop must call
-  `Shared::resume_checks` before guest execution to honor the periodic-check idle handshake.
-- A syscall handler may run several times for one syscall (FUSE retries): whatever it does before
-  a walk that can fail with `FUSE_RETRY` is done again, so handlers change nothing before their
-  last walk (`kernel/exec`'s execve changes no process state before killing the other threads).
-  Copies to and from guest memory can fail with it too (FUSE mappings), which only the read/write
-  buffers read in first make safe.
+- BKL-path entries must call `kernel::doing`/`done`, and BKL acquisition must update `Hold` on one
+  cache line (`kernel/bug` watchdog). Guest times must use `kernel/time`'s `timespec`, and the run
+  loop must call `Shared::resume_checks` before guest execution.
+- Syscall handlers may rerun on `FUSE_RETRY` (walks or FUSE-mapping copies): mutate nothing before
+  the last walk (`kernel/exec` mutates nothing before killing other threads); only pre-read
+  read/write buffers make copy retries safe.
 - Between syscalls no FUSE node is held by the finishing thread, which is when `sweep` may forget
   nodes; a node another thread holds must be found by `kernel/fuse`'s `in_use` scan, an open
   handle or a request in flight.
-- Removed overlay nodes are kept for every syscall in progress that began before the removal, unless
-  its number is in `kernel/overlay`'s `waits_on_files_only`: a syscall that waits with the BKL
-  released while keeping a node it looked up must never be added there.
+- Removed overlay nodes stay for syscalls started before removal unless listed in `kernel/overlay`'s
+  `waits_on_files_only` (never add a wait holding a looked-up node there).
 
 ## Confirmed bugs / technical debt
 
 - **`sched_setattr` changes the policy before the nice check**, so a refused nice value can leave
   the policy (and reset-on-fork) changed.
-- **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` (`kernel/bug`)
-  before the guard drops, so a panic there would leave the BKL locked; wake requests made without
-  the BKL go to a global fallback that any kernel instance may consume.
+- **Latent hazards:** BKL-release wake matching runs outside `bug::catch` (`kernel/bug`, panic leaves
+  BKL locked); unlocked wake requests use a global fallback consumable by any kernel instance.
 
 ## Open questions
 
@@ -482,8 +415,6 @@ and Tier 1 translation (`engine/dbt`), signals and ptrace, credentials, mount tr
 
 ## To verify
 
-- The Linux 6.1 comparisons above that rest on kernel behaviour rather than repository source
-  (`eligible_child`, `do_notify_parent` and `copy_process` exit signals,
-  `zap_pid_ns_processes`, the keep and uclamp flags of `sched_setattr`, `INIT_RLIMITS`)
-  were checked from knowledge of the kernel, not against its source; the items found by Starnix's
-  syscall tests were also observed on a native 6.8 kernel.
+- Linux 6.1 comparisons resting on kernel knowledge rather than source (`eligible_child`,
+  `do_notify_parent`/`copy_process` exit signals, `zap_pid_ns_processes`, `sched_setattr` keep/uclamp
+  flags, `INIT_RLIMITS`); items from Starnix tests were also observed on native Linux 6.8.

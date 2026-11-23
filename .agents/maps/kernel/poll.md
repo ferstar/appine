@@ -25,7 +25,7 @@ Outside the module: the wait mechanism, wake objects and the BKL (`kernel/proces
 the timer thread (`kernel/time`); per-kind readiness of sockets (`kernel/net`, `kernel/rawicmp`, `kernel/netlink`, `kernel/unix`),
 terminals (`kernel/tty`), pipes (`kernel/pipe`), inotify (`kernel/inotify`), signalfd
 (`kernel/signal`), message queues (`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl
-entry points and the read paths (`kernel/files`); clock bases, `Expiry` and the wall-clock jump
+entry points (`kernel/files`) and the read paths (`kernel/fileio`); clock bases, `Expiry` and the wall-clock jump
 count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ## Key types
@@ -230,7 +230,7 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 ### Inbound
 
 - The syscall dispatcher (also the drain hook after I/O syscalls; timerfd reads through
-  `kernel/files`' read path); `kernel/procfs` (timerfd fdinfo); `kernel/aio` (`poll_once`,
+  `kernel/fileio`'s read path); `kernel/procfs` (timerfd fdinfo); `kernel/aio` (`poll_once`,
   `wait_aio_polls`, `watch_aio_poll`, masks, resfd eventfds); the timer thread (`check_exclusive`,
   `check_fasync`); fcntl/ioctl (`register_fasync`); pipe writes (`arrived`); lease breaks
   (`send_to_owner`); fdinfo and kcmp.

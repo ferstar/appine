@@ -350,7 +350,7 @@ listen notifications (`android/service`).
 
 ### Inbound
 
-- The syscall dispatcher; `kernel/files` (read/write/ioctl on sockets), `kernel/vfs` (`Vfs::open`
+- The syscall dispatcher; `kernel/files` (ioctl on sockets), `kernel/fileio` (read/write on sockets), `kernel/vfs` (`Vfs::open`
   writing `resolv.conf`); `kernel/poll`; `kernel/procfs` (`/proc/net`) and `kernel/sysfs` (sysfs
   interface counters); `kernel/time` (timer thread `deliver_dns`) and `kernel/process`
   (`Machine::take_listens`); `kernel/netns` (forward targets); `kernel/netlink` (`SockOpts`, the

@@ -20,8 +20,8 @@
 Root: `core/kernel/src/locks.rs`, `syscall/lease.rs`, and in `syscall/fs.rs` `flock` and the
 fcntl lock commands (`record_lock`).
 
-Outside the module: closing fds and open files, which call `locks::closed`, and the opens and
-truncations that call `break_leases` (`kernel/files`); the lock keys of overlay and FUSE nodes
+Outside the module: closing fds and open files, which call `locks::closed`, and opens calling
+`break_leases` (`kernel/files`), plus truncations calling `break_leases` (`kernel/fileio`); the lock keys of overlay and FUSE nodes
 (`lock_ino`, `kernel/files`); owners and the signals a lease break sends (`kernel/files`'
 `F_SETOWN`, `kernel/signal`); the procfs files that show the listings (`kernel/procfs`).
 
@@ -83,8 +83,8 @@ truncations that call `break_leases` (`kernel/files`); the lock keys of overlay 
 
 ### Inbound
 
-- `kernel/files`: fcntl's dispatch, every close path (`locks::closed`), opens and truncation
-  (`break_leases`), the last reference to an open file.
+- `kernel/files`: fcntl's dispatch, every close path (`locks::closed`), opens (`break_leases`),
+  the last reference to an open file; `kernel/fileio`: truncation (`break_leases`).
 - `kernel/procfs`: `/proc/locks` and fdinfo `lock:` lines; `kernel/sysctl`: the `lease-break-time`
   sysctl.
 - `kernel/overlay` and `kernel/fuse`: the nodes whose keys locks use.

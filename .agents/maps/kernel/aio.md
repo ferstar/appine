@@ -21,7 +21,7 @@
 Root: `core/kernel/src/syscall/aio.rs`.
 
 Outside the module: the read, write, vectored and fsync paths and their file checks
-(`kernel/files`); readiness, the ppoll-style wait, temporary signal masks and eventfds
+(`kernel/fileio`), plus fd lookup and `FileKind` (`kernel/files`); readiness, the ppoll-style wait, temporary signal masks and eventfds
 (`kernel/poll`); thread groups and exit (`kernel/process`); the timer thread (`kernel/time`); execve
 (`kernel/exec`); the context page's mapping (`kernel/mm`); `/proc/sys/fs/aio-nr` and `aio-max-nr`
 (`kernel/sysctl`).
@@ -77,7 +77,7 @@ Outside the module: the read, write, vectored and fsync paths and their file che
   `aio_rw_flags` is `EINVAL`. The first failure is returned when nothing was submitted, otherwise
   the count so far.
 - PREAD, PWRITE, PREADV, PWRITEV, FSYNC and FDSYNC run synchronously inside io_submit through
-  `kernel/files`' read, write, vectored and fsync paths (blocking pipe or socket I/O blocks
+  `kernel/fileio`'s read, write, vectored and fsync paths (blocking pipe or socket I/O blocks
   io_submit), and their result or negative errno is queued at once (an interrupted one as
   `-EINTR`, as `aio_rw_done` turns restart codes into it). `aio_offset` is used only for
   positional files; `RWF_NOWAIT` and `RWF_APPEND` are set temporarily as `O_NONBLOCK`/`O_APPEND`
@@ -118,8 +118,8 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 
 ### Outbound
 
-- `kernel/files`: fd lookup, `read_file`, `write_file`, `vectored`, `fsync`, `has_fsync`,
-  `seekable`, `append_offset`, `write_sync`; `FileKind` for `has_iter`; `kernel/vfs`: `Device`
+- `kernel/files`: fd lookup, `FileKind` for `has_iter`; `kernel/fileio`: `read_file`, `write_file`,
+  `vectored`, `fsync`, `has_fsync`, `seekable`, `append_offset`, `write_sync`; `kernel/vfs`: `Device`
   for `has_iter`.
 - `kernel/poll`: `poll_once`, `wait_aio_polls`, `watch_aio_poll`, `set_temp_mask`/`restore_mask`,
   the resfd eventfds it signals.

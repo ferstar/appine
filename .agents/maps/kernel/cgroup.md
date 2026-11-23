@@ -177,7 +177,7 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 - `kernel/procfs`: synthetic node lookup, metadata and listing; cgroup interface content and
   writes; `/proc/<pid>/cgroup` and `/proc/cgroups`.
 - `kernel/vfs`: cgroup mkdir/rmdir and device checks at mknod; `kernel/files`: device checks at
-  opens (including devpts), file-change observation and write notifications.
+  opens (including devpts) and file-change observation; `kernel/fileio`: write notifications.
 - `kernel/process`: clone/clone3 placement, pids charge, inherited freezer state, change checks
   after BKL syscalls and at thread exit; `kernel/time`: change checks on the timer thread;
   `kernel/signal`: freezer stops.

@@ -24,8 +24,8 @@ the sysfs arms of `View`, `stat`, `fs_of`, `readdir`, `node_ino`, `ino_of`, `ope
 `pollable` and `content`.
 
 Outside the module: the shared `Pseudo` / `View` / `FileKind::Proc` snapshot and poll-event
-machinery (`kernel/procfs`); sysfs mounting and single-instance rules (`kernel/mount`); open/read
-dispatch (`kernel/files`); loop-device values (`kernel/loop`); network interface views and counters
+machinery (`kernel/procfs`); sysfs mounting and single-instance rules (`kernel/mount`); open
+dispatch (`kernel/files`) and read dispatch (`kernel/fileio`); loop-device values (`kernel/loop`); network interface views and counters
 (`kernel/net`, `kernel/netns`); the cgroup2 tree mounted on `fs/cgroup/` (`kernel/cgroup`); host
 CPU and `tx_queue_len` helpers (`hal`).
 
@@ -96,7 +96,7 @@ CPU and `tx_queue_len` helpers (`hal`).
 - `kernel/procfs`: dispatches sysfs lookup, stat, readdir, open-writability, pollability and
   content generation inside `pseudo.rs`.
 - `kernel/mount`: mounts `/sys` and `/sys/fs/cgroup` (using `CGROUP_POINT`).
-- `kernel/files`: opens and reads sysfs files through `open_pseudo`.
+- `kernel/files` and `kernel/fileio`: opens (`open_pseudo`) and reads sysfs files.
 
 ### Outbound
 

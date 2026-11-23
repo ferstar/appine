@@ -25,7 +25,7 @@ kernel, so no host notification is used. It provides:
 Root: `core/kernel/src/syscall/inotify.rs`.
 
 Outside the module: where the hooks are called — the file syscalls and renames in `kernel/vfs`,
-opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 file changes in
+opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel/fuse`, cgroup2 file changes in
 `kernel/cgroup`; readiness, epoll and `O_ASYNC` of inotify fds (`kernel/poll`);
 `/proc/sys/fs/inotify/*` (`kernel/sysctl`) and the fdinfo text's place (`kernel/procfs`); the Files app's change list
 (`kernel/store`) and the machine's `store_changed`, which finds each kernel and takes its BKL
@@ -51,7 +51,7 @@ opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 
 ## Public entry points
 
 - Syscalls `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`; `read` through
-  `kernel/files`' `IoPath::Inotify`; `FIONREAD` in `kernel/files`' ioctl dispatch.
+  `kernel/fileio`'s `IoPath::Inotify`; `FIONREAD` in `kernel/files`' ioctl dispatch.
 - Hooks for the file syscalls: `active` (whether any watch exists), `path_event`, `file_event`,
   `dir_event`, `cookie`, `opened`, `renamed`, `deleted`, `watched_at`, `key_of`.
 - `host_change` (the Files app's changes, from the machine's `store_changed`), `kernfs_modified`
@@ -112,7 +112,7 @@ opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 
 - Files app changes (`host_change`, under the target kernel's BKL) map `Created`, `Removed`,
   `Moved`, `Opened` (write opens) and `Written` to the same event sequences; the provider reports
   no access, close-nowrite, read-open or attribute events. An `Opened` that gave a held file an
-  object of its own also moves this kernel's descriptions of it there (`kernel/files`'
+  object of its own also moves this kernel's descriptions of it there (`kernel/fileio`'s
   `host_unshared` and `rehome`), even with no watches.
 
 ## Dependencies (inbound / outbound)
@@ -121,8 +121,8 @@ opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 
 
 - `kernel/vfs`: the hooks from the metadata and namespace syscalls, renames (`renamed`) and
   removals (`deleted`); the overlay sweep reading `watched`.
-- `kernel/files`: the hooks from opens (`opened`), I/O and closes; the instance's read and
-  `FIONREAD`.
+- `kernel/files`: the hooks from opens (`opened`) and closes, and `FIONREAD`; `kernel/fileio`:
+  I/O hooks and the instance's read.
 - `kernel/fuse`: hooks for FUSE namespace changes; `watched` in `in_use`.
 - `kernel/cgroup`: `kernfs_modified` for cgroup2 file changes.
 - `kernel/sysctl`: the registry's limits behind `/proc/sys/fs/inotify/*`; `kernel/procfs`: the
@@ -134,8 +134,8 @@ opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 
 ### Outbound
 
 - `kernel/vfs`: `Node`, path resolution (`read_path`, `watched_at`'s second walk), overlay keys
-  and `Overlays::linked`, the store's link counts for `IN_EXCL_UNLINK`; `kernel/files`:
-  `OpenFile`, `host_unshared`.
+  and `Overlays::linked`, the store's link counts for `IN_EXCL_UNLINK`; `kernel/files`: `OpenFile`;
+  `kernel/fileio`: `host_unshared`.
 - `kernel/store`: the `Change` records of the browse API.
 - Credentials: `MAY_READ` permission on the watched node.
 - The kernel's wake objects (`request_wake_object`).
