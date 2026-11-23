@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: remove temporary strace/gdb and sy-sample.log diagnostic probes from full.yml's difftest shards)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: open ping_group_range before cargo test in ci.yml)
 
 ## Responsibilities
 
@@ -104,8 +104,8 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   `--ulimit nice=40:40`, the Docker daemon's proxy settings, `-it` only when stdin and stdout are
   terminals, docker's default seccomp, and only `APPINE_DBT_REGS` forwarded (when set).
 - `ci.yml`, on every push and pull request that changes more than `docs/`, `.agents/`, Markdown
-  or `android/`: Linux arm64 (`ubuntu-24.04-arm`) fmt, clippy (`-D warnings`), fetch the rootfs
-  and `cargo test --workspace` with the require switches.
+  or `android/`: Linux arm64 (`ubuntu-24.04-arm`) fmt, clippy (`-D warnings`), fetch the rootfs,
+  open `ping_group_range` and `cargo test --workspace` with the require switches.
 - `android.yml`, on pushes and pull requests that change `core/`, `hosts/android/`, `android/`,
   the Cargo files or the rootfs, Ghostty and virglrenderer fetch scripts (or on demand), on x86_64 (`ubuntu-24.04`,
   for aapt2): NDK 29.0.14206865, SDK CMake 3.22.1, Java 21, cargo-ndk (unpinned), the rootfs, Zig 0.17.0 (from
