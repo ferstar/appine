@@ -4459,3 +4459,262 @@ fn go(g: &mut Guest, dbt: &mut Dbt, pc: u64) -> Exit {
     g.cpu.state_mut().pc = pc;
     dbt.run(&mut g.cpu)
 }
+
+#[test]
+fn memop_self_copy_validates_pages_before_returning() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(space) = DbtSpace::new(0, regs) else {
+            return;
+        };
+        let mut dbt = Dbt::attach(&space, 0).unwrap();
+        let mut g = Guest::with_data();
+
+        let f_memcpy = CODE + 0x100;
+        let f_memmove = CODE + 0x120;
+        let caller = CODE + 0x40;
+        g.code(f_memcpy, &[movz_x0(0x7777), RET]);
+        g.code(f_memmove, &[movz_x0(0x7777), RET]);
+        g.code(caller, &[0xd63f_0120, SVC]); // blr x9; svc #0
+        space.set_memops(&[
+            DbtMemop {
+                pc: f_memcpy,
+                kind: MEMOP_MEMCPY,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_memmove,
+                kind: MEMOP_MEMMOVE,
+                reserved: 0,
+            },
+        ]);
+
+        let ro_page = DATA + 5 * PAGE_SIZE;
+        let unmapped = DATA + 6 * PAGE_SIZE;
+
+        for target in [f_memcpy, f_memmove] {
+            for len in [256u64, 5000] {
+                // Unmapped dst == src with n >= 128 must decline exec_memop and run guest code.
+                {
+                    let s = g.cpu.state_mut();
+                    s.x[9] = target;
+                    s.x[0] = unmapped;
+                    s.x[1] = unmapped;
+                    s.x[2] = len;
+                }
+                assert_eq!(g.run_at(&mut dbt, caller), 0x7777, "{regs:?} len={len}");
+
+                // Read-only dst == src with n >= 128 must also decline exec_memop.
+                {
+                    let s = g.cpu.state_mut();
+                    s.x[9] = target;
+                    s.x[0] = ro_page;
+                    s.x[1] = ro_page;
+                    s.x[2] = len;
+                }
+                assert_eq!(g.run_at(&mut dbt, caller), 0x7777, "{regs:?} len={len}");
+
+                // Writable+readable dst == src (including cross-page > 4 KiB through exec_memop)
+                // succeeds without running guest stub.
+                let before0 = g.pages[3].0;
+                let before1 = g.pages[4].0;
+                {
+                    let s = g.cpu.state_mut();
+                    s.x[9] = target;
+                    s.x[0] = DATA;
+                    s.x[1] = DATA;
+                    s.x[2] = len;
+                }
+                assert_eq!(g.run_at(&mut dbt, caller), DATA, "{regs:?} len={len}");
+                assert_eq!(g.pages[3].0, before0, "{regs:?} len={len}");
+                assert_eq!(g.pages[4].0, before1, "{regs:?} len={len}");
+            }
+
+            // Zero-length copy stays below the length gate and runs guest code directly.
+            {
+                let s = g.cpu.state_mut();
+                s.x[9] = target;
+                s.x[0] = unmapped;
+                s.x[1] = unmapped;
+                s.x[2] = 0;
+            }
+            assert_eq!(g.run_at(&mut dbt, caller), 0x7777, "{regs:?}");
+        }
+    }
+}
+
+#[test]
+fn revive_does_not_insert_duplicate_key_after_early_stop() {
+    let Some(mut dbt) = Dbt::new() else {
+        return;
+    };
+    // 2 initial code pages (CODE, CODE+PAGE_SIZE) + 1 stack page + 6 extra code pages.
+    let mut g = Guest::with_pages(9);
+    let base = NonNull::new(g.pages.as_mut_ptr().cast::<u8>()).unwrap();
+    let park_page = CODE + PAGE_SIZE;
+    let park_host = unsafe { base.add(4096) };
+    let extra_base = CODE + 2 * PAGE_SIZE;
+    unsafe {
+        g.mmu
+            .map(
+                extra_base,
+                base.add(3 * 4096),
+                6 * PAGE_SIZE,
+                prot::READ | prot::EXEC,
+            )
+            .unwrap();
+    }
+
+    // Install pc_a before pc_b on park_page so page_head visits pc_b first during dbt_revive.
+    let pc_a = park_page;
+    let pc_b = park_page + 0x10;
+    let pc_c = park_page + 0x20;
+    g.code(pc_a, &[movz_x0(11), SVC]);
+    g.code(pc_b, &[movz_x0(22), SVC]);
+    g.code(pc_c, &[movz_x0(33), SVC]);
+    assert_eq!(g.run_at(&mut dbt, pc_a), 11);
+    assert_eq!(g.run_at(&mut dbt, pc_b), 22);
+
+    // Fill the initial 4096-slot table to 3071 occupied slots (3/4 load is 3072):
+    // 2 blocks on park_page + 3069 distinct blocks across the 6 extra code pages.
+    for i in 0..3069usize {
+        let page_idx = 3 + i / 512;
+        let off = (i % 512) * 8;
+        let insns = [movz_x0(1), SVC];
+        g.pages[page_idx].0[off..off + 4].copy_from_slice(&insns[0].to_le_bytes());
+        g.pages[page_idx].0[off + 4..off + 8].copy_from_slice(&insns[1].to_le_bytes());
+        let pc = extra_base + (i as u64) * 8;
+        assert_eq!(g.run_at(&mut dbt, pc), 1);
+    }
+
+    // Park park_page while keeping the 3069 extra blocks live (table_occupied stays 3071).
+    let source = DbtSource {
+        start: park_page,
+        len: PAGE_SIZE,
+        id: [1, 2, 0, 0, PAGE_SIZE],
+    };
+    dbt.space().set_sources(&[source]);
+    dbt.recheck();
+    dbt.space().trust(&[]);
+    g.mmu.unmap(park_page, PAGE_SIZE).unwrap();
+    g.cpu.tlb_flush();
+    assert_eq!(g.run_at(&mut dbt, extra_base), 1);
+
+    // Remap park_page and run pc_a: dbt_revive revives pc_b (n=1), hits 3071+1 == 3072 and
+    // stops before pc_a; dbt_run then translates and installs a fresh pc_a (growing the table).
+    unsafe {
+        g.mmu
+            .map(park_page, park_host, PAGE_SIZE, prot::READ | prot::EXEC)
+            .unwrap();
+    }
+    assert_eq!(g.run_at(&mut dbt, pc_a), 11);
+
+    // Run a third PC on park_page to trigger dbt_revive again if any parked block remained.
+    assert_eq!(g.run_at(&mut dbt, pc_c), 33);
+
+    // Rewrite pc_a and invalidate: exactly one live block for pc_a must exist (no duplicate key).
+    g.code(pc_a, &[movz_x0(99), SVC]);
+    let inv_before = dbt.stats().invalidated;
+    dbt.invalidate(&g.cpu, pc_a, 4);
+    assert_eq!(dbt.stats().invalidated - inv_before, 1);
+    assert_eq!(g.run_at(&mut dbt, pc_a), 99);
+}
+
+#[test]
+fn concurrent_attach_during_conditional_branch_linking() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let Some(space) = DbtSpace::new(0, DbtRegs::Default) else {
+        return;
+    };
+    const PAIRS: usize = 32;
+    let setup = |g: &mut Guest| {
+        for i in 0..PAIRS {
+            let src = CODE + (i as u64) * 0x20;
+            let dst = CODE + 0x800 + (i as u64) * 0x10;
+            // src: cbz x0, dst; movz x0, #1; svc #0
+            // dst: movz x0, #2; svc #0
+            g.code(src, &[cbz_x0(src, dst), movz_x0(1), SVC]);
+            g.code(dst, &[movz_x0(2), SVC]);
+        }
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let space2 = space.clone();
+    let stop2 = stop.clone();
+    let attacher = std::thread::spawn(move || {
+        let mut g = Guest::new();
+        setup(&mut g);
+        while !stop2.load(Ordering::Relaxed) {
+            let mut dbt = Dbt::attach(&space2, 0).unwrap();
+            for i in 0..PAIRS {
+                let src = CODE + (i as u64) * 0x20;
+                g.cpu.state_mut().x[0] = 0;
+                g.cpu.state_mut().pc = src;
+                run_to_svc(&mut dbt, &mut g.cpu);
+                assert_eq!(g.cpu.state().x[0], 2);
+            }
+        }
+    });
+
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
+    let mut g = Guest::new();
+    setup(&mut g);
+    for _ in 0..32 {
+        dbt.flush();
+        // Translate src (not taken), then dst directly, then take src -> dst so the link hits
+        // the already-translated path with patch_branch_site != NULL while attacher races attach.
+        for i in 0..PAIRS {
+            let src = CODE + (i as u64) * 0x20;
+            let dst = CODE + 0x800 + (i as u64) * 0x10;
+            g.cpu.state_mut().x[0] = 1;
+            g.cpu.state_mut().pc = src;
+            run_to_svc(&mut dbt, &mut g.cpu);
+            assert_eq!(g.cpu.state().x[0], 1);
+
+            g.cpu.state_mut().pc = dst;
+            run_to_svc(&mut dbt, &mut g.cpu);
+            assert_eq!(g.cpu.state().x[0], 2);
+
+            g.cpu.state_mut().x[0] = 0;
+            g.cpu.state_mut().pc = src;
+            run_to_svc(&mut dbt, &mut g.cpu);
+            assert_eq!(g.cpu.state().x[0], 2);
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    attacher.join().unwrap();
+}
+
+#[test]
+fn concurrent_instances_update_spare_stats_independently() {
+    if DbtSpace::new(0, DbtRegs::Default).is_none() {
+        return;
+    }
+    let workers: Vec<_> = (0..4)
+        .map(|id| {
+            std::thread::spawn(move || {
+                let mut g = Guest::new();
+                g.code(CODE, &[movz_x0(7), SVC]);
+                let ops = [DbtMemop {
+                    pc: CODE,
+                    kind: MEMOP_MEMSET,
+                    reserved: 0,
+                }];
+                for r in 0..24u64 {
+                    let space = DbtSpace::new(0x1000 + id * 100 + r, DbtRegs::Default).unwrap();
+                    let mut dbt = Dbt::attach(&space, 0).unwrap();
+                    assert_eq!(g.run(&mut dbt), 7);
+                    space.set_memops(&ops);
+                    space.set_memops(&[]);
+                    space.retire_outside(&[]);
+                    drop(dbt);
+                    drop(space);
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+}

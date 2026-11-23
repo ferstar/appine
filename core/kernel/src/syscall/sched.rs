@@ -498,13 +498,8 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
         } else {
             0
         };
-        // With SCHED_FLAG_KEEP_PARAMS neither the parameters nor the policy change
-        // (__setscheduler_params is skipped); only reset-on-fork and the clamps do
-        set_policy(cx, task.as_ref(), (policy | reset, priority), !keep_params)?;
-        if keep_params && let Some(t) = &task {
-            t.sched
-                .set((cur_policy & !SCHED_RESET_ON_FORK | reset, cur_priority));
-        }
+        // Validate policy and permissions before mutating anything; only apply after nice succeeds
+        set_policy(cx, task.as_ref(), (policy | reset, priority), false)?;
         // Only SCHED_OTHER and SCHED_BATCH take the nice value (fair_policy): SCHED_IDLE keeps the
         // one the thread had, which leaving it again is judged by
         if !keep_params
@@ -517,6 +512,17 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
                 Errno::EACCES => Errno::EPERM,
                 e => e,
             })?;
+        }
+        // With SCHED_FLAG_KEEP_PARAMS neither the parameters nor the policy change
+        // (__setscheduler_params is skipped); only reset-on-fork and the clamps do
+        if let Some(t) = &task {
+            if keep_params {
+                t.sched
+                    .set((cur_policy & !SCHED_RESET_ON_FORK | reset, cur_priority));
+            } else {
+                t.sched.set((policy | reset, priority));
+                apply_host(t);
+            }
         }
     }
     // __setscheduler_uclamp: -1 goes back to the default

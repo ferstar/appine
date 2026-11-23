@@ -634,13 +634,21 @@ fn for_target(
 ) -> Option<SigInfo> {
     info.retarget_uid(&group.cred);
     let ns = &group.pid_ns;
+    let mut force = info.code == code::SI_KERNEL;
+    if info.sender != 0 {
+        if let Some(vnr) = ns.vnr(info.sender) {
+            // Translate kernel-populated sender pid into the target's pid namespace (preserving
+            // caller-supplied si_pid in InfoFields::User)
+            if let InfoFields::Kill { pid, .. } = &mut info.fields {
+                *pid = vnr;
+            }
+        } else {
+            info.hide_sender();
+            force = true;
+        }
+    }
     if ns.level == 0 {
         return Some(info);
-    }
-    let mut force = info.code == code::SI_KERNEL;
-    if info.sender != 0 && !ns.sees(info.sender) {
-        info.hide_sender();
-        force = true;
     }
     let ignored = unkillable(group)
         && (!blocked && !traced || sig == Signal::KILL)
@@ -1181,6 +1189,9 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         }
         // Decided by the first signal taken, even if its frame cannot be written (Linux's do_signal
         // forgets the syscall before handling it)
+        if matches!(restart, Some((Errno::ERESTART_RESTARTBLOCK, _))) {
+            cx.t.restart = None;
+        }
         restart = None;
         // The mask temporarily swapped by sigsuspend or ppoll: the frame saves the original,
         // restored when the handler returns
@@ -1235,11 +1246,12 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
     }
     // No handler interrupted: the svc being re-executed becomes restart_syscall, which continues
     // the remaining part
-    if !handled
-        && let Some((Errno::ERESTART_RESTARTBLOCK, cont)) = restart
-        && cpu.state().pc == cont - 4
-    {
-        cpu.state_mut().x[8] = super::syscall::NR_RESTART_SYSCALL;
+    if !handled && let Some((Errno::ERESTART_RESTARTBLOCK, cont)) = restart {
+        if cpu.state().pc == cont - 4 {
+            cpu.state_mut().x[8] = super::syscall::NR_RESTART_SYSCALL;
+        } else {
+            cx.t.restart = None;
+        }
     }
     Flow::Continue
 }
@@ -1258,7 +1270,11 @@ pub(crate) fn retarget(
         if set == 0 {
             break;
         }
-        let Some(t) = k.tasks.get(&tid).filter(|_| Some(tid) != except) else {
+        let Some(t) = k
+            .tasks
+            .get(&tid)
+            .filter(|t| Some(tid) != except && t.trace.borrow().stop.is_none())
+        else {
             continue;
         };
         let takes = set & !t.sigmask.get();
@@ -1848,5 +1864,141 @@ mod tests {
             "Tainted: G        W  O      "
         );
         assert_eq!(tainted_text(1), "Tainted: P                  ");
+    }
+
+    #[test]
+    fn for_target_translates_si_pid_across_pid_namespaces() {
+        use crate::cred::UserNs;
+        use crate::pidns::PidNs;
+
+        let root_ns = PidNs::init();
+        let mid_ns = PidNs::child(&root_ns, UserNs::init());
+        let leaf_ns = PidNs::child(&mid_ns, UserNs::init());
+        let sibling_ns = PidNs::child(&root_ns, UserNs::init());
+
+        // Global tid 42 is pid 1 in leaf_ns and pid 7 in mid_ns (not visible in sibling_ns).
+        PidNs::register(&leaf_ns, 42, &[1, 7]).unwrap();
+
+        let make_group = |tgid: Tid, ns: &Rc<PidNs>| {
+            let mut g = ThreadGroup::new(tgid, 1, Rc::new(RefCell::new(SigHandlers::default())));
+            g.pid_ns = ns.clone();
+            g
+        };
+        let pid_of = |info: SigInfo| match info.fields {
+            InfoFields::Kill { pid, .. } | InfoFields::User { pid, .. } => pid,
+            _ => unreachable!(),
+        };
+
+        // Kernel-populated Kill from leaf_ns (local pid 1, global 42) to root_ns, mid_ns, sibling_ns.
+        let sent = SigInfo::kill(code::SI_USER, 1, 0).from(42);
+        let to_root =
+            for_target(&make_group(10, &root_ns), Signal::USR1, sent, false, false).unwrap();
+        assert_eq!(pid_of(to_root), 42);
+        let to_mid =
+            for_target(&make_group(20, &mid_ns), Signal::USR1, sent, false, false).unwrap();
+        assert_eq!(pid_of(to_mid), 7);
+        let to_sibling = for_target(
+            &make_group(30, &sibling_ns),
+            Signal::USR1,
+            sent,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pid_of(to_sibling), 0);
+
+        // User-supplied InfoFields::User preserves caller si_pid when visible, hides when invisible.
+        let user_sent = SigInfo {
+            code: -1,
+            fields: InfoFields::User {
+                errno: 0,
+                pid: 999,
+                uid: 0,
+                rest: [0; 24],
+            },
+            ..SigInfo::default()
+        }
+        .from(42);
+        let u_root = for_target(
+            &make_group(10, &root_ns),
+            Signal::USR1,
+            user_sent,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pid_of(u_root), 999);
+        let u_sibling = for_target(
+            &make_group(30, &sibling_ns),
+            Signal::USR1,
+            user_sent,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pid_of(u_sibling), 0);
+    }
+
+    #[test]
+    fn retarget_skips_ptrace_stopped_threads() {
+        use crate::fd::FdTable;
+        use crate::kernel::Shared;
+        use crate::mm::Mm;
+        use crate::task::{FsContext, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut cpus = Vec::new();
+        {
+            let mut k = shared.lock();
+            let group = Rc::new(RefCell::new(ThreadGroup::new(
+                10,
+                1,
+                Rc::new(RefCell::new(SigHandlers::default())),
+            )));
+            let mm = Mm::new().into_shared();
+            let fds = Rc::new(RefCell::new(FdTable::new()));
+            let fs = Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: Rc::new(MntNs {
+                    id: INIT_MNT_NS,
+                    owner: crate::cred::UserNs::init(),
+                    anon: false,
+                }),
+            }));
+
+            let mut tasks = Vec::new();
+            for (tid, mask) in [(10, Signal::USR1.bit()), (11, 0), (12, 0)] {
+                let cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
+                let state = TaskState {
+                    mm: mm.clone(),
+                    fds: fds.clone(),
+                    fs: fs.clone(),
+                    group: group.clone(),
+                    vfs: None,
+                    altstack: Default::default(),
+                    clear_child_tid: 0,
+                    vfork_done: None,
+                    restart: None,
+                    fast_sleep: None,
+                };
+                let task =
+                    Task::new(tid, 10, &cpu, state, k.init_ns.clone(), mask, [0; 16]).unwrap();
+                group.borrow_mut().threads.push(tid);
+                k.tasks.insert(tid, task.clone());
+                cpus.push(cpu);
+                tasks.push(task);
+            }
+            // Thread 11 is in a ptrace stop; retarget must skip it and wake thread 12 instead.
+            tasks[1].trace.borrow_mut().stop = Some(crate::ptrace::Stop::Signal(Signal::TRAP));
+
+            retarget(&k, &group, Some(10), Signal::USR1.bit());
+        }
+
+        // Thread 12 was kicked (immediate Exit::Kick); thread 11 was not kicked.
+        assert!(!matches!(cpus[1].run(), appine_engine::Exit::Kick));
+        assert!(matches!(cpus[2].run(), appine_engine::Exit::Kick));
     }
 }

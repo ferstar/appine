@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/signal.md` for the paired decision history, including pre-split decisions for kernel/ptrace and kernel/vdso.
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 16 claims checked by 3 independent verifiers — 12 confirmed and 4 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: fix kill(i32::MIN), retarget ptrace-stop skip, restart clearing, sigaltstack uoss ordering, cross-pidns si_pid and immutable queries)
 
 ## Responsibilities
 
@@ -85,7 +87,8 @@ construction (`kernel/vdso`).
   `pidfd_send_signal` check the thread group's main-thread credentials; `kill(1, ...)` checks
   against `Cred::root()`.
 - Target preparation (`for_target`): retargets `si_uid` across user namespaces (65534 overflow),
-  hides `si_pid` to 0 when a non-root pid namespace cannot see the sender, and drops default-handled
+  translates kernel-populated `si_pid` (`InfoFields::Kill`) into the target's pid namespace at all
+  levels and hides `si_pid` to 0 when the sender is invisible there, and drops default-handled
   signals aimed at a non-killable child pid-namespace init (unless forced `SIGKILL`/`SIGSTOP` from
   an ancestor namespace or `SI_KERNEL`).
 - `SIGKILL` skips queueing and calls `group_exit` (sets `exiting`, marks cgroup observation via
@@ -102,8 +105,8 @@ construction (`kernel/vdso`).
 - Waking & retargeting: `send_to_task` wakes the thread if unblocked; `send_group` picks the first
   thread with the signal unmasked and not in a ptrace stop (`send_cpu_timer` rotates among running
   unmasked threads via a global counter); if none qualifies, requests `wake::SIGNAL`. `retarget`
-  wakes siblings for group-pending signals blocked by the current thread at the end of `deliver` and
-  for all group-pending signals on non-last thread exit.
+  wakes siblings (skipping ptrace-stopped threads) for group-pending signals blocked by the current
+  thread at the end of `deliver` and for all group-pending signals on non-last thread exit.
 
 ### Delivery and syscall restart
 
@@ -124,7 +127,8 @@ construction (`kernel/vdso`).
 - First-handler restart rules: if PC is still at `cont - 4`, `ERESTARTNOHAND`,
   `ERESTART_RESTARTBLOCK`, and `ERESTARTSYS` without `SA_RESTART` become `-EINTR` at `cont`;
   `ERESTARTNOINTR` (produced by `futex_lock_pi`) and `ERESTARTSYS` with `SA_RESTART` stay rewound.
-  `restart` is decided once by the first signal taken, even if frame setup fails.
+  `restart` is decided once by the first signal taken, even if frame setup fails, and clears
+  `TaskState::restart` whenever `ERESTART_RESTARTBLOCK` is turned into `EINTR` or abandoned.
 - After frame setup: mask becomes `(mask | act.mask | (sig unless SA_NODEFER)) & !UNBLOCKABLE`;
   `SA_RESETHAND` resets `act.handler` to `DEFAULT`. Loop repeats to stack further signals.
 - Post-loop: if no handler ran, restores `saved_sigmask` (from `rt_sigsuspend`/`ppoll`/`pselect6`/
@@ -173,9 +177,10 @@ construction (`kernel/vdso`).
 
 ### Signal syscalls, `SignalFd` and clone/exec transitions
 
-- `rt_sigaction`: `size == 8`; rejects setting `SIGKILL`/`SIGSTOP` (querying allowed) or any
-  `immutable` signal; masks flags with `UAPI_SA_FLAGS` (so `SA_UNSUPPORTED` probes see 5.11+);
-  becoming ignored discards pending instances from `cx.t.group` and its threads.
+- `rt_sigaction`: `size == 8`; rejects setting (`act != 0`) `SIGKILL`/`SIGSTOP` or any
+  `immutable` signal (querying with `act == 0` is allowed); masks flags with `UAPI_SA_FLAGS`
+  (so `SA_UNSUPPORTED` probes see 5.11+); becoming ignored discards pending instances from
+  `cx.t.group` and its threads.
 - `rt_sigprocmask` (`size == 8`), `rt_sigpending` (`size <= 8`), `rt_sigsuspend` (`saved_sigmask`,
   `ERESTARTNOHAND`), `rt_sigtimedwait` (`signal::take`, `EAGAIN`, `EINTR` on other signals),
   `sigaltstack` (`SS_DISABLE`/`SS_ONSTACK`/`SS_AUTODISARM`, min 5120).
@@ -189,8 +194,9 @@ construction (`kernel/vdso`).
   `POLLIN` alone (using `task::current()` on guest threads, fallback `group` off-thread) with
   `wake::SIGNAL` and `wake::of(s)` for mask updates.
 - `execve`/`execveat`: unshares `sighand`, calls `reset_on_exec` (caught -> default, `SIG_IGN`
-  preserved), clears `altstack` and `saved_sigmask`, preserves `sigmask` and pending signals, and
-  self-kicks if interrupted. `clone`/`clone3`: inherits `sigmask`, starts with empty pending;
+  preserved), clears `altstack`, `TaskState::restart` and `saved_sigmask`, preserves `sigmask` and
+  pending signals, and self-kicks if interrupted. `clone`/`clone3`: inherits `sigmask`, starts with
+  empty pending;
   `CLONE_SIGHAND` shares handlers, `CLONE_CLEAR_SIGHAND` resets them; `CLONE_VM && !CLONE_VFORK`
   clears `altstack`. `unshare(CLONE_SIGHAND)` succeeds only when already unshared.
 
@@ -313,24 +319,7 @@ construction (`kernel/vdso`).
 - **Synthesized abort ESRs differ from Linux's:** every translation fault reports level-3 FSC `0x07`
   and every fault inside a mapping reports level-3 permission FSC `0x0f`, rather than the real
   table walk level or translation-fault-on-unpopulated-page semantics.
-- **`TaskState::restart` is not cleared on `execve` or `EINTR` conversion:** when `deliver` turns
-  `ERESTART_RESTARTBLOCK` into `EINTR` for a handler, or on `execve`, `TaskState::restart` stays
-  populated so a subsequent explicit `restart_syscall(128)` could resume a stale sleep/futex.
-- **`sigaltstack` mutates state before writing `uoss`:** `cx.t.altstack` is updated before copying
-  the old stack to user memory, leaving the new stack installed if `uoss` faults with `EFAULT`.
-- **`retarget` can wake a ptrace-stopped thread:** unlike `send_group` (which checks
-  `trace.stop.is_none()`), `retarget` checks only `!sigmask` and clears those bits from `set`, so
-  it can wake a ptrace-stopped thread that will not consume the signal while stopped and fail to
-  wake other eligible siblings.
-- **`kill(i32::MIN, sig)` overflows `-p` in debug builds:** `pid_args` leaves `i32::MIN`
-  unchanged, causing `-p` in `syscall::sig::kill` to panic in debug builds.
-- **Cross-pidns `si_pid` from child to ancestor namespace:** `kill`/`tkill`/`tgkill`/
-  `pidfd_send_signal` (when `uinfo == 0`) store `cx.pid_out(me)` in the sender's pidns and
-  `for_target` never translates `si_pid` to the target's pidns at any level (returning early at
-  `ns.level == 0` and only zeroing invisible senders at `ns.level > 0`), so a signal from a child
-  pidns to an ancestor pidns carries the child-ns PID instead of its PID in the target namespace.
-- **`rt_sigaction` query/shared-group edge cases:** `immutable` is checked even when `act == 0`
-  (rejecting queries with `EINVAL`), and discarding pending signals when becoming ignored only
+- **`rt_sigaction` shared-group discard:** discarding pending signals when becoming ignored only
   covers `cx.t.group`, not sibling `CLONE_SIGHAND` non-`CLONE_THREAD` groups.
 - **Minor divergences:** `settimeofday` skips argument validation and `clock_settime` returns
   `EINVAL` for CPU clocks where Linux returns `EPERM`; `rt_sigreturn` silently drops DAIF bits

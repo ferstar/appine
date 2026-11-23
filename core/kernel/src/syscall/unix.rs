@@ -349,8 +349,11 @@ pub(super) fn send(
             let mut c = tx.borrow_mut();
             if c.eof || c.closed {
                 drop(c);
-                let e = epipe(cx, flags);
-                return if done > 0 { Ok(done) } else { Err(e) };
+                return if done > 0 {
+                    Ok(done)
+                } else {
+                    Err(epipe(cx, flags))
+                };
             }
             if ty == SOCK_SEQPACKET {
                 if data.len() > CAPACITY {
@@ -714,6 +717,7 @@ fn deliver(
 /// already installed, are closed again (Linux installs a file only once its number is written,
 /// `receive_fd_user`).
 pub(super) fn drop_passed_files(cx: &mut Cx<'_>, control: &[u8]) {
+    let mut closed = Vec::new();
     let mut off = 0;
     while let Some(h) = control.get(off..off + CMSG_HDR) {
         let len = u64::from_le_bytes(h[..8].try_into().unwrap()) as usize;
@@ -725,12 +729,18 @@ pub(super) fn drop_passed_files(cx: &mut Cx<'_>, control: &[u8]) {
         if (level, ty) == (SOL_SOCKET, SCM_RIGHTS) {
             let data = control.get(off + CMSG_HDR..off + len).unwrap_or_default();
             for fd in data.chunks_exact(4) {
-                let _ = cx
+                if let Ok(file) = cx
                     .fds_mut()
-                    .close(i32::from_le_bytes(fd.try_into().unwrap()));
+                    .close(i32::from_le_bytes(fd.try_into().unwrap()))
+                {
+                    closed.push(file);
+                }
             }
         }
         off += len.next_multiple_of(8);
+    }
+    if !closed.is_empty() {
+        crate::unix::released(cx.k(), closed);
     }
 }
 

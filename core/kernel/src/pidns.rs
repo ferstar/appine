@@ -167,6 +167,7 @@ impl PidNs {
 
     /// The process with global number `g` is visible here (it is in this namespace or a
     /// descendant).
+    #[cfg(test)]
     pub fn sees(&self, g: Tid) -> bool {
         self.vnr(g).is_some()
     }

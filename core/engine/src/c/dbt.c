@@ -449,10 +449,6 @@ static void release(struct appine_dbt *d)
     dbt_zfree(d, sizeof(*d));
 }
 
-/* Statistics of an instance itself while no threads are attached (flushing and checking when it
- * is taken out of or put back into the pool) */
-static struct appine_dbt_stats spare_stats;
-
 struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs)
 {
     const struct regs *r = &reg_sets[regs];
@@ -479,7 +475,7 @@ struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs)
         return NULL;
     pthread_mutex_init(&d->lock, NULL);
     pthread_cond_init(&d->flushed, NULL);
-    d->st = &spare_stats;
+    d->st = &d->spare_stats;
     d->cache = appine_map_code(CODE_CACHE_BYTES, &d->rw_delta);
     if (d->cache && d->rw_delta)
         d->written = dbt_zalloc(sizeof(*d->written));
@@ -539,7 +535,7 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
         release(d);
         return;
     }
-    d->st = &spare_stats;
+    d->st = &d->spare_stats;
     size_t words = d->used_words - d->routine_words;
     /* Keep the translations when there are not many blocks: checking them once before the next
      * user running the same program runs (recheck) is much cheaper than copying templates block by
@@ -796,7 +792,7 @@ void appine_dbt_detach(struct appine_dbt_thread *t)
     if (!t)
         return;
     struct appine_dbt *d = t->d;
-    lock_dbt(d, &spare_stats);
+    lock_dbt(d, &d->spare_stats);
     for (struct appine_dbt_thread **p = &d->threads; *p; p = &(*p)->next) {
         if (*p == t) {
             *p = t->next;
@@ -892,7 +888,7 @@ void appine_dbt_set_memops(struct appine_dbt *d, const struct appine_dbt_memop *
      * block sees the updated registrations, and any in-flight R_INTERP at a removed PC sees NONE. */
     m->older = old;
     __atomic_store_n(&d->memops, m, __ATOMIC_RELEASE);
-    d->st = &spare_stats;
+    d->st = &d->spare_stats;
     struct retire_batch r = {.n = 0};
     unsigned oi = 0, ni = 0;
     bool ok = true;
@@ -1017,11 +1013,15 @@ static bool exec_memop(struct appine_cpu *c, uint32_t kind)
         uint64_t dst = untag(raw_dst), src = untag(raw_src), n = c->x[2];
         if (n > MEMOP_MAX_BYTES)
             return false;
-        if (dst == src || n == 0)
+        if (n == 0)
             return true;
         if (!memop_check_range(mmu, dst, n, APPINE_PROT_WRITE) ||
             !memop_check_range(mmu, src, n, APPINE_PROT_READ))
             return false;
+        if (dst == src) {
+            memop_warm_tlb(c, raw_dst, APPINE_ACCESS_WRITE);
+            return true;
+        }
         if (dst > src && dst < src + n) {
             uint64_t rem = n;
             while (rem > 0) {
@@ -1183,7 +1183,7 @@ void appine_dbt_trust(struct appine_dbt *d, const struct appine_dbt_source *s, s
 void appine_dbt_retire_outside(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
 {
     pthread_mutex_lock(&d->lock);
-    d->st = &spare_stats; /* the previous thread holding the lock may have detached already */
+    d->st = &d->spare_stats; /* the previous thread holding the lock may have detached already */
     struct retire_batch r = {.n = 0};
     for (size_t i = 0; i < d->table_count; i++) {
         struct block *b = &d->blocks[i];
@@ -1269,6 +1269,29 @@ static void code_changed(struct appine_dbt_thread *t, const struct appine_cpu *c
     lock_dbt(t->d, &t->stats);
     dbt_invalidate_locked(t->d, c->mmu, addr & ~(uint64_t)PAGE_MASK, APPINE_PAGE_SIZE);
     unlock_dbt(t->d);
+}
+
+/* Patch an already-translated link point; when branch_site is non-NULL the caller holds d->lock
+ * as the sole attached thread, and icache sync finishes before returning */
+static void patch_existing_link(const struct appine_dbt *d, uint32_t *site, uint32_t *branch_site,
+                                const uint32_t *target)
+{
+    uint32_t b = enc_b((intptr_t)target - (intptr_t)site);
+    /* Read through the execution address; see relink_word */
+    bool again = __atomic_load_n(site, __ATOMIC_RELAXED) == b;
+    __atomic_store_n(rw(d, site), b, __ATOMIC_RELAXED);
+    bool branch = branch_site && dbt_relink_word(d, branch_site, target);
+    if (again || branch) {
+        /* Already changed (yet this thread still executed the old instruction), or a non-CMODX
+         * conditional branch was rewritten: do one full sync */
+        struct syncs sync = {.n = 0};
+        sync_add(&sync, site, site + 1);
+        if (branch)
+            sync_add(&sync, branch_site, branch_site + 1);
+        dbt_sync_all(d, &sync);
+    } else {
+        dbt_publish_link(d, site);
+    }
 }
 
 static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
@@ -1366,14 +1389,15 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
                 !(patch_shared && found)) {
                 *rw(d, patch_site) = enc_b((intptr_t)target - (intptr_t)patch_site);
                 /* Conditional branches are not among the instructions CMODX allows to be modified
-                 * concurrently: do not change it when there are other threads */
+                 * concurrently: do not change it when there are other threads, and finish icache
+                 * sync before unlocking so no newly attached thread can fetch it concurrently */
                 bool branch = patch_branch_site && alone && dbt_relink_word(d, patch_branch_site, target);
-                if (sync.n) { /* the new block is synced anyway, so the link point goes with it */
+                if (sync.n || branch) {
                     sync_add(&sync, patch_site, patch_site + 1);
                     if (branch)
                         sync_add(&sync, patch_branch_site, patch_branch_site + 1);
                 } else {
-                    dbt_publish_link(d, patch_site, branch ? patch_branch_site : NULL);
+                    dbt_publish_link(d, patch_site);
                 }
             }
             dbt_sync_all(d, &sync);
@@ -1392,25 +1416,20 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
              * where the patch would make the entry branch to itself (hence target != patch_site)
              */
             uint32_t *target = patch_forward ? code + ENTRY_CHECK_WORDS : code;
-            if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&
-                target != patch_site && !(patch_shared && found)) {
-                uint32_t b = enc_b((intptr_t)target - (intptr_t)patch_site);
-                /* Read through the execution address; see relink_word */
-                bool again = __atomic_load_n(patch_site, __ATOMIC_RELAXED) == b;
-                __atomic_store_n(rw(d, patch_site), b, __ATOMIC_RELAXED);
-                bool branch = patch_branch_site && __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1 &&
-                              dbt_relink_word(d, patch_branch_site, target);
-                if (again) {
-                    /* Already changed, yet this thread still executed the old instruction: do
-                     * one full sync */
-                    struct syncs sync = {.n = 0};
-                    sync_add(&sync, patch_site, patch_site + 1);
-                    if (branch)
-                        sync_add(&sync, patch_branch_site, patch_branch_site + 1);
-                    dbt_sync_all(d, &sync);
-                } else {
-                    dbt_publish_link(d, patch_site, branch ? patch_branch_site : NULL);
+            if (patch_branch_site && __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1) {
+                /* Conditional branches are not CMODX-safe: serialize against appine_dbt_attach
+                 * under d->lock and finish icache sync before unlocking */
+                lock_dbt(d, &t->stats);
+                if (!__atomic_load_n(&d->flushing, __ATOMIC_RELAXED) &&
+                    patch_generation == d->generation && target != patch_site &&
+                    !(patch_shared && found)) {
+                    bool alone = d->threads == t && !t->next;
+                    patch_existing_link(d, patch_site, alone ? patch_branch_site : NULL, target);
                 }
+                unlock_dbt(d);
+            } else if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&
+                       target != patch_site && !(patch_shared && found)) {
+                patch_existing_link(d, patch_site, NULL, target);
             }
             patch_site = NULL;
         }

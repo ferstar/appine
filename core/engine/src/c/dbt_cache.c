@@ -93,14 +93,10 @@ void dbt_sync_range(const struct appine_dbt *d, const uint32_t *start, const uin
  * doing an isb: at java startup each block is linked once or twice, and a full sync each time
  * waits for the invalidation broadcast to complete, which took a fifth of the startup time.
  */
-void dbt_publish_link(const struct appine_dbt *d, uint32_t *site, uint32_t *branch)
+void dbt_publish_link(const struct appine_dbt *d, uint32_t *site)
 {
     publish_code_lazily(site, site + 1, d->rw_delta);
-    if (branch)
-        publish_code_lazily(branch, branch + 1, d->rw_delta);
     note_written(d, site, site + 1);
-    if (branch)
-        note_written(d, branch, branch + 1);
 }
 
 
@@ -317,6 +313,15 @@ void dbt_table_insert(struct appine_dbt *d, uint64_t pc, unsigned tag, uint32_t 
     __atomic_store_n(&t->slots[i].pc, tagged(pc, tag), __ATOMIC_RELAXED);
     __atomic_store_n(&t->slots[i].code, code, __ATOMIC_RELEASE);
     unsigned h = page_bucket(pc >> APPINE_PAGE_SHIFT);
+    /* If a parked block for the same key was left behind when dbt_revive stopped early at high
+     * table load, retire it now so a later revive cannot insert a duplicate key */
+    if (UNLIKELY(d->page_parked[h])) {
+        for (uint32_t j = d->page_head[h]; j; j = d->blocks[j - 1].next) {
+            struct block *old = &d->blocks[j - 1];
+            if (old->parked && old->pc == pc && old->tag == tag)
+                dbt_kill_parked(d, old);
+        }
+    }
     memcpy(d->words + d->words_used, guest, nguest * 4);
     d->blocks[d->table_count] =
         (struct block){pc, code, d->page_head[h], (uint32_t)d->words_used, nguest, 0, (uint16_t)tag, 0};
@@ -802,6 +807,14 @@ void dbt_recheck(struct appine_dbt *d, const struct appine_cpu *c)
  * reviving and flushing, the table would fill up, and neither insertion nor lookup would find an
  * empty slot. Lock held
  */
+static bool table_has_key(const struct table *t, uint64_t key)
+{
+    for (size_t i = table_index(t, key); t->slots[i].code; i = (i + 1) & table_mask(t))
+        if (t->slots[i].pc == key)
+            return true;
+    return false;
+}
+
 static void table_relink(struct appine_dbt *d, size_t k)
 {
     struct table *t = d->table;
@@ -861,6 +874,10 @@ void dbt_revive(struct appine_dbt *d, const struct appine_cpu *c, uint64_t pc)
         struct block *b = &d->blocks[i - 1];
         if (!b->parked || b->pc >> APPINE_PAGE_SHIFT != page)
             continue;
+        if (table_has_key(d->table, block_key(b))) {
+            dbt_kill_parked(d, b);
+            continue;
+        }
         if (!block_matches(d, c->mmu, b, &p, &host)) {
             /* The page has no entry yet (large mappings fill entries on demand): keep it; when
              * the dispatcher cannot fetch the instruction, Tier 0 reports the page fault, and it

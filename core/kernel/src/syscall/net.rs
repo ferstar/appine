@@ -266,7 +266,7 @@ fn same_host(a: &[u8], b: &[u8]) -> bool {
 }
 
 pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     let addr = read_addr(cx, addr, len)?;
     if is_unix(&sock) {
         return unix::bind(cx, &sock, &addr).map(|()| 0);
@@ -565,7 +565,7 @@ fn inet_bind_addr(family: i32, raw: bool, mut addr: Vec<u8>) -> Result<Vec<u8>, 
 }
 
 pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             let src = s
@@ -635,7 +635,7 @@ pub(super) fn accept4(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, flags: 
     }
     let newfd = cx.fds_mut().reserve(0)?;
     let accepted = (|| {
-        let (sock, nonblock) = socket_of(cx, fd)?;
+        let (_file, sock, nonblock) = socket_of(cx, fd)?;
         let (new, peer) = if is_unix(&sock) {
             unix::accept(cx, &sock, nonblock)?
         } else {
@@ -742,7 +742,7 @@ fn accept_host(
 }
 
 pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
     let addr = read_addr(cx, addr, len)?;
     if is_unix(&sock) {
         return unix::connect(cx, &sock, nonblock, &addr).map(|()| 0);
@@ -1144,7 +1144,7 @@ pub(super) fn getpeername(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64) -> 
 }
 
 fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     let value = match &*sock.borrow() {
         Socket::Inet(s) if peer && s.stub_peer => stub_addr(s.family),
         // The host connection of a UDP socket the aggregation point watches may have been changed
@@ -1291,7 +1291,7 @@ pub(super) fn setsockopt(
     const SO_RCVBUF: i32 = 8;
     const SO_SNDBUFFORCE: i32 = 32;
     const SO_RCVBUFFORCE: i32 = 33;
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     let name = new_timeouts(level, name);
     let optlen = len;
     let len = (len as usize).min(256);
@@ -1703,7 +1703,7 @@ pub(super) fn getsockopt(
     value: u64,
     len: u64,
 ) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     let name = new_timeouts(level, name);
     let room = usize::try_from(i32::from_le_bytes(get(cx, len)?)).map_err(|_| Errno::EINVAL)?;
     let encode_tv = encode_timeval;
@@ -1949,7 +1949,7 @@ pub(super) fn sendto(
     addr: u64,
     addrlen: u32,
 ) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
     let len = len.min(MSG_MAX);
     let mut data = vec![0u8; len];
     cx.mm().read(UserSlice::new(buf, len), &mut data)?;
@@ -1970,7 +1970,7 @@ pub(super) fn recvfrom(
     addr: u64,
     addrlen: u64,
 ) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
     let m = recv(cx, &sock, nonblock, len, 0, flags)?;
     cx.mm().write(UserSlice::new(buf, m.data.len()), &m.data)?;
     let more = recv_rest(cx, &sock, nonblock, m.len, len, flags, |cx, off, d| {
@@ -2035,7 +2035,7 @@ pub(super) fn sendmmsg(cx: &mut Cx<'_>, fd: i32, vec: u64, vlen: u32, flags: u32
 }
 
 pub(super) fn sendmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
     let MsgHdr {
         name,
         namelen,
@@ -2096,7 +2096,7 @@ pub(super) fn recvmmsg(
 }
 
 pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
     let MsgHdr {
         name,
         namelen,
@@ -2131,42 +2131,53 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         controllen.min(4096)
     };
     let mut m = recv(cx, &sock, nonblock, total, room, flags)?;
-    scatter(cx, &iovecs, 0, &m.data)?;
-    let more = recv_rest(cx, &sock, nonblock, m.len, total, flags, |cx, off, d| {
-        scatter(cx, &iovecs, off, d)
-    });
-    // Write msg_namelen, msg_controllen, msg_flags back to the msghdr
-    if name != 0 {
-        let n = (namelen as usize).min(m.addr.len());
-        cx.mm().write(UserSlice::new(name, n), &m.addr[..n])?;
-        put(cx, msg + 8, (m.addr.len() as u32).to_le_bytes())?;
-    }
-    let mut n = controllen.min(m.control.len());
-    // A control buffer that cannot be written loses its messages, not the data: the passed files
-    // are not installed (receive_fd_user) and MSG_CTRUNC is set
-    if n > 0
-        && cx
-            .mm()
-            .write(UserSlice::new(control, n), &m.control[..n])
-            .is_err()
-    {
+    let unix_sock = is_unix(&sock);
+    let mut dropped = false;
+    let res = (|| {
+        scatter(cx, &iovecs, 0, &m.data)?;
+        let more = recv_rest(cx, &sock, nonblock, m.len, total, flags, |cx, off, d| {
+            scatter(cx, &iovecs, off, d)
+        });
+        // Write msg_namelen, msg_controllen, msg_flags back to the msghdr
+        if name != 0 {
+            let n = (namelen as usize).min(m.addr.len());
+            cx.mm().write(UserSlice::new(name, n), &m.addr[..n])?;
+            put(cx, msg + 8, (m.addr.len() as u32).to_le_bytes())?;
+        }
+        let mut n = controllen.min(m.control.len());
+        // A control buffer that cannot be written loses its messages, not the data: the passed
+        // files are not installed (receive_fd_user) and MSG_CTRUNC is set
+        if n > 0
+            && cx
+                .mm()
+                .write(UserSlice::new(control, n), &m.control[..n])
+                .is_err()
+        {
+            if unix_sock {
+                unix::drop_passed_files(cx, &m.control);
+                dropped = true;
+            }
+            m.flags |= MSG_CTRUNC;
+            n = 0;
+        }
+        put(cx, msg + 40, (n as u64).to_le_bytes())?;
+        // As on Linux, msg_flags echoes the MSG_CMSG_CLOEXEC the caller gave
+        const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
+        put(
+            cx,
+            msg + 48,
+            (m.flags | flags & MSG_CMSG_CLOEXEC).to_le_bytes(),
+        )?;
+        Ok((if flags & MSG_TRUNC != 0 {
+            m.len
+        } else {
+            m.data.len()
+        } + more) as u64)
+    })();
+    if res.is_err() && unix_sock && !dropped {
         unix::drop_passed_files(cx, &m.control);
-        m.flags |= MSG_CTRUNC;
-        n = 0;
     }
-    put(cx, msg + 40, (n as u64).to_le_bytes())?;
-    // As on Linux, msg_flags echoes the MSG_CMSG_CLOEXEC the caller gave
-    const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
-    put(
-        cx,
-        msg + 48,
-        (m.flags | flags & MSG_CMSG_CLOEXEC).to_le_bytes(),
-    )?;
-    Ok((if flags & MSG_TRUNC != 0 {
-        m.len
-    } else {
-        m.data.len()
-    } + more) as u64)
+    res
 }
 
 /// Writes `data` over the iovecs in order, starting `off` bytes into them.
@@ -2271,7 +2282,7 @@ pub(super) fn rw(
 }
 
 pub(super) fn shutdown(cx: &mut Cx<'_>, fd: i32, how: i32) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             const SHUT_RD: i32 = 0;
@@ -4403,15 +4414,20 @@ fn is_local(addr: &[u8]) -> bool {
 
 // ---- Shared helpers ----
 
-/// The socket of an fd; ENOTSOCK when it is not a socket.
-fn socket_of(cx: &Cx<'_>, fd: i32) -> Result<(SocketRef, bool), Errno> {
+/// The open file and socket of an fd; ENOTSOCK when it is not a socket. Keeping the [`FileRef`]
+/// alive for the duration of the syscall ensures `unix::collect` sees the socket as referenced
+/// while a blocking call waits.
+fn socket_of(cx: &Cx<'_>, fd: i32) -> Result<(FileRef, SocketRef, bool), Errno> {
     let file = cx.fds().get(fd)?;
-    let f = file.borrow();
-    match &f.kind {
-        _ if f.flags & oflags::O_PATH != 0 => Err(Errno::EBADF),
-        FileKind::Socket(s) => Ok((s.clone(), f.nonblocking())),
-        _ => Err(Errno::ENOTSOCK),
-    }
+    let (sock, nonblock) = {
+        let f = file.borrow();
+        match &f.kind {
+            _ if f.flags & oflags::O_PATH != 0 => return Err(Errno::EBADF),
+            FileKind::Socket(s) => (s.clone(), f.nonblocking()),
+            _ => return Err(Errno::ENOTSOCK),
+        }
+    };
+    Ok((file, sock, nonblock))
 }
 
 /// AF_UNIX operations that wait or need the socket itself are handed to [`unix`].

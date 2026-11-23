@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: condense map in place)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: validate sched_setattr policy before nice check and commit atomically)
 
 ## Responsibilities
 
@@ -400,8 +400,6 @@ and `kernel/oom`.
 
 ## Confirmed bugs / technical debt
 
-- **`sched_setattr` changes the policy before the nice check**, so a refused nice value can leave
-  the policy (and reset-on-fork) changed.
 - **Latent hazards:** BKL-release wake matching runs outside `bug::catch` (`kernel/bug`, panic leaves
   BKL locked); unlocked wake requests use a global fallback consumable by any kernel instance.
 

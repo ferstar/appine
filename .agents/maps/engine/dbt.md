@@ -4,6 +4,8 @@
 > See `.agents/decisions/engine/dbt.md` for the paired decision history (decisions from before the split remain in `.agents/decisions/engine.md`: D6–D10, D13–D16, D18, D23, D25, D27–D29, and the Tier 1 halves of D2, D5, D17, D20, D22 and D24).
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: serialize conditional-branch relinking, deduplicate dbt_revive, validate exec_memop self-copies and per-instance spare_stats)
 
 ## Responsibilities
 
@@ -209,9 +211,10 @@ triggers (`kernel/oom`).
   single-site conditional branches relinked directly before publication); inline unconditional
   `B`/`BL`, fallthrough `R_CHAIN_FWD`, and `BL`/`BLR` landing pads link lazily on first execution.
   Runtime patching enforces matching `generation`, `target != patch_site`, and no shared->private
-  link; conditional-branch relinking requires being the sole attached thread (`alone` under lock,
-  or relaxed `nthreads == 1` lock-free). Patching uses lazy cache maintenance unless the patching
-  thread hits an already-patched site (`dbt_sync_all`).
+  link; conditional-branch relinking always runs under `d->lock` with `alone` (`d->nthreads == 1`
+  is only a lock-free hint before taking `d->lock`) and finishes full icache sync before unlocking.
+  Unconditional `b -> b` patching uses lazy cache maintenance unless the patching thread hits an
+  already-patched site (`dbt_sync_all`).
 - Forward direct links skip the 2-word entry kick check (`code + 2`); backward/self links and
   indirect jumps land at `code + 0`, so every loop checks `pending`.
 - Indirect branches (`BR`/`BLR`/`RET`) probe the thread's 4096-entry direct-mapped jump cache
@@ -295,7 +298,9 @@ triggers (`kernel/oom`).
   parkable. First `dbt_run` runs `dbt_recheck`: unmapped single-page parkable blocks are parked;
   cross-page and other mismatches are invalidated; if non-parkable mismatches exceed half of live
   blocks, a full flush is requested instead. First lookup miss on a page with `page_parked > 0`
-  calls `dbt_revive`, restoring matching blocks in batches of 32 and relinking tombstones in place.
+  calls `dbt_revive`, restoring matching blocks in batches of 32 and relinking tombstones in place
+  (skipping and killing any parked block whose key is already live; `dbt_table_insert` also kills
+  any parked duplicate in the page bucket when installing a fresh block).
 - Code groups: `new_tag` issues `1..65535` (0 when exhausted); `share` publishes immutable sorted
   `shared_ranges` (tag 0 vs private `tag`); `retire_outside` retires tag-0 blocks outside shared
   ranges before multi-member sharing.
@@ -371,24 +376,6 @@ triggers (`kernel/oom`).
 
 ## Confirmed bugs / technical debt
 
-- **Lock-free conditional-branch relinking races a newly attached thread:** in `dbt_run`'s
-  lock-free link-patch path, `dbt_relink_word` is gated only on a relaxed `d->nthreads == 1` load
-  without holding `d->lock`. Because the kernel attaches threads and code-group members without
-  stopping running ones, a conditional branch can be rewritten while a second thread fetches it
-  (non-CMODX on aarch64).
-- **`dbt_revive` can insert a duplicate key into the open-addressed table:** if `dbt_revive` stops
-  early when the table approaches 3/4 load, an unrevived parked block stays parked while `dbt_run`
-  translates and installs a fresh live block for the same key; a later miss on that page can revive
-  the old parked block and call `table_relink` without checking whether the key is already present.
-- **`exec_memop` `dst == src` shortcut skips page validation:** for `memcpy`/`memmove` with
-  `dst == src` and `n <= 64 MiB`, `exec_memop` returns success before `memop_check_range`, so an
-  unmapped or read-only self-copy with `n >= 128` succeeds as a no-op instead of faulting (unlike
-  the in-cache same-page helper, which validates write+read TLB first).
-- **Concurrent unsynchronized writes to global `spare_stats`:** multiple distinct `appine_dbt`
-  instances share one static dummy `spare_stats` sink written without cross-instance
-  synchronization during `appine_dbt_free`, `appine_dbt_set_memops` and `appine_dbt_retire_outside`
-  (undefined behavior in C, though never read; `appine_dbt_new` and `appine_dbt_detach` only point
-  `d->st` at it).
 - **Test-only public API:** `Dbt::recheck` (`appine_dbt_recheck`) is called only by
   `core/engine/tests/dbt.rs`; production reuse sets `d->stale` internally on pool return.
 

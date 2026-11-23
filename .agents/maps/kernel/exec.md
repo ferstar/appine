@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: ELF memop symbol discovery and file-offset cache)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: clear TaskState::restart on execve and fail Machine::spawn on doomed images)
 
 ## Responsibilities
 
@@ -87,7 +87,8 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   `PER_CLEAR_ON_SETID` flags (`kernel/cred`); commit the credentials; clear POSIX timers and AIO;
   unshare and reset signal handlers; release the old address space (robust list,
   `clear_child_tid`, vfork) and install the new one with the CPU state reset, reaping shm
-  segments marked for removal it held last; reset the alternate stack and comm; set PC and SP;
+  segments marked for removal it held last; reset the alternate stack, `TaskState::restart` and
+  comm; set PC and SP;
   force the `SIGSEGV` of a doomed image; re-kick if interrupted. The run loop then re-attaches the
   translator.
 
@@ -172,8 +173,8 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 - The unlocked build of the new image touches only the new address space and structures that lock
   themselves (the kernel's file mappings), and re-checks after re-taking the BKL whether the thread
   was killed meanwhile.
-- A doomed image commits like any other and dies only afterwards, so callers that skip the commit
-  (`Machine::spawn`) must check `Image::doomed` themselves.
+- A doomed image commits like any other on execve and dies only afterwards; `Machine::spawn`
+  checks `Image::doomed` and fails with `LoadError::Malformed` instead of starting it.
 
 ## Confirmed bugs / technical debt
 
@@ -183,9 +184,8 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   `ETXTBSY`.
 - **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
   whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
-- **Doomed images:** `Machine::spawn` ignores `Image::doomed` and starts the program at pc 0 and
-  sp 0 instead of failing the spawn; execve reports its ptrace exec event (and a successful syscall
-  exit) for a doomed image, where Linux fails the exec before the event.
+- **Doomed images:** execve reports its ptrace exec event (and a successful syscall exit) for a
+  doomed image, where Linux fails the exec before the event.
 
 ## Open questions
 

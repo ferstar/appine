@@ -280,6 +280,11 @@ impl Machine {
         };
         let image =
             loader::load(&mut mm, &file, &args, &mut read_interp).map_err(RunError::Load)?;
+        if image.doomed {
+            return Err(RunError::Load(loader::LoadError::Malformed(
+                "program image cannot be mapped",
+            )));
+        }
         let walked = vfs.as_ref().and_then(|vfs| {
             vfs.walk(
                 &offline,

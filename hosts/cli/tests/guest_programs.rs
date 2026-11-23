@@ -904,6 +904,95 @@ fn missing_program_exits_127() {
     assert_eq!(out.status.code(), Some(127));
 }
 
+#[test]
+fn stability_regressions() {
+    let Some(program) = build_c_guest("stability") else {
+        return;
+    };
+    let bytes = std::fs::read(&program).unwrap();
+    let (_, store) = output("stability-store");
+    let (_, empty_dir) = output("stability-empty");
+    let (_, tar_path) = output("stability-empty.tar.gz");
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let tar = Command::new("tar")
+        .args(["-czf"])
+        .arg(&tar_path)
+        .args(["-C"])
+        .arg(&empty_dir)
+        .arg(".")
+        .status()
+        .expect("tar failed");
+    assert!(tar.success());
+    appine_kernel::import_rootfs(&store, &tar_path).unwrap();
+    appine_kernel::write_file(&store, "/stability", &bytes, 0o755, true, 0, 0).unwrap();
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--rootfs"])
+            .arg(&store)
+            .args(["--tier", tier, "/stability"])
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: stdout={} stderr={}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: stdout={}",
+            stdout(&out)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_file(&tar_path);
+}
+
+#[test]
+fn doomed_elf_fails_to_spawn() {
+    // Minimal 64-bit aarch64 ET_EXEC whose PT_LOAD has p_offset != p_vaddr (mod page),
+    // which loader::load marks as Image::doomed.
+    let mut elf = vec![0u8; 128];
+    elf[0..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // ELFDATA2LSB
+    elf[6] = 1; // EV_CURRENT
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    elf[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+    elf[24..32].copy_from_slice(&0x400078u64.to_le_bytes()); // e_entry
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    // PT_LOAD at offset 64: p_offset = 1, p_vaddr = 0x400000 (misaligned within page -> doomed)
+    elf[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf[68..72].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+    elf[72..80].copy_from_slice(&1u64.to_le_bytes()); // p_offset
+    elf[80..88].copy_from_slice(&0x400000u64.to_le_bytes()); // p_vaddr
+    elf[96..104].copy_from_slice(&16u64.to_le_bytes()); // p_filesz
+    elf[104..112].copy_from_slice(&16u64.to_le_bytes()); // p_memsz
+    elf[112..120].copy_from_slice(&4096u64.to_le_bytes()); // p_align
+
+    let (_, path) = output("doomed-elf");
+    std::fs::write(&path, &elf).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+        .arg(&path)
+        .output()
+        .expect("failed to run appine-run");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(126),
+        "doomed ELF must fail load instead of launching at pc 0: stderr={}",
+        stderr(&out)
+    );
+}
+
 /// Runs a guest program once under each tier, returning (tier, output).
 fn run(name: &str, args: &[&str]) -> Vec<(&'static str, Output)> {
     let program = build_guest(name);

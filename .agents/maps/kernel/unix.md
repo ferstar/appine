@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/unix.md` for the paired decision history.
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 10 confirmed and 2 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: pin FileRef across socket syscalls, drop SCM_RIGHTS on any recvmsg EFAULT and omit SIGPIPE on partial stream send)
 
 ## Responsibilities
 
@@ -156,8 +158,9 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   if buffer is 16..27 B), then `SCM_RIGHTS` installing as many fds as fit (`MSG_CMSG_CLOEXEC`,
   stopping on buffer/EMFILE with `MSG_CTRUNC` and dropping remaining files). A NULL control buffer
   forces `room = 0`; an unwritable control buffer in `recvmsg` closes installed fds via
-  `drop_passed_files`, sets `MSG_CTRUNC` and `msg_controllen = 0`, and still returns received data
-  bytes.
+  `drop_passed_files` (which calls `unix::released`), sets `MSG_CTRUNC` and `msg_controllen = 0`,
+  and still returns received data bytes; any other `EFAULT` in `recvmsg` after `recv` likewise
+  closes installed `SCM_RIGHTS` fds via `drop_passed_files`.
 - `block()` interruption: timed waits (`SO_RCVTIMEO`/`SO_SNDTIMEO`) interrupted by a signal return
   `EINTR`; untimed waits return `ERESTARTSYS` (partial stream sends and `MSG_WAITALL` reads return
   moved bytes instead).
@@ -200,8 +203,9 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   unreachable candidates' inboxes into a local `garbage: Vec<Packet>` and drops `inflight` then
   `garbage` after releasing all borrows.
 - Epoll `Interest`/`ExGate`/`Fasync`, OFD locks and inotify `doomed` hold `Weak<RefCell<OpenFile>>`
-  so they never pin cycles; `read_file`/`write_file`/`splice_read`, `ppoll`/`pselect6`, `epoll`
-  `EPOLLEXCLUSIVE` waits, `sendmsg` passed `files` and AIO `PendingPoll` hold strong `FileRef`s.
+  so they never pin cycles; `socket_of` (all socket syscalls), `read_file`/`write_file`/
+  `splice_read`, `ppoll`/`pselect6`, `epoll` `EPOLLEXCLUSIVE` waits, `sendmsg` passed `files` and
+  AIO `PendingPoll` hold strong `FileRef`s.
 
 ## Dependencies (inbound / outbound)
 
@@ -243,17 +247,6 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 
 ## Confirmed bugs / technical debt
 
-- **Blocked socket syscalls hold `SocketRef` instead of `FileRef` during GC:** `socket_of` drops
-  the temporary `FileRef` before blocking in `accept4`, `connect`, `sendto`, `sendmsg`, `recvfrom`
-  and `recvmsg`. Because `unix::collect` checks `Rc::strong_count` on `OpenFile`, a concurrent
-  `close` in another thread can let `collect` select the blocked socket as a candidate and empty
-  its inbox while the syscall is still waiting on `SocketRef`.
-- **Partial stream send raises `SIGPIPE` while returning `Ok(done)`:** in `unix::send`, peer
-  closure calls `epipe(cx, flags)` before checking `done > 0`, raising `SIGPIPE` even when returning
-  a positive partial byte count.
-- **`recvmsg` leaks installed `SCM_RIGHTS` fds on non-control `EFAULT`:** `drop_passed_files` runs
-  only when copying `control` faults, not when copying payload (`scatter`) or writing `msg_name`,
-  `msg_namelen`, `msg_controllen` or `msg_flags` faults with `EFAULT`.
 - **Connected datagram sends skip `unix_may_send`:** an unaddressed send to a connected peer that
   has since connected to a third socket succeeds instead of returning `EPERM` (connect and
   addressed sends do check).
@@ -267,7 +260,7 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   kind (`ECONNREFUSED`) before `MAY_WRITE` (`EACCES`), and pathname `bind` does not call
   `reject_trailing_slash` (creating the stripped path while storing the trailing-slash address).
 - **Delayed cycle collection on non-GC drop paths:** files dropped by `MSG_CTRUNC`/`EMFILE`,
-  `drop_passed_files`, `UnixSocket::drop`, `accept4` address-write failure, AIO `PendingPoll`
+  `UnixSocket::drop`, `accept4` address-write failure, AIO `PendingPoll`
   teardown, or non-last thread exit after `unshare(CLONE_FILES)` do not trigger `unix::collect`,
   leaving cycles alive until a later AF_UNIX close or last-thread exit.
 - **`recvmsg` copy faults can still lose data:** `can_write` checks only `total.min(queued)` VMA

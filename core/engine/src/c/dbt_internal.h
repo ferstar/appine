@@ -335,8 +335,10 @@ struct appine_dbt {
     /* A full flush is wanted: the caller asked for one, or a forwarding stub did not fit when
      * invalidating (read atomically) */
     bool flush_wanted;
-    /* Statistics of the lock holder: translations and invalidations are charged to it */
+    /* Statistics of the lock holder: translations and invalidations are charged to it; spare_stats
+     * is this instance's own sink when no thread owns the lock */
     struct appine_dbt_stats *st;
+    struct appine_dbt_stats spare_stats;
 };
 
 /* Registered mappings: [r[i][0], r[i][1]), sorted by start and non-overlapping */
@@ -881,7 +883,7 @@ void dbt_emit_routines(struct appine_dbt *d);
 size_t dbt_host_page_size(void);
 void dbt_drop_written(const struct appine_dbt *d);
 void dbt_sync_range(const struct appine_dbt *d, const uint32_t *start, const uint32_t *end);
-void dbt_publish_link(const struct appine_dbt *d, uint32_t *site, uint32_t *branch);
+void dbt_publish_link(const struct appine_dbt *d, uint32_t *site);
 void dbt_sync_all(const struct appine_dbt *d, struct syncs *s);
 bool dbt_relink_word(const struct appine_dbt *d, uint32_t *site, const uint32_t *target);
 void *dbt_zalloc(size_t bytes);

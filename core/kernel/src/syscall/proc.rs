@@ -1031,6 +1031,7 @@ fn exec(
     // last one
     crate::ipc::reap_shm(cx.k());
     cx.t.altstack = AltStack::default();
+    cx.t.restart = None;
     cx.task.saved_sigmask.set(None);
     cx.task.comm.set(process::comm_of(&comm));
     let st = cpu.state_mut();
