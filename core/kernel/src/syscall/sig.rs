@@ -373,17 +373,30 @@ pub(super) fn rt_sigaction(
     }
     if let Some(new) = new {
         sighand.borrow_mut().set(sig, new);
-        // Once changed to ignored, pending instances of the same signal are discarded (on the
-        // thread group and on every thread)
+        // Once changed to ignored, pending instances of the same signal are discarded across
+        // every thread group sharing these signal handlers (CLONE_SIGHAND) and all their threads.
         if sighand.borrow().ignores(sig) {
-            let threads = {
+            let bit = sig.bit();
+            let k = cx.kr();
+            if Rc::strong_count(&sighand) <= 2 {
                 let mut g = cx.t.group.borrow_mut();
-                g.pending.discard(sig.bit());
-                g.threads.clone()
-            };
-            for tid in threads {
-                if let Some(t) = cx.kr().tasks.get(&tid) {
-                    t.pending.borrow_mut().discard(sig.bit());
+                g.pending.discard(bit);
+                for tid in &g.threads {
+                    if let Some(t) = k.tasks.get(tid) {
+                        t.pending.borrow_mut().discard(bit);
+                    }
+                }
+            } else {
+                for group in k.groups.values() {
+                    let mut g = group.borrow_mut();
+                    if Rc::ptr_eq(&g.sighand, &sighand) {
+                        g.pending.discard(bit);
+                        for tid in &g.threads {
+                            if let Some(t) = k.tasks.get(tid) {
+                                t.pending.borrow_mut().discard(bit);
+                            }
+                        }
+                    }
                 }
             }
         }

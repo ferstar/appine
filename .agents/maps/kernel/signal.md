@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 16 claims checked by 3 independent verifiers — 12 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: fix kill(i32::MIN), retarget ptrace-stop skip, restart clearing, sigaltstack uoss ordering, cross-pidns si_pid and immutable queries)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: wait for all threads before CLD_STOPPED, omit SIGILL esr_context, CLONE_SIGHAND discard, rt_sigreturn DAIF/ESR/step, settimeofday/clock_settime)
 
 ## Responsibilities
 
@@ -94,9 +94,9 @@ construction (`kernel/vdso`).
 - `SIGKILL` skips queueing and calls `group_exit` (sets `exiting`, marks cgroup observation via
   `cgroups.task_changed`, sets `killed = true` and wakes all live threads).
 - Stop/cont mutual discard (`prepare`): stop signals (`19..=22`) discard pending `SIGCONT`;
-  `SIGCONT` discards pending stop signals, ends group stop (`CLD_CONTINUED`, clears
-  `trace.group_stop`, wakes `PTRACE_LISTEN` threads). Ignored unblocked untraced signals are
-  discarded at send time (`send_group` checks `threads.first()`).
+  `SIGCONT` discards pending stop signals, ends group stop (`CLD_CONTINUED` only if the stop had
+  completed, clears `stop_pending`, `trace.group_stop`, wakes `PTRACE_LISTEN` threads). Ignored
+  unblocked untraced signals are discarded at send time (`send_group` checks `threads.first()`).
 - Queueing: standard signals (1–31) coalesce, keeping the first sender's `SigInfo`; RT signals
   (32–64) queue FIFO bounded per thread group by `RLIMIT_SIGPENDING` (default 16384). On overflow,
   `kill` and kernel senders still set the pending bit without `SigInfo`; `tkill`/`tgkill` on RT
@@ -121,9 +121,11 @@ construction (`kernel/vdso`).
   `FPE`/`SYS`) before lowest number (updating POSIX timer overrun on `SI_TIMER`); offers ptrace
   signal-delivery stop unless `act.immutable`.
 - Dispositions: ignored/default-ignored/unkillable-init -> continue; default stop -> drop if
-  orphaned pgrp (except `SIGSTOP`), else `group_stop` (marks stopped, wakes siblings, sends
-  `CLD_STOPPED`); default fatal -> `group_exit`, `coredump::dump` if first exit and
-  core-generating, `ptrace::exit`, return `Flow::Exit`; handler -> frame setup.
+  orphaned pgrp (except `SIGSTOP`), else `group_stop` (marks stopped, sets `stop_pending` on
+  running threads, wakes siblings, and notifies parent with `CLD_STOPPED` once all threads stop
+  via `participate_group_stop`; if already stopped, re-enters silently without re-notifying);
+  default fatal -> `group_exit`, `coredump::dump` if first exit and core-generating,
+  `ptrace::exit`, return `Flow::Exit`; handler -> frame setup.
 - First-handler restart rules: if PC is still at `cont - 4`, `ERESTARTNOHAND`,
   `ERESTART_RESTARTBLOCK`, and `ERESTARTSYS` without `SA_RESTART` become `-EINTR` at `cont`;
   `ERESTARTNOINTR` (produced by `futex_lock_pi`) and `ERESTARTSYS` with `SA_RESTART` stay rewound.
@@ -151,17 +153,18 @@ construction (`kernel/vdso`).
 - Unwritable frame: restores any swapped `saved_sigmask`, leaves mask/handler unchanged, does not
   call `show_unhandled`, and forces `SIGSEGV` (`SI_KERNEL`) via `force_fatal` if `sig == SIGSEGV`
   else `force` (catchable on an altstack).
-- `rt_sigreturn` (nr 139, returning directly from `syscall::dispatch` without `syscall_stepped`):
-  validates before mutating — 16-byte-aligned SP, 4688 readable bytes, `pstate & 0x1f == 0`,
-  valid 16-byte-aligned `>= 16` `__reserved` records with exactly one 528-byte `fpsimd_context`,
-  any `esr_context` skipped, other magics `EINVAL`. Restores GPRs, SP, PC, pstate (`NZCV`, plus
-  `DIT` if advertised; DAIF silently masked off), FPSR/FPCR/V0–V31, `sigmask` and `altstack`
+- `rt_sigreturn` (nr 139, returning directly from `syscall::dispatch`): validates before mutating —
+  16-byte-aligned SP, 4688 readable bytes, `pstate & (0x1f | 0x3c0) == 0` (EL0t AArch64 with DAIF
+  clear), valid 16-byte-aligned `>= 16` `__reserved` records with exactly one 528-byte
+  `fpsimd_context`, at most one 16-byte `esr_context`, other magics `EINVAL`. Restores GPRs, SP,
+  PC, pstate (`NZCV`, plus `DIT` if advertised), FPSR/FPCR/V0–V31, `sigmask` and `altstack`
   (ignoring altstack errors). A bad frame leaves state intact, calls `show_unhandled` with
   `illegal memory access` (logging original `x0`), forces `SIGSEGV` at SP (`SEGV_ACCERR` if
   `Mm::mapped_above`, else `SEGV_MAPERR`), and then sets `x0 = 0`; both valid and bad paths run
-  `ptrace::syscall_exit` when traced and call `deliver(..., false)`.
+  `ptrace::syscall_exit` when traced, invoke `ptrace::syscall_stepped`, and call
+  `deliver(..., false)`.
 - Synchronous faults (`task::handle`, after recoverable CoW / demand-page / FUSE-fill / EOF-growth
-  / stack-growth checks): `Exit::Undefined` -> `SIGILL`/`ILL_ILLOPC` (`info.esr = ESR_IL`, EC 0);
+  / stack-growth checks): `Exit::Undefined` -> `SIGILL`/`ILL_ILLOPC` (no ESR);
   `Exit::Breakpoint` -> `SIGTRAP`/`TRAP_BRKPT` (no ESR); `Watchpoint`/`HwBreakpoint` ->
   `SIGTRAP`/`TRAP_HWBKPT` (no ESR); `Alignment`/`StackAlignment` -> `SIGBUS`/`BUS_ADRALN` (EC 0x24
   FSC 0x21 + WnR, EC 0x22, or EC 0x26); past-EOF/unreadable FUSE -> `SIGBUS`/`BUS_ADRERR` (level-3
@@ -179,8 +182,8 @@ construction (`kernel/vdso`).
 
 - `rt_sigaction`: `size == 8`; rejects setting (`act != 0`) `SIGKILL`/`SIGSTOP` or any
   `immutable` signal (querying with `act == 0` is allowed); masks flags with `UAPI_SA_FLAGS`
-  (so `SA_UNSUPPORTED` probes see 5.11+); becoming ignored discards pending instances from
-  `cx.t.group` and its threads.
+  (so `SA_UNSUPPORTED` probes see 5.11+); becoming ignored discards pending instances across all
+  thread groups sharing `sighand` (`CLONE_SIGHAND`) and their threads.
 - `rt_sigprocmask` (`size == 8`), `rt_sigpending` (`size <= 8`), `rt_sigsuspend` (`saved_sigmask`,
   `ERESTARTNOHAND`), `rt_sigtimedwait` (`signal::take`, `EAGAIN`, `EINTR` on other signals),
   `sigaltstack` (`SS_DISABLE`/`SS_ONSTACK`/`SS_AUTODISARM`, min 5120).
@@ -247,9 +250,10 @@ construction (`kernel/vdso`).
 - Unknown syscalls return `ENOSYS` from `syscall::dispatch`'s default arm and record
   `Stub::Syscall(nr)` (except `NO_SYSCALL` = `u64::MAX`). `FUSE_RETRY` (600) is absorbed in
   `syscall::dispatch`'s retry loop (max 16384 retries -> `EIO`).
-- Host time is read-only: `settimeofday` returns `EPERM` without reading args; `clock_settime`
-  validates timespec then returns `EPERM` for `CLOCK_REALTIME` and `EINVAL` for others;
-  `adjtimex`/`clock_adjtime` allow read-only queries (`appine_hal::adjtimex_query`: host
+- Host time is read-only: `settimeofday` validates `tv`/`tz` pointers (`EFAULT`) and
+  `tv_sec`/`tv_usec` ranges (`EINVAL`) before returning `EPERM`; `clock_settime` validates
+  timespec then returns `EPERM` for `CLOCK_REALTIME` and valid CPU clocks and `EINVAL` for
+  others; `adjtimex`/`clock_adjtime` allow read-only queries (`appine_hal::adjtimex_query`: host
   `SYS_adjtimex` on Linux, synthesized `STA_UNSYNC`/`TIME_ERROR` on Android to avoid app seccomp
   `SIGSYS`) and return `EPERM` on modifying modes.
 - `Stubs` (`Kernel::stubs`): tracks up to `128` distinct unimplemented paths (syscalls, prctl,
@@ -310,21 +314,10 @@ construction (`kernel/vdso`).
 
 ## Confirmed bugs / technical debt
 
-- **`CLD_STOPPED` is reported early:** `group_stop` notifies the parent as soon as the first thread
-  handles the stop signal while sibling threads may still be running (Linux notifies once all
-  threads stop).
-- **`SIGILL` frames carry an `esr_context` with EC 0:** `task::handle` sets `info.esr = ESR_IL`
-  (`0x0200_0000`) on `Exit::Undefined`, causing `setup_frame` to emit an `esr_context` where Linux
-  6.1 emits none for undefined instructions (even though `show_unhandled` receives `esr = 0`).
 - **Synthesized abort ESRs differ from Linux's:** every translation fault reports level-3 FSC `0x07`
   and every fault inside a mapping reports level-3 permission FSC `0x0f`, rather than the real
   table walk level or translation-fault-on-unpopulated-page semantics.
-- **`rt_sigaction` shared-group discard:** discarding pending signals when becoming ignored only
-  covers `cx.t.group`, not sibling `CLONE_SIGHAND` non-`CLONE_THREAD` groups.
-- **Minor divergences:** `settimeofday` skips argument validation and `clock_settime` returns
-  `EINVAL` for CPU clocks where Linux returns `EPERM`; `rt_sigreturn` silently drops DAIF bits
-  Linux rejects, accepts arbitrary 16-byte-aligned `ESR_MAGIC` records, and skips
-  `ptrace::syscall_stepped`; kernel-generated RT signals lose `SigInfo` when the queue is full;
+- **Minor divergences:** kernel-generated RT signals lose `SigInfo` when the queue is full;
   core file creation inherits process `umask` and `RLIMIT_FSIZE`, and `/proc/sys/fs/suid_dumpable`
   is recorded without affecting `bool dumpable`; `/dev/kmsg` zero-length `write` logs an empty
   record while zero-total `writev` does not.

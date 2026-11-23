@@ -973,6 +973,49 @@ fn ipc_poll_unix_regressions() {
 }
 
 #[test]
+fn sig_ptrace_tty_regressions() {
+    run_guest_in_empty_rootfs("sig_ptrace_tty");
+}
+
+#[test]
+fn sig_ptrace_tty_console_write_after_end() {
+    use appine_kernel::errno::Errno;
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
+    use std::os::unix::ffi::OsStrExt;
+
+    let hello = build_guest("hello");
+    let path = hello.as_os_str().as_bytes().to_vec();
+    for tier in [Tier::Interpreter, Tier::Dbt] {
+        let machine = Machine::start(&MachineOptions {
+            tier,
+            rootfs: None,
+            memory_limit: None,
+            low_port_offset: None,
+            always_map_low_ports: false,
+            exception_trace: false,
+        })
+        .unwrap();
+        let id = machine.open_console(24, 80).unwrap();
+        let pid = machine
+            .spawn(&path, &[b"hello".to_vec()], &[], Stdio::Console(id))
+            .unwrap();
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
+
+        // Drain all output until EOF (0).
+        let mut buf = [0u8; 256];
+        while machine.read_console(id, &mut buf).unwrap() > 0 {}
+
+        // Writing after the console session ended must fail with EIO and produce no echoes.
+        assert_eq!(
+            machine.write_console(id, b"late input\n"),
+            Err(Errno::EIO),
+            "{tier:?}"
+        );
+        assert_eq!(machine.read_console(id, &mut buf), Ok(0), "{tier:?}");
+    }
+}
+
+#[test]
 fn doomed_elf_fails_to_spawn() {
     // Minimal 64-bit aarch64 ET_EXEC whose PT_LOAD has p_offset != p_vaddr (mod page),
     // which loader::load marks as Image::doomed.

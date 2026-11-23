@@ -340,6 +340,10 @@ pub(crate) struct ThreadGroup {
     /// reaped, as Linux keeps the leader as a zombie task. None while it runs, after a non-main
     /// thread's execve took its place, and for the virtual init, which never had one.
     pub leader_exit: Option<([u8; 16], CpuTime)>,
+    /// The exited main thread's task serial ([`crate::task::Task::serial`]), kept alongside
+    /// `leader_exit` so that CPU-clock reads and POSIX timers on the zombie leader's thread clock
+    /// stay valid (stopped) until the process is reaped or a non-leader execve replaces it.
+    pub leader_serial: Option<u64>,
     /// The signal sent to the parent on exit (the low 8 bits of clone, usually SIGCHLD), 0 meaning
     /// none.
     pub exit_signal: i32,
@@ -352,6 +356,9 @@ pub(crate) struct ThreadGroup {
     pub tty_old_pgrp: Option<Tid>,
     /// The whole thread group has been stopped by a stop signal.
     pub stopped: bool,
+    /// Live threads that have not yet entered the current group-stop (`group_stop_count`); once
+    /// this reaches 0, `stop_report` is set and the parent is notified with `CLD_STOPPED`.
+    pub stop_pending: usize,
     /// Its cgroup or an ancestor of it is frozen (`cgroup.freeze`): threads stop before returning
     /// to the guest; unlike a stop signal, the parent and wait do not see it.
     pub frozen: bool,
@@ -463,10 +470,12 @@ impl ThreadGroup {
             leader_status: ExitStatus::Exited(0),
             zombie: None,
             leader_exit: None,
+            leader_serial: None,
             exit_signal: Signal::CHLD.number(),
             ctty: None,
             tty_old_pgrp: None,
             stopped: false,
+            stop_pending: 0,
             frozen: false,
             stop_signal: Signal::STOP,
             stop_report: None,

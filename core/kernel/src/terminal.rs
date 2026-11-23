@@ -143,14 +143,25 @@ fn taken(
     ended.then(|| (Vec::new(), false))
 }
 
+/// Whether the console's session has ended (a session was attached and every slave end is now
+/// closed).
+pub(crate) fn ended(k: &Kernel, id: u32) -> Result<bool, Errno> {
+    let console = k.consoles.get(&id).ok_or(Errno::ENOENT)?;
+    Ok(console.attached && console.master.tty.borrow().slaves == 0)
+}
+
 /// How many more bytes the input queue can hold.
 pub(crate) fn input_room(k: &Kernel, id: u32) -> Result<usize, Errno> {
     Ok(tty_of(k, id)?.borrow().input_room())
 }
 
 /// Hands host input to the line discipline and sends the resulting signals to the foreground
-/// process group.
+/// process group. Fails with EIO once the console's session has ended so input (and echoes) are
+/// never accepted after EOF.
 pub(crate) fn feed(k: &Kernel, id: u32, data: &[u8]) -> Result<(), Errno> {
+    if ended(k, id)? {
+        return Err(Errno::EIO);
+    }
     let tty = tty_of(k, id)?;
     let signals = tty.borrow_mut().write_input(data);
     request_wake_object(wake::of(&tty));
@@ -391,4 +402,32 @@ fn tty_of(k: &Kernel, id: u32) -> Result<Rc<RefCell<Tty>>, Errno> {
         .get(&id)
         .map(|c| c.master.tty.clone())
         .ok_or(Errno::ENOENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::Tier;
+
+    #[test]
+    fn feed_returns_eio_after_console_session_ends() {
+        let mut k = Kernel::new(Tier::Interpreter);
+        let id = open(&mut k, Winsize::default());
+        // Before any session attaches, input is accepted.
+        assert!(!ended(&k, id).unwrap());
+        feed(&k, id, b"pre").unwrap();
+        let _ = take_output(&k, id, 64).unwrap();
+
+        // Attach a session leader and then close its slave fd (session ended).
+        let (slave, _tty) = attach(&mut k, id, 10).unwrap();
+        assert!(!ended(&k, id).unwrap());
+        feed(&k, id, b"a").unwrap();
+        assert_eq!(take_output(&k, id, 64).unwrap(), Some(b"a".to_vec()));
+
+        drop(slave);
+        assert!(ended(&k, id).unwrap());
+        assert_eq!(feed(&k, id, b"after"), Err(Errno::EIO));
+        // Echoes must not have been produced after session end.
+        assert_eq!(take_output(&k, id, 64).unwrap(), Some(Vec::new()));
+    }
 }

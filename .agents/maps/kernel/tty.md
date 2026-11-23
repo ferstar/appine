@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: clamp slave output expansion, fix TIOCSCTTY leader check, TIOCSPGRP error codes/order, and EIO on ended console writes)
 
 ## Responsibilities
 
@@ -164,8 +164,9 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 ### Output (slave writes, master reads)
 
-- Slave writes are clamped to `output_room` (0 while output is stopped, otherwise 64 KiB minus
-  the queue), then output processing (Linux's `do_output_char`) with the cursor column: with
+- Slave writes are bounded per character against `OUTPUT_MAX` (64 KiB; 0 while output is stopped)
+  after `ONLCR` and tab expansion (`processed_len`), then output processing (Linux's
+  `do_output_char`) with the cursor column: with
   `OPOST`, `ONLCR`, `OCRNL`, `ONOCR` (CR at column 0 dropped), `ONLRET`, `OLCUC` (Latin-1
   `toupper`), tab expansion with `XTABS`; control characters take no column, UTF-8 continuation
   bytes none with `IUTF8`. Without `OPOST` bytes pass unchanged and the column is not followed.
@@ -196,15 +197,17 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 - Acquire: the console's session leader gets the console at spawn; a session leader opening an
   unowned slave with read access and without `O_NOCTTY` acquires it (`session`, `fg` = its group);
-  `TIOCSCTTY` (Linux's `tiocsctty`) returns 0 if already the caller's ctty, `EPERM` for
-  non-leaders or callers with a ctty, steals a terminal from another session only with argument 1
+  `TIOCSCTTY` (Linux's `tiocsctty`) returns `EPERM` for non-leaders (even when already their
+  ctty), 0 for a session leader whose ctty it already is, `EPERM` for leaders with another ctty,
+  steals a terminal from another session only with argument 1
   and `CAP_SYS_ADMIN` (clearing that session's links), and otherwise needs read access to the fd
   or `CAP_SYS_ADMIN` (`EPERM`). `CAP_SYS_ADMIN` counts only in the initial user namespace, so a
   sandbox's root cannot steal the terminal it was started on.
-- Foreground: `TIOCSPGRP` needs the caller's ctty (`ENOTTY`, also before a bad pointer is read),
-  passes the background check (an orphaned caller's `EIO` is returned as is), then `EINVAL` for
-  negative values, translates through the pid namespace, `EPERM` unless a group with that id
-  exists in the caller's session (also for 0 and unknown ids); because both ends share one `Tty`,
+- Foreground: `TIOCSPGRP` runs the background check (turning an orphaned caller's `EIO` into
+  `ENOTTY`), reads the argument (`EFAULT` on bad pointer) and rejects negative values (`EINVAL`)
+  before checking that the terminal is the caller's ctty (`ENOTTY`), translates through the pid
+  namespace, returns `ESRCH` for 0 or unknown ids and `EPERM` unless a group with that id exists
+  in the caller's session; because both ends share one `Tty`,
   it works on a master fd only when that terminal is the caller's ctty. `TIOCGPGRP`/`TIOCGSID`
   need the caller's ctty on a slave but answer any holder of the master (a tmux server has no
   ctty), and translate out (0 when invisible; `TIOCGSID` without a session is `ENOTTY`).
@@ -289,8 +292,9 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   read passwords and Ghostty tests; the app draws a lock for the cursor then), and closes (drop
   the master, hang up
   immediately, so the number is free again at once, lowest-first, for consoles and `/dev/ptmx`).
-  `write_console` keeps feeding input after the attached session has ended and fails with `EIO`
-  only when the input room is 0, which in canonical mode without a complete line never happens.
+  `write_console` and `terminal::feed` check `terminal::ended` (`attached && slaves == 0`) first
+  and fail with `EIO` once the attached session has ended, without feeding input or generating
+  echoes.
   Host threads take the BKL and wait on the terminal's wake object like guest threads; a panic in
   a console read, write or resize closes the console and returns `EIO`. A kill report names the
   console of the killed process's controlling terminal.
@@ -334,8 +338,8 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   terminal on `CLOSED` (or call `hang_up` directly, as console close does).
 - `/dev/tty` opens count as slaves, so they affect `slave_closed` and console end-of-session.
 - `session` and `fg` are bare ids, not references; a ctty link is a strong reference.
-- The output limit is soft: room is measured before `ONLCR` and tab expansion, and `TIOCSTI` on a
-  master ignores it.
+- Slave writes clamp per character after output expansion (`ONLCR`, `XTABS`) so they cannot
+  overshoot `OUTPUT_MAX`, while `TIOCSTI` on a master still ignores the output limit.
 - Input can be taken by the line discipline on a slave read, a termios change or `TIOCSTI`, not
   only on a master write, so those paths must send what `take_signals` returns.
 - A signal character discards all unread output, while Linux discards only what its workqueue has
@@ -351,16 +355,6 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 ## Confirmed bugs / technical debt
 
-- **One slave write can overshoot the output limit** by its `ONLCR` and tab expansion (the write is
-  clamped to the room before output processing).
-- **`TIOCSCTTY` returns 0 to a non-leader** whose controlling terminal it is: the "already the
-  caller's ctty" test runs before the session-leader check, where Linux answers `EPERM`.
-- **`TIOCSPGRP` error codes:** `EPERM` instead of `ESRCH` for unknown groups, `ENOTTY` instead of
-  `EINVAL` for negative values (or `EFAULT` for a bad pointer) from a non-ctty caller, `EIO`
-  instead of `ENOTTY` for orphaned callers.
-- **Console input after the session ended is accepted** instead of failing with `EIO` as
-  `write_console`'s comment and the JNI documentation promise; with echo on, its echoes reach the
-  host after the end was reported.
 - **`/dev/tty` cannot be told apart from the slave it opens:** the descriptor is a plain slave end,
   so fstat reports the pts device (136:N, with the devpts inode and owner) instead of 5:0 (5:1 for
   `/dev/console`); programs that recognise the controlling-terminal device by its number see a

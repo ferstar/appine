@@ -159,6 +159,9 @@ pub(crate) struct Task {
     pub saved_sigmask: Cell<Option<u64>>,
     /// The thread has been asked to exit (whole-group exit, execve ending the other threads).
     pub killed: Cell<bool>,
+    /// This thread has not yet participated in an in-progress group-stop
+    /// ([`ThreadGroup::stop_pending`]).
+    pub stop_pending: Cell<bool>,
     /// The thread stopped before signal delivery because its cgroup is frozen
     /// ([`crate::signal::deliver`]), or waits for its vfork child (which Linux counts as frozen
     /// too): the frozen field of `cgroup.events` looks at it.
@@ -233,7 +236,7 @@ pub(crate) struct Task {
     /// signal (reported to the tracer when a traced thread exits).
     pub exit_status: Cell<ExitStatus>,
     /// Has entered the exit path (may still be stopped at PTRACE_EVENT_EXIT).
-    exit_started: Cell<bool>,
+    pub(crate) exit_started: Cell<bool>,
     /// A vfork child whose parent still waits for it to exec or exit (`TaskState::vfork_done`
     /// pending), readable by other threads: the OOM killer passes it over while it shares its
     /// parent's address space (Linux's `in_vfork`, [`crate::oom`]).
@@ -322,6 +325,7 @@ impl Task {
             ns: RefCell::new(ns),
             saved_sigmask: Cell::new(None),
             killed: Cell::new(false),
+            stop_pending: Cell::new(false),
             frozen: Cell::new(false),
             pdeathsig: Cell::new(0),
             cred: RefCell::new(cred),
@@ -471,6 +475,14 @@ pub(crate) fn start(
         let st = task.state.borrow();
         let mut group = st.group.borrow_mut();
         group.threads.push(tid);
+        if group.stopped {
+            if group.stop_pending > 0 {
+                task.stop_pending.set(true);
+                group.stop_pending += 1;
+            }
+            // SAFETY: the new thread's Cpu still exists, and the caller holds the BKL
+            unsafe { task.sync.kicker.kick() };
+        }
         k.cgroups.task_changed(group.cgroup);
         st.mm.borrow_mut().add_user(task.sync.clone());
     }
@@ -786,6 +798,14 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
                 generations = cx.mm().generations();
             }
             if let Flow::Exit = flow {
+                if !cx.task.exit_started.get() && !cx.kr().stopping {
+                    let status =
+                        cx.t.group
+                            .borrow()
+                            .exiting
+                            .unwrap_or_else(|| cx.task.exit_status.get());
+                    crate::ptrace::exit(&mut cx, cpu, status);
+                }
                 crate::syscall::flush_at_exit(&mut cx);
             }
             fast.refresh(shared, cx.task, cx.t);
@@ -872,11 +892,12 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             return flow;
         }
         Exit::Kick => return signal::deliver(cx, cpu, false),
+        // Linux's SIGILL for an undefined instruction has no esr_context in the signal frame
         Exit::Undefined { insn } => {
             crate::debug::log(format_args!(
                 "undefined instruction {insn:#010x} at {pc:#x}"
             ));
-            let info = SigInfo::fault(code::ILL_ILLOPC, pc, ESR_IL);
+            let info = SigInfo::fault(code::ILL_ILLOPC, pc, 0);
             (Signal::ILL, info, 0, signal::trap::UNDEFINED)
         }
         // Linux's SIGTRAP for a breakpoint has no esr_context in the signal frame
@@ -1060,8 +1081,11 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         k.cpu += cpu;
         group.borrow_mut().cpu += cpu;
         // The main thread: procfs goes on showing it as a zombie thread (ThreadGroup::leader_exit)
+        // and its stopped CPU clock stays readable until the process is reaped
         if tid == tgid {
-            group.borrow_mut().leader_exit = Some((task.comm.get(), cpu));
+            let mut g = group.borrow_mut();
+            g.leader_exit = Some((task.comm.get(), cpu));
+            g.leader_serial = Some(task.serial);
         }
         let mut st = task.state.borrow_mut();
         // The process's last thread: sample the peak resident memory once before exiting
@@ -1137,6 +1161,8 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         // them (Linux's exit_signals)
         let pending = group.borrow().pending.set();
         crate::signal::retarget(&k, &group, None, pending);
+        // If a group-stop was waiting for this thread, its exit completes its participation
+        crate::signal::participate_group_stop(&k, &group, &task);
     }
     // When a later step fails: if other threads remain, end this process; otherwise it has
     // already ended, so only report

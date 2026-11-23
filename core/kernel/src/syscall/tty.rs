@@ -425,18 +425,20 @@ fn slave_write(
                 return if done > 0 { Ok(done) } else { Err(Errno::EIO) };
             }
             let echoed = t.echoes_before_write();
-            let n = t.output_room().min(data.len() - done);
-            if n > 0 {
+            let rest = &data[done..];
+            let n = if !rest.is_empty() {
                 // Noted for the host console: a job the shell left in the background writes
                 // while another group (the shell at its prompt) has the terminal
                 let pgid = cx.t.group.borrow().pgid;
                 if t.fg.is_some_and(|fg| fg != pgid) {
-                    t.write_background(&data[done..done + n]);
+                    t.write_background(rest)
                 } else {
-                    t.write_output(&data[done..done + n]);
+                    t.write_output(rest)
                 }
-                done += n;
-            }
+            } else {
+                0
+            };
+            done += n;
             if n > 0 || echoed {
                 request_wake_object(wake::of(tty));
             }
@@ -728,22 +730,42 @@ pub(crate) fn ioctl(
             put(cx, arg, fg.to_le_bytes()).map(|()| 0)
         }
         TIOCSPGRP => {
-            if !is_ctty(cx, tty) {
-                return Err(Errno::ENOTTY);
+            // Linux's tiocspgrp: tty_check_change turns EIO (orphaned background caller) into
+            // ENOTTY, then reads and checks the pgid before the ctty check
+            match check_background(cx, tty, Signal::TTOU) {
+                Ok(()) => {}
+                Err(Errno::EIO) => return Err(Errno::ENOTTY),
+                Err(e) => return Err(e),
             }
-            check_background(cx, tty, Signal::TTOU)?;
             let pgid = i32::from_le_bytes(get(cx, arg)?);
             if pgid < 0 {
                 return Err(Errno::EINVAL);
             }
-            let pgid = cx.pid_in(pgid);
             let sid = cx.t.group.borrow().sid;
-            let exists = cx
-                .kr()
-                .groups
-                .values()
-                .any(|g| g.borrow().pgid == pgid && g.borrow().sid == sid);
-            if !exists {
+            if !is_ctty(cx, tty) || tty.borrow().session != Some(sid) {
+                return Err(Errno::ENOTTY);
+            }
+            if pgid == 0 {
+                return Err(Errno::ESRCH);
+            }
+            let pgid = cx.pid_in(pgid);
+            let k = cx.kr();
+            let mut in_session = false;
+            let mut known = k.groups.contains_key(&pgid) || k.tasks.contains_key(&pgid);
+            for g in k.groups.values() {
+                let g = g.borrow();
+                if g.pgid == pgid {
+                    known = true;
+                    if g.sid == sid {
+                        in_session = true;
+                        break;
+                    }
+                }
+            }
+            if !known {
+                return Err(Errno::ESRCH);
+            }
+            if !in_session {
                 return Err(Errno::EPERM);
             }
             tty.borrow_mut().fg = Some(pgid);
@@ -770,10 +792,15 @@ pub(crate) fn ioctl(
                 let g = cx.t.group.borrow();
                 (g.sid, g.pgid, g.tgid, g.ctty.is_some())
             };
+            // Linux's tiocsctty: only a session leader may succeed (even when this terminal is
+            // already its controlling terminal)
+            if sid != tgid {
+                return Err(Errno::EPERM);
+            }
             if is_ctty(cx, tty) {
                 return Ok(0);
             }
-            if sid != tgid || has_ctty {
+            if has_ctty {
                 return Err(Errno::EPERM);
             }
             // Linux's tiocsctty: the controlling terminal of another session can be taken over

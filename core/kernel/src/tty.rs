@@ -1230,25 +1230,40 @@ impl Tty {
         self.output.len() != before
     }
 
-    /// A slave write: goes through output processing into the output queue.
-    pub fn write_output(&mut self, data: &[u8]) {
-        for &c in data {
-            self.output_char(c);
+    /// A slave write: goes through output processing into the output queue while each byte's
+    /// expanded output (e.g. `ONLCR` or `XTABS`) fits within [`OUTPUT_MAX`]. Returns how many
+    /// input bytes were consumed.
+    pub fn write_output(&mut self, data: &[u8]) -> usize {
+        if self.stopped {
+            return 0;
         }
-        self.arrivals[1] += 1;
+        let before = self.output.len();
+        let mut consumed = 0;
+        for &c in data {
+            if self.processed_len(c) > OUTPUT_MAX.saturating_sub(self.output.len()) {
+                break;
+            }
+            self.output_char(c);
+            consumed += 1;
+        }
+        if self.output.len() > before {
+            self.arrivals[1] += 1;
+        }
+        consumed
     }
 
     /// A slave write by a process group that is not the terminal's foreground one: as
     /// [`Tty::write_output`], and remembers which bytes of the output queue it added.
-    pub fn write_background(&mut self, data: &[u8]) {
+    pub fn write_background(&mut self, data: &[u8]) -> usize {
         let from = self.taken + self.output.len() as u64;
-        self.write_output(data);
+        let consumed = self.write_output(data);
         let to = self.taken + self.output.len() as u64;
         match self.background.back_mut() {
             Some(last) if last.end == from => last.end = to,
             _ if to > from => self.background.push_back(from..to),
             _ => {}
         }
+        consumed
     }
 
     /// One byte of output (Linux's `do_output_char`), following the cursor column: with OPOST, NL
@@ -2012,5 +2027,40 @@ mod tests {
             ypixel: 0,
         };
         assert_eq!(Winsize::decode(&w.encode()), w);
+    }
+
+    #[test]
+    fn slave_write_clamps_onlcr_and_xtabs_to_output_max() {
+        let mut t = Tty::new(0);
+        // ONLCR: each '\n' expands to "\r\n" (2 bytes), so at most OUTPUT_MAX / 2 newlines fit.
+        let nls = vec![b'\n'; OUTPUT_MAX];
+        let consumed = t.write_output(&nls);
+        assert_eq!(consumed, OUTPUT_MAX / 2);
+        assert_eq!(t.output_len(), OUTPUT_MAX);
+        assert_eq!(t.write_output(b"\n"), 0);
+        assert_eq!(t.output_len(), OUTPUT_MAX);
+
+        // With 1 byte left, a '\n' (needs 2 bytes) must not overshoot OUTPUT_MAX.
+        t.take_output(1);
+        assert_eq!(t.output_len(), OUTPUT_MAX - 1);
+        assert_eq!(t.write_output(b"\n"), 0);
+        assert_eq!(t.output_len(), OUTPUT_MAX - 1);
+        assert_eq!(t.write_output(b"x"), 1);
+        assert_eq!(t.output_len(), OUTPUT_MAX);
+
+        // XTABS: each '\t' from column 0 expands to 8 spaces, so at most OUTPUT_MAX / 8 tabs fit.
+        t.clear_output();
+        let mut tio = t.termios;
+        tio.oflag |= XTABS;
+        t.set_termios(tio);
+        t.write_output(b"\r");
+        t.clear_output();
+        let tabs = vec![b'\t'; OUTPUT_MAX];
+        let consumed = t.write_output(&tabs);
+        assert_eq!(consumed, OUTPUT_MAX / 8);
+        assert_eq!(t.output_len(), OUTPUT_MAX);
+        t.take_output(7);
+        assert_eq!(t.write_output(b"\t"), 0);
+        assert_eq!(t.output_len(), OUTPUT_MAX - 7);
     }
 }

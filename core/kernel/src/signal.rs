@@ -705,22 +705,29 @@ fn prepare(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, sig: Signal) {
         clear(Signal::CONT.bit());
     } else if sig == Signal::CONT {
         clear(STOP_SIGNALS);
-        let resumed = {
+        let (was_stopped, notify_cont) = {
             let mut g = group.borrow_mut();
             let was = std::mem::take(&mut g.stopped);
+            let pending = std::mem::take(&mut g.stop_pending);
+            let notify = was && pending == 0;
             if was {
                 g.stop_report = None;
-                g.cont_report = true;
+                if notify {
+                    g.cont_report = true;
+                }
             }
-            was
+            (was, notify)
         };
-        if resumed {
+        if notify_cont {
             notify_parent(k, group, code::CLD_CONTINUED, Signal::CONT.number());
+        }
+        if was_stopped {
             request_wake();
         }
         // Traced threads no longer join the group-stop; those in PTRACE_LISTEN must report again
-        // (crate::ptrace)
+        // (crate::ptrace). Clear any pending stop participation on every thread.
         for t in group.borrow().threads.iter().filter_map(|t| k.tasks.get(t)) {
+            t.stop_pending.set(false);
             let mut trace = t.trace.borrow_mut();
             trace.group_stop = None;
             if trace.listening {
@@ -1108,10 +1115,20 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         if let Flow::Exit = wait_while_stopped(cx) {
             return Flow::Exit;
         }
-        if crate::ptrace::traced(cx.task)
-            && (!crate::ptrace::group_stop(cx, cpu) || !crate::ptrace::trap(cx, cpu))
-        {
-            return Flow::Exit;
+        if crate::ptrace::traced(cx.task) {
+            // Re-loop after a group-stop or interrupt trap: if the tracer detached while the
+            // group is still stopped, the thread re-enters wait_while_stopped silently instead
+            // of dequeuing the SIGSTOP that PTRACE_ATTACH queued.
+            match crate::ptrace::group_stop(cx, cpu) {
+                crate::ptrace::StopResult::Killed => return Flow::Exit,
+                crate::ptrace::StopResult::Stopped => continue,
+                crate::ptrace::StopResult::None => {}
+            }
+            match crate::ptrace::trap(cx, cpu) {
+                crate::ptrace::StopResult::Killed => return Flow::Exit,
+                crate::ptrace::StopResult::Stopped => continue,
+                crate::ptrace::StopResult::None => {}
+            }
         }
         let Some((sig, info)) = dequeue(cx) else {
             break;
@@ -1301,6 +1318,9 @@ fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
         if !stopped && !frozen {
             break Flow::Continue;
         }
+        if stopped {
+            participate_group_stop(cx.kr(), &cx.t.group, cx.task);
+        }
         // The last thread stopping completes the freeze (cgroup.events' frozen)
         if frozen {
             crate::cgroup::enter_frozen(cx);
@@ -1370,31 +1390,86 @@ pub(crate) fn pgrp_orphaned(k: &Kernel, pgid: Tid) -> bool {
     })
 }
 
-/// Stops the whole thread group (the default action of stop signals): notifies the parent and
-/// kicks the other threads so that they stop too. Traced threads (including this one) record that
-/// they must join this group-stop (crate::ptrace).
+/// Stops the whole thread group (the default action of stop signals): marks every running thread
+/// to join the stop and kicks siblings so they stop too. The parent is notified with
+/// `CLD_STOPPED` only once all threads have entered the stop ([`participate_group_stop`]). If the
+/// group is already stopped, the thread re-enters the stop silently without notifying the parent
+/// again, matching Linux 6.1's `do_signal_stop`.
 fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
     let group = cx.t.group.clone();
+    let already_stopped = group.borrow().stopped;
+    if already_stopped {
+        let mut trace = cx.task.trace.borrow_mut();
+        if trace.tracer.is_some() {
+            trace.group_stop = Some(group.borrow().stop_signal);
+        }
+        return;
+    }
     let threads = {
         let mut g = group.borrow_mut();
         g.stopped = true;
         g.stop_signal = sig;
-        g.stop_report = Some(sig);
         g.cont_report = false;
         g.threads.clone()
     };
+    let mut pending = 0usize;
     for t in threads.iter().filter_map(|t| cx.kr().tasks.get(t)) {
-        {
+        if t.exit_started.get() {
+            continue;
+        }
+        let already_traced_stop = {
             let mut trace = t.trace.borrow_mut();
             if trace.tracer.is_some() {
                 trace.group_stop = Some(sig);
             }
-        }
-        if !Rc::ptr_eq(t, cx.task) {
-            wake(t);
+            trace.stop.is_some()
+        };
+        if !already_traced_stop {
+            t.stop_pending.set(true);
+            pending += 1;
+            if !Rc::ptr_eq(t, cx.task) {
+                wake(t);
+            }
         }
     }
-    notify_parent(cx.kr(), &group, code::CLD_STOPPED, sig.number());
+    let notify = {
+        let mut g = group.borrow_mut();
+        g.stop_pending = pending;
+        if pending == 0 && !g.threads.is_empty() && g.exiting.is_none() {
+            g.stop_report = Some(sig);
+            true
+        } else {
+            false
+        }
+    };
+    if notify {
+        notify_parent(cx.kr(), &group, code::CLD_STOPPED, sig.number());
+    }
+}
+
+/// Completes `task`'s participation in an in-progress group-stop (Linux's
+/// `task_participate_group_stop`): decrements `ThreadGroup::stop_pending` and notifies the parent
+/// with `CLD_STOPPED` once every thread has stopped.
+pub(crate) fn participate_group_stop(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, task: &Task) {
+    if !task.stop_pending.replace(false) {
+        return;
+    }
+    let notify = {
+        let mut g = group.borrow_mut();
+        if !g.stopped || g.stop_pending == 0 {
+            return;
+        }
+        g.stop_pending -= 1;
+        if g.stop_pending == 0 && !g.threads.is_empty() && g.exiting.is_none() {
+            g.stop_report = Some(g.stop_signal);
+            Some(g.stop_signal)
+        } else {
+            None
+        }
+    };
+    if let Some(sig) = notify {
+        notify_parent(k, group, code::CLD_STOPPED, sig.number());
+    }
 }
 
 // ---- Signal frames ----
@@ -1499,8 +1574,10 @@ const FPSIMD_MAGIC: u32 = 0x4650_8001;
 const FPSIMD_SIZE: usize = 528;
 const ESR_MAGIC: u32 = 0x4553_5201;
 const ESR_SIZE: usize = 16;
-/// The exception level and AArch32 bits of pstate: in a signal frame they must be EL0t, AArch64.
+/// The exception level, AArch32 and DAIF interrupt-mask bits of pstate: in a signal frame they
+/// must all be 0 (EL0t, AArch64, interrupts unmasked; Linux's `valid_native_regs`).
 const PSTATE_MODE: u64 = 0x1f;
+const PSTATE_DAIF: u64 = 0x3c0;
 
 /// Builds the signal frame on the guest stack and makes the CPU start executing the handler.
 fn setup_frame(
@@ -1605,10 +1682,12 @@ pub(crate) fn sigreturn(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         force(cx, Signal::SEGV, SigInfo::fault(code, sp, 0));
         cpu.state_mut().x[0] = 0;
     }
-    // PTRACE_SYSCALL: stop at exit, and the tracer sees the restored registers (crate::ptrace)
+    // PTRACE_SYSCALL: stop at exit, and the tracer sees the restored registers (crate::ptrace);
+    // a single-stepped rt_sigreturn reports at syscall return rather than one instruction late.
     if crate::ptrace::traced(cx.task) && !crate::ptrace::syscall_exit(cx, cpu) {
         return Flow::Exit;
     }
+    crate::ptrace::syscall_stepped(cx);
     // The restored mask may have unblocked pending signals; x0 is the restored value, not
     // treated as a syscall return value
     deliver(cx, cpu, false)
@@ -1622,12 +1701,13 @@ fn restore_frame(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Result<(), Errno> {
     let mut b = vec![0u8; FRAME_SIZE];
     cx.mm().read(UserSlice::new(frame, FRAME_SIZE), &mut b)?;
     let pstate = r64(&b, PSTATE);
-    if pstate & PSTATE_MODE != 0 {
+    if pstate & (PSTATE_MODE | PSTATE_DAIF) != 0 {
         return Err(Errno::EINVAL);
     }
     // Parse the records in __reserved first, and change no state until the whole frame is known
     // to be valid
     let mut fpsimd = None;
+    let mut esr = false;
     let mut off = 0;
     loop {
         if off + 8 > RESERVED_SIZE {
@@ -1645,7 +1725,7 @@ fn restore_frame(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Result<(), Errno> {
             FPSIMD_MAGIC if size == FPSIMD_SIZE && fpsimd.is_none() => {
                 fpsimd = Some(RESERVED + off);
             }
-            ESR_MAGIC => {}
+            ESR_MAGIC if size == ESR_SIZE && !esr => esr = true,
             _ => return Err(Errno::EINVAL),
         }
         off += size;
@@ -2001,5 +2081,100 @@ mod tests {
         // Thread 12 was kicked (immediate Exit::Kick); thread 11 was not kicked.
         assert!(!matches!(cpus[1].run(), appine_engine::Exit::Kick));
         assert!(matches!(cpus[2].run(), appine_engine::Exit::Kick));
+    }
+
+    #[test]
+    fn group_stop_waits_for_all_threads_before_notifying_parent() {
+        use crate::fd::FdTable;
+        use crate::kernel::Shared;
+        use crate::mm::Mm;
+        use crate::task::{FsContext, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut cpus = Vec::new();
+        let mut k = shared.lock();
+        let parent = Rc::new(RefCell::new(ThreadGroup::new(
+            2,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            10,
+            2,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        k.groups.insert(2, parent.clone());
+        k.groups.insert(10, group.clone());
+        let mm = Mm::new().into_shared();
+        let fds = Rc::new(RefCell::new(FdTable::new()));
+        let fs = Rc::new(RefCell::new(FsContext {
+            root: Node::ROOT,
+            cwd: Node::ROOT,
+            umask: 0o022,
+            mnt_ns: Rc::new(MntNs {
+                id: INIT_MNT_NS,
+                owner: crate::cred::UserNs::init(),
+                anon: false,
+            }),
+        }));
+
+        let mut tasks = Vec::new();
+        for tid in [10, 11] {
+            let cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
+            let state = TaskState {
+                mm: mm.clone(),
+                fds: fds.clone(),
+                fs: fs.clone(),
+                group: group.clone(),
+                vfs: None,
+                altstack: Default::default(),
+                clear_child_tid: 0,
+                vfork_done: None,
+                restart: None,
+                fast_sleep: None,
+                sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+            };
+            let task = Task::new(tid, 10, &cpu, state, k.init_ns.clone(), 0, [0; 16]).unwrap();
+            group.borrow_mut().threads.push(tid);
+            k.tasks.insert(tid, task.clone());
+            cpus.push(cpu);
+            tasks.push(task);
+        }
+
+        // Start a group-stop across 2 live threads: neither stop_report nor CLD_STOPPED yet.
+        {
+            let mut g = group.borrow_mut();
+            g.stopped = true;
+            g.stop_signal = Signal::STOP;
+            g.stop_pending = 2;
+        }
+        tasks[0].stop_pending.set(true);
+        tasks[1].stop_pending.set(true);
+
+        // First thread stops: parent must NOT be notified while sibling is still running.
+        participate_group_stop(&k, &group, &tasks[0]);
+        assert_eq!(group.borrow().stop_pending, 1);
+        assert_eq!(group.borrow().stop_report, None);
+
+        // Second thread stops: now stop_report is set and parent is notified.
+        participate_group_stop(&k, &group, &tasks[1]);
+        assert_eq!(group.borrow().stop_pending, 0);
+        assert_eq!(group.borrow().stop_report, Some(Signal::STOP));
+
+        // Cancelling an in-progress group-stop via SIGCONT does not set cont_report.
+        {
+            let mut g = group.borrow_mut();
+            g.stopped = true;
+            g.stop_pending = 1;
+            g.stop_report = None;
+            g.cont_report = false;
+        }
+        tasks[0].stop_pending.set(true);
+        prepare(&k, &group, Signal::CONT);
+        assert!(!group.borrow().stopped);
+        assert_eq!(group.borrow().stop_pending, 0);
+        assert!(!group.borrow().cont_report);
+        assert!(!tasks[0].stop_pending.get());
     }
 }

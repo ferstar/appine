@@ -156,6 +156,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         if !crate::ptrace::syscall_exit(cx, cpu) {
             return Flow::Exit;
         }
+        crate::ptrace::syscall_stepped(cx);
         return signal::deliver(cx, cpu, true);
     }
     let mut a: [u64; 6] = cpu.state().x[..6].try_into().unwrap();
@@ -412,7 +413,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             166 => misc::umask(cx, a[0] as u32),
             167 => misc::prctl(cx, a[0] as i32, [a[1], a[2], a[3], a[4]]),
             169 => misc::gettimeofday(cx, a[0], a[1]),
-            170 => Err(Errno::EPERM), // settimeofday: the guest cannot change the host's time
+            170 => misc::settimeofday(cx, a[0], a[1]),
             171 => misc::adjtimex(cx, None, a[0]),
             172 => Ok(cx.tgid() as u64),                // getpid
             173 => Ok(cx.t.group.borrow().ppid as u64), // getppid
@@ -740,6 +741,7 @@ fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid, doomed
     if !crate::ptrace::exec(cx, cpu, old_tid) || !crate::ptrace::syscall_exit(cx, cpu) {
         return Flow::Exit;
     }
+    crate::ptrace::syscall_stepped(cx);
     match signal::deliver(cx, cpu, false) {
         Flow::Exit => Flow::Exit,
         _ => Flow::Exec,

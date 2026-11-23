@@ -576,6 +576,9 @@ pub(super) fn process_vm(
         return Ok(0);
     }
     let remote = iovecs(cx, remote, remote_count)?;
+    if remote.iter().all(|&(_, len)| len == 0) {
+        return Ok(0);
+    }
     let task = cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH)?;
     if !may_ptrace(cx, task.tid.get()) {
         return Err(Errno::EPERM);

@@ -288,17 +288,27 @@ impl HwDebug {
     }
 }
 
+/// Outcome of checking for a group-stop or `PTRACE_INTERRUPT` trap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopResult {
+    /// No stop was pending.
+    None,
+    /// Stopped and was later resumed or detached.
+    Stopped,
+    /// Killed while stopped.
+    Killed,
+}
+
 // ---- Signal-delivery stops and group-stops ----
 
 /// Joins a group-stop (the thread group was stopped by a stop signal): stops in a ptrace-stop and
-/// reports to the tracer. Does nothing when there is no group-stop to join. Returns false when
-/// the thread is killed.
-pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
+/// reports to the tracer. Does nothing when there is no group-stop to join.
+pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> StopResult {
     let (sig, seized) = {
         let mut t = cx.task.trace.borrow_mut();
         match t.group_stop.take() {
             Some(sig) if t.tracer.is_some() => (sig, t.seized),
-            _ => return true,
+            _ => return StopResult::None,
         }
     };
     let (why, info) = if seized {
@@ -313,17 +323,19 @@ pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     } else {
         (Stop::Group(sig), None)
     };
-    stop(cx, cpu, why, info, 0).is_some()
+    match stop(cx, cpu, why, info, 0) {
+        Some(_) => StopResult::Stopped,
+        None => StopResult::Killed,
+    }
 }
 
 /// PTRACE_INTERRUPT, or a new thread auto-attached under SEIZE: stops once at
-/// `PTRACE_EVENT_STOP`. Does nothing when no stop is due. Returns false when the thread is
-/// killed.
-pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
+/// `PTRACE_EVENT_STOP`. Does nothing when no stop is due.
+pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> StopResult {
     {
         let mut t = cx.task.trace.borrow_mut();
         if !std::mem::take(&mut t.trap) || t.tracer.is_none() {
-            return true;
+            return StopResult::None;
         }
     }
     let sig = Signal::TRAP;
@@ -334,7 +346,10 @@ pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
         cx.pid_out(cx.tid()),
         cx.cred().uid_out(cx.cred().ruid),
     );
-    stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0).is_some()
+    match stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0) {
+        Some(_) => StopResult::Stopped,
+        None => StopResult::Killed,
+    }
 }
 
 /// Before signal `sig` is delivered (signal-delivery stop). Returns the signal the tracer lets
@@ -609,7 +624,7 @@ pub(crate) fn tracer_pid_of(cx: &Cx<'_>, tid: Tid) -> Tid {
 /// waiting if killed by SIGKILL during the stop.
 pub(crate) fn exit(cx: &mut Cx<'_>, cpu: &mut Cpu, status: ExitStatus) {
     cx.task.begin_exit(cx.kr(), &cx.t.group, status);
-    if !cx.task.trace.borrow().enabled(event::EXIT) {
+    if cx.kr().stopping || !cx.task.trace.borrow().enabled(event::EXIT) {
         return;
     }
     let killed = cx.task.killed.replace(false);
@@ -662,6 +677,7 @@ pub(crate) fn stop(
         t.siginfo = info;
         t.message = message;
     }
+    signal::participate_group_stop(cx.kr(), &cx.t.group, cx.task);
     notify(cx.kr(), cx.task);
     let (tid, uid) = (cx.pid_out(cx.tid()), cx.cred().uid_out(cx.cred().ruid));
     let resumed = loop {
@@ -794,6 +810,7 @@ pub(crate) fn detach(task: &Task, sig: Option<i32>) {
     }
     task.syscall_traced.store(false, Ordering::Relaxed);
     task.stepping.store(false, Ordering::Relaxed);
+    task.step_again.store(false, Ordering::Relaxed);
     signal::wake(task);
 }
 

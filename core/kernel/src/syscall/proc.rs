@@ -1230,6 +1230,8 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
             // The original main thread has been reaped (release_task in Linux's de_thread)
             g.leader_seccomp = None;
             g.leader_exit = None;
+            g.leader_serial = None;
+            g.leader_tracer = None;
             g.children.clone()
         };
         // Children created by other threads were handed to this thread when they exited, and

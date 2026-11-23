@@ -788,12 +788,17 @@ fn cpu_clock(cx: &Cx<'_>, clock: i32) -> Option<Result<u64, Errno>> {
     };
     let k = cx.kr();
     Some(if thread {
-        let task = if pid == 0 {
-            Some(cx.task.clone())
+        if pid == 0 {
+            Ok(cx.task.cpu_ns())
+        } else if let Some(t) = k.tasks.get(&pid) {
+            Ok(t.cpu_ns())
+        } else if let Some(g) = k.groups.get(&pid)
+            && let Some((_, cpu)) = g.borrow().leader_exit
+        {
+            Ok(cpu.total_ns)
         } else {
-            k.tasks.get(&pid).cloned()
-        };
-        task.map(|t| t.cpu_ns()).ok_or(Errno::EINVAL)
+            Err(Errno::EINVAL)
+        }
     } else {
         let group = if pid == 0 {
             Some(cx.t.group.clone())
@@ -804,14 +809,41 @@ fn cpu_clock(cx: &Cx<'_>, clock: i32) -> Option<Result<u64, Errno>> {
     })
 }
 
-/// clock_settime: the guest cannot change the host's time. The settable clock (`CLOCK_REALTIME`)
-/// returns EPERM, as without `CAP_SYS_TIME`; the other clocks cannot be set in any case.
+/// settimeofday: validates arguments like Linux 6.1 (`EFAULT`, `EINVAL`) and then refuses with
+/// `EPERM` because the guest cannot change the host's time.
+pub(super) fn settimeofday(cx: &mut Cx<'_>, tv: u64, tz: u64) -> SysResult {
+    const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
+    let timeval = if tv != 0 {
+        let b: [u8; 16] = get(cx, tv)?;
+        let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(b[8..].try_into().unwrap());
+        Some((sec, usec))
+    } else {
+        None
+    };
+    if tz != 0 {
+        let _: [u8; 8] = get(cx, tz)?;
+    }
+    if let Some((sec, usec)) = timeval
+        && (!(0..=KTIME_SEC_MAX).contains(&sec) || !(0..1_000_000).contains(&usec))
+    {
+        return Err(Errno::EINVAL);
+    }
+    Err(Errno::EPERM)
+}
+
+/// clock_settime: the guest cannot change the host's time. `CLOCK_REALTIME` and valid CPU clocks
+/// return `EPERM` (matching Linux 6.1's `posix_cpu_clock_set`); other clocks return `EINVAL`.
 pub(super) fn clock_settime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
     read_timespec(cx, tp)?;
-    match clock {
-        CLOCK_REALTIME => Err(Errno::EPERM),
-        _ => Err(Errno::EINVAL),
+    if clock == CLOCK_REALTIME {
+        return Err(Errno::EPERM);
     }
+    if let Some(res) = cpu_clock(cx, clock) {
+        res?;
+        return Err(Errno::EPERM);
+    }
+    Err(Errno::EINVAL)
 }
 
 /// adjtimex (`clock` None) and clock_adjtime: only queries are answered, with the host clock's

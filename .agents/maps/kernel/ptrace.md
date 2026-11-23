@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/ptrace.md` for the paired decision history (not yet created; pre-split decisions D5, D6, D12, the ptrace half of D14, D17, D20 and D26 stay in `.agents/decisions/kernel/signal.md`).
 >
 > Verified: 2026-11-15 (split out of the kernel/signal full mapping of 2026-11-03; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: silent attach-stop detach, single-step on sigreturn/execve/skipped syscalls, PTRACE_EVENT_EXIT for killed siblings, process_vm zero-remote shortcut)
 
 ## Responsibilities
 
@@ -60,7 +62,8 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
   vfork-done, seccomp. `CLONE_PTRACE` forces and `CLONE_UNTRACED` prevents tracing of children.
   A non-seized tracee exec without `TRACEEXEC` gets `SIGTRAP`.
 - Single-step: the interpreter executes one instruction (`Cpu::step`) and the tracee reports
-  `SIGTRAP`/`TRAP_TRACE`; a stepped `svc` reports after the syscall.
+  `SIGTRAP`/`TRAP_TRACE`; a stepped `svc` (including `rt_sigreturn`, `execve`, and skipped `-1`
+  syscalls) reports at syscall return.
 - Register sets: `NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`,
   `NT_ARM_HW_BREAK` (6 slots), `NT_ARM_HW_WATCH` (4 slots); nothing for SVE, PAC, MTE, SME. Debug
   slots are handed to the engine (`set_hw_debug`) when the tracee resumes: breakpoints force Tier
@@ -75,7 +78,9 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 - wait: the tracer finds its tracees without `WUNTRACED`; a stop reports `code << 8 | 0x7f`. A
   traced leader's zombie is hidden from its parent until the tracer reaps it. When the tracer
   process exits, tracees are killed with `EXITKILL`, otherwise detached; detaching a tracee in a
-  stopped group returns it to the group stop.
+  stopped group returns it to the group stop silently without dequeuing attach-time `SIGSTOP` or
+  re-notifying the parent. `process_vm_readv`/`writev` with zero local or zero remote bytes return
+  0 before PID lookup and access checks.
 
 ## Dependencies (inbound / outbound)
 
@@ -98,29 +103,17 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 
 - The tracer works on the saved register copy; changes made directly to the CPU state during a
   stop would be overwritten on resume.
-- Only threads calling `exit`/`exit_group` or taking the fatal signal report
-  `PTRACE_EVENT_EXIT`.
+- Every traced thread exiting normally (including `exit_group` siblings, fatal-signal siblings,
+  and threads killed by a non-leader's `execve`, which waits for them) reports `PTRACE_EVENT_EXIT`
+  before teardown (skipped only during machine shutdown).
 
 - Signal-delivery and fatal-exit ordering crosses `kernel/signal`; changing stops requires
   reading both maps. Immutable signal actions bypass signal-delivery stops.
 
 ## Confirmed bugs / technical debt
 
-- **Single-step over some syscalls reports one instruction late:** after `rt_sigreturn`, execve or a
-  skipped syscall (number -1), the step is not reported at syscall return.
 - **ptrace reads are not forced:** `PTRACE_PEEK*` and `/proc/<pid>/mem` reads fail on `PROT_NONE`
   pages Linux can read; `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
-- **Threads ended by another thread report no `PTRACE_EVENT_EXIT`:** only threads calling
-  `exit`/`exit_group` or taking the fatal signal stop there, so the other threads of an
-  `exit_group`, and the leader killed by a non-leader's execve, exit without the stop Linux 6.1
-  gives them (there the execve waits for it); a tracer that collects state at exit misses them.
-- **Detaching at an attach-time group stop reports the stop again:** after `PTRACE_ATTACH` to a
-  stopped process and a detach during its group-stop report, the thread takes the `SIGSTOP` that
-  ATTACH queued, so the parent gets a second `CLD_STOPPED`/`SIGCHLD` and waitpid stop report,
-  where Linux 6.1 re-enters the stop silently; a shell whose stopped job was briefly attached by
-  gdb or strace sees a duplicate stop.
-- `process_vm_readv`/`writev` with a non-empty local vector but no remote bytes look up the pid and
-  check access (`ESRCH`, `EPERM`) where Linux 6.1 returns 0 first.
 
 ## Open questions
 

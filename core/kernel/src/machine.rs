@@ -464,16 +464,15 @@ impl Machine {
         let objects = terminal::wake_objects(&self.shared.lock(), id);
         self.wait_objects(wake::FILE, objects.as_deref(), |k| {
             on_console(k, id, "Machine::write_console", |k| {
+                if terminal::ended(k, id)? {
+                    return Err(Errno::EIO);
+                }
                 let room = terminal::input_room(k, id)?;
                 if room > 0 {
                     let n = room.min(data.len());
                     return terminal::feed(k, id, &data[..n]).map(|()| Some(n));
                 }
-                // The input queue is full, but no process will read it any more
-                match terminal::take_output(k, id, 0) {
-                    Ok(Some(_)) => Err(Errno::EIO),
-                    _ => Ok(None),
-                }
+                Ok(None)
             })
             .transpose()
         })
