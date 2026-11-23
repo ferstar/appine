@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the split; latest change: retry `apk add` up to 3 times during difftest store creation)
+> Maintained: 2026-11-23 (targeted verification only since the split; latest change: starnix-mm includes uio_test for zero-length process_vm_readv)
 
 ## Responsibilities
 
@@ -123,7 +123,7 @@ benchmarks, surveys and crash testing remain `harness`.
   development VM).
 - Each builder does nothing while its tarball's name exists, so a local change to `tests/starnix`
   or `tests/gvisor` takes effect only after the tarball is deleted (CI keys its caches on them).
-- Seven Starnix cases cover 65 of its built programs by subsystem (`starnix-mm`, `-process`,
+- Seven Starnix cases cover 66 of its built programs by subsystem (`starnix-mm`, `-process`,
   `-signal`, `-fs`, `-proc`, `-io`, and `-overlay`, which runs overlayfs_test and fs_test's
   `OverlayFs` tests with `TEST_TMPDIR` on a tmpfs, since Linux refuses docker's overlay root as an
   upper layer), and four gVisor cases 43 of its programs (`gvisor-process`, `-fs`, `-net`,
@@ -149,7 +149,7 @@ benchmarks, surveys and crash testing remain `harness`.
   only on CI's runner, depends on timing, or hangs on both sides), or a gVisor test that sleeps
   10 s or more by design (left out for CI time). The runner's header lists the programs in no case and why: those that would reboot,
   suspend or set the clock of the VM, features Appine does not have (bpf maps and other program
-  types, perf, userfaultfd, tun), devices neither side has, and two with nothing to compare.
+  types, perf, userfaultfd, tun), devices neither side has, and cache_flush_test with no arm64 tests.
 
 ## Dependencies (inbound / outbound)
 

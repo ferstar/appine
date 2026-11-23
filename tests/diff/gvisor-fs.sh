@@ -4,16 +4,13 @@
 # chroot, inotify, fcntl and flock, open and openat2, rename, getdents, close_range, chown and
 # pipes. Run by tests/diff/gtest/run.sh, one process per test. Tests that differ for a reason
 # recorded in a map, or that cannot be compared, are skipped, with the reason above them.
-# kernel/tty: TIOCSPGRP error codes; kernel/procfs fidelity gaps: the devpts root is 0555
-SKIP="JobControlTest.SetForegroundProcessGroupEmptyProcessGroup:SetModeTest.SetMode/*"
-# kernel/procfs: synthetic files other than cgroup2's report no inotify events (procfs opens and
-# reads); kernel/vfs: IN_EXCL_UNLINK filters the wrong events; executing a file reports no
-# inotify events
+# kernel/procfs: the devpts root is 0555
+SKIP="SetModeTest.SetMode/*"
+# kernel/inotify: procfs opens and reads do not emit inotify events
 SKIP="$SKIP:Inotify.KernfsBasic:Inotify.KernfsDynamicFileAcrossSave"
-SKIP="$SKIP:Inotify.ExcludeUnlink*:Inotify.Exec"
-# kernel/vfs: F_GETFL never shows O_DIRECT; open with O_PATH keeps other status flags; locks on
-# inode-less files (pipes) are no-ops
-SKIP="$SKIP:FcntlTest.GetAllFlags:FcntlTest.GetOpathFlag"
+# kernel/inotify: executing a file emits no inotify events
+SKIP="$SKIP:Inotify.Exec"
+# kernel/locks: locks on inode-less files (pipes) are no-ops
 SKIP="$SKIP:FlockTestNoFixture.FlockPipe"
 # kernel/vfs: scoped openat2 never returns EAGAIN (the rename variants loop for minutes)
 SKIP="$SKIP:Openat2Test.BeneathRaceWithMount:Openat2Test.InRootRaceWithMount"

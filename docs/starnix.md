@@ -33,11 +33,11 @@ in the module maps, not here.
 - **PTY scenarios:** the 83 recorded scenarios are the `line-discipline` differential case. All of
   them pass since the line discipline follows n_tty.
 - **`tests/syscalls/cpp`:** `scripts/build-starnix-tests` builds 81 of its 93 gtest programs
-  statically against musl, and CI builds them too. 65 programs run in seven differential cases by
+  statically against musl, and CI builds them too. 66 programs run in seven differential cases by
   subsystem (`starnix-mm`, `-process`, `-signal`, `-fs`, `-proc`, `-io`, `-overlay`) through a
   shared runner, each skipping by reason the tests that differ for a deviation recorded in a map
   or cannot be compared; `starnix-overlay` puts its layers on a tmpfs, since Linux refuses
-  docker's overlay root as an upper layer. The other 16 are listed with their reasons in
+  docker's overlay root as an upper layer. The other 15 are listed with their reasons in
   `tests/diff/gtest/run.sh`: they would reboot, suspend or set the clock of the VM, test what
   Appine does not implement (bpf maps, perf, userfaultfd, tun), need devices, or have nothing to
   compare.

@@ -26,8 +26,7 @@
 #   tun_test;
 # - devices neither side has: input_test, uinput_test, udev_test, touch_standby_test,
 #   custom_artifact_test, ext4_write_test;
-# - nothing to compare: cache_flush_test has no tests on arm64, and uio_test's one test is
-#   process_vm_readv's recorded deviation (the kernel/ptrace map).
+# - nothing to compare: cache_flush_test has no tests on arm64.
 suite=$1
 skip=$2
 shift 2

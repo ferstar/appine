@@ -17,8 +17,7 @@ SKIP="$SKIP:ProcfsAccessTest/ProcfsAccessTest.AccessDeniedToNonOwnerWithoutCapPt
 # kernel/procfs fidelity gaps: /proc/<pid>/attr is absent (the test stats it); procfs mount
 # options are ignored
 SKIP="$SKIP:ProcfsBlksizeTest.StatBlksize:ProcHidePidTest.HidePidAndGidMountOptions"
-# kernel/procfs: a reaped process's held directory behaves like a live or missing one
-SKIP="$SKIP:ProcTaskDirTest.PidDirFdListingAndReadsFailAfterExit"
+# kernel/procfs: lookups through a reaped process's directory fd return ENOENT instead of ESRCH
 SKIP="$SKIP:ProcTaskDirTest.PidDirFdLookupsFailAfterExit"
 # No perf_event_open (ENOSYS, kernel/signal D10) and no tun device (kernel/net D1)
 SKIP="$SKIP:ProcSelfFdTest.PerfEventFdName:SysctlTest.DisableIpv6Default"
