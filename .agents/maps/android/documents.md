@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/documents.md` for the paired decision history.
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: enforce canonical `%XX` validation, clear and directory-check the home cache, revoke grants on rootfs replacement)
 
 ## Responsibilities
 
@@ -36,9 +38,10 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
 - `Documents : DocumentsProvider` — exported SAF provider (`MANAGE_DOCUMENTS`,
   `grantUriPermissions="true"`, `DOCUMENTS_PROVIDER` intent filter); roots `home` and `system`,
   `SEARCH_LIMIT = 200`, `CACHE_MS = 5_000L`, lazy `closer: Handler` on
-  `HandlerThread("documents-close")`, and `@Volatile cache: Triple<Long, String, Home?>?`.
+  `HandlerThread("documents-close")`, and companion `@Volatile cache: HomeCache?` guarded by
+  `cacheGeneration: AtomicLong`.
 - `Documents.Home(account, uid, gid, path)` — resolved login account and non-`/` canonical home
-  document ID, cached 5 s per `Settings.login` value.
+  document ID, cached 5 s per `(cacheGeneration, Settings.login)` value (`HomeCache`).
 - `Documents.FileLink` — sealed interface returned by `fileLink`: `Found(uri, mime)`,
   `Remote(host)`, `Hidden`, `Missing`.
 
@@ -50,8 +53,8 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   `removeDocument`, `queryRecentDocuments` and `openDocumentThumbnail` are not overridden;
   `getType` delegates to `queryDocument`.)
 - Companion APIs: `authority`, `rootsChanged`, `revokeAccess`, `dirsChanged`, `fileLink`,
-  `grantedUnder`, `canonical`, `child`, `parent`, `within`, `fileName`, `displayName`, `mimeType`,
-  `guessType`.
+  `grantedUnder`, `documentId`, `canonical`, `child`, `parent`, `within`, `fileName`,
+  `displayName`, `mimeType`, `guessType`.
 
 ## Data flow / lifecycle
 
@@ -63,16 +66,21 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   methods throw `FileNotFoundException`. Enabling privacy clears `file_access` and revokes grants;
   disabling privacy restores neither.
 - **Home resolution and roots**: `home(context)` returns `null` when `!Rootfs.isReady(context)`
-  (`meta.db` absent); otherwise checks the 5 s cache keyed by `Settings.login` (caching `null`
-  too). On miss, under `Rootfs.access.read`, it calls `Rootfs.loginAccount` (reading `/etc/passwd`
-  from the store; falling back to `root`/`/root`), rejects `/` (so the whole system cannot become
-  writable) and non-canonical paths, and confirms existence via `Native.browseStat`. `queryRoots`
+  (`meta.db` absent); otherwise checks the 5 s companion cache keyed by `(cacheGeneration,
+  Settings.login)` (caching `null` too, invalidated by `rootsChanged`). On miss, under
+  `Rootfs.access.read`, it calls `Rootfs.loginAccount` (reading `/etc/passwd` from the store;
+  falling back to `root`/`/root`), encodes the raw guest path via `documentId(account.home)`,
+  rejects `/` (so the whole system cannot become writable) and non-canonical paths, and confirms
+  the target exists and is a directory (`meta.startsWith("d\t")`) via `Native.browseStat` (a
+  symlink to `/` still relies on native `top_of` to refuse writes). `queryRoots`
   adds `home` (`"account · distro"`, flags local-only, is-child, search, create) when `home`
   resolves, and always adds `system` (`"/"`, same flags without create) with free space from
   `StorageManager.getAllocatableBytes`, setting the roots notification URI (early empty returns
   when disabled or unready skip `setNotificationUri`).
 - **Document IDs**: canonical absolute guest paths (`"/"` or leading `"/"`, no trailing `"/"`, no
-  empty, `"."` or `".."` segments). `documentId` + `utf8Length` mirror native `browse::encode_path`:
+  empty, `"."` or `".."` segments, no NUL bytes, and exact round-trip equality with
+  `documentId(percentDecode(path))`, rejecting encoded `/` or `.` such as `%2F`/`%2E` and
+  non-canonical escapes). `documentId` + `utf8Length` mirror native `browse::encode_path`:
   valid UTF-8 passes literally except `%` and ISO control characters (`U+0000..001F`,
   `U+007F..009F`), which along with invalid UTF-8 bytes become uppercase `%XX`. `displayName`
   decodes the last segment via `percentDecode` (invalid UTF-8 -> `U+FFFD`).
@@ -125,8 +133,8 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
 - **Grant revocation**:
   - `revokeAccess(context)` calls `revokeUriPermission` on `content://<authority>` for read+write
     (revoking persisted and transient document/tree grants provider-wide; called by
-    `TerminalService.setFileAccess(false)` and `Privacy.changeMode(true)`). Already-open fds and
-    copied data survive; re-enabling does not restore revoked grants.
+    `TerminalService.setFileAccess(false)`, `TerminalService.replace` and `Privacy.changeMode(true)`).
+    Already-open fds and copied data survive; re-enabling does not restore revoked grants.
   - `deleteDocument`, `renameDocument` (when path changed) and `moveDocument` call `revokeTree`:
     revokes the source ID directly and enumerates `outgoingPersistedUriPermissions` through
     `grantedUnder` (checking `getTreeDocumentId` for tree URIs and `getDocumentId` for document
@@ -168,7 +176,7 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
 - `android/service` (`TerminalService`: `dirsChanged`, `rootsChanged`, `revokeAccess`).
 - `android/privacy` (`Privacy.changeMode`: `revokeAccess`, `rootsChanged`).
 - `android/terminal` (`TerminalLinks`: `fileLink`, `FileLink`, read-only `ACTION_VIEW` grant).
-- `android/file-import` (`TerminalFiles`: reuses `canonical`, `fileName`, `child`, `displayName`).
+- `android/file-import` (`TerminalFiles`: reuses `documentId`, `fileName`, `child`, `displayName`).
 - `android/tests` (`MachineTest`).
 
 ### Outbound
@@ -185,10 +193,9 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   permission checks apply), whereas all writes/mutations enforce real-path home confinement in
   native `browse.rs` (Kotlin `flags`/`writable` check literal paths only).
 - `Documents.documentId` + `utf8Length` match native `browse::encode_path` and must change
-  together; `fileLink` relies on `percentDecode` + `documentId` running before `/` splitting so
-  `%2F` and `%2E%2E` are caught. Note that native `browse::decode_path` uses `u8::from_str_radix`
-  (accepting leading `'+'` such as `%+a`), whereas Kotlin `percentDecode` strictly requires two
-  ASCII hex digits.
+  together; both Kotlin `percentDecode` and native `browse::decode_path` require two ASCII hex
+  digits after `%`, and `canonical` enforces `documentId(percentDecode(path)) == path` with no NUL
+  bytes so `%2F`, `%2E` and non-canonical escapes are rejected everywhere.
 - `fileLink` checks `/etc/hostname` in the store (not the running UTS hostname) before checking
   `fileAccess`, and infers `Hidden` whenever `getType` returns null while direct `browseStat`
   succeeds (including when privacy mode forces `fileAccess` false).
@@ -204,20 +211,6 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   exposes only persisted grants; transient (activity-scoped) grants on descendants of a deleted,
   renamed or moved directory cannot be listed and last until that activity ends, covering any new
   file created at the same path meanwhile.
-- **`canonical()` accepts `%2E`/`%2F` sequences decoded by native `browse::decode_path`:**
-  `canonical()` validates raw string segments without decoding `%XX`, whereas `browse::decode_path`
-  decodes arbitrary `%XX` before `walk()` splits on `/`. A crafted document ID containing
-  `%2e%2e` or `%2f` passes `canonical()`, `visible()` and `isChildDocument`, bypassing tree-URI
-  descendant confinement both on reads anywhere in the rootfs and on writes to sibling/ancestor
-  paths within `home` (native real-path checks confine writes only to `home`, not to a narrower
-  granted subtree, whereas `fileLink` decodes and re-encodes before splitting).
-- **Rootfs replacement does not revoke existing URI grants:** `TerminalService.replace` deletes and
-  reimports the store without calling `Documents.revokeAccess`, so existing path-based URI grants
-  survive into matching paths of the replacement rootfs if `fileAccess` stays enabled.
-- **`home(context)` 5 s cache is not cleared by `rootsChanged` and skips directory check:** the
-  cache is keyed only by `Settings.login` (so a same-login store reset/reimport can briefly return
-  a stale `Home?` within 5 s), and `home(context)` checks only that `browseStat` succeeds without
-  verifying `meta.startsWith("d\t")` or the resolved real path (native `top_of` still blocks writes).
 - **Terminal file imports do not refresh open Files app listings:** `TerminalFiles.copyIntoHome`
   mutates the home directory through `Native.browse*` directly (a separate store connection with
   `changed_dirs = None`) without calling `Documents.dirsChanged`.

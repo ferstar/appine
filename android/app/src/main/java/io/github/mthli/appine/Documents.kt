@@ -20,6 +20,8 @@ import android.webkit.MimeTypeMap
 import java.io.ByteArrayOutputStream
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.read
 
 /**
@@ -68,6 +70,8 @@ class Documents : DocumentsProvider() {
      */
     private data class Home(val account: String, val uid: Int, val gid: Int, val path: String)
 
+    private data class HomeCache(val generation: Long, val time: Long, val login: String, val home: Home?)
+
     override fun onCreate(): Boolean = true
 
     override fun queryRoots(projection: Array<out String>?): Cursor {
@@ -110,27 +114,28 @@ class Documents : DocumentsProvider() {
 
     private fun home(context: Context): Home? {
         if (!Rootfs.isReady(context)) return null
+        val generation = cacheGeneration.get()
         val login = Settings.login(context)
-        cache?.let { (time, key, home) ->
-            if (key == login && SystemClock.elapsedRealtime() - time < CACHE_MS) return home
+        val now = SystemClock.elapsedRealtime()
+        cache?.let { entry ->
+            if (entry.generation == generation && entry.login == login && now - entry.time < CACHE_MS) {
+                return entry.home
+            }
         }
         val home = Rootfs.access.read {
             val account = Rootfs.loginAccount(context, login)
-            val path = canonical("/" + account.home.trim('/'))?.takeIf { it != "/" } ?: return@read null
-            // No root is listed when the home directory does not exist (the account has none)
-            runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull() ?: return@read null
+            val path = documentId(account.home)?.takeIf { it != "/" } ?: return@read null
+            // No root is listed when the home directory does not exist or is not a directory
+            val meta = runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull()
+                ?: return@read null
+            if (!meta.startsWith("d\t")) return@read null
             Home(account.name, account.uid, account.gid, path)
         }
-        cache = Triple(SystemClock.elapsedRealtime(), login, home)
+        if (cacheGeneration.get() == generation) {
+            cache = HomeCache(generation, SystemClock.elapsedRealtime(), login, home)
+        }
         return home
     }
-
-    /**
-     * The home directory computed last: one browse queries several times, so /etc/passwd need not
-     * be read every time.
-     */
-    @Volatile
-    private var cache: Triple<Long, String, Home?>? = null
 
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
         val context = attached()
@@ -412,13 +417,23 @@ class Documents : DocumentsProvider() {
             Document.COLUMN_SIZE, Document.COLUMN_LAST_MODIFIED, Document.COLUMN_FLAGS,
         )
 
+        /**
+         * The home directory computed last: one browse queries several times, so /etc/passwd need
+         * not be read every time. Cleared and invalidated by [rootsChanged].
+         */
+        @Volatile
+        private var cache: HomeCache? = null
+        private val cacheGeneration = AtomicLong()
+
         fun authority(context: Context) = "${context.packageName}.documents"
 
         /**
-         * The login account, the store or file access changed: the Files app reads the
-         * roots again.
+         * The login account, the store or file access changed: drop the cached home directory and
+         * tell the Files app to read the roots again.
          */
         fun rootsChanged(context: Context) {
+            cacheGeneration.incrementAndGet()
+            cache = null
             context.contentResolver.notifyChange(DocumentsContract.buildRootsUri(authority(context)), null)
         }
 
@@ -517,7 +532,7 @@ class Documents : DocumentsProvider() {
                 if (c >= 0 && c != '%'.code && !Character.isISOControl(c)) {
                     out.appendCodePoint(c)
                 } else {
-                    for (k in i until i + maxOf(n, 1)) out.append("%%%02X".format(path[k].toInt() and 0xff))
+                    for (k in i until i + maxOf(n, 1)) out.append("%%%02X".format(Locale.ROOT, path[k].toInt() and 0xff))
                 }
                 i += maxOf(n, 1)
             }
@@ -543,14 +558,28 @@ class Documents : DocumentsProvider() {
         }
 
         /**
-         * A canonical path: starts with `/`, has no empty, `.` or `..` components, and does not end
-         * with `/` (except `/` itself). null when it is not.
+         * Encodes a raw guest path (such as an `/etc/passwd` home directory) as a canonical
+         * document ID, trimming trailing slashes; null when not absolute or not canonical.
+         */
+        fun documentId(guestPath: String): String? {
+            if (!guestPath.startsWith("/")) return null
+            val trimmed = guestPath.trimEnd('/').ifEmpty { "/" }
+            return canonical(documentId(trimmed.toByteArray(Charsets.UTF_8)))
+        }
+
+        /**
+         * A canonical document ID: starts with `/`, has no empty, `.` or `..` components, does not
+         * end with `/` (except `/` itself), contains no NUL bytes, and matches the exact `%XX`
+         * encoding of [documentId] (rejecting encoded `/` or `.` such as `%2F`/`%2E` and any
+         * non-canonical escape). null when it is not.
          */
         fun canonical(path: String): String? {
             if (path == "/") return path
             if (!path.startsWith("/") || path.endsWith("/")) return null
             val parts = path.substring(1).split('/')
             if (parts.any { it.isEmpty() || it == "." || it == ".." }) return null
+            val decoded = percentDecode(path)
+            if (0.toByte() in decoded || documentId(decoded) != path) return null
             return path
         }
 

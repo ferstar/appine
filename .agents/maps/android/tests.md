@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: cover existing regular bash account seeding and ownership in MachineTest)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: cover percent-encoded document ID rejection, regular-file homes and rootsChanged cache invalidation in MachineTest)
 
 ## Responsibilities
 
@@ -89,7 +89,8 @@ debug variant, manifest and network-security configuration belong to `android/bu
   the foreground cwd), login from `/etc/passwd`, the saved directory, accounts and doas (two logins installing it at once, and one waiting for apk's lock, included), NOPASSWD
   rules following a password set later, saved tabs, the Files provider (default-off access including
   legacy preferences, disabled queries/reads/changes and file links, authority-wide grant revocation,
-  home, no home, writes,
+  canonical `%XX` validation and `%2E`/`%2F` tree-grant rejection, home, no home including regular-file
+  homes and `rootsChanged` cache invalidation, writes,
   changes both ways, grants below a directory as a pure check of `Documents.grantedUnder`), manual
   mirrors, verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
   ports, bugs injected through the test hooks killing only the guest process on both tiers, kill

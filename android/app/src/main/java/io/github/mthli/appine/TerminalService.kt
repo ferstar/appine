@@ -1182,8 +1182,10 @@ class TerminalService : Service() {
      * are done on [worker].
      */
     private fun replace(distro: Rootfs.Distro) {
-        // The old accounts were all deleted with the store
+        // The old accounts and path-based document grants belong to the store being removed.
         Settings.clearLogin(this)
+        Documents.revokeAccess(this)
+        Documents.rootsChanged(this)
         transitioning = true
         val m = detach()
         startError = null
@@ -1192,6 +1194,9 @@ class TerminalService : Service() {
             if (m != 0L) Native.stop(m)
             mirrorThread?.join()
             Rootfs.reset(this)
+            // Revoke again after deletion in case a grant was issued while stopping the old kernel.
+            Documents.revokeAccess(this)
+            Documents.rootsChanged(this)
             main.post {
                 transitioning = false
                 // Also after "Exit all" meanwhile: the store is gone, so import the chosen distro

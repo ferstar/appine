@@ -525,19 +525,17 @@ pub fn encode_path(bytes: &[u8]) -> String {
     out
 }
 
-/// The reverse of [`encode_path`]; a `%` not followed by two hex digits is kept as it is.
+/// The reverse of [`encode_path`]; a `%` not followed by two ASCII hex digits is kept as it is.
 pub fn decode_path(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%'
-            && let Some(v) = b
-                .get(i + 1..i + 3)
-                .and_then(|h| std::str::from_utf8(h).ok())
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            && let Some(&[hi, lo]) = b.get(i + 1..i + 3)
+            && let (Some(hi), Some(lo)) = (hex_digit(hi), hex_digit(lo))
         {
-            out.push(v);
+            out.push((hi << 4) | lo);
             i += 3;
             continue;
         }
@@ -545,6 +543,15 @@ pub fn decode_path(s: &str) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ---- Path resolution ----
@@ -765,7 +772,7 @@ mod tests {
         }
         assert_eq!(encode_path(b"/a%b\tc"), "/a%25b%09c");
         assert_eq!(encode_path("中".as_bytes()), "中");
-        assert_eq!(decode_path("/x%zz%4"), b"/x%zz%4");
+        assert_eq!(decode_path("/x%zz%4%+a%+0"), b"/x%zz%4%+a%+0");
     }
 
     #[test]

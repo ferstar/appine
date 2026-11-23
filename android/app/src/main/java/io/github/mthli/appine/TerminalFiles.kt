@@ -109,9 +109,9 @@ internal class TerminalFiles(application: Application) : AndroidViewModel(applic
             var createdFile: Pair<String, String>? = null
             return try {
                 input.use {
-                    val home = Documents.canonical("/" + account.home.trim('/'))?.takeIf { it != "/" }
+                    val top = Documents.documentId(account.home)?.takeIf { it != "/" }
                         ?: throw IOException("The login account has no home directory")
-                    val top = Uri.encode(home, "/")
+                    val home = account.home.trimEnd('/')
                     val safeName = displayName.map { if (Character.isISOControl(it)) '_' else it }.joinToString("")
                     val name = Documents.fileName(safeName, "", false)
                     val created = Native.browseCreate(store, top, top, name, false, account.uid, account.gid)

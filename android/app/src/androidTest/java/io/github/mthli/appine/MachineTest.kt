@@ -1423,18 +1423,47 @@ class MachineTest {
             assertEquals("hi", read("/root/dt/a.txt"))
             assertEquals("x", read("/root/dt/100%25 中文.txt"))
             assertTrue(read("/root/dt/release").startsWith("3."))
-            // Non-canonical IDs count as nonexistent (the query returns null).
+            // Non-canonical IDs count as nonexistent (the query returns null), including percent-
+            // encoded `.`/`/` and non-canonical `%XX` escapes that native decode_path decodes.
             assertEquals(listOf(listOf("text/plain")), rows(document("/root/dt/release"), mime))
-            assertEquals(null, rows(document("/root/dt/../../etc/motd"), id))
-            assertEquals(null, rows(document("/root//dt"), id))
-            // Tree grants: what is inside works, walking out with `..` does not
+            for (bad in listOf(
+                "/root/dt/../../etc/motd",
+                "/root//dt",
+                "/root/dt/%2e%2e/etc/motd",
+                "/root/dt/%2E%2E/a.txt",
+                "/root/dt/sub%2f..%2f..%2fetc%2fmotd",
+                "/root/dt/a%2fb",
+                "/root/dt/%61.txt",
+                "/root/dt/100%",
+                "/root/dt/a%00b",
+                "/root/dt/a%+ab",
+                "/root/dt/%ff",
+            )) {
+                assertEquals(bad, null, Documents.canonical(bad))
+                assertEquals(bad, null, rows(document(bad), id))
+            }
+            for (good in listOf("/", "/root/dt/100%25 中文.txt", "/root/dt/a%09b", "/root/dt/%FF%FE")) {
+                assertEquals(good, Documents.canonical(good))
+            }
+            assertEquals("/root/100%25 home", Documents.documentId("/root/100% home/"))
+            assertEquals(null, Documents.documentId("root/relative"))
+            assertEquals(null, Documents.documentId("//root"))
+            assertEquals(null, Documents.documentId("/root/../etc"))
+            // Tree grants: what is inside works, walking out with `..` or `%2E`/`%2F` does not
             val tree = DocumentsContract.buildTreeDocumentUri(authority, "/root/dt")
             assertEquals(
                 listOf(listOf("/root/dt/sub")),
                 rows(DocumentsContract.buildDocumentUriUsingTree(tree, "/root/dt/sub"), id),
             )
-            assertThrows(SecurityException::class.java) {
-                rows(DocumentsContract.buildDocumentUriUsingTree(tree, "/root/dt/../../etc/motd"), id)
+            for (escape in listOf(
+                "/root/dt/../../etc/motd",
+                "/root/dt/%2e%2e/%2e%2e/etc/motd",
+                "/root/dt/sub%2f..%2f..%2f..%2fetc%2fmotd",
+                "/root/dt/%2E%2E/a.txt",
+            )) {
+                assertThrows(escape, SecurityException::class.java) {
+                    rows(DocumentsContract.buildDocumentUriUsingTree(tree, escape), id)
+                }
             }
             // The Files app passes the name in the arguments when it searches
             val search = DocumentsContract.buildSearchDocumentsUri(authority, Documents.ROOT_HOME, "A.TXT")
@@ -1473,8 +1502,10 @@ class MachineTest {
     fun documentsWithoutAHomeDirectory() {
         val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
         val machine = start(1)
-        val setup = "deluser carol 2>/dev/null; deluser dave 2>/dev/null; " +
-            "adduser -D -H -h / -u 1601 carol && adduser -D -H -h /home/dave -u 1602 dave"
+        val setup = "deluser carol 2>/dev/null; deluser dave 2>/dev/null; deluser erin 2>/dev/null; " +
+            "rm -rf /home/dave /tmp/erin-home && printf x > /tmp/erin-home && " +
+            "adduser -D -H -h / -u 1601 carol && adduser -D -H -h /home/dave -u 1602 dave && " +
+            "adduser -D -H -h /tmp/erin-home -u 1603 erin"
         assertEquals(0, sh(machine, setup).second)
         val resolver = context.contentResolver
         val authority = Documents.authority(context)
@@ -1488,7 +1519,7 @@ class MachineTest {
         fun document(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
         try {
             // Each account is its own login setting, so the provider's cached home is not reused
-            for (account in listOf("carol", "dave")) {
+            for (account in listOf("carol", "dave", "erin")) {
                 prefs.edit().putString("login", account).putBoolean("file_access", false).commit()
                 assertEquals(account, emptyList<String>(), roots())
                 prefs.edit().putBoolean("file_access", true).commit()
@@ -1497,10 +1528,19 @@ class MachineTest {
                 val created = runCatching { DocumentsContract.createDocument(resolver, document("/"), "text/plain", "x") }
                 assertEquals(account, null, created.getOrNull())
             }
+            // rootsChanged clears the cached home immediately even when login is unchanged.
+            prefs.edit().putString("login", "dave").putBoolean("file_access", true).commit()
+            assertEquals(listOf("system"), roots())
+            assertEquals(0, sh(machine, "mkdir -p /home/dave").second)
+            Documents.rootsChanged(context)
+            assertEquals(listOf("home", "system"), roots())
+            assertEquals(0, sh(machine, "rmdir /home/dave").second)
+            Documents.rootsChanged(context)
+            assertEquals(listOf("system"), roots())
             assertEquals(1, sh(machine, "test -e /x").second)
         } finally {
             prefs.edit().remove("login").remove("file_access").commit()
-            sh(machine, "deluser carol; deluser dave")
+            sh(machine, "deluser carol; deluser dave; deluser erin; rm -rf /home/dave /tmp/erin-home")
         }
     }
 

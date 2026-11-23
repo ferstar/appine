@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: list android/vtgestures alongside android/vtview and android/vtrender)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: revoke Documents URI grants and refresh roots during rootfs replacement)
 
 ## Responsibilities
 
@@ -192,10 +192,12 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   finishes, `replace` if a kernel runs or the start failed, else record it in `pendingReplace`
   while a start or restart is under way (in any other state it is dropped). After a failed start
   the switch keeps the service running without a UI; its failure or cancel then stops it as a
-  failed start does. `replace`: reset the login setting, `transitioning`,
+  failed start does. `replace`: reset the login setting, revoke provider URI grants
+  (`Documents.revokeAccess`) and refresh roots (`Documents.rootsChanged`), `transitioning`,
   `detach`, then on the worker `Native.stop` (kill all, no inittab shutdown), join the mirror
-  thread and delete the store, then `start(distro)` — also after "exit all" meanwhile, so the
-  chosen distro is imported (and then stopped) rather than the next start importing Alpine.
+  thread, delete the store, and revoke grants and refresh roots again before `start(distro)` — also
+  after "exit all" meanwhile, so the chosen distro is imported (and then stopped) rather than the
+  next start importing Alpine.
 - `onDestroy` marks the service destroyed (from then on nothing posts the ongoing notification,
   which a thread outliving it, the download's, would otherwise post again),
   cancels a distro switch still downloading, removes the pending callbacks, clears saved tabs
