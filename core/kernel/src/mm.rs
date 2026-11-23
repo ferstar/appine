@@ -3145,38 +3145,27 @@ impl Mm {
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
         let mut cursor = addr;
         while cursor < end {
-            let (s, v_len, backing, reserved, written, cow, contents_len, prot) = {
-                let (&s, v) = self
-                    .vmas
-                    .range(..=cursor)
-                    .next_back()
-                    .ok_or(Errno::ENOMEM)?;
-                if s + v.len <= cursor {
-                    return Err(Errno::ENOMEM);
-                }
-                (
-                    s,
-                    v.len,
-                    v.backing,
-                    v.reserved(),
-                    v.written.get(),
-                    v.cow,
-                    v.contents_len(),
-                    v.prot,
-                )
-            };
-            let stop = end.min(s + v_len);
-            if backing == Backing::Anonymous && !reserved {
-                if prot & prot::EXEC != 0 {
+            let (&s, v) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .ok_or(Errno::ENOMEM)?;
+            if s + v.len <= cursor {
+                return Err(Errno::ENOMEM);
+            }
+            let stop = end.min(s + v.len);
+            if v.backing == Backing::Anonymous && !v.reserved() {
+                if v.prot & prot::EXEC != 0 {
                     self.code_ranges.push((cursor, stop - cursor));
                 }
                 // Borrowers still need lent pages, and borrowed pages are replaced by our own
                 // (reading zero afterwards)
                 self.cow_settle(cursor, stop);
-                let host = self.vmas[&s].host;
                 // SAFETY: [cursor, stop) is inside this VMA, and its host memory is the VMA's
                 // private anonymous memory
-                unsafe { discard_host(host.add((cursor - s) as usize), (stop - cursor) as usize) };
+                unsafe {
+                    discard_host(v.host.add((cursor - s) as usize), (stop - cursor) as usize)
+                };
                 // The vDSO comes back as the kernel's image, not zeros (on Linux a special
                 // mapping whose pages fault back in; breakpoints written into it are gone)
                 if s == self.vdso {
@@ -3190,76 +3179,78 @@ impl Mm {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 image[from..].as_ptr(),
-                                host.add(from).as_ptr(),
+                                v.host.add(from).as_ptr(),
                                 to - from,
                             )
                         };
                     }
                 }
-            }
-            // Only written pages differ from the file, and whole pages past the end of the file
-            // have no entries. Fork marks every read-only private file VMA `cow` (even if written
-            // before becoming read-only); unshare it first so discarding reverts only this
-            // address space without corrupting the peer.
-            let in_file = stop.min(s + page_up(contents_len).unwrap_or(v_len));
-            if backing == Backing::PrivateFile && written && cursor < in_file {
-                if cow {
-                    self.unshare(s)?;
-                }
-                if prot & prot::EXEC != 0 {
-                    self.code_ranges.push((cursor, in_file - cursor));
-                }
-                let v = &self.vmas[&s];
-                // Read on demand: its host file holds what was read, which the rest of a host page
-                // is read back from
-                if let Some(fill) = &v.fill {
-                    use std::os::unix::fs::FileExt;
-                    // SAFETY: [cursor, in_file) is inside this VMA's host file mapping
-                    let left = unsafe {
-                        discard_file_host(
-                            v.host.add((cursor - s) as usize),
-                            (in_file - cursor) as usize,
-                        )
-                    };
-                    let base = v.offset() + (cursor - s);
-                    for (off, l) in left {
-                        // SAFETY: this piece lies inside this VMA's own writable host memory
-                        let dst = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                v.host.as_ptr().add((cursor - s) as usize + off),
-                                l,
+            } else if v.backing == Backing::PrivateFile && v.written.get() {
+                // Only written pages differ from the file, and whole pages past the end of the
+                // file have no entries. Fork marks every read-only private file VMA `cow` (even if
+                // written before becoming read-only); unshare it first so discarding reverts only
+                // this address space without corrupting the peer.
+                let in_file = stop.min(s + page_up(v.contents_len()).unwrap_or(v.len));
+                if cursor < in_file {
+                    if v.cow {
+                        self.unshare(s)?;
+                    }
+                    let v = &self.vmas[&s];
+                    if v.prot & prot::EXEC != 0 {
+                        self.code_ranges.push((cursor, in_file - cursor));
+                    }
+                    // Read on demand: its host file holds what was read, which the rest of a host
+                    // page is read back from
+                    if let Some(fill) = &v.fill {
+                        use std::os::unix::fs::FileExt;
+                        // SAFETY: [cursor, in_file) is inside this VMA's host file mapping
+                        let left = unsafe {
+                            discard_file_host(
+                                v.host.add((cursor - s) as usize),
+                                (in_file - cursor) as usize,
                             )
                         };
-                        if fill.host.read_exact_at(dst, base + off as u64).is_err() {
-                            dst.fill(0);
+                        let base = v.offset() + (cursor - s);
+                        for (off, l) in left {
+                            // SAFETY: this piece lies inside this VMA's own writable host memory
+                            let dst = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    v.host.as_ptr().add((cursor - s) as usize + off),
+                                    l,
+                                )
+                            };
+                            if fill.host.read_exact_at(dst, base + off as u64).is_err() {
+                                dst.fill(0);
+                            }
                         }
+                        cursor = stop;
+                        continue;
                     }
-                    cursor = stop;
-                    continue;
-                }
-                let base = v.file_id.map_or(0, |f| f.2) + (cursor - s);
-                let reread = |a: u64, l: u64| Reread {
-                    addr: a,
-                    len: l,
-                    ino: v.ino,
-                    offset: base + (a - cursor),
-                };
-                if v.region.anonymous.is_none() {
-                    // A host private file mapping: the host drops its copies of whole host pages
-                    // SAFETY: [cursor, in_file) is inside this VMA's host file mapping
-                    let left = unsafe {
-                        discard_file_host(
-                            v.host.add((cursor - s) as usize),
-                            (in_file - cursor) as usize,
-                        )
+                    let base = v.file_id.map_or(0, |f| f.2) + (cursor - s);
+                    let reread = |a: u64, l: u64| Reread {
+                        addr: a,
+                        len: l,
+                        ino: v.ino,
+                        offset: base + (a - cursor),
                     };
-                    for (off, l) in left {
-                        rereads.push(reread(cursor + off as u64, l as u64));
+                    if v.region.anonymous.is_none() {
+                        // A host private file mapping: the host drops its copies of whole host
+                        // pages
+                        // SAFETY: [cursor, in_file) is inside this VMA's host file mapping
+                        let left = unsafe {
+                            discard_file_host(
+                                v.host.add((cursor - s) as usize),
+                                (in_file - cursor) as usize,
+                            )
+                        };
+                        for (off, l) in left {
+                            rereads.push(reread(cursor + off as u64, l as u64));
+                        }
+                    } else {
+                        // Anonymous memory holding a copy of the file (copied before it became
+                        // writable, or unshared above)
+                        rereads.push(reread(cursor, in_file - cursor));
                     }
-                } else {
-                    // Anonymous memory holding a copy of the file (copied before it became
-                    // writable, or unshared above)
-                    rereads.push(reread(cursor, in_file - cursor));
                 }
             }
             cursor = stop;

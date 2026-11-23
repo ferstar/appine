@@ -1010,7 +1010,7 @@ impl Nft {
                 (NEWSETELEM, Some(_)) => {}
                 (NEWSETELEM, None) => {
                     let elem = table
-                        .check_elem(e)
+                        .check_verdict(&unflag(e), SET_ELEM_DATA, None)
                         .map_err(|f| bad(Errno(f.errno), Some(e)))?;
                     table.sets[s].elems.push(elem);
                 }
@@ -1084,7 +1084,9 @@ impl Table {
             .map(|r| {
                 exprs(&r.exprs)
                     .iter()
-                    .filter(|(n, d)| n == b"immediate" && verdict_chain(d).as_deref() == Some(name))
+                    .filter(|(n, d)| {
+                        n == b"immediate" && verdict_chain(d, IMMEDIATE_DATA) == Some(name)
+                    })
                     .count()
             })
             .sum();
@@ -1092,50 +1094,9 @@ impl Table {
             .sets
             .iter()
             .flat_map(|s| &s.elems)
-            .filter(|e| elem_verdict_chain(e).as_deref() == Some(name))
+            .filter(|e| verdict_chain(e, SET_ELEM_DATA) == Some(name))
             .count();
         rules + maps
-    }
-
-    /// Validates a set element (`NEWSETELEM`): if it carries a jump/goto verdict, checks that the
-    /// target chain exists and is not a base chain, and rewrites `VERDICT_CHAIN_ID` to its name.
-    fn check_elem(&self, elem: &[u8]) -> Result<Vec<u8>, Fail> {
-        let clean = unflag(elem);
-        let a = crate::route::attrs(&clean);
-        let Some(d) = get(&a, SET_ELEM_DATA) else {
-            return Ok(clean);
-        };
-        let Some(v) = get(&crate::route::attrs(d), DATA_VERDICT) else {
-            return Ok(clean);
-        };
-        let va = crate::route::attrs(v);
-        let code = get_be32(&va, VERDICT_CODE).ok_or_else(|| fail(Errno::EINVAL))? as i32;
-        if code != NFT_JUMP && code != NFT_GOTO {
-            return Ok(clean);
-        }
-        let chain = match (get_str(&va, VERDICT_CHAIN), get_be32(&va, VERDICT_CHAIN_ID)) {
-            (Some(n), _) => self.chains.iter().find(|c| c.name == n),
-            (None, Some(id)) => self.chains.iter().find(|c| c.id == Some(id)),
-            (None, None) => return Err(fail(Errno::EINVAL)),
-        }
-        .ok_or_else(|| fail(Errno::ENOENT))?;
-        if chain.base.is_some() {
-            return Err(fail(Errno::EOPNOTSUPP));
-        }
-        let mut nv = Vec::new();
-        attr(&mut nv, VERDICT_CODE, &be32(code as u32));
-        attr(&mut nv, VERDICT_CHAIN, &cstr(&chain.name));
-        let mut nd = Vec::new();
-        attr(&mut nd, DATA_VERDICT, &nv);
-        let mut out = Vec::new();
-        for (t, x) in &a {
-            if *t == SET_ELEM_DATA {
-                attr(&mut out, SET_ELEM_DATA, &nd);
-            } else {
-                attr(&mut out, *t, x);
-            }
-        }
-        Ok(out)
     }
 
     /// Updates all jump/goto references in rules and verdict maps when chain `old` is renamed to
@@ -1143,17 +1104,16 @@ impl Table {
     fn rename_chain_refs(&mut self, old: &[u8], new: &[u8]) {
         for c in &mut self.chains {
             for r in &mut c.rules {
-                if exprs(&r.exprs)
-                    .iter()
-                    .any(|(n, d)| n == b"immediate" && verdict_chain(d).as_deref() == Some(old))
-                {
+                if exprs(&r.exprs).iter().any(|(n, d)| {
+                    n == b"immediate" && verdict_chain(d, IMMEDIATE_DATA) == Some(old)
+                }) {
                     let mut out = Vec::new();
                     for (_, elem) in crate::route::attrs(&r.exprs) {
                         let a = crate::route::attrs(elem);
                         let name = get_str(&a, EXPR_NAME).unwrap_or_default();
                         let data = get(&a, EXPR_DATA).unwrap_or_default();
                         let data = if name == b"immediate"
-                            && verdict_chain(data).as_deref() == Some(old)
+                            && verdict_chain(data, IMMEDIATE_DATA) == Some(old)
                         {
                             rewrite_verdict_chain(data, IMMEDIATE_DATA, new)
                         } else {
@@ -1170,7 +1130,7 @@ impl Table {
         }
         for s in &mut self.sets {
             for e in &mut s.elems {
-                if elem_verdict_chain(e).as_deref() == Some(old) {
+                if verdict_chain(e, SET_ELEM_DATA) == Some(old) {
                     *e = rewrite_verdict_chain(e, SET_ELEM_DATA, new);
                 }
             }
@@ -1222,7 +1182,9 @@ impl Table {
             }
             let data = unflag(get(&a, EXPR_DATA).unwrap_or_default());
             let data = match name {
-                b"immediate" => self.check_verdict(&data, from).map_err(here)?,
+                b"immediate" => self
+                    .check_verdict(&data, IMMEDIATE_DATA, Some(from))
+                    .map_err(here)?,
                 b"lookup" => self.check_set_ref(&data, LOOKUP_SET_ID).map_err(here)?,
                 b"dynset" => self.check_set_ref(&data, DYNSET_SET_ID).map_err(here)?,
                 _ => data,
@@ -1235,18 +1197,26 @@ impl Table {
         Ok(out)
     }
 
-    fn check_verdict(&self, data: &[u8], from: &[u8]) -> Result<Vec<u8>, Fail> {
-        let a = crate::route::attrs(data);
-        let Some(d) = get(&a, IMMEDIATE_DATA) else {
-            return Ok(data.to_vec());
+    /// Validates a jump/goto verdict inside `data_attr` (`IMMEDIATE_DATA` for a rule expression or
+    /// `SET_ELEM_DATA` for a verdict-map element): the target chain must exist and not be a base
+    /// chain, rule jumps cannot form a loop (`from`), and `VERDICT_CHAIN_ID` is rewritten to name.
+    fn check_verdict(
+        &self,
+        bytes: &[u8],
+        data_attr: u16,
+        from: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Fail> {
+        let a = crate::route::attrs(bytes);
+        let Some(d) = get(&a, data_attr) else {
+            return Ok(bytes.to_vec());
         };
         let Some(v) = get(&crate::route::attrs(d), DATA_VERDICT) else {
-            return Ok(data.to_vec());
+            return Ok(bytes.to_vec());
         };
         let va = crate::route::attrs(v);
         let code = get_be32(&va, VERDICT_CODE).ok_or_else(|| fail(Errno::EINVAL))? as i32;
         if code != NFT_JUMP && code != NFT_GOTO {
-            return Ok(data.to_vec());
+            return Ok(bytes.to_vec());
         }
         let chain = match (get_str(&va, VERDICT_CHAIN), get_be32(&va, VERDICT_CHAIN_ID)) {
             (Some(n), _) => self.chains.iter().find(|c| c.name == n),
@@ -1260,7 +1230,9 @@ impl Table {
         // Jumping back to itself (directly or through other chains) is a loop: a 6.8 kernel
         // checks the jump depth (nft_chain_validate), and beyond NFT_JUMP_STACK_SIZE it is
         // EMLINK
-        if self.reaches(&chain.name, from, 0) {
+        if let Some(from) = from
+            && self.reaches(&chain.name, from, 0)
+        {
             return Err(fail(Errno::EMLINK));
         }
         // Record it by name
@@ -1271,8 +1243,8 @@ impl Table {
         attr(&mut nd, DATA_VERDICT, &nv);
         let mut out = Vec::new();
         for (t, x) in &a {
-            if *t == IMMEDIATE_DATA {
-                attr(&mut out, IMMEDIATE_DATA, &nd);
+            if *t == data_attr {
+                attr(&mut out, data_attr, &nd);
             } else {
                 attr(&mut out, *t, x);
             }
@@ -1294,7 +1266,8 @@ impl Table {
         c.rules.iter().any(|r| {
             exprs(&r.exprs).iter().any(|(n, d)| {
                 n == b"immediate"
-                    && verdict_chain(d).is_some_and(|t| self.reaches(&t, goal, depth + 1))
+                    && verdict_chain(d, IMMEDIATE_DATA)
+                        .is_some_and(|t| self.reaches(t, goal, depth + 1))
             })
         })
     }
@@ -1327,18 +1300,11 @@ impl Table {
     }
 }
 
-/// The chain jumped to in immediate's arguments.
-fn verdict_chain(data: &[u8]) -> Option<Vec<u8>> {
-    let d = get(&crate::route::attrs(data), IMMEDIATE_DATA)?;
+/// The chain jumped to in `data_attr` (`IMMEDIATE_DATA` or `SET_ELEM_DATA`).
+fn verdict_chain(bytes: &[u8], data_attr: u16) -> Option<&[u8]> {
+    let d = get(&crate::route::attrs(bytes), data_attr)?;
     let v = get(&crate::route::attrs(d), DATA_VERDICT)?;
-    get_str(&crate::route::attrs(v), VERDICT_CHAIN).map(<[u8]>::to_vec)
-}
-
-/// The chain jumped to in a verdict-map element (`NFTA_SET_ELEM_DATA`).
-fn elem_verdict_chain(elem: &[u8]) -> Option<Vec<u8>> {
-    let d = get(&crate::route::attrs(elem), SET_ELEM_DATA)?;
-    let v = get(&crate::route::attrs(d), DATA_VERDICT)?;
-    get_str(&crate::route::attrs(v), VERDICT_CHAIN).map(<[u8]>::to_vec)
+    get_str(&crate::route::attrs(v), VERDICT_CHAIN)
 }
 
 /// Rewrites `VERDICT_CHAIN` inside `data_attr` (`IMMEDIATE_DATA` or `SET_ELEM_DATA`) to `new_name`.
@@ -3817,6 +3783,31 @@ mod tests {
     fn verdict_map_refs_rule_replace_chain_rename_and_nonrec_deltable() {
         let ns = ns();
         let root = Cred::root();
+        let run = |msgs: &[Vec<u8>]| errors(&handle(&ns, &root, &batch(msgs), &peer()));
+        let chain_ref = |name: &[u8]| {
+            let mut p = Vec::new();
+            a(&mut p, CHAIN_TABLE, &cstr(b"t"));
+            a(&mut p, CHAIN_NAME, &cstr(name));
+            p
+        };
+        let get_chain = |name: &[u8]| {
+            dumped(&handle(
+                &ns,
+                &root,
+                &msg(GETCHAIN, 0, 1, &chain_ref(name)),
+                &peer(),
+            ))
+        };
+        let first_rule_handle = || {
+            let rules = dumped(&handle(
+                &ns,
+                &root,
+                &msg(GETRULE, NLM_F_DUMP, 1, &[]),
+                &peer(),
+            ));
+            u64::from_be_bytes(find(&rules[0], RULE_HANDLE).try_into().unwrap())
+        };
+
         // Create table t, chains c1 and target, verdict map vm pointing at target, and a jump rule
         let mut set_p = Vec::new();
         a(&mut set_p, SET_TABLE, &cstr(b"t"));
@@ -3839,114 +3830,58 @@ mod tests {
         a(&mut el_p, SET_ELEM_LIST_SET, &cstr(b"vm"));
         a(&mut el_p, SET_ELEM_LIST_ELEMENTS, &elems);
 
-        let r = handle(
-            &ns,
-            &root,
-            &batch(&[
+        assert!(
+            run(&[
                 table_msg(1, b"t"),
                 chain_msg(1, b"t", b"c1", None),
                 chain_msg(1, b"t", b"target", None),
                 msg(NEWSET, NLM_F_CREATE, 1, &set_p),
                 msg(NEWSETELEM, NLM_F_CREATE, 1, &el_p),
                 rule_msg(1, b"t", b"c1", &[jump(b"target")]),
-            ]),
-            &peer(),
+            ])
+            .is_empty()
         );
-        assert!(r.is_empty(), "{:?}", errors(&r));
 
         // target has 2 uses (1 rule jump + 1 verdict map element); deleting it fails with EBUSY
-        let mut del_c = Vec::new();
-        a(&mut del_c, CHAIN_TABLE, &cstr(b"t"));
-        a(&mut del_c, CHAIN_NAME, &cstr(b"target"));
         assert_eq!(
-            errors(&handle(
-                &ns,
-                &root,
-                &batch(&[msg(DELCHAIN, 0, 1, &del_c)]),
-                &peer()
-            )),
+            run(&[msg(DELCHAIN, 0, 1, &chain_ref(b"target"))]),
             [Errno::EBUSY.0]
         );
-        let c_get = dumped(&handle(&ns, &root, &msg(GETCHAIN, 0, 1, &del_c), &peer()));
+        let c_get = get_chain(b"target");
         assert_eq!(find(&c_get[0], CHAIN_USE), be32(2));
         let target_handle = u64::from_be_bytes(find(&c_get[0], CHAIN_HANDLE).try_into().unwrap());
 
         // Rename target -> renamed by handle; collision with c1 fails with EEXIST
-        let mut bad_ren = Vec::new();
-        a(&mut bad_ren, CHAIN_TABLE, &cstr(b"t"));
-        a(&mut bad_ren, CHAIN_HANDLE, &be64(target_handle));
-        a(&mut bad_ren, CHAIN_NAME, &cstr(b"c1"));
-        assert_eq!(
-            errors(&handle(
-                &ns,
-                &root,
-                &batch(&[msg(NEWCHAIN, 0, 1, &bad_ren)]),
-                &peer()
-            )),
-            [Errno::EEXIST.0]
-        );
-        let mut ren = Vec::new();
-        a(&mut ren, CHAIN_TABLE, &cstr(b"t"));
-        a(&mut ren, CHAIN_HANDLE, &be64(target_handle));
-        a(&mut ren, CHAIN_NAME, &cstr(b"renamed"));
-        assert!(handle(&ns, &root, &batch(&[msg(NEWCHAIN, 0, 1, &ren)]), &peer()).is_empty());
+        let rename_msg = |to: &[u8]| {
+            let mut p = Vec::new();
+            a(&mut p, CHAIN_TABLE, &cstr(b"t"));
+            a(&mut p, CHAIN_HANDLE, &be64(target_handle));
+            a(&mut p, CHAIN_NAME, &cstr(to));
+            msg(NEWCHAIN, 0, 1, &p)
+        };
+        assert_eq!(run(&[rename_msg(b"c1")]), [Errno::EEXIST.0]);
+        assert!(run(&[rename_msg(b"renamed")]).is_empty());
 
         // Both rule jump and verdict map still reference renamed -> EBUSY
-        let mut del_ren = Vec::new();
-        a(&mut del_ren, CHAIN_TABLE, &cstr(b"t"));
-        a(&mut del_ren, CHAIN_NAME, &cstr(b"renamed"));
-        let r_get = dumped(&handle(&ns, &root, &msg(GETCHAIN, 0, 1, &del_ren), &peer()));
-        assert_eq!(find(&r_get[0], CHAIN_USE), be32(2));
+        assert_eq!(find(&get_chain(b"renamed")[0], CHAIN_USE), be32(2));
         assert_eq!(
-            errors(&handle(
-                &ns,
-                &root,
-                &batch(&[msg(DELCHAIN, 0, 1, &del_ren)]),
-                &peer()
-            )),
+            run(&[msg(DELCHAIN, 0, 1, &chain_ref(b"renamed"))]),
             [Errno::EBUSY.0]
         );
 
         // Replacing the rule in c1 preserves its handle and drops its jump to renamed
-        let rules = dumped(&handle(
-            &ns,
-            &root,
-            &msg(GETRULE, NLM_F_DUMP, 1, &[]),
-            &peer(),
-        ));
-        let orig_h = u64::from_be_bytes(find(&rules[0], RULE_HANDLE).try_into().unwrap());
+        let orig_h = first_rule_handle();
         let mut rep = Vec::new();
         a(&mut rep, RULE_TABLE, &cstr(b"t"));
         a(&mut rep, RULE_CHAIN, &cstr(b"c1"));
         a(&mut rep, RULE_HANDLE, &be64(orig_h));
-        assert!(
-            handle(
-                &ns,
-                &root,
-                &batch(&[msg(NEWRULE, NLM_F_REPLACE, 1, &rep)]),
-                &peer()
-            )
-            .is_empty()
-        );
-        let rules2 = dumped(&handle(
-            &ns,
-            &root,
-            &msg(GETRULE, NLM_F_DUMP, 1, &[]),
-            &peer(),
-        ));
-        let new_h = u64::from_be_bytes(find(&rules2[0], RULE_HANDLE).try_into().unwrap());
-        assert_eq!(new_h, orig_h);
+        assert!(run(&[msg(NEWRULE, NLM_F_REPLACE, 1, &rep)]).is_empty());
+        assert_eq!(first_rule_handle(), orig_h);
 
         // renamed is still held solely by the verdict map -> still EBUSY
-        let r_get = dumped(&handle(&ns, &root, &msg(GETCHAIN, 0, 1, &del_ren), &peer()));
-        assert_eq!(find(&r_get[0], CHAIN_USE), be32(1));
+        assert_eq!(find(&get_chain(b"renamed")[0], CHAIN_USE), be32(1));
         assert_eq!(
-            errors(&handle(
-                &ns,
-                &root,
-                &batch(&[msg(DELCHAIN, 0, 1, &del_ren)]),
-                &peer()
-            )),
+            run(&[msg(DELCHAIN, 0, 1, &chain_ref(b"renamed"))]),
             [Errno::EBUSY.0]
         );
 
@@ -3954,12 +3889,7 @@ mod tests {
         let mut del_t = Vec::new();
         a(&mut del_t, TABLE_NAME, &cstr(b"t"));
         assert_eq!(
-            errors(&handle(
-                &ns,
-                &root,
-                &batch(&[msg(DELTABLE, NLM_F_NONREC, 1, &del_t)]),
-                &peer()
-            )),
+            run(&[msg(DELTABLE, NLM_F_NONREC, 1, &del_t)]),
             [Errno::EBUSY.0]
         );
 
@@ -3967,21 +3897,15 @@ mod tests {
         let mut del_s = Vec::new();
         a(&mut del_s, SET_TABLE, &cstr(b"t"));
         a(&mut del_s, SET_NAME, &cstr(b"vm"));
-        let mut del_c1 = Vec::new();
-        a(&mut del_c1, CHAIN_TABLE, &cstr(b"t"));
-        a(&mut del_c1, CHAIN_NAME, &cstr(b"c1"));
-        let r = handle(
-            &ns,
-            &root,
-            &batch(&[
+        assert!(
+            run(&[
                 msg(DELSET, 0, 1, &del_s),
-                msg(DELCHAIN, 0, 1, &del_ren),
-                msg(DELCHAIN, 0, 1, &del_c1),
+                msg(DELCHAIN, 0, 1, &chain_ref(b"renamed")),
+                msg(DELCHAIN, 0, 1, &chain_ref(b"c1")),
                 msg(DELTABLE, NLM_F_NONREC, 1, &del_t),
-            ]),
-            &peer(),
+            ])
+            .is_empty()
         );
-        assert!(r.is_empty(), "{:?}", errors(&r));
         assert!(ns.nft.borrow().is_empty());
     }
 }

@@ -86,7 +86,7 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   same cgroup (`EOPNOTSUPP` otherwise); `cgroup.type` is always `domain` (`threaded` is
   `EOPNOTSUPP`).
 - Writes, in order: a removed cgroup or a file whose controller is no longer enabled on that
-  cgroup `ENODEV` (`k.cgroups.get(id)` and `k.cgroups.files(id)`); on the root and on the writer's
+  cgroup `ENODEV` (`Cgroups::has_file`); on the root and on the writer's
   namespace root only `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable
   (`EPERM`); a read-only file `EINVAL`. `cgroup.subtree_control`: `+name`/`-name` tokens (anything else,
   including a token starting with a multi-byte character, `EINVAL`); enabling a

@@ -1,5 +1,5 @@
 /*
- * Regression tests for Package 2 (kernel/signal, kernel/ptrace, kernel/tty, kernel/time):
+ * Regression tests for kernel/signal, kernel/ptrace, kernel/tty, and kernel/time:
  * - group_stop notifies parent with CLD_STOPPED only after all threads in the group have stopped;
  * - SIGILL from an undefined instruction omits esr_context in the arm64 signal frame;
  * - rt_sigaction setting SIG_IGN discards pending signals in sibling CLONE_SIGHAND groups;
@@ -24,7 +24,6 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
@@ -56,6 +55,13 @@
             fprintf(stderr, " (errno %d)\n", errno);                                               \
             _exit(1);                                                                              \
         }                                                                                          \
+    } while (0)
+
+#define CHECK_ERR(expr, expected_err, ...)                                                         \
+    do {                                                                                           \
+        errno = 0;                                                                                 \
+        long _rc = (long)(expr);                                                                   \
+        CHECK(_rc == -1 && errno == (expected_err), __VA_ARGS__);                                  \
     } while (0)
 
 #ifndef NT_PRSTATUS
@@ -91,14 +97,8 @@
 #ifndef PTRACE_EVENT_EXIT
 #define PTRACE_EVENT_EXIT 6
 #endif
-#ifndef SYS_rt_sigreturn
-#define SYS_rt_sigreturn 139
-#endif
 #ifndef SYS_settimeofday
 #define SYS_settimeofday 170
-#endif
-#ifndef SYS_gettid
-#define SYS_gettid 178
 #endif
 #ifndef SYS_process_vm_readv
 #define SYS_process_vm_readv 270
@@ -135,6 +135,27 @@ static int set_syscallno(pid_t pid, int nr)
 {
     struct iovec iov = {.iov_base = &nr, .iov_len = sizeof(nr)};
     return (int)ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_ARM_SYSTEM_CALL, &iov);
+}
+
+static unsigned long get_eventmsg(pid_t pid)
+{
+    unsigned long msg = 0;
+    CHECK(ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg) == 0, "GETEVENTMSG %d", pid);
+    return msg;
+}
+
+static void wait_stop(pid_t pid, int sig)
+{
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSTOPPED(st) && WSTOPSIG(st) == sig,
+          "expected pid %d stop sig %d, got 0x%x", pid, sig, st);
+}
+
+static void wait_exit(pid_t pid, int code)
+{
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == code,
+          "expected pid %d exit %d, got 0x%x", pid, code, st);
 }
 
 static void msleep(int ms)
@@ -300,7 +321,7 @@ static void test_sigaction_clone_sighand_discard(void)
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     CHECK(stack != MAP_FAILED, "mmap clone stack");
 
-    /* Reset SIGUSR1 to a caught handler so parent can send it while blocked in child. */
+    /* Ensure SIGUSR1 is not ignored so parent can queue it while blocked in child. */
     struct sigaction sa = {0}, old = {0};
     sa.sa_handler = SIG_DFL;
     CHECK(sigaction(SIGUSR1, &sa, &old) == 0, "sigaction SIGUSR1 DFL");
@@ -320,9 +341,7 @@ static void test_sigaction_clone_sighand_discard(void)
     CHECK(sigaction(SIGUSR1, &sa, NULL) == 0, "sigaction SIGUSR1 IGN");
 
     atomic_store_explicit(&sh.state, 2, memory_order_release);
-    int st = 0;
-    CHECK(waitpid(child, &st, 0) == child, "waitpid sighand child");
-    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "sighand child exit 0x%x", st);
+    wait_exit(child, 0);
     CHECK(atomic_load_explicit(&sh.still_pending, memory_order_acquire) == 0,
           "pending SIGUSR1 in sibling CLONE_SIGHAND group was not discarded");
 
@@ -351,30 +370,25 @@ static void on_sigret_usr1(int sig, siginfo_t *info, void *uctx)
     if (sigret_mode == 1) {
         /* Set IRQ mask bit (I = 1<<7 = 0x80) in pstate. */
         uc->uc_mcontext.pstate |= 0x80ULL;
-    } else if (sigret_mode == 2) {
+        return;
+    }
+    uint8_t *p = (uint8_t *)uc->uc_mcontext.__reserved;
+    struct aarch64_ctx_hdr h, end = {.magic = 0, .size = 0};
+    memcpy(&h, p, sizeof(h));
+    if (h.magic != FPSIMD_MAGIC || h.size + 48 > sizeof(uc->uc_mcontext.__reserved)) {
+        return;
+    }
+    if (sigret_mode == 2) {
         /* Append an oversized ESR_MAGIC record (size 32 != 16) after fpsimd_context. */
-        uint8_t *p = (uint8_t *)uc->uc_mcontext.__reserved;
-        struct aarch64_ctx_hdr h;
-        memcpy(&h, p, sizeof(h));
-        if (h.magic == FPSIMD_MAGIC && h.size + 48 <= sizeof(uc->uc_mcontext.__reserved)) {
-            struct aarch64_ctx_hdr bad = {.magic = ESR_MAGIC, .size = 32};
-            struct aarch64_ctx_hdr end = {.magic = 0, .size = 0};
-            memcpy(p + h.size, &bad, sizeof(bad));
-            memcpy(p + h.size + 32, &end, sizeof(end));
-        }
+        struct aarch64_ctx_hdr bad = {.magic = ESR_MAGIC, .size = 32};
+        memcpy(p + h.size, &bad, sizeof(bad));
     } else if (sigret_mode == 3) {
         /* Append duplicate valid-sized ESR_MAGIC records after fpsimd_context. */
-        uint8_t *p = (uint8_t *)uc->uc_mcontext.__reserved;
-        struct aarch64_ctx_hdr h;
-        memcpy(&h, p, sizeof(h));
-        if (h.magic == FPSIMD_MAGIC && h.size + 48 <= sizeof(uc->uc_mcontext.__reserved)) {
-            struct aarch64_ctx_hdr esr = {.magic = ESR_MAGIC, .size = 16};
-            struct aarch64_ctx_hdr end = {.magic = 0, .size = 0};
-            memcpy(p + h.size, &esr, sizeof(esr));
-            memcpy(p + h.size + 16, &esr, sizeof(esr));
-            memcpy(p + h.size + 32, &end, sizeof(end));
-        }
+        struct aarch64_ctx_hdr esr = {.magic = ESR_MAGIC, .size = 16};
+        memcpy(p + h.size, &esr, sizeof(esr));
+        memcpy(p + h.size + 16, &esr, sizeof(esr));
     }
+    memcpy(p + h.size + 32, &end, sizeof(end));
 }
 
 static void test_sigreturn_validation(void)
@@ -410,63 +424,39 @@ static void test_time_setting_errors(void)
 
     tv.tv_sec = 100;
     tv.tv_usec = 1000000;
-    errno = 0;
-    CHECK(syscall(SYS_settimeofday, &tv, NULL) == -1 && errno == EINVAL,
-          "settimeofday usec=1000000 -> EINVAL");
+    CHECK_ERR(syscall(SYS_settimeofday, &tv, NULL), EINVAL, "settimeofday usec=1000000 -> EINVAL");
 
     tv.tv_sec = 100;
     tv.tv_usec = -1;
-    errno = 0;
-    CHECK(syscall(SYS_settimeofday, &tv, NULL) == -1 && errno == EINVAL,
-          "settimeofday usec=-1 -> EINVAL");
+    CHECK_ERR(syscall(SYS_settimeofday, &tv, NULL), EINVAL, "settimeofday usec=-1 -> EINVAL");
 
     tv.tv_sec = -1;
     tv.tv_usec = 0;
-    errno = 0;
-    CHECK(syscall(SYS_settimeofday, &tv, NULL) == -1 && errno == EINVAL,
-          "settimeofday sec=-1 -> EINVAL");
+    CHECK_ERR(syscall(SYS_settimeofday, &tv, NULL), EINVAL, "settimeofday sec=-1 -> EINVAL");
 
-    errno = 0;
-    CHECK(syscall(SYS_settimeofday, (void *)0x10, NULL) == -1 && errno == EFAULT,
-          "settimeofday bad tv -> EFAULT");
-
-    errno = 0;
-    CHECK(syscall(SYS_settimeofday, NULL, (void *)0x10) == -1 && errno == EFAULT,
-          "settimeofday bad tz -> EFAULT");
+    CHECK_ERR(syscall(SYS_settimeofday, (void *)0x10, NULL), EFAULT, "settimeofday bad tv -> EFAULT");
+    CHECK_ERR(syscall(SYS_settimeofday, NULL, (void *)0x10), EFAULT, "settimeofday bad tz -> EFAULT");
 
     tv.tv_sec = 100;
     tv.tv_usec = 500;
-    errno = 0;
-    CHECK(syscall(SYS_settimeofday, &tv, &tz) == -1 && errno == EPERM,
-          "settimeofday valid -> EPERM");
-
-    errno = 0;
-    CHECK(syscall(SYS_settimeofday, NULL, NULL) == -1 && errno == EPERM,
-          "settimeofday(NULL, NULL) -> EPERM");
+    CHECK_ERR(syscall(SYS_settimeofday, &tv, &tz), EPERM, "settimeofday valid -> EPERM");
+    CHECK_ERR(syscall(SYS_settimeofday, NULL, NULL), EPERM, "settimeofday(NULL, NULL) -> EPERM");
 
     struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
-    errno = 0;
-    CHECK(clock_settime(CLOCK_PROCESS_CPUTIME_ID, &ts) == -1 && errno == EPERM,
-          "clock_settime(CLOCK_PROCESS_CPUTIME_ID) -> EPERM");
-
-    errno = 0;
-    CHECK(clock_settime(CLOCK_THREAD_CPUTIME_ID, &ts) == -1 && errno == EPERM,
-          "clock_settime(CLOCK_THREAD_CPUTIME_ID) -> EPERM");
+    CHECK_ERR(clock_settime(CLOCK_PROCESS_CPUTIME_ID, &ts), EPERM,
+              "clock_settime(CLOCK_PROCESS_CPUTIME_ID) -> EPERM");
+    CHECK_ERR(clock_settime(CLOCK_THREAD_CPUTIME_ID, &ts), EPERM,
+              "clock_settime(CLOCK_THREAD_CPUTIME_ID) -> EPERM");
 
     clockid_t pid_clk = 0;
     CHECK(clock_getcpuclockid(getpid(), &pid_clk) == 0, "clock_getcpuclockid(self)");
-    errno = 0;
-    CHECK(clock_settime(pid_clk, &ts) == -1 && errno == EPERM,
-          "clock_settime(pid cpu clock) -> EPERM");
+    CHECK_ERR(clock_settime(pid_clk, &ts), EPERM, "clock_settime(pid cpu clock) -> EPERM");
 
     clockid_t bad_clk = (clockid_t)((~(uint32_t)999999U << 3) | 2U);
-    errno = 0;
-    CHECK(clock_settime(bad_clk, &ts) == -1 && errno == EINVAL,
-          "clock_settime(nonexistent pid cpu clock) -> EINVAL");
-
-    errno = 0;
-    CHECK(clock_settime(CLOCK_MONOTONIC, &ts) == -1 && errno == EINVAL,
-          "clock_settime(CLOCK_MONOTONIC) -> EINVAL");
+    CHECK_ERR(clock_settime(bad_clk, &ts), EINVAL,
+              "clock_settime(nonexistent pid cpu clock) -> EINVAL");
+    CHECK_ERR(clock_settime(CLOCK_MONOTONIC, &ts), EINVAL,
+              "clock_settime(CLOCK_MONOTONIC) -> EINVAL");
 }
 
 /* ---- 6. Detach at attach-time group stop does not duplicate CLD_STOPPED ---- */
@@ -500,16 +490,12 @@ static void test_ptrace_detach_at_attach_group_stop(void)
     CHECK(tracer >= 0, "fork tracer");
     if (tracer == 0) {
         CHECK(ptrace(PTRACE_ATTACH, child, 0, 0) == 0, "PTRACE_ATTACH");
-        int tst = 0;
-        CHECK(waitpid(child, &tst, 0) == child, "tracer waitpid");
-        CHECK(WIFSTOPPED(tst) && WSTOPSIG(tst) == SIGTSTP,
-              "tracer expected SIGTSTP group stop, got 0x%x", tst);
+        wait_stop(child, SIGTSTP);
         CHECK(ptrace(PTRACE_DETACH, child, 0, 0) == 0, "PTRACE_DETACH");
         _exit(0);
     }
 
-    CHECK(waitpid(tracer, &st, 0) == tracer, "waitpid tracer");
-    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "tracer exit 0x%x", st);
+    wait_exit(tracer, 0);
 
     /* Give the detached child time to settle; parent must NOT see a second stop report. */
     msleep(20);
@@ -521,8 +507,7 @@ static void test_ptrace_detach_at_attach_group_stop(void)
     char buf = 0;
     CHECK(read(pfd[0], &buf, 1) == 1, "read child post-SIGCONT byte");
     close(pfd[0]);
-    CHECK(waitpid(child, &st, 0) == child, "waitpid child exit");
-    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "child exit 0x%x", st);
+    wait_exit(child, 0);
 }
 
 /* ---- 7. Single-step over skipped syscall (-1), rt_sigreturn, and execve ---- */
@@ -546,16 +531,13 @@ static void test_singlestep_skipped_syscall(void)
         _exit(x0 == -EPERM ? 0 : 2);
     }
 
-    int st = 0;
-    CHECK(waitpid(child, &st, 0) == child && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP,
-          "initial SIGSTOP");
+    wait_stop(child, SIGSTOP);
 
     /* Run until syscall entry of getpid. */
     struct arm64_regs entry_regs;
     for (;;) {
         CHECK(ptrace(PTRACE_SYSCALL, child, 0, 0) == 0, "PTRACE_SYSCALL");
-        CHECK(waitpid(child, &st, 0) == child && WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP,
-              "syscall entry stop");
+        wait_stop(child, SIGTRAP);
         CHECK(get_regs(child, &entry_regs) == 0, "get_regs entry");
         if (entry_regs.regs[8] == SYS_getpid) {
             break;
@@ -569,8 +551,7 @@ static void test_singlestep_skipped_syscall(void)
     CHECK(set_regs(child, &entry_regs) == 0, "set_regs x0=-EPERM");
     CHECK(ptrace(PTRACE_SINGLESTEP, child, 0, 0) == 0, "PTRACE_SINGLESTEP over skipped svc");
 
-    CHECK(waitpid(child, &st, 0) == child && WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP,
-          "step trap after skipped svc");
+    wait_stop(child, SIGTRAP);
     struct arm64_regs step_regs;
     CHECK(get_regs(child, &step_regs) == 0, "get_regs step");
     CHECK(step_regs.pc == after_svc_pc,
@@ -578,8 +559,7 @@ static void test_singlestep_skipped_syscall(void)
           (unsigned long long)step_regs.pc, (unsigned long long)after_svc_pc);
 
     CHECK(ptrace(PTRACE_CONT, child, 0, 0) == 0, "PTRACE_CONT");
-    CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0,
-          "skipped syscall child exit 0x%x", st);
+    wait_exit(child, 0);
 }
 
 static volatile sig_atomic_t step_sigret_hit = 0;
@@ -607,9 +587,7 @@ static void test_singlestep_rt_sigreturn(void)
         _exit(step_sigret_hit ? 0 : 2);
     }
 
-    int st = 0;
-    CHECK(waitpid(child, &st, 0) == child && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP,
-          "initial SIGSTOP");
+    wait_stop(child, SIGSTOP);
 
     struct arm64_regs before_sig;
     CHECK(get_regs(child, &before_sig) == 0, "get_regs before SIGUSR1");
@@ -618,8 +596,7 @@ static void test_singlestep_rt_sigreturn(void)
     /* Inject SIGUSR1 while single-stepping -> stops at first instruction of handler. */
     CHECK(ptrace(PTRACE_SINGLESTEP, child, 0, (void *)(uintptr_t)SIGUSR1) == 0,
           "PTRACE_SINGLESTEP with SIGUSR1");
-    CHECK(waitpid(child, &st, 0) == child && WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP,
-          "handler entry stop");
+    wait_stop(child, SIGTRAP);
     struct arm64_regs hregs;
     CHECK(get_regs(child, &hregs) == 0, "get_regs handler entry");
     CHECK(hregs.pc == (uint64_t)(uintptr_t)on_step_usr1,
@@ -641,14 +618,12 @@ static void test_singlestep_rt_sigreturn(void)
               "single-step over rt_sigreturn stopped one instruction late (pc=0x%llx expected 0x%llx)",
               (unsigned long long)r.pc, (unsigned long long)expected_return_pc);
         CHECK(ptrace(PTRACE_SINGLESTEP, child, 0, 0) == 0, "PTRACE_SINGLESTEP");
-        CHECK(waitpid(child, &st, 0) == child && WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP,
-              "step trap in handler");
+        wait_stop(child, SIGTRAP);
     }
     CHECK(returned_exact, "did not observe exact return PC from rt_sigreturn");
 
     CHECK(ptrace(PTRACE_CONT, child, 0, 0) == 0, "PTRACE_CONT");
-    CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0,
-          "rt_sigreturn child exit 0x%x", st);
+    wait_exit(child, 0);
 }
 
 static uint64_t elf_entry_of(const char *path)
@@ -690,17 +665,13 @@ static void test_singlestep_execve(const char *self)
     CHECK(write(sync_p[1], &go, 1) == 1, "signal child");
     close(sync_p[1]);
 
-    int st = 0;
-    CHECK(waitpid(child, &st, 0) == child && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP,
-          "wait SIGSTOP");
+    wait_stop(child, SIGSTOP);
     /* Suppress SIGSTOP and step until we hit execve's entry point. */
     CHECK(ptrace(PTRACE_SINGLESTEP, child, 0, 0) == 0, "start SINGLESTEP");
 
     bool hit_entry = false;
     for (int i = 0; i < 600; i++) {
-        CHECK(waitpid(child, &st, 0) == child, "waitpid step execve");
-        CHECK(WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP,
-              "expected SIGTRAP stepping to execve, got 0x%x", st);
+        wait_stop(child, SIGTRAP);
         struct arm64_regs r;
         CHECK(get_regs(child, &r) == 0, "get_regs");
         if (r.pc == entry) {
@@ -716,8 +687,7 @@ static void test_singlestep_execve(const char *self)
           (unsigned long long)entry);
 
     CHECK(ptrace(PTRACE_CONT, child, 0, 0) == 0, "PTRACE_CONT");
-    CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 42,
-          "execve helper exit 0x%x", st);
+    wait_exit(child, 42);
 }
 
 /* ---- 8. PTRACE_EVENT_EXIT for exit_group siblings and non-leader execve ---- */
@@ -750,9 +720,7 @@ static void test_ptrace_event_exit_on_exit_group(void)
         _exit(1);
     }
 
-    int st = 0;
-    CHECK(waitpid(child, &st, 0) == child && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP,
-          "initial SIGSTOP");
+    wait_stop(child, SIGSTOP);
     CHECK(ptrace(PTRACE_SETOPTIONS, child, 0,
                  (void *)(uintptr_t)(PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT)) == 0,
           "PTRACE_SETOPTIONS");
@@ -765,6 +733,7 @@ static void test_ptrace_event_exit_on_exit_group(void)
     bool leader_reaped = false;
 
     while (!leader_reaped) {
+        int st = 0;
         pid_t w = waitpid(-1, &st, __WALL);
         CHECK(w > 0, "waitpid __WALL");
         if (WIFEXITED(st)) {
@@ -777,12 +746,9 @@ static void test_ptrace_event_exit_on_exit_group(void)
         CHECK(WIFSTOPPED(st), "unexpected status 0x%x for %d", st, w);
         int ev = st >> 16;
         if (ev == PTRACE_EVENT_CLONE) {
-            unsigned long msg = 0;
-            CHECK(ptrace(PTRACE_GETEVENTMSG, w, 0, &msg) == 0, "GETEVENTMSG clone");
-            sibling = (pid_t)msg;
+            sibling = (pid_t)get_eventmsg(w);
         } else if (ev == PTRACE_EVENT_EXIT) {
-            unsigned long msg = 0;
-            CHECK(ptrace(PTRACE_GETEVENTMSG, w, 0, &msg) == 0, "GETEVENTMSG exit");
+            unsigned long msg = get_eventmsg(w);
             CHECK(msg == (7UL << 8), "expected exit_group eventmsg 0x700, got 0x%lx (pid %d)",
                   msg, w);
             exit_events++;
@@ -803,13 +769,9 @@ static void test_ptrace_event_exit_on_exit_group(void)
           saw_leader_exit, saw_sibling_exit, exit_events);
 }
 
-struct exec_arg {
-    const char *self;
-};
-
 static void *nonleader_exec_thread(void *arg)
 {
-    const char *self = ((struct exec_arg *)arg)->self;
+    const char *self = arg;
     char *argv[] = {(char *)self, "--exec-helper", NULL};
     char *envp[] = {NULL};
     syscall(SYS_execve, self, argv, envp);
@@ -823,17 +785,15 @@ static void test_ptrace_event_exit_on_nonleader_execve(const char *self)
     if (child == 0) {
         CHECK(ptrace(PTRACE_TRACEME, 0, 0, 0) == 0, "PTRACE_TRACEME");
         raise(SIGSTOP);
-        struct exec_arg ea = {.self = self};
         pthread_t th;
-        CHECK(pthread_create(&th, NULL, nonleader_exec_thread, &ea) == 0, "pthread_create");
+        CHECK(pthread_create(&th, NULL, nonleader_exec_thread, (void *)self) == 0,
+              "pthread_create");
         for (;;) {
             pause();
         }
     }
 
-    int st = 0;
-    CHECK(waitpid(child, &st, 0) == child && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP,
-          "initial SIGSTOP");
+    wait_stop(child, SIGSTOP);
     CHECK(ptrace(PTRACE_SETOPTIONS, child, 0,
                  (void *)(uintptr_t)(PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC |
                                      PTRACE_O_TRACEEXIT)) == 0,
@@ -846,6 +806,7 @@ static void test_ptrace_event_exit_on_nonleader_execve(const char *self)
     bool done = false;
 
     while (!done) {
+        int st = 0;
         pid_t w = waitpid(-1, &st, __WALL);
         CHECK(w > 0, "waitpid __WALL");
         if (WIFEXITED(st)) {
@@ -858,18 +819,14 @@ static void test_ptrace_event_exit_on_nonleader_execve(const char *self)
         CHECK(WIFSTOPPED(st), "unexpected status 0x%x for %d", st, w);
         int ev = st >> 16;
         if (ev == PTRACE_EVENT_CLONE) {
-            unsigned long msg = 0;
-            CHECK(ptrace(PTRACE_GETEVENTMSG, w, 0, &msg) == 0, "GETEVENTMSG clone");
-            worker = (pid_t)msg;
+            worker = (pid_t)get_eventmsg(w);
         } else if (ev == PTRACE_EVENT_EXIT && w == child && !saw_exec_event) {
-            unsigned long msg = 0;
-            CHECK(ptrace(PTRACE_GETEVENTMSG, w, 0, &msg) == 0, "GETEVENTMSG leader exit");
+            unsigned long msg = get_eventmsg(w);
             CHECK(msg == 0, "leader killed by non-leader execve should report msg 0, got 0x%lx",
                   msg);
             saw_leader_exit_event = true;
         } else if (ev == PTRACE_EVENT_EXEC) {
-            unsigned long msg = 0;
-            CHECK(ptrace(PTRACE_GETEVENTMSG, w, 0, &msg) == 0, "GETEVENTMSG exec");
+            unsigned long msg = get_eventmsg(w);
             CHECK(w == child, "execing thread should take over leader pid %d (got %d)", child, w);
             CHECK((pid_t)msg == worker, "exec eventmsg should be former tid %d (got %lu)",
                   worker, msg);
@@ -893,19 +850,16 @@ static void test_process_vm_zero_remote(void)
     char buf[16] = {0};
     struct iovec local = {.iov_base = buf, .iov_len = sizeof(buf)};
     struct iovec remote_zero = {.iov_base = (void *)0x1000, .iov_len = 0};
+    long syscalls[2] = {SYS_process_vm_readv, SYS_process_vm_writev};
 
-    errno = 0;
-    CHECK(syscall(SYS_process_vm_readv, 999999, &local, 1, &remote_zero, 1, 0) == 0,
-          "process_vm_readv zero-len remote must return 0 before ESRCH");
-    errno = 0;
-    CHECK(syscall(SYS_process_vm_readv, 999999, &local, 1, &remote_zero, 0, 0) == 0,
-          "process_vm_readv empty remote must return 0 before ESRCH");
-    errno = 0;
-    CHECK(syscall(SYS_process_vm_writev, 999999, &local, 1, &remote_zero, 1, 0) == 0,
-          "process_vm_writev zero-len remote must return 0 before ESRCH");
-    errno = 0;
-    CHECK(syscall(SYS_process_vm_writev, 999999, &local, 1, &remote_zero, 0, 0) == 0,
-          "process_vm_writev empty remote must return 0 before ESRCH");
+    for (int i = 0; i < 2; i++) {
+        for (unsigned long rcnt = 0; rcnt <= 1; rcnt++) {
+            errno = 0;
+            CHECK(syscall(syscalls[i], 999999, &local, 1, &remote_zero, rcnt, 0) == 0,
+                  "process_vm syscall %ld (rcnt=%lu) must return 0 before ESRCH",
+                  syscalls[i], rcnt);
+        }
+    }
 }
 
 /* ---- 10 & 11. TIOCSCTTY non-leader & TIOCSPGRP error codes ---- */
@@ -953,34 +907,23 @@ static void test_tty_job_control_ioctls(void)
 
         /* TIOCSPGRP with pgid=0 or nonexistent pgid returns ESRCH. */
         pid_t pg = 0;
-        errno = 0;
-        CHECK(ioctl(s, TIOCSPGRP, &pg) == -1 && errno == ESRCH,
-              "TIOCSPGRP(0) -> ESRCH");
+        CHECK_ERR(ioctl(s, TIOCSPGRP, &pg), ESRCH, "TIOCSPGRP(0) -> ESRCH");
         pg = 999999;
-        errno = 0;
-        CHECK(ioctl(s, TIOCSPGRP, &pg) == -1 && errno == ESRCH,
-              "TIOCSPGRP(unknown) -> ESRCH");
+        CHECK_ERR(ioctl(s, TIOCSPGRP, &pg), ESRCH, "TIOCSPGRP(unknown) -> ESRCH");
 
         /* TIOCSPGRP with a pgid in another session returns EPERM. */
         pid_t parent_pg = getpgid(getppid());
-        errno = 0;
-        CHECK(ioctl(s, TIOCSPGRP, &parent_pg) == -1 && errno == EPERM,
-              "TIOCSPGRP(other session) -> EPERM");
+        CHECK_ERR(ioctl(s, TIOCSPGRP, &parent_pg), EPERM, "TIOCSPGRP(other session) -> EPERM");
 
         /* Non-ctty PTY: bad pointer -> EFAULT, negative -> EINVAL, valid -> ENOTTY. */
         int m2 = -1, s2 = -1;
         CHECK(open_pty_pair(&m2, &s2, O_RDWR | O_NOCTTY) == 0, "open second pty");
-        errno = 0;
-        CHECK(ioctl(s2, TIOCSPGRP, (void *)0x10) == -1 && errno == EFAULT,
-              "non-ctty TIOCSPGRP bad ptr -> EFAULT");
+        CHECK_ERR(ioctl(s2, TIOCSPGRP, (void *)0x10), EFAULT,
+                  "non-ctty TIOCSPGRP bad ptr -> EFAULT");
         pg = -1;
-        errno = 0;
-        CHECK(ioctl(s2, TIOCSPGRP, &pg) == -1 && errno == EINVAL,
-              "non-ctty TIOCSPGRP negative -> EINVAL");
+        CHECK_ERR(ioctl(s2, TIOCSPGRP, &pg), EINVAL, "non-ctty TIOCSPGRP negative -> EINVAL");
         pg = getpgrp();
-        errno = 0;
-        CHECK(ioctl(s2, TIOCSPGRP, &pg) == -1 && errno == ENOTTY,
-              "non-ctty TIOCSPGRP valid -> ENOTTY");
+        CHECK_ERR(ioctl(s2, TIOCSPGRP, &pg), ENOTTY, "non-ctty TIOCSPGRP valid -> ENOTTY");
         close(m2);
         close(s2);
 
@@ -988,14 +931,10 @@ static void test_tty_job_control_ioctls(void)
         pid_t nonleader = fork();
         CHECK(nonleader >= 0, "fork nonleader");
         if (nonleader == 0) {
-            errno = 0;
-            CHECK(ioctl(s, TIOCSCTTY, 0) == -1 && errno == EPERM,
-                  "non-leader TIOCSCTTY on own ctty -> EPERM");
+            CHECK_ERR(ioctl(s, TIOCSCTTY, 0), EPERM, "non-leader TIOCSCTTY on own ctty -> EPERM");
             _exit(0);
         }
-        int st = 0;
-        CHECK(waitpid(nonleader, &st, 0) == nonleader && WIFEXITED(st) && WEXITSTATUS(st) == 0,
-              "nonleader exit 0x%x", st);
+        wait_exit(nonleader, 0);
 
         /* Orphaned background process group calling TIOCSPGRP gets ENOTTY (not EIO). */
         int pfd[2];
@@ -1028,8 +967,7 @@ static void test_tty_job_control_ioctls(void)
             _exit(0);
         }
         close(pfd[1]);
-        CHECK(waitpid(mid, &st, 0) == mid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
-              "waitpid mid");
+        wait_exit(mid, 0);
         int res[2] = {0, 0};
         CHECK(read(pfd[0], res, sizeof(res)) == (ssize_t)sizeof(res), "read orphan result");
         close(pfd[0]);
@@ -1043,9 +981,7 @@ static void test_tty_job_control_ioctls(void)
         _exit(0);
     }
 
-    int st = 0;
-    CHECK(waitpid(leader, &st, 0) == leader && WIFEXITED(st) && WEXITSTATUS(st) == 0,
-          "tty job control leader exit 0x%x", st);
+    wait_exit(leader, 0);
 }
 
 /* ---- 12. PTY slave write clamps ONLCR and XTABS expansion to OUTPUT_MAX ---- */
@@ -1086,9 +1022,7 @@ static void test_tty_output_clamp(void)
     /* With 1 byte free, writing '\n' must return EAGAIN and not overshoot 65536. */
     char one;
     CHECK(read(m, &one, 1) == 1, "read 1 byte");
-    errno = 0;
-    CHECK(write(s, "\n", 1) == -1 && errno == EAGAIN,
-          "ONLCR write with 1 byte free must return EAGAIN");
+    CHECK_ERR(write(s, "\n", 1), EAGAIN, "ONLCR write with 1 byte free must return EAGAIN");
     CHECK(ioctl(m, FIONREAD, &queued) == 0 && queued == 65535,
           "queued must remain 65535, got %d", queued);
 
@@ -1109,17 +1043,12 @@ static void test_tty_output_clamp(void)
 
 /* ---- 13. Exited (zombie) main thread's CPU clock stays readable & stopped until reaped ---- */
 
-struct zombie_clock_arg {
-    int release_fd;
-    int leader_exited_fd;
-};
-
 static void *keep_process_alive(void *arg)
 {
-    struct zombie_clock_arg *a = arg;
+    int release_fd = (int)(intptr_t)arg;
     /* Wait until parent tells us to exit. */
     char c;
-    (void)read(a->release_fd, &c, 1);
+    (void)read(release_fd, &c, 1);
     _exit(0);
 }
 
@@ -1147,12 +1076,9 @@ static void test_zombie_leader_cpu_clock(void)
         }
         (void)spin;
 
-        struct zombie_clock_arg arg = {
-            .release_fd = p_release[0],
-            .leader_exited_fd = -1,
-        };
         pthread_t th;
-        CHECK(pthread_create(&th, NULL, keep_process_alive, &arg) == 0, "pthread_create");
+        CHECK(pthread_create(&th, NULL, keep_process_alive, (void *)(intptr_t)p_release[0]) == 0,
+              "pthread_create");
 
         /* Tell parent we're ready so parent can create a POSIX timer on our thread CPU clock
          * before we exit. */
@@ -1236,17 +1162,12 @@ static void test_zombie_leader_cpu_clock(void)
     /* Now release the worker so the whole process exits, then reap it. */
     CHECK(write(p_release[1], &c, 1) == 1, "release worker");
     close(p_release[1]);
-    int st = 0;
-    CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0,
-          "reap child");
+    wait_exit(child, 0);
 
     /* Once reaped, the leader's CPU clock and timer are gone. */
-    errno = 0;
-    CHECK(clock_gettime(clk, &t_z1) == -1 && errno == EINVAL,
-          "clock_gettime after reap must return EINVAL");
-    errno = 0;
-    CHECK(timer_settime(tid_timer, 0, &its, NULL) == -1 && errno == ESRCH,
-          "timer_settime after reap must return ESRCH");
+    CHECK_ERR(clock_gettime(clk, &t_z1), EINVAL, "clock_gettime after reap must return EINVAL");
+    CHECK_ERR(timer_settime(tid_timer, 0, &its, NULL), ESRCH,
+              "timer_settime after reap must return ESRCH");
     CHECK(timer_gettime(tid_timer, &cur) == 0 &&
           cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec == 0 &&
           cur.it_interval.tv_sec == 0 && cur.it_interval.tv_nsec == 0,

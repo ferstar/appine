@@ -1116,18 +1116,18 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             return Flow::Exit;
         }
         if crate::ptrace::traced(cx.task) {
+            use crate::ptrace::StopResult;
             // Re-loop after a group-stop or interrupt trap: if the tracer detached while the
             // group is still stopped, the thread re-enters wait_while_stopped silently instead
             // of dequeuing the SIGSTOP that PTRACE_ATTACH queued.
-            match crate::ptrace::group_stop(cx, cpu) {
-                crate::ptrace::StopResult::Killed => return Flow::Exit,
-                crate::ptrace::StopResult::Stopped => continue,
-                crate::ptrace::StopResult::None => {}
-            }
-            match crate::ptrace::trap(cx, cpu) {
-                crate::ptrace::StopResult::Killed => return Flow::Exit,
-                crate::ptrace::StopResult::Stopped => continue,
-                crate::ptrace::StopResult::None => {}
+            let stop = match crate::ptrace::group_stop(cx, cpu) {
+                StopResult::None => crate::ptrace::trap(cx, cpu),
+                other => other,
+            };
+            match stop {
+                StopResult::Killed => return Flow::Exit,
+                StopResult::Stopped => continue,
+                StopResult::None => {}
             }
         }
         let Some((sig, info)) = dequeue(cx) else {
@@ -1397,11 +1397,13 @@ pub(crate) fn pgrp_orphaned(k: &Kernel, pgid: Tid) -> bool {
 /// again, matching Linux 6.1's `do_signal_stop`.
 fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
     let group = cx.t.group.clone();
-    let already_stopped = group.borrow().stopped;
-    if already_stopped {
+    if let Some(stop_sig) = {
+        let g = group.borrow();
+        g.stopped.then_some(g.stop_signal)
+    } {
         let mut trace = cx.task.trace.borrow_mut();
         if trace.tracer.is_some() {
-            trace.group_stop = Some(group.borrow().stop_signal);
+            trace.group_stop = Some(stop_sig);
         }
         return;
     }
@@ -1432,18 +1434,9 @@ fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
             }
         }
     }
-    let notify = {
-        let mut g = group.borrow_mut();
-        g.stop_pending = pending;
-        if pending == 0 && !g.threads.is_empty() && g.exiting.is_none() {
-            g.stop_report = Some(sig);
-            true
-        } else {
-            false
-        }
-    };
-    if notify {
-        notify_parent(cx.kr(), &group, code::CLD_STOPPED, sig.number());
+    group.borrow_mut().stop_pending = pending;
+    if pending == 0 {
+        complete_group_stop(cx.kr(), &group);
     }
 }
 
@@ -1454,22 +1447,29 @@ pub(crate) fn participate_group_stop(k: &Kernel, group: &Rc<RefCell<ThreadGroup>
     if !task.stop_pending.replace(false) {
         return;
     }
-    let notify = {
+    let completed = {
         let mut g = group.borrow_mut();
         if !g.stopped || g.stop_pending == 0 {
             return;
         }
         g.stop_pending -= 1;
-        if g.stop_pending == 0 && !g.threads.is_empty() && g.exiting.is_none() {
-            g.stop_report = Some(g.stop_signal);
-            Some(g.stop_signal)
-        } else {
-            None
-        }
+        g.stop_pending == 0
     };
-    if let Some(sig) = notify {
-        notify_parent(k, group, code::CLD_STOPPED, sig.number());
+    if completed {
+        complete_group_stop(k, group);
     }
+}
+
+fn complete_group_stop(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+    let sig = {
+        let mut g = group.borrow_mut();
+        if g.threads.is_empty() || g.exiting.is_some() {
+            return;
+        }
+        g.stop_report = Some(g.stop_signal);
+        g.stop_signal
+    };
+    notify_parent(k, group, code::CLD_STOPPED, sig.number());
 }
 
 // ---- Signal frames ----
@@ -2019,93 +2019,17 @@ mod tests {
         assert_eq!(pid_of(u_sibling), 0);
     }
 
-    #[test]
-    fn retarget_skips_ptrace_stopped_threads() {
+    fn spawn_test_tasks(
+        k: &mut Kernel,
+        group: &Rc<RefCell<ThreadGroup>>,
+        specs: &[(Tid, u64)],
+    ) -> (Vec<Cpu>, Vec<Rc<Task>>) {
         use crate::fd::FdTable;
-        use crate::kernel::Shared;
         use crate::mm::Mm;
         use crate::task::{FsContext, TaskState};
         use crate::vfs::{INIT_MNT_NS, MntNs, Node};
 
-        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
-        let mut cpus = Vec::new();
-        {
-            let mut k = shared.lock();
-            let group = Rc::new(RefCell::new(ThreadGroup::new(
-                10,
-                1,
-                Rc::new(RefCell::new(SigHandlers::default())),
-            )));
-            let mm = Mm::new().into_shared();
-            let fds = Rc::new(RefCell::new(FdTable::new()));
-            let fs = Rc::new(RefCell::new(FsContext {
-                root: Node::ROOT,
-                cwd: Node::ROOT,
-                umask: 0o022,
-                mnt_ns: Rc::new(MntNs {
-                    id: INIT_MNT_NS,
-                    owner: crate::cred::UserNs::init(),
-                    anon: false,
-                }),
-            }));
-
-            let mut tasks = Vec::new();
-            for (tid, mask) in [(10, Signal::USR1.bit()), (11, 0), (12, 0)] {
-                let cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
-                let state = TaskState {
-                    mm: mm.clone(),
-                    fds: fds.clone(),
-                    fs: fs.clone(),
-                    group: group.clone(),
-                    vfs: None,
-                    altstack: Default::default(),
-                    clear_child_tid: 0,
-                    vfork_done: None,
-                    restart: None,
-                    fast_sleep: None,
-                    sem_undo: Rc::new(crate::ipc::SemUndo::new()),
-                };
-                let task =
-                    Task::new(tid, 10, &cpu, state, k.init_ns.clone(), mask, [0; 16]).unwrap();
-                group.borrow_mut().threads.push(tid);
-                k.tasks.insert(tid, task.clone());
-                cpus.push(cpu);
-                tasks.push(task);
-            }
-            // Thread 11 is in a ptrace stop; retarget must skip it and wake thread 12 instead.
-            tasks[1].trace.borrow_mut().stop = Some(crate::ptrace::Stop::Signal(Signal::TRAP));
-
-            retarget(&k, &group, Some(10), Signal::USR1.bit());
-        }
-
-        // Thread 12 was kicked (immediate Exit::Kick); thread 11 was not kicked.
-        assert!(!matches!(cpus[1].run(), appine_engine::Exit::Kick));
-        assert!(matches!(cpus[2].run(), appine_engine::Exit::Kick));
-    }
-
-    #[test]
-    fn group_stop_waits_for_all_threads_before_notifying_parent() {
-        use crate::fd::FdTable;
-        use crate::kernel::Shared;
-        use crate::mm::Mm;
-        use crate::task::{FsContext, TaskState};
-        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
-
-        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
-        let mut cpus = Vec::new();
-        let mut k = shared.lock();
-        let parent = Rc::new(RefCell::new(ThreadGroup::new(
-            2,
-            1,
-            Rc::new(RefCell::new(SigHandlers::default())),
-        )));
-        let group = Rc::new(RefCell::new(ThreadGroup::new(
-            10,
-            2,
-            Rc::new(RefCell::new(SigHandlers::default())),
-        )));
-        k.groups.insert(2, parent.clone());
-        k.groups.insert(10, group.clone());
+        let tgid = group.borrow().tgid;
         let mm = Mm::new().into_shared();
         let fds = Rc::new(RefCell::new(FdTable::new()));
         let fs = Rc::new(RefCell::new(FsContext {
@@ -2118,9 +2042,9 @@ mod tests {
                 anon: false,
             }),
         }));
-
-        let mut tasks = Vec::new();
-        for tid in [10, 11] {
+        let mut cpus = Vec::with_capacity(specs.len());
+        let mut tasks = Vec::with_capacity(specs.len());
+        for &(tid, mask) in specs {
             let cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
             let state = TaskState {
                 mm: mm.clone(),
@@ -2135,12 +2059,63 @@ mod tests {
                 fast_sleep: None,
                 sem_undo: Rc::new(crate::ipc::SemUndo::new()),
             };
-            let task = Task::new(tid, 10, &cpu, state, k.init_ns.clone(), 0, [0; 16]).unwrap();
+            let task = Task::new(tid, tgid, &cpu, state, k.init_ns.clone(), mask, [0; 16]).unwrap();
             group.borrow_mut().threads.push(tid);
             k.tasks.insert(tid, task.clone());
             cpus.push(cpu);
             tasks.push(task);
         }
+        (cpus, tasks)
+    }
+
+    #[test]
+    fn retarget_skips_ptrace_stopped_threads() {
+        use crate::kernel::Shared;
+
+        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut cpus = {
+            let mut k = shared.lock();
+            let group = Rc::new(RefCell::new(ThreadGroup::new(
+                10,
+                1,
+                Rc::new(RefCell::new(SigHandlers::default())),
+            )));
+            let (cpus, tasks) = spawn_test_tasks(
+                &mut k,
+                &group,
+                &[(10, Signal::USR1.bit()), (11, 0), (12, 0)],
+            );
+            // Thread 11 is in a ptrace stop; retarget must skip it and wake thread 12 instead.
+            tasks[1].trace.borrow_mut().stop = Some(crate::ptrace::Stop::Signal(Signal::TRAP));
+
+            retarget(&k, &group, Some(10), Signal::USR1.bit());
+            cpus
+        };
+
+        // Thread 12 was kicked (immediate Exit::Kick); thread 11 was not kicked.
+        assert!(!matches!(cpus[1].run(), appine_engine::Exit::Kick));
+        assert!(matches!(cpus[2].run(), appine_engine::Exit::Kick));
+    }
+
+    #[test]
+    fn group_stop_waits_for_all_threads_before_notifying_parent() {
+        use crate::kernel::Shared;
+
+        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let parent = Rc::new(RefCell::new(ThreadGroup::new(
+            2,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            10,
+            2,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        k.groups.insert(2, parent.clone());
+        k.groups.insert(10, group.clone());
+        let (_cpus, tasks) = spawn_test_tasks(&mut k, &group, &[(10, 0), (11, 0)]);
 
         // Start a group-stop across 2 live threads: neither stop_report nor CLD_STOPPED yet.
         {

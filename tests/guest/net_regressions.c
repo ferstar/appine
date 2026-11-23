@@ -276,6 +276,28 @@ static void nl_attr(struct nlbuf *b, uint16_t type, const void *p, size_t n)
     nl_attr_end(b, off);
 }
 
+static void nl_attr_str(struct nlbuf *b, uint16_t type, const char *s)
+{
+    nl_attr(b, type, s, strlen(s) + 1);
+}
+
+static void nl_attr_u32(struct nlbuf *b, uint16_t type, uint32_t v)
+{
+    nl_attr(b, type, &v, sizeof v);
+}
+
+static void nl_attr_be32(struct nlbuf *b, uint16_t type, uint32_t v)
+{
+    uint32_t be = htonl(v);
+    nl_attr(b, type, &be, sizeof be);
+}
+
+static void nl_attr_be64(struct nlbuf *b, uint16_t type, uint64_t v)
+{
+    uint64_t be = __builtin_bswap64(v);
+    nl_attr(b, type, &be, sizeof be);
+}
+
 static void nl_finish(struct nlbuf *b)
 {
     uint32_t len = (uint32_t)b->len;
@@ -297,13 +319,13 @@ static int nl_send_ack(int fd, struct nlbuf *b)
     return -err;
 }
 
-static void bring_lo_up(int rtnl)
+static void set_link_up(int rtnl, int ifindex)
 {
     struct nlbuf b;
     nl_init(&b, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK, 1);
-    struct ifinfomsg ifi = {.ifi_index = 1, .ifi_flags = IFF_UP, .ifi_change = IFF_UP};
+    struct ifinfomsg ifi = {.ifi_index = ifindex, .ifi_flags = IFF_UP, .ifi_change = IFF_UP};
     nl_put_raw(&b, &ifi, sizeof ifi);
-    CHECK(nl_send_ack(rtnl, &b) == 0, "bring lo up");
+    CHECK(nl_send_ack(rtnl, &b) == 0, "link up %d", ifindex);
 }
 
 static void create_dummy(int rtnl, const char *name)
@@ -312,20 +334,32 @@ static void create_dummy(int rtnl, const char *name)
     nl_init(&b, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK, 2);
     struct ifinfomsg ifi = {0};
     nl_put_raw(&b, &ifi, sizeof ifi);
-    nl_attr(&b, IFLA_IFNAME, name, strlen(name) + 1);
+    nl_attr_str(&b, IFLA_IFNAME, name);
     size_t li = nl_attr_start(&b, IFLA_LINKINFO);
-    nl_attr(&b, IFLA_INFO_KIND, "dummy", 6);
+    nl_attr_str(&b, IFLA_INFO_KIND, "dummy");
     nl_attr_end(&b, li);
     CHECK(nl_send_ack(rtnl, &b) == 0, "create dummy %s", name);
 }
 
-static void set_link_up(int rtnl, int ifindex)
+static void create_veth(int rtnl, const char *name, const char *peer_name, pid_t peer_ns_pid)
 {
     struct nlbuf b;
-    nl_init(&b, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK, 3);
-    struct ifinfomsg ifi = {.ifi_index = ifindex, .ifi_flags = IFF_UP, .ifi_change = IFF_UP};
+    nl_init(&b, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK, 3);
+    struct ifinfomsg ifi = {0};
     nl_put_raw(&b, &ifi, sizeof ifi);
-    CHECK(nl_send_ack(rtnl, &b) == 0, "link up %d", ifindex);
+    nl_attr_str(&b, IFLA_IFNAME, name);
+    size_t li = nl_attr_start(&b, IFLA_LINKINFO);
+    nl_attr_str(&b, IFLA_INFO_KIND, "veth");
+    size_t ld = nl_attr_start(&b, IFLA_INFO_DATA);
+    size_t pr = nl_attr_start(&b, 1 /* VETH_INFO_PEER */);
+    nl_put_raw(&b, &ifi, sizeof ifi);
+    nl_attr_str(&b, IFLA_IFNAME, peer_name);
+    if (peer_ns_pid > 0)
+        nl_attr_u32(&b, IFLA_NET_NS_PID, (uint32_t)peer_ns_pid);
+    nl_attr_end(&b, pr);
+    nl_attr_end(&b, ld);
+    nl_attr_end(&b, li);
+    CHECK(nl_send_ack(rtnl, &b) == 0, "create veth %s/%s", name, peer_name);
 }
 
 static void add_v4_addr(int rtnl, int ifindex, const char *ip, uint8_t prefix)
@@ -510,7 +544,7 @@ static void test_wildcard_connect_bound_v4(void)
 
 /* ---- 5. kernel/netns: connected UDP listener & filter checks, ephemeral port aliasing ---- */
 
-static void nft_batch_send(int fd, const struct nlbuf *msgs, size_t nmsgs, int *errs, size_t nerrs)
+static void nft_batch_send(int fd, struct nlbuf *msgs, size_t nmsgs, int *errs, size_t nerrs)
 {
     uint8_t buf[16384];
     size_t off = 0;
@@ -524,6 +558,7 @@ static void nft_batch_send(int fd, const struct nlbuf *msgs, size_t nmsgs, int *
     off += (begin.len + 3) & ~3u;
 
     for (size_t i = 0; i < nmsgs; i++) {
+        nl_finish(&msgs[i]);
         memcpy(buf + off, msgs[i].data, msgs[i].len);
         off += (msgs[i].len + 3) & ~3u;
     }
@@ -546,6 +581,13 @@ static void nft_batch_send(int fd, const struct nlbuf *msgs, size_t nmsgs, int *
     }
 }
 
+static int nft_batch_one(int fd, struct nlbuf *msg)
+{
+    int err = -1;
+    nft_batch_send(fd, msg, 1, &err, 1);
+    return err;
+}
+
 static void nft_msg_init(struct nlbuf *b, uint8_t msg, uint16_t flags, uint32_t seq, uint8_t fam)
 {
     nl_init(b, (uint16_t)((NFNL_SUBSYS_NFTABLES << 8) | msg), NLM_F_REQUEST | flags, seq);
@@ -553,12 +595,54 @@ static void nft_msg_init(struct nlbuf *b, uint8_t msg, uint16_t flags, uint32_t 
     nl_put_raw(b, g, 4);
 }
 
+static void nft_table_msg(struct nlbuf *b, uint8_t msg, uint16_t flags, uint32_t seq,
+                          const char *table)
+{
+    nft_msg_init(b, msg, flags, seq, NFPROTO_IPV4);
+    nl_attr_str(b, NFTA_TABLE_NAME, table);
+}
+
+static void nft_chain_msg(struct nlbuf *b, uint8_t msg, uint16_t flags, uint32_t seq,
+                          const char *table, const char *chain)
+{
+    nft_msg_init(b, msg, flags, seq, NFPROTO_IPV4);
+    nl_attr_str(b, NFTA_CHAIN_TABLE, table);
+    nl_attr_str(b, NFTA_CHAIN_NAME, chain);
+}
+
+static void nft_base_chain_msg(struct nlbuf *b, uint32_t seq, const char *table, const char *chain,
+                               uint32_t hooknum, int32_t prio, uint32_t policy, const char *type)
+{
+    nft_chain_msg(b, NFT_MSG_NEWCHAIN, NLM_F_CREATE | NLM_F_ACK, seq, table, chain);
+    size_t hk = nl_attr_start(b, NFTA_CHAIN_HOOK);
+    nl_attr_be32(b, NFTA_HOOK_HOOKNUM, hooknum);
+    nl_attr_be32(b, NFTA_HOOK_PRIORITY, (uint32_t)prio);
+    nl_attr_end(b, hk);
+    nl_attr_be32(b, NFTA_CHAIN_POLICY, policy);
+    nl_attr_str(b, NFTA_CHAIN_TYPE, type);
+}
+
+static void nft_rule_msg(struct nlbuf *b, uint16_t flags, uint32_t seq, const char *table,
+                         const char *chain)
+{
+    nft_msg_init(b, NFT_MSG_NEWRULE, flags, seq, NFPROTO_IPV4);
+    nl_attr_str(b, NFTA_RULE_TABLE, table);
+    nl_attr_str(b, NFTA_RULE_CHAIN, chain);
+}
+
+static void nft_put_data_val(struct nlbuf *b, uint16_t outer_attr, const void *val, size_t len)
+{
+    size_t dv = nl_attr_start(b, outer_attr | NLA_F_NESTED);
+    nl_attr(b, NFTA_DATA_VALUE, val, len);
+    nl_attr_end(b, dv);
+}
+
 static void test_netns_udp_and_ephemeral_child(void)
 {
     CHECK(unshare(CLONE_NEWNET) == 0, "unshare net");
     int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     CHECK(rtnl >= 0, "rtnl");
-    bring_lo_up(rtnl);
+    set_link_up(rtnl, 1);
     close(rtnl);
 
     /* Ephemeral port vs explicit bind aliasing (TCP, UDP, wide UDP) */
@@ -621,23 +705,8 @@ static void test_netns_udp_and_ephemeral_child(void)
     int nf = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
     CHECK(nf >= 0, "nf socket");
     struct nlbuf msgs[2];
-    nft_msg_init(&msgs[0], NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_ACK, 1, NFPROTO_IPV4);
-    nl_attr(&msgs[0], NFTA_TABLE_NAME, "flt", 4);
-    nl_finish(&msgs[0]);
-
-    nft_msg_init(&msgs[1], NFT_MSG_NEWCHAIN, NLM_F_CREATE | NLM_F_ACK, 2, NFPROTO_IPV4);
-    nl_attr(&msgs[1], NFTA_CHAIN_TABLE, "flt", 4);
-    nl_attr(&msgs[1], NFTA_CHAIN_NAME, "out", 4);
-    size_t hk = nl_attr_start(&msgs[1], NFTA_CHAIN_HOOK);
-    uint32_t hnum = htonl(NF_INET_LOCAL_OUT);
-    uint32_t hpri = htonl(0);
-    nl_attr(&msgs[1], NFTA_HOOK_HOOKNUM, &hnum, 4);
-    nl_attr(&msgs[1], NFTA_HOOK_PRIORITY, &hpri, 4);
-    nl_attr_end(&msgs[1], hk);
-    uint32_t pol = htonl(NF_DROP);
-    nl_attr(&msgs[1], NFTA_CHAIN_POLICY, &pol, 4);
-    nl_attr(&msgs[1], NFTA_CHAIN_TYPE, "filter", 7);
-    nl_finish(&msgs[1]);
+    nft_table_msg(&msgs[0], NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_ACK, 1, "flt");
+    nft_base_chain_msg(&msgs[1], 2, "flt", "out", NF_INET_LOCAL_OUT, 0, NF_DROP, "filter");
 
     int errs[2] = {-1, -1};
     nft_batch_send(nf, msgs, 2, errs, 2);
@@ -671,7 +740,7 @@ static void test_netns_routes_child(void)
     CHECK(unshare(CLONE_NEWNET) == 0, "unshare net");
     int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     CHECK(rtnl >= 0, "rtnl");
-    bring_lo_up(rtnl);
+    set_link_up(rtnl, 1);
     create_dummy(rtnl, "d0");
     create_dummy(rtnl, "d1");
     int i0 = (int)if_nametoindex("d0");
@@ -706,43 +775,23 @@ static void test_netns_routes_child(void)
     nl_put_raw(&b, &rtm, sizeof rtm);
     nl_attr(&b, RTA_DST, &dst, 4);
     nl_attr(&b, RTA_GATEWAY, &gw, 4);
-    uint32_t oif0 = (uint32_t)i0;
-    nl_attr(&b, RTA_OIF, &oif0, 4);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)i0);
     CHECK(nl_send_ack(rtnl, &b) == EEXIST, "duplicate on d0 must be EEXIST");
 
     /* All-zero RTA_GATEWAY counts as no gateway */
     CHECK(inet_pton(AF_INET, "10.89.0.0", &dst) == 1, "pton");
     uint8_t zero4[4] = {0, 0, 0, 0};
     nl_init(&b, RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK, 12);
-    struct rtmsg rtm_link = {
-        .rtm_family = AF_INET,
-        .rtm_dst_len = 24,
-        .rtm_table = RT_TABLE_MAIN,
-        .rtm_protocol = RTPROT_BOOT,
-        .rtm_scope = RT_SCOPE_LINK,
-        .rtm_type = RTN_UNICAST,
-    };
+    struct rtmsg rtm_link = rtm;
+    rtm_link.rtm_scope = RT_SCOPE_LINK;
     nl_put_raw(&b, &rtm_link, sizeof rtm_link);
     nl_attr(&b, RTA_DST, &dst, 4);
     nl_attr(&b, RTA_GATEWAY, zero4, 4);
-    nl_attr(&b, RTA_OIF, &oif0, 4);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)i0);
     CHECK(nl_send_ack(rtnl, &b) == 0, "all-zero gateway route");
 
     /* Create veth v0 (up) + v1 (down) so v0 has NO carrier; IPv6 link-local gw with dev succeeds */
-    nl_init(&b, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK, 13);
-    struct ifinfomsg ifi = {0};
-    nl_put_raw(&b, &ifi, sizeof ifi);
-    nl_attr(&b, IFLA_IFNAME, "v0", 3);
-    size_t li = nl_attr_start(&b, IFLA_LINKINFO);
-    nl_attr(&b, IFLA_INFO_KIND, "veth", 5);
-    size_t ld = nl_attr_start(&b, IFLA_INFO_DATA);
-    size_t peer = nl_attr_start(&b, 1 /* VETH_INFO_PEER */);
-    nl_put_raw(&b, &ifi, sizeof ifi);
-    nl_attr(&b, IFLA_IFNAME, "v1", 3);
-    nl_attr_end(&b, peer);
-    nl_attr_end(&b, ld);
-    nl_attr_end(&b, li);
-    CHECK(nl_send_ack(rtnl, &b) == 0, "create veth");
+    create_veth(rtnl, "v0", "v1", 0);
     int iv0 = (int)if_nametoindex("v0");
     CHECK(iv0 > 0, "v0 index");
     set_link_up(rtnl, iv0);
@@ -763,8 +812,7 @@ static void test_netns_routes_child(void)
     nl_put_raw(&b, &rtm6, sizeof rtm6);
     nl_attr(&b, RTA_DST, &dst6, 16);
     nl_attr(&b, RTA_GATEWAY, &ll_gw, 16);
-    uint32_t oifv0 = (uint32_t)iv0;
-    nl_attr(&b, RTA_OIF, &oifv0, 4);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)iv0);
     CHECK(nl_send_ack(rtnl, &b) == 0, "IPv6 link-local gw on no-carrier veth");
 
     /* Unreachable IPv6 gateway must return EHOSTUNREACH (not ENETUNREACH) */
@@ -805,6 +853,18 @@ static void test_netlink_unpriv_child(void)
     CHECK(sendto(nl, b.data, b.len, 0, (struct sockaddr *)&dst, sizeof dst) == -1 && errno == EPERM,
           "unpriv sendto group must EPERM");
     close(nl);
+}
+
+static int getneigh_err(int nl, uint32_t seq, uint8_t fam, int32_t ifindex, const void *dst,
+                        size_t dst_len)
+{
+    struct nlbuf nb;
+    nl_init(&nb, RTM_GETNEIGH, NLM_F_REQUEST, seq);
+    struct ndmsg ndm = {.ndm_family = fam, .ndm_ifindex = ifindex};
+    nl_put_raw(&nb, &ndm, sizeof ndm);
+    if (dst)
+        nl_attr(&nb, NDA_DST, dst, dst_len);
+    return nl_send_ack(nl, &nb);
 }
 
 static void test_netlink(void)
@@ -892,39 +952,14 @@ static void test_netlink(void)
 
     /* Single RTM_GETNEIGH validation */
     struct nlbuf nb;
-    /* Short header */
     nl_init(&nb, RTM_GETNEIGH, NLM_F_REQUEST, 10);
     CHECK(nl_send_ack(nl3, &nb) == EINVAL, "short GETNEIGH EINVAL");
-    /* Missing NDA_DST */
-    struct ndmsg ndm = {.ndm_family = AF_INET, .ndm_ifindex = 1};
-    nl_init(&nb, RTM_GETNEIGH, NLM_F_REQUEST, 11);
-    nl_put_raw(&nb, &ndm, sizeof ndm);
-    CHECK(nl_send_ack(nl3, &nb) == EINVAL, "missing NDA_DST EINVAL");
-    /* Bad family */
     uint8_t ip4[4] = {127, 0, 0, 1};
-    ndm.ndm_family = 99;
-    nl_init(&nb, RTM_GETNEIGH, NLM_F_REQUEST, 12);
-    nl_put_raw(&nb, &ndm, sizeof ndm);
-    nl_attr(&nb, NDA_DST, ip4, 4);
-    CHECK(nl_send_ack(nl3, &nb) == EAFNOSUPPORT, "bad family EAFNOSUPPORT");
-    /* Wrong NDA_DST length */
-    ndm.ndm_family = AF_INET;
-    nl_init(&nb, RTM_GETNEIGH, NLM_F_REQUEST, 13);
-    nl_put_raw(&nb, &ndm, sizeof ndm);
-    nl_attr(&nb, NDA_DST, ip4, 2);
-    CHECK(nl_send_ack(nl3, &nb) == EINVAL, "short NDA_DST EINVAL");
-    /* Bad ifindex */
-    ndm.ndm_ifindex = 99999;
-    nl_init(&nb, RTM_GETNEIGH, NLM_F_REQUEST, 14);
-    nl_put_raw(&nb, &ndm, sizeof ndm);
-    nl_attr(&nb, NDA_DST, ip4, 4);
-    CHECK(nl_send_ack(nl3, &nb) == ENODEV, "bad ifindex ENODEV");
-    /* Valid single GETNEIGH -> ENOENT */
-    ndm.ndm_ifindex = 1;
-    nl_init(&nb, RTM_GETNEIGH, NLM_F_REQUEST, 15);
-    nl_put_raw(&nb, &ndm, sizeof ndm);
-    nl_attr(&nb, NDA_DST, ip4, 4);
-    CHECK(nl_send_ack(nl3, &nb) == ENOENT, "valid GETNEIGH ENOENT");
+    CHECK(getneigh_err(nl3, 11, AF_INET, 1, NULL, 0) == EINVAL, "missing NDA_DST EINVAL");
+    CHECK(getneigh_err(nl3, 12, 99, 1, ip4, 4) == EAFNOSUPPORT, "bad family EAFNOSUPPORT");
+    CHECK(getneigh_err(nl3, 13, AF_INET, 1, ip4, 2) == EINVAL, "short NDA_DST EINVAL");
+    CHECK(getneigh_err(nl3, 14, AF_INET, 99999, ip4, 4) == ENODEV, "bad ifindex ENODEV");
+    CHECK(getneigh_err(nl3, 15, AF_INET, 1, ip4, 4) == ENOENT, "valid GETNEIGH ENOENT");
 
     /* Queue capped against SO_RCVBUF -> ENOBUFS */
     int small = 2048;
@@ -1003,9 +1038,7 @@ static uint64_t find_be64_attr(const uint8_t *buf, size_t len, uint16_t want)
 static uint64_t get_chain_handle(int nf, const char *table, const char *chain)
 {
     struct nlbuf b;
-    nft_msg_init(&b, NFT_MSG_GETCHAIN, 0, 100, NFPROTO_IPV4);
-    nl_attr(&b, NFTA_CHAIN_TABLE, table, strlen(table) + 1);
-    nl_attr(&b, NFTA_CHAIN_NAME, chain, strlen(chain) + 1);
+    nft_chain_msg(&b, NFT_MSG_GETCHAIN, 0, 100, table, chain);
     nl_finish(&b);
     CHECK(send(nf, b.data, b.len, 0) == (ssize_t)b.len, "getchain send");
     uint8_t resp[4096];
@@ -1018,8 +1051,8 @@ static uint64_t get_first_rule_handle(int nf, const char *table, const char *cha
 {
     struct nlbuf b;
     nft_msg_init(&b, NFT_MSG_GETRULE, NLM_F_DUMP, 101, NFPROTO_IPV4);
-    nl_attr(&b, NFTA_RULE_TABLE, table, strlen(table) + 1);
-    nl_attr(&b, NFTA_RULE_CHAIN, chain, strlen(chain) + 1);
+    nl_attr_str(&b, NFTA_RULE_TABLE, table);
+    nl_attr_str(&b, NFTA_RULE_CHAIN, chain);
     nl_finish(&b);
     CHECK(send(nf, b.data, b.len, 0) == (ssize_t)b.len, "getrule send");
     uint64_t handle = 0;
@@ -1056,50 +1089,32 @@ static void test_nft_control_plane_child(void)
 
     /* Create table t, chain c1, chain target, verdict map vm with element jumping to target */
     struct nlbuf m[5];
-    nft_msg_init(&m[0], NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_ACK, 1, NFPROTO_IPV4);
-    nl_attr(&m[0], NFTA_TABLE_NAME, "t", 2);
-    nl_finish(&m[0]);
-
-    nft_msg_init(&m[1], NFT_MSG_NEWCHAIN, NLM_F_CREATE | NLM_F_ACK, 2, NFPROTO_IPV4);
-    nl_attr(&m[1], NFTA_CHAIN_TABLE, "t", 2);
-    nl_attr(&m[1], NFTA_CHAIN_NAME, "c1", 3);
-    nl_finish(&m[1]);
-
-    nft_msg_init(&m[2], NFT_MSG_NEWCHAIN, NLM_F_CREATE | NLM_F_ACK, 3, NFPROTO_IPV4);
-    nl_attr(&m[2], NFTA_CHAIN_TABLE, "t", 2);
-    nl_attr(&m[2], NFTA_CHAIN_NAME, "target", 7);
-    nl_finish(&m[2]);
+    nft_table_msg(&m[0], NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_ACK, 1, "t");
+    nft_chain_msg(&m[1], NFT_MSG_NEWCHAIN, NLM_F_CREATE | NLM_F_ACK, 2, "t", "c1");
+    nft_chain_msg(&m[2], NFT_MSG_NEWCHAIN, NLM_F_CREATE | NLM_F_ACK, 3, "t", "target");
 
     nft_msg_init(&m[3], NFT_MSG_NEWSET, NLM_F_CREATE | NLM_F_ACK, 4, NFPROTO_IPV4);
-    nl_attr(&m[3], NFTA_SET_TABLE, "t", 2);
-    nl_attr(&m[3], NFTA_SET_NAME, "vm", 3);
-    uint32_t sflags = htonl(NFT_SET_MAP);
-    uint32_t klen = htonl(2);
-    uint32_t dtype = htonl(NFT_DATA_VERDICT);
-    nl_attr(&m[3], NFTA_SET_FLAGS, &sflags, 4);
-    nl_attr(&m[3], NFTA_SET_KEY_LEN, &klen, 4);
-    nl_attr(&m[3], NFTA_SET_DATA_TYPE, &dtype, 4);
-    nl_finish(&m[3]);
+    nl_attr_str(&m[3], NFTA_SET_TABLE, "t");
+    nl_attr_str(&m[3], NFTA_SET_NAME, "vm");
+    nl_attr_be32(&m[3], NFTA_SET_FLAGS, NFT_SET_MAP);
+    nl_attr_be32(&m[3], NFTA_SET_KEY_LEN, 2);
+    nl_attr_be32(&m[3], NFTA_SET_DATA_TYPE, NFT_DATA_VERDICT);
 
     nft_msg_init(&m[4], NFT_MSG_NEWSETELEM, NLM_F_CREATE | NLM_F_ACK, 5, NFPROTO_IPV4);
-    nl_attr(&m[4], NFTA_SET_ELEM_LIST_TABLE, "t", 2);
-    nl_attr(&m[4], NFTA_SET_ELEM_LIST_SET, "vm", 3);
+    nl_attr_str(&m[4], NFTA_SET_ELEM_LIST_TABLE, "t");
+    nl_attr_str(&m[4], NFTA_SET_ELEM_LIST_SET, "vm");
     size_t els = nl_attr_start(&m[4], NFTA_SET_ELEM_LIST_ELEMENTS | NLA_F_NESTED);
     size_t el = nl_attr_start(&m[4], NFTA_LIST_ELEM | NLA_F_NESTED);
-    size_t key = nl_attr_start(&m[4], NFTA_SET_ELEM_KEY | NLA_F_NESTED);
     uint16_t port80 = htons(80);
-    nl_attr(&m[4], NFTA_DATA_VALUE, &port80, 2);
-    nl_attr_end(&m[4], key);
+    nft_put_data_val(&m[4], NFTA_SET_ELEM_KEY, &port80, 2);
     size_t dat = nl_attr_start(&m[4], NFTA_SET_ELEM_DATA | NLA_F_NESTED);
     size_t verd = nl_attr_start(&m[4], NFTA_DATA_VERDICT | NLA_F_NESTED);
-    uint32_t jcode = htonl((uint32_t)NFT_JUMP);
-    nl_attr(&m[4], NFTA_VERDICT_CODE, &jcode, 4);
-    nl_attr(&m[4], NFTA_VERDICT_CHAIN, "target", 7);
+    nl_attr_be32(&m[4], NFTA_VERDICT_CODE, (uint32_t)NFT_JUMP);
+    nl_attr_str(&m[4], NFTA_VERDICT_CHAIN, "target");
     nl_attr_end(&m[4], verd);
     nl_attr_end(&m[4], dat);
     nl_attr_end(&m[4], el);
     nl_attr_end(&m[4], els);
-    nl_finish(&m[4]);
 
     int errs[5];
     nft_batch_send(nf, m, 5, errs, 5);
@@ -1107,91 +1122,53 @@ static void test_nft_control_plane_child(void)
         CHECK(errs[i] == 0, "setup batch[%d] err %d", i, errs[i]);
 
     /* Deleting chain referenced by verdict map must fail with EBUSY */
-    struct nlbuf delc;
-    nft_msg_init(&delc, NFT_MSG_DELCHAIN, NLM_F_ACK, 6, NFPROTO_IPV4);
-    nl_attr(&delc, NFTA_CHAIN_TABLE, "t", 2);
-    nl_attr(&delc, NFTA_CHAIN_NAME, "target", 7);
-    nl_finish(&delc);
-    int e = -1;
-    nft_batch_send(nf, &delc, 1, &e, 1);
+    struct nlbuf b;
+    nft_chain_msg(&b, NFT_MSG_DELCHAIN, NLM_F_ACK, 6, "t", "target");
+    int e = nft_batch_one(nf, &b);
     CHECK(e == EBUSY, "delchain referenced by vmap must be EBUSY, got %d", e);
 
     /* Rename chain target -> renamed by handle */
     uint64_t th = get_chain_handle(nf, "t", "target");
     CHECK(th != 0, "target handle");
-    struct nlbuf ren;
-    nft_msg_init(&ren, NFT_MSG_NEWCHAIN, NLM_F_ACK, 7, NFPROTO_IPV4);
-    nl_attr(&ren, NFTA_CHAIN_TABLE, "t", 2);
-    uint64_t th_be = __builtin_bswap64(th);
-    nl_attr(&ren, NFTA_CHAIN_HANDLE, &th_be, 8);
-    nl_attr(&ren, NFTA_CHAIN_NAME, "renamed", 8);
-    nl_finish(&ren);
-    e = -1;
-    nft_batch_send(nf, &ren, 1, &e, 1);
+    nft_chain_msg(&b, NFT_MSG_NEWCHAIN, NLM_F_ACK, 7, "t", "renamed");
+    nl_attr_be64(&b, NFTA_CHAIN_HANDLE, th);
+    e = nft_batch_one(nf, &b);
     CHECK(e == 0, "rename chain err %d", e);
     CHECK(get_chain_handle(nf, "t", "renamed") == th, "renamed chain keeps handle");
 
     /* Verdict map reference must now point to renamed -> still EBUSY */
-    nft_msg_init(&delc, NFT_MSG_DELCHAIN, NLM_F_ACK, 8, NFPROTO_IPV4);
-    nl_attr(&delc, NFTA_CHAIN_TABLE, "t", 2);
-    nl_attr(&delc, NFTA_CHAIN_NAME, "renamed", 8);
-    nl_finish(&delc);
-    e = -1;
-    nft_batch_send(nf, &delc, 1, &e, 1);
+    nft_chain_msg(&b, NFT_MSG_DELCHAIN, NLM_F_ACK, 8, "t", "renamed");
+    e = nft_batch_one(nf, &b);
     CHECK(e == EBUSY, "renamed chain still referenced by vmap -> EBUSY, got %d", e);
 
     /* Add a rule to c1, replace it with NLM_F_REPLACE, and verify its handle is preserved */
-    struct nlbuf radd;
-    nft_msg_init(&radd, NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_ACK, 9, NFPROTO_IPV4);
-    nl_attr(&radd, NFTA_RULE_TABLE, "t", 2);
-    nl_attr(&radd, NFTA_RULE_CHAIN, "c1", 3);
-    nl_finish(&radd);
-    e = -1;
-    nft_batch_send(nf, &radd, 1, &e, 1);
+    nft_rule_msg(&b, NLM_F_CREATE | NLM_F_ACK, 9, "t", "c1");
+    e = nft_batch_one(nf, &b);
     CHECK(e == 0, "add rule err %d", e);
     uint64_t rh = get_first_rule_handle(nf, "t", "c1");
     CHECK(rh != 0, "rule handle");
 
-    struct nlbuf rrep;
-    nft_msg_init(&rrep, NFT_MSG_NEWRULE, NLM_F_REPLACE | NLM_F_ACK, 10, NFPROTO_IPV4);
-    nl_attr(&rrep, NFTA_RULE_TABLE, "t", 2);
-    nl_attr(&rrep, NFTA_RULE_CHAIN, "c1", 3);
-    uint64_t rh_be = __builtin_bswap64(rh);
-    nl_attr(&rrep, NFTA_RULE_HANDLE, &rh_be, 8);
-    nl_finish(&rrep);
-    e = -1;
-    nft_batch_send(nf, &rrep, 1, &e, 1);
+    nft_rule_msg(&b, NLM_F_REPLACE | NLM_F_ACK, 10, "t", "c1");
+    nl_attr_be64(&b, NFTA_RULE_HANDLE, rh);
+    e = nft_batch_one(nf, &b);
     CHECK(e == 0, "replace rule err %d", e);
     uint64_t rh2 = get_first_rule_handle(nf, "t", "c1");
     CHECK(rh2 == rh, "replaced rule handle changed %llu -> %llu", (unsigned long long)rh,
           (unsigned long long)rh2);
 
     /* DELTABLE with NLM_F_NONREC on non-empty table must fail with EBUSY */
-    struct nlbuf delt;
-    nft_msg_init(&delt, NFT_MSG_DELTABLE, NLM_F_NONREC | NLM_F_ACK, 11, NFPROTO_IPV4);
-    nl_attr(&delt, NFTA_TABLE_NAME, "t", 2);
-    nl_finish(&delt);
-    e = -1;
-    nft_batch_send(nf, &delt, 1, &e, 1);
+    nft_table_msg(&b, NFT_MSG_DELTABLE, NLM_F_NONREC | NLM_F_ACK, 11, "t");
+    e = nft_batch_one(nf, &b);
     CHECK(e == EBUSY, "DELTABLE NONREC on non-empty table must EBUSY, got %d", e);
 
     /* Delete set, chains, then DELTABLE with NLM_F_NONREC succeeds */
     struct nlbuf cleanup[4];
     nft_msg_init(&cleanup[0], NFT_MSG_DELSET, NLM_F_ACK, 12, NFPROTO_IPV4);
-    nl_attr(&cleanup[0], NFTA_SET_TABLE, "t", 2);
-    nl_attr(&cleanup[0], NFTA_SET_NAME, "vm", 3);
-    nl_finish(&cleanup[0]);
-    nft_msg_init(&cleanup[1], NFT_MSG_DELCHAIN, NLM_F_ACK, 13, NFPROTO_IPV4);
-    nl_attr(&cleanup[1], NFTA_CHAIN_TABLE, "t", 2);
-    nl_attr(&cleanup[1], NFTA_CHAIN_NAME, "renamed", 8);
-    nl_finish(&cleanup[1]);
-    nft_msg_init(&cleanup[2], NFT_MSG_DELCHAIN, NLM_F_ACK, 14, NFPROTO_IPV4);
-    nl_attr(&cleanup[2], NFTA_CHAIN_TABLE, "t", 2);
-    nl_attr(&cleanup[2], NFTA_CHAIN_NAME, "c1", 3);
-    nl_finish(&cleanup[2]);
-    nft_msg_init(&cleanup[3], NFT_MSG_DELTABLE, NLM_F_NONREC | NLM_F_ACK, 15, NFPROTO_IPV4);
-    nl_attr(&cleanup[3], NFTA_TABLE_NAME, "t", 2);
-    nl_finish(&cleanup[3]);
+    nl_attr_str(&cleanup[0], NFTA_SET_TABLE, "t");
+    nl_attr_str(&cleanup[0], NFTA_SET_NAME, "vm");
+    nft_chain_msg(&cleanup[1], NFT_MSG_DELCHAIN, NLM_F_ACK, 13, "t", "renamed");
+    nft_chain_msg(&cleanup[2], NFT_MSG_DELCHAIN, NLM_F_ACK, 14, "t", "c1");
+    nft_table_msg(&cleanup[3], NFT_MSG_DELTABLE, NLM_F_NONREC | NLM_F_ACK, 15, "t");
     int cerrs[4];
     nft_batch_send(nf, cleanup, 4, cerrs, 4);
     for (int i = 0; i < 4; i++)
@@ -1264,7 +1241,7 @@ static void test_dualstack_dnat_and_close_wait_peer(void)
 
         int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
         CHECK(rtnl >= 0, "child rtnl");
-        bring_lo_up(rtnl);
+        set_link_up(rtnl, 1);
         int if1 = (int)if_nametoindex("fw1");
         CHECK(if1 > 0, "fw1 index");
         set_link_up(rtnl, if1);
@@ -1340,23 +1317,7 @@ static void test_dualstack_dnat_and_close_wait_peer(void)
     int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     CHECK(rtnl >= 0, "parent rtnl");
     /* Create veth fw0 (init_ns) <-> fw1 (child netns) */
-    struct nlbuf vb;
-    nl_init(&vb, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK, 30);
-    struct ifinfomsg ifi = {0};
-    nl_put_raw(&vb, &ifi, sizeof ifi);
-    nl_attr(&vb, IFLA_IFNAME, "fw0", 4);
-    size_t li = nl_attr_start(&vb, IFLA_LINKINFO);
-    nl_attr(&vb, IFLA_INFO_KIND, "veth", 5);
-    size_t ld = nl_attr_start(&vb, IFLA_INFO_DATA);
-    size_t pr = nl_attr_start(&vb, 1 /* VETH_INFO_PEER */);
-    nl_put_raw(&vb, &ifi, sizeof ifi);
-    nl_attr(&vb, IFLA_IFNAME, "fw1", 4);
-    uint32_t cpid = (uint32_t)child;
-    nl_attr(&vb, IFLA_NET_NS_PID, &cpid, 4);
-    nl_attr_end(&vb, pr);
-    nl_attr_end(&vb, ld);
-    nl_attr_end(&vb, li);
-    CHECK(nl_send_ack(rtnl, &vb) == 0, "create fw0/fw1");
+    create_veth(rtnl, "fw0", "fw1", child);
 
     int if0 = (int)if_nametoindex("fw0");
     CHECK(if0 > 0, "fw0 index");
@@ -1381,87 +1342,57 @@ static void test_dualstack_dnat_and_close_wait_peer(void)
     int nf = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
     CHECK(nf >= 0, "nf init");
     struct nlbuf m[3];
-    nft_msg_init(&m[0], NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_ACK, 1, NFPROTO_IPV4);
-    nl_attr(&m[0], NFTA_TABLE_NAME, "fwdt", 5);
-    nl_finish(&m[0]);
-
-    nft_msg_init(&m[1], NFT_MSG_NEWCHAIN, NLM_F_CREATE | NLM_F_ACK, 2, NFPROTO_IPV4);
-    nl_attr(&m[1], NFTA_CHAIN_TABLE, "fwdt", 5);
-    nl_attr(&m[1], NFTA_CHAIN_NAME, "pre", 4);
-    size_t hk = nl_attr_start(&m[1], NFTA_CHAIN_HOOK);
-    uint32_t hnum = htonl(NF_INET_PRE_ROUTING);
-    uint32_t hpri = htonl((uint32_t)-100);
-    nl_attr(&m[1], NFTA_HOOK_HOOKNUM, &hnum, 4);
-    nl_attr(&m[1], NFTA_HOOK_PRIORITY, &hpri, 4);
-    nl_attr_end(&m[1], hk);
-    uint32_t pol = htonl(NF_ACCEPT);
-    nl_attr(&m[1], NFTA_CHAIN_POLICY, &pol, 4);
-    nl_attr(&m[1], NFTA_CHAIN_TYPE, "nat", 4);
-    nl_finish(&m[1]);
-
-    nft_msg_init(&m[2], NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_ACK, 3, NFPROTO_IPV4);
-    nl_attr(&m[2], NFTA_RULE_TABLE, "fwdt", 5);
-    nl_attr(&m[2], NFTA_RULE_CHAIN, "pre", 4);
+    nft_table_msg(&m[0], NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_ACK, 1, "fwdt");
+    nft_base_chain_msg(&m[1], 2, "fwdt", "pre", NF_INET_PRE_ROUTING, -100, NF_ACCEPT, "nat");
+    nft_rule_msg(&m[2], NLM_F_CREATE | NLM_F_ACK, 3, "fwdt", "pre");
     size_t exs = nl_attr_start(&m[2], NFTA_RULE_EXPRESSIONS | NLA_F_NESTED);
-    uint32_t reg1 = htonl(1), reg2 = htonl(2), meta_l4 = htonl(16), cmp_eq = htonl(0);
-    uint32_t base_tr = htonl(2), off2 = htonl(2), len2 = htonl(2);
-    uint32_t nat_dnat = htonl(1), fam_v4 = htonl(NFPROTO_IPV4);
 
     struct nlbuf ed;
     /* meta l4proto -> reg1 */
     ed.len = 0;
-    nl_attr(&ed, 2 /* NFTA_META_KEY */, &meta_l4, 4);
-    nl_attr(&ed, 1 /* NFTA_META_DREG */, &reg1, 4);
+    nl_attr_be32(&ed, 2 /* NFTA_META_KEY */, 16);
+    nl_attr_be32(&ed, 1 /* NFTA_META_DREG */, 1);
     nft_put_expr(&m[2], "meta", ed.data, ed.len);
     /* cmp reg1 == IPPROTO_TCP (6) */
     ed.len = 0;
-    nl_attr(&ed, 1 /* NFTA_CMP_SREG */, &reg1, 4);
-    nl_attr(&ed, 2 /* NFTA_CMP_OP */, &cmp_eq, 4);
-    size_t dv = nl_attr_start(&ed, 3 | NLA_F_NESTED);
+    nl_attr_be32(&ed, 1 /* NFTA_CMP_SREG */, 1);
+    nl_attr_be32(&ed, 2 /* NFTA_CMP_OP */, 0);
     uint8_t tcp_p = IPPROTO_TCP;
-    nl_attr(&ed, NFTA_DATA_VALUE, &tcp_p, 1);
-    nl_attr_end(&ed, dv);
+    nft_put_data_val(&ed, 3, &tcp_p, 1);
     nft_put_expr(&m[2], "cmp", ed.data, ed.len);
     /* payload th@2,2 -> reg1 */
     ed.len = 0;
-    nl_attr(&ed, 1 /* DREG */, &reg1, 4);
-    nl_attr(&ed, 2 /* BASE */, &base_tr, 4);
-    nl_attr(&ed, 3 /* OFFSET */, &off2, 4);
-    nl_attr(&ed, 4 /* LEN */, &len2, 4);
+    nl_attr_be32(&ed, 1 /* DREG */, 1);
+    nl_attr_be32(&ed, 2 /* BASE */, 2);
+    nl_attr_be32(&ed, 3 /* OFFSET */, 2);
+    nl_attr_be32(&ed, 4 /* LEN */, 2);
     nft_put_expr(&m[2], "payload", ed.data, ed.len);
     /* cmp reg1 == sin6.sin6_port */
     ed.len = 0;
-    nl_attr(&ed, 1, &reg1, 4);
-    nl_attr(&ed, 2, &cmp_eq, 4);
-    dv = nl_attr_start(&ed, 3 | NLA_F_NESTED);
-    nl_attr(&ed, NFTA_DATA_VALUE, &sin6.sin6_port, 2);
-    nl_attr_end(&ed, dv);
+    nl_attr_be32(&ed, 1, 1);
+    nl_attr_be32(&ed, 2, 0);
+    nft_put_data_val(&ed, 3, &sin6.sin6_port, 2);
     nft_put_expr(&m[2], "cmp", ed.data, ed.len);
     /* immediate 10.91.0.2 -> reg1 */
     ed.len = 0;
-    nl_attr(&ed, 1, &reg1, 4);
-    dv = nl_attr_start(&ed, 2 | NLA_F_NESTED);
+    nl_attr_be32(&ed, 1, 1);
     uint8_t dst_ip[4] = {10, 91, 0, 2};
-    nl_attr(&ed, NFTA_DATA_VALUE, dst_ip, 4);
-    nl_attr_end(&ed, dv);
+    nft_put_data_val(&ed, 2, dst_ip, 4);
     nft_put_expr(&m[2], "immediate", ed.data, ed.len);
     /* immediate 18080 -> reg2 */
     ed.len = 0;
-    nl_attr(&ed, 1, &reg2, 4);
-    dv = nl_attr_start(&ed, 2 | NLA_F_NESTED);
+    nl_attr_be32(&ed, 1, 2);
     uint16_t dst_port = htons(18080);
-    nl_attr(&ed, NFTA_DATA_VALUE, &dst_port, 2);
-    nl_attr_end(&ed, dv);
+    nft_put_data_val(&ed, 2, &dst_port, 2);
     nft_put_expr(&m[2], "immediate", ed.data, ed.len);
     /* nat dnat ipv4 reg1:reg2 */
     ed.len = 0;
-    nl_attr(&ed, 1 /* TYPE */, &nat_dnat, 4);
-    nl_attr(&ed, 2 /* FAMILY */, &fam_v4, 4);
-    nl_attr(&ed, 3 /* REG_ADDR_MIN */, &reg1, 4);
-    nl_attr(&ed, 5 /* REG_PROTO_MIN */, &reg2, 4);
+    nl_attr_be32(&ed, 1 /* TYPE */, 1);
+    nl_attr_be32(&ed, 2 /* FAMILY */, NFPROTO_IPV4);
+    nl_attr_be32(&ed, 3 /* REG_ADDR_MIN */, 1);
+    nl_attr_be32(&ed, 5 /* REG_PROTO_MIN */, 2);
     nft_put_expr(&m[2], "nat", ed.data, ed.len);
     nl_attr_end(&m[2], exs);
-    nl_finish(&m[2]);
 
     int errs[3] = {-1, -1, -1};
     nft_batch_send(nf, m, 3, errs, 3);
@@ -1494,13 +1425,10 @@ static void test_dualstack_dnat_and_close_wait_peer(void)
 
     /* Clean up init_ns table and veth */
     struct nlbuf delt;
-    nft_msg_init(&delt, NFT_MSG_DELTABLE, NLM_F_ACK, 4, NFPROTO_IPV4);
-    nl_attr(&delt, NFTA_TABLE_NAME, "fwdt", 5);
-    nl_finish(&delt);
-    int de = -1;
-    nft_batch_send(nf, &delt, 1, &de, 1);
-    CHECK(de == 0, "delete fwdt");
+    nft_table_msg(&delt, NFT_MSG_DELTABLE, NLM_F_ACK, 4, "fwdt");
+    CHECK(nft_batch_one(nf, &delt) == 0, "delete fwdt");
 
+    struct nlbuf vb;
     nl_init(&vb, RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK, 31);
     struct ifinfomsg dfi = {.ifi_index = if0};
     nl_put_raw(&vb, &dfi, sizeof dfi);

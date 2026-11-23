@@ -378,24 +378,21 @@ pub(super) fn rt_sigaction(
         if sighand.borrow().ignores(sig) {
             let bit = sig.bit();
             let k = cx.kr();
-            if Rc::strong_count(&sighand) <= 2 {
-                let mut g = cx.t.group.borrow_mut();
+            let discard = |g: &mut crate::process::ThreadGroup| {
                 g.pending.discard(bit);
                 for tid in &g.threads {
                     if let Some(t) = k.tasks.get(tid) {
                         t.pending.borrow_mut().discard(bit);
                     }
                 }
+            };
+            if Rc::strong_count(&sighand) <= 2 {
+                discard(&mut cx.t.group.borrow_mut());
             } else {
                 for group in k.groups.values() {
                     let mut g = group.borrow_mut();
                     if Rc::ptr_eq(&g.sighand, &sighand) {
-                        g.pending.discard(bit);
-                        for tid in &g.threads {
-                            if let Some(t) = k.tasks.get(tid) {
-                                t.pending.borrow_mut().discard(bit);
-                            }
-                        }
+                        discard(&mut g);
                     }
                 }
             }

@@ -138,6 +138,25 @@ static void wait_ok(pid_t pid, const char *label)
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "%s failed (status=0x%x)", label, st);
 }
 
+static void setup_overlay_dirs(const char *base)
+{
+    static const char *const subs[] = {"", "/lower", "/upper", "/work", "/merged"};
+    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+        char p[128];
+        snprintf(p, sizeof(p), "%s%s", base, subs[i]);
+        CHECK(mkdir(p, 0755) == 0, "mkdir %s", p);
+    }
+}
+
+static void mount_overlay(const char *base)
+{
+    char merged[128], opts[256];
+    snprintf(merged, sizeof(merged), "%s/merged", base);
+    snprintf(opts, sizeof(opts), "lowerdir=%s/lower,upperdir=%s/upper,workdir=%s/work", base, base,
+             base);
+    CHECK(mount("overlay", merged, "overlay", 0, opts) == 0, "mount overlay %s", base);
+}
+
 /* ---- 1. Overlay leases before and across copy-up ---- */
 
 static volatile sig_atomic_t lease_sigio_count = 0;
@@ -156,18 +175,11 @@ static void on_lease_sigio(int sig)
 
 static void test_overlay_leases(void)
 {
-    CHECK(mkdir("/tmp/ovl_l", 0755) == 0, "mkdir ovl_l");
-    CHECK(mkdir("/tmp/ovl_l/lower", 0755) == 0, "mkdir lower");
-    CHECK(mkdir("/tmp/ovl_l/upper", 0755) == 0, "mkdir upper");
-    CHECK(mkdir("/tmp/ovl_l/work", 0755) == 0, "mkdir work");
-    CHECK(mkdir("/tmp/ovl_l/merged", 0755) == 0, "mkdir merged");
+    setup_overlay_dirs("/tmp/ovl_l");
     write_file_bytes("/tmp/ovl_l/lower/a", "hello", 5, 0644);
     write_file_bytes("/tmp/ovl_l/lower/b", "world", 5, 0644);
     write_file_bytes("/tmp/ovl_l/lower/c", "12345", 5, 0644);
-
-    CHECK(mount("overlay", "/tmp/ovl_l/merged", "overlay", 0,
-                "lowerdir=/tmp/ovl_l/lower,upperdir=/tmp/ovl_l/upper,workdir=/tmp/ovl_l/work") == 0,
-          "mount overlay for leases");
+    mount_overlay("/tmp/ovl_l");
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -329,18 +341,10 @@ static void test_overlay_tmpfs_accounting(void)
 
 static void test_overlay_perm_before_copy_up(void)
 {
-    CHECK(mkdir("/tmp/ovl_p", 0755) == 0, "mkdir ovl_p");
-    CHECK(mkdir("/tmp/ovl_p/lower", 0755) == 0, "mkdir lower");
+    setup_overlay_dirs("/tmp/ovl_p");
     CHECK(mkdir("/tmp/ovl_p/lower/dir", 0755) == 0, "mkdir lower/dir");
     CHECK(mkdir("/tmp/ovl_p/lower/dir/sub", 0755) == 0, "mkdir lower/dir/sub");
-    CHECK(mkdir("/tmp/ovl_p/upper", 0755) == 0, "mkdir upper");
-    CHECK(mkdir("/tmp/ovl_p/work", 0755) == 0, "mkdir work");
-    CHECK(mkdir("/tmp/ovl_p/merged", 0755) == 0, "mkdir merged");
-
-    CHECK(mount("overlay", "/tmp/ovl_p/merged", "overlay", 0,
-                "lowerdir=/tmp/ovl_p/lower,upperdir=/tmp/ovl_p/upper,"
-                "workdir=/tmp/ovl_p/work") == 0,
-          "mount overlay for perm test");
+    mount_overlay("/tmp/ovl_p");
 
     /* Refused whiteout mknod must not copy up parent directories */
     errno = 0;
@@ -386,17 +390,9 @@ static void test_overlay_perm_before_copy_up(void)
 
 static void test_overlay_fifo_fstat(void)
 {
-    CHECK(mkdir("/tmp/ovl_f", 0755) == 0, "mkdir ovl_f");
-    CHECK(mkdir("/tmp/ovl_f/lower", 0755) == 0, "mkdir lower");
-    CHECK(mkdir("/tmp/ovl_f/upper", 0755) == 0, "mkdir upper");
-    CHECK(mkdir("/tmp/ovl_f/work", 0755) == 0, "mkdir work");
-    CHECK(mkdir("/tmp/ovl_f/merged", 0755) == 0, "mkdir merged");
+    setup_overlay_dirs("/tmp/ovl_f");
     CHECK(mkfifo("/tmp/ovl_f/lower/pipe", 0644) == 0, "mkfifo lower/pipe");
-
-    CHECK(mount("overlay", "/tmp/ovl_f/merged", "overlay", 0,
-                "lowerdir=/tmp/ovl_f/lower,upperdir=/tmp/ovl_f/upper,"
-                "workdir=/tmp/ovl_f/work") == 0,
-          "mount overlay for fifo");
+    mount_overlay("/tmp/ovl_f");
 
     int fd = open("/tmp/ovl_f/merged/pipe", O_RDWR);
     CHECK(fd >= 0, "open overlay fifo O_RDWR");
@@ -472,6 +468,13 @@ static int has_event(const struct ino_ev *evs, size_t n, int wd, uint32_t mask, 
         return 1;
     }
     return 0;
+}
+
+static void expect_event(int ifd, int wd, uint32_t mask, const char *name, const char *msg)
+{
+    struct ino_ev evs[32];
+    size_t n = read_inotify_events(ifd, evs, 32);
+    CHECK(has_event(evs, n, wd, mask, name), "%s", msg);
 }
 
 static void test_inotify_core(void)
@@ -743,6 +746,44 @@ static struct fuse_file *fuse_find_id(struct fuse_test_ctx *c, uint64_t id)
     return NULL;
 }
 
+enum {
+    OP_LOOKUP = 1,
+    OP_GETATTR = 3,
+    OP_SETATTR = 4,
+    OP_MKNOD = 8,
+    OP_UNLINK = 10,
+    OP_OPEN = 14,
+    OP_WRITE = 16,
+    OP_RELEASE = 18,
+    OP_FSYNC = 20,
+    OP_SETXATTR = 21,
+    OP_REMOVEXATTR = 24,
+    OP_FLUSH = 25,
+    OP_INIT = 26,
+    OP_CREATE = 35,
+
+    FATTR_MODE = 1U << 0,
+    FATTR_UID = 1U << 1,
+    FATTR_GID = 1U << 2,
+    FATTR_SIZE = 1U << 3,
+};
+
+static struct fuse_file *fuse_alloc_file(struct fuse_test_ctx *c, const char *name, uint32_t mode)
+{
+    for (int i = 0; i < 4; i++) {
+        if (!c->files[i].present) {
+            struct fuse_file *slot = &c->files[i];
+            memset(slot, 0, sizeof(*slot));
+            slot->present = 1;
+            snprintf(slot->name, sizeof(slot->name), "%.31s", name);
+            slot->nodeid = ++c->next_id;
+            slot->mode = mode;
+            return slot;
+        }
+    }
+    return NULL;
+}
+
 static void fill_attr(struct fuse_attr *a, const struct fuse_file *f)
 {
     memset(a, 0, sizeof(*a));
@@ -753,6 +794,22 @@ static void fill_attr(struct fuse_attr *a, const struct fuse_file *f)
     a->gid = f->gid;
     a->size = f->size;
     a->blksize = 4096;
+}
+
+static void fill_entry_out(struct fuse_entry_out *e, const struct fuse_file *f)
+{
+    memset(e, 0, sizeof(*e));
+    e->nodeid = f->nodeid;
+    e->entry_valid = 1;
+    e->attr_valid = 1;
+    fill_attr(&e->attr, f);
+}
+
+static void reply_body(uint8_t *out, struct fuse_out_hdr *hdr, const void *body, size_t len)
+{
+    hdr->len = (uint32_t)(sizeof(*hdr) + len);
+    if (len > 0)
+        memcpy(out + sizeof(*hdr), body, len);
 }
 
 static void *fuse_reg_daemon(void *arg)
@@ -767,22 +824,22 @@ static void *fuse_reg_daemon(void *arg)
         struct fuse_in_hdr in;
         memcpy(&in, buf, sizeof(in));
 
-        memset(out, 0, sizeof(struct fuse_out_hdr));
         struct fuse_out_hdr *hdr = (struct fuse_out_hdr *)out;
+        memset(hdr, 0, sizeof(*hdr));
         hdr->unique = in.unique;
+        hdr->len = (uint32_t)sizeof(*hdr);
 
-        if (in.opcode == 26 /* FUSE_INIT */) {
-            uint32_t init_out[16];
-            memset(init_out, 0, sizeof(init_out));
+        switch (in.opcode) {
+        case OP_INIT: {
+            uint32_t init_out[16] = {0};
             init_out[0] = 7;
             init_out[1] = 37;
             init_out[6] = 65536;
-            hdr->len = (uint32_t)(sizeof(*hdr) + sizeof(init_out));
-            memcpy(out + sizeof(*hdr), init_out, sizeof(init_out));
-        } else if (in.opcode == 3 /* FUSE_GETATTR */) {
-            struct fuse_attr_out a;
-            memset(&a, 0, sizeof(a));
-            a.attr_valid = 1;
+            reply_body(out, hdr, init_out, sizeof(init_out));
+            break;
+        }
+        case OP_GETATTR: {
+            struct fuse_attr_out a = {.attr_valid = 1};
             if (in.nodeid == 1) {
                 a.attr.ino = 1;
                 a.attr.mode = S_IFDIR | 0755;
@@ -790,155 +847,116 @@ static void *fuse_reg_daemon(void *arg)
             } else {
                 struct fuse_file *f = fuse_find_id(c, in.nodeid);
                 if (!f) {
-                    hdr->len = (uint32_t)sizeof(*hdr);
                     hdr->error = -ENOENT;
-                    goto reply;
+                    break;
                 }
                 fill_attr(&a.attr, f);
             }
-            hdr->len = (uint32_t)(sizeof(*hdr) + sizeof(a));
-            memcpy(out + sizeof(*hdr), &a, sizeof(a));
-        } else if (in.opcode == 1 /* FUSE_LOOKUP */) {
-            const char *name = (const char *)(buf + sizeof(in));
-            struct fuse_file *f = fuse_find_name(c, name);
+            reply_body(out, hdr, &a, sizeof(a));
+            break;
+        }
+        case OP_LOOKUP: {
+            struct fuse_file *f = fuse_find_name(c, (const char *)(buf + sizeof(in)));
             if (!f) {
-                hdr->len = (uint32_t)sizeof(*hdr);
                 hdr->error = -ENOENT;
             } else {
                 struct fuse_entry_out e;
-                memset(&e, 0, sizeof(e));
-                e.nodeid = f->nodeid;
-                e.entry_valid = 1;
-                e.attr_valid = 1;
-                fill_attr(&e.attr, f);
-                hdr->len = (uint32_t)(sizeof(*hdr) + sizeof(e));
-                memcpy(out + sizeof(*hdr), &e, sizeof(e));
+                fill_entry_out(&e, f);
+                reply_body(out, hdr, &e, sizeof(e));
             }
-        } else if (in.opcode == 35 /* FUSE_CREATE */) {
+            break;
+        }
+        case OP_CREATE: {
             if (c->fail_create) {
-                hdr->len = (uint32_t)sizeof(*hdr);
                 hdr->error = -ENOSYS;
-            } else {
-                const char *name = (const char *)(buf + sizeof(in) + 16);
-                struct fuse_file *slot = NULL;
-                for (int i = 0; i < 4; i++) {
-                    if (!c->files[i].present) {
-                        slot = &c->files[i];
-                        break;
-                    }
-                }
-                if (!slot) {
-                    hdr->len = (uint32_t)sizeof(*hdr);
-                    hdr->error = -ENOSPC;
-                } else {
-                    memset(slot, 0, sizeof(*slot));
-                    slot->present = 1;
-                    snprintf(slot->name, sizeof(slot->name), "%.31s", name);
-                    slot->nodeid = ++c->next_id;
-                    slot->mode = S_IFREG | 0644;
-                    struct fuse_entry_out e;
-                    struct fuse_open_out o;
-                    memset(&e, 0, sizeof(e));
-                    memset(&o, 0, sizeof(o));
-                    e.nodeid = slot->nodeid;
-                    e.entry_valid = 1;
-                    e.attr_valid = 1;
-                    fill_attr(&e.attr, slot);
-                    o.fh = slot->nodeid;
-                    hdr->len = (uint32_t)(sizeof(*hdr) + sizeof(e) + sizeof(o));
-                    memcpy(out + sizeof(*hdr), &e, sizeof(e));
-                    memcpy(out + sizeof(*hdr) + sizeof(e), &o, sizeof(o));
-                }
+                break;
             }
-        } else if (in.opcode == 8 /* FUSE_MKNOD */) {
+            struct fuse_file *slot =
+                fuse_alloc_file(c, (const char *)(buf + sizeof(in) + 16), S_IFREG | 0644);
+            if (!slot) {
+                hdr->error = -ENOSPC;
+                break;
+            }
+            struct {
+                struct fuse_entry_out e;
+                struct fuse_open_out o;
+            } resp = {0};
+            fill_entry_out(&resp.e, slot);
+            resp.o.fh = slot->nodeid;
+            reply_body(out, hdr, &resp, sizeof(resp));
+            break;
+        }
+        case OP_MKNOD: {
             struct fuse_mknod_in mi;
             memcpy(&mi, buf + sizeof(in), sizeof(mi));
-            const char *name = (const char *)(buf + sizeof(in) + sizeof(mi));
-            struct fuse_file *slot = NULL;
-            for (int i = 0; i < 4; i++) {
-                if (!c->files[i].present) {
-                    slot = &c->files[i];
-                    break;
-                }
-            }
+            uint32_t mode = (mi.mode & S_IFMT) ? mi.mode : (S_IFREG | (mi.mode & 07777));
+            struct fuse_file *slot =
+                fuse_alloc_file(c, (const char *)(buf + sizeof(in) + sizeof(mi)), mode);
             if (!slot) {
-                hdr->len = (uint32_t)sizeof(*hdr);
                 hdr->error = -ENOSPC;
-            } else {
-                memset(slot, 0, sizeof(*slot));
-                slot->present = 1;
-                snprintf(slot->name, sizeof(slot->name), "%.31s", name);
-                slot->nodeid = ++c->next_id;
-                slot->mode = (mi.mode & S_IFMT) ? mi.mode : (S_IFREG | (mi.mode & 07777));
-                struct fuse_entry_out e;
-                memset(&e, 0, sizeof(e));
-                e.nodeid = slot->nodeid;
-                e.entry_valid = 1;
-                e.attr_valid = 1;
-                fill_attr(&e.attr, slot);
-                hdr->len = (uint32_t)(sizeof(*hdr) + sizeof(e));
-                memcpy(out + sizeof(*hdr), &e, sizeof(e));
+                break;
             }
-        } else if (in.opcode == 14 /* FUSE_OPEN */) {
-            struct fuse_open_out o;
-            memset(&o, 0, sizeof(o));
-            o.fh = in.nodeid;
-            hdr->len = (uint32_t)(sizeof(*hdr) + sizeof(o));
-            memcpy(out + sizeof(*hdr), &o, sizeof(o));
-        } else if (in.opcode == 16 /* FUSE_WRITE */) {
+            struct fuse_entry_out e;
+            fill_entry_out(&e, slot);
+            reply_body(out, hdr, &e, sizeof(e));
+            break;
+        }
+        case OP_OPEN: {
+            struct fuse_open_out o = {.fh = in.nodeid};
+            reply_body(out, hdr, &o, sizeof(o));
+            break;
+        }
+        case OP_WRITE: {
             struct fuse_write_in wi;
             memcpy(&wi, buf + sizeof(in), sizeof(wi));
             struct fuse_file *f = fuse_find_id(c, in.nodeid);
             if (f && wi.offset + wi.size > f->size)
                 f->size = wi.offset + wi.size;
-            struct fuse_write_out wo = {.size = wi.size, .padding = 0};
-            hdr->len = (uint32_t)(sizeof(*hdr) + sizeof(wo));
-            memcpy(out + sizeof(*hdr), &wo, sizeof(wo));
-        } else if (in.opcode == 4 /* FUSE_SETATTR */) {
+            struct fuse_write_out wo = {.size = wi.size};
+            reply_body(out, hdr, &wo, sizeof(wo));
+            break;
+        }
+        case OP_SETATTR: {
             struct fuse_setattr_in si;
             memcpy(&si, buf + sizeof(in), sizeof(si));
             struct fuse_file *f = fuse_find_id(c, in.nodeid);
             if (!f) {
-                hdr->len = (uint32_t)sizeof(*hdr);
                 hdr->error = -ENOENT;
-            } else {
-                if (si.valid & (1U << 0)) /* FATTR_MODE */
-                    f->mode = (f->mode & S_IFMT) | (si.mode & 07777);
-                if (si.valid & (1U << 1)) /* FATTR_UID */
-                    f->uid = si.uid;
-                if (si.valid & (1U << 2)) /* FATTR_GID */
-                    f->gid = si.gid;
-                if (si.valid & (1U << 3)) /* FATTR_SIZE */
-                    f->size = si.size;
-                struct fuse_attr_out a;
-                memset(&a, 0, sizeof(a));
-                a.attr_valid = 1;
-                fill_attr(&a.attr, f);
-                hdr->len = (uint32_t)(sizeof(*hdr) + sizeof(a));
-                memcpy(out + sizeof(*hdr), &a, sizeof(a));
+                break;
             }
-        } else if (in.opcode == 10 /* FUSE_UNLINK */) {
-            const char *name = (const char *)(buf + sizeof(in));
-            struct fuse_file *f = fuse_find_name(c, name);
-            if (!f) {
-                hdr->len = (uint32_t)sizeof(*hdr);
-                hdr->error = -ENOENT;
-            } else {
-                f->present = 0;
-                hdr->len = (uint32_t)sizeof(*hdr);
-            }
-        } else if (in.opcode == 20 /* FUSE_FSYNC */) {
-            c->fsync_ops++;
-            hdr->len = (uint32_t)sizeof(*hdr);
-        } else if (in.opcode == 21 /* FUSE_SETXATTR */ ||
-                   in.opcode == 24 /* FUSE_REMOVEXATTR */ ||
-                   in.opcode == 18 /* FUSE_RELEASE */ || in.opcode == 25 /* FUSE_FLUSH */) {
-            hdr->len = (uint32_t)sizeof(*hdr);
-        } else {
-            hdr->len = (uint32_t)sizeof(*hdr);
-            hdr->error = -ENOSYS;
+            if (si.valid & FATTR_MODE)
+                f->mode = (f->mode & S_IFMT) | (si.mode & 07777);
+            if (si.valid & FATTR_UID)
+                f->uid = si.uid;
+            if (si.valid & FATTR_GID)
+                f->gid = si.gid;
+            if (si.valid & FATTR_SIZE)
+                f->size = si.size;
+            struct fuse_attr_out a = {.attr_valid = 1};
+            fill_attr(&a.attr, f);
+            reply_body(out, hdr, &a, sizeof(a));
+            break;
         }
-    reply:
+        case OP_UNLINK: {
+            struct fuse_file *f = fuse_find_name(c, (const char *)(buf + sizeof(in)));
+            if (!f)
+                hdr->error = -ENOENT;
+            else
+                f->present = 0;
+            break;
+        }
+        case OP_FSYNC:
+            c->fsync_ops++;
+            break;
+        case OP_SETXATTR:
+        case OP_REMOVEXATTR:
+        case OP_RELEASE:
+        case OP_FLUSH:
+            break;
+        default:
+            hdr->error = -ENOSYS;
+            break;
+        }
         (void)write(c->devfd, out, hdr->len);
     }
     return NULL;
@@ -986,49 +1004,39 @@ static void test_fuse_inotify_and_sync(void)
 
     /* Write on linked FUSE child must emit IN_MODIFY under IN_EXCL_UNLINK */
     CHECK(write(fd, "hello", 5) == 5, "write fuse f");
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_MODIFY, "f"),
-          "IN_EXCL_UNLINK on FUSE dir must NOT drop linked child IN_MODIFY");
+    expect_event(ifd, dwd, IN_MODIFY, "f",
+                 "IN_EXCL_UNLINK on FUSE dir must NOT drop linked child IN_MODIFY");
 
     /* FUSE chmod, chown, utimensat, truncate, ftruncate, setxattr, removexattr, O_TRUNC */
     CHECK(chmod("/tmp/fuse_ino/f", 0600) == 0, "fuse chmod");
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_ATTRIB, "f"), "fuse chmod must emit IN_ATTRIB");
+    expect_event(ifd, dwd, IN_ATTRIB, "f", "fuse chmod must emit IN_ATTRIB");
 
     CHECK(chown("/tmp/fuse_ino/f", 0, 0) == 0, "fuse chown");
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_ATTRIB, "f"), "fuse chown must emit IN_ATTRIB");
+    expect_event(ifd, dwd, IN_ATTRIB, "f", "fuse chown must emit IN_ATTRIB");
 
     CHECK(utimensat(AT_FDCWD, "/tmp/fuse_ino/f", NULL, 0) == 0, "fuse utimensat");
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_ATTRIB, "f"), "fuse utimensat must emit IN_ATTRIB");
+    expect_event(ifd, dwd, IN_ATTRIB, "f", "fuse utimensat must emit IN_ATTRIB");
 
     CHECK(truncate("/tmp/fuse_ino/f", 2) == 0, "fuse truncate");
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_MODIFY, "f"), "fuse truncate must emit IN_MODIFY");
+    expect_event(ifd, dwd, IN_MODIFY, "f", "fuse truncate must emit IN_MODIFY");
 
     CHECK(ftruncate(fd, 1) == 0, "fuse ftruncate");
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_MODIFY, "f"), "fuse ftruncate must emit IN_MODIFY");
+    expect_event(ifd, dwd, IN_MODIFY, "f", "fuse ftruncate must emit IN_MODIFY");
 
     CHECK(setxattr("/tmp/fuse_ino/f", "user.k", "v", 1, 0) == 0, "fuse setxattr");
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_ATTRIB, "f"), "fuse setxattr must emit IN_ATTRIB");
+    expect_event(ifd, dwd, IN_ATTRIB, "f", "fuse setxattr must emit IN_ATTRIB");
 
     CHECK(removexattr("/tmp/fuse_ino/f", "user.k") == 0, "fuse removexattr");
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_ATTRIB, "f"), "fuse removexattr must emit IN_ATTRIB");
+    expect_event(ifd, dwd, IN_ATTRIB, "f", "fuse removexattr must emit IN_ATTRIB");
 
     int rfd = open("/tmp/fuse_ino/f", O_RDONLY | O_TRUNC);
     CHECK(rfd >= 0, "fuse O_RDONLY|O_TRUNC");
     close(rfd);
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_MODIFY, "f"), "fuse O_TRUNC open must emit IN_MODIFY");
+    expect_event(ifd, dwd, IN_MODIFY, "f", "fuse O_TRUNC open must emit IN_MODIFY");
 
     /* After unlink on FUSE, IN_EXCL_UNLINK suppresses write and close events */
     CHECK(unlink("/tmp/fuse_ino/f") == 0, "fuse unlink f");
-    n = read_inotify_events(ifd, evs, 32);
-    CHECK(has_event(evs, n, dwd, IN_DELETE, "f"), "fuse unlink emits IN_DELETE");
+    expect_event(ifd, dwd, IN_DELETE, "f", "fuse unlink emits IN_DELETE");
 
     CHECK(write(fd, "z", 1) == 1, "write unlinked fuse fd");
     close(fd);
@@ -1090,19 +1098,14 @@ static void *close_range_worker(void *arg)
     return NULL;
 }
 
-struct pos_race_arg {
-    int fd;
-    volatile int stop;
-};
-
 static void *lseek_racer(void *arg)
 {
-    struct pos_race_arg *a = (struct pos_race_arg *)arg;
-    for (int i = 0; i < 400 && !a->stop; i++) {
-        off_t pos = lseek(a->fd, 0, SEEK_SET);
+    int fd = (int)(intptr_t)arg;
+    for (int i = 0; i < 400; i++) {
+        off_t pos = lseek(fd, 0, SEEK_SET);
         CHECK(pos == 0, "lseek SEEK_SET");
         char b[4];
-        ssize_t n = read(a->fd, b, sizeof(b));
+        ssize_t n = read(fd, b, sizeof(b));
         CHECK(n >= 0, "concurrent read");
     }
     return NULL;
@@ -1258,10 +1261,9 @@ static void test_fileio_and_files(void)
     /* Concurrent lseek + read/writev on shared fd */
     int rfd = open("/tmp/fio/src", O_RDONLY);
     CHECK(rfd >= 0, "open src for race test");
-    struct pos_race_arg pra = {.fd = rfd, .stop = 0};
     pthread_t t1, t2;
-    CHECK(pthread_create(&t1, NULL, lseek_racer, &pra) == 0, "spawn racer 1");
-    CHECK(pthread_create(&t2, NULL, lseek_racer, &pra) == 0, "spawn racer 2");
+    CHECK(pthread_create(&t1, NULL, lseek_racer, (void *)(intptr_t)rfd) == 0, "spawn racer 1");
+    CHECK(pthread_create(&t2, NULL, lseek_racer, (void *)(intptr_t)rfd) == 0, "spawn racer 2");
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
     close(rfd);
@@ -1406,13 +1408,12 @@ int main(void)
     CHECK(chmod("/tmp", 0777) == 0, "chmod /tmp");
 
     /* Clean leftovers so Tier 0 and Tier 1 can reuse the same rootfs image */
-    rm_rf("/tmp/ovl_l");
-    rm_rf("/tmp/ovl_t");
-    rm_rf("/tmp/ovl_p");
-    rm_rf("/tmp/ovl_f");
-    rm_rf("/tmp/ino_core");
-    rm_rf("/tmp/fuse_ino");
-    rm_rf("/tmp/fio");
+    static const char *const dirs[] = {
+        "/tmp/ovl_l", "/tmp/ovl_t",    "/tmp/ovl_p", "/tmp/ovl_f",
+        "/tmp/ino_core", "/tmp/fuse_ino", "/tmp/fio",
+    };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+        rm_rf(dirs[i]);
 
     test_overlay_leases();
     test_overlay_tmpfs_accounting();

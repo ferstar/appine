@@ -114,28 +114,7 @@ fn threads_signals_and_fork() {
     // Mutexes, condition variables, atomics, thread-local storage, signals sent to a given thread,
     // the alternate signal stack, returning after fixing up a memory access fault, SA_RESTART, fork
     // in a multithreaded process, detached threads
-    let Some(program) = build_c_guest("threads") else {
-        return;
-    };
-    for tier in TIERS {
-        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
-            .args(["--tier", tier])
-            .arg(&program)
-            .output()
-            .expect("failed to run appine-run");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "tier {tier}: {}{}",
-            stdout(&out),
-            stderr(&out)
-        );
-        assert!(
-            stdout(&out).ends_with("all ok\n"),
-            "tier {tier}: {}",
-            stdout(&out)
-        );
-    }
+    run_c_guest("threads");
 }
 
 #[test]
@@ -167,56 +146,14 @@ fn thread_churn_keeps_the_host_heap_intact() {
 fn sockets_polling_and_timers() {
     // AF_UNIX (socketpair, SCM_RIGHTS, SO_PEERCRED, abstract addresses), TCP/UDP loopback, netlink,
     // epoll/eventfd/select, setitimer; none of them needs outside network
-    let Some(program) = build_c_guest("net") else {
-        return;
-    };
-    for tier in TIERS {
-        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
-            .args(["--tier", tier])
-            .arg(&program)
-            .output()
-            .expect("failed to run appine-run");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "tier {tier}: {}{}",
-            stdout(&out),
-            stderr(&out)
-        );
-        assert!(
-            stdout(&out).ends_with("all ok\n"),
-            "tier {tier}: {}",
-            stdout(&out)
-        );
-    }
+    run_c_guest("net");
 }
 
 #[test]
 fn net_regressions() {
     // Targeted regressions for kernel/net, kernel/netns, kernel/netlink, kernel/rawicmp and
     // kernel/nft fixes
-    let Some(program) = build_c_guest("net_regressions") else {
-        return;
-    };
-    for tier in TIERS {
-        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
-            .args(["--tier", tier])
-            .arg(&program)
-            .output()
-            .expect("failed to run appine-run");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "tier {tier}: {}{}",
-            stdout(&out),
-            stderr(&out)
-        );
-        assert!(
-            stdout(&out).ends_with("all ok\n"),
-            "tier {tier}: {}",
-            stdout(&out)
-        );
-    }
+    run_c_guest("net_regressions");
 }
 
 #[test]
@@ -930,6 +867,31 @@ fn missing_program_exits_127() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(127));
+}
+
+fn run_c_guest(name: &str) {
+    let Some(program) = build_c_guest(name) else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+    }
 }
 
 fn run_guest_in_empty_rootfs(name: &str) {

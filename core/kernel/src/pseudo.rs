@@ -2004,16 +2004,14 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let (atime_ns, mtime_ns, ctime_ns) = times.unwrap_or((now, now, now));
     // net.* sysctls belong to root of the user namespace owning the pinned network namespace,
     // when it maps one (net_ctl_set_ownership)
-    let (uid, gid) = if let Some(net) = pinned_net(node) {
-        let owner = &net.0.owner;
-        let uid = owner.uid_map.borrow().down(0).unwrap_or(0);
-        let gid = owner.gid_map.borrow().down(0).unwrap_or(0);
-        (uid, gid)
-    } else if is_net_sysctl(node) {
-        let owner = ps.ns().net.owner.clone();
-        let uid = owner.uid_map.borrow().down(0).unwrap_or(0);
-        let gid = owner.gid_map.borrow().down(0).unwrap_or(0);
-        (uid, gid)
+    let (uid, gid) = if let Some(owner) = pinned_net(node)
+        .map(|n| n.0.owner.clone())
+        .or_else(|| is_net_sysctl(node).then(|| ps.ns().net.owner.clone()))
+    {
+        (
+            owner.uid_map.borrow().down(0).unwrap_or(0),
+            owner.gid_map.borrow().down(0).unwrap_or(0),
+        )
     } else {
         owner_of(ps.k, node)
     };
@@ -2535,7 +2533,6 @@ pub(crate) fn has_iter(node: &PseudoNode, write: bool) -> bool {
             | self::Entry::CoredumpFilter,
         ) => false,
         Entry(..) => !write,
-        NsFile(..) => false,
         _ => false,
     }
 }
@@ -2687,15 +2684,17 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             }
             _ => return Err(Errno::EISDIR),
         },
-        IpcSysctl(path, ipc) => match &path[..] {
-            p if p.starts_with(b"sys/fs/mqueue/") => {
-                format!("{}\n", ps.k.ipc(ipc.0.id).mq_limits.get(&p[14..]).unwrap_or(0))
+        IpcSysctl(path, ipc) => {
+            if let Some(name) = path.strip_prefix(b"sys/fs/mqueue/") {
+                format!("{}\n", ps.k.ipc(ipc.0.id).mq_limits.get(name).unwrap_or(0))
+            } else if let Some(name) = path.strip_prefix(b"sys/kernel/")
+                && let Some(val) = ps.k.ipc(ipc.0.id).tunables.read(name)
+            {
+                val
+            } else {
+                return Err(Errno::EISDIR);
             }
-            b"sys/kernel/msgmax" | b"sys/kernel/msgmnb" | b"sys/kernel/msgmni"
-            | b"sys/kernel/sem" | b"sys/kernel/shmall" | b"sys/kernel/shmmax"
-            | b"sys/kernel/shmmni" => ps.k.ipc(ipc.0.id).tunables.read(&path[11..]).unwrap(),
-            _ => return Err(Errno::EISDIR),
-        },
+        }
         Static(path) => match &path[..] {
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
             b"sys/fs/lease-break-time" => format!("{}\n", ps.k.lease_break_time),
@@ -5166,9 +5165,7 @@ pub(crate) fn gone(k: &Kernel, node: &PseudoNode) -> bool {
         | PseudoNode::FdInfo(proc, tid, _)
         | PseudoNode::Ns(proc, tid, _) => !pid_exists_in(k, *proc, *tid),
         PseudoNode::OpenExe(proc) => group_of_id(k, *proc).is_none(),
-        PseudoNode::Cgroup(id, name) if !name.is_empty() => {
-            k.cgroups.get(*id).is_none() || !k.cgroups.files(*id).any(|f| f == *name)
-        }
+        PseudoNode::Cgroup(id, name) if !name.is_empty() => !k.cgroups.has_file(*id, name),
         _ => false,
     }
 }

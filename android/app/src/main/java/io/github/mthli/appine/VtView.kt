@@ -400,8 +400,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     fun attach(s: VtSession?) {
         if (s === session) return
-        val hadSession = session != null
-        val hadIme = imePassword || preedit.isNotEmpty()
         clearResizePreview()
         endSearch()
         session?.let { if (it.view === this) it.view = null }
@@ -414,9 +412,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         removeCallbacks(autoscrollTick)
         stopPasswordCheck()
         // Drop any active composition and password mode when switching or detaching tabs.
+        val hadIme = imePassword || preedit.isNotEmpty()
         imePassword = false
         setPreedit("")
-        if (hadSession || hadIme) restartInput()
+        if (session != null || hadIme) restartInput()
         hoverCell = -1
         hoverLink = false
         scroller.forceFinished(true)
@@ -1103,24 +1102,18 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             }
         }
 
-        override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-            if (editable.isNullOrEmpty()) {
-                repeat(beforeLength) { press(KeyEvent.KEYCODE_DEL) }
-                return true
-            }
-            val result = super.deleteSurroundingText(beforeLength, afterLength)
-            setPreedit(editable?.toString().orEmpty())
-            return result
-        }
+        override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean =
+            deleteSurrounding(beforeLength) { super.deleteSurroundingText(beforeLength, afterLength) }
 
-        override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean {
+        override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
+            deleteSurrounding(beforeLength) { super.deleteSurroundingTextInCodePoints(beforeLength, afterLength) }
+
+        private fun deleteSurrounding(beforeLength: Int, delete: () -> Boolean): Boolean {
             if (editable.isNullOrEmpty()) {
                 repeat(beforeLength) { press(KeyEvent.KEYCODE_DEL) }
                 return true
             }
-            val result = super.deleteSurroundingTextInCodePoints(beforeLength, afterLength)
-            setPreedit(editable?.toString().orEmpty())
-            return result
+            return delete().also { setPreedit(editable?.toString().orEmpty()) }
         }
 
         override fun performEditorAction(editorAction: Int): Boolean {

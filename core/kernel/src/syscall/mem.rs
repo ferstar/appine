@@ -750,14 +750,14 @@ fn will_free_mem(k: &crate::kernel::Kernel, g: &crate::process::ThreadGroup) -> 
     if g.core.is_some() {
         return false;
     }
-    if g.exiting.is_some() {
-        let killed = g
-            .threads
-            .iter()
-            .any(|tid| k.tasks.get(tid).is_some_and(|t| t.killed.get()));
-        if !g.single_exit || killed || (g.leader_exit.is_none() && g.threads.len() == 1) {
-            return true;
-        }
+    if g.exiting.is_some()
+        && (!g.single_exit
+            || (g.leader_exit.is_none() && g.threads.len() == 1)
+            || g.threads
+                .iter()
+                .any(|tid| k.tasks.get(tid).is_some_and(|t| t.killed.get())))
+    {
+        return true;
     }
     has_fatal_pending(k, g)
 }

@@ -68,6 +68,16 @@ class TerminalInputTest {
         val statusChanges: AtomicInteger,
     )
 
+    private fun fakeEvents(onStatusChanged: () -> Unit = {}): VtSession.Events = Proxy.newProxyInstance(
+        VtSession.Events::class.java.classLoader, arrayOf(VtSession.Events::class.java),
+    ) { _, method, _ ->
+        if (method.name == "onStatusChanged") onStatusChanged()
+        null
+    } as VtSession.Events
+
+    private fun field(clazz: Class<*>, name: String) =
+        clazz.getDeclaredField(name).apply { isAccessible = true }
+
     private fun withConnection(test: (InputConnection, Host, Long) -> Unit) =
         withFixture { test(it.connection, it.host, it.tab) }
 
@@ -88,15 +98,9 @@ class TerminalInputTest {
                 val statusChanges = AtomicInteger()
                 scenario.onActivity { activity ->
                     assertFalse("Tests require an unlocked page", Privacy.locked(activity))
-                    val events = Proxy.newProxyInstance(
-                        VtSession.Events::class.java.classLoader, arrayOf(VtSession.Events::class.java),
-                    ) { _, method, _ ->
-                        if (method.name == "onStatusChanged") statusChanges.incrementAndGet()
-                        null
-                    } as VtSession.Events
-                    session = VtSession(1, ConsolePty(machine, "", "root"), machine, events)
+                    session = VtSession(1, ConsolePty(machine, "", "root"), machine, fakeEvents { statusChanges.incrementAndGet() })
                     // Supply only the terminal; starting a session would also start shell threads.
-                    VtSession::class.java.getDeclaredField("tab").apply { isAccessible = true }.setLong(session, tab)
+                    field(VtSession::class.java, "tab").setLong(session, tab)
                     view = VtView(ContextThemeWrapper(activity, R.style.Theme_Appine_Terminal), host)
                     view.attach(session)
                     connection = view.onCreateInputConnection(EditorInfo())
@@ -304,7 +308,7 @@ class TerminalInputTest {
     @Test
     fun composingDeleteSurroundingTextUpdatesPreedit() {
         withFixture { f ->
-            val preeditField = VtView::class.java.getDeclaredField("preedit").apply { isAccessible = true }
+            val preeditField = field(VtView::class.java, "preedit")
             onMain {
                 f.connection.setComposingText("abc", 1)
                 assertEquals("abc", preeditField.get(f.view))
@@ -322,8 +326,8 @@ class TerminalInputTest {
     @Test
     fun attachClearsPreeditAndStopsBlink() {
         withFixture { f ->
-            val preeditField = VtView::class.java.getDeclaredField("preedit").apply { isAccessible = true }
-            val blinkField = VtView::class.java.getDeclaredField("blinkRunning").apply { isAccessible = true }
+            val preeditField = field(VtView::class.java, "preedit")
+            val blinkField = field(VtView::class.java, "blinkRunning")
             onMain {
                 f.connection.setComposingText("hello", 1)
                 blinkField.setBoolean(f.view, true)
@@ -338,7 +342,7 @@ class TerminalInputTest {
     @Test
     fun mode1004FocusEventsDoNotJumpScrolledBackViewport() {
         withFixture { f ->
-            val atBottomField = VtView::class.java.getDeclaredField("atBottom").apply { isAccessible = true }
+            val atBottomField = field(VtView::class.java, "atBottom")
             onMain {
                 f.view.layout(0, 0, 640, 384)
                 VtNative.print(f.tab, ("\u001b[?1004h" + (1..60).joinToString("\r\n") { "line $it" }).toByteArray())
@@ -386,13 +390,10 @@ class TerminalInputTest {
         val blockerStarted = CountDownLatch(1)
         val releaseBlocker = CountDownLatch(1)
         val executor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, LinkedBlockingQueue())
-        val events = Proxy.newProxyInstance(
-            VtSession.Events::class.java.classLoader, arrayOf(VtSession.Events::class.java),
-        ) { _, _, _ -> null } as VtSession.Events
         val pty = ConsolePty(0L, "", "root")
-        ConsolePty::class.java.getDeclaredField("console").apply { isAccessible = true }.setInt(pty, 0)
-        val session = VtSession(1, pty, 0L, events)
-        VtSession::class.java.getDeclaredField("writer").apply { isAccessible = true }.set(session, executor)
+        field(ConsolePty::class.java, "console").setInt(pty, 0)
+        val session = VtSession(1, pty, 0L, fakeEvents())
+        field(VtSession::class.java, "writer").set(session, executor)
         try {
             executor.execute {
                 blockerStarted.countDown()

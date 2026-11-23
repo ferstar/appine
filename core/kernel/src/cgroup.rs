@@ -405,6 +405,11 @@ impl Cgroups {
             .map(|f| f.0)
     }
 
+    /// Whether cgroup `id` exists and exposes interface file `name` (its controller is enabled).
+    pub(crate) fn has_file(&self, id: u64, name: &[u8]) -> bool {
+        self.map.contains_key(&id) && self.files(id).any(|f| f == name)
+    }
+
     /// The controllers enabled in cgroup `id` (`cgroup.controllers`): all of them at the root,
     /// otherwise the parent cgroup's `subtree_control`.
     fn controllers(&self, id: u64) -> u32 {
@@ -529,10 +534,10 @@ pub(crate) fn file(
     name: &[u8],
     vnr: &dyn Fn(crate::kernel::Tid) -> crate::kernel::Tid,
 ) -> Result<String, Errno> {
-    let g = k.cgroups.get(id).ok_or(Errno::ENODEV)?;
-    if !k.cgroups.files(id).any(|f| f == name) {
+    if !k.cgroups.has_file(id, name) {
         return Err(Errno::ENODEV);
     }
+    let g = &k.cgroups.map[&id];
     let root = g.parent.is_none();
     let max = |v: u64| {
         if v == u64::MAX {
@@ -791,7 +796,7 @@ pub(crate) fn write(
 ) -> Result<(), Errno> {
     // A file of a removed cgroup or a disabled controller still open: every write is ENODEV
     // (kernfs_get_active fails), which container managers take as "cgroup/file gone"
-    if k.cgroups.get(id).is_none() || !k.cgroups.files(id).any(|f| f == name) {
+    if !k.cgroups.has_file(id, name) {
         return Err(Errno::ENODEV);
     }
     // On a namespace root only cgroup.procs, cgroup.threads and cgroup.subtree_control may be

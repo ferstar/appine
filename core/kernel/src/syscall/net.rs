@@ -412,10 +412,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                     }) => {}
                 None => {
                     appine_hal::net::bind(s.fd, &host_addr).map_err(Errno)?;
-                    if s.net.is_some() {
-                        let v6only = s.family == AF_INET6 && s.v6only && ipv6_proper(&addr);
-                        claim_ephemeral(&map, s, v6only);
-                    }
+                    claim_ephemeral(&map, s, Some(&addr));
                 }
             }
             if s.net.is_some() {
@@ -477,7 +474,7 @@ fn netlink_bind(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), Errno>
     let chosen = if s.pid == 0 {
         if pid == 0 {
             netlink_alloc_pid(cx, sock, &s.net, s.protocol)
-        } else if netlink_pid_in_use(cx.kr(), sock, &s.net, s.protocol, pid) {
+        } else if netlink_find_peer(cx.kr(), sock, &s.net, s.protocol, pid).is_some() {
             return Err(Errno::EADDRINUSE);
         } else {
             pid
@@ -514,23 +511,30 @@ fn netlink_connect(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), Err
         s.dst_group = 0;
         return Ok(());
     }
-    if family != AF_NETLINK as u16 || addr.len() < 12 {
-        return Err(Errno::EINVAL);
-    }
-    let dst_pid = u32::from_le_bytes(addr[4..8].try_into().unwrap());
-    let dst_groups = u32::from_le_bytes(addr[8..12].try_into().unwrap());
-    let dst_group = if dst_groups == 0 {
-        0
-    } else {
-        dst_groups.trailing_zeros() + 1
-    };
-    if (dst_pid != 0 || dst_group != 0) && !netlink_admin(cx, s) {
-        return Err(Errno::EPERM);
-    }
+    let (dst_pid, dst_group) = netlink_dst(cx, s, addr)?;
     netlink_autobind(cx, sock, s);
     s.dst_pid = dst_pid;
     s.dst_group = dst_group;
     Ok(())
+}
+
+/// Parses and authorizes a destination `sockaddr_nl` for `connect` and `sendto`, returning
+/// `(dst_pid, dst_group)` with `dst_group` as the 1-based lowest set bit (0 for none).
+fn netlink_dst(cx: &Cx<'_>, s: &NetlinkSocket, addr: &[u8]) -> Result<(u32, u32), Errno> {
+    if addr.len() < 12 || u16::from_le_bytes([addr[0], addr[1]]) != AF_NETLINK as u16 {
+        return Err(Errno::EINVAL);
+    }
+    let pid = u32::from_le_bytes(addr[4..8].try_into().unwrap());
+    let groups = u32::from_le_bytes(addr[8..12].try_into().unwrap());
+    let group = if groups == 0 {
+        0
+    } else {
+        groups.trailing_zeros() + 1
+    };
+    if (pid != 0 || group != 0) && !netlink_admin(cx, s) {
+        return Err(Errno::EPERM);
+    }
+    Ok((pid, group))
 }
 
 /// Gives an unbound netlink socket a unique `nl_pid` at connect and send (Linux's
@@ -542,32 +546,27 @@ fn netlink_autobind(cx: &Cx<'_>, sock: &SocketRef, s: &mut NetlinkSocket) {
     }
 }
 
-/// Whether another live netlink socket in the same network namespace and protocol holds `pid`.
-fn netlink_pid_in_use(
+/// Finds another live netlink socket in the same network namespace and protocol holding `pid`.
+fn netlink_find_peer(
     k: &crate::kernel::Kernel,
     self_sock: &SocketRef,
     net: &Option<Rc<crate::nsproxy::NetNs>>,
     protocol: i32,
     pid: u32,
-) -> bool {
-    let same_ns =
-        |a: &Option<Rc<crate::nsproxy::NetNs>>, b: &Option<Rc<crate::nsproxy::NetNs>>| match (a, b)
-        {
-            (None, None) => true,
-            (Some(x), Some(y)) => Rc::ptr_eq(x, y),
-            _ => false,
-        };
+) -> Option<SocketRef> {
+    let want_ns = net.as_ref().map(Rc::as_ptr);
     k.rtnl_sockets
         .iter()
         .filter_map(|w| w.upgrade())
-        .any(|other| {
-            !Rc::ptr_eq(&other, self_sock)
-                && match other.try_borrow().as_deref() {
-                    Ok(Socket::Netlink(o)) => {
-                        o.protocol == protocol && o.pid == pid && same_ns(&o.net, net)
-                    }
-                    _ => false,
-                }
+        .find(|other| {
+            !Rc::ptr_eq(other, self_sock)
+                && matches!(
+                    other.try_borrow().as_deref(),
+                    Ok(Socket::Netlink(o))
+                        if o.protocol == protocol
+                            && o.pid == pid
+                            && o.net.as_ref().map(Rc::as_ptr) == want_ns
+                )
         })
 }
 
@@ -581,7 +580,7 @@ fn netlink_alloc_pid(
 ) -> u32 {
     static ROVER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-4097);
     let tgid = cx.pid_out(cx.tgid()) as u32;
-    if tgid != 0 && !netlink_pid_in_use(cx.kr(), sock, net, protocol, tgid) {
+    if tgid != 0 && netlink_find_peer(cx.kr(), sock, net, protocol, tgid).is_none() {
         return tgid;
     }
     loop {
@@ -591,7 +590,7 @@ fn netlink_alloc_pid(
             cand = -4097;
         }
         let pid = cand as u32;
-        if pid != 0 && !netlink_pid_in_use(cx.kr(), sock, net, protocol, pid) {
+        if pid != 0 && netlink_find_peer(cx.kr(), sock, net, protocol, pid).is_none() {
             return pid;
         }
     }
@@ -1020,10 +1019,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
         && let Socket::Inet(s) = &mut *sock.borrow_mut()
     {
         s.any &= !connected;
-        if s.net.is_some() && s.lease.is_none() {
-            let v6only = s.family == AF_INET6 && s.v6only;
-            claim_ephemeral(&map, s, v6only);
-        }
+        claim_ephemeral(&map, s, None);
     }
     match r {
         Ok(()) => {
@@ -1155,8 +1151,7 @@ fn ensure_bound(
                 Some(addr) => {
                     appine_hal::net::bind(s.fd, addr).map_err(Errno)?;
                     s.any = true;
-                    let v6only = s.family == AF_INET6 && s.v6only;
-                    claim_ephemeral(map, s, v6only);
+                    claim_ephemeral(map, s, None);
                     register_udp(s);
                     // A UDP socket sending to its own virtual address: register the guest port so
                     // that answers can be delivered (crate::netns)
@@ -1193,7 +1188,12 @@ fn ensure_bound(
 
 /// Registers an ephemeral host port (`bind(0)` or implicit bind) in a new network namespace in
 /// [`crate::portmap`] so it cannot alias an explicitly bound guest port in the same namespace.
-fn claim_ephemeral(map: &Rc<RefCell<crate::portmap::PortMap>>, s: &mut InetSocket, v6only: bool) {
+/// When `addr` is given (an explicit `bind(0)`), `v6only` only applies to real IPv6 addresses.
+fn claim_ephemeral(
+    map: &Rc<RefCell<crate::portmap::PortMap>>,
+    s: &mut InetSocket,
+    addr: Option<&[u8]>,
+) {
     let Some(net) = &s.net else {
         return;
     };
@@ -1207,6 +1207,7 @@ fn claim_ephemeral(map: &Rc<RefCell<crate::portmap::PortMap>>, s: &mut InetSocke
     else {
         return;
     };
+    let v6only = s.family == AF_INET6 && s.v6only && addr.is_none_or(ipv6_proper);
     let (lo, hi) = net.devs.borrow().conf.port_range;
     let range = (lo.clamp(1, 65535) as u16, hi.clamp(1, 65535) as u16);
     let (guest, lease) =
@@ -1531,15 +1532,6 @@ pub(super) fn setsockopt(
         Some(false) => return Ok(0),
         None => {}
     }
-    // Classic BPF filters (SO_ATTACH_FILTER, SO_ATTACH_REUSEPORT_CBPF), checked in Linux 6.1.y's
-    // order: an optlen under an int is EINVAL; SO_ATTACH_FILTER on a TCP socket needs
-    // CAP_NET_ADMIN over the socket's network namespace (Linux 5d39580f68e6, EPERM); struct
-    // sock_fprog must be exactly 16 bytes (EINVAL); a locked filter is EPERM; a count of 0 or above
-    // BPF_MAXINSNS, or no program, is EINVAL. The pointer to the instructions is then replaced
-    // with one on the host, which checks them. dockerd attaches a drop-everything filter to each
-    // TCP port it publishes until its DNAT rules are in place, and a host with 5d39580f68e6
-    // refuses TCP filters from the app, which never has CAP_NET_ADMIN: the program is then checked
-    // on a scratch UDP socket and kept in InetSocket::filter, filtering nothing
     const SO_ATTACH_BPF: i32 = 50;
     const SO_ATTACH_REUSEPORT_CBPF: i32 = 51;
     const SO_ATTACH_REUSEPORT_EBPF: i32 = 52;
@@ -1573,6 +1565,15 @@ pub(super) fn setsockopt(
         cx.fds().get(ufd)?;
         return Err(Errno::EINVAL);
     }
+    // Classic BPF filters (SO_ATTACH_FILTER, SO_ATTACH_REUSEPORT_CBPF), checked in Linux 6.1.y's
+    // order: an optlen under an int is EINVAL; SO_ATTACH_FILTER on a TCP socket needs
+    // CAP_NET_ADMIN over the socket's network namespace (Linux 5d39580f68e6, EPERM); struct
+    // sock_fprog must be exactly 16 bytes (EINVAL); a locked filter is EPERM; a count of 0 or above
+    // BPF_MAXINSNS, or no program, is EINVAL. The pointer to the instructions is then replaced
+    // with one on the host, which checks them. dockerd attaches a drop-everything filter to each
+    // TCP port it publishes until its DNAT rules are in place, and a host with 5d39580f68e6
+    // refuses TCP filters from the app, which never has CAP_NET_ADMIN: the program is then checked
+    // on a scratch UDP socket and kept in InetSocket::filter, filtering nothing
     if let Some((host_fd, tcp, owner)) = inet
         && level == SOL_SOCKET
         && matches!(name, SO_ATTACH_FILTER | SO_ATTACH_REUSEPORT_CBPF)
@@ -2935,10 +2936,7 @@ pub(crate) fn send(
     // Bound automatically by the host (on the first send to the outside in a new namespace): only
     // now is the port known, so claim it in the portmap and register its listener
     if sent_datagram && let Socket::Inet(s) = &mut *sock.borrow_mut() {
-        if s.net.is_some() && s.lease.is_none() {
-            let v6only = s.family == AF_INET6 && s.v6only;
-            claim_ephemeral(&map, s, v6only);
-        }
+        claim_ephemeral(&map, s, None);
         if s.listener.is_none() {
             register_udp(s);
         }
@@ -2949,60 +2947,44 @@ pub(crate) fn send(
 /// Validates a guest destination address for `sendto`/`sendmsg` on an inet socket as Linux 6.1
 /// does (`udp_sendmsg`, `udpv6_sendmsg`, `raw_sendmsg`, `rawv6_sendmsg`, `ping_v4_sendmsg`,
 /// `ping_v6_sendmsg`, `tcp_sendmsg_fastopen`) before passing it to the host.
-fn inet_send_addr(s: &InetSocket, addr: &[u8]) -> Result<Vec<u8>, Errno> {
+fn inet_send_addr<'a>(s: &InetSocket, addr: &'a [u8]) -> Result<std::borrow::Cow<'a, [u8]>, Errno> {
+    use std::borrow::Cow;
     const AF_UNSPEC: i32 = 0;
     let given = addr
         .get(..2)
         .map(|b| i32::from(u16::from_le_bytes([b[0], b[1]])));
+    let rewrite = |fam: i32| {
+        let mut out = addr.to_vec();
+        out[..2].copy_from_slice(&(fam as u16).to_le_bytes());
+        Cow::Owned(out)
+    };
     if s.family == AF_INET {
         if addr.len() < 16 {
             return Err(Errno::EINVAL);
         }
         return match given {
-            Some(AF_INET) => Ok(addr.to_vec()),
+            Some(AF_INET) => Ok(Cow::Borrowed(addr)),
             // udp_sendmsg and raw_sendmsg accept AF_UNSPEC as AF_INET; rewrite before the host so
             // LSMs like AppArmor do not reject AF_UNSPEC with EAFNOSUPPORT.
             Some(AF_UNSPEC) if s.ty == SOCK_DGRAM && (s.raw || s.proto != IPPROTO_ICMP) => {
-                let mut out = addr.to_vec();
-                out[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
-                Ok(out)
+                Ok(rewrite(AF_INET))
             }
             _ => Err(Errno::EAFNOSUPPORT),
         };
     }
-    // AF_INET6
+    // AF_INET6 UDP (udpv6_sendmsg): checks sa_family first (short < 2 or unknown family is EINVAL,
+    // AF_UNSPEC clears msg_name, AF_INET falls through to IPv4 if !IPV6_V6ONLY).
     if s.ty == SOCK_DGRAM && !s.raw && s.proto != IPPROTO_ICMPV6 {
-        // udpv6_sendmsg: checks sa_family first (short < 2 is EINVAL, unknown family is EINVAL,
-        // AF_UNSPEC clears msg_name, AF_INET falls through to IPv4 if !IPV6_V6ONLY).
-        if addr.len() < 2 {
-            return Err(Errno::EINVAL);
-        }
         return match given {
-            Some(AF_INET6) => {
-                if addr.len() < 24 {
-                    Err(Errno::EINVAL)
+            Some(AF_INET6) if addr.len() >= 24 => Ok(Cow::Borrowed(addr)),
+            Some(AF_INET) if addr.len() >= 16 => {
+                if is_v6only(s) {
+                    Err(Errno::ENETUNREACH)
                 } else {
-                    Ok(addr.to_vec())
+                    Ok(Cow::Borrowed(addr))
                 }
             }
-            Some(AF_INET) => {
-                if addr.len() < 16 {
-                    Err(Errno::EINVAL)
-                } else {
-                    let v6only = if s.net.is_some() {
-                        s.v6only
-                    } else {
-                        appine_hal::net::getsockopt(s.fd, IPPROTO_IPV6, IPV6_V6ONLY, 4)
-                            .is_ok_and(|v| v.get(..4).is_some_and(|b| b != [0; 4]))
-                    };
-                    if v6only {
-                        Err(Errno::ENETUNREACH)
-                    } else {
-                        Ok(addr.to_vec())
-                    }
-                }
-            }
-            Some(AF_UNSPEC) => Ok(Vec::new()),
+            Some(AF_UNSPEC) => Ok(Cow::Borrowed(&[])),
             _ => Err(Errno::EINVAL),
         };
     }
@@ -3010,12 +2992,8 @@ fn inet_send_addr(s: &InetSocket, addr: &[u8]) -> Result<Vec<u8>, Errno> {
         return Err(Errno::EINVAL);
     }
     match given {
-        Some(AF_INET6) => Ok(addr.to_vec()),
-        Some(AF_UNSPEC) if s.raw => {
-            let mut out = addr.to_vec();
-            out[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
-            Ok(out)
-        }
+        Some(AF_INET6) => Ok(Cow::Borrowed(addr)),
+        Some(AF_UNSPEC) if s.raw => Ok(rewrite(AF_INET6)),
         _ => Err(Errno::EAFNOSUPPORT),
     }
 }
@@ -3601,20 +3579,7 @@ fn netlink_send(
             unreachable!("checked by the caller")
         };
         let (dst_pid, dst_group) = if !addr.is_empty() {
-            if addr.len() < 12 || u16::from_le_bytes([addr[0], addr[1]]) != AF_NETLINK as u16 {
-                return Err(Errno::EINVAL);
-            }
-            let pid = u32::from_le_bytes(addr[4..8].try_into().unwrap());
-            let groups = u32::from_le_bytes(addr[8..12].try_into().unwrap());
-            let group = if groups == 0 {
-                0
-            } else {
-                groups.trailing_zeros() + 1
-            };
-            if (pid != 0 || group != 0) && !netlink_admin(cx, s) {
-                return Err(Errno::EPERM);
-            }
-            (pid, group)
+            netlink_dst(cx, s, addr)?
         } else {
             (s.dst_pid, s.dst_group)
         };
@@ -3626,28 +3591,7 @@ fn netlink_send(
                 s.enqueue(data.to_vec(), 0);
                 Delivery::Kernel(Vec::new())
             } else {
-                let same_ns =
-                    |a: &Option<Rc<crate::nsproxy::NetNs>>,
-                     b: &Option<Rc<crate::nsproxy::NetNs>>| match (a, b) {
-                        (None, None) => true,
-                        (Some(x), Some(y)) => Rc::ptr_eq(x, y),
-                        _ => false,
-                    };
-                let peer = cx
-                    .kr()
-                    .rtnl_sockets
-                    .iter()
-                    .filter_map(|w| w.upgrade())
-                    .find(|other| {
-                        !Rc::ptr_eq(other, sock)
-                            && matches!(
-                                other.try_borrow().as_deref(),
-                                Ok(Socket::Netlink(o))
-                                    if o.protocol == s.protocol
-                                        && o.pid == dst_pid
-                                        && same_ns(&o.net, &s.net)
-                            )
-                    })
+                let peer = netlink_find_peer(cx.kr(), sock, &s.net, s.protocol, dst_pid)
                     .ok_or(Errno::ECONNREFUSED)?;
                 Delivery::Peer(peer)
             }
@@ -4735,12 +4679,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
     let dst = crate::netns::external_nat(init, proto as u8, &local).or_else(|| {
         // Dual-stack AF_INET6 wildcard listener (!IPV6_V6ONLY): also probe as IPv4 wildcard so
         // IPv4 PREROUTING DNAT rules match it.
-        if s.family != AF_INET6 || !crate::netns::is_any(&local) {
-            return None;
-        }
-        let v6only = appine_hal::net::getsockopt(s.fd, IPPROTO_IPV6, IPV6_V6ONLY, 4)
-            .is_ok_and(|v| v.get(..4).is_some_and(|b| b != [0; 4]));
-        if v6only {
+        if s.family != AF_INET6 || !crate::netns::is_any(&local) || is_v6only(s) {
             return None;
         }
         let mut v4_any = vec![0u8; 16];
@@ -5021,6 +4960,17 @@ fn set_port(addr: &mut [u8], port: u16) {
 /// Whether a sockaddr holds an IPv6 address proper (not an IPv4-mapped one).
 fn ipv6_proper(addr: &[u8]) -> bool {
     matches!(ip_of(addr), Some(std::net::IpAddr::V6(_)))
+}
+
+/// Whether IPv6 socket `s` has `IPV6_V6ONLY` enabled (recorded in new namespaces, queried from the
+/// host in the initial namespace).
+fn is_v6only(s: &InetSocket) -> bool {
+    if s.net.is_some() {
+        s.v6only
+    } else {
+        appine_hal::net::getsockopt(s.fd, IPPROTO_IPV6, IPV6_V6ONLY, 4)
+            .is_ok_and(|v| v.get(..4).is_some_and(|b| b != [0; 4]))
+    }
 }
 
 /// Whether `addr` is in the forwarder's `127.254.0.0/16` outside-client block (IPv4 or

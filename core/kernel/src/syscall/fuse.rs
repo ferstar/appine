@@ -251,22 +251,17 @@ pub(super) fn make(
     name: &[u8],
     what: Make<'_>,
 ) -> Result<FuseId, Errno> {
-    let kind = match what {
-        Make::Node(mode, _) => mode & mode::S_IFMT,
-        Make::Dir(_) => mode::S_IFDIR,
-        Make::Symlink(_) => mode::S_IFLNK,
-        Make::Link(_) => 0,
-    };
-    let id = make_node(cx, vfs, dir, name, what)?;
-    // As the VFS reports creations on any filesystem: a link first changes the file's link count
-    if kind == 0 {
-        inotify::path_event(cx.kr(), fuse::key(id), None, inotify::IN_ATTRIB);
-    }
-    let isdir = if kind == mode::S_IFDIR {
+    let is_link = matches!(what, Make::Link(_));
+    let isdir = if matches!(what, Make::Dir(_)) {
         inotify::IN_ISDIR
     } else {
         0
     };
+    let id = make_node(cx, vfs, dir, name, what)?;
+    // As the VFS reports creations on any filesystem: a link first changes the file's link count
+    if is_link {
+        inotify::path_event(cx.kr(), fuse::key(id), None, inotify::IN_ATTRIB);
+    }
     inotify::dir_event(cx.kr(), fuse::key(dir), name, inotify::IN_CREATE | isdir, 0);
     Ok(id)
 }
@@ -487,37 +482,6 @@ pub(super) fn setattr(
 
 // ---- Reading and writing ----
 
-/// Takes the position of open file `file` for a read or write without an offset, as
-/// [`super::fs`]'s unlocked I/O does (Linux's `f_pos_lock`): waits while another one is in
-/// progress, unless `held` says the caller already holds it.
-fn take_pos(
-    cx: &mut Cx<'_>,
-    file: &FileRef,
-    offset: Option<u64>,
-    held: bool,
-) -> Result<u64, Errno> {
-    if let Some(off) = offset {
-        return Ok(off);
-    }
-    if !held {
-        super::fs::take_pos(cx, file)?;
-    }
-    Ok(file.borrow().pos)
-}
-
-/// Gives the position back after [`take_pos`], advanced past what was transferred.
-fn put_pos(file: &FileRef, offset: Option<u64>, held: bool, start: u64, r: &Result<usize, Errno>) {
-    if offset.is_some() {
-        return;
-    }
-    if let Ok(n) = r {
-        file.borrow_mut().pos = start + *n as u64;
-    }
-    if !held {
-        super::fs::release_pos(file);
-    }
-}
-
 /// read(2) and its relatives on an open FUSE file: `FUSE_READ` from the position (0 for a
 /// stream). `pos_held` is true when the caller already holds `file`'s `pos_busy`.
 pub(super) fn read(
@@ -529,13 +493,16 @@ pub(super) fn read(
     pos_held: bool,
 ) -> Result<usize, Errno> {
     let offset = if io.stream { Some(0) } else { offset };
-    let start = take_pos(cx, file, offset, pos_held)?;
-    let r = fuse::read(cx, io.handle(), start, buf.len()).map(|data| {
+    let _pos = super::fs::PosGuard::lock_if(cx, file, offset.is_none() && !pos_held)?;
+    let start = offset.unwrap_or_else(|| file.borrow().pos);
+    let n = fuse::read(cx, io.handle(), start, buf.len()).map(|data| {
         buf[..data.len()].copy_from_slice(&data);
         data.len()
-    });
-    put_pos(file, offset, pos_held, start, &r);
-    r
+    })?;
+    if offset.is_none() {
+        file.borrow_mut().pos = start + n as u64;
+    }
+    Ok(n)
 }
 
 /// write(2) and its relatives on an open FUSE file: `FUSE_WRITE` at the position, or with
@@ -554,13 +521,11 @@ pub(super) fn write(
     // As fcntl may have changed it since the open, or a per-request flag (RWF_APPEND) asked for it
     let append = append || file.borrow().flags & oflags::O_APPEND != 0;
     let offset = if io.stream { Some(0) } else { offset };
-    let start = take_pos(cx, file, offset, pos_held)?;
+    let _pos = super::fs::PosGuard::lock_if(cx, file, offset.is_none() && !pos_held)?;
+    let start = offset.unwrap_or_else(|| file.borrow().pos);
     let vfs = cx.vfs()?;
     // Appends to one node go one at a time from asking for the size to writing there
-    let appending = append
-        && take_append(cx, &vfs, io.id).inspect_err(|e| {
-            put_pos(file, offset, pos_held, start, &Err(*e));
-        })?;
+    let appending = append && take_append(cx, &vfs, io.id)?;
     let r = (|| {
         let at = if append {
             fuse::getattr(cx, &vfs, io.id, Some(io.fh))?.size
@@ -579,16 +544,11 @@ pub(super) fn write(
         }
         crate::kernel::request_wake_locks();
     }
-    match r {
-        Ok((n, at)) => {
-            put_pos(file, offset, pos_held, at, &Ok(n));
-            Ok(n)
-        }
-        Err(e) => {
-            put_pos(file, offset, pos_held, start, &Err(e));
-            Err(e)
-        }
+    let (n, at) = r?;
+    if offset.is_none() {
+        file.borrow_mut().pos = at + n as u64;
     }
+    Ok(n)
 }
 
 /// Takes node `id` for an `O_APPEND` write, waiting while another one has it (on the lock

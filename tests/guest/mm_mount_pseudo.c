@@ -1,5 +1,5 @@
 /*
- * Regression tests for Package 4B (mount, procfs, sysctl, cgroup, aio-procfs, mm, cow, oom, exec):
+ * Regression tests for mount, procfs, sysctl, cgroup, AIO, mm, CoW, OOM and exec:
  *  1. mount_setattr enforces caller's-namespace check on child mounts of an open_tree anon clone
  *     (exempting only the parentless anon root);
  *  2. move_mount attaching an open_tree clone releases its max_mnt_namespaces count immediately
@@ -53,6 +53,13 @@
             fprintf(stderr, " (errno %d: %s)\n", errno, strerror(errno));                          \
             exit(1);                                                                               \
         }                                                                                          \
+    } while (0)
+
+#define CHECK_ERR(expr, want, ...)                                                                 \
+    do {                                                                                           \
+        errno = 0;                                                                                 \
+        long _r = (long)(expr);                                                                    \
+        CHECK(_r < 0 && errno == (want), __VA_ARGS__);                                             \
     } while (0)
 
 #ifndef MNT_EXPIRE
@@ -161,16 +168,21 @@ static void write_str(const char *path, const char *s)
     close(fd);
 }
 
+static void write_all(int fd, const void *buf, size_t len, const char *label)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, (const uint8_t *)buf + off, len - off);
+        CHECK(n > 0, "write %s", label);
+        off += (size_t)n;
+    }
+}
+
 static void write_file_bytes(const char *path, const void *buf, size_t len, mode_t mode)
 {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
     CHECK(fd >= 0, "open %s", path);
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, (const uint8_t *)buf + off, len - off);
-        CHECK(n > 0, "write %s", path);
-        off += (size_t)n;
-    }
+    write_all(fd, buf, len, path);
     close(fd);
 }
 
@@ -204,6 +216,20 @@ static void wait_ok(pid_t pid, const char *label)
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "%s failed (status=0x%x)", label, st);
 }
 
+static void wait_leader_zombie(pid_t pid)
+{
+    char stat_path[64], buf[4096];
+    snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+    for (int i = 0; i < 200; i++) {
+        read_str(stat_path, buf, sizeof(buf));
+        char *rp = strrchr(buf, ')');
+        if (rp && rp[1] == ' ' && rp[2] == 'Z')
+            return;
+        usleep(5000);
+    }
+    CHECK(0, "leader %d did not become zombie", pid);
+}
+
 static void copy_file(const char *src, const char *dst, mode_t mode)
 {
     int in = open(src, O_RDONLY);
@@ -216,12 +242,7 @@ static void copy_file(const char *src, const char *dst, mode_t mode)
         CHECK(n >= 0, "read %s", src);
         if (n == 0)
             break;
-        ssize_t off = 0;
-        while (off < n) {
-            ssize_t w = write(out, buf + off, (size_t)(n - off));
-            CHECK(w > 0, "write %s", dst);
-            off += w;
-        }
+        write_all(out, buf, (size_t)n, dst);
     }
     close(in);
     close(out);
@@ -250,16 +271,13 @@ static void test_mount_setattr_anon_child(void)
           "mount_setattr on anon root must succeed");
 
     /* Child mount inside the anonymous namespace is NOT exempt -> EINVAL */
-    errno = 0;
-    CHECK(syscall(SYS_mount_setattr, tfd, "sub", 0, &ma, sizeof(ma)) < 0 && errno == EINVAL,
-          "mount_setattr on anon child by path must be EINVAL");
+    CHECK_ERR(syscall(SYS_mount_setattr, tfd, "sub", 0, &ma, sizeof(ma)), EINVAL,
+              "mount_setattr on anon child by path must be EINVAL");
 
     int subfd = openat(tfd, "sub", O_PATH | O_CLOEXEC);
     CHECK(subfd >= 0, "openat sub inside anon clone");
-    errno = 0;
-    CHECK(syscall(SYS_mount_setattr, subfd, "", AT_EMPTY_PATH, &ma, sizeof(ma)) < 0 &&
-              errno == EINVAL,
-          "mount_setattr on anon child fd must be EINVAL");
+    CHECK_ERR(syscall(SYS_mount_setattr, subfd, "", AT_EMPTY_PATH, &ma, sizeof(ma)), EINVAL,
+              "mount_setattr on anon child fd must be EINVAL");
 
     close(subfd);
     close(tfd);
@@ -289,10 +307,9 @@ static void test_open_tree_attach_releases_mnt_ns_count(void)
                                 OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
         CHECK(tfd1 >= 0, "open_tree #1");
 
-        errno = 0;
-        long r = syscall(SYS_open_tree, AT_FDCWD, "/tmp/ot_src",
-                         OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
-        CHECK(r < 0 && errno == ENOSPC, "open_tree #2 while #1 unattached must be ENOSPC");
+        CHECK_ERR(syscall(SYS_open_tree, AT_FDCWD, "/tmp/ot_src",
+                          OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC),
+                  ENOSPC, "open_tree #2 while #1 unattached must be ENOSPC");
 
         /* Attach tfd1 while keeping tfd1 open: anonymous ns count must be released immediately */
         CHECK(syscall(SYS_move_mount, tfd1, "", AT_FDCWD, "/tmp/ot_dst",
@@ -322,22 +339,19 @@ static void test_mnt_expire_cleared_on_access(void)
     write_file_bytes("/tmp/exp_mp/f", "hi", 2, 0644);
 
     /* First MNT_EXPIRE marks the mount and returns EAGAIN */
-    errno = 0;
-    CHECK(umount2("/tmp/exp_mp", MNT_EXPIRE) < 0 && errno == EAGAIN,
-          "first MNT_EXPIRE must return EAGAIN");
+    CHECK_ERR(umount2("/tmp/exp_mp", MNT_EXPIRE), EAGAIN,
+              "first MNT_EXPIRE must return EAGAIN");
 
     /* Accessing a file inside the mount clears the MNT_EXPIRE mark */
     struct stat st;
     CHECK(stat("/tmp/exp_mp/f", &st) == 0, "stat file inside mount");
-    errno = 0;
-    CHECK(umount2("/tmp/exp_mp", MNT_EXPIRE) < 0 && errno == EAGAIN,
-          "MNT_EXPIRE after file access must return EAGAIN again");
+    CHECK_ERR(umount2("/tmp/exp_mp", MNT_EXPIRE), EAGAIN,
+              "MNT_EXPIRE after file access must return EAGAIN again");
 
     /* Accessing the mount root itself also clears the mark */
     CHECK(stat("/tmp/exp_mp", &st) == 0, "stat mount root");
-    errno = 0;
-    CHECK(umount2("/tmp/exp_mp", MNT_EXPIRE) < 0 && errno == EAGAIN,
-          "MNT_EXPIRE after root access must return EAGAIN again");
+    CHECK_ERR(umount2("/tmp/exp_mp", MNT_EXPIRE), EAGAIN,
+              "MNT_EXPIRE after root access must return EAGAIN again");
 
     /* Immediate second MNT_EXPIRE with no intervening access unmounts */
     CHECK(umount2("/tmp/exp_mp", MNT_EXPIRE) == 0, "second consecutive MNT_EXPIRE must succeed");
@@ -360,19 +374,15 @@ static void test_move_mount_set_group(void)
     CHECK(mount(NULL, "/tmp/sg_other", NULL, MS_PRIVATE, NULL) == 0, "make sg_other private");
 
     /* Source is private -> EINVAL */
-    errno = 0;
-    CHECK(syscall(SYS_move_mount, AT_FDCWD, "/tmp/sg_src", AT_FDCWD, "/tmp/sg_dst",
-                  MOVE_MOUNT_SET_GROUP) < 0 &&
-              errno == EINVAL,
-          "SET_GROUP from private source must be EINVAL");
+    CHECK_ERR(syscall(SYS_move_mount, AT_FDCWD, "/tmp/sg_src", AT_FDCWD, "/tmp/sg_dst",
+                      MOVE_MOUNT_SET_GROUP),
+              EINVAL, "SET_GROUP from private source must be EINVAL");
 
     /* Make source shared; different superblock must still fail with EINVAL */
     CHECK(mount(NULL, "/tmp/sg_src", NULL, MS_SHARED, NULL) == 0, "make sg_src shared");
-    errno = 0;
-    CHECK(syscall(SYS_move_mount, AT_FDCWD, "/tmp/sg_src", AT_FDCWD, "/tmp/sg_other",
-                  MOVE_MOUNT_SET_GROUP) < 0 &&
-              errno == EINVAL,
-          "SET_GROUP across different superblocks must be EINVAL");
+    CHECK_ERR(syscall(SYS_move_mount, AT_FDCWD, "/tmp/sg_src", AT_FDCWD, "/tmp/sg_other",
+                      MOVE_MOUNT_SET_GROUP),
+              EINVAL, "SET_GROUP across different superblocks must be EINVAL");
 
     /* Join sg_dst to sg_src's peer group */
     CHECK(syscall(SYS_move_mount, AT_FDCWD, "/tmp/sg_src", AT_FDCWD, "/tmp/sg_dst",
@@ -380,11 +390,9 @@ static void test_move_mount_set_group(void)
           "SET_GROUP must succeed");
 
     /* Target is no longer private -> EINVAL */
-    errno = 0;
-    CHECK(syscall(SYS_move_mount, AT_FDCWD, "/tmp/sg_src", AT_FDCWD, "/tmp/sg_dst",
-                  MOVE_MOUNT_SET_GROUP) < 0 &&
-              errno == EINVAL,
-          "SET_GROUP on already-shared target must be EINVAL");
+    CHECK_ERR(syscall(SYS_move_mount, AT_FDCWD, "/tmp/sg_src", AT_FDCWD, "/tmp/sg_dst",
+                      MOVE_MOUNT_SET_GROUP),
+              EINVAL, "SET_GROUP on already-shared target must be EINVAL");
 
     /* Verify mount propagation from sg_src/sub to sg_dst/sub */
     CHECK(mount("tmpfs", "/tmp/sg_src/sub", "tmpfs", 0, "size=64k") == 0, "mount sg_src/sub");
@@ -392,9 +400,8 @@ static void test_move_mount_set_group(void)
     struct stat st;
     CHECK(stat("/tmp/sg_dst/sub/probe", &st) == 0, "submount must propagate to sg_dst/sub");
     CHECK(umount2("/tmp/sg_src/sub", 0) == 0, "umount sg_src/sub");
-    errno = 0;
-    CHECK(stat("/tmp/sg_dst/sub/probe", &st) < 0 && errno == ENOENT,
-          "unmount must propagate to sg_dst/sub");
+    CHECK_ERR(stat("/tmp/sg_dst/sub/probe", &st), ENOENT,
+              "unmount must propagate to sg_dst/sub");
 
     CHECK(umount2("/tmp/sg_other", 0) == 0, "umount sg_other");
     CHECK(umount2("/tmp/sg_dst", 0) == 0, "umount sg_dst");
@@ -460,18 +467,9 @@ static void test_proc_pid_net_zombie_leader(void)
     CHECK(read(ready[0], &c, 1) == 1, "wait worker ready");
     close(ready[0]);
 
-    /* Wait until /proc/<pid>/stat reports leader state 'Z' */
-    char stat_path[64], buf[4096];
-    snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
-    for (int i = 0; i < 200; i++) {
-        read_str(stat_path, buf, sizeof(buf));
-        char *rp = strrchr(buf, ')');
-        if (rp && rp[1] == ' ' && rp[2] == 'Z')
-            break;
-        usleep(5000);
-    }
+    wait_leader_zombie(pid);
 
-    char udp_path[64], snmp_path[64];
+    char udp_path[64], snmp_path[64], buf[4096];
     snprintf(udp_path, sizeof(udp_path), "/proc/%d/net/udp", pid);
     snprintf(snmp_path, sizeof(snmp_path), "/proc/%d/net/snmp", pid);
 
@@ -516,6 +514,19 @@ static void test_proc_net_snmp_forwarding(void)
 /* 7. /proc/sys/net and IPC sysctls pin namespace at open/lookup time */
 static void test_sysctl_namespace_pinning(void)
 {
+    static const struct {
+        const char *path;
+        const char *val_a;
+        const char *val_b;
+        const char *val_a2;
+    } cases[] = {
+        {"/proc/sys/net/ipv4/ip_forward", "1\n", "0\n", "0\n"},
+        {"/proc/sys/net/core/somaxconn", "8192\n", "4096\n", "9000\n"},
+        {"/proc/sys/kernel/shmmax", "12345678\n", "87654321\n", "22222222\n"},
+        {"/proc/sys/fs/mqueue/queues_max", "512\n", "128\n", "768\n"},
+    };
+    const size_t ncases = sizeof(cases) / sizeof(cases[0]);
+
     pid_t pid = fork();
     CHECK(pid >= 0, "fork sysctl pin");
     if (pid == 0) {
@@ -524,58 +535,38 @@ static void test_sysctl_namespace_pinning(void)
         CHECK(stat("/proc/sys/fs/mqueue", &st) == 0 && S_ISDIR(st.st_mode),
               "/proc/sys/fs/mqueue must remain a directory");
 
-        write_str("/proc/sys/net/ipv4/ip_forward", "1\n");
-        write_str("/proc/sys/net/core/somaxconn", "8192\n");
-        write_str("/proc/sys/kernel/shmmax", "12345678\n");
-        write_str("/proc/sys/fs/mqueue/queues_max", "512\n");
-
-        int fd_fwd = open("/proc/sys/net/ipv4/ip_forward", O_RDWR);
-        int fd_soma = open("/proc/sys/net/core/somaxconn", O_RDWR);
-        int fd_shm = open("/proc/sys/kernel/shmmax", O_RDWR);
-        int fd_mq = open("/proc/sys/fs/mqueue/queues_max", O_RDWR);
-        CHECK(fd_fwd >= 0 && fd_soma >= 0 && fd_shm >= 0 && fd_mq >= 0, "open sysctls in ns A");
+        int fds[4];
+        for (size_t i = 0; i < ncases; i++) {
+            write_str(cases[i].path, cases[i].val_a);
+            fds[i] = open(cases[i].path, O_RDWR);
+            CHECK(fds[i] >= 0, "open %s in ns A", cases[i].path);
+        }
 
         /* Switch into a new netns and ipcns with distinct values */
         CHECK(unshare(CLONE_NEWNET | CLONE_NEWIPC) == 0, "unshare ns B");
-        write_str("/proc/sys/net/ipv4/ip_forward", "0\n");
-        write_str("/proc/sys/net/core/somaxconn", "4096\n");
-        write_str("/proc/sys/kernel/shmmax", "87654321\n");
-        write_str("/proc/sys/fs/mqueue/queues_max", "128\n");
+        for (size_t i = 0; i < ncases; i++)
+            write_str(cases[i].path, cases[i].val_b);
 
         char buf[128];
-        pread_str(fd_fwd, buf, sizeof(buf));
-        CHECK(strcmp(buf, "1\n") == 0, "pinned ip_forward expected 1, got %s", buf);
-        pread_str(fd_soma, buf, sizeof(buf));
-        CHECK(strcmp(buf, "8192\n") == 0, "pinned somaxconn expected 8192, got %s", buf);
-        pread_str(fd_shm, buf, sizeof(buf));
-        CHECK(strcmp(buf, "12345678\n") == 0, "pinned shmmax expected 12345678, got %s", buf);
-        pread_str(fd_mq, buf, sizeof(buf));
-        CHECK(strcmp(buf, "512\n") == 0, "pinned queues_max expected 512, got %s", buf);
+        for (size_t i = 0; i < ncases; i++) {
+            pread_str(fds[i], buf, sizeof(buf));
+            CHECK(strcmp(buf, cases[i].val_a) == 0, "pinned %s expected %s, got %s",
+                  cases[i].path, cases[i].val_a, buf);
 
-        /* Writes through pinned fds update ns A without touching ns B */
-        CHECK(pwrite(fd_fwd, "0\n", 2, 0) == 2, "pwrite pinned ip_forward");
-        CHECK(pwrite(fd_soma, "9000\n", 5, 0) == 5, "pwrite pinned somaxconn");
-        CHECK(pwrite(fd_shm, "22222222\n", 9, 0) == 9, "pwrite pinned shmmax");
-        CHECK(pwrite(fd_mq, "768\n", 4, 0) == 4, "pwrite pinned queues_max");
+            /* Writes through pinned fds update ns A without touching ns B */
+            size_t len = strlen(cases[i].val_a2);
+            CHECK(pwrite(fds[i], cases[i].val_a2, len, 0) == (ssize_t)len,
+                  "pwrite pinned %s", cases[i].path);
 
-        read_str("/proc/sys/net/core/somaxconn", buf, sizeof(buf));
-        CHECK(strcmp(buf, "4096\n") == 0, "ns B somaxconn must remain 4096, got %s", buf);
-        read_str("/proc/sys/kernel/shmmax", buf, sizeof(buf));
-        CHECK(strcmp(buf, "87654321\n") == 0, "ns B shmmax must remain 87654321, got %s", buf);
-        read_str("/proc/sys/fs/mqueue/queues_max", buf, sizeof(buf));
-        CHECK(strcmp(buf, "128\n") == 0, "ns B queues_max must remain 128, got %s", buf);
+            read_str(cases[i].path, buf, sizeof(buf));
+            CHECK(strcmp(buf, cases[i].val_b) == 0, "ns B %s must remain %s, got %s",
+                  cases[i].path, cases[i].val_b, buf);
 
-        pread_str(fd_soma, buf, sizeof(buf));
-        CHECK(strcmp(buf, "9000\n") == 0, "ns A somaxconn must be 9000, got %s", buf);
-        pread_str(fd_shm, buf, sizeof(buf));
-        CHECK(strcmp(buf, "22222222\n") == 0, "ns A shmmax must be 22222222, got %s", buf);
-        pread_str(fd_mq, buf, sizeof(buf));
-        CHECK(strcmp(buf, "768\n") == 0, "ns A queues_max must be 768, got %s", buf);
-
-        close(fd_fwd);
-        close(fd_soma);
-        close(fd_shm);
-        close(fd_mq);
+            pread_str(fds[i], buf, sizeof(buf));
+            CHECK(strcmp(buf, cases[i].val_a2) == 0, "ns A %s must be %s, got %s",
+                  cases[i].path, cases[i].val_a2, buf);
+            close(fds[i]);
+        }
         _exit(0);
     }
     wait_ok(pid, "sysctl namespace pinning");
@@ -597,12 +588,10 @@ static void test_cgroup_enodev(void)
 
     /* Disable memory controller: writes and offset-0 reads on held fd must return ENODEV */
     write_str("/sys/fs/cgroup/cgroup.subtree_control", "-memory\n");
-    errno = 0;
-    CHECK(pwrite(mfd, "4096\n", 5, 0) < 0 && errno == ENODEV,
-          "write to disabled memory.max must return ENODEV");
-    errno = 0;
-    CHECK(pread(mfd, buf, sizeof(buf), 0) < 0 && errno == ENODEV,
-          "read from disabled memory.max must return ENODEV");
+    CHECK_ERR(pwrite(mfd, "4096\n", 5, 0), ENODEV,
+              "write to disabled memory.max must return ENODEV");
+    CHECK_ERR(pread(mfd, buf, sizeof(buf), 0), ENODEV,
+              "read from disabled memory.max must return ENODEV");
 
     /* Re-enable memory controller: value must still be "max" (failed write stored nothing) */
     write_str("/sys/fs/cgroup/cgroup.subtree_control", "+memory\n");
@@ -611,12 +600,10 @@ static void test_cgroup_enodev(void)
 
     /* Remove cgroup: offset-0 read and write on held pfd must return ENODEV */
     CHECK(rmdir("/sys/fs/cgroup/cg_test") == 0, "rmdir cg_test");
-    errno = 0;
-    CHECK(pread(pfd, buf, sizeof(buf), 0) < 0 && errno == ENODEV,
-          "read from removed cgroup file must return ENODEV");
-    errno = 0;
-    CHECK(pwrite(pfd, "10\n", 3, 0) < 0 && errno == ENODEV,
-          "write to removed cgroup file must return ENODEV");
+    CHECK_ERR(pread(pfd, buf, sizeof(buf), 0), ENODEV,
+              "read from removed cgroup file must return ENODEV");
+    CHECK_ERR(pwrite(pfd, "10\n", 3, 0), ENODEV,
+              "write to removed cgroup file must return ENODEV");
 
     close(mfd);
     close(pfd);
@@ -624,6 +611,20 @@ static void test_cgroup_enodev(void)
 }
 
 /* 9. Native AIO refuses procfs files without read_iter/write_iter */
+static long aio_submit_one(unsigned long ctx, uint16_t op, int fd, void *buf, uint64_t nbytes,
+                           int64_t offset)
+{
+    struct k_iocb cb = {
+        .aio_lio_opcode = op,
+        .aio_fildes = (uint32_t)fd,
+        .aio_buf = (uint64_t)(uintptr_t)buf,
+        .aio_nbytes = nbytes,
+        .aio_offset = offset,
+    };
+    struct k_iocb *cbs[1] = {&cb};
+    return syscall(SYS_io_submit, ctx, 1L, cbs);
+}
+
 static void test_aio_procfs_has_iter(void)
 {
     unsigned long ctx = 0;
@@ -637,57 +638,24 @@ static void test_aio_procfs_has_iter(void)
 
     char buf[128];
     uint64_t dummy = 0x123456789abcdef0ULL;
-    struct k_iocb cb;
-    struct k_iocb *cbs[1] = {&cb};
+    int64_t dummy_off = (int64_t)(uintptr_t)&dummy;
 
-    /* /proc/self/mem PREAD -> EINVAL */
-    memset(&cb, 0, sizeof(cb));
-    cb.aio_lio_opcode = IOCB_CMD_PREAD;
-    cb.aio_fildes = (uint32_t)mem_fd;
-    cb.aio_buf = (uint64_t)(uintptr_t)buf;
-    cb.aio_nbytes = sizeof(dummy);
-    cb.aio_offset = (int64_t)(uintptr_t)&dummy;
-    errno = 0;
-    CHECK(syscall(SYS_io_submit, ctx, 1L, cbs) < 0 && errno == EINVAL,
-          "AIO PREAD on /proc/self/mem must be EINVAL");
+    CHECK_ERR(aio_submit_one(ctx, IOCB_CMD_PREAD, mem_fd, buf, sizeof(dummy), dummy_off), EINVAL,
+              "AIO PREAD on /proc/self/mem must be EINVAL");
+    CHECK_ERR(aio_submit_one(ctx, IOCB_CMD_PWRITE, mem_fd, buf, sizeof(dummy), dummy_off), EINVAL,
+              "AIO PWRITE on /proc/self/mem must be EINVAL");
+    CHECK_ERR(aio_submit_one(ctx, IOCB_CMD_PREAD, pm_fd, buf, 8, 0), EINVAL,
+              "AIO PREAD on /proc/self/pagemap must be EINVAL");
 
-    /* /proc/self/mem PWRITE -> EINVAL */
-    cb.aio_lio_opcode = IOCB_CMD_PWRITE;
-    errno = 0;
-    CHECK(syscall(SYS_io_submit, ctx, 1L, cbs) < 0 && errno == EINVAL,
-          "AIO PWRITE on /proc/self/mem must be EINVAL");
-
-    /* /proc/self/pagemap PREAD -> EINVAL */
-    memset(&cb, 0, sizeof(cb));
-    cb.aio_lio_opcode = IOCB_CMD_PREAD;
-    cb.aio_fildes = (uint32_t)pm_fd;
-    cb.aio_buf = (uint64_t)(uintptr_t)buf;
-    cb.aio_nbytes = 8;
-    cb.aio_offset = 0;
-    errno = 0;
-    CHECK(syscall(SYS_io_submit, ctx, 1L, cbs) < 0 && errno == EINVAL,
-          "AIO PREAD on /proc/self/pagemap must be EINVAL");
-
-    /* /proc/cpuinfo (seq_file) PREAD -> succeeds */
+    /* /proc/cpuinfo (seq_file) and /proc/sys/kernel/ostype (sysctl) PREAD succeed */
     struct k_io_event ev;
-    memset(&cb, 0, sizeof(cb));
-    cb.aio_lio_opcode = IOCB_CMD_PREAD;
-    cb.aio_fildes = (uint32_t)cpu_fd;
-    cb.aio_buf = (uint64_t)(uintptr_t)buf;
-    cb.aio_nbytes = sizeof(buf);
-    cb.aio_offset = 0;
-    CHECK(syscall(SYS_io_submit, ctx, 1L, cbs) == 1, "AIO PREAD on /proc/cpuinfo");
+    CHECK(aio_submit_one(ctx, IOCB_CMD_PREAD, cpu_fd, buf, sizeof(buf), 0) == 1,
+          "AIO PREAD on /proc/cpuinfo");
     CHECK(syscall(SYS_io_getevents, ctx, 1L, 1L, &ev, NULL) == 1 && ev.res > 0,
           "io_getevents /proc/cpuinfo");
 
-    /* /proc/sys/kernel/ostype (sysctl) PREAD -> succeeds */
-    memset(&cb, 0, sizeof(cb));
-    cb.aio_lio_opcode = IOCB_CMD_PREAD;
-    cb.aio_fildes = (uint32_t)os_fd;
-    cb.aio_buf = (uint64_t)(uintptr_t)buf;
-    cb.aio_nbytes = sizeof(buf);
-    cb.aio_offset = 0;
-    CHECK(syscall(SYS_io_submit, ctx, 1L, cbs) == 1, "AIO PREAD on /proc/sys/kernel/ostype");
+    CHECK(aio_submit_one(ctx, IOCB_CMD_PREAD, os_fd, buf, sizeof(buf), 0) == 1,
+          "AIO PREAD on /proc/sys/kernel/ostype");
     CHECK(syscall(SYS_io_getevents, ctx, 1L, 1L, &ev, NULL) == 1 && ev.res > 0,
           "io_getevents ostype");
 
@@ -711,6 +679,23 @@ static void fault_handler(int sig, siginfo_t *si, void *ucontext)
     siglongjmp(fault_jmp, 1);
 }
 
+static void expect_fault(volatile uint8_t *p, int write_op, int want_sig, int want_code,
+                         const char *label)
+{
+    fault_sig = 0;
+    fault_code = 0;
+    if (sigsetjmp(fault_jmp, 1) == 0) {
+        if (write_op)
+            *p = 1;
+        else
+            (void)*p;
+        CHECK(0, "%s must fault", label);
+    }
+    CHECK(fault_sig == want_sig && fault_code == want_code,
+          "%s expected sig=%d code=%d, got sig=%d code=%d",
+          label, want_sig, want_code, fault_sig, fault_code);
+}
+
 static void test_past_eof_fault_permissions(void)
 {
     uint8_t page[4096];
@@ -729,40 +714,14 @@ static void test_past_eof_fault_permissions(void)
     /* PROT_NONE past EOF -> SIGSEGV / SEGV_ACCERR */
     volatile uint8_t *p_none = mmap(NULL, 8192, PROT_NONE, MAP_PRIVATE, fd, 0);
     CHECK(p_none != MAP_FAILED, "mmap PROT_NONE");
-    fault_sig = 0;
-    fault_code = 0;
-    if (sigsetjmp(fault_jmp, 1) == 0) {
-        (void)p_none[4096];
-        CHECK(0, "PROT_NONE past-EOF read must fault");
-    }
-    CHECK(fault_sig == SIGSEGV && fault_code == SEGV_ACCERR,
-          "PROT_NONE past-EOF read expected SIGSEGV/SEGV_ACCERR, got sig=%d code=%d",
-          fault_sig, fault_code);
+    expect_fault(&p_none[4096], 0, SIGSEGV, SEGV_ACCERR, "PROT_NONE past-EOF read");
     munmap((void *)p_none, 8192);
 
-    /* Write to PROT_READ past EOF -> SIGSEGV / SEGV_ACCERR */
+    /* PROT_READ past EOF: write -> SIGSEGV/SEGV_ACCERR, read -> SIGBUS/BUS_ADRERR */
     volatile uint8_t *p_ro = mmap(NULL, 8192, PROT_READ, MAP_PRIVATE, fd, 0);
     CHECK(p_ro != MAP_FAILED, "mmap PROT_READ");
-    fault_sig = 0;
-    fault_code = 0;
-    if (sigsetjmp(fault_jmp, 1) == 0) {
-        p_ro[4096] = 1;
-        CHECK(0, "PROT_READ past-EOF write must fault");
-    }
-    CHECK(fault_sig == SIGSEGV && fault_code == SEGV_ACCERR,
-          "PROT_READ past-EOF write expected SIGSEGV/SEGV_ACCERR, got sig=%d code=%d",
-          fault_sig, fault_code);
-
-    /* Permitted read of PROT_READ past EOF -> SIGBUS / BUS_ADRERR */
-    fault_sig = 0;
-    fault_code = 0;
-    if (sigsetjmp(fault_jmp, 1) == 0) {
-        (void)p_ro[4096];
-        CHECK(0, "PROT_READ past-EOF read must fault");
-    }
-    CHECK(fault_sig == SIGBUS && fault_code == BUS_ADRERR,
-          "PROT_READ past-EOF read expected SIGBUS/BUS_ADRERR, got sig=%d code=%d",
-          fault_sig, fault_code);
+    expect_fault(&p_ro[4096], 1, SIGSEGV, SEGV_ACCERR, "PROT_READ past-EOF write");
+    expect_fault(&p_ro[4096], 0, SIGBUS, BUS_ADRERR, "PROT_READ past-EOF read");
     munmap((void *)p_ro, 8192);
 
     CHECK(sigaction(SIGSEGV, &old_segv, NULL) == 0, "restore SIGSEGV");
@@ -810,9 +769,7 @@ static void test_mlock_semantics(void)
     CHECK(p != MAP_FAILED, "mmap 3 pages");
     CHECK(mprotect(p + 4096, 4096, PROT_NONE) == 0, "mprotect middle PROT_NONE");
 
-    errno = 0;
-    CHECK(mlock(p, 3 * 4096) < 0 && errno == ENOMEM,
-          "mlock over PROT_NONE must return ENOMEM");
+    CHECK_ERR(mlock(p, 3 * 4096), ENOMEM, "mlock over PROT_NONE must return ENOMEM");
     int lo0 = 0, lo1 = 0, lo2 = 0;
     long rss0 = read_smaps_kb(p, "Rss:", &lo0);
     long rss1 = read_smaps_kb(p + 4096, "Rss:", &lo1);
@@ -936,9 +893,8 @@ static void test_process_mrelease(void)
     int pfd = (int)syscall(SYS_pidfd_open, blocked, 0);
     CHECK(pfd >= 0, "pidfd_open blocked");
     CHECK(kill(blocked, SIGTERM) == 0, "send blocked SIGTERM");
-    errno = 0;
-    CHECK(syscall(SYS_process_mrelease, pfd, 0) < 0 && errno == EINVAL,
-          "process_mrelease with blocked SIGTERM must be EINVAL");
+    CHECK_ERR(syscall(SYS_process_mrelease, pfd, 0), EINVAL,
+              "process_mrelease with blocked SIGTERM must be EINVAL");
     CHECK(kill(blocked, SIGKILL) == 0, "kill blocked");
     int st = 0;
     CHECK(waitpid(blocked, &st, 0) == blocked, "wait blocked");
@@ -1009,16 +965,7 @@ static void test_process_mrelease(void)
     close(ready[0]);
     close(tid_pipe[0]);
 
-    /* Wait for leader to become zombie */
-    char stat_path[64], sbuf[512];
-    snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", zl);
-    for (int i = 0; i < 200; i++) {
-        read_str(stat_path, sbuf, sizeof(sbuf));
-        char *rp = strrchr(sbuf, ')');
-        if (rp && rp[1] == ' ' && rp[2] == 'Z')
-            break;
-        usleep(5000);
-    }
+    wait_leader_zombie(zl);
 
     /* Attach ptrace with PTRACE_O_TRACEEXIT to catch the last worker inside SYS_exit */
     CHECK(ptrace(PTRACE_ATTACH, wtid, 0, 0) == 0, "ptrace attach worker");
@@ -1035,9 +982,8 @@ static void test_process_mrelease(void)
 
     pfd = (int)syscall(SYS_pidfd_open, zl, 0);
     CHECK(pfd >= 0, "pidfd_open zombie-leader");
-    errno = 0;
-    CHECK(syscall(SYS_process_mrelease, pfd, 0) < 0 && errno == EINVAL,
-          "process_mrelease on zombie-leader thread group in exit(2) must be EINVAL");
+    CHECK_ERR(syscall(SYS_process_mrelease, pfd, 0), EINVAL,
+              "process_mrelease on zombie-leader thread group in exit(2) must be EINVAL");
 
     CHECK(ptrace(PTRACE_CONT, wtid, 0, 0) == 0, "ptrace release worker");
     CHECK(waitpid(zl, &st, 0) == zl, "reap zombie-leader");

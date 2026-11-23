@@ -793,50 +793,13 @@ impl NetlinkSocket {
             // always empty; single gets still validate ndmsg, family, ifindex and NDA_DST as
             // Linux's neigh_get does before answering ENOENT.
             RTM_GETNEIGH if dump => vec![done()],
-            RTM_GETNEIGH => {
-                const NDA_DST: u16 = 1;
-                const NTF_PROXY: u8 = 0x08;
-                const ENODEV: i32 = 19;
-                const EAFNOSUPPORT: i32 = 97;
-                let err = (|| -> Result<(), i32> {
-                    let ndm = req.get(16..28).ok_or(EINVAL)?;
-                    let ndm_family = i32::from(ndm[0]);
-                    let ndm_ifindex = i32::from_le_bytes(ndm[4..8].try_into().unwrap());
-                    let ndm_state = u16::from_le_bytes([ndm[8], ndm[9]]);
-                    let ndm_flags = ndm[10];
-                    let ndm_type = ndm[11];
-                    if ndm_state != 0 || ndm_type != 0 {
-                        return Err(EINVAL);
-                    }
-                    let attrs = crate::route::attrs(&req[28..]);
-                    let dst = attrs
-                        .iter()
-                        .find(|(t, _)| *t == NDA_DST)
-                        .map(|(_, d)| *d)
-                        .ok_or(EINVAL)?;
-                    let key_len = match ndm_family {
-                        AF_INET => 4,
-                        AF_INET6 => 16,
-                        _ => return Err(EAFNOSUPPORT),
-                    };
-                    if dst.len() != key_len {
-                        return Err(EINVAL);
-                    }
-                    if ndm_ifindex < 0 {
-                        return Err(ENODEV);
-                    }
-                    if ndm_ifindex == 0 {
-                        if ndm_flags & NTF_PROXY == 0 {
-                            return Err(EINVAL);
-                        }
-                    } else if !host.links().iter().any(|l| l.index() as i32 == ndm_ifindex) {
-                        return Err(ENODEV);
-                    }
-                    Err(ENOENT)
-                })()
-                .unwrap_err();
-                vec![ack_ext(req, err, self.pid, None, self.cap_ack)]
-            }
+            RTM_GETNEIGH => vec![ack_ext(
+                req,
+                check_getneigh(req, host),
+                self.pid,
+                None,
+                self.cap_ack,
+            )],
             // Unsupported requests: EOPNOTSUPP, after rtnetlink_rcv_msg's checks (a type it knows
             // that changes something needs CAP_NET_ADMIN over the namespace owner: EPERM).
             _ => {
@@ -854,27 +817,70 @@ impl NetlinkSocket {
 
     /// This socket's `sockaddr_nl`.
     pub fn sockaddr(&self) -> Vec<u8> {
-        let mut b = vec![0u8; 12];
-        b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
-        b[4..8].copy_from_slice(&self.pid.to_le_bytes());
         // nl_groups: the first 32 groups
-        b[8..12].copy_from_slice(&(self.groups.unwrap_or(0) as u32).to_le_bytes());
-        b
+        sockaddr_nl(self.pid, self.groups.unwrap_or(0) as u32)
     }
 
     /// The connected peer's `sockaddr_nl` (Linux's `netlink_getname` with `peer = 1`).
     pub fn peer_sockaddr(&self) -> Vec<u8> {
-        let mut b = vec![0u8; 12];
-        b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
-        b[4..8].copy_from_slice(&self.dst_pid.to_le_bytes());
-        let mask = if self.dst_group == 0 {
-            0u32
-        } else {
+        let mask = if (1..=32).contains(&self.dst_group) {
             1u32 << (self.dst_group - 1)
+        } else {
+            0
         };
-        b[8..12].copy_from_slice(&mask.to_le_bytes());
-        b
+        sockaddr_nl(self.dst_pid, mask)
     }
+}
+
+/// Validates a single (non-dump) `RTM_GETNEIGH` request as Linux's `neigh_get` does and returns
+/// the errno to report (`ENOENT` when valid, since the neighbour table is always empty).
+fn check_getneigh(req: &[u8], host: &dyn Host) -> i32 {
+    const NDA_DST: u16 = 1;
+    const NTF_PROXY: u8 = 0x08;
+    const ENODEV: i32 = 19;
+    const EAFNOSUPPORT: i32 = 97;
+    let Some(ndm) = req.get(16..28) else {
+        return EINVAL;
+    };
+    let family = i32::from(ndm[0]);
+    let ifindex = i32::from_le_bytes(ndm[4..8].try_into().unwrap());
+    let state = u16::from_le_bytes([ndm[8], ndm[9]]);
+    let flags = ndm[10];
+    let ty = ndm[11];
+    if state != 0 || ty != 0 {
+        return EINVAL;
+    }
+    let attrs = crate::route::attrs(&req[28..]);
+    let Some(dst) = attrs.iter().find(|(t, _)| *t == NDA_DST).map(|(_, d)| *d) else {
+        return EINVAL;
+    };
+    let key_len = match family {
+        AF_INET => 4,
+        AF_INET6 => 16,
+        _ => return EAFNOSUPPORT,
+    };
+    if dst.len() != key_len {
+        return EINVAL;
+    }
+    if ifindex < 0 {
+        return ENODEV;
+    }
+    if ifindex == 0 {
+        if flags & NTF_PROXY == 0 {
+            return EINVAL;
+        }
+    } else if !host.links().iter().any(|l| l.index() as i32 == ifindex) {
+        return ENODEV;
+    }
+    ENOENT
+}
+
+fn sockaddr_nl(pid: u32, groups: u32) -> Vec<u8> {
+    let mut b = vec![0u8; 12];
+    b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
+    b[4..8].copy_from_slice(&pid.to_le_bytes());
+    b[8..12].copy_from_slice(&groups.to_le_bytes());
+    b
 }
 
 /// Packs a dump's messages into datagrams of at most `DUMP_CHUNK` bytes, as Linux's `netlink_dump`
@@ -2788,44 +2794,30 @@ mod tests {
             assert_eq!(u16::from_le_bytes([m[4], m[5]]), NLMSG_ERROR);
             -i32::from_le_bytes(m[16..20].try_into().unwrap())
         };
-        // Short body -> EINVAL
+        let ndm = |fam: u8, ifindex: i32, state: u16, dst: Option<&[u8]>| {
+            let mut b = vec![0u8; 12];
+            b[0] = fam;
+            b[4..8].copy_from_slice(&ifindex.to_le_bytes());
+            b[8..10].copy_from_slice(&state.to_le_bytes());
+            if let Some(d) = dst {
+                attr(&mut b, 1 /* NDA_DST */, d);
+            }
+            b
+        };
+        let lo = Some(&[127, 0, 0, 1][..]);
         assert_eq!(getneigh_err(&mut s, &[0; 4]), EINVAL);
-        // Non-zero ndm_state -> EINVAL
-        let mut ndm = vec![0u8; 12];
-        ndm[0] = AF_INET as u8;
-        ndm[4..8].copy_from_slice(&1i32.to_le_bytes());
-        ndm[8..10].copy_from_slice(&1u16.to_le_bytes());
-        attr(&mut ndm, 1 /* NDA_DST */, &[127, 0, 0, 1]);
-        assert_eq!(getneigh_err(&mut s, &ndm), EINVAL);
-        // Missing NDA_DST -> EINVAL
-        let mut ndm = vec![0u8; 12];
-        ndm[0] = AF_INET as u8;
-        ndm[4..8].copy_from_slice(&1i32.to_le_bytes());
-        assert_eq!(getneigh_err(&mut s, &ndm), EINVAL);
-        // Unknown family -> EAFNOSUPPORT (97)
-        let mut bad_fam = vec![0u8; 12];
-        bad_fam[0] = 99;
-        bad_fam[4..8].copy_from_slice(&1i32.to_le_bytes());
-        attr(&mut bad_fam, 1, &[127, 0, 0, 1]);
-        assert_eq!(getneigh_err(&mut s, &bad_fam), 97);
-        // Wrong NDA_DST size -> EINVAL
-        let mut bad_len = vec![0u8; 12];
-        bad_len[0] = AF_INET as u8;
-        bad_len[4..8].copy_from_slice(&1i32.to_le_bytes());
-        attr(&mut bad_len, 1, &[127, 0]);
-        assert_eq!(getneigh_err(&mut s, &bad_len), EINVAL);
-        // Unknown ifindex -> ENODEV (19)
-        let mut bad_if = vec![0u8; 12];
-        bad_if[0] = AF_INET as u8;
-        bad_if[4..8].copy_from_slice(&99i32.to_le_bytes());
-        attr(&mut bad_if, 1, &[127, 0, 0, 1]);
-        assert_eq!(getneigh_err(&mut s, &bad_if), 19);
-        // Valid single RTM_GETNEIGH -> ENOENT
-        let mut ok = vec![0u8; 12];
-        ok[0] = AF_INET as u8;
-        ok[4..8].copy_from_slice(&1i32.to_le_bytes());
-        attr(&mut ok, 1, &[127, 0, 0, 1]);
-        assert_eq!(getneigh_err(&mut s, &ok), ENOENT);
+        assert_eq!(getneigh_err(&mut s, &ndm(AF_INET as u8, 1, 1, lo)), EINVAL);
+        assert_eq!(
+            getneigh_err(&mut s, &ndm(AF_INET as u8, 1, 0, None)),
+            EINVAL
+        );
+        assert_eq!(getneigh_err(&mut s, &ndm(99, 1, 0, lo)), 97); // EAFNOSUPPORT
+        assert_eq!(
+            getneigh_err(&mut s, &ndm(AF_INET as u8, 1, 0, Some(&[127, 0]))),
+            EINVAL
+        );
+        assert_eq!(getneigh_err(&mut s, &ndm(AF_INET as u8, 99, 0, lo)), 19); // ENODEV
+        assert_eq!(getneigh_err(&mut s, &ndm(AF_INET as u8, 1, 0, lo)), ENOENT);
     }
 }
 

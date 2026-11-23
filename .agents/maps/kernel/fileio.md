@@ -219,7 +219,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - `kernel/inotify`: `host_unshared`; `kernel/aio` and `kernel/loop`: `IoFlags`, `read_file`/
   `read_file_with`, `write_file`/`write_file_with`, `read_bytes`, `write_bytes`, `write_sync`,
   `vectored`/`vectored_with`, `fsync`, `has_fsync`, `seekable`, `append_offset`; `kernel/fuse`:
-  `check_fsize`, `fsize_room`, `take_pos`/`release_pos`; core dumps (`write_at`).
+  `check_fsize`, `fsize_room`, `PosGuard`; core dumps (`write_at`).
 
 ### Outbound
 

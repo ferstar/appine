@@ -1079,11 +1079,14 @@ pub(super) fn sys_move_mount(
 fn set_group(cx: &mut Cx<'_>, src: &Node, target: &Node) -> SysResult {
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
-    let from_id = vfs.mount_root(src).ok_or(Errno::EINVAL)?;
-    let to_id = vfs.mount_root(target).ok_or(Errno::EINVAL)?;
-    let (Some(from), Some(to)) = (vfs.mount(from_id), vfs.mount(to_id)) else {
-        return Err(Errno::EINVAL);
-    };
+    let from = vfs
+        .mount_root(src)
+        .and_then(|id| vfs.mount(id))
+        .ok_or(Errno::EINVAL)?;
+    let to = vfs
+        .mount_root(target)
+        .and_then(|id| vfs.mount(id))
+        .ok_or(Errno::EINVAL)?;
     let (Some(from_ns), Some(to_ns)) = (vfs.find_ns(from.ns), vfs.find_ns(to.ns)) else {
         return Err(Errno::EINVAL);
     };
@@ -1113,7 +1116,7 @@ fn set_group(cx: &mut Cx<'_>, src: &Node, target: &Node) -> SysResult {
     } else {
         from.prop.of_slave_copy()
     };
-    vfs.update_mount(to_id, |m| m.prop = prop);
+    vfs.update_mount(to.id, |m| m.prop = prop);
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -1205,12 +1208,7 @@ pub(super) fn mount_setattr(
     let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
     // In the caller's namespace, or the root of a tree copied by open_tree and not yet attached
     // (Linux 6.1's do_mount_setattr: exempt only a mount without a parent in an anonymous ns)
-    let anon = vfs
-        .mount_ns(id)
-        .and_then(|ns| vfs.find_ns(ns))
-        .is_some_and(|ns| ns.anon)
-        && vfs.mount(id).is_some_and(|m| m.point.is_none());
-    if !anon {
+    if anon_root_ns(&vfs, id).is_none() {
         check_mnt(cx, &vfs, id)?;
     }
     let bit = |a: u64, m: u64| if set & a != 0 { m } else { 0 };
@@ -1793,12 +1791,8 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     // The root of a mount tree is also mounted (on the invisible rootfs); when it is moved the
     // target is always inside it, which is the ELOOP below
     let id = vfs.mount_root(src).ok_or(Errno::EINVAL)?;
-    let anon = vfs
-        .mount_ns(id)
-        .and_then(|ns| vfs.find_ns(ns))
-        .is_some_and(|ns| ns.anon)
-        && vfs.mount(id).is_some_and(|m| m.point.is_none());
-    if !anon {
+    let anon_ns = anon_root_ns(&vfs, id);
+    if anon_ns.is_none() {
         check_mnt(cx, &vfs, id)?;
     }
     check_mnt(cx, &vfs, target.mnt())?;
@@ -1812,7 +1806,7 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     // A mount in a shared parent does not move, nor a tree holding an unbindable mount onto a
     // shared mount (do_move_mount)
     let parent = vfs.mount(id).and_then(|m| m.parent());
-    if !anon && parent.is_some_and(|p| vfs.propagation(p).group != 0) {
+    if anon_ns.is_none() && parent.is_some_and(|p| vfs.propagation(p).group != 0) {
         return Err(Errno::EINVAL);
     }
     if vfs.propagation(target.mnt()).group != 0
@@ -1823,7 +1817,6 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     {
         return Err(Errno::EINVAL);
     }
-    let anon_ns = anon.then(|| vfs.mount_ns(id)).flatten();
     // An attached tree is in the namespace already; its copies count anyway
     let targets = if let Some(ns_id) = anon_ns {
         let size = vfs.count_in(ns_id);
@@ -1847,6 +1840,13 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     vfs.attached(id);
     propagate(cx, &vfs, id, &targets);
     Ok(0)
+}
+
+/// If `id` is the parentless root of an unattached anonymous (`open_tree`) namespace, returns
+/// that namespace's id (Linux 6.1's `is_anon_ns` + `!mnt_has_parent`).
+fn anon_root_ns(vfs: &Vfs, id: MountId) -> Option<u64> {
+    let m = vfs.mount(id)?;
+    (m.point.is_none() && vfs.find_ns(m.ns).is_some_and(|ns| ns.anon)).then_some(m.ns)
 }
 
 /// Drops the anonymous mount namespace `ns_id` from any open `open_tree(OPEN_TREE_CLONE)` file
