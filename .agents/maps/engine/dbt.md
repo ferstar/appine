@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-21 (split out of the engine full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: Phase 2B-2 fast loops with derived shifted indices, derived compares, zero-stride SP streams, cross-page fast-loop lifecycle, generalized stolen-register pinning, and pool nogroup reset)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: split `dbt.c` into `dbt.c`, `dbt_internal.h`, `dbt_translate.c`, `dbt_group.c`, `dbt_loop.c`, `dbt_routines.c`, and `dbt_cache.c`)
 
 ## Responsibilities
 
@@ -22,7 +22,10 @@
   process-global template arena, instance pooling, code-group sharing (`DbtSpace` / `Dbt`), and
   periodic unmapping of written code pages.
 
-Root: `core/engine/src/c/dbt.c`, `core/engine/src/c/emit.h`, the Tier 1 section of
+Root: `core/engine/src/c/dbt.c`, `core/engine/src/c/dbt_internal.h`,
+`core/engine/src/c/dbt_translate.c`, `core/engine/src/c/dbt_group.c`,
+`core/engine/src/c/dbt_loop.c`, `core/engine/src/c/dbt_routines.c`,
+`core/engine/src/c/dbt_cache.c`, `core/engine/src/c/emit.h`, the Tier 1 section of
 `core/engine/include/appine/engine.h`, the `Tier 1` section of `core/engine/src/lib.rs`
 (`DbtStats`, `DbtRegs`, `DbtMemop`, `DbtSource`, `DbtSpace`, `Dbt`, `trim_dbt_pool`,
 `unmap_written_code`, `written_code_bytes`), and `core/engine/tests/dbt.rs`.
