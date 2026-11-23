@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: check VMA permissions before past-EOF SIGBUS, fix mlock PROT_NONE/RO-anon/CoW population, unshare cow private file VMAs on MADV_DONTNEED)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: shared anonymous mremap regrowth)
 
 ## Responsibilities
 
@@ -397,6 +397,8 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
+- Growing a shared anonymous mapping after shrinking it allocates fresh pages. Linux exposes the
+  original bytes again up to the original mapping size and delivers `SIGBUS` beyond it.
 - **FUSE mappings read on demand are not Linux's page cache:** a page keeps what was read when first
   touched, so writes through the mount or by another process are not seen and separate mmap calls
   read separately; the size is fixed at mmap (growth not seen, truncation never `SIGBUS`); mlock,

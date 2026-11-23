@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/signal full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: silent attach-stop detach, single-step on sigreturn/execve/skipped syscalls, PTRACE_EVENT_EXIT for killed siblings, process_vm zero-remote shortcut)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: remote iovec count validation for empty process_vm transfers)
 
 ## Responsibilities
 
@@ -112,6 +112,8 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 
 ## Confirmed bugs / technical debt
 
+- `process_vm_readv/writev` check both iovec counts before summing local lengths. With zero local
+  bytes and more than 1024 remote iovecs, Appine returns `EINVAL` where Linux returns 0.
 - **ptrace reads are not forced:** `PTRACE_PEEK*` and `/proc/<pid>/mem` reads fail on `PROT_NONE`
   pages Linux can read; `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
 
