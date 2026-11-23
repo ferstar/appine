@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint route, sysctl and sysfs references to kernel/route, kernel/sysctl and kernel/sysfs)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: connected UDP checks, dual-stack IPv6 DNAT forwarding, ephemeral port aliasing, CLOSE_WAIT forwarded peer, route gateway/nexthop rules)
 
 ## Responsibilities
 
@@ -113,17 +113,19 @@ sockets (`hal`).
   with `IPV6_V6ONLY`, which gets a host port of its own; no address in the key, and the guest's
   `IPV6_V6ONLY` is never set on the host socket; no linger, so the next bind gets a new host
   port). Connects and sends to the port pick the host port by destination: an IPv6 address goes
-  to the IPv6-only binding first, an IPv4 address never does. bind(0) and implicit binds use host
-  ephemeral ports directly (`ip_local_port_range` is stored only), which can equal a guest port
-  bound explicitly in the same namespace.
+  to the IPv6-only binding first, an IPv4 address never does. bind(0) and implicit binds register
+  through `portmap::claim_ephemeral`, which remaps the guest port away from any existing bound
+  guest port in the same namespace (within `ip_local_port_range`) and prevents later explicit binds
+  from aliasing an active ephemeral port.
 - TCP listens and bound UDP sockets register `Listener`s with the guest address (or wildcard).
   Matching: same port and protocol; AF_INET wildcards accept IPv4, AF_INET6 wildcards IPv6 and —
   unless `v6only` — IPv4; specific addresses only themselves.
 - A TCP connect to a new namespace with no matching listener is `ECONNREFUSED` before the host is
   asked; a UDP sendto there with no match is dropped silently (reporting success). Targets in the
   initial namespace are not checked.
-- Connected UDP sockets that are host-wide emulate the connection with `vconn` (foreign sources
-  are discarded on receive); address-less sends skip the listener check.
+- Connected UDP sockets record their filter verdict and target namespace listener at connect — both
+  host-wide sockets (`vconn`, which discard foreign sources on receive) and namespace-bound sockets
+  — and address-less sends recheck the target listener.
 - Accepted sockets inherit the port map, `vaddr` and namespace; their peer is translated as above;
   getsockname reports the wildcard until a connect, then the facing address.
 
@@ -150,7 +152,11 @@ sockets (`hal`).
   route always, subnet and broadcast routes while up; deleting a primary deletes its secondaries.
   IPv6 addresses: `EACCES` with IPv6 disabled; removed on down unless `keep_addr_on_down`.
 - Routes: unicast only, table ≤ 255, next hop an up virtual device (host interfaces and lo
-  `EOPNOTSUPP`), gateways must be on-link (`ENETUNREACH`) unless `RTNH_F_ONLINK`, which needs a
+  `EOPNOTSUPP`), all-zero `RTA_GATEWAY` counts as no gateway, gateways without a device resolve to
+  the first (lowest-index) matching longest-prefix subnet, IPv6 link-local gateways with an explicit
+  up device are accepted without routing-table lookup (working without carrier; `EINVAL` without a
+  device), other gateways must be on-link (`ENETUNREACH` for IPv4, `EHOSTUNREACH` for IPv6) unless
+  `RTNH_F_ONLINK`, which needs a
   device that is up (`ENODEV`, `ENETDOWN`) and, for IPv4, a scope below link and a gateway that is
   not local, broadcast or multicast (`EINVAL`), and shows in dumps; flags as `fib_table_insert`; deleting a
   missing route `EOPNOTSUPP` in the initial namespace, `ESRCH` elsewhere; dumps merge with the host
@@ -195,8 +201,9 @@ sockets (`hal`).
   through the initial FORWARD and the target's PREROUTING/INPUT chains (a drop or reject means no
   forwarding), and low ports are replaced by their host ports. Re-evaluated on listen, UDP bind,
   initial-namespace nft commits and explicit-port binds in namespaces (when PREROUTING nat
-  exists) — not on interface address changes or container-namespace filter changes. An AF_INET6
-  wildcard listener is probed as IPv6, so IPv4 DNAT rules never match it.
+  exists) — not on interface address changes or container-namespace filter changes. A dual-stack
+  AF_INET6 wildcard listener (`!IPV6_V6ONLY`) falls back to probing IPv4 PREROUTING nat when the
+  IPv6 probe does not match, so IPv4 DNAT rules forward it.
 - One host thread (`forward`, no BKL) owns dups of the selected host sockets: it accepts up to 64
   connections per round, opens a nonblocking connection to the target, and copies both ways with
   64 KiB buffers, propagating half-close with `SHUT_WR`; errors close both ends, and so does a side
@@ -207,7 +214,9 @@ sockets (`hal`).
 - Real client address: for IPv4, non-loopback TCP clients and IPv4 targets the relay binds a
   127.254.x.y address with the client's port and records it, so accept, getpeername and
   `/proc/net` in the container report the real client; loopback, IPv6 and UDP clients see the
-  gateway. The record is removed when the forwarded connection closes.
+  gateway. The global record is removed when the forwarded connection closes, while accepted guest
+  sockets cache the resolved real client address in `track.outside_peer` so getpeername and
+  `/proc/net/tcp` preserve it across `CLOSE_WAIT` until the guest socket closes.
 - Closing the socket or a rule change drops the handle; established forwarded TCP connections stay,
   UDP relays of that port are closed at once. The guest's own accept races with the forwarder on
   the same host listener. There is no cap on connections or relays and no connect timeout.
@@ -256,22 +265,10 @@ sockets (`hal`).
   address:P conflict (both are 127.a.b.1 on the host) where Linux allows them, while wildcard:P
   plus 127.0.0.2:P succeed, and so do an IPv6-only `[::]:P` plus a dual-stack `[::]:P` (separate
   host ports), where Linux refuses the second.
-- **Ephemeral ports can alias explicit ports:** bind(0) and implicit binds take host ephemeral
-  ports, which may equal a guest port bound explicitly in the same namespace; connects to that
-  number then go to the explicit socket, and a later explicit bind to an ephemeral number succeeds.
-- **Connected UDP escapes namespace checks:** address-less sends skip the listener check, and a
-  host-wide UDP socket connecting to a namespace target returns before the filter verdict is
-  recorded, so a drop rule never applies to its later sends.
 - **nat-chain drops become `EPERM`:** a drop or reject in a nat chain (even a remote namespace's
   PREROUTING) fails connect/sendto with `EPERM`; Linux times TCP out and never filters UDP connect.
-- **Dual-stack listeners are not forwarded:** an AF_INET6 wildcard listener in the initial
-  namespace is probed as IPv6, so IPv4 DNAT rules never match it and outside IPv4 clients reach the
-  listener itself (older docker-proxy setups lose the real client address).
 - **Forwarder limits:** there are no connection or relay limits and no connect timeout; UDP relays
   are cut when the rule changes.
-- **Forwarded peers revert to 127.254.x.y:** the real-client record is removed when the forwarder
-  closes the connection, so a container still holding the socket (CLOSE_WAIT) sees the raw
-  address in getpeername.
 - **Smaller deviations:** only 127.0.0.0/24 works as loopback in a namespace (Linux: 127/8); IPv6 on
   virtual devices is unusable and on-link IPv6 is handed to the host; `hostmap` entries are never
   freed and collide once 65534 are used; PREROUTING filter chains see the post-DNAT destination at
@@ -281,14 +278,6 @@ sockets (`hal`).
   answers `ERANGE` for a short IPv4 attribute or IPv6 gateway, uses the first 4 bytes of a longer
   IPv4 attribute, and needs only the prefix's bytes of an IPv6 destination. iproute2 sends exact
   sizes, so only oddly encoded requests are affected.
-- **Gateways resolve to the last matching subnet:** a route with a gateway but no device takes the
-  device of the last longest-prefix route covering the gateway, where Linux takes the first
-  (lowest index); with two devices on one subnet the route lands on the other device, and a later
-  duplicate naming the first device is accepted instead of `EEXIST`.
-- **Next-hop checks miss Linux's special cases:** an all-zero `RTA_GATEWAY` counts as a gateway
-  instead of none; IPv6 link-local gateways are looked up in the
-  table (failing while the device has no carrier) where Linux accepts them with a device; and an
-  unreachable IPv6 gateway is `ENETUNREACH` where Linux says `EHOSTUNREACH`.
 
 ## Open questions
 

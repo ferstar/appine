@@ -1561,7 +1561,9 @@ fn route_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
         }
     };
     let mut dst = addr(RTA_DST)?.unwrap_or_else(|| vec![0; len]);
-    let gw = addr(RTA_GATEWAY)?;
+    // An all-zero RTA_GATEWAY (0.0.0.0 or ::) counts as no gateway, as in Linux's
+    // rtm_to_fib_config / rtm_to_fib6_config.
+    let gw = addr(RTA_GATEWAY)?.filter(|g| g.iter().any(|&b| b != 0));
     let prefsrc = addr(RTA_PREFSRC)?;
     let oif = get_u32(&attrs, RTA_OIF);
     let metric = get_u32(&attrs, RTA_PRIORITY).unwrap_or(0);
@@ -1751,8 +1753,20 @@ fn nexthop(
         }
         return Ok(dev);
     }
-    // The gateway's subnet: the longest prefix in the local and main tables through oif (when
-    // given) with a scope not less than link
+    // IPv6 link-local gateway (fe80::/10, Linux's fib6_nh_init): accepted with an explicit up
+    // device without consulting the routing table (so it works even before the device has carrier),
+    // and EINVAL without a device.
+    if !v4 && gw.len() == 16 && gw[0] == 0xfe && gw[1] & 0xc0 == 0x80 {
+        let Some(idx) = oif else {
+            return Err(fail(
+                Errno::EINVAL,
+                "Link-local gateway requires an explicit device",
+            ));
+        };
+        return device(Some(idx), Errno::ENODEV.into(), not_up);
+    }
+    // The gateway's subnet: the first (lowest-index) longest-prefix route in the local and main
+    // tables through oif (when given) with a scope not less than link
     let want = if v4 {
         scope.saturating_add(1).max(RT_SCOPE_LINK)
     } else {
@@ -1760,14 +1774,22 @@ fn nexthop(
     };
     let found = entries(ns)
         .into_iter()
-        .filter(|e| {
+        .enumerate()
+        .filter(|(_, e)| {
             e.family == family
                 && (e.table == RT_TABLE_LOCAL || e.table == RT_TABLE_MAIN)
                 && e.scope >= want
                 && oif.is_none_or(|o| e.index == o)
                 && crate::route::network(gw, e.prefix) == e.dst
         })
-        .max_by_key(|e| e.prefix);
+        .max_by_key(|(pos, e)| {
+            (
+                e.prefix,
+                std::cmp::Reverse(e.index),
+                std::cmp::Reverse(*pos),
+            )
+        })
+        .map(|(_, e)| e);
     let Some(e) = found else {
         let host = base(ns).iter().any(|i| {
             i.addrs.iter().any(|(f, a, p)| {
@@ -1780,7 +1802,7 @@ fn nexthop(
         return Err(if v4 {
             fail(Errno::ENETUNREACH, "Nexthop has invalid gateway")
         } else {
-            Errno::ENETUNREACH.into()
+            Errno::EHOSTUNREACH.into()
         });
     };
     if e.ty != RTN_UNICAST && e.ty != RTN_LOCAL {
@@ -3485,6 +3507,144 @@ mod tests {
                 b"lo".to_vec(),
                 b"d0".to_vec()
             ]
+        );
+    }
+
+    #[test]
+    fn route_gateway_and_nexthop_special_cases() {
+        let n = ns(6);
+        run(
+            &n,
+            &link(RTM_NEWLINK, CREATE, 0, None, &[name("d0"), kind("dummy")]),
+            &[],
+        )
+        .unwrap();
+        run(
+            &n,
+            &link(RTM_NEWLINK, CREATE, 0, None, &[name("d1"), kind("dummy")]),
+            &[],
+        )
+        .unwrap();
+        let i0 = view_of(&n, "d0").index;
+        let i1 = view_of(&n, "d1").index;
+        assert!(i0 < i1);
+        up(&n, "d0", true);
+        up(&n, "d1", true);
+        run(
+            &n,
+            &addr(RTM_NEWADDR, CREATE, AF_INET, 24, i0, &[10, 50, 0, 1], None),
+            &[],
+        )
+        .unwrap();
+        run(
+            &n,
+            &addr(RTM_NEWADDR, CREATE, AF_INET, 24, i1, &[10, 50, 0, 2], None),
+            &[],
+        )
+        .unwrap();
+
+        // Gateway without device must pick the lowest-index matching subnet (d0, not d1)
+        let gw_no_dev = route(
+            RTM_NEWROUTE,
+            CREATE,
+            [10, 60, 0, 0],
+            24,
+            Some([10, 50, 0, 254]),
+            None,
+        );
+        run(&n, &gw_no_dev, &[]).unwrap();
+        let dup_d0 = route(
+            RTM_NEWROUTE,
+            CREATE,
+            [10, 60, 0, 0],
+            24,
+            Some([10, 50, 0, 254]),
+            Some(i0),
+        );
+        assert_eq!(run(&n, &dup_d0, &[]).unwrap_err().errno, Errno::EEXIST.0);
+
+        // All-zero RTA_GATEWAY is treated as no gateway
+        let zero_gw = route(
+            RTM_NEWROUTE,
+            CREATE,
+            [10, 61, 0, 0],
+            24,
+            Some([0; 4]),
+            Some(i0),
+        );
+        run(&n, &zero_gw, &[]).unwrap();
+        let added = entries(&n)
+            .into_iter()
+            .find(|e| e.dst == [10, 61, 0, 0])
+            .expect("zero-gw route");
+        assert_eq!(added.gateway, None);
+
+        // Veth v0 (up) + v1 (down) => v0 has no carrier; IPv6 link-local gateway with explicit dev
+        // still succeeds, while without dev fails with EINVAL
+        let mut peer = vec![0u8; 16];
+        let (t, d) = name("v1");
+        attr(&mut peer, t, &d);
+        let info = nested(
+            IFLA_LINKINFO,
+            &[
+                (IFLA_INFO_KIND, b"veth".to_vec()),
+                (IFLA_INFO_DATA, {
+                    let mut x = Vec::new();
+                    attr(&mut x, VETH_INFO_PEER, &peer);
+                    x
+                }),
+            ],
+        );
+        run(
+            &n,
+            &link(RTM_NEWLINK, CREATE, 0, None, &[name("v0"), info]),
+            &[],
+        )
+        .unwrap();
+        up(&n, "v0", true);
+        assert!(!view_of(&n, "v0").carrier);
+        let iv0 = view_of(&n, "v0").index;
+
+        let route6 = |dst: [u8; 16], prefix: u8, gw: Option<[u8; 16]>, oif: Option<u32>| {
+            let mut p = vec![
+                AF_INET6 as u8,
+                prefix,
+                0,
+                0,
+                RT_TABLE_MAIN,
+                3,
+                0,
+                RTN_UNICAST,
+                0,
+                0,
+                0,
+                0,
+            ];
+            attr(&mut p, RTA_DST, &dst);
+            if let Some(g) = gw {
+                attr(&mut p, RTA_GATEWAY, &g);
+            }
+            if let Some(o) = oif {
+                attr(&mut p, RTA_OIF, &o.to_le_bytes());
+            }
+            message(RTM_NEWROUTE, CREATE | 1, 1, 0, &p)
+        };
+        let dst6 = [0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let ll_gw = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let far_gw = [0x20, 0x01, 0x0d, 0xb8, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(
+            run(&n, &route6(dst6, 64, Some(ll_gw), None), &[])
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL.0
+        );
+        run(&n, &route6(dst6, 64, Some(ll_gw), Some(iv0)), &[]).unwrap();
+        // Unreachable IPv6 gateway returns EHOSTUNREACH (not ENETUNREACH)
+        assert_eq!(
+            run(&n, &route6(dst6, 64, Some(far_gw), None), &[])
+                .unwrap_err()
+                .errno,
+            Errno::EHOSTUNREACH.0
         );
     }
 }

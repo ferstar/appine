@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: drop resolved new-netns loopback statistics leak entry now fixed in kernel/sysfs)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: SO_ATTACH_BPF guest fd check, MSG_WAITALL pending_err preservation, sendto destination validation, bound IPv4 wildcard getpeername)
 
 ## Responsibilities
 
@@ -44,9 +44,11 @@ listen notifications (`android/service`).
   (a connected datagram socket's peer, for `/proc/net`) and `guest_peer` (what getpeername
   reports); DNS stub state (`stub_peer`, queued `answers`, `answered`); `rcvtimeo`/`sndtimeo`;
   the cached traffic `route` and `opening` (ActiveOpens counted for this connect); `listening`;
-  `rd_shut` (the guest shut it down for reading); namespace state owned by `kernel/netns` (`net`,
+  `rd_shut` (the guest shut it down for reading); `pending_err` (a host socket error consumed after
+  a partial `MSG_WAITALL` read, kept for the next read or `SO_ERROR`); namespace state owned by `kernel/netns` (`net`,
   `bound`, `any`, `vaddr`, `wide`, `vconn`, `listener`, `self_port`, `v6only`) and the forwarder
-  handle `fwd`; `track` (nat state, seen peers, a blocked verdict, the claimed original
+  handle `fwd`; `track` (nat state, seen peers, a blocked verdict, connected UDP target listener,
+  preserved real outside peer, the claimed original
   destination, `SO_MARK`); raw ICMP and tap state used with `kernel/rawicmp` (`icmp`, `ttl_set`,
   `guest_recverr`, `udp_tap`, `icmp_err`); port-map `lease`, `local_map`, `peer_map`; `filter` (a
   TCP socket's classic BPF program the host refused, kept as given). Dropping it closes the host fd
@@ -79,7 +81,7 @@ listen notifications (`android/service`).
   `net::ioctl`; `readiness`, `wake_objects`, `arrivals` for poll/epoll.
 - DNS stub: `net::{is_stub, stub_addr, servfail}`, `deliver_dns` (timer thread),
   `hal::net::dns_query`, `vfs::ensure_resolv_conf`.
-- Ports: `portmap::{bind, bind_any}`, `PortMap::{maps, host_port, guest_port, listened}`,
+- Ports: `portmap::{bind, bind_any, claim_ephemeral}`, `PortMap::{maps, host_port, guest_port, listened}`,
   `Machine::take_listens`; `map_dest` (private) and `unmap_addr` (also used by the `/proc/net`
   listings).
 - Forwarding hooks: `forward_socket`, `forward_target`, `forward_all`.
@@ -141,9 +143,11 @@ listen notifications (`android/service`).
   connect sends a new SYN. TCP connects register `SO_ORIGINAL_DST` records when the host answered
   success or `EINPROGRESS`, before the BKL is released.
 - The peer getpeername reports is recorded at connect as Linux reports it: an IPv4 address given
-  to an IPv6 socket IPv4-mapped, the wildcard as the loopback (IPv4-mapped when the IPv6 socket's
-  local address is), no IPv6 flow information, a scope only for link-local addresses.
-  getsockname and getpeername unmap host ports and translate addresses; a raw ICMP socket's local
+  to an IPv6 socket IPv4-mapped, the wildcard as the socket's bound IPv4 address (or loopback when
+  unbound; IPv4-mapped when the IPv6 socket's local address is), no IPv6 flow information, a scope
+  only for link-local addresses.
+  getsockname and getpeername unmap host ports and translate addresses (accepted forwarded sockets
+  report their cached `outside_peer` while connected); a raw ICMP socket's local
   port is its protocol number; the stub peer is `127.0.0.53:53`.
 - accept4, in `__sys_accept4_file`'s order: a bad fd `EBADF`, bad flags `EINVAL`, then the new fd
   is reserved in the fd table (`EMFILE`; no other thread can take it while this one waits), then
@@ -161,8 +165,11 @@ listen notifications (`android/service`).
 
 - send (sendto, sendmsg, write; sendmmsg one message at a time): AF_UNIX goes to `kernel/unix`,
   netlink to `kernel/netlink`; DNS stub queries go to the stub (see below); raw ICMP sockets and
-  tapped UDP sockets call into `kernel/rawicmp` (`before_io`, `sent`, `take_errors`); a connected
-  datagram socket whose peer the filter blocked fails or drops; datagrams with an address go
+  tapped UDP sockets call into `kernel/rawicmp` (`before_io`, `sent`, `take_errors`); inet
+  destination addresses are validated for family and length (`inet_send_addr`, matching Linux 6.1)
+  before routing or host calls; a connected
+  datagram socket whose peer the filter blocked fails or drops and address-less UDP sends recheck
+  their target namespace's listener; datagrams with an address go
   through `route()` (`EPERM` or a silent drop from the filter; UDP to an unbound port in a new
   namespace is dropped silently); TCP drops the guest address unless `MSG_FASTOPEN`; destinations
   are portmapped; an `IP_PKTINFO`/`IPV6_PKTINFO` may be appended; the host gets the guest flags
@@ -176,11 +183,11 @@ listen notifications (`android/service`).
   anyone else; source addresses are unmapped, translated and nat-reversed, and UDP peers recorded
   for the filter's replies; control data is returned verbatim; `EAGAIN` checks the stub queue
   again, then waits (`SO_RCVTIMEO`, `ERESTARTSYS` on signals). `MSG_TRUNC` on a stream discards the
-  data the host returns without copying any (a NULL buffer included) and reports its length, as
-  `tcp_recvmsg` does, also with `MSG_PEEK` and `MSG_WAITALL`. `MSG_WAITALL` on a stream reads until
+  `MSG_WAITALL` on a stream reads until
   the length is complete, waiting between pieces; nonblocking, the timeout, a signal (even under
   `SA_RESTART`), end of file or a host error ends it with what was read, as Linux's `tcp_recvmsg`
-  returns what it copied.
+  returns what it copied; when a host error ends a partial `MSG_WAITALL` read, it is preserved in
+  `pending_err` so the next read, `SO_ERROR` or `POLLERR` reports it instead of EOF.
   `MSG_PEEK|MSG_WAITALL` peeks from the head each time and waits with the host socket's
   `SO_RCVLOWAT` raised to the length (restored afterwards); when the host fd was ready but the
   peek did not grow (end of file, a receive buffer that can never hold the length) it returns what
@@ -211,6 +218,9 @@ listen notifications (`android/service`).
 - Emulated on inet sockets, in this order: `SO_SNDBUFFORCE`/`SO_RCVBUFFORCE` (need `CAP_NET_ADMIN`,
   then become the plain options); raw ICMP's own options and UDP TTL/`IP_RECVERR` hooks dispatched
   to `kernel/rawicmp`;
+  `SO_ATTACH_BPF`/`SO_ATTACH_REUSEPORT_EBPF` are intercepted on inet sockets (short optlen
+  `EINVAL`, unprivileged TCP `SO_ATTACH_BPF` `EPERM`, guest fd table checked for `EBADF`/`EINVAL`
+  so raw guest fds never reach the host);
   `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF`, checked in Linux 6.1.y's order (an optlen under
   4 `EINVAL`; `SO_ATTACH_FILTER` on a TCP socket without `CAP_NET_ADMIN` over the namespace owner
   `EPERM`, as Linux 5d39580f68e6; an optlen other than 16 `EINVAL`; a host filter locked with
@@ -234,7 +244,7 @@ listen notifications (`android/service`).
   back as the program's count.
 - Everything else (including `SO_DETACH_FILTER` without a kept program, `SO_LOCK_FILTER`,
   `SO_PEERCRED`, `SO_BINDTODEVICE` — resolved against host interface names —, `SO_PRIORITY`,
-  `IP_TRANSPARENT`, `TCP_*`, and `SO_ATTACH_BPF` with its guest fd number) goes to the host and is
+  `IP_TRANSPARENT`, `TCP_*`) goes to the host and is
   checked against the app's host credentials. Netlink (`kernel/netlink`) and AF_UNIX sockets keep
   their options in process (`SockOpts`).
 - ioctls: `FIONREAD`/`SIOCINQ` (stub answers emulated) and `SIOCATMARK` pass
@@ -394,13 +404,9 @@ listen notifications (`android/service`).
 
 ## Confirmed bugs / technical debt
 
-- **An error after part of a `MSG_WAITALL` read is lost:** the partial count is returned, but the
-  host has already taken the error (a reset, say), so the next read sees end of file where Linux
-  reports the error then.
 - **Option passthrough uses host semantics:** privileged options (`SO_PRIORITY` above 6,
   `IP_TRANSPARENT`) are judged by the app's host credentials (a privileged guest gets `EPERM`);
-  `SO_BINDTODEVICE` names are resolved against host interfaces; `SO_ATTACH_BPF` passes a guest fd
-  number to the host.
+  `SO_BINDTODEVICE` names are resolved against host interfaces.
 - **A TCP filter the host refused filters nothing:** on a host with Linux 5d39580f68e6 the program
   is only kept in Appine, so a drop-everything filter (dockerd's on each port it publishes, until
   its DNAT rules are in place) still lets connections through and other programs see unfiltered
@@ -408,12 +414,6 @@ listen notifications (`android/service`).
 - **`/proc/net/snmp` departs from the namespace's state:** `Forwarding` is always 2 although each
   namespace has `ip_forward` (Linux shows 1 when it is on), and MPTCP sockets are left out of the
   Tcp counters and `CurrEstab`, where Linux counts their subflows.
-- **A wildcard connect from a bound IPv4 socket reports the loopback:** connecting to `0.0.0.0`
-  gives getpeername `127.0.0.1` even when the socket is bound to an address of its own, which
-  Linux's route lookup would take instead.
-- **Odd destinations reach the host unchecked:** sendto hands a guest address the layer does not
-  understand to the host socket as is, so the host kernel's own checks answer instead of Linux
-  6.1's; under AppArmor that is `EAFNOSUPPORT` for a bogus family where Linux says `EINVAL`.
 
 ## Open questions
 

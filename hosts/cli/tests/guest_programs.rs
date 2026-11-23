@@ -192,6 +192,34 @@ fn sockets_polling_and_timers() {
 }
 
 #[test]
+fn net_regressions() {
+    // Targeted regressions for kernel/net, kernel/netns, kernel/netlink, kernel/rawicmp and
+    // kernel/nft fixes
+    let Some(program) = build_c_guest("net_regressions") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
 fn bugs_kill_only_the_guest_process() {
     // A kernel-layer panic (on entering the kernel, while the BKL is released, in a no-BKL system
     // call, when a thread starts and exits, on the timer thread) or the engine making the host

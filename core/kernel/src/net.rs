@@ -139,6 +139,9 @@ pub(crate) struct InetSocket {
     /// Linux's rules say to report to the guest (an errno, 0 for none): the next send or receive,
     /// or `SO_ERROR`, takes it (Linux's `sk_err`).
     pub icmp_err: std::cell::Cell<i32>,
+    /// A host socket error consumed after a partial `MSG_WAITALL` receive (an errno, 0 for none):
+    /// preserved here so the next read, write or `SO_ERROR` reports it instead of EOF.
+    pub pending_err: std::cell::Cell<i32>,
     /// Bound to a mapped low port ([`crate::portmap`]): the lease, and (guest port, host port).
     /// Connections from accept have only the latter (the local end is the listening port).
     pub lease: Option<crate::portmap::Lease>,
@@ -191,6 +194,7 @@ impl InetSocket {
             guest_recverr: false,
             udp_tap: None,
             icmp_err: std::cell::Cell::new(0),
+            pending_err: std::cell::Cell::new(0),
             lease: None,
             local_map: None,
             peer_map: None,
@@ -221,6 +225,13 @@ pub(crate) struct Track {
     /// address are not sent: 0 means silently dropped, anything else is an error number (a drop
     /// on OUTPUT is EPERM).
     pub blocked: Option<i32>,
+    /// Connected UDP into a new network namespace: the target namespace and the destination
+    /// sockaddr as seen there (after DNAT), so address-less sends recheck the target's listeners.
+    pub udp_target: Option<(std::rc::Weak<crate::nsproxy::NetNs>, Vec<u8>)>,
+    /// An accepted TCP connection forwarded in from outside (127.254.x.y): the real outside client
+    /// sockaddr captured at accept, kept until the guest socket closes so `getpeername` and
+    /// `/proc/net` do not revert to 127.254.x.y in `CLOSE_WAIT` after the forwarder closes.
+    pub outside_peer: Option<Vec<u8>>,
     /// A TCP connection from accept: when nat rewrote the destination of the initiating end, the
     /// original destination seen in this namespace (a guest sockaddr, reported by
     /// `SO_ORIGINAL_DST`, [`crate::origdst`]).
@@ -403,10 +414,17 @@ pub(crate) struct NetlinkSocket {
     /// `nl_pid`: assigned on bind, or by the first connect or send (Linux's autobind); 0 until
     /// then.
     pub pid: u32,
+    /// Connected destination port (`dst_portid`) and multicast group number (`dst_group`, 1-based;
+    /// 0 for none), reported by `getpeername` and used by address-less sends.
+    pub dst_pid: u32,
+    pub dst_group: u32,
     /// Answers and notifications waiting for the guest to read them, one datagram per item,
     /// with the multicast group a notification went to (0 for a unicast answer: the source
     /// address's `nl_groups` and `NETLINK_PKTINFO` report it).
     pub queue: VecDeque<(Vec<u8>, u32)>,
+    /// Bytes currently charged in `queue` (payload plus per-datagram overhead), capped against
+    /// `SO_RCVBUF` (`opts.rcvbuf()`).
+    pub queued_bytes: usize,
     /// The number of datagrams put into `queue` (`EPOLLET` triggers on each).
     pub arrivals: u64,
     /// `SO_RCVTIMEO`: how long to wait at most when there is no answer to read.
@@ -440,12 +458,18 @@ pub(crate) struct NetlinkSocket {
 }
 
 impl NetlinkSocket {
+    /// Per-datagram overhead charged against `SO_RCVBUF` (like Linux's `sk_buff` truesize).
+    pub(crate) const SKB_OVERHEAD: usize = 256;
+
     pub fn new(protocol: i32, ty: i32) -> NetlinkSocket {
         NetlinkSocket {
             protocol,
             ty,
             pid: 0,
+            dst_pid: 0,
+            dst_group: 0,
             queue: VecDeque::new(),
+            queued_bytes: 0,
             arrivals: 0,
             rcvtimeo: None,
             net: None,
@@ -460,28 +484,51 @@ impl NetlinkSocket {
         }
     }
 
+    /// Queues a datagram (reply, nftables reply, `mq_notify` cookie or multicast notification)
+    /// bounded by `SO_RCVBUF`: an empty queue always admits one datagram; otherwise exceeding
+    /// `SO_RCVBUF` drops it and sets `overrun` (`ENOBUFS`) unless `NETLINK_NO_ENOBUFS` is set.
+    /// Returns whether the datagram was queued.
+    pub(crate) fn enqueue(&mut self, msg: Vec<u8>, group: u32) -> bool {
+        const NETLINK_NO_ENOBUFS: u32 = 5;
+        let charge = msg.len().saturating_add(Self::SKB_OVERHEAD);
+        let limit = self.opts.rcvbuf();
+        if !self.queue.is_empty() && self.queued_bytes.saturating_add(charge) > limit {
+            if self.flags & (1 << NETLINK_NO_ENOBUFS) == 0 {
+                self.overrun.set(true);
+            }
+            return false;
+        }
+        self.queued_bytes = self.queued_bytes.saturating_add(charge);
+        self.queue.push_back((msg, group));
+        self.arrivals += 1;
+        true
+    }
+
+    /// Takes (or peeks) the front datagram from `queue`, updating `queued_bytes`.
+    pub(crate) fn dequeue(&mut self, peek: bool) -> Option<(Vec<u8>, u32)> {
+        if peek {
+            return self.queue.front().cloned();
+        }
+        let (msg, group) = self.queue.pop_front()?;
+        let charge = msg.len().saturating_add(Self::SKB_OVERHEAD);
+        self.queued_bytes = self.queued_bytes.saturating_sub(charge);
+        Some((msg, group))
+    }
+
     /// It is an rtnetlink socket that joined a group notifications go to.
     pub fn subscribed(&self) -> bool {
         self.protocol == NETLINK_ROUTE && self.groups.is_some_and(|g| g & RTNL_NOTIFIED != 0)
     }
 
     /// Queues notification `msg` of multicast group `group` when the socket joined it; when the
-    /// queue is full it is dropped, and unless `NETLINK_NO_ENOBUFS` the next receive reports the
-    /// overrun. Returns whether it concerned the socket.
+    /// queue is full (`SO_RCVBUF`) it is dropped, and unless `NETLINK_NO_ENOBUFS` the next receive
+    /// reports the overrun. Returns whether it concerned the socket.
     pub fn notify(&mut self, group: u32, msg: &[u8]) -> bool {
-        const NETLINK_NO_ENOBUFS: u32 = 5;
         if self.protocol != NETLINK_ROUTE || self.groups.is_none_or(|g| g & (1 << (group - 1)) == 0)
         {
             return false;
         }
-        if self.queue.len() >= NOTE_QUEUE {
-            if self.flags & (1 << NETLINK_NO_ENOBUFS) == 0 {
-                self.overrun.set(true);
-            }
-            return true;
-        }
-        self.queue.push_back((msg.to_vec(), group));
-        self.arrivals += 1;
+        self.enqueue(msg.to_vec(), group);
         true
     }
 
@@ -496,7 +543,7 @@ impl NetlinkSocket {
     }
 
     /// Handles one datagram from the guest (which may hold several requests) and queues the
-    /// answers.
+    /// answers (bounded by `SO_RCVBUF`).
     pub fn handle(&mut self, data: &[u8], host: &dyn Host) {
         // An nftables batch spans several messages, so the whole datagram is handled together
         if self.protocol == NETLINK_NETFILTER {
@@ -508,8 +555,7 @@ impl NetlinkSocket {
                 comm: b"",
             };
             for d in host.netfilter(data, &peer) {
-                self.queue.push_back((d, 0));
-                self.arrivals += 1;
+                self.enqueue(d, 0);
             }
             return;
         }
@@ -532,8 +578,7 @@ impl NetlinkSocket {
                 _ => self.route_request(&h[..len], host),
             };
             for d in answers {
-                self.queue.push_back((d, 0));
-                self.arrivals += 1;
+                self.enqueue(d, 0);
             }
             off += len.next_multiple_of(4);
         }
@@ -543,6 +588,15 @@ impl NetlinkSocket {
     fn route_request(&self, req: &[u8], host: &dyn Host) -> Vec<Vec<u8>> {
         let ty = u16::from_le_bytes([req[4], req[5]]);
         let flags = u16::from_le_bytes([req[6], req[7]]);
+        // Linux's netlink_rcv_skb: non-requests and control messages (< NLMSG_MIN_TYPE) are
+        // skipped and acked with 0 only when NLM_F_ACK is set.
+        if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
+            return if flags & NLM_F_ACK != 0 {
+                vec![ack(req, 0, self.pid)]
+            } else {
+                Vec::new()
+            };
+        }
         let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
         let family = req.get(16).copied().unwrap_or(0) as i32;
         let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
@@ -736,20 +790,57 @@ impl NetlinkSocket {
                 }
             }
             // The neighbour table (ARP, NDP): the app on Android cannot see the host's, so it is
-            // always empty
+            // always empty; single gets still validate ndmsg, family, ifindex and NDA_DST as
+            // Linux's neigh_get does before answering ENOENT.
             RTM_GETNEIGH if dump => vec![done()],
-            RTM_GETNEIGH => vec![ack(req, ENOENT, self.pid)],
-            // Unsupported requests: EOPNOTSUPP, after rtnetlink_rcv_msg's checks (a type it knows
-            // that changes something needs CAP_NET_ADMIN over the namespace owner: EPERM);
-            // control messages are acked only when an ack is asked for
-            _ if flags & NLM_F_REQUEST != 0 => {
-                if ty < NLMSG_MIN_TYPE {
-                    if flags & NLM_F_ACK != 0 {
-                        vec![ack(req, 0, self.pid)]
-                    } else {
-                        Vec::new()
+            RTM_GETNEIGH => {
+                const NDA_DST: u16 = 1;
+                const NTF_PROXY: u8 = 0x08;
+                const ENODEV: i32 = 19;
+                const EAFNOSUPPORT: i32 = 97;
+                let err = (|| -> Result<(), i32> {
+                    let ndm = req.get(16..28).ok_or(EINVAL)?;
+                    let ndm_family = i32::from(ndm[0]);
+                    let ndm_ifindex = i32::from_le_bytes(ndm[4..8].try_into().unwrap());
+                    let ndm_state = u16::from_le_bytes([ndm[8], ndm[9]]);
+                    let ndm_flags = ndm[10];
+                    let ndm_type = ndm[11];
+                    if ndm_state != 0 || ndm_type != 0 {
+                        return Err(EINVAL);
                     }
-                } else if (RTM_BASE..=RTM_MAX).contains(&ty)
+                    let attrs = crate::route::attrs(&req[28..]);
+                    let dst = attrs
+                        .iter()
+                        .find(|(t, _)| *t == NDA_DST)
+                        .map(|(_, d)| *d)
+                        .ok_or(EINVAL)?;
+                    let key_len = match ndm_family {
+                        AF_INET => 4,
+                        AF_INET6 => 16,
+                        _ => return Err(EAFNOSUPPORT),
+                    };
+                    if dst.len() != key_len {
+                        return Err(EINVAL);
+                    }
+                    if ndm_ifindex < 0 {
+                        return Err(ENODEV);
+                    }
+                    if ndm_ifindex == 0 {
+                        if ndm_flags & NTF_PROXY == 0 {
+                            return Err(EINVAL);
+                        }
+                    } else if !host.links().iter().any(|l| l.index() as i32 == ndm_ifindex) {
+                        return Err(ENODEV);
+                    }
+                    Err(ENOENT)
+                })()
+                .unwrap_err();
+                vec![ack_ext(req, err, self.pid, None, self.cap_ack)]
+            }
+            // Unsupported requests: EOPNOTSUPP, after rtnetlink_rcv_msg's checks (a type it knows
+            // that changes something needs CAP_NET_ADMIN over the namespace owner: EPERM).
+            _ => {
+                if (RTM_BASE..=RTM_MAX).contains(&ty)
                     && (ty - RTM_BASE) & 3 != 2
                     && !host.net_admin()
                 {
@@ -758,7 +849,6 @@ impl NetlinkSocket {
                     vec![ack(req, EOPNOTSUPP, self.pid)]
                 }
             }
-            _ => Vec::new(),
         }
     }
 
@@ -769,6 +859,20 @@ impl NetlinkSocket {
         b[4..8].copy_from_slice(&self.pid.to_le_bytes());
         // nl_groups: the first 32 groups
         b[8..12].copy_from_slice(&(self.groups.unwrap_or(0) as u32).to_le_bytes());
+        b
+    }
+
+    /// The connected peer's `sockaddr_nl` (Linux's `netlink_getname` with `peer = 1`).
+    pub fn peer_sockaddr(&self) -> Vec<u8> {
+        let mut b = vec![0u8; 12];
+        b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
+        b[4..8].copy_from_slice(&self.dst_pid.to_le_bytes());
+        let mask = if self.dst_group == 0 {
+            0u32
+        } else {
+            1u32 << (self.dst_group - 1)
+        };
+        b[8..12].copy_from_slice(&mask.to_le_bytes());
         b
     }
 }
@@ -1104,9 +1208,6 @@ const RTNL_NOTIFIED: u64 = 1 << (RTNLGRP_LINK - 1)
     | 1 << (RTNLGRP_IPV4_ROUTE - 1)
     | 1 << (RTNLGRP_IPV6_IFADDR - 1)
     | 1 << (RTNLGRP_IPV6_ROUTE - 1);
-/// The most datagrams a socket holds before notifications are dropped (about its 212992-byte
-/// receive buffer at a typical notification's size).
-const NOTE_QUEUE: usize = 1024;
 
 /// A namespace's links, addresses and routes as rtnetlink dumps encode them (message bodies, in
 /// dump order). Taken before and after a change request, the difference is what Linux notifies
@@ -1605,13 +1706,19 @@ pub(crate) fn proc_listing(
             };
             crate::netns::from_host(w, &me, &unmap(a, true), role, inet.icmp6())
         });
-        let peer = host_peer
-            .clone()
-            .map(|a| {
-                let role = crate::netns::Role::Peer;
-                crate::netns::from_host(w, &me, &unmap(a, false), role, inet.icmp6())
-            })
-            .or_else(|| inet.peer.clone());
+        let peer = if host_peer.is_some()
+            && let Some(p) = inet.track.as_ref().and_then(|t| t.outside_peer.as_ref())
+        {
+            Some(p.clone())
+        } else {
+            host_peer
+                .clone()
+                .map(|a| {
+                    let role = crate::netns::Role::Peer;
+                    crate::netns::from_host(w, &me, &unmap(a, false), role, inet.icmp6())
+                })
+                .or_else(|| inet.peer.clone())
+        };
         let state = if tcp {
             appine_hal::net::getsockopt(fd, IPPROTO_TCP, TCP_INFO, 8)
                 .ok()
@@ -2028,10 +2135,11 @@ mod tests {
         assert!(!s.subscribed() && !s.notify(RTNLGRP_LINK, b"x"));
         s.groups = Some(1 << (RTNLGRP_IPV4_IFADDR - 1));
         assert!(s.subscribed() && !s.notify(RTNLGRP_LINK, b"x"));
-        for _ in 0..=NOTE_QUEUE {
+        let cap = s.opts.rcvbuf() / (1 + NetlinkSocket::SKB_OVERHEAD);
+        for _ in 0..=cap {
             assert!(s.notify(RTNLGRP_IPV4_IFADDR, b"y"));
         }
-        assert_eq!(s.queue.len(), NOTE_QUEUE);
+        assert_eq!(s.queue.len(), cap);
         assert_eq!(s.queue[0], (b"y".to_vec(), RTNLGRP_IPV4_IFADDR));
         assert!(s.overrun.get());
     }
@@ -2618,6 +2726,107 @@ mod tests {
         );
         assert_eq!(ask(msg(RTM_GETLINK, 0, 1, (0, 0), &[])), None);
     }
+
+    #[test]
+    fn netlink_queue_caps_to_so_rcvbuf_and_reports_peer() {
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
+        // Minimum SO_RCVBUF is 2304 bytes
+        assert!(
+            s.opts
+                .set(8 /* SO_RCVBUF */, &1i32.to_le_bytes(), false, false)
+                == Some(Ok(()))
+        );
+        assert_eq!(s.opts.rcvbuf(), 2304);
+        assert!(s.enqueue(vec![0u8; 800], 0));
+        assert!(s.enqueue(vec![0u8; 800], 0));
+        assert!(!s.overrun.get());
+        // Next message overflows 2304 bytes (2 * (800 + 256) + (64 + 256) = 2432 > 2304)
+        assert!(!s.enqueue(vec![0u8; 64], 0));
+        assert!(s.overrun.get());
+        // Peek does not reduce queued_bytes; pop does
+        let _ = s.dequeue(true);
+        assert!(!s.enqueue(vec![0u8; 64], 0));
+        s.overrun.set(false);
+        let _ = s.dequeue(false);
+        let _ = s.dequeue(false);
+        assert!(s.enqueue(vec![0u8; 64], 0));
+        // NETLINK_NO_ENOBUFS suppresses overrun on drop
+        s.flags |= 1 << 5; // NETLINK_NO_ENOBUFS
+        assert!(!s.enqueue(vec![0u8; 2500], 0));
+        assert!(!s.overrun.get());
+        // peer_sockaddr reflects dst_pid and dst_group
+        assert_eq!(s.peer_sockaddr(), [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        s.dst_pid = 42;
+        s.dst_group = 3;
+        let peer = s.peer_sockaddr();
+        assert_eq!(u32::from_le_bytes(peer[4..8].try_into().unwrap()), 42);
+        assert_eq!(u32::from_le_bytes(peer[8..12].try_into().unwrap()), 1 << 2);
+    }
+
+    #[test]
+    fn rtnetlink_request_flag_and_single_getneigh_validation() {
+        let host = Fake {
+            stats: IfStats::default(),
+            routes: Some(Vec::new()),
+        };
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
+        s.pid = 7;
+        // Handled rtnetlink request without NLM_F_REQUEST is skipped (or acks 0 on NLM_F_ACK)
+        let mut no_req = message(RTM_GETLINK, NLM_F_DUMP, 1, 0, &[0; 16]);
+        s.handle(&no_req, &host);
+        assert!(s.queue.is_empty());
+        no_req = message(RTM_GETLINK, NLM_F_ACK, 2, 0, &[0; 16]);
+        s.handle(&no_req, &host);
+        let (ack_msg, _) = s.dequeue(false).expect("ack");
+        assert_eq!(u16::from_le_bytes([ack_msg[4], ack_msg[5]]), NLMSG_ERROR);
+        assert_eq!(i32::from_le_bytes(ack_msg[16..20].try_into().unwrap()), 0);
+
+        let getneigh_err = |s: &mut NetlinkSocket, body: &[u8]| -> i32 {
+            let req = message(RTM_GETNEIGH, NLM_F_REQUEST, 3, 0, body);
+            s.handle(&req, &host);
+            let (m, _) = s.dequeue(false).expect("reply");
+            assert_eq!(u16::from_le_bytes([m[4], m[5]]), NLMSG_ERROR);
+            -i32::from_le_bytes(m[16..20].try_into().unwrap())
+        };
+        // Short body -> EINVAL
+        assert_eq!(getneigh_err(&mut s, &[0; 4]), EINVAL);
+        // Non-zero ndm_state -> EINVAL
+        let mut ndm = vec![0u8; 12];
+        ndm[0] = AF_INET as u8;
+        ndm[4..8].copy_from_slice(&1i32.to_le_bytes());
+        ndm[8..10].copy_from_slice(&1u16.to_le_bytes());
+        attr(&mut ndm, 1 /* NDA_DST */, &[127, 0, 0, 1]);
+        assert_eq!(getneigh_err(&mut s, &ndm), EINVAL);
+        // Missing NDA_DST -> EINVAL
+        let mut ndm = vec![0u8; 12];
+        ndm[0] = AF_INET as u8;
+        ndm[4..8].copy_from_slice(&1i32.to_le_bytes());
+        assert_eq!(getneigh_err(&mut s, &ndm), EINVAL);
+        // Unknown family -> EAFNOSUPPORT (97)
+        let mut bad_fam = vec![0u8; 12];
+        bad_fam[0] = 99;
+        bad_fam[4..8].copy_from_slice(&1i32.to_le_bytes());
+        attr(&mut bad_fam, 1, &[127, 0, 0, 1]);
+        assert_eq!(getneigh_err(&mut s, &bad_fam), 97);
+        // Wrong NDA_DST size -> EINVAL
+        let mut bad_len = vec![0u8; 12];
+        bad_len[0] = AF_INET as u8;
+        bad_len[4..8].copy_from_slice(&1i32.to_le_bytes());
+        attr(&mut bad_len, 1, &[127, 0]);
+        assert_eq!(getneigh_err(&mut s, &bad_len), EINVAL);
+        // Unknown ifindex -> ENODEV (19)
+        let mut bad_if = vec![0u8; 12];
+        bad_if[0] = AF_INET as u8;
+        bad_if[4..8].copy_from_slice(&99i32.to_le_bytes());
+        attr(&mut bad_if, 1, &[127, 0, 0, 1]);
+        assert_eq!(getneigh_err(&mut s, &bad_if), 19);
+        // Valid single RTM_GETNEIGH -> ENOENT
+        let mut ok = vec![0u8; 12];
+        ok[0] = AF_INET as u8;
+        ok[4..8].copy_from_slice(&1i32.to_le_bytes());
+        attr(&mut ok, 1, &[127, 0, 0, 1]);
+        assert_eq!(getneigh_err(&mut s, &ok), ENOENT);
+    }
 }
 
 // ---- Generic socket options ----
@@ -2674,6 +2883,11 @@ impl Default for SockOpts {
 }
 
 impl SockOpts {
+    /// Current `SO_RCVBUF` byte limit.
+    pub fn rcvbuf(&self) -> usize {
+        self.rcvbuf.max(0) as usize
+    }
+
     const DEBUG: i32 = 1;
     const REUSEADDR: i32 = 2;
     const TYPE: i32 = 3;

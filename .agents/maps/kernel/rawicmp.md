@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/rawicmp.md` for the paired decision history (not yet created; decisions from before the split are D2, D22 and the raw-ICMP parts of D9, D12, D18 and D19 in `.agents/decisions/kernel/net.md`).
 >
 > Verified: 2026-11-22 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: raw ICMP SHUT_RD immediate EOF and receiver wakeup)
 
 ## Responsibilities
 
@@ -90,7 +92,10 @@ socket and epoll `Watch` wrappers (`hal`).
   `IP_PKTINFO`/`IP_TTL` control messages only when enabled, other control messages only for what
   reached the socket's own ping socket; `MSG_TRUNC`/`MSG_CTRUNC` as Linux; `MSG_ERRQUEUE` returns
   the socket's own errors (`EAGAIN` at once when there are none).
-- Readiness comes from the receiver queues (`POLLOUT` always, `POLLERR` while errors are pending).
+- Readiness comes from the receiver queues (`POLLOUT` always, `POLLIN | POLLRDNORM` when queued or
+  `rd_shut` is set, `POLLERR` while errors are pending). On `SHUT_RD`, `shutdown` wakes waiting
+  receivers and a blocking `raw_recv` with an empty queue returns 0 at once (nonblocking stays
+  `EAGAIN`).
 
 ## Dependencies (inbound / outbound)
 
@@ -117,10 +122,6 @@ socket and epoll `Watch` wrappers (`hal`).
 - **Raw ICMP keeps one echo id per socket:** every reply to a socket's ping ident is rewritten to
   the last id that socket sent, so programs using several ids on one socket (liboping) see them
   collapse; the queue cap ignores `SO_RCVBUF` and drops silently.
-- **A raw ICMP socket shut down for reading still waits in recv:** the aggregation point's receive
-  path does not look at the read shutdown, so a blocking recv with nothing queued sleeps until a
-  reply, a timeout or a signal, where Linux's `skb_recv_datagram` returns 0 at once (and wakes
-  receivers already waiting); only internet datagram sockets on host sockets return 0.
 - **A raw socket cannot be bound to another address:** Linux's `raw_bind` lets a raw socket be
   bound any number of times; the host ping socket that emulates a raw ICMP socket refuses a second
   bind, so binding it again succeeds only for the address it already has (`EINVAL` otherwise).

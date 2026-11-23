@@ -184,9 +184,11 @@ impl Drop for Lease {
             {
                 v.1 = Some(now);
             }
-            m.released
-                .retain(|_, (_, t)| now.duration_since(*t) < STICKY);
-            m.released.insert(self.key, (host, now));
+            if ns == 0 {
+                m.released
+                    .retain(|_, (_, t)| now.duration_since(*t) < STICKY);
+                m.released.insert(self.key, (host, now));
+            }
         }
     }
 }
@@ -320,6 +322,48 @@ pub fn bind_any(
     bind(0).map_err(Errno)?;
     let host = bound_port().ok_or(Errno::EADDRINUSE)?;
     Ok((host, lease(map, host)))
+}
+
+/// Registers an ephemeral port (`bind(0)` or implicit bind) in a new network namespace so that:
+/// - if the host-assigned port `host` aliases a guest port already bound in the same namespace, a
+///   free guest port in `range` (falling back to 1024..=65535, then 1..1024) is chosen instead;
+/// - a later explicit bind of the chosen guest port tries `host` and collides with `EADDRINUSE`
+///   instead of silently binding a fresh host port.
+pub fn claim_ephemeral(
+    map: &Rc<RefCell<PortMap>>,
+    ns: usize,
+    proto: i32,
+    host: u16,
+    v6only: bool,
+    range: (u16, u16),
+) -> (u16, Lease) {
+    let mut m = map.borrow_mut();
+    let in_use = |m: &PortMap, p: u16| {
+        m.entries.contains_key(&(ns, proto, p, false))
+            || m.entries.contains_key(&(ns, proto, p, true))
+    };
+    let guest = if !in_use(&m, host) {
+        host
+    } else {
+        let (lo, hi) = (range.0.min(range.1).max(1), range.0.max(range.1).max(1));
+        let start = host.clamp(lo, hi);
+        (start..=hi)
+            .chain(lo..start)
+            .chain(1024..=u16::MAX)
+            .chain(1..1024)
+            .find(|&p| !in_use(&m, p))
+            .unwrap_or(host)
+    };
+    let key = (ns, proto, guest, v6only);
+    m.entries.entry(key).or_insert(Entry { host, refs: 0 }).refs += 1;
+    m.by_host.insert((ns, proto, host), (guest, None));
+    (
+        guest,
+        Lease {
+            map: map.clone(),
+            key,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -664,5 +708,39 @@ mod tests {
         assert!(m.maps(22) && !m.maps(0) && !m.maps(1024));
         m.offset = 0;
         assert!(!m.maps(22));
+    }
+
+    #[test]
+    fn claim_ephemeral_avoids_explicit_port_and_blocks_later_alias() {
+        let m = map();
+        // Explicit bind in ns 1 takes guest port 40000 (on host port 51000)
+        let (h_exp, _exp) = bind_any(&m, 1, TCP, 40000, false, |_| Ok(()), || Some(51000)).unwrap();
+        assert_eq!(h_exp, 51000);
+        // Host gives an ephemeral socket port 40000: claim_ephemeral remaps it away from 40000
+        let (g_eph, eph) = claim_ephemeral(&m, 1, TCP, 40000, false, (40000, 40010));
+        assert_ne!(g_eph, 40000);
+        assert!((40000..=40010).contains(&g_eph));
+        assert_eq!(m.borrow().host_port(1, TCP, g_eph, false), Some(40000));
+        assert_eq!(m.borrow().guest_port(1, TCP, 40000), Some(g_eph));
+        // Explicit bind onto the active ephemeral guest port tries its host port and fails
+        let mut tried = Vec::new();
+        let err = bind_any(
+            &m,
+            1,
+            TCP,
+            g_eph,
+            false,
+            |p| {
+                tried.push(p);
+                Err(Errno::EADDRINUSE.0)
+            },
+            || None,
+        );
+        assert_eq!(err.err(), Some(Errno::EADDRINUSE));
+        assert_eq!(tried, [40000]);
+        // After releasing the ephemeral lease, explicit bind allocates a fresh host port
+        drop(eph);
+        let (h2, _l2) = bind_any(&m, 1, TCP, g_eph, false, |_| Ok(()), || Some(52000)).unwrap();
+        assert_eq!(h2, 52000);
     }
 }
