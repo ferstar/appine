@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: compute secure exec argument limit before clamping the 8 MB stack limit)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: inotify events for execve and execveat across script, ELF and FUSE retry paths)
 
 ## Responsibilities
 
@@ -68,6 +68,12 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 - `ETXTBSY` if a writable open file refers to the initial file, any nested `#!` script being run
   (checked before its interpreter is opened), the final executable, or its ELF `PT_INTERP`
   interpreter (memfds never count as writers).
+- `ExecOpens` records the open and positive reads of each file, including header reads served
+  by the executable cache. Across FUSE retries it reuses the matching prefix of opens and
+  reports each read once. An open accepted by the daemon counts even if copying the file fails.
+  Scripts close in reverse order after interpreter loading. The new address space retains the
+  main program's open. File-backed interpreter segments retain theirs until unmapped, except
+  on overlay where the mapping holds the real layer file.
 - Credentials: setuid and setgid (the latter with group execute) apply unless `no_new_privs`,
   nosuid, or the owner/group are unmapped; file capabilities come from the xattr; a tracer without
   `CAP_SYS_PTRACE` or a fs context shared with another process makes the execution unsafe, so it
@@ -158,6 +164,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 
 - `kernel/process`: killing and waiting for the other threads, the tgid takeover and
   `leader_exit`, vfork completion (`release_mm`), `fast_changed`, `ExeFile`.
+- `kernel/inotify`: the file and parent watches reached by each exec open, read and close.
 - `kernel/time`: POSIX timer state cleared at execve.
 - `kernel/mm`: `Mm::new`, `share_files`, `into_shared`, `set_layout`, `mmap` and `munmap`
   (segments), `map_anonymous`, `map_vvar`, `find_free` (interpreter and vDSO placement),
@@ -173,7 +180,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 
 - execve changes no process state before killing the other threads: a FUSE retry runs the handler
   again from the start (`kernel/process`'s dispatcher), so everything before the last walk must be
-  repeatable.
+  repeatable. The dispatcher keeps the exec open records across these retries.
 - The unlocked build of the new image touches only the new address space and structures that lock
   themselves (the kernel's file mappings), and re-checks after re-taking the BKL whether the thread
   was killed meanwhile.

@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use appine_engine::Cpu;
 
-use super::{Flow, SysResult, put, read_path};
+use super::{Flow, SysResult, inotify, put, read_path};
 use crate::cell::RefCell;
 use crate::cred::{Cred, FileCaps, XATTR_NAME_CAPS, cap};
 use crate::errno::Errno;
@@ -20,7 +20,7 @@ use crate::signal::{self, AltStack, SigInfo, code};
 use crate::task::{self, FsContext, Task, TaskState};
 use crate::uaccess::UserSlice;
 use crate::vfs::store::{Ino, mode};
-use crate::vfs::{Node, Pseudo, Vfs, normalize};
+use crate::vfs::{Dentry, Node, Pseudo, Vfs, normalize};
 
 const CLONE_VM: u64 = 0x100;
 const CLONE_FS: u64 = 0x200;
@@ -637,9 +637,10 @@ pub(super) fn execve(
     path: u64,
     argv: u64,
     envp: u64,
+    opens: &mut inotify::ExecOpens,
 ) -> Result<bool, Errno> {
     let path = read_path(cx, path)?;
-    exec(cx, cpu, AT_FDCWD, path, argv, envp, 0)
+    exec(cx, cpu, AT_FDCWD, path, (argv, envp), 0, opens)
 }
 
 /// execveat: the path is relative to `dirfd`; with `AT_EMPTY_PATH` and an empty path, `dirfd`
@@ -651,12 +652,13 @@ pub(super) fn execveat(
     path: u64,
     (argv, envp): (u64, u64),
     flags: u32,
+    opens: &mut inotify::ExecOpens,
 ) -> Result<bool, Errno> {
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    exec(cx, cpu, dirfd, path, argv, envp, flags)
+    exec(cx, cpu, dirfd, path, (argv, envp), flags, opens)
 }
 
 fn exec(
@@ -664,20 +666,12 @@ fn exec(
     cpu: &mut Cpu,
     dirfd: i32,
     path: Vec<u8>,
-    argv: u64,
-    envp: u64,
+    (argv, envp): (u64, u64),
     flags: u32,
+    opens: &mut inotify::ExecOpens,
 ) -> Result<bool, Errno> {
     let mut stack_limit = cx.t.group.borrow().rlimits[process::RLIMIT_STACK as usize].0;
     let limit = loader::arg_limit(stack_limit);
-    let mut total = 0;
-    let mut argv = read_strings(cx, argv, &mut total, limit)?;
-    let envp = read_strings(cx, envp, &mut total, limit)?;
-    // The same as Linux since 5.18: an empty argv gets one empty string, so the new program's
-    // argc is at least 1
-    if argv.is_empty() {
-        argv.push(Vec::new());
-    }
     let vfs = cx.vfs()?;
     let files = cx.k().file_maps.clone();
     let cwd = cx.cwd();
@@ -702,9 +696,9 @@ fn exec(
     // Executing through an open regular file (fexecve, /proc/<pid>/fd/<n>): use its host file
     // ([`process::open_open_file`]); deleted files and memfds cannot be opened by inode
     let mut by_file: Option<FileRef> = None;
-    let node = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    let (node, dentry) = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dirfd == AT_FDCWD {
-            cwd.clone()
+            (cwd.clone(), None)
         } else {
             let file = cx.fds().get(dirfd)?;
             let f = file.borrow();
@@ -719,16 +713,16 @@ fn exec(
             if matches!(f.kind, FileKind::Regular { .. }) {
                 by_file = Some(file.clone());
             }
-            node
+            (node, f.dentry.clone())
         }
     } else {
         let start = super::fs::start_dir(cx, dirfd, &path)?;
         exe_at.0 = start.clone();
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        match vfs.resolve(&view, &cred, &root, &start, &path, follow)? {
+        match vfs.walk(&view, &cred, &root, &start, &path, follow)? {
             // An open file not in the store that /proc/<pid>/fd/<n> leads to: deleted files and
             // memfds can be executed, pipes and the like are EACCES
-            Node::Pseudo(_, crate::pseudo::PseudoNode::OpenFd(proc, tid, fd)) => {
+            (Node::Pseudo(_, crate::pseudo::PseudoNode::OpenFd(proc, tid, fd)), _) => {
                 let file = view.open_file(proc, tid, fd).ok_or(Errno::ENOENT)?;
                 let f = file.borrow();
                 let node = f.node().ok_or(Errno::EACCES)?;
@@ -737,7 +731,7 @@ fn exec(
                 if matches!(f.kind, FileKind::Regular { .. }) {
                     by_file = Some(file.clone());
                 }
-                node
+                (node, f.dentry.clone())
             }
             node => node,
         }
@@ -750,17 +744,62 @@ fn exec(
         }
         _ => None,
     };
-    let (mut file, mut st, mut nosuid) = match (&from, &by_file) {
-        (Some(exe), _) => process::open_exe_file(&vfs, &cred, exe)?,
-        (None, Some(f)) => process::open_open_file(&vfs, &cred, &f.borrow())?,
-        (None, None) => process::open_node(&vfs, &cred, &node)?,
+    let open_exec = |node: &Node,
+                     dentry: Option<Dentry>,
+                     from: Option<&process::ExeFile>,
+                     fd: Option<&OpenFile>,
+                     opens: &mut inotify::ExecOpens| {
+        let result = match (from, fd) {
+            (Some(exe), _) => process::open_exe_file(&vfs, &cred, exe),
+            (None, Some(f)) => process::open_open_file(&vfs, &cred, f),
+            (None, None) => process::open_node(&vfs, &cred, node),
+        };
+        if let (Err(Errno::FUSE_RETRY), Node::Fuse(_, id)) = (&result, node) {
+            opens.expect_fuse(crate::vfs::fuse::key(*id), dentry);
+            return Err(Errno::FUSE_RETRY);
+        }
+        let (file, st, nosuid) = result?;
+        let key = from
+            .and_then(|e| e.ovl.as_ref().map(|(_, o, _)| crate::vfs::overlay::key(*o)))
+            .or_else(|| inotify::key_of(node))
+            .unwrap_or(st.ino);
+        opens.push(
+            cx.kr(),
+            key,
+            dentry.or_else(|| from?.dentry.clone()),
+            st.nlink == 0 || from.is_some(),
+            fd.and_then(|f| f.watch.as_ref()),
+        );
+        // deny_write_access follows the open and precedes the first read for every executable.
+        if super::fs::open_for_write(cx, st.ino) {
+            return Err(Errno::ETXTBSY);
+        }
+        Ok((file, st, nosuid))
     };
-    let script = parse_shebang(file.head()).is_some();
-    // A file open for writing cannot be executed, every nested `#!` script included
-    // (do_open_execat's deny_write_access, before its interpreter is looked at)
-    if super::fs::open_for_write(cx, st.ino) {
-        return Err(Errno::ETXTBSY);
+    let (mut file, mut st, mut nosuid) = open_exec(
+        &node,
+        dentry,
+        from.as_deref(),
+        by_file.as_ref().map(|f| f.borrow()).as_deref(),
+        opens,
+    )?;
+
+    let mut total = 0;
+    let mut argv = read_strings(cx, argv, &mut total, limit)?;
+    let envp = read_strings(cx, envp, &mut total, limit)?;
+    // The same as Linux since 5.18: an empty argv gets one empty string, so the new program's
+    // argc is at least 1
+    if argv.is_empty() {
+        argv.push(Vec::new());
     }
+    opens.accessed(cx.kr(), usize::from(!file.head().is_empty()));
+    let script = parse_shebang(file.head()).is_some();
+    let open_interp = |path: &[u8], opens: &mut inotify::ExecOpens| {
+        let (node, dentry) = vfs.walk(&view, &cred, &root, &cwd, path, true)?;
+        let (file, st, nosuid) = open_exec(&node, dentry, None, None, opens)?;
+        opens.accessed(cx.kr(), usize::from(!file.head().is_empty()));
+        Ok((file, st, nosuid, matches!(node, Node::Overlay(..))))
+    };
 
     // `#!` scripts: switch to the interpreter, and argv becomes [interpreter, argument, script
     // path, original argv[1..]]
@@ -782,10 +821,7 @@ fn exec(
         new_argv.push(file_path);
         new_argv.extend(argv.into_iter().skip(1));
         argv = new_argv;
-        (file, st, nosuid) = process::open_executable(&vfs, &view, &cred, &root, &cwd, &interp)?;
-        if super::fs::open_for_write(cx, st.ino) {
-            return Err(Errno::ETXTBSY);
-        }
+        (file, st, nosuid, _) = open_interp(&interp, opens)?;
         exe_at = (cwd.clone(), interp.clone());
         file_path = interp;
     }
@@ -875,18 +911,28 @@ fn exec(
     };
     // An interpreter the caller cannot read makes the process non-dumpable too (would_dump): its
     // owner and group
-    let interp_unreadable = std::cell::Cell::new(None);
-    let mut read_interp = |p: &[u8]| {
-        let (exe, st, _) = process::open_executable(&vfs, &view, &cred, &root, &cwd, p)?;
-        if super::fs::open_for_write(cx, st.ino) {
-            return Err(Errno::ETXTBSY);
-        }
-        if cred.permission(&st, crate::cred::MAY_READ).is_err() {
-            interp_unreadable.set(Some((st.uid, st.gid)));
-        }
-        Ok(exe)
-    };
-    let prepared = loader::prepare(&file, &mut read_interp).map_err(load_error)?;
+    let mut interp_unreadable = None;
+    let mut interp_overlay = None;
+    let mut header_reads = 0;
+    let prepared = loader::prepare(
+        &file,
+        &mut |path, main_reads| {
+            opens.accessed(cx.kr(), 1 + main_reads);
+            let (exe, st, _, overlay) = open_interp(path, opens)?;
+            interp_overlay = Some(overlay);
+            if cred.permission(&st, crate::cred::MAY_READ).is_err() {
+                interp_unreadable = Some((st.uid, st.gid));
+            }
+            Ok(exe)
+        },
+        &mut header_reads,
+    );
+    if header_reads > 0 {
+        opens.accessed(cx.kr(), 1 + header_reads);
+    }
+    let prepared = prepared.map_err(load_error)?;
+    let interp_open = interp_overlay.map(|overlay| (opens.take_last(), overlay));
+    let exe_open = opens.take_last();
     // The new address space is built with the BKL released: mapping the program's segments and
     // building the initial stack took most of execve's time under the lock, and processes at both
     // ends of a pipe or exec'ing at once in a parallel build used to queue. Meanwhile only the new
@@ -911,6 +957,14 @@ fn exec(
         .or_else(|| from.as_deref().filter(|_| !script).and_then(|e| e.mnt()));
     label_image(&mut mm, &image, (&exe, st.ino, main_mnt), interp);
     mm.exe = Some(st.ino);
+    mm.exe_open = Some(exe_open);
+    // An overlay mmap uses the real layer file, so it does not hold the overlay open.
+    if let (Some((interp, false)), Some((_, start, end))) = (&interp_open, &image.interp) {
+        mm.keep_interp_open(*start, *end, interp);
+    }
+    drop(interp_open);
+    // A script is released after switching to its interpreter (last nested script first).
+    opens.close();
     // The process runs in the time namespace for children from here on (entered below); with
     // offsets, the vDSO's clock functions must enter the kernel layer, which adds them
     if cx.task.ns.borrow().time_for_children.offsets_ns() != [0, 0] {
@@ -993,8 +1047,8 @@ fn exec(
             g.dumpable = false;
             cx.task.pdeathsig.set(0);
         } else {
-            g.dumpable = cred.permission(&st, crate::cred::MAY_READ).is_ok()
-                && interp_unreadable.get().is_none();
+            g.dumpable =
+                cred.permission(&st, crate::cred::MAY_READ).is_ok() && interp_unreadable.is_none();
         }
         // The new address space belongs to the caller's user namespace, or to the nearest
         // ancestor where a program file it could not read is owned by mapped IDs (would_dump's
@@ -1003,7 +1057,7 @@ fn exec(
         if cred.permission(&st, crate::cred::MAY_READ).is_err() {
             mm_ns = mm_ns.holding(st.uid, st.gid);
         }
-        if let Some((uid, gid)) = interp_unreadable.get() {
+        if let Some((uid, gid)) = interp_unreadable {
             mm_ns = mm_ns.holding(uid, gid);
         }
         g.mm_user_ns = Some(mm_ns);

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: provider unshare replay refreshes descriptors while shared mappings pin their object)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: exec opens, ELF header reads, close lifetime and the registry of open files)
 
 ## Responsibilities
 
@@ -25,7 +25,7 @@ kernel, so no host notification is used. It provides:
 Root: `core/kernel/src/syscall/inotify.rs`.
 
 Outside the module: where the hooks are called — the file syscalls and renames in `kernel/vfs`,
-opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel/fuse`, cgroup2 file changes in
+opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kernel/fileio`, FUSE operations in `kernel/fuse`, cgroup2 file changes in
 `kernel/cgroup`; readiness, epoll and `O_ASYNC` of inotify fds (`kernel/poll`);
 `/proc/sys/fs/inotify/*` (`kernel/sysctl`) and the fdinfo text's place (`kernel/procfs`); the Files app's change list
 (`kernel/store`) and the machine's `store_changed`, which finds each kernel and takes its BKL
@@ -42,9 +42,10 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
   the last rename cookie, instance and watch counts per user, the three limits under
   `/proc/sys/fs/inotify/`, and the removed inodes whose `IN_DELETE_SELF` waits for files still open
   through the removed name (cleaned up when all watches on the key disappear).
-- `Opened` (on `OpenFile`) — the file's key, the directory key and name it was opened through, the
-  close mask, and `unlinked` (whether its dentry was unlinked or reopened from an unlinked fd, for
-  `IN_EXCL_UNLINK`); its drop reports `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` (Linux's fput).
+- `Opened` — a shared open record on a file description, an executed image or an ELF interpreter
+  mapping. It holds the file key, opening directory and name, close mask and unlinked flag
+  (`IN_EXCL_UNLINK`). Its last reference reports `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE`.
+  The registry indexes these records weakly by inode and record address.
 - Keys: store inode numbers stay below 2^62; overlay nodes take top bits 10 (`overlay::key`, also
   the lock tables' key), FUSE nodes 11 (`fuse::key`), cgroup2 files and directories 01
   (`cgroup::key`).
@@ -98,8 +99,8 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
   writes, truncation and fallocate (`IN_MODIFY`), reads and getdents (`IN_ACCESS`), the last close
   of an open file (`IN_CLOSE_*`).
 - `IN_EXCL_UNLINK` filters path-based open/access/modify/close events (`path_event_unlinked`,
-  `file_io_event`, `Opened::drop`) on both directory and file watches when `Opened::unlinked` is
-  set (marked by `unlinked` on unlink, rmdir, overwriting rename, or host removal across store,
+  `file_io_event`, `OpenRecord::drop`) on both directory and file watches when the dentry is
+  marked unlinked (by `unlinked` on unlink, rmdir, overwriting rename, or host removal across store,
   overlay and FUSE, or when reopened from an unlinked fd); metadata and truncation calls
   (`file_event`: fchmod, fchown, futimens, ftruncate, fsetxattr/fremovexattr) are not filtered.
   cgroup2 nodes are never excluded.
@@ -110,8 +111,13 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
   regular file, device or directory (store, overlay, FUSE, cgroup2 directories) or FUSE file
   records one, whether or not watches exist; store FIFOs and cgroup2 files get none, so they
   report `IN_OPEN` and never `IN_CLOSE_*`. Unlinks and renames update the records of open files,
-  scanning all open files even with no watches; after a deletion the records stay (marked
+  looking up records for the affected key even with no watches; after a deletion the records stay (marked
   unlinked), so non-excluded events still go to the original directory.
+- Exec reports the program, nested scripts and ELF interpreter under the key each was opened
+  through. Header reads report access even on an executable cache hit. An empty file or a file
+  rejected with `ETXTBSY` reports open and close without access. The address space retains
+  the main open and the interpreter's non-overlay file mappings retain theirs. Watches added after exec
+  can therefore receive the last close.
 - `IN_DELETE_SELF` waits until the last open file of the removed name closes (`deleted`); removing
   the last watch on a key (`inotify_rm_watch`, instance drop, or one-shot/`IN_DELETE_SELF`
   delivery) removes any pending `doomed` entry.
@@ -138,6 +144,7 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
   removals (`deleted`); the overlay sweep reading `watched`.
 - `kernel/files`: the hooks from opens (`opened`) and closes, and `FIONREAD`; `kernel/fileio`:
   I/O hooks and the instance's read.
+- `kernel/exec`: logical opens and reads during execve and execveat.
 - `kernel/fuse`: hooks for FUSE namespace changes; `watched` in `in_use`.
 - `kernel/cgroup`: `kernfs_modified` for cgroup2 file changes.
 - `kernel/sysctl`: the registry's limits behind `/proc/sys/fs/inotify/*`; `kernel/procfs`: the
@@ -175,8 +182,6 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
 - **Namespace-file watch lifetime:** repeated watches on `/proc/self/ns/mnt` reuse the descriptor
   by namespace ID. Native Linux 6.8 returned a new descriptor on each lookup when no fd pinned
   the nsfs inode, and reused it while an fd was open.
-- **Executing a file reports nothing:** execve opens and reads the program (and a script's
-  interpreter) without `IN_OPEN`, `IN_ACCESS` or `IN_CLOSE_NOWRITE`.
 - **Overlay layers see little:** watches on a layer's own directories and files see, of what is
   done through the overlay, only creations (Linux's overlay changes the upper layer through the
   VFS, which reports copy-ups, removals, renames and attribute changes there too); a hard link

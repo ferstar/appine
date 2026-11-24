@@ -183,6 +183,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     // looked up (mount::sweep_overlays)
     let in_syscall = InSyscall::enter(cx.task, nr);
     let mut retries = 0;
+    let mut exec_opens = inotify::ExecOpens::default();
     let result = loop {
         let result = match nr {
             // These do not return, or set all registers themselves. When traced they may stop to
@@ -203,14 +204,22 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             crate::bug::TEST_SYSCALL => crate::bug::test_hook(cx, cpu, a[0], a[1]),
             221 => {
                 let tid = cx.tid();
-                match proc::execve(cx, cpu, a[0], a[1], a[2]) {
+                match proc::execve(cx, cpu, a[0], a[1], a[2], &mut exec_opens) {
                     Ok(doomed) => return exec_done(cx, cpu, tid, doomed),
                     Err(e) => Err(e),
                 }
             }
             281 => {
                 let tid = cx.tid();
-                match proc::execveat(cx, cpu, a[0] as i32, a[1], (a[2], a[3]), a[4] as u32) {
+                match proc::execveat(
+                    cx,
+                    cpu,
+                    a[0] as i32,
+                    a[1],
+                    (a[2], a[3]),
+                    a[4] as u32,
+                    &mut exec_opens,
+                ) {
                     Ok(doomed) => return exec_done(cx, cpu, tid, doomed),
                     Err(e) => Err(e),
                 }
@@ -573,15 +582,24 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
                     Errno::EINTR => Errno::ERESTARTSYS,
                     _ => Errno::EFAULT,
                 }),
-                None => crate::vfs::fuse::serve(cx),
+                None => crate::vfs::fuse::serve(cx, |k, id| {
+                    exec_opens.fuse_opened(k, crate::vfs::fuse::key(id))
+                }),
             };
             match served {
-                Ok(()) => continue,
+                Ok(()) => {
+                    exec_opens.retry();
+                    continue;
+                }
                 Err(e) => break Err(e),
             }
         }
         break result;
     };
+    // A failed exec (including a failed FUSE request) releases the files already opened.
+    if matches!(nr, 221 | 281) {
+        exec_opens.close();
+    }
     // Releases of FUSE files dropped while their connection was borrowed
     crate::vfs::fuse::flush_released();
     // AF_UNIX cycles left by drops that had no &mut Kernel (UnixSocket::drop, AIO polls, accept4)

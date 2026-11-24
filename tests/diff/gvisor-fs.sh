@@ -8,8 +8,6 @@
 SKIP="SetModeTest.SetMode/*"
 # kernel/inotify: procfs opens and reads do not emit inotify events
 SKIP="$SKIP:Inotify.KernfsBasic:Inotify.KernfsDynamicFileAcrossSave"
-# kernel/inotify: executing a file emits no inotify events
-SKIP="$SKIP:Inotify.Exec"
 # kernel/locks: locks on inode-less files (pipes) are no-ops
 SKIP="$SKIP:FlockTestNoFixture.FlockPipe"
 # kernel/vfs: scoped openat2 never returns EAGAIN (the rename variants loop for minutes)

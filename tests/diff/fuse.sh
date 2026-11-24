@@ -313,7 +313,10 @@ label = {2: "d", 3: "f1", 4: "f2", 5: "f3", 6: "g"}
 held = {n: 0 for n in label}
 def attr(n):
     mode = 0o40755 if n in names else 0o100644
-    return struct.pack("<6Q4x4x4xIIIIIII", n, 0, 0, 0, 0, 0, mode, 1, 0, 0, 0, 4096, 0)
+    size = 1 if n == 5 else 0
+    if n == 5:
+        mode = 0o100755
+    return struct.pack("<6Q4x4x4xIIIIIII", n, size, 0, 0, 0, 0, mode, 1, 0, 0, 0, 4096, 0)
 def state():
     with open("/tmp/fuse/zs.new", "w") as f:
         f.write("".join("%s %d\n" % (label[n], held[n]) for n in sorted(label)))
@@ -341,6 +344,8 @@ while True:
         reply(unique, body=struct.pack("<QII", 3600, 0, 0) + attr(node))
     elif op in (14, 27):
         reply(unique, body=struct.pack("<QII", 0, 0, 0))
+    elif op == 15 and node == 5:
+        reply(unique, 5)  # EIO reading the executable
     elif op in (18, 29, 25):
         reply(unique)
     elif op == 2:
@@ -361,6 +366,28 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
     grep -q ' /tmp/fuse/z ' /proc/self/mountinfo && break
     sleep 0.5
 done
+# A retry opens the shebang interpreter on FUSE, then the daemon fails its first read.
+# Both files have been opened, and only the outer script supplied any bytes.
+printf '#!/tmp/fuse/z/f3\n' > launch
+chmod 755 launch
+python3 - <<'PYEXEC'
+import ctypes, errno, os, struct
+libc = ctypes.CDLL(None, use_errno=True)
+fd = libc.inotify_init1(os.O_NONBLOCK)
+names = {}
+for target in (b"launch", b"z/f3"):
+    wd = libc.inotify_add_watch(fd, target, 0x31)
+    assert wd >= 0
+    names[wd] = target.decode()
+try:
+    os.execv("./launch", ["launch"])
+except OSError as exc:
+    print("FUSE exec error:", errno.errorcode[exc.errno])
+events = os.read(fd, 4096)
+for wd, mask, _, _ in struct.iter_unpack("iIII", events):
+    print("FUSE exec event:", names[wd], hex(mask))
+os.close(fd)
+PYEXEC
 stat -c %n z/f1 z/f2 z/f3 z/d/g
 exec 3< z/f2
 (cd z/d && sleep 3) &

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: forced unmount aborts outstanding requests and wakes waiters across the connection)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: inotify open and close of executable files when a program snapshot fails)
 
 ## Responsibilities
 
@@ -328,6 +328,10 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   its node's key as inode number, so running it and writing it exclude each other (ETXTBSY).
 
 ### inotify
+
+- When the daemon accepts a program open, `serve` reports it to the exec attempt before
+  fetching attributes or copying data. A subsequent read failure still delivers open and close.
+  The successful retry reuses the same open.
 
 - Watches key FUSE nodes by `key`; reads and writes report `IN_ACCESS`/`IN_MODIFY`, opens (with
   `IN_MODIFY` on `O_TRUNC`) and closes through the open file's record, creations `IN_CREATE` (once

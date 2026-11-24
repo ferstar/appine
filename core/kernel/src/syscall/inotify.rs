@@ -468,7 +468,9 @@ pub struct Registry {
     pub max_watches: usize,
     /// Inodes whose last link has been removed but that still have files open through that name:
     /// `IN_DELETE_SELF` is reported once those files have all closed.
-    doomed: HashMap<Ino, Vec<Weak<RefCell<OpenFile>>>>,
+    doomed: HashMap<Ino, Vec<Weak<OpenRecord>>>,
+    /// Live file descriptions, including files held by exec rather than in an fd table.
+    opened: BTreeMap<(Ino, usize), Weak<OpenRecord>>,
 }
 
 impl Default for Registry {
@@ -481,11 +483,18 @@ impl Default for Registry {
             max_instances: MAX_INSTANCES,
             max_watches: MAX_WATCHES,
             doomed: HashMap::new(),
+            opened: BTreeMap::new(),
         }
     }
 }
 
 impl Registry {
+    fn opens_of(&self, ino: Ino) -> impl Iterator<Item = Rc<OpenRecord>> + '_ {
+        self.opened
+            .range((ino, 0)..=(ino, usize::MAX))
+            .filter_map(|(_, f)| f.upgrade())
+    }
+
     pub(crate) fn watches(&self, ino: Ino) -> bool {
         self.by_ino.contains_key(&ino)
     }
@@ -578,28 +587,82 @@ impl Registry {
 /// Carried by an open store, overlay or FUSE file: fd-based events are reported to its directory
 /// through it, `unlinked` tracks whether its dentry was unlinked (`IN_EXCL_UNLINK`), and
 /// `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` is reported when the last reference is released.
-pub struct Opened {
+#[derive(Clone)]
+pub struct Opened(Rc<OpenRecord>);
+
+struct OpenRecord {
     registry: Weak<RefCell<Registry>>,
     ino: Ino,
-    parent: Option<(Ino, Vec<u8>)>,
+    parent: RefCell<Option<(Ino, Vec<u8>)>>,
     close: u32,
-    unlinked: bool,
+    unlinked: std::cell::Cell<bool>,
 }
 
 impl Opened {
+    fn new(
+        registry: &Rc<RefCell<Registry>>,
+        ino: Ino,
+        parent: Option<(Ino, Vec<u8>)>,
+        close: u32,
+        unlinked: bool,
+    ) -> Self {
+        let record = Rc::new(OpenRecord {
+            registry: Rc::downgrade(registry),
+            ino,
+            parent: RefCell::new(parent),
+            close,
+            unlinked: unlinked.into(),
+        });
+        let weak = Rc::downgrade(&record);
+        let mut r = registry.borrow_mut();
+        if let Some(doomed) = r.doomed.get_mut(&ino) {
+            doomed.push(weak.clone());
+        }
+        r.opened.insert((ino, Rc::as_ptr(&record).addr()), weak);
+        Self(record)
+    }
+
     pub(crate) fn is_unlinked(&self) -> bool {
-        self.unlinked
+        self.0.unlinked.get()
+    }
+
+    fn location(&self) -> (Ino, Option<(Ino, Vec<u8>)>, bool) {
+        (
+            self.0.ino,
+            self.0.parent.borrow().clone(),
+            self.is_unlinked(),
+        )
     }
 }
 
-impl Drop for Opened {
+impl OpenRecord {
+    fn at(&self, dir: Ino, name: &[u8]) -> bool {
+        self.parent
+            .borrow()
+            .as_ref()
+            .is_some_and(|(d, n)| *d == dir && n == name)
+    }
+
+    fn notify(&self, r: &mut Registry, mask: u32, unlinked: bool) {
+        let parent = self.parent.borrow();
+        r.notify(
+            self.ino,
+            parent.as_ref().map(|(d, n)| (*d, n.as_slice())),
+            mask,
+            unlinked,
+        );
+    }
+}
+
+impl Drop for OpenRecord {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade()
             && let Ok(mut r) = registry.try_borrow_mut()
         {
+            r.opened
+                .remove(&(self.ino, std::ptr::from_ref(self).addr()));
             if !r.by_ino.is_empty() {
-                let parent = self.parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
-                r.notify(self.ino, parent, self.close, self.unlinked);
+                self.notify(&mut r, self.close, self.unlinked.get());
             }
             if !r.doomed.is_empty() {
                 r.closed(self.ino);
@@ -720,12 +783,12 @@ fn file_event_inner(k: &Kernel, f: &OpenFile, mask: u32, unlinked: bool) {
         return;
     };
     let mask = mask | dir;
-    let parent = f
-        .watch
-        .as_ref()
-        .and_then(|w| w.parent.as_ref())
-        .map(|(d, n)| (*d, n.as_slice()));
-    k.inotify.borrow_mut().notify(ino, parent, mask, unlinked);
+    let mut registry = k.inotify.borrow_mut();
+    if let Some(open) = &f.watch {
+        open.0.notify(&mut registry, mask, unlinked);
+    } else {
+        registry.notify(ino, None, mask, unlinked);
+    }
 }
 
 /// A child named `name` in directory `dir` was created, deleted, moved in or moved out.
@@ -767,36 +830,108 @@ pub(crate) fn opened(
     unlinked: bool,
 ) -> Option<Opened> {
     let (ino, dir) = file_key(f)?;
-    Some(Opened {
-        registry: Rc::downgrade(&k.inotify),
-        ino,
-        parent,
-        close: dir
-            | if f.writable() {
-                IN_CLOSE_WRITE
-            } else {
-                IN_CLOSE_NOWRITE
-            },
-        unlinked,
-    })
+    let close = if f.writable() {
+        IN_CLOSE_WRITE
+    } else {
+        IN_CLOSE_NOWRITE
+    };
+    Some(Opened::new(&k.inotify, ino, parent, dir | close, unlinked))
+}
+
+/// One exec's logical opens. A FUSE retry walks the same prefix again, sometimes
+/// after another task renamed or replaced a file. Reuse only the matching opens.
+#[derive(Default)]
+pub(super) struct ExecOpens {
+    files: Vec<(Opened, usize)>,
+    next: usize,
+    pending_fuse: Option<(Ino, Option<crate::vfs::Dentry>)>,
+}
+
+impl ExecOpens {
+    pub(super) fn retry(&mut self) {
+        self.next = 0;
+        self.pending_fuse = None;
+    }
+
+    pub(super) fn expect_fuse(&mut self, ino: Ino, dentry: Option<crate::vfs::Dentry>) {
+        self.pending_fuse = Some((ino, dentry));
+    }
+
+    pub(super) fn fuse_opened(&mut self, k: &Kernel, ino: Ino) {
+        if let Some((key, dentry)) = self.pending_fuse.take() {
+            debug_assert_eq!(key, ino);
+            self.push(k, ino, dentry, false, None);
+        }
+    }
+
+    pub(super) fn push(
+        &mut self,
+        k: &Kernel,
+        ino: Ino,
+        dentry: Option<crate::vfs::Dentry>,
+        unlinked: bool,
+        source: Option<&Opened>,
+    ) {
+        let (ino, parent, unlinked) = source.map(Opened::location).unwrap_or_else(|| {
+            (
+                ino,
+                dentry.and_then(|(dir, name)| Some((key_of(&dir)?, name))),
+                unlinked,
+            )
+        });
+        let same = self.files.get(self.next).is_some_and(|(f, _)| {
+            f.0.ino == ino && f.is_unlinked() == unlinked && *f.0.parent.borrow() == parent
+        });
+        if !same {
+            self.close_after(self.next);
+            let file = Opened::new(&k.inotify, ino, parent, IN_CLOSE_NOWRITE, unlinked);
+            if active(k) {
+                file.0
+                    .notify(&mut k.inotify.borrow_mut(), IN_OPEN, unlinked);
+            }
+            self.files.push((file, 0));
+        }
+        self.next += 1;
+    }
+
+    /// Report positive reads on the current open up to `count`, skipping those reported on a retry.
+    pub(super) fn accessed(&mut self, k: &Kernel, count: usize) {
+        let (file, seen) = &mut self.files[self.next - 1];
+        if count > *seen {
+            if active(k) {
+                let mut r = k.inotify.borrow_mut();
+                for _ in *seen..count {
+                    file.0.notify(&mut r, IN_ACCESS, file.is_unlinked());
+                }
+            }
+            *seen = count;
+        }
+    }
+
+    fn close_after(&mut self, index: usize) {
+        while self.files.len() > index {
+            self.files.pop();
+        }
+    }
+
+    pub(super) fn take_last(&mut self) -> Opened {
+        self.close_after(self.next);
+        self.next -= 1;
+        self.files.pop().unwrap().0
+    }
+
+    pub(super) fn close(&mut self) {
+        self.close_after(0);
+        self.next = 0;
+    }
 }
 
 /// The name `(dir, name)` of `ino` was unlinked, rmdir'd or replaced by a rename: mark every open
 /// file opened through that name as unlinked (`d_unlinked`) so `IN_EXCL_UNLINK` filters its
 /// open/access/modify/close events even when another hard link remains or watches are added later.
 pub(crate) fn unlinked(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
-    for f in k.open_files() {
-        let Ok(mut f) = f.try_borrow_mut() else {
-            continue;
-        };
-        if let Some(w) = f.watch.as_mut()
-            && w.ino == ino
-            && w.parent
-                .as_ref()
-                .is_some_and(|(d, n)| *d == dir && n == name)
-        {
-            w.unlinked = true;
-        }
+    for file in k.inotify.borrow().opens_of(ino).filter(|f| f.at(dir, name)) {
+        file.unlinked.set(true);
     }
 }
 
@@ -809,27 +944,14 @@ pub(crate) fn renamed(
     to: (Ino, &[u8]),
     moved: impl FnOnce() -> Option<Ino>,
 ) {
-    let at = |f: &OpenFile| {
-        f.watch
-            .as_ref()
-            .and_then(|w| w.parent.as_ref())
-            .is_some_and(|(d, n)| *d == from.0 && n == from.1)
-    };
-    let files: Vec<_> = k
-        .open_files()
-        .into_iter()
-        .filter(|f| at(&f.borrow()))
-        .collect();
-    if files.is_empty() {
+    if k.inotify.borrow().opened.is_empty() {
         return;
     }
-    let Some(ino) = moved() else {
-        return;
-    };
-    for f in files {
-        let mut f = f.borrow_mut();
-        if let Some(w) = f.watch.as_mut().filter(|w| w.ino == ino && !w.unlinked) {
-            w.parent = Some((to.0, to.1.to_vec()));
+    if let Some(ino) = moved() {
+        for file in k.inotify.borrow().opens_of(ino) {
+            if !file.unlinked.get() && file.at(from.0, from.1) {
+                *file.parent.borrow_mut() = Some((to.0, to.1.to_vec()));
+            }
         }
     }
 }
@@ -840,28 +962,16 @@ pub(crate) fn deleted(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
     if !k.inotify.borrow().by_ino.contains_key(&ino) {
         return;
     }
-    let open: Vec<_> = k
-        .open_files()
-        .iter()
-        .filter(|f| {
-            f.borrow().watch.as_ref().is_some_and(|w| {
-                w.ino == ino
-                    && w.parent
-                        .as_ref()
-                        .is_some_and(|(d, n)| *d == dir && n == name)
-            })
-        })
-        .map(Rc::downgrade)
+    let mut registry = k.inotify.borrow_mut();
+    let open: Vec<_> = registry
+        .opens_of(ino)
+        .filter(|f| f.at(dir, name))
+        .map(|f| Rc::downgrade(&f))
         .collect();
     if open.is_empty() {
-        path_event(k, ino, None, IN_DELETE_SELF);
+        registry.notify(ino, None, IN_DELETE_SELF, false);
     } else {
-        k.inotify
-            .borrow_mut()
-            .doomed
-            .entry(ino)
-            .or_default()
-            .extend(open);
+        registry.doomed.entry(ino).or_default().extend(open);
     }
 }
 
@@ -1040,27 +1150,26 @@ mod tests {
         let i = Rc::new(RefCell::new(Inotify::default()));
         let wd = watch(&mut registry.borrow_mut(), &i, 7, IN_ALL_EVENTS);
         let open = || {
-            let file = OpenFile::new(
-                FileKind::Path(Node::Store(crate::vfs::ROOT_MOUNT, 7)),
-                oflags::O_RDONLY,
-            );
-            file.borrow_mut().watch = Some(Opened {
-                registry: Rc::downgrade(&registry),
-                ino: 7,
-                parent: Some((1, b"f".to_vec())),
-                close: IN_CLOSE_NOWRITE,
-                unlinked: false,
-            });
-            file
+            Opened::new(
+                &registry,
+                7,
+                Some((1, b"f".to_vec())),
+                IN_CLOSE_NOWRITE,
+                false,
+            )
         };
         let (a, b) = (open(), open());
         registry
             .borrow_mut()
             .doomed
-            .insert(7, vec![Rc::downgrade(&a), Rc::downgrade(&b)]);
+            .insert(7, vec![Rc::downgrade(&a.0), Rc::downgrade(&b.0)]);
+        // An exec through a still-open fd gets a new open after unlink.
+        let exe = open();
         drop(a);
         assert_eq!(events(&i), vec![(wd, IN_CLOSE_NOWRITE, vec![])]);
         drop(b);
+        assert_eq!(events(&i), vec![(wd, IN_CLOSE_NOWRITE, vec![])]);
+        drop(exe);
         assert_eq!(
             events(&i),
             vec![
@@ -1073,26 +1182,66 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_closes_after_inherited_and_remapped_segments() {
+        use crate::mm::{Mm, flags};
+        use appine_engine::{PAGE_SIZE, prot};
+        use std::os::fd::AsRawFd;
+
+        let registry = Rc::new(RefCell::new(Registry::default()));
+        let i = Rc::new(RefCell::new(Inotify::default()));
+        let wd = watch(&mut registry.borrow_mut(), &i, 7, IN_CLOSE_NOWRITE);
+        let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let src = Some((file.as_raw_fd(), 0, false));
+        let parent = Mm::new().into_shared();
+        let addr = parent
+            .borrow_mut()
+            .mmap(0, PAGE_SIZE, prot::READ, flags::MAP_PRIVATE, src)
+            .unwrap();
+        let open = Opened::new(&registry, 7, None, IN_CLOSE_NOWRITE, false);
+        parent
+            .borrow_mut()
+            .keep_interp_open(addr, addr + PAGE_SIZE, &open);
+        drop(open);
+        let child = parent.borrow_mut().fork().unwrap();
+        drop(parent);
+        assert!(events(&i).is_empty());
+
+        let mut mm = child.borrow_mut();
+        let (dst, refill) = mm.mremap_dontunmap(addr, PAGE_SIZE, None).unwrap();
+        assert_eq!(refill.len(), 1);
+        mm.mmap(
+            addr,
+            PAGE_SIZE,
+            prot::READ,
+            flags::MAP_PRIVATE | flags::MAP_FIXED,
+            src,
+        )
+        .unwrap();
+        mm.apply_refill_flags(&refill[0]);
+        drop(refill);
+        mm.munmap(dst, PAGE_SIZE).unwrap();
+        assert!(events(&i).is_empty());
+        mm.munmap(addr, PAGE_SIZE).unwrap();
+        assert_eq!(events(&i), vec![(wd, IN_CLOSE_NOWRITE, vec![])]);
+    }
+
+    #[test]
     fn delete_self_entry_clears_when_watches_disappear_before_close() {
         let registry = Rc::new(RefCell::new(Registry::default()));
         let i = Rc::new(RefCell::new(Inotify::default()));
         i.borrow_mut().registry = Rc::downgrade(&registry);
         watch(&mut registry.borrow_mut(), &i, 9, IN_ALL_EVENTS);
-        let file = OpenFile::new(
-            FileKind::Path(Node::Store(crate::vfs::ROOT_MOUNT, 9)),
-            oflags::O_RDONLY,
+        let file = Opened::new(
+            &registry,
+            9,
+            Some((1, b"g".to_vec())),
+            IN_CLOSE_NOWRITE,
+            true,
         );
-        file.borrow_mut().watch = Some(Opened {
-            registry: Rc::downgrade(&registry),
-            ino: 9,
-            parent: Some((1, b"g".to_vec())),
-            close: IN_CLOSE_NOWRITE,
-            unlinked: true,
-        });
         registry
             .borrow_mut()
             .doomed
-            .insert(9, vec![Rc::downgrade(&file)]);
+            .insert(9, vec![Rc::downgrade(&file.0)]);
         // Dropping the inotify instance removes the last watch on inode 9 and cleans doomed
         drop(i);
         assert!(registry.borrow().by_ino.is_empty());
@@ -1101,7 +1250,7 @@ mod tests {
         registry
             .borrow_mut()
             .doomed
-            .insert(9, vec![Rc::downgrade(&file)]);
+            .insert(9, vec![Rc::downgrade(&file.0)]);
         drop(file);
         assert!(registry.borrow().doomed.is_empty());
     }

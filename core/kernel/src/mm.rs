@@ -217,6 +217,7 @@ pub struct Refill {
     pub name: Option<Rc<[u8]>>,
     pub mnt: Option<crate::vfs::MountId>,
     pub flags: VmaFlags,
+    interp_open: Option<crate::syscall::Opened>,
 }
 
 /// A host-page-aligned slice of a live [`HostRegion`] retained across a BKL release so
@@ -467,6 +468,8 @@ struct Vma {
     /// The name shown in `/proc/<pid>/maps` (the mapped file or program) and the file's inode.
     name: Option<Rc<[u8]>>,
     ino: u64,
+    /// The ELF interpreter's open file, retained by its file-backed segments.
+    interp_open: Option<crate::syscall::Opened>,
     /// The mount the mapped file was opened through (None for anonymous, memfd, vvar, SysV shm).
     mnt: Option<MountPin>,
     /// The host address corresponding to this VMA's start. For shared anonymous memory
@@ -640,6 +643,8 @@ pub struct Mm {
     pub lock_onfault: bool,
     /// The store inode of the program file being executed (ETXTBSY).
     pub exe: Option<u64>,
+    /// The main program remains open even after its last segment is unmapped.
+    pub(crate) exe_open: Option<crate::syscall::Opened>,
     /// Which register set Tier 1 uses when translating this program, chosen per program at
     /// execve (Go gets a different one).
     pub dbt_regs: appine_engine::DbtRegs,
@@ -724,6 +729,7 @@ impl Mm {
             lock_future: false,
             lock_onfault: false,
             exe: None,
+            exe_open: None,
             dbt_regs: appine_engine::DbtRegs::Default,
             memops: Vec::new(),
             memops_dirty: false,
@@ -900,6 +906,14 @@ impl Mm {
         }
     }
 
+    pub(crate) fn keep_interp_open(&mut self, start: u64, end: u64, file: &crate::syscall::Opened) {
+        for (_, v) in self.vmas.range_mut(start..end) {
+            if v.file_id.is_some() {
+                v.interp_open = Some(file.clone());
+            }
+        }
+    }
+
     /// Records the mount through which the file mapped at `[start, start + len)` was opened
     /// (keeps the mount busy for `umount2` and reports its release when unmapped).
     pub fn set_mnt(&mut self, start: u64, len: u64, mnt: crate::vfs::MountId) {
@@ -940,6 +954,7 @@ impl Mm {
     pub fn apply_refill_flags(&mut self, r: &Refill) {
         if let Some(v) = self.vmas.get_mut(&r.start) {
             r.flags.apply_to(v);
+            v.interp_open = r.interp_open.clone();
         }
     }
 
@@ -1325,6 +1340,12 @@ impl Mm {
     /// Unregisters a thread that no longer uses this address space (exit or execve).
     pub fn remove_user(&mut self, user: &Arc<TaskSync>) {
         self.users.retain(|u| !Arc::ptr_eq(u, user));
+        // Emit the final close under the BKL when the address space loses its last user.
+        if self.users.is_empty() && self.exe_open.take().is_some() {
+            for v in self.vmas.values_mut() {
+                v.interp_open = None;
+            }
+        }
     }
 
     // ---- Guest page faults ----
@@ -2275,6 +2296,7 @@ impl Mm {
                     name: v.name.clone(),
                     mnt: v.mnt.as_ref().map(|m| m.0),
                     flags: VmaFlags::of(v),
+                    interp_open: v.interp_open.clone(),
                 }),
             }
         }
@@ -3699,6 +3721,7 @@ impl Mm {
         child.membarrier = self.membarrier;
         child.auxv = self.auxv.clone();
         child.exe = self.exe;
+        child.exe_open = self.exe_open.clone();
         child.dbt_regs = self.dbt_regs;
         child.memops = self.memops.clone();
         child.mmap_top = self.mmap_top;
@@ -3839,6 +3862,7 @@ impl Mm {
             c.file_id = v.file_id;
             c.content = v.content;
             c.file = v.file.clone();
+            c.interp_open = v.interp_open.clone();
             c.shm = v.shm;
             c.growsdown = v.growsdown;
             c.noreserve = v.noreserve;
@@ -4787,6 +4811,7 @@ impl Mm {
                 host,
                 file_len,
                 cow: false,
+                interp_open: None,
                 file_id: None,
                 content: None,
                 file: None,

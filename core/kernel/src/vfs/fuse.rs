@@ -1918,7 +1918,10 @@ pub(crate) fn need(q: Query) -> Errno {
 /// the BKL released; the dispatcher then runs the syscall again. A lookup of a missing name is
 /// cached as such; any other error ends the syscall with it, as a failed lookup ends Linux's
 /// walk.
-pub(crate) fn serve(cx: &mut Cx<'_>) -> Result<(), Errno> {
+pub(crate) fn serve(
+    cx: &mut Cx<'_>,
+    program_opened: impl FnOnce(&crate::kernel::Kernel, FuseId),
+) -> Result<(), Errno> {
     let Some(q) = QUERY.with_borrow_mut(Option::take) else {
         return Err(Errno::EIO);
     };
@@ -1932,6 +1935,7 @@ pub(crate) fn serve(cx: &mut Cx<'_>) -> Result<(), Errno> {
         Query::Program(id) => {
             use crate::fd::oflags;
             let h = open(cx, &vfs, id, oflags::O_RDONLY | oflags::O_LARGEFILE, false)?;
+            program_opened(cx.kr(), id);
             let size = getattr(cx, &vfs, id, Some(h.fh))?.size;
             let copy = snapshot(cx, (&h.conn, h.nodeid, h.fh, h.flags), 0, size)?;
             drop(h);

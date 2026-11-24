@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared store mappings pin their backing before mmap and provider truncation clips live translations)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: main executable and interpreter open records across unmap, fork and last-user exit)
 
 ## Responsibilities
 
@@ -339,6 +339,10 @@ signals may still be delivered).
   shrink; guest faults can then observe EOF or regrowth. Private mappings retain their backing.
 
 ### Introspection and teardown
+
+- After guest exec, `exe_open` holds the main program's inotify open record. Fork shares it.
+  Non-overlay file-backed interpreter VMAs share their open record across splits and fork.
+  Their last unmap releases it. Leaving the address space with no users releases its remaining exec opens.
 
 - `regions` labels each VMA (file name, else `[stack]` for the VMA containing `start_stack` and the
   contiguous same-prot growsdown VMAs below it, else `[vdso]`, else `[vvar]` for the foreign VMA,
