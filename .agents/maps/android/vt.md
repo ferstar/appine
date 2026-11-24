@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 9 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: cancel queued writes on hangup/exit/release, clear progress/status on reset, and track console epochs)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: expire transient program reports at command and primary prompt boundaries)
 
 ## Responsibilities
 
@@ -115,8 +115,8 @@ login script and prompt-mark producers (`android/setup`).
 - `onOutput()` runs directly on `vt-pump` without checking `released` and calls
   `view?.postInvalidateOnAnimation()`. All other native callbacks post to `main`: `onProgress` and
   `applyReports` guard `!released && isRunning`; `onTitle`, `onBell`, `onClipboard`,
-  `onNotification`, `onClipboardRead`, `onCommandFinished`, `onTmuxDetached` and `onForeground`
-  guard `!released`.
+  `onNotification`, `onClipboardRead`, `onCommandFinished` and `onTmuxDetached` guard `!released`.
+  `onForeground` uses the progress and status queues.
 - Clipboard reads (`OSC 52 ; <clipboard> ; ?`): `onClipboardRead(kind, count)` appends `count`
   entries to `clipboardReads` and notifies `events.onClipboardRead(this)` only when the queue was
   empty (coalescing concurrent reads into one user prompt). `answerClipboardRead(text)` formats
@@ -135,11 +135,10 @@ login script and prompt-mark producers (`android/setup`).
   `records` (`LinkedHashMap`), evicting the oldest entry past `MAX_STATUS_RECORDS` (64).
   `updateStatus` selects the most urgent record (`blocked > error > done > working > idle`, ties to
   most recently updated) and fires `events.onStatusChanged` on value change.
-- Foreground clearing and seen: when `android/vtcore`'s pump sees the console's foreground process
-  group change on a later read with no report, `onForeground` calls `setProgress(null)` and drops
-  all status records except `STATUS_DONE` and `STATUS_ERROR` (firing `onStatusChanged` per cleared
-  side). `statusSeen()` (called when the tab is in front) removes `STATUS_DONE` and `STATUS_ERROR`
-  records; shell exit drops everything.
+- A command end or primary prompt expires earlier progress and transient status records. A later
+  report in the same read survives. A foreground process-group change observed on a read without
+  reports sends the same progress removal and ordered status expiry through `onForeground`.
+  Done and error records remain until `statusSeen()` when the tab is in front. Shell exit clears all.
 - `onCommandFinished(hasExit, exit, millis)` converts `exit.takeIf { hasExit }` and forwards to
   `Events`; `onTmuxDetached` forwards to `Events` (where `TerminalService` displays a notice).
 
@@ -235,17 +234,11 @@ login script and prompt-mark producers (`android/setup`).
 
 ## Confirmed bugs / technical debt
 
-- **Foreground-group status tracking outlives exited or background commands:** progress and status
-  records clear on foreground process-group changes rather than OSC 133 prompt marks (even though
-  `android/vtcore` installs the OSC 133 callback for command timing), so reports from an
-  already-exited command or a background job can outlive their command.
 - **Shell mark coverage debt inherited from `android/vtcore`:** `busy` and command-completion
   events inherit `android/vtcore`'s prompt-marking and ash/bash parsing limitations.
 
 ## Open questions
 
-- Should a background tab's progress and status clear at the next OSC 133 prompt mark instead of on
-  foreground process-group changes?
 - Should a status notification name the record's `app` when it has no title rather than the tab's
   title?
 

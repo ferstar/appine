@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: private file growth across close, fork and mremap)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: address space availability during shared file mapping migration)
 
 ## Responsibilities
 
@@ -334,8 +334,9 @@ signals may still be delivered).
   fails leaves the mappings' EOF at the requested length.
 - When a guest or Files app write gives a store file its own object (`kernel/fileio`'s
   `make_private` and `host_unshared`), its shared mappings follow it. The move selects non-FUSE
-  mappings of that store inode whose host file differs from the current object. If any address
-  space cannot be borrowed, all mappings stay in place. Otherwise `file_moving`
+  mappings of that store inode whose host file differs from the current object. Guest unsharing
+  checks every live address space before publishing the copy. Host replay enters with the BKL
+  freshly acquired. In both cases `file_moving`
   first removes, in every address space, the entries past the new object's length (as truncation
   does) and each changed one syncs; then `file_moved` maps the new object over each of their host
   regions with `MAP_FIXED` at the same host addresses, so entries and TLBs stay valid, and points

@@ -26,6 +26,7 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
+import java.util.concurrent.CompletableFuture
 import kotlin.concurrent.thread
 
 /**
@@ -52,15 +53,19 @@ class MachineTest {
 
     private fun start(tier: Int) = Native.start(Rootfs.store(context).path, tier, false).also { machines.add(it) }
 
-    private fun withAlpineStore(name: String, test: (String) -> Unit) {
+    private fun withTempStore(name: String, test: (File) -> Unit) {
         val store = File(context.cacheDir, name)
         store.deleteRecursively()
         try {
-            Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
-            test(store.path)
+            test(store)
         } finally {
             store.deleteRecursively()
         }
+    }
+
+    private fun withAlpineStore(name: String, test: (String) -> Unit) = withTempStore(name) { store ->
+        Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
+        test(store.path)
     }
 
     private fun <T> withMachine(store: String, test: (Long) -> T): T {
@@ -1238,44 +1243,65 @@ class MachineTest {
         }
     }
 
-    /**
-     * The fastest mirror goes into the sources only while they are still exactly what the import
-     * wrote: also while the kernel runs, and the guest sees it at once. Sources already switched,
-     * edited by the user or deleted are left alone.
-     */
-    @Test
-    fun mirrorIsWrittenOnlyIntoUntouchedSources() {
-        val machine = start(1)
+    @Test(timeout = 60000)
+    fun mirrorSelectionEndsBeforeTheGuestCanEditSources() = withTempStore("mirror-selection") { store ->
         val distro = Rootfs.Distro.ALPINE
+        val (official, tuna, ustc, aliyun) = distro.mirrors
+        val late = CompletableFuture<Double?>()
+        Rootfs.prepare(context, distro, store = store) {
+            mapOf(
+                official to CompletableFuture.completedFuture(1.0),
+                tuna to CompletableFuture.completedFuture(3.0),
+                ustc to CompletableFuture.completedFuture(3.0),
+                aliyun to late,
+            )
+        }
+
+        fun prepareAgain() = Rootfs.prepare(context, distro, store = store) {
+            error("a ready store started mirror probes")
+        }
+
         val path = "/etc/apk/repositories"
-        val before = sh(machine, "cat $path").first
-        val (official, tuna, ustc) = distro.mirrors
         val branch = BuildConfig.ALPINE_BRANCH
-        val sources = { mirror: String -> "$mirror/$branch/main\n$mirror/$branch/community\n" }
-        val write = { text: String -> Native.writeFile(Rootfs.store(context).path, path, text.toByteArray(), 420, true) }
-        try {
-            // The app's speed probe may already have switched the mirror: start as at import
-            write(sources(official))
-            // The official mirror being the fastest writes nothing
-            assertTrue(Rootfs.useMirror(context, distro, official))
-            assertEquals(sources(official), sh(machine, "cat $path").first)
-            assertTrue(Rootfs.useMirror(context, distro, ustc))
-            assertEquals(sources(ustc), sh(machine, "cat $path").first)
-            // Once switched, never again
-            assertFalse(Rootfs.useMirror(context, distro, tuna))
-            assertEquals(sources(ustc), sh(machine, "cat $path").first)
-            // A line the user added, even with the official mirror still there
-            val edited = sources(official) + "@testing $official/edge/testing\n"
-            write(edited)
-            assertFalse(Rootfs.useMirror(context, distro, ustc))
-            assertEquals(edited, sh(machine, "cat $path").first)
-            // The sources file is gone: not written again
-            sh(machine, "rm $path")
-            assertFalse(Rootfs.useMirror(context, distro, ustc))
-            assertEquals(null, Native.readFile(Rootfs.store(context).path, path))
-        } finally {
-            // Restore the original sources: other test cases and the app itself use this store
-            write(before)
+        withMachine(store.path) { machine ->
+            assertEquals("$tuna/$branch/main\n$tuna/$branch/community\n", checkedShell(machine, "cat $path"))
+            checkedShell(machine, "echo my-mirror > $path")
+            assertTrue(late.isCancelled)
+            assertFalse(late.complete(10.0))
+            prepareAgain()
+            assertEquals("my-mirror\n", checkedShell(machine, "cat $path"))
+            checkedShell(machine, "rm $path")
+            prepareAgain()
+            checkedShell(machine, "test ! -e $path")
+        }
+    }
+
+    @Test(timeout = 60000)
+    fun mirrorSelectionFallsBackToOfficialSources() = withTempStore("mirror-fallback") { store ->
+        val distro = Rootfs.Distro.ALPINE
+        val (official, tuna, ustc) = distro.mirrors
+        Rootfs.prepare(context, distro, store = store) {
+            mapOf(tuna to CompletableFuture.completedFuture(null), ustc to CompletableFuture<Double?>())
+        }
+        val branch = BuildConfig.ALPINE_BRANCH
+        val sources = Native.readFile(store.path, "/etc/apk/repositories")!!.decodeToString()
+        assertEquals("$official/$branch/main\n$official/$branch/community\n", sources)
+    }
+
+    /** Uses the pinned Debian tarball, like downloadedDistributionsRun. */
+    @Test
+    fun debianImportsBothSourcesWithTheSelectedMirror() {
+        assumeTrue(InstrumentationRegistry.getArguments().getString("network") == "true")
+        withTempStore("debian-mirror") { store ->
+            val distro = Rootfs.Distro.DEBIAN
+            val mirror = distro.mirrors[1]
+            Rootfs.prepare(context, distro, store = store) {
+                mapOf(mirror to CompletableFuture.completedFuture(3.0))
+            }
+            withMachine(store.path) { machine ->
+                val uris = checkedShell(machine, "grep '^URIs:' /etc/apt/sources.list.d/debian.sources")
+                assertEquals("URIs: http://$mirror/debian\nURIs: http://$mirror/debian-security\n", uris)
+            }
         }
     }
 

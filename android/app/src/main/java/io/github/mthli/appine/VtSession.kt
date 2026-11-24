@@ -192,7 +192,7 @@ internal class VtSession(
     /**
      * The last progress report (OSC 9;4); null when there is none, it was removed, none came for
      * [PROGRESS_TIMEOUT_MS] (as Ghostty drops it, against programs that never remove it), the
-     * program gave the terminal back ([onForeground]) or the shell exited.
+     * command ended, the shell started a primary prompt, the foreground group changed, or the shell exited.
      */
     var progress: Progress? = null
         private set
@@ -466,6 +466,10 @@ internal class VtSession(
         val taken = synchronized(reports) { reports.toList().also { reports.clear() } }
         if (released || !isRunning) return
         for (r in taken) {
+            if (r.state == STATUS_EXPIRE_TRANSIENT) {
+                records.values.removeAll { it.state != STATUS_DONE && it.state != STATUS_ERROR }
+                continue
+            }
             if (r.state == STATUS_CLEAR) {
                 if (r.id.isEmpty()) records.clear() else records.keys.removeAll { it == r.id || it.startsWith(r.id + "/") }
                 continue
@@ -505,11 +509,8 @@ internal class VtSession(
      */
     @Suppress("unused")
     fun onForeground() {
-        main.post {
-            if (released) return@post
-            setProgress(null)
-            if (records.values.removeAll { it.state != STATUS_DONE && it.state != STATUS_ERROR }) updateStatus()
-        }
+        onProgress(PROGRESS_REMOVE, -1)
+        onStatus(STATUS_EXPIRE_TRANSIENT, 0, -1, "", "", "")
     }
 
     /**
@@ -668,6 +669,8 @@ internal class VtSession(
         const val STATUS_BLOCKED = 3
         const val STATUS_ERROR = 4
         const val STATUS_CLEAR = 5
+        // Internal queue entry shared with vt.c. Later reports can be in the same batch.
+        private const val STATUS_EXPIRE_TRANSIENT = 255
 
         // libghostty-vt's GhosttyProgramStatusKind: what a blocked program needs
         const val KIND_NONE = 0

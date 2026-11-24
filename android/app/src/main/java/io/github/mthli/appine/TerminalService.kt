@@ -337,13 +337,6 @@ class TerminalService : Service() {
      */
     private var nextSessionId = (System.currentTimeMillis() % Notifications.TAB_NOTIFICATION_COUNT).toInt()
 
-    /**
-     * The thread that probes mirror speeds after an import: replacing the store must wait until
-     * it has written the sources.
-     */
-    @Volatile
-    private var mirrorThread: Thread? = null
-
     /** [network] is registered. */
     private var watchingNetwork = false
 
@@ -632,11 +625,10 @@ class TerminalService : Service() {
         thread(name = "appine-start") {
             val result = runCatching {
                 if (distro != null) {
-                    Rootfs.prepare(this, distro, progress = { done, total ->
+                    Rootfs.prepare(this, distro, startMirrorProbes = Rootfs::probeMirrors, progress = { done, total ->
                         val text = getString(R.string.downloading, distro.label, done shr 20, total shr 20)
                         main.post { preparing(text) }
                     })
-                    mirrorThread = thread(name = "appine-mirrors") { Rootfs.chooseMirror(this, distro) }
                 }
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
@@ -1245,7 +1237,6 @@ class TerminalService : Service() {
         preparing(getString(R.string.preparing, distro.label))
         worker.execute {
             if (m != 0L) Native.stop(m)
-            mirrorThread?.join()
             Rootfs.reset(this)
             // Revoke again after deletion in case a grant was issued while stopping the old kernel.
             Documents.revokeAccess(this)

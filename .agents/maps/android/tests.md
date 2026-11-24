@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: exercise first-poll reconciliation, in-place credential changes and refresh retry)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: cover import-time mirror selection and guest ownership of package sources)
 
 ## Responsibilities
 
@@ -72,7 +72,10 @@ debug variant, manifest and network-security configuration belong to `android/bu
   whitespace (including unsafe/empty remainders and changed terminal modes), composing
   `deleteSurroundingText`/`InCodePoints` preedit updates, `attach(null)` preedit/blink cleanup,
   mode 1004 focus events preserving scrolled-back viewports, `VtSession.reset` progress/status
-  clearing, and `VtSession` queued-write cancellation on hangup. The
+  clearing, and `VtSession` queued-write cancellation on hangup. A guest printf drives the real
+  console pump to check status and progress on both sides of a primary prompt or command end,
+  including continuation prompts and retention of done and error records. A session test checks
+  that a queued foreground change preserves the next program's reports. The
   `screenshots=true` runner argument saves `cache/paste-preview.png` for visual inspection of
   the terminal-themed dialog; the tests do not drive Gboard's UI.
 - `PrivacyTest` covers default-off/mutually exclusive file access, cold and recreated locked pages, pause-only visibility versus stop-and-return locking, secure dialog flags, non-exported action targets, service/broadcast/activity routing and locked-report clipboard denial without an authentication bypass. `MachineTest.documentsShowTheHomeDirectory` also checks every provider denial with privacy on and a stale true file-access preference.
@@ -100,8 +103,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
   legacy preferences, disabled queries/reads/changes and file links, authority-wide grant revocation,
   canonical `%XX` validation and `%2E`/`%2F` tree-grant rejection, home, no home including regular-file
   homes and `rootsChanged` cache invalidation, writes,
-  changes both ways, persisted grant selection and stale descendant IDs through direct and symlink paths after deleting and recreating a directory), manual
-  mirrors, verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
+  changes both ways, persisted grant selection and stale descendant IDs through direct and symlink paths after deleting and recreating a directory),
+  import-time mirror selection (partial results, ties, official fallback, guest edits and deletion;
+  both Debian source URIs in the network-enabled test), verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
   ports, bugs injected through the test hooks killing only the guest process on both tiers, kill
   reports (including an OOM from a cgroup `memory.max`), a guest crash reaching the kernel log, and
   prompt marks (busybox ash's with root's shell set to `/bin/sh` for the test), and a
@@ -123,8 +127,8 @@ debug variant, manifest and network-security configuration belong to `android/bu
   caches and an existing dependency-only OpenRC installation with custom configuration.
   `interruptedOpenRcSetupKeepsTheUpgradeRecoverable` restarts between apk transactions, repairs
   a custom inittab from a login after verification fails, and finishes setup on the next start.
-  Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
-  from the internet, behind the `network=true` argument; `routesComeFromLinkProperties` has no
+  Both `downloadedDistributionsRun` and `debianImportsBothSourcesWithTheSelectedMirror` require
+  `network=true` and import the pinned Debian tarball (about 50 MB) into separate stores; `routesComeFromLinkProperties` has no
   gate but fails without a default network with an IPv4 gateway.
 - The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set
   and never unset. The KDoc and README ask for runs on 4 KB and 16 KB-page arm64 emulators; CI does
@@ -152,6 +156,11 @@ debug variant, manifest and network-security configuration belong to `android/bu
   and CRs (bash puts its marks and bracketed paste right before the output).
 - Tests that require test hooks must use the debug build; successful API 34 runs do not
   establish physical-device, real keyboard or 16 KB-page behavior.
+
+## Confirmed bugs / technical debt
+
+- On API 34, `composingDeleteSurroundingTextUpdatesPreedit` observes `abc` after
+  `deleteSurroundingText(1, 0)` on the composing text `abc`. The test expects `ab`.
 
 ## Open questions
 

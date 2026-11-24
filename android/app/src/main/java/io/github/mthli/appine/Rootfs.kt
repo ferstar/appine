@@ -20,6 +20,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.thread
@@ -29,9 +30,8 @@ import kotlin.concurrent.write
  * Importing and configuring the rootfs (the android/setup map): the first run imports the Alpine in
  * the APK, and Settings can switch to Debian (downloaded only when chosen; the version and sha256
  * are fixed here, and as with `scripts/fetch-rootfs` only a tarball whose digest matches is
- * accepted). After the import the configuration files are written, mirror speeds are probed in the
- * background, and the fastest one is written into the package manager's sources, once: from then on
- * the sources are the user's to edit.
+ * accepted). During import, mirror probes run alongside local setup. The importer writes package
+ * sources using the best available result before publishing the store for the guest to edit.
  */
 internal object Rootfs {
     private const val TAG = "Rootfs"
@@ -167,6 +167,7 @@ internal object Rootfs {
         distro: Distro,
         progress: (Long, Long) -> Unit = { _, _ -> },
         store: File = store(context),
+        startMirrorProbes: (Distro) -> Map<String, Future<Double?>> = { emptyMap() },
     ) {
         if (isReady(store)) return
         // The next launch resumes this distro if the app is killed before the store is in place,
@@ -183,8 +184,15 @@ internal object Rootfs {
         } else {
             download(context, distro, progress)
         }
-        Native.importRootfs(tmp.path, tarball.path)
-        configure(context, tmp.path, distro)
+        val probes = startMirrorProbes(distro)
+        try {
+            Native.importRootfs(tmp.path, tarball.path)
+            configure(context, tmp.path, distro)
+            val (path, content) = sources(distro, selectMirror(distro, probes))
+            write(tmp.path, path, content)
+        } finally {
+            probes.values.forEach { it.cancel(true) }
+        }
         // Sync before the rename: otherwise after a power loss the store could be in place while
         // its files are empty; after the rename, sync the directory too, so what is later written
         // into the store does not fall back into rootfs.tmp on a power loss and get deleted as an
@@ -199,8 +207,6 @@ internal object Rootfs {
 
     @Throws(IOException::class)
     private fun configure(context: Context, store: String, distro: Distro) {
-        val (sources, content) = sources(distro, distro.mirrors[0])
-        write(store, sources, content)
         write(store, "/etc/hostname", "localhost\n")
         if (distro == Distro.ALPINE) {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
@@ -458,38 +464,23 @@ esac
         }
     }
 
-    /**
-     * Probes the mirrors of [distro] concurrently and puts the fastest into the package manager's
-     * sources ([useMirror]); when every probe fails, nothing changes. Run once, right after an
-     * import. Blocks for a few seconds; call it on a background thread. Debian's mirrors are
-     * written as host names only, and probed with https.
-     */
-    fun chooseMirror(context: Context, distro: Distro) {
-        val base = { mirror: String -> if (distro == Distro.ALPINE) mirror else "https://$mirror" }
-        val speeds = distro.mirrors.zip(probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" }))
-        val best = speeds.filter { it.second != null }.maxByOrNull { it.second!! }?.first ?: return
-        Log.i(TAG, "mirror speeds: $speeds, using $best")
-        runCatching { useMirror(context, distro, best) }
-            .onSuccess { if (!it) Log.i(TAG, "the package sources are not as imported, leaving them alone") }
-            .onFailure { Log.w(TAG, "cannot write the package sources", it) }
+    /** Only completed measurements count. Distro order breaks ties and puts the official fallback first. */
+    private fun selectMirror(distro: Distro, probes: Map<String, Future<Double?>>): String {
+        val speeds = probes.filterValues { it.isDone }.mapValues { (_, result) ->
+            runCatching { result.get() }.getOrNull()
+        }
+        val mirror = distro.mirrors.maxBy { speeds[it] ?: -1.0 }
+        if (probes.isNotEmpty()) Log.i(TAG, "mirror speeds at import: $speeds, using $mirror")
+        return mirror
     }
 
-    /**
-     * Makes [mirror] the one in the package manager's sources of [distro], only while the sources
-     * file is still exactly what the import wrote ([configure], with the official mirror): once it
-     * was changed, by this or by the user, it is left alone, and false is returned. It can be
-     * written while the kernel runs too: the store's commit counter changes and the kernel layer's
-     * caches are invalidated with it (the kernel/store map).
-     */
-    @Throws(IOException::class)
-    fun useMirror(context: Context, distro: Distro, mirror: String): Boolean {
-        val store = store(context).path
-        val official = distro.mirrors[0]
-        val (path, imported) = sources(distro, official)
-        val old = Native.readFile(store, path) ?: return false
-        if (String(old) != imported) return false
-        if (mirror != official) write(store, path, sources(distro, mirror).second)
-        return true
+    /** Starts throughput probes for an import. Debian lists host names and probes them over HTTPS. */
+    fun probeMirrors(distro: Distro): Map<String, Future<Double?>> {
+        val urls = distro.mirrors.map { mirror ->
+            val base = if (distro == Distro.ALPINE) mirror else "https://$mirror"
+            "$base/${distro.probe}"
+        }
+        return distro.mirrors.zip(startProbes(urls)).toMap()
     }
 
     /**
@@ -498,23 +489,24 @@ esac
      */
     private fun fastest(urls: List<String>): List<String> {
         if (urls.size < 2) return urls
-        val speeds = probeAll(urls)
+        val probes = startProbes(urls)
+        val speeds = try {
+            probes.map { runCatching { it.get(PROBE_TIMEOUT_MS * 2L, TimeUnit.MILLISECONDS) }.getOrNull() }
+        } finally {
+            probes.forEach { it.cancel(true) }
+        }
         Log.i(TAG, "download speeds: ${urls.zip(speeds)}")
         return urls.indices.sortedByDescending { speeds[it] ?: -1.0 }.map { urls[it] }
     }
 
-    /**
-     * Probes [urls] concurrently and returns each one's speed (bytes per ms), null for failures.
-     * Blocks for a few seconds.
-     */
-    private fun probeAll(urls: List<String>): List<Double?> {
+    /** Submits one independent measurement per URL, in input order. */
+    private fun startProbes(urls: List<String>): List<Future<Double?>> {
         val pool = Executors.newFixedThreadPool(urls.size)
-        val results = urls.map { url -> pool.submit<Double?> { probe(url) } }
-        val speeds = results.map {
-            runCatching { it.get(PROBE_TIMEOUT_MS * 2L, TimeUnit.MILLISECONDS) }.getOrNull()
+        try {
+            return urls.map { url -> pool.submit<Double?> { probe(url) } }
+        } finally {
+            pool.shutdown()
         }
-        pool.shutdownNow()
-        return speeds
     }
 
     /**

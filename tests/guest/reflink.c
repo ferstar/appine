@@ -224,11 +224,20 @@ static void mappings_follow(void)
     char *pa = mmap(NULL, SIZE, PROT_READ, MAP_SHARED, ra, 0);
     CHECK(pb != MAP_FAILED && pa != MAP_FAILED, "mmap");
     CHECK(memcmp(pb, data, SIZE) == 0, "mapped clone");
-    int w = open(DIR "/b", O_RDWR);
-    CHECK(w >= 0 && pwrite(w, "NEW", 3, 8192) == 3, "write the clone");
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork before unsharing");
+    if (pid == 0) {
+        int w = open(DIR "/b", O_RDWR);
+        CHECK(w >= 0 && pwrite(w, "NEW", 3, 8192) == 3, "write the clone");
+        CHECK(memcmp(pb + 8192, "NEW", 3) == 0, "child sees the write");
+        CHECK(memcmp(pa, data, SIZE) == 0, "child sees the original source");
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "child write: status %#x", status);
     CHECK(memcmp(pb + 8192, "NEW", 3) == 0, "the clone's mapping shows the write");
     CHECK(memcmp(pa, data, SIZE) == 0, "the source's mapping keeps its data");
-    close(w);
     munmap(pb, SIZE);
     munmap(pa, SIZE);
     close(ra);
@@ -239,17 +248,27 @@ static void mappings_follow(void)
     int rc = open(DIR "/c", O_RDONLY);
     char *pc = mmap(NULL, SIZE, PROT_READ, MAP_SHARED, rc, 0);
     CHECK(pc != MAP_FAILED && pc[8192] == data[8192], "mapped clone");
-    CHECK(truncate(DIR "/c", 4096) == 0, "truncate");
-    CHECK(memcmp(pc, data, 4096) == 0, "the kept part");
-    pid_t pid = fork();
+    pid = fork();
+    CHECK(pid >= 0, "fork before truncating");
+    if (pid == 0) {
+        CHECK(truncate(DIR "/c", 4096) == 0, "truncate");
+        CHECK(memcmp(pc, data, 4096) == 0, "the kept part");
+        volatile char x = pc[8192];
+        (void)x;
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS,
+          "past the end: status %#x", status);
+    CHECK(memcmp(pc, data, 4096) == 0, "parent sees the kept part");
+    pid = fork();
+    CHECK(pid >= 0, "fork after truncating");
     if (pid == 0) {
         volatile char x = pc[8192];
         (void)x;
         _exit(0);
     }
-    int status;
     CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS,
-          "past the end: status %#x", status);
+          "parent's mapping past the end: status %#x", status);
     munmap(pc, SIZE);
     close(rc);
     close(rb);

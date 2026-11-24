@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: sample login rule inputs independently of directory notifications)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: move mirror selection into rootfs preparation)
 
 ## Responsibilities
 
@@ -54,7 +54,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   and the BKL in the background (the poll's fetches, `setRoutes`, `consoleCwd`, `trimMemory` with
   the tabs' scrollback compression after it, `shutdown`, `stop`), together with what must stay
   ordered with them: saving tabs (their terminals' snapshots included), resolving an `auto` login, changed directories,
-  and a replacement's mirror join and store reset.
+  and a replacement's store reset.
 - Session state (internal): `sessions` (every tab, ended ones included), `unshown` (restored tabs
   whose terminal does not exist yet, with their saved copy), `restore` (saved tabs from a killed
   run, kept until a start restores them), `ended` (why that run ended), `focus` (set only by the
@@ -67,7 +67,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   (restart or replace, between letting go of the old kernel and starting the new one),
   `booting` (boot work is outstanding), `destroyed` (late completions cannot restart the service),
   `pendingReplace` (a distro download that finished during a start or restart), `startError`,
-  `progress`, `mirrorThread`.
+  `progress`.
 - `GuestActivity` — the last guest CPU sample and activity timestamp used by
   the BUSY running policy; `RunPolicy` in `Settings` defines SLEEP, BUSY and ALWAYS.
 - `ConsoleTracker` — per-kernel monitor serializing console opens/closes with `Native.takeKills`
@@ -125,7 +125,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   `start(null)`.
 - `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
-  notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
+  notification and listeners and `Rootfs::probeMirrors` for import-time source selection, android/setup),
   `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBashStartup`,
   `ensureGpuCommand` (only when `gpu` is enabled), `ensureBrowser`, `updateProfile`, then
   `Native.start(store, tier, gpu)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
@@ -200,8 +200,8 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   the switch keeps the service running without a UI; its failure or cancel then stops it as a
   failed start does. `replace`: reset the login setting, revoke provider URI grants
   (`Documents.revokeAccess`) and refresh roots (`Documents.rootsChanged`), `transitioning`,
-  `detach`, then on the worker `Native.stop` (kill all, no inittab shutdown), join the mirror
-  thread, delete the store, and revoke grants and refresh roots again before `start(distro)` — also
+  `detach`, then on the worker `Native.stop` (kill all, no inittab shutdown), delete the
+  store, and revoke grants and refresh roots again before `start(distro)` — also
   after "exit all" meanwhile, so the chosen distro is imported (and then stopped) rather than the
   next start importing Alpine.
 - `onDestroy` marks the service destroyed (from then on nothing posts the ongoing notification,
@@ -388,7 +388,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 - An `exitAll` during a start, restart or replace leaves the rest of the exit to them: every path
   that ends `starting` or `transitioning` must check `exiting` (a replacement does so through the
   start it ends with), or the service stops with a kernel still running (or never stops).
-- A thread that outlives the service (a download; the mirror probe posts nothing) posts to the
+- A download thread that outlives the service posts to the
   main thread after `onDestroy`: it reaches notification 1 only through `updateNotification`, which does nothing once
   destroyed, so a new way of posting it must go through that too. Ongoing notification id 1 must
   not collide with `android/reports`'s notification id ranges.

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: condense verbose type field lists, unused API catalog and repeated invariants while keeping all verified facts)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: preserve stream order when prompt marks expire transient reports)
 
 ## Responsibilities
 
@@ -78,8 +78,8 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   (`wrap` only turns blinking on over libghostty-vt's steady block, and the session sets the user's
   choice right after, `VtNative.setCursor`, before the pending text; android/vtrender's Frames and
   drawing); grapheme clustering, mode 2027, on by default as in Ghostty; the render state asks for
-  one overscan row below the viewport; the OSC 133 callback (command timing) and unimplemented OSC
-  and APC strings reported with 16 bytes kept, of which only an OSC's leading number or an APC's
+  one overscan row below the viewport; the OSC 133 callback for command timing and report expiry;
+  unimplemented OSC and APC strings reported with 16 bytes kept, of which only an OSC's leading number or an APC's
   first letter is logged (a malformed string may start with the program's data); Kitty graphics on,
   with 32 MiB of decoded images per screen (Ghostty's default is 320 MB) and only data sent in the
   escape sequences (the file, temporary file and shared memory media, which would name the host's
@@ -144,14 +144,13 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   so and that `tmux attach` brings the session back (android/service; nothing on the alternate
   screen). Other DCS strings (DECRQSS, XTGETTCAP, tmux passthrough) only cost two extra stops each. Nothing
   retries when tmux does not detach.
-- The pump stands in for shell integration's prompt mark, which only some shells send: after a
-  read that carried a progress or status report it notes the console's foreground process group
-  (`Machine::console_foreground`; a failed lookup notes none, and that report then waits for its
-  timeout, being seen or the shell's end), and on a later read where another group (or none) has
-  the foreground it calls `onForeground`,
-  which drops the progress and the working, blocked and idle records, keeping done and error ones
-  until seen. Seeing the tab (`statusSeen`, from the service) drops done and error records; the
-  shell's end drops everything.
+- At an OSC 133 command end or primary prompt start after a report, the progress slot records
+  removal and the ordered status queue records expiry of transient records. Later reports in the
+  same read take effect in order. This also works when no command was timed. The pump also samples
+  the foreground group after a report (`Machine::console_foreground`). If it recorded a group
+  and a later report-free read sees a different one or none, `onForeground` expires progress and
+  working, blocked and idle records. This covers shells without marks. The service's `statusSeen`
+  drops done and error records when the user sees the tab. Shell exit clears all records.
 - Kill reports go through `VtNative.message` (a yellow line inserted above the cursor line: a CAN
   first when the parser is not at ground (`VT_GROUND`, which includes the UTF-8 decoder), so a
   program that died inside an OSC, DCS or APC string does not swallow it; then as many line feeds
@@ -396,8 +395,7 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   of several lines are not continuation rows; after a background
   job's output at ash's prompt, a tap on a row above the one the input resumed on counts arrow
   keys as if ash had broken the command there (ash still has its cursor on the prompt's row),
-  and an ash PS1 set after its `ENV` file was read has none. The related progress/status lifetime
-  debt belongs to android/vt; the native OSC 133 callback currently serves command timing only.
+  and an ash PS1 set after its `ENV` file was read has none.
 - **libghostty-vt features not wired**: ENQ, the title report (CSI 21 t),
   XTCHECKSUM and window resizing (CSI 8 t) are left unanswered, as Ghostty's defaults leave them
   (`enquiry-response` empty, `title-report`, `vt-xt-checksum-report` and
@@ -417,14 +415,12 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 ## Open questions
 
 - Should zsh on Debian get prompt marks too (the app would have to write or inject a zprofile)?
-- Should native prompt events also drive android/vt's progress/status lifetime? The current pump
-  reports foreground-group changes; the session owns the records and the reset-policy question.
 
 ## To verify
 
-- Tried only on a Pixel 4a API 34 emulator (4 KB pages) and through vt.c's harnesses on a macOS
-  build, where the figures for scrollback rows and memory also come from; not on real or 16 KB-page
-  devices. Unverified beyond that:
+- Native checks include a Pixel 4a API 34 emulator (4 KB pages), prompt expiry on an API 37
+  emulator (16 KB pages) and vt.c harnesses on macOS, the source of the scrollback measurements.
+  Unverified on physical devices and in these cases:
   - shell integration: zsh's marks in the app, bash's on Debian (on Alpine only closing a tab at
     its prompt was tried), and those fish 4.6 and nushell 0.104 send themselves (all seen only in
     containers); the console's password state at sudo, passwd, ssh or

@@ -718,13 +718,8 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
 /// `onForeground()` once the process group that was in the foreground when progress or a status
 /// was last reported no longer is.
 ///
-/// That stands in for the shell's next prompt (OSC 133), which only some shells mark (the guest's
-/// login shells, bash, busybox ash and zsh, android/setup): the program status specification drops a
-/// program's `working` and `blocked` records when the next prompt starts or the program exits.
-/// Without it, a program that exits without clearing them
-/// (killed, or interrupted with Ctrl-C) would leave its tab working forever. The group is the one
-/// in the foreground after the read that carried the report, so a report from a command that has
-/// already exited by then lasts until the next command takes the foreground.
+/// vt.c expires transient reports at a command end or primary prompt. The foreground group
+/// supplies a fallback for shells without marks. It is sampled after reading the report.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
     mut env: JNIEnv<'l>,

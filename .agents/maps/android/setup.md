@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: refresh login rules on changes to account files and serialize publication)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: select package sources in the private import before store publication)
 
 ## Responsibilities
 
@@ -17,8 +17,8 @@
 - files refreshed before every kernel start (network interfaces, rootless podman's network, the
   bundled doas package, the profile script and the files of ash's, bash's and zsh's prompt marks for the
   terminal's shell integration), one-time OpenRC setup on Alpine, the osclock script run before boot and the boot log's failed services;
-- package mirrors: built-in lists, one speed probe after an import, writing the fastest into
-  sources nobody has changed;
+- package mirrors: built-in lists, concurrent throughput probes during import and one sources write in the
+  temporary store;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
   admin setup, installing the bundled bash, procps-ng and bubblewrap, and the NOPASSWD rules;
 - the store lock shared by the kernel start, store deletion and the Files provider.
@@ -45,8 +45,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   - `DEBIAN`: "Debian 13"; one pinned GitHub URL (debuerreotype's `debian:trixie`) with fixed
     length and sha256; mirrors are host names (deb.debian.org, Tsinghua, USTC, Aliyun), probed at
     `debian/dists/trixie/InRelease` over https.
-  - The first mirror of each list is the official one: the import writes it, and probing falls
-    back to it.
+  - The first mirror of each list is the official one: the importer uses it when no successful probe is ready.
 - Preferences: file `rootfs`, owned here (`distro`); the `settings` file is `android/service`'s
   `Settings`, displayed and edited through `android/settings`.
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
@@ -76,7 +75,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
   `ensureBashStartup`, `ensureGpuCommand`, `ensureBrowser`, `updateProfile`; around boot:
   `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
-- Mirrors: `chooseMirror`, `useMirror`.
+- Mirrors: the service supplies `probeMirrors` to `prepare`. The default imports offline with official sources when the tarball is local.
 - Accounts: `loginAccount`, `regularAccounts`, `LoginRules.poll` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
   packages into `target/rootfs` by default; prints each package's path, then the tarball's last).
@@ -121,7 +120,8 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   2. delete `<store>.tmp`;
   3. get the tarball into the cache: Alpine's asset copied over it, unchecked; others through
      `download`;
-  4. import into `<store>.tmp` (`Native.importRootfs`) and `configure` it;
+  4. start the supplied mirror probes, import into `<store>.tmp` (`Native.importRootfs`),
+     `configure` it and write package sources from the results available then;
   5. sync the store (`syncfs`), rename it to the real store, fsync `files/` (a failure only
      logged) and only then delete the tarball.
 - `installed` is the recorded distro of a ready store (Alpine when there is no record); while
@@ -130,8 +130,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   the store under the write lock and leaves the preferences and the cache alone.
 - `configure` writes, with mode 0644 for new files (an overwritten file keeps its mode, and an
   existing entry that is not a regular file fails the import):
-  - always: package sources from the first mirror (apk `main` and `community`; Debian deb822 over
-    http for trixie, -updates, -security), `hostname` (`localhost`), `motd`, and
+  - always: `hostname` (`localhost`), `motd`, and
     `/etc/profile.d/appine.ashrc`, `/etc/profile.d/appine.bashrc`, `/etc/profile.d/appine.zshrc`, on Alpine
     `/etc/bash/appine.sh`, and then `/etc/profile.d/appine.sh` (the assets' `ashrc.sh`,
     `bashrc.sh`, `zshrc.sh` and `profile.sh`: motd, `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, the browser default below,
@@ -168,7 +167,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   shells such as fish and Debian's zsh need their own login configuration.
   Each invocation rereads the configuration and sends one HTTP(S) URL without using a TTY or
   inherited tab token; success acknowledges Android intent acceptance, not page loading or login.
-- On the start thread, after an import and the start of its mirror probe when there is one, in
+- On the start thread, after any import, in
   this order, before the kernel starts under the write lock: a loopback-only `/etc/network/interfaces` when absent;
   `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
   (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
@@ -273,19 +272,16 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ### Mirrors
 
-- Each distro has built-in mirrors (official, Tsinghua, USTC, Aliyun). After every import, and
-  only then, on the `appine-mirrors` thread, `chooseMirror` probes every mirror at once (one
-  thread each, checking 512 KiB and 5 s thresholds between reads, waiting at most 10 s for each result) and takes the
-  highest throughput (ties to the earlier mirror); if every probe failed it does nothing. A read
-  can overshoot either probe threshold; these are not hard byte or elapsed-time caps.
-- Writing (`useMirror`): only while the distro's sources file (`/etc/apk/repositories` or
-  `debian.sources`) is byte for byte what the import wrote, with the official mirror, it is
-  written again from the same template with the winner (nothing is written when the official
-  mirror won). A file that differs in any way (already switched, edited by the user) or is
-  missing is left alone, so the mirror is switched at most once per import and the sources are
-  the user's from then on. It does not take the store lock; a failed write is only logged.
-- Nothing records the mirror in use and nothing in the app shows or changes it later: the user
-  edits the sources in the guest.
+- After obtaining the tarball, `prepare` starts the service's `probeMirrors` measurements in
+  distro list order, one task per mirror. Each measures throughput, checking the 512 KiB and
+  5 s thresholds between reads. The import proceeds while these tasks run.
+- After local configuration, the importer chooses the highest completed successful speed, breaking
+  ties in distro list order and falling back to the official mirror if no speed is available.
+  It writes Alpine's `main` and `community` to `/etc/apk/repositories`, or Debian's deb822
+  HTTP sources for trixie, updates and security to `/etc/apt/sources.list.d/debian.sources`.
+- The importer requests cancellation of outstanding probes before syncing and renaming the
+  temporary store. Probe tasks only measure throughput. A ready store skips the entire import,
+  so users can edit or remove sources in the guest.
 
 ### Accounts and login
 
@@ -352,7 +348,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   files, boot, the poll's `LoginRules`, login accounts), `SettingsFragment` (`android/settings`:
   `Distro`, `installed`, `regularAccounts`, `loginAccount`), `Documents` (`android/documents`:
   `loginAccount`, `installed`, `isReady`, `access`), `ConsolePty` (`android/vt`: runs `login.sh`),
-  the instrumentation tests (`fetch`, `prepare` into another store, `useMirror`, `updateProfile`,
+  the instrumentation tests (`fetch`, `prepare` into another store with supplied probe results, `updateProfile`,
   `PREFER_OSCLOCK`).
 
 ### Outbound
@@ -366,12 +362,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 - `Rootfs.access`: provider calls hold the read lock; starting the kernel and deleting the store
   hold the write lock, so the kernel's exclusive boot open never overlaps a provider open. The
-  mirror write, the import (on `rootfs.tmp`) and the per-start files run without it.
-- The probe starts as the import ends, so it can write the sources while the kernel opens the
-  store (a distro switch's `replace` joins the mirror thread before deleting the store). The write
-  opens its own store connection: at worst the kernel then skips one boot
-  cleanup (the store's leftovers under `/dev/shm` and `/run`, hidden by the tmpfs mounts, and
-  orphaned objects reclaimed later), with no corruption.
+  import (including package sources in the temporary store) and the per-start files run without it.
 - A store becomes ready only when the synced import is renamed into place, so a half-imported
   `rootfs.tmp` never counts and is deleted by the next `prepare` or `reset`.
 - An import interrupted by a kill (a first run, a distro switch, a reset) is redone with the same
@@ -408,8 +399,6 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ## Confirmed bugs / technical debt
 
-- Mirror template comparison and replacement are separate operations: a guest edit between
-  them can be overwritten.
 - Busybox ash can emit literal path controls through the visible prompt's `\w`. The directory
   title is sanitized and restored after that prompt, but other terminal effects in visible
   prompt text are not sanitized.

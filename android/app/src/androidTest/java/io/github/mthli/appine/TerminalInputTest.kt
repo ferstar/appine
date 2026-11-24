@@ -66,6 +66,8 @@ class TerminalInputTest {
         val tab: Long,
         val session: VtSession,
         val statusChanges: AtomicInteger,
+        val machine: Long,
+        val console: Int,
     )
 
     private fun fakeEvents(onStatusChanged: () -> Unit = {}): VtSession.Events = Proxy.newProxyInstance(
@@ -114,7 +116,7 @@ class TerminalInputTest {
                         if (!focused) SystemClock.sleep(20)
                     }
                     assertTrue("The test page must have window focus", focused)
-                    test(Fixture(view, connection, host, tab, session, statusChanges))
+                    test(Fixture(view, connection, host, tab, session, statusChanges, machine, console))
                 } finally {
                     onMain {
                         button(android.R.id.button2)?.performClick()
@@ -383,6 +385,61 @@ class TerminalInputTest {
                 assertTrue("Reset must notify status change when clearing progress/status", f.statusChanges.get() > before)
             }
         }
+    }
+
+    private fun Fixture.pumpReports(vararg sequences: String) {
+        // Queue a single write before starting the pump so it sees the whole batch.
+        val stream = sequences.joinToString("") { "\u001b]$it\u0007" }
+        val pid = Native.spawn(
+            machine, console, "/bin/sh", arrayOf("sh", "-c", "printf '%s' \"\$1\"", "sh", stream),
+            ConsolePty.ENVIRONMENT,
+        )
+        assertEquals(0, Native.waitFor(machine, pid))
+        VtNative.pump(tab, session)
+        instrumentation.waitForIdleSync()
+    }
+
+    @Test
+    fun promptExpiresOnlyEarlierTransientReports() {
+        withFixture { f ->
+            f.pumpReports(
+                "7501;state=done:id=finished", "7501;state=blocked:id=old", "9;4;1;45",
+                "133;A", "7501;state=working:id=next", "133;P;k=s",
+            )
+            onMain {
+                assertNull(f.session.progress)
+                assertEquals("finished", f.session.status?.id)
+                f.session.statusSeen()
+                assertEquals("next", f.session.status?.id)
+            }
+        }
+    }
+
+    @Test
+    fun commandEndKeepsErrorsAndLaterProgress() {
+        withFixture { f ->
+            f.pumpReports("7501;state=error:id=failed", "7501;state=blocked:id=old")
+            onMain { assertEquals("old", f.session.status?.id) }
+            f.pumpReports("133;D;1", "9;4;1;70")
+            onMain {
+                assertEquals(VtSession.Progress(VtSession.PROGRESS_SET, 70), f.session.progress)
+                assertEquals("failed", f.session.status?.id)
+                f.session.statusSeen()
+                assertNull(f.session.status)
+            }
+        }
+    }
+
+    @Test
+    fun foregroundChangeKeepsLaterReportsInTheQueue() {
+        val session = VtSession(1, ConsolePty(0L, "", "root"), 0L, fakeEvents())
+        onMain {
+            // Keep the main thread from draining the first report before the next two callbacks.
+            session.onStatus(VtSession.STATUS_BLOCKED, 0, -1, "old", "", "")
+            session.onForeground()
+            session.onStatus(VtSession.STATUS_WORKING, 0, -1, "next", "", "")
+        }
+        onMain { assertEquals("next", session.status?.id) }
     }
 
     @Test

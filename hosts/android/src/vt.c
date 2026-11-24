@@ -281,6 +281,8 @@ static const char TERMINFO_NAME[] = "xterm-256color";
 // (0-100, -1 for none), u8 id length, u8 title length, u16 message length, then the id, title and
 // message bytes. The specification's limits (id 128, title 192, message 2048 bytes) fit the fields
 #define STATUS_HEADER_BYTES 7
+// Internal status queue entry, consumed by VtSession.applyReports in stream order.
+#define STATUS_EXPIRE_TRANSIENT 255
 
 typedef struct {
   uint8_t *ptr;
@@ -429,6 +431,7 @@ typedef struct AppineVt {
   int32_t progress_state;
   int32_t progress;
   Buf statuses;
+  bool reported_since_prompt;
   // Clipboard reads (OSC 52 "?") since appine_vt_take_effects, and the clipboard of the last
   uint32_t clipboard_reads;
   uint8_t clipboard_read_kind;
@@ -657,6 +660,7 @@ static void on_progress(GhosttyTerminal t, void *userdata, const GhosttyTerminal
   AppineVt *vt = userdata;
   vt->progress_state = (int32_t)r->state;
   vt->progress = r->progress;
+  vt->reported_since_prompt = true;
 }
 
 static size_t at_most(size_t len, size_t max) {
@@ -685,6 +689,18 @@ static void on_program_status(GhosttyTerminal t, void *userdata,
   if (title > 0) memcpy(p + id, s->title.ptr, title);
   if (message > 0) memcpy(p + id + title, s->message.ptr, message);
   vt->statuses.len += STATUS_HEADER_BYTES + id + title + message;
+  vt->reported_since_prompt = true;
+}
+
+static void expire_reports(AppineVt *vt) {
+  if (!vt->reported_since_prompt) return;
+  vt->progress_state = GHOSTTY_TERMINAL_PROGRESS_STATE_REMOVE;
+  vt->progress = -1;
+  const uint8_t entry[STATUS_HEADER_BYTES] = {STATUS_EXPIRE_TRANSIENT};
+  if (!buf_reserve(&vt->statuses, sizeof(entry))) return;
+  memcpy(vt->statuses.ptr + vt->statuses.len, entry, sizeof(entry));
+  vt->statuses.len += sizeof(entry);
+  vt->reported_since_prompt = false;
 }
 
 // OSC 133: a command starts when the shell marks its output's start (bash's PS0, zsh's preexec)
@@ -707,6 +723,7 @@ static void on_semantic_prompt(GhosttyTerminal t, void *userdata,
       if (!vt->lf_marking) vt->command_start = now_ns();
       break;
     case GHOSTTY_SEMANTIC_PROMPT_COMMAND_END:
+      expire_reports(vt);
       if (vt->command_start == 0) break;
       vt->command_finished = true;
       vt->command_has_exit = e->has_exit_code;
@@ -716,7 +733,10 @@ static void on_semantic_prompt(GhosttyTerminal t, void *userdata,
       break;
     case GHOSTTY_SEMANTIC_PROMPT_PROMPT_START:
       // A new prompt without a command end: what ran is not known to have finished
-      if (e->prompt_kind == GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY) vt->command_start = 0;
+      if (e->prompt_kind == GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY) {
+        expire_reports(vt);
+        vt->command_start = 0;
+      }
       break;
     default:
       break;
