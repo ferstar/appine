@@ -517,9 +517,9 @@ fn group_mm(k: &Kernel, g: &ThreadGroup) -> Result<Option<Rc<RefCell<crate::mm::
 }
 
 /// Whether process `g` is irreversibly exiting as a whole and not writing a core dump (Linux 6.1's
-/// `task_will_free_mem` for OOM reaping, matching `process_mrelease`'s check without treating an
-/// undelivered signal as guaranteed exit).
-fn will_free_mem(k: &Kernel, g: &ThreadGroup) -> bool {
+/// `task_will_free_mem` without treating an undelivered signal as guaranteed exit; shared by OOM
+/// reaping and `process_mrelease`).
+pub(crate) fn will_free_mem(k: &Kernel, g: &ThreadGroup) -> bool {
     if g.core.is_some() {
         return false;
     }

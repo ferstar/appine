@@ -343,17 +343,6 @@ pub(super) fn mremap(
 ) -> SysResult {
     // `Mm::insert_vma`, `Mm::move_range` and `Mm::munmap` keep `shared_maps` updated before any
     // moved or newly installed writable shared PTEs become visible to the no-BKL futex path.
-    remap(cx, old, old_len, new_len, flags, new_addr)
-}
-
-fn remap(
-    cx: &mut Cx<'_>,
-    old: u64,
-    old_len: u64,
-    new_len: u64,
-    flags: u32,
-    new_addr: u64,
-) -> SysResult {
     const MREMAP_MAYMOVE: u32 = 1;
     const MREMAP_FIXED: u32 = 2;
     const MREMAP_DONTUNMAP: u32 = 4;
@@ -406,7 +395,7 @@ fn remap(
 }
 
 /// Reads pieces of private file mappings from their files again after `MADV_DONTNEED`
-/// ([`Mm::discard`](crate::mm::Mm::discard)): zeros past the end of the file, and zeros for all of
+/// ([`Mm::discard_range`](crate::mm::Mm::discard_range)): zeros past the end of the file, and zeros for all of
 /// a piece whose file can no longer be opened (deleted and reclaimed).
 fn reread(cx: &mut Cx<'_>, rereads: Vec<crate::mm::Reread>) -> Result<(), Errno> {
     if rereads.is_empty() {
@@ -825,16 +814,7 @@ fn will_free_mem(k: &crate::kernel::Kernel, g: &crate::process::ThreadGroup) -> 
     if g.core.is_some() {
         return false;
     }
-    if g.exiting.is_some()
-        && (!g.single_exit
-            || (g.leader_exit.is_none() && g.threads.len() == 1)
-            || g.threads
-                .iter()
-                .any(|tid| k.tasks.get(tid).is_some_and(|t| t.killed.get())))
-    {
-        return true;
-    }
-    has_fatal_pending(k, g)
+    crate::oom::will_free_mem(k, g) || has_fatal_pending(k, g)
 }
 
 /// Whether `g` has a pending non-coredumping fatal signal that Linux 6.1's `complete_signal`

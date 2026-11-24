@@ -157,7 +157,7 @@ pub enum Backing {
 }
 
 /// A piece of a private file mapping whose written pages `MADV_DONTNEED` dropped but whose host
-/// memory could not simply be given back to the host file ([`Mm::discard`]): the caller reads it
+/// memory could not simply be given back to the host file ([`Mm::discard_range`]): the caller reads it
 /// from the file again (zeros past the end of the file) and stores it with [`Mm::fill_private`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct Reread {
@@ -2805,7 +2805,7 @@ impl Mm {
             v.may_write = false;
         }
         if changed_shared {
-            self.note_shared_maps(false);
+            self.note_shared_maps();
         }
     }
 
@@ -3245,7 +3245,7 @@ impl Mm {
         if !moved_shared.is_empty() {
             // Source PTEs have been removed and moved VMAs are now in `self.vmas`; drop the stale
             // source ranges.
-            self.note_shared_maps(false);
+            self.note_shared_maps();
         }
         self.dirty = true;
         Ok(())
@@ -3682,6 +3682,17 @@ impl Mm {
         Ok(())
     }
 
+    /// Returns the first VMA overlapping `[cursor, end)` (either containing `cursor` or starting
+    /// within `[cursor, end)`), along with its start address.
+    fn next_vma(&self, cursor: u64, end: u64) -> Option<(u64, &Vma)> {
+        self.vmas
+            .range(..=cursor)
+            .next_back()
+            .filter(|&(&s, v)| s + v.len > cursor)
+            .or_else(|| self.vmas.range(cursor..end).next())
+            .map(|(&s, v)| (s, v))
+    }
+
     /// madvise(`MADV_REMOVE`): frees this part of shared mappings, which then read zeros. The
     /// host mapping is shared too, so the host punches the hole in the file or shared memory
     /// behind it (Linux punches one in the file); the parts of host pages at the ends (4 KB guest
@@ -3704,22 +3715,13 @@ impl Mm {
         let mut cursor = addr;
         let mut has_gap = false;
         while cursor < end {
-            let Some((&s, v)) = self
-                .vmas
-                .range(..=cursor)
-                .next_back()
-                .filter(|&(&s, v)| s + v.len > cursor)
-                .or_else(|| self.vmas.range(cursor..end).next())
-            else {
+            let Some((s, v)) = self.next_vma(cursor, end) else {
                 has_gap = true;
                 break;
             };
             if cursor < s {
                 has_gap = true;
                 cursor = s;
-                if cursor >= end {
-                    break;
-                }
             }
             if v.locked || v.backing == Backing::Anonymous || v.region.gpu.is_some() {
                 return RemovePlan {
@@ -3783,22 +3785,12 @@ impl Mm {
         let mut cursor = addr;
         let mut has_gap = false;
         while cursor < end {
-            let Some((&s, v)) = self
-                .vmas
-                .range(..=cursor)
-                .next_back()
-                .filter(|&(&s, v)| s + v.len > cursor)
-                .or_else(|| self.vmas.range(cursor..end).next())
-            else {
+            let Some((s, v)) = self.next_vma(cursor, end) else {
                 has_gap = true;
                 break;
             };
             if cursor < s {
                 has_gap = true;
-                cursor = s;
-                if cursor >= end {
-                    break;
-                }
             }
             if v.backing != Backing::Anonymous {
                 return Err(Errno::EINVAL);
@@ -3933,21 +3925,21 @@ impl Mm {
         out
     }
 
+    /// Test helper wrapping [`Mm::discard_range`] for callers that expect no gap/error.
+    #[cfg(test)]
+    fn discard(&mut self, addr: u64, len: u64) -> Result<Vec<Reread>, Errno> {
+        let (rereads, res) = self.discard_range(addr, len);
+        res.map(|()| rereads)
+    }
+
     /// madvise(`MADV_DONTNEED`): anonymous memory goes back to the host (reading zero afterwards);
     /// the written pages of private file mappings go back to the file's contents (Linux drops
     /// their copies and reads the file again): whole host pages of a host file mapping through the
     /// host, the rest returned as [`Reread`]s for the caller to read from the file; shared
     /// mappings stay unchanged. Walks mapped VMAs in order like Linux 6.1's `do_madvise`: unmapped
     /// gaps are skipped and reported as `ENOMEM` at the end, while a locked VMA stops immediately
-    /// with `EINVAL` (taking precedence over earlier gaps).
-    #[cfg(test)]
-    pub fn discard(&mut self, addr: u64, len: u64) -> Result<Vec<Reread>, Errno> {
-        let (rereads, res) = self.discard_range(addr, len);
-        res.map(|()| rereads)
-    }
-
-    /// Per-VMA implementation of [`Mm::discard`] that also returns partial [`Reread`]s collected
-    /// before hitting an unmapped gap (`ENOMEM`) or a locked VMA (`EINVAL`).
+    /// with `EINVAL` (taking precedence over earlier gaps), still returning partial [`Reread`]s
+    /// collected beforehand.
     pub(crate) fn discard_range(
         &mut self,
         addr: u64,
@@ -3963,29 +3955,21 @@ impl Mm {
         let mut cursor = addr;
         let mut has_gap = false;
         while cursor < end {
-            let Some((&s, v)) = self
-                .vmas
-                .range(..=cursor)
-                .next_back()
-                .filter(|&(&s, v)| s + v.len > cursor)
-                .or_else(|| self.vmas.range(cursor..end).next())
-            else {
+            let Some((s, v)) = self.next_vma(cursor, end) else {
                 has_gap = true;
                 break;
             };
             if cursor < s {
                 has_gap = true;
                 cursor = s;
-                if cursor >= end {
-                    break;
-                }
             }
             if v.locked {
                 return (rereads, Err(Errno::EINVAL));
             }
             let stop = end.min(s + v.len);
             if v.backing == Backing::Anonymous && !v.reserved() {
-                if v.prot & prot::EXEC != 0 {
+                let (exec, host) = (v.prot & prot::EXEC != 0, v.host);
+                if exec {
                     self.code_ranges.push((cursor, stop - cursor));
                 }
                 // Borrowers still need lent pages, and borrowed pages are replaced by our own
@@ -3993,9 +3977,7 @@ impl Mm {
                 self.cow_settle(cursor, stop);
                 // SAFETY: [cursor, stop) is inside this VMA, and its host memory is the VMA's
                 // private anonymous memory
-                unsafe {
-                    discard_host(v.host.add((cursor - s) as usize), (stop - cursor) as usize)
-                };
+                unsafe { discard_host(host.add((cursor - s) as usize), (stop - cursor) as usize) };
                 // The vDSO comes back as the kernel's image, not zeros (on Linux a special
                 // mapping whose pages fault back in; breakpoints written into it are gone)
                 if s == self.vdso {
@@ -4009,7 +3991,7 @@ impl Mm {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 image[from..].as_ptr(),
-                                v.host.add(from).as_ptr(),
+                                host.add(from).as_ptr(),
                                 to - from,
                             )
                         };
@@ -4104,7 +4086,7 @@ impl Mm {
     }
 
     /// Stores `data` at `addr` in a private file mapping, from the file again after
-    /// [`discard`](Self::discard) (its pages are never lent, so they are written in place).
+    /// [`discard_range`](Self::discard_range) (its pages are never lent, so they are written in place).
     pub fn fill_private(&mut self, addr: u64, data: &[u8]) {
         let Some((&s, v)) = self.vmas.range(..=addr).next_back() else {
             return;
@@ -4248,22 +4230,13 @@ impl Mm {
         let mut cursor = addr;
         let mut has_gap = false;
         while cursor < end {
-            let Some((&s, v)) = self
-                .vmas
-                .range(..=cursor)
-                .next_back()
-                .filter(|&(&s, v)| s + v.len > cursor)
-                .or_else(|| self.vmas.range(cursor..end).next())
-            else {
+            let Some((s, v)) = self.next_vma(cursor, end) else {
                 has_gap = true;
                 break;
             };
             if cursor < s {
                 has_gap = true;
                 cursor = s;
-                if cursor >= end {
-                    break;
-                }
             }
             validate(v)?;
             let stop = end.min(s + v.len);
@@ -4442,13 +4415,7 @@ impl Mm {
     /// `msync(2)` loop. When `sync` is true (`MS_SYNC`), populates [`MsyncTarget`] for shared
     /// file mappings (retaining `Arc<HostRegion>` across the unlocked host `msync` call).
     pub(crate) fn next_msync(&self, cursor: u64, end: u64, sync: bool) -> MsyncStep {
-        let Some((&s, v)) = self
-            .vmas
-            .range(..=cursor)
-            .next_back()
-            .filter(|&(&s, v)| s + v.len > cursor)
-            .or_else(|| self.vmas.range(cursor..end).next())
-        else {
+        let Some((s, v)) = self.next_vma(cursor, end) else {
             return MsyncStep::Unmapped;
         };
         let start = cursor.max(s);
@@ -4543,7 +4510,7 @@ impl Mm {
         }
         if removed_shared {
             // All doomed PTEs are unmapped above; refresh `shared_maps` to drop torn-down ranges.
-            self.note_shared_maps(false);
+            self.note_shared_maps();
         }
         if let Some((vdso, vdso_end)) = self.vdso_range()
             && addr < vdso_end
@@ -4933,16 +4900,12 @@ impl Mm {
         self.shared_maps.clone()
     }
 
-    /// Recounts [`Mm::shared_maps`] from the current mappings. With `moved`, only when such
-    /// mappings exist (after mremap: the ones moved or grown may be among them).
-    pub fn note_shared_maps(&self, moved: bool) {
+    /// Recounts [`Mm::shared_maps`] from the current mappings.
+    fn note_shared_maps(&self) {
         let mut ranges = self
             .shared_maps
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        if moved && ranges.is_empty() {
-            return;
-        }
         *ranges = self
             .vmas
             .iter()

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: OOM victim reaping via Mm::release and Tier 1 DBT pool trimming under root memory pressure)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: OOM victim reaping via Mm::release and Tier 1 DBT pool trimming under root memory pressure)
 
 ## Responsibilities
 
