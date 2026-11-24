@@ -3399,13 +3399,38 @@ impl Vfs {
         self.overlays.borrow()
     }
 
-    /// Drops the removed overlay nodes nothing uses any more ([`overlay::Overlays::sweep`]).
+    /// Drops removed and excess unused overlay nodes nothing uses any more
+    /// ([`overlay::Overlays::sweep`]).
     pub(crate) fn sweep_overlays(
         &self,
         keep: &std::collections::HashSet<overlay::OvlId>,
         oldest: u64,
     ) -> usize {
         self.overlays.borrow_mut().sweep(keep, oldest)
+    }
+
+    /// Overlay nodes referenced by any mount (attached or detached): mount roots, mount points,
+    /// and the recorded parent directories of mounts on or of files (`Mount::at`,
+    /// `Mount::root_at`).
+    pub(crate) fn overlay_mount_nodes(&self) -> Vec<overlay::OvlId> {
+        let mounts = self.mounts.borrow();
+        let mut ids = Vec::new();
+        for m in mounts.list.iter().chain(&mounts.detached) {
+            for node in [
+                Some(&m.root),
+                m.point.as_ref(),
+                m.at.as_ref().map(|(dir, _)| dir),
+                m.root_at.as_ref().map(|(dir, _)| dir),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Node::Overlay(_, o) = node {
+                    ids.push(*o);
+                }
+            }
+        }
+        ids
     }
 
     /// Mounts a new FUSE instance served through connection `conn` (whose device number is

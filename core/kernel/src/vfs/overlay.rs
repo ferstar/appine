@@ -6,10 +6,11 @@
 //!
 //! Every layer is a directory in the inode store, so an overlay node refers to the store inodes
 //! behind it ([`OvlNode`]) and reads go to the topmost of them. Nodes are created as names are
-//! looked up and kept per directory and name (Linux's overlay dentries), so the same path always
-//! gives the same node; they are dropped with their instance ([`Overlays::remove_instance`]),
-//! and a node whose name was removed (unlinked, or replaced by a rename) is dropped once nothing
-//! can use it any more ([`Overlays::sweep`]).
+//! looked up and kept per directory and name (Linux's overlay dentries), so an active path gives
+//! the same node; they are dropped with their instance ([`Overlays::remove_instance`]), a node
+//! whose name was removed (unlinked, or replaced by a rename) is dropped once nothing can use it
+//! any more, and unused live nodes are evicted least-recently-used once the cache outgrows
+//! [`NODES_MAX`] ([`Overlays::sweep`]).
 //!
 //! Changes go to the upper layer. What they change is first copied up ([`Overlays::upper_of`]):
 //! its parent directories, then itself with its data, attributes and times, each in one store
@@ -18,6 +19,7 @@
 //! one was removed is opaque, and a directory with lower layers cannot be renamed (EXDEV, Linux
 //! without `redirect_dir`).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, PoisonError};
@@ -56,6 +58,14 @@ const MAX_STACK: usize = 500;
 /// one waits for twice as many as were left, so nodes still in use are not scanned again and
 /// again.
 const ORPHANS_MIN: usize = 1024;
+/// Live nodes the cache keeps before evicting unused ones least recently looked up
+/// ([`Overlays::sweep`]).
+const NODES_MAX: usize = 1 << 14;
+/// Target node count after a size-triggered live eviction (3/4 of [`NODES_MAX`]).
+const NODES_TARGET: usize = NODES_MAX / 4 * 3;
+/// Minimum headroom above live pinned nodes before triggering another size sweep (1/4 of
+/// [`NODES_MAX`]).
+const NODES_HEADROOM: usize = NODES_MAX / 4;
 
 /// Every overlay instance and the nodes looked up in them.
 #[derive(Default)]
@@ -64,11 +74,16 @@ pub(crate) struct Overlays {
     instances: HashMap<u64, Instance>,
     nodes: HashMap<OvlId, OvlNode>,
     next: OvlId,
+    /// Logical LRU clock incremented on node creation and lookup.
+    clock: u64,
     /// Nodes whose name was removed, with the [`crate::task::SYSCALLS`] count when it was: no
     /// lookup finds them again, and they go once nothing uses them ([`Overlays::sweep`]).
     orphans: Vec<(OvlId, u64)>,
     /// The number of orphans at which the next sweep is tried (0 meaning [`ORPHANS_MIN`]).
     sweep_at: usize,
+    /// The total node count above which the next live-cache sweep is tried (0 meaning
+    /// [`NODES_MAX`]).
+    nodes_sweep_at: usize,
 }
 
 /// Open files holding each overlay node ([`Hold`]): their nodes are never swept. One table for
@@ -92,11 +107,13 @@ impl Hold {
         Hold(id)
     }
 
-    /// Whether some open file holds node `id`.
-    fn held(id: OvlId) -> bool {
+    /// Snapshot of all overlay nodes currently held by an open file or running program.
+    fn snapshot() -> HashSet<OvlId> {
         HELD.lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(&id)
+            .keys()
+            .copied()
+            .collect()
     }
 }
 
@@ -124,6 +141,9 @@ pub(crate) struct Instance {
     pub pins: Vec<u64>,
     /// Options as given.
     pub options: Options,
+    /// Copied-up upper inodes mapped to the lower inode they were copied up from, so evicting an
+    /// unused copied-up node does not change its shown inode number while the mount lasts.
+    origins: HashMap<Ino, Ino>,
 }
 
 /// An overlay node: the store inodes behind one name (Linux's `ovl_entry`).
@@ -141,10 +161,15 @@ pub(crate) struct OvlNode {
     pub lower: Vec<Ino>,
     /// The lower inode it was copied up from, whose number stat keeps showing (6.1's
     /// `ovl_getattr` keeps a directory's, and a file's with one link, while the mount lasts:
-    /// Linux records it in `trusted.overlay.origin`, here it is not recorded).
+    /// Linux records it in `trusted.overlay.origin`, here it is kept in [`Instance::origins`]).
     origin: Option<Ino>,
     /// Nodes already looked up in it, by name.
     children: HashMap<Vec<u8>, OvlId>,
+    /// [`Overlays::clock`] when it was last created or looked up: the oldest go first.
+    seen: u64,
+    /// [`crate::task::SYSCALLS`] when it was last created, looked up or accessed: nodes touched
+    /// during another thread's in-flight path syscall are kept from live eviction.
+    touched: Cell<u64>,
 }
 
 impl OvlNode {
@@ -428,6 +453,8 @@ impl Overlays {
             lower,
             origin: None,
             children: HashMap::new(),
+            seen: 0,
+            touched: Cell::new(0),
         });
         self.node_mut(root).parent = root;
         self.instances.insert(
@@ -437,9 +464,19 @@ impl Overlays {
                 mounter,
                 pins,
                 options,
+                origins: HashMap::new(),
             },
         );
         root
+    }
+
+    /// Next node count above which [`Overlays::wants_sweep`] should trigger a live-cache sweep,
+    /// given `live` nodes remaining: at least [`NODES_MAX`], and at least 25% (or
+    /// [`NODES_HEADROOM`]) above `live` so working sets larger than [`NODES_MAX`] do not rescan on
+    /// every lookup.
+    fn next_nodes_sweep_at(live: usize) -> usize {
+        let headroom = (live / 4).max(NODES_HEADROOM);
+        NODES_MAX.max(live.saturating_add(headroom))
     }
 
     /// Forgets instance `dev` and all its nodes (its last mount is gone).
@@ -448,6 +485,9 @@ impl Overlays {
             self.nodes.retain(|_, n| n.dev != dev);
             let nodes = &self.nodes;
             self.orphans.retain(|(id, _)| nodes.contains_key(id));
+            self.nodes_sweep_at = self
+                .nodes_sweep_at
+                .min(Self::next_nodes_sweep_at(self.nodes.len()));
         }
     }
 
@@ -457,18 +497,23 @@ impl Overlays {
         self.orphans.push((id, now));
     }
 
-    /// Whether enough removed nodes have gathered to try a [`Overlays::sweep`].
+    /// Whether enough removed nodes have gathered or the live node cache outgrew its bound to try
+    /// a [`Overlays::sweep`].
     pub(crate) fn wants_sweep(&self) -> bool {
         self.orphans.len() >= self.sweep_at.max(ORPHANS_MIN)
+            || self.nodes.len() > self.nodes_sweep_at.max(NODES_MAX)
     }
 
-    /// Drops the removed nodes nothing can use any more, with what lies below them; returns how
-    /// many nodes went. A node stays while it, or a node below it (whose parent links lead to
-    /// it), is in `keep` (processes' roots and cwds, mounts, inotify watches) or held by an open
-    /// file or a running program ([`Hold`]), and while it was removed at or after
+    /// Drops removed nodes nothing can use any more (with what lies below them) and, when total
+    /// cached nodes still exceed [`NODES_MAX`], evicts unused live leaf nodes least recently
+    /// looked up down to [`NODES_TARGET`]; returns how many nodes went. A node stays while it, or
+    /// a node below it (whose parent links lead to it), is an instance root, in `keep` (processes'
+    /// roots and cwds, mounts' roots/points/recorded file-mount directories, inotify watches),
+    /// held by an open file or a running program ([`Hold`]), or removed/touched at or after
     /// `oldest`, the [`crate::task::SYSCALLS`] number of the earliest system call still running in
-    /// another thread that may hold nodes it looked up before the removal.
+    /// another thread that may hold nodes it looked up.
     pub(crate) fn sweep(&mut self, keep: &HashSet<OvlId>, oldest: u64) -> usize {
+        let held = Hold::snapshot();
         let orphans = std::mem::take(&mut self.orphans);
         let removed: HashMap<OvlId, u64> = orphans.iter().copied().collect();
         // Removed nodes are no longer their directories' children: index them by parent
@@ -490,7 +535,7 @@ impl Overlays {
                 };
                 if keep.contains(&id)
                     || removed.get(&id).is_some_and(|&at| at >= oldest)
-                    || Hold::held(id)
+                    || held.contains(&id)
                 {
                     break false;
                 }
@@ -512,6 +557,79 @@ impl Overlays {
             .filter(|(id, _)| nodes.contains_key(id))
             .collect();
         self.sweep_at = 2 * self.orphans.len();
+
+        if self.nodes.len() <= NODES_MAX {
+            self.nodes_sweep_at = self
+                .nodes_sweep_at
+                .min(Self::next_nodes_sweep_at(self.nodes.len()));
+            return gone;
+        }
+        let mut pinned: HashSet<OvlId> = keep
+            .iter()
+            .copied()
+            .filter(|id| self.nodes.contains_key(id))
+            .collect();
+        for &id in &held {
+            if self.nodes.contains_key(&id) {
+                pinned.insert(id);
+            }
+        }
+        for &(id, _) in &self.orphans {
+            pinned.insert(id);
+        }
+        for (&id, n) in &self.nodes {
+            if n.parent == id || n.touched.get() >= oldest {
+                pinned.insert(id);
+            }
+        }
+        // Keep every ancestor of a pinned node so parent links and copy-ups never see a gap
+        let seeds: Vec<OvlId> = pinned.iter().copied().collect();
+        for mut x in seeds {
+            while let Some(n) = self.nodes.get(&x) {
+                if n.parent == x || !pinned.insert(n.parent) {
+                    break;
+                }
+                x = n.parent;
+            }
+        }
+        // Surviving orphan subtrees are managed by the orphan sweep above
+        if !self.orphans.is_empty() {
+            let mut stack: Vec<OvlId> = self.orphans.iter().map(|&(id, _)| id).collect();
+            while let Some(id) = stack.pop() {
+                if let Some(n) = self.nodes.get(&id) {
+                    for &child in n.children.values() {
+                        if pinned.insert(child) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        // Evict unused leaves, least recently looked up first; a directory whose last child goes
+        // becomes a leaf on the next iteration
+        while self.nodes.len() > NODES_TARGET {
+            let mut leaves: Vec<(u64, OvlId)> = self
+                .nodes
+                .iter()
+                .filter(|(id, n)| !pinned.contains(id) && n.children.is_empty())
+                .map(|(&id, n)| (n.seen, id))
+                .collect();
+            if leaves.is_empty() {
+                break;
+            }
+            leaves.sort_unstable();
+            leaves.truncate(self.nodes.len() - NODES_TARGET);
+            for (_, id) in leaves {
+                let n = self.nodes.remove(&id).unwrap();
+                if let Some(p) = self.nodes.get_mut(&n.parent)
+                    && p.children.get(&n.name) == Some(&id)
+                {
+                    p.children.remove(&n.name);
+                }
+                gone += 1;
+            }
+        }
+        self.nodes_sweep_at = Self::next_nodes_sweep_at(self.nodes.len());
         gone
     }
 
@@ -527,15 +645,23 @@ impl Overlays {
 
     /// Node `id`.
     pub(crate) fn node(&self, id: OvlId) -> &OvlNode {
-        &self.nodes[&id]
+        let n = &self.nodes[&id];
+        n.touched.set(crate::task::SYSCALLS.load(Ordering::Relaxed));
+        n
     }
 
     fn node_mut(&mut self, id: OvlId) -> &mut OvlNode {
-        self.nodes.get_mut(&id).expect("overlay node")
+        let n = self.nodes.get_mut(&id).expect("overlay node");
+        n.touched.set(crate::task::SYSCALLS.load(Ordering::Relaxed));
+        n
     }
 
-    fn add_node(&mut self, node: OvlNode) -> OvlId {
+    fn add_node(&mut self, mut node: OvlNode) -> OvlId {
         self.next += 1;
+        self.clock += 1;
+        node.seen = self.clock;
+        node.touched
+            .set(crate::task::SYSCALLS.load(Ordering::Relaxed));
         self.nodes.insert(self.next, node);
         self.next
     }
@@ -602,15 +728,20 @@ impl Overlays {
             return Err(Errno::ENOENT);
         }
         let dev = d.dev;
+        let known_origin = upper.and_then(|u| self.instances[&dev].origins.get(&u).copied());
         // The same name gives the same node again, brought up to date with the layers (keeping
         // what it was copied up from while its upper inode stays)
         if let Some(&id) = d.children.get(name) {
+            self.clock += 1;
+            let seen = self.clock;
             let n = self.node_mut(id);
             if n.upper != upper {
-                n.origin = None;
+                n.origin = known_origin;
             }
             n.upper = upper;
             n.lower = lower;
+            n.seen = seen;
+            self.node_mut(dir).seen = seen;
             return Ok(id);
         }
         let id = self.add_node(OvlNode {
@@ -619,10 +750,15 @@ impl Overlays {
             name: name.to_vec(),
             upper,
             lower,
-            origin: None,
+            origin: known_origin,
             children: HashMap::new(),
+            seen: 0,
+            touched: Cell::new(0),
         });
-        self.node_mut(dir).children.insert(name.to_vec(), id);
+        let seen = self.clock;
+        let parent = self.node_mut(dir);
+        parent.seen = seen;
+        parent.children.insert(name.to_vec(), id);
         Ok(id)
     }
 
@@ -631,9 +767,11 @@ impl Overlays {
     /// names below them, each entry's inode number the one stat shows.
     pub(crate) fn readdir(&self, store: &Store, dir: OvlId) -> Result<Vec<DirEntry>, Errno> {
         let d = self.node(dir);
+        let origins = &self.instances[&d.dev].origins;
         let layers = d.upper.iter().chain(&d.lower);
         let mut seen: std::collections::BTreeMap<Vec<u8>, Option<DirEntry>> = Default::default();
         for &layer in layers {
+            let is_upper = d.upper == Some(layer);
             for e in store.readdir(layer)? {
                 if seen.contains_key(&e.name) {
                     continue;
@@ -641,9 +779,8 @@ impl Overlays {
                 let mut shown = (!maybe_whiteout(store, &e)?).then(|| e.clone());
                 // A copied-up entry shows the number stat shows
                 if let Some(shown) = &mut shown
-                    && let Some(c) = d.children.get(&e.name).map(|&c| self.node(c))
-                    && c.upper == Some(e.ino)
-                    && let Some(origin) = c.origin
+                    && is_upper
+                    && let Some(&origin) = origins.get(&e.ino)
                 {
                     shown.ino = origin;
                 }
@@ -759,13 +896,25 @@ impl Overlays {
             s.set_times(dir, Some(at(pst.atime_ns)), Some(at(pst.mtime_ns)))?;
             Ok(ino)
         })?;
+        let dev = self.node(id).dev;
+        self.clock += 1;
+        let seen = self.clock;
+        let record_origin = st.is_dir() || st.nlink == 1;
         let n = self.node_mut(id);
         n.upper = Some(upper);
-        if st.is_dir() || st.nlink == 1 {
+        n.seen = seen;
+        if record_origin {
             n.origin = Some(lower);
         }
         if !st.is_dir() {
             n.lower.clear();
+        }
+        if record_origin {
+            self.instances
+                .get_mut(&dev)
+                .unwrap()
+                .origins
+                .insert(upper, lower);
         }
         Ok(upper)
     }
@@ -807,6 +956,12 @@ impl Overlays {
             }
             Ok(())
         })?;
+        if let Some(u) = child_upper
+            && (rmdir || store.attrs(u).is_ok_and(|st| st.nlink == 0) || store.attrs(u).is_err())
+        {
+            let dev = self.node(dir).dev;
+            self.instances.get_mut(&dev).unwrap().origins.remove(&u);
+        }
         self.node_mut(dir).children.remove(name);
         self.orphan(child);
         Ok(())
@@ -901,18 +1056,33 @@ impl Overlays {
             }
             Ok(())
         })?;
+        if !exchange
+            && let Some(du) = dst_up
+            && (store.attrs(du).is_ok_and(|st| st.nlink == 0) || store.attrs(du).is_err())
+        {
+            let dev = self.node(new).dev;
+            self.instances.get_mut(&dev).unwrap().origins.remove(&du);
+        }
+        self.clock += 1;
+        let seen = self.clock;
         self.node_mut(old).children.remove(old_name);
         let replaced = self.node_mut(new).children.remove(new_name);
         let n = self.node_mut(src);
         n.parent = new;
         n.name = new_name.to_vec();
-        self.node_mut(new).children.insert(new_name.to_vec(), src);
+        n.seen = seen;
+        let new_dir = self.node_mut(new);
+        new_dir.seen = seen;
+        new_dir.children.insert(new_name.to_vec(), src);
         match replaced {
             Some(d) if exchange => {
                 let n = self.node_mut(d);
                 n.parent = old;
                 n.name = old_name.to_vec();
-                self.node_mut(old).children.insert(old_name.to_vec(), d);
+                n.seen = seen;
+                let old_dir = self.node_mut(old);
+                old_dir.seen = seen;
+                old_dir.children.insert(old_name.to_vec(), d);
             }
             Some(d) => self.orphan(d),
             None => {}
@@ -1141,6 +1311,167 @@ mod tests {
         assert!([d, f, cwd, g].iter().all(|n| !o.nodes.contains_key(n)));
         assert!(o.linked(top) && o.orphans.is_empty());
         o.remove_instance(0x32);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unused live nodes are evicted least-recently-used once the cache outgrows `NODES_MAX`,
+    /// keeping roots, held/kept nodes, their ancestors, in-flight syscall nodes, and copied-up
+    /// origin inode numbers across eviction, and backing off `nodes_sweep_at` when live pinned
+    /// nodes exceed `NODES_MAX`.
+    #[test]
+    fn live_nodes_bounded_and_preserve_invariants() {
+        let dir = std::env::temp_dir().join(format!("appine-ovl-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::create(&dir).unwrap();
+        let root = super::super::store::ROOT;
+        let l = s.mkdir(root, b"l", 0o755, 0, 0).unwrap();
+        let u = s.mkdir(root, b"u", 0o755, 0, 0).unwrap();
+
+        // Subdirectories and files in lower layer
+        let keep_dir = s.mkdir(l, b"keep_dir", 0o755, 0, 0).unwrap();
+        let (keep_file_ino, _) = s.create_file(keep_dir, b"held", 0o644, 0, 0).unwrap();
+        let watch_dir = s.mkdir(l, b"watch_dir", 0o755, 0, 0).unwrap();
+        s.create_file(watch_dir, b"watched", 0o644, 0, 0).unwrap();
+        let (copied_lower_ino, _) = s.create_file(l, b"copied", 0o644, 0, 0).unwrap();
+        let temp_dir = s.mkdir(l, b"temp_dir", 0o755, 0, 0).unwrap();
+        s.create_file(temp_dir, b"temp_leaf", 0o644, 0, 0).unwrap();
+
+        // Populate enough distinct files across buckets to cross NODES_MAX
+        let total = NODES_MAX + 600;
+        let mut buckets = Vec::new();
+        for b in 0..32 {
+            let name = format!("b{b}");
+            buckets.push(s.mkdir(l, name.as_bytes(), 0o755, 0, 0).unwrap());
+        }
+        s.transaction(|s| {
+            for i in 0..total {
+                let name = format!("f{i}");
+                s.create_file(buckets[i % buckets.len()], name.as_bytes(), 0o644, 0, 0)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let mut o = Overlays::default();
+        let top = o.add_instance(
+            0x33,
+            (Some(u), vec![l]),
+            ((0, 0), Vec::new()),
+            Options::default(),
+        );
+
+        // Pin one file with Hold (in keep_dir), one with keep (watch_dir/watched), copy up one
+        // unused file to check origin persistence, and look up an unused subdirectory tree.
+        let kd = o.lookup(&s, top, b"keep_dir").unwrap();
+        let kf = o.lookup(&s, kd, b"held").unwrap();
+        let hold = Hold::new(kf);
+        let wd = o.lookup(&s, top, b"watch_dir").unwrap();
+        let wf = o.lookup(&s, wd, b"watched").unwrap();
+        let cf = o.lookup(&s, top, b"copied").unwrap();
+        let copied_upper = o.upper_of(&s, cf, CopyUp::All).unwrap();
+        assert_ne!(copied_upper, copied_lower_ino);
+        assert_eq!(o.stat(&s, cf).unwrap().ino, copied_lower_ino);
+        let td = o.lookup(&s, top, b"temp_dir").unwrap();
+        let tf = o.lookup(&s, td, b"temp_leaf").unwrap();
+
+        // Walk all buckets and files
+        let mut bucket_ids = Vec::new();
+        for b in 0..32 {
+            let name = format!("b{b}");
+            bucket_ids.push(o.lookup(&s, top, name.as_bytes()).unwrap());
+        }
+        let mut last_id = 0;
+        for i in 0..total {
+            let name = format!("f{i}");
+            last_id = o
+                .lookup(&s, bucket_ids[i % bucket_ids.len()], name.as_bytes())
+                .unwrap();
+        }
+        assert!(o.wants_sweep());
+
+        // Touch one node during a simulated in-flight syscall on another thread
+        let inflight_start = crate::task::SYSCALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let inflight_file = o.lookup(&s, bucket_ids[0], b"f0").unwrap();
+        let keep = HashSet::from([wf]);
+
+        let evicted = o.sweep(&keep, inflight_start);
+        assert!(evicted > 0);
+        assert_eq!(o.nodes.len(), NODES_TARGET);
+        assert!(!o.wants_sweep());
+
+        // Root, held file + parent, kept file + parent, most-recent node, and in-flight node stay
+        for id in [top, kd, kf, wd, wf, last_id, inflight_file] {
+            assert!(o.nodes.contains_key(&id), "node {id} should have stayed");
+            assert!(o.linked(id), "node {id} should still be linked");
+        }
+        assert_eq!(o.node(kf).real(), keep_file_ino);
+
+        // Earliest unused leaves (including temp_leaf and copied) were evicted; temp_dir is now an
+        // empty leaf and goes on the next sweep once the cache fills again
+        assert!(!o.nodes.contains_key(&tf));
+        assert!(!o.nodes.contains_key(&cf));
+        assert!(o.nodes.contains_key(&td));
+        for i in 0..NODES_HEADROOM + 64 {
+            let name = format!("f{i}");
+            o.lookup(&s, bucket_ids[i % bucket_ids.len()], name.as_bytes())
+                .unwrap();
+        }
+        assert!(o.wants_sweep());
+        let evicted_dir = o.sweep(&keep, u64::MAX);
+        assert!(evicted_dir > 0);
+        assert_eq!(o.nodes.len(), NODES_TARGET);
+        assert!(
+            !o.nodes.contains_key(&td),
+            "empty unused directory should be evicted once it becomes a leaf"
+        );
+
+        // Re-looking up the evicted copied-up file restores its origin inode number in stat and
+        // readdir!
+        let readdir_ino = o
+            .readdir(&s, top)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == b"copied")
+            .unwrap()
+            .ino;
+        assert_eq!(readdir_ino, copied_lower_ino);
+        let cf2 = o.lookup(&s, top, b"copied").unwrap();
+        assert_ne!(cf2, cf);
+        assert_eq!(o.node(cf2).upper, Some(copied_upper));
+        assert_eq!(o.stat(&s, cf2).unwrap().ino, copied_lower_ino);
+        assert!(o.linked(cf2));
+
+        // Re-looking up an evicted directory and its leaf works cleanly
+        let td2 = o.lookup(&s, top, b"temp_dir").unwrap();
+        let tf2 = o.lookup(&s, td2, b"temp_leaf").unwrap();
+        assert!(o.linked(td2) && o.linked(tf2));
+
+        // Backoff when pinned nodes exceed NODES_MAX: does not rescan on every lookup
+        let mut all_pinned: HashSet<OvlId> = o.nodes.keys().copied().collect();
+        for i in 0..total {
+            let b_name = format!("b{}", i % bucket_ids.len());
+            let bd = o.lookup(&s, top, b_name.as_bytes()).unwrap();
+            let name = format!("f{i}");
+            let id = o.lookup(&s, bd, name.as_bytes()).unwrap();
+            all_pinned.insert(id);
+        }
+        assert!(o.nodes.len() > NODES_MAX);
+        assert!(o.wants_sweep());
+        assert_eq!(o.sweep(&all_pinned, u64::MAX), 0);
+        assert!(
+            !o.wants_sweep(),
+            "nodes_sweep_at should back off above pinned working set"
+        );
+
+        // Once unpinned, an explicit sweep reclaims back down to NODES_TARGET
+        let evicted2 = o.sweep(&HashSet::new(), u64::MAX);
+        assert!(evicted2 > 0);
+        assert_eq!(o.nodes.len(), NODES_TARGET);
+        assert!(!o.wants_sweep());
+
+        drop(hold);
+        o.remove_instance(0x33);
+        assert!(o.nodes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

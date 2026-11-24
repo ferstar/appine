@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: reopening deleted overlay executables with their overlay identity)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: bounded live overlay node cache eviction and mmap following copy-up)
 
 ## Responsibilities
 
@@ -36,10 +36,13 @@ holding its node (`kernel/exec`).
 ## Key types
 
 - `Overlays` (`vfs/overlay.rs`) — `Instance`s by device number (upper root, the mounter's IDs, the
-  tmpfs instances its layers are in, `Options`) and `OvlNode`s by `OvlId` (Linux's overlay dentry:
-  parent and name, upper inode, lower inodes — every merged lower directory for a directory, the
-  topmost otherwise — `origin`, children looked up), plus orphans stamped with the syscall count
-  and the next sweep threshold. Ids are per kernel, never reused.
+  tmpfs instances its layers are in, `Options`, and `origins` mapping copied-up upper inodes to
+  their lower origin inode numbers for the life of the mount) and `OvlNode`s by `OvlId` (Linux's
+  overlay dentry: parent and name, upper inode, lower inodes — every merged lower directory for a
+  directory, the topmost otherwise — `origin`, children looked up, LRU `seen` clock, and `touched`
+  syscall stamp), plus orphans stamped with the syscall count and the orphan/live sweep thresholds
+  (`ORPHANS_MIN` = 1024, `NODES_MAX` = 16384, `NODES_TARGET` = 12288). Ids are per kernel, never
+  reused.
 - `overlay::Hold` — an open file's or running program's claim on an overlay node, in one static
   table for every kernel in the process (a hold in another kernel can only delay a sweep).
 - `Node::Overlay(MountId, OvlId)` (`kernel/vfs`); `OpenFile::ovl`, `ovl_holds` and `ovl_lower`;
@@ -49,10 +52,12 @@ holding its node (`kernel/exec`).
 
 - **Instances and nodes**: `Vfs::new_overlay`, `overlay`, `overlay_stat`, `overlay_readdir`,
   `overlay_upper`, `overlay_remove`, `overlay_rename`, `overlay_child`, `overlay_prefix`,
-  `sweep_overlays`; `Overlays::upper_of` (copy-up), `remove`, `rename`.
-- **Syscall paths**: mount(2) of type `overlay`; `open_overlay`, `follow_copy_up`, `unlink_overlay`,
-  `link_overlay`, `rename_overlay`; overlay branches of creation, attribute changes and readdir in
-  `kernel/vfs`, of opening in `kernel/files`, of truncate in `kernel/fileio`, and of xattr calls in `kernel/xattr`.
+  `overlay_mount_nodes`, `sweep_overlays`; `Overlays::upper_of` (copy-up), `remove`, `rename`.
+- **Syscall paths**: mount(2) of type `overlay`; `open_overlay`, `follow_copy_up`, `copy_up`,
+  `unlink_overlay`, `link_overlay`, `rename_overlay`; overlay branches of creation, attribute
+  changes and readdir in `kernel/vfs`, of opening in `kernel/files`, of truncate in
+  `kernel/fileio`, of `mmap` in `kernel/mm` (`syscall/mem.rs`), and of xattr calls in
+  `kernel/xattr`.
 
 ## Data flow / lifecycle
 
@@ -86,18 +91,31 @@ holding its node (`kernel/exec`).
   directory; an opaque directory (`trusted.overlay.opaque` = `y`, or `user.overlay.opaque` with
   `userxattr`, in any layer) ends it after itself. One directory and name give one node, its
   inodes refreshed on each lookup. Mounts inside a layer are not seen through the overlay.
-- Node lifetime: a node lasts while its name does. A removed name (unlink, rmdir, a replacing
+- Node lifetime: active nodes stay cached while referenced; unused live nodes and removed nodes are
+  reclaimed by `sweep_overlays` at the end of a syscall. A removed name (unlink, rmdir, a replacing
   rename) makes it an orphan no lookup finds; once 1024 orphans gather (then twice as many as the
-  last sweep left), the end of a syscall sweeps them (`sweep_overlays`): an orphan goes, with every
-  node below it, unless it or a node below is held (`Hold`), is a process's root or cwd, a mount's
-  root or point (detached ones too), watched by inotify, or was removed after another thread's
-  syscall began — unless that syscall waits only on files it holds (`waits_on_files_only`: I/O,
-  polls, child and signal waits, sleeps, futexes, locks, receives and accepts, fcntl, ioctl,
-  fsync, copy_file_range, IPC, AIO events), as `kernel/process` numbers syscalls. A sweep gives up
-  for the round when a task's resources or the inotify registry are borrowed. An instance and its
-  nodes go in `kernel/mount`'s `collect` once it has no mount. After an executable's name is
-  removed, opening its procfs exe link reads the pinned host file and keeps the overlay node
-  for metadata and locks. Write opens and truncation still check the mount and executable.
+  last sweep left), or once total cached nodes exceed `NODES_MAX` (16384; backing off with at least
+  25% / `NODES_HEADROOM` above remaining live nodes when the pinned working set exceeds
+  `NODES_MAX`), `sweep_overlays` runs:
+  - an orphan goes, with every node below it, unless it or a node below is held (`Hold`), is a
+    process's root or cwd, a mount's root, point or recorded file-mount directory (`Mount::at`,
+    `Mount::root_at`, detached ones too via `overlay_mount_nodes`), watched by inotify, or was
+    removed at or after another thread's syscall began — unless that syscall waits only on files it
+    holds (`waits_on_files_only`: I/O, polls, child and signal waits, sleeps, futexes, locks,
+    receives and accepts, fcntl, ioctl, fsync, copy_file_range, IPC, AIO events), as
+    `kernel/process` numbers syscalls;
+  - when total cached nodes still exceed `NODES_MAX`, unused live leaf nodes are evicted
+    least-recently-used down to `NODES_TARGET` (12288) and detached from their parent's `children`,
+    keeping instance roots, all kept/held/orphan nodes, any node touched at or after `oldest`
+    (every `Overlays::node`/`node_mut`/`add_node` stamps `touched`; `open_overlay` also holds a
+    scoped `Hold` across blocking lease breaks and FIFO opens), all ancestors of pinned nodes, and
+    surviving orphan subtrees; `Instance::origins` preserves copied-up upper-to-lower inode numbers
+    across eviction for both `stat` and `readdir` while mounted.
+  A sweep gives up for the round when a task's resources or the inotify registry are borrowed. An
+  instance and its nodes go in `kernel/mount`'s `collect` once it has no mount. After an
+  executable's name is removed, opening its procfs exe link reads the pinned host file and keeps
+  the overlay node for metadata and locks. Write opens and truncation still check the mount and
+  executable.
 
 ### readdir, stat and xattrs
 
@@ -169,12 +187,15 @@ holding its node (`kernel/exec`).
   overlay node's stat and device (`overlay_stat` and `dev_of`, consistent with `stat` across
   copy-up). `O_DIRECT` is decided by the mount's filesystem, so overlay files pass it even with
   the upper layer on a tmpfs. A file opened before its copy-up switches to the upper object on its
-  next read, fstat, lseek or copy out (`follow_copy_up`, `ovl_real_fdget`; a writable one marked
-  `cow` while the upper file is held), keeping the lower object open until close
-  (`OpenFile::ovl_lower`). Both locks (`lock_ino`) and leases (`lease::key_of`) key on the overlay
-  node (`overlay::key`), with write opens and truncations breaking leases before copy-up. Writes,
-  truncations, fallocate and copy-ups whose upper layer is on tmpfs (`backing_tmpfs_dev`) are
-  checked and charged against that tmpfs instance.
+  next read, fstat, lseek, copy out or `mmap` (`follow_copy_up`, matching 6.1's `ovl_real_fdget`
+  and `ovl_mmap` calling `ovl_realfile`; a writable one marked `cow` while the upper file is held),
+  keeping the lower object open until close (`OpenFile::ovl_lower`); `mmap` also unshares a
+  copied-up upper object through `mapping_object` / `make_private` before mapping, while a mapping
+  already created before copy-up keeps the lower object isolated (its store mapping pin forces
+  copy-up to copy instead of sharing). Both locks (`lock_ino`) and leases (`lease::key_of`) key on
+  the overlay node (`overlay::key`), with write opens and truncations breaking leases before
+  copy-up. Writes, truncations, fallocate and copy-ups whose upper layer is on tmpfs
+  (`backing_tmpfs_dev`) are checked and charged against that tmpfs instance.
 
 ## Dependencies (inbound / outbound)
 
@@ -216,12 +237,10 @@ holding its node (`kernel/exec`).
 
 - **Overlay gaps**, one per line:
   - an overlay cannot be a layer (Linux accepts one as a lower layer);
-  - nodes of existing names are never freed while mounted (one per name looked up), and removed
-    ones stay while a path-based syscall begun before their removal runs in another thread;
+  - removed nodes stay while a path-based syscall begun before their removal runs in another thread;
   - the no-BKL stat never serves overlay paths;
-  - no `trusted.overlay.origin`, `impure` or shared whiteout inode: a copied-up file's inode
-    number changes at the next mount, and a hard link through the overlay shows the upper number;
-  - a mapping made from a file opened before its copy-up keeps the lower object;
+  - no persistent `trusted.overlay.origin`, `impure` or shared whiteout inode: a copied-up file's
+    inode number changes at the next mount;
   - other namespaces' mounts on a removed or renamed overlay name are not detached;
   - a lower layer's `trusted.overlay.redirect` is not followed, though sysfs shows
     `redirect_always_follow` as Y (nothing Appine runs writes one).

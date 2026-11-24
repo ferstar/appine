@@ -1508,6 +1508,8 @@ fn open_overlay(
     flags: u32,
     (created, beside): (Option<std::fs::File>, Option<&Node>),
 ) -> Result<FileKind, Errno> {
+    // Hold the overlay node across any BKL release in break_leases or open_fifo.
+    let _hold = overlay::Hold::new(o);
     let mut real = vfs.overlay().node(o).real();
     let st = vfs.store().attrs(real)?;
     let lease_ino = overlay::key(o);
@@ -5247,10 +5249,11 @@ fn io_path(f: &OpenFile) -> IoPath {
 /// The host fd of a regular file: the BKL can be released while reading or writing it
 /// ([`unlocked_io`]).
 /// A regular file opened through an overlay before it was copied up still holds the lower
-/// inode's object: reads, fstat, seeks and copies out of it then switch to the upper one, as
-/// 6.1's `ovl_real_fdget` does, so they see what was changed through the overlay since (a
-/// mapping keeps what it mapped). The lower object stays open with the file
-/// ([`OpenFile::ovl_lower`]): a read without the BKL may still be using it.
+/// inode's object: reads, fstat, seeks, copies out of it and new memory mappings then switch to
+/// the upper one, as 6.1's `ovl_real_fdget` and `ovl_mmap` do, so they see what was changed
+/// through the overlay since (a mapping created before copy-up keeps the lower object). The lower
+/// object stays open with the file ([`OpenFile::ovl_lower`]): a read without the BKL may still be
+/// using it.
 pub(super) fn follow_copy_up(cx: &Cx<'_>, file: &FileRef) -> Result<(), Errno> {
     let (o, ino) = match &*file.borrow() {
         OpenFile {

@@ -1461,13 +1461,14 @@ pub(super) fn collect_released(k: &crate::kernel::Kernel, vfs: &Vfs) {
     }
 }
 
-/// At the end of a syscall, once enough overlay names have been removed: drops the nodes
-/// behind them that nothing can use any more ([`overlay::Overlays::sweep`]). Kept are the nodes
-/// processes' roots and cwds are, mounts' roots and points, and inotify watches; open files and
-/// the programs processes run (`/proc/<pid>/exe`) hold their own ([`overlay::Hold`]). A system
-/// call another thread is in may hold nodes it looked up while it waits, so it keeps those
-/// removed since it began, unless it waits only on files it holds ([`waits_on_files_only`]): a
-/// long wait4, epoll_wait or read keeps nothing.
+/// At the end of a syscall, once enough overlay names have been removed or the live node cache
+/// outgrows its bound: drops removed and excess unused nodes nothing can use any more
+/// ([`overlay::Overlays::sweep`]). Kept are the nodes processes' roots and cwds are, mounts'
+/// roots, points and recorded file-mount directories (`Mount::at`, `Mount::root_at`), and inotify
+/// watches; open files and the programs processes run (`/proc/<pid>/exe`) hold their own
+/// ([`overlay::Hold`]). A system call another thread is in may hold nodes it looked up while it
+/// waits, so it keeps those removed or touched since it began, unless it waits only on files it
+/// holds ([`waits_on_files_only`]): a long wait4, epoll_wait or read keeps nothing.
 pub(super) fn sweep_overlays(cx: &Cx<'_>) {
     let Ok(vfs) = cx.vfs() else {
         return;
@@ -1497,7 +1498,7 @@ pub(super) fn sweep_overlays(cx: &Cx<'_>) {
         keep.extend(ovl(&fs.root));
         keep.extend(ovl(&fs.cwd));
     }
-    keep.extend(vfs.mount_nodes().iter().filter_map(ovl));
+    keep.extend(vfs.overlay_mount_nodes());
     let Ok(inotify) = k.inotify.try_borrow() else {
         return;
     };

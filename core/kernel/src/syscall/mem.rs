@@ -140,15 +140,9 @@ pub(super) fn mmap(
         let mut f = file.borrow();
         let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
         match &f.kind {
-            FileKind::Regular {
-                file: host, ino, ..
-            } => {
+            FileKind::Regular { .. } => {
                 if !f.readable() {
                     return Err(Errno::EACCES);
-                }
-                label = Some((f.path.clone(), *ino));
-                if !f.pseudo {
-                    file_mnt = Some(f.mnt);
                 }
                 if shared_write && !f.writable() {
                     return Err(Errno::EACCES);
@@ -160,6 +154,23 @@ pub(super) fn mmap(
                         return Err(Errno::EPERM);
                     }
                     deny_exec = true;
+                }
+                // An overlay file opened before copy-up maps its copied-up upper object
+                // (Linux 6.1's `ovl_mmap` calling `ovl_realfile`).
+                if f.ovl.is_some() {
+                    drop(f);
+                    super::fs::follow_copy_up(cx, &file)?;
+                    f = file.borrow();
+                }
+                let FileKind::Regular {
+                    file: host, ino, ..
+                } = &f.kind
+                else {
+                    return Err(Errno::EBADF);
+                };
+                label = Some((f.path.clone(), *ino));
+                if !f.pseudo {
+                    file_mnt = Some(f.mnt);
                 }
                 // A memfd sealed against writes cannot have a writable shared mapping, now or later
                 let sealed = cx
