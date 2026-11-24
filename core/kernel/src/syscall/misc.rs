@@ -1503,11 +1503,8 @@ pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
     put(cx, buf, b).map(|()| 0)
 }
 
-/// membarrier(2). Kicking the other threads that share the address space out of guest code amounts
-/// to a full memory barrier and context synchronization on them (V8 uses the `SYNC_CORE` form
-/// after rewriting code). Global commands also act only on this process: other processes share
-/// only shared mappings with it, and all of Appine's guest threads are in one host process, so a
-/// host memory barrier is added here as well.
+/// membarrier(2). Quiescing an address space orders its threads' guest accesses and provides
+/// context synchronization for the private `SYNC_CORE` command.
 pub(super) fn membarrier(cx: &mut Cx<'_>, cmd: i32, flags: u32) -> SysResult {
     const QUERY: i32 = 0;
     const GLOBAL: i32 = 1;
@@ -1544,9 +1541,24 @@ pub(super) fn membarrier(cx: &mut Cx<'_>, cmd: i32, flags: u32) -> SysResult {
             {
                 return Err(Errno::EPERM);
             }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            let sync = cx.task.sync.clone();
-            cx.mm().quiesce(&sync);
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if cmd == GLOBAL || cmd == GLOBAL_EXPEDITED {
+                // Registration selects the receivers of GLOBAL_EXPEDITED. The caller may be
+                // unregistered. Threads and CLONE_VM processes can share the same address space.
+                let mut seen = std::collections::HashSet::new();
+                for task in cx.kr().tasks.values() {
+                    let res = task.res.borrow();
+                    if seen.insert(std::rc::Rc::as_ptr(&res.mm)) {
+                        let mm = res.mm.borrow();
+                        if cmd == GLOBAL || mm.membarrier & REGISTER_GLOBAL_EXPEDITED != 0 {
+                            mm.quiesce(&cx.task.sync);
+                        }
+                    }
+                }
+            } else {
+                cx.mm().quiesce(&cx.task.sync);
+            }
+            std::sync::atomic::fence(Ordering::SeqCst);
             Ok(0)
         }
         _ => Err(Errno::EINVAL),

@@ -179,7 +179,7 @@ jobs:
 
   # M7's exit criterion: the same scripts give the same output on Appine (Tier 1) and on native
   # Alpine in Docker. Each runner uses one lane and installs the suite its shard needs.
-  # The large gVisor socket groups and the long-running tests have their own shards.
+  # The gVisor filesystem and device groups run together, in parallel with the remaining groups.
   difftest:
     name: Differential tests (${{ matrix.shard }})
     needs: [changed, build]
@@ -192,6 +192,8 @@ jobs:
           - shard: gvisor-process
             suite: gvisor
           - shard: gvisor
+            suite: gvisor
+          - shard: gvisor-fs-devices
             suite: gvisor
           - shard: gvisor-inet
             suite: gvisor
@@ -270,6 +272,11 @@ jobs:
                 ;;
               gvisor-slow|gvisor-slow-process)
                 if [ "${{ matrix.shard }}" = "gvisor-slow" ]; then
+                  cases+=("$name")
+                fi
+                ;;
+              gvisor-devices|gvisor-fs)
+                if [ "${{ matrix.shard }}" = "gvisor-fs-devices" ]; then
                   cases+=("$name")
                 fi
                 ;;

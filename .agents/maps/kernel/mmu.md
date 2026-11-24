@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve existing soft-PTE entries on allocation failure via prefill_pages)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: cross-process targets for global membarrier commands)
 
 ## Responsibilities
 
@@ -158,10 +158,13 @@ fast path and refill (`engine/dbt`).
   translator) and looks again on the next pass; if `tlb` changed it flushes its TLB; if `code`
   changed it invalidates Tier 1 blocks for the ranges its space has not yet applied (once per
   space), or flushes all translations when the log no longer covers them.
-- Code-only changes kick nobody; other threads see them on their next guest entry, and membarrier
-  is the way to force it: every barrier command fences and quiesces the caller's address space
-  only (the private ones need registration, `EPERM`). Tier 1 handles `ic ivau` inside the
-  translator; the log carries mapping changes, Tier 0 invalidations, and leftover `ivau` pages.
+- Other threads see code-only changes on their next guest entry. A registered caller can force
+  context synchronization with `PRIVATE_EXPEDITED_SYNC_CORE`. Tier 1 handles `ic ivau` inside
+  the translator. The log carries mapping changes, Tier 0 invalidations and leftover `ivau` pages.
+- `membarrier` fences the caller before and after quiescing the target address spaces. The private
+  commands target the caller's space and require the matching registration (`EPERM`).
+  `GLOBAL` visits every live address space in the guest kernel once. `GLOBAL_EXPEDITED` quiesces
+  only those registered to receive it, including when the caller is unregistered.
 
 ### Code groups (mm side of translation sharing)
 
