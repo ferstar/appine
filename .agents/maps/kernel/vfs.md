@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: utimensat ownership checks and FUSE path descriptor pins)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: newfstatat flag validation on the cached and locked paths)
 
 ## Responsibilities
 
@@ -232,8 +232,9 @@ capabilities (`kernel/cred`).
   and devpts nodes stat'ed by path); `st_blocks` of regular store and tmpfs files (and host fds) as
   the host allocated them, of others from the size (sysfs files 0; symlinks under 60 bytes on the
   root filesystem or 128 elsewhere live in the inode); directories report size 4096 on the root
-  filesystem. statx reports `STATX_BASIC_STATS` only and takes `AT_NO_AUTOMOUNT` and one
-  `AT_STATX_*` sync flag; newfstatat takes only `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`.
+  filesystem. newfstatat and statx accept `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`,
+  `AT_NO_AUTOMOUNT` and the `AT_STATX_*` sync flags. newfstatat accepts both sync bits together.
+  statx rejects that combination with `EINVAL` and reports only `STATX_BASIC_STATS` on success.
 - statfs: the store reports ext4's magic with the host's `statvfs` of the objects directory, tmpfs
   its magic and limits (recounted), an overlay overlayfs's magic with the store's capacity, FUSE
   what the daemon answers, synthetic nodes the magic of their kind with zero sizes; `f_flags` from
@@ -382,7 +383,6 @@ capabilities (`kernel/cred`).
   - no `protected_regular` or `protected_fifos`;
   - a fault on a mapping of a full tmpfs never raises `SIGBUS`, and shared-mapping writes are
     counted only at a recount;
-  - newfstatat refuses `AT_NO_AUTOMOUNT` and the `AT_STATX_*` sync flags;
   - fstat of an open PTY reports `st_blksize` 4096 (stat by path 1024), epoll's fdinfo shows the
     root filesystem's device for tmpfs files and an anonymous one for overlay and FUSE files, and
     fstatfs of a FIFO reports pipefs;

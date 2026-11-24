@@ -154,7 +154,7 @@ syscalls	sendfile_test	18	*	SendFileTest.DoNotSendANegativeNumberOfBytes:SendFil
 syscalls	shm_test	25	*	ShmTest.MprotectWriteOnReadonlySegmentFails:ShmTest.ShmStat
 syscalls	sigreturn_test	1	*	-
 syscalls	splice_test	29	*	-
-syscalls	stat_test	33	*	All/*:StatTest.LinkCountsWithDirChild:StatTest.Nlinks:StatTest.StatIgnoreNoAutomount:StatTest.StatxMnt*:StatTest.StatxMount*
+syscalls	stat_test	34	*	All/*:StatTest.LinkCountsWithDirChild:StatTest.Nlinks:StatTest.StatxMnt*:StatTest.StatxMount*
 syscalls	stat_times_test	7	*	StatTimesTest.DirCreate*:StatTimesTest.DirList:StatTimesTest.DirRemoveFile:StatTimesTest.FileUtimes
 syscalls	sticky_test	5	*	-
 syscalls	symlink_test	32	*	SymlinkTest.FollowUpdatesATime

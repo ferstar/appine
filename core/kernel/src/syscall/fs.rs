@@ -36,7 +36,9 @@ pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_EACCESS: u32 = 0x200;
 const AT_SYMLINK_FOLLOW: u32 = 0x400;
+const AT_NO_AUTOMOUNT: u32 = 0x800;
 const AT_EMPTY_PATH: u32 = 0x1000;
+const AT_STATX_SYNC_TYPE: u32 = 0x6000;
 
 const F_DUPFD: u32 = 0;
 const F_GETFD: u32 = 1;
@@ -6093,9 +6095,10 @@ pub(super) fn newfstatat(
     put(cx, buf, st).map(|()| 0)
 }
 
-/// The `flags` check of newfstatat.
+/// Linux 6.1's vfs_fstatat accepts all sync bits through vfs_statx. Only the statx syscall
+/// rejects the combination of AT_STATX_FORCE_SYNC and AT_STATX_DONT_SYNC.
 pub(super) fn newfstatat_flags(flags: u32) -> Result<(), Errno> {
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0 {
         return Err(Errno::EINVAL);
     }
     Ok(())
@@ -6117,13 +6120,9 @@ pub(super) fn statx(
 
 /// The `flags` and `mask` checks of statx; returns the flags for [`stat_at`].
 pub(super) fn statx_flags(flags: u32, mask: u32) -> Result<u32, Errno> {
-    const AT_NO_AUTOMOUNT: u32 = 0x800;
-    const AT_STATX_SYNC_TYPE: u32 = 0x6000;
     const STATX_RESERVED: u32 = 0x8000_0000;
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0
-        || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE
-        || mask & STATX_RESERVED != 0
-    {
+    newfstatat_flags(flags)?;
+    if flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE || mask & STATX_RESERVED != 0 {
         return Err(Errno::EINVAL);
     }
     Ok(flags & (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
@@ -9597,4 +9596,15 @@ fn truncating(cx: &Cx<'_>, host: &std::fs::File, len: u64) {
 
 fn host_errno(e: std::io::Error) -> Errno {
     Errno(e.raw_os_error().unwrap_or(Errno::EIO.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combined_sync_flags_are_valid_only_for_newfstatat() {
+        assert_eq!(newfstatat_flags(AT_STATX_SYNC_TYPE), Ok(()));
+        assert_eq!(statx_flags(AT_STATX_SYNC_TYPE, 0), Err(Errno::EINVAL));
+    }
 }
