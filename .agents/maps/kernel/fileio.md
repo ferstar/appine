@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pin private store mappings and gather numeric sysctl writes)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: keep tmpfs fallocate reservations sparse on ext4)
 
 ## Responsibilities
 
@@ -149,11 +149,12 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 
 - `fallocate` checks offset, length and `EFBIG` before the fd, then `prepare_write`, writability
   (`EBADF`), directories `EISDIR`, pipes and sockets `ESPIPE`, other non-regular files `ENODEV`,
-  then the mode: 0, `KEEP_SIZE`, `PUNCH_HOLE` (with `KEEP_SIZE`) and, outside tmpfs, `ZERO_RANGE`
-  go to the host, others `EOPNOTSUPP`; then `RLIMIT_FSIZE`, seals and tmpfs room. A host without
-  the mode falls back to zeroing or lengthening. Tmpfs records reserved guest ranges, including
-  `KEEP_SIZE` past EOF. Reservations extending past EOF or on a store without FIEMAP are logical. Tmpfs hole punching
-  revokes mapped translations across address spaces before releasing the backing pages.
+  then the mode (0, `KEEP_SIZE`, `PUNCH_HOLE` with `KEEP_SIZE`, and `ZERO_RANGE` outside tmpfs),
+  then `RLIMIT_FSIZE`, seals and tmpfs room. Tmpfs records the reserved range against guest quota
+  and extends the file when needed. Leaving host holes sparse keeps untouched reservations out of
+  `SEEK_DATA` and overlay copy-up. A later write can still exhaust the host disk. Hole punching
+  revokes tmpfs mappings' translations before releasing the backing pages. Other allocations,
+  punches and zeroing use host fallocate, with a zeroing or lengthening fallback.
 - truncate: `EISDIR`, `EINVAL` for non-regular, `EROFS`, write permission (a synthetic regular file
   then succeeds unchanged), `ETXTBSY`, `RLIMIT_FSIZE`, then leases (6.1 breaks leases before
   `inode_newsize_ok`), seals, `make_private`, unmapping the dropped tail (busy address spaces
@@ -264,8 +265,6 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 
 ## Confirmed bugs / technical debt
 
-- With a store on ext4, host readahead into a physically preallocated range can make
-  `SEEK_DATA` report adjacent, untouched reserved pages as data. Those pages were already charged.
 - **Fidelity gaps**, one per line:
   - a memfd uses an unlinked store object. Extending it to `INT64_MAX` with `ftruncate`
     returns `EFBIG` on the development store, while native Linux accepts that length

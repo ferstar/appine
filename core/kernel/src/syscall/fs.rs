@@ -8617,19 +8617,13 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         }
     }
     remove_privs(cx, ino)?;
-    // Store objects and tmpfs files are host files: the host reserves, punches (freeing the
-    // hole's storage) or zeroes; on a host filesystem that cannot, a hole or zeroed range is
-    // written with zeros and a reservation only lengthens the file
     if tmpfs.is_some() && mode & FALLOC_FL_PUNCH_HOLE != 0 {
         punch_tmpfs_maps(cx, ino, offset, end);
     }
     let fd = std::os::fd::AsRawFd::as_raw_fd(host);
-    let logical = tmpfs.is_some()
-        && !zero
-        && (keep && end > size || !crate::vfs::tmpfs_host_reservations(host, offset));
-    let result = if logical {
-        // The guest range reserves quota even on stores that cannot reserve exactly these
-        // blocks. Leave unrelated holes intact when the file later grows into this range.
+    let result = if tmpfs.is_some() && !zero {
+        // Reserve guest quota while leaving host holes sparse. On ext4, readahead into an
+        // unwritten extent can make SEEK_DATA and overlay copy-up see an untouched page.
         if !keep && end > size {
             host.set_len(end).map_err(host_errno)?;
         }
