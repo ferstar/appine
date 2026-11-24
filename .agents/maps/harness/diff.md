@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the split; latest change: per-program gVisor test directory for tmpfs seal coverage)
+> Maintained: 2026-11-24 (targeted verification only since the split; latest change: directory locking across concurrent runs and legacy PID-lock recovery)
 
 ## Responsibilities
 
@@ -21,8 +21,8 @@ benchmarks, surveys and crash testing remain `harness`.
 - difftest's per-case directives, matched on any line: `# docker-run-options:`,
   `# appine-options:` and `# difftest-files:`; outputs `target/difftest/<case>.{native,appine,
   appine.err}`, failure copies `failed/<time>-t<tier>-<case>.*`, timings
-  `durations-t<tier>.txt` (`<case> <seconds>`), the run lock `.lock` (a symbolic link naming the
-  run's pid), lane claims
+  `durations-t<tier>.txt` (`<case> <seconds>`), an exclusive lock on the output directory,
+  the legacy `.lock` symlink naming the run's pid, lane claims
   `.slot-<n>`, lane stores `<store>-w<n>` (marked `.cloned`); the image `appine-difftest`,
   labelled with the exported directory list.
 - Suite tarballs: `target/starnix-tests/starnix-tests-<commit12>.tar` and
@@ -40,12 +40,12 @@ benchmarks, surveys and crash testing remain `harness`.
 
 ### Differential tests
 
-- One run at a time: a run creates `target/difftest/.lock`, a symbolic link naming its pid made in
-  one step, before touching the store; it waits while the run it names is alive (`ps -p`, which
-  also finds another user's process), takes over a lock whose run is gone (or an earlier version's
-  lock directory, with or without its pid file) by moving it aside first, so that of two waiters
-  finding the same dead run the one that moved away the other's new lock puts it back, and
-  removes it on exit; its lanes run under it.
+- Before touching the store or reclaiming a PID lock, the top-level shell opens
+  `target/difftest` and takes an exclusive `flock` on that descriptor through host Perl.
+  Contenders wait in the kernel. Lanes inherit the descriptor; the lock is released when its
+  last copy closes. For older runners the shell also publishes its PID as `.lock`, waits for a
+  live PID in a symlink or legacy lock directory, reclaims stale entries and removes its link
+  on exit.
 - On aarch64 Linux `appine-run` runs inside a container (`APPINE_IMAGE`, default
   `debian:trixie-slim`, the caller's uid, seccomp unconfined, the repository at its own path) for
   the store import, the tool check, the export and the cases, while the store's package and suite
@@ -219,8 +219,7 @@ benchmarks, surveys and crash testing remain `harness`.
 
 ## Confirmed bugs / technical debt
 
-- **Three waiters can still run together:** when one moves aside a lock another waiter has just
-  made and a third makes its own before it is put back, the moved one's run goes on without it.
+None recorded.
 
 ## Open questions
 

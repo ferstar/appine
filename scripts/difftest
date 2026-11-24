@@ -87,11 +87,21 @@ shift $((OPTIND - 1))
 
 out=target/difftest
 mkdir -p "$out"
-# One run at a time: runs share the per-case outputs, the lane claims and the lane clones (which -r
-# deletes), so a second run waits for the first. The lock is a symbolic link naming the owner's
-# pid, made in one step (earlier versions left a directory holding a pid file, also understood);
-# one left by a run that was killed is taken over. The lanes (-G) run under their parent's lock
+# Runs share outputs, lane claims and clones. Lock the output directory itself so replacing a
+# stale PID link cannot split the lock between contenders. Lanes inherit the open descriptor.
 if [ -z "$group" ]; then
+    exec 9<"$out"
+    # macOS has flock(2) but no flock(1). STDIN is a duplicate of the shell's open descriptor,
+    # so the lock survives the helper and is released when the last holder closes it.
+    perl -MFcntl=:flock -e '
+        flock(STDIN, LOCK_EX | LOCK_NB) and exit 0;
+        $!{EWOULDBLOCK} or die "difftest: lock $ARGV[0]: $!\n";
+        warn "difftest: waiting for the run holding $ARGV[0]\n";
+        flock(STDIN, LOCK_EX) or die "difftest: lock $ARGV[0]: $!\n";
+    ' "$out" <&9
+
+    # Older runners in this checkout use only the PID link (or a directory with a pid file).
+    # Honor their lock and publish ours for any already waiting to enter.
     lock=$out/.lock
     owner() { readlink "$1" 2>/dev/null || cat "$1/pid" 2>/dev/null || true; }
     waited=0
