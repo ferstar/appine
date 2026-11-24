@@ -1438,7 +1438,7 @@ fn open_store_with(
                 };
                 let target = writable.as_ref().unwrap_or(&file);
                 let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), ino, target)?;
-                truncate_regular(cx, vfs, target, 0, tmpfs)?;
+                truncate_regular(cx, vfs, ino, target, 0, tmpfs)?;
             }
             FileKind::Regular { ino, file, cow }
         }
@@ -3009,7 +3009,7 @@ fn splice_read(
         |s| matches!(&*s.borrow(), crate::net::Socket::Unix(u) if u.ty == crate::net::SOCK_STREAM),
     );
     let Some(sock) = unix_stream else {
-        return read_bytes_inner(cx, file, buf, offset, IoFlags::default(), pos_held);
+        return read_bytes_inner(cx, file, buf, offset, IoFlags::default(), pos_held, true);
     };
     let nonblock = nonblock || file.borrow().nonblocking();
     let m = super::net::recv(cx, &sock, nonblock, buf.len(), 0, 0)?;
@@ -3346,6 +3346,7 @@ fn vectored_inner(
         false => usize::MAX,
     };
     let mut total = 0;
+    let mut touch_atime = !write;
     for (index, (base, len)) in vecs.into_iter().enumerate() {
         if index != 0 && len == 0 {
             continue;
@@ -3358,7 +3359,12 @@ fn vectored_inner(
         let r = if write {
             write_file_inner(cx, &file, base, len, at, io, pos_held, true)
         } else {
-            read_file_inner(cx, &file, base, len, at, io, pos_held)
+            let touch = touch_atime && len > 0;
+            let res = read_file_inner(cx, &file, base, len, at, io, pos_held, touch);
+            if res.is_ok() && touch {
+                touch_atime = false;
+            }
+            res
         };
         match r {
             Ok(n) => {
@@ -3679,6 +3685,7 @@ pub(super) fn sendfile(
     let _pos = TwoPosGuard::lock(cx, (&input, lock_in), (&output, lock_out))?;
     let mut chunk = vec![0u8; count.min(IO_CHUNK)];
     let mut done = 0;
+    let mut touch_atime = true;
     while done < count {
         let n = (count - done).min(IO_CHUNK);
         let before = input.borrow().pos;
@@ -3689,9 +3696,13 @@ pub(super) fn sendfile(
             off,
             IoFlags::default(),
             lock_in,
+            touch_atime,
         ) {
             Ok(0) => break,
-            Ok(k) => k,
+            Ok(k) => {
+                touch_atime = false;
+                k
+            }
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
         };
@@ -3800,6 +3811,7 @@ pub(super) fn copy_file_range(
     } else {
         copy_data(cx, &input, src, &output, dst, len)?
     };
+    file_accessed(cx, &input.borrow());
     if n > 0 {
         write_sync(cx, &output, 0)?;
     }
@@ -3835,13 +3847,20 @@ fn copy_data(
     while done < len {
         let n = (len - done).min(IO_CHUNK);
         let before = input.borrow().pos;
-        let got =
-            match read_bytes_inner(cx, input, &mut chunk[..n], src, IoFlags::default(), lock_in) {
-                Ok(0) => break,
-                Ok(k) => k,
-                Err(_) if done > 0 => break,
-                Err(e) => return Err(e),
-            };
+        let got = match read_bytes_inner(
+            cx,
+            input,
+            &mut chunk[..n],
+            src,
+            IoFlags::default(),
+            lock_in,
+            false,
+        ) {
+            Ok(0) => break,
+            Ok(k) => k,
+            Err(_) if done > 0 => break,
+            Err(e) => return Err(e),
+        };
         let wrote =
             match write_bytes_inner(cx, output, &chunk[..got], dst, IoFlags::default(), lock_out) {
                 Ok(k) => k,
@@ -4147,6 +4166,9 @@ fn copy_regular(
         Err(e) => Some(Err(e)),
         Ok(n) => {
             if n > 0 {
+                if let Ok(vfs) = cx.vfs() {
+                    vfs.store().object_modified(ino);
+                }
                 inotify::file_io_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
                 inotify::file_io_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
             }
@@ -4174,9 +4196,10 @@ pub(super) fn read_file_with(
     offset: Option<u64>,
     io: IoFlags,
 ) -> SysResult {
-    read_file_inner(cx, file, buf, len, offset, io, false)
+    read_file_inner(cx, file, buf, len, offset, io, false, true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_file_inner(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -4185,6 +4208,7 @@ fn read_file_inner(
     offset: Option<u64>,
     io: IoFlags,
     pos_held: bool,
+    mut touch_atime: bool,
 ) -> SysResult {
     // A socket receives one message of up to the whole length (super::net::rw). The borrow must
     // end before: receiving may wait with the BKL released
@@ -4195,7 +4219,7 @@ fn read_file_inner(
         return super::net::rw(cx, &s, nonblock, &[(buf, len)], false);
     }
     if len == 0 {
-        return read_bytes_inner(cx, file, &mut [], offset, io, pos_held).map(|n| n as u64);
+        return read_bytes_inner(cx, file, &mut [], offset, io, pos_held, false).map(|n| n as u64);
     }
     // Pipe reads peek and copy into user memory before draining so an EFAULT never consumes bytes
     if let Some((pipe, _)) = pipe_of(file) {
@@ -4236,8 +4260,12 @@ fn read_file_inner(
             offset.map(|o| o + done as u64),
             io,
             held,
+            touch_atime,
         ) {
-            Ok(k) => k,
+            Ok(k) => {
+                touch_atime = false;
+                k
+            }
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
         };
@@ -4447,7 +4475,7 @@ fn read_bytes_with(
     offset: Option<u64>,
     io: IoFlags,
 ) -> Result<usize, Errno> {
-    read_bytes_inner(cx, file, buf, offset, io, false)
+    read_bytes_inner(cx, file, buf, offset, io, false, true)
 }
 
 fn read_bytes_inner(
@@ -4457,6 +4485,7 @@ fn read_bytes_inner(
     offset: Option<u64>,
     io: IoFlags,
     pos_held: bool,
+    touch_atime: bool,
 ) -> Result<usize, Errno> {
     let (path, nonblock) = {
         let f = file.borrow();
@@ -4534,7 +4563,9 @@ fn read_bytes_inner(
                     let n = unlocked_io(cx, file, fd, (offset, pos_held), |fd, pos| {
                         appine_hal::pread(fd, buf, pos)
                     })?;
-                    file_accessed(cx, &file.borrow());
+                    if touch_atime {
+                        file_accessed(cx, &file.borrow());
+                    }
                     n
                 }
                 None => {
@@ -4558,7 +4589,7 @@ pub(super) fn file_accessed(cx: &Cx<'_>, f: &OpenFile) {
         return;
     }
     if let FileKind::Regular { ino, file, .. } = &f.kind
-        && let Ok(vfs) = cx.vfs()
+        && let Some(vfs) = cx.kr().vfs.as_deref()
     {
         vfs.accessed(f.mnt, *ino, Some(file));
     }
@@ -4998,6 +5029,11 @@ fn write_local(
         tmpfs_resized(&*cx.vfs()?, Some(t), host);
     }
     if n > 0 {
+        if let FileKind::Regular { ino, .. } = &file.borrow().kind
+            && let Ok(vfs) = cx.vfs()
+        {
+            vfs.store().object_modified(*ino);
+        }
         inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
     }
     Ok(n)
@@ -8571,7 +8607,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             remove_privs(cx, ino)?;
             let host = object(ino)?;
             let tmpfs = tmpfs_size(&vfs, &node, ino, &host)?;
-            truncate_regular(cx, &vfs, &host, len, tmpfs)?;
+            truncate_regular(cx, &vfs, ino, &host, len, tmpfs)?;
             if inotify::active(cx.kr()) {
                 let (target, parent) = inotify::watched_at(cx, ino, (AT_FDCWD, &path), true);
                 let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
@@ -8616,7 +8652,7 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
             remove_privs(cx, *ino)?;
             let vfs = cx.vfs()?;
             let tmpfs = open_tmpfs_size(&vfs, &f, *ino, file)?;
-            truncate_regular(cx, &vfs, file, len, tmpfs)?;
+            truncate_regular(cx, &vfs, *ino, file, len, tmpfs)?;
             inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
             Ok(0)
         }
@@ -8628,12 +8664,14 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
 fn truncate_regular(
     cx: &Cx<'_>,
     vfs: &Vfs,
+    ino: Ino,
     host: &std::fs::File,
     len: u64,
     tmpfs: Option<TmpfsFile>,
 ) -> Result<(), Errno> {
     truncating(cx, host, len);
     host.set_len(len).map_err(host_errno)?;
+    vfs.store().object_modified(ino);
     if let Some(t) = tmpfs
         && len <= t.size
     {
@@ -8753,6 +8791,7 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
             vfs.tmpfs_record_pages(t.dev, ino, offset, end, false);
         }
     }
+    vfs.store().object_modified(ino);
     tmpfs_resized(&vfs, tmpfs, host);
     inotify::file_io_event(cx.kr(), &f, inotify::IN_MODIFY);
     Ok(0)

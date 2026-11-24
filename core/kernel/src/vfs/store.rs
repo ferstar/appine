@@ -65,7 +65,7 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -122,6 +122,9 @@ const FLUSH_EACH: usize = 16;
 /// reported (the close could not be watched) keeps its object out of sharing, which costs only
 /// copies.
 static HOST_WRITERS: Mutex<Vec<HostWriter>> = Mutex::new(Vec::new());
+
+/// Number of entries currently in [`HOST_WRITERS`], checked on the read path without locking.
+static HOST_WRITERS_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// One entry of [`HOST_WRITERS`]: the store's identity, the object, the path.
 type HostWriter = ((u64, u64), Ino, Vec<u8>);
@@ -317,6 +320,8 @@ pub struct Store {
     #[cfg(any(debug_assertions, feature = "borrow-check"))]
     owner: std::sync::atomic::AtomicUsize,
     objects: PathBuf,
+    /// The store's identity across connections (`(st_dev, st_ino)` of `objects/`).
+    store_id: (u64, u64),
     /// The `lock` file in the store directory. Every process using the store holds a shared lock
     /// on it, and deleted inodes are cleaned up only under exclusive use: other processes may still
     /// have them open.
@@ -355,6 +360,10 @@ pub struct Store {
     reaper: Option<JoinHandle<()>>,
     /// What goes into the cache after this operation succeeds ([`Fill`]).
     fills: RefCell<Vec<Fill>>,
+    /// Inodes that may have a writable shared mapping (or are anonymous memfds), so their host
+    /// object's mtime/ctime can advance via dirty-page writeback without a syscall into the store.
+    /// Kept outside [`Cache`] because a mapping outlives cache clears.
+    writable_maps: RefCell<HashSet<Ino>>,
 }
 
 impl Store {
@@ -377,7 +386,7 @@ impl Store {
                 params![ROOT, mode::S_IFDIR | 0o755, now],
             )
             .map_err(db_err)?;
-        store.meta.commits.users().fetch_add(1, Ordering::SeqCst);
+        store.meta.commits.join();
         Ok(store)
     }
 
@@ -391,7 +400,7 @@ impl Store {
         let store = Self::connect(dir)?;
         let fd = store.lock.as_raw_fd();
         if appine_hal::flock(fd, true, false).is_ok() {
-            store.meta.commits.users().store(0, Ordering::SeqCst);
+            store.meta.commits.reset_users();
             store.recover_objects()?;
             store.remove_lost_objects()?;
             for path in volatile {
@@ -410,7 +419,7 @@ impl Store {
         // Another process is also using the store: wait for it to commit its deferred write
         // transaction (after seeing this count it no longer defers); only then are its changes
         // visible
-        if store.meta.commits.users().fetch_add(1, Ordering::SeqCst) > 0 {
+        if store.meta.commits.join() > 0 {
             store.exec("BEGIN IMMEDIATE")?;
             store.exec("COMMIT")?;
         }
@@ -464,6 +473,8 @@ impl Store {
         appine_hal::flock(lock.as_raw_fd(), false, true).map_err(Errno)?;
         let commits = Commits::open(&lock)?;
         let objects_dir = appine_hal::open_dir(&dir.join("objects")).map_err(Errno)?;
+        let objects_st = appine_hal::fstat(objects_dir.as_raw_fd()).map_err(Errno)?;
+        let store_id = (objects_st.st_dev, objects_st.st_ino);
         let meta = Arc::new(Meta {
             lock: RwLock::new(()),
             cache: UnsafeCell::new(Cache {
@@ -480,6 +491,8 @@ impl Store {
             syncs: AtomicU64::new(0),
             #[cfg(test)]
             flushes: AtomicU64::new(0),
+            #[cfg(test)]
+            accessed_stats: AtomicU64::new(0),
         });
         let reaper = {
             let (meta, db) = (meta.clone(), dir.join("meta.db"));
@@ -506,6 +519,7 @@ impl Store {
             #[cfg(any(debug_assertions, feature = "borrow-check"))]
             owner: std::sync::atomic::AtomicUsize::new(0),
             objects: dir.join("objects"),
+            store_id,
             lock,
             meta,
             reaper,
@@ -519,6 +533,7 @@ impl Store {
             changed_dirs: RefCell::new(None),
             waker: RefCell::new(None),
             fills: RefCell::default(),
+            writable_maps: RefCell::default(),
         })
     }
 
@@ -858,10 +873,9 @@ impl Store {
     /// ([`HOST_WRITERS`]).
     pub fn host_opened(&self, ino: Ino, path: &[u8]) -> Result<(), Errno> {
         let entry = (self.id()?, self.data(ino)?.object, path.to_vec());
-        HOST_WRITERS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(entry);
+        let mut writers = HOST_WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
+        writers.push(entry);
+        HOST_WRITERS_COUNT.store(writers.len(), Ordering::SeqCst);
         Ok(())
     }
 
@@ -873,17 +887,14 @@ impl Store {
         let mut writers = HOST_WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(i) = writers.iter().position(|(s, _, p)| *s == id && p == path) {
             writers.remove(i);
+            HOST_WRITERS_COUNT.store(writers.len(), Ordering::SeqCst);
         }
     }
 
     /// Whether the host may be writing regular file `ino`'s object, which then must not be shared
     /// with another file in either direction (the writes would reach both).
     pub fn host_writing(&self, ino: Ino) -> Result<bool, Errno> {
-        if HOST_WRITERS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty()
-        {
+        if HOST_WRITERS_COUNT.load(Ordering::Acquire) == 0 {
             return Ok(false);
         }
         let (id, object) = (self.id()?, self.data(ino)?.object);
@@ -894,10 +905,19 @@ impl Store {
             .any(|(s, o, _)| *s == id && *o == object))
     }
 
+    /// Whether the Files app currently holds any host object in this store open for writing.
+    fn has_host_writers(&self) -> bool {
+        HOST_WRITERS_COUNT.load(Ordering::Acquire) != 0
+            && HOST_WRITERS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|(s, _, _)| *s == self.store_id)
+    }
+
     /// The store's identity across connections: the device and inode of its `objects` directory.
     fn id(&self) -> Result<(u64, u64), Errno> {
-        let st = appine_hal::fstat(self.meta.objects_dir.as_raw_fd()).map_err(Errno)?;
-        Ok((st.st_dev, st.st_ino))
+        Ok(self.store_id)
     }
 
     /// Metadata in the database (without touching the host; a regular file's size and times are
@@ -1196,12 +1216,15 @@ impl Store {
     /// deleted from the start, so the data goes away once it is closed; the inode is cleaned up
     /// the next time the store is opened. The owner is the creator's (filesystem) ids.
     pub fn create_anonymous(&self, perm: u32, uid: u32, gid: u32) -> Result<(Ino, File), Errno> {
-        self.transaction(|s| {
+        let (ino, file) = self.transaction(|s| {
             let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 0, 0)?;
             let file = s.new_object(ino)?;
             s.remove_object(ino)?;
             Ok((ino, file))
-        })
+        })?;
+        // memfd mappings bypass `mapping_object`, so never cache host-backed relatime state.
+        self.writable_maps.borrow_mut().insert(ino);
+        Ok((ino, file))
     }
 
     /// Creates a symbolic link.
@@ -1880,7 +1903,9 @@ impl Store {
         set: impl FnOnce() -> Result<(), Errno>,
     ) -> Result<(), Errno> {
         if atime.is_none() {
-            return set();
+            set()?;
+            self.object_modified(ino);
+            return Ok(());
         }
         self.statement(|s| {
             set()?;
@@ -1904,31 +1929,143 @@ impl Store {
         file: Option<&File>,
         relatime: bool,
     ) -> Result<(), Errno> {
-        let stat = || match file {
-            Some(file) => self.stat_open(ino, file),
-            None => self.stat(ino),
-        };
         const DAY_NS: i64 = 86_400 * 1_000_000_000;
-        let relatime_due = |st: Stat, now: i64| {
-            st.atime_ns <= st.mtime_ns
-                || st.atime_ns <= st.ctime_ns
-                || now.saturating_sub(st.atime_ns) >= DAY_NS
+        let relatime_due = |atime: i64, mtime: i64, ctime: i64, now: i64| {
+            atime <= mtime || atime <= ctime || now.saturating_sub(atime) >= DAY_NS
         };
-        // Avoid a write transaction for most reads. When due, check again under the write lock.
-        if relatime && !relatime_due(stat()?, now_ns()) {
+        let now = now_ns();
+        if relatime && self.relatime_is_fresh(ino, now, DAY_NS) {
             return Ok(());
         }
-        self.statement(|s| {
+        let before_users = self.meta.commits.users_state();
+        // Avoid a write transaction for most reads. When due, check again under the write lock.
+        if relatime {
+            let (atime, mtime, ctime) = self.inode_times(ino, file)?;
+            if !relatime_due(atime, mtime, ctime, now) {
+                self.record_relatime_fresh(ino, atime, before_users);
+                return Ok(());
+            }
+        }
+        let fresh = self.statement(|s| {
             let now = if file.is_some() {
                 s.filesystem_now()?
             } else {
                 now_ns()
             };
-            if !relatime || relatime_due(stat()?, now) {
+            if !relatime {
                 s.write_atime(ino, now)?;
+                return Ok(None);
             }
-            Ok(())
+            let (atime, mtime, ctime) = s.inode_times(ino, file)?;
+            let atime = if relatime_due(atime, mtime, ctime, now) {
+                s.write_atime(ino, now)?;
+                now
+            } else {
+                atime
+            };
+            Ok((atime > mtime && atime > ctime).then_some(atime))
+        })?;
+        if let Some(atime) = fresh {
+            self.record_relatime_fresh(ino, atime, before_users);
+        }
+        Ok(())
+    }
+
+    /// Returns `(atime_ns, mtime_ns, ctime_ns)` for `ino` without cloning [`Stat`] or stat-ing
+    /// the host object for directories and held regular files whose timestamps live in SQLite.
+    fn inode_times(&self, ino: Ino, file: Option<&File>) -> Result<(i64, i64, i64), Errno> {
+        let generation = self.cache_generation();
+        let (kind, row_times, data) = if let Some(hit) = self.cached(|c| {
+            c.rows
+                .get(&ino)
+                .map(|(st, data)| (st.kind(), (st.atime_ns, st.mtime_ns, st.ctime_ns), *data))
+        }) {
+            hit
+        } else {
+            self.begin_read()?;
+            let row = self.query_row(ino)?;
+            let res = (
+                row.0.kind(),
+                (row.0.atime_ns, row.0.mtime_ns, row.0.ctime_ns),
+                row.1,
+            );
+            if generation.is_some_and(|g| self.may_fill(g)) {
+                self.update(|c| {
+                    c.entries += 1;
+                    c.rows.insert(ino, row);
+                });
+            }
+            res
+        };
+        if kind != mode::S_IFREG || data.held.is_some() {
+            return Ok(row_times);
+        }
+        #[cfg(test)]
+        self.meta.accessed_stats.fetch_add(1, Ordering::Relaxed);
+        let host = match file {
+            Some(file) => appine_hal::fstat(file.as_raw_fd()).map_err(Errno)?,
+            None => {
+                let mut name = [0u8; 21];
+                appine_hal::stat_at(
+                    self.meta.objects_dir.as_raw_fd(),
+                    object_name(data.object, &mut name),
+                )
+                .map_err(Errno)?
+            }
+        };
+        let atime = data
+            .atime
+            .unwrap_or_else(|| timestamp_ns(host.st_atime, host.st_atime_nsec));
+        let mtime = timestamp_ns(host.st_mtime, host.st_mtime_nsec);
+        let ctime = timestamp_ns(host.st_ctime, host.st_ctime_nsec);
+        Ok((atime, mtime, ctime))
+    }
+
+    fn relatime_is_fresh(&self, ino: Ino, now: i64, day_ns: i64) -> bool {
+        let users = self.meta.commits.users_state();
+        if users as u32 > 1 || self.has_host_writers() {
+            return false;
+        }
+        let commits = self.meta.commits.get();
+        self.cached(|c| {
+            if c.generation != commits || c.relatime_state != users {
+                return false;
+            }
+            let atime = match c.last_relatime {
+                Some((last, atime)) if last == ino => atime,
+                _ => match c.relatime_fresh.get(&ino) {
+                    Some(&atime) => atime,
+                    None => return false,
+                },
+            };
+            now.saturating_sub(atime) < day_ns
         })
+    }
+
+    fn record_relatime_fresh(&self, ino: Ino, atime: i64, before_users: u64) {
+        if self.writing.get()
+            || before_users as u32 > 1
+            || self.meta.commits.users_state() != before_users
+            || self.has_host_writers()
+            || self.writable_maps.borrow().contains(&ino)
+        {
+            return;
+        }
+        let commits = self.meta.commits.get();
+        self.update(|c| {
+            if c.generation != commits || c.entries > Cache::MAX_ENTRIES {
+                c.clear(commits);
+            }
+            if c.relatime_state != before_users {
+                c.relatime_fresh.clear();
+                c.last_relatime = None;
+                c.relatime_state = before_users;
+            }
+            if c.relatime_fresh.insert(ino, atime).is_none() {
+                c.entries += 1;
+            }
+            c.last_relatime = Some((ino, atime));
+        });
     }
 
     /// A held regular file keeps its timestamps in SQLite across sharing and copy-up. Sample
@@ -2065,7 +2202,7 @@ impl Store {
 
     /// Write transactions may be deferred: no other connection is open on the store.
     fn defers(&self) -> bool {
-        self.meta.commits.users().load(Ordering::Relaxed) <= 1
+        self.meta.commits.active_users() <= 1
     }
 
     /// Takes the directories whose dentries changed (created, removed, renamed) since the last
@@ -2266,7 +2403,29 @@ impl Store {
             c.rows.remove(&ino);
             c.targets.remove(&ino);
             c.parents.remove(&ino);
+            c.relatime_fresh.remove(&ino);
+            if c.last_relatime.is_some_and(|(i, _)| i == ino) {
+                c.last_relatime = None;
+            }
         });
+    }
+
+    /// Marks regular file `ino`'s host object as modified outside SQLite (data write, truncate,
+    /// fallocate, copy, writable shared mapping, or host-only mtime update) so cached `relatime`
+    /// state is re-checked on the next read.
+    pub(crate) fn object_modified(&self, ino: Ino) {
+        let present = self.cached(|c| {
+            c.last_relatime.is_some_and(|(i, _)| i == ino)
+                || (!c.relatime_fresh.is_empty() && c.relatime_fresh.contains_key(&ino))
+        });
+        if present {
+            self.update(|c| {
+                c.relatime_fresh.remove(&ino);
+                if c.last_relatime.is_some_and(|(i, _)| i == ino) {
+                    c.last_relatime = None;
+                }
+            });
+        }
     }
 
     /// File capabilities changed: invalidates the cached set.
@@ -2338,6 +2497,10 @@ impl Store {
             if data.held.is_some() {
                 return Err(Errno::EAGAIN);
             }
+            if writable {
+                s.writable_maps.borrow_mut().insert(ino);
+                s.object_modified(ino);
+            }
             let access = if writable {
                 libc::O_RDWR
             } else {
@@ -2399,7 +2562,9 @@ impl Store {
     /// Truncates a regular file.
     pub fn truncate(&self, ino: Ino, len: u64) -> Result<(), Errno> {
         self.make_private(ino, Some(len))?;
-        self.open_object(ino, true)?.set_len(len).map_err(io_err)
+        self.open_object(ino, true)?.set_len(len).map_err(io_err)?;
+        self.object_modified(ino);
+        Ok(())
     }
 
     /// Opens regular file `ino`'s object (its own, or the one it shares); `flags` are host open
@@ -2600,6 +2765,7 @@ impl Store {
     /// Deleted regular file `ino` is not open any more: if it was held, it stops sharing its
     /// object, which goes when no other file uses it (otherwise the next boot does this).
     pub fn release(&self, ino: Ino) -> Result<(), Errno> {
+        self.writable_maps.borrow_mut().remove(&ino);
         let (st, data) = self.row(ino)?;
         if st.nlink != 0 || st.kind() != mode::S_IFREG || !data.listed(ino) {
             return Ok(());
@@ -2750,7 +2916,7 @@ impl Drop for Store {
             r.work.notify_one();
             let _ = t.join();
         }
-        self.meta.commits.users().fetch_sub(1, Ordering::SeqCst);
+        self.meta.commits.leave();
     }
 }
 
@@ -2863,6 +3029,9 @@ pub(crate) struct Meta {
     syncs: AtomicU64,
     #[cfg(test)]
     flushes: AtomicU64,
+    /// Host object stat calls made from [`Store::accessed`] (for tests).
+    #[cfg(test)]
+    accessed_stats: AtomicU64,
 }
 
 impl Meta {
@@ -3082,6 +3251,14 @@ struct Cache {
     /// means not looked up yet. Writing a file has to check it, so the whole set is cached
     /// together and invalidated with the commit count.
     file_caps: Option<Map<Ino, ()>>,
+    /// Connection state (`Commits::users_state`) when `relatime_fresh` entries were verified.
+    relatime_state: u64,
+    /// Single-entry fast slot for the most recently verified `relatime_fresh` inode.
+    last_relatime: Option<(Ino, i64)>,
+    /// Inodes whose guest atime is already known to be strictly newer than their mtime and ctime,
+    /// storing that `atime_ns`. Cleared on inode mutations, host object modifications, foreign
+    /// commits, or another connection opening the store.
+    relatime_fresh: Map<Ino, i64>,
 }
 
 impl Cache {
@@ -3129,13 +3306,35 @@ impl Commits {
         self.word(0).fetch_add(1, Ordering::SeqCst)
     }
 
-    /// The number of [`Store`] connections open on the store (one process may hold several: each
-    /// host call opens its own besides the kernel's). A process that exited abnormally has not
-    /// subtracted its connections, so it may be too high (which only makes other connections stop
-    /// deferring commits); it is reset to zero when the store is opened exclusively (the
-    /// equivalent of boot).
-    fn users(&self) -> &AtomicU64 {
-        self.word(1)
+    /// Packed connection state in word 1 of the shared header: low 32 bits hold the number of
+    /// [`Store`] connections currently open on the store (one process may hold several: each host
+    /// call opens its own besides the kernel's), and high 32 bits hold a monotonically increasing
+    /// open epoch bumped by every join so cached `relatime` state detects another connection that
+    /// opened, modified an object without committing to SQLite, and closed. A process that exited
+    /// abnormally has not subtracted its connection, so the active count may stay high (disabling
+    /// deferred commits and `relatime` caching) until the next exclusive open resets word 1.
+    fn users_state(&self) -> u64 {
+        self.word(1).load(Ordering::Acquire)
+    }
+
+    fn active_users(&self) -> u32 {
+        self.word(1).load(Ordering::Relaxed) as u32
+    }
+
+    /// Registers a new open connection, bumping both the open epoch and active count; returns the
+    /// active count before joining.
+    fn join(&self) -> u32 {
+        self.word(1).fetch_add((1u64 << 32) | 1, Ordering::SeqCst) as u32
+    }
+
+    /// Unregisters a closing connection, decrementing only the active count.
+    fn leave(&self) {
+        self.word(1).fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Resets the shared connection state under an exclusive lock (boot).
+    fn reset_users(&self) {
+        self.word(1).store(0, Ordering::SeqCst);
     }
 
     /// The minimum and maximum inode numbers newly allocated by write transactions not yet
@@ -4411,6 +4610,234 @@ mod tests {
         let objs: Vec<_> = fs::read_dir(dir.join("objects")).unwrap().collect();
         assert!(objs.is_empty(), "rolled-back import leaked objects");
         drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relatime_cache_skips_warm_stats_and_invalidates_on_mutations() {
+        let (s, dir) = temp_store("relatime-cache");
+        let tick = || std::thread::sleep(Duration::from_millis(25));
+        let stats = |s: &Store| s.meta.accessed_stats.load(Ordering::Relaxed);
+
+        let (f, mut file) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
+        file.write_all(b"hello").unwrap();
+        s.object_modified(f);
+
+        // First relatime read after the creation tick advances atime past mtime/ctime and caches.
+        tick();
+        s.accessed(f, Some(&file), true).unwrap();
+        let st1 = s.stat_open(f, &file).unwrap();
+        assert!(st1.atime_ns > st1.mtime_ns && st1.atime_ns > st1.ctime_ns);
+
+        // Warm repeated relatime reads must skip host fstat completely and leave atime intact.
+        let before_stats = stats(&s);
+        tick();
+        for _ in 0..100 {
+            s.accessed(f, Some(&file), true).unwrap();
+        }
+        assert_eq!(stats(&s), before_stats, "warm relatime reads hit host stat");
+        assert_eq!(s.stat_open(f, &file).unwrap().atime_ns, st1.atime_ns);
+
+        // 1. Host data write + object_modified invalidates the cache.
+        tick();
+        file.write_all(b"!").unwrap();
+        s.object_modified(f);
+        tick();
+        s.accessed(f, Some(&file), true).unwrap();
+        let a2 = s.stat_open(f, &file).unwrap().atime_ns;
+        assert!(a2 > st1.atime_ns, "write must trigger relatime update");
+        let before_stats = stats(&s);
+        for _ in 0..50 {
+            s.accessed(f, Some(&file), true).unwrap();
+        }
+        assert_eq!(stats(&s), before_stats, "re-cached after write");
+
+        // 2. set_mode (chmod) bumps ctime and invalidates the cache.
+        tick();
+        s.set_mode(f, 0o600).unwrap();
+        tick();
+        s.accessed(f, Some(&file), true).unwrap();
+        let a3 = s.stat_open(f, &file).unwrap().atime_ns;
+        assert!(a3 > a2, "chmod must trigger relatime update");
+
+        // 3. Host-only set_times (atime: None, mtime: Some(Now)) invalidates the cache.
+        tick();
+        s.set_times(f, None, Some(FileTime::Now)).unwrap();
+        tick();
+        s.accessed(f, Some(&file), true).unwrap();
+        let a4 = s.stat_open(f, &file).unwrap().atime_ns;
+        assert!(a4 > a3, "mtime-only set_times must trigger relatime update");
+
+        // 4. Store::truncate invalidates the cache.
+        tick();
+        s.truncate(f, 2).unwrap();
+        tick();
+        s.accessed(f, Some(&file), true).unwrap();
+        let a5 = s.stat_open(f, &file).unwrap().atime_ns;
+        assert!(a5 > a4, "truncate must trigger relatime update");
+
+        // 5. strictatime (relatime = false) bypasses the cache and updates atime every time.
+        tick();
+        s.accessed(f, Some(&file), false).unwrap();
+        let a6 = s.stat_open(f, &file).unwrap().atime_ns;
+        assert!(a6 > a5, "strictatime must update even when cache is warm");
+
+        // 6. Held regular files keep timestamps in SQLite and never stat the host in accessed().
+        let (g, _) = s.create_file(ROOT, b"g", 0o644, 0, 0).unwrap();
+        s.share(f, g).unwrap();
+        let gfile = s.open_object(g, false).unwrap();
+        s.set_times(g, Some(FileTime::At(1_000_000_000)), None)
+            .unwrap();
+        tick();
+        let before_stats = stats(&s);
+        s.accessed(g, Some(&gfile), true).unwrap();
+        assert_eq!(stats(&s), before_stats, "held file must not host-stat");
+        let ga1 = s.stat_open(g, &gfile).unwrap().atime_ns;
+        assert!(ga1 > 1_000_000_000);
+        tick();
+        s.accessed(g, Some(&gfile), true).unwrap();
+        assert_eq!(s.stat_open(g, &gfile).unwrap().atime_ns, ga1);
+        s.make_private(g, None).unwrap();
+        // Reopen g's host handle after make_private (the kernel's `rehome` does this for open fds).
+        let gfile = s.open_object(g, false).unwrap();
+
+        // 7. Pure 24-hour relatime window on a directory (atime > mtime && atime > ctime).
+        let d = s.mkdir(ROOT, b"dir", 0o755, 0, 0).unwrap();
+        const HOUR_NS: i64 = 3600 * 1_000_000_000;
+        let now = now_ns();
+        s.db()
+            .execute(
+                "UPDATE inodes SET atime_ns = ?2, mtime_ns = ?3, ctime_ns = ?3 WHERE ino = ?1",
+                params![d, now - 23 * HOUR_NS, now - 26 * HOUR_NS],
+            )
+            .unwrap();
+        s.touch_ino(d);
+        s.accessed(d, None, true).unwrap();
+        assert_eq!(s.stat(d).unwrap().atime_ns, now - 23 * HOUR_NS);
+        // Pushing atime past 24h ago must trigger a relatime update even with atime > mtime/ctime.
+        s.db()
+            .execute(
+                "UPDATE inodes SET atime_ns = ?2, mtime_ns = ?3, ctime_ns = ?3 WHERE ino = ?1",
+                params![d, now - 25 * HOUR_NS, now - 26 * HOUR_NS],
+            )
+            .unwrap();
+        s.touch_ino(d);
+        s.accessed(d, None, true).unwrap();
+        assert!(s.stat(d).unwrap().atime_ns >= now - HOUR_NS);
+
+        // 8. Writable shared mapping (mapping_object(true)) disables caching for that inode so
+        // dirty-page writeback advancing host mtime without a store syscall is still observed.
+        tick();
+        s.accessed(g, Some(&gfile), true).unwrap();
+        let gm1 = s.stat_open(g, &gfile).unwrap().atime_ns;
+        let _pin = s.mapping_object(g, true).unwrap().unwrap();
+        let mut gwriter = s.open_object(g, true).unwrap();
+        tick();
+        gwriter.write_all(b"mapped-write").unwrap();
+        // Deliberately do NOT call s.object_modified(g).
+        tick();
+        s.accessed(g, Some(&gfile), true).unwrap();
+        assert!(
+            s.stat_open(g, &gfile).unwrap().atime_ns > gm1,
+            "writably mapped inode must observe host mtime advance without object_modified"
+        );
+
+        drop((_pin, gwriter, gfile, file, s));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relatime_cache_invalidates_on_other_connections_and_host_writers() {
+        let (a, dir) = temp_store("relatime-external");
+        let tick = || std::thread::sleep(Duration::from_millis(25));
+        let stats = |s: &Store| s.meta.accessed_stats.load(Ordering::Relaxed);
+
+        let home = a.mkdir(ROOT, b"home", 0o755, 0, 0).unwrap();
+        let alice = a.mkdir(home, b"alice", 0o755, 1000, 1000).unwrap();
+        let (f, mut file) = a.create_file(alice, b"doc.txt", 0o644, 1000, 1000).unwrap();
+        file.write_all(b"v1").unwrap();
+        a.object_modified(f);
+        a.commit().unwrap();
+
+        // Warm up relatime cache on connection `a`, then commit its deferred atime update before
+        // opening a second connection on the same thread (temp_store sets delay = 3600s).
+        tick();
+        a.accessed(f, Some(&file), true).unwrap();
+        a.commit().unwrap();
+        let a1 = a.stat_open(f, &file).unwrap().atime_ns;
+        let before_stats = stats(&a);
+        for _ in 0..20 {
+            a.accessed(f, Some(&file), true).unwrap();
+        }
+        assert_eq!(stats(&a), before_stats);
+
+        // Case 1: Another Store connection modifies the host object WITHOUT any SQLite commit and
+        // closes before `a`'s next read. The bumped open epoch in word 1 must invalidate `a`.
+        {
+            let b = Store::open(&dir, &[]).unwrap();
+            let mut bfile = b.open_object(f, true).unwrap();
+            tick();
+            bfile.write_all(b"v2-no-sql-commit").unwrap();
+            drop((bfile, b));
+        }
+        tick();
+        a.accessed(f, Some(&file), true).unwrap();
+        a.commit().unwrap();
+        let a2 = a.stat_open(f, &file).unwrap().atime_ns;
+        assert!(
+            a2 > a1,
+            "external connection object write without SQLite commit must invalidate relatime cache"
+        );
+        // Once alone again, warm reads re-cache.
+        let before_stats = stats(&a);
+        for _ in 0..20 {
+            a.accessed(f, Some(&file), true).unwrap();
+        }
+        assert_eq!(stats(&a), before_stats);
+
+        // Case 2: DocumentsProvider (`browse::open_write`) holds the host fd open after closing
+        // its Store connection. While HOST_WRITERS is non-empty, `a` must not cache relatime.
+        let mut changes = Vec::new();
+        let mut host_fd = {
+            let b = Store::open(&dir, &[]).unwrap();
+            crate::vfs::browse::open_write(
+                &b,
+                b"/home/alice",
+                b"/home/alice/doc.txt",
+                false,
+                false,
+                &mut changes,
+            )
+            .unwrap()
+        };
+        // Read on `a` BEFORE the provider writes: must NOT cache while provider fd is open.
+        a.accessed(f, Some(&file), true).unwrap();
+        tick();
+        host_fd.write_all(b"v3-provider").unwrap();
+        tick();
+        a.accessed(f, Some(&file), true).unwrap();
+        a.commit().unwrap();
+        let a3 = a.stat_open(f, &file).unwrap().atime_ns;
+        assert!(
+            a3 > a2,
+            "provider write while fd held open must trigger relatime update"
+        );
+        drop(host_fd);
+        {
+            let b = Store::open(&dir, &[]).unwrap();
+            crate::vfs::browse::written(&b, b"/home/alice", b"/home/alice/doc.txt", &mut changes)
+                .unwrap();
+        }
+        // After provider closes, `a` settles and caches warm reads again.
+        tick();
+        a.accessed(f, Some(&file), true).unwrap();
+        let before_stats = stats(&a);
+        for _ in 0..20 {
+            a.accessed(f, Some(&file), true).unwrap();
+        }
+        assert_eq!(stats(&a), before_stats);
+
+        drop((file, a));
         let _ = fs::remove_dir_all(&dir);
     }
 }

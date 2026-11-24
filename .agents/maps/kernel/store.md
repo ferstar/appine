@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-inode guest access times and old-store migration)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cached relatime freshness state, packed connection open epoch, and host-modification invalidation)
 
 ## Responsibilities
 
@@ -37,16 +37,19 @@ provider and rootfs installation UI (`android`).
 - `Store` — one SQLite connection with transaction state: pending deferred transaction, `writing`
   flag, `doomed` objects to delete after commit, `replaced` files to flush before commit, `created`
   objects to unlink on savepoint rollback, the waker, the read-snapshot state, the owning kernel
-  id, changed directories.
+  id, changed directories, cached `store_id` (`objects/` dev/ino), and `writable_maps` (inodes
+  excluded from `relatime` caching because they may be mutated via writable shared mappings).
 - `Meta` — state shared with readers and the reaper thread: the cache behind an `RwLock`, the
   commit counter, the reaper queue, the WAL path and durability watermark.
 - `Stat` includes the store inode’s access and default ACLs; `DirEntry`, `FileTime` (`Now` or `At(ns)`), the `mode` constants; `Ino = u64`, `ROOT = 1`.
-- `Commits` — 32 bytes of the `lock` file mapped shared: commit counter, number of open
-  connections (`users`), and the range of inode numbers allocated by uncommitted transactions.
+- `Commits` — 32 bytes of the `lock` file mapped shared: commit counter, packed connection state
+  (active open connections in the low 32 bits, monotonic open epoch in the high 32 bits), and the
+  range of inode numbers allocated by uncommitted transactions.
 - `Cache` — dentries (including negative entries), database rows with where each regular file's
   data and times are (`Data`: object number, held timestamp and guest atime),
-  symlink targets, `..` parents, names (for getcwd), directory listings, and the set of inodes with
-  file capabilities.
+  symlink targets, `..` parents, names (for getcwd), directory listings, the set of inodes with
+  file capabilities, and `relatime_fresh` (plus a 1-entry `last_relatime` fast slot) caching
+  inodes whose guest atime is strictly newer than mtime and ctime for the current connection state.
 - `Unshare` — a held file's private copy in the making: the shared object open for reading, the
   new one open for writing, the length to copy, and both numbers.
 - `Fill` — an entry created by an operation, inserted into the cache only if the operation
@@ -72,7 +75,7 @@ provider and rootfs installation UI (`android`).
 - **Changes**: `mkdir`, `create_file`, `create_anonymous`, `symlink`, `mknod`, `link`, `unlink`,
   `rmdir`, `rename` (no-replace, exchange), `create_detached_dir`/`remove_detached_dir`,
   `set_mode`, `set_owner`, `set_owner_mode`, `remove_privs`, xattr writes, `set_mtime`,
-  `set_times`, `set_times_open`, `accessed`; `transaction`.
+  `set_times`, `set_times_open`, `accessed`, `object_modified`; `transaction`.
 - **Durability**: `commit`, `commit_due`, `set_waker`, `Meta::sync_metadata`, `Meta::sync_all`.
 - **Host-facing**: `import_rootfs`, `sync_store`, `browse` (stat, list, open, text sniffing,
   search), `browse_changing` (create, import a file, remove, rename, move, open for writing, written),
@@ -106,7 +109,10 @@ provider and rootfs installation UI (`android`).
 - Guest atime lives in `inodes.atime_ns`. On older stores, unshared objects retain their host atime
   until first opened. The upgrade copies held times from `shared`. Other inodes start from row mtime.
   Regular-file creation and subsequent access use the backing filesystem clock. An access
-  updates only guest atime. Other inode types keep all three timestamps in the database.
+  updates only guest atime. Under `relatime`, once an inode's atime is verified strictly newer than
+  both mtime and ctime, warm reads skip SQLite and host `fstat` while within the 24-hour window;
+  directories and held regular files also skip host `fstat` on a miss because their timestamps live
+  in SQLite. Other inode types keep all three timestamps in the database.
   Symlinks report the target length as size and mode 0777.
 - Reads and writes go straight to the host fd (`pread`/`pwrite`); copies between two regular files
   use the host's `sendfile`.
@@ -232,9 +238,16 @@ provider and rootfs installation UI (`android`).
 ### Metadata cache
 
 - Caches dentries (including names that do not exist), database rows (with the `shared` row
-  joined in), symlink targets, `..` parents, names, directory listings and the file-capability
-  set; xattr values, emptiness checks
-  and regular-file sizes and times are not cached.
+  joined in), symlink targets, `..` parents, names, directory listings, the file-capability set, and
+  `relatime_fresh` (with a 1-entry `last_relatime` fast slot); xattr values, emptiness checks
+  and regular-file sizes and mtime/ctime are not cached.
+- `relatime_fresh` records an inode's `atime_ns` only when `atime > mtime && atime > ctime`, no
+  other connection is open (`active_users <= 1`), no Files app writer is open on this store
+  (`HOST_WRITERS`), and the inode has no writable shared mapping (`mapping_object(_, true)` or
+  `create_anonymous`). Inode mutations (`touch_ino`), direct host-object modifications
+  (`object_modified` from writes, truncates, fallocate, copies, and mtime-only `set_times`),
+  foreign commits, or any other connection joining the store (via the open epoch packed into word 1
+  of `lock`) invalidate cached `relatime` entries.
 - Reads hit the cache first; on a miss the database is queried and the result inserted only if the
   commit counter did not move. Inside a `snapshot` all misses share one lazily started read
   transaction (path walks and the following stat).
@@ -347,9 +360,6 @@ provider and rootfs installation UI (`android`).
 - **Shared objects of deleted files:** a held file deleted while open keeps its share until boot,
   so the next write to another file sharing the object copies it although nobody reads the deleted
   one any more.
-- Default relatime checks object metadata on each regular-file read, including each internal I/O chunk.
-  In a debug Tier 1 run, 10,000 warm one-byte preads cost 9.2–9.5 µs each with relatime and
-  6.7–7.2 µs with `O_NOATIME` across three rounds.
 - **Whole-file sharing:** the first change to a file sharing its object copies all of it, where
   btrfs and XFS copy only the extents written.
 
