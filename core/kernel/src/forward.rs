@@ -40,6 +40,12 @@ const SOCK_DGRAM: i32 = 2;
 const SHUT_WR: i32 = 1;
 /// Most bytes buffered per direction (when full, reading pauses).
 const BUFFER: usize = 64 * 1024;
+/// Maximum concurrent forwarded TCP connections across all forwarded ports.
+const MAX_CONNS: usize = 256;
+/// Maximum concurrent UDP forwarding sockets across all forwarded ports.
+const MAX_UDP_RELAYS: usize = 256;
+/// How long a nonblocking outbound TCP connect may remain in progress before it is closed.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a UDP forwarding socket may stay idle before it is closed (docker-proxy: 90 seconds).
 const UDP_IDLE: Duration = Duration::from_secs(120);
 /// How long a listening socket that is readable while accept fails (out of fds, shut down) is left
@@ -48,6 +54,26 @@ const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 /// How long the thread waits after poll itself fails (too many fds, out of memory) before trying
 /// again.
 const POLL_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Resource limits and timeouts enforced by the forwarding thread.
+#[derive(Clone, Copy)]
+struct Limits {
+    max_conns: usize,
+    max_relays: usize,
+    connect_timeout: Duration,
+    udp_idle: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_conns: MAX_CONNS,
+            max_relays: MAX_UDP_RELAYS,
+            connect_timeout: CONNECT_TIMEOUT,
+            udp_idle: UDP_IDLE,
+        }
+    }
+}
 
 // ---- Forwarding thread ----
 
@@ -69,6 +95,16 @@ pub(crate) struct Forwarder {
 }
 
 impl Forwarder {
+    #[cfg(test)]
+    fn with_limits(limits: Limits) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                limits,
+                ..Shared::default()
+            }),
+        }
+    }
+
     /// Forwards `fd`, listening on the host (a TCP listening socket, a bound UDP socket), to
     /// `target`.
     pub(crate) fn add(&self, fd: i32, target: Target) -> Result<Handle, i32> {
@@ -120,6 +156,7 @@ impl Drop for Forwarder {
 struct Shared {
     state: Mutex<State>,
     event: std::sync::OnceLock<appine_hal::Event>,
+    limits: Limits,
     /// Host tid of the forwarding thread, for tests measuring its CPU time without scanning other
     /// threads that may exit concurrently.
     #[cfg(test)]
@@ -177,6 +214,9 @@ struct Conn {
     outside: Option<[u8; 4]>,
     /// The connection to the destination has completed.
     ready: bool,
+    /// When the nonblocking outbound connect started (used to expire stalled connects while
+    /// `!ready`).
+    connect_started: Instant,
     to_up: Vec<u8>,
     to_client: Vec<u8>,
     client_eof: bool,
@@ -212,6 +252,7 @@ struct Relay {
 fn run(shared: &Shared) {
     #[cfg(test)]
     let _ = shared.tid.set(appine_hal::gettid());
+    let limits = shared.limits;
     let event = shared.event.get().expect("event before thread");
     let mut ports: HashMap<u64, (i32, Target)> = HashMap::new();
     let mut conns: Vec<Conn> = Vec::new();
@@ -245,31 +286,44 @@ fn run(shared: &Shared) {
                 return;
             }
         }
+        let now = Instant::now();
+        conns.retain(|c| {
+            let expired = !c.ready
+                && now.saturating_duration_since(c.connect_started) >= limits.connect_timeout;
+            if expired {
+                c.close();
+            }
+            !expired
+        });
         relays.retain(|r| {
-            let keep = ports.contains_key(&r.port) && r.last.elapsed() < UDP_IDLE;
+            let keep = ports.contains_key(&r.port)
+                && now.saturating_duration_since(r.last) < limits.udp_idle;
             if !keep {
                 appine_hal::net::close(r.fd);
             }
             keep
         });
-        let now = Instant::now();
         stalled.retain(|id, until| ports.contains_key(id) && *until > now);
-        // What to wait for: the event, every port (but stalled ones), both sides of every
-        // connection, every UDP forwarding socket
+        // What to wait for: the event, every port (omitting stalled ones, and omitting TCP
+        // listeners while at the connection cap so the accept socket does not busy-loop), both
+        // sides of every connection, every UDP forwarding socket
+        let at_conn_cap = conns.len() >= limits.max_conns;
         let mut fds: Vec<(i32, i16, i16)> = vec![(event.fd(), POLLIN, 0)];
         let order: Vec<(u64, i32, bool)> = ports
             .iter()
-            .filter(|(id, _)| !stalled.contains_key(id))
+            .filter(|(id, (_, t))| !stalled.contains_key(id) && (t.udp || !at_conn_cap))
             .map(|(id, (fd, t))| (*id, *fd, t.udp))
             .collect();
         fds.extend(order.iter().map(|&(_, fd, _)| (fd, POLLIN, 0)));
         for c in &conns {
             let mut ce = 0;
-            if !c.client_eof && c.to_up.len() < BUFFER {
-                ce |= POLLIN;
-            }
-            if !c.to_client.is_empty() {
-                ce |= POLLOUT;
+            if c.ready {
+                if !c.client_eof && c.to_up.len() < BUFFER {
+                    ce |= POLLIN;
+                }
+                if !c.to_client.is_empty() {
+                    ce |= POLLOUT;
+                }
             }
             let mut ue = 0;
             if !c.ready {
@@ -288,15 +342,21 @@ fn run(shared: &Shared) {
         fds.extend(relays.iter().map(|r| (r.fd, POLLIN, 0)));
         // Connections accepted and forwarding sockets opened below are not in this round
         let (polled_conns, polled_relays) = (conns.len(), relays.len());
-        let idle = (!relays.is_empty()).then_some(Duration::from_secs(5));
+        let idle = (!relays.is_empty()).then(|| limits.udp_idle.min(Duration::from_secs(5)));
         let resume = stalled
             .values()
             .min()
             .map(|t| t.saturating_duration_since(now));
-        let timeout = match (idle, resume) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let connect_wait = conns
+            .iter()
+            .filter(|c| !c.ready)
+            .map(|c| {
+                limits
+                    .connect_timeout
+                    .saturating_sub(now.saturating_duration_since(c.connect_started))
+            })
+            .min();
+        let timeout = [idle, resume, connect_wait].into_iter().flatten().min();
         match appine_hal::poll(&mut fds, timeout) {
             Ok(_) => {}
             Err(EINTR) => continue,
@@ -315,11 +375,15 @@ fn run(shared: &Shared) {
             }
             let target = &ports[&id].1;
             if udp {
-                datagrams(id, fd, target, &mut relays);
+                datagrams(id, fd, target, &mut relays, limits.max_relays);
                 continue;
             }
-            // Accept at most 64 at a time so the other connections do not starve
+            // Accept at most 64 at a time so the other connections do not starve, stopping once
+            // the concurrent connection cap is reached
             for n in 0..64 {
+                if conns.len() >= limits.max_conns {
+                    break;
+                }
                 let (client, from) = match appine_hal::net::accept(fd) {
                     Ok(c) => c,
                     // Readable but nothing taken: out of fds, or a listener shut down (readable
@@ -336,6 +400,7 @@ fn run(shared: &Shared) {
                         upstream,
                         outside,
                         ready,
+                        connect_started: Instant::now(),
                         to_up: Vec::new(),
                         to_client: Vec::new(),
                         client_eof: false,
@@ -391,6 +456,9 @@ fn run(shared: &Shared) {
 /// Events ready on one connection (`cr` on the client side, `ur` on the destination side).
 fn step(c: &mut Conn, cr: i16, ur: i16) -> Result<(), i32> {
     if !c.ready {
+        if cr & (POLLERR | POLLHUP) != 0 {
+            return Err(ECONNRESET);
+        }
         if ur == 0 {
             return Ok(());
         }
@@ -466,9 +534,10 @@ fn drain(fd: i32, buf: &mut Vec<u8>) -> Result<(), i32> {
     Ok(())
 }
 
-/// Datagrams received on a UDP port: finds (or opens) the forwarding socket of the source and
-/// sends them to the destination.
-fn datagrams(id: u64, fd: i32, target: &Target, relays: &mut Vec<Relay>) {
+/// Datagrams received on a UDP port: finds (or opens, up to `max_relays`) the forwarding socket
+/// of the source and sends them to the destination. Datagrams from new sources while at the cap
+/// are drained and dropped so the UDP socket does not busy-loop or leak fds.
+fn datagrams(id: u64, fd: i32, target: &Target, relays: &mut Vec<Relay>, max_relays: usize) {
     let mut buf = vec![0u8; 65536];
     for _ in 0..64 {
         let Ok(m) = appine_hal::net::recvmsg(fd, &mut buf, 0, 0) else {
@@ -481,6 +550,9 @@ fn datagrams(id: u64, fd: i32, target: &Target, relays: &mut Vec<Relay>) {
         {
             Some(i) => &mut relays[i],
             None => {
+                if relays.len() >= max_relays {
+                    continue;
+                }
                 // UDP still binds the gateway's address: datagrams the container sends back to
                 // the real address must go back through the forwarding socket, and the address
                 // mapping has no entry for that direction
@@ -514,7 +586,10 @@ fn open(t: &Target, client: Option<([u8; 4], u16)>) -> Result<(i32, bool, Option
     let mut outside = None;
     let bound = match client.filter(|_| family(&t.addr) == 2) {
         Some((ip, port)) => {
-            let host = take_outside();
+            let Some(host) = take_outside() else {
+                appine_hal::net::close(fd);
+                return Err(EAGAIN);
+            };
             let at = |p: u16| appine_hal::net::sockaddr(std::net::SocketAddr::from((host, p)));
             let r =
                 appine_hal::net::bind(fd, &at(port)).or_else(|_| appine_hal::net::bind(fd, &at(0)));
@@ -579,18 +654,23 @@ fn outside_client(addr: &[u8]) -> Option<([u8; 4], u16)> {
     (ip[0] != 127).then_some((ip, port))
 }
 
-/// Gives a connection from outside a 127.254.x.y address (skipping .0.0).
-fn take_outside() -> [u8; 4] {
+/// Gives a connection from outside a 127.254.x.y address (skipping .0.0), or `None` if all
+/// 65,535 addresses are currently in use.
+fn take_outside() -> Option<[u8; 4]> {
     let mut g = OUTSIDE.lock().unwrap();
     let o = g.get_or_insert_with(Default::default);
-    loop {
+    for _ in 0..u16::MAX {
         o.next = o.next.wrapping_add(1);
+        if o.next == 0 {
+            continue;
+        }
         let [a, b] = o.next.to_be_bytes();
         let addr = [127, OUTSIDE_BLOCK, a, b];
-        if o.next != 0 && !o.peers.contains_key(&addr) {
-            return addr;
+        if !o.peers.contains_key(&addr) {
+            return Some(addr);
         }
     }
+    None
 }
 
 fn record_outside(host: [u8; 4], client: [u8; 4], cport: u16, hport: u16) {
@@ -860,6 +940,291 @@ mod tests {
         // The reply comes from the port the client sent to
         assert_eq!(r.addr[2..8], loopback(port(held))[2..8]);
         for fd in [server, held, c] {
+            appine_hal::net::close(fd);
+        }
+    }
+
+    /// TCP connection cap: once `max_conns` connections are active, further incoming connections
+    /// wait without spinning the forwarding thread until a slot frees up.
+    #[test]
+    fn tcp_connection_cap_enforced_without_spinning() {
+        let server = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(server, &loopback(0)).unwrap();
+        appine_hal::net::listen(server, 16).unwrap();
+        let held = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(held, &loopback(0)).unwrap();
+        appine_hal::net::listen(held, 16).unwrap();
+        let f = Forwarder::with_limits(Limits {
+            max_conns: 2,
+            max_relays: 2,
+            connect_timeout: Duration::from_secs(5),
+            udp_idle: UDP_IDLE,
+        });
+        let _h = f
+            .add(
+                held,
+                Target {
+                    udp: false,
+                    addr: loopback(port(server)),
+                    source: None,
+                },
+            )
+            .unwrap();
+
+        let connect_pair = || {
+            let c = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+            let _ = appine_hal::net::connect(c, &loopback(port(held)));
+            wait(server, POLLIN);
+            let (s, _) = appine_hal::net::accept(server).unwrap();
+            wait(c, POLLOUT);
+            (c, s)
+        };
+        let (c1, s1) = connect_pair();
+        let (c2, s2) = connect_pair();
+
+        // A third client connects while at cap: it must not be forwarded yet and must not cause
+        // the forwarding thread to spin on the readable listener.
+        let c3 = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        let _ = appine_hal::net::connect(c3, &loopback(port(held)));
+        let mut p = [(server, POLLIN, 0)];
+        appine_hal::poll(&mut p, Some(Duration::from_millis(200))).unwrap();
+        assert_eq!(p[0].2, 0, "cap exceeded: third connection was forwarded");
+
+        let tid = *f.shared.tid.get().expect("forwarding thread started");
+        if let Some(before) = thread_ticks(tid) {
+            std::thread::sleep(Duration::from_millis(400));
+            let used = thread_ticks(tid).unwrap() - before;
+            assert!(
+                used < 10,
+                "tcp cap spin: forwarding thread used {used} ticks in 0.4 s"
+            );
+        }
+
+        // Closing one active connection frees a slot and lets the third connection through.
+        appine_hal::net::close(c1);
+        appine_hal::net::close(s1);
+        wait(server, POLLIN);
+        let (s3, _) = appine_hal::net::accept(server).unwrap();
+        wait(c3, POLLOUT);
+        appine_hal::net::sendmsg(c3, b"third", &[], &[], 0).unwrap();
+        wait(s3, POLLIN);
+        let mut buf = [0u8; 16];
+        assert_eq!(appine_hal::read(s3, &mut buf), Ok(5));
+        assert_eq!(&buf[..5], b"third");
+
+        for fd in [server, held, c2, s2, c3, s3] {
+            appine_hal::net::close(fd);
+        }
+    }
+
+    /// UDP relay cap: once `max_relays` sources are active, datagrams from additional sources are
+    /// dropped cleanly while existing relays keep working, and new sources work after idle expiry.
+    #[test]
+    fn udp_relay_cap_drops_excess_clients_gracefully() {
+        let server = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        appine_hal::net::bind(server, &loopback(0)).unwrap();
+        let held = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        appine_hal::net::bind(held, &loopback(0)).unwrap();
+        let f = Forwarder::with_limits(Limits {
+            max_conns: 2,
+            max_relays: 2,
+            connect_timeout: Duration::from_secs(5),
+            udp_idle: Duration::from_millis(250),
+        });
+        let _h = f
+            .add(
+                held,
+                Target {
+                    udp: true,
+                    addr: loopback(port(server)),
+                    source: None,
+                },
+            )
+            .unwrap();
+
+        let mk_client = || {
+            let c = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+            appine_hal::net::bind(c, &loopback(0)).unwrap();
+            c
+        };
+        let (c1, c2, c3) = (mk_client(), mk_client(), mk_client());
+        let dst = loopback(port(held));
+        let mut buf = [0u8; 64];
+
+        for (c, msg, rep) in [
+            (c1, b"one".as_slice(), b"r1".as_slice()),
+            (c2, b"two", b"r2"),
+        ] {
+            appine_hal::net::sendmsg(c, msg, &dst, &[], 0).unwrap();
+            wait(server, POLLIN);
+            let m = appine_hal::net::recvmsg(server, &mut buf, 0, 0).unwrap();
+            assert_eq!(&buf[..m.len], msg);
+            appine_hal::net::sendmsg(server, rep, &m.addr, &[], 0).unwrap();
+            wait(c, POLLIN);
+            let r = appine_hal::net::recvmsg(c, &mut buf, 0, 0).unwrap();
+            assert_eq!(&buf[..r.len], rep);
+        }
+
+        // At cap: datagrams from c3 are dropped without leaking fds or stalling c1.
+        appine_hal::net::sendmsg(c3, b"drop1", &dst, &[], 0).unwrap();
+        appine_hal::net::sendmsg(c3, b"drop2", &dst, &[], 0).unwrap();
+        let mut p = [(server, POLLIN, 0)];
+        appine_hal::poll(&mut p, Some(Duration::from_millis(120))).unwrap();
+        assert_eq!(p[0].2, 0, "excess UDP client bypassed relay cap");
+
+        // Existing relay c1 continues working while at cap.
+        appine_hal::net::sendmsg(c1, b"keep", &dst, &[], 0).unwrap();
+        wait(server, POLLIN);
+        let m = appine_hal::net::recvmsg(server, &mut buf, 0, 0).unwrap();
+        assert_eq!(&buf[..m.len], b"keep");
+
+        // Once relays expire after udp_idle, c3 can open a relay and exchange datagrams.
+        std::thread::sleep(Duration::from_millis(350));
+        appine_hal::net::sendmsg(c3, b"three", &dst, &[], 0).unwrap();
+        wait(server, POLLIN);
+        let m = appine_hal::net::recvmsg(server, &mut buf, 0, 0).unwrap();
+        assert_eq!(&buf[..m.len], b"three");
+        appine_hal::net::sendmsg(server, b"r3", &m.addr, &[], 0).unwrap();
+        wait(c3, POLLIN);
+        let r = appine_hal::net::recvmsg(c3, &mut buf, 0, 0).unwrap();
+        assert_eq!(&buf[..r.len], b"r3");
+
+        for fd in [server, held, c1, c2, c3] {
+            appine_hal::net::close(fd);
+        }
+    }
+
+    /// Connect timeout: a nonblocking outbound connect that stalls in progress is closed after
+    /// `connect_timeout` without spinning (even if the client already sent data), freeing its slot.
+    #[test]
+    fn stalled_connect_expires_on_connect_timeout() {
+        // Create a loopback listener with backlog 1 and saturate its accept queue without
+        // accepting so subsequent nonblocking connects stay in EINPROGRESS (Linux drops SYNs when
+        // the accept queue is full).
+        let blackhole = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(blackhole, &loopback(0)).unwrap();
+        appine_hal::net::listen(blackhole, 1).unwrap();
+        let bh_addr = loopback(port(blackhole));
+        let mut fillers = Vec::new();
+        let mut saturated = false;
+        for _ in 0..64 {
+            let s = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+            match appine_hal::net::connect(s, &bh_addr) {
+                Ok(()) => fillers.push(s),
+                Err(EINPROGRESS) => {
+                    let mut p = [(s, POLLOUT, 0)];
+                    appine_hal::poll(&mut p, Some(Duration::from_millis(30))).unwrap();
+                    if p[0].2 == 0 {
+                        appine_hal::net::close(s);
+                        saturated = true;
+                        break;
+                    }
+                    fillers.push(s);
+                }
+                Err(_) => {
+                    appine_hal::net::close(s);
+                    break;
+                }
+            }
+        }
+        assert!(
+            saturated,
+            "failed to saturate loopback listen backlog to simulate stalled connect"
+        );
+
+        let held_bh = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(held_bh, &loopback(0)).unwrap();
+        appine_hal::net::listen(held_bh, 8).unwrap();
+
+        let server = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(server, &loopback(0)).unwrap();
+        appine_hal::net::listen(server, 8).unwrap();
+        let held_ok = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(held_ok, &loopback(0)).unwrap();
+        appine_hal::net::listen(held_ok, 8).unwrap();
+
+        let timeout = Duration::from_millis(250);
+        let f = Forwarder::with_limits(Limits {
+            max_conns: 1,
+            max_relays: 1,
+            connect_timeout: timeout,
+            udp_idle: UDP_IDLE,
+        });
+        let _h_bh = f
+            .add(
+                held_bh,
+                Target {
+                    udp: false,
+                    addr: bh_addr,
+                    source: None,
+                },
+            )
+            .unwrap();
+        let _h_ok = f
+            .add(
+                held_ok,
+                Target {
+                    udp: false,
+                    addr: loopback(port(server)),
+                    source: None,
+                },
+            )
+            .unwrap();
+
+        // Connect to the stalled target and send data immediately to verify client POLLIN does not
+        // busy-loop while the outbound connect is still pending.
+        let c = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        let _ = appine_hal::net::connect(c, &loopback(port(held_bh)));
+        wait(c, POLLOUT);
+        let started = Instant::now();
+        appine_hal::net::sendmsg(c, b"waiting", &[], &[], 0).unwrap();
+        // Wait for the thread to record its tid, then snapshot CPU ticks while waiting for expiry.
+        let tid = loop {
+            if let Some(&t) = f.shared.tid.get() {
+                break t;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let ticks_before = thread_ticks(tid);
+
+        // The forwarder should close `c` when `connect_timeout` elapses.
+        let mut p = [(c, POLLIN, 0)];
+        appine_hal::poll(&mut p, Some(Duration::from_secs(2))).unwrap();
+        assert_ne!(p[0].2, 0, "stalled outbound connect did not time out");
+        let elapsed = started.elapsed();
+        let mut buf = [0u8; 16];
+        let r = appine_hal::read(c, &mut buf);
+        assert!(
+            matches!(r, Ok(0) | Err(ECONNRESET)),
+            "expected EOF/reset after connect timeout, got {r:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(2),
+            "unexpected connect timeout duration: {elapsed:?}"
+        );
+        if let Some(before) = ticks_before {
+            let used = thread_ticks(tid).unwrap() - before;
+            assert!(
+                used < 10,
+                "stalled connect spin: forwarding thread used {used} ticks"
+            );
+        }
+
+        // The single connection slot (max_conns = 1) must now be free for a healthy target.
+        let c2 = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        let _ = appine_hal::net::connect(c2, &loopback(port(held_ok)));
+        wait(server, POLLIN);
+        let (s2, _) = appine_hal::net::accept(server).unwrap();
+        wait(c2, POLLOUT);
+        appine_hal::net::sendmsg(c2, b"ok", &[], &[], 0).unwrap();
+        wait(s2, POLLIN);
+        assert_eq!(appine_hal::read(s2, &mut buf), Ok(2));
+        assert_eq!(&buf[..2], b"ok");
+
+        for fd in [blackhole, held_bh, server, held_ok, c, c2, s2] {
+            appine_hal::net::close(fd);
+        }
+        for fd in fillers {
             appine_hal::net::close(fd);
         }
     }

@@ -226,7 +226,7 @@ pub(crate) fn to_host(
             }
             let route = crate::netdev::route_v4(me, ip).ok_or_else(fail)?;
             match w.owner(me, ip) {
-                Some(m) => Ok(mapped_to(host_of(w, m, ip), m, None)),
+                Some(m) => Ok(mapped_to(host_of(w, m, ip)?, m, None)),
                 // Handed to the host network (going out through the gateway): no loopback address
                 // is bound first, or the traffic could not get out
                 None if route.gateway.is_some() => Ok(Mapped::plain(addr)),
@@ -245,7 +245,7 @@ fn init_to_host(w: &World, me: &Rc<NetNs>, addr: &[u8], usage: Use) -> Result<Ma
     };
     if crate::netdev::local_v4(me).iter().any(|(x, _)| *x == ip) {
         return Ok(Mapped {
-            addr: with_ipv4(addr, init_host(me, ip)),
+            addr: with_ipv4(addr, init_host(me, ip)?),
             target: Some(me.clone()),
             source: None,
             vaddr: None,
@@ -260,9 +260,11 @@ fn init_to_host(w: &World, me: &Rc<NetNs>, addr: &[u8], usage: Use) -> Result<Ma
     };
     match w.owner(me, ip) {
         Some(m) => {
-            let src = source(me, ip).map(|s| with_ipv4(&any_like(addr), init_host(me, s)));
+            let src = source(me, ip)
+                .map(|s| init_host(me, s).map(|h| with_ipv4(&any_like(addr), h)))
+                .transpose()?;
             Ok(Mapped {
-                addr: with_ipv4(addr, host_of(w, m, ip)),
+                addr: with_ipv4(addr, host_of(w, m, ip)?),
                 target: Some(m.clone()),
                 source: src,
                 vaddr: None,
@@ -327,29 +329,27 @@ impl Loopback {
 
 /// The host address of virtual address `ip` in another namespace `m`: 127.c.d.1 for a new
 /// namespace, 127.255.x.y for the initial one.
-fn host_of(w: &World, m: &NetNs, ip: [u8; 4]) -> [u8; 4] {
+fn host_of(w: &World, m: &NetNs, ip: [u8; 4]) -> Result<[u8; 4], Errno> {
     match m.host_net {
-        Some([c, d]) => [127, c, d, 1],
+        Some([c, d]) => Ok([127, c, d, 1]),
         None => init_host(w.init(), ip),
     }
 }
 
 /// The host loopback address (127.255.x.y) of virtual address `v` in the initial namespace,
-/// allocated if there is none.
-pub(crate) fn init_host(init: &NetNs, v: [u8; 4]) -> [u8; 4] {
+/// allocated if there is none. Returns `EADDRNOTAVAIL` when all 65,534 slots in `127.255.0.0/16`
+/// are already in use.
+pub(crate) fn init_host(init: &NetNs, v: [u8; 4]) -> Result<[u8; 4], Errno> {
     let mut d = init.devs.borrow_mut();
-    if let Some((_, h)) = d.hostmap.iter().find(|(g, _)| *g == v) {
-        return *h;
+    if let Some(h) = d.hostmap.get(v) {
+        return Ok(h);
     }
-    let n = (1..0xffffu16)
-        .find(|n| {
-            let h = [127, INIT_BLOCK, (n >> 8) as u8, *n as u8];
-            !d.hostmap.iter().any(|(_, x)| *x == h)
-        })
-        .unwrap_or(1);
-    let h = [127, INIT_BLOCK, (n >> 8) as u8, n as u8];
-    d.hostmap.push((v, h));
-    h
+    if let Some(h) = d.hostmap.get_or_alloc(v) {
+        return Ok(h);
+    }
+    // Reclaim any veths whose peer namespace has already been dropped before declaring exhaustion.
+    d.prune();
+    d.hostmap.get_or_alloc(v).ok_or(Errno::EADDRNOTAVAIL)
 }
 
 // ---- Translation back to the guest ----
@@ -492,12 +492,7 @@ fn remote_guest(w: &World, me: &NetNs, x: [u8; 4]) -> Option<[u8; 4]> {
 
 /// Which virtual address in the initial namespace the host's 127.255.x.y stands for.
 fn init_guest(init: &NetNs, h: [u8; 4]) -> Option<[u8; 4]> {
-    init.devs
-        .borrow()
-        .hostmap
-        .iter()
-        .find(|(_, x)| *x == h)
-        .map(|(g, _)| *g)
+    init.devs.borrow().hostmap.guest_of(h)
 }
 
 /// The virtual address of `m` that faces `me`: one in a subnet `me` has a directly connected
@@ -2030,5 +2025,282 @@ mod tests {
             Some(Errno::EPERM.0)
         );
         assert_eq!(configure(&ns, &root, &msg(18, 0, &link)), None);
+    }
+
+    /// Deleting IPv4 addresses (including secondaries with their primary), deleting or moving a
+    /// virtual device, or dropping a veth peer's namespace reclaims initial-namespace `hostmap`
+    /// entries so slots recycle cleanly past the 65,534-slot address space without leaking.
+    #[test]
+    fn hostmap_reclaims_and_recycles_on_addr_and_dev_removal() {
+        let init = crate::nsproxy::NsProxy::init().net;
+        let child = Rc::new(ns());
+        let w = World {
+            all: vec![init.clone(), child.clone()],
+        };
+        let root = Cred::root();
+        let resolve_child = |_: u16, id: u32| -> Result<Rc<NetNs>, Errno> {
+            if id == child.id as u32 {
+                Ok(child.clone())
+            } else {
+                Err(Errno::ESRCH)
+            }
+        };
+        let send = |target_ns: &Rc<NetNs>, ty: u16, flags: u16, body: &[u8]| {
+            let req = crate::net::message(ty, flags | 1, 1, 0, body);
+            crate::netdev::request(target_ns, &root, &req, &resolve_child)
+                .unwrap()
+                .unwrap();
+        };
+        let add_dummy = |name: &str| -> u32 {
+            let mut p = vec![0u8; 16];
+            let mut n = name.as_bytes().to_vec();
+            n.push(0);
+            crate::net::attr(&mut p, 3, &n); // IFLA_IFNAME
+            let mut li = Vec::new();
+            crate::net::attr(&mut li, 1, b"dummy"); // IFLA_INFO_KIND
+            crate::net::attr(&mut p, 18, &li); // IFLA_LINKINFO
+            send(&init, 16, 0x600, &p); // RTM_NEWLINK, CREATE|EXCL
+            crate::netdev::views(&init)
+                .into_iter()
+                .find(|v| v.name == name.as_bytes())
+                .unwrap()
+                .index
+        };
+        let add_ip = |idx: u32, ip: [u8; 4], prefix: u8| {
+            let mut p = vec![AF_INET as u8, prefix, 0, 0];
+            p.extend_from_slice(&idx.to_le_bytes());
+            crate::net::attr(&mut p, 2, &ip); // IFA_LOCAL
+            crate::net::attr(&mut p, 1, &ip); // IFA_ADDRESS
+            send(&init, 20, 0x600, &p); // RTM_NEWADDR
+        };
+        let del_ip = |idx: u32, ip: [u8; 4], prefix: u8| {
+            let mut p = vec![AF_INET as u8, prefix, 0, 0];
+            p.extend_from_slice(&idx.to_le_bytes());
+            crate::net::attr(&mut p, 2, &ip); // IFA_LOCAL
+            crate::net::attr(&mut p, 1, &ip); // IFA_ADDRESS
+            send(&init, 21, 0, &p); // RTM_DELADDR
+        };
+        let del_link = |idx: u32| {
+            let mut p = vec![0u8; 16];
+            p[4..8].copy_from_slice(&(idx as i32).to_le_bytes());
+            send(&init, 17, 0, &p); // RTM_DELLINK
+        };
+
+        // 1. Primary + secondary deletion reclaims both entries.
+        let d0 = add_dummy("hm0");
+        let ip1 = [10, 90, 0, 1];
+        let ip2 = [10, 90, 0, 2];
+        let ip3 = [10, 90, 0, 3];
+        add_ip(d0, ip1, 24);
+        add_ip(d0, ip2, 24);
+        let h1 = to_host(&w, &init, &v4(ip1, 80), Use::Bind, false)
+            .unwrap()
+            .addr;
+        let h2 = to_host(&w, &init, &v4(ip2, 80), Use::Bind, false)
+            .unwrap()
+            .addr;
+        let h1_ip: [u8; 4] = h1[4..8].try_into().unwrap();
+        let h2_ip: [u8; 4] = h2[4..8].try_into().unwrap();
+        assert_ne!(h1_ip, h2_ip);
+        assert_eq!(init.devs.borrow().hostmap.len(), 2);
+        assert_eq!(init_guest(&init, h1_ip), Some(ip1));
+        assert_eq!(init_guest(&init, h2_ip), Some(ip2));
+
+        del_ip(d0, ip2, 24);
+        assert_eq!(init.devs.borrow().hostmap.len(), 1);
+        assert_eq!(init_guest(&init, h2_ip), None);
+        assert_eq!(init_guest(&init, h1_ip), Some(ip1));
+
+        // Deleting primary also removes secondary ip3 and reclaims both.
+        add_ip(d0, ip3, 24);
+        let _ = to_host(&w, &init, &v4(ip3, 80), Use::Bind, false).unwrap();
+        assert_eq!(init.devs.borrow().hostmap.len(), 2);
+        del_ip(d0, ip1, 24);
+        assert_eq!(init.devs.borrow().hostmap.len(), 0);
+
+        // 2. Shared address across two devices is kept until the last device holding it goes away.
+        let d1 = add_dummy("hm1");
+        let shared = [10, 91, 0, 1];
+        add_ip(d0, shared, 24);
+        add_ip(d1, shared, 24);
+        let hs = init_host(&init, shared).unwrap();
+        del_link(d0);
+        assert_eq!(init.devs.borrow().hostmap.len(), 1);
+        assert_eq!(init_host(&init, shared).unwrap(), hs);
+        del_link(d1);
+        assert_eq!(init.devs.borrow().hostmap.len(), 0);
+        assert_eq!(init_guest(&init, hs), None);
+
+        // 3. Moving a device out of the initial namespace reclaims its hostmap entries.
+        let d2 = add_dummy("hm2");
+        let moved_ip = [10, 92, 0, 1];
+        add_ip(d2, moved_ip, 24);
+        let hm = init_host(&init, moved_ip).unwrap();
+        assert_eq!(init.devs.borrow().hostmap.len(), 1);
+        let mut mv = vec![0u8; 16];
+        mv[4..8].copy_from_slice(&(d2 as i32).to_le_bytes());
+        crate::net::attr(&mut mv, 19, &(child.id as u32).to_le_bytes()); // IFLA_NET_NS_PID
+        send(&init, 19, 0, &mv); // RTM_SETLINK
+        assert_eq!(init.devs.borrow().hostmap.len(), 0);
+        assert_eq!(init_guest(&init, hm), None);
+
+        // 4. Dropping a veth peer's namespace prunes the init-ns veth and reclaims its hostmap.
+        let peer_ns = Rc::new(NetNs {
+            id: 42,
+            owner: crate::cred::UserNs::init(),
+            host_net: Some([8, 42]),
+            lo: Default::default(),
+            devs: RefCell::new(crate::netdev::Devices::for_new_ns(&Default::default())),
+            nft: Default::default(),
+            listeners: Default::default(),
+        });
+        let mut peer_info = vec![0u8; 16];
+        crate::net::attr(&mut peer_info, 3, b"vp1\0");
+        crate::net::attr(&mut peer_info, 19, &(peer_ns.id as u32).to_le_bytes());
+        let mut veth_data = Vec::new();
+        crate::net::attr(&mut veth_data, 1, &peer_info); // VETH_INFO_PEER
+        let mut li = Vec::new();
+        crate::net::attr(&mut li, 1, b"veth");
+        crate::net::attr(&mut li, 2, &veth_data); // IFLA_INFO_DATA
+        let mut veth_req = vec![0u8; 16];
+        crate::net::attr(&mut veth_req, 3, b"vp0\0");
+        crate::net::attr(&mut veth_req, 18, &li);
+        let resolve_peer = |_: u16, id: u32| -> Result<Rc<NetNs>, Errno> {
+            if id == peer_ns.id as u32 {
+                Ok(peer_ns.clone())
+            } else {
+                Err(Errno::ESRCH)
+            }
+        };
+        let req = crate::net::message(16, 0x601, 1, 0, &veth_req);
+        crate::netdev::request(&init, &root, &req, &resolve_peer)
+            .unwrap()
+            .unwrap();
+        let vp0 = crate::netdev::views(&init)
+            .into_iter()
+            .find(|v| v.name == b"vp0")
+            .unwrap()
+            .index;
+        let veth_ip = [10, 93, 0, 1];
+        add_ip(vp0, veth_ip, 24);
+        let hv = init_host(&init, veth_ip).unwrap();
+        assert_eq!(init.devs.borrow().hostmap.len(), 1);
+        drop(peer_ns);
+        let _ = crate::netdev::views(&init);
+        assert_eq!(init.devs.borrow().hostmap.len(), 0);
+        assert_eq!(init_guest(&init, hv), None);
+
+        // 5. Recycling past MAX_SLOT (65,534) add/delete cycles never leaks or exhausts.
+        let total = usize::from(crate::netdev::HostMap::MAX_SLOT) + 2000;
+        let mut seen_recycled = false;
+        let first_host = init
+            .devs
+            .borrow_mut()
+            .hostmap
+            .get_or_alloc([10, 0, 0, 1])
+            .unwrap();
+        assert!(init.devs.borrow_mut().hostmap.remove([10, 0, 0, 1]));
+        for i in 1..=total {
+            let ip = [
+                10,
+                ((i >> 16) & 0xff) as u8,
+                ((i >> 8) & 0xff) as u8,
+                (i & 0xff) as u8,
+            ];
+            let h = init
+                .devs
+                .borrow_mut()
+                .hostmap
+                .get_or_alloc(ip)
+                .expect("recycled slot must be available");
+            if h == first_host {
+                seen_recycled = true;
+            }
+            assert_eq!(init_guest(&init, h), Some(ip));
+            assert!(init.devs.borrow_mut().hostmap.remove(ip));
+        }
+        assert!(seen_recycled, "freed slot must eventually be recycled");
+        assert_eq!(init.devs.borrow().hostmap.len(), 0);
+    }
+
+    /// Exhausting all 65,534 slots of `hostmap` returns `EADDRNOTAVAIL` instead of colliding on
+    /// `127.255.0.1`, preserves O(1) lookup of existing mappings, and recovers once a slot is
+    /// freed.
+    #[test]
+    fn hostmap_exhaustion_fails_without_colliding() {
+        let init = crate::nsproxy::NsProxy::init().net;
+        let max = usize::from(crate::netdev::HostMap::MAX_SLOT);
+        let mut first_host = [0u8; 4];
+        let mut last_host = [0u8; 4];
+        let mut seen = std::collections::HashSet::with_capacity(max);
+
+        for i in 0..max {
+            let ip = [10, 100, (i >> 8) as u8, (i & 0xff) as u8];
+            let h = init_host(&init, ip).expect("slot within capacity");
+            assert_eq!(h[..2], [127, INIT_BLOCK]);
+            assert_ne!(
+                &h[2..],
+                &[0, 0],
+                "network address .0.0 must never be allocated"
+            );
+            assert_ne!(
+                &h[2..],
+                &[255, 255],
+                "broadcast address .255.255 must never be allocated"
+            );
+            assert!(seen.insert(h), "duplicate hostmap allocation {h:?}");
+            if i == 0 {
+                first_host = h;
+            }
+            if i + 1 == max {
+                last_host = h;
+            }
+        }
+        assert_eq!(init.devs.borrow().hostmap.len(), max);
+
+        // Existing entries still resolve in O(1) in both directions even when full.
+        assert_eq!(init_host(&init, [10, 100, 0, 0]), Ok(first_host));
+        assert_eq!(
+            init_host(
+                &init,
+                [10, 100, ((max - 1) >> 8) as u8, ((max - 1) & 0xff) as u8]
+            ),
+            Ok(last_host)
+        );
+        assert_eq!(init_guest(&init, first_host), Some([10, 100, 0, 0]));
+        assert_eq!(
+            init_guest(&init, last_host),
+            Some([10, 100, ((max - 1) >> 8) as u8, ((max - 1) & 0xff) as u8])
+        );
+
+        // Overflowing fails cleanly with EADDRNOTAVAIL and does not overwrite 127.255.0.1.
+        let extra = [10, 200, 0, 1];
+        assert_eq!(init_host(&init, extra), Err(Errno::EADDRNOTAVAIL));
+        assert_eq!(init_guest(&init, first_host), Some([10, 100, 0, 0]));
+
+        // Reaching or binding `extra` via `to_host` propagates EADDRNOTAVAIL instead of
+        // misrouting to 127.255.0.1.
+        crate::netdev::test_dev(&init, "ex0", extra, 24, None);
+        let a = Rc::new(ns());
+        crate::netdev::test_dev(&a, "eth0", [10, 200, 0, 2], 24, Some(extra));
+        let w = World {
+            all: vec![init.clone(), a.clone()],
+        };
+        assert_eq!(
+            to_host(&w, &init, &v4(extra, 80), Use::Bind, false).err(),
+            Some(Errno::EADDRNOTAVAIL)
+        );
+        assert_eq!(
+            to_host(&w, &a, &v4(extra, 80), Use::Reach, false).err(),
+            Some(Errno::EADDRNOTAVAIL)
+        );
+
+        // Freeing one slot allows the new mapping to succeed using that reclaimed slot.
+        assert!(init.devs.borrow_mut().hostmap.remove([10, 100, 0, 0]));
+        let reused = to_host(&w, &init, &v4(extra, 80), Use::Bind, false)
+            .unwrap()
+            .addr;
+        assert_eq!(&reused[4..8], &first_host);
+        assert_eq!(init_guest(&init, first_host), Some(extra));
     }
 }

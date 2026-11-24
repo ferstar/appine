@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: IPv4 bridge netfilter path and per-namespace original destinations)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: O(1) reclaiming `hostmap` with exhaustion handling, forwarder TCP/UDP caps and connect timeout)
 
 ## Responsibilities
 
@@ -39,7 +39,8 @@ sockets (`hal`).
   virtual address); `Role` (`Peer` or `Local`).
 - `Listener` — id, port, address (or wildcard), family, `v6only`, UDP flag.
 - `Devices` — devices, index counter, routes through virtual devices (`Rt`), `NetConf`, nsids,
-  `hostmap` (initial namespace: virtual IPv4 address → 127.255.x.y); `Dev` (index, name, kind,
+  `hostmap` (`HostMap`: initial namespace bidirectional virtual IPv4 ↔ 127.255.0.1..=127.255.255.254
+  with O(1) lookup, FIFO slot recycling, and `EADDRNOTAVAIL` on exhaustion); `Dev` (index, name, kind,
   up, flags, MTU, MAC, txqlen, group, alias, peer/master as weak references, IPv4/IPv6 addresses,
   per-device settings, carrier counters); `View` (read-only snapshot for netlink, procfs, sysfs).
 - `NetConf` / `Conf` — interface and namespace sysctls (`all`, `default`, per device; host
@@ -96,8 +97,11 @@ sockets (`hal`).
 - Unbound sockets are bound implicitly before connect, sendto or listen: 127.a.b.1 (or
   `::ffff:127.a.b.1`; host `::1` for ICMPv6; 127.a.b.254 for UDP to the own virtual address); none
   when the destination goes to the host network.
-- The initial namespace: its virtual addresses map to permanent 127.255.x.y entries; destinations
-  in other namespaces map to their 127.c.d.1; 127.x and everything else pass through unchanged.
+- The initial namespace: its virtual addresses map to 127.255.x.y entries in `HostMap` (allocated
+  on demand in O(1), reclaimed when deleted from all virtual devices or when a device is deleted,
+  moved out or pruned, and recycled FIFO; all 65,534 slots full returns `EADDRNOTAVAIL`);
+  destinations in other namespaces map to their 127.c.d.1; 127.x and everything else pass through
+  unchanged.
 - Back to the guest (`from_host`, by who is looking): wildcard for `any` sockets; 127.254.x.y →
   the real outside client; own 127.a.b.x → 127.0.0.x (`::1` for IPv6 sockets at .1); 127.a.b.254 →
   the first virtual address; another namespace's 127.c.d.1 → that namespace's address facing the
@@ -210,12 +214,17 @@ sockets (`hal`).
   AF_INET6 wildcard listener (`!IPV6_V6ONLY`) falls back to probing IPv4 PREROUTING nat when the
   IPv6 probe does not match, so IPv4 DNAT rules forward it.
 - One host thread (`forward`, no BKL) owns dups of the selected host sockets: it accepts up to 64
-  connections per round, opens a nonblocking connection to the target, and copies both ways with
-  64 KiB buffers, propagating half-close with `SHUT_WR`; errors close both ends, and so does a side
-  that reports an error or hangs up after its end of file before it was shut for writing (a reset
-  half-closed side). A listener that polls readable while its first accept fails with anything but
-  `EAGAIN` (out of fds, shut down) is left out of the poll for 1 s; a failing poll waits 100 ms. UDP uses one relay
-  socket per client address (120 s idle), replies sent from the held port.
+  connections per round up to `MAX_CONNS` (256) concurrent forwarded TCP connections (omitting TCP
+  listeners from `poll` while at cap so accept sockets do not busy-loop), opens a nonblocking
+  connection to the target with a `CONNECT_TIMEOUT` (10 s; client input is not polled until the
+  outbound connect completes, while client `POLLERR`/`POLLHUP` aborts early), and copies both ways
+  with 64 KiB buffers, propagating half-close with `SHUT_WR`; errors close both ends, and so does a
+  side that reports an error or hangs up after its end of file before it was shut for writing (a
+  reset half-closed side). A listener that polls readable while its first accept fails with anything
+  but `EAGAIN` (out of fds, shut down) is left out of the poll for 1 s; a failing poll waits 100 ms.
+  UDP uses one relay socket per client address (120 s idle), capped at `MAX_UDP_RELAYS` (256;
+  datagrams from new clients while at cap are drained and dropped without opening fds, while
+  existing relays stay active), replies sent from the held port.
 - Real client address: for IPv4, non-loopback TCP clients and IPv4 targets the relay binds a
   127.254.x.y address with the client's port and records it, so accept, getpeername and
   `/proc/net` in the container report the real client; loopback, IPv6 and UDP clients see the
@@ -225,8 +234,7 @@ sockets (`hal`).
 - Closing the socket or a rule change drops the handle; established forwarded TCP connections stay,
   UDP relays of that port are closed at once. Ordinary listeners share the accept queue with the
   guest. For a host-refused RET 0, the socket layer supplies a separate listener for DNAT and
-  shuts it down on withdrawal. The port stays bound on the deferred guest fd. There is no cap on connections
-  or relays and no connect timeout.
+  shuts it down on withdrawal. The port stays bound on the deferred guest fd.
 
 ## Dependencies (inbound / outbound)
 
@@ -274,12 +282,12 @@ sockets (`hal`).
   host ports), where Linux refuses the second.
 - **nat-chain drops become `EPERM`:** a drop or reject in a nat chain (even a remote namespace's
   PREROUTING) fails connect/sendto with `EPERM`; Linux times TCP out and never filters UDP connect.
-- **Forwarder limits:** there are no connection or relay limits and no connect timeout; UDP relays
-  are cut when the rule changes.
+- **Forwarder rule-change behavior:** UDP relays are cut when the rule changes (while established
+  TCP connections stay).
 - **Smaller deviations:** only 127.0.0.0/24 works as loopback in a namespace (Linux: 127/8); IPv6 on
-  virtual devices is unusable and on-link IPv6 is handed to the host; `hostmap` entries are never
-  freed and collide once 65534 are used; PREROUTING filter chains see the post-DNAT destination at
-  every priority. `kernel/nft` records the unsupported POSTROUTING, SNAT and MASQUERADE effects.
+  virtual devices is unusable and on-link IPv6 is handed to the host; PREROUTING filter chains see
+  the post-DNAT destination at every priority. `kernel/nft` records the unsupported POSTROUTING,
+  SNAT and MASQUERADE effects.
 - **Route requests insist on exact address sizes:** `RTA_DST`, `RTA_GATEWAY` and `RTA_PREFSRC` in
   `RTM_NEWROUTE`/`RTM_DELROUTE` must be exactly 4 or 16 bytes, otherwise `EINVAL`; Linux 6.1
   answers `ERANGE` for a short IPv4 attribute or IPv6 gateway, uses the first 4 bytes of a longer
@@ -291,7 +299,6 @@ sockets (`hal`).
 - Is reaching a namespace's 127.a.b.x sockets directly from the initial namespace acceptable?
 - Is the first block 127.0.1.0/24 (Debian's `127.0.1.1` hostname convention) deliberate?
 - Should forwarded connections be torn down when the DNAT rule disappears?
-- Should `hostmap` entries be freed when virtual addresses are deleted?
 
 ## To verify
 

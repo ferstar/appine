@@ -31,6 +31,7 @@
 //!   ([`crate::route`]). Only through virtual devices.
 //! - Interface sysctls: see [`crate::netconf`].
 
+use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 
 use appine_hal::net::Interface;
@@ -358,6 +359,79 @@ impl Rt {
     }
 }
 
+/// Bidirectional map between virtual IPv4 addresses in the initial namespace and their host
+/// loopback addresses (`127.255.0.1`..=`127.255.255.254`).
+#[derive(Debug, Default)]
+pub(crate) struct HostMap {
+    /// Virtual IPv4 address → allocated slot in `1..=MAX_SLOT`.
+    by_guest: HashMap<[u8; 4], u16>,
+    /// Allocated slot in `1..=MAX_SLOT` → virtual IPv4 address.
+    by_host: HashMap<u16, [u8; 4]>,
+    /// Highest slot allocated from the fresh range `1..=MAX_SLOT`.
+    next: u16,
+    /// Freed slots recycled FIFO so recently deleted addresses are not immediately reused.
+    free: VecDeque<u16>,
+}
+
+impl HostMap {
+    /// Usable slots in `127.255.0.0/16`, excluding `.0.0` (network) and `.255.255` (broadcast).
+    pub(crate) const MAX_SLOT: u16 = 0xfffe;
+
+    fn host_addr(slot: u16) -> [u8; 4] {
+        [127, crate::netns::INIT_BLOCK, (slot >> 8) as u8, slot as u8]
+    }
+
+    /// Returns the mapped host loopback address for `guest` if one already exists.
+    pub(crate) fn get(&self, guest: [u8; 4]) -> Option<[u8; 4]> {
+        self.by_guest.get(&guest).copied().map(Self::host_addr)
+    }
+
+    /// Returns the mapped host loopback address for `guest`, allocating a free slot if none
+    /// exists. Returns `None` when all [`Self::MAX_SLOT`] slots are in use.
+    pub(crate) fn get_or_alloc(&mut self, guest: [u8; 4]) -> Option<[u8; 4]> {
+        if let Some(&slot) = self.by_guest.get(&guest) {
+            return Some(Self::host_addr(slot));
+        }
+        let slot = if self.next < Self::MAX_SLOT {
+            self.next += 1;
+            self.next
+        } else {
+            self.free.pop_front()?
+        };
+        self.by_guest.insert(guest, slot);
+        self.by_host.insert(slot, guest);
+        Some(Self::host_addr(slot))
+    }
+
+    /// Reverse lookup: the virtual IPv4 address mapped to host loopback address `host`.
+    pub(crate) fn guest_of(&self, host: [u8; 4]) -> Option<[u8; 4]> {
+        if host[0] != 127 || host[1] != crate::netns::INIT_BLOCK {
+            return None;
+        }
+        let slot = u16::from_be_bytes([host[2], host[3]]);
+        self.by_host.get(&slot).copied()
+    }
+
+    /// Reclaims the host loopback slot mapped to `guest`, if any.
+    pub(crate) fn remove(&mut self, guest: [u8; 4]) -> bool {
+        let Some(slot) = self.by_guest.remove(&guest) else {
+            return false;
+        };
+        self.by_host.remove(&slot);
+        self.free.push_back(slot);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.by_guest.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_guest.is_empty()
+    }
+}
+
 /// The virtual devices, routes and sysctls of one network namespace.
 #[derive(Debug, Default)]
 pub(crate) struct Devices {
@@ -370,8 +444,8 @@ pub(crate) struct Devices {
     /// Ids allocated to other namespaces (`IFLA_LINK_NETNSID`, `RTM_GETNSID`).
     pub nsids: Vec<(Weak<NetNs>, i32)>,
     /// In the initial namespace: virtual addresses and their host loopback addresses
-    /// (127.255.x.y, allocated when used, [`crate::netns`]).
-    pub hostmap: Vec<([u8; 4], [u8; 4])>,
+    /// (127.255.x.y, allocated when used and reclaimed when deleted, [`crate::netns`]).
+    pub hostmap: HostMap,
 }
 
 impl Devices {
@@ -385,9 +459,26 @@ impl Devices {
         }
     }
 
+    /// Releases `hostmap` entries for IPv4 addresses that are no longer configured on any
+    /// remaining virtual device in this namespace.
+    fn release_hostmap(&mut self, gone: &[[u8; 4]]) {
+        if gone.is_empty() || self.hostmap.is_empty() {
+            return;
+        }
+        for &ip in gone {
+            let still_present = self
+                .list
+                .iter()
+                .any(|dev| dev.borrow().v4.iter().any(|a| a.local == ip));
+            if !still_present {
+                self.hostmap.remove(ip);
+            }
+        }
+    }
+
     /// Removes veths whose peer is gone (the peer's namespace was freed) and routes through
     /// devices that are gone.
-    fn prune(&mut self) {
+    pub(crate) fn prune(&mut self) {
         let gone: Vec<DevRef> = self
             .list
             .iter()
@@ -399,7 +490,9 @@ impl Devices {
             .collect();
         if !gone.is_empty() {
             self.list.retain(|d| !gone.iter().any(|g| Rc::ptr_eq(g, d)));
+            let mut gone_v4 = Vec::new();
             for g in &gone {
+                gone_v4.extend(g.borrow().v4.iter().map(|a| a.local));
                 for d in &self.list {
                     let mut d = d.borrow_mut();
                     if d.master.upgrade().is_some_and(|m| Rc::ptr_eq(&m, g)) {
@@ -407,6 +500,7 @@ impl Devices {
                     }
                 }
             }
+            self.release_hostmap(&gone_v4);
         }
         self.routes.retain(|r| r.dev.strong_count() > 0);
     }
@@ -1175,13 +1269,15 @@ fn delete(ns: &NetNs, dev: &DevRef) {
     settle(ns, &[]);
 }
 
-/// Removes a device from the namespace's table (on deletion or moving away): detaches its ports
-/// and removes the routes through it.
+/// Removes a device from the namespace's table (on deletion or moving away): detaches its ports,
+/// removes the routes through it, and releases any `hostmap` entries for its IPv4 addresses.
 fn unlink(ns: &NetNs, dev: &DevRef) {
+    let gone_v4: Vec<[u8; 4]> = dev.borrow().v4.iter().map(|a| a.local).collect();
     let ports = {
         let mut d = devs(ns);
         d.list.retain(|x| !Rc::ptr_eq(x, dev));
         d.routes.retain(|r| !r.on(dev) && r.dev.strong_count() > 0);
+        d.release_hostmap(&gone_v4);
         d.ports(dev)
     };
     for p in &ports {
@@ -1426,7 +1522,9 @@ fn del_addr4(ns: &Rc<NetNs>, dev: &DevRef, prefix: u8, attrs: &[(u16, &[u8])]) -
         });
     }
     drop(x);
-    redo_ifaddr4(&mut devs(ns), dev, &gone);
+    let mut d = devs(ns);
+    redo_ifaddr4(&mut d, dev, &gone);
+    d.release_hostmap(&gone);
     Ok(())
 }
 
