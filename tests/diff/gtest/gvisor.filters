@@ -1,5 +1,5 @@
 # gVisor 9ee2906f518e. Each tests/diff/gvisor-<group>.sh script sets its native Docker options.
-# group  program  expected passes  ONLY  SKIP (a dash denotes an empty SKIP)
+# group  program  expected passes  ONLY  SKIP (a dash denotes an empty SKIP)  [TEST_TMPDIR]
 
 devices	access_test	19	*	-
 devices	capabilities_test	14	*	-
@@ -121,7 +121,7 @@ syscalls	ioctl_test	39	*	IoctlTest.FIOASYNCHandlesFuseFD:IoctlTest.FIOASYNCSelfT
 syscalls	link_test	20	*	LinkTest.LinkAt*
 syscalls	lseek_test	13	*	LseekTest.ProcFile:LseekTest.ProcStatTwice
 syscalls	membarrier_test	4	*	-
-syscalls	memfd_test	20	*	MemfdTest.TmpfsFilesHaveSealSeal
+syscalls	memfd_test	21	*	-	/dev/shm
 syscalls	mkdir_test	7	*	-
 syscalls	mlock_test	17	*	MapLockedTest.RlimitMemlockZero:MremapLockedTest.Rlimit*
 syscalls	mmap_test	112	*	MMapTest.ExceedLimitAS:MMapTest.MapPipe:MMapTest.MprotectHugeLength:MMapTest.MprotectNotPageAligned:MMapTest.NoExceedLimitData:MMapTest.PrivateAndShared

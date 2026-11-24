@@ -4,12 +4,15 @@ dir=$(dirname "$0")
 group=$1
 found=0
 failed=0
-while read -r name program expected only skip; do
+while read -r name program expected only skip tmpdir; do
     [ "$name" = "$group" ] || continue
     found=1
     [ "$skip" != - ] || skip=""
     echo "@ $program"
-    GTEST_FAILURE_DETAILS=1 ONLY="$only" sh "$dir/run.sh" gvisor "$skip" "$program" </dev/null |
+    (
+        if [ -n "$tmpdir" ]; then export TEST_TMPDIR="$tmpdir"; fi
+        GTEST_FAILURE_DETAILS=1 ONLY="$only" sh "$dir/run.sh" gvisor "$skip" "$program" </dev/null
+    ) |
         awk -v program="$program" -v expected="$expected" '
             { print }
             /^  out: / { next }

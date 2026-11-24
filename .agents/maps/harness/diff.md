@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the split; latest change: gVisor failure diagnostics and cases excluded from native comparison)
+> Maintained: 2026-11-24 (targeted verification only since the split; latest change: per-program gVisor test directory for tmpfs seal coverage)
 
 ## Responsibilities
 
@@ -151,9 +151,10 @@ benchmarks, surveys and crash testing remain `harness`.
 - Nine further gVisor cases select program-specific `ONLY` and `SKIP` filters from
   `gvisor.filters`. Each group sets its measured native Docker options. The seven regular groups
   and two slow groups run through `selected.sh`, which prints each program name and checks its
-  expected pass count. For a failed assertion it also prints the first 30 lines of the captured
-  GoogleTest output. The pass-count check excludes these diagnostic lines. An empty group,
-  missing binary, skip or failure makes the selection fail even when native Linux and Appine
+  expected pass count. A row can set `TEST_TMPDIR` for its program. `memfd_test` uses
+  `/dev/shm` so its ordinary tmpfs seal test runs. For a failed assertion it also prints the
+  first 30 lines of the captured GoogleTest output. The pass-count check excludes these diagnostic
+  lines. An empty group, missing binary, skip or failure makes the selection fail even when native Linux and Appine
   print identical output. The program list across all fifteen
   gVisor groups determines the selected tarball.
 - Legacy skips are a negative gtest filter in each case, grouped by reason: a deviation recorded in a

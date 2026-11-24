@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: seal queries on ordinary tmpfs files)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: default seal on ordinary tmpfs files)
 
 ## Responsibilities
 
@@ -121,6 +121,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   are `EINVAL`; the path is `/memfd:<name> (deleted)`. `F_ADD_SEALS` with `F_SEAL_EXEC` on a memfd
   with an execute bit also adds the shrink, grow, write and future-write seals
   (`memfd_add_seals`); `F_SEAL_WRITE` with a writable shared mapping is `EBUSY`.
+- An ordinary tmpfs file has a fixed `F_SEAL_SEAL`: `F_GET_SEALS` returns it and adding a
+  valid seal fails with `EPERM`. Only memfds need entries in `Kernel::seals`.
 - Boot: with host stdio, fds 0–2 wrap the host's fds (`FileKind::Host`); with a console, one PTY
   slave description on all three.
 - ioctl: `O_PATH` is `EBADF`; then render-node DRM requests (`'d'`, `syscall/gpu.rs`),
@@ -274,8 +276,6 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 ## Confirmed bugs / technical debt
 
 - **Fidelity gaps**, one per line:
-  - `F_GET_SEALS` on an ordinary tmpfs file returns `EINVAL` because only memfds have a seal
-    entry. Linux returns `F_SEAL_SEAL` (gVisor's `MemfdTest.TmpfsFilesHaveSealSeal`);
   - no `O_TMPFILE`;
   - a write open on a read-only instance is `EROFS` only after permission (6.1's `sb_permission`
     comes first; overlay opens already do);

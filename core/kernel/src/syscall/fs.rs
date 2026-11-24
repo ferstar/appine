@@ -1940,15 +1940,19 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             let FileKind::Regular { ino, .. } = f.kind else {
                 return Err(Errno::EINVAL);
             };
-            let seals = cx.k().seals.get_mut(&ino).ok_or(Errno::EINVAL)?;
+            let seals = match cx.kr().seals.get(&ino) {
+                Some(&seals) => seals,
+                None if cx.vfs()?.fs_of(&Node::Store(f.mnt, ino)) == Fs::Tmpfs => F_SEAL_SEAL,
+                None => return Err(Errno::EINVAL),
+            };
             if cmd == F_GET_SEALS {
-                return Ok(*seals as u64);
+                return Ok(seals as u64);
             }
             let mut add = arg as u32;
             if add & !F_SEAL_ALL != 0 {
                 return Err(Errno::EINVAL);
             }
-            if !f.writable() || *seals & F_SEAL_SEAL != 0 {
+            if !f.writable() || seals & F_SEAL_SEAL != 0 {
                 return Err(Errno::EPERM);
             }
             // Sealing an executable memfd's execute bits also seals its contents, W^X from then
