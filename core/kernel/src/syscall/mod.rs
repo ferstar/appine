@@ -184,6 +184,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     let in_syscall = InSyscall::enter(cx.task, nr);
     let mut retries = 0;
     let mut exec_opens = inotify::ExecOpens::default();
+    let mut exec = None;
     let result = loop {
         let result = match nr {
             // These do not return, or set all registers themselves. When traced they may stop to
@@ -205,7 +206,10 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             221 => {
                 let tid = cx.tid();
                 match proc::execve(cx, cpu, a[0], a[1], a[2], &mut exec_opens) {
-                    Ok(doomed) => return exec_done(cx, cpu, tid, doomed),
+                    Ok(doomed) => {
+                        exec = Some((tid, doomed));
+                        Ok(0)
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -220,7 +224,10 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
                     a[4] as u32,
                     &mut exec_opens,
                 ) {
-                    Ok(doomed) => return exec_done(cx, cpu, tid, doomed),
+                    Ok(doomed) => {
+                        exec = Some((tid, doomed));
+                        Ok(0)
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -596,25 +603,20 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         }
         break result;
     };
-    // A failed exec (including a failed FUSE request) releases the files already opened.
+    // A failed exec (including a failed FUSE request) releases the files already opened; on a
+    // successful exec `exec_opens` is already empty.
     if matches!(nr, 221 | 281) {
         exec_opens.close();
     }
-    // Releases of FUSE files dropped while their connection was borrowed
-    crate::vfs::fuse::flush_released();
-    // AF_UNIX cycles left by drops that had no &mut Kernel (UnixSocket::drop, AIO polls, accept4)
-    crate::unix::collect_deferred(cx.k());
-    // Between syscalls nothing holds a FUSE node but what in_use finds
-    fuse::sweep(cx);
-    // A detached mount whose last open file or directory this syscall let go of
-    if let Ok(vfs) = cx.vfs() {
-        mount::collect_released(cx.kr(), &vfs);
-    }
-    // Removed overlay nodes nothing uses any more
-    mount::sweep_overlays(cx);
-    // Changes to watched cgroup files (crate::cgroup::notify_changes)
-    crate::cgroup::notify_changes(cx.k());
+    post_syscall_sweeps(cx);
     drop(in_syscall);
+    if let Some((old_tid, doomed)) = exec {
+        // Drain any dirty/code/graveyard state accumulated while building the new image (such as
+        // overlapping PT_LOAD segments or vDSO syscall patching) before exec_done.
+        let sync = cx.task.sync.clone();
+        cx.mm_mut().sync(&sync);
+        return exec_done(cx, cpu, old_tid, doomed);
+    }
     // pids returned by set_tid_address, getpgid, getsid, setsid, getpid, getppid and gettid, and
     // the pid or negative process group ID returned by fcntl(F_GETOWN) (wait4's are translated
     // before reaping)
@@ -666,6 +668,25 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     crate::ptrace::syscall_stepped(cx);
     // Handle pending signals and syscall restarts before returning to user space, as on Linux
     signal::deliver(cx, cpu, true)
+}
+
+/// Runs the end-of-syscall cleanup sweeps after a handler completes (including successful
+/// `execve`/`execveat`), before `InSyscall` is dropped and before any ptrace or signal stops.
+fn post_syscall_sweeps(cx: &mut Cx<'_>) {
+    // Releases of FUSE files dropped while their connection was borrowed
+    crate::vfs::fuse::flush_released();
+    // AF_UNIX cycles left by drops that had no &mut Kernel (UnixSocket::drop, AIO polls, accept4)
+    crate::unix::collect_deferred(cx.k());
+    // Between syscalls nothing holds a FUSE node but what in_use finds
+    fuse::sweep(cx);
+    // A detached mount whose last open file or directory this syscall let go of
+    if let Ok(vfs) = cx.vfs() {
+        mount::collect_released(cx.kr(), &vfs);
+    }
+    // Removed overlay nodes nothing uses any more
+    mount::sweep_overlays(cx);
+    // Changes to watched cgroup files (crate::cgroup::notify_changes)
+    crate::cgroup::notify_changes(cx.k());
 }
 
 /// The thread is inside BKL system call `nr` while this lives ([`crate::task::Task::syscall`]),

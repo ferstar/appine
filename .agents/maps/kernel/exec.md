@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: old-address-space FUSE writeback at exec)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: post-syscall sweeps and `Mm::sync` on successful execve/execveat)
 
 ## Responsibilities
 
@@ -156,8 +156,9 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 
 ### Inbound
 
-- The syscall dispatcher (`kernel/process`): execve and execveat; a successful execve returns
-  before the post-syscall sweeps and `Mm::sync`.
+- The syscall dispatcher (`kernel/process`): execve and execveat; a successful exec runs the
+  shared post-syscall sweeps (`post_syscall_sweeps`), drops `InSyscall` before any ptrace/signal
+  stops, and runs `Mm::sync` on the new address space before `exec_done`.
 - `Machine::spawn` (`kernel/boot`): `loader::load` for a host-started process.
 - `kernel/procfs`: `/proc/<pid>/exe` and `/proc/<pid>/fd/<n>` as targets, the mapping names.
 
@@ -194,7 +195,7 @@ None.
 
 ## Open questions
 
-- Should a successful execve run the post-syscall sweeps and `Mm::sync` that it now skips?
+None.
 
 ## To verify
 
