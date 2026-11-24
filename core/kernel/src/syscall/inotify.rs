@@ -625,6 +625,20 @@ impl Opened {
         self.0.unlinked.get()
     }
 
+    /// The current parent and name in the mount through which this file was opened.
+    pub(crate) fn dentry(&self, original: &Node) -> Option<crate::vfs::Dentry> {
+        let parent = self.0.parent.borrow();
+        let (key, name) = parent.as_ref()?;
+        let mnt = original.mnt();
+        let dir = match original {
+            Node::Store(..) => Node::Store(mnt, *key),
+            Node::Fuse(..) => Node::Fuse(mnt, crate::vfs::fuse::id_of(*key)?),
+            Node::Overlay(..) => Node::Overlay(mnt, overlay::of_key(*key)?),
+            Node::Pseudo(..) => return None,
+        };
+        Some((dir, name.clone()))
+    }
+
     /// A magic-link reopen has its own last close at the original dentry, even after unlink.
     pub(super) fn reopen(&self, k: &Kernel, writable: bool) -> Self {
         let (ino, parent, unlinked) = self.location();
@@ -681,7 +695,7 @@ impl Drop for OpenRecord {
         {
             r.opened
                 .remove(&(self.ino, std::ptr::from_ref(self).addr()));
-            if !r.by_ino.is_empty() {
+            if self.close != 0 && !r.by_ino.is_empty() {
                 self.notify(&mut r, self.close, self.unlinked.get());
             }
             if !r.doomed.is_empty() {
@@ -791,7 +805,7 @@ pub(crate) fn file_event(k: &Kernel, f: &OpenFile, mask: u32) {
 /// `fsnotify_access`/`fsnotify_modify` pass the open file's dentry, so watches with
 /// `IN_EXCL_UNLINK` (both directory and file watches) skip events on an unlinked name.
 pub(crate) fn file_io_event(k: &Kernel, f: &OpenFile, mask: u32) {
-    let unlinked = f.watch.as_ref().is_some_and(Opened::is_unlinked);
+    let unlinked = f.dentry_unlinked();
     file_event_inner(k, f, mask, unlinked);
 }
 
@@ -858,6 +872,9 @@ pub(crate) fn opened(
     parent: Option<(Ino, Vec<u8>)>,
     unlinked: bool,
 ) -> Option<Opened> {
+    if let FileKind::Path(node) = &f.kind {
+        return Some(Opened::new(&k.inotify, key_of(node)?, parent, 0, unlinked));
+    }
     let (ino, dir) = file_key(f)?;
     let close = close_mask(f.writable());
     Some(Opened::new(&k.inotify, ino, parent, dir | close, unlinked))

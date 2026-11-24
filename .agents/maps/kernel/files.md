@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: named FIFO open records)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: O_PATH pins for unlinked store files reopened through proc fd links)
 
 ## Responsibilities
 
@@ -107,8 +107,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   `O_PATH|O_DIRECTORY|O_NOFOLLOW`), and every other open adds `O_LARGEFILE`. An `O_PATH` fd
   takes only `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD` and `F_GETFL` (else `EBADF`), and
   flock on it is `EBADF`. `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME`
-  (registering fasync whenever `O_ASYNC` is set for pipes, sockets, PTYs, inotify and host fds; no
-  `O_NOATIME` ownership or `O_DIRECT` check). Access mode 3 needs read and write permission but
+  (fasync registration on `O_ASYNC`, ownership check when enabling `O_NOATIME` on store or overlay files, no `O_DIRECT` check). Access mode 3 needs read and write permission but
   makes the file neither readable nor writable (`OPEN_FMODE`). Unknown fcntl commands are `EINVAL`,
   counted as unimplemented paths.
 - Owners: `F_SETOWN`/`F_GETOWN` (translated by the dispatcher's `pid_args` in a non-initial pid
@@ -145,8 +144,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   umask (`kernel/cred`: setgid stripped before the umask, setgid directories); a just-created file
   skips permission checks and truncation. `O_PATH` gives a `FileKind::Path` (`O_DIRECTORY` on a
   non-directory `ENOTDIR`). Store, overlay, FUSE and mqueue-mount nodes (`PseudoNode::Mq`) set the
-  file's mount. O_PATH pins a queue's inode and quota or a FUSE node's cache entry until final
-  release, including while the description travels in an AF_UNIX message.
+  file's mount. O_PATH pins queue inodes and quota, FUSE cache entries, and the backing object of an
+  unlinked store file reopened via a proc fd link until final release, including in-flight AF_UNIX fds.
   A direct `mq_open` marks its descriptor `pseudo` for the internal mqueue instance.
 - Store nodes (`open_store`), unless just created: symlink `ELOOP`; a directory with write access,
   `O_CREAT` or `O_TRUNC` `EISDIR`; a regular file with `O_TRUNC` `EROFS` on ro, else it adds

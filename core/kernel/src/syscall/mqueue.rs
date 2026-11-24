@@ -738,9 +738,11 @@ pub(super) fn mq_timedreceive(
         r?;
     };
     request_wake_object(wake::of(&q));
-    cx.mm().write(UserSlice::new(msg, data.len()), &data)?;
+    super::copy_result(cx, |cx| {
+        cx.mm().write(UserSlice::new(msg, data.len()), &data)
+    })?;
     if prio != 0 {
-        put(cx, prio, p.to_le_bytes())?;
+        super::copy_result(cx, |cx| put(cx, prio, p.to_le_bytes()))?;
     }
     Ok(data.len() as u64)
 }

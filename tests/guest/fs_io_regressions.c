@@ -38,6 +38,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/sendfile.h>
@@ -97,6 +98,13 @@
 #ifndef IN_EXCL_UNLINK
 #define IN_EXCL_UNLINK 0x04000000
 #endif
+
+static int reopen_fd(int fd, int flags)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    return open(path, flags);
+}
 
 static void write_file_bytes(const char *path, const void *buf, size_t len, mode_t mode)
 {
@@ -415,10 +423,8 @@ static void test_fifo_last_close(const char *dir, const char *path)
     int excluded = inotify_init1(IN_NONBLOCK);
     CHECK(excluded >= 0 && inotify_add_watch(excluded, dir, IN_EXCL_UNLINK | IN_OPEN | IN_CLOSE) >= 0,
           "watch FIFO parent");
-    char link[64];
-    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
     CHECK(unlink(path) == 0, "unlink open FIFO");
-    int reopened = open(link, O_RDONLY | O_NONBLOCK);
+    int reopened = reopen_fd(fd, O_RDONLY | O_NONBLOCK);
     CHECK(reopened >= 0 && close(reopened) == 0 && close(fd) == 0, "reopen deleted FIFO");
     for (int n = 0; n < 3; n++) {
         struct inotify_event event;
@@ -1445,6 +1451,161 @@ static void test_anonymous_locks(void)
     close(master);
 }
 
+static void check_fd_link(int fd, const char *expected)
+{
+    char link[64], target[256];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, target, sizeof(target));
+    CHECK(n == (ssize_t)strlen(expected) && memcmp(target, expected, n) == 0,
+          "fd %d should name %s, got %.*s", fd, expected, n > 0 ? (int)n : 0, target);
+}
+
+static void test_renamed_fd_links(void)
+{
+    CHECK(mkdir("/tmp/fio/parent", 0700) == 0, "create fd-link directory");
+    int dir = open("/tmp/fio/parent", O_DIRECTORY);
+    int fd = openat(dir, "file", O_CREAT | O_RDWR, 0600);
+    int path = openat(dir, "file", O_PATH);
+    CHECK(fd >= 0 && path >= 0 && linkat(dir, "file", dir, "alias", 0) == 0, "open hard links");
+    int alias = openat(dir, "alias", O_RDONLY);
+    CHECK(alias >= 0 && renameat(dir, "file", dir, "alias") == 0, "same-inode rename");
+    check_fd_link(fd, "/tmp/fio/parent/file");
+    CHECK(rename("/tmp/fio/parent", "/tmp/fio/moved") == 0 &&
+          renameat(dir, "file", dir, "new") == 0, "rename directory and file");
+    check_fd_link(dir, "/tmp/fio/moved");
+    check_fd_link(path, "/tmp/fio/moved/new");
+    check_fd_link(fd, "/tmp/fio/moved/new");
+    check_fd_link(alias, "/tmp/fio/moved/alias");
+    CHECK(unlinkat(dir, "new", 0) == 0, "unlink opened name");
+    int replacement = openat(dir, "new", O_CREAT | O_RDWR, 0600);
+    CHECK(replacement >= 0, "reuse unlinked name");
+    check_fd_link(fd, "/tmp/fio/moved/new (deleted)");
+    check_fd_link(replacement, "/tmp/fio/moved/new");
+    check_fd_link(alias, "/tmp/fio/moved/alias");
+    int reopen = reopen_fd(path, O_RDONLY);
+    int repath = reopen_fd(fd, O_PATH);
+    close(path);
+    close(fd);
+    CHECK(reopen >= 0 && repath >= 0 && dup2(replacement, fd) == fd, "reuse original fd");
+    check_fd_link(reopen, "/tmp/fio/moved/new (deleted)");
+    check_fd_link(repath, "/tmp/fio/moved/new (deleted)");
+    struct stat from_path, from_alias;
+    CHECK(fstat(repath, &from_path) == 0 && fstat(alias, &from_alias) == 0 &&
+          from_path.st_ino == from_alias.st_ino, "O_PATH reopen pins original inode");
+    close(reopen);
+    close(repath);
+    close(fd);
+    close(replacement);
+    close(alias);
+    close(dir);
+}
+
+static void test_unlinked_opath_reopen(void)
+{
+    char byte;
+    const char *name = "/tmp/fio/unlinked-path";
+    int source = open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    int other = open("/tmp/fio/other-path", O_CREAT | O_RDWR, 0600);
+    struct stat original, replacement, st;
+    CHECK(source >= 0 && other >= 0 && write(source, "A", 1) == 1 &&
+          unlink(name) == 0 && fstat(source, &original) == 0 && original.st_nlink == 0 &&
+          fstat(other, &replacement) == 0 && replacement.st_ino != original.st_ino,
+          "prepare distinct inodes and remove last link");
+    CHECK(flock(source, LOCK_EX) == 0, "lock source description");
+    int path = reopen_fd(source, O_PATH);
+    CHECK(path >= 0 && close(source) == 0 && fstat(path, &st) == 0 &&
+          st.st_dev == original.st_dev && st.st_ino == original.st_ino && st.st_nlink == 0,
+          "O_PATH keeps unlinked inode after source close");
+    CHECK(dup2(other, source) == source && fstat(path, &st) == 0 &&
+          st.st_dev == original.st_dev && st.st_ino == original.st_ino && st.st_nlink == 0,
+          "O_PATH keeps unlinked inode after source fd reuse");
+    check_fd_link(path, "/tmp/fio/unlinked-path (deleted)");
+    CHECK(read(path, &byte, 1) < 0 && errno == EBADF, "O_PATH rejects direct reads");
+
+    int second = reopen_fd(path, O_PATH);
+    CHECK(second >= 0 && close(path) == 0, "reopen unlinked O_PATH");
+    int rw = reopen_fd(second, O_RDWR);
+    CHECK(rw >= 0 && read(rw, &byte, 1) == 1 && byte == 'A',
+          "read original file through second O_PATH");
+    CHECK(flock(rw, LOCK_EX | LOCK_NB) == 0, "O_PATH allows original file lock to be released");
+    CHECK(write(rw, "!", 1) == 1 && fstat(second, &st) == 0 && st.st_size == 2,
+          "O_PATH sees updates to original inode");
+    close(rw);
+    close(second);
+    close(source);
+    close(other);
+    unlink("/tmp/fio/other-path");
+}
+
+static void test_guest_atime(void)
+{
+    const char *path = "/tmp/fio/atime";
+    const struct timespec times[] = {{1, 0}, {2, 0}};
+    struct stat before, after;
+    int fd = open(path, O_CREAT | O_RDWR | O_NOATIME, 0600);
+    char c;
+    CHECK(fd >= 0 && write(fd, "A", 1) == 1 && futimens(fd, times) == 0, "set file times");
+    CHECK(pread(fd, &c, 1, 0) == 1 && fstat(fd, &after) == 0 && after.st_atim.tv_sec == 1,
+          "O_NOATIME preserves regular file atime");
+    int reader = open(path, O_RDONLY);
+    CHECK(reader >= 0 && fstat(reader, &before) == 0 && pread(reader, &c, 1, 0) == 1 &&
+          fstat(fd, &after) == 0 && after.st_atim.tv_sec > 1 &&
+          before.st_ctim.tv_sec == after.st_ctim.tv_sec && before.st_ctim.tv_nsec == after.st_ctim.tv_nsec,
+          "ordinary open advances atime only");
+    CHECK(futimens(fd, times) == 0 && fcntl(reader, F_SETFL, O_NOATIME) == 0 &&
+          pread(reader, &c, 1, 0) == 1 && stat(path, &after) == 0 && after.st_atim.tv_sec == 1,
+          "F_SETFL enables O_NOATIME");
+    void *map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, reader, 0);
+    CHECK(map != MAP_FAILED && *(const char *)map == 'A' && stat(path, &after) == 0 &&
+          after.st_atim.tv_sec == 1, "O_NOATIME survives mmap");
+    munmap(map, 4096);
+    CHECK(fcntl(reader, F_SETFL, 0) == 0, "clear O_NOATIME");
+    pid_t child = fork();
+    CHECK(child >= 0, "fork atime reader");
+    if (child == 0) {
+        if (setuid(65534) < 0) _exit(1);
+        _exit(fcntl(reader, F_SETFL, O_NOATIME) < 0 && errno == EPERM ? 0 : 1);
+    }
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "non-owner cannot enable O_NOATIME on inherited fd");
+    close(reader);
+    close(fd);
+
+    CHECK(utimensat(AT_FDCWD, "/proc/self/exe", times, 0) == 0, "reset executable atime");
+    child = fork();
+    CHECK(child >= 0, "fork exec reader");
+    if (child == 0) {
+        execl("/proc/self/exe", "fs_io_regressions", "atime-child", (char *)NULL);
+        _exit(1);
+    }
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+          stat("/proc/self/exe", &after) == 0 && after.st_atim.tv_sec > 1, "exec advances atime");
+}
+
+static void test_splice_socket_offset(void)
+{
+    int sockets[2], p[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0 && pipe2(p, O_NONBLOCK) == 0,
+          "splice descriptors");
+    CHECK(write(sockets[1], "S", 1) == 1, "queue socket byte");
+    off_t off = 7;
+    CHECK(splice(sockets[0], &off, p[1], NULL, 1, SPLICE_F_NONBLOCK) == -1 && errno == EINVAL,
+          "reject socket input offset");
+    CHECK(fcntl(p[1], F_SETPIPE_SZ, 4096) == 4096, "set one pipe slot");
+    char page[4096] = {0};
+    CHECK(write(p[1], page, sizeof(page)) == sizeof(page), "fill destination pipe");
+    CHECK(splice(sockets[0], &off, p[1], NULL, 1, SPLICE_F_NONBLOCK) == -1 && errno == EINVAL,
+          "reject socket offset before waiting for pipe space");
+    CHECK(off == 7 && read(p[0], page, sizeof(page)) == sizeof(page), "offset and pipe intact");
+    CHECK(splice(sockets[0], NULL, p[1], NULL, 1, SPLICE_F_NONBLOCK) == 1 &&
+          read(p[0], page, 1) == 1 && page[0] == 'S', "offset-free splice receives queued byte");
+    close(sockets[0]);
+    close(sockets[1]);
+    close(p[0]);
+    close(p[1]);
+}
+
 static void test_pipe_regressions(void)
 {
     /* Part A: read, readv, and read-side vmsplice with faulting buffer do not consume bytes */
@@ -1569,8 +1730,9 @@ static void rm_rf(const char *path)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "atime-child") == 0) return 0;
     CHECK(mkdir("/tmp", 0777) == 0 || errno == EEXIST, "mkdir /tmp");
     CHECK(chmod("/tmp", 0777) == 0, "chmod /tmp");
 
@@ -1590,8 +1752,12 @@ int main(void)
     test_inotify_core();
     test_fuse_inotify_and_sync();
     test_fileio_and_files();
+    test_guest_atime();
+    test_renamed_fd_links();
+    test_unlinked_opath_reopen();
     test_pipe_flock();
     test_anonymous_locks();
+    test_splice_socket_offset();
     test_pipe_regressions();
 
     printf("all ok\n");

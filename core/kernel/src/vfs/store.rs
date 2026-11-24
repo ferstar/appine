@@ -9,6 +9,7 @@
 //! the database column uses does not necessarily agree with the one the host filesystem stamps
 //! times with (tens of milliseconds apart on virtiofs), and taking the later of the two would
 //! miss changes.
+//! Guest atime is independent of reads of the backing object and is stored per inode.
 //! A hard link is simply several dentries pointing at the same ino. Only paths of the form
 //! `objects/<number>` ever appear on the host side, never built from guest input (§12 item 3).
 //!
@@ -20,11 +21,10 @@
 //! Several regular files can share one object ([`Store::share`]: FICLONE, a whole-file
 //! copy_file_range, an overlay copy-up), the reflink of filesystems such as btrfs and XFS at the
 //! granularity of whole files. The `shared` table records each file whose data is not simply its
-//! own `objects/<ino>`: the object's number, and while the object is or was shared since the file
-//! was last written, the file's access time (its mtime and ctime are then the row's), since the
-//! object's host times belong to no one file. Such a file is held: writing, truncating or
-//! mapping it shared for write first gives it an object of its own ([`Store::unshare`]: a copy
-//! when others still share the object), and only then do its times come from the object again.
+//! own `objects/<ino>`. It stores the object number and a saved access time marking a held file.
+//! While held, the inode row supplies all guest timestamps because several files can share the
+//! object's host times. Writing, truncating or mapping it shared for write first gives it an
+//! object of its own ([`Store::unshare`]). Its mtime and ctime then come from that object.
 //! A number some row uses as its object keeps its inode row at boot, so it is never given to a new
 //! file while the object lives.
 //!
@@ -63,7 +63,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard};
@@ -196,8 +196,7 @@ pub struct Stat {
     pub rdev: u64,
     /// Size in bytes.
     pub size: u64,
-    /// Access time (nanoseconds). Recorded separately only for regular files (the host object's
-    /// atime); for the others it equals mtime.
+    /// Guest access time (nanoseconds).
     pub atime_ns: i64,
     /// Modification time (nanoseconds).
     pub mtime_ns: i64,
@@ -267,6 +266,7 @@ const SCHEMA: &str = "
         parent   INTEGER NOT NULL DEFAULT 0, -- a directory's parent directory (..)
         mtime_ns INTEGER NOT NULL DEFAULT 0, -- used only by inodes without an object
         ctime_ns INTEGER NOT NULL DEFAULT 0,
+        atime_ns INTEGER,                    -- NULL uses the original object's or row's time
         target   BLOB                        -- the symlink's target
     );
     CREATE TABLE IF NOT EXISTS dentries (
@@ -287,8 +287,8 @@ const SCHEMA: &str = "
         ino INTEGER PRIMARY KEY
     );
     -- Regular files whose data is in objects/<object> rather than their own objects/<ino>, or
-    -- whose object other files share (module docs); atime_ns is set while the file is held: its
-    -- times are then the database's (mtime and ctime in inodes)
+    -- whose object other files share. A saved atime marks a held file; legacy stores used
+    -- that value as the guest atime. The inode row now supplies all timestamps while held.
     CREATE TABLE IF NOT EXISTS shared (
         ino      INTEGER PRIMARY KEY,
         object   INTEGER NOT NULL,
@@ -372,8 +372,8 @@ impl Store {
         store
             .db()
             .execute(
-                "INSERT INTO inodes (ino, mode, uid, gid, nlink, parent, mtime_ns, ctime_ns)
-                 VALUES (?1, ?2, 0, 0, 2, ?1, ?3, ?3)",
+                "INSERT INTO inodes (ino, mode, uid, gid, nlink, parent, atime_ns, mtime_ns, ctime_ns)
+                 VALUES (?1, ?2, 0, 0, 2, ?1, ?3, ?3, ?3)",
                 params![ROOT, mode::S_IFDIR | 0o755, now],
             )
             .map_err(db_err)?;
@@ -418,7 +418,7 @@ impl Store {
     }
 
     fn connect(dir: &Path) -> Result<Store, Errno> {
-        let db = Connection::open(dir.join("meta.db")).map_err(db_err)?;
+        let mut db = Connection::open(dir.join("meta.db")).map_err(db_err)?;
         db.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;
         db.pragma_update(None, "synchronous", "NORMAL")
@@ -431,6 +431,29 @@ impl Store {
         // Metadata operations are very frequent: every statement is compiled only once
         db.set_prepared_statement_cache_capacity(64);
         db.execute_batch(SCHEMA).map_err(db_err)?;
+        // Serialize the upgrade if two processes open an older store together.
+        let has_atime = |db: &Connection| {
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('inodes') WHERE name = 'atime_ns')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(db_err)
+        };
+        if !has_atime(&db)? {
+            let tx = db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(db_err)?;
+            if !has_atime(&tx)? {
+                tx.execute_batch(
+                    "ALTER TABLE inodes ADD COLUMN atime_ns INTEGER;
+                     UPDATE inodes SET atime_ns = shared.atime_ns FROM shared
+                     WHERE inodes.ino = shared.ino AND shared.atime_ns IS NOT NULL;",
+                )
+                .map_err(db_err)?;
+            }
+            tx.commit().map_err(db_err)?;
+        }
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -820,7 +843,8 @@ impl Store {
     /// works after the file is deleted.
     pub fn stat_open(&self, ino: Ino, file: &File) -> Result<Stat, Errno> {
         let (mut st, data) = self.row(ino)?;
-        fill_from_object(&mut st, &file.metadata().map_err(io_err)?, data.held);
+        let host = appine_hal::fstat(file.as_raw_fd()).map_err(Errno)?;
+        fill_from_object(&mut st, &host, data);
         Ok(st)
     }
 
@@ -920,7 +944,7 @@ impl Store {
             .db()
             .prepare_cached(
                 "SELECT i.mode, i.nlink, i.uid, i.gid, i.rdev, i.mtime_ns, i.ctime_ns,
-                        length(i.target), s.object, s.atime_ns, a.value, d.value
+                        length(i.target), s.object, s.atime_ns, i.atime_ns, a.value, d.value
                  FROM inodes i LEFT JOIN shared s ON s.ino = i.ino
                  LEFT JOIN xattrs a ON a.ino = i.ino AND a.name = ?2
                  LEFT JOIN xattrs d ON d.ino = i.ino AND d.name = ?3
@@ -941,10 +965,14 @@ impl Store {
                             r.get::<_, i64>(6)?,
                             r.get::<_, Option<u64>>(7)?,
                         ),
-                        (r.get::<_, Option<Ino>>(8)?, r.get::<_, Option<i64>>(9)?),
+                        Data {
+                            object: r.get::<_, Option<Ino>>(8)?.unwrap_or(ino),
+                            held: r.get(9)?,
+                            atime: r.get(10)?,
+                        },
                         (
-                            r.get::<_, Option<Vec<u8>>>(10)?,
                             r.get::<_, Option<Vec<u8>>>(11)?,
+                            r.get::<_, Option<Vec<u8>>>(12)?,
                         ),
                     ))
                 })
@@ -955,7 +983,7 @@ impl Store {
         let (
             (mode, nlink, uid, gid, rdev),
             (mtime_ns, ctime_ns, target_len),
-            (object, held),
+            data,
             (access, default),
         ) = row;
         let size = target_len.unwrap_or(0);
@@ -978,7 +1006,7 @@ impl Store {
             gid,
             rdev,
             size,
-            atime_ns: held.unwrap_or(mtime_ns),
+            atime_ns: data.atime.or(data.held).unwrap_or(mtime_ns),
             mtime_ns,
             ctime_ns,
             blocks: None,
@@ -988,10 +1016,6 @@ impl Store {
                 entries.into()
             }),
             default_acl: default.map(|raw| decode(raw).into()),
-        };
-        let data = Data {
-            object: object.unwrap_or(ino),
-            held,
         };
         Ok((st, data))
     }
@@ -1264,8 +1288,8 @@ impl Store {
         let now = now_ns();
         self.db()
             .prepare_cached(
-                "INSERT INTO inodes (mode, uid, gid, nlink, parent, mtime_ns, ctime_ns)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                "INSERT INTO inodes (mode, uid, gid, nlink, parent, atime_ns, mtime_ns, ctime_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)",
             )
             .and_then(|mut st| st.execute(params![mode, uid, gid, nlink, parent, now]))
             .map_err(db_err)?;
@@ -1322,6 +1346,8 @@ impl Store {
         if self.writing.get() {
             self.created.borrow_mut().push(ino);
         }
+        // Start all regular-file timestamps on the same filesystem clock for relatime.
+        self.write_atime(ino, open_atime(&file)?)?;
         Ok(file)
     }
 
@@ -1682,11 +1708,14 @@ impl Store {
         let mut st = self.stat_row(dir)?;
         let now = now_ns();
         self.db()
-            .prepare_cached("UPDATE inodes SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1")
+            .prepare_cached(
+                "UPDATE inodes SET atime_ns = coalesce(atime_ns, mtime_ns),
+                        mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
+            )
             .and_then(|mut st| st.execute(params![dir, now]))
             .map_err(db_err)?;
         self.touch_ino(dir);
-        (st.atime_ns, st.mtime_ns, st.ctime_ns) = (now, now, now);
+        (st.mtime_ns, st.ctime_ns) = (now, now);
         self.fill(Fill::Row(st));
         Ok(())
     }
@@ -1783,8 +1812,7 @@ impl Store {
         self.set_times(ino, None, Some(FileTime::At(mtime_ns)))
     }
 
-    /// Sets the requested times and updates ctime. Regular files use the filesystem clock
-    /// and keep their times in the database while held. Other inodes report mtime as atime.
+    /// Sets the requested times and updates ctime. Regular files use the filesystem clock.
     pub fn set_times(
         &self,
         ino: Ino,
@@ -1797,15 +1825,23 @@ impl Store {
                 return self.set_held_times(ino, atime, mtime);
             }
             let mut name = [0u8; 21];
-            return appine_hal::set_times_at(
-                self.meta.objects_dir.as_raw_fd(),
-                object_name(data.object, &mut name),
-                atime.map(FileTime::host),
-                mtime.map(FileTime::host),
-            )
-            .map_err(|e| object_err(ino, e));
+            return self.set_object_times(
+                ino,
+                atime,
+                || Ok(self.object_stat(data.object)?.atime_ns),
+                || {
+                    appine_hal::set_times_at(
+                        self.meta.objects_dir.as_raw_fd(),
+                        object_name(data.object, &mut name),
+                        atime.map(FileTime::host),
+                        mtime.map(FileTime::host),
+                    )
+                    .map_err(|e| object_err(ino, e))
+                },
+            );
         }
-        self.statement(|s| s.set_row_times(ino, mtime, now_ns()))
+        let now = now_ns();
+        self.statement(|s| s.set_row_times(ino, atime.map(|t| t.resolve(now)), mtime, now))
     }
 
     /// Sets the access and modification times of regular file `ino` through its open object: also
@@ -1820,12 +1856,79 @@ impl Store {
         if self.held(ino)? {
             return self.set_held_times(ino, atime, mtime);
         }
-        appine_hal::set_times_fd(
-            file.as_raw_fd(),
-            atime.map(FileTime::host),
-            mtime.map(FileTime::host),
+        self.set_object_times(
+            ino,
+            atime,
+            || open_atime(file),
+            || {
+                appine_hal::set_times_fd(
+                    file.as_raw_fd(),
+                    atime.map(FileTime::host),
+                    mtime.map(FileTime::host),
+                )
+                .map_err(|e| object_err(ino, e))
+            },
         )
-        .map_err(|e| object_err(ino, e))
+    }
+
+    /// An explicit regular-file atime comes from the host filesystem clock again.
+    fn set_object_times(
+        &self,
+        ino: Ino,
+        atime: Option<FileTime>,
+        read_atime: impl FnOnce() -> Result<i64, Errno>,
+        set: impl FnOnce() -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        if atime.is_none() {
+            return set();
+        }
+        self.statement(|s| {
+            set()?;
+            s.write_atime(ino, read_atime()?)
+        })
+    }
+
+    fn write_atime(&self, ino: Ino, time: i64) -> Result<(), Errno> {
+        self.db()
+            .prepare_cached("UPDATE inodes SET atime_ns = ?2 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![ino, time]))
+            .map_err(db_err)?;
+        self.touch_ino(ino);
+        Ok(())
+    }
+
+    /// An ordinary access changes only guest atime. Explicit utimens calls also change ctime.
+    pub(crate) fn accessed(
+        &self,
+        ino: Ino,
+        file: Option<&File>,
+        relatime: bool,
+    ) -> Result<(), Errno> {
+        let stat = || match file {
+            Some(file) => self.stat_open(ino, file),
+            None => self.stat(ino),
+        };
+        const DAY_NS: i64 = 86_400 * 1_000_000_000;
+        let relatime_due = |st: Stat, now: i64| {
+            st.atime_ns <= st.mtime_ns
+                || st.atime_ns <= st.ctime_ns
+                || now.saturating_sub(st.atime_ns) >= DAY_NS
+        };
+        // Avoid a write transaction for most reads. When due, check again under the write lock.
+        if relatime && !relatime_due(stat()?, now_ns()) {
+            return Ok(());
+        }
+        self.statement(|s| {
+            let now = if file.is_some() {
+                s.filesystem_now()?
+            } else {
+                now_ns()
+            };
+            if !relatime || relatime_due(stat()?, now) {
+                s.write_atime(ino, now)?;
+            }
+            Ok(())
+        })
     }
 
     /// A held regular file keeps its timestamps in SQLite across sharing and copy-up. Sample
@@ -1836,7 +1939,7 @@ impl Store {
         let now = Some(appine_hal::TIME_NOW);
         appine_hal::set_times_at(dir, c".", now, now).map_err(Errno)?;
         let st = appine_hal::stat_at(dir, c".").map_err(Errno)?;
-        Ok(st.st_ctime * 1_000_000_000 + st.st_ctime_nsec)
+        Ok(timestamp_ns(st.st_ctime, st.st_ctime_nsec))
     }
 
     fn inode_now(&self, ino: Ino) -> Result<i64, Errno> {
@@ -1863,18 +1966,25 @@ impl Store {
                 )
                 .and_then(|mut st| st.execute(params![ino, atime]))
                 .map_err(db_err)?;
-            s.set_row_times(ino, mtime, now)
+            s.set_row_times(ino, atime, mtime, now)
         })
     }
 
     /// Store the inode's ctime and any requested mtime using the caller's clock.
-    fn set_row_times(&self, ino: Ino, mtime: Option<FileTime>, now: i64) -> Result<(), Errno> {
+    fn set_row_times(
+        &self,
+        ino: Ino,
+        atime: Option<i64>,
+        mtime: Option<FileTime>,
+        now: i64,
+    ) -> Result<(), Errno> {
         let mtime = mtime.map(|t| t.resolve(now));
         self.db()
             .prepare_cached(
-                "UPDATE inodes SET mtime_ns = coalesce(?2, mtime_ns), ctime_ns = ?3 WHERE ino = ?1",
+                "UPDATE inodes SET mtime_ns = coalesce(?2, mtime_ns), ctime_ns = ?3,
+                        atime_ns = coalesce(?4, atime_ns, mtime_ns) WHERE ino = ?1",
             )
-            .and_then(|mut st| st.execute(params![ino, mtime, now]))
+            .and_then(|mut st| st.execute(params![ino, mtime, now, atime]))
             .map_err(db_err)?;
         self.touch_ino(ino);
         Ok(())
@@ -2295,7 +2405,23 @@ impl Store {
     /// Opens regular file `ino`'s object (its own, or the one it shares); `flags` are host open
     /// flags.
     fn object(&self, ino: Ino, flags: i32) -> Result<File, Errno> {
-        self.open_number(self.data(ino)?.object, flags)
+        let data = self.data(ino)?;
+        let file = self.open_number(data.object, flags)?;
+        if data.atime.is_none() && data.held.is_none() {
+            // Preserve a legacy object's access time before its first read on this host.
+            self.statement(|s| {
+                let atime = open_atime(&file)?;
+                s.db()
+                    .prepare_cached(
+                        "UPDATE inodes SET atime_ns = ?2 WHERE ino = ?1 AND atime_ns IS NULL",
+                    )
+                    .and_then(|mut st| st.execute(params![ino, atime]))
+                    .map_err(db_err)?;
+                s.touch_ino(ino);
+                Ok(())
+            })?;
+        }
+        Ok(file)
     }
 
     /// Opens object `object` (relative to the `objects` directory, without resolving the whole
@@ -2369,11 +2495,15 @@ impl Store {
             // The source's times move into the database as they are
             if sdata.held.is_none() {
                 let o = s.object_stat(sdata.object)?;
-                s.hold(src, sdata.object, (o.atime_ns, o.mtime_ns, o.ctime_ns))?;
+                s.hold(
+                    src,
+                    sdata.object,
+                    (sdata.atime.unwrap_or(o.atime_ns), o.mtime_ns, o.ctime_ns),
+                )?;
             }
             // The destination keeps its access time (Linux's file_modified changes the other two)
             let now = s.filesystem_now()?;
-            let atime = match ddata.held {
+            let atime = match ddata.atime.or(ddata.held) {
                 Some(atime) => atime,
                 None => s.object_stat(ddata.object).map_or(now, |o| o.atime_ns),
             };
@@ -2391,11 +2521,11 @@ impl Store {
     pub fn unshare(&self, ino: Ino, keep: Option<u64>) -> Result<Option<Unshare>, Errno> {
         self.transaction(|s| {
             let (st, data) = s.query_row(ino)?;
-            let Some(atime) = data.held else {
+            if data.held.is_none() {
                 return Ok(None);
-            };
+            }
             if s.users_of(data.object)? <= 1 {
-                s.settle(ino, data.object, (atime, st.mtime_ns))?;
+                s.settle(ino, data.object, (st.atime_ns, st.mtime_ns))?;
                 return Ok(None);
             }
             let from = s.open_number(data.object, libc::O_RDONLY)?;
@@ -2430,10 +2560,10 @@ impl Store {
         let (from, to) = job.objects;
         let r = self.transaction(|s| {
             let (st, data) = s.query_row(job.ino)?;
-            let (Some(atime), true) = (data.held, data.object == from) else {
+            if data.held.is_none() || data.object != from {
                 return Err(Errno::EAGAIN);
-            };
-            s.settle(job.ino, to, (atime, st.mtime_ns))?;
+            }
+            s.settle(job.ino, to, (st.atime_ns, st.mtime_ns))?;
             if !s.object_used(from)? {
                 s.doomed.borrow_mut().push(from);
             }
@@ -2485,8 +2615,10 @@ impl Store {
         (atime, mtime, ctime): (i64, i64, i64),
     ) -> Result<(), Errno> {
         self.db()
-            .prepare_cached("UPDATE inodes SET mtime_ns = ?2, ctime_ns = ?3 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![ino, mtime, ctime]))
+            .prepare_cached(
+                "UPDATE inodes SET atime_ns = ?4, mtime_ns = ?2, ctime_ns = ?3 WHERE ino = ?1",
+            )
+            .and_then(|mut st| st.execute(params![ino, mtime, ctime, atime]))
             .map_err(db_err)?;
         self.db()
             .prepare_cached(
@@ -2559,7 +2691,7 @@ impl Store {
     /// The host's times of object `object`.
     fn object_stat(&self, object: Ino) -> Result<Stat, Errno> {
         let mut st = Stat::default();
-        fill_from_host(&mut st, &self.meta.objects_dir, Data { object, held: None })?;
+        fill_from_host(&mut st, &self.meta.objects_dir, Data::own(object))?;
         Ok(st)
     }
 
@@ -2669,7 +2801,11 @@ impl Drop for Op<'_> {
                         }
                         Fill::Row(st) => {
                             let ino = st.ino;
-                            c.rows.insert(ino, (st, Data::own(ino)));
+                            let data = Data {
+                                atime: Some(st.atime_ns),
+                                ..Data::own(ino)
+                            };
+                            c.rows.insert(ino, (st, data));
                         }
                     }
                 }
@@ -2822,20 +2958,35 @@ impl Reader<'_> {
     }
 }
 
-/// A regular file's size and times are taken from the host object file (for ctime see the module
-/// docs), except that a held file keeps the times of its row.
 fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, data: Data) -> Result<(), Errno> {
     let mut name = [0u8; 21];
-    let o = appine_hal::stat_at(objects_dir.as_raw_fd(), object_name(data.object, &mut name))
+    let host = appine_hal::stat_at(objects_dir.as_raw_fd(), object_name(data.object, &mut name))
         .map_err(Errno)?;
-    st.size = o.st_size as u64;
-    st.blocks = Some(o.st_blocks as u64);
-    if data.held.is_none() {
-        st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
-        st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
-        st.ctime_ns = o.st_ctime * 1_000_000_000 + o.st_ctime_nsec;
-    }
+    fill_from_object(st, &host, data);
     Ok(())
+}
+
+/// Read size and blocks from the backing object, and its timestamps where the store defers to it.
+fn fill_from_object(st: &mut Stat, host: &libc::stat, data: Data) {
+    st.size = host.st_size as u64;
+    st.blocks = Some(host.st_blocks as u64);
+    if data.held.is_none() {
+        st.atime_ns = data
+            .atime
+            .unwrap_or_else(|| timestamp_ns(host.st_atime, host.st_atime_nsec));
+        st.mtime_ns = timestamp_ns(host.st_mtime, host.st_mtime_nsec);
+        st.ctime_ns = timestamp_ns(host.st_ctime, host.st_ctime_nsec);
+    }
+}
+
+fn timestamp_ns(seconds: i64, nanos: i64) -> i64 {
+    // The seconds term can exceed i64 even when adding the fractional part brings it into range.
+    (i128::from(seconds) * 1_000_000_000 + i128::from(nanos)) as i64
+}
+
+fn open_atime(file: &File) -> Result<i64, Errno> {
+    let host = appine_hal::fstat(file.as_raw_fd()).map_err(Errno)?;
+    Ok(timestamp_ns(host.st_atime, host.st_atime_nsec))
 }
 
 // ---- Cache entries and hashing ----
@@ -2886,11 +3037,12 @@ type Map<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
 
 /// Where a regular file's data and times are (module docs): `object` is the number of the object
 /// holding its data, its own unless it uses another's, and `held` its access time while it is held
-/// (its other times are then the row's too).
+/// (a legacy fallback). `atime` is the guest access time stored in the inode row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Data {
     object: Ino,
     held: Option<i64>,
+    atime: Option<i64>,
 }
 
 impl Data {
@@ -2899,13 +3051,14 @@ impl Data {
         Data {
             object: ino,
             held: None,
+            atime: None,
         }
     }
 
     /// Whether inode `ino`, so described, has a row in `shared` (one that would only repeat
     /// [`Data::own`] is never kept).
     fn listed(&self, ino: Ino) -> bool {
-        *self != Data::own(ino)
+        self.object != ino || self.held.is_some()
     }
 }
 
@@ -3213,17 +3366,6 @@ fn now_ns() -> i64 {
         .unwrap_or(0)
 }
 
-/// [`fill_from_host`] from an open object; `held` is the file's access time if it is held.
-fn fill_from_object(st: &mut Stat, meta: &fs::Metadata, held: Option<i64>) {
-    st.size = meta.len();
-    st.blocks = Some(meta.blocks());
-    if held.is_none() {
-        st.mtime_ns = meta.modified().map(to_ns).unwrap_or(st.mtime_ns);
-        st.atime_ns = meta.accessed().map(to_ns).unwrap_or(st.mtime_ns);
-        st.ctime_ns = meta.ctime() * 1_000_000_000 + meta.ctime_nsec();
-    }
-}
-
 /// Copies `len` bytes of object `from` into the empty object `to`, leaving holes where the host
 /// reports them, and makes `to` that long ([`Unshare`], overlay copy-up).
 pub(crate) fn copy_object(from: &File, to: &File, len: u64) -> Result<(), Errno> {
@@ -3252,13 +3394,6 @@ pub(crate) fn copy_object(from: &File, to: &File, len: u64) -> Result<(), Errno>
         pos = hole.max(data + 1);
     }
     to.set_len(len).map_err(io_err)
-}
-
-fn to_ns(t: SystemTime) -> i64 {
-    match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_nanos() as i64,
-        Err(e) => -(e.duration().as_nanos() as i64),
-    }
 }
 
 /// An error operating on an object on the host (a host error code).
@@ -3320,6 +3455,47 @@ mod tests {
         // regardless of how fast the machine is
         s.delay = Duration::from_secs(3600);
         (s, dir)
+    }
+
+    #[test]
+    fn legacy_atime_survives_host_reads_and_copy_up() {
+        let (s, dir) = temp_store("legacy-atime");
+        let (a, _) = s.create_file(ROOT, b"a", 0o644, 0, 0).unwrap();
+        let (b, _) = s.create_file(ROOT, b"b", 0o644, 0, 0).unwrap();
+        let (c, _) = s.create_file(ROOT, b"c", 0o644, 0, 0).unwrap();
+        s.share(b, c).unwrap();
+        let old = 1_000_000_000;
+        s.set_times(a, Some(FileTime::At(old)), None).unwrap();
+        s.commit().unwrap();
+        drop(s);
+        Connection::open(dir.join("meta.db"))
+            .unwrap()
+            .execute_batch("ALTER TABLE inodes DROP COLUMN atime_ns")
+            .unwrap();
+
+        let s = Store::open(&dir, &[]).unwrap();
+        let held_time = s.stat(c).unwrap().atime_ns;
+        s.make_private(c, None).unwrap();
+        assert_eq!(s.data(c).unwrap().atime, Some(held_time));
+        let parent_atime = s.stat(ROOT).unwrap().mtime_ns;
+        s.mkdir(ROOT, b"child", 0o755, 0, 0).unwrap();
+        assert_eq!(s.stat(ROOT).unwrap().atime_ns, parent_atime);
+        let file = s.open_object(a, false).unwrap();
+        appine_hal::set_times_fd(file.as_raw_fd(), Some(appine_hal::TIME_NOW), None).unwrap();
+        assert_eq!(s.stat_open(a, &file).unwrap().atime_ns, old);
+        s.share(a, b).unwrap();
+        let alias_time = s.stat(b).unwrap().atime_ns;
+        s.accessed(a, Some(&file), false).unwrap();
+        let updated = s.stat(a).unwrap().atime_ns;
+        assert!(updated > old);
+        s.make_private(a, None).unwrap();
+        assert_eq!(s.stat(b).unwrap().atime_ns, alias_time);
+        s.commit().unwrap();
+        drop(s);
+        let s = Store::open(&dir, &[]).unwrap();
+        assert_eq!(s.stat(a).unwrap().atime_ns, updated);
+        drop(s);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// A store belonging to a running kernel ([`Store::guard_with_bkl`]) may be used only while
@@ -4076,7 +4252,7 @@ mod tests {
         assert_eq!(read(&s, a), b"shared data");
         // a, the last one, takes the object back with its times, without a copy
         s.make_private(a, None).unwrap();
-        assert_eq!(s.data(a).unwrap(), Data::own(a));
+        assert!(!s.data(a).unwrap().listed(a));
         let st = s.stat(a).unwrap();
         assert_eq!((st.atime_ns, st.mtime_ns), (1_000_000_000, 2_000_000_000));
         s.commit().unwrap();

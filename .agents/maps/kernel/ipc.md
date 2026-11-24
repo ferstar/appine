@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: charge POSIX queue capacity by real uid across IPC namespaces until inode release)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: local result copies after dequeuing SysV and POSIX messages)
 
 ## Responsibilities
 
@@ -278,8 +278,8 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   because the calling task holds its `IpcNs`.
 - SysV waiters wake on any kernel change and redo the lookup and permission checks, so an IPC_SET
   during a semop wait can end it with `EACCES`, and waiters are served in no particular order.
-- msgrcv and mq_timedreceive dequeue before copying out, so a fault loses the message (as on
-  Linux).
+- After dequeue, `msgrcv` and `mq_timedreceive` retry each result copy locally across FUSE
+  page fills. A terminal copy fault loses the selected message. Later messages stay queued.
 - `shmmni` counts destroyed segments that are still attached.
 - An unlinked queue that is still open no longer counts toward `queues_max` and still reports
   nlink 1.

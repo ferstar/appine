@@ -785,10 +785,10 @@ pub(crate) fn open_open_file(
     cred: &Cred,
     f: &crate::fd::OpenFile,
 ) -> Result<(Executable, Stat, bool), Errno> {
-    let crate::fd::FileKind::Regular { ino, file, .. } = &f.kind else {
+    let Some((ino, file, _)) = f.regular_backing() else {
         return Err(Errno::EACCES);
     };
-    let st = vfs.store().stat_open(*ino, file)?;
+    let st = vfs.store().stat_open(ino, file)?;
     if st.kind() != mode::S_IFREG {
         return Err(Errno::EACCES);
     }
@@ -796,7 +796,7 @@ pub(crate) fn open_open_file(
     let flags = if f.pseudo {
         0
     } else {
-        vfs.mount_flags(&Node::Store(f.mnt, *ino)).unwrap_or(0)
+        vfs.mount_flags(&Node::Store(f.mnt, ino)).unwrap_or(0)
     };
     if flags & crate::vfs::ms::NOEXEC != 0 {
         return Err(Errno::EACCES);

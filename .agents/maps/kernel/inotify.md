@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: last-close events for named pipes and magic-link reopens)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: O_PATH dentry tracking and renamed proc fd links)
 
 ## Responsibilities
 
@@ -109,7 +109,8 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   fd-based events (I/O, truncation, close) go to the directory and name the open went through,
   recorded in `Opened` (the dentry a Linux open file references): every non-`O_PATH` open of a
   regular file, named FIFO, device or directory (store, overlay, FUSE, cgroup2 directories) or FUSE file
-  records one, whether or not watches exist. A reopened FIFO gets its own record at the original dentry. Cgroup2 files
+  records one, whether or not watches exist. Store, overlay and FUSE `O_PATH` fds track the dentry
+  with a zero close mask and emit no open or close event. A reopened FIFO gets its own record at the original dentry. Cgroup2 files
   report `IN_OPEN` and never `IN_CLOSE_*`. Unlinks and renames update the records of open files,
   looking up records for the affected key even with no watches; after a deletion the records stay (marked
   unlinked), so non-excluded events still go to the original directory.

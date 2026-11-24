@@ -410,9 +410,13 @@ fn open_path_with(
     // A file was created and opened in a FUSE filesystem
     let mut fuse_created = None;
     // parent is the last directory and name passed through, for reporting inotify events
-    let (node, created, parent) = match resolved {
+    let mut unlinked_name = false;
+    let (mut node, created, parent) = match resolved {
         Ok(_) if excl => return Err(Errno::EEXIST),
-        Ok((node, found)) => (node, None, found),
+        Ok((node, found)) => {
+            unlinked_name = found.as_ref().is_some_and(|d| d.unlinked);
+            (node, None, found.map(|d| d.entry))
+        }
         Err(e) if e == Errno::ENOENT && create => {
             // When the last component is a dangling symlink, follow it and create the target
             // file, as on Linux
@@ -556,77 +560,71 @@ fn open_path_with(
     }
     let was_created = created.is_some() || fuse_created.is_some();
     let via_devpts = matches!(node, Node::Pseudo(_, PseudoNode::Pts(..)));
-    let mut opened_ino = inotify::key_of(&node).filter(|_| flags & oflags::O_PATH == 0);
-    // A file without a name reopened through /proc/<pid>/fd or exe is the same file again, as
-    // Linux reopens its dentry: on the mount it was opened or run through, with the path it shows
-    // (`/memfd:<name> (deleted)`, `pipe:[<n>]`). Being opened, it counts as a writer
-    // ([`OpenFile::pseudo`] stays unset)
+    let mut opened_ino = inotify::key_of(&node);
+    let path_only = flags & oflags::O_PATH != 0;
+    let mut opened_mnt = match &node {
+        Node::Store(mnt, _) | Node::Fuse(mnt, _) | Node::Pseudo(mnt, PseudoNode::Mq(..)) => {
+            Some(*mnt)
+        }
+        _ => None,
+    };
     let mut fifo_open = None;
-    let reopened = match &node {
-        Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) if flags & oflags::O_PATH == 0 => {
-            cx.view(&vfs).open_file(*proc, *tid, *fd).map(|f| {
-                let f = f.borrow();
-                let ino = match f.kind {
-                    FileKind::Pipe(_) => {
-                        fifo_open = f.watch.clone();
-                        None
-                    }
-                    FileKind::Regular { ino, .. } => Some(ino),
-                    _ => None,
-                };
-                let unlinked = f.watch.as_ref().is_some_and(inotify::Opened::is_unlinked)
-                    || ino.is_some_and(|i| vfs.store().attrs(i).is_ok_and(|st| st.nlink == 0));
-                (f.mnt, f.path.clone(), ino, unlinked)
-            })
+    let mut path_object = None;
+    let mut mq_path = None;
+    // A magic-link reopen uses the source mount, dentry and object.
+    match &node {
+        Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
+            let source = cx
+                .view(&vfs)
+                .open_file(*proc, *tid, *fd)
+                .ok_or(Errno::ENOENT)?;
+            let source = source.borrow();
+            let backing = source.regular_backing();
+            if !path_only || backing.is_some() {
+                opened_mnt = Some(source.mnt);
+                display = source.path.clone();
+                opened_ino = backing.map(|(ino, ..)| ino);
+                unlinked_name |= path_only
+                    || source.dentry_unlinked()
+                    || opened_ino
+                        .is_some_and(|ino| vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0));
+            }
+            if path_only {
+                if let Some((ino, host, writable)) = backing {
+                    // Pin the object before the source fd number can be reused.
+                    path_object = Some((host.try_clone().map_err(host_errno)?, writable));
+                    node = Node::Store(source.mnt, ino);
+                } else {
+                    mq_path = source.message_queue().cloned();
+                }
+            } else if matches!(source.kind, FileKind::Pipe(_)) {
+                fifo_open = source.watch.clone();
+            }
         }
-        Node::Pseudo(_, PseudoNode::OpenExe(proc)) if flags & oflags::O_PATH == 0 => {
-            exe_file(cx, *proc).ok().and_then(|e| {
-                let (mnt, ino) = e.node?;
-                let unlinked = vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0);
-                Some((mnt, Some(e.path.clone()), Some(ino), unlinked))
-            })
+        Node::Pseudo(_, PseudoNode::OpenExe(proc)) if !path_only => {
+            if let Ok(exe) = exe_file(cx, *proc)
+                && let Some((mnt, ino)) = exe.node
+            {
+                opened_mnt = Some(mnt);
+                display = Some(exe.path.clone());
+                opened_ino = Some(ino);
+                unlinked_name |= vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0);
+            }
         }
-        _ => None,
-    };
-    let reopened_unlinked = reopened.as_ref().is_some_and(|r| r.3)
-        || matches!(node, Node::Overlay(_, o) if !vfs.overlay().linked(o));
-    if let Some((mnt, path, ino, _)) = &reopened {
-        display = path.clone();
-        opened_ino = ino.and_then(|ino| inotify::key_of(&Node::Store(*mnt, ino)));
+        _ => {}
     }
-    // Files in the store record the mount they were reached through ([`OpenFile::mnt`]), and
-    // those in an overlay their overlay node too ([`OpenFile::ovl`])
-    let store_mnt = node.ino().map(|_| node.mnt());
-    let fuse_mnt = match &node {
-        Node::Fuse(mnt, _) => Some(*mnt),
-        _ => None,
-    };
+    unlinked_name |= matches!(node, Node::Overlay(_, o) if !vfs.overlay().linked(o));
     let overlay = match &node {
         Node::Overlay(mnt, o) => Some((*mnt, *o)),
         _ => None,
     };
-    let mq_mnt = match &node {
-        Node::Pseudo(mnt, PseudoNode::Mq(..)) => Some(*mnt),
-        _ => None,
-    };
-    let mut mq_path = None;
-    let kind = if flags & oflags::O_PATH != 0 {
+    let kind = if path_only {
         if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
         }
-        mq_path = match &node {
-            Node::Pseudo(_, PseudoNode::Mq(ns, ino)) => Some(mq_queue(cx, *ns, *ino)?),
-            Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
-                cx.view(&vfs).open_file(*proc, *tid, *fd).and_then(|f| {
-                    let f = f.borrow();
-                    match &f.kind {
-                        FileKind::MessageQueue(q) => Some(q.clone()),
-                        _ => f.mq_path.clone(),
-                    }
-                })
-            }
-            _ => None,
-        };
+        if let Node::Pseudo(_, PseudoNode::Mq(ns, ino)) = &node {
+            mq_path = Some(mq_queue(cx, *ns, *ino)?);
+        }
         FileKind::Path(node)
     } else {
         match node {
@@ -676,41 +674,26 @@ fn open_path_with(
         )
     });
     let file = OpenFile::with_path(kind, flags & kept(flags) | largefile(flags), display);
-    file.borrow_mut().mq_path = mq_path;
-    if let Some(mnt) = store_mnt {
-        file.borrow_mut().mnt = mnt;
-    }
-    if let Some((mnt, ..)) = reopened {
-        file.borrow_mut().mnt = mnt;
-    }
-    if let Some(mnt) = fuse_mnt {
+    {
         let mut f = file.borrow_mut();
+        f.path_object = path_object;
+        f.mq_path = mq_path;
         f.pin_fuse_path(&vfs)?;
-        f.mnt = mnt;
+        if let Some(mnt) = opened_mnt {
+            f.mnt = mnt;
+        }
+        if let Some((mnt, o)) = overlay {
+            f.mnt = mnt;
+            f.ovl = Some(o);
+            f.hold(&Node::Overlay(mnt, o));
+        }
+        if let Some((dir, _)) = &parent {
+            f.hold(dir);
+        }
+        f.dentry = parent.clone();
     }
-    if let Some(mnt) = mq_mnt {
-        file.borrow_mut().mnt = mnt;
-    }
-    if let Some((mnt, o)) = overlay {
-        let mut f = file.borrow_mut();
-        f.mnt = mnt;
-        f.ovl = Some(o);
-        f.hold(&Node::Overlay(mnt, o));
-    }
-    if let Some((dir, _)) = &parent {
-        file.borrow_mut().hold(dir);
-    }
-    file.borrow_mut().dentry = parent.clone();
     if let Some(ino) = opened_ino {
-        open_events(
-            cx,
-            &file,
-            ino,
-            parent,
-            was_created,
-            flags,
-            reopened_unlinked,
-        );
+        open_events(cx, &file, ino, parent, was_created, flags, unlinked_name);
     } else if let Some(source) = fifo_open {
         let watch = source.reopen(cx.kr(), file.borrow().writable());
         file.borrow_mut().watch = Some(watch);
@@ -1022,11 +1005,7 @@ fn reopen(
     let accmode = flags & oflags::O_ACCMODE;
     let file = cx.view(vfs).open_file(proc, tid, fd).ok_or(Errno::ENOENT)?;
     let f = file.borrow();
-    let mq = match &f.kind {
-        FileKind::MessageQueue(q) => Some(q),
-        _ => f.mq_path.as_ref(),
-    };
-    if let Some(q) = mq {
+    if let Some(q) = f.message_queue() {
         if flags & oflags::O_DIRECTORY != 0 {
             return Err(Errno::ENOTDIR);
         }
@@ -1034,20 +1013,16 @@ fn reopen(
         return Ok(FileKind::MessageQueue(q.clone()));
     }
 
-    if let FileKind::Regular {
-        ino, file: host, ..
-    } = &f.kind
-    {
-        let ino = *ino;
+    if let Some((ino, host, writable)) = f.regular_backing() {
         if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
-            check_seals(cx, &f, false, |_| 0)?;
+            seals_permit(cx, ino, host, false, |_| 0)?;
         }
         // The host fd is always readable, and also writable when originally opened for write: if
         // that suffices, duplicate it (reads and writes are positional, with offsets kept by each
         // open file). Otherwise reopen it through the host's /proc/self/fd; deleted files cannot
         // be opened that way on filesystems like virtiofs. A held file's descriptions only read
         // the shared object (open_store)
-        let new = if accmode == oflags::O_RDONLY || f.writable() || vfs.store().held(ino)? {
+        let new = if accmode == oflags::O_RDONLY || writable || vfs.store().held(ino)? {
             host.try_clone()
         } else {
             std::fs::OpenOptions::new()
@@ -1136,7 +1111,7 @@ fn open_events(
         _ => None,
     };
     let parent = parent.and_then(|(dir, name)| Some((inotify::key_of(&dir)?, name)));
-    if inotify::active(k) {
+    if flags & oflags::O_PATH == 0 && inotify::active(k) {
         if let (Some(up), Some((_, name))) = (upper, &parent) {
             inotify::dir_event(k, up, name, inotify::IN_CREATE, 0);
         }
@@ -1899,6 +1874,16 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
         F_SETFL => {
             let async_on = {
                 let mut f = file.borrow_mut();
+                if arg as u32 & oflags::O_NOATIME != 0 && f.flags & oflags::O_NOATIME == 0 {
+                    let owner = match f.node() {
+                        Some(Node::Store(_, ino)) => Some(cx.vfs()?.store().attrs(ino)?),
+                        Some(Node::Overlay(_, o)) => Some(cx.vfs()?.overlay_stat(o)?),
+                        _ => None,
+                    };
+                    if owner.is_some_and(|st| !cx.cred().owns(&st)) {
+                        return Err(Errno::EPERM);
+                    }
+                }
                 f.flags = (f.flags & !oflags::SETFL_MASK) | (arg as u32 & oflags::SETFL_MASK);
                 f.flags & oflags::O_ASYNC != 0
             };
@@ -2766,6 +2751,9 @@ pub(super) fn splice(
         }
     };
     let (src, dst) = (read_off(cx, off_in)?, read_off(cx, off_out)?);
+    if src.is_some() && matches!(input.borrow().kind, FileKind::Socket(_)) {
+        return Err(Errno::EINVAL);
+    }
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
     let wrote = match (in_pipe, out_pipe) {
         (Some((from, _)), Some((to, _))) => {
@@ -3644,6 +3632,9 @@ pub(super) fn sendfile(
     }
     if let Some(r) = copy_regular(cx, &input, off, &output, None, count) {
         let n = r?;
+        if count > 0 {
+            file_accessed(cx, &input.borrow());
+        }
         if n > 0 {
             write_sync(cx, &output, 0)?;
         }
@@ -4505,9 +4496,13 @@ fn read_bytes_inner(
             follow_copy_up(cx, file)?;
             let regular = regular_fd(&file.borrow());
             let n = match regular {
-                Some(fd) => unlocked_io(cx, file, fd, (offset, pos_held), |fd, pos| {
-                    appine_hal::pread(fd, buf, pos)
-                })?,
+                Some(fd) => {
+                    let n = unlocked_io(cx, file, fd, (offset, pos_held), |fd, pos| {
+                        appine_hal::pread(fd, buf, pos)
+                    })?;
+                    file_accessed(cx, &file.borrow());
+                    n
+                }
                 None => {
                     if !buf.is_empty() {
                         refresh_pseudo(cx, file, offset)?;
@@ -4520,6 +4515,18 @@ fn read_bytes_inner(
             }
             Ok(n)
         }
+    }
+}
+
+/// Apply the access policy of the open description and its current mount.
+pub(super) fn file_accessed(cx: &Cx<'_>, f: &OpenFile) {
+    if f.flags & oflags::O_NOATIME != 0 {
+        return;
+    }
+    if let FileKind::Regular { ino, file, .. } = &f.kind
+        && let Ok(vfs) = cx.vfs()
+    {
+        vfs.accessed(f.mnt, *ino, Some(file));
     }
 }
 
@@ -5388,6 +5395,8 @@ fn replace_object(f: &mut OpenFile, object: std::fs::File, held: bool) {
     if let FileKind::Regular { file, cow, .. } = &mut f.kind {
         f.retired.push(std::mem::replace(file, object));
         *cow = cow_now;
+    } else if let Some(pin) = &mut f.path_object {
+        *pin = (object, false);
     }
 }
 
@@ -5399,9 +5408,11 @@ pub(super) fn reconcile_mapping(k: &Kernel, ino: Ino, object: &std::fs::File) ->
     let current = object.metadata().map_err(host_errno)?;
     for handle in opens_of(k, ino) {
         let mut f = handle.try_borrow_mut().map_err(|_| Errno::EBUSY)?;
-        if let FileKind::Regular { file, cow, .. } = &f.kind {
+        if let Some((_, file, _)) = f.regular_backing() {
             let old = file.metadata().map_err(host_errno)?;
-            if *cow || (old.dev(), old.ino()) != (current.dev(), current.ino()) {
+            if matches!(f.kind, FileKind::Regular { cow: true, .. })
+                || (old.dev(), old.ino()) != (current.dev(), current.ino())
+            {
                 let fresh = std::fs::OpenOptions::new()
                     .read(true)
                     .write(f.writable())
@@ -5434,7 +5445,7 @@ fn opens_of(k: &crate::kernel::Kernel, ino: Ino) -> Vec<FileRef> {
     for f in all {
         let ours = f
             .try_borrow()
-            .is_ok_and(|f| matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino));
+            .is_ok_and(|f| f.regular_backing().is_some_and(|(i, ..)| i == ino));
         if ours && !out.iter().any(|o| Rc::ptr_eq(o, &f)) {
             out.push(f);
         }
@@ -5632,14 +5643,20 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
     if f.flags & oflags::O_PATH != 0 {
         return Err(Errno::EBADF);
     }
-    let OpenFile { kind, pos, .. } = &mut *f;
+    let OpenFile {
+        kind, pos, flags, ..
+    } = &mut *f;
     let FileKind::Directory { node, entries, .. } = kind else {
         return Err(Errno::ENOTDIR);
     };
-    if let Node::Store(_, ino) = node
-        && cx.vfs()?.store().stat(*ino)?.nlink == 0
-    {
-        return Err(Errno::ENOENT);
+    if let Node::Store(mnt, ino) = node {
+        let vfs = cx.vfs()?;
+        if vfs.store().attrs(*ino)?.nlink == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if *flags & oflags::O_NOATIME == 0 {
+            vfs.accessed(*mnt, *ino, None);
+        }
     }
     let count = count as u32 as usize;
     if entries.is_none() {
@@ -6528,6 +6545,17 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
         let q = q.borrow();
         return Ok(encode_stat(&q.stat(), cx.vfs()?.mq_dev(q.ns)));
     }
+    if let Some((ino, file, _)) = f.regular_backing() {
+        let vfs = cx.vfs()?;
+        let dev = vfs.dev_of(&Node::Store(f.mnt, ino));
+        let mut st = vfs.store().stat_open(ino, file)?;
+        vfs.tmpfs_stat_blocks(ino, Some(file), &mut st)?;
+        // Through an overlay: the inode number stat shows for its node
+        if let Some(o) = f.ovl {
+            st.ino = vfs.overlay().shown_ino(o);
+        }
+        return Ok(encode_stat(&st, dev));
+    }
     let anon = |ino: u64, mode: u32, rdev: u64, dev: u64| {
         let st = Stat {
             ino,
@@ -6603,17 +6631,6 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
             // The device number is that of the devpts instance the terminal is in (ttyname
             // compares it with that of /dev/pts/<n>)
             Ok(encode_stat(&st, t.fs))
-        }
-        FileKind::Regular { ino, file, .. } => {
-            let vfs = cx.vfs()?;
-            let dev = vfs.dev_of(&Node::Store(f.mnt, *ino));
-            let mut st = vfs.store().stat_open(*ino, file)?;
-            vfs.tmpfs_stat_blocks(*ino, Some(file), &mut st)?;
-            // Through an overlay: the inode number stat shows for its node
-            if let Some(o) = f.ovl {
-                st.ino = vfs.overlay().shown_ino(o);
-            }
-            Ok(encode_stat(&st, dev))
         }
         FileKind::Path(node) => {
             let vfs = cx.vfs()?;
@@ -7251,12 +7268,14 @@ pub(super) fn linkat(
                 .open_file(proc, tid, fd)
                 .ok_or(Errno::ENOENT)?;
             let f = file.borrow();
-            match &f.kind {
-                // A memfd is on no mount of the caller's (Linux's internal shm mount): EXDEV
-                FileKind::Regular { ino, .. } if !f.pseudo && f.ovl.is_none() => {
-                    Node::Store(f.mnt, *ino)
-                }
-                _ => Node::Pseudo(f.mnt, PseudoNode::OpenFd(proc, tid, fd)),
+            // A memfd is on no mount of the caller's (Linux's internal shm mount): EXDEV
+            if let Some((ino, ..)) = f.regular_backing()
+                && !f.pseudo
+                && f.ovl.is_none()
+            {
+                Node::Store(f.mnt, ino)
+            } else {
+                Node::Pseudo(f.mnt, PseudoNode::OpenFd(proc, tid, fd))
             }
         }
         src => src,
@@ -7487,10 +7506,13 @@ pub(super) fn renameat2(
         flags & RENAME_NOREPLACE != 0,
         exchange,
     )?;
+    if moving == overwritten {
+        return Ok(0);
+    }
     tmpfs_removed(cx, &vfs, replaced);
     // Detach the mounts of other namespaces on the overwritten target
     let k = cx.kr();
-    if !exchange && overwritten != moving {
+    if !exchange {
         release_if_closed(cx, &vfs, held);
         detach_points(cx, &vfs, overwritten, (new_dir, new_name));
         if let Some(ino) = overwritten {
@@ -8364,18 +8386,17 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
                 .open_file(proc, tid, fd)
                 .ok_or(Errno::ENOENT)?;
             let f = file.borrow();
-            match &f.kind {
-                FileKind::Regular {
-                    ino, file: host, ..
-                } if f.ovl.is_none() => {
-                    let host = host.try_clone().map_err(host_errno)?;
-                    (Node::Store(f.mnt, *ino), f.pseudo, Some(host))
-                }
-                _ => (
+            if let Some((ino, host, _)) = f.regular_backing()
+                && f.ovl.is_none()
+            {
+                let host = host.try_clone().map_err(host_errno)?;
+                (Node::Store(f.mnt, ino), f.pseudo, Some(host))
+            } else {
+                (
                     Node::Pseudo(proc_mnt, PseudoNode::OpenFd(proc, tid, fd)),
                     false,
                     None,
-                ),
+                )
             }
         }
         node => (node, false, None),

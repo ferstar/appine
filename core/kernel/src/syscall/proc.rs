@@ -19,7 +19,7 @@ use crate::process::{self, ExitStatus, Signal, ThreadGroup};
 use crate::signal::{self, AltStack, SigInfo, code};
 use crate::task::{self, FsContext, Task, TaskState};
 use crate::uaccess::UserSlice;
-use crate::vfs::store::{Ino, mode};
+use crate::vfs::store::{Ino, Stat, mode};
 use crate::vfs::{Dentry, Node, Pseudo, Vfs, normalize};
 
 const CLONE_VM: u64 = 0x100;
@@ -710,7 +710,7 @@ fn exec(
                 comm.clone_from(&exe_at.1);
             }
             let node = f.node().ok_or(Errno::EACCES)?;
-            if matches!(f.kind, FileKind::Regular { .. }) {
+            if f.regular_backing().is_some() {
                 by_file = Some(file.clone());
             }
             (node, f.dentry.clone())
@@ -728,7 +728,7 @@ fn exec(
                 let node = f.node().ok_or(Errno::EACCES)?;
                 let shown = f.path.as_deref().unwrap_or_default();
                 exe_at.1 = shown.strip_suffix(b" (deleted)").unwrap_or(shown).to_vec();
-                if matches!(f.kind, FileKind::Regular { .. }) {
+                if f.regular_backing().is_some() {
                     by_file = Some(file.clone());
                 }
                 (node, f.dentry.clone())
@@ -792,12 +792,29 @@ fn exec(
     if argv.is_empty() {
         argv.push(Vec::new());
     }
-    opens.accessed(cx.kr(), usize::from(!file.head().is_empty()));
+    // A cached executable still has a guest header read on this mount.
+    let read_header =
+        |file: &loader::Executable, st: &Stat, node: &Node, opens: &mut inotify::ExecOpens| {
+            opens.accessed(cx.kr(), usize::from(!file.head().is_empty()));
+            let mnt = match node {
+                Node::Store(m, _) | Node::Overlay(m, _) => Some(*m),
+                Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(_)) => {
+                    from.as_ref().and_then(|e| e.mnt())
+                }
+                _ => None,
+            };
+            if let Some(mnt) = mnt
+                && let Some(host) = file.host()
+            {
+                vfs.accessed(mnt, st.ino, Some(&host));
+            }
+        };
+    read_header(&file, &st, &node, opens);
     let script = parse_shebang(file.head()).is_some();
     let open_interp = |path: &[u8], opens: &mut inotify::ExecOpens| {
         let (node, dentry) = vfs.walk(&view, &cred, &root, &cwd, path, true)?;
         let (file, st, nosuid) = open_exec(&node, dentry, None, None, opens)?;
-        opens.accessed(cx.kr(), usize::from(!file.head().is_empty()));
+        read_header(&file, &st, &node, opens);
         Ok((file, st, nosuid, matches!(node, Node::Overlay(..))))
     };
 

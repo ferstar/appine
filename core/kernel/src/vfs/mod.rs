@@ -89,6 +89,13 @@ impl Node {
 /// A directory and one name in it.
 pub(crate) type Dentry = (Node, Vec<u8>);
 
+/// The final component, including a removed name reached through an open file's magic link.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WalkDentry {
+    pub entry: Dentry,
+    pub unlinked: bool,
+}
+
 /// Where a mount is mounted: [`Mount::point`] and [`Mount::at`].
 type Place = (Option<Node>, Option<Dentry>);
 
@@ -478,7 +485,7 @@ pub(crate) trait Pseudo {
     /// Through which name in which directory the open file a magic link points at was opened (a
     /// file that is not a directory has no unique parent directory; when it is a mount point,
     /// mountinfo's path is computed from this).
-    fn follow_dentry(&self, _node: &PseudoNode) -> Option<Dentry> {
+    fn follow_dentry(&self, _node: &PseudoNode) -> Option<WalkDentry> {
         None
     }
     /// Whether this is a Linux magic link (`nd_jump_link`): openat2's `RESOLVE_NO_MAGICLINKS`
@@ -1456,6 +1463,7 @@ impl Vfs {
         follow: bool,
     ) -> Result<(Node, Option<Dentry>), Errno> {
         self.walk_resolve(ps, cred, root, cwd, path, follow, 0)
+            .map(|(node, found)| (node, found.map(|d| d.entry)))
     }
 
     /// [`resolve`](Self::resolve) for `umount2` (Linux's `LOOKUP_MOUNTPOINT` + `mntput_no_expire`):
@@ -1486,7 +1494,7 @@ impl Vfs {
         path: &[u8],
         follow: bool,
         flags: u64,
-    ) -> Result<(Node, Option<Dentry>), Errno> {
+    ) -> Result<(Node, Option<WalkDentry>), Errno> {
         self.store
             .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, flags, true))
     }
@@ -1502,7 +1510,7 @@ impl Vfs {
         follow: bool,
         flags: u64,
         touch: bool,
-    ) -> Result<(Node, Option<Dentry>), Errno> {
+    ) -> Result<(Node, Option<WalkDentry>), Errno> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
@@ -1656,7 +1664,10 @@ impl Vfs {
                 }
                 continue;
             }
-            found = Some((std::mem::replace(&mut dir, node), comp));
+            found = Some(WalkDentry {
+                entry: (std::mem::replace(&mut dir, node), comp),
+                unlinked: false,
+            });
         }
         Ok((dir, found))
     }
@@ -3028,6 +3039,17 @@ impl Vfs {
     /// Flags of the mount `node` is in; None when the mount is unknown.
     pub(crate) fn mount_flags(&self, node: &Node) -> Option<u64> {
         self.with_mount(node.mnt(), |m| m.flags)
+    }
+
+    /// Account a store file read or directory listing on its open mount.
+    pub(crate) fn accessed(&self, mnt: MountId, ino: Ino, file: Option<&std::fs::File>) {
+        let skip = ms::RDONLY | ms::NOATIME | if file.is_none() { ms::NODIRATIME } else { 0 };
+        let flags = self.with_mount(mnt, |m| m.flags | (self.sb_flags(m) & ms::RDONLY));
+        if let Some(flags) = flags
+            && flags & skip == 0
+        {
+            let _ = self.store.accessed(ino, file, flags & ms::RELATIME != 0);
+        }
     }
 
     /// `node` is in a read-only mount or filesystem: changing it is EROFS.

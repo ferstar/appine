@@ -23,6 +23,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mqueue.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -39,6 +40,7 @@
 #include <sys/resource.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/msg.h>
 #include <sys/ptrace.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
@@ -447,6 +449,7 @@ static uint64_t fuse_file_node(const char *name)
         "data", "recv-data", "recv-peer", "recv-peer-len", "batch-len", "batch-data",
         "batch-peer", "rights-control", "unix-data",
         "wait-status", "wait-info", "wait4-usage", "waitid-usage",
+        "sysv-type", "sysv-text", "mq-data", "mq-priority",
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++)
         if (strcmp(name, files[i]) == 0)
@@ -833,6 +836,51 @@ static void *map_output_page(int dir, const char *name, void *at)
     return p;
 }
 
+static void sysv_receive_fuse_outputs(int dir, struct fuse_ctx *ctx)
+{
+    struct message { long type; char text[8]; };
+    const struct message first = {1, "first"}, second = {2, "second"};
+    int q = msgget(IPC_PRIVATE, 0600);
+    CHECK(q >= 0 && msgsnd(q, &first, sizeof(first.text), 0) == 0 &&
+          msgsnd(q, &second, sizeof(second.text), 0) == 0, "queue two SysV messages");
+
+    /* Place the type at the end of one cold page and the text at the start of another. */
+    char *pages = mmap(NULL, 8192, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(pages != MAP_FAILED, "reserve SysV output pages");
+    map_output_page(dir, "sysv-type", pages);
+    map_output_page(dir, "sysv-text", pages + 4096);
+    struct message *out = (void *)(pages + 4096 - offsetof(struct message, text));
+    int reads = ctx->read_ops;
+    CHECK(msgrcv(q, out, sizeof(out->text), 0, IPC_NOWAIT) == sizeof(out->text) &&
+          out->type == first.type && memcmp(out->text, first.text, sizeof(out->text)) == 0,
+          "first SysV message survives output faults");
+    CHECK(ctx->read_ops >= reads + 2, "SysV type and text both faulted");
+    CHECK(msgrcv(q, out, sizeof(out->text), 0, IPC_NOWAIT) == sizeof(out->text) &&
+          out->type == second.type && memcmp(out->text, second.text, sizeof(out->text)) == 0,
+          "second SysV message stays queued");
+    msgctl(q, IPC_RMID, NULL);
+    munmap(pages, 8192);
+}
+
+static void posix_receive_fuse_outputs(int dir, struct fuse_ctx *ctx)
+{
+    struct mq_attr attr = {.mq_maxmsg = 2, .mq_msgsize = 8};
+    mqd_t q = mq_open("/fuse-receive", O_CREAT | O_EXCL | O_RDWR | O_NONBLOCK, 0600, &attr);
+    CHECK(q != (mqd_t)-1 && mq_unlink("/fuse-receive") == 0, "create private POSIX queue");
+    CHECK(mq_send(q, "A", 1, 2) == 0 && mq_send(q, "B", 1, 1) == 0, "queue two POSIX messages");
+    char *data = map_output_page(dir, "mq-data", NULL);
+    unsigned *priority = map_output_page(dir, "mq-priority", NULL);
+    int reads = ctx->read_ops;
+    CHECK(mq_receive(q, data, 8, priority) == 1 && *data == 'A' && *priority == 2,
+          "first POSIX message survives output faults");
+    CHECK(ctx->read_ops >= reads + 2, "POSIX data and priority both faulted");
+    CHECK(mq_receive(q, data, 8, priority) == 1 && *data == 'B' && *priority == 1,
+          "second POSIX message stays queued");
+    mq_close(q);
+    munmap(data, 4096);
+    munmap(priority, 4096);
+}
+
 static void wait_fuse_outputs(int dir, struct fuse_ctx *ctx)
 {
     for (int use_id = 0; use_id < 2; use_id++) {
@@ -1042,6 +1090,8 @@ static void test_fuse_short_read_mapping(void)
     CHECK(m != MAP_FAILED, "mmap fuse data");
     int dir = open("/tmp/fuse_short", O_RDONLY | O_DIRECTORY);
     CHECK(dir >= 0, "open FUSE fixture directory");
+    sysv_receive_fuse_outputs(dir, &ctx);
+    posix_receive_fuse_outputs(dir, &ctx);
     wait_fuse_outputs(dir, &ctx);
     recvfrom_fuse_outputs(dir, &ctx);
     recvmmsg_fuse_outputs(dir, &ctx);

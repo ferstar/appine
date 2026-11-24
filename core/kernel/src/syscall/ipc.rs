@@ -168,8 +168,10 @@ pub(super) fn msgrcv(
         cx.wait(None, &mut [])?;
     };
     let n = msg.text.len().min(max);
-    put(cx, msgp, msg.mtype.to_le_bytes())?;
-    cx.mm().write(UserSlice::new(msgp + 8, n), &msg.text[..n])?;
+    super::copy_result(cx, |cx| put(cx, msgp, msg.mtype.to_le_bytes()))?;
+    super::copy_result(cx, |cx| {
+        cx.mm().write(UserSlice::new(msgp + 8, n), &msg.text[..n])
+    })?;
     Ok(n as u64)
 }
 

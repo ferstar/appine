@@ -235,6 +235,9 @@ impl ProcEvent {
 
 /// An open file.
 pub struct OpenFile {
+    /// The unlinked store object pinned by a proc fd O_PATH reopen, and whether its host
+    /// handle permits writes. The guest description itself remains path-only.
+    pub(crate) path_object: Option<(File, bool)>,
     /// A queue inode pinned by an O_PATH description, even after mq_unlink.
     pub(crate) mq_path: Option<Rc<RefCell<crate::syscall::MessageQueue>>>,
     /// Keeps an O_PATH node in the FUSE cache for the lifetime of the description.
@@ -245,7 +248,7 @@ pub struct OpenFile {
     pub flags: u32,
     /// File position; for a directory, the index of the next entry.
     pub pos: u64,
-    /// The path `/proc/<pid>/fd/<n>` shows (the absolute path at open time).
+    /// Display name at open time, also used for files without a tracked dentry.
     pub path: Option<Rc<[u8]>>,
     /// The last directory and name passed through when opened by path: when it is used as a
     /// mount point through `/proc/<pid>/fd/<n>` (bubblewrap mounts this way), the mount records
@@ -333,6 +336,7 @@ impl OpenFile {
             _ => Vec::new(),
         };
         Rc::new(RefCell::new(OpenFile {
+            path_object: None,
             mq_path: None,
             fuse_path: None,
             kind,
@@ -398,6 +402,32 @@ impl OpenFile {
         }
     }
 
+    /// Store inode, backing file and host write access for metadata or a magic-link reopen.
+    pub(crate) fn regular_backing(&self) -> Option<(Ino, &File, bool)> {
+        match &self.kind {
+            FileKind::Regular { ino, file, cow } => Some((*ino, file, self.writable() && !cow)),
+            FileKind::Path(Node::Store(_, ino)) => {
+                let (file, writable) = self.path_object.as_ref()?;
+                Some((*ino, file, *writable))
+            }
+            _ => None,
+        }
+    }
+
+    /// Queue behind a normal descriptor or an O_PATH reference to the same queue.
+    pub(crate) fn message_queue(&self) -> Option<&Rc<RefCell<crate::syscall::MessageQueue>>> {
+        match &self.kind {
+            FileKind::MessageQueue(q) => Some(q),
+            _ => self.mq_path.as_ref(),
+        }
+    }
+
+    pub(crate) fn dentry_unlinked(&self) -> bool {
+        self.watch
+            .as_ref()
+            .is_some_and(crate::syscall::Opened::is_unlinked)
+    }
+
     /// The corresponding filesystem node (host fds, anonymous pipes and PTYs have none).
     pub fn node(&self) -> Option<Node> {
         if let Some(o) = self.ovl {
@@ -432,6 +462,15 @@ impl OpenFile {
     /// The inode in the store (chmod, chown and the like only make sense for these).
     pub fn ino(&self) -> Option<Ino> {
         self.node()?.ino()
+    }
+
+    /// The opened name follows renames independently of other hard links to the same inode.
+    pub(crate) fn current_dentry(&self) -> Option<crate::vfs::Dentry> {
+        let entry = self.dentry.as_ref()?;
+        self.watch
+            .as_ref()
+            .and_then(|w| w.dentry(&entry.0))
+            .or_else(|| Some(entry.clone()))
     }
 
     /// The store inode whose data a regular file reads and writes: for a file opened through an

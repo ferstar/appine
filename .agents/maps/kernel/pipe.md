@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: page-slot occupancy, tail merging, resize checks, and slot accounting for splice, tee, vmsplice and sendfile)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: socket input offsets and error ordering in splice)
 
 ## Responsibilities
 
@@ -71,8 +71,8 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
   after the flags in tee, and in vmsplice after the flags, access mode and iovecs (a non-pipe fd
   is `EBADF` only after that). splice checks access modes (`EBADF`), then its `EINVAL` cases (no
   pipe, an `O_APPEND` output including FIFOs, an end that cannot splice that way), then offsets on
-  a pipe (`ESPIPE`); an offset with an AF_UNIX stream input is ignored for the read and written back
-  advanced, on other unseekable inputs `ESPIPE` only after the wait for room. `/dev/fuse` splices
+  a pipe (`ESPIPE`). An explicit socket input offset gives `EINVAL` before waiting for room or
+  consuming data. Other unseekable inputs can return `ESPIPE` after the wait for room. `/dev/fuse` splices
   one whole request into a pipe (waiting as the device's own `O_NONBLOCK` says, `EIO` without
   room) and takes a reply of exactly the length asked, setting its header length to it (libfuse
   fixes the length in user memory after vmsplicing the header, which a copying vmsplice does not
@@ -126,9 +126,8 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 ## Confirmed bugs / technical debt
 
 - **splice's checks differ:** access modes (`EBADF`) come before a pipe given an offset
-  (`ESPIPE`), where 6.1 returns `ESPIPE` first; an offset on an unseekable non-pipe is `ESPIPE`
-  (after waiting for room) instead of `EINVAL`; one with an AF_UNIX stream input is ignored and
-  written back advanced.
+  (`ESPIPE`), where 6.1 returns `ESPIPE` first; some unseekable non-socket inputs return `ESPIPE`
+  after waiting for room where Linux returns `EINVAL`.
 - **Pipe write I/O with faulting buffers:** a writev whose later iovec faults still writes what
   precedes it (Linux commits only whole copied pages; a sub-page writev writes nothing); a write
   copies up to 64 KiB at a time, so a fault in the first chunk is `EFAULT` and a later one

@@ -1637,7 +1637,10 @@ impl Pseudo for View<'_> {
                     return Err(Errno::EACCES);
                 }
                 let f = file.borrow();
-                let name = describe(&f);
+                let name = self.fd_path(&f).unwrap_or_else(|| describe(&f));
+                if f.dentry_unlinked() {
+                    return Ok(with_deleted(name));
+                }
                 Ok(match &f.kind {
                     FileKind::Regular { ino, .. } => mark_deleted(self.vfs.store(), *ino, name),
                     _ => name,
@@ -1659,9 +1662,12 @@ impl Pseudo for View<'_> {
         }
     }
 
-    fn follow_dentry(&self, node: &PseudoNode) -> Option<crate::vfs::Dentry> {
+    fn follow_dentry(&self, node: &PseudoNode) -> Option<crate::vfs::WalkDentry> {
         if let PseudoNode::Entry(proc, _, Entry::Exe) = node {
-            return self.group(*proc)?.borrow().exe.as_ref()?.dentry.clone();
+            return Some(crate::vfs::WalkDentry {
+                entry: self.group(*proc)?.borrow().exe.as_ref()?.dentry.clone()?,
+                unlinked: false,
+            });
         }
         let PseudoNode::Fd(proc, tid, fd) = node else {
             return None;
@@ -1675,7 +1681,10 @@ impl Pseudo for View<'_> {
             FileKind::Directory { .. } => true,
             _ => false,
         };
-        f.dentry.clone().filter(|_| !dir)
+        Some(crate::vfs::WalkDentry {
+            entry: f.current_dentry().filter(|_| !dir)?,
+            unlinked: f.dentry_unlinked(),
+        })
     }
 
     /// `/proc/<pid>/fd/<n>`, `ns/*`, `root`, `cwd`, `exe` (Linux's proc_pid_get_link and
@@ -1858,6 +1867,23 @@ impl View<'_> {
         })
     }
 
+    /// Current path of a named fd relative to the reader's root.
+    fn fd_path(&self, f: &OpenFile) -> Option<Vec<u8>> {
+        f.path.as_ref()?;
+        let node = f.node()?;
+        if matches!(node, Node::Pseudo(..)) {
+            return None;
+        }
+        let root = self.root();
+        let entry = f.current_dentry();
+        match entry.as_ref() {
+            // A mount root takes its name from the mount point.
+            Some((dir, _)) if dir.mnt() != node.mnt() => self.vfs.path_of(self, &root, &node),
+            found => self.vfs.found_path(self, &root, &node, found),
+        }
+        .ok()
+    }
+
     /// The node reached by following `/proc/<pid>/fd/<n>` ([`Pseudo::follow`]).
     fn follow_fd(&self, mnt: MountId, node: &PseudoNode) -> Option<Node> {
         let PseudoNode::Fd(proc, tid, fd) = node else {
@@ -1870,18 +1896,13 @@ impl View<'_> {
         if let Some(o) = f.ovl {
             return Some(Node::Overlay(f.mnt, o));
         }
+        // A deleted object can only be reopened through the handle this description holds.
+        if let Some((ino, ..)) = f.regular_backing()
+            && self.vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0)
+        {
+            return Some(Node::Pseudo(mnt, PseudoNode::OpenFd(*proc, *tid, *fd)));
+        }
         Some(match &f.kind {
-            // A deleted file cannot be reopened by inode (its object in the store is already
-            // deleted): point at the open file itself, and copy the host file on reopen
-            FileKind::Regular { ino, file, .. }
-                if self
-                    .vfs
-                    .store()
-                    .stat_open(*ino, file)
-                    .is_ok_and(|st| st.nlink == 0) =>
-            {
-                Node::Pseudo(mnt, PseudoNode::OpenFd(*proc, *tid, *fd))
-            }
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
                 Node::Store(f.mnt, *ino)
             }
@@ -3603,10 +3624,9 @@ fn map_line(store: &Store, r: &Region) -> String {
 /// As with Linux's `d_path`, deleted files (still open or mapped) get ` (deleted)` appended to
 /// their path: `/proc/<pid>/fd/<n>`, maps, smaps. After the last name is removed in the store,
 /// the inode's row stays with nlink = 0 until the store is next opened exclusively, so the check
-/// uses nlink. Linux looks at the name used at open and also appends it when only that name was
-/// removed while other hard links remain; here it does not. When apt upgrades, dpkg replaces old
-/// libraries with rename, and needrestart finds the processes to restart by the ` (deleted)` in
-/// maps.
+/// uses nlink. An fd link also checks its open dentry when other hard links remain.
+/// When dpkg replaces old libraries with rename, needrestart uses the suffix in maps to find
+/// processes still using them.
 pub(crate) fn mark_deleted(store: &Store, ino: Ino, name: Vec<u8>) -> Vec<u8> {
     if store.attrs(ino).is_ok_and(|st| st.nlink == 0) {
         with_deleted(name)

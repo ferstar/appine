@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: initial page-table entries for file mappings are built from the configured VMA)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: message-queue result copies across FUSE demand fills)
 
 ## Responsibilities
 
@@ -54,7 +54,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   private-file piece reread after `MADV_DONTNEED`), and `AdviseRange` (host-page-aligned slice of a
   retained `Arc<HostRegion>` for unlocked non-destructive `madvise`).
 - `WANTED` (thread-local) — the page of a `Fill` a kernel access found not read, for the dispatcher
-  or the socket result copy to service (`take_wanted`).
+  or a local result copy to service (`take_wanted`).
 - `UserSlice` — an unchecked guest range passed to kernel-side accessors.
 
 ### Introspection
@@ -427,7 +427,7 @@ signals may still be delivered).
   (dumps emit zeros).
   A handler that has already consumed input can repeat its effects on a whole-syscall retry
   or return a short count. The dispatcher prefaults read/write, positional
-  and vectored I/O buffers. Socket receives and wait4/waitid retry their result copies locally.
+  and vectored I/O buffers. Socket receives, wait4/waitid, msgrcv and mq_timedreceive retry their result copies locally.
 - **Approximate madvise:** `MADV_DONTNEED_LOCKED`/`MADV_POPULATE_WRITE` are no-ops;
   `MADV_POPULATE_READ` runs advisory host readahead + RO file soft-PTE prefill without faulting or
   failing on inaccessible ranges; `MADV_FREE`/`COLD`/`PAGEOUT` are not refused on locked ranges.

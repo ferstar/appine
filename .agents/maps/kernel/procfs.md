@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: return the consumed length and position together from a synthetic write)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: stable O_PATH targets for deleted store files)
 
 ## Responsibilities
 
@@ -231,8 +231,11 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `fd/` and `fdinfo/` and reading or following `fd/N` need the ptrace read check with filesystem
   credentials (`EACCES`, Linux's `proc_fd_permission` and `proc_fd_access_allowed`), as do `root`,
   `cwd`, `exe`, `ns/*` and `stat`'s layout fields, checked against the target thread's credentials
-  (`tid.unwrap_or(proc.pid)`); `fd/N` links show the path stored at open with
-  ` (deleted)` appended when nlink is 0; `fdinfo/N` has `pos`, `flags` (octal, with
+  (`tid.unwrap_or(proc.pid)`); named fd links resolve their tracked parent and name against the reader's root.
+  Renames follow the opened name. Unlinking it appends ` (deleted)` even with other hard links.
+  Reopening a deleted regular store file via `fd/N` with `O_PATH` pins its backing object.
+  Stat and subsequent reopens keep the original inode across source-fd close and reuse.
+  Synthetic descriptors and unreachable paths use their recorded description; `fdinfo/N` has `pos`, `flags` (octal, with
   `O_CLOEXEC`), `mnt_id`, `ino`, the `lock:` lines of the locks held through that open file
   (`kernel/locks`'s `fd_locks`; only for files or fd tables that have taken locks) and per-kind
   lines (eventfd count, inotify watches, epoll `tfd:` lines, timerfd clock and times, signalfd

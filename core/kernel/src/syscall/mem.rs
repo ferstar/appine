@@ -109,6 +109,7 @@ pub(super) fn mmap(
     let mut gpu_mapping = None;
     let mut fuse_fill = None;
     let mut mapping_object = None;
+    let mut accessed = None;
     let mut file_source = None;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         if low && len != 0 {
@@ -199,6 +200,7 @@ pub(super) fn mmap(
                     let mapping = crate::vfs::TmpfsMapping::new(vfs, dev, ino, fd)?;
                     file_source = Some(FileSource::Tmpfs(mapping));
                 }
+                accessed = Some(file.clone());
                 Some((fd, offset, may_write))
             }
             FileKind::Render { ino, file } => {
@@ -268,6 +270,9 @@ pub(super) fn mmap(
         cx.mm_mut().map(addr, len, prot, flags, file, file_source)?
     };
     drop(mapping_object);
+    if let Some(file) = accessed {
+        super::fs::file_accessed(cx, &file.borrow());
+    }
     // MAP_FIXED may have replaced a segment's last attachment
     if flags & flags::MAP_FIXED != 0 {
         crate::ipc::reap_shm(cx.k());

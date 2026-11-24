@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: track tmpfs reservations and mapped data by inode and guest page)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-mount guest atime on file and directory access)
 
 ## Responsibilities
 
@@ -179,8 +179,10 @@ capabilities (`kernel/cred`).
   memfds as noexec. nosuid: exec ignores set-id bits and file caps
   (always for FUSE programs). nodev: device opens `EACCES` (store, overlay, FUSE and devpts
   nodes); mknod is unaffected. nosymfollow: `ELOOP`, and on the root filesystem it turns off
-  `Cached`. Atime flags and the sync, dirsync, mand and lazytime superblock flags are only recorded
-  and reported (mountinfo, statfs).
+  `Cached`. Store file reads and mappings and store directory listings honor the description's
+  `O_NOATIME` and current mount flags. Read-only and noatime suppress updates, nodiratime
+  suppresses directory updates, and relatime compares atime to mtime, ctime and a 24-hour age.
+  The sync, dirsync, mand and lazytime flags are recorded and reported (mountinfo, statfs).
 - Removing or renaming a mount point in the caller's namespace is `EBUSY` (rename: either name);
   mounts on it in other namespaces are detached after the change (rename: only on the replaced
   target). Removing the name a mount's root is (a bound directory once its nlink is 0, or the name
@@ -378,9 +380,6 @@ capabilities (`kernel/cred`).
 
 - **No inode flags:** `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` are unsupported, while 6.1's tmpfs has
   append-only, immutable, nodump and noatime (LTP unlink09, copy_file_range02).
-- **atime ignores the guest:** a regular file's atime is its host object's, updated by the host's
-  rules whatever `O_NOATIME`, `noatime`, `nodiratime` or `strictatime` say; directories never get
-  an atime of their own (LTP open12, mount03).
 - **Fidelity gaps**, one per line:
   - statx: no btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`;
   - no `protected_regular` or `protected_fifos`;
