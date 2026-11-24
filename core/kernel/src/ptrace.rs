@@ -218,9 +218,10 @@ impl Trace {
         self.tracer.is_some() && self.options & (1 << e) != 0
     }
 
-    /// In a ptrace-stop and not in PTRACE_LISTEN: the tracer can send it requests.
+    /// In a ptrace-stop and not in PTRACE_LISTEN or already resumed: the tracer can send it
+    /// requests.
     pub fn stopped(&self) -> bool {
-        self.stop.is_some() && !self.listening
+        self.stop.is_some() && !self.listening && self.resume.is_none()
     }
 
     /// Whether the tracer had `CAP_SYS_PTRACE` over user namespace `ns` when tracing began

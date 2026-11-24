@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: publish `shared_maps` before installing/moving writable shared PTEs and match Linux 6.1 gap semantics in `madvise`/`msync`/`mlock`/`mincore`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `write_kernel` validates mapped contents across the full range before mutating, and ptrace PEEK/POKE fill cold FUSE pages)
 
 ## Responsibilities
 
@@ -434,8 +434,6 @@ signals may still be delivered).
   and core-dump holes still use mincore.
 
 ## Confirmed bugs / technical debt
-
-- Ptrace PEEK and POKE can return EIO at a cold FUSE page.
 
 - **FUSE demand reads:** mlock and `MADV_WILLNEED` do not fetch missing pages.
   A handler that has already consumed input can repeat its effects on a whole-syscall retry

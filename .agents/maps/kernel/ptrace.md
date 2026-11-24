@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/signal full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: PEEKTEXT and PEEKDATA use forced reads from the stopped tracee)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `PEEK*`/`POKE*` and `process_vm_readv`/`writev` fill cold FUSE pages locally, re-validating tracee state after BKL release)
 
 ## Responsibilities
 
@@ -73,10 +73,15 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 - Memory: `PEEK*`/`POKE*` on a tracee that is not dumpable are `EIO` unless the tracer had
   `CAP_SYS_PTRACE` over the tracee's user namespace when it attached (`ptrace_access_vm`).
   `PEEKTEXT`/`PEEKDATA` and `/proc/<pid>/mem` can read protected pages, including CoW loans,
-  through forced reads. `process_vm_readv` still requires read permission.
-  `POKETEXT`/`POKEDATA` and `/proc/<pid>/mem` writes use forced writes (private copies of
-  non-writable mappings, translation invalidation; written mappings stop being trusted translation
-  sources). `process_vm_writev` uses plain writes.
+  through forced reads. `POKETEXT`/`POKEDATA` and `/proc/<pid>/mem` writes use forced writes
+  (private copies of non-writable mappings, translation invalidation; written mappings stop being
+  trusted translation sources). Both `PEEK*` and `POKE*` retry cold FUSE (`Fill`) pages locally
+  via `fuse::fill` with the BKL released, dropping all borrows and the tracee `Mm` reference
+  across the wait and re-validating tracee identity, ptrace attachment, stop state (not resumed or
+  killed) and `may_access_vm` afterwards (`ESRCH` if detached, resumed, killed or exited; `EIO` on
+  fill or access error). `process_vm_readv` and `process_vm_writev` still require ordinary read or
+  write permissions and also fill cold FUSE pages locally on both local and remote sides per page
+  chunk.
 - wait: the tracer finds its tracees without `WUNTRACED`; a stop reports `code << 8 | 0x7f`. A
   traced leader's zombie is hidden from its separate parent until the tracer reaps it. If the
   tracer becomes the parent first, the pending exit is taken once through the ordinary child wait. When the tracer
@@ -99,7 +104,8 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 - `kernel/signal` supplies siginfo, signals and delivery on resume; `kernel/process` supplies
   task/group tables, wakes and waits. `kernel/ns` translates visible IDs.
 - `kernel/cred` checks access; `kernel/mm` performs ordinary and forced reads and writes, with
-  `kernel/mmu` code invalidation; `engine` provides Cpu state, stepping and hardware-debug slots.
+  `kernel/mmu` code invalidation; `kernel/fuse` (`fill`) serves cold FUSE pages for `PEEK*`/`POKE*`
+  and `process_vm_readv`/`writev`; `engine` provides Cpu state, stepping and hardware-debug slots.
 - `kernel/vdso` identifies clock stubs that bypass ptrace stops.
 
 ## Invariants and gotchas

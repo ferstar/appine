@@ -2325,6 +2325,20 @@ impl Mm {
         {
             return Err(request_fill(w));
         }
+        // Verify the entire range lies within mapped contents before settling CoW, unsharing, or
+        // mutating any bytes (e.g., an unaligned PTRACE_POKE straddling EOF must not leave a
+        // partial write).
+        let write_end = addr.checked_add(data.len() as u64).ok_or(Errno::EFAULT)?;
+        let mut check = addr;
+        while check < write_end {
+            let (&s, v) = self
+                .vmas
+                .range(..=check)
+                .next_back()
+                .filter(|&(&s, v)| check < s + v.contents_len())
+                .ok_or(Errno::EFAULT)?;
+            check = s + v.contents_len();
+        }
         self.cow_settle(addr & !(PAGE_SIZE - 1), end);
         let first = self
             .vmas
