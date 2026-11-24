@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: FUSE pages in core dumps and proc memory transfers)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: publish `shared_maps` before installing/moving writable shared PTEs and match Linux 6.1 gap semantics in `madvise`/`msync`/`mlock`/`mincore`)
 
 ## Responsibilities
 
@@ -78,7 +78,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `populate_mlock`, `mapped_above`, `check_mapped`.
 - **Files, shm, futex & introspection**: `futex_key`, `shared_maps`, `id`; `file_truncated`,
   `writably_maps`, `maps_file`, `maps_ino`, `mapped_inos`, `set_mnt`, `mapped_mounts`,
-  `shared_file_ranges`; `attach_shm`/`detach_shm`/`shm_attachments`;
+  `next_msync`, `residency_chunk`; `attach_shm`/`detach_shm`/`shm_attachments`;
   `regions`, `residency`, `size`, `locked_bytes`/`locked_in`, `dump_regions`, `dump_page`.
 
 ## Data flow / lifecycle
@@ -279,39 +279,51 @@ signals may still be delivered).
   also retain the same open handle and access limits (`EINVAL` on mismatch; shared anonymous memory
   and segments are refused); it maps the file again with `MAP_SHARED | MAP_FIXED`, keeping the
   label, FUSE page source, exec denial and lock, and populates unless `MAP_NONBLOCK`.
-- `msync`: flags and alignment `EINVAL`, the range must be fully mapped (`ENOMEM`), `MS_INVALIDATE`
-  on locked pages `EBUSY`; `MS_SYNC` syncs shared host file ranges with the BKL released and
-  writes changed shared FUSE pages to the daemon before requesting a data sync. `mincore`: alignment
-  `EINVAL`, fully mapped or `ENOMEM`; reserved pages report 0 and borrowed pages 1; the result is written without growing the stack.
-- `mlock`/`mlock2`/`munlock` follow `do_mlock`: the length plus the offset in the page is
-  page-aligned with wrapping arithmetic; after mlock's `RLIMIT_MEMLOCK` check (`EPERM` with a limit
-  of 0, `ENOMEM` above it; skipped with `CAP_IPC_LOCK`) a range that wraps past the end is `EINVAL`
-  and an empty one succeeds; the range must be fully mapped (`ENOMEM`) and is populated via
-  `populate_mlock` unless `MLOCK_ONFAULT` (stopping at the first `PROT_NONE` VMA and returning
-  `ENOMEM` while leaving the range locked; skipping read-only private anonymous VMAs so RSS stays 0
-  and CoW stays intact; settling CoW and atomically write-faulting writable private anonymous VMAs
-  so real private host pages are resident). `mlockall(MCL_CURRENT)` checks the whole size (`PROT_NONE` reservations
-  included) against the limit, locks every VMA and populates unless `MCL_ONFAULT`; `MCL_FUTURE`
-  makes new VMAs locked, uncharged.
+- `msync`: flags and alignment `EINVAL`, overflow `ENOMEM`, zero-length succeeds; walks VMAs in
+  order via `next_msync`, skipping unmapped gaps (returning `ENOMEM` at the end), stopping on
+  `MS_INVALIDATE` over a locked VMA with `EBUSY` (preceding earlier gaps), and under `MS_SYNC`
+  syncing each shared host file slice with the BKL released (retaining `Arc<HostRegion>`) and
+  writing changed shared FUSE pages to the daemon before requesting a data sync. `mincore`:
+  alignment `EINVAL`, range overflow or above `1 << VA_BITS` `ENOMEM`, `vec` above `1 << VA_BITS`
+  `EFAULT`; walks contiguous mapped VMAs from `addr` in chunks of at most `PAGE_SIZE` pages
+  (`residency_chunk`), writing each chunk to `vec` without growing the stack and stopping at the
+  first unmapped page (`ENOMEM`) or write fault (`EFAULT`); reserved pages report 0 and borrowed
+  pages 1.
+- `mlock`/`mlock2`/`munlock` follow `do_mlock` / `apply_vma_lock_flags`: the length plus the offset
+  in the page is page-aligned with wrapping arithmetic; after mlock's `RLIMIT_MEMLOCK` check
+  (`EPERM` with a limit of 0, `ENOMEM` above it; skipped with `CAP_IPC_LOCK`) a range that wraps
+  past the end is `EINVAL` and an empty one succeeds; `set_locked` walks contiguous mapped VMAs
+  from `start` and stops at the first unmapped gap (`ENOMEM`, leaving earlier contiguous VMAs
+  updated, later VMAs untouched, and skipping `populate_mlock`); on a fully mapped lock without
+  `MLOCK_ONFAULT`, `populate_mlock` stops at the first `PROT_NONE` VMA (`ENOMEM`, leaving the range
+  locked), skips read-only private anonymous VMAs so RSS stays 0 and CoW stays intact, and settles
+  CoW plus atomically write-faults writable private anonymous VMAs so real private host pages are
+  resident. `mlockall(MCL_CURRENT)` checks the whole size (`PROT_NONE` reservations included)
+  against the limit, locks every VMA and populates unless `MCL_ONFAULT`; `MCL_FUTURE` makes new
+  VMAs locked, uncharged.
 - `madvise`: alignment/length/unknown advice (counted as unimplemented) `EINVAL`; length 0 succeeds.
-  Flag advice (`DONTDUMP`/`DODUMP`, `WIPEONFORK`/`KEEPONFORK`, `DONTFORK`/`DOFORK`) requires a fully
-  mapped range (`ENOMEM`), splits VMAs at ends and sets the flag. Locked (`MADV_DONTNEED` `EINVAL`)
-  and private-anon checks (`MADV_FREE`/`MADV_WIPEONFORK` `EINVAL`) inspect overlapping VMAs only.
-  Non-destructive hints (`NORMAL`/`RANDOM`/`SEQUENTIAL`/`WILLNEED`/`POPULATE_READ`) forward to
-  `appine_hal::advise` unlocked via coalesced `AdviseRange`s clipped to `file_len` (skipping
-  reserved/foreign/GPU/`Fill` VMAs; `NORMAL`/`RANDOM`/`SEQUENTIAL` file-backed only; `WILLNEED`/
-  `POPULATE_READ` skip untouched anon, pass `MADV_WILLNEED`, and prefill read-only non-FUSE file soft
-  PTEs up to 4 GB/call). Other unlisted advice returns 0.
-- `MADV_DONTNEED` (`discard`): private anon returns to host and zeroes (CoW settled via `kernel/cow`);
-  written private file pages before EOF unshare first if marked `cow` (so reverting never corrupts a
-  fork peer), then revert via `kernel/hostmem`'s `discard_file_host` (whole host
-  pages) and `Reread`s read from the store (`fill_private`, zeros past EOF or open failure; `Fill`
-  partial host pages reread from its memfd so entries stay). Executable ranges queue code
-  invalidation; shared/unwritten VMAs untouched; vDSO refills from kernel image (with svc stubs
-  when `vdso_svc`).
-- `MADV_REMOVE` (`remove`): fully mapped; locked or private anon `EINVAL`, other private or
-  never-writable `EACCES` (6.7); shared host ranges use `remove_host`. FUSE ranges punch a hole
-  through the daemon. Neither path requests code invalidation.
+  Walks mapped VMAs in order like Linux 6.1's `do_madvise`: unmapped gaps are skipped and reported
+  as `ENOMEM` at the end, while per-VMA errors (`EINVAL` on locked VMAs for `MADV_DONTNEED`,
+  `EINVAL` on non-private-anon VMAs for `MADV_FREE`/`MADV_WIPEONFORK`, `EINVAL`/`EACCES` for
+  `MADV_REMOVE`, or split `ENOMEM`) stop immediately (taking precedence over earlier gaps) while
+  leaving earlier mapped portions applied. Flag advice (`DONTDUMP`/`DODUMP`, `WIPEONFORK`/
+  `KEEPONFORK`, `DONTFORK`/`DOFORK`) splits each mapped VMA at slice ends and sets the flag.
+  Non-destructive hints (`NORMAL`/`RANDOM`/`SEQUENTIAL`/`WILLNEED`/`POPULATE_READ`) prefill RO
+  non-FUSE file soft PTEs up to 4 GB/call and forward to `appine_hal::advise` unlocked via
+  coalesced `AdviseRange`s clipped to `file_len` (skipping reserved/foreign/GPU/`Fill` VMAs;
+  `NORMAL`/`RANDOM`/`SEQUENTIAL` file-backed only; `WILLNEED`/`POPULATE_READ` skip untouched anon
+  and pass `MADV_WILLNEED`) before reporting any gap as `ENOMEM`. Other unlisted advice returns 0
+  if fully mapped (`ENOMEM` on gaps).
+- `MADV_DONTNEED` (`discard_range` / `discard`): private anon returns to host and zeroes (CoW
+  settled via `kernel/cow`); written private file pages before EOF unshare first if marked `cow`
+  (so reverting never corrupts a fork peer), then revert via `kernel/hostmem`'s `discard_file_host`
+  (whole host pages) and `Reread`s read from the store (`fill_private`, zeros past EOF or open
+  failure; `Fill` partial host pages reread from its memfd so entries stay). Executable ranges
+  queue code invalidation; shared/unwritten VMAs untouched; vDSO refills from kernel image (with
+  svc stubs when `vdso_svc`).
+- `MADV_REMOVE` (`remove`): per-VMA check (`EINVAL` on locked, private anon or GPU; `EACCES` on
+  other private or never-writable, 6.7); shared host ranges use `remove_host`, tmpfs and FUSE
+  ranges punch holes through tmpfs / the daemon. Neither path requests code invalidation.
 
 ### Stack growth
 
@@ -407,7 +419,10 @@ signals may still be delivered).
   `kernel/cow` adds): kernel writes, mlock and `MAP_POPULATE` fill entries, mremap moves them, and
   `PROT_NONE` keeps prot-0 entries (`kernel/cow` lending and `kernel/oom` RSS rely on this).
 - `Mm` (`Rc<RefCell>`) is BKL-only (checking builds assert no borrow across BKL release);
-  `shared_maps` is shared across threads for the fast path.
+  `shared_maps` is shared across threads for the fast futex path. `insert_vma` and `move_range`
+  publish writable shared ranges in `shared_maps` before installing or moving PTEs (rolling back if
+  `map_pages` fails), and `munmap`, `move_range`, and `deny_write` prune removed/non-writable
+  ranges after old PTEs are gone.
 - The host's `vm.max_map_count` is shared by the whole app process, so the guest limit is enforced
   per address space.
 - VMAs never merge; adjacent anonymous VMAs are separate host mappings and are only joined (as
@@ -432,13 +447,9 @@ signals may still be delivered).
 - **Approximate Linux VMA boundaries:** anonymous pieces join ignoring page offsets (mremap-moved
   VMAs join new neighbours); `MREMAP_DONTUNMAP` of a multi-piece VMA needs one VMA slot per piece,
   and in-place growth adds a VMA.
-- **Ranges with gaps fail as a whole:** madvise, msync, mlock and mincore refuse a range that is not
-  fully mapped before doing anything (`ENOMEM`), where Linux acts on the mapped parts first.
 
 ## Open questions
 
 - Why is `STACK_TOP` `1 << 47` while the page table covers 48 bits and `MAP_FIXED` may reach
   `1 << 48`?
 - Should mappings locked through `mlockall(MCL_FUTURE)` be charged against `RLIMIT_MEMLOCK`?
-- Is the window in `mmap` and `shmat` between installing entries and `note_shared_maps` acceptable
-  for a concurrent fast-path futex on a writable shared page?

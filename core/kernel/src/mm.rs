@@ -244,6 +244,53 @@ impl AdviseRange {
     }
 }
 
+/// A host-page-aligned slice of a live shared file [`HostRegion`] retained across a BKL release so
+/// `msync(MS_SYNC)` can wait on host write-back without holding the BKL.
+pub(crate) struct MsyncHost {
+    _region: Arc<HostRegion>,
+    addr: usize,
+    len: usize,
+}
+
+impl MsyncHost {
+    /// Syncs the retained host mapping slice with `MS_SYNC`, ignoring host `ENOMEM` if the range
+    /// was torn down concurrently.
+    pub(crate) fn sync(self) -> Result<(), Errno> {
+        match appine_hal::msync(self.addr, self.len) {
+            Err(libc::ENOMEM) => Ok(()),
+            r => r.map_err(Errno),
+        }
+    }
+}
+
+/// What a single VMA slice in `msync(2)` needs to sync when `MS_SYNC` is set.
+pub(crate) enum MsyncTarget {
+    Fuse(Rc<Fill>, u64, u64),
+    Host(MsyncHost),
+}
+
+/// Work collected by [`Mm::remove`] (`MADV_REMOVE`) for tmpfs and FUSE VMAs visited before any
+/// per-VMA error, paired with the final result (`ENOMEM` if any unmapped gap was skipped).
+pub(crate) struct RemovePlan {
+    pub tmpfs: Vec<TmpfsRange>,
+    pub fuse: Vec<(Rc<Fill>, u64, u64)>,
+    pub result: Result<(), Errno>,
+}
+
+/// One step of Linux 6.1's per-VMA `msync(2)` walk ([`Mm::next_msync`]).
+pub(crate) enum MsyncStep {
+    /// No VMA overlaps `[cursor, end)`.
+    Unmapped,
+    /// Next mapped slice `[start, stop)` inside `[cursor, end)`. If `start > cursor`,
+    /// `[cursor, start)` is an unmapped gap.
+    Vma {
+        start: u64,
+        stop: u64,
+        locked: bool,
+        target: Option<MsyncTarget>,
+    },
+}
+
 struct FilePages {
     tmpfs: Option<Rc<crate::vfs::TmpfsMapping>>,
     /// File offsets with private copies. Split ordinary VMAs share this set across host pages.
@@ -2490,7 +2537,6 @@ impl Mm {
         });
         self.insert(start, len, len, prot, Backing::Shared, true, region, host)?;
         self.deny_exec(start, len);
-        self.note_shared_maps(false);
         Ok(start)
     }
 
@@ -2681,9 +2727,6 @@ impl Mm {
         v.fill = fill;
         self.insert_vma(start, v)?;
         self.fills |= has_fill;
-        if backing == Backing::Shared && may_write {
-            self.note_shared_maps(false);
-        }
         if let (Some(libc), Some((_, offset, _))) = (bundled_libc, file) {
             let before = self.memops.len();
             libc.register(offset, start, len, &mut self.memops);
@@ -2742,8 +2785,13 @@ impl Mm {
     /// Mappings starting in `[start, start + len)` may never become writable (shared mappings of
     /// /dev/zero opened read-only).
     pub fn deny_write(&mut self, start: u64, len: u64) {
+        let mut changed_shared = false;
         for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
+            changed_shared |= v.backing == Backing::Shared && v.may_write;
             v.may_write = false;
+        }
+        if changed_shared {
+            self.note_shared_maps(false);
         }
     }
 
@@ -3129,6 +3177,25 @@ impl Mm {
         self.split_at(old);
         self.split_at(old + len);
         let starts: Vec<u64> = self.vmas.range(old..old + len).map(|(&s, _)| s).collect();
+        // Publish destination ranges for any writable shared VMAs before `move_entries` makes
+        // destination PTEs visible to concurrent threads on the no-BKL futex fast path, keeping
+        // the old ranges present until all source PTEs have been removed.
+        let moved_shared: Vec<(u64, u64)> = starts
+            .iter()
+            .filter_map(|&s| {
+                let v = &self.vmas[&s];
+                (v.backing == Backing::Shared && v.may_write).then(|| {
+                    let new_start = dst + (s - old);
+                    (new_start, new_start + v.len)
+                })
+            })
+            .collect();
+        if !moved_shared.is_empty() {
+            self.shared_maps
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(moved_shared.iter().copied());
+        }
         let mut moved = Vec::with_capacity(starts.len());
         for s in starts {
             let mut v = self.vmas.remove(&s).unwrap();
@@ -3160,6 +3227,11 @@ impl Mm {
         // `move_entries`, so an eager-prefill allocation failure must not drop the moved VMAs.
         for (s, v) in moved {
             self.place_moved_vma(s, v);
+        }
+        if !moved_shared.is_empty() {
+            // Source PTEs have been removed and moved VMAs are now in `self.vmas`; drop the stale
+            // source ranges.
+            self.note_shared_maps(false);
         }
         self.dirty = true;
         Ok(())
@@ -3369,7 +3441,6 @@ impl Mm {
             host,
         )?;
         self.vmas.get_mut(&start).unwrap().shm = Some((id, start));
-        self.note_shared_maps(false);
         Ok(start)
     }
 
@@ -3601,81 +3672,126 @@ impl Mm {
     /// host mapping is shared too, so the host punches the hole in the file or shared memory
     /// behind it (Linux punches one in the file); the parts of host pages at the ends (4 KB guest
     /// pages on a 16 KB host), or everything when the host refuses, are zeroed through the
-    /// mapping instead, which keeps their storage. As on Linux, a range with locked pages
-    /// or private anonymous mappings is EINVAL, and other private mappings or ones that cannot get
-    /// write permission are EACCES (since 6.7 what counts is whether write permission can be
-    /// granted, not whether it is held now). The range must be fully mapped.
-    pub(crate) fn remove(&mut self, addr: u64, len: u64) -> Result<Vec<TmpfsRange>, Errno> {
-        self.check_mapped(addr, len)?;
-        let end = addr + len;
-        let first = self
-            .vmas
-            .range(..=addr)
-            .next_back()
-            .map_or(addr, |(&s, _)| s);
-        let overlapping = || {
-            self.vmas
-                .range(first..end)
-                .filter(move |(s, v)| *s + v.len > addr)
-        };
-        for (_, v) in overlapping() {
-            if v.locked || v.backing == Backing::Anonymous || v.region.gpu.is_some() {
-                return Err(Errno::EINVAL);
-            }
-            if v.backing != Backing::Shared || !v.may_write {
-                return Err(Errno::EACCES);
-            }
-        }
+    /// mapping instead, which keeps their storage. Walks mapped VMAs in order like Linux 6.1's
+    /// `do_madvise`: unmapped gaps are skipped and reported as `ENOMEM` at the end, while a VMA
+    /// error (`EINVAL` for locked, private anonymous or GPU mappings; `EACCES` for other private
+    /// mappings or ones that cannot get write permission) stops immediately, leaving earlier
+    /// mapped portions removed.
+    pub(crate) fn remove(&mut self, addr: u64, len: u64) -> RemovePlan {
         let mut tmpfs = Vec::new();
-        for (&s, v) in overlapping() {
-            // The part past the end of the file must not be touched (the host would raise SIGBUS)
-            let from = addr.max(s);
-            let to = end.min(s + v.file_len);
-            if from < to {
-                if let Some(mapping) = v.tmpfs() {
-                    tmpfs.push(TmpfsRange {
-                        mapping: mapping.clone(),
-                        offset: v.offset() + from - s,
-                        len: to - from,
-                    });
-                    continue;
+        let mut fuse = Vec::new();
+        let Some(end) = page_up(len).and_then(|l| addr.checked_add(l)) else {
+            return RemovePlan {
+                tmpfs,
+                fuse,
+                result: Err(Errno::ENOMEM),
+            };
+        };
+        let mut cursor = addr;
+        let mut has_gap = false;
+        while cursor < end {
+            let Some((&s, v)) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|&(&s, v)| s + v.len > cursor)
+                .or_else(|| self.vmas.range(cursor..end).next())
+            else {
+                has_gap = true;
+                break;
+            };
+            if cursor < s {
+                has_gap = true;
+                cursor = s;
+                if cursor >= end {
+                    break;
                 }
-                // SAFETY: [from, to) is inside this VMA, which holds the host memory; for a shared
-                // mapping that can get write permission the host mapping is always writable and
-                // shared
-                unsafe {
-                    remove_host(
-                        v.host.as_ptr().add((from - s) as usize),
-                        (to - from) as usize,
-                    )
+            }
+            if v.locked || v.backing == Backing::Anonymous || v.region.gpu.is_some() {
+                return RemovePlan {
+                    tmpfs,
+                    fuse,
+                    result: Err(Errno::EINVAL),
                 };
             }
+            if v.backing != Backing::Shared || !v.may_write {
+                return RemovePlan {
+                    tmpfs,
+                    fuse,
+                    result: Err(Errno::EACCES),
+                };
+            }
+            let stop = end.min(s + v.len);
+            if let Some(fill) = &v.fill {
+                fuse.push((
+                    fill.clone(),
+                    v.offset() + (cursor - s),
+                    v.offset() + (stop - s),
+                ));
+            } else {
+                // The part past the end of the file must not be touched (the host would raise
+                // SIGBUS)
+                let to = stop.min(s + v.file_len);
+                if cursor < to {
+                    if let Some(mapping) = v.tmpfs() {
+                        tmpfs.push(TmpfsRange {
+                            mapping: mapping.clone(),
+                            offset: v.offset() + cursor - s,
+                            len: to - cursor,
+                        });
+                    } else {
+                        // SAFETY: [cursor, to) is inside this VMA, which holds the host memory;
+                        // for a shared mapping that can get write permission the host mapping is
+                        // always writable and shared
+                        unsafe {
+                            remove_host(
+                                v.host.as_ptr().add((cursor - s) as usize),
+                                (to - cursor) as usize,
+                            )
+                        };
+                    }
+                }
+            }
+            cursor = stop;
         }
-        Ok(tmpfs)
+        RemovePlan {
+            tmpfs,
+            fuse,
+            result: if has_gap { Err(Errno::ENOMEM) } else { Ok(()) },
+        }
     }
 
-    /// The properties of a range madvise cares about: (whether it has locked pages, whether it is
-    /// all private anonymous memory). The range must be fully mapped.
-    pub fn advice_range(&self, addr: u64, len: u64) -> Result<(bool, bool), Errno> {
-        self.check_mapped(addr, len)?;
-        let end = addr + len;
-        // The VMA starting below `addr` counts only if it reaches into the range
-        let first = self
-            .vmas
-            .range(..=addr)
-            .next_back()
-            .map_or(addr, |(&s, _)| s);
-        let mut locked = false;
-        let mut anon = true;
-        for (_, v) in self
-            .vmas
-            .range(first..end)
-            .filter(|&(&s, v)| s + v.len > addr)
-        {
-            locked |= v.locked;
-            anon &= v.backing == Backing::Anonymous;
+    /// `MADV_FREE`: walks mapped VMAs in `[addr, addr + len)` in order, returning `EINVAL` on the
+    /// first non-private-anonymous VMA (taking precedence over any earlier unmapped gap) and
+    /// `ENOMEM` at the end if any gap existed.
+    pub(crate) fn check_free(&self, addr: u64, len: u64) -> Result<(), Errno> {
+        let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
+        let mut cursor = addr;
+        let mut has_gap = false;
+        while cursor < end {
+            let Some((&s, v)) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|&(&s, v)| s + v.len > cursor)
+                .or_else(|| self.vmas.range(cursor..end).next())
+            else {
+                has_gap = true;
+                break;
+            };
+            if cursor < s {
+                has_gap = true;
+                cursor = s;
+                if cursor >= end {
+                    break;
+                }
+            }
+            if v.backing != Backing::Anonymous {
+                return Err(Errno::EINVAL);
+            }
+            cursor = end.min(s + v.len);
         }
-        Ok((locked, anon))
+        if has_gap { Err(Errno::ENOMEM) } else { Ok(()) }
     }
 
     /// Prefills soft page-table entries for read-only non-FUSE file mappings in `[addr, addr + len)`
@@ -3803,24 +3919,55 @@ impl Mm {
         out
     }
 
-    /// madvise(MADV_DONTNEED): anonymous memory goes back to the host (reading zero afterwards);
+    /// madvise(`MADV_DONTNEED`): anonymous memory goes back to the host (reading zero afterwards);
     /// the written pages of private file mappings go back to the file's contents (Linux drops
     /// their copies and reads the file again): whole host pages of a host file mapping through the
     /// host, the rest returned as [`Reread`]s for the caller to read from the file; shared
-    /// mappings stay unchanged. The range must be fully mapped.
+    /// mappings stay unchanged. Walks mapped VMAs in order like Linux 6.1's `do_madvise`: unmapped
+    /// gaps are skipped and reported as `ENOMEM` at the end, while a locked VMA stops immediately
+    /// with `EINVAL` (taking precedence over earlier gaps).
+    #[cfg(test)]
     pub fn discard(&mut self, addr: u64, len: u64) -> Result<Vec<Reread>, Errno> {
+        let (rereads, res) = self.discard_range(addr, len);
+        res.map(|()| rereads)
+    }
+
+    /// Per-VMA implementation of [`Mm::discard`] that also returns partial [`Reread`]s collected
+    /// before hitting an unmapped gap (`ENOMEM`) or a locked VMA (`EINVAL`).
+    pub(crate) fn discard_range(
+        &mut self,
+        addr: u64,
+        len: u64,
+    ) -> (Vec<Reread>, Result<(), Errno>) {
         let mut rereads = Vec::new();
-        let len = page_up(len).ok_or(Errno::EINVAL)?;
-        let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+        let Some(len) = page_up(len) else {
+            return (rereads, Err(Errno::EINVAL));
+        };
+        let Some(end) = addr.checked_add(len) else {
+            return (rereads, Err(Errno::EINVAL));
+        };
         let mut cursor = addr;
+        let mut has_gap = false;
         while cursor < end {
-            let (&s, v) = self
+            let Some((&s, v)) = self
                 .vmas
                 .range(..=cursor)
                 .next_back()
-                .ok_or(Errno::ENOMEM)?;
-            if s + v.len <= cursor {
-                return Err(Errno::ENOMEM);
+                .filter(|&(&s, v)| s + v.len > cursor)
+                .or_else(|| self.vmas.range(cursor..end).next())
+            else {
+                has_gap = true;
+                break;
+            };
+            if cursor < s {
+                has_gap = true;
+                cursor = s;
+                if cursor >= end {
+                    break;
+                }
+            }
+            if v.locked {
+                return (rereads, Err(Errno::EINVAL));
             }
             let stop = end.min(s + v.len);
             if v.backing == Backing::Anonymous && !v.reserved() {
@@ -3861,8 +4008,10 @@ impl Mm {
                 // this address space without corrupting the peer.
                 let in_file = stop.min(s + page_up(v.contents_len()).unwrap_or(v.len));
                 if cursor < in_file {
-                    if v.cow {
-                        self.unshare(s)?;
+                    if v.cow
+                        && let Err(e) = self.unshare(s)
+                    {
+                        return (rereads, Err(e));
                     }
                     let v = &self.vmas[&s];
                     if v.prot & prot::EXEC != 0 {
@@ -3902,7 +4051,9 @@ impl Mm {
                         t.copied
                             .borrow_mut()
                             .retain(|off| *off < lo || *off + grain > hi);
-                        self.mmu.unmap(cursor, in_file - cursor).map_err(map_err)?;
+                        if let Err(e) = self.mmu.unmap(cursor, in_file - cursor).map_err(map_err) {
+                            return (rereads, Err(e));
+                        }
                         self.dirty = true;
                     }
                     let base = v.file_id.map_or(0, |f| f.2) + (cursor - s);
@@ -3934,7 +4085,8 @@ impl Mm {
             }
             cursor = stop;
         }
-        Ok(rereads)
+        let res = if has_gap { Err(Errno::ENOMEM) } else { Ok(()) };
+        (rereads, res)
     }
 
     /// Stores `data` at `addr` in a private file mapping, from the file again after
@@ -4038,37 +4190,76 @@ impl Mm {
         }
     }
 
-    /// `MADV_DONTDUMP`, `MADV_DODUMP`: whether `[addr, addr + len)` is written to core files; the
-    /// range must be fully mapped.
+    /// `MADV_DONTDUMP`, `MADV_DODUMP`: whether `[addr, addr + len)` is written to core files.
+    /// Acts on mapped portions in order and returns `ENOMEM` at the end if any gap existed.
     pub fn set_dontdump(&mut self, addr: u64, len: u64, dontdump: bool) -> Result<(), Errno> {
-        self.update_range(addr, len, |v| v.dontdump = dontdump)
+        self.update_range(addr, len, |_| Ok(()), |v| v.dontdump = dontdump)
     }
 
     /// `MADV_WIPEONFORK`, `MADV_KEEPONFORK`: whether a forked child gets `[addr, addr + len)`
-    /// zero-filled ([`Vma::wipeonfork`]); the range must be fully mapped (the caller checks that
-    /// wiping applies only to private anonymous memory).
+    /// zero-filled ([`Vma::wipeonfork`]). Wiping applies only to private anonymous memory
+    /// (`EINVAL` stops at the offending VMA, taking precedence over earlier unmapped gaps).
     pub fn set_wipeonfork(&mut self, addr: u64, len: u64, wipe: bool) -> Result<(), Errno> {
-        self.update_range(addr, len, |v| v.wipeonfork = wipe)
+        self.update_range(
+            addr,
+            len,
+            |v| {
+                if wipe && v.backing != Backing::Anonymous {
+                    Err(Errno::EINVAL)
+                } else {
+                    Ok(())
+                }
+            },
+            |v| v.wipeonfork = wipe,
+        )
     }
 
-    /// `MADV_DONTFORK`, `MADV_DOFORK`: whether a forked child gets `[addr, addr + len)` at all;
-    /// the range must be fully mapped.
+    /// `MADV_DONTFORK`, `MADV_DOFORK`: whether a forked child gets `[addr, addr + len)` at all.
+    /// Acts on mapped portions in order and returns `ENOMEM` at the end if any gap existed.
     pub fn set_dontfork(&mut self, addr: u64, len: u64, dontfork: bool) -> Result<(), Errno> {
-        self.update_range(addr, len, |v| v.dontfork = dontfork)
+        self.update_range(addr, len, |_| Ok(()), |v| v.dontfork = dontfork)
     }
 
-    /// Splits the VMAs at both ends of `[addr, addr + len)` and applies `f` to each VMA inside;
-    /// the range must be fully mapped.
-    fn update_range(&mut self, addr: u64, len: u64, f: impl Fn(&mut Vma)) -> Result<(), Errno> {
+    /// Walks mapped VMAs in `[addr, addr + len)` like Linux 6.1's `do_madvise`: validates each VMA
+    /// slice, splits at its ends and applies `f`, skipping unmapped gaps (returning `ENOMEM` at
+    /// the end if any gap existed) and stopping immediately on a VMA validation or split error.
+    fn update_range(
+        &mut self,
+        addr: u64,
+        len: u64,
+        validate: impl Fn(&Vma) -> Result<(), Errno>,
+        f: impl Fn(&mut Vma),
+    ) -> Result<(), Errno> {
         let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
-        self.check_mapped(addr, len)?;
-        self.room_for(self.splits(&[addr, end]))?;
-        self.split_at(addr);
-        self.split_at(end);
-        for (_, v) in self.vmas.range_mut(addr..end) {
-            f(v);
+        let mut cursor = addr;
+        let mut has_gap = false;
+        while cursor < end {
+            let Some((&s, v)) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|&(&s, v)| s + v.len > cursor)
+                .or_else(|| self.vmas.range(cursor..end).next())
+            else {
+                has_gap = true;
+                break;
+            };
+            if cursor < s {
+                has_gap = true;
+                cursor = s;
+                if cursor >= end {
+                    break;
+                }
+            }
+            validate(v)?;
+            let stop = end.min(s + v.len);
+            self.room_for(self.splits(&[cursor, stop]))?;
+            self.split_at(cursor);
+            self.split_at(stop);
+            f(self.vmas.get_mut(&cursor).unwrap());
+            cursor = stop;
         }
-        Ok(())
+        if has_gap { Err(Errno::ENOMEM) } else { Ok(()) }
     }
 
     /// Bytes already locked in `[addr, addr + len)` (mlock counts only the newly locked part).
@@ -4086,17 +4277,28 @@ impl Mm {
         self.vmas.values().filter(|v| v.locked).map(|v| v.len).sum()
     }
 
-    /// mlock, munlock: locks or unlocks `[addr, addr + len)` (widened to pages); the range must be
-    /// fully mapped.
+    /// mlock, munlock: locks or unlocks contiguous mapped VMAs in `[addr, addr + len)` (widened to
+    /// pages), matching Linux 6.1's `apply_vma_lock_flags`: stops at the first unmapped gap and
+    /// returns `ENOMEM`, leaving earlier contiguous VMAs updated and VMAs after the gap untouched.
     pub fn set_locked(&mut self, addr: u64, len: u64, locked: bool) -> Result<(), Errno> {
         let start = addr & !(PAGE_SIZE - 1);
         let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
-        self.check_mapped(start, end - start)?;
-        self.room_for(self.splits(&[start, end]))?;
-        self.split_at(start);
-        self.split_at(end);
-        for (_, v) in self.vmas.range_mut(start..end) {
-            v.locked = locked;
+        let mut cursor = start;
+        while cursor < end {
+            let Some((&s, v)) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|&(&s, v)| s + v.len > cursor)
+            else {
+                return Err(Errno::ENOMEM);
+            };
+            let stop = end.min(s + v.len);
+            self.room_for(self.splits(&[cursor, stop]))?;
+            self.split_at(cursor);
+            self.split_at(stop);
+            self.vmas.get_mut(&cursor).unwrap().locked = locked;
+            cursor = stop;
         }
         Ok(())
     }
@@ -4222,28 +4424,57 @@ impl Mm {
             .collect()
     }
 
-    /// Host address ranges of the shared file mappings in `[addr, addr + len)`, aligned to host
-    /// pages (msync's `MS_SYNC`: the host maps the object itself, so the host writes it back).
-    pub fn shared_file_ranges(&self, addr: u64, len: u64) -> Vec<(usize, usize)> {
-        let end = addr.saturating_add(len);
-        let page = appine_hal::page_size();
-        self.vmas
-            .iter()
-            .filter(|&(&s, v)| {
-                v.backing == Backing::Shared
-                    && v.file_id.is_some()
-                    && v.fill.is_none()
-                    && s < end
-                    && s + v.len > addr
-            })
-            .map(|(&s, v)| {
-                let from = s.max(addr);
-                let host = v.host.as_ptr() as usize + (from - s) as usize;
-                let start = host & !(page - 1);
-                let stop = (host + ((s + v.len).min(end) - from) as usize).next_multiple_of(page);
-                (start, stop - start)
-            })
-            .collect()
+    /// Returns the next mapped VMA slice overlapping `[cursor, end)` for Linux 6.1's per-VMA
+    /// `msync(2)` loop. When `sync` is true (`MS_SYNC`), populates [`MsyncTarget`] for shared
+    /// file mappings (retaining `Arc<HostRegion>` across the unlocked host `msync` call).
+    pub(crate) fn next_msync(&self, cursor: u64, end: u64, sync: bool) -> MsyncStep {
+        let Some((&s, v)) = self
+            .vmas
+            .range(..=cursor)
+            .next_back()
+            .filter(|&(&s, v)| s + v.len > cursor)
+            .or_else(|| self.vmas.range(cursor..end).next())
+        else {
+            return MsyncStep::Unmapped;
+        };
+        let start = cursor.max(s);
+        let stop = end.min(s + v.len);
+        let target = if sync && v.backing == Backing::Shared {
+            if let Some(fill) = &v.fill {
+                Some(MsyncTarget::Fuse(
+                    fill.clone(),
+                    v.offset() + (start - s),
+                    v.offset() + (stop - s),
+                ))
+            } else if v.file_id.is_some() && !v.foreign() && v.region.gpu.is_none() && !v.reserved()
+            {
+                let page = appine_hal::page_size();
+                let reg_start = v.region.base.as_ptr() as usize;
+                let reg_end = reg_start + v.region.len.next_multiple_of(page);
+                let host = v.host.as_ptr() as usize + (start - s) as usize;
+                let hstart = (host & !(page - 1)).max(reg_start);
+                let hstop = (host + (stop - start) as usize)
+                    .next_multiple_of(page)
+                    .min(reg_end);
+                (hstart < hstop).then(|| {
+                    MsyncTarget::Host(MsyncHost {
+                        _region: v.region.clone(),
+                        addr: hstart,
+                        len: hstop - hstart,
+                    })
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        MsyncStep::Vma {
+            start,
+            stop,
+            locked: v.locked,
+            target,
+        }
     }
 
     /// Implements munmap(2).
@@ -4278,9 +4509,11 @@ impl Mm {
             .range(addr..end)
             .map(|(&s, v)| (s, v.len))
             .collect();
+        let mut removed_shared = false;
         for (s, len) in doomed {
             let vma = self.vmas.remove(&s).unwrap();
             self.mmu.unmap(s, len).map_err(map_err)?;
+            removed_shared |= vma.backing == Backing::Shared && vma.may_write;
             if vma.prot & prot::EXEC != 0 {
                 self.code_ranges.push((s, len));
             }
@@ -4294,6 +4527,10 @@ impl Mm {
             self.graveyard.push(vma.region);
             self.dirty = true;
         }
+        if removed_shared {
+            // All doomed PTEs are unmapped above; refresh `shared_maps` to drop torn-down ranges.
+            self.note_shared_maps(false);
+        }
         if let Some((vdso, vdso_end)) = self.vdso_range()
             && addr < vdso_end
             && vdso < end
@@ -4304,7 +4541,46 @@ impl Mm {
         Ok(())
     }
 
-    /// mincore: whether each page of `[addr, addr + len)` is in host memory. The range must be
+    /// Fills `out` with 0/1 residency bytes for the next contiguous mapped chunk starting at
+    /// page-aligned `addr` within `[addr, end)` (at most `PAGE_SIZE` pages, matching Linux 6.1's
+    /// `do_mincore`), returning the guest address after the chunk or `ENOMEM` if `addr` is
+    /// unmapped.
+    pub(crate) fn residency_chunk(
+        &self,
+        addr: u64,
+        end: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<u64, Errno> {
+        const MAX_PAGES: u64 = PAGE_SIZE;
+        out.clear();
+        let (&s, v) = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .filter(|&(&s, v)| s + v.len > addr)
+            .ok_or(Errno::ENOMEM)?;
+        let stop = end
+            .min(s + v.len)
+            .min(addr.saturating_add(MAX_PAGES * PAGE_SIZE));
+        let backed_end = stop.min(s + v.host_len());
+        if addr < backed_end {
+            // SAFETY: [addr, backed_end) lies inside the host region.
+            let host = unsafe { v.host.as_ptr().add((addr - s) as usize) };
+            out.extend(
+                appine_hal::page_residency(host, (backed_end - addr) as usize)
+                    .into_iter()
+                    .map(u8::from),
+            );
+        }
+        out.resize(((stop - addr) / PAGE_SIZE) as usize, 0);
+        // Borrowed pages are in the owner's host memory.
+        for (&page, _) in self.cow.borrow().borrowed.range(addr..stop) {
+            out[((page - addr) / PAGE_SIZE) as usize] = 1;
+        }
+        Ok(stop)
+    }
+
+    /// Residency of `[addr, addr + len)` for core-dump sparseness and tests. The range must be
     /// fully mapped.
     pub fn residency(&self, addr: u64, len: u64) -> Result<Vec<bool>, Errno> {
         let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
@@ -4523,13 +4799,8 @@ impl Mm {
             .get_mut()
             .lent
             .append(&mut lent.into_iter().collect());
-        let ranges = self
-            .shared_maps
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !ranges.is_empty() {
-            child.note_shared_maps(false);
-        }
+        // `child.insert_vma` already populated `child.shared_maps` for every copied writable
+        // shared VMA.
         drop(child);
         Ok(shared)
     }
@@ -4640,9 +4911,10 @@ impl Mm {
     /// writable private pages (`syscall::fast`), must leave them to the locked path. Shared
     /// mappings of files opened read-only do not count: Go's toolchain reads files through them
     /// and also maps a telemetry counter file shared and writable in every process, hence
-    /// tracking by range. Recounted after such a mapping is created or moved
-    /// ([`Mm::note_shared_maps`]); torn-down ones need not be removed at once, it only means
-    /// futexes there take the locked path.
+    /// tracking by range. New and moved ranges are published in [`Mm::insert_vma`] and
+    /// [`Mm::move_range`] before their PTEs become visible in `self.mmu`, and pruned in
+    /// [`Mm::munmap`], [`Mm::move_range`] and [`Mm::deny_write`] via [`Mm::note_shared_maps`]
+    /// after the old PTEs are gone.
     pub fn shared_maps(&self) -> Arc<RwLock<Vec<(u64, u64)>>> {
         self.shared_maps.clone()
     }
@@ -5585,16 +5857,39 @@ impl Mm {
     /// Puts a whole VMA at `start`; the caller guarantees the range is free.
     fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
         self.room_for(1)?;
+        let shared_writable = v.backing == Backing::Shared && v.may_write;
+        // Publish writable shared ranges before installing PTEs so concurrent threads on the
+        // no-BKL futex fast path never observe a writable PTE before `shared_maps` sees it.
+        let prev_shared_len = if shared_writable {
+            let mut ranges = self
+                .shared_maps
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let prev = ranges.len();
+            ranges.push((start, start + v.len));
+            Some(prev)
+        } else {
+            None
+        };
         v.region.note_used(v.host, v.file_len as usize);
         let file = v.backing != Backing::Anonymous;
-        Self::map_pages(
+        if let Err(e) = Self::map_pages(
             &mut self.mmu,
             start,
             v.host,
             v.eager_len(),
             v.prefill_prot(),
             file,
-        )?;
+        ) {
+            if let Some(prev) = prev_shared_len {
+                // `map_pages` already unmapped any partial PTEs; roll back the tentative range.
+                self.shared_maps
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .truncate(prev);
+            }
+            return Err(e);
+        }
         self.exec_changed |= v.prot & prot::EXEC != 0;
         self.vmas.insert(start, v);
         Ok(())
@@ -10012,5 +10307,348 @@ mod tests {
         let mut pbuf = [0u8; 4];
         parent.read(UserSlice::new(addr, 4), &mut pbuf).unwrap();
         assert_eq!(&pbuf, b"BBBB");
+    }
+
+    #[test]
+    fn shared_maps_published_before_ptes_and_rolled_back_on_failure() {
+        struct MockGpuMapping {
+            base: NonNull<u8>,
+            len: usize,
+        }
+        unsafe impl Send for MockGpuMapping {}
+        unsafe impl Sync for MockGpuMapping {}
+        unsafe impl crate::gpu::Mapping for MockGpuMapping {
+            fn base(&self) -> NonNull<u8> {
+                self.base
+            }
+            fn size(&self) -> usize {
+                self.len
+            }
+        }
+        impl Drop for MockGpuMapping {
+            fn drop(&mut self) {
+                // SAFETY: allocated by appine_hal::map_anonymous below.
+                unsafe { appine_hal::unmap(self.base, self.len) };
+            }
+        }
+
+        let has_range = |mm: &Mm, addr: u64| {
+            mm.shared_maps()
+                .read()
+                .unwrap()
+                .iter()
+                .any(|&(s, e)| (s..e).contains(&addr))
+        };
+
+        let mut mm = Mm::new();
+        // 1. Writable shared anonymous mmap publishes in shared_maps.
+        let sh = mm
+            .mmap(
+                0,
+                2 * PAGE_SIZE,
+                RW,
+                flags::MAP_SHARED | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        assert!(has_range(&mm, sh));
+        assert!(has_range(&mm, sh + PAGE_SIZE));
+
+        // 2. Private anonymous mmap does not enter shared_maps.
+        let priv_a = mm
+            .mmap(
+                0,
+                PAGE_SIZE,
+                RW,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        assert!(!has_range(&mm, priv_a));
+
+        // 3. attach_shm publishes in shared_maps, even when mapped read-only (may_write is true).
+        let shm = SharedMemory::new(PAGE_SIZE).unwrap();
+        let shm_a = mm
+            .attach_shm(None, &shm, prot::READ, false, (1, 1))
+            .unwrap();
+        assert!(has_range(&mm, shm_a));
+
+        // 4. mmap_gpu publishes in shared_maps; deny_write removes it when non-writable.
+        let gpu_base = appine_hal::map_anonymous(PAGE_SIZE as usize, false).unwrap();
+        let gpu: Arc<dyn crate::gpu::Mapping> = Arc::new(MockGpuMapping {
+            base: gpu_base,
+            len: PAGE_SIZE as usize,
+        });
+        let gpu_a = mm
+            .mmap_gpu(0, PAGE_SIZE, prot::READ, flags::MAP_SHARED, gpu)
+            .unwrap();
+        assert!(has_range(&mm, gpu_a));
+        mm.deny_write(gpu_a, PAGE_SIZE);
+        assert!(!has_range(&mm, gpu_a));
+
+        // 5. insert_vma rollback: if map_pages fails (out-of-range guest address), shared_maps is
+        //    rolled back cleanly with no stale entry left behind.
+        let before = mm.shared_maps().read().unwrap().clone();
+        let (region, host) = Mm::new_anonymous(PAGE_SIZE, false).unwrap();
+        let bad_vma = mm.new_vma(
+            PAGE_SIZE,
+            PAGE_SIZE,
+            RW,
+            Backing::Shared,
+            true,
+            region,
+            host,
+        );
+        assert!(mm.insert_vma(1 << VA_BITS, bad_vma).is_err());
+        assert_eq!(*mm.shared_maps().read().unwrap(), before);
+
+        // 6. mremap move updates shared_maps to the destination and drops the old address.
+        let fixed_dst = 0x2000_0000;
+        let moved = mm
+            .mremap(sh, PAGE_SIZE, 2 * PAGE_SIZE, true, Some(fixed_dst))
+            .unwrap();
+        assert_eq!(moved, fixed_dst);
+        assert!(!has_range(&mm, sh));
+        assert!(has_range(&mm, sh + PAGE_SIZE));
+        assert!(has_range(&mm, fixed_dst));
+        assert!(has_range(&mm, fixed_dst + PAGE_SIZE));
+
+        // 7. mremap_dontunmap keeps both the moved destination and the shared alias at old.
+        let (du_dst, refills) = mm.mremap_dontunmap(fixed_dst, PAGE_SIZE, None).unwrap();
+        assert!(refills.is_empty());
+        assert!(has_range(&mm, fixed_dst));
+        assert!(has_range(&mm, du_dst));
+
+        // 8. mremap duplication (old_len == 0) adds the duplicate range.
+        let dup_dst = mm.mremap(du_dst, 0, PAGE_SIZE, true, None).unwrap();
+        assert!(has_range(&mm, dup_dst));
+
+        // 9. fork populates child's shared_maps directly via insert_vma.
+        let child_rc = mm.fork().unwrap();
+        assert!(has_range(&child_rc.borrow(), dup_dst));
+        assert!(has_range(&child_rc.borrow(), shm_a));
+        assert!(!has_range(&child_rc.borrow(), priv_a));
+
+        // 10. munmap removes torn-down ranges from shared_maps.
+        mm.munmap(dup_dst, PAGE_SIZE).unwrap();
+        assert!(!has_range(&mm, dup_dst));
+        assert!(has_range(&mm, du_dst));
+    }
+
+    #[test]
+    fn madvise_gap_semantics_match_linux() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let mut mm = Mm::new();
+        let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let base = 0x3000_0000;
+        // Layout: [p0: anon, p1: gap, p2: anon]
+        mm.mmap(base, 3 * PAGE_SIZE, RW, fixed, None).unwrap();
+        mm.munmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+
+        // MADV_DONTNEED across [p0, gap, p2]: zeroes both p0 and p2, returns ENOMEM.
+        mm.write(UserSlice::new(base, 4), b"AAAA").unwrap();
+        mm.write(UserSlice::new(base + 2 * PAGE_SIZE, 4), b"BBBB")
+            .unwrap();
+        let (rereads, res) = mm.discard_range(base, 3 * PAGE_SIZE);
+        assert!(rereads.is_empty());
+        assert_eq!(res, Err(Errno::ENOMEM));
+        let mut b0 = [1u8; 4];
+        let mut b2 = [1u8; 4];
+        mm.read(UserSlice::new(base, 4), &mut b0).unwrap();
+        mm.read(UserSlice::new(base + 2 * PAGE_SIZE, 4), &mut b2)
+            .unwrap();
+        assert_eq!(&b0, &[0; 4]);
+        assert_eq!(&b2, &[0; 4]);
+
+        // MADV_DONTNEED across [gap, locked p2]: EINVAL takes precedence over earlier gap ENOMEM.
+        mm.write(UserSlice::new(base + 2 * PAGE_SIZE, 4), b"CCCC")
+            .unwrap();
+        mm.set_locked(base + 2 * PAGE_SIZE, PAGE_SIZE, true)
+            .unwrap();
+        let (_, res) = mm.discard_range(base + PAGE_SIZE, 2 * PAGE_SIZE);
+        assert_eq!(res, Err(Errno::EINVAL));
+        mm.read(UserSlice::new(base + 2 * PAGE_SIZE, 4), &mut b2)
+            .unwrap();
+        assert_eq!(&b2, b"CCCC");
+        mm.set_locked(base + 2 * PAGE_SIZE, PAGE_SIZE, false)
+            .unwrap();
+
+        // Flag advice (MADV_DONTDUMP / MADV_DONTFORK / MADV_WIPEONFORK) across [p0, gap, p2]:
+        // sets flag on both p0 and p2, returns ENOMEM.
+        assert_eq!(
+            mm.set_dontdump(base, 3 * PAGE_SIZE, true),
+            Err(Errno::ENOMEM)
+        );
+        assert!(mm.vmas[&base].dontdump);
+        assert!(mm.vmas[&(base + 2 * PAGE_SIZE)].dontdump);
+
+        assert_eq!(
+            mm.set_dontfork(base, 3 * PAGE_SIZE, true),
+            Err(Errno::ENOMEM)
+        );
+        assert!(mm.vmas[&base].dontfork);
+        assert!(mm.vmas[&(base + 2 * PAGE_SIZE)].dontfork);
+
+        assert_eq!(
+            mm.set_wipeonfork(base, 3 * PAGE_SIZE, true),
+            Err(Errno::ENOMEM)
+        );
+        assert!(mm.vmas[&base].wipeonfork);
+        assert!(mm.vmas[&(base + 2 * PAGE_SIZE)].wipeonfork);
+
+        // MADV_WIPEONFORK on [anon p0, file p1, anon p2]: sets p0, stops at file p1 with EINVAL,
+        // leaves p2 unchanged.
+        mm.set_wipeonfork(base, 3 * PAGE_SIZE, false).unwrap_err();
+        let mut f = appine_hal::memfd(c"mm-madvise-gap").unwrap();
+        f.write_all(&[b'X'; 3 * PAGE_SIZE as usize]).unwrap();
+        mm.mmap(
+            base + PAGE_SIZE,
+            PAGE_SIZE,
+            RW,
+            flags::MAP_PRIVATE | flags::MAP_FIXED,
+            Some((f.as_raw_fd(), 0, true)),
+        )
+        .unwrap();
+        assert_eq!(
+            mm.set_wipeonfork(base, 3 * PAGE_SIZE, true),
+            Err(Errno::EINVAL)
+        );
+        assert!(mm.vmas[&base].wipeonfork);
+        assert!(!mm.vmas[&(base + 2 * PAGE_SIZE)].wipeonfork);
+
+        // MADV_FREE on [gap, file p1]: EINVAL overrides earlier gap ENOMEM.
+        mm.munmap(base, PAGE_SIZE).unwrap();
+        assert_eq!(mm.check_free(base, 2 * PAGE_SIZE), Err(Errno::EINVAL));
+
+        // MADV_REMOVE on [shared p0, gap, shared p2]: zeroes both shared pages, returns ENOMEM.
+        let sbase = 0x3100_0000;
+        mm.mmap(
+            sbase,
+            3 * PAGE_SIZE,
+            RW,
+            flags::MAP_SHARED | flags::MAP_FIXED,
+            Some((f.as_raw_fd(), 0, true)),
+        )
+        .unwrap();
+        mm.munmap(sbase + PAGE_SIZE, PAGE_SIZE).unwrap();
+        let plan = mm.remove(sbase, 3 * PAGE_SIZE);
+        assert!(plan.tmpfs.is_empty() && plan.fuse.is_empty());
+        assert_eq!(plan.result, Err(Errno::ENOMEM));
+        mm.read(UserSlice::new(sbase, 4), &mut b0).unwrap();
+        mm.read(UserSlice::new(sbase + 2 * PAGE_SIZE, 4), &mut b2)
+            .unwrap();
+        assert_eq!(&b0, &[0; 4]);
+        assert_eq!(&b2, &[0; 4]);
+
+        // MADV_REMOVE on [gap, read-only shared p2]: EACCES overrides earlier gap ENOMEM.
+        let ro_base = 0x3200_0000;
+        mm.mmap(
+            ro_base + PAGE_SIZE,
+            PAGE_SIZE,
+            prot::READ,
+            flags::MAP_SHARED | flags::MAP_FIXED,
+            Some((f.as_raw_fd(), 0, false)),
+        )
+        .unwrap();
+        let plan = mm.remove(ro_base, 2 * PAGE_SIZE);
+        assert_eq!(plan.result, Err(Errno::EACCES));
+    }
+
+    #[test]
+    fn mlock_munlock_mincore_and_msync_gap_semantics() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let mut mm = Mm::new();
+        let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let base = 0x3400_0000;
+        // Layout: [p0, gap, p2]
+        mm.mmap(base, 3 * PAGE_SIZE, RW, fixed, None).unwrap();
+        mm.munmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+
+        // mlock stops at the first gap: p0 locked, p2 untouched, returns ENOMEM.
+        assert_eq!(mm.set_locked(base, 3 * PAGE_SIZE, true), Err(Errno::ENOMEM));
+        assert!(mm.vmas[&base].locked);
+        assert!(!mm.vmas[&(base + 2 * PAGE_SIZE)].locked);
+
+        // mlock starting in a gap locks nothing.
+        assert_eq!(
+            mm.set_locked(base + PAGE_SIZE, 2 * PAGE_SIZE, true),
+            Err(Errno::ENOMEM)
+        );
+        assert!(!mm.vmas[&(base + 2 * PAGE_SIZE)].locked);
+
+        // munlock stops at the first gap: p0 unlocked, p2 remains locked, returns ENOMEM.
+        mm.set_locked(base + 2 * PAGE_SIZE, PAGE_SIZE, true)
+            .unwrap();
+        assert_eq!(
+            mm.set_locked(base, 3 * PAGE_SIZE, false),
+            Err(Errno::ENOMEM)
+        );
+        assert!(!mm.vmas[&base].locked);
+        assert!(mm.vmas[&(base + 2 * PAGE_SIZE)].locked);
+
+        // mincore residency_chunk reads p0, then stops with ENOMEM at the gap.
+        mm.write(UserSlice::new(base, 4), b"1234").unwrap();
+        let mut buf = Vec::new();
+        let next = mm
+            .residency_chunk(base, base + 3 * PAGE_SIZE, &mut buf)
+            .unwrap();
+        assert_eq!(next, base + PAGE_SIZE);
+        assert_eq!(buf, [1]);
+        assert_eq!(
+            mm.residency_chunk(next, base + 3 * PAGE_SIZE, &mut buf),
+            Err(Errno::ENOMEM)
+        );
+
+        // next_msync skips gaps and reports locked VMAs and shared file sync targets.
+        let mut f = appine_hal::memfd(c"mm-msync-gap").unwrap();
+        f.write_all(&[b'M'; 3 * PAGE_SIZE as usize]).unwrap();
+        let fbase = 0x3500_0000;
+        mm.mmap(
+            fbase,
+            3 * PAGE_SIZE,
+            RW,
+            flags::MAP_SHARED | flags::MAP_FIXED,
+            Some((f.as_raw_fd(), 0, true)),
+        )
+        .unwrap();
+        mm.munmap(fbase + PAGE_SIZE, PAGE_SIZE).unwrap();
+        mm.set_locked(fbase + 2 * PAGE_SIZE, PAGE_SIZE, true)
+            .unwrap();
+
+        match mm.next_msync(fbase, fbase + 3 * PAGE_SIZE, true) {
+            MsyncStep::Vma {
+                start,
+                stop,
+                locked,
+                target,
+            } => {
+                assert_eq!((start, stop, locked), (fbase, fbase + PAGE_SIZE, false));
+                assert!(matches!(target, Some(MsyncTarget::Host(_))));
+            }
+            MsyncStep::Unmapped => panic!("expected first shared file VMA"),
+        }
+        match mm.next_msync(fbase + PAGE_SIZE, fbase + 3 * PAGE_SIZE, true) {
+            MsyncStep::Vma {
+                start,
+                stop,
+                locked,
+                target,
+            } => {
+                assert_eq!(
+                    (start, stop, locked),
+                    (fbase + 2 * PAGE_SIZE, fbase + 3 * PAGE_SIZE, true)
+                );
+                assert!(matches!(target, Some(MsyncTarget::Host(_))));
+            }
+            MsyncStep::Unmapped => panic!("expected second shared file VMA after gap"),
+        }
+        assert!(matches!(
+            mm.next_msync(fbase + 3 * PAGE_SIZE, fbase + 4 * PAGE_SIZE, true),
+            MsyncStep::Unmapped
+        ));
     }
 }

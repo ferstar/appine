@@ -2,14 +2,14 @@
 
 use std::os::fd::AsRawFd;
 
-use appine_engine::{PAGE_SIZE, prot};
+use appine_engine::{PAGE_SIZE, VA_BITS, prot};
 
 use super::SysResult;
 use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile};
 use crate::kernel::Cx;
-use crate::mm::{FileSource, flags};
+use crate::mm::{FileSource, MsyncStep, MsyncTarget, flags};
 use crate::process::RLIMIT_MEMLOCK;
 use crate::vfs::dev::Device;
 use crate::vfs::ms;
@@ -330,11 +330,9 @@ pub(super) fn mremap(
     flags: u32,
     new_addr: u64,
 ) -> SysResult {
-    let r = remap(cx, old, old_len, new_len, flags, new_addr);
-    // What was moved or grown may be writable shared file mappings: the no-BKL futex must know
-    // where they are now
-    cx.mm().note_shared_maps(true);
-    r
+    // `Mm::insert_vma`, `Mm::move_range` and `Mm::munmap` keep `shared_maps` updated before any
+    // moved or newly installed writable shared PTEs become visible to the no-BKL futex path.
+    remap(cx, old, old_len, new_len, flags, new_addr)
 }
 
 fn remap(
@@ -501,29 +499,26 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
     if len == 0 {
         return Ok(0);
     }
-    if advice == MADV_REMOVE {
-        let tmpfs = cx.mm_mut().remove(addr, len)?;
-        for r in tmpfs {
-            super::fs::punch_tmpfs_maps(cx, r.mapping.ino, r.offset, r.offset + r.len);
-            r.mapping.punch(r.offset, r.len)?;
-        }
-        let ranges = cx.mm().fuse_ranges(addr, len);
-        for (fill, start, end) in ranges {
-            super::fuse::remove_mapped(cx, &fill, start, end)?;
-        }
-        return Ok(0);
-    }
-    let (locked, private_anon) = cx.mm().advice_range(addr, len)?;
     match advice {
-        MADV_DONTNEED if locked => Err(Errno::EINVAL),
-        // The other advice only affects performance and can be ignored; after DONTNEED anonymous
-        // memory must read back as 0, and private file mappings as the file
-        MADV_DONTNEED => {
-            let rereads = cx.mm_mut().discard(addr, len)?;
-            reread(cx, rereads)?;
-            Ok(0)
+        MADV_REMOVE => {
+            let plan = cx.mm_mut().remove(addr, len);
+            for r in plan.tmpfs {
+                super::fs::punch_tmpfs_maps(cx, r.mapping.ino, r.offset, r.offset + r.len);
+                r.mapping.punch(r.offset, r.len)?;
+            }
+            for (fill, start, end) in plan.fuse {
+                super::fuse::remove_mapped(cx, &fill, start, end)?;
+            }
+            plan.result.map(|()| 0)
         }
-        MADV_FREE | MADV_WIPEONFORK if !private_anon => Err(Errno::EINVAL),
+        // After DONTNEED anonymous memory must read back as 0, and private file mappings as the
+        // file.
+        MADV_DONTNEED => {
+            let (rereads, res) = cx.mm_mut().discard_range(addr, len);
+            reread(cx, rereads)?;
+            res.map(|()| 0)
+        }
+        MADV_FREE => cx.mm().check_free(addr, len).map(|()| 0),
         MADV_WIPEONFORK | MADV_KEEPONFORK => cx
             .mm_mut()
             .set_wipeonfork(addr, len, advice == MADV_WIPEONFORK)
@@ -542,12 +537,21 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_POPULATE_READ => {
             let prefill = matches!(advice, MADV_WILLNEED | MADV_POPULATE_READ);
             let file_only = !prefill;
-            let ranges = {
+            let (ranges, res) = {
                 let mm = cx.mm();
-                if prefill {
-                    mm.prefill_file_ptes(addr, len, advice == MADV_POPULATE_READ)?;
+                let prefill_res = if prefill {
+                    mm.prefill_file_ptes(addr, len, advice == MADV_POPULATE_READ)
+                } else {
+                    Ok(())
+                };
+                match prefill_res {
+                    Err(e) => (Vec::new(), Err(e)),
+                    Ok(()) => {
+                        let ranges = mm.advise_ranges(addr, len, file_only);
+                        let res = mm.check_mapped(addr, len);
+                        (ranges, res)
+                    }
                 }
-                mm.advise_ranges(addr, len, file_only)
             };
             if !ranges.is_empty() {
                 // Use MADV_WILLNEED on the host for MADV_POPULATE_READ so older host kernels
@@ -563,9 +567,9 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
                     }
                 });
             }
-            Ok(0)
+            res.map(|()| 0)
         }
-        _ => Ok(0),
+        _ => cx.mm().check_mapped(addr, len).map(|()| 0),
     }
 }
 
@@ -653,6 +657,9 @@ fn check_memlock(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
 }
 
 /// msync of shared files waits for the host object or the FUSE daemon.
+/// Walks VMAs in `[addr, end)` like Linux 6.1's `msync`: skips unmapped gaps (returning `ENOMEM`
+/// at the end), stops immediately with `EBUSY` on a locked VMA under `MS_INVALIDATE`, and syncs
+/// each shared file VMA in turn with the BKL released.
 pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResult {
     const MS_ASYNC: u32 = 1;
     const MS_INVALIDATE: u32 = 2;
@@ -663,32 +670,52 @@ pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResu
     {
         return Err(Errno::EINVAL);
     }
-    cx.mm().check_mapped(addr, len)?;
-    // Locked pages cannot be invalidated
-    if flags & MS_INVALIDATE != 0 && cx.mm().locked_in(addr, len) > 0 {
-        return Err(Errno::EBUSY);
+    let len = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
+    if end == addr {
+        return Ok(0);
     }
-    // A shared file mapping is the host's shared mapping of the object itself: MS_SYNC leaves the
-    // write-back to the host and waits with the BKL released. If another thread tears down the
-    // mapping meanwhile the host reports ENOMEM, which is ignored (unmapping already handed the
-    // data to the host page cache)
-    if flags & MS_SYNC != 0 {
-        let mapped = cx.mm().fuse_ranges(addr, len);
-        for (fill, start, end) in mapped {
-            super::fuse::sync_mapping(cx, &fill, start, end)?;
+    let sync = flags & MS_SYNC != 0;
+    let invalidate = flags & MS_INVALIDATE != 0;
+    let mut cursor = addr;
+    let mut unmapped = false;
+    while cursor < end {
+        let step = cx.mm().next_msync(cursor, end, sync);
+        match step {
+            MsyncStep::Unmapped => return Err(Errno::ENOMEM),
+            MsyncStep::Vma {
+                start,
+                stop,
+                locked,
+                target,
+            } => {
+                if start > cursor {
+                    unmapped = true;
+                }
+                // Locked pages cannot be invalidated (`EBUSY` takes precedence over earlier gaps).
+                if invalidate && locked {
+                    return Err(Errno::EBUSY);
+                }
+                // A shared file mapping is the host's shared mapping of the object itself: MS_SYNC
+                // leaves the write-back to the host and waits with the BKL released.
+                if let Some(target) = target {
+                    match target {
+                        MsyncTarget::Fuse(fill, fstart, fend) => {
+                            super::fuse::sync_mapping(cx, &fill, fstart, fend)?;
+                        }
+                        MsyncTarget::Host(host) => {
+                            cx.unlocked(move || host.sync())?;
+                        }
+                    }
+                }
+                cursor = stop;
+            }
         }
-        let ranges = cx.mm().shared_file_ranges(addr, len);
-        if !ranges.is_empty() {
-            cx.unlocked(move || {
-                ranges
-                    .into_iter()
-                    .try_for_each(|(a, n)| match appine_hal::msync(a, n) {
-                        Err(libc::ENOMEM) => Ok(()),
-                        r => r,
-                    })
-            })
-            .map_err(Errno)?;
-        }
+    }
+    if unmapped {
+        return Err(Errno::ENOMEM);
     }
     Ok(0)
 }
@@ -701,18 +728,32 @@ pub(super) fn munmap(cx: &mut Cx<'_>, addr: u64, len: u64) -> SysResult {
 }
 
 /// mincore: reports whether each page is resident, by host memory.
+/// Matches Linux 6.1's `mincore`: walks contiguous mapped VMAs from `addr` in chunks of at most
+/// `PAGE_SIZE` pages, writing each chunk to `vec` (without growing the stack) before advancing,
+/// and stops on the first unmapped page (`ENOMEM`) or write fault (`EFAULT`).
 pub(super) fn mincore(cx: &mut Cx<'_>, addr: u64, len: u64, vec: u64) -> SysResult {
     if !addr.is_multiple_of(PAGE_SIZE) {
         return Err(Errno::EINVAL);
     }
-    let out: Vec<u8> = cx
-        .mm()
-        .residency(addr, len)?
-        .into_iter()
-        .map(u8::from)
-        .collect();
-    cx.mm()
-        .write(crate::uaccess::UserSlice::new(vec, out.len()), &out)?;
+    let end = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .and_then(|l| addr.checked_add(l))
+        .filter(|&e| e <= 1 << VA_BITS)
+        .ok_or(Errno::ENOMEM)?;
+    let pages = (end - addr) / PAGE_SIZE;
+    if vec.checked_add(pages).is_none_or(|e| e > 1 << VA_BITS) {
+        return Err(Errno::EFAULT);
+    }
+    let mut cursor = addr;
+    let mut out_addr = vec;
+    let mut buf = Vec::new();
+    while cursor < end {
+        let next = cx.mm().residency_chunk(cursor, end, &mut buf)?;
+        cx.mm()
+            .write(crate::uaccess::UserSlice::new(out_addr, buf.len()), &buf)?;
+        out_addr += buf.len() as u64;
+        cursor = next;
+    }
     Ok(0)
 }
 
