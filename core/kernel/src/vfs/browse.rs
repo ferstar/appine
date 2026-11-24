@@ -207,13 +207,15 @@ pub enum Change {
     },
     /// Regular file `ino` (named `parent.1` in directory `parent.0`) was opened for writing,
     /// truncated if `truncated`; with `unshared` it shared its object until then and now has one
-    /// of its own, which its open descriptions and shared mappings must follow.
+    /// of its own, which its open descriptions must follow.
     Opened {
         ino: Ino,
         parent: (Ino, Vec<u8>),
         truncated: bool,
         unshared: bool,
     },
+    /// The object switch committed but the subsequent provider open failed.
+    Unshared(Ino),
     /// A regular file opened for writing was closed: something was written (the other side
     /// writes the host object directly, and the kernel does not see each write).
     Written { ino: Ino, parent: (Ino, Vec<u8>) },
@@ -495,14 +497,19 @@ pub fn open_write(
     changes: &mut Vec<Change>,
 ) -> Result<File, Errno> {
     let (ino, parent) = writable_file(store, top, path)?;
-    let unshared = store.held(ino)?;
-    // Truncated first: a file sharing its object then gets an empty one of its own rather than a
-    // copy (Store::make_private)
-    if truncate {
-        store.truncate(ino, 0)?;
+    let (file, unshared) = store.open_provider_object(ino, truncate, append)?;
+    let finish = || {
+        if truncate {
+            store.truncate_host_object(&file)?;
+        }
+        store.host_opened(ino, path)
+    };
+    if let Err(e) = finish() {
+        if unshared {
+            changes.push(Change::Unshared(ino));
+        }
+        return Err(e);
     }
-    let file = store.open_object_append(ino, append)?;
-    store.host_opened(ino, path)?;
     changes.push(Change::Opened {
         ino,
         parent,

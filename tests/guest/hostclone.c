@@ -6,6 +6,8 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -26,7 +28,7 @@ int main(int argc, char **argv)
         printf("cloned\n");
         return 0;
     }
-    if (argc == 4 && strcmp(argv[1], "hold") == 0) {
+    if (argc == 4 && (strcmp(argv[1], "hold") == 0 || strcmp(argv[1], "hold-truncate") == 0)) {
         int fd = open(argv[2], O_RDONLY);
         int src = open(argv[3], O_RDONLY);
         char *dst_map = mmap(NULL, 5, PROT_READ, MAP_SHARED, fd, 0);
@@ -39,6 +41,17 @@ int main(int argc, char **argv)
         fflush(stdout);
         if (getchar() == EOF)
             return 1;
+        if (strcmp(argv[1], "hold-truncate") == 0) {
+            pid_t child = fork();
+            if (child < 0) return 1;
+            if (child == 0) _exit(*(volatile char *)dst_map);
+            int status;
+            if (waitpid(child, &status, 0) < 0 || !WIFSIGNALED(status) || WTERMSIG(status) != SIGBUS)
+                return 1;
+            puts("tail faulted");
+            fflush(stdout);
+            if (getchar() == EOF) return 1;
+        }
         char buf[5];
         if (pread(fd, buf, sizeof buf, 0) != sizeof buf)
             return 1;

@@ -262,9 +262,12 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         if (currentTab != null) scroll.post { revealCurrentTab() }
     }
 
-    fun setImportEnabled(enabled: Boolean) {
-        importButton.isEnabled = enabled
-        importButton.alpha = if (enabled) 1f else 0.38f
+    fun setImportState(canStart: Boolean, copying: Boolean) {
+        importButton.isEnabled = canStart || copying
+        importButton.alpha = if (importButton.isEnabled) 1f else 0.38f
+        importButton.text = if (copying) "■" else "@"
+        importButton.contentDescription = context.getString(if (copying) R.string.cancel_file_import else R.string.import_files)
+        importButton.tooltipText = importButton.contentDescription
     }
 
     fun setListOpen(open: Boolean) {

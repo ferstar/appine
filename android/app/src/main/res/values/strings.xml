@@ -84,6 +84,8 @@
 
     <!-- File import -->
     <string name="import_files">Import files</string>
+    <string name="cancel_file_import">Cancel file import</string>
+    <string name="import_files_cancelled">Import cancelled.</string>
     <string name="importing_files">Importing files…</string>
     <string name="import_file_name">Imported file</string>
     <string name="import_file_failed">Could not import %1$s: %2$s</string>

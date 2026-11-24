@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: shared terminal control colours with stronger state contrast)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: switch the import button to a labelled stop action during a copy)
 
 ## Responsibilities
 
@@ -22,7 +22,7 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 - `TabBarView` — the tab bar (optional `⧉` fixed at the left, a scrolling row of numbered tabs, with `×`, `+`, Import and `⋮` over its
   end): shows the sessions and the current one it is given (`render`) and sends taps on tabs and
   buttons and the ⋮ anchor to a `Target` (`show`, `closeCurrent`,
-  `newTab`, `importFiles`, `menu`, `listTabs`); `setImportEnabled` controls the import button;
+  `newTab`, `importFiles`, `menu`, `listTabs`); `setImportState` controls the import button;
   `setListOpen` highlights the list button; `setListVisible` changes its visibility and the row's start margin;
   it draws the other tabs' progress and status marks and redraws them
   on `refreshStatus`; `Tab` (one per session: its number in the row, which slides, rolls to a new
@@ -43,7 +43,7 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 
 ## Public entry points
 
-- `TabBarView.render`, `refreshStatus`, `setImportEnabled`, `setListOpen`, `setListVisible`.
+- `TabBarView.render`, `refreshStatus`, `setImportState`, `setListOpen`, `setListVisible`.
 - `TabListView.open`, `render`, `refreshStatus`, `close`; `ProgressLine.show`.
 - `TabBarView.Target` and `TabListView.Target` send user actions to MainActivity.
 
@@ -119,7 +119,7 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 - The five fixed buttons (`⧉`, `×`, `+`, `@`, `⋮`) use native Android tooltips with the same
   localized names as their accessibility descriptions. Long presses show the name without
   running the click action, as for numbered tabs' title tooltips.
-- Import announces "Import files". The four fixed controls reserve 128 dp at the end of the
+- Import announces "Import files". During a copy it shows ■ and announces "Cancel file import". The four fixed controls reserve 128 dp at the end of the
   scrolling row; the fade still reaches into `×`. The list button reserves another 32 dp at the left
   only while shown. Hiding it uses `GONE` and removes the row's start margin; changing visibility
   reveals the current tab after layout, and layout updates gesture exclusion to the new row bounds.
@@ -207,7 +207,7 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   cleared after each draw.
 - The tab bar's buttons are characters in the system font: `⧉`, `+`, `@`, `⋮` and `×` (the multiplication
   sign, which Roboto draws like its `+`). `✕` (U+2715) is not in Roboto, and the fallback font's
-  glyph is larger and thinner than the others. `@` opens file import.
+  glyph is larger and thinner than the others. `@` opens file import; ■ cancels the active copy.
 - The programmatically built tab list must assign `verticalScrollbarThumbDrawable` from the
   theme, as the terminal view does; enabling the scrollbar alone does not initialize its drawable.
 - The tab row and the extra keys' grid draw into their end padding (`clipToPadding` off).

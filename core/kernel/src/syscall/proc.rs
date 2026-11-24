@@ -267,7 +267,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let euid = child_cred.euid;
     if flags & CLONE_NEWUSER != 0 {
         let chrooted = super::ns::chrooted(cx);
-        super::ns::new_user_ns(cx.k(), &mut child_cred, chrooted)?;
+        super::ns::new_user_ns(cx, &mut child_cred, chrooted)?;
     }
     if flags & CLONE_NEW_ADMIN != 0 && !child_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
@@ -1845,7 +1845,7 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     let euid = new_cred.euid;
     if flags & CLONE_NEWUSER != 0 {
         let chrooted = super::ns::chrooted(cx);
-        super::ns::new_user_ns(cx.k(), &mut new_cred, chrooted)?;
+        super::ns::new_user_ns(cx, &mut new_cred, chrooted)?;
     }
     if flags & CLONE_NEW_ADMIN != 0 && !new_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);

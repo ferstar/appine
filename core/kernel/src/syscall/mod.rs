@@ -44,7 +44,7 @@ pub(crate) use loopdev::{LoopOpen, Loops};
 pub(crate) use misc::Restart;
 pub(crate) use mount::collect_unused;
 pub(crate) use mqueue::{
-    Limits as MqLimits, MessageQueue, MqDir, closed as mqueue_closed, find as mqueue_find,
+    Limits as MqLimits, MessageQueue, MqDir, MqUsage, closed as mqueue_closed, find as mqueue_find,
 };
 pub(crate) use net::{SocketRef, deliver_dns, unmap_addr};
 pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};

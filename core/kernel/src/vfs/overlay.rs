@@ -733,8 +733,8 @@ impl Overlays {
                 mode::S_IFREG => {
                     let (ino, file) = s.create_file(dir, &name, perm, st.uid, st.gid)?;
                     match what {
-                        CopyUp::All => s.share(lower, ino)?,
-                        CopyUp::Copied => {
+                        CopyUp::All if s.try_share(lower, ino)? => {}
+                        CopyUp::All | CopyUp::Copied => {
                             let from = s.open_object(lower, false)?;
                             let len = from
                                 .metadata()

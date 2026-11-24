@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: sample rootfs metadata for host observers)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: message queue soft limits are enforced at queue creation)
 
 ## Responsibilities
 
@@ -50,7 +50,7 @@ and `kernel/oom`.
   other processes go by, kept after it ends), pid namespace, cgroup, tracers of its exit, AIO,
   controlling terminal and `tty_old_pgrp`, timers.
 - Default rlimits: stack 8 MB (hard unlimited), core 0, open files 1024/4096, memlock 8 MB, nproc
-  half of threads-max, pending signals 16384, message queues 819200 (not enforced), nice and
+  half of threads-max, pending signals 16384, message queues 819200 (charged on queue creation by `kernel/ipc`), nice and
   real-time priority 0, the rest unlimited.
 - `ExitStatus` — exited with a code or killed by a signal (with pc, fault address, core dump);
   encoded for wait.

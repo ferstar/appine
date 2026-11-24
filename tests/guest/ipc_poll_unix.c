@@ -43,6 +43,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/sem.h>
+#include <sys/resource.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -990,6 +991,30 @@ static void test_mqueue_root_perms_and_sticky(void)
     CHECK(unshare(CLONE_NEWIPC | CLONE_NEWNS) == 0, "unshare ipc+ns");
     mkdir("/tmp/mq_mnt", 0755);
     CHECK(mount("none", "/tmp/mq_mnt", "mqueue", 0, NULL) == 0, "mount mqueue");
+
+    /* A default queue costs 10 * (8192 + 48 + 48) bytes on arm64. Its inode remains
+     * charged after unlink until the last open reference is dropped. */
+    struct rlimit original;
+    CHECK(getrlimit(RLIMIT_MSGQUEUE, &original) == 0, "get message queue limit");
+    struct rlimit one = original;
+    one.rlim_cur = 10 * (8192 + 48 + 48);
+    CHECK(setrlimit(RLIMIT_MSGQUEUE, &one) == 0, "set one-queue limit");
+    int charged = syscall(SYS_mq_open, "charged", O_CREAT | O_RDWR, 0600, NULL);
+    CHECK(charged >= 0, "create at limit");
+    int pin = open("/tmp/mq_mnt/charged", O_PATH);
+    CHECK(pin >= 0, "pin queue inode");
+    CHECK(syscall(SYS_mq_unlink, "charged") == 0, "unlink charged queue");
+    CHECK(open("/tmp/mq_mnt/next", O_CREAT | O_RDWR, 0600) < 0 && errno == EMFILE,
+          "mounted mqueue must include unlinked queue charge");
+    close(charged);
+    CHECK(open("/tmp/mq_mnt/next", O_CREAT | O_RDWR, 0600) < 0 && errno == EMFILE,
+          "O_PATH alone must retain queue charge");
+    close(pin);
+    charged = open("/tmp/mq_mnt/next", O_CREAT | O_RDWR, 0600);
+    CHECK(charged >= 0, "last close releases charge");
+    close(charged);
+    CHECK(syscall(SYS_mq_unlink, "next") == 0, "unlink named queue");
+    CHECK(setrlimit(RLIMIT_MSGQUEUE, &original) == 0, "restore message queue limit");
 
     /* Root creates queue q1 owned by uid 0 with mode 0666 (umask 0 so others have rw) */
     umask(0);

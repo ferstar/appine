@@ -1039,6 +1039,8 @@ pub(crate) struct UserNs {
     /// The creator had `CAP_SETFCAP` in its effective set (Linux's `parent_could_setfcap`): only
     /// then may a process inside map the parent's uid 0 into it.
     pub parent_could_setfcap: bool,
+    /// The creator's soft message-queue limit, applied to charges in the parent namespace.
+    pub mq_max: Cell<u64>,
 }
 
 impl UserNs {
@@ -1067,6 +1069,7 @@ impl UserNs {
             gid_map: RefCell::new(IdMap::identity()),
             setgroups: Cell::new(true),
             parent_could_setfcap: true,
+            mq_max: Cell::new(u64::MAX),
         })
     }
 
@@ -1083,6 +1086,7 @@ impl UserNs {
             gid_map: RefCell::new(IdMap::default()),
             setgroups: Cell::new(parent.setgroups.get()),
             parent_could_setfcap: could_setfcap,
+            mq_max: Cell::new(u64::MAX),
         })
     }
 

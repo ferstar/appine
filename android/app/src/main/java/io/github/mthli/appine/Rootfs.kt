@@ -126,6 +126,9 @@ internal object Rootfs {
      * the store holds the write lock.
      */
     val access = ReentrantReadWriteLock()
+    /** Read and advanced under access so a staged import cannot publish into a replacement store. */
+    var generation = 0L
+        private set
 
     fun store(context: Context): File = File(context.filesDir, "rootfs")
 
@@ -995,6 +998,7 @@ netns = "host"
 
     /** Deletes the app's store (distro switch, rootfs reset). The kernel must be stopped first. */
     fun reset(context: Context) = access.write {
+        generation++
         File(context.filesDir, "rootfs.tmp").deleteRecursively()
         if (!store(context).deleteRecursively()) Log.w(TAG, "cannot delete all of the rootfs")
     }

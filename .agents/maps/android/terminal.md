@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: settling clipboard questions when changing sessions or stopping)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: route the tab bar stop button to the retained import)
 
 ## Responsibilities
 
@@ -206,7 +206,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 - `android/file-import` owns retained selection, copying and results. The activity launches
   `OpenMultipleDocuments`, enables Import from `occupied`, resumes copies only when unlocked,
-  and presents/copies paths through a protected dialog. Recreation must not consume a result.
+  routes the tab bar stop button to the active copy, and presents/copies paths through a protected dialog. Recreation must not consume a result.
 
 ### Hardware-keyboard shortcuts
 

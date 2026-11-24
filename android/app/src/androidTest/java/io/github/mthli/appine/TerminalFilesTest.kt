@@ -25,6 +25,11 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.FileInputStream
+import java.util.concurrent.CancellationException
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
+import kotlin.concurrent.read
 import java.io.IOException
 import java.io.InputStream
 import java.util.UUID
@@ -63,7 +68,14 @@ class TerminalFilesTest {
 
     @Test
     fun copyIntoHomeNotifiesDocumentsProvider() {
-        val uri = DocumentsContract.buildChildDocumentsUri(Documents.authority(context), "/root")
+        val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val privacy = Settings.privacyMode(context)
+        val previous = prefs.getBoolean("file_access", false)
+        Settings.setPrivacyMode(context, false)
+        Settings.setFileAccess(context, true)
+        val generation = Native.browseGenerations(store, arrayOf("/root")).single()
+        val id = if (generation == 0L) "/root" else "${generation}/root"
+        val uri = DocumentsContract.buildChildDocumentsUri(Documents.authority(context), id)
         val notified = CountDownLatch(1)
         val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
             override fun onChange(selfChange: Boolean) { notified.countDown() }
@@ -75,6 +87,8 @@ class TerminalFilesTest {
             assertTrue("Expected Files app child listing notification for /root", notified.await(5, TimeUnit.SECONDS))
         } finally {
             context.contentResolver.unregisterContentObserver(observer)
+            Settings.setPrivacyMode(context, privacy)
+            Settings.setFileAccess(context, previous)
         }
     }
 
@@ -169,6 +183,46 @@ class TerminalFilesTest {
             assertNull(Native.readFile(store, "/root/injected"))
         } finally {
             Native.stop(machine)
+        }
+    }
+
+    @Test
+    fun cancellationReleasesImportWhileProviderStillWaits() {
+        val batch = ImportBatch()
+        fun publish(input: FileInputStream, name: String) = Rootfs.access.read {
+            TerminalFiles.copyIntoHome(store, account, name, check = batch::check) { input }
+        }
+        batch.stage(root, { output, _ -> output.write(42) }) { publish(it, "first") }
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val exited = CountDownLatch(1)
+        val blocked = FutureTask {
+            batch.stage(root, { _, _ ->
+                started.countDown()
+                try {
+                    while (true) {
+                        try { release.await(); break } catch (_: InterruptedException) { }
+                    }
+                } finally {
+                    exited.countDown()
+                }
+            }) { publish(it, "second") }
+        }
+        Thread(blocked).start()
+        try {
+            assertTrue(started.await(5, TimeUnit.SECONDS))
+            val writer = Rootfs.access.writeLock()
+            assertTrue(writer.tryLock(5, TimeUnit.SECONDS))
+            writer.unlock()
+            batch.cancel()
+            val error = assertThrows(ExecutionException::class.java) { blocked.get(5, TimeUnit.SECONDS) }
+            assertTrue(error.cause is CancellationException)
+            assertEquals(1L, exited.count)
+            assertArrayEquals(byteArrayOf(42), Native.readFile(store, "/root/first"))
+            assertNull(Native.readFile(store, "/root/second"))
+        } finally {
+            release.countDown()
+            assertTrue(exited.await(5, TimeUnit.SECONDS))
         }
     }
 

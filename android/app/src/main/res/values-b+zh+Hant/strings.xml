@@ -82,6 +82,8 @@
 
     <!-- File import -->
     <string name="import_files">匯入檔案</string>
+    <string name="cancel_file_import">取消檔案匯入</string>
+    <string name="import_files_cancelled">已取消匯入。</string>
     <string name="importing_files">正在匯入檔案…</string>
     <string name="import_file_name">匯入的檔案</string>
     <string name="import_file_failed">無法匯入 %1$s：%2$s</string>

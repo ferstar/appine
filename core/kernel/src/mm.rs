@@ -564,17 +564,6 @@ impl Vma {
         let page = (self.offset() + (addr - start)) / PAGE_SIZE;
         (addr < start + self.contents_len() && !fill.has(page)).then(|| (fill.clone(), page))
     }
-
-    /// File offset to remap when store inode `ino` moves to `to`. FUSE inode numbers belong
-    /// to the daemon and can coincide with an unrelated store inode.
-    fn file_move_offset(&self, ino: u64, to: (u64, u64)) -> Option<u64> {
-        let (dev, host_ino, offset) = self.file_id?;
-        (self.backing == Backing::Shared
-            && self.ino == ino
-            && self.fill.is_none()
-            && (dev, host_ino) != to)
-            .then_some(offset)
-    }
 }
 
 /// Whether VMA `b`, starting where `a` ends, is part of the same VMA on Linux. Linux merges
@@ -4030,58 +4019,6 @@ impl Mm {
             .any(|v| v.file_id.is_some_and(|(d, i, _)| (d, i) == (dev, ino)))
     }
 
-    /// Before moving shared mappings of store inode `ino` to host file `to`, remove entries
-    /// past its new length. Sync every changed address space before calling [`Mm::file_moved`]
-    /// in any of them, since a host region can be shared across fork.
-    pub fn file_moving(&mut self, ino: u64, to: (u64, u64), len: u64) -> bool {
-        self.clip_file_mappings(len, |v| v.file_move_offset(ino, to))
-    }
-
-    /// Every address space has gone through [`Mm::file_moving`]: the shared mappings of store
-    /// file `ino` still on an older object map `to` (host file `to_id`) instead, over the same
-    /// host addresses, so the page table and the TLBs stay valid and the mappings show what is
-    /// written to the file from now on, as Linux's mappings of the inode do. A host region shared
-    /// with other pieces or address spaces (splits, fork) is mapped once here, and again,
-    /// harmlessly, for another address space still pointing at the old object.
-    pub fn file_moved(
-        &mut self,
-        ino: u64,
-        to: &Rc<OwnedFd>,
-        to_id: (u64, u64),
-    ) -> Result<(), Errno> {
-        use std::os::fd::AsRawFd;
-        let mut done: Vec<*const HostRegion> = Vec::new();
-        for v in self.vmas.values_mut() {
-            let Some(offset) = v.file_move_offset(ino, to_id) else {
-                continue;
-            };
-            let region = &v.region;
-            if !done.contains(&Arc::as_ptr(region)) {
-                // The region starts at the host page holding the file offset its first piece was
-                // mapped from
-                let inside = v.host.as_ptr() as u64 - region.base.as_ptr() as u64;
-                let at = offset.checked_sub(inside).ok_or(Errno::EINVAL)?;
-                // SAFETY: the region is a host file mapping owned by these VMAs
-                unsafe {
-                    appine_hal::map_file_over(
-                        region.base,
-                        region.len,
-                        to.as_raw_fd(),
-                        at,
-                        v.may_write,
-                    )
-                }
-                .map_err(Errno)?;
-                done.push(Arc::as_ptr(region));
-            }
-            v.file_id = Some((to_id.0, to_id.1, offset));
-            if let Some((fd, _)) = &mut v.file {
-                *fd = to.clone();
-            }
-        }
-        Ok(())
-    }
-
     /// Host file (`dev`, `ino`) was truncated to `size` bytes: pages past the new end in the VMAs
     /// mapping it are removed from the page table, so later guest accesses get SIGBUS, as with
     /// truncate on Linux. Otherwise the host would get SIGBUS accessing the mapping past the end
@@ -7230,7 +7167,7 @@ mod tests {
     }
 
     #[test]
-    fn remapped_fuse_pages_do_not_follow_a_store_inode() {
+    fn remapped_fuse_pages_keep_the_daemon_offset() {
         let size = 2 * PAGE_SIZE;
         let host = appine_hal::memfd(c"appine-mm-fill").unwrap();
         host.set_len(size).unwrap();
@@ -7242,7 +7179,6 @@ mod tests {
             .unwrap();
         mm.label(a, PAGE_SIZE, None, 42);
         mm.remap_file_pages(a, PAGE_SIZE, PAGE_SIZE).unwrap();
-        assert_eq!(mm.vmas[&a].file_move_offset(42, (0, 0)), None);
         assert_eq!(mm.fill_wanted(a, prot::READ).unwrap().1, 1);
     }
 

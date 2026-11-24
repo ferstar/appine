@@ -389,8 +389,12 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     // ---- Importing files ----
 
     private fun importFiles() {
-        val s = service ?: return
-        if (Privacy.locked(this) || s.machine == 0L) return
+        if (Privacy.locked(this)) return
+        if (files.copying) {
+            files.cancelImport()
+            return
+        }
+        if ((service?.machine ?: 0L) == 0L) return
         if (!files.begin(Settings.login(this))) return
         try {
             pickFiles.launch(arrayOf("*/*"))
@@ -401,7 +405,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     }
 
     private fun updateImport() {
-        layout.tabBar.setImportEnabled(!files.occupied && (service?.machine ?: 0L) != 0L)
+        layout.tabBar.setImportState(!files.occupied && (service?.machine ?: 0L) != 0L, files.copying)
         if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || Privacy.locked(this)) return
         if (files.importSelected()) showToast(getString(R.string.importing_files))
         val result = files.result ?: return

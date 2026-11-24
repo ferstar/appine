@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: share SEM_UNDO via CLONE_SYSVSEM, enforce semmns/shmall, check mqueue root perms and S_ISVTX)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: charge POSIX queue capacity by real uid across IPC namespaces until inode release)
 
 ## Responsibilities
 
@@ -193,6 +193,11 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 
 ### POSIX message queues
 
+- A new queue reserves its maximum payload plus arm64 message and priority-node overhead.
+  Both creation paths charge the real uid in its user namespace against the soft
+  `RLIMIT_MSGQUEUE`, and charge ancestor namespace owners against the limits saved at creation.
+  An over-limit creation returns `EMFILE`. The queue owns its charge until its name and final
+  reference (including an O_PATH descriptor) have gone.
 - mq_open: the name (one leading `/` stripped) must be 1 to 255 bytes without `/`, `.` or `..`;
   access mode 3 is `EINVAL`; checks `MAY_EXEC` on `mq_dir` before lookup. An existing queue is
   `EEXIST` with `O_CREAT|O_EXCL`, else permission by access mode. A new one: checks
@@ -283,8 +288,7 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 
 ## Confirmed bugs / technical debt
 
-- **`RLIMIT_MSGQUEUE` is not enforced:** `queues_max` and per-queue limits apply, but
-  `RLIMIT_MSGQUEUE` is not enforced.
+None recorded.
 
 ## Open questions
 

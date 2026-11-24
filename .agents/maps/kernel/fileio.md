@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: check shared mapping migration before publishing a copied object)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pin shared mapping objects and prepare replacement handles before publishing a copy)
 
 ## Responsibilities
 
@@ -167,28 +167,18 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 
 ### Clones and unsharing
 
-- Before a regular file changes it gets an object of its own if it shares one: a write or host copy
-  through a `cow` description, ftruncate, fallocate and a `MAP_SHARED` mmap of a read-write
-  description (before mmap's other checks) call `prepare_write`, which acts on `cow` descriptions;
-  truncate and `O_TRUNC` of a held file call `make_private` directly; both run before set-id bits
-  are removed. `make_private` waits on the lock channel while the inode is in `Kernel::unsharing`,
-  asks `kernel/store` to unshare, and when a copy is needed makes it (or what a truncation keeps)
-  with the BKL released while the inode is in that set, retrying when the object changed
-  meanwhile. After the copy it collects the live address spaces under the BKL. A busy one makes
-  it discard the copy and return `EBUSY` before the inode changes objects. Then, when the file
-  was held or a description of it is still `cow`, `rehome` gives
-  every description of the file it can borrow (fd tables, AF_UNIX
-  messages in flight, loop backing files) a new handle on its current object, read-only and `cow`
-  while still shared, retires the old handles and forgets the cached executable; a busy
-  description is logged and skipped. After a copy, `move_mappings` reopens the current object
-  without unsharing it and moves the inode's shared mappings still on another object (`kernel/mm`'s
-  `file_moving`/`file_moved`) under the same BKL hold. A Files app open that unshares a file
-  runs both `rehome` and `move_mappings` after acquiring each running kernel's BKL.
+- Writes to a held file, truncation, allocation and shared mapping creation give the inode an
+  object of its own. Guest unsharing copies outside the BKL while other writers wait. Back under
+  the BKL it prepares replacement handles for open descriptions before publishing the copy,
+  abandons it on failure and retries if the original object changed. Replaced handles remain
+  open until description close for I/O in flight. A Files app unshare rehomes descriptions
+  during change replay. Before exposing a shared mapping, the kernel reconciles open
+  descriptions with its pinned host object.
 - Clones: copy_file_range from offset 0 to offset 0 of a whole non-empty input into an output no
   longer than it, and FICLONE or FICLONERANGE doing the same, share the input's object
   (`try_share`) unless either is not a regular store file, a memfd, opened through an overlay or on
   tmpfs, both are one inode, the input is deleted, open for writing in this kernel by a description
-  not marked `cow`, or mapped shared where it may become writable, either is open for writing by
+  not marked `cow`, or has a shared mapping pin, either is open for writing by
   the Files app (`host_writing`), or the output is mapped (privately too), sealed or being
   unshared; then they copy. The output's set-id bits go first and its descriptions move to the
   shared object (`rehome`); copy_file_range returns the whole length at once and advances the
@@ -202,8 +192,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   reserved fields (`EINVAL`), directories (`EISDIR`) and other non-regular files (`EINVAL`), then
   is `EOPNOTSUPP`.
 - An overlay copy-up shares the lower file's object too, through `kernel/overlay`'s `copy_up`,
-  which copies the data instead when a writable shared mapping or the Files app could write the
-  lower object in place, and rehomes the lower file's descriptions open for writing.
+  which copies the data instead when the lower object has a shared mapping pin or a host writer, and rehomes the lower file's descriptions open for writing.
 
 ## Dependencies (inbound / outbound)
 
@@ -217,7 +206,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - `kernel/vfs`: `opens_of` before releasing an unlinked file's object, and `remove_privs` shared
   privileges rule.
 - `kernel/overlay`: `prepare_write`, `rehome` after copy-up; `kernel/pipe`: file checks and the
-  read and write paths of a splice's other end; `kernel/mm`: `prepare_write` for shared mappings.
+  read and write paths of a splice's other end; `kernel/mm`: `make_private` and `reconcile_mapping` for shared mappings.
 - `kernel/inotify`: `host_unshared`; `kernel/aio` and `kernel/loop`: `IoFlags`, `read_file`/
   `read_file_with`, `write_file`/`write_file_with`, `read_bytes`, `write_bytes`, `write_sync`,
   `vectored`/`vectored_with`, `fsync`, `has_fsync`, `seekable`, `append_offset`; `kernel/fuse`:
@@ -237,8 +226,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   writes), `kernel/procfs`, `kernel/sysctl`, `kernel/sysfs` (synthetic content regeneration and
   writes), `kernel/tty` (terminal read/write), `kernel/ipc` (mqueue reads), `kernel/poll` (eventfd
   and timerfd reads), `kernel/net` (socket I/O), `kernel/unix` (files in flight for `opens_of`).
-- `kernel/mm`: `grow_for` on buffer faults, `writably_maps`, `maps_file`, `file_moving`,
-  `file_moved`, `file_truncated`.
+- `kernel/mm`: `grow_for` on buffer faults, `writably_maps`, `maps_file` and `file_truncated`.
 - Credentials (`permission`, `CAP_FSETID`), signals (`SIGPIPE`, `SIGXFSZ`), `appine_hal` (pread,
   pwrite, poll, lseek, fsync, `copy_file`, fallocate, `sync_file_range`, `cachestat`,
   `fill_random`), and the kernel's wake objects and `Cx::unlocked`.
@@ -281,8 +269,6 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - **Private mappings do not follow a file to its own object:** a private mapping made while the
   file shared an object keeps the shared data in pages it has not copied after a write through
   another descriptor.
-- **Host errors during shared mapping migration:** after publication, a failure to reopen or stat
-  the object skips migration. A failed host remap can also leave mappings on the previous object.
 - **Clone fidelity:** FICLONE and FICLONERANGE work on a store that reports ext4's magic (ext4
   says `EOPNOTSUPP`); partial ranges are copied, not shared; `FIDEDUPERANGE` is `EOPNOTSUPP`; a
   whole-file copy_file_range returns more than `MAX_RW_COUNT` in one call.

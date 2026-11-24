@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: watch identity across bind mounts and synthetic filesystem instances)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: provider unshare replay refreshes descriptors while shared mappings pin their object)
 
 ## Responsibilities
 
@@ -127,7 +127,8 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
   `Moved`, `Opened` (write opens) and `Written` to the same event sequences; the provider reports
   no access, close-nowrite, read-open or attribute events. An `Opened` that gave a held file an
   object of its own calls `kernel/fileio`'s `host_unshared` before checking for watches. It moves
-  open descriptions and shared mappings of that file to its current object.
+  open descriptions of that file to its current object. A committed split followed by a failed
+  provider open replays only `Unshared`, without an open event. Shared mappings already pin their backing.
 
 ## Dependencies (inbound / outbound)
 

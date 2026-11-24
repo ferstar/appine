@@ -418,10 +418,10 @@ class Documents : DocumentsProvider() {
 
         private const val TAG = "Documents"
 
-        private fun currentIds(context: Context, paths: List<String>): List<String> {
+        private fun currentIds(context: Context, paths: List<String>, store: String = Rootfs.store(context).path): List<String> {
             if (paths.isEmpty()) return emptyList()
             val generations = Rootfs.access.read {
-                Native.browseGenerations(Rootfs.store(context).path, paths.toTypedArray())
+                Native.browseGenerations(store, paths.toTypedArray())
             }
             return paths.mapIndexed { i, path -> if (generations[i] == 0L) path else "${generations[i]}$path" }
         }
@@ -485,13 +485,13 @@ class Documents : DocumentsProvider() {
          * The guest changed something in these directories ([Native.takeChangedDirs]): the Files
          * app lists them again if it is looking at them.
          */
-        fun dirsChanged(context: Context, dirs: Array<String>) {
+        fun dirsChanged(context: Context, dirs: Array<String>, store: String = Rootfs.store(context).path) {
             if (dirs.isEmpty()) return
             val authority = authority(context)
             // One call for all of them (each notifyChange is a call into the system server)
             if (!Settings.fileAccess(context)) return
             val ids = try {
-                currentIds(context, dirs.asList())
+                currentIds(context, dirs.asList(), store)
             } catch (e: IOException) {
                 Log.w(TAG, "cannot notify changed directories", e)
                 return

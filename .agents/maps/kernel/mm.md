@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: address space availability during shared file mapping migration)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared store mappings pin their backing before mmap and provider truncation clips live translations)
 
 ## Responsibilities
 
@@ -79,7 +79,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `populate_mlock`, `mapped_above`, `check_mapped`.
 - **Files, shm, futex & introspection**: `futex_key`, `shared_maps`, `id`; `file_truncated`,
   `writably_maps`, `maps_file`, `maps_ino`, `mapped_inos`, `set_mnt`, `mapped_mounts`,
-  `file_moving`, `file_moved`, `shared_file_ranges`; `attach_shm`/`detach_shm`/`shm_attachments`;
+  `shared_file_ranges`; `attach_shm`/`detach_shm`/`shm_attachments`;
   `regions`, `residency`, `size`, `locked_bytes`/`locked_in`, `dump_regions`, `dump_page`.
 
 ## Data flow / lifecycle
@@ -127,8 +127,8 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `EOPNOTSUPP`), `MAP_SHARED | MAP_ANONYMOUS | MAP_GROWSDOWN` (`EINVAL`), a fixed address below
   `vm.mmap_min_addr` without `CAP_SYS_RAWIO` (`EPERM`; for an anonymous mapping only with a
   non-zero length; for a file after its `EBADF` and zero-length `EINVAL`), then the file's own
-  rules (a shared mapping of a read-write descriptor first gives the store file an object of its
-  own; a FUSE file gets its `Fill`; `EACCES`/`EPERM` by file kind), and `MAP_LOCKED` over the
+  rules (a FUSE mapping gets its `Fill`; regular shared mappings check access, noexec and seals
+  before unsharing and pinning the store object), and `MAP_LOCKED` over the
   locked-memory limit (`EAGAIN`). After the mapping: `reap_shm` for `MAP_FIXED`, grows-down for
   private anonymous memory, the label, write and exec denials, locking, and population
   (`MAP_POPULATE`, `MAP_LOCKED`; a FUSE mapping's pages are read then).
@@ -332,16 +332,11 @@ signals may still be delivered).
   file: no thread can reach the dropped tail through a stale translation, so an access there faults
   into the kernel and gets the guest's `SIGBUS` once the BKL is free. A host truncation that then
   fails leaves the mappings' EOF at the requested length.
-- When a guest or Files app write gives a store file its own object (`kernel/fileio`'s
-  `make_private` and `host_unshared`), its shared mappings follow it. The move selects non-FUSE
-  mappings of that store inode whose host file differs from the current object. Guest unsharing
-  checks every live address space before publishing the copy. Host replay enters with the BKL
-  freshly acquired. In both cases `file_moving`
-  first removes, in every address space, the entries past the new object's length (as truncation
-  does) and each changed one syncs; then `file_moved` maps the new object over each of their host
-  regions with `MAP_FIXED` at the same host addresses, so entries and TLBs stay valid, and points
-  the VMAs' file identity and fd at it (a failure is only logged). Private mappings stay on the old
-  object.
+- A named store file mapped shared gets its own backing object before mapping, including
+  read-only opens. The VMA retains a duplicate of its locked open description. Splits, fork
+  and mremap keep the pin. Clones and overlay copy-up copy bytes when either object is pinned.
+  A Files app truncate clips affected address spaces in each running kernel before the host
+  shrink; guest faults can then observe EOF or regrowth. Private mappings retain their backing.
 
 ### Introspection and teardown
 
@@ -373,7 +368,7 @@ signals may still be delivered).
   `write_around`, `discard_unlent`, `return_loans`); `kernel/hostmem` (`HostRegion`, `FileMaps`,
   `content_version`, `WRITABLY_SHARED`, `discard_host`/`discard_file_host`/`remove_host`,
   `mmap_gpu`); `kernel/mmu` (PTE builders/movers, `sync`, `quiesce`, `shootdown`, code groups).
-- `appine_hal` (`map_file_over`, `populate`, `fstat`, `msync`, `advise`, `mincore`, memfds,
+- `appine_hal` (`populate`, `fstat`, `msync`, `advise`, `mincore`, memfds,
   `page_size`); `kernel/vdso` (image/svc image, clocks, host vvar); `kernel/fuse` (`Fill::source`);
   `kernel/vfs`/`kernel/fileio`/`kernel/mount`/`kernel/cred`/`kernel/ipc` (`reap_shm`).
 

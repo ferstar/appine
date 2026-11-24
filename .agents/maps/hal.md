@@ -4,6 +4,8 @@
 > See `.agents/decisions/hal.md` for the paired decision history.
 >
 > Verified: 2026-11-23 (full verification: 10 claims checked by 2 independent verifiers across `lib.rs` and `net.rs` — 8 confirmed and 2 partial, both corrected below; no bugs found)
+>
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: retire the kernel caller of the fixed-address remapping helper)
 
 ## Responsibilities
 
@@ -90,7 +92,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   only shared read-only ones are read-only), rounding the offset down to the host page (16K on some
   devices) and the length up; `map_file_read_only` serves shared read-only mappings;
   `map_file_over` maps a file shared over an existing host range with `MAP_FIXED`, replacing the
-  old mapping in one step (the kernel moves a shared file mapping to another object this way).
+  old mapping in one step. Store shared mappings now retain a stable backing object.
 - `discard` is `MADV_DONTNEED`, `remove` is `MADV_REMOVE` (the host punches the hole in the file or
   shared memory behind a writable shared mapping), and `advise` forwards non-destructive `madvise`
   hints (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`, `MADV_WILLNEED`), all on host-page-aligned

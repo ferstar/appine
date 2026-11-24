@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pinned Alpine inventory shared with Gradle and release-sources)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: invalidate staged file imports when the store is reset)
 
 ## Responsibilities
 
@@ -360,6 +360,8 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ## Invariants and gotchas
 
+- Reset advances the in-process rootfs generation under the write lock. Terminal imports check
+  this generation before publishing a staged file.
 - `Rootfs.access`: provider calls hold the read lock; starting the kernel and deleting the store
   hold the write lock, so the kernel's exclusive boot open never overlaps a provider open. The
   import (including package sources in the temporary store) and the per-start files run without it.

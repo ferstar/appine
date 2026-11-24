@@ -14,7 +14,7 @@
 //! then gets the cookie marked removed, which ends musl's helper thread. Limits follow
 //! `/proc/sys/fs/mqueue/*`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -232,8 +232,81 @@ impl Default for MqDir {
     }
 }
 
+/// Charged capacity per (user namespace, real kernel uid), shared across IPC namespaces.
+pub(crate) type MqUsage = Rc<std::cell::RefCell<BTreeMap<(u64, u32), u64>>>;
+
+struct QueueCharge {
+    usage: MqUsage,
+    owners: Vec<(u64, u32)>,
+    bytes: u64,
+}
+
+impl QueueCharge {
+    fn reserve(
+        usage: &MqUsage,
+        cred: &Cred,
+        mut limit: u64,
+        maxmsg: u64,
+        msgsize: u64,
+    ) -> Result<Self, Errno> {
+        // arm64 Linux accounts a 48-byte msg_msg per slot and a 48-byte priority tree node
+        // per possible priority, in addition to the maximum payload.
+        let overhead = maxmsg
+            .checked_mul(48)
+            .and_then(|n| n.checked_add(maxmsg.min(MQ_PRIO_MAX.into()) * 48));
+        let bytes = maxmsg
+            .checked_mul(msgsize)
+            .zip(overhead)
+            .and_then(|(data, overhead)| data.checked_add(overhead))
+            .ok_or(Errno::EOVERFLOW)?;
+        let mut owners = Vec::new();
+        let mut ns = &cred.user_ns;
+        let mut uid = cred.ruid;
+        let mut totals = usage.borrow_mut();
+        loop {
+            let owner = (ns.id, uid);
+            if totals
+                .get(&owner)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(bytes)
+                .is_none_or(|n| n > limit.min(i64::MAX as u64))
+            {
+                return Err(Errno::EMFILE);
+            }
+            owners.push(owner);
+            let Some(parent) = &ns.parent else { break };
+            limit = ns.mq_max.get();
+            uid = ns.owner;
+            ns = parent;
+        }
+        for owner in &owners {
+            *totals.entry(*owner).or_default() += bytes;
+        }
+        Ok(Self {
+            usage: usage.clone(),
+            owners,
+            bytes,
+        })
+    }
+}
+
+impl Drop for QueueCharge {
+    fn drop(&mut self) {
+        let mut totals = self.usage.borrow_mut();
+        for owner in &self.owners {
+            let total = totals.get_mut(owner).expect("missing message queue charge");
+            *total -= self.bytes;
+            if *total == 0 {
+                totals.remove(owner);
+            }
+        }
+    }
+}
+
 /// A message queue.
 pub struct MessageQueue {
+    _charge: QueueCharge,
     /// Inode number: nodes in the mqueue filesystem find their queue by it.
     pub ino: u64,
     /// The number of the IPC namespace it is in (fstat's device number follows it).
@@ -401,7 +474,7 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
                 size = Some((m as u64, s as u64));
             }
             let ns = cx.ns().ipc.id;
-            new_queue(cx.ipc(), ns, &cred, perm & !cx.umask(), size)?
+            new_queue(cx, ns, &cred, perm & !cx.umask(), size)?
         }
     };
     let path: Rc<[u8]> = Rc::from([b"/".as_slice(), &name].concat());
@@ -427,12 +500,13 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
 /// installing the fd). The defaults are capped by `msg_max` and `msgsize_max`
 /// (`mqueue_get_inode`).
 pub(crate) fn new_queue(
-    ipc: &crate::ipc::Ipc,
+    cx: &Cx<'_>,
     ns: u64,
     cred: &Cred,
     perm: u32,
     size: Option<(u64, u64)>,
 ) -> Result<Rc<RefCell<MessageQueue>>, Errno> {
+    let ipc = cx.kr().ipc(ns);
     let limits = &ipc.mq_limits;
     if ipc.mqueues.len() as u64 >= limits.queues_max && !cred.capable(cap::SYS_RESOURCE) {
         return Err(Errno::ENOSPC);
@@ -442,7 +516,10 @@ pub(crate) fn new_queue(
         limits.msgsize_default.min(limits.msgsize_max),
     ));
     let now = crate::tty::wall_ns();
+    let limit = cx.t.group.borrow().rlimits[crate::process::RLIMIT_MSGQUEUE as usize].0;
+    let charge = QueueCharge::reserve(&cx.kr().mq_usage, cred, limit, maxmsg, msgsize)?;
     Ok(Rc::new(RefCell::new(MessageQueue {
+        _charge: charge,
         ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
         ns,
         uid: cred.fsuid,
@@ -842,4 +919,32 @@ pub(crate) fn find(ipc: &crate::ipc::Ipc, ino: u64) -> Option<(&[u8], &Rc<RefCel
         .iter()
         .find(|(_, q)| q.borrow().ino == ino)
         .map(|(n, q)| (n.as_slice(), q))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_user_namespace_charges_its_creator() {
+        let mut parent = Cred::root();
+        parent.ruid = 42;
+        let usage = MqUsage::default();
+        let first = QueueCharge::reserve(&usage, &parent, 100, 1, 4).unwrap();
+        let child_ns = crate::cred::UserNs::child(&parent.user_ns, parent.ruid, false);
+        child_ns.mq_max.set(199);
+        let mut child = parent.clone();
+        child.enter_user_ns(child_ns);
+        child.ruid = 1234;
+        assert!(matches!(
+            QueueCharge::reserve(&usage, &child, 100, 1, 4),
+            Err(Errno::EMFILE)
+        ));
+        assert_eq!(usage.borrow().len(), 1);
+        drop(first);
+        let second = QueueCharge::reserve(&usage, &child, 100, 1, 4).unwrap();
+        assert_eq!(usage.borrow().len(), 2);
+        drop(second);
+        assert!(usage.borrow().is_empty());
+    }
 }

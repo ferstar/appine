@@ -109,6 +109,7 @@ pub(super) fn mmap(
     // are touched (crate::mm::Fill)
     let mut gpu_mapping = None;
     let mut fuse_fill = None;
+    let mut mapping_object = None;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         if low && len != 0 {
             return Err(Errno::EPERM);
@@ -130,16 +131,11 @@ pub(super) fn mmap(
         if implies_exec && !on_noexec(cx, &file.borrow()) {
             prot |= prot::EXEC;
         }
-        // A shared mapping that can be made writable writes the file's object in place, and a
-        // mapping does not follow a file to another object: a held file gets its own first
-        if kind == flags::MAP_SHARED && file.borrow().readable() && file.borrow().writable() {
-            super::fs::prepare_write(cx, &file, None)?;
-        }
         // A shared writable mapping, or an executable one on a noexec mount, is refused below
         let refused = kind == flags::MAP_SHARED && prot & prot::WRITE != 0
             || on_noexec(cx, &file.borrow()) && prot & prot::EXEC != 0;
         fuse_fill = super::fuse::map_fill(cx, &file, kind == flags::MAP_SHARED, refused)?;
-        let f = file.borrow();
+        let mut f = file.borrow();
         let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
         match &f.kind {
             FileKind::Regular {
@@ -169,14 +165,36 @@ pub(super) fn mmap(
                     .seals
                     .get(ino)
                     .is_some_and(|s| s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0);
-                if sealed && kind == flags::MAP_SHARED {
-                    if prot & prot::WRITE != 0 {
-                        return Err(Errno::EPERM);
-                    }
-                    Some((host.as_raw_fd(), offset, false))
-                } else {
-                    Some((host.as_raw_fd(), offset, f.writable()))
+                if sealed && shared_write {
+                    return Err(Errno::EPERM);
                 }
+                let may_write = f.writable() && !(sealed && kind == flags::MAP_SHARED);
+                let mut fd = host.as_raw_fd();
+                if kind == flags::MAP_SHARED && !f.pseudo {
+                    let ino = *ino;
+                    drop(f);
+                    let vfs = cx.vfs()?;
+                    loop {
+                        match vfs.store().mapping_object(ino, may_write) {
+                            Err(Errno::EAGAIN) => super::fs::make_private(cx, ino, None)?,
+                            r => {
+                                mapping_object = r?;
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(object) = &mapping_object {
+                        super::fs::reconcile_mapping(cx.kr(), ino, object)?;
+                        fd = object.as_raw_fd();
+                    } else {
+                        f = file.borrow();
+                        let FileKind::Regular { file: object, .. } = &f.kind else {
+                            return Err(Errno::EBADF);
+                        };
+                        fd = object.as_raw_fd();
+                    }
+                }
+                Some((fd, offset, may_write))
             }
             FileKind::Render { ino, file } => {
                 if !f.readable() || (shared_write && !f.writable()) {
@@ -251,6 +269,7 @@ pub(super) fn mmap(
             None => cx.mm_mut().mmap(addr, len, prot, flags, file)?,
         }
     };
+    drop(mapping_object);
     // MAP_FIXED may have replaced a segment's last attachment
     if flags & flags::MAP_FIXED != 0 {
         crate::ipc::reap_shm(cx.k());

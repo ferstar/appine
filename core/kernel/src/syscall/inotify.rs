@@ -884,13 +884,14 @@ pub(crate) fn host_change(k: &Kernel, c: &Change) {
         }
         _ => {}
     }
-    // A held file the host made private as it opened it for writing: its open descriptions and shared
-    // mappings move to the current object, even with no watches
+    // A held file the host made private as it opened it for writing: its open descriptions
+    // move to the current object, even with no watches
     if let Change::Opened {
         ino,
         unshared: true,
         ..
-    } = c
+    }
+    | Change::Unshared(ino) = c
     {
         super::fs::host_unshared(k, *ino);
     }
@@ -945,6 +946,7 @@ pub(crate) fn host_change(k: &Kernel, c: &Change) {
             }
             path_event(k, *ino, parent, IN_OPEN);
         }
+        Change::Unshared(_) => {}
         Change::Written { ino, parent } => {
             let parent = Some((parent.0, parent.1.as_slice()));
             path_event(k, *ino, parent, IN_MODIFY);

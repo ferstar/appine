@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the split; latest change: key overlay leases on overlay nodes, charge upper-layer tmpfs accounting, check creation permissions before parent copy-up, and align overlay FIFO fstat with stat)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: copy-up copies data for read-only and writable shared mapping pins)
 
 ## Responsibilities
 
@@ -117,7 +117,8 @@ holding its node (`kernel/exec`).
   open of either first gives it an object of its own. The syscalls copy up through
   `syscall::fs::copy_up`, which, as `try_share` does, copies a regular file's data instead
   (`CopyUp::Copied`) when a writable shared mapping or the Files app could write the lower object in
-  place, and after sharing rehomes the lower file's descriptions open for writing (`cow`); a rename
+  place. The store also falls back to copying if either object carries a shared mapping pin,
+  including a read-only mapping in another kernel. After sharing it rehomes the lower file's descriptions open for writing (`cow`); a rename
   copies up the files it moves that way first. A non-directory then forgets its lower inodes; a
   copied-up directory keeps them and stays merged (one link, rename `EXDEV`). A file opened with
   `O_TRUNC` or truncated to 0 is copied without data. chmod, chown, utimensat (`Attrs::Overlay`),

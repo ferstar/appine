@@ -2218,16 +2218,28 @@ impl Store {
         self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
     }
 
-    /// Reopens the current object for existing shared mappings without changing its ownership.
-    /// A private object can back writable mappings. A held object must stay read-only.
-    pub(crate) fn open_mapped_object(&self, ino: Ino) -> Result<File, Errno> {
-        let data = self.data(ino)?;
-        let flags = if data.held.is_some() {
-            libc::O_RDONLY
-        } else {
-            libc::O_RDWR
-        };
-        self.open_number(data.object, flags)
+    /// Acquire a shared mapping's backing and pin it against object sharing. The mmap code
+    /// duplicates this open description, keeping the host flock through VMA splits and fork.
+    /// Serialize the pin with share across store connections. EAGAIN asks the caller to split
+    /// a held object first. An anonymous or deleted plain file can use its existing descriptor.
+    pub(crate) fn mapping_object(&self, ino: Ino, writable: bool) -> Result<Option<File>, Errno> {
+        self.transaction(|s| {
+            let (st, data) = s.query_row(ino)?;
+            if data.held.is_some() {
+                return Err(Errno::EAGAIN);
+            }
+            let access = if writable {
+                libc::O_RDWR
+            } else {
+                libc::O_RDONLY
+            };
+            let file = match s.open_number(data.object, access) {
+                Err(Errno::ENOENT) if st.nlink == 0 => return Ok(None),
+                result => result?,
+            };
+            file.lock_shared().map_err(io_err)?;
+            Ok(Some(file))
+        })
     }
 
     /// Opens a regular file's object for reading and writing, with `O_APPEND` under `append` (for
@@ -2236,6 +2248,39 @@ impl Store {
         self.make_private(ino, None)?;
         let append = if append { libc::O_APPEND } else { 0 };
         self.object(ino, libc::O_RDWR | append)
+    }
+
+    /// The provider hands this open description to another process. Pin it against clones
+    /// before releasing the transaction that checked and, if needed, separated its object.
+    pub(crate) fn open_provider_object(
+        &self,
+        ino: Ino,
+        truncate: bool,
+        append: bool,
+    ) -> Result<(File, bool), Errno> {
+        self.transaction(|s| {
+            let (_, data) = s.query_row(ino)?;
+            let unshared = data.held.is_some();
+            let number = if unshared {
+                s.make_private(ino, truncate.then_some(0))?;
+                s.query_row(ino)?.1.object
+            } else {
+                data.object
+            };
+            let file = s.open_number(
+                number,
+                libc::O_RDWR | if append { libc::O_APPEND } else { 0 },
+            )?;
+            file.lock_shared().map_err(io_err)?;
+            Ok((file, unshared))
+        })
+    }
+
+    /// A host writer can shrink an object with live guest mappings. Release any store write
+    /// transaction before taking guest kernel locks, then clip their page tables before ftruncate.
+    pub(crate) fn truncate_host_object(&self, file: &File) -> Result<(), Errno> {
+        self.commit()?;
+        crate::machine::truncate_host_object(self.objects.parent().unwrap(), file)
     }
 
     /// Truncates a regular file.
@@ -2281,18 +2326,42 @@ impl Store {
     /// writing it, no writable shared mapping of it) and that nothing maps `dst`. ENOENT for a
     /// deleted `src`, whose object may already be on its way to the reaper.
     pub fn share(&self, src: Ino, dst: Ino) -> Result<(), Errno> {
+        if self.try_share(src, dst)? {
+            Ok(())
+        } else {
+            Err(Errno::EBUSY)
+        }
+    }
+
+    /// False asks a caller that supports copying to use that fallback.
+    pub(crate) fn try_share(&self, src: Ino, dst: Ino) -> Result<bool, Errno> {
         if src == dst {
             return Err(Errno::EINVAL);
         }
         self.transaction(|s| {
-            let (sst, sdata) = s.row(src)?;
-            let (dst_st, ddata) = s.row(dst)?;
+            let (sst, sdata) = s.query_row(src)?;
+            let (dst_st, ddata) = s.query_row(dst)?;
             if sst.kind() != mode::S_IFREG || dst_st.kind() != mode::S_IFREG {
                 return Err(Errno::EINVAL);
             }
             // A deleted source's object may already be on its way to the reaper
             if sst.nlink == 0 {
                 return Err(Errno::ENOENT);
+            }
+            // A shared VMA in any kernel pins its backing. Both probes and mapping_object
+            // are serialized by the store write transaction. A pinned side requires a copy.
+            for object in [sdata.object, ddata.object] {
+                let file = match s.open_number(object, libc::O_RDONLY) {
+                    Err(Errno::ENOENT) if object == ddata.object && dst_st.nlink == 0 => {
+                        return Ok(false);
+                    }
+                    r => r?,
+                };
+                match file.try_lock() {
+                    Ok(()) => {}
+                    Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+                    Err(std::fs::TryLockError::Error(e)) => return Err(io_err(e)),
+                }
             }
             // The source's times move into the database as they are
             if sdata.held.is_none() {
@@ -2306,7 +2375,8 @@ impl Store {
                 None => s.object_stat(ddata.object).map_or(now, |o| o.atime_ns),
             };
             s.drop_object(dst, ddata)?;
-            s.hold(dst, sdata.object, (atime, now, now))
+            s.hold(dst, sdata.object, (atime, now, now))?;
+            Ok(true)
         })
     }
 
@@ -2316,27 +2386,35 @@ impl Store {
     /// holds it, and returned for the caller to copy into ([`Unshare`]); `keep` is the length a
     /// truncation is about to leave (None: all of it). Does nothing to a file that is not held.
     pub fn unshare(&self, ino: Ino, keep: Option<u64>) -> Result<Option<Unshare>, Errno> {
-        let (st, data) = self.row(ino)?;
-        let Some(atime) = data.held else {
-            return Ok(None);
-        };
-        if self.users_of(data.object)? <= 1 {
-            self.transaction(|s| s.settle(ino, data.object, (atime, st.mtime_ns)))?;
-            return Ok(None);
-        }
-        let from = self.open_number(data.object, libc::O_RDONLY)?;
-        let len = from.metadata().map_err(io_err)?.len();
-        let (number, to) = self.transaction(|s| {
+        self.transaction(|s| {
+            let (st, data) = s.query_row(ino)?;
+            let Some(atime) = data.held else {
+                return Ok(None);
+            };
+            if s.users_of(data.object)? <= 1 {
+                s.settle(ino, data.object, (atime, st.mtime_ns))?;
+                return Ok(None);
+            }
+            let from = s.open_number(data.object, libc::O_RDONLY)?;
+            let len = from.metadata().map_err(io_err)?.len();
             let number = s.new_inode(mode::S_IFREG, 0, 0, 0, 0)?;
-            Ok((number, s.new_object(number)?))
-        })?;
-        Ok(Some(Unshare {
-            ino,
-            from,
-            to,
-            len: keep.map_or(len, |k| k.min(len)),
-            objects: (data.object, number),
-        }))
+            let to = s.new_object(number)?;
+            Ok(Some(Unshare {
+                ino,
+                from,
+                to,
+                len: keep.map_or(len, |k| k.min(len)),
+                objects: (data.object, number),
+            }))
+        })
+    }
+
+    /// Prepares an open description on the copy before it is published.
+    pub(crate) fn open_unshare(&self, job: &Unshare, write: bool) -> Result<File, Errno> {
+        self.open_number(
+            job.objects.1,
+            if write { libc::O_RDWR } else { libc::O_RDONLY },
+        )
     }
 
     /// The copy of [`Store::unshare`] is done: the file uses its new object (with the times it had
@@ -2348,7 +2426,7 @@ impl Store {
     pub fn finish_unshare(&self, job: Unshare) -> Result<(), Errno> {
         let (from, to) = job.objects;
         let r = self.transaction(|s| {
-            let (st, data) = s.row(job.ino)?;
+            let (st, data) = s.query_row(job.ino)?;
             let (Some(atime), true) = (data.held, data.object == from) else {
                 return Err(Errno::EAGAIN);
             };
@@ -3954,13 +4032,7 @@ mod tests {
         s.set_xattr(b, b"user.test", b"value", false, false)
             .unwrap();
         assert_eq!(s.stat(a).unwrap().ctime_ns, source_ctime);
-        // Reopening the held object for mappings keeps it shared and read-only.
-        let held = s.open_mapped_object(b).unwrap();
-        assert_eq!(
-            held.write_at(b"B", 0).unwrap_err().raw_os_error(),
-            Some(libc::EBADF)
-        );
-        assert!(s.held(b).unwrap());
+        assert!(matches!(s.mapping_object(b, false), Err(Errno::EAGAIN)));
         // Writing b: a copy of its own, with its times, on disk before the commit recording it
         let flushes = s.meta.flushes.load(Ordering::Relaxed);
         s.make_private(b, None).unwrap();
@@ -3970,10 +4042,21 @@ mod tests {
             (st.atime_ns, st.mtime_ns, st.size),
             (5_000_000_000, 6_000_000_000, 11)
         );
-        s.open_mapped_object(b)
+        s.open_object(b, true)
             .unwrap()
             .write_all_at(b"B", 0)
             .unwrap();
+        // A second connection cannot make either side of a live mapping change backing.
+        // A VMA retains a duplicate of the flocked description even after mmap returns.
+        let pin = s.mapping_object(b, false).unwrap().unwrap();
+        let retained = pin.try_clone().unwrap();
+        drop(pin);
+        s.commit().unwrap();
+        let peer = Store::open(&dir, &[]).unwrap();
+        assert!(!peer.try_share(a, b).unwrap());
+        assert!(!peer.try_share(b, a).unwrap());
+        drop(retained);
+        drop(peer);
         assert_eq!(read(&s, b), b"Bhared data");
         assert_eq!(read(&s, a), b"shared data");
         s.commit().unwrap();

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: cold-boot object recovery, cached ACLs and transactional document IDs)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pin stable mapping and provider descriptors, serialize object selection and clip live mappings before host truncation)
 
 ## Responsibilities
 
@@ -130,9 +130,11 @@ provider and rootfs installation UI (`android`).
   in place.
 - `open_object` for writing, `open_object_append` and `truncate` call `make_private` first, so host
   callers (the browse API, `write_file`) never write a shared object. When a Files app open
-  unshares the file, its `Opened` change tells each running kernel to move the file's open
-  descriptions and shared mappings to its current object (`kernel/fileio`). `open_mapped_object`
-  reopens that object read-write while private or read-only while held, without unsharing it.
+  unshares the file, its change replay (also on failure after publication) refreshes the file's open
+  descriptions to its current object. Shared VMAs hold a flock on their backing descriptor.
+  `mapping_object` acquires it under the store write transaction, and `try_share` probes both
+  objects in that transaction, falling back to a byte copy when a pin exists. Provider write
+  opens also pin their descriptor. Provider truncation clips live guest mappings before shrink.
 - Objects the provider handed out for writing are recorded process-wide (`HOST_WRITERS`: the
   store's identity, the object, the path it was opened by) from `open_write` until `written`
   reports the close by the same path, whatever became of the file; `host_writing` tells the kernel
@@ -248,7 +250,7 @@ provider and rootfs installation UI (`android`).
 
 - Connections, not processes, are counted in `users`. The kernel and the app's DocumentsProvider run
   in the same process; each host call (`browse`, `browse_changing`, `write_file`, `read_file`) opens
-  its own connection. A file import keeps this connection through the provider copy. While multiple
+  its own connection. An Android import opens this connection for local publication after staging provider data. While multiple
   connections are open, every operation commits immediately. A count leaked by a crash can only persist while another process holds the shared lock (e.g. several
   `appine-run` processes on one store), so on Android the next open is exclusive and resets it.
 - Changes made by host calls are replayed to running kernels of the same store in this process

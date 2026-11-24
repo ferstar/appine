@@ -82,6 +82,8 @@
 
     <!-- File import -->
     <string name="import_files">ファイルをインポート</string>
+    <string name="cancel_file_import">ファイルのインポートをキャンセル</string>
+    <string name="import_files_cancelled">インポートをキャンセルしました。</string>
     <string name="importing_files">ファイルをインポート中…</string>
     <string name="import_file_name">インポートしたファイル</string>
     <string name="import_file_failed">%1$sをインポートできません：%2$s</string>

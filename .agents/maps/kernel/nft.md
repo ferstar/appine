@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/netns full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: verdict-map chain refcounting, rule-replace handle preservation, chain rename, DELTABLE NLM_F_NONREC)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: execute xt_recent matches against named address histories shared across rules)
 
 ## Responsibilities
 
@@ -68,7 +68,8 @@ and netlink transport in `kernel/netlink`.
   `log`, `notrack`, `dynset`, `objref`, `last`, `masq`, `connlimit`, `dup` always match without
   effect. xt targets DNAT, REDIRECT, MARK, ACCEPT, DROP, REJECT (others no-ops) and matches
   comment, mark, owner, conntrack, state, addrtype, tcp, udp, limit (the same bucket from avg and
-  burst; others never match). Unknown or
+  burst), and recent (named per-netns address histories; SET, CHECK, UPDATE and REMOVE with
+  masks, expiry, hit counts, TTL checks and optional reaping). Unknown or
   unevaluable expressions break the rule. Jumps to missing chains or deeper than 16 drop; 100,000
   steps accept; chains end in their policy.
 - `kernel/netns` builds packets and selects hooks at connect/sendto and forwarding probes;
@@ -93,15 +94,17 @@ and netlink transport in `kernel/netlink`.
 
 ## Invariants and gotchas
 
+- A named recent list holds at most 100 addresses. Its first installed match chooses the mask.
+  History survives unrelated and rejected batches; increasing timestamp capacity or committing
+  removal of the last referencing rule clears it.
 - Rulesets are per network namespace; requests, including queries, require `CAP_NET_ADMIN`.
 - Evaluation uses synthetic headers, not host packets. Hook placement and verdict application
   must stay consistent with `kernel/netns`; changing either side requires reading both maps.
 
 ## Confirmed bugs / technical debt
 
-- **Per-key rate limits do nothing:** meters (`dynset` with a limit per key) always match, and the
-  xt `hashlimit` and `recent` matches never match, so ufw's `limit` rules (built on `recent`) never
-  trigger; byte limits and quotas count headers only, so they let through more than Linux.
+- Native per-key meters (`dynset` with a limit) always match, and xt `hashlimit` never matches.
+  Byte limits and quotas count headers only.
 - **nft control-plane gaps:** no `NLM_F_ECHO` and no monitor notifications; set-element dumps are
   one unbounded message.
 - POSTROUTING, SNAT and MASQUERADE have no effect; unsupported expression effects are listed above.

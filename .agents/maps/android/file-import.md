@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: publish completed home imports from detached store directories)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: cancel blocked provider reads and publish staged files only into the original rootfs generation)
 
 ## Responsibilities
 
@@ -24,7 +24,7 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
 
 ## Public entry points
 
-- `begin(login)`, `selected(uris)`, `importSelected()`, `dismissResult()`.
+- `begin(login)`, `selected(uris)`, `importSelected()`, `cancelImport()`, `dismissResult()`.
 - `occupied`, `copying`, `result`, `changes`; `copyIntoHome` and `clipboardPaths` helpers.
 
 ## Data flow / lifecycle
@@ -36,17 +36,14 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
   is needed. One request, copy or undismissed result occupies the button; cancelling releases it.
 - `TerminalFiles.begin` retains the login preference. The picker callback accepts results only
   for that process-local request and deduplicates URIs. A resumed unlocked page starts the copy;
-  the worker resolves the account once against the current store and holds `Rootfs.access`'s read
-  lock for the batch. Destination is that account's home, independent of the tab's cwd, effective
-  user and mounts. A missing home or `/` is refused.
-- Provider display names are used with a localized fallback. Controls, slash and NUL are replaced,
-  empty/dot names are sanitized, and extensions are preserved. `Native.browseImport` stages a
-  regular file owned by the account outside the guest tree. Its callback opens the source and
-  streams it to a duplicate of the borrowed fd. After both streams close, the store syncs the
-  data. One transaction rechecks the home and publishes the file under an available name.
-  Guest watchers receive the create, open and write/close events after commit. On success
-  `copySelected` refreshes Files app listings through `Documents.dirsChanged`. A failed file
-  leaves the home untouched and the batch continues.
+  the worker captures the account and rootfs generation under a short read lock. The account's
+  home is independent of tab cwd, effective user and mounts; a missing home or `/` is refused.
+- Each provider query and read runs outside the rootfs lock, writing one unlinked app-cache file.
+  After source close, publication takes the read lock and checks the generation again.
+  `Native.browseImport` copies from the cache into a detached store object, checks cancellation,
+  and publishes under a collision-safe name. Successful files notify watchers and Files listings.
+  An individual failure is recorded and the batch continues. Staging may temporarily use two
+  copies of the current file.
 - The retained result lists successful guest paths in monospace and per-file failures in a protected
   dialog. A blank line separates the explanation from the paths; message assembly preserves spans.
   Copy paths explicitly puts space-separated shell arguments on the clipboard, prefixing whitespace
@@ -54,10 +51,9 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
   newline and sends no terminal input. Result display
   requires a resumed unlocked page, and copying checks the gate again.
 - Recreation retains selection/copy/result; destruction dismisses its dialog without consuming
-  the result, so it can reappear after unlock. Process death loses this state. An already-started
-  worker continues after backgrounding or closing the activity. There is no cancellation; slow
-  document providers hold up rootfs reset/replacement. Publication is per file. Completed files
-  survive an interruption, and the next exclusive store open reclaims abandoned staging files.
+  the result, so it can reappear after unlock. Clearing the ViewModel or pressing the tab bar's
+  stop button wakes the coordinator and signals the provider. Completed publications remain in the result. A
+  provider ignoring cancellation may keep its worker alive, without the store lock.
 
 ## Dependencies (inbound / outbound)
 
@@ -77,14 +73,13 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
 ## Invariants and gotchas
 
 - The ViewModel keeps the Application, never the activity; recreation retains state but process
-  death does not. A started worker keeps running after the activity closes.
+  death does not. Clearing the ViewModel cancels its import.
 - MainActivity must be resumed and unlocked before starting a pending copy or showing a result;
-  clipboard copying checks the gate again. The batch lock can delay rootfs replacement.
+  clipboard copying checks the gate again.
 
 ## Confirmed bugs / technical debt
 
-- A running import cannot be cancelled or resumed after process death. Closing its activity can
-  lose the eventual result display.
+- An interrupted import cannot resume after process death. Completed files survive.
 
 ## Open questions
 
@@ -93,8 +88,8 @@ None.
 ## To verify
 
 - File import was exercised through the API 34 system picker with multiple files, cancellation,
-  collision numbering and activity recreation, including redisplay of the result. The nine
+  collision numbering and activity recreation, including redisplay of the result. The
   instrumentation cases cover publication after source close, a concurrent name collision,
-  failure cleanup, provider notifications, guest reads, shell escaping and locked-picker retention.
+  cancellation while a source ignores interrupts, failure cleanup, provider notifications, guest reads, shell escaping and locked-picker retention.
   An API 34 process kill during a copy verified cleanup on reopen and retry. Cloud document
   providers and vendor pickers remain unverified.

@@ -1193,8 +1193,18 @@ pub(crate) fn store_changed(store: &std::path::Path, changes: &[crate::vfs::brow
     if changes.is_empty() {
         return;
     }
+    let kernels = kernels_using(store);
+    for shared in kernels {
+        let k = shared.lock();
+        for c in changes {
+            crate::syscall::host_change(&k, c);
+        }
+    }
+}
+
+fn kernels_using(store: &std::path::Path) -> Vec<Arc<Shared>> {
     let dir = store.canonicalize().unwrap_or_else(|_| store.to_path_buf());
-    let kernels: Vec<Arc<Shared>> = {
+    {
         let mut running = RUNNING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1204,11 +1214,52 @@ pub(crate) fn store_changed(store: &std::path::Path, changes: &[crate::vfs::brow
             .filter(|(d, _)| *d == dir)
             .filter_map(|(_, w)| w.upgrade())
             .collect()
-    };
-    for shared in kernels {
-        let k = shared.lock();
-        for c in changes {
-            crate::syscall::host_change(&k, c);
-        }
     }
+}
+
+/// A host shrink must invalidate cached guest translations before shortening their backing.
+/// Hold each affected kernel through ftruncate so a fault cannot refill the tail between
+/// the shootdown and the shrink. BKL ownership is thread-local; multiple machines sharing
+/// one store acquire their locks in registry order on distinct host threads.
+pub(crate) fn truncate_host_object(
+    store: &std::path::Path,
+    file: &std::fs::File,
+) -> Result<(), Errno> {
+    use std::os::unix::fs::MetadataExt;
+    fn truncate(
+        kernels: &[Arc<Shared>],
+        file: &std::fs::File,
+        id: (u64, u64),
+    ) -> Result<(), Errno> {
+        let Some((shared, rest)) = kernels.split_first() else {
+            return file
+                .set_len(0)
+                .map_err(|e| Errno(e.raw_os_error().unwrap_or(libc::EIO)));
+        };
+        let kernel = shared.lock();
+        let mut seen = std::collections::HashSet::new();
+        for task in kernel.tasks.values() {
+            let mm = task.res.borrow().mm.clone();
+            if seen.insert(Rc::as_ptr(&mm)) {
+                let mut mm = mm.borrow_mut();
+                if mm.file_truncated(id.0, id.1, 0) {
+                    mm.sync_except(None);
+                }
+            }
+        }
+        if rest.is_empty() {
+            return truncate(rest, file, id);
+        }
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .spawn_scoped(scope, || truncate(rest, file, id))
+                .map_err(|_| Errno::EAGAIN)?
+                .join()
+                .map_err(|_| Errno::EIO)?
+        })
+    }
+    let meta = file
+        .metadata()
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(libc::EIO)))?;
+    truncate(&kernels_using(store), file, (meta.dev(), meta.ino()))
 }

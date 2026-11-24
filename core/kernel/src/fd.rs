@@ -234,6 +234,8 @@ impl ProcEvent {
 
 /// An open file.
 pub struct OpenFile {
+    /// A queue inode pinned by an O_PATH description, even after mq_unlink.
+    pub(crate) mq_path: Option<Rc<RefCell<crate::syscall::MessageQueue>>>,
     /// The kind.
     pub kind: FileKind,
     /// Access mode and status flags (without `O_CLOEXEC`).
@@ -328,6 +330,7 @@ impl OpenFile {
             _ => Vec::new(),
         };
         Rc::new(RefCell::new(OpenFile {
+            mq_path: None,
             kind,
             flags: flags & !oflags::O_CLOEXEC,
             pos: 0,

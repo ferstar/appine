@@ -188,6 +188,8 @@ pub(crate) struct Kernel {
     pub locks: crate::locks::Locks,
     /// The boot-time UTS, IPC, network, cgroup and time namespaces ([`crate::nsproxy`]).
     pub init_ns: crate::nsproxy::NsProxy,
+    /// Queue capacity by user, including unlinked queues held open.
+    pub mq_usage: crate::syscall::MqUsage,
     /// The System V IPC objects and POSIX message queues of each IPC namespace, by namespace id;
     /// namespaces that no thread uses any more are dropped ([`Kernel::collect_ipc`]).
     pub ipcs: BTreeMap<u64, (Weak<crate::nsproxy::IpcNs>, crate::ipc::Ipc)>,
@@ -375,6 +377,7 @@ impl Kernel {
             net_nss: Vec::new(),
             cgroups: Default::default(),
             bpf: Default::default(),
+            mq_usage: Default::default(),
             ipcs: BTreeMap::from([(
                 init_ns.ipc.id,
                 (Rc::downgrade(&init_ns.ipc), crate::ipc::Ipc::default()),

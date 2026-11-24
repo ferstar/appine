@@ -27,7 +27,7 @@
 //!   as the rule not matching. `limit`, `quota` and xt's `limit` keep their state with the rule;
 //!   a packet's length is that of its headers, as `meta len` gives it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -175,6 +175,7 @@ pub(crate) struct Nft {
     /// Table handles (`nft_net->table_handle`): a counter in the namespace; deleted ones are
     /// never reused.
     table_handle: u64,
+    recent: RecentLists,
 }
 
 impl Default for Nft {
@@ -183,6 +184,7 @@ impl Default for Nft {
             generation: 1,
             tables: Vec::new(),
             table_handle: 0,
+            recent: HashMap::new(),
         }
     }
 }
@@ -230,6 +232,194 @@ struct Rule {
     /// The state of its rate expressions, by their position in the rule; shared with the copies
     /// a batch makes of the rule.
     rates: Rates,
+    recent: Vec<(usize, RecentMatch)>,
+}
+
+type RecentLists = HashMap<Vec<u8>, Rc<RefCell<RecentList>>>;
+
+/// An xt_recent match (xt_recent_mtinfo v0/v1). Rules name a common list within their netns.
+#[derive(Debug, Clone)]
+struct RecentMatch {
+    name: Vec<u8>,
+    mask: [u8; 16],
+    flags: u8,
+    invert: bool,
+    dest: bool,
+    hits: usize,
+    seconds: u32,
+}
+
+impl RecentMatch {
+    const CHECK: u8 = 1;
+    const SET: u8 = 2;
+    const UPDATE: u8 = 4;
+    const REMOVE: u8 = 8;
+    const TTL: u8 = 16;
+    const REAP: u8 = 32;
+    const OPERATIONS: u8 = Self::CHECK | Self::SET | Self::UPDATE | Self::REMOVE;
+
+    fn for_rule(raw: &[u8], lists: &mut RecentLists) -> Result<Vec<(usize, Self)>, Fail> {
+        let mut matches = Vec::new();
+        for (at, (name, data)) in exprs(raw).into_iter().enumerate() {
+            if name != b"match" {
+                continue;
+            }
+            let attrs = crate::route::attrs(&data);
+            if get_str(&attrs, 1) != Some(b"recent") {
+                continue;
+            }
+            let m = Self::parse(&attrs)?;
+            let capacity = if m.hits == 0 {
+                32
+            } else {
+                m.hits.next_power_of_two()
+            };
+            let empty = |mask| {
+                Rc::new(RefCell::new(RecentList {
+                    mask,
+                    capacity,
+                    entries: VecDeque::new(),
+                }))
+            };
+            let list = lists.entry(m.name.clone()).or_insert_with(|| empty(m.mask));
+            // Replace the batch's list so a rejected resize preserves the active history.
+            if capacity > list.borrow().capacity {
+                let mask = list.borrow().mask;
+                *list = empty(mask);
+            }
+            matches.push((at, m));
+        }
+        Ok(matches)
+    }
+
+    fn parse(a: &[(u16, &[u8])]) -> Result<Self, Fail> {
+        let invalid = || fail(Errno::EINVAL);
+        let rev = get_be32(a, 2).ok_or_else(invalid)?;
+        let info = get(a, 3).ok_or_else(invalid)?;
+        let required = match rev {
+            0 => 212,
+            1 => 228,
+            _ => return Err(fail(Errno::ENOENT)),
+        };
+        if info.len() < required {
+            return Err(invalid());
+        }
+        let seconds = u32::from_ne_bytes(info[..4].try_into().unwrap());
+        let hits = u32::from_ne_bytes(info[4..8].try_into().unwrap()) as usize;
+        let flags = info[8];
+        let op = flags & Self::OPERATIONS;
+        let name = &info[10..210];
+        let name = &name[..name.iter().position(|&c| c == 0).ok_or_else(invalid)?];
+        if flags & !(Self::OPERATIONS | Self::TTL | Self::REAP) != 0
+            || op.count_ones() != 1
+            || hits >= 256
+            || (op == Self::SET || op == Self::REMOVE) && (seconds != 0 || hits != 0 || flags != op)
+            || flags & Self::REAP != 0 && seconds == 0
+            || name.is_empty()
+            || name.contains(&b'/')
+            || name == b"."
+            || name == b".."
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            name: name.to_vec(),
+            mask: if rev == 0 {
+                [255; 16]
+            } else {
+                info[212..228].try_into().unwrap()
+            },
+            flags,
+            invert: info[9] != 0,
+            dest: info[210] == 1,
+            hits,
+            seconds,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecentEntry {
+    addr: Vec<u8>,
+    ttl: u8,
+    stamps: VecDeque<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct RecentList {
+    mask: [u8; 16],
+    capacity: usize,
+    // Oldest update first. Linux's default ip_list_tot is 100 addresses per named list.
+    entries: VecDeque<RecentEntry>,
+}
+
+impl RecentList {
+    fn matches(&mut self, m: &RecentMatch, p: &Packet<'_>, now: Instant) -> bool {
+        let address = if m.dest { p.dst } else { p.src };
+        let addr: Vec<_> = address
+            .iter()
+            .zip(self.mask)
+            .map(|(&a, mask)| a & mask)
+            .collect();
+        let ttl = if p.hook == HOOK_FORWARD { 65 } else { 64 };
+        let pos = self
+            .entries
+            .iter()
+            .position(|e| e.addr == addr && (m.flags & RecentMatch::TTL == 0 || e.ttl == ttl));
+        let op = m.flags & RecentMatch::OPERATIONS;
+        let Some(i) = pos else {
+            if op != RecentMatch::SET {
+                return m.invert;
+            }
+            if self.entries.len() == 100 {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(RecentEntry {
+                addr,
+                ttl,
+                stamps: VecDeque::from([now]),
+            });
+            return !m.invert;
+        };
+        if op == RecentMatch::REMOVE {
+            self.entries.remove(i);
+            return !m.invert;
+        }
+        let in_window = |stamp: &Instant| {
+            m.seconds == 0
+                || now.duration_since(*stamp) <= std::time::Duration::from_secs(m.seconds.into())
+        };
+        let hit = op == RecentMatch::SET
+            || self.entries[i]
+                .stamps
+                .iter()
+                .rev()
+                .take_while(|s| in_window(s))
+                .count()
+                >= m.hits.max(1);
+        let result = hit != m.invert;
+        let update = op == RecentMatch::SET || op == RecentMatch::UPDATE && result;
+        let reap = m.flags & RecentMatch::REAP != 0
+            && !(i == 0 && update)
+            && self
+                .entries
+                .front()
+                .and_then(|e| e.stamps.back())
+                .is_some_and(|t| !in_window(t));
+        if update {
+            let mut entry = self.entries.remove(i).unwrap();
+            if entry.stamps.len() == self.capacity {
+                entry.stamps.pop_front();
+            }
+            entry.stamps.push_back(now);
+            entry.ttl = ttl;
+            self.entries.push_back(entry);
+        }
+        if reap {
+            self.entries.pop_front();
+        }
+        result
+    }
 }
 
 /// See [`Rule::rates`].
@@ -418,6 +608,19 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Vec<u
             t.chains.iter_mut().for_each(|c| c.id = None);
             t.sets.iter_mut().for_each(|s| s.id = None);
         }
+        let mut names = std::collections::HashSet::new();
+        for table in &st.tables {
+            for m in table
+                .chains
+                .iter()
+                .flat_map(|c| &c.rules)
+                .flat_map(|r| &r.recent)
+                .map(|(_, m)| m)
+            {
+                names.insert(m.name.as_slice());
+            }
+        }
+        st.recent.retain(|name, _| names.contains(name.as_slice()));
         *ns.nft.borrow_mut() = st;
     }
     replies
@@ -851,6 +1054,7 @@ impl Nft {
             }
         };
         let rule = Rule {
+            recent: RecentMatch::for_rule(&exprs, &mut self.recent)?,
             handle,
             exprs,
             userdata,
@@ -1710,6 +1914,7 @@ const NFT_RETURN: i32 = -5;
 const JUMP_STACK: usize = 16;
 /// The PREROUTING and OUTPUT hooks (`NF_INET_PRE_ROUTING`, `NF_INET_LOCAL_OUT`).
 pub(crate) const HOOK_PRE_ROUTING: u32 = 0;
+const HOOK_FORWARD: u32 = 2;
 pub(crate) const HOOK_LOCAL_OUT: u32 = 3;
 const RTN_UNICAST: u32 = 1;
 const RTN_LOCAL: u32 = 2;
@@ -1831,6 +2036,7 @@ impl Nft {
         let mut mark = p.mark;
         for (t, c, _) in chains {
             let mut e = Eval {
+                recent: &self.recent,
                 p,
                 nh: nh.clone(),
                 th: th.clone(),
@@ -1879,6 +2085,7 @@ impl Nft {
         let mut mark = p.mark;
         for (t, c, _) in chains {
             let mut e = Eval {
+                recent: &self.recent,
                 p,
                 nh: nh.clone(),
                 th: th.clone(),
@@ -2019,7 +2226,16 @@ fn run_chain(e: &mut Eval<'_>, t: &Table, base: &Chain) -> i32 {
         e.rates = Some(rule.rates.clone());
         for (at, (name, data)) in exprs(&rule.exprs).into_iter().enumerate() {
             e.at = at;
-            e.expr(t, &name, &data);
+            if let Some((_, m)) = rule.recent.iter().find(|(i, _)| *i == at) {
+                if !e.recent[&m.name]
+                    .borrow_mut()
+                    .matches(m, e.p, Instant::now())
+                {
+                    e.verdict = NFT_BREAK;
+                }
+            } else {
+                e.expr(t, &name, &data);
+            }
             if e.verdict != NFT_CONTINUE {
                 break;
             }
@@ -2059,6 +2275,7 @@ fn run_chain(e: &mut Eval<'_>, t: &Table, base: &Chain) -> i32 {
 
 /// The state of a rule while it runs (`struct nft_regs` and the packet).
 struct Eval<'a> {
+    recent: &'a RecentLists,
     p: &'a Packet<'a>,
     /// Network- and transport-layer headers (synthesized from the [`Packet`]: TCP is a SYN).
     nh: Vec<u8>,
@@ -3172,6 +3389,80 @@ mod tests {
         };
         assert_eq!(run(&with(2, xt(b"REDIRECT"))), (true, false));
         assert_eq!(run(&with(2, xt(b"LOG"))), (false, false));
+    }
+
+    #[test]
+    fn ufw_recent_limit_shares_history_across_rules() {
+        let ns = ns();
+        let root = Cred::root();
+        let recent = |op, hits: u32, seconds: u32| {
+            let mut info = vec![0; 232];
+            info[..4].copy_from_slice(&seconds.to_ne_bytes());
+            info[4..8].copy_from_slice(&hits.to_ne_bytes());
+            info[8] = op;
+            info[10..17].copy_from_slice(b"DEFAULT");
+            info[212..228].fill(0xff);
+            expr(
+                "match",
+                &[(1, cstr(b"recent")), (2, be32(1).to_vec()), (3, info)],
+            )
+        };
+        let setup = [
+            table_msg(2, b"ufw"),
+            chain_msg(2, b"ufw", b"in", Some((1, 0, b"filter"))),
+            rule_msg(2, b"ufw", b"in", &[recent(RecentMatch::SET, 0, 0)]),
+            rule_msg(
+                2,
+                b"ufw",
+                b"in",
+                &[
+                    recent(RecentMatch::UPDATE, 6, 30),
+                    expr(
+                        "immediate",
+                        &[
+                            (IMMEDIATE_DREG, be32(0).to_vec()),
+                            (IMMEDIATE_DATA, verdict(NF_DROP, None)),
+                        ],
+                    ),
+                ],
+            ),
+        ];
+        let install = || {
+            assert!(
+                errors(&handle(&ns, &root, &batch(&setup), &peer()))
+                    .iter()
+                    .all(|&e| e == 0)
+            )
+        };
+        install();
+        let local = |_: &[u8]| RTN_UNICAST;
+        let run = |src: &[u8]| {
+            let mut p = packet(6, &[127, 0, 0, 1], 80, &local);
+            p.src = src;
+            p.hook = 1;
+            ns.nft.borrow().filter(&p)
+        };
+        let src = [10, 0, 0, 2];
+        for _ in 0..5 {
+            assert_eq!(run(&src), Outcome::Accept);
+        }
+        // A rejected batch cannot discard the live list.
+        let invalid = rule_msg(2, b"ufw", b"in", &[recent(RecentMatch::SET, 1, 0)]);
+        assert!(
+            errors(&handle(&ns, &root, &batch(&[invalid]), &peer())).contains(&Errno::EINVAL.0)
+        );
+        assert_eq!(run(&src), Outcome::Drop);
+        assert_eq!(run(&[10, 0, 0, 3]), Outcome::Accept);
+        let mut attrs = Vec::new();
+        a(&mut attrs, TABLE_NAME, &cstr(b"ufw"));
+        let delete = msg(DELTABLE, 0, 2, &attrs);
+        assert!(
+            errors(&handle(&ns, &root, &batch(&[delete]), &peer()))
+                .iter()
+                .all(|&e| e == 0)
+        );
+        install();
+        assert_eq!(run(&src), Outcome::Accept);
     }
 
     /// xt mark and owner matches (older iptables-nft sends `-m mark` as xt, current ones translate

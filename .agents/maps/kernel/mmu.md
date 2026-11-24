@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: TLB shootdown from the Files app without a current guest thread)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shoot down live file mappings before a provider truncates their host object)
 
 ## Responsibilities
 
@@ -131,7 +131,7 @@ fast path and refill (`engine/dbt`).
 ### Consistency: shootdown and code invalidation
 
 - Mutators run under the BKL and only record what changed: `dirty` (unmap, mremap moves, permission
-  downgrades, fork lending, `unshare`, truncation and file moves, leaving a code group), the
+  downgrades, fork lending, `unshare`, truncation, leaving a code group), the
   `graveyard` (always together with `dirty`), `code_ranges` (executable ranges unmapped, moved,
   re-protected, discarded or truncated, and invalidations), and `exec_changed` (executable VMAs
   inserted, re-protected or grown, kernel writes into them; never an unmap).
@@ -139,14 +139,14 @@ fast path and refill (`engine/dbt`).
   `rt_sigreturn`, a successful execve or execveat, a syscall a tracer or seccomp skipped, and a
   kill at the entry stop; the no-BKL fast path never changes the mm), on `ic ivau` exits (and any
   exit with an `ivau` page pending), after `write_force`, and on every address space a truncation
-  or file move changed. It re-checks the code group, prunes `Mm::memops` against invalidated or
+  changed. It re-checks the code group, prunes `Mm::memops` against invalidated or
   non-exec/writable/written ranges and syncs group-admitted or sole-space memops to
   `DbtSpace::set_memops`; returns when nothing is dirty and no code changed; publishes `code_ranges`
   to the `CodeLog` and bumps the code generation; returns if nothing is dirty and the graveyard is
   empty; otherwise bumps the TLB generation (when dirty), runs `quiesce`, and clears the graveyard.
 - `quiesce` kicks every other user of the mm and spins until none is in guest code. When a
-  Files app open moves a shared mapping to a shorter object, `sync_except(None)` includes
-  every guest thread in the shootdown before the host region is remapped. The kick is
+  Files app open truncates a mapped object, `sync_except(None)` includes
+  every guest thread in the shootdown before the host file shrinks. The kick is
   sticky, so a thread returning from a no-BKL fast syscall stops at its next guest entry. fork and
   membarrier quiesce too.
 - `shootdown` is the immediate form used when a PTE is re-pointed (CoW copy, return of a borrowed

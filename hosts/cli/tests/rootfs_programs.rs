@@ -2451,8 +2451,13 @@ fn files_app_writes_stay_out_of_clones() {
             "cloned\n"
         );
         let id = machine.open_console(24, 200).unwrap();
-        let argv =
-            ["hostclone", "hold", "/root/hc/dst2", "/root/hc/src"].map(|s| s.as_bytes().to_vec());
+        let argv = [
+            "hostclone",
+            if truncate { "hold-truncate" } else { "hold" },
+            "/root/hc/dst2",
+            "/root/hc/src",
+        ]
+        .map(|s| s.as_bytes().to_vec());
         let pid = machine
             .spawn(b"/root/hc/hostclone", &argv, &env, Io::Console(id))
             .unwrap();
@@ -2468,6 +2473,16 @@ fn files_app_writes_stay_out_of_clones() {
             "holding BBBB BBBB"
         );
         let file = open_write(b"/root/hc/dst2", truncate);
+        if truncate {
+            machine.write_console(id, b"\n").unwrap();
+            ready = Vec::new();
+            while !ready.ends_with(b"tail faulted\r\n") && !ready.ends_with(b"tail faulted\n") {
+                let n = machine.read_console(id, &mut buf).unwrap();
+                assert!(n > 0, "{ready:?}");
+                ready.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(String::from_utf8(ready).unwrap().trim(), "tail faulted");
+        }
         file.write_all_at(b"CCCC\n", 0).unwrap();
         machine.write_console(id, b"\n").unwrap();
         let out = read_console(&machine, id);

@@ -10,7 +10,6 @@
 
 use std::os::unix::fs::FileExt;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 use std::time::Duration;
 
 use super::SocketRef;
@@ -25,12 +24,11 @@ use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, PIPE_DEV, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
 use crate::pseudo::{self, PseudoNode};
 use crate::signal::{self, SigInfo};
-use crate::task::TaskSync;
 use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::overlay::{self, CopyUp, OvlId};
-use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, Unshare, mode};
+use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, mode};
 use crate::vfs::{Dentry, Fs, MountId, Node, Pseudo, TMPFS_PAGE, Vfs, ms, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
@@ -435,11 +433,15 @@ fn open_path_with(
                     if vfs.readonly(&dir) {
                         return Err(Errno::EROFS);
                     }
+                    if flags & oflags::O_DIRECTORY != 0 {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    cx.fds().free_slot(0)?;
                     let ipc = cx.kr().ipc(ns);
                     let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
                     cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
                     let perm = perm & !cx.umask();
-                    let q = super::mqueue::new_queue(ipc, ns, &cred, perm, None)?;
+                    let q = super::mqueue::new_queue(cx, ns, &cred, perm, None)?;
                     let ino = q.borrow().ino;
                     super::mqueue::insert_queue(cx.k().ipc_mut(ns), name.to_vec(), q);
                     mq_created = true;
@@ -601,10 +603,24 @@ fn open_path_with(
         Node::Pseudo(mnt, PseudoNode::Mq(..)) => Some(*mnt),
         _ => None,
     };
+    let mut mq_path = None;
     let kind = if flags & oflags::O_PATH != 0 {
         if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
         }
+        mq_path = match &node {
+            Node::Pseudo(_, PseudoNode::Mq(ns, ino)) => Some(mq_queue(cx, *ns, *ino)?),
+            Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
+                cx.view(&vfs).open_file(*proc, *tid, *fd).and_then(|f| {
+                    let f = f.borrow();
+                    match &f.kind {
+                        FileKind::MessageQueue(q) => Some(q.clone()),
+                        _ => f.mq_path.clone(),
+                    }
+                })
+            }
+            _ => None,
+        };
         FileKind::Path(node)
     } else {
         match node {
@@ -654,6 +670,7 @@ fn open_path_with(
         )
     });
     let file = OpenFile::with_path(kind, flags & kept(flags) | largefile(flags), display);
+    file.borrow_mut().mq_path = mq_path;
     if let Some(mnt) = store_mnt {
         file.borrow_mut().mnt = mnt;
     }
@@ -994,6 +1011,18 @@ fn reopen(
     let accmode = flags & oflags::O_ACCMODE;
     let file = cx.view(vfs).open_file(proc, tid, fd).ok_or(Errno::ENOENT)?;
     let f = file.borrow();
+    let mq = match &f.kind {
+        FileKind::MessageQueue(q) => Some(q),
+        _ => f.mq_path.as_ref(),
+    };
+    if let Some(q) = mq {
+        if flags & oflags::O_DIRECTORY != 0 {
+            return Err(Errno::ENOTDIR);
+        }
+        cred.permission(&q.borrow().stat(), open_mask(flags))?;
+        return Ok(FileKind::MessageQueue(q.clone()));
+    }
+
     if let FileKind::Regular {
         ino, file: host, ..
     } = &f.kind
@@ -3809,7 +3838,9 @@ fn try_share(cx: &mut Cx<'_>, input: &FileRef, output: &FileRef) -> Result<bool,
         return Ok(false);
     }
     remove_privs(cx, dst)?;
-    vfs.store().share(src, dst)?;
+    if !vfs.store().try_share(src, dst)? {
+        return Ok(false);
+    }
     rehome(cx.kr(), &vfs, dst);
     Ok(true)
 }
@@ -5151,13 +5182,13 @@ pub(super) fn prepare_write(
 pub(super) fn make_private(cx: &mut Cx<'_>, ino: Ino, keep: Option<u64>) -> Result<(), Errno> {
     let vfs = cx.vfs()?;
     let was_held = vfs.store().held(ino).unwrap_or(true);
-    let moved_spaces = loop {
+    loop {
         if cx.kr().unsharing.contains(&ino) {
             cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
             continue;
         }
         let Some(job) = vfs.store().unshare(ino, keep)? else {
-            break None;
+            break;
         };
         cx.k().unsharing.insert(ino);
         let copied = cx.unlocked(|| crate::vfs::store::copy_object(&job.from, &job.to, job.len));
@@ -5167,15 +5198,33 @@ pub(super) fn make_private(cx: &mut Cx<'_>, ino: Ino, keep: Option<u64>) -> Resu
             vfs.store().abandon_unshare(job);
             return Err(e);
         }
-        // Include mappings created during the unlocked copy. The BKL stays held from this
-        // check through migration, so a busy address space can refuse the switch safely.
-        let spaces = mapping_spaces(cx.kr());
-        match finish_mapped_unshare(vfs.store(), job, &spaces) {
+        // No descriptor acquisition may fail after the store publishes the new identity.
+        // Include descriptions opened while the copy ran without the BKL.
+        let handles = opens_of(cx.kr(), ino)
+            .into_iter()
+            .map(|file| {
+                let write = file.try_borrow_mut().map_err(|_| Errno::EBUSY)?.writable();
+                let object = vfs.store().open_unshare(&job, write)?;
+                Ok((file, object))
+            })
+            .collect::<Result<Vec<_>, Errno>>();
+        let handles = match handles {
+            Ok(handles) => handles,
+            Err(e) => {
+                vfs.store().abandon_unshare(job);
+                return Err(e);
+            }
+        };
+        match vfs.store().finish_unshare(job) {
             Err(Errno::EAGAIN) => continue,
             r => r?,
         }
-        break Some(spaces);
-    };
+        for (handle, object) in handles {
+            replace_object(&mut handle.borrow_mut(), object, false);
+        }
+        vfs.forget_executable(ino);
+        return Ok(());
+    }
     // Descriptions need new handles only when the file was sharing its object, or when some still
     // hold a read-only one from then: rehoming always would keep every replaced handle open until
     // close, a host fd per description each time a file kept open (a log) is truncated
@@ -5186,64 +5235,7 @@ pub(super) fn make_private(cx: &mut Cx<'_>, ino: Ino, keep: Option<u64>) -> Resu
     if was_held || opens_of(cx.kr(), ino).iter().any(cow) {
         rehome(cx.kr(), &vfs, ino);
     }
-    if let Some(spaces) = moved_spaces {
-        move_mappings(&spaces, &vfs, ino, Some(&cx.task.sync));
-    }
     Ok(())
-}
-
-/// Each live address space once, including a fork that shares host regions with its parent.
-fn mapping_spaces(k: &Kernel) -> Vec<Rc<RefCell<crate::mm::Mm>>> {
-    let mut mms = Vec::new();
-    for t in k.tasks.values() {
-        let mm = t.res.borrow().mm.clone();
-        if !mms.iter().any(|m| Rc::ptr_eq(m, &mm)) {
-            mms.push(mm);
-        }
-    }
-    mms
-}
-
-/// Publish the copy only when every address space can participate in the mapping move.
-fn finish_mapped_unshare(
-    store: &Store,
-    job: Unshare,
-    spaces: &[Rc<RefCell<crate::mm::Mm>>],
-) -> Result<(), Errno> {
-    if spaces.iter().any(|mm| mm.try_borrow_mut().is_err()) {
-        store.abandon_unshare(job);
-        return Err(Errno::EBUSY);
-    }
-    store.finish_unshare(job)
-}
-
-/// Clip and sync every address space before replacing any host region shared across fork.
-fn move_mappings(
-    mms: &[Rc<RefCell<crate::mm::Mm>>],
-    vfs: &Vfs,
-    ino: Ino,
-    current: Option<&Arc<TaskSync>>,
-) {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(object) = vfs.store().open_mapped_object(ino) else {
-        return;
-    };
-    let Ok(meta) = object.metadata() else {
-        return;
-    };
-    let to_id = (meta.dev(), meta.ino());
-    for mm in mms {
-        let mut m = mm.borrow_mut();
-        if m.file_moving(ino, to_id, meta.len()) {
-            m.sync_except(current);
-        }
-    }
-    let to = Rc::new(std::os::fd::OwnedFd::from(object));
-    for mm in mms {
-        if let Err(e) = mm.borrow_mut().file_moved(ino, &to, to_id) {
-            crate::debug::log(format_args!("move_mappings: inode {ino}: {e:?}"));
-        }
-    }
 }
 
 /// Store regular file `ino` changed objects, or stopped being held: every description of it
@@ -5265,24 +5257,48 @@ fn rehome(k: &crate::kernel::Kernel, vfs: &Vfs, ino: Ino) {
         let Ok(object) = store.open_object(ino, write) else {
             continue;
         };
-        let f = &mut *f;
-        let cow_now = f.writable() && held;
-        if let FileKind::Regular { file, cow, .. } = &mut f.kind {
-            f.retired.push(std::mem::replace(file, object));
-            *cow = cow_now;
-        }
+        replace_object(&mut f, object, held);
     }
     vfs.forget_executable(ino);
 }
 
+fn replace_object(f: &mut OpenFile, object: std::fs::File, held: bool) {
+    let cow_now = f.writable() && held;
+    if let FileKind::Regular { file, cow, .. } = &mut f.kind {
+        f.retired.push(std::mem::replace(file, object));
+        *cow = cow_now;
+    }
+}
+
+/// A provider can commit its object switch before its notification reaches this kernel.
+/// Check open descriptions against the pinned object before exposing a new shared mapping.
+pub(super) fn reconcile_mapping(k: &Kernel, ino: Ino, object: &std::fs::File) -> Result<(), Errno> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let current = object.metadata().map_err(host_errno)?;
+    for handle in opens_of(k, ino) {
+        let mut f = handle.try_borrow_mut().map_err(|_| Errno::EBUSY)?;
+        if let FileKind::Regular { file, cow, .. } = &f.kind {
+            let old = file.metadata().map_err(host_errno)?;
+            if *cow || (old.dev(), old.ino()) != (current.dev(), current.ino()) {
+                let fresh = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(f.writable())
+                    .open(format!("/proc/self/fd/{}", object.as_raw_fd()))
+                    .map_err(host_errno)?;
+                replace_object(&mut f, fresh, false);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The host (the Files app) gave held regular file `ino` an object of its own as it opened it for
-/// writing ([`crate::vfs::browse::open_write`]). Move this kernel's open descriptions and shared
-/// mappings to its current object under the BKL, as after the kernel's own unsharing.
+/// writing ([`crate::vfs::browse::open_write`]). Move this kernel's open descriptions to the
+/// current object under the BKL.
 pub(crate) fn host_unshared(k: &Kernel, ino: Ino) {
     if let Some(vfs) = &k.vfs {
         rehome(k, vfs, ino);
-        // Provider changes enter under a freshly acquired BKL with no guest Mm borrowed.
-        move_mappings(&mapping_spaces(k), vfs, ino, None);
     }
 }
 
@@ -6383,6 +6399,10 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
 pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
     follow_copy_up(cx, file)?;
     let f = file.borrow();
+    if let Some(q) = &f.mq_path {
+        let q = q.borrow();
+        return Ok(encode_stat(&q.stat(), cx.vfs()?.mq_dev(q.ns)));
+    }
     let anon = |ino: u64, mode: u32, rdev: u64, dev: u64| {
         let st = Stat {
             ino,
@@ -9583,32 +9603,4 @@ fn truncating(cx: &Cx<'_>, host: &std::fs::File, len: u64) {
 
 fn host_errno(e: std::io::Error) -> Errno {
     Errno(e.raw_os_error().unwrap_or(Errno::EIO.0))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::vfs::store::ROOT;
-
-    #[test]
-    fn busy_mapping_keeps_the_shared_object_until_retry() {
-        let dir = std::env::temp_dir().join(format!("appine-busy-mapping-{}", std::process::id()));
-        let store = Store::create(&dir).unwrap();
-        let (src, _) = store.create_file(ROOT, b"src", 0o600, 0, 0).unwrap();
-        let (dst, _) = store.create_file(ROOT, b"dst", 0o600, 0, 0).unwrap();
-        store.share(src, dst).unwrap();
-        let copy = || store.unshare(dst, None).unwrap().unwrap();
-        let spaces = [crate::mm::Mm::new().into_shared()];
-        let busy = spaces[0].borrow();
-        assert_eq!(
-            finish_mapped_unshare(&store, copy(), &spaces),
-            Err(Errno::EBUSY)
-        );
-        assert!(store.held(dst).unwrap());
-        drop(busy);
-        finish_mapped_unshare(&store, copy(), &spaces).unwrap();
-        assert!(!store.held(dst).unwrap());
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
 }

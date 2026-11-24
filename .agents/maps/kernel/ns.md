@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: make unshare atomic and unshare shared FsContext on pidfd setns with CLONE_NEWNS)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: capture the creator’s message queue soft limit in each new user namespace)
 
 ## Responsibilities
 
@@ -36,7 +36,7 @@ addresses and ports (`kernel/netns`), IPC objects (`kernel/ipc`), the cgroup tre
 ## Key types
 
 - `NsProxy` (per task: UTS, IPC, net, cgroup, time, time-for-children), `UtsNs`, `IpcNs`,
-  `CgroupNs`, `TimeNs` (offsets, frozen), `UserNs` (parent, level, owner, uid/gid maps, setgroups,
+  `CgroupNs`, `TimeNs` (offsets, frozen), `UserNs` (parent, level, owner, uid/gid maps, parent message queue charge limit, setgroups,
   whether the creator had `CAP_SETFCAP`; held in credentials), `PidNs` (parent, level, owner,
   global↔local tables, reaper, dead; held per thread group), `MntNs` (held in `FsContext`), `NsRef`
   (a strong reference to any namespace), `NsSet`; `Counted` (the eight counted kinds and their

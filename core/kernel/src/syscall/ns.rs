@@ -25,12 +25,12 @@ use crate::vfs::{MntNs, MountId, Node, Vfs, new_ns_id};
 /// (ENOSPC; older kernels give EUSERS for the level), a chrooted process may not (EPERM), and the
 /// creator's effective user ID and group ID must be mapped in the old namespace (EPERM).
 /// `chrooted` means the root directory is not the mount namespace's root.
-pub(super) fn new_user_ns(k: &mut Kernel, cred: &mut Cred, chrooted: bool) -> Result<(), Errno> {
+pub(super) fn new_user_ns(cx: &mut Cx<'_>, cred: &mut Cred, chrooted: bool) -> Result<(), Errno> {
     let parent = cred.user_ns.clone();
     if parent.level > MAX_USER_NS_LEVEL {
         return Err(Errno::ENOSPC);
     }
-    check_counts(k, &[Counted::User], &parent, cred.euid)?;
+    check_counts(cx.k(), &[Counted::User], &parent, cred.euid)?;
     if chrooted {
         return Err(Errno::EPERM);
     }
@@ -41,7 +41,10 @@ pub(super) fn new_user_ns(k: &mut Kernel, cred: &mut Cred, chrooted: bool) -> Re
     }
     let setfcap = cred.cap_effective & 1 << cap::SETFCAP != 0;
     let ns = UserNs::child(&parent, cred.euid, setfcap);
-    k.ucounts
+    ns.mq_max
+        .set(cx.t.group.borrow().rlimits[crate::process::RLIMIT_MSGQUEUE as usize].0);
+    cx.k()
+        .ucounts
         .add(Counted::User, &parent, cred.euid, ns.clone(), Some(ns.id));
     cred.enter_user_ns(ns);
     Ok(())
