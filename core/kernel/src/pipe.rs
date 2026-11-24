@@ -23,6 +23,9 @@ pub const PIPE_MAX_SIZE: usize = 1024 * 1024;
 /// Writes up to this length are never interleaved with other writes.
 pub const PIPE_BUF: usize = 4096;
 
+/// Device number anonymous pipes report (pipefs).
+pub(crate) const PIPE_DEV: u64 = 0xd;
+
 /// A pipe.
 pub struct Pipe {
     /// Buffered data.

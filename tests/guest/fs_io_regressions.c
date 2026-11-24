@@ -22,7 +22,8 @@
  *    destinations, and concurrent lseek + I/O position safety.
  * 8. Pipe I/O: read/readv/read-side vmsplice with faulting buffer (EFAULT) preserve unread pipe
  *    bytes; splice into file hitting RLIMIT_FSIZE raises SIGXFSZ; F_SETPIPE_SZ shrinking above
- *    pipe-max-size succeeds without EPERM while growing returns EPERM.
+ *    pipe-max-size succeeds without EPERM while growing returns EPERM. Anonymous pipe ends
+ *    contend for flock locks, with open-file ownership, conversion and procfs listings.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -35,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
@@ -1278,6 +1280,50 @@ static void on_xfsz(int sig)
     got_xfsz = 1;
 }
 
+static void check_pipe_flock_listing(int fd)
+{
+    char path[64], info[1024], id[96];
+    struct stat st;
+    CHECK(fstat(fd, &st) == 0, "stat locked pipe");
+    snprintf(id, sizeof(id), "FLOCK  ADVISORY  WRITE %d %02x:%02x:%llu 0 EOF",
+             getpid(), major(st.st_dev), minor(st.st_dev), (unsigned long long)st.st_ino);
+    snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+    read_proc_str(path, info, sizeof(info));
+    CHECK(strstr(info, id) != NULL, "locked pipe in fdinfo: %s", info);
+    read_proc_str("/proc/locks", info, sizeof(info));
+    CHECK(strstr(info, id) != NULL, "locked pipe in /proc/locks: %s", info);
+}
+
+static void test_pipe_flock(void)
+{
+    int p[2], other[2];
+    CHECK(pipe(p) == 0 && pipe(other) == 0, "create pipes for flock");
+    int alias = dup(p[0]);
+    CHECK(alias >= 0, "dup pipe read end");
+    CHECK(flock(p[0], LOCK_EX | LOCK_NB) == 0, "lock pipe read end");
+    CHECK(flock(p[1], LOCK_EX | LOCK_NB) < 0 && errno == EWOULDBLOCK,
+          "pipe write end must conflict with read end");
+    CHECK(flock(other[0], LOCK_EX | LOCK_NB) == 0, "lock independent pipe");
+    close(p[0]);
+    CHECK(flock(p[1], LOCK_SH | LOCK_NB) < 0 && errno == EWOULDBLOCK,
+          "dup must keep exclusive lock alive");
+
+    check_pipe_flock_listing(alias);
+
+    CHECK(flock(alias, LOCK_SH | LOCK_NB) == 0, "downgrade to shared lock");
+    CHECK(flock(p[1], LOCK_SH | LOCK_NB) == 0, "share lock with write end");
+    CHECK(flock(alias, LOCK_EX | LOCK_NB) < 0 && errno == EWOULDBLOCK,
+          "upgrade must conflict with the other shared holder");
+    CHECK(flock(p[1], LOCK_EX | LOCK_NB) == 0, "failed upgrade released the old shared lock");
+    CHECK(flock(p[1], LOCK_UN) == 0, "unlock pipe write end");
+    CHECK(flock(alias, LOCK_EX | LOCK_NB) == 0, "acquire after unlock");
+    close(alias);
+    CHECK(flock(p[1], LOCK_EX | LOCK_NB) == 0, "acquire after last close");
+    close(p[1]);
+    close(other[0]);
+    close(other[1]);
+}
+
 static void test_pipe_regressions(void)
 {
     /* Part A: read, readv, and read-side vmsplice with faulting buffer do not consume bytes */
@@ -1422,6 +1468,7 @@ int main(void)
     test_inotify_core();
     test_fuse_inotify_and_sync();
     test_fileio_and_files();
+    test_pipe_flock();
     test_pipe_regressions();
 
     printf("all ok\n");

@@ -146,10 +146,6 @@ type Waiter = (Arc<Event>, u32, Option<Box<[wake::Object]>>);
 /// namespace, the process, and the process groups that may become orphaned.
 type HeldReaper = (Rc<crate::pidns::PidNs>, Rc<RefCell<ThreadGroup>>, Vec<Tid>);
 
-/// An open file holding a flock(2) lock (a weak reference; the lock is released with it when it is
-/// closed), whether the lock is exclusive, and the process that took it (`/proc/locks`).
-pub(crate) type FlockHolder = (std::rc::Weak<RefCell<crate::fd::OpenFile>>, bool, Tid);
-
 /// The kernel layer's global state.
 pub(crate) struct Kernel {
     /// All live threads.
@@ -187,7 +183,7 @@ pub(crate) struct Kernel {
     pub consoles: BTreeMap<u32, crate::terminal::Console>,
     /// flock(2) locks: for each inode, the open files holding a lock and whether it is exclusive.
     /// Once an open file is closed its weak reference dies and the lock is released with it.
-    pub flocks: BTreeMap<Ino, Vec<FlockHolder>>,
+    pub flocks: crate::locks::Flocks,
     /// fcntl(2) record locks.
     pub locks: crate::locks::Locks,
     /// The boot-time UTS, IPC, network, cgroup and time namespaces ([`crate::nsproxy`]).
@@ -373,7 +369,7 @@ impl Kernel {
             },
             ptys: BTreeMap::new(),
             consoles: BTreeMap::new(),
-            flocks: BTreeMap::new(),
+            flocks: crate::locks::Flocks::default(),
             locks: crate::locks::Locks::default(),
             init_ns: init_ns.clone(),
             net_nss: Vec::new(),

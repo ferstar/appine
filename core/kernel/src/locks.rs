@@ -1,22 +1,106 @@
-//! fcntl(2) record locks (the kernel/locks map): traditional POSIX locks and OFD locks (open file
-//! description locks).
+//! flock(2) locks and fcntl(2) record locks (the kernel/locks map).
 //!
-//! Locks are recorded by inode, and each lock has one owner: a POSIX lock belongs to an fd table
+//! Each lock has one owner: a POSIX lock belongs to an fd table
 //! (shared by all threads of one process), and closing any fd in that table that refers to the
-//! file releases all of the table's locks on the file; an OFD lock belongs to an open file and is
-//! released when its last reference is closed. Owners are recorded as weak references, so locks
-//! lapse by themselves once their owner is gone (process exit, open file dropped). Locks of one
-//! owner never overlap, and adjacent locks of the same type are merged, as on Linux.
+//! file releases all of the table's locks on the file. OFD and flock locks belong to an open
+//! file and lapse when its last reference is closed. Record locks of one owner never overlap,
+//! and adjacent ranges of the same type are merged.
 
 use std::fmt::Write as _;
 use std::rc::{Rc, Weak};
 
 use crate::cell::RefCell;
-use crate::fd::{FdTable, FileRef, OpenFile};
+use crate::fd::{FdTable, FileKind, FileRef, OpenFile};
 use crate::kernel::{Kernel, Tid, request_wake_locks};
 use crate::pidns::PidNs;
 use crate::vfs::store::Ino;
 use crate::vfs::{Node, Vfs};
+
+/// Anonymous pipe inodes are allocated independently of store, overlay and FUSE lock keys.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum FlockKey {
+    Node(Ino),
+    Pipe(Ino),
+}
+
+impl FlockKey {
+    pub fn of(file: &OpenFile) -> Option<Self> {
+        if let Some(ino) = file.lock_ino() {
+            return Some(Self::Node(ino));
+        }
+        match &file.kind {
+            FileKind::Pipe(end) => Some(Self::Pipe(end.pipe.borrow().ino)),
+            _ => None,
+        }
+    }
+}
+
+struct FlockHolder {
+    file: Weak<RefCell<OpenFile>>,
+    exclusive: bool,
+    /// The process that took the lock, as reported in /proc/locks.
+    pid: Tid,
+}
+
+#[derive(Default)]
+pub(crate) struct Flocks {
+    by_key: std::collections::BTreeMap<FlockKey, Vec<FlockHolder>>,
+    sweep_at: usize,
+}
+
+impl Flocks {
+    fn sweep_if_needed(&mut self) {
+        // A last close releases the lock through its weak owner. Reclaim old keys even when a
+        // workload keeps locking fresh pipes, whose inode numbers never repeat.
+        if self.by_key.len() >= self.sweep_at.max(256) {
+            self.by_key.retain(|_, holders| {
+                holders.retain(|holder| holder.file.strong_count() > 0);
+                !holders.is_empty()
+            });
+            self.sweep_at = 2 * self.by_key.len();
+        }
+    }
+
+    /// Returns false if another open file holds a conflicting lock.
+    pub fn try_lock(&mut self, key: FlockKey, file: &FileRef, exclusive: bool, pid: Tid) -> bool {
+        self.sweep_if_needed();
+        let holders = self.by_key.entry(key).or_default();
+        holders.retain(|holder| holder.file.strong_count() > 0);
+        let owner = Rc::downgrade(file);
+        if let Some(i) = holders.iter().position(|holder| holder.file.ptr_eq(&owner)) {
+            if holders[i].exclusive == exclusive {
+                return true;
+            }
+            // A conversion releases the old lock even when the new request would block.
+            holders.remove(i);
+            request_wake_locks();
+        }
+        if holders.iter().any(|holder| exclusive || holder.exclusive) {
+            return false;
+        }
+        holders.push(FlockHolder {
+            file: owner,
+            exclusive,
+            pid,
+        });
+        file.borrow_mut().holds_locks = true;
+        true
+    }
+
+    pub fn unlock(&mut self, key: FlockKey, file: &FileRef) {
+        let Some(holders) = self.by_key.get_mut(&key) else {
+            return;
+        };
+        let owner = Rc::downgrade(file);
+        if let Some(i) = holders.iter().position(|holder| holder.file.ptr_eq(&owner)) {
+            holders.remove(i);
+            request_wake_locks();
+        }
+        if holders.is_empty() {
+            self.by_key.remove(&key);
+        }
+    }
+}
 
 /// The owner of a lock.
 #[derive(Clone)]
@@ -241,12 +325,12 @@ pub(crate) fn fd_locks(
     fds: &Rc<RefCell<FdTable>>,
     file: &FileRef,
 ) -> String {
-    let Some(ino) = file.borrow().lock_ino() else {
+    let Some(key) = FlockKey::of(&file.borrow()) else {
         return String::new();
     };
     let mut out = String::new();
     let mut n = 0;
-    for s in shown(k, Some(ino)).iter().filter(|s| {
+    for s in shown(k, Some(key)).iter().filter(|s| {
         Rc::ptr_eq(&s.file, file)
             && s.table
                 .as_ref()
@@ -303,16 +387,19 @@ impl Shown {
 
 /// Every lock and lease (only those on `only` when given), in the order Linux keeps an inode's:
 /// flock locks, then POSIX and OFD locks, then leases.
-fn shown(k: &Kernel, only: Option<Ino>) -> Vec<Shown> {
-    let wanted = |ino: &Ino| only.is_none_or(|o| o == *ino);
+fn shown(k: &Kernel, only: Option<FlockKey>) -> Vec<Shown> {
+    let wanted = |ino: &Ino| only.is_none_or(|o| o == FlockKey::Node(*ino));
     let mut out = Vec::new();
-    for (_, holders) in k.flocks.iter().filter(|(i, _)| wanted(i)) {
-        for (file, exclusive, pid) in holders {
-            if let Some(file) = file.upgrade() {
+    for (key, holders) in &k.flocks.by_key {
+        if only.is_some_and(|o| o != *key) {
+            continue;
+        }
+        for holder in holders {
+            if let Some(file) = holder.file.upgrade() {
                 out.push(Shown {
                     kind: "FLOCK  ADVISORY  ",
-                    write: Some(*exclusive),
-                    pid: *pid,
+                    write: Some(holder.exclusive),
+                    pid: holder.pid,
                     file,
                     range: "0 EOF".into(),
                     table: None,
@@ -390,6 +477,11 @@ impl Owner {
 /// The device and inode numbers stat shows for `file` (`/proc/locks` prints the inode's): those of
 /// its node, with an overlay node's shown inode number.
 fn shown_id(vfs: &Vfs, file: &OpenFile) -> Option<(u64, u64)> {
+    if let FileKind::Pipe(end) = &file.kind
+        && end.pipe.borrow().fifo.is_none()
+    {
+        return Some((crate::pipe::PIPE_DEV, end.pipe.borrow().ino));
+    }
     let node = file.node()?;
     let ino = match &node {
         Node::Overlay(_, o) => vfs.overlay().shown_ino(*o),

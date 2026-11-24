@@ -19,8 +19,8 @@ use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
 use crate::kernel::{Cx, Kernel, Tid, request_wake_locks, request_wake_object, wake};
-use crate::locks::{self, Lock, Owner, Waiter};
-use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
+use crate::locks::{self, FlockKey, Lock, Owner, Waiter};
+use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, PIPE_DEV, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
 use crate::pseudo::{self, PseudoNode};
 use crate::signal::{self, SigInfo};
@@ -98,8 +98,6 @@ const CLOSE_RANGE_CLOEXEC: u32 = 4;
 const UIO_MAXIOV: usize = 1024;
 
 pub(super) use crate::vfs::ROOT_DEV;
-/// Device number pipes report (on Linux pipefs is an anonymous device).
-const PIPE_DEV: u64 = 0xd;
 /// Device number sockets and anon_inodes (epoll, eventfd) report.
 const SOCK_DEV: u64 = 0x8;
 const ANON_DEV: u64 = 0xe;
@@ -2192,44 +2190,20 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     if file.borrow().flags & oflags::O_PATH != 0 {
         return Err(Errno::EBADF);
     }
-    // Files not in the store (pipes, sockets) have no lock to share: always succeeds
-    let Some(ino) = file.borrow().lock_ino() else {
+    let Some(key) = FlockKey::of(&file.borrow()) else {
         return Ok(0);
     };
-    let me = Rc::downgrade(&file);
-    let tgid = cx.tgid();
     let exclusive = match op & !LOCK_NB {
         LOCK_SH => false,
         LOCK_EX => true,
         LOCK_UN => {
-            if let Some(locks) = cx.k().flocks.get_mut(&ino) {
-                locks.retain(|(f, ..)| !f.ptr_eq(&me));
-            }
-            request_wake_locks();
+            cx.k().flocks.unlock(key, &file);
             return Ok(0);
         }
         _ => return Err(Errno::EINVAL),
     };
-    loop {
-        let locks = cx.k().flocks.entry(ino).or_default();
-        locks.retain(|(f, ..)| f.strong_count() > 0);
-        // Locking the same open file again converts the lock type
-        let conflict = locks
-            .iter()
-            .any(|(f, ex, _)| !f.ptr_eq(&me) && (exclusive || *ex));
-        if !conflict {
-            // When converting the lock type, release the old one first (as on Linux): when an
-            // exclusive lock becomes shared, those waiting for a shared lock can take it
-            let before = locks.len();
-            locks.retain(|(f, ..)| !f.ptr_eq(&me));
-            if locks.len() != before {
-                request_wake_locks();
-            }
-            // The caller's tgid, as Linux's flock_make_lock records it (a conversion too)
-            locks.push((me, exclusive, tgid));
-            file.borrow_mut().holds_locks = true;
-            return Ok(0);
-        }
+    let tgid = cx.tgid();
+    while !cx.k().flocks.try_lock(key, &file, exclusive, tgid) {
         if op & LOCK_NB != 0 {
             return Err(Errno::EAGAIN);
         }
@@ -2240,6 +2214,7 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
         // (OpenFile's destructor)
         cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
     }
+    Ok(0)
 }
 
 pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResult {
