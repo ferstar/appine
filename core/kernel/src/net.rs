@@ -388,12 +388,13 @@ const IFLA_CARRIER: u16 = 33;
 const IFLA_PROTO_DOWN: u16 = 39;
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
-/// The largest datagram of a dump (larger dumps are split): Linux's `NLMSG_GOODSIZE` on 4 KiB
-/// pages, `SKB_WITH_OVERHEAD(PAGE_SIZE)`, which bounds a dump's first datagram and every later one
-/// for a reader whose buffer is a page. Go's `syscall.NetlinkRIB` (`net.Interfaces`,
-/// `net.InterfaceAddrs`) reads into one page and fails on a truncated datagram without checking
-/// `MSG_TRUNC`, so a dump datagram must fit in 4 KiB.
-const DUMP_CHUNK: usize = 3776;
+/// Linux's `NLMSG_GOODSIZE` on 4 KiB pages (`SKB_WITH_OVERHEAD(PAGE_SIZE)`): bounds a single
+/// `NFT_MSG_NEWSETELEM` chunk so every multipart set-element message fits inside a page-sized
+/// receive buffer (e.g. Go's `syscall.NetlinkRIB`, libmnl).
+pub(crate) const DUMP_CHUNK: usize = 3776;
+/// Upper bound on a single dynamically packed dump datagram (Linux's 32 KiB `max_recvmsg_len`
+/// ceiling in `netlink_dump`).
+const DUMP_MAX: usize = 32768;
 /// `IF_OPER_*` (RFC 2863 interface states).
 const IF_OPER_UNKNOWN: u8 = 0;
 const IF_OPER_DOWN: u8 = 2;
@@ -432,6 +433,142 @@ pub const NETLINK_NETFILTER: i32 = 12;
 /// a kernel without its diag modules ([`sock_diag_request`]).
 pub const NETLINK_SOCK_DIAG: i32 = 4;
 
+/// One queued entry on a netlink socket: either an atomic datagram (single reply, ack/error,
+/// notification, peer unicast or `mq_notify` cookie) with its multicast group (0 for unicast), or
+/// a resumable multipart dump packed on demand into each receive buffer.
+pub(crate) enum NetlinkItem {
+    Datagram(Vec<u8>, u32),
+    Dump(NetlinkDump),
+}
+
+impl NetlinkItem {
+    fn is_empty(&self) -> bool {
+        match self {
+            NetlinkItem::Datagram(..) => false,
+            NetlinkItem::Dump(d) => d.is_empty(),
+        }
+    }
+
+    fn byte_len(&self) -> usize {
+        match self {
+            NetlinkItem::Datagram(msg, _) => msg.len(),
+            NetlinkItem::Dump(d) => d.remaining_bytes(),
+        }
+    }
+}
+
+/// Resumable multipart dump state queued on a [`NetlinkSocket`], packed on demand to match each
+/// `recv`/`recvmsg` buffer size (Linux's `netlink_dump`).
+pub(crate) enum NetlinkDump {
+    Messages(DumpMessages),
+    SetElems(crate::nft::SetElemDump),
+}
+
+impl NetlinkDump {
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            NetlinkDump::Messages(m) => m.is_empty(),
+            NetlinkDump::SetElems(s) => s.is_empty(),
+        }
+    }
+
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        match self {
+            NetlinkDump::Messages(m) => m.remaining_bytes(),
+            NetlinkDump::SetElems(s) => s.remaining_bytes(),
+        }
+    }
+
+    pub(crate) fn next_datagram(&mut self, max: usize, peek: bool) -> Option<Vec<u8>> {
+        match self {
+            NetlinkDump::Messages(m) => m.next_datagram(max, peek),
+            NetlinkDump::SetElems(s) => s.next_datagram(max, peek),
+        }
+    }
+}
+
+/// A resumable dump of pre-encoded individual netlink messages (carrying `NLM_F_MULTI` where
+/// appropriate, terminating with `NLMSG_DONE`), packed on demand into each caller's buffer.
+pub(crate) struct DumpMessages {
+    /// `(message, end_section)`: when `end_section` is true, packing stops after this message so
+    /// the next section (e.g. next address family or trailing `NLMSG_DONE`) starts in a fresh
+    /// datagram, matching Linux 6.1's `rtnl_dump_all` / `netlink_dump`.
+    msgs: VecDeque<(Vec<u8>, bool)>,
+    /// Sum of `m.len()` across `msgs`, for O(1) `SO_RCVBUF` accounting.
+    bytes: usize,
+}
+
+impl DumpMessages {
+    pub(crate) fn new() -> Self {
+        Self {
+            msgs: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Appends a section of messages; if non-empty, ends the section after the last message so
+    /// the following section starts in a fresh datagram.
+    pub(crate) fn push_section(&mut self, iter: impl IntoIterator<Item = Vec<u8>>) {
+        let start = self.msgs.len();
+        for m in iter {
+            self.bytes = self.bytes.saturating_add(m.len());
+            self.msgs.push_back((m, false));
+        }
+        if self.msgs.len() > start {
+            self.msgs.back_mut().unwrap().1 = true;
+        }
+    }
+
+    /// Appends one message, ending the current section only when `end_section` is true.
+    pub(crate) fn push(&mut self, msg: Vec<u8>, end_section: bool) {
+        self.bytes = self.bytes.saturating_add(msg.len());
+        self.msgs.push_back((msg, end_section));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.msgs.is_empty()
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Packs consecutive messages from the current section up to `max.min(DUMP_MAX)` bytes.
+    /// Always returns at least one atomic message (so an oversized message triggers `MSG_TRUNC`
+    /// with its true length without losing subsequent messages; `peek` leaves the queue intact).
+    fn next_datagram(&mut self, max: usize, peek: bool) -> Option<Vec<u8>> {
+        if self.msgs.is_empty() {
+            return None;
+        }
+        let budget = max.min(DUMP_MAX);
+        let mut count = 0;
+        let mut total = 0;
+        for (m, end_section) in &self.msgs {
+            if count > 0 && total + m.len() > budget {
+                break;
+            }
+            total += m.len();
+            count += 1;
+            if *end_section {
+                break;
+            }
+        }
+        let mut out = Vec::with_capacity(total);
+        if peek {
+            for (m, _) in self.msgs.iter().take(count) {
+                out.extend_from_slice(m);
+            }
+        } else {
+            for _ in 0..count {
+                let (m, _) = self.msgs.pop_front().unwrap();
+                self.bytes = self.bytes.saturating_sub(m.len());
+                out.extend_from_slice(&m);
+            }
+        }
+        Some(out)
+    }
+}
+
 /// A netlink socket emulated in process. `NETLINK_ROUTE` answers queries, `NETLINK_GENERIC` only
 /// for nlctrl, `NETLINK_NETFILTER` for nftables and `NETLINK_SOCK_DIAG` only with errors; a
 /// `NETLINK_KOBJECT_UEVENT` socket never receives anything (the uevents mdev listens for), and
@@ -447,10 +584,8 @@ pub(crate) struct NetlinkSocket {
     /// 0 for none), reported by `getpeername` and used by address-less sends.
     pub dst_pid: u32,
     pub dst_group: u32,
-    /// Answers and notifications waiting for the guest to read them, one datagram per item,
-    /// with the multicast group a notification went to (0 for a unicast answer: the source
-    /// address's `nl_groups` and `NETLINK_PKTINFO` report it).
-    pub queue: VecDeque<(Vec<u8>, u32)>,
+    /// Answers, resumable dumps and notifications waiting for the guest to read them.
+    pub queue: VecDeque<NetlinkItem>,
     /// Bytes currently charged in `queue` (payload plus per-datagram overhead), capped against
     /// `SO_RCVBUF` (`opts.rcvbuf()`).
     pub queued_bytes: usize,
@@ -514,12 +649,20 @@ impl NetlinkSocket {
     }
 
     /// Queues a datagram (reply, nftables reply, `mq_notify` cookie or multicast notification)
-    /// bounded by `SO_RCVBUF`: an empty queue always admits one datagram; otherwise exceeding
+    /// bounded by `SO_RCVBUF`: an empty queue always admits one entry; otherwise exceeding
     /// `SO_RCVBUF` drops it and sets `overrun` (`ENOBUFS`) unless `NETLINK_NO_ENOBUFS` is set.
     /// Returns whether the datagram was queued.
     pub(crate) fn enqueue(&mut self, msg: Vec<u8>, group: u32) -> bool {
+        self.enqueue_item(NetlinkItem::Datagram(msg, group))
+    }
+
+    /// Queues one datagram or resumable dump bounded by `SO_RCVBUF`.
+    pub(crate) fn enqueue_item(&mut self, item: NetlinkItem) -> bool {
         const NETLINK_NO_ENOBUFS: u32 = 5;
-        let charge = msg.len().saturating_add(Self::SKB_OVERHEAD);
+        if item.is_empty() {
+            return true;
+        }
+        let charge = item.byte_len().saturating_add(Self::SKB_OVERHEAD);
         let limit = self.opts.rcvbuf();
         if !self.queue.is_empty() && self.queued_bytes.saturating_add(charge) > limit {
             if self.flags & (1 << NETLINK_NO_ENOBUFS) == 0 {
@@ -528,20 +671,49 @@ impl NetlinkSocket {
             return false;
         }
         self.queued_bytes = self.queued_bytes.saturating_add(charge);
-        self.queue.push_back((msg, group));
+        self.queue.push_back(item);
         self.arrivals += 1;
         true
     }
 
-    /// Takes (or peeks) the front datagram from `queue`, updating `queued_bytes`.
-    pub(crate) fn dequeue(&mut self, peek: bool) -> Option<(Vec<u8>, u32)> {
+    /// Takes (or peeks) the next datagram from `queue` sized for a `max`-byte receive buffer,
+    /// packing resumable dump messages on demand and updating `queued_bytes`.
+    pub(crate) fn dequeue(&mut self, max: usize, peek: bool) -> Option<(Vec<u8>, u32)> {
         if peek {
-            return self.queue.front().cloned();
+            return match self.queue.front_mut()? {
+                NetlinkItem::Datagram(msg, group) => Some((msg.clone(), *group)),
+                NetlinkItem::Dump(dump) => dump.next_datagram(max, true).map(|d| (d, 0)),
+            };
         }
-        let (msg, group) = self.queue.pop_front()?;
-        let charge = msg.len().saturating_add(Self::SKB_OVERHEAD);
-        self.queued_bytes = self.queued_bytes.saturating_sub(charge);
-        Some((msg, group))
+        match self.queue.front_mut()? {
+            NetlinkItem::Datagram(..) => {
+                let Some(NetlinkItem::Datagram(msg, group)) = self.queue.pop_front() else {
+                    unreachable!();
+                };
+                let charge = msg.len().saturating_add(Self::SKB_OVERHEAD);
+                self.queued_bytes = self.queued_bytes.saturating_sub(charge);
+                Some((msg, group))
+            }
+            NetlinkItem::Dump(dump) => {
+                let before = dump.remaining_bytes();
+                let d = dump.next_datagram(max, false)?;
+                let after = dump.remaining_bytes();
+                if dump.is_empty() {
+                    self.queue.pop_front();
+                    self.queued_bytes = self
+                        .queued_bytes
+                        .saturating_sub(before.saturating_add(Self::SKB_OVERHEAD));
+                } else {
+                    self.queued_bytes = self
+                        .queued_bytes
+                        .saturating_sub(before.saturating_sub(after));
+                    // Mirror Linux's netlink_dump -> sk_data_ready so EPOLLET readers wake for
+                    // the next dump chunk.
+                    self.arrivals += 1;
+                }
+                Some((d, 0))
+            }
+        }
     }
 
     /// It is an rtnetlink socket that joined a group notifications go to.
@@ -583,8 +755,8 @@ impl NetlinkSocket {
                 proc_pid: 0,
                 comm: b"",
             };
-            for d in host.netfilter(data, &peer) {
-                self.enqueue(d, 0);
+            for item in host.netfilter(data, &peer) {
+                self.enqueue_item(item);
             }
             return;
         }
@@ -606,22 +778,23 @@ impl NetlinkSocket {
                 NETLINK_SOCK_DIAG => sock_diag_request(&h[..len], self.pid, self.cap_ack),
                 _ => self.route_request(&h[..len], host),
             };
-            for d in answers {
-                self.enqueue(d, 0);
+            for item in answers {
+                self.enqueue_item(item);
             }
             off += len.next_multiple_of(4);
         }
     }
 
-    /// Answers one request `req` (the whole message) on `NETLINK_ROUTE`, returning the datagrams.
-    fn route_request(&self, req: &[u8], host: &dyn Host) -> Vec<Vec<u8>> {
+    /// Answers one request `req` (the whole message) on `NETLINK_ROUTE`, returning single
+    /// datagrams or a resumable dump.
+    fn route_request(&self, req: &[u8], host: &dyn Host) -> Vec<NetlinkItem> {
         let ty = u16::from_le_bytes([req[4], req[5]]);
         let flags = u16::from_le_bytes([req[6], req[7]]);
         // Linux's netlink_rcv_skb: non-requests and control messages (< NLMSG_MIN_TYPE) are
         // skipped and acked with 0 only when NLM_F_ACK is set.
         if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
             return if flags & NLM_F_ACK != 0 {
-                vec![ack(req, 0, self.pid)]
+                vec![NetlinkItem::Datagram(ack(req, 0, self.pid), 0)]
             } else {
                 Vec::new()
             };
@@ -630,17 +803,18 @@ impl NetlinkSocket {
         let family = req.get(16).copied().unwrap_or(0) as i32;
         let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
         let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
+        let dgram = |m| NetlinkItem::Datagram(m, 0);
         let dump = flags & NLM_F_DUMP != 0;
         if let Some(r) = host.configure(req) {
             return match r {
-                Err(f) => vec![ack_ext(
+                Err(f) => vec![dgram(ack_ext(
                     req,
                     f.errno,
                     self.pid,
                     f.msg.filter(|_| self.ext_ack),
                     self.cap_ack,
-                )],
-                Ok(()) if flags & NLM_F_ACK != 0 => vec![ack(req, 0, self.pid)],
+                ))],
+                Ok(()) if flags & NLM_F_ACK != 0 => vec![dgram(ack(req, 0, self.pid))],
                 Ok(()) => Vec::new(),
             };
         }
@@ -649,11 +823,11 @@ impl NetlinkSocket {
             Link::Virt(v, nsid) => crate::netdev::link_message(v, *nsid),
         };
         match ty {
-            // As on Linux, the interfaces are one datagram (split into several when too large,
-            // `pack`); the addresses one per address family (IPv4 first for AF_UNSPEC, each split
-            // the same way), and NLMSG_DONE another one. When filtering by IFLA_MASTER or
-            // IFLA_LINKINFO's kind, the messages carry NLM_F_DUMP_FILTERED (Linux's
-            // rtnl_dump_ifinfo)
+            // As on Linux 6.1, links form one dump section, addresses one section per address
+            // family (IPv4 first for AF_UNSPEC), and NLMSG_DONE its own trailing section; each
+            // section is packed on demand to fit the reader's receive buffer. When filtering by
+            // IFLA_MASTER or IFLA_LINKINFO's kind, the messages carry NLM_F_DUMP_FILTERED
+            // (Linux's rtnl_dump_ifinfo).
             RTM_GETLINK if dump => {
                 const NLM_F_DUMP_FILTERED: u16 = 0x20;
                 let attrs = crate::route::attrs(req.get(32..).unwrap_or_default());
@@ -684,13 +858,14 @@ impl NetlinkSocket {
                                 .is_none_or(|k| k == v.kind.name().as_bytes())
                     }
                 });
-                let mut out = pack(kept.map(|l| reply(RTM_NEWLINK, mflags, &one(l))));
-                out.push(done());
-                out
+                let mut out = DumpMessages::new();
+                out.push_section(kept.map(|l| reply(RTM_NEWLINK, mflags, &one(l))));
+                out.push_section([done()]);
+                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
             }
             RTM_GETADDR if dump => {
                 let links = host.links();
-                let mut out = Vec::new();
+                let mut out = DumpMessages::new();
                 for f in [AF_INET, AF_INET6] {
                     if family != 0 && family != f {
                         continue;
@@ -702,10 +877,10 @@ impl NetlinkSocket {
                             Link::Virt(v, _) => crate::netdev::addr_messages(v, f),
                         })
                         .map(|m| reply(RTM_NEWADDR, NLM_F_MULTI, &m));
-                    out.extend(pack(messages));
+                    out.push_section(messages);
                 }
-                out.push(done());
-                out
+                out.push_section([done()]);
+                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
             }
             // `ip link show <interface>`: looked up by ifi_index or IFLA_IFNAME (Linux's
             // rtnl_getlink)
@@ -719,7 +894,7 @@ impl NetlinkSocket {
                     .find(|(t, _)| *t == IFLA_IFNAME)
                     .map(|(_, d)| d.split(|&c| c == 0).next().unwrap_or_default().to_vec());
                 if index <= 0 && name.is_none() {
-                    return vec![ack(req, EINVAL, self.pid)];
+                    return vec![dgram(ack(req, EINVAL, self.pid))];
                 }
                 let found = host.links().into_iter().find(|l| {
                     if index > 0 {
@@ -729,55 +904,54 @@ impl NetlinkSocket {
                     }
                 });
                 let Some(l) = found else {
-                    return vec![ack(req, ENODEV, self.pid)];
+                    return vec![dgram(ack(req, ENODEV, self.pid))];
                 };
-                let mut out = vec![reply(RTM_NEWLINK, 0, &one(&l))];
+                let mut out = vec![dgram(reply(RTM_NEWLINK, 0, &one(&l)))];
                 if flags & NLM_F_ACK != 0 {
-                    out.push(ack(req, 0, self.pid));
+                    out.push(dgram(ack(req, 0, self.pid)));
                 }
                 out
             }
-            // As on Linux, the routes of each address family are one datagram (split when too
-            // large), and NLMSG_DONE another one
+            // As on Linux 6.1, each address family's routes form one dump section, followed by
+            // NLMSG_DONE, packed on demand to the caller's receive buffer.
             RTM_GETROUTE if dump => {
                 let entries = host.tables();
-                let mut out = Vec::new();
+                let mut out = DumpMessages::new();
                 for f in [AF_INET, AF_INET6] {
                     let messages = entries
                         .iter()
                         .filter(|e| e.family == f && (family == 0 || family == f))
                         .map(|e| reply(RTM_NEWROUTE, NLM_F_MULTI, &crate::route::route_message(e)));
-                    out.extend(pack(messages));
+                    out.push_section(messages);
                 }
-                out.push(done());
-                out
+                out.push_section([done()]);
+                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
             }
             RTM_GETROUTE => {
                 let ifaces = host.all_interfaces();
                 let entries = host.tables();
                 match crate::route::get(req, &entries, &ifaces, host.uid(), host.init_net()) {
                     Ok(p) => {
-                        let mut out = vec![reply(RTM_NEWROUTE, 0, &p)];
+                        let mut out = vec![dgram(reply(RTM_NEWROUTE, 0, &p))];
                         if flags & NLM_F_ACK != 0 {
-                            out.push(ack(req, 0, self.pid));
+                            out.push(dgram(ack(req, 0, self.pid)));
                         }
                         out
                     }
-                    Err(e) => vec![ack(req, e, self.pid)],
+                    Err(e) => vec![dgram(ack(req, e, self.pid))],
                 }
             }
-            // The rules fit in one datagram, and NLMSG_DONE is another one
+            // Rules form one dump section, followed by NLMSG_DONE, packed on demand.
             RTM_GETRULE if dump => {
                 const EAFNOSUPPORT: i32 = 97;
                 let rules = crate::route::rule_messages(family);
                 if rules.is_empty() {
-                    return vec![ack(req, EAFNOSUPPORT, self.pid)];
+                    return vec![dgram(ack(req, EAFNOSUPPORT, self.pid))];
                 }
-                let d = rules
-                    .iter()
-                    .flat_map(|m| reply(RTM_NEWRULE, NLM_F_MULTI, m))
-                    .collect();
-                vec![d, done()]
+                let mut out = DumpMessages::new();
+                out.push_section(rules.iter().map(|m| reply(RTM_NEWRULE, NLM_F_MULTI, m)));
+                out.push_section([done()]);
+                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
             }
             // Network namespace numbers (`ip netns list`): assigned to the namespace of the peer
             // only when dumping veths (IFLA_LINK_NETNSID, Linux's peernet2id_alloc), and
@@ -809,26 +983,30 @@ impl NetlinkSocket {
                     Ok(id) => {
                         let mut p = vec![0u8; 4];
                         attr(&mut p, NETNSA_NSID, &id.unwrap_or(-1).to_le_bytes());
-                        let mut out = vec![reply(RTM_NEWNSID, 0, &p)];
+                        let mut out = vec![dgram(reply(RTM_NEWNSID, 0, &p))];
                         if flags & NLM_F_ACK != 0 {
-                            out.push(ack(req, 0, self.pid));
+                            out.push(dgram(ack(req, 0, self.pid)));
                         }
                         out
                     }
-                    Err(e) => vec![ack(req, e, self.pid)],
+                    Err(e) => vec![dgram(ack(req, e, self.pid))],
                 }
             }
             // The neighbour table (ARP, NDP): the app on Android cannot see the host's, so it is
             // always empty; single gets still validate ndmsg, family, ifindex and NDA_DST as
             // Linux's neigh_get does before answering ENOENT.
-            RTM_GETNEIGH if dump => vec![done()],
-            RTM_GETNEIGH => vec![ack_ext(
+            RTM_GETNEIGH if dump => {
+                let mut out = DumpMessages::new();
+                out.push_section([done()]);
+                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
+            }
+            RTM_GETNEIGH => vec![dgram(ack_ext(
                 req,
                 check_getneigh(req, host),
                 self.pid,
                 None,
                 self.cap_ack,
-            )],
+            ))],
             // Unsupported requests: EOPNOTSUPP, after rtnetlink_rcv_msg's checks (a type it knows
             // that changes something needs CAP_NET_ADMIN over the namespace owner: EPERM).
             _ => {
@@ -836,9 +1014,9 @@ impl NetlinkSocket {
                     && (ty - RTM_BASE) & 3 != 2
                     && !host.net_admin()
                 {
-                    vec![ack(req, EPERM, self.pid)]
+                    vec![dgram(ack(req, EPERM, self.pid))]
                 } else {
-                    vec![ack(req, EOPNOTSUPP, self.pid)]
+                    vec![dgram(ack(req, EOPNOTSUPP, self.pid))]
                 }
             }
         }
@@ -912,24 +1090,6 @@ fn sockaddr_nl(pid: u32, groups: u32) -> Vec<u8> {
     b
 }
 
-/// Packs a dump's messages into datagrams of at most `DUMP_CHUNK` bytes, as Linux's `netlink_dump`
-/// fills one buffer after another (a message larger than that goes alone); no messages give no
-/// datagram.
-fn pack(messages: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut cur = Vec::new();
-    for m in messages {
-        if !cur.is_empty() && cur.len() + m.len() > DUMP_CHUNK {
-            out.push(std::mem::take(&mut cur));
-        }
-        cur.extend(m);
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 /// Host information that netlink answers need (replaced with fixed values in tests).
 pub(crate) trait Host {
     /// The host's network interfaces.
@@ -975,9 +1135,9 @@ pub(crate) trait Host {
     fn net_admin(&self) -> bool {
         true
     }
-    /// One datagram on `NETLINK_NETFILTER` ([`crate::nft::handle`]); returns the answer
-    /// datagrams.
-    fn netfilter(&self, _data: &[u8], _peer: &crate::nft::Peer<'_>) -> Vec<Vec<u8>> {
+    /// One datagram on `NETLINK_NETFILTER` ([`crate::nft::handle`]); returns single datagrams or
+    /// resumable dumps.
+    fn netfilter(&self, _data: &[u8], _peer: &crate::nft::Peer<'_>) -> Vec<NetlinkItem> {
         Vec::new()
     }
 }
@@ -1438,9 +1598,9 @@ const EINVAL: i32 = 22;
 const EOPNOTSUPP: i32 = 95;
 
 /// Answers one request `req` (the whole message) on `NETLINK_GENERIC`; `pid` is this socket's
-/// `nl_pid`. Returns the datagrams: as on Linux, the answer and the ack are one each
-/// (`genlmsg_reply`, `netlink_ack`), so a program reading once gets only the answer.
-fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
+/// `nl_pid`. Returns the datagrams or resumable dump: as on Linux, the answer and the ack are one
+/// each (`genlmsg_reply`, `netlink_ack`), so a program reading once gets only the answer.
+fn generic_request(req: &[u8], pid: u32) -> Vec<NetlinkItem> {
     let ty = u16::from_le_bytes([req[4], req[5]]);
     let flags = u16::from_le_bytes([req[6], req[7]]);
     let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
@@ -1456,15 +1616,20 @@ fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
         Err(EINVAL)
     } else {
         match req[16] {
-            // The dump is small, and as on Linux NLMSG_DONE follows in the same datagram
+            // As on Linux, NLMSG_DONE shares the datagram with nlctrl when both fit in the
+            // caller's buffer, and splits cleanly onto the next recv when the buffer is smaller.
             CTRL_CMD_GETFAMILY if dump => {
-                let mut out = reply(GENL_ID_CTRL, NLM_F_MULTI, &nlctrl_family());
-                out.extend(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()));
-                Ok(Some(out))
+                let mut out = DumpMessages::new();
+                out.push(reply(GENL_ID_CTRL, NLM_F_MULTI, &nlctrl_family()), false);
+                out.push(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()), true);
+                Ok(Some(NetlinkItem::Dump(NetlinkDump::Messages(out))))
             }
-            CTRL_CMD_GETFAMILY => {
-                names_nlctrl(req).map(|()| Some(reply(GENL_ID_CTRL, 0, &nlctrl_family())))
-            }
+            CTRL_CMD_GETFAMILY => names_nlctrl(req).map(|()| {
+                Some(NetlinkItem::Datagram(
+                    reply(GENL_ID_CTRL, 0, &nlctrl_family()),
+                    0,
+                ))
+            }),
             // Policy dumps are not implemented: it can only tell that the requested family does not
             // exist
             CTRL_CMD_GETPOLICY if dump => names_nlctrl(req).and(Err(EOPNOTSUPP)),
@@ -1475,13 +1640,13 @@ fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
         // No separate ack after a dump (Linux's netlink_dump_start makes netlink_rcv_skb skip the
         // ack)
         Ok(answer) => {
-            let mut out: Vec<Vec<u8>> = answer.into_iter().collect();
+            let mut out: Vec<NetlinkItem> = answer.into_iter().collect();
             if flags & NLM_F_ACK != 0 && (!dump || out.is_empty()) {
-                out.push(ack(req, 0, pid));
+                out.push(NetlinkItem::Datagram(ack(req, 0, pid), 0));
             }
             out
         }
-        Err(e) => vec![ack(req, e, pid)],
+        Err(e) => vec![NetlinkItem::Datagram(ack(req, e, pid), 0)],
     }
 }
 
@@ -1597,7 +1762,7 @@ const AF_MAX: u8 = 46;
 /// requests with a short body or a family at or past `AF_MAX` `EINVAL` and otherwise `ENOENT` (no
 /// family handler), other types `EINVAL`; non-requests and control messages are acked only when
 /// asked. `cap` is `NETLINK_CAP_ACK`.
-fn sock_diag_request(req: &[u8], pid: u32, cap: bool) -> Vec<Vec<u8>> {
+fn sock_diag_request(req: &[u8], pid: u32, cap: bool) -> Vec<NetlinkItem> {
     let ty = u16::from_le_bytes([req[4], req[5]]);
     let flags = u16::from_le_bytes([req[6], req[7]]);
     let err = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
@@ -1613,7 +1778,7 @@ fn sock_diag_request(req: &[u8], pid: u32, cap: bool) -> Vec<Vec<u8>> {
     if err == 0 && flags & NLM_F_ACK == 0 {
         return Vec::new();
     }
-    vec![ack_ext(req, err, pid, None, cap)]
+    vec![NetlinkItem::Datagram(ack_ext(req, err, pid, None, cap), 0)]
 }
 
 /// The ack or error for request `req` (the whole message) (Linux's `netlink_ack`): on success only
@@ -2168,7 +2333,10 @@ mod tests {
             assert!(s.notify(RTNLGRP_IPV4_IFADDR, b"y"));
         }
         assert_eq!(s.queue.len(), cap);
-        assert_eq!(s.queue[0], (b"y".to_vec(), RTNLGRP_IPV4_IFADDR));
+        assert_eq!(
+            s.dequeue(4096, true),
+            Some((b"y".to_vec(), RTNLGRP_IPV4_IFADDR))
+        );
         assert!(s.overrun.get());
     }
 
@@ -2251,6 +2419,15 @@ mod tests {
         out
     }
 
+    /// Drains all datagrams from a netlink socket using a `max`-byte receive buffer.
+    fn drain(s: &mut NetlinkSocket, max: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some((d, _)) = s.dequeue(max, false) {
+            out.push(d);
+        }
+        out
+    }
+
     #[test]
     fn dumps_links_and_addresses() {
         let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
@@ -2277,7 +2454,7 @@ mod tests {
             },
         );
         // Interfaces, NLMSG_DONE, IPv4 addresses, NLMSG_DONE are one datagram each
-        let datagrams: Vec<_> = s.queue.drain(..).map(|(d, _)| parse(&d)).collect();
+        let datagrams: Vec<_> = drain(&mut s, 4096).iter().map(|d| parse(d)).collect();
         let types: Vec<Vec<u16>> = datagrams
             .iter()
             .map(|d| d.iter().map(|m| m.0).collect())
@@ -2333,7 +2510,7 @@ mod tests {
         };
         let mut ask = |req: Vec<u8>| -> (u16, Vec<u8>) {
             s.handle(&req, &NOTHING);
-            let d = parse(&s.queue.pop_front().unwrap().0);
+            let d = parse(&s.dequeue(4096, false).unwrap().0);
             assert!(s.queue.is_empty());
             d[0].clone()
         };
@@ -2390,9 +2567,9 @@ mod tests {
                 &message(ty, NLM_F_REQUEST | NLM_F_DUMP, 1, 0, &[0; 16]),
                 &host,
             );
-            s.queue
-                .drain(..)
-                .map(|(d, _)| {
+            drain(&mut s, 4096)
+                .into_iter()
+                .map(|d| {
                     assert!(d.len() <= 4096, "a {}-byte datagram", d.len());
                     parse(&d)
                 })
@@ -2433,7 +2610,7 @@ mod tests {
         s.pid = 42;
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
-            s.queue.drain(..).map(|(d, _)| parse(&d)).collect()
+            drain(&mut s, 4096).iter().map(|d| parse(d)).collect()
         };
         let dump = |ty, family: i32| {
             message(
@@ -2486,7 +2663,7 @@ mod tests {
                 attr(&mut p, *t, d);
             }
             s.handle(&message(RTM_GETNSID, NLM_F_REQUEST, 5, 0, &p), &NOTHING);
-            s.queue.drain(..).flat_map(|(d, _)| parse(&d)).collect()
+            drain(&mut s, 4096).iter().flat_map(|d| parse(d)).collect()
         };
         // The other namespace is found: the answer is -1 (no number assigned), the same as what
         // `ip netns list` sees on Linux
@@ -2523,7 +2700,7 @@ mod tests {
         // The answer's datagrams, each parsed into messages
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
-            s.queue.drain(..).map(|(d, _)| parse(&d)).collect()
+            drain(&mut s, 4096).iter().map(|d| parse(d)).collect()
         };
         // Query nlctrl by name, asking for an ack: the answer and the ack are two datagrams, and
         // the ack attaches only the request's message header
@@ -2609,7 +2786,7 @@ mod tests {
         s.pid = 42;
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
-            s.queue.drain(..).map(|(d, _)| parse(&d)).collect()
+            drain(&mut s, 4096).iter().map(|d| parse(d)).collect()
         };
         let dump = NLM_F_REQUEST | NLM_F_DUMP;
         // ss's inet_diag_req_v2 for TCP over IPv4, a unix_diag_req, the old TCPDIAG_GETSOCK, a
@@ -2772,11 +2949,11 @@ mod tests {
         assert!(!s.enqueue(vec![0u8; 64], 0));
         assert!(s.overrun.get());
         // Peek does not reduce queued_bytes; pop does
-        let _ = s.dequeue(true);
+        let _ = s.dequeue(4096, true);
         assert!(!s.enqueue(vec![0u8; 64], 0));
         s.overrun.set(false);
-        let _ = s.dequeue(false);
-        let _ = s.dequeue(false);
+        let _ = s.dequeue(4096, false);
+        let _ = s.dequeue(4096, false);
         assert!(s.enqueue(vec![0u8; 64], 0));
         // NETLINK_NO_ENOBUFS suppresses overrun on drop
         s.flags |= 1 << 5; // NETLINK_NO_ENOBUFS
@@ -2805,14 +2982,14 @@ mod tests {
         assert!(s.queue.is_empty());
         no_req = message(RTM_GETLINK, NLM_F_ACK, 2, 0, &[0; 16]);
         s.handle(&no_req, &host);
-        let (ack_msg, _) = s.dequeue(false).expect("ack");
+        let (ack_msg, _) = s.dequeue(4096, false).expect("ack");
         assert_eq!(u16::from_le_bytes([ack_msg[4], ack_msg[5]]), NLMSG_ERROR);
         assert_eq!(i32::from_le_bytes(ack_msg[16..20].try_into().unwrap()), 0);
 
         let getneigh_err = |s: &mut NetlinkSocket, body: &[u8]| -> i32 {
             let req = message(RTM_GETNEIGH, NLM_F_REQUEST, 3, 0, body);
             s.handle(&req, &host);
-            let (m, _) = s.dequeue(false).expect("reply");
+            let (m, _) = s.dequeue(4096, false).expect("reply");
             assert_eq!(u16::from_le_bytes([m[4], m[5]]), NLMSG_ERROR);
             -i32::from_le_bytes(m[16..20].try_into().unwrap())
         };
@@ -2840,6 +3017,93 @@ mod tests {
         );
         assert_eq!(getneigh_err(&mut s, &ndm(AF_INET as u8, 99, 0, lo)), 19); // ENODEV
         assert_eq!(getneigh_err(&mut s, &ndm(AF_INET as u8, 1, 0, lo)), ENOENT);
+    }
+
+    #[test]
+    fn resumable_dumps_adapt_to_small_buffers_and_preserve_peek_trunc() {
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
+        s.pid = 77;
+        let host = Many(20);
+
+        // Links with 512B and 1024B buffers: every datagram fits, all 20 links preserved in order
+        for max in [512usize, 1024] {
+            s.handle(
+                &message(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, 0, &[0; 16]),
+                &host,
+            );
+            let dgrams = drain(&mut s, max);
+            assert!(dgrams.len() > 10);
+            assert!(dgrams.iter().all(|d| d.len() <= max));
+            let msgs: Vec<_> = dgrams.iter().flat_map(|d| parse(d)).collect();
+            assert_eq!(msgs.last().unwrap().0, NLMSG_DONE);
+            let names: Vec<_> = msgs[..msgs.len() - 1]
+                .iter()
+                .map(|(ty, p)| {
+                    assert_eq!(*ty, RTM_NEWLINK);
+                    attributes(&p[16..])[&IFLA_IFNAME].clone()
+                })
+                .collect();
+            let want: Vec<Vec<u8>> = (1..=20).map(|n| format!("eth{n}\0").into()).collect();
+            assert_eq!(names, want);
+            assert_eq!(s.queued_bytes, 0);
+        }
+
+        // Addresses, routes and rules with small buffers (256B / 128B)
+        for (ty, max, expect_ty, min_count) in [
+            (RTM_GETADDR, 256usize, RTM_NEWADDR, 40usize),
+            (RTM_GETROUTE, 256, RTM_NEWROUTE, 40),
+            (RTM_GETRULE, 96, RTM_NEWRULE, 3),
+        ] {
+            let fam = if ty == RTM_GETRULE { AF_INET as u8 } else { 0 };
+            s.handle(
+                &message(ty, NLM_F_REQUEST | NLM_F_DUMP, 2, 0, &[fam, 0, 0, 0]),
+                &host,
+            );
+            let dgrams = drain(&mut s, max);
+            assert!(dgrams.len() > 2, "ty={ty} should span multiple datagrams");
+            assert!(dgrams.iter().all(|d| d.len() <= max));
+            let msgs: Vec<_> = dgrams.iter().flat_map(|d| parse(d)).collect();
+            assert_eq!(msgs.last().unwrap().0, NLMSG_DONE);
+            assert!(msgs.len() > min_count);
+            assert!(msgs[..msgs.len() - 1].iter().all(|(t, _)| *t == expect_ty));
+            assert_eq!(s.queued_bytes, 0);
+        }
+
+        // Oversized single atomic message + MSG_PEEK probe (max=0 and max=128)
+        s.handle(
+            &message(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 3, 0, &[0; 16]),
+            &host,
+        );
+        let probe0 = s.dequeue(0, true).expect("peek 0").0;
+        let probe128 = s.dequeue(128, true).expect("peek 128").0;
+        assert_eq!(probe0, probe128);
+        assert!(probe0.len() > 128);
+        assert_eq!(parse(&probe0).len(), 1);
+        // Non-peek with 128B returns that single atomic link (truncated by caller) without
+        // losing links 2..=20 or NLMSG_DONE.
+        let first = s.dequeue(128, false).expect("first").0;
+        assert_eq!(first, probe0);
+        // Next peek/read with exact size receives eth2 intact.
+        let p2 = s.dequeue(0, true).expect("peek eth2").0;
+        let d2 = s.dequeue(p2.len(), false).expect("read eth2").0;
+        assert_eq!(d2, p2);
+        let rest: Vec<_> = drain(&mut s, 512).iter().flat_map(|d| parse(d)).collect();
+        assert_eq!(rest.last().unwrap().0, NLMSG_DONE);
+        // 1 (eth1) + 1 (eth2) + 18 (eth3..=eth20) = 20 links
+        assert_eq!(rest.len() - 1, 18);
+        assert_eq!(s.queued_bytes, 0);
+
+        // NETLINK_GENERIC dump splits GENL_ID_CTRL and NLMSG_DONE when buffer fits only one
+        let mut g = NetlinkSocket::new(NETLINK_GENERIC, SOCK_RAW);
+        g.pid = 77;
+        let greq = genl(GENL_ID_CTRL, NLM_F_DUMP, CTRL_CMD_GETFAMILY, &[]);
+        g.handle(&greq, &NOTHING);
+        let ctrl_len = g.dequeue(0, true).unwrap().0.len();
+        let gd = drain(&mut g, ctrl_len);
+        assert_eq!(gd.len(), 2);
+        assert_eq!(parse(&gd[0])[0].0, GENL_ID_CTRL);
+        assert_eq!(parse(&gd[1])[0].0, NLMSG_DONE);
+        assert_eq!(g.queued_bytes, 0);
     }
 }
 

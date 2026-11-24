@@ -3315,7 +3315,7 @@ pub(crate) fn recv(
                 if s.overrun.take() {
                     return Err(Errno::ENOBUFS);
                 }
-                if let Some((d, group)) = s.dequeue(peek) {
+                if let Some((d, group)) = s.dequeue(max, peek) {
                     // From the kernel (pid 0), with the group a notification went to as a mask
                     let mut addr = vec![0u8; 12];
                     addr[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
@@ -4104,7 +4104,7 @@ impl crate::net::Host for KernelHost<'_> {
         Ok(crate::netdev::nsid(&self.ns(), &peer))
     }
 
-    fn netfilter(&self, data: &[u8], peer: &crate::nft::Peer<'_>) -> Vec<Vec<u8>> {
+    fn netfilter(&self, data: &[u8], peer: &crate::nft::Peer<'_>) -> Vec<crate::net::NetlinkItem> {
         let comm = self.comm.split(|&c| c == 0).next().unwrap_or_default();
         let peer = crate::nft::Peer {
             proc_pid: self.proc_pid,

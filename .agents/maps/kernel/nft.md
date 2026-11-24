@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/netns full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: native dynamic meters and named xt hashlimit tables)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: chunked resumable set-element and ruleset dumps)
 
 ## Responsibilities
 
@@ -51,9 +51,12 @@ and netlink transport in `kernel/netlink`.
 - Validation: expression names must be known (39); jump targets must exist and not be base chains;
   loops `EMLINK`; set references rewritten to names. Arguments are not validated.
 - Queries outside batches: `GETGEN`, dumps of tables, chains, rules (filters by table and chain),
-  sets and elements in 6.8's format, packed into 8 KiB datagrams (a single larger message, and a
-  set-element dump, which is one message, go out unbounded); `nft_compat` revision queries;
-  empty ctnetlink dumps. No `NLM_F_ECHO`, no monitor notifications. Base-chain counters are 0.
+  sets and elements in 6.8's format, returned as resumable `NetlinkItem::Dump` entries packed on
+  demand to the caller's receive buffer; `GETSETELEM` (`SetElemDump`) splits elements across
+  bounded multipart `NFT_MSG_NEWSETELEM` messages (at most `min(max, 3776)` bytes per chunk)
+  followed by the trailing empty `NFT_MSG_NEWSETELEM` and `NLMSG_DONE`; `nft_compat` revision
+  queries; empty ctnetlink dumps. No `NLM_F_ECHO`, no monitor notifications. Base-chain counters
+  are 0.
 - An initial-namespace commit re-evaluates port forwarding.
 
 ### Expression evaluation
@@ -110,8 +113,7 @@ and netlink transport in `kernel/netlink`.
 ## Confirmed bugs / technical debt
 
 - Byte limits and quotas count headers only.
-- **nft control-plane gaps:** no `NLM_F_ECHO` and no monitor notifications; set-element dumps are
-  one unbounded message.
+- **nft control-plane gaps:** no `NLM_F_ECHO` and no monitor notifications.
 - POSTROUTING, SNAT and MASQUERADE have no effect; unsupported expression effects are listed above.
 
 ## Open questions

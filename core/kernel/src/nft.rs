@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use crate::cell::RefCell;
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
-use crate::net::{attr, message};
+use crate::net::{DUMP_CHUNK, DumpMessages, NetlinkDump, NetlinkItem, attr, message};
 use crate::nsproxy::NetNs;
 
 const NFNL_SUBSYS_CTNETLINK: u16 = 1;
@@ -789,9 +789,9 @@ pub(crate) struct Peer<'a> {
     pub comm: &'a [u8],
 }
 
-/// Handles one datagram the guest sent on `NETLINK_NETFILTER`, returning the datagrams of the
-/// answers.
-pub(crate) fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
+/// Handles one datagram the guest sent on `NETLINK_NETFILTER`, returning single datagrams or
+/// resumable multipart dumps.
+pub(crate) fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> Vec<NetlinkItem> {
     let msgs = split(data);
     let Some(first) = msgs.first() else {
         return Vec::new();
@@ -799,7 +799,10 @@ pub(crate) fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> V
     // Needs CAP_NET_ADMIN in the namespace's owner (nfnetlink_rcv: only the first message is
     // acknowledged, the rest are dropped)
     if !cred.ns_capable(&ns.owner, cap::NET_ADMIN) {
-        return vec![ack(first, Err(fail(Errno::EPERM)), peer)];
+        return vec![NetlinkItem::Datagram(
+            ack(first, Err(fail(Errno::EPERM)), peer),
+            0,
+        )];
     }
     let mut out = Vec::new();
     let mut i = 0;
@@ -841,26 +844,32 @@ fn split(data: &[u8]) -> Vec<&[u8]> {
 
 /// One batch: applied message by message on a copy of the ruleset, which replaces the ruleset
 /// only if all succeed.
-fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Vec<u8>> {
+fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<NetlinkItem> {
     let b = parse(begin);
     let res = begin
         .get(18..20)
         .map_or(0, |r| u16::from_be_bytes([r[0], r[1]]));
     if res != NFNL_SUBSYS_NFTABLES {
-        return vec![ack(begin, Err(fail(Errno::EOPNOTSUPP)), peer)];
+        return vec![NetlinkItem::Datagram(
+            ack(begin, Err(fail(Errno::EOPNOTSUPP)), peer),
+            0,
+        )];
     }
     let mut st = ns.nft.borrow().clone();
     if let Some(genid) = get_be32(&b.attrs, NFNL_BATCH_GENID)
         && genid != 0
         && genid != st.generation
     {
-        return vec![ack(
-            begin,
-            Err(Fail {
-                errno: ERESTART,
-                at: None,
-            }),
-            peer,
+        return vec![NetlinkItem::Datagram(
+            ack(
+                begin,
+                Err(Fail {
+                    errno: ERESTART,
+                    at: None,
+                }),
+                peer,
+            ),
+            0,
         )];
     }
     let mut replies = Vec::new();
@@ -878,12 +887,12 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Vec<u
             Ok(()) => {
                 changed = true;
                 if r.flags & NLM_F_ACK != 0 {
-                    replies.push(ack(m, Ok(()), peer));
+                    replies.push(NetlinkItem::Datagram(ack(m, Ok(()), peer), 0));
                 }
             }
             Err(f) => {
                 failed = true;
-                replies.push(ack(m, Err(f), peer));
+                replies.push(NetlinkItem::Datagram(ack(m, Err(f), peer), 0));
             }
         }
     }
@@ -916,7 +925,7 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Vec<u
 }
 
 /// One message outside a batch: queries, `NFT_MSG_GETGEN`, xt extension revisions, conntrack.
-fn single(ns: &NetNs, m: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
+fn single(ns: &NetNs, m: &[u8], peer: &Peer<'_>) -> Vec<NetlinkItem> {
     let r = parse(m);
     let ty = u16::from_le_bytes([m[4], m[5]]);
     if r.flags & NLM_F_REQUEST == 0 || ty < 0x10 {
@@ -928,7 +937,7 @@ fn single(ns: &NetNs, m: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
         NFNL_SUBSYS_NFT_COMPAT => compat(&r, peer),
         // The conntrack table is always empty: dumps contain nothing
         NFNL_SUBSYS_CTNETLINK | NFNL_SUBSYS_CTNETLINK_EXP if r.dump() => {
-            Ok(vec![done(r.seq, peer.pid)])
+            Ok(dump_reply(Vec::new(), r.seq, peer.pid))
         }
         NFNL_SUBSYS_CTNETLINK | NFNL_SUBSYS_CTNETLINK_EXP => Err(fail(Errno::EOPNOTSUPP)),
         _ => Err(fail(Errno::EINVAL)),
@@ -936,11 +945,11 @@ fn single(ns: &NetNs, m: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
     match answer {
         Ok(mut d) => {
             if r.flags & NLM_F_ACK != 0 && !r.dump() {
-                d.push(ack(m, Ok(()), peer));
+                d.push(NetlinkItem::Datagram(ack(m, Ok(()), peer), 0));
             }
             d
         }
-        Err(f) => vec![ack(m, Err(f), peer)],
+        Err(f) => vec![NetlinkItem::Datagram(ack(m, Err(f), peer), 0)],
     }
 }
 
@@ -1904,11 +1913,12 @@ const XT: [(&str, bool, u32); 52] = [
 
 impl Nft {
     /// nftables messages outside batches: `NFT_MSG_GET*`.
-    fn query(&self, r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<Vec<u8>>, Fail> {
+    fn query(&self, r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<NetlinkItem>, Fail> {
         let res = (self.generation & 0xffff) as u16;
         let one = |msg: u8, flags: u16, family: u8, attrs: &[u8]| {
             nfmsg(nft_type(msg), flags, r.seq, peer.pid, family, res, attrs)
         };
+        let dgram = |m| NetlinkItem::Datagram(m, 0);
         // A dump with address family NFPROTO_UNSPEC lists everything
         let fam = |t: &Table| r.family == 0 || t.family == r.family;
         let by_name = |a: u16| get_str(&r.attrs, a);
@@ -1918,7 +1928,7 @@ impl Nft {
                 attr(&mut p, GEN_ID, &be32(self.generation));
                 attr(&mut p, GEN_PROC_PID, &be32(peer.proc_pid));
                 attr(&mut p, GEN_PROC_NAME, &cstr(peer.comm));
-                Ok(vec![one(NEWGEN, 0, 0, &p)])
+                Ok(vec![dgram(one(NEWGEN, 0, 0, &p))])
             }
             GETTABLE if r.dump() => {
                 let m = self
@@ -1932,7 +1942,7 @@ impl Nft {
             GETTABLE => {
                 let t = self.table_of(r, TABLE_NAME, None)?;
                 let t = &self.tables[t];
-                Ok(vec![one(NEWTABLE, 0, t.family, &t.table_attrs())])
+                Ok(vec![dgram(one(NEWTABLE, 0, t.family, &t.table_attrs()))])
             }
             GETCHAIN if r.dump() => {
                 let m = self
@@ -1955,7 +1965,7 @@ impl Nft {
                     .iter()
                     .find(|c| c.name == n)
                     .ok_or_else(|| fail(Errno::ENOENT))?;
-                Ok(vec![one(NEWCHAIN, 0, t.family, &t.chain_attrs(c))])
+                Ok(vec![dgram(one(NEWCHAIN, 0, t.family, &t.chain_attrs(c)))])
             }
             GETRULE if r.dump() => {
                 let (tn, cn) = (by_name(RULE_TABLE), by_name(RULE_CHAIN));
@@ -1990,7 +2000,12 @@ impl Nft {
                     .iter()
                     .position(|x| x.handle == h)
                     .ok_or_else(|| fail(Errno::ENOENT))?;
-                Ok(vec![one(NEWRULE, 0, t.family, &t.rule_attrs(c, i, false))])
+                Ok(vec![dgram(one(
+                    NEWRULE,
+                    0,
+                    t.family,
+                    &t.rule_attrs(c, i, false),
+                ))])
             }
             GETSET if r.dump() => {
                 let tn = by_name(SET_TABLE);
@@ -2014,7 +2029,7 @@ impl Nft {
                     .iter()
                     .find(|s| s.name == n)
                     .ok_or_else(|| fail(Errno::ENOENT))?;
-                Ok(vec![one(NEWSET, 0, t.family, &t.set_attrs(s))])
+                Ok(vec![dgram(one(NEWSET, 0, t.family, &t.set_attrs(s)))])
             }
             GETSETELEM if r.dump() => {
                 let t = &self.tables[self.table_of(r, SET_ELEM_LIST_TABLE, None)?];
@@ -2024,9 +2039,9 @@ impl Nft {
                     .iter()
                     .find(|s| s.name == n)
                     .ok_or_else(|| fail(Errno::ENOENT))?;
-                // nf_tables_dump_set: one message with the elements when there are any, and
-                // always a final one with no elements, together with DONE
-                let mut out = Vec::new();
+                // nf_tables_dump_set: chunk elements on demand into bounded NFT_MSG_NEWSETELEM
+                // multipart messages sized to the caller's receive buffer (capped at DUMP_CHUNK),
+                // followed by a final empty NFT_MSG_NEWSETELEM and NLMSG_DONE.
                 let now = Instant::now();
                 let mut elements = s.elems.borrow().clone();
                 for entry in s.dynamic.borrow().values() {
@@ -2042,18 +2057,17 @@ impl Nft {
                         elements.push(wire);
                     }
                 }
-                if !elements.is_empty() {
-                    out.push(one(
-                        NEWSETELEM,
-                        NLM_F_MULTI,
+                Ok(vec![NetlinkItem::Dump(NetlinkDump::SetElems(
+                    SetElemDump::new(
+                        r.seq,
+                        peer.pid,
                         t.family,
-                        &t.elems_attrs(s, &elements),
-                    ));
-                }
-                let mut last = one(NEWSETELEM, NLM_F_MULTI, t.family, &t.elems_attrs(s, &[]));
-                last.extend(done(r.seq, peer.pid));
-                out.push(last);
-                Ok(out)
+                        res,
+                        t.name.clone(),
+                        s.name.clone(),
+                        elements,
+                    ),
+                ))])
             }
             GETSETELEM => Err(fail(Errno::EOPNOTSUPP)),
             GETOBJ | GETFLOWTABLE if r.dump() => Ok(dump_reply(Vec::new(), r.seq, peer.pid)),
@@ -2162,40 +2176,192 @@ impl Table {
         }
         p
     }
+}
 
-    fn elems_attrs(&self, s: &Set, elems: &[Vec<u8>]) -> Vec<u8> {
-        let mut p = Vec::new();
-        attr(&mut p, SET_ELEM_LIST_TABLE, &cstr(&self.name));
-        attr(&mut p, SET_ELEM_LIST_SET, &cstr(&s.name));
-        let mut l = Vec::new();
-        for e in elems {
-            attr(&mut l, LIST_ELEM, e);
+/// Encodes `NFTA_SET_ELEM_LIST_{TABLE,SET,ELEMENTS}` for a single `NFT_MSG_NEWSETELEM` message.
+fn encode_elems_attrs<'a>(
+    table: &[u8],
+    set: &[u8],
+    elems: impl IntoIterator<Item = &'a [u8]>,
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    attr(&mut p, SET_ELEM_LIST_TABLE, &cstr(table));
+    attr(&mut p, SET_ELEM_LIST_SET, &cstr(set));
+    let mut l = Vec::new();
+    for e in elems {
+        attr(&mut l, LIST_ELEM, e);
+    }
+    attr(&mut p, SET_ELEM_LIST_ELEMENTS, &l);
+    p
+}
+
+/// Resumable `NFT_MSG_GETSETELEM` dump state: packs set elements on demand into bounded
+/// `NFT_MSG_NEWSETELEM` multipart messages sized to each receive buffer (capped at
+/// [`DUMP_CHUNK`]), followed by the final empty `NFT_MSG_NEWSETELEM` and `NLMSG_DONE`
+/// (matching Linux's `nf_tables_dump_set`).
+pub(crate) struct SetElemDump {
+    seq: u32,
+    pid: u32,
+    family: u8,
+    res_id: u16,
+    table: Vec<u8>,
+    set: Vec<u8>,
+    elems: VecDeque<Vec<u8>>,
+    /// Total aligned `NFTA_LIST_ELEM` bytes remaining in `elems`, for O(1) `SO_RCVBUF` accounting.
+    elem_bytes: usize,
+    /// Fixed byte size of one `NFT_MSG_NEWSETELEM` message carrying zero elements.
+    base_msg_len: usize,
+    /// Whether the final empty `NFT_MSG_NEWSETELEM` has been delivered.
+    tail_sent: bool,
+    /// Whether the terminating `NLMSG_DONE` has been delivered.
+    done_sent: bool,
+}
+
+impl SetElemDump {
+    fn new(
+        seq: u32,
+        pid: u32,
+        family: u8,
+        res_id: u16,
+        table: Vec<u8>,
+        set: Vec<u8>,
+        elems: Vec<Vec<u8>>,
+    ) -> Self {
+        let elem_bytes = elems
+            .iter()
+            .map(|e| (4 + e.len()).next_multiple_of(4))
+            .sum();
+        let base_msg_len = Self::build_msg(seq, pid, family, res_id, &table, &set, []).len();
+        Self {
+            seq,
+            pid,
+            family,
+            res_id,
+            table,
+            set,
+            elems: VecDeque::from(elems),
+            elem_bytes,
+            base_msg_len,
+            tail_sent: false,
+            done_sent: false,
         }
-        attr(&mut p, SET_ELEM_LIST_ELEMENTS, &l);
-        p
+    }
+
+    fn build_msg<'a>(
+        seq: u32,
+        pid: u32,
+        family: u8,
+        res_id: u16,
+        table: &[u8],
+        set: &[u8],
+        elems: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Vec<u8> {
+        let attrs = encode_elems_attrs(table, set, elems);
+        nfmsg(
+            nft_type(NEWSETELEM),
+            NLM_F_MULTI,
+            seq,
+            pid,
+            family,
+            res_id,
+            &attrs,
+        )
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.elems.is_empty() && self.tail_sent && self.done_sent
+    }
+
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        let mut n = self.elem_bytes;
+        if !self.tail_sent {
+            n = n.saturating_add(self.base_msg_len);
+        }
+        if !self.done_sent {
+            // NLMSG_DONE with 4-byte i32(0) payload = 20 bytes
+            n = n.saturating_add(20);
+        }
+        n
+    }
+
+    /// Produces the next datagram sized for a `max`-byte receive buffer (capped at `DUMP_CHUNK`
+    /// for element chunks so each `NFT_MSG_NEWSETELEM` stays bounded and never overflows
+    /// `nlattr.nla_len`). Always makes forward progress by emitting at least one element even if
+    /// `max` is smaller than a single-element message.
+    pub(crate) fn next_datagram(&mut self, max: usize, peek: bool) -> Option<Vec<u8>> {
+        if self.is_empty() {
+            return None;
+        }
+        if !self.elems.is_empty() {
+            let budget = max.min(DUMP_CHUNK);
+            let mut size = self.base_msg_len;
+            let mut count = 0;
+            for e in &self.elems {
+                let add = (4 + e.len()).next_multiple_of(4);
+                if count > 0 && size + add > budget {
+                    break;
+                }
+                size += add;
+                count += 1;
+            }
+            let msg = Self::build_msg(
+                self.seq,
+                self.pid,
+                self.family,
+                self.res_id,
+                &self.table,
+                &self.set,
+                self.elems.iter().take(count).map(Vec::as_slice),
+            );
+            if !peek {
+                for _ in 0..count {
+                    let e = self.elems.pop_front().unwrap();
+                    let sub = (4 + e.len()).next_multiple_of(4);
+                    self.elem_bytes = self.elem_bytes.saturating_sub(sub);
+                }
+            }
+            return Some(msg);
+        }
+        if !self.tail_sent {
+            let mut last = Self::build_msg(
+                self.seq,
+                self.pid,
+                self.family,
+                self.res_id,
+                &self.table,
+                &self.set,
+                [],
+            );
+            let d = done(self.seq, self.pid);
+            if last.len() + d.len() <= max {
+                last.extend(d);
+                if !peek {
+                    self.tail_sent = true;
+                    self.done_sent = true;
+                }
+            } else if !peek {
+                self.tail_sent = true;
+            }
+            return Some(last);
+        }
+        let d = done(self.seq, self.pid);
+        if !peek {
+            self.done_sent = true;
+        }
+        Some(d)
     }
 }
 
-/// Packs dumped messages into datagrams (each at most 8 KiB), ending with `NLMSG_DONE`.
-fn dump_reply(msgs: Vec<Vec<u8>>, seq: u32, pid: u32) -> Vec<Vec<u8>> {
-    const CHUNK: usize = 8192;
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut cur = Vec::new();
-    for m in msgs {
-        if !cur.is_empty() && cur.len() + m.len() > CHUNK {
-            out.push(std::mem::take(&mut cur));
-        }
-        cur.extend(m);
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out.push(done(seq, pid));
-    out
+/// Wraps dumped nftables messages in a resumable [`NetlinkDump`] ending with `NLMSG_DONE`.
+fn dump_reply(msgs: Vec<Vec<u8>>, seq: u32, pid: u32) -> Vec<NetlinkItem> {
+    let mut out = DumpMessages::new();
+    out.push_section(msgs);
+    out.push_section([done(seq, pid)]);
+    vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
 }
 
 /// `NFNL_MSG_COMPAT_GET`: whether an xt extension exists, and its highest revision.
-fn compat(r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<Vec<u8>>, Fail> {
+fn compat(r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<NetlinkItem>, Fail> {
     let (Some(name), Some(rev), Some(ty)) = (
         get_str(&r.attrs, COMPAT_NAME),
         get_be32(&r.attrs, COMPAT_REV),
@@ -2213,14 +2379,9 @@ fn compat(r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<Vec<u8>>, Fail> {
     attr(&mut p, COMPAT_REV, &be32(rev.min(*max)));
     attr(&mut p, COMPAT_TYPE, &be32(ty));
     let t = NFNL_SUBSYS_NFT_COMPAT << 8;
-    Ok(vec![nfmsg(
-        t,
-        NLM_F_MULTI,
-        r.seq,
-        peer.pid,
-        r.family,
+    Ok(vec![NetlinkItem::Datagram(
+        nfmsg(t, NLM_F_MULTI, r.seq, peer.pid, r.family, 0, &p),
         0,
-        &p,
     )])
 }
 
@@ -3789,6 +3950,27 @@ mod tests {
         b
     }
 
+    /// Drains [`NetlinkItem`]s using a `max`-byte receive buffer.
+    fn drain_items(items: Vec<NetlinkItem>, max: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for item in items {
+            match item {
+                NetlinkItem::Datagram(d, _) => out.push(d),
+                NetlinkItem::Dump(mut dump) => {
+                    while let Some(d) = dump.next_datagram(max, false) {
+                        out.push(d);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Test wrapper matching the legacy datagram-returning view at page-sized `DUMP_CHUNK`.
+    fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
+        drain_items(super::handle(ns, cred, data, peer), DUMP_CHUNK)
+    }
+
     /// Error codes in the answers (of NLMSG_ERROR; 0 is an acknowledgement), in order.
     fn errors(replies: &[Vec<u8>]) -> Vec<i32> {
         replies
@@ -4700,5 +4882,126 @@ mod tests {
             .is_empty()
         );
         assert!(ns.nft.borrow().is_empty());
+    }
+
+    #[test]
+    fn large_set_element_dump_chunks_across_small_and_standard_buffers() {
+        let ns = ns();
+        let root = Cred::root();
+        let run = |msgs: &[Vec<u8>]| errors(&handle(&ns, &root, &batch(msgs), &peer()));
+
+        // Create table + set with 4-byte IPv4 keys, plus an empty set
+        let mk_set = |name: &[u8]| {
+            let mut p = Vec::new();
+            a(&mut p, SET_TABLE, &cstr(b"t"));
+            a(&mut p, SET_NAME, &cstr(name));
+            a(&mut p, SET_KEY_LEN, &be32(4));
+            msg(NEWSET, NLM_F_CREATE, 2, &p)
+        };
+        assert!(run(&[table_msg(2, b"t"), mk_set(b"big"), mk_set(b"empty")]).is_empty());
+
+        // Insert 600 distinct 4-byte elements in batches of 100
+        let total_elems: u32 = 600;
+        for base in (0..total_elems).step_by(100) {
+            let mut elems = Vec::new();
+            for i in base..(base + 100) {
+                let key = [10, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8, 1];
+                let mut e = Vec::new();
+                a(&mut e, SET_ELEM_KEY, &value(&key));
+                a(&mut elems, LIST_ELEM, &e);
+            }
+            let mut p = Vec::new();
+            a(&mut p, SET_ELEM_LIST_TABLE, &cstr(b"t"));
+            a(&mut p, SET_ELEM_LIST_SET, &cstr(b"big"));
+            a(&mut p, SET_ELEM_LIST_ELEMENTS, &elems);
+            assert!(run(&[msg(NEWSETELEM, NLM_F_CREATE, 2, &p)]).is_empty());
+        }
+
+        let mut req_p = Vec::new();
+        a(&mut req_p, SET_ELEM_LIST_TABLE, &cstr(b"t"));
+        a(&mut req_p, SET_ELEM_LIST_SET, &cstr(b"big"));
+        let req = msg(GETSETELEM, NLM_F_DUMP, 2, &req_p);
+
+        for max in [512usize, 1024, 4096, 16384] {
+            let dgrams = drain_items(super::handle(&ns, &root, &req, &peer()), max);
+            assert!(
+                dgrams.len() > 2,
+                "max={max} must chunk across multiple datagrams"
+            );
+            for d in &dgrams {
+                assert!(
+                    d.len() <= max.min(DUMP_CHUNK),
+                    "max={max} produced {}-byte datagram",
+                    d.len()
+                );
+            }
+            // Final datagram ends with NLMSG_DONE
+            let last_msgs = split(dgrams.last().unwrap());
+            let last_ty =
+                u16::from_le_bytes([last_msgs.last().unwrap()[4], last_msgs.last().unwrap()[5]]);
+            assert_eq!(last_ty, NLMSG_DONE);
+
+            let parsed = dumped(&dgrams);
+            // At least 2 non-empty NEWSETELEM messages plus the trailing empty NEWSETELEM
+            assert!(parsed.len() >= 3, "max={max} parsed={}", parsed.len());
+            assert!(find(parsed.last().unwrap(), SET_ELEM_LIST_ELEMENTS).is_empty());
+
+            let mut keys = Vec::new();
+            for m in &parsed[..parsed.len() - 1] {
+                let list = crate::route::attrs(find(m, SET_ELEM_LIST_ELEMENTS));
+                assert!(!list.is_empty());
+                for (_, raw_e) in list {
+                    let ea = crate::route::attrs(raw_e);
+                    let k = crate::route::attrs(get(&ea, SET_ELEM_KEY).unwrap());
+                    keys.push(get(&k, DATA_VALUE).unwrap().to_vec());
+                }
+            }
+            let want: Vec<Vec<u8>> = (0..total_elems)
+                .map(|i| vec![10, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8, 1])
+                .collect();
+            assert_eq!(keys, want, "max={max}");
+        }
+
+        // MSG_PEEK / max=0 probe on SetElemDump preserves every element
+        let mut items = super::handle(&ns, &root, &req, &peer());
+        assert_eq!(items.len(), 1);
+        let NetlinkItem::Dump(mut dump) = items.pop().unwrap() else {
+            panic!("expected resumable dump");
+        };
+        let p0 = dump.next_datagram(0, true).unwrap();
+        let p0_again = dump.next_datagram(0, true).unwrap();
+        assert_eq!(p0, p0_again);
+        let first_read = dump.next_datagram(p0.len(), false).unwrap();
+        assert_eq!(first_read, p0);
+        let mut all = vec![first_read];
+        while let Some(d) = dump.next_datagram(512, false) {
+            assert!(d.len() <= 512);
+            all.push(d);
+        }
+        assert!(dump.is_empty());
+        assert_eq!(dump.remaining_bytes(), 0);
+        let total_got: usize = dumped(&all)
+            .iter()
+            .map(|m| crate::route::attrs(find(m, SET_ELEM_LIST_ELEMENTS)).len())
+            .sum();
+        assert_eq!(total_got, total_elems as usize);
+
+        // Empty set dump: fits in 1 datagram normally, splits into [empty NEWSETELEM] + [DONE]
+        // when buffer is too small for both together.
+        let mut empty_p = Vec::new();
+        a(&mut empty_p, SET_ELEM_LIST_TABLE, &cstr(b"t"));
+        a(&mut empty_p, SET_ELEM_LIST_SET, &cstr(b"empty"));
+        let empty_req = msg(GETSETELEM, NLM_F_DUMP, 2, &empty_p);
+        let normal = drain_items(super::handle(&ns, &root, &empty_req, &peer()), 4096);
+        assert_eq!(normal.len(), 1);
+        assert_eq!(split(&normal[0]).len(), 2);
+        let empty_msg_len = split(&normal[0])[0].len();
+        let tiny = drain_items(
+            super::handle(&ns, &root, &empty_req, &peer()),
+            empty_msg_len,
+        );
+        assert_eq!(tiny.len(), 2);
+        assert_eq!(tiny[0].len(), empty_msg_len);
+        assert_eq!(u16::from_le_bytes([tiny[1][4], tiny[1][5]]), NLMSG_DONE);
     }
 }

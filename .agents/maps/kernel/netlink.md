@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: SO_RCVBUF queue cap, unique nl_pid, msg_name validation, NLM_F_REQUEST check, shutdown/getpeername, RTM_GETNEIGH validation)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: resumable on-demand netlink dumps sized to each receive buffer)
 
 ## Responsibilities
 
@@ -35,12 +35,14 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 
 ## Key types
 
-- `NetlinkSocket` — protocol, type, `pid`, connected `dst_pid`/`dst_group`, datagram queue (each
-  with the multicast group it went to, 0 for answers) and `queued_bytes` (capped against
-  `SO_RCVBUF`), arrival counter, `overrun`, `rcvtimeo`/`sndtimeo`, namespace,
-  `ext_ack`/`cap_ack`, joined groups, the other `SOL_NETLINK` flags (bit n for option n),
-  `passcred`, `SockOpts`. `Kernel::rtnl_sockets` holds every netlink socket weakly (for unique
-  `nl_pid` checks and peer delivery across protocols, as well as `NETLINK_ROUTE` notifications).
+- `NetlinkSocket` — protocol, type, `pid`, connected `dst_pid`/`dst_group`, reply/notification
+  queue (`VecDeque<NetlinkItem>`: atomic `Datagram(Vec<u8>, group)` entries or resumable
+  `Dump(NetlinkDump)` entries—either `DumpMessages` or `nft::SetElemDump`—packed on demand to
+  each receive buffer) and `queued_bytes` (capped against `SO_RCVBUF`), arrival counter,
+  `overrun`, `rcvtimeo`/`sndtimeo`, namespace, `ext_ack`/`cap_ack`, joined groups, the other
+  `SOL_NETLINK` flags (bit n for option n), `passcred`, `SockOpts`. `Kernel::rtnl_sockets` holds
+  every netlink socket weakly (for unique `nl_pid` checks and peer delivery across protocols, as
+  well as `NETLINK_ROUTE` notifications).
 - `Host` trait (interfaces, stats, routes, `tx_queue_len`, uid; with defaults configure,
   `peer_net`, links, tables, `all_interfaces`, `init_net`, `net_admin`, netfilter), implemented by
   `KernelHost` (kernel, credentials, namespace, pid namespace, fds, the namespaces `watched` for
@@ -90,8 +92,13 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   `NETLINK_NETFILTER` hands the whole datagram to nftables (and a
   change of the initial namespace's ruleset re-runs the inbound forwarding hooks);
   `NETLINK_KOBJECT_UEVENT` swallows it. recv first takes a pending overrun (`ENOBUFS` once), then
-  pops one datagram (`MSG_PEEK` clones; oversized datagrams are truncated with `MSG_TRUNC` and the
-  rest lost); source `{AF_NETLINK, 0, group mask}`; with `NETLINK_PKTINFO` a pktinfo control
+  dequeues one datagram (`dequeue(max, peek)`): atomic `Datagram` items pop whole (cloned on
+  `MSG_PEEK`), while resumable `Dump` items pack as many consecutive messages from the current
+  section as fit in `min(max, 32768)` bytes on demand (always emitting at least one atomic
+  message so an oversized single message reports `MSG_TRUNC` and its full length without losing
+  subsequent dump entries, and leaving state intact on `MSG_PEEK`, including 0-byte
+  `MSG_PEEK|MSG_TRUNC` probes; advancing a non-empty dump bumps `arrivals` for `EPOLLET`); source
+  `{AF_NETLINK, 0, group mask}`; with `NETLINK_PKTINFO` a pktinfo control
   message (the group, 0 for answers), then with `SO_PASSCRED` the kernel's credentials (pid 0, uid
   and gid 0 as the receiver sees them), cut as `put_cmsg` cuts them; with nothing queued,
   nonblocking, `MSG_DONTWAIT`, `MSG_ERRQUEUE` or an expired `SO_RCVTIMEO` give `EAGAIN` and a
@@ -144,15 +151,16 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   only on `NLM_F_ACK`.
 - Queries: link dumps (filtered by master and kind), single links by index or name (`EINVAL`,
   `ENODEV`), address dumps (per family, IPv4 first), route dumps (per family) and `ip route get`
-  (both built by `kernel/route`), rule dumps (one datagram; `EAFNOSUPPORT` for a
-  family without rules), nsid (by pid or fd), neighbour dumps (empty) and single neighbour gets
+  (both built by `kernel/route`), rule dumps (`EAFNOSUPPORT` for a family without rules), nsid
+  (by pid or fd), neighbour dumps (empty) and single neighbour gets
   (validating header length, `ndm_state`/`ndm_type`, family `EAFNOSUPPORT`, `NDA_DST` length
   `EINVAL` and ifindex `ENODEV`/`EINVAL` before `ENOENT`); others `EOPNOTSUPP`; control messages
   are acked only on `NLM_F_ACK`.
-- Link, address and route dumps are packed into datagrams of at most 3776 bytes (Linux's
-  `NLMSG_GOODSIZE` on 4 KiB pages, which bounds a dump's first datagram), so readers with a
-  page-sized buffer (Go's `syscall.NetlinkRIB`, behind `net.Interfaces`) get whole messages; dumps
-  are not resumable, so a datagram larger than the reader's buffer is lost.
+- Link, address, route, rule and neighbour dumps are queued as resumable `DumpMessages` (keeping
+  Linux 6.1's per-family section boundaries and trailing `NLMSG_DONE` section) and packed on
+  demand to each `recv`/`recvmsg` buffer size (capped at 32 KiB), so both small buffers (e.g.
+  512 B) and page-sized buffers (Go's `syscall.NetlinkRIB`, behind `net.Interfaces`) receive whole
+  multipart messages without losing entries.
 - In the initial namespace interfaces and addresses come from the host's `getifaddrs` (MTU fixed,
   MAC from `AF_PACKET` entries, host statistics and queue length) plus its virtual devices; new
   namespaces see only their own devices, with zero statistics and a queue length of 1000.
@@ -162,7 +170,8 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 - `NETLINK_GENERIC`: `nlctrl` only, modelled on 6.8 (the differential tests run on a 6.8 host,
   where 6.1 would report a different maxattr): a short header `EINVAL`, unknown families
   `ENOENT`; `GETPOLICY` only as a dump (`EINVAL` without a family, `ENOENT` for another family,
-  `EOPNOTSUPP` for nlctrl); the `GETFAMILY` dump ends with `NLMSG_DONE` in the same datagram.
+  `EOPNOTSUPP` for nlctrl); the `GETFAMILY` dump is resumable and shares a datagram with
+  `NLMSG_DONE` when both fit in the caller's buffer (splitting across two receives otherwise).
 - `NETLINK_SOCK_DIAG` answers as 6.1 does without any family diag module (`sock_diag_rcv_msg`):
   the old `TCPDIAG_GETSOCK`/`DCCPDIAG_GETSOCK` `EOPNOTSUPP`; `SOCK_DIAG_BY_FAMILY` and
   `SOCK_DESTROY` `EINVAL` for a body under two bytes or a family at or past `AF_MAX` (46), else
@@ -206,9 +215,6 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 
 ## Confirmed bugs / technical debt
 
-- **Netlink dumps are not resumable:** a reader whose buffer is smaller than a dump datagram (at
-  most 3776 bytes, a whole rule dump in one) gets `MSG_TRUNC` and loses the rest, where Linux
-  sizes later datagrams to the reader's buffer and continues the dump on the next recv.
 - **Only rtnetlink link, address and route changes are notified:** groups other than rtnetlink's
   link, address and route ones (neighbours, rules, netconf, nsid, other protocols) never receive
   anything; changes made through sysctls (`disable_ipv6`) or to the host's own interfaces (boot
