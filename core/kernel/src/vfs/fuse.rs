@@ -32,7 +32,7 @@
 //! mappings copy the file ([`snapshot`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1379,11 +1379,22 @@ pub(crate) struct Node {
     /// Entries the daemon returned for it, given back with `FUSE_FORGET` when it is forgotten
     /// (Linux's `nlookup`).
     nlookup: u64,
+    /// Shared by O_PATH descriptions, which have no daemon file handle.
+    path_pin: Weak<()>,
     /// When it was last entered ([`Fuses::clock`]): the oldest go first.
     seen: u64,
 }
 
 impl Node {
+    pub(crate) fn pin_path(&mut self) -> Rc<()> {
+        if let Some(pin) = self.path_pin.upgrade() {
+            return pin;
+        }
+        let pin = Rc::new(());
+        self.path_pin = Rc::downgrade(&pin);
+        pin
+    }
+
     /// The file type bits.
     pub fn kind(&self) -> u32 {
         self.attr.mode & mode::S_IFMT
@@ -1430,6 +1441,7 @@ impl Fuses {
                 link: None,
                 appending: false,
                 nlookup: 0,
+                path_pin: Weak::new(),
                 seen: 0,
             },
         );
@@ -1546,6 +1558,7 @@ impl Fuses {
                         link: None,
                         appending: false,
                         nlookup: 1,
+                        path_pin: Weak::new(),
                         seen: 0,
                     },
                 );
@@ -1577,8 +1590,8 @@ impl Fuses {
     /// Forgets the nodes nothing uses (Linux evicting unused inodes), giving their lookups back to
     /// their daemons (`FUSE_FORGET`, [`Conn::read_forget`]); returns how many went. Kept are
     /// those in `keep` (what processes' roots, cwds and open files, mounts, inotify watches and
-    /// running programs are), roots, nodes with an open handle or a request in flight, and the
-    /// directories any of these or any remaining node lies in. With `all` (`drop_caches`) every
+    /// running programs are), roots, nodes with an O_PATH pin, an open handle or a request in
+    /// flight, and the directories any of these or any remaining node lies in. With `all` (`drop_caches`) every
     /// other node goes; otherwise only when the cache holds more than [`NODES_MAX`], the least
     /// recently entered first, down to 3/4 of it. Entries naming forgotten nodes go too, and so do
     /// negative entries no longer valid. A node `all` keeps only for a release in flight loses its
@@ -1615,7 +1628,7 @@ impl Fuses {
                 if n.dev != c.dev {
                     continue;
                 }
-                let open = c.opens.get(&n.nodeid).is_some_and(|&k| k > 0);
+                let open = n.path_pin.strong_count() != 0 || c.opens.contains_key(&n.nodeid);
                 if n.nodeid == ROOT_ID || open || busy.contains(&n.nodeid) {
                     kept.insert(id);
                     if n.nodeid != ROOT_ID

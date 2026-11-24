@@ -14,11 +14,11 @@ use crate::cell::RefCell;
 use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::FileRef;
-use crate::kernel::{Cx, request_wake_object, wake};
+use crate::kernel::{Cx, Kernel, request_wake_object, wake};
 use crate::net::{AF_UNIX, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, Socket};
 use crate::unix::{
-    CAPACITY, ChannelRef, Link, Name, Packet, Received, SOCK_SEQPACKET, SOCKADDR_UN_LEN, Ucred,
-    UnixSocket, unnamed,
+    CAPACITY, ChannelRef, Link, Name, Packet, Received, SOCK_SEQPACKET, SOCKADDR_UN_LEN,
+    SendingRights, Ucred, UnixSocket, unnamed,
 };
 use crate::vfs::Node;
 use crate::vfs::store::mode;
@@ -322,7 +322,8 @@ pub(super) fn send(
     flags: u32,
 ) -> Result<usize, Errno> {
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
-    let (mut files, declared) = rights(cx, control)?;
+    let (files, declared) = rights(cx, control)?;
+    let mut files = SendingRights::track(cx.k(), files);
     // Without a declaration it is the sender itself (Linux's maybe_add_creds uses the real user ID
     // and group ID)
     let cred = declared.unwrap_or_else(|| cx.scm_cred());
@@ -361,28 +362,23 @@ pub(super) fn send(
                     return Err(Errno::EMSGSIZE);
                 }
                 if c.space() >= data.len() {
-                    let inflight = !files.is_empty();
-                    c.push(packet(data, files, cred, from));
-                    if inflight {
-                        crate::unix::note_inflight(cx.k(), &tx);
-                    }
+                    c.push(packet(cx.k(), &tx, data, files, cred, from));
                     return Ok(data.len());
                 }
             } else {
-                if data.is_empty() && files.is_empty() {
+                if data.is_empty() && files.is_none() {
                     return Ok(0);
                 }
                 // A stream socket may queue only part of it; open files go with the first part.
                 // Even a zero-byte send carrying SCM_RIGHTS must wait when the channel is full.
                 let n = c.space().min(data.len() - done);
                 if n > 0 || (data.is_empty() && c.space() > 0) {
-                    if !files.is_empty() {
-                        crate::unix::note_inflight(cx.k(), &tx);
-                    }
                     // The receiver's recvfrom gets the sender's address, as bound when sent
                     c.push(packet(
+                        cx.k(),
+                        &tx,
                         &data[done..done + n],
-                        std::mem::take(&mut files),
+                        files.take(),
                         cred,
                         from.clone(),
                     ));
@@ -475,7 +471,7 @@ fn send_dgram(
     deadline: Option<Instant>,
     data: &[u8],
     addr: &[u8],
-    files: Vec<FileRef>,
+    files: Option<Rc<SendingRights>>,
     cred: Ucred,
 ) -> Result<usize, Errno> {
     let (own_rx, from, connected, shut_wr) = with(sock, |u| {
@@ -529,7 +525,6 @@ fn send_dgram(
     if data.len() > CAPACITY {
         return Err(Errno::EMSGSIZE);
     }
-    let mut files = Some(files);
     loop {
         {
             let mut c = rx.borrow_mut();
@@ -547,11 +542,7 @@ fn send_dgram(
             // Room for the bytes, and unless the receiver is connected back to this socket, for
             // one more datagram (unix_dgram_sendmsg's unix_recvq_full wait)
             if c.space() >= data.len() && !c.holds_back(&own_rx) {
-                let files = files.take().unwrap_or_default();
-                if !files.is_empty() {
-                    crate::unix::note_inflight(cx.k(), &rx);
-                }
-                c.push(packet(data, files, cred, from));
+                c.push(packet(cx.k(), &rx, data, files, cred, from));
                 return Ok(data.len());
             }
         }
@@ -559,11 +550,20 @@ fn send_dgram(
     }
 }
 
-fn packet(data: &[u8], fds: Vec<FileRef>, cred: Ucred, from: Vec<u8>) -> Packet {
+fn packet(
+    k: &mut Kernel,
+    channel: &ChannelRef,
+    data: &[u8],
+    rights: Option<Rc<SendingRights>>,
+    cred: Ucred,
+    from: Vec<u8>,
+) -> Packet {
     Packet {
         data: data.to_vec(),
         off: 0,
-        fds,
+        fds: rights
+            .map(|r| r.into_packet(k, channel))
+            .unwrap_or_default(),
         cred,
         from,
     }

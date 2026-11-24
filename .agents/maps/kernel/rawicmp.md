@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: raw ICMP SHUT_RD immediate EOF and receiver wakeup)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: matching overlapping echo requests on replies and quoted errors)
 
 ## Responsibilities
 
@@ -13,9 +13,9 @@
 including traceroute's ICMP errors:
 
 - per-socket raw ICMP state (`ICMP_FILTER`, guest `IP_RECVTTL`/`IP_PKTINFO`/`IP_RECVERR`/
-  `IPV6_CHECKSUM`, echo-id tracking);
+  `IPV6_CHECKSUM`);
 - per-namespace aggregation points (`Tap`) on a host epoll watching ping sockets and TTL-limited
-  UDP probe sockets;
+  UDP probe sockets, tracking guest echo ids and sequences;
 - rebuilding full ICMP error messages, restoring guest echo ids, synthesizing IPv4 headers and
   fanning messages out to every matching raw socket in the namespace;
 - the raw-ICMP receive and error-draining paths (`raw_recv`, `take_errors`).
@@ -30,10 +30,10 @@ socket and epoll `Watch` wrappers (`hal`).
 
 ## Key types
 
-- `RawIcmp` — per raw socket: family, last guest echo id, `ICMP_FILTER`, guest `IP_RECVTTL`,
+- `RawIcmp` — per raw socket: family, `ICMP_FILTER`, guest `IP_RECVTTL`,
   `IP_PKTINFO` and `IP_RECVERR`, `IPV6_CHECKSUM`, and its `Tap`.
 - `Tap` — per-namespace aggregation point on a host epoll: sources and receivers; held weakly in
-  `Kernel::icmp_taps`.
+  `Kernel::icmp_taps`. Its `Echoes` history matches wire sequences to successful requests.
 - `Source` — one host fd watched by a `Tap` (a raw socket's ping socket, or an error-only UDP
   socket that set a TTL).
 - `Receiver` — per raw socket delivery state: data queue, byte count, arrivals and error queue
@@ -42,7 +42,7 @@ socket and epoll `Watch` wrappers (`hal`).
 ## Public entry points
 
 - `rawicmp::{tap_for, register, udp_setsockopt, before_io, untap, dispatch, check_taps}` and
-  `RawIcmp::{sent, setsockopt, getsockopt, present}`.
+  `RawIcmp::{send, setsockopt, getsockopt, present}`.
 - `raw_recv` and `take_errors` in `core/kernel/src/syscall/net.rs` (called from `kernel/net`'s
   socket receive and send/option paths).
 
@@ -65,9 +65,9 @@ socket and epoll `Watch` wrappers (`hal`).
 
 ### Sending and UDP probe tapping
 
-- Sending records the guest's echo id (`RawIcmp::sent`: one per socket, the last echo request of
-  8 bytes or more sent, recorded even if the send fails) and passes the ICMP message to the host
-  unchanged (no IP header); the host enforces echo-only and rewrites the id. An ICMP error already
+- `RawIcmp::send` gives each echo request a sequence on the wire. The host supplies its ping
+  socket id and checksum. Each successful send records the family, host id, guest id and guest
+  sequence in the namespace's tap before another thread can receive the reply. An ICMP error already
   recorded for the socket fails the send; a host error that ICMP can cause makes `kernel/net` drain
   the socket (`take_errors`) and retry once.
 - On UDP sockets, `IP_TTL`/`IPV6_UNICAST_HOPS` is recorded for the taps (still passed to the host),
@@ -84,7 +84,8 @@ socket and epoll `Watch` wrappers (`hal`).
   (quoted IP header, quoted UDP header or echo request with the guest id restored, checksums),
   applies Linux's `sk_err`/`IP_RECVERR` rules (with `IP_RECVERR` every error is queued, at most
   64; without it only hard errors from the connected peer set the socket error), then drains echo
-  replies, restoring an id that is some raw socket's host ident to that socket's last guest id.
+  replies. The wire sequence, family and host ping ident select the guest id and sequence for
+  replies, quoted echo requests and original datagrams returned by `MSG_ERRQUEUE`.
   Every live raw socket of the same family whose `ICMP_FILTER` passes gets a copy of replies and
   errors (queue capped at 212992 bytes of ICMP data, overflow dropped).
 - `raw_recv` / `RawIcmp::present` prepends a synthesized IPv4 header (TTL from the host, protocol
@@ -102,7 +103,7 @@ socket and epoll `Watch` wrappers (`hal`).
 ### Inbound
 
 - `kernel/net`: socket creation, bind, getsockname, options (`ICMP_*`/`SOL_RAW`, `SO_ERROR`,
-  `SO_TYPE`, UDP TTL/`IP_RECVERR` hooks), send (`before_io`, `sent`, `take_errors`), recv
+  `SO_TYPE`, UDP TTL/`IP_RECVERR` hooks), send (`before_io`, `RawIcmp::send`, `take_errors`), recv
   (`raw_recv`), readiness and `InetSocket` drop cleanup (`untap`).
 - `kernel/time`: the timer thread watches every `Tap`'s epoll fd and calls `check_taps`.
 
@@ -114,14 +115,14 @@ socket and epoll `Watch` wrappers (`hal`).
 
 ## Invariants and gotchas
 
-- The raw ICMP id rewrite assumes one echo id per raw socket (the last one sent).
+- A tap keeps the latest 65,536 successful echoes across its sockets. Duplicate and reordered
+  replies use the same mapping. A reply delayed past reuse of its 16-bit wire sequence can no
+  longer be distinguished from a newer request with the same family and host ping ident.
 - `dispatch` of the raw ICMP taps must run with no socket borrowed.
 
 ## Confirmed bugs / technical debt
 
-- **Raw ICMP keeps one echo id per socket:** every reply to a socket's ping ident is rewritten to
-  the last id that socket sent, so programs using several ids on one socket (liboping) see them
-  collapse; the queue cap ignores `SO_RCVBUF` and drops silently.
+- The queue cap ignores `SO_RCVBUF` and drops silently.
 - **A raw socket cannot be bound to another address:** Linux's `raw_bind` lets a raw socket be
   bound any number of times; the host ping socket that emulates a raw ICMP socket refuses a second
   bind, so binding it again succeeds only for the address it already has (`EINVAL` otherwise).

@@ -1042,6 +1042,7 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
             .map(std::rc::Rc::from);
         crate::fd::OpenFile::with_path(crate::fd::FileKind::Path(node), o_path, path)
     };
+    file.borrow_mut().pin_fuse_path(&vfs)?;
     let cloexec = flags & OPEN_TREE_CLOEXEC != 0;
     Ok(cx.fds_mut().install(file, cloexec, 0)? as u64)
 }
@@ -1546,13 +1547,12 @@ fn collect_now(k: &crate::kernel::Kernel, vfs: &Vfs) {
     }
 }
 
-/// The mounts that processes' root directories, cwds, open files, mappings and executables are in.
+/// Mounts held by tasks and by files being transferred over AF_UNIX sockets.
 fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
-    try_in_use(k).expect("a task's directories, address space or fd table are borrowed")
+    try_in_use(k).expect("mount holders are available during unmount")
 }
 
-/// [`in_use`], or None when some task's directories, address space, fd table or open file is
-/// borrowed.
+/// [`in_use`], or None when a holder is borrowed during teardown.
 fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
     let mut used = HashSet::new();
     let mut seen_mm = HashSet::new();
@@ -1569,18 +1569,11 @@ fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
         }
         let fds = res.fds.try_borrow().ok()?;
         for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
-            let file = file.try_borrow().ok()?;
-            if let Some(node) = file.node() {
-                used.insert(node.mnt());
-            } else if matches!(file.kind, FileKind::MessageQueue(_)) && !file.pseudo {
-                used.insert(file.mnt);
-            }
-            if let crate::fd::FileKind::Pty(end) = &file.kind
-                && end.pin
-            {
-                used.insert(end.mnt);
-            }
+            note_file_mount(&file, &mut used)?;
         }
+    }
+    for file in crate::unix::try_inflight_files(k)? {
+        note_file_mount(&file, &mut used)?;
     }
     for group in k.groups.values() {
         let g = group.try_borrow().ok()?;
@@ -1592,6 +1585,21 @@ fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
         }
     }
     Some(used)
+}
+
+fn note_file_mount(file: &crate::fd::FileRef, used: &mut HashSet<MountId>) -> Option<()> {
+    let file = file.try_borrow().ok()?;
+    if let Some(node) = file.node() {
+        used.insert(node.mnt());
+    } else if matches!(file.kind, FileKind::MessageQueue(_)) && !file.pseudo {
+        used.insert(file.mnt);
+    }
+    if let FileKind::Pty(end) = &file.kind
+        && end.pin
+    {
+        used.insert(end.mnt);
+    }
+    Some(())
 }
 
 /// The mounts with files open for writing through them (Linux's `mnt_get_writers`): regular and

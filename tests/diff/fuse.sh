@@ -359,6 +359,7 @@ while True:
         state()
     elif op != 36:
         reply(unique, 38)
+open("/tmp/fuse/fz-exited", "w").close()
 EOF
 mkdir z
 python3 fz.py &
@@ -411,9 +412,77 @@ exec 3<&-
 wait $sleeper
 echo 2 > /proc/sys/vm/drop_caches
 settle "$(printf 'd 0\nf1 0\nf2 0\nf3 0\ng 0')"
-umount z && echo unmounted
-sleep 0.5
-rm -f fz.py zs
+# Only the socket message holds the path when the node cache is reclaimed.
+python3 - <<'PYRIGHTS'
+import ctypes, os, socket
+libc = ctypes.CDLL(None, use_errno=True)
+sender, receiver = socket.socketpair()
+for fd in (os.open("z/f1", os.O_PATH), libc.syscall(428, -100, b"z/f2", 0)):  # open_tree
+    ino = os.fstat(fd).st_ino
+    socket.send_fds(sender, [b"x"], [fd])
+    os.close(fd)
+    with open("/proc/sys/vm/drop_caches", "w") as drop:
+        drop.write("2")
+    _, (fd,), _, _ = socket.recv_fds(receiver, 1, 1)
+    print("received O_PATH keeps inode", os.fstat(fd).st_ino == ino)
+    os.close(fd)
+sender.close()
+receiver.close()
+PYRIGHTS
+echo 2 > /proc/sys/vm/drop_caches
+settle "$(printf 'd 0\nf1 0\nf2 0\nf3 0\ng 0')"
+# Only sendmsg, then its queued message, holds this mount. After a lazy detach, its
+# daemon serves the received fd until the last unread copy is discarded.
+python3 - <<'PYMOUNT' || exit 1
+import ctypes, errno, os, socket, threading, time
+libc = ctypes.CDLL(None, use_errno=True)
+sender, receiver = socket.socketpair()
+receiver.settimeout(5)
+filled = 0
+while True:
+    try:
+        filled += sender.send(b"x" * 16384, socket.MSG_DONTWAIT)
+    except BlockingIOError:
+        break
+fd = os.open("z/f1", os.O_PATH)
+ino = os.fstat(fd).st_ino
+worker = threading.Thread(target=socket.send_fds, args=(sender, [b"r"], [fd]), daemon=True)
+worker.start()
+task = "/proc/self/task/%d/" % worker.native_id
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    with open(task + "stat") as st, open(task + "syscall") as call:
+        if st.read().rsplit(")", 1)[1].split()[0] == "S" and call.read().split()[0] == "211":
+            break
+    time.sleep(0.01)
+else:
+    raise RuntimeError("sender did not block in sendmsg")
+os.close(fd)
+def expect_busy(stage):
+    r = libc.umount2(b"z", 0)
+    assert r == -1 and ctypes.get_errno() == errno.EBUSY, (stage, r, ctypes.get_errno())
+    print("mount busy", stage)
+expect_busy("during send")
+while filled:
+    filled -= len(receiver.recv(min(filled, 65536)))
+worker.join(5)
+assert not worker.is_alive()
+expect_busy("while queued")
+assert libc.umount2(b"z", 2) == 0  # MNT_DETACH
+_, (fd,), _, _ = socket.recv_fds(receiver, 1, 1)
+assert os.fstat(fd).st_ino == ino
+socket.send_fds(sender, [b"d"], [fd])
+os.close(fd)
+receiver.close()
+sender.close()
+deadline = time.monotonic() + 5
+while not os.path.exists("fz-exited"):
+    if time.monotonic() >= deadline:
+        raise RuntimeError("FUSE daemon still serving after last queued fd was discarded")
+    time.sleep(0.01)
+print("detached mount released")
+PYMOUNT
+rm -f fz.py zs fz-exited
 echo "-- mount errors"
 python3 -c '
 import ctypes, errno, os

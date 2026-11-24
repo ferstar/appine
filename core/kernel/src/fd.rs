@@ -236,6 +236,8 @@ impl ProcEvent {
 pub struct OpenFile {
     /// A queue inode pinned by an O_PATH description, even after mq_unlink.
     pub(crate) mq_path: Option<Rc<RefCell<crate::syscall::MessageQueue>>>,
+    /// Keeps an O_PATH node in the FUSE cache for the lifetime of the description.
+    fuse_path: Option<Rc<()>>,
     /// The kind.
     pub kind: FileKind,
     /// Access mode and status flags (without `O_CLOEXEC`).
@@ -331,6 +333,7 @@ impl OpenFile {
         };
         Rc::new(RefCell::new(OpenFile {
             mq_path: None,
+            fuse_path: None,
             kind,
             flags: flags & !oflags::O_CLOEXEC,
             pos: 0,
@@ -354,6 +357,15 @@ impl OpenFile {
             pseudo: false,
             tree: None,
         }))
+    }
+
+    pub(crate) fn pin_fuse_path(&mut self, vfs: &crate::vfs::Vfs) -> Result<(), Errno> {
+        if let FileKind::Path(Node::Fuse(_, id)) = self.kind {
+            let mut fuse = vfs.fuse_mut();
+            let node = fuse.get_mut(id).ok_or(Errno::ENOTCONN)?;
+            self.fuse_path = Some(node.pin_path());
+        }
+        Ok(())
     }
 
     /// Whether it is readable.

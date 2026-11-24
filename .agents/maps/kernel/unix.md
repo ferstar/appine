@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 10 confirmed and 2 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: SCM_RIGHTS reservations across recvmsg output page fills)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: SCM_RIGHTS ownership before enqueue and mount accounting throughout transfer)
 
 ## Responsibilities
 
@@ -20,7 +20,8 @@ sockets:
 - socket options, poll/epoll readiness, wake objects, edge-triggered arrivals, `FIONREAD`, and
   `/proc/net/unix` enumeration;
 - a `unix_gc`-style collector breaking `Rc` cycles through in-flight `SCM_RIGHTS` messages, plus
-  in-flight snapshots for `/proc/net/unix`, read-only remounts and host-unshare rehoming.
+  in-flight snapshots for `/proc/net/unix`, unmount, detached mount collection, read-only remounts
+  and host-unshare rehoming.
 
 Root: `core/kernel/src/unix.rs`, `core/kernel/src/syscall/unix.rs`.
 
@@ -48,6 +49,8 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 - `Ucred` — kernel-space `(pid, uid, gid)` (global tgid, kuid, kgid) with 12-byte LE encoding.
 - `Name` — `Path(Ino)` or `Abstract(net_id, ty, bytes)`; `Names` (`Kernel::unix`) maps `Name` to
   `Weak<RefCell<Socket>>` plus kernel-wide `next_auto` counter.
+- `Kernel::unix_sending` holds weak references to `SendingRights`. A send with SCM_RIGHTS owns its
+  files from control-message validation until the first packet takes them or the send fails.
 - `Kernel::unix_inflight` — `Vec<Weak<RefCell<Channel>>>` of channels carrying `SCM_RIGHTS` fds.
 - `Kernel::unix_receiving` holds weak references to `PendingRights` deliveries. Each delivery owns
   its files and reserved descriptor numbers until recvmsg finishes its output copies.
@@ -64,7 +67,8 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   AIO `complete_polls`/`check_polls`, syscall dispatch end), `unix::collect` (also at `task::exit`
   when `last || fds_gone || take_deferred()`), `unix::proc_listing`, `unix::inflight_sockets`
   (`/proc/net/unix`) and `unix::inflight_files` (`sb_busy` remount checks and `opens_of`
-  host-unshare rehoming).
+  host-unshare rehoming). Mount accounting uses `try_inflight_files` so teardown can retry if a
+  channel is borrowed.
 
 ## Data flow / lifecycle
 
@@ -204,9 +208,9 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 ### Garbage collection (`unix::collect`)
 
 - Channels carrying `SCM_RIGHTS` register weak refs in `Kernel::unix_inflight` via `note_inflight`.
-  `inflight_files` and `inflight_sockets` enumerate queued files and pending recvmsg deliveries.
-  The latter hold external file references for GC. Dropping an unfinished delivery that holds an
-  AF_UNIX socket schedules deferred collection.
+  File and socket snapshots include pending sends, queued packets and pending recvmsg deliveries.
+  Pending sends and deliveries hold external references for cycle collection. A failed send that
+  still owns files, or a cancelled delivery holding a Unix socket, schedules deferred collection.
 - `unix::released` drops closed files and runs `unix::collect` when any was an AF_UNIX socket
   (called from `close`, `close_range`, `dup3`, `close_replaced`/seccomp `addfd`, `exec`, AIO
   `io_cancel`/`released`, `deliver` truncation, datagram `EFAULT` drop). `UnixSocket::drop` (when
@@ -235,7 +239,7 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   `accept4` fd reservation and `recvmsg` installation of pending rights.
 - `kernel/files` (`close`, `close_range`, `dup3`, `close_replaced`, `OpenFile::drop`, `splice_read`,
   `opens_of` -> `inflight_files`), `kernel/exec` (`exec` cloexec), `kernel/process` (last-thread
-  `task::exit`), `kernel/cred` (seccomp `addfd`), `kernel/mount` (`sb_busy` -> `inflight_files`),
+  `task::exit`), `kernel/cred` (seccomp `addfd`), `kernel/mount` (busy checks and collection),
   `kernel/procfs` (`/proc/net/unix`).
 
 ### Outbound

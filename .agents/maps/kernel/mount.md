@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: abort the FUSE connection before checking whether a forced unmount can remove the mount)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: SCM_RIGHTS mount references during send, queueing and receive)
 
 ## Responsibilities
 
@@ -262,9 +262,9 @@ Outside the module:
   the initial user namespace (`EPERM`, 6.1's `can_umount`). After validating the flags and mount,
   it aborts a FUSE mount's connection before checking whether the mount is busy.
   Without `MNT_DETACH`, the caller's root or a busy mount gives `EBUSY` (busy means submounts, task
-  roots/cwds, nodes of open fds, fds opened through an mqueue mount, pinned PTYs, mappings via
-  `Vma::mnt`, and running executables via `ExeFile::mnt` — not `mq_open` pseudo fds, sockets, or
-  loop devices' backing files). `MNT_DETACH` moves the subtree to the detached list, where nodes
+  roots/cwds, mount-bearing open files in fd tables or SCM_RIGHTS transfers, mappings via
+  `Vma::mnt`, and running executables via `ExeFile::mnt`). Files opened through an mqueue mount
+  and pinned PTYs count. Internal `mq_open` fds, sockets and loop backing files are excluded. `MNT_DETACH` moves the subtree to the detached list, where nodes
   keep working: the mount root and every unlocked mount below it lose their mount point, while a
   mount locked in place stays on its detached parent (6.1's `disconnect_mount`), so an fd kept in
   the detached tree still finds what hides a path.
@@ -297,8 +297,10 @@ Outside the module:
   `detach_store_point` or `defer_collect`), or when `has_dead_ns()` is true (such as closing an
   unattached `open_tree` fd); and at thread exit. So a lazily unmounted mount, detached mount-point
   subtree, unattached `open_tree` clone or tmpfs tree goes once its last use does, as with Linux's
-  last `mntput`. When the fd tables, address spaces or fs contexts are borrowed, collection is put
-  off kernel-wide via `Vfs::defer_collect()` (`Mounts::collect_pending`).
+  last `mntput`. Files held by a blocked Unix send, a queued packet or a pending recvmsg delivery
+  keep their mount alive. Final delivery transfers the reference to the fd table. Discarding the
+  last copy triggers the usual open-file release. When a holder or Unix channel is borrowed,
+  collection is put off kernel-wide via `Vfs::defer_collect()` (`Mounts::collect_pending`).
 
 ## Dependencies (inbound / outbound)
 
@@ -334,7 +336,8 @@ Outside the module:
   - new tmpfs and FUSE instances (`new_tmpfs`, `new_fuse`) and tmpfs reconfiguration.
 - `kernel/files`: the fd tables that `in_use`, `writers` and `sb_busy` scan, and memfds' seals
   (which files are memfds).
-- `kernel/unix`: files in flight in AF_UNIX messages (`sb_busy`).
+- `kernel/unix`: files in SCM_RIGHTS transfers for mount usage, detached mount collection,
+  instance remount checks and open_tree file updates.
 - `kernel/store`: link counts (`sb_busy`).
 - `kernel/exec`: running programs' exe files (`sb_busy`).
 - `kernel/overlay`: new overlayfs instances (`new_overlay`).
@@ -410,8 +413,8 @@ Outside the module:
 
 ## Open questions
 
-- Should loop devices' backing files (and other fds held outside fd tables) make a mount busy for
-  `umount2`, as they already do for remount's writer check?
+- Should loop devices' backing files make a mount busy for `umount2`, as they already do for
+  remount's writer check?
 - Should sysfs and cgroup2 mounted in different network or cgroup namespaces count as different
   instances for the same-instance `EBUSY`?
 

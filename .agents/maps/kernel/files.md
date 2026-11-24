@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: fd table capacity and reservations for received SCM_RIGHTS)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE node lifetime across O_PATH descriptor transfers)
 
 ## Responsibilities
 
@@ -146,7 +146,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   umask (`kernel/cred`: setgid stripped before the umask, setgid directories); a just-created file
   skips permission checks and truncation. `O_PATH` gives a `FileKind::Path` (`O_DIRECTORY` on a
   non-directory `ENOTDIR`). Store, overlay, FUSE and mqueue-mount nodes (`PseudoNode::Mq`) set the
-  file's mount. O_PATH on a queue pins its inode and quota until final release.
+  file's mount. O_PATH pins a queue's inode and quota or a FUSE node's cache entry until final
+  release, including while the description travels in an AF_UNIX message.
   A direct `mq_open` marks its descriptor `pseudo` for the internal mqueue instance.
 - Store nodes (`open_store`), unless just created: symlink `ELOOP`; a directory with write access,
   `O_CREAT` or `O_TRUNC` `EISDIR`; a regular file with `O_TRUNC` `EROFS` on ro, else it adds

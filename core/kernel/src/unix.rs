@@ -692,6 +692,39 @@ impl Channel {
 
 // ---- Received and in-flight files ----
 
+/// The files imported by sendmsg before its first packet is queued. Enumeration upgrades
+/// the weak registration only while snapshotting under the BKL.
+pub(crate) struct SendingRights {
+    files: Vec<FileRef>,
+}
+
+impl SendingRights {
+    pub fn track(k: &mut Kernel, files: Vec<FileRef>) -> Option<Rc<Self>> {
+        if files.is_empty() {
+            return None;
+        }
+        let pending = Rc::new(Self { files });
+        k.unix_sending.retain(|s| s.strong_count() != 0);
+        k.unix_sending.push(Rc::downgrade(&pending));
+        Some(pending)
+    }
+
+    pub fn into_packet(self: Rc<Self>, k: &mut Kernel, channel: &ChannelRef) -> Vec<FileRef> {
+        note_inflight(k, channel);
+        let mut pending = Rc::into_inner(self).expect("sendmsg owns its pending SCM_RIGHTS");
+        std::mem::take(&mut pending.files)
+    }
+}
+
+impl Drop for SendingRights {
+    fn drop(&mut self) {
+        // A failed send may have held the last external reference to a queued socket cycle.
+        if !self.files.is_empty() {
+            defer_collect();
+        }
+    }
+}
+
 /// SCM_RIGHTS numbers have been reserved and encoded in the control message. They remain
 /// unavailable to other threads until recvmsg finishes writing its result. The kernel tracks
 /// this delivery weakly so in-flight file enumerations still see its files during a page fill.
@@ -750,30 +783,36 @@ impl Drop for PendingRights {
 
 /// In-flight sockets (those only in `SCM_RIGHTS` messages): `/proc/net/unix` lists them too.
 pub(crate) fn inflight_sockets(k: &Kernel) -> Vec<Rc<RefCell<Socket>>> {
-    let mut out = Vec::new();
-    for delivery in k.unix_receiving.iter().filter_map(Weak::upgrade) {
-        out.extend(delivery.files.iter().filter_map(|(_, f)| unix_socket(f)));
-    }
-    for c in k.unix_inflight.iter().filter_map(Weak::upgrade) {
-        for p in &c.borrow().packets {
-            out.extend(p.fds.iter().filter_map(unix_socket));
-        }
-    }
-    out
+    collect_inflight(k, unix_socket).expect("in-flight AF_UNIX channels are available")
 }
 
 /// The open files carried by messages in flight (each as many times as it is carried).
 pub(crate) fn inflight_files(k: &Kernel) -> Vec<FileRef> {
+    try_inflight_files(k).expect("in-flight AF_UNIX channels are available")
+}
+
+/// Mount collection can retry when a channel is borrowed during teardown.
+pub(crate) fn try_inflight_files(k: &Kernel) -> Option<Vec<FileRef>> {
+    collect_inflight(k, |file| Some(file.clone()))
+}
+
+fn collect_inflight<T>(
+    k: &Kernel,
+    mut select: impl FnMut(&FileRef) -> Option<T>,
+) -> Option<Vec<T>> {
     let mut out = Vec::new();
-    for delivery in k.unix_receiving.iter().filter_map(Weak::upgrade) {
-        out.extend(delivery.files.iter().map(|(_, f)| f.clone()));
+    for sending in k.unix_sending.iter().filter_map(Weak::upgrade) {
+        out.extend(sending.files.iter().filter_map(&mut select));
     }
-    for c in k.unix_inflight.iter().filter_map(Weak::upgrade) {
-        for p in &c.borrow().packets {
-            out.extend(p.fds.iter().cloned());
+    for delivery in k.unix_receiving.iter().filter_map(Weak::upgrade) {
+        out.extend(delivery.files.iter().filter_map(|(_, file)| select(file)));
+    }
+    for channel in k.unix_inflight.iter().filter_map(Weak::upgrade) {
+        for packet in &channel.try_borrow().ok()?.packets {
+            out.extend(packet.fds.iter().filter_map(&mut select));
         }
     }
-    out
+    Some(out)
 }
 
 // ---- /proc/net/unix ----
@@ -863,7 +902,7 @@ pub(crate) fn is_unix_file(f: &FileRef) -> bool {
 }
 
 /// Records a channel whose messages carry open files; [`collect`] finds in-flight sockets here.
-pub(crate) fn note_inflight(k: &mut Kernel, c: &ChannelRef) {
+fn note_inflight(k: &mut Kernel, c: &ChannelRef) {
     let weak = Rc::downgrade(c);
     if !k.unix_inflight.iter().any(|w| w.ptr_eq(&weak)) {
         k.unix_inflight.push(weak);
@@ -1040,9 +1079,9 @@ mod tests {
 
     fn send(k: &mut Kernel, c: &ChannelRef, f: &FileRef) {
         let mut p = packet(b"x", 1);
-        p.fds.push(f.clone());
+        let rights = SendingRights::track(k, vec![f.clone()]).unwrap();
+        p.fds = rights.into_packet(k, c);
         c.borrow_mut().push(p);
-        note_inflight(k, c);
     }
 
     #[test]
@@ -1071,6 +1110,22 @@ mod tests {
         collect(&mut k);
         assert!(kept_c.upgrade().is_none() && kept_d.upgrade().is_none());
         assert!(inflight_sockets(&k).is_empty());
+    }
+
+    #[test]
+    fn failed_send_releases_the_last_external_reference_to_a_socket_cycle() {
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let (peer, file, channel) = pair();
+        send(&mut k, &channel, &file);
+        let weak = Rc::downgrade(&file);
+        let pending = SendingRights::track(&mut k, vec![file]).unwrap();
+        drop((peer, channel));
+        collect(&mut k);
+        assert!(weak.upgrade().is_some());
+
+        drop(pending);
+        collect_deferred(&mut k);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

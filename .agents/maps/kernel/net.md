@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: recvmsg output faults and per-record recvmmsg retries)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: raw ICMP echo sends and host retries)
 
 ## Responsibilities
 
@@ -165,7 +165,7 @@ listen notifications (`android/service`).
 
 - send (sendto, sendmsg, write; sendmmsg one message at a time): AF_UNIX goes to `kernel/unix`,
   netlink to `kernel/netlink`; DNS stub queries go to the stub (see below); raw ICMP sockets and
-  tapped UDP sockets call into `kernel/rawicmp` (`before_io`, `sent`, `take_errors`); inet
+  tapped UDP sockets call into `kernel/rawicmp` (`before_io`, `RawIcmp::send`, `take_errors`); inet
   destination addresses are validated for family and length (`inet_send_addr`, matching Linux 6.1)
   before routing or host calls; a connected
   datagram socket whose peer the filter blocked fails or drops and address-less UDP sends recheck

@@ -16,9 +16,9 @@
 //!   ([`check_taps`]).
 //! - **The echo id**: a ping socket replaces the id with its own number when sending an echo
 //!   request, and the replies carry that number too; a raw socket sends it unchanged, and programs
-//!   (busybox's ping uses the pid) recognize replies by their own id. The id the guest sent last
-//!   is recorded, and received echo replies and the echo requests quoted in error messages get it
-//!   back, with the checksum updated along with it.
+//!   (busybox's ping uses the pid) recognize replies by their own id. The tap assigns a sequence number on the wire
+//!   so even requests with identical guest sequences can be told apart. Replies and quoted
+//!   requests get the guest's id and sequence back, with the checksum updated.
 //! - **The IPv4 IP header**: data received on a raw socket includes the IP header, so a 20-byte
 //!   header is assembled here ([`present`]): TTL and destination address come from the host's
 //!   `IP_TTL` and `IP_PKTINFO` control messages (always enabled on the host, and not passed to the
@@ -35,6 +35,7 @@
 //!
 //! [`present`]: RawIcmp::present
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 
@@ -86,12 +87,10 @@ const QUEUE_MAX: usize = 212_992;
 /// Room for control messages the host may leave when sending and receiving.
 const CONTROL_ROOM: usize = 512;
 
-/// The guest raw ICMP socket's own state: options, the id of the last echo sent, and its
+/// The guest raw ICMP socket's own state: options and its
 /// aggregation point.
 pub(crate) struct RawIcmp {
     family: i32,
-    /// The id of the last echo request the guest sent (network byte order).
-    id: Option<[u8; 2]>,
     /// The filter; types whose bit is set are dropped (Linux stores it as a u32 array, and IPv4
     /// uses only the first).
     filter: [u8; 32],
@@ -112,7 +111,6 @@ impl RawIcmp {
     pub fn new(family: i32, tap: Rc<RefCell<Tap>>) -> RawIcmp {
         RawIcmp {
             family,
-            id: None,
             filter: [0; 32],
             recvttl: false,
             pktinfo: false,
@@ -201,15 +199,43 @@ impl RawIcmp {
         }))
     }
 
-    /// The guest sends a message: when it is an echo request, record its id.
-    pub fn sent(&mut self, data: &[u8]) {
-        if data.len() >= 8 && data[0] == self.echo().0 {
-            self.id = Some([data[4], data[5]]);
+    /// Sends one host datagram under the BKL. A failed attempt consumes no sequence number.
+    pub fn send(
+        &self,
+        fd: i32,
+        data: &[u8],
+        send: impl FnOnce(&[u8]) -> Result<usize, i32>,
+    ) -> Result<usize, i32> {
+        if data.len() < 8 || data[0] != echo_types(self.family).0 {
+            return send(data);
         }
-    }
-
-    fn echo(&self) -> (u8, u8) {
-        echo_types(self.family)
+        let mut tap = self.tap.borrow_mut();
+        let guest = [data[4], data[5], data[6], data[7]];
+        let wire = tap
+            .echoes
+            .next
+            .unwrap_or(u16::from_be_bytes([data[6], data[7]]));
+        let n = if data[6..8] == wire.to_be_bytes() {
+            send(data)?
+        } else {
+            let mut packet = data.to_vec();
+            packet[6..8].copy_from_slice(&wire.to_be_bytes());
+            // Host ping sockets compute the checksum after supplying their own id.
+            send(&packet)?
+        };
+        // The host assigns the ping ident on the first successful send if it was not bound.
+        let host_id = appine_hal::net::sockname(fd, false)
+            .ok()
+            .and_then(|a| a.get(2..4)?.try_into().ok());
+        tap.echoes.record(
+            wire,
+            EchoRequest {
+                family: self.family,
+                host_id,
+                guest,
+            },
+        );
+        Ok(n)
     }
 
     /// Whether a message of type `ty` passes the filter.
@@ -319,6 +345,7 @@ pub(crate) struct Tap {
     watch: Watch,
     /// Its network namespace; None is the boot one.
     net: Option<Rc<NetNs>>,
+    echoes: Echoes,
     sources: Vec<Source>,
     receivers: Vec<Receiver>,
 }
@@ -422,6 +449,7 @@ pub(crate) fn tap_for(k: &mut Kernel, net: &Option<Rc<NetNs>>) -> Result<Rc<RefC
     let tap = Rc::new(RefCell::new(Tap {
         watch: Watch::new().map_err(Errno)?,
         net: net.clone(),
+        echoes: Echoes::default(),
         sources: Vec::new(),
         receivers: Vec::new(),
     }));
@@ -711,7 +739,6 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
             .filter_map(|s| Some((s.fd, s.sock.upgrade()?, s.family, s.udp, s.key)))
             .collect()
     };
-    let ids = guest_ids(tap);
     let mut items = Vec::new();
     let mut arrivals = Vec::new();
     let mut buf = vec![0u8; PACKET_MAX];
@@ -735,12 +762,11 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
         let net = tap.borrow().net.clone();
         let flags = MSG_ERRQUEUE | MSG_DONTWAIT;
         while let Ok(r) = appine_hal::net::recvmsg(fd, &mut buf, CONTROL_ROOM, flags) {
-            let data = &buf[..r.len.min(buf.len())];
-            let it = match family {
-                AF_INET => error_v4(fd, udp, &ids, key, data, &r),
-                _ => error_v6(fd, udp, &ids, key, data, &r),
-            };
-            let Some((it, errno, original)) = it else {
+            let len = r.len.min(buf.len());
+            let original = &mut buf[..len];
+            let Some((it, errno)) =
+                error_message(fd, family, udp, &tap.borrow().echoes, key, original, &r)
+            else {
                 continue;
             };
             // Only for comparing with the connected peer: addresses of other namespaces are not
@@ -757,17 +783,16 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
             };
             let to_peer = peer.as_ref().is_some_and(|p| same_peer(p, &dst, udp));
             if recverr {
-                let e = ErrItem {
-                    data: original,
-                    addr: r.addr.clone(),
-                    control: r.control.clone(),
-                    errno,
-                };
                 let mut t = tap.borrow_mut();
                 if let Some(rx) = t.receivers.iter_mut().find(|rx| rx.key == key)
                     && rx.errors.len() < 64
                 {
-                    rx.errors.push_back(e);
+                    rx.errors.push_back(ErrItem {
+                        data: original.to_vec(),
+                        addr: r.addr.clone(),
+                        control: r.control.clone(),
+                        errno,
+                    });
                 }
             }
             if recverr || to_peer && hard(family, it.icmp[0], it.icmp[1]) {
@@ -784,7 +809,7 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
         while let Ok(r) = appine_hal::net::recvmsg(fd, &mut buf, CONTROL_ROOM, MSG_DONTWAIT) {
             let mut icmp = buf[..r.len.min(buf.len())].to_vec();
             if icmp.first() == Some(&echo_types(family).1) {
-                restore_id(&mut icmp, &ids);
+                tap.borrow().echoes.restore(family, &mut icmp);
             }
             arrivals.push(Arrival {
                 sock: sock.clone(),
@@ -800,32 +825,23 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
     arrivals
 }
 
-/// The numbers (echo ids) of the ping sockets of the raw sockets on the host, and the ids the guest
-/// sent last. Replies and errors do not necessarily reach the ping socket that sent the request:
-/// the guest may bind the receiving socket to the sending socket's address (busybox's
-/// traceroute), and the host finds the socket by number, which finds the one bound first.
-fn guest_ids(tap: &Rc<RefCell<Tap>>) -> Vec<([u8; 2], [u8; 2])> {
-    let socks: Vec<_> = tap
-        .borrow()
-        .sources
-        .iter()
-        .filter(|s| !s.udp)
-        .filter_map(|s| s.sock.upgrade())
-        .collect();
-    socks
-        .iter()
-        .filter_map(|sock| {
-            let Socket::Inet(InetSocket {
-                icmp: Some(r), fd, ..
-            }) = &*sock.borrow()
-            else {
-                return None;
-            };
-            let guest = r.id?;
-            let name = appine_hal::net::sockname(*fd, false).ok()?;
-            Some((name.get(2..4)?.try_into().ok()?, guest))
-        })
-        .collect()
+/// Restore the guest request in place so the ICMP quote and MSG_ERRQUEUE report the same bytes.
+fn error_message(
+    fd: i32,
+    family: i32,
+    udp: bool,
+    echoes: &Echoes,
+    key: usize,
+    original: &mut [u8],
+    r: &appine_hal::net::Received,
+) -> Option<(Item, i32)> {
+    if !udp && original.first() == Some(&echo_types(family).0) {
+        echoes.restore(family, original);
+    }
+    match family {
+        AF_INET => error_v4(fd, udp, key, original, r),
+        _ => error_v6(fd, udp, key, original, r),
+    }
 }
 
 /// Reassembles an IPv4 error-queue entry into an ICMP error message: type, code, the attached
@@ -836,11 +852,10 @@ fn guest_ids(tap: &Rc<RefCell<Tap>>) -> Vec<([u8; 2], [u8; 2])> {
 fn error_v4(
     fd: i32,
     udp: bool,
-    ids: &[([u8; 2], [u8; 2])],
     key: usize,
     data: &[u8],
     r: &appine_hal::net::Received,
-) -> Option<(Item, i32, Vec<u8>)> {
+) -> Option<(Item, i32)> {
     let (ee, offender) = extended_err(&r.control, SOL_IP, IP_RECVERR, SO_EE_ORIGIN_ICMP)?;
     let (ty, code) = (ee[5], ee[6]);
     let info = u32::from_le_bytes(ee[8..12].try_into().unwrap());
@@ -867,9 +882,7 @@ fn error_v4(
             .unwrap_or(ours),
         _ => ours,
     };
-    let (sport, dport) = ports(&local, &r.addr);
-    let inner = quoted(udp, ids, ICMP_ECHO, data, &sport, &dport);
-    let original = quoted(false, ids, ICMP_ECHO, data, &[], &[]);
+    let inner = quoted(udp, data, &local, &r.addr);
     let mut ip = vec![0u8; 20];
     ip[0] = 0x45;
     ip[2..4].copy_from_slice(&((20 + inner.len()).min(0xffff) as u16).to_be_bytes());
@@ -896,11 +909,7 @@ fn error_v4(
     let sum = checksum(&icmp);
     icmp[2..4].copy_from_slice(&sum);
     it.icmp = icmp;
-    Some((
-        it,
-        i32::from_le_bytes(ee[..4].try_into().unwrap()),
-        original,
-    ))
+    Some((it, i32::from_le_bytes(ee[..4].try_into().unwrap())))
 }
 
 /// Reassembles an IPv6 error-queue entry into an ICMPv6 error message (the same as [`error_v4`],
@@ -908,11 +917,10 @@ fn error_v4(
 fn error_v6(
     fd: i32,
     udp: bool,
-    ids: &[([u8; 2], [u8; 2])],
     key: usize,
     data: &[u8],
     r: &appine_hal::net::Received,
-) -> Option<(Item, i32, Vec<u8>)> {
+) -> Option<(Item, i32)> {
     let (ee, offender) = extended_err(&r.control, SOL_IPV6, IPV6_RECVERR, SO_EE_ORIGIN_ICMP6)?;
     let (ty, code) = (ee[5], ee[6]);
     let info = u32::from_le_bytes(ee[8..12].try_into().unwrap());
@@ -929,9 +937,7 @@ fn error_v6(
         ours = a;
     }
     let ours = &ours[..];
-    let (sport, dport) = ports(&local, &r.addr);
-    let inner = quoted(udp, ids, ICMPV6_ECHO_REQUEST, data, &sport, &dport);
-    let original = quoted(false, ids, ICMPV6_ECHO_REQUEST, data, &[], &[]);
+    let inner = quoted(udp, data, &local, &r.addr);
     let mut icmp = vec![ty, code, 0, 0, 0, 0, 0, 0];
     if matches!(ty, ICMPV6_PKT_TOOBIG | ICMPV6_PARAMPROB) {
         icmp[4..8].copy_from_slice(&info.to_be_bytes());
@@ -968,7 +974,6 @@ fn error_v6(
             origin: key,
         },
         errno,
-        original,
     ))
 }
 
@@ -979,39 +984,19 @@ fn extended_err(control: &[u8], level: i32, name: i32, origin: u8) -> Option<(&[
     (data.len() >= 16 && data[4] == origin).then(|| (&data[..16], &data[16..]))
 }
 
-/// The ports (network byte order) in the local address and the original destination address, 0
-/// when unavailable.
-fn ports(local: &[u8], dst: &[u8]) -> ([u8; 2], [u8; 2]) {
-    let port = |a: &[u8]| a.get(2..4).map_or([0; 2], |p| [p[0], p[1]]);
-    (port(local), port(dst))
-}
-
-/// The quoted original message: an ICMP echo request gets the guest's id back; for UDP a UDP
-/// header is added (the error queue gives only the payload; the ports come from the local address
-/// and the original destination address).
-fn quoted(
-    udp: bool,
-    ids: &[([u8; 2], [u8; 2])],
-    echo: u8,
-    data: &[u8],
-    sport: &[u8],
-    dport: &[u8],
-) -> Vec<u8> {
-    if udp {
-        let mut u = Vec::with_capacity(8 + data.len());
-        u.extend_from_slice(sport);
-        u.extend_from_slice(dport);
-        u.extend_from_slice(&((8 + data.len()).min(0xffff) as u16).to_be_bytes());
-        u.extend_from_slice(&[0, 0]);
-        u.extend_from_slice(data);
-        u
-    } else {
-        let mut d = data.to_vec();
-        if d.first() == Some(&echo) {
-            restore_id(&mut d, ids);
-        }
-        d
+/// Only UDP needs a header prepended: its error queue gives just the payload.
+fn quoted<'a>(udp: bool, data: &'a [u8], local: &[u8], dst: &[u8]) -> Cow<'a, [u8]> {
+    if !udp {
+        return Cow::Borrowed(data);
     }
+    let port = |addr: &[u8]| addr.get(2..4).map_or([0; 2], |p| [p[0], p[1]]);
+    let mut packet = Vec::with_capacity(8 + data.len());
+    packet.extend_from_slice(&port(local));
+    packet.extend_from_slice(&port(dst));
+    packet.extend_from_slice(&((8 + data.len()).min(0xffff) as u16).to_be_bytes());
+    packet.extend_from_slice(&[0, 0]);
+    packet.extend_from_slice(data);
+    Cow::Owned(packet)
 }
 
 /// The destination address `dst` of the failed message is the peer `peer` the socket is connected
@@ -1057,15 +1042,52 @@ fn echo_types(family: i32) -> (u8, u8) {
     }
 }
 
-/// When the id of an echo message is the number of a ping socket on the host, replaces it with the
-/// id the guest sent from that socket ([`guest_ids`]), updating the checksum incrementally.
-fn restore_id(icmp: &mut [u8], ids: &[([u8; 2], [u8; 2])]) {
-    if icmp.len() >= 6
-        && let Some(&(_, id)) = ids.iter().find(|(host, _)| icmp[4..6] == *host)
-    {
-        let sum = csum_replace([icmp[2], icmp[3]], [icmp[4], icmp[5]], id);
-        icmp[2..4].copy_from_slice(&sum);
-        icmp[4..6].copy_from_slice(&id);
+struct EchoRequest {
+    family: i32,
+    host_id: Option<[u8; 2]>,
+    guest: [u8; 4],
+}
+
+/// Sequence numbers are shared across the tap: replies and errors can reach a different
+/// ping socket with the same host ident. Keep one full sequence space, including duplicates'
+/// mappings after the first reply.
+#[derive(Default)]
+struct Echoes {
+    next: Option<u16>,
+    requests: VecDeque<EchoRequest>,
+}
+
+impl Echoes {
+    fn record(&mut self, wire: u16, request: EchoRequest) {
+        if self.requests.len() == 1 << 16 {
+            self.requests.pop_front();
+        }
+        self.requests.push_back(request);
+        self.next = Some(wire.wrapping_add(1));
+    }
+
+    fn restore(&self, family: i32, icmp: &mut [u8]) {
+        let Some(header) = icmp.first_chunk_mut::<8>() else {
+            return;
+        };
+        let Some(next) = self.next else { return };
+        let wire = u16::from_be_bytes([header[6], header[7]]);
+        let age = usize::from(next.wrapping_sub(1).wrapping_sub(wire));
+        let Some(request) = self.requests.iter().rev().nth(age) else {
+            return;
+        };
+        if request.family != family || request.host_id != Some([header[4], header[5]]) {
+            return;
+        }
+        let [id0, id1, seq0, seq1] = request.guest;
+        let sum = csum_replace([header[2], header[3]], [header[4], header[5]], [id0, id1]);
+        let sum = csum_replace(sum, wire.to_be_bytes(), [seq0, seq1]);
+        header[2..4].copy_from_slice(&sum);
+        header[4..8].copy_from_slice(&request.guest);
+        // An all-zero IPv4 echo reply has checksum 0xffff (positive zero before complement).
+        if family == AF_INET && sum == [0, 0] && icmp.iter().all(|&b| b == 0) {
+            icmp[2..4].fill(0xff);
+        }
     }
 }
 
@@ -1224,23 +1246,59 @@ mod tests {
         e
     }
 
-    const IDS: [([u8; 2], [u8; 2]); 1] = [([0x05, 0x97], [0x12, 0x34])];
+    fn echoes() -> Echoes {
+        let mut echoes = Echoes::default();
+        echoes.record(
+            7,
+            EchoRequest {
+                family: AF_INET,
+                host_id: Some([0x05, 0x97]),
+                guest: [0x12, 0x34, 0, 19],
+            },
+        );
+        echoes
+    }
+
+    #[test]
+    fn reordered_and_duplicate_replies_across_sequence_wrap() {
+        let mut echoes = Echoes::default();
+        for (wire, id) in [(u16::MAX, 1), (0, 2)] {
+            echoes.record(
+                wire,
+                EchoRequest {
+                    family: AF_INET,
+                    host_id: Some([5, 7]),
+                    guest: [0, id, 0, 42],
+                },
+            );
+        }
+        for (wire, id) in [(0u16, 2), (u16::MAX, 1), (0, 2)] {
+            let [hi, lo] = wire.to_be_bytes();
+            let mut reply = [0, 0, 0, 0, 5, 7, hi, lo];
+            let sum = checksum(&reply);
+            reply[2..4].copy_from_slice(&sum);
+            echoes.restore(AF_INET, &mut reply);
+            assert_eq!(reply[4..], [0, id, 0, 42]);
+            assert_eq!(checksum(&reply), [0, 0]);
+        }
+    }
 
     #[test]
     fn replies_get_the_guest_id_and_an_ip_header() {
         let mut reply = echo(ICMP_ECHOREPLY);
-        restore_id(&mut reply, &IDS);
-        assert_eq!(reply[4..6], [0x12, 0x34]);
+        echoes().restore(AF_INET, &mut reply);
+        assert_eq!(reply[4..8], [0x12, 0x34, 0, 19]);
         assert_eq!(
             checksum(&reply),
             [0, 0],
             "the checksum is updated along with it"
         );
         let mut other = echo(ICMP_ECHOREPLY);
-        restore_id(&mut other, &[([9, 9], [1, 1])]);
+        other[4] = 9;
+        let original = other.clone();
+        echoes().restore(AF_INET, &mut other);
         assert_eq!(
-            other,
-            echo(ICMP_ECHOREPLY),
+            other, original,
             "ids that are not the number of a raw socket on the host are not replaced"
         );
 
@@ -1251,6 +1309,7 @@ mod tests {
         let tap = Rc::new(RefCell::new(Tap {
             watch: Watch::new().unwrap(),
             net: None,
+            echoes: Echoes::default(),
             sources: Vec::new(),
             receivers: Vec::new(),
         }));
@@ -1291,10 +1350,11 @@ mod tests {
         control.extend(cmsg(SOL_IP, IP_TTL, &63i32.to_le_bytes()));
         control.extend(cmsg(SOL_IP, IP_RECVERR, &ee));
         let r = received(sockaddr_in([1, 1, 1, 1], 0), control);
-        let request = echo(ICMP_ECHO);
-        let (it, errno, original) = error_v4(-1, false, &IDS, 3, &request, &r).unwrap();
+        let mut original = echo(ICMP_ECHO);
+        let (it, errno) =
+            error_message(-1, AF_INET, false, &echoes(), 3, &mut original, &r).unwrap();
         assert_eq!(errno, 113);
-        assert_eq!(original[4..6], [0x12, 0x34]);
+        assert_eq!(original[4..8], [0x12, 0x34, 0, 19]);
         assert_eq!(it.src, sockaddr_in([10, 0, 0, 254], 0));
         assert_eq!(it.ttl, Some(63));
         assert!(it.other.is_empty());
@@ -1316,7 +1376,7 @@ mod tests {
         // UDP: the error queue holds only the payload, and a UDP header is added (the destination
         // port comes from the original destination address)
         let r = received(sockaddr_in([127, 0, 0, 1], 33434), r.control.clone());
-        let (it, ..) = error_v4(-1, true, &[], 3, b"abcd", &r).unwrap();
+        let (it, ..) = error_v4(-1, true, 3, b"abcd", &r).unwrap();
         let udp = &it.icmp[28..];
         assert_eq!(it.icmp[8 + 9], IPPROTO_UDP as u8);
         assert_eq!(udp[2..6], [0x82, 0x9a, 0, 12]);
@@ -1329,7 +1389,7 @@ mod tests {
             sockaddr_in([1, 1, 1, 1], 0),
             cmsg(SOL_IP, IP_RECVERR, &local),
         );
-        assert!(error_v4(-1, false, &[], 3, &request, &r).is_none());
+        assert!(error_v4(-1, false, 3, &original, &r).is_none());
     }
 
     #[test]

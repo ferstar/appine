@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: device and inode lookup for socket and PTY lock listings)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: utimensat ownership checks and FUSE path descriptor pins)
 
 ## Responsibilities
 
@@ -255,10 +255,10 @@ capabilities (`kernel/cred`).
   `chown(-1, -1)` by another user fails on `su` but succeeds on a file with only caps (which lose
   them, as on Linux). Writes and truncation clear set-id bits through `kernel/fileio`'s
   `remove_privs`.
-- utimensat: explicit times need the owner or `CAP_FOWNER`; `UTIME_NOW`/`UTIME_OMIT` only (one of
-  each included) also accept write permission; the both-`UTIME_OMIT` shortcut runs after
-  resolution. On synthetic nodes other than devpts terminals, message queues and the mqueue root,
-  chmod, chown and utimensat are `EROFS` on a read-only mount and `EACCES` otherwise by path,
+- utimensat accepts write permission for NULL times or two `UTIME_NOW` fields. Two `UTIME_OMIT`
+  fields succeed after resolution. Explicit times and mixed NOW/OMIT require the owner or
+  `CAP_FOWNER` where the kernel checks permissions. On synthetic nodes other than devpts terminals,
+  message queues and the mqueue root, chmod, chown and utimensat are `EROFS` on a read-only mount and `EACCES` otherwise by path,
   `EBADF` by fd before any `EROFS` (cgroup2 nodes included); sockets and anonymous pipes accept
   them by fd and change nothing, other anonymous fds are `EBADF`.
 - mknodat, after resolution and the `.`/`..` `EEXIST`: regular, char, block, FIFO, socket
@@ -343,9 +343,9 @@ capabilities (`kernel/cred`).
 
 - A node's mount is part of its identity: `..`, root checks, `BENEATH`, `EXDEV` and busy checks
   all compare mounts, so binds of one filesystem are distinct.
-- `Node` values are held without counting (cwds, roots, open files, mounts, inotify watches):
-  `kernel/fuse` may forget a FUSE node between syscalls only when its scan finds none, so a new
-  long-lived holder of FUSE nodes must join that scan.
+- A `Node` value alone does not pin a FUSE cache entry. FUSE path descriptors pin the entry for
+  their lifetime. Other long-lived holders such as cwds, mounts and inotify watches participate
+  in the FUSE sweep's in-use scan.
 - `mounted()` matches a whole node, so a mount on a file shows through every hard link to it in
   that mount; the process root itself is never lifted (a mount on `/` is not seen by absolute
   lookups or `..`).
@@ -386,8 +386,6 @@ capabilities (`kernel/cred`).
   - fstat of an open PTY reports `st_blksize` 4096 (stat by path 1024), epoll's fdinfo shows the
     root filesystem's device for tmpfs files and an anonymous one for overlay and FUSE files, and
     fstatfs of a FIFO reports pipefs;
-  - utimensat with one `UTIME_NOW` and one `UTIME_OMIT` passes on write permission (Linux wants
-    the owner unless both are `UTIME_NOW`);
   - chmod and chown of cgroup2 nodes are refused, where kernfs lets a privileged caller chown them
     (systemd's cgroup delegation does), and cgroup mkdir reports `EROFS` before `EEXIST`;
   - readlink of `/proc/<pid>/cwd` for a removed cwd is `ENOENT` (Linux appends ` (deleted)`);

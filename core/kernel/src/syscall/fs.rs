@@ -678,7 +678,9 @@ fn open_path_with(
         file.borrow_mut().mnt = mnt;
     }
     if let Some(mnt) = fuse_mnt {
-        file.borrow_mut().mnt = mnt;
+        let mut f = file.borrow_mut();
+        f.pin_fuse_path(&vfs)?;
+        f.mnt = mnt;
     }
     if let Some(mnt) = mq_mnt {
         file.borrow_mut().mnt = mnt;
@@ -8004,7 +8006,7 @@ pub(super) fn utimensat(
     };
     // times[0] is atime and times[1] is mtime. The current time is taken by the store (for
     // regular files it is left to the host)
-    let (atime, mtime, explicit) = if times == 0 {
+    let (atime, mtime, needs_owner) = if times == 0 {
         (Some(FileTime::Now), Some(FileTime::Now), false)
     } else {
         let b: [u8; 32] = get(cx, times)?;
@@ -8017,23 +8019,20 @@ pub(super) fn utimensat(
         if word(1) == UTIME_OMIT && word(3) == UTIME_OMIT {
             return Ok(0);
         }
-        let explicit = [word(1), word(3)]
-            .iter()
-            .any(|&n| n != UTIME_NOW && n != UTIME_OMIT);
+        let needs_owner = word(1) != UTIME_NOW || word(3) != UTIME_NOW;
         let time = |sec: i64, nsec: i64| match nsec {
             UTIME_OMIT => None,
             UTIME_NOW => Some(FileTime::Now),
             nsec => Some(FileTime::At(sec * 1_000_000_000 + nsec)),
         };
-        (time(word(0), word(1)), time(word(2), word(3)), explicit)
+        (time(word(0), word(1)), time(word(2), word(3)), needs_owner)
     };
-    // Only the owner can set given times; write permission also allows setting the current
-    // time
+    // Write permission suffices only when both timestamps are set to now.
     if target.checked(cx)? {
         let st = target.stat(cx)?;
         let cred = cx.cred();
         if !cred.owns(&st) {
-            if explicit {
+            if needs_owner {
                 return Err(Errno::EPERM);
             }
             if let Attrs::Fuse(id, _) = target {

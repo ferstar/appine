@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: mapped page fills during socket and batch receive output)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE path descriptions pin cached nodes across SCM_RIGHTS transfers)
 
 ## Responsibilities
 
@@ -206,9 +206,9 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   of a syscall. It keeps what `in_use` finds (every task's root and cwd, the node of every open
   file in every fd table, O_PATH ones included, every running program's key, every mount's root
   and point attached or detached, every inotify watch), each connection's roots, nodes with an
-  open handle, and nodes a request in flight is about (its node, and a rename's other directory or
-  a link's file), plus the directories all of these lie in; it gives up for now when something is
-  borrowed. `evict` then forgets leaves (nodes no other node lies in), oldest entered first, round
+  open handle or live O_PATH description, and nodes a request in flight refers to (its node, a
+  rename's other directory, or a link's file). It keeps their ancestor directories and retries if
+  it finds a borrow. `evict` then forgets leaves (nodes no other node lies in), oldest entered first, round
   after round: all it may with `drop_caches`, otherwise down to 12288. A forgotten node leaves the
   table and the node-id index, the names naming it go with negative entries no longer valid, and
   its `nlookup` is queued as a forget and the readers woken. A node id looked up again is a new
@@ -398,9 +398,9 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - The type of a node never changes; a reply giving another type is EIO (getattr, setattr) or a new
   node (lookup).
 - Nodes are forgotten only between syscalls (`sweep`), so a `FuseId` in a syscall's locals stays
-  valid; across a wait it stays valid only while an open handle, a request in flight or one of
-  `in_use`'s holders keeps it. Code keeping a `Node::Fuse` somewhere new across syscalls must be
-  added to `in_use`.
+  valid. A path description from open or open_tree holds a shared pin for its cache entry,
+  including while its only reference is in an AF_UNIX message. Other holders across waits need
+  a daemon handle, a pending request or a reference visible to `in_use`.
 
 ## Confirmed bugs / technical debt
 
@@ -410,10 +410,9 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   writing through `MAP_SHARED` fail on FUSE); reads and writes always reach the daemon (no
   read-ahead for read(2), writeback or readdirplus).
 - **Forgetting is coarser than Linux's:** nodes go only above 16384 or with `drop_caches`, not when
-  a file unlinked through the mount is no longer used (Linux forgets it at once); an O_PATH
-  descriptor in flight in an `SCM_RIGHTS` message does not keep its node, which then answers
-  ENOTCONN; and when nothing can go (everything above the limit in use) every new entry makes the
-  next syscall's end scan every task again.
+  a file unlinked through the mount is no longer used (Linux forgets it at once). When every
+  node above the limit is in use, each new entry makes the next syscall's end scan every task
+  again.
 - **Locks stay local:** POSIX, OFD and flock locks on FUSE files work only between processes of this
   kernel; the daemon never sees them.
 - **Missing pieces:** no `fuseblk` (ntfs-3g), no fusectl (`/sys/fs/fuse/connections` and its

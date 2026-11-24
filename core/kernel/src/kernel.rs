@@ -204,6 +204,8 @@ pub(crate) struct Kernel {
     pub unix: crate::unix::Names,
     /// AF_UNIX channels with open files in their messages (for `unix::collect`).
     pub unix_inflight: Vec<Weak<RefCell<crate::unix::Channel>>>,
+    /// SCM_RIGHTS held by sendmsg before the first bytes are queued.
+    pub unix_sending: Vec<Weak<crate::unix::SendingRights>>,
     /// Dequeued SCM_RIGHTS being copied to a receiver's control buffer.
     pub unix_receiving: Vec<Weak<crate::unix::PendingRights>>,
     /// Named pipes (FIFOs) currently open: all opens of one inode share one pipe object.
@@ -386,6 +388,7 @@ impl Kernel {
             )]),
             unix: Default::default(),
             unix_inflight: Vec::new(),
+            unix_sending: Vec::new(),
             unix_receiving: Vec::new(),
             fifos: BTreeMap::new(),
             loops: crate::syscall::Loops::new(),

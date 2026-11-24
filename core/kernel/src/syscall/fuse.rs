@@ -1481,8 +1481,8 @@ pub(super) fn prefault(cx: &mut Cx<'_>, nr: u64, a: &[u64; 6]) {
 
 /// Forgets the FUSE nodes nothing uses when the cache asked for it ([`fuse::SWEEP`]: it grew too
 /// large, or `drop_caches`), at the end of a syscall, when no syscall of this thread holds a node.
-/// Other threads hold nodes only through what [`in_use`] finds, open handles and requests in
-/// flight ([`fuse::Fuses::evict`]).
+/// Other threads hold nodes through what [`in_use`] finds, O_PATH pins, open handles and
+/// requests in flight ([`fuse::Fuses::evict`]).
 pub(super) fn sweep(cx: &Cx<'_>) {
     use std::sync::atomic::Ordering::Relaxed;
     if !fuse::SWEEP.load(Relaxed) || !fuse::SWEEP.swap(false, Relaxed) {

@@ -2701,9 +2701,6 @@ pub(crate) fn send(
             if s.ty == SOCK_STREAM && s.pending_err.get() != 0 {
                 return Err(Errno(s.pending_err.replace(0)));
             }
-            if let Some(r) = &mut s.icmp {
-                r.sent(data);
-            }
             let to_stub = stub_capable(s) && (is_stub(addr) || (addr.is_empty() && s.stub_peer));
             (s.fd, s.ty, s.sndtimeo, to_stub)
         }
@@ -2931,13 +2928,23 @@ pub(crate) fn send(
     let mut done = 0;
     let mut sent_datagram = false;
     let r = loop {
-        let r = appine_hal::net::sendmsg(
-            host_fd,
-            &data[done..],
-            addr,
-            control,
-            flags as i32 & !(MSG_DONTWAIT | MSG_NOSIGNAL) as i32,
-        );
+        let send = |payload: &[u8]| {
+            appine_hal::net::sendmsg(
+                host_fd,
+                payload,
+                addr,
+                control,
+                flags as i32 & !(MSG_DONTWAIT | MSG_NOSIGNAL) as i32,
+            )
+        };
+        let r = if tap.is_some()
+            && let Socket::Inet(s) = &*sock.borrow()
+            && let Some(raw) = &s.icmp
+        {
+            raw.send(host_fd, data, send)
+        } else {
+            send(&data[done..])
+        };
         match r {
             Ok(n) => {
                 done += n;
