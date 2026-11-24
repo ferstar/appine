@@ -1564,11 +1564,12 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
         }
         // The main thread is traced by the caller: stops and continues are reported as
         // ptrace-stops (below), and as on Linux not reported twice
-        let traced = cx
-            .kr()
-            .tasks
-            .get(&c)
-            .is_some_and(|t| t.trace.borrow().tracer == Some(me));
+        let traced = child.borrow().leader_tracer == Some(me)
+            || cx
+                .kr()
+                .tasks
+                .get(&c)
+                .is_some_and(|t| t.trace.borrow().tracer == Some(me));
         let clone = child.borrow().exit_signal != Signal::CHLD.number();
         if !traced && want.clones.is_some_and(|c| c != clone) {
             continue;

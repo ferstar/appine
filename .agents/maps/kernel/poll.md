@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-17 (full mapping: 3 research concerns, 14 claims checked by 2 independent verifiers)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pselect6 retains the fd table scan range after close)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pipe write readiness and edge notifications follow released page slots)
 
 ## Responsibilities
 
@@ -78,7 +78,7 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   Host stdio and ordinary inet sockets supply an fd. Queued DNS answers on an untapped UDP socket
   supply guest bits alone. A tapped UDP socket can supply both guest bits and its host fd. Other
   readiness sources include pipes (a write end `POLLOUT` with
-  `PIPE_BUF` free, plus `POLLERR` without readers, as `pipe_poll`) and eventfd inline; timerfd
+  a free page slot, plus `POLLERR` without readers, as `pipe_poll`) and eventfd inline; timerfd
   (expirations), inotify, signalfd, pidfd (exited), epoll (nested, up to 4 levels), PTYs
   (`tty::readiness`), sockets (`net::readiness` → unix, netlink, inet, raw ICMP), message queues,
   seccomp notify, kmsg, `/dev/fuse` (`kernel/fuse`: always writable, readable while a request or
@@ -163,8 +163,8 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   or exclusive interests (or in an edge-watched epoll) get a private edge-triggered host epoll
   (`HostEdges`) so each host arrival counts. While waiting, reported-and-still-ready bits are left
   out (avoiding busy loops); drains and pipe arrivals wake edge waiters. A pipe's read end counts
-  writes as arrivals and its write end the reads that made it writable again (`Pipe::room`, as
-  Linux's pipe_read wakes the writers of a full pipe). Drains are counted for
+  writes as arrivals. Its write end counts reads that free a slot from a full pipe, whole slots
+  moved by pipe-to-pipe splice and successful resizes (`Pipe::room`). Drains are counted for
   read, readv, accept, recv* and write, writev, send*, sendfile, splice, tee when they return
   `EAGAIN`, and for short read, write, recvfrom and sendto (pread/pwrite and their vector forms
   never count; tee's write-side entry reads the length argument instead of `fd_out`).
@@ -264,9 +264,6 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 - **Exclusive gates rotate waiter order:** woken exclusive waiters requeue at the back instead of
   keeping Linux's stable queue order.
-- **Pipe `POLLOUT` counts bytes, not buffers:** a pipe write end is reported writable once
-  `PIPE_BUF` bytes are free, while Linux needs a free page buffer, so after partial reads leave
-  buffers partly used, poll and epoll report a pipe writable earlier than Linux.
 - **Per-scan cost:** epoll still scans under the BKL without a ready list. ppoll, pselect6 and
   epoll's scalar probes issue a separate poll per host-backed item. Building a blocking wait
   recomputes readiness.

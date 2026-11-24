@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cell::RefCell;
-use crate::kernel::request_wake_object;
+use crate::kernel::{request_wake_object, wake};
 use crate::vfs::store::Ino;
 
 /// The default capacity of a pipe.
@@ -26,11 +26,22 @@ pub const PIPE_BUF: usize = 4096;
 /// Device number anonymous pipes report (pipefs).
 pub(crate) const PIPE_DEV: u64 = 0xd;
 
+/// One occupied pipe buffer. Consuming its prefix does not make the page tail longer.
+#[derive(Clone, Copy)]
+struct Slot {
+    start: usize,
+    end: usize,
+    mergeable: bool,
+}
+
 /// A pipe.
 pub struct Pipe {
     /// Buffered data.
-    pub buf: VecDeque<u8>,
-    /// Capacity.
+    buf: VecDeque<u8>,
+    slots: VecDeque<Slot>,
+    /// Slots claimed by a splice reading its input without the BKL.
+    pub reserved: usize,
+    /// Capacity in bytes, a multiple of the guest page size.
     pub capacity: usize,
     /// Number of open read ends.
     pub readers: usize,
@@ -44,16 +55,10 @@ pub struct Pipe {
     /// end, and these show that the other end has come (even if it has closed again).
     pub reader_opens: u64,
     pub writer_opens: u64,
-    /// The least number of bytes the write ends waiting for space need (0 means none): they are
-    /// woken only when the readers free that much ([`Pipe::drained`]).
-    pub writer_need: usize,
     /// Number of writes of data: as on Linux, every write makes the read end's `EPOLLET` fire
     /// again.
     pub writes: u64,
-    /// Number of reads that made the pipe writable again (at least `PIPE_BUF` free, where poll
-    /// reports `POLLOUT`): each makes the write end's `EPOLLET` fire again, as Linux's pipe_read
-    /// wakes the writers when it frees a full pipe, so a writer that wrote until a short count
-    /// learns of the room.
+    /// Write-side wakeups observed by edge-triggered pollers.
     pub room: u64,
     /// A splice is writing out data it takes from the pipe only once written: every other
     /// consumer waits until it is done, as Linux's hold the pipe's lock across the write, so the
@@ -72,7 +77,8 @@ impl Pipe {
             fifo,
             reader_opens: 0,
             writer_opens: 0,
-            writer_need: 0,
+            slots: VecDeque::new(),
+            reserved: 0,
             writes: 0,
             room: 0,
             splicing: false,
@@ -84,35 +90,112 @@ impl Pipe {
         Pipe::new(ino, Some(ino), capacity)
     }
 
-    /// A write end waits for at least `need` bytes of space.
-    pub fn want_space(&mut self, need: usize) {
-        self.writer_need = match self.writer_need {
-            0 => need,
-            n => n.min(need),
-        };
+    /// Bytes visible to readers and FIONREAD, in slot order.
+    pub fn bytes(&self) -> &VecDeque<u8> {
+        &self.buf
     }
 
-    /// Data was read, with `before` the space before the read: returns whether to wake the waiting
-    /// write ends. As on Linux, they are not woken on every small read: only when the space the
-    /// waiting write ends need is available, or the space crosses `PIPE_BUF` (the threshold at
-    /// which poll reports writable). With a reader using stdio reading 1 KB at a time, the writer
-    /// used to be woken on every read.
-    pub fn drained(&mut self, before: usize) -> bool {
-        let now = self.space();
-        let writable = before < PIPE_BUF && now >= PIPE_BUF;
-        if writable {
+    /// Readiness observes published slots. An input read in flight can still be short or fail.
+    pub fn writable(&self) -> bool {
+        self.slots.len() < self.capacity / PIPE_BUF
+    }
+
+    /// Occupied or reserved page buffers, including partially consumed ones.
+    pub fn used_slots(&self) -> usize {
+        self.slots.len() + self.reserved
+    }
+
+    pub fn free_slots(&self) -> usize {
+        self.capacity / PIPE_BUF - self.used_slots()
+    }
+
+    /// Adds new slots split at source page boundaries. Spliced buffers cannot merge with writes.
+    pub fn push_pages(&mut self, data: &[u8], mut offset: usize, mergeable: bool) {
+        let mut left = data.len();
+        while left != 0 {
+            let n = left.min(PIPE_BUF - offset);
+            self.slots.push_back(Slot {
+                start: offset,
+                end: offset + n,
+                mergeable,
+            });
+            left -= n;
+            offset = 0;
+        }
+        self.buf.extend(data);
+    }
+
+    /// Linux pipe_write merges the initial partial page only if it fits entirely in the tail.
+    pub fn merge_len(&self, len: usize) -> usize {
+        let tail = len % PIPE_BUF;
+        if self
+            .slots
+            .back()
+            .is_some_and(|s| s.mergeable && s.end + tail <= PIPE_BUF)
+        {
+            tail
+        } else {
+            0
+        }
+    }
+
+    pub fn write(&mut self, data: &[u8], first: bool) -> usize {
+        let tail = if first { self.merge_len(data.len()) } else { 0 };
+        if tail != 0 {
+            self.slots.back_mut().unwrap().end += tail;
+            self.buf.extend(&data[..tail]);
+        }
+        let n = (data.len() - tail).min(self.free_slots() * PIPE_BUF);
+        self.push_pages(&data[tail..tail + n], 0, true);
+        tail + n
+    }
+
+    /// Copies up to one destination slot per source slot. Only a whole slot moved by splice
+    /// carries its merge flag. The caller consumes the transferred bytes on a move.
+    pub fn transfer(&self, dst: &mut Pipe, len: usize, take: bool) -> usize {
+        let mut done = 0;
+        for slot in self.slots.iter().take(dst.free_slots()) {
+            let n = (slot.end - slot.start).min(len - done);
+            dst.slots.push_back(Slot {
+                start: slot.start,
+                end: slot.start + n,
+                mergeable: take && slot.mergeable && slot.start + n == slot.end,
+            });
+            done += n;
+            if done == len {
+                break;
+            }
+        }
+        dst.buf.extend(self.buf.iter().take(done));
+        done
+    }
+
+    /// Ordinary reads wake writers of a full pipe. A pipe-to-pipe splice also wakes them
+    /// whenever it moves a whole slot, even if the pipe was already writable.
+    pub fn consume(&mut self, n: usize, splice_move: bool) {
+        let full = self.free_slots() == 0;
+        let slots = self.slots.len();
+        let writable = self.writable();
+        self.buf.drain(..n);
+        let mut left = n;
+        while left != 0 {
+            let first = self.slots.front_mut().unwrap();
+            let used = (first.end - first.start).min(left);
+            first.start += used;
+            left -= used;
+            if first.start == first.end {
+                self.slots.pop_front();
+            }
+        }
+        if self.slots.len() == slots {
+            return;
+        }
+        if !writable || splice_move {
             self.room += 1;
         }
-        let wake = writable || (self.writer_need != 0 && now >= self.writer_need);
-        if wake {
-            self.writer_need = 0;
+        if full || splice_move {
+            request_wake_object(wake::of_value(self));
         }
-        wake
-    }
-
-    /// Remaining space.
-    pub fn space(&self) -> usize {
-        self.capacity.saturating_sub(self.buf.len())
     }
 }
 

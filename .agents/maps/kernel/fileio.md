@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE uses the cross-address-space truncate shootdown before shrinking mapped backing)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: sendfile to a pipe uses splice slots and pipe writes preserve the initial tail merge across I/O chunks)
 
 ## Responsibilities
 
@@ -134,7 +134,8 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   without `FUSE_COPY_FILE_RANGE`), a sealed or tmpfs output, or host
   `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV`. The fallbacks move the input position back over what was
   not written, never further than the read moved it (devices keep their positions), and an error
-  after some bytes were copied returns those bytes. `copy_file_range` checks fds, offsets, then
+  after some bytes were copied returns those bytes. A pipe destination for sendfile uses the same
+  slot reservation and source page boundaries as splice. `copy_file_range` checks fds, offsets, then
   flags (`EINVAL`), then in `generic_copy_file_checks` order per file (a non-regular input before a
   directory output): directories `EISDIR`, other non-regular files `EINVAL`, modes and `O_APPEND`
   `EBADF`, different devices `EXDEV` (the mounts' device numbers; a memfd counts as the root

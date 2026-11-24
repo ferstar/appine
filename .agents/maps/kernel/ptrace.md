@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/signal full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: remote iovec count validation for empty process_vm transfers)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: PEEKTEXT and PEEKDATA use forced reads from the stopped tracee)
 
 ## Responsibilities
 
@@ -72,11 +72,14 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
   set during the last stop) and a later attach finds them; only execve clears them.
 - Memory: `PEEK*`/`POKE*` on a tracee that is not dumpable are `EIO` unless the tracer had
   `CAP_SYS_PTRACE` over the tracee's user namespace when it attached (`ptrace_access_vm`).
+  `PEEKTEXT`/`PEEKDATA` and `/proc/<pid>/mem` can read protected pages, including CoW loans,
+  through forced reads. `process_vm_readv` still requires read permission.
   `POKETEXT`/`POKEDATA` and `/proc/<pid>/mem` writes use forced writes (private copies of
   non-writable mappings, translation invalidation; written mappings stop being trusted translation
   sources). `process_vm_writev` uses plain writes.
 - wait: the tracer finds its tracees without `WUNTRACED`; a stop reports `code << 8 | 0x7f`. A
-  traced leader's zombie is hidden from its parent until the tracer reaps it. When the tracer
+  traced leader's zombie is hidden from its separate parent until the tracer reaps it. If the
+  tracer becomes the parent first, the pending exit is taken once through the ordinary child wait. When the tracer
   process exits, tracees are killed with `EXITKILL`, otherwise detached; detaching a tracee in a
   stopped group returns it to the group stop silently without dequeuing attach-time `SIGSTOP` or
   re-notifying the parent. `process_vm_readv`/`writev` with zero local or zero remote bytes return
@@ -95,7 +98,7 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 
 - `kernel/signal` supplies siginfo, signals and delivery on resume; `kernel/process` supplies
   task/group tables, wakes and waits. `kernel/ns` translates visible IDs.
-- `kernel/cred` checks access; `kernel/mm` performs reads/plain and forced writes, with
+- `kernel/cred` checks access; `kernel/mm` performs ordinary and forced reads and writes, with
   `kernel/mmu` code invalidation; `engine` provides Cpu state, stepping and hardware-debug slots.
 - `kernel/vdso` identifies clock stubs that bypass ptrace stops.
 
@@ -114,8 +117,7 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 
 - `process_vm_readv/writev` check both iovec counts before summing local lengths. With zero local
   bytes and more than 1024 remote iovecs, Appine returns `EINVAL` where Linux returns 0.
-- **ptrace reads are not forced:** `PTRACE_PEEK*` and `/proc/<pid>/mem` reads fail on `PROT_NONE`
-  pages Linux can read; `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
+- `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
 
 ## Open questions
 

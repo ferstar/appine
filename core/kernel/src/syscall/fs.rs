@@ -1944,7 +1944,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             }
             // Round up by pages to a power of two; growing past pipe-max-size requires
             // CAP_SYS_RESOURCE (shrinking or keeping the current size is allowed even when above
-            // pipe-max-size), and it cannot be smaller than the data already buffered
+            // pipe-max-size). Shrinking must leave room for all occupied and reserved slots.
             let size = (arg as u32 as usize)
                 .max(PIPE_BUF)
                 .checked_next_power_of_two()
@@ -1956,10 +1956,11 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             {
                 return Err(Errno::EPERM);
             }
-            if size < p.buf.len() {
+            if size / PIPE_BUF < p.used_slots() {
                 return Err(Errno::EBUSY);
             }
             p.capacity = size;
+            p.room += 1;
             request_wake_object(crate::pipe::object(&end.pipe));
             Ok(size as u64)
         }
@@ -2395,7 +2396,7 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
     let host_fd = match &file.borrow().kind {
         FileKind::Host(fd) => *fd,
         FileKind::Pipe(end) if request == FIONREAD => {
-            let n = end.pipe.borrow().buf.len() as i32;
+            let n = end.pipe.borrow().bytes().len() as i32;
             return put(cx, arg, n.to_le_bytes()).map(|()| 0);
         }
         FileKind::Inotify(i) if request == FIONREAD => {
@@ -2781,7 +2782,7 @@ pub(super) fn splice(
             // The data stays in the pipe until written; other consumers wait meanwhile, since
             // writing can release the BKL or wait
             let _splicing = Splicing::start(&pipe);
-            let mut data: Vec<u8> = pipe.borrow().buf.iter().take(len).copied().collect();
+            let mut data: Vec<u8> = pipe.borrow().bytes().iter().take(len).copied().collect();
             // A FUSE reply spliced from a pipe is the `len` bytes asked for (6.1's
             // fuse_dev_splice_write). libfuse vmsplices the header first and sets its length only
             // after splicing the data behind it, which Linux sees because vmsplice puts the
@@ -2814,17 +2815,12 @@ pub(super) fn splice(
             }
             {
                 let mut p = pipe.borrow_mut();
-                let before = p.space();
                 debug_assert!(
-                    n <= p.buf.len(),
+                    n <= p.bytes().len(),
                     "spliced data left the pipe while being written"
                 );
-                let drained = n.min(p.buf.len());
-                p.buf.drain(..drained);
-                if p.drained(before) {
-                    request_wake_object(crate::pipe::object(&pipe));
-                }
-                n = drained;
+                n = n.min(p.bytes().len());
+                p.consume(n, false);
             }
             drop(_out_pos);
             if n > 0 {
@@ -2838,24 +2834,17 @@ pub(super) fn splice(
         (None, Some((pipe, _))) if matches!(input.borrow().kind, FileKind::FuseDev(_)) => {
             let nonblock = input.borrow().nonblocking();
             let message = crate::vfs::fuse::dev_read(cx, &input, len, nonblock)?;
-            if message.len() > pipe.borrow().space() {
+            let mut p = pipe.borrow_mut();
+            if message.len().div_ceil(PIPE_BUF) > p.free_slots() {
                 return Err(Errno::EIO);
             }
-            pipe_push(cx, &pipe, &message);
+            p.push_pages(&message, 0, false);
+            pipe_arrival(cx, &mut p, message.len());
             message.len()
         }
         (None, Some((pipe, _))) => {
-            // Linux's splice_file_to_pipe: wait for room, then read at most what fits
             let nonblock = nonblock || output.borrow().nonblocking();
-            let room = wait_room(cx, &pipe, nonblock)?;
-            let mut buf = vec![0u8; len.min(room)];
-            // As on Linux, an unconnected socket cannot splice out data: EINVAL
-            let got = match splice_read(cx, &input, &mut buf, src, nonblock) {
-                Err(e) if e == Errno::ENOTCONN => return Err(Errno::EINVAL),
-                r => r?,
-            };
-            pipe_push(cx, &pipe, &buf[..got]);
-            got
+            splice_into_pipe(cx, &input, src, &pipe, len, nonblock)?
         }
         (None, None) => unreachable!("refused above"),
     };
@@ -2912,6 +2901,68 @@ fn splice_kind(kind: &FileKind) -> bool {
     )
 }
 
+/// Reserve page slots before reading the input: socket and file I/O can release the BKL,
+/// and an intervening writer or resize must not consume the same slots.
+struct PipeSlots<'a> {
+    pipe: &'a Rc<RefCell<Pipe>>,
+    slots: usize,
+}
+
+impl Drop for PipeSlots<'_> {
+    fn drop(&mut self) {
+        if self.slots != 0 {
+            self.pipe.borrow_mut().reserved -= self.slots;
+            request_wake_object(crate::pipe::object(self.pipe));
+        }
+    }
+}
+
+fn splice_into_pipe(
+    cx: &mut Cx<'_>,
+    input: &FileRef,
+    src: Option<u64>,
+    pipe: &Rc<RefCell<Pipe>>,
+    len: usize,
+    nonblock: bool,
+) -> Result<usize, Errno> {
+    // A splice in the opposite direction may need this same file position to drain the pipe.
+    // Wait for a slot before taking the position, then recheck if acquiring it slept.
+    let (pos, free) = loop {
+        wait_room(cx, pipe, nonblock)?;
+        let pos = PosGuard::lock_positioned(cx, input, src.is_none(), false)?;
+        let p = pipe.borrow();
+        if p.readers != 0 && p.free_slots() != 0 {
+            break (pos, p.free_slots());
+        }
+    };
+    let offset = {
+        let f = input.borrow();
+        if matches!(f.kind, FileKind::Regular { .. }) {
+            src.unwrap_or(f.pos) as usize % PIPE_BUF
+        } else {
+            0
+        }
+    };
+    let n = len.min(free * PIPE_BUF - offset);
+    let slots = (offset + n).div_ceil(PIPE_BUF);
+    pipe.borrow_mut().reserved += slots;
+    let mut claim = PipeSlots { pipe, slots };
+    let mut buf = vec![0; n];
+    let got = match splice_read(cx, input, &mut buf, src, nonblock, pos.is_some()) {
+        Err(e) if e == Errno::ENOTCONN => return Err(Errno::EINVAL),
+        r => r?,
+    };
+    if got != 0 {
+        let mut p = pipe.borrow_mut();
+        let used = (offset + got).div_ceil(PIPE_BUF);
+        p.reserved -= used;
+        claim.slots -= used;
+        p.push_pages(&buf[..got], offset, false);
+        pipe_arrival(cx, &mut p, got);
+    }
+    Ok(got)
+}
+
 /// Reads splice's input into a buffer bound for a pipe: as the file's own `O_NONBLOCK` says (TCP's
 /// `tcp_splice_read`, and `read_iter` for the rest), except that an AF_UNIX stream socket also
 /// stops waiting with `nonblock` (`SPLICE_F_NONBLOCK` or the output pipe's `O_NONBLOCK`), as
@@ -2922,6 +2973,7 @@ fn splice_read(
     buf: &mut [u8],
     offset: Option<u64>,
     nonblock: bool,
+    pos_held: bool,
 ) -> Result<usize, Errno> {
     let sock = match &file.borrow().kind {
         FileKind::Socket(s) => Some(s.clone()),
@@ -2931,7 +2983,7 @@ fn splice_read(
         |s| matches!(&*s.borrow(), crate::net::Socket::Unix(u) if u.ty == crate::net::SOCK_STREAM),
     );
     let Some(sock) = unix_stream else {
-        return read_bytes(cx, file, buf, offset);
+        return read_bytes_inner(cx, file, buf, offset, IoFlags::default(), pos_held);
     };
     let nonblock = nonblock || file.borrow().nonblocking();
     let m = super::net::recv(cx, &sock, nonblock, buf.len(), 0, 0)?;
@@ -2982,19 +3034,19 @@ fn pipe_to_pipe(
 ) -> Result<usize, Errno> {
     loop {
         pipe_wait_data(cx, src, nonblock)?;
+        wait_room(cx, dst, nonblock)?;
         if take && wait_splice_done(cx, src)? {
             continue;
         }
-        wait_room(cx, dst, nonblock)?;
         let (mut s, mut d) = (src.borrow_mut(), dst.borrow_mut());
         if d.readers == 0 {
             drop((s, d));
             return Err(broken_pipe(cx));
         }
-        if s.buf.is_empty() && s.writers == 0 {
+        if s.bytes().is_empty() && s.writers == 0 {
             return Ok(0);
         }
-        if s.buf.is_empty() || splice_room(&d) == 0 {
+        if s.bytes().is_empty() || d.free_slots() == 0 {
             if !take {
                 return Ok(0);
             }
@@ -3003,31 +3055,19 @@ fn pipe_to_pipe(
             }
             continue;
         }
-        let n = len.min(s.buf.len()).min(splice_room(&d));
-        if d.buf.is_empty() {
-            request_wake_object(crate::pipe::object(dst));
-        } else {
-            super::poll::arrived(cx);
-        }
+
+        let n = s.transfer(&mut d, len, take);
+        pipe_arrival(cx, &mut d, n);
         if take {
-            let before = s.space();
-            d.buf.extend(s.buf.drain(..n));
-            if s.drained(before) {
-                request_wake_object(crate::pipe::object(src));
-            }
-        } else {
-            let data: Vec<u8> = s.buf.iter().take(n).copied().collect();
-            d.buf.extend(data);
+            s.consume(n, true);
         }
-        d.writes += 1;
         return Ok(n);
     }
 }
 
 /// Waits for room in a pipe that splice, tee or vmsplice writes into (Linux's `wait_for_space`
 /// and `opipe_prep`): no readers is `EPIPE` with `SIGPIPE`, a full pipe `EAGAIN` when nonblocking.
-/// Returns the room ([`splice_room`]).
-fn wait_room(cx: &mut Cx<'_>, pipe: &Rc<RefCell<Pipe>>, nonblock: bool) -> Result<usize, Errno> {
+fn wait_room(cx: &mut Cx<'_>, pipe: &Rc<RefCell<Pipe>>, nonblock: bool) -> Result<(), Errno> {
     loop {
         {
             let p = pipe.borrow();
@@ -3035,8 +3075,8 @@ fn wait_room(cx: &mut Cx<'_>, pipe: &Rc<RefCell<Pipe>>, nonblock: bool) -> Resul
                 drop(p);
                 return Err(broken_pipe(cx));
             }
-            if splice_room(&p) > 0 {
-                return Ok(splice_room(&p));
+            if p.free_slots() > 0 {
+                return Ok(());
             }
         }
         if nonblock {
@@ -3045,38 +3085,22 @@ fn wait_room(cx: &mut Cx<'_>, pipe: &Rc<RefCell<Pipe>>, nonblock: bool) -> Resul
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        pipe.borrow_mut().want_space(SPLICE_PAGE);
         cx.wait_object(crate::pipe::object(pipe))?;
     }
 }
 
-/// A pipe buffer's size: Linux's pipes are rings of page-sized buffers, and splice, tee and
-/// vmsplice fill whole free buffers rather than adding to a partly used one.
-const SPLICE_PAGE: usize = 4096;
-
-/// The room splice, tee and vmsplice see in a pipe: its free space in whole pages, as Linux counts
-/// free buffers (`do_splice_to` reads at most that many pages), so a pipe with less than a page
-/// free is full to them although a small write would still fit.
-fn splice_room(p: &Pipe) -> usize {
-    p.space() / SPLICE_PAGE * SPLICE_PAGE
-}
-
-/// Puts data read for splice or vmsplice into a pipe whole, waking readers as a pipe write does.
-/// Linux holds the pipe's lock from the wait for room to the end, so no other writer takes the
-/// room meanwhile; here one may have taken it while the input was read with the BKL released, and
-/// the pipe then holds more than its capacity until it is read.
-fn pipe_push(cx: &mut Cx<'_>, pipe: &Rc<RefCell<Pipe>>, data: &[u8]) {
-    if data.is_empty() {
+/// Wake readers for a new arrival. An edge-triggered reader also observes writes to a
+/// nonempty pipe through the write counter.
+fn pipe_arrival(cx: &mut Cx<'_>, pipe: &mut Pipe, written: usize) {
+    if written == 0 {
         return;
     }
-    let mut p = pipe.borrow_mut();
-    if p.buf.is_empty() {
-        request_wake_object(crate::pipe::object(pipe));
+    if pipe.bytes().len() == written {
+        request_wake_object(wake::of_value(pipe));
     } else {
         super::poll::arrived(cx);
     }
-    p.buf.extend(data);
-    p.writes += 1;
+    pipe.writes += 1;
 }
 
 /// vmsplice (Linux 6.1): an fd open for writing (checked first, so a FIFO opened read-write is
@@ -3105,19 +3129,28 @@ pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: 
     if !write {
         return pipe_read_user(cx, &file, &pipe, nonblock, &iovecs);
     }
-    let room = wait_room(cx, &pipe, nonblock)?;
-    let mut data = Vec::new();
-    for (base, len) in iovecs {
-        let n = len.min(room - data.len());
-        let start = data.len();
-        data.resize(start + n, 0);
-        cx.mm().read(UserSlice::new(base, n), &mut data[start..])?;
-        if data.len() == room {
-            break;
+    wait_room(cx, &pipe, nonblock)?;
+    let mut p = pipe.borrow_mut();
+    let mut done = 0;
+    let mut page = [0; PIPE_BUF];
+    'iov: for (mut base, mut len) in iovecs {
+        while len != 0 && p.free_slots() != 0 {
+            let offset = base as usize % PIPE_BUF;
+            let n = len.min(PIPE_BUF - offset);
+            if let Err(e) = cx.mm().read(UserSlice::new(base, n), &mut page[..n]) {
+                if done == 0 {
+                    return Err(e);
+                }
+                break 'iov;
+            }
+            p.push_pages(&page[..n], offset, false);
+            done += n;
+            base = base.wrapping_add(n as u64);
+            len -= n;
         }
     }
-    pipe_push(cx, &pipe, &data);
-    Ok(data.len() as u64)
+    pipe_arrival(cx, &mut p, done);
+    Ok(done as u64)
 }
 
 /// When the open file is a pipe, returns the pipe and whether it is the read end.
@@ -3137,7 +3170,7 @@ fn pipe_wait_data(
     loop {
         {
             let p = pipe.borrow();
-            if !p.buf.is_empty() {
+            if !p.bytes().is_empty() {
                 return Ok(true);
             }
             if p.writers == 0 {
@@ -3425,8 +3458,23 @@ fn write_gathered(
     let mut rest = vecs.iter().copied();
     let mut cur = None;
     let mut done = 0;
-    let mut chunk = Vec::with_capacity(step.min(vecs.iter().map(|v| v.1).sum()));
+    let total = vecs.iter().map(|v| v.1).sum();
+    let pipe = pipe_of(file);
+    let first_step = match &pipe {
+        Some((p, _)) if total > step => {
+            // End the first copy on a new pipe-page boundary even when it merges a prefix.
+            let merge = p.borrow().merge_len(total);
+            if merge == 0 {
+                step
+            } else {
+                step - PIPE_BUF + merge
+            }
+        }
+        _ => step,
+    };
+    let mut chunk = Vec::with_capacity(step.min(total));
     loop {
+        let step = if done == 0 { first_step } else { step };
         chunk.clear();
         let mut fault = None;
         while chunk.len() < step {
@@ -3451,7 +3499,14 @@ fn write_gathered(
                 _ => Ok(done as u64),
             };
         }
-        match write_bytes_with(cx, file, &chunk, None, io) {
+        let written = match &pipe {
+            Some((p, _)) => {
+                let nonblock = file.borrow().nonblocking() || io.nowait;
+                pipe_write(cx, p, nonblock, &chunk, done == 0)
+            }
+            None => write_bytes_with(cx, file, &chunk, None, io),
+        };
+        match written {
             Ok(k) => {
                 done += k;
                 if k < chunk.len() || fault.is_some() {
@@ -3523,6 +3578,17 @@ pub(super) fn sendfile(
         0 => None,
         addr => Some(u64::try_from(i64::from_le_bytes(get(cx, addr)?)).map_err(|_| Errno::EINVAL)?),
     };
+    if let Some((pipe, _)) = pipe_of(&output) {
+        if count == 0 {
+            return Ok(0);
+        }
+        let nonblock = output.borrow().nonblocking();
+        let n = splice_into_pipe(cx, &input, off, &pipe, count, nonblock)?;
+        if let Some(o) = off {
+            put(cx, offset, (o + n as u64).to_le_bytes())?;
+        }
+        return Ok(n as u64);
+    }
     if let Some(r) = copy_regular(cx, &input, off, &output, None, count) {
         let n = r?;
         if n > 0 {
@@ -4203,6 +4269,9 @@ fn write_file_inner(
         let nonblock = file.borrow().nonblocking() || io.nowait;
         return super::net::rw(cx, &s, nonblock, &[(buf, len)], true);
     }
+    if matches!(file.borrow().kind, FileKind::Pipe(_)) {
+        return write_gathered(cx, file, &[(buf, len)], IO_CHUNK, io);
+    }
     let _pos = PosGuard::lock_positioned(cx, file, !pos_held && offset.is_none(), io.nowait)?;
     let held = pos_held || _pos.is_some();
     // RLIMIT_FSIZE is checked once for the whole write, as generic_write_checks does: a piece
@@ -4442,7 +4511,7 @@ fn pipe_read_user(
         }
         {
             let p = pipe.borrow();
-            if !p.buf.is_empty() {
+            if !p.bytes().is_empty() {
                 break;
             }
             if p.writers == 0 {
@@ -4457,7 +4526,7 @@ fn pipe_read_user(
         }
         cx.wait_object(crate::pipe::object(pipe))?;
     }
-    let data: Vec<u8> = pipe.borrow().buf.iter().take(total).copied().collect();
+    let data: Vec<u8> = pipe.borrow().bytes().iter().take(total).copied().collect();
     let mut done = 0;
     for &(base, len) in vecs {
         let n = len.min(data.len() - done);
@@ -4473,14 +4542,7 @@ fn pipe_read_user(
     if done == 0 {
         return Err(Errno::EFAULT);
     }
-    {
-        let mut p = pipe.borrow_mut();
-        let before = p.space();
-        p.buf.drain(..done);
-        if p.drained(before) {
-            request_wake_object(crate::pipe::object(pipe));
-        }
-    }
+    pipe.borrow_mut().consume(done, false);
     note_read(cx, file, done);
     Ok(done as u64)
 }
@@ -4497,15 +4559,12 @@ fn pipe_read(
         }
         {
             let mut p = pipe.borrow_mut();
-            if !p.buf.is_empty() || buf.is_empty() {
-                let n = buf.len().min(p.buf.len());
-                let before = p.space();
-                for (d, s) in buf.iter_mut().zip(p.buf.drain(..n)) {
-                    *d = s;
+            if !p.bytes().is_empty() || buf.is_empty() {
+                let n = buf.len().min(p.bytes().len());
+                for (d, s) in buf.iter_mut().zip(p.bytes()) {
+                    *d = *s;
                 }
-                if p.drained(before) {
-                    request_wake_object(crate::pipe::object(pipe));
-                }
+                p.consume(n, false);
                 return Ok(n);
             }
             if p.writers == 0 {
@@ -4742,7 +4801,7 @@ fn write_bytes_inner(
             Err(e) if e == Errno::EPIPE.0 => Err(broken_pipe(cx)),
             Err(e) => Err(Errno(e)),
         },
-        IoPath::Pipe(pipe) => pipe_write(cx, &pipe, nonblock, data),
+        IoPath::Pipe(pipe) => pipe_write(cx, &pipe, nonblock, data, true),
         IoPath::Pty(t, side) => tty::write(cx, &t, side, nonblock, data),
         IoPath::Socket(s) => super::net::send(cx, &s, nonblock, data, &[], &[], 0),
         IoPath::EventFd(e) => super::poll::eventfd_write(cx, &e, nonblock, data),
@@ -4864,6 +4923,7 @@ fn pipe_write(
     pipe: &Rc<RefCell<Pipe>>,
     nonblock: bool,
     data: &[u8],
+    mut first: bool,
 ) -> Result<usize, Errno> {
     let mut done = 0;
     loop {
@@ -4874,34 +4934,11 @@ fn pipe_write(
                 let e = broken_pipe(cx);
                 return if done > 0 { Ok(done) } else { Err(e) };
             }
-            let want = data.len() - done;
-            // Writes up to PIPE_BUF must complete at once and not interleave with other writes
-            let space = p.space();
-            if (data.len() <= PIPE_BUF && space >= want) || (data.len() > PIPE_BUF && space > 0) {
-                let n = want.min(space);
-                // Readers wait only while the pipe is empty, and poll reports it unreadable only
-                // while empty; when it is not empty only edge-triggered epoll needs to know that
-                // more data came
-                if p.buf.is_empty() {
-                    request_wake_object(crate::pipe::object(pipe));
-                } else {
-                    super::poll::arrived(cx);
-                }
-                p.buf.extend(&data[done..done + n]);
-                p.writes += 1;
-                done += n;
-                true
-            } else {
-                // Wait for the reader to make room: a small write needs room for all of it at
-                // once; a large write waits until at least a page fits, so it is not woken every
-                // time the reader reads a little
-                p.want_space(if data.len() <= PIPE_BUF {
-                    want
-                } else {
-                    want.min(PIPE_BUF)
-                });
-                false
-            }
+            let n = p.write(&data[done..], first);
+            first = false;
+            done += n;
+            pipe_arrival(cx, &mut p, n);
+            n != 0
         };
         if done == data.len() {
             return Ok(done);

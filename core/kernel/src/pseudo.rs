@@ -30,7 +30,6 @@ use crate::signal::SigAction;
 use crate::syscall::SocketRef;
 use crate::task::Task;
 use crate::tty::{PTS_MAJOR, Tty};
-use crate::uaccess::UserSlice;
 use crate::vfs::dev::rdev;
 use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
 use crate::vfs::{Fs, MountId, Node, Pseudo, Vfs};
@@ -3664,16 +3663,16 @@ pub(crate) fn read_mem(
     let Some(mm) = mm else {
         return Ok(0);
     };
+    let mut mm = mm.borrow_mut();
     let mut done = 0;
     while done < buf.len() {
         let Some(addr) = pos.checked_add(done as u64) else {
             break;
         };
         let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(buf.len() - done);
-        let mut read =
-            |mm: &crate::mm::Mm| mm.read(UserSlice::new(addr, n), &mut buf[done..done + n]);
-        if read(&mm.borrow()).is_err()
-            && !(mm.borrow_mut().grow_for(addr, n, limit) && read(&mm.borrow()).is_ok())
+        let out = &mut buf[done..done + n];
+        if mm.read_force(addr, out).is_err()
+            && !(mm.grow_for(addr, n, limit) && mm.read_force(addr, out).is_ok())
         {
             break;
         }

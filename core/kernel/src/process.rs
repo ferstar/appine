@@ -992,6 +992,9 @@ pub(crate) fn finish_group(
             let Some(child) = k.groups.get(&c).cloned() else {
                 continue;
             };
+            if reaper != INIT {
+                k.groups[&reaper].borrow_mut().children.push(c);
+            }
             let zombie = {
                 let mut cg = child.borrow_mut();
                 cg.ppid = reaper;
@@ -1000,22 +1003,25 @@ pub(crate) fn finish_group(
                 if cg.pgid != pgid && cg.sid == sid {
                     pgrps.push(cg.pgid);
                 }
+                if cg.exit_tracer == Some(reaper) {
+                    // The new parent already received the tracer notification. Its ordinary
+                    // wait now owns this zombie, so discard the duplicate external-tracer event.
+                    cg.exit_tracer = None;
+                    k.trace_exits
+                        .retain(|e| !(e.process && e.pid == c && e.tracer == reaper));
+                    continue;
+                }
                 // A zombie the tracer has not taken yet goes to the new parent; once the tracer
                 // has taken it, the new parent reaps it
                 cg.zombie.filter(|_| cg.exit_tracer.is_none())
             };
-            if reaper != INIT {
-                k.groups[&reaper].borrow_mut().children.push(c);
-            }
             match zombie {
                 Some(_) if reaper == INIT => {
                     k.groups.remove(&c);
                     k.release_pid(c);
                 }
                 // The new parent must reap it: notify once more, as Linux's reparent_leader does
-                Some(status) => {
-                    hand_to_parent(k, &child, (c, reaper, Signal::CHLD.number()), status)
-                }
+                Some(status) => hand_to_parent(k, &child, status),
                 None if reaper == INIT => k.groups[&INIT].borrow_mut().children.push(c),
                 None => {}
             }
@@ -1160,10 +1166,10 @@ pub(crate) fn finish_reported(
     group: &Rc<RefCell<ThreadGroup>>,
     mut pgrps: Vec<Tid>,
 ) {
-    let (tgid, ppid, pgid, sid, status, exit_signal) = {
+    let (tgid, ppid, pgid, sid, status) = {
         let g = group.borrow();
         let status = g.exiting.unwrap_or(g.leader_status);
-        (g.tgid, g.ppid, g.pgid, g.sid, status, g.exit_signal)
+        (g.tgid, g.ppid, g.pgid, g.sid, status)
     };
     if let Some(slot) = k.watched.get_mut(&tgid) {
         *slot = Some(status);
@@ -1177,7 +1183,7 @@ pub(crate) fn finish_reported(
         step(k, tgid, 7, "handing it to its parent", |k| {
             // Reporting to the tracer failed: stop waiting for the tracer to take it
             group.borrow_mut().exit_tracer = None;
-            hand_to_parent(k, group, (tgid, ppid, exit_signal), status);
+            hand_to_parent(k, group, status);
         });
     }
     // The processes it traces are no longer traced
@@ -1242,45 +1248,58 @@ fn step<R>(
 /// parent, the same as what Linux's `wait_task_zombie` and `__ptrace_detach` do with zombies
 /// ([`crate::ptrace`]).
 pub(crate) fn tracer_released(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
-    let (ids, status) = {
+    let status = {
         let mut g = group.borrow_mut();
         g.exit_tracer = None;
-        let Some(status) = g.zombie else {
-            return;
-        };
-        ((g.tgid, g.ppid, g.exit_signal), status)
+        g.leader_tracer = None;
+        g.zombie
     };
-    hand_to_parent(k, group, ids, status);
-    request_wake_on(wake::CHILD);
+    if let Some(status) = status {
+        hand_to_parent(k, group, status);
+        request_wake_on(wake::CHILD);
+    }
 }
 
-/// Hands an exited process (`tgid`, `ppid`, `exit_signal`) to its parent: when the parent is
-/// init, is gone, or ignores SIGCHLD (SIG_IGN, SA_NOCLDWAIT), the process is reaped directly;
-/// otherwise it becomes a zombie and the parent is notified.
-fn hand_to_parent(
-    k: &mut Kernel,
-    group: &Rc<RefCell<ThreadGroup>>,
-    (tgid, ppid, exit_signal): (Tid, Tid, i32),
-    status: ExitStatus,
-) {
+/// Reports a group exit. An untraced SIGCHLD child may be reaped immediately while its parent
+/// still receives the notification (SA_NOCLDWAIT). The virtual init always reaps directly.
+fn hand_to_parent(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>, status: ExitStatus) {
+    let (tgid, ppid, exit_signal, parent_traces) = {
+        let g = group.borrow();
+        (
+            g.tgid,
+            g.ppid,
+            Signal::new(g.exit_signal),
+            g.leader_tracer == Some(g.ppid),
+        )
+    };
     let parent = k.groups.get(&ppid).cloned();
-    let reap = ppid == INIT
-        || parent.as_ref().is_none_or(|p| {
-            let act = p.borrow().sighand.borrow().get(Signal::CHLD);
-            act.handler == SigAction::IGNORE || act.flags & sa::NOCLDWAIT != 0
-        });
-    if reap {
-        k.groups.remove(&tgid);
-        k.release_pid(tgid);
-        if let Some(p) = &parent {
-            p.borrow_mut().children.retain(|&c| c != tgid);
+    if let Some(p) = parent.as_ref().filter(|_| ppid != INIT) {
+        let (notify, reap) = match exit_signal {
+            Some(Signal::CHLD) if !parent_traces => {
+                let act = p.borrow().sighand.borrow().get(Signal::CHLD);
+                if act.handler == SigAction::IGNORE {
+                    (None, true)
+                } else {
+                    (exit_signal, act.flags & sa::NOCLDWAIT != 0)
+                }
+            }
+            _ => (exit_signal, false),
+        };
+        if !reap {
+            group.borrow_mut().zombie = Some(status);
         }
-    } else {
-        group.borrow_mut().zombie = Some(status);
-        if let (Some(sig), Some(p)) = (Signal::new(exit_signal), &parent) {
+        if let Some(sig) = notify {
             let pid = k.pid_seen_by(ppid, tgid);
             let info = signal::exit_info(&group.borrow().cred, &p.borrow().cred, pid, status);
             signal::send_to_group(k, ppid, sig, info);
         }
+        if !reap {
+            return;
+        }
+    }
+    k.groups.remove(&tgid);
+    k.release_pid(tgid);
+    if let Some(p) = parent {
+        p.borrow_mut().children.retain(|&c| c != tgid);
     }
 }

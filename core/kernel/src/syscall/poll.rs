@@ -50,7 +50,6 @@ use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, HostEdges, OpenFile, oflags};
 use crate::kernel::{Cx, request_wake_object, wake};
-use crate::pipe::PIPE_BUF;
 use crate::process::RLIMIT_NOFILE;
 use crate::signal;
 use crate::uaccess::UserSlice;
@@ -1504,7 +1503,7 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             // pipe_poll: writable while not full, also with no readers left (when writing
             // raises EPIPE), which adds POLLERR
             if end.write {
-                if p.space() >= PIPE_BUF {
+                if p.writable() {
                     ev |= POLLOUT | POLLWRNORM;
                 }
                 if p.readers == 0 {
@@ -1512,7 +1511,7 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
                 }
             }
             if end.read {
-                if !p.buf.is_empty() {
+                if !p.bytes().is_empty() {
                     ev |= POLLIN | POLLRDNORM;
                 }
                 if p.writers == 0 && end.hup_after != Some(p.writer_opens) {

@@ -1774,17 +1774,28 @@ impl Mm {
         if addr >= s + v.len || v.prot & need == 0 || addr < s + v.contents_len() {
             return None;
         }
-        // The fill already tracks the current size of its memfd.
-        if v.fill.is_some() {
+        if !self.refresh_file_extent(addr)? {
             return Some(true);
         }
+        // A large VMA can already be demand-paged. Fill the leaf containing the actual fault.
+        self.fault_in(addr, need).then_some(false)
+    }
+
+    /// Refresh a stale extent after a mapped file grows. The caller has already found that
+    /// `addr` falls inside this VMA beyond its previous EOF.
+    fn refresh_file_extent(&mut self, addr: u64) -> Option<bool> {
+        let (&s, v) = self.vmas.range(..=addr).next_back()?;
+        // The fill already tracks the current size of its memfd.
+        if v.fill.is_some() {
+            return Some(false);
+        }
         let Some((fd, offset)) = &v.file else {
-            return Some(true);
+            return Some(false);
         };
         let raw = std::os::fd::AsRawFd::as_raw_fd(&**fd);
         let extent = file_extent(raw, *offset, v.len);
         if addr >= s + extent {
-            return Some(true);
+            return Some(false);
         }
         let from = v.file_len;
         let start = s + from;
@@ -1816,8 +1827,7 @@ impl Mm {
             v.file_len = extent;
             v.content = None;
         }
-        // A large VMA can already be demand-paged. Fill the leaf containing the actual fault.
-        self.fault_in(addr, need).then_some(false)
+        Some(true)
     }
 
     /// The current bottom of the main thread's stack; 0 while there is no stack.
@@ -1988,6 +1998,50 @@ impl Mm {
         self.for_each_page(src.addr, src.len, prot::READ, |host, done, chunk| unsafe {
             std::ptr::copy_nonoverlapping(host, dst[done..].as_mut_ptr(), chunk);
         })
+    }
+
+    /// Reads guest memory for a debugger (Linux's FOLL_FORCE). Guest access permissions and
+    /// page-table entries stay untouched, including for CoW loans hidden by PROT_NONE.
+    pub(crate) fn read_force(&mut self, addr: u64, dst: &mut [u8]) -> Result<(), Errno> {
+        let mut done = 0;
+        while done < dst.len() {
+            let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
+            let (&start, v) = self.vmas.range(..=cur).next_back().ok_or(Errno::EFAULT)?;
+            if cur >= start + v.len || v.foreign() {
+                return Err(Errno::EFAULT);
+            }
+            if v.unread(start, cur).is_some() {
+                return Err(Errno::EFAULT);
+            }
+            if cur >= start + v.contents_len() {
+                if self.refresh_file_extent(cur) == Some(true) {
+                    continue;
+                }
+                return Err(Errno::EFAULT);
+            }
+            let offset = cur % PAGE_SIZE;
+            let n = (dst.len() - done).min((PAGE_SIZE - offset) as usize);
+            let out = &mut dst[done..done + n];
+            if v.reserved() {
+                out.fill(0);
+            } else {
+                let cow = self.cow.borrow();
+                let (host, off) = match cow.borrowed.get(&(cur - offset)) {
+                    Some(loan) => (loan.host, offset),
+                    None => (v.host, cur - start),
+                };
+                // SAFETY: the VMA or CoW loan holds this page, within the page-rounded file extent.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        host.as_ptr().add(off as usize),
+                        out.as_mut_ptr(),
+                        n,
+                    )
+                };
+            }
+            done += n;
+        }
+        Ok(())
     }
 
     /// Writes to guest memory (like Linux's `copy_to_user`); every page must be writable.

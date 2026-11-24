@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve pipe bytes on read/readv/vmsplice EFAULT, raise SIGXFSZ on splice RLIMIT_FSIZE, and allow F_SETPIPE_SZ shrink above pipe-max-size)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: page-slot occupancy, tail merging, resize checks, and slot accounting for splice, tee, vmsplice and sendfile)
 
 ## Responsibilities
 
@@ -28,7 +28,7 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 
 ## Key types
 
-- `Pipe` / `PipeEnd` — buffer, capacity, reader and writer counts, `writer_need`, EPOLLET
+- `Pipe` / `PipeEnd` — payload bytes and occupied page slots, capacity, reader and writer counts, EPOLLET
   counters, `splicing`; FIFOs by inode in `Kernel::fifos` (weak).
 - `FileKind::Pipe` (`kernel/files`).
 
@@ -46,13 +46,15 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 - Data lives in process memory. `pipe2` accepts `O_CLOEXEC|O_NONBLOCK|O_DIRECT` (`O_DIRECT`
   ignored: no packet mode, not in `F_GETFL`). Capacity 64 KiB, capped at `pipe-max-size` (1 MiB)
   without `CAP_SYS_RESOURCE`; `F_SETPIPE_SZ` rounds up to a power of two of at least a page
-  (`EPERM` over the max only when growing past the current capacity, `EBUSY` below the buffered
-  bytes).
+  (`EPERM` when growing beyond the max, `EBUSY` when the new capacity cannot hold all occupied
+  and reserved slots).
 - Pipe reads (`read`, `readv`, read-side `vmsplice`) peek and copy into guest memory via
   `pipe_read_user` (`write_user_partial`), draining only the bytes actually copied so a faulting
   user buffer (`EFAULT`) leaves unread bytes in the pipe.
-- A write wakes readers only when the pipe was empty; a read wakes writers only when it crosses
-  `PIPE_BUF` of free room or meets the room a blocked writer asked for (`writer_need`).
+- Ordinary writes may merge the initial length modulo 4096 into the last anonymous write slot
+  if it all fits after the last byte. The remaining data occupies new slots. Reading a prefix
+  keeps its slot occupied until the final byte leaves. Freeing a slot from a full pipe wakes
+  blocked writers and advances the write-end edge counter.
 - FIFO open: one `Pipe` per inode; write-only nonblocking without a reader `ENXIO`; read-only
   nonblocking succeeds; read-write never waits; blocking one-ended opens wait for a peer present
   or opened since (`ERESTARTSYS` on a signal); access mode 3 `EINVAL` (`fifo_open`).
@@ -90,7 +92,9 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
   `O_NONBLOCK` says, except that an AF_UNIX stream socket also stops waiting for the splice flag or
   the pipe's `O_NONBLOCK` (TCP does not). vmsplice writes when the fd is open for writing (a FIFO
   opened read-write too), reads otherwise, and waits unless `SPLICE_F_NONBLOCK`, whatever the
-  pipe's `O_NONBLOCK`. Room is the free space in whole pages, as Linux counts free page buffers.
+  pipe's `O_NONBLOCK`. Regular-file splice and sendfile split at file page boundaries, vmsplice
+  at each iovec's guest page boundaries. Each fragment occupies a separate slot. A whole slot moved between
+  pipes keeps its merge flag; tee and partial moves create nonmergeable destination slots.
 - vmsplice's write side reads guest memory directly; every other copy to or from a guest buffer
   first grows a grows-down mapping below it (`kernel/fileio`).
 
@@ -112,9 +116,8 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 
 ## Invariants and gotchas
 
-- splice and vmsplice put what they read into the output pipe whole even when a writer took the
-  room while the BKL was released (Linux holds the pipe lock throughout), so a pipe can briefly
-  exceed its capacity.
+- A splice reading into a pipe reserves slots across unlocked input I/O. A short read or error
+  releases unused slots for other writers. Poll sees published slots.
 - A splice out of a pipe into a file, socket or FUSE file drains what it wrote only after the
   write, which can release the BKL: code that takes data out of a pipe must first wait while
   `Pipe::splicing` is set (`wait_splice_done`), or the late drain removes bytes it never wrote.
@@ -128,12 +131,11 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
   written back advanced.
 - **Pipe write I/O with faulting buffers:** a writev whose later iovec faults still writes what
   precedes it (Linux commits only whole copied pages; a sub-page writev writes nothing); a write
-  copies 64 KiB at a time, so a fault in the first 64 KiB is `EFAULT` and a later one returns a
-  multiple of 64 KiB (Linux returns the bytes up to the fault).
+  copies up to 64 KiB at a time, so a fault in the first chunk is `EFAULT` and a later one
+  returns the preceding chunks (Linux returns the bytes up to the fault).
 - **Fidelity gaps**, one per line:
   - `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues);
   - vmsplice copies at the call, so later changes to the buffer are not seen by the reader;
-  - `F_SETPIPE_SZ` checks `EBUSY` against bytes rather than occupied pages;
   - every procfs and sysfs file is taken as splicing both ways, so splice reads a per-process
     file such as `/proc/<pid>/status` into a pipe, which has no `splice_read` on Linux (`EINVAL`
     on a native 6.8 kernel).

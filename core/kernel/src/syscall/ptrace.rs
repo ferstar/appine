@@ -299,8 +299,8 @@ fn peek(cx: &mut Cx<'_>, task: &Task, addr: u64, data: u64) -> SysResult {
     }
     let mm = task.res.borrow().mm.clone();
     let mut word = [0u8; 8];
-    mm.borrow()
-        .read(UserSlice::new(addr, 8), &mut word)
+    mm.borrow_mut()
+        .read_force(addr, &mut word)
         .map_err(|_| Errno::EIO)?;
     put(cx, data, word).map(|()| 0)
 }

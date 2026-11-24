@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE inode notifications and mapped-page invalidation)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: forced debugger reads preserve guest permissions and follow CoW loans, reservations and file growth)
 
 ## Responsibilities
 
@@ -74,7 +74,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `is_mapped` (`cow_break` is `kernel/cow`'s; `mmu().translate`/`fault_in` `kernel/mmu`'s).
 - **FUSE fills & kernel access**: `FillPages::new`/`size`/`has`/`window`/`window_from`/`store`/`fd`,
   `take_wanted`, `has_fills`, `first_unread`; `read`, `write` (breaks CoW via `kernel/cow`),
-  `translate` (no CoW break), `read_cstr`, `write_kernel`, `write_force`, `populate`,
+  `translate` (no CoW break), `read_cstr`, `read_force`, `write_kernel`, `write_force`, `populate`,
   `populate_mlock`, `mapped_above`, `check_mapped`.
 - **Files, shm, futex & introspection**: `futex_key`, `shared_maps`, `id`; `file_truncated`,
   `writably_maps`, `maps_file`, `maps_ino`, `mapped_inos`, `set_mnt`, `mapped_mounts`,
@@ -188,6 +188,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   the whole range first (any permission,
   `PROT_NONE` fills included), before changing anything, and gives `PROT_NONE` anonymous memory it
   writes prot-0 entries.
+- Debugger reads (`read_force`) walk page by page without changing VMA permissions. CoW loans
+  read the owner's page and untouched anonymous reservations read as zeros. File growth refreshes
+  the accessible extent. Holes, foreign vvar pages and missing FUSE pages stop the read.
 
 ### Guest page faults (task run loop, under the BKL, in this order)
 
@@ -366,7 +369,7 @@ signals may still be delivered).
 
 - `syscall/mem.rs`, `syscall/mod.rs` (stack growth at entry, `take_wanted`), `kernel/fuse` (`Fill`,
   `prefault`, `invalidate_fill`), `kernel/process`/`kernel/exec`/`kernel/ns`/`kernel/signal` (execve, setns
-  `vdso_syscalls`, faults, `Cx` stack growth, signal frames), `kernel/ptrace` (`write_force`),
+  `vdso_syscalls`, faults, `Cx` stack growth, signal frames), `kernel/ptrace` (`read_force`, `write_force`),
   `kernel/futex` (`futex_key`, `translate`, `id`, `shared_maps`), `kernel/ipc` (`attach/detach_shm`),
   `kernel/files`/`kernel/fileio` (`ETXTBSY`, seals, truncation, clones, unsharing), `kernel/procfs`,
   `kernel/oom`, `kernel/mmu` (VMAs/EOF/sync inputs), `kernel/cow`.
@@ -409,7 +412,7 @@ signals may still be delivered).
 ## Confirmed bugs / technical debt
 
 - A read or write through `/proc/<pid>/mem` can stop with EIO or a short count at a FUSE page
-  awaiting a fill. A ptrace POKE can likewise return EIO there. These paths consume the fill retry.
+  awaiting a fill. Ptrace PEEK and POKE can likewise return EIO there.
 
 - **FUSE demand reads:** mlock, `MADV_WILLNEED` and core dumps do not fetch missing pages
   (dumps emit zeros).

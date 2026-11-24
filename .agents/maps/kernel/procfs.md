@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: distinguish synthetic lookups during host metadata sampling)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: mem reads use forced access to the pinned address space)
 
 ## Responsibilities
 
@@ -333,7 +333,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   (`/sys` tables, CPU/net/loop/GPU views).
 - Kernel state: thread groups and tasks, credentials (`permission`, `may_ptrace`, `capable`,
   `uid_out`/`gid_out`), pid namespaces (`vnr`, `find`), nsproxy, `mm` (sizes, residency, argument
-  ranges, pagemap, forced writes), the kernel-entry record (`TaskSync`), `signal`, `tty` (`Tty`
+  ranges, pagemap, forced reads and writes for `mem`), the kernel-entry record (`TaskSync`), `signal`, `tty` (`Tty`
   owner/mode/times, `new_pty`), `net`/`route`/`netdev`/`unix`/`traffic`, `ipc` `/proc/sysvipc`,
   `mqueue` nodes, `seccomp`, `klog`, `loadavg`, the VFS (`reach`, `path_of`), the locks
   (`proc_locks` and `fd_locks`, `kernel/locks`), the mount table (`mounts_from`, devpts options;

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE writeback at syscall completion and after final thread stores)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: parent exit notification and automatic reaping, and pipe writer wakeups)
 
 ## Responsibilities
 
@@ -200,7 +200,7 @@ and `kernel/oom`.
   (one in the middle of exiting can be chosen, as on Linux), else the pid-namespace init while it
   has not exited and the namespace is not dead, else the virtual init (children get `exit_signal =
   SIGCHLD`; zombies handed to the virtual init are freed at once, others reported to their new
-  parent, and zombies still held for a tracer only moved); send `PR_SET_PDEATHSIG` signals (keyed to the creating thread); release SysV IPC and,
+  parent, and zombies still held for a tracer keep their pending wait); send `PR_SET_PDEATHSIG` signals (keyed to the creating thread); release SysV IPC and,
   for a session leader, the controlling terminal (`kernel/tty`).
 - When a pid-namespace init exits, the namespace is marked dead (registering a pid in it is then
   `ENOMEM`) and every other member gets `SIGKILL`; the init's own children, and the orphans other
@@ -209,9 +209,11 @@ and `kernel/oom`.
   reported only once all other members are reaped (it stays registered meanwhile).
 - Reporting: the status is `exiting` or the leader's; it is reported to a tracer or the parent (a
   process traced by another process is held as a zombie for the tracer and handed to its parent
-  once the tracer takes it). Handed to the parent, the group is reaped immediately when the parent
-  is the virtual init, gone, ignores `SIGCHLD` or has `SA_NOCLDWAIT`, whatever its exit signal;
-  otherwise it becomes a zombie and the parent gets `exit_signal`. Orphaned process
+  once the tracer takes it). When the tracer itself adopts a pending zombie, its ordinary wait
+  consumes the already reported exit once. Children of a missing parent or virtual init are reaped
+  immediately. An untraced `SIGCHLD` child is also reaped for explicit `SIG_IGN` or `SA_NOCLDWAIT`.
+  Explicit ignore suppresses the exit notification, while `SA_NOCLDWAIT` alone still sends it.
+  Other children remain waitable and notify their parent when their exit signal is nonzero. Orphaned process
   groups with a stopped member get SIGHUP/SIGCONT. A `CHILD` wake follows (`WATCHED` too for a
   process the host watches).
 - `wait4`/`waitid` (option checks; `waitid` takes `P_PIDFD`, where a reaped process is `ECHILD`
@@ -316,7 +318,7 @@ and `kernel/oom`.
   thread, Z once it has exited (even while other threads run, as on Linux); group zombie (Z), the
   thread's ptrace stop (t) and group stop (T) take precedence.
 - Pipes wake like Linux: a write wakes readers only if the pipe was empty; a read wakes writers only
-  when enough space for the writer's request appears or `PIPE_BUF` is crossed.
+  when it releases a page slot from a full pipe. Moving a whole slot to another pipe also wakes writers.
 
 ### Scheduling and TLS
 
@@ -412,14 +414,11 @@ and `kernel/oom`.
 
 ## Open questions
 
-- Should a parent's exit signal other than `SIGCHLD`, or a `SA_NOCLDWAIT` handler, change how a
-  child is reaped and signalled (Linux reaps directly only for `SIGCHLD` and still signals the
-  handler)?
 - Is counting `RLIMIT_NPROC` by kernel uid across user namespaces, and never consulting
   `RLIMIT_RTPRIO`, intended?
 
 ## To verify
 
 - Linux 6.1 comparisons resting on kernel knowledge rather than source (`eligible_child`,
-  `do_notify_parent`/`copy_process` exit signals, `zap_pid_ns_processes`, `sched_setattr` keep/uclamp
+  `copy_process` exit signals, `zap_pid_ns_processes`, `sched_setattr` keep/uclamp
   flags, `INIT_RLIMITS`); items from Starnix tests were also observed on native Linux 6.8.
