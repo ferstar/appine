@@ -29,7 +29,7 @@ use appine_kernel::vfs::browse;
 use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Power, Stdio, Tier};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
-use jni::sys::{jboolean, jbooleanArray, jbyteArray, jint, jlong, jobjectArray, jstring};
+use jni::sys::{jboolean, jbooleanArray, jbyteArray, jint, jlong, jlongArray, jobjectArray, jstring};
 
 /// Runs the body of a JNI function. A panic in it (a kernel-layer bug outside the calls the kernel
 /// wraps itself, or one in this crate) would unwind out of `extern "system"` and abort the app
@@ -324,7 +324,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseGenerations<'l>(
     _: JClass<'l>,
     store: JString<'l>,
     paths: JObjectArray<'l>,
-) -> jni::sys::jlongArray {
+) -> jlongArray {
     guarded!("Native.browseGenerations", throws env, std::ptr::null_mut(), {
         let (Some(store), Some(paths)) = (string(&mut env, &store), strings(&mut env, &paths)) else {
             return std::ptr::null_mut();
@@ -340,13 +340,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseGenerations<'l>(
                 return std::ptr::null_mut();
             }
         };
-        let Ok(array) = env.new_long_array(generations.len() as jint) else {
-            return std::ptr::null_mut();
-        };
-        if env.set_long_array_region(&array, 0, &generations).is_err() {
-            return std::ptr::null_mut();
-        }
-        array.into_raw()
+        long_array(&env, &generations)
     })
 }
 
@@ -1274,6 +1268,36 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_guestCpuTime<'l>(
     })
 }
 
+/// Identity, size and nanosecond change times of the login rule inputs, excluding access times
+/// (reading the inputs to refresh the rules must not trigger another refresh).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_loginRuleInputs<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jlongArray {
+    guarded!("Native.loginRuleInputs", std::ptr::null_mut(), {
+        let paths: &[&[u8]] = &[
+            b"/etc",
+            b"/etc/passwd",
+            b"/etc/group",
+            b"/etc/shadow",
+            b"/var/lib/appine/admins",
+        ];
+        let Some(stats) = machine(handle).and_then(|m| m.rootfs_stats(paths).ok()) else {
+            return std::ptr::null_mut();
+        };
+        let stamps: Vec<_> = stats
+            .into_iter()
+            .flat_map(|stat| match stat {
+                Some(s) => [s.ino as jlong, s.size as jlong, s.mtime_ns, s.ctime_ns],
+                None => [0; 4],
+            })
+            .collect();
+        long_array(&env, &stamps)
+    })
+}
+
 /// Takes the directories whose entries the guest changed (written as by [`browse::encode_path`],
 /// that is, document IDs): the Files app refreshes them.
 #[unsafe(no_mangle)]
@@ -1353,7 +1377,7 @@ fn machines() -> std::sync::MutexGuard<'static, BTreeMap<jlong, RegisteredMachin
     MACHINES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-// ---- Strings and errors ----
+// ---- JNI values and errors ----
 
 /// Throws `java.io.IOException`; Kotlin sees it after the JNI call returns.
 fn throw(env: &mut JNIEnv<'_>, message: impl AsRef<str>) {
@@ -1387,6 +1411,16 @@ fn string_array(env: &mut JNIEnv<'_>, items: &[String]) -> jobjectArray {
         if env.set_object_array_element(&array, i as jint, s).is_err() {
             return std::ptr::null_mut();
         }
+    }
+    array.into_raw()
+}
+
+fn long_array(env: &JNIEnv<'_>, items: &[jlong]) -> jlongArray {
+    let Ok(array) = env.new_long_array(items.len() as jint) else {
+        return std::ptr::null_mut();
+    };
+    if env.set_long_array_region(&array, 0, items).is_err() {
+        return std::ptr::null_mut();
     }
     array.into_raw()
 }

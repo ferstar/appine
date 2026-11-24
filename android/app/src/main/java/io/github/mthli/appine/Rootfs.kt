@@ -22,6 +22,7 @@ import java.security.MessageDigest
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.thread
 import kotlin.concurrent.write
 
 /**
@@ -98,7 +99,7 @@ internal object Rootfs {
     /** An account in `/etc/passwd`. */
     data class Account(val name: String, val uid: Int, val gid: Int, val home: String)
 
-    /** The first argument that makes `login.sh` only rewrite the NOPASSWD rules ([dirsChanged]). */
+    /** The first argument that makes `login.sh` only rewrite the NOPASSWD rules ([LoginRules]). */
     private const val REFRESH_RULES = "--refresh-rules"
 
     /** The most bytes and time a probe downloads. */
@@ -828,17 +829,31 @@ netns = "host"
     }
 
     /**
-     * The guest changed the entries of [dirs] ([Native.takeChangedDirs], polled by the service):
-     * when `/etc` is among them (passwd, chpasswd and adduser replace `/etc/shadow`, addgroup and
-     * deluser `/etc/group`), the login's NOPASSWD rules are rewritten from the passwords and groups
-     * now, by `login.sh --refresh-rules` run as root on the running [machine], so a password set in
-     * a running session counts without a new tab. Returns the refresh's pid (it is not waited for:
-     * the guest's init reaps it), or -1 when nothing needed refreshing.
+     * Per-machine state, polled by the service worker. A guest waiting on the rules lock must
+     * not block the worker or shutdown. Only a completed refresh acknowledges its input sample.
      */
-    fun dirsChanged(context: Context, machine: Long, dirs: Array<String>): Int {
-        if ("/etc" !in dirs) return -1
-        val argv = ConsolePty.argv(ConsolePty.script(context), REFRESH_RULES)
-        return Native.spawn(machine, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+    class LoginRules(private val machine: Long) {
+        @Volatile
+        private var appliedInputs: LongArray? = null
+        private var pendingRefresh: Thread? = null
+
+        fun poll(context: Context): Thread? {
+            if (pendingRefresh?.isAlive == true) return null
+            val inputs = Native.loginRuleInputs(machine)
+            if (inputs != null && inputs.contentEquals(appliedInputs)) return null
+            appliedInputs = null
+            val pid = try {
+                val argv = ConsolePty.argv(ConsolePty.script(context), REFRESH_RULES)
+                Native.spawn(machine, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+            } catch (e: IOException) {
+                Log.w(TAG, "cannot start login rule refresh", e)
+                return null
+            }
+            pendingRefresh = thread(name = "appine-login-rules") {
+                if (Native.waitFor(machine, pid) == 0) appliedInputs = inputs
+            }
+            return pendingRefresh
+        }
     }
 
     /**

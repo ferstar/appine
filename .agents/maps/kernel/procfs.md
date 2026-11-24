@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve zombie-leader netns for /proc/<pid>/net/*, reflect ip_forward in /proc/net/snmp, add pseudo::has_iter for AIO, mark gone cgroup files)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: distinguish synthetic lookups during host metadata sampling)
 
 ## Responsibilities
 
@@ -56,7 +56,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `STATIC`.
 - `View` — a read-only view of the kernel for one reading thread (`tid`, `tgid`), taken under the
   BKL, with optional replacement credentials (`cred`, an opener's); implements `Pseudo`.
-  `Offline` serves an empty root before boot.
+  `Offline::Boot` serves empty synthetic roots for boot and host spawns.
+  `Offline::HostStat` reports synthetic child lookups as unavailable to host metadata samples.
 - `FileKind::Proc` — an open synthetic file: mount, node, snapshot `data`, `fresh` flag, a weak
   address space for `mem` and `pagemap`, the namespace reference of an nsfs file, the kernel-log reader for
   `/proc/kmsg`, the opener's credentials (`opener`, Linux's `f_cred`) and change state
@@ -321,7 +322,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - `kernel/files` (pseudo open) and `kernel/fileio` (pseudo read/write/lseek); `kernel/vfs` (walker and magic links, pseudo
   stat/getdents, chmod/chown/utimensat on devpts nodes); `kernel/mount` (synthetic mounts, devpts
   options and `mount_events`); `kernel/ns` (unshare/setns, nsfs files); `kernel/poll` (epoll
-  refusal and readiness); the machine (`Offline` before boot); `kernel/signal` (`mark_deleted` for
+  refusal and readiness); the machine (`Offline` for startup and metadata sampling); `kernel/signal` (`mark_deleted` for
   unhandled-exception reports); `kernel/net` (`sockets`, `socket_ino`); `kernel/sysctl` and
   `kernel/sysfs` (shared `View`, `FileKind::Proc` snapshot/regeneration, `tree_*` helpers and
   missing-path accounting).

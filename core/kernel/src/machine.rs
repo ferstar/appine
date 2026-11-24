@@ -248,7 +248,7 @@ impl Machine {
         let io_err = |e: Errno| RunError::Io(io::Error::from_raw_os_error(e.0));
         let mut k = self.shared.lock();
         let vfs = k.vfs.clone();
-        let offline = crate::pseudo::Offline;
+        let offline = crate::pseudo::Offline::Boot;
         let file = match &vfs {
             Some(vfs) => read_executable(
                 vfs,
@@ -646,7 +646,7 @@ impl Machine {
         let text = crate::bug::host_call("Machine::inittab", || {
             let k = self.shared.lock();
             let vfs = k.vfs.as_ref()?;
-            let offline = crate::pseudo::Offline;
+            let offline = crate::pseudo::Offline::Boot;
             let root = Cred::root();
             match vfs.resolve(
                 &offline,
@@ -677,7 +677,7 @@ impl Machine {
         if let Some(program) = crate::inittab::program(process) {
             // Checked with the BKL held: earlier once commands may already be running (see
             // [`Machine::inittab`])
-            let offline = crate::pseudo::Offline;
+            let offline = crate::pseudo::Offline::Boot;
             let found = crate::bug::host_call("Machine::boot", || {
                 let k = self.shared.lock();
                 k.vfs.as_ref().is_some_and(|vfs| {
@@ -797,6 +797,40 @@ impl Machine {
             std::mem::take(&mut *self.shared.lock().kills.borrow_mut())
         })
         .unwrap_or_default()
+    }
+
+    /// Samples paths in the root filesystem seen by host-spawned programs under one BKL hold.
+    /// Missing paths have no metadata. Nodes requiring a guest syscall cannot be sampled here.
+    pub fn rootfs_stats(
+        &self,
+        paths: &[&[u8]],
+    ) -> Result<Vec<Option<crate::vfs::store::Stat>>, Errno> {
+        crate::bug::host_call("Machine::rootfs_stats", || {
+            let k = self.shared.lock();
+            let vfs = k.vfs.as_ref().ok_or(Errno::ENOENT)?;
+            let root = Cred::root();
+            let mut stats = Vec::with_capacity(paths.len());
+            for &path in paths {
+                let node = vfs.resolve_mountpoint(
+                    &crate::pseudo::Offline::HostStat,
+                    &root,
+                    &Node::ROOT,
+                    &Node::ROOT,
+                    path,
+                    true,
+                );
+                let stat = match node {
+                    Ok(Node::Store(_, ino)) => Some(vfs.store().stat(ino)?),
+                    Ok(Node::Overlay(_, node)) => Some(vfs.overlay_stat(node)?),
+                    Ok(_) => return Err(Errno::EOPNOTSUPP),
+                    Err(Errno::ENOENT | Errno::ENOTDIR) => None,
+                    Err(err) => return Err(err),
+                };
+                stats.push(stat);
+            }
+            Ok(stats)
+        })
+        .unwrap_or(Err(Errno::EIO))
     }
 
     /// Takes the store paths of directories whose entries the guest changed (created, deleted,

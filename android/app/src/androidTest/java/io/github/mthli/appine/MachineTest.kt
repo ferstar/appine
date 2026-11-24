@@ -898,39 +898,65 @@ class MachineTest {
         }
     }
 
-    /**
-     * A password set while the session runs (the android/setup map): until then alice escalates
-     * without one; chpasswd replaces `/etc/shadow`, the changed `/etc` (what the service takes with
-     * [Native.takeChangedDirs]) makes [Rootfs.dirsChanged] rewrite the rules, and from then on doas
-     * asks for the password without a new login. A change elsewhere refreshes nothing.
-     */
+    /** Account changes reach doas without opening another login or depending on a directory event. */
     @Test
-    fun rulesFollowAPasswordSetLater() {
-        Rootfs.ensureLoginTools(context)
-        val machine = start(1)
-        val escalate = "su alice -c 'doas -n id -un' 2>&1"
-        try {
-            assertEquals(0, sh(machine, "adduser -D -s /bin/sh alice").second)
+    fun rulesFollowAPasswordSetLater() = withAlpineStore("login-rules") { store ->
+        context.assets.open("doas.apk").use {
+            Native.writeFile(store, "/var/cache/appine/doas.apk", it.readBytes(), 420, true)
+        }
+        withMachine(store) { machine ->
+            val rules = Rootfs.LoginRules(machine)
+            val escalate = "su alice -c 'doas -n id -un' 2>&1"
+
+            fun assertPasswordless() {
+                val output = checkedShell(machine, escalate)
+                assertTrue(output, output.lineSequence().any { it.trim() == "root" })
+            }
+
+            fun assertPasswordRequired() {
+                val (output, status) = sh(machine, escalate)
+                assertTrue(output, status != 0 && output.contains("doas: Authentication required"))
+            }
+
+            fun refresh() {
+                val task = requireNotNull(rules.poll(context)) { "expected a login rule refresh" }
+                task.join(10_000)
+                assertFalse("login rule refresh still running", task.isAlive)
+            }
+
+            checkedShell(machine, "adduser -D -s /bin/sh alice")
             val first = login(machine, "id -un; id -nG; doas -n id -un; exit\n")
             assertTrue(first, becameAdmin(first, "wheel"))
-            Native.takeChangedDirs(machine)
-            assertEquals(-1, Rootfs.dirsChanged(context, machine, arrayOf("/home/alice")))
-            assertEquals(0, sh(machine, "echo alice:secret | chpasswd").second)
-            val before = sh(machine, escalate).first
-            assertTrue(before, before.lines().any { it.trim() == "root" })
-            val dirs = Native.takeChangedDirs(machine) ?: emptyArray()
-            assertTrue(dirs.joinToString(), "/etc" in dirs)
-            val pid = Rootfs.dirsChanged(context, machine, dirs)
-            assertTrue(pid > 0)
-            Native.waitFor(machine, pid)
-            val after = sh(machine, escalate).first
-            assertTrue(after, after.contains("doas: Authentication required"))
-        } finally {
-            sh(
-                machine,
-                "deluser --remove-home alice; apk del -q --no-network --repositories-file /dev/null doas; " +
-                    "rm -rf /var/lib/appine /etc/doas.d",
-            )
+
+            // The first poll must reconcile an earlier change, even if no event was collected.
+            checkedShell(machine, "cp /etc/shadow /root/passwordless-shadow && echo alice:secret | chpasswd")
+            assertPasswordless()
+            refresh()
+            assertPasswordRequired()
+
+            // Restore the passwordless entry without replacing the inode or changing /etc.
+            checkedShell(machine, "cp /etc/shadow /root/protected-shadow && cat /root/passwordless-shadow > /etc/shadow")
+            refresh()
+            assertPasswordless()
+
+            // A failed refresh must retry the same sample after the lock becomes available.
+            checkedShell(machine, "cat /root/protected-shadow > /etc/shadow && " +
+                "rm /run/appine-rules.lock && mkdir /run/appine-rules.lock")
+            refresh()
+            checkedShell(machine, "rmdir /run/appine-rules.lock")
+            refresh()
+            assertPasswordRequired()
+            checkedShell(machine, "cat /root/passwordless-shadow > /etc/shadow")
+            refresh()
+            assertPasswordless()
+
+            // Rewrite the group in place, with all temporary files outside /etc.
+            checkedShell(machine, "sed '/^wheel:/s/alice//' /etc/group > /root/updated-group && " +
+                "cat /root/updated-group > /etc/group")
+            refresh()
+            assertTrue(sh(machine, escalate).second != 0)
+            checkedShell(machine, "touch /home/alice/unrelated")
+            assertTrue("unrelated change refreshed the rules", rules.poll(context) == null)
         }
     }
 

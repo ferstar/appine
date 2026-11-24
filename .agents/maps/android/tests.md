@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: document URI reuse after a recursive deletion)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: exercise first-poll reconciliation, in-place credential changes and refresh retry)
 
 ## Responsibilities
 
@@ -93,7 +93,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
   them back in `finally`. It covers both tiers (guest page size 4096), calls after stop, memory
   trim, boot and shutdown by inittab (under 10 s), osclock, consoles (input, Ctrl-C, concurrency,
   the foreground cwd), login from `/etc/passwd`, the saved directory, accounts and doas (two logins installing it at once, and one waiting for apk's lock, included), NOPASSWD
-  rules following a password set later, saved tabs (including 32-bit hash-colliding `/Aa` vs `/BB`
+  rules in a separate Alpine store (first-poll password change, in-place shadow and group
+  rewrites, retry after a failed refresh, and unrelated changes on both 4 KB and 16 KB pages),
+  saved tabs (including 32-bit hash-colliding `/Aa` vs `/BB`
   cwd layouts), the Files provider (default-off access including
   legacy preferences, disabled queries/reads/changes and file links, authority-wide grant revocation,
   canonical `%XX` validation and `%2E`/`%2F` tree-grant rejection, home, no home including regular-file

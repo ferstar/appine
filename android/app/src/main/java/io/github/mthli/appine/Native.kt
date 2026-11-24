@@ -267,6 +267,10 @@ internal object Native {
     @JvmStatic
     external fun guestCpuTime(machine: Long): Long
 
+    /** Login rule input metadata, including missing files, or null if it cannot be sampled. */
+    @JvmStatic
+    external fun loginRuleInputs(machine: Long): LongArray?
+
     /**
      * Takes the directories whose entries (create, delete, rename) the guest changed, written as
      * document IDs, so the Files app refreshes them. Recording starts only with the first call.

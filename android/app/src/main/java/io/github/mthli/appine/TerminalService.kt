@@ -220,7 +220,7 @@ class TerminalService : Service() {
      *   refuses was moved, so the user must be told which one to connect to;
      * - the guest's power requests (busybox's reboot, halt, poweroff);
      * - directories the guest changed: the Files app is told to refresh them (the android/documents
-     *   map), and a change in `/etc` rewrites the login's NOPASSWD rules (the android/setup map);
+     *   map). The login rule inputs are sampled separately (the android/setup map);
      * - whether guest processes remain when there are no sessions and no UI: if none, exit (the
      *   android/service map).
      *
@@ -232,6 +232,7 @@ class TerminalService : Service() {
             val m = machine
             if (m == 0L) return
             val tracker = consoleTracker
+            val rules = loginRules
             Native.bklStall(m)?.let { notifications.stall(m, it) }
             runCatching {
                 worker.execute {
@@ -241,8 +242,8 @@ class TerminalService : Service() {
                     val processes = Native.processes(m)
                     Native.takeChangedDirs(m)?.let {
                         Documents.dirsChanged(this@TerminalService, it)
-                        runCatching { Rootfs.dirsChanged(this@TerminalService, m, it) }
                     }
+                    rules?.poll(this@TerminalService)
                     val cpu = Native.guestCpuTime(m)
                     val sampledAt = SystemClock.elapsedRealtime()
                     main.post {
@@ -273,6 +274,7 @@ class TerminalService : Service() {
 
     /** Console-lifetime epoch tracker for the current kernel's kill reports. */
     private var consoleTracker: ConsoleTracker? = null
+    private var loginRules: Rootfs.LoginRules? = null
 
     /**
      * [onDestroy] has run: a thread that outlives the service (a download) must not
@@ -681,6 +683,7 @@ class TerminalService : Service() {
                 }
             },
         )
+        loginRules = Rootfs.LoginRules(m)
         machine = m
         gpuAvailable = kernel.gpuAvailable
         booting = true
@@ -1345,6 +1348,7 @@ class TerminalService : Service() {
         main.removeCallbacks(periodicSave)
         releaseSessions()
         consoleTracker = null
+        loginRules = null
         sessionsChanged()
         return m
     }
@@ -1381,6 +1385,7 @@ class TerminalService : Service() {
         gpuAvailable = false
         releaseSessions()
         consoleTracker = null
+        loginRules = null
         // Stopped without going through exitAll: shut down anyway, best effort. It has to wait for
         // guest threads to exit, so not on the main thread
         if (m != 0L) worker.execute { Native.shutdown(m) }

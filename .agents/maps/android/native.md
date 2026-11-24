@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: batch document ID generations for SAF)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: sample login rule input metadata on the running machine)
 
 ## Responsibilities
 
@@ -27,7 +27,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 - `MACHINES` — a mutex-protected map from handle (`jlong`, from `NEXT_HANDLE`, counting up from 1
   and never reused in a process) to `RegisteredMachine` (`Arc<Machine>` plus `has_gpu: bool`); a poisoned lock is recovered. `vt.rs` looks
   kernels up in the same table through `machine(handle)`.
-- `Native` — `internal object` with 40 `@JvmStatic external` functions, 19 of them
+- `Native` — `internal object` with 41 `@JvmStatic external` functions, 19 of them
   `@Throws(IOException::class)`; its initialiser loads the library and calls the private
   `init(BuildConfig.DEBUG)`.
 - `guarded!` — the macro every JNI body runs in: `(name, fallback, body)`, or
@@ -46,7 +46,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   `takeKills`, `bklStall` (the latest too-long hold of the BKL as
   `<id>\t<seconds>\t<report>\t<end record or empty>`, tabs and line breaks in the last two turned
   into spaces, or null; it does not take the BKL), `takePower`, `processes`, `guestCpuTime`
-  (live-plus-exited guest CPU nanoseconds under the BKL; −1 for a stopped handle or caught panic), `takeChangedDirs`,
+  (live-plus-exited guest CPU nanoseconds under the BKL; −1 for a stopped handle or caught panic), `loginRuleInputs` (inode, size, mtime and ctime of the five rule inputs under one BKL hold; four zeros for a missing path), `takeChangedDirs`,
   `trimMemory`, `shutdown`, `stop`.
 - Consoles and processes: `openConsole`, `spawn` (negative console = the app's stdio), `read`,
   `write` (until all bytes are written), `resize`, `closeConsole`, `waitFor`, `consoleCwd`. The app
@@ -77,7 +77,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   last call on a removed kernel runs that drop.
 - After the kernel is gone: `read` and `write` return −1, `waitFor` −9, `openConsole` and `spawn`
   throw "the machine is stopped", `takeListens`, `takeKills` and `takeChangedDirs` return empty
-  arrays, `bklStall` and `consoleCwd` null, `takePower` and `processes` 0, `guestCpuTime` −1, and the rest
+  arrays, `bklStall`, `loginRuleInputs` and `consoleCwd` null, `takePower` and `processes` 0, `guestCpuTime` −1, and the rest
   (`boot`, `setRoutes`, `resize`, `closeConsole`, `trimMemory`, `shutdown`, `stop`) do nothing.
 - `browseImport` calls an `IntConsumer` synchronously with a borrowed staging fd. It returns
   the encoded name after publication, propagates the writer's exception, and throws `IOException`
@@ -93,7 +93,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 - GPU context setup attaches its caller to the JVM to bind the service. The retirement thread attaches
   to release the binding. Other runtime JNI callers include the main thread (`bklStall`, and `openConsole`/`spawn` from a tab's
   start), `appine-start` (`start`), the service's worker (the poll's calls, `setRoutes`,
-  `consoleCwd`, `trimMemory`, `stop`, `shutdown`, the rules refresh's `spawn`), `appine-boot`
+  `consoleCwd`, `trimMemory`, `stop`, `shutdown`, the rules refresh's `spawn`), `appine-login-rules` (the refresh's `waitFor`), `appine-boot`
   (`spawn`, `waitFor`, `boot`), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`),
   `terminal-import` (`browseImport`), the provider's binder threads (browse functions, `readFile`),
   and each tab's `vt-pump`, which reads the console through `Machine::read_console` in `vt.rs` and calls back into Java from inside

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: compare exact tab-index layout string and route kill reports by console-lifetime epoch)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: sample login rule inputs independently of directory notifications)
 
 ## Responsibilities
 
@@ -18,7 +18,7 @@ outlives an Activity:
   was killed (`Tabs`);
 - the ongoing foreground notification (id 1) and its actions, the wake lock, memory trimming;
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
-  directories, too-long holds of the BKL) and decides whether they become in-tab messages,
+  directories, too-long holds of the BKL), checks login rule inputs and decides whether they become in-tab messages,
   lifecycle actions or notifications delegated to `android/reports`, and the routing of what
   programs ask of the app (bells, notifications, program statuses, clipboard writes and reads,
   browser URL opens via `BrowserBridge`) and of commands the shells' prompt marks see finish;
@@ -158,10 +158,11 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 - On the main thread, while a kernel runs: first `bklStall` (it takes no BKL, and the worker
   would wait behind a hold that does not end) reports a too-long hold of the BKL to
   `Notifications`; then the worker fetches `takeListens`, `takeKills`, `takePower`, `processes`
-  and `takeChangedDirs`, then `guestCpuTime`; the poll reschedules itself at once, whether or not
-  the fetch has run.
-- Changed directories are handled on the worker straight away: `Documents.dirsChanged`, then
-  `Rootfs.dirsChanged` (a change in `/etc` rewrites the login's NOPASSWD rules, android/setup).
+  and `takeChangedDirs`, checks the login rule inputs, then fetches `guestCpuTime`. The poll
+  reschedules itself without waiting for the fetch.
+- The worker passes changed directories to `Documents.dirsChanged`. Each machine has its own
+  `Rootfs.LoginRules` captured when its poll is queued. The worker starts a needed refresh in
+  order with shutdown. A separate thread waits for completion (android/setup).
 - The rest is applied on the main thread only if the kernel is still the same: listens (to
   `Notifications`), kills (taken with their `ConsoleTracker` epoch by the poll or drained on
   console close, routed via `sessionForKill` -> `VtSession.ownedConsoleAt` to the unique tab whose
@@ -376,7 +377,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   its abandoned handle is shut down on `appine-stop`. A stale kernel handle is harmless
   (the JNI table no longer finds it). A call that must answer while the BKL is stuck (`bklStall`)
   must not take it and runs on the main thread.
-- Results of a poll other than changed directories are dropped if the kernel changed meanwhile
+- Poll results posted to the main thread are dropped if the kernel changed meanwhile
   (reports fetched just before a restart are lost). While a hold of the BKL lasts, the poll keeps
   queueing fetches behind it on the worker, which run back to back once it ends.
 - Android names low-memory kills only where `isLowMemoryKillReportSupported`; elsewhere they are

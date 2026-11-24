@@ -13,7 +13,7 @@
 # it is not added back. With a password set, escalating asks for the password, following the
 # distro's convention; without one (adduser -D) it does not ask. The rule is rewritten at every
 # login according to the password at that time, and, while Appine runs, within a few seconds of the
-# guest changing /etc (passwd replaces /etc/shadow): the app then runs this script with
+# account files changing (including in-place writes): the app then runs this script with
 # --refresh-rules as $1, which only rewrites the rules.
 # On a system the app imported from Alpine, the login shell is bash (root's, and that of the
 # accounts busybox's adduser makes after it): the app puts bash's packages in
@@ -176,9 +176,13 @@ ensure_shell() {
 # passwords at that time. No password means a shadow field that is empty or only "!" or "*"
 # (adduser -D writes "!"); passwd -l puts "!" in front of a hash, and that account still has a
 # password. Without a shadow entry, or without a readable /etc/shadow, an account counts as having
-# a password. The file is written beside and renamed into place, so a login and a refresh running
-# at once never leave it half written (doas reads only *.conf, sudo skips names with a dot)
-refresh_rules() {
+# a password. Serialize the reads and publication across logins and the service refresh so an
+# older decision cannot overwrite a newer one. Readers see only complete files.
+refresh_rules() (
+    # An unprivileged reader could otherwise take this lock exclusively and stall revocation.
+    umask 077
+    exec 9>/run/appine-rules.lock || exit 1
+    flock 9 || exit 1
     nopass=
     if [ -f "$admins" ]; then
         while read -r u; do
@@ -198,17 +202,20 @@ refresh_rules() {
                     echo "$u ALL=(ALL:ALL) NOPASSWD: ALL"
                 fi
             done
-        } >"$tmp" && chmod 0440 "$tmp" && mv -f "$tmp" "$rules"
-        rm -f "$tmp"
+        } >"$tmp" && chmod 0440 "$tmp" && mv -f "$tmp" "$rules" || {
+            # The previous file may still grant an account that now needs a password.
+            rm -f "$tmp" "$rules"
+            exit 1
+        }
     else
         rm -f "$rules"
     fi
-}
+)
 
-# Only the rules: the app asks for this when the guest changed /etc
+# Only the rules: the service retries failed refreshes on its next poll.
 if [ "$want" = --refresh-rules ]; then
     refresh_rules
-    exit 0
+    exit $?
 fi
 
 if [ -d /var/cache/appine/procps ]; then

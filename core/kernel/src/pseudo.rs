@@ -1038,9 +1038,13 @@ pub(crate) struct View<'a> {
     pub cred: Option<Rc<Cred>>,
 }
 
-/// The view used before the kernel has started (resolving the first program's path): the
-/// synthetic filesystems have only empty root directories.
-pub(crate) struct Offline;
+/// A host path lookup without a guest task to resolve synthetic nodes.
+pub(crate) enum Offline {
+    /// Boot and host-spawned programs see empty synthetic root directories.
+    Boot,
+    /// An observation cannot treat a synthetic path as a missing store file.
+    HostStat,
+}
 
 impl Pseudo for Offline {
     fn parent(&self, _: &PseudoNode) -> Option<PseudoNode> {
@@ -1050,7 +1054,10 @@ impl Pseudo for Offline {
         Vec::new()
     }
     fn lookup(&self, _: MountId, _: &PseudoNode, _: &[u8]) -> Result<PseudoNode, Errno> {
-        Err(Errno::ENOENT)
+        Err(match self {
+            Self::Boot => Errno::ENOENT,
+            Self::HostStat => Errno::EOPNOTSUPP,
+        })
     }
     fn kind(&self, _: &PseudoNode) -> Result<u32, Errno> {
         Ok(mode::S_IFDIR)

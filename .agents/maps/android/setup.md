@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: check flock exit status before running locked install commands)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: refresh login rules on changes to account files and serialize publication)
 
 ## Responsibilities
 
@@ -67,7 +67,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`,
   `sudo-installed` and `bash-startup-done` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
   (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`,
-  `/var/cache/appine/{bash,procps,bubblewrap,openrc}/` (packages until installed), and `/run/appine-install.lock`.
+  `/var/cache/appine/{bash,procps,bubblewrap,openrc}/` (packages until installed), `/run/appine-install.lock` and `/run/appine-rules.lock`.
 
 ## Public entry points
 
@@ -77,7 +77,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   `ensureBashStartup`, `ensureGpuCommand`, `ensureBrowser`, `updateProfile`; around boot:
   `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
 - Mirrors: `chooseMirror`, `useMirror`.
-- Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
+- Accounts: `loginAccount`, `regularAccounts`, `LoginRules.poll` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
   packages into `target/rootfs` by default; prints each package's path, then the tarball's last).
 - `login.sh` arguments: login setting (`auto`, `root` or an account name) and an optional start
@@ -303,11 +303,12 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     do a missing shadow entry and an unreadable `/etc/shadow`. The file is written beside it,
     made 0440 and renamed into place; with nobody qualifying, or without the rules' directory
     (on Debian, until sudo is installed), it is deleted;
-  - `--refresh-rules` as the first argument only rewrites the rules: `Rootfs.dirsChanged` runs
-    it as root, without a console and without waiting, when the service's poll finds `/etc`
-    itself among the directories the guest changed (`passwd`, `chpasswd` and `adduser` replace
-    `/etc/shadow`; group changes replace `/etc/group`), so a password set in a running session
-    makes escalating ask for it within about one poll (2 s);
+  - the first service poll for each machine runs `--refresh-rules` as root without a console.
+    Later polls compare the inode, size, mtime and ctime of `/etc`, `/etc/passwd`, `/etc/group`,
+    `/etc/shadow` and `/var/lib/appine/admins`. A changed or unavailable sample triggers
+    another refresh. The worker starts the process and a separate thread waits for its exit.
+    Only a successful exit acknowledges the sample. Changes during a refresh are checked at
+    the next poll after it finishes;
   - before choosing the account: install procps-ng, then bubblewrap offline when their cache directories
     exist, under the install lock, testing `apk info -e <package>` (BusyBox already provides ps/top/free),
     re-add each by name for upgrades, and delete its cache under the lock only on success. Failure
@@ -348,7 +349,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 ### Inbound
 
 - `TerminalService` (`android/service`: start, import, switch, reset, the mirror probe, per-start
-  files, boot, the poll's `dirsChanged`, login accounts), `SettingsFragment` (`android/settings`:
+  files, boot, the poll's `LoginRules`, login accounts), `SettingsFragment` (`android/settings`:
   `Distro`, `installed`, `regularAccounts`, `loginAccount`), `Documents` (`android/documents`:
   `loginAccount`, `installed`, `isReady`, `access`), `ConsolePty` (`android/vt`: runs `login.sh`),
   the instrumentation tests (`fetch`, `prepare` into another store, `useMirror`, `updateProfile`,
@@ -357,7 +358,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 ### Outbound
 
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
-  symlinks), `readFile` (null when missing), `spawn` and `waitFor` (`android/native`);
+  symlinks), `readFile` (null when missing), `loginRuleInputs`, `spawn` and `waitFor` (`android/native`);
   `HttpURLConnection` (system proxy); `BuildConfig` (Alpine branch); the bundled assets
   (`android/build`).
 
@@ -396,8 +397,10 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   fresh `scripts/fetch-rootfs` fail until it is pinned anew.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
   rows on a resize; `android/vtcore`): bash, busybox ash and zsh do.
-- The rules refresh writes in `/etc/doas.d` or `/etc/sudoers.d`, not `/etc` itself, so it does not
-  trigger itself; the first login's group change and `mkdir /etc/doas.d` cause one more refresh.
+- Every rule writer takes the root-only rules lock before reading the accounts and holds it
+  through publication or removal. A failed publication attempts to remove stale grants.
+  Reading account files and publishing in the rules subdirectory do not change the sampled
+  inputs. The service polls every 2 s independently of the Files app's directory notifications.
 - `login.sh` runs without job control, so its children share its process group: a Ctrl-C that
   lands during another command than an install (the passwd lookup, the group check, the shadow
   read, the `su --help` probe) can log a named account in as root, leave an admin out of the
@@ -412,11 +415,6 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   prompt text are not sanitized.
 - Automatic command titles cover bash and zsh only. Busybox ash has no preexec hook; it still
   needs terminal-side or foreground-process detection to report commands that set no title.
-- **The rules miss changes that rename nothing in `/etc`.** A shadow or group file edited in place
-  (an append, a text editor writing the file itself) changes no entry of `/etc`, a burst of more
-  than 256 changed directories between two polls stops recording the rest, and changes before the
-  service's first poll are not recorded, so such a change waits for the next login; while the app
-  is not running there is nothing to refresh.
 
 ## Open questions
 

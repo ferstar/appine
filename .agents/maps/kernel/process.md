@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: contain BKL-release wake panics, drop unlocked global wake fallback, track per-task SemUndo and deferred unix GC)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: sample rootfs metadata for host observers)
 
 ## Responsibilities
 
@@ -80,7 +80,7 @@ and `kernel/oom`.
   `prlimit`, `personality`, `sethostname`/`setdomainname`, `getcpu`, `sysinfo`, `getrandom`.
 - **Internal & host (`Machine`)**: `task::start`, `thread_main` → `run` → `exit`, `finish_group`,
   `Shared::lock`, `block`/`block_for`, `Cx::wait*`/`unlocked`, `request_wake*`,
-  `signal_later`/`flush_signals`, `Shared::fast_changed`; `Machine::{processes, cpu_time_ns, wait,
+  `signal_later`/`flush_signals`, `Shared::fast_changed`; `Machine::{processes, cpu_time_ns, rootfs_stats, wait,
   try_wait, wait_or_power, signal}` (lifecycle in `kernel/boot`; `take_kills`/`stall` in
   `kernel/bug`); procfs `threads-max`, `/proc/<pid>/task/<tid>/children`.
 
@@ -91,6 +91,9 @@ and `kernel/oom`.
 - `Machine::cpu_time_ns` sums `Kernel.cpu.total_ns` (exited) and live tasks' `cpu_ns` under the BKL
   without `/proc` or hot-loop instrumentation (UI/timer CPU excluded; exit-stage panics can skip
   credit, so callers compare deltas).
+- `Machine::rootfs_stats` samples store and overlay paths under one BKL hold without clearing
+  mount expiry marks. It follows symlinks, reports missing paths separately and returns an
+  error when guest-only filesystem state is needed.
 - Each guest thread runs on its own host pthread, scheduled by the host kernel. A finished thread's
   host thread is pooled (at most 8 idle, 5 s) and its engine CPU state goes to the engine's spare
   list (up to 8), so creating threads rarely creates host threads.
