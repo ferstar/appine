@@ -29,7 +29,9 @@ use appine_kernel::vfs::browse;
 use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Power, Stdio, Tier};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
-use jni::sys::{jboolean, jbooleanArray, jbyteArray, jint, jlong, jlongArray, jobjectArray, jstring};
+use jni::sys::{
+    jboolean, jbooleanArray, jbyteArray, jint, jlong, jlongArray, jobjectArray, jstring,
+};
 
 /// Runs the body of a JNI function. A panic in it (a kernel-layer bug outside the calls the kernel
 /// wraps itself, or one in this crate) would unwind out of `extern "system"` and abort the app
