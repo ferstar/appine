@@ -625,6 +625,27 @@ impl Opened {
         self.0.unlinked.get()
     }
 
+    /// A magic-link reopen has its own last close at the original dentry, even after unlink.
+    pub(super) fn reopen(&self, k: &Kernel, writable: bool) -> Self {
+        let (ino, parent, unlinked) = self.location();
+        Self::open(k, ino, parent, close_mask(writable), unlinked)
+    }
+
+    fn open(
+        k: &Kernel,
+        ino: Ino,
+        parent: Option<(Ino, Vec<u8>)>,
+        close: u32,
+        unlinked: bool,
+    ) -> Self {
+        let open = Self::new(&k.inotify, ino, parent, close, unlinked);
+        if active(k) {
+            open.0
+                .notify(&mut k.inotify.borrow_mut(), IN_OPEN, unlinked);
+        }
+        open
+    }
+
     fn location(&self) -> (Ino, Option<(Ino, Vec<u8>)>, bool) {
         (
             self.0.ino,
@@ -814,9 +835,18 @@ fn file_key(f: &OpenFile) -> Option<(Ino, u32)> {
         FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
             Some((f.ovl.map_or(*ino, overlay::key), 0))
         }
+        FileKind::Pipe(_) => Some((key_of(&f.node()?)?, 0)),
         FileKind::Directory { node, .. } => Some((key_of(node)?, IN_ISDIR)),
         FileKind::Fuse(h) => Some((crate::vfs::fuse::key(h.id), 0)),
         _ => None,
+    }
+}
+
+fn close_mask(writable: bool) -> u32 {
+    if writable {
+        IN_CLOSE_WRITE
+    } else {
+        IN_CLOSE_NOWRITE
     }
 }
 
@@ -829,11 +859,7 @@ pub(crate) fn opened(
     unlinked: bool,
 ) -> Option<Opened> {
     let (ino, dir) = file_key(f)?;
-    let close = if f.writable() {
-        IN_CLOSE_WRITE
-    } else {
-        IN_CLOSE_NOWRITE
-    };
+    let close = close_mask(f.writable());
     Some(Opened::new(&k.inotify, ino, parent, dir | close, unlinked))
 }
 
@@ -883,11 +909,7 @@ impl ExecOpens {
         });
         if !same {
             self.close_after(self.next);
-            let file = Opened::new(&k.inotify, ino, parent, IN_CLOSE_NOWRITE, unlinked);
-            if active(k) {
-                file.0
-                    .notify(&mut k.inotify.borrow_mut(), IN_OPEN, unlinked);
-            }
+            let file = Opened::open(k, ino, parent, IN_CLOSE_NOWRITE, unlinked);
             self.files.push((file, 0));
         }
         self.next += 1;

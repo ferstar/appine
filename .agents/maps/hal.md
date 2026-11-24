@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full verification: 10 claims checked by 2 independent verifiers across `lib.rs` and `net.rs` — 8 confirmed and 2 partial, both corrected below; no bugs found)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: retire the kernel caller of the fixed-address remapping helper)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-page private copy detection and pagemap availability)
 
 ## Responsibilities
 
@@ -98,8 +98,8 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   hints (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`, `MADV_WILLNEED`), all on host-page-aligned
   ranges; residency comes from `mincore` (`resident_pages`, `page_residency`)
   or `/proc/self/pagemap` (`touched_pages`, present or swapped bits — zram pages count as touched;
-  `has_private_pages`, whether a private file mapping has a page present without the file bit or
-  swapped, a copy written since it was mapped), all in 4K units (pages within one 16K host page
+  `private_pages` and `has_private_pages`, per-page and aggregate checks for present non-file or
+  swapped pages; `pagemap_readable` selects guest write tracking when entries are unavailable), all in 4K units (pages within one 16K host page
   share a result, so `resident_pages` may count 4K pages just outside the range); `cachestat` maps
   the file in chunks to count cached pages.
 - `memory_usage` reads `/proc/self/status`; `host_meminfo` copies host `/proc/meminfo` (falling

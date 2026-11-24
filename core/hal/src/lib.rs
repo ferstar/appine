@@ -319,44 +319,59 @@ pub fn page_residency(ptr: *const u8, len: usize) -> Vec<bool> {
 /// result. Returns None when pagemap cannot be read. mincore cannot be used: it reports pages
 /// swapped out (zram on Android) as "absent" too.
 pub fn touched_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
-    use std::os::unix::fs::FileExt;
-    let pagemap = pagemap()?;
+    page_flags(ptr, len, |entry| entry & (3 << 62) != 0)
+}
+
+/// Which 4 KiB pages are private copies in a host file mapping, including swapped-out copies.
+pub fn private_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
+    page_flags(ptr, len, is_private)
+}
+
+fn is_private(entry: u64) -> bool {
+    let (present, swapped, file) = (1 << 63, 1 << 62, 1 << 61);
+    entry & swapped != 0 || entry & (present | file) == present
+}
+
+fn page_flags(ptr: *const u8, len: usize, flag: impl Fn(u64) -> bool) -> Option<Vec<bool>> {
+    let raw = page_entries(ptr, len)?;
     let page = page_size();
-    let first = ptr as usize / page;
-    let last = (ptr as usize + len).div_ceil(page);
-    let mut raw = vec![0u8; (last - first) * 8];
-    pagemap.read_exact_at(&mut raw, first as u64 * 8).ok()?;
-    let touched = |host: usize| {
-        let i = (host - first) * 8;
-        let entry = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
-        entry & (3 << 62) != 0
-    };
+    let start = ptr as usize % page;
     Some(
         (0..len.div_ceil(4096))
-            .map(|i| touched((ptr as usize + i * 4096) / page))
+            .map(|i| {
+                let at = (start + i * 4096) / page * 8;
+                flag(u64::from_le_bytes(raw[at..at + 8].try_into().unwrap()))
+            })
             .collect(),
     )
 }
 
-/// Whether any host page of `[ptr, ptr + len)` in a private file mapping holds a private copy
-/// (written since it was mapped, so no longer the file's page): `/proc/self/pagemap` shows it
-/// present without the "file page" bit, or swapped. Returns None when pagemap cannot be read.
+/// Whether any host page of a private file mapping has been written privately.
 pub fn has_private_pages(ptr: *const u8, len: usize) -> Option<bool> {
+    Some(
+        page_entries(ptr, len)?
+            .chunks_exact(8)
+            .any(|e| is_private(u64::from_le_bytes(e.try_into().unwrap()))),
+    )
+}
+
+/// Hosts without readable page entries must track private file writes at guest faults.
+pub fn pagemap_readable() -> bool {
+    static READABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *READABLE.get_or_init(|| page_entries(&0u8, 1).is_some())
+}
+
+fn page_entries(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
     use std::os::unix::fs::FileExt;
     if len == 0 {
-        return Some(false);
+        return Some(Vec::new());
     }
-    let pagemap = pagemap()?;
     let page = page_size();
     let first = ptr as usize / page;
     let last = (ptr as usize + len).div_ceil(page);
-    let mut raw = vec![0u8; (last - first) * 8];
-    pagemap.read_exact_at(&mut raw, first as u64 * 8).ok()?;
-    Some(raw.chunks_exact(8).any(|e| {
-        let entry = u64::from_le_bytes(e.try_into().unwrap());
-        let (present, swapped, file) = (entry >> 63 & 1, entry >> 62 & 1, entry >> 61 & 1);
-        present == 1 && file == 0 || swapped == 1
-    }))
+    let mut raw = vec![0; (last - first) * 8];
+    pagemap()?.read_exact_at(&mut raw, first as u64 * 8).ok()?;
+    Some(raw)
 }
 
 /// `/proc/self/pagemap`, opened once.

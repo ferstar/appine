@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: distinguish the first shared tmpfs write from read admission)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: write faults for private files without host pagemap)
 
 ## Responsibilities
 
@@ -105,7 +105,9 @@ fast path and refill (`engine/dbt`).
   the VMA and EOF; existing entries are left alone and no flush is needed. A `Fill` VMA gets
   entries only for pages already read (`kernel/mm`). Tmpfs admits a single page. A read fault leaves it write-protected, and its first
   store goes through shared write admission or private CoW. A permission change revokes its entries. `MADV_POPULATE_READ` faults tmpfs pages
-  explicitly. For other non-FUSE files it and `MADV_WILLNEED` can prefill read-only soft PTEs
+  explicitly. On hosts without readable pagemap, ordinary private files prefill read permissions and
+  admit writes one guest page at a time, recording the underlying host CoW page. For non-tmpfs,
+  non-FUSE files, `MADV_POPULATE_READ` and `MADV_WILLNEED` can prefill read-only soft PTEs
   (up to 4 GB per call) via `fill_shared` without touching host pages.
 - `mprotect` to `PROT_NONE` keeps entries with prot 0 (the host page keeps its content); changing
   back rewrites the kept entries and fills the rest under the eager rule above, otherwise on demand.

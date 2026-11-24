@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: durable document ID generations for provider mutations)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: capability handling when opening documents for writing)
 
 ## Responsibilities
 
@@ -111,7 +111,7 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   from `Native.browseOpen` (follows symlinks without home confinement; regular files only). Any
   non-read-only mode requires a strict child of `home`, passes `truncate` (`MODE_TRUNCATE`) and
   `append` (`MODE_APPEND`) to `Native.browseOpenWrite` (`MODE_CREATE` ignored; real path confined
-  strictly inside `home`, unshares held objects, records `HOST_WRITERS`, replays `Change::Opened`),
+  strictly inside `home`, unshares held objects, clears guest file capabilities, records `HOST_WRITERS`, replays `Change::Opened`),
   and wraps the adopted fd with `ParcelFileDescriptor.wrap(..., closer)` on `documents-close` so
   closing invokes `Native.browseWritten` (clears `HOST_WRITERS` and replays `Change::Written` ->
   `IN_MODIFY` + `IN_CLOSE_WRITE`). If `wrap` throws `IOException`, the already-detached fd is

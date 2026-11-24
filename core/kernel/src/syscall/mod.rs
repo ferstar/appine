@@ -810,6 +810,37 @@ fn write_pair(cx: &Cx<'_>, addr: u64, a: i64, b: i64) -> Result<(), Errno> {
     put(cx, addr, buf)
 }
 
+/// After consuming an event or message, retry its result copy without repeating the operation.
+fn copy_result<T>(
+    cx: &mut Cx<'_>,
+    mut copy: impl FnMut(&Cx<'_>) -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    retry_user_pages(cx, Errno::EFAULT, |cx| copy(cx))
+}
+
+fn retry_user_pages<T>(
+    cx: &mut Cx<'_>,
+    interrupted: Errno,
+    mut op: impl FnMut(&mut Cx<'_>) -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    for _ in 0..=FUSE_RETRIES {
+        match op(cx) {
+            Err(Errno::FUSE_RETRY) => {
+                let page = crate::mm::take_wanted().ok_or(Errno::EFAULT)?;
+                fuse::fill(cx, page).map_err(|e| {
+                    if e == Errno::EINTR {
+                        interrupted
+                    } else {
+                        Errno::EFAULT
+                    }
+                })?;
+            }
+            result => return result,
+        }
+    }
+    Err(Errno::EFAULT)
+}
+
 /// Writes an integer type to guest memory.
 fn put<const N: usize>(cx: &Cx<'_>, addr: u64, bytes: [u8; N]) -> Result<(), Errno> {
     cx.write_user(UserSlice::new(addr, N), &bytes)

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: exec opens, ELF header reads, close lifetime and the registry of open files)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: last-close events for named pipes and magic-link reopens)
 
 ## Responsibilities
 
@@ -108,8 +108,8 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   exist (`watched_at`, falling back to a FUSE node's recorded parent/name if cached attrs staled).
   fd-based events (I/O, truncation, close) go to the directory and name the open went through,
   recorded in `Opened` (the dentry a Linux open file references): every non-`O_PATH` open of a
-  regular file, device or directory (store, overlay, FUSE, cgroup2 directories) or FUSE file
-  records one, whether or not watches exist; store FIFOs and cgroup2 files get none, so they
+  regular file, named FIFO, device or directory (store, overlay, FUSE, cgroup2 directories) or FUSE file
+  records one, whether or not watches exist. A reopened FIFO gets its own record at the original dentry. Cgroup2 files
   report `IN_OPEN` and never `IN_CLOSE_*`. Unlinks and renames update the records of open files,
   looking up records for the affected key even with no watches; after a deletion the records stay (marked
   unlinked), so non-excluded events still go to the original directory.
@@ -178,7 +178,7 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
 ## Confirmed bugs / technical debt
 
 - **fdinfo and event gaps:** fdinfo shows device 8:1 for every store-node watch, tmpfs files
-  included; store FIFOs and cgroup2 files report `IN_OPEN` but never `IN_CLOSE_*`.
+  included; cgroup2 files report `IN_OPEN` but never `IN_CLOSE_*`.
 - **Namespace-file watch lifetime:** repeated watches on `/proc/self/ns/mnt` reuse the descriptor
   by namespace ID. Native Linux 6.8 returned a new descriptor on each lookup when no fd pinned
   the nsfs inode, and reused it while an fd was open.

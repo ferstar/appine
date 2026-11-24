@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: preserve private tmpfs pages across fork and hole punching)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: fork installs the child VMA after setting up its private page tracking)
 
 ## Responsibilities
 
@@ -72,18 +72,20 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 - Per VMA (`MADV_DONTFORK` VMAs are skipped; the child's VMAs keep `dontdump` and `wipeonfork`):
   - private tmpfs mappings get a fresh private view of the pinned file. Fork copies only pages
     already written privately. Clean pages keep following the backing file and its quota.
-  - shared mappings, reservations and other read-only private file mappings share the parent's region;
+  - shared mappings, reservations and read-only private files outside tmpfs share the parent's region;
     read-only private file VMAs are marked `cow` on both sides;
-  - non-growsdown, non-reserved, non-heap anonymous or writable private-file VMAs of at most 1 MB
+  - non-growsdown, non-reserved, non-heap anonymous VMAs of at most 1 MB
     are carved (`carve`) from one `spare` region (`kernel/hostmem`);
   - the heap (the anonymous VMA at the page-aligned `brk_start`, at most 256 MB) gets a `spare`
     region of 256 MB; a growsdown anonymous VMA with reserved room below (`spare_below`) gets a
-    `spare` region of room plus length; everything else gets new anonymous memory
+    `spare` region of room plus length; other private anonymous VMAs get new anonymous memory
     (`kernel/hostmem`);
   - private anonymous VMAs that were ever written are lent, except `MADV_WIPEONFORK` ones, where
     the child keeps its own all-zero memory; never-written ones need nothing;
-  - writable private file VMAs are copied page by page up to EOF, skipping all-zero pages
-    (`copy_nonzero_pages`); a `Fill` one instead maps its host file privately again and copies the
+  - ordinary writable private file VMAs remap their pinned file and inherit only private pages,
+    including same-value writes. Host pagemap identifies these pages where readable. Otherwise
+    guest write faults record detached host pages across VMA splits. The verified musl snapshot keeps its own contents.
+    A `Fill` VMA maps its host file privately again and copies the
     pages read that differ from it, keeping the same fill (pages either side reads later reach
     both), and is never carved.
 
@@ -136,12 +138,12 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 ### Outbound
 
 - `kernel/mm`: `Mm` fields (`vmas`, `me`, `dirty`, `shared_maps`, layout/exec fields), `same_vma`,
-  `insert`, `fill_copy`, `note_shared_maps`, `OVERCOMMIT_MEMORY`.
+  `insert_vma`, `copy_private_file`, `note_shared_maps`, `OVERCOMMIT_MEMORY`.
 - `kernel/hostmem`: `HostRegion`, `spare::anonymous`, `Carved`, `Mm::new_anonymous`,
   `discard_host`, `copy_nonzero_pages`.
 - `kernel/mmu`: `Mmu::map_shared`, `Mmu::protect`, `Mmu::protect_shared`, `shootdown`,
   `touched_windows` (relying on page-table entries for non-zero pages).
-- `appine_hal`: `ram_and_swap`, `page_size`, `touched_pages`, `has_private_pages`.
+- `appine_hal`: `ram_and_swap`, `page_size`, `touched_pages`, `has_private_pages`, `private_pages`.
 
 ## Invariants and gotchas
 
@@ -161,7 +163,7 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 - Host `mincore` reports pages swapped to zram as absent, which is why `fork`'s touched-page check
   reads `/proc/self/pagemap` instead.
 - `fork` cannot fail after lending starts; all host allocations (`carve`, `spare::anonymous`,
-  `new_anonymous`, `fill_copy`, `child.insert`) run before `lend`.
+  `new_anonymous`, `copy_private_file`, `child.insert_vma`) run before `lend`.
 
 ## Confirmed bugs / technical debt
 

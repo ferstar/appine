@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-process descriptor limits on shared fd tables)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: named FIFO open records)
 
 ## Responsibilities
 
@@ -183,7 +183,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   new description takes the original's mount and display path (`/memfd:<name> (deleted)`,
   `pipe:[<n>]`) and records an `Opened`; unlike the memfd it reopens it is not `pseudo`, so it
   counts as a writer (exec `ETXTBSY`) as on Linux. Linked targets resolve to store or overlay
-  nodes and get the normal checks.
+  nodes and get the normal checks. Named FIFO opens and reopens each retain a last-close record.
 - File handles: `name_to_handle_at` (`AT_SYMLINK_FOLLOW`, `AT_EMPTY_PATH`, and 6.5's
   `AT_HANDLE_FID` ignored) encodes store nodes only (else `EOPNOTSUPP`) as 8 bytes of type 1 holding
   the inode number, and returns the mount id; over 128 bytes is `EINVAL`, too small `EOVERFLOW`.

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: extend mapping pins to private mmap)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: provider capability clearing and backing-object pins on Android)
 
 ## Responsibilities
 
@@ -281,8 +281,9 @@ provider and rootfs installation UI (`android`).
   rename and move without overwriting, open for writing with a read-write or append fd) are confined
   to a caller-supplied `top` directory compared by real path (`EACCES` outside, and for a `top`
   whose real path is the root directory, which would cover everything; `top` itself cannot be
-  removed). No guest permission checks are applied, tree removal is one transaction, and
-  provider writes do not strip setuid/setgid bits or capabilities.
+  removed). Tree removal is one transaction. Provider writes skip guest permission checks and
+  preserve setuid/setgid. A writable open clears file capabilities in the transaction that pins
+  the object, before truncation or fd handoff. Subsequent host writes use the returned description directly.
 - Removing or moving a source entry retires its document IDs atomically with the namespace change.
   `document_generations` reads one SQLite snapshot per batch, looking up the newest retired
   (parent inode, name) along the resolved path, including symlinks and their targets.
@@ -352,7 +353,6 @@ provider and rootfs installation UI (`android`).
 
 - Should importing a rootfs keep xattrs and file capabilities (the store supports them)?
 - Should `top` for provider writes be validated in the kernel, or is the JNI caller fully trusted?
-- Should provider writes strip setuid/setgid bits as Linux's `file_remove_privs` would?
 
 ## To verify
 

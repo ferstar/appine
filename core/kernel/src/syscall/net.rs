@@ -2336,37 +2336,6 @@ pub(super) fn sendto(
     send(cx, &sock, nonblock, &data, &addr, &[], flags).map(|n| n as u64)
 }
 
-/// Once input has been consumed, a failed fill is a copy fault and must not restart the receive.
-fn copy_socket_result<T>(
-    cx: &mut Cx<'_>,
-    mut copy: impl FnMut(&Cx<'_>) -> Result<T, Errno>,
-) -> Result<T, Errno> {
-    retry_socket_pages(cx, Errno::EFAULT, |cx| copy(cx))
-}
-
-fn retry_socket_pages<T>(
-    cx: &mut Cx<'_>,
-    interrupted: Errno,
-    mut op: impl FnMut(&mut Cx<'_>) -> Result<T, Errno>,
-) -> Result<T, Errno> {
-    for _ in 0..=super::FUSE_RETRIES {
-        match op(cx) {
-            Err(Errno::FUSE_RETRY) => {
-                let page = crate::mm::take_wanted().ok_or(Errno::EFAULT)?;
-                super::fuse::fill(cx, page).map_err(|e| {
-                    if e == Errno::EINTR {
-                        interrupted
-                    } else {
-                        Errno::EFAULT
-                    }
-                })?;
-            }
-            result => return result,
-        }
-    }
-    Err(Errno::EFAULT)
-}
-
 pub(super) fn recvfrom(
     cx: &mut Cx<'_>,
     fd: i32,
@@ -2519,12 +2488,12 @@ pub(super) fn recvmmsg(
         let hdr = vec + i * MMSGHDR_SIZE;
         // A mapped input can fault before this record is consumed. Keep the socket and all
         // completed records across the fill. recv_one handles faults after consumption.
-        let result = retry_socket_pages(cx, Errno::ERESTARTSYS, |cx| {
+        let result = super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| {
             let nonblock = file.borrow().nonblocking();
             recv_one(cx, &sock, nonblock, hdr, flags & !MSG_WAITFORONE)
         });
         if let Err(e) = result
-            .and_then(|n| copy_socket_result(cx, |cx| put(cx, hdr + 56, (n as u32).to_le_bytes())))
+            .and_then(|n| super::copy_result(cx, |cx| put(cx, hdr + 56, (n as u32).to_le_bytes())))
         {
             if done == 0 {
                 return Err(e);
@@ -2566,10 +2535,10 @@ fn recv_one(cx: &mut Cx<'_>, sock: &SocketRef, nonblock: bool, msg: u64, flags: 
     // Write msg_namelen, msg_controllen, msg_flags back to the msghdr
     if name != 0 {
         let n = (namelen as usize).min(m.addr.len());
-        copy_socket_result(cx, |cx| {
+        super::copy_result(cx, |cx| {
             cx.mm().write(UserSlice::new(name, n), &m.addr[..n])
         })?;
-        copy_socket_result(cx, |cx| {
+        super::copy_result(cx, |cx| {
             put(cx, msg + 8, (m.addr.len() as u32).to_le_bytes())
         })?;
     }
@@ -2577,7 +2546,7 @@ fn recv_one(cx: &mut Cx<'_>, sock: &SocketRef, nonblock: bool, msg: u64, flags: 
     // A control buffer that cannot be written loses its messages, not the data: the passed
     // files are not installed (receive_fd_user) and MSG_CTRUNC is set
     if n > 0
-        && copy_socket_result(cx, |cx| {
+        && super::copy_result(cx, |cx| {
             cx.mm().write(UserSlice::new(control, n), &m.control[..n])
         })
         .is_err()
@@ -2586,10 +2555,10 @@ fn recv_one(cx: &mut Cx<'_>, sock: &SocketRef, nonblock: bool, msg: u64, flags: 
         m.flags |= MSG_CTRUNC;
         n = 0;
     }
-    copy_socket_result(cx, |cx| put(cx, msg + 40, (n as u64).to_le_bytes()))?;
+    super::copy_result(cx, |cx| put(cx, msg + 40, (n as u64).to_le_bytes()))?;
     // As on Linux, msg_flags echoes the MSG_CMSG_CLOEXEC the caller gave
     const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
-    copy_socket_result(cx, |cx| {
+    super::copy_result(cx, |cx| {
         put(
             cx,
             msg + 48,
@@ -2635,7 +2604,7 @@ fn scatter_received(
     data: &[u8],
 ) -> Result<(), Errno> {
     scatter(iovecs, off, data, |dst, bytes| {
-        copy_socket_result(cx, |cx| cx.mm().write(dst, bytes))
+        super::copy_result(cx, |cx| cx.mm().write(dst, bytes))
     })
 }
 
@@ -5208,11 +5177,11 @@ fn write_addr(cx: &mut Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<
 
 /// getsockname, getpeername: `addrlen` must be valid, and a negative length is EINVAL.
 fn write_addr_to(cx: &mut Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
-    let len = copy_socket_result(cx, |cx| get(cx, addrlen))?;
+    let len = super::copy_result(cx, |cx| get(cx, addrlen))?;
     let room = usize::try_from(i32::from_le_bytes(len)).map_err(|_| Errno::EINVAL)?;
     let n = room.min(value.len());
-    copy_socket_result(cx, |cx| cx.mm().write(UserSlice::new(addr, n), &value[..n]))?;
-    copy_socket_result(cx, |cx| {
+    super::copy_result(cx, |cx| cx.mm().write(UserSlice::new(addr, n), &value[..n]))?;
+    super::copy_result(cx, |cx| {
         put(cx, addrlen, (value.len() as u32).to_le_bytes())
     })
 }

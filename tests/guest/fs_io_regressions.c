@@ -391,6 +391,47 @@ static void test_overlay_perm_before_copy_up(void)
 
 /* ---- 4. Overlay FIFO fstat matches stat before and after copy-up ---- */
 
+static void test_fifo_last_close(const char *dir, const char *path)
+{
+    CHECK(mkfifo(path, 0600) == 0, "create watched FIFO");
+    for (int write_end = 0; write_end < 2; write_end++) {
+        int fd = open(path, O_NONBLOCK | (write_end ? O_RDWR : O_RDONLY));
+        int i = inotify_init1(IN_NONBLOCK);
+        CHECK(fd >= 0 && i >= 0, "open FIFO and inotify");
+        int wd = inotify_add_watch(i, path, IN_CLOSE);
+        CHECK(wd >= 0, "watch already-open FIFO");
+        int other = dup(fd);
+        CHECK(other >= 0 && close(fd) == 0, "drop first FIFO reference");
+        struct inotify_event event;
+        CHECK(read(i, &event, sizeof(event)) == -1 && errno == EAGAIN, "premature FIFO close");
+        CHECK(close(other) == 0, "drop final FIFO reference");
+        CHECK(read(i, &event, sizeof(event)) == sizeof(event) && event.wd == wd &&
+              event.mask == (write_end ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE), "missing FIFO close");
+        close(i);
+    }
+    int fd = open(path, O_RDWR | O_NONBLOCK);
+    int i = inotify_init1(IN_NONBLOCK);
+    CHECK(fd >= 0 && i >= 0 && inotify_add_watch(i, path, IN_OPEN | IN_CLOSE) >= 0, "watch FIFO reopen");
+    int excluded = inotify_init1(IN_NONBLOCK);
+    CHECK(excluded >= 0 && inotify_add_watch(excluded, dir, IN_EXCL_UNLINK | IN_OPEN | IN_CLOSE) >= 0,
+          "watch FIFO parent");
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    CHECK(unlink(path) == 0, "unlink open FIFO");
+    int reopened = open(link, O_RDONLY | O_NONBLOCK);
+    CHECK(reopened >= 0 && close(reopened) == 0 && close(fd) == 0, "reopen deleted FIFO");
+    for (int n = 0; n < 3; n++) {
+        struct inotify_event event;
+        const unsigned expected[] = {IN_OPEN, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE};
+        CHECK(read(i, &event, sizeof(event)) == sizeof(event) && event.mask == expected[n],
+              "wrong event for deleted FIFO reopen");
+    }
+    struct inotify_event events[8];
+    CHECK(read(excluded, events, sizeof(events)) == -1 && errno == EAGAIN, "reported unlinked FIFO");
+    close(excluded);
+    close(i);
+}
+
 static void test_overlay_fifo_fstat(void)
 {
     setup_overlay_dirs("/tmp/ovl_f");
@@ -418,6 +459,7 @@ static void test_overlay_fifo_fstat(void)
     CHECK((fst2.st_mode & 0777) == 0600, "fifo fstat reflects updated mode");
 
     close(fd);
+    test_fifo_last_close("/tmp/ovl_f/merged", "/tmp/ovl_f/merged/watch-fifo");
     CHECK(umount2("/tmp/ovl_f/merged", 0) == 0, "umount ovl_f");
 }
 
@@ -1544,6 +1586,7 @@ int main(void)
     test_overlay_tmpfs_accounting();
     test_overlay_perm_before_copy_up();
     test_overlay_fifo_fstat();
+    test_fifo_last_close("/tmp", "/tmp/watch-fifo");
     test_inotify_core();
     test_fuse_inotify_and_sync();
     test_fileio_and_files();

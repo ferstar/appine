@@ -36,6 +36,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ipc.h>
+#include <sys/resource.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/ptrace.h>
@@ -439,12 +440,13 @@ struct fuse_ctx {
     _Atomic int slot_reserved;
 };
 
-/* Independent inodes keep demand reads for one receive output from warming another. */
+/* Independent inodes keep demand reads for one output from warming another. */
 static uint64_t fuse_file_node(const char *name)
 {
     static const char *const files[] = {
         "data", "recv-data", "recv-peer", "recv-peer-len", "batch-len", "batch-data",
         "batch-peer", "rights-control", "unix-data",
+        "wait-status", "wait-info", "wait4-usage", "waitid-usage",
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++)
         if (strcmp(name, files[i]) == 0)
@@ -821,7 +823,7 @@ static void test_pagemap_cow_lent_not_exclusive(void)
     munmap(p, 4096);
 }
 
-static void *map_receive_page(int dir, const char *name, void *at)
+static void *map_output_page(int dir, const char *name, void *at)
 {
     int fd = openat(dir, name, O_RDONLY);
     CHECK(fd >= 0, "open FUSE output %s", name);
@@ -829,6 +831,35 @@ static void *map_receive_page(int dir, const char *name, void *at)
     CHECK(p != MAP_FAILED && (!at || p == at), "map FUSE output %s", name);
     close(fd);
     return p;
+}
+
+static void wait_fuse_outputs(int dir, struct fuse_ctx *ctx)
+{
+    for (int use_id = 0; use_id < 2; use_id++) {
+        void *result = map_output_page(dir, use_id ? "wait-info" : "wait-status", NULL);
+        struct rusage *usage = map_output_page(dir, use_id ? "waitid-usage" : "wait4-usage", NULL);
+        pid_t child = fork();
+        CHECK(child >= 0, "fork for cold wait outputs");
+        if (!child)
+            _exit(37);
+        int before = ctx->read_ops;
+        if (use_id) {
+            siginfo_t *info = result;
+            CHECK(syscall(SYS_waitid, P_PID, child, info, WEXITED, usage) == 0, "waitid cold outputs");
+            CHECK(info->si_pid == child && info->si_code == CLD_EXITED && info->si_status == 37,
+                  "waitid returned wrong child status");
+        } else {
+            int *status = result;
+            CHECK(wait4(child, status, 0, usage) == child, "wait4 cold outputs");
+            CHECK(WIFEXITED(*status) && WEXITSTATUS(*status) == 37, "wait4 returned wrong status");
+        }
+        CHECK(ctx->read_ops >= before + 2, "wait must fill both outputs");
+        CHECK(usage->ru_utime.tv_usec >= 0 && usage->ru_utime.tv_usec < 1000000 &&
+              usage->ru_stime.tv_usec >= 0 && usage->ru_stime.tv_usec < 1000000, "invalid wait rusage");
+        CHECK(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD, "child must be reaped once");
+        munmap(result, 4096);
+        munmap(usage, 4096);
+    }
 }
 
 static int bind_loopback_udp(struct sockaddr_in *addr)
@@ -853,10 +884,10 @@ static void queue_datagrams(int sock, const struct sockaddr_in *addr, const char
 /* Filling the three output mappings must not receive another packet. */
 static void recvfrom_fuse_outputs(int dir, struct fuse_ctx *ctx)
 {
-    unsigned char *data = map_receive_page(dir, "recv-data", NULL);
-    struct sockaddr_in *peer = map_receive_page(dir, "recv-peer", NULL);
+    unsigned char *data = map_output_page(dir, "recv-data", NULL);
+    struct sockaddr_in *peer = map_output_page(dir, "recv-peer", NULL);
     /* The daemon fills page zero with 0x40, so the initial socklen is large enough. */
-    socklen_t *peer_len = map_receive_page(dir, "recv-peer-len", NULL);
+    socklen_t *peer_len = map_output_page(dir, "recv-peer-len", NULL);
     struct sockaddr_in addr;
     int sock = bind_loopback_udp(&addr);
     queue_datagrams(sock, &addr, "AB");
@@ -880,11 +911,11 @@ static void recvmmsg_fuse_outputs(int dir, struct fuse_ctx *ctx)
     const size_t page = 4096;
     char *pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     CHECK(pages != MAP_FAILED, "allocate mmsghdr array");
-    map_receive_page(dir, "batch-len", pages + page);
+    map_output_page(dir, "batch-len", pages + page);
     struct mmsghdr *batch = (void *)(pages + page - offsetof(struct mmsghdr, msg_len) -
                                       sizeof(struct mmsghdr));
-    char *data = map_receive_page(dir, "batch-data", NULL);
-    struct sockaddr_in *peer = map_receive_page(dir, "batch-peer", NULL);
+    char *data = map_output_page(dir, "batch-data", NULL);
+    struct sockaddr_in *peer = map_output_page(dir, "batch-peer", NULL);
     struct iovec iov[] = {{data, 1}, {data + 1, 1}};
     batch[0].msg_hdr = (struct msghdr){.msg_name = peer, .msg_namelen = sizeof(*peer),
                                         .msg_iov = iov, .msg_iovlen = 1};
@@ -939,7 +970,7 @@ static void recvmsg_fuse_rights(int dir, struct fuse_ctx *ctx)
     byte = 'C';
     CHECK(sendmsg(sockets[0], &msg, 0) == 1, "send rights to read-only header");
     close(pipefd[1]);
-    void *control = map_receive_page(dir, "rights-control", NULL);
+    void *control = map_output_page(dir, "rights-control", NULL);
     msg.msg_control = control;
     byte = 0;
     ctx->receiving_fd = pipefd[1];
@@ -979,7 +1010,7 @@ static void recvmsg_fuse_rights(int dir, struct fuse_ctx *ctx)
     munmap(control, 4096);
     /* A Unix datagram stays queued when its payload copy encounters an unread page. A fault
      * on the second record must retry that record even though the batch already made progress. */
-    char *second = map_receive_page(dir, "unix-data", NULL);
+    char *second = map_output_page(dir, "unix-data", NULL);
     struct iovec second_iov = {second, 1};
     struct mmsghdr batch[] = {
         {.msg_hdr = {.msg_iov = &iov, .msg_iovlen = 1}},
@@ -1011,6 +1042,7 @@ static void test_fuse_short_read_mapping(void)
     CHECK(m != MAP_FAILED, "mmap fuse data");
     int dir = open("/tmp/fuse_short", O_RDONLY | O_DIRECTORY);
     CHECK(dir >= 0, "open FUSE fixture directory");
+    wait_fuse_outputs(dir, &ctx);
     recvfrom_fuse_outputs(dir, &ctx);
     recvmmsg_fuse_outputs(dir, &ctx);
     recvmsg_fuse_rights(dir, &ctx);

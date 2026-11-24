@@ -244,22 +244,52 @@ impl AdviseRange {
     }
 }
 
-#[derive(Clone)]
-struct TmpfsPages {
-    mapping: Rc<crate::vfs::TmpfsMapping>,
-    /// File offsets with private copies. These survive a hole punched in the backing file.
+struct FilePages {
+    tmpfs: Option<Rc<crate::vfs::TmpfsMapping>>,
+    /// File offsets with private copies. Split ordinary VMAs share this set across host pages.
     copied: std::cell::RefCell<BTreeSet<u64>>,
 }
 
-impl TmpfsPages {
+impl FilePages {
+    fn new(tmpfs: Option<Rc<crate::vfs::TmpfsMapping>>, copied: BTreeSet<u64>) -> Rc<Self> {
+        Rc::new(Self {
+            tmpfs,
+            copied: copied.into(),
+        })
+    }
+
+    /// Tmpfs tracks admitted guest pages. A write to an ordinary private mapping detaches
+    /// a whole host page, including the part covered by another piece of a split VMA.
+    fn page_size(&self) -> u64 {
+        if self.tmpfs.is_some() {
+            PAGE_SIZE
+        } else {
+            appine_hal::page_size() as u64
+        }
+    }
+
+    fn page_start(&self, offset: u64) -> u64 {
+        offset & !(self.page_size() - 1)
+    }
+
+    fn detached(&self, offset: u64, len: u64) -> Rc<Self> {
+        let range = self.page_start(offset)..offset + len;
+        Self::new(
+            self.tmpfs.clone(),
+            self.copied.borrow().range(range).copied().collect(),
+        )
+    }
+
     /// Admit a page at a byte offset within its VMA and return whether it can be mapped writable.
     fn admit(&self, vma: &Vma, delta: u64, write: bool) -> Result<bool, Errno> {
-        let offset = vma.offset() + delta;
+        let offset = self.page_start(vma.offset() + delta);
         let private = vma.backing == Backing::PrivateFile;
         if private && self.copied.borrow().contains(&offset) {
             return Ok(true);
         }
-        self.mapping.fault(offset, !private && write)?;
+        if let Some(tmpfs) = &self.tmpfs {
+            tmpfs.fault(offset, !private && write)?;
+        }
         if private && write {
             // SAFETY: this host page is mapped MAP_PRIVATE and writable regardless of guest
             // permissions. Break host CoW before recording the page as independent of the file.
@@ -834,18 +864,35 @@ struct Vma {
     /// its own, shared by the pieces that were one VMA in the parent. On Linux such child VMAs no
     /// longer merge with their neighbours, while the parent's still do.
     anon: u64,
-    /// A tmpfs file whose sparse pages must fit the mount before they get a translation.
-    tmpfs: Option<Box<TmpfsPages>>,
+    /// Per-page faults for tmpfs quota or private writes on hosts without readable pagemap.
+    pages: Option<Rc<FilePages>>,
+    /// The verified musl mapping uses an immutable snapshot distinct from the pinned store fd.
+    snapshot: bool,
     /// A file mapping read on demand ([`Fill`]); its `file_len` stays 0.
     fill: Option<Rc<Fill>>,
 }
 
 impl Vma {
     fn eager_len(&self) -> u64 {
-        if self.tmpfs.is_some() {
+        if self.tmpfs().is_some() {
             0
         } else {
             self.file_len
+        }
+    }
+
+    fn tmpfs(&self) -> Option<&Rc<crate::vfs::TmpfsMapping>> {
+        self.pages.as_ref()?.tmpfs.as_ref()
+    }
+
+    /// Regular file reads keep the usual prefill. When tracking writes in software, only
+    /// the first store to a page needs to fault.
+    fn prefill_prot(&self) -> u32 {
+        let prot = mmu_prot(self.prot);
+        if self.pages.is_some() {
+            prot & !prot::WRITE
+        } else {
+            prot
         }
     }
 
@@ -1722,7 +1769,9 @@ impl Mm {
             return Ok(false);
         }
         let present = self.mmu.next_present(page, page + PAGE_SIZE) == page;
-        if let Some(t) = &v.tmpfs {
+        if let Some(t) = &v.pages
+            && (t.tmpfs.is_some() || need & prot::WRITE != 0)
+        {
             if present && (need & prot::WRITE == 0 || self.mmu.translate(page, need).is_some()) {
                 return Ok(false);
             }
@@ -1751,7 +1800,9 @@ impl Mm {
             // SAFETY: [lo, hi) is inside the part of this VMA with contents, and it holds the host
             // memory
             let host = unsafe { v.host.add((lo - s) as usize) };
-            return Ok(unsafe { self.mmu.fill_shared(lo, host, hi - lo, p) }.is_ok());
+            return Ok(
+                unsafe { self.mmu.fill_shared(lo, host, hi - lo, v.prefill_prot()) }.is_ok(),
+            );
         };
         // Read on demand: only the pages already read
         if v.unread(s, page).is_some() {
@@ -1899,6 +1950,10 @@ impl Mm {
             tail.host = mapping.ptr;
             tail.region = region;
             tail.cow = false;
+            tail.snapshot = false;
+            if let Some(pages) = &mut tail.pages {
+                *pages = FilePages::new(pages.tmpfs.clone(), BTreeSet::new());
+            }
             tail.content = None;
             tail.file_len = extent - from;
         } else {
@@ -2100,7 +2155,7 @@ impl Mm {
             }
             let offset = cur % PAGE_SIZE;
             let n = (dst.len() - done).min((PAGE_SIZE - offset) as usize);
-            if let Some(t) = &v.tmpfs {
+            if let Some(t) = &v.pages {
                 t.admit(v, cur - offset - start, false)
                     .map_err(|_| Errno::EFAULT)?;
             }
@@ -2269,7 +2324,7 @@ impl Mm {
                 .filter(|&(&s, v)| cur < s + v.contents_len())
                 .ok_or(Errno::EFAULT)?;
             let chunk = ((s + v.contents_len() - cur) as usize).min(data.len() - done);
-            if let Some(t) = &v.tmpfs {
+            if let Some(t) = &v.pages {
                 for page in
                     ((cur & !(PAGE_SIZE - 1))..cur + chunk as u64).step_by(PAGE_SIZE as usize)
                 {
@@ -2300,7 +2355,7 @@ impl Mm {
                 let hi = page_up(cur + chunk as u64).unwrap_or(s + v.len);
                 // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
                 let host = unsafe { v.host.add((lo - s) as usize) };
-                unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) }
+                unsafe { self.mmu.fill_shared(lo, host, hi - lo, v.prefill_prot()) }
                     .map_err(map_err)?;
             }
             done += chunk;
@@ -2613,24 +2668,20 @@ impl Mm {
             }
             _ => None,
         };
-        let eager = if tmpfs.is_some() { 0 } else { file_len };
-        self.insert(start, len, eager, prot, backing, may_write, region, host)?;
-        let has_fill = fill.is_some();
-        self.fills |= has_fill;
-        let v = self.vmas.get_mut(&start).unwrap();
-        v.file_len = file_len;
-        v.tmpfs = tmpfs.map(|mapping| {
-            Box::new(TmpfsPages {
-                mapping,
-                copied: Default::default(),
-            })
-        });
+        let track = tmpfs.is_some()
+            || backing == Backing::PrivateFile && fill.is_none() && !appine_hal::pagemap_readable();
+        let mut v = self.new_vma(len, file_len, prot, backing, may_write, region, host);
+        v.pages = track.then(|| FilePages::new(tmpfs, BTreeSet::new()));
+        v.snapshot = bundled_libc.is_some();
         v.file_id = file_id;
         v.content = content;
         v.cow = cached;
         v.file = dup;
         v.noreserve = flags & flags::MAP_NORESERVE != 0;
+        let has_fill = fill.is_some();
         v.fill = fill;
+        self.insert_vma(start, v)?;
+        self.fills |= has_fill;
         if backing == Backing::Shared && may_write {
             self.note_shared_maps(false);
         }
@@ -2783,7 +2834,7 @@ impl Mm {
                     mnt: v.mnt.as_ref().map(|m| m.0),
                     flags: VmaFlags::of(v),
                     file: v.file.as_ref().map(|(fd, _)| fd.clone()),
-                    tmpfs: v.tmpfs.as_ref().map(|t| t.mapping.clone()),
+                    tmpfs: v.tmpfs().cloned(),
                     interp_open: v.interp_open.clone(),
                 }),
             }
@@ -3011,12 +3062,11 @@ impl Mm {
             }
         };
         Ok(Vma {
-            tmpfs: template.tmpfs.as_ref().map(|t| {
-                Box::new(TmpfsPages {
-                    mapping: t.mapping.clone(),
-                    copied: Default::default(),
-                })
-            }),
+            snapshot: false,
+            pages: template
+                .pages
+                .as_ref()
+                .map(|p| FilePages::new(p.tmpfs.clone(), BTreeSet::new())),
             len,
             region,
             host,
@@ -3170,11 +3220,10 @@ impl Mm {
             prot,
             flags,
             Some((raw, offset, may_write)),
-            v.fill.clone().map(FileSource::Fuse).or_else(|| {
-                v.tmpfs
-                    .as_ref()
-                    .map(|t| FileSource::Tmpfs(t.mapping.clone()))
-            }),
+            v.fill
+                .clone()
+                .map(FileSource::Fuse)
+                .or_else(|| v.tmpfs().cloned().map(FileSource::Tmpfs)),
         )?;
         if !may_exec {
             self.deny_exec(start, len);
@@ -3487,12 +3536,20 @@ impl Mm {
             // refilled on a miss, so no flush is needed
             let (old, new) = (mmu_prot(v.prot), mmu_prot(prot));
             self.dirty |= old & !new != 0;
-            if v.tmpfs.is_some() {
+            if v.pages.is_some() {
+                v.prot = prot;
                 if old != new {
                     self.mmu.unmap(s, v.len).map_err(map_err)?;
                     self.dirty = true;
+                    Self::prefill_pages(
+                        &mut self.mmu,
+                        s,
+                        v.host,
+                        v.eager_len(),
+                        v.prefill_prot(),
+                        true,
+                    );
                 }
-                v.prot = prot;
                 if new & prot::WRITE != 0 {
                     v.written.set(true);
                 }
@@ -3576,9 +3633,9 @@ impl Mm {
             let from = addr.max(s);
             let to = end.min(s + v.file_len);
             if from < to {
-                if let Some(mapping) = &v.tmpfs {
+                if let Some(mapping) = v.tmpfs() {
                     tmpfs.push(TmpfsRange {
-                        mapping: mapping.mapping.clone(),
+                        mapping: mapping.clone(),
                         offset: v.offset() + from - s,
                         len: to - from,
                     });
@@ -3638,7 +3695,7 @@ impl Mm {
             .range(first..end)
             .filter(|&(&s, v)| s + v.len > addr)
         {
-            if v.tmpfs.is_some() && populate {
+            if v.tmpfs().is_some() && populate {
                 if mmu_prot(v.prot) & prot::READ == 0 {
                     return Err(Errno::EINVAL);
                 }
@@ -3655,7 +3712,7 @@ impl Mm {
             }
             if budget == 0
                 || v.file_id.is_none()
-                || v.tmpfs.is_some()
+                || v.tmpfs().is_some()
                 || v.fill.is_some()
                 || v.foreign()
                 || v.region.gpu.is_some()
@@ -3839,10 +3896,13 @@ impl Mm {
                         cursor = stop;
                         continue;
                     }
-                    if let Some(t) = &v.tmpfs {
+                    if let Some(t) = &v.pages {
                         let lo = v.offset() + cursor - s;
                         let hi = v.offset() + in_file - s;
-                        t.copied.borrow_mut().retain(|off| *off < lo || *off >= hi);
+                        let grain = t.page_size();
+                        t.copied
+                            .borrow_mut()
+                            .retain(|off| *off < lo || *off + grain > hi);
                         self.mmu.unmap(cursor, in_file - cursor).map_err(map_err)?;
                         self.dirty = true;
                     }
@@ -3887,6 +3947,16 @@ impl Mm {
         let end = addr.saturating_add(data.len() as u64);
         if v.backing != Backing::PrivateFile || v.cow || end > s + v.len {
             return;
+        }
+        if let Some(pages) = &v.pages
+            && pages.tmpfs.is_none()
+            && !data.is_empty()
+        {
+            let from = pages.page_start(v.offset() + addr - s);
+            pages
+                .copied
+                .borrow_mut()
+                .extend((from..v.offset() + end - s).step_by(pages.page_size() as usize));
         }
         // SAFETY: [addr, end) is inside this VMA's own writable host memory
         unsafe {
@@ -4078,7 +4148,7 @@ impl Mm {
                 continue;
             }
             let (lo, hi) = (from & !(PAGE_SIZE - 1), page_up(to).unwrap_or(to));
-            if v.tmpfs.is_some() {
+            if v.tmpfs().is_some() {
                 for page in (lo..hi).step_by(PAGE_SIZE as usize) {
                     if self.mmu.next_present(page, page + PAGE_SIZE) != page {
                         self.try_fault_in(page, 0).map_err(|_| Errno::EFAULT)?;
@@ -4127,7 +4197,7 @@ impl Mm {
             // (copy-on-write ones) are left alone
             // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
             let host = unsafe { v.host.add((lo - s) as usize) };
-            let _ = unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) };
+            let _ = unsafe { self.mmu.fill_shared(lo, host, hi - lo, v.prefill_prot()) };
         }
         Ok(())
     }
@@ -4273,9 +4343,9 @@ impl Mm {
 
     /// fork: makes a new address space. Written private anonymous mappings are copy-on-write
     /// ([`Mm::lend`]); contents never written are all zero, so the child uses its own; writable
-    /// private file mappings are copied page by page (skipping all-zero pages, copying only the
-    /// part before the end of the file). Shared mappings and read-only private file mappings share
-    /// host memory with the child. The caller first stops the other threads of the same address
+    /// private file mappings retain their file backing and inherit private copies page by page.
+    /// Shared mappings and read-only private file mappings share host memory with the child.
+    /// The caller first stops the other threads of the same address
     /// space outside guest code ([`Mm::quiesce`]).
     pub fn fork(&mut self) -> Result<Rc<RefCell<Mm>>, Errno> {
         if OVERCOMMIT_MEMORY.load(Ordering::Relaxed) != 1
@@ -4331,13 +4401,7 @@ impl Mm {
                     && !v.reserved()
                     && !is_heap(s, v)
                     && v.len <= FORK_PIECE_MAX
-                    && match v.backing {
-                        Backing::Shared => false,
-                        Backing::PrivateFile => {
-                            v.prot & prot::WRITE != 0 && v.fill.is_none() && v.tmpfs.is_none()
-                        }
-                        Backing::Anonymous => true,
-                    }
+                    && v.backing == Backing::Anonymous
             })
             .map(|(&s, _)| s)
             .collect();
@@ -4384,7 +4448,7 @@ impl Mm {
                     Backing::Shared => true,
                     // Neither side can write, so the contents cannot diverge; whoever makes it
                     // writable copies its own
-                    Backing::PrivateFile if v.prot & prot::WRITE == 0 && v.tmpfs.is_none() => {
+                    Backing::PrivateFile if v.prot & prot::WRITE == 0 && v.tmpfs().is_none() => {
                         v.cow = true;
                         true
                     }
@@ -4392,28 +4456,8 @@ impl Mm {
                 };
             let (region, host) = if share {
                 (v.region.clone(), v.host)
-            } else if let Some(t) = &v.tmpfs {
-                use std::os::fd::AsRawFd;
-                let (fd, offset) = v.file.as_ref().ok_or(Errno::EFAULT)?;
-                let mapped =
-                    appine_hal::map_file(fd.as_raw_fd(), *offset, v.len as usize, false, true)
-                        .map_err(Errno)?;
-                let region = HostRegion::file(mapped.base, mapped.len);
-                for at in t.copied.borrow().range(*offset..*offset + v.file_len) {
-                    let delta = (*at - offset) as usize;
-                    // SAFETY: fork stopped the parent's users. Both pages lie before the
-                    // rounded EOF, and the child's mapping is new and private.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            v.host.as_ptr().add(delta),
-                            mapped.ptr.as_ptr().add(delta),
-                            PAGE_SIZE as usize,
-                        );
-                    }
-                }
-                (region, mapped.ptr)
-            } else if v.fill.is_some() {
-                Self::fill_copy(v)?
+            } else if v.backing == Backing::PrivateFile {
+                Self::copy_private_file(v)?
             } else {
                 // The heap still reserves host address space, so growing it in the child extends
                 // the same VMA too
@@ -4434,30 +4478,22 @@ impl Mm {
                     // of more than ten TB
                     Self::new_anonymous(v.len, v.prot & prot::WRITE != 0 && !v.noreserve)?
                 };
-                let len = v.file_len as usize;
-                // Wiped on fork: the child keeps its own all-zero memory
-                if v.backing == Backing::Anonymous && v.written.get() && !v.wipeonfork {
+                if v.written.get() && !v.wipeonfork {
                     cow.push(start);
-                } else if v.backing != Backing::Anonymous {
-                    // SAFETY: both pieces of host memory have at least v.len bytes and do not
-                    // overlap
-                    unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), len, None) };
                 }
                 (region, host)
             };
-            child.insert(
-                start,
+            let mut c = child.new_vma(
                 v.len,
-                v.eager_len(),
+                v.file_len,
                 v.prot,
                 v.backing,
                 v.may_write,
                 region,
                 host,
-            )?;
-            let c = child.vmas.get_mut(&start).unwrap();
-            c.file_len = v.file_len;
-            c.tmpfs = v.tmpfs.clone();
+            );
+            c.pages = v.pages.as_ref().map(|p| p.detached(v.offset(), v.len));
+            c.snapshot = v.snapshot;
             c.may_exec = v.may_exec;
             c.written.set(v.written.get());
             c.name = v.name.clone();
@@ -4474,6 +4510,7 @@ impl Mm {
             c.wipeonfork = v.wipeonfork;
             c.anon = anon[&start];
             c.fill = v.fill.clone();
+            child.insert_vma(start, c)?;
         }
         let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
         for start in cow {
@@ -4652,7 +4689,7 @@ impl Mm {
     pub(crate) fn punch_tmpfs(&mut self, ino: u64, offset: u64, end: u64) -> bool {
         let mut changed = false;
         for (&s, v) in &self.vmas {
-            if v.tmpfs.as_ref().is_none_or(|t| t.mapping.ino != ino) {
+            if v.tmpfs().is_none_or(|t| t.ino != ino) {
                 continue;
             }
             let first = v.offset();
@@ -4735,7 +4772,7 @@ impl Mm {
             if v.prot & prot::EXEC != 0 {
                 self.code_ranges.push((start + extent, old - extent));
             }
-            if let Some(t) = &v.tmpfs {
+            if let Some(t) = &v.pages {
                 t.copied.borrow_mut().retain(|at| *at < offset + extent);
             }
             if v.fill.is_none() {
@@ -5376,34 +5413,75 @@ impl Mm {
         Ok(())
     }
 
+    /// Recreate a private file view, copying only pages already detached from the backing file.
+    fn copy_private_file(v: &Vma) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        use std::os::fd::AsRawFd;
+        if v.fill.is_some() {
+            return Self::fill_copy(v);
+        }
+        if v.snapshot {
+            let (region, host) =
+                Self::new_anonymous(v.len, v.prot & prot::WRITE != 0 && !v.noreserve)?;
+            // SAFETY: the snapshot cannot shrink and the new mapping covers its whole extent.
+            unsafe {
+                copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize, None)
+            };
+            return Ok((region, host));
+        }
+        let (fd, offset) = v.file.as_ref().ok_or(Errno::EFAULT)?;
+        let raw = fd.as_raw_fd();
+        let mapped =
+            appine_hal::map_file(raw, *offset, v.len as usize, false, true).map_err(Errno)?;
+        let region = HostRegion::file(mapped.base, mapped.len);
+        let len = v.file_len.min(file_extent(raw, *offset, v.len));
+        let copy = |delta: u64| {
+            // SAFETY: both views cover this page before rounded EOF, and the destination is private.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    v.host.as_ptr().add(delta as usize),
+                    mapped.ptr.as_ptr().add(delta as usize),
+                    PAGE_SIZE as usize,
+                )
+            };
+        };
+        if let Some(pages) = &v.pages {
+            let grain = pages.page_size();
+            let end = *offset + len;
+            for &at in pages.copied.borrow().range(pages.page_start(*offset)..end) {
+                for page in (at.max(*offset)..(at + grain).min(end)).step_by(PAGE_SIZE as usize) {
+                    copy(page - offset);
+                }
+            }
+        } else if v.written.get() {
+            for start in (0..len).step_by(WINDOW_MAX as usize) {
+                let size = (len - start).min(WINDOW_MAX) as usize;
+                let pages =
+                    appine_hal::private_pages(v.host.as_ptr().wrapping_add(start as usize), size)
+                        .ok_or(Errno::EIO)?;
+                for (index, private) in pages.into_iter().enumerate() {
+                    if private {
+                        copy(start + index as u64 * PAGE_SIZE);
+                    }
+                }
+            }
+        }
+        Ok((region, mapped.ptr))
+    }
+
     /// Gives a private file mapping that shares host memory with other address spaces a copy of
     /// its own.
     fn unshare(&mut self, start: u64) -> Result<(), Errno> {
         let v = &self.vmas[&start];
-        if v.fill.is_some() {
-            // Read on demand: the entries come back as pages are touched again
-            let (region, host) = Self::fill_copy(v)?;
-            self.mmu.unmap(start, v.len).map_err(map_err)?;
-            let v = self.vmas.get_mut(&start).unwrap();
-            let old = std::mem::replace(&mut v.region, region);
-            v.host = host;
-            v.cow = false;
-            self.graveyard.push(old);
-            self.dirty = true;
-            return Ok(());
-        }
-        let reserve = v.prot & prot::WRITE != 0 && !v.noreserve;
-        let (region, host) = Self::new_anonymous(v.len, reserve)?;
-        // SAFETY: both pieces of host memory have at least v.len bytes and do not overlap
-        unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize, None) };
+        let (region, host) = Self::copy_private_file(v)?;
         // The old entries point at the shared piece, so remove them first (map_pages leaves
         // existing entries alone); pages past the end of the file still stay out of the page
         // table
-        let (file_len, eager, p) = (v.file_len, v.eager_len(), v.prot);
-        self.mmu.unmap(start, file_len).map_err(map_err)?;
+        let (eager, p) = (v.eager_len(), v.prefill_prot());
+        self.mmu.unmap(start, v.len).map_err(map_err)?;
         Self::map_pages(&mut self.mmu, start, host, eager, p, true)?;
         let v = self.vmas.get_mut(&start).unwrap();
         let old = std::mem::replace(&mut v.region, region);
+        v.pages = v.pages.as_ref().map(|p| p.detached(v.offset(), v.len));
         v.host = host;
         v.cow = false;
         // Other threads' TLBs may still hold stale translations: release only after the shootdown
@@ -5457,44 +5535,51 @@ impl Mm {
         region: Arc<HostRegion>,
         host: NonNull<u8>,
     ) -> Result<(), Errno> {
-        self.room_for(1)?;
-        region.note_used(host, file_len as usize);
-        let file = backing != Backing::Anonymous;
-        Self::map_pages(&mut self.mmu, start, host, file_len, prot, file)?;
-        self.exec_changed |= prot & prot::EXEC != 0;
-        self.vmas.insert(
-            start,
-            Vma {
-                len,
-                prot,
-                backing,
-                may_write,
-                may_exec: true,
-                region,
-                name: None,
-                ino: 0,
-                mnt: None,
-                host,
-                file_len,
-                cow: false,
-                interp_open: None,
-                file_id: None,
-                content: None,
-                file: None,
-                shm: None,
-                locked: self.lock_future,
-                written: Cell::new(prot & prot::WRITE != 0),
-                growsdown: false,
-                dontdump: false,
-                wipeonfork: false,
-                dontfork: false,
-                noreserve: false,
-                anon: 0,
-                fill: None,
-                tmpfs: None,
-            },
-        );
-        Ok(())
+        let vma = self.new_vma(len, file_len, prot, backing, may_write, region, host);
+        self.insert_vma(start, vma)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_vma(
+        &self,
+        len: u64,
+        file_len: u64,
+        prot: u32,
+        backing: Backing,
+        may_write: bool,
+        region: Arc<HostRegion>,
+        host: NonNull<u8>,
+    ) -> Vma {
+        Vma {
+            len,
+            prot,
+            backing,
+            may_write,
+            may_exec: true,
+            region,
+            name: None,
+            ino: 0,
+            mnt: None,
+            host,
+            file_len,
+            cow: false,
+            interp_open: None,
+            file_id: None,
+            content: None,
+            file: None,
+            shm: None,
+            locked: self.lock_future,
+            written: Cell::new(prot & prot::WRITE != 0),
+            growsdown: false,
+            dontdump: false,
+            wipeonfork: false,
+            dontfork: false,
+            noreserve: false,
+            anon: 0,
+            fill: None,
+            pages: None,
+            snapshot: false,
+        }
     }
 
     /// Puts a whole VMA at `start`; the caller guarantees the range is free.
@@ -5502,7 +5587,14 @@ impl Mm {
         self.room_for(1)?;
         v.region.note_used(v.host, v.file_len as usize);
         let file = v.backing != Backing::Anonymous;
-        Self::map_pages(&mut self.mmu, start, v.host, v.eager_len(), v.prot, file)?;
+        Self::map_pages(
+            &mut self.mmu,
+            start,
+            v.host,
+            v.eager_len(),
+            v.prefill_prot(),
+            file,
+        )?;
         self.exec_changed |= v.prot & prot::EXEC != 0;
         self.vmas.insert(start, v);
         Ok(())
@@ -5514,7 +5606,14 @@ impl Mm {
     fn place_moved_vma(&mut self, start: u64, v: Vma) {
         v.region.note_used(v.host, v.file_len as usize);
         let file = v.backing != Backing::Anonymous;
-        Self::prefill_pages(&mut self.mmu, start, v.host, v.eager_len(), v.prot, file);
+        Self::prefill_pages(
+            &mut self.mmu,
+            start,
+            v.host,
+            v.eager_len(),
+            v.prefill_prot(),
+            file,
+        );
         self.exec_changed |= v.prot & prot::EXEC != 0;
         self.vmas.insert(start, v);
     }
@@ -5571,11 +5670,11 @@ impl Mm {
         // Reservations and shared anonymous tails can have offsets beyond the host region.
         tail.host = NonNull::new(tail.host.as_ptr().wrapping_add(head_len as usize)).unwrap();
         let head = self.vmas.get_mut(&s).unwrap();
-        if let (Some(h), Some(t)) = (&mut head.tmpfs, &mut tail.tmpfs) {
-            *t.copied.get_mut() = h
-                .copied
-                .get_mut()
-                .split_off(&tail.file_id.map_or(0, |f| f.2));
+        if let Some(pages) = &head.pages
+            && pages.tmpfs.is_some()
+        {
+            let upper = pages.copied.borrow_mut().split_off(&tail.offset());
+            tail.pages = Some(FilePages::new(pages.tmpfs.clone(), upper));
         }
         head.len = head_len;
         head.file_len = head.file_len.min(head_len);
@@ -8030,7 +8129,10 @@ mod tests {
     #[test]
     fn private_store_mapping_keeps_its_pin_after_an_unpinned_elf_mapping() {
         use std::os::fd::AsRawFd;
-        let object = appine_hal::memfd(c"mapping-pin").unwrap();
+        let path = std::env::temp_dir().join(format!("appine-mapping-pin-{}", std::process::id()));
+        let object = std::fs::File::create_new(&path).unwrap();
+        let pin = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
         object.set_len(PAGE_SIZE).unwrap();
         let mut mm = Mm::new();
         mm.mmap(
@@ -8041,8 +8143,7 @@ mod tests {
             Some((object.as_raw_fd(), 0, false)),
         )
         .unwrap();
-        let pin = std::fs::File::open(format!("/proc/self/fd/{}", object.as_raw_fd())).unwrap();
-        pin.lock_shared().unwrap();
+        appine_hal::flock(pin.as_raw_fd(), false, true).unwrap();
         let addr = mm
             .map(
                 0,
@@ -8056,14 +8157,14 @@ mod tests {
         drop(pin);
         let child = mm.fork().unwrap();
         mm.munmap(addr, PAGE_SIZE).unwrap();
-        assert!(matches!(
-            object.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
+        assert_eq!(
+            appine_hal::flock(object.as_raw_fd(), true, false),
+            Err(libc::EWOULDBLOCK)
+        );
         child.borrow_mut().munmap(addr, PAGE_SIZE).unwrap();
         mm.sync_except(None);
         child.borrow_mut().sync_except(None);
-        object.try_lock().unwrap();
+        appine_hal::flock(object.as_raw_fd(), true, false).unwrap();
     }
 
     #[test]
@@ -8138,6 +8239,66 @@ mod tests {
         let end = exec + (1 << 30);
         assert_eq!(mm.mmu().next_present(exec + 2 * PAGE_SIZE, end), end);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fork_keeps_clean_file_pages_and_same_value_private_writes() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        let page = appine_hal::page_size() as u64;
+        let path = std::env::temp_dir().join(format!("appine-fork-clean-{}", std::process::id()));
+        let f = std::fs::File::create_new(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        f.set_len(3 * page).unwrap();
+        for readonly in [false, true] {
+            f.write_all_at(b"A", page).unwrap();
+            f.write_all_at(b"A", 2 * page).unwrap();
+            let mut parent = Mm::new();
+            let addr = parent
+                .mmap(
+                    0,
+                    2 * page,
+                    RW,
+                    flags::MAP_PRIVATE,
+                    Some((f.as_raw_fd(), page, true)),
+                )
+                .unwrap();
+            // Split a host page into two VMAs before the first private write.
+            if page > PAGE_SIZE {
+                f.write_all_at(b"S", page + PAGE_SIZE).unwrap();
+                parent
+                    .mprotect(addr + PAGE_SIZE, PAGE_SIZE, prot::READ)
+                    .unwrap();
+            }
+            parent.write(UserSlice::new(addr, 1), b"A").unwrap();
+            if page > PAGE_SIZE {
+                f.write_all_at(b"T", page + PAGE_SIZE).unwrap();
+            }
+            if readonly {
+                parent.mprotect(addr, 2 * page, prot::READ).unwrap();
+            }
+            let child = parent.fork().unwrap();
+            let mut child = child.borrow_mut();
+            if readonly {
+                child.mprotect(addr, 2 * page, RW).unwrap();
+            }
+            if page > PAGE_SIZE {
+                let mut value = [0];
+                child
+                    .read(UserSlice::new(addr + PAGE_SIZE, 1), &mut value)
+                    .unwrap();
+                assert_eq!(value, *b"S");
+            }
+            f.write_all_at(b"B", page).unwrap();
+            f.write_all_at(b"B", 2 * page).unwrap();
+            for (offset, expected) in [(0, b'A'), (page, b'B')] {
+                let mut value = [0];
+                child
+                    .read(UserSlice::new(addr + offset, 1), &mut value)
+                    .unwrap();
+                assert_eq!(value[0], expected);
+            }
+        }
     }
 
     #[test]
@@ -9569,11 +9730,13 @@ mod tests {
             )
             .unwrap();
         assert!(mm.fault_in(rw_priv + PAGE_SIZE, prot::READ));
-        assert!(
-            mm.mmu()
-                .translate(rw_priv + LEAF_SPAN - PAGE_SIZE, prot::WRITE)
-                .is_some()
+        let last = rw_priv + LEAF_SPAN - PAGE_SIZE;
+        assert!(mm.mmu().translate(last, prot::READ).is_some());
+        assert_eq!(
+            mm.mmu().translate(last, prot::WRITE).is_some(),
+            appine_hal::pagemap_readable()
         );
+        assert!(mm.translate(last, prot::WRITE).is_some());
         assert_eq!(
             mm.mmu()
                 .next_present(rw_priv + LEAF_SPAN, rw_priv + file_len),

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: retain private store mapping pins across descriptor reuse and remapping)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: initial page-table entries for file mappings are built from the configured VMA)
 
 ## Responsibilities
 
@@ -148,9 +148,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 - Host backing, `FileMaps` sharing, content-version trust, 16 KB alignment and commit accounting
   belong to `kernel/hostmem`. A FUSE file maps its inode's memfd with the permissions of the
   guest open, without a content version or `FileMaps` entry. Its `file_len` stays zero.
-- `insert` enforces `vm.max_map_count` (default 65530, writable through procfs; a new VMA must keep
-  the count at or below it), builds page-table entries (`kernel/mmu`), and sets `locked` from
-  `mlockall(MCL_FUTURE)`.
+- `new_vma` initializes `locked` from `mlockall(MCL_FUTURE)`. Once the mapping has its file
+  and page-tracking state, `insert_vma` enforces `vm.max_map_count` (default 65530, writable
+  through procfs) and builds the initial page-table entries (`kernel/mmu`).
 - `brk`: below `brk_start` returns the current break; growth needs the range free; it grows in
   place inside the heap's host region when the last part is anonymous, unnamed, with the heap's
   permissions and lock state and no other VMA on that host range (discarding the host range
@@ -162,7 +162,8 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 ### Mappings read on demand (`Fill`)
 
 - Page-table entries build eagerly for small/executable mappings and lazily otherwise (`kernel/mmu`);
-  `PROT_NONE` gets none. FUSE and tmpfs mappings have their own fault paths.
+  `PROT_NONE` gets none. FUSE and tmpfs mappings have their own fault paths. Without host pagemap,
+  ordinary private file mappings prefill reads and record private host pages on first write.
 - A file backed by tmpfs pins its mapped object. Each fault admits one guest page against the
   backing mount’s quota before installing a translation. A read fault installs a read-only entry.
   The first shared write publishes the backing file's mtime and ctime. Private mappings track written pages
@@ -232,10 +233,11 @@ signals may still be delivered).
   `PROT_GROWSDOWN` the range starts at the start of the Linux VMA holding that first VMA, which
   must grow down (`EINVAL`; `ENOMEM` if it starts at or above the end), so it reaches the parts the
   mapping grew by; `PROT_GROWSUP` is `EINVAL` once the range is found. A `cow` VMA is copied
-  (`unshare`, which sets `dirty`; a `Fill` VMA maps its host file privately again, copies the pages
+  (`unshare` remaps ordinary files and copies private pages as at fork; a `Fill` VMA maps its host file privately again, copies the pages
   it changed after reading them and drops its entries) before it becomes writable, and a
   `reserved` region gets real host memory (`back_reserved`) before it becomes accessible.
-  Otherwise only a permission downgrade sets `dirty`. For a private anonymous VMA with fork CoW
+  Tracked file pages revoke their entries on a protection change. For other mappings only a
+  permission downgrade sets `dirty`. For a private anonymous VMA with fork CoW
   pages, non-write perms apply first, then read-only CoW entries (`kernel/cow`, even where
   `PROT_NONE` had none), then write permission on other pages.
 - `mremap`: the syscall checks the flags (`MREMAP_DONTUNMAP` needs equal lengths) and gives `EPERM`
@@ -418,9 +420,6 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
-- Fork copies ordinary writable private file mappings into anonymous host memory in the child.
-  Its clean pages can therefore miss later file writes even when the backing object stays pinned.
-
 - A read or write through `/proc/<pid>/mem` can stop with EIO or a short count at a FUSE page
   awaiting a fill. Ptrace PEEK and POKE can likewise return EIO there.
 
@@ -428,7 +427,7 @@ signals may still be delivered).
   (dumps emit zeros).
   A handler that has already consumed input can repeat its effects on a whole-syscall retry
   or return a short count. The dispatcher prefaults read/write, positional
-  and vectored I/O buffers. recvfrom, recvmsg and recvmmsg handle post-receive copies locally.
+  and vectored I/O buffers. Socket receives and wait4/waitid retry their result copies locally.
 - **Approximate madvise:** `MADV_DONTNEED_LOCKED`/`MADV_POPULATE_WRITE` are no-ops;
   `MADV_POPULATE_READ` runs advisory host readahead + RO file soft-PTE prefill without faulting or
   failing on inaccessible ranges; `MADV_FREE`/`COLD`/`PAGEOUT` are not refused on locked ranges.

@@ -561,11 +561,16 @@ fn open_path_with(
     // Linux reopens its dentry: on the mount it was opened or run through, with the path it shows
     // (`/memfd:<name> (deleted)`, `pipe:[<n>]`). Being opened, it counts as a writer
     // ([`OpenFile::pseudo`] stays unset)
+    let mut fifo_open = None;
     let reopened = match &node {
         Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) if flags & oflags::O_PATH == 0 => {
             cx.view(&vfs).open_file(*proc, *tid, *fd).map(|f| {
                 let f = f.borrow();
                 let ino = match f.kind {
+                    FileKind::Pipe(_) => {
+                        fifo_open = f.watch.clone();
+                        None
+                    }
                     FileKind::Regular { ino, .. } => Some(ino),
                     _ => None,
                 };
@@ -583,7 +588,8 @@ fn open_path_with(
         }
         _ => None,
     };
-    let reopened_unlinked = reopened.as_ref().is_some_and(|r| r.3);
+    let reopened_unlinked = reopened.as_ref().is_some_and(|r| r.3)
+        || matches!(node, Node::Overlay(_, o) if !vfs.overlay().linked(o));
     if let Some((mnt, path, ino, _)) = &reopened {
         display = path.clone();
         opened_ino = ino.and_then(|ino| inotify::key_of(&Node::Store(*mnt, ino)));
@@ -705,6 +711,9 @@ fn open_path_with(
             flags,
             reopened_unlinked,
         );
+    } else if let Some(source) = fifo_open {
+        let watch = source.reopen(cx.kr(), file.borrow().writable());
+        file.borrow_mut().watch = Some(watch);
     }
     Ok(file)
 }

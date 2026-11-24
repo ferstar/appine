@@ -1434,10 +1434,10 @@ pub(super) fn wait4(
         return Ok(0);
     };
     if wstatus != 0 {
-        put(cx, wstatus, event.wait_status().to_le_bytes())?;
+        super::copy_result(cx, |cx| put(cx, wstatus, event.wait_status().to_le_bytes()))?;
     }
     if rusage != 0 {
-        put(cx, rusage, usage.encode())?;
+        super::copy_result(cx, |cx| put(cx, rusage, usage.encode()))?;
     }
     Ok(child as u64)
 }
@@ -1499,11 +1499,11 @@ pub(super) fn waitid(
                 .encode(Signal::CHLD),
             None => [0; 128],
         };
-        cx.write_user(UserSlice::new(infop, 128), &info)?;
+        super::copy_result(cx, |cx| cx.write_user(UserSlice::new(infop, 128), &info))?;
     }
     if rusage != 0 {
         let usage = found.map_or(process::Rusage::default(), |f| f.2);
-        put(cx, rusage, usage.encode())?;
+        super::copy_result(cx, |cx| put(cx, rusage, usage.encode()))?;
     }
     Ok(0)
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: parent exit notification and automatic reaping, and pipe writer wakeups)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: wait status and resource usage copyout after a FUSE fault)
 
 ## Responsibilities
 
@@ -226,6 +226,8 @@ and `kernel/oom`.
   continue reports, then tracees; nothing matching is `ECHILD`, and a zombie counts only for a wait
   that takes exits (so waiting for stops and continues of children that have all exited is
   `ECHILD`); otherwise the waiter blocks on `CHILD` and restarts if interrupted.
+  After selecting an event, wait4 and waitid retain the result while filling cold FUSE output
+  pages. A failed result copy returns `EFAULT` after any requested event consumption.
 - An exited leader keeps its tgid registered until the group is reaped. Its task leaves the task
   table like any thread, but the group records its name and own CPU time (`leader_exit`, cleared
   when a non-main thread's execve takes the tgid), and procfs shows it as a zombie thread until

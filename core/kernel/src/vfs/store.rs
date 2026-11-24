@@ -2237,7 +2237,7 @@ impl Store {
                 Err(Errno::ENOENT) if st.nlink == 0 => return Ok(None),
                 result => result?,
             };
-            file.lock_shared().map_err(io_err)?;
+            appine_hal::flock(file.as_raw_fd(), false, true).map_err(Errno)?;
             Ok(Some(file))
         })
     }
@@ -2271,7 +2271,10 @@ impl Store {
                 number,
                 libc::O_RDWR | if append { libc::O_APPEND } else { 0 },
             )?;
-            file.lock_shared().map_err(io_err)?;
+            appine_hal::flock(file.as_raw_fd(), false, true).map_err(Errno)?;
+            // The device owner keeps set-id bits. Clear old capabilities before handing out
+            // the description, since subsequent host writes bypass guest file_remove_privs.
+            s.remove_privs(ino, true, true)?;
             Ok((file, unshared))
         })
     }
@@ -2357,10 +2360,10 @@ impl Store {
                     }
                     r => r?,
                 };
-                match file.try_lock() {
+                match appine_hal::flock(file.as_raw_fd(), true, false) {
                     Ok(()) => {}
-                    Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
-                    Err(std::fs::TryLockError::Error(e)) => return Err(io_err(e)),
+                    Err(libc::EWOULDBLOCK) => return Ok(false),
+                    Err(e) => return Err(Errno(e)),
                 }
             }
             // The source's times move into the database as they are
@@ -3600,6 +3603,12 @@ mod tests {
         s.commit().unwrap();
         let other = Store::open(&dir, &[]).unwrap();
         assert!(other.has_file_caps(f).unwrap());
+        let (writer, _) = other.open_provider_object(f, false, false).unwrap();
+        assert!(!s.has_file_caps(f).unwrap());
+        assert_eq!(s.attrs(f).unwrap().mode & 0o6000, 0o6000);
+        drop(writer);
+        s.set_xattr(f, XATTR_NAME_CAPS, &caps, false, false)
+            .unwrap();
         // A write with CAP_FSETID: only the file capabilities are removed
         other.remove_privs(f, true, true).unwrap();
         other.commit().unwrap();
