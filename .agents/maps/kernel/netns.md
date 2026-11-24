@@ -37,7 +37,7 @@ sockets (`hal`).
 - `World` — every live namespace (initial first), built per call; `Use` (`Bind` → `EADDRNOTAVAIL`,
   `Reach` → `ENETUNREACH`); `Mapped` (host address, target namespace, implicit-bind source,
   virtual address); `Role` (`Peer` or `Local`).
-- `Bindings` / `Binding` / `BindAddr` / `BindReq` — per-namespace registry of bound TCP/UDP sockets
+- `Bindings` / `Binding` / `NewBinding` / `BindAddr` / `BindReq` — per-namespace registry of bound TCP/UDP sockets
   (id, protocol, guest port, normalized guest `BindAddr`: `AnyV4`/`AnyV6`/`V4`/`V6`, `v6only`, live
   `SO_REUSEADDR`/`SO_REUSEPORT`, `euid`, `listening`, `accepted`, host IP/port, `wide`) plus a 10 s
   `LINGER` reverse table `(proto, host_ip, host_port) → (guest_port, BindAddr)`.
@@ -58,8 +58,8 @@ sockets (`hal`).
 - Namespaces: `Kernel::new_net_ns`, `Kernel::world`; translation `to_host`, `init_to_host`,
   `from_host`, `from_host_peer`, `from_self`, `toward_self`, `implicit_bind`, `local_toward`,
   `entering`, `owner_of_host`, `host_ipv4`, `with_host_endpoint`; bindings & listeners
-  `addrs_overlap`, `bind_conflict`, `listen_conflict`, `shared_host_port`, `add_binding`,
-  `add_ephemeral`, `remove_binding`, `set_listening`, `set_reuse`, `resolve_target`, `lookup_host`.
+  `bind_conflict`, `listen_conflict`, `shared_host_port`, `add_binding`, `add_ephemeral`,
+  `remove_binding`, `set_listening`, `set_reuse`, `resolve_target`, `lookup_host`.
 - Devices: `netdev::request` (rtnetlink changes), `link_message`, `addr_messages`, `nsid`,
   `nsid_alloc`, `ioctl`, `ifconf`, readers (`views`, `interfaces`, `base`, `tables`, `entries`,
   `local_v4`, `route_v4`, `routes_v6`, `first_v4`), sysctls (`conf_dirs`, `conf_read`,

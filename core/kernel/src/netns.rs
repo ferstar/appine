@@ -344,9 +344,6 @@ fn host_of(w: &World, m: &NetNs, ip: [u8; 4]) -> Result<[u8; 4], Errno> {
 /// are already in use.
 pub(crate) fn init_host(init: &NetNs, v: [u8; 4]) -> Result<[u8; 4], Errno> {
     let mut d = init.devs.borrow_mut();
-    if let Some(h) = d.hostmap.get(v) {
-        return Ok(h);
-    }
     if let Some(h) = d.hostmap.get_or_alloc(v) {
         return Ok(h);
     }
@@ -517,42 +514,58 @@ pub(crate) fn local_toward(me: &NetNs, local: &[u8], peer: &[u8]) -> Option<Vec<
     Some(with_ipv4(local, src))
 }
 
-/// Translates a host peer address `host_addr` (with host port intact) and its port-unmapped copy
-/// `unmapped` into the guest peer address seen by `me`. When `host_addr` belongs to a new network
-/// namespace whose binding table records a specific IPv4 address (e.g. a virtual-device IP or
-/// `127.0.0.1` sharing host `127.a.b.1`), reports that exact guest IP rather than collapsing it
-/// through `127.a.b.1`.
+/// Translates a host peer address `host_addr` (with host port intact) into the guest peer address
+/// seen by `me`, performing at most one `owner_of_host` + `lookup_host` lookup.
+///
+/// When `host_addr` has an inet port and is not in the outside-client block (`127.254.0.0/16`),
+/// calls `resolve_port(owner, ns_guest_port, host_port)` to choose the guest port to substitute.
+/// When `host_addr` belongs to a new network namespace whose binding records a specific IPv4
+/// address (e.g. a virtual-device IP or `127.0.0.1` sharing host `127.a.b.1`), reports that exact
+/// guest IP rather than collapsing it through `127.a.b.1`.
 pub(crate) fn from_host_peer(
     w: &World,
     me: &NetNs,
     proto: i32,
     host_addr: &[u8],
-    unmapped: &[u8],
     self_peer: bool,
     icmp6: bool,
+    resolve_port: impl FnOnce(Option<&NetNs>, Option<u16>, u16) -> Option<u16>,
 ) -> Vec<u8> {
-    if !icmp6
-        && let Some(owner) = owner_of_host(w, host_addr)
-        && owner.host_net.is_some()
-        && let Some(host_ip) = ipv4_of(host_addr)
-        && host_ip[..2] != [127, crate::forward::OUTSIDE_BLOCK]
-        && let Some(host_port) = host_addr
-            .get(2..4)
-            .map(|p| u16::from_be_bytes([p[0], p[1]]))
-        && let Some((_, addr)) = lookup_host(&owner, proto, host_ip, host_port)
+    let host_port = matches!(family(host_addr), Some(AF_INET | AF_INET6))
+        .then(|| {
+            host_addr
+                .get(2..4)
+                .map(|p| u16::from_be_bytes([p[0], p[1]]))
+        })
+        .flatten();
+    let host_ip = ipv4_of(host_addr);
+    let outside = host_ip.is_some_and(|ip| ip[..2] == [127, crate::forward::OUTSIDE_BLOCK]);
+    let owner = (!outside).then(|| owner_of_host(w, host_addr)).flatten();
+    let ns_entry = owner
+        .as_deref()
+        .filter(|o| o.host_net.is_some())
+        .and_then(|o| lookup_host(o, proto, host_ip?, host_port?).map(|e| (o, e)));
+    let guest_port = if outside {
+        None
+    } else {
+        host_port.and_then(|p| resolve_port(owner.as_deref(), ns_entry.map(|(_, (g, _))| g), p))
+    };
+    let mut out = if !icmp6
+        && let Some((o, (_, BindAddr::V4(v)))) = ns_entry
+        && (v[0] != 127 || std::ptr::eq(o, me))
     {
-        match addr {
-            BindAddr::V4(v) if v[0] != 127 => return with_ipv4(unmapped, v),
-            BindAddr::V4(v) if std::ptr::eq(owner.as_ref(), me) => {
-                return with_ipv4(unmapped, v);
-            }
-            _ => {}
-        }
+        with_ipv4(host_addr, v)
+    } else if self_peer && let Some(v) = from_self(me, host_addr) {
+        v
+    } else {
+        from_host(w, me, host_addr, Role::Peer, icmp6)
+    };
+    if let Some(g) = guest_port
+        && out.len() >= 4
+    {
+        out[2..4].copy_from_slice(&g.to_be_bytes());
     }
-    if self_peer && let Some(v) = from_self(me, unmapped) {
-        return v;
-    }
-    from_host(w, me, unmapped, Role::Peer, icmp6)
+    out
 }
 
 // ---- Bindings and listeners ----
@@ -609,7 +622,7 @@ impl BindAddr {
 
 /// Whether two guest bindings can match the same incoming destination (Linux 6.1's
 /// `ipv4_rcv_saddr_equal` / `ipv6_rcv_saddr_equal`).
-pub(crate) fn addrs_overlap(a: BindAddr, a_v6only: bool, b: BindAddr, b_v6only: bool) -> bool {
+fn addrs_overlap(a: BindAddr, a_v6only: bool, b: BindAddr, b_v6only: bool) -> bool {
     #[derive(Clone, Copy)]
     enum Cover<T> {
         None,
@@ -649,15 +662,12 @@ pub(crate) struct BindReq {
     pub euid: u32,
 }
 
-/// One bound TCP or UDP socket in a new network namespace.
+/// Parameters for registering a bound TCP or UDP socket in a new network namespace
+/// ([`add_binding`], [`add_ephemeral`]).
 #[derive(Debug, Clone)]
-pub(crate) struct Binding {
-    /// Unique identifier stored in [`crate::net::InetSocket::listener`].
-    pub id: u64,
+pub(crate) struct NewBinding {
     /// Protocol (`IPPROTO_TCP` for TCP/MPTCP, `IPPROTO_UDP` for UDP).
     pub proto: i32,
-    /// Guest port (nonzero).
-    pub guest_port: u16,
     /// Normalized guest bind address.
     pub addr: BindAddr,
     /// `IPV6_V6ONLY` recorded on the guest AF_INET6 socket.
@@ -678,6 +688,26 @@ pub(crate) struct Binding {
     pub host_port: u16,
     /// Bound to the host wildcard address (`0.0.0.0` / `::`), reachable via `127.a.b.1`.
     pub wide: bool,
+}
+
+/// One bound TCP or UDP socket in a new network namespace.
+#[derive(Debug, Clone)]
+pub(crate) struct Binding {
+    /// Unique identifier stored in [`crate::net::InetSocket::listener`].
+    id: u64,
+    /// Guest port (nonzero).
+    guest_port: u16,
+    proto: i32,
+    addr: BindAddr,
+    v6only: bool,
+    reuseaddr: bool,
+    reuseport: bool,
+    euid: u32,
+    listening: bool,
+    accepted: bool,
+    host_ip: [u8; 4],
+    host_port: u16,
+    wide: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -758,34 +788,38 @@ pub(crate) fn shared_host_port(me: &NetNs, req: &BindReq, host_ip: [u8; 4]) -> O
     })
 }
 
-/// Registers a bound socket in `me` and returns its unique binding ID.
-pub(crate) fn add_binding(me: &NetNs, mut entry: Binding) -> std::num::NonZeroU64 {
+/// Registers a bound socket in `me` at `guest_port` and returns its unique binding ID.
+pub(crate) fn add_binding(me: &NetNs, guest_port: u16, entry: NewBinding) -> std::num::NonZeroU64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    entry.id = id;
+    let binding = Binding {
+        id,
+        guest_port,
+        proto: entry.proto,
+        addr: entry.addr,
+        v6only: entry.v6only,
+        reuseaddr: entry.reuseaddr,
+        reuseport: entry.reuseport,
+        euid: entry.euid,
+        listening: entry.listening,
+        accepted: entry.accepted,
+        host_ip: entry.host_ip,
+        host_port: entry.host_port,
+        wide: entry.wide,
+    };
     let mut b = me.listeners.borrow_mut();
     b.linger
-        .remove(&(entry.proto, entry.host_ip, entry.host_port));
-    b.entries.push(entry);
+        .remove(&(binding.proto, binding.host_ip, binding.host_port));
+    b.entries.push(binding);
     std::num::NonZeroU64::new(id).expect("starts at 1")
 }
 
-/// Registers an ephemeral bind (`bind(0)` or implicit bind) in `me`, remapping `host_port` into
-/// `range` (then `1024..=65535`, then `1..1024`) if `host_port` already aliases any bound guest
-/// port for `proto` in `me`.
-#[allow(clippy::too_many_arguments)]
+/// Registers an ephemeral bind (`bind(0)` or implicit bind) in `me`, remapping `entry.host_port`
+/// into `range` (then `1024..=65535`, then `1..1024`) if `entry.host_port` already aliases any
+/// bound guest port for `entry.proto` in `me`.
 pub(crate) fn add_ephemeral(
     me: &NetNs,
-    proto: i32,
-    addr: BindAddr,
-    v6only: bool,
-    reuseaddr: bool,
-    reuseport: bool,
-    euid: u32,
-    listening: bool,
-    host_ip: [u8; 4],
-    host_port: u16,
-    wide: bool,
+    entry: NewBinding,
     range: (u16, u16),
 ) -> (u16, std::num::NonZeroU64) {
     let guest_port = {
@@ -793,39 +827,22 @@ pub(crate) fn add_ephemeral(
         let in_use = |p: u16| {
             b.entries
                 .iter()
-                .any(|e| e.proto == proto && e.guest_port == p)
+                .any(|e| e.proto == entry.proto && e.guest_port == p)
         };
-        if !in_use(host_port) {
-            host_port
+        if !in_use(entry.host_port) {
+            entry.host_port
         } else {
             let (lo, hi) = (range.0.min(range.1).max(1), range.0.max(range.1).max(1));
-            let start = host_port.clamp(lo, hi);
+            let start = entry.host_port.clamp(lo, hi);
             (start..=hi)
                 .chain(lo..start)
                 .chain(1024..=u16::MAX)
                 .chain(1..1024)
                 .find(|&p| !in_use(p))
-                .unwrap_or(host_port)
+                .unwrap_or(entry.host_port)
         }
     };
-    let id = add_binding(
-        me,
-        Binding {
-            id: 0,
-            proto,
-            guest_port,
-            addr,
-            v6only,
-            reuseaddr,
-            reuseport,
-            euid,
-            listening,
-            accepted: false,
-            host_ip,
-            host_port,
-            wide,
-        },
-    );
+    let id = add_binding(me, guest_port, entry);
     (guest_port, id)
 }
 
@@ -2096,10 +2113,9 @@ mod tests {
         let bind = |proto, port, addr, v6only, host_ip, host_port| {
             add_binding(
                 &n,
-                Binding {
-                    id: 0,
+                port,
+                NewBinding {
                     proto,
-                    guest_port: port,
                     addr,
                     v6only,
                     reuseaddr: false,
@@ -2291,10 +2307,9 @@ mod tests {
         let insert = |r: BindReq, listening, host_ip, host_port| {
             add_binding(
                 &n,
-                Binding {
-                    id: 0,
+                r.guest_port,
+                NewBinding {
                     proto: r.proto,
-                    guest_port: r.guest_port,
                     addr: r.addr,
                     v6only: r.v6only,
                     reuseaddr: r.reuseaddr,
@@ -2458,10 +2473,9 @@ mod tests {
 
         let exp = add_binding(
             &n,
-            Binding {
-                id: 0,
+            40000,
+            NewBinding {
                 proto: tcp,
-                guest_port: 40000,
                 addr: BindAddr::V4([127, 0, 0, 1]),
                 v6only: false,
                 reuseaddr: false,
@@ -2476,16 +2490,19 @@ mod tests {
         );
         let (g_eph, eph) = add_ephemeral(
             &n,
-            tcp,
-            BindAddr::V4([127, 0, 0, 1]),
-            false,
-            false,
-            false,
-            0,
-            false,
-            [127, 1, 2, 1],
-            40000,
-            false,
+            NewBinding {
+                proto: tcp,
+                addr: BindAddr::V4([127, 0, 0, 1]),
+                v6only: false,
+                reuseaddr: false,
+                reuseport: false,
+                euid: 0,
+                listening: false,
+                accepted: false,
+                host_ip: [127, 1, 2, 1],
+                host_port: 40000,
+                wide: false,
+            },
             (40000, 40010),
         );
         assert_ne!(g_eph, 40000);
@@ -2526,10 +2543,9 @@ mod tests {
         // UDP reverse lookup distinguishes 127.0.0.1 vs <vaddr> even after socket close (LINGER)
         let u_lo = add_binding(
             &n,
-            Binding {
-                id: 0,
+            8080,
+            NewBinding {
                 proto: udp,
-                guest_port: 8080,
                 addr: BindAddr::V4([127, 0, 0, 1]),
                 v6only: false,
                 reuseaddr: false,
@@ -2544,10 +2560,9 @@ mod tests {
         );
         let u_va = add_binding(
             &n,
-            Binding {
-                id: 0,
+            8080,
+            NewBinding {
                 proto: udp,
-                guest_port: 8080,
                 addr: BindAddr::V4(vaddr),
                 v6only: false,
                 reuseaddr: false,
@@ -2569,9 +2584,9 @@ mod tests {
                 &n,
                 udp,
                 &v4([127, 1, 2, 1], 52001),
-                &v4([127, 1, 2, 1], 8080),
                 true,
-                false
+                false,
+                |_, g, _| g,
             ),
             v4([127, 0, 0, 1], 8080)
         );
@@ -2581,9 +2596,9 @@ mod tests {
                 &n,
                 udp,
                 &v4([127, 1, 2, 1], 52002),
-                &v4([127, 1, 2, 1], 8080),
                 false,
-                false
+                false,
+                |_, g, _| g,
             ),
             v4(vaddr, 8080)
         );

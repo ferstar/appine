@@ -16,13 +16,15 @@
 //! After the original port it tries `port + offset`, `port + 2 × offset`, `port + 3 × offset` in
 //! turn (up to 65535), and when all are taken lets the host assign one. The last three digits are
 //! always the original port (with offset 10000, 22 becomes 10022, 20022, 30022), recognizable at a
-//! glance and never taking another port's place. As long as any socket binds a (network namespace,
-//! protocol, port), it keeps the same host port (`SO_REUSEPORT`, IPv4 and IPv6 bound separately),
-//! and the guest's own conflicts are EADDRINUSE as usual; TCP and UDP on the same port use the same
-//! host port when possible (DNS's 53). A bind within [`STICKY`] after all of them closed still
-//! tries the original host port first and is EADDRINUSE when that fails: after a TCP connection
-//! closes its host port is in TIME_WAIT, and on Linux binding again without `SO_REUSEADDR` is
-//! EADDRINUSE too, so it must not be taken as held by another program and moved to another port.
+//! glance and never taking another port's place. As long as any socket in the initial network
+//! namespace binds a `(protocol, port)`, it keeps the same host port (`SO_REUSEPORT`, IPv4 and
+//! IPv6 bound separately), and the guest's own conflicts are EADDRINUSE as usual; TCP and UDP on
+//! the same port use the same host port when possible (DNS's 53). A bind within [`STICKY`] after
+//! all of them closed still tries the original host port first and is EADDRINUSE when that fails:
+//! after a TCP connection closes its host port is in TIME_WAIT, and on Linux binding again without
+//! `SO_REUSEADDR` is EADDRINUSE too, so it must not be taken as held by another program and moved
+//! to another port. New network namespaces manage their own port mappings in
+//! [`crate::netns::Bindings`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -50,11 +52,11 @@ pub const STICKY: Duration = Duration::from_secs(120);
 /// ephemeral ports at random).
 pub const LINGER: Duration = Duration::from_secs(10);
 
-/// The key of the registry: network namespace (0 for the boot one), protocol, guest port.
-type Key = (usize, i32, u16);
+/// The key of the registry: protocol, guest port (initial network namespace).
+type Key = (i32, u16);
 
-/// A host port: network namespace, protocol, port on the host.
-type HostKey = (usize, i32, u16);
+/// A host port: protocol, port on the host.
+type HostKey = (i32, u16);
 
 struct Entry {
     host: u16,
@@ -73,7 +75,8 @@ pub struct ListenEvent {
     pub host_port: u16,
 }
 
-/// The port-mapping registry, one for the whole kernel ([`crate::kernel::Kernel::portmap`]).
+/// The initial-namespace low-port mapping registry, one for the whole kernel
+/// ([`crate::kernel::Kernel::portmap`]).
 pub struct PortMap {
     /// 0 means no mapping: binding low ports is left to the host as before (mostly EACCES on
     /// Android).
@@ -113,15 +116,15 @@ impl PortMap {
 
     /// Which host port an already mapped guest port is (connecting to this port on the local
     /// machine is switched to it).
-    pub fn host_port(&self, ns: usize, proto: i32, port: u16) -> Option<u16> {
-        self.entries.get(&(ns, proto, port)).map(|e| e.host)
+    pub fn host_port(&self, proto: i32, port: u16) -> Option<u16> {
+        self.entries.get(&(proto, port)).map(|e| e.host)
     }
 
     /// When a host port comes from a mapping (including just released ones, [`LINGER`]), the port
     /// the guest sees.
-    pub fn guest_port(&self, ns: usize, proto: i32, host: u16) -> Option<u16> {
+    pub fn guest_port(&self, proto: i32, host: u16) -> Option<u16> {
         self.by_host
-            .get(&(ns, proto, host))
+            .get(&(proto, host))
             .filter(|(_, t)| t.is_none_or(|t| t.elapsed() < LINGER))
             .map(|&(g, _)| g)
     }
@@ -167,20 +170,18 @@ impl Drop for Lease {
         if e.refs == 0 {
             let host = e.host;
             m.entries.remove(&self.key);
-            let (ns, proto, port) = self.key;
+            let (proto, port) = self.key;
             let now = Instant::now();
             m.by_host
                 .retain(|_, (_, t)| t.is_none_or(|t| now.duration_since(t) < LINGER));
-            if let Some(v) = m.by_host.get_mut(&(ns, proto, host))
+            if let Some(v) = m.by_host.get_mut(&(proto, host))
                 && v.0 == port
             {
                 v.1 = Some(now);
             }
-            if ns == 0 {
-                m.released
-                    .retain(|_, (_, t)| now.duration_since(*t) < STICKY);
-                m.released.insert(self.key, (host, now));
-            }
+            m.released
+                .retain(|_, (_, t)| now.duration_since(*t) < STICKY);
+            m.released.insert(self.key, (host, now));
         }
     }
 }
@@ -194,14 +195,13 @@ impl Drop for Lease {
 /// the host refusing and moved to another port.
 pub fn bind(
     map: &Rc<RefCell<PortMap>>,
-    ns: usize,
     proto: i32,
     port: u16,
     mut bind: impl FnMut(u16) -> Result<(), i32>,
     bound_port: impl Fn() -> Option<u16>,
 ) -> Result<(u16, Lease, bool), Errno> {
-    let key = (ns, proto, port);
-    let existing = map.borrow().host_port(ns, proto, port).or_else(|| {
+    let key = (proto, port);
+    let existing = map.borrow().host_port(proto, port).or_else(|| {
         // Just released: still the original host port (STICKY)
         let m = map.borrow();
         m.released
@@ -213,7 +213,7 @@ pub fn bind(
         let mut m = map.borrow_mut();
         m.released.remove(&key);
         m.entries.entry(key).or_insert(Entry { host, refs: 0 }).refs += 1;
-        m.by_host.insert((ns, proto, host), (port, None));
+        m.by_host.insert((proto, host), (port, None));
         Lease {
             map: map.clone(),
             key,
@@ -240,7 +240,7 @@ pub fn bind(
     } else {
         crate::net::IPPROTO_TCP
     };
-    if let Some(h) = map.borrow().host_port(ns, other, port)
+    if let Some(h) = map.borrow().host_port(other, port)
         && !candidates.contains(&h)
     {
         candidates.push(h);
@@ -305,7 +305,6 @@ mod tests {
         let mut tried = Vec::new();
         let (h, _a, new) = bind(
             &m,
-            0,
             TCP,
             22,
             |p| {
@@ -317,19 +316,19 @@ mod tests {
         .unwrap();
         assert_eq!((h, new), (30022, true));
         assert_eq!(tried, [22, 10022, 20022, 30022]);
-        let (h, _b, _) = bind(&m, 0, TCP, 80, refusing(&[30080, 10080, 20080]), || {
+        let (h, _b, _) = bind(&m, TCP, 80, refusing(&[30080, 10080, 20080]), || {
             Some(45678)
         })
         .unwrap();
         assert_eq!(h, 45678);
-        assert_eq!(m.borrow().guest_port(0, TCP, 45678), Some(80));
+        assert_eq!(m.borrow().guest_port(TCP, 45678), Some(80));
         // Other errors stop the search: when a moved-to port is also EACCES, no further move
         assert_eq!(
-            bind(&m, 0, TCP, 23, |_| Err(Errno::EACCES.0), || None).err(),
+            bind(&m, TCP, 23, |_| Err(Errno::EACCES.0), || None).err(),
             Some(Errno::EACCES)
         );
         assert_eq!(
-            bind(&m, 0, TCP, 24, |_| Err(Errno::EADDRNOTAVAIL.0), || None).err(),
+            bind(&m, TCP, 24, |_| Err(Errno::EADDRNOTAVAIL.0), || None).err(),
             Some(Errno::EADDRNOTAVAIL)
         );
     }
@@ -340,31 +339,30 @@ mod tests {
     #[test]
     fn the_real_port_when_the_host_allows_it() {
         let m = map();
-        let (h, a, new) = bind(&m, 0, TCP, 22, |_| Ok(()), || None).unwrap();
+        let (h, a, new) = bind(&m, TCP, 22, |_| Ok(()), || None).unwrap();
         assert_eq!((h, new), (22, true));
-        assert_eq!(m.borrow().host_port(0, TCP, 22), Some(22));
-        assert_eq!(m.borrow().guest_port(0, TCP, 22), Some(22));
+        assert_eq!(m.borrow().host_port(TCP, 22), Some(22));
+        assert_eq!(m.borrow().guest_port(TCP, 22), Some(22));
         // A second socket on the same port: the guest's own conflict is reported as usual, no move
         assert_eq!(
-            bind(&m, 0, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
+            bind(&m, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
             Some(Errno::EADDRINUSE)
         );
-        let (h, b, new) = bind(&m, 0, TCP, 22, |_| Ok(()), || None).unwrap();
+        let (h, b, new) = bind(&m, TCP, 22, |_| Ok(()), || None).unwrap();
         assert_eq!((h, new), (22, false));
         // After closing, the host port is in TIME_WAIT: EADDRINUSE as on Linux, not taken as held
         // by someone else
         drop((a, b));
         assert_eq!(
-            bind(&m, 0, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
+            bind(&m, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
             Some(Errno::EADDRINUSE)
         );
         // A port opened only for TCP: UDP may bind neither the original nor TCP's port (the same
         // one), so it moves to another
-        let (_, _c, _) = bind(&m, 0, TCP, 22, |_| Ok(()), || None).unwrap();
+        let (_, _c, _) = bind(&m, TCP, 22, |_| Ok(()), || None).unwrap();
         let mut tried = Vec::new();
         let (h, _d, _) = bind(
             &m,
-            0,
             UDP,
             22,
             |p| {
@@ -378,7 +376,6 @@ mod tests {
         // Another app on the phone holds the original port: move to another
         let (h, _e, _) = bind(
             &m,
-            0,
             TCP,
             80,
             |p| {
@@ -393,11 +390,10 @@ mod tests {
         .unwrap();
         assert_eq!(h, 10080);
         // A refused low port (DNS's 53): UDP tries the original first, then the port TCP moved to
-        let (_, _f, _) = bind(&m, 0, TCP, 53, refusing(&[10053]), || None).unwrap();
+        let (_, _f, _) = bind(&m, TCP, 53, refusing(&[10053]), || None).unwrap();
         let mut tried = Vec::new();
         let (h, _g, _) = bind(
             &m,
-            0,
             UDP,
             53,
             |p| {
@@ -410,7 +406,7 @@ mod tests {
         assert_eq!((h, tried), (20053, vec![53, 20053]));
         // Always map: move even when the host allows the port
         m.borrow_mut().always_map = true;
-        let (h, _h, _) = bind(&m, 0, TCP, 443, |_| Ok(()), || None).unwrap();
+        let (h, _h, _) = bind(&m, TCP, 443, |_| Ok(()), || None).unwrap();
         assert_eq!(h, 10443);
     }
 
@@ -418,13 +414,12 @@ mod tests {
     fn a_bound_port_keeps_its_host_port_until_the_last_lease() {
         let m = map();
         m.borrow_mut().always_map = true;
-        let (h, a, _) = bind(&m, 0, TCP, 22, |_| Ok(()), || None).unwrap();
+        let (h, a, _) = bind(&m, TCP, 22, |_| Ok(()), || None).unwrap();
         assert_eq!(h, 10022);
         // A second socket (SO_REUSEPORT, the other address family) uses the same host port, and
         // conflicts are reported as usual
         let (h2, b, new) = bind(
             &m,
-            0,
             TCP,
             22,
             |p| if p == 10022 { Ok(()) } else { Err(1) },
@@ -433,27 +428,26 @@ mod tests {
         .unwrap();
         assert_eq!((h2, new), (10022, false));
         assert_eq!(
-            bind(&m, 0, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
+            bind(&m, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
             Some(Errno::EADDRINUSE)
         );
         drop(a);
-        assert_eq!(m.borrow().host_port(0, TCP, 22), Some(10022));
+        assert_eq!(m.borrow().host_port(TCP, 22), Some(10022));
         drop(b);
-        assert_eq!(m.borrow().host_port(0, TCP, 22), None);
+        assert_eq!(m.borrow().host_port(TCP, 22), None);
         // The host port still translates back to the guest port for a while (answers the other
         // side has not read yet)
-        assert_eq!(m.borrow().guest_port(0, TCP, 10022), Some(22));
-        m.borrow_mut().by_host.get_mut(&(0, TCP, 10022)).unwrap().1 = Some(Instant::now() - LINGER);
-        assert_eq!(m.borrow().guest_port(0, TCP, 10022), None);
+        assert_eq!(m.borrow().guest_port(TCP, 10022), Some(22));
+        m.borrow_mut().by_host.get_mut(&(TCP, 10022)).unwrap().1 = Some(Instant::now() - LINGER);
+        assert_eq!(m.borrow().guest_port(TCP, 10022), None);
         // Rebinding a just released port still uses the original host port; when it is held
         // (TIME_WAIT) it is EADDRINUSE, no move
         assert_eq!(
-            bind(&m, 0, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
+            bind(&m, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
             Some(Errno::EADDRINUSE)
         );
         let (h, again, _) = bind(
             &m,
-            0,
             TCP,
             22,
             |p| if p == 10022 { Ok(()) } else { Err(1) },
@@ -462,10 +456,9 @@ mod tests {
         .unwrap();
         assert_eq!(h, 10022);
         drop(again);
-        // Namespaces and protocols are independent; UDP tries TCP's host port first
+        // Protocols are independent; UDP tries TCP's host port first
         let (_, _c, _) = bind(
             &m,
-            0,
             TCP,
             53,
             |p| {
@@ -478,10 +471,8 @@ mod tests {
             || None,
         )
         .unwrap();
-        let (h, _d, _) = bind(&m, 0, UDP, 53, |_| Ok(()), || None).unwrap();
+        let (h, _d, _) = bind(&m, UDP, 53, |_| Ok(()), || None).unwrap();
         assert_eq!(h, 20053);
-        let (h, _e, _) = bind(&m, 1, TCP, 53, |_| Ok(()), || None).unwrap();
-        assert_eq!(h, 10053);
     }
 
     #[test]

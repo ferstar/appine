@@ -381,11 +381,6 @@ impl HostMap {
         [127, crate::netns::INIT_BLOCK, (slot >> 8) as u8, slot as u8]
     }
 
-    /// Returns the mapped host loopback address for `guest` if one already exists.
-    pub(crate) fn get(&self, guest: [u8; 4]) -> Option<[u8; 4]> {
-        self.by_guest.get(&guest).copied().map(Self::host_addr)
-    }
-
     /// Returns the mapped host loopback address for `guest`, allocating a free slot if none
     /// exists. Returns `None` when all [`Self::MAX_SLOT`] slots are in use.
     pub(crate) fn get_or_alloc(&mut self, guest: [u8; 4]) -> Option<[u8; 4]> {

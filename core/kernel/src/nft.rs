@@ -34,8 +34,13 @@ use std::time::{Duration, Instant};
 use crate::cell::RefCell;
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
-use crate::net::{DUMP_CHUNK, DumpMessages, NetlinkDump, NetlinkItem, attr, message};
+use crate::net::{DumpMessages, NetlinkDump, NetlinkItem, attr, message};
 use crate::nsproxy::NetNs;
+
+/// Linux's `NLMSG_GOODSIZE` on 4 KiB pages (`SKB_WITH_OVERHEAD(PAGE_SIZE)`): bounds a single
+/// `NFT_MSG_NEWSETELEM` chunk so every multipart set-element message fits inside a page-sized
+/// receive buffer (e.g. Go's `syscall.NetlinkRIB`, libmnl).
+const DUMP_CHUNK: usize = 3776;
 
 const NFNL_SUBSYS_CTNETLINK: u16 = 1;
 const NFNL_SUBSYS_CTNETLINK_EXP: u16 = 2;
@@ -799,10 +804,11 @@ pub(crate) fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> V
     // Needs CAP_NET_ADMIN in the namespace's owner (nfnetlink_rcv: only the first message is
     // acknowledged, the rest are dropped)
     if !cred.ns_capable(&ns.owner, cap::NET_ADMIN) {
-        return vec![NetlinkItem::Datagram(
-            ack(first, Err(fail(Errno::EPERM)), peer),
-            0,
-        )];
+        return vec![NetlinkItem::reply(ack(
+            first,
+            Err(fail(Errno::EPERM)),
+            peer,
+        ))];
     }
     let mut out = Vec::new();
     let mut i = 0;
@@ -850,27 +856,25 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Netli
         .get(18..20)
         .map_or(0, |r| u16::from_be_bytes([r[0], r[1]]));
     if res != NFNL_SUBSYS_NFTABLES {
-        return vec![NetlinkItem::Datagram(
-            ack(begin, Err(fail(Errno::EOPNOTSUPP)), peer),
-            0,
-        )];
+        return vec![NetlinkItem::reply(ack(
+            begin,
+            Err(fail(Errno::EOPNOTSUPP)),
+            peer,
+        ))];
     }
     let mut st = ns.nft.borrow().clone();
     if let Some(genid) = get_be32(&b.attrs, NFNL_BATCH_GENID)
         && genid != 0
         && genid != st.generation
     {
-        return vec![NetlinkItem::Datagram(
-            ack(
-                begin,
-                Err(Fail {
-                    errno: ERESTART,
-                    at: None,
-                }),
-                peer,
-            ),
-            0,
-        )];
+        return vec![NetlinkItem::reply(ack(
+            begin,
+            Err(Fail {
+                errno: ERESTART,
+                at: None,
+            }),
+            peer,
+        ))];
     }
     let mut replies = Vec::new();
     let mut failed = false;
@@ -887,12 +891,12 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Netli
             Ok(()) => {
                 changed = true;
                 if r.flags & NLM_F_ACK != 0 {
-                    replies.push(NetlinkItem::Datagram(ack(m, Ok(()), peer), 0));
+                    replies.push(NetlinkItem::reply(ack(m, Ok(()), peer)));
                 }
             }
             Err(f) => {
                 failed = true;
-                replies.push(NetlinkItem::Datagram(ack(m, Err(f), peer), 0));
+                replies.push(NetlinkItem::reply(ack(m, Err(f), peer)));
             }
         }
     }
@@ -945,11 +949,11 @@ fn single(ns: &NetNs, m: &[u8], peer: &Peer<'_>) -> Vec<NetlinkItem> {
     match answer {
         Ok(mut d) => {
             if r.flags & NLM_F_ACK != 0 && !r.dump() {
-                d.push(NetlinkItem::Datagram(ack(m, Ok(()), peer), 0));
+                d.push(NetlinkItem::reply(ack(m, Ok(()), peer)));
             }
             d
         }
-        Err(f) => vec![NetlinkItem::Datagram(ack(m, Err(f), peer), 0)],
+        Err(f) => vec![NetlinkItem::reply(ack(m, Err(f), peer))],
     }
 }
 
@@ -1918,7 +1922,6 @@ impl Nft {
         let one = |msg: u8, flags: u16, family: u8, attrs: &[u8]| {
             nfmsg(nft_type(msg), flags, r.seq, peer.pid, family, res, attrs)
         };
-        let dgram = |m| NetlinkItem::Datagram(m, 0);
         // A dump with address family NFPROTO_UNSPEC lists everything
         let fam = |t: &Table| r.family == 0 || t.family == r.family;
         let by_name = |a: u16| get_str(&r.attrs, a);
@@ -1928,7 +1931,7 @@ impl Nft {
                 attr(&mut p, GEN_ID, &be32(self.generation));
                 attr(&mut p, GEN_PROC_PID, &be32(peer.proc_pid));
                 attr(&mut p, GEN_PROC_NAME, &cstr(peer.comm));
-                Ok(vec![dgram(one(NEWGEN, 0, 0, &p))])
+                Ok(vec![NetlinkItem::reply(one(NEWGEN, 0, 0, &p))])
             }
             GETTABLE if r.dump() => {
                 let m = self
@@ -1942,7 +1945,12 @@ impl Nft {
             GETTABLE => {
                 let t = self.table_of(r, TABLE_NAME, None)?;
                 let t = &self.tables[t];
-                Ok(vec![dgram(one(NEWTABLE, 0, t.family, &t.table_attrs()))])
+                Ok(vec![NetlinkItem::reply(one(
+                    NEWTABLE,
+                    0,
+                    t.family,
+                    &t.table_attrs(),
+                ))])
             }
             GETCHAIN if r.dump() => {
                 let m = self
@@ -1965,7 +1973,12 @@ impl Nft {
                     .iter()
                     .find(|c| c.name == n)
                     .ok_or_else(|| fail(Errno::ENOENT))?;
-                Ok(vec![dgram(one(NEWCHAIN, 0, t.family, &t.chain_attrs(c)))])
+                Ok(vec![NetlinkItem::reply(one(
+                    NEWCHAIN,
+                    0,
+                    t.family,
+                    &t.chain_attrs(c),
+                ))])
             }
             GETRULE if r.dump() => {
                 let (tn, cn) = (by_name(RULE_TABLE), by_name(RULE_CHAIN));
@@ -2000,7 +2013,7 @@ impl Nft {
                     .iter()
                     .position(|x| x.handle == h)
                     .ok_or_else(|| fail(Errno::ENOENT))?;
-                Ok(vec![dgram(one(
+                Ok(vec![NetlinkItem::reply(one(
                     NEWRULE,
                     0,
                     t.family,
@@ -2029,7 +2042,12 @@ impl Nft {
                     .iter()
                     .find(|s| s.name == n)
                     .ok_or_else(|| fail(Errno::ENOENT))?;
-                Ok(vec![dgram(one(NEWSET, 0, t.family, &t.set_attrs(s)))])
+                Ok(vec![NetlinkItem::reply(one(
+                    NEWSET,
+                    0,
+                    t.family,
+                    &t.set_attrs(s),
+                ))])
             }
             GETSETELEM if r.dump() => {
                 let t = &self.tables[self.table_of(r, SET_ELEM_LIST_TABLE, None)?];
@@ -2218,6 +2236,10 @@ pub(crate) struct SetElemDump {
 }
 
 impl SetElemDump {
+    fn elem_attr_len(elem: &[u8]) -> usize {
+        (4 + elem.len()).next_multiple_of(4)
+    }
+
     fn new(
         seq: u32,
         pid: u32,
@@ -2227,10 +2249,7 @@ impl SetElemDump {
         set: Vec<u8>,
         elems: Vec<Vec<u8>>,
     ) -> Self {
-        let elem_bytes = elems
-            .iter()
-            .map(|e| (4 + e.len()).next_multiple_of(4))
-            .sum();
+        let elem_bytes = elems.iter().map(|e| Self::elem_attr_len(e)).sum();
         let base_msg_len = Self::build_msg(seq, pid, family, res_id, &table, &set, []).len();
         Self {
             seq,
@@ -2297,7 +2316,7 @@ impl SetElemDump {
             let mut size = self.base_msg_len;
             let mut count = 0;
             for e in &self.elems {
-                let add = (4 + e.len()).next_multiple_of(4);
+                let add = Self::elem_attr_len(e);
                 if count > 0 && size + add > budget {
                     break;
                 }
@@ -2316,7 +2335,7 @@ impl SetElemDump {
             if !peek {
                 for _ in 0..count {
                     let e = self.elems.pop_front().unwrap();
-                    let sub = (4 + e.len()).next_multiple_of(4);
+                    let sub = Self::elem_attr_len(&e);
                     self.elem_bytes = self.elem_bytes.saturating_sub(sub);
                 }
             }
@@ -2357,7 +2376,7 @@ fn dump_reply(msgs: Vec<Vec<u8>>, seq: u32, pid: u32) -> Vec<NetlinkItem> {
     let mut out = DumpMessages::new();
     out.push_section(msgs);
     out.push_section([done(seq, pid)]);
-    vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
+    vec![NetlinkItem::dump(out)]
 }
 
 /// `NFNL_MSG_COMPAT_GET`: whether an xt extension exists, and its highest revision.
@@ -2379,10 +2398,15 @@ fn compat(r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<NetlinkItem>, Fail> {
     attr(&mut p, COMPAT_REV, &be32(rev.min(*max)));
     attr(&mut p, COMPAT_TYPE, &be32(ty));
     let t = NFNL_SUBSYS_NFT_COMPAT << 8;
-    Ok(vec![NetlinkItem::Datagram(
-        nfmsg(t, NLM_F_MULTI, r.seq, peer.pid, r.family, 0, &p),
+    Ok(vec![NetlinkItem::reply(nfmsg(
+        t,
+        NLM_F_MULTI,
+        r.seq,
+        peer.pid,
+        r.family,
         0,
-    )])
+        &p,
+    ))])
 }
 
 // ---- Execution ----

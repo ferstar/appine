@@ -57,7 +57,7 @@ listen notifications (`android/service`).
 - `Message` (one recv result), `MsgHdr` (a guest msghdr read in), `Routed` (connect/sendto
   routing result: namespace map, nat, filter verdict, original destinations).
 - `PortMap` (kernel-wide initial-namespace low-port registry: offset, `always_map`, entries keyed
-  by `(namespace, protocol, guest port)`, `by_host`, `released`, `reported`, listen events),
+  by `(protocol, guest port)`, `by_host`, `released`, `reported`, listen events),
   `Lease` (refcount on an entry, released on drop), `ListenEvent` (comm, guest port, host port).
 - `Traffic` (per-interface `IfStats`, an address table refetched at most once a second and kept
   5 s, `Protocols` counters), `traffic::Route`.
@@ -83,8 +83,9 @@ listen notifications (`android/service`).
 - DNS stub: `net::{is_stub, stub_addr, servfail}`, `deliver_dns` (timer thread),
   `hal::net::dns_query`, `vfs::ensure_resolv_conf`.
 - Ports: `portmap::bind`, `PortMap::{maps, host_port, guest_port, listened}`,
-  `Machine::take_listens`; `map_dest` (private, initial namespace) and `unmap_addr` (also used by
-  the `/proc/net` listings, consulting `kernel/netns::lookup_host` for new namespaces).
+  `Machine::take_listens`; `map_dest` (private, initial namespace), `unmap_addr` (local addresses)
+  and `net::translate_peer` (single-lookup peer unmapping and namespace translation across
+  `accept4`, `getpeername`, `recvfrom` and `/proc/net`).
 - Forwarding hooks: `forward_socket`, `forward_target`, `forward_all`.
 - Traffic and `/proc/net`: `Traffic::{account, get}`, `count_connect`; the listings
   `net::{proc_listing, sockstat, sockstat6, proc_snmp, proc_netstat}` and `PROC_ARP`.

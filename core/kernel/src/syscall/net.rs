@@ -18,7 +18,8 @@ use crate::kernel::{Cx, request_wake_object, wake};
 use crate::net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT,
     NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_SOCK_DIAG, NetlinkSocket, SOCK_DGRAM, SOCK_RAW,
-    SOCK_STREAM, Socket, TCP_CLOSE, TCP_INFO, TCP_LISTEN, is_stub, servfail, stub_addr,
+    SOCK_STREAM, Socket, TCP_CLOSE, TCP_INFO, TCP_LISTEN, ip_of, is_local, is_stub, map_proto,
+    mappable, servfail, stub_addr, translate_peer,
 };
 use crate::process::Signal;
 use crate::signal::{self, SigInfo};
@@ -406,10 +407,9 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                     };
                     let id = crate::netns::add_binding(
                         &net,
-                        crate::netns::Binding {
-                            id: 0,
+                        port,
+                        crate::netns::NewBinding {
                             proto,
-                            guest_port: port,
                             addr: baddr,
                             v6only,
                             reuseaddr,
@@ -443,7 +443,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                             .and_then(|a| port_of(&a))
                     };
                     let (host, lease, new) =
-                        crate::portmap::bind(&map, 0, map_proto(s), port, try_bind, bound)?;
+                        crate::portmap::bind(&map, map_proto(s), port, try_bind, bound)?;
                     if new && host != port {
                         let proto = if map_proto(s) == IPPROTO_TCP {
                             "tcp"
@@ -909,17 +909,7 @@ fn accept_host(
                 let w = cx.kr().world();
                 let outside = is_outside_host(&peer);
                 let raw_peer = peer;
-                let unmapped_peer = unmap_addr(&cx.kr().portmap, &w, &new, raw_peer.clone(), false);
-                let me = net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone());
-                let peer = crate::netns::from_host_peer(
-                    &w,
-                    &me,
-                    map_proto(&new),
-                    &raw_peer,
-                    &unmapped_peer,
-                    false,
-                    false,
-                );
+                let peer = translate_peer(&cx.kr().portmap, &w, &new, &raw_peer, false);
                 if outside && !is_outside_host(&peer) {
                     new.track_mut().outside_peer = Some(peer.clone());
                 }
@@ -951,10 +941,9 @@ fn accept_host(
                     if let Some(baddr) = crate::netns::BindAddr::from_guest(&guest_local) {
                         new.listener = Some(crate::netns::add_binding(
                             ns,
-                            crate::netns::Binding {
-                                id: 0,
+                            guest_port,
+                            crate::netns::NewBinding {
                                 proto: map_proto(&new),
-                                guest_port,
                                 addr: baddr,
                                 v6only: new.family == AF_INET6 && new.v6only,
                                 reuseaddr: guest_reuseaddr(&new),
@@ -1397,16 +1386,19 @@ fn claim_ephemeral(s: &mut InetSocket, addr: Option<&[u8]>) {
     let range = (lo.clamp(1, 65535) as u16, hi.clamp(1, 65535) as u16);
     let (guest, id) = crate::netns::add_ephemeral(
         &net,
-        proto,
-        baddr,
-        v6only,
-        guest_reuseaddr(s),
-        guest_reuseport(s),
-        s.euid,
-        proto == IPPROTO_UDP,
-        host_ip,
-        host,
-        s.wide,
+        crate::netns::NewBinding {
+            proto,
+            addr: baddr,
+            v6only,
+            reuseaddr: guest_reuseaddr(s),
+            reuseport: guest_reuseport(s),
+            euid: s.euid,
+            listening: proto == IPPROTO_UDP,
+            accepted: false,
+            host_ip,
+            host_port: host,
+            wide: s.wide,
+        },
         range,
     );
     s.listener = Some(id);
@@ -1611,18 +1603,9 @@ fn inet_name(cx: &Cx<'_>, s: &InetSocket, peer: bool) -> Result<Vec<u8>, Errno> 
         if let Some(p) = s.track.as_ref().and_then(|t| t.outside_peer.as_ref()) {
             return Ok(p.clone());
         }
-        let unmapped = unmap_addr(&cx.kr().portmap, &w, s, a.clone(), false);
-        return Ok(crate::netns::from_host_peer(
-            &w,
-            &me,
-            map_proto(s),
-            &a,
-            &unmapped,
-            false,
-            s.icmp6(),
-        ));
+        return Ok(translate_peer(&cx.kr().portmap, &w, s, &a, false));
     }
-    let a = unmap_addr(&cx.kr().portmap, &w, s, a, true);
+    let a = unmap_addr(s, a);
     let other = s
         .track
         .as_ref()
@@ -3078,21 +3061,21 @@ pub(crate) fn send(
                 return Ok(data.len());
             };
             let gport = port_of(there).unwrap_or(0);
-            let desired = if let Some(v) = &s.vconn {
-                crate::netns::with_host_endpoint(v, ip, h)
-            } else {
-                let template = appine_hal::net::sockname(s.fd, true)
-                    .ok()
-                    .unwrap_or_else(|| crate::netns::any_like(there));
-                crate::netns::with_host_endpoint(&template, ip, h)
-            };
             if let Some(v) = &mut s.vconn {
+                let desired = crate::netns::with_host_endpoint(v, ip, h);
                 if !same_endpoint(v, &desired) {
                     *v = desired;
                 }
             } else {
-                let current = appine_hal::net::sockname(s.fd, true).unwrap_or_default();
-                if !same_endpoint(&current, &desired) {
+                let current = appine_hal::net::sockname(s.fd, true).ok();
+                let desired = match &current {
+                    Some(cur) => crate::netns::with_host_endpoint(cur, ip, h),
+                    None => crate::netns::with_host_endpoint(&crate::netns::any_like(there), ip, h),
+                };
+                if current
+                    .as_deref()
+                    .is_none_or(|cur| !same_endpoint(cur, &desired))
+                {
                     let _ = appine_hal::net::connect(s.fd, &desired);
                 }
             }
@@ -3630,17 +3613,8 @@ pub(crate) fn recv(
                         // From a mapped low port on the local machine: report the guest's port
                         // (crate::portmap)
                         let w = cx.kr().world();
-                        let unmapped = unmap_addr(&cx.kr().portmap, &w, s, r.addr.clone(), false);
-                        let me = net_of(cx, s);
-                        let a = crate::netns::from_host_peer(
-                            &w,
-                            &me,
-                            map_proto(s),
-                            &r.addr,
-                            &unmapped,
-                            s.self_port.is_some(),
-                            s.icmp6(),
-                        );
+                        let a =
+                            translate_peer(&cx.kr().portmap, &w, s, &r.addr, s.self_port.is_some());
                         // From the destination DNAT rewrote to: report the one the guest sent to
                         match s
                             .track
@@ -5160,7 +5134,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
     } else {
         let map = k.portmap.borrow();
         if let Some(p) = port_of(&addr)
-            && let Some(h) = map.host_port(0, proto, p)
+            && let Some(h) = map.host_port(proto, p)
         {
             set_port(&mut addr, h);
         }
@@ -5203,7 +5177,7 @@ fn map_dest(
         if !mappable(s) {
             return (addr, None);
         }
-        map.borrow().host_port(0, map_proto(s), port)
+        map.borrow().host_port(map_proto(s), port)
     };
     match host {
         Some(h) if is_local(&addr) => {
@@ -5214,86 +5188,16 @@ fn map_dest(
     }
 }
 
-/// In a local (`local`) or peer address given by the host, a mapped host port is translated back
-/// to the guest's: the local end by the socket's bound mapping; the peer first by what was
-/// recorded at connect, then by its owning network namespace's binding table (for new namespaces,
-/// [`crate::netns::lookup_host`]) or the initial namespace's low-port registry
-/// ([`crate::portmap`]).
-pub(crate) fn unmap_addr(
-    map: &crate::cell::RefCell<crate::portmap::PortMap>,
-    w: &crate::netns::World,
-    s: &InetSocket,
-    mut addr: Vec<u8>,
-    local: bool,
-) -> Vec<u8> {
-    let Some(port) = port_of(&addr) else {
-        return addr;
-    };
-    let known = if local { s.local_map } else { s.peer_map };
-    // The source of a connection forwarded in from outside is not a mapped port (crate::forward)
-    let outside = ip_of(&addr).is_some_and(|ip| match ip {
-        std::net::IpAddr::V4(v) => v.octets()[..2] == [127, crate::forward::OUTSIDE_BLOCK],
-        std::net::IpAddr::V6(_) => false,
-    });
-    let guest = match known {
-        Some((g, h)) if h == port => Some(g),
-        _ if local || !mappable(s) || outside => None,
-        _ => match crate::netns::owner_of_host(w, &addr) {
-            Some(owner) if owner.host_net.is_some() => crate::netns::lookup_host(
-                &owner,
-                map_proto(s),
-                crate::netns::host_ipv4(&addr),
-                port,
-            )
-            .map(|(g, _)| g),
-            None if s.net.is_some() => None,
-            _ => map
-                .borrow()
-                .guest_port(0, map_proto(s), port)
-                .filter(|_| is_local(&addr)),
-        },
-    };
-    if let Some(g) = guest {
+/// In a local address given by the host, translates a mapped host port back to the guest's using
+/// the socket's bound mapping ([`InetSocket::local_map`]).
+pub(crate) fn unmap_addr(s: &InetSocket, mut addr: Vec<u8>) -> Vec<u8> {
+    if let Some(port) = port_of(&addr)
+        && let Some((g, h)) = s.local_map
+        && h == port
+    {
         set_port(&mut addr, g);
     }
     addr
-}
-
-/// Mapped low ports apply to this socket ([`crate::portmap`]): TCP, UDP, not raw sockets.
-fn mappable(s: &InetSocket) -> bool {
-    !s.raw && matches!(map_proto(s), IPPROTO_TCP | IPPROTO_UDP)
-}
-
-/// The protocol in the low-port mapping registry: MPTCP's ports are the same as TCP's (Go 1.24 and
-/// later listen with MPTCP by default).
-fn map_proto(s: &InetSocket) -> i32 {
-    if s.proto == IPPROTO_MPTCP {
-        IPPROTO_TCP
-    } else {
-        s.proto
-    }
-}
-
-/// The host address is local: loopback, the wildcard address, or one on a host interface
-/// (connecting to its own wlan0 address).
-fn is_local(addr: &[u8]) -> bool {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    let Some(ip) = ip_of(addr) else {
-        return false;
-    };
-    if ip.is_loopback() || ip.is_unspecified() {
-        return true;
-    }
-    appine_hal::net::interfaces().iter().any(|i| {
-        i.addrs.iter().any(|(_, a, _)| {
-            let own = match a.len() {
-                4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&a[..]).unwrap())),
-                16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&a[..]).unwrap())),
-                _ => return false,
-            };
-            own == ip
-        })
-    })
 }
 
 // ---- Shared helpers ----
@@ -5433,20 +5337,4 @@ fn is_outside_host(addr: &[u8]) -> bool {
         std::net::IpAddr::V4(v) => v.octets()[..2] == [127, crate::forward::OUTSIDE_BLOCK],
         std::net::IpAddr::V6(_) => false,
     })
-}
-
-/// The IP in a sockaddr (the IPv4 part of an IPv4-mapped IPv6 address).
-fn ip_of(addr: &[u8]) -> Option<std::net::IpAddr> {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    let family = i32::from(u16::from_le_bytes([*addr.first()?, *addr.get(1)?]));
-    match family {
-        AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
-            <[u8; 4]>::try_from(addr.get(4..8)?).ok()?,
-        ))),
-        AF_INET6 => {
-            let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(addr.get(8..24)?).ok()?);
-            Some(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4))
-        }
-        _ => None,
-    }
 }

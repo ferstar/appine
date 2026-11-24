@@ -243,6 +243,93 @@ impl InetSocket {
     }
 }
 
+/// Translates a host peer address `host_addr` (with host port intact) into the guest peer address
+/// seen by socket `s`, combining host-port unmapping and namespace address translation in a single
+/// `owner_of_host` + `lookup_host` lookup without cloning `host_addr`.
+pub(crate) fn translate_peer(
+    portmap: &crate::cell::RefCell<crate::portmap::PortMap>,
+    w: &crate::netns::World,
+    s: &InetSocket,
+    host_addr: &[u8],
+    self_peer: bool,
+) -> Vec<u8> {
+    let me = s.net.as_deref().unwrap_or_else(|| w.init());
+    let proto = map_proto(s);
+    crate::netns::from_host_peer(
+        w,
+        me,
+        proto,
+        host_addr,
+        self_peer,
+        s.icmp6(),
+        |owner, ns_port, host_port| match s.peer_map {
+            Some((g, h)) if h == host_port => Some(g),
+            _ if !mappable(s) => None,
+            _ => match owner {
+                Some(o) if o.host_net.is_some() => ns_port,
+                None if s.net.is_some() => None,
+                _ => portmap
+                    .borrow()
+                    .guest_port(proto, host_port)
+                    .filter(|_| is_local(host_addr)),
+            },
+        },
+    )
+}
+
+/// Mapped low ports apply to this socket ([`crate::portmap`]): TCP, UDP, not raw sockets.
+pub(crate) fn mappable(s: &InetSocket) -> bool {
+    !s.raw && matches!(map_proto(s), IPPROTO_TCP | IPPROTO_UDP)
+}
+
+/// The protocol in the port-mapping and binding tables: MPTCP's ports are the same as TCP's (Go
+/// 1.24 and later listen with MPTCP by default).
+pub(crate) fn map_proto(s: &InetSocket) -> i32 {
+    if s.proto == IPPROTO_MPTCP {
+        IPPROTO_TCP
+    } else {
+        s.proto
+    }
+}
+
+/// The host address is local: loopback, the wildcard address, or one on a host interface
+/// (connecting to its own wlan0 address).
+pub(crate) fn is_local(addr: &[u8]) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let Some(ip) = ip_of(addr) else {
+        return false;
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    appine_hal::net::interfaces().iter().any(|i| {
+        i.addrs.iter().any(|(_, a, _)| {
+            let own = match a.len() {
+                4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&a[..]).unwrap())),
+                16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&a[..]).unwrap())),
+                _ => return false,
+            };
+            own == ip
+        })
+    })
+}
+
+/// The IP in a sockaddr (the IPv4 part of an IPv4-mapped IPv6 address).
+pub(crate) fn ip_of(addr: &[u8]) -> Option<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let family = i32::from(u16::from_le_bytes([*addr.first()?, *addr.get(1)?]));
+    match family {
+        AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
+            <[u8; 4]>::try_from(addr.get(4..8)?).ok()?,
+        ))),
+        AF_INET6 => {
+            let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(addr.get(8..24)?).ok()?);
+            Some(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4))
+        }
+        _ => None,
+    }
+}
+
 /// What Linux keeps in connection tracking for a socket ([`crate::nft`],
 /// docs/rounds/175-filter.md).
 #[derive(Debug, Default)]
@@ -389,10 +476,6 @@ const IFLA_CARRIER: u16 = 33;
 const IFLA_PROTO_DOWN: u16 = 39;
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
-/// Linux's `NLMSG_GOODSIZE` on 4 KiB pages (`SKB_WITH_OVERHEAD(PAGE_SIZE)`): bounds a single
-/// `NFT_MSG_NEWSETELEM` chunk so every multipart set-element message fits inside a page-sized
-/// receive buffer (e.g. Go's `syscall.NetlinkRIB`, libmnl).
-pub(crate) const DUMP_CHUNK: usize = 3776;
 /// Upper bound on a single dynamically packed dump datagram (Linux's 32 KiB `max_recvmsg_len`
 /// ceiling in `netlink_dump`).
 const DUMP_MAX: usize = 32768;
@@ -443,6 +526,16 @@ pub(crate) enum NetlinkItem {
 }
 
 impl NetlinkItem {
+    /// A unicast reply or ack datagram (multicast group 0).
+    pub(crate) fn reply(msg: Vec<u8>) -> Self {
+        NetlinkItem::Datagram(msg, 0)
+    }
+
+    /// A resumable dump of pre-encoded netlink messages.
+    pub(crate) fn dump(msgs: DumpMessages) -> Self {
+        NetlinkItem::Dump(NetlinkDump::Messages(msgs))
+    }
+
     fn is_empty(&self) -> bool {
         match self {
             NetlinkItem::Datagram(..) => false,
@@ -521,7 +614,7 @@ impl DumpMessages {
     }
 
     /// Appends one message, ending the current section only when `end_section` is true.
-    pub(crate) fn push(&mut self, msg: Vec<u8>, end_section: bool) {
+    fn push(&mut self, msg: Vec<u8>, end_section: bool) {
         self.bytes = self.bytes.saturating_add(msg.len());
         self.msgs.push_back((msg, end_section));
     }
@@ -795,7 +888,7 @@ impl NetlinkSocket {
         // skipped and acked with 0 only when NLM_F_ACK is set.
         if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
             return if flags & NLM_F_ACK != 0 {
-                vec![NetlinkItem::Datagram(ack(req, 0, self.pid), 0)]
+                vec![NetlinkItem::reply(ack(req, 0, self.pid))]
             } else {
                 Vec::new()
             };
@@ -804,18 +897,17 @@ impl NetlinkSocket {
         let family = req.get(16).copied().unwrap_or(0) as i32;
         let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
         let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
-        let dgram = |m| NetlinkItem::Datagram(m, 0);
         let dump = flags & NLM_F_DUMP != 0;
         if let Some(r) = host.configure(req) {
             return match r {
-                Err(f) => vec![dgram(ack_ext(
+                Err(f) => vec![NetlinkItem::reply(ack_ext(
                     req,
                     f.errno,
                     self.pid,
                     f.msg.filter(|_| self.ext_ack),
                     self.cap_ack,
                 ))],
-                Ok(()) if flags & NLM_F_ACK != 0 => vec![dgram(ack(req, 0, self.pid))],
+                Ok(()) if flags & NLM_F_ACK != 0 => vec![NetlinkItem::reply(ack(req, 0, self.pid))],
                 Ok(()) => Vec::new(),
             };
         }
@@ -862,7 +954,7 @@ impl NetlinkSocket {
                 let mut out = DumpMessages::new();
                 out.push_section(kept.map(|l| reply(RTM_NEWLINK, mflags, &one(l))));
                 out.push_section([done()]);
-                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
+                vec![NetlinkItem::dump(out)]
             }
             RTM_GETADDR if dump => {
                 let links = host.links();
@@ -881,7 +973,7 @@ impl NetlinkSocket {
                     out.push_section(messages);
                 }
                 out.push_section([done()]);
-                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
+                vec![NetlinkItem::dump(out)]
             }
             // `ip link show <interface>`: looked up by ifi_index or IFLA_IFNAME (Linux's
             // rtnl_getlink)
@@ -895,7 +987,7 @@ impl NetlinkSocket {
                     .find(|(t, _)| *t == IFLA_IFNAME)
                     .map(|(_, d)| d.split(|&c| c == 0).next().unwrap_or_default().to_vec());
                 if index <= 0 && name.is_none() {
-                    return vec![dgram(ack(req, EINVAL, self.pid))];
+                    return vec![NetlinkItem::reply(ack(req, EINVAL, self.pid))];
                 }
                 let found = host.links().into_iter().find(|l| {
                     if index > 0 {
@@ -905,11 +997,11 @@ impl NetlinkSocket {
                     }
                 });
                 let Some(l) = found else {
-                    return vec![dgram(ack(req, ENODEV, self.pid))];
+                    return vec![NetlinkItem::reply(ack(req, ENODEV, self.pid))];
                 };
-                let mut out = vec![dgram(reply(RTM_NEWLINK, 0, &one(&l)))];
+                let mut out = vec![NetlinkItem::reply(reply(RTM_NEWLINK, 0, &one(&l)))];
                 if flags & NLM_F_ACK != 0 {
-                    out.push(dgram(ack(req, 0, self.pid)));
+                    out.push(NetlinkItem::reply(ack(req, 0, self.pid)));
                 }
                 out
             }
@@ -926,20 +1018,20 @@ impl NetlinkSocket {
                     out.push_section(messages);
                 }
                 out.push_section([done()]);
-                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
+                vec![NetlinkItem::dump(out)]
             }
             RTM_GETROUTE => {
                 let ifaces = host.all_interfaces();
                 let entries = host.tables();
                 match crate::route::get(req, &entries, &ifaces, host.uid(), host.init_net()) {
                     Ok(p) => {
-                        let mut out = vec![dgram(reply(RTM_NEWROUTE, 0, &p))];
+                        let mut out = vec![NetlinkItem::reply(reply(RTM_NEWROUTE, 0, &p))];
                         if flags & NLM_F_ACK != 0 {
-                            out.push(dgram(ack(req, 0, self.pid)));
+                            out.push(NetlinkItem::reply(ack(req, 0, self.pid)));
                         }
                         out
                     }
-                    Err(e) => vec![dgram(ack(req, e, self.pid))],
+                    Err(e) => vec![NetlinkItem::reply(ack(req, e, self.pid))],
                 }
             }
             // Rules form one dump section, followed by NLMSG_DONE, packed on demand.
@@ -947,12 +1039,12 @@ impl NetlinkSocket {
                 const EAFNOSUPPORT: i32 = 97;
                 let rules = crate::route::rule_messages(family);
                 if rules.is_empty() {
-                    return vec![dgram(ack(req, EAFNOSUPPORT, self.pid))];
+                    return vec![NetlinkItem::reply(ack(req, EAFNOSUPPORT, self.pid))];
                 }
                 let mut out = DumpMessages::new();
                 out.push_section(rules.iter().map(|m| reply(RTM_NEWRULE, NLM_F_MULTI, m)));
                 out.push_section([done()]);
-                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
+                vec![NetlinkItem::dump(out)]
             }
             // Network namespace numbers (`ip netns list`): assigned to the namespace of the peer
             // only when dumping veths (IFLA_LINK_NETNSID, Linux's peernet2id_alloc), and
@@ -984,13 +1076,13 @@ impl NetlinkSocket {
                     Ok(id) => {
                         let mut p = vec![0u8; 4];
                         attr(&mut p, NETNSA_NSID, &id.unwrap_or(-1).to_le_bytes());
-                        let mut out = vec![dgram(reply(RTM_NEWNSID, 0, &p))];
+                        let mut out = vec![NetlinkItem::reply(reply(RTM_NEWNSID, 0, &p))];
                         if flags & NLM_F_ACK != 0 {
-                            out.push(dgram(ack(req, 0, self.pid)));
+                            out.push(NetlinkItem::reply(ack(req, 0, self.pid)));
                         }
                         out
                     }
-                    Err(e) => vec![dgram(ack(req, e, self.pid))],
+                    Err(e) => vec![NetlinkItem::reply(ack(req, e, self.pid))],
                 }
             }
             // The neighbour table (ARP, NDP): the app on Android cannot see the host's, so it is
@@ -999,9 +1091,9 @@ impl NetlinkSocket {
             RTM_GETNEIGH if dump => {
                 let mut out = DumpMessages::new();
                 out.push_section([done()]);
-                vec![NetlinkItem::Dump(NetlinkDump::Messages(out))]
+                vec![NetlinkItem::dump(out)]
             }
-            RTM_GETNEIGH => vec![dgram(ack_ext(
+            RTM_GETNEIGH => vec![NetlinkItem::reply(ack_ext(
                 req,
                 check_getneigh(req, host),
                 self.pid,
@@ -1015,9 +1107,9 @@ impl NetlinkSocket {
                     && (ty - RTM_BASE) & 3 != 2
                     && !host.net_admin()
                 {
-                    vec![dgram(ack(req, EPERM, self.pid))]
+                    vec![NetlinkItem::reply(ack(req, EPERM, self.pid))]
                 } else {
-                    vec![dgram(ack(req, EOPNOTSUPP, self.pid))]
+                    vec![NetlinkItem::reply(ack(req, EOPNOTSUPP, self.pid))]
                 }
             }
         }
@@ -1623,14 +1715,10 @@ fn generic_request(req: &[u8], pid: u32) -> Vec<NetlinkItem> {
                 let mut out = DumpMessages::new();
                 out.push(reply(GENL_ID_CTRL, NLM_F_MULTI, &nlctrl_family()), false);
                 out.push(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()), true);
-                Ok(Some(NetlinkItem::Dump(NetlinkDump::Messages(out))))
+                Ok(Some(NetlinkItem::dump(out)))
             }
-            CTRL_CMD_GETFAMILY => names_nlctrl(req).map(|()| {
-                Some(NetlinkItem::Datagram(
-                    reply(GENL_ID_CTRL, 0, &nlctrl_family()),
-                    0,
-                ))
-            }),
+            CTRL_CMD_GETFAMILY => names_nlctrl(req)
+                .map(|()| Some(NetlinkItem::reply(reply(GENL_ID_CTRL, 0, &nlctrl_family())))),
             // Policy dumps are not implemented: it can only tell that the requested family does not
             // exist
             CTRL_CMD_GETPOLICY if dump => names_nlctrl(req).and(Err(EOPNOTSUPP)),
@@ -1643,11 +1731,11 @@ fn generic_request(req: &[u8], pid: u32) -> Vec<NetlinkItem> {
         Ok(answer) => {
             let mut out: Vec<NetlinkItem> = answer.into_iter().collect();
             if flags & NLM_F_ACK != 0 && (!dump || out.is_empty()) {
-                out.push(NetlinkItem::Datagram(ack(req, 0, pid), 0));
+                out.push(NetlinkItem::reply(ack(req, 0, pid)));
             }
             out
         }
-        Err(e) => vec![NetlinkItem::Datagram(ack(req, e, pid), 0)],
+        Err(e) => vec![NetlinkItem::reply(ack(req, e, pid))],
     }
 }
 
@@ -1779,7 +1867,7 @@ fn sock_diag_request(req: &[u8], pid: u32, cap: bool) -> Vec<NetlinkItem> {
     if err == 0 && flags & NLM_F_ACK == 0 {
         return Vec::new();
     }
-    vec![NetlinkItem::Datagram(ack_ext(req, err, pid, None, cap), 0)]
+    vec![NetlinkItem::reply(ack_ext(req, err, pid, None, cap))]
 }
 
 /// The ack or error for request `req` (the whole message) (Linux's `netlink_ack`): on success only
@@ -1895,9 +1983,7 @@ pub(crate) fn proc_listing(
         }
         // Addresses as the guest sees them (crate::netns), and mapped low ports reported as the
         // guest's (crate::portmap)
-        let me = inet.net.clone().unwrap_or_else(|| w.all[0].clone());
-        let unmap =
-            |a: Vec<u8>, local: bool| crate::syscall::unmap_addr(portmap, w, inet, a, local);
+        let me = inet.net.as_deref().unwrap_or_else(|| w.init());
         let host_peer = appine_hal::net::sockname(fd, true).ok();
         let local = appine_hal::net::sockname(fd, false).ok().map(|a| {
             let role = crate::netns::Role::Local {
@@ -1905,7 +1991,8 @@ pub(crate) fn proc_listing(
                 vaddr: inet.vaddr,
                 peer: host_peer.as_deref(),
             };
-            crate::netns::from_host(w, &me, &unmap(a, true), role, inet.icmp6())
+            let a = crate::syscall::unmap_addr(inet, a);
+            crate::netns::from_host(w, me, &a, role, inet.icmp6())
         });
         let peer = if host_peer.is_some()
             && let Some(p) = inet.track.as_ref().and_then(|t| t.outside_peer.as_ref())
@@ -1913,16 +2000,8 @@ pub(crate) fn proc_listing(
             Some(p.clone())
         } else {
             host_peer
-                .clone()
-                .map(|a| {
-                    let proto = if inet.proto == IPPROTO_MPTCP {
-                        IPPROTO_TCP
-                    } else {
-                        inet.proto
-                    };
-                    let unmapped = unmap(a.clone(), false);
-                    crate::netns::from_host_peer(w, &me, proto, &a, &unmapped, false, inet.icmp6())
-                })
+                .as_deref()
+                .map(|a| translate_peer(portmap, w, inet, a, false))
                 .or_else(|| inet.peer.clone())
         };
         let state = if tcp {
