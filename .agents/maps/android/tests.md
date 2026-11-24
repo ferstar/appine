@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: cover import publication after source close and a concurrent name collision)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: document URI reuse after a recursive deletion)
 
 ## Responsibilities
 
@@ -98,7 +98,7 @@ debug variant, manifest and network-security configuration belong to `android/bu
   legacy preferences, disabled queries/reads/changes and file links, authority-wide grant revocation,
   canonical `%XX` validation and `%2E`/`%2F` tree-grant rejection, home, no home including regular-file
   homes and `rootsChanged` cache invalidation, writes,
-  changes both ways, grants below a directory as a pure check of `Documents.grantedUnder`), manual
+  changes both ways, persisted grant selection and stale descendant IDs through direct and symlink paths after deleting and recreating a directory), manual
   mirrors, verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
   ports, bugs injected through the test hooks killing only the guest process on both tiers, kill
   reports (including an OOM from a cgroup `memory.max`), a guest crash reaching the kernel log, and

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: filesystem timestamps for held regular files)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: cold-boot object recovery, cached ACLs and transactional document IDs)
 
 ## Responsibilities
 
@@ -40,7 +40,7 @@ provider and rootfs installation UI (`android`).
   id, changed directories.
 - `Meta` — state shared with readers and the reaper thread: the cache behind an `RwLock`, the
   commit counter, the reaper queue, the WAL path and durability watermark.
-- `Stat`, `DirEntry`, `FileTime` (`Now` or `At(ns)`), the `mode` constants; `Ino = u64`, `ROOT = 1`.
+- `Stat` includes the store inode’s access and default ACLs; `DirEntry`, `FileTime` (`Now` or `At(ns)`), the `mode` constants; `Ino = u64`, `ROOT = 1`.
 - `Commits` — 32 bytes of the `lock` file mapped shared: commit counter, number of open
   connections (`users`), and the range of inode numbers allocated by uncommitted transactions.
 - `Cache` — dentries (including negative entries), database rows with where each regular file's
@@ -196,7 +196,11 @@ provider and rootfs installation UI (`android`).
   - A held file's private copy is flushed before the commit that points it there, through the same
     `replaced` list as a rename-over.
 - New regular files' objects exist immediately; the `lock` header records the uncommitted inode
-  range so the next boot can delete objects without rows.
+  range so the next exclusive open can delete objects without rows. On a different host boot
+  (or first use with no boot marker), recovery compares the numbered objects with the database,
+  including shared-object references. It syncs the WAL before deleting unused objects and
+  records the boot token after the scan. If the host hides its boot ID, each process uses its
+  own token. The original 32-byte shared header stays at the front of the lock file.
 
 ### Reaper and checkpoints
 
@@ -211,7 +215,7 @@ provider and rootfs installation UI (`android`).
 ### Opening and boot cleanup
 
 - Every connection takes a shared `flock` on `lock`. If it can get the lock exclusively (nobody else
-  has the store open), it runs boot cleanup: reset `users`, delete objects in the recorded
+  has the store open), it runs boot cleanup: reset `users`, reconcile objects when the boot token changes, delete objects in the recorded
   uncommitted range that have no row, empty the volatile directories passed in (the kernel passes
   `/dev/shm` and `/run`; host-side openers pass none), remove detached trees, sync, drop the
   `shared` rows of deleted files, delete nlink-0 rows no `shared` row uses as an object and their
@@ -275,8 +279,11 @@ provider and rootfs installation UI (`android`).
   rename and move without overwriting, open for writing with a read-write or append fd) are confined
   to a caller-supplied `top` directory compared by real path (`EACCES` outside, and for a `top`
   whose real path is the root directory, which would cover everything; `top` itself cannot be
-  removed). No guest permission checks are applied, tree removal is one operation per entry, and
+  removed). No guest permission checks are applied, tree removal is one transaction, and
   provider writes do not strip setuid/setgid bits or capabilities.
+- Removing or moving a source entry retires its document IDs atomically with the namespace change.
+  `document_generations` reads one SQLite snapshot per batch, looking up the newest retired
+  (parent inode, name) along the resolved path, including symlinks and their targets.
 - `import_file` creates a file in a detached directory and commits before calling its writer.
   The store stays open during the copy and holds no SQLite writer lock. After syncing the object,
   it checks that the account's home still resolves to the original directory, renames the file
@@ -338,9 +345,6 @@ provider and rootfs installation UI (`android`).
 - **Whole-file sharing:** the first change to a file sharing its object copies all of it, where
   btrfs and XFS copy only the extents written.
 
-- **Storage leaks:** the shared `lock` header is not ordered against the WAL, so after power loss a
-  cleared range can be durable while the commit is not, leaving uncommitted objects on disk until
-  their inode number is reused by a regular file (or forever if reused by another kind).
 
 ## Open questions
 

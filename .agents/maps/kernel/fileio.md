@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared mappings after guest and Files app unsharing)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: zero-length scalar reads)
 
 ## Responsibilities
 
@@ -96,8 +96,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   `splice` call, `write_sync` syncs a regular store file's object (fdatasync for `O_DSYNC`/
   `RWF_DSYNC`, fsync for `O_SYNC`/`RWF_SYNC`, BKL released) or a FUSE file (`FUSE_FSYNC`); a sync
   error after writing is propagated cleanly. Host fds, core dumps and loop writes are not synced.
-- A zero-length `read` or `pread` of anything but a socket returns 0 after the fd lookup, before
-  the readable, `ESPIPE` and directory checks (zero-length readv and write check first).
+- Zero-length scalar reads check the fd, positional I/O and read mode. Empty reads on pipes and regular files complete immediately. Directories return `EISDIR`, epoll and short fixed-size device reads return `EINVAL`. Socket reads retain their message semantics.
 - Host stdio fds (`FileKind::Host`): reads poll the host fd (`EAGAIN` when nonblocking,
   interruptible), then read without the BKL; writes run without the BKL, ignore guest
   `O_NONBLOCK`, retry `EINTR` and turn `EPIPE` into `SIGPIPE`; positional I/O is `ESPIPE` even on
@@ -274,8 +273,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   - host stdio: positional I/O is `ESPIPE` on a regular host file, and a blocked write cannot be
     interrupted;
   - fadvise64 on an `O_PATH` fd succeeds, and sync_file_range on a loop device is `ESPIPE`.
-- **Error order in I/O calls:** a zero-length read or pread skips the readable (`EBADF`, `EINVAL`
-  for epoll), `ESPIPE` and `EISDIR` checks; pread and pwrite look up the fd before refusing a
+- **Error order in I/O calls:** pread and pwrite look up the fd before refusing a
   negative offset; fallocate checks its arguments before the fd, its mode after the fd's type, and
   on a socket is `ESPIPE` where 6.1 says `ENODEV`.
 - **Private mappings do not follow a file to its own object:** a private mapping made while the

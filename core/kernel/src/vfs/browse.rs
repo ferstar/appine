@@ -351,8 +351,14 @@ pub fn remove(
     path: &[u8],
     changes: &mut Vec<Change>,
 ) -> Result<(), Errno> {
-    let (dir, name) = entry_in(store, top, path)?;
-    remove_tree(store, dir, &name, changes)
+    let mut removed = Vec::new();
+    store.transaction(|s| {
+        let (dir, name) = entry_in(s, top, path)?;
+        remove_tree(s, dir, &name, &mut removed)?;
+        s.retire_document(dir, &name)
+    })?;
+    changes.extend(removed);
+    Ok(())
 }
 
 fn remove_tree(
@@ -460,7 +466,13 @@ fn moved(
 ) -> Result<(), Errno> {
     let ino = store.lookup(from.0, from.1)?.ok_or(Errno::ENOENT)?;
     let is_dir = store.kind(ino)? == mode::S_IFDIR;
-    store.rename(from.0, from.1, to.0, to.1, true, false)?;
+    store.transaction(|s| {
+        s.rename(from.0, from.1, to.0, to.1, true, false)?;
+        if from != to {
+            s.retire_document(from.0, from.1)?;
+        }
+        Ok(())
+    })?;
     changes.push(Change::Moved {
         from: (from.0, from.1.to_vec()),
         to: (to.0, to.1.to_vec()),
@@ -633,6 +645,38 @@ pub fn resolve(store: &Store, path: &[u8]) -> Result<Ino, Errno> {
 /// [`resolve`], also giving the components of the real path (with every symlink replaced by where
 /// it points, like realpath).
 fn walk(store: &Store, path: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
+    walk_with(store, path, |_, _| Ok(()))
+}
+
+/// SAF identifiers retain the original path until a provider mutation retires an entry traversed
+/// by the walk. Include intermediate symlinks and their targets, even across an absolute link.
+pub fn document_generations(store: &Store, paths: &[Vec<u8>]) -> Result<Vec<u64>, Errno> {
+    store.snapshot(|s| {
+        if !s.has_retired_documents()? {
+            return Ok(vec![0; paths.len()]);
+        }
+        paths
+            .iter()
+            .map(|path| {
+                let mut newest = 0;
+                let r = walk_with(s, path, |dir, name| {
+                    newest = newest.max(s.document_generation(dir, name)?);
+                    Ok(())
+                });
+                match r {
+                    Ok(_) | Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => Ok(newest),
+                    Err(e) => Err(e),
+                }
+            })
+            .collect()
+    })
+}
+
+fn walk_with(
+    store: &Store,
+    path: &[u8],
+    mut visit: impl FnMut(Ino, &[u8]) -> Result<(), Errno>,
+) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
     // The components not walked yet, in reverse (the top of the stack is the next one); following
     // a symlink pushes the target's components
     let mut pending: Vec<Vec<u8>> = components(path).rev().collect();
@@ -651,6 +695,7 @@ fn walk(store: &Store, path: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
             inos.pop();
             continue;
         }
+        visit(dir, &name)?;
         let ino = store.lookup(dir, &name)?.ok_or(Errno::ENOENT)?;
         if store.kind(ino)? == mode::S_IFLNK {
             links += 1;
@@ -724,6 +769,38 @@ mod tests {
         s.mknod(alice, b"fifo", mode::S_IFIFO | 0o644, 0, 1000, 1000)
             .unwrap();
         (s, dir)
+    }
+
+    #[test]
+    fn retired_document_ids_follow_aliases_and_survive_reopen() {
+        let (s, dir) = sample("document-ids");
+        let top = b"/home/alice";
+        let source = b"/home/alice/Docs";
+        let paths = [
+            b"/home/alice/Docs/Notes.txt".to_vec(),
+            b"/home/alice/rel".to_vec(),
+            b"/home/alice/motd".to_vec(),
+        ];
+        let mut changes = Vec::new();
+        rename(&s, top, source, b"Docs", &mut changes).unwrap();
+        assert_eq!(
+            rename(&s, top, source, b"motd", &mut changes),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(document_generations(&s, &paths).unwrap(), [0, 0, 0]);
+        rename(&s, top, source, b"moved", &mut changes).unwrap();
+        rename(&s, top, b"/home/alice/moved", b"Docs", &mut changes).unwrap();
+        let first = document_generations(&s, &paths).unwrap();
+        assert!(first[0] > 0);
+        assert_eq!(first, [first[0], first[0], 0]);
+        remove(&s, top, source, &mut changes).unwrap();
+        drop(s);
+        let s = Store::open(&dir, &[]).unwrap();
+        let next = document_generations(&s, &paths).unwrap();
+        assert!(next[0] > first[0]);
+        assert_eq!(next, [next[0], next[0], 0]);
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -521,6 +521,7 @@ fn open_path_with(
                     &vfs,
                     (mnt, d),
                     name,
+                    dir_st.default_acl.as_deref(),
                     || vfs.store().create_file(d, name, perm, uid, gid),
                     |(ino, _)| *ino,
                 )?;
@@ -3255,7 +3256,10 @@ fn vectored_inner(
         false => usize::MAX,
     };
     let mut total = 0;
-    for (base, len) in vecs {
+    for (index, (base, len)) in vecs.into_iter().enumerate() {
+        if index != 0 && len == 0 {
+            continue;
+        }
         if total as usize >= room {
             break;
         }
@@ -3358,10 +3362,13 @@ fn read_scattered(
     note_read(cx, file, k);
     let mut done = 0;
     for &(base, len) in vecs {
-        let n = len.min(k - done);
-        if n == 0 {
+        if done == k {
             break;
         }
+        if len == 0 {
+            continue;
+        }
+        let n = len.min(k - done);
         let copied = cx.write_user_partial(base, &buf[done..done + n]);
         done += copied;
         if copied < n {
@@ -4016,10 +4023,11 @@ fn read_file_inner(
         let nonblock = file.borrow().nonblocking() || io.nowait;
         return super::net::rw(cx, &s, nonblock, &[(buf, len)], false);
     }
+    if len == 0 {
+        return read_bytes_inner(cx, file, &mut [], offset, io, pos_held).map(|n| n as u64);
+    }
     // Pipe reads peek and copy into user memory before draining so an EFAULT never consumes bytes
-    if len > 0
-        && let Some((pipe, _)) = pipe_of(file)
-    {
+    if let Some((pipe, _)) = pipe_of(file) {
         let nonblock = {
             let f = file.borrow();
             positional(&f, offset)?;
@@ -4030,12 +4038,7 @@ fn read_file_inner(
         };
         return pipe_read_user(cx, file, &pipe, nonblock, &[(buf, len)]);
     }
-    let _pos = PosGuard::lock_positioned(
-        cx,
-        file,
-        len > 0 && !pos_held && offset.is_none(),
-        io.nowait,
-    )?;
+    let _pos = PosGuard::lock_positioned(cx, file, !pos_held && offset.is_none(), io.nowait)?;
     let held = pos_held || _pos.is_some();
     // Each read of a terminal or pipe returns only data already ready and must not block again
     // to fill the buffer; /dev/zero and /dev/urandom fill it in one read as on Linux
@@ -4286,6 +4289,16 @@ fn read_bytes_inner(
         }
         (path, f.nonblocking() || io.nowait)
     };
+    // Stream and regular-file reads can finish an empty transfer without waiting for
+    // readiness or contacting a FUSE daemon. Record-oriented devices check their own sizes.
+    if buf.is_empty()
+        && (matches!(
+            path,
+            IoPath::Host(_) | IoPath::Pty(..) | IoPath::Fuse(_) | IoPath::Loop(_) | IoPath::Pipe(_)
+        ) || matches!(file.borrow().kind, FileKind::Regular { .. }))
+    {
+        return Ok(0);
+    }
     match path {
         IoPath::Host(fd) => {
             wait_host(cx, fd, POLLIN, nonblock)?;
@@ -4341,7 +4354,9 @@ fn read_bytes_inner(
                     appine_hal::pread(fd, buf, pos)
                 })?,
                 None => {
-                    refresh_pseudo(cx, file, offset)?;
+                    if !buf.is_empty() {
+                        refresh_pseudo(cx, file, offset)?;
+                    }
                     local_read(&mut file.borrow_mut(), buf, offset)?
                 }
             };
@@ -6359,6 +6374,7 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
             mtime_ns: 0,
             ctime_ns: 0,
             blocks: None,
+            ..Stat::default()
         };
         encode_stat(&st, dev)
     };
@@ -6456,6 +6472,7 @@ fn host_stat(fd: i32) -> Result<[u8; 128], Errno> {
         mtime_ns: s.st_mtime as i64 * 1_000_000_000 + s.st_mtime_nsec as i64,
         ctime_ns: s.st_ctime as i64 * 1_000_000_000 + s.st_ctime_nsec as i64,
         blocks: Some(s.st_blocks as u64),
+        ..Stat::default()
     };
     Ok(encode_stat(&st, s.st_dev as u64))
 }
@@ -6545,6 +6562,7 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
         &vfs,
         (mnt, dir),
         name,
+        dir_st.default_acl.as_deref(),
         || vfs.store().mkdir(dir, name, perm, uid, gid),
         |&ino| ino,
     )?;
@@ -6652,7 +6670,14 @@ pub(super) fn mknodat(
                 .mknod(dir, name, kind | perm, dev & 0xffff_ffff, uid, gid)
         }
     };
-    create_in(&vfs, (mnt, dir), name, made, |&ino| ino)?;
+    create_in(
+        &vfs,
+        (mnt, dir),
+        name,
+        dir_st.default_acl.as_deref(),
+        made,
+        |&ino| ino,
+    )?;
     tmpfs_created_name(&vfs, tmpfs, 0);
     created_events(cx.kr(), (dir, ovl), name, 0);
     Ok(0)
@@ -6989,6 +7014,7 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
         &vfs,
         (mnt, dir),
         name,
+        None,
         || vfs.store().symlink(dir, name, &target, uid, gid),
         |&ino| ino,
     )?;
@@ -7147,6 +7173,7 @@ fn link_overlay(
         vfs,
         (mnt, up),
         name,
+        None,
         || vfs.store().link(up, name, file).map(|()| file),
         |&ino| ino,
     )?;
@@ -8803,20 +8830,28 @@ pub(super) fn create_in<T>(
     vfs: &Vfs,
     (mnt, dir): (MountId, Ino),
     name: &[u8],
+    default_acl: Option<&[crate::vfs::acl::AclEntry]>,
     make: impl FnOnce() -> Result<T, Errno>,
     made: impl Fn(&T) -> Ino,
 ) -> Result<T, Errno> {
-    let Some(prefix) = vfs.overlay_prefix(mnt) else {
+    let prefix = vfs.overlay_prefix(mnt);
+    if prefix.is_none() && default_acl.is_none() {
         return make();
-    };
+    }
     vfs.store().transaction(|s| {
-        let whiteout = crate::vfs::overlay::whiteout_at(s, dir, name)?;
+        let whiteout = prefix.is_some() && crate::vfs::overlay::whiteout_at(s, dir, name)?;
         if whiteout {
             s.unlink(dir, name)?;
         }
         let new = make()?;
         let ino = made(&new);
-        if whiteout && s.kind(ino)? == mode::S_IFDIR {
+        if let Some(acl) = default_acl {
+            crate::vfs::acl::inherit(s, ino, acl)?;
+        }
+        if let Some(prefix) = prefix
+            && whiteout
+            && s.kind(ino)? == mode::S_IFDIR
+        {
             s.set_xattr(ino, &[prefix, b"opaque"].concat(), b"y", false, false)?;
         }
         Ok(new)

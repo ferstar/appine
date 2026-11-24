@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: notify dirsChanged from TerminalFiles.copyIntoHome)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: durable document ID generations for provider mutations)
 
 ## Responsibilities
 
@@ -15,7 +15,7 @@ terminal `file:` links:
 
 - up to two roots, both gated behind default-off `Settings.fileAccess` (overridden by privacy
   mode): the login account's home (writable) and the whole system (read-only outside home);
-- canonical guest-path document IDs, `%XX` encoding/decoding matching native `browse`, columns,
+- generation-checked guest-path document IDs, `%XX` encoding/decoding matching native `browse`, columns,
   literal-path flags, containment/path queries (`isChildDocument`, `findDocumentPath`), and MIME
   detection with batched UTF-8 content sniffing;
 - direct store reads, home-confined writes/creates/deletes/renames/moves and breadth-first search
@@ -77,7 +77,7 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   resolves, and always adds `system` (`"/"`, same flags without create) with free space from
   `StorageManager.getAllocatableBytes`, setting the roots notification URI (early empty returns
   when disabled or unready skip `setNotificationUri`).
-- **Document IDs**: canonical absolute guest paths (`"/"` or leading `"/"`, no trailing `"/"`, no
+- **Document IDs**: the canonical absolute guest path optionally prefixed by its decimal generation. The path format is unchanged (`"/"` or leading `"/"`, no trailing `"/"`, no
   empty, `"."` or `".."` segments, no NUL bytes, and exact round-trip equality with
   `documentId(percentDecode(path))`, rejecting encoded `/` or `.` such as `%2F`/`%2E` and
   non-canonical escapes). `documentId` + `utf8Length` mirror native `browse::encode_path`:
@@ -93,14 +93,15 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   extension after the last `.` (dotfiles like `.bashrc` usually miss). Unknown-extension files are
   batched in one `Native.browseSniff` call (first 1000 files only; reads up to 4 KB following
   symlinks; no NUL and valid UTF-8 -> `text/plain`, else `application/octet-stream`).
-- **Ancestry and paths**: `isChildDocument` checks `fileAccess`, canonical IDs and `doc != parent
-  && within(parent, doc)` without store I/O. `findDocumentPath` returns the ancestor ID list from
+- **Ancestry and paths**: with file access enabled, `isChildDocument` checks both IDs against their
+  current store generations, then tests whether the child's path is strictly below the parent's.
+  `findDocumentPath` returns the ancestor ID list from
   a supplied `parentDocumentId`, else from `home` if `within(home, child)`, else from `system`
   (`"/"`), throwing `FileNotFoundException` if `child` is not under `top`.
 
 ### Operations, locking and grant revocation
 
-- **Locking and errors**: every `Native.browse*` call runs inside `Rootfs.access.read` and opens a
+- **Locking and errors**: provider callbacks serialize ID validation with namespace mutations. Every `Native.browse*` call runs inside `Rootfs.access.read` and opens a
   fresh `Store` connection per JNI call (forcing a running kernel to flush deferred commits, then
   closing immediately). Native `Errno` maps to `FileNotFoundException`; non-`FileNotFoundException`
   `IOException`s are rethrown as `FileNotFoundException`; writes outside `home` (or targeting
@@ -124,8 +125,7 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
     does not follow a final symlink, and removes trees recursively.
   - `renameDocument`: strict child of `home`; `fileName(displayName, "", true)` adds no extension;
     native `browse::rename` never overwrites (`noreplace = true`).
-  - `moveDocument`: strict child of `home` into `home` (`top = true`, ignoring
-    `sourceParentDocumentId`); native `browse::move_to` refuses overwrites and moving a directory
+  - `moveDocument`: strict child of `home` into `home` (`top = true`, validating the source-parent ID); native `browse::move_to` refuses overwrites and moving a directory
     into itself.
   - `querySearchDocuments`: breadth-first case-insensitive substring search under `home` or
     `system` (`SEARCH_LIMIT = 200`, native `SEARCH_BUDGET = 50,000` entries; does not descend into
@@ -139,7 +139,10 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
     revokes the source ID directly and enumerates `outgoingPersistedUriPermissions` through
     `grantedUnder` (checking `getTreeDocumentId` for tree URIs and `getDocumentId` for document
     URIs) to revoke persisted grants on descendants, because SAF document IDs occupy a single URI
-    path segment.
+    path segment. The store records the source parent inode and name in the same SQLite transaction
+    as removal, rename or move. An ID takes the newest generation traversed during resolution,
+    including symlinks and their targets. Reusing the path invalidates old direct and descendant
+    URIs, including aliases. Siblings, rolled-back operations and no-op renames keep their IDs.
 
 ### Terminal `file:` links
 
@@ -208,10 +211,7 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
 
 ## Confirmed bugs / technical debt
 
-- **Transient grants outlive moved or deleted directories:** `outgoingPersistedUriPermissions`
-  exposes only persisted grants; transient (activity-scoped) grants on descendants of a deleted,
-  renamed or moved directory cannot be listed and last until that activity ends, covering any new
-  file created at the same path meanwhile.
+None recorded.
 
 ## Open questions
 

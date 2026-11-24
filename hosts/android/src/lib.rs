@@ -317,6 +317,39 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseList<'l>(
     })
 }
 
+/// Current SAF document generations in one read snapshot, including symlink traversal.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseGenerations<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    paths: JObjectArray<'l>,
+) -> jni::sys::jlongArray {
+    guarded!("Native.browseGenerations", throws env, std::ptr::null_mut(), {
+        let (Some(store), Some(paths)) = (string(&mut env, &store), strings(&mut env, &paths)) else {
+            return std::ptr::null_mut();
+        };
+        let paths: Vec<_> = paths.iter()
+            .map(|p| browse::decode_path(&String::from_utf8_lossy(p)))
+            .collect();
+        let result = appine_kernel::browse(store.as_ref(), |s| browse::document_generations(s, &paths));
+        let generations = match result {
+            Ok(g) => g.into_iter().map(|n| n as i64).collect::<Vec<_>>(),
+            Err(e) => {
+                not_found(&mut env, "lookup document generations in", &store, e);
+                return std::ptr::null_mut();
+            }
+        };
+        let Ok(array) = env.new_long_array(generations.len() as jint) else {
+            return std::ptr::null_mut();
+        };
+        if env.set_long_array_region(&array, 0, &generations).is_err() {
+            return std::ptr::null_mut();
+        }
+        array.into_raw()
+    })
+}
+
 /// Opens a regular file for reading and returns the host fd (handed to
 /// ParcelFileDescriptor.adoptFd, which closes it).
 #[unsafe(no_mangle)]
@@ -1337,6 +1370,7 @@ fn strings(env: &mut JNIEnv<'_>, array: &JObjectArray<'_>) -> Option<Vec<Vec<u8>
     for i in 0..n {
         let item = JString::from(env.get_object_array_element(array, i).ok()?);
         out.push(string(env, &item)?.into_bytes());
+        env.delete_local_ref(item).ok()?;
     }
     Some(out)
 }

@@ -1562,8 +1562,9 @@ class MachineTest {
     fun documentsWriteInTheHomeDirectory() {
         val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
         val machine = start(1)
-        val setup = "deluser --remove-home bob 2>/dev/null; adduser -D -u 1500 bob && mkdir /home/bob/dw && " +
-            "ln -s /etc /home/bob/dw/etc-link && chown -h bob:bob /home/bob/dw /home/bob/dw/etc-link"
+        val dw = "/home/bob/dw-${java.util.UUID.randomUUID()}"
+        val setup = "deluser --remove-home bob 2>/dev/null; adduser -D -u 1500 bob && mkdir $dw && " +
+            "ln -s /etc $dw/etc-link && chown -h bob:bob $dw $dw/etc-link"
         assertEquals(0, sh(machine, setup).second)
         prefs.edit().putString("login", "bob").putBoolean("file_access", true).commit()
         val resolver = context.contentResolver
@@ -1578,7 +1579,6 @@ class MachineTest {
             it.moveToFirst()
             it.getInt(it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_FLAGS))
         }
-        val dw = "/home/bob/dw"
         try {
             assertEquals("$dw/notes.txt", create(dw, "text/plain", "notes"))
             assertEquals("$dw/notes (1).txt", create(dw, "text/plain", "notes.txt"))
@@ -1607,8 +1607,34 @@ class MachineTest {
             val moved = DocumentsContract.moveDocument(resolver, renamed!!, uri(dw), uri("$dw/sub"))
             assertEquals("$dw/sub/renamed.txt", id(moved))
             assertEquals("y" to 0, sh(machine, "cat $dw/sub/renamed.txt"))
+            assertEquals(0, sh(machine, "ln -s sub $dw/alias").second)
+            val alias = uri("$dw/alias/renamed.txt")
+            val recipient = InstrumentationRegistry.getInstrumentation().context
+            val grant = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            context.grantUriPermission(recipient.packageName, alias, grant)
+            assertEquals(android.content.pm.PackageManager.PERMISSION_GRANTED,
+                context.checkUriPermission(alias, -1, recipient.applicationInfo.uid, grant))
+            assertEquals("y", resolver.openInputStream(alias)!!.bufferedReader().use { it.readText() })
             assertTrue(DocumentsContract.deleteDocument(resolver, uri("$dw/sub")))
             assertEquals(1, sh(machine, "test -e $dw/sub").second)
+            // Reusing the path produces fresh IDs even for descendants whose transient
+            // grants Android cannot enumerate. A sibling's pre-existing URI still works.
+            val newDir = create(dw, DocumentsContract.Document.MIME_TYPE_DIR, "sub")!!
+            val newFile = create(newDir, "text/plain", "renamed.txt")!!
+            assertTrue(newFile != id(moved))
+            assertThrows(java.io.FileNotFoundException::class.java) {
+                resolver.openInputStream(moved!!)!!.use { it.read() }
+            }
+            // Android still knows the transient grant. The provider rejects its stale ID.
+            assertEquals(android.content.pm.PackageManager.PERMISSION_GRANTED,
+                context.checkUriPermission(alias, -1, recipient.applicationInfo.uid, grant))
+            assertThrows(java.io.FileNotFoundException::class.java) {
+                resolver.openInputStream(alias)!!.use { it.read() }
+            }
+            context.revokeUriPermission(alias, grant)
+            write(newFile, "wt", "new")
+            assertEquals("new" to 0, sh(machine, "cat $dw/sub/renamed.txt"))
+            assertEquals("hello from Files again", resolver.openInputStream(uri("$dw/notes.txt"))!!.bufferedReader().use { it.readText() })
             // Outside the home directory, leading out through a symbolic link, the home directory
             // itself
             val motd = sh(machine, "cat /etc/motd").first

@@ -30,6 +30,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -1028,6 +1030,30 @@ static void test_page_zero_ic_ivau(void)
     write_proc_str("/proc/sys/vm/mmap_min_addr", "32768\n");
 }
 
+static void test_zero_length_read(void)
+{
+    int p[2];
+    int dir = open("/", O_RDONLY | O_DIRECTORY);
+    int ep = epoll_create1(0);
+    int event = eventfd(0, EFD_NONBLOCK);
+    CHECK(dir >= 0 && ep >= 0 && event >= 0 && pipe(p) == 0, "open read test descriptors");
+    CHECK(read(p[1], NULL, 0) == -1 && errno == EBADF, "read from write end");
+    CHECK(pread(p[0], NULL, 0, 0) == -1 && errno == ESPIPE, "pread from pipe");
+    CHECK(read(p[0], NULL, 0) == 0, "empty read from empty pipe");
+    CHECK(read(dir, NULL, 0) == -1 && errno == EISDIR, "empty directory read");
+    CHECK(read(ep, NULL, 0) == -1 && errno == EINVAL, "empty epoll read");
+    CHECK(read(event, NULL, 0) == -1 && errno == EINVAL, "empty eventfd read");
+    uint64_t value = 0;
+    struct iovec vecs[] = {{NULL, 0}, {&value, sizeof(value)}};
+    CHECK(eventfd_write(event, 2) == 0, "prime eventfd");
+    CHECK(readv(event, vecs, 2) == sizeof(value) && value == 2, "eventfd readv with empty first buffer");
+    close(dir);
+    close(ep);
+    close(event);
+    close(p[0]);
+    close(p[1]);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--exit-ok") == 0)
@@ -1046,6 +1072,7 @@ int main(int argc, char **argv)
 
     mkdir("/tmp", 01777);
 
+    test_zero_length_read();
     test_protected_symlinks_trailing_slash();
     test_access_noexec();
     test_tmpfs_unlinked_open_accounting();

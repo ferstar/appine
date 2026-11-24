@@ -147,6 +147,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
                 &vfs,
                 (mnt, dir),
                 name,
+                dir_st.default_acl.as_deref(),
                 || {
                     vfs.store()
                         .mknod(dir, name, mode::S_IFSOCK | perm, 0, uid, gid)

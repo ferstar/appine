@@ -525,14 +525,16 @@ impl Cred {
     /// Permission check for file access (`generic_permission`): `mask` is a combination of
     /// `MAY_*`.
     pub fn permission(&self, st: &Stat, mask: u32) -> Result<(), Errno> {
-        let class = if self.fsuid == st.uid {
-            st.mode >> 6
+        let allowed = if self.fsuid == st.uid {
+            mask & !(st.mode >> 6) & 7 == 0
+        } else if let Some(acl) = &st.access_acl {
+            crate::vfs::acl::allows(acl, self, st, mask & 7)
         } else if self.in_group(st.gid) {
-            st.mode >> 3
+            mask & !(st.mode >> 3) & 7 == 0
         } else {
-            st.mode
+            mask & !st.mode & 7 == 0
         };
-        if mask & !class & 7 == 0 {
+        if allowed {
             return Ok(());
         }
         if st.kind() == mode::S_IFDIR {
@@ -630,7 +632,9 @@ impl Cred {
         {
             perm &= !mode::S_ISGID;
         }
-        perm &= !umask;
+        if dir.default_acl.is_none() {
+            perm &= !umask;
+        }
         if is_dir {
             perm &= 0o1777;
             if setgid_dir {
@@ -1120,6 +1124,7 @@ mod tests {
             mtime_ns: 0,
             ctime_ns: 0,
             blocks: None,
+            ..Stat::default()
         }
     }
 

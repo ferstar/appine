@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: honour SECBIT_NO_SETUID_FIXUP in for_access and clear dumpable/pdeathsig on foreign userns setns)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: store ACLs in permission checks and creation mode)
 
 ## Responsibilities
 
@@ -149,18 +149,18 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ### Access decisions
 
-- `permission(stat, mask)`: owner class if fsuid matches, group if fsgid or a supplementary group
-  matches, else other; if the class allows everything requested, allow; otherwise directories
+- `permission(stat, mask)`: owner class if fsuid matches, otherwise a store access ACL checks named users and group entries under its mask;
+  without one the owning group or other class applies; if the class allows everything requested, allow; otherwise directories
   allow with `CAP_DAC_READ_SEARCH` (no write) or `CAP_DAC_OVERRIDE`, non-directories allow with
   `CAP_DAC_READ_SEARCH` (read only) or `CAP_DAC_OVERRIDE` (no exec, or some exec bit set), all via
-  `capable_wrt`; else `EACCES`. No ACLs, immutable or append flags.
+  `capable_wrt`; else `EACCES`. Immutable and append flags are unsupported.
 - `owns`: fsuid is the owner, or `CAP_FOWNER` in the caller's namespace with the owner mapped there
   (Linux's `inode_owner_or_capable`; the group need not be mapped). `may_delete`: write and search
   on the directory, then for sticky directories the owner of file or directory or `CAP_FOWNER`
   (`EPERM`). `new_owner` (Linux 6.1's `vfs_prepare_mode` and `inode_init_owner`) takes the mode
   and the umask: uid fsuid; gid the directory's when it is setgid, else fsgid; in a setgid
   directory a non-member without `CAP_FSETID` loses `S_ISGID` on a group-executable file before
-  the umask applies; a directory keeps only its permissions and the sticky bit and inherits the
+  the umask applies when the parent has no default ACL; a directory keeps only its permissions and the sticky bit and inherits the
   setgid bit of a setgid parent. `for_access`: filesystem ids set to the real ids; unless
   `SECBIT_NO_SETUID_FIXUP` is set, effective capabilities become permitted when the real uid is
   root in the namespace and 0 otherwise (Linux's `access_override_creds`). `searches_all`: `CAP_DAC_READ_SEARCH`

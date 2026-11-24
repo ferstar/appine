@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared anonymous mremap growth, backing extent and VMA boundaries)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: private file growth across close, fork and mremap)
 
 ## Responsibilities
 
@@ -35,7 +35,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `mlockall` metadata, and per-mm handles for `kernel/mmu`, `kernel/cow` and `kernel/hostmem`.
 - `Vma` — one guest mapping: range, guest prot, `Backing`, `may_write`/`may_exec`,
   `Arc<HostRegion>` (`kernel/hostmem`) + host pointer, file metadata (`file_len`, identity/version,
-  shared-file fd, display `name`/`ino`, optional `MountPin` `mnt` whose drop reports to
+  mapped-file fd, display `name`/`ino`, optional `MountPin` `mnt` whose drop reports to
   `vfs::released`), SysV `shm`, optional `Fill`, and Linux VMA flags (locked, sticky `written`,
   growsdown, dump/fork/noreserve, `anon`).
 - `Fill` (`Rc`) — a FUSE file mapping read on demand: a sparse host file (memfd) as long as the
@@ -194,7 +194,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
    the daemon (above) and re-execute; a signal arriving before the daemon took the read is
    delivered first and the access faults again; a read error → `SIGBUS` / `BUS_ADRERR`.
 5. `fault_past_eof`: checks VMA permissions first (`v.prot & need == 0` falls through to step 7's
-   `SIGSEGV` / `SEGV_ACCERR`); otherwise past EOF in a shared file mapping whose file has grown →
+   `SIGSEGV` / `SEGV_ACCERR`); otherwise past EOF in an ordinary file mapping whose file has grown →
    map the new part and re-execute (not a `Fill` mapping, which keeps its size); otherwise past EOF
    → `SIGBUS` / `BUS_ADRERR`.
 6. Stack growth (`grow_down`) succeeds → re-execute.
@@ -320,8 +320,11 @@ signals may still be delivered).
 
 ### Files: EOF and truncation
 
-- Whole pages past EOF have no entries. A shared mapping whose file grew picks up the new content on
-  the next fault; private mappings do not.
+- Whole pages past EOF have no entries. Ordinary shared and private mappings keep the file open
+  across descriptor close, VMA splits, fork and mremap. Private mappings share a retained descriptor
+  per host inode across a fork family. Guest instruction faults and kernel copies retried through
+  `grow_for` check the current extent. If a private mapping has anonymous or shared read-only backing after fork,
+  caching or mprotect, only the previously inaccessible tail gets a fresh private host mapping.
 - truncate, ftruncate and `O_TRUNC` that shorten a file first call `file_truncated` on every
   address space (entries past the new end are removed, executable ranges are queued for
   invalidation, `dirty` is set; `Fill` VMAs are left alone) and sync each one that changed, the
@@ -411,7 +414,6 @@ signals may still be delivered).
 - **Approximate madvise:** `MADV_DONTNEED_LOCKED`/`MADV_POPULATE_WRITE` are no-ops;
   `MADV_POPULATE_READ` runs advisory host readahead + RO file soft-PTE prefill without faulting or
   failing on inaccessible ranges; `MADV_FREE`/`COLD`/`PAGEOUT` are not refused on locked ranges.
-- **Private file mappings never see file growth** past the length recorded at mmap.
 - **Approximate Linux VMA boundaries:** anonymous pieces join ignoring page offsets (mremap-moved
   VMAs join new neighbours); `MREMAP_DONTUNMAP` of a multi-piece VMA needs one VMA slot per piece,
   and in-place growth adds a VMA.

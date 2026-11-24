@@ -13,6 +13,7 @@
 //! directory passed needs search permission. A process's root can be replaced by chroot and
 //! pivot_root: absolute paths start from it, and `..` never goes past it.
 
+pub(crate) mod acl;
 pub mod browse;
 pub mod dev;
 pub mod fuse;

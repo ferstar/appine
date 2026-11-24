@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 10 confirmed and 2 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: check unix_may_send on connected dgrams, copy-fault-safe recv, trailing-slash bind & connect order, full zero-byte SCM_RIGHTS, deferred GC)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: default ACL inheritance on pathname bind)
 
 ## Responsibilities
 
@@ -85,7 +85,7 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   - Pathname: calls `reject_trailing_slash` (`ENOENT` if missing, `EADDRINUSE` if existing),
     resolves parent via `create_parent_at` (copying up overlay parent if needed), rejects
     `.`/`..` (`EADDRINUSE`), runs `may_create` (`MAY_EXEC`, `!exists_in` -> `EADDRINUSE`, `!ro` ->
-    `EROFS`, `MAY_WRITE|MAY_EXEC`), computes `0o777 & ~umask` with setgid-dir rules, reserves
+    `EROFS`, `MAY_WRITE|MAY_EXEC`), limits mode 0777 by the parent default ACL or umask with setgid-directory rules, reserves
     tmpfs room (`ENOSPC`), creates an `S_IFSOCK` inode, emits `IN_CREATE` (including on overlay
     dir), and inserts `Name::Path(ino)`.
 - Path names key strictly by store `Ino` (shared across network namespaces, surviving hard links,

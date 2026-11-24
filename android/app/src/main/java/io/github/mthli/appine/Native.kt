@@ -71,6 +71,11 @@ internal object Native {
     @Throws(IOException::class)
     external fun browseStat(store: String, path: String): String
 
+    /** The generation of each path, including changes reached through symbolic links. */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseGenerations(store: String, paths: Array<String>): LongArray
+
     /** Lists a directory: entries are `<name>\t<metadata>`, with names written like paths. */
     @JvmStatic
     @Throws(IOException::class)

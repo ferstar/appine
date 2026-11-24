@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: add the synchronous writer callback for atomic home-file imports)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: batch document ID generations for SAF)
 
 ## Responsibilities
 
@@ -27,7 +27,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 - `MACHINES` — a mutex-protected map from handle (`jlong`, from `NEXT_HANDLE`, counting up from 1
   and never reused in a process) to `RegisteredMachine` (`Arc<Machine>` plus `has_gpu: bool`); a poisoned lock is recovered. `vt.rs` looks
   kernels up in the same table through `machine(handle)`.
-- `Native` — `internal object` with 39 `@JvmStatic external` functions, 18 of them
+- `Native` — `internal object` with 40 `@JvmStatic external` functions, 19 of them
   `@Throws(IOException::class)`; its initialiser loads the library and calls the private
   `init(BuildConfig.DEBUG)`.
 - `guarded!` — the macro every JNI body runs in: `(name, fallback, body)`, or
@@ -37,7 +37,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 
 - Init: `init(verbose)` (private; stderr redirect, debug log).
 - Store: `importRootfs`, `syncRootfs`, `writeFile`, `readFile` (null on `ENOENT`).
-- Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch` (read);
+- Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch`, `browseGenerations` (read);
   `browseImport`, `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
   (through the store's change path; `browseWritten` is not `@Throws` and ignores every error).
 - Kernel: `start(store, tier, gpu)` (1 = Tier 1, else Tier 0; when `gpu` is true, probes `:venus` and attaches the Android renderer if supported, otherwise starts with `None` without binding `:venus`; the kernel starts with
@@ -117,7 +117,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   `catch_unwind`: the panic message reaches logcat through the panic hook's stderr, a
   line names the function, and the call returns its fallback (−1 for console reads and writes,
   `openConsole`, `spawn`, `browseOpen` and `browseOpenWrite`; 0 for `start`, `takePower` and
-  `processes`; −9 from `waitFor`; null for objects; nothing for unit). The 18 `@Throws` functions
+  `processes`; −9 from `waitFor`; null for objects; nothing for unit). The `@Throws` functions
   also throw `IOException("internal error in …")` unless an exception is already pending. Kernel
   state a panic left half changed (a poisoned lock, a held BKL) is not repaired, so later calls
   may fail or wait.
@@ -165,8 +165,8 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 
 ## Confirmed bugs / technical debt
 
-- Local references are never deleted in lib.rs's loops that build or read arrays (`string_array`,
-  `takeListens`, `takeKills`, `strings`; harmless with ART's large table on every supported
+- Local references are never deleted in lib.rs's loops that build arrays (`string_array`,
+  `takeListens`, `takeKills`; harmless with ART's large table on every supported
   version); a failed string conversion with no pending exception makes void calls return silently
   (unreachable from the non-null Kotlin signatures).
 

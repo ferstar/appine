@@ -8,7 +8,7 @@
 //! `security.capability`, are format-checked on write and converted on read by
 //! [`FileCaps::xattr_for_reader`]. Of `system.*` only the POSIX ACL attributes exist, as on ext4
 //! and tmpfs ([`change_acl`]): checked, kept with kernel IDs and shown in the reader's user
-//! namespace, but not enforced.
+//! namespace. Store-backed inodes use them for access checks and creation.
 
 use super::fs::{AT_FDCWD, attrib_at, attrib_fd, lookup_at};
 use super::{SysResult, inotify, read_path};
@@ -18,6 +18,10 @@ use crate::fd::oflags;
 use crate::kernel::Cx;
 use crate::uaccess::UserSlice;
 use crate::vfs::Node;
+use crate::vfs::acl::{
+    self, ACL_ACCESS, ACL_DEFAULT, ACL_GROUP, ACL_USER, AclEntry, acl_encode, acl_entries,
+    acl_valid,
+};
 use crate::vfs::store::{Ino, Stat, mode};
 
 const XATTR_CREATE: u32 = 1;
@@ -28,11 +32,6 @@ const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65536;
 /// Names must carry one of these namespace prefixes.
 const NAMESPACES: [&[u8]; 4] = [b"security.", b"system.", b"trusted.", b"user."];
-/// The only `system.*` attributes (6.1's `posix_acl_access_xattr_handler` and
-/// `posix_acl_default_xattr_handler`, the ones ext4 and tmpfs have).
-const ACL_ACCESS: &[u8] = b"system.posix_acl_access";
-const ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
-
 /// The object operated on.
 #[derive(Clone, Copy)]
 pub(super) enum Target {
@@ -211,9 +210,8 @@ pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResu
 /// succeeds); not being the owner or capable over it (`CAP_FOWNER`) EPERM; an invalid ACL
 /// EINVAL (`posix_acl_valid`). An access ACL that only restates the mode changes the mode, as a
 /// chmod would, and is not stored (`posix_acl_update_mode`); any other is stored with kernel IDs
-/// and changes nothing else: ACLs are not enforced, and the mode does not take the mask (that
-/// would widen the owning group's access without the ACL's limits). Removing an ACL that is not
-/// there succeeds, and `XATTR_CREATE` and `XATTR_REPLACE` are ignored, as Linux's ACL handlers
+/// and its mask supplies the group mode bits. Removing an absent ACL succeeds on a store inode
+/// and gives ENODATA on a lower-only overlay inode. `XATTR_CREATE` and `XATTR_REPLACE` are ignored, as Linux's ACL handlers
 /// ignore them.
 fn change_acl(
     cx: &mut Cx<'_>,
@@ -255,37 +253,40 @@ fn change_acl(
     if let Some(e) = &acl {
         acl_valid(e)?;
     }
+    // Removing a missing ACL from a lower-only file must leave it in the lower layer.
+    if acl.is_none()
+        && let Node::Overlay(_, o) = node
+        && vfs.overlay().node(o).upper.is_none()
+    {
+        vfs.store().get_xattr(vfs.overlay().node(o).real(), name)?;
+    }
     let ino = writable_ino(cx, node, name)?;
     let store = vfs.store();
-    match acl {
-        // Only the owner, group and other entries: the mode says it all (posix_acl_equiv_mode);
-        // the set-group-ID bit goes as posix_acl_update_mode drops it
-        Some(e)
-            if name == ACL_ACCESS
-                && e.iter()
-                    .all(|x| matches!(x.0, ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_OTHER)) =>
-        {
-            let st = store.attrs(ino)?;
-            let perm = |tag| u32::from(e.iter().find(|x| x.0 == tag).map_or(0, |x| x.1));
-            let mut m = st.mode & 0o7000
-                | perm(ACL_USER_OBJ) << 6
-                | perm(ACL_GROUP_OBJ) << 3
-                | perm(ACL_OTHER);
-            if !cred.in_group(st.gid) && !cred.capable_wrt(&st, cap::FSETID) {
-                m &= !mode::S_ISGID;
+    store.transaction(|s| {
+        let mut keep = acl.as_deref();
+        if name == ACL_ACCESS {
+            let st = s.attrs(ino)?;
+            let mut perm = st.mode;
+            if let Some(entries) = keep {
+                perm = (perm & !0o777) | acl::mode_bits(entries);
+                keep = keep.filter(|e| acl::extended(e));
             }
-            store.set_mode(ino, m)?;
-            match store.remove_xattr(ino, name) {
-                Ok(()) | Err(Errno::ENODATA) => {}
-                Err(e) => return Err(e),
+            if !cred.in_group(st.gid) && !cred.capable_wrt(&st, cap::FSETID) {
+                perm &= !mode::S_ISGID;
+            }
+            if perm != st.mode {
+                s.set_mode(ino, perm)?;
             }
         }
-        Some(e) => store.set_xattr(ino, name, &acl_encode(&e), false, false)?,
-        None => match store.remove_xattr(ino, name) {
-            Ok(()) | Err(Errno::ENODATA) => {}
-            Err(e) => return Err(e),
-        },
-    }
+        if let Some(entries) = keep {
+            s.set_xattr(ino, name, &acl_encode(entries), false, false)
+        } else {
+            match s.remove_xattr(ino, name) {
+                Ok(()) | Err(Errno::ENODATA) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    })?;
     attrib(cx, target, ino);
     Ok(0)
 }
@@ -293,49 +294,6 @@ fn change_acl(
 /// Whether `name` is one of the POSIX ACL attributes.
 fn is_acl(name: &[u8]) -> bool {
     name == ACL_ACCESS || name == ACL_DEFAULT
-}
-
-// The tags of ACL entries (Linux's `ACL_USER_OBJ` and the rest)
-const ACL_USER_OBJ: u16 = 0x01;
-const ACL_USER: u16 = 0x02;
-const ACL_GROUP_OBJ: u16 = 0x04;
-const ACL_GROUP: u16 = 0x08;
-const ACL_MASK: u16 = 0x10;
-const ACL_OTHER: u16 = 0x20;
-/// The ID of entries that name none.
-const ACL_UNDEFINED_ID: u32 = u32::MAX;
-
-/// One ACL entry: tag, permissions and ID.
-type AclEntry = (u16, u16, u32);
-
-/// An ACL attribute's entries as (tag, permissions, ID), read as `posix_acl_from_xattr` reads
-/// them: a header (EINVAL when too short) of version 2 (EOPNOTSUPP otherwise), then 8-byte
-/// entries with known tags (EINVAL otherwise).
-fn acl_entries(v: &[u8]) -> Result<Vec<AclEntry>, Errno> {
-    if v.len() < 4 {
-        return Err(Errno::EINVAL);
-    }
-    if v[..4] != 2u32.to_le_bytes() {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    if !(v.len() - 4).is_multiple_of(8) {
-        return Err(Errno::EINVAL);
-    }
-    v[4..]
-        .chunks_exact(8)
-        .map(|c| {
-            let tag = u16::from_le_bytes([c[0], c[1]]);
-            let perm = u16::from_le_bytes([c[2], c[3]]);
-            let id = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-            match tag {
-                ACL_USER | ACL_GROUP => Ok((tag, perm, id)),
-                ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER => {
-                    Ok((tag, perm, ACL_UNDEFINED_ID))
-                }
-                _ => Err(Errno::EINVAL),
-            }
-        })
-        .collect()
 }
 
 /// An ACL as the caller wrote it, its named users and groups taken from the caller's user
@@ -351,51 +309,6 @@ fn acl_from_user(v: &[u8], cred: &Cred) -> Result<Option<Vec<AclEntry>>, Errno> 
         };
     }
     Ok((!entries.is_empty()).then_some(entries))
-}
-
-/// 6.1's `posix_acl_valid`: permissions within rwx, and the entries in the order owner, named
-/// users, owning group, named groups, mask, other, each of the owner, owning group and other once,
-/// and a mask when there are named entries.
-fn acl_valid(entries: &[AclEntry]) -> Result<(), Errno> {
-    let mut state = ACL_USER_OBJ;
-    let mut needs_mask = false;
-    for &(tag, perm, _) in entries {
-        if perm & !7 != 0 {
-            return Err(Errno::EINVAL);
-        }
-        state = match (tag, state) {
-            (ACL_USER_OBJ, ACL_USER_OBJ) => ACL_USER,
-            (ACL_USER, ACL_USER) => {
-                needs_mask = true;
-                ACL_USER
-            }
-            (ACL_GROUP_OBJ, ACL_USER) => ACL_GROUP,
-            (ACL_GROUP, ACL_GROUP) => {
-                needs_mask = true;
-                ACL_GROUP
-            }
-            (ACL_MASK, ACL_GROUP) => ACL_OTHER,
-            (ACL_OTHER, ACL_OTHER) => 0,
-            (ACL_OTHER, ACL_GROUP) if !needs_mask => 0,
-            _ => return Err(Errno::EINVAL),
-        };
-    }
-    if state == 0 {
-        Ok(())
-    } else {
-        Err(Errno::EINVAL)
-    }
-}
-
-/// The attribute form of ACL entries (`posix_acl_to_xattr`).
-fn acl_encode(entries: &[AclEntry]) -> Vec<u8> {
-    let mut v = 2u32.to_le_bytes().to_vec();
-    for &(tag, perm, id) in entries {
-        v.extend_from_slice(&tag.to_le_bytes());
-        v.extend_from_slice(&perm.to_le_bytes());
-        v.extend_from_slice(&id.to_le_bytes());
-    }
-    v
 }
 
 /// setxattr (`value` Some) or removexattr on FUSE node `id`: EROFS on a read-only mount, the

@@ -364,22 +364,9 @@ fn remap(
         }
         return Ok(new);
     }
-    // Growing a private file mapping maps the rest of that store file, so open it first
-    let ino = (new_len > old_len)
-        .then(|| cx.mm().private_file_ino(old + old_len.max(1) - 1))
-        .flatten();
-    let file = match ino {
-        Some(ino) => Some(cx.vfs()?.store().open_object(ino, false)?),
-        None => None,
-    };
-    let r = cx.mm_mut().mremap(
-        old,
-        old_len,
-        new_len,
-        flags & MREMAP_MAYMOVE != 0,
-        fixed,
-        file.as_ref().map(|f| f.as_raw_fd()),
-    );
+    let r = cx
+        .mm_mut()
+        .mremap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed);
     // A shrunk or replaced segment attachment may have been the last one
     crate::ipc::reap_shm(cx.k());
     r

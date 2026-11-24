@@ -2043,6 +2043,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         mtime_ns,
         ctime_ns,
         blocks: None,
+        ..Stat::default()
     })
 }
 

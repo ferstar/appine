@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: default seal on ordinary tmpfs files)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: default ACL inheritance on file creation)
 
 ## Responsibilities
 
@@ -139,7 +139,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 
 - `open_path_with` (openat, openat2, `create_exclusive`): resolve through `kernel/vfs` (openat2's
   rules and `O_CREAT`'s creation loop are in its map); on create, `may_create` (search, `EEXIST`,
-  `EROFS`, write+search) and create with the mode `new_owner` makes of the requested one and the
+  `EROFS`, write+search) and create with the requested mode limited by the parent default ACL or the
   umask (`kernel/cred`: setgid stripped before the umask, setgid directories); a just-created file
   skips permission checks and truncation. `O_PATH` gives a `FileKind::Path` (`O_DIRECTORY` on a
   non-directory `ENOTDIR`). Store, overlay, FUSE and mqueue-mount nodes (`PseudoNode::Mq`) set the

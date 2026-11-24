@@ -63,7 +63,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard};
@@ -72,6 +72,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, ffi, params};
 
+use super::acl::{self, ACL_ACCESS, ACL_DEFAULT, AclEntry};
 use crate::cell::RefCell;
 use crate::cred::XATTR_NAME_CAPS;
 use crate::errno::Errno;
@@ -179,7 +180,7 @@ pub mod mode {
 }
 
 /// The metadata of an inode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stat {
     /// Inode number.
     pub ino: Ino,
@@ -205,6 +206,9 @@ pub struct Stat {
     /// Storage a regular file takes in 512-byte blocks, as the host reports it for the object
     /// (holes take none); `None` where there is no object, and the size stands in for it.
     pub blocks: Option<u64>,
+    /// Store ACLs in kernel IDs. Synthetic files use their mode alone.
+    pub(crate) access_acl: Option<Arc<[AclEntry]>>,
+    pub(crate) default_acl: Option<Arc<[AclEntry]>>,
 }
 
 impl Stat {
@@ -291,6 +295,12 @@ const SCHEMA: &str = "
         atime_ns INTEGER
     );
     CREATE INDEX IF NOT EXISTS shared_object ON shared (object);
+    CREATE TABLE IF NOT EXISTS document_generations (
+        generation INTEGER PRIMARY KEY,
+        parent INTEGER NOT NULL,
+        name BLOB NOT NULL,
+        UNIQUE(parent, name)
+    );
 ";
 
 /// An inode store.
@@ -382,6 +392,7 @@ impl Store {
         let fd = store.lock.as_raw_fd();
         if appine_hal::flock(fd, true, false).is_ok() {
             store.meta.commits.users().store(0, Ordering::SeqCst);
+            store.recover_objects()?;
             store.remove_lost_objects()?;
             for path in volatile {
                 store.empty_dir(path)?;
@@ -486,6 +497,92 @@ impl Store {
             waker: RefCell::new(None),
             fills: RefCell::default(),
         })
+    }
+
+    /// Reconcile objects against SQLite on the first exclusive open after a host reboot.
+    /// A power cut can persist either the object or the cleared allocation range ahead of
+    /// its WAL commit. The range alone still handles ordinary process death between boots.
+    fn recover_objects(&self) -> Result<(), Errno> {
+        // Repeated DocumentsProvider opens on an idle store must not enumerate the rootfs.
+        // If Android hides boot_id, a process-local token also changes across a power cut.
+        static BOOT: std::sync::OnceLock<Option<[u8; 36]>> = std::sync::OnceLock::new();
+        let boot = BOOT.get_or_init(|| {
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .ok()
+                .and_then(|id| id.trim().as_bytes().try_into().ok())
+                .or_else(|| {
+                    let mut token = [0; 36];
+                    appine_hal::fill_random(&mut token).ok()?;
+                    Some(token)
+                })
+        });
+        // The first 32 bytes are the shared commit header.
+        let mut previous = [0; 36];
+        if let Some(token) = boot
+            && self.lock.read_at(&mut previous, 32).map_err(io_err)? == previous.len()
+            && previous == *token
+        {
+            return Ok(());
+        }
+        let mut stmt = self
+            .db()
+            .prepare(
+                "SELECT COALESCE(s.object, i.ino) FROM inodes i LEFT JOIN shared s ON i.ino = s.ino
+             WHERE (i.mode & ?1) = ?2",
+            )
+            .map_err(db_err)?;
+        let live = stmt
+            .query_map(params![mode::S_IFMT, mode::S_IFREG], |r| r.get::<_, Ino>(0))
+            .map_err(db_err)?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(db_err)?;
+        for entry in fs::read_dir(&self.objects).map_err(io_err)? {
+            let name = entry.map_err(io_err)?.file_name();
+            let Some(ino) = name.to_str().and_then(|n| n.parse::<Ino>().ok()) else {
+                continue;
+            };
+            if !live.contains(&ino) && name.to_str() == Some(&ino.to_string()) {
+                self.meta.sync_metadata()?;
+                self.remove_object(ino)?;
+            }
+        }
+        if let Some(token) = boot {
+            self.lock.write_all_at(token, 32).map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// Retire the SAF IDs that traverse this dentry, in the same transaction as its removal.
+    pub(super) fn retire_document(&self, parent: Ino, name: &[u8]) -> Result<(), Errno> {
+        self.db()
+            .prepare_cached(
+                "INSERT OR REPLACE INTO document_generations(parent,name) VALUES (?1,?2)",
+            )
+            .and_then(|mut st| st.execute(params![parent, name]))
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub(super) fn has_retired_documents(&self) -> Result<bool, Errno> {
+        self.begin_read()?;
+        self.db()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM document_generations)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+    }
+
+    pub(super) fn document_generation(&self, parent: Ino, name: &[u8]) -> Result<u64, Errno> {
+        self.db()
+            .prepare_cached(
+                "SELECT generation FROM document_generations WHERE parent = ?1 AND name = ?2",
+            )
+            .and_then(|mut st| st.query_row(params![parent, name], |r| r.get(0)))
+            .optional()
+            .map(|g| g.unwrap_or(0))
+            .map_err(db_err)
     }
 
     /// Deletes the objects left by inodes lost last time before they could be committed
@@ -804,7 +901,7 @@ impl Store {
     /// The database row of inode `ino` ([`Store::stat_row`], [`Store::data`]).
     fn row(&self, ino: Ino) -> Result<(Stat, Data), Errno> {
         let generation = self.cache_generation();
-        if let Some(hit) = self.cached(|c| c.rows.get(&ino).copied()) {
+        if let Some(hit) = self.cached(|c| c.rows.get(&ino).cloned()) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -812,7 +909,7 @@ impl Store {
         if generation.is_some_and(|g| self.may_fill(g)) {
             self.update(|c| {
                 c.entries += 1;
-                c.rows.insert(ino, row);
+                c.rows.insert(ino, row.clone());
             });
         }
         Ok(row)
@@ -823,11 +920,14 @@ impl Store {
             .db()
             .prepare_cached(
                 "SELECT i.mode, i.nlink, i.uid, i.gid, i.rdev, i.mtime_ns, i.ctime_ns,
-                        length(i.target), s.object, s.atime_ns
-                 FROM inodes i LEFT JOIN shared s ON s.ino = i.ino WHERE i.ino = ?1",
+                        length(i.target), s.object, s.atime_ns, a.value, d.value
+                 FROM inodes i LEFT JOIN shared s ON s.ino = i.ino
+                 LEFT JOIN xattrs a ON a.ino = i.ino AND a.name = ?2
+                 LEFT JOIN xattrs d ON d.ino = i.ino AND d.name = ?3
+                 WHERE i.ino = ?1",
             )
             .and_then(|mut st| {
-                st.query_row(params![ino], |r| {
+                st.query_row(params![ino, ACL_ACCESS, ACL_DEFAULT], |r| {
                     Ok((
                         (
                             r.get::<_, u32>(0)?,
@@ -842,14 +942,34 @@ impl Store {
                             r.get::<_, Option<u64>>(7)?,
                         ),
                         (r.get::<_, Option<Ino>>(8)?, r.get::<_, Option<i64>>(9)?),
+                        (
+                            r.get::<_, Option<Vec<u8>>>(10)?,
+                            r.get::<_, Option<Vec<u8>>>(11)?,
+                        ),
                     ))
                 })
             })
             .optional()
             .map_err(db_err)?
             .ok_or(Errno::ENOENT)?;
-        let ((mode, nlink, uid, gid, rdev), (mtime_ns, ctime_ns, target_len), (object, held)) = row;
+        let (
+            (mode, nlink, uid, gid, rdev),
+            (mtime_ns, ctime_ns, target_len),
+            (object, held),
+            (access, default),
+        ) = row;
         let size = target_len.unwrap_or(0);
+        // Older stores kept ACLs without updating their mode on set or their ACL on chmod.
+        // Retain the mode's three permission classes and the named ACL entries. A malformed
+        // legacy value grants no ACL permissions, but its owner can still repair it.
+        let decode = |raw: Vec<u8>| {
+            acl::acl_entries(&raw)
+                .and_then(|e| {
+                    acl::acl_valid(&e)?;
+                    Ok(e)
+                })
+                .unwrap_or_default()
+        };
         let st = Stat {
             ino,
             mode,
@@ -862,6 +982,12 @@ impl Store {
             mtime_ns,
             ctime_ns,
             blocks: None,
+            access_acl: access.map(|raw| {
+                let mut entries = decode(raw);
+                acl::apply_mode(&mut entries, mode, false);
+                entries.into()
+            }),
+            default_acl: default.map(|raw| decode(raw).into()),
         };
         let data = Data {
             object: object.unwrap_or(ino),
@@ -1157,6 +1283,7 @@ impl Store {
             mtime_ns: now,
             ctime_ns: now,
             blocks: None,
+            ..Stat::default()
         }));
         let (lo, hi) = self.meta.commits.fresh();
         if lo.load(Ordering::Relaxed) == 0 {
@@ -1597,6 +1724,12 @@ impl Store {
 
     /// Reads an extended attribute; ENODATA if there is none.
     pub fn get_xattr(&self, ino: Ino, name: &[u8]) -> Result<Vec<u8>, Errno> {
+        if name == ACL_ACCESS
+            && let Some(entries) = self.attrs(ino)?.access_acl
+            && !entries.is_empty()
+        {
+            return Ok(acl::acl_encode(&entries));
+        }
         self.db()
             .prepare_cached("SELECT value FROM xattrs WHERE ino = ?1 AND name = ?2")
             .and_then(|mut st| st.query_row(params![ino, name], |r| r.get(0)))
@@ -2454,7 +2587,8 @@ impl Drop for Op<'_> {
                             c.dentries.entry(dir).or_default().insert(name, Some(ino));
                         }
                         Fill::Row(st) => {
-                            c.rows.insert(st.ino, (st, Data::own(st.ino)));
+                            let ino = st.ino;
+                            c.rows.insert(ino, (st, Data::own(ino)));
                         }
                     }
                 }
@@ -2599,7 +2733,7 @@ impl Reader<'_> {
     /// reused after deletion, the result is not half from the old file and half from the new one.
     /// None on a host error.
     pub fn stat(&self, ino: Ino) -> Option<Stat> {
-        let (mut st, data) = *self.cache.rows.get(&ino)?;
+        let (mut st, data) = self.cache.rows.get(&ino)?.clone();
         if st.kind() == mode::S_IFREG {
             fill_from_host(&mut st, self.objects_dir, data).ok()?;
         }
@@ -3953,6 +4087,35 @@ mod tests {
         assert_eq!(objs, vec![ok_ino.to_string()]);
         drop(s);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_with_a_cleared_range_keeps_shared_data_and_reclaims_stray_objects() {
+        let (s, dir) = temp_store("lost-range");
+        let (src, _) = s.create_file(ROOT, b"src", 0o600, 0, 0).unwrap();
+        let (dst, _) = s.create_file(ROOT, b"dst", 0o600, 0, 0).unwrap();
+        s.share(src, dst).unwrap();
+        let other = s.mkdir(ROOT, b"d", 0o700, 0, 0).unwrap();
+        drop(s);
+        // On disk after a power cut: SQLite has its older namespace, the header is clear,
+        // and the objects for rolled-back creates survived, including a number now used by a dir.
+        drop(Store::open(&dir, &[]).unwrap());
+        OpenOptions::new()
+            .write(true)
+            .open(dir.join("lock"))
+            .unwrap()
+            .write_all_at(b"00000000-0000-0000-0000-000000000000", 32)
+            .unwrap();
+        let objects = dir.join("objects");
+        fs::write(objects.join(other.to_string()), b"lost").unwrap();
+        fs::write(objects.join("99999"), b"lost").unwrap();
+        let s = Store::open(&dir, &[]).unwrap();
+        assert!(!objects.join(other.to_string()).exists());
+        assert!(!objects.join("99999").exists());
+        assert!(s.open_object(src, false).is_ok());
+        assert!(s.open_object(dst, false).is_ok());
+        drop(s);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

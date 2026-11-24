@@ -216,6 +216,7 @@ impl MqDir {
             mtime_ns: self.mtime_ns,
             ctime_ns: self.ctime_ns,
             blocks: None,
+            ..Stat::default()
         }
     }
 
@@ -306,6 +307,7 @@ impl MessageQueue {
             mtime_ns: self.mtime_ns,
             ctime_ns: self.ctime_ns,
             blocks: None,
+            ..Stat::default()
         }
     }
 
