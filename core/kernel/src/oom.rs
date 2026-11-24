@@ -148,9 +148,8 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     let mut over = None;
     let mut near = false;
     if k.oom.limit != u64::MAX {
-        match footprint() {
+        match measure_root(&k.oom, k.oom.limit, footprint, appine_engine::trim_dbt_pool) {
             Some(used) => {
-                k.oom.note(used);
                 near = used > k.oom.limit / 4 * 3;
                 if used > k.oom.limit {
                     over = Some((ROOT, used, k.oom.limit));
@@ -190,6 +189,34 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     crate::cgroup::memory_event(k, domain, |e| e.max += 1);
     out_of_memory(k, (domain, used, limit));
     k.oom.next
+}
+
+/// Measures root (whole-app) usage against `limit` and records the peak. When usage exceeds
+/// `limit`, reclaims unused Tier 1 translations kept in the pool (`trim`) and re-measures so a
+/// guest process is only killed if root usage remains over the limit.
+///
+/// Lock ordering: `appine_engine::trim_dbt_pool` only takes the engine's leaf `pool.lock` briefly
+/// and unmaps evicted idle instances outside it; it never acquires the BKL or calls back into the
+/// kernel layer.
+fn measure_root(
+    oom: &Oom,
+    limit: u64,
+    measure: impl Fn() -> Option<u64>,
+    trim: impl FnOnce(),
+) -> Option<u64> {
+    let used = measure()?;
+    oom.note(used);
+    if used <= limit {
+        return Some(used);
+    }
+    trim();
+    match measure() {
+        Some(after) => {
+            oom.note(after);
+            Some(after)
+        }
+        None => Some(used),
+    }
 }
 
 /// The app's memory usage (bytes): the sum of the items of [`app_memory`]. Returns None when it
@@ -233,9 +260,11 @@ pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u6
     };
     crate::cgroup::memory_event(k, domain, |e| e.oom += 1);
     k.oom.victim = Some((Rc::downgrade(&victim), now));
-    // One already exiting (exit_group, a fatal signal) need not be ended; as on Linux, wait for it
-    // to finish exiting
+    // One already exiting (exit_group, a fatal signal) need not be ended; as on Linux, reap its
+    // private memory when safe and wait for it to finish exiting.
     if victim.borrow().exiting.is_some() {
+        let mut reaped = Vec::new();
+        reap(k, &victim, &mut reaped);
         return;
     }
     {
@@ -262,6 +291,7 @@ pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u6
     }
     let group = crate::cgroup::oom_group(k, victim.borrow().cgroup, domain);
     kill(k, &victim);
+    let mut killed = vec![victim.clone()];
     // memory.oom.group: the processes in that cgroup are ended along with it (Linux's
     // mem_cgroup_scan_tasks, counting the picked one again too), except those whose oom_score_adj
     // is the lower bound
@@ -292,7 +322,16 @@ pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u6
                 }
             }
             kill(k, &g);
+            if !Rc::ptr_eq(&g, &victim) {
+                killed.push(g);
+            }
         }
+    }
+    // Reap private memory after all kills and RSS logs in this round have finished so processes
+    // sharing an address space inside a memory.oom.group cgroup are all marked exiting first.
+    let mut reaped = Vec::new();
+    for g in &killed {
+        reap(k, g, &mut reaped);
     }
 }
 
@@ -336,7 +375,15 @@ fn select(
 /// Linux's `oom_badness` for process `g` against `total` pages: its resident pages plus its
 /// `oom_score_adj` times a thousandth of `total`, and the resident pages; None for a process never
 /// picked (the built-in init, `oom_score_adj` -1000, no live thread, a vfork child still sharing
-/// its parent's address space). Unlike Linux, swap and page tables are not counted.
+/// its parent's address space).
+///
+/// Unlike Linux, swap and page-table pages are not added:
+/// - Host `/proc/self/status`'s `VmSwap` is aggregate for the entire host process and cannot be
+///   attributed to individual guest processes; `Mm::resident_pages` uses host `mincore` (which
+///   reports swapped-out pages as absent), and `/proc/self/pagemap` is blocked by SELinux on
+///   Android hosts where zram swap matters.
+/// - `appine_engine::Mmu` uses on-demand 2 MiB superpages and exposes no allocated page-table
+///   count (matching `VmPTE: 0 kB` in `/proc/<pid>/status` and `pgtables:0kB` in OOM kill logs).
 fn badness(k: &Kernel, g: &ThreadGroup, total: i64) -> Option<(i64, u64)> {
     if g.tgid == INIT || g.oom_score_adj == OOM_SCORE_ADJ_MIN {
         return None;
@@ -459,6 +506,103 @@ fn kill(k: &mut Kernel, g: &Rc<RefCell<ThreadGroup>>) {
     crate::cgroup::memory_event(k, cgroup, |e| e.oom_kill += 1);
 }
 
+/// The address space of process `g`'s first live thread: `Ok(None)` when `g` has no live thread in
+/// `k.tasks`, `Err(())` when that thread's resources are currently borrowed.
+fn group_mm(k: &Kernel, g: &ThreadGroup) -> Result<Option<Rc<RefCell<crate::mm::Mm>>>, ()> {
+    let Some(task) = g.threads.iter().find_map(|t| k.tasks.get(t)) else {
+        return Ok(None);
+    };
+    let res = task.res.try_borrow().map_err(|_| ())?;
+    Ok(Some(res.mm.clone()))
+}
+
+/// Whether process `g` is irreversibly exiting as a whole and not writing a core dump (Linux 6.1's
+/// `task_will_free_mem` for OOM reaping, matching `process_mrelease`'s check without treating an
+/// undelivered signal as guaranteed exit).
+fn will_free_mem(k: &Kernel, g: &ThreadGroup) -> bool {
+    if g.core.is_some() {
+        return false;
+    }
+    g.exiting.is_some()
+        && (!g.single_exit
+            || (g.leader_exit.is_none() && g.threads.len() == 1)
+            || g.threads
+                .iter()
+                .any(|tid| k.tasks.get(tid).is_some_and(|t| t.killed.get())))
+}
+
+/// Reaps `group`'s private memory via [`crate::mm::Mm::release`] (Linux's `oom_reaper`, reusing
+/// the same release path as `process_mrelease`) when `group` and every other process sharing its
+/// address space satisfy [`will_free_mem`] (no core dump in progress, no live `vfork`/`CLONE_VM`
+/// sharer) and the address space is not borrowed. Samples peak RSS on every sharing process first
+/// so `ru_maxrss` is preserved.
+fn reap(
+    k: &Kernel,
+    group: &Rc<RefCell<ThreadGroup>>,
+    reaped: &mut Vec<Rc<RefCell<crate::mm::Mm>>>,
+) -> bool {
+    let Ok(gb) = group.try_borrow() else {
+        return false;
+    };
+    let Ok(Some(mm)) = group_mm(k, &gb) else {
+        return false;
+    };
+    if reaped.iter().any(|m| Rc::ptr_eq(m, &mm)) {
+        return true;
+    }
+    if !will_free_mem(k, &gb) {
+        return false;
+    }
+    drop(gb);
+    let mut sharers = Vec::new();
+    for g in k.groups.values() {
+        if Rc::ptr_eq(g, group) {
+            continue;
+        }
+        let Ok(other) = g.try_borrow() else {
+            return false;
+        };
+        let Ok(other_mm) = group_mm(k, &other) else {
+            return false;
+        };
+        if other_mm.is_some_and(|m| Rc::ptr_eq(&m, &mm)) {
+            if !will_free_mem(k, &other) {
+                return false;
+            }
+            sharers.push(g.clone());
+        }
+    }
+    // Sample peak resident memory before releasing private pages so wait's ru_maxrss keeps what
+    // each exiting process used.
+    {
+        let Ok(mm_ref) = mm.try_borrow() else {
+            return false;
+        };
+        if let Ok(mut g) = group.try_borrow_mut() {
+            g.sample_rss(&mm_ref);
+        } else {
+            return false;
+        }
+        for s in &sharers {
+            if let Ok(mut sb) = s.try_borrow_mut() {
+                sb.sample_rss(&mm_ref);
+            } else {
+                return false;
+            }
+        }
+    }
+    let released = if let Ok(mut m) = mm.try_borrow_mut() {
+        m.release();
+        true
+    } else {
+        false
+    };
+    if released {
+        reaped.push(mm);
+    }
+    released
+}
+
 /// The process picked last time has not finished exiting, and [`VICTIM_TIMEOUT`] has not passed
 /// yet.
 fn waiting_for_victim(k: &Kernel, now: Instant) -> bool {
@@ -501,4 +645,339 @@ pub(crate) fn unmap_code_views(k: &mut Kernel, shared: &Shared) -> Option<Instan
 /// will not be written either.
 fn all_sleeping(k: &Kernel) -> bool {
     k.tasks.values().all(|t| t.sleeping.load(Ordering::SeqCst))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fd::FdTable;
+    use crate::mm::{Mm, flags};
+    use crate::nsproxy::NsProxy;
+    use crate::process::Tier;
+    use crate::signal::{AltStack, SigHandlers};
+    use crate::task::{FsContext, Task, TaskState};
+    use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+    use appine_engine::{Cpu, prot};
+
+    /// Creates a synthetic process in `k` with `mm` and a live thread (returns its group, task,
+    /// and the `Cpu` whose `Kicker` the task references).
+    fn add_process(
+        k: &mut Kernel,
+        tgid: i32,
+        ppid: i32,
+        cgroup: u64,
+        mm: Rc<RefCell<Mm>>,
+    ) -> (Rc<RefCell<ThreadGroup>>, Rc<Task>, Cpu) {
+        let sighand = Rc::new(RefCell::new(SigHandlers::default()));
+        let mut tg = ThreadGroup::new(tgid, ppid, sighand);
+        tg.cgroup = cgroup;
+        tg.threads.push(tgid);
+        let group = Rc::new(RefCell::new(tg));
+        let cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
+        let state = TaskState {
+            mm: mm.clone(),
+            fds: Rc::new(RefCell::new(FdTable::new())),
+            fs: Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: Rc::new(MntNs {
+                    id: INIT_MNT_NS,
+                    owner: crate::cred::UserNs::init(),
+                    anon: false,
+                }),
+            })),
+            group: group.clone(),
+            vfs: None,
+            altstack: AltStack::default(),
+            clear_child_tid: 0,
+            vfork_done: None,
+            restart: None,
+            fast_sleep: None,
+            sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+        };
+        let task = Task::new(
+            tgid,
+            tgid,
+            &cpu,
+            state,
+            NsProxy::init(),
+            0,
+            *b"oom-test\0\0\0\0\0\0\0\0",
+        )
+        .unwrap();
+        k.groups.insert(tgid, group.clone());
+        k.tasks.insert(tgid, task.clone());
+        (group, task, cpu)
+    }
+
+    /// Maps `pages` of private anonymous RW memory in `mm` and writes `byte` to every page so all
+    /// pages are resident.
+    fn dirty_anon(mm: &Rc<RefCell<Mm>>, pages: u64, byte: u8) -> u64 {
+        let rw = prot::READ | prot::WRITE;
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let addr = mm
+            .borrow_mut()
+            .mmap(0, pages * PAGE_SIZE, rw, anon, None)
+            .unwrap();
+        let buf = vec![byte; (pages * PAGE_SIZE) as usize];
+        mm.borrow_mut().write_kernel(addr, &buf).unwrap();
+        addr
+    }
+
+    fn read_byte(mm: &Rc<RefCell<Mm>>, addr: u64) -> u8 {
+        let mut b = [0u8; 1];
+        mm.borrow()
+            .read(crate::uaccess::UserSlice::new(addr, 1), &mut b)
+            .unwrap();
+        b[0]
+    }
+
+    #[test]
+    fn oom_reaps_killed_victim_immediately() {
+        let mut k = Kernel::new(Tier::Interpreter);
+        let mm = Mm::new().into_shared();
+        let addr = dirty_anon(&mm, 64, 0x5a);
+        assert!(mm.borrow().resident_pages() >= 64);
+        let (victim, task, _cpu) = add_process(&mut k, 10, INIT, ROOT, mm.clone());
+
+        out_of_memory(&mut k, (ROOT, 1 << 20, 512 << 10));
+
+        assert!(victim.borrow().exiting.is_some());
+        assert!(task.killed.get());
+        // Even while the victim's thread stays in k.tasks (stuck in exit), private memory is freed
+        // immediately and ru_maxrss keeps the pre-reap peak.
+        assert_eq!(mm.borrow().resident_pages(), 0);
+        assert!(victim.borrow().maxrss_kb >= 64 * 4);
+        assert_eq!(read_byte(&mm, addr), 0);
+    }
+
+    #[test]
+    fn oom_reaps_already_exiting_victim() {
+        let mut k = Kernel::new(Tier::Interpreter);
+        let mm = Mm::new().into_shared();
+        let _addr = dirty_anon(&mm, 64, 0x33);
+        let (victim, _task, _cpu) = add_process(&mut k, 11, INIT, ROOT, mm.clone());
+        victim.borrow_mut().exiting = Some(ExitStatus::Exited(0));
+
+        out_of_memory(&mut k, (ROOT, 1 << 20, 512 << 10));
+
+        assert_eq!(mm.borrow().resident_pages(), 0);
+        assert!(victim.borrow().maxrss_kb >= 64 * 4);
+        // An already-exiting victim is waited for and reaped without incrementing oom_kill.
+        assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.oom, 1);
+        assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.oom_kill, 0);
+    }
+
+    #[test]
+    fn oom_does_not_reap_shared_mm_with_live_vfork_sharer() {
+        let mut k = Kernel::new(Tier::Interpreter);
+        let mm = Mm::new().into_shared();
+        let addr = dirty_anon(&mm, 64, 0x42);
+        let (parent, _ptask, _pcpu) = add_process(&mut k, 20, INIT, ROOT, mm.clone());
+        let (child, ctask, _ccpu) = add_process(&mut k, 21, 20, ROOT, mm.clone());
+        child.borrow_mut().parent_thread = 20;
+        ctask.vfork.set(true);
+
+        out_of_memory(&mut k, (ROOT, 1 << 20, 512 << 10));
+
+        // Parent is picked and killed (vfork child is skipped), but mm stays intact for child.
+        assert!(parent.borrow().exiting.is_some());
+        assert!(child.borrow().exiting.is_none());
+        assert!(mm.borrow().resident_pages() >= 64);
+        assert_eq!(read_byte(&mm, addr), 0x42);
+    }
+
+    #[test]
+    fn oom_group_kill_reaps_shared_mm_when_all_sharers_killed() {
+        let mut k = Kernel::new(Tier::Interpreter);
+        let cg = k
+            .cgroups
+            .mkdir(ROOT, b"grp", &crate::cred::Cred::root(), 0o755)
+            .unwrap();
+        // Enable memory controller (1 << 3) on root so grp's memory.oom.group is active.
+        k.cgroups.map.get_mut(&ROOT).unwrap().subtree_control = 1 << 3;
+        k.cgroups
+            .map
+            .get_mut(&cg)
+            .unwrap()
+            .values
+            .insert(b"memory.oom.group", "1".to_owned());
+
+        let mm = Mm::new().into_shared();
+        let _addr = dirty_anon(&mm, 64, 0x77);
+        let (parent, _ptask, _pcpu) = add_process(&mut k, 30, INIT, cg, mm.clone());
+        let (child, ctask, _ccpu) = add_process(&mut k, 31, 30, cg, mm.clone());
+        child.borrow_mut().parent_thread = 30;
+        ctask.vfork.set(true);
+
+        out_of_memory(&mut k, (cg, 1 << 20, 64 << 10));
+
+        assert!(parent.borrow().exiting.is_some());
+        assert!(child.borrow().exiting.is_some());
+        assert!(parent.borrow().maxrss_kb >= 64 * 4);
+        assert!(child.borrow().maxrss_kb >= 64 * 4);
+        assert_eq!(mm.borrow().resident_pages(), 0);
+    }
+
+    #[test]
+    fn oom_skips_reap_for_coredump_partial_single_exit_and_borrowed_mm() {
+        // 1. Core dump in progress
+        let mut k = Kernel::new(Tier::Interpreter);
+        let mm = Mm::new().into_shared();
+        let _addr = dirty_anon(&mm, 32, 0x11);
+        let (g, _t, _cpu) = add_process(&mut k, 40, INIT, ROOT, mm.clone());
+        {
+            let mut gb = g.borrow_mut();
+            gb.exiting = Some(ExitStatus::Signaled {
+                signal: Signal::SEGV,
+                pc: None,
+                fault_addr: None,
+                core_dumped: true,
+            });
+            gb.core = Some(Vec::new());
+        }
+        let mut reaped = Vec::new();
+        assert!(!reap(&k, &g, &mut reaped));
+        assert!(mm.borrow().resident_pages() >= 32);
+
+        // 2. Partial single-thread exit(2) with another live thread
+        {
+            let mut gb = g.borrow_mut();
+            gb.core = None;
+            gb.single_exit = true;
+            gb.threads.push(41);
+        }
+        assert!(!reap(&k, &g, &mut reaped));
+        assert!(mm.borrow().resident_pages() >= 32);
+
+        // 3. Borrowed Mm is skipped without panicking
+        {
+            let mut gb = g.borrow_mut();
+            gb.single_exit = false;
+            gb.threads.truncate(1);
+        }
+        {
+            let _held = mm.borrow();
+            assert!(!reap(&k, &g, &mut reaped));
+        }
+        // Once unborrowed, reaping succeeds
+        assert!(reap(&k, &g, &mut reaped));
+        assert_eq!(mm.borrow().resident_pages(), 0);
+    }
+
+    #[test]
+    fn measure_root_trims_only_over_limit_and_avoids_kill_when_reclaimed() {
+        let oom = Oom::default();
+        let trimmed = Cell::new(0u32);
+        // Under limit: trim is not called
+        let got = measure_root(&oom, 100, || Some(80), || trimmed.set(trimmed.get() + 1));
+        assert_eq!(got, Some(80));
+        assert_eq!(trimmed.get(), 0);
+        assert_eq!(oom.peak.get(), 80);
+
+        // Over limit, trim brings usage below limit
+        let used = Cell::new(140u64);
+        let got = measure_root(
+            &oom,
+            100,
+            || Some(used.get()),
+            || {
+                trimmed.set(trimmed.get() + 1);
+                used.set(90);
+            },
+        );
+        assert_eq!(got, Some(90));
+        assert_eq!(trimmed.get(), 1);
+        assert_eq!(oom.peak.get(), 140);
+
+        // Over limit, trim leaves usage still above limit
+        used.set(160);
+        let got = measure_root(
+            &oom,
+            100,
+            || Some(used.get()),
+            || {
+                trimmed.set(trimmed.get() + 1);
+                used.set(120);
+            },
+        );
+        assert_eq!(got, Some(120));
+        assert_eq!(trimmed.get(), 2);
+        assert_eq!(oom.peak.get(), 160);
+    }
+
+    #[test]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_arch = "aarch64"
+    ))]
+    fn oom_check_trims_real_dbt_pool_under_root_pressure() {
+        use appine_engine::{Dbt, DbtRegs, DbtSpace, Mmu};
+
+        // Start from a clean pool so we can observe real pooled DBT memory being reclaimed.
+        appine_engine::trim_dbt_pool();
+        let baseline = footprint().expect("footprint readable on Linux");
+
+        // Populate the DBT pool with keyed instances containing translated blocks: each distinct
+        // key keeps its code cache + translation tables in the pool when dropped.
+        let mut mmu = Mmu::new();
+        let code_len = 16 * PAGE_SIZE as usize;
+        let code = appine_hal::map_anonymous(code_len, false).unwrap();
+        // Fill 16 pages of `add x0, x0, #1` ending in `svc #0` so Tier 1 translates many blocks.
+        let words =
+            unsafe { std::slice::from_raw_parts_mut(code.as_ptr().cast::<u32>(), code_len / 4) };
+        let n = words.len();
+        for w in &mut words[..n - 1] {
+            *w = 0x9100_0400; // add x0, x0, #1
+        }
+        words[n - 1] = 0xd400_0001; // svc #0
+        let gva = 0x40_0000u64;
+        unsafe {
+            mmu.map(gva, code, code_len as u64, prot::READ | prot::EXEC)
+                .unwrap();
+        }
+        for key in 1u64..=8 {
+            let space = DbtSpace::new(key, DbtRegs::Default).unwrap();
+            let mut dbt = Dbt::attach(&space, 0).unwrap();
+            let mut cpu = unsafe { Cpu::new(&mmu) };
+            cpu.state_mut().pc = gva;
+            let _ = dbt.run(&mut cpu);
+            drop(dbt);
+            drop(space);
+        }
+        unsafe { appine_hal::unmap(code, code_len) };
+
+        let with_pool = footprint().unwrap();
+        assert!(
+            with_pool > baseline,
+            "pooled DBT instances should increase footprint: baseline={baseline}, with_pool={with_pool}"
+        );
+
+        // Put a live guest process in a kernel whose root limit sits halfway between baseline and
+        // with_pool: oom::check must trim the DBT pool, re-measure below the limit, and spare the
+        // live guest process.
+        let shared = Shared::new(Kernel::new(Tier::Dbt));
+        let mut k = shared.lock();
+        let mm = Mm::new().into_shared();
+        let _addr = dirty_anon(&mm, 4, 0xaa);
+        let (victim, _task, _cpu) = add_process(&mut k, 50, INIT, ROOT, mm.clone());
+        let limit = baseline + (with_pool - baseline) / 2;
+        k.oom.limit = limit;
+
+        let _ = check(&mut k, &shared);
+
+        let after = footprint().unwrap();
+        assert!(
+            after <= limit,
+            "trim_dbt_pool during oom::check should drop footprint below limit: \
+             baseline={baseline}, with_pool={with_pool}, limit={limit}, after={after}"
+        );
+        assert!(
+            victim.borrow().exiting.is_none(),
+            "guest process must not be killed when DBT pool trimming restores headroom"
+        );
+        assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.oom, 0);
+        assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.oom_kill, 0);
+    }
 }

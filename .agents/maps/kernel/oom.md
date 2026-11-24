@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: residency of remapped shared anonymous memory)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: OOM victim reaping via Mm::release and Tier 1 DBT pool trimming under root memory pressure)
 
 ## Responsibilities
 
@@ -111,8 +111,12 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 - `check` runs under the BKL each time the timer thread wakes. With no root limit and no cgroup
   limit it does nothing; otherwise it measures every 20 ms, every 5 ms once a scope is above 3/4 of
   its limit, and never more often than 20 times the measurement's own time. The root is measured
-  first and cgroups stop at the first scope over its limit, so one scope is handled per round. A
-  `memory.max` write forces an immediate round.
+  first (`measure_root`): when root usage exceeds `k.oom.limit`, it trims unused Tier 1 translations
+  from the pool (`appine_engine::trim_dbt_pool`, which only briefly takes the engine's leaf
+  `pool.lock` and unmaps evicted instances outside it, never acquiring the BKL) and re-measures,
+  sparing guest processes if trimming brings root usage back within the limit. Cgroups stop at the
+  first scope over its limit, so one scope is handled per round. A `memory.max` write forces an
+  immediate round.
 - When every task is sleeping (a thread in `Cx::unlocked` counts as sleeping), `check` stops
   through `Shared::stop_checks`: it sets `checks_idle` and then looks at the tasks again, clearing
   the flag and going on if one woke meanwhile. Every guest thread clears its `sleeping` flag and
@@ -135,15 +139,21 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 - `/proc/<pid>/oom_score` (`proc_score`, Linux's `proc_oom_score`) is the same badness with
   `total` the host's RAM plus swap, as `(1000 + badness * 1000 / total) * 2 / 3` (0 to 2000), and
   0 for the processes `select` never takes (init, -1000, no live thread, a vfork child).
-- The kill records `oom` on the domain and its ancestors; a victim already exiting is only waited
-  for. Otherwise the group gets `SIGKILL` (`group_exit`), its cgroup and ancestors count
-  `oom_kill`, host stderr gets a line, the kernel log gets Linux's memcg lines (`memory: usage …`,
-  `oom-kill:constraint=CONSTRAINT_MEMCG,…`, `Memory cgroup out of memory: Killed process …`; the
-  app-wide limit appears as a memcg OOM; the log's anonymous, file and shmem split goes by
-  mapping kind, so memfds show as file), and the app gets a `KillReason::OutOfMemory` report. With
-  `memory.oom.group` on the victim's cgroup or an ancestor up to the domain, every other live
-  process of the topmost such cgroup except init and -1000 ones is killed too (stuck victims
-  included); the victim is logged and counted twice, as Linux's `mem_cgroup_scan_tasks` does.
+- The kill records `oom` on the domain and its ancestors; a victim already exiting is reaped when
+  eligible and waited for. Otherwise the group gets `SIGKILL` (`group_exit`), its cgroup and
+  ancestors count `oom_kill`, host stderr gets a line, the kernel log gets Linux's memcg lines
+  (`memory: usage …`, `oom-kill:constraint=CONSTRAINT_MEMCG,…`, `Memory cgroup out of memory:
+  Killed process …`; the app-wide limit appears as a memcg OOM; the log's anonymous, file and shmem
+  split goes by mapping kind, so memfds show as file), and the app gets a `KillReason::OutOfMemory`
+  report. With `memory.oom.group` on the victim's cgroup or an ancestor up to the domain, every
+  other live process of the topmost such cgroup except init and -1000 ones is killed too (stuck
+  victims included); the victim is logged and counted twice, as Linux's `mem_cgroup_scan_tasks`
+  does. After all kills and RSS logs in the round finish, `reap` invokes `Mm::release` (the same
+  release path as `process_mrelease`) once per distinct address space when the killed process and
+  every other live process sharing its address space are irreversibly exiting as a whole and not
+  writing a core dump (`will_free_mem`, skipping live `vfork`/`CLONE_VM` sharers, partial
+  single-thread exits and borrowed `Mm`s), sampling each sharing process's peak RSS first so
+  `ru_maxrss` is preserved.
 - `unmap_code_views` runs on the timer thread whether or not there is a limit: at once after a
   resume from idle, then once a second while any task runs, and once more when everything is idle,
   it calls `appine_engine::unmap_written_code`, because translation-cache pages written through the
@@ -191,7 +201,7 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   `FileMaps`, `UNMAPPING`, `HostRegion` flags; `shootdown` (`kernel/mmu`) for borrowed pages a
   release re-points.
 - `appine_hal` (`memory_usage` from `/proc/self/status`, `memory_info`, `mincore` and pagemap
-  reads), `engine/dbt` (`written_code_bytes`, `unmap_written_code`), `kernel/cgroup` (`memory_limits`,
+  reads), `engine/dbt` (`written_code_bytes`, `unmap_written_code`, `trim_dbt_pool`), `kernel/cgroup` (`memory_limits`,
   `measure_memory`, `memory_event`, `oom_group`), `signal::group_exit`, the kernel log (`printk`)
   and kill reports (`bug::record_kill`, `kernel/bug`).
 
@@ -210,16 +220,19 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 ## Confirmed bugs / technical debt
 
 - **OOM scores omit swap and page tables:** a mostly swapped-out process ranks low although the
-  root's usage counts VmSwap (Linux adds swap entries and page-table pages to `oom_badness`).
-- **OOM killer does not reap victims itself:** the OOM killer does not release its victims' memory
-  itself (Linux's oom_reaper does); only `process_mrelease` triggers `Mm::release`.
+  root's usage counts `VmSwap` (Linux adds swap entries and page-table pages to `oom_badness`).
+  Host `/proc/self/status`'s `VmSwap` is aggregate for the whole app process and cannot be
+  attributed per guest process, `Mm::resident_pages` uses `mincore` (which excludes swapped-out
+  pages), and `/proc/self/pagemap` is unreadable on SELinux-enforced Android hosts where zram swap
+  matters; `appine_engine::Mmu` uses on-demand 2 MiB superpages and exposes no allocated page-table
+  count (`VmPTE` and OOM `pgtables` are 0).
 
 ## Open questions
 
 - `statm` reports data = rss while `status` reports VmData = VmSize; is the mismatch intentional?
-- A kill frees no Tier 1 translations kept in the translator's pool or shared through code groups,
-  and the OOM killer never trims the pool; is that acceptable when translations dominate the root
-  usage?
+- Root memory pressure now trims unused Tier 1 translations kept in the pool (`trim_dbt_pool`)
+  before killing a guest process, but active translations shared through `CodeGroups` stay until
+  all live sharers exit; is that acceptable when active shared translations dominate root usage?
 
 ## To verify
 
