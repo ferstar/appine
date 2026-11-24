@@ -116,9 +116,11 @@ pub(crate) struct InetSocket {
     /// the call fails with `ENOTCONN`, as Linux's `inet_shutdown` sets `sk_shutdown` then too): a
     /// blocking receive on a datagram socket with nothing queued returns 0.
     pub rd_shut: bool,
-    /// The number under which a listen in a new network namespace is registered in the namespace
-    /// ([`crate::nsproxy::Listener`]), removed on close.
+    /// The number under which a bound socket in a new network namespace is registered in the
+    /// namespace ([`crate::netns::Binding`]), removed on close.
     pub listener: Option<std::num::NonZeroU64>,
+    /// Effective UID of the socket owner at creation (`sock_i_uid`, for `SO_REUSEPORT` matching).
+    pub euid: u32,
     /// UDP: bound on the host to 127.a.b.254 (for datagrams sent to its own virtual address), with
     /// the port registered in the namespace's [`crate::nsproxy::Loopback::self_udp`], removed on
     /// close.
@@ -204,6 +206,7 @@ impl InetSocket {
             listening: false,
             rd_shut: false,
             listener: None,
+            euid: 0,
             self_port: None,
             v6only: false,
             icmp: None,
@@ -291,10 +294,8 @@ impl Drop for InetSocket {
         {
             lo.self_udp.swap_remove(i);
         }
-        if let (Some(id), Some(n)) = (self.listener, &self.net)
-            && let Ok(mut l) = n.listeners.try_borrow_mut()
-        {
-            l.retain(|x| x.id != id.get());
+        if let (Some(id), Some(n)) = (self.listener, &self.net) {
+            crate::netns::remove_binding(n, id);
         }
     }
 }
@@ -1914,8 +1915,13 @@ pub(crate) fn proc_listing(
             host_peer
                 .clone()
                 .map(|a| {
-                    let role = crate::netns::Role::Peer;
-                    crate::netns::from_host(w, &me, &unmap(a, false), role, inet.icmp6())
+                    let proto = if inet.proto == IPPROTO_MPTCP {
+                        IPPROTO_TCP
+                    } else {
+                        inet.proto
+                    };
+                    let unmapped = unmap(a.clone(), false);
+                    crate::netns::from_host_peer(w, &me, proto, &a, &unmapped, false, inet.icmp6())
                 })
                 .or_else(|| inet.peer.clone())
         };

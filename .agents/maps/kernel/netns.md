@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: O(1) reclaiming `hostmap` with exhaustion handling, forwarder TCP/UDP caps and connect timeout)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: guest-address bind/listen conflict checks and per-address host ports in `Bindings`)
 
 ## Responsibilities
 
@@ -33,11 +33,14 @@ sockets (`hal`).
 
 - `NetNs` (in nsproxy) — id, owner user namespace, `host_net` (the 127.a.b block; `None` for the
   initial namespace, which is the host network), `lo` (`Loopback`: up, IPv4 addresses, `::1`,
-  MTU, `self_udp`), `devs` (`Devices`), `nft` (`Nft`), `listeners`.
+  MTU, `self_udp`), `devs` (`Devices`), `nft` (`Nft`), `listeners` (`Bindings`).
 - `World` — every live namespace (initial first), built per call; `Use` (`Bind` → `EADDRNOTAVAIL`,
   `Reach` → `ENETUNREACH`); `Mapped` (host address, target namespace, implicit-bind source,
   virtual address); `Role` (`Peer` or `Local`).
-- `Listener` — id, port, address (or wildcard), family, `v6only`, UDP flag.
+- `Bindings` / `Binding` / `BindAddr` / `BindReq` — per-namespace registry of bound TCP/UDP sockets
+  (id, protocol, guest port, normalized guest `BindAddr`: `AnyV4`/`AnyV6`/`V4`/`V6`, `v6only`, live
+  `SO_REUSEADDR`/`SO_REUSEPORT`, `euid`, `listening`, `accepted`, host IP/port, `wide`) plus a 10 s
+  `LINGER` reverse table `(proto, host_ip, host_port) → (guest_port, BindAddr)`.
 - `Devices` — devices, index counter, routes through virtual devices (`Rt`), `NetConf`, nsids,
   `hostmap` (`HostMap`: initial namespace bidirectional virtual IPv4 ↔ 127.255.0.1..=127.255.255.254
   with O(1) lookup, FIFO slot recycling, and `EADDRNOTAVAIL` on exhaustion); `Dev` (index, name, kind,
@@ -53,8 +56,10 @@ sockets (`hal`).
 ## Public entry points
 
 - Namespaces: `Kernel::new_net_ns`, `Kernel::world`; translation `to_host`, `init_to_host`,
-  `from_host`, `from_self`, `toward_self`, `implicit_bind`, `local_toward`, `entering`,
-  `owner_of_host`; listeners `add_listener`, `listening`.
+  `from_host`, `from_host_peer`, `from_self`, `toward_self`, `implicit_bind`, `local_toward`,
+  `entering`, `owner_of_host`, `host_ipv4`, `with_host_endpoint`; bindings & listeners
+  `addrs_overlap`, `bind_conflict`, `listen_conflict`, `shared_host_port`, `add_binding`,
+  `add_ephemeral`, `remove_binding`, `set_listening`, `set_reuse`, `resolve_target`, `lookup_host`.
 - Devices: `netdev::request` (rtnetlink changes), `link_message`, `addr_messages`, `nsid`,
   `nsid_alloc`, `ioctl`, `ifconf`, readers (`views`, `interfaces`, `base`, `tables`, `entries`,
   `local_v4`, `route_v4`, `routes_v6`, `first_v4`), sysctls (`conf_dirs`, `conf_read`,
@@ -102,36 +107,55 @@ sockets (`hal`).
   moved out or pruned, and recycled FIFO; all 65,534 slots full returns `EADDRNOTAVAIL`);
   destinations in other namespaces map to their 127.c.d.1; 127.x and everything else pass through
   unchanged.
-- Back to the guest (`from_host`, by who is looking): wildcard for `any` sockets; 127.254.x.y →
-  the real outside client; own 127.a.b.x → 127.0.0.x (`::1` for IPv6 sockets at .1); 127.a.b.254 →
-  the first virtual address; another namespace's 127.c.d.1 → that namespace's address facing the
-  viewer; 127.255.x.y → the initial namespace's virtual address; non-loopback local ends → the
-  namespace's route source toward the peer.
+- Back to the guest (`from_host` / `from_host_peer`, by who is looking): wildcard for `any`
+  sockets; 127.254.x.y → the real outside client; for peers in a new namespace, `from_host_peer`
+  first checks `lookup_host` so bindings on a specific virtual or loopback IPv4 address sharing
+  127.a.b.1 report their exact guest IP; own 127.a.b.x → 127.0.0.x (`::1` for IPv6 sockets at .1,
+  except `::ffff:127.0.0.1` binds which record `vaddr`); 127.a.b.254 → the first virtual address;
+  another namespace's 127.c.d.1 → that namespace's address facing the viewer; 127.255.x.y → the
+  initial namespace's virtual address; non-loopback local ends → the namespace's route source
+  toward the peer.
 - `/proc/<pid>/net` lists the sockets created in the target's namespace, translated through each
   socket's own namespace.
 
 ### Ports and listeners in a namespace
 
-- Explicit nonzero binds keep the guest port and let the host choose (`portmap::bind_any`, keyed
-  by namespace, protocol, guest port and whether the socket takes only IPv6 — an AF_INET6 socket
-  with `IPV6_V6ONLY`, which gets a host port of its own; no address in the key, and the guest's
-  `IPV6_V6ONLY` is never set on the host socket; no linger, so the next bind gets a new host
-  port). Connects and sends to the port pick the host port by destination: an IPv6 address goes
-  to the IPv6-only binding first, an IPv4 address never does. bind(0) and implicit binds register
-  through `portmap::claim_ephemeral`, which remaps the guest port away from any existing bound
-  guest port in the same namespace (within `ip_local_port_range`) and prevents later explicit binds
-  from aliasing an active ephemeral port.
-- TCP listens and bound UDP sockets register `Listener`s with the guest address (or wildcard).
-  Matching: same port and protocol; AF_INET wildcards accept IPv4, AF_INET6 wildcards IPv6 and —
-  unless `v6only` — IPv4; specific addresses only themselves.
-- A TCP connect to a new namespace with no matching listener is `ECONNREFUSED` before the host is
-  asked; a UDP sendto there with no match is dropped silently (reporting success). Targets in the
-  initial namespace are not checked.
+- Every bound TCP/MPTCP and UDP socket in a new namespace is tracked in `NetNs::listeners`
+  (`Bindings`) by `(proto, guest_port)` with its normalized guest `BindAddr`, `v6only`, live
+  `SO_REUSEADDR`/`SO_REUSEPORT`, creator `euid`, `listening`/`accepted` state, and host endpoint
+  `(host_ip, host_port, wide)`.
+- Guest-level conflict checks run BEFORE host `bind()` (`bind_conflict`) and BEFORE TCP `listen()`
+  (`listen_conflict`), matching Linux 6.1's `inet_csk_bind_conflict` and `udp_lib_lport_inuse`:
+  two bindings overlap iff their covered IPv4 or IPv6 sets intersect (`addrs_overlap`: `0.0.0.0`
+  and IPv6-only `[::]` are disjoint, `127.0.0.1` and `<vaddr>` or `[::1]` are disjoint, while
+  `0.0.0.0` + `127.0.0.2` and IPv6-only `[::]` + dual-stack `[::]` overlap); overlapping binds
+  return `EADDRINUSE` unless both set `SO_REUSEADDR` (for UDP, or for TCP when the existing socket
+  is not `TCP_LISTEN`) or both set `SO_REUSEPORT` with the same `euid`. `IPV6_V6ONLY` refuses
+  IPv4-mapped binds and post-bind changes with `EINVAL`; `setsockopt(SO_REUSEADDR|SO_REUSEPORT)`
+  updates the live `Binding`, and `shutdown(SHUT_RD|SHUT_RDWR)` clears `listening` without
+  releasing the port.
+- Host-port separation: explicit nonzero binds get a host-assigned port (`bind(..., 0)`) per
+  distinct guest bind target `(proto, guest_port, addr, v6only, host_ip)`, so `127.0.0.1:P`,
+  `<vaddr>:P`, multiple virtual IPs, `[::1]:P`, `0.0.0.0:P`, and `[::]:P` never collide on
+  `127.a.b.1`; only sockets joining the exact same non-`wide`, non-`accepted` target via
+  `SO_REUSEPORT` (same `euid`) or UDP `SO_REUSEADDR` share a host port (`shared_host_port`).
+  `bind(0)`, implicit binds, and host autobinds register through `add_ephemeral`, which remaps the
+  guest port away from any active bound guest port for `proto` in the namespace (within
+  `ip_local_port_range`) and blocks conflicting explicit binds. Accepted TCP child sockets register
+  as non-listening `accepted` bindings. Removed bindings linger 10 s (`LINGER`) for reverse
+  `(proto, host_ip, host_port)` translation (`lookup_host`).
+- `resolve_target` routes TCP connects, UDP sends, and `forward_target` DNAT probes into a new
+  namespace to the best matching active listener's `(host_ip, host_port)` (exact guest address
+  beats wildcard; pure IPv6 prefers `v6only` wildcard; `wide` sockets route via `127.a.b.1`). A
+  TCP connect with no match returns `ECONNREFUSED` before the host is asked; a UDP sendto with no
+  match is dropped silently (reporting success). Targets in the initial namespace are not checked.
 - Connected UDP sockets record their filter verdict and target namespace listener at connect — both
   host-wide sockets (`vconn`, which discard foreign sources on receive) and namespace-bound sockets
-  — and address-less sends recheck the target listener.
-- Accepted sockets inherit the port map, `vaddr` and namespace; their peer is translated as above;
-  getsockname reports the wildcard until a connect, then the facing address.
+  — and address-less sends re-resolve the target listener's `(host_ip, host_port)` (updating
+  `vconn` or reconnecting the host socket across connect-before-bind and server close/rebind).
+- Accepted sockets inherit `local_map`, `vaddr`, `euid`, `v6only`, and namespace; their peer is
+  translated via `from_host_peer`; getsockname reports the wildcard until a connect, then the
+  facing address.
 
 ### Virtual devices
 
@@ -208,9 +232,10 @@ sockets (`hal`).
   socket's port (wildcards become the first non-loopback IPv4 interface address) runs PREROUTING
   nat; a DNAT result is translated to the target's host address and gateway source, filtered
   through the initial FORWARD and the target's PREROUTING/INPUT chains (a drop or reject means no
-  forwarding), and low ports are replaced by their host ports. Re-evaluated on listen, UDP bind,
-  initial-namespace nft commits and explicit-port binds in namespaces (when PREROUTING nat
-  exists) — not on interface address changes or container-namespace filter changes. A dual-stack
+  forwarding), and target endpoints in new namespaces are resolved via `resolve_target` (or
+  initial-namespace low ports via `portmap`). Re-evaluated on listen (both initial and new
+  namespaces), UDP bind, initial-namespace nft commits and explicit-port binds in namespaces (when
+  PREROUTING nat exists) — not on interface address changes or container-namespace filter changes. A dual-stack
   AF_INET6 wildcard listener (`!IPV6_V6ONLY`) falls back to probing IPv4 PREROUTING nat when the
   IPv6 probe does not match, so IPv4 DNAT rules forward it.
 - One host thread (`forward`, no BKL) owns dups of the selected host sockets: it accepts up to 64
@@ -261,8 +286,9 @@ sockets (`hal`).
   reachable by the initial namespace (which passes 127.x through) and by other apps on the device.
 - Namespace translation depends on who is looking; every address leaving the kernel layer must be
   translated for the viewing socket's namespace.
-- Wildcard, 127.0.0.1 and the namespace's virtual address share host 127.a.b.1; only the listener
-  registry tells them apart.
+- Wildcard, 127.0.0.1, `::1` and the namespace's virtual addresses share host IP 127.a.b.1, but
+  each distinct guest bind target receives its own host port in `NetNs::listeners` (`Bindings`),
+  which governs conflict checks, target resolution and peer reverse translation.
 - Device snapshots (`View`) hold their veth peer's namespace alive; devices refer to each other only
   weakly.
 - The forwarder never takes the BKL and touches only host fds and its own shared state.
@@ -276,10 +302,6 @@ sockets (`hal`).
 - **Namespace isolation is guest-side only:** the initial namespace passes 127.x through, so its
   guests (and other apps on the device) reach a container's host sockets directly, including
   services bound only to the container's 127.0.0.1.
-- **Same-port binds are judged by host address, not guest address:** 127.0.0.1:P and the virtual
-  address:P conflict (both are 127.a.b.1 on the host) where Linux allows them, while wildcard:P
-  plus 127.0.0.2:P succeed, and so do an IPv6-only `[::]:P` plus a dual-stack `[::]:P` (separate
-  host ports), where Linux refuses the second.
 - **nat-chain drops become `EPERM`:** a drop or reject in a nat chain (even a remote namespace's
   PREROUTING) fails connect/sendto with `EPERM`; Linux times TCP out and never filters UDP connect.
 - **Forwarder rule-change behavior:** UDP relays are cut when the rule changes (while established

@@ -150,28 +150,9 @@ pub(crate) struct NetNs {
     pub devs: RefCell<crate::netdev::Devices>,
     /// The nftables rule set ([`crate::nft`]).
     pub nft: RefCell<crate::nft::Nft>,
-    /// TCP sockets listening and UDP sockets bound in a new network namespace
-    /// ([`crate::netns::listening`]).
-    pub listeners: RefCell<Vec<Listener>>,
-}
-
-/// A TCP socket listening or a UDP socket bound in a new network namespace: on the host they are
-/// all on this namespace's loopback addresses, and incoming connections and datagrams are checked
-/// against these for whether anyone is there and whether the bound address matches (on Linux TCP
-/// gets ECONNREFUSED and UDP is dropped).
-#[derive(Debug, Clone)]
-pub(crate) struct Listener {
-    /// The number used to remove it ([`crate::net::InetSocket::listener`]).
-    pub id: u64,
-    /// The guest port.
-    pub port: u16,
-    /// The bound guest address (4 or 16 bytes); None is the wildcard address.
-    pub addr: Option<Vec<u8>>,
-    /// An AF_INET6 socket, and its `IPV6_V6ONLY`.
-    pub v6: bool,
-    pub v6only: bool,
-    /// UDP (bound), otherwise TCP (listening).
-    pub udp: bool,
+    /// Bound TCP and UDP sockets in a new network namespace (conflict checks, host-port
+    /// resolution and reverse lookup; [`crate::netns::Bindings`]).
+    pub listeners: RefCell<crate::netns::Bindings>,
 }
 
 /// The state of lo in a new network namespace: initially down and without addresses (Linux's

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: host-refused TCP filters and deferred listeners)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: delegate new-namespace bind conflicts and host-port mapping to `kernel/netns::Bindings`)
 
 ## Responsibilities
 
@@ -45,20 +45,20 @@ listen notifications (`android/service`).
   reports); DNS stub state (`stub_peer`, queued `answers`, `answered`); `rcvtimeo`/`sndtimeo`;
   the cached traffic `route` and `opening` (ActiveOpens counted for this connect); `listening`;
   `rd_shut` (the guest shut it down for reading); `pending_err` (a host socket error consumed after
-  a partial `MSG_WAITALL` read, kept for the next read or `SO_ERROR`); namespace state owned by `kernel/netns` (`net`,
-  `bound`, `any`, `vaddr`, `wide`, `vconn`, `listener`, `self_port`, `v6only`) and the forwarder
-  handle `fwd`; `track` (nat state, seen peers, a blocked verdict, connected UDP target listener,
-  preserved real outside peer, the claimed original
-  destination, `SO_MARK`); raw ICMP and tap state used with `kernel/rawicmp` (`icmp`, `ttl_set`,
-  `guest_recverr`, `udp_tap`, `icmp_err`); port-map `lease`, `local_map`, `peer_map`; `filter` (a
-  supported host-refused TCP program, as given), and `deferred` (backlog, guest reuse option and
-  optional private DNAT listener while a guest listen is held by RET 0). Dropping it closes the host fd
-  and removes its namespace UDP port and listener.
+  a partial `MSG_WAITALL` read, kept for the next read or `SO_ERROR`); namespace state owned by
+  `kernel/netns` (`net`, `bound`, `any`, `vaddr`, `wide`, `vconn`, `listener` — the `netns::Binding`
+  id —, `euid`, `self_port`, `v6only`) and the forwarder handle `fwd`; `track` (nat state, seen
+  peers, a blocked verdict, connected UDP target listener, preserved real outside peer, the claimed
+  original destination, `SO_MARK`); raw ICMP and tap state used with `kernel/rawicmp` (`icmp`,
+  `ttl_set`, `guest_recverr`, `udp_tap`, `icmp_err`); port-map `lease`, `local_map`, `peer_map`;
+  `filter` (a supported host-refused TCP program, as given), and `deferred` (backlog, guest reuse
+  option and optional private DNAT listener while a guest listen is held by RET 0). Dropping it
+  closes the host fd and removes its namespace UDP port and `Binding`.
 - `Message` (one recv result), `MsgHdr` (a guest msghdr read in), `Routed` (connect/sendto
   routing result: namespace map, nat, filter verdict, original destinations).
-- `PortMap` (kernel-wide: offset, `always_map`, entries keyed by `(namespace, protocol, guest
-  port, IPv6-only)`, `by_host`, `released`, `reported`, listen events), `Lease` (refcount on an
-  entry, released on drop), `ListenEvent` (comm, guest port, host port).
+- `PortMap` (kernel-wide initial-namespace low-port registry: offset, `always_map`, entries keyed
+  by `(namespace, protocol, guest port)`, `by_host`, `released`, `reported`, listen events),
+  `Lease` (refcount on an entry, released on drop), `ListenEvent` (comm, guest port, host port).
 - `Traffic` (per-interface `IfStats`, an address table refetched at most once a second and kept
   5 s, `Protocols` counters), `traffic::Route`.
 - `origdst::Table` (host 4-tuple → original destinations per namespace, with age and a cap),
@@ -82,9 +82,9 @@ listen notifications (`android/service`).
   `net::ioctl`; `readiness`, `wake_objects`, `arrivals` for poll/epoll.
 - DNS stub: `net::{is_stub, stub_addr, servfail}`, `deliver_dns` (timer thread),
   `hal::net::dns_query`, `vfs::ensure_resolv_conf`.
-- Ports: `portmap::{bind, bind_any, claim_ephemeral}`, `PortMap::{maps, host_port, guest_port, listened}`,
-  `Machine::take_listens`; `map_dest` (private) and `unmap_addr` (also used by the `/proc/net`
-  listings).
+- Ports: `portmap::bind`, `PortMap::{maps, host_port, guest_port, listened}`,
+  `Machine::take_listens`; `map_dest` (private, initial namespace) and `unmap_addr` (also used by
+  the `/proc/net` listings, consulting `kernel/netns::lookup_host` for new namespaces).
 - Forwarding hooks: `forward_socket`, `forward_target`, `forward_all`.
 - Traffic and `/proc/net`: `Traffic::{account, get}`, `count_connect`; the listings
   `net::{proc_listing, sockstat, sockstat6, proc_snmp, proc_netstat}` and `PROC_ARP`.
@@ -117,13 +117,15 @@ listen notifications (`android/service`).
   namespace translation runs (in a new namespace a datagram socket binding the wildcard with port
   0 binds the host wildcard, `wide`); ports below the namespace's `ip_unprivileged_port_start`
   need `CAP_NET_BIND_SERVICE` over the namespace owner (`EACCES`, checked after the translation);
-  then the port map (owned ports in new namespaces through `bind_any`, low ports in the initial
-  namespace through `bind`) or a plain host bind (a raw socket already bound to the same address
-  succeeds without binding again); then namespace registration, `forward_socket` for datagram
-  sockets and, after a remap with PREROUTING nat, `forward_all`.
-- listen: implicit bind (only in a new namespace; the host autobinds otherwise), host listen,
-  then a TCP/MPTCP socket in a new namespace registers its listener once; `forward_socket`; a
-  listen on a non-loopback host address is reported to the app.
+  then in new namespaces `netns::bind_conflict` / `shared_host_port` / `add_binding` (or
+  `add_ephemeral` for port 0) with guest-level conflict checks and per-address host ports, in the
+  initial namespace `portmap::bind` for low ports, or a plain host bind (a raw socket already bound
+  to the same address succeeds without binding again); then `forward_socket` for datagram sockets
+  and, after a new-namespace bind with PREROUTING nat, `forward_all`.
+- listen: implicit bind (only in a new namespace; the host autobinds otherwise), `netns::listen_conflict`
+  re-check in new namespaces, host listen, then mark the new-namespace binding `listening` (and
+  refresh `forward_all` when PREROUTING nat exists); `forward_socket`; a listen on a non-loopback
+  host address is reported to the app.
 - A listen held by a host-refused RET 0 explicitly reserves its port with host `SO_REUSEADDR`
   off. Guest accept waits on the socket object, polling has no ready bits, and `SO_ACCEPTCONN`,
   `TCP_INFO` and procfs report a listener. A read shutdown ends it and wakes waiters; a write
@@ -313,22 +315,19 @@ listen notifications (`android/service`).
 
 ### Low ports and listen events
 
-- Mapping applies to TCP/UDP (MPTCP as TCP) non-raw sockets: in the initial namespace for guest
-  ports 1..1023 (when the offset is nonzero), in new namespaces for every explicitly bound port
-  (`bind_any`: reuse the namespace's host port or let the host pick; an AF_INET6 socket with
-  `IPV6_V6ONLY` bound to a real IPv6 address gets its own entry and host port). Destinations are
-  rewritten by `map_dest` with `host_port`, which takes an IPv6 destination (as seen in the target
-  namespace) to an IPv6-only entry first, then the dual-stack one, and an IPv4 destination only to
-  the latter.
-- `bind` (initial namespace) candidates: if the dual-stack key is live or was released within
+- Initial-namespace mapping applies to TCP/UDP (MPTCP as TCP) non-raw sockets for guest ports
+  1..1023 (when the offset is nonzero). New-namespace explicit and ephemeral ports live in
+  `kernel/netns`'s `Bindings` instead, keyed by guest address so distinct guest addresses get
+  distinct host ports and `resolve_target` routes directly to the matching listener's host endpoint.
+- `bind` (initial namespace) candidates: if the key is live or was released within
   120 s, bind that host port and return its error (so `TIME_WAIT` gives `EADDRINUSE`); otherwise
   the original port (unless `always_map`), the other protocol's host port for the same guest port,
   port + k×offset for k = 1..3, then 0. Only `EADDRINUSE` (or `EACCES` on the original port) moves
-  to the next candidate. A new mapping that differs writes a kernel log line. `bind_any` has no
-  such reuse.
+  to the next candidate. A new mapping that differs writes a kernel log line.
 - Hiding: getsockname/getpeername, accept, recvfrom and `/proc/net` unmap host ports
-  (`local_map`, `peer_map`, and the host→guest table, which lingers 10 s after release); connect
-  and sendto to a local address with a mapped port use the host port.
+  (`local_map`, `peer_map`, `netns::lookup_host` for new namespaces, and the initial-namespace
+  host→guest table, which lingers 10 s after release); connect and sendto to a local address with a
+  mapped port use the host port.
 - Listen events: every listen on a non-loopback host address (comm, guest port, host port),
   deduplicated per (port, host port) for the kernel's lifetime, at most 32 queued, drained by
   `Machine::take_listens`; a listen dropped by a full queue is not marked reported, so its next
@@ -413,8 +412,10 @@ listen notifications (`android/service`).
 - A bind must not reach the host with `AF_UNSPEC`: Ubuntu's 6.8 kernels (colima's 6.8.0-117) oops
   in AppArmor's `aa_inet_bind_perm` on one from a confined process, and the host thread dies
   holding the BKL, hanging every guest process. bind rewrites the family to `AF_INET` first.
-- The portmap key has no address, so binds of one guest port share one host port and the host
-  decides their conflicts, except that IPv6-only binds in new namespaces get their own.
+- The initial-namespace `PortMap` key has no address, so initial-namespace low-port binds of one
+  guest port share one host port and the host decides their conflicts; new-namespace bindings live
+  in `kernel/netns`'s `Bindings` with guest-address conflict checks and distinct host ports per
+  guest bind target.
 - A `MSG_PEEK|MSG_WAITALL` wait changes the host socket's `SO_RCVLOWAT` while the BKL is released,
   so another thread polling the same socket meanwhile sees the raised low-water mark.
 - Raw ICMP tap dispatch must run with no socket borrowed (`kernel/rawicmp`).

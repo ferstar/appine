@@ -205,7 +205,10 @@ pub(crate) fn to_host(
             }
             if ip[0] == 127 {
                 return if ip[..3] == [127, 0, 0] && lo.has_v4(ip, usage) {
-                    Ok(mapped_to(block(ip[3]), me, None))
+                    let vaddr =
+                        (usage == Use::Bind && family(addr) == Some(AF_INET6) && ip[3] == 1)
+                            .then_some(ip);
+                    Ok(mapped_to(block(ip[3]), me, vaddr))
                 } else {
                     Err(fail())
                 };
@@ -514,87 +517,503 @@ pub(crate) fn local_toward(me: &NetNs, local: &[u8], peer: &[u8]) -> Option<Vec<
     Some(with_ipv4(local, src))
 }
 
-// ---- Listeners ----
-
-/// What [`add_listener`] records: the guest port, whether the wildcard address is bound, the
-/// virtual address bound, the local end on the host, the address family and `IPV6_V6ONLY`, and
-/// whether it is UDP.
-#[derive(Clone, Copy)]
-pub(crate) struct ListenAt<'a> {
-    pub port: u16,
-    pub any: bool,
-    pub vaddr: Option<[u8; 4]>,
-    pub host: &'a [u8],
-    pub v6: bool,
-    pub v6only: bool,
-    pub udp: bool,
+/// Translates a host peer address `host_addr` (with host port intact) and its port-unmapped copy
+/// `unmapped` into the guest peer address seen by `me`. When `host_addr` belongs to a new network
+/// namespace whose binding table records a specific IPv4 address (e.g. a virtual-device IP or
+/// `127.0.0.1` sharing host `127.a.b.1`), reports that exact guest IP rather than collapsing it
+/// through `127.a.b.1`.
+pub(crate) fn from_host_peer(
+    w: &World,
+    me: &NetNs,
+    proto: i32,
+    host_addr: &[u8],
+    unmapped: &[u8],
+    self_peer: bool,
+    icmp6: bool,
+) -> Vec<u8> {
+    if !icmp6
+        && let Some(owner) = owner_of_host(w, host_addr)
+        && owner.host_net.is_some()
+        && let Some(host_ip) = ipv4_of(host_addr)
+        && host_ip[..2] != [127, crate::forward::OUTSIDE_BLOCK]
+        && let Some(host_port) = host_addr
+            .get(2..4)
+            .map(|p| u16::from_be_bytes([p[0], p[1]]))
+        && let Some((_, addr)) = lookup_host(&owner, proto, host_ip, host_port)
+    {
+        match addr {
+            BindAddr::V4(v) if v[0] != 127 => return with_ipv4(unmapped, v),
+            BindAddr::V4(v) if std::ptr::eq(owner.as_ref(), me) => {
+                return with_ipv4(unmapped, v);
+            }
+            _ => {}
+        }
+    }
+    if self_peer && let Some(v) = from_self(me, unmapped) {
+        return v;
+    }
+    from_host(w, me, unmapped, Role::Peer, icmp6)
 }
 
-/// A TCP socket in a new network namespace starts listening, or a UDP socket binds: records it
-/// ([`listening`]).
-pub(crate) fn add_listener(me: &NetNs, l: &ListenAt<'_>) -> std::num::NonZeroU64 {
-    let ListenAt {
-        port,
-        any,
-        vaddr,
-        host,
-        v6,
-        v6only,
-        udp,
-    } = *l;
+// ---- Bindings and listeners ----
+
+/// How long after a binding in a new network namespace is removed its `(proto, host_ip, host_port)`
+/// still translates back to its guest port and address (for in-flight UDP replies after close).
+const LINGER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Normalized guest bind address of a socket in a new network namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum BindAddr {
+    /// IPv4 wildcard (`0.0.0.0`, or `::ffff:0.0.0.0` on AF_INET6).
+    AnyV4,
+    /// IPv6 wildcard (`::` on AF_INET6; dual-stack unless `v6only` is set).
+    AnyV6,
+    /// Specific IPv4 address (`127.0.0.x` or a virtual-device IPv4 address, including IPv4-mapped).
+    V4([u8; 4]),
+    /// Specific non-mapped IPv6 address (e.g. `::1`).
+    V6([u8; 16]),
+}
+
+impl BindAddr {
+    /// Parses a guest inet sockaddr into its normalized [`BindAddr`].
+    pub(crate) fn from_guest(addr: &[u8]) -> Option<BindAddr> {
+        match family(addr) {
+            Some(AF_INET) if addr.len() >= 8 => {
+                let ip: [u8; 4] = addr[4..8].try_into().ok()?;
+                Some(if ip == [0; 4] {
+                    BindAddr::AnyV4
+                } else {
+                    BindAddr::V4(ip)
+                })
+            }
+            Some(AF_INET6) if addr.len() >= 24 => {
+                if let Some(v4) = mapped(&addr[8..24]) {
+                    Some(if v4 == [0; 4] {
+                        BindAddr::AnyV4
+                    } else {
+                        BindAddr::V4(v4)
+                    })
+                } else {
+                    let ip: [u8; 16] = addr[8..24].try_into().ok()?;
+                    Some(if ip == [0; 16] {
+                        BindAddr::AnyV6
+                    } else {
+                        BindAddr::V6(ip)
+                    })
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether two guest bindings can match the same incoming destination (Linux 6.1's
+/// `ipv4_rcv_saddr_equal` / `ipv6_rcv_saddr_equal`).
+pub(crate) fn addrs_overlap(a: BindAddr, a_v6only: bool, b: BindAddr, b_v6only: bool) -> bool {
+    #[derive(Clone, Copy)]
+    enum Cover<T> {
+        None,
+        One(T),
+        All,
+    }
+    fn overlap<T: PartialEq>(x: Cover<T>, y: Cover<T>) -> bool {
+        match (x, y) {
+            (Cover::None, _) | (_, Cover::None) => false,
+            (Cover::All, _) | (_, Cover::All) => true,
+            (Cover::One(p), Cover::One(q)) => p == q,
+        }
+    }
+    let v4 = |addr: BindAddr, v6only: bool| match addr {
+        BindAddr::AnyV4 => Cover::All,
+        BindAddr::AnyV6 if !v6only => Cover::All,
+        BindAddr::V4(ip) => Cover::One(ip),
+        BindAddr::AnyV6 | BindAddr::V6(_) => Cover::None,
+    };
+    let v6 = |addr: BindAddr| match addr {
+        BindAddr::AnyV6 => Cover::All,
+        BindAddr::V6(ip) => Cover::One(ip),
+        BindAddr::AnyV4 | BindAddr::V4(_) => Cover::None,
+    };
+    overlap(v4(a, a_v6only), v4(b, b_v6only)) || overlap(v6(a), v6(b))
+}
+
+/// Parameters of a candidate bind or listen conflict check in a new network namespace.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BindReq {
+    pub proto: i32,
+    pub guest_port: u16,
+    pub addr: BindAddr,
+    pub v6only: bool,
+    pub reuseaddr: bool,
+    pub reuseport: bool,
+    pub euid: u32,
+}
+
+/// One bound TCP or UDP socket in a new network namespace.
+#[derive(Debug, Clone)]
+pub(crate) struct Binding {
+    /// Unique identifier stored in [`crate::net::InetSocket::listener`].
+    pub id: u64,
+    /// Protocol (`IPPROTO_TCP` for TCP/MPTCP, `IPPROTO_UDP` for UDP).
+    pub proto: i32,
+    /// Guest port (nonzero).
+    pub guest_port: u16,
+    /// Normalized guest bind address.
+    pub addr: BindAddr,
+    /// `IPV6_V6ONLY` recorded on the guest AF_INET6 socket.
+    pub v6only: bool,
+    /// Live `SO_REUSEADDR`.
+    pub reuseaddr: bool,
+    /// Live `SO_REUSEPORT`.
+    pub reuseport: bool,
+    /// Socket owner's effective UID (`sock_i_uid`, for `SO_REUSEPORT` matching).
+    pub euid: u32,
+    /// Actively receiving inbound traffic: TCP `TCP_LISTEN`, or any bound UDP socket.
+    pub listening: bool,
+    /// Accepted TCP child socket (bound to the listener's port, not accepting new SYNs).
+    pub accepted: bool,
+    /// Host IPv4 address bound on the host (`[0; 4]` for `wide` host-wildcard UDP sockets).
+    pub host_ip: [u8; 4],
+    /// Host port bound on the host.
+    pub host_port: u16,
+    /// Bound to the host wildcard address (`0.0.0.0` / `::`), reachable via `127.a.b.1`.
+    pub wide: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Lingered {
+    guest_port: u16,
+    addr: BindAddr,
+    released: std::time::Instant,
+}
+
+/// Per-namespace table of bound TCP/UDP sockets and host-port mappings in a new network namespace.
+#[derive(Debug, Default)]
+pub(crate) struct Bindings {
+    entries: Vec<Binding>,
+    /// Recently released `(proto, host_ip, host_port)` entries kept for [`LINGER`].
+    linger: std::collections::HashMap<(i32, [u8; 4], u16), Lingered>,
+}
+
+/// Whether `req` conflicts with any existing binding in `me` (excluding `skip_id`, used when a
+/// bound TCP socket enters `listen`), matching Linux 6.1's `inet_csk_bind_conflict` (TCP) and
+/// `udp_lib_lport_inuse` (UDP).
+pub(crate) fn bind_conflict(me: &NetNs, req: &BindReq, skip_id: Option<u64>) -> bool {
+    let is_tcp = req.proto == crate::net::IPPROTO_TCP;
+    me.listeners.borrow().entries.iter().any(|b| {
+        if Some(b.id) == skip_id || b.proto != req.proto || b.guest_port != req.guest_port {
+            return false;
+        }
+        if !addrs_overlap(req.addr, req.v6only, b.addr, b.v6only) {
+            return false;
+        }
+        let reuse_ok = req.reuseaddr && b.reuseaddr && !(is_tcp && b.listening);
+        let rport_ok = req.reuseport && b.reuseport && req.euid == b.euid;
+        !reuse_ok && !rport_ok
+    })
+}
+
+/// Checks whether the already-registered TCP binding `id` conflicts with any other binding in `me`
+/// upon entering `TCP_LISTEN` (e.g. two `SO_REUSEADDR` sockets bound to overlapping addresses when
+/// the second calls `listen()`).
+pub(crate) fn listen_conflict(me: &NetNs, id: std::num::NonZeroU64) -> bool {
+    let req = {
+        let b = me.listeners.borrow();
+        b.entries
+            .iter()
+            .find(|e| e.id == id.get())
+            .map(|e| BindReq {
+                proto: e.proto,
+                guest_port: e.guest_port,
+                addr: e.addr,
+                v6only: e.v6only,
+                reuseaddr: e.reuseaddr,
+                reuseport: e.reuseport,
+                euid: e.euid,
+            })
+    };
+    req.is_some_and(|r| bind_conflict(me, &r, Some(id.get())))
+}
+
+/// Returns an existing host port to share when `req` joins the exact same host endpoint as a
+/// compatible `SO_REUSEPORT` (or UDP `SO_REUSEADDR`) socket in `me`. Distinct guest addresses
+/// (such as `127.0.0.1` vs `<vaddr>`, `0.0.0.0` vs `[::]`, `::1` vs `127.0.0.1`) always receive
+/// distinct host ports so they never collide on `127.a.b.1`.
+pub(crate) fn shared_host_port(me: &NetNs, req: &BindReq, host_ip: [u8; 4]) -> Option<u16> {
+    let is_udp = req.proto == crate::net::IPPROTO_UDP;
+    me.listeners.borrow().entries.iter().rev().find_map(|b| {
+        if b.proto != req.proto
+            || b.guest_port != req.guest_port
+            || b.addr != req.addr
+            || b.v6only != req.v6only
+            || b.host_ip != host_ip
+            || b.wide
+            || b.accepted
+        {
+            return None;
+        }
+        let share = (req.reuseport && b.reuseport && req.euid == b.euid)
+            || (is_udp && req.reuseaddr && b.reuseaddr);
+        share.then_some(b.host_port)
+    })
+}
+
+/// Registers a bound socket in `me` and returns its unique binding ID.
+pub(crate) fn add_binding(me: &NetNs, mut entry: Binding) -> std::num::NonZeroU64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // The guest address bound: the virtual address; 127.a.b.x is 127.0.0.x, and AF_INET6
-    // 127.a.b.1 is ::1
-    let addr = if any {
-        None
-    } else if let Some(v) = vaddr {
-        Some(v.to_vec())
-    } else {
-        match ipv4_of(host) {
-            Some([_, _, _, 1]) if v6 && mapped(&host[8..24]).is_some() => Some(LOOPBACK6.to_vec()),
-            // 127.a.b.254, bound when sending to its own virtual address: it receives what is
-            // sent to the virtual address
-            Some([_, _, _, SELF_VIA_VADDR]) => {
-                crate::netdev::local_v4(me).first().map(|(a, _)| a.to_vec())
-            }
-            Some([_, _, _, x]) => Some(vec![127, 0, 0, x]),
-            None => None,
-        }
-    };
-    me.listeners.borrow_mut().push(crate::nsproxy::Listener {
-        id,
-        port,
-        addr,
-        v6,
-        v6only,
-        udp,
-    });
+    entry.id = id;
+    let mut b = me.listeners.borrow_mut();
+    b.linger
+        .remove(&(entry.proto, entry.host_ip, entry.host_port));
+    b.entries.push(entry);
     std::num::NonZeroU64::new(id).expect("starts at 1")
 }
 
-/// Whether a TCP socket (with `udp`, a bound UDP socket; [`crate::nsproxy::Listener`]) in new
-/// network namespace `t` is listening on guest address `dst` (a sockaddr, as seen in `t`): a
-/// wildcard listener accepts IPv4 and IPv6 (an AF_INET one only IPv4, one with `IPV6_V6ONLY` set
-/// only IPv6), and one bound to an address accepts only what is sent to it.
-pub(crate) fn listening(t: &NetNs, dst: &[u8], udp: bool) -> bool {
-    let Some(port) = dst.get(2..4).map(|p| u16::from_be_bytes([p[0], p[1]])) else {
-        return true;
+/// Registers an ephemeral bind (`bind(0)` or implicit bind) in `me`, remapping `host_port` into
+/// `range` (then `1024..=65535`, then `1..1024`) if `host_port` already aliases any bound guest
+/// port for `proto` in `me`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_ephemeral(
+    me: &NetNs,
+    proto: i32,
+    addr: BindAddr,
+    v6only: bool,
+    reuseaddr: bool,
+    reuseport: bool,
+    euid: u32,
+    listening: bool,
+    host_ip: [u8; 4],
+    host_port: u16,
+    wide: bool,
+    range: (u16, u16),
+) -> (u16, std::num::NonZeroU64) {
+    let guest_port = {
+        let b = me.listeners.borrow();
+        let in_use = |p: u16| {
+            b.entries
+                .iter()
+                .any(|e| e.proto == proto && e.guest_port == p)
+        };
+        if !in_use(host_port) {
+            host_port
+        } else {
+            let (lo, hi) = (range.0.min(range.1).max(1), range.0.max(range.1).max(1));
+            let start = host_port.clamp(lo, hi);
+            (start..=hi)
+                .chain(lo..start)
+                .chain(1024..=u16::MAX)
+                .chain(1..1024)
+                .find(|&p| !in_use(p))
+                .unwrap_or(host_port)
+        }
     };
-    let ip: Vec<u8> = match (family(dst), ipv4_of(dst)) {
-        (_, Some(v4)) => v4.to_vec(),
-        (Some(AF_INET6), None) if dst.len() >= 24 => dst[8..24].to_vec(),
-        _ => return true,
+    let id = add_binding(
+        me,
+        Binding {
+            id: 0,
+            proto,
+            guest_port,
+            addr,
+            v6only,
+            reuseaddr,
+            reuseport,
+            euid,
+            listening,
+            accepted: false,
+            host_ip,
+            host_port,
+            wide,
+        },
+    );
+    (guest_port, id)
+}
+
+/// Removes binding `id` from `me` on socket close, keeping its `(proto, host_ip, host_port)`
+/// reverse mapping for [`LINGER`] if no other live binding still holds that host endpoint.
+pub(crate) fn remove_binding(me: &NetNs, id: std::num::NonZeroU64) {
+    let Ok(mut b) = me.listeners.try_borrow_mut() else {
+        return;
     };
-    t.listeners.borrow().iter().any(|l| {
-        l.port == port
-            && l.udp == udp
-            && match &l.addr {
-                None if ip.len() == 4 => !l.v6 || !l.v6only,
-                None => l.v6,
-                Some(a) => *a == ip,
+    let Some(pos) = b.entries.iter().position(|e| e.id == id.get()) else {
+        return;
+    };
+    let removed = b.entries.swap_remove(pos);
+    let still_live = b.entries.iter().any(|e| {
+        e.proto == removed.proto && e.host_ip == removed.host_ip && e.host_port == removed.host_port
+    });
+    if !still_live {
+        let now = std::time::Instant::now();
+        b.linger
+            .retain(|_, v| now.duration_since(v.released) < LINGER);
+        b.linger.insert(
+            (removed.proto, removed.host_ip, removed.host_port),
+            Lingered {
+                guest_port: removed.guest_port,
+                addr: removed.addr,
+                released: now,
+            },
+        );
+    }
+}
+
+/// Updates the `listening` state of binding `id` (TCP `listen()` / `shutdown()`).
+pub(crate) fn set_listening(me: &NetNs, id: std::num::NonZeroU64, listening: bool) {
+    if let Some(e) = me
+        .listeners
+        .borrow_mut()
+        .entries
+        .iter_mut()
+        .find(|e| e.id == id.get())
+    {
+        e.listening = listening;
+    }
+}
+
+/// Updates `SO_REUSEADDR` (`reuseport == false`) or `SO_REUSEPORT` (`reuseport == true`) on
+/// binding `id`.
+pub(crate) fn set_reuse(me: &NetNs, id: std::num::NonZeroU64, reuseport: bool, on: bool) {
+    if let Some(e) = me
+        .listeners
+        .borrow_mut()
+        .entries
+        .iter_mut()
+        .find(|e| e.id == id.get())
+    {
+        if reuseport {
+            e.reuseport = on;
+        } else {
+            e.reuseaddr = on;
+        }
+    }
+}
+
+/// Resolves guest destination `dst` (as seen in new network namespace `t`) for `proto`
+/// (`IPPROTO_TCP` or `IPPROTO_UDP`) to the host `(host_ip, host_port)` of the best matching
+/// active listener (TCP `TCP_LISTEN`, or any bound UDP socket). Exact address matches win over
+/// wildcard matches. Returns `None` when no matching listener exists.
+pub(crate) fn resolve_target(t: &NetNs, proto: i32, dst: &[u8]) -> Option<([u8; 4], u16)> {
+    let [a, b] = t.host_net?;
+    let port = dst.get(2..4).map(|p| u16::from_be_bytes([p[0], p[1]]))?;
+    let want_v4 = ipv4_of(dst);
+    let want_v6: Option<[u8; 16]> = if want_v4.is_none() && family(dst) == Some(AF_INET6) {
+        dst.get(8..24).and_then(|s| s.try_into().ok())
+    } else {
+        None
+    };
+    if want_v4.is_none() && want_v6.is_none() {
+        return None;
+    }
+    let bindings = t.listeners.borrow();
+    let endpoint = |e: &Binding| {
+        let ip = if e.wide { [127, a, b, 1] } else { e.host_ip };
+        (ip, e.host_port)
+    };
+    // Pass 1: exact address match takes priority over wildcard (Linux __inet_lookup_listener)
+    if let Some(e) = bindings.entries.iter().rev().find(|e| {
+        e.proto == proto
+            && e.guest_port == port
+            && e.listening
+            && match (want_v4, want_v6, e.addr) {
+                (Some(ip), _, BindAddr::V4(bound)) => ip == bound,
+                (_, Some(ip), BindAddr::V6(bound)) => ip == bound,
+                _ => false,
             }
-    })
+    }) {
+        return Some(endpoint(e));
+    }
+    // Pass 2: wildcard match
+    if want_v4.is_some() {
+        return bindings.entries.iter().rev().find_map(|e| {
+            let matches = e.proto == proto
+                && e.guest_port == port
+                && e.listening
+                && matches!(
+                    (e.addr, e.v6only),
+                    (BindAddr::AnyV4, _) | (BindAddr::AnyV6, false)
+                );
+            matches.then(|| endpoint(e))
+        });
+    }
+    // Pure IPv6 destination: prefer IPv6-only wildcard before dual-stack wildcard
+    bindings
+        .entries
+        .iter()
+        .rev()
+        .find(|e| {
+            e.proto == proto
+                && e.guest_port == port
+                && e.listening
+                && e.addr == BindAddr::AnyV6
+                && e.v6only
+        })
+        .or_else(|| {
+            bindings.entries.iter().rev().find(|e| {
+                e.proto == proto && e.guest_port == port && e.listening && e.addr == BindAddr::AnyV6
+            })
+        })
+        .map(endpoint)
+}
+
+/// Whether a TCP socket (with `udp`, a bound UDP socket) in new network namespace `t` is
+/// listening on guest address `dst` (a sockaddr as seen in `t`).
+#[cfg(test)]
+fn listening(t: &NetNs, dst: &[u8], udp: bool) -> bool {
+    if dst.len() < 4 || !is_inet(dst) {
+        return true;
+    }
+    let proto = if udp {
+        crate::net::IPPROTO_UDP
+    } else {
+        crate::net::IPPROTO_TCP
+    };
+    resolve_target(t, proto, dst).is_some()
+}
+
+/// Looks up the guest `(guest_port, BindAddr)` for a host `(proto, host_ip, host_port)` in new
+/// network namespace `owner` (checking live bindings, then recently released [`LINGER`] entries).
+pub(crate) fn lookup_host(
+    owner: &NetNs,
+    proto: i32,
+    host_ip: [u8; 4],
+    host_port: u16,
+) -> Option<(u16, BindAddr)> {
+    let b = owner.listeners.borrow();
+    if let Some(e) = b
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.proto == proto && e.host_port == host_port && e.host_ip == host_ip)
+        .or_else(|| {
+            b.entries
+                .iter()
+                .rev()
+                .find(|e| e.proto == proto && e.host_port == host_port && e.wide)
+        })
+    {
+        return Some((e.guest_port, e.addr));
+    }
+    let entry = b
+        .linger
+        .get(&(proto, host_ip, host_port))
+        .or_else(|| b.linger.get(&(proto, [0; 4], host_port)))
+        .filter(|l| l.released.elapsed() < LINGER)?;
+    Some((entry.guest_port, entry.addr))
+}
+
+/// Extracts the IPv4 address from a host sockaddr (IPv4-mapped IPv6 included), or `[0; 4]` for
+/// wildcards / non-IPv4 addresses.
+pub(crate) fn host_ipv4(addr: &[u8]) -> [u8; 4] {
+    ipv4_of(addr).unwrap_or([0; 4])
+}
+
+/// Rewrites `addr`'s IPv4 (or IPv4-mapped IPv6) address to `ip` and its port to `port`.
+pub(crate) fn with_host_endpoint(addr: &[u8], ip: [u8; 4], port: u16) -> Vec<u8> {
+    let mut out = with_ipv4(addr, ip);
+    if out.len() >= 4 {
+        out[2..4].copy_from_slice(&port.to_be_bytes());
+    }
+    out
 }
 
 // ---- Sending to its own virtual address ----
@@ -1664,85 +2083,67 @@ mod tests {
         assert_ne!(other[4..8], [192, 168, 1, 50]);
     }
 
-    /// Listener records: wildcard addresses go by address family and `IPV6_V6ONLY`; those bound
-    /// to an address accept only what is sent to it.
+    /// Listener resolution: wildcard addresses go by address family and `IPV6_V6ONLY`; exact
+    /// guest addresses take priority over wildcards and return their own distinct host endpoints
+    /// (`127.0.0.1:P` vs `<vaddr>:P` vs `[::1]:P` vs `0.0.0.0:P`).
     #[test]
     fn listeners_match_like_linux() {
         let n = ns();
-        let host = |x: u8| v4([127, 1, 2, x], 0);
-        let mapped = |x: u8| {
-            let mut a = [0u8; 16];
-            a[10..12].copy_from_slice(&[0xff, 0xff]);
-            a[12..].copy_from_slice(&[127, 1, 2, x]);
-            v6(a, 0)
-        };
+        let tcp = crate::net::IPPROTO_TCP;
+        let udp = crate::net::IPPROTO_UDP;
         let eth0 = [10, 9, 0, 2];
-        let a = add_listener(
-            &n,
-            &ListenAt {
-                port: 7000,
-                any: true,
-                vaddr: None,
-                host: &host(1),
-                v6: false,
-                v6only: false,
-                udp: false,
-            },
+        let eth1 = [10, 9, 1, 2];
+        let bind = |proto, port, addr, v6only, host_ip, host_port| {
+            add_binding(
+                &n,
+                Binding {
+                    id: 0,
+                    proto,
+                    guest_port: port,
+                    addr,
+                    v6only,
+                    reuseaddr: false,
+                    reuseport: false,
+                    euid: 0,
+                    listening: true,
+                    accepted: false,
+                    host_ip,
+                    host_port,
+                    wide: false,
+                },
+            )
+        };
+        let a = bind(tcp, 7000, BindAddr::AnyV4, false, [127, 1, 2, 1], 41000);
+        bind(tcp, 7001, BindAddr::AnyV6, true, [127, 1, 2, 1], 41001);
+        bind(
+            tcp,
+            7002,
+            BindAddr::V4([127, 0, 0, 1]),
+            false,
+            [127, 1, 2, 1],
+            41002,
         );
-        add_listener(
-            &n,
-            &ListenAt {
-                port: 7001,
-                any: true,
-                vaddr: None,
-                host: &mapped(1),
-                v6: true,
-                v6only: true,
-                udp: false,
-            },
-        );
-        add_listener(
-            &n,
-            &ListenAt {
-                port: 7002,
-                any: false,
-                vaddr: None,
-                host: &host(1),
-                v6: false,
-                v6only: false,
-                udp: false,
-            },
-        );
-        add_listener(
-            &n,
-            &ListenAt {
-                port: 7003,
-                any: false,
-                vaddr: Some(eth0),
-                host: &host(1),
-                v6: false,
-                v6only: false,
-                udp: false,
-            },
-        );
-        add_listener(
-            &n,
-            &ListenAt {
-                port: 7004,
-                any: false,
-                vaddr: None,
-                host: &mapped(1),
-                v6: true,
-                v6only: false,
-                udp: false,
-            },
+        bind(tcp, 7003, BindAddr::V4(eth0), false, [127, 1, 2, 1], 41003);
+        bind(
+            tcp,
+            7004,
+            BindAddr::V6(LOOPBACK6),
+            false,
+            [127, 1, 2, 1],
+            41004,
         );
         // 0.0.0.0: any IPv4 works, pure IPv6 does not
-        assert!(listening(&n, &v4(eth0, 7000), false));
+        assert_eq!(
+            resolve_target(&n, tcp, &v4(eth0, 7000)),
+            Some(([127, 1, 2, 1], 41000))
+        );
         assert!(listening(&n, &v4([127, 0, 0, 1], 7000), false));
         assert!(!listening(&n, &v6(LOOPBACK6, 7000), false));
         // [::] with IPV6_V6ONLY: only IPv6
-        assert!(listening(&n, &v6(LOOPBACK6, 7001), false));
+        assert_eq!(
+            resolve_target(&n, tcp, &v6(LOOPBACK6, 7001)),
+            Some(([127, 1, 2, 1], 41001))
+        );
         assert!(!listening(&n, &v4(eth0, 7001), false));
         // 127.0.0.1, eth0's address and ::1 accept only what is sent to them
         assert!(listening(&n, &v4([127, 0, 0, 1], 7002), false));
@@ -1751,26 +2152,448 @@ mod tests {
         assert!(!listening(&n, &v4([127, 0, 0, 1], 7003), false));
         assert!(listening(&n, &v6(LOOPBACK6, 7004), false));
         assert!(!listening(&n, &v4([127, 0, 0, 1], 7004), false));
-        // UDP and TCP are registered separately
-        add_listener(
-            &n,
-            &ListenAt {
-                port: 7005,
-                any: true,
-                vaddr: None,
-                host: &host(1),
-                v6: false,
-                v6only: false,
-                udp: true,
-            },
+        // Same port on 127.0.0.1, eth0, eth1 and ::1 each resolve to their own distinct host port
+        bind(
+            tcp,
+            8080,
+            BindAddr::V4([127, 0, 0, 1]),
+            false,
+            [127, 1, 2, 1],
+            42001,
         );
-        assert!(listening(&n, &v4(eth0, 7005), true));
-        assert!(!listening(&n, &v4(eth0, 7005), false));
+        bind(tcp, 8080, BindAddr::V4(eth0), false, [127, 1, 2, 1], 42002);
+        bind(tcp, 8080, BindAddr::V4(eth1), false, [127, 1, 2, 1], 42003);
+        bind(
+            tcp,
+            8080,
+            BindAddr::V6(LOOPBACK6),
+            false,
+            [127, 1, 2, 1],
+            42004,
+        );
+        assert_eq!(
+            resolve_target(&n, tcp, &v4([127, 0, 0, 1], 8080)),
+            Some(([127, 1, 2, 1], 42001))
+        );
+        assert_eq!(
+            resolve_target(&n, tcp, &v4(eth0, 8080)),
+            Some(([127, 1, 2, 1], 42002))
+        );
+        assert_eq!(
+            resolve_target(&n, tcp, &v4(eth1, 8080)),
+            Some(([127, 1, 2, 1], 42003))
+        );
+        assert_eq!(
+            resolve_target(&n, tcp, &v6(LOOPBACK6, 8080)),
+            Some(([127, 1, 2, 1], 42004))
+        );
+        // 0.0.0.0:P + [::]:P (v6only) coexist on separate host ports; IPv4 hits 0.0.0.0, IPv6 hits [::]
+        bind(tcp, 80, BindAddr::AnyV4, false, [127, 1, 2, 1], 43001);
+        bind(tcp, 80, BindAddr::AnyV6, true, [127, 1, 2, 1], 43002);
+        assert_eq!(
+            resolve_target(&n, tcp, &v4(eth0, 80)),
+            Some(([127, 1, 2, 1], 43001))
+        );
+        assert_eq!(
+            resolve_target(&n, tcp, &v6(LOOPBACK6, 80)),
+            Some(([127, 1, 2, 1], 43002))
+        );
+        // Exact match takes precedence over wildcard (e.g. UDP SO_REUSEADDR 0.0.0.0 + eth0)
+        bind(udp, 5353, BindAddr::AnyV4, false, [127, 1, 2, 1], 44001);
+        bind(udp, 5353, BindAddr::V4(eth0), false, [127, 1, 2, 1], 44002);
+        assert_eq!(
+            resolve_target(&n, udp, &v4(eth0, 5353)),
+            Some(([127, 1, 2, 1], 44002))
+        );
+        assert_eq!(
+            resolve_target(&n, udp, &v4([127, 0, 0, 1], 5353)),
+            Some(([127, 1, 2, 1], 44001))
+        );
+        // UDP and TCP are registered separately
+        assert!(listening(&n, &v4(eth0, 5353), true));
+        assert!(!listening(&n, &v4(eth0, 5353), false));
         assert!(!listening(&n, &v4(eth0, 7000), true));
         // A port nobody listens on; and none after removal either
         assert!(!listening(&n, &v4(eth0, 7999), false));
-        n.listeners.borrow_mut().retain(|l| l.id != a.get());
+        remove_binding(&n, a);
         assert!(!listening(&n, &v4(eth0, 7000), false));
+    }
+
+    /// Linux 6.1 guest-address bind and listen conflict rules (`inet_csk_bind_conflict` and
+    /// `udp_lib_lport_inuse`) in a new network namespace.
+    #[test]
+    fn bind_and_listen_conflicts_match_linux() {
+        let tcp = crate::net::IPPROTO_TCP;
+        let udp = crate::net::IPPROTO_UDP;
+        let vaddr = [10, 50, 0, 2];
+
+        // Overlap matrix
+        assert!(addrs_overlap(
+            BindAddr::AnyV4,
+            false,
+            BindAddr::V4([127, 0, 0, 2]),
+            false
+        ));
+        assert!(addrs_overlap(
+            BindAddr::AnyV4,
+            false,
+            BindAddr::AnyV6,
+            false
+        ));
+        assert!(!addrs_overlap(
+            BindAddr::AnyV4,
+            false,
+            BindAddr::AnyV6,
+            true
+        ));
+        assert!(addrs_overlap(BindAddr::AnyV6, true, BindAddr::AnyV6, false));
+        assert!(addrs_overlap(
+            BindAddr::AnyV6,
+            true,
+            BindAddr::V6(LOOPBACK6),
+            false
+        ));
+        assert!(!addrs_overlap(
+            BindAddr::AnyV6,
+            true,
+            BindAddr::V4(vaddr),
+            false
+        ));
+        assert!(addrs_overlap(
+            BindAddr::AnyV6,
+            false,
+            BindAddr::V4(vaddr),
+            false
+        ));
+        assert!(!addrs_overlap(
+            BindAddr::V4([127, 0, 0, 1]),
+            false,
+            BindAddr::V4(vaddr),
+            false
+        ));
+        assert!(!addrs_overlap(
+            BindAddr::V4([127, 0, 0, 1]),
+            false,
+            BindAddr::V6(LOOPBACK6),
+            false
+        ));
+
+        let n = ns();
+        let req = |proto, port, addr, v6only, reuseaddr, reuseport, euid| BindReq {
+            proto,
+            guest_port: port,
+            addr,
+            v6only,
+            reuseaddr,
+            reuseport,
+            euid,
+        };
+        let insert = |r: BindReq, listening, host_ip, host_port| {
+            add_binding(
+                &n,
+                Binding {
+                    id: 0,
+                    proto: r.proto,
+                    guest_port: r.guest_port,
+                    addr: r.addr,
+                    v6only: r.v6only,
+                    reuseaddr: r.reuseaddr,
+                    reuseport: r.reuseport,
+                    euid: r.euid,
+                    listening,
+                    accepted: false,
+                    host_ip,
+                    host_port,
+                    wide: false,
+                },
+            )
+        };
+
+        // 1. 0.0.0.0:9000 + 127.0.0.2:9000 conflicts without reuse, and even with SO_REUSEADDR
+        //    once listening; allowed with SO_REUSEPORT for the same euid, refused for another euid.
+        let r_any = req(tcp, 9000, BindAddr::AnyV4, false, true, false, 0);
+        let id_any = insert(r_any, false, [127, 1, 2, 1], 45000);
+        // Without SO_REUSEADDR on the second socket -> conflict
+        assert!(bind_conflict(
+            &n,
+            &req(
+                tcp,
+                9000,
+                BindAddr::V4([127, 0, 0, 2]),
+                false,
+                false,
+                false,
+                0
+            ),
+            None
+        ));
+        // With SO_REUSEADDR on both while first is NOT listening -> allowed at bind
+        let r_lo2 = req(
+            tcp,
+            9000,
+            BindAddr::V4([127, 0, 0, 2]),
+            false,
+            true,
+            false,
+            0,
+        );
+        assert!(!bind_conflict(&n, &r_lo2, None));
+        let id_lo2 = insert(r_lo2, false, [127, 1, 2, 2], 45001);
+        // First enters listen -> allowed (second is not listening)
+        assert!(!listen_conflict(&n, id_any));
+        set_listening(&n, id_any, true);
+        // Second enters listen -> conflict (first is now TCP_LISTEN)
+        assert!(listen_conflict(&n, id_lo2));
+        // Third socket with SO_REUSEADDR binding 127.0.0.2:9000 -> conflict (first is TCP_LISTEN)
+        assert!(bind_conflict(&n, &r_lo2, None));
+        remove_binding(&n, id_any);
+        remove_binding(&n, id_lo2);
+
+        // 2. IPv6-only [::]:9001 + dual-stack [::]:9001 conflicts (both directions), while
+        //    0.0.0.0:9001 + IPv6-only [::]:9001 succeeds.
+        let r_v6only = req(tcp, 9001, BindAddr::AnyV6, true, false, false, 0);
+        let id_v6only = insert(r_v6only, true, [127, 1, 2, 1], 45010);
+        assert!(bind_conflict(
+            &n,
+            &req(tcp, 9001, BindAddr::AnyV6, false, false, false, 0),
+            None
+        ));
+        assert!(!bind_conflict(
+            &n,
+            &req(tcp, 9001, BindAddr::AnyV4, false, false, false, 0),
+            None
+        ));
+        remove_binding(&n, id_v6only);
+
+        // 3. 127.0.0.1:9002 + <vaddr>:9002 succeeds with no reuse options and never shares a port.
+        let r_lo1 = req(
+            tcp,
+            9002,
+            BindAddr::V4([127, 0, 0, 1]),
+            false,
+            false,
+            false,
+            0,
+        );
+        let id_lo1 = insert(r_lo1, true, [127, 1, 2, 1], 45020);
+        let r_v = req(tcp, 9002, BindAddr::V4(vaddr), false, false, false, 0);
+        assert!(!bind_conflict(&n, &r_v, None));
+        assert_eq!(shared_host_port(&n, &r_v, [127, 1, 2, 1]), None);
+        remove_binding(&n, id_lo1);
+
+        // 4. SO_REUSEPORT: same euid allowed and shares host port only for exact same bind target;
+        //    different euid conflicts.
+        let r_rp1 = req(tcp, 9003, BindAddr::V4(vaddr), false, false, true, 1000);
+        let id_rp1 = insert(r_rp1, true, [127, 1, 2, 1], 45030);
+        assert!(!bind_conflict(&n, &r_rp1, None));
+        assert_eq!(shared_host_port(&n, &r_rp1, [127, 1, 2, 1]), Some(45030));
+        // Different euid -> conflict
+        assert!(bind_conflict(
+            &n,
+            &req(tcp, 9003, BindAddr::V4(vaddr), false, false, true, 1001),
+            None
+        ));
+        // Overlapping 0.0.0.0 with SO_REUSEPORT & same euid -> allowed, distinct host port
+        let r_rp_any = req(tcp, 9003, BindAddr::AnyV4, false, false, true, 1000);
+        assert!(!bind_conflict(&n, &r_rp_any, None));
+        assert_eq!(shared_host_port(&n, &r_rp_any, [127, 1, 2, 1]), None);
+        remove_binding(&n, id_rp1);
+
+        // 5. UDP: SO_REUSEADDR allows overlapping binds even while bound; without it, conflicts.
+        let u_any = req(udp, 9004, BindAddr::AnyV4, false, true, false, 0);
+        let id_u = insert(u_any, true, [127, 1, 2, 1], 45040);
+        assert!(bind_conflict(
+            &n,
+            &req(
+                udp,
+                9004,
+                BindAddr::V4([127, 0, 0, 2]),
+                false,
+                false,
+                false,
+                0
+            ),
+            None
+        ));
+        assert!(!bind_conflict(
+            &n,
+            &req(
+                udp,
+                9004,
+                BindAddr::V4([127, 0, 0, 2]),
+                false,
+                true,
+                false,
+                0
+            ),
+            None
+        ));
+        // Turning SO_REUSEADDR off dynamically causes later binds to conflict
+        set_reuse(&n, id_u, false, false);
+        assert!(bind_conflict(
+            &n,
+            &req(
+                udp,
+                9004,
+                BindAddr::V4([127, 0, 0, 2]),
+                false,
+                true,
+                false,
+                0
+            ),
+            None
+        ));
+        remove_binding(&n, id_u);
+    }
+
+    /// Ephemeral binds avoid aliasing explicit guest ports, block conflicting explicit binds until
+    /// released, and reverse lookups preserve both guest port and bound virtual address across
+    /// the 10 s linger window.
+    #[test]
+    fn ephemeral_non_aliasing_and_reverse_lookup_linger() {
+        let n = Rc::new(ns());
+        let tcp = crate::net::IPPROTO_TCP;
+        let udp = crate::net::IPPROTO_UDP;
+        let vaddr = [10, 50, 0, 2];
+
+        let exp = add_binding(
+            &n,
+            Binding {
+                id: 0,
+                proto: tcp,
+                guest_port: 40000,
+                addr: BindAddr::V4([127, 0, 0, 1]),
+                v6only: false,
+                reuseaddr: false,
+                reuseport: false,
+                euid: 0,
+                listening: true,
+                accepted: false,
+                host_ip: [127, 1, 2, 1],
+                host_port: 51000,
+                wide: false,
+            },
+        );
+        let (g_eph, eph) = add_ephemeral(
+            &n,
+            tcp,
+            BindAddr::V4([127, 0, 0, 1]),
+            false,
+            false,
+            false,
+            0,
+            false,
+            [127, 1, 2, 1],
+            40000,
+            false,
+            (40000, 40010),
+        );
+        assert_ne!(g_eph, 40000);
+        assert!((40000..=40010).contains(&g_eph));
+        assert_eq!(
+            lookup_host(&n, tcp, [127, 1, 2, 1], 40000),
+            Some((g_eph, BindAddr::V4([127, 0, 0, 1])))
+        );
+        assert!(bind_conflict(
+            &n,
+            &BindReq {
+                proto: tcp,
+                guest_port: g_eph,
+                addr: BindAddr::V4([127, 0, 0, 1]),
+                v6only: false,
+                reuseaddr: false,
+                reuseport: false,
+                euid: 0,
+            },
+            None
+        ));
+        remove_binding(&n, eph);
+        assert!(!bind_conflict(
+            &n,
+            &BindReq {
+                proto: tcp,
+                guest_port: g_eph,
+                addr: BindAddr::V4([127, 0, 0, 1]),
+                v6only: false,
+                reuseaddr: false,
+                reuseport: false,
+                euid: 0,
+            },
+            None
+        ));
+        remove_binding(&n, exp);
+
+        // UDP reverse lookup distinguishes 127.0.0.1 vs <vaddr> even after socket close (LINGER)
+        let u_lo = add_binding(
+            &n,
+            Binding {
+                id: 0,
+                proto: udp,
+                guest_port: 8080,
+                addr: BindAddr::V4([127, 0, 0, 1]),
+                v6only: false,
+                reuseaddr: false,
+                reuseport: false,
+                euid: 0,
+                listening: true,
+                accepted: false,
+                host_ip: [127, 1, 2, 1],
+                host_port: 52001,
+                wide: false,
+            },
+        );
+        let u_va = add_binding(
+            &n,
+            Binding {
+                id: 0,
+                proto: udp,
+                guest_port: 8080,
+                addr: BindAddr::V4(vaddr),
+                v6only: false,
+                reuseaddr: false,
+                reuseport: false,
+                euid: 0,
+                listening: true,
+                accepted: false,
+                host_ip: [127, 1, 2, 1],
+                host_port: 52002,
+                wide: false,
+            },
+        );
+        let w = World {
+            all: vec![crate::nsproxy::NsProxy::init().net, n.clone()],
+        };
+        assert_eq!(
+            from_host_peer(
+                &w,
+                &n,
+                udp,
+                &v4([127, 1, 2, 1], 52001),
+                &v4([127, 1, 2, 1], 8080),
+                true,
+                false
+            ),
+            v4([127, 0, 0, 1], 8080)
+        );
+        assert_eq!(
+            from_host_peer(
+                &w,
+                &n,
+                udp,
+                &v4([127, 1, 2, 1], 52002),
+                &v4([127, 1, 2, 1], 8080),
+                false,
+                false
+            ),
+            v4(vaddr, 8080)
+        );
+        remove_binding(&n, u_lo);
+        remove_binding(&n, u_va);
+        // Still translates during LINGER window
+        assert_eq!(
+            lookup_host(&n, udp, [127, 1, 2, 1], 52002),
+            Some((8080, BindAddr::V4(vaddr)))
+        );
     }
 
     /// Translation in a world of only the initial namespace and `ns` (addresses only).

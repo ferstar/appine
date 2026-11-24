@@ -50,9 +50,8 @@ pub const STICKY: Duration = Duration::from_secs(120);
 /// ephemeral ports at random).
 pub const LINGER: Duration = Duration::from_secs(10);
 
-/// The key of the registry: network namespace (0 for the boot one, otherwise the `NetNs`'s
-/// address), protocol, guest port, and whether the binding takes only IPv6 ([`bind_any`]).
-type Key = (usize, i32, u16, bool);
+/// The key of the registry: network namespace (0 for the boot one), protocol, guest port.
+type Key = (usize, i32, u16);
 
 /// A host port: network namespace, protocol, port on the host.
 type HostKey = (usize, i32, u16);
@@ -113,16 +112,9 @@ impl PortMap {
     }
 
     /// Which host port an already mapped guest port is (connecting to this port on the local
-    /// machine is switched to it). `v6`: the destination is an IPv6 address (not IPv4-mapped),
-    /// which a binding that takes only IPv6 receives first, then a dual-stack one; an IPv4
-    /// destination never goes to an IPv6-only binding.
-    pub fn host_port(&self, ns: usize, proto: i32, port: u16, v6: bool) -> Option<u16> {
-        let get = |v6only| self.entries.get(&(ns, proto, port, v6only)).map(|e| e.host);
-        if v6 {
-            get(true).or_else(|| get(false))
-        } else {
-            get(false)
-        }
+    /// machine is switched to it).
+    pub fn host_port(&self, ns: usize, proto: i32, port: u16) -> Option<u16> {
+        self.entries.get(&(ns, proto, port)).map(|e| e.host)
     }
 
     /// When a host port comes from a mapping (including just released ones, [`LINGER`]), the port
@@ -175,7 +167,7 @@ impl Drop for Lease {
         if e.refs == 0 {
             let host = e.host;
             m.entries.remove(&self.key);
-            let (ns, proto, port, _) = self.key;
+            let (ns, proto, port) = self.key;
             let now = Instant::now();
             m.by_host
                 .retain(|_, (_, t)| t.is_none_or(|t| now.duration_since(t) < LINGER));
@@ -208,8 +200,8 @@ pub fn bind(
     mut bind: impl FnMut(u16) -> Result<(), i32>,
     bound_port: impl Fn() -> Option<u16>,
 ) -> Result<(u16, Lease, bool), Errno> {
-    let key = (ns, proto, port, false);
-    let existing = map.borrow().host_port(ns, proto, port, false).or_else(|| {
+    let key = (ns, proto, port);
+    let existing = map.borrow().host_port(ns, proto, port).or_else(|| {
         // Just released: still the original host port (STICKY)
         let m = map.borrow();
         m.released
@@ -248,7 +240,7 @@ pub fn bind(
     } else {
         crate::net::IPPROTO_TCP
     };
-    if let Some(h) = map.borrow().host_port(ns, other, port, false)
+    if let Some(h) = map.borrow().host_port(ns, other, port)
         && !candidates.contains(&h)
     {
         candidates.push(h);
@@ -280,90 +272,6 @@ pub fn bind(
         }
     }
     Err(Errno::EADDRINUSE)
-}
-
-/// A port bound explicitly in a new network namespace ([`bind`] is for low ports in the boot
-/// namespace): the host always picks another one (host-assigned), so this port on the host is not
-/// taken, and the boot namespace and other apps on the phone can still bind it (when someone else
-/// on the host binds the wildcard address, binding this namespace's loopback address would conflict
-/// anyway). When a socket in the same namespace already binds this port, the same host port is
-/// used, and a conflict is the guest's own (EADDRINUSE, `SO_REUSEPORT`). No [`STICKY`]: nobody
-/// else connects to the host port, so just take another.
-///
-/// `v6only`: an AF_INET6 socket with `IPV6_V6ONLY` binds, which gets a host port of its own. The
-/// host socket is dual-stack on the namespace's IPv4-mapped loopback address, so sharing a host
-/// port with IPv4 binds of the same port would conflict, where Linux lets `0.0.0.0:P` and
-/// `[::]:P` with `IPV6_V6ONLY` coexist (nginx's `listen 80; listen [::]:80`); connections pick
-/// the binding by destination ([`PortMap::host_port`]).
-pub fn bind_any(
-    map: &Rc<RefCell<PortMap>>,
-    ns: usize,
-    proto: i32,
-    port: u16,
-    v6only: bool,
-    mut bind: impl FnMut(u16) -> Result<(), i32>,
-    bound_port: impl Fn() -> Option<u16>,
-) -> Result<(u16, Lease), Errno> {
-    let key = (ns, proto, port, v6only);
-    let lease = |map: &Rc<RefCell<PortMap>>, host: u16| {
-        let mut m = map.borrow_mut();
-        m.entries.entry(key).or_insert(Entry { host, refs: 0 }).refs += 1;
-        m.by_host.insert((ns, proto, host), (port, None));
-        Lease {
-            map: map.clone(),
-            key,
-        }
-    };
-    let existing = map.borrow().entries.get(&key).map(|e| e.host);
-    if let Some(host) = existing {
-        bind(host).map_err(Errno)?;
-        return Ok((host, lease(map, host)));
-    }
-    bind(0).map_err(Errno)?;
-    let host = bound_port().ok_or(Errno::EADDRINUSE)?;
-    Ok((host, lease(map, host)))
-}
-
-/// Registers an ephemeral port (`bind(0)` or implicit bind) in a new network namespace so that:
-/// - if the host-assigned port `host` aliases a guest port already bound in the same namespace, a
-///   free guest port in `range` (falling back to 1024..=65535, then 1..1024) is chosen instead;
-/// - a later explicit bind of the chosen guest port tries `host` and collides with `EADDRINUSE`
-///   instead of silently binding a fresh host port.
-pub fn claim_ephemeral(
-    map: &Rc<RefCell<PortMap>>,
-    ns: usize,
-    proto: i32,
-    host: u16,
-    v6only: bool,
-    range: (u16, u16),
-) -> (u16, Lease) {
-    let mut m = map.borrow_mut();
-    let in_use = |m: &PortMap, p: u16| {
-        m.entries.contains_key(&(ns, proto, p, false))
-            || m.entries.contains_key(&(ns, proto, p, true))
-    };
-    let guest = if !in_use(&m, host) {
-        host
-    } else {
-        let (lo, hi) = (range.0.min(range.1).max(1), range.0.max(range.1).max(1));
-        let start = host.clamp(lo, hi);
-        (start..=hi)
-            .chain(lo..start)
-            .chain(1024..=u16::MAX)
-            .chain(1..1024)
-            .find(|&p| !in_use(&m, p))
-            .unwrap_or(host)
-    };
-    let key = (ns, proto, guest, v6only);
-    m.entries.entry(key).or_insert(Entry { host, refs: 0 }).refs += 1;
-    m.by_host.insert((ns, proto, host), (guest, None));
-    (
-        guest,
-        Lease {
-            map: map.clone(),
-            key,
-        },
-    )
 }
 
 #[cfg(test)]
@@ -434,7 +342,7 @@ mod tests {
         let m = map();
         let (h, a, new) = bind(&m, 0, TCP, 22, |_| Ok(()), || None).unwrap();
         assert_eq!((h, new), (22, true));
-        assert_eq!(m.borrow().host_port(0, TCP, 22, false), Some(22));
+        assert_eq!(m.borrow().host_port(0, TCP, 22), Some(22));
         assert_eq!(m.borrow().guest_port(0, TCP, 22), Some(22));
         // A second socket on the same port: the guest's own conflict is reported as usual, no move
         assert_eq!(
@@ -506,117 +414,6 @@ mod tests {
         assert_eq!(h, 10443);
     }
 
-    /// Ports in a new namespace: the host assigns them; binding again in the same namespace uses
-    /// the same host port (conflicts left to the host), the same port in another namespace gets
-    /// its own, and binding after full release need not reuse the original.
-    #[test]
-    fn namespace_ports_let_the_host_choose() {
-        let m = map();
-        let mut tried = Vec::new();
-        let (h, a) = bind_any(
-            &m,
-            7,
-            TCP,
-            8080,
-            false,
-            |p| {
-                tried.push(p);
-                Ok(())
-            },
-            || Some(41000),
-        )
-        .unwrap();
-        assert_eq!((h, tried), (41000, vec![0]));
-        assert_eq!(m.borrow().host_port(7, TCP, 8080, false), Some(41000));
-        assert_eq!(m.borrow().guest_port(7, TCP, 41000), Some(8080));
-        // Same namespace: the same host port, and when the host reports a conflict it is
-        // EADDRINUSE
-        let r = bind_any(
-            &m,
-            7,
-            TCP,
-            8080,
-            false,
-            |p| {
-                assert_eq!(p, 41000);
-                Err(Errno::EADDRINUSE.0)
-            },
-            || None,
-        );
-        assert_eq!(r.err(), Some(Errno::EADDRINUSE));
-        let (h2, b) = bind_any(&m, 7, TCP, 8080, false, |_| Ok(()), || None).unwrap();
-        assert_eq!(h2, 41000);
-        // The same port in another namespace and in the boot namespace are unrelated
-        let (h3, _c) = bind_any(
-            &m,
-            9,
-            TCP,
-            8080,
-            false,
-            |p| {
-                assert_eq!(p, 0);
-                Ok(())
-            },
-            || Some(42000),
-        )
-        .unwrap();
-        assert_eq!(h3, 42000);
-        assert_eq!(m.borrow().host_port(0, TCP, 8080, false), None);
-        // After the last lease is returned the registration is gone, and binding again assigns
-        // anew
-        drop((a, b));
-        assert_eq!(m.borrow().host_port(7, TCP, 8080, false), None);
-        assert_eq!(m.borrow().guest_port(7, TCP, 41000), Some(8080));
-        let (h4, _d) = bind_any(
-            &m,
-            7,
-            TCP,
-            8080,
-            false,
-            |p| {
-                assert_eq!(p, 0);
-                Ok(())
-            },
-            || Some(43000),
-        )
-        .unwrap();
-        assert_eq!(h4, 43000);
-        // The host gave the just released port to another mapping: switch to the new one
-        let (_, _e) = bind_any(&m, 7, TCP, 9090, false, |_| Ok(()), || Some(41000)).unwrap();
-        assert_eq!(m.borrow().guest_port(7, TCP, 41000), Some(9090));
-    }
-
-    /// In a new namespace an AF_INET6 socket with `IPV6_V6ONLY` gets a host port of its own, so it
-    /// can bind next to an IPv4 socket on the same port (nginx's `listen 80; listen [::]:80`);
-    /// IPv6 destinations go to it first, IPv4 ones never do, and a dual-stack binding still takes
-    /// IPv6 when there is no IPv6-only one.
-    #[test]
-    fn ipv6_only_binds_get_their_own_host_port() {
-        let m = map();
-        let (v4, _a) = bind_any(&m, 7, TCP, 80, false, |_| Ok(()), || Some(41000)).unwrap();
-        let (v6, b) = bind_any(
-            &m,
-            7,
-            TCP,
-            80,
-            true,
-            |p| {
-                assert_eq!(p, 0, "a new host port, not the IPv4 binding's");
-                Ok(())
-            },
-            || Some(42000),
-        )
-        .unwrap();
-        assert_eq!((v4, v6), (41000, 42000));
-        assert_eq!(m.borrow().host_port(7, TCP, 80, false), Some(41000));
-        assert_eq!(m.borrow().host_port(7, TCP, 80, true), Some(42000));
-        assert_eq!(m.borrow().guest_port(7, TCP, 42000), Some(80));
-        drop(b);
-        assert_eq!(m.borrow().host_port(7, TCP, 80, true), Some(41000));
-        let (_, _c) = bind_any(&m, 7, UDP, 53, true, |_| Ok(()), || Some(43000)).unwrap();
-        assert_eq!(m.borrow().host_port(7, UDP, 53, false), None);
-    }
-
     #[test]
     fn a_bound_port_keeps_its_host_port_until_the_last_lease() {
         let m = map();
@@ -640,9 +437,9 @@ mod tests {
             Some(Errno::EADDRINUSE)
         );
         drop(a);
-        assert_eq!(m.borrow().host_port(0, TCP, 22, false), Some(10022));
+        assert_eq!(m.borrow().host_port(0, TCP, 22), Some(10022));
         drop(b);
-        assert_eq!(m.borrow().host_port(0, TCP, 22, false), None);
+        assert_eq!(m.borrow().host_port(0, TCP, 22), None);
         // The host port still translates back to the guest port for a while (answers the other
         // side has not read yet)
         assert_eq!(m.borrow().guest_port(0, TCP, 10022), Some(22));
@@ -708,39 +505,5 @@ mod tests {
         assert!(m.maps(22) && !m.maps(0) && !m.maps(1024));
         m.offset = 0;
         assert!(!m.maps(22));
-    }
-
-    #[test]
-    fn claim_ephemeral_avoids_explicit_port_and_blocks_later_alias() {
-        let m = map();
-        // Explicit bind in ns 1 takes guest port 40000 (on host port 51000)
-        let (h_exp, _exp) = bind_any(&m, 1, TCP, 40000, false, |_| Ok(()), || Some(51000)).unwrap();
-        assert_eq!(h_exp, 51000);
-        // Host gives an ephemeral socket port 40000: claim_ephemeral remaps it away from 40000
-        let (g_eph, eph) = claim_ephemeral(&m, 1, TCP, 40000, false, (40000, 40010));
-        assert_ne!(g_eph, 40000);
-        assert!((40000..=40010).contains(&g_eph));
-        assert_eq!(m.borrow().host_port(1, TCP, g_eph, false), Some(40000));
-        assert_eq!(m.borrow().guest_port(1, TCP, 40000), Some(g_eph));
-        // Explicit bind onto the active ephemeral guest port tries its host port and fails
-        let mut tried = Vec::new();
-        let err = bind_any(
-            &m,
-            1,
-            TCP,
-            g_eph,
-            false,
-            |p| {
-                tried.push(p);
-                Err(Errno::EADDRINUSE.0)
-            },
-            || None,
-        );
-        assert_eq!(err.err(), Some(Errno::EADDRINUSE));
-        assert_eq!(tried, [40000]);
-        // After releasing the ephemeral lease, explicit bind allocates a fresh host port
-        drop(eph);
-        let (h2, _l2) = bind_any(&m, 1, TCP, g_eph, false, |_| Ok(()), || Some(52000)).unwrap();
-        assert_eq!(h2, 52000);
     }
 }
