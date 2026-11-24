@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-mount guest atime on file and directory access)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: overlay identity during procfs fd and executable reopens)
 
 ## Responsibilities
 
@@ -123,9 +123,11 @@ capabilities (`kernel/cred`).
   node of a linked regular file or device, the node of a directory, `O_PATH` or procfs file, a PTY
   slave's devpts node, or otherwise the open file (`OpenFd`: deleted and memfd files, pipes,
   sockets, PTY masters, host fds, FUSE files, `/dev/fuse`, anonymous inodes), whose reopen is
-  `ENXIO` unless it is a regular file, pipe or host fd. Ordinary absolute targets restart at the
-  root (`EXDEV` under `BENEATH`, or under `NO_XDEV` when the root was not yet taken or the link is
-  on another mount); relative ones continue from the link's directory.
+  `ENXIO` unless it is a regular file, pipe or host fd. An open walk also uses `OpenFd` for a
+  pinned overlay file whose last upper link is gone. The new fd keeps the overlay identity.
+  Ordinary absolute targets restart at the root (`EXDEV` under `BENEATH`, or under `NO_XDEV`
+  when the root was not yet taken or the link is on another mount). Relative targets continue
+  from the link's directory.
 - openat2: `open_how` under 24 bytes `EINVAL`, over 4096 or with a nonzero tail `E2BIG`; flags,
   resolve bits, mode and the `O_TMPFILE` and `O_PATH` combinations follow 6.1's
   `build_open_flags`; `BENEATH|IN_ROOT` `EINVAL`; scoped resolution starts at the dirfd, `IN_ROOT`
@@ -149,8 +151,9 @@ capabilities (`kernel/cred`).
   its name is removed) is `ENOENT` for getcwd and `/proc/<pid>/cwd`. mountinfo's `mounts_from`
   does the same for every mount through an index built once and skips unreachable mounts. `getcwd`
   prefixes `(unreachable)`; `/proc/<pid>/{cwd,root}` are computed live against the reader's root;
-  an fd's display path is fixed at open (a magic-link reopen of a nameless file takes the
-  original's), with ` (deleted)` appended when a regular file's nlink is 0.
+  `/proc/<pid>/fd/N` follows renames of the opened name through its current dentry, relative to
+  the reader's root. If the path cannot be reconstructed, procfs uses the fd's saved path or
+  description. It appends ` (deleted)` when the opened name was unlinked or a regular file's nlink is 0.
 - `Cached` (no-BKL newfstatat and statx) runs only when the thread's root is in the root
   filesystem's mount, the credentials search everything, that mount is attached and not
   nosymfollow, the fast epoch is current, the flags are valid, the thread is not syscall-traced,
@@ -398,8 +401,6 @@ capabilities (`kernel/cred`).
 
 ## Open questions
 
-- Is losing renames in `/proc/<pid>/fd/N` (path frozen at open) acceptable, given Linux computes
-  `d_path` at readlink?
 - Is skipping search permission on synthetic directories other than cgroup ones intended (only
   `/proc/<pid>/fd` and `fdinfo` gate access, by the ptrace-read check)?
 - Should `protected_regular` and `protected_fifos` be implemented?

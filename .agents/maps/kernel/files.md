@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: O_PATH pins for unlinked store files reopened through proc fd links)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: O_PATH pins for deleted executable and fd magic links)
 
 ## Responsibilities
 
@@ -144,8 +144,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   umask (`kernel/cred`: setgid stripped before the umask, setgid directories); a just-created file
   skips permission checks and truncation. `O_PATH` gives a `FileKind::Path` (`O_DIRECTORY` on a
   non-directory `ENOTDIR`). Store, overlay, FUSE and mqueue-mount nodes (`PseudoNode::Mq`) set the
-  file's mount. O_PATH pins queue inodes and quota, FUSE cache entries, and the backing object of an
-  unlinked store file reopened via a proc fd link until final release, including in-flight AF_UNIX fds.
+  file's mount. O_PATH pins queue inodes and quota, FUSE cache entries, and the object of a deleted
+  file or executable reopened through procfs. Overlay reopens keep the overlay node as well.
   A direct `mq_open` marks its descriptor `pseudo` for the internal mqueue instance.
 - Store nodes (`open_store`), unless just created: symlink `ELOOP`; a directory with write access,
   `O_CREAT` or `O_TRUNC` `EISDIR`; a regular file with `O_TRUNC` `EROFS` on ro, else it adds

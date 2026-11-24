@@ -235,9 +235,9 @@ impl ProcEvent {
 
 /// An open file.
 pub struct OpenFile {
-    /// The unlinked store object pinned by a proc fd O_PATH reopen, and whether its host
-    /// handle permits writes. The guest description itself remains path-only.
-    pub(crate) path_object: Option<(File, bool)>,
+    /// Store inode, pinned object and host write access for an O_PATH reopen through procfs.
+    /// An overlay path keeps its overlay node separately from this backing inode.
+    pub(crate) path_object: Option<(Ino, File, bool)>,
     /// A queue inode pinned by an O_PATH description, even after mq_unlink.
     pub(crate) mq_path: Option<Rc<RefCell<crate::syscall::MessageQueue>>>,
     /// Keeps an O_PATH node in the FUSE cache for the lifetime of the description.
@@ -258,10 +258,9 @@ pub struct OpenFile {
     /// ([`OpenFile::node`]): flags such as read-only and noexec are taken from it. Directory and
     /// `O_PATH` nodes carry their mount already.
     pub mnt: crate::vfs::MountId,
-    /// A regular file, device node or FIFO opened through an overlay: the overlay node (in
-    /// mount [`OpenFile::mnt`]), while the kind holds the store inode reads and writes go to.
-    /// Changes to the file's metadata go through the node ([`OpenFile::node`]), never to that
-    /// inode directly.
+    /// The overlay node in mount [`OpenFile::mnt`] for a regular file, device, FIFO or an
+    /// `O_PATH` descriptor with a pinned backing file. Reads and writes use the backing inode.
+    /// Metadata changes go through the overlay node ([`OpenFile::node`]).
     pub ovl: Option<crate::vfs::overlay::OvlId>,
     /// The overlay nodes it names (its directory or `O_PATH` node, [`OpenFile::ovl`], the
     /// directory of [`OpenFile::dentry`]), kept from being forgotten while it is open
@@ -406,8 +405,8 @@ impl OpenFile {
     pub(crate) fn regular_backing(&self) -> Option<(Ino, &File, bool)> {
         match &self.kind {
             FileKind::Regular { ino, file, cow } => Some((*ino, file, self.writable() && !cow)),
-            FileKind::Path(Node::Store(_, ino)) => {
-                let (file, writable) = self.path_object.as_ref()?;
+            FileKind::Path(_) => {
+                let (ino, file, writable) = self.path_object.as_ref()?;
                 Some((*ino, file, *writable))
             }
             _ => None,

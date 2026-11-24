@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: independent FUSE wait outputs and FIFO last-close regressions)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: regression coverage for Unix reply addresses, queued signals and overlay executable reopens)
 
 ## Responsibilities
 
@@ -116,7 +116,7 @@ benchmarks are `harness`, differential testing `harness/diff`.
 
 ## Invariants and gotchas
 
-- Each receive or child-wait output in `fs_mm_regressions` that needs a FUSE fault maps a distinct fixture
+- Each receive, signal-wait or child-wait output in `fs_mm_regressions` that needs a FUSE fault maps a distinct fixture
   inode. Private mappings of the same file page share the initial read, which can leave later
   calls without a daemon callback. `fs_io_regressions` checks FIFO close events across dup and unlink/reopen on store and overlay paths.
 - Default builds enable borrow-check; runners detect kernel bugs on stderr via

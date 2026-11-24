@@ -1037,6 +1037,8 @@ pub(crate) struct View<'a> {
     /// Credentials to read with instead of the process's: an open file's opener's, when its
     /// content is generated again ([`crate::fd::FileKind::Proc`]).
     pub cred: Option<Rc<Cred>>,
+    /// An open walk can reopen an unlinked overlay object through its source descriptor.
+    pub opening: bool,
 }
 
 /// A host path lookup without a guest task to resolve synthetic nodes.
@@ -1748,10 +1750,7 @@ impl Pseudo for View<'_> {
                 let Some(exe) = exe.filter(|_| self.task(*proc, *tid).is_some()) else {
                     return Some(Err(Errno::ENOENT));
                 };
-                // A program found through an overlay: its node while its name lasts. Once removed
-                // it can still be run through the recorded host file (OpenExe), but not opened
-                // (reopen_exe): a descriptor of the store inode behind it would change it behind
-                // the overlay's back
+                // A deleted overlay executable keeps both its overlay identity and its host file.
                 if let Some((m, o, _)) = &exe.ovl {
                     return Some(if self.vfs.overlay().linked(*o) {
                         Ok(Node::Overlay(*m, *o))
@@ -1894,6 +1893,17 @@ impl View<'_> {
         // A file opened through an overlay leads back to its overlay node, never to the store
         // inode behind it (which may be in a lower layer)
         if let Some(o) = f.ovl {
+            let ovl = self.vfs.overlay();
+            // If the last upper link is gone, only the retained fd can supply its bytes.
+            if self.opening
+                && !ovl.linked(o)
+                && ovl.node(o).upper.is_some()
+                && f.regular_backing().is_some_and(|(ino, ..)| {
+                    self.vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0)
+                })
+            {
+                return Some(Node::Pseudo(mnt, PseudoNode::OpenFd(*proc, *tid, *fd)));
+            }
             return Some(Node::Overlay(f.mnt, o));
         }
         // A deleted object can only be reopened through the handle this description holds.

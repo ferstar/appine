@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: message-queue result copies across FUSE demand fills)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: rt_sigtimedwait result copies across FUSE demand fills)
 
 ## Responsibilities
 
@@ -427,7 +427,7 @@ signals may still be delivered).
   (dumps emit zeros).
   A handler that has already consumed input can repeat its effects on a whole-syscall retry
   or return a short count. The dispatcher prefaults read/write, positional
-  and vectored I/O buffers. Socket receives, wait4/waitid, msgrcv and mq_timedreceive retry their result copies locally.
+  and vectored I/O buffers. Socket receives, wait4/waitid, msgrcv, mq_timedreceive and rt_sigtimedwait retry their result copies locally.
 - **Approximate madvise:** `MADV_DONTNEED_LOCKED`/`MADV_POPULATE_WRITE` are no-ops;
   `MADV_POPULATE_READ` runs advisory host readahead + RO file soft-PTE prefill without faulting or
   failing on inaccessible ranges; `MADV_FREE`/`COLD`/`PAGEOUT` are not refused on locked ranges.

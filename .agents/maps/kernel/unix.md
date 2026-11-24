@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 10 confirmed and 2 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: send-time credential stamping and SO_PASSCRED changes during receive)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: automatic abstract names for sockets using SO_PASSCRED)
 
 ## Responsibilities
 
@@ -85,7 +85,7 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   otherwise a pathname cut at the first NUL.
 - `bind`: already bound -> `EINVAL`.
   - Unnamed: `Names::autobind` tries up to `2^20` sequential `\0%05x` names (starting at `\000001`)
-    per `(net_id, ty)`, returning `EADDRINUSE` when exhausted.
+    per `(net_id, ty)`, returning `ENOSPC` when exhausted.
   - Abstract: inserts `Name::Abstract(net_id, ty, bytes)` (`EADDRINUSE` while a live socket of
     the same namespace and type holds it).
   - Pathname: calls `reject_trailing_slash` (`ENOENT` if missing, `EADDRINUSE` if existing),
@@ -94,6 +94,9 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
     `EROFS`, `MAY_WRITE|MAY_EXEC`), limits mode 0777 by the parent default ACL or umask with setgid-directory rules, reserves
     tmpfs room (`ENOSPC`), creates an `S_IFSOCK` inode, emits `IN_CREATE` (including on overlay
     dir), and inserts `Name::Path(ino)`.
+- With `SO_PASSCRED` enabled, an unnamed socket autobinds on connect to a valid peer address.
+  Datagram sends and connected seqpacket sends also autobind, so a receiver can reply to the
+  sender's abstract address. Enabling the option alone leaves the socket unnamed.
 - Path names key strictly by store `Ino` (shared across network namespaces, surviving hard links,
   bind mounts and renames; inode stays on disk after socket drop); abstract/autobind names scope by
   `(net_id, ty)` and expire with their `Weak` reference.
@@ -114,8 +117,8 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 - `accept`: non-listening -> `EINVAL`; pops front embryo, clears `embryo`, inherits listener's
   `SO_PASSCRED` (not timeouts or `SockOpts`), wakes `u.rx`, and returns peer name (2-byte
   `unnamed()` when client unbound). Waits bounded by `SO_RCVTIMEO`.
-- `connect_dgram`: non-blocking. `AF_UNSPEC` (`addr[..2] == [0, 0]`, checked before `parse`)
-  disconnects via `set_dgram_link(Link::None)`. Otherwise resolves target (`EPROTOTYPE` if not
+- Datagram connect is non-blocking. `connect` handles `AF_UNSPEC` before autobind and
+  disconnects via `set_dgram_link(Link::None)`. Otherwise `connect_dgram` resolves the target (`EPROTOTYPE` if not
   datagram; self-connect allowed), checks `unix_may_send` (target connected to another socket ->
   `EPERM`), and installs `Link::Dgram` (does not set `peer_cred`).
 - `shutdown`: `how` outside `0..=2` -> `EINVAL`; succeeds on any state. On `Link::Stream`,
@@ -287,7 +290,6 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 
 ## Open questions
 
-- Should `SO_PASSCRED` autobind on connect and send?
 - Should `SOCK_SEQPACKET` send omit `SIGPIPE` or match its current shared stream path?
 
 ## To verify

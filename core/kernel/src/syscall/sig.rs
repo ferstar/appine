@@ -487,7 +487,7 @@ pub(super) fn rt_sigtimedwait(
     loop {
         if let Some((sig, si)) = signal::take(cx, want) {
             if info != 0 {
-                put(cx, info, si.encode(sig))?;
+                super::copy_result(cx, |cx| put(cx, info, si.encode(sig)))?;
             }
             return Ok(sig.number() as u64);
         }

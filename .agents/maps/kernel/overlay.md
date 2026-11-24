@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: account for private store mapping pins during copy-up)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: reopening deleted overlay executables with their overlay identity)
 
 ## Responsibilities
 
@@ -95,7 +95,9 @@ holding its node (`kernel/exec`).
   polls, child and signal waits, sleeps, futexes, locks, receives and accepts, fcntl, ioctl,
   fsync, copy_file_range, IPC, AIO events), as `kernel/process` numbers syscalls. A sweep gives up
   for the round when a task's resources or the inotify registry are borrowed. An instance and its
-  nodes go in `kernel/mount`'s `collect` once it has no mount.
+  nodes go in `kernel/mount`'s `collect` once it has no mount. After an executable's name is
+  removed, opening its procfs exe link reads the pinned host file and keeps the overlay node
+  for metadata and locks. Write opens and truncation still check the mount and executable.
 
 ### readdir, stat and xattrs
 
@@ -125,7 +127,7 @@ holding its node (`kernel/exec`).
   copied-up directory keeps them and stays merged (one link, rename `EXDEV`). A file opened with
   `O_TRUNC` or truncated to 0 is copied without data. chmod, chown, utimensat (`Attrs::Overlay`),
   setxattr, removexattr, truncate and write opens check `EROFS` and permission on what the overlay
-  shows (the last two also `ETXTBSY` for a program run from the lower inode), copy up only then, and
+  shows (the last two also check `ETXTBSY` against the backing inode and the running overlay node across copy-up), copy up only then, and
   change the upper inode. utimensat by fd goes by number, never through the open (possibly lower)
   object.
 
@@ -160,7 +162,8 @@ holding its node (`kernel/exec`).
 ### Opening
 
 - Opening goes through `open_store_with` on the topmost inode; a directory stays an overlay node
-  for getdents, fchdir and `*at` calls, and regular files, devices and FIFOs record the node in
+  for getdents, fchdir and `*at` calls. Regular files, devices, FIFOs and `O_PATH`
+  descriptors with a pinned backing file record the node in
   `OpenFile::ovl`, so `OpenFile::node`, fchmod-like calls and `/proc/<pid>/fd` give the overlay
   node; fstat of a regular file shows the node's inode number, and of a device or FIFO shows the
   overlay node's stat and device (`overlay_stat` and `dev_of`, consistent with `stat` across
@@ -213,8 +216,6 @@ holding its node (`kernel/exec`).
 
 - **Overlay gaps**, one per line:
   - an overlay cannot be a layer (Linux accepts one as a lower layer);
-  - `/proc/<pid>/exe` of a program whose overlay name was removed can be run again but not opened
-    (`ENOENT`; a descriptor of the store inode would change it behind the overlay);
   - nodes of existing names are never freed while mounted (one per name looked up), and removed
     ones stay while a path-based syscall begun before their removal runs in another thread;
   - the no-BKL stat never serves overlay paths;

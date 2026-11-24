@@ -168,6 +168,86 @@ static void mount_overlay(const char *base)
     CHECK(mount("overlay", merged, "overlay", 0, opts) == 0, "mount overlay %s", base);
 }
 
+static void check_exe_header(int fd)
+{
+    char magic[4];
+    CHECK(read(fd, magic, sizeof(magic)) == sizeof(magic) &&
+          memcmp(magic, "\177ELF", sizeof(magic)) == 0, "read original ELF header");
+}
+
+static int same_inode(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+static void check_deleted_overlay_exe(const char *program, int copy_up)
+{
+    struct stat original, st;
+    const char *exe = "/proc/self/exe";
+    const char replacement[] = "replacement";
+    CHECK(stat(exe, &original) == 0, "stat running overlay program");
+    if (copy_up)
+        CHECK(chmod(program, 0755) == 0, "copy up running executable metadata");
+    CHECK(unlink(program) == 0, "unlink running overlay program");
+    write_file_bytes(program, replacement, sizeof(replacement) - 1, 0644);
+    CHECK(stat(exe, &st) == 0 && same_inode(&st, &original), "stat deleted overlay executable");
+
+    int fd = open(exe, O_RDONLY);
+    CHECK(fd >= 0 && fstat(fd, &st) == 0 && same_inode(&st, &original),
+          "open deleted overlay executable");
+    check_exe_header(fd);
+    close(fd);
+
+    int path = open(exe, O_PATH);
+    CHECK(path >= 0 && fstat(path, &st) == 0 && same_inode(&st, &original),
+          "O_PATH pins overlay identity");
+    CHECK(reopen_fd(path, O_WRONLY) == -1 && errno == ETXTBSY, "refuse writable O_PATH reopen");
+    fd = reopen_fd(path, O_RDONLY);
+    CHECK(fd >= 0, "reopen deleted overlay executable through O_PATH");
+    check_exe_header(fd);
+    close(fd);
+    close(path);
+    CHECK(open(exe, O_WRONLY) == -1 && errno == ETXTBSY, "refuse writable executable");
+    CHECK(open(exe, O_RDONLY | O_TRUNC) == -1 && errno == ETXTBSY, "refuse executable truncation");
+    CHECK(stat(program, &st) == 0 && st.st_size == sizeof(replacement) - 1, "replacement remains intact");
+}
+
+static void test_deleted_overlay_exe(void)
+{
+    const char *base = "/tmp/ovl_exe";
+    setup_overlay_dirs(base);
+    static const struct { const char *layer, *name; } cases[] = {
+        {"lower", "from-lower"}, {"upper", "from-upper"}, {"lower", "copy-up"},
+    };
+    const size_t count = sizeof(cases) / sizeof(cases[0]);
+    for (size_t i = 0; i < count; i++) {
+        char source[128];
+        snprintf(source, sizeof(source), "%s/%s/%s", base, cases[i].layer, cases[i].name);
+        int in = open("/proc/self/exe", O_RDONLY);
+        int out = open(source, O_CREAT | O_EXCL | O_WRONLY, 0755);
+        struct stat st;
+        CHECK(in >= 0 && out >= 0 && fstat(in, &st) == 0, "open overlay test image");
+        off_t pos = 0;
+        while (pos < st.st_size)
+            CHECK(sendfile(out, in, &pos, st.st_size - pos) > 0, "copy overlay test image");
+        close(out);
+        close(in);
+    }
+    mount_overlay(base);
+    for (size_t i = 0; i < count; i++) {
+        char merged[128];
+        snprintf(merged, sizeof(merged), "%s/merged/%s", base, cases[i].name);
+        pid_t child = fork();
+        CHECK(child >= 0, "fork overlay program");
+        if (child == 0) {
+            execl(merged, merged, "deleted-overlay-exe", cases[i].name, (char *)NULL);
+            _exit(127);
+        }
+        wait_ok(child, cases[i].name);
+    }
+    CHECK(umount2("/tmp/ovl_exe/merged", 0) == 0, "unmount executable overlay");
+}
+
 /* ---- 1. Overlay leases before and across copy-up ---- */
 
 static volatile sig_atomic_t lease_sigio_count = 0;
@@ -1732,6 +1812,10 @@ static void rm_rf(const char *path)
 
 int main(int argc, char **argv)
 {
+    if (argc == 3 && strcmp(argv[1], "deleted-overlay-exe") == 0) {
+        check_deleted_overlay_exe(argv[0], strcmp(argv[2], "copy-up") == 0);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "atime-child") == 0) return 0;
     CHECK(mkdir("/tmp", 0777) == 0 || errno == EEXIST, "mkdir /tmp");
     CHECK(chmod("/tmp", 0777) == 0, "chmod /tmp");
@@ -1739,11 +1823,12 @@ int main(int argc, char **argv)
     /* Clean leftovers so Tier 0 and Tier 1 can reuse the same rootfs image */
     static const char *const dirs[] = {
         "/tmp/ovl_l", "/tmp/ovl_t",    "/tmp/ovl_p", "/tmp/ovl_f",
-        "/tmp/ino_core", "/tmp/fuse_ino", "/tmp/fio",
+        "/tmp/ino_core", "/tmp/fuse_ino", "/tmp/fio", "/tmp/ovl_exe",
     };
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
         rm_rf(dirs[i]);
 
+    test_deleted_overlay_exe();
     test_overlay_leases();
     test_overlay_tmpfs_accounting();
     test_overlay_perm_before_copy_up();

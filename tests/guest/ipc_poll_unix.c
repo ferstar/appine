@@ -561,6 +561,62 @@ static void make_abstract(struct sockaddr_un *sa, socklen_t *len, const char *na
     *len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
 
+static void test_passcred_autobind(void)
+{
+    struct sockaddr_un peer, sender, local;
+    const socklen_t unnamed_len = offsetof(struct sockaddr_un, sun_path);
+    const socklen_t autobound_len = unnamed_len + 6; /* leading NUL and five hex digits */
+    const int on = 1;
+    socklen_t peer_len;
+    make_abstract(&peer, &peer_len, "passcred-reply");
+    int server = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(server >= 0 && bind(server, (struct sockaddr *)&peer, peer_len) == 0, "bind server");
+    for (int connected = 0; connected <= 1; connected++) {
+        int client = socket(AF_UNIX, SOCK_DGRAM, 0);
+        socklen_t len = sizeof(local);
+        CHECK(client >= 0 && setsockopt(client, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == 0,
+              "enable credentials");
+        CHECK(getsockname(client, (struct sockaddr *)&local, &len) == 0 &&
+              len == unnamed_len, "setsockopt alone leaves client unnamed");
+        if (connected) {
+            CHECK(connect(client, (struct sockaddr *)&peer, peer_len) == 0, "connect client");
+            len = sizeof(local);
+            CHECK(getsockname(client, (struct sockaddr *)&local, &len) == 0 &&
+                  len == autobound_len, "connect autobinds");
+            CHECK(send(client, "x", 1, 0) == 1, "send on connected socket");
+        } else {
+            CHECK(sendto(client, "x", 1, 0, (struct sockaddr *)&peer, peer_len) == 1, "sendto");
+        }
+        char c;
+        socklen_t sender_len = sizeof(sender);
+        CHECK(recvfrom(server, &c, 1, MSG_DONTWAIT, (struct sockaddr *)&sender, &sender_len) == 1 &&
+              c == 'x', "receive request");
+        len = sizeof(local);
+        CHECK(getsockname(client, (struct sockaddr *)&local, &len) == 0 &&
+              len == autobound_len && local.sun_path[0] == 0 &&
+              len == sender_len && memcmp(&sender, &local, len) == 0, "sender has autobound name");
+        CHECK(sendto(server, "y", 1, 0, (struct sockaddr *)&sender, sender_len) == 1 &&
+              recv(client, &c, 1, MSG_DONTWAIT) == 1 && c == 'y', "reply to autobound client");
+        close(client);
+    }
+    close(server);
+
+    /* A seqpacket send uses the datagram autobind rule. A stream send on a pair stays unnamed. */
+    const int types[] = {SOCK_STREAM, SOCK_SEQPACKET};
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        int pair[2];
+        CHECK(socketpair(AF_UNIX, types[i], 0, pair) == 0 &&
+              setsockopt(pair[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == 0 &&
+              send(pair[0], "x", 1, 0) == 1, "send on credential-enabled socketpair");
+        socklen_t len = sizeof(local);
+        CHECK(getsockname(pair[0], (struct sockaddr *)&local, &len) == 0 &&
+              len == (types[i] == SOCK_SEQPACKET ? autobound_len : unnamed_len),
+              "socketpair autobind by type");
+        close(pair[0]);
+        close(pair[1]);
+    }
+}
+
 static void test_unix_dgram_may_send_and_paths(void)
 {
     int a = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -1127,6 +1183,7 @@ int main(int argc, char **argv)
     test_epoll_exclusive_direction();
     test_aio_eintr_and_per_request_flags();
     test_pi_futex_execve_handover(argv[0]);
+    test_passcred_autobind();
     test_unix_dgram_may_send_and_paths();
     test_unix_stream_dgram_faults_and_zero_byte_scm();
     test_unix_gc_non_close_paths();

@@ -403,7 +403,11 @@ fn open_path_with(
     let follow = flags & oflags::O_NOFOLLOW == 0 && !excl;
     let cred = cx.cred();
 
-    let resolved = vfs.walk_resolve(&cx.view(&vfs), &cred, &root, &start, &path, follow, res);
+    let view = pseudo::View {
+        opening: true,
+        ..cx.view(&vfs)
+    };
+    let resolved = vfs.walk_resolve(&view, &cred, &root, &start, &path, follow, res);
     // A queue was created in the mqueue filesystem (open permission is not checked again, as for
     // files just created in the store)
     let mut mq_created = false;
@@ -568,6 +572,10 @@ fn open_path_with(
         }
         _ => None,
     };
+    let mut overlay = match &node {
+        Node::Overlay(mnt, o) => Some((*mnt, *o)),
+        _ => None,
+    };
     let mut fifo_open = None;
     let mut path_object = None;
     let mut mq_path = None;
@@ -583,17 +591,23 @@ fn open_path_with(
             if !path_only || backing.is_some() {
                 opened_mnt = Some(source.mnt);
                 display = source.path.clone();
-                opened_ino = backing.map(|(ino, ..)| ino);
+                overlay = source.ovl.map(|o| (source.mnt, o));
+                opened_ino = source
+                    .ovl
+                    .map(overlay::key)
+                    .or_else(|| backing.map(|(ino, ..)| ino));
                 unlinked_name |= path_only
+                    || source.ovl.is_some()
                     || source.dentry_unlinked()
-                    || opened_ino
-                        .is_some_and(|ino| vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0));
+                    || backing.is_some_and(|(ino, ..)| {
+                        vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0)
+                    });
             }
             if path_only {
                 if let Some((ino, host, writable)) = backing {
                     // Pin the object before the source fd number can be reused.
-                    path_object = Some((host.try_clone().map_err(host_errno)?, writable));
-                    node = Node::Store(source.mnt, ino);
+                    path_object = Some((ino, host.try_clone().map_err(host_errno)?, writable));
+                    node = source.node().ok_or(Errno::ENOENT)?;
                 } else {
                     mq_path = source.message_queue().cloned();
                 }
@@ -601,23 +615,22 @@ fn open_path_with(
                 fifo_open = source.watch.clone();
             }
         }
-        Node::Pseudo(_, PseudoNode::OpenExe(proc)) if !path_only => {
-            if let Ok(exe) = exe_file(cx, *proc)
-                && let Some((mnt, ino)) = exe.node
-            {
-                opened_mnt = Some(mnt);
-                display = Some(exe.path.clone());
-                opened_ino = Some(ino);
-                unlinked_name |= vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0);
+        Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
+            let exe = exe_file(cx, *proc)?;
+            let (target, ino, host) = exe.backing(&vfs)?;
+            overlay = exe.ovl.as_ref().map(|(mnt, o, _)| (*mnt, *o));
+            opened_mnt = Some(target.mnt());
+            opened_ino = inotify::key_of(&target);
+            display = Some(exe.path.clone());
+            unlinked_name = true;
+            if path_only {
+                path_object = Some((ino, host.try_clone().map_err(host_errno)?, false));
+                node = target;
             }
         }
         _ => {}
     }
     unlinked_name |= matches!(node, Node::Overlay(_, o) if !vfs.overlay().linked(o));
-    let overlay = match &node {
-        Node::Overlay(mnt, o) => Some((*mnt, *o)),
-        _ => None,
-    };
     let kind = if path_only {
         if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
@@ -668,10 +681,11 @@ fn open_path_with(
         display = None;
     }
     let overlay = overlay.filter(|_| {
-        matches!(
-            kind,
-            FileKind::Regular { .. } | FileKind::Device { .. } | FileKind::Pipe(_)
-        )
+        path_object.is_some()
+            || matches!(
+                kind,
+                FileKind::Regular { .. } | FileKind::Device { .. } | FileKind::Pipe(_)
+            )
     });
     let file = OpenFile::with_path(kind, flags & kept(flags) | largefile(flags), display);
     {
@@ -1017,27 +1031,19 @@ fn reopen(
         if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
             seals_permit(cx, ino, host, false, |_| 0)?;
         }
-        // The host fd is always readable, and also writable when originally opened for write: if
-        // that suffices, duplicate it (reads and writes are positional, with offsets kept by each
-        // open file). Otherwise reopen it through the host's /proc/self/fd; deleted files cannot
-        // be opened that way on filesystems like virtiofs. A held file's descriptions only read
-        // the shared object (open_store)
-        let new = if accmode == oflags::O_RDONLY || writable || vfs.store().held(ino)? {
-            host.try_clone()
-        } else {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!(
-                    "/proc/self/fd/{}",
-                    std::os::fd::AsRawFd::as_raw_fd(host)
-                ))
+        if let Some(o) = f.ovl
+            && writes_on_open(flags)
+        {
+            check_overlay_write(cx, cred, vfs, (f.mnt, o), &vfs.store().attrs(ino)?, flags)?;
         }
-        .map_err(host_errno)?;
+        // A held object needs a writable host handle only after copy-on-write.
+        let need_write = accmode != oflags::O_RDONLY && !writable && !vfs.store().held(ino)?;
+        let new = clone_or_reopen(host, need_write)?;
         let (mnt, memfd) = (f.mnt, f.pseudo);
+        let key = f.ovl.map_or(ino, overlay::key);
         drop(f);
         let how = StoreOpen::Reopened(new, memfd);
-        return open_store(cx, cred, vfs, (mnt, ino), flags, how);
+        return open_store_with(cx, cred, vfs, (mnt, ino), flags, how, key);
     }
     match &f.kind {
         FileKind::Pipe(end) => Ok(FileKind::Pipe(PipeEnd::open(
@@ -1061,32 +1067,38 @@ fn reopen_exe(
     flags: u32,
 ) -> Result<FileKind, Errno> {
     let exe = exe_file(cx, proc)?;
-    // A removed overlay program has no store node: it can be run (process::open_exe_file) but not
-    // opened, since a descriptor of the store inode behind it would bypass the overlay
-    let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
-        return Err(Errno::ENOENT);
-    };
+    let (node, ino, host) = exe.backing(vfs)?;
     let accmode = flags & oflags::O_ACCMODE;
-    let new = if accmode == oflags::O_RDONLY {
-        host.try_clone()
-    } else {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(format!(
-                "/proc/self/fd/{}",
-                std::os::fd::AsRawFd::as_raw_fd(&**host)
-            ))
+    if let Node::Overlay(mnt, o) = node
+        && writes_on_open(flags)
+    {
+        check_overlay_write(cx, cred, vfs, (mnt, o), &vfs.store().attrs(ino)?, flags)?;
     }
-    .map_err(host_errno)?;
-    open_store(
+    let new = clone_or_reopen(host, accmode != oflags::O_RDONLY)?;
+    open_store_with(
         cx,
         cred,
         vfs,
-        (mnt, ino),
+        (node.mnt(), ino),
         flags,
         StoreOpen::Reopened(new, false),
+        inotify::key_of(&node).unwrap_or(ino),
     )
+}
+
+/// Positional I/O lets guest descriptions share a host handle. Reopen through procfs only
+/// to gain write access, since some host filesystems cannot reopen an unlinked file by fd.
+fn clone_or_reopen(host: &std::fs::File, need_write: bool) -> Result<std::fs::File, Errno> {
+    use std::os::fd::AsRawFd;
+    if need_write {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", host.as_raw_fd()))
+    } else {
+        host.try_clone()
+    }
+    .map_err(host_errno)
 }
 
 /// inotify events of open, in the same order as Linux: create (reported to the directory),
@@ -1391,7 +1403,7 @@ fn open_store_with(
         }
         _ if flags & oflags::O_DIRECTORY != 0 => return Err(Errno::ENOTDIR),
         mode::S_IFREG => {
-            let write = accmode != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0;
+            let write = writes_on_open(flags);
             if write && check && executing(cx, ino) {
                 return Err(Errno::ETXTBSY);
             }
@@ -1499,23 +1511,9 @@ fn open_overlay(
     let mut real = vfs.overlay().node(o).real();
     let st = vfs.store().attrs(real)?;
     let lease_ino = overlay::key(o);
-    let write = flags & oflags::O_ACCMODE != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0;
-    if write && created.is_none() && st.kind() == mode::S_IFREG {
-        if vfs.readonly(&Node::Overlay(mnt, o)) {
-            return Err(Errno::EROFS);
-        }
+    if writes_on_open(flags) && created.is_none() && st.kind() == mode::S_IFREG {
+        check_overlay_write(cx, cred, vfs, (mnt, o), &st, flags)?;
         let truncate = flags & oflags::O_TRUNC != 0;
-        let mask = open_mask(flags) | if truncate { MAY_WRITE } else { 0 };
-        cred.permission(&st, mask)?;
-        if flags & oflags::O_NOATIME != 0 && !cred.owns(&st) {
-            return Err(Errno::EPERM);
-        }
-        if flags & oflags::O_DIRECTORY != 0 {
-            return Err(Errno::ENOTDIR);
-        }
-        if executing(cx, real) {
-            return Err(Errno::ETXTBSY);
-        }
         // Break leases on the overlay node identity before copying up so a nonblocking open
         // failing with EAGAIN does not copy up, and holders on the lower inode are notified
         let nonblock = flags & oflags::O_NONBLOCK != 0;
@@ -1546,6 +1544,37 @@ fn open_overlay(
             kind => kind,
         },
     )
+}
+
+/// O_TRUNC requires write access even when combined with O_RDONLY.
+fn writes_on_open(flags: u32) -> bool {
+    flags & oflags::O_ACCMODE != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0
+}
+
+fn check_overlay_write(
+    cx: &Cx<'_>,
+    cred: &Cred,
+    vfs: &Vfs,
+    (mnt, o): (MountId, OvlId),
+    st: &Stat,
+    flags: u32,
+) -> Result<(), Errno> {
+    if vfs.readonly(&Node::Overlay(mnt, o)) {
+        return Err(Errno::EROFS);
+    }
+    let truncate = flags & oflags::O_TRUNC != 0;
+    let mask = open_mask(flags) | if truncate { MAY_WRITE } else { 0 };
+    cred.permission(st, mask)?;
+    if flags & oflags::O_NOATIME != 0 && !cred.owns(st) {
+        return Err(Errno::EPERM);
+    }
+    if flags & oflags::O_DIRECTORY != 0 {
+        return Err(Errno::ENOTDIR);
+    }
+    if executing_overlay(cx, o, st.ino) {
+        return Err(Errno::ETXTBSY);
+    }
+    Ok(())
 }
 
 /// The access permissions open requires (`MAY_*`).
@@ -5395,8 +5424,9 @@ fn replace_object(f: &mut OpenFile, object: std::fs::File, held: bool) {
     if let FileKind::Regular { file, cow, .. } = &mut f.kind {
         f.retired.push(std::mem::replace(file, object));
         *cow = cow_now;
-    } else if let Some(pin) = &mut f.path_object {
-        *pin = (object, false);
+    } else if let Some((_, file, writable)) = &mut f.path_object {
+        *file = object;
+        *writable = false;
     }
 }
 
@@ -6520,12 +6550,13 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
         // A deleted program file
         Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
             let exe = exe_file(cx, *proc)?;
-            let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
-                return Err(Errno::ENOENT);
-            };
+            let (node, ino, host) = exe.backing(&vfs)?;
             let mut st = vfs.store().stat_open(ino, host)?;
             vfs.tmpfs_stat_blocks(ino, Some(host), &mut st)?;
-            Ok(encode_stat(&st, vfs.dev_of(&Node::Store(mnt, ino))))
+            if let Node::Overlay(_, o) = node {
+                st.ino = vfs.overlay().shown_ino(o);
+            }
+            Ok(encode_stat(&st, vfs.dev_of(&node)))
         }
         Node::Pseudo(_, p) => {
             let mut b = encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node));
@@ -8438,7 +8469,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
                 return Err(Errno::EROFS);
             }
             cx.cred().permission(&st, MAY_WRITE)?;
-            if executing(cx, real) {
+            if executing_overlay(cx, o, real) {
                 return Err(Errno::ETXTBSY);
             }
             check_fsize(cx, len)?;
@@ -9620,6 +9651,19 @@ pub(super) fn executing(cx: &Cx<'_>, ino: Ino) -> bool {
         .tasks
         .values()
         .any(|t| t.res.borrow().mm.borrow().exe == Some(ino))
+}
+
+/// A metadata copy-up changes the real inode while the running program keeps its overlay node.
+fn executing_overlay(cx: &Cx<'_>, o: OvlId, real: Ino) -> bool {
+    executing(cx, real)
+        || cx.kr().groups.values().any(|g| {
+            let g = g.borrow();
+            !g.threads.is_empty()
+                && g.exe
+                    .as_ref()
+                    .and_then(|exe| exe.ovl.as_ref())
+                    .is_some_and(|(_, id, _)| *id == o)
+        })
 }
 
 /// Whether `ino` is open for write (executing it is ETXTBSY).

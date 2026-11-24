@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 16 claims checked by 3 independent verifiers — 12 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: wait for all threads before CLD_STOPPED, omit SIGILL esr_context, CLONE_SIGHAND discard, rt_sigreturn DAIF/ESR/step, settimeofday/clock_settime)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: signal result copies across FUSE demand fills)
 
 ## Responsibilities
 
@@ -187,6 +187,8 @@ construction (`kernel/vdso`).
 - `rt_sigprocmask` (`size == 8`), `rt_sigpending` (`size <= 8`), `rt_sigsuspend` (`saved_sigmask`,
   `ERESTARTNOHAND`), `rt_sigtimedwait` (`signal::take`, `EAGAIN`, `EINTR` on other signals),
   `sigaltstack` (`SS_DISABLE`/`SS_ONSTACK`/`SS_AUTODISARM`, min 5120).
+  Once `rt_sigtimedwait` takes a signal, it retains the selected siginfo across FUSE page fills
+  while copying to the caller.
 - Senders: `kill` handles virtual PID 1 (`k.init_handlers` -> `inittab::Power`), `pid > 0`
   (accepting any tid -> its group, including zombies), `0`, `-1` (all except init and self), and
   `< -1`; `tkill`/`tgkill` send `SI_TKILL`; `rt_sigqueueinfo`/`rt_tgsigqueueinfo`/

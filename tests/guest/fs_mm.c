@@ -449,7 +449,7 @@ static uint64_t fuse_file_node(const char *name)
         "data", "recv-data", "recv-peer", "recv-peer-len", "batch-len", "batch-data",
         "batch-peer", "rights-control", "unix-data",
         "wait-status", "wait-info", "wait4-usage", "waitid-usage",
-        "sysv-type", "sysv-text", "mq-data", "mq-priority",
+        "sysv-type", "sysv-text", "mq-data", "mq-priority", "signal-info",
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++)
         if (strcmp(name, files[i]) == 0)
@@ -836,6 +836,32 @@ static void *map_output_page(int dir, const char *name, void *at)
     return p;
 }
 
+static void sigtimedwait_fuse_output(int dir, struct fuse_ctx *ctx)
+{
+    sigset_t set, saved;
+    sigemptyset(&set);
+    sigaddset(&set, SIGRTMIN);
+    CHECK(sigprocmask(SIG_BLOCK, &set, &saved) == 0, "block queued signal");
+    siginfo_t *info = map_output_page(dir, "signal-info", NULL);
+    int reads = ctx->read_ops;
+    const struct timespec no_wait = {0};
+    pid_t pid = getpid(), tid = syscall(SYS_gettid);
+    siginfo_t queued = {.si_signo = SIGRTMIN, .si_code = SI_QUEUE, .si_pid = pid,
+                        .si_uid = getuid()};
+    for (int i = 1; i <= 2; i++) {
+        queued.si_value.sival_int = i;
+        CHECK(syscall(SYS_rt_tgsigqueueinfo, pid, tid, SIGRTMIN, &queued) == 0,
+              "queue signal for the waiting thread");
+    }
+    for (int i = 1; i <= 2; i++)
+        CHECK(sigtimedwait(&set, info, &no_wait) == SIGRTMIN && info->si_code == SI_QUEUE &&
+              info->si_value.sival_int == i, "receive queued signal %d exactly once", i);
+    CHECK(ctx->read_ops > reads, "signal result required a FUSE read");
+    CHECK(sigtimedwait(&set, NULL, &no_wait) == -1 && errno == EAGAIN, "signal queue empty");
+    munmap(info, 4096);
+    CHECK(sigprocmask(SIG_SETMASK, &saved, NULL) == 0, "restore signal mask");
+}
+
 static void sysv_receive_fuse_outputs(int dir, struct fuse_ctx *ctx)
 {
     struct message { long type; char text[8]; };
@@ -1090,6 +1116,7 @@ static void test_fuse_short_read_mapping(void)
     CHECK(m != MAP_FAILED, "mmap fuse data");
     int dir = open("/tmp/fuse_short", O_RDONLY | O_DIRECTORY);
     CHECK(dir >= 0, "open FUSE fixture directory");
+    sigtimedwait_fuse_output(dir, &ctx);
     sysv_receive_fuse_outputs(dir, &ctx);
     posix_receive_fuse_outputs(dir, &ctx);
     wait_fuse_outputs(dir, &ctx);

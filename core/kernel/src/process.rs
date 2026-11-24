@@ -723,6 +723,18 @@ impl ExeFile {
         }
     }
 
+    /// The guest node for mount and identity checks, its store inode and the pinned host file.
+    pub(crate) fn backing(&self, vfs: &Vfs) -> Result<(Node, Ino, &File), Errno> {
+        let host = self.host.as_deref().ok_or(Errno::ENOENT)?;
+        if let Some((mnt, o, _)) = &self.ovl {
+            let real = vfs.overlay().real_of(*o).ok_or(Errno::ENOENT)?;
+            Ok((Node::Overlay(*mnt, *o), real, host))
+        } else {
+            let (mnt, ino) = self.node.ok_or(Errno::ENOENT)?;
+            Ok((Node::Store(mnt, ino), ino, host))
+        }
+    }
+
     /// The mount the program file was executed through (store or overlay), when known.
     pub(crate) fn mnt(&self) -> Option<MountId> {
         self.node
@@ -748,17 +760,7 @@ pub(crate) fn open_exe_file(
     cred: &Cred,
     exe: &ExeFile,
 ) -> Result<(Executable, Stat, bool), Errno> {
-    let (ino, node) = match (exe.node, &exe.ovl) {
-        (Some((mnt, ino)), _) => (ino, Node::Store(mnt, ino)),
-        (None, Some((mnt, o, _))) => {
-            let ino = vfs.overlay().real_of(*o).ok_or(Errno::ENOENT)?;
-            (ino, Node::Overlay(*mnt, *o))
-        }
-        (None, None) => return Err(Errno::ENOENT),
-    };
-    let Some(host) = &exe.host else {
-        return Err(Errno::ENOENT);
-    };
+    let (node, ino, host) = exe.backing(vfs)?;
     let st = vfs.store().stat_open(ino, host)?;
     if st.kind() != mode::S_IFREG {
         return Err(Errno::EACCES);

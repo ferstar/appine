@@ -1365,6 +1365,7 @@ impl<'a> Cx<'a> {
             tid: self.tid(),
             tgid: self.tgid(),
             cred: None,
+            opening: false,
         }
     }
 

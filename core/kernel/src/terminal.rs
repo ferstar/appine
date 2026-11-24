@@ -208,6 +208,7 @@ pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {
         tid,
         tgid,
         cred: None,
+        opening: false,
     };
     vfs.path_of(&view, &root, &cwd)
 }

@@ -101,15 +101,15 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
     if with(sock, |u| !u.addr.is_empty()) {
         return Err(Errno::EINVAL);
     }
+    bind_addr(cx, sock, parse(addr)?)
+}
+
+fn bind_addr(cx: &mut Cx<'_>, sock: &SocketRef, addr: Addr<'_>) -> Result<(), Errno> {
     let mut bound = unnamed();
     let (net, ty) = with(sock, |u| (u.net_id(), u.ty));
-    match parse(addr)? {
+    match addr {
         Addr::Unnamed => {
-            let path = cx
-                .k()
-                .unix
-                .autobind(net, ty, sock)
-                .ok_or(Errno::EADDRINUSE)?;
+            let path = cx.k().unix.autobind(net, ty, sock).ok_or(Errno::ENOSPC)?;
             bound.extend_from_slice(&path);
         }
         Addr::Abstract(p) => {
@@ -163,6 +163,22 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
     }
     with(sock, |u| u.addr = bound);
     Ok(())
+}
+
+/// Linux assigns a reply address before looking up the peer, even if that lookup fails.
+fn autobind_passcred(cx: &mut Cx<'_>, sock: &SocketRef, peer: Option<&[u8]>) -> Result<(), Errno> {
+    let needs_name = with(sock, |u| {
+        u.addr.is_empty() && u.receive_queue().borrow().passcred
+    });
+    if !needs_name {
+        return Ok(());
+    }
+    if let Some(peer) = peer
+        && matches!(parse(peer)?, Addr::Unnamed)
+    {
+        return Err(Errno::EINVAL);
+    }
+    bind_addr(cx, sock, Addr::Unnamed)
 }
 
 pub(super) fn listen(u: &mut UnixSocket, backlog: i32, cred: Ucred) -> Result<(), Errno> {
@@ -234,6 +250,12 @@ pub(super) fn connect(
     addr: &[u8],
 ) -> Result<(), Errno> {
     let (ty, timeout) = with(sock, |u| (u.ty, u.sndtimeo));
+    if ty == SOCK_DGRAM && addr.starts_with(&[0, 0]) {
+        // AF_UNSPEC disconnects without choosing a local name.
+        with(sock, |u| u.set_dgram_link(Link::None));
+        return Ok(());
+    }
+    autobind_passcred(cx, sock, Some(addr))?;
     if ty == SOCK_DGRAM {
         return connect_dgram(cx, sock, addr);
     }
@@ -287,11 +309,6 @@ pub(super) fn connect(
 }
 
 fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), Errno> {
-    // AF_UNSPEC: disconnect
-    if addr.len() >= 2 && addr[..2] == [0, 0] {
-        with(sock, |u| u.set_dgram_link(Link::None));
-        return Ok(());
-    }
     let target = find(cx, sock, addr)?;
     let own_rx = with(sock, |u| Rc::downgrade(&u.rx));
     let link = match &*target.borrow() {
@@ -324,11 +341,15 @@ pub(super) fn send(
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let (files, declared) = rights(cx, control)?;
     let mut files = SendingRights::track(cx.k(), files);
-    let (ty, timeout, from) = with(sock, |u| (u.ty, u.sndtimeo, u.addr.clone()));
+    let (ty, timeout) = with(sock, |u| (u.ty, u.sndtimeo));
     let deadline = deadline(timeout);
     if ty == SOCK_DGRAM {
         return send_dgram(cx, sock, nonblock, deadline, data, addr, files, declared);
     }
+    if ty == SOCK_SEQPACKET && with(sock, |u| matches!(u.link, Link::Stream { .. })) {
+        autobind_passcred(cx, sock, None)?;
+    }
+    let from = with(sock, |u| u.addr.clone());
     // A stream socket takes no destination (unix_stream_sendmsg); seqpacket ignores it
     if ty == SOCK_STREAM && !addr.is_empty() {
         let connected = with(sock, |u| matches!(u.link, Link::Stream { .. }));
@@ -472,6 +493,10 @@ fn send_dgram(
     files: Option<Rc<SendingRights>>,
     declared: Option<Ucred>,
 ) -> Result<usize, Errno> {
+    let destination = (!addr.is_empty()).then_some(addr);
+    if destination.is_some() || with(sock, |u| matches!(u.link, Link::Dgram { .. })) {
+        autobind_passcred(cx, sock, destination)?;
+    }
     let (own_rx, from, connected, shut_wr) = with(sock, |u| {
         let connected = match &u.link {
             Link::Dgram { tx, .. } => Some(tx.clone()),

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: stable O_PATH targets for deleted store files)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: opening deleted overlay executables through procfs)
 
 ## Responsibilities
 
@@ -243,8 +243,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - `exe` reads as the program's path recorded at execve, with ` (deleted)` once the file's last
   link is gone or, for a program found through an overlay, once that name is removed; following
   it reaches the program itself even after a rename (an overlay program through its overlay node)
-  and a deleted program through the host file recorded at execve (`OpenExe`), which a removed
-  overlay program only runs from: opening it is `ENOENT`.
+  and a deleted program through the host file recorded at execve (`OpenExe`). Opening a removed
+  overlay program retains the overlay mount and inode. An O_PATH reopen pins the object too.
 - `mounts`/`mountinfo` come from the mount table (`kernel/mount`) for the thread's namespace and
   root (an exited thread has none: `EINVAL` at open, as `mounts_open_common`), each mount's type
   as `Vfs::type_of` gives it (`fuse.<subtype>` for a FUSE mount with a subtype); mountinfo's
