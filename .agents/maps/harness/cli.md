@@ -4,6 +4,8 @@
 > See `.agents/decisions/harness/cli.md` for the paired decision history (not yet created; pre-split decisions D5, D6, D9, D11, D15, D20, D21, D25, D28, D32, D35 and the guest-test portions of D36, D40 and D41 stay in `.agents/decisions/harness.md`).
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-24 (targeted verification only since the split; latest change: forced PTY with redirected input or output)
 
 ## Responsibilities
 
@@ -42,10 +44,11 @@ benchmarks are `harness`, differential testing `harness/diff`.
   failure, "the inode store already exists" for an existing one); anything after it is ignored.
 - Without `--rootfs` the program is a host file and the guest has no filesystem (dynamically linked
   programs fail to load); with `--rootfs` the path is resolved in the store.
-- A PTY is used by default when fds 0 and 1 are both terminals (then the host terminal goes raw,
-  continuing with a message if it cannot, and `SIGWINCH` resizes the guest console); `--pty`
-  forces one (24×80 unless both are terminals), `--no-pty` gives the guest the host's stdio.
-  Through the PTY, guest stdout and stderr both reach fd 1.
+- A PTY is used by default when stdin and stdout are both terminals. `--pty` forces one and
+  `--no-pty` gives the guest the host's stdio. With a PTY, terminal input goes raw and is
+  restored on exit. A raw-mode error is reported and execution continues. `SIGWINCH` updates
+  the guest's window size from the output terminal, falling back to the input terminal. With
+  neither, it defaults to 24×80. Guest stdout and stderr both reach fd 1.
 - On Android, a recognized interactive shell with a PTY starts the system DNS loader in a
   background thread (joined before exit). Command and script invocations load it on demand. Set
   `APPINE_PRELOAD_ANDROID_DNS=0` to disable preloading.
@@ -117,17 +120,9 @@ benchmarks are `harness`, differential testing `harness/diff`.
   bug-injection and BKL-watchdog cases only run in debug builds.
 - RunOptions/Terminal/RunReport/RunError are kernel API types consumed here, not owned here.
 
-## Confirmed bugs / technical debt
-
-- **A forced PTY on a terminal with piped stdout is half set up.** Raw mode needs both fds to be
-  terminals, so the host keeps ISIG (^C reaches the program as `SIGINT` through `appine-run`, ^Z
-  stops `appine-run` itself), line-buffers input and echoes it while the guest echoes into the
-  pipe; the size stays 24×80.
-
 ## Open questions
 
-- Should `--import` install the stop handlers (SIGINT now ends it by default), and is a forced PTY
-  with only one side a terminal meant to be supported?
+- Should `--import` install the stop handlers (SIGINT now ends it by default)?
 
 ## To verify
 

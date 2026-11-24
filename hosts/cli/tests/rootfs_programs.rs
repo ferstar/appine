@@ -1443,6 +1443,37 @@ fn end_of_piped_input_survives_leaving_canonical_mode() {
 }
 
 #[test]
+fn forced_pty_follows_the_only_host_terminal() {
+    let Some(store) = store() else {
+        return;
+    };
+    // script supplies a host terminal regardless of cargo's stdio.
+    let probe = r#"
+        set -e
+        guest_size() { "$RUN" --pty --rootfs "$STORE" /bin/busybox stty size; }
+        stty rows 37 cols 101
+        saved=$(stty -g)
+        piped=$(guest_size)
+        test "$(stty -g)" = "$saved"
+        printf '%s\n' "$piped"
+        guest_size </dev/null
+    "#;
+    // Keep stdin open. On EOF, script can inject a character that the terminal echoes.
+    let (input, _writer) = std::io::pipe().unwrap();
+    let out = Command::new("script")
+        .args(["-qec", probe, "/dev/null"])
+        .env("SHELL", "/bin/sh")
+        .env("RUN", env!("CARGO_BIN_EXE_appine-run"))
+        .env("STORE", store)
+        .stdin(input)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let sizes: Vec<_> = stdout(&out).lines().map(str::trim_end).collect();
+    assert_eq!(sizes, ["37 101", "37 101"], "{out:?}");
+}
+
+#[test]
 fn interactive_shell_runs_on_a_terminal() {
     let Some(store) = store() else {
         return;

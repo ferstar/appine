@@ -15,7 +15,7 @@ devices	mq_test	18	*	MqTest.OpenInvalidArgs
 devices	open_create_test	16	*	-
 devices	ping_socket_test	6	PingSocket.Receive*	-
 # OverlayLower ACL ctime failed repeated Tier 1 checks (kernel/xattr).
-devices	posix_acl_test	70	*	*.ChmodUpdate/*:*.DefaultACLInheritance/*:*.RemoveACLClearsSGID/*:*.SetACLClearsSGID/*:*.SetACLEmpty/*:All/PosixACLTest.Access*:All/PosixACLTest.CopyUpDirectoryDoesNotInheritDefaultACL/OverlayUpper:All/PosixACLTest.CopyUpDirectoryDoesNotInheritDefaultACL/Tmpfs:All/PosixACLTest.DeviceFileModeUnaffectedByPostCopyUpParentDefaultACL/OverlayUpper:All/PosixACLTest.DeviceFileModeUnaffectedByPostCopyUpParentDefaultACL/Tmpfs:All/PosixACLTest.GetACLThrough*:All/PosixACLTest.NamedUser*:All/PosixACLTest.RemoveACLOn*:All/PosixACLTest.SetACLThrough*:All/PosixACLTest.User*:All/PosixACLTest.SetACLUpdatesCTime/OverlayLower
+devices	posix_acl_test	71	*	*.ChmodUpdate/*:*.DefaultACLInheritance/*:*.RemoveACLClearsSGID/*:*.SetACLClearsSGID/*:*.SetACLEmpty/*:All/PosixACLTest.Access*:All/PosixACLTest.CopyUpDirectoryDoesNotInheritDefaultACL/OverlayUpper:All/PosixACLTest.CopyUpDirectoryDoesNotInheritDefaultACL/Tmpfs:All/PosixACLTest.DeviceFileModeUnaffectedByPostCopyUpParentDefaultACL/OverlayUpper:All/PosixACLTest.DeviceFileModeUnaffectedByPostCopyUpParentDefaultACL/Tmpfs:All/PosixACLTest.GetACLThrough*:All/PosixACLTest.NamedUser*:All/PosixACLTest.RemoveACLOn*:All/PosixACLTest.SetACLThrough*:All/PosixACLTest.User*
 devices	prctl_setuid_test	6	*	-
 devices	priority_test	18	*	SetpriorityTest.OtherUidRequiresCapSysNice
 devices	proc_pid_uid_gid_map_test	8	*	*.IdentityMapOwnID/*:*.MapOtherID/*:*.NonIdentityMapOwnID/*:*.TrailingNewlineAndNULIgnored/*:All/ProcPidUidGidMapTest.*:ProcSelfSetgroupsTest.Setgroups*

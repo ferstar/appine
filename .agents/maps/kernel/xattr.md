@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the split; latest change: overlay lower-file ctime after ACL copy-up)
+> Maintained: 2026-11-24 (targeted verification only since the split; latest change: ACL changes after overlay copy-up)
 
 ## Responsibilities
 
@@ -94,10 +94,6 @@ checks and `FileCaps` (`kernel/cred`); path resolution (`kernel/vfs`); fd lookup
 - **POSIX ACLs are not enforced:** named users, groups and masks are stored but never consulted,
   the mode does not take the mask as its group bits, chmod leaves a stored ACL alone, and new
   files never inherit a default ACL.
-- Setting an extended access ACL on an overlay lower file can leave the observed ctime no later
-  than its original value. The gVisor `SetACLUpdatesCTime/OverlayLower` case waits 10 ms before
-  setxattr. In 40 repetitions the assertion passed 40 times on native arm64 Linux 6.8 and three
-  times on Tier 1. The difftest filter omits this parameter.
 
 ## Open questions
 

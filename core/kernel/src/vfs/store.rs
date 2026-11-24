@@ -136,6 +136,13 @@ pub enum FileTime {
 }
 
 impl FileTime {
+    fn resolve(self, now: i64) -> i64 {
+        match self {
+            FileTime::Now => now,
+            FileTime::At(ns) => ns,
+        }
+    }
+
     /// (seconds, nanoseconds) to hand to the host.
     fn host(self) -> (i64, i64) {
         match self {
@@ -1109,9 +1116,10 @@ impl Store {
                 return Err(Errno::ENOENT);
             }
             s.add_dentry(parent, name, ino)?;
+            let now = s.inode_now(ino)?;
             s.db()
                 .prepare_cached("UPDATE inodes SET nlink = nlink + 1, ctime_ns = ?2 WHERE ino = ?1")
-                .and_then(|mut st| st.execute(params![ino, now_ns()]))
+                .and_then(|mut st| st.execute(params![ino, now]))
                 .map_err(db_err)?;
             s.touch_ino(ino);
             s.object_changed(ino);
@@ -1193,12 +1201,13 @@ impl Store {
     /// Changes the permission bits (keeping the type bits).
     pub fn set_mode(&self, ino: Ino, perm: u32) -> Result<(), Errno> {
         self.statement(|s| {
+            let now = s.inode_now(ino)?;
             let n = s
                 .db()
                 .prepare_cached(
                     "UPDATE inodes SET mode = (mode & ?2) | ?3, ctime_ns = ?4 WHERE ino = ?1",
                 )
-                .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, now_ns()]))
+                .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, now]))
                 .map_err(db_err)?;
             s.touch_ino(ino);
             if n == 0 {
@@ -1298,8 +1307,9 @@ impl Store {
     /// Changes the permission bits, owner and group (keeping the type bits).
     pub fn set_owner_mode(&self, ino: Ino, perm: u32, uid: u32, gid: u32) -> Result<(), Errno> {
         self.statement(|s| {
+            let now = s.inode_now(ino)?;
             s.db().prepare_cached("UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1")
-                .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()]))
+                .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now]))
                 .map_err(db_err)?;
             s.touch_ino(ino);
             s.object_changed(ino);
@@ -1435,9 +1445,10 @@ impl Store {
             .prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
             .and_then(|mut st| st.execute(params![parent, name]))
             .map_err(db_err)?;
+        let now = self.inode_now(ino)?;
         self.db()
             .prepare_cached("UPDATE inodes SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![ino, now_ns()]))
+            .and_then(|mut st| st.execute(params![ino, now]))
             .map_err(db_err)?;
         self.touch_name(parent, name);
         self.touch_ino(ino);
@@ -1623,9 +1634,10 @@ impl Store {
     }
 
     fn touch_ctime(&self, ino: Ino) -> Result<(), Errno> {
+        let now = self.inode_now(ino)?;
         self.db()
             .prepare_cached("UPDATE inodes SET ctime_ns = ?2 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![ino, now_ns()]))
+            .and_then(|mut st| st.execute(params![ino, now]))
             .map_err(db_err)?;
         self.touch_ino(ino);
         self.object_changed(ino);
@@ -1638,9 +1650,8 @@ impl Store {
         self.set_times(ino, None, Some(FileTime::At(mtime_ns)))
     }
 
-    /// Sets the access and modification times (None means unchanged). For regular files the host
-    /// object's times change; the rest record only the modification time, and the access time
-    /// follows it. ctime always becomes now (for regular files, the object's).
+    /// Sets the requested times and updates ctime. Regular files use the filesystem clock
+    /// and keep their times in the database while held. Other inodes report mtime as atime.
     pub fn set_times(
         &self,
         ino: Ino,
@@ -1648,10 +1659,10 @@ impl Store {
         mtime: Option<FileTime>,
     ) -> Result<(), Errno> {
         let (st, data) = self.row(ino)?;
-        if st.kind() == mode::S_IFREG && data.held.is_some() {
-            return self.set_held_times(ino, atime, mtime);
-        }
         if st.kind() == mode::S_IFREG {
+            if data.held.is_some() {
+                return self.set_held_times(ino, atime, mtime);
+            }
             let mut name = [0u8; 21];
             return appine_hal::set_times_at(
                 self.meta.objects_dir.as_raw_fd(),
@@ -1661,20 +1672,7 @@ impl Store {
             )
             .map_err(|e| object_err(ino, e));
         }
-        let now = now_ns();
-        let mtime_ns = mtime.map(|t| match t {
-            FileTime::Now => now,
-            FileTime::At(ns) => ns,
-        });
-        self.statement(|s| {
-            s.db().prepare_cached(
-                "UPDATE inodes SET mtime_ns = coalesce(?2, mtime_ns), ctime_ns = ?3 WHERE ino = ?1",
-            )
-            .and_then(|mut st| st.execute(params![ino, mtime_ns, now]))
-            .map_err(db_err)?;
-            s.touch_ino(ino);
-            Ok(())
-        })
+        self.statement(|s| s.set_row_times(ino, mtime, now_ns()))
     }
 
     /// Sets the access and modification times of regular file `ino` through its open object: also
@@ -1697,6 +1695,25 @@ impl Store {
         .map_err(|e| object_err(ino, e))
     }
 
+    /// A held regular file keeps its timestamps in SQLite across sharing and copy-up. Sample
+    /// the objects directory's ctime so they use the same filesystem clock as the original
+    /// object, without changing any file visible to the guest.
+    fn filesystem_now(&self) -> Result<i64, Errno> {
+        let dir = self.meta.objects_dir.as_raw_fd();
+        let now = Some(appine_hal::TIME_NOW);
+        appine_hal::set_times_at(dir, c".", now, now).map_err(Errno)?;
+        let st = appine_hal::stat_at(dir, c".").map_err(Errno)?;
+        Ok(st.st_ctime * 1_000_000_000 + st.st_ctime_nsec)
+    }
+
+    fn inode_now(&self, ino: Ino) -> Result<i64, Errno> {
+        if self.held(ino)? {
+            self.filesystem_now()
+        } else {
+            Ok(now_ns())
+        }
+    }
+
     /// The times of held regular file `ino` are the database's; ctime becomes now.
     fn set_held_times(
         &self,
@@ -1704,31 +1721,30 @@ impl Store {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> Result<(), Errno> {
-        let now = now_ns();
-        let ns = |t: Option<FileTime>| {
-            t.map(|t| match t {
-                FileTime::Now => now,
-                FileTime::At(ns) => ns,
-            })
-        };
-        let (atime, mtime) = (ns(atime), ns(mtime));
         self.transaction(|s| {
-            s.db()
-                .prepare_cached(
-                    "UPDATE inodes SET mtime_ns = coalesce(?2, mtime_ns), ctime_ns = ?3
-                     WHERE ino = ?1",
-                )
-                .and_then(|mut st| st.execute(params![ino, mtime, now]))
-                .map_err(db_err)?;
+            let now = s.filesystem_now()?;
+            let atime = atime.map(|t| t.resolve(now));
             s.db()
                 .prepare_cached(
                     "UPDATE shared SET atime_ns = coalesce(?2, atime_ns) WHERE ino = ?1",
                 )
                 .and_then(|mut st| st.execute(params![ino, atime]))
                 .map_err(db_err)?;
-            s.touch_ino(ino);
-            Ok(())
+            s.set_row_times(ino, mtime, now)
         })
+    }
+
+    /// Store the inode's ctime and any requested mtime using the caller's clock.
+    fn set_row_times(&self, ino: Ino, mtime: Option<FileTime>, now: i64) -> Result<(), Errno> {
+        let mtime = mtime.map(|t| t.resolve(now));
+        self.db()
+            .prepare_cached(
+                "UPDATE inodes SET mtime_ns = coalesce(?2, mtime_ns), ctime_ns = ?3 WHERE ino = ?1",
+            )
+            .and_then(|mut st| st.execute(params![ino, mtime, now]))
+            .map_err(db_err)?;
+        self.touch_ino(ino);
+        Ok(())
     }
 
     // ---- Transactions and deferred commits ----
@@ -2151,12 +2167,12 @@ impl Store {
                 s.hold(src, sdata.object, (o.atime_ns, o.mtime_ns, o.ctime_ns))?;
             }
             // The destination keeps its access time (Linux's file_modified changes the other two)
+            let now = s.filesystem_now()?;
             let atime = match ddata.held {
                 Some(atime) => atime,
-                None => s.object_stat(ddata.object).map_or(now_ns(), |o| o.atime_ns),
+                None => s.object_stat(ddata.object).map_or(now, |o| o.atime_ns),
             };
             s.drop_object(dst, ddata)?;
-            let now = now_ns();
             s.hold(dst, sdata.object, (atime, now, now))
         })
     }
@@ -3780,6 +3796,7 @@ mod tests {
             .unwrap();
         let (b, _) = s.create_file(ROOT, b"b", 0o600, 0, 0).unwrap();
         let (c, _) = s.create_file(ROOT, b"c", 0o600, 0, 0).unwrap();
+        let source_ctime = s.stat(a).unwrap().ctime_ns;
         s.share(a, b).unwrap();
         s.share(b, c).unwrap();
         s.commit().unwrap();
@@ -3800,6 +3817,9 @@ mod tests {
         let st = s.stat(b).unwrap();
         assert_eq!((st.atime_ns, st.mtime_ns), (5_000_000_000, 6_000_000_000));
         assert_eq!(s.stat(a).unwrap().mtime_ns, 2_000_000_000);
+        s.set_xattr(b, b"user.test", b"value", false, false)
+            .unwrap();
+        assert_eq!(s.stat(a).unwrap().ctime_ns, source_ctime);
         // Reopening the held object for mappings keeps it shared and read-only.
         let held = s.open_mapped_object(b).unwrap();
         assert_eq!(

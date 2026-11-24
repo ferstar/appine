@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: Files app writes and shared mappings after unsharing)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: filesystem timestamps for held regular files)
 
 ## Responsibilities
 
@@ -97,10 +97,10 @@ provider and rootfs installation UI (`android`).
 - Each regular file's data is `objects/<ino>` (mode 0600), or the object `shared` names for it,
   always opened by number relative to an `O_PATH` directory fd, never by path. Directories,
   symlinks, device nodes, FIFOs and sockets exist only in the database.
-- Regular files take size, mtime, atime, ctime and the allocated block count (`Stat::blocks`, so
+- Unshared regular files take size, mtime, atime, ctime and the allocated block count (`Stat::blocks`, so
   holes take no storage) from the host object; a metadata change to a
   regular file chmods the object back to 0600 so the host bumps its ctime (one clock per file); the
-  database ctime column is still written for regular files but never reported. Time changes use
+  database ctime column is reported only while the file is held. Time changes use
   the host's `utimensat` on the object by number, except an empty-path change on a (non-`O_PATH`)
   regular-file fd, which uses `futimens`.
 - Other inodes keep mtime and ctime in the database; their atime is reported equal to mtime.
@@ -116,9 +116,9 @@ provider and rootfs installation UI (`android`).
   object is doomed when no row uses it. Both rows are then held. A deleted source is `ENOENT` (its
   object may already be queued for the reaper). The caller guarantees nothing writes the source's
   object in place and nothing maps the destination.
-- A held file reports its times from the database (set by `set_times`/`set_times_open` there, ctime
-  now), its size and blocks from the shared object; metadata changes do not chmod the object, whose
-  host times belong to no one file.
+- A held file reports its own times from the database and its size and blocks from the shared object.
+  For a current timestamp the store touches the host `objects/` directory and reads its ctime. This
+  keeps regular files on the filesystem clock through copy-up and leaves other sharers' times intact.
 - `unshare(ino, keep)` before a held file changes: when no other row uses its object, the file
   settles in place (the object's atime and mtime set from the database, the row deleted when the
   object is its own number, else its access time cleared) and nothing is returned; otherwise an
