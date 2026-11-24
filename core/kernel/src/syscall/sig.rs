@@ -530,8 +530,7 @@ pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags:
         FileKind::SignalFd(std::rc::Rc::new(crate::cell::RefCell::new(s))),
         oflags::O_RDWR | (flags & oflags::O_NONBLOCK),
     );
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
 

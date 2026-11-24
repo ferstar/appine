@@ -255,8 +255,7 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
     }
     let path = read_path(cx, path)?;
     let file = open_path(cx, dirfd, path, flags, perm)?;
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
 
@@ -345,8 +344,7 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
     let path = read_path(cx, path)?;
     let flags = flags as u32;
     let file = open_path_with(cx, dirfd, path, flags, mode as u32, res)?;
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
 
@@ -438,7 +436,7 @@ fn open_path_with(
                     if flags & oflags::O_DIRECTORY != 0 {
                         return Err(Errno::ENOTDIR);
                     }
-                    cx.fds().free_slot(0)?;
+                    cx.fds().free_slot(0..cx.nofile())?;
                     let ipc = cx.kr().ipc(ns);
                     let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
                     cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
@@ -1273,8 +1271,7 @@ pub(super) fn open_by_handle_at(
     };
     let file = OpenFile::new(kind, flags & kept(flags) | largefile(flags));
     file.borrow_mut().mnt = mnt;
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
 
@@ -1739,7 +1736,7 @@ pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) ->
 
 pub(super) fn dup(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     let file = cx.fds().get(fd)?;
-    cx.fds_mut().install(file, false, 0).map(|fd| fd as u64)
+    cx.install_fd(file, false).map(|fd| fd as u64)
 }
 
 pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult {
@@ -1747,7 +1744,7 @@ pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult
         return Err(Errno::EINVAL);
     }
     let file = cx.fds().get(old)?;
-    let replaced = cx.fds_mut().install_at(new, file, flags != 0);
+    let replaced = cx.fds_mut().install_at(new, file, flags != 0, cx.nofile());
     let fds = cx.t.fds.clone();
     let replaced: Vec<_> = replaced?.into_iter().collect();
     locks::closed(cx.k(), &fds, &replaced);
@@ -1786,10 +1783,10 @@ pub(super) fn pipe2(cx: &mut Cx<'_>, fds: u64, flags: u32) -> SysResult {
     let (r, w) = PipeEnd::pair(pipe_capacity(cx));
     let r = OpenFile::new(FileKind::Pipe(r), oflags::O_RDONLY | status);
     let w = OpenFile::new(FileKind::Pipe(w), oflags::O_WRONLY | status);
-    let rfd = cx.fds_mut().install(r, cloexec, 0)?;
+    let rfd = cx.install_fd(r, cloexec)?;
     // End the borrow of the fd table first: on failure it must be borrowed again to close the
     // read end
-    let installed = cx.fds_mut().install(w, cloexec, 0);
+    let installed = cx.install_fd(w, cloexec);
     let wfd = match installed {
         Ok(fd) => fd,
         Err(e) => {
@@ -1862,8 +1859,7 @@ pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult 
         Some(Rc::from(path)),
     );
     file.borrow_mut().pseudo = true;
-    cx.fds_mut()
-        .install(file, flags & MFD_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & MFD_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
 
@@ -1878,12 +1874,13 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             // A start not below RLIMIT_NOFILE is EINVAL; only having no free slot is EMFILE
+            let limit = cx.nofile();
             let min = usize::try_from(arg as i32)
                 .ok()
-                .filter(|&m| m < cx.fds().limit)
+                .filter(|&m| m < limit)
                 .ok_or(Errno::EINVAL)?;
             cx.fds_mut()
-                .install(file, cmd == F_DUPFD_CLOEXEC, min)
+                .install(file, cmd == F_DUPFD_CLOEXEC, min..limit)
                 .map(|fd| fd as u64)
         }
         F_GETFD => Ok(cx.fds().cloexec(fd)? as u64),

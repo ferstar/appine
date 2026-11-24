@@ -547,7 +547,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         // CLONE_PIDFD: open the new process's pidfd in the parent (without CLONE_FILES the child
         // does not see it)
         let pidfd = if flags & CLONE_PIDFD != 0 {
-            let fd = cx.fds_mut().install(new_pidfd(tid, &group, 0), true, 0)?;
+            let fd = cx.install_fd(new_pidfd(tid, &group, 0), true)?;
             if let Err(e) = put(cx, args.pidfd, fd.to_le_bytes()) {
                 let _ = cx.fds_mut().close(fd);
                 return Err(e);
@@ -1697,7 +1697,7 @@ pub(super) fn pidfd_open(cx: &mut Cx<'_>, pid: i32, flags: u32) -> SysResult {
         return Err(if thread { Errno::EINVAL } else { Errno::ESRCH });
     };
     let file = new_pidfd(pid, &group, flags);
-    cx.fds_mut().install(file, true, 0).map(|fd| fd as u64)
+    cx.install_fd(file, true).map(|fd| fd as u64)
 }
 
 /// A new pidfd referring to thread group `group` (with pid `tgid`).
@@ -1733,7 +1733,7 @@ pub(super) fn pidfd_getfd(cx: &mut Cx<'_>, pidfd: i32, target: i32, flags: u32) 
     let task = cx.kr().tasks.get(&leader).cloned().ok_or(Errno::ESRCH)?;
     let fds = task.res.borrow().fds.clone();
     let remote = fds.borrow().get(target)?;
-    cx.fds_mut().install(remote, true, 0).map(|fd| fd as u64)
+    cx.install_fd(remote, true).map(|fd| fd as u64)
 }
 
 /// kcmp: whether some resource of two threads is the same one. Returns 0 when the same, otherwise

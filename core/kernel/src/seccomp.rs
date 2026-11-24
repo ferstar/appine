@@ -443,7 +443,7 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     // does get_unused_fd_flags first)
     let listener = flags & flag::NEW_LISTENER != 0;
     let fd = if listener {
-        Some(cx.fds().free_slot(0)?)
+        Some(cx.fds().free_slot(0..cx.nofile())?)
     } else {
         None
     };
@@ -545,7 +545,7 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     match fd {
         Some(fd) => {
             let file = OpenFile::new(FileKind::SeccompNotify(Listener(filter)), oflags::O_RDWR);
-            cx.fds_mut().install_at(fd, file, true)?;
+            cx.fds_mut().install_at(fd, file, true, cx.nofile())?;
             Ok(fd as u64)
         }
         None => Ok(0),
@@ -1077,9 +1077,12 @@ fn addfd(cx: &mut Cx<'_>, f: &Filter, arg: u64, size: usize) -> Result<u64, Errn
     let tid = knotif.borrow().tid;
     let task = cx.kr().tasks.get(&tid).cloned().ok_or(Errno::ENOENT)?;
     let fds = task.res.borrow().fds.clone();
+    let limit = cx.kr().groups[&task.tgid].borrow().nofile();
     let cloexec = newfd_flags & oflags::O_CLOEXEC != 0;
     let installed = if flags & ADDFD_FLAG_SETFD != 0 {
-        let replaced = fds.borrow_mut().install_at(newfd as i32, file, cloexec);
+        let replaced = fds
+            .borrow_mut()
+            .install_at(newfd as i32, file, cloexec, limit);
         match replaced {
             Ok(old) => {
                 let old: Vec<_> = old.into_iter().collect();
@@ -1089,7 +1092,7 @@ fn addfd(cx: &mut Cx<'_>, f: &Filter, arg: u64, size: usize) -> Result<u64, Errn
             Err(e) => Err(e),
         }
     } else {
-        fds.borrow_mut().install(file, cloexec, 0)
+        fds.borrow_mut().install(file, cloexec, 0..limit)
     };
     let fd = installed?;
     if flags & ADDFD_FLAG_SEND != 0 {

@@ -579,8 +579,7 @@ pub(super) fn epoll_create1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
         FileKind::Epoll(Rc::new(RefCell::new(Epoll::default()))),
         oflags::O_RDWR,
     );
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
 
@@ -1821,8 +1820,7 @@ pub(super) fn eventfd2(cx: &mut Cx<'_>, initval: u32, flags: u32) -> SysResult {
         FileKind::EventFd(Rc::new(RefCell::new(efd))),
         oflags::O_RDWR | (flags & oflags::O_NONBLOCK),
     );
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
 

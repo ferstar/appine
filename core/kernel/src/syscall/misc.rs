@@ -1241,15 +1241,6 @@ pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u
     }
     if let Some(v) = new {
         group.borrow_mut().rlimits[resource as usize] = v;
-        // The fd table allocates new fds by the soft limit of RLIMIT_NOFILE
-        if resource == RLIMIT_NOFILE {
-            let k = cx.kr();
-            for tid in &group.borrow().threads {
-                if let Some(t) = k.tasks.get(tid) {
-                    t.res.borrow().fds.borrow_mut().limit = v.0 as usize;
-                }
-            }
-        }
     }
     Ok(0)
 }

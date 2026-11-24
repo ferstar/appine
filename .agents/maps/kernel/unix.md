@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 10 confirmed and 2 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: SCM_RIGHTS ownership before enqueue and mount accounting throughout transfer)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: send-time credential stamping and SO_PASSCRED changes during receive)
 
 ## Responsibilities
 
@@ -33,14 +33,14 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 ## Key types
 
 - `UnixSocket` — socket type (`ty`), bound `addr` bytes, `link: Link`, datagram/listener-wait
-  channel `rx: ChannelRef`, `peer_cred: Option<Ucred>`, `passcred`, `rcvtimeo`/`sndtimeo`,
+  channel `rx: ChannelRef`, `peer_cred: Option<Ucred>`, `rcvtimeo`/`sndtimeo`,
   `shut_wr`, `connections` arrival counter, `embryo` flag (unaccepted server end), `net:
   Option<Rc<NetNs>>` (`Some` only for non-initial netns), and recorded generic `SockOpts`
   (`kernel/net`).
 - `Link` — `None`, `Listening { backlog, pending, cred }`, `Stream { rx, tx, peer_addr }`,
   `Dgram { tx: Weak<RefCell<Channel>>, peer_addr }`.
 - `Channel` (`ChannelRef = Rc<RefCell<Channel>>`) — one direction: `packets: VecDeque<Packet>`,
-  `bytes` (capacity `CAPACITY = 212_992`), `eof`, `closed`, `arrivals`/`taken`, `max_qlen`
+  the receiving socket's `passcred`, `bytes` (capacity `CAPACITY = 212_992`), `eof`, `closed`, `arrivals`/`taken`, `max_qlen`
   (datagram queue cap, default `10`), `peer: Option<Weak<RefCell<Channel>>>` (set by
   `set_dgram_link`; `None` unconnected, `Some` connected so `may_receive_from` distinguishes
   unconnected from connected to a dead third socket), and `reset` (one-shot pending `ECONNRESET`).
@@ -138,7 +138,9 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   unknown types -> `EINVAL`. `SCM_RIGHTS`: at most `253` fds total (`EINVAL`/`EBADF`).
   `SCM_CREDENTIALS`: exact length 28; validates `uid_in`/`gid_in` (`EINVAL`), pid/uid/gid match or
   `CAP_SYS_ADMIN` (over `pid_ns.owner`)/`CAP_SETUID`/`CAP_SETGID` (`EPERM`), and live task
-  existence (`ESRCH`). Default when omitted is `cx.scm_cred()` (`tgid`, real uid/gid).
+  existence (`ESRCH`). Explicit credentials are recorded on the packet. Otherwise each enqueue
+  records the sender's tgid and real uid/gid if either endpoint has `SO_PASSCRED` enabled or the
+  receiving connection is awaiting accept. Other packets carry `Ucred::UNSTAMPED`.
 - Send paths (sender's bound `addr` snapshotted at send entry):
   - `SOCK_STREAM`: destination address -> `EISCONN` (connected) or `EOPNOTSUPP` (unconnected);
     peer gone -> `epipe` (`EPIPE` + `SIGPIPE` unless `MSG_NOSIGNAL`) or partial count; loops pushing
@@ -156,11 +158,13 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   - `SOCK_STREAM` (`unix::recv_into`, used by `recvmsg`, `recvfrom`, `read` and `readv`): peeks from
     `Channel` and copies into guest iovecs via `net::scatter_partial` *before* consuming, consuming
     only the copied byte count on partial copy fault (leaving unread bytes intact) or `EFAULT` when
-    nothing was copied; `MSG_WAITALL` loops until full (capped at 1 MiB), files, credential change,
-    reset (left pending when returning partial bytes), EOF or error/timeout.
+    nothing was copied. `MSG_WAITALL` loops until full (capped at 1 MiB), receipt of files,
+    a credential change once the read has taken credentials, reset (left pending on a partial read),
+    EOF or error/timeout. A waiting read can start taking credentials when the option is enabled.
+    Once taken, they delimit the rest of that read even if the option is then disabled.
   - `Channel::read_stream` merges packets in order, taking `from` from the first packet, stopping
-    after a packet with `fds` and before a packet whose `cred` differs (unconditionally, even
-    without `SO_PASSCRED`). Zero-length non-`MSG_PEEK` `recv*` on a non-empty queue returns 0
+    after a packet with `fds`. When the receiver has `SO_PASSCRED` enabled, it also stops before
+    a packet whose `cred` differs. Zero-length non-`MSG_PEEK` `recv*` on a non-empty queue returns 0
     immediately while taking the head packet's `fds` (whereas zero-length `read` short-circuits in
     `net::rw` and zero-length `readv` short-circuits earlier in `fs::vectored`). `MSG_PEEK` clones
     `fds` without consuming or waking writers.
@@ -171,6 +175,7 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 - Ancillary delivery (`deliver` / `put_cmsg`): `SCM_CREDENTIALS` first when `passcred` is set
   (translated via `pid_out`, `uid_out`/`gid_out` with overflow 65534; truncated with `MSG_CTRUNC`
   if buffer is 16..27 B), then `SCM_RIGHTS` reserving as many descriptor numbers as fit.
+  Enabling `SO_PASSCRED` after enqueue reports pid 0 and overflow uid/gid for unstamped packets.
   A NULL control buffer supplies zero room. Buffer and fd limits set `MSG_CTRUNC` and excess
   files are released. Reserved numbers remain unavailable to other threads during a FUSE fill.
   After the control and header copies succeed, recvmsg installs each file with the requested
@@ -271,10 +276,6 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 
 ## Confirmed bugs / technical debt
 
-- **Eager credential stamping and splitting on stream reads:** `read_stream` splits at credential
-  changes even without `SO_PASSCRED`, and every packet stamps sender creds unconditionally, so
-  enabling `SO_PASSCRED` later reveals real creds for earlier messages instead of
-  `(0, 65534, 65534)`.
 - **Smaller Linux divergences:** `SIOCOUTQ` unimplemented (`ENOTTY`); `setsockopt` silently accepts
   read-only `SO_SNDLOWAT`, `SO_ACCEPTCONN` and `SO_PEERCRED` instead of `ENOPROTOOPT`; sender
   addresses are snapshotted at send time rather than receive time; connected datagram sockets are

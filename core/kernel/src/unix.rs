@@ -54,6 +54,13 @@ pub struct Ucred {
 }
 
 impl Ucred {
+    /// No SCM credentials were recorded. Invalid kernel IDs translate to the receiver's overflow IDs.
+    pub(crate) const UNSTAMPED: Self = Self {
+        pid: 0,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
+
     /// The process with pid `pid` (global) and user ID and group ID `uid` and `gid` (kernel IDs:
     /// the effective ones for `SO_PEERCRED`, the real or declared ones for `SCM_CREDENTIALS`).
     pub fn of(pid: i32, uid: u32, gid: u32) -> Ucred {
@@ -105,8 +112,6 @@ pub(crate) struct UnixSocket {
     pub rx: ChannelRef,
     /// The peer's credentials (`SO_PEERCRED`): recorded at socketpair and stream connect.
     pub peer_cred: Option<Ucred>,
-    /// `SO_PASSCRED`: every receive attaches the sender's credentials.
-    pub passcred: bool,
     pub rcvtimeo: Option<Duration>,
     pub sndtimeo: Option<Duration>,
     /// The datagram socket did `SHUT_WR`.
@@ -138,7 +143,6 @@ impl UnixSocket {
             link: Link::None,
             rx,
             peer_cred: None,
-            passcred: false,
             rcvtimeo: None,
             sndtimeo: None,
             shut_wr: false,
@@ -146,6 +150,14 @@ impl UnixSocket {
             embryo: false,
             net: None,
             opts: crate::net::SockOpts::default(),
+        }
+    }
+
+    /// The queue on which peers can see this socket's SO_PASSCRED setting.
+    pub fn receive_queue(&self) -> &ChannelRef {
+        match &self.link {
+            Link::Stream { rx, .. } => rx,
+            _ => &self.rx,
         }
     }
 
@@ -207,6 +219,9 @@ impl UnixSocket {
         cred: Ucred,
     ) -> UnixSocket {
         let (up, down) = (ChannelRef::default(), ChannelRef::default());
+        down.borrow_mut().passcred = self.rx.borrow().passcred;
+        // Linux records credentials for an unaccepted peer. accept installs the listener's setting.
+        up.borrow_mut().passcred = true;
         let mut server = UnixSocket::new(self.ty);
         // As in Linux's unix_stream_connect, the new end is created in the connecting side's
         // network namespace
@@ -490,7 +505,7 @@ pub(crate) struct Packet {
     pub off: usize,
     /// The open files `SCM_RIGHTS` brought.
     pub fds: Vec<FileRef>,
-    /// The sender's credentials.
+    /// The recorded sender credentials, or `Ucred::UNSTAMPED`.
     pub cred: Ucred,
     /// The sender's address (recvfrom of datagrams).
     pub from: Vec<u8>,
@@ -515,6 +530,8 @@ pub(crate) struct Received {
 /// The messages buffered in one direction.
 #[derive(Default)]
 pub(crate) struct Channel {
+    /// The receiving socket's SO_PASSCRED flag, also set while a connection is awaiting accept.
+    pub passcred: bool,
     pub packets: VecDeque<Packet>,
     /// Bytes not yet read.
     pub bytes: usize,
@@ -563,37 +580,23 @@ impl Channel {
     }
 
     /// Stream read: takes up to `max` bytes in order. As on Linux, it stops after a message
-    /// carrying open files is read, and data from different senders is not merged into one read.
-    pub fn read_stream(&mut self, max: usize, peek: bool) -> Received {
+    /// carrying open files is read. With SO_PASSCRED, a change of credentials also ends the read.
+    pub fn read_stream(&mut self, max: usize, peek: bool, passcred: bool) -> Received {
         let mut data = Vec::new();
         let mut fds = Vec::new();
         let mut cred = None;
-        // The sender's address, from the first message read (unix_stream_read_generic)
-        let mut from = None;
+        let from = self
+            .packets
+            .front()
+            .map(|p| p.from.clone())
+            .unwrap_or_default();
         let mut i = 0;
         while let Some(p) = self.packets.get_mut(i) {
-            if from.is_none() {
-                from = Some(p.from.clone());
+            if passcred && cred.is_some_and(|c| c != p.cred) {
+                break;
             }
+            // Even a zero-length receive takes the first packet's files and leaves its data.
             let room = max - data.len();
-            // A read of nothing still takes the first message's files and leaves its data, as
-            // Linux detaches them before looking at the length
-            if max == 0 && i == 0 && cred.is_none() {
-                cred = Some(p.cred);
-                if peek {
-                    fds.extend(p.fds.iter().cloned());
-                } else {
-                    fds.append(&mut p.fds);
-                    if p.remaining() == 0 {
-                        self.packets.pop_front();
-                    }
-                }
-                break;
-            }
-            // A message with only open files and no data is read out even when there is no room
-            if (room == 0 && p.remaining() > 0) || cred.is_some_and(|c| c != p.cred) {
-                break;
-            }
             cred = Some(p.cred);
             let n = room.min(p.remaining());
             data.extend_from_slice(&p.data[p.off..p.off + n]);
@@ -623,8 +626,8 @@ impl Channel {
             len: data.len(),
             data,
             fds,
-            cred: cred.unwrap_or_default(),
-            from: from.unwrap_or_default(),
+            cred: cred.unwrap_or(Ucred::UNSTAMPED),
+            from,
         }
     }
 
@@ -1141,19 +1144,19 @@ mod tests {
         c.push(packet(b"gh", 2));
         assert_eq!(c.bytes, 8);
 
-        let peek = c.read_stream(100, true);
+        let peek = c.read_stream(100, true, true);
         assert_eq!(peek.data, b"abcd");
         assert_eq!(peek.fds.len(), 1);
         assert_eq!(c.bytes, 8);
 
-        let r = c.read_stream(3, false);
+        let r = c.read_stream(3, false, true);
         assert_eq!((r.data.as_slice(), r.fds.len()), (&b"abc"[..], 1));
         // The rest of a message with open files is read as usual, but the open files are
         // delivered only once
-        let r = c.read_stream(100, false);
+        let r = c.read_stream(100, false, true);
         assert_eq!((r.data.as_slice(), r.fds.len()), (&b"def"[..], 0));
-        // Data from different senders is not merged
-        let r = c.read_stream(100, false);
+        // SO_PASSCRED leaves the second sender for the next read
+        let r = c.read_stream(100, false, true);
         assert_eq!((r.data.as_slice(), r.cred.pid), (&b"gh"[..], 2));
         assert_eq!(c.bytes, 0);
     }
@@ -1186,7 +1189,7 @@ mod tests {
             POLLIN | POLLHUP | POLLRDHUP | POLLOUT
         );
         if let Link::Stream { rx, tx, .. } = &b.link {
-            assert_eq!(rx.borrow_mut().read_stream(10, false).data, b"bye");
+            assert_eq!(rx.borrow_mut().read_stream(10, false, false).data, b"bye");
             assert!(tx.borrow().closed);
         }
     }

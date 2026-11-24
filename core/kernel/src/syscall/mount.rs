@@ -1044,7 +1044,7 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
     };
     file.borrow_mut().pin_fuse_path(&vfs)?;
     let cloexec = flags & OPEN_TREE_CLOEXEC != 0;
-    Ok(cx.fds_mut().install(file, cloexec, 0)? as u64)
+    Ok(cx.install_fd(file, cloexec)? as u64)
 }
 
 /// move_mount(2) (Linux 6.1): needs `CAP_SYS_ADMIN`; source and target are each resolved from a

@@ -762,7 +762,7 @@ pub(super) fn accept4(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, flags: 
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
     }
-    let newfd = cx.fds_mut().reserve(0)?;
+    let newfd = cx.fds_mut().reserve(0..cx.nofile())?;
     let accepted = (|| {
         let (_file, sock, nonblock) = socket_of(cx, fd)?;
         let (new, peer) = if is_unix(&sock) {
@@ -5251,7 +5251,7 @@ fn net_of(cx: &Cx<'_>, s: &InetSocket) -> Rc<crate::nsproxy::NetNs> {
 /// Puts a socket into the fd table; `flags` may include `SOCK_NONBLOCK`, `SOCK_CLOEXEC`.
 fn install(cx: &mut Cx<'_>, sock: SocketRef, flags: u32) -> Result<i32, Errno> {
     let file = socket_file(sock, flags);
-    cx.fds_mut().install(file, flags & SOCK_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & SOCK_CLOEXEC != 0)
 }
 
 /// The open file of a socket; `flags` may include `SOCK_NONBLOCK`.

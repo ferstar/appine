@@ -457,6 +457,11 @@ pub(crate) struct ThreadGroup {
 }
 
 impl ThreadGroup {
+    /// Exclusive upper bound for new descriptors installed in this process.
+    pub fn nofile(&self) -> usize {
+        self.rlimits[RLIMIT_NOFILE as usize].0 as usize
+    }
+
     pub fn new(tgid: Tid, ppid: Tid, sighand: Rc<RefCell<SigHandlers>>) -> ThreadGroup {
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         ThreadGroup {

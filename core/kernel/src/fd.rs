@@ -5,6 +5,7 @@
 //! and fd tables are accessed only while holding the BKL ([`crate::kernel`]).
 
 use std::fs::File;
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -736,14 +737,13 @@ struct Slot {
 }
 
 /// A process's fd table.
+#[derive(Default)]
 pub struct FdTable {
     slots: Vec<Option<Slot>>,
     /// fds taken by [`reserve`](Self::reserve) for a file not made yet (Linux's
     /// `get_unused_fd_flags`: an open_fds bit with no file): new fds skip them, dup2 onto one is
     /// EBUSY, and every other call sees them closed.
     reserved: Vec<usize>,
-    /// New fds must be below this (the soft limit of `RLIMIT_NOFILE`, synced from prlimit).
-    pub limit: usize,
     /// Has taken POSIX record locks (the locks belong to the fd table, see `crate::locks`).
     pub holds_locks: bool,
 }
@@ -770,31 +770,40 @@ impl FdTable {
             (1, oflags::O_WRONLY | oflags::O_LARGEFILE),
             (2, oflags::O_WRONLY | oflags::O_LARGEFILE),
         ] {
-            t.install(OpenFile::new(FileKind::Host(fd), flags), false, 0)
-                .unwrap();
+            t.install(
+                OpenFile::new(FileKind::Host(fd), flags),
+                false,
+                0..DEFAULT_NOFILE.0,
+            )
+            .unwrap();
         }
         t
     }
 
-    /// Installs at the lowest free fd not below `min`.
-    pub fn install(&mut self, file: FileRef, cloexec: bool, min: usize) -> Result<i32, Errno> {
-        let fd = self.free_slot(min)?;
-        self.install_at(fd, file, cloexec)?;
+    /// Installs at the lowest free fd in the allocating process's range.
+    pub fn install(
+        &mut self,
+        file: FileRef,
+        cloexec: bool,
+        range: Range<usize>,
+    ) -> Result<i32, Errno> {
+        let fd = self.free_slot(range)?;
+        self.replace_slot(fd as usize, Slot { file, cloexec });
         Ok(fd)
     }
 
-    /// The lowest free fd not below `min`.
-    pub fn free_slot(&self, min: usize) -> Result<i32, Errno> {
-        (min..self.limit)
+    /// The lowest free fd in the requested range.
+    pub fn free_slot(&self, mut range: Range<usize>) -> Result<i32, Errno> {
+        range
             .find(|&i| self.slots.get(i).is_none_or(Option::is_none) && !self.reserved.contains(&i))
             .map(|i| i as i32)
             .ok_or(Errno::EMFILE)
     }
 
-    /// Takes the lowest free fd not below `min` for a file to be made later (accept4 before it
+    /// Takes the lowest free fd in `range` for a file to be made later (accept4 before it
     /// waits), until [`fill`](Self::fill) or [`unreserve`](Self::unreserve).
-    pub fn reserve(&mut self, min: usize) -> Result<i32, Errno> {
-        let fd = self.free_slot(min)?;
+    pub fn reserve(&mut self, range: Range<usize>) -> Result<i32, Errno> {
+        let fd = self.free_slot(range)?;
         if self.slots.len() <= fd as usize {
             self.slots.resize(fd as usize + 1, None);
         }
@@ -821,20 +830,25 @@ impl FdTable {
         fd: i32,
         file: FileRef,
         cloexec: bool,
+        limit: usize,
     ) -> Result<Option<FileRef>, Errno> {
         let i = usize::try_from(fd)
             .ok()
-            .filter(|&i| i < self.limit)
+            .filter(|&i| i < limit)
             .ok_or(Errno::EBADF)?;
         // An fd reserved for a file still being made (do_dup2)
         if self.reserved.contains(&i) {
             return Err(Errno::EBUSY);
         }
+        Ok(self.replace_slot(i, Slot { file, cloexec }))
+    }
+
+    /// Both allocation and dup3 have already checked the slot against the caller's limit and reservations.
+    fn replace_slot(&mut self, i: usize, slot: Slot) -> Option<FileRef> {
         if self.slots.len() <= i {
             self.slots.resize(i + 1, None);
         }
-        let old = self.slots[i].replace(Slot { file, cloexec });
-        Ok(old.map(|s| s.file))
+        self.slots[i].replace(slot).map(|old| old.file)
     }
 
     /// Gets the open file for an fd.
@@ -922,7 +936,6 @@ impl FdTable {
         Self {
             slots: self.slots[..len].to_vec(),
             reserved: Vec::new(),
-            limit: self.limit,
             holds_locks: false,
         }
     }
@@ -957,17 +970,6 @@ impl FdTable {
     }
 }
 
-impl Default for FdTable {
-    fn default() -> Self {
-        FdTable {
-            slots: Vec::new(),
-            reserved: Vec::new(),
-            limit: DEFAULT_NOFILE.0,
-            holds_locks: false,
-        }
-    }
-}
-
 impl Clone for FdTable {
     /// fork, clone without `CLONE_FILES`, unshare: POSIX locks belong to the original fd table
     /// and are not copied with it, nor are reserved fds (dup_fd clears their bits).
@@ -995,22 +997,22 @@ mod tests {
     fn allocates_lowest_free_fd() {
         let mut t = FdTable::with_host_stdio();
         let f = OpenFile::new(FileKind::Host(1), oflags::O_WRONLY);
-        assert_eq!(t.install(f.clone(), false, 0), Ok(3));
+        assert_eq!(t.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(3));
         t.close(1).unwrap();
-        assert_eq!(t.install(f.clone(), true, 0), Ok(1));
+        assert_eq!(t.install(f.clone(), true, 0..DEFAULT_NOFILE.0), Ok(1));
         assert_eq!(t.cloexec(1), Ok(true));
-        assert_eq!(t.install(f.clone(), false, 10), Ok(10));
+        assert_eq!(t.install(f.clone(), false, 10..DEFAULT_NOFILE.0), Ok(10));
         assert_eq!(t.close(7).err(), Some(Errno::EBADF));
         assert_eq!(t.get(-1).err(), Some(Errno::EBADF));
         // New fds cannot exceed RLIMIT_NOFILE
-        t.limit = 11;
+        let limit = 11;
         for fd in [4, 5, 6, 7, 8, 9] {
-            assert_eq!(t.install(f.clone(), false, 0), Ok(fd));
+            assert_eq!(t.install(f.clone(), false, 0..limit), Ok(fd));
         }
-        assert_eq!(t.install(f.clone(), false, 0), Err(Errno::EMFILE));
+        assert_eq!(t.install(f.clone(), false, 0..limit), Err(Errno::EMFILE));
         // A starting point beyond the limit also means no free slot (the caller checks F_DUPFD's
         // EINVAL)
-        assert_eq!(t.install(f.clone(), false, 11), Err(Errno::EMFILE));
+        assert_eq!(t.install(f.clone(), false, 11..limit), Err(Errno::EMFILE));
         // fds created by dup share one open file
         f.borrow_mut().pos = 5;
         assert_eq!(t.get(10).unwrap().borrow().pos, 5);
@@ -1020,11 +1022,13 @@ mod tests {
     fn table_capacity_after_copy() {
         let mut parent = FdTable::with_host_stdio();
         let file = parent.get(1).unwrap();
-        parent.install_at(100, file.clone(), false).unwrap();
-        parent.reserve(200).unwrap();
+        parent
+            .install_at(100, file.clone(), false, DEFAULT_NOFILE.0)
+            .unwrap();
+        parent.reserve(200..DEFAULT_NOFILE.0).unwrap();
         let child = parent.clone();
         assert_eq!(child.capacity(), 256);
-        assert_eq!(child.free_slot(200), Ok(200));
+        assert_eq!(child.free_slot(200..DEFAULT_NOFILE.0), Ok(200));
         parent.unreserve(200);
         assert_eq!(parent.capacity(), 256);
         assert_eq!(parent.clone().capacity(), 128);
@@ -1046,18 +1050,21 @@ mod tests {
     fn reserved_fds() {
         let mut t = FdTable::with_host_stdio();
         let f = OpenFile::new(FileKind::Host(1), oflags::O_WRONLY);
-        assert_eq!(t.reserve(0), Ok(3));
-        assert_eq!(t.install(f.clone(), false, 0), Ok(4));
+        assert_eq!(t.reserve(0..DEFAULT_NOFILE.0), Ok(3));
+        assert_eq!(t.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(4));
         assert_eq!(t.get(3).err(), Some(Errno::EBADF));
         assert_eq!(t.close(3).err(), Some(Errno::EBADF));
-        assert_eq!(t.install_at(3, f.clone(), false).err(), Some(Errno::EBUSY));
+        assert_eq!(
+            t.install_at(3, f.clone(), false, DEFAULT_NOFILE.0).err(),
+            Some(Errno::EBUSY)
+        );
         assert_eq!(t.open_fds(), [0, 1, 2, 4]);
         let mut child = t.clone();
-        assert_eq!(child.install(f.clone(), false, 0), Ok(3));
+        assert_eq!(child.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(3));
         t.fill(3, f.clone(), true);
         assert_eq!(t.cloexec(3), Ok(true));
-        assert_eq!(t.reserve(0), Ok(5));
+        assert_eq!(t.reserve(0..DEFAULT_NOFILE.0), Ok(5));
         t.unreserve(5);
-        assert_eq!(t.install(f.clone(), false, 0), Ok(5));
+        assert_eq!(t.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(5));
     }
 }

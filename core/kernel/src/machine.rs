@@ -351,7 +351,9 @@ impl Machine {
                 group.ctty = Some(tty);
                 let mut table = FdTable::new();
                 for fd in 0..3 {
-                    table.install_at(fd, slave.clone(), false).unwrap();
+                    table
+                        .install_at(fd, slave.clone(), false, group.nofile())
+                        .unwrap();
                 }
                 table
             }

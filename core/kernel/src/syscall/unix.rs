@@ -213,11 +213,11 @@ pub(super) fn accept(
             _ => Err(Errno::EINVAL),
         })?;
         if let Some(new) = new {
-            with(&new, |u| u.embryo = false);
-            // The listener's SO_PASSCRED carries over (unix_sock_inherit_flags)
-            if with(sock, |u| u.passcred) {
-                with(&new, |u| u.passcred = true);
-            }
+            let passcred = with(sock, |u| u.receive_queue().borrow().passcred);
+            with(&new, |u| {
+                u.embryo = false;
+                u.receive_queue().borrow_mut().passcred = passcred;
+            });
             // Connects waiting for room in the backlog can go on now
             request_wake_object(wake::of(&queue));
             let peer = with(&new, |u| u.peer_name()).unwrap_or_else(unnamed);
@@ -324,13 +324,10 @@ pub(super) fn send(
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let (files, declared) = rights(cx, control)?;
     let mut files = SendingRights::track(cx.k(), files);
-    // Without a declaration it is the sender itself (Linux's maybe_add_creds uses the real user ID
-    // and group ID)
-    let cred = declared.unwrap_or_else(|| cx.scm_cred());
     let (ty, timeout, from) = with(sock, |u| (u.ty, u.sndtimeo, u.addr.clone()));
     let deadline = deadline(timeout);
     if ty == SOCK_DGRAM {
-        return send_dgram(cx, sock, nonblock, deadline, data, addr, files, cred);
+        return send_dgram(cx, sock, nonblock, deadline, data, addr, files, declared);
     }
     // A stream socket takes no destination (unix_stream_sendmsg); seqpacket ignores it
     if ty == SOCK_STREAM && !addr.is_empty() {
@@ -343,8 +340,8 @@ pub(super) fn send(
     }
     let mut done = 0;
     loop {
-        let tx = with(sock, |u| match &u.link {
-            Link::Stream { tx, .. } => Ok(tx.clone()),
+        let (tx, passcred) = with(sock, |u| match &u.link {
+            Link::Stream { rx, tx, .. } => Ok((tx.clone(), rx.borrow().passcred)),
             _ => Err(Errno::ENOTCONN),
         })?;
         {
@@ -357,6 +354,7 @@ pub(super) fn send(
                     Err(epipe(cx, flags))
                 };
             }
+            let cred = packet_cred(cx, declared, passcred || c.passcred);
             if ty == SOCK_SEQPACKET {
                 if data.len() > CAPACITY {
                     return Err(Errno::EMSGSIZE);
@@ -472,7 +470,7 @@ fn send_dgram(
     data: &[u8],
     addr: &[u8],
     files: Option<Rc<SendingRights>>,
-    cred: Ucred,
+    declared: Option<Ucred>,
 ) -> Result<usize, Errno> {
     let (own_rx, from, connected, shut_wr) = with(sock, |u| {
         let connected = match &u.link {
@@ -526,6 +524,8 @@ fn send_dgram(
         return Err(Errno::EMSGSIZE);
     }
     loop {
+        // A datagram socket may be sending to itself.
+        let passcred = with(sock, |u| u.rx.borrow().passcred);
         {
             let mut c = rx.borrow_mut();
             if c.closed {
@@ -542,12 +542,20 @@ fn send_dgram(
             // Room for the bytes, and unless the receiver is connected back to this socket, for
             // one more datagram (unix_dgram_sendmsg's unix_recvq_full wait)
             if c.space() >= data.len() && !c.holds_back(&own_rx) {
+                let cred = packet_cred(cx, declared, passcred || c.passcred);
                 c.push(packet(cx.k(), &rx, data, files, cred, from));
                 return Ok(data.len());
             }
         }
         block(cx, nonblock, deadline, &rx)?;
     }
+}
+
+/// Record explicit credentials, or the sender's real IDs when either endpoint requests them.
+fn packet_cred(cx: &Cx<'_>, declared: Option<Ucred>, passcred: bool) -> Ucred {
+    declared
+        .or_else(|| passcred.then(|| cx.scm_cred()))
+        .unwrap_or(Ucred::UNSTAMPED)
 }
 
 fn packet(
@@ -610,13 +618,13 @@ fn recv_inner(
 ) -> Result<(usize, Message), Errno> {
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let peek = flags & MSG_PEEK != 0;
-    let (ty, timeout, passcred) = with(sock, |u| (u.ty, u.rcvtimeo, u.passcred));
+    let (ty, timeout) = with(sock, |u| (u.ty, u.rcvtimeo));
     let deadline = deadline(timeout);
     if ty == SOCK_STREAM {
         recv_stream(
             cx,
             sock,
-            (nonblock, peek, passcred, deadline),
+            (nonblock, peek, deadline),
             max,
             iovecs,
             control_len,
@@ -626,7 +634,7 @@ fn recv_inner(
         recv_packet(
             cx,
             sock,
-            (ty, nonblock, peek, passcred, deadline),
+            (ty, nonblock, peek, deadline),
             max,
             iovecs,
             control_len,
@@ -647,42 +655,44 @@ fn empty_message() -> Message {
 
 fn rx_channel(sock: &SocketRef) -> Result<ChannelRef, Errno> {
     with(sock, |u| match &u.link {
-        Link::Stream { rx, .. } => Ok(rx.clone()),
         Link::Listening { .. } => Err(Errno::EINVAL),
         Link::None if u.ty != SOCK_DGRAM => Err(Errno::ENOTCONN),
-        _ => Ok(u.rx.clone()),
+        _ => Ok(u.receive_queue().clone()),
     })
 }
 
 fn recv_stream(
     cx: &mut Cx<'_>,
     sock: &SocketRef,
-    (nonblock, peek, passcred, deadline): (bool, bool, bool, Option<Instant>),
+    (nonblock, peek, deadline): (bool, bool, Option<Instant>),
     max: usize,
     iovecs: Option<&[(u64, usize)]>,
     control_len: usize,
     flags: u32,
 ) -> Result<(usize, Message), Errno> {
     let wait_all = flags & MSG_WAITALL != 0 && !peek;
-    // The part already read under MSG_WAITALL (and total bytes copied so far)
+    // Bytes and ancillary data already read under MSG_WAITALL.
     let mut part: Option<Received> = None;
-    let mut copied = 0usize;
-    let finish = |cx: &mut Cx<'_>, r: Received, copied: usize| {
-        Ok((copied, deliver(cx, r, false, passcred, control_len)))
+    // Once this read takes credentials, their boundary survives a wait and any later option change.
+    let mut checked_cred = None;
+    let rx = rx_channel(sock)?;
+    let finish = |cx: &mut Cx<'_>, r: Received| {
+        let passcred = rx.borrow().passcred;
+        Ok((r.len, deliver(cx, r, false, passcred, control_len)))
     };
     loop {
-        let rx = rx_channel(sock)?;
+        let passcred = checked_cred.is_some() || rx.borrow().passcred;
+        let copied = part.as_ref().map_or(0, |r| r.len);
         let room = max - copied;
         let (preview, cred_break, eof, reset) = {
             let mut c = rx.borrow_mut();
             let queued = !c.packets.is_empty();
-            let cred_break = part
-                .as_ref()
-                .is_some_and(|p| c.packets.front().is_some_and(|h| h.cred != p.cred));
+            let cred_break =
+                checked_cred.is_some_and(|cred| c.packets.front().is_some_and(|h| h.cred != cred));
             let preview = if cred_break {
                 None
             } else {
-                Some(c.read_stream(room, true))
+                Some(c.read_stream(room, true, passcred))
                     .filter(|r| !r.data.is_empty() || !r.fds.is_empty() || (room == 0 && queued))
             };
             // Keep a pending ECONNRESET intact when returning partial MSG_WAITALL data so the
@@ -697,74 +707,68 @@ fn recv_stream(
             (preview, cred_break, c.eof, reset)
         };
         if cred_break {
-            return finish(cx, part.take().unwrap(), copied);
+            return finish(cx, part.unwrap());
         }
-        if let Some(mut pre) = preview {
-            let (mut taken, short_fault) = if let Some(vecs) = iovecs {
+        if let Some(pre) = preview {
+            let n = if let Some(vecs) = iovecs {
                 match super::net::scatter_partial(cx, vecs, copied, &pre.data) {
-                    Ok(wrote) => {
-                        let short = wrote < pre.data.len();
-                        let mut r = if peek {
-                            pre.data.truncate(wrote);
-                            pre.len = wrote;
-                            pre
-                        } else {
-                            drop(pre);
-                            let take_max = if short { wrote } else { room };
-                            rx.borrow_mut().read_stream(take_max, false)
-                        };
-                        copied += r.data.len();
-                        r.data.clear();
-                        (r, short)
-                    }
+                    Ok(n) => n,
                     Err(e) => {
-                        return match part.take() {
-                            Some(r) => finish(cx, r, copied),
+                        return match part {
+                            Some(r) => finish(cx, r),
                             None => Err(e),
                         };
                     }
                 }
             } else {
-                let r = if peek {
-                    pre
-                } else {
-                    drop(pre);
-                    rx.borrow_mut().read_stream(room, false)
-                };
-                copied += r.data.len();
-                (r, false)
+                pre.len
             };
-            taken.len = copied;
-            let r = match part.take() {
+            let short_fault = n < pre.len;
+            let mut taken = if peek {
+                pre
+            } else {
+                drop(pre);
+                let take_max = if short_fault { n } else { room };
+                rx.borrow_mut().read_stream(take_max, false, passcred)
+            };
+            if iovecs.is_some() {
+                taken.data.clear();
+            }
+            taken.len = copied + n;
+            if passcred {
+                checked_cred = Some(taken.cred);
+            }
+            let mut r = match part.take() {
                 Some(mut p) => {
                     p.data.extend_from_slice(&taken.data);
-                    p.len = copied;
+                    p.len = taken.len;
                     p.fds.extend(taken.fds);
                     p
                 }
                 None => taken,
             };
-            if short_fault || !wait_all || copied >= max || !r.fds.is_empty() {
-                return finish(cx, r, copied);
+            r.cred = checked_cred.unwrap_or(Ucred::UNSTAMPED);
+            if short_fault || !wait_all || r.len >= max || !r.fds.is_empty() {
+                return finish(cx, r);
             }
             part = Some(r);
             continue;
         }
         if reset {
             return match part.take() {
-                Some(r) => finish(cx, r, copied),
+                Some(r) => finish(cx, r),
                 None => Err(Errno::ECONNRESET),
             };
         }
         if eof {
             return match part.take() {
-                Some(r) => finish(cx, r, copied),
+                Some(r) => finish(cx, r),
                 None => Ok((0, empty_message())),
             };
         }
         if let Err(e) = block(cx, nonblock, deadline, &rx) {
             return match part.take() {
-                Some(r) => finish(cx, r, copied),
+                Some(r) => finish(cx, r),
                 None => Err(e),
             };
         }
@@ -774,7 +778,7 @@ fn recv_stream(
 fn recv_packet(
     cx: &mut Cx<'_>,
     sock: &SocketRef,
-    (ty, nonblock, peek, passcred, deadline): (i32, bool, bool, bool, Option<Instant>),
+    (ty, nonblock, peek, deadline): (i32, bool, bool, Option<Instant>),
     max: usize,
     iovecs: Option<&[(u64, usize)]>,
     control_len: usize,
@@ -820,6 +824,7 @@ fn recv_packet(
             if iovecs.is_some() {
                 r.data.clear();
             }
+            let passcred = rx.borrow().passcred;
             return Ok((n, deliver(cx, r, truncated, passcred, control_len)));
         }
         if reset {
@@ -873,7 +878,7 @@ fn deliver(
         let mut files = r.fds.into_iter();
         let mut dropped = Vec::new();
         for file in files.by_ref().take(fit) {
-            let Ok(fd) = cx.fds_mut().reserve(0) else {
+            let Ok(fd) = cx.fds_mut().reserve(0..cx.nofile()) else {
                 dropped.push(file);
                 break;
             };
@@ -922,7 +927,9 @@ pub(super) fn setsockopt(
         return Err(Errno::EOPNOTSUPP);
     }
     match name {
-        SO_PASSCRED => u.passcred = value.get(..4).ok_or(Errno::EINVAL)? != [0; 4],
+        SO_PASSCRED => {
+            u.receive_queue().borrow_mut().passcred = value.get(..4).ok_or(Errno::EINVAL)? != [0; 4]
+        }
         SO_RCVTIMEO => u.rcvtimeo = timeval(value)?,
         SO_SNDTIMEO => u.sndtimeo = timeval(value)?,
         // Buffer sizes, lingering and the like are only recorded; other options are accepted
@@ -958,7 +965,7 @@ pub(super) fn getsockopt(
             _ => int(0),
         },
         SO_DOMAIN => int(AF_UNIX),
-        SO_PASSCRED => int(u.passcred as i32),
+        SO_PASSCRED => int(u.receive_queue().borrow().passcred as i32),
         SO_ACCEPTCONN => int(matches!(u.link, Link::Listening { .. }) as i32),
         SO_RCVTIMEO => encode_timeval(u.rcvtimeo),
         SO_SNDTIMEO => encode_timeval(u.sndtimeo),

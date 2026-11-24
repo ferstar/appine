@@ -278,8 +278,7 @@ pub(super) fn inotify_init1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
         FileKind::Inotify(Rc::new(RefCell::new(inotify))),
         oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
     );
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
 

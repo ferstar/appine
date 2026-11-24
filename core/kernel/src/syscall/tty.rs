@@ -171,9 +171,7 @@ pub(crate) fn open_peer(
         flags & keep | oflags::O_LARGEFILE,
         path.map(Rc::from),
     );
-    Ok(cx
-        .fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)? as u64)
+    Ok(cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)? as u64)
 }
 
 /// Opens `/dev/tty`: the caller's controlling terminal.

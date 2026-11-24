@@ -339,7 +339,7 @@ fn prog_get_fd_by_id(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
 /// New fds are all close-on-exec (`bpf_prog_new_fd`).
 fn install(cx: &mut Cx<'_>, prog: Rc<Prog>) -> SysResult {
     let file = OpenFile::new(FileKind::Bpf(prog), oflags::O_RDWR);
-    Ok(cx.fds_mut().install(file, true, 0)? as u64)
+    Ok(cx.install_fd(file, true)? as u64)
 }
 
 /// BPF_OBJ_GET_INFO_BY_FD (`bpf_prog_get_info_by_fd`): first reads the guest's `bpf_prog_info`

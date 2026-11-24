@@ -193,7 +193,7 @@ fn submit(cx: &mut Cx<'_>, file: &RenderFile, arg: u64, size: usize) -> SysResul
     let fence = cx.unlocked(|| ctx.submit(ring, &command, flags & 2 != 0, buffers))?;
     if let Some(fence) = fence {
         let f = OpenFile::new(FileKind::GpuFence(fence), oflags::O_RDONLY);
-        let fd = cx.fds_mut().install(f, true, 0)?;
+        let fd = cx.install_fd(f, true)?;
         if let Err(e) = put(
             cx,
             arg.checked_add(28).ok_or(Errno::EFAULT)?,

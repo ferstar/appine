@@ -541,7 +541,7 @@ pub(super) fn ioctl(
         crate::fd::oflags::O_RDONLY,
         Some(Rc::from(name.into_bytes())),
     );
-    cx.fds_mut().install(file, true, 0).map(|fd| fd as u64)
+    cx.install_fd(file, true).map(|fd| fd as u64)
 }
 
 /// The owner of namespace `ns`, which must be the caller's user namespace or below it (Linux's

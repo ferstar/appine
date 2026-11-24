@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE node lifetime across O_PATH descriptor transfers)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-process descriptor limits on shared fd tables)
 
 ## Responsibilities
 
@@ -36,8 +36,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 
 ## Key types
 
-- `FdTable` — slots (`FileRef` and `cloexec`), reserved fds, the limit (1024 by default; the soft
-  `RLIMIT_NOFILE`), `holds_locks`.
+- `FdTable` — slots (`FileRef` and `cloexec`), reserved fds and `holds_locks`.
 - `OpenFile` (`FileRef = Rc<RefCell<OpenFile>>`) — kind, mode and status flags, position and
   `pos_busy` (0 free, 1 taken, 2 with waiters; used by `kernel/fileio`), display path, dentry,
   mount (the root mount unless
@@ -74,19 +73,19 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 
 ### fd tables and open files
 
-- Allocation takes the lowest slot at or above the minimum that is neither used nor reserved, below
-  the table's limit (`EMFILE`; `F_DUPFD` with min negative or at or over the limit `EINVAL`; dup3
-  targets at or over it `EBADF`). getrlimit, setrlimit and prlimit share one path, which refuses an
-  `RLIMIT_NOFILE` hard limit over `nr_open` (`EPERM`) and sets the soft limit on the tables of all
-  the target's threads, so it changes for every process sharing one (Linux checks each process's
-  own rlimit). accept4 reserves an fd before waiting, and AF_UNIX recvmsg reserves the fd numbers
-  encoded in `SCM_RIGHTS` until output is written. `fill` or `unreserve` ends the reservation: new fds skip a reserved one, dup3 onto
-  it (and seccomp's `SECCOMP_ADDFD_FLAG_SETFD`) is `EBUSY`, everything else sees it closed, and
+- Allocation searches from the requested minimum up to the receiving process's soft
+  `RLIMIT_NOFILE`, returning `EMFILE` if no slot is free. An invalid `F_DUPFD` minimum gives
+  `EINVAL` and a dup3 target at or above the limit gives `EBADF`. prlimit sets the target thread
+  group's limits and refuses a hard limit over `nr_open` (`EPERM`). Processes sharing a table
+  through `CLONE_FILES` can have different limits. accept4 reserves an fd before waiting.
+  AF_UNIX recvmsg reserves the numbers encoded in `SCM_RIGHTS` until output is written.
+  New fds skip a reserved slot until `fill` or `unreserve` ends the reservation. While reserved,
+  dup3 and seccomp's `SECCOMP_ADDFD_FLAG_SETFD` report `EBUSY`, other lookups see it closed and
   fork does not copy it. Installing or reserving a descriptor grows the table's logical capacity
   (at least 64, rounded up to a power of two). Closing or cancelling a reservation retains this
   capacity for `pselect6`. arm64 has no dup2.
 - dup and fork share one `OpenFile` (offset and status flags shared). Clone without `CLONE_FILES`
-  sizes the copy from the highest open or reserved fd, copies open slots and the limit, and resets
+  sizes the copy from the highest open or reserved fd, copies open slots, and resets
   `holds_locks`. Every thread holds two references to its
   table: `unshare(CLONE_FILES)`, execve (after the other threads are gone) and
   `CLOSE_RANGE_UNSHARE` copy only when there are more; a copy is a new owner of POSIX locks, so an
@@ -288,7 +287,6 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
     comes first; overlay opens already do);
   - open_by_handle_at and memfds report no `IN_OPEN`, and cgroup2 files no `IN_CLOSE_*`; handles
     open a store inode through any store mount;
-  - `RLIMIT_NOFILE` from prlimit applies to the whole shared fd table;
   - table growth uses power-of-two capacity even when a lowered `nr_open` would cap Linux’s allocation;
   - FIONREAD on a FUSE regular file is `ENOTTY`.
 

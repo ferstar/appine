@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE range invalidation, private copies and byte-range writeback)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE inode notifications and mapped-page invalidation)
 
 ## Responsibilities
 
@@ -166,7 +166,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 - A `Fill` VMA keeps `file_len` 0, so `map_pages` and every other path sizing by `file_len`
   (mprotect, mremap, fork, populate, truncation) build none of its entries, even when executable;
   only `fault_in` does, for a page already read, and then for the runs read within its 2 MB leaf
-  range. A data invalidation revokes affected entries and executable translations in each address space.
+  range. A FUSE `INVAL_INODE` notification expires cached attributes. With a nonnegative offset,
+  it also revokes page-table entries and executable translations for the affected pages in every
+  address space that maps them, then marks those pages stale in `FillPages`.
   A subsequent fill refreshes the EOF, including for a fault beyond the old end. Shared writable
   aliases get a baseline so writeback can send only contiguous runs of changed bytes.
 - Reading a page (`kernel/fuse`'s `fill`): `Fill::window` picks the pages not read around it
@@ -410,7 +412,7 @@ signals may still be delivered).
   awaiting a fill. A ptrace POKE can likewise return EIO there. These paths consume the fill retry.
 
 - **FUSE demand reads:** mlock, `MADV_WILLNEED` and core dumps do not fetch missing pages
-  (dumps emit zeros). Daemon-side data invalidations do not evict resident mapped pages.
+  (dumps emit zeros).
   A handler that has already consumed input can repeat its effects on a whole-syscall retry
   or return a short count. The dispatcher prefaults read/write, positional
   and vectored I/O buffers. recvfrom, recvmsg and recvmmsg handle post-receive copies locally.
