@@ -524,16 +524,17 @@ fn visible_locks(cx: &Cx<'_>, fs: Fs, flags: u64) -> Result<u64, Errno> {
     }
     let vfs = cx.vfs()?;
     let mounts: Vec<Mount> = vfs.mounts().into_iter().filter(|m| m.ns == ns.id).collect();
+    let blocked: HashSet<MountId> = mounts
+        .iter()
+        .filter(|c| c.locks & lock::MOUNT != 0 && !c.point.as_ref().is_some_and(empty_mount_point))
+        .filter_map(Mount::parent)
+        .collect();
     let visible = mounts.iter().find(|m| {
         m.fs == fs
             && m.root == fs.root().in_mount(m.id)
             && (m.locks & lock::READONLY == 0 || flags & ms::RDONLY != 0)
             && (m.locks & lock::ATIME == 0 || m.flags & ATIME == flags & ATIME)
-            && !mounts.iter().any(|c| {
-                c.parent() == Some(m.id)
-                    && c.locks & lock::MOUNT != 0
-                    && !c.point.as_ref().is_some_and(empty_mount_point)
-            })
+            && !blocked.contains(&m.id)
     });
     match visible {
         Some(m) => Ok(m.locks & (lock::READONLY | lock::ATIME)),
@@ -611,7 +612,7 @@ fn bind(
     let plan = plan_copies(&vfs, &view, &inside, &src)?;
     let size = 1 + plan.len();
     let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), size, size)?;
-    let id = vfs.add_mount(
+    let id = vfs.add_mount_unattached(
         m.fs,
         src.clone(),
         (target, at),
@@ -1226,11 +1227,7 @@ pub(super) fn mount_setattr(
         | cleared(attr::NOEXEC, ms::NOEXEC)
         | cleared(attr::NODIRATIME, ms::NODIRATIME)
         | cleared(attr::NOSYMFOLLOW, ms::NOSYMFOLLOW);
-    let targets = if flags & AT_RECURSIVE != 0 {
-        vfs.subtree(id)
-    } else {
-        vec![id]
-    };
+    let recursive = flags & AT_RECURSIVE != 0;
     let changed = |m: &Mount| {
         let mut f = (m.flags & !clr_ms) | set_ms;
         if let Some(a) = atime {
@@ -1239,31 +1236,16 @@ pub(super) fn mount_setattr(
         f
     };
     // Every mount is checked before any changes (mount_setattr_prepare): locked flags stay, and
-    // a mount with files open for writing cannot become read-only (EBUSY, mnt_hold_writers)
-    if targets
-        .iter()
-        .filter_map(|&t| vfs.mount(t))
-        .any(|m| !m.keeps_locked(changed(&m)))
-    {
-        return Err(Errno::EPERM);
-    }
-    if set_ms & ms::RDONLY != 0 {
-        let writers = writers(cx.kr());
-        if targets
-            .iter()
-            .filter_map(|&t| vfs.mount(t))
-            .any(|m| m.flags & ms::RDONLY == 0 && writers.contains(&m.id))
-        {
-            return Err(Errno::EBUSY);
-        }
-    }
-    for &t in &targets {
-        vfs.update_mount(t, |m| m.flags = changed(m));
-    }
-    // The propagation type, after the flags (mount_setattr_commit)
-    if let Some(kind) = propagation_type(propagation) {
-        vfs.set_propagation(id, kind, flags & AT_RECURSIVE != 0);
-    }
+    // a mount with files open for writing cannot become read-only (EBUSY, mnt_hold_writers);
+    // flags and propagation then apply in one pass with a single fast-path rebuild.
+    vfs.set_mount_attrs(
+        id,
+        recursive,
+        changed,
+        set_ms & ms::RDONLY != 0,
+        || writers(cx.kr()),
+        propagation_type(propagation),
+    )?;
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -1776,10 +1758,7 @@ fn plan_attach(
     for t in &targets {
         *added.entry(t.ns).or_default() += size;
     }
-    if added
-        .into_iter()
-        .any(|(ns, n)| n > 0 && vfs.count_in(ns) + n > cx.kr().mount_max)
-    {
+    if vfs.any_ns_over(&added, cx.kr().mount_max) {
         return Err(Errno::ENOSPC);
     }
     Ok(targets)
@@ -1823,12 +1802,7 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     if anon_ns.is_none() && parent.is_some_and(|p| vfs.propagation(p).group != 0) {
         return Err(Errno::EINVAL);
     }
-    if vfs.propagation(target.mnt()).group != 0
-        && vfs
-            .subtree(id)
-            .iter()
-            .any(|&m| vfs.propagation(m).unbindable)
-    {
+    if vfs.propagation(target.mnt()).group != 0 && vfs.subtree_has_unbindable(id) {
         return Err(Errno::EINVAL);
     }
     // An attached tree is in the namespace already; its copies count anyway

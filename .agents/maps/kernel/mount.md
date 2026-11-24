@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: SCM_RIGHTS mount references during send, queueing and receive)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: incremental mount id/children indices and linear-time propagation, mount_setattr, move_tree and propagation_targets)
 
 ## Responsibilities
 
@@ -54,10 +54,12 @@ Outside the module:
   directory and name of a bound file (`root_at`) and whether that name was removed (`root_gone`).
   `keeps_locked` is Linux's `can_change_locked_flags`.
 - `Mounts` — the attached list (also the mountinfo order; the root filesystem's entry stays
-  first), the detached list, the `collect_pending` flag (kernel-wide under the BKL, set when
-  `detach_store_point` detaches mounts or `defer_collect` postpones collection), the id counter
-  (from 11) and device counter (from 0x30), and per-instance side tables by device number (tmpfs,
-  procfs pid namespaces, devpts options, superblock flags), plus mqueue devices by IPC namespace.
+  first), the detached list, incremental `by_id` (`MountId -> MountLoc`) and `children`
+  (`MountId -> Vec<MountId>`, in mount order) indices kept in sync across mount/move/detach/collect,
+  the `collect_pending` flag (kernel-wide under the BKL, set when `detach_store_point` detaches
+  mounts or `defer_collect` postpones collection), the id counter (from 11) and device counter
+  (from 0x30), and per-instance side tables by device number (tmpfs, procfs pid namespaces, devpts
+  options, superblock flags), plus mqueue devices by IPC namespace.
 - `Fs` — Store, Tmpfs, Proc, Pts, Sys, Cgroup, Nsfs, Mqueue, Overlay, Fuse. Tmpfs, procfs, devpts,
   overlay and FUSE mounts are new instances with their own device numbers (`new_instance`,
   `own_dev`), except that a FUSE mount given a `/dev/fuse` fd already mounted mounts that instance
@@ -77,15 +79,15 @@ Outside the module:
 ## Public entry points
 
 - **Table and namespaces**: `Vfs::open` (boot mounts), `mounts`/`mounts_from` (with `sb_options`,
-  `type_of` and `root_path`, what mountinfo shows), `count_in`, `find_ns`/`ns_root`/`pinned_ns`/
-  `init_ns`, `copy_ns`, `anon_ns`, `mount`/`mount_root`/`any_mount_root`/`children`/`subtree`,
-  `mount_ns`, `is_point_in`, `mount_nodes` (every attached and detached mount's root and point,
-  which the FUSE and overlay node sweeps keep), `mount_events` (the counter polled through mounts
-  and mountinfo).
-- **Changes**: `clone_mount`, `attach_tree`, `add_mount`, `add_copies`, `move_mount`,
-  `set_root_at`, `remove_mount`, `umount_tree`, `propagation_targets`, `propagate`,
-  `propagated_busy`, `set_propagation`, `attached`, `propagation`, `update_mount`, `set_expiring`,
-  `resolve_mountpoint`.
+  `type_of` and `root_path`, what mountinfo shows), `count_in`/`any_ns_over`, `find_ns`/`ns_root`/
+  `pinned_ns`/`init_ns`, `copy_ns`, `anon_ns`, `mount`/`mount_root`/`any_mount_root`/`children`/
+  `subtree`/`subtree_has_unbindable`, `mount_ns`, `is_point_in`, `mount_nodes` (every attached and
+  detached mount's root and point, which the FUSE and overlay node sweeps keep), `mount_events`
+  (the counter polled through mounts and mountinfo).
+- **Changes**: `clone_mount`, `attach_tree`, `add_mount`/`add_mount_unattached`, `add_copies`,
+  `move_mount`, `set_root_at`, `umount_tree`, `propagation_targets`, `propagate`,
+  `propagated_busy`, `set_propagation`, `attached`, `propagation`, `update_mount`,
+  `set_mount_attrs`, `set_expiring`, `resolve_mountpoint`.
 - **Instances**: `sb_flags`/`set_sb_flags`, `sb_readonly`, `readonly`, `mount_flags` (read by
   `kernel/vfs`'s checks), `dev_of`, `mount_dev` (None for a mount that is gone), `fs_of`,
   `proc_pid_ns`/`set_proc_pid_ns`, `devpts_options`/`set_devpts_options` (`kernel/tty`), `mq_dev`
@@ -373,12 +375,19 @@ Outside the module:
   over from the fully visible instance); a bind's own root drops `lock::MOUNT`, so
   code that creates a mount from another must decide which locks it inherits (`clone_mount`,
   `bind`, `add_copies`, `propagate` keep or clear them).
-- The mount table is a list, and a namespace may hold 100000 mounts: anything that visits many
-  mounts must index them once (by parent in `plan_copies` and `tree_of`, by id in `mounts_from`, by
-  id, group, master, parent and mount point in `Index` for propagation and unmounting, group
-  numbers handed out by `GroupAlloc`), since a scan of the table per mount holds the BKL for tens
-  of seconds at that size (some paths still do, see Confirmed bugs). Propagation stacks thousands
-  of mounts on one directory, so `mounted` climbs past eight stacked mounts through an index.
+- The mount table is a list backed by incremental `Mounts::by_id` and `Mounts::children` indices,
+  and a namespace may hold 100000 mounts: every mount lookup by id, `root_point`/`is_under` step,
+  child/subtree traversal (`subtree`, `subtree_has_unbindable`, `set_mount_attrs`, `copy_ns`,
+  `detach_store_point`), batch propagation change (`change_propagations`/`leave_groups` with
+  memoized master-chain resolution) and `propagation_targets` (precomputing the mount point's
+  filesystem ancestor set once) runs in O(1) / O(subtree) / O(N) rather than scanning the table
+  per mount; propagation and unmounting build `Index` once, and `GroupAlloc` hands out peer group
+  numbers once per operation. Mutations to `Mounts::list`, `Mounts::detached`, or `Mount::point`
+  must go through `push_attached`, `set_point`, or `rebuild_index` (`update_mount` asserts that
+  `id` and `parent()` do not change). `set_mount_attrs` rebuilds the fast path's mount points once
+  at the end of a recursive `mount_setattr`, and `bind` uses `add_mount_unattached` so `attached`
+  runs once after copies are added. Propagation stacks thousands of mounts on one directory, so
+  `mounted` climbs past eight stacked mounts through an index.
 - Every attach path in `syscall::mount` pairs `plan_attach` (before attaching: the targets, and
   `ENOSPC` for every namespace concerned) with `propagate` (after); planning first keeps a new
   mount's or a bind's own mounts out of the targets, but a moved attached tree and an open_tree
@@ -397,12 +406,6 @@ Outside the module:
 
 ## Confirmed bugs / technical debt
 
-- **Quadratic mount operations:** recursive propagation changes
-  (`set_propagation` through `change_propagation`/`make_slave`), `attached` (twice per bind),
-  `move_tree`'s unbindable check and `mount_setattr` with `AT_RECURSIVE` (which also rebuilds the
-  fast path's mount points per mount) scan the whole mount table once per mount in the subtree,
-  and `propagation_targets` checks each target with `is_under`, which scans the table at each
-  step.
 - **Mount fidelity gaps:**
   - `walk_at` lifts the source of open_tree, move_mount and mount_setattr reached without a lookup
     (an `AT_EMPTY_PATH` fd, `.`, `/`), where 6.1's `user_path_at` stays on the mount it has;

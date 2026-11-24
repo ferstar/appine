@@ -560,6 +560,13 @@ pub struct Vfs {
     expiring: std::cell::Cell<usize>,
 }
 
+/// Position of a live mount in [`Mounts::list`] or [`Mounts::detached`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MountLoc {
+    Attached(usize),
+    Detached(usize),
+}
+
 struct Mounts {
     /// Attached mounts, in mount order (the mountinfo order); the first is the root of the mount
     /// tree, and it is not moved even when that is no longer true after pivot_root.
@@ -569,6 +576,11 @@ struct Mounts {
     /// the mount is locked in place on a detached parent ([`detach`]; [`Vfs::collect`] removes the
     /// unused ones).
     detached: Vec<Mount>,
+    /// Live mounts (attached and detached) indexed by id for O(1) lookup.
+    by_id: HashMap<MountId, MountLoc>,
+    /// Direct children of each mount (`m.parent() == Some(parent)` with `parent != m.id`),
+    /// across attached and detached mounts, kept in mount order.
+    children: HashMap<MountId, Vec<MountId>>,
     /// The id of the next mount. Ids of detached mounts are never reused: files still open and
     /// current directories after the detach keep the old id, which must not count toward a new
     /// mount.
@@ -598,6 +610,137 @@ struct Mounts {
 }
 
 impl Mounts {
+    fn get(&self, id: MountId) -> Option<&Mount> {
+        match self.by_id.get(&id).copied()? {
+            MountLoc::Attached(i) => self.list.get(i),
+            MountLoc::Detached(i) => self.detached.get(i),
+        }
+    }
+
+    fn get_attached(&self, id: MountId) -> Option<&Mount> {
+        match self.by_id.get(&id).copied()? {
+            MountLoc::Attached(i) => self.list.get(i),
+            MountLoc::Detached(_) => None,
+        }
+    }
+
+    fn get_mut(&mut self, id: MountId) -> Option<&mut Mount> {
+        match self.by_id.get(&id).copied()? {
+            MountLoc::Attached(i) => self.list.get_mut(i),
+            MountLoc::Detached(i) => self.detached.get_mut(i),
+        }
+    }
+
+    fn get_attached_mut(&mut self, id: MountId) -> Option<&mut Mount> {
+        match self.by_id.get(&id).copied()? {
+            MountLoc::Attached(i) => self.list.get_mut(i),
+            MountLoc::Detached(_) => None,
+        }
+    }
+
+    fn loc_key(&self, id: MountId) -> (u8, usize) {
+        match self.by_id.get(&id).copied() {
+            Some(MountLoc::Attached(i)) => (0, i),
+            Some(MountLoc::Detached(i)) => (1, i),
+            None => (2, 0),
+        }
+    }
+
+    fn link_child(&mut self, parent: MountId, child: MountId) {
+        let key = self.loc_key(child);
+        let fast_append = self
+            .children
+            .get(&parent)
+            .and_then(|kids| kids.last().copied())
+            .is_none_or(|last| self.loc_key(last) < key);
+        if fast_append {
+            self.children.entry(parent).or_default().push(child);
+            return;
+        }
+        let pos = self.children[&parent]
+            .binary_search_by_key(&key, |&c| self.loc_key(c))
+            .unwrap_or_else(|p| p);
+        self.children.entry(parent).or_default().insert(pos, child);
+    }
+
+    fn unlink_child(&mut self, parent: MountId, child: MountId) {
+        if let Some(kids) = self.children.get_mut(&parent) {
+            if let Some(pos) = kids.iter().position(|&c| c == child) {
+                kids.remove(pos);
+            }
+            if kids.is_empty() {
+                self.children.remove(&parent);
+            }
+        }
+    }
+
+    fn push_attached(&mut self, m: Mount) {
+        let idx = self.list.len();
+        let id = m.id;
+        let parent = m.parent().filter(|&p| p != id);
+        self.by_id.insert(id, MountLoc::Attached(idx));
+        self.list.push(m);
+        if let Some(parent) = parent {
+            self.link_child(parent, id);
+        }
+    }
+
+    fn set_point(&mut self, id: MountId, point: Option<Node>, at: Option<Dentry>) {
+        let Some(m) = self.get_mut(id) else {
+            return;
+        };
+        let old_parent = m.parent().filter(|&p| p != id);
+        let new_parent = point.as_ref().map(Node::mnt).filter(|&p| p != id);
+        m.point = point;
+        m.at = at;
+        if old_parent != new_parent {
+            if let Some(p) = old_parent {
+                self.unlink_child(p, id);
+            }
+            if let Some(p) = new_parent {
+                self.link_child(p, id);
+            }
+        }
+    }
+
+    fn rebuild_index(&mut self) {
+        self.by_id.clear();
+        self.by_id.reserve(self.list.len() + self.detached.len());
+        self.children.clear();
+        for (i, m) in self.list.iter().enumerate() {
+            self.by_id.insert(m.id, MountLoc::Attached(i));
+            if let Some(parent) = m.parent().filter(|&p| p != m.id) {
+                self.children.entry(parent).or_default().push(m.id);
+            }
+        }
+        for (i, m) in self.detached.iter().enumerate() {
+            self.by_id.insert(m.id, MountLoc::Detached(i));
+            if let Some(parent) = m.parent().filter(|&p| p != m.id) {
+                self.children.entry(parent).or_default().push(m.id);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn verify_index(&self) {
+        let mut expected_by_id = HashMap::with_capacity(self.list.len() + self.detached.len());
+        let mut expected_children: HashMap<MountId, Vec<MountId>> = HashMap::new();
+        for (i, m) in self.list.iter().enumerate() {
+            expected_by_id.insert(m.id, MountLoc::Attached(i));
+            if let Some(parent) = m.parent().filter(|&p| p != m.id) {
+                expected_children.entry(parent).or_default().push(m.id);
+            }
+        }
+        for (i, m) in self.detached.iter().enumerate() {
+            expected_by_id.insert(m.id, MountLoc::Detached(i));
+            if let Some(parent) = m.parent().filter(|&p| p != m.id) {
+                expected_children.entry(parent).or_default().push(m.id);
+            }
+        }
+        assert_eq!(self.by_id, expected_by_id);
+        assert_eq!(self.children, expected_children);
+    }
+
     /// A boot mount: root `root` of filesystem `fs` (device number `dev`) mounted on `point`;
     /// not mounted when there is no mount point.
     fn boot(
@@ -612,7 +755,7 @@ impl Mounts {
             crate::debug::log(format_args!("no mount point for {fs:?}"));
             return;
         };
-        self.list.push(Mount {
+        self.push_attached(Mount {
             id,
             ns: INIT_MNT_NS,
             fs,
@@ -669,9 +812,8 @@ impl Mounts {
     /// pivot_root), its root directory counts too: `..` has to leave through its mount point.
     fn store_points(&self) -> Arc<[Ino]> {
         let top = self
-            .list
-            .iter()
-            .any(|m| m.id == ROOT_MOUNT && m.point.is_none());
+            .get_attached(ROOT_MOUNT)
+            .is_some_and(|m| m.point.is_none());
         self.list
             .iter()
             .filter_map(|m| match m.point {
@@ -685,9 +827,8 @@ impl Mounts {
     /// The boot root filesystem is still attached and not nosymfollow: no-BKL resolution walks
     /// only inside it.
     fn fast_usable(&self) -> bool {
-        self.list
-            .iter()
-            .any(|m| m.id == ROOT_MOUNT && m.flags & ms::NOSYMFOLLOW == 0)
+        self.get_attached(ROOT_MOUNT)
+            .is_some_and(|m| m.flags & ms::NOSYMFOLLOW == 0)
     }
 }
 
@@ -1273,6 +1414,8 @@ impl Vfs {
                 owner: None,
             }],
             detached: Vec::new(),
+            by_id: HashMap::from([(ROOT_MOUNT, MountLoc::Attached(0))]),
+            children: HashMap::new(),
             next: RUN_MOUNT + 1,
             next_dev: 0x30,
             tmpfs: Default::default(),
@@ -1317,6 +1460,7 @@ impl Vfs {
                 Err(e) => {
                     crate::debug::log(format_args!("cannot mount /dev: {e}"));
                     mounts.list.retain(|m| m.id != DEV_MOUNT);
+                    mounts.rebuild_index();
                     point
                 }
             }
@@ -1900,19 +2044,13 @@ impl Vfs {
         dir: &Node,
     ) -> Result<(Vec<u8>, bool), Errno> {
         let mounts = self.mounts.borrow();
-        self.reach_in(ps, root, dir, |id| {
-            mounts
-                .list
-                .iter()
-                .chain(&mounts.detached)
-                .find(|m| m.id == id)
-        })
+        self.reach_in(ps, root, dir, |id| mounts.get(id))
     }
 
     /// Attached mounts in mount namespace `ns`, in mount order, each with its mount point's path
-    /// from `root` when reachable from it (mountinfo). Mounts are looked up by id through an
-    /// index built once: a scan of the table at each step up made listing a large table
-    /// quadratic (65,000 mounts took 17 s under the BKL, and busybox's umount reads the list).
+    /// from `root` when reachable from it (mountinfo). Mounts are looked up by id in O(1) through
+    /// `Mounts::by_id`: a scan of the table at each step up made listing a large table quadratic
+    /// (65,000 mounts took 17 s under the BKL, and busybox's umount reads the list).
     pub(crate) fn mounts_from(
         &self,
         ps: &dyn Pseudo,
@@ -1920,18 +2058,12 @@ impl Vfs {
         ns: u64,
     ) -> Vec<(Mount, Option<Vec<u8>>)> {
         let mounts = self.mounts.borrow();
-        let by_id: std::collections::HashMap<MountId, &Mount> = mounts
-            .list
-            .iter()
-            .chain(&mounts.detached)
-            .map(|m| (m.id, m))
-            .collect();
         mounts
             .list
             .iter()
             .filter(|m| m.ns == ns)
             .map(|m| {
-                let path = match self.reach_in(ps, root, &m.root, |id| by_id.get(&id).copied()) {
+                let path = match self.reach_in(ps, root, &m.root, |id| mounts.get(id)) {
                     Ok((path, true)) => Some(path),
                     _ => None,
                 };
@@ -2205,11 +2337,7 @@ impl Vfs {
     /// still on its detached parent), the mount point and [`Mount::at`].
     fn root_point(&self, node: &Node) -> Option<(Node, Option<Dentry>)> {
         let mounts = self.mounts.borrow();
-        let m = mounts
-            .list
-            .iter()
-            .chain(&mounts.detached)
-            .find(|m| m.id == node.mnt())?;
+        let m = mounts.get(node.mnt())?;
         if m.root != *node {
             return None;
         }
@@ -2323,12 +2451,17 @@ impl Vfs {
         // copy_tree without CL_COPY_MNT_NS_FILE): the new namespace is newer than it, and
         // keeping it could form a cycle
         let mut skip = std::collections::HashSet::new();
-        while let Some(m) = old.iter().find(|m| {
-            !skip.contains(&m.id)
-                && (matches!(m.pin, Some(crate::nsproxy::NsRef::Mnt(_)))
-                    || m.parent().is_some_and(|p| skip.contains(&p)))
-        }) {
-            skip.insert(m.id);
+        let mut queue: Vec<MountId> = old
+            .iter()
+            .filter(|m| matches!(m.pin, Some(crate::nsproxy::NsRef::Mnt(_))))
+            .map(|m| m.id)
+            .collect();
+        while let Some(id) = queue.pop() {
+            if skip.insert(id)
+                && let Some(kids) = mounts.children.get(&id)
+            {
+                queue.extend_from_slice(kids);
+            }
         }
         old.retain(|m| !skip.contains(&m.id));
         // Allocate the ids before copying: after MS_MOVE or pivot_root, the mount a mount point
@@ -2367,7 +2500,7 @@ impl Vfs {
                 },
                 ..m
             };
-            mounts.list.push(copy);
+            mounts.push_attached(copy);
         }
         drop(mounts);
         self.namespaces
@@ -2406,7 +2539,7 @@ impl Vfs {
         let mut mounts = self.mounts.borrow_mut();
         let id = mounts.next;
         mounts.next += 1;
-        mounts.list.push(Mount {
+        mounts.push_attached(Mount {
             id,
             ns,
             root: src.clone().in_mount(id),
@@ -2430,13 +2563,13 @@ impl Vfs {
     /// mounts in the tree move into namespace `to`.
     pub(crate) fn attach_tree(&self, root: MountId, (point, at): (Node, Option<Dentry>), to: u64) {
         let mut mounts = self.mounts.borrow_mut();
-        let from = mounts.list.iter().find(|m| m.id == root).map(|m| m.ns);
+        let from = mounts.get_attached(root).map(|m| m.ns);
         for m in mounts.list.iter_mut().filter(|m| Some(m.ns) == from) {
             m.ns = to;
         }
-        if let Some(m) = mounts.list.iter_mut().find(|m| m.id == root) {
-            m.at = at.filter(|_| matches!(point, Node::Store(..)));
-            m.point = Some(point);
+        if matches!(mounts.by_id.get(&root), Some(MountLoc::Attached(_))) {
+            let at = at.filter(|_| matches!(point, Node::Store(..)));
+            mounts.set_point(root, Some(point), at);
         }
         drop(mounts);
         self.mounts_changed();
@@ -2445,7 +2578,43 @@ impl Vfs {
     /// Mount `id` and the mounts below it (level by level downwards, mount_setattr's
     /// `AT_RECURSIVE`).
     pub(crate) fn subtree(&self, id: MountId) -> Vec<MountId> {
-        tree_of(&self.mounts.borrow().list, id)
+        self.mounts.borrow().attached_subtree(id)
+    }
+
+    /// Whether attached mount `id` or any attached mount below it is unbindable (Linux's
+    /// `do_move_mount` check when moving onto a shared mount).
+    pub(crate) fn subtree_has_unbindable(&self, id: MountId) -> bool {
+        let mounts = self.mounts.borrow();
+        let mut stack = vec![id];
+        while let Some(cur) = stack.pop() {
+            let Some(m) = mounts.get_attached(cur) else {
+                continue;
+            };
+            if m.prop.unbindable {
+                return true;
+            }
+            if let Some(kids) = mounts.children.get(&cur) {
+                stack.extend_from_slice(kids);
+            }
+        }
+        false
+    }
+
+    /// Whether adding `added[ns]` attached mounts to each namespace `ns` would exceed `limit`
+    /// (`fs.mount-max`), counted in a single pass over the attached list.
+    pub(crate) fn any_ns_over(&self, added: &HashMap<u64, usize>, limit: usize) -> bool {
+        if added.values().all(|&n| n == 0) {
+            return false;
+        }
+        let mut counts: HashMap<u64, usize> = HashMap::with_capacity(added.len());
+        for m in &self.mounts.borrow().list {
+            if added.get(&m.ns).is_some_and(|&n| n > 0) {
+                *counts.entry(m.ns).or_default() += 1;
+            }
+        }
+        added
+            .iter()
+            .any(|(&ns, &n)| n > 0 && counts.get(&ns).copied().unwrap_or(0) + n > limit)
     }
 
     /// The root directory of mount namespace `ns` (the root of the mount tree's root, or the
@@ -2464,24 +2633,21 @@ impl Vfs {
 
     /// The namespace mount `id` belongs to; None for detached ones (Linux's `check_mnt`).
     pub(crate) fn mount_ns(&self, id: MountId) -> Option<u64> {
-        let mounts = self.mounts.borrow();
-        mounts.list.iter().find(|m| m.id == id).map(|m| m.ns)
+        self.mounts.borrow().get_attached(id).map(|m| m.ns)
     }
 
     /// The attached mount with id `id`; None for detached ones.
     pub(crate) fn mount(&self, id: MountId) -> Option<Mount> {
-        self.mounts
-            .borrow()
-            .list
-            .iter()
-            .find(|m| m.id == id)
-            .cloned()
+        self.mounts.borrow().get_attached(id).cloned()
     }
 
     /// When `node` is the root of an attached mount, that mount's id.
     pub(crate) fn mount_root(&self, node: &Node) -> Option<MountId> {
-        let mounts = self.mounts.borrow();
-        mounts.list.iter().find(|m| m.root == *node).map(|m| m.id)
+        self.mounts
+            .borrow()
+            .get_attached(node.mnt())
+            .filter(|m| m.root == *node)
+            .map(|m| m.id)
     }
 
     /// Some mount is mounted on `node`.
@@ -2510,21 +2676,26 @@ impl Vfs {
     /// rename): all mounts on it in other namespaces are detached (Linux's `detach_mounts`), and
     /// scheduled for collection at the end of the syscall.
     pub(crate) fn detach_store_point(&self, (ino, dir, name): (Ino, Ino, &[u8])) {
-        let ids: Vec<MountId> = self
-            .mounts
-            .borrow()
+        let mut mounts = self.mounts.borrow_mut();
+        let roots: Vec<MountId> = mounts
             .list
             .iter()
             .filter(|m| on_entry(m, (ino, dir, name)))
             .map(|m| m.id)
             .collect();
-        if ids.is_empty() {
+        if roots.is_empty() {
             return;
         }
-        for id in ids {
-            self.remove_mount(id);
+        let mut gone = std::collections::HashSet::new();
+        for id in roots {
+            if !gone.contains(&id) {
+                gone.extend(mounts.attached_subtree(id));
+            }
         }
-        self.mounts.borrow_mut().collect_pending = true;
+        detach(&mut mounts, |m| gone.contains(&m.id));
+        mounts.collect_pending = true;
+        drop(mounts);
+        self.mounts_changed();
     }
 
     /// `name` (inode `ino`) in store directory `dir` was deleted: the mounts, in any namespace or
@@ -3184,7 +3355,7 @@ impl Vfs {
             .create_detached_dir(params.perm, params.uid, params.gid)?;
         let id = self.add_mount(Fs::Tmpfs, Node::Store(0, root), point, flags, source, None);
         let mut mounts = self.mounts.borrow_mut();
-        let dev = mounts.list.iter().find(|m| m.id == id).map_or(0, |m| m.dev);
+        let dev = mounts.get_attached(id).map_or(0, |m| m.dev);
         mounts.tmpfs.insert(
             dev,
             Tmpfs {
@@ -3360,10 +3531,37 @@ impl Vfs {
         &self,
         fs: Fs,
         root: Node,
+        point: (Node, Option<Dentry>),
+        flags: u64,
+        source: Vec<u8>,
+        dev: Option<u64>,
+    ) -> MountId {
+        self.add_mount_inner((fs, root), point, flags, source, dev, true)
+    }
+
+    /// Like [`Vfs::add_mount`], leaving propagation at default and skipping `mounts_changed` for
+    /// a caller (`bind`) that sets the source's locks and propagation, adds copies, and then calls
+    /// [`Vfs::attached`] once.
+    pub(crate) fn add_mount_unattached(
+        &self,
+        fs: Fs,
+        root: Node,
+        point: (Node, Option<Dentry>),
+        flags: u64,
+        source: Vec<u8>,
+        dev: Option<u64>,
+    ) -> MountId {
+        self.add_mount_inner((fs, root), point, flags, source, dev, false)
+    }
+
+    fn add_mount_inner(
+        &self,
+        (fs, root): (Fs, Node),
         (point, at): (Node, Option<Dentry>),
         flags: u64,
         source: Vec<u8>,
         dev: Option<u64>,
+        attach: bool,
     ) -> MountId {
         let mut mounts = self.mounts.borrow_mut();
         let id = mounts.next;
@@ -3373,14 +3571,21 @@ impl Vfs {
             mounts.next_dev - 1
         });
         let at = at.filter(|_| matches!(point, Node::Store(..)));
-        // The new mount belongs to the namespace of the mount its mount point is in
-        let ns = mounts
-            .list
-            .iter()
-            .chain(&mounts.detached)
-            .find(|m| m.id == point.mnt())
-            .map_or(INIT_MNT_NS, |m| m.ns);
-        mounts.list.push(Mount {
+        // The new mount belongs to the namespace of the mount its mount point is in, and is
+        // private unless mounted under a shared mount (no children exist yet for a brand-new id)
+        let (ns, parent_shared) = mounts
+            .get(point.mnt())
+            .map_or((INIT_MNT_NS, false), |m| (m.ns, m.prop.group != 0));
+        let prop = if attach && parent_shared {
+            Propagation {
+                group: GroupAlloc::of(&mounts).take(),
+                master: 0,
+                unbindable: false,
+            }
+        } else {
+            Propagation::default()
+        };
+        mounts.push_attached(Mount {
             id,
             ns,
             fs,
@@ -3395,13 +3600,13 @@ impl Vfs {
             expiring: false,
             pin: None,
             locks: 0,
-            prop: Propagation::default(),
+            prop,
             owner: None,
         });
         drop(mounts);
-        self.mounts_changed();
-        // Private, unless mounted under a shared mount
-        self.attached(id);
+        if attach {
+            self.mounts_changed();
+        }
         id
     }
 
@@ -3409,11 +3614,7 @@ impl Vfs {
     /// (None for the boot one).
     pub(crate) fn proc_pid_ns(&self, id: MountId) -> Option<std::rc::Rc<crate::pidns::PidNs>> {
         let mounts = self.mounts.borrow();
-        let m = mounts
-            .list
-            .iter()
-            .chain(&mounts.detached)
-            .find(|m| m.id == id)?;
+        let m = mounts.get(id)?;
         mounts.proc_ns.get(&m.dev).cloned()
     }
 
@@ -3427,12 +3628,7 @@ impl Vfs {
             return;
         }
         let mut mounts = self.mounts.borrow_mut();
-        let ns = mounts
-            .list
-            .iter()
-            .chain(&mounts.detached)
-            .find(|m| m.id == to)
-            .map_or(INIT_MNT_NS, |m| m.ns);
+        let ns = mounts.get(to).map_or(INIT_MNT_NS, |m| m.ns);
         let mut ids: Vec<MountId> = Vec::with_capacity(plan.len());
         for (parent, c) in plan {
             let parent = parent.map_or(to, |i| ids[i]);
@@ -3448,7 +3644,7 @@ impl Vfs {
                 c.at.clone()
                     .map(|(dir, name)| (dir.in_mount(parent), name))
                     .filter(|_| matches!(point, Node::Store(..)));
-            mounts.list.push(Mount {
+            mounts.push_attached(Mount {
                 id,
                 ns,
                 fs: c.fs,
@@ -3492,28 +3688,30 @@ impl Vfs {
     /// New procfs instance `id` belongs to pid namespace `ns`.
     pub(crate) fn set_proc_pid_ns(&self, id: MountId, ns: std::rc::Rc<crate::pidns::PidNs>) {
         let mut mounts = self.mounts.borrow_mut();
-        if let Some(dev) = mounts.list.iter().find(|m| m.id == id).map(|m| m.dev) {
+        if let Some(dev) = mounts.get_attached(id).map(|m| m.dev) {
             mounts.proc_ns.insert(dev, ns);
         }
     }
 
     /// Mounts mounted directly in mount `id`, in mount order.
     pub(crate) fn children(&self, id: MountId) -> Vec<Mount> {
-        self.mounts
-            .borrow()
-            .list
-            .iter()
-            .filter(|m| m.parent() == Some(id))
-            .cloned()
+        let mounts = self.mounts.borrow();
+        mounts
+            .children
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter_map(|&cid| mounts.get_attached(cid).cloned())
             .collect()
     }
 
     /// Detaches mount `id` and all mounts inside it (Linux's `umount_tree`): none of them is
     /// mounted on another mount any more, and each one's root has no parent.
-    pub(crate) fn remove_mount(&self, id: MountId) {
+    #[cfg(test)]
+    fn remove_mount(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
         let gone: std::collections::HashSet<MountId> =
-            tree_of(&mounts.list, id).into_iter().collect();
+            mounts.attached_subtree(id).into_iter().collect();
         detach(&mut mounts, |m| gone.contains(&m.id));
         drop(mounts);
         self.mounts_changed();
@@ -3575,7 +3773,10 @@ impl Vfs {
         }
         let gone: Vec<Ino> = {
             let mut mounts = self.mounts.borrow_mut();
-            keep_used(&mut mounts.detached, in_use);
+            if !mounts.detached.is_empty() {
+                keep_used(&mut mounts.detached, in_use);
+                mounts.rebuild_index();
+            }
             // Overlays without a mount go, and the tmpfs instances the others' layers are in stay
             let overlays: std::collections::HashSet<u64> = mounts
                 .list
@@ -3669,21 +3870,18 @@ impl Vfs {
     /// Moves attached mount `id` onto `point` (`MS_MOVE`, pivot_root); None makes it the root
     /// of the mount tree.
     pub(crate) fn move_mount(&self, id: MountId, point: Option<(Node, Option<Dentry>)>) {
-        if let Some(m) = self
-            .mounts
-            .borrow_mut()
-            .list
-            .iter_mut()
-            .find(|m| m.id == id)
-        {
-            (m.point, m.at) = match point {
+        let mut mounts = self.mounts.borrow_mut();
+        if matches!(mounts.by_id.get(&id), Some(MountLoc::Attached(_))) {
+            let (point, at) = match point {
                 Some((p, at)) => {
                     let at = at.filter(|_| matches!(p, Node::Store(..)));
                     (Some(p), at)
                 }
                 None => (None, None),
             };
+            mounts.set_point(id, point, at);
         }
+        drop(mounts);
         self.mounts_changed();
     }
 
@@ -3703,10 +3901,7 @@ impl Vfs {
         } else {
             vec![id]
         };
-        let mut groups = GroupAlloc::of(&mounts);
-        for id in ids {
-            mounts.change_propagation(id, kind, &mut groups);
-        }
+        mounts.change_propagations(&ids, kind);
         drop(mounts);
         self.mounts_changed();
     }
@@ -3717,24 +3912,21 @@ impl Vfs {
     /// slaves).
     pub(crate) fn attached(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
-        let Some(parent) = mounts.all().find(|m| m.id == id).and_then(Mount::parent) else {
+        let Some(parent) = mounts.get(id).and_then(Mount::parent) else {
             return;
         };
-        if !mounts.all().any(|m| m.id == parent && m.prop.group != 0) {
+        if mounts.get(parent).is_none_or(|m| m.prop.group == 0) {
             return;
         }
-        let mut groups = GroupAlloc::of(&mounts);
-        for id in mounts.subtree(id) {
-            mounts.change_propagation(id, PropagationType::Shared, &mut groups);
-        }
+        let ids = mounts.subtree(id);
+        mounts.change_propagations(&ids, PropagationType::Shared);
     }
 
     /// The propagation of mount `id` (attached or detached).
     pub(crate) fn propagation(&self, id: MountId) -> Propagation {
-        let mounts = self.mounts.borrow();
-        mounts
-            .all()
-            .find(|m| m.id == id)
+        self.mounts
+            .borrow()
+            .get(id)
             .map_or_else(Propagation::default, |m| m.prop)
     }
 
@@ -3750,6 +3942,37 @@ impl Vfs {
             .map(|ns| ns.id)
             .collect();
         Index::of(list, &anon)
+    }
+
+    /// `start` (mount-id 0) and every ancestor directory above it within its underlying
+    /// filesystem, stopping at the filesystem root (or on error / cycle).
+    // PinnedNet/PinnedIpc inside PseudoNode hash and compare only by immutable namespace id.
+    #[allow(clippy::mutable_key_type)]
+    fn fs_ancestors(&self, ps: &dyn Pseudo, start: &Node) -> std::collections::HashSet<Node> {
+        let mut ancestors = std::collections::HashSet::new();
+        let mut cur = start.clone();
+        while ancestors.insert(cur.clone()) {
+            let up = match &cur {
+                Node::Store(id, ino) => match self.store.parent(*ino) {
+                    Ok(p) => Node::Store(*id, p),
+                    Err(_) => break,
+                },
+                Node::Pseudo(id, p) => match ps.parent(p) {
+                    Some(up) => Node::Pseudo(*id, up),
+                    None => break,
+                },
+                Node::Overlay(id, o) => Node::Overlay(*id, self.overlays.borrow().parent(*o)),
+                Node::Fuse(id, f) => match self.fuse.borrow().get(*f) {
+                    Some(n) => Node::Fuse(*id, n.parent),
+                    None => break,
+                },
+            };
+            if up == cur {
+                break;
+            }
+            cur = up;
+        }
+        ancestors
     }
 
     // ---- Propagation of mount events (fs/pnode.c) ----
@@ -3777,16 +4000,29 @@ impl Vfs {
                 })
                 .collect()
         };
+        if planned.is_empty() {
+            return Vec::new();
+        }
+        // Every target mount sees the same underlying filesystem instance, and `from` and `root`
+        // are both inside that mount (`root == m.root`), so reachability only walks up the
+        // underlying filesystem without crossing mount boundaries; precomputing the ancestor set
+        // of `from` once keeps filtering O(depth + targets).
+        let from_base = at.filter(|_| matches!(point, Node::Store(..))).map_or_else(
+            || point.clone().in_mount(0),
+            |(dir, _)| dir.clone().in_mount(0),
+        );
+        #[allow(clippy::mutable_key_type)]
+        let ancestors = self.fs_ancestors(ps, &from_base);
         planned
             .into_iter()
             .filter_map(|(mount, ns, root, group, masters)| {
                 let point = point.clone().in_mount(mount);
+                let on_root = point == root;
                 // On the mount's root the directory it was found in is outside the mount
                 let at = at
-                    .filter(|_| matches!(point, Node::Store(..)) && point != root)
+                    .filter(|_| matches!(point, Node::Store(..)) && !on_root)
                     .map(|(dir, name)| (dir.clone().in_mount(mount), name.clone()));
-                let from = at.as_ref().map_or(&point, |(dir, _)| dir);
-                let seen = point == root || self.is_under(ps, from, &root);
+                let seen = on_root || ancestors.contains(&root.in_mount(0));
                 seen.then_some(Target {
                     ns,
                     point,
@@ -3811,21 +4047,21 @@ impl Vfs {
         if targets.is_empty() {
             return;
         }
-        let owners: HashMap<u64, Option<u64>> = targets
+        let mut owners: HashMap<u64, u64> = HashMap::from([(INIT_MNT_NS, self.init_ns.owner.id)]);
+        for ns in self
+            .namespaces
+            .borrow()
             .iter()
-            .map(|t| (t.ns, self.find_ns(t.ns).map(|ns| ns.owner.id)))
-            .collect();
+            .filter_map(std::rc::Weak::upgrade)
+        {
+            owners.insert(ns.id, ns.owner.id);
+        }
         let mut mounts = self.mounts.borrow_mut();
-        let pos: HashMap<MountId, usize> = mounts
-            .list
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.id, i))
-            .collect();
         // The tree in the order to copy it (each after its parent), with each one's parent index
-        let tree: Vec<Mount> = tree_of(&mounts.list, id)
-            .iter()
-            .filter_map(|i| pos.get(i).map(|&p| mounts.list[p].clone()))
+        let tree: Vec<Mount> = mounts
+            .attached_subtree(id)
+            .into_iter()
+            .filter_map(|mid| mounts.get_attached(mid).cloned())
             .collect();
         let in_tree: HashMap<MountId, usize> =
             tree.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
@@ -3843,8 +4079,8 @@ impl Vfs {
         // the tree; the parent's own group has the original
         let top = tree[0]
             .parent()
-            .and_then(|p| pos.get(&p))
-            .map_or(0, |&i| mounts.list[i].prop.group);
+            .and_then(|p| mounts.get_attached(p))
+            .map_or(0, |m| m.prop.group);
         let mut copies: HashMap<u32, Vec<u32>> =
             HashMap::from([(top, tree.iter().map(|m| m.prop.group).collect())]);
         let mut groups = GroupAlloc::of(&mounts);
@@ -3875,7 +4111,7 @@ impl Vfs {
                     })
                     .collect()
             };
-            let lock = owners.get(&t.ns).copied().flatten() != Some(owner);
+            let lock = owners.get(&t.ns).copied() != Some(owner);
             let mut ids: Vec<MountId> = Vec::with_capacity(tree.len());
             for (i, m) in tree.iter().enumerate() {
                 let new = mounts.next;
@@ -3895,7 +4131,7 @@ impl Vfs {
                 if i == 0 {
                     locks &= !lock::MOUNT;
                 }
-                mounts.list.push(Mount {
+                mounts.push_attached(Mount {
                     id: new,
                     ns: t.ns,
                     root: m.root.clone().in_mount(new),
@@ -3909,10 +4145,9 @@ impl Vfs {
                 ids.push(new);
             }
             if let Some(q) = index.at_place(&mounts.list, &t.point, t.at.as_ref()) {
+                let q_id = mounts.list[q].id;
                 let root = tree[0].root.clone().in_mount(ids[0]);
-                let q = &mut mounts.list[q];
-                q.point = Some(root);
-                q.at = None;
+                mounts.set_point(q_id, Some(root), None);
             }
         }
         drop(mounts);
@@ -3958,9 +4193,9 @@ impl Vfs {
     /// root) moves to the place of the nearest mount above it that stays (`restore_mounts`).
     pub(crate) fn umount_tree(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
+        let order = mounts.attached_subtree(id);
         let list = &mounts.list;
         let index = self.prop_index(list);
-        let order = tree_of(list, id);
         let gone: std::collections::HashSet<MountId> = order.iter().copied().collect();
         // The mounts on the same places elsewhere, each place of a peer group visited once.
         // PinnedNet/PinnedIpc inside PseudoNode hash and compare only by immutable namespace id.
@@ -4069,14 +4304,17 @@ impl Vfs {
 
     /// The mount whose root `node` is, attached or detached.
     pub(crate) fn any_mount_root(&self, node: &Node) -> Option<MountId> {
-        let mounts = self.mounts.borrow();
-        mounts.all().find(|m| m.root == *node).map(|m| m.id)
+        self.mounts
+            .borrow()
+            .get(node.mnt())
+            .filter(|m| m.root == *node)
+            .map(|m| m.id)
     }
 
     /// Marks attached mount `id` as expiring (`umount2(MNT_EXPIRE)`).
     pub(crate) fn set_expiring(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
-        if let Some(m) = mounts.list.iter_mut().find(|m| m.id == id)
+        if let Some(m) = mounts.get_attached_mut(id)
             && !m.expiring
         {
             m.expiring = true;
@@ -4090,7 +4328,7 @@ impl Vfs {
             return;
         }
         let mut mounts = self.mounts.borrow_mut();
-        if let Some(m) = mounts.list.iter_mut().find(|m| m.id == id)
+        if let Some(m) = mounts.get_attached_mut(id)
             && m.expiring
         {
             m.expiring = false;
@@ -4099,30 +4337,77 @@ impl Vfs {
     }
 
     /// Changes attached mount `id` through `f` (its flags, the MNT_EXPIRE mark, its locks and the
-    /// like), keeping only per-mount flags, and reports a mount change.
+    /// like), keeping only per-mount flags, and reports a mount change. Must not alter `id` or
+    /// `point` (use [`Vfs::move_mount`] for mount-point changes).
     pub(crate) fn update_mount(&self, id: MountId, f: impl FnOnce(&mut Mount)) {
-        if let Some(m) = self
-            .mounts
-            .borrow_mut()
-            .list
-            .iter_mut()
-            .find(|m| m.id == id)
-        {
+        if let Some(m) = self.mounts.borrow_mut().get_attached_mut(id) {
+            let old_parent = m.parent();
             f(m);
+            debug_assert_eq!(m.id, id);
+            debug_assert_eq!(m.parent(), old_parent);
             m.flags &= ms::PER_MOUNT;
         }
         self.mounts_changed();
     }
 
+    /// Applies `mount_setattr(2)` to attached mount `id` (and the attached mounts below it when
+    /// `recursive` is set): validates locked flags (`EPERM`) and writers for mounts turning
+    /// read-only (`EBUSY`, computed lazily via `open_writers`) before mutating anything, updates
+    /// flags and optional propagation in one pass, and rebuilds the fast path's mount points once
+    /// at the end.
+    pub(crate) fn set_mount_attrs(
+        &self,
+        id: MountId,
+        recursive: bool,
+        changed: impl Fn(&Mount) -> u64,
+        making_readonly: bool,
+        open_writers: impl FnOnce() -> std::collections::HashSet<MountId>,
+        propagation: Option<PropagationType>,
+    ) -> Result<(), Errno> {
+        let (targets, turning_ro) = {
+            let mounts = self.mounts.borrow();
+            let targets = if recursive {
+                mounts.attached_subtree(id)
+            } else {
+                vec![id]
+            };
+            let mut turning_ro = Vec::new();
+            for &t in &targets {
+                let Some(m) = mounts.get_attached(t) else {
+                    continue;
+                };
+                if !m.keeps_locked(changed(m)) {
+                    return Err(Errno::EPERM);
+                }
+                if making_readonly && m.flags & ms::RDONLY == 0 {
+                    turning_ro.push(t);
+                }
+            }
+            (targets, turning_ro)
+        };
+        if !turning_ro.is_empty() {
+            let writers = open_writers();
+            if turning_ro.iter().any(|t| writers.contains(t)) {
+                return Err(Errno::EBUSY);
+            }
+        }
+        let mut mounts = self.mounts.borrow_mut();
+        for &t in &targets {
+            if let Some(m) = mounts.get_attached_mut(t) {
+                m.flags = changed(m) & ms::PER_MOUNT;
+            }
+        }
+        if let Some(kind) = propagation {
+            mounts.change_propagations(&targets, kind);
+        }
+        drop(mounts);
+        self.mounts_changed();
+        Ok(())
+    }
+
     /// Runs `f` on the mount with id `id` (attached or detached).
     fn with_mount<T>(&self, id: MountId, f: impl FnOnce(&Mount) -> T) -> Option<T> {
-        let mounts = self.mounts.borrow();
-        mounts
-            .list
-            .iter()
-            .chain(&mounts.detached)
-            .find(|m| m.id == id)
-            .map(f)
+        self.mounts.borrow().get(id).map(f)
     }
 
     /// The mount table changed: the mount points used by no-BKL path resolution are replaced to
@@ -4271,27 +4556,6 @@ fn split(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
         .map(<[u8]>::to_vec)
 }
 
-/// Mount `id` and the mounts below it in `list`, level by level downwards. After MS_MOVE or
-/// pivot_root a mount is not necessarily inside a mount mounted before it, so the levels come from
-/// an index by parent built once: a scan of the list per mount made unmounting a large tree (a
-/// recursive bind doubled up to `fs.mount-max`) quadratic, holding the BKL for tens of seconds.
-fn tree_of(list: &[Mount], id: MountId) -> Vec<MountId> {
-    let mut children: std::collections::HashMap<MountId, Vec<MountId>> =
-        std::collections::HashMap::new();
-    for m in list {
-        if let Some(parent) = m.parent().filter(|&p| p != m.id) {
-            children.entry(parent).or_default().push(m.id);
-        }
-    }
-    let mut out = vec![id];
-    let mut i = 0;
-    while let Some(&parent) = out.get(i) {
-        out.extend(children.get(&parent).into_iter().flatten());
-        i += 1;
-    }
-    out
-}
-
 thread_local! {
     /// The mounts of the open files, current directories and roots this thread let go of since
     /// [`Vfs::released_detached`] last looked ([`released`]); [`ANY_MOUNT`] alone when more went.
@@ -4358,6 +4622,7 @@ fn detach(mounts: &mut Mounts, gone: impl Fn(&Mount) -> bool) {
         }
         mounts.detached.push(m);
     }
+    mounts.rebuild_index();
     // Unmounted mounts leave their peer groups (umount_tree's change_mnt_propagation(MS_PRIVATE))
     mounts.make_private(&ids);
 }
@@ -4369,61 +4634,137 @@ impl Mounts {
         self.list.iter().chain(&self.detached)
     }
 
-    fn get_mut(&mut self, id: MountId) -> Option<&mut Mount> {
-        self.list
-            .iter_mut()
-            .chain(self.detached.iter_mut())
-            .find(|m| m.id == id)
-    }
-
-    /// Mount `id` and the mounts below it, attached or detached.
+    /// Mount `id` and the mounts below it (attached or detached), level by level downwards.
     fn subtree(&self, id: MountId) -> Vec<MountId> {
-        let all: Vec<Mount> = self.all().cloned().collect();
-        tree_of(&all, id)
+        let mut out = vec![id];
+        let mut i = 0;
+        while let Some(&parent) = out.get(i) {
+            if let Some(kids) = self.children.get(&parent) {
+                out.extend_from_slice(kids);
+            }
+            i += 1;
+        }
+        out
     }
 
-    /// Linux's `change_mnt_propagation`, new peer groups coming from `groups`.
-    fn change_propagation(&mut self, id: MountId, kind: PropagationType, groups: &mut GroupAlloc) {
+    /// Attached mount `id` and the attached mounts below it, level by level downwards.
+    fn attached_subtree(&self, id: MountId) -> Vec<MountId> {
+        let mut out = vec![id];
+        let mut i = 0;
+        while let Some(&parent) = out.get(i) {
+            if let Some(kids) = self.children.get(&parent) {
+                out.extend(
+                    kids.iter()
+                        .copied()
+                        .filter(|&k| matches!(self.by_id.get(&k), Some(MountLoc::Attached(_)))),
+                );
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Changes the propagation type of every mount in `ids` (Linux's `change_mnt_propagation`).
+    /// For `Shared`, each mount without a peer group gets the smallest unused group id in `ids`
+    /// order (`invent_group_ids`). For `Slave`, `Private` and `Unbindable`, peer groups left
+    /// without members hand their slaves up to their own master (transitively) in O(N) total.
+    fn change_propagations(&mut self, ids: &[MountId], kind: PropagationType) {
+        if ids.is_empty() {
+            return;
+        }
         if kind == PropagationType::Shared {
-            if let Some(m) = self.get_mut(id) {
-                if m.prop.group == 0 {
-                    m.prop.group = groups.take();
+            let needs_group = ids
+                .iter()
+                .any(|&id| self.get(id).is_some_and(|m| m.prop.group == 0));
+            let mut groups = needs_group.then(|| GroupAlloc::of(self));
+            for &id in ids {
+                if let Some(m) = self.get_mut(id) {
+                    if m.prop.group == 0 {
+                        m.prop.group = groups.as_mut().unwrap().take();
+                    }
+                    m.prop.unbindable = false;
                 }
-                m.prop.unbindable = false;
             }
             return;
         }
-        self.make_slave(id);
-        if kind != PropagationType::Slave
-            && let Some(m) = self.get_mut(id)
-        {
-            m.prop.master = 0;
-            m.prop.unbindable = kind == PropagationType::Unbindable;
-        }
+        let target: std::collections::HashSet<MountId> = ids.iter().copied().collect();
+        self.leave_groups(&target, kind);
     }
 
-    /// Linux's `do_make_slave`: a shared mount with peers becomes a slave of its peer group; the
-    /// last member of a group leaves it for its own master (none: private), taking the group's
-    /// slaves along; a mount that is not shared keeps what it is.
-    fn make_slave(&mut self, id: MountId) {
-        let Some(m) = self.all().find(|m| m.id == id) else {
-            return;
-        };
-        let Propagation { group, master, .. } = m.prop;
-        if group == 0 {
-            return;
-        }
-        let peers = self.all().any(|o| o.id != id && o.prop.group == group);
-        if !peers {
-            for o in self.list.iter_mut().chain(self.detached.iter_mut()) {
-                if o.prop.master == group {
-                    o.prop.master = master;
+    /// Applies `Slave`, `Private` or `Unbindable` to every mount in `target` at once: any peer
+    /// group left without surviving members hands its slaves to its own master, and on up when
+    /// that group is left empty too (matching Linux's `do_make_slave` per mount).
+    fn leave_groups(&mut self, target: &std::collections::HashSet<MountId>, kind: PropagationType) {
+        debug_assert_ne!(kind, PropagationType::Shared);
+        let mut left: HashMap<u32, u32> = HashMap::new();
+        for &id in target {
+            let Some(m) = self.get_mut(id) else {
+                continue;
+            };
+            let old_group = m.prop.group;
+            let old_master = m.prop.master;
+            if old_group != 0 {
+                left.insert(old_group, old_master);
+            }
+            match kind {
+                PropagationType::Slave => {
+                    if old_group != 0 {
+                        m.prop.group = 0;
+                        m.prop.master = old_group;
+                    }
                 }
+                PropagationType::Private => m.prop = Propagation::default(),
+                PropagationType::Unbindable => {
+                    m.prop = Propagation {
+                        group: 0,
+                        master: 0,
+                        unbindable: true,
+                    };
+                }
+                PropagationType::Shared => unreachable!(),
             }
         }
-        if let Some(m) = self.get_mut(id) {
-            m.prop.group = 0;
-            m.prop.master = if peers { group } else { master };
+        if left.is_empty() {
+            return;
+        }
+        let alive: std::collections::HashSet<u32> = self
+            .all()
+            .map(|m| m.prop.group)
+            .filter(|&g| g != 0)
+            .collect();
+        left.retain(|g, _| !alive.contains(g));
+        if left.is_empty() {
+            return;
+        }
+        let mut resolved: HashMap<u32, Option<u32>> = HashMap::with_capacity(left.len());
+        let mut resolve = |g: u32| -> u32 {
+            if let Some(Some(r)) = resolved.get(&g) {
+                return *r;
+            }
+            let mut path = Vec::new();
+            let mut cur = g;
+            let dest = loop {
+                if let Some(&state) = resolved.get(&cur) {
+                    break state.unwrap_or(0);
+                }
+                match left.get(&cur) {
+                    Some(&up) => {
+                        resolved.insert(cur, None);
+                        path.push(cur);
+                        cur = up;
+                    }
+                    None => break cur,
+                }
+            };
+            for node in path {
+                resolved.insert(node, Some(dest));
+            }
+            dest
+        };
+        for m in self.list.iter_mut().chain(self.detached.iter_mut()) {
+            if left.contains_key(&m.prop.master) {
+                m.prop.master = resolve(m.prop.master);
+            }
         }
     }
 
@@ -4431,34 +4772,7 @@ impl Mounts {
     /// `change_mnt_propagation(MS_PRIVATE)` for each): a peer group left without members hands its
     /// slaves to its own master, and on up when that group is left empty too.
     fn make_private(&mut self, ids: &std::collections::HashSet<MountId>) {
-        let mut left: HashMap<u32, u32> = HashMap::new();
-        for m in self.list.iter_mut().chain(self.detached.iter_mut()) {
-            if ids.contains(&m.id) {
-                if m.prop.group != 0 {
-                    left.insert(m.prop.group, m.prop.master);
-                }
-                m.prop = Propagation::default();
-            }
-        }
-        let alive: std::collections::HashSet<u32> = self.all().map(|m| m.prop.group).collect();
-        left.retain(|g, _| !alive.contains(g));
-        if left.is_empty() {
-            return;
-        }
-        let resolve = |mut g: u32| {
-            for _ in 0..=left.len() {
-                match left.get(&g) {
-                    Some(&up) => g = up,
-                    None => break,
-                }
-            }
-            g
-        };
-        for m in self.list.iter_mut().chain(self.detached.iter_mut()) {
-            if left.contains_key(&m.prop.master) {
-                m.prop.master = resolve(m.prop.master);
-            }
-        }
+        self.leave_groups(ids, PropagationType::Private);
     }
 }
 
@@ -4622,20 +4936,24 @@ impl Index {
 /// ([`detach`]); a connected mount whose parent goes is disconnected, as one holding its own
 /// reference outlives its parent on Linux.
 fn keep_used(detached: &mut Vec<Mount>, in_use: &std::collections::HashSet<MountId>) {
-    let mut keep: std::collections::HashSet<MountId> = detached
-        .iter()
-        .map(|m| m.id)
-        .filter(|id| in_use.contains(id))
-        .collect();
-    loop {
-        let before = keep.len();
-        for m in detached.iter() {
-            if m.parent().is_some_and(|p| keep.contains(&p)) {
-                keep.insert(m.id);
-            }
+    let mut children: HashMap<MountId, Vec<MountId>> = HashMap::new();
+    let mut keep: std::collections::HashSet<MountId> = std::collections::HashSet::new();
+    let mut stack: Vec<MountId> = Vec::new();
+    for m in detached.iter() {
+        if let Some(p) = m.parent().filter(|&p| p != m.id) {
+            children.entry(p).or_default().push(m.id);
         }
-        if keep.len() == before {
-            break;
+        if in_use.contains(&m.id) && keep.insert(m.id) {
+            stack.push(m.id);
+        }
+    }
+    while let Some(id) = stack.pop() {
+        if let Some(kids) = children.get(&id) {
+            for &k in kids {
+                if keep.insert(k) {
+                    stack.push(k);
+                }
+            }
         }
     }
     detached.retain(|m| keep.contains(&m.id));
@@ -5733,6 +6051,524 @@ mod tests {
             .unwrap();
         assert_eq!(accessed.mnt(), id);
         assert!(!vfs.mount(id).unwrap().expiring);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_propagation_preserves_pnode_semantics_and_index() {
+        let (vfs, dir) = sample("batch-prop");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let usr = vfs
+            .resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/usr", true)
+            .unwrap();
+        let bin = vfs
+            .resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/bin", true)
+            .unwrap();
+        let sub = vfs
+            .store()
+            .mkdir(usr.ino().unwrap(), b"sub", 0o755, 0, 0)
+            .unwrap();
+        let sub_node = Node::Store(ROOT_MOUNT, sub);
+
+        let bind_mount = |src: &Node, at: &Node| {
+            let id = vfs.add_mount_unattached(
+                Fs::Store,
+                src.clone(),
+                (at.clone(), None),
+                0,
+                Vec::new(),
+                Some(ROOT_DEV),
+            );
+            let prop = vfs.propagation(src.mnt()).of_bind();
+            vfs.update_mount(id, |m| m.prop = prop);
+            vfs.attached(id);
+            id
+        };
+
+        // Create a surviving peer group G0 (outside_peer + root_a), a child group G1 slaved to G0,
+        // and a grandchild group G2 slaved to G1 with an external slave ext_slave outside the subtree.
+        let outside_peer = bind_mount(&bin, &bin);
+        vfs.set_propagation(outside_peer, PropagationType::Shared, false);
+        let g0 = vfs.propagation(outside_peer).group;
+        assert_ne!(g0, 0);
+
+        let root_a = bind_mount(&Node::Store(outside_peer, bin.ino().unwrap()), &usr);
+        assert_eq!(vfs.propagation(root_a).group, g0);
+
+        let child_b = vfs.add_mount(
+            Fs::Store,
+            sub_node.clone(),
+            (Node::Store(root_a, bin.ino().unwrap()), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        // Make child_b a shared slave of G0 (group G1, master G0)
+        vfs.update_mount(child_b, |m| {
+            m.prop = Propagation {
+                group: 0,
+                master: g0,
+                unbindable: false,
+            };
+        });
+        vfs.set_propagation(child_b, PropagationType::Shared, false);
+        let g1 = vfs.propagation(child_b).group;
+        assert_ne!(g1, 0);
+        assert_eq!(vfs.propagation(child_b).master, g0);
+
+        // Grandchild C is a shared slave of G1 (group G2, master G1)
+        let child_c = vfs.add_mount(
+            Fs::Store,
+            sub_node.clone(),
+            (Node::Store(child_b, sub), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        vfs.update_mount(child_c, |m| {
+            m.prop = Propagation {
+                group: 0,
+                master: g1,
+                unbindable: false,
+            };
+        });
+        vfs.set_propagation(child_c, PropagationType::Shared, false);
+        let g2 = vfs.propagation(child_c).group;
+        assert_ne!(g2, 0);
+        assert_eq!(vfs.propagation(child_c).master, g1);
+
+        // External slave of G2 outside root_a's subtree
+        let ext_slave = vfs.add_mount(
+            Fs::Store,
+            bin.clone(),
+            (sub_node.clone(), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        vfs.update_mount(ext_slave, |m| {
+            m.prop = Propagation {
+                group: 0,
+                master: g2,
+                unbindable: false,
+            };
+        });
+
+        // An unbindable leaf inside child_c must stay unbindable under Slave
+        let unbind_leaf = vfs.add_mount(
+            Fs::Store,
+            bin.clone(),
+            (Node::Store(child_c, sub), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        vfs.set_propagation(unbind_leaf, PropagationType::Unbindable, false);
+        assert!(vfs.subtree_has_unbindable(root_a));
+        assert!(!vfs.subtree_has_unbindable(outside_peer));
+
+        // Recursive MS_SLAVE on root_a:
+        // - root_a leaves G0, which still has outside_peer -> root_a becomes slave of G0
+        // - child_b empties G1 (master G0) and child_c empties G2 (master G1) -> both and
+        //   ext_slave transitively reparent their master to G0!
+        // - unbind_leaf stays unbindable.
+        vfs.set_propagation(root_a, PropagationType::Slave, true);
+        assert_eq!(
+            vfs.propagation(root_a),
+            Propagation {
+                group: 0,
+                master: g0,
+                unbindable: false,
+            }
+        );
+        assert_eq!(
+            vfs.propagation(child_b),
+            Propagation {
+                group: 0,
+                master: g0,
+                unbindable: false,
+            }
+        );
+        assert_eq!(
+            vfs.propagation(child_c),
+            Propagation {
+                group: 0,
+                master: g0,
+                unbindable: false,
+            }
+        );
+        assert_eq!(
+            vfs.propagation(ext_slave),
+            Propagation {
+                group: 0,
+                master: g0,
+                unbindable: false,
+            }
+        );
+        assert_eq!(
+            vfs.propagation(unbind_leaf),
+            Propagation {
+                group: 0,
+                master: 0,
+                unbindable: true,
+            }
+        );
+
+        // Recursive MS_SHARED on root_a assigns fresh groups to all 4 mounts and clears unbindable
+        vfs.set_propagation(root_a, PropagationType::Shared, true);
+        assert!(!vfs.subtree_has_unbindable(root_a));
+        for id in [root_a, child_b, child_c, unbind_leaf] {
+            assert_ne!(vfs.propagation(id).group, 0);
+            assert!(!vfs.propagation(id).unbindable);
+        }
+
+        // Now make outside_peer private (emptying G0): all slaves of G0 (including ext_slave)
+        // must become master=0.
+        vfs.set_propagation(outside_peer, PropagationType::Private, false);
+        assert_eq!(vfs.propagation(ext_slave).master, 0);
+        assert_eq!(vfs.propagation(root_a).master, 0);
+
+        // Recursive MS_PRIVATE on root_a clears all groups & masters in the subtree
+        vfs.set_propagation(root_a, PropagationType::Private, true);
+        for id in [root_a, child_b, child_c, unbind_leaf] {
+            assert_eq!(vfs.propagation(id), Propagation::default());
+        }
+
+        // Verify set_mount_attrs checks locks (EPERM) and writers (EBUSY) atomically before
+        // mutating anything, and bumps mount_events only once on success.
+        vfs.update_mount(child_c, |m| m.locks |= lock::NOEXEC);
+        let before_events = vfs.mount_events().get();
+        let mut writers_called = false;
+        assert_eq!(
+            vfs.set_mount_attrs(
+                root_a,
+                true,
+                |m| (m.flags | ms::RDONLY) & !ms::NOEXEC,
+                true,
+                || {
+                    writers_called = true;
+                    std::collections::HashSet::new()
+                },
+                Some(PropagationType::Shared),
+            ),
+            Err(Errno::EPERM)
+        );
+        assert!(!writers_called, "EPERM must short-circuit before writers");
+        assert_eq!(vfs.mount_events().get(), before_events);
+        assert_eq!(vfs.mount(root_a).unwrap().flags & ms::RDONLY, 0);
+
+        // Clear lock and fail with EBUSY due to an open writer on child_c
+        vfs.update_mount(child_c, |m| m.locks &= !lock::NOEXEC);
+        let before_events = vfs.mount_events().get();
+        assert_eq!(
+            vfs.set_mount_attrs(
+                root_a,
+                true,
+                |m| m.flags | ms::RDONLY,
+                true,
+                || std::collections::HashSet::from([child_c]),
+                Some(PropagationType::Shared),
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(vfs.mount_events().get(), before_events);
+        assert_eq!(vfs.mount(root_a).unwrap().flags & ms::RDONLY, 0);
+
+        // Succeed: every mount in subtree updated, propagation applied, single mounts_changed()
+        assert_eq!(
+            vfs.set_mount_attrs(
+                root_a,
+                true,
+                |m| m.flags | ms::RDONLY | ms::NODEV,
+                true,
+                std::collections::HashSet::new,
+                Some(PropagationType::Shared),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            vfs.mount_events().get(),
+            before_events + 1,
+            "recursive mount_setattr must rebuild fast-path mount points only once"
+        );
+        for id in [root_a, child_b, child_c, unbind_leaf] {
+            let m = vfs.mount(id).unwrap();
+            assert_eq!(m.flags & (ms::RDONLY | ms::NODEV), ms::RDONLY | ms::NODEV);
+            assert_ne!(m.prop.group, 0);
+        }
+
+        // propagation_targets filters by visibility: a peer rooted at /bin must not receive
+        // mounts under /usr/sub, while peers rooted at / or /usr do, and a peer rooted at
+        // /usr/sub itself receives it with at=None.
+        vfs.set_propagation(ROOT_MOUNT, PropagationType::Shared, false);
+        let g_root = vfs.propagation(ROOT_MOUNT).group;
+        let peer_root = vfs.add_mount_unattached(
+            Fs::Store,
+            Node::ROOT,
+            (bin.clone(), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        vfs.update_mount(peer_root, |m| {
+            m.prop = Propagation {
+                group: g_root,
+                master: 0,
+                unbindable: false,
+            };
+        });
+        let peer_usr = vfs.add_mount_unattached(
+            Fs::Store,
+            usr.clone(),
+            (bin.clone(), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        vfs.update_mount(peer_usr, |m| {
+            m.prop = Propagation {
+                group: g_root,
+                master: 0,
+                unbindable: false,
+            };
+        });
+        let peer_sub = vfs.add_mount_unattached(
+            Fs::Store,
+            sub_node.clone(),
+            (bin.clone(), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        vfs.update_mount(peer_sub, |m| {
+            m.prop = Propagation {
+                group: g_root,
+                master: 0,
+                unbindable: false,
+            };
+        });
+        let peer_bin = vfs.add_mount_unattached(
+            Fs::Store,
+            bin.clone(),
+            (bin.clone(), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        vfs.update_mount(peer_bin, |m| {
+            m.prop = Propagation {
+                group: g_root,
+                master: 0,
+                unbindable: false,
+            };
+        });
+        let at_entry = (usr.clone(), b"sub".to_vec());
+        let targets = vfs.propagation_targets(ps, (&sub_node, Some(&at_entry)));
+        let target_mnts: Vec<MountId> = targets.iter().map(|t| t.point.mnt()).collect();
+        assert_eq!(target_mnts, vec![peer_root, peer_usr, peer_sub]);
+        assert!(targets[0].at.is_some());
+        assert!(targets[1].at.is_some());
+        assert!(targets[2].at.is_none(), "on_root target must clear at");
+
+        vfs.mounts.borrow().verify_index();
+        vfs.umount_tree(root_a);
+        vfs.mounts.borrow().verify_index();
+        vfs.collect(&std::collections::HashSet::new());
+        vfs.mounts.borrow().verify_index();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn large_mount_tree_operations_avoid_quadratic_stalls() {
+        let (vfs, dir) = sample("mount-scale");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let usr = vfs
+            .resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/usr", true)
+            .unwrap();
+        let bin = vfs
+            .resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/bin", true)
+            .unwrap();
+        let sub = vfs
+            .store()
+            .mkdir(usr.ino().unwrap(), b"sub", 0o755, 0, 0)
+            .unwrap();
+        let sub_node = Node::Store(ROOT_MOUNT, sub);
+
+        const N: usize = 800;
+
+        // Build an 800-mount subtree under a single root (mix of chain + fanout)
+        let tree_root = vfs.add_mount(
+            Fs::Store,
+            usr.clone(),
+            (usr.clone(), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        let mut parent = tree_root;
+        let mut last = tree_root;
+        for i in 0..N {
+            let point = Node::Store(parent, sub);
+            let m = vfs.add_mount_unattached(
+                Fs::Store,
+                usr.clone(),
+                (point, None),
+                0,
+                Vec::new(),
+                Some(ROOT_DEV),
+            );
+            last = m;
+            // Create both depth and branching
+            if i % 4 == 0 {
+                parent = m;
+            }
+        }
+        vfs.mounts.borrow().verify_index();
+        assert_eq!(vfs.subtree(tree_root).len(), N + 1);
+
+        let start = std::time::Instant::now();
+
+        // 1. Recursive set_propagation across all 801 mounts (Shared -> Slave -> Unbindable -> Private)
+        vfs.set_propagation(tree_root, PropagationType::Shared, true);
+        assert_ne!(vfs.propagation(last).group, 0);
+        vfs.set_propagation(tree_root, PropagationType::Slave, true);
+        assert_eq!(vfs.propagation(last).group, 0);
+        vfs.set_propagation(tree_root, PropagationType::Unbindable, true);
+        assert!(vfs.subtree_has_unbindable(tree_root));
+        vfs.set_propagation(tree_root, PropagationType::Private, true);
+        assert!(!vfs.subtree_has_unbindable(tree_root));
+
+        // 2. attached() on the 801-mount subtree under a shared parent
+        vfs.set_propagation(ROOT_MOUNT, PropagationType::Shared, false);
+        vfs.attached(tree_root);
+        assert_ne!(vfs.propagation(tree_root).group, 0);
+        assert_ne!(vfs.propagation(last).group, 0);
+
+        // 3. move_tree's unbindable check (full negative scan, then deep positive hit)
+        assert!(!vfs.subtree_has_unbindable(tree_root));
+        vfs.set_propagation(last, PropagationType::Unbindable, false);
+        assert!(vfs.subtree_has_unbindable(tree_root));
+        vfs.set_propagation(last, PropagationType::Private, false);
+
+        // 4. mount_setattr(AT_RECURSIVE) with flags + propagation in one pass and one rebuild
+        let events_before = vfs.mount_events().get();
+        vfs.set_mount_attrs(
+            tree_root,
+            true,
+            |m| m.flags | ms::RDONLY | ms::NOSUID,
+            true,
+            std::collections::HashSet::new,
+            Some(PropagationType::Shared),
+        )
+        .unwrap();
+        assert_eq!(vfs.mount_events().get(), events_before + 1);
+        assert_eq!(
+            vfs.mount(last).unwrap().flags & (ms::RDONLY | ms::NOSUID),
+            ms::RDONLY | ms::NOSUID
+        );
+
+        // 5. move_mount of the 801-mount tree root
+        vfs.move_mount(tree_root, Some((bin.clone(), None)));
+        vfs.mounts.borrow().verify_index();
+        assert_eq!(vfs.mount(tree_root).unwrap().parent(), Some(ROOT_MOUNT));
+
+        // 6. Recursive bind copy (add_copies + attached) of the 801-mount tree onto /bin
+        let bind_root = vfs.add_mount_unattached(
+            Fs::Store,
+            usr.clone(),
+            (bin.clone(), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        {
+            let snapshot = vfs.mounts();
+            let sub_ids = vfs.subtree(tree_root);
+            let mut by_id: HashMap<MountId, &Mount> = snapshot.iter().map(|m| (m.id, m)).collect();
+            let mut plan_idx: HashMap<MountId, usize> = HashMap::new();
+            let mut plan: Vec<(Option<usize>, &Mount)> = Vec::with_capacity(sub_ids.len() - 1);
+            for &mid in &sub_ids[1..] {
+                let m = by_id.remove(&mid).unwrap();
+                let parent_idx = m.parent().and_then(|p| plan_idx.get(&p).copied());
+                plan_idx.insert(mid, plan.len());
+                plan.push((parent_idx, m));
+            }
+            vfs.add_copies(bind_root, &plan);
+        }
+        vfs.attached(bind_root);
+        assert_eq!(vfs.subtree(bind_root).len(), N + 1);
+        vfs.mounts.borrow().verify_index();
+        vfs.umount_tree(bind_root);
+        vfs.mounts.borrow().verify_index();
+
+        // 7. propagation_targets across 800 peers (half rooted at /usr seeing /usr/sub, half at /bin)
+        let shared_root = vfs.add_mount(
+            Fs::Store,
+            Node::ROOT,
+            (sub_node.clone(), None),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        vfs.set_propagation(shared_root, PropagationType::Shared, false);
+        let peer_group = vfs.propagation(shared_root).group;
+        {
+            let mut mounts = vfs.mounts.borrow_mut();
+            for i in 0..N {
+                let id = mounts.next;
+                mounts.next += 1;
+                let root = if i % 2 == 0 { usr.clone() } else { bin.clone() };
+                mounts.push_attached(Mount {
+                    id,
+                    ns: INIT_MNT_NS,
+                    fs: Fs::Store,
+                    root: root.in_mount(id),
+                    point: Some(Node::Store(ROOT_MOUNT, sub)),
+                    at: None,
+                    root_at: None,
+                    root_gone: false,
+                    flags: 0,
+                    dev: ROOT_DEV,
+                    source: Vec::new(),
+                    expiring: false,
+                    pin: None,
+                    locks: 0,
+                    prop: Propagation {
+                        group: peer_group,
+                        master: 0,
+                        unbindable: false,
+                    },
+                    owner: None,
+                });
+            }
+        }
+        let targets = vfs.propagation_targets(
+            ps,
+            (
+                &Node::Store(shared_root, sub),
+                Some(&(
+                    Node::Store(shared_root, usr.ino().unwrap()),
+                    b"sub".to_vec(),
+                )),
+            ),
+        );
+        assert_eq!(targets.len(), N / 2);
+
+        // Clean unmount & index verification
+        vfs.umount_tree(tree_root);
+        vfs.mounts.borrow().verify_index();
+        vfs.collect(&std::collections::HashSet::new());
+        vfs.mounts.borrow().verify_index();
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "800-mount operations took {elapsed:?}, expected well below stall threshold"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
