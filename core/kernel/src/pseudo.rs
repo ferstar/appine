@@ -12,7 +12,6 @@ use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use appine_engine::PAGE_SIZE;
 
@@ -962,7 +961,7 @@ pub(crate) enum PseudoNode {
     SysBlock(u32, &'static [u8]),
     /// A cgroup directory (empty name), or a file in it (names from [`crate::cgroup::FILES`]): the
     /// cgroup id and the file name.
-    Cgroup(u64, &'static [u8]),
+    Cgroup(u64, &'static [u8], u64),
     /// `/proc/<pid>/ns/<kind>` (including those in the task subdirectories): a magic link to a
     /// namespace.
     Ns(ProcId, Option<Tid>, NsKind),
@@ -1234,7 +1233,7 @@ impl Pseudo for View<'_> {
         Some(match node {
             PtsRoot(_) | ProcRoot | SysRoot | MqRoot(_) => return None,
             // A child cgroup's parent is its parent cgroup; the root has none
-            Cgroup(id, b"") => Cgroup(self.k.cgroups.get(*id)?.parent?, b""),
+            Cgroup(id, b"", 0) => Cgroup(self.k.cgroups.get(*id)?.parent?, b"", 0),
             Mq(ns, _) => MqRoot(*ns),
             Pts(fs, _) | PtsPtmx(fs) => PtsRoot(*fs),
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
@@ -1258,7 +1257,7 @@ impl Pseudo for View<'_> {
             SysBlock(n, path) => {
                 tree_parent(&BLOCK_FILES, path).map_or(SysBlock(*n, b""), |p| SysBlock(*n, p))
             }
-            Cgroup(id, _) => Cgroup(*id, b""),
+            Cgroup(id, _, _) => Cgroup(*id, b"", 0),
             NetConf(v6, _, b"", _) => Static(if *v6 { NET_CONF6 } else { NET_CONF4 }),
             NetSysctl(path, _) => {
                 let dir = &path[..=path.find('/').unwrap_or(0)];
@@ -1316,13 +1315,13 @@ impl Pseudo for View<'_> {
                 .interface(*p)
                 .map_or_else(|| p.to_string(), |i| i.name)
                 .into_bytes(),
-            Cgroup(crate::cgroup::ROOT, b"") => b"cgroup".to_vec(),
-            Cgroup(id, b"") => self
+            Cgroup(crate::cgroup::ROOT, b"", 0) => b"cgroup".to_vec(),
+            Cgroup(id, b"", 0) => self
                 .k
                 .cgroups
                 .get(*id)
                 .map_or_else(|| id.to_string().into_bytes(), |g| g.name.clone()),
-            Cgroup(_, name) => name.to_vec(),
+            Cgroup(_, name, _) => name.to_vec(),
             Pid(proc, None) => self
                 .pid_ns(mnt)
                 .vnr(proc.pid)
@@ -1451,14 +1450,17 @@ impl Pseudo for View<'_> {
                     (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
                 }),
             // A child cgroup, or a file this cgroup has
-            Cgroup(id, b"") => self.k.cgroups.get(*id).and_then(|g| {
-                g.children.get(name).map(|&c| Cgroup(c, b"")).or_else(|| {
-                    self.k
-                        .cgroups
-                        .files(*id)
-                        .find(|f| *f == name)
-                        .map(|f| Cgroup(*id, f))
-                })
+            Cgroup(id, b"", 0) => self.k.cgroups.get(*id).and_then(|g| {
+                g.children
+                    .get(name)
+                    .map(|&c| Cgroup(c, b"", 0))
+                    .or_else(|| {
+                        self.k
+                            .cgroups
+                            .files(*id)
+                            .find(|(f, _)| *f == name)
+                            .map(|(f, generation)| Cgroup(*id, f, generation))
+                    })
             }),
             SysCpu(n, path) => tree_lookup(&CPU_FILES, path, name)
                 .or_else(|| {
@@ -1533,7 +1535,7 @@ impl Pseudo for View<'_> {
             SysCpu(_, p) | SysNet(_, p) | SysBlock(_, p) if p.is_empty() || p.ends_with(b"/") => {
                 mode::S_IFDIR
             }
-            Cgroup(_, b"") => mode::S_IFDIR,
+            Cgroup(_, b"", 0) => mode::S_IFDIR,
             NetStatic(..) | NetSysctl(..) | IpcSysctl(..) => mode::S_IFREG,
             NetConf(_, dir, name, net) => {
                 if !Self::conf_dir_exists_in(&net.0, *dir) {
@@ -1707,7 +1709,7 @@ impl Pseudo for View<'_> {
 
     /// A cgroup directory is searched by its mode, as kernfs checks it (mkdir gives it one).
     fn searched(&self, node: &PseudoNode) -> Option<Stat> {
-        matches!(node, PseudoNode::Cgroup(_, b"")).then(|| stat(self, node).ok())?
+        matches!(node, PseudoNode::Cgroup(_, b"", 0)).then(|| stat(self, node).ok())?
     }
 
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {
@@ -1977,6 +1979,14 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
 pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     // mqueue filesystem: owners, permissions and times are kept on the queues and the namespace
     match node {
+        PseudoNode::Cgroup(id, name, _) => {
+            if gone(ps.k, node) {
+                return Err(Errno::ENODEV);
+            }
+            let mut st = ps.k.cgroups.get(*id).ok_or(Errno::ENOENT)?.attrs(name)?;
+            st.ino = node_ino(node);
+            return Ok(st);
+        }
         PseudoNode::MqRoot(ns) => {
             let (_, ipc) = ps.k.ipcs.get(ns).ok_or(Errno::ENOENT)?;
             let mut st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
@@ -1993,14 +2003,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let kind = ps.kind(node)?;
     let sysfs = matches!(fs_of(node), Fs::Sys | Fs::Cgroup);
     let perm = match (kind, node) {
-        // A cgroup directory has the mode mkdir gave it
-        (mode::S_IFDIR, PseudoNode::Cgroup(id, b"")) => {
-            ps.k.cgroups.get(*id).ok_or(Errno::ENOENT)?.mode
-        }
         (mode::S_IFDIR, _) if sysfs => 0o755,
-        (_, PseudoNode::Cgroup(_, name)) if !name.is_empty() => {
-            crate::cgroup::file_mode(name).unwrap_or(0o444)
-        }
         (mode::S_IFDIR, _) => 0o555,
         // proc_fd_instantiate: read and search bits for a readable file, write and search for a
         // writable one (none for O_PATH)
@@ -2146,7 +2149,6 @@ fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
         | PseudoNode::Entry(proc, tid, _)
         | PseudoNode::Fd(proc, tid, _) => dump_owner(k, *proc, *tid),
         PseudoNode::Pts(fs, n) => pty(k, *fs, *n).map_or((0, 0), |t| t.borrow().owner),
-        PseudoNode::Cgroup(id, _) => k.cgroups.get(*id).map_or((0, 0), |g| (g.uid, g.gid)),
         _ => (0, 0),
     }
 }
@@ -2287,10 +2289,14 @@ pub(crate) fn readdir(
                 nodes.extend(tree_children(&PORT_FILES, path).map(|p| SysNet(*n, p)));
             }
         }
-        Cgroup(id, b"") => {
-            nodes.extend(ps.k.cgroups.files(*id).map(|f| Cgroup(*id, f)));
+        Cgroup(id, b"", 0) => {
+            nodes.extend(
+                ps.k.cgroups
+                    .files(*id)
+                    .map(|(f, generation)| Cgroup(*id, f, generation)),
+            );
             if let Some(g) = ps.k.cgroups.get(*id) {
-                nodes.extend(g.children.values().map(|&c| Cgroup(c, b"")));
+                nodes.extend(g.children.values().map(|&c| Cgroup(c, b"", 0)));
             }
         }
         SysCpu(n, path) => {
@@ -2395,7 +2401,7 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
         PseudoNode::ProcRoot
             | PseudoNode::SysRoot
             | PseudoNode::PtsRoot(_)
-            | PseudoNode::Cgroup(crate::cgroup::ROOT, b"")
+            | PseudoNode::Cgroup(crate::cgroup::ROOT, b"", 0)
     ) {
         return 1;
     }
@@ -2420,7 +2426,7 @@ const HZ: u64 = crate::loader::CLOCK_TICKS;
 
 /// The procfs files that can be written.
 pub(crate) fn writable(node: &PseudoNode) -> bool {
-    if let PseudoNode::Cgroup(_, name) = node {
+    if let PseudoNode::Cgroup(_, name, _) = node {
         return crate::cgroup::file_mode(name).is_some_and(|m| m & 0o200 != 0);
     }
     if let PseudoNode::NetConf(_, _, name, _) = node {
@@ -2579,7 +2585,7 @@ pub(crate) fn has_iter(node: &PseudoNode, write: bool) -> bool {
 /// Files that cannot be read: write-only cgroup files (`cgroup.kill`); as on Linux this is not
 /// checked at open, and reading is EINVAL (`cgroup_seqfile_show` has no read callback).
 pub(crate) fn unreadable(node: &PseudoNode) -> bool {
-    matches!(node, PseudoNode::Cgroup(_, name)
+    matches!(node, PseudoNode::Cgroup(_, name, _)
         if crate::cgroup::file_mode(name).is_some_and(|m| m & 0o444 == 0))
         || matches!(node, PseudoNode::Static(b"sys/vm/drop_caches"))
 }
@@ -2904,8 +2910,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 self::Entry::SmapsRollup => {
                     task.map_or(String::new(), |t| smaps(ps.vfs.store(), &t, true))
                 }
-                // Binary, computed from the read or write position (`read_pagemap`, `read_mem`,
-                // `write_mem`)
+                // Binary, computed from the read or write position (`read_pagemap`, `access_mem`).
                 self::Entry::Pagemap | self::Entry::Mem => String::new(),
                 self::Entry::Auxv => {
                     let auxv =
@@ -3015,8 +3020,9 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         NetConf(v6, dir, name, net) => crate::netdev::conf_read(&net.0, *v6, *dir, name)?,
         NetSysctl(path, net) => crate::netconf::sysctl_read(&net.0.devs.borrow().conf, path),
         // Removed cgroups / disabled controllers are ENODEV; write-only files are EINVAL
-        Cgroup(_, b"") => return Err(Errno::EISDIR),
-        Cgroup(id, name) => {
+        Cgroup(_, b"", 0) => return Err(Errno::EISDIR),
+        Cgroup(id, name, _) => {
+            if gone(ps.k, node) { return Err(Errno::ENODEV); }
             // Ids as the reader's pid namespace sees them (task_pid_vnr: current's, not the
             // mount's)
             let ns = ps.k.pid_ns_of(ps.tgid);
@@ -3680,75 +3686,43 @@ pub(crate) fn read_pagemap(
     Ok(n * 8)
 }
 
-/// Reads `/proc/<pid>/mem` (`mm` is the address space at open; once it is released reads get
-/// EOF): the position is the address. Reads page by page and stops at a page that cannot be read;
-/// when not a single byte was read, it is EIO (Linux's `mem_rw`). As Linux's access_remote_vm,
-/// a page below a grows-down mapping grows it first, within the reader's `RLIMIT_STACK`
-/// (`limit`).
-pub(crate) fn read_mem(
+/// Transfers bytes through an open /proc/<pid>/mem, holding the address space at open for
+/// this operation. Fill a cold FUSE page without holding an Mm borrow and retry that page.
+/// An expired address space gives EOF. An inaccessible page gives EIO or the preceding count.
+pub(crate) fn access_mem(
+    cx: &mut crate::kernel::Cx<'_>,
     mm: Option<Rc<RefCell<crate::mm::Mm>>>,
-    buf: &mut [u8],
     pos: u64,
-    limit: u64,
+    len: usize,
+    mut transfer: impl FnMut(&mut crate::mm::Mm, u64, Range<usize>) -> Result<(), Errno>,
 ) -> Result<usize, Errno> {
-    let Some(mm) = mm else {
-        return Ok(0);
-    };
-    let mut mm = mm.borrow_mut();
+    let Some(mm) = mm else { return Ok(0) };
+    let limit = cx.stack_limit();
     let mut done = 0;
-    while done < buf.len() {
+    while done < len {
         let Some(addr) = pos.checked_add(done as u64) else {
             break;
         };
-        let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(buf.len() - done);
-        let out = &mut buf[done..done + n];
-        if mm.read_force(addr, out).is_err()
-            && !(mm.grow_for(addr, n, limit) && mm.read_force(addr, out).is_ok())
-        {
+        let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(len - done);
+        let result = crate::syscall::retry_user_pages(cx, Errno::EIO, |_| {
+            let mut mm = mm.borrow_mut();
+            match transfer(&mut mm, addr, done..done + n) {
+                Err(Errno::EFAULT) if mm.grow_for(addr, n, limit) => {
+                    transfer(&mut mm, addr, done..done + n)
+                }
+                result => result,
+            }
+        });
+        if result.is_err() {
             break;
         }
         done += n;
     }
-    if done == 0 && !buf.is_empty() {
-        return Err(Errno::EIO);
+    if done == 0 && len != 0 {
+        Err(Errno::EIO)
+    } else {
+        Ok(done)
     }
-    Ok(done)
-}
-
-/// Writes `/proc/<pid>/mem`: a forced write like PTRACE_POKETEXT ([`Mm::write_force`]), page by
-/// page, stopping at a page that cannot be written; grows grows-down mappings as [`read_mem`]
-/// does. `current` is the writing thread.
-///
-/// [`Mm::write_force`]: crate::mm::Mm::write_force
-pub(crate) fn write_mem(
-    mm: Option<Rc<RefCell<crate::mm::Mm>>>,
-    data: &[u8],
-    pos: u64,
-    current: &Arc<crate::task::TaskSync>,
-    limit: u64,
-) -> Result<usize, Errno> {
-    let Some(mm) = mm else {
-        return Ok(0);
-    };
-    let mut mm = mm.borrow_mut();
-    let mut done = 0;
-    while done < data.len() {
-        let Some(addr) = pos.checked_add(done as u64) else {
-            break;
-        };
-        let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(data.len() - done);
-        let page = &data[done..done + n];
-        if mm.write_force(addr, page, current).is_err()
-            && !(mm.grow_for(addr, n, limit) && mm.write_force(addr, page, current).is_ok())
-        {
-            break;
-        }
-        done += n;
-    }
-    if done == 0 && !data.is_empty() {
-        return Err(Errno::EIO);
-    }
-    Ok(done)
 }
 
 /// `/proc/<pid>/mounts` (`info` false) or `mountinfo`: as with Linux's `show_vfsmnt` and
@@ -4739,8 +4713,12 @@ fn write_value(
     data: &[u8],
 ) -> Result<(), Errno> {
     match node {
-        PseudoNode::Cgroup(id, name) => {
+        PseudoNode::Cgroup(id, name, _) => {
+            if gone(k, node) {
+                return Err(Errno::ENODEV);
+            }
             let writer = crate::cgroup::Writer {
+                cred,
                 tid,
                 pid_ns,
                 ns_root: ns.cgroup.root,
@@ -5343,7 +5321,10 @@ pub(crate) fn gone(k: &Kernel, node: &PseudoNode) -> bool {
         | PseudoNode::FdInfo(proc, tid, _)
         | PseudoNode::Ns(proc, tid, _) => !pid_exists_in(k, *proc, *tid),
         PseudoNode::OpenExe(proc) => group_of_id(k, *proc).is_none(),
-        PseudoNode::Cgroup(id, name) if !name.is_empty() => !k.cgroups.has_file(*id, name),
+        PseudoNode::Cgroup(id, name, generation) if !name.is_empty() => !k
+            .cgroups
+            .files(*id)
+            .any(|entry| entry == (*name, *generation)),
         _ => false,
     }
 }
@@ -5477,7 +5458,7 @@ mod tests {
         let sysctl = PseudoNode::Static(b"sys/kernel/ostype");
         assert!(has_iter(&sysctl, false));
         assert!(has_iter(&sysctl, true));
-        let cg = PseudoNode::Cgroup(1, b"memory.max");
+        let cg = PseudoNode::Cgroup(1, b"memory.max", 0);
         assert!(has_iter(&cg, false));
         assert!(has_iter(&cg, true));
     }

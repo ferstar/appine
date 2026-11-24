@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FOPEN_KEEP_CACHE on open and create, including the no-open fallback)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: core-dump fills and proc memory reads and writes)
 
 ## Responsibilities
 
@@ -141,7 +141,7 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 - Waiting (6.1's `request_wait_answer`): a signal marks the request interrupted; once the daemon
   holds it a `FUSE_INTERRUPT` is queued (at once, or when the daemon reads an already-interrupted
   request) and the wait goes on. A killed thread takes back a request not yet read (EINTR), except
-  a forced one (`FUSE_FLUSH`, 6.1's `FR_FORCE`); one already read, or forced, is waited for until
+  a forced one (flush, teardown writeback or a core-dump fill); one already read, or forced, is waited for until
   answered or aborted (after an interrupt), unless the system is stopping, when it is left to the
   daemon and the call is EINTR.
 - One wake object per side: every reply wakes every waiter of the connection, every new request
@@ -340,7 +340,9 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 - Pages are read as they are touched (`fill`: `FUSE_READ` through the mapped file's handle, the
   BKL released): on a guest fault, on a kernel copy failing with `FUSE_RETRY`, before read and
   write syscalls for their buffers (`prefault`), and for the whole mapping with `MAP_POPULATE`
-  (errors ignored). How much one fault reads is `kernel/mm`'s (`Fill::window`).
+  (errors ignored). Proc memory transfers retry each cold page locally. Core dumps force fills for
+  selected file pages and ELF header checks after group exit. If only the dumping process holds the device,
+  its cold pages are unavailable. How much one fault reads is `kernel/mm`'s (`Fill::window`).
 - execve of a FUSE program (or interpreter) reads it whole into a memfd through a retry
   (`Query::Program`, one copy per file per syscall), runs it as from a nosuid mount, and gives it
   its node's key as inode number, so running it and writing it exclude each other (ETXTBSY).

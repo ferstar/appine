@@ -653,6 +653,8 @@ static void test_cgroup_enodev(void)
 
     /* Re-enable memory controller: value must still be "max" (failed write stored nothing) */
     write_str("/sys/fs/cgroup/cgroup.subtree_control", "+memory\n");
+    CHECK_ERR(fchmod(mfd, 0600), ENODEV, "old fd must not chmod replacement");
+    CHECK_ERR(pwrite(mfd, "4096\n", 5, 0), ENODEV, "old fd must not write replacement");
     read_str("/sys/fs/cgroup/cg_test/memory.max", buf, sizeof(buf));
     CHECK(strcmp(buf, "max\n") == 0, "memory.max after failed write expected max, got %s", buf);
 
@@ -666,6 +668,43 @@ static void test_cgroup_enodev(void)
     close(mfd);
     close(pfd);
     write_str("/sys/fs/cgroup/cgroup.subtree_control", "-memory -pids\n");
+}
+
+/* A directory and its interface files can be delegated independently. */
+static void test_cgroup_delegation(void)
+{
+    const char *base = "/sys/fs/cgroup/delegate";
+    CHECK(mkdir(base, 0755) == 0, "create delegation root");
+    int dir = open(base, O_RDONLY | O_DIRECTORY);
+    CHECK(dir >= 0 && fchown(dir, 1000, 1000) == 0, "delegate directory by fd");
+    struct stat st;
+    CHECK(fstatat(dir, "cgroup.procs", &st, 0) == 0 && st.st_uid == 0,
+          "chown directory preserves interface owners");
+    int procs = openat(dir, "cgroup.procs", O_RDWR);
+    CHECK(procs >= 0 && fchown(procs, 1000, 1000) == 0 && fchmod(procs, 0600) == 0,
+          "delegate membership file");
+    CHECK(fstat(procs, &st) == 0 && st.st_uid == 1000 && (st.st_mode & 0777) == 0600,
+          "descriptor reports delegated attributes");
+    pid_t child = fork();
+    CHECK(child >= 0, "fork delegate");
+    if (child == 0) {
+        /* Enter the subtree with the original credentials before running as its delegate. */
+        write_str("/sys/fs/cgroup/delegate/cgroup.procs", "0");
+        CHECK(setgid(1000) == 0 && setuid(1000) == 0, "become delegate");
+        CHECK(mkdirat(dir, "child", 0755) == 0, "create delegated child");
+        CHECK(fstatat(dir, "child/cgroup.procs", &st, 0) == 0 && st.st_uid == 1000,
+              "new files belong to creator");
+        write_str("/sys/fs/cgroup/delegate/child/cgroup.procs", "0");
+        CHECK_ERR(openat(dir, "cgroup.max.depth", O_WRONLY), EACCES, "nondelegated file stays protected");
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "delegate creates child and migrates");
+    close(procs);
+    CHECK(unlinkat(dir, "child", AT_REMOVEDIR) == 0, "remove delegated child");
+    close(dir);
+    CHECK(rmdir(base) == 0, "remove delegated root");
 }
 
 /* 9. Native AIO refuses procfs files without read_iter/write_iter */
@@ -1131,6 +1170,7 @@ int main(int argc, char **argv, char **envp)
     test_sysctl_write_position();
     test_sysctl_namespace_pinning();
     test_cgroup_enodev();
+    test_cgroup_delegation();
     test_aio_procfs_has_iter();
     test_past_eof_fault_permissions();
     test_mlock_semantics();

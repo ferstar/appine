@@ -949,6 +949,8 @@ fn wait_answer(cx: &mut Cx<'_>, conn: &Rc<RefCell<Conn>>, unique: u64) -> Result
             let Some(r) = c.requests.get_mut(&unique) else {
                 return Err(Errno::ECONNABORTED);
             };
+            // The exit path sets killed before issuing forced I/O and still needs its reply.
+            let interruptible = !(r.interrupted || killed && r.force);
             match r.state {
                 ReqState::Done(_) => {
                     let Some(Req {
@@ -970,7 +972,7 @@ fn wait_answer(cx: &mut Cx<'_>, conn: &Rc<RefCell<Conn>>, unique: u64) -> Result
                     return Err(Errno::EINTR);
                 }
                 ReqState::Sent
-                    if !r.interrupted && c.no & no::INTERRUPT == 0 && cx.interrupted() =>
+                    if interruptible && c.no & no::INTERRUPT == 0 && cx.interrupted() =>
                 {
                     r.interrupted = true;
                     c.interrupts.push_back(unique);
@@ -978,7 +980,7 @@ fn wait_answer(cx: &mut Cx<'_>, conn: &Rc<RefCell<Conn>>, unique: u64) -> Result
                     request_wake_object(readers(conn));
                 }
                 // Not read yet: the interrupt is sent when it is (FR_INTERRUPTED)
-                ReqState::Pending if !r.interrupted && cx.interrupted() => r.interrupted = true,
+                ReqState::Pending if interruptible && cx.interrupted() => r.interrupted = true,
                 _ => {}
             }
         }
@@ -1985,12 +1987,12 @@ pub(crate) fn serve(
             Ok(_) | Err(Errno::ENOENT) => Ok(()),
             Err(e) => Err(e),
         },
-        Query::Getattr(id) => getattr(cx, &vfs, id, None).map(|_| ()),
+        Query::Getattr(id) => getattr(cx, &vfs, id, None, false).map(|_| ()),
         Query::Program(id) => {
             use crate::fd::oflags;
             let h = open(cx, &vfs, id, oflags::O_RDONLY | oflags::O_LARGEFILE, false)?;
             program_opened(cx.kr(), id);
-            let size = getattr(cx, &vfs, id, Some(h.fh))?.size;
+            let size = getattr(cx, &vfs, id, Some(h.fh), false)?.size;
             let copy = snapshot(cx, (&h.conn, h.nodeid, h.fh, h.flags), 0, size)?;
             drop(h);
             PROGRAMS.with_borrow_mut(|p| p.push((id, copy)));
@@ -2051,6 +2053,7 @@ pub(crate) fn getattr(
     vfs: &super::Vfs,
     id: FuseId,
     fh: Option<u64>,
+    forced: bool,
 ) -> Result<Attr, Errno> {
     const GETATTR_FH: u32 = 1;
     let (conn, nodeid) = target(vfs, id)?;
@@ -2058,7 +2061,14 @@ pub(crate) fn getattr(
         .u32(if fh.is_some() { GETATTR_FH } else { 0 })
         .u32(0)
         .u64(fh.unwrap_or(0));
-    let reply = call(cx, &conn, op::GETATTR, nodeid, &args.0)?;
+    let reply = request(
+        cx,
+        &cx.cred(),
+        &conn,
+        (op::GETATTR, nodeid),
+        &args.0,
+        forced,
+    )?;
     let ns = conn.borrow().user_ns.clone();
     let (attr, until) = attr_out(&reply, &ns)?;
     let mut f = vfs.fuse_mut();
@@ -2261,6 +2271,7 @@ pub(crate) fn read(
     h: (&Rc<RefCell<Conn>>, u64, u64, u32),
     offset: u64,
     len: usize,
+    forced: bool,
 ) -> Result<Vec<u8>, Errno> {
     let (conn, nodeid, fh, flags) = h;
     let chunk = conn.borrow().max_read as usize;
@@ -2275,7 +2286,7 @@ pub(crate) fn read(
             .u64(0)
             .u32(flags)
             .u32(0);
-        let data = match call(cx, conn, op::READ, nodeid, &args.0) {
+        let data = match request(cx, &cx.cred(), conn, (op::READ, nodeid), &args.0, forced) {
             Ok(d) => d,
             Err(e) if out.is_empty() => return Err(e),
             Err(_) => break,
@@ -2483,7 +2494,7 @@ pub(crate) fn snapshot(
     len: u64,
 ) -> Result<std::fs::File, Errno> {
     use std::os::unix::fs::FileExt;
-    let data = read(cx, h, offset, len as usize)?;
+    let data = read(cx, h, offset, len as usize, false)?;
     let file = appine_hal::memfd(c"appine-fuse").map_err(Errno)?;
     file.set_len(offset + data.len() as u64)
         .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;

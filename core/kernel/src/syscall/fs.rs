@@ -978,7 +978,7 @@ fn open_pseudo(
         PseudoNode::Entry(_, _, pseudo::Entry::Mounts | pseudo::Entry::MountInfo) => {
             Some(crate::fd::ProcEvent::mounts(vfs.mount_events()))
         }
-        PseudoNode::Cgroup(id, name) if !name.is_empty() => Some(crate::fd::ProcEvent::kernfs(
+        PseudoNode::Cgroup(id, name, _) if !name.is_empty() => Some(crate::fd::ProcEvent::kernfs(
             crate::cgroup::observe(cx.k(), id, name)
                 .unwrap_or_else(|| Rc::new(std::cell::Cell::new(1))),
         )),
@@ -4514,8 +4514,11 @@ fn read_bytes_inner(
             Ok(message.len())
         }
         IoPath::Mem(mm) => {
+            let _pos = PosGuard::lock_if(cx, file, !pos_held && offset.is_none())?;
             let pos = offset.unwrap_or(file.borrow().pos);
-            let n = pseudo::read_mem(mm, buf, pos, cx.stack_limit())?;
+            let n = pseudo::access_mem(cx, mm, pos, buf.len(), |mm, addr, range| {
+                mm.read_force(addr, &mut buf[range])
+            })?;
             if offset.is_none() {
                 file.borrow_mut().pos = pos.wrapping_add(n as u64);
             }
@@ -4916,9 +4919,12 @@ fn write_bytes_inner(
             crate::vfs::fuse::dev_write(cx, &vfs, file, data)
         }
         IoPath::Mem(mm) => {
+            let _pos = PosGuard::lock_if(cx, file, !pos_held && offset.is_none())?;
             let pos = offset.unwrap_or(file.borrow().pos);
             let sync = cx.task.sync.clone();
-            let n = pseudo::write_mem(mm, data, pos, &sync, cx.stack_limit())?;
+            let n = pseudo::access_mem(cx, mm, pos, data.len(), |mm, addr, range| {
+                mm.write_force(addr, &data[range], &sync)
+            })?;
             if offset.is_none() {
                 file.borrow_mut().pos = pos.wrapping_add(n as u64);
             }
@@ -5028,13 +5034,13 @@ fn write_proc(
         }
     }
     // The cgroup memory limit changed: wake the timer thread to measure once right away
-    if let PseudoNode::Cgroup(_, b"memory.max") = node {
+    if let PseudoNode::Cgroup(_, b"memory.max", _) = node {
         cx.k().oom.recheck();
         crate::kernel::signal_later(&cx.shared.timers);
     }
     // A write is IN_MODIFY (fsnotify_modify); of the synthetic files only cgroup2's can be
     // watched
-    if let PseudoNode::Cgroup(id, name) = node {
+    if let PseudoNode::Cgroup(id, name, _) = node {
         let key = crate::cgroup::key(id, name);
         super::kernfs_modified(cx.kr(), key, crate::cgroup::key(id, b""), name);
     }
@@ -5529,7 +5535,15 @@ fn unlocked_io(
 /// Whether `f` performs unlocked I/O on its position and must serialize position readers/writers
 /// with `pos_busy` (regular files and FUSE files).
 fn needs_pos_lock(f: &OpenFile) -> bool {
-    matches!(f.kind, FileKind::Regular { .. } | FileKind::Fuse(_))
+    matches!(
+        f.kind,
+        FileKind::Regular { .. }
+            | FileKind::Fuse(_)
+            | FileKind::Proc {
+                node: PseudoNode::Entry(_, _, pseudo::Entry::Mem),
+                ..
+            }
+    )
 }
 
 /// RAII guard holding `OpenFile::pos_busy` (Linux's `f_pos_lock`).
@@ -5768,8 +5782,8 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
     }
     follow_copy_up(cx, &file)?;
     // Serialize regular-file seeks against unlocked I/O using pos_busy (Linux's f_pos_lock)
-    let regular = matches!(file.borrow().kind, FileKind::Regular { .. });
-    let _pos = PosGuard::lock_if(cx, &file, regular)?;
+    let positioned = needs_pos_lock(&file.borrow());
+    let _pos = PosGuard::lock_if(cx, &file, positioned)?;
     let mut f = file.borrow_mut();
     let OpenFile { kind, pos, .. } = &mut *f;
     let base = match kind {
@@ -6823,7 +6837,7 @@ fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], perm: u32) -> Option<R
         let exists = cgroups
             .get(id)
             .is_some_and(|g| g.children.contains_key(name))
-            || cgroups.files(id).any(|f| f == name);
+            || cgroups.has_file(id, name);
         if name == b"." || name == b".." || exists {
             return Err(Errno::EEXIST);
         }
@@ -7195,7 +7209,7 @@ fn cgroup_unlink(
         }
         let cgroups = &cx.kr().cgroups;
         let child = cgroups.get(id).and_then(|g| g.children.get(name).copied());
-        let file = cgroups.files(id).any(|f| f == name);
+        let file = cgroups.has_file(id, name);
         if child.is_none() && !file {
             return Err(Errno::ENOENT);
         }
@@ -7221,10 +7235,10 @@ fn cgroup_parent<'p>(
     let (dir, name) = vfs
         .resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)
         .ok()?;
-    let Node::Pseudo(_, PseudoNode::Cgroup(id, b"")) = dir else {
+    let Node::Pseudo(_, PseudoNode::Cgroup(id, b"", 0)) = dir else {
         return None;
     };
-    let st = pseudo::stat(&cx.view(&vfs), &PseudoNode::Cgroup(id, b"")).ok()?;
+    let st = pseudo::stat(&cx.view(&vfs), &PseudoNode::Cgroup(id, b"", 0)).ok()?;
     Some((dir, id, st, name))
 }
 
@@ -7835,7 +7849,7 @@ fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino, (dir, name): (Ino, &[u8
 
 /// What chmod, chown and utimensat act on: a store inode, or `/dev/pts/<n>` (owner, permissions
 /// and times are kept on the terminal, as with Linux's devpts). Other nodes in synthetic
-/// filesystems cannot be modified.
+/// filesystems route through their own attribute storage when supported.
 enum Attrs {
     Store(Ino),
     /// A node in an overlay: checked as what the overlay shows, changed in the upper layer
@@ -7851,6 +7865,7 @@ enum Attrs {
     Mq(Rc<RefCell<super::MessageQueue>>),
     /// The root directory of the mqueue filesystem of an IPC namespace (its id).
     MqDir(u64),
+    Cgroup(u64, &'static [u8]),
     /// A node in a FUSE filesystem, changed by its daemon (`FUSE_SETATTR`, through the handle of
     /// the open file it was reached by, if any).
     Fuse(crate::vfs::fuse::FuseId, Option<u64>),
@@ -7863,13 +7878,18 @@ impl Attrs {
             Node::Pseudo(_, PseudoNode::Pts(fs, n)) => pseudo::pty(cx.kr(), *fs, *n)
                 .map(Attrs::Pts)
                 .ok_or(Errno::ENOENT),
-            Node::Pseudo(_, PseudoNode::MqRoot(_) | PseudoNode::Mq(..))
-                if cx.vfs()?.readonly(node) =>
-            {
-                Err(Errno::EROFS)
-            }
+            Node::Pseudo(
+                _,
+                PseudoNode::MqRoot(_) | PseudoNode::Mq(..) | PseudoNode::Cgroup(..),
+            ) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
             Node::Pseudo(_, PseudoNode::MqRoot(ns)) => Ok(Attrs::MqDir(*ns)),
             Node::Pseudo(_, PseudoNode::Mq(ns, ino)) => mq_queue(cx, *ns, *ino).map(Attrs::Mq),
+            Node::Pseudo(_, n @ PseudoNode::Cgroup(id, name, _)) => {
+                if pseudo::gone(cx.kr(), n) {
+                    return Err(Errno::ENODEV);
+                }
+                Ok(Attrs::Cgroup(*id, name))
+            }
             Node::Overlay(..) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
             Node::Overlay(_, o) => Ok(Attrs::Overlay(*o)),
             Node::Fuse(..) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
@@ -7878,24 +7898,25 @@ impl Attrs {
         }
     }
 
-    /// An open file: a terminal slave, or a file in the store (not one opened with `O_PATH`).
+    /// Resolve fd-specific objects first. A FUSE open handle is passed through to SETATTR.
     fn of_fd(cx: &Cx<'_>, fd: i32) -> Result<Attrs, Errno> {
         let file = cx.fds().get(fd)?;
         let f = file.borrow();
         match &f.kind {
             FileKind::Pty(end) if !end.master && f.flags & oflags::O_PATH == 0 => {
-                Ok(Attrs::Pts(end.tty.clone()))
+                return Ok(Attrs::Pts(end.tty.clone()));
             }
-            FileKind::Socket(_) => Ok(Attrs::Anon),
-            FileKind::Pipe(end) if end.pipe.borrow().fifo.is_none() => Ok(Attrs::Anon),
-            FileKind::MessageQueue(q) => Ok(Attrs::Mq(q.clone())),
-            _ if matches!(f.node(), Some(Node::Fuse(..))) => {
-                let Some(node @ Node::Fuse(_, id)) = f.node() else {
-                    return Err(Errno::EBADF);
-                };
-                if f.flags & oflags::O_PATH != 0 {
-                    return Err(Errno::EBADF);
-                }
+            FileKind::Socket(_) => return Ok(Attrs::Anon),
+            FileKind::Pipe(end) if end.pipe.borrow().fifo.is_none() => return Ok(Attrs::Anon),
+            FileKind::MessageQueue(q) => return Ok(Attrs::Mq(q.clone())),
+            _ => {}
+        }
+        if f.flags & oflags::O_PATH != 0 {
+            return Err(Errno::EBADF);
+        }
+        let node = f.node().ok_or(Errno::EBADF)?;
+        match node {
+            Node::Fuse(_, id) => {
                 if cx.vfs()?.readonly(&node) {
                     return Err(Errno::EROFS);
                 }
@@ -7905,22 +7926,10 @@ impl Attrs {
                 };
                 Ok(Attrs::Fuse(id, fh))
             }
-            _ if matches!(f.node(), Some(Node::Overlay(..))) => {
-                let Some(node @ Node::Overlay(_, o)) = f.node() else {
-                    return Err(Errno::EBADF);
-                };
-                if f.flags & oflags::O_PATH != 0 {
-                    return Err(Errno::EBADF);
-                }
-                if cx.vfs()?.readonly(&node) {
-                    return Err(Errno::EROFS);
-                }
-                Ok(Attrs::Overlay(o))
+            Node::Store(..) | Node::Overlay(..) | Node::Pseudo(_, PseudoNode::Cgroup(..)) => {
+                Self::of(cx, &node)
             }
-            _ => {
-                drop(f);
-                file_ino(cx, fd).map(Attrs::Store)
-            }
+            Node::Pseudo(..) => Err(Errno::EBADF),
         }
     }
 
@@ -7929,6 +7938,7 @@ impl Attrs {
     fn ino(&self, cx: &Cx<'_>) -> Option<Ino> {
         match self {
             Attrs::Store(ino) => Some(*ino),
+            Attrs::Cgroup(id, name) => Some(crate::cgroup::key(*id, name)),
             Attrs::Overlay(o) => Some(cx.vfs().ok()?.overlay().node(*o).real()),
             Attrs::Fuse(id, _) => Some(crate::vfs::fuse::key(*id)),
             _ => None,
@@ -7959,6 +7969,7 @@ impl Attrs {
                     ..Stat::default()
                 })
             }
+            Attrs::Cgroup(id, name) => cx.kr().cgroups.get(*id).ok_or(Errno::ENOENT)?.attrs(name),
             Attrs::Mq(q) => Ok(q.borrow().stat()),
             Attrs::MqDir(ns) => {
                 let ipc = cx.kr().ipc(*ns);
@@ -8033,6 +8044,11 @@ fn chmod(cx: &mut Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
             t.changed();
         }
         Attrs::Anon => {}
+        Attrs::Cgroup(id, name) => {
+            let st = cx.k().cgroups.attrs_mut(*id, name)?;
+            st.mode = st.kind() | perm;
+            st.ctime_ns = crate::tty::wall_ns();
+        }
         Attrs::Mq(q) => q.borrow_mut().set_mode(perm),
         Attrs::MqDir(ns) => {
             let ipc = cx.kr().ipc(*ns);
@@ -8134,7 +8150,12 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> Result<bool, Er
     let clears_setid = !st.is_dir()
         && (st.mode & mode::S_ISUID != 0
             || st.mode & mode::S_ISGID != 0 && (st.mode & 0o010 != 0 || !keep_sgid));
-    if matches!(target, Attrs::Store(_) | Attrs::Overlay(_)) && clears_setid && !cred.owns(&st) {
+    if matches!(
+        target,
+        Attrs::Store(_) | Attrs::Overlay(_) | Attrs::Cgroup(..)
+    ) && clears_setid
+        && !cred.owns(&st)
+    {
         return Err(Errno::EPERM);
     }
     if uid.is_none() && gid.is_none() && !clears_setid {
@@ -8164,6 +8185,18 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> Result<bool, Er
             t.changed();
         }
         Attrs::Anon => {}
+        Attrs::Cgroup(id, name) => {
+            let st = cx.k().cgroups.attrs_mut(*id, name)?;
+            st.uid = uid.unwrap_or(st.uid);
+            st.gid = gid.unwrap_or(st.gid);
+            if clears_setid {
+                st.mode &= !mode::S_ISUID;
+                if !keep_sgid || st.mode & 0o010 != 0 {
+                    st.mode &= !mode::S_ISGID;
+                }
+            }
+            st.ctime_ns = crate::tty::wall_ns();
+        }
         Attrs::Mq(q) => q.borrow_mut().set_owner(uid, gid),
         Attrs::MqDir(ns) => {
             let ipc = cx.kr().ipc(*ns);
@@ -8240,6 +8273,14 @@ pub(super) fn utimensat(
             }
         }
     }
+    let local_times = || {
+        let now = crate::tty::wall_ns();
+        let resolve = |time| match time {
+            FileTime::Now => now,
+            FileTime::At(ns) => ns,
+        };
+        (atime.map(resolve), mtime.map(resolve), now)
+    };
     let ino = match target {
         Attrs::Store(ino) => ino,
         Attrs::Overlay(o) => {
@@ -8249,37 +8290,42 @@ pub(super) fn utimensat(
         // A terminal's times are kept on the terminal (changeable, as with Linux's devpts)
         Attrs::Pts(t) => {
             let mut t = t.borrow_mut();
-            let now = crate::tty::wall_ns();
-            let ns = |time: FileTime| match time {
-                FileTime::Now => now,
-                FileTime::At(ns) => ns,
-            };
-            t.atime_ns = atime.map_or(t.atime_ns, ns);
-            t.mtime_ns = mtime.map_or(t.mtime_ns, ns);
+            let (atime_ns, mtime_ns, _) = local_times();
+            t.atime_ns = atime_ns.unwrap_or(t.atime_ns);
+            t.mtime_ns = mtime_ns.unwrap_or(t.mtime_ns);
             t.changed();
+            return Ok(0);
+        }
+        Attrs::Cgroup(id, name) => {
+            let st = cx.k().cgroups.attrs_mut(id, name)?;
+            let (atime_ns, mtime_ns, now) = local_times();
+            st.atime_ns = atime_ns.unwrap_or(st.atime_ns);
+            st.mtime_ns = mtime_ns.unwrap_or(st.mtime_ns);
+            st.ctime_ns = now;
+            notify_utimens(
+                cx,
+                crate::cgroup::key(id, name),
+                dirfd,
+                &path,
+                follow,
+                atime,
+                mtime,
+            );
             return Ok(0);
         }
         Attrs::Anon => return Ok(0),
         // Times of message queues and the mqueue root directory are kept in the kernel layer
         Attrs::Mq(q) => {
-            let now = crate::tty::wall_ns();
-            let ns = |time: FileTime| match time {
-                FileTime::Now => now,
-                FileTime::At(ns) => ns,
-            };
-            q.borrow_mut().set_times(atime.map(ns), mtime.map(ns));
+            let (atime_ns, mtime_ns, _) = local_times();
+            q.borrow_mut().set_times(atime_ns, mtime_ns);
             return Ok(0);
         }
         Attrs::MqDir(id) => {
-            let now = crate::tty::wall_ns();
-            let ns = |time: FileTime| match time {
-                FileTime::Now => now,
-                FileTime::At(ns) => ns,
-            };
+            let (atime_ns, mtime_ns, now) = local_times();
             let ipc = cx.kr().ipc(id);
             let mut d = ipc.mq_dir.borrow_mut();
-            d.atime_ns = atime.map_or(d.atime_ns, ns);
-            d.mtime_ns = mtime.map_or(d.mtime_ns, ns);
+            d.atime_ns = atime_ns.unwrap_or(d.atime_ns);
+            d.mtime_ns = mtime_ns.unwrap_or(d.mtime_ns);
             d.ctime_ns = now;
             return Ok(0);
         }
@@ -8365,6 +8411,12 @@ fn event_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool, event:
                 Ok(a) if a.mode & mode::S_IFMT == mode::S_IFDIR => inotify::IN_ISDIR,
                 _ => 0,
             }
+        } else if crate::cgroup::is_key(ino) {
+            if ino & 0xff == 0 {
+                inotify::IN_ISDIR
+            } else {
+                0
+            }
         } else {
             match cx.vfs().map(|v| v.store().kind(ino)) {
                 Ok(Ok(mode::S_IFDIR)) => inotify::IN_ISDIR,
@@ -8382,8 +8434,19 @@ pub(super) fn attrib_fd(cx: &Cx<'_>, fd: i32) {
 
 /// Reports `event` for a change made through fd `fd`.
 fn event_fd(cx: &Cx<'_>, fd: i32, event: u32) {
+    if !inotify::active(cx.kr()) {
+        return;
+    }
     if let Ok(file) = cx.fds().get(fd) {
-        inotify::file_event(cx.kr(), &file.borrow(), event);
+        let file = file.borrow();
+        if let Some(Node::Pseudo(_, PseudoNode::Cgroup(id, name, _))) = file.node()
+            && !name.is_empty()
+        {
+            let parent = Some((crate::cgroup::key(id, b""), name));
+            inotify::path_event(cx.kr(), crate::cgroup::key(id, name), parent, event);
+        } else {
+            inotify::file_event(cx.kr(), &file, event);
+        }
     }
 }
 
@@ -9136,22 +9199,6 @@ fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat,
     let victim = store.stat(store.lookup(dir, name)?.ok_or(Errno::ENOENT)?)?;
     cred.may_delete(&dir_st, &victim)?;
     Ok(victim)
-}
-
-/// The store inode of the open file that fchmod, fchown and the like act on: not for files
-/// opened with `O_PATH`, and EROFS in a read-only mount (Linux's `mnt_want_write_file`).
-fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
-    let file = cx.fds().get(fd)?;
-    let f = file.borrow();
-    if f.flags & oflags::O_PATH != 0 {
-        return Err(Errno::EBADF);
-    }
-    let node = f.node().ok_or(Errno::EBADF)?;
-    let ino = node.ino().ok_or(Errno::EBADF)?;
-    if cx.vfs()?.readonly(&node) {
-        return Err(Errno::EROFS);
-    }
-    Ok(ino)
 }
 
 /// The store inode to modify: EROFS in a read-only mount; nodes in synthetic filesystems cannot

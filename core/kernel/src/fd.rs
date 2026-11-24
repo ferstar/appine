@@ -997,6 +997,11 @@ impl FdTable {
         Ok((copy, closed))
     }
 
+    /// Open file descriptions in descriptor order, including duplicate references.
+    pub(crate) fn files(&self) -> impl Iterator<Item = &FileRef> {
+        self.slots.iter().flatten().map(|slot| &slot.file)
+    }
+
     /// All open fds, in increasing order.
     pub fn open_fds(&self) -> Vec<i32> {
         self.slots

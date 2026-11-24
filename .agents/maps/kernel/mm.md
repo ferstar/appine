@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: rt_sigtimedwait result copies across FUSE demand fills)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: FUSE pages in core dumps and proc memory transfers)
 
 ## Responsibilities
 
@@ -195,7 +195,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   writes prot-0 entries.
 - Debugger reads (`read_force`) walk page by page without changing VMA permissions. CoW loans
   read the owner's page and untouched anonymous reservations read as zeros. File growth refreshes
-  the accessible extent. Holes, foreign vvar pages and missing FUSE pages stop the read.
+  the accessible extent. Holes and foreign vvar pages stop the read. A missing FUSE page requests a fill.
 
 ### Guest page faults (task run loop, under the BKL, in this order)
 
@@ -368,7 +368,7 @@ signals may still be delivered).
 - `dump_regions` applies `coredump_filter` and `MADV_DONTDUMP` (the vDSO is dumped whole anyway; a
   written private file VMA follows `ANON_PRIVATE`; ELF headers' first pages follow their own bit)
   and writes nothing of `[vvar]`; the core-dump writer leaves holes where `residency` reports pages
-  absent in regions other than private file mappings.
+  absent in sparse regions. FUSE mappings fetch missing pages before ELF checks and segment writes.
 - `Mm` drop leaves its code group (`kernel/mmu`), releases CoW (`kernel/cow`), defers the page
   table (`kernel/hostmem`), then drops VMAs and graveyard. RSS measures live in `kernel/oom`.
 
@@ -420,11 +420,9 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
-- A read or write through `/proc/<pid>/mem` can stop with EIO or a short count at a FUSE page
-  awaiting a fill. Ptrace PEEK and POKE can likewise return EIO there.
+- Ptrace PEEK and POKE can return EIO at a cold FUSE page.
 
-- **FUSE demand reads:** mlock, `MADV_WILLNEED` and core dumps do not fetch missing pages
-  (dumps emit zeros).
+- **FUSE demand reads:** mlock and `MADV_WILLNEED` do not fetch missing pages.
   A handler that has already consumed input can repeat its effects on a whole-syscall retry
   or return a short count. The dispatcher prefaults read/write, positional
   and vectored I/O buffers. Socket receives, wait4/waitid, msgrcv, mq_timedreceive and rt_sigtimedwait retry their result copies locally.

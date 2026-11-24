@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: O_PATH dentry tracking and renamed proc fd links)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cgroup2 attribute events through paths and file descriptors)
 
 ## Responsibilities
 
@@ -103,7 +103,8 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   marked unlinked (by `unlinked` on unlink, rmdir, overwriting rename, or host removal across store,
   overlay and FUSE, or when reopened from an unlinked fd); metadata and truncation calls
   (`file_event`: fchmod, fchown, futimens, ftruncate, fsetxattr/fremovexattr) are not filtered.
-  cgroup2 nodes are never excluded.
+  Cgroup2 attribute changes through a path or a regular cgroup file descriptor also notify the directory.
+  Cgroup2 nodes are never excluded.
 - Path-based operations resolve the path a second time to find the directory, only when watches
   exist (`watched_at`, falling back to a FUSE node's recorded parent/name if cached attrs staled).
   fd-based events (I/O, truncation, close) go to the directory and name the open went through,

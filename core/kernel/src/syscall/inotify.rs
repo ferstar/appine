@@ -327,10 +327,10 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     };
     // A cgroup2 file, or a cgroup's directory, starts being looked at for changes
     match &node {
-        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b"")) => {
+        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b"", 0)) => {
             crate::cgroup::observe_all(cx.k(), *id);
         }
-        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, name)) => {
+        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, name, _)) => {
             crate::cgroup::observe(cx.k(), *id, name);
         }
         _ => {}
@@ -719,7 +719,7 @@ pub(crate) fn key_of(node: &Node) -> Option<Ino> {
         Node::Overlay(_, o) => Some(overlay::key(*o)),
         Node::Fuse(_, f) => Some(crate::vfs::fuse::key(*f)),
         // cgroup2 files report the changes Linux notifies (crate::cgroup::notify_changes)
-        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, name)) => {
+        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, name, _)) => {
             Some(crate::cgroup::key(*id, name))
         }
         Node::Pseudo(..) => None,

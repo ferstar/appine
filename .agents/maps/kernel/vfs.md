@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: overlay identity during procfs fd and executable reopens)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cgroup2 attributes by path and descriptor)
 
 ## Responsibilities
 
@@ -64,7 +64,7 @@ capabilities (`kernel/cred`).
 - `Device` — Null, Zero, Full, Random, Kmsg, LoopControl, Loop (`kernel/loop`'s; tty, ptmx, pts
   and `/dev/fuse` are routed before it).
 - `fs::Attrs` — what chmod, chown and utimensat act on: Store, Overlay, Pts, Anon (sockets and
-  anonymous pipes), Mq, MqDir (the mqueue root), Fuse.
+  anonymous pipes), Mq, MqDir (the mqueue root), Cgroup, Fuse.
 
 ## Public entry points
 
@@ -267,8 +267,8 @@ capabilities (`kernel/cred`).
 - utimensat accepts write permission for NULL times or two `UTIME_NOW` fields. Two `UTIME_OMIT`
   fields succeed after resolution. Explicit times and mixed NOW/OMIT require the owner or
   `CAP_FOWNER` where the kernel checks permissions. On synthetic nodes other than devpts terminals,
-  message queues and the mqueue root, chmod, chown and utimensat are `EROFS` on a read-only mount and `EACCES` otherwise by path,
-  `EBADF` by fd before any `EROFS` (cgroup2 nodes included); sockets and anonymous pipes accept
+  message queues, the mqueue root and cgroup2, chmod, chown and utimensat are `EROFS` on a read-only mount and `EACCES` otherwise by path,
+  `EBADF` by fd before any `EROFS`; sockets and anonymous pipes accept
   them by fd and change nothing, other anonymous fds are `EBADF`.
 - mknodat, after resolution and the `.`/`..` `EEXIST`: regular, char, block, FIFO, socket
   (directory `EPERM`, other types `EINVAL`); devices need `CAP_MKNOD` in the initial namespace and
@@ -389,8 +389,7 @@ capabilities (`kernel/cred`).
   - fstat of an open PTY reports `st_blksize` 4096 (stat by path 1024), epoll's fdinfo shows the
     root filesystem's device for tmpfs files and an anonymous one for overlay and FUSE files, and
     fstatfs of a FIFO reports pipefs;
-  - chmod and chown of cgroup2 nodes are refused, where kernfs lets a privileged caller chown them
-    (systemd's cgroup delegation does), and cgroup mkdir reports `EROFS` before `EEXIST`;
+  - cgroup mkdir reports `EROFS` before `EEXIST`;
   - readlink of `/proc/<pid>/cwd` for a removed cwd is `ENOENT` (Linux appends ` (deleted)`);
   - the store's rename errors come after permission.
 - **Scoped openat2 never returns `EAGAIN`:** the walk is atomic under the BKL, so a `..` walked

@@ -366,6 +366,11 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+fn request_fill(page: (Rc<Fill>, u64)) -> Errno {
+    WANTED.with_borrow_mut(|wanted| *wanted = Some(page));
+    Errno::FUSE_RETRY
+}
+
 /// The page a kernel access last wanted read ([`WANTED`]): the fill and its file page number.
 pub fn take_wanted() -> Option<(Rc<Fill>, u64)> {
     WANTED.with_borrow_mut(Option::take)
@@ -1881,13 +1886,8 @@ impl Mm {
     /// on-demand file mapping still to be read, [`Errno::FUSE_RETRY`], recording it for the
     /// dispatcher ([`take_wanted`]); EFAULT otherwise.
     fn miss(&self, addr: u64, need: u32) -> Errno {
-        match self.fill_wanted(addr, need) {
-            Some(w) => {
-                WANTED.with_borrow_mut(|x| *x = Some(w));
-                Errno::FUSE_RETRY
-            }
-            None => Errno::EFAULT,
-        }
+        self.fill_wanted(addr, need)
+            .map_or(Errno::EFAULT, request_fill)
     }
 
     /// Called when a guest access to `addr` requiring permission `need` faults. Checks VMA
@@ -2144,8 +2144,8 @@ impl Mm {
             if cur >= start + v.len || v.foreign() {
                 return Err(Errno::EFAULT);
             }
-            if v.unread(start, cur).is_some() {
-                return Err(Errno::EFAULT);
+            if let Some(w) = v.unread(start, cur) {
+                return Err(request_fill(w));
             }
             if cur >= start + v.contents_len() {
                 if self.refresh_file_extent(cur) == Some(true) {
@@ -2276,8 +2276,7 @@ impl Mm {
             .then(|| self.first_unread(addr, data.len() as u64, 0))
             .flatten()
         {
-            WANTED.with_borrow_mut(|x| *x = Some(w));
-            return Err(Errno::FUSE_RETRY);
+            return Err(request_fill(w));
         }
         self.cow_settle(addr & !(PAGE_SIZE - 1), end);
         let first = self
@@ -5213,6 +5212,7 @@ impl Mm {
             .iter()
             .map(|(&s, v)| {
                 let offset = v.file_id.map(|(_, _, off)| off);
+                let mut check_elf = false;
                 let size = if s == self.vdso {
                     v.len
                 } else if v.dontdump || v.foreign() {
@@ -5242,12 +5242,11 @@ impl Mm {
                             if filter & ELF_HEADERS != 0
                                 && offset == Some(0)
                                 && v.prot & prot::READ != 0
-                                && v.file_len >= PAGE_SIZE =>
+                                && (v.contents_len() >= PAGE_SIZE
+                                    || v.fill.as_ref().is_some_and(|f| f.size_stale.get())) =>
                         {
-                            // SAFETY: the first page lies in the file contents, and this VMA holds
-                            // the host memory
-                            let magic = unsafe { std::slice::from_raw_parts(v.host.as_ptr(), 4) };
-                            if magic == b"\x7fELF" { PAGE_SIZE } else { 0 }
+                            check_elf = true;
+                            PAGE_SIZE
                         }
                         Backing::PrivateFile => 0,
                     }
@@ -5257,7 +5256,8 @@ impl Mm {
                     end: s + v.len,
                     prot: v.prot,
                     size,
-                    sparse: v.backing != Backing::PrivateFile,
+                    check_elf,
+                    sparse: v.backing != Backing::PrivateFile && v.fill.is_none(),
                     file: offset
                         .map(|off| (off, v.name.clone().unwrap_or_else(|| Rc::from(&b""[..])))),
                 }
@@ -6755,6 +6755,8 @@ pub struct DumpRegion {
     /// written as holes; untouched pages of private file mappings are file contents and must be
     /// read.
     pub sparse: bool,
+    /// Include this page only if its contents start with the ELF magic.
+    pub check_elf: bool,
     /// File mappings: the file offset of the start and the path (`NT_FILE`).
     pub file: Option<(u64, Rc<[u8]>)>,
 }

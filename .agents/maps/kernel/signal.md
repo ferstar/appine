@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 16 claims checked by 3 independent verifiers — 12 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: signal result copies across FUSE demand fills)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: core dumps fetch FUSE file contents for ELF headers and data)
 
 ## Responsibilities
 
@@ -220,7 +220,7 @@ construction (`kernel/vdso`).
 - Writes 64-bit LE arm64 `ET_CORE` (supporting `PN_XNUM` overflow): `PT_NOTE` (`NT_PRSTATUS`,
   `NT_PRPSINFO`, `NT_SIGINFO`, `NT_AUXV`, `NT_FILE`, `NT_PRFPREG`, `NT_ARM_TLS`,
   `NT_ARM_HW_BREAK`, `NT_ARM_HW_WATCH`, `NT_ARM_SYSTEM_CALL`) and `PT_LOAD` filtered by
-  `/proc/<pid>/coredump_filter` (sparse non-resident pages left as holes; `CoreWriter` caps
+  `/proc/<pid>/coredump_filter` (cold FUSE pages are filled before ELF checks and data copies; `CoreWriter` caps
   non-hole bytes at `RLIMIT_CORE`). Creating the file sets `WCOREDUMP` (`0x80`) and `CLD_DUMPED`.
 
 ### Kernel log

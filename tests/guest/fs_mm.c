@@ -15,6 +15,7 @@
  *   address ([vdso] label, MADV_DONTNEED refill, default signal restorer);
  * - /proc/self/pagemap clears MAP_EXCLUSIVE on CoW-lent pages in parent while child lives;
  * - FUSE on-demand mapping short reads do not mark unread tail pages as filled zeros;
+ * - /proc/self/mem and core dumps read cold FUSE mappings, including ELF headers;
  * - execve returns ETXTBSY for writable nested `#!` scripts and writable ELF PT_INTERP;
  * - traced execve of a doomed ELF dies by SIGSEGV without reporting PTRACE_EVENT_EXEC;
  * - pure Tier 0 single-stepped `ic ivau` on guest page 0 invalidates Tier 1 translations.
@@ -450,6 +451,7 @@ static uint64_t fuse_file_node(const char *name)
         "batch-peer", "rights-control", "unix-data",
         "wait-status", "wait-info", "wait4-usage", "waitid-usage",
         "sysv-type", "sysv-text", "mq-data", "mq-priority", "signal-info",
+        "mem-read", "mem-write", "core-private", "core-shared", "core-elf",
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++)
         if (strcmp(name, files[i]) == 0)
@@ -558,6 +560,8 @@ static void *fuse_daemon(void *arg)
                 uint64_t page = (ri.offset + i) / 4096;
                 out[sizeof(*hdr) + i] = (uint8_t)(0x40 + (page & 0x3f));
             }
+            if (in.nodeid == fuse_file_node("core-elf") && ri.offset == 0 && want >= SELFMAG)
+                memcpy(out + sizeof(*hdr), ELFMAG, SELFMAG);
             hdr->len = (uint32_t)(sizeof(*hdr) + want);
         } else if (in.opcode == 18 /* FUSE_RELEASE */ || in.opcode == 25 /* FUSE_FLUSH */) {
             hdr->len = (uint32_t)sizeof(*hdr);
@@ -1103,6 +1107,129 @@ static void recvmsg_fuse_rights(int dir, struct fuse_ctx *ctx)
     close(sockets[1]);
 }
 
+/* Forced accesses preserve surrounding file contents, even with no guest read permission. */
+static void proc_mem_cold_pages(int dir)
+{
+    void *span = mmap(NULL, 8192, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(span != MAP_FAILED, "reserve proc mem range");
+    uint8_t *r = map_output_page(dir, "mem-read", span);
+    uint8_t *w = map_output_page(dir, "mem-write", NULL);
+    CHECK(mprotect(r, 4096, PROT_NONE) == 0, "protect cold proc mem page");
+    int mem = open("/proc/self/mem", O_RDWR);
+    CHECK(mem >= 0, "open self mem");
+    CHECK(munmap(r + 4096, 4096) == 0, "leave a hole after cold page");
+    CHECK(lseek(mem, (off_t)(uintptr_t)(r + 4095), SEEK_SET) >= 0, "seek to cold page end");
+    uint8_t pair[2] = {0};
+    CHECK(read(mem, pair, 2) == 1 && pair[0] == 0x40, "short proc mem read before hole");
+    CHECK(read(mem, pair, 1) == -1 && errno == EIO, "proc mem position advanced to hole");
+    uint8_t byte = 0;
+    CHECK(pread(mem, &byte, 1, (off_t)(uintptr_t)r) == 1 && byte == 0x40, "warm proc mem read");
+    CHECK(pwrite(mem, "X", 1, (off_t)(uintptr_t)(w + 1)) == 1, "cold proc mem write");
+    CHECK(w[0] == 0x40 && w[1] == 'X' && w[2] == 0x40, "partial proc mem write preserves page");
+    close(mem);
+    munmap(r, 4096);
+    munmap(w, 4096);
+}
+
+static void abort_with_core(void)
+{
+    struct rlimit limit = {RLIM_INFINITY, RLIM_INFINITY};
+    CHECK(setrlimit(RLIMIT_CORE, &limit) == 0, "set core limit");
+    raise(SIGABRT);
+    _exit(1);
+}
+
+/* Check actual PT_LOAD contents, including an ELF header selected by coredump_filter. */
+static void core_cold_pages(int dir, const char *core)
+{
+    int addresses[2];
+    CHECK(pipe(addresses) == 0, "pipe for core addresses");
+    pid_t child = fork();
+    CHECK(child >= 0, "fork core writer");
+    if (child == 0) {
+        /* Private writable data, shared files and ELF headers. */
+        write_proc_str("/proc/self/coredump_filter", "0x19");
+        void *maps[3];
+        maps[0] = map_output_page(dir, "core-private", NULL);
+        const char *names[] = {"core-shared", "core-elf"};
+        for (int i = 0; i < 2; ++i) {
+            int fd = openat(dir, names[i], O_RDONLY);
+            CHECK(fd >= 0, "open core mapping");
+            maps[i + 1] = mmap(NULL, 4096, PROT_READ, i == 0 ? MAP_SHARED : MAP_PRIVATE, fd, 0);
+            CHECK(maps[i + 1] != MAP_FAILED, "map cold core file");
+            close(fd);
+        }
+        CHECK(write(addresses[1], maps, sizeof(maps)) == sizeof(maps), "send core addresses");
+        abort_with_core();
+    }
+    close(addresses[1]);
+    uintptr_t maps[3];
+    CHECK(read(addresses[0], maps, sizeof(maps)) == sizeof(maps), "read core addresses");
+    close(addresses[0]);
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT,
+          "wait for core");
+    int fd = open(core, O_RDONLY);
+    Elf64_Ehdr elf;
+    CHECK(fd >= 0 && read(fd, &elf, sizeof(elf)) == sizeof(elf), "read core header");
+    unsigned seen = 0;
+    for (int i = 0; i < elf.e_phnum; ++i) {
+        Elf64_Phdr ph;
+        CHECK(pread(fd, &ph, sizeof(ph), elf.e_phoff + i * elf.e_phentsize) == sizeof(ph),
+              "read core program header");
+        for (int j = 0; j < 3; ++j) {
+            if (ph.p_type != PT_LOAD || maps[j] < ph.p_vaddr || maps[j] - ph.p_vaddr >= ph.p_filesz)
+                continue;
+            uint8_t byte;
+            CHECK(pread(fd, &byte, 1, ph.p_offset + maps[j] - ph.p_vaddr) == 1 &&
+                  byte == (j == 2 ? 0x7f : 0x40), "cold core mapping %d", j);
+            seen |= 1U << j;
+        }
+    }
+    CHECK(seen == 7, "all cold mappings present in core");
+    close(fd);
+}
+
+/* The dumping thread holds the last device fd, but its daemon thread has exited. */
+static void core_without_daemon(void)
+{
+    pid_t child = fork();
+    CHECK(child >= 0, "fork daemon core writer");
+    if (child == 0) {
+        struct fuse_ctx ctx = {.file_size = 4096};
+        mount_test_fuse("/tmp/fuse_daemon_core", &ctx);
+        int dir = open("/tmp/fuse_daemon_core", O_RDONLY | O_DIRECTORY);
+        CHECK(dir >= 0, "open daemon directory");
+        map_output_page(dir, "core-private", NULL);
+        abort_with_core();
+    }
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WCOREDUMP(status),
+          "daemon exit completes core");
+    CHECK(umount2("/tmp/fuse_daemon_core", MNT_DETACH) == 0, "detach dead daemon");
+    CHECK(rmdir("/tmp/fuse_daemon_core") == 0, "remove daemon mountpoint");
+}
+
+static void test_fuse_core_dumps(int dir)
+{
+    const char *pattern = "/proc/sys/kernel/core_pattern";
+    const char *core = "/tmp/fuse_mapping.core";
+    char saved[256];
+    int fd = open(pattern, O_RDONLY);
+    CHECK(fd >= 0, "open core pattern");
+    ssize_t n = read(fd, saved, sizeof(saved) - 1);
+    CHECK(n > 0 && saved[n - 1] == '\n', "read core pattern");
+    saved[n] = '\0';
+    close(fd);
+
+    write_proc_str(pattern, core);
+    core_cold_pages(dir, core);
+    CHECK(unlink(core) == 0, "remove mapping core");
+    core_without_daemon();
+    CHECK(unlink(core) == 0, "remove daemon core");
+    write_proc_str(pattern, saved);
+}
+
 /* 8. FUSE short-read on-demand mapping does not permanently zero unread tail pages */
 static void test_fuse_short_read_mapping(void)
 {
@@ -1116,6 +1243,8 @@ static void test_fuse_short_read_mapping(void)
     CHECK(m != MAP_FAILED, "mmap fuse data");
     int dir = open("/tmp/fuse_short", O_RDONLY | O_DIRECTORY);
     CHECK(dir >= 0, "open FUSE fixture directory");
+    proc_mem_cold_pages(dir);
+    test_fuse_core_dumps(dir);
     sigtimedwait_fuse_output(dir, &ctx);
     sysv_receive_fuse_outputs(dir, &ctx);
     posix_receive_fuse_outputs(dir, &ctx);

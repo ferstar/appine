@@ -13,7 +13,7 @@ mod fs;
 mod gpu;
 pub(crate) use gpu::RenderFile;
 mod fuse;
-pub(crate) use fuse::{fill, flush_at_exit, flush_mappings};
+pub(crate) use fuse::{fill, fill_for_dump, flush_at_exit, flush_mappings};
 mod inotify;
 mod ipc;
 mod lease;
@@ -818,7 +818,7 @@ fn copy_result<T>(
     retry_user_pages(cx, Errno::EFAULT, |cx| copy(cx))
 }
 
-fn retry_user_pages<T>(
+pub(crate) fn retry_user_pages<T>(
     cx: &mut Cx<'_>,
     interrupted: Errno,
     mut op: impl FnMut(&mut Cx<'_>) -> Result<T, Errno>,

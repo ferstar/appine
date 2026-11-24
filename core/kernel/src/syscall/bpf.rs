@@ -318,7 +318,9 @@ fn cgroup_of_fd(cx: &Cx<'_>, fd: u32) -> Result<u64, Errno> {
     let file = cx.fds().get(fd as i32).map_err(|_| Errno::EBADF)?;
     let node = file.borrow().node();
     match node {
-        Some(Node::Pseudo(_, PseudoNode::Cgroup(id, b""))) if cx.kr().cgroups.get(id).is_some() => {
+        Some(Node::Pseudo(_, PseudoNode::Cgroup(id, b"", 0)))
+            if cx.kr().cgroups.get(id).is_some() =>
+        {
             Ok(id)
         }
         _ => Err(Errno::EBADF),

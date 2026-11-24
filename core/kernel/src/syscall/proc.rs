@@ -194,7 +194,7 @@ pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &mut Cpu, uargs: u64, size: usize) ->
         let file = cx.fds().get(w(10) as i32).map_err(|_| Errno::EBADF)?;
         let node = file.borrow().node();
         match node {
-            Some(Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b""))) => Some(id),
+            Some(Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b"", 0))) => Some(id),
             _ => return Err(Errno::EBADF),
         }
     } else {

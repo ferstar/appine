@@ -46,6 +46,7 @@ use crate::cell::RefCell;
 use crate::kernel::{Cx, INIT, Kernel, Tid};
 use crate::oom::Events;
 use crate::process::ThreadGroup;
+use crate::vfs::store::{Stat, mode};
 
 /// The root cgroup's id (also its inode number, 1 as on Linux).
 pub(crate) const ROOT: u64 = 1;
@@ -131,12 +132,13 @@ pub(crate) struct Cgroup {
     /// `cgroup.subtree_control`: the controllers enabled for child cgroups (bits in
     /// [`CONTROLLERS`]).
     pub subtree_control: u32,
-    /// Owner of the directory and its files (the fsuid and fsgid of the process that created it,
-    /// Linux's `cgroup_kn_set_ugid`).
-    pub uid: u32,
-    pub gid: u32,
-    /// The directory's permission bits, as mkdir gave them (the umask applied); the root's 0755.
-    pub mode: u32,
+    /// Generation of the controller files exposed in children. A removed node stays dead.
+    generations: [u64; CONTROLLERS.len()],
+    /// Default kernfs attributes at mkdir. An attribute change affects only the named node.
+    creator: (u32, u32),
+    dir_mode: u32,
+    created_ns: i64,
+    attrs: BTreeMap<&'static [u8], Stat>,
     /// Values of the interface files written (the limits), in the format Linux shows; files not
     /// written show their defaults.
     pub values: BTreeMap<&'static [u8], String>,
@@ -169,9 +171,11 @@ impl Cgroup {
             parent,
             children: BTreeMap::new(),
             subtree_control: 0,
-            uid,
-            gid,
-            mode,
+            generations: [0; CONTROLLERS.len()],
+            creator: (uid, gid),
+            dir_mode: mode,
+            created_ns: crate::tty::wall_ns(),
+            attrs: BTreeMap::new(),
             values: BTreeMap::new(),
             pids_events: 0,
             mem_events: Events::default(),
@@ -180,6 +184,51 @@ impl Cgroup {
             freeze: false,
             device_progs: Vec::new(),
             device_flags: 0,
+        }
+    }
+
+    fn initial_attrs(&self, name: &[u8]) -> Result<Stat, Errno> {
+        let mode = if name.is_empty() {
+            mode::S_IFDIR | self.dir_mode
+        } else {
+            mode::S_IFREG | file_mode(name).ok_or(Errno::ENOENT)?
+        };
+        Ok(self.node_attrs(mode, self.creator))
+    }
+
+    fn node_attrs(&self, mode: u32, (uid, gid): (u32, u32)) -> Stat {
+        let dir = mode & mode::S_IFMT == mode::S_IFDIR;
+        Stat {
+            mode,
+            uid,
+            gid,
+            nlink: if dir { 2 } else { 1 },
+            size: if dir { 0 } else { 4096 },
+            atime_ns: self.created_ns,
+            mtime_ns: self.created_ns,
+            ctime_ns: self.created_ns,
+            ..Stat::default()
+        }
+    }
+
+    /// Remove a disabled controller's files and create newly enabled files as the writer.
+    fn update_controller_files(&mut self, enable: u32, disable: u32, owner: (u32, u32)) {
+        for (name, perm, ctl) in FILES {
+            let Some(ctl) = ctl else { continue };
+            if disable & (1 << ctl) != 0 {
+                self.attrs.remove(name);
+                self.values.remove(name);
+            } else if enable & (1 << ctl) != 0 && self.creator != owner {
+                self.attrs
+                    .insert(name, self.node_attrs(mode::S_IFREG | perm, owner));
+            }
+        }
+    }
+
+    pub(crate) fn attrs(&self, name: &[u8]) -> Result<Stat, Errno> {
+        match self.attrs.get(name) {
+            Some(st) => Ok(st.clone()),
+            None => self.initial_attrs(name),
         }
     }
 }
@@ -278,7 +327,7 @@ pub(crate) fn observe_all(k: &mut Kernel, id: u64) {
     let names: Vec<&'static [u8]> = k
         .cgroups
         .files(id)
-        .filter(|f| NOTIFYING.contains(f))
+        .filter_map(|(name, _)| NOTIFYING.contains(&name).then_some(name))
         .collect();
     for name in names {
         observe(k, id, name);
@@ -361,7 +410,7 @@ impl Cgroups {
         mode: u32,
     ) -> Result<u64, Errno> {
         let p = self.map.get(&parent).ok_or(Errno::ENOENT)?;
-        if p.children.contains_key(name) || self.files(parent).any(|f| f == name) {
+        if p.children.contains_key(name) || self.has_file(parent, name) {
             return Err(Errno::EEXIST);
         }
         if name.contains(&b'\n') {
@@ -396,18 +445,34 @@ impl Cgroups {
         Ok(id)
     }
 
-    /// The files in cgroup `id`'s directory: the core files plus those of the enabled controllers.
-    pub fn files(&self, id: u64) -> impl Iterator<Item = &'static [u8]> + '_ {
-        let on = self.controllers(id);
-        FILES
-            .iter()
-            .filter(move |f| f.2.is_none_or(|c| on & 1 << c != 0))
-            .map(|f| f.0)
+    /// Visible interface files and their generations. A lookup captures both so an open fd
+    /// cannot act on a controller file recreated under the same name.
+    pub fn files(&self, id: u64) -> impl Iterator<Item = (&'static [u8], u64)> + '_ {
+        let group = self.get(id);
+        let parent = group.and_then(|g| self.get(g.parent?));
+        FILES.iter().filter_map(move |&(name, _, controller)| {
+            group?;
+            let generation = match (parent, controller) {
+                (Some(p), Some(ctl)) if p.subtree_control & (1 << ctl) != 0 => p.generations[ctl],
+                (Some(_), Some(_)) => return None,
+                _ => 0,
+            };
+            Some((name, generation))
+        })
     }
 
-    /// Whether cgroup `id` exists and exposes interface file `name` (its controller is enabled).
+    pub(crate) fn attrs_mut(&mut self, id: u64, name: &'static [u8]) -> Result<&mut Stat, Errno> {
+        if !name.is_empty() && !self.has_file(id, name) {
+            return Err(Errno::ENOENT);
+        }
+        let group = self.map.get_mut(&id).ok_or(Errno::ENOENT)?;
+        let initial = group.initial_attrs(name)?;
+        Ok(group.attrs.entry(name).or_insert(initial))
+    }
+
+    /// Whether cgroup `id` exposes an interface file with this name.
     pub(crate) fn has_file(&self, id: u64, name: &[u8]) -> bool {
-        self.map.contains_key(&id) && self.files(id).any(|f| f == name)
+        self.files(id).any(|(f, _)| f == name)
     }
 
     /// The controllers enabled in cgroup `id` (`cgroup.controllers`): all of them at the root,
@@ -785,6 +850,7 @@ pub(crate) struct Writer<'a> {
     pub pid_ns: &'a crate::pidns::PidNs,
     pub ns_root: u64,
     pub opener: &'a Cred,
+    pub cred: &'a Cred,
 }
 
 /// Writes `<name>` in cgroup `id` (Linux 6.1's `cgroup_file_write` and each cftype's `write`).
@@ -827,7 +893,7 @@ pub(crate) fn write(
             };
             migrate(k, (tid, w.opener), (id, w.ns_root), name == b"cgroup.procs")
         }
-        b"cgroup.subtree_control" => subtree_control(k, id, text),
+        b"cgroup.subtree_control" => subtree_control(k, id, text, (w.cred.fsuid, w.cred.fsgid)),
         // An integer; anything other than 1 is ERANGE (Linux's cgroup_kill_write)
         b"cgroup.kill" => match word.parse::<i32>().map_err(|_| Errno::EINVAL)? {
             1 => {
@@ -936,7 +1002,7 @@ fn migrate(
 /// separated by whitespace. An unknown controller or a missing `+`/`-` is EINVAL; enabling one not
 /// in `cgroup.controllers` is ENOENT; controllers cannot be enabled in a non-root cgroup that has
 /// processes (EBUSY); one a child cgroup still has enabled cannot be disabled (EBUSY).
-fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
+fn subtree_control(k: &mut Kernel, id: u64, text: &str, owner: (u32, u32)) -> Result<(), Errno> {
     let (mut enable, mut disable) = (0u32, 0u32);
     for tok in text.split_ascii_whitespace() {
         let (on, name) = match tok.split_at_checked(1) {
@@ -979,8 +1045,15 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
     }
     let g = k.cgroups.map.get_mut(&id).unwrap();
     g.subtree_control = (g.subtree_control | enable) & !disable;
+    for (ctl, generation) in g.generations.iter_mut().enumerate() {
+        if enable & (1 << ctl) != 0 {
+            *generation += 1;
+        }
+    }
     let adds_event_files = enable & ((1 << MEMORY) | (1 << PIDS)) != 0;
     for child_id in children {
+        let child = k.cgroups.map.get_mut(&child_id).unwrap();
+        child.update_controller_files(enable, disable, owner);
         if adds_event_files && k.inotify.borrow().watches(key(child_id, b"")) {
             observe_all(k, child_id);
         }
@@ -998,13 +1071,6 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
         let Some(child) = k.cgroups.map.get_mut(&child_id) else {
             continue;
         };
-        child.values.retain(|name, _| {
-            FILES
-                .iter()
-                .find(|f| f.0 == *name)
-                .and_then(|f| f.2)
-                .is_none_or(|ctl| disable & 1 << ctl == 0)
-        });
         if disable & 1 << PIDS != 0 {
             child.pids_events = 0;
         }
@@ -1196,12 +1262,7 @@ pub(crate) fn may_enter(
 /// an open for writing would be (Linux's `cgroup_may_write`).
 fn may_write_procs(k: &Kernel, cred: &Cred, id: u64) -> Result<(), Errno> {
     let g = k.cgroups.get(id).ok_or(Errno::ENOENT)?;
-    let st = crate::vfs::store::Stat {
-        mode: crate::vfs::store::mode::S_IFREG | file_mode(b"cgroup.procs").unwrap_or(0o644),
-        uid: g.uid,
-        gid: g.gid,
-        ..Default::default()
-    };
+    let st = g.attrs(b"cgroup.procs")?;
     cred.permission(&st, crate::cred::MAY_WRITE)
 }
 
@@ -1397,7 +1458,7 @@ mod tests {
         let shared = crate::kernel::Shared::new(Kernel::new(crate::process::Tier::Interpreter));
         let mut k = shared.lock();
         let child = k.cgroups.mkdir(ROOT, b"t", &Cred::root(), 0o755).unwrap();
-        subtree_control(&mut k, ROOT, "+memory +pids").unwrap();
+        subtree_control(&mut k, ROOT, "+memory +pids", (0, 0)).unwrap();
         let root_events = observe(&mut k, ROOT, b"memory.events").unwrap();
         let root_local = observe(&mut k, ROOT, b"memory.events.local").unwrap();
         let local = observe(&mut k, child, b"memory.events.local").unwrap();
@@ -1422,9 +1483,9 @@ mod tests {
         notify_changes(&mut k);
         assert_eq!(pids.get(), 2);
 
-        subtree_control(&mut k, ROOT, "-memory").unwrap();
+        subtree_control(&mut k, ROOT, "-memory", (0, 0)).unwrap();
         notify_changes(&mut k);
-        subtree_control(&mut k, ROOT, "+memory").unwrap();
+        subtree_control(&mut k, ROOT, "+memory", (0, 0)).unwrap();
         let reopened = observe(&mut k, child, b"memory.events.local").unwrap();
         memory_event(&mut k, child, |e| e.max += 1);
         notify_changes(&mut k);
@@ -1446,11 +1507,11 @@ mod tests {
         );
         assert_eq!(c.mkdir(ROOT, b"a\nb", &cred, 0o755), Err(Errno::EINVAL));
         // t has no memory enabled, so a child cgroup named memory.max can be created
-        assert!(!c.files(t).any(|f| f == b"memory.max"));
+        assert!(!c.has_file(t, b"memory.max"));
         assert!(c.mkdir(t, b"memory.max", &cred, 0o755).is_ok());
         c.map.get_mut(&ROOT).unwrap().subtree_control = 1 << 3;
-        assert!(c.files(t).any(|f| f == b"memory.max"));
-        assert!(!c.files(t).any(|f| f == b"pids.max"));
+        assert!(c.has_file(t, b"memory.max"));
+        assert!(!c.has_file(t, b"pids.max"));
         let a = c.mkdir(t, b"a", &cred, 0o755).unwrap();
         let b = c.mkdir(t, b"b", &cred, 0o755).unwrap();
         assert_eq!(c.path(a, ROOT), "/t/a");
@@ -1537,9 +1598,10 @@ mod tests {
             pid_ns: &pid_ns,
             ns_root: ROOT,
             opener: &cred,
+            cred: &cred,
         };
         let child = k.cgroups.mkdir(ROOT, b"c", &cred, 0o755).unwrap();
-        subtree_control(&mut k, ROOT, "+memory +pids").unwrap();
+        subtree_control(&mut k, ROOT, "+memory +pids", (0, 0)).unwrap();
         assert!(file(&k, child, b"memory.max", &|t| t).is_ok());
         assert_eq!(
             file(&k, child, b"cgroup.kill", &|t| t),
@@ -1548,7 +1610,7 @@ mod tests {
         );
 
         // Disabling a controller rejects writes and reads on held fds with ENODEV and stores nothing.
-        subtree_control(&mut k, ROOT, "-memory").unwrap();
+        subtree_control(&mut k, ROOT, "-memory", (0, 0)).unwrap();
         assert_eq!(
             write(&mut k, &writer, (child, b"memory.max"), b"4096\n"),
             Err(Errno::ENODEV)

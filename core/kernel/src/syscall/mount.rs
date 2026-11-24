@@ -275,7 +275,7 @@ fn new_mount(
         // The root of cgroup2 is the root of the caller's cgroup namespace (Linux's
         // cgroup_get_tree)
         Fs::Cgroup => (
-            Node::Pseudo(0, PseudoNode::Cgroup(cx.ns().cgroup.root, b"")),
+            Node::Pseudo(0, PseudoNode::Cgroup(cx.ns().cgroup.root, b"", 0)),
             Some(fs.dev()),
         ),
         _ => (fs.root(), (!fs.own_dev()).then(|| fs.dev())),

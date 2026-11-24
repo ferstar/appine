@@ -285,7 +285,7 @@ impl Fs {
                 Fs::Pts => PseudoNode::PtsRoot(crate::tty::BOOT_PTS),
                 Fs::Sys => PseudoNode::SysRoot,
                 // Replaced by the root of the caller's cgroup namespace when mounted
-                Fs::Cgroup => PseudoNode::Cgroup(crate::cgroup::ROOT, b""),
+                Fs::Cgroup => PseudoNode::Cgroup(crate::cgroup::ROOT, b"", 0),
                 // Replaced by the caller's IPC namespace's when mounted
                 Fs::Mqueue => PseudoNode::MqRoot(crate::nsproxy::INIT_IPC_NS),
             },

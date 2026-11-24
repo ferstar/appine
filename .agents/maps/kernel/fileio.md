@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: keep tmpfs fallocate reservations sparse on ext4)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: proc memory transfers serialize shared file positions across page fills)
 
 ## Responsibilities
 
@@ -73,11 +73,11 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - `/dev/zero`, `/dev/full` and the random devices fill the whole buffer per read; randomness comes
   from the host's `getrandom(2)` with no flags; writes to the random devices are discarded, to
   `/dev/full` `ENOSPC`.
-- Without an explicit offset, regular and FUSE files serialize position updates with `pos_busy`
+- Without an explicit offset, regular files, FUSE files and `/proc/<pid>/mem` serialize position updates with `pos_busy`
   (`PosGuard`/`TwoPosGuard`, emulating `f_pos_lock`): `read_file`/`write_file` loops, synchronous
-  `writev`, `lseek` (store regular and FUSE), `sendfile`, `copy_file_range` (including `try_share`
+  `writev`, `lseek`, `sendfile`, `copy_file_range` (including `try_share`
   and `copy_regular`), and `splice` into a file hold `pos_busy` across their position work so
-  unlocked I/O cannot overwrite a sought or advanced position. Loop devices and synthetic files
+  unlocked I/O cannot overwrite a sought or advanced position. Loop devices and other synthetic files
   move their position without it.
 - write and writev check `RLIMIT_FSIZE` once for the whole call (cut, or `SIGXFSZ` and `EFBIG` at
   or past it), so a piece or iovec ending at the limit only shortens the call. A write at the

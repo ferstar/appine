@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: opening deleted overlay executables through procfs)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cold proc memory transfers and cgroup2 per-node attributes)
 
 ## Responsibilities
 
@@ -71,7 +71,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `follow_dentry`, `magic`, `protected_symlinks`, `searched`.
 - `pseudo::stat`, `node_ino`, `ino_of`, `fs_of`, `readdir`, `content`, `writable`, `unwritable_error`,
   `open_unwritable`, `unreadable`, `pollable`, `has_iter`, `write`, `read_pagemap`,
-  `read_mem`, `write_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `group_of_id`,
+  `access_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `group_of_id`,
   `gone`, `comm_str`, `mark_deleted`, `uptime_ns`. (`sysctl_kind`/`recorded_value`/`RECORDED`
   belong to `kernel/sysctl`; `CGROUP_POINT` belongs to `kernel/sysfs`.)
 
@@ -105,16 +105,16 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   fd or open process file never resolves to a new process reusing that pid: once the pinned thread
   group is reaped, lookups and directory listings under it fail with `ENOENT` and offset-0 reads of
   open files fail with `ESRCH`.
-- Modes: directories 0555 (0755 on sysfs, a cgroup's from its mkdir); `fd/<n>` links by the open
+- Modes: directories 0555 (0755 on sysfs, a cgroup's from its node attributes); `fd/<n>` links by the open
   mode as `proc_fd_instantiate` (0500 readable, 0300 writable, 0700 both, 0 for `O_PATH`); other
   symlinks 0777; `mem` 0600; `syscall`, `pagemap`, `auxv` and `/proc/kmsg` 0400; sysctls follow
   `kernel/sysctl`; other writable files 0644; everything else 0444 (so `fd/`, `fdinfo/`, `ns/` are
-  0555, `environ` 0444, `comm` and `projid_map` read-only); cgroup files their `FILES` modes;
+  0555, `environ` 0444, `comm` and `projid_map` read-only); cgroup files their current modes;
   devpts nodes the terminal's mode and `ptmxmode`.
 - Owners: per-process nodes (`Pid`, `Entry`, `Fd`, including the `fd/`, `fdinfo/`, `ns/`, `net/`
   directories) belong to the euid/egid of the thread (under `task/<tid>`) or the main thread, or
   to root of those credentials' user namespace when the process is not dumpable; `net.*` sysctls
-  follow `kernel/sysctl`; cgroups belong to their creator; terminals to their owner; the entries
+  follow `kernel/sysctl`; cgroup nodes have individual owners; terminals to their owner; the entries
   inside `fdinfo/`, `ns/` and `net/`, reopened open files and everything else to root.
 - Stat reports `st_blksize` 1024 for procfs and devpts paths, 4096 elsewhere (slave and master
   fds included). Times are "now" except devpts terminals; directories have nlink 2 (`task/` 2
@@ -161,7 +161,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   translates the ids shown; pid numbers follow the mount's pid namespace. lseek
   (`SEEK_SET`/`CUR`/`END` against the snapshot length) never regenerates. `pagemap`, `mem` and
   `/proc/kmsg` are computed at read time (`mem` and `pagemap` from the address space held weakly
-  since open, returning empty/EOF once freed or replaced by execve); nsfs files cannot be read
+  since open, returning empty/EOF once freed or replaced by execve). Memory transfers fill missing
+  FUSE pages one at a time, retaining the byte count across fills. Nsfs files cannot be read
   (`EINVAL`), nor can write-only files.
 - Writes pass each chunk or iovec (one gathered input for numeric sysctls) to `pseudo::write` with the
   writer's credentials and namespaces (the id maps, `setgroups`, `timens_offsets` and cgroup
@@ -341,7 +342,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `mqueue` nodes, `seccomp`, `klog`, `loadavg`, the VFS (`reach`, `path_of`), the locks
   (`proc_locks` and `fd_locks`, `kernel/locks`), the mount table (`mounts_from`, devpts options;
   `kernel/mount`), the OOM killer (`proc_score`), unimplemented-path counting (`stub::record`).
-- `kernel/cgroup`: cgroup directory lookup and metadata use `Cgroups` and `file_mode`;
+- `kernel/cgroup`: cgroup directory lookup and metadata use `Cgroups` and `Cgroup::attrs`;
   `content` delegates to `file`, `proc_cgroup` and `proc_cgroups`; `write` supplies a `Writer`
   with the writer's namespaces and the opener's credentials. Device filtering and change
   observation are called by the file syscalls, not owned by this adapter.
@@ -356,7 +357,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `kernel/sysctl`).
 - Cgroup node adapters must preserve `kernel/cgroup`'s directory modes, controller-dependent
   file visibility and opener-credential checks; policy changes belong in that module.
-- Synthetic nodes have no store inode, so store-only operations (chown/chmod outside devpts and
+- Synthetic nodes have no store inode, so store-only operations (chown/chmod outside devpts, cgroup2 and
   mqueue, xattrs, links) fail on them.
 - `dev_ino` (epoll fdinfo) and inotify use `ino_of`, which omits the mount's device and nsfs's
   namespace id, so they can disagree with stat for later procfs instances and nsfs files.

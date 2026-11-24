@@ -517,7 +517,7 @@ pub(super) fn read(
     let start = offset.unwrap_or_else(|| file.borrow().pos);
     let vfs = cx.vfs()?;
     let mut read = |cx: &mut Cx<'_>| {
-        let data = fuse::read(cx, io.handle(), start, buf.len())?;
+        let data = fuse::read(cx, io.handle(), start, buf.len(), false)?;
         buf[..data.len()].copy_from_slice(&data);
         if let Some(pages) = mapped_pages(&vfs, io.id) {
             pages.overlay(start, &mut buf[..data.len()])?;
@@ -557,7 +557,7 @@ pub(super) fn write(
     // Appends to one node go one at a time from asking for the size to writing there
     let (n, at) = with_io(cx, &vfs, io.id, false, |cx| {
         let at = if append {
-            fuse::getattr(cx, &vfs, io.id, Some(io.fh))?.size
+            fuse::getattr(cx, &vfs, io.id, Some(io.fh), false)?.size
         } else {
             start
         };
@@ -657,7 +657,7 @@ pub(super) fn lseek(
         SEEK_SET => offset,
         SEEK_CUR => (pos as i64).checked_add(offset).ok_or(Errno::EINVAL)?,
         SEEK_END => {
-            let size = fuse::getattr(cx, &vfs, io.id, Some(io.fh))?.size as i64;
+            let size = fuse::getattr(cx, &vfs, io.id, Some(io.fh), false)?.size as i64;
             size.checked_add(offset).ok_or(Errno::EINVAL)?
         }
         SEEK_DATA | SEEK_HOLE => {
@@ -678,7 +678,7 @@ pub(super) fn lseek(
             match found {
                 Some(at) => at,
                 None => {
-                    let size = fuse::getattr(cx, &vfs, io.id, Some(io.fh))?.size as i64;
+                    let size = fuse::getattr(cx, &vfs, io.id, Some(io.fh), false)?.size as i64;
                     if offset < 0 || offset >= size {
                         return Err(Errno::ENXIO);
                     }
@@ -1494,10 +1494,11 @@ fn refresh_mapping_size(
     vfs: &Vfs,
     io: &Io,
     pages: &FillPages,
+    forced: bool,
 ) -> Result<(), Errno> {
     while pages.size_stale.get() {
         let generation = pages.generation.get();
-        let reply = fuse::getattr(cx, vfs, io.id, Some(io.fh));
+        let reply = fuse::getattr(cx, vfs, io.id, Some(io.fh), forced);
         if generation == pages.generation.get() {
             resize_mapping(cx, vfs, io.id, reply?.size)?;
             pages.size_stale.set(false);
@@ -1508,18 +1509,54 @@ fn refresh_mapping_size(
 
 /// Reads into an on-demand mapping of a FUSE file ([`Fill`]) the pages missing around file page
 /// `page` (Linux's `filemap_fault` read-around), the BKL released while the daemon answers.
-pub(crate) fn fill(cx: &mut Cx<'_>, (fill, page): (Rc<Fill>, u64)) -> Result<(), Errno> {
+pub(crate) fn fill(cx: &mut Cx<'_>, wanted: (Rc<Fill>, u64)) -> Result<(), Errno> {
+    fill_page(cx, wanted, false)
+}
+
+/// The core writer runs after group_exit marked the dumping thread killed. Wait for its
+/// daemon replies as for exit writeback, including a size refresh before reading the page.
+pub(crate) fn fill_for_dump(cx: &mut Cx<'_>, addr: u64) -> Result<(), Errno> {
+    for _ in 0..=super::FUSE_RETRIES {
+        let Some(wanted) = cx.mm().first_unread(addr, 1, 0) else {
+            return Ok(());
+        };
+        fill_page(cx, wanted, true)?;
+    }
+    Err(Errno::EIO)
+}
+
+/// After the other threads have exited, a device held only by the dumping process
+/// cannot answer its own page fault. An inherited fd is fine if another task can serve it.
+fn dump_owns_last_device(cx: &Cx<'_>, conn: &Rc<RefCell<Conn>>) -> bool {
+    let serves = |fds: &crate::fd::FdTable| {
+        fds.files().any(|file| {
+            matches!(&file.borrow().kind, FileKind::FuseDev(dev)
+                if dev.conn.as_ref().is_some_and(|c| Rc::ptr_eq(c, conn)))
+        })
+    };
+    serves(&cx.fds())
+        && !cx
+            .kr()
+            .tasks
+            .values()
+            .any(|task| !task.killed.get() && serves(&task.res.borrow().fds.borrow()))
+}
+
+fn fill_page(cx: &mut Cx<'_>, (fill, page): (Rc<Fill>, u64), forced: bool) -> Result<(), Errno> {
     let io = file_io(&fill.source).ok_or(Errno::EIO)?;
+    if forced && dump_owns_last_device(cx, &io.conn) {
+        return Err(Errno::ENOTCONN);
+    }
     let vfs = cx.vfs()?;
-    with_io(cx, &vfs, io.id, false, |cx| {
-        refresh_mapping_size(cx, &vfs, &io, &fill)?;
+    with_io(cx, &vfs, io.id, forced, |cx| {
+        refresh_mapping_size(cx, &vfs, &io, &fill, forced)?;
         let Some(mut window) = fill.window(page) else {
             return Ok(());
         };
         let generation = fill.generation.get();
         loop {
             let around = window.0 < page * PAGE_SIZE;
-            let read = read_fill_window(cx, &io, &fill, window, around, generation);
+            let read = read_fill_window(cx, &io, &fill, window, around, generation, forced);
             if generation != fill.generation.get() {
                 // The page fault or kernel access retries using a fresh window.
                 return Ok(());
@@ -1546,8 +1583,9 @@ fn read_fill_window(
     (offset, len): (u64, u64),
     around: bool,
     generation: u64,
+    forced: bool,
 ) -> Result<(Vec<u8>, bool), Errno> {
-    let mut data = fuse::read(cx, io.handle(), offset, len as usize)?;
+    let mut data = fuse::read(cx, io.handle(), offset, len as usize, forced)?;
     if around {
         return Ok((data, false));
     }
@@ -1558,7 +1596,7 @@ fn read_fill_window(
         && generation == fill.generation.get()
     {
         let want = PAGE_SIZE as usize - data.len();
-        let more = fuse::read(cx, io.handle(), offset + data.len() as u64, want)?;
+        let more = fuse::read(cx, io.handle(), offset + data.len() as u64, want, forced)?;
         eof = more.is_empty();
         data.extend_from_slice(&more);
     }
@@ -1578,10 +1616,10 @@ fn writeback(cx: &mut Cx<'_>, id: FuseId, start: u64, end: u64) -> Result<(), Er
     let io = file_io(&writer.source).ok_or(Errno::EIO)?;
     with_io(cx, &vfs, id, true, |cx| {
         for page in pages.tracked(start, end) {
-            refresh_mapping_size(cx, &vfs, &io, &pages)?;
+            refresh_mapping_size(cx, &vfs, &io, &pages, true)?;
             for (at, data) in pages.dirty_runs(page)? {
                 // Another invalidation may have arrived during the preceding write.
-                refresh_mapping_size(cx, &vfs, &io, &pages)?;
+                refresh_mapping_size(cx, &vfs, &io, &pages, true)?;
                 let len = (data.len() as u64).min(pages.size().saturating_sub(at)) as usize;
                 let n = fuse::write(cx, io.handle(), at, &data[..len], true)?;
                 pages.acknowledge(at, &data[..n]);
@@ -1730,7 +1768,7 @@ fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<std::collections::Hash
             add(Node::Fuse(0, id));
         }
         let fds = res.fds.try_borrow().ok()?;
-        for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
+        for file in fds.files() {
             if let Some(n) = file.try_borrow().ok()?.node() {
                 add(n);
             }
@@ -1765,10 +1803,9 @@ pub(crate) fn flush_at_exit(cx: &mut Cx<'_>) {
     }
     let files: Vec<FileRef> = {
         let t = cx.fds();
-        t.open_fds()
-            .into_iter()
-            .filter_map(|fd| t.get(fd).ok())
+        t.files()
             .filter(|f| matches!(f.borrow().kind, FileKind::Fuse(_)))
+            .cloned()
             .collect()
     };
     flush_all(cx, &files);

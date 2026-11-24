@@ -184,13 +184,15 @@ fn write(
     info: &SigInfo,
 ) -> Result<(), Errno> {
     let mm = cx.t.mm.clone();
-    let (regions, notes) = {
-        let mm = mm.borrow();
-        let filter = cx.t.group.borrow().coredump_filter;
-        let regions = mm.dump_regions(filter);
-        let notes = notes(cx, &mm, &regions, threads, sig, info);
-        (regions, notes)
-    };
+    let filter = cx.t.group.borrow().coredump_filter;
+    let mut regions = mm.borrow().dump_regions(filter);
+    let mut page = vec![0u8; PAGE_SIZE as usize];
+    for r in regions.iter_mut().filter(|r| r.check_elf) {
+        if !read_page(cx, r.start, &mut page) || !page.starts_with(b"\x7fELF") {
+            r.size = 0;
+        }
+    }
+    let notes = notes(cx, &mm.borrow(), &regions, threads, sig, info);
     let limit = cx.t.group.borrow().rlimits[RLIMIT_CORE as usize].0;
     let (header, data_offset) = elf_header(&regions, &notes);
     let _ = crate::syscall::unlink_path(cx, name);
@@ -204,7 +206,6 @@ fn write(
     };
     w.put(cx, 0, &header);
     let mut offset = data_offset;
-    let mut page = vec![0u8; PAGE_SIZE as usize];
     for r in regions.iter().filter(|r| r.size > 0) {
         // Untouched pages of anonymous and shared memory are left as holes (Linux's FOLL_DUMP)
         let resident = if r.sparse {
@@ -218,7 +219,7 @@ fn write(
             let touched = resident
                 .as_ref()
                 .is_none_or(|v| v.get(index) == Some(&true));
-            if touched && mm.borrow().dump_page(addr, &mut page) {
+            if touched && read_page(cx, addr, &mut page) {
                 w.put(cx, offset, &page);
             }
             addr += PAGE_SIZE;
@@ -230,6 +231,13 @@ fn write(
         w.put(cx, offset - 1, &[0]);
     }
     Ok(())
+}
+
+fn read_page(cx: &mut Cx<'_>, addr: u64, page: &mut [u8]) -> bool {
+    if cx.mm().has_fills() && crate::syscall::fill_for_dump(cx, addr).is_err() {
+        return false;
+    }
+    cx.mm().dump_page(addr, page)
 }
 
 /// Writes to the core file. As with Linux's `dump_emit`, writing stops once the bytes written
@@ -542,6 +550,7 @@ mod tests {
                 end: 0x12000,
                 prot: prot::READ | prot::EXEC,
                 size: 0x1000,
+                check_elf: false,
                 sparse: false,
                 file: Some((0, std::rc::Rc::from(&b"/bin/x"[..]))),
             },
@@ -550,6 +559,7 @@ mod tests {
                 end: 0x23000,
                 prot: prot::READ | prot::WRITE,
                 size: 0x3000,
+                check_elf: false,
                 sparse: true,
                 file: None,
             },

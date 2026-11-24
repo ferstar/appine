@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: return ENODEV on writes and reads of disabled-controller or removed-cgroup files)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: independent ownership and permissions for delegated nodes)
 
 ## Responsibilities
 
@@ -27,12 +27,11 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 
 ## Key types
 
-- `Cgroup` (name, parent, children, `subtree_control`, owner, mode, written `values`, pids and
+- `Cgroup` (name, parent, children, `subtree_control`, creator, directory mode, per-node attribute overrides, written `values`, pids and
   memory events, memory peak, `freeze`, attached device programs and their flags) and `Cgroups`
   (the tree; ids never reused, root 1; `observed` notifying files); `CONTROLLERS` (8 in Linux's
   order, of which cpuset, cpu, memory and pids are available), `FILES` (39 interface files with
-  modes and controllers), `Writer` (writing thread, pid namespace, cgroup-namespace root, opener's
-  credentials); `CgroupNs` (in nsproxy).
+  modes and controllers), `Writer` (writing thread, pid namespace, cgroup-namespace root, writer and opener credentials); `CgroupNs` (in nsproxy).
 - `bpf::Prog` (id, instructions, name, tag, gpl, load time, loader's uid), `bpf::Registry` (weak,
   by id, ids never reused), `FileKind::Bpf`.
 - `PseudoNode::Cgroup(id, name)` is the `kernel/procfs` adapter (empty name for a directory).
@@ -59,10 +58,10 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 - mkdir: `EROFS` on ro mounts; `EEXIST` for `.`, `..`, existing names and interface-file names;
   write and search on the parent; newline in the name `EINVAL`; ancestors' `cgroup.max.depth` /
   `max.descendants` `EAGAIN`; the new cgroup and its files belong to the creator's fsuid/fsgid,
-  which is the only way to own one (path chown/chmod `EACCES`, or `EROFS` on ro mounts; fd-based
-  `EBADF`), and the directory has the mode mkdir gave (umask applied, `S_IRWXUGO|S_ISVTX`), which
-  path lookups through it, chdir and chroot check for search, as kernfs does. So only privileged
-  processes create top-level cgroups. rmdir: write and search on the parent; children or live
+  and chmod/chown change each node independently. The directory starts with the mode from mkdir
+  (umask applied, `S_IRWXUGO|S_ISVTX`), which
+  path lookups through it, chdir and chroot check for search, as kernfs does. The default root permissions restrict
+  top-level creation to privileged processes. rmdir: write and search on the parent; children or live
   processes `EBUSY` (zombies do not count); the root `EBUSY`; removal is immediate, with no dying
   state. Creating plain files is `EACCES`, renaming `EPERM`.
 - Membership: every process starts in the root; fork places the child in the parent's cgroup or a
@@ -137,8 +136,9 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 ### Synthetic node and open-file boundary
 
 - `kernel/procfs` maps cgroup directories and files to `PseudoNode::Cgroup`, gets their names
-  from `Cgroups::files`, modes from the cgroup or `file_mode`, and owners from the creator.
-  File sizes are 4096 and times are "now"; the node adapter has no store inode.
+  from `Cgroups::files` and attributes from `Cgroup::attrs`. Interface files report size 4096.
+  Enabling a controller creates its files with the writer's fsuid and fsgid. Lookups retain the controller
+  generation. Disabling it retires the open node and discards its attribute overrides.
 - The file syscalls check mount flags and DAC. Read-only cgroup files can still open for root
   in a write mode, with writes failing `EINVAL`; write-only files cannot be read (`EINVAL`).
 - The shared synthetic-file path generates content at open (empty for write-only files). The
@@ -227,8 +227,7 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   watched. A directory watch can also receive an inherited freeze notification for a child
   event file never looked up, where the native 6.8 VM reported it only with the child dentry
   instantiated.
-- **Delegation and controller gaps:** cgroup directories cannot be chmod'ed or chown'ed;
-  threaded cgroups are unavailable; limits such as `cpu.max`, `cpu.weight`, `cpuset.cpus` and
+- **Controller gaps:** threaded cgroups are unavailable; limits such as `cpu.max`, `cpu.weight`, `cpuset.cpus` and
   `memory.high` are stored without enforcement.
 
 ## Open questions
