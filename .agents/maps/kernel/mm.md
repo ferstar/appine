@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: hold tmpfs pages read-only until the first write fault)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: retain private store mapping pins across descriptor reuse and remapping)
 
 ## Responsibilities
 
@@ -126,7 +126,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `EOPNOTSUPP`), `MAP_SHARED | MAP_ANONYMOUS | MAP_GROWSDOWN` (`EINVAL`), a fixed address below
   `vm.mmap_min_addr` without `CAP_SYS_RAWIO` (`EPERM`; for an anonymous mapping only with a
   non-zero length; for a file after its `EBADF` and zero-length `EINVAL`), then the file's own
-  rules (a FUSE mapping gets its `Fill`; regular shared mappings check access, noexec and seals
+  rules (a FUSE mapping gets its `Fill`; regular store mappings check access, noexec and seals
   before unsharing and pinning the store object), and `MAP_LOCKED` over the
   locked-memory limit (`EAGAIN`). After the mapping: `reap_shm` for `MAP_FIXED`, grows-down for
   private anonymous memory, the label, write and exec denials, locking, and population
@@ -260,8 +260,8 @@ signals may still be delivered).
   `EINVAL`, the margin `ENOMEM`, the target unmapped, the one-VMA rule `EFAULT`; it splits nothing
   before these, and then also needs room for the splits and for one VMA per piece left at the old
   address. What it leaves there: for anonymous memory a new empty VMA, for a private file a
-  `Refill` that the syscall maps from the store object (both keeping `may_exec`, dump, fork,
-  grows-down, `noreserve`, `anon` and `mnt`), and for shared memory and a `Fill` VMA a copy of the
+  `Refill` that the syscall maps from its retained descriptor, even after unlink (both keeping
+  `may_exec`, dump, fork, grows-down, `noreserve`, `anon` and `mnt`), and for shared memory and a `Fill` VMA a copy of the
   old VMA (unlocked; a `Fill` one on its host file mapped privately again); the syscall then calls
   `reap_shm`. `shmat` also refuses non-zero fixed addresses below `vm.mmap_min_addr` without
   `CAP_SYS_RAWIO` (`EPERM`).
@@ -335,7 +335,8 @@ signals may still be delivered).
 
 - Whole pages past EOF have no entries. Ordinary shared and private mappings keep the file open
   across descriptor close, VMA splits, fork and mremap. Private mappings share a retained descriptor
-  per host inode across a fork family. Guest instruction faults and kernel copies retried through
+  per host inode across a fork family. A store pin takes precedence over an unpinned descriptor from
+  the ELF loader. Guest instruction faults and kernel copies retried through
   `grow_for` check the current extent. If a private mapping has anonymous or shared read-only backing after fork,
   caching or mprotect, only the previously inaccessible tail gets a fresh private host mapping.
 - truncate, ftruncate and `O_TRUNC` that shorten a file first call `file_truncated` on every
@@ -345,9 +346,10 @@ signals may still be delivered).
   file: no thread can reach the dropped tail through a stale translation, so an access there faults
   into the kernel and gets the guest's `SIGBUS` once the BKL is free. A host truncation that then
   fails leaves the mappings' EOF at the requested length.
-- A named store file mapped shared gets its own backing object before mapping, including
-  read-only opens. The VMA retains a duplicate of its locked open description. Splits, fork
-  and mremap keep the pin. Clones and overlay copy-up copy bytes when either object is pinned.
+- Private and shared mmap of a named store file first give the inode its own backing object, including
+  on read-only opens. The VMA retains a duplicate of its locked open description. Splits, fork
+  and mremap keep the pin. Cached host views use a separate open description. Clones and overlay
+  copy-up copy bytes when either object is pinned.
   A Files app truncate clips affected address spaces in each running kernel before the host
   shrink; guest faults can then observe EOF or regrowth. Private mappings retain their backing.
 
@@ -415,6 +417,9 @@ signals may still be delivered).
   and core-dump holes still use mincore.
 
 ## Confirmed bugs / technical debt
+
+- Fork copies ordinary writable private file mappings into anonymous host memory in the child.
+  Its clean pages can therefore miss later file writes even when the backing object stays pinned.
 
 - A read or write through `/proc/<pid>/mem` can stop with EIO or a short count at a FUSE page
   awaiting a fill. Ptrace PEEK and POKE can likewise return EIO there.

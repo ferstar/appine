@@ -216,6 +216,7 @@ pub struct Refill {
     pub offset: u64,
     pub name: Option<Rc<[u8]>>,
     pub mnt: Option<crate::vfs::MountId>,
+    pub(crate) file: Option<Rc<OwnedFd>>,
     pub flags: VmaFlags,
     pub(crate) tmpfs: Option<Rc<crate::vfs::TmpfsMapping>>,
     interp_open: Option<crate::syscall::Opened>,
@@ -276,7 +277,8 @@ pub(crate) struct TmpfsRange {
     pub len: u64,
 }
 
-pub(crate) enum FileFault {
+pub(crate) enum FileSource {
+    PinnedStore,
     Fuse(Rc<Fill>),
     Tmpfs(Rc<crate::vfs::TmpfsMapping>),
 }
@@ -1036,7 +1038,12 @@ pub struct Mm {
     pub(crate) unmapped_fills: Vec<(Rc<Fill>, u64, u64)>,
 }
 
-type PrivateFiles = HashMap<(u64, u64), Weak<OwnedFd>>;
+struct PrivateFile {
+    fd: Weak<OwnedFd>,
+    pinned: bool,
+}
+
+type PrivateFiles = HashMap<(u64, u64), PrivateFile>;
 
 impl Mm {
     // ---- Creation and layout ----
@@ -2393,7 +2400,7 @@ impl Mm {
         (fill, offset): (Rc<Fill>, u64),
     ) -> Result<u64, Errno> {
         let file = Some((fill.fd(), offset, fill.source.borrow().writable()));
-        self.map(addr, len, prot, flags, file, Some(FileFault::Fuse(fill)))
+        self.map(addr, len, prot, flags, file, Some(FileSource::Fuse(fill)))
     }
 
     /// Maps a range owned by the GPU backend directly into the guest page table.
@@ -2469,12 +2476,13 @@ impl Mm {
         prot: u32,
         flags: u32,
         file: Option<(i32, u64, bool)>,
-        source: Option<FileFault>,
+        source: Option<FileSource>,
     ) -> Result<u64, Errno> {
+        let pinned = matches!(source, Some(FileSource::PinnedStore | FileSource::Tmpfs(_)));
         let (fill, tmpfs) = match source {
-            Some(FileFault::Fuse(fill)) => (Some(fill), None),
-            Some(FileFault::Tmpfs(mapping)) => (None, Some(mapping)),
-            None => (None, None),
+            Some(FileSource::Fuse(fill)) => (Some(fill), None),
+            Some(FileSource::Tmpfs(mapping)) => (None, Some(mapping)),
+            None | Some(FileSource::PinnedStore) => (None, None),
         };
         let len = page_up(len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         let shared = flags & 3 == flags::MAP_SHARED;
@@ -2560,16 +2568,27 @@ impl Mm {
                     cached = true;
                     (backing, true, region, host)
                 } else {
-                    let m = match (&bundled_libc, key) {
-                        (Some(libc), _) => libc.map(offset, host_len),
-                        (None, Some(_)) => appine_hal::map_file_read_only(fd, offset, host_len),
-                        (None, None) => {
-                            appine_hal::map_file(fd, offset, host_len, shared, writable)
-                        }
-                    }
-                    .map_err(Errno)?;
+                    // Cached views can outlive every guest VMA. Use an independent open
+                    // description so the cache cannot keep a store mapping's flock.
+                    use std::os::fd::AsRawFd;
+                    let (mapping, cache_key) = if let Some(libc) = &bundled_libc {
+                        (libc.map(offset, host_len), key)
+                    } else if key.is_some()
+                        && let Ok(view) = std::fs::File::open(format!("/proc/self/fd/{fd}"))
+                    {
+                        (
+                            appine_hal::map_file_read_only(view.as_raw_fd(), offset, host_len),
+                            key,
+                        )
+                    } else {
+                        (
+                            appine_hal::map_file(fd, offset, host_len, shared, writable),
+                            None,
+                        )
+                    };
+                    let m = mapping.map_err(Errno)?;
                     let region = HostRegion::file(m.base, m.len);
-                    if let Some(key) = key {
+                    if let Some(key) = cache_key {
                         self.files.insert(key, region.clone(), m.ptr);
                         cached = true;
                     }
@@ -2590,7 +2609,7 @@ impl Mm {
                 let private_inode = file_id.filter(|_| !shared).map(|(dev, ino, _)| (dev, ino));
                 // SAFETY: the mapping's input fd stays open for this call.
                 let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-                Some((self.retain_file(fd, private_inode)?, offset))
+                Some((self.retain_file(fd, private_inode, pinned)?, offset))
             }
             _ => None,
         };
@@ -2629,13 +2648,16 @@ impl Mm {
         &self,
         fd: BorrowedFd<'_>,
         private_inode: Option<(u64, u64)>,
+        pinned: bool,
     ) -> Result<Rc<OwnedFd>, Errno> {
         if let Some(key) = private_inode
             && let Some(retained) = self
                 .private_files
                 .borrow()
                 .get(&key)
-                .and_then(Weak::upgrade)
+                // An ELF segment can have retained this inode without a store mapping pin.
+                .filter(|entry| !pinned || entry.pinned)
+                .and_then(|entry| entry.fd.upgrade())
         {
             return Ok(retained);
         }
@@ -2646,9 +2668,15 @@ impl Mm {
         if let Some(key) = private_inode {
             let mut files = self.private_files.borrow_mut();
             if files.len() == files.capacity() {
-                files.retain(|_, fd| fd.strong_count() > 0);
+                files.retain(|_, entry| entry.fd.strong_count() > 0);
             }
-            files.insert(key, Rc::downgrade(&retained));
+            files.insert(
+                key,
+                PrivateFile {
+                    fd: Rc::downgrade(&retained),
+                    pinned,
+                },
+            );
         }
         Ok(retained)
     }
@@ -2754,6 +2782,7 @@ impl Mm {
                     name: v.name.clone(),
                     mnt: v.mnt.as_ref().map(|m| m.0),
                     flags: VmaFlags::of(v),
+                    file: v.file.as_ref().map(|(fd, _)| fd.clone()),
                     tmpfs: v.tmpfs.as_ref().map(|t| t.mapping.clone()),
                     interp_open: v.interp_open.clone(),
                 }),
@@ -3141,10 +3170,10 @@ impl Mm {
             prot,
             flags,
             Some((raw, offset, may_write)),
-            v.fill.clone().map(FileFault::Fuse).or_else(|| {
+            v.fill.clone().map(FileSource::Fuse).or_else(|| {
                 v.tmpfs
                     .as_ref()
-                    .map(|t| FileFault::Tmpfs(t.mapping.clone()))
+                    .map(|t| FileSource::Tmpfs(t.mapping.clone()))
             }),
         )?;
         if !may_exec {
@@ -7996,6 +8025,45 @@ mod tests {
             Err(Errno::FUSE_RETRY)
         );
         assert_eq!(take_wanted().unwrap().1, 33);
+    }
+
+    #[test]
+    fn private_store_mapping_keeps_its_pin_after_an_unpinned_elf_mapping() {
+        use std::os::fd::AsRawFd;
+        let object = appine_hal::memfd(c"mapping-pin").unwrap();
+        object.set_len(PAGE_SIZE).unwrap();
+        let mut mm = Mm::new();
+        mm.mmap(
+            0,
+            PAGE_SIZE,
+            prot::READ,
+            flags::MAP_PRIVATE,
+            Some((object.as_raw_fd(), 0, false)),
+        )
+        .unwrap();
+        let pin = std::fs::File::open(format!("/proc/self/fd/{}", object.as_raw_fd())).unwrap();
+        pin.lock_shared().unwrap();
+        let addr = mm
+            .map(
+                0,
+                PAGE_SIZE,
+                prot::READ,
+                flags::MAP_PRIVATE,
+                Some((pin.as_raw_fd(), 0, false)),
+                Some(FileSource::PinnedStore),
+            )
+            .unwrap();
+        drop(pin);
+        let child = mm.fork().unwrap();
+        mm.munmap(addr, PAGE_SIZE).unwrap();
+        assert!(matches!(
+            object.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        child.borrow_mut().munmap(addr, PAGE_SIZE).unwrap();
+        mm.sync_except(None);
+        child.borrow_mut().sync_except(None);
+        object.try_lock().unwrap();
     }
 
     #[test]

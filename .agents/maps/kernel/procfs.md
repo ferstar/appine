@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: report the addressed thread’s no_new_privs flag)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: return the consumed length and position together from a synthetic write)
 
 ## Responsibilities
 
@@ -70,7 +70,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - `Pseudo for View`: `lookup`, `missing`, `parent`, `name`, `kind`, `readlink`, `follow`,
   `follow_dentry`, `magic`, `protected_symlinks`, `searched`.
 - `pseudo::stat`, `node_ino`, `ino_of`, `fs_of`, `readdir`, `content`, `writable`, `unwritable_error`,
-  `open_unwritable`, `unreadable`, `pollable`, `has_iter`, `write`, `written`, `read_pagemap`,
+  `open_unwritable`, `unreadable`, `pollable`, `has_iter`, `write`, `read_pagemap`,
   `read_mem`, `write_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `group_of_id`,
   `gone`, `comm_str`, `mark_deleted`, `uptime_ns`. (`sysctl_kind`/`recorded_value`/`RECORDED`
   belong to `kernel/sysctl`; `CGROUP_POINT` belongs to `kernel/sysfs`.)
@@ -163,10 +163,10 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `/proc/kmsg` are computed at read time (`mem` and `pagemap` from the address space held weakly
   since open, returning empty/EOF once freed or replaced by execve); nsfs files cannot be read
   (`EINVAL`), nor can write-only files.
-- Writes pass each call's buffer (each 64 KiB chunk, each iovec) to `pseudo::write` with the
+- Writes pass each chunk or iovec (one gathered input for numeric sysctls) to `pseudo::write` with the
   writer's credentials and namespaces (the id maps, `setgroups`, `timens_offsets` and cgroup
-  migration also check the opener's), apply immediately, do not advance the position (except
-  `mem`), and mark the snapshot stale. Per-process numbers use `proc_number`/`kstrto` (first 12
+  migration also check the opener's), apply at the current position for `mem` and numeric sysctls, and
+  mark the snapshot stale. Per-process numbers use `proc_number`/`kstrto` (first 12
   bytes, base 0, `EINVAL`/`ERANGE`).
 - Change notifications (`fd::ProcEvent`): epoll accepts the files with a Linux poll operation
   (`pseudo::pollable`: global procfs files, `/proc/sys`, `/proc/sysvipc`, `/proc/<pid>/net`,
@@ -383,9 +383,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   and symbol lookups (perf, bpftrace) find nothing.
 - **Per-thread values that are the process's:** `task/<tid>/stat`'s start time is the process's
   (Appine keeps none per thread).
-- **Writes never advance a synthetic file's position** (except `mem`): repeated writes on one
-  descriptor keep taking effect, where Linux refuses a second id-map write (`EINVAL`; Appine's is
-  `EPERM`, the map being set).
+- **Non-sysctl synthetic writes other than `mem` leave the position unchanged:** Linux refuses a second
+  id-map write with `EINVAL`. Appine returns `EPERM` once the map has been set.
 
 ## Open questions
 

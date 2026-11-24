@@ -11,7 +11,7 @@ use super::{SysResult, get, put};
 use crate::cell::RefCell;
 use crate::cred::cap;
 use crate::errno::Errno;
-use crate::fd::{FileKind, oflags};
+use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Kernel, Tid, request_wake_object, wake};
 use crate::process::Signal;
 use crate::signal::{self, SigAction, SigInfo};
@@ -29,6 +29,7 @@ const TCSETAF: u32 = 0x5408;
 const TCSBRK: u32 = 0x5409;
 const TCXONC: u32 = 0x540a;
 const TCFLSH: u32 = 0x540b;
+const TIOCGEXCL: u32 = 0x8004_5440;
 const TIOCEXCL: u32 = 0x540c;
 const TIOCNXCL: u32 = 0x540d;
 const TIOCSCTTY: u32 = 0x540e;
@@ -119,6 +120,7 @@ pub(crate) fn open_slave(
         .ok_or(Errno::ENOENT)?;
     {
         let t = tty.borrow();
+        check_reopen(cx, &t)?;
         if t.locked || t.masters == 0 {
             return Err(Errno::EIO);
         }
@@ -160,24 +162,38 @@ pub(crate) fn open_peer(
         let t = tty.borrow();
         (t.fs, t.index)
     };
-    let kind = open_slave(cx, (fs, index, mnt, true), flags)?;
-    let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK;
     // The path is <number> in that devpts mount (used by the fd's link and ttyname)
     let vfs = cx.vfs()?;
     let node = crate::vfs::Node::Pseudo(mnt, crate::pseudo::PseudoNode::Pts(fs, index));
-    let path = vfs.path_of(&cx.view(&vfs), &cx.root(), &node).ok();
-    let file = crate::fd::OpenFile::with_path(
-        kind,
-        flags & keep | oflags::O_LARGEFILE,
-        path.map(Rc::from),
-    );
+    let path = vfs
+        .path_of(&cx.view(&vfs), &cx.root(), &node)
+        .ok()
+        .map(Rc::from);
+    let file = if flags & oflags::O_PATH != 0 {
+        let file = OpenFile::with_path(FileKind::Path(node), flags, path);
+        // ptm_open_peer passes the raw flags to dentry_open, including O_CLOEXEC.
+        file.borrow_mut().flags = flags;
+        file
+    } else {
+        let kind = open_slave(cx, (fs, index, mnt, true), flags)?;
+        let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK;
+        OpenFile::with_path(kind, flags & keep | oflags::O_LARGEFILE, path)
+    };
     Ok(cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)? as u64)
 }
 
 /// Opens `/dev/tty`: the caller's controlling terminal.
 pub(crate) fn open_ctty(cx: &mut Cx<'_>) -> Result<FileKind, Errno> {
     let tty = cx.t.group.borrow().ctty.clone().ok_or(Errno::ENXIO)?;
+    check_reopen(cx, &tty.borrow())?;
     Ok(FileKind::Pty(PtyEnd::new(tty, false)))
+}
+
+fn check_reopen(cx: &Cx<'_>, tty: &Tty) -> Result<(), Errno> {
+    if tty.exclusive[0] && !cx.cred().capable(cap::SYS_ADMIN) {
+        return Err(Errno::EBUSY);
+    }
+    Ok(())
 }
 
 // ---- Reading and writing ----
@@ -649,7 +665,14 @@ pub(crate) fn ioctl(
             }
             Ok(0)
         }
-        TIOCEXCL | TIOCNXCL => Ok(0),
+        TIOCEXCL | TIOCNXCL => {
+            tty.borrow_mut().exclusive[master as usize] = request == TIOCEXCL;
+            Ok(0)
+        }
+        TIOCGEXCL => {
+            let value = i32::from(tty.borrow().exclusive[master as usize]);
+            put(cx, arg, value.to_le_bytes()).map(|()| 0)
+        }
         TIOCGETD => put(cx, arg, 0i32.to_le_bytes()).map(|()| 0),
         FIONREAD => {
             let t = tty.borrow();

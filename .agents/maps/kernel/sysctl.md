@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-network-namespace IPv4 bridge netfilter switch)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: honor numeric write positions and parse vectored input once)
 
 ## Responsibilities
 
@@ -101,8 +101,11 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
   root never passes): `dmesg_restrict`, `kernel.tainted`, `kptr_restrict`,
   `unprivileged_bpf_disabled` and seccomp `actions_logged` need `CAP_SYS_ADMIN`; `mmap_min_addr`
   needs `CAP_SYS_RAWIO`.
-- Most sysctls parse decimal after trimming; writes do not advance the file position and mark the
-  open file's snapshot stale (`kernel/procfs`).
+- Numeric handlers parse a write or writev once at offset zero. Signed integer and unsigned-long
+  writes advance the open position. Linux 6.1 unsigned-int and byte handlers keep an initial
+  write at zero. Nonzero offsets consume input without changing the value. The IPv6 forwarding
+  and linkdown fixups for `all` and device entries return one byte and keep their position.
+  Positioned writes preserve the open position. Successful writes mark the snapshot stale.
 
 ### Recorded sysctls and constants
 
@@ -171,8 +174,7 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
   offset 0 still read the current reader's namespace.
 - **Sysctl poll never reports `POLLPRI`:** `hostname` and `domainname` never wake pollers on
   change.
-- **Writes never advance a sysctl file's position:** repeated writes on one descriptor keep taking
-  effect, where Linux ignores a strict-mode sysctl write at a non-zero position.
+- String and bitmap sysctls still process successive writes independently of the file position.
 - **`kernel/pid_max` writes are ignored.**
 
 ## Open questions

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: reuse exact tmpfs page reservations for writes and sparse seeks)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pin private store mappings and gather numeric sysctl writes)
 
 ## Responsibilities
 
@@ -113,7 +113,8 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   order; writes in 64 KiB pieces across iovecs until one is short; sockets through `kernel/net`),
   so a pipe readv returns what was there and small pipe writes stay atomic; `/dev/fuse` does the
   same in pieces of up to 8 MiB, since a FUSE message moves whole, and a `/dev/kmsg` writev is one
-  record. Host stdio fds that are not regular files on the host take the pipe path. Everything else
+  record. Numeric sysctl writes parse all iovecs as one value. Host stdio fds that are not regular
+  files on the host take the pipe path. Everything else
   goes iovec by iovec and stops at an incomplete one, as Linux does for files with only
   `read`/`write`. Over 1024 iovecs or a total over `isize::MAX` is `EINVAL`; a total of 0 returns
   0 after the offset and mode checks.
@@ -172,18 +173,19 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 
 ### Clones and unsharing
 
-- Writes to a held file, truncation, allocation and shared mapping creation give the inode an
+- Writes to a held file, truncation, allocation and mapping through a store descriptor give the inode an
   object of its own. Guest unsharing copies outside the BKL while other writers wait. Back under
   the BKL it prepares replacement handles for open descriptions before publishing the copy,
   abandons it on failure and retries if the original object changed. Replaced handles remain
   open until description close for I/O in flight. A Files app unshare rehomes descriptions
-  during change replay. Before exposing a shared mapping, the kernel reconciles open
-  descriptions with its pinned host object.
+  during change replay. Settling a held inode restores atime and mtime on the host object and can
+  advance ctime, even for a read-only mapping. Before exposing a store mapping, the kernel reconciles
+  open descriptions with its pinned host object.
 - Clones: copy_file_range from offset 0 to offset 0 of a whole non-empty input into an output no
   longer than it, and FICLONE or FICLONERANGE doing the same, share the input's object
   (`try_share`) unless either is not a regular store file, a memfd, opened through an overlay or on
   tmpfs, both are one inode, the input is deleted, open for writing in this kernel by a description
-  not marked `cow`, or has a shared mapping pin, either is open for writing by
+  not marked `cow`, either object has a store mapping pin, either file is open for writing by
   the Files app (`host_writing`), or the output is mapped (privately too), sealed or being
   unshared; then they copy. The output's set-id bits go first and its descriptions move to the
   shared object (`rehome`); copy_file_range returns the whole length at once and advances the
@@ -197,7 +199,8 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   reserved fields (`EINVAL`), directories (`EISDIR`) and other non-regular files (`EINVAL`), then
   is `EOPNOTSUPP`.
 - An overlay copy-up shares the lower file's object too, through `kernel/overlay`'s `copy_up`,
-  which copies the data instead when the lower object has a shared mapping pin or a host writer, and rehomes the lower file's descriptions open for writing.
+  which copies the data instead when the lower object has a mapping pin or a host writer, and rehomes
+  the lower file's descriptions open for writing.
 
 ## Dependencies (inbound / outbound)
 
@@ -211,7 +214,8 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - `kernel/vfs`: `opens_of` before releasing an unlinked file's object, and `remove_privs` shared
   privileges rule.
 - `kernel/overlay`: `prepare_write`, `rehome` after copy-up; `kernel/pipe`: file checks and the
-  read and write paths of a splice's other end; `kernel/mm`: `make_private` and `reconcile_mapping` for shared mappings.
+  read and write paths of a splice's other end; `kernel/mm`: `make_private` and `reconcile_mapping` for
+  store mappings.
 - `kernel/inotify`: `host_unshared`; `kernel/aio` and `kernel/loop`: `IoFlags`, `read_file`/
   `read_file_with`, `write_file`/`write_file_with`, `read_bytes`, `write_bytes`, `write_sync`,
   `vectored`/`vectored_with`, `fsync`, `has_fsync`, `seekable`, `append_offset`; `kernel/fuse`:
@@ -273,9 +277,6 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - **Error order in I/O calls:** pread and pwrite look up the fd before refusing a
   negative offset; fallocate checks its arguments before the fd, its mode after the fd's type, and
   on a socket is `ESPIPE` where 6.1 says `ENODEV`.
-- **Private mappings do not follow a file to its own object:** a private mapping made while the
-  file shared an object keeps the shared data in pages it has not copied after a write through
-  another descriptor.
 - **Clone fidelity:** FICLONE and FICLONERANGE work on a store that reports ext4's magic (ext4
   says `EOPNOTSUPP`); partial ranges are copied, not shared; `FIDEDUPERANGE` is `EOPNOTSUPP`; a
   whole-file copy_file_range returns more than `MAX_RW_COUNT` in one call.

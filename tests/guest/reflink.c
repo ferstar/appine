@@ -44,8 +44,12 @@ struct file_clone_range {
     uint64_t dest_offset;
 };
 
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+
 #define DIR "/tmp/reflink-test"
-#define SIZE (3 * 4096 + 100)
+#define SIZE (4 * 4096 + 100)
 
 static char data[SIZE];
 
@@ -275,6 +279,35 @@ static void mappings_follow(void)
     ok("mappings_follow");
 }
 
+/* Only a privately dirtied page stops following writes to the cloned file. */
+static void private_mapping(void)
+{
+    source(DIR "/a");
+    int b = empty(DIR "/b");
+    CHECK(clone_into(b, DIR "/a") == 0, "clone before private mmap");
+    close(b);
+    int r = open(DIR "/b", O_RDONLY);
+    CHECK(r >= 0, "open clone read-only");
+    char *p = mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, r, 0);
+    CHECK(p != MAP_FAILED && p[16384] == data[16384], "fault clean clone page");
+    close(r);
+    p[1] = 'P';
+    b = open(DIR "/b", O_WRONLY);
+    CHECK(b >= 0 && pwrite(b, "X", 1, 1) == 1 && pwrite(b, "Y", 1, 16384) == 1,
+          "write both clone pages");
+    CHECK(p[1] == 'P' && p[16384] == 'Y', "private and clean pages after write");
+    CHECK(holds(DIR "/a", data, SIZE), "original after clone write");
+    CHECK(unlink(DIR "/b") == 0, "unlink mapped clone");
+    char *moved = mremap(p, SIZE, SIZE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    CHECK(moved != MAP_FAILED && moved[1] == 'P' && p[1] == 'X',
+          "remap keeps dirty page and refills old address from unlinked file");
+    munmap(moved, SIZE);
+    CHECK(pwrite(b, "Z", 1, 16384) == 1 && p[16384] == 'Z', "refilled mapping follows file");
+    close(b);
+    munmap(p, SIZE);
+    ok("private_mapping");
+}
+
 /* A whole-file copy_file_range shares too, advancing both positions */
 static void copy_whole(void)
 {
@@ -379,6 +412,7 @@ int main(void)
     truncation();
     shared_mapping();
     mappings_follow();
+    private_mapping();
     copy_whole();
     ranges();
     sources();

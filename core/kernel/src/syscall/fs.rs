@@ -3295,6 +3295,9 @@ fn vectored_inner(
         }
         return Ok(0);
     }
+    if write && numeric_sysctl(&file.borrow()) {
+        return write_sysctl_iov(cx, &file, &vecs, offset);
+    }
     if let Some(r) = stream_vectored(cx, &file, &vecs, offset, write, io) {
         return r;
     }
@@ -3388,6 +3391,49 @@ fn stream_vectored(
         }
         _ => return None,
     })
+}
+
+fn numeric_sysctl(f: &OpenFile) -> bool {
+    matches!(&f.kind, FileKind::Proc { node, .. } if pseudo::is_numeric_sysctl(node))
+}
+
+/// proc_sys_write sees one buffer. Validate the full transfer before changing the value;
+/// the numeric handlers parse at most the first page minus its terminating NUL.
+fn write_sysctl_iov(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    vecs: &[(u64, usize)],
+    offset: Option<u64>,
+) -> SysResult {
+    positional(&file.borrow(), offset)?;
+    if !file.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
+    const PREFIX: usize = appine_engine::PAGE_SIZE as usize - 1;
+    let count = vecs
+        .iter()
+        .map(|&(_, len)| len)
+        .sum::<usize>()
+        .min(MAX_COPY);
+    let mut data = vec![0; count.min(PREFIX)];
+    let mut scratch = [0; 4096];
+    let mut copied = 0;
+    for &(mut base, len) in vecs {
+        let mut left = len.min(count - copied);
+        while left > 0 {
+            let dst = if copied < data.len() {
+                &mut data[copied..]
+            } else {
+                &mut scratch[..]
+            };
+            let n = dst.len().min(left);
+            cx.read_user(UserSlice::new(base, n), &mut dst[..n])?;
+            copied += n;
+            base = base.wrapping_add(n as u64);
+            left -= n;
+        }
+    }
+    write_proc(cx, file, &data, count, offset).map(|n| n as u64)
 }
 
 /// Whether host fd `fd` (host stdio) is a regular file on the host.
@@ -4251,6 +4297,9 @@ fn write_file_inner(
     pos_held: bool,
     defer_sync: bool,
 ) -> SysResult {
+    if numeric_sysctl(&file.borrow()) {
+        return write_sysctl_iov(cx, file, &[(buf, len)], offset);
+    }
     // ESPIPE and EBADF are reported before an unreadable buffer
     positional(&file.borrow(), offset)?;
     if !file.borrow().writable() {
@@ -4863,31 +4912,8 @@ fn write_local(
         };
         size.max(pos + data.len() as u64)
     })?;
-    let proc_node = match &file.borrow().kind {
-        FileKind::Proc { node, opener, .. } => Some((node.clone(), opener.clone())),
-        _ => None,
-    };
-    let mut written = data.len();
-    if let Some((node, opener)) = proc_node {
-        let cred = cx.cred();
-        let (ns, pid_ns) = (cx.ns(), cx.pid_ns());
-        let tid = cx.tid();
-        pseudo::write(cx.k(), (tid, &cred, &opener), (&ns, &pid_ns), &node, data)?;
-        written = pseudo::written(&node, data.len());
-        if let FileKind::Proc { fresh, .. } = &mut file.borrow_mut().kind {
-            *fresh = false;
-        }
-        // The cgroup memory limit changed: wake the timer thread to measure once right away
-        if let PseudoNode::Cgroup(_, b"memory.max") = node {
-            cx.k().oom.recheck();
-            crate::kernel::signal_later(&cx.shared.timers);
-        }
-        // A write is IN_MODIFY (fsnotify_modify); of the synthetic files only cgroup2's can be
-        // watched
-        if let PseudoNode::Cgroup(id, name) = node {
-            let key = crate::cgroup::key(id, name);
-            super::kernfs_modified(cx.kr(), key, crate::cgroup::key(id, b""), name);
-        }
+    if matches!(file.borrow().kind, FileKind::Proc { .. }) {
+        return write_proc(cx, file, data, data.len(), offset);
     }
     let (ino, cow) = match file.borrow().kind {
         FileKind::Regular { ino, cow, .. } => (Some(ino), cow),
@@ -4913,7 +4939,7 @@ fn write_local(
         Some(fd) => unlocked_io(cx, file, fd, (offset, held), |fd, pos| {
             appine_hal::pwrite(fd, data, pos)
         })?,
-        None => local_write(&mut file.borrow_mut(), data, offset, append)?.min(written),
+        None => local_write(&mut file.borrow_mut(), data, offset, append)?,
     };
     if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind) {
         tmpfs_resized(&*cx.vfs()?, Some(t), host);
@@ -4922,6 +4948,55 @@ fn write_local(
         inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
     }
     Ok(n)
+}
+
+fn write_proc(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    data: &[u8],
+    count: usize,
+    offset: Option<u64>,
+) -> Result<usize, Errno> {
+    let (node, opener, pos) = {
+        let f = file.borrow();
+        let FileKind::Proc { node, opener, .. } = &f.kind else {
+            return Err(Errno::EBADF);
+        };
+        (node.clone(), opener.clone(), offset.unwrap_or(f.pos))
+    };
+    let (tid, cred, ns, pid_ns) = (cx.tid(), cx.cred(), cx.ns(), cx.pid_ns());
+    let (written, next) = pseudo::write(
+        cx.k(),
+        (tid, &cred, &opener),
+        (&ns, &pid_ns),
+        &node,
+        data,
+        (pos, count),
+    )?;
+    {
+        let mut f = file.borrow_mut();
+        if offset.is_none() {
+            f.pos = next;
+        }
+        if let FileKind::Proc { fresh, .. } = &mut f.kind {
+            *fresh = false;
+        }
+    }
+    // The cgroup memory limit changed: wake the timer thread to measure once right away
+    if let PseudoNode::Cgroup(_, b"memory.max") = node {
+        cx.k().oom.recheck();
+        crate::kernel::signal_later(&cx.shared.timers);
+    }
+    // A write is IN_MODIFY (fsnotify_modify); of the synthetic files only cgroup2's can be
+    // watched
+    if let PseudoNode::Cgroup(id, name) = node {
+        let key = crate::cgroup::key(id, name);
+        super::kernfs_modified(cx.kr(), key, crate::cgroup::key(id, b""), name);
+    }
+    if written > 0 {
+        inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+    }
+    Ok(written)
 }
 
 fn pipe_write(
@@ -5045,8 +5120,6 @@ fn local_write(
             Device::LoopControl | Device::Loop => Err(Errno::EINVAL),
             _ => Ok(data.len()),
         },
-        // Writable procfs files: the content was already handled by pseudo::write
-        FileKind::Proc { .. } => Ok(data.len()),
         // Anonymous inodes without a write operation
         FileKind::Epoll(_)
         | FileKind::Pidfd(_)
@@ -5310,7 +5383,7 @@ fn replace_object(f: &mut OpenFile, object: std::fs::File, held: bool) {
 }
 
 /// A provider can commit its object switch before its notification reaches this kernel.
-/// Check open descriptions against the pinned object before exposing a new shared mapping.
+/// Check open descriptions against the pinned object before exposing a new store mapping.
 pub(super) fn reconcile_mapping(k: &Kernel, ino: Ino, object: &std::fs::File) -> Result<(), Errno> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;

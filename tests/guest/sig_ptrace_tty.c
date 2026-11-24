@@ -38,6 +38,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -892,6 +893,40 @@ static int open_pty_pair(int *master_out, int *slave_out, int slave_flags)
     return 0;
 }
 
+static void test_tty_exclusive(void)
+{
+    pid_t child = fork();
+    CHECK(child >= 0, "fork exclusive tty");
+    if (child == 0) {
+        CHECK(setsid() > 0, "setsid");
+        int m, s, bit;
+        CHECK(open_pty_pair(&m, &s, O_RDWR) == 0, "open controlling tty");
+        char *path = ptsname(m);
+        CHECK(path && chmod(path, 0666) == 0, "allow unprivileged slave open");
+        CHECK(ioctl(m, TIOCEXCL) == 0 && ioctl(s, TIOCGEXCL, &bit) == 0 && bit == 0,
+              "master exclusivity is separate");
+        CHECK(ioctl(s, TIOCEXCL) == 0 && ioctl(s, TIOCGEXCL, &bit) == 0 && bit == 1,
+              "exclusive slave");
+        int admin = open(path, O_RDWR);
+        CHECK(admin >= 0, "privileged reopen");
+        close(admin);
+        CHECK(setuid(1000) == 0, "drop privileges");
+        CHECK_ERR(open(path, O_RDWR), EBUSY, "exclusive slave path");
+        CHECK_ERR(open("/dev/tty", O_RDWR), EBUSY, "exclusive controlling tty");
+        CHECK_ERR(ioctl(m, TIOCGPTPEER, O_RDWR), EBUSY, "exclusive peer");
+        int flags = O_PATH | O_CLOEXEC | O_NONBLOCK;
+        int pathfd = ioctl(m, TIOCGPTPEER, flags);
+        CHECK(pathfd >= 0 && fcntl(pathfd, F_GETFL) == flags &&
+                  fcntl(pathfd, F_GETFD) == FD_CLOEXEC, "path-only peer flags");
+        close(pathfd);
+        CHECK(ioctl(s, TIOCNXCL) == 0 && ioctl(s, TIOCGEXCL, &bit) == 0 && bit == 0,
+              "clear slave exclusivity");
+        CHECK(open(path, O_RDWR) >= 0, "reopen after clearing");
+        _exit(0);
+    }
+    wait_exit(child, 0);
+}
+
 static void test_tty_job_control_ioctls(void)
 {
     /* Test TIOCSCTTY and TIOCSPGRP in a fresh session. */
@@ -1194,6 +1229,7 @@ int main(int argc, char **argv)
     test_ptrace_event_exit_on_exit_group();
     test_ptrace_event_exit_on_nonleader_execve(self);
     test_process_vm_zero_remote();
+    test_tty_exclusive();
     test_tty_job_control_ioctls();
     test_tty_output_clamp();
     test_zombie_leader_cpu_clock();

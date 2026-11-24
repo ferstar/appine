@@ -9,7 +9,7 @@ use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile};
 use crate::kernel::Cx;
-use crate::mm::flags;
+use crate::mm::{FileSource, flags};
 use crate::process::RLIMIT_MEMLOCK;
 use crate::vfs::dev::Device;
 use crate::vfs::ms;
@@ -109,7 +109,7 @@ pub(super) fn mmap(
     let mut gpu_mapping = None;
     let mut fuse_fill = None;
     let mut mapping_object = None;
-    let mut tmpfs = None;
+    let mut file_source = None;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         if low && len != 0 {
             return Err(Errno::EPERM);
@@ -174,20 +174,19 @@ pub(super) fn mmap(
                 let vfs = cx.vfs()?;
                 let ino = *ino;
                 let tmpfs_dev = f.node().and_then(|n| vfs.mapped_tmpfs_dev(&n, ino));
-                if kind == flags::MAP_SHARED && !f.pseudo {
+                if !f.pseudo {
                     drop(f);
-                    loop {
-                        match vfs.store().mapping_object(ino, may_write) {
+                    let writable = kind == flags::MAP_SHARED && may_write;
+                    mapping_object = loop {
+                        match vfs.store().mapping_object(ino, writable) {
                             Err(Errno::EAGAIN) => super::fs::make_private(cx, ino, None)?,
-                            r => {
-                                mapping_object = r?;
-                                break;
-                            }
+                            result => break result?,
                         }
-                    }
+                    };
                     if let Some(object) = &mapping_object {
                         super::fs::reconcile_mapping(cx.kr(), ino, object)?;
                         fd = object.as_raw_fd();
+                        file_source = Some(FileSource::PinnedStore);
                     } else {
                         f = file.borrow();
                         let FileKind::Regular { file: object, .. } = &f.kind else {
@@ -197,7 +196,8 @@ pub(super) fn mmap(
                     }
                 }
                 if let Some(dev) = tmpfs_dev {
-                    tmpfs = Some(crate::vfs::TmpfsMapping::new(vfs, dev, ino, fd)?);
+                    let mapping = crate::vfs::TmpfsMapping::new(vfs, dev, ino, fd)?;
+                    file_source = Some(FileSource::Tmpfs(mapping));
                 }
                 Some((fd, offset, may_write))
             }
@@ -259,23 +259,13 @@ pub(super) fn mmap(
     if flags & MAP_LOCKED != 0 {
         check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
     }
-    let fill = fuse_fill;
     let start = if let Some(mapping) = gpu_mapping {
         cx.mm_mut().mmap_gpu(addr, len, prot, flags, mapping)?
+    } else if let Some(fill) = &fuse_fill {
+        cx.mm_mut()
+            .mmap_fill(addr, len, prot, flags, (fill.clone(), offset))?
     } else {
-        match &fill {
-            Some(fill) => cx
-                .mm_mut()
-                .mmap_fill(addr, len, prot, flags, (fill.clone(), offset))?,
-            None => cx.mm_mut().map(
-                addr,
-                len,
-                prot,
-                flags,
-                file,
-                tmpfs.map(crate::mm::FileFault::Tmpfs),
-            )?,
-        }
+        cx.mm_mut().map(addr, len, prot, flags, file, file_source)?
     };
     drop(mapping_object);
     // MAP_FIXED may have replaced a segment's last attachment
@@ -313,7 +303,7 @@ pub(super) fn mmap(
         cx.mm().populate(start, len);
         // A FUSE file's pages are read now, the BKL released (errors are not reported, as on
         // Linux)
-        if fill.is_some() && prot != 0 {
+        if fuse_fill.is_some() && prot != 0 {
             loop {
                 let Some(w) = cx.mm().first_unread(start, len, 0) else {
                     break;
@@ -367,15 +357,10 @@ fn remap(
         let (new, refill) = cx.mm_mut().mremap_dontunmap(old, old_len, fixed)?;
         // MREMAP_FIXED may have unmapped a destroyed SysV segment's last attachment
         crate::ipc::reap_shm(cx.k());
-        // Map the store file again at the old address of a private file mapping; if it cannot be
-        // opened (for example deleted and reclaimed), empty anonymous memory is all that is left
-        let vfs = cx.vfs()?;
+        // Refill from the moved mapping's retained description, even after unlink.
         for r in refill {
-            let file = (r.ino != 0)
-                .then(|| vfs.store().open_object(r.ino, false).ok())
-                .flatten();
             let mut mm = cx.mm_mut();
-            match &file {
+            match &r.file {
                 Some(f) => {
                     let flags = flags::MAP_PRIVATE | flags::MAP_FIXED;
                     let src = Some((f.as_raw_fd(), r.offset, false));
@@ -385,7 +370,7 @@ fn remap(
                         r.prot,
                         flags,
                         src,
-                        r.tmpfs.clone().map(crate::mm::FileFault::Tmpfs),
+                        r.tmpfs.clone().map(FileSource::Tmpfs),
                     )?;
                     mm.label(r.start, r.len, r.name.clone(), r.ino);
                     if let Some(mnt) = r.mnt {

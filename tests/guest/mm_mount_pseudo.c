@@ -44,6 +44,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -511,6 +512,42 @@ static void test_proc_net_snmp_forwarding(void)
         _exit(0);
     }
     wait_ok(pid, "snmp forwarding");
+}
+
+static void test_sysctl_write_position(void)
+{
+    const char *path = "/proc/sys/net/core/somaxconn";
+    int fd = open(path, O_RDWR);
+    CHECK(fd >= 0, "open somaxconn");
+    char saved[32], value[32];
+    pread_str(fd, saved, sizeof(saved));
+    struct iovec bad[] = {{"10", 2}, {(void *)1, 1}};
+    CHECK_ERR(writev(fd, bad, 2), EFAULT, "reject unreadable second iovec");
+    CHECK(lseek(fd, 0, SEEK_CUR) == 0, "failed write preserves offset");
+    pread_str(fd, value, sizeof(value));
+    CHECK(strcmp(value, saved) == 0, "failed write leaves sysctl value intact");
+    struct iovec parts[] = {{"10", 2}, {"1", 1}};
+    CHECK(writev(fd, parts, 2) == 3, "write fragmented number");
+    CHECK(lseek(fd, 0, SEEK_CUR) == 3, "first sysctl write advances offset");
+    CHECK(write(fd, "invalid", 7) == 7 && lseek(fd, 0, SEEK_CUR) == 10,
+          "nonzero offset consumes input");
+    pread_str(fd, value, sizeof(value));
+    CHECK(strcmp(value, "101\n") == 0, "second write preserved first value");
+    CHECK(pwrite(fd, saved, strlen(saved), 0) == (ssize_t)strlen(saved), "restore somaxconn");
+    CHECK(lseek(fd, 0, SEEK_CUR) == 10, "pwrite preserves open offset");
+    pread_str(fd, value, sizeof(value));
+    CHECK(strcmp(value, saved) == 0, "positioned write at zero took effect");
+    close(fd);
+
+    fd = open("/proc/sys/net/ipv4/tcp_timestamps", O_RDWR);
+    CHECK(fd >= 0, "open unsigned sysctl");
+    pread_str(fd, saved, sizeof(saved));
+    CHECK(write(fd, "0", 1) == 1 && write(fd, "1", 1) == 1, "repeat unsigned writes");
+    pread_str(fd, value, sizeof(value));
+    CHECK(strcmp(value, "1\n") == 0 && lseek(fd, 0, SEEK_CUR) == 0,
+          "unsigned writes at zero keep the offset");
+    CHECK(write(fd, saved, strlen(saved)) == (ssize_t)strlen(saved), "restore tcp_timestamps");
+    close(fd);
 }
 
 /* 7. /proc/sys/net and IPC sysctls pin namespace at open/lookup time */
@@ -1091,6 +1128,7 @@ int main(int argc, char **argv, char **envp)
     test_move_mount_set_group();
     test_proc_pid_net_zombie_leader();
     test_proc_net_snmp_forwarding();
+    test_sysctl_write_position();
     test_sysctl_namespace_pinning();
     test_cgroup_enodev();
     test_aio_procfs_has_iter();

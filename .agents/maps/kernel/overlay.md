@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: copy instantiated sparse data into a tmpfs upper layer)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: account for private store mapping pins during copy-up)
 
 ## Responsibilities
 
@@ -118,7 +118,8 @@ holding its node (`kernel/exec`).
   `syscall::fs::copy_up`, which, as `try_share` does, copies a regular file's data instead
   (`CopyUp::Copied`) when a writable shared mapping or the Files app could write the lower object in
   place. A tmpfs upper also copies a lower inode with tracked tmpfs pages. It carries over
-  instantiated pages within EOF and leaves unused reservations in the lower layer. The store also falls back to copying if either object carries a shared mapping pin,
+  instantiated pages within EOF and leaves unused reservations in the lower layer. The store also falls
+  back to copying if either object carries a store mapping pin,
   including a read-only mapping in another kernel. After sharing it rehomes the lower file's descriptions open for writing (`cow`); a rename
   copies up the files it moves that way first. A non-directory then forgets its lower inodes; a
   copied-up directory keeps them and stays merged (one link, rename `EXDEV`). A file opened with

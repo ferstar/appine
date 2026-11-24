@@ -4537,22 +4537,177 @@ fn host_cpu(n: u32) -> Option<usize> {
 
 // ---- Writing ----
 
+#[derive(Clone, Copy)]
+enum NumericWrite {
+    Advance,
+    // Linux 6.1's proc_douintvec and proc_dou8vec leave a successful initial write at zero.
+    Unsigned,
+    // addrconf returns one byte for a forwarding or linkdown fixup and restores the position.
+    Ipv6Fixup,
+}
+
+/// Position rule of a numeric sysctl. Text, bitmaps and ordinary proc files have other handlers.
+fn numeric_write(node: &PseudoNode) -> Option<NumericWrite> {
+    use NumericWrite::*;
+    let rule = match node {
+        PseudoNode::Static(
+            b"sys/kernel/hostname"
+            | b"sys/kernel/domainname"
+            | b"sys/kernel/modprobe"
+            | b"sys/kernel/core_pattern"
+            | b"sys/kernel/printk_devkmsg"
+            | b"sys/kernel/seccomp/actions_logged",
+        ) => return None,
+        PseudoNode::Static(b"sys/fs/pipe-max-size") => Unsigned,
+        PseudoNode::Static(p) if p.starts_with(b"sys/") && writable(node) => Advance,
+        PseudoNode::IpcSysctl(..) | PseudoNode::NetStatic(..) => Advance,
+        PseudoNode::NetConf(true, _, b"stable_secret", _) => return None,
+        PseudoNode::NetConf(true, dir, b"forwarding" | b"ignore_routes_with_linkdown", _)
+            if *dir != crate::netdev::ConfDir::Default =>
+        {
+            Ipv6Fixup
+        }
+        PseudoNode::NetConf(
+            true,
+            _,
+            b"addr_gen_mode"
+            | b"ra_defrtr_metric"
+            | b"ioam6_enabled"
+            | b"ioam6_id"
+            | b"ioam6_id_wide"
+            | b"ndisc_evict_nocarrier",
+            _,
+        ) => Unsigned,
+        PseudoNode::NetConf(..) => Advance,
+        PseudoNode::NetSysctl(path, _) => match path.split_once('/')? {
+            ("ipv4", "tcp_congestion_control" | "ip_local_reserved_ports" | "tcp_fastopen_key") => {
+                return None;
+            }
+            (
+                "ipv4",
+                "icmp_ratelimit"
+                | "icmp_ratemask"
+                | "igmp_max_memberships"
+                | "igmp_max_msf"
+                | "igmp_qrv"
+                | "ipfrag_high_thresh"
+                | "ipfrag_low_thresh"
+                | "ipfrag_max_dist"
+                | "ipfrag_time"
+                | "tcp_adv_win_scale"
+                | "tcp_base_mss"
+                | "tcp_challenge_ack_limit"
+                | "tcp_comp_sack_delay_ns"
+                | "tcp_comp_sack_slack_ns"
+                | "tcp_fastopen"
+                | "tcp_fastopen_blackhole_timeout_sec"
+                | "tcp_fin_timeout"
+                | "tcp_invalid_ratelimit"
+                | "tcp_keepalive_intvl"
+                | "tcp_keepalive_time"
+                | "tcp_limit_output_bytes"
+                | "tcp_max_reordering"
+                | "tcp_max_syn_backlog"
+                | "tcp_max_tw_buckets"
+                | "tcp_min_rtt_wlen"
+                | "tcp_min_snd_mss"
+                | "tcp_mtu_probe_floor"
+                | "tcp_pacing_ca_ratio"
+                | "tcp_pacing_ss_ratio"
+                | "tcp_probe_threshold"
+                | "tcp_reordering"
+                | "tcp_rmem"
+                | "tcp_wmem"
+                | "udp_rmem_min"
+                | "udp_wmem_min"
+                | "xfrm4_gc_thresh",
+            ) => Advance,
+            ("ipv4", _) => Unsigned,
+            (
+                "ipv6",
+                "anycast_src_echo_reply"
+                | "auto_flowlabels"
+                | "bindv6only"
+                | "fib_multipath_hash_fields"
+                | "fib_multipath_hash_policy"
+                | "fib_notify_on_flag_change"
+                | "flowlabel_consistency"
+                | "flowlabel_state_ranges"
+                | "fwmark_reflect"
+                | "ioam6_id"
+                | "ip_nonlocal_bind",
+            ) => Unsigned,
+            ("core", "txrehash" | "xfrm_aevent_etime" | "xfrm_aevent_rseqth") => Unsigned,
+            _ => Advance,
+        },
+        _ => return None,
+    };
+    Some(rule)
+}
+
+pub(crate) fn is_numeric_sysctl(node: &PseudoNode) -> bool {
+    numeric_write(node).is_some()
+}
+
 /// Writes a synthetic file: cgroup files go to [`crate::cgroup::write`], the id maps,
 /// `setgroups` and `timens_offsets` to their own writers, and the other writable files check the
 /// value and record it (namespaced sysctls in the writer's namespaces); some recorded values have
 /// no effect, and `kernel/pid_max` accepts writes and ignores them. `cred`, `ns` and `pid_ns` are
-/// the writer's, `opener` the credentials the file was opened with.
+/// the writer's, `opener` the credentials the file was opened with. Returns the bytes consumed
+/// and the resulting position.
 pub(crate) fn write(
     k: &mut Kernel,
     (tid, cred, opener): (Tid, &Cred, &Cred),
     (ns, pid_ns): (&crate::nsproxy::NsProxy, &PidNs),
     node: &PseudoNode,
     data: &[u8],
-) -> Result<(), Errno> {
+    (pos, count): (u64, usize),
+) -> Result<(usize, u64), Errno> {
     // Opened for writing by root although not writable ([`unwritable_error`])
     if !writable(node) && !matches!(node, PseudoNode::Cgroup(..)) {
         return Err(unwritable_error(node).unwrap_or(Errno::EINVAL));
     }
+    let required = match node {
+        PseudoNode::Static(b"sys/vm/mmap_min_addr") => Some(cap::SYS_RAWIO),
+        PseudoNode::Static(
+            b"sys/kernel/dmesg_restrict"
+            | b"sys/kernel/kptr_restrict"
+            | b"sys/kernel/tainted"
+            | b"sys/kernel/unprivileged_bpf_disabled",
+        ) => Some(cap::SYS_ADMIN),
+        _ => None,
+    };
+    if required.is_some_and(|cap| !cred.capable(cap)) {
+        return Err(Errno::EPERM);
+    }
+    let numeric = numeric_write(node);
+    if numeric.is_none() || (pos == 0 && !data.is_empty()) {
+        write_value(k, (tid, cred, opener), (ns, pid_ns), node, data)?;
+    }
+    // Per-process numbers consume at most the 12 bytes parsed by proc_number.
+    let result = match numeric {
+        Some(NumericWrite::Ipv6Fixup) => (count.min(1), pos),
+        Some(NumericWrite::Unsigned) if pos == 0 => (count, pos),
+        Some(_) => (count, pos + count as u64),
+        None if matches!(
+            node,
+            PseudoNode::Entry(_, _, Entry::OomScoreAdj | Entry::CoredumpFilter)
+        ) =>
+        {
+            (count.min(12), pos)
+        }
+        None => (count, pos),
+    };
+    Ok(result)
+}
+
+fn write_value(
+    k: &mut Kernel,
+    (tid, cred, opener): (Tid, &Cred, &Cred),
+    (ns, pid_ns): (&crate::nsproxy::NsProxy, &PidNs),
+    node: &PseudoNode,
+    data: &[u8],
+) -> Result<(), Errno> {
     match node {
         PseudoNode::Cgroup(id, name) => {
             let writer = crate::cgroup::Writer {
@@ -4652,9 +4807,6 @@ pub(crate) fn write(
     }
     // mmap_min_addr_handler: writing needs CAP_SYS_RAWIO
     if let PseudoNode::Static(b"sys/vm/mmap_min_addr") = node {
-        if !cred.capable(cap::SYS_RAWIO) {
-            return Err(Errno::EPERM);
-        }
         let n: u64 = std::str::from_utf8(data)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -4802,9 +4954,6 @@ pub(crate) fn write(
     // proc_dointvec_minmax_sysadmin: writing needs CAP_SYS_ADMIN in the boot-time namespace, and
     // only 0 or 1
     if let PseudoNode::Static(b"sys/kernel/dmesg_restrict") = node {
-        if !cred.capable(cap::SYS_ADMIN) {
-            return Err(Errno::EPERM);
-        }
         k.dmesg_restrict = std::str::from_utf8(data)
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
@@ -4834,9 +4983,6 @@ pub(crate) fn write(
         // proc_taint: needs CAP_SYS_ADMIN, and the flags written (of the 19 defined) are added
         // to those already set, never cleared
         PseudoNode::Static(b"sys/kernel/tainted") => {
-            if !cred.capable(cap::SYS_ADMIN) {
-                return Err(Errno::EPERM);
-            }
             let v: u64 = std::str::from_utf8(data)
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
@@ -4853,9 +4999,6 @@ pub(crate) fn write(
         }
         PseudoNode::Static(p) if recorded(p).is_some() => {
             let (path, _, _, lo, hi) = *recorded(p).unwrap();
-            if path == b"sys/kernel/kptr_restrict" && !cred.capable(cap::SYS_ADMIN) {
-                return Err(Errno::EPERM);
-            }
             let v = int_in(lo..=hi)?;
             k.sysctls.insert(path, v);
         }
@@ -4865,9 +5008,6 @@ pub(crate) fn write(
         // bpf_unpriv_handler: needs CAP_SYS_ADMIN, 0 to 2, and once set to 1 it cannot be changed
         // back (EPERM)
         PseudoNode::Static(b"sys/kernel/unprivileged_bpf_disabled") => {
-            if !cred.capable(cap::SYS_ADMIN) {
-                return Err(Errno::EPERM);
-            }
             let v = int_in(0..=2)? as u8;
             if k.unprivileged_bpf_disabled == 1 && v != 1 {
                 return Err(Errno::EPERM);
@@ -5126,16 +5266,6 @@ fn kstrto(s: &str, signed: bool) -> Result<i64, Errno> {
         (true, false) if v <= i32::MAX as u64 => Ok(v as i64),
         (false, _) if v <= u32::MAX as u64 => Ok(v as i64),
         _ => Err(Errno::ERANGE),
-    }
-}
-
-/// The number of bytes a write to `node` consumes: `/proc/<pid>` files taking numbers accept only
-/// the 12 bytes [`proc_number`] looks at (Linux truncates count and returns it), everything else
-/// accepts all.
-pub(crate) fn written(node: &PseudoNode, len: usize) -> usize {
-    match node {
-        PseudoNode::Entry(_, _, Entry::OomScoreAdj | Entry::CoredumpFilter) => len.min(12),
-        _ => len,
     }
 }
 

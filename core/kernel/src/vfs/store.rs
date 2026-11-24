@@ -2218,7 +2218,7 @@ impl Store {
         self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
     }
 
-    /// Acquire a shared mapping's backing and pin it against object sharing. The mmap code
+    /// Acquire a store mapping's backing and pin it against object sharing. The mmap code
     /// duplicates this open description, keeping the host flock through VMA splits and fork.
     /// Serialize the pin with share across store connections. EAGAIN asks the caller to split
     /// a held object first. An anonymous or deleted plain file can use its existing descriptor.
@@ -2348,7 +2348,7 @@ impl Store {
             if sst.nlink == 0 {
                 return Err(Errno::ENOENT);
             }
-            // A shared VMA in any kernel pins its backing. Both probes and mapping_object
+            // A store mapping in any kernel pins its backing. Both probes and mapping_object
             // are serialized by the store write transaction. A pinned side requires a copy.
             for object in [sdata.object, ddata.object] {
                 let file = match s.open_number(object, libc::O_RDONLY) {

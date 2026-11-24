@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: retaining opened device-node lock keys on PTY ends)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: enforce per-end exclusivity on slave reopens and support path-only peer opens)
 
 ## Responsibilities
 
@@ -31,7 +31,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 ## Key types
 
 - `Tty` — one PTY pair (shared by both sides): devpts device and index; `masters`/`slaves`
-  counts, `slave_closed`, `locked`, `hung_up`, per-side `vhangups` generations and `hupped`;
+  counts, `slave_closed`, `locked`, `hung_up`, per-side `exclusive` bits, `vhangups` generations and `hupped`;
   termios (the slave's, the only one), winsize; buffers `unprocessed` (master writes not taken by
   the line discipline yet: Linux's flip buffer, 64 KiB), `editing` (canonical line being edited),
   `lines` (finished lines, each `Line` with data, whether VEOF ended it and whether that VEOF is the
@@ -84,13 +84,15 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - Master-only ioctls: `TIOCSPTLCK`/`TIOCGPTLCK`, `TIOCGPTN`, `TIOCPKT`/`TIOCGPKT`, `TIOCSIG`
   (INT, QUIT, TSTP; others `EINVAL`), `TIOCGPTPEER` (opens the slave through the master's mount,
   with the caller's flags and so with controlling-terminal acquisition, keeping access mode,
-  `O_APPEND`, `O_NONBLOCK`, honouring `O_CLOEXEC`; on a slave or hung master `EIO`).
-- Slave open: no live entry `ENOENT`; locked or no master `EIO`; without `O_NOCTTY` a session
+  `O_APPEND`, `O_NONBLOCK`, honouring `O_CLOEXEC`. With `O_PATH` it returns a path descriptor. On a
+  slave or hung master `EIO`).
+- Slave open: no live entry `ENOENT`; exclusive slave without initial-namespace `CAP_SYS_ADMIN` gives
+  `EBUSY`; locked or no master gives `EIO`; without `O_NOCTTY` a session
   leader without a controlling terminal acquires an unowned terminal when the open has read
   access (Job control below).
 - `/dev/tty` and `/dev/console` both open the caller's controlling terminal as a slave end through
-  the boot devpts mount (`ENXIO` without one), with no lock or master checks, and never acquire
-  one.
+  the boot devpts mount (`ENXIO` without one), with the same exclusivity check. They skip the lock and
+  master checks and never acquire one.
 
 ### Input (master writes, host console feed)
 
@@ -254,9 +256,10 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   background check runs on the slave only), `TIOCGWINSZ`/`TIOCSWINSZ`, `TCFLSH`, `TCXONC` (slave:
   TCOOFF/TCOON; master: stops input; 2/3 send VSTOP/VSTART, on the master from the slave's
   termios into the input without a room check), `TCSBRK`/`TCSBRKP` (no-ops after the background
-  check), `TIOCEXCL`/`TIOCNXCL` (no-ops), `TIOCSETD` (argument never read) / `TIOCGETD` (always 0),
+  check), `TIOCEXCL`/`TIOCNXCL`/`TIOCGEXCL` (set, clear and query the opened end's exclusive bit),
+  `TIOCSETD` (argument never read) / `TIOCGETD` (always 0),
   `FIONREAD`, `TIOCOUTQ`, `TIOCSTI`; other requests are counted as unimplemented paths
-  (`kernel/signal`) and return `ENOTTY` (`TIOCSBRK`, `TIOCCBRK`, `TIOCGEXCL` and `TIOCGDEV` among
+  (`kernel/signal`) and return `ENOTTY` (`TIOCSBRK`, `TIOCCBRK` and `TIOCGDEV` among
   them).
 - `TCFLSH` follows `pty_flush_buffer`: on the slave, TCIFLUSH discards the input (taken or not)
   and TCOFLUSH only output beyond the 4095 bytes the master side has taken, both reported in packet
@@ -360,7 +363,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   `/dev/console`); programs that recognise the controlling-terminal device by its number see a
   different device than on Linux.
 - **Fidelity gaps:** `IMAXBEL`, break handling, `HUPCL` and `VDISCARD` are not implemented;
-  `TIOCEXCL` is a no-op; `TIOCGETD` is always 0; `TIOCGEXCL` and `TIOCGDEV` are `ENOTTY`;
+  `TIOCGETD` is always 0 and `TIOCGDEV` is `ENOTTY`;
   `FIONREAD` and `TIOCOUTQ` on the master count the whole output queue; flow-control characters
   are not looked ahead in input waiting for room. The line-discipline rules themselves match all
   83 recorded scenarios of the `line-discipline` differential case.

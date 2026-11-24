@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pin stable mapping and provider descriptors, serialize object selection and clip live mappings before host truncation)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: extend mapping pins to private mmap)
 
 ## Responsibilities
 
@@ -131,7 +131,7 @@ provider and rootfs installation UI (`android`).
 - `open_object` for writing, `open_object_append` and `truncate` call `make_private` first, so host
   callers (the browse API, `write_file`) never write a shared object. When a Files app open
   unshares the file, its change replay (also on failure after publication) refreshes the file's open
-  descriptions to its current object. Shared VMAs hold a flock on their backing descriptor.
+  descriptions to its current object. Private and shared store mmaps hold a flock on their backing descriptor.
   `mapping_object` acquires it under the store write transaction, and `try_share` probes both
   objects in that transaction, falling back to a byte copy when a pin exists. Provider write
   opens also pin their descriptor. Provider truncation clips live guest mappings before shrink.

@@ -539,6 +539,8 @@ pub struct Tty {
     /// master reads are EIO and poll includes POLLHUP; cleared when a slave is opened again. A
     /// slave never opened does not count, and master reads block as usual.
     pub slave_closed: bool,
+    /// TIOCEXCL on the slave and master respectively.
+    pub exclusive: [bool; 2],
     /// Whether the slave is still locked (unlockpt).
     pub locked: bool,
     /// All masters are closed and it has been hung up (`syscall::tty::hang_up`): open slaves
@@ -607,6 +609,7 @@ impl Tty {
             masters: 0,
             slaves: 0,
             slave_closed: false,
+            exclusive: [false; 2],
             locked: true,
             hung_up: false,
             vhangups: [0; 2],
