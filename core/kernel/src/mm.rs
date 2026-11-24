@@ -469,12 +469,13 @@ struct Vma {
     ino: u64,
     /// The mount the mapped file was opened through (None for anonymous, memfd, vvar, SysV shm).
     mnt: Option<MountPin>,
-    /// The host address of this VMA's start.
+    /// The host address corresponding to this VMA's start. For shared anonymous memory
+    /// remapped past its original extent this can be past the host region.
     host: NonNull<u8>,
-    /// Bytes from the start that have file contents (rounded up to 4K); equal to `len` for
-    /// anonymous mappings. The host raises SIGBUS as soon as the part of a file mapping past the
-    /// end of the file is touched: that part is kept out of the page table, guest accesses get
-    /// SIGBUS ([`Mm::fault_past_eof`]), and fork does not read it when copying.
+    /// Bytes with contents, rounded up to 4K. Private anonymous mappings have `len` bytes,
+    /// while remapped shared memory ends at the original backing extent. Pages past that end
+    /// or a mapped file's EOF get no entries, so guest accesses raise SIGBUS
+    /// ([`Mm::fault_past_eof`]) and fork does not read them.
     file_len: u64,
     /// After fork a read-only private file mapping shares its host mapping with other address
     /// spaces; before it becomes writable it copies its own first ([`Mm::mprotect`]).
@@ -537,6 +538,17 @@ impl Vma {
         self.file_id.map_or(0, |f| f.2)
     }
 
+    /// Bytes of the host region available from this start, even after a VMA split or shrink.
+    fn host_available(&self) -> u64 {
+        let end = self.region.base.as_ptr() as usize + self.region.len;
+        end.saturating_sub(self.host.as_ptr() as usize) as u64
+    }
+
+    /// Part of this VMA backed by a host mapping, including mapped file pages past EOF.
+    fn host_len(&self) -> u64 {
+        self.len.min(self.host_available())
+    }
+
     /// Bytes from its start that the host memory may be read at: `file_len`, or for a mapping read
     /// on demand ([`Fill`]) as far as the file reached when mapped.
     fn contents_len(&self) -> u64 {
@@ -571,10 +583,16 @@ impl Vma {
 /// keeps its own host memory and VMAs are only ever split (the kernel/mm map's D7), so the pieces
 /// of one Linux VMA are joined wherever Linux's VMA boundaries show: `/proc/<pid>/maps`
 /// ([`Mm::regions`]), mremap's rule that the old range lies in one VMA, and mprotect with
-/// `PROT_GROWSDOWN`. Shared anonymous mappings are each their own shmem file and never merge.
+/// `PROT_GROWSDOWN`. Pieces of one shared anonymous mapping have contiguous offsets in the
+/// same host region.
 fn same_vma(a: &Vma, b: &Vma) -> bool {
     let contents = match (a.file_id, b.file_id) {
-        (None, None) => a.backing != Backing::Shared,
+        (None, None) if a.backing == Backing::Shared => {
+            Arc::ptr_eq(&a.region, &b.region)
+                && a.shm == b.shm
+                && a.host.as_ptr().wrapping_add(a.len as usize) == b.host.as_ptr()
+        }
+        (None, None) => true,
         (Some((_, _, offset)), Some((_, _, next))) => a.ino == b.ino && offset + a.len == next,
         _ => false,
     };
@@ -2228,10 +2246,9 @@ impl Mm {
 
     /// Implements mremap(2): `fixed` is the `MREMAP_FIXED` target address. When growing it first
     /// tries to extend in place, and otherwise moves to a new address (`may_move`): moving copies
-    /// no data, it only maps the same host memory at the new address. The added part is anonymous
-    /// memory, while a shared file mapping goes on to map the rest of the file; so does a private
-    /// file mapping (mapped privately, `file` being the file the caller opened from
-    /// [`Mm::private_file_ino`]), which cannot grow without `file`.
+    /// no data, it only maps the same host memory at the new address. Shared anonymous mappings
+    /// retain their original backing extent. File mappings continue at the next file offset;
+    /// private file mappings need the fd the caller opened from [`Mm::private_file_ino`].
     pub fn mremap(
         &mut self,
         old: u64,
@@ -2258,14 +2275,6 @@ impl Mm {
             return Err(Errno::EFAULT);
         }
         let grow = new_len.saturating_sub(old_len);
-        // The extension follows the old range, at its offset in the VMA holding the last page
-        let extension = |mm: &Mm| -> Result<Option<Vma>, Errno> {
-            if grow == 0 {
-                return Ok(None);
-            }
-            let (&s, v) = mm.vmas.range(..old_end).next_back().unwrap();
-            mm.extension(v, old_end - s, grow, file).map(Some)
-        };
         if let Some(dst) = fixed {
             Self::check_target(old, old_len, dst, new_len)?;
             // mremap_to's margin: unmapping the target and the shrunk tail may each split a VMA
@@ -2278,10 +2287,16 @@ impl Mm {
             if !self.in_one_vma(old, old + kept) {
                 return Err(Errno::EFAULT);
             }
-            let ext = extension(self)?;
+            let ext = if grow > 0 {
+                let (&start, tail) = self.vmas.range(..old_end).next_back().unwrap();
+                let offset = old_end - start;
+                Some(Self::extension(tail, offset, grow, file, Some(dst))?)
+            } else {
+                None
+            };
             self.move_range(old, kept, dst)?;
-            if let Some(e) = ext {
-                self.insert_vma(dst + old_len, e)?;
+            if let Some(ext) = ext {
+                self.insert_vma(dst + old_len, ext)?;
             }
             return Ok(dst);
         }
@@ -2295,32 +2310,24 @@ impl Mm {
             return Err(Errno::EFAULT);
         }
         // [vvar] cannot grow, in place or moved (Linux's VM_DONTEXPAND, before looking for room)
-        if self
-            .vmas
-            .range(..old_end)
-            .next_back()
-            .is_some_and(|(_, v)| v.foreign())
-        {
+        let (&start, tail) = self.vmas.range(..old_end).next_back().unwrap();
+        if tail.foreign() {
             return Err(Errno::EFAULT);
         }
-        let vma_end = self
-            .vmas
-            .range(..old_end)
-            .next_back()
-            .map_or(0, |(&s, v)| s + v.len);
-        if old_end == vma_end && old_end + grow <= self.mmap_top && self.is_free(old_end, grow) {
-            let e = extension(self)?.unwrap();
-            self.insert_vma(old_end, e)?;
+        let offset = old_end - start;
+        if offset == tail.len && old_end + grow <= self.mmap_top && self.is_free(old_end, grow) {
+            let ext = Self::extension(tail, offset, grow, file, None)?;
+            self.insert_vma(old_end, ext)?;
             return Ok(old);
         }
         if !may_move {
             return Err(Errno::ENOMEM);
         }
         let dst = self.find_free(new_len).ok_or(Errno::ENOMEM)?;
-        let e = extension(self)?.unwrap();
+        let ext = Self::extension(tail, offset, grow, file, Some(dst))?;
         self.move_room(0)?;
         self.move_range(old, old_len, dst)?;
-        self.insert_vma(dst + old_len, e)?;
+        self.insert_vma(dst + old_len, ext)?;
         Ok(dst)
     }
 
@@ -2383,38 +2390,20 @@ impl Mm {
             None if may_move => self.find_free(new_len).ok_or(Errno::ENOMEM)?,
             None => return Err(Errno::ENOMEM),
         };
-        let offset = old - s;
-        let copy = if v.file.is_some() {
-            self.extension(&v, offset, new_len, None)?
-        } else {
-            // Shared anonymous memory or a System V segment: the same host memory, which may go on
-            // past this VMA when the mapping was split. Past the end of that memory the copy has
-            // none, so accesses there get SIGBUS, as past the end of a shmem object
-            let host = v.host.as_ptr().wrapping_add(offset as usize);
-            let end = v.region.base.as_ptr() as usize + v.region.len;
-            let avail = end.saturating_sub(host as usize) as u64;
-            let mut c = v.clone();
-            c.len = new_len;
-            c.host = NonNull::new(host).ok_or(Errno::EFAULT)?;
-            c.file_len = avail.min(new_len);
-            c.growsdown = false;
-            // A segment counts one more attachment, as Linux's vm_ops open does for the copy
-            c.shm = v.shm.map(|(id, _)| (id, dst));
-            c
-        };
+        let copy = Self::extension(&v, old - s, new_len, None, Some(dst))?;
         self.insert_vma(dst, copy)?;
         Ok(dst)
     }
 
-    /// The `len` bytes mremap grows by: following offset `offset` in `template`, with the same kind
-    /// and permissions. Private file mappings need `file` (the host fd of the mapped file).
-    /// `[vvar]` cannot grow (`EFAULT`, Linux's `VM_DONTEXPAND`).
+    /// Builds a grown or duplicated piece at the given offset in the original backing.
+    /// Private file mappings need the host fd. A moved or duplicated SysV mapping takes
+    /// its destination as the attachment base. In-place growth keeps the existing base.
     fn extension(
-        &self,
         template: &Vma,
         offset: u64,
         len: u64,
         file: Option<i32>,
+        destination: Option<u64>,
     ) -> Result<Vma, Errno> {
         if template.foreign() || template.region.gpu.is_some() {
             return Err(Errno::EFAULT);
@@ -2440,6 +2429,19 @@ impl Mm {
                 let file_len = file_extent(raw, file_offset, len);
                 (region, m.ptr, Some((fd.clone(), file_offset)), file_len)
             }
+            // Shared anonymous memory (including SysV segments) keeps its original extent.
+            // The host pointer records the offset even in a tail with no accessible pages.
+            (Backing::Shared, None) => {
+                let start = template
+                    .host
+                    .addr()
+                    .checked_add(offset as usize)
+                    .ok_or(Errno::ENOMEM)?;
+                start.checked_add(len as usize).ok_or(Errno::ENOMEM)?;
+                let host = template.host.with_addr(start);
+                let available = template.host_available().saturating_sub(offset);
+                (template.region.clone(), host, None, len.min(available))
+            }
             // Private file mapping: go on to map the rest of the file privately (the part past the
             // end of the file stays out of the page table, and accesses get SIGBUS, as on Linux)
             (Backing::PrivateFile, _) => {
@@ -2463,31 +2465,19 @@ impl Mm {
         };
         Ok(Vma {
             len,
-            prot: template.prot,
-            backing: template.backing,
-            may_write: template.may_write,
-            may_exec: template.may_exec,
             region,
-            name: template.name.clone(),
-            ino: template.ino,
-            mnt: template.mnt.clone(),
             host,
             file_len,
             cow: false,
             file_id: template.file_id.map(|(d, i, o)| (d, i, o + offset)),
             content: None,
             file,
-            shm: None,
-            locked: template.locked,
+            shm: template
+                .shm
+                .map(|(id, base)| (id, destination.unwrap_or(base))),
             written: Cell::new(template.prot & prot::WRITE != 0),
             growsdown: false,
-            // The grown part belongs to the same mapping, as on Linux
-            dontdump: template.dontdump,
-            wipeonfork: template.wipeonfork,
-            dontfork: template.dontfork,
-            noreserve: template.noreserve,
-            anon: template.anon,
-            fill: template.fill.clone(),
+            ..template.clone()
         })
     }
 
@@ -3609,14 +3599,16 @@ impl Mm {
         while cursor < end {
             let (&s, v) = self.vmas.range(..=cursor).next_back().unwrap();
             let stop = end.min(s + v.len);
-            if v.reserved() {
-                out.resize(out.len() + ((stop - cursor) / PAGE_SIZE) as usize, false);
-                cursor = stop;
-                continue;
+            let backed_end = stop.min(s + v.host_len());
+            if cursor < backed_end {
+                // SAFETY: [cursor, backed_end) lies inside the host region.
+                let host = unsafe { v.host.as_ptr().add((cursor - s) as usize) };
+                out.extend(appine_hal::page_residency(
+                    host,
+                    (backed_end - cursor) as usize,
+                ));
             }
-            // SAFETY: [cursor, stop) is inside this VMA, which holds the host memory
-            let host = unsafe { v.host.as_ptr().add((cursor - s) as usize) };
-            out.extend(appine_hal::page_residency(host, (stop - cursor) as usize));
+            out.resize(((stop - addr) / PAGE_SIZE) as usize, false);
             cursor = stop;
         }
         // Borrowed pages are in the owner's host memory
@@ -4192,7 +4184,7 @@ impl Mm {
             .map_or(addr, |(&s, _)| s);
         let mut total = 0;
         for (&s, v) in self.vmas.range(first..end) {
-            let (from, to) = (addr.max(s), end.min(s + v.len));
+            let (from, to) = (addr.max(s), end.min(s + v.host_len()));
             if from >= to
                 || v.reserved()
                 || v.foreign()
@@ -4298,7 +4290,7 @@ impl Mm {
             .map_or(addr, |(&s, _)| s);
         for (&s, v) in self.vmas.range(first..end) {
             let from = addr.max(s);
-            let to = end.min(s + v.len);
+            let to = end.min(s + v.host_len());
             if from >= to || v.reserved() {
                 continue;
             }
@@ -4384,8 +4376,9 @@ impl Mm {
             appine_hal::resident_pages(host as *const u8, len as usize) as u64
         };
         for (&s, v) in &self.vmas {
+            let host_len = v.host_len();
             let pages = match (v.backing, v.file_id) {
-                _ if v.foreign() => continue,
+                _ if v.foreign() || host_len == 0 => continue,
                 (Backing::Anonymous, _) if !v.written.get() => continue,
                 (Backing::Anonymous, _) if v.len > EAGER_MAX => self
                     .touched_windows(s)
@@ -4399,7 +4392,7 @@ impl Mm {
                         appine_hal::resident_pages(v.host.as_ptr(), v.len as usize) as u64
                     })
                 }
-                _ => mincore(v.host.as_ptr() as usize, v.len),
+                _ => mincore(v.host.as_ptr() as usize, host_len),
             };
             match v.backing {
                 Backing::Anonymous => anon += pages,
@@ -4447,7 +4440,8 @@ impl Mm {
         drop(cow);
         let now = std::time::Instant::now();
         for (&s, v) in &self.vmas {
-            if v.foreign() {
+            let host_len = v.host_len();
+            if v.foreign() || host_len == 0 {
                 continue;
             }
             let page_cache = match v.backing {
@@ -4466,7 +4460,7 @@ impl Mm {
                 }
                 continue;
             }
-            let span = (v.host.as_ptr() as usize, v.len as usize);
+            let span = (v.host.as_ptr() as usize, host_len as usize);
             match v.file_id {
                 Some((dev, ino, offset)) if page_cache => {
                     let piece = (dev, ino, offset, v.len);
@@ -4889,14 +4883,8 @@ impl Mm {
         if let Some(f) = &mut tail.file {
             f.1 += head_len;
         }
-        // A reservation has no host memory and its address is only computed
-        // (HostRegion::reserved), so do integer arithmetic
-        tail.host = if tail.reserved() {
-            NonNull::new(tail.host.as_ptr().wrapping_add(head_len as usize)).unwrap()
-        } else {
-            // SAFETY: addr is inside the VMA, so the offset stays within the host mapping
-            unsafe { tail.host.add(head_len as usize) }
-        };
+        // Reservations and shared anonymous tails can have offsets beyond the host region.
+        tail.host = NonNull::new(tail.host.as_ptr().wrapping_add(head_len as usize)).unwrap();
         let head = self.vmas.get_mut(&s).unwrap();
         head.len = head_len;
         head.file_len = head.file_len.min(head_len);
@@ -7092,11 +7080,14 @@ mod tests {
         let a = mm.attach_shm(None, &mem, RW, false, (1, 7)).unwrap();
         let dst = a - 4 * PAGE_SIZE;
         let moved = mm
-            .mremap(a, PAGE_SIZE, PAGE_SIZE, true, Some(dst), None)
+            .mremap(a, PAGE_SIZE, 2 * PAGE_SIZE, true, Some(dst), None)
             .unwrap();
         assert_eq!(moved, dst);
+        assert_eq!(mm.fault_past_eof(dst + PAGE_SIZE, prot::READ), Some(true));
+        assert_eq!(mm.shm_attachments((1, 7)), 1);
         assert_eq!(mm.detach_shm(a), Err(Errno::EINVAL));
         assert_eq!(mm.detach_shm(dst), Ok((1, 7)));
+        assert!(!mm.is_mapped(dst + PAGE_SIZE));
 
         let vdso_len = (crate::vdso::image().len() as u64).next_multiple_of(PAGE_SIZE);
         let v0 = mm
@@ -7906,6 +7897,39 @@ mod tests {
             )
             .unwrap();
         assert!(kept(&mm, b) && !mm.is_mapped(a + PAGE_SIZE));
+    }
+
+    #[test]
+    fn mremap_shared_anonymous_regrowth_keeps_aliases_and_the_original_extent() {
+        let mut mm = Mm::new();
+        let p = PAGE_SIZE;
+        let fixed = flags::MAP_SHARED | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let a = mm.mmap(0x100000, 3 * p, RW, fixed, None).unwrap();
+        // Keep an alias of the last page while shrinking and regrowing the original in place.
+        let alias = mm.mremap(a + 2 * p, 0, p, true, None, None).unwrap();
+        mm.mremap(a, 3 * p, p, false, None, None).unwrap();
+        mm.write_kernel(alias, b"x").unwrap();
+        for n in 1..5 {
+            assert_eq!(mm.mremap(a, n * p, (n + 1) * p, false, None, None), Ok(a));
+        }
+        let mut byte = [0];
+        mm.read(UserSlice::new(a + 2 * p, 1), &mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+        assert_eq!(mm.futex_key(a + 2 * p, false), mm.futex_key(alias, false));
+        assert_eq!(mm.fault_past_eof(a + 3 * p, prot::READ), Some(true));
+        assert_eq!(
+            mm.residency(a + 2 * p, 3 * p).unwrap(),
+            [true, false, false]
+        );
+        assert_eq!(mm.pagemap(a + 3 * p, 2), [0, 0]);
+        assert_eq!(mm.resident_in(a + 3 * p, 2 * p), 0);
+
+        // An independent shared mapping at the next address still starts a different Linux VMA.
+        mm.mmap(a + 5 * p, p, RW, fixed, None).unwrap();
+        assert_eq!(
+            mm.mremap(a, 6 * p, 7 * p, true, None, None),
+            Err(Errno::EFAULT)
+        );
     }
 
     #[test]

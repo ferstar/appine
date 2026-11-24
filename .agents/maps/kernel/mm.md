@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared file mapping migration after guest or Files app writes)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared anonymous mremap growth, backing extent and VMA boundaries)
 
 ## Responsibilities
 
@@ -43,9 +43,10 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   from (kept open while mapped); the runs of file pages read; and the read-ahead state. Every VMA
   made from one mmap call (split, forked, moved, grown) holds the same one.
 - `same_vma` — whether two adjacent VMAs are one VMA on Linux: same contents source (both
-  file-less and not shared, or the same store inode at contiguous offsets; shared anonymous
-  never), backing, prot, lock, may_write, growsdown, dump and fork flags, `anon` and name (not
-  `may_exec`, `noreserve` or the fill).
+  private and file-less, the same store inode at contiguous offsets, or contiguous offsets in
+  the same shared host region with the same SysV attachment if any), backing, prot, lock,
+  may_write, growsdown, dump and fork flags, `anon` and name (not `may_exec`, `noreserve` or the
+  fill).
 - `Backing` — `Anonymous` (private anonymous, private `/dev/zero`), `PrivateFile` (private file
   mapping), `Shared` (shared file, shared anonymous, shared `/dev/zero`, GPU or SysV shm; also
   `[vvar]`, whose host memory is shared with forked children).
@@ -233,9 +234,11 @@ signals may still be delivered).
   place needs the old end to be a VMA end, free space above, the new end at or below `mmap_top`,
   and room for one more VMA (the grown part is a separate VMA with the same lock, dump, fork,
   `noreserve` and `anon` flags; a `Fill` VMA's maps more of its host file, sharing the fill); a
-  locked VMA's grown part is neither charged nor populated. A move settles CoW (`kernel/cow`),
-  re-points host memory, moves PTEs, updates SysV shm attach bases (`v.shm`), and updates `vdso`
-  when the whole vDSO moves (or clears it on a partial move).
+  locked VMA's grown part is neither charged nor populated. Shared anonymous memory and SysV
+  segments retain their backing region across shrink, growth and moves. Regrown pages alias the
+  original bytes up to the region's end and fault with `SIGBUS` beyond it. A move settles CoW
+  (`kernel/cow`), re-points host memory, moves PTEs, updates SysV shm attach bases (`v.shm`),
+  and updates `vdso` when the whole vDSO moves (or clears it on a partial move).
 - A move (growing with `MREMAP_MAYMOVE` and no room in place, `MREMAP_FIXED`,
   `MREMAP_DONTUNMAP`) is `ENOMEM` before anything changes unless the address space stays more
   than three VMAs below `vm.max_map_count` (`move_room`, 6.1's `move_vma`), with two more for a
@@ -398,8 +401,6 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
-- Growing a shared anonymous mapping after shrinking it allocates fresh pages. Linux exposes the
-  original bytes again up to the original mapping size and delivers `SIGBUS` beyond it.
 - **FUSE mappings read on demand are not Linux's page cache:** a page keeps what was read when first
   touched, so writes through the mount or by another process are not seen and separate mmap calls
   read separately; the size is fixed at mmap (growth not seen, truncation never `SIGBUS`); mlock,

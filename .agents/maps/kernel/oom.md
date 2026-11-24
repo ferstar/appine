@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: refine process_mrelease exiting check for deliverable fatal signals and zombie-leader thread groups, avoid RO-anon/CoW RSS inflation in resident_in)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: residency of remapped shared anonymous memory)
 
 ## Responsibilities
 
@@ -61,7 +61,8 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   `resident_in` (smaps) counts file mappings by host pagemap presence or swap (falling back to
   `mincore`; readahead fills the page cache around touched pages) and a borrowed page only when the
   owner's host page is resident. `resident_pages` and `resident_split` count every borrowed page.
-  Reserved VMAs and `[vvar]` never count.
+  Reserved VMAs and `[vvar]` never count. Shared anonymous mappings contribute only pages within
+  their original backing region, even after mremap grows the guest range beyond it.
 - `stack_bytes` (VmStk) sums the grows-down VMAs; `cow_shared` counts pages with more than one user
   for smaps' shared lines and divides them for Pss.
 - `resident_split` (status's `VmRSS` as their sum, and `RssAnon`/`RssFile`/`RssShmem`) measures each
