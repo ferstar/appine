@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the split; latest change: forced PTY with redirected input or output)
+> Maintained: 2026-11-24 (targeted verification only since the split; latest change: independent FUSE output pages in receive regressions)
 
 ## Responsibilities
 
@@ -91,6 +91,8 @@ benchmarks are `harness`, differential testing `harness/diff`.
   loop block sizes), and one network test (`apk add`, `git clone`, Python imports
   at Tier 1 in a store of its own, gated by `APPINE_NETWORK_TESTS=1`, run only by `full.yml`).
   Most cases run under both tiers.
+- In debug builds the host-refused TCP filter check runs `sockfilter` and the filtered DNAT
+  variant of `net_regressions` on both tiers, using hook 14 to force the restricted-host path.
 - Without a store or `musl-gcc` the tests skip with a message (each rootfs test that skips says
   so), unless `APPINE_REQUIRE_ROOTFS=1` / `APPINE_REQUIRE_MUSL=1` (set in CI); bug-injection and
   BKL-watchdog tests run only in debug builds and return silently otherwise. No cargo test sends
@@ -114,6 +116,9 @@ benchmarks are `harness`, differential testing `harness/diff`.
 
 ## Invariants and gotchas
 
+- Each receive output in `fs_mm_regressions` that needs a FUSE fault maps a distinct fixture
+  inode. Private mappings of the same file page share the initial read, which can leave later
+  receives without a daemon callback.
 - Default builds enable borrow-check; runners detect kernel bugs on stderr via
   `appine: internal error`, even when guest exit status otherwise looks successful.
 - Required-rootfs/musl switches make missing prerequisites fail rather than silently skip;

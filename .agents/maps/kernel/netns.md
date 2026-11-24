@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: connected UDP checks, dual-stack IPv6 DNAT forwarding, ephemeral port aliasing, CLOSE_WAIT forwarded peer, route gateway/nexthop rules)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: IPv4 bridge netfilter path and per-namespace original destinations)
 
 ## Responsibilities
 
@@ -175,11 +175,16 @@ sockets (`hal`).
   layer builds a fake packet (addresses, protocol, ports, uid/gid, mark, interfaces, ct state) and
   runs one hook's base chains of the matching families in priority order:
   1. OUTPUT nat of the sender (TCP/UDP/MPTCP, IPv4 and IPv6);
-  2. PREROUTING nat of one entered namespace (the target namespace, or the initial namespace for a
-     container going out through it), IPv4 only, once;
+  2. IPv4 PREROUTING nat of the entered namespace (the target or the initial namespace on the
+     way out). On-link traffic between veth endpoints whose peers share a bridge first passes
+     that bridge owner's PREROUTING when its `bridge-nf-call-iptables` is enabled. A bridge DNAT
+     can change which namespace is entered next; the endpoint can apply its own DNAT;
   3. filter chains along the path (IPv4 only): the sender's OUTPUT, then per step PREROUTING
      filter chains (evaluated after DNAT) and the step's own hook — INPUT on lo, the initial
-     namespace's INPUT or FORWARD, the target's INPUT; the mark is cleared outside the sender.
+     namespace's INPUT or FORWARD, the target's INPUT. A filtered bridge hop sees its logical
+     bridge interface and its own post-DNAT destination on FORWARD (INPUT for local delivery).
+     Routed traffic still takes its usual hooks when bridge filtering is disabled. The mark is
+     cleared outside the sender.
   POSTROUTING (nat and filter), INPUT-hook nat and arp/bridge/netdev tables are never evaluated.
   (Inbound forwarding's probe can evaluate IPv6 PREROUTING nat.)
 - Effects: a nat drop or reject is `EPERM` at connect/sendto (also for drops in a remote
@@ -218,8 +223,10 @@ sockets (`hal`).
   sockets cache the resolved real client address in `track.outside_peer` so getpeername and
   `/proc/net/tcp` preserve it across `CLOSE_WAIT` until the guest socket closes.
 - Closing the socket or a rule change drops the handle; established forwarded TCP connections stay,
-  UDP relays of that port are closed at once. The guest's own accept races with the forwarder on
-  the same host listener. There is no cap on connections or relays and no connect timeout.
+  UDP relays of that port are closed at once. Ordinary listeners share the accept queue with the
+  guest. For a host-refused RET 0, the socket layer supplies a separate listener for DNAT and
+  shuts it down on withdrawal. The port stays bound on the deferred guest fd. There is no cap on connections
+  or relays and no connect timeout.
 
 ## Dependencies (inbound / outbound)
 

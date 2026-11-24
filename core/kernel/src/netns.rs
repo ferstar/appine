@@ -680,9 +680,41 @@ pub(crate) fn output_nat(
         gid,
         iif: None,
         ct_state: crate::nft::CT_NEW,
+        original_dst: None,
         mark,
     };
     hook_nat(me, &packet, dst)
+}
+
+/// The logical ingress interface for IPv4 hooks on a bridge, including unnumbered bridges.
+pub(crate) struct BridgeHop {
+    pub ns: Rc<NetNs>,
+    pub iif: crate::nft::Iif,
+    /// Destination after the bridge's own PREROUTING, before the endpoint's rules.
+    pub dst: Vec<u8>,
+}
+
+pub(crate) fn bridge_hop(me: &NetNs, m: &Mapped, dst: &[u8]) -> Option<BridgeHop> {
+    let target = m.target.as_ref()?;
+    if std::ptr::eq(me, target.as_ref()) {
+        return None;
+    }
+    let bridge = crate::netdev::shared_bridge(me, target, ipv4_of(dst)?)?;
+    let dev = bridge.borrow();
+    let ns = dev.ns.upgrade()?;
+    if !ns.devs.borrow().conf.bridge_call_iptables {
+        return None;
+    }
+    let iif = crate::nft::Iif {
+        index: dev.index,
+        name: dev.name.clone(),
+        addr: dev.v4.first().map(|a| a.local.to_vec()).unwrap_or_default(),
+    };
+    Some(BridgeHop {
+        ns,
+        iif,
+        dst: dst.to_vec(),
+    })
 }
 
 /// The other namespace that a connection or datagram in `me` to guest address `dst` (already
@@ -709,7 +741,7 @@ pub(crate) fn entering(w: &World, me: &Rc<NetNs>, m: &Mapped, dst: &[u8]) -> Opt
                 .and_then(|e| <[u8; 4]>::try_from(e.gateway?.as_slice()).ok())
                 .and_then(|gw| w.owner(me, gw))
                 .is_some_and(|o| Rc::ptr_eq(o, init));
-            (via_init || init_local(init, ip)).then(|| init.clone())
+            (via_init || local_v4(init, ip)).then(|| init.clone())
         }
     }
 }
@@ -724,6 +756,7 @@ pub(crate) fn prerouting_nat(
     proto: u8,
     sport: u16,
     dst: &[u8],
+    ingress: Option<&crate::nft::Iif>,
 ) -> Result<Option<Vec<u8>>, Errno> {
     if !t.nft.borrow().has_nat(crate::nft::HOOK_PRE_ROUTING) {
         return Ok(None);
@@ -732,18 +765,7 @@ pub(crate) fn prerouting_nat(
         return Ok(None);
     };
     let src = source(from, ip[..4].try_into().unwrap()).unwrap_or_default();
-    let iif = crate::netdev::route_v4(t, src).and_then(|e| {
-        let i = crate::netdev::interfaces(t)
-            .into_iter()
-            .find(|i| i.index == e.index)?;
-        Some(crate::nft::Iif {
-            index: i.index,
-            name: i.name.into_bytes(),
-            addr: crate::netdev::first_v4(t, e.index)
-                .map(|a| a.to_vec())
-                .unwrap_or_default(),
-        })
-    });
+    let iif = ingress.cloned().unwrap_or_else(|| iif_facing(t, src));
     let packet = NatPacket {
         hook: crate::nft::HOOK_PRE_ROUTING,
         proto,
@@ -751,14 +773,18 @@ pub(crate) fn prerouting_nat(
         sport,
         uid: 0,
         gid: 0,
-        iif: Some(iif.unwrap_or_default()),
+        iif: Some(iif),
         ct_state: crate::nft::CT_NEW,
+        original_dst: None,
         mark: 0,
     };
     hook_nat(t, &packet, dst)
 }
 
 // ---- Filter chains along the path ----
+
+const HOOK_LOCAL_IN: u32 = 1;
+const HOOK_FORWARD: u32 = 2;
 
 /// One namespace a packet enters in turn in [`path_filter`]: the hook, the input interface and
 /// the output interface (on FORWARD).
@@ -770,8 +796,22 @@ struct Step<'a> {
 }
 
 impl<'a> Step<'a> {
-    fn new(ns: &'a Rc<NetNs>, hook: u32, iif: crate::nft::Iif, oif: Option<Vec<u8>>) -> Step<'a> {
-        Step { ns, hook, iif, oif }
+    fn input(ns: &'a Rc<NetNs>, iif: crate::nft::Iif) -> Self {
+        Self {
+            ns,
+            hook: HOOK_LOCAL_IN,
+            iif,
+            oif: None,
+        }
+    }
+
+    fn forward(ns: &'a Rc<NetNs>, iif: crate::nft::Iif, oif: Vec<u8>) -> Self {
+        Self {
+            ns,
+            hook: HOOK_FORWARD,
+            iif,
+            oif: Some(oif),
+        }
     }
 }
 
@@ -783,6 +823,8 @@ pub(crate) struct Flow<'a> {
     pub sport: u16,
     /// The destination as seen in `me` after OUTPUT nat.
     pub dst: &'a [u8],
+    pub bridge: Option<&'a BridgeHop>,
+    pub origs: &'a [(u64, Vec<u8>)],
     /// As seen on arrival in the destination's namespace (after PREROUTING nat).
     pub there: &'a [u8],
     pub uid: u32,
@@ -801,7 +843,8 @@ pub(crate) struct Flow<'a> {
 /// 2. From a new namespace, through the initial namespace: going out to the host network (`t` is
 ///    None) takes its FORWARD, with a host interface as the output; going to it takes INPUT; going
 ///    to another namespace whose destination is not in `me`'s directly connected subnets (through
-///    a gateway) takes FORWARD.
+///    a gateway) takes FORWARD. A switched IPv4 flow with bridge filtering enabled takes the
+///    bridge owner's hooks using the logical bridge as its interface.
 /// 3. On arrival in the destination's namespace `t`: INPUT (for the initial namespace see above).
 ///
 /// On entering a namespace, the filter chains on its PREROUTING (the raw table and the like) come
@@ -813,18 +856,14 @@ pub(crate) fn path_filter(
     f: &Flow<'_>,
 ) -> (crate::nft::Outcome, bool) {
     use crate::nft::{HOOK_LOCAL_OUT, HOOK_PRE_ROUTING, Outcome};
-    const HOOK_LOCAL_IN: u32 = 1;
-    const HOOK_FORWARD: u32 = 2;
     let ct_state = if f.established {
         crate::nft::CT_ESTABLISHED
     } else {
         crate::nft::CT_NEW
     };
-    let (Some((ip, true)), Some((final_ip, true))) = (nat_ip(f.dst), nat_ip(f.there)) else {
+    let (Some(ip), Some(final_ip)) = (ipv4_of(f.dst), ipv4_of(f.there)) else {
         return (Outcome::Accept, false);
     };
-    let ip: [u8; 4] = ip[..].try_into().unwrap();
-    let final_ip: [u8; 4] = final_ip[..].try_into().unwrap();
     let src = match f.vaddr {
         Some(v) => v,
         None if ip[0] == 127 => ip,
@@ -839,6 +878,11 @@ pub(crate) fn path_filter(
         gid: f.gid,
         iif,
         ct_state,
+        original_dst: f
+            .origs
+            .iter()
+            .find(|(id, _)| *id == ns.id)
+            .and_then(|(_, addr)| nat_ip(addr).map(|(ip, _)| ip)),
         mark: if std::ptr::eq(ns, me.as_ref()) {
             f.mark
         } else {
@@ -853,51 +897,12 @@ pub(crate) fn path_filter(
             return (o, true);
         }
     }
-    // The namespaces entered in turn: (namespace, hook, input interface, output interface)
-    let init = w.init();
-    let lo = crate::nft::Iif {
-        index: 1,
-        name: b"lo".to_vec(),
-        addr: vec![127, 0, 0, 1],
-    };
-    let mut steps: Vec<Step<'_>> = Vec::new();
-    let new_ns = me.host_net.is_some();
-    match t {
-        None if new_ns => {
-            let oif = outer_iface(init).map(|(i, _)| i.name).unwrap_or_default();
-            steps.push(Step::new(
-                init,
-                HOOK_FORWARD,
-                iif_facing(init, src),
-                Some(oif),
-            ));
-        }
-        None => {}
-        Some(x) if Rc::ptr_eq(x, me) => steps.push(Step::new(me, HOOK_LOCAL_IN, lo, None)),
-        Some(x) if Rc::ptr_eq(x, init) => {
-            steps.push(Step::new(init, HOOK_LOCAL_IN, iif_facing(init, src), None))
-        }
-        Some(x) => {
-            // Not through the initial namespace: sent to x's address in a directly connected
-            // subnet (x's PREROUTING may DNAT it again afterwards). Sent to an address behind the
-            // gateway or to a local address of the outer namespace, and DNATed to x in the outer
-            // PREROUTING (a container connecting to a published port, or going outside and DNATed
-            // to another container): all of these pass the outer FORWARD
-            let direct = crate::netdev::route_v4(me, ip).is_some_and(|e| e.gateway.is_none())
-                && !init_local(init, ip);
-            if new_ns && !direct {
-                let oif = iif_facing(init, final_ip).name;
-                steps.push(Step::new(
-                    init,
-                    HOOK_FORWARD,
-                    iif_facing(init, src),
-                    Some(oif),
-                ));
-            }
-            steps.push(Step::new(x, HOOK_LOCAL_IN, iif_facing(x, src), None));
-        }
-    }
+    let steps = filter_steps(w.init(), me, t, f.bridge, src, ip, final_ip);
     for Step { ns, hook, iif, oif } in steps {
+        let dst = f
+            .bridge
+            .filter(|b| Rc::ptr_eq(&b.ns, ns))
+            .map_or(f.there, |b| &b.dst);
         let (pre, this) = {
             let nft = ns.nft.borrow();
             (nft.has_filter(HOOK_PRE_ROUTING), nft.has_filter(hook))
@@ -907,7 +912,7 @@ pub(crate) fn path_filter(
             let o = hook_eval(
                 ns,
                 &packet(HOOK_PRE_ROUTING, Some(iif.clone()), ns),
-                f.there,
+                dst,
                 None,
                 true,
             );
@@ -916,7 +921,7 @@ pub(crate) fn path_filter(
             }
         }
         if this {
-            let o = hook_eval(ns, &packet(hook, Some(iif), ns), f.there, oif, true);
+            let o = hook_eval(ns, &packet(hook, Some(iif), ns), dst, oif, true);
             if !pass(&o) {
                 return (o, false);
             }
@@ -925,9 +930,68 @@ pub(crate) fn path_filter(
     (Outcome::Accept, false)
 }
 
-/// Local addresses in the initial namespace `init` (on host interfaces, lo and virtual devices).
-fn init_local(init: &NetNs, ip: [u8; 4]) -> bool {
-    crate::netdev::interfaces(init)
+/// Namespaces visited after OUTPUT. A switched packet enters the bridge owner's hooks
+/// only when bridge netfilter is enabled. A routed packet follows its gateway.
+fn filter_steps<'a>(
+    init: &'a Rc<NetNs>,
+    me: &'a Rc<NetNs>,
+    target: Option<&'a Rc<NetNs>>,
+    bridge: Option<&'a BridgeHop>,
+    src: [u8; 4],
+    dst: [u8; 4],
+    final_dst: [u8; 4],
+) -> Vec<Step<'a>> {
+    let mut steps = Vec::new();
+    if let Some(bridge) = bridge {
+        let bridge_dst = ipv4_of(&bridge.dst).unwrap();
+        if bridge_dst != dst && (bridge_dst[0] == 127 || local_v4(&bridge.ns, bridge_dst)) {
+            return vec![Step::input(&bridge.ns, bridge.iif.clone())];
+        }
+        let oif = if bridge_dst == dst {
+            bridge.iif.name.clone()
+        } else {
+            iif_facing(&bridge.ns, bridge_dst).name
+        };
+        steps.push(Step::forward(&bridge.ns, bridge.iif.clone(), oif));
+    } else {
+        let new_ns = me.host_net.is_some();
+        let Some(target) = target else {
+            if new_ns {
+                let oif = outer_iface(init).map(|(i, _)| i.name).unwrap_or_default();
+                steps.push(Step::forward(init, iif_facing(init, src), oif));
+            }
+            return steps;
+        };
+        // A published port can DNAT back to the sender via the initial namespace.
+        if Rc::ptr_eq(target, me) && !(new_ns && dst != final_dst && local_v4(init, dst)) {
+            let lo = crate::nft::Iif {
+                index: 1,
+                name: b"lo".to_vec(),
+                addr: vec![127, 0, 0, 1],
+            };
+            return vec![Step::input(me, lo)];
+        }
+        if new_ns && !Rc::ptr_eq(target, init) {
+            let on_link = crate::netdev::route_v4(me, dst).is_some_and(|e| e.gateway.is_none())
+                && !local_v4(init, dst);
+            if !on_link {
+                steps.push(Step::forward(
+                    init,
+                    iif_facing(init, src),
+                    iif_facing(init, final_dst).name,
+                ));
+            }
+        }
+    }
+    if let Some(target) = target {
+        steps.push(Step::input(target, iif_facing(target, src)));
+    }
+    steps
+}
+
+/// Whether an interface in this namespace owns the IPv4 address.
+fn local_v4(ns: &NetNs, ip: [u8; 4]) -> bool {
+    crate::netdev::interfaces(ns)
         .iter()
         .any(|i| i.addrs.iter().any(|(_, a, _)| a[..] == ip[..]))
 }
@@ -941,8 +1005,8 @@ const EXTERNAL: [u8; 4] = [192, 0, 2, 1];
 /// on the phone) to `dst` listening in the initial namespace `init` (a guest sockaddr, with the
 /// wildcard address replaced by one of the host's addresses): the source is taken to be 192.0.2.1
 /// (TEST-NET-1), and the input interface is the host's first non-loopback interface with an IPv4
-/// address.
-pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<Vec<u8>> {
+/// address. Returns the probe address and its DNAT destination.
+pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     if !init.nft.borrow().has_nat(crate::nft::HOOK_PRE_ROUTING) {
         return None;
     }
@@ -960,24 +1024,29 @@ pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<Vec<u8
         gid: 0,
         iif: Some(outer.map(|(i, _)| i).unwrap_or_default()),
         ct_state: crate::nft::CT_NEW,
+        original_dst: None,
         mark: 0,
     };
-    hook_nat(init, &packet, &dst).ok().flatten()
+    let translated = hook_nat(init, &packet, &dst).ok()??;
+    Some((dst, translated))
 }
 
 /// Forwarding from outside the host through the initial namespace `init` to the DNAT
 /// destination `there` (a guest address in namespace `t`): passes `init`'s FORWARD (entering on
 /// the host's interface) and the filter chains on `t`'s PREROUTING and INPUT; what is dropped or
 /// rejected is not forwarded.
-pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there: &[u8]) -> bool {
+pub(crate) fn external_filter(
+    init: &NetNs,
+    t: Option<&NetNs>,
+    proto: u8,
+    original: &[u8],
+    there: &[u8],
+) -> bool {
     use crate::nft::{HOOK_PRE_ROUTING, Outcome};
-    const HOOK_LOCAL_IN: u32 = 1;
-    const HOOK_FORWARD: u32 = 2;
-    let Some((ip, true)) = nat_ip(there) else {
+    let Some(ip) = ipv4_of(there) else {
         return true;
     };
-    let ip: [u8; 4] = ip[..].try_into().unwrap();
-    let packet = |hook: u32, iif: crate::nft::Iif| NatPacket {
+    let packet = |hook: u32, iif: crate::nft::Iif, ns: &NetNs| NatPacket {
         hook,
         proto,
         src: EXTERNAL.to_vec(),
@@ -986,6 +1055,11 @@ pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there:
         gid: 0,
         iif: Some(iif),
         ct_state: crate::nft::CT_NEW,
+        original_dst: if std::ptr::eq(ns, init) {
+            nat_ip(original).map(|(ip, _)| ip)
+        } else {
+            None
+        },
         mark: 0,
     };
     let pass = |o: Outcome| matches!(o, Outcome::Accept | Outcome::Dnat(..));
@@ -995,7 +1069,7 @@ pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there:
             let oif = iif_facing(init, ip).name;
             if !pass(hook_eval(
                 init,
-                &packet(HOOK_FORWARD, outer.clone()),
+                &packet(HOOK_FORWARD, outer.clone(), init),
                 there,
                 Some(oif),
                 true,
@@ -1006,7 +1080,13 @@ pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there:
         let iif = iif_facing(t, EXTERNAL);
         for hook in [HOOK_PRE_ROUTING, HOOK_LOCAL_IN] {
             if t.nft.borrow().has_filter(hook)
-                && !pass(hook_eval(t, &packet(hook, iif.clone()), there, None, true))
+                && !pass(hook_eval(
+                    t,
+                    &packet(hook, iif.clone(), t),
+                    there,
+                    None,
+                    true,
+                ))
             {
                 return false;
             }
@@ -1014,7 +1094,7 @@ pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there:
     } else if init.nft.borrow().has_filter(HOOK_LOCAL_IN)
         && !pass(hook_eval(
             init,
-            &packet(HOOK_LOCAL_IN, outer),
+            &packet(HOOK_LOCAL_IN, outer, init),
             there,
             None,
             true,
@@ -1037,6 +1117,8 @@ struct NatPacket {
     gid: u32,
     iif: Option<crate::nft::Iif>,
     ct_state: u32,
+    /// Pre-DNAT destination in this namespace, when translated.
+    original_dst: Option<Vec<u8>>,
     /// The packet's initial mark ([`crate::nft::Packet::mark`]).
     mark: u32,
 }
@@ -1116,6 +1198,7 @@ fn hook_eval(
     let packet = crate::nft::Packet {
         src: &src,
         dst: &ip,
+        original_dst: p.original_dst.as_deref().unwrap_or(&ip),
         proto: p.proto,
         sport: p.sport,
         dport: u16::from_be_bytes([dst[2], dst[3]]),

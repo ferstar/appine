@@ -6,6 +6,7 @@
 //! ready through [`Cx::wait`], releasing the BKL meanwhile; it can be interrupted by signals and
 //! times out according to `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,7 @@ use crate::kernel::{Cx, request_wake_object, wake};
 use crate::net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT,
     NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_SOCK_DIAG, NetlinkSocket, SOCK_DGRAM, SOCK_RAW,
-    SOCK_STREAM, Socket, is_stub, servfail, stub_addr,
+    SOCK_STREAM, Socket, TCP_CLOSE, TCP_INFO, TCP_LISTEN, is_stub, servfail, stub_addr,
 };
 use crate::process::Signal;
 use crate::signal::{self, SigInfo};
@@ -52,6 +53,12 @@ const NETLINK_CAP_ACK: i32 = 10;
 const NETLINK_EXT_ACK: i32 = 11;
 const NETLINK_GET_STRICT_CHK: i32 = 12;
 const SCM_CREDENTIALS: i32 = 2;
+const SO_REUSEADDR: i32 = 2;
+const SO_REUSEPORT: i32 = 15;
+const SO_BINDTODEVICE: i32 = 25;
+const SO_BINDTOIFINDEX: i32 = 62;
+const SO_ACCEPTCONN: i32 = 30;
+const DROP_TCP: &[u8] = &[6, 0, 0, 0, 0, 0, 0, 0];
 const SO_TYPE: i32 = 3;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
@@ -658,7 +665,11 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
                 .as_ref()
                 .and_then(|ns| crate::netns::implicit_bind(ns, s.family, s.icmp6()));
             ensure_bound(s, src.as_deref(), &map)?;
-            appine_hal::net::listen(s.fd, backlog).map_err(Errno)?;
+            if s.filter.as_deref() == Some(DROP_TCP) {
+                defer_listen(s, backlog)?;
+            } else {
+                appine_hal::net::listen(s.fd, backlog).map_err(Errno)?;
+            }
             s.listening = true;
             // TCP listens in a new network namespace are registered in the namespace: incoming
             // connections are judged by it (crate::netns)
@@ -707,6 +718,39 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
         Socket::Unix(u) => unix::listen(u, backlog, cx.ucred())?,
     }
     Ok(0)
+}
+
+/// Reserve the guest port without exposing a host accept queue while RET 0 is installed.
+fn defer_listen(s: &mut InetSocket, backlog: i32) -> Result<(), Errno> {
+    if let Some(held) = &mut s.deferred {
+        if let Some(listener) = &held.forward {
+            appine_hal::net::listen(listener.0.as_raw_fd(), backlog).map_err(Errno)?;
+        }
+        held.backlog = backlog;
+        return Ok(());
+    }
+    let local = appine_hal::net::sockname(s.fd, false).map_err(Errno)?;
+    let unbound = port_of(&local) == Some(0);
+    const IP_BIND_ADDRESS_NO_PORT: i32 = 24;
+    if unbound
+        && appine_hal::net::getsockopt(s.fd, 0, IP_BIND_ADDRESS_NO_PORT, 4)
+            .is_ok_and(|v| v.iter().any(|&b| b != 0))
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    // A bound TCP socket with SO_REUSEADDR would let a second caller take the port.
+    let reuse_addr = int_option(s.fd, SO_REUSEADDR)?;
+    set_reuse_addr(s.fd, 0)?;
+    if unbound && let Err(e) = appine_hal::net::bind(s.fd, &local) {
+        set_reuse_addr(s.fd, reuse_addr)?;
+        return Err(Errno(e));
+    }
+    s.deferred = Some(Box::new(crate::net::DeferredListen {
+        backlog,
+        reuse_addr,
+        forward: None,
+    }));
+    Ok(())
 }
 
 pub(super) fn accept4(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, flags: u32) -> SysResult {
@@ -759,22 +803,30 @@ fn accept_host(
                 s.net.clone(),
                 s.local_map,
                 s.vaddr,
-                (s.mark(), s.filter.clone(), s.v6only),
+                (s.mark(), s.v6only),
             ),
             Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
             Socket::Unix(_) => unreachable!("handled by accept4"),
         };
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
-        match appine_hal::net::accept(host_fd) {
+        let held = matches!(&*sock.borrow(), Socket::Inet(s) if s.deferred.is_some());
+        let accepted = if held {
+            Err(Errno::EAGAIN.0)
+        } else {
+            appine_hal::net::accept(host_fd)
+        };
+        match accepted {
             Ok((new, peer)) => {
                 let mut new = InetSocket::new(new, family, ty);
                 new.proto = proto;
                 // The listener's timeouts and the filter kept in Appine carry over (sk_clone_lock
                 // copies the whole sock and shares sk_filter)
                 (new.rcvtimeo, new.sndtimeo) = (timeout, sndtimeo);
-                let (mark, filter, v6only) = &inherited;
-                new.filter = filter.clone();
+                let (mark, v6only) = &inherited;
+                if let Socket::Inet(s) = &*sock.borrow() {
+                    new.filter = s.filter.clone();
+                }
                 // IPV6_V6ONLY, recorded in a new namespace (sk_clone_lock copies sk_ipv6only)
                 new.v6only = *v6only;
                 new.local_map = local_map;
@@ -818,12 +870,19 @@ fn accept_host(
             // A signal is EINTR when the wait has a timeout (inet_csk_wait_for_connect's
             // sock_intr_errno), as for AF_UNIX
             Err(e) if e == Errno::EAGAIN.0 => {
-                wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN).map_err(
-                    |e| match e {
-                        Errno::ERESTARTSYS if timeout.is_some() => Errno::EINTR,
-                        e => e,
-                    },
-                )?;
+                wait_host(
+                    cx,
+                    sock,
+                    if held { -1 } else { host_fd },
+                    POLLIN,
+                    nonblock,
+                    deadline,
+                    Errno::EAGAIN,
+                )
+                .map_err(|e| match e {
+                    Errno::ERESTARTSYS if timeout.is_some() => Errno::EINTR,
+                    e => e,
+                })?;
             }
             Err(e) => return Err(Errno(e)),
         }
@@ -845,6 +904,9 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     let cred = cx.cred();
     let (host_addr, tcp, host_fd, origs, udp_state) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
+            if s.filter.as_deref() == Some(DROP_TCP) {
+                return Err(Errno::EOPNOTSUPP);
+            }
             // The local address may have changed: identify again which interface the traffic
             // counts on
             s.route = None;
@@ -1535,26 +1597,24 @@ pub(super) fn setsockopt(
     const SO_ATTACH_BPF: i32 = 50;
     const SO_ATTACH_REUSEPORT_CBPF: i32 = 51;
     const SO_ATTACH_REUSEPORT_EBPF: i32 = 52;
-    let inet = match &*sock.borrow() {
-        Socket::Inet(s) => Some((
-            s.fd,
-            s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP,
-            net_of(cx, s).owner.clone(),
-        )),
-        _ => None,
+    let mut socket = sock.borrow_mut();
+    let Socket::Inet(s) = &mut *socket else {
+        unreachable!("handled above")
     };
+    let tcp = s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP;
     // eBPF socket filters (SO_ATTACH_BPF, SO_ATTACH_REUSEPORT_EBPF): never pass a raw guest fd
     // number to the host kernel. Validate optlen, TCP CAP_NET_ADMIN (Linux 5d39580f68e6) and
     // guest fd table (EBADF for closed/bad fd); Appine's bpf(2) only supports cgroup device
     // programs, so any valid guest fd is not a BPF_PROG_TYPE_SOCKET_FILTER program (EINVAL).
-    if let Some((_, tcp, ref owner)) = inet
-        && level == SOL_SOCKET
-        && matches!(name, SO_ATTACH_BPF | SO_ATTACH_REUSEPORT_EBPF)
-    {
+    if level == SOL_SOCKET && matches!(name, SO_ATTACH_BPF | SO_ATTACH_REUSEPORT_EBPF) {
         if optlen < 4 {
             return Err(Errno::EINVAL);
         }
-        if tcp && name == SO_ATTACH_BPF && !cx.cred().ns_capable(owner, crate::cred::cap::NET_ADMIN)
+        if tcp
+            && name == SO_ATTACH_BPF
+            && !cx
+                .cred()
+                .ns_capable(&net_of(cx, s).owner, crate::cred::cap::NET_ADMIN)
         {
             return Err(Errno::EPERM);
         }
@@ -1565,87 +1625,42 @@ pub(super) fn setsockopt(
         cx.fds().get(ufd)?;
         return Err(Errno::EINVAL);
     }
-    // Classic BPF filters (SO_ATTACH_FILTER, SO_ATTACH_REUSEPORT_CBPF), checked in Linux 6.1.y's
-    // order: an optlen under an int is EINVAL; SO_ATTACH_FILTER on a TCP socket needs
-    // CAP_NET_ADMIN over the socket's network namespace (Linux 5d39580f68e6, EPERM); struct
-    // sock_fprog must be exactly 16 bytes (EINVAL); a locked filter is EPERM; a count of 0 or above
-    // BPF_MAXINSNS, or no program, is EINVAL. The pointer to the instructions is then replaced
-    // with one on the host, which checks them. dockerd attaches a drop-everything filter to each
-    // TCP port it publishes until its DNAT rules are in place, and a host with 5d39580f68e6
-    // refuses TCP filters from the app, which never has CAP_NET_ADMIN: the program is then checked
-    // on a scratch UDP socket and kept in InetSocket::filter, filtering nothing
-    if let Some((host_fd, tcp, owner)) = inet
-        && level == SOL_SOCKET
-        && matches!(name, SO_ATTACH_FILTER | SO_ATTACH_REUSEPORT_CBPF)
-    {
-        let tcp_filter = tcp && name == SO_ATTACH_FILTER;
-        if optlen < 4 {
-            return Err(Errno::EINVAL);
+    let kept = match (level, name) {
+        (SOL_SOCKET, SO_ATTACH_FILTER) => attach_classic_filter(cx, s, name, &v, tcp)?,
+        (SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF) => {
+            attach_classic_filter(cx, s, name, &v, false)?;
+            return Ok(0);
         }
-        if tcp_filter && !cx.cred().ns_capable(&owner, crate::cred::cap::NET_ADMIN) {
-            return Err(Errno::EPERM);
-        }
-        if optlen != 16 {
-            return Err(Errno::EINVAL);
-        }
-        if filter_locked(host_fd) {
-            return Err(Errno::EPERM);
-        }
-        let n = usize::from(u16::from_le_bytes([v[0], v[1]]));
-        let ptr = u64::from_le_bytes(v[8..16].try_into().unwrap());
-        if n == 0 || n > BPF_MAXINSNS || ptr == 0 {
-            return Err(Errno::EINVAL);
-        }
-        let mut insns = vec![0u8; n * 8];
-        cx.mm().read(UserSlice::new(ptr, n * 8), &mut insns)?;
-        let mut host = [0u8; 16];
-        host[..2].copy_from_slice(&(n as u16).to_le_bytes());
-        host[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
-        let attach = |fd: i32| appine_hal::net::setsockopt(fd, level, name, &host);
-        let res = if tcp_filter && crate::bug::host_refuses_tcp_filters() {
-            Err(Errno::EPERM.0)
-        } else {
-            attach(host_fd)
-        };
-        let kept = match res {
-            Ok(()) => None,
-            Err(e) if e == Errno::EPERM.0 && tcp_filter => {
-                let scratch = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).map_err(Errno)?;
-                let checked = attach(scratch);
-                appine_hal::net::close(scratch);
-                checked.map_err(Errno)?;
-                Some(insns)
+        (SOL_SOCKET, SO_DETACH_FILTER) if s.filter.is_some() => {
+            if optlen < 4 {
+                return Err(Errno::EINVAL);
             }
-            Err(e) => return Err(Errno(e)),
-        };
-        if name == SO_ATTACH_FILTER
-            && let Socket::Inet(s) = &mut *sock.borrow_mut()
-        {
-            s.filter = kept;
+            if filter_locked(s.fd) {
+                return Err(Errno::EPERM);
+            }
+            None
         }
-        return Ok(0);
+        _ => return set_inet_option(cx, s, level, name, &v),
+    };
+    if kept.as_deref() != Some(DROP_TCP) && s.deferred.is_some() {
+        activate_listener(cx.kr(), s)?;
+        request_wake_object(wake::of(&sock));
     }
-    // SO_DETACH_FILTER of a program kept in Appine (Linux's sk_detach_filter: EPERM while the
-    // filter is locked); without one the host answers (ENOENT when it has none either)
-    if (level, name) == (SOL_SOCKET, SO_DETACH_FILTER)
-        && let Socket::Inet(s) = &mut *sock.borrow_mut()
-        && s.filter.is_some()
-    {
-        if optlen < 4 {
-            return Err(Errno::EINVAL);
-        }
-        if filter_locked(s.fd) {
-            return Err(Errno::EPERM);
-        }
-        s.filter = None;
-        return Ok(0);
-    }
+    s.filter = kept;
+    Ok(0)
+}
+
+fn set_inet_option(
+    cx: &mut Cx<'_>,
+    s: &mut InetSocket,
+    level: i32,
+    name: i32,
+    v: &[u8],
+) -> SysResult {
     // SO_MARK: only recorded (InetSocket::mark); packets sent by this machine carry it in
     // nftables. Linux requires CAP_NET_RAW or CAP_NET_ADMIN over the owner of the socket's
     // network namespace (sk_setsockopt)
-    if (level, name) == (SOL_SOCKET, SO_MARK)
-        && let Socket::Inet(s) = &mut *sock.borrow_mut()
-    {
+    if (level, name) == (SOL_SOCKET, SO_MARK) {
         let mark = v.get(..4).ok_or(Errno::EINVAL)?;
         let owner = net_of(cx, s).owner.clone();
         let cred = cx.cred();
@@ -1660,19 +1675,31 @@ pub(super) fn setsockopt(
         }
         return Ok(0);
     }
-    match &mut *sock.borrow_mut() {
-        Socket::Inet(s) => match (level, name) {
-            (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(&v)?,
-            (SOL_SOCKET, SO_SNDTIMEO) => s.sndtimeo = timeval(&v)?,
-            // In a new network namespace the host socket must use IPv4-mapped addresses: only
-            // record it
-            (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
-                let on = v.get(..4).ok_or(Errno::EINVAL)?;
-                s.v6only = i32::from_le_bytes(on.try_into().unwrap()) != 0;
+    match (level, name) {
+        (SOL_SOCKET, SO_REUSEADDR) if s.deferred.is_some() => {
+            s.deferred.as_mut().unwrap().reuse_addr =
+                i32::from(v.get(..4).ok_or(Errno::EINVAL)? != [0; 4]);
+        }
+        (SOL_SOCKET, SO_BINDTODEVICE | SO_BINDTOIFINDEX)
+            if s.deferred.as_ref().is_some_and(|h| h.forward.is_some()) =>
+        {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        (SOL_SOCKET, SO_REUSEPORT) if s.filter.as_deref() == Some(DROP_TCP) => {
+            let arg = v.get(..4).ok_or(Errno::EINVAL)?;
+            if arg != [0; 4] {
+                return Err(Errno::EOPNOTSUPP);
             }
-            _ => appine_hal::net::setsockopt(s.fd, level, name, &v).map_err(Errno)?,
-        },
-        Socket::Netlink(_) | Socket::Unix(_) => unreachable!("handled above"),
+        }
+        (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(v)?,
+        (SOL_SOCKET, SO_SNDTIMEO) => s.sndtimeo = timeval(v)?,
+        // In a new network namespace the host socket must use IPv4-mapped addresses: only
+        // record it
+        (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
+            let on = v.get(..4).ok_or(Errno::EINVAL)?;
+            s.v6only = i32::from_le_bytes(on.try_into().unwrap()) != 0;
+        }
+        _ => appine_hal::net::setsockopt(s.fd, level, name, v).map_err(Errno)?,
     }
     Ok(0)
 }
@@ -1687,6 +1714,127 @@ fn new_timeouts(level: i32, name: i32) -> i32 {
         (SOL_SOCKET, SO_SNDTIMEO_NEW) => SO_SNDTIMEO,
         _ => name,
     }
+}
+
+/// Attach a classic BPF program, returning the instructions if Appine must enforce it.
+fn attach_classic_filter(
+    cx: &mut Cx<'_>,
+    s: &InetSocket,
+    name: i32,
+    v: &[u8],
+    tcp_filter: bool,
+) -> Result<Option<Vec<u8>>, Errno> {
+    // Linux checks the TCP capability before the full sock_fprog size and the filter lock.
+    if v.len() < 4 {
+        return Err(Errno::EINVAL);
+    }
+    if tcp_filter
+        && !cx
+            .cred()
+            .ns_capable(&net_of(cx, s).owner, crate::cred::cap::NET_ADMIN)
+    {
+        return Err(Errno::EPERM);
+    }
+    if v.len() != 16 {
+        return Err(Errno::EINVAL);
+    }
+    if filter_locked(s.fd) {
+        return Err(Errno::EPERM);
+    }
+    let n = usize::from(u16::from_le_bytes([v[0], v[1]]));
+    let ptr = u64::from_le_bytes(v[8..16].try_into().unwrap());
+    if n == 0 || n > BPF_MAXINSNS || ptr == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut insns = vec![0u8; n * 8];
+    cx.mm().read(UserSlice::new(ptr, n * 8), &mut insns)?;
+    let mut host = [0u8; 16];
+    host[..2].copy_from_slice(&(n as u16).to_le_bytes());
+    host[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
+    let attach = |fd: i32| appine_hal::net::setsockopt(fd, SOL_SOCKET, name, &host);
+    let emulate = tcp_filter && (crate::bug::host_refuses_tcp_filters() || s.deferred.is_some());
+    if !emulate {
+        match attach(s.fd) {
+            Ok(()) => return Ok(None),
+            Err(e) if tcp_filter && e == Errno::EPERM.0 => {}
+            Err(e) => return Err(Errno(e)),
+        }
+    }
+    // On a restricted host, validate the program on UDP before emulating its verdict.
+    let scratch = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).map_err(Errno)?;
+    let checked = attach(scratch);
+    appine_hal::net::close(scratch);
+    checked.map_err(Errno)?;
+    if insns == DROP_TCP {
+        let state = appine_hal::net::getsockopt(s.fd, IPPROTO_TCP, TCP_INFO, 1).map_err(Errno)?;
+        if state.first() != Some(&TCP_CLOSE) || int_option(s.fd, SO_REUSEPORT)? != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+    } else if !passes_all_tcp(&insns) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if s.filter.is_none() && appine_hal::net::get_filter(s.fd, 0).map_err(Errno)?.0 != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(Some(insns))
+}
+
+/// A validated straight-line program ending in RET UINT_MAX. The preceding immediate/length
+/// loads cannot reject a packet or affect the constant return.
+fn passes_all_tcp(insns: &[u8]) -> bool {
+    let Some((loads, last)) = insns.split_last_chunk::<8>() else {
+        return false;
+    };
+    last == &[6, 0, 0, 0, 255, 255, 255, 255]
+        && loads
+            .chunks_exact(8)
+            .all(|insn| matches!(u16::from_ne_bytes([insn[0], insn[1]]), 0 | 0x80))
+}
+
+fn int_option(fd: i32, option: i32) -> Result<i32, Errno> {
+    let bytes = appine_hal::net::getsockopt(fd, SOL_SOCKET, option, 4).map_err(Errno)?;
+    Ok(i32::from_ne_bytes(
+        bytes.try_into().map_err(|_| Errno::EINVAL)?,
+    ))
+}
+
+fn set_reuse_addr(fd: i32, value: i32) -> Result<(), Errno> {
+    appine_hal::net::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &value.to_ne_bytes()).map_err(Errno)
+}
+
+/// Start the guest listener after detaching (or replacing) RET 0. If DNAT is active,
+/// stop its private accept queue first. Its fd is still bound until the worker drops
+/// its dup, so both sockets need SO_REUSEADDR during the handover.
+fn activate_listener(k: &crate::kernel::Kernel, s: &mut InetSocket) -> Result<(), Errno> {
+    let held = s.deferred.as_ref().unwrap();
+    set_reuse_addr(s.fd, 1)?;
+    let forward = held.forward.as_ref().map(|listener| listener.0.as_raw_fd());
+    if let Some(fd) = forward
+        && let Err(e) = appine_hal::net::shutdown(fd, 2)
+    {
+        set_reuse_addr(s.fd, 0)?;
+        return Err(Errno(e));
+    }
+    if let Err(e) = appine_hal::net::listen(s.fd, held.backlog) {
+        let restored = forward.is_none_or(|fd| appine_hal::net::listen(fd, held.backlog).is_ok());
+        set_reuse_addr(s.fd, 0)?;
+        if !restored {
+            s.deferred.as_mut().unwrap().forward = None;
+            s.fwd = None;
+        }
+        return Err(Errno(e));
+    }
+    // listen succeeded, so the filter is gone even if restoring the guest option fails.
+    if let Err(e) = set_reuse_addr(s.fd, held.reuse_addr) {
+        crate::debug::log(format_args!(
+            "TCP listen: restoring SO_REUSEADDR: errno {}",
+            e.0
+        ));
+    }
+    s.deferred = None;
+    s.fwd = None;
+    forward_socket(k, s);
+    Ok(())
 }
 
 /// Whether the host socket's filter is locked (`SO_LOCK_FILTER`, which goes to the host): Linux
@@ -1936,25 +2084,21 @@ pub(super) fn getsockopt(
     // each), and optlen comes back as the program's count; with 0 only the count is asked, and
     // fewer than the program has is EINVAL. A program kept in Appine (InetSocket::filter) answers
     // itself; otherwise the host is asked with the count, never above BPF_MAXINSNS
-    let inet = match &*sock.borrow() {
-        Socket::Inet(s) => Some((s.fd, s.filter.clone())),
-        _ => None,
-    };
     if (level, name) == (SOL_SOCKET, SO_GET_FILTER)
-        && let Some((host_fd, kept)) = inet
+        && let Socket::Inet(s) = &*sock.borrow()
     {
-        let (n, insns) = match kept {
+        let (n, insns) = match &s.filter {
             Some(insns) => {
                 let n = insns.len() / 8;
                 match room {
                     0 => (n, Vec::new()),
                     r if r < n => return Err(Errno::EINVAL),
-                    _ => (n, insns),
+                    _ => (n, insns.clone()),
                 }
             }
             None => {
                 let count = room.min(BPF_MAXINSNS) as u32;
-                let (n, insns) = appine_hal::net::get_filter(host_fd, count).map_err(Errno)?;
+                let (n, insns) = appine_hal::net::get_filter(s.fd, count).map_err(Errno)?;
                 (n as usize, insns)
             }
         };
@@ -1993,6 +2137,22 @@ pub(super) fn getsockopt(
             Socket::Inet(s) => match (level, name) {
                 (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
                     (s.v6only as i32).to_le_bytes().to_vec()
+                }
+                (SOL_SOCKET, SO_ACCEPTCONN) if s.deferred.is_some() => 1i32.to_le_bytes().to_vec(),
+                (SOL_SOCKET, SO_REUSEADDR) if s.deferred.is_some() => s
+                    .deferred
+                    .as_ref()
+                    .unwrap()
+                    .reuse_addr
+                    .to_le_bytes()
+                    .to_vec(),
+                (IPPROTO_TCP, TCP_INFO) if s.deferred.is_some() => {
+                    let mut info = appine_hal::net::getsockopt(s.fd, level, name, room.min(256))
+                        .map_err(Errno)?;
+                    if let Some(state) = info.first_mut() {
+                        *state = TCP_LISTEN;
+                    }
+                    info
                 }
                 (SOL_SOCKET, SO_RCVTIMEO) => encode_tv(s.rcvtimeo),
                 (SOL_SOCKET, SO_SNDTIMEO) => encode_tv(s.sndtimeo),
@@ -2606,6 +2766,24 @@ pub(super) fn shutdown(cx: &mut Cx<'_>, fd: i32, how: i32) -> SysResult {
         Socket::Inet(s) => {
             const SHUT_RD: i32 = 0;
             const SHUT_RDWR: i32 = 2;
+            if let Some(held) = &s.deferred {
+                match how {
+                    1 => return Ok(0),
+                    SHUT_RD | SHUT_RDWR => {
+                        set_reuse_addr(s.fd, held.reuse_addr)?;
+                        s.deferred = None;
+                        s.fwd = None;
+                        s.listening = false;
+                        if let (Some(id), Some(net)) = (s.listener.take(), &s.net) {
+                            net.listeners.borrow_mut().retain(|l| l.id != id.get());
+                        }
+                        s.rd_shut = true;
+                        request_wake_object(wake::of(&sock));
+                        return Ok(0);
+                    }
+                    _ => return Err(Errno::EINVAL),
+                }
+            }
             let r = appine_hal::net::shutdown(s.fd, how).map_err(Errno);
             // The host records the shutdown even on an unconnected socket, failing with ENOTCONN
             // as Linux's inet_shutdown does, and recv needs to know about it (InetSocket::rd_shut)
@@ -2698,6 +2876,9 @@ pub(crate) fn send(
     let addr = validated.as_deref().unwrap_or(addr);
     let (host_fd, ty, timeout, to_stub) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
+            if flags & MSG_FASTOPEN != 0 && s.filter.as_deref() == Some(DROP_TCP) {
+                return Err(Errno::EOPNOTSUPP);
+            }
             if s.ty == SOCK_STREAM && s.pending_err.get() != 0 {
                 return Err(Errno(s.pending_err.replace(0)));
             }
@@ -4452,6 +4633,7 @@ pub(crate) fn readiness(sock: &Socket) -> (i16, Option<i32>) {
             };
             (err | stub, Some(s.fd))
         }
+        Socket::Inet(s) if s.deferred.is_some() => (0, None),
         Socket::Inet(s) if !s.answers.is_empty() => (POLLIN | POLLOUT, None),
         Socket::Inet(s) if s.pending_err.get() != 0 => (POLLIN | POLLERR, Some(s.fd)),
         Socket::Inet(s) => (0, Some(s.fd)),
@@ -4563,7 +4745,8 @@ const NAT_BACK_MAX: usize = 16;
 
 /// The destination address `addr` (the guest's) of connect or sendto: it first goes through `me`'s
 /// OUTPUT nat and is translated to the host's; when it enters another namespace
-/// ([`crate::netns::entering`]) it also goes through that namespace's PREROUTING nat and is
+/// ([`crate::netns::entering`]) it also goes through that namespace's PREROUTING nat, including
+/// any enabled bridge hop before the endpoint, and is
 /// translated to the host's by that namespace (containers connecting to published ports through
 /// the gateway or the outer address).
 fn route(
@@ -4579,70 +4762,93 @@ fn route(
         origs.push((me.id, addr.to_vec()));
     }
     let dst = nat.clone().unwrap_or_else(|| addr.to_vec());
-    let mut m = crate::netns::to_host(w, me, &dst, crate::netns::Use::Reach, s.icmp6())?;
-    let mut actual = nat;
-    let mut there = dst.clone();
-    if let Some(proto) = nat_proto(s)
-        && let Some(t) = crate::netns::entering(w, me, &m, &dst)
-        && let Some(d2) = crate::netns::prerouting_nat(me, &t, proto, local_port(s), &dst)?
-    {
-        let m2 = crate::netns::to_host(w, &t, &d2, crate::netns::Use::Reach, s.icmp6())?;
-        origs.push((t.id, dst.clone()));
-        there = d2;
-        actual = Some(crate::netns::from_host(
+    let m = crate::netns::to_host(w, me, &dst, crate::netns::Use::Reach, s.icmp6())?;
+    let mut route = Routed {
+        m,
+        there: dst.clone(),
+        dst,
+        actual: nat,
+        verdict: (crate::nft::Outcome::Accept, false),
+        origs,
+    };
+    let Some(proto) = nat_proto(s) else {
+        return Ok(route);
+    };
+    let mut bridge = crate::netns::bridge_hop(me, &route.m, &route.dst);
+    let entered = if let Some(b) = &mut bridge {
+        route.preroute(w, me, s, proto, &b.ns, Some(&b.iif))?;
+        b.dst.clone_from(&route.there);
+        route
+            .m
+            .target
+            .as_ref()
+            .filter(|ns| !Rc::ptr_eq(ns, &b.ns))
+            .cloned()
+    } else {
+        crate::netns::entering(w, me, &route.m, &route.dst)
+    };
+    if let Some(t) = entered {
+        route.preroute(w, me, s, proto, &t, None)?;
+    }
+    let flow = crate::netns::Flow {
+        proto,
+        vaddr: s.vaddr,
+        sport: local_port(s),
+        dst: &route.dst,
+        bridge: bridge.as_ref(),
+        origs: &route.origs,
+        there: &route.there,
+        uid: cred.euid,
+        gid: cred.egid,
+        established: proto == IPPROTO_UDP as u8
+            && s.track
+                .as_ref()
+                .is_some_and(|k| k.seen.iter().any(|p| same_endpoint(p, addr))),
+        mark: s.mark(),
+    };
+    route.verdict = crate::netns::path_filter(w, me, route.m.target.as_ref(), &flow);
+    Ok(route)
+}
+
+impl Routed {
+    fn preroute(
+        &mut self,
+        w: &crate::netns::World,
+        me: &Rc<crate::nsproxy::NetNs>,
+        s: &InetSocket,
+        proto: u8,
+        ns: &Rc<crate::nsproxy::NetNs>,
+        ingress: Option<&crate::nft::Iif>,
+    ) -> Result<(), Errno> {
+        let Some(dst) =
+            crate::netns::prerouting_nat(me, ns, proto, local_port(s), &self.there, ingress)?
+        else {
+            return Ok(());
+        };
+        // A port-only bridge DNAT keeps the original L2 path, even on an unnumbered bridge.
+        let via = if ingress.is_some() && ip_of(&self.there) == ip_of(&dst) {
+            me
+        } else {
+            ns
+        };
+        let mapped = crate::netns::to_host(w, via, &dst, crate::netns::Use::Reach, s.icmp6())?;
+        self.origs
+            .push((ns.id, std::mem::replace(&mut self.there, dst)));
+        self.actual = Some(crate::netns::from_host(
             w,
             me,
-            &m2.addr,
+            &mapped.addr,
             crate::netns::Role::Peer,
             s.icmp6(),
         ));
-        // Going through the host network originally, no source address was chosen: when DNAT
-        // leads into a namespace, a new namespace binds its loopback address so the other side
-        // recognizes the source; when DNAT leads to another address outside it still does not
-        // bind, since bound it could not get out
-        let source = m.source.take().or_else(|| {
-            m2.target.as_ref()?;
-            me.host_net
-                .and_then(|_| crate::netns::implicit_bind(me, s.family, s.icmp6()))
-        });
-        m = crate::netns::Mapped {
-            addr: m2.addr,
-            target: m2.target,
-            source,
-            vaddr: m.vaddr,
-        };
-    }
-    // The filter chains passed (crate::netns::path_filter): UDP sending back to peers it received
-    // from is ESTABLISHED
-    let verdict = match nat_proto(s) {
-        Some(proto) => {
-            let established = proto == IPPROTO_UDP as u8
-                && s.track
-                    .as_ref()
-                    .is_some_and(|k| k.seen.iter().any(|p| same_endpoint(p, addr)));
-            let flow = crate::netns::Flow {
-                proto,
-                vaddr: s.vaddr,
-                sport: local_port(s),
-                dst: &dst,
-                there: &there,
-                uid: cred.euid,
-                gid: cred.egid,
-                established,
-                mark: s.mark(),
-            };
-            crate::netns::path_filter(w, me, m.target.as_ref(), &flow)
+        // DNAT from the host network into a namespace needs an implicit source bind.
+        if self.m.source.is_none() && mapped.target.is_some() && me.host_net.is_some() {
+            self.m.source = crate::netns::implicit_bind(me, s.family, s.icmp6());
         }
-        None => (crate::nft::Outcome::Accept, false),
-    };
-    Ok(Routed {
-        m,
-        dst,
-        there,
-        actual,
-        verdict,
-        origs,
-    })
+        self.m.addr = mapped.addr;
+        self.m.target = mapped.target;
+        Ok(())
+    }
 }
 
 /// The destination address rewritten by nftables' OUTPUT nat ([`crate::netns::output_nat`]);
@@ -4704,9 +4910,56 @@ fn forward_socket(k: &crate::kernel::Kernel, s: &mut InetSocket) {
     if want.as_ref() == s.fwd.as_ref().map(|h| &h.target) {
         return;
     }
-    // Hand over the new one before dropping the old: no gap in between
-    let new = want.and_then(|t| k.forward.add(s.fd, t).ok()).map(Box::new);
-    s.fwd = new;
+    // A held guest listener keeps its own accept queue empty. Only a matching target gets
+    // a host listener; a failed registration or removal drops that listener and its queue.
+    s.fwd = want.and_then(|target| {
+        let fd = match &mut s.deferred {
+            Some(held) => {
+                if held.forward.is_none() {
+                    held.forward = Some(forward_listener(s.fd, s.family, held.backlog).ok()?);
+                }
+                held.forward.as_ref()?.0.as_raw_fd()
+            }
+            None => s.fd,
+        };
+        k.forward.add(fd, target).ok().map(Box::new)
+    });
+    if s.fwd.is_none()
+        && let Some(held) = &mut s.deferred
+    {
+        held.forward = None;
+    }
+}
+
+/// The forwarding queue has an independent lifetime: withdrawing DNAT discards queued
+/// handshakes and leaves even an ephemeral guest port reserved on its original fd.
+fn forward_listener(
+    guest: i32,
+    family: i32,
+    backlog: i32,
+) -> Result<crate::net::ForwardListener, Errno> {
+    let addr = appine_hal::net::sockname(guest, false).map_err(Errno)?;
+    let raw = appine_hal::net::socket(family, SOCK_STREAM, IPPROTO_TCP).map_err(Errno)?;
+    // SAFETY: socket returned a new fd owned by this function.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    if family == AF_INET6 {
+        let only =
+            appine_hal::net::getsockopt(guest, IPPROTO_IPV6, IPV6_V6ONLY, 4).map_err(Errno)?;
+        appine_hal::net::setsockopt(raw, IPPROTO_IPV6, IPV6_V6ONLY, &only).map_err(Errno)?;
+    }
+    let dev = appine_hal::net::getsockopt(guest, SOL_SOCKET, SO_BINDTODEVICE, 16).map_err(Errno)?;
+    if !dev.is_empty() {
+        appine_hal::net::setsockopt(raw, SOL_SOCKET, SO_BINDTODEVICE, &dev).map_err(Errno)?;
+    }
+    // Two SO_REUSEADDR sockets may bind before either listens. Once listening, the
+    // forwarder excludes other listeners, including those requesting SO_REUSEPORT.
+    set_reuse_addr(raw, 1)?;
+    set_reuse_addr(guest, 1)?;
+    let result =
+        appine_hal::net::bind(raw, &addr).and_then(|()| appine_hal::net::listen(raw, backlog));
+    set_reuse_addr(guest, 0)?;
+    result.map_err(Errno)?;
+    Ok(crate::net::ForwardListener(fd))
 }
 
 /// When a connection from outside the host reaches `s` in the boot namespace (a TCP listen, or a
@@ -4738,7 +4991,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
         set_port(&mut local, g);
     }
     let proto = if udp { IPPROTO_UDP } else { IPPROTO_TCP };
-    let dst = crate::netns::external_nat(init, proto as u8, &local).or_else(|| {
+    let (original, dst) = crate::netns::external_nat(init, proto as u8, &local).or_else(|| {
         // Dual-stack AF_INET6 wildcard listener (!IPV6_V6ONLY): also probe as IPv4 wildcard so
         // IPv4 PREROUTING DNAT rules match it.
         if s.family != AF_INET6 || !crate::netns::is_any(&local) || is_v6only(s) {
@@ -4752,7 +5005,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
     let w = k.world();
     let m = crate::netns::to_host(&w, init, &dst, crate::netns::Use::Reach, false).ok()?;
     // Not forwarded when dropped or rejected by filter chains (FORWARD and so on)
-    if !crate::netns::external_filter(init, m.target.as_deref(), proto as u8, &dst) {
+    if !crate::netns::external_filter(init, m.target.as_deref(), proto as u8, &original, &dst) {
         return None;
     }
     let mut addr = m.addr;

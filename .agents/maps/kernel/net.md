@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: raw ICMP echo sends and host retries)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: host-refused TCP filters and deferred listeners)
 
 ## Responsibilities
 
@@ -51,7 +51,8 @@ listen notifications (`android/service`).
   preserved real outside peer, the claimed original
   destination, `SO_MARK`); raw ICMP and tap state used with `kernel/rawicmp` (`icmp`, `ttl_set`,
   `guest_recverr`, `udp_tap`, `icmp_err`); port-map `lease`, `local_map`, `peer_map`; `filter` (a
-  TCP socket's classic BPF program the host refused, kept as given). Dropping it closes the host fd
+  supported host-refused TCP program, as given), and `deferred` (backlog, guest reuse option and
+  optional private DNAT listener while a guest listen is held by RET 0). Dropping it closes the host fd
   and removes its namespace UDP port and listener.
 - `Message` (one recv result), `MsgHdr` (a guest msghdr read in), `Routed` (connect/sendto
   routing result: namespace map, nat, filter verdict, original destinations).
@@ -123,6 +124,11 @@ listen notifications (`android/service`).
 - listen: implicit bind (only in a new namespace; the host autobinds otherwise), host listen,
   then a TCP/MPTCP socket in a new namespace registers its listener once; `forward_socket`; a
   listen on a non-loopback host address is reported to the app.
+- A listen held by a host-refused RET 0 explicitly reserves its port with host `SO_REUSEADDR`
+  off. Guest accept waits on the socket object, polling has no ready bits, and `SO_ACCEPTCONN`,
+  `TCP_INFO` and procfs report a listener. A read shutdown ends it and wakes waiters; a write
+  shutdown leaves it listening. Detach or replacement by a supported pass program starts the guest
+  listener with the latest backlog and wakes waiters. A failed listen keeps the drop filter.
 - connect: in the initial namespace a UDP socket connecting to the DNS stub records `stub_peer`
   and connects its host socket there too (see below). Otherwise `route()` applies OUTPUT nat,
   the namespace translation, PREROUTING nat when entering another namespace and the filter chains
@@ -235,11 +241,13 @@ listen notifications (`android/service`).
   `EPERM`, as Linux 5d39580f68e6; an optlen other than 16 `EINVAL`; a host filter locked with
   `SO_LOCK_FILTER` `EPERM`; 0 or more than 4096 instructions, or no program, `EINVAL`), then the
   instructions are copied and the pointer rewritten for the host, which checks them; when the host
-  refuses a TCP `SO_ATTACH_FILTER` with `EPERM` (a host with 5d39580f68e6, or test hook 14), the
-  program is checked by attaching it to a scratch host UDP socket and kept in `filter`, filtering
-  nothing; a host attach that succeeds clears `filter`; `SO_DETACH_FILTER` with a kept program
-  clears it (`EPERM` while the host filter is locked); `SO_MARK` (needs `CAP_NET_RAW` or
-  `CAP_NET_ADMIN` over the namespace owner; stored only, inherited by accepted sockets, fed to
+  refuses a TCP `SO_ATTACH_FILTER` with `EPERM` (a host with 5d39580f68e6, or test hook 14), a
+  scratch UDP socket validates the instructions. The fallback accepts a single RET 0 on a
+  closed TCP socket without SO_REUSEPORT, or RET UINT_MAX preceded only by immediate or length
+  loads. Other valid programs return `EOPNOTSUPP` and preserve the old filter. A kept RET 0
+  refuses outgoing connect and fast open; pass programs are inherited on accept. While a guest
+  listen is held, replacement is checked by the fallback. Detach honours `SO_LOCK_FILTER`.
+  `SO_MARK` (needs `CAP_NET_RAW` or `CAP_NET_ADMIN` over the namespace owner; stored only, inherited by accepted sockets, fed to
   nftables, which sees 0 outside the sender's namespace); `SO_RCVTIMEO`/`SO_SNDTIMEO` (Linux
   6.1's `sock_set_timeout`: a short buffer `EINVAL`, microseconds outside `[0, 1000000)` `EDOM`, a
   negative time zero (no waiting, `EAGAIN` at once), 0 or at least `KTIME_MAX` no timeout, read
@@ -333,7 +341,9 @@ listen notifications (`android/service`).
   (`forward_target`: the guest port, `external_nat`, `external_filter` and the mapped host port);
   `forward_all` runs again after a new-namespace bind that remapped a port and after a
   `NETLINK_NETFILTER` change in the initial namespace. Sockets in new namespaces and raw sockets
-  are never forwarded.
+  are never forwarded. For a deferred guest listen the forwarder alone receives a separate
+  listener bound to the same host endpoint (including IPv6-only and device binding). Withdrawing
+  the target shuts down that listener and discards its queue; the guest fd keeps the port.
 
 ### Traffic counters and `/proc/net`
 
@@ -410,18 +420,18 @@ listen notifications (`android/service`).
 - Raw ICMP tap dispatch must run with no socket borrowed (`kernel/rawicmp`).
 - Options passed to the host meet the host kernel's rules, which change with the device's kernel:
   a host with Linux 5d39580f68e6 (in 6.1.y since June 2026) refuses `SO_ATTACH_FILTER` on a TCP
-  socket without `CAP_NET_ADMIN`, which the app never has, so such programs live in `filter` and
-  every path that reads, replaces, detaches or inherits a filter must look there before the host.
+  socket without `CAP_NET_ADMIN`, which the app never has. Only filters whose effect Appine can
+  enforce may be retained. A DNAT queue must never become a guest accept queue on detach.
 
 ## Confirmed bugs / technical debt
 
 - **Option passthrough uses host semantics:** privileged options (`SO_PRIORITY` above 6,
   `IP_TRANSPARENT`) are judged by the app's host credentials (a privileged guest gets `EPERM`);
   `SO_BINDTODEVICE` names are resolved against host interfaces.
-- **A TCP filter the host refused filters nothing:** on a host with Linux 5d39580f68e6 the program
-  is only kept in Appine, so a drop-everything filter (dockerd's on each port it publishes, until
-  its DNAT rules are in place) still lets connections through and other programs see unfiltered
-  data; a guest filter that the host accepts on an older kernel does filter.
+- **Host-refused TCP filters:** a held RET 0 can give connecting peers immediate refusal
+  instead of Linux's silent drop and retransmission. A conflicting socket already bound with
+  `SO_REUSEADDR` can defer a port conflict until activation. General packet-dependent filters,
+  drop on an active TCP socket, and port sharing with `SO_REUSEPORT` are unsupported in the fallback.
 - **`/proc/net/snmp` omits MPTCP sockets:** MPTCP sockets are left out of the Tcp counters and
   `CurrEstab`, where Linux counts their subflows.
 

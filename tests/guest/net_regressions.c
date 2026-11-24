@@ -22,6 +22,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "sockfilter.h"
+
 /* Self-contained Linux UAPI definitions (musl-gcc has no linux UAPI headers). */
 #ifndef SO_ATTACH_BPF
 #define SO_ATTACH_BPF 50
@@ -1218,7 +1220,7 @@ static void nft_put_expr(struct nlbuf *b, const char *name, const uint8_t *data,
     nl_attr_end(b, el);
 }
 
-static void test_dualstack_dnat_and_close_wait_peer(void)
+static void test_dualstack_dnat_and_close_wait_peer(int filtered)
 {
     struct in_addr host_ip = {0};
     if (!find_non_lo_ipv4(&host_ip)) {
@@ -1226,12 +1228,16 @@ static void test_dualstack_dnat_and_close_wait_peer(void)
         return;
     }
 
+    if (filtered)
+        alarm(30);
     int p2c[2], c2p[2];
     CHECK(pipe(p2c) == 0 && pipe(c2p) == 0, "pipe");
     pid_t child = fork();
     CHECK(child >= 0, "fork");
 
     if (child == 0) {
+        if (filtered)
+            alarm(30);
         close(p2c[1]);
         close(c2p[0]);
         CHECK(unshare(CLONE_NEWNET) == 0, "child unshare");
@@ -1336,6 +1342,15 @@ static void test_dualstack_dnat_and_close_wait_peer(void)
     socklen_t s6len = sizeof sin6;
     CHECK(getsockname(srv6, (struct sockaddr *)&sin6, &s6len) == 0 && sin6.sin6_port != 0,
           "getsockname srv6");
+    if (filtered) {
+        /* One classic BPF RET 0, on a host that refuses attachment to TCP. */
+        struct sock_filter drop = {.code = BPF_RET | BPF_K};
+        struct sock_fprog prog = {1, &drop};
+        CHECK(syscall(TEST_SYSCALL, HOOK_REFUSE_TCP_FILTERS, 1) == 0, "force host refusal");
+        CHECK(setsockopt(srv6, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof prog) == 0,
+              "attach RET 0");
+        CHECK(fcntl(srv6, F_SETFL, O_NONBLOCK) == 0, "nonblocking filtered listener");
+    }
     CHECK(listen(srv6, 4) == 0, "listen srv6");
 
     /* Install IPv4 PREROUTING DNAT matching TCP dport == sin6.sin6_port -> 10.91.0.2:18080 */
@@ -1414,6 +1429,16 @@ static void test_dualstack_dnat_and_close_wait_peer(void)
     CHECK(send(cli, "ping", 4, 0) == 4, "send ping");
     CHECK(read(c2p[0], &b, 1) == 1, "wait child accepted");
 
+    if (filtered) {
+        CHECK(accept(srv6, NULL, NULL) < 0 && errno == EAGAIN, "private forwarding queue");
+        int other = socket(AF_INET6, SOCK_STREAM, 0);
+        CHECK(other >= 0 && setsockopt(other, SOL_SOCKET, SO_REUSEPORT, &(int){1}, sizeof(int)) == 0,
+              "reuseport");
+        CHECK(bind(other, (struct sockaddr *)&sin6, sizeof sin6) < 0 && errno == EADDRINUSE,
+              "exclusive DNAT listener");
+        close(other);
+    }
+
     /* Close cli with RST so forwarder aborts relay and removes OUTSIDE entry while child is in CLOSE_WAIT */
     struct linger lg = {.l_onoff = 1, .l_linger = 0};
     CHECK(setsockopt(cli, SOL_SOCKET, SO_LINGER, &lg, sizeof lg) == 0, "cli SO_LINGER");
@@ -1427,6 +1452,23 @@ static void test_dualstack_dnat_and_close_wait_peer(void)
     struct nlbuf delt;
     nft_table_msg(&delt, NFT_MSG_DELTABLE, NLM_F_ACK, 4, "fwdt");
     CHECK(nft_batch_one(nf, &delt) == 0, "delete fwdt");
+
+    if (filtered) {
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(c >= 0 && connect(c, (struct sockaddr *)&dst, sizeof dst) < 0 && errno == ECONNREFUSED,
+              "withdrawn DNAT closed");
+        close(c);
+        CHECK(setsockopt(srv6, SOL_SOCKET, SO_DETACH_FILTER, &zero, sizeof zero) == 0,
+              "detach after withdrawal");
+        CHECK(accept(srv6, NULL, NULL) < 0 && errno == EAGAIN, "empty queue after withdrawal");
+        c = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(c >= 0 && connect(c, (struct sockaddr *)&dst, sizeof dst) == 0,
+              "original port after detach");
+        int accepted = accept(srv6, NULL, NULL);
+        CHECK(accepted >= 0, "guest accepts on original port");
+        close(accepted);
+        close(c);
+    }
 
     struct nlbuf vb;
     nl_init(&vb, RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK, 31);
@@ -1443,8 +1485,13 @@ static void test_dualstack_dnat_and_close_wait_peer(void)
     ok("dualstack_dnat_and_close_wait_peer");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "filtered-dnat") == 0) {
+        test_dualstack_dnat_and_close_wait_peer(1);
+        printf("all ok\n");
+        return 0;
+    }
     test_so_attach_bpf();
     test_waitall_preserves_error();
     test_sendto_validation();
@@ -1454,7 +1501,7 @@ int main(void)
     test_netlink();
     test_rawicmp_shut_rd();
     test_nft_control_plane();
-    test_dualstack_dnat_and_close_wait_peer();
+    test_dualstack_dnat_and_close_wait_peer(0);
     printf("all ok\n");
     return 0;
 }

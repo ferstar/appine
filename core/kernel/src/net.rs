@@ -148,11 +148,28 @@ pub(crate) struct InetSocket {
     pub local_map: Option<(u16, u16)>,
     /// Connected to a mapped low port on the local machine: (guest port, host port).
     pub peer_map: Option<(u16, u16)>,
-    /// A classic BPF program attached with `SO_ATTACH_FILTER` that the host refused (a host with
-    /// Linux 5d39580f68e6 lets only `CAP_NET_ADMIN` attach one to a TCP socket, and the app never
-    /// has it), kept here as the guest gave it so that `SO_GET_FILTER`, `SO_DETACH_FILTER` and
-    /// accepted sockets see it as on Linux. It filters nothing.
+    /// A host-refused constant-verdict filter, retained for SO_GET_FILTER.
     pub filter: Option<Vec<u8>>,
+    /// Guest listen under a host-refused RET 0. The guest fd stays bound until detach.
+    pub deferred: Option<Box<DeferredListen>>,
+}
+
+pub(crate) struct DeferredListen {
+    pub backlog: i32,
+    pub reuse_addr: i32,
+    /// Only the DNAT forwarder can accept from this separate queue.
+    pub forward: Option<ForwardListener>,
+}
+
+pub(crate) struct ForwardListener(pub std::os::fd::OwnedFd);
+
+impl Drop for ForwardListener {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // The forwarding thread can still be polling its dup. Stop the listener and discard
+        // its backlog synchronously when the rule goes away.
+        let _ = appine_hal::net::shutdown(self.0.as_raw_fd(), 2);
+    }
 }
 
 impl InetSocket {
@@ -199,11 +216,23 @@ impl InetSocket {
             local_map: None,
             peer_map: None,
             filter: None,
+            deferred: None,
         }
     }
 }
 
 impl InetSocket {
+    /// Guest-visible state for the TCP tables in /proc/net.
+    fn tcp_state(&self) -> u8 {
+        if self.deferred.is_some() {
+            return TCP_LISTEN;
+        }
+        appine_hal::net::getsockopt(self.fd, IPPROTO_TCP, TCP_INFO, 8)
+            .ok()
+            .and_then(|info| info.first().copied())
+            .unwrap_or(TCP_CLOSE)
+    }
+
     /// An ICMPv6 socket (a ping socket, or the one emulating a raw socket): IPv4-mapped addresses
     /// cannot be used in a new network namespace ([`crate::netns::to_host`]).
     pub fn icmp6(&self) -> bool {
@@ -1626,11 +1655,11 @@ fn align4(b: &mut Vec<u8>) {
 
 const SOL_SOCKET: i32 = 1;
 const SO_PROTOCOL: i32 = 38;
-const TCP_INFO: i32 = 11;
+pub(crate) const TCP_INFO: i32 = 11;
 /// The st column of `/proc/net` (Linux's TCP states; UDP borrows two of them too).
 const TCP_ESTABLISHED: u8 = 1;
-const TCP_CLOSE: u8 = 7;
-const TCP_LISTEN: u8 = 10;
+pub(crate) const TCP_CLOSE: u8 = 7;
+pub(crate) const TCP_LISTEN: u8 = 10;
 
 /// The tables under `/proc/net` that list sockets.
 #[derive(Clone, Copy, PartialEq)]
@@ -1726,10 +1755,7 @@ pub(crate) fn proc_listing(
                 .or_else(|| inet.peer.clone())
         };
         let state = if tcp {
-            appine_hal::net::getsockopt(fd, IPPROTO_TCP, TCP_INFO, 8)
-                .ok()
-                .and_then(|b| b.first().copied())
-                .unwrap_or(TCP_CLOSE)
+            inet.tcp_state()
         } else if peer.is_some() {
             TCP_ESTABLISHED
         } else {
@@ -1807,10 +1833,7 @@ pub(crate) fn sockstat(sockets: &[(crate::syscall::SocketRef, u32)], v6: bool) -
         ));
         if inet.ty == SOCK_STREAM && proto == Some(IPPROTO_TCP) {
             alloc += 1;
-            let state = appine_hal::net::getsockopt(inet.fd, IPPROTO_TCP, TCP_INFO, 8)
-                .ok()
-                .and_then(|b| b.first().copied());
-            if inet.family == family && state.is_some_and(|s| s != TCP_CLOSE) {
+            if inet.family == family && inet.tcp_state() != TCP_CLOSE {
                 tcp += 1;
             }
             continue;
@@ -1930,8 +1953,7 @@ pub(crate) fn proc_snmp(
                 return false;
             };
             (inet.ty, inet.proto) == (SOCK_STREAM, IPPROTO_TCP)
-                && appine_hal::net::getsockopt(inet.fd, IPPROTO_TCP, TCP_INFO, 8)
-                    .is_ok_and(|b| b.first() == Some(&TCP_ESTABLISHED))
+                && inet.tcp_state() == TCP_ESTABLISHED
         })
         .count() as u64;
     let line = |group: &str, names: &[&str], values: &[String]| {

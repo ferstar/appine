@@ -439,6 +439,19 @@ struct fuse_ctx {
     _Atomic int slot_reserved;
 };
 
+/* Independent inodes keep demand reads for one receive output from warming another. */
+static uint64_t fuse_file_node(const char *name)
+{
+    static const char *const files[] = {
+        "data", "recv-data", "recv-peer", "recv-peer-len", "batch-len", "batch-data",
+        "batch-peer", "rights-control", "unix-data",
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++)
+        if (strcmp(name, files[i]) == 0)
+            return 2 + i;
+    return 0;
+}
+
 static void *fuse_daemon(void *arg)
 {
     struct fuse_ctx *ctx = (struct fuse_ctx *)arg;
@@ -481,13 +494,14 @@ static void *fuse_daemon(void *arg)
             memcpy(out + sizeof(*hdr), &a, sizeof(a));
         } else if (in.opcode == 1 /* FUSE_LOOKUP */) {
             const char *name = (const char *)(buf + sizeof(in));
-            if (strcmp(name, "data") == 0) {
+            uint64_t node = fuse_file_node(name);
+            if (node) {
                 struct fuse_entry_out e;
                 memset(&e, 0, sizeof(e));
-                e.nodeid = 2;
+                e.nodeid = node;
                 e.entry_valid = 60;
                 e.attr_valid = 60;
-                e.attr.ino = 2;
+                e.attr.ino = node;
                 e.attr.mode = S_IFREG | 0444;
                 e.attr.nlink = 1;
                 e.attr.size = ctx->file_size;
@@ -807,84 +821,105 @@ static void test_pagemap_cow_lent_not_exclusive(void)
     munmap(p, 4096);
 }
 
-/* Each output has its own unread mapping. Filling any of them must not receive another packet. */
-static int recvfrom_fuse_outputs(int fd)
+static void *map_receive_page(int dir, const char *name, void *at)
 {
-    unsigned char *data = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    struct sockaddr_in *peer = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    socklen_t *peer_len = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    CHECK(data != MAP_FAILED && peer != MAP_FAILED && peer_len != MAP_FAILED, "map recvfrom outputs");
-    /* The daemon fills page zero with 0x40, so the initial socklen is large enough. */
+    int fd = openat(dir, name, O_RDONLY);
+    CHECK(fd >= 0, "open FUSE output %s", name);
+    void *p = mmap(at, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | (at ? MAP_FIXED : 0), fd, 0);
+    CHECK(p != MAP_FAILED && (!at || p == at), "map FUSE output %s", name);
+    close(fd);
+    return p;
+}
+
+static int bind_loopback_udp(struct sockaddr_in *addr)
+{
+    *addr = (struct sockaddr_in){.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof(*addr);
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
-    socklen_t len = sizeof(addr);
-    CHECK(sock >= 0 && bind(sock, (struct sockaddr *)&addr, len) == 0, "bind UDP socket");
-    CHECK(getsockname(sock, (struct sockaddr *)&addr, &len) == 0, "get UDP port");
-    CHECK(sendto(sock, "A", 1, 0, (struct sockaddr *)&addr, len) == 1, "queue A");
-    CHECK(sendto(sock, "B", 1, 0, (struct sockaddr *)&addr, len) == 1, "queue B");
-    int first = recvfrom(sock, data, 1, MSG_DONTWAIT, (struct sockaddr *)peer, peer_len) == 1 &&
-                *data == 'A' && *peer_len == sizeof(addr) && peer->sin_family == AF_INET &&
-                peer->sin_port == addr.sin_port;
-    int second = recv(sock, data, 1, MSG_DONTWAIT) == 1 && *data == 'B';
+    CHECK(sock >= 0 && bind(sock, (struct sockaddr *)addr, len) == 0, "bind UDP socket");
+    CHECK(getsockname(sock, (struct sockaddr *)addr, &len) == 0 && len == sizeof(*addr),
+          "get bound UDP address");
+    return sock;
+}
+
+/* Each byte is a separate datagram so the receiver can check queue order. */
+static void queue_datagrams(int sock, const struct sockaddr_in *addr, const char *bytes)
+{
+    for (; *bytes; bytes++)
+        CHECK(sendto(sock, bytes, 1, 0, (const struct sockaddr *)addr, sizeof(*addr)) == 1,
+              "queue datagram %c", *bytes);
+}
+
+/* Filling the three output mappings must not receive another packet. */
+static void recvfrom_fuse_outputs(int dir, struct fuse_ctx *ctx)
+{
+    unsigned char *data = map_receive_page(dir, "recv-data", NULL);
+    struct sockaddr_in *peer = map_receive_page(dir, "recv-peer", NULL);
+    /* The daemon fills page zero with 0x40, so the initial socklen is large enough. */
+    socklen_t *peer_len = map_receive_page(dir, "recv-peer-len", NULL);
+    struct sockaddr_in addr;
+    int sock = bind_loopback_udp(&addr);
+    queue_datagrams(sock, &addr, "AB");
+    int reads = ctx->read_ops;
+    ssize_t n = recvfrom(sock, data, 1, MSG_DONTWAIT, (struct sockaddr *)peer, peer_len);
+    CHECK(ctx->read_ops - reads >= 3, "recvfrom must fault in data, peer and peer length");
+    CHECK(n == 1 && *data == 'A', "recvfrom first datagram");
+    CHECK(*peer_len == sizeof(addr) && peer->sin_family == AF_INET &&
+          peer->sin_port == addr.sin_port, "recvfrom peer address");
+    CHECK(recv(sock, data, 1, MSG_DONTWAIT) == 1 && *data == 'B', "recvfrom second datagram");
     close(sock);
     munmap(peer_len, 4096);
     munmap(peer, 4096);
     munmap(data, 4096);
-    return first && second;
 }
 
 /* Put the second msg_len alone on an unread FUSE page. Three queued messages make a
  * replay visible even when the first payload and source address also fault. */
-static int recvmmsg_fuse_outputs(int fd, struct fuse_ctx *ctx)
+static void recvmmsg_fuse_outputs(int dir, struct fuse_ctx *ctx)
 {
     const size_t page = 4096;
     char *pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     CHECK(pages != MAP_FAILED, "allocate mmsghdr array");
-    CHECK(mmap(pages + page, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0) ==
-          pages + page, "map final msg_len");
+    map_receive_page(dir, "batch-len", pages + page);
     struct mmsghdr *batch = (void *)(pages + page - offsetof(struct mmsghdr, msg_len) -
                                       sizeof(struct mmsghdr));
-    char *data = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    struct sockaddr_in *peer = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    CHECK(data != MAP_FAILED && peer != MAP_FAILED, "map recvmsg outputs");
+    char *data = map_receive_page(dir, "batch-data", NULL);
+    struct sockaddr_in *peer = map_receive_page(dir, "batch-peer", NULL);
     struct iovec iov[] = {{data, 1}, {data + 1, 1}};
     batch[0].msg_hdr = (struct msghdr){.msg_name = peer, .msg_namelen = sizeof(*peer),
                                         .msg_iov = iov, .msg_iovlen = 1};
     batch[1].msg_hdr = (struct msghdr){.msg_iov = iov + 1, .msg_iovlen = 1};
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
-    socklen_t len = sizeof(addr);
-    CHECK(sock >= 0 && bind(sock, (struct sockaddr *)&addr, len) == 0, "bind recvmmsg socket");
-    CHECK(getsockname(sock, (struct sockaddr *)&addr, &len) == 0, "get recvmmsg address");
-    for (char c = 'A'; c <= 'C'; c++)
-        CHECK(sendto(sock, &c, 1, 0, (struct sockaddr *)&addr, len) == 1, "queue recvmmsg packet");
+    struct sockaddr_in addr;
+    int sock = bind_loopback_udp(&addr);
+    queue_datagrams(sock, &addr, "ABC");
     int original = dup(sock);
     CHECK(original >= 0, "keep original recvmmsg socket");
+    int reads = ctx->read_ops;
     ctx->batch_fd = sock;
     int count = syscall(SYS_recvmmsg, sock, batch, 2, MSG_DONTWAIT, NULL);
-    int replaced = ctx->batch_fd == 0;
-    ctx->batch_fd = 0;
+    CHECK(ctx->read_ops - reads >= 3, "recvmmsg must fault in data, peer and final msg_len");
+    CHECK(ctx->batch_fd == 0, "daemon replaced batch fd during receive");
     close(sock);
     sock = original;
     char tail;
-    int ok = replaced && count == 2 && !memcmp(data, "AB", 2) && batch[0].msg_len == 1 &&
-             batch[1].msg_len == 1 && batch[0].msg_hdr.msg_namelen == len &&
-             peer->sin_port == addr.sin_port && recv(sock, &tail, 1, MSG_DONTWAIT) == 1 && tail == 'C';
+    CHECK(count == 2 && !memcmp(data, "AB", 2) && batch[0].msg_len == 1 && batch[1].msg_len == 1,
+          "recvmmsg first two datagrams");
+    CHECK(batch[0].msg_hdr.msg_namelen == sizeof(addr) && peer->sin_port == addr.sin_port,
+          "recvmmsg peer address");
+    CHECK(recv(sock, &tail, 1, MSG_DONTWAIT) == 1 && tail == 'C', "recvmmsg remaining datagram");
     /* An actual fault writing the second length still returns the completed first record. */
     CHECK(mprotect(pages + page, page, PROT_NONE) == 0, "protect second msg_len");
-    for (char c = 'D'; c <= 'F'; c++)
-        CHECK(sendto(sock, &c, 1, 0, (struct sockaddr *)&addr, len) == 1, "queue partial batch");
+    queue_datagrams(sock, &addr, "DEF");
     count = syscall(SYS_recvmmsg, sock, batch, 2, MSG_DONTWAIT, NULL);
-    ok = ok && count == 1 && data[0] == 'D' &&
-         recv(sock, &tail, 1, MSG_DONTWAIT) == 1 && tail == 'F';
+    CHECK(count == 1 && data[0] == 'D', "recvmmsg completed record before msg_len fault");
+    CHECK(recv(sock, &tail, 1, MSG_DONTWAIT) == 1 && tail == 'F', "datagram after partial batch");
     close(sock);
     munmap(peer, page);
     munmap(data, page);
     munmap(pages, 2 * page);
-    return ok;
 }
 
-static int recvmsg_fuse_rights(int fd, struct fuse_ctx *ctx)
+static void recvmsg_fuse_rights(int dir, struct fuse_ctx *ctx)
 {
     int sockets[2], pipefd[2];
     CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0 && pipe(pipefd) == 0, "SCM_RIGHTS setup");
@@ -904,27 +939,26 @@ static int recvmsg_fuse_rights(int fd, struct fuse_ctx *ctx)
     byte = 'C';
     CHECK(sendmsg(sockets[0], &msg, 0) == 1, "send rights to read-only header");
     close(pipefd[1]);
-    void *control = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    CHECK(control != MAP_FAILED, "map SCM_RIGHTS output");
+    void *control = map_receive_page(dir, "rights-control", NULL);
     msg.msg_control = control;
     byte = 0;
     ctx->receiving_fd = pipefd[1];
-    int ok = recvmsg(sockets[1], &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC) == 1 && byte == 'A' &&
-             !(msg.msg_flags & MSG_CTRUNC) && (cmsg = CMSG_FIRSTHDR(&msg)) &&
-             cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
-             cmsg->cmsg_len == CMSG_LEN(sizeof(int));
+    ssize_t n = recvmsg(sockets[1], &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
     ctx->receiving_fd = 0;
-    ok = ok && ctx->slot_reserved;
-    if (ok) {
-        int received;
-        memcpy(&received, CMSG_DATA(cmsg), sizeof(received));
-        ok = fcntl(received, F_GETFD) == FD_CLOEXEC && write(received, "X", 1) == 1;
-        close(received);
-    }
+    CHECK(n == 1 && byte == 'A' && !(msg.msg_flags & MSG_CTRUNC), "receive first rights");
+    CHECK(ctx->slot_reserved, "reserve received fd during control-buffer fault");
+    cmsg = CMSG_FIRSTHDR(&msg);
+    CHECK(cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+          cmsg->cmsg_len == CMSG_LEN(sizeof(int)), "received rights header");
+    int received;
+    memcpy(&received, CMSG_DATA(cmsg), sizeof(received));
+    CHECK(fcntl(received, F_GETFD) == FD_CLOEXEC, "received fd has CLOEXEC");
+    CHECK(write(received, "X", 1) == 1, "write through received fd");
+    close(received);
     CHECK(mprotect(control, 4096, PROT_NONE) == 0, "protect control buffer");
     msg.msg_controllen = sizeof(sent.bytes);
-    int truncated = recvmsg(sockets[1], &msg, MSG_DONTWAIT) == 1 && byte == 'B' &&
-                    (msg.msg_flags & MSG_CTRUNC) && msg.msg_controllen == 0;
+    CHECK(recvmsg(sockets[1], &msg, MSG_DONTWAIT) == 1 && byte == 'B' &&
+          (msg.msg_flags & MSG_CTRUNC) && msg.msg_controllen == 0, "truncate inaccessible rights");
     struct msghdr *readonly = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     CHECK(readonly != MAP_FAILED, "map read-only message header");
@@ -933,21 +967,19 @@ static int recvmsg_fuse_rights(int fd, struct fuse_ctx *ctx)
     *readonly = msg;
     CHECK(mprotect(readonly, 4096, PROT_READ) == 0, "protect message header");
     /* musl copies msg_flags back in userspace. Pass the protected header directly to the kernel. */
-    int faulted = syscall(SYS_recvmsg, sockets[1], readonly, MSG_DONTWAIT) == -1 &&
-                  errno == EFAULT && byte == 'C';
+    CHECK(syscall(SYS_recvmsg, sockets[1], readonly, MSG_DONTWAIT) == -1 &&
+          errno == EFAULT && byte == 'C', "report fault writing read-only message header");
     munmap(readonly, 4096);
     CHECK(fcntl(pipefd[0], F_SETFL, O_NONBLOCK) == 0, "nonblocking rights check");
-    ok = ok && truncated && faulted && read(pipefd[0], &byte, 1) == 1 && byte == 'X' &&
-         read(pipefd[0], &byte, 1) == 0;
+    CHECK(read(pipefd[0], &byte, 1) == 1 && byte == 'X', "read byte from received fd");
+    CHECK(read(pipefd[0], &byte, 1) == 0, "all received pipe writers closed");
     int available = fcntl(pipefd[0], F_DUPFD, pipefd[1]);
-    ok = ok && available == pipefd[1];
-    if (available >= 0)
-        close(available);
+    CHECK(available == pipefd[1], "received fd slot released");
+    close(available);
     munmap(control, 4096);
     /* A Unix datagram stays queued when its payload copy encounters an unread page. A fault
      * on the second record must retry that record even though the batch already made progress. */
-    char *second = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    CHECK(second != MAP_FAILED, "map second Unix datagram");
+    char *second = map_receive_page(dir, "unix-data", NULL);
     struct iovec second_iov = {second, 1};
     struct mmsghdr batch[] = {
         {.msg_hdr = {.msg_iov = &iov, .msg_iovlen = 1}},
@@ -955,14 +987,15 @@ static int recvmsg_fuse_rights(int fd, struct fuse_ctx *ctx)
     };
     CHECK(send(sockets[0], "D", 1, 0) == 1 && send(sockets[0], "E", 1, 0) == 1,
           "queue Unix datagrams");
+    int reads = ctx->read_ops;
     int count = syscall(SYS_recvmmsg, sockets[1], batch, 2, MSG_DONTWAIT, NULL);
-    ok = ok && count == 2 && batch[0].msg_len == 1 && batch[1].msg_len == 1 &&
-         byte == 'D' && *second == 'E';
+    CHECK(ctx->read_ops > reads, "second Unix datagram must fault in its payload buffer");
+    CHECK(count == 2 && batch[0].msg_len == 1 && batch[1].msg_len == 1 &&
+          byte == 'D' && *second == 'E', "Unix datagram batch after payload fault");
     munmap(second, 4096);
     close(pipefd[0]);
     close(sockets[0]);
     close(sockets[1]);
-    return ok;
 }
 
 /* 8. FUSE short-read on-demand mapping does not permanently zero unread tail pages */
@@ -976,9 +1009,12 @@ static void test_fuse_short_read_mapping(void)
     CHECK(fd >= 0, "open fuse data");
     uint8_t *m = mmap(NULL, 16 * 4096, PROT_READ, MAP_PRIVATE, fd, 0);
     CHECK(m != MAP_FAILED, "mmap fuse data");
-    int received_in_order = recvfrom_fuse_outputs(fd);
-    int batch_in_order = recvmmsg_fuse_outputs(fd, &ctx);
-    int rights_delivered = recvmsg_fuse_rights(fd, &ctx);
+    int dir = open("/tmp/fuse_short", O_RDONLY | O_DIRECTORY);
+    CHECK(dir >= 0, "open FUSE fixture directory");
+    recvfrom_fuse_outputs(dir, &ctx);
+    recvmmsg_fuse_outputs(dir, &ctx);
+    recvmsg_fuse_rights(dir, &ctx);
+    close(dir);
     close(fd);
     int prior_reads = ctx.read_ops;
 
@@ -994,9 +1030,6 @@ static void test_fuse_short_read_mapping(void)
     pthread_join(th, NULL);
     close(ctx.devfd);
     rmdir("/tmp/fuse_short");
-    CHECK(batch_in_order && rights_delivered, "FUSE recvmmsg batch=%d, SCM_RIGHTS=%d",
-          batch_in_order, rights_delivered);
-    CHECK(received_in_order, "FUSE output faults must preserve both datagrams and the peer address");
 }
 
 /* 9. execve returns ETXTBSY for writable nested `#!` script and writable ELF PT_INTERP */

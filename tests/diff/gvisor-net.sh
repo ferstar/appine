@@ -38,6 +38,9 @@ SKIP="$SKIP:NetlinkRouteTest.VethAddRefusedPeerNetnsLeavesNothing"
 # Cannot be compared: skips itself on a kernel without Linux 5d39580f68e6 (the dev VM's 6.8), while
 # Appine refuses SO_ATTACH_FILTER on TCP without CAP_NET_ADMIN as 6.1.y does
 SKIP="$SKIP:AllInetTests/SimpleTcpSocketTest.SetSocketAttachFilterWithoutNetAdmin/*"
+# kernel/net: this test installs a packet-dependent TCP filter. A privileged native container
+# can install it on restricted hosts; Appine reports EOPNOTSUPP when its host refuses it.
+SKIP="$SKIP:AllInetTests/SimpleTcpSocketTest.SetSocketAttachDetachFilter/*"
 sh /tmp/difftest-files/gtest/run.sh gvisor "$SKIP" tcp_socket_test bind_test \
     socket_ip_unbound_test socket_netlink_test socket_netlink_route_test proc_net_test epoll_test \
     poll_test

@@ -1928,6 +1928,8 @@ pub(crate) struct Packet<'a> {
     /// Addresses: 4 bytes for IPv4, 16 bytes for IPv6.
     pub src: &'a [u8],
     pub dst: &'a [u8],
+    /// Destination address as the connection first entered this namespace.
+    pub original_dst: &'a [u8],
     pub proto: u8,
     pub sport: u16,
     pub dport: u16,
@@ -2863,14 +2865,32 @@ impl Eval<'_> {
                 (want & UID == 0 || uid_ok) && (want & GID == 0 || gid_ok)
             }
             // Connection tracking state: in xt_conntrack_mtinfo1..3, match_flags and invert_flags
-            // are at 146 and 148, and state_mask at 150 (one byte in revision 1); only
-            // XT_CONNTRACK_STATE (and STATE_ALIAS) are recognized
+            // are at 146 and 148, and state_mask at 150 (one byte in revision 1).
+            // State and original destination can be combined, each with its own inversion.
             b"conntrack" => {
                 let (Some(flags), Some(inv)) = (ne16(146), ne16(148)) else {
                     return false;
                 };
-                if flags & !(1 | 0x2000) != 0 {
+                const ORIGDST: u16 = 1 << 3;
+                if flags & !(1 | ORIGDST | 0x2000) != 0 {
                     return false;
+                }
+                if flags & ORIGDST != 0 {
+                    let len = self.p.original_dst.len();
+                    let (Some(addr), Some(mask)) = (info.get(32..32 + len), info.get(48..48 + len))
+                    else {
+                        return false;
+                    };
+                    let matches = self
+                        .p
+                        .original_dst
+                        .iter()
+                        .zip(addr)
+                        .zip(mask)
+                        .all(|((&ip, &addr), &mask)| (ip ^ addr) & mask == 0);
+                    if matches == (inv & ORIGDST != 0) {
+                        return false;
+                    }
                 }
                 let mask = if rev == 1 {
                     info.get(150).map(|&b| u16::from(b))
@@ -3334,6 +3354,7 @@ mod tests {
         Packet {
             src: &[127, 0, 0, 1],
             dst,
+            original_dst: dst,
             proto,
             sport: 33000,
             dport,

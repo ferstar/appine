@@ -207,36 +207,10 @@ fn bugs_kill_only_the_guest_process() {
 }
 
 #[test]
-fn tcp_filters_refused_by_the_host_are_kept() {
-    // A host with Linux 5d39580f68e6 refuses SO_ATTACH_FILTER on TCP sockets to the app (made so
-    // with a test hook of debug builds, since it depends on the host's kernel): a guest with
-    // CAP_NET_ADMIN still attaches, reads back, replaces and detaches the program, accepted
-    // sockets inherit it, a locked one stays, and one without the capability gets EPERM
-    if !cfg!(debug_assertions) {
-        return;
-    }
-    let Some(program) = build_c_guest("sockfilter") else {
-        return;
-    };
-    for tier in TIERS {
-        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
-            .args(["--tier", tier])
-            .env("APPINE_TEST_HOOKS", "1")
-            .arg(&program)
-            .output()
-            .expect("failed to run appine-run");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "tier {tier}: {}{}",
-            stdout(&out),
-            stderr(&out)
-        );
-        assert!(
-            stdout(&out).ends_with("all ok\n"),
-            "tier {tier}: {}",
-            stdout(&out)
-        );
+fn tcp_filters_refused_by_the_host() {
+    if cfg!(debug_assertions) {
+        run_c_guest_with("sockfilter", &[], true);
+        run_c_guest_with("net_regressions", &["filtered-dnat"], true);
     }
 }
 
@@ -870,13 +844,22 @@ fn missing_program_exits_127() {
 }
 
 fn run_c_guest(name: &str) {
+    run_c_guest_with(name, &[], false);
+}
+
+fn run_c_guest_with(name: &str, args: &[&str], test_hooks: bool) {
     let Some(program) = build_c_guest(name) else {
         return;
     };
     for tier in TIERS {
-        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+        let mut run = Command::new(env!("CARGO_BIN_EXE_appine-run"));
+        if test_hooks {
+            run.env("APPINE_TEST_HOOKS", "1");
+        }
+        let out = run
             .args(["--tier", tier])
             .arg(&program)
+            .args(args)
             .output()
             .expect("failed to run appine-run");
         assert_eq!(

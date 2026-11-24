@@ -308,7 +308,7 @@ const SYS_GPU: &[&[u8]] = &[
 /// `/proc`, directories ending in `/`). Those under `sys/net` follow the reader's network namespace
 /// (as on Linux), and the directories under `ipv4/conf` and `ipv6/conf` are
 /// [`PseudoNode::NetConf`].
-const STATIC: [&[u8]; 129] = [
+const STATIC: [&[u8]; 131] = [
     b"sys/",
     b"sys/debug/",
     b"sys/debug/exception-trace",
@@ -397,6 +397,8 @@ const STATIC: [&[u8]; 129] = [
     b"sys/kernel/unprivileged_bpf_disabled",
     b"sys/kernel/version",
     b"sys/net/",
+    b"sys/net/bridge/",
+    b"sys/net/bridge/bridge-nf-call-iptables",
     b"sys/net/core/",
     b"sys/net/core/somaxconn",
     b"sys/net/ipv4/",
@@ -2400,7 +2402,8 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
     if let PseudoNode::NetStatic(p, _) = node {
         return matches!(
             *p,
-            b"sys/net/core/somaxconn"
+            b"sys/net/bridge/bridge-nf-call-iptables"
+                | b"sys/net/core/somaxconn"
                 | b"sys/net/ipv4/ip_forward"
                 | b"sys/net/ipv4/ip_local_port_range"
                 | b"sys/net/ipv4/ip_unprivileged_port_start"
@@ -2673,6 +2676,9 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             }
         }
         NetStatic(path, net) => match &path[..] {
+            b"sys/net/bridge/bridge-nf-call-iptables" => {
+                format!("{}\n", u8::from(net.0.devs.borrow().conf.bridge_call_iptables))
+            }
             b"sys/net/core/somaxconn" => format!("{}\n", net.0.devs.borrow().conf.somaxconn),
             b"sys/net/ipv4/ip_forward" => format!("{}\n", crate::netdev::ip_forward(&net.0)),
             b"sys/net/ipv4/ip_local_port_range" => {
@@ -4581,6 +4587,12 @@ pub(crate) fn write(
                 b"forwarding",
                 data,
             );
+        }
+        PseudoNode::NetStatic(b"sys/net/bridge/bridge-nf-call-iptables", net) => {
+            let value =
+                i32::try_from(crate::netconf::parse_int(data)?).map_err(|_| Errno::EINVAL)?;
+            net.0.devs.borrow_mut().conf.bridge_call_iptables = value != 0;
+            return Ok(());
         }
         PseudoNode::NetStatic(b"sys/net/core/somaxconn", net) => {
             let v = crate::netconf::parse_int(data)?;

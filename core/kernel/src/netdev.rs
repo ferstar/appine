@@ -2954,6 +2954,25 @@ pub(crate) fn route_v4(ns: &NetNs, ip: [u8; 4]) -> Option<Entry> {
         .min_by_key(|e| (std::cmp::Reverse(e.prefix), e.metric))
 }
 
+/// The bridge traversed by an on-link IPv4 packet between two veth endpoints.
+pub(crate) fn shared_bridge(from: &NetNs, to: &NetNs, dst: [u8; 4]) -> Option<DevRef> {
+    let route = route_v4(from, dst)?;
+    if route.gateway.is_some() {
+        return None;
+    }
+    let peer = devs(from).by_index(route.index)?.borrow().peer.upgrade()?;
+    let bridge = peer.borrow().master.upgrade()?;
+    let shares_bridge = devs(to).list.iter().any(|dev| {
+        let dev = dev.borrow();
+        dev.v4.iter().any(|a| a.local == dst)
+            && dev
+                .peer
+                .upgrade()
+                .is_some_and(|peer| peer.borrow().master.ptr_eq(&Rc::downgrade(&bridge)))
+    });
+    shares_bridge.then_some(bridge)
+}
+
 /// Whether namespace `ns` has an IPv6 route to `ip` through virtual devices.
 pub(crate) fn routes_v6(ns: &NetNs, ip: &[u8; 16]) -> bool {
     entries(ns).iter().any(|e| {

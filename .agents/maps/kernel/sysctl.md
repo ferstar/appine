@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: pin network and IPC namespaces on open /proc/sys/net/* and IPC sysctl nodes at lookup time)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-network-namespace IPv4 bridge netfilter switch)
 
 ## Responsibilities
 
@@ -88,7 +88,9 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
   - `net.*` per network namespace, pinned at lookup time (`NetStatic`, `NetConf`, `NetSysctl`) so
     offset-0 rereads and writes keep targeting the lookup namespace (`ip_forward` aliases
     `conf/all/forwarding`; `NetConf` directories per interface; entries flagged init-only exist
-    only in the initial namespace);
+    only in the initial namespace). The static `net/bridge/bridge-nf-call-iptables` leaf defaults
+    to 1 in each namespace. Zero disables IPv4 bridge hooks there and a nonzero signed integer
+    enables them and reads back as 1;
   - `user/max_*_namespaces` per user namespace (the reader's or writer's: the limits of
     `kernel/ns`'s namespace counts, `INT_MAX` by default in a new one, 0 to `INT_MAX`);
   - everything else kernel-wide (`max_map_count`, `mmap_min_addr`, inotify limits, `aio-max-nr`,
