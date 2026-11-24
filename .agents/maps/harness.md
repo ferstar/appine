@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: dedicated CI shard for gVisor filesystem and device tests)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: Galaxy S25 Ultra Adreno 830 native reproduction note)
 
 ## Responsibilities
 
@@ -178,7 +178,7 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
 
 - On Pixel 11 Pro, Alpine llama.cpp b9564 selects incompatible matrix-multiply and Flash Attention tiles for the PowerVR GPU's 128-lane subgroups. Full offload with `-fa off -ub 16` passed both surveyed Qwen2.5 prompts. The native driver also signals zero-batch submission fences early. The [device survey](../../docs/mobile-gpu.md#powervr-correctness) records the independent controls.
 - On Galaxy S23 firmware `S9110ZCS8FZJ1`, llama.cpp b9564 reproduces the Adreno 740 shader link failure during warm-up in both Alpine and native Android. Native runs identify `quantize_q8_1_x4` for both surveyed Qwen2.5 models. The guest logs do not name the shader. The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
-- On Galaxy S25 Ultra firmware `S9380ZCS8BZA1`, Alpine llama.cpp b9564 completes full Vulkan offload on Adreno 830 but produces incorrect text for both surveyed Qwen2.5 prompts. The cause remains open. The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
+- On Galaxy S25 Ultra firmware `S9380ZCS8BZA1`, llama.cpp b9564 reproduces both Adreno 830 failures in Alpine and native Android independently of Appine and Venus: full Vulkan offload completes with incorrect text for both surveyed Qwen2.5 prompts, and `-fa off -ub 16` aborts with a shader link failure on `mul_mat_vec_q4_0_q8_1_f32` (named in native logs). The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
 
 ## Open questions
 

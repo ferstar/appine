@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: wait status and resource usage copyout after a FUSE fault)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: post-syscall sweeps and `Mm::sync` on successful execve/execveat)
 
 ## Responsibilities
 
@@ -175,8 +175,10 @@ and `kernel/oom`.
   and removed overlay nodes swept (`kernel/overlay`), and pending cgroup2 file changes checked
   (`cgroup::notify_changes`, also run at thread exit, freezer stops and by the timer thread); then
   results are translated out (invisible pids become 0), edge-triggered readiness is re-armed after
-  reads, x0 is set, `Mm::sync` runs, then the exit stop and signal delivery. `exit`, `exit_group`,
-  `rt_sigreturn` and a successful `execve` return before the sweeps and `Mm::sync`.
+  reads, x0 is set, `Mm::sync` runs, then the exit stop and signal delivery. A successful `execve`
+  or `execveat` runs the sweeps, drops `InSyscall`, and runs `Mm::sync` on the new address space
+  before `exec_done`. `exit`, `exit_group` and `rt_sigreturn` return before the sweeps and
+  `Mm::sync`.
 - A guest page fault on a FUSE mapping's page not yet read reads it with the BKL released before
   re-executing (`kernel/mm`'s fault order).
 
