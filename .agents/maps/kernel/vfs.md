@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: newfstatat flag validation on the cached and locked paths)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: track tmpfs reservations and mapped data by inode and guest page)
 
 ## Responsibilities
 
@@ -204,23 +204,25 @@ capabilities (`kernel/cred`).
   instance limited, or going below what is in use, is `EINVAL`.
 - Boot instances (`/dev` 0755 nosuid, `/dev/shm` 1777 nosuid,nodev, `/run` 0755 nosuid,nodev with
   20% of RAM and 800Ki inodes) start uncounted: charges are dropped until the first count, at a
-  create, write or fallocate check, a statfs or a remount.
+  create, write, fallocate or mapping allocation check, a statfs or a remount.
 - Accounting per instance: one inode per name plus the root (creates, links, AF_UNIX binds);
-  regular files by the pages their host objects take (holes take none: lengthening by truncation
-  is free, punching gives pages back); symlinks of 128 bytes or more one page. Limits default to
-  half of RAM in pages and inodes; 0 is unlimited. Creates need room (`ENOSPC`, after
-  `may_create`); a write needs room only for its pages holding no data yet (found with the host's
-  `SEEK_DATA`/`SEEK_HOLE` when they might not fit, less pages reserved and unwritten) and is clipped
-  where room ends; fallocate reservations need room for the whole range or fail; truncation is
-  never limited; a removal gives back one inode and its pages at the last link, unless the regular
+  regular files by the union of host extents and guest allocations. Per-inode ranges distinguish
+  fallocate reservations from pages instantiated by a mapping. Either consumes quota once.
+  A mapped read instantiates its page without changing mtime or ctime. Growth by truncation is
+  free and punching whole pages releases them. Symlinks of 128 bytes or more take one page.
+  Limits default to half of RAM in pages and inodes; 0 is unlimited. Creates need room (`ENOSPC`, after
+  `may_create`); a write needs room only for pages outside both recorded allocations and host extents
+  (FIEMAP or a `SEEK_DATA` fallback). Writes stop at the first page that cannot fit. A fallocate reservation needs
+  room for the whole range. Truncation is unlimited; a removal gives back one inode and its pages at the last link, unless the regular
   file is still open, mapped or executing (`file_in_use`), in which case its pages and inode stay
-  charged in `Tmpfs::unlinked` (updated on subsequent writes/truncates, included in counts and
+  charged in `Tmpfs::unlinked`. A pinned object supports stats through the last `O_PATH` fd.
+  Unlinked files are updated on subsequent writes/truncates, included in counts and
   recounts, and evicted by `evict_unlinked_tmpfs` at syscall/thread release, execve close-on-exec,
-  statfs and remount). statfs and remount recount the tree; a create, write or reservation about to
+  statfs and remount. Both statfs and remount recount the tree; a create, write or reservation about to
   be refused or cut recounts once
-  when usage changed since the last count. The mount's filesystem decides what is charged, so
-  changes through an overlay, memfds and the loop nodes `kernel/loop` adds to the boot `/dev` are
-  never checked or charged as they happen; a full count still sees them.
+  when usage changed since the last count. Overlay writes charge a tmpfs upper, and mappings
+  charge the layer supplying the mapped inode. Memfds and boot `/dev` loop nodes bypass the
+  ordinary per-operation hooks.
 
 ### Metadata and namespace syscalls
 
@@ -229,8 +231,9 @@ capabilities (`kernel/cred`).
   anonymous devices for pipes, sockets and anonymous inodes (owned by root), the queue
   filesystem's for message queues, the devpts instance's for an open PTY slave, and the root
   filesystem's on the fast path (which resolves only there); `st_blksize` 4096 (1024 for procfs
-  and devpts nodes stat'ed by path); `st_blocks` of regular store and tmpfs files (and host fds) as
-  the host allocated them, of others from the size (sysfs files 0; symlinks under 60 bytes on the
+  and devpts nodes stat'ed by path); ordinary files and host fds report the host’s `st_blocks`. Tracked
+  tmpfs files count host extents and logical guest pages together. Other nodes use size (sysfs
+  files 0; symlinks under 60 bytes on the
   root filesystem or 128 elsewhere live in the inode); directories report size 4096 on the root
   filesystem. newfstatat and statx accept `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`,
   `AT_NO_AUTOMOUNT` and the `AT_STATX_*` sync flags. newfstatat accepts both sync bits together.
@@ -381,8 +384,6 @@ capabilities (`kernel/cred`).
 - **Fidelity gaps**, one per line:
   - statx: no btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`;
   - no `protected_regular` or `protected_fifos`;
-  - a fault on a mapping of a full tmpfs never raises `SIGBUS`, and shared-mapping writes are
-    counted only at a recount;
   - fstat of an open PTY reports `st_blksize` 4096 (stat by path 1024), epoll's fdinfo shows the
     root filesystem's device for tmpfs files and an anonymous one for overlay and FUSE files, and
     fstatfs of a FIFO reports pipefs;

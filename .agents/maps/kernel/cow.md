@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: replace return_loans try_borrow guard with direct borrow and debug_assert on lend, unshare cow private file VMAs on MADV_DONTNEED)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: preserve private tmpfs pages across fork and hole punching)
 
 ## Responsibilities
 
@@ -70,7 +70,9 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   region holds a private copy (host pagemap: present without the file bit, or swapped; unreadable
   pagemap counts as yes).
 - Per VMA (`MADV_DONTFORK` VMAs are skipped; the child's VMAs keep `dontdump` and `wipeonfork`):
-  - shared mappings, reservations and read-only private file mappings share the parent's region;
+  - private tmpfs mappings get a fresh private view of the pinned file. Fork copies only pages
+    already written privately. Clean pages keep following the backing file and its quota.
+  - shared mappings, reservations and other read-only private file mappings share the parent's region;
     read-only private file VMAs are marked `cow` on both sides;
   - non-growsdown, non-reserved, non-heap anonymous or writable private-file VMAs of at most 1 MB
     are carved (`carve`) from one `spare` region (`kernel/hostmem`);

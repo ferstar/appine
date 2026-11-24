@@ -1303,12 +1303,12 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
         }
         PR_SET_NO_NEW_PRIVS if arg == 1 => {
             unused(1)?;
-            cx.t.group.borrow_mut().no_new_privs = true;
+            cx.task.no_new_privs.set(true);
             Ok(0)
         }
         PR_GET_NO_NEW_PRIVS => {
             unused(0)?;
-            Ok(cx.t.group.borrow().no_new_privs as u64)
+            Ok(cx.task.no_new_privs.get() as u64)
         }
         PR_GET_KEEPCAPS => Ok(cx.cred().keep_caps() as u64),
         PR_SET_KEEPCAPS if arg <= 1 => {

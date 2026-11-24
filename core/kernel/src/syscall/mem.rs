@@ -109,6 +109,7 @@ pub(super) fn mmap(
     let mut gpu_mapping = None;
     let mut fuse_fill = None;
     let mut mapping_object = None;
+    let mut tmpfs = None;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         if low && len != 0 {
             return Err(Errno::EPERM);
@@ -170,10 +171,11 @@ pub(super) fn mmap(
                 }
                 let may_write = f.writable() && !(sealed && kind == flags::MAP_SHARED);
                 let mut fd = host.as_raw_fd();
+                let vfs = cx.vfs()?;
+                let ino = *ino;
+                let tmpfs_dev = f.node().and_then(|n| vfs.mapped_tmpfs_dev(&n, ino));
                 if kind == flags::MAP_SHARED && !f.pseudo {
-                    let ino = *ino;
                     drop(f);
-                    let vfs = cx.vfs()?;
                     loop {
                         match vfs.store().mapping_object(ino, may_write) {
                             Err(Errno::EAGAIN) => super::fs::make_private(cx, ino, None)?,
@@ -193,6 +195,9 @@ pub(super) fn mmap(
                         };
                         fd = object.as_raw_fd();
                     }
+                }
+                if let Some(dev) = tmpfs_dev {
+                    tmpfs = Some(crate::vfs::TmpfsMapping::new(vfs, dev, ino, fd)?);
                 }
                 Some((fd, offset, may_write))
             }
@@ -262,7 +267,14 @@ pub(super) fn mmap(
             Some(fill) => cx
                 .mm_mut()
                 .mmap_fill(addr, len, prot, flags, (fill.clone(), offset))?,
-            None => cx.mm_mut().mmap(addr, len, prot, flags, file)?,
+            None => cx.mm_mut().map(
+                addr,
+                len,
+                prot,
+                flags,
+                file,
+                tmpfs.map(crate::mm::FileFault::Tmpfs),
+            )?,
         }
     };
     drop(mapping_object);
@@ -367,7 +379,14 @@ fn remap(
                 Some(f) => {
                     let flags = flags::MAP_PRIVATE | flags::MAP_FIXED;
                     let src = Some((f.as_raw_fd(), r.offset, false));
-                    mm.mmap(r.start, r.len, r.prot, flags, src)?;
+                    mm.map(
+                        r.start,
+                        r.len,
+                        r.prot,
+                        flags,
+                        src,
+                        r.tmpfs.clone().map(crate::mm::FileFault::Tmpfs),
+                    )?;
                     mm.label(r.start, r.len, r.name.clone(), r.ino);
                     if let Some(mnt) = r.mnt {
                         mm.set_mnt(r.start, r.len, mnt);
@@ -493,7 +512,11 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
         return Ok(0);
     }
     if advice == MADV_REMOVE {
-        cx.mm_mut().remove(addr, len)?;
+        let tmpfs = cx.mm_mut().remove(addr, len)?;
+        for r in tmpfs {
+            super::fs::punch_tmpfs_maps(cx, r.mapping.ino, r.offset, r.offset + r.len);
+            r.mapping.punch(r.offset, r.len)?;
+        }
         let ranges = cx.mm().fuse_ranges(addr, len);
         for (fill, start, end) in ranges {
             super::fuse::remove_mapped(cx, &fill, start, end)?;
@@ -532,7 +555,7 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
             let ranges = {
                 let mm = cx.mm();
                 if prefill {
-                    mm.prefill_file_ptes(addr, len);
+                    mm.prefill_file_ptes(addr, len, advice == MADV_POPULATE_READ)?;
                 }
                 mm.advise_ranges(addr, len, file_only)
             };

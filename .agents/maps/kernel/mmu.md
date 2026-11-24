@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shoot down live file mappings before a provider truncates their host object)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: distinguish the first shared tmpfs write from read admission)
 
 ## Responsibilities
 
@@ -94,7 +94,7 @@ fast path and refill (`engine/dbt`).
 
 - `map_pages` builds entries eagerly for new mappings when the part of the VMA before EOF is at
   most 1 MB, or when the mapping is executable and not private anonymous (file mappings, shared
-  anonymous, SysV shm). `PROT_NONE` mappings get none. If building them fails it removes every
+  anonymous, SysV shm). Tmpfs file mappings wait for per-page quota admission. `PROT_NONE` mappings get none. If building them fails it removes every
   entry of the range. For existing or already-moved VMAs (`mprotect` out of `PROT_NONE`, `mremap`
   moves), `prefill_pages` performs the same eager `fill_shared` as best-effort without unmapping
   on failure, leaving existing entries intact so any unfilled pages fault in on demand.
@@ -103,9 +103,10 @@ fast path and refill (`engine/dbt`).
   has an entry (including a prot-0 one). Otherwise it fills every empty slot of the 2 MB leaf range
   — or 16 MB (`FILE_FAULT_SPAN`, 8 leaf spans) for read-only non-FUSE file mappings — clipped to
   the VMA and EOF; existing entries are left alone and no flush is needed. A `Fill` VMA gets
-  entries only for pages already read (`kernel/mm`). `MADV_WILLNEED` and `MADV_POPULATE_READ` also
-  prefill read-only non-FUSE file soft PTEs (up to 4 GB per call) via `fill_shared` without
-  touching host pages.
+  entries only for pages already read (`kernel/mm`). Tmpfs admits a single page. A read fault leaves it write-protected, and its first
+  store goes through shared write admission or private CoW. A permission change revokes its entries. `MADV_POPULATE_READ` faults tmpfs pages
+  explicitly. For other non-FUSE files it and `MADV_WILLNEED` can prefill read-only soft PTEs
+  (up to 4 GB per call) via `fill_shared` without touching host pages.
 - `mprotect` to `PROT_NONE` keeps entries with prot 0 (the host page keeps its content); changing
   back rewrites the kept entries and fills the rest under the eager rule above, otherwise on demand.
 - Execute-only mappings (`PROT_EXEC` without `PROT_READ`) do not gain read permission: data loads

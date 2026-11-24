@@ -97,7 +97,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   included) treats compiler warnings as errors, and lint treats its warnings as errors, except
   `GradleDependency`, `AndroidGradlePluginVersion`, `OldTargetApi`, `ExpiringTargetSdkVersion` and
   `OutdatedLibrary`, which follow data outside the repository and are informational.
-- Release: signed with the debug key, versionCode 3 and versionName 1.1.0. The Cargo workspace shares the release version. R8 uses the
+- Release: versionCode 3 and versionName 1.1.0. The Cargo workspace shares the release version. R8 uses the
   optimized Android defaults and shrinks unused resources. `app/proguard-rules.pro` keeps app
   JNI declarations, the GPU service connection lookup and the public void `VtSession.on*` callbacks looked up by the native pump;
   callbacks outside that pattern need a matching keep rule. The release mapping is under
@@ -223,7 +223,6 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Confirmed bugs / technical debt
 
-- The release build is signed with the debug key.
 - `scripts/fetch-ghostty` checks only the pinned sha256s; the release's minisign signatures are to
   be checked by hand once when upgrading, before pinning the new sha256s.
 - `scripts/release-sources` fixes the aports path to `main/` and vendors the whole workspace although its header speaks
@@ -231,4 +230,4 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Open questions
 
-- Is the release variant meant to ship as configured?
+None.

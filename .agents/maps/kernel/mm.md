@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: forced debugger reads preserve guest permissions and follow CoW loans, reservations and file growth)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: hold tmpfs pages read-only until the first write fault)
 
 ## Responsibilities
 
@@ -162,7 +162,11 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 ### Mappings read on demand (`Fill`)
 
 - Page-table entries build eagerly for small/executable mappings and lazily otherwise (`kernel/mmu`);
-  `PROT_NONE` gets none. A `Fill` VMA is the exception below.
+  `PROT_NONE` gets none. FUSE and tmpfs mappings have their own fault paths.
+- A file backed by tmpfs pins its mapped object. Each fault admits one guest page against the
+  backing mount’s quota before installing a translation. A read fault installs a read-only entry.
+  The first shared write publishes the backing file's mtime and ctime. Private mappings track written pages
+  independently of the file. Hole punching and `MADV_REMOVE` revoke aliases before freeing pages.
 - A `Fill` VMA keeps `file_len` 0, so `map_pages` and every other path sizing by `file_len`
   (mprotect, mremap, fork, populate, truncation) build none of its entries, even when executable;
   only `fault_in` does, for a page already read, and then for the runs read within its 2 MB leaf
@@ -196,7 +200,8 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 
 1. A write fault where `cow_break` (`kernel/cow`) succeeds → re-execute.
 2. The page now translates (another thread fixed it while this one waited for the BKL) → re-execute.
-3. `fault_in` (`kernel/mmu`) succeeds → re-execute.
+3. `try_fault_in` (`kernel/mmu`) succeeds → re-execute. A tmpfs page allocation failure delivers
+   `SIGBUS` / `BUS_ADRERR`.
 4. A page of a `Fill` mapping not yet read and allowing the access (`fill_wanted`) → read it through
    the daemon (above) and re-execute; a signal arriving before the daemon took the read is
    delivered first and the access faults again; a read error → `SIGBUS` / `BUS_ADRERR`.

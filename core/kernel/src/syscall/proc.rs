@@ -386,7 +386,6 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.rlimits = parent.rlimits;
         g.dumpable = parent.dumpable;
         g.mm_user_ns = parent.mm_user_ns.clone();
-        g.no_new_privs = parent.no_new_privs;
         g.oom_score_adj = parent.oom_score_adj;
         g.oom_score_adj_min = parent.oom_score_adj_min;
         g.cred = child_cred.clone();
@@ -525,6 +524,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let slack = cx.task.timerslack.get().0;
     task.timerslack.set((slack, slack));
     // The seccomp mode and filter chain are inherited as on Linux
+    task.no_new_privs.set(cx.task.no_new_privs.get());
     let seccomp = cx.task.seccomp.borrow().clone();
     *task.seccomp.borrow_mut() = seccomp;
     crate::seccomp::publish(&task);
@@ -848,7 +848,7 @@ fn exec(
     // setuid and setgid programs (no effect after `PR_SET_NO_NEW_PRIVS` or on a nosuid mount) and
     // the program file's capabilities; for scripts the interpreter counts. No new privileges are
     // gained while traced by a tracer without CAP_SYS_PTRACE
-    let no_new_privs = cx.t.group.borrow().no_new_privs;
+    let no_new_privs = cx.task.no_new_privs.get();
     // Also no effect when the file's owner or group has no mapping in one's own user namespace
     // (bprm_fill_uid)
     let mapped = cred.user_ns.uid_map.borrow().up(st.uid).is_some()
@@ -1285,6 +1285,7 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
             g.threads = vec![tgid];
             // The original main thread has been reaped (release_task in Linux's de_thread)
             g.leader_seccomp = None;
+            g.leader_no_new_privs = false;
             g.leader_exit = None;
             g.leader_serial = None;
             g.leader_tracer = None;

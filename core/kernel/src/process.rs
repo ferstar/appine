@@ -409,8 +409,8 @@ pub(crate) struct ThreadGroup {
     /// that is not dumpable can be traced only with `CAP_SYS_PTRACE` over it. None until the first
     /// execve: the credentials' namespace.
     pub mm_user_ns: Option<Rc<crate::cred::UserNs>>,
-    /// `PR_SET_NO_NEW_PRIVS`, kept by both fork and execve.
-    pub no_new_privs: bool,
+    /// Saved for procfs once the main thread exits.
+    pub leader_no_new_privs: bool,
     /// `/proc/<pid>/oom_score_adj` (-1000–1000), inherited by fork. Used when the OOM killer picks
     /// a process ([`crate::oom`]); -1000 means never pick it.
     pub oom_score_adj: i32,
@@ -507,7 +507,7 @@ impl ThreadGroup {
             child_subreaper: false,
             dumpable: true,
             mm_user_ns: None,
-            no_new_privs: false,
+            leader_no_new_privs: false,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
             cred: Cred::root(),

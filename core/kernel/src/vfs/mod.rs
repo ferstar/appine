@@ -529,6 +529,7 @@ pub(crate) mod resolve {
 /// A virtual filesystem instance.
 pub struct Vfs {
     store: Store,
+    tmpfs_file_ranges: RefCell<HashMap<Ino, TmpfsFileRanges>>,
     /// The mount table: the boot ones and those mount(2) mounted later, in mount order.
     mounts: RefCell<Mounts>,
     /// Regenerated whenever the mount table changes.
@@ -686,6 +687,294 @@ impl Mounts {
 /// tmpfs accounts usage in pages; the page size (guest pages).
 pub(crate) const TMPFS_PAGE: u64 = 4096;
 
+/// Count unallocated guest pages in a host file range, or return the first page that would
+/// exceed the budget. FIEMAP includes unwritten reservations and excludes filesystem metadata.
+/// None means the object filesystem needs the SEEK_DATA/st_blocks fallback.
+fn fiemap_holes(host: &std::fs::File, from: u64, to: u64, budget: u64) -> Option<Result<u64, u64>> {
+    use std::os::fd::AsRawFd;
+    const FS_IOC_FIEMAP: u64 = 0xc020660b;
+    const COUNT: usize = 32;
+    const HEADER: usize = 32;
+    const EXTENT: usize = 56;
+    let last = to.div_ceil(TMPFS_PAGE);
+    let mut page = from / TMPFS_PAGE;
+    let mut holes = 0;
+    while page < last {
+        let pos = page * TMPFS_PAGE;
+        let mut buf = [0u8; HEADER + COUNT * EXTENT];
+        buf[..8].copy_from_slice(&pos.to_ne_bytes());
+        buf[8..16].copy_from_slice(&(to - pos).to_ne_bytes());
+        buf[24..28].copy_from_slice(&(COUNT as u32).to_ne_bytes());
+        appine_hal::ioctl(host.as_raw_fd(), FS_IOC_FIEMAP, &mut buf).ok()?;
+        let count = u32::from_ne_bytes(buf[20..24].try_into().ok()?) as usize;
+        let old = page;
+        for extent in buf[HEADER..].chunks_exact(EXTENT).take(count) {
+            let start = u64::from_ne_bytes(extent[..8].try_into().ok()?);
+            let len = u64::from_ne_bytes(extent[16..24].try_into().ok()?);
+            let gap = last.min(start / TMPFS_PAGE).saturating_sub(page);
+            if gap > budget - holes {
+                return Some(Err((page + budget - holes) * TMPFS_PAGE));
+            }
+            holes += gap;
+            page = page
+                .max(start.saturating_add(len).div_ceil(TMPFS_PAGE))
+                .min(last);
+        }
+        if count < COUNT {
+            let gap = last - page;
+            return Some(if gap > budget - holes {
+                Err((page + budget - holes) * TMPFS_PAGE)
+            } else {
+                Ok(holes + gap)
+            });
+        }
+        if page <= old {
+            return None;
+        }
+    }
+    Some(Ok(holes))
+}
+
+/// How many pages of `[from, to)` in host file `host` (`size` bytes long) would need storage
+/// when written: holes and pages past the end, found with the host's `SEEK_DATA` and
+/// `SEEK_HOLE` (a page holding any data needs none; a host that cannot tell has data everywhere
+/// before the end). When more than `budget` are needed, `Err` gives the offset of the first page
+/// that no longer fits.
+fn seek_holes(
+    host: &std::fs::File,
+    size: u64,
+    from: u64,
+    to: u64,
+    budget: u64,
+) -> Result<u64, u64> {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(host);
+    let end = to.div_ceil(TMPFS_PAGE);
+    let mut page = from / TMPFS_PAGE;
+    let mut needed = 0;
+    while page < end {
+        let at = page * TMPFS_PAGE;
+        let data = if at >= size {
+            end
+        } else {
+            match appine_hal::lseek(fd, at as i64, libc::SEEK_DATA) {
+                Ok(d) => d / TMPFS_PAGE,
+                Err(e) if e == Errno::ENXIO.0 => end,
+                Err(_) => page,
+            }
+        };
+        let holes = data.min(end) - page;
+        if needed + holes > budget {
+            return Err((page + budget - needed) * TMPFS_PAGE);
+        }
+        needed += holes;
+        if data >= end {
+            break;
+        }
+        let hole = appine_hal::lseek(fd, (data * TMPFS_PAGE) as i64, libc::SEEK_HOLE)
+            .unwrap_or(size)
+            .div_ceil(TMPFS_PAGE);
+        page = hole.max(data + 1);
+    }
+    Ok(needed)
+}
+
+/// Page-aligned byte ranges in a tmpfs inode, sorted and coalesced. A single large
+/// KEEP_SIZE reservation needs only one entry, including beyond the current EOF.
+#[derive(Clone, Default)]
+struct PageRuns(Vec<std::ops::Range<u64>>);
+
+impl PageRuns {
+    fn add(&mut self, start: u64, end: u64) {
+        let lo = self.0.partition_point(|r| r.end < start);
+        let hi = self.0.partition_point(|r| r.start <= end);
+        let merged = if lo < hi {
+            start.min(self.0[lo].start)..end.max(self.0[hi - 1].end)
+        } else {
+            start..end
+        };
+        self.0.splice(lo..hi, std::iter::once(merged));
+    }
+
+    fn remove(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        let lo = self.0.partition_point(|r| r.end <= start);
+        let hi = self.0.partition_point(|r| r.start < end);
+        if lo < hi {
+            let head = self.0[lo].start..start;
+            let tail = end..self.0[hi - 1].end;
+            self.0
+                .splice(lo..hi, [head, tail].into_iter().filter(|r| !r.is_empty()));
+        }
+    }
+
+    /// The first run containing or following this offset.
+    fn next(&self, offset: u64) -> Option<&std::ops::Range<u64>> {
+        self.0.get(self.0.partition_point(|r| r.end <= offset))
+    }
+
+    /// Count missing pages, consulting the host only in gaps between guest allocations.
+    fn holes(
+        &self,
+        from: u64,
+        to: u64,
+        budget: u64,
+        mut missing: impl FnMut(u64, u64, u64) -> Result<u64, u64>,
+    ) -> Result<u64, u64> {
+        let mut at = from / TMPFS_PAGE * TMPFS_PAGE;
+        let mut holes = 0;
+        let mut gap = |lo, hi| -> Result<(), u64> {
+            let left = budget - holes;
+            holes += missing(lo, hi, left)?;
+            Ok(())
+        };
+        let first = self.0.partition_point(|r| r.end <= at);
+        for r in self.0[first..].iter().take_while(|r| r.start < to) {
+            if at < r.start {
+                gap(at, r.start)?;
+            }
+            at = r.end;
+        }
+        if at < to {
+            gap(at, to)?;
+        }
+        Ok(holes)
+    }
+}
+
+#[derive(Default)]
+struct TmpfsFileRanges {
+    /// Includes reserved pages that are still holes for SEEK_DATA.
+    allocated: PageRuns,
+    /// Pages instantiated by mapped access even if their backing bytes are still sparse.
+    data: PageRuns,
+    dev: u64,
+}
+
+/// Some hosts emulate fallocate by allocating from byte zero even for a nonzero range.
+/// Use logical reservations alone when the object cannot describe physical extents.
+pub(crate) fn tmpfs_host_reservations(host: &std::fs::File, offset: u64) -> bool {
+    fiemap_holes(host, offset, offset + 1, 0).is_some()
+}
+
+fn object_pages(host: &std::fs::File) -> Result<u64, Errno> {
+    use std::os::unix::fs::MetadataExt;
+    // KEEP_SIZE reservations can extend beyond EOF.
+    const END: u64 = 1 << 63;
+    if let Some(Ok(holes)) = fiemap_holes(host, 0, END, u64::MAX) {
+        Ok(END / TMPFS_PAGE - holes)
+    } else {
+        Ok(host
+            .metadata()
+            .map_err(mapping_errno)?
+            .blocks()
+            .div_ceil(TMPFS_PAGE / 512))
+    }
+}
+
+/// The object pinned by a tmpfs VMA. Faults allocate one guest page under the BKL,
+/// before an engine or kernel memory access can use the host mapping.
+pub(crate) struct TmpfsMapping {
+    vfs: std::rc::Rc<Vfs>,
+    dev: u64,
+    pub(crate) ino: Ino,
+    file: std::fs::File,
+}
+
+impl TmpfsMapping {
+    pub(crate) fn new(
+        vfs: std::rc::Rc<Vfs>,
+        dev: u64,
+        ino: Ino,
+        fd: i32,
+    ) -> Result<std::rc::Rc<Self>, Errno> {
+        // Even a read fault into a sparse shmem file instantiates a page. Open the actual
+        // mapped object, including an unlinked one, independently of the guest fd's mode.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{fd}"))
+            .map_err(mapping_errno)?;
+        Ok(std::rc::Rc::new(Self {
+            vfs,
+            dev,
+            ino,
+            file,
+        }))
+    }
+
+    pub(crate) fn punch(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        use std::os::fd::AsRawFd;
+        let before = self.vfs.tmpfs_file_pages(self.ino, &self.file)?;
+        appine_hal::fallocate(
+            self.file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset,
+            len,
+        )
+        .map_err(Errno)?;
+        self.vfs.tmpfs_forget_pages(self.ino, offset, offset + len);
+        let after = self.vfs.tmpfs_file_pages(self.ino, &self.file)?;
+        self.vfs
+            .tmpfs_charge(self.dev, after as i64 - before as i64, 0);
+        self.vfs.tmpfs_update_unlinked(self.dev, self.ino, after);
+        Ok(())
+    }
+
+    pub(crate) fn fault(&self, offset: u64, shared_write: bool) -> Result<(), Errno> {
+        use std::os::fd::AsRawFd;
+        let fd = self.file.as_raw_fd();
+        let size = self.file.metadata().map_err(mapping_errno)?.len();
+        if offset >= size {
+            return Err(Errno::EFAULT);
+        }
+        let end = offset + TMPFS_PAGE;
+        let data = appine_hal::lseek(fd, offset as i64, libc::SEEK_DATA);
+        let has_data = data.is_ok_and(|d| d < end);
+        let missing = !has_data
+            && self
+                .vfs
+                .tmpfs_missing(self.ino, &self.file, size, offset, end, 0)
+                .is_err();
+        if missing {
+            self.vfs.tmpfs_check(self.dev, 1, 0)?;
+        }
+        if shared_write {
+            if !has_data && tmpfs_host_reservations(&self.file, offset) {
+                // Reserve storage without overwriting bytes another guest CPU could be writing.
+                match appine_hal::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, offset, TMPFS_PAGE) {
+                    Ok(()) | Err(libc::EOPNOTSUPP) => {}
+                    Err(e) => return Err(Errno(e)),
+                }
+            }
+            // Some hosts defer mmap write timestamps until writeback. Publish the first
+            // shared write fault on the filesystem clock before granting a writable PTE.
+            appine_hal::set_times_fd(fd, None, Some(appine_hal::TIME_NOW)).map_err(Errno)?;
+        }
+        if has_data {
+            return Ok(());
+        }
+        // A shmem fault instantiates this page for subsequent stats and seeks, including
+        // private reads. Pure reads and private stores leave the backing file's times alone.
+        self.vfs
+            .tmpfs_record_pages(self.dev, self.ino, offset, end, true);
+        if missing {
+            self.vfs.tmpfs_charge(self.dev, 1, 0);
+            if let Some(t) = self.vfs.mounts.borrow_mut().tmpfs.get_mut(&self.dev)
+                && let Some(file) = t.unlinked.get_mut(&self.ino)
+            {
+                file.pages += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn mapping_errno(e: std::io::Error) -> Errno {
+    Errno(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
 /// tmpfs superblock parameters (these fields of Linux's `shmem_sb_info`): set by mount(2)'s
 /// options at mount time; a remount can change the size, the inode count and inode32/64.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -767,7 +1056,13 @@ pub(crate) struct Tmpfs {
     /// Regular files whose last link was removed while still open or mapped, mapped to their last
     /// known page count: their pages and one inode stay charged until their last user closes them
     /// ([`Vfs::evict_tmpfs`]), matching Linux's `shmem_evict_inode`.
-    unlinked: std::collections::HashMap<Ino, u64>,
+    unlinked: HashMap<Ino, UnlinkedTmpfs>,
+}
+
+struct UnlinkedTmpfs {
+    pages: u64,
+    /// O_PATH descriptions carry a node, so retain the backing object across store reaping.
+    object: std::fs::File,
 }
 
 /// What no-BKL path resolution needs (`syscall::fast`): the store's metadata cache and the mount
@@ -1097,6 +1392,7 @@ impl Vfs {
             fuse: Default::default(),
             mount_events: std::rc::Rc::new(std::cell::Cell::new(1)),
             expiring: std::cell::Cell::new(0),
+            tmpfs_file_ranges: RefCell::default(),
         })
     }
 
@@ -2271,6 +2567,40 @@ impl Vfs {
         (self.fs_of(node) == Fs::Tmpfs).then(|| self.dev_of(node))
     }
 
+    /// Charge a mapped overlay file to the tmpfs layer that supplies its data.
+    pub(crate) fn mapped_tmpfs_dev(&self, node: &Node, ino: Ino) -> Option<u64> {
+        let Node::Overlay(_, id) = node else {
+            return self.tmpfs_dev(node);
+        };
+        let overlays = self.overlay();
+        let n = overlays.node(*id);
+        let instance = overlays.instance(n.dev)?;
+        if instance.pins.is_empty() {
+            return None;
+        }
+        let parent = overlays.node(n.parent);
+        let mut dir = parent
+            .upper
+            .into_iter()
+            .chain(parent.lower.iter().copied())
+            .find(|&dir| self.store.lookup(dir, &n.name) == Ok(Some(ino)));
+        let mounts = self.mounts.borrow();
+        if dir.is_none() {
+            return mounts
+                .tmpfs
+                .iter()
+                .find(|(_, t)| t.unlinked.contains_key(&ino))
+                .map(|(&dev, _)| dev);
+        }
+        while let Some(here) = dir {
+            if let Some((&dev, _)) = mounts.tmpfs.iter().find(|(_, t)| t.root == here) {
+                return Some(dev);
+            }
+            dir = self.store.parent(here).ok().filter(|&next| next != here);
+        }
+        None
+    }
+
     /// The kind of filesystem `node` is in.
     pub(crate) fn fs_of(&self, node: &Node) -> Fs {
         self.with_mount(node.mnt(), |m| m.fs)
@@ -2280,6 +2610,155 @@ impl Vfs {
                 Node::Overlay(..) => Fs::Overlay,
                 Node::Fuse(..) => Fs::Fuse,
             })
+    }
+
+    pub(crate) fn tmpfs_record_pages(&self, dev: u64, ino: Ino, start: u64, end: u64, data: bool) {
+        let start = start / TMPFS_PAGE * TMPFS_PAGE;
+        let end = end.next_multiple_of(TMPFS_PAGE);
+        let mut files = self.tmpfs_file_ranges.borrow_mut();
+        let r = files.entry(ino).or_insert_with(|| TmpfsFileRanges {
+            dev,
+            ..Default::default()
+        });
+        r.allocated.add(start, end);
+        if data {
+            r.data.add(start, end);
+        }
+    }
+
+    pub(crate) fn tmpfs_forget_pages(&self, ino: Ino, start: u64, end: u64) {
+        let mut files = self.tmpfs_file_ranges.borrow_mut();
+        if let Some(r) = files.get_mut(&ino) {
+            let start = start.next_multiple_of(TMPFS_PAGE);
+            let end = end / TMPFS_PAGE * TMPFS_PAGE;
+            r.allocated.remove(start, end);
+            r.data.remove(start, end);
+            if r.allocated.0.is_empty() {
+                files.remove(&ino);
+            }
+        }
+    }
+
+    pub(crate) fn tmpfs_missing(
+        &self,
+        ino: Ino,
+        host: &std::fs::File,
+        size: u64,
+        from: u64,
+        to: u64,
+        budget: u64,
+    ) -> Result<u64, u64> {
+        let files = self.tmpfs_file_ranges.borrow();
+        let empty = PageRuns::default();
+        files
+            .get(&ino)
+            .map_or(&empty, |r| &r.allocated)
+            .holes(from, to, budget, |lo, hi, left| {
+                fiemap_holes(host, lo, hi, left)
+                    .unwrap_or_else(|| seek_holes(host, size, lo, hi, left))
+            })
+    }
+
+    pub(crate) fn tmpfs_file_pages(&self, ino: Ino, host: &std::fs::File) -> Result<u64, Errno> {
+        if !self.tmpfs_file_ranges.borrow().contains_key(&ino) {
+            return object_pages(host);
+        }
+        const END: u64 = 1 << 63;
+        let size = host.metadata().map_err(mapping_errno)?.len();
+        let holes = self
+            .tmpfs_missing(ino, host, size, 0, END, u64::MAX)
+            .expect("unlimited page budget");
+        Ok(END / TMPFS_PAGE - holes)
+    }
+
+    /// A tmpfs upper copies data within EOF. Unwritten lower reservations do not transfer.
+    pub(crate) fn tmpfs_copy_pages(&self, st: &Stat) -> Result<Option<u64>, Errno> {
+        let files = self.tmpfs_file_ranges.borrow();
+        let Some(file) = files.get(&st.ino) else {
+            return Ok(None);
+        };
+        let host = self.store.open_object(st.ino, false)?;
+        let holes = file
+            .data
+            .holes(0, st.size, u64::MAX, |lo, hi, left| {
+                seek_holes(&host, st.size, lo, hi, left)
+            })
+            .expect("unlimited page budget");
+        Ok(Some(st.size.div_ceil(TMPFS_PAGE) - holes))
+    }
+
+    pub(crate) fn tmpfs_copy_mapped_data(&self, dev: u64, lower: Ino, upper: Ino) {
+        let mut files = self.tmpfs_file_ranges.borrow_mut();
+        if let Some(r) = files.get(&lower)
+            && !r.data.0.is_empty()
+        {
+            let data = r.data.clone();
+            files.insert(
+                upper,
+                TmpfsFileRanges {
+                    dev,
+                    allocated: data.clone(),
+                    data,
+                },
+            );
+        }
+    }
+
+    /// SEEK_DATA and SEEK_HOLE see the union of host data and pages instantiated by a
+    /// mapped access. Unwritten fallocate reservations remain holes until first touched.
+    pub(crate) fn seek_data_or_hole(
+        &self,
+        ino: Ino,
+        fd: i32,
+        mut at: u64,
+        end: u64,
+        whence: i32,
+    ) -> Result<u64, Errno> {
+        let files = self.tmpfs_file_ranges.borrow();
+        let data = files.get(&ino).map(|r| &r.data);
+        loop {
+            let found = match appine_hal::lseek(fd, at as i64, whence) {
+                Ok(pos) => pos,
+                Err(libc::ENXIO) => end,
+                Err(_) if whence == libc::SEEK_DATA => at,
+                Err(_) => end,
+            };
+            if whence == libc::SEEK_DATA {
+                let next = data
+                    .and_then(|d| d.next(at))
+                    .map_or(found, |r| found.min(r.start.max(at)));
+                return if next < end {
+                    Ok(next)
+                } else {
+                    Err(Errno::ENXIO)
+                };
+            }
+            match data.and_then(|d| d.next(found)) {
+                Some(r) if r.contains(&found) && r.end < end => at = r.end,
+                Some(r) if r.contains(&found) => return Ok(end),
+                _ => return Ok(found),
+            }
+        }
+    }
+
+    pub(crate) fn tmpfs_stat_blocks(
+        &self,
+        ino: Ino,
+        host: Option<&std::fs::File>,
+        st: &mut Stat,
+    ) -> Result<(), Errno> {
+        if self.tmpfs_file_ranges.borrow().contains_key(&ino) {
+            let opened;
+            let f = match host {
+                Some(f) => f,
+                None => {
+                    opened = self.store.open_object(ino, false)?;
+                    &opened
+                }
+            };
+            st.blocks = Some(self.tmpfs_file_pages(ino, f)? * (TMPFS_PAGE / 512));
+        }
+        Ok(())
     }
 
     /// Whether `pages` more pages and `inodes` more inodes fit in tmpfs instance `dev` (Linux's
@@ -2339,9 +2818,9 @@ impl Vfs {
     /// Regular file `ino` in tmpfs instance `dev` lost its last link while still open or mapped:
     /// keeps its `pages` and one inode charged until its last user goes away
     /// ([`Vfs::evict_tmpfs`]).
-    pub(crate) fn tmpfs_unlinked(&self, dev: u64, ino: Ino, pages: u64) {
+    pub(crate) fn tmpfs_unlinked(&self, dev: u64, ino: Ino, pages: u64, object: std::fs::File) {
         if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
-            t.unlinked.insert(ino, pages);
+            t.unlinked.insert(ino, UnlinkedTmpfs { pages, object });
         }
     }
 
@@ -2351,7 +2830,7 @@ impl Vfs {
         if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev)
             && let Some(p) = t.unlinked.get_mut(&ino)
         {
-            *p = pages;
+            p.pages = pages;
         }
     }
 
@@ -2365,25 +2844,32 @@ impl Vfs {
             .any(|t| !t.unlinked.is_empty())
     }
 
-    /// Updates live unlinked tmpfs files' page counts from open descriptors and evicts those no
-    /// longer in `live`, releasing their pages and inode charges.
-    pub(crate) fn evict_tmpfs(&self, live: &std::collections::HashMap<Ino, Option<u64>>) {
+    /// Metadata after the last unlink, including after the store reaps the object name.
+    pub(crate) fn unlinked_tmpfs_stat(&self, ino: Ino) -> Option<Result<Stat, Errno>> {
+        let mounts = self.mounts.borrow();
+        let file = mounts.tmpfs.values().find_map(|t| t.unlinked.get(&ino))?;
+        Some(self.store.stat_open(ino, &file.object).and_then(|mut st| {
+            self.tmpfs_stat_blocks(ino, Some(&file.object), &mut st)?;
+            Ok(st)
+        }))
+    }
+
+    /// Refresh charges through the pinned objects and drop those with no guest references.
+    pub(crate) fn evict_tmpfs(&self, live: &std::collections::HashSet<Ino>) {
         let mut mounts = self.mounts.borrow_mut();
         for t in mounts.tmpfs.values_mut() {
-            if t.unlinked.is_empty() {
-                continue;
-            }
             let mut drop_inodes = 0u64;
             let mut delta_pages = 0i64;
-            t.unlinked.retain(|ino, pages| match live.get(ino) {
-                Some(Some(actual)) => {
-                    delta_pages += *actual as i64 - *pages as i64;
-                    *pages = *actual;
+            t.unlinked.retain(|ino, file| {
+                if live.contains(ino) {
+                    if let Ok(actual) = self.tmpfs_file_pages(*ino, &file.object) {
+                        delta_pages += actual as i64 - file.pages as i64;
+                        file.pages = actual;
+                    }
                     true
-                }
-                Some(None) => true,
-                None => {
-                    delta_pages -= *pages as i64;
+                } else {
+                    self.tmpfs_file_ranges.borrow_mut().remove(ino);
+                    delta_pages -= file.pages as i64;
                     drop_inodes += 1;
                     false
                 }
@@ -2428,12 +2914,20 @@ impl Vfs {
         let (params, root, used, unlinked) = {
             let mounts = self.mounts.borrow();
             let t = mounts.tmpfs.get(&dev).ok_or(Errno::EINVAL)?;
-            (t.params.clone(), t.root, t.used, t.unlinked.clone())
+            (
+                t.params.clone(),
+                t.root,
+                t.used,
+                (
+                    t.unlinked.values().map(|f| f.pages).sum(),
+                    t.unlinked.len() as u64,
+                ),
+            )
         };
         let (pages, inodes) = match used {
             Some(u) if !fresh => u,
             _ => {
-                let u = self.count_tmpfs(root, &unlinked)?;
+                let u = self.count_tmpfs(root, unlinked)?;
                 if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
                     t.used = Some(u);
                     t.changed = false;
@@ -2446,11 +2940,7 @@ impl Vfs {
 
     /// Counts the usage of the tmpfs rooted at `root` (pages, inodes; see [`Vfs::tmpfs_usage`]),
     /// including unlinked regular files still held open or mapped (`unlinked`).
-    fn count_tmpfs(
-        &self,
-        root: Ino,
-        unlinked: &std::collections::HashMap<Ino, u64>,
-    ) -> Result<(u64, u64), Errno> {
+    fn count_tmpfs(&self, root: Ino, unlinked: (u64, u64)) -> Result<(u64, u64), Errno> {
         let (mut pages, mut inodes) = (0, 1);
         let mut seen = std::collections::HashSet::new();
         let mut dirs = vec![root];
@@ -2463,14 +2953,14 @@ impl Vfs {
                 match e.mode & mode::S_IFMT {
                     mode::S_IFDIR => dirs.push(e.ino),
                     mode::S_IFREG | mode::S_IFLNK if seen.insert(e.ino) => {
-                        pages += tmpfs_pages(&self.store.stat(e.ino)?);
+                        pages += self.tmpfs_pages(&self.store.stat(e.ino)?);
                     }
                     _ => {}
                 }
             }
         }
-        inodes += unlinked.len() as u64;
-        pages += unlinked.values().sum::<u64>();
+        pages += unlinked.0;
+        inodes += unlinked.1;
         Ok((pages, inodes))
     }
 
@@ -3103,7 +3593,7 @@ impl Vfs {
                 .chain(ovl.pinned())
                 .collect();
             drop(ovl);
-            let dead: Vec<u64> = mounts
+            let dead: std::collections::HashSet<u64> = mounts
                 .tmpfs
                 .keys()
                 .filter(|dev| !live.contains(dev))
@@ -3125,6 +3615,9 @@ impl Vfs {
                 .map(|m| m.dev)
                 .collect();
             mounts.devpts.retain(|dev, _| pts.contains(dev));
+            self.tmpfs_file_ranges
+                .borrow_mut()
+                .retain(|_, file| !dead.contains(&file.dev));
             dead.iter()
                 .filter_map(|dev| mounts.tmpfs.remove(dev))
                 .map(|t| t.root)
@@ -4140,16 +4633,24 @@ fn on_entry(m: &Mount, (ino, dir, name): (Ino, Ino, &[u8])) -> bool {
             .is_none_or(|(d, n)| d.ino() == Some(dir) && n == name)
 }
 
-/// Pages one inode takes in tmpfs: regular files by the storage their object takes (holes take
-/// none), symlinks one page when the target is 128 bytes or more (Linux's `SHORT_SYMLINK_LEN`;
-/// short ones live in the inode), others none.
-pub(crate) fn tmpfs_pages(st: &Stat) -> u64 {
-    match st.kind() {
-        mode::S_IFREG => st.blocks.map_or(st.size.div_ceil(TMPFS_PAGE), |b| {
-            b.div_ceil(TMPFS_PAGE / 512)
-        }),
-        mode::S_IFLNK => u64::from(st.size >= 128),
-        _ => 0,
+impl Vfs {
+    /// Pages one inode takes in tmpfs: regular files by the storage their object takes (holes take
+    /// none), symlinks one page when the target is 128 bytes or more (Linux's `SHORT_SYMLINK_LEN`;
+    /// short ones live in the inode), others none.
+    pub(crate) fn tmpfs_pages(&self, st: &Stat) -> u64 {
+        match st.kind() {
+            mode::S_IFREG => self
+                .store
+                .open_object(st.ino, false)
+                .and_then(|f| self.tmpfs_file_pages(st.ino, &f))
+                .unwrap_or_else(|_| {
+                    st.blocks.map_or(st.size.div_ceil(TMPFS_PAGE), |b| {
+                        b.div_ceil(TMPFS_PAGE / 512)
+                    })
+                }),
+            mode::S_IFLNK => u64::from(st.size >= 128),
+            _ => 0,
+        }
     }
 }
 

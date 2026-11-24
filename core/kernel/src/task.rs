@@ -241,6 +241,8 @@ pub(crate) struct Task {
     /// pending), readable by other threads: the OOM killer passes it over while it shares its
     /// parent's address space (Linux's `in_vfork`, [`crate::oom`]).
     pub vfork: Cell<bool>,
+    /// Sticky privilege restriction inherited by children and preserved across exec.
+    pub no_new_privs: Cell<bool>,
     /// seccomp state ([`crate::seccomp`]), accessed only while holding the BKL.
     pub seccomp: RefCell<crate::seccomp::Seccomp>,
     /// The thread has seccomp: syscalls must be checked first (`syscall::fast` reads it without
@@ -357,6 +359,7 @@ impl Task {
             exit_status: Cell::new(ExitStatus::Exited(0)),
             exit_started: Cell::new(false),
             vfork: Cell::new(vfork),
+            no_new_privs: Cell::new(false),
             seccomp: RefCell::default(),
             seccomp_on: AtomicBool::new(false),
             seccomp_allow: [const { AtomicU64::new(0) }; crate::seccomp::CACHE_WORDS],
@@ -946,7 +949,8 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 return signal::deliver(cx, cpu, false);
             }
             // Large mappings fill entries on demand: fill them in on first access and re-execute
-            if cx.mm().fault_in(addr, need) {
+            let fault = cx.mm().try_fault_in(addr, need);
+            if fault == Ok(true) {
                 return signal::deliver(cx, cpu, false);
             }
             let (ec, wnr) = match access {
@@ -966,7 +970,7 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 },
                 None => false,
             };
-            let past_eof = if unreadable {
+            let past_eof = if unreadable || fault.is_err() {
                 Some(true)
             } else {
                 cx.mm_mut().fault_past_eof(addr, need)

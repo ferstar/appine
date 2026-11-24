@@ -3230,7 +3230,8 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Resu
     writeln!(
         s,
         "NoNewPrivs:\t{}\nSeccomp:\t{seccomp}\nSeccomp_filters:\t{filters}",
-        g.no_new_privs as u8
+        task.as_ref()
+            .map_or(g.leader_no_new_privs, |t| t.no_new_privs.get()) as u8
     )
     .unwrap();
     // The thread's affinity (the main thread's for the process), within the online CPUs

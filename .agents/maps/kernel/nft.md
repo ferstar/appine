@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/netns full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: original destination matching for xt conntrack rules)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: native dynamic meters and named xt hashlimit tables)
 
 ## Responsibilities
 
@@ -65,15 +65,19 @@ and netlink transport in `kernel/netlink`.
   interface's address on PREROUTING), `reject`, `queue` (drop), `limit` (a token bucket per rule
   expression, packets or bytes, `over` inverting) and `quota` (bytes counted per rule expression,
   `over` inverting); a packet's length, for them as for `meta len`, is its headers only. `counter`,
-  `log`, `notrack`, `dynset`, `objref`, `last`, `masq`, `connlimit`, `dup` always match without
+  `log`, `notrack`, `objref`, `last`, `masq`, `connlimit`, `dup` always match without
   effect. xt targets DNAT, REDIRECT, MARK, ACCEPT, DROP, REJECT (others no-ops) and matches
   comment, mark, owner, conntrack (state and masked original destination address, independently
   invertible, using the destination before DNAT in the evaluating namespace), state, addrtype,
-  tcp, udp, limit (the same bucket from avg and
-  burst), and recent (named per-netns address histories; SET, CHECK, UPDATE and REMOVE with
-  masks, expiry, hit counts, TTL checks and optional reaping). Unknown or
+  tcp, udp, limit (the same bucket from avg and burst), hashlimit (revisions 1–3), and recent
+  (named per-netns address histories with SET, CHECK, UPDATE, REMOVE, masks, expiry, hit counts,
+  TTL checks and optional reaping). Unknown or
   unevaluable expressions break the rule. Jumps to missing chains or deeper than 16 drop; 100,000
   steps accept; chains end in their policy.
+- Native `dynset` adds, updates and deletes set members during evaluation. Limits and quotas
+  keep separate state for each key. Updates refresh timeouts, and lookups and element dumps see
+  live dynamic members. xt hashlimit rules sharing a table name and family in one network namespace
+  use the same keyed state for packet, byte or rate-window matching.
 - `kernel/netns` builds packets and selects hooks at connect/sendto and forwarding probes;
   matching-family base chains run in priority order. `Outcome` returns accept, drop, reject
   with errno or DNAT to that caller. `tracks()` decides whether `SO_ORIGINAL_DST` answers.
@@ -105,8 +109,7 @@ and netlink transport in `kernel/netlink`.
 
 ## Confirmed bugs / technical debt
 
-- Native per-key meters (`dynset` with a limit) always match, and xt `hashlimit` never matches.
-  Byte limits and quotas count headers only.
+- Byte limits and quotas count headers only.
 - **nft control-plane gaps:** no `NLM_F_ECHO` and no monitor notifications; set-element dumps are
   one unbounded message.
 - POSTROUTING, SNAT and MASQUERADE have no effect; unsupported expression effects are listed above.

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: sendfile to a pipe uses splice slots and pipe writes preserve the initial tail merge across I/O chunks)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: reuse exact tmpfs page reservations for writes and sparse seeks)
 
 ## Responsibilities
 
@@ -39,8 +39,8 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 ## Key types
 
 - `IoPath` — the route of one I/O call, chosen so no borrow of the open file is held during I/O
-  (`Local`: regular files through `unlocked_io`; other local files, and `O_APPEND` writes to
-  regular files, while borrowed under the BKL).
+  (`Local` uses `unlocked_io` for regular files and holds the BKL for other local files,
+  tmpfs writes and regular-file appends).
 - `Kernel::unsharing` — inodes `make_private` is copying with the BKL released.
 - Shared `OpenFile` state owned by `kernel/files` and driven here: `pos`, `pos_busy` (0 free, 1
   taken, 2 with waiters), `FileKind::Regular { cow, .. }` and `retired` old host handles kept until
@@ -83,8 +83,9 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   or past it), so a piece or iovec ending at the limit only shortens the call. A write at the
   position of a regular file (not `O_APPEND`) takes `pos_busy` before its checks and holds it to
   the end (`write_local`); each piece checks `RLIMIT_FSIZE`, tmpfs room and seals at its position,
-  calls `prepare_write` and `remove_privs`, writes, and charges tmpfs. Writes and truncation call
-  `remove_privs` (`CAP_FSETID` checked via `capable_wrt`), which clears setgid with group exec or
+  calls `prepare_write` and `remove_privs`, writes, and charges tmpfs. Tmpfs writes hold the BKL
+  from the final room check through charging, including a fresh check after copy-up. Writes and
+  truncation call `remove_privs` (`CAP_FSETID` checked via `capable_wrt`), which clears setgid with group exec or
   when the caller is not in the file's group and lacks `CAP_FSETID` (Linux 6.2+, aligned with
   chown).
 - `O_APPEND` writes run under the BKL at the current host length; `pwrite` on an `O_APPEND` file
@@ -101,8 +102,9 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   interruptible), then read without the BKL; writes run without the BKL, ignore guest
   `O_NONBLOCK`, retry `EINTR` and turn `EPIPE` into `SIGPIPE`; positional I/O is `ESPIPE` even on
   a regular host file, while lseek reaches the host.
-- Holes are the host's: `SEEK_DATA`/`SEEK_HOLE` ask the host object (outside the file `ENXIO`; a
-  host that cannot tell has data everywhere). lseek on a directory takes `SEEK_SET` and `SEEK_CUR`
+- `SEEK_DATA` and `SEEK_HOLE` query host extents and include tmpfs pages instantiated by mapped
+  access. Recorded fallocate reservations start as holes. Offsets outside the file
+  give `ENXIO`. A host without sparse seeks assumes data up to EOF. lseek on a directory takes `SEEK_SET` and `SEEK_CUR`
   everywhere; `SEEK_END`, `SEEK_DATA` and `SEEK_HOLE` count from the end as the filesystem's
   `llseek` does: store directories end at the largest position (ext4's hashed directories),
   procfs, sysfs and cgroup2 at 0, every other filesystem refuses them (`EINVAL`).
@@ -148,7 +150,9 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   (`EBADF`), directories `EISDIR`, pipes and sockets `ESPIPE`, other non-regular files `ENODEV`,
   then the mode: 0, `KEEP_SIZE`, `PUNCH_HOLE` (with `KEEP_SIZE`) and, outside tmpfs, `ZERO_RANGE`
   go to the host, others `EOPNOTSUPP`; then `RLIMIT_FSIZE`, seals and tmpfs room. A host without
-  the mode falls back to writing zeros (with the BKL held) and lengthening.
+  the mode falls back to zeroing or lengthening. Tmpfs records reserved guest ranges, including
+  `KEEP_SIZE` past EOF. Reservations extending past EOF or on a store without FIEMAP are logical. Tmpfs hole punching
+  revokes mapped translations across address spaces before releasing the backing pages.
 - truncate: `EISDIR`, `EINVAL` for non-regular, `EROFS`, write permission (a synthetic regular file
   then succeeds unchanged), `ETXTBSY`, `RLIMIT_FSIZE`, then leases (6.1 breaks leases before
   `inode_newsize_ok`), seals, `make_private`, unmapping the dropped tail (busy address spaces
@@ -256,6 +260,8 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 
 ## Confirmed bugs / technical debt
 
+- With a store on ext4, host readahead into a physically preallocated range can make
+  `SEEK_DATA` report adjacent, untouched reserved pages as data. Those pages were already charged.
 - **Fidelity gaps**, one per line:
   - a memfd uses an unlinked store object. Extending it to `INT64_MAX` with `ftruncate`
     returns `EFBIG` on the development store, while native Linux accepts that length

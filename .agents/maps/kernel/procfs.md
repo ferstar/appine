@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: mem reads use forced access to the pinned address space)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: report the addressed thread’s no_new_privs flag)
 
 ## Responsibilities
 
@@ -211,7 +211,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - `status`: the thread's ids (the main thread's for `/proc/<pid>`) translated into the reader's
   user namespace (the reading thread's credentials, or the opener's when regenerated),
   `NStgid`/`NSpid`/`NSpgid`/`NSsid` from the instance's namespace down, capabilities,
-  `NoNewPrivs`, `Seccomp`, signal masks (`SigPnd` the thread's, `ShdPnd` the group's); memory
+  the thread's `NoNewPrivs` (saved when the leader exits), `Seccomp`, signal masks (`SigPnd` the thread's, `ShdPnd` the group's); memory
   lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, `VmRSS` the sum of
   `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmStk` the grows-down mappings,
   exe/lib/PTE/swap 0; omitted with no live task); `FDSize` the open fds rounded up to 64;

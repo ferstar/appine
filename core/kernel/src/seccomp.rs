@@ -424,7 +424,7 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
         // Without no_new_privs, CAP_SYS_ADMIN is needed in our own user namespace (Linux's
         // seccomp_prepare_filter uses ns_capable, so root in a user namespace is enough)
         let cred = cx.cred();
-        if !cx.t.group.borrow().no_new_privs
+        if !cx.task.no_new_privs.get()
             && !cred.ns_capable(&cred.user_ns, crate::cred::cap::SYS_ADMIN)
         {
             return Err(Errno::EACCES);
@@ -532,6 +532,9 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
                 s.mode = mode::FILTER;
                 // The replaced chain decreases its user count when it is dropped
                 s.chain = Some(chain.clone());
+            }
+            if cx.task.no_new_privs.get() {
+                t.no_new_privs.set(true);
             }
             publish(t);
         }
@@ -1186,6 +1189,7 @@ fn privileged_tracer(cx: &Cx<'_>) -> Result<(), Errno> {
 pub(crate) fn exited(task: &Task, group: &mut crate::process::ThreadGroup) {
     let chain = task.seccomp.borrow_mut().chain.take();
     if task.tid.get() == group.tgid {
+        group.leader_no_new_privs = task.no_new_privs.get();
         group.leader_seccomp = chain;
     }
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: route the tab bar stop button to the retained import)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: confirm keyboard closure of busy tabs)
 
 ## Responsibilities
 
@@ -135,14 +135,13 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   and are consumed, including over the keys. The whole content column is hidden
   from accessibility while the list is open, and restored when it closes.
 
-- The list’s close buttons, `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
+- Ctrl+Shift+W, the list’s close buttons, `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
   they close is busy (its shell has ended, has not started, as in a restored tab never shown, or
   waits at its prompt as the prompt marks tell, `VtSession.busy`, android/vt's Shell integration),
   else after a confirmation dialog ("Close this tab?" for one tab, else "Close N tabs?", counting
   all of them); a shell without prompt marks always counts as busy. Several tabs are closed with the
   current one last, so no other tab is shown (and its shell started) on the way, and closing all
-  ends like closing the last tab. Ctrl+Shift+W closes the current tab without asking, even while its
-  shell runs, and in an ended tab any input with a line break (Enter) closes it.
+  ends like closing the last tab. In an ended tab any input with a line break (Enter) closes it.
 - The close dialog's button closes only the tabs still open, and dismissing it or the clipboard
   question gives the terminal the focus.
 - Its dialogs (close, notices, the clipboard question, the paste confirmation) and its menu (⋮, a
@@ -212,7 +211,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 - Taken by the activity (`dispatchKeyEvent`) before the terminal sees them, together with the
   matching key release, when the key event (from a hardware keyboard, or an IME sending key events)
-  has Ctrl without Alt or Meta: Ctrl+Shift+T opens a tab, Ctrl+Shift+W closes the current one,
+  has Ctrl without Alt or Meta: Ctrl+Shift+T opens a tab, Ctrl+Shift+W asks to close a busy tab and closes an idle one immediately,
   Ctrl+Shift+F opens the search bar (these once per press; repeats are swallowed), Ctrl+Tab and
   Ctrl+Shift+Tab show the next and the previous one, going round and repeating while held (and
   swallowed when there is nothing to switch to), and Ctrl+Shift+↑ and ↓ scroll to the previous and
@@ -379,8 +378,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ## Open questions
 
-- Should Ctrl+Shift+W ask before closing a running shell, as `×` does, and should "Close other
-  tabs" with one other tab name it rather than ask "Close this tab?"?
+- Should "Close other tabs" name the tab when only one other tab is open?
 - Should a clipboard read from a tab not in front wait until the tab is shown rather than get an
   empty clipboard, and should the question offer to remember the answer for the tab (Ghostty asks
   every time)?

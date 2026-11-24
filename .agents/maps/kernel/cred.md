@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: store ACLs in permission checks and creation mode)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-thread no_new_privs and seccomp synchronization)
 
 ## Responsibilities
 
@@ -34,8 +34,9 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   `cap_permitted`, `cap_inheritable`, `cap_bounding`, `cap_ambient` (u64), `securebits`,
   `user_ns`. All ids are kernel (initial-namespace) ids. Kept per thread (`Task.cred`), as on
   Linux; the thread group keeps a copy of its main thread's (`ThreadGroup.cred`), which is what
-  other processes go by and outlives the main thread. `dumpable` and `no_new_privs` stay per
-  thread group; umask lives in the fs context, not here.
+  other processes go by and outlives the main thread. `dumpable` belongs to the thread group and umask to the fs context.
+  Each task holds its own sticky `no_new_privs`, inherited from the calling thread on clone or fork
+  and preserved across exec.
 - `cap` constants (`LAST` = 40, `CAP_FULL`), `secbit` (NOROOT, NO_SETUID_FIXUP, KEEP_CAPS,
   NO_CAP_AMBIENT_RAISE and their locks), `MAY_EXEC`/`MAY_WRITE`/`MAY_READ`.
 - `FileCaps` — parsed `security.capability` (permitted, inheritable, effective).
@@ -180,13 +181,14 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 ### seccomp
 
 - Installing (`seccomp(2)`/prctl, Linux order): flag combinations `EINVAL`; length 0 or over 4096
-  `EINVAL`; without no_new_privs (read from the thread group) or `CAP_SYS_ADMIN` in the caller's
+  `EINVAL`; without the caller's no_new_privs or `CAP_SYS_ADMIN` in the caller's
   namespace `EACCES`; the classic and seccomp checkers (aligned loads of `seccomp_data`, forward
   jumps, packet loads and MOD rejected); mode must be disabled or filter; a second listener
   `EBUSY`; total converted length plus 4 per filter over 32768 `ENOMEM`; TSYNC requires every other
   thread to be disabled or on an ancestor chain (else that thread's tid in the caller's pid
   namespace, or `ESRCH` with `TSYNC_ESRCH` or when the caller cannot see it). The always-allow bitmap is built (ANDed with the previous filter's) and the filter
-  pushed; TSYNC copies the chain to other threads; the listener fd is close-on-exec.
+  pushed. Successful TSYNC copies the chain to other threads and sets their no_new_privs if
+  the caller has it. The listener fd is close-on-exec.
 - Filters belong to threads, are copied by clone/fork and kept across execve; an exiting leader's
   chain is held until the group is reaped.
 - At syscall entry (after a `PTRACE_SYSCALL` entry stop): disabled, `PTRACE_O_SUSPEND_SECCOMP` and
@@ -254,9 +256,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ## Open questions
 
-- `no_new_privs` is kept per thread group, while Linux keeps it per thread (prctl sets only the
-  caller's; seccomp TSYNC spreads it): does anything set it on one thread only and rely on the
-  others staying free of it?
+None.
 
 ## To verify
 

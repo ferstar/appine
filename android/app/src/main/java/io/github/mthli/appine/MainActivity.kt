@@ -584,10 +584,11 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         }
     }
 
+    private fun confirmClose(session: VtSession) = confirmClose(listOf(session))
+
     /**
-     * `×` and the menu: closes [targets] at once when none is [busy][VtSession.busy] (their shells
-     * have ended or wait at their prompts), else after asking, as closing hangs a shell up and with
-     * it, usually, the programs it runs. A shell without prompt marks always counts as busy.
+     * Ask before closing any [busy][VtSession.busy] shell, since hanging it up usually ends its
+     * programs. A running shell without prompt marks always counts as busy.
      */
     private fun confirmClose(targets: List<VtSession>) {
         if (targets.none { it.busy }) {
@@ -716,7 +717,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
             event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1)
             !event.isShiftPressed -> return false
             event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
-            event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
+            event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let(::confirmClose)
             event.keyCode == KeyEvent.KEYCODE_F -> if (first) openSearch()
             event.keyCode == KeyEvent.KEYCODE_DPAD_UP -> return layout.screen.jumpToPrompt(-1)
             event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN -> return layout.screen.jumpToPrompt(1)
@@ -806,7 +807,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
         override fun closeCurrent() {
             closeTabList()
-            current?.let { confirmClose(listOf(it)) }
+            current?.let(::confirmClose)
         }
 
         override fun newTab() = newSession()
@@ -826,7 +827,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         }
 
         override fun close(session: VtSession) {
-            if (canUse(session)) confirmClose(listOf(session))
+            if (canUse(session)) confirmClose(session)
         }
 
         override fun dismiss() = closeTabList()

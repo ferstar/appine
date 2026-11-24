@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cell::RefCell;
 use crate::cred::{Cred, cap};
@@ -135,7 +135,11 @@ const SET_ELEM_LIST_SET_ID: u16 = 4;
 const SET_ELEM_KEY: u16 = 1;
 const SET_ELEM_DATA: u16 = 2;
 const SET_ELEM_FLAGS: u16 = 3;
+const SET_ELEM_TIMEOUT: u16 = 4;
+const SET_ELEM_EXPIRATION: u16 = 5;
+const SET_ELEM_EXPR: u16 = 7;
 const SET_ELEM_KEY_END: u16 = 10;
+const SET_ELEM_EXPRESSIONS: u16 = 11;
 const GEN_ID: u16 = 1;
 const GEN_PROC_PID: u16 = 2;
 const GEN_PROC_NAME: u16 = 3;
@@ -176,6 +180,7 @@ pub(crate) struct Nft {
     /// never reused.
     table_handle: u64,
     recent: RecentLists,
+    hashlimits: HashLimits,
 }
 
 impl Default for Nft {
@@ -185,6 +190,7 @@ impl Default for Nft {
             tables: Vec::new(),
             table_handle: 0,
             recent: HashMap::new(),
+            hashlimits: HashMap::new(),
         }
     }
 }
@@ -233,6 +239,7 @@ struct Rule {
     /// a batch makes of the rule.
     rates: Rates,
     recent: Vec<(usize, RecentMatch)>,
+    hashlimits: Vec<HashMatch>,
 }
 
 type RecentLists = HashMap<Vec<u8>, Rc<RefCell<RecentList>>>;
@@ -422,6 +429,272 @@ impl RecentList {
     }
 }
 
+/// xt_hashlimit tables are named within a family and network namespace. Rules keep the table
+/// alive, including across unrelated ruleset transactions.
+type HashLimits = HashMap<(u8, Vec<u8>), std::rc::Weak<RefCell<HashLimit>>>;
+
+#[derive(Debug, Clone)]
+struct HashMatch {
+    at: usize,
+    invert: bool,
+    table: Rc<RefCell<HashLimit>>,
+}
+
+impl HashMatch {
+    fn for_rule(raw: &[u8], family: u8, tables: &mut HashLimits) -> Result<Vec<Self>, Fail> {
+        let mut matches = Vec::new();
+        for (at, (name, data)) in exprs(raw).into_iter().enumerate() {
+            if name != b"match" {
+                continue;
+            }
+            let a = crate::route::attrs(&data);
+            if get_str(&a, COMPAT_NAME) != Some(b"hashlimit") {
+                continue;
+            }
+            let invalid = || fail(Errno::EINVAL);
+            let rev = get_be32(&a, COMPAT_REV).ok_or_else(invalid)?;
+            let info = get(&a, 3).ok_or_else(invalid)?;
+            let (name_len, mode_at, mask_at) = match rev {
+                1 => (16, 16, 44),
+                2 => (255, 272, 292),
+                3 => (255, 272, 296),
+                _ => return Err(fail(Errno::ENOENT)),
+            };
+            if info.len() < mask_at + 2 {
+                return Err(invalid());
+            }
+            let end = info[..name_len]
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or_else(invalid)?;
+            let name = &info[..end];
+            let word = |i: usize| u32::from_ne_bytes(info[i..i + 4].try_into().unwrap());
+            let wide = |i: usize| u64::from_ne_bytes(info[i..i + 8].try_into().unwrap());
+            let (avg, burst, size_at) = if rev == 1 {
+                (u64::from(word(20)), u64::from(word(24)), 28)
+            } else {
+                (wide(256), wide(264), 276)
+            };
+            let mode = word(mode_at);
+            let expire = word(size_at + 12);
+            let masks = [info[mask_at], info[mask_at + 1]];
+            let bits = if family == 2 { 32 } else { 128 };
+            if name.is_empty()
+                || name.contains(&b'/')
+                || masks.iter().any(|&m| m > bits)
+                || mode & !127 != 0
+                || expire == 0
+                || word(size_at + 8) == 0
+                || avg == 0
+            {
+                return Err(invalid());
+            }
+            let bytes = mode & 32 != 0;
+            let policy = if mode & 64 != 0 {
+                if rev != 3 || word(292) == 0 || avg > u64::from(u32::MAX) {
+                    return Err(invalid());
+                }
+                let rate = if bytes {
+                    (u64::from(u32::MAX) / avg - 1) * 16
+                } else {
+                    1_000_000 / avg
+                };
+                let threshold = if bytes {
+                    burst.max(1).saturating_mul(rate)
+                } else {
+                    burst.saturating_add(rate)
+                };
+                HashPolicy::Window {
+                    interval: Duration::from_secs(word(292).into()),
+                    rate,
+                    threshold,
+                    bytes,
+                }
+            } else if bytes {
+                HashPolicy::Bytes {
+                    avg: u32::try_from(avg).map_err(|_| invalid())?,
+                    burst,
+                }
+            } else {
+                let unit = if rev == 1 { 100_000 } else { 1_000 };
+                let cost = avg.checked_mul(unit).ok_or_else(invalid)?;
+                let capacity = cost
+                    .checked_mul(burst)
+                    .filter(|&c| c != 0)
+                    .ok_or_else(invalid)?;
+                HashPolicy::Packets { cost, capacity }
+            };
+            let key = (family, name.to_vec());
+            let entry = tables.entry(key).or_default();
+            let table = entry.upgrade().unwrap_or_else(|| {
+                let size = word(size_at);
+                let size = if size == 0 { 8192 } else { size.min(1 << 20) };
+                let max = word(size_at + 4);
+                let max = if max == 0 {
+                    size * 8
+                } else {
+                    max.clamp(size, 1 << 20)
+                };
+                let table = Rc::new(RefCell::new(HashLimit {
+                    mode,
+                    masks,
+                    policy,
+                    max: max as usize,
+                    expire: Duration::from_millis(expire.into()),
+                    gc_ms: word(size_at + 8),
+                    last_gc: Instant::now(),
+                    entries: HashMap::new(),
+                }));
+                *entry = Rc::downgrade(&table);
+                table
+            });
+            matches.push(Self {
+                at,
+                invert: mode & 16 != 0,
+                table,
+            });
+        }
+        Ok(matches)
+    }
+}
+
+#[derive(Debug)]
+enum HashPolicy {
+    Packets {
+        cost: u64,
+        capacity: u64,
+    },
+    Bytes {
+        avg: u32,
+        burst: u64,
+    },
+    Window {
+        interval: Duration,
+        rate: u64,
+        threshold: u64,
+        bytes: bool,
+    },
+}
+
+#[derive(Debug)]
+struct HashLimit {
+    mode: u32,
+    masks: [u8; 2],
+    policy: HashPolicy,
+    max: usize,
+    expire: Duration,
+    gc_ms: u32,
+    last_gc: Instant,
+    entries: HashMap<Vec<u8>, HashEntry>,
+}
+
+#[derive(Debug)]
+struct HashEntry {
+    seen: Instant,
+    last: Instant,
+    credit: u64,
+    refills: u64,
+    previous_over: bool,
+}
+
+impl HashLimit {
+    fn key(&self, packet: &Packet<'_>) -> Vec<u8> {
+        const DST_IP: u32 = 1;
+        const DST_PORT: u32 = 2;
+        const SRC_IP: u32 = 4;
+        const SRC_PORT: u32 = 8;
+        let mut key = Vec::new();
+        for (flag, addr, bits) in [
+            (SRC_IP, packet.src, self.masks[0]),
+            (DST_IP, packet.dst, self.masks[1]),
+        ] {
+            if self.mode & flag != 0 {
+                for (i, byte) in addr.iter().enumerate() {
+                    let keep = (usize::from(bits).saturating_sub(i * 8)).min(8);
+                    key.push(byte & (0xff00u16 >> keep) as u8);
+                }
+            }
+        }
+        for (flag, port) in [(SRC_PORT, packet.sport), (DST_PORT, packet.dport)] {
+            if self.mode & flag != 0 {
+                key.extend(port.to_be_bytes());
+            }
+        }
+        key
+    }
+
+    fn matches(&mut self, packet: &Packet<'_>, len: u64, now: Instant) -> Option<bool> {
+        let key = self.key(packet);
+        // Apply the periodic collector up to the last elapsed tick. An idle bucket can
+        // still be reused between its expiry and the following collection.
+        let elapsed_ms = now.duration_since(self.last_gc).as_millis() as u64;
+        let period = u64::from(self.gc_ms);
+        if elapsed_ms >= period {
+            self.last_gc += Duration::from_millis(elapsed_ms - elapsed_ms % period);
+            self.entries.retain(|_, entry| {
+                self.last_gc.saturating_duration_since(entry.seen) < self.expire
+            });
+        }
+        if self.entries.len() >= self.max && !self.entries.contains_key(&key) {
+            return None;
+        }
+        let fresh = || {
+            let (credit, refills) = match self.policy {
+                HashPolicy::Packets { capacity, .. } => (capacity, 0),
+                HashPolicy::Bytes { burst, .. } => (1_000_000_000, burst),
+                HashPolicy::Window { .. } => (0, 0),
+            };
+            HashEntry {
+                seen: now,
+                last: now,
+                credit,
+                refills,
+                previous_over: false,
+            }
+        };
+        let entry = self.entries.entry(key).or_insert_with(fresh);
+        entry.seen = now;
+        let elapsed = now.duration_since(entry.last);
+        let (cost, capacity) = match self.policy {
+            HashPolicy::Window {
+                interval,
+                rate,
+                threshold,
+                bytes,
+            } => {
+                if elapsed >= interval {
+                    entry.previous_over = u128::from(entry.credit) * interval.as_nanos()
+                        > u128::from(rate) * elapsed.as_nanos();
+                    entry.credit = 0;
+                    entry.last = now;
+                }
+                entry.credit = entry.credit.saturating_add(if bytes { len } else { 1 });
+                return Some(!entry.previous_over && entry.credit <= threshold);
+            }
+            HashPolicy::Bytes { avg, .. } => {
+                let cost = ((u128::from(len / 16 + 1) * u128::from(avg) * 1_000_000_000) >> 32)
+                    .min(1_000_000_000) as u64;
+                (cost, 1_000_000_000)
+            }
+            HashPolicy::Packets { cost, capacity } => (cost, capacity),
+        };
+        entry.credit = entry
+            .credit
+            .saturating_add(elapsed.as_nanos() as u64)
+            .min(capacity);
+        entry.last = now;
+        if entry.credit < cost && entry.refills > 0 {
+            entry.refills -= 1;
+            entry.credit = capacity;
+        }
+        if entry.credit < cost {
+            return Some(false);
+        }
+        entry.credit -= cost;
+        Some(true)
+    }
+}
+
 /// See [`Rule::rates`].
 type Rates = Rc<RefCell<HashMap<usize, Rate>>>;
 
@@ -446,7 +719,22 @@ struct Set {
     /// on), returned as given in dumps.
     other: Vec<(u16, Vec<u8>)>,
     /// Elements (contents of `NFTA_LIST_ELEM`).
-    elems: Vec<Vec<u8>>,
+    elems: std::cell::RefCell<Vec<Vec<u8>>>,
+    dynamic: std::cell::RefCell<HashMap<Vec<u8>, DynamicElement>>,
+}
+
+#[derive(Debug, Clone)]
+struct DynamicElement {
+    wire: Vec<u8>,
+    exprs: Vec<(Vec<u8>, Vec<u8>)>,
+    rates: Rates,
+    expires: Option<Instant>,
+}
+
+impl DynamicElement {
+    fn live(&self, now: Instant) -> bool {
+        self.expires.is_none_or(|until| now < until)
+    }
 }
 
 // ---- Requests ----
@@ -621,6 +909,7 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Vec<u
             }
         }
         st.recent.retain(|name, _| names.contains(name.as_slice()));
+        st.hashlimits.retain(|_, table| table.strong_count() != 0);
         *ns.nft.borrow_mut() = st;
     }
     replies
@@ -1054,6 +1343,7 @@ impl Nft {
             }
         };
         let rule = Rule {
+            hashlimits: HashMatch::for_rule(&exprs, r.family, &mut self.hashlimits)?,
             recent: RecentMatch::for_rule(&exprs, &mut self.recent)?,
             handle,
             exprs,
@@ -1155,7 +1445,8 @@ impl Nft {
                 .filter(|(t, _)| !skip.contains(t))
                 .map(|(t, d)| (*t, d.to_vec()))
                 .collect(),
-            elems: Vec::new(),
+            dynamic: Default::default(),
+            elems: Default::default(),
         });
         Ok(())
     }
@@ -1198,15 +1489,25 @@ impl Nft {
         .ok_or_else(|| bad(Errno::ENOENT, get(&r.attrs, SET_ELEM_LIST_SET)))?;
         let list = get(&r.attrs, SET_ELEM_LIST_ELEMENTS).map(crate::route::attrs);
         if r.msg == DELSETELEM && list.is_none() {
-            table.sets[s].elems.clear();
+            table.sets[s].dynamic.get_mut().clear();
+            table.sets[s].elems.get_mut().clear();
             return Ok(());
         }
         for (_, e) in list.unwrap_or_default() {
             let key = elem_key(e).ok_or_else(|| bad(Errno::EINVAL, Some(e)))?;
-            let at = table.sets[s]
-                .elems
-                .iter()
-                .position(|x| elem_key(x) == Some(key.clone()) && elem_flags(x) == elem_flags(e));
+            let dynamic = table.sets[s].dynamic.get_mut();
+            if dynamic.get(&key).is_some_and(|e| e.live(Instant::now())) {
+                if r.msg == DELSETELEM {
+                    dynamic.remove(&key);
+                } else if r.flags & NLM_F_EXCL != 0 {
+                    return Err(bad(Errno::EEXIST, Some(e)));
+                }
+                continue;
+            }
+            let at =
+                table.sets[s].elems.borrow().iter().position(|x| {
+                    elem_key(x).as_ref() == Some(&key) && elem_flags(x) == elem_flags(e)
+                });
             match (r.msg, at) {
                 (NEWSETELEM, Some(_)) if r.flags & NLM_F_EXCL != 0 => {
                     return Err(bad(Errno::EEXIST, Some(e)));
@@ -1216,10 +1517,10 @@ impl Nft {
                     let elem = table
                         .check_verdict(&unflag(e), SET_ELEM_DATA, None)
                         .map_err(|f| bad(Errno(f.errno), Some(e)))?;
-                    table.sets[s].elems.push(elem);
+                    table.sets[s].elems.get_mut().push(elem);
                 }
                 (_, Some(i)) => {
-                    table.sets[s].elems.remove(i);
+                    table.sets[s].elems.get_mut().remove(i);
                 }
                 (_, None) => return Err(bad(Errno::ENOENT, Some(e))),
             }
@@ -1297,9 +1598,14 @@ impl Table {
         let maps: usize = self
             .sets
             .iter()
-            .flat_map(|s| &s.elems)
-            .filter(|e| verdict_chain(e, SET_ELEM_DATA) == Some(name))
-            .count();
+            .map(|s| {
+                s.elems
+                    .borrow()
+                    .iter()
+                    .filter(|e| verdict_chain(e, SET_ELEM_DATA) == Some(name))
+                    .count()
+            })
+            .sum();
         rules + maps
     }
 
@@ -1333,7 +1639,7 @@ impl Table {
             }
         }
         for s in &mut self.sets {
-            for e in &mut s.elems {
+            for e in s.elems.get_mut() {
                 if verdict_chain(e, SET_ELEM_DATA) == Some(old) {
                     *e = rewrite_verdict_chain(e, SET_ELEM_DATA, new);
                 }
@@ -1721,12 +2027,27 @@ impl Nft {
                 // nf_tables_dump_set: one message with the elements when there are any, and
                 // always a final one with no elements, together with DONE
                 let mut out = Vec::new();
-                if !s.elems.is_empty() {
+                let now = Instant::now();
+                let mut elements = s.elems.borrow().clone();
+                for entry in s.dynamic.borrow().values() {
+                    if entry.live(now) {
+                        let mut wire = entry.wire.clone();
+                        if let Some(expires) = entry.expires {
+                            attr(
+                                &mut wire,
+                                SET_ELEM_EXPIRATION,
+                                &be64(expires.duration_since(now).as_millis() as u64),
+                            );
+                        }
+                        elements.push(wire);
+                    }
+                }
+                if !elements.is_empty() {
                     out.push(one(
                         NEWSETELEM,
                         NLM_F_MULTI,
                         t.family,
-                        &t.elems_attrs(s, &s.elems),
+                        &t.elems_attrs(s, &elements),
                     ));
                 }
                 let mut last = one(NEWSETELEM, NLM_F_MULTI, t.family, &t.elems_attrs(s, &[]));
@@ -2228,7 +2549,14 @@ fn run_chain(e: &mut Eval<'_>, t: &Table, base: &Chain) -> i32 {
         e.rates = Some(rule.rates.clone());
         for (at, (name, data)) in exprs(&rule.exprs).into_iter().enumerate() {
             e.at = at;
-            if let Some((_, m)) = rule.recent.iter().find(|(i, _)| *i == at) {
+            if let Some(m) = rule.hashlimits.iter().find(|m| m.at == at) {
+                let len = (e.nh.len() + e.th.len()) as u64;
+                match m.table.borrow_mut().matches(e.p, len, Instant::now()) {
+                    Some(under) if under != m.invert => {}
+                    Some(_) => e.verdict = NFT_BREAK,
+                    None => return NF_DROP,
+                }
+            } else if let Some((_, m)) = rule.recent.iter().find(|(i, _)| *i == at) {
                 if !e.recent[&m.name]
                     .borrow_mut()
                     .matches(m, e.p, Instant::now())
@@ -2302,8 +2630,9 @@ impl Eval<'_> {
         let a = crate::route::attrs(data);
         let u = |t: u16| get_be32(&a, t).unwrap_or(0);
         let ok = match name {
-            b"counter" | b"log" | b"notrack" | b"dynset" | b"objref" | b"last" | b"masq"
-            | b"connlimit" | b"dup" => true,
+            b"dynset" => self.dynset(table, &a),
+            b"counter" | b"log" | b"notrack" | b"objref" | b"last" | b"masq" | b"connlimit"
+            | b"dup" => true,
             b"limit" => self.limit(&a),
             b"quota" => self.quota(&a),
             b"reject" => {
@@ -2555,6 +2884,149 @@ impl Eval<'_> {
         };
         let t = (self.p.addr_type)(a);
         self.store_u32(dreg, t)
+    }
+
+    /// A meter clones its stateful expressions once per key. All rules naming the same set
+    /// see the same buckets. UPDATE also refreshes the element's timeout.
+    fn dynset(&mut self, table: &Table, a: &[(u16, &[u8])]) -> bool {
+        let Some(set) = get_str(a, 1).and_then(|name| table.sets.iter().find(|s| s.name == name))
+        else {
+            return false;
+        };
+        let Some(key) = get_be32(a, 4).and_then(|reg| self.load(reg, set.key_len as usize)) else {
+            return false;
+        };
+        let key = key.to_vec();
+        let op = get_be32(a, 3).unwrap_or(0);
+        let inverted = get_be32(a, 9).unwrap_or(0) & 1 != 0;
+        let mut dynamic = set.dynamic.borrow_mut();
+        if op == 2 {
+            if dynamic.remove(&key).is_none() {
+                set.elems
+                    .borrow_mut()
+                    .retain(|e| elem_key(e).as_ref() != Some(&key));
+            }
+            return true;
+        }
+        if op > 1 {
+            return false;
+        }
+        let now = Instant::now();
+        let other = |kind| {
+            set.other
+                .iter()
+                .find(|(t, _)| *t == kind)
+                .map(|(_, d)| d.as_slice())
+        };
+        let timeout = get_be64(a, 6)
+            .filter(|&t| t != 0)
+            .or_else(|| Some(u64::from_be_bytes(other(SET_TIMEOUT)?.try_into().ok()?)))
+            .unwrap_or(0);
+        let deadline = || {
+            if timeout == 0 {
+                None
+            } else {
+                now.checked_add(Duration::from_millis(timeout))
+            }
+        };
+        if !dynamic.get(&key).is_some_and(|e| e.live(now)) {
+            dynamic.remove(&key);
+            let mut initial = set.elems.borrow_mut();
+            let existing = initial
+                .iter()
+                .position(|e| elem_key(e).as_ref() == Some(&key));
+            let max = other(SET_DESC)
+                .and_then(|d| get_be32(&crate::route::attrs(d), 1))
+                .filter(|&n| n > 0)
+                .unwrap_or(65535) as usize;
+            if existing.is_none() && dynamic.len() + initial.len() >= max {
+                dynamic.retain(|_, e| e.live(now));
+                if dynamic.len() + initial.len() >= max {
+                    return inverted;
+                }
+            }
+            let mut wire = if let Some(i) = existing {
+                initial.remove(i)
+            } else {
+                let mut wire = Vec::new();
+                let mut data = Vec::new();
+                attr(&mut data, DATA_VALUE, &key);
+                attr(&mut wire, SET_ELEM_KEY, &data);
+                if let Some(reg) = get_be32(a, 5) {
+                    let Some(len) = other(SET_DATA_LEN)
+                        .and_then(|b| b.try_into().ok())
+                        .map(u32::from_be_bytes)
+                    else {
+                        return false;
+                    };
+                    let Some(val) = self.load(reg, len as usize) else {
+                        return false;
+                    };
+                    data.clear();
+                    attr(&mut data, DATA_VALUE, val);
+                    attr(&mut wire, SET_ELEM_DATA, &data);
+                }
+                wire
+            };
+            let attrs = crate::route::attrs(&wire);
+            let (single, list) = if existing.is_some() {
+                (
+                    get(&attrs, SET_ELEM_EXPR),
+                    get(&attrs, SET_ELEM_EXPRESSIONS),
+                )
+            } else {
+                (get(a, 7), get(a, 10))
+            };
+            let (single, list) = if single.is_none() && list.is_none() {
+                (other(SET_EXPR), other(SET_EXPRESSIONS))
+            } else {
+                (single, list)
+            };
+            let expressions = match single {
+                Some(expr) => vec![decode_expr(expr)],
+                None => exprs(list.unwrap_or_default()),
+            };
+            if existing.is_none() {
+                let mut extra = Vec::new();
+                if let Some(expr) = single {
+                    attr(&mut extra, SET_ELEM_EXPR, expr);
+                }
+                if let Some(exprs) = list {
+                    attr(&mut extra, SET_ELEM_EXPRESSIONS, exprs);
+                }
+                wire.extend_from_slice(&extra);
+                if timeout != 0 {
+                    attr(&mut wire, SET_ELEM_TIMEOUT, &be64(timeout));
+                }
+            }
+            dynamic.insert(
+                key.clone(),
+                DynamicElement {
+                    wire,
+                    exprs: expressions,
+                    rates: Rc::default(),
+                    expires: deadline(),
+                },
+            );
+        }
+        let elem = dynamic.get_mut(&key).unwrap();
+        let old_rates = self.rates.replace(elem.rates.clone());
+        let old_at = self.at;
+        let matched = elem.exprs.iter().enumerate().all(|(at, (name, data))| {
+            self.at = at;
+            match name.as_slice() {
+                b"limit" => self.limit(&crate::route::attrs(data)),
+                b"quota" => self.quota(&crate::route::attrs(data)),
+                b"counter" => true,
+                _ => false,
+            }
+        });
+        self.rates = old_rates;
+        self.at = old_at;
+        if op == 1 && elem.expires.is_some() && timeout != 0 {
+            elem.expires = deadline();
+        }
+        matched && !inverted
     }
 
     fn lookup(&mut self, table: &Table, a: &[(u16, &[u8])]) -> bool {
@@ -3014,15 +3486,20 @@ fn reject_errno(ty: u32, code: u8, v6: bool) -> i32 {
 /// KEY_END are [start, end]; those without are sorted endpoints, and the last one not greater
 /// than the key must not be an interval end).
 fn set_find(set: &Set, key: &[u8]) -> Option<Vec<u8>> {
+    if let Some(e) = set.dynamic.borrow().get(key)
+        && e.live(Instant::now())
+    {
+        return Some(e.wire.clone());
+    }
+    let elems = set.elems.borrow();
     if set.flags & NFT_SET_INTERVAL == 0 {
-        return set
-            .elems
+        return elems
             .iter()
             .find(|e| elem_key(e).as_deref() == Some(key))
             .cloned();
     }
     let mut best: Option<(Vec<u8>, &Vec<u8>)> = None;
-    for e in &set.elems {
+    for e in elems.iter() {
         let Some(k) = elem_key(e) else { continue };
         if let Some(end) = elem_key_end(e) {
             if &k[..] <= key && key <= &end[..] {
@@ -3136,14 +3613,16 @@ fn unflag(mut b: &[u8]) -> Vec<u8> {
 fn exprs(e: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     crate::route::attrs(e)
         .into_iter()
-        .map(|(_, x)| {
-            let a = crate::route::attrs(x);
-            (
-                get_str(&a, EXPR_NAME).unwrap_or_default().to_vec(),
-                get(&a, EXPR_DATA).unwrap_or_default().to_vec(),
-            )
-        })
+        .map(|(_, x)| decode_expr(x))
         .collect()
+}
+
+fn decode_expr(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let a = crate::route::attrs(raw);
+    (
+        get_str(&a, EXPR_NAME).unwrap_or_default().to_vec(),
+        get(&a, EXPR_DATA).unwrap_or_default().to_vec(),
+    )
 }
 
 /// An element's key (the value in `NFTA_SET_ELEM_KEY`).
@@ -4073,19 +4552,21 @@ mod tests {
             id: None,
             other: Vec::new(),
             // 80-89, 100-100 (an end is the next value, exclusive)
+            dynamic: Default::default(),
             elems: vec![
                 elem(&[0, 80], false, None),
                 elem(&[0, 90], true, None),
                 elem(&[0, 100], false, None),
                 elem(&[0, 101], true, None),
-            ],
+            ]
+            .into(),
         };
         let hit = |s: &Set, p: u16| set_find(s, &p.to_be_bytes()).is_some();
         assert!(!hit(&s, 79));
         assert!(hit(&s, 80) && hit(&s, 89));
         assert!(!hit(&s, 90) && !hit(&s, 99));
         assert!(hit(&s, 100) && !hit(&s, 101));
-        s.elems = vec![elem(&[0, 10], false, Some(&[0, 20]))];
+        *s.elems.get_mut() = vec![elem(&[0, 10], false, Some(&[0, 20]))];
         assert!(hit(&s, 10) && hit(&s, 20) && !hit(&s, 21));
         s.flags = 0;
         assert!(hit(&s, 10) && !hit(&s, 11));
