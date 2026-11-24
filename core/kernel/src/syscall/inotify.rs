@@ -82,8 +82,24 @@ const MAX_WATCHES: usize = 1 << 20;
 struct Watch {
     node: Node,
     mask: u32,
-    /// The inode number and device (the kernel's internal encoding) fdinfo shows.
-    shown: (Ino, u64),
+    /// The inode number shown in fdinfo.
+    ino: Ino,
+    /// The filesystem device in the kernel's internal encoding.
+    sdev: u64,
+}
+
+impl Watch {
+    /// Bind mounts share a watch. Store, overlay and FUSE node IDs are unique across
+    /// instances, while the same synthetic node can occur on separate superblocks.
+    fn same_inode(&self, other: &Watch) -> bool {
+        match (&self.node, &other.node) {
+            (Node::Store(_, a), Node::Store(_, b))
+            | (Node::Overlay(_, a), Node::Overlay(_, b))
+            | (Node::Fuse(_, a), Node::Fuse(_, b)) => a == b,
+            (Node::Pseudo(_, a), Node::Pseudo(_, b)) => a == b && self.sdev == other.sdev,
+            _ => false,
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -195,10 +211,9 @@ impl Inotify {
     pub fn fdinfo(&self) -> String {
         let mut out = String::new();
         for (wd, w) in &self.watches {
-            let (ino, sdev) = w.shown;
             out += &format!(
-                "inotify wd:{wd:x} ino:{ino:x} sdev:{sdev:x} mask:{:x} ignored_mask:0",
-                w.mask
+                "inotify wd:{wd:x} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:0",
+                w.ino, w.sdev, w.mask
             );
             if let Node::Store(_, ino) = w.node {
                 let handle: String = ino
@@ -280,14 +295,13 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     if mask & IN_ONLYDIR != 0 && !vfs.is_dir(&view, &node)? {
         return Err(Errno::ENOTDIR);
     }
-    // What fdinfo shows: the device in the kernel's internal encoding, (major << 20) | minor (the
-    // store is 8:1, procfs 0:4)
+    // fdinfo encodes the filesystem device as (major << 20) | minor.
     let internal = |dev: u64| {
         let major = (dev >> 8) & 0xfff | (dev >> 32) & !0xfff;
         let minor = dev & 0xff | (dev >> 12) & !0xff;
         major << 20 | minor
     };
-    let shown = match &node {
+    let (ino, sdev) = match &node {
         Node::Store(_, ino) => {
             cx.cred().permission(&vfs.store().stat(*ino)?, MAY_READ)?;
             (*ino, 0x80_0001)
@@ -297,14 +311,21 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
             cx.cred().permission(&st, MAY_READ)?;
             (st.ino, internal(vfs.dev_of(&node)))
         }
-        Node::Pseudo(_, p) => (crate::pseudo::ino_of(p), crate::pseudo::fs_of(p).dev()),
+        Node::Pseudo(_, p) => {
+            // A namespace file belongs to nsfs even when reached through procfs.
+            let dev = if matches!(p, crate::pseudo::PseudoNode::NsFile(..)) {
+                crate::vfs::Fs::Nsfs.dev()
+            } else {
+                vfs.dev_of(&node)
+            };
+            (crate::pseudo::ino_of(p), internal(dev))
+        }
         Node::Fuse(_, f) => {
             vfs.fuse_permission(&cx.cred(), *f, MAY_READ)?;
             let ino = crate::vfs::fuse::cached_attr(&vfs, *f)?.ino;
             (ino, internal(vfs.dev_of(&node)))
         }
     };
-    let keep = IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT;
     // A cgroup2 file, or a cgroup's directory, starts being looked at for changes
     match &node {
         Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b"")) => {
@@ -315,16 +336,22 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
         }
         _ => {}
     }
+    let watch = Watch {
+        node,
+        mask: mask & (IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT),
+        ino,
+        sdev,
+    };
     let mut i = inotify.borrow_mut();
     // The same object already has a watch: change its mask (merged with IN_MASK_ADD)
-    if let Some((&wd, w)) = i.watches.iter_mut().find(|(_, w)| w.node == node) {
+    if let Some((&wd, w)) = i.watches.iter_mut().find(|(_, w)| w.same_inode(&watch)) {
         if mask & IN_MASK_CREATE != 0 {
             return Err(Errno::EEXIST);
         }
         w.mask = if mask & IN_MASK_ADD != 0 {
-            w.mask | (mask & keep)
+            w.mask | watch.mask
         } else {
-            mask & keep
+            watch.mask
         };
         return Ok(wd as u64);
     }
@@ -337,20 +364,13 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     i.last_wd = i.last_wd.checked_add(1).ok_or(Errno::ENOSPC)?;
     r.users.entry(i.uid).or_default().1 += 1;
     let wd = i.last_wd;
-    i.watches.insert(
-        wd,
-        Watch {
-            node: node.clone(),
-            mask: mask & keep,
-            shown,
-        },
-    );
-    if let Some(ino) = key_of(&node) {
+    if let Some(ino) = key_of(&watch.node) {
         r.by_ino
             .entry(ino)
             .or_default()
             .push((Rc::downgrade(&inotify), wd));
     }
+    i.watches.insert(wd, watch);
     Ok(wd as u64)
 }
 
@@ -951,7 +971,8 @@ mod tests {
             Watch {
                 node: Node::Store(crate::vfs::ROOT_MOUNT, ino),
                 mask,
-                shown: (ino, 0x80_0001),
+                ino,
+                sdev: 0x80_0001,
             },
         );
         r.by_ino

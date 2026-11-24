@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: Files app opens that move shared mappings)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: watch identity across bind mounts and synthetic filesystem instances)
 
 ## Responsibilities
 
@@ -72,8 +72,11 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
   node's key, whose changes `kernel/cgroup` reports as `IN_MODIFY`; watches on other synthetic
   nodes are accepted, counted and never report. Adding one needs read permission on what the
   store or the overlay shows (a FUSE node `fuse_permission`'s; synthetic nodes are not checked);
-  a watch is identified by its node, mount included. `IN_MASK_ADD`/`IN_MASK_CREATE`,
-  `IN_ONLYDIR`, `IN_DONT_FOLLOW`, `IN_EXCL_UNLINK`, `IN_ONESHOT`.
+  bind aliases of a node share one descriptor per instance. Store, overlay and FUSE use their
+  respective node IDs; synthetic nodes are compared within their filesystem device. Adding an
+  existing watch replaces its mask, merges it with `IN_MASK_ADD`, or fails with `EEXIST` for
+  `IN_MASK_CREATE`. Other flags include `IN_ONLYDIR`, `IN_DONT_FOLLOW`, `IN_EXCL_UNLINK` and
+  `IN_ONESHOT`.
 - read returns whole events (`EINVAL` if the first does not fit) and blocks unless nonblocking;
   `FIONREAD`, poll readiness and fdinfo read the instance. No fanotify (`ENOSYS`), no dnotify.
 
@@ -166,10 +169,11 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
 
 ## Confirmed bugs / technical debt
 
-- **Identity and event gaps:** a watch is identified by its node, mount included, so one inode
-  watched through two bind mounts gives two descriptors and each event twice (Linux keeps one mark
-  per inode per instance); fdinfo shows device 8:1 for every store-node watch, tmpfs files
+- **fdinfo and event gaps:** fdinfo shows device 8:1 for every store-node watch, tmpfs files
   included; store FIFOs and cgroup2 files report `IN_OPEN` but never `IN_CLOSE_*`.
+- **Namespace-file watch lifetime:** repeated watches on `/proc/self/ns/mnt` reuse the descriptor
+  by namespace ID. Native Linux 6.8 returned a new descriptor on each lookup when no fd pinned
+  the nsfs inode, and reused it while an fd was open.
 - **Executing a file reports nothing:** execve opens and reads the program (and a script's
   interpreter) without `IN_OPEN`, `IN_ACCESS` or `IN_CLOSE_NOWRITE`.
 - **Overlay layers see little:** watches on a layer's own directories and files see, of what is
