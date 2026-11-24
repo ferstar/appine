@@ -219,6 +219,14 @@ static void test_vfork_sharer_not_corrupted(void)
 
         pid_t child = vfork();
         if (child == 0) {
+            /*
+             * Exempt the vfork child from follow-up OOM ticks after parent exits: parent is still
+             * killed by /oom_reap_vfork's memory.max, while child stays in the same cgroup as a
+             * live sharer so reap() must leave their shared address space intact.
+             */
+            int adj = open("/proc/self/oom_score_adj", O_WRONLY);
+            if (adj < 0 || write(adj, "-1000\n", 6) != 6 || close(adj) != 0)
+                _exit(5);
             char b = 'R';
             if (write(ready[1], &b, 1) != 1)
                 _exit(2);
@@ -250,12 +258,15 @@ static void test_vfork_sharer_not_corrupted(void)
 
     char ok = 0;
     CHECK(read(res[0], &ok, 1) == 1, "read res");
-    close(res[0]);
     CHECK(ok == 'K', "vfork child saw corrupted/reaped memory: %c", ok);
 
     int st = 0;
     CHECK(waitpid(parent, &st, 0) == parent, "waitpid parent");
     CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "expected parent SIGKILL, st=0x%x", st);
+    /* Wait for child to close res[1] on exit before removing the cgroup. */
+    char eof = 0;
+    CHECK(read(res[0], &eof, 1) == 0, "wait child exit");
+    close(res[0]);
     CHECK(rmdir(cg) == 0, "rmdir %s", cg);
 }
 
