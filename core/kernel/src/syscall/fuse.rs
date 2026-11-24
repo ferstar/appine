@@ -343,7 +343,7 @@ pub(super) fn remove(
         f.forget_child(dir, name);
         f.stale(dir);
         f.stale(child);
-        rmdir || f.get(child).is_none_or(|n| n.attr.nlink <= 1)
+        f.unlinked(child, rmdir)
     };
     // As the store's removals report: mark open descriptions unlinked, then report the file's
     // link count, its deletion with its last link, and the directory's entry
@@ -1332,11 +1332,11 @@ pub(super) fn rename_at(
     if src_dir && vfs.fuse().is_within(to, src) {
         return Err(Errno::EINVAL);
     }
-    // What the replaced name was: a directory, the last link of a file
+    // What the replaced name was: a directory, or a file whose last link may be gone
     let dst_seen = dst.and_then(|d| {
         let f = vfs.fuse();
         let n = f.get(d)?;
-        Some((d, n.kind() == mode::S_IFDIR, n.attr.nlink <= 1))
+        Some((d, n.kind() == mode::S_IFDIR))
     });
     rename(
         cx,
@@ -1346,13 +1346,19 @@ pub(super) fn rename_at(
         src_dir.then_some(src),
         flags,
     )?;
-    if let Some((d, dir, _)) = dst_seen {
+    let dst_seen = dst_seen.map(|(d, dir)| {
         let mut f = vfs.fuse_mut();
         f.stale(d);
-        if flags & RENAME_EXCHANGE != 0 && dir {
-            f.moved(d, from, old);
-        }
-    }
+        let last = if flags & RENAME_EXCHANGE != 0 {
+            if dir {
+                f.moved(d, from, old);
+            }
+            false
+        } else {
+            f.unlinked(d, dir)
+        };
+        (d, dir, last)
+    });
     // fsnotify_move: mark any replaced target unlinked, move open files to their new names, then
     // emit the pair of moves with one cookie, the replaced file's events and the moved file's own
     // event

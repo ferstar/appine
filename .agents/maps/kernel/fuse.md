@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: core-dump fills and proc memory reads and writes)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cache sweep high-water mark backoff and prompt forgetting of unlinked nodes)
 
 ## Responsibilities
 
@@ -40,8 +40,8 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   `max_write`, `max_read`), `no` (operations the daemon answered ENOSYS to), the number of attached
   device files, the next `unique` (even, from 2), the queues `pending` and `interrupts` plus
   `requests` by unique, the `forgets` to send with Linux's `forget_batch`, `opens`, the open
-  handles of each node id, and `doomed`, the node ids `drop_caches` kept only for a release in
-  flight.
+  handles of each node id, and `doomed`, the node ids marked for prompt forgetting (either kept at
+  `drop_caches` only for a release in flight, or whose last link was removed through the mount).
 - `Req` — the whole message, its state (`Pending` until read, `Sent` until answered, `Done` with
   the reply or error), whether nobody waits for it (`background`: INIT, RELEASE) and whether its
   caller was interrupted.
@@ -50,7 +50,8 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 - `DevFile` (`FileKind::FuseDev`) — the connection once attached (None before), the device node it
   was opened through, the opener's user namespace.
 - `Fuses` (in `Vfs`) — connections by device number, `Node`s by `FuseId`, the node of each
-  (device, daemon node id), and a `clock` counting entries.
+  (device, daemon node id), a `clock` counting entries, and `sweep_at`, the high-water mark above
+  which new entries ask for a sweep.
 - `FuseId` — a node's number, never reused; `Node::Fuse(MountId, FuseId)` in the VFS. `key(id)` is
   `3 << 62 | id`, its number in tables keyed by inode (locks, inotify watches, a program's inode).
 - `Node` — device and daemon node id, the directory and name it was last found under (a root's
@@ -80,7 +81,7 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   `attach`, `readiness`, `object`), `atomic_o_trunc`, `dont_mask`.
 - Cache and retries: `Fuses` (`add`, `remove`, `root_of`, `conn`, `conn_of`, `get`, `node`,
   `cached_child`, `enter`, `enter_negative`, `forget_child`, `moved`, `is_within`, `set_attr`,
-  `stale`, `link`, `set_link`, `evict`), `token`, `new_syscall`, `need`, `serve`, `program`,
+  `stale`, `link`, `set_link`, `evict`, `unlinked`), `token`, `new_syscall`, `need`, `serve`, `program`,
   `lookup`, `getattr`, `cached_attr`, `target`, `key`, `id_of`, `drop_caches`.
 - Request helpers: `open`, `read`, `write`, `readdir`, `statfs`, `access`, `getxattr`,
   `lock_owner`, `snapshot`.
@@ -176,7 +177,7 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   pipe takes one whole request (the device's own `O_NONBLOCK`, EIO when the pipe lacks room, the
   request then lost as in Linux), and splice from a pipe takes a reply of the length asked, its
   header's length set to it (`kernel/pipe`).
-- poll: always writable, readable while a request or an interrupt for a held request waits,
+- poll: always writable, readable while a request, a forget, or an interrupt for a held request waits,
   `POLLERR` once aborted or unattached.
 - `FUSE_DEV_IOC_CLONE` attaches an unattached device file to the connection of another, both
   opened in one user namespace; anything else, a bad fd included, is EINVAL.
@@ -205,23 +206,30 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   truncation, fallocate, xattr changes and links stale the node; SETATTR caches its reply.
 - Every entry accepted counts a lookup on its node (`nlookup`), even one refused as a loop; the
   root's node id counts none.
-- Forgetting (6.1 evicting unused inodes): when an entry takes the cache past 16384 nodes, or a
-  write of 2 or 3 to `vm.drop_caches`, `SWEEP` is set and the dispatcher calls `sweep` at the end
-  of a syscall. It keeps what `in_use` finds (every task's root and cwd, the node of every open
-  file in every fd table, O_PATH ones included, every running program's key, every mount's root
-  and point attached or detached, every inotify watch), each connection's roots, nodes with an
-  open handle or live O_PATH description, and nodes a request in flight refers to (its node, a
-  rename's other directory, or a link's file). It keeps their ancestor directories and retries if
-  it finds a borrow. `evict` then forgets leaves (nodes no other node lies in), oldest entered first, round
-  after round: all it may with `drop_caches`, otherwise down to 12288. A forgotten node leaves the
-  table and the node-id index, the names naming it go with negative entries no longer valid, and
-  its `nlookup` is queued as a forget and the readers woken. A node id looked up again is a new
-  node.
-- A node `drop_caches` keeps only for a release in flight (its file closed, the daemon not yet
-  answering `FUSE_RELEASE`/`RELEASEDIR`) loses its names and is doomed: the daemon's answer to that
-  release asks for a sweep, which forgets it unless something keeps it again or a lookup found it
-  meanwhile (Linux evicts the inode when the release, holding its last reference, ends; its dentry
-  is gone and FUSE keeps no unused inode).
+- Forgetting (6.1 evicting unused inodes): when an entry takes the cache past `sweep_at` (starting
+  at 16384), an unlinked/rmdir'd/overwritten node loses its last link, a doomed node's last open
+  handle or request finishes, or a write of 2 or 3 to `vm.drop_caches` runs, `SWEEP` is set and the
+  dispatcher calls `sweep` at the end of a syscall. It keeps what `in_use` finds (every task's root
+  and cwd, the node of every open file in every fd table, O_PATH ones included, every running
+  program's key, every mount's root and point attached or detached, every inotify watch), each
+  connection's roots, nodes with an open handle or live O_PATH description, and nodes a request in
+  flight refers to (its node, a rename's other directory, or a link's file). It keeps their ancestor
+  directories and retries if it finds a borrow. `evict` first forgets unused `doomed` nodes (and any
+  unused cached descendants of a doomed directory) leaves-first without waiting for 16384 nodes,
+  then runs bulk LRU eviction only on `drop_caches` (all unused nodes) or while the cache still
+  exceeds 16384 (down to 12288, leaves first, oldest entered first). After a bulk trim or
+  `drop_caches`, `sweep_at` is set to `max(16384, live + max(live / 4, 4096))` so working sets above
+  16384 do not rescan on every new entry, and resets back toward 16384 as nodes drop or an instance
+  is removed. A forgotten node leaves the table and the node-id index, the names naming it go with
+  negative entries no longer valid, and its `nlookup` is queued as a forget and the readers woken. A
+  node id looked up again is a new node (and reusing a doomed node id for any type clears its doom).
+- A node `unlink`, `rmdir`, or non-exchange overwriting `rename` removes the last link of (cached
+  `nlink` decremented, always last for directories) is doomed in `Conn::doomed` and swept at once if
+  unused. If held open or busy in flight, it stays alive and doomed until closed and its
+  `FUSE_RELEASE`/`RELEASEDIR` reply (or `no_release` handle drop, or last non-open request reply)
+  schedules a sweep; one held solely by an `O_PATH` pin, cwd, mount or watch stays alive and is
+  forgotten on the next sweep once released. Likewise, a node `drop_caches` keeps only for a release
+  in flight loses its names and is doomed until that release ends unless a lookup saves it.
 
 ### Permission
 
@@ -426,10 +434,6 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 
 - A resident mapping can show old data after a silent backend change until a data notification
   or an invalidating open. `STORE` does not supply mapped data, and there is no periodic flusher.
-- **Forgetting is coarser than Linux's:** nodes go only above 16384 or with `drop_caches`, not when
-  a file unlinked through the mount is no longer used (Linux forgets it at once). When every
-  node above the limit is in use, each new entry makes the next syscall's end scan every task
-  again.
 - **Locks stay local:** POSIX, OFD and flock locks on FUSE files work only between processes of this
   kernel; the daemon never sees them.
 - **Missing pieces:** no `fuseblk` (ntfs-3g), no fusectl (`/sys/fs/fuse/connections` and its
