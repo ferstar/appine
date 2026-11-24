@@ -83,9 +83,9 @@ internal class TerminalFiles(application: Application) : AndroidViewModel(applic
                         resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
                             if (cursor.moveToFirst()) name = cursor.getString(0)?.takeIf(String::isNotEmpty) ?: name
                         }
-                        val input = resolver.openInputStream(uri)
-                            ?: throw IOException("Cannot open the selected file")
-                        paths += copyIntoHome(store, account, name, input, context)
+                        paths += copyIntoHome(store, account, name, context) {
+                            resolver.openInputStream(uri) ?: throw IOException("Cannot open the selected file")
+                        }
                     } catch (e: Exception) {
                         failures += context.getString(R.string.import_file_failed, name, e.message ?: e.javaClass.simpleName)
                     }
@@ -105,50 +105,27 @@ internal class TerminalFiles(application: Application) : AndroidViewModel(applic
     private fun changed() { notifications.value = Unit }
 
     companion object {
-        /** Owns [input]; a failed copy or close removes only the file it created. */
+        /** Publishes the completed file only after both streams close successfully. */
         internal fun copyIntoHome(
             store: String,
             account: Rootfs.Account,
             displayName: String,
-            input: InputStream,
             context: Context? = null,
+            openInput: () -> InputStream,
         ): String {
-            var createdFile: Pair<String, String>? = null
-            val (top, imported) = try {
-                input.use {
-                    val top = Documents.documentId(account.home)?.takeIf { it != "/" }
-                        ?: throw IOException("The login account has no home directory")
-                    val home = account.home.trimEnd('/')
-                    val safeName = displayName.map { if (Character.isISOControl(it)) '_' else it }.joinToString("")
-                    val name = Documents.fileName(safeName, "", false)
-                    val created = Native.browseCreate(store, top, top, name, false, account.uid, account.gid)
-                    val path = Documents.child(top, created)
-                    createdFile = top to path
-                    val fd = Native.browseOpenWrite(store, top, path, truncate = false, append = false)
-                    try {
-                        ParcelFileDescriptor.AutoCloseOutputStream(ParcelFileDescriptor.adoptFd(fd)).use { output ->
-                            input.copyTo(output)
-                            output.flush()
-                            output.fd.sync()
-                        }
-                    } finally {
-                        Native.browseWritten(store, top, path)
-                    }
-                    top to Documents.child(home, Documents.displayName(created))
-                }
-            } catch (e: Exception) {
-                createdFile?.let { (top, path) ->
-                    try {
-                        Native.browseRemove(store, top, path)
-                    } catch (cleanup: Exception) {
-                        e.addSuppressed(cleanup)
-                        context?.let { runCatching { Documents.dirsChanged(it, arrayOf(top)) } }
+            val top = Documents.documentId(account.home)?.takeIf { it != "/" }
+                ?: throw IOException("The login account has no home directory")
+            val safeName = displayName.map { if (Character.isISOControl(it)) '_' else it }.joinToString("")
+            val name = Documents.fileName(safeName, "", false)
+            val created = Native.browseImport(store, top, name, account.uid, account.gid) { fd ->
+                openInput().use { input ->
+                    ParcelFileDescriptor.AutoCloseOutputStream(ParcelFileDescriptor.fromFd(fd)).use { output ->
+                        input.copyTo(output)
                     }
                 }
-                throw e
             }
             context?.let { Documents.dirsChanged(it, arrayOf(top)) }
-            return imported
+            return Documents.child(account.home.trimEnd('/'), Documents.displayName(created))
         }
 
         /** Escapes imported absolute paths as shell arguments without appending a newline. */

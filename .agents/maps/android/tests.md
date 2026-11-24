@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: cover tab-layout hash collisions, epoch-based kill routing, VtView preedit/blink/focus, VtSession reset/write cancellation, and file-import provider notifications)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: cover import publication after source close and a concurrent name collision)
 
 ## Responsibilities
 
@@ -55,9 +55,10 @@ debug variant, manifest and network-security configuration belong to `android/bu
   preview pixels under full-frame requests and subrow layouts, split control sequences, quiet
   output, timeout, complete repaint and detach cleanup. It drives layout/draw directly, not the IME.
 - `TerminalFilesTest` uses isolated stores for binary/empty imports, collisions, name/home
-  escaping, read/close failure cleanup, missing homes and `Documents.dirsChanged` provider
-  notifications; a real guest shell checks reads and
+  escaping, read/close failure cleanup, invisibility before source close, a competing name created
+  during the copy, missing homes and provider notifications. A guest shell checks reads and
   clipboard quoting. A locked MainActivity checks pending-picker retention across recreation.
+  All nine cases passed on the API 34 (4 KiB pages) and API 37 (16 KiB pages) emulators.
 - `DiagnosticsTest` checks two-part byte limits and previous-run rotation, ZIP entries and
   report retention, own-PID capture excluding another process, read-only share intents and
   provider root confinement, plus rejection of locked/stale export callbacks and recreation.

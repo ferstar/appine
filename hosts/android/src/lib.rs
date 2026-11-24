@@ -435,6 +435,58 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseSearch<'l>(
 // [`browse`]). New names come from the user and are used as UTF-8 as they are, without decoding
 // `%XX`; returned names are written by [`browse::encode_path`].
 
+/// Calls the writer with a borrowed staging fd, then publishes the complete file in the home.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseImport<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    home: JString<'l>,
+    name: JString<'l>,
+    uid: jint,
+    gid: jint,
+    writer: JObject<'l>,
+) -> jstring {
+    use appine_kernel::errno::Errno;
+    use std::os::fd::AsRawFd;
+
+    guarded!("Native.browseImport", throws env, std::ptr::null_mut(), {
+        let (Some(store), Some(home), Some(name)) = (
+            string(&mut env, &store),
+            string(&mut env, &home),
+            string(&mut env, &name),
+        ) else {
+            return std::ptr::null_mut();
+        };
+        let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+            browse::import_file(
+                s,
+                &browse::decode_path(&home),
+                name.as_bytes(),
+                (uid as u32, gid as u32),
+                |file| {
+                    env.call_method(&writer, "accept", "(I)V", &[file.as_raw_fd().into()])
+                        .map(drop)
+                        .map_err(|_| Errno::EIO)
+                },
+                changes,
+            )
+        });
+        match r {
+            Ok(name) => env
+                .new_string(browse::encode_path(&name))
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            Err(e) => {
+                if !env.exception_check().unwrap_or(true) {
+                    throw(&mut env, format!("cannot import {name} into {home}: {e}"));
+                }
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// Creates a file or directory ([directory]) in directory [dir], owned by [uid] and [gid]; when the
 /// name is taken another one is used, and the name actually used is returned.
 #[unsafe(no_mangle)]

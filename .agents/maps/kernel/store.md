@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: unlink created objects on savepoint rollback and wrap import_rootfs with ensure_dev_nodes in one transaction)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: stage home-file imports outside the guest tree and publish after sync)
 
 ## Responsibilities
 
@@ -75,7 +75,7 @@ provider and rootfs installation UI (`android`).
   `set_times`, `set_times_open`; `transaction`.
 - **Durability**: `commit`, `commit_due`, `set_waker`, `Meta::sync_metadata`, `Meta::sync_all`.
 - **Host-facing**: `import_rootfs`, `sync_store`, `browse` (stat, list, open, text sniffing,
-  search), `browse_changing` (create, remove, rename, move, open for writing, written),
+  search), `browse_changing` (create, import a file, remove, rename, move, open for writing, written),
   `take_changed_dirs`.
 
 ## Data flow / lifecycle
@@ -84,8 +84,8 @@ provider and rootfs installation UI (`android`).
 
 - A store directory holds `meta.db` (SQLite, WAL mode), `objects/` and `lock`.
 - Tables: `inodes` (mode, owner, nlink, `..` parent for directories, rdev, mtime/ctime, symlink
-  targets), `dentries`, `xattrs`, `detached_roots` (tmpfs roots), `shared` (regular files whose data
-  is not plainly their own object: the object's number and, while held, the access time). Only
+  targets), `dentries`, `xattrs`, `detached_roots` (tmpfs roots and file-import staging directories),
+  `shared` (regular files whose data is not plainly their own object: the object's number and, while held, the access time). Only
   primary keys are indexed, and `shared` by object. Tables are created with `IF NOT EXISTS`, so
   older stores gain `shared` when opened.
 - Pragmas: `journal_mode = WAL`, `synchronous = NORMAL`, `journal_size_limit = 8 MB`, a 10 s busy
@@ -156,8 +156,8 @@ provider and rootfs installation UI (`android`).
   find it. rmdir likewise leaves an nlink-0 row. Rows stay until
   the next boot cleanup, so numbers are not reused while the store runs; after boot, numbers above
   the highest surviving row (and numbers of rolled-back inserts) are reused.
-- tmpfs trees are detached directories (their own parent) recorded in `detached_roots`; their files
-  are ordinary objects.
+- tmpfs trees and file-import staging directories are detached directories (their own parent) recorded in
+  `detached_roots`; their files are ordinary objects.
 - `create_anonymous` (memfd) creates an nlink-0 row owned by the given ids (`memfd_create` passes
   the caller's fsuid and fsgid) and an object that is unlinked at once, so only the returned fd
   holds the data.
@@ -212,7 +212,7 @@ provider and rootfs installation UI (`android`).
 - Every connection takes a shared `flock` on `lock`. If it can get the lock exclusively (nobody else
   has the store open), it runs boot cleanup: reset `users`, delete objects in the recorded
   uncommitted range that have no row, empty the volatile directories passed in (the kernel passes
-  `/dev/shm` and `/run`; host-side openers pass none), remove detached tmpfs trees, sync, drop the
+  `/dev/shm` and `/run`; host-side openers pass none), remove detached trees, sync, drop the
   `shared` rows of deleted files, delete nlink-0 rows no `shared` row uses as an object and their
   objects, delete the objects those dropped rows used that no row uses any more (unless one is a
   live file's own data), taking all those numbers back out of the doomed list the emptying filled,
@@ -243,8 +243,8 @@ provider and rootfs installation UI (`android`).
 
 - Connections, not processes, are counted in `users`. The kernel and the app's DocumentsProvider run
   in the same process; each host call (`browse`, `browse_changing`, `write_file`, `read_file`) opens
-  its own short-lived connection, and while it is open every operation commits immediately. A count
-  leaked by a crash can only persist while another process holds the shared lock (e.g. several
+  its own connection. A file import keeps this connection through the provider copy. While multiple
+  connections are open, every operation commits immediately. A count leaked by a crash can only persist while another process holds the shared lock (e.g. several
   `appine-run` processes on one store), so on Android the next open is exclusive and resets it.
 - Changes made by host calls are replayed to running kernels of the same store in this process
   (found in the machine's registry), under their BKL, as inotify events. Directories the guest
@@ -276,6 +276,12 @@ provider and rootfs installation UI (`android`).
   whose real path is the root directory, which would cover everything; `top` itself cannot be
   removed). No guest permission checks are applied, tree removal is one operation per entry, and
   provider writes do not strip setuid/setgid bits or capabilities.
+- `import_file` creates a file in a detached directory and commits before calling its writer.
+  The store stays open during the copy and holds no SQLite writer lock. After syncing the object,
+  it checks that the account's home still resolves to the original directory, renames the file
+  there without replacement (numbering collisions as in `create`), and retires the staging
+  directory in one transaction. Only a committed import reports `Created`, `Opened` and `Written`.
+  Errors clean up the staging tree, and boot reclaims one abandoned by process death.
 - A provider write reports `Opened`, writes the object directly, and reports `Written` on close if
   the path still resolves (`IN_MODIFY`, `IN_CLOSE_WRITE` in the guest).
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: spawn stderr-log thread before dup2 on fd 2)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: add the synchronous writer callback for atomic home-file imports)
 
 ## Responsibilities
 
@@ -27,7 +27,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 - `MACHINES` — a mutex-protected map from handle (`jlong`, from `NEXT_HANDLE`, counting up from 1
   and never reused in a process) to `RegisteredMachine` (`Arc<Machine>` plus `has_gpu: bool`); a poisoned lock is recovered. `vt.rs` looks
   kernels up in the same table through `machine(handle)`.
-- `Native` — `internal object` with 38 `@JvmStatic external` functions, 17 of them
+- `Native` — `internal object` with 39 `@JvmStatic external` functions, 18 of them
   `@Throws(IOException::class)`; its initialiser loads the library and calls the private
   `init(BuildConfig.DEBUG)`.
 - `guarded!` — the macro every JNI body runs in: `(name, fallback, body)`, or
@@ -38,7 +38,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 - Init: `init(verbose)` (private; stderr redirect, debug log).
 - Store: `importRootfs`, `syncRootfs`, `writeFile`, `readFile` (null on `ENOENT`).
 - Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch` (read);
-  `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
+  `browseImport`, `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
   (through the store's change path; `browseWritten` is not `@Throws` and ignores every error).
 - Kernel: `start(store, tier, gpu)` (1 = Tier 1, else Tier 0; when `gpu` is true, probes `:venus` and attaches the Android renderer if supported, otherwise starts with `None` without binding `:venus`; the kernel starts with
   `debug.exception-trace` at 1, so guest crashes reach the kernel log and with it the bug reports;
@@ -79,8 +79,10 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   throw "the machine is stopped", `takeListens`, `takeKills` and `takeChangedDirs` return empty
   arrays, `bklStall` and `consoleCwd` null, `takePower` and `processes` 0, `guestCpuTime` −1, and the rest
   (`boot`, `setRoutes`, `resize`, `closeConsole`, `trimMemory`, `shutdown`, `stop`) do nothing.
-- Errors become `IOException`, or `FileNotFoundException` for every browse error whatever its
-  errno, or sentinel values. `openConsole` and `resize` clamp rows and columns to 1–65535.
+- `browseImport` calls an `IntConsumer` synchronously with a borrowed staging fd. It returns
+  the encoded name after publication, propagates the writer's exception, and throws `IOException`
+  on store errors. Other throwing browse calls use `FileNotFoundException` for every errno.
+  Other runtime calls use `IOException` or sentinel values. `openConsole` and `resize` clamp rows and columns to 1–65535.
 - `setRoutes` parses lines of `<hex destination>/<prefix> <hex gateway or -> <interface>` (later
   fields ignored); hex fields must be ASCII and even, the destination 4 or 16 bytes and the gateway
   the same length; the metric is 0 for IPv4, and for IPv6 1024 for a default route, else 256.
@@ -92,9 +94,9 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   to release the binding. Other runtime JNI callers include the main thread (`bklStall`, and `openConsole`/`spawn` from a tab's
   start), `appine-start` (`start`), the service's worker (the poll's calls, `setRoutes`,
   `consoleCwd`, `trimMemory`, `stop`, `shutdown`, the rules refresh's `spawn`), `appine-boot`
-  (`spawn`, `waitFor`, `boot`), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`), the
-  provider's binder threads (browse functions, `readFile`), and each tab's `vt-pump`, which reads
-  the console through `Machine::read_console` in `vt.rs` and calls back into Java from inside
+  (`spawn`, `waitFor`, `boot`), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`),
+  `terminal-import` (`browseImport`), the provider's binder threads (browse functions, `readFile`),
+  and each tab's `vt-pump`, which reads the console through `Machine::read_console` in `vt.rs` and calls back into Java from inside
   `pump`.
 
 ### stderr and panics
@@ -115,7 +117,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   `catch_unwind`: the panic message reaches logcat through the panic hook's stderr, a
   line names the function, and the call returns its fallback (−1 for console reads and writes,
   `openConsole`, `spawn`, `browseOpen` and `browseOpenWrite`; 0 for `start`, `takePower` and
-  `processes`; −9 from `waitFor`; null for objects; nothing for unit). The 17 `@Throws` functions
+  `processes`; −9 from `waitFor`; null for objects; nothing for unit). The 18 `@Throws` functions
   also throw `IOException("internal error in …")` unless an exception is already pending. Kernel
   state a panic left half changed (a poisoned lock, a held BKL) is not repaired, so later calls
   may fail or wait.
@@ -140,7 +142,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 
 ### Inbound
 
-- `TerminalService`, `VtSession`, `ConsolePty`, `Rootfs`, `Documents` and `android/tests`
+- `TerminalService`, `VtSession`, `ConsolePty`, `Rootfs`, `Documents`, `TerminalFiles` and `android/tests`
   call `Native`; `vt.rs` uses `guarded!`, `machine`, `string`, `throw` and the handle table.
 - `android/build` compiles and packages this bridge and the guest browser client.
 

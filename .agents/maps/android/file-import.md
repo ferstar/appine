@@ -1,11 +1,11 @@
 # android/file-import Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/file-import.md` for the paired decision history (not yet created; pre-split decisions D4 and D62 stay in `.agents/decisions/android/terminal.md`).
+> See `.agents/decisions/android/file-import.md` for the paired decision history (pre-split decisions D4 and D62 stay in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: notify Documents.dirsChanged after home imports)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: publish completed home imports from detached store directories)
 
 ## Responsibilities
 
@@ -40,12 +40,13 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
   lock for the batch. Destination is that account's home, independent of the tab's cwd, effective
   user and mounts. A missing home or `/` is refused.
 - Provider display names are used with a localized fallback. Controls, slash and NUL are replaced,
-  empty/dot names are sanitized, and extensions are preserved. Native browse creation assigns the
-  account's ownership and numbers collisions without overwriting. Source and destination streams
-  close, file data is synced, `browseWritten` reports the write to the guest, and when a `Context`
-  is supplied (`copySelected`), `Documents.dirsChanged` refreshes the modified home directory in
-  open Files app listings. Read/write/close errors attempt to remove the created file (notifying
-  `Documents.dirsChanged` if cleanup fails); other files in the batch continue.
+  empty/dot names are sanitized, and extensions are preserved. `Native.browseImport` stages a
+  regular file owned by the account outside the guest tree. Its callback opens the source and
+  streams it to a duplicate of the borrowed fd. After both streams close, the store syncs the
+  data. One transaction rechecks the home and publishes the file under an available name.
+  Guest watchers receive the create, open and write/close events after commit. On success
+  `copySelected` refreshes Files app listings through `Documents.dirsChanged`. A failed file
+  leaves the home untouched and the batch continues.
 - The retained result lists successful guest paths in monospace and per-file failures in a protected
   dialog. A blank line separates the explanation from the paths; message assembly preserves spans.
   Copy paths explicitly puts space-separated shell arguments on the clipboard, prefixing whitespace
@@ -55,8 +56,8 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
 - Recreation retains selection/copy/result; destruction dismisses its dialog without consuming
   the result, so it can reappear after unlock. Process death loses this state. An already-started
   worker continues after backgrounding or closing the activity. There is no cancellation; slow
-  document providers hold up rootfs reset/replacement. Process termination or cleanup failure can
-  leave an incomplete file; imports are not transactional across the whole batch.
+  document providers hold up rootfs reset/replacement. Publication is per file. Completed files
+  survive an interruption, and the next exclusive store open reclaims abandoned staging files.
 
 ## Dependencies (inbound / outbound)
 
@@ -70,7 +71,7 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
 - ContentResolver supplies Android document streams; `android/setup` resolves accounts and
   holds the Rootfs store read lock. `android/documents` supplies naming/path helpers and
   `dirsChanged` notifications.
-- `android/native` browse calls create, sync, notify and remove partial guest files.
+- `android/native` supplies the staging fd and publishes the completed file through `kernel/store`.
 - `android/terminal` supplies localized resources and privacy-protected presentation.
 
 ## Invariants and gotchas
@@ -82,8 +83,8 @@ remain `android/terminal`; the import button belongs to `android/tabbar`.
 
 ## Confirmed bugs / technical debt
 
-- Imports have no cancellation or process-death recovery. Killing the app during a copy can
-  leave an incomplete file, and closing its activity can lose the eventual result display.
+- A running import cannot be cancelled or resumed after process death. Closing its activity can
+  lose the eventual result display.
 
 ## Open questions
 
@@ -92,6 +93,8 @@ None.
 ## To verify
 
 - File import was exercised through the API 34 system picker with multiple files, cancellation,
-  collision numbering and activity recreation, including redisplay of the result. Seven
-  instrumentation cases cover native-store copies, read/close cleanup, guest reads, shell escaping
-  and locked-picker retention. Cloud providers, process interruption and vendor pickers remain unverified.
+  collision numbering and activity recreation, including redisplay of the result. The nine
+  instrumentation cases cover publication after source close, a concurrent name collision,
+  failure cleanup, provider notifications, guest reads, shell escaping and locked-picker retention.
+  An API 34 process kill during a copy verified cleanup on reopen and retry. Cloud document
+  providers and vendor pickers remain unverified.

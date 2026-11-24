@@ -219,8 +219,8 @@ pub enum Change {
     Written { ino: Ino, parent: (Ino, Vec<u8>) },
 }
 
-/// The most names one create tries (`a (1).txt`, `a (2).txt`, ...).
-const MAX_TRIES: u32 = 100;
+/// The last numbered alternative after the requested name is taken.
+const MAX_NAME_SUFFIX: u32 = 100;
 
 /// Creates a file (0644) or directory (0755) in directory `dir` inside `top`, owned by `uid` and
 /// `gid`. When the name is taken another one is used ([`numbered`]); returns the name actually
@@ -236,27 +236,92 @@ pub fn create(
 ) -> Result<Vec<u8>, Errno> {
     check_name(name)?;
     let dir = dir_in(store, top, dir)?;
-    for n in 0..=MAX_TRIES {
-        let name = if n == 0 {
+    let name = with_available_name(name, directory, |candidate| {
+        if directory {
+            store.mkdir(dir, candidate, 0o755, uid, gid).map(drop)
+        } else {
+            store.create_file(dir, candidate, 0o644, uid, gid).map(drop)
+        }
+    })?;
+    changes.push(Change::Created {
+        dir,
+        name: name.clone(),
+        is_dir: directory,
+    });
+    Ok(name)
+}
+
+/// Streams one file into a detached directory, then publishes it in the account's home.
+/// The open store pins the staging directory during the copy. Boot reclaims it after a crash.
+pub fn import_file(
+    store: &Store,
+    home: &[u8],
+    name: &[u8],
+    (uid, gid): (u32, u32),
+    fill: impl FnOnce(&File) -> Result<(), Errno>,
+    changes: &mut Vec<Change>,
+) -> Result<Vec<u8>, Errno> {
+    check_name(name)?;
+    let (dir, stage, ino, file) = store.transaction(|s| {
+        let (dir, _) = top_of(s, home)?;
+        let stage = s.create_detached_dir(0o700, uid, gid)?;
+        let (ino, file) = s.create_file(stage, b"data", 0o644, uid, gid)?;
+        Ok((dir, stage, ino, file))
+    })?;
+    // Release the SQLite writer even when this is the only connection. A provider may block.
+    store.commit()?;
+    let copy_and_publish = || -> Result<_, Errno> {
+        fill(&file)?;
+        file.sync_all()
+            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+        let name = store.transaction(|s| {
+            let (current_dir, _) = top_of(s, home)?;
+            if current_dir != dir {
+                return Err(Errno::ESTALE);
+            }
+            let name = with_available_name(name, false, |candidate| {
+                s.rename(stage, b"data", dir, candidate, true, false)
+            })?;
+            s.remove_detached_dir(stage)?;
+            Ok(name)
+        })?;
+        store.commit()?;
+        Ok(name)
+    };
+    let name = copy_and_publish().inspect_err(|_| {
+        // A failed cleanup leaves only a detached tree for boot to reclaim.
+        let _ = store.remove_detached_dir(stage);
+    })?;
+    let parent = (dir, name.clone());
+    changes.push(Change::Created {
+        dir,
+        name: name.clone(),
+        is_dir: false,
+    });
+    changes.push(Change::Opened {
+        ino,
+        parent: parent.clone(),
+        truncated: false,
+        unshared: false,
+    });
+    changes.push(Change::Written { ino, parent });
+    Ok(name)
+}
+
+fn with_available_name(
+    name: &[u8],
+    directory: bool,
+    mut install: impl FnMut(&[u8]) -> Result<(), Errno>,
+) -> Result<Vec<u8>, Errno> {
+    for n in 0..=MAX_NAME_SUFFIX {
+        let candidate = if n == 0 {
             name.to_vec()
         } else {
             numbered(name, n, directory)
         };
-        check_name(&name)?;
-        let r = if directory {
-            store.mkdir(dir, &name, 0o755, uid, gid).map(drop)
-        } else {
-            store.create_file(dir, &name, 0o644, uid, gid).map(drop)
-        };
-        match r {
-            Ok(()) => {
-                changes.push(Change::Created {
-                    dir,
-                    name: name.clone(),
-                    is_dir: directory,
-                });
-                return Ok(name);
-            }
+        check_name(&candidate)?;
+        match install(&candidate) {
+            Ok(()) => return Ok(candidate),
             Err(Errno::EEXIST) => continue,
             Err(e) => return Err(e),
         }
@@ -375,7 +440,7 @@ fn entry_in(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, Vec<u8>), Er
 
 /// Directory `dir` inside `top` (following symlinks).
 fn dir_in(store: &Store, top: &[u8], dir: &[u8]) -> Result<Ino, Errno> {
-    let top = top_of(store, top)?;
+    let (_, top) = top_of(store, top)?;
     let (ino, real) = walk(store, dir)?;
     if store.kind(ino)? != mode::S_IFDIR {
         return Err(Errno::ENOTDIR);
@@ -453,7 +518,7 @@ pub fn written(
 /// Regular file `path` inside `top` (following symlinks; the file pointed at must also be inside
 /// `top`): its inode, and the directory and name it has on its real path.
 fn writable_file(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, (Ino, Vec<u8>)), Errno> {
-    let top = top_of(store, top)?;
+    let (_, top) = top_of(store, top)?;
     let (ino, mut real) = walk(store, path)?;
     if !real.starts_with(&top) {
         return Err(Errno::EACCES);
@@ -468,9 +533,9 @@ fn writable_file(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, (Ino, V
     Ok((ino, (dir, name)))
 }
 
-/// The components of `top`'s real path; it must be a directory other than the root directory
+/// The inode and real path of `top`; it must be a directory other than the root directory
 /// (EACCES): an account whose home is `/`, or a link to it, would make the whole system writable.
-fn top_of(store: &Store, top: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
+fn top_of(store: &Store, top: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
     let (ino, real) = walk(store, top)?;
     if store.kind(ino)? != mode::S_IFDIR {
         return Err(Errno::ENOTDIR);
@@ -478,7 +543,7 @@ fn top_of(store: &Store, top: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
     if real.is_empty() {
         return Err(Errno::EACCES);
     }
-    Ok(real)
+    Ok((ino, real))
 }
 
 // ---- Paths for the host ----

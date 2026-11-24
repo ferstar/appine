@@ -1,6 +1,7 @@
 package io.github.mthli.appine
 
 import java.io.IOException
+import java.util.function.IntConsumer
 
 /**
  * JNI interface of the native library libappine.so, implemented in hosts/android/src/lib.rs.
@@ -101,6 +102,11 @@ internal object Native {
     // leading out through a symbolic link is not allowed.
     // New names come from the user and are used as they are; returned names are written as paths
     // are.
+
+    /** Calls [writer] synchronously with a borrowed fd and returns the published, encoded name. */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseImport(store: String, home: String, name: String, uid: Int, gid: Int, writer: IntConsumer): String
 
     /**
      * Creates a file or directory in directory [dir], owned by [uid] and [gid]; when the name is

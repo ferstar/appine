@@ -53,8 +53,8 @@ class TerminalFilesTest {
     @Test
     fun copiesBinaryFilesAndNumbersCollisionsWithoutOverwriting() {
         val bytes = ByteArray(256 * 1024 + 37) { it.toByte() }
-        val first = TerminalFiles.copyIntoHome(store, account, "资料 100%.bin", bytes.inputStream())
-        val second = TerminalFiles.copyIntoHome(store, account, "资料 100%.bin", byteArrayOf(9).inputStream())
+        val first = TerminalFiles.copyIntoHome(store, account, "资料 100%.bin") { bytes.inputStream() }
+        val second = TerminalFiles.copyIntoHome(store, account, "资料 100%.bin") { byteArrayOf(9).inputStream() }
         assertEquals("/root/资料 100%.bin", first)
         assertEquals("/root/资料 100% (1).bin", second)
         assertArrayEquals(bytes, Native.readFile(store, first))
@@ -70,12 +70,30 @@ class TerminalFilesTest {
         }
         context.contentResolver.registerContentObserver(uri, false, observer)
         try {
-            val imported = TerminalFiles.copyIntoHome(store, account, "notify.txt", "hello".toByteArray().inputStream(), context)
+            val imported = TerminalFiles.copyIntoHome(store, account, "notify.txt", context) { "hello".toByteArray().inputStream() }
             assertEquals("/root/notify.txt", imported)
             assertTrue("Expected Files app child listing notification for /root", notified.await(5, TimeUnit.SECONDS))
         } finally {
             context.contentResolver.unregisterContentObserver(observer)
         }
+    }
+
+    @Test
+    fun publishesAfterSourceClosesAndKeepsAConcurrentFile() {
+        val path = "/root/race.txt"
+        val original = byteArrayOf(7)
+        val imported = byteArrayOf(1, 2, 3)
+        val input = object : ByteArrayInputStream(imported) {
+            override fun close() {
+                assertNull(Native.readFile(store, path))
+                Native.writeFile(store, path, original, 420, true)
+                super.close()
+            }
+        }
+        val result = TerminalFiles.copyIntoHome(store, account, "race.txt") { input }
+        assertEquals("/root/race (1).txt", result)
+        assertArrayEquals(original, Native.readFile(store, path))
+        assertArrayEquals(imported, Native.readFile(store, result))
     }
 
     @Test
@@ -91,7 +109,7 @@ class TerminalFilesTest {
             }
         }
         assertThrows(IOException::class.java) {
-            TerminalFiles.copyIntoHome(store, account, "keep.txt", input)
+            TerminalFiles.copyIntoHome(store, account, "keep.txt") { input }
         }
         assertArrayEquals("original".toByteArray(), Native.readFile(store, "/root/keep.txt"))
         assertNull(Native.readFile(store, "/root/keep (1).txt"))
@@ -99,12 +117,14 @@ class TerminalFilesTest {
 
     @Test
     fun failedSourceCloseAlsoRemovesTheCopy() {
+        val failure = IOException("Source close failed")
         val input = object : ByteArrayInputStream("data".toByteArray()) {
-            override fun close() { throw IOException("Source close failed") }
+            override fun close() { throw failure }
         }
-        assertThrows(IOException::class.java) {
-            TerminalFiles.copyIntoHome(store, account, "close-failed.txt", input)
+        val thrown = assertThrows(IOException::class.java) {
+            TerminalFiles.copyIntoHome(store, account, "close-failed.txt") { input }
         }
+        assertSame(failure, thrown)
         assertNull(Native.readFile(store, "/root/close-failed.txt"))
     }
 
@@ -112,7 +132,7 @@ class TerminalFilesTest {
     fun sanitizesNamesAndSupportsEmptyFilesAndEscapedHomePaths() {
         Native.browseCreate(store, "/root", "/root", "100% home", true, 1000, 1000)
         val user = Rootfs.Account("user", 1000, 1000, "/root/100% home")
-        val path = TerminalFiles.copyIntoHome(store, user, "../bad\nname\u001b.txt", byteArrayOf().inputStream())
+        val path = TerminalFiles.copyIntoHome(store, user, "../bad\nname\u001b.txt") { byteArrayOf().inputStream() }
         assertEquals("/root/100% home/.._bad_name_.txt", path)
         assertArrayEquals(byteArrayOf(), Native.readFile(store, path))
         assertFalse(path.contains('\n'))
@@ -122,7 +142,7 @@ class TerminalFilesTest {
     fun refusesMissingOrWholeSystemHomes() {
         for (home in listOf("/", "/missing-home")) {
             assertThrows(IOException::class.java) {
-                TerminalFiles.copyIntoHome(store, account.copy(home = home), "file.txt", byteArrayOf(1).inputStream())
+                TerminalFiles.copyIntoHome(store, account.copy(home = home), "file.txt") { byteArrayOf(1).inputStream() }
             }
         }
         assertNull(Native.readFile(store, "/file.txt"))
@@ -135,7 +155,7 @@ class TerminalFilesTest {
         val machine = Native.start(store, 1, false)
         try {
             val name = "quote' and \$dollar.txt"
-            val path = TerminalFiles.copyIntoHome(store, account, name, "imported".toByteArray().inputStream())
+            val path = TerminalFiles.copyIntoHome(store, account, name) { "imported".toByteArray().inputStream() }
             val arguments = listOf(
                 path, "/root/\$(touch /root/injected)", "/root/back`tick`", "/root/中文",
                 "/root/*?[ab]{one,two}!(x)~#^&|;<>\\\"", "/root/tab\tname", "/root/trailing\\",
