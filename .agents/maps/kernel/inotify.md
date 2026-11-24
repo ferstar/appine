@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: align IN_EXCL_UNLINK with dentry unlinking across store/overlay/FUSE, fix full-queue overflow precedence, clean up doomed entries, and fix O_RDONLY|O_TRUNC and no-op chown events)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: Files app opens that move shared mappings)
 
 ## Responsibilities
 
@@ -123,8 +123,8 @@ opens in `kernel/files`, file I/O in `kernel/fileio`, FUSE operations in `kernel
 - Files app changes (`host_change`, under the target kernel's BKL) map `Created`, `Removed`,
   `Moved`, `Opened` (write opens) and `Written` to the same event sequences; the provider reports
   no access, close-nowrite, read-open or attribute events. An `Opened` that gave a held file an
-  object of its own also moves this kernel's descriptions of it there (`kernel/fileio`'s
-  `host_unshared` and `rehome`), even with no watches.
+  object of its own calls `kernel/fileio`'s `host_unshared` before checking for watches. It moves
+  open descriptions and shared mappings of that file to its current object.
 
 ## Dependencies (inbound / outbound)
 

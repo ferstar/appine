@@ -2358,8 +2358,8 @@ fn files_app_writes_stay_out_of_clones() {
     // The Files app writes a file's host object itself (appine_kernel::browse_changing hands out
     // the fd): a clone the guest makes while the app has the file open copies it rather than
     // sharing its object, so the app's later writes stay out of the clone; and when the app opens
-    // a file that shares its object for writing, the guest's descriptions of the file move to the
-    // file's new object with it and read what the app wrote (tests/guest/hostclone.c)
+    // a file that shares its object for writing, its open description and shared mapping follow
+    // the file while the source's mapping stays on the original object (tests/guest/hostclone.c)
     use appine_kernel::vfs::browse;
     use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio as Io, Tier};
     use std::os::unix::fs::FileExt;
@@ -2393,54 +2393,58 @@ fn files_app_writes_stay_out_of_clones() {
         assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{out}");
         out
     };
-    let top = b"/root".as_slice();
-    let errno = |_| appine_kernel::errno::Errno::EIO;
+    let open_write = |path: &[u8], truncate| {
+        appine_kernel::browse_changing(store, |s, c| {
+            browse::open_write(s, b"/root", path, truncate, false, c)
+        })
+        .unwrap()
+    };
+    let close_write = |path: &[u8], file: std::fs::File| {
+        drop(file);
+        appine_kernel::browse_changing(store, |s, c| browse::written(s, b"/root", path, c))
+            .unwrap();
+    };
     // The app opens src for writing and keeps it open while the guest clones it
-    let mut writer = None;
-    appine_kernel::browse_changing(store, |s, c| {
-        writer = Some(browse::open_write(
-            s,
-            top,
-            b"/root/hc/src",
-            false,
-            false,
-            c,
-        )?);
-        Ok(())
-    })
-    .unwrap();
+    let writer = open_write(b"/root/hc/src", false);
     assert_eq!(
         run("/root/hc/hostclone clone /root/hc/src /root/hc/dst"),
         "cloned\n"
     );
-    writer.take().unwrap().write_all_at(b"BBBB\n", 0).unwrap();
-    appine_kernel::browse_changing(store, |s, c| browse::written(s, top, b"/root/hc/src", c))
-        .unwrap();
+    writer.write_all_at(b"BBBB\n", 0).unwrap();
+    close_write(b"/root/hc/src", writer);
     assert_eq!(run("cat /root/hc/src /root/hc/dst"), "BBBB\nAAAA\n");
-    // A clone made after the app closed the file shares it again; the app then writes the clone
-    // while a guest program holds it open
-    assert_eq!(
-        run("/root/hc/hostclone clone /root/hc/src /root/hc/dst2"),
-        "cloned\n"
-    );
-    let host = {
-        let store = store.to_path_buf();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(1));
-            appine_kernel::browse_changing(&store, |s, c| {
-                let f = browse::open_write(s, top, b"/root/hc/dst2", false, false, c)?;
-                f.write_all_at(b"CCCC\n", 0).map_err(errno)
-            })
+    // Wait until the guest has read both mappings, then open the clone through the provider.
+    for truncate in [false, true] {
+        assert_eq!(
+            run("/root/hc/hostclone clone /root/hc/src /root/hc/dst2"),
+            "cloned\n"
+        );
+        let id = machine.open_console(24, 200).unwrap();
+        let argv =
+            ["hostclone", "hold", "/root/hc/dst2", "/root/hc/src"].map(|s| s.as_bytes().to_vec());
+        let pid = machine
+            .spawn(b"/root/hc/hostclone", &argv, &env, Io::Console(id))
             .unwrap();
-            appine_kernel::browse_changing(&store, |s, c| {
-                browse::written(s, top, b"/root/hc/dst2", c)
-            })
-            .unwrap();
-        })
-    };
-    let out = run("/root/hc/hostclone hold /root/hc/dst2 3");
-    host.join().unwrap();
-    assert_eq!(out, "holding\nread CCCC\n");
+        let mut ready = Vec::new();
+        let mut buf = [0u8; 64];
+        while !ready.ends_with(b"\n") {
+            let n = machine.read_console(id, &mut buf).unwrap();
+            assert!(n > 0, "{ready:?}");
+            ready.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(
+            String::from_utf8(ready).unwrap().trim_end(),
+            "holding BBBB BBBB"
+        );
+        let file = open_write(b"/root/hc/dst2", truncate);
+        file.write_all_at(b"CCCC\n", 0).unwrap();
+        machine.write_console(id, b"\n").unwrap();
+        let out = read_console(&machine, id);
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{out}");
+        assert_eq!(out.trim(), "read CCCC mapped CCCC source BBBB");
+        close_write(b"/root/hc/dst2", file);
+        machine.close_console(id).unwrap();
+    }
     assert_eq!(run("cat /root/hc/src; rm -rf /root/hc"), "BBBB\n");
 }
 

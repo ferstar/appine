@@ -207,7 +207,7 @@ pub enum Change {
     },
     /// Regular file `ino` (named `parent.1` in directory `parent.0`) was opened for writing,
     /// truncated if `truncated`; with `unshared` it shared its object until then and now has one
-    /// of its own, which the kernel's open files of it must move to.
+    /// of its own, which its open descriptions and shared mappings must follow.
     Opened {
         ino: Ino,
         parent: (Ino, Vec<u8>),

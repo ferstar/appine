@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: cross-process targets for global membarrier commands)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: TLB shootdown from the Files app without a current guest thread)
 
 ## Responsibilities
 
@@ -144,7 +144,9 @@ fast path and refill (`engine/dbt`).
   `DbtSpace::set_memops`; returns when nothing is dirty and no code changed; publishes `code_ranges`
   to the `CodeLog` and bumps the code generation; returns if nothing is dirty and the graveyard is
   empty; otherwise bumps the TLB generation (when dirty), runs `quiesce`, and clears the graveyard.
-- `quiesce` kicks every other user of the mm and spins until none is in guest code. The kick is
+- `quiesce` kicks every other user of the mm and spins until none is in guest code. When a
+  Files app open moves a shared mapping to a shorter object, `sync_except(None)` includes
+  every guest thread in the shootdown before the host region is remapped. The kick is
   sticky, so a thread returning from a no-BKL fast syscall stops at its next guest entry. fork and
   membarrier quiesce too.
 - `shootdown` is the immediate form used when a PTE is re-pointed (CoW copy, return of a borrowed

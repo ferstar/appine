@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: shared anonymous mremap regrowth)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared file mapping migration after guest or Files app writes)
 
 ## Responsibilities
 
@@ -260,7 +260,7 @@ signals may still be delivered).
 - `remap_file_pages`: a non-zero prot is `EINVAL`; start and size are rounded down; the range must
   lie in contiguous shared file pieces of one host file and prot (`EINVAL`; shared anonymous memory
   and segments are refused); it maps the file again with `MAP_SHARED | MAP_FIXED`, keeping the
-  label, exec denial and lock, and populates unless `MAP_NONBLOCK`.
+  label, FUSE page source, exec denial and lock, and populates unless `MAP_NONBLOCK`.
 - `msync`: flags and alignment `EINVAL`, the range must be fully mapped (`ENOMEM`), `MS_INVALIDATE`
   on locked pages `EBUSY`; `MS_SYNC` syncs the shared file ranges on the host with the BKL
   released. `mincore`: alignment `EINVAL`, fully mapped or `ENOMEM`; reserved pages report 0 and
@@ -326,9 +326,10 @@ signals may still be delivered).
   file: no thread can reach the dropped tail through a stale translation, so an access there faults
   into the kernel and gets the guest's `SIGBUS` once the BKL is free. A host truncation that then
   fails leaves the mappings' EOF at the requested length.
-- When a store file that shared its object gets one of its own (`kernel/fileio`'s `make_private`),
-  its shared mappings follow it, picked by store inode and old host file so other files' mappings
-  of the old object stay (nothing moves if an address space cannot be borrowed): `file_moving`
+- When a guest or Files app write gives a store file its own object (`kernel/fileio`'s
+  `make_private` and `host_unshared`), its shared mappings follow it. The move selects non-FUSE
+  mappings of that store inode whose host file differs from the current object. If any address
+  space cannot be borrowed, all mappings stay in place. Otherwise `file_moving`
   first removes, in every address space, the entries past the new object's length (as truncation
   does) and each changed one syncs; then `file_moved` maps the new object over each of their host
   regions with `MAP_FIXED` at the same host addresses, so entries and TLBs stay valid, and points

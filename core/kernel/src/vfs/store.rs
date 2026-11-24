@@ -2069,6 +2069,18 @@ impl Store {
         self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
     }
 
+    /// Reopens the current object for existing shared mappings without changing its ownership.
+    /// A private object can back writable mappings. A held object must stay read-only.
+    pub(crate) fn open_mapped_object(&self, ino: Ino) -> Result<File, Errno> {
+        let data = self.data(ino)?;
+        let flags = if data.held.is_some() {
+            libc::O_RDONLY
+        } else {
+            libc::O_RDWR
+        };
+        self.open_number(data.object, flags)
+    }
+
     /// Opens a regular file's object for reading and writing, with `O_APPEND` under `append` (for
     /// writes when the host browses the store).
     pub fn open_object_append(&self, ino: Ino, append: bool) -> Result<File, Errno> {
@@ -3788,6 +3800,13 @@ mod tests {
         let st = s.stat(b).unwrap();
         assert_eq!((st.atime_ns, st.mtime_ns), (5_000_000_000, 6_000_000_000));
         assert_eq!(s.stat(a).unwrap().mtime_ns, 2_000_000_000);
+        // Reopening the held object for mappings keeps it shared and read-only.
+        let held = s.open_mapped_object(b).unwrap();
+        assert_eq!(
+            held.write_at(b"B", 0).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(s.held(b).unwrap());
         // Writing b: a copy of its own, with its times, on disk before the commit recording it
         let flushes = s.meta.flushes.load(Ordering::Relaxed);
         s.make_private(b, None).unwrap();
@@ -3797,7 +3816,7 @@ mod tests {
             (st.atime_ns, st.mtime_ns, st.size),
             (5_000_000_000, 6_000_000_000, 11)
         );
-        s.open_object(b, true)
+        s.open_mapped_object(b)
             .unwrap()
             .write_all_at(b"B", 0)
             .unwrap();

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: maximum memfd length on the development store)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared mappings after guest and Files app unsharing)
 
 ## Responsibilities
 
@@ -179,9 +179,10 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   every description of the file it can borrow (fd tables, AF_UNIX
   messages in flight, loop backing files) a new handle on its current object, read-only and `cow`
   while still shared, retires the old handles and forgets the cached executable; a busy
-  description is logged and skipped. Only after a copy, shared mappings move to the new object
-  (`move_mappings`, through `kernel/mm`'s `file_moving`/`file_moved`), or all stay when some address
-  space is busy. A Files app open that unshares a file only rehomes (`host_unshared`).
+  description is logged and skipped. After a copy, `move_mappings` reopens the current object
+  without unsharing it and moves the inode's shared mappings still on another object (`kernel/mm`'s
+  `file_moving`/`file_moved`), or all stay when some address space is busy. A Files app open that
+  unshares a file runs both `rehome` and `move_mappings` under each running kernel's BKL.
 - Clones: copy_file_range from offset 0 to offset 0 of a whole non-empty input into an output no
   longer than it, and FICLONE or FICLONERANGE doing the same, share the input's object
   (`try_share`) unless either is not a regular store file, a memfd, opened through an overlay or on
@@ -279,8 +280,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   on a socket is `ESPIPE` where 6.1 says `ENODEV`.
 - **Private mappings do not follow a file to its own object:** a private mapping made while the
   file shared an object keeps the shared data in pages it has not copied after a write through
-  another descriptor. Shared mappings follow, unless an address space was busy then or the Files
-  app unshared the file.
+  another descriptor. Shared mappings follow unless an address space was busy during migration.
 - **Clone fidelity:** FICLONE and FICLONERANGE work on a store that reports ext4's magic (ext4
   says `EOPNOTSUPP`); partial ranges are copied, not shared; `FIDEDUPERANGE` is `EOPNOTSUPP`; a
   whole-file copy_file_range returns more than `MAX_RW_COUNT` in one call.

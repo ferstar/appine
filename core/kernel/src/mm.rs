@@ -554,12 +554,15 @@ impl Vma {
         (addr < start + self.contents_len() && !fill.has(page)).then(|| (fill.clone(), page))
     }
 
-    /// A shared mapping of store file `ino` through host file `from`, which follows the file when
-    /// its data moves to another host file ([`Mm::file_moving`]).
-    fn moves_with(&self, ino: u64, from: (u64, u64)) -> bool {
-        self.backing == Backing::Shared
+    /// File offset to remap when store inode `ino` moves to `to`. FUSE inode numbers belong
+    /// to the daemon and can coincide with an unrelated store inode.
+    fn file_move_offset(&self, ino: u64, to: (u64, u64)) -> Option<u64> {
+        let (dev, host_ino, offset) = self.file_id?;
+        (self.backing == Backing::Shared
             && self.ino == ino
-            && self.file_id.is_some_and(|(d, i, _)| (d, i) == from)
+            && self.fill.is_none()
+            && (dev, host_ino) != to)
+            .then_some(offset)
     }
 }
 
@@ -1153,6 +1156,11 @@ impl Mm {
     /// The caller holds the BKL; `current` is the calling thread, which flushes by itself before
     /// re-entering guest code.
     pub fn sync(&mut self, current: &Arc<TaskSync>) {
+        self.sync_except(Some(current));
+    }
+
+    /// A host caller has no current guest thread, so every user takes part in the shootdown.
+    pub fn sync_except(&mut self, current: Option<&Arc<TaskSync>>) {
         let exec_changed = self.exec_changed;
         self.check_code_group();
         let code = std::mem::take(&mut self.code_ranges);
@@ -1186,7 +1194,7 @@ impl Mm {
         if dirty {
             self.generation.fetch_add(1, Ordering::SeqCst);
         }
-        self.quiesce(current);
+        self.quiesce_except(current);
         self.graveyard.clear();
     }
 
@@ -1279,7 +1287,14 @@ impl Mm {
     /// BKL, which the caller holds, so no guest code runs in this address space until the caller
     /// releases the BKL (fork relies on this for a consistent snapshot of memory).
     pub fn quiesce(&self, current: &Arc<TaskSync>) {
-        let others = self.users.iter().filter(|u| !Arc::ptr_eq(u, current));
+        self.quiesce_except(Some(current));
+    }
+
+    fn quiesce_except(&self, current: Option<&Arc<TaskSync>>) {
+        let others = self
+            .users
+            .iter()
+            .filter(|u| current.is_none_or(|c| !Arc::ptr_eq(u, c)));
         for user in others.clone() {
             // SAFETY: a thread unregisters from users (holding the BKL) before destroying its Cpu
             unsafe { user.kicker.kick() };
@@ -2597,7 +2612,15 @@ impl Mm {
         }
         let raw = std::os::fd::AsRawFd::as_raw_fd(&*fd);
         let flags = flags::MAP_SHARED | flags::MAP_FIXED;
-        self.mmap(start, len, prot, flags, Some((raw, offset, may_write)))?;
+        // A FUSE remap keeps the daemon's page source and inode namespace.
+        self.map(
+            start,
+            len,
+            prot,
+            flags,
+            Some((raw, offset, may_write)),
+            v.fill.clone(),
+        )?;
         if !may_exec {
             self.deny_exec(start, len);
         }
@@ -3959,54 +3982,29 @@ impl Mm {
             .any(|v| v.file_id.is_some_and(|(d, i, _)| (d, i) == (dev, ino)))
     }
 
-    /// Store regular file `ino`'s data is moving from host file `from` to one of `len` bytes (the
-    /// inode store gave a file that shared its object one of its own, holding the same data up to
-    /// `len`): the pages of its shared mappings of `from` past `len` leave the page table first, as
-    /// for truncation, so the new host mapping is never touched past its end. Mappings of `from`
-    /// for other files are left alone. Returns whether anything changed; if so a shootdown is
-    /// needed ([`Mm::sync`]) before [`Mm::file_moved`].
-    pub fn file_moving(&mut self, ino: u64, from: (u64, u64), len: u64) -> bool {
-        let mut changed = false;
-        for (&s, v) in self.vmas.iter_mut() {
-            let Some((_, _, offset)) = v.file_id.filter(|_| v.moves_with(ino, from)) else {
-                continue;
-            };
-            let extent = len
-                .saturating_sub(offset)
-                .next_multiple_of(PAGE_SIZE)
-                .min(v.len);
-            if extent >= v.file_len {
-                continue;
-            }
-            // unmap fails only on invalid arguments, and this range comes from a VMA
-            let _ = self.mmu.unmap(s + extent, v.file_len - extent);
-            if v.prot & prot::EXEC != 0 {
-                self.code_ranges.push((s + extent, v.file_len - extent));
-            }
-            v.file_len = extent;
-            changed = true;
-        }
-        self.dirty |= changed;
-        changed
+    /// Before moving shared mappings of store inode `ino` to host file `to`, remove entries
+    /// past its new length. Sync every changed address space before calling [`Mm::file_moved`]
+    /// in any of them, since a host region can be shared across fork.
+    pub fn file_moving(&mut self, ino: u64, to: (u64, u64), len: u64) -> bool {
+        self.clip_file_mappings(len, |v| v.file_move_offset(ino, to))
     }
 
     /// Every address space has gone through [`Mm::file_moving`]: the shared mappings of store
-    /// file `ino` still on host file `from` map `to` (host file `to_id`) instead, over the same
+    /// file `ino` still on an older object map `to` (host file `to_id`) instead, over the same
     /// host addresses, so the page table and the TLBs stay valid and the mappings show what is
     /// written to the file from now on, as Linux's mappings of the inode do. A host region shared
     /// with other pieces or address spaces (splits, fork) is mapped once here, and again,
-    /// harmlessly, for another address space still pointing at `from`.
+    /// harmlessly, for another address space still pointing at the old object.
     pub fn file_moved(
         &mut self,
         ino: u64,
-        from: (u64, u64),
         to: &Rc<OwnedFd>,
         to_id: (u64, u64),
     ) -> Result<(), Errno> {
         use std::os::fd::AsRawFd;
         let mut done: Vec<*const HostRegion> = Vec::new();
         for v in self.vmas.values_mut() {
-            let Some((_, _, offset)) = v.file_id.filter(|_| v.moves_with(ino, from)) else {
+            let Some(offset) = v.file_move_offset(ino, to_id) else {
                 continue;
             };
             let region = &v.region;
@@ -4042,22 +4040,30 @@ impl Mm {
     /// of the file, and the whole app would exit. Returns whether anything changed; if so a
     /// shootdown is needed ([`Mm::sync`]).
     pub fn file_truncated(&mut self, dev: u64, ino: u64, size: u64) -> bool {
+        self.clip_file_mappings(size, |v| {
+            let (dev_id, ino_id, offset) = v.file_id?;
+            ((dev_id, ino_id) == (dev, ino)).then_some(offset)
+        })
+    }
+
+    /// Remove pages beyond EOF from each selected VMA and invalidate any executable tail.
+    fn clip_file_mappings(&mut self, size: u64, file_offset: impl Fn(&Vma) -> Option<u64>) -> bool {
         let mut changed = false;
-        for (&s, v) in self.vmas.iter_mut() {
-            let Some((d, i, offset)) = v.file_id else {
+        for (&start, v) in &mut self.vmas {
+            let Some(offset) = file_offset(v) else {
                 continue;
             };
             let extent = size
                 .saturating_sub(offset)
                 .next_multiple_of(PAGE_SIZE)
                 .min(v.len);
-            if (d, i) != (dev, ino) || extent >= v.file_len {
+            if extent >= v.file_len {
                 continue;
             }
             // unmap fails only on invalid arguments, and this range comes from a VMA
-            let _ = self.mmu.unmap(s + extent, v.file_len - extent);
+            let _ = self.mmu.unmap(start + extent, v.file_len - extent);
             if v.prot & prot::EXEC != 0 {
-                self.code_ranges.push((s + extent, v.file_len - extent));
+                self.code_ranges.push((start + extent, v.file_len - extent));
             }
             v.file_len = extent;
             changed = true;
@@ -7175,6 +7181,23 @@ mod tests {
         // Once child breaks CoW (writes its own copy), parent's page is exclusive again
         child.borrow().write(UserSlice::new(a, 4), b"wxyz").unwrap();
         assert_eq!(parent.borrow().pagemap(a, 1)[0], PRESENT | EXCLUSIVE);
+    }
+
+    #[test]
+    fn remapped_fuse_pages_do_not_follow_a_store_inode() {
+        let size = 2 * PAGE_SIZE;
+        let host = appine_hal::memfd(c"appine-mm-fill").unwrap();
+        host.set_len(size).unwrap();
+        let source = crate::fd::OpenFile::new(crate::fd::FileKind::Host(-1), 0);
+        let fill = Fill::new(host, size, source);
+        let mut mm = Mm::new();
+        let a = mm
+            .mmap_fill(0, PAGE_SIZE, prot::READ, flags::MAP_SHARED, (fill, 0))
+            .unwrap();
+        mm.label(a, PAGE_SIZE, None, 42);
+        mm.remap_file_pages(a, PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(mm.vmas[&a].file_move_offset(42, (0, 0)), None);
+        assert_eq!(mm.fill_wanted(a, prot::READ).unwrap().1, 1);
     }
 
     #[test]

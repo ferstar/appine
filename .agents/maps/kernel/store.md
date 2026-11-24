@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: stage home-file imports outside the guest tree and publish after sync)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: Files app writes and shared mappings after unsharing)
 
 ## Responsibilities
 
@@ -129,9 +129,10 @@ provider and rootfs installation UI (`android`).
   longer uses the object it was copied from. `make_private` loops over the three with the copy done
   in place.
 - `open_object` for writing, `open_object_append` and `truncate` call `make_private` first, so host
-  callers (the browse API, `write_file`) never write a shared object; they do not move the kernel's
-  open descriptions themselves: the browse API's `Opened` change says when it unshared the file
-  (`unshared`), and the kernel then moves its own (`kernel/fileio`).
+  callers (the browse API, `write_file`) never write a shared object. When a Files app open
+  unshares the file, its `Opened` change tells each running kernel to move the file's open
+  descriptions and shared mappings to its current object (`kernel/fileio`). `open_mapped_object`
+  reopens that object read-write while private or read-only while held, without unsharing it.
 - Objects the provider handed out for writing are recorded process-wide (`HOST_WRITERS`: the
   store's identity, the object, the path it was opened by) from `open_write` until `written`
   reports the close by the same path, whatever became of the file; `host_writing` tells the kernel
@@ -330,9 +331,6 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
-- **Shared mappings across connections:** when a Files app write gives a held file an object of its
-  own, the running kernel moves its open descriptions there but not its shared mappings, which
-  keep the old shared object.
 - **Shared objects of deleted files:** a held file deleted while open keeps its share until boot,
   so the next write to another file sharing the object copies it although nobody reads the deleted
   one any more.

@@ -10,6 +10,7 @@
 
 use std::os::unix::fs::FileExt;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::SocketRef;
@@ -24,6 +25,7 @@ use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, PIPE_DEV, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
 use crate::pseudo::{self, PseudoNode};
 use crate::signal::{self, SigInfo};
+use crate::task::TaskSync;
 use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
@@ -5129,17 +5131,15 @@ pub(super) fn prepare_write(
 /// for it ([`Kernel::unsharing`](crate::kernel::Kernel::unsharing)). Then every description of
 /// the file moves to its object ([`rehome`]).
 pub(super) fn make_private(cx: &mut Cx<'_>, ino: Ino, keep: Option<u64>) -> Result<(), Errno> {
-    use std::os::unix::fs::MetadataExt;
     let vfs = cx.vfs()?;
     let was_held = vfs.store().held(ino).unwrap_or(true);
-    let mut moved_from = None;
-    loop {
+    let moved = loop {
         if cx.kr().unsharing.contains(&ino) {
             cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
             continue;
         }
         let Some(job) = vfs.store().unshare(ino, keep)? else {
-            break;
+            break false;
         };
         cx.k().unsharing.insert(ino);
         let copied = cx.unlocked(|| crate::vfs::store::copy_object(&job.from, &job.to, job.len));
@@ -5149,14 +5149,12 @@ pub(super) fn make_private(cx: &mut Cx<'_>, ino: Ino, keep: Option<u64>) -> Resu
             vfs.store().abandon_unshare(job);
             return Err(e);
         }
-        let from = job.from.metadata().map(|m| (m.dev(), m.ino()));
         match vfs.store().finish_unshare(job) {
             Err(Errno::EAGAIN) => continue,
             r => r?,
         }
-        moved_from = from.ok();
-        break;
-    }
+        break true;
+    };
     // Descriptions need new handles only when the file was sharing its object, or when some still
     // hold a read-only one from then: rehoming always would keep every replaced handle open until
     // close, a host fd per description each time a file kept open (a log) is truncated
@@ -5167,29 +5165,25 @@ pub(super) fn make_private(cx: &mut Cx<'_>, ino: Ino, keep: Option<u64>) -> Resu
     if was_held || opens_of(cx.kr(), ino).iter().any(cow) {
         rehome(cx.kr(), &vfs, ino);
     }
-    if let Some(from) = moved_from {
-        move_mappings(cx, &vfs, ino, from);
+    if moved {
+        move_mappings(cx.kr(), &vfs, ino, Some(&cx.task.sync));
     }
     Ok(())
 }
 
-/// Held file `ino` moved from host object `from` to an object of its own: its shared mappings
-/// follow it ([`crate::mm::Mm::file_moving`], [`crate::mm::Mm::file_moved`]), so they show what
-/// is written to the file from now on. Pages past the new object's end leave the page tables, and
-/// every address space that had some syncs, before any host mapping changes. When an address
-/// space is busy the mappings all stay on the old object, unchanged but safe: re-mapping a host
-/// region it shares (after fork) without clipping it could let a thread touch the new object past
-/// its end.
-fn move_mappings(cx: &Cx<'_>, vfs: &Vfs, ino: Ino, from: (u64, u64)) {
+/// Move shared mappings of `ino` to its current object. First clip and sync the mappings in
+/// every address space, then replace their host regions. Fork can share one region between
+/// address spaces, so a busy address space must stop the move before any mapping changes.
+fn move_mappings(k: &Kernel, vfs: &Vfs, ino: Ino, current: Option<&Arc<TaskSync>>) {
     use std::os::unix::fs::MetadataExt;
-    let Ok(object) = vfs.store().open_object(ino, true) else {
+    let Ok(object) = vfs.store().open_mapped_object(ino) else {
         return;
     };
     let Ok(meta) = object.metadata() else {
         return;
     };
     let mut mms: Vec<Rc<RefCell<crate::mm::Mm>>> = Vec::new();
-    for t in cx.kr().tasks.values() {
+    for t in k.tasks.values() {
         let mm = t.res.borrow().mm.clone();
         if !mms.iter().any(|m| Rc::ptr_eq(m, &mm)) {
             mms.push(mm);
@@ -5201,19 +5195,16 @@ fn move_mappings(cx: &Cx<'_>, vfs: &Vfs, ino: Ino, from: (u64, u64)) {
         ));
         return;
     }
-    let sync = cx.task.sync.clone();
+    let to_id = (meta.dev(), meta.ino());
     for mm in &mms {
         let mut m = mm.borrow_mut();
-        if m.file_moving(ino, from, meta.len()) {
-            m.sync(&sync);
+        if m.file_moving(ino, to_id, meta.len()) {
+            m.sync_except(current);
         }
     }
     let to = Rc::new(std::os::fd::OwnedFd::from(object));
     for mm in &mms {
-        if let Err(e) = mm
-            .borrow_mut()
-            .file_moved(ino, from, &to, (meta.dev(), meta.ino()))
-        {
+        if let Err(e) = mm.borrow_mut().file_moved(ino, &to, to_id) {
             crate::debug::log(format_args!("move_mappings: inode {ino}: {e:?}"));
         }
     }
@@ -5249,12 +5240,12 @@ fn rehome(k: &crate::kernel::Kernel, vfs: &Vfs, ino: Ino) {
 }
 
 /// The host (the Files app) gave held regular file `ino` an object of its own as it opened it for
-/// writing ([`crate::vfs::browse::open_write`]): this kernel's descriptions of it move there too, as
-/// after the kernel's own unsharing (shared mappings stay on the old object). Called with the BKL
-/// held.
-pub(crate) fn host_unshared(k: &crate::kernel::Kernel, ino: Ino) {
-    if let Some(vfs) = k.vfs.clone() {
-        rehome(k, &vfs, ino);
+/// writing ([`crate::vfs::browse::open_write`]). Move this kernel's open descriptions and shared
+/// mappings to its current object under the BKL, as after the kernel's own unsharing.
+pub(crate) fn host_unshared(k: &Kernel, ino: Ino) {
+    if let Some(vfs) = &k.vfs {
+        rehome(k, vfs, ino);
+        move_mappings(k, vfs, ino, None);
     }
 }
 

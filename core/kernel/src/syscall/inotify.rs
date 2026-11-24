@@ -864,8 +864,8 @@ pub(crate) fn host_change(k: &Kernel, c: &Change) {
         }
         _ => {}
     }
-    // A held file the host made private as it opened it for writing: the kernel's open files of it
-    // move to its new object, even with no watches
+    // A held file the host made private as it opened it for writing: its open descriptions and shared
+    // mappings move to the current object, even with no watches
     if let Change::Opened {
         ino,
         unshared: true,
