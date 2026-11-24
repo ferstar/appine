@@ -44,7 +44,6 @@ const MSG_CTRUNC: u32 = 0x8;
 const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u32 = 0x40;
 const MSG_WAITALL: u32 = 0x100;
-const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
 
 /// The length of a `cmsghdr` (64-bit).
 const CMSG_HDR: usize = 16;
@@ -631,7 +630,6 @@ fn recv_inner(
             max,
             iovecs,
             control_len,
-            flags,
         )
     }
 }
@@ -642,6 +640,7 @@ fn empty_message() -> Message {
         len: 0,
         addr: Vec::new(),
         control: Vec::new(),
+        rights: None,
         flags: 0,
     }
 }
@@ -669,7 +668,7 @@ fn recv_stream(
     let mut part: Option<Received> = None;
     let mut copied = 0usize;
     let finish = |cx: &mut Cx<'_>, r: Received, copied: usize| {
-        Ok((copied, deliver(cx, r, false, passcred, control_len, flags)))
+        Ok((copied, deliver(cx, r, false, passcred, control_len)))
     };
     loop {
         let rx = rx_channel(sock)?;
@@ -779,7 +778,6 @@ fn recv_packet(
     max: usize,
     iovecs: Option<&[(u64, usize)]>,
     control_len: usize,
-    flags: u32,
 ) -> Result<(usize, Message), Errno> {
     loop {
         let rx = rx_channel(sock)?;
@@ -796,7 +794,8 @@ fn recv_packet(
         };
         if let Some(pre) = preview {
             if let Some(vecs) = iovecs
-                && let Err(e) = super::net::scatter(cx, vecs, 0, &pre.data)
+                && let Err(e) =
+                    super::net::scatter(vecs, 0, &pre.data, |dst, bytes| cx.mm().write(dst, bytes))
             {
                 if e == Errno::FUSE_RETRY {
                     return Err(Errno::FUSE_RETRY);
@@ -821,7 +820,7 @@ fn recv_packet(
             if iovecs.is_some() {
                 r.data.clear();
             }
-            return Ok((n, deliver(cx, r, truncated, passcred, control_len, flags)));
+            return Ok((n, deliver(cx, r, truncated, passcred, control_len)));
         }
         if reset {
             return Err(Errno::ECONNRESET);
@@ -833,7 +832,7 @@ fn recv_packet(
     }
 }
 
-/// Hands the data read to the guest: attaches the credentials and installs the passed open files
+/// Hands the data read to the guest: attaches the credentials and reserves slots for passed files
 /// into the current process's fd table, as Linux's `scm_recv` fills a control buffer of
 /// `control_len` bytes: the credentials cut to what fits (`put_cmsg`), then as many files as fit
 /// after a header (`scm_detach_fds`); what does not fit is dropped and `MSG_CTRUNC` is set.
@@ -843,7 +842,6 @@ fn deliver(
     truncated: bool,
     passcred: bool,
     control_len: usize,
-    flags: u32,
 ) -> Message {
     let mut control = Vec::new();
     let mut room = control_len;
@@ -866,31 +864,26 @@ fn deliver(
             &data,
         );
     }
-    if !r.fds.is_empty() {
+    let rights = if r.fds.is_empty() {
+        None
+    } else {
+        let mut pending = crate::unix::PendingRights::new(&cx.t.fds);
         let fit = room.saturating_sub(CMSG_HDR) / 4;
-        let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
         let mut fds = Vec::new();
-        let total = r.fds.len();
-        let mut iter = r.fds.into_iter();
-        let mut dropped_unix = false;
-        for file in (&mut iter).take(fit) {
-            let unix = crate::unix::is_unix_file(&file);
-            match cx.fds_mut().install(file, cloexec, 0) {
-                Ok(fd) => fds.extend_from_slice(&fd.to_le_bytes()),
-                Err(_) => {
-                    dropped_unix |= unix;
-                    break;
-                }
-            }
+        let mut files = r.fds.into_iter();
+        let mut dropped = Vec::new();
+        for file in files.by_ref().take(fit) {
+            let Ok(fd) = cx.fds_mut().reserve(0) else {
+                dropped.push(file);
+                break;
+            };
+            pending.push(fd, file);
+            fds.extend_from_slice(&fd.to_le_bytes());
         }
-        let rest: Vec<FileRef> = iter.collect();
-        dropped_unix |= rest.iter().any(crate::unix::is_unix_file);
-        drop(rest);
-        if dropped_unix {
-            crate::unix::collect(cx.k());
-        }
-        if fds.len() / 4 < total {
+        dropped.extend(files);
+        if !dropped.is_empty() {
             out_flags |= MSG_CTRUNC;
+            crate::unix::released(cx.k(), dropped);
         }
         if !fds.is_empty() {
             super::net::put_cmsg(
@@ -902,44 +895,15 @@ fn deliver(
                 &fds,
             );
         }
-    }
+        pending.track(cx.k())
+    };
     Message {
         data: r.data,
         len: r.len,
         addr: r.from,
         control,
         flags: out_flags,
-    }
-}
-
-/// The control buffer that would carry `control` cannot be written: the files passed in it,
-/// already installed, are closed again (Linux installs a file only once its number is written,
-/// `receive_fd_user`).
-pub(super) fn drop_passed_files(cx: &mut Cx<'_>, control: &[u8]) {
-    let mut closed = Vec::new();
-    let mut off = 0;
-    while let Some(h) = control.get(off..off + CMSG_HDR) {
-        let len = u64::from_le_bytes(h[..8].try_into().unwrap()) as usize;
-        let level = i32::from_le_bytes(h[8..12].try_into().unwrap());
-        let ty = i32::from_le_bytes(h[12..16].try_into().unwrap());
-        if len < CMSG_HDR {
-            break;
-        }
-        if (level, ty) == (SOL_SOCKET, SCM_RIGHTS) {
-            let data = control.get(off + CMSG_HDR..off + len).unwrap_or_default();
-            for fd in data.chunks_exact(4) {
-                if let Ok(file) = cx
-                    .fds_mut()
-                    .close(i32::from_le_bytes(fd.try_into().unwrap()))
-                {
-                    closed.push(file);
-                }
-            }
-        }
-        off += len.next_multiple_of(8);
-    }
-    if !closed.is_empty() {
-        crate::unix::released(cx.k(), closed);
+        rights,
     }
 }
 

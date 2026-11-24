@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 10 confirmed and 2 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: default ACL inheritance on pathname bind)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: SCM_RIGHTS reservations across recvmsg output page fills)
 
 ## Responsibilities
 
@@ -49,11 +49,13 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 - `Name` — `Path(Ino)` or `Abstract(net_id, ty, bytes)`; `Names` (`Kernel::unix`) maps `Name` to
   `Weak<RefCell<Socket>>` plus kernel-wide `next_auto` counter.
 - `Kernel::unix_inflight` — `Vec<Weak<RefCell<Channel>>>` of channels carrying `SCM_RIGHTS` fds.
+- `Kernel::unix_receiving` holds weak references to `PendingRights` deliveries. Each delivery owns
+  its files and reserved descriptor numbers until recvmsg finishes its output copies.
 
 ## Public entry points
 
 - `syscall::unix::{socket, pair, max_dgram_qlen, bind, listen, accept, connect, send, recv,
-  recv_into, drop_passed_files, setsockopt, getsockopt, sockname, shutdown}`, dispatched from
+  recv_into, setsockopt, getsockopt, sockname, shutdown}`, dispatched from
   `kernel/net`'s socket syscalls and socket read/write/splice paths.
 - `UnixSocket::{readiness, wake_objects, arrivals, unread}` for `kernel/poll` and `FIONREAD`.
 - `unix::released` (from `close`, `close_range`, `dup3`, `close_replaced`/seccomp `addfd`,
@@ -164,13 +166,12 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
     `FUSE_RETRY` leaves it queued for retry.
 - Ancillary delivery (`deliver` / `put_cmsg`): `SCM_CREDENTIALS` first when `passcred` is set
   (translated via `pid_out`, `uid_out`/`gid_out` with overflow 65534; truncated with `MSG_CTRUNC`
-  if buffer is 16..27 B), then `SCM_RIGHTS` installing as many fds as fit (`MSG_CMSG_CLOEXEC`,
-  stopping on buffer/EMFILE with `MSG_CTRUNC`, dropping remaining files and calling `unix::collect`
-  when any was an AF_UNIX socket). A NULL control buffer
-  forces `room = 0`; an unwritable control buffer in `recvmsg` closes installed fds via
-  `drop_passed_files` (which calls `unix::released`), sets `MSG_CTRUNC` and `msg_controllen = 0`,
-  and still returns received data bytes; any other `EFAULT` in `recvmsg` after `recv` likewise
-  closes installed `SCM_RIGHTS` fds via `drop_passed_files`.
+  if buffer is 16..27 B), then `SCM_RIGHTS` reserving as many descriptor numbers as fit.
+  A NULL control buffer supplies zero room. Buffer and fd limits set `MSG_CTRUNC` and excess
+  files are released. Reserved numbers remain unavailable to other threads during a FUSE fill.
+  After the control and header copies succeed, recvmsg installs each file with the requested
+  `MSG_CMSG_CLOEXEC`. An unwritable control buffer drops the reservations and returns the data
+  with `MSG_CTRUNC` and zero control length. A failing header copy also releases the reservations.
 - `block()` interruption: timed waits (`SO_RCVTIMEO`/`SO_SNDTIMEO`) interrupted by a signal return
   `EINTR`; untimed waits return `ERESTARTSYS` (partial stream sends and `MSG_WAITALL` reads return
   moved bytes instead).
@@ -203,6 +204,9 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 ### Garbage collection (`unix::collect`)
 
 - Channels carrying `SCM_RIGHTS` register weak refs in `Kernel::unix_inflight` via `note_inflight`.
+  `inflight_files` and `inflight_sockets` enumerate queued files and pending recvmsg deliveries.
+  The latter hold external file references for GC. Dropping an unfinished delivery that holds an
+  AF_UNIX socket schedules deferred collection.
 - `unix::released` drops closed files and runs `unix::collect` when any was an AF_UNIX socket
   (called from `close`, `close_range`, `dup3`, `close_replaced`/seccomp `addfd`, `exec`, AIO
   `io_cancel`/`released`, `deliver` truncation, datagram `EFAULT` drop). `UnixSocket::drop` (when
@@ -228,7 +232,7 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 ### Inbound
 
 - `kernel/net`: socket syscalls, `Socket::Unix`, `rw`, ioctl (`FIONREAD`), readiness/wake/arrivals,
-  `accept4` fd reservation and `recvmsg` `drop_passed_files`.
+  `accept4` fd reservation and `recvmsg` installation of pending rights.
 - `kernel/files` (`close`, `close_range`, `dup3`, `close_replaced`, `OpenFile::drop`, `splice_read`,
   `opens_of` -> `inflight_files`), `kernel/exec` (`exec` cloexec), `kernel/process` (last-thread
   `task::exit`), `kernel/cred` (seccomp `addfd`), `kernel/mount` (`sb_busy` -> `inflight_files`),

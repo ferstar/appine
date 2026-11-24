@@ -1714,22 +1714,17 @@ pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) ->
     // references): copying an unshared one would make a new lock owner and drop the POSIX record
     // locks held through it. Enforce nr_open just as unshare(CLONE_FILES) / dup_fd does: when
     // closing through the end of the table without CLOEXEC, fds from `first` onward are not copied.
-    if flags & CLOSE_RANGE_UNSHARE != 0 && Rc::strong_count(&cx.t.fds) > 2 {
-        let mut highest = cx.fds().open_fds().last().map_or(0, |&fd| fd as usize + 1);
-        if flags & CLOSE_RANGE_CLOEXEC == 0 && (last as usize).saturating_add(1) >= highest {
-            highest = (first as usize).min(highest);
-        }
-        if highest.next_multiple_of(64) > cx.kr().nr_open {
-            return Err(Errno::EMFILE);
-        }
-        let copy = cx.fds().clone();
+    let (first, last) = (first as usize, last as usize);
+    let cloexec = flags & CLOSE_RANGE_CLOEXEC != 0;
+    let closed = if flags & CLOSE_RANGE_UNSHARE != 0 && Rc::strong_count(&cx.t.fds) > 2 {
+        let (copy, closed) = cx
+            .fds()
+            .unshare_close_range(first, last, cloexec, cx.kr().nr_open)?;
         cx.set_fds(Rc::new(RefCell::new(copy)));
-    }
-    let closed = cx.fds_mut().close_range(
-        first as usize,
-        last as usize,
-        flags & CLOSE_RANGE_CLOEXEC != 0,
-    );
+        closed
+    } else {
+        cx.fds_mut().close_range(first, last, cloexec)
+    };
     let fds = cx.t.fds.clone();
     locks::closed(cx.k(), &fds, &closed);
     super::mqueue_closed(&cx.t.group, &closed);

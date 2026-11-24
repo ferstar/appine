@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: inotify open and close of executable files when a program snapshot fails)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: mapped page fills during socket and batch receive output)
 
 ## Responsibilities
 
@@ -358,6 +358,8 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - `kernel/mm` (`map_fill` for mmap, `fill` from the fault path), `kernel/poll` (device readiness
   and wake object), `kernel/procfs` (mountinfo type and options), `kernel/sysctl` (`drop_caches`).
 - The dispatcher: `fill` and `prefault` for mapped pages, `sweep` after every syscall.
+- `kernel/net` calls `fill` for socket output copies, including payload, address, control data
+  and message header fields. recvmmsg also fills pages when importing the current record.
 
 ### Outbound
 

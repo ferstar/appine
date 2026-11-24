@@ -402,6 +402,19 @@ class MachineTest {
             assertTrue(out, out.contains("\u001b]133;P;k=s;appine_lf=output\u0007> \u001b]133;B\u0007"))
             // The loop's status, after its continuation line
             assertTrue(out, out.contains("true; done\n\u001b]133;D;0\u0007"))
+            // Check the visible path and the title in the raw PTY output. BusyBox expands
+            // prompt backslashes after ash has substituted the directory name.
+            val prefix = "ash-${System.nanoTime()}"
+            val leaf = "$prefix?\\w"
+            val command = """d=$(printf '$prefix\t\\w'); mkdir "/root/${'$'}d" && cd "/root/${'$'}d"; false"""
+            val path = login(machine,
+                "$command\nash\nexit\ncd /root; ln -s \"\$d\" $prefix-link; cd $prefix-link\n" +
+                    "cd /root; rm $prefix-link; rmdir \"\$d\"\nexit\n", ConsolePty.LOGIN_ROOT)
+            assertTrue("visible ash path", path.contains("\u001b[1;34m~/$leaf\u001b[0m"))
+            assertTrue("nested ash path", path.contains("appine_lf=output\u0007~/$leaf # "))
+            assertTrue("ash directory title", path.contains("\u001b]2;/root/$leaf\u0007"))
+            assertTrue("physical prompt and logical title", path.contains(
+                "~/$leaf\u001b[0m# \u001b]133;B\u0007\u001b]2;/root/$prefix-link\u0007"))
             // A prompt that ~/.profile sets gets the marks when ash reads ENV after it, and so does
             // a nested ash, which reads no profile
             try {

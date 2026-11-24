@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: SO_ATTACH_BPF guest fd check, MSG_WAITALL pending_err preservation, sendto destination validation, bound IPv4 wildcard getpeername, /proc/net/snmp Forwarding reflects ip_forward)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: recvmsg output faults and per-record recvmmsg retries)
 
 ## Responsibilities
 
@@ -194,7 +194,10 @@ listen notifications (`android/service`).
   is there instead of spinning. A datagram socket shut down for reading returns 0 from a blocking
   recv with nothing queued, before timeouts and signals, where the nonblocking host socket would
   answer `EAGAIN` while polling readable; queued datagrams come first, and a nonblocking recv stays
-  `EAGAIN`. recvmmsg honours `MSG_WAITFORONE` and checks its timeout after each message.
+  `EAGAIN`. recvmmsg honours `MSG_WAITFORONE` and checks its timeout after each message. It holds
+  the same socket throughout the batch. A FUSE fault before a receive retries the current record,
+  and a fault writing its `msg_len` retries only that field. A later error returns the number of
+  fully written records.
 - read, write, readv and writev on a socket are one recvmsg or sendmsg over all the iovecs with no
   address, control data or flags (Linux's `sock_read_iter`/`sock_write_iter`): a datagram or
   seqpacket record is one message whatever the iovecs or the length, a read of nothing returns 0
@@ -208,6 +211,12 @@ listen notifications (`android/service`).
   read as Linux's `import_iovec` does (a negative length anywhere `EINVAL`, then an iovec reaching
   past 2^48 `EFAULT`, the total cut to `MAX_RW_COUNT`); setsockopt values are cut to 256 bytes and
   getsockopt asks the host for at most 256 (`SO_GET_FILTER` aside).
+- After recvfrom or recvmsg takes a message, a missing FUSE page retries the affected output
+  copy while the receiver holds the data. This covers non-Unix payload iovecs (including later
+  `MSG_WAITALL` pieces), source addresses, ancillary data and output header fields. An unsuccessful
+  fill is a copy fault. AF_UNIX payloads are copied before consumption; recvmsg installs reserved
+  `SCM_RIGHTS` fds after its header writes succeed (`kernel/unix`). The address helper also keeps
+  the accepted peer through a fill in accept4.
 - Host sendmsg/recvmsg run under the BKL (nonblocking); only waits release it. There is no
   BKL-free fast path for sockets.
 
@@ -371,6 +380,7 @@ listen notifications (`android/service`).
 ### Outbound
 
 - `appine_hal::net` (host sockets, `dns_query`, `interfaces`, `source_for`);
+- `kernel/fuse` (fill an unread mapped page during a socket result copy);
 - `kernel/rawicmp` (raw ICMP socket emulation, taps, options, receive and error draining);
 - `kernel/route` (host route lookups used for traffic default-interface resolution);
 - `kernel/netns` (`to_host`, `from_host`, `implicit_bind`, nat, filter, listener registration,

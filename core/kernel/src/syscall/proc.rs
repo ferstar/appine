@@ -1920,10 +1920,8 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     // Each thread's TaskState and TaskRes each hold one reference
     let others = |count: usize| count > 2;
     let copy_fds = if flags & CLONE_FILES != 0 && others(Rc::strong_count(&cx.t.fds)) {
-        // As with Linux's dup_fd: copying fails when the highest open fd (rounded up to 64)
-        // exceeds nr_open
-        let highest = cx.fds().open_fds().last().map_or(0, |&fd| fd as usize + 1);
-        if highest.next_multiple_of(64) > cx.kr().nr_open {
+        // dup_fd sizes the copy from both installed and reserved descriptors.
+        if cx.fds().copy_len(|_| true).next_multiple_of(64) > cx.kr().nr_open {
             return Err(Errno::EMFILE);
         }
         true

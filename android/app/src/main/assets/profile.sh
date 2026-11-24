@@ -34,8 +34,10 @@ if [ -n "${BASH_VERSION-}" ]; then
 elif [ -n "${BB_ASH_VERSION-}" ]; then
     # ash runs nothing before a command or a prompt, so its marks are in PS1 and PS2 themselves:
     # appine.ashrc puts them there, now and again when ash reads ENV
-    PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
-    if [ -r /etc/profile.d/appine.ashrc ]; then . /etc/profile.d/appine.ashrc; fi
+    if [ -r /etc/profile.d/appine.ashrc ]; then
+        PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]$(__appine_ash_path prompt)\[\e[0m\]\$ '
+        . /etc/profile.d/appine.ashrc
+    fi
 elif [ -n "${ZSH_VERSION-}" ]; then
     # zsh reads this file where its /etc/zsh/zprofile sources /etc/profile (Alpine's does, in sh
     # emulation; Debian's does not). Its hooks come from appine.zshrc

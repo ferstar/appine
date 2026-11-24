@@ -42,6 +42,7 @@
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/select.h>
 #include <sys/sem.h>
 #include <sys/resource.h>
 #include <sys/shm.h>
@@ -1088,6 +1089,31 @@ static void test_mqueue_root_perms_and_sticky(void)
     _exit(0);
 }
 
+static int select_high_fd(int fd)
+{
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(fd, &readfds);
+    struct timeval timeout = {0};
+    return select(fd + 1, &readfds, NULL, NULL, &timeout);
+}
+
+static void test_select_closed_high_fd(void)
+{
+    int fd = fcntl(STDIN_FILENO, F_DUPFD, 200);
+    CHECK(fd == 200, "allocate high fd for select");
+    CHECK(close(fd) == 0, "close high fd");
+    CHECK(select_high_fd(fd) == -1 && errno == EBADF, "select detects closed high fd");
+
+    pid_t child = fork();
+    CHECK(child >= 0, "fork with empty high fd slots");
+    if (child == 0) {
+        CHECK(select_high_fd(fd) == 0, "child fd table fits its open fds");
+        _exit(0);
+    }
+    wait_ok(child, "select after fork");
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--exit-ok") == 0)
@@ -1095,6 +1121,7 @@ int main(int argc, char **argv)
 
     mkdir("/tmp", 01777);
 
+    test_select_closed_high_fd();
     test_epoll_efault_and_partial_copy();
     test_epoll_top_down_nesting();
     test_epoll_exclusive_direction();

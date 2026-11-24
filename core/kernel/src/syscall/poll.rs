@@ -143,7 +143,7 @@ pub(super) fn pselect6(
     }
     // core_sys_select clamps nfds to the size of the fd table (`select(FD_SETSIZE, ...)` works
     // whatever the fd limit): bits above it are neither read nor written back
-    let nfds = (nfds as usize).min(fd_table_size(cx.fds().open_fds().last().copied()));
+    let nfds = (nfds as usize).min(cx.fds().capacity());
     let words = nfds.div_ceil(64);
     // The three fd_sets: read, write and except
     let mut bits = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
@@ -211,16 +211,6 @@ pub(super) fn pselect6(
         }
     }
     Ok(n)
-}
-
-/// The size of Linux's fd table (`fdt->max_fds`) for a process whose highest open fd is
-/// `highest`: 64 (`NR_OPEN_DEFAULT`) until a higher fd is opened, then `alloc_fdtable`'s
-/// 128 · 2^k. Linux's table never shrinks; this assumes it was never larger than now.
-fn fd_table_size(highest: Option<i32>) -> usize {
-    match highest {
-        Some(fd) if fd >= 64 => (fd as usize / 128 + 1).next_power_of_two() * 128,
-        _ => 64,
-    }
 }
 
 /// Installs the temporary signal mask given by the guest; when interrupted by a signal, signal

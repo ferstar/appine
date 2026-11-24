@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: message queue soft limits are enforced at queue creation)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: local page fills after socket receives)
 
 ## Responsibilities
 
@@ -397,8 +397,9 @@ and `kernel/oom`.
   cache line (`kernel/bug` watchdog). Guest times must use `kernel/time`'s `timespec`, and the run
   loop must call `Shared::resume_checks` before guest execution.
 - Syscall handlers may rerun on `FUSE_RETRY` (walks or FUSE-mapping copies): mutate nothing before
-  the last walk (`kernel/exec` mutates nothing before killing other threads); only pre-read
-  read/write buffers make copy retries safe.
+  the last walk (`kernel/exec` mutates nothing before killing other threads). Prefault I/O
+  buffers ahead of side effects or service missing pages within the handler, as `kernel/net`
+  does when a receive has already consumed data.
 - Between syscalls no FUSE node is held by the finishing thread, which is when `sweep` may forget
   nodes; a node another thread holds must be found by `kernel/fuse`'s `in_use` scan, an open
   handle or a request in flight.

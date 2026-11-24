@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: main executable and interpreter open records across unmap, fork and last-user exit)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: recvmsg and recvmmsg service mapped output faults locally)
 
 ## Responsibilities
 
@@ -54,8 +54,8 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 - `Refill` (private-file piece remapped at old address after `MREMAP_DONTUNMAP`), `Reread` (written
   private-file piece reread after `MADV_DONTNEED`), and `AdviseRange` (host-page-aligned slice of a
   retained `Arc<HostRegion>` for unlocked non-destructive `madvise`).
-- `WANTED` (thread-local) — the page of a `Fill` a kernel access found not read, for the syscall
-  dispatcher (`take_wanted`).
+- `WANTED` (thread-local) — the page of a `Fill` a kernel access found not read, for the dispatcher
+  or the socket result copy to service (`take_wanted`).
 - `UserSlice` — an unchecked guest range passed to kernel-side accessors.
 
 ### Introspection
@@ -180,8 +180,10 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   private.
 - A kernel access (`read`, `write`, `read_cstr`, `write_kernel`) meeting a page of a `Fill` mapping
   not yet read fails with the internal `FUSE_RETRY` and records the page in `WANTED`; the syscall
-  dispatcher reads it and runs the syscall again (`kernel/process`). `read` and `write` go page by
-  page, so a copy can stop partway; `write_kernel` checks the whole range first (any permission,
+  dispatcher normally reads it and runs the syscall again (`kernel/process`). Socket result
+  copies fill pages locally after recvfrom, recvmsg and accept4 have obtained their result;
+  recvmmsg handles missing pages within the current record. `read` and `write` go page by page, so a copy can stop partway. `write_kernel` checks
+  the whole range first (any permission,
   `PROT_NONE` fills included), before changing anything, and gives `PROT_NONE` anonymous memory it
   writes prot-0 entries.
 
@@ -407,10 +409,10 @@ signals may still be delivered).
 - **FUSE mappings read on demand are not Linux's page cache:** a page keeps what was read when first
   touched, so writes through the mount or by another process are not seen and separate mmap calls
   read separately; the size is fixed at mmap (growth not seen, truncation never `SIGBUS`); mlock,
-  `MADV_WILLNEED` and core dumps do not read pages (dumps write unread pages as zeros); a kernel
-  access to an unread page reruns the whole syscall, so a syscall other than read/write, pread,
-  pwrite and the vector forms (whose buffers the dispatcher reads in first) repeats what it did
-  before the copy, or returns a short count after a partial transfer.
+  `MADV_WILLNEED` and core dumps do not read pages (dumps write unread pages as zeros).
+  A handler that has already consumed input can repeat its effects on a whole-syscall retry
+  or return a short count. The dispatcher prefaults read/write, positional
+  and vectored I/O buffers. recvfrom, recvmsg and recvmmsg handle post-receive copies locally.
 - **Approximate madvise:** `MADV_DONTNEED_LOCKED`/`MADV_POPULATE_WRITE` are no-ops;
   `MADV_POPULATE_READ` runs advisory host readahead + RO file soft-PTE prefill without faulting or
   failing on inaccessible ranges; `MADV_FREE`/`COLD`/`PAGEOUT` are not refused on locked ranges.

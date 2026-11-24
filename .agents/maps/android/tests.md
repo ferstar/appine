@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: check that surrounding-text deletion preserves active IME composition)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: raw ash prompt paths and titles in the login test)
 
 ## Responsibilities
 
@@ -112,7 +112,8 @@ debug variant, manifest and network-security configuration belong to `android/bu
   both Debian source URIs in the network-enabled test), verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
   ports, bugs injected through the test hooks killing only the guest process on both tiers, kill
   reports (including an OOM from a cgroup `memory.max`), a guest crash reaching the kernel log, and
-  prompt marks (busybox ash's with root's shell set to `/bin/sh` for the test), and a
+  prompt marks (busybox ash's with root's shell set to `/bin/sh`, including the raw visible
+  path and the OSC title for a directory with a control character and a literal backslash), and a
   new Alpine import logging in with bash (`newSystemsLogInWithBash`, its own store: the offline
   install, the `/bin/sh` fallback, bash's marks and nested shells', root and `adduser`-copied
   `.bash_profile`/`.bashrc` loading and ownership, and non-interactive `bash -lc` skipping

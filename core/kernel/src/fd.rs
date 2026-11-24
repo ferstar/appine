@@ -742,6 +742,12 @@ impl FdTable {
         Self::default()
     }
 
+    /// Linux starts with 64 descriptors and grows in powers of two. Closing a file clears
+    /// its slot without shrinking the allocated table.
+    pub fn capacity(&self) -> usize {
+        self.slots.len().max(64).next_power_of_two()
+    }
+
     /// 0/1/2 are the host's stdin/stdout/stderr respectively.
     pub fn with_host_stdio() -> Self {
         let mut t = Self::new();
@@ -777,6 +783,9 @@ impl FdTable {
     /// waits), until [`fill`](Self::fill) or [`unreserve`](Self::unreserve).
     pub fn reserve(&mut self, min: usize) -> Result<i32, Errno> {
         let fd = self.free_slot(min)?;
+        if self.slots.len() <= fd as usize {
+            self.slots.resize(fd as usize + 1, None);
+        }
         self.reserved.push(fd as usize);
         Ok(fd)
     }
@@ -786,9 +795,6 @@ impl FdTable {
     pub fn fill(&mut self, fd: i32, file: FileRef, cloexec: bool) {
         let i = fd as usize;
         self.reserved.retain(|&r| r != i);
-        if self.slots.len() <= i {
-            self.slots.resize(i + 1, None);
-        }
         self.slots[i] = Some(Slot { file, cloexec });
     }
 
@@ -888,6 +894,46 @@ impl FdTable {
         closed
     }
 
+    /// Linux's dup_fd sizes the copy from the highest open bitmap bit. Reservations count
+    /// towards the size but have no file to copy. close_range may exclude a range of fds.
+    pub fn copy_len(&self, keep: impl Fn(usize) -> bool) -> usize {
+        let file = self
+            .slots
+            .iter()
+            .enumerate()
+            .rfind(|(i, slot)| slot.is_some() && keep(*i));
+        let reserved = self.reserved.iter().copied().filter(|&i| keep(i)).max();
+        file.map(|(i, _)| i).max(reserved).map_or(0, |i| i + 1)
+    }
+
+    fn copy_slots(&self, len: usize) -> Self {
+        Self {
+            slots: self.slots[..len].to_vec(),
+            reserved: Vec::new(),
+            limit: self.limit,
+            holds_locks: false,
+        }
+    }
+
+    /// Applies close_range while unsharing. Size the new table for the surviving bitmap
+    /// and return every closed file for lock, notification and FUSE cleanup.
+    pub fn unshare_close_range(
+        &self,
+        first: usize,
+        last: usize,
+        cloexec: bool,
+        nr_open: usize,
+    ) -> Result<(Self, Vec<FileRef>), Errno> {
+        let len = self.copy_len(|fd| cloexec || fd < first || fd > last);
+        if len.next_multiple_of(64) > nr_open {
+            return Err(Errno::EMFILE);
+        }
+        let mut copy = self.copy_slots(len);
+        let mut closed = copy.close_range(first, last, cloexec);
+        closed.extend(self.slots[len..].iter().flatten().map(|s| s.file.clone()));
+        Ok((copy, closed))
+    }
+
     /// All open fds, in increasing order.
     pub fn open_fds(&self) -> Vec<i32> {
         self.slots
@@ -914,12 +960,7 @@ impl Clone for FdTable {
     /// fork, clone without `CLONE_FILES`, unshare: POSIX locks belong to the original fd table
     /// and are not copied with it, nor are reserved fds (dup_fd clears their bits).
     fn clone(&self) -> Self {
-        FdTable {
-            slots: self.slots.clone(),
-            reserved: Vec::new(),
-            limit: self.limit,
-            holds_locks: false,
-        }
+        self.copy_slots(self.copy_len(|_| true))
     }
 }
 
@@ -961,6 +1002,30 @@ mod tests {
         // fds created by dup share one open file
         f.borrow_mut().pos = 5;
         assert_eq!(t.get(10).unwrap().borrow().pos, 5);
+    }
+
+    #[test]
+    fn table_capacity_after_copy() {
+        let mut parent = FdTable::with_host_stdio();
+        let file = parent.get(1).unwrap();
+        parent.install_at(100, file.clone(), false).unwrap();
+        parent.reserve(200).unwrap();
+        let child = parent.clone();
+        assert_eq!(child.capacity(), 256);
+        assert_eq!(child.free_slot(200), Ok(200));
+        parent.unreserve(200);
+        assert_eq!(parent.capacity(), 256);
+        assert_eq!(parent.clone().capacity(), 128);
+
+        let (private, closed) = parent.unshare_close_range(100, 200, false, 64).unwrap();
+        assert_eq!(private.capacity(), 64);
+        assert_eq!(closed.len(), 1);
+        assert!(Rc::ptr_eq(&closed[0], &file));
+        assert!(parent.get(100).is_ok());
+        let (marked, closed) = parent.unshare_close_range(100, 200, true, 128).unwrap();
+        assert_eq!(marked.capacity(), 128);
+        assert_eq!(marked.cloexec(100), Ok(true));
+        assert!(closed.is_empty());
     }
 
     /// A reserved fd is skipped by new fds, closed to everything else, EBUSY to dup2, not copied

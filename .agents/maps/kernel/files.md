@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: mounted queue path descriptors keep the queue inode and its capacity charge alive)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: fd table capacity and reservations for received SCM_RIGHTS)
 
 ## Responsibilities
 
@@ -67,7 +67,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   `FIOASYNC`/`FIONREAD`, random ioctls, render-node DRM ioctls (`syscall/gpu.rs`), and the dispatch
   of other ioctls by kind (including `FICLONE`/`FICLONERANGE`/`FIDEDUPERANGE` to `kernel/fileio`).
 - **Kernel-internal**: `create_exclusive`, `unlink_path`, `close_replaced` (seccomp's ADDFD),
-  `FdTable::with_host_stdio` (boot), `FdTable::reserve`/`fill`/`unreserve` (accept4), `open_mask`,
+  `FdTable::with_host_stdio` (boot), `FdTable::reserve`/`fill`/`unreserve` (accept4 and AF_UNIX ancillary delivery), `open_mask`,
   `executing`, `open_for_write`.
 
 ## Data flow / lifecycle
@@ -79,17 +79,20 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   targets at or over it `EBADF`). getrlimit, setrlimit and prlimit share one path, which refuses an
   `RLIMIT_NOFILE` hard limit over `nr_open` (`EPERM`) and sets the soft limit on the tables of all
   the target's threads, so it changes for every process sharing one (Linux checks each process's
-  own rlimit). `reserve` takes an fd for a file made later (accept4 while it waits, Linux's
-  `get_unused_fd_flags`), and `fill` or `unreserve` ends it: new fds skip a reserved one, dup3 onto
+  own rlimit). accept4 reserves an fd before waiting, and AF_UNIX recvmsg reserves the fd numbers
+  encoded in `SCM_RIGHTS` until output is written. `fill` or `unreserve` ends the reservation: new fds skip a reserved one, dup3 onto
   it (and seccomp's `SECCOMP_ADDFD_FLAG_SETFD`) is `EBUSY`, everything else sees it closed, and
-  fork does not copy it. arm64 has no dup2.
+  fork does not copy it. Installing or reserving a descriptor grows the table's logical capacity
+  (at least 64, rounded up to a power of two). Closing or cancelling a reservation retains this
+  capacity for `pselect6`. arm64 has no dup2.
 - dup and fork share one `OpenFile` (offset and status flags shared). Clone without `CLONE_FILES`
-  copies the slots and the limit and resets `holds_locks`. Every thread holds two references to its
+  sizes the copy from the highest open or reserved fd, copies open slots and the limit, and resets
+  `holds_locks`. Every thread holds two references to its
   table: `unshare(CLONE_FILES)`, execve (after the other threads are gone) and
   `CLOSE_RANGE_UNSHARE` copy only when there are more; a copy is a new owner of POSIX locks, so an
   unshared table keeps its locks. Both `unshare(CLONE_FILES)` and `CLOSE_RANGE_UNSHARE` return
-  `EMFILE` when the highest fd copied (excluding fds from `first` onward when `CLOSE_RANGE_UNSHARE`
-  closes through the end without `CLOSE_RANGE_CLOEXEC`), rounded up to 64, passes `nr_open`. execve
+  `EMFILE` when the required slot count rounded up to 64 passes `nr_open`. The close-range
+  copy excludes the range being closed when sizing it, and includes fds only marked close-on-exec. execve
   then applies close-on-exec.
 - Closing (close, dup3 over an fd, close_range, close-on-exec) removes the slot, runs
   `locks::closed`, `mqueue_closed`, flushes a FUSE file (close returns the flush's error, the
@@ -230,7 +233,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 - `kernel/mount`: the fd tables its busy and writer checks scan.
 - `kernel/overlay`: `open_store`; `kernel/locks`: fd tables, open files, `lock_ino`;
   `kernel/pipe`: `FileKind::Pipe`, fcntl/ioctl/close dispatch; `kernel/hostmem`: `gpu::Mapping`.
-- `kernel/procfs`: fd links and fdinfo; `kernel/net`: accept4's reserved fds, socket ioctls.
+- `kernel/procfs`: fd links and fdinfo; `kernel/net`: accept4's reserved fds, socket ioctls;
+  `kernel/unix`: pending `SCM_RIGHTS` reservations.
 - `kernel/poll`: poll/epoll reading open files, `EventFd`/`TimerFd`.
 - `kernel/inotify`: `Opened` on open/close, `FIONREAD`; `kernel/aio`, `kernel/loop` and
   `kernel/fuse`: fd lookup, `open_mask`, `executing`, `open_for_write`.
@@ -284,6 +288,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   - open_by_handle_at and memfds report no `IN_OPEN`, and cgroup2 files no `IN_CLOSE_*`; handles
     open a store inode through any store mount;
   - `RLIMIT_NOFILE` from prlimit applies to the whole shared fd table;
+  - table growth uses power-of-two capacity even when a lowered `nr_open` would cap Linux’s allocation;
   - FIONREAD on a FUSE regular file is `ENOTTY`.
 
 ## Open questions

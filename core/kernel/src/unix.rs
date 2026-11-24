@@ -20,7 +20,7 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use crate::cell::RefCell;
-use crate::fd::{FileKind, FileRef, OpenFile};
+use crate::fd::{FdTable, FileKind, FileRef, OpenFile};
 use crate::kernel::{Kernel, request_wake_object, wake};
 use crate::net::{AF_UNIX, SOCK_DGRAM, Socket};
 use crate::vfs::store::Ino;
@@ -690,11 +690,70 @@ impl Channel {
     }
 }
 
-// ---- /proc/net/unix ----
+// ---- Received and in-flight files ----
+
+/// SCM_RIGHTS numbers have been reserved and encoded in the control message. They remain
+/// unavailable to other threads until recvmsg finishes writing its result. The kernel tracks
+/// this delivery weakly so in-flight file enumerations still see its files during a page fill.
+pub(crate) struct PendingRights {
+    table: Weak<RefCell<FdTable>>,
+    files: Vec<(i32, FileRef)>,
+}
+
+impl PendingRights {
+    pub fn new(table: &Rc<RefCell<FdTable>>) -> Self {
+        Self {
+            table: Rc::downgrade(table),
+            files: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, fd: i32, file: FileRef) {
+        self.files.push((fd, file));
+    }
+
+    pub fn track(self, k: &mut Kernel) -> Option<Rc<Self>> {
+        if self.files.is_empty() {
+            return None;
+        }
+        let pending = Rc::new(self);
+        k.unix_receiving
+            .retain(|delivery| delivery.strong_count() != 0);
+        k.unix_receiving.push(Rc::downgrade(&pending));
+        Some(pending)
+    }
+
+    pub fn install(self: Rc<Self>, table: &mut FdTable, cloexec: bool) {
+        // Enumerators hold a strong reference only while snapshotting under the BKL.
+        let mut pending = Rc::into_inner(self).expect("recvmsg owns its pending SCM_RIGHTS");
+        for (fd, file) in pending.files.drain(..) {
+            table.fill(fd, file, cloexec);
+        }
+    }
+}
+
+impl Drop for PendingRights {
+    fn drop(&mut self) {
+        if !self.files.is_empty() {
+            if let Some(table) = self.table.upgrade() {
+                let mut table = table.borrow_mut();
+                for (fd, _) in &self.files {
+                    table.unreserve(*fd);
+                }
+            }
+            if self.files.iter().any(|(_, file)| is_unix_file(file)) {
+                defer_collect();
+            }
+        }
+    }
+}
 
 /// In-flight sockets (those only in `SCM_RIGHTS` messages): `/proc/net/unix` lists them too.
 pub(crate) fn inflight_sockets(k: &Kernel) -> Vec<Rc<RefCell<Socket>>> {
     let mut out = Vec::new();
+    for delivery in k.unix_receiving.iter().filter_map(Weak::upgrade) {
+        out.extend(delivery.files.iter().filter_map(|(_, f)| unix_socket(f)));
+    }
     for c in k.unix_inflight.iter().filter_map(Weak::upgrade) {
         for p in &c.borrow().packets {
             out.extend(p.fds.iter().filter_map(unix_socket));
@@ -706,6 +765,9 @@ pub(crate) fn inflight_sockets(k: &Kernel) -> Vec<Rc<RefCell<Socket>>> {
 /// The open files carried by messages in flight (each as many times as it is carried).
 pub(crate) fn inflight_files(k: &Kernel) -> Vec<FileRef> {
     let mut out = Vec::new();
+    for delivery in k.unix_receiving.iter().filter_map(Weak::upgrade) {
+        out.extend(delivery.files.iter().map(|(_, f)| f.clone()));
+    }
     for c in k.unix_inflight.iter().filter_map(Weak::upgrade) {
         for p in &c.borrow().packets {
             out.extend(p.fds.iter().cloned());
@@ -713,6 +775,8 @@ pub(crate) fn inflight_files(k: &Kernel) -> Vec<FileRef> {
     }
     out
 }
+
+// ---- /proc/net/unix ----
 
 /// `/proc/net/unix`: all AF_UNIX sockets. Abstract addresses start with `@`, and the NULs in them
 /// are shown as `@` too.

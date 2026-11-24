@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-17 (full mapping: 3 research concerns, 14 claims checked by 2 independent verifiers)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: epoll copy-before-report, top-down nesting limit, and direction-aware EPOLLEXCLUSIVE gates)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pselect6 retains the fd table scan range after close)
 
 ## Responsibilities
 
@@ -114,8 +114,8 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   in every timed wait here, saturated at `KTIME_MAX` (the `kernel/time` map); each fd
   looked up once (closed → `POLLNVAL`, negative → ignored); revents written back and counted,
   also when the wait is interrupted (zeros, before the error is returned, as `do_sys_poll`).
-- pselect6: `nfds` negative `EINVAL`, otherwise clamped to Linux's fd table size computed from
-  the highest open fd (64, then `alloc_fdtable`'s 128 · 2^k), so bits above it are neither read
+- pselect6: `nfds` negative `EINVAL`, otherwise clamped to the fd table's retained capacity
+  (`FdTable::capacity`, including previously occupied slots), so bits above it are neither read
   nor written back; sets read in 64-bit words; read → `IN|RDNORM|HUP|ERR|NVAL`, write →
   `OUT|WRNORM|ERR|NVAL`, except → `PRI|NVAL` (an `O_PATH` fd is ready in every set); a set bit on a
   closed fd `EBADF`; results rebuilt per set (one count per bit). Only events in an fd's sets end
@@ -262,9 +262,6 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ## Confirmed bugs / technical debt
 
-- **select's fd table size is estimated:** Linux's table never shrinks and a forked child's is
-  sized by its parent's open fds, while here it is computed from the highest fd open now, so a set
-  bit on a closed fd just above that can be ignored where Linux returns `EBADF`.
 - **Exclusive gates rotate waiter order:** woken exclusive waiters requeue at the back instead of
   keeping Linux's stable queue order.
 - **Pipe `POLLOUT` counts bytes, not buffers:** a pipe write end is reported writable once

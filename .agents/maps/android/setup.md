@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: invalidate staged file imports when the store is reset)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: escaped default ash prompt paths and titles)
 
 ## Responsibilities
 
@@ -239,8 +239,11 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     and breaks a command longer than the screen's width into rows itself, so A and P also carry
     `appine_lf=output`, the app's own option, asking the terminal to read ash's line feeds
     (android/vtcore): one ash breaks a line with continues the input, any other ends it. `appine.ashrc`
-    wraps whatever PS1 and PS2 are when they have no marks, and only in busybox ash: the profile
-    sources it after setting its coloured PS1, and every interactive ash reads it again through
+    calls `__appine_ash_path` to show the physical directory in the stock visible prompt
+    (abbreviated under `HOME`) and the full logical `PWD` in the title. Both replace controls with
+    `?` and double backslashes before BusyBox interprets the prompt escapes. Custom prompt text
+    keeps its own path formatting. The script wraps unmarked PS1 and PS2 only in busybox ash.
+    The profile sources it after setting its coloured PS1, and every interactive ash reads it through
     `ENV`, a login shell after `/etc/profile` and `~/.profile`, so a PS1 that `~/.profile` sets is
     marked; one set later (typed, or by a file the user's own `ENV` names) goes without.
   - zsh: the profile sets the coloured PS1 and reads `appine.zshrc`. Its `__appine_precmd`,
@@ -401,9 +404,6 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ## Confirmed bugs / technical debt
 
-- Busybox ash can emit literal path controls through the visible prompt's `\w`. The directory
-  title is sanitized and restored after that prompt, but other terminal effects in visible
-  prompt text are not sanitized.
 - Automatic command titles cover bash and zsh only. Busybox ash has no preexec hook; it still
   needs terminal-side or foreground-process detection to report commands that set no title.
 
