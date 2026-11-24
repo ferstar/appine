@@ -732,14 +732,9 @@ impl Conn {
     fn busy_nodeids(&self) -> HashSet<u64> {
         let mut ids = HashSet::new();
         for r in self.requests.values() {
-            let m = &r.message;
-            let opcode = u32::from_le_bytes(m[4..8].try_into().unwrap());
-            ids.insert(u64::from_le_bytes(m[16..24].try_into().unwrap()));
-            if matches!(opcode, op::RENAME | op::RENAME2 | op::LINK) && m.len() >= IN_HEADER + 8 {
-                ids.insert(u64::from_le_bytes(
-                    m[IN_HEADER..IN_HEADER + 8].try_into().unwrap(),
-                ));
-            }
+            let (nodeid, other) = req_nodeids(&r.message);
+            ids.insert(nodeid);
+            ids.extend(other);
         }
         ids
     }
@@ -751,17 +746,13 @@ impl Conn {
         if self.doomed.is_empty() {
             return;
         }
-        let nodeid = u64::from_le_bytes(message[16..24].try_into().unwrap());
-        if self.doomed.contains(&nodeid) && !self.opens.contains_key(&nodeid) {
+        let (nodeid, other) = req_nodeids(message);
+        if [Some(nodeid), other]
+            .into_iter()
+            .flatten()
+            .any(|id| self.doomed.contains(&id) && !self.opens.contains_key(&id))
+        {
             SWEEP.store(true, Ordering::Relaxed);
-            return;
-        }
-        let opcode = u32::from_le_bytes(message[4..8].try_into().unwrap());
-        if matches!(opcode, op::RENAME | op::RENAME2 | op::LINK) && message.len() >= IN_HEADER + 8 {
-            let other = u64::from_le_bytes(message[IN_HEADER..IN_HEADER + 8].try_into().unwrap());
-            if self.doomed.contains(&other) && !self.opens.contains_key(&other) {
-                SWEEP.store(true, Ordering::Relaxed);
-            }
         }
     }
 
@@ -770,19 +761,13 @@ impl Conn {
         let mut releasing = HashSet::new();
         let mut others = HashSet::new();
         for r in self.requests.values() {
-            let m = &r.message;
-            let opcode = u32::from_le_bytes(m[4..8].try_into().unwrap());
-            let nodeid = u64::from_le_bytes(m[16..24].try_into().unwrap());
+            let opcode = u32::from_le_bytes(r.message[4..8].try_into().unwrap());
+            let (nodeid, other) = req_nodeids(&r.message);
             if matches!(opcode, op::RELEASE | op::RELEASEDIR) {
                 releasing.insert(nodeid);
             } else {
                 others.insert(nodeid);
-                if matches!(opcode, op::RENAME | op::RENAME2 | op::LINK) && m.len() >= IN_HEADER + 8
-                {
-                    others.insert(u64::from_le_bytes(
-                        m[IN_HEADER..IN_HEADER + 8].try_into().unwrap(),
-                    ));
-                }
+                others.extend(other);
             }
         }
         &releasing - &others
@@ -799,6 +784,17 @@ impl Conn {
             None
         }
     }
+}
+
+/// Decodes the primary node id from a FUSE request header and, for `RENAME`/`RENAME2`/`LINK`,
+/// the secondary node id from the start of the request body.
+fn req_nodeids(message: &[u8]) -> (u64, Option<u64>) {
+    let opcode = u32::from_le_bytes(message[4..8].try_into().unwrap());
+    let nodeid = u64::from_le_bytes(message[16..24].try_into().unwrap());
+    let other = (matches!(opcode, op::RENAME | op::RENAME2 | op::LINK)
+        && message.len() >= IN_HEADER + 8)
+        .then(|| u64::from_le_bytes(message[IN_HEADER..IN_HEADER + 8].try_into().unwrap()));
+    (nodeid, other)
 }
 
 /// Queues `FUSE_INIT` on a new connection (6.1's `fuse_send_init`); nobody waits for it, and its

@@ -866,13 +866,13 @@ impl Store {
     /// Whether regular file `ino` is held: it shares its object, or did since it was last
     /// written, so it must get an object of its own before it is changed ([`Store::unshare`]).
     pub fn held(&self, ino: Ino) -> Result<bool, Errno> {
-        Ok(self.row(ino)?.1.held.is_some())
+        Ok(self.data(ino)?.held.is_some())
     }
 
     /// The host handed regular file `ino`'s object out for writing, opened by `path`
     /// ([`HOST_WRITERS`]).
     pub fn host_opened(&self, ino: Ino, path: &[u8]) -> Result<(), Errno> {
-        let entry = (self.id()?, self.data(ino)?.object, path.to_vec());
+        let entry = (self.store_id, self.data(ino)?.object, path.to_vec());
         let mut writers = HOST_WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
         writers.push(entry);
         HOST_WRITERS_COUNT.store(writers.len(), Ordering::SeqCst);
@@ -881,11 +881,11 @@ impl Store {
 
     /// The host closed a file it had opened for writing by `path`.
     pub fn host_closed(&self, path: &[u8]) {
-        let Ok(id) = self.id() else {
-            return;
-        };
         let mut writers = HOST_WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(i) = writers.iter().position(|(s, _, p)| *s == id && p == path) {
+        if let Some(i) = writers
+            .iter()
+            .position(|(s, _, p)| *s == self.store_id && p == path)
+        {
             writers.remove(i);
             HOST_WRITERS_COUNT.store(writers.len(), Ordering::SeqCst);
         }
@@ -897,12 +897,12 @@ impl Store {
         if HOST_WRITERS_COUNT.load(Ordering::Acquire) == 0 {
             return Ok(false);
         }
-        let (id, object) = (self.id()?, self.data(ino)?.object);
+        let object = self.data(ino)?.object;
         Ok(HOST_WRITERS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .any(|(s, o, _)| *s == id && *o == object))
+            .any(|(s, o, _)| *s == self.store_id && *o == object))
     }
 
     /// Whether the Files app currently holds any host object in this store open for writing.
@@ -915,11 +915,6 @@ impl Store {
                 .any(|(s, _, _)| *s == self.store_id)
     }
 
-    /// The store's identity across connections: the device and inode of its `objects` directory.
-    fn id(&self) -> Result<(u64, u64), Errno> {
-        Ok(self.store_id)
-    }
-
     /// Metadata in the database (without touching the host; a regular file's size and times are
     /// not filled in): for permission checks when opening a file.
     pub fn attrs(&self, ino: Ino) -> Result<Stat, Errno> {
@@ -929,34 +924,42 @@ impl Store {
     /// File type bits (no need to read the object; also works for files still open after
     /// deletion).
     pub fn kind(&self, ino: Ino) -> Result<u32, Errno> {
-        Ok(self.stat_row(ino)?.kind())
+        self.with_row(ino, |(st, _)| st.kind())
     }
 
     /// Metadata in the database (a regular file's size and mtime are not filled in yet).
     fn stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
-        Ok(self.row(ino)?.0)
+        self.with_row(ino, |(st, _)| st.clone())
     }
 
     /// Where regular file `ino`'s data and times are.
     fn data(&self, ino: Ino) -> Result<Data, Errno> {
-        Ok(self.row(ino)?.1)
+        self.with_row(ino, |(_, data)| *data)
     }
 
     /// The database row of inode `ino` ([`Store::stat_row`], [`Store::data`]).
     fn row(&self, ino: Ino) -> Result<(Stat, Data), Errno> {
+        self.with_row(ino, Clone::clone)
+    }
+
+    /// Reads inode `ino`'s database row from the metadata cache or SQLite and passes it to `f`
+    /// without cloning [`Stat`] when the caller only needs selected fields.
+    fn with_row<R>(&self, ino: Ino, f: impl FnOnce(&(Stat, Data)) -> R) -> Result<R, Errno> {
         let generation = self.cache_generation();
-        if let Some(hit) = self.cached(|c| c.rows.get(&ino).cloned()) {
+        let mut f = Some(f);
+        if let Some(hit) = self.cached(|c| c.rows.get(&ino).map(|row| f.take().unwrap()(row))) {
             return Ok(hit);
         }
         self.begin_read()?;
         let row = self.query_row(ino)?;
+        let out = f.take().unwrap()(&row);
         if generation.is_some_and(|g| self.may_fill(g)) {
             self.update(|c| {
                 c.entries += 1;
-                c.rows.insert(ino, row.clone());
+                c.rows.insert(ino, row);
             });
         }
-        Ok(row)
+        Ok(out)
     }
 
     fn query_row(&self, ino: Ino) -> Result<(Stat, Data), Errno> {
@@ -1974,29 +1977,9 @@ impl Store {
     /// Returns `(atime_ns, mtime_ns, ctime_ns)` for `ino` without cloning [`Stat`] or stat-ing
     /// the host object for directories and held regular files whose timestamps live in SQLite.
     fn inode_times(&self, ino: Ino, file: Option<&File>) -> Result<(i64, i64, i64), Errno> {
-        let generation = self.cache_generation();
-        let (kind, row_times, data) = if let Some(hit) = self.cached(|c| {
-            c.rows
-                .get(&ino)
-                .map(|(st, data)| (st.kind(), (st.atime_ns, st.mtime_ns, st.ctime_ns), *data))
-        }) {
-            hit
-        } else {
-            self.begin_read()?;
-            let row = self.query_row(ino)?;
-            let res = (
-                row.0.kind(),
-                (row.0.atime_ns, row.0.mtime_ns, row.0.ctime_ns),
-                row.1,
-            );
-            if generation.is_some_and(|g| self.may_fill(g)) {
-                self.update(|c| {
-                    c.entries += 1;
-                    c.rows.insert(ino, row);
-                });
-            }
-            res
-        };
+        let (kind, row_times, data) = self.with_row(ino, |(st, data)| {
+            (st.kind(), (st.atime_ns, st.mtime_ns, st.ctime_ns), *data)
+        })?;
         if kind != mode::S_IFREG || data.held.is_some() {
             return Ok(row_times);
         }

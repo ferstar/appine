@@ -957,7 +957,7 @@ impl Overlays {
             Ok(())
         })?;
         if let Some(u) = child_upper
-            && (rmdir || store.attrs(u).is_ok_and(|st| st.nlink == 0) || store.attrs(u).is_err())
+            && (rmdir || !store.attrs(u).is_ok_and(|st| st.nlink > 0))
         {
             let dev = self.node(dir).dev;
             self.instances.get_mut(&dev).unwrap().origins.remove(&u);
@@ -1058,7 +1058,7 @@ impl Overlays {
         })?;
         if !exchange
             && let Some(du) = dst_up
-            && (store.attrs(du).is_ok_and(|st| st.nlink == 0) || store.attrs(du).is_err())
+            && !store.attrs(du).is_ok_and(|st| st.nlink > 0)
         {
             let dev = self.node(new).dev;
             self.instances.get_mut(&dev).unwrap().origins.remove(&du);

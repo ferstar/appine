@@ -1498,7 +1498,7 @@ pub(super) fn sweep_overlays(cx: &Cx<'_>) {
         keep.extend(ovl(&fs.root));
         keep.extend(ovl(&fs.cwd));
     }
-    keep.extend(vfs.overlay_mount_nodes());
+    keep.extend(vfs.mount_nodes().iter().filter_map(ovl));
     let Ok(inotify) = k.inotify.try_borrow() else {
         return;
     };

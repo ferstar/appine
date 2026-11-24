@@ -2358,14 +2358,22 @@ impl Vfs {
         self.mounts.borrow().list.clone()
     }
 
-    /// The roots and mount points of every mount, attached or detached.
+    /// Every node referenced by any mount, attached or detached: mount roots, mount points, and
+    /// the recorded parent directories of mounts on or of files (`Mount::at`, `Mount::root_at`).
     pub(crate) fn mount_nodes(&self) -> Vec<Node> {
         let mounts = self.mounts.borrow();
         mounts
             .list
             .iter()
             .chain(&mounts.detached)
-            .flat_map(|m| [Some(m.root.clone()), m.point.clone()])
+            .flat_map(|m| {
+                [
+                    Some(m.root.clone()),
+                    m.point.clone(),
+                    m.at.as_ref().map(|(dir, _)| dir.clone()),
+                    m.root_at.as_ref().map(|(dir, _)| dir.clone()),
+                ]
+            })
             .flatten()
             .collect()
     }
@@ -3407,30 +3415,6 @@ impl Vfs {
         oldest: u64,
     ) -> usize {
         self.overlays.borrow_mut().sweep(keep, oldest)
-    }
-
-    /// Overlay nodes referenced by any mount (attached or detached): mount roots, mount points,
-    /// and the recorded parent directories of mounts on or of files (`Mount::at`,
-    /// `Mount::root_at`).
-    pub(crate) fn overlay_mount_nodes(&self) -> Vec<overlay::OvlId> {
-        let mounts = self.mounts.borrow();
-        let mut ids = Vec::new();
-        for m in mounts.list.iter().chain(&mounts.detached) {
-            for node in [
-                Some(&m.root),
-                m.point.as_ref(),
-                m.at.as_ref().map(|(dir, _)| dir),
-                m.root_at.as_ref().map(|(dir, _)| dir),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Node::Overlay(_, o) = node {
-                    ids.push(*o);
-                }
-            }
-        }
-        ids
     }
 
     /// Mounts a new FUSE instance served through connection `conn` (whose device number is

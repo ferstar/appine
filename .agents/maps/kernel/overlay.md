@@ -52,7 +52,7 @@ holding its node (`kernel/exec`).
 
 - **Instances and nodes**: `Vfs::new_overlay`, `overlay`, `overlay_stat`, `overlay_readdir`,
   `overlay_upper`, `overlay_remove`, `overlay_rename`, `overlay_child`, `overlay_prefix`,
-  `overlay_mount_nodes`, `sweep_overlays`; `Overlays::upper_of` (copy-up), `remove`, `rename`.
+  `sweep_overlays`; `Overlays::upper_of` (copy-up), `remove`, `rename`.
 - **Syscall paths**: mount(2) of type `overlay`; `open_overlay`, `follow_copy_up`, `copy_up`,
   `unlink_overlay`, `link_overlay`, `rename_overlay`; overlay branches of creation, attribute
   changes and readdir in `kernel/vfs`, of opening in `kernel/files`, of truncate in
@@ -99,7 +99,7 @@ holding its node (`kernel/exec`).
   `NODES_MAX`), `sweep_overlays` runs:
   - an orphan goes, with every node below it, unless it or a node below is held (`Hold`), is a
     process's root or cwd, a mount's root, point or recorded file-mount directory (`Mount::at`,
-    `Mount::root_at`, detached ones too via `overlay_mount_nodes`), watched by inotify, or was
+    `Mount::root_at`, detached ones too via `Vfs::mount_nodes`), watched by inotify, or was
     removed at or after another thread's syscall began — unless that syscall waits only on files it
     holds (`waits_on_files_only`: I/O, polls, child and signal waits, sleeps, futexes, locks,
     receives and accepts, fcntl, ioctl, fsync, copy_file_range, IPC, AIO events), as
@@ -214,7 +214,7 @@ holding its node (`kernel/exec`).
   xattrs.
 - `kernel/files`: `open_store`; `kernel/fileio`: `prepare_write`; `kernel/vfs`: the tmpfs instances its layers are
   in.
-- `kernel/mount` (layer checks, `clone_private_mount`'s rules), `kernel/cred` (permission and
+- `kernel/mount` (layer checks, `clone_private_mount`'s rules, `mount_nodes`), `kernel/cred` (permission and
   ownership on what the overlay shows), every task's root and cwd and the inotify registry for the
   sweep.
 

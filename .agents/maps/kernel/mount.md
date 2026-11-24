@@ -82,7 +82,8 @@ Outside the module:
   `type_of` and `root_path`, what mountinfo shows), `count_in`/`any_ns_over`, `find_ns`/`ns_root`/
   `pinned_ns`/`init_ns`, `copy_ns`, `anon_ns`, `mount`/`mount_root`/`any_mount_root`/`children`/
   `subtree`/`subtree_has_unbindable`, `mount_ns`, `is_point_in`, `mount_nodes` (every attached and
-  detached mount's root and point, which the FUSE and overlay node sweeps keep), `mount_events`
+  detached mount's root, point, and `at`/`root_at` parent directories, which the FUSE and overlay
+  node sweeps keep), `mount_events`
   (the counter polled through mounts and mountinfo).
 - **Changes**: `clone_mount`, `attach_tree`, `add_mount`/`add_mount_unattached`, `add_copies`,
   `move_mount`, `set_root_at`, `umount_tree`, `propagation_targets`, `propagate`,
@@ -330,6 +331,7 @@ Outside the module:
 - `kernel/tty`: devpts instance options.
 - `kernel/ipc`: `mq_dev`.
 - `kernel/fuse`: `mount_nodes` for its node sweep, `is_point_in`.
+- `kernel/overlay`: `mount_nodes` for its node sweep.
 
 ### Outbound
 
