@@ -874,6 +874,11 @@ fn run_c_guest_with(name: &str, args: &[&str], test_hooks: bool) {
             "tier {tier}: {}",
             stdout(&out)
         );
+        assert!(
+            !stderr(&out).contains("appine: internal error"),
+            "tier {tier}: unexpected internal error in stderr: {}",
+            stderr(&out)
+        );
     }
 }
 
@@ -882,11 +887,10 @@ fn run_guest_in_empty_rootfs(name: &str) {
         return;
     };
     let bytes = std::fs::read(&program).unwrap();
-    let (_, store) = output(&format!("{name}-store"));
     let (_, empty_dir) = output(&format!("{name}-empty"));
     let (_, tar_path) = output(&format!("{name}-empty.tar.gz"));
-    let _ = std::fs::remove_dir_all(&store);
     let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_file(&tar_path);
     std::fs::create_dir_all(&empty_dir).unwrap();
     let tar = Command::new("tar")
         .args(["-czf"])
@@ -897,16 +901,19 @@ fn run_guest_in_empty_rootfs(name: &str) {
         .status()
         .expect("tar failed");
     assert!(tar.success());
-    appine_kernel::import_rootfs(&store, &tar_path).unwrap();
     let guest_path = format!("/{name}");
-    appine_kernel::write_file(&store, &guest_path, &bytes, 0o755, true, 0, 0).unwrap();
     for tier in TIERS {
+        let (_, store) = output(&format!("{name}-store-t{tier}"));
+        let _ = std::fs::remove_dir_all(&store);
+        appine_kernel::import_rootfs(&store, &tar_path).unwrap();
+        appine_kernel::write_file(&store, &guest_path, &bytes, 0o755, true, 0, 0).unwrap();
         let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
             .args(["--rootfs"])
             .arg(&store)
             .args(["--tier", tier, &guest_path])
             .output()
             .expect("failed to run appine-run");
+        let _ = std::fs::remove_dir_all(&store);
         assert_eq!(
             out.status.code(),
             Some(0),
@@ -916,11 +923,16 @@ fn run_guest_in_empty_rootfs(name: &str) {
         );
         assert!(
             stdout(&out).ends_with("all ok\n"),
-            "tier {tier}: stdout={}",
-            stdout(&out)
+            "tier {tier}: stdout={} stderr={}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            !stderr(&out).contains("appine: internal error"),
+            "tier {tier}: unexpected internal error in stderr: {}",
+            stderr(&out)
         );
     }
-    let _ = std::fs::remove_dir_all(&store);
     let _ = std::fs::remove_dir_all(&empty_dir);
     let _ = std::fs::remove_file(&tar_path);
 }
@@ -996,6 +1008,46 @@ fn fs_io_regressions() {
 #[test]
 fn mm_mount_pseudo_regressions() {
     run_guest_in_empty_rootfs("mm_mount_pseudo");
+}
+
+#[test]
+fn exec_runs_post_syscall_sweeps() {
+    run_guest_in_empty_rootfs("exec_sweep");
+}
+
+#[test]
+fn mm_gap_semantics_and_shared_futex_maps() {
+    run_guest_in_empty_rootfs("mm_fixes");
+}
+
+#[test]
+fn netlink_resumable_and_nft_setelem_dumps() {
+    run_c_guest("netlink_dump");
+}
+
+#[test]
+fn netns_same_port_bind_conflicts_and_routing() {
+    run_guest_in_empty_rootfs("netns_bind");
+}
+
+#[test]
+fn oom_victim_reaping_and_vfork_safety() {
+    run_guest_in_empty_rootfs("oom_reap");
+}
+
+#[test]
+fn overlay_node_eviction_and_mmap_copy_up() {
+    run_guest_in_empty_rootfs("overlay_fixes");
+}
+
+#[test]
+fn ptrace_and_process_vm_cold_fuse_pages() {
+    run_guest_in_empty_rootfs("ptrace_fuse");
+}
+
+#[test]
+fn store_relatime_semantics_and_multichunk_reads() {
+    run_guest_in_empty_rootfs("store_relatime");
 }
 
 #[test]

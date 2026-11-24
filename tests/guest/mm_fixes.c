@@ -1,4 +1,4 @@
-// Regression tests for kernel/mm Batch-1 fixes:
+// Regression tests for kernel/mm fixes:
 // 1. Range operations with unmapped gaps (madvise, msync, mlock/munlock, mincore).
 // 2. Concurrent writable shared mappings (mmap, shmat, mremap) with cross-process futexes
 //    (ensuring shared_maps is visible before PTEs so fast-path futexes never use private keys).

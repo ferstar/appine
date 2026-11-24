@@ -276,6 +276,6 @@ int main(void)
     test_reap_exiting_ptrace();
     test_reap_killed_victim();
     test_vfork_sharer_not_corrupted();
-    printf("PASS\n");
+    printf("all ok\n");
     return 0;
 }
