@@ -26,10 +26,9 @@
 //! attributes, links) go this way; operations that change something are made directly by the
 //! syscall that has `&mut Cx`, after which it must not need a retry.
 //!
-//! Nodes are kept by node id per instance until the instance goes; the kernel never sends
-//! `FUSE_FORGET`, so the daemon keeps every node it has looked up while mounted. There is no page
-//! cache: reads and writes go to the daemon as they come (as with `FOPEN_DIRECT_IO`), and
-//! mappings copy the file ([`snapshot`]).
+//! Nodes are cached by node id per instance. Descriptor I/O goes through the daemon and
+//! live mappings share demand-filled file pages. Inode notifications revoke affected
+//! translations before the pages can be filled from a new daemon reply.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::{Rc, Weak};
@@ -41,6 +40,7 @@ use crate::cell::RefCell;
 use crate::cred::{Cred, UserNs};
 use crate::errno::Errno;
 use crate::kernel::{Cx, Tid, request_wake_object, wake};
+use crate::mm::FillPages;
 
 /// A FUSE node's number (in [`super::Node::Fuse`]), unique across all instances and never reused.
 pub(crate) type FuseId = u64;
@@ -136,7 +136,7 @@ mod init {
     pub const HANDLE_KILLPRIV: u32 = 1 << 19;
     pub const MAX_PAGES: u32 = 1 << 22;
     pub const NO_OPENDIR_SUPPORT: u32 = 1 << 24;
-    /// What the kernel offers: no page cache, so no writeback cache, splice, readdirplus or
+    /// Descriptor writes go to the daemon, so no writeback cache is negotiated. No splice, readdirplus or
     /// cache invalidation flags, and no `ASYNC_READ` (the kernel reads ahead in parallel with it,
     /// which this one does not: sshfs leaves reading ahead to a kernel that offers it, and does it
     /// itself otherwise); locks are kept in the kernel (no `POSIX_LOCKS`, `FLOCK_LOCKS`).
@@ -157,6 +157,7 @@ mod init {
 /// `FOPEN_*` flags of an open reply.
 pub(crate) mod fopen {
     pub const DIRECT_IO: u32 = 1 << 0;
+    pub const KEEP_CACHE: u32 = 1 << 1;
     pub const NONSEEKABLE: u32 = 1 << 2;
     pub const STREAM: u32 = 1 << 4;
     pub const NOFLUSH: u32 = 1 << 5;
@@ -1180,7 +1181,7 @@ pub(crate) fn dev_read(
 /// (EINVAL); a reply to no request the daemon holds is ENOENT. ENOSYS replies mark the operation
 /// as not implemented ([`no`]); an interrupt answered with EAGAIN is queued again.
 pub(crate) fn dev_write(
-    _cx: &mut Cx<'_>,
+    cx: &mut Cx<'_>,
     vfs: &super::Vfs,
     file: &crate::fd::FileRef,
     data: &[u8],
@@ -1199,7 +1200,7 @@ pub(crate) fn dev_write(
         return Err(Errno::ENOENT);
     }
     if unique == 0 {
-        notification(vfs, &conn, error, body)?;
+        notification(cx, vfs, &conn, error, body)?;
         return Ok(len);
     }
     if error > 0 || error <= -512 || (error != 0 && !body.is_empty()) {
@@ -1282,11 +1283,29 @@ pub(crate) fn dev_write(
     Ok(len)
 }
 
-/// A notification from the daemon (6.1's `fuse_notify`). Without a page cache, invalidating an
-/// inode drops its cached attributes, and invalidating or deleting an entry drops the name from
-/// its directory's cache; storing data and polls have nothing to act on and are accepted, and
-/// retrieving cached data is refused (ENOSYS: there is none).
+pub(crate) fn mapped_pages(vfs: &super::Vfs, id: FuseId) -> Option<Rc<FillPages>> {
+    vfs.fuse().get(id)?.pages.upgrade()
+}
+
+/// Revoke all translations before marking the file pages stale. The daemon may still owe a
+/// READ reply, so this runs under the BKL without acquiring the inode I/O lock.
+fn invalidate_pages(cx: &Cx<'_>, pages: &Rc<FillPages>, lo: u64, hi: u64) {
+    let mut seen = HashSet::new();
+    for task in cx.kr().tasks.values() {
+        let mm = task.res.borrow().mm.clone();
+        if seen.insert(Rc::as_ptr(&mm)) {
+            let mut mm = mm.borrow_mut();
+            if mm.invalidate_fill(pages, lo, hi) {
+                mm.sync(&cx.task.sync);
+            }
+        }
+    }
+    pages.invalidate(lo, hi);
+}
+
+/// Daemon notifications for cached attributes, directory entries and mapped file ranges.
 fn notification(
+    cx: &Cx<'_>,
     vfs: &super::Vfs,
     conn: &Rc<RefCell<Conn>>,
     code: i32,
@@ -1297,7 +1316,29 @@ fn notification(
     match code {
         notify::INVAL_INODE => {
             let nodeid = f.u64()?;
-            vfs.fuse_mut().invalidate_attr(dev, nodeid);
+            let offset = f.u64()? as i64;
+            let len = f.u64()? as i64;
+            if !f.rest().is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            let pages = {
+                let mut nodes = vfs.fuse_mut();
+                let id = *nodes.by_nodeid.get(&(dev, nodeid)).ok_or(Errno::ENOENT)?;
+                nodes.stale(id);
+                nodes.node(id).pages.upgrade()
+            };
+            if let Some(pages) = pages
+                && offset >= 0
+            {
+                use appine_engine::PAGE_SIZE;
+                let lo = offset as u64 / PAGE_SIZE;
+                let hi = if len <= 0 {
+                    u64::MAX
+                } else {
+                    (offset as u64 + len as u64).div_ceil(PAGE_SIZE)
+                };
+                invalidate_pages(cx, &pages, lo, hi);
+            }
             Ok(())
         }
         notify::INVAL_ENTRY | notify::DELETE => {
@@ -1373,9 +1414,12 @@ pub(crate) struct Node {
     /// A symlink's target and the syscall that read it (Linux caches it only with
     /// `FUSE_CACHE_SYMLINKS`, which is not offered).
     link: Option<(Vec<u8>, u64)>,
-    /// An `O_APPEND` write is between asking for the size and writing there: others wait (6.1
-    /// holds the inode lock across both).
-    pub appending: bool,
+    /// Serializes page fills, writeback and mutations, including append offset selection.
+    pub io_busy: bool,
+    pub pages: Weak<FillPages>,
+    /// A last unmap or exit could not write back. Keep dirty data for a later sync on
+    /// this inode, or until the connection is torn down.
+    pub retry_writeback: Option<Rc<crate::mm::Fill>>,
     /// Entries the daemon returned for it, given back with `FUSE_FORGET` when it is forgotten
     /// (Linux's `nlookup`).
     nlookup: u64,
@@ -1439,7 +1483,9 @@ impl Fuses {
                 attr_token: 0,
                 children: HashMap::new(),
                 link: None,
-                appending: false,
+                io_busy: false,
+                pages: Weak::new(),
+                retry_writeback: None,
                 nlookup: 0,
                 path_pin: Weak::new(),
                 seen: 0,
@@ -1556,7 +1602,9 @@ impl Fuses {
                         attr_token: 0,
                         children: HashMap::new(),
                         link: None,
-                        appending: false,
+                        io_busy: false,
+                        pages: Weak::new(),
+                        retry_writeback: None,
                         nlookup: 1,
                         path_pin: Weak::new(),
                         seen: 0,
@@ -1814,13 +1862,6 @@ impl Fuses {
         }
     }
 
-    /// The daemon invalidated node id `nodeid`'s attributes (`FUSE_NOTIFY_INVAL_INODE`).
-    fn invalidate_attr(&mut self, dev: u64, nodeid: u64) {
-        if let Some(&id) = self.by_nodeid.get(&(dev, nodeid)) {
-            self.stale(id);
-        }
-    }
-
     /// The daemon invalidated `name` in directory node id `parent` (`FUSE_NOTIFY_INVAL_ENTRY`,
     /// `FUSE_NOTIFY_DELETE`).
     fn invalidate_entry(&mut self, dev: u64, parent: u64, name: &[u8]) {
@@ -1895,7 +1936,7 @@ thread_local! {
 }
 
 /// A copy of FUSE node `id`'s data for execve, when this syscall has read it ([`Query::Program`]):
-/// the loader needs a host file, and there is no page cache to map.
+/// the loader needs a fully populated host file.
 pub(crate) fn program(id: FuseId) -> Option<std::fs::File> {
     PROGRAMS.with_borrow(|p| {
         p.iter()
@@ -2059,9 +2100,22 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
+    /// OPEN and CREATE use the same cache policy. An atomic truncate resizes the backing
+    /// in the caller, even for a handle that otherwise keeps the cache.
+    pub(crate) fn finish_open(self, cx: &Cx<'_>, vfs: &super::Vfs) -> Self {
+        if !self.dir
+            && self.flags & crate::fd::oflags::O_TRUNC == 0
+            && self.open_flags & fopen::KEEP_CACHE == 0
+            && let Some(pages) = mapped_pages(vfs, self.id)
+        {
+            invalidate_pages(cx, &pages, 0, u64::MAX);
+        }
+        self.counted()
+    }
+
     /// Counts it among the node's open handles ([`Conn::opens`]), which keep the node from being
     /// forgotten until it goes.
-    pub(crate) fn counted(self) -> Handle {
+    fn counted(self) -> Handle {
         *self.conn.borrow_mut().opens.entry(self.nodeid).or_insert(0) += 1;
         self
     }
@@ -2147,6 +2201,16 @@ pub(crate) fn flush_released() {
     }
 }
 
+/// File status flags kept on a FUSE handle and sent in a standalone OPEN request.
+pub(crate) fn handle_flags(conn: &Conn, flags: u32) -> u32 {
+    use crate::fd::oflags;
+    let mut kept = flags & !(oflags::O_CREAT | oflags::O_EXCL | oflags::O_NOCTTY);
+    if !atomic_o_trunc(conn) {
+        kept &= !oflags::O_TRUNC;
+    }
+    kept
+}
+
 /// Opens node `id` (6.1's `fuse_do_open`): `FUSE_OPEN` or `FUSE_OPENDIR` with the open flags
 /// less `O_CREAT`, `O_EXCL` and `O_NOCTTY` (and `O_TRUNC` unless the daemon takes it). A daemon
 /// answering ENOSYS needs no open: no handle, no release, and none is asked again.
@@ -2157,50 +2221,37 @@ pub(crate) fn open(
     flags: u32,
     dir: bool,
 ) -> Result<Handle, Errno> {
-    use crate::fd::oflags;
     let (conn, nodeid) = target(vfs, id)?;
-    let (skip, keep_trunc) = {
-        let c = conn.borrow();
-        let bit = if dir { no::OPENDIR } else { no::OPEN };
-        (c.no & bit != 0, atomic_o_trunc(&c))
+    let sent = handle_flags(&conn.borrow(), flags);
+    let (opcode, unsupported) = if dir {
+        (op::OPENDIR, no::OPENDIR)
+    } else {
+        (op::OPEN, no::OPEN)
     };
-    let mut sent = flags & !(oflags::O_CREAT | oflags::O_EXCL | oflags::O_NOCTTY);
-    if !keep_trunc {
-        sent &= !oflags::O_TRUNC;
-    }
-    let handle = |fh, open_flags, no_release| {
-        Handle {
-            conn: conn.clone(),
-            id,
-            nodeid,
-            fh,
-            open_flags,
-            flags: sent,
-            dir,
-            no_release,
+    let (fh, open_flags, no_release) = if conn.borrow().no & unsupported != 0 {
+        (0, fopen::KEEP_CACHE, true)
+    } else {
+        let args = Args::default().u32(sent).u32(0);
+        match call(cx, &conn, opcode, nodeid, &args.0) {
+            Ok(reply) => {
+                let mut f = Fields::new(&reply);
+                (f.u64()?, f.u32()?, false)
+            }
+            Err(Errno::ENOSYS) => (0, fopen::KEEP_CACHE, true),
+            Err(e) => return Err(e),
         }
-        .counted()
     };
-    if skip {
-        return Ok(handle(0, 0, true));
-    }
-    let opcode = if dir { op::OPENDIR } else { op::OPEN };
-    match call(
-        cx,
-        &conn,
-        opcode,
+    Ok(Handle {
+        conn,
+        id,
         nodeid,
-        &Args::default().u32(sent).u32(0).0,
-    ) {
-        Ok(reply) => {
-            let mut f = Fields::new(&reply);
-            let (fh, open_flags) = (f.u64()?, f.u32()?);
-            Ok(handle(fh, open_flags, false))
-        }
-        // A daemon without them needs no open, whatever INIT said (6.1's fuse_file_open)
-        Err(Errno::ENOSYS) => Ok(handle(0, 0, true)),
-        Err(e) => Err(e),
+        fh,
+        flags: sent,
+        open_flags,
+        dir,
+        no_release,
     }
+    .finish_open(cx, vfs))
 }
 
 /// Reads up to `len` bytes at `offset` through open handle `h` (`FUSE_READ`), in requests of at
@@ -2246,6 +2297,7 @@ pub(crate) fn write(
     h: (&Rc<RefCell<Conn>>, u64, u64, u32),
     offset: u64,
     data: &[u8],
+    cached: bool,
 ) -> Result<usize, Errno> {
     let (conn, nodeid, fh, flags) = h;
     let chunk = conn.borrow().max_write as usize;
@@ -2256,12 +2308,17 @@ pub(crate) fn write(
             .u64(fh)
             .u64(offset + done as u64)
             .u32(piece.len() as u32)
-            .u32(0)
+            .u32(u32::from(cached)) // FUSE_WRITE_CACHE
             .u64(0)
             .u32(flags)
             .u32(0)
             .bytes(piece);
-        let n = match call(cx, conn, op::WRITE, nodeid, &args.0) {
+        let reply = if cached {
+            call_forced(cx, conn, op::WRITE, nodeid, &args.0)
+        } else {
+            call(cx, conn, op::WRITE, nodeid, &args.0)
+        };
+        let n = match reply {
             Ok(r) => Fields::new(&r).u32()? as usize,
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,

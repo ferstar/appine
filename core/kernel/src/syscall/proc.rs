@@ -1090,6 +1090,7 @@ fn exec(
     }
     let task = cx.task.clone();
     task::release_mm(cx.shared, &task, cx.t);
+    super::fuse::flush_mappings(cx);
     // Hand over any PI futexes this thread held (robust locks just marked owner-died, plus any
     // non-robust PI locks with waiters) before switching address spaces (Linux's futex_exec_release)
     crate::futex::pi_owners_exited(cx.kr(), &mut cx.shared.futexes(), Some(task.tid.get()));

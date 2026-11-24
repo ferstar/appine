@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: recvmsg and recvmmsg service mapped output faults locally)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE range invalidation, private copies and byte-range writeback)
 
 ## Responsibilities
 
@@ -38,10 +38,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   mapped-file fd, display `name`/`ino`, optional `MountPin` `mnt` whose drop reports to
   `vfs::released`), SysV `shm`, optional `Fill`, and Linux VMA flags (locked, sticky `written`,
   growsdown, dump/fork/noreserve, `anon`).
-- `Fill` (`Rc`) — a FUSE file mapping read on demand: a sparse host file (memfd) as long as the
-  file was when mapped, holding what was read at the file's own offsets; the open file to read
-  from (kept open while mapped); the runs of file pages read; and the read-ahead state. Every VMA
-  made from one mmap call (split, forked, moved, grown) holds the same one.
+- `Fill` pins the mapping's FUSE open. All its VMA pieces share that handle. Mappings of one
+  FUSE inode share `FillPages`, including its sparse memfd, current size, filled runs and
+  read-ahead state. It tracks previously filled pages, shared-write baselines and writable opens.
 - `same_vma` — whether two adjacent VMAs are one VMA on Linux: same contents source (both
   private and file-less, the same store inode at contiguous offsets, or contiguous offsets in
   the same shared host region with the same SysV attachment if any), backing, prot, lock,
@@ -73,7 +72,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `map_anonymous`, `map_vvar`, `find_free`, `set_brk`, `map_stack`, `set_start_stack`, `label`,
   `vdso_syscalls`; `fill_wanted`, `fault_past_eof`, `Cx::grow_stack`/`grow_stack_to`/`grow_for`,
   `is_mapped` (`cow_break` is `kernel/cow`'s; `mmu().translate`/`fault_in` `kernel/mmu`'s).
-- **FUSE fills & kernel access**: `Fill::new`/`size`/`has`/`window`/`window_from`/`store`/`fd`,
+- **FUSE fills & kernel access**: `FillPages::new`/`size`/`has`/`window`/`window_from`/`store`/`fd`,
   `take_wanted`, `has_fills`, `first_unread`; `read`, `write` (breaks CoW via `kernel/cow`),
   `translate` (no CoW break), `read_cstr`, `write_kernel`, `write_force`, `populate`,
   `populate_mlock`, `mapped_above`, `check_mapped`.
@@ -147,8 +146,8 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   and used if it ends at or below `mmap_top`, is free, and stays clear of the guard gap below a
   grows-down VMA above it.
 - Host backing, `FileMaps` sharing, content-version trust, 16 KB alignment and commit accounting
-  belong to `kernel/hostmem`. A FUSE file maps its `Fill`'s memfd empty (`mmap_fill`: no content
-  version, no `FileMaps`, `file_len` 0, shared writable `EACCES`).
+  belong to `kernel/hostmem`. A FUSE file maps its inode's memfd with the permissions of the
+  guest open, without a content version or `FileMaps` entry. Its `file_len` stays zero.
 - `insert` enforces `vm.max_map_count` (default 65530, writable through procfs; a new VMA must keep
   the count at or below it), builds page-table entries (`kernel/mmu`), and sets `locked` from
   `mlockall(MCL_FUTURE)`.
@@ -167,7 +166,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 - A `Fill` VMA keeps `file_len` 0, so `map_pages` and every other path sizing by `file_len`
   (mprotect, mremap, fork, populate, truncation) build none of its entries, even when executable;
   only `fault_in` does, for a page already read, and then for the runs read within its 2 MB leaf
-  range. Its EOF is the size the file had when mapped (`contents_len`).
+  range. A data invalidation revokes affected entries and executable translations in each address space.
+  A subsequent fill refreshes the EOF, including for a fault beyond the old end. Shared writable
+  aliases get a baseline so writeback can send only contiguous runs of changed bytes.
 - Reading a page (`kernel/fuse`'s `fill`): `Fill::window` picks the pages not read around it
   (normally 32 starting 16 before it; from it, twice the last read when it continues that read or
   twice the run read just before it, between 32 and 512), clipped to the runs already read and
@@ -175,9 +176,8 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   the memfd with `pwrite`, recording the whole window only when the reply reaches `Fill::size`,
   the single page on confirmed 0-byte EOF, and otherwise only complete pages returned (`kernel/fuse`
   retries from `window_from(page)` when backward read-around stopped short and loops on partial-page
-  replies until a full page or EOF). A page not read has no private copy
-  anywhere (no entry, no kernel write), so the host file reaches every mapping of it, shared or
-  private.
+  replies until a full page or EOF). A refill merges local shared stores with the new daemon bytes.
+  Private host copies retain their contents.
 - A kernel access (`read`, `write`, `read_cstr`, `write_kernel`) meeting a page of a `Fill` mapping
   not yet read fails with the internal `FUSE_RETRY` and records the page in `WANTED`; the syscall
   dispatcher normally reads it and runs the syscall again (`kernel/process`). Socket result
@@ -197,7 +197,7 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
    delivered first and the access faults again; a read error → `SIGBUS` / `BUS_ADRERR`.
 5. `fault_past_eof`: checks VMA permissions first (`v.prot & need == 0` falls through to step 7's
    `SIGSEGV` / `SEGV_ACCERR`); otherwise past EOF in an ordinary file mapping whose file has grown →
-   map the new part and re-execute (not a `Fill` mapping, which keeps its size); otherwise past EOF
+   map the new part and re-execute (a `Fill` obtains its current EOF from the shared backing); otherwise past EOF
    → `SIGBUS` / `BUS_ADRERR`.
 6. Stack growth (`grow_down`) succeeds → re-execute.
 7. Otherwise `SIGSEGV`: `SEGV_ACCERR` if the address is mapped, else `SEGV_MAPERR`.
@@ -263,13 +263,14 @@ signals may still be delivered).
   source VMA to the end of the region and past that has no contents (`SIGBUS`). A segment's copy is
   a new attach base, so it counts as one more attachment and shmdt at its address detaches it.
 - `remap_file_pages`: a non-zero prot is `EINVAL`; start and size are rounded down; the range must
-  lie in contiguous shared file pieces of one host file and prot (`EINVAL`; shared anonymous memory
+  lie in contiguous shared pieces of one host file with matching protections. FUSE pieces must
+  also retain the same open handle and access limits (`EINVAL` on mismatch; shared anonymous memory
   and segments are refused); it maps the file again with `MAP_SHARED | MAP_FIXED`, keeping the
   label, FUSE page source, exec denial and lock, and populates unless `MAP_NONBLOCK`.
 - `msync`: flags and alignment `EINVAL`, the range must be fully mapped (`ENOMEM`), `MS_INVALIDATE`
-  on locked pages `EBUSY`; `MS_SYNC` syncs the shared file ranges on the host with the BKL
-  released. `mincore`: alignment `EINVAL`, fully mapped or `ENOMEM`; reserved pages report 0 and
-  borrowed pages 1; the result is written without growing the stack.
+  on locked pages `EBUSY`; `MS_SYNC` syncs shared host file ranges with the BKL released and
+  writes changed shared FUSE pages to the daemon before requesting a data sync. `mincore`: alignment
+  `EINVAL`, fully mapped or `ENOMEM`; reserved pages report 0 and borrowed pages 1; the result is written without growing the stack.
 - `mlock`/`mlock2`/`munlock` follow `do_mlock`: the length plus the offset in the page is
   page-aligned with wrapping arithmetic; after mlock's `RLIMIT_MEMLOCK` check (`EPERM` with a limit
   of 0, `ENOMEM` above it; skipped with `CAP_IPC_LOCK`) a range that wraps past the end is `EINVAL`
@@ -297,8 +298,8 @@ signals may still be delivered).
   invalidation; shared/unwritten VMAs untouched; vDSO refills from kernel image (with svc stubs
   when `vdso_svc`).
 - `MADV_REMOVE` (`remove`): fully mapped; locked or private anon `EINVAL`, other private or
-  never-writable `EACCES` (6.7); shared parts before EOF freed via `kernel/hostmem`'s `remove_host`,
-  no code invalidation.
+  never-writable `EACCES` (6.7); shared host ranges use `remove_host`. FUSE ranges punch a hole
+  through the daemon. Neither path requests code invalidation.
 
 ### Stack growth
 
@@ -329,7 +330,7 @@ signals may still be delivered).
   caching or mprotect, only the previously inaccessible tail gets a fresh private host mapping.
 - truncate, ftruncate and `O_TRUNC` that shorten a file first call `file_truncated` on every
   address space (entries past the new end are removed, executable ranges are queued for
-  invalidation, `dirty` is set; `Fill` VMAs are left alone) and sync each one that changed, the
+  invalidation, `dirty` is set; a `Fill` uses its old logical extent) and sync each one that changed, the
   current one included (one that cannot be borrowed is skipped), and only then shorten the host
   file: no thread can reach the dropped tail through a stale translation, so an access there faults
   into the kernel and gets the guest's `SIGBUS` once the BKL is free. A host truncation that then
@@ -362,7 +363,7 @@ signals may still be delivered).
 ### Inbound
 
 - `syscall/mem.rs`, `syscall/mod.rs` (stack growth at entry, `take_wanted`), `kernel/fuse` (`Fill`,
-  `prefault`), `kernel/process`/`kernel/exec`/`kernel/ns`/`kernel/signal` (execve, setns
+  `prefault`, `invalidate_fill`), `kernel/process`/`kernel/exec`/`kernel/ns`/`kernel/signal` (execve, setns
   `vdso_syscalls`, faults, `Cx` stack growth, signal frames), `kernel/ptrace` (`write_force`),
   `kernel/futex` (`futex_key`, `translate`, `id`, `shared_maps`), `kernel/ipc` (`attach/detach_shm`),
   `kernel/files`/`kernel/fileio` (`ETXTBSY`, seals, truncation, clones, unsharing), `kernel/procfs`,
@@ -385,10 +386,9 @@ signals may still be delivered).
   `kernel/cow` (never write lent/borrowed pages in place; break/settle CoW before mutating), and
   `kernel/hostmem` (never dereference `RESERVED_HOST`; never discard/unmap `foreign`/`gpu` regions;
   release via `HostRegion` drop).
-- A `Fill` VMA has `file_len` 0 and entries only for pages read; a page not read is never written
-  anywhere (guest writes need an entry, kernel writes read it first), so storing it into the host
-  file shows it to every VMA of the fill, and copies of a `Fill` VMA (fork, `unshare`, mremap)
-  map that host file again rather than copying into anonymous memory.
+- A `Fill` VMA has `file_len` 0 and entries only for valid pages. A previously filled page can
+  retain private CoW data after invalidation. Fork and unshare compare all previously filled
+  pages within EOF when copying private contents to a new host file mapping.
 - Every private anonymous page with content has a PTE (except borrowed pages in `PROT_NONE`, which
   `kernel/cow` adds): kernel writes, mlock and `MAP_POPULATE` fill entries, mremap moves them, and
   `PROT_NONE` keeps prot-0 entries (`kernel/cow` lending and `kernel/oom` RSS rely on this).
@@ -406,10 +406,11 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
-- **FUSE mappings read on demand are not Linux's page cache:** a page keeps what was read when first
-  touched, so writes through the mount or by another process are not seen and separate mmap calls
-  read separately; the size is fixed at mmap (growth not seen, truncation never `SIGBUS`); mlock,
-  `MADV_WILLNEED` and core dumps do not read pages (dumps write unread pages as zeros).
+- A read or write through `/proc/<pid>/mem` can stop with EIO or a short count at a FUSE page
+  awaiting a fill. A ptrace POKE can likewise return EIO there. These paths consume the fill retry.
+
+- **FUSE demand reads:** mlock, `MADV_WILLNEED` and core dumps do not fetch missing pages
+  (dumps emit zeros). Daemon-side data invalidations do not evict resident mapped pages.
   A handler that has already consumed input can repeat its effects on a whole-syscall retry
   or return a short count. The dispatcher prefaults read/write, positional
   and vectored I/O buffers. recvfrom, recvmsg and recvmmsg handle post-receive copies locally.

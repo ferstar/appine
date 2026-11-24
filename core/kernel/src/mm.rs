@@ -242,23 +242,39 @@ impl AdviseRange {
     }
 }
 
-/// A file mapping whose pages are read from the file only when first touched (a FUSE file: there
-/// is no page cache to map, and the daemon cannot be waited for under the BKL). Every VMA made from
-/// one mmap call (split, forked, moved or grown by mremap) holds the same `Fill`, and its host
-/// memory maps `host` at the file's own offsets, shared or privately. Such VMAs keep `file_len` 0,
-/// so nothing builds their entries but [`Mm::fault_in`], and only for pages already read. A page
-/// not yet read has no private copy anywhere (no entry, no kernel write: those need it read
-/// first), so storing it into `host` ([`Fill::store`]) reaches every mapping of it, and
-/// `MADV_DONTNEED` brings a private page back to what was read.
+/// An on-demand FUSE mapping pins the open handle that created it. Independent mappings
+/// of the same inode map the same sparse host file, using the guest file offsets.
 pub struct Fill {
-    /// What was read so far, at the file's own offsets; the rest are holes.
-    host: std::fs::File,
-    /// The file's size when it was mapped: `host`'s length, past which accesses get SIGBUS.
-    size: u64,
-    /// The file to read from, kept open while it is mapped (Linux's `vm_file`).
+    /// Only an open that supplied a shared mapping can be used for a cached FUSE_WRITE.
+    pub(crate) shared: bool,
     pub source: crate::fd::FileRef,
+    pub pages: Rc<FillPages>,
+}
+
+impl std::ops::Deref for Fill {
+    type Target = FillPages;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pages
+    }
+}
+
+/// File data shared by live mappings. Private host mappings retain normal host CoW semantics.
+pub struct FillPages {
+    pub(crate) host: std::fs::File,
+    size: Cell<u64>,
+    /// Baselines for pages exposed to potentially writable shared mappings. Guest stores run
+    /// outside the BKL, so writeback compares the memfd with the last acknowledged contents.
+    clean: RefCell<BTreeMap<u64, Vec<u8>>>,
+    /// Writable opens pinned by mappings, including those awaiting final writeback.
+    writers: RefCell<Vec<Weak<Fill>>>,
     /// Pages read so far, as runs of file page numbers (start → end).
     filled: RefCell<BTreeMap<u64, u64>>,
+    /// All pages ever filled within the current EOF, including those awaiting a fresh read.
+    /// An invalidated page may still have private CoW copies or unacknowledged shared bytes.
+    materialized: RefCell<BTreeMap<u64, u64>>,
+    pub(crate) generation: Cell<u64>,
+    pub(crate) size_stale: Cell<bool>,
     /// The file page where the last read ended and how many pages it took: a fault right there
     /// reads twice as much, up to [`FILL_MAX`] (Linux ramps up its read-ahead the same way).
     ahead: Cell<(u64, u64)>,
@@ -285,15 +301,215 @@ pub fn take_wanted() -> Option<(Rc<Fill>, u64)> {
 }
 
 impl Fill {
-    /// A fill reading from `source` into the empty host file `host`, which is `size` bytes long.
-    pub fn new(host: std::fs::File, size: u64, source: crate::fd::FileRef) -> Rc<Fill> {
+    #[cfg(test)]
+    fn new(host: std::fs::File, size: u64, source: crate::fd::FileRef) -> Rc<Fill> {
         Rc::new(Fill {
-            host,
-            size,
+            shared: false,
             source,
+            pages: FillPages::new(host, size),
+        })
+    }
+}
+
+impl FillPages {
+    pub(crate) fn new(host: std::fs::File, size: u64) -> Rc<Self> {
+        Rc::new(Self {
+            host,
+            size: Cell::new(size),
+            clean: RefCell::new(BTreeMap::new()),
+            writers: RefCell::new(Vec::new()),
             filled: RefCell::new(BTreeMap::new()),
+            materialized: RefCell::new(BTreeMap::new()),
+            generation: Cell::new(0),
+            size_stale: Cell::new(false),
             ahead: Cell::new((u64::MAX, 0)),
         })
+    }
+
+    pub(crate) fn add_writer(&self, fill: &Rc<Fill>) {
+        let mut writers = self.writers.borrow_mut();
+        writers.retain(|w| w.strong_count() != 0);
+        writers.push(Rc::downgrade(fill));
+    }
+
+    pub(crate) fn writer(&self) -> Option<Rc<Fill>> {
+        self.writers
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|fill| fill.shared)
+    }
+
+    pub(crate) fn has_writable_open(&self) -> bool {
+        self.writers.borrow().iter().any(|w| w.strong_count() != 0)
+    }
+
+    /// Snapshot before granting a writable alias, including one later upgraded by mprotect.
+    fn track(&self, lo: u64, hi: u64) -> Result<(), Errno> {
+        use std::os::unix::fs::FileExt;
+        let mut clean = self.clean.borrow_mut();
+        for page in lo..hi {
+            if let std::collections::btree_map::Entry::Vacant(entry) = clean.entry(page) {
+                let mut data = vec![0; PAGE_SIZE as usize];
+                let n = (self.size().saturating_sub(page * PAGE_SIZE)).min(PAGE_SIZE) as usize;
+                self.host
+                    .read_exact_at(&mut data[..n], page * PAGE_SIZE)
+                    .map_err(fill_errno)?;
+                entry.insert(data);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn tracked(&self, start: u64, end: u64) -> Vec<u64> {
+        self.clean
+            .borrow()
+            .range(start / PAGE_SIZE..end.div_ceil(PAGE_SIZE))
+            .map(|(&page, _)| page)
+            .collect()
+    }
+
+    pub(crate) fn dirty_runs(&self, page: u64) -> Result<Vec<(u64, Vec<u8>)>, Errno> {
+        use std::os::unix::fs::FileExt;
+        let n = self.size().saturating_sub(page * PAGE_SIZE).min(PAGE_SIZE) as usize;
+        let mut data = vec![0; n];
+        self.host
+            .read_exact_at(&mut data, page * PAGE_SIZE)
+            .map_err(fill_errno)?;
+        let clean = self.clean.borrow();
+        let mut runs = Vec::new();
+        if let Some(old) = clean.get(&page) {
+            let mut start = 0;
+            while start < n {
+                if old[start] == data[start] {
+                    start += 1;
+                    continue;
+                }
+                let end = (start + 1..n).find(|&i| old[i] == data[i]).unwrap_or(n);
+                runs.push((page * PAGE_SIZE + start as u64, data[start..end].to_vec()));
+                start = end;
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Only bytes the daemon acknowledged become clean. New stores during the request
+    /// remain different from this snapshot and are picked up by the next writeback.
+    pub(crate) fn acknowledge(&self, offset: u64, data: &[u8]) {
+        let at = (offset % PAGE_SIZE) as usize;
+        if let Some(old) = self.clean.borrow_mut().get_mut(&(offset / PAGE_SIZE)) {
+            old[at..at + data.len()].copy_from_slice(data);
+        }
+    }
+
+    /// Byte intersections with resident file pages, clipped to the supplied buffer.
+    fn resident_bytes(&self, offset: u64, len: usize) -> Vec<(u64, std::ops::Range<usize>)> {
+        let end = offset.saturating_add(len as u64);
+        Self::intersections(
+            &self.materialized.borrow(),
+            offset / PAGE_SIZE,
+            end.div_ceil(PAGE_SIZE),
+        )
+        .into_iter()
+        .map(|(a, b)| {
+            let start = (a * PAGE_SIZE).max(offset);
+            let stop = (b * PAGE_SIZE).min(end);
+            (start, (start - offset) as usize..(stop - offset) as usize)
+        })
+        .collect()
+    }
+
+    pub(crate) fn overlay(&self, offset: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        use std::os::unix::fs::FileExt;
+        // The daemon supplied ordinary reads. Overlay only stores not yet written back,
+        // so clean mapped pages do not hide a daemon-side change from descriptor readers.
+        let end = offset.saturating_add(buf.len() as u64);
+        let clean = self.clean.borrow();
+        let mut current = [0; PAGE_SIZE as usize];
+        for (&page, old) in clean.range(offset / PAGE_SIZE..end.div_ceil(PAGE_SIZE)) {
+            let base = page * PAGE_SIZE;
+            let start = base.max(offset);
+            let stop = (base + PAGE_SIZE).min(end).min(self.size());
+            if start >= stop {
+                continue;
+            }
+            let n = (stop - start) as usize;
+            self.host
+                .read_exact_at(&mut current[..n], start)
+                .map_err(fill_errno)?;
+            let src = (start - base) as usize;
+            let dst = (start - offset) as usize;
+            for i in 0..n {
+                if current[i] != old[src + i] {
+                    buf[dst + i] = current[i];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_resident(&self, mut offset: u64, mut data: &[u8]) -> Result<(), Errno> {
+        use std::os::unix::fs::FileExt;
+        self.host.write_all_at(data, offset).map_err(fill_errno)?;
+        while !data.is_empty() {
+            let n = data.len().min((PAGE_SIZE - offset % PAGE_SIZE) as usize);
+            self.acknowledge(offset, &data[..n]);
+            data = &data[n..];
+            offset += n as u64;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn written(&self, offset: u64, buf: &[u8]) -> Result<(), Errno> {
+        for (start, range) in self.resident_bytes(offset, buf.len()) {
+            self.write_resident(start, &buf[range])?;
+        }
+        Ok(())
+    }
+
+    /// Apply a daemon-acknowledged hole to resident bytes, preserving unwritten gaps in
+    /// this sparse memfd. Unfilled pages will see the hole on their first FUSE_READ.
+    pub(crate) fn punch(&self, start: u64, end: u64) -> Result<(), Errno> {
+        let end = end.min(self.size());
+        if end <= start {
+            return Ok(());
+        }
+        let zero = [0; PAGE_SIZE as usize];
+        for (a, b) in Self::intersections(
+            &self.materialized.borrow(),
+            start / PAGE_SIZE,
+            end.div_ceil(PAGE_SIZE),
+        ) {
+            for page in a..b {
+                let offset = (page * PAGE_SIZE).max(start);
+                let len = ((page + 1) * PAGE_SIZE).min(end) - offset;
+                self.write_resident(offset, &zero[..len as usize])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Call after all PTEs beyond a shrinking EOF have been revoked.
+    pub(crate) fn resize(&self, size: u64) -> Result<(), Errno> {
+        self.host.set_len(size).map_err(fill_errno)?;
+        if size < self.size() {
+            let end = size.div_ceil(PAGE_SIZE);
+            for runs in [&self.filled, &self.materialized] {
+                runs.borrow_mut().retain(|&start, stop| {
+                    *stop = (*stop).min(end);
+                    start < *stop
+                });
+            }
+            let mut clean = self.clean.borrow_mut();
+            clean.split_off(&end);
+            if !size.is_multiple_of(PAGE_SIZE)
+                && let Some(last) = clean.get_mut(&(size / PAGE_SIZE))
+            {
+                last[(size % PAGE_SIZE) as usize..].fill(0);
+            }
+        }
+        self.size.set(size);
+        Ok(())
     }
 
     /// Its host file.
@@ -301,9 +517,9 @@ impl Fill {
         std::os::fd::AsRawFd::as_raw_fd(&self.host)
     }
 
-    /// The file size recorded when this on-demand mapping was created.
+    /// Current size of the mapped sparse file.
     pub fn size(&self) -> u64 {
-        self.size
+        self.size.get()
     }
 
     /// Whether file page `page` has been read.
@@ -329,7 +545,10 @@ impl Fill {
 
     /// The runs of pages read within file pages `[lo, hi)`.
     fn runs(&self, lo: u64, hi: u64) -> Vec<(u64, u64)> {
-        let filled = self.filled.borrow();
+        Self::intersections(&self.filled.borrow(), lo, hi)
+    }
+
+    fn intersections(filled: &BTreeMap<u64, u64>, lo: u64, hi: u64) -> Vec<(u64, u64)> {
         let first = filled.range(..=lo).next_back().map_or(lo, |(&s, _)| s);
         filled
             .range(first..hi)
@@ -344,7 +563,7 @@ impl Fill {
     /// as the pages read just before (Linux's context read-ahead), up to [`FILL_MAX`]. None when
     /// the page has been read meanwhile or lies past the end.
     pub fn window(&self, page: u64) -> Option<(u64, u64)> {
-        let last = self.size.div_ceil(PAGE_SIZE);
+        let last = self.size().div_ceil(PAGE_SIZE);
         if page >= last || self.has(page) {
             return None;
         }
@@ -379,7 +598,7 @@ impl Fill {
     /// Like [`Fill::window`], but always starts at `page` (no backward read-around): used when a
     /// read-around short reply stopped before reaching `page`.
     pub fn window_from(&self, page: u64) -> Option<(u64, u64)> {
-        let last = self.size.div_ceil(PAGE_SIZE);
+        let last = self.size().div_ceil(PAGE_SIZE);
         if page >= last || self.has(page) {
             return None;
         }
@@ -392,16 +611,42 @@ impl Fill {
         Some((page * PAGE_SIZE, (hi - page) * PAGE_SIZE))
     }
 
+    /// Fill a missing run from its part of the reply, zeroing any short EOF tail.
+    fn store_run(&self, first: u64, end: u64, reply: &[u8]) -> Result<(), Errno> {
+        use std::os::unix::fs::FileExt;
+        let offset = first * PAGE_SIZE;
+        let len = ((end * PAGE_SIZE).min(self.size()) - offset) as usize;
+        let bytes = &reply[..reply.len().min(len)];
+        if bytes.len() == len && self.clean.borrow().range(first..end).next().is_none() {
+            return self.host.write_all_at(bytes, offset).map_err(fill_errno);
+        }
+
+        // Merge local stores against the old baseline before recording the daemon's bytes.
+        let mut merged = vec![0; len];
+        merged[..bytes.len()].copy_from_slice(bytes);
+        self.overlay(offset, &mut merged)?;
+        self.host
+            .write_all_at(&merged, offset)
+            .map_err(fill_errno)?;
+        for (&page, baseline) in self.clean.borrow_mut().range_mut(first..end) {
+            let index = ((page - first) * PAGE_SIZE) as usize;
+            let src = bytes.get(index..).unwrap_or_default();
+            let count = src.len().min(baseline.len());
+            baseline[..count].copy_from_slice(&src[..count]);
+            baseline[count..].fill(0);
+        }
+        Ok(())
+    }
+
     /// Stores what was read for [`Fill::window`] `(offset, len)` (`data`): only pages still not
     /// read, as another thread may have read some meanwhile. When `data` is shorter than `len`
     /// before the recorded end of the file, only completely read whole pages are recorded unless
     /// `eof` is true (the daemon returned 0 bytes at the requested offset, confirming early EOF),
     /// in which case only the partial/empty EOF page is marked filled rather than the whole window.
     pub fn store(&self, (offset, len): (u64, u64), data: &[u8], eof: bool) -> Result<(), Errno> {
-        use std::os::unix::fs::FileExt;
         let lo = offset / PAGE_SIZE;
         let max_hi = (offset + len) / PAGE_SIZE;
-        let hi = if offset.saturating_add(data.len() as u64) >= self.size {
+        let hi = if offset.saturating_add(data.len() as u64) >= self.size() {
             max_hi
         } else if eof {
             (lo + (data.len() as u64).div_ceil(PAGE_SIZE).max(1)).min(max_hi)
@@ -413,21 +658,24 @@ impl Fill {
         }
         let mut at = lo;
         for (s, e) in self.runs(lo, hi).into_iter().chain([(hi, hi)]) {
-            // [at, s) is still missing
-            let from = ((at - lo) * PAGE_SIZE) as usize;
-            let to = (((s - lo) * PAGE_SIZE) as usize).min(data.len());
-            if from < to {
-                self.host
-                    .write_all_at(&data[from..to], at * PAGE_SIZE)
-                    .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+            if at < s {
+                let from = ((at - lo) * PAGE_SIZE) as usize;
+                self.store_run(at, s, data.get(from..).unwrap_or_default())?;
             }
             at = e;
         }
-        let mut filled = self.filled.borrow_mut();
+        Self::insert_run(&mut self.filled.borrow_mut(), lo, hi);
+        Self::insert_run(&mut self.materialized.borrow_mut(), lo, hi);
+        self.ahead.set((hi, hi - lo));
+        Ok(())
+    }
+
+    fn insert_run(filled: &mut BTreeMap<u64, u64>, lo: u64, hi: u64) {
         // Merge with the runs it touches
         let (mut s, mut e) = (lo, hi);
+        let first = filled.range(..=lo).next_back().map_or(lo, |(&s, _)| s);
         let touching: Vec<u64> = filled
-            .range(..=hi)
+            .range(first..=hi)
             .filter(|&(_, &end)| end >= lo)
             .map(|(&start, _)| start)
             .collect();
@@ -436,9 +684,34 @@ impl Fill {
             (s, e) = (s.min(start), e.max(end));
         }
         filled.insert(s, e);
-        self.ahead.set((hi, hi - lo));
-        Ok(())
     }
+
+    /// Revoke cached data after all address spaces have dropped translations for these pages.
+    pub(crate) fn invalidate(&self, lo: u64, hi: u64) {
+        let mut filled = self.filled.borrow_mut();
+        let first = filled.range(..=lo).next_back().map_or(lo, |(&s, _)| s);
+        let overlap: Vec<_> = filled
+            .range(first..hi)
+            .filter(|&(_, &e)| e > lo)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (start, end) in overlap {
+            filled.remove(&start);
+            if start < lo {
+                filled.insert(start, lo);
+            }
+            if hi < end {
+                filled.insert(hi, end);
+            }
+        }
+        self.ahead.set((u64::MAX, 0));
+        self.size_stale.set(true);
+        self.generation.set(self.generation.get().wrapping_add(1));
+    }
+}
+
+fn fill_errno(error: std::io::Error) -> Errno {
+    Errno(error.raw_os_error().unwrap_or(Errno::EIO.0))
 }
 
 /// Mount reference held by a file-backed VMA: keeps the mount busy for `umount2` and reports its
@@ -552,11 +825,25 @@ impl Vma {
     }
 
     /// Bytes from its start that the host memory may be read at: `file_len`, or for a mapping read
-    /// on demand ([`Fill`]) as far as the file reached when mapped.
+    /// on demand ([`Fill`]) up to its current EOF.
     fn contents_len(&self) -> u64 {
         match &self.fill {
-            Some(f) => extent(f.size as i64, self.offset(), self.len),
+            Some(f) => extent(f.size() as i64, self.offset(), self.len),
             None => self.file_len,
+        }
+    }
+
+    /// FUSE ranges may share a memfd across independent opens. Combining VMAs must retain
+    /// their original open handle and access limits (including a later mprotect).
+    fn same_fill_source(&self, other: &Vma) -> bool {
+        match (&self.fill, &other.fill) {
+            (Some(a), Some(b)) => {
+                Rc::ptr_eq(&a.source, &b.source)
+                    && self.may_write == other.may_write
+                    && self.may_exec == other.may_exec
+            }
+            (None, None) => true,
+            _ => false,
         }
     }
 
@@ -565,7 +852,10 @@ impl Vma {
     fn unread(&self, start: u64, addr: u64) -> Option<(Rc<Fill>, u64)> {
         let fill = self.fill.as_ref()?;
         let page = (self.offset() + (addr - start)) / PAGE_SIZE;
-        (addr < start + self.contents_len() && !fill.has(page)).then(|| (fill.clone(), page))
+        (addr < start + self.len
+            && (addr < start + self.contents_len() || fill.size_stale.get())
+            && !fill.has(page))
+        .then(|| (fill.clone(), page))
     }
 }
 
@@ -588,6 +878,7 @@ fn same_vma(a: &Vma, b: &Vma) -> bool {
         _ => false,
     };
     contents
+        && a.same_fill_source(b)
         && a.backing == b.backing
         && (a.prot, a.locked, a.may_write) == (b.prot, b.locked, b.may_write)
         && (a.growsdown, a.dontdump) == (b.growsdown, b.dontdump)
@@ -693,6 +984,7 @@ pub struct Mm {
     private_files: Rc<RefCell<PrivateFiles>>,
     /// A mapping read on demand ([`Fill`]) has been made here (or in the parent before fork).
     fills: bool,
+    pub(crate) unmapped_fills: Vec<(Rc<Fill>, u64, u64)>,
 }
 
 type PrivateFiles = HashMap<(u64, u64), Weak<OwnedFd>>;
@@ -749,6 +1041,7 @@ impl Mm {
             files: FileMaps::default(),
             private_files: Default::default(),
             fills: false,
+            unmapped_fills: Vec::new(),
         }
     }
 
@@ -1392,6 +1685,9 @@ impl Mm {
         let guest = |p: u64| ((p as i128 - first) as u64) * PAGE_SIZE;
         let file = |a: u64| ((a / PAGE_SIZE) as i128 + first) as u64;
         for (a, b) in fill.runs(file(lo), file(hi)) {
+            if v.backing == Backing::Shared && v.may_write && fill.track(a, b).is_err() {
+                return false;
+            }
             let (from, to) = (guest(a), guest(b));
             // SAFETY: [from, to) is inside the part of this VMA with contents, and it holds the
             // host memory
@@ -1435,13 +1731,18 @@ impl Mm {
             if v.fill.is_none() || need != 0 && (p == 0 || p & need != need) {
                 continue;
             }
-            let (from, to) = (addr.max(s), end.min(s + v.contents_len()));
+            let fill = v.fill.as_ref().unwrap();
+            let extent = if fill.size_stale.get() {
+                v.len
+            } else {
+                v.contents_len()
+            };
+            let (from, to) = (addr.max(s), end.min(s + extent));
             if from >= to {
                 continue;
             }
             let first = v.offset() / PAGE_SIZE;
             let (lo, hi) = ((from - s) / PAGE_SIZE, (to - s).div_ceil(PAGE_SIZE));
-            let fill = v.fill.as_ref().unwrap();
             if let Some(page) = fill.first_missing(first + lo, first + hi) {
                 return Some((fill.clone(), page));
             }
@@ -1473,7 +1774,7 @@ impl Mm {
         if addr >= s + v.len || v.prot & need == 0 || addr < s + v.contents_len() {
             return None;
         }
-        // A mapping read on demand keeps the size the file had when mapped
+        // The fill already tracks the current size of its memfd.
         if v.fill.is_some() {
             return Some(true);
         }
@@ -1831,6 +2132,12 @@ impl Mm {
                 .filter(|&(&s, v)| cur < s + v.contents_len())
                 .ok_or(Errno::EFAULT)?;
             let chunk = ((s + v.contents_len() - cur) as usize).min(data.len() - done);
+            if v.backing == Backing::Shared
+                && let Some(fill) = &v.fill
+            {
+                let at = v.offset() + cur - s;
+                fill.track(at / PAGE_SIZE, (at + chunk as u64).div_ceil(PAGE_SIZE))?;
+            }
             v.written.set(true);
             self.exec_changed |= v.prot & prot::EXEC != 0;
             // SAFETY: [cur, cur + chunk) is in the part of this VMA with contents, and it holds
@@ -1948,7 +2255,7 @@ impl Mm {
         flags: u32,
         (fill, offset): (Rc<Fill>, u64),
     ) -> Result<u64, Errno> {
-        let file = Some((fill.fd(), offset, false));
+        let file = Some((fill.fd(), offset, fill.source.borrow().writable()));
         self.map(addr, len, prot, flags, file, Some(fill))
     }
 
@@ -2546,7 +2853,8 @@ impl Mm {
         let fill = v.fill.as_ref().ok_or(Errno::EFAULT)?;
         let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
         let shared = v.backing == Backing::Shared;
-        let m = appine_hal::map_file(fill.fd(), offset, host_len, shared, false).map_err(Errno)?;
+        let m = appine_hal::map_file(fill.fd(), offset, host_len, shared, v.may_write)
+            .map_err(Errno)?;
         let region = HostRegion::file(m.base, m.len);
         Ok((region, m.ptr))
     }
@@ -2559,7 +2867,7 @@ impl Mm {
         let fill = v.fill.as_ref().unwrap();
         let first = v.offset() / PAGE_SIZE;
         let pages = v.contents_len() / PAGE_SIZE;
-        for (a, b) in fill.runs(first, first + pages) {
+        for (a, b) in FillPages::intersections(&fill.materialized.borrow(), first, first + pages) {
             for p in a..b {
                 let at = ((p - first) * PAGE_SIZE) as usize;
                 // SAFETY: both pieces of host memory have v.len bytes, this page lies within the
@@ -2662,7 +2970,7 @@ impl Mm {
                         && n.file.is_some()
                         && n.file_id.map(|(d, i, _)| (d, i)) == id
                 })
-                .filter(|n| n.prot == prot)
+                .filter(|n| n.prot == prot && v.same_fill_source(n))
                 .ok_or(Errno::EINVAL)?;
             at += next.len;
         }
@@ -3584,6 +3892,27 @@ impl Mm {
         Ok(())
     }
 
+    /// File offsets intersecting shared FUSE VMAs for msync and address-space teardown.
+    pub(crate) fn fuse_ranges(&self, addr: u64, len: u64) -> Vec<(Rc<Fill>, u64, u64)> {
+        if !self.fills || len == 0 {
+            return Vec::new();
+        }
+        let end = addr.saturating_add(len);
+        self.vmas
+            .range(..end)
+            .filter_map(|(&s, v)| {
+                let fill = v.fill.as_ref()?;
+                (v.backing == Backing::Shared && s + v.len > addr).then(|| {
+                    (
+                        fill.clone(),
+                        v.offset() + addr.saturating_sub(s),
+                        v.offset() + v.len.min(end - s),
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Host address ranges of the shared file mappings in `[addr, addr + len)`, aligned to host
     /// pages (msync's `MS_SYNC`: the host maps the object itself, so the host writes it back).
     pub fn shared_file_ranges(&self, addr: u64, len: u64) -> Vec<(usize, usize)> {
@@ -3592,7 +3921,11 @@ impl Mm {
         self.vmas
             .iter()
             .filter(|&(&s, v)| {
-                v.backing == Backing::Shared && v.file_id.is_some() && s < end && s + v.len > addr
+                v.backing == Backing::Shared
+                    && v.file_id.is_some()
+                    && v.fill.is_none()
+                    && s < end
+                    && s + v.len > addr
             })
             .map(|(&s, v)| {
                 let from = s.max(addr);
@@ -3641,6 +3974,13 @@ impl Mm {
             self.mmu.unmap(s, len).map_err(map_err)?;
             if vma.prot & prot::EXEC != 0 {
                 self.code_ranges.push((s, len));
+            }
+            if vma.backing == Backing::Shared
+                && vma.may_write
+                && let Some(fill) = &vma.fill
+            {
+                self.unmapped_fills
+                    .push((fill.clone(), vma.offset(), vma.offset() + len));
             }
             self.graveyard.push(vma.region);
             self.dirty = true;
@@ -4043,6 +4383,33 @@ impl Mm {
             .any(|v| v.file_id.is_some_and(|(d, i, _)| (d, i) == (dev, ino)))
     }
 
+    /// Drop translations of invalidated FUSE pages in every alias, including executable ones.
+    pub(crate) fn invalidate_fill(&mut self, pages: &Rc<FillPages>, lo: u64, hi: u64) -> bool {
+        let mut changed = false;
+        for (&start, v) in &self.vmas {
+            if !v.fill.as_ref().is_some_and(|f| Rc::ptr_eq(&f.pages, pages)) {
+                continue;
+            }
+            let first = v.offset() / PAGE_SIZE;
+            let from = lo.max(first);
+            let to = hi.min(first + v.contents_len() / PAGE_SIZE);
+            if from >= to {
+                continue;
+            }
+            for (a, b) in pages.runs(from, to) {
+                let addr = start + (a - first) * PAGE_SIZE;
+                let len = (b - a) * PAGE_SIZE;
+                let _ = self.mmu.unmap(addr, len);
+                if v.prot & prot::EXEC != 0 {
+                    self.code_ranges.push((addr, len));
+                }
+                changed = true;
+            }
+        }
+        self.dirty |= changed;
+        changed
+    }
+
     /// Host file (`dev`, `ino`) was truncated to `size` bytes: pages past the new end in the VMAs
     /// mapping it are removed from the page table, so later guest accesses get SIGBUS, as with
     /// truncate on Linux. Otherwise the host would get SIGBUS accessing the mapping past the end
@@ -4066,15 +4433,18 @@ impl Mm {
                 .saturating_sub(offset)
                 .next_multiple_of(PAGE_SIZE)
                 .min(v.len);
-            if extent >= v.file_len {
+            let old = v.contents_len();
+            if extent >= old {
                 continue;
             }
             // unmap fails only on invalid arguments, and this range comes from a VMA
-            let _ = self.mmu.unmap(start + extent, v.file_len - extent);
+            let _ = self.mmu.unmap(start + extent, old - extent);
             if v.prot & prot::EXEC != 0 {
-                self.code_ranges.push((start + extent, v.file_len - extent));
+                self.code_ranges.push((start + extent, old - extent));
             }
-            v.file_len = extent;
+            if v.fill.is_none() {
+                v.file_len = extent;
+            }
             changed = true;
         }
         self.dirty |= changed;
@@ -7065,6 +7435,63 @@ mod tests {
         assert_eq!(window(1000), (984, 32));
         assert_eq!(f.window(100), None);
         assert_eq!(f.window(2048), None);
+    }
+
+    #[test]
+    fn mapped_writeback_acknowledges_only_the_bytes_sent() {
+        use std::os::unix::fs::FileExt;
+        let host = appine_hal::memfd(c"appine-fill-writeback").unwrap();
+        host.set_len(4).unwrap();
+        let pages = FillPages::new(host, 4);
+        pages.store((0, PAGE_SIZE), b"abcd", false).unwrap();
+        pages.track(0, 1).unwrap();
+        pages.host.write_all_at(b"ABCD", 0).unwrap();
+        let sent = pages.dirty_runs(0).unwrap();
+        assert_eq!(sent, [(0, b"ABCD".to_vec())]);
+        // A short reply, with another mapped store while the request was outstanding.
+        pages.host.write_all_at(b"X", 0).unwrap();
+        pages.acknowledge(0, &sent[0].1[..2]);
+        let mut daemon = *b"ABcd";
+        pages.overlay(0, &mut daemon).unwrap();
+        assert_eq!(&daemon, b"XBCD");
+        let retry = pages.dirty_runs(0).unwrap();
+        assert_eq!(retry, [(0, b"X".to_vec()), (2, b"CD".to_vec())]);
+        for (offset, bytes) in retry {
+            pages.acknowledge(offset, &bytes);
+        }
+        assert!(pages.dirty_runs(0).unwrap().is_empty());
+        // Ordinary reads retain a fresh daemon reply for clean bytes.
+        let mut external = *b"1234";
+        pages.overlay(0, &mut external).unwrap();
+        assert_eq!(&external, b"1234");
+    }
+
+    #[test]
+    fn invalidated_pages_merge_pending_stores_with_short_refills() {
+        use std::os::unix::fs::FileExt;
+        let host = appine_hal::memfd(c"appine-fill-invalidate").unwrap();
+        let size = 3 * PAGE_SIZE;
+        host.set_len(size).unwrap();
+        let pages = FillPages::new(host, size);
+        pages
+            .store((0, size), &vec![1; size as usize], false)
+            .unwrap();
+        pages.track(1, 2).unwrap();
+        pages.host.write_all_at(b"abcdef", PAGE_SIZE).unwrap();
+        pages.invalidate(1, 2);
+        assert_eq!(pages.runs(0, 3), [(0, 1), (2, 3)]);
+        // A descriptor write and a hole supersede local stores even while the page is stale.
+        pages.written(PAGE_SIZE + 1, b"B").unwrap();
+        pages.punch(PAGE_SIZE + 2, PAGE_SIZE + 3).unwrap();
+        pages.store((PAGE_SIZE, PAGE_SIZE), b"XB", true).unwrap();
+        let mut merged = [0; 8];
+        pages.host.read_exact_at(&mut merged, PAGE_SIZE).unwrap();
+        assert_eq!(&merged, b"aB\0def\0\0");
+        assert_eq!(
+            pages.dirty_runs(1).unwrap(),
+            [(PAGE_SIZE, b"a".to_vec()), (PAGE_SIZE + 3, b"def".to_vec()),]
+        );
+        assert_eq!(pages.runs(0, 3), [(0, 3)]);
     }
 
     #[test]

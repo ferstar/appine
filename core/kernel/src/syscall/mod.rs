@@ -13,7 +13,7 @@ mod fs;
 mod gpu;
 pub(crate) use gpu::RenderFile;
 mod fuse;
-pub(crate) use fuse::{fill, flush_at_exit};
+pub(crate) use fuse::{fill, flush_at_exit, flush_mappings};
 mod inotify;
 mod ipc;
 mod lease;

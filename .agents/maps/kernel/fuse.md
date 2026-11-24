@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE path descriptions pin cached nodes across SCM_RIGHTS transfers)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FOPEN_KEEP_CACHE on open and create, including the no-open fallback)
 
 ## Responsibilities
 
@@ -20,8 +20,8 @@ sshfs, rclone mount, fuse-overlayfs, any libfuse program) serves through `/dev/f
   resolution reads under the BKL, and the retry that fetches what it lacks;
 - the file syscalls on FUSE nodes and open FUSE files: open and create, reads and writes,
   directory listing, namespace changes, attribute and xattr changes, statfs, access, fsync,
-  fallocate, flushing and releasing, reading mapped pages as they are touched, and copies of
-  programs for execve;
+  fallocate, flushing and releasing, demand reads and writeback for shared mappings, and
+  program snapshots for execve;
 - forgetting nodes nothing uses (`FUSE_FORGET`).
 
 Root: `core/kernel/src/vfs/fuse.rs` (connection, device, cache, retries, request helpers) and
@@ -30,7 +30,7 @@ Root: `core/kernel/src/vfs/fuse.rs` (connection, device, cache, retries, request
 Outside the module: the walker, mount table, fd tables and the dispatch of every file syscall
 (`kernel/vfs`, `kernel/files` and `kernel/fileio`, which hand FUSE nodes and files to this module), the syscall
 dispatcher's retry loop (`kernel/process`), execve (`kernel/exec`), poll and epoll (`kernel/poll`),
-the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
+the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ## Key types
 
@@ -57,14 +57,16 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   parent is itself), the last attributes (`Attr`, owners as kernel IDs) with their validity and
   the syscall that fetched them, the directory's cached names (node, or None for a missing name,
   with validity and syscall), a symlink target read in this syscall, `nlookup` (entries the daemon
-  returned for it) and `seen` (the clock when last entered).
+  returned for it) and `seen` (the clock when last entered). It holds a weak reference to live mapped pages
+  and pins a writable mapping if teardown writeback needs a retry.
 - `Entry` — a `fuse_entry_out`: node id (0 for a missing name), attributes, both validities.
 - `Query` — what a walk lacked: `Lookup`, `Getattr`, `Readlink`, `Program`.
 - `Handle` (`FileKind::Fuse`, or a FUSE `Directory`'s `fuse`) — Linux's `fuse_file`: connection,
   node, node id, the daemon's file handle, the `FOPEN_*` flags, the open flags sent,
   directory or not, and `no_release` when no open was made. Every handle is counted in its
   connection's `opens` (`counted`) until dropped.
-- `Fill` (`kernel/mm`) — what a mapping of a FUSE file reads its pages into; it holds the open file.
+- `Fill` pins the open file used by a mapping. Its `FillPages` is shared by mappings of the same
+  node, including those opened through a hard link or bind mount.
 - `SWEEP`, `DROP` — atomics asking for a sweep of the node cache at the end of a syscall, and for
   dropping every unused node (`drop_caches`).
 - `Io` (syscall side) — a copy of a handle's fields, taken so no borrow is held while waiting.
@@ -166,8 +168,10 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   bare header (EINVAL), ENOSYS stopping interrupts, EAGAIN queuing it again, any other error
   accepted; a reply to anything but a held request is ENOENT. An ENOSYS reply marks the operation in `no`. The INIT reply is taken by the
   connection.
-- Notifications: `INVAL_INODE` drops the node's attributes, `INVAL_ENTRY` and `DELETE` drop the
-  name and the directory's attributes, `POLL` and `STORE` are accepted, `RETRIEVE` is ENOSYS.
+- `INVAL_INODE` expires attributes. A nonnegative offset also invalidates overlapping mapped
+  pages across all address spaces. A nonpositive length covers the remainder of the file.
+  `INVAL_ENTRY` and `DELETE` drop the name and directory attributes. `POLL` and `STORE` are
+  accepted, and `RETRIEVE` returns ENOSYS.
 - read, write, readv and writev of the device move one whole message (up to 8 MiB); splice into a
   pipe takes one whole request (the device's own `O_NONBLOCK`, EIO when the pipe lacks room, the
   request then lost as in Linux), and splice from a pipe takes a reply of the length asked, its
@@ -241,25 +245,30 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   writing a program being run ETXTBSY; `O_DIRECTORY` on a non-directory ENOTDIR. Then
   `FUSE_OPENDIR` or `FUSE_OPEN` with the open flags less `O_CREAT`, `O_EXCL`, `O_NOCTTY` (and
   `O_TRUNC` without `ATOMIC_O_TRUNC`, which then is a SETATTR after the open). An ENOSYS answer
-  means no open is needed, now and later (no handle, no release). Device nodes, FIFOs and
+  means no open is needed, now and later (cached pages retained, no handle or release). Device nodes, FIFOs and
   sockets in a FUSE filesystem cannot be opened (ENXIO).
 - Create (`O_CREAT` of a missing name, 6.1's `fuse_create_open`): EROFS, the directory's write and
   search permission, then `FUSE_CREATE` (mode with the umask applied unless `DONT_MASK`, which
   sends it beside), or from a daemon without it `FUSE_MKNOD` and an open. Without `O_EXCL`, an
   EEXIST (another process created the name since the walk; Linux holds the directory's lock across
   both) forgets the missing name and runs the syscall again, which then opens the file.
+- Successful regular-file OPEN and CREATE replies retain mapped pages with `FOPEN_KEEP_CACHE`.
+  Clearing the flag invalidates all mapped pages of that inode, including through another name.
+  An atomic truncating open or create shrinks the mapped backing to zero even with the flag set.
 
 ### Reading, writing and positions
 
 - read and write go to the daemon in requests of the negotiated size, stopping at a short reply;
   errors after the first piece return what was done. One guest read or write moves up to 8 MiB.
+  Reads overlay unacknowledged mapped stores on the reply. Writes update resident mapped bytes and
+  their writeback baseline for exactly the range accepted by the daemon.
 - A file opened `FOPEN_STREAM` has no position (offset 0); with `FOPEN_NONSEEKABLE` or `STREAM`,
   pread, pwrite and lseek are ESPIPE.
 - The position is taken as unlocked I/O takes it (`pos_busy`) and advanced past what moved; a
   fault while copying out moves it back.
 - A write with `O_APPEND` (as the open file's flags are now) asks the daemon for the size first
   and writes there, one append per node at a time from the size to the write (the node's
-  `appending`, waited for on the lock channel, as 6.1 holds the inode lock); `RLIMIT_FSIZE` cuts
+  `io_busy` flag also orders fills, mapped reads, writeback and size changes); `RLIMIT_FSIZE` cuts
   writes (`SIGXFSZ` and EFBIG at the limit).
 - lseek takes `pos_busy` (`PosGuard`): `SEEK_END` from the daemon's size, `SEEK_DATA`/`SEEK_HOLE`
   through `FUSE_LSEEK` (a daemon without it has data up to the end).
@@ -313,12 +322,21 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ### Mappings and programs
 
-- mmap of a FUSE file (`map_fill`) makes a `Fill` (`kernel/mm`): an empty memfd as long as the
-  cached size (fetched by a retry when stale) and the open file, kept open until the last mapping
-  goes, so the release comes after munmap as on Linux. In do_mmap's order a file not open for
-  reading or a shared writable mapping is EACCES and an executable one on a noexec mount EPERM;
-  then a file opened `FOPEN_DIRECT_IO` cannot be mapped shared (ENODEV, 6.1's `fuse_file_mmap`).
-  A shared mapping is never made writable later.
+- mmap of a FUSE file pins its open handle. The first mapping creates a sparse memfd at the
+  inode's cached size. Later mappings reuse its pages at file offsets. A shared writable mapping
+  requires a readable and writable descriptor, including write permission added with mprotect.
+  A noexec mount still refuses execution and a direct-I/O handle refuses shared mmap with ENODEV.
+- `MS_SYNC` writes contiguous runs of changed bytes in range and waits for a data sync.
+  Matching bytes between runs stay untouched on the daemon. File sync and close write
+  back the inode before the daemon sync or flush. Unmap (including fixed replacement) writes back
+  removed shared ranges with write access. Exec and thread exit flush shared ranges of the old mm. A short write keeps unacknowledged bytes dirty. Failed
+  teardown retains a writable handle and cached data for a later sync.
+- Writes, truncate, atomic truncating open and fallocate through the mount update the backing.
+  Shrink revokes guest translations before resizing the memfd. Hole punching also clears resident
+  mapped bytes. Private host mappings keep their own modified pages.
+- Data invalidation from a notification or open revokes translations without waiting for the inode
+  I/O lock. The next fill rechecks size and merges unacknowledged mapped stores with fresh daemon
+  data. A fill discards replies overtaken by either kind of invalidation.
 - Pages are read as they are touched (`fill`: `FUSE_READ` through the mapped file's handle, the
   BKL released): on a guest fault, on a kernel copy failing with `FUSE_RETRY`, before read and
   write syscalls for their buffers (`prefault`), and for the whole mapping with `MAP_POPULATE`
@@ -367,13 +385,13 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   `stopping`.
 - `kernel/mount`: the mount table (`readonly`, `mount_flags`, `is_point_in`, `dev_of`).
 - `kernel/vfs`: `resolve_parent`, `encode_stat`; `kernel/files`: `open_mask`, `executing`;
-  `kernel/fileio`: `check_fsize`.
+  `kernel/fileio`: `check_fsize`, `fsize_room`, `PosGuard` and `truncating`.
 - `kernel/inotify`: the hooks for FUSE namespace changes.
 - `kernel/cred`: `Cred`, user namespace ID maps, `permission`, `owns`, `may_delete`,
   `capable_wrt`; `kernel/cgroup`: `check_device` for `mknod`.
 - `kernel/signal`: `SIGXFSZ` through the VFS's `file_too_big`.
 - `hal`: `memfd` for program copies and mapping fills.
-- `kernel/mm`: `Fill` (`window`, `store`, `first_unread`, `has_fills`).
+- `kernel/mm`: `Fill` and `FillPages` for reads and dirty byte runs, and `Mm::invalidate_fill` for notification and open-time shootdowns.
 - The task table, fd tables, mm `exe`, `Vfs::mount_nodes` and `kernel/inotify`'s registry
   (`watched`) for `in_use`.
 
@@ -404,11 +422,8 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ## Confirmed bugs / technical debt
 
-- **No page cache:** a mapped page keeps what was read when first touched, so a shared mapping
-  never sees later writes through the mount or another process, separate mmap calls read
-  separately, and a shared writable mapping is refused (SQLite's WAL `-shm` file and programs
-  writing through `MAP_SHARED` fail on FUSE); reads and writes always reach the daemon (no
-  read-ahead for read(2), writeback or readdirplus).
+- A resident mapping can show old data after a silent backend change until a data notification
+  or an invalidating open. `STORE` does not supply mapped data, and there is no periodic flusher.
 - **Forgetting is coarser than Linux's:** nodes go only above 16384 or with `drop_caches`, not when
   a file unlinked through the mount is no longer used (Linux forgets it at once). When every
   node above the limit is in use, each new entry makes the next syscall's end scan every task
@@ -432,8 +447,7 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ## Open questions
 
-- Would readdirplus or a page cache for read-only mappings be worth their complexity for sshfs and
-  rclone workloads?
+- Would readdirplus benefit sshfs and rclone workloads?
 
 ## To verify
 
@@ -441,6 +455,6 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   what the `fuse` and `fuse-tools` differential cases exercise was observed on a native 6.8 kernel
   (fuse-overlayfs, sshfs, rclone, mount option errors, `/dev/fuse` before a mount, the clone
   ioctl, ETXTBSY, `RLIMIT_FSIZE`, mapped pages, which nodes `drop_caches` forgets), while
-  interrupts, oversized requests, notifications, refused INIT, the `max_read` shown, the forget
+  interrupts, oversized requests, notifications other than `INVAL_INODE`, refused INIT, the `max_read` shown, the forget
   interleaving and `FOPEN_DIRECT_IO` mappings were not (a 6.6+ kernel lets libfuse 3.17 map
   direct-I/O files shared).

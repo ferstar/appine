@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pin shared mapping objects and prepare replacement handles before publishing a copy)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE uses the cross-address-space truncate shootdown before shrinking mapped backing)
 
 ## Responsibilities
 
@@ -59,7 +59,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   `write_file`/`write_file_with`, `read_bytes`, `write_bytes`, `write_sync`,
   `vectored`/`vectored_with`, `fsync`, `has_fsync`, `seekable`, `append_offset` (`kernel/aio`,
   `kernel/loop`), `check_fsize`, `fsize_room` (`kernel/fuse`), `check_seals`, `seals_permit`,
-  `remove_privs`, `truncating` (`kernel/files`'s `O_TRUNC` and `kernel/vfs`), `opens_of`.
+  `remove_privs`, `truncating` (`kernel/files`'s `O_TRUNC`, `kernel/vfs` and FUSE mapped backing), `opens_of`.
 
 ## Data flow / lifecycle
 
@@ -210,7 +210,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - `kernel/inotify`: `host_unshared`; `kernel/aio` and `kernel/loop`: `IoFlags`, `read_file`/
   `read_file_with`, `write_file`/`write_file_with`, `read_bytes`, `write_bytes`, `write_sync`,
   `vectored`/`vectored_with`, `fsync`, `has_fsync`, `seekable`, `append_offset`; `kernel/fuse`:
-  `check_fsize`, `fsize_room`, `PosGuard`; core dumps (`write_at`).
+  `check_fsize`, `fsize_room`, `PosGuard` and `truncating`; core dumps (`write_at`).
 
 ### Outbound
 

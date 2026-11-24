@@ -16,10 +16,11 @@ use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE};
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, oflags};
 use crate::kernel::Cx;
-use crate::mm::Fill;
-use crate::vfs::fuse::{self, Args, Conn, Entry, FuseId, Handle, op};
+use crate::mm::{Fill, FillPages};
+use crate::vfs::fuse::{self, Args, Conn, Entry, FuseId, Handle, mapped_pages, op};
 use crate::vfs::store::{DirEntry, mode};
 use crate::vfs::{MountId, Node, Vfs, ms};
+use appine_engine::PAGE_SIZE;
 
 /// What a read or write of an open FUSE file needs, taken out of it so no borrow is held while
 /// waiting: the connection, node, node id, file handle, open flags, and whether the file has a
@@ -119,15 +120,26 @@ pub(super) fn open(
             fuse: Some(Box::new(fuse::open(cx, vfs, id, flags, true)?)),
         }),
         mode::S_IFREG => {
-            let h = fuse::open(cx, vfs, id, flags, false)?;
-            if flags & oflags::O_TRUNC != 0 {
-                if !fuse::atomic_o_trunc(&h.conn.borrow()) {
+            let truncate = flags & oflags::O_TRUNC != 0;
+            let atomic = truncate && fuse::atomic_o_trunc(&vfs.fuse().conn_of(id)?.borrow());
+            let h = if atomic {
+                with_io(cx, vfs, id, false, |cx| {
+                    let h = fuse::open(cx, vfs, id, flags, false)?;
+                    resize_mapping(cx, vfs, id, 0)?;
+                    Ok(h)
+                })?
+            } else {
+                let h = fuse::open(cx, vfs, id, flags, false)?;
+                if truncate {
                     let set = SetAttr {
                         size: Some(0),
                         ..SetAttr::default()
                     };
                     setattr(cx, vfs, id, &set, Some(h.fh))?;
                 }
+                h
+            };
+            if truncate {
                 vfs.fuse_mut().stale(id);
             }
             Ok(FileKind::Fuse(Box::new(h)))
@@ -179,10 +191,7 @@ pub(super) fn create(
                     fuse.stale(dir);
                     fuse.enter(dir, name, &e)?
                 };
-                let mut kept = flags & !(oflags::O_CREAT | oflags::O_EXCL | oflags::O_NOCTTY);
-                if !fuse::atomic_o_trunc(&conn.borrow()) {
-                    kept &= !oflags::O_TRUNC;
-                }
+                let kept = fuse::handle_flags(&conn.borrow(), flags);
                 let h = Handle {
                     conn: conn.clone(),
                     id,
@@ -193,7 +202,11 @@ pub(super) fn create(
                     dir: false,
                     no_release: false,
                 }
-                .counted();
+                .finish_open(cx, vfs);
+                if kept & oflags::O_TRUNC != 0 && mapped_pages(vfs, id).is_some() {
+                    // CREATE can return an inode already mapped through another name.
+                    with_io(cx, vfs, id, false, |cx| resize_mapping(cx, vfs, id, 0))?;
+                }
                 return Ok((id, FileKind::Fuse(Box::new(h))));
             }
             Err(Errno::ENOSYS) => {}
@@ -468,16 +481,23 @@ pub(super) fn setattr(
         .u32(up(&ns.uid_map.borrow(), set.uid))
         .u32(up(&ns.gid_map.borrow(), set.gid))
         .u32(0);
-    let reply = fuse::call(cx, &conn, op::SETATTR, nodeid, &args.0)?;
-    let (attr, until) = fuse::attr_out(&reply, &ns)?;
-    let mut f = vfs.fuse_mut();
-    let old = f.get(id).ok_or(Errno::ENOTCONN)?.attr.mode;
-    if (attr.mode ^ old) & mode::S_IFMT != 0 {
-        f.stale(id);
-        return Err(Errno::EIO);
-    }
-    f.set_attr(id, attr, until);
-    Ok(())
+    with_io(cx, vfs, id, false, |cx| {
+        let reply = fuse::call(cx, &conn, op::SETATTR, nodeid, &args.0)?;
+        let (attr, until) = fuse::attr_out(&reply, &ns)?;
+        let mut f = vfs.fuse_mut();
+        let old = f.get(id).ok_or(Errno::ENOTCONN)?.attr.mode;
+        if (attr.mode ^ old) & mode::S_IFMT != 0 {
+            f.stale(id);
+            return Err(Errno::EIO);
+        }
+        let size = attr.size;
+        f.set_attr(id, attr, until);
+        drop(f);
+        if set.size.is_some() {
+            resize_mapping(cx, vfs, id, size)?;
+        }
+        Ok(())
+    })
 }
 
 // ---- Reading and writing ----
@@ -495,10 +515,20 @@ pub(super) fn read(
     let offset = if io.stream { Some(0) } else { offset };
     let _pos = super::fs::PosGuard::lock_if(cx, file, offset.is_none() && !pos_held)?;
     let start = offset.unwrap_or_else(|| file.borrow().pos);
-    let n = fuse::read(cx, io.handle(), start, buf.len()).map(|data| {
+    let vfs = cx.vfs()?;
+    let mut read = |cx: &mut Cx<'_>| {
+        let data = fuse::read(cx, io.handle(), start, buf.len())?;
         buf[..data.len()].copy_from_slice(&data);
-        data.len()
-    })?;
+        if let Some(pages) = mapped_pages(&vfs, io.id) {
+            pages.overlay(start, &mut buf[..data.len()])?;
+        }
+        Ok(data.len())
+    };
+    let n = if mapped_pages(&vfs, io.id).is_some() {
+        with_io(cx, &vfs, io.id, false, read)?
+    } else {
+        read(cx)?
+    };
     if offset.is_none() {
         file.borrow_mut().pos = start + n as u64;
     }
@@ -525,8 +555,7 @@ pub(super) fn write(
     let start = offset.unwrap_or_else(|| file.borrow().pos);
     let vfs = cx.vfs()?;
     // Appends to one node go one at a time from asking for the size to writing there
-    let appending = append && take_append(cx, &vfs, io.id)?;
-    let r = (|| {
+    let (n, at) = with_io(cx, &vfs, io.id, false, |cx| {
         let at = if append {
             fuse::getattr(cx, &vfs, io.id, Some(io.fh))?.size
         } else {
@@ -534,40 +563,66 @@ pub(super) fn write(
         };
         // RLIMIT_FSIZE, as generic_write_checks applies it
         let data = &data[..super::fs::fsize_room(cx, at, data.len())?];
-        let n = fuse::write(cx, io.handle(), at, data)?;
+        let n = fuse::write(cx, io.handle(), at, data, false)?;
+        if n != 0
+            && let Some(pages) = mapped_pages(&vfs, io.id)
+        {
+            let end = at + n as u64;
+            if end > pages.size() {
+                pages.resize(end)?;
+            }
+            pages.written(at, &data[..n])?;
+        }
         vfs.fuse_mut().stale(io.id);
         Ok((n, at))
-    })();
-    if appending {
-        if let Some(n) = vfs.fuse_mut().get_mut(io.id) {
-            n.appending = false;
-        }
-        crate::kernel::request_wake_locks();
-    }
-    let (n, at) = r?;
+    })?;
     if offset.is_none() {
         file.borrow_mut().pos = at + n as u64;
     }
     Ok(n)
 }
 
-/// Takes node `id` for an `O_APPEND` write, waiting while another one has it (on the lock
-/// channel, as file positions do); true once taken.
-fn take_append(cx: &mut Cx<'_>, vfs: &Vfs, id: FuseId) -> Result<bool, Errno> {
+/// Serializes daemon operations that change the page cache. A fill cannot publish an old
+/// reply after a descriptor write or truncate, and overlapping writebacks complete in order.
+fn with_io<T>(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    id: FuseId,
+    forced: bool,
+    run: impl FnOnce(&mut Cx<'_>) -> Result<T, Errno>,
+) -> Result<T, Errno> {
     loop {
-        let busy = vfs.fuse().get(id).ok_or(Errno::ENOTCONN)?.appending;
+        let busy = vfs.fuse().get(id).ok_or(Errno::ENOTCONN)?.io_busy;
         if !busy {
             break;
         }
-        if cx.task.killed.get() {
+        if cx.kr().stopping || !forced && cx.task.killed.get() {
             return Err(Errno::EINTR);
         }
         cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
     }
-    if let Some(n) = vfs.fuse_mut().get_mut(id) {
-        n.appending = true;
+    vfs.fuse_mut().get_mut(id).ok_or(Errno::ENOTCONN)?.io_busy = true;
+    struct Unlock<'a>(&'a Vfs, FuseId);
+    impl Drop for Unlock<'_> {
+        fn drop(&mut self) {
+            if let Some(node) = self.0.fuse_mut().get_mut(self.1) {
+                node.io_busy = false;
+            }
+            crate::kernel::request_wake_locks();
+        }
     }
-    Ok(true)
+    let _unlock = Unlock(vfs, id);
+    run(cx)
+}
+
+fn resize_mapping(cx: &Cx<'_>, vfs: &Vfs, id: FuseId, size: u64) -> Result<(), Errno> {
+    if let Some(pages) = mapped_pages(vfs, id) {
+        if size < pages.size() {
+            super::fs::truncating(cx, &pages.host, size);
+        }
+        pages.resize(size)?;
+    }
+    Ok(())
 }
 
 /// lseek on an open FUSE file (6.1's `fuse_file_llseek`): `SEEK_END` from the size the daemon
@@ -664,6 +719,13 @@ pub(super) fn fill_dir(cx: &mut Cx<'_>, file: &FileRef) -> Result<(), Errno> {
 /// fsync and fdatasync of an open FUSE file or directory (`FUSE_FSYNC`, `FUSE_FSYNCDIR`): a
 /// daemon without them has nothing to sync.
 pub(super) fn fsync(cx: &mut Cx<'_>, io: &Io, dir: bool, data_only: bool) -> Result<(), Errno> {
+    if !dir {
+        writeback(cx, io.id, 0, u64::MAX)?;
+    }
+    sync_handle(cx, io, dir, data_only)
+}
+
+fn sync_handle(cx: &mut Cx<'_>, io: &Io, dir: bool, data_only: bool) -> Result<(), Errno> {
     let (conn, nodeid, fh) = (&io.conn, io.nodeid, io.fh);
     let (opcode, bit) = if dir {
         (op::FSYNCDIR, fuse::no::FSYNCDIR)
@@ -680,6 +742,19 @@ pub(super) fn fsync(cx: &mut Cx<'_>, io: &Io, dir: bool, data_only: bool) -> Res
     }
 }
 
+const KEEP_SIZE: u32 = 1;
+const PUNCH_HOLE: u32 = 2;
+
+pub(super) fn remove_mapped(
+    cx: &mut Cx<'_>,
+    fill: &Fill,
+    start: u64,
+    end: u64,
+) -> Result<(), Errno> {
+    let io = file_io(&fill.source).ok_or(Errno::EIO)?;
+    fallocate(cx, &io, KEEP_SIZE | PUNCH_HOLE, start, end - start)
+}
+
 /// fallocate of an open FUSE file (`FUSE_FALLOCATE`; a daemon without it is EOPNOTSUPP).
 pub(super) fn fallocate(
     cx: &mut Cx<'_>,
@@ -688,8 +763,6 @@ pub(super) fn fallocate(
     offset: u64,
     len: u64,
 ) -> Result<(), Errno> {
-    const KEEP_SIZE: u32 = 1;
-    const PUNCH_HOLE: u32 = 2;
     // Only these two (6.1's fuse_file_fallocate), and a hole keeps the size (vfs_fallocate)
     if mode & !(KEEP_SIZE | PUNCH_HOLE) != 0 || mode == PUNCH_HOLE {
         return Err(Errno::EOPNOTSUPP);
@@ -706,14 +779,23 @@ pub(super) fn fallocate(
         .u64(len)
         .u32(mode)
         .u32(0);
-    match fuse::call(cx, &io.conn, op::FALLOCATE, io.nodeid, &args.0) {
-        Err(Errno::ENOSYS) => Err(Errno::EOPNOTSUPP),
-        r => {
-            r?;
-            cx.vfs()?.fuse_mut().stale(io.id);
-            Ok(())
+    let vfs = cx.vfs()?;
+    with_io(cx, &vfs, io.id, false, |cx| {
+        match fuse::call(cx, &io.conn, op::FALLOCATE, io.nodeid, &args.0) {
+            Err(Errno::ENOSYS) => return Err(Errno::EOPNOTSUPP),
+            r => r?,
+        };
+        vfs.fuse_mut().stale(io.id);
+        if let Some(pages) = mapped_pages(&vfs, io.id) {
+            let end = offset.saturating_add(len);
+            if mode & PUNCH_HOLE != 0 {
+                pages.punch(offset, end)?;
+            } else if mode & KEEP_SIZE == 0 && end > pages.size() {
+                pages.resize(end)?;
+            }
         }
-    }
+        Ok(())
+    })
 }
 
 /// The I/O route of an open FUSE file (regular file or directory), for fsync and fallocate.
@@ -746,6 +828,7 @@ pub(super) fn flush_as(cx: &mut Cx<'_>, file: &FileRef, table: usize) -> Result<
         };
         handle.no_release || handle.open_flags & fuse::fopen::NOFLUSH != 0
     };
+    writeback(cx, h.id, 0, u64::MAX)?;
     if skip || h.conn.borrow().no & fuse::no::FLUSH != 0 {
         return Ok(());
     }
@@ -1361,13 +1444,8 @@ pub(super) fn file_io(file: &FileRef) -> Option<Io> {
 
 // ---- Mappings ----
 
-/// For mmap of an open FUSE file: what the mapping reads its pages through ([`Fill`]), an empty
-/// host file as long as the file is (its size from the attribute cache, fetched first when stale),
-/// into which pages are read as they are touched ([`fill`]). None for any other file, one not open
-/// for reading or a mapping mmap will refuse anyway (`refused`). As in 6.1's `fuse_file_mmap`, a
-/// file the daemon opened with `FOPEN_DIRECT_IO` cannot be mapped shared (`ENODEV`). Linux maps
-/// the file's page cache, which later writes through the mount change; here a page keeps what was
-/// read when it was first touched.
+/// Independent opens of the same inode map one sparse memfd. Each mapping pins its own
+/// handle for demand reads and a shared writable mapping also supplies the writeback handle.
 pub(super) fn map_fill(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -1386,49 +1464,168 @@ pub(super) fn map_fill(
     if direct && shared {
         return Err(Errno::ENODEV);
     }
-    let size = fuse::cached_attr(&*cx.vfs()?, id)?.size;
-    let host = appine_hal::memfd(c"appine-fuse").map_err(Errno)?;
-    host.set_len(size)
-        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
-    Ok(Some(Fill::new(host, size, file.clone())))
+    let vfs = cx.vfs()?;
+    let pages = if let Some(pages) = mapped_pages(&vfs, id) {
+        pages
+    } else {
+        let size = fuse::cached_attr(&vfs, id)?.size;
+        let host = appine_hal::memfd(c"appine-fuse").map_err(Errno)?;
+        host.set_len(size)
+            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+        let pages = FillPages::new(host, size);
+        vfs.fuse_mut().get_mut(id).ok_or(Errno::ENOTCONN)?.pages = Rc::downgrade(&pages);
+        pages
+    };
+    let fill = Rc::new(Fill {
+        shared,
+        source: file.clone(),
+        pages,
+    });
+    if file.borrow().writable() {
+        fill.add_writer(&fill);
+    }
+    Ok(Some(fill))
+}
+
+/// Refresh the mapped EOF after a data invalidation. A daemon can notify while replying
+/// to GETATTR, so only a reply for the current generation may resize the backing.
+fn refresh_mapping_size(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    io: &Io,
+    pages: &FillPages,
+) -> Result<(), Errno> {
+    while pages.size_stale.get() {
+        let generation = pages.generation.get();
+        let reply = fuse::getattr(cx, vfs, io.id, Some(io.fh));
+        if generation == pages.generation.get() {
+            resize_mapping(cx, vfs, io.id, reply?.size)?;
+            pages.size_stale.set(false);
+        }
+    }
+    Ok(())
 }
 
 /// Reads into an on-demand mapping of a FUSE file ([`Fill`]) the pages missing around file page
 /// `page` (Linux's `filemap_fault` read-around), the BKL released while the daemon answers.
 pub(crate) fn fill(cx: &mut Cx<'_>, (fill, page): (Rc<Fill>, u64)) -> Result<(), Errno> {
-    use appine_engine::PAGE_SIZE;
-    let io = match &fill.source.borrow().kind {
-        FileKind::Fuse(h) => Io::of(h),
-        _ => return Err(Errno::EIO),
-    };
-    let Some(mut window) = fill.window(page) else {
-        return Ok(());
-    };
-    let mut data = fuse::read(cx, io.handle(), window.0, window.1 as usize)?;
-    if window.0 < page * PAGE_SIZE {
-        fill.store(window, &data, false)?;
-        if fill.has(page) {
-            return Ok(());
-        }
-        let Some(next) = fill.window_from(page) else {
+    let io = file_io(&fill.source).ok_or(Errno::EIO)?;
+    let vfs = cx.vfs()?;
+    with_io(cx, &vfs, io.id, false, |cx| {
+        refresh_mapping_size(cx, &vfs, &io, &fill)?;
+        let Some(mut window) = fill.window(page) else {
             return Ok(());
         };
-        window = next;
-        data = fuse::read(cx, io.handle(), window.0, window.1 as usize)?;
+        let generation = fill.generation.get();
+        loop {
+            let around = window.0 < page * PAGE_SIZE;
+            let read = read_fill_window(cx, &io, &fill, window, around, generation);
+            if generation != fill.generation.get() {
+                // The page fault or kernel access retries using a fresh window.
+                return Ok(());
+            }
+            let (data, eof) = read?;
+            fill.store(window, &data, eof)?;
+            if !around || fill.has(page) {
+                break;
+            }
+            let Some(next) = fill.window_from(page) else {
+                break;
+            };
+            window = next;
+        }
+        Ok(())
+    })
+}
+
+/// For a forward read, collect at least one complete page unless the daemon confirms EOF.
+fn read_fill_window(
+    cx: &mut Cx<'_>,
+    io: &Io,
+    fill: &FillPages,
+    (offset, len): (u64, u64),
+    around: bool,
+    generation: u64,
+) -> Result<(Vec<u8>, bool), Errno> {
+    let mut data = fuse::read(cx, io.handle(), offset, len as usize)?;
+    if around {
+        return Ok((data, false));
     }
-    // Reading from `page`: if a short reply stopped before filling one whole page before the
-    // recorded EOF, keep reading until we have a full page or the daemon confirms EOF (0 bytes).
     let mut eof = data.is_empty();
-    while !eof && data.len() < PAGE_SIZE as usize && window.0 + (data.len() as u64) < fill.size() {
-        let want = (PAGE_SIZE as usize) - data.len();
-        let more = fuse::read(cx, io.handle(), window.0 + data.len() as u64, want)?;
-        if more.is_empty() {
-            eof = true;
-        } else {
-            data.extend_from_slice(&more);
+    while !eof
+        && data.len() < PAGE_SIZE as usize
+        && offset + (data.len() as u64) < fill.size()
+        && generation == fill.generation.get()
+    {
+        let want = PAGE_SIZE as usize - data.len();
+        let more = fuse::read(cx, io.handle(), offset + data.len() as u64, want)?;
+        eof = more.is_empty();
+        data.extend_from_slice(&more);
+    }
+    Ok((data, eof))
+}
+
+/// Write changed pages in the file range through a retained writable open. The baseline
+/// advances only for bytes actually accepted by the daemon, so fsync can retry a failed write.
+fn writeback(cx: &mut Cx<'_>, id: FuseId, start: u64, end: u64) -> Result<(), Errno> {
+    let vfs = cx.vfs()?;
+    let Some(pages) = mapped_pages(&vfs, id) else {
+        return Ok(());
+    };
+    let Some(writer) = pages.writer() else {
+        return Ok(());
+    };
+    let io = file_io(&writer.source).ok_or(Errno::EIO)?;
+    with_io(cx, &vfs, id, true, |cx| {
+        for page in pages.tracked(start, end) {
+            refresh_mapping_size(cx, &vfs, &io, &pages)?;
+            for (at, data) in pages.dirty_runs(page)? {
+                // Another invalidation may have arrived during the preceding write.
+                refresh_mapping_size(cx, &vfs, &io, &pages)?;
+                let len = (data.len() as u64).min(pages.size().saturating_sub(at)) as usize;
+                let n = fuse::write(cx, io.handle(), at, &data[..len], true)?;
+                pages.acknowledge(at, &data[..n]);
+                if n != len {
+                    return Err(Errno::EIO);
+                }
+            }
+        }
+        if start == 0
+            && end == u64::MAX
+            && let Some(node) = vfs.fuse_mut().get_mut(id)
+        {
+            node.retry_writeback = None;
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn sync_mapping(
+    cx: &mut Cx<'_>,
+    fill: &Fill,
+    start: u64,
+    end: u64,
+) -> Result<(), Errno> {
+    let io = file_io(&fill.source).ok_or(Errno::EIO)?;
+    writeback(cx, io.id, start, end)?;
+    sync_handle(cx, &io, false, true)
+}
+
+pub(crate) fn flush_mappings(cx: &mut Cx<'_>) {
+    let ranges = cx.mm().fuse_ranges(0, u64::MAX);
+    flush_ranges(cx, ranges);
+}
+
+fn flush_ranges(cx: &mut Cx<'_>, ranges: Vec<(Rc<Fill>, u64, u64)>) {
+    for (fill, start, end) in ranges {
+        if let Some(io) = file_io(&fill.source)
+            && writeback(cx, io.id, start, end).is_err()
+            && let Ok(vfs) = cx.vfs()
+            && let Some(node) = vfs.fuse_mut().get_mut(io.id)
+        {
+            node.retry_writeback = fill.writer();
         }
     }
-    fill.store(window, &data, eof)
 }
 
 /// Before a read or write syscall (`nr`, arguments `a`): the pages of its buffers in on-demand
@@ -1483,7 +1680,13 @@ pub(super) fn prefault(cx: &mut Cx<'_>, nr: u64, a: &[u64; 6]) {
 /// large, or `drop_caches`), at the end of a syscall, when no syscall of this thread holds a node.
 /// Other threads hold nodes through what [`in_use`] finds, O_PATH pins, open handles and
 /// requests in flight ([`fuse::Fuses::evict`]).
-pub(super) fn sweep(cx: &Cx<'_>) {
+pub(super) fn sweep(cx: &mut Cx<'_>) {
+    if !cx.mm().unmapped_fills.is_empty() {
+        let ranges = std::mem::take(&mut cx.mm_mut().unmapped_fills);
+        let current = cx.task.sync.clone();
+        cx.mm_mut().sync(&current);
+        flush_ranges(cx, ranges);
+    }
     use std::sync::atomic::Ordering::Relaxed;
     if !fuse::SWEEP.load(Relaxed) || !fuse::SWEEP.swap(false, Relaxed) {
         return;

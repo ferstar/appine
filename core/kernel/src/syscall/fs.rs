@@ -9499,6 +9499,16 @@ pub(super) fn executing(cx: &Cx<'_>, ino: Ino) -> bool {
 /// Whether `ino` is open for write (executing it is ETXTBSY).
 /// fds from memfd_create do not count ([`OpenFile::pseudo`]).
 pub(super) fn open_for_write(cx: &Cx<'_>, ino: Ino) -> bool {
+    if let Some(id) = crate::vfs::fuse::id_of(ino)
+        && let Ok(vfs) = cx.vfs()
+        && vfs
+            .fuse()
+            .get(id)
+            .and_then(|n| n.pages.upgrade())
+            .is_some_and(|p| p.has_writable_open())
+    {
+        return true;
+    }
     cx.kr().open_files().iter().any(|f| {
         let f = f.borrow();
         f.writable()
@@ -9568,7 +9578,7 @@ fn remove_privs(cx: &Cx<'_>, ino: Ino) -> Result<(), Errno> {
 /// in the engine, ending the process as a kernel bug). Afterwards an access there faults into the
 /// kernel, waits for the BKL and gets the guest's SIGBUS. Nothing happens when `len` is not
 /// shorter.
-fn truncating(cx: &Cx<'_>, host: &std::fs::File, len: u64) {
+pub(super) fn truncating(cx: &Cx<'_>, host: &std::fs::File, len: u64) {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = host.metadata() else {
         return;

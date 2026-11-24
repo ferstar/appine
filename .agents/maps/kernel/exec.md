@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: inotify events for execve and execveat across script, ELF and FUSE retry paths)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: old-address-space FUSE writeback at exec)
 
 ## Responsibilities
 
@@ -67,7 +67,8 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   script run by fd through a close-on-exec directory is `ENOENT`.
 - `ETXTBSY` if a writable open file refers to the initial file, any nested `#!` script being run
   (checked before its interpreter is opened), the final executable, or its ELF `PT_INTERP`
-  interpreter (memfds never count as writers).
+  interpreter (memfds never count as writers). A writable FUSE open pinned by mmap still counts
+  after its descriptor is closed.
 - `ExecOpens` records the open and positive reads of each file, including header reads served
   by the executable cache. Across FUSE retries it reuses the matching prefix of opens and
   reports each read once. An open accepted by the daemon counts even if copying the file fails.
@@ -95,7 +96,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   the personality (arm64's `SET_PERSONALITY`) and on a privileged exec the other
   `PER_CLEAR_ON_SETID` flags (`kernel/cred`); commit the credentials; clear POSIX timers and AIO;
   unshare and reset signal handlers; release the old address space (robust list,
-  `clear_child_tid`, vfork) and install the new one with the CPU state reset, reaping shm
+  `clear_child_tid`, vfork), write back its shared FUSE mappings, and install the new one with the CPU state reset, reaping shm
   segments marked for removal it held last; reset the alternate stack, `TaskState::restart` and
   comm; set PC and SP;
   force the `SIGSEGV` of a doomed image; re-kick if interrupted. For a doomed image, `exec_done`
@@ -173,7 +174,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   `kernel/ns` (the time namespace for children and its vDSO stubs), `kernel/signal` (handler reset,
   `force_fatal`), `kernel/ptrace` (exec event), `kernel/vdso` (image), `kernel/vfs`, `kernel/files` and
   `kernel/mount` (resolution, noexec and nosuid, writers, close-on-exec), `kernel/fuse`
-  (`open_fuse`, the close-on-exec flush), `kernel/aio`, `kernel/ipc` and `kernel/unix` (released at
+  (`open_fuse`, close-on-exec flush and mapped writeback), `kernel/aio`, `kernel/ipc` and `kernel/unix` (released at
   exec), `engine` (the Go register set).
 
 ## Invariants and gotchas

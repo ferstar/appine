@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: local page fills after socket receives)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: FUSE writeback at syscall completion and after final thread stores)
 
 ## Responsibilities
 
@@ -170,7 +170,7 @@ and `kernel/oom`.
   (`InSyscall`, numbered by the global `SYSCALLS` count, cleared on every way out), so the overlay
   sweep can tell which syscalls began before a removal.
 - After the handler: released FUSE files are flushed, deferred AF_UNIX cycle collection runs
-  (`unix::collect_deferred`), the FUSE node cache may be swept
+  (`unix::collect_deferred`), removed FUSE mappings complete writeback and the node cache may be swept
   (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall let go of are collected
   and removed overlay nodes swept (`kernel/overlay`), and pending cgroup2 file changes checked
   (`cgroup::notify_changes`, also run at thread exit, freezer stops and by the timer thread); then
@@ -189,7 +189,7 @@ and `kernel/oom`.
 - `task::exit` runs in `bug::catch`-contained stages (`kernel/bug`): core-dump regs, stats/CPU time,
   `leader_exit`, last-thread RSS sample, `release_mm` (robust list, shared-mm `clear_child_tid` wake,
   vfork completion, leave mm users; on panic vfork completion and user removal re-run idempotently
-  before killing the process), ptrace/seccomp cleanup, task/pid removal, `futex::pi_owners_exited`,
+  before killing the process), ptrace/seccomp cleanup, shared FUSE mapping writeback, task/pid removal, `futex::pi_owners_exited`,
   SysV shm reap (`kernel/ipc`), non-last thread `sem_undo` release (if last holder) and child
   handoff (`pdeathsig`) + signal retargeting or last-thread `finish_group`, mqueue notification
   flush, namespace reset/drop under BKL, FUSE flush, unix-GC (when `last || fds_gone ||

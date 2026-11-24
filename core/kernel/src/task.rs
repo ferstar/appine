@@ -1122,6 +1122,20 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         let what = format_args!("kernel panic while the thread was exiting");
         crate::bug::kill(&k, &task, pc, what);
     }
+    // release_mm can store final robust-futex and clear_child_tid values in a mapped
+    // file. Finish their writeback before a waiting parent observes this thread's exit.
+    if task.res.borrow().mm.borrow().has_fills() {
+        {
+            let mut state = task.state.borrow_mut();
+            let mut cx = Cx::new(shared, k, &task, &mut state);
+            if crate::bug::catch(|| crate::syscall::flush_mappings(&mut cx)).is_none() {
+                crate::bug::report(format_args!(
+                    "kernel panic flushing FUSE mappings for thread {tid}"
+                ));
+            }
+        }
+        k = shared.lock();
+    }
     k.tasks.remove(&tid);
     k.release_pid(tid);
     // PI locks this thread held with waiters go to their first waiter (exit_pi_state_list)
