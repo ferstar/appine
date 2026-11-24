@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: emit inotify events for FUSE attrib/modify/O_TRUNC/xattr and avoid double IN_CREATE on MKNOD fallback, mark unlinked dentries, sync O_SYNC FUSE writes, and lock lseek position)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: forced unmount aborts outstanding requests and wakes waiters across the connection)
 
 ## Responsibilities
 
@@ -123,11 +123,11 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - mountinfo shows the type with its subtype and the options `user_id`, `group_id` (in the
   mounter's namespace), `default_permissions`, `allow_other`, `max_read` (at least 4096) when
   given. statfs reports `FUSE_SUPER_MAGIC`; `/proc/filesystems` lists `nodev fuse`.
-- Aborting (6.1's `fuse_abort_conn`): the last attached device file closing, or `Vfs::collect`
-  finding no attached or detached mount of the instance (umount, a dying mount namespace, or the
-  last open file, cwd or root in a lazily unmounted one going, `kernel/mount`), which also forgets
-  the instance's nodes. Requests not yet answered end with ECONNABORTED, new ones are
-  ENOTCONN, the daemon's reads ENODEV and writes ENOENT, poll `POLLERR`.
+- A forced unmount aborts the whole connection before the mount's busy check. The last attached
+  device file closing also aborts it, as does `Vfs::collect` when no attached or detached mount of
+  the instance remains. Collection also removes the instance and its cached nodes. Aborting wakes readers,
+  pollers and callers waiting for INIT or a reply. Requests not yet answered end with ECONNABORTED,
+  new ones are ENOTCONN, the daemon's reads ENODEV and writes ENOENT, poll `POLLERR`.
 
 ### Requests and waiting
 

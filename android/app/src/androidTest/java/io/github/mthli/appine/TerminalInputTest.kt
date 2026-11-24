@@ -393,19 +393,20 @@ class TerminalInputTest {
     }
 
     @Test
-    fun composingDeleteSurroundingTextUpdatesPreedit() {
+    fun deletingSurroundingTextPreservesComposition() {
         withFixture { f ->
             val preeditField = field(VtView::class.java, "preedit")
             onMain {
                 f.connection.setComposingText("abc", 1)
                 assertEquals("abc", preeditField.get(f.view))
                 f.connection.deleteSurroundingText(1, 0)
-                assertEquals("ab", preeditField.get(f.view))
+                assertEquals("abc", preeditField.get(f.view))
                 f.connection.deleteSurroundingTextInCodePoints(1, 0)
-                assertEquals("a", preeditField.get(f.view))
-                f.connection.deleteSurroundingText(1, 0)
-                assertEquals("", preeditField.get(f.view))
+                assertEquals("abc", preeditField.get(f.view))
                 assertEquals("", f.host.text())
+                f.connection.finishComposingText()
+                assertEquals("", preeditField.get(f.view))
+                assertEquals("abc", f.host.text())
             }
         }
     }

@@ -1430,6 +1430,12 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
             return Err(Errno::EAGAIN);
         }
     }
+    // Linux's fuse_umount_begin aborts the instance even if an open file keeps the mount busy.
+    if flags & MNT_FORCE != 0
+        && let Node::Fuse(_, root) = node
+    {
+        vfs.fuse().conn_of(root)?.borrow_mut().abort();
+    }
     // The root of a mount tree cannot be unmounted; the mount the caller's root directory is in
     // can only be unmounted with MNT_DETACH (without it, Linux remounts the root filesystem
     // read-only)

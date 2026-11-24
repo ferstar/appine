@@ -5,6 +5,7 @@
  * - tmpfs keeps unlinked open files charged until last close, handles truncate/write without
  *   drift or underflow, and frees pages/inodes immediately on close;
  * - umount2(MNT_FORCE) requires initial CAP_SYS_ADMIN (EPERM in userns);
+ * - forcing a busy FUSE mount aborts its outstanding read even when umount2 returns EBUSY;
  * - umount2 returns EBUSY for mapped files, running executables, and open mqueue-mount fds;
  * - detached FUSE mount held only by an O_PATH fd aborts immediately on close;
  * - unattached open_tree(OPEN_TREE_CLONE) of a shared mount is excluded from mount propagation
@@ -352,7 +353,7 @@ static void test_mount_busy_and_force_cap(const char *self_path)
     rmdir("/tmp/umnt_mq");
 }
 
-/* Minimal FUSE daemon shared by tests 5 and 8 */
+/* Minimal FUSE daemon for mount lifetime and short-read mapping tests */
 struct fuse_in_hdr {
     uint32_t len;
     uint32_t opcode;
@@ -427,11 +428,12 @@ struct fuse_ctx {
     int devfd;
     uint64_t file_size;
     size_t max_reply; /* cap each FUSE_READ reply to simulate short reads */
-    volatile int aborted;
-    volatile int read_ops;
+    const char *force_on_read; /* force this mount after receiving FUSE_READ, before replying */
+    _Atomic int aborted;
+    _Atomic int read_ops;
 };
 
-static void *fuse_short_daemon(void *arg)
+static void *fuse_daemon(void *arg)
 {
     struct fuse_ctx *ctx = (struct fuse_ctx *)arg;
     uint8_t buf[16384];
@@ -493,9 +495,14 @@ static void *fuse_short_daemon(void *arg)
             struct fuse_open_out o;
             memset(&o, 0, sizeof(o));
             o.fh = 1;
+            if (ctx->force_on_read)
+                o.open_flags = 1; /* FOPEN_DIRECT_IO: observe the one aborted request */
             hdr->len = (uint32_t)(sizeof(*hdr) + sizeof(o));
             memcpy(out + sizeof(*hdr), &o, sizeof(o));
         } else if (in.opcode == 15 /* FUSE_READ */) {
+            if (ctx->force_on_read)
+                CHECK(umount2(ctx->force_on_read, MNT_FORCE) == -1 && errno == EBUSY,
+                      "forced unmount with fd open");
             ctx->read_ops++;
             struct fuse_read_in ri;
             memcpy(&ri, buf + sizeof(in), sizeof(ri));
@@ -525,19 +532,48 @@ static void *fuse_short_daemon(void *arg)
     return NULL;
 }
 
+static pthread_t mount_test_fuse(const char *path, struct fuse_ctx *ctx)
+{
+    CHECK(mkdir(path, 0755) == 0, "mkdir %s", path);
+    ctx->devfd = open("/dev/fuse", O_RDWR);
+    CHECK(ctx->devfd >= 0, "open /dev/fuse");
+    char opts[128];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=40755,user_id=0,group_id=0", ctx->devfd);
+    CHECK(mount("f", path, "fuse", 0, opts) == 0, "mount %s", path);
+    pthread_t daemon;
+    CHECK(pthread_create(&daemon, NULL, fuse_daemon, ctx) == 0, "start FUSE daemon for %s", path);
+    return daemon;
+}
+
+static void test_force_unmount_busy_fuse(void)
+{
+    const char *mnt = "/tmp/fuse_force";
+    struct fuse_ctx ctx = {.file_size = 4096, .force_on_read = mnt};
+    pthread_t daemon = mount_test_fuse(mnt, &ctx);
+    int fd = open("/tmp/fuse_force/data", O_RDONLY);
+    CHECK(fd >= 0, "open file pinning FUSE mount");
+    CHECK(umount2(mnt, MNT_FORCE | MNT_EXPIRE) == -1 && errno == EINVAL, "incompatible flags");
+    CHECK(umount2(mnt, 0) == -1 && errno == EBUSY, "ordinary unmount of busy FUSE mount");
+    struct pollfd device = {.fd = ctx.devfd, .events = POLLIN};
+    CHECK(poll(&device, 1, 0) == 0, "connection must still be live");
+    char byte;
+    int read_aborted = read(fd, &byte, 1) == -1 && errno == ECONNABORTED;
+    int device_aborted = poll(&device, 1, 0) == 1 && (device.revents & POLLERR);
+    close(fd);
+    CHECK(umount2(mnt, 0) == 0, "unmount aborted FUSE mount");
+    pthread_join(daemon, NULL);
+    close(ctx.devfd);
+    rmdir(mnt);
+    CHECK(read_aborted, "abort outstanding FUSE read");
+    CHECK(device_aborted, "forced unmount must abort FUSE");
+}
+
 /* 5. Detached FUSE mount held only by O_PATH fd aborts on close + open_tree propagation isolation */
 static void test_mount_collection_and_open_tree_propagation(void)
 {
     /* Part A: O_PATH fd on lazily unmounted FUSE mount triggers collection right at close() */
-    CHECK(mkdir("/tmp/fuse_opath", 0755) == 0, "mkdir fuse_opath");
-    int devfd = open("/dev/fuse", O_RDWR);
-    CHECK(devfd >= 0, "open /dev/fuse");
-    struct fuse_ctx ctx = {.devfd = devfd, .file_size = 4096, .max_reply = 0, .aborted = 0};
-    char opts[128];
-    snprintf(opts, sizeof(opts), "fd=%d,rootmode=40755,user_id=0,group_id=0", devfd);
-    CHECK(mount("f", "/tmp/fuse_opath", "fuse", 0, opts) == 0, "mount fuse");
-    pthread_t th;
-    CHECK(pthread_create(&th, NULL, fuse_short_daemon, &ctx) == 0, "spawn fuse daemon");
+    struct fuse_ctx ctx = {.file_size = 4096};
+    pthread_t th = mount_test_fuse("/tmp/fuse_opath", &ctx);
     int pfd = open("/tmp/fuse_opath/data", O_PATH);
     CHECK(pfd >= 0, "open O_PATH on fuse");
     CHECK(umount2("/tmp/fuse_opath", MNT_DETACH) == 0, "lazy umount fuse");
@@ -546,7 +582,7 @@ static void test_mount_collection_and_open_tree_propagation(void)
     /* Daemon must abort promptly without any unrelated umount2 or thread exit */
     pthread_join(th, NULL);
     CHECK(ctx.aborted == 1, "closing last O_PATH fd must abort detached FUSE mount");
-    close(devfd);
+    close(ctx.devfd);
     rmdir("/tmp/fuse_opath");
 
     /* Part B: unattached open_tree(OPEN_TREE_CLONE) of a shared mount must not receive
@@ -574,15 +610,8 @@ static void test_mount_collection_and_open_tree_propagation(void)
           "unattached open_tree clone must not have received propagated mount");
 
     /* Unattached clone closed without attaching must free its mounts immediately (test with FUSE) */
-    CHECK(mkdir("/tmp/ot_fuse", 0755) == 0, "mkdir ot_fuse");
-    int fdev = open("/dev/fuse", O_RDWR);
-    CHECK(fdev >= 0, "open /dev/fuse for open_tree");
-    struct fuse_ctx fctx = {.devfd = fdev, .file_size = 4096, .max_reply = 0, .aborted = 0};
-    char fopts[128];
-    snprintf(fopts, sizeof(fopts), "fd=%d,rootmode=40755,user_id=0,group_id=0", fdev);
-    CHECK(mount("f", "/tmp/ot_fuse", "fuse", 0, fopts) == 0, "mount ot_fuse");
-    pthread_t fth;
-    CHECK(pthread_create(&fth, NULL, fuse_short_daemon, &fctx) == 0, "spawn open_tree fuse");
+    struct fuse_ctx fctx = {.file_size = 4096};
+    pthread_t fth = mount_test_fuse("/tmp/ot_fuse", &fctx);
     int ftree = (int)syscall(SYS_open_tree, AT_FDCWD, "/tmp/ot_fuse",
                              OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
     CHECK(ftree >= 0, "open_tree clone fuse");
@@ -591,7 +620,7 @@ static void test_mount_collection_and_open_tree_propagation(void)
     close(ftree);
     pthread_join(fth, NULL);
     CHECK(fctx.aborted == 1, "closing unattached open_tree clone must abort FUSE mount");
-    close(fdev);
+    close(fctx.devfd);
     rmdir("/tmp/ot_fuse");
 
     CHECK(umount2("/tmp/ot_base/sub", 0) == 0, "umount sub");
@@ -762,23 +791,9 @@ static void test_pagemap_cow_lent_not_exclusive(void)
 /* 8. FUSE short-read on-demand mapping does not permanently zero unread tail pages */
 static void test_fuse_short_read_mapping(void)
 {
-    CHECK(mkdir("/tmp/fuse_short", 0755) == 0, "mkdir fuse_short");
-    int devfd = open("/dev/fuse", O_RDWR);
-    CHECK(devfd >= 0, "open /dev/fuse");
-
     /* 64 KiB file (16 pages), daemon caps every FUSE_READ reply to 8 KiB (2 pages) */
-    struct fuse_ctx ctx = {
-        .devfd = devfd,
-        .file_size = 16 * 4096,
-        .max_reply = 2 * 4096,
-        .aborted = 0,
-        .read_ops = 0,
-    };
-    char opts[128];
-    snprintf(opts, sizeof(opts), "fd=%d,rootmode=40755,user_id=0,group_id=0", devfd);
-    CHECK(mount("f", "/tmp/fuse_short", "fuse", 0, opts) == 0, "mount fuse_short");
-    pthread_t th;
-    CHECK(pthread_create(&th, NULL, fuse_short_daemon, &ctx) == 0, "spawn fuse short daemon");
+    struct fuse_ctx ctx = {.file_size = 16 * 4096, .max_reply = 2 * 4096};
+    pthread_t th = mount_test_fuse("/tmp/fuse_short", &ctx);
 
     int fd = open("/tmp/fuse_short/data", O_RDONLY);
     CHECK(fd >= 0, "open fuse data");
@@ -796,7 +811,7 @@ static void test_fuse_short_read_mapping(void)
     munmap(m, 16 * 4096);
     CHECK(umount2("/tmp/fuse_short", 0) == 0, "umount fuse_short");
     pthread_join(th, NULL);
-    close(devfd);
+    close(ctx.devfd);
     rmdir("/tmp/fuse_short");
 }
 
@@ -1077,6 +1092,7 @@ int main(int argc, char **argv)
     test_access_noexec();
     test_tmpfs_unlinked_open_accounting();
     test_mount_busy_and_force_cap(argv[0]);
+    test_force_unmount_busy_fuse();
     test_mount_collection_and_open_tree_propagation();
     test_mremap_shm_vdso_and_shmat_min_addr();
     test_pagemap_cow_lent_not_exclusive();

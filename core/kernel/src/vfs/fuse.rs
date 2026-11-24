@@ -539,14 +539,21 @@ enum ReqState {
 }
 
 /// The wake object of a connection's readers (daemon threads reading the device, poll on it).
-fn readers(conn: &Rc<RefCell<Conn>>) -> wake::Object {
-    wake::of(&**conn)
+fn readers(conn: &RefCell<Conn>) -> wake::Object {
+    wake::of(conn)
 }
+
+const ANSWER_OFFSET: usize = 1;
 
 /// The wake object of the threads waiting for answers (and for INIT): an address inside the
 /// connection, different from [`readers`].
-fn answers(conn: &Rc<RefCell<Conn>>) -> wake::Object {
-    wake::of(&**conn) + 1
+fn answers(conn: &RefCell<Conn>) -> wake::Object {
+    readers(conn) + ANSWER_OFFSET
+}
+
+fn wake_connection(readers: wake::Object) {
+    request_wake_object(readers);
+    request_wake_object(readers + ANSWER_OFFSET);
 }
 
 impl Conn {
@@ -680,6 +687,7 @@ impl Conn {
             }
             true
         });
+        wake_connection(wake::of_value(self));
     }
 
     /// The next forget message for a read of `len` bytes (6.1's `fuse_read_forget`): one
@@ -1036,7 +1044,7 @@ impl DevFile {
 
     /// The object poll and epoll wait on.
     pub fn object(&self) -> Option<wake::Object> {
-        self.conn.as_ref().map(readers)
+        self.conn.as_deref().map(readers)
     }
 }
 
@@ -1053,9 +1061,6 @@ impl Drop for DevFile {
         c.devs = c.devs.saturating_sub(1);
         if c.devs == 0 {
             c.abort();
-            drop(c);
-            request_wake_object(readers(&conn));
-            request_wake_object(answers(&conn));
         }
     }
 }
@@ -1438,9 +1443,9 @@ impl Fuses {
         if let Some(conn) = self.conns.remove(&dev) {
             if let Ok(mut c) = conn.try_borrow_mut() {
                 c.abort();
+            } else {
+                wake_connection(readers(&conn));
             }
-            request_wake_object(readers(&conn));
-            request_wake_object(answers(&conn));
         }
         self.nodes.retain(|_, n| n.dev != dev);
         self.by_nodeid.retain(|&(d, _), _| d != dev);

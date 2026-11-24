@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: enforce mount_setattr anon-child check, release open_tree anon ns on attach, clear MNT_EXPIRE on mount access, implement MOVE_MOUNT_SET_GROUP)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: abort the FUSE connection before checking whether a forced unmount can remove the mount)
 
 ## Responsibilities
 
@@ -259,8 +259,9 @@ Outside the module:
   `MNT_DETACH` or on the caller's root `EINVAL`, busy `EBUSY`, otherwise marks via `set_expiring`
   then `EAGAIN`; normal path lookup/access clears the mark via `Vfs::touch_mount`, and copies of a
   mount start unmarked, as Linux's `clone_mnt` leaves them); the tree root `EBUSY` (`EINVAL` with `MNT_DETACH`); `MNT_FORCE` needs `CAP_SYS_ADMIN` in
-  the initial user namespace (`EPERM`, 6.1's `can_umount`) and otherwise has no extra effect;
-  without `MNT_DETACH`, the caller's root or a busy mount `EBUSY` (busy means submounts, task
+  the initial user namespace (`EPERM`, 6.1's `can_umount`). After validating the flags and mount,
+  it aborts a FUSE mount's connection before checking whether the mount is busy.
+  Without `MNT_DETACH`, the caller's root or a busy mount gives `EBUSY` (busy means submounts, task
   roots/cwds, nodes of open fds, fds opened through an mqueue mount, pinned PTYs, mappings via
   `Vma::mnt`, and running executables via `ExeFile::mnt` — not `mq_open` pseudo fds, sockets, or
   loop devices' backing files). `MNT_DETACH` moves the subtree to the detached list, where nodes
@@ -346,7 +347,7 @@ Outside the module:
   - `Kernel::mount_max`;
   - every task's root and cwd (`in_use`, pivot_root's rewrite).
 - `kernel/cred`: `capable_wrt` over namespace owners, and `CAP_SYS_ADMIN`/`CAP_SYS_CHROOT`.
-- `kernel/fuse`: FUSE mount options and connections, and their abort at collection.
+- `kernel/fuse`: FUSE mount options and connections, including abort on forced unmount and at collection.
 - `kernel/ipc`: the IPC namespace that an mqueue mount shows.
 
 ## Invariants and gotchas
@@ -400,7 +401,6 @@ Outside the module:
   and `propagation_targets` checks each target with `is_under`, which scans the table at each
   step.
 - **Mount fidelity gaps:**
-  - `umount2` with `MNT_FORCE` does nothing beyond its `CAP_SYS_ADMIN` check (no FUSE abort);
   - `walk_at` lifts the source of open_tree, move_mount and mount_setattr reached without a lookup
     (an `AT_EMPTY_PATH` fd, `.`, `/`), where 6.1's `user_path_at` stays on the mount it has;
   - an open_tree clone of `/proc/<pid>/ns/*` is a procfs mount pinning nothing, not an nsfs mount

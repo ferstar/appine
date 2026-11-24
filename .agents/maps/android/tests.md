@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: exercise cancellation with an unresponsive provider and enable file access in the notification fixture)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: check that surrounding-text deletion preserves active IME composition)
 
 ## Responsibilities
 
@@ -71,8 +71,8 @@ debug variant, manifest and network-security configuration belong to `android/bu
   It checks confirmation and cancellation, no delayed replay, bracketed paste and its terminator,
   ordinary Chinese composition/Enter, trailing-newline removal without trimming other
   whitespace (including unsafe/empty remainders and changed terminal modes), stale clicks on
-  either paste action after a session switch, composing
-  `deleteSurroundingText`/`InCodePoints` preedit updates, `attach(null)` preedit/blink cleanup,
+  either paste action after a session switch, preservation of preedit through both surrounding-text
+  deletion methods until `finishComposingText` sends it to the terminal, `attach(null)` preedit/blink cleanup,
   mode 1004 focus events preserving scrolled-back viewports, `VtSession.reset` progress/status
   clearing, and `VtSession` queued-write cancellation on hangup. A guest printf drives the real
   console pump to check status and progress on both sides of a primary prompt or command end,
@@ -163,8 +163,7 @@ debug variant, manifest and network-security configuration belong to `android/bu
 
 ## Confirmed bugs / technical debt
 
-- On API 34, `composingDeleteSurroundingTextUpdatesPreedit` observes `abc` after
-  `deleteSurroundingText(1, 0)` on the composing text `abc`. The test expects `ab`.
+None.
 
 ## Open questions
 
