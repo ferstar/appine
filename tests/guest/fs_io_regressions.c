@@ -41,6 +41,7 @@
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/sendfile.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
@@ -1280,18 +1281,18 @@ static void on_xfsz(int sig)
     got_xfsz = 1;
 }
 
-static void check_pipe_flock_listing(int fd)
+static void check_flock_listing(int fd)
 {
     char path[64], info[1024], id[96];
     struct stat st;
-    CHECK(fstat(fd, &st) == 0, "stat locked pipe");
+    CHECK(fstat(fd, &st) == 0, "stat locked file");
     snprintf(id, sizeof(id), "FLOCK  ADVISORY  WRITE %d %02x:%02x:%llu 0 EOF",
              getpid(), major(st.st_dev), minor(st.st_dev), (unsigned long long)st.st_ino);
     snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
     read_proc_str(path, info, sizeof(info));
-    CHECK(strstr(info, id) != NULL, "locked pipe in fdinfo: %s", info);
+    CHECK(strstr(info, id) != NULL, "lock in fdinfo: %s", info);
     read_proc_str("/proc/locks", info, sizeof(info));
-    CHECK(strstr(info, id) != NULL, "locked pipe in /proc/locks: %s", info);
+    CHECK(strstr(info, id) != NULL, "lock in /proc/locks: %s", info);
 }
 
 static void test_pipe_flock(void)
@@ -1308,7 +1309,7 @@ static void test_pipe_flock(void)
     CHECK(flock(p[1], LOCK_SH | LOCK_NB) < 0 && errno == EWOULDBLOCK,
           "dup must keep exclusive lock alive");
 
-    check_pipe_flock_listing(alias);
+    check_flock_listing(alias);
 
     CHECK(flock(alias, LOCK_SH | LOCK_NB) == 0, "downgrade to shared lock");
     CHECK(flock(p[1], LOCK_SH | LOCK_NB) == 0, "share lock with write end");
@@ -1322,6 +1323,84 @@ static void test_pipe_flock(void)
     close(p[1]);
     close(other[0]);
     close(other[1]);
+}
+
+/* POSIX and OFD locks conflict even in one process. Closing any descriptor for the inode
+ * drops the process's POSIX locks. The peer can be the opposite end of an anonymous pipe. */
+static void check_record_lock(int writer, int reader)
+{
+    int alias = dup(reader);
+    CHECK(alias >= 0, "duplicate descriptor for lock close");
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 3, .l_len = 7};
+    CHECK(fcntl(writer, F_SETLK, &lock) == 0, "set POSIX lock");
+    lock.l_type = F_RDLCK;
+    CHECK(fcntl(reader, F_OFD_GETLK, &lock) == 0 && lock.l_type == F_WRLCK &&
+          lock.l_pid == getpid() && lock.l_start == 3 && lock.l_len == 7, "query conflicting lock");
+    lock.l_type = F_RDLCK;
+    lock.l_pid = 0;
+    CHECK(fcntl(reader, F_OFD_SETLK, &lock) < 0 && errno == EAGAIN, "OFD lock must conflict");
+    close(alias);
+    CHECK(fcntl(reader, F_OFD_SETLK, &lock) == 0, "close releases POSIX lock");
+    lock.l_type = F_UNLCK;
+    CHECK(fcntl(reader, F_OFD_SETLK, &lock) == 0, "unlock OFD lock");
+}
+
+static void test_anonymous_locks(void)
+{
+    int p[2], socks[2];
+    CHECK(pipe(p) == 0, "create pipe for record locks");
+    check_record_lock(p[1], p[0]);
+    close(p[0]);
+    close(p[1]);
+
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, socks) == 0, "socket pair for locks");
+    check_record_lock(socks[0], socks[0]);
+    CHECK(flock(socks[0], LOCK_EX | LOCK_NB) == 0 && flock(socks[1], LOCK_EX | LOCK_NB) == 0,
+          "socket pair ends lock independently");
+    check_flock_listing(socks[0]);
+    close(socks[0]);
+    close(socks[1]);
+
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    int other = posix_openpt(O_RDWR | O_NOCTTY);
+    CHECK(master >= 0 && other >= 0 && unlockpt(master) == 0, "open two PTY masters");
+    CHECK(flock(master, LOCK_EX | LOCK_NB) == 0, "lock master");
+    CHECK(flock(other, LOCK_EX | LOCK_NB) < 0 && errno == EWOULDBLOCK, "same ptmx inode");
+    check_record_lock(master, other);
+    int slave = open(ptsname(master), O_RDWR | O_NOCTTY);
+    int again = open(ptsname(master), O_RDWR | O_NOCTTY);
+    CHECK(slave >= 0 && again >= 0, "open same slave twice");
+    CHECK(flock(slave, LOCK_EX | LOCK_NB) == 0, "slave independent of master");
+    CHECK(flock(again, LOCK_EX | LOCK_NB) < 0 && errno == EWOULDBLOCK, "same slave inode");
+    int pathfd = open(ptsname(master), O_PATH);
+    CHECK(pathfd >= 0, "open slave O_PATH");
+    struct flock record = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    CHECK(fcntl(slave, F_SETLK, &record) == 0, "lock before O_PATH close");
+    close(pathfd);
+    CHECK(fcntl(again, F_OFD_GETLK, &record) == 0 && record.l_type == F_WRLCK,
+          "O_PATH close keeps the POSIX lock");
+    record.l_type = F_UNLCK;
+    CHECK(fcntl(slave, F_SETLK, &record) == 0, "unlock slave record");
+    check_record_lock(slave, again);
+    check_flock_listing(slave);
+
+    /* A character device node can open the same terminal through a different inode. */
+    struct stat st;
+    const char *alias_path = "/tmp/pty-lock-alias";
+    CHECK(fstat(slave, &st) == 0 && mknod(alias_path, S_IFCHR | 0600, st.st_rdev) == 0,
+          "create slave device alias");
+    int alias = open(alias_path, O_RDWR | O_NOCTTY);
+    int same_alias = open(alias_path, O_RDWR | O_NOCTTY);
+    CHECK(alias >= 0 && same_alias >= 0, "open slave through store inode");
+    CHECK(flock(alias, LOCK_EX | LOCK_NB) == 0, "device alias lock independent of devpts");
+    CHECK(flock(same_alias, LOCK_EX | LOCK_NB) < 0 && errno == EWOULDBLOCK, "alias inode conflicts");
+    close(same_alias);
+    close(alias);
+    unlink(alias_path);
+    close(again);
+    close(slave);
+    close(other);
+    close(master);
 }
 
 static void test_pipe_regressions(void)
@@ -1469,6 +1548,7 @@ int main(void)
     test_fuse_inotify_and_sync();
     test_fileio_and_files();
     test_pipe_flock();
+    test_anonymous_locks();
     test_pipe_regressions();
 
     printf("all ok\n");

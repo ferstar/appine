@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: anonymous pipe flock identity, conversion and lock listings)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared lock identities and ownership for pipes, sockets and PTYs)
 
 ## Responsibilities
 
@@ -30,7 +30,7 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
 - `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, ranges, taker's pid, waiters),
   `FlockHolder`, `Lease` (with its setter's pid); leases are registered by inode in
   `Kernel::leases`.
-- `Flocks` maps a `FlockKey` (node or anonymous pipe) to its open-file holders.
+- `Flocks` and the record-lock table use the same `LockKey` for filesystem nodes, pipes, sockets and devpts inodes.
 - `FdTable::holds_locks`, and lock ownership in `OpenFile` (`kernel/files`).
 
 ## Public entry points
@@ -50,8 +50,11 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
   regular files so leases survive copy-up and break before copy-up on write opens and truncations,
   or the store inode otherwise (FUSE files `EINVAL`). The host
   `flock` is used only by the store itself. `flock` and fcntl locks are separate tables.
-- `flock`: the two ends of an anonymous pipe share a pipefs inode key, distinct from filesystem
-  lock keys. Each open file owns its lock, including through dup or fork. Conversion drops the old
+- The ends of an anonymous pipe share one pipefs lock key. A socket has its own sockfs key.
+  PTYs opened through a store or overlay device node use that node's lock key. Direct devpts
+  opens key on the instance and inode, so independent opens of its ptmx conflict, as do
+  independent opens of the same slave. Named FIFOs keep their filesystem keys.
+- `flock`: each open file owns its lock, including through dup or fork. Conversion drops the old
   mode before trying the new one, including on `LOCK_NB` failure (`EAGAIN`). Unlock or the last
   close releases the lock. Dead holders and keys are swept as the table grows. On an `O_PATH` fd
   flock is `EBADF`.
@@ -62,8 +65,9 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
   (`EOVERFLOW` past it), 0 means to the end and beyond, a negative one covers the bytes before the
   start (`EINVAL` below 0). Ranges split and merge; `F_SETLKW` detects deadlocks for POSIX requests
   only (`EDEADLK`; the chain may pass through OFD waiters, which Linux excludes) and waits on the
-  lock channel. Files without a store inode (anonymous pipes, sockets, PTYs, synthetic files,
-  eventfds) succeed silently and `F_GETLK` reports unlocked; named FIFOs lock normally.
+  lock channel. Closing an `O_PATH` descriptor preserves POSIX locks. Files without a lock key
+  (for example eventfds) still succeed silently and `F_GETLK` reports unlocked. The record-lock
+  table reclaims dead owners across keys as it grows.
 - Clone without `CLONE_FILES` copies the slots and resets `holds_locks`; a copied table (also from
   unshare, execve or `CLOSE_RANGE_UNSHARE`) is a new owner of POSIX locks, so an unshared table
   keeps its locks. The last reference to an open file wakes lock waiters when it held locks.
@@ -80,7 +84,7 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
   `LEASE  ACTIVE    `/`LEASE  BREAKING  `, the type (a lease being broken shows its target type),
   the taker's pid (the caller's tgid at flock, F_SETLK or F_SETLEASE; -1 for OFD locks), the device
   and inode fstat shows through the holding open file (the shown inode on overlayfs, the pipefs
-  inode for an anonymous pipe), and the range with an inclusive end (`EOF` from `OFFSET_MAX`)
+  inode for an anonymous pipe, sockfs or PTY fstat identity for those files), and the range with an inclusive end (`EOF` from `OFFSET_MAX`)
   or `0 EOF`. `/proc/locks` numbers lines by
   position, leaving out (numbers included) locks whose pid the reader's procfs cannot see; fdinfo
   numbers from 1 the locks held through that open file, a POSIX lock through the open file of its
@@ -111,8 +115,6 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
 
 ## Confirmed bugs / technical debt
 
-- **Missing locks on anonymous files:** record locks on anonymous pipes, and both `flock` and
-  record locks on sockets and PTYs, can succeed without locking.
 - **Lock listings differ:** `/proc/locks` goes by kind and inode where Linux lists newest first
   (lslocks prints another order) and leaves out `F_SETLKW` waiters (Linux's `->` lines); a POSIX
   lock shows in the fdinfo of its table's lowest fd on the file, not of the open file that took

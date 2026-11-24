@@ -1,5 +1,6 @@
 package io.github.mthli.appine
 
+import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
@@ -15,6 +16,7 @@ import android.view.inputmethod.InputConnection
 import android.view.inspector.WindowInspector
 import android.widget.TextView
 import androidx.core.graphics.createBitmap
+import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -83,6 +85,19 @@ class TerminalInputTest {
     private fun withConnection(test: (InputConnection, Host, Long) -> Unit) =
         withFixture { test(it.connection, it.host, it.tab) }
 
+    private fun <A : Activity> ActivityScenario<A>.await(
+        description: String, timeoutMillis: Long = 60_000, condition: (A) -> Boolean,
+    ) {
+        val deadline = SystemClock.uptimeMillis() + timeoutMillis
+        do {
+            var ready = false
+            onActivity { ready = condition(it) }
+            if (ready) return
+            SystemClock.sleep(25)
+        } while (SystemClock.uptimeMillis() < deadline)
+        throw AssertionError("Timed out waiting for $description")
+    }
+
     private fun withFixture(test: (Fixture) -> Unit) {
         val root = File(context.cacheDir, "terminal-input-test").apply { mkdirs() }
         val tar = File(root, "rootfs.tgz")
@@ -109,13 +124,7 @@ class TerminalInputTest {
                 }
                 try {
                     // Clipboard reads require window focus, which can follow ActivityScenario's resume.
-                    val deadline = SystemClock.uptimeMillis() + 5000
-                    var focused = false
-                    while (!focused && SystemClock.uptimeMillis() < deadline) {
-                        scenario.onActivity { focused = it.hasWindowFocus() }
-                        if (!focused) SystemClock.sleep(20)
-                    }
-                    assertTrue("The test page must have window focus", focused)
+                    scenario.await("the test page to gain window focus", 5000) { it.hasWindowFocus() }
                     test(Fixture(view, connection, host, tab, session, statusChanges, machine, console))
                 } finally {
                     onMain {
@@ -194,6 +203,82 @@ class TerminalInputTest {
                 button(android.R.id.button3)!!.performClick()
             }
             assertEquals("\u001b[200~hello\u001b[201~", host.text())
+        }
+    }
+
+    @Test
+    fun switchingSessionsInvalidatesBothPasteActions() {
+        withFixture { f ->
+            val other = VtSession(2, ConsolePty(f.machine, "", "root"), f.machine, fakeEvents())
+            field(VtSession::class.java, "tab").setLong(other, f.tab)
+            for (action in listOf(android.R.id.button1, android.R.id.button3)) {
+                onMain {
+                    f.view.attach(f.session)
+                    f.connection.commitText("echo hello\n", 1)
+                    assertTrue(hasPreview())
+                    val staleButton = button(action)!!
+                    f.view.attach(other)
+                    // A click already enqueued when a notification switched tabs must also be harmless.
+                    staleButton.performClick()
+                }
+                assertEquals("", f.host.text())
+                onMain { assertFalse(hasPreview()) }
+            }
+        }
+    }
+
+    @Test
+    fun clipboardReadCanAskAgainAfterSwitchAndStop() {
+        ActivityScenario.launch<MainActivity>(Intent(context, MainActivity::class.java)).use { scenario ->
+            val serviceField = field(MainActivity::class.java, "service")
+            fun service(activity: MainActivity) =
+                serviceField.get(activity) as? TerminalService
+            fun select(session: VtSession) {
+                scenario.onActivity {
+                    it.startActivity(Intent(it, MainActivity::class.java).putExtra(MainActivity.EXTRA_TAB, session.id))
+                }
+                scenario.await("tab ${session.id} to gain focus") { it.hasWindowFocus() && service(it)?.current === session }
+            }
+            fun ask(session: VtSession) {
+                session.onClipboardRead('c'.code, 1)
+                scenario.await("the clipboard question for tab ${session.id}") {
+                    val allow = button(android.R.id.button1) as? TextView
+                    allow?.text?.toString().equals(context.getString(R.string.allow), ignoreCase = true)
+                }
+            }
+            scenario.await("the first terminal session") { it.hasWindowFocus() && service(it)?.current != null }
+            lateinit var owner: TerminalService
+            lateinit var original: VtSession
+            lateinit var first: VtSession
+            lateinit var second: VtSession
+            val clipboard = context.getSystemService(ClipboardManager::class.java)
+            val previous = clipboard.primaryClip
+            scenario.onActivity {
+                owner = service(it)!!
+                original = owner.current!!
+                first = owner.createSession()
+                second = owner.createSession()
+                clipboard.setPrimaryClip(ClipData.newPlainText("Test", "clipboard read test"))
+            }
+            try {
+                select(first)
+                ask(first)
+                select(second)
+                ask(second)
+                scenario.moveToState(Lifecycle.State.CREATED)
+                scenario.moveToState(Lifecycle.State.RESUMED)
+                scenario.await("the second tab to resume") { it.hasWindowFocus() && service(it)?.current === second }
+                ask(second)
+                select(first)
+                ask(first)
+            } finally {
+                select(original)
+                scenario.onActivity {
+                    owner.removeSession(first)
+                    owner.removeSession(second)
+                    if (previous == null) clipboard.clearPrimaryClip() else clipboard.setPrimaryClip(previous)
+                }
+            }
         }
     }
 

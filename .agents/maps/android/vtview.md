@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 9 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: stop blink and clear preedit/IME on attach, send mode 1004 focus without scrolling, and sync preedit on composing deletes)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: unsafe paste confirmation lifetime and checks on both actions)
 
 ## Responsibilities
 
@@ -192,7 +192,9 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
   monospace preview (`Context.monospaceMessage` in `Ui.kt`, preserving `TypefaceSpan` through `^1`),
   "Paste as is" and Cancel. A neutral "Drop trailing newlines" action appears only when
   `text.trimEnd('\r', '\n')` is shorter, non-empty, and passes a probe `VtNative.paste(..., false)`;
-  choosing it re-calls `paste(trimmed)` to re-check privacy and current terminal modes.
+  choosing it re-calls `paste(trimmed)` to recheck the terminal modes. Both actions require the
+  original dialog, the requesting session, a live terminal and an unlocked page. Changing or
+  detaching the session dismisses the dialog and invalidates queued clicks.
 - Focus: `onWindowFocusChanged` finishes flings and calls `settle()` if `scrollPx != 0` on focus
   loss, sends non-empty `VtNative.focus(tab, hasWindowFocus)` bytes (encoded via
   `ghostty_focus_encode` into a 16-byte buffer only when mode 1004 is enabled, queried directly by
@@ -291,9 +293,6 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
 - `appine_vt_paste` relies on `vt->replies` being empty before `ghostty_terminal_paste` because
   `vt.rs` drains the whole buffer (maintained by `feed`, `resize` and `promptClick` draining before
   unlocking).
-- The unsafe-paste dialog's "Paste as is" lambda checks `tab != 0L` without re-checking
-  `Privacy.locked` directly (relying on `MainActivity.Host.onInput`'s final privacy gate), whereas
-  "Drop trailing newlines" calls `paste(trimmed)` and re-checks both privacy and terminal modes.
 - When mode 1004 is active, `onWindowFocusChanged` sends focus bytes directly to `host.onInput`
   rather than `send(...)`, preserving `settle()` and any scrolled-back viewport position.
 - With IME shown, a hardware Esc press is consumed by the IME (e.g. Gboard hides itself), so a
@@ -322,8 +321,6 @@ None.
 ## Open questions
 
 - Should showing another tab send focus-out and focus-in (mode 1004) to the two tabs?
-- Should the unsafe-paste dialog capture the requesting session and re-check `Privacy.locked` in
-  its "Paste as is" button before calling `VtNative.paste` and `clearSelection`?
 
 ## To verify
 

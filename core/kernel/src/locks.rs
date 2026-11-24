@@ -1,11 +1,12 @@
 //! flock(2) locks and fcntl(2) record locks (the kernel/locks map).
 //!
 //! Each lock has one owner: a POSIX lock belongs to an fd table
-//! (shared by all threads of one process), and closing any fd in that table that refers to the
+//! (shared by all threads of one process), and closing any non-O_PATH fd in that table referring to the
 //! file releases all of the table's locks on the file. OFD and flock locks belong to an open
 //! file and lapse when its last reference is closed. Record locks of one owner never overlap,
 //! and adjacent ranges of the same type are merged.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::rc::{Rc, Weak};
 
@@ -13,23 +14,43 @@ use crate::cell::RefCell;
 use crate::fd::{FdTable, FileKind, FileRef, OpenFile};
 use crate::kernel::{Kernel, Tid, request_wake_locks};
 use crate::pidns::PidNs;
+use crate::pseudo::{self, PseudoNode};
 use crate::vfs::store::Ino;
 use crate::vfs::{Node, Vfs};
 
-/// Anonymous pipe inodes are allocated independently of store, overlay and FUSE lock keys.
+/// Filesystem, pipefs, sockfs and devpts inodes have independent number spaces.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum FlockKey {
+pub(crate) enum LockKey {
     Node(Ino),
     Pipe(Ino),
+    Socket(Ino),
+    Devpts(u64, Ino),
 }
 
-impl FlockKey {
+impl LockKey {
     pub fn of(file: &OpenFile) -> Option<Self> {
+        // Linux skips POSIX lock removal on close of an O_PATH descriptor.
+        if file.flags & crate::fd::oflags::O_PATH != 0 {
+            return None;
+        }
         if let Some(ino) = file.lock_ino() {
             return Some(Self::Node(ino));
         }
         match &file.kind {
             FileKind::Pipe(end) => Some(Self::Pipe(end.pipe.borrow().ino)),
+            FileKind::Socket(s) => Some(Self::Socket(pseudo::socket_ino(s))),
+            FileKind::Pty(end) => {
+                if let Some(ino) = end.lock_ino {
+                    return Some(Self::Node(ino));
+                }
+                let tty = end.tty.borrow();
+                let node = if end.master {
+                    PseudoNode::PtsPtmx(tty.fs)
+                } else {
+                    PseudoNode::Pts(tty.fs, tty.index)
+                };
+                Some(Self::Devpts(tty.fs, pseudo::ino_of(&node)))
+            }
             _ => None,
         }
     }
@@ -44,26 +65,31 @@ struct FlockHolder {
 
 #[derive(Default)]
 pub(crate) struct Flocks {
-    by_key: std::collections::BTreeMap<FlockKey, Vec<FlockHolder>>,
+    by_key: BTreeMap<LockKey, Vec<FlockHolder>>,
     sweep_at: usize,
 }
 
-impl Flocks {
-    fn sweep_if_needed(&mut self) {
-        // A last close releases the lock through its weak owner. Reclaim old keys even when a
-        // workload keeps locking fresh pipes, whose inode numbers never repeat.
-        if self.by_key.len() >= self.sweep_at.max(256) {
-            self.by_key.retain(|_, holders| {
-                holders.retain(|holder| holder.file.strong_count() > 0);
-                !holders.is_empty()
-            });
-            self.sweep_at = 2 * self.by_key.len();
-        }
+/// Last close can drop a weak owner without revisiting its key. Sweep as the table grows.
+fn sweep_dead<T>(
+    by_key: &mut BTreeMap<LockKey, Vec<T>>,
+    sweep_at: &mut usize,
+    alive: impl Fn(&T) -> bool,
+) {
+    if by_key.len() >= (*sweep_at).max(256) {
+        by_key.retain(|_, locks| {
+            locks.retain(&alive);
+            !locks.is_empty()
+        });
+        *sweep_at = 2 * by_key.len();
     }
+}
 
+impl Flocks {
     /// Returns false if another open file holds a conflicting lock.
-    pub fn try_lock(&mut self, key: FlockKey, file: &FileRef, exclusive: bool, pid: Tid) -> bool {
-        self.sweep_if_needed();
+    pub fn try_lock(&mut self, key: LockKey, file: &FileRef, exclusive: bool, pid: Tid) -> bool {
+        sweep_dead(&mut self.by_key, &mut self.sweep_at, |holder| {
+            holder.file.strong_count() > 0
+        });
         let holders = self.by_key.entry(key).or_default();
         holders.retain(|holder| holder.file.strong_count() > 0);
         let owner = Rc::downgrade(file);
@@ -87,7 +113,7 @@ impl Flocks {
         true
     }
 
-    pub fn unlock(&mut self, key: FlockKey, file: &FileRef) {
+    pub fn unlock(&mut self, key: LockKey, file: &FileRef) {
         let Some(holders) = self.by_key.get_mut(&key) else {
             return;
         };
@@ -155,30 +181,34 @@ impl Lock {
 
 /// What a lock request is waiting for (for deadlock detection).
 pub(crate) struct Waiter {
-    pub ino: Ino,
+    pub key: LockKey,
     pub req: Lock,
 }
 
 /// Record locks on all inodes.
 #[derive(Default)]
 pub(crate) struct Locks {
-    by_ino: std::collections::BTreeMap<Ino, Vec<Lock>>,
+    by_key: BTreeMap<LockKey, Vec<Lock>>,
+    sweep_at: usize,
     /// POSIX lock requests waiting in F_SETLKW.
     waiters: Vec<Waiter>,
 }
 
 impl Locks {
     /// The first lock (in order of start) that conflicts with the request.
-    pub fn conflict(&mut self, ino: Ino, req: &Lock) -> Option<Lock> {
-        let locks = self.by_ino.get_mut(&ino)?;
+    pub fn conflict(&mut self, key: LockKey, req: &Lock) -> Option<Lock> {
+        let locks = self.by_key.get_mut(&key)?;
         locks.retain(|l| l.owner.alive());
         locks.iter().find(|l| l.conflicts(req)).cloned()
     }
 
     /// Sets (or, with `unlock`, removes) the locks in `req`'s range. The caller has already made
     /// sure there is no conflict.
-    pub fn set(&mut self, ino: Ino, req: Lock, unlock: bool) {
-        let locks = self.by_ino.entry(ino).or_default();
+    pub fn set(&mut self, key: LockKey, req: Lock, unlock: bool) {
+        sweep_dead(&mut self.by_key, &mut self.sweep_at, |lock| {
+            lock.owner.alive()
+        });
+        let locks = self.by_key.entry(key).or_default();
         let (mut start, mut end) = (req.start, req.end);
         let mut kept = Vec::with_capacity(locks.len() + 2);
         for l in locks.drain(..).filter(|l| l.owner.alive()) {
@@ -215,7 +245,7 @@ impl Locks {
         }
         kept.sort_by_key(|l| l.start);
         if kept.is_empty() {
-            self.by_ino.remove(&ino);
+            self.by_key.remove(&key);
         } else {
             *locks = kept;
         }
@@ -225,11 +255,11 @@ impl Locks {
     /// Whether waiting for `req` would deadlock: follow "whose lock blocks the waiting request"
     /// along the chain; coming back to ourselves is a deadlock (`posix_locks_deadlock`). Checks
     /// POSIX locks only.
-    pub fn deadlock(&mut self, ino: Ino, req: &Lock) -> bool {
+    pub fn deadlock(&mut self, key: LockKey, req: &Lock) -> bool {
         let Owner::Posix(_) = req.owner else {
             return false;
         };
-        let mut blocker = match self.conflict(ino, req) {
+        let mut blocker = match self.conflict(key, req) {
             Some(l) => l.owner,
             None => return false,
         };
@@ -240,8 +270,8 @@ impl Locks {
             let Some(w) = self.waiters.iter().find(|w| w.req.owner.same(&blocker)) else {
                 return false;
             };
-            let (wino, wreq) = (w.ino, w.req.clone());
-            match self.conflict(wino, &wreq) {
+            let (key, request) = (w.key, w.req.clone());
+            match self.conflict(key, &request) {
                 Some(l) => blocker = l.owner,
                 None => return false,
             }
@@ -262,17 +292,17 @@ impl Locks {
     pub fn closed(&mut self, fds: &Rc<RefCell<FdTable>>, files: &[FileRef]) {
         let owner = Owner::Posix(Rc::downgrade(fds));
         for file in files {
-            let Some(ino) = file.borrow().lock_ino() else {
+            let Some(key) = LockKey::of(&file.borrow()) else {
                 continue;
             };
-            if let Some(locks) = self.by_ino.get_mut(&ino) {
+            if let Some(locks) = self.by_key.get_mut(&key) {
                 let before = locks.len();
                 locks.retain(|l| !l.owner.same(&owner) && l.owner.alive());
                 if locks.len() != before {
                     request_wake_locks();
                 }
                 if locks.is_empty() {
-                    self.by_ino.remove(&ino);
+                    self.by_key.remove(&key);
                 }
             }
         }
@@ -325,7 +355,7 @@ pub(crate) fn fd_locks(
     fds: &Rc<RefCell<FdTable>>,
     file: &FileRef,
 ) -> String {
-    let Some(key) = FlockKey::of(&file.borrow()) else {
+    let Some(key) = LockKey::of(&file.borrow()) else {
         return String::new();
     };
     let mut out = String::new();
@@ -387,8 +417,8 @@ impl Shown {
 
 /// Every lock and lease (only those on `only` when given), in the order Linux keeps an inode's:
 /// flock locks, then POSIX and OFD locks, then leases.
-fn shown(k: &Kernel, only: Option<FlockKey>) -> Vec<Shown> {
-    let wanted = |ino: &Ino| only.is_none_or(|o| o == FlockKey::Node(*ino));
+fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
+    let wanted = |ino: &Ino| only.is_none_or(|o| o == LockKey::Node(*ino));
     let mut out = Vec::new();
     for (key, holders) in &k.flocks.by_key {
         if only.is_some_and(|o| o != *key) {
@@ -407,9 +437,12 @@ fn shown(k: &Kernel, only: Option<FlockKey>) -> Vec<Shown> {
             }
         }
     }
-    for (&ino, locks) in k.locks.by_ino.iter().filter(|(i, _)| wanted(i)) {
+    for (&key, locks) in &k.locks.by_key {
+        if only.is_some_and(|o| o != key) {
+            continue;
+        }
         for l in locks.iter().filter(|l| l.owner.alive()) {
-            let Some(file) = l.owner.file(ino) else {
+            let Some(file) = l.owner.file(key) else {
                 continue;
             };
             // Linux's inclusive end, OFFSET_MAX meaning to the end
@@ -457,9 +490,9 @@ fn shown(k: &Kernel, only: Option<FlockKey>) -> Vec<Shown> {
 }
 
 impl Owner {
-    /// An open file the lock on `ino` is held through: an OFD lock's own, or for a POSIX lock one
+    /// An open file the lock on `key` is held through: an OFD lock's own, or for a POSIX lock one
     /// in its fd table that refers to the file (any close of which would release the lock).
-    fn file(&self, ino: Ino) -> Option<FileRef> {
+    fn file(&self, key: LockKey) -> Option<FileRef> {
         match self {
             Owner::Ofd(f) => f.upgrade(),
             Owner::Posix(t) => {
@@ -468,7 +501,7 @@ impl Owner {
                 t.open_fds()
                     .into_iter()
                     .filter_map(|fd| t.get(fd).ok())
-                    .find(|f| f.borrow().lock_ino() == Some(ino))
+                    .find(|f| LockKey::of(&f.borrow()) == Some(key))
             }
         }
     }
@@ -481,6 +514,9 @@ fn shown_id(vfs: &Vfs, file: &OpenFile) -> Option<(u64, u64)> {
         && end.pipe.borrow().fifo.is_none()
     {
         return Some((crate::pipe::PIPE_DEV, end.pipe.borrow().ino));
+    }
+    if matches!(file.kind, FileKind::Socket(_) | FileKind::Pty(_)) {
+        return Some(crate::syscall::dev_ino(file));
     }
     let node = file.node()?;
     let ino = match &node {
@@ -510,7 +546,7 @@ mod tests {
     }
 
     fn ranges(l: &Locks, ino: Ino) -> Vec<(u64, u64, bool)> {
-        l.by_ino.get(&ino).map_or(Vec::new(), |v| {
+        l.by_key.get(&LockKey::Node(ino)).map_or(Vec::new(), |v| {
             v.iter().map(|l| (l.start, l.end, l.write)).collect()
         })
     }
@@ -523,25 +559,26 @@ mod tests {
         );
         let (oa, ob) = (owner(&a), owner(&b));
         let mut l = Locks::default();
-        l.set(1, lock(&oa, 0, 100, true), false);
+        let key = LockKey::Node(1);
+        l.set(key, lock(&oa, 0, 100, true), false);
         // Turn the middle into a read lock: split into three pieces
-        l.set(1, lock(&oa, 40, 60, false), false);
+        l.set(key, lock(&oa, 40, 60, false), false);
         assert_eq!(
             ranges(&l, 1),
             vec![(0, 40, true), (40, 60, false), (60, 100, true)]
         );
         // Another owner: a read lock does not conflict with read locks but does with write locks
-        assert!(l.conflict(1, &lock(&ob, 45, 50, false)).is_none());
-        assert_eq!(l.conflict(1, &lock(&ob, 30, 50, false)).unwrap().start, 0);
+        assert!(l.conflict(key, &lock(&ob, 45, 50, false)).is_none());
+        assert_eq!(l.conflict(key, &lock(&ob, 30, 50, false)).unwrap().start, 0);
         // Adjacent locks of the same type merge
-        l.set(1, lock(&oa, 40, 60, true), false);
+        l.set(key, lock(&oa, 40, 60, true), false);
         assert_eq!(ranges(&l, 1), vec![(0, 100, true)]);
         // Unlock a piece in the middle
-        l.set(1, lock(&oa, 10, 20, false), true);
+        l.set(key, lock(&oa, 10, 20, false), true);
         assert_eq!(ranges(&l, 1), vec![(0, 10, true), (20, 100, true)]);
         // The owner goes away, and its locks lapse with it
         drop(a);
-        assert!(l.conflict(1, &lock(&ob, 0, u64::MAX, true)).is_none());
+        assert!(l.conflict(key, &lock(&ob, 0, u64::MAX, true)).is_none());
     }
 
     #[test]
@@ -552,7 +589,7 @@ mod tests {
             FileKind::Path(crate::vfs::Node::Store(crate::vfs::ROOT_MOUNT, 7)),
             0,
         );
-        l.set(7, lock(&owner(&a), 0, 10, true), false);
+        l.set(LockKey::Node(7), lock(&owner(&a), 0, 10, true), false);
         l.closed(&a, &[file]);
         assert!(ranges(&l, 7).is_empty());
     }
@@ -565,12 +602,13 @@ mod tests {
         );
         let (oa, ob) = (owner(&a), owner(&b));
         let mut l = Locks::default();
-        l.set(1, lock(&oa, 0, 10, true), false);
-        l.set(1, lock(&ob, 10, 20, true), false);
+        let key = LockKey::Node(1);
+        l.set(key, lock(&oa, 0, 10, true), false);
+        l.set(key, lock(&ob, 10, 20, true), false);
         // a is waiting for b's lock; b then waiting for a's lock is a deadlock
         let wait = lock(&oa, 10, 20, true);
-        assert!(!l.deadlock(1, &wait));
-        l.set_waiting(&oa, Some(Waiter { ino: 1, req: wait }));
-        assert!(l.deadlock(1, &lock(&ob, 0, 10, true)));
+        assert!(!l.deadlock(key, &wait));
+        l.set_waiting(&oa, Some(Waiter { key, req: wait }));
+        assert!(l.deadlock(key, &lock(&ob, 0, 10, true)));
     }
 }

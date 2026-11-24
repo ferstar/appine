@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: move mirror selection into rootfs preparation)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: routing clipboard requests by session ID and answering unhandled reads)
 
 ## Responsibilities
 
@@ -44,7 +44,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   the service itself.
 - `Listener` — UI callbacks with no-op defaults, always on the main thread: `onProgress`,
   `onMachineReady(error)`, `onSessionsChanged`, `onBell` (haptics for a bell or program notification
-  in the tab in front), `onClipboardRead`
+  in the tab in front), `onClipboardRead(sessionId)`
   (a program in the tab in front, the current one, asks to read the clipboard), `onTabStatus` (a
   tab's progress or program status changed), `onSettingsChanged`,
   `onOpenUrl` (guest browser request; true acknowledges Android accepted it), `onNotice`, `onRestarting`, `onExitAll` (sessions redraw their view themselves). Activities
@@ -328,8 +328,9 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   (the program was killed or stopped waiting) takes its notification away, unless a bell or a
   program's notification has replaced it since. A clipboard write sets the clipboard from any tab
   (labelled Appine), or clears it; before Android 13, which shows copies itself, a toast says a
-  program copied text. A clipboard read (OSC 52) from the tab in front goes to the listeners'
-  `onClipboardRead`, where the terminal Activity asks the user; from any other tab it is answered
+  program copied text. A clipboard read (OSC 52) from the tab in front goes to the
+  first `onClipboardRead(sessionId)` handler that accepts it. With no matching listener, or for
+  any other tab, it is answered
   at once with an empty clipboard (`VtSession.answerClipboardRead(null)`): Android lets an app
   read the clipboard only while it has the focus, and the program would otherwise wait for a
   timeout.

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: clamp slave output expansion, fix TIOCSCTTY leader check, TIOCSPGRP error codes/order, and EIO on ended console writes)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: retaining opened device-node lock keys on PTY ends)
 
 ## Responsibilities
 
@@ -45,7 +45,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - `Echo` — one echo operation of Linux's echo buffer: a character through output processing, a
   `^X` pair, backspaces over an erased tab, setting the line's start column, one column back.
 - `PtyEnd` — one open end: the `Tty`, master flag, mount, `pin` (keeps the devpts mount busy),
-  `born` (the side's vhangup generation at open). Opening and dropping it maintain the counts (and
+  the optional store or overlay device-node lock key, and `born` (the side's vhangup generation at open). Opening and dropping it maintain the counts (and
   opening a slave re-arms the slave side's vhangup); dropping the last master queues the terminal
   on `CLOSED`, and every drop wakes the terminal's waiters.
 - `Termios` — kernel termios2 layout (four flag words, line, 19 control characters, input and

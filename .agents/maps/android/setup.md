@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: select package sources in the private import before store publication)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: pinned Alpine inventory shared with Gradle and release-sources)
 
 ## Responsibilities
 
@@ -79,6 +79,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - Accounts: `loginAccount`, `regularAccounts`, `LoginRules.poll` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
   packages into `target/rootfs` by default; prints each package's path, then the tarball's last).
+  `--assets` lists their pinned filenames, SHA-256 digests and APK destinations offline.
 - `login.sh` arguments: login setting (`auto`, `root` or an account name) and an optional start
   directory; or `--refresh-rules`.
 
@@ -92,10 +93,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   the ncurses dependencies; also bubblewrap and libcap2, openrc, openrc-user, ifupdown-ng and bridge; apk checks signatures at install) and, unless a copy with the
   pinned sha256 is already there, the minirootfs: its GPG signature is
   checked when both gpg and gpgv are installed (a failed signature download counts as bad; without
-  gpg a warning), then its pinned sha256. Gradle bundles the newest fetched files by version
-  (`BuildConfig.ALPINE_BRANCH` is taken from the name, `edge` without one) as `rootfs.tgz`,
-  `doas.apk`, `{bash,procps,bubblewrap,openrc}/<file name>` without checking them again, and fails without them; `prepare`
-  copies the tarball asset to the cache.
+  gpg a warning), then its pinned sha256. Gradle verifies the inputs named by `--assets` and bundles
+  them as `rootfs.tgz`, `doas.apk` and `{bash,procps,bubblewrap,openrc}/<file name>`.
+  `BuildConfig.ALPINE_BRANCH` comes from the pinned tarball name. `prepare` copies the tarball asset to the cache.
 - Debian (`download`): a cached `cacheDir/<distro>.tar.gz` with the pinned length and sha256 is
   reused; else `fetch` tries the sources in order (probed by speed when there are several; Debian
   has one), checking for cancellation before each, moving to the next on any error but a cancel,

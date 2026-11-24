@@ -37,7 +37,7 @@ mod xattr;
 
 pub(crate) use aio::{AioContext, check_polls as check_aio_polls, released as aio_released};
 pub(crate) use fs::ENTROPY;
-pub(crate) use fs::{close_replaced, create_exclusive, unlink_path, write_at};
+pub(crate) use fs::{close_replaced, create_exclusive, dev_ino, unlink_path, write_at};
 pub(crate) use inotify::{Inotify, Opened, Registry, host_change, kernfs_modified};
 pub(crate) use lease::Lease;
 pub(crate) use loopdev::{LoopOpen, Loops};

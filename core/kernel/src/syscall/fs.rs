@@ -20,7 +20,7 @@ use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
 use crate::kernel::{Cx, Kernel, Tid, request_wake_locks, request_wake_object, wake};
-use crate::locks::{self, FlockKey, Lock, Owner, Waiter};
+use crate::locks::{self, Lock, LockKey, Owner, Waiter};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, PIPE_DEV, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
 use crate::pseudo::{self, PseudoNode};
@@ -1274,9 +1274,7 @@ impl<'a> StoreOpen<'a> {
     }
 }
 
-/// Opens a store inode reached through mount `mnt`. When opened through an overlay, `lease_ino`
-/// is the overlay node's key so leases are broken on the overlay identity rather than the layer
-/// inode.
+/// Opens a store inode reached through mount `mnt`.
 fn open_store(
     cx: &mut Cx<'_>,
     cred: &Cred,
@@ -1288,6 +1286,7 @@ fn open_store(
     open_store_with(cx, cred, vfs, (mnt, ino), flags, how, ino)
 }
 
+/// An overlay open supplies its own inode key for leases and PTY device-node locks.
 fn open_store_with(
     cx: &mut Cx<'_>,
     cred: &Cred,
@@ -1295,7 +1294,7 @@ fn open_store_with(
     (mnt, ino): (MountId, Ino),
     flags: u32,
     how: StoreOpen<'_>,
-    lease_ino: Ino,
+    lock_ino: Ino,
 ) -> Result<FileKind, Errno> {
     let (created, beside, check, memfd) = match how {
         StoreOpen::Found(beside) => (None, beside, true, false),
@@ -1363,7 +1362,7 @@ fn open_store_with(
     if flags & oflags::O_DIRECT != 0 && !direct_io() && !direct_open_is_eisdir(&st, flags) {
         return Err(Errno::EINVAL);
     }
-    Ok(match st.kind() {
+    let mut kind = match st.kind() {
         mode::S_IFLNK => return Err(Errno::ELOOP),
         mode::S_IFDIR => {
             if accmode != oflags::O_RDONLY || flags & (oflags::O_CREAT | oflags::O_TRUNC) != 0 {
@@ -1386,7 +1385,7 @@ fn open_store_with(
             // only with write leases
             if check {
                 let nonblock = flags & oflags::O_NONBLOCK != 0;
-                super::lease::break_leases(cx, lease_ino, write, nonblock, None)?;
+                super::lease::break_leases(cx, lock_ino, write, nonblock, None)?;
             }
             // A held file shares its object: truncating it first gives it an empty one of its
             // own; otherwise a description opened for writing gets a read-only handle on the
@@ -1464,7 +1463,11 @@ fn open_store_with(
         mode::S_IFIFO => open_fifo(cx, ino, flags)?,
         // Socket files cannot be opened (they use connect)
         _ => return Err(Errno::ENXIO),
-    })
+    };
+    if let FileKind::Pty(end) = &mut kind {
+        end.lock_ino = Some(lock_ino);
+    }
+    Ok(kind)
 }
 
 /// Opens overlay node `o` reached through mount `mnt` (Linux's `ovl_open`): the store inode
@@ -2041,13 +2044,13 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
     if !matches!(whence as u32, SEEK_SET | SEEK_CUR | SEEK_END) {
         return Err(Errno::EINVAL);
     }
-    let (ino, start, end) = {
+    let (key, start, end) = {
         let f = file.borrow();
         if !getlk && !unlock && !(if write { f.writable() } else { f.readable() }) {
             return Err(Errno::EBADF);
         }
-        let Some(ino) = f.lock_ino() else {
-            // Files not in the store (pipes, sockets): other processes cannot see their locks
+        let Some(key) = LockKey::of(&f) else {
+            // This file kind has no lock identity.
             if getlk {
                 b[..2].copy_from_slice(&F_UNLCK.to_le_bytes());
                 put(cx, arg, b)?;
@@ -2096,7 +2099,7 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
         } else {
             last as u64 + 1
         };
-        (ino, start as u64, end)
+        (key, start as u64, end)
     };
     let owner = if ofd {
         file.borrow_mut().holds_locks = true;
@@ -2114,7 +2117,7 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
     };
     if getlk {
         // With no conflict only l_type is changed to F_UNLCK; the other fields stay
-        match cx.k().locks.conflict(ino, &req) {
+        match cx.k().locks.conflict(key, &req) {
             None => b[..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
             Some(l) => {
                 let ty = if l.write { F_WRLCK } else { F_RDLCK };
@@ -2137,22 +2140,22 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
     }
     loop {
         let locks = &mut cx.k().locks;
-        if unlock || locks.conflict(ino, &req).is_none() {
+        if unlock || locks.conflict(key, &req).is_none() {
             locks.set_waiting(&req.owner, None);
-            locks.set(ino, req, unlock);
+            locks.set(key, req, unlock);
             return Ok(0);
         }
         if matches!(cmd, F_SETLK | F_OFD_SETLK) {
             return Err(Errno::EAGAIN);
         }
-        if locks.deadlock(ino, &req) {
+        if locks.deadlock(key, &req) {
             locks.set_waiting(&req.owner, None);
             return Err(Errno::EDEADLK);
         }
         locks.set_waiting(
             &req.owner,
             Some(Waiter {
-                ino,
+                key,
                 req: req.clone(),
             }),
         );
@@ -2193,7 +2196,7 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     if file.borrow().flags & oflags::O_PATH != 0 {
         return Err(Errno::EBADF);
     }
-    let Some(key) = FlockKey::of(&file.borrow()) else {
+    let Some(key) = LockKey::of(&file.borrow()) else {
         return Ok(0);
     };
     let exclusive = match op & !LOCK_NB {
@@ -6555,6 +6558,11 @@ pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
         (_, Some(Node::Store(_, ino))) => (ROOT_DEV, ino),
         (FileKind::Pipe(end), None) => (PIPE_DEV, end.pipe.borrow().ino),
         (FileKind::Socket(s), _) => (SOCK_DEV, pseudo::socket_ino(s)),
+        (FileKind::Pty(end), _) if end.master => (ROOT_DEV, 2),
+        (FileKind::Pty(end), _) => {
+            let t = end.tty.borrow();
+            (t.fs, pseudo::ino_of(&PseudoNode::Pts(t.fs, t.index)))
+        }
         (_, Some(Node::Pseudo(_, p))) => (pseudo::fs_of(&p).dev(), pseudo::ino_of(&p)),
         _ => (ANON_DEV, 1),
     }

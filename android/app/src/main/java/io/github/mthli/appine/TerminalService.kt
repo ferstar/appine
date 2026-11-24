@@ -141,10 +141,9 @@ class TerminalService : Service() {
 
         /**
          * A program in the tab in front ([inFront], so the current one) asks to read the clipboard
-         * (OSC 52): the listener asks the user and answers through
-         * [VtSession.answerClipboardRead].
+         * (OSC 52). Return true if handling the request for [sessionId], including an empty answer.
          */
-        fun onClipboardRead() {}
+        fun onClipboardRead(sessionId: Int): Boolean = false
 
         /** A guest requests a browser; true means Android accepted the launch. */
         fun onOpenUrl(url: String): Boolean = false
@@ -420,7 +419,9 @@ class TerminalService : Service() {
          * would otherwise wait for a timeout.
          */
         override fun onClipboardRead(session: VtSession) {
-            if (inFront(session)) each { it.onClipboardRead() } else session.answerClipboardRead(null)
+            if (!inFront(session) || listeners.toList().none { it.onClipboardRead(session.id) }) {
+                session.answerClipboardRead(null)
+            }
         }
 
         override fun onStatusChanged(session: VtSession) {

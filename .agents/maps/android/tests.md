@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: cover import-time mirror selection and guest ownership of package sources)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: paste confirmation and OSC 52 regressions across session and activity changes)
 
 ## Responsibilities
 
@@ -69,7 +69,8 @@ debug variant, manifest and network-security configuration belong to `android/bu
   capturing view host to exercise IME replacement/commit/composition and clipboard menu callbacks.
   It checks confirmation and cancellation, no delayed replay, bracketed paste and its terminator,
   ordinary Chinese composition/Enter, trailing-newline removal without trimming other
-  whitespace (including unsafe/empty remainders and changed terminal modes), composing
+  whitespace (including unsafe/empty remainders and changed terminal modes), stale clicks on
+  either paste action after a session switch, composing
   `deleteSurroundingText`/`InCodePoints` preedit updates, `attach(null)` preedit/blink cleanup,
   mode 1004 focus events preserving scrolled-back viewports, `VtSession.reset` progress/status
   clearing, and `VtSession` queued-write cancellation on hangup. A guest printf drives the real
@@ -77,7 +78,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
   including continuation prompts and retention of done and error records. A session test checks
   that a queued foreground change preserves the next program's reports. The
   `screenshots=true` runner argument saves `cache/paste-preview.png` for visual inspection of
-  the terminal-themed dialog; the tests do not drive Gboard's UI.
+  the terminal-themed dialog; the tests do not drive Gboard's UI. A MainActivity case opens
+  two temporary service sessions and checks that OSC 52 can ask again after a notification
+  switches tabs and after the activity stops and resumes.
 - `PrivacyTest` covers default-off/mutually exclusive file access, cold and recreated locked pages, pause-only visibility versus stop-and-return locking, secure dialog flags, non-exported action targets, service/broadcast/activity routing and locked-report clipboard denial without an authentication bypass. `MachineTest.documentsShowTheHomeDirectory` also checks every provider denial with privacy on and a stale true file-access preference.
 - `BrowserTest` imports separate temporary stores and checks custom launcher preservation,
   launching without a TTY or stdio, root and `su` users, endpoint replacement with a surviving

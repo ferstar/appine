@@ -1603,6 +1603,8 @@ impl Tty {
 /// One end of a PTY, held by an open file; opening and closing maintain the counts of both ends.
 pub struct PtyEnd {
     pub tty: Rc<RefCell<Tty>>,
+    /// The opened device node's lock key. Direct devpts opens use the instance and inode instead.
+    pub(crate) lock_ino: Option<crate::vfs::store::Ino>,
     /// Whether this is the master.
     pub master: bool,
     /// The devpts mount it was opened through (where the terminal's instance is mounted): the
@@ -1635,6 +1637,7 @@ impl PtyEnd {
             master,
             mnt: crate::vfs::PTS_MOUNT,
             pin: false,
+            lock_ino: None,
             born,
         }
     }

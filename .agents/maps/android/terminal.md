@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint link, zoom and gesture references to android/vtgestures)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: settling clipboard questions when changing sessions or stopping)
 
 ## Responsibilities
 
@@ -289,7 +289,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - A tab's clipboard read reaches the activity through the service (`onClipboardRead`; the queue and
   the answers are `VtSession`'s, android/vt). `MainActivity` reads the clipboard's first item as
   text and, when there is some, asks ("Let the program read the clipboard?", up to 300 characters
-  shown, Allow and Deny), one question at a time, whose answer covers every read queued meanwhile;
+  shown, Allow and Deny). Its answer covers every read queued by that session. Switching tabs or
+  stopping denies the old session's pending reads before another question can open; a delayed
+  dismissal only handles its own dialog. A listener only accepts requests for its current tab;
   an empty clipboard, or one without text, is answered at once (`VtSession.answerClipboardRead`).
 
 ## Dependencies (inbound / outbound)
@@ -362,7 +364,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - No activity handles `density`: every view is sized in dp when built. Settings and the license
   pages also recreate for dark mode (android/setup and android/licenses).
 - The privacy gate is android/privacy's. Keep checks at the final input and clipboard sinks,
-  including delayed IME/paste callbacks; pausing cancels activity toasts and denies the open clipboard
+  including delayed IME/paste callbacks; pausing with privacy mode enabled cancels activity toasts and denies the open clipboard
   question. Dialogs use `showPrivate`, and deferred import results require a resumed unlocked page.
 - An activity the system recreates (a configuration change it does not handle, or after killing
   the app) or that is opened from Recents gets the intent that first started it, so `EXTRA_TAB`
@@ -382,8 +384,6 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - Should a clipboard read from a tab not in front wait until the tab is shown rather than get an
   empty clipboard, and should the question offer to remember the answer for the tab (Ghostty asks
   every time)?
-- Should a clipboard question left open when the activity is destroyed be answered then? Until
-  the tab's queued reads are answered it asks for no later read.
 - Should typing in the search bar select the newest match at once, as Chrome's find bar does,
   rather than wait for a step, as Ghostty does? And should the extra keys act on the search text
   while it has the keyboard, rather than on the terminal?

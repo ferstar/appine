@@ -63,6 +63,10 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     private var service: TerminalService? = null
     private var current: VtSession? = null
+        set(value) {
+            if (field !== value) dismissClipboardQuestion()
+            field = value
+        }
 
     /** [current]'s position when the tabs were last shown, where its successor is taken from. */
     private var currentIndex = 0
@@ -180,12 +184,13 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         closeTabList()
         if (Settings.privacyMode(this)) {
             toast?.cancel()
-            clipboardQuestion?.dismiss()
+            dismissClipboardQuestion()
         }
         super.onPause()
     }
 
     override fun onStop() {
+        dismissClipboardQuestion()
         service?.removeListener(this)
         unbindService(connection)
         service = null
@@ -286,20 +291,21 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
      * or no text) is answered at once. Denying, or leaving the question unanswered, gives the
      * program an empty clipboard.
      */
-    override fun onClipboardRead() {
-        val session = current ?: return
+    override fun onClipboardRead(sessionId: Int): Boolean {
+        val session = current?.takeIf { it.id == sessionId } ?: return false
         if (Privacy.locked(this)) {
             session.answerClipboardRead(null)
-            return
+            return true
         }
-        if (clipboardQuestion != null) return
+        if (clipboardQuestion != null) return true
         val clip = getSystemService(ClipboardManager::class.java).primaryClip?.takeIf { it.itemCount > 0 }
         val text = clip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
         if (text.isEmpty()) {
             session.answerClipboardRead("")
-            return
+            return true
         }
         confirmClipboardRead(session, text)
+        return true
     }
 
     /** A tab's reports changed: refresh the bar, the open list and the progress line. */
@@ -344,7 +350,14 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     // ---- Clipboard and notices ----
 
-    /** Answers the requesting session even if another tab becomes current while the dialog is open. */
+    /** Settle the old session's reads before a switch or stop. A queued dismiss callback is stale. */
+    private fun dismissClipboardQuestion() {
+        val dialog = clipboardQuestion ?: return
+        clipboardQuestion = null
+        current?.answerClipboardRead(null)
+        dialog.dismiss()
+    }
+
     private fun confirmClipboardRead(session: VtSession, text: String) {
         val preview = if (text.length > CLIPBOARD_PREVIEW) text.take(CLIPBOARD_PREVIEW) + "…" else text
         var allowed = false
@@ -353,7 +366,8 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
             .setMessage(getString(R.string.clipboard_read, preview))
             .setPositiveButton(R.string.allow) { _, _ -> allowed = true }
             .setNegativeButton(R.string.deny, null)
-            .setOnDismissListener {
+            .setOnDismissListener { dialog ->
+                if (clipboardQuestion !== dialog) return@setOnDismissListener
                 clipboardQuestion = null
                 session.answerClipboardRead(if (allowed && !Privacy.locked(this)) text else null)
                 // The terminal takes the keyboard again

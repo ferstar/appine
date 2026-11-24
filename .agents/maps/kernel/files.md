@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: default ACL inheritance on file creation)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: store and overlay PTY device-node identity for advisory locks)
 
 ## Responsibilities
 
@@ -210,7 +210,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   1:3/5/7/8/9/11 `kernel/vfs`'s `Device` (`/dev/kmsg`: `EPERM` when devkmsg is off, syslog
   permission to read), 10:237 loop-control and block 7:N (`kernel/loop`), 10:229 `/dev/fuse`
   (`kernel/fuse`), 226:128 render node (`syscall/gpu.rs`); other character devices and block majors
-  `ENXIO`, counted as unimplemented paths.
+  `ENXIO`, counted as unimplemented paths. An opened PTY retains the store or overlay device
+  node's lock identity independently of the terminal it serves.
 - Random-device ioctls follow `random_ioctl` (entropy count fixed at 256; changing ones need
   `CAP_SYS_ADMIN` in the initial namespace). Character-device reads and writes belong to
   `kernel/fileio`.

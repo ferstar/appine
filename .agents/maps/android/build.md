@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: isolate libghostty-vt's Zig build from Appine's Git repository with GIT_CEILING_DIRECTORIES)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: selecting and verifying APK assets from the release inventory)
 
 ## Responsibilities
 
@@ -23,13 +23,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 - Gradle tasks: `CargoNdkTask` (one per variant, `buildRust<Variant>`, owning the workspace,
   process execution and cargo lookup), `RootfsAssetTask` (one `rootfsAsset` shared by all variants);
-  helpers `byVersion` (compares file names by their runs of digits, then by how many runs),
-  `newestFetched` (the newest file in `target/rootfs` whose name matches), `fetchedPackages`
-  (the newest APK for each requested name, null if any is missing), used by `bashPackages`
-  (the newest of bash, readline, libncursesw and ncurses-terminfo-base, null when any is missing)
-  and `procpsPackages` (procps-ng, libproc2, libintl, utmps-libs, skalibs-libs and the two ncurses
-  packages, null when any is missing), `bubblewrapPackages` (bubblewrap and libcap2, null when either
-  is missing), `openrcPackages` (the four new OpenRC packages), and `alpineBranch` (from the tarball's name, `edge` without one).
+  `rootfsAssets` reads the pinned filenames, digests and destinations from `fetch-rootfs --assets`.
+  `alpineBranch` derives the APK's Alpine branch from the pinned tarball name.
 - `BrowserAssetTask` builds the static guest browser client as a generated asset.
 
 ## Public entry points
@@ -88,12 +83,11 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   `androidx.webkit:webkit` 1.18.0, `androidx.recyclerview:recyclerview` 1.2.1 and Material Components 1.14.0 (which
   brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
   1.3.0.
-- Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
-  since AAPT would unpack `.gz`), the newest `doas.apk`, and bash's four packages under `bash/`
+- Assets: the pinned Alpine minirootfs tarball from `target/rootfs` (as `rootfs.tgz`,
+  since AAPT would unpack `.gz`), the pinned doas package as `doas.apk`, and bash's four packages under `bash/`
   with their own file names, plus procps-ng's seven packages under `procps/` (including copies of
   ncurses so either bundle installs independently), bubblewrap/libcap2 under `bubblewrap/`, and OpenRC, openrc-user, ifupdown-ng and bridge under `openrc/`
-  (all by `byVersion`; `rootfsAsset` fails with "run
-  scripts/fetch-rootfs first" when any is missing), checked-in `notices/`, and
+  (`rootfsAsset` rejects a missing input or checksum mismatch and writes the verified bytes), checked-in `notices/`, and
   the terminal font (`fonts/`, `android/vtrender`); `BuildConfig.ALPINE_BRANCH` carries the
   branch.
 - SDK: min 30, compile and target 37; no ABI filter (only `arm64-v8a` is built); uncompressed
@@ -229,13 +223,10 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Confirmed bugs / technical debt
 
-- The release build is signed with the debug key; the Alpine tarball's checksum
-  is checked only in `scripts/fetch-rootfs`.
+- The release build is signed with the debug key.
 - `scripts/fetch-ghostty` checks only the pinned sha256s; the release's minisign signatures are to
   be checked by hand once when upgrading, before pinning the new sha256s.
-- `scripts/release-sources` takes the Alpine sources from `fetch-rootfs`'s pinned tarball and
-  packages while the APK bundles the newest ones in `target/rootfs`, so the two can differ; its
-  aports path is fixed to `main/`; and it vendors the whole workspace although its header speaks
+- `scripts/release-sources` fixes the aports path to `main/` and vendors the whole workspace although its header speaks
   of the crates linked into the app.
 
 ## Open questions

@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.DialogInterface
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Matrix
@@ -35,6 +36,7 @@ import android.view.inputmethod.InputMethodManager
 import android.view.inputmethod.TextAttribute
 import android.widget.OverScroller
 import androidx.annotation.RequiresApi
+import androidx.appcompat.app.AlertDialog
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withTranslation
 import androidx.core.net.toUri
@@ -108,6 +110,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The tab shown, null for none. */
     var session: VtSession? = null
         private set
+
+    private var pasteQuestion: AlertDialog? = null
 
     /** The shown tab's terminal, 0 when there is none or its shell has not started. */
     private val tab: Long get() = session?.tab ?: 0L
@@ -400,6 +404,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     fun attach(s: VtSession?) {
         if (s === session) return
+        pasteQuestion?.dismiss()
+        pasteQuestion = null
         clearResizePreview()
         endSearch()
         session?.let { if (it.view === this) it.view = null }
@@ -1176,27 +1182,35 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     private fun paste(text: String) {
         if (Privacy.locked(context)) return
-        if (tab == 0L) return
-        val bytes = VtNative.paste(tab, text, false)
-        if (bytes != null) {
-            input(bytes)
-            return
-        }
+        val target = session ?: return
+        if (target.tab == 0L) return
+        val bytes = VtNative.paste(target.tab, text, false)
+        if (bytes == null) confirmPaste(target, text) else input(bytes)
+    }
+
+    private fun confirmPaste(target: VtSession, text: String) {
+        pasteQuestion?.dismiss()
+        fun canPaste(dialog: DialogInterface) =
+            pasteQuestion === dialog && session === target && target.tab != 0L && !Privacy.locked(context)
+
         val preview = if (text.length > PASTE_PREVIEW) text.take(PASTE_PREVIEW) + "…" else text
         val dialog = MaterialAlertDialogBuilder(context)
+            .setOnDismissListener { if (pasteQuestion === it) pasteQuestion = null }
             .setTitle(R.string.paste_unsafe_title)
             .setMessage(context.monospaceMessage(R.string.paste_unsafe, preview))
-            .setPositiveButton(R.string.paste_as_is) { _, _ ->
-                if (tab != 0L) input(VtNative.paste(tab, text, true))
+            .setPositiveButton(R.string.paste_as_is) { question, _ ->
+                if (canPaste(question)) input(VtNative.paste(target.tab, text, true))
             }
             .setNegativeButton(android.R.string.cancel, null)
         val trimmed = text.trimEnd('\r', '\n')
         if (trimmed.isNotEmpty() && trimmed.length < text.length &&
-            VtNative.paste(tab, trimmed, false)?.isNotEmpty() == true
+            VtNative.paste(target.tab, trimmed, false)?.isNotEmpty() == true
         ) {
-            dialog.setNeutralButton(R.string.paste_without_trailing_newlines) { _, _ -> paste(trimmed) }
+            dialog.setNeutralButton(R.string.paste_without_trailing_newlines) { question, _ ->
+                if (canPaste(question)) paste(trimmed)
+            }
         }
-        dialog.showPrivate()
+        pasteQuestion = dialog.showPrivate()
     }
 
     // ---- Selection ----

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: track unlinked open tmpfs files until eviction, enforce protected_symlinks on trailing slash, and honor noexec in faccessat)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: device and inode lookup for socket and PTY lock listings)
 
 ## Responsibilities
 
@@ -80,7 +80,7 @@ capabilities (`kernel/cred`).
   `chroot`.
 - **Devices**: `dev::ensure_dev_nodes` (store `/dev`, at import and every boot), `dev::populate`
   (boot `/dev` tmpfs), `Device::from_rdev`.
-- **Kernel-internal**: `dev_ino` (epoll's fdinfo); for `kernel/files` and `kernel/fileio`,
+- **Kernel-internal**: `dev_ino` (epoll fdinfo and the lock listings of sockets and PTYs); for `kernel/files` and `kernel/fileio`,
   `may_create`, `display_path`, `file_stat` and the tmpfs hooks.
 
 ## Data flow / lifecycle
@@ -318,7 +318,7 @@ capabilities (`kernel/cred`).
   flags.
 - `kernel/mm`: mmap `PROT_EXEC` on noexec.
 - `kernel/sysctl`: sysctls for `protected_*`; `kernel/unix`: AF_UNIX bind creating store nodes.
-- `kernel/poll`: `dev_ino`; `kernel/inotify`: overlay keys, second walks; `kernel/fuse`: the walk.
+- `kernel/poll` and `kernel/locks`: `dev_ino`; `kernel/inotify`: overlay keys, second walks; `kernel/fuse`: the walk.
 - The machine at boot (`/dev` nodes).
 
 ### Outbound
