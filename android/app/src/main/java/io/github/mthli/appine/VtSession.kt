@@ -12,6 +12,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import kotlin.math.abs
 
 /**
  * A terminal tab (the android/vt map), owned by [TerminalService]: a login shell on a kernel
@@ -400,18 +401,27 @@ internal class VtSession(
         main.post { if (!released) events.onNotification(this, title, body) }
     }
 
+    /** Invalidate queued replies on the pump thread before the main thread dismisses the preview. */
+    @Suppress("unused")
+    fun onClipboardReset(generation: Long) {
+        clipboardReads.observeNativeGeneration(generation)
+        main.post { if (!released) clipboardReads.resetTo(generation) }
+    }
+
     /**
      * From vt.rs, on the pump thread: programs asked to read the clipboard (OSC 52 "?") [count]
      * times, the last naming clipboard [kind]. Only the first waiting read needs a UI callback.
      */
     @Suppress("unused")
-    fun onClipboardRead(kind: Int, count: Int) {
-        val generation = clipboardReads.generation
+    fun onClipboardRead(kind: Int, count: Int, generation: Long) {
+        if (clipboardReads.isStale(generation)) return
         main.post {
-            if (released || !isRunning || generation != clipboardReads.generation) return@post
-            if (clipboardReads.enqueue(kind.toChar(), count)) events.onClipboardRead(this)
+            if (released || !isRunning) return@post
+            if (clipboardReads.enqueue(kind.toChar(), count, generation)) events.onClipboardRead(this)
         }
     }
+
+    fun onClipboardRead(kind: Int, count: Int) = onClipboardRead(kind, count, clipboardReads.currentNativeGeneration)
 
     fun answerClipboardRead(text: String?) = clipboardReads.answer(text)
 
@@ -545,14 +555,14 @@ internal class VtSession(
     /** Input for the program, written on the tab's writer thread; dropped once the shell exited. */
     fun write(data: ByteArray) = write(data, null)
 
-    private fun write(data: ByteArray, clipboardGeneration: Long?) {
+    private fun write(data: ByteArray, clipboardToken: ClipboardReads.Token?) {
         val w = writer ?: return
         if (!isRunning || hungUp.get()) return
         val console = pty.console
         if (console < 0) return
         try {
             w.execute {
-                if (clipboardGeneration != null && clipboardGeneration != clipboardReads.generation) return@execute
+                if (clipboardToken != null && !clipboardReads.isCurrent(clipboardToken)) return@execute
                 if (!hungUp.get()) Native.write(machine, console, data, 0, data.size)
             }
         } catch (_: RejectedExecutionException) {
@@ -580,9 +590,11 @@ internal class VtSession(
      * matching a program's RIS.
      */
     fun reset() {
-        clipboardReads.clear()
+        clipboardReads.clear() // Invalidate queued replies before waiting for the terminal lock.
         if (tab == 0L || released) return
-        if (VtNative.reset(tab)) write(FORM_FEED)
+        val reset = VtNative.reset(tab)
+        clipboardReads.resetTo(abs(reset))
+        if (reset > 0L) write(FORM_FEED)
         clearStatus()
         view?.invalidate()
         // The title a program set is gone

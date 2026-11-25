@@ -39,8 +39,9 @@ internal object VtNative {
      * closed; calls `session.onOutput()` (on this thread) when the screen changed after the last
      * [frame], `session.onTitle()` when a program set the title, the session's `onBell`,
      * `onClipboard`, `onNotification`, `onProgress`, `onStatus` and `onClipboardRead` for what
-     * programs asked of the app, `onCommandFinished` when the shell's prompt marks saw a command
-     * finish, `onTmuxDetached()` when tmux's control mode, which vt.c detached, ended, and
+     * programs asked of the app, `onClipboardReset` before any reads following a RIS in the same
+     * batch, `onCommandFinished` when the shell's prompt marks saw a command finish,
+     * `onTmuxDetached()` when tmux's control mode, which vt.c detached, ended, and
      * `onForeground()` once the process group in the foreground when progress or a status was last
      * reported has given the terminal back.
      */
@@ -273,10 +274,11 @@ internal object VtNative {
     @JvmStatic external fun clear(tab: Long): Int
 
     /**
-     * Resets the terminal (a full reset, RIS: screens, scrollback, modes, title, images); true when
-     * the shell was at its prompt, which then gets a form feed to draw it again.
+     * Resets the terminal and returns its new clipboard generation. A positive value means the
+     * shell was at its prompt and needs a form feed to redraw. Otherwise the value is negative.
+     * Returns zero if the tab is gone.
      */
-    @JvmStatic external fun reset(tab: Long): Boolean
+    @JvmStatic external fun reset(tab: Long): Long
 
     /**
      * Shows a yellow line of app notice above the cursor's line (a kill report); false on the

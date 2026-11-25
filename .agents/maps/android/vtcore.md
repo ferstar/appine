@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: added foreground-process fallback for busybox ash command titles and unmarked-shell busy/completion tracking via `VtNative.busy` and `Machine::console_foreground_process`)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: clipboard generations in reset results, pump effects and JNI callbacks)
 
 ## Responsibilities
 
@@ -39,14 +39,15 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   mutex-guarded `Render`, `dirty` flag) in monotonically keyed `TABS` (handles from 1, never
   reused); `TermGuard` (releases the tab's terminal lock and schedules compression when work
   remains); `Term` (owns `AppineVt` and optional foreground-process `fallback_title`, freed on
-  drop); `Render` (owns `AppineVtRender`, freed on drop); `RawEffects` (C-ABI mirror of `AppineVtEffects`) decoded into `Effects` (`StatusReport`
-  queue, clipboard reads, last finished command, `tmux_detached`); `COMPRESS` (`Due` per tab)
-  served by `vt-compress` (`compressor`).
+  drop); `Render` (owns `AppineVtRender`, freed on drop); `RawEffects` (C-ABI mirror of
+  `AppineVtEffects`) decoded into `Effects` (`StatusReport` queue, optional clipboard reset and
+  reads tagged with the captured generation, last finished command, `tmux_detached`);
+  `COMPRESS` (`Due` per tab) served by `vt-compress` (`compressor`).
 - In `vt.c`: `AppineVt` — per-terminal native state holding the libghostty-vt terminal,
   key/mouse encoders, grid/cell geometry, shared reply/text buffers, resize settle and
   synchronized-output (`held_state`, `held`, `held_since`)/password flags, selection-gesture and
-  search scratch, queued `AppineVtEffects`, OSC/DCS prefix scanners and `tmux_control` state,
-  command-timing, `prompt_click` and `lf_resumed` state, and compression/transcript/snapshot dirty
+  search scratch, clipboard generation and pending reset flag, queued effects, OSC/DCS prefix
+  scanners and `tmux_control` state, command-timing, `prompt_click` and `lf_resumed` state, and compression/transcript/snapshot dirty
   flags. `AppineVtRender` — per-tab render state guarded by `Tab.render`, holding the
   `GhosttyRenderState`, row/cell/image iterators, frame/extras/grapheme buffers, viewport search
   marks (`marks`/`marks_sent`), Kitty `Placement` list with generation/validity, and the
@@ -64,7 +65,7 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   `searchSelect`, `searchRows`, `searchEnd`, `clear`, `reset`, `message`, `transcript`, `snapshot`,
   `version`, `compressAll`, `dropImages`, `destroy`; `pump` runs on `vt-pump` and calls
   `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`, `onProgress`,
-  `onStatus`, `onClipboardRead`, `onCommandFinished`, `onTmuxDetached` and `onForeground` back;
+  `onStatus`, `onClipboardReset`, `onClipboardRead`, `onCommandFinished`, `onTmuxDetached` and `onForeground` back;
   `snapshot`, `compressAll` and `dropImages` run on the service's worker, `version` wherever `Tabs`
   needs it, the rest on the main thread.
 
@@ -132,10 +133,14 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   with the first clipboard the last one named (`p` or `s`, else `c`), which every read of the
   batch is answered for; the last command the prompt marks saw finish (Shell integration); the end
   of tmux's control mode, which vt.c detached (below), delivered last (`onTmuxDetached`).
+  `appine_vt_take_effects` captures the clipboard generation under `Tab.term` and consumes the
+  reset flag and read count. After unlocking, the pump delivers `onClipboardReset(generation)`
+  before `onClipboardRead(kind, count, generation)` when both occur in one batch.
   libghostty-vt's clipboard-read
   callback is left unset: it must answer before returning, under the tab's lock, which rules out
   asking the user; so OSC 5522 reads are refused and Kitty paste events never sent. What the app
-  prints itself (`VtNative.print`) asks nothing: its replies and effects are dropped. Where they go
+  prints itself (`VtNative.print`) asks nothing: its replies and effects are dropped. A RIS in
+  those bytes still advances the generation captured with the next clipboard read. Where effects go
   is android/service's choice; the bell of the tab in front comes back as `VtView.bell`.
 - tmux's control mode (`tmux -CC`), which libghostty-vt built for apps does not parse (Confirmed
   bugs / technical debt), would leave the tab showing nothing while keys reach tmux as commands.
@@ -236,14 +241,17 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   reset (RIS) of both screens, the scrollback, modes, the palette, the title and images, keeping
   the app's options and the colours set with OSC 10, 11 and 12; the selection, a
   synchronized-output hold and the prompt's way of moving its cursor end, a shell that was at its
-  prompt gets a form feed (^L) to draw it
-  on the empty screen, and the tab bar hears that the title went. Unlike a program's RIS, it
-  reports no removal of the progress and no clear of the status records (libghostty-vt reports
-  them only from the stream), so the tab keeps them (the progress still lapses 15 s after its last
-  report).
+  prompt gets a form feed (^L) to redraw, and the tab bar hears that the title went. The session
+  clears progress and status directly. A program's RIS clears them through stream callbacks.
+- `on_reset` advances the native clipboard generation on each program RIS, drops earlier reads
+  in the feed and sets the reset flag. Later reads use the new generation. `appine_vt_reset`
+  advances the same counter, clears buffered reads and the pending reset flag, and returns the
+  generation to JNI through an output parameter. `VtNative.reset` returns zero for a missing tab,
+  the positive generation at a prompt, or its negative otherwise.
 - Clearing writes its sequences as the app's own (`write_own`, as kill reports do): after a CAN
   when the parser is inside a sequence a program left unfinished, keeping the console's replies
-  as they were; resetting calls libghostty-vt's reset directly.
+  as they were. Resetting uses the same cancellation before libghostty-vt resets the screens.
+  Both paths clear `osc_open`, `dcs_open` and `tmux_control`.
 
 ### Shell integration
 

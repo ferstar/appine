@@ -14,6 +14,7 @@ class ClipboardReadsTest {
         var previews = 0
         var dismissals = 0
         val replies = mutableListOf<String>()
+        val tokens = mutableListOf<ClipboardReads.Token>()
         val reads = ClipboardReads(
             schedule = { task, delay ->
                 check(timer == null)
@@ -26,7 +27,10 @@ class ClipboardReadsTest {
                     due = null
                 }
             },
-            reply = { bytes, _ -> replies.add(bytes.decodeToString()) },
+            reply = { bytes, token ->
+                replies.add(bytes.decodeToString())
+                tokens.add(token)
+            },
         )
 
         fun deliver(resumed: Boolean = true, focused: Boolean = true, locked: Boolean = false): Boolean {
@@ -159,6 +163,113 @@ class ClipboardReadsTest {
         assertTrue(tab.deliver())
         tab.reads.answer("x")
         assertEquals(listOf(reply('s', "eA==")), tab.replies)
+    }
+
+    @Test
+    fun userResetDropsLateReadCapturedBeforeReset() {
+        val tab = Tab()
+        tab.reads.enqueue('c', 1)
+        assertTrue(tab.deliver())
+        tab.reads.clear()
+        assertEquals(1, tab.dismissals)
+        tab.reads.resetTo(1)
+        assertEquals(1, tab.dismissals)
+        assertFalse(tab.reads.enqueue('p', 1, readGeneration = 0))
+        assertFalse(tab.deliver())
+        assertNull(tab.timer)
+        assertTrue(tab.replies.isEmpty())
+    }
+
+    @Test
+    fun userResetAcceptsReadCapturedAfterReset() {
+        val tab = Tab()
+        tab.reads.clear()
+        tab.reads.resetTo(1)
+        assertTrue(tab.reads.enqueue('c', 1, readGeneration = 1))
+        assertTrue(tab.deliver())
+        tab.reads.answer("x")
+        assertEquals(listOf(reply('c', "eA==")), tab.replies)
+        assertTrue(tab.reads.isCurrent(tab.tokens.single()))
+    }
+
+    @Test
+    fun programResetInvalidatesQueuedReplyBeforeDismissingPreview() {
+        val tab = Tab()
+        tab.reads.enqueue('c', 65) // An overflow reply is already queued on the writer.
+        val overflow = tab.tokens.single()
+        assertTrue(tab.reads.isCurrent(overflow))
+        assertTrue(tab.deliver())
+
+        tab.reads.observeNativeGeneration(1)
+        assertFalse(tab.reads.isCurrent(overflow))
+        assertTrue(tab.reads.isStale(0))
+        assertFalse(tab.reads.enqueue('p', 1, readGeneration = 0))
+        assertTrue(tab.reads.promptActive)
+        tab.reads.resetTo(1)
+        assertEquals(1, tab.dismissals)
+        tab.reads.answer("old")
+        assertEquals(listOf(reply('c')), tab.replies)
+        assertFalse(tab.reads.enqueue('p', 1, readGeneration = 0))
+        assertTrue(tab.reads.enqueue('s', 1, readGeneration = 1))
+        assertTrue(tab.deliver())
+        tab.reads.answer("x")
+        assertEquals(listOf(reply('c'), reply('s', "eA==")), tab.replies)
+    }
+
+    @Test
+    fun delayedResetKeepsReadsFromANewerGeneration() {
+        val tab = Tab()
+        tab.reads.clear()
+        tab.reads.resetTo(2)
+        tab.reads.enqueue('p', 1, readGeneration = 2)
+        val timer = tab.timer
+        tab.reads.resetTo(2)
+        tab.reads.resetTo(1)
+        assertEquals(2L, tab.reads.currentNativeGeneration)
+        assertEquals(timer, tab.timer)
+        assertTrue(tab.deliver())
+        tab.reads.answer("x")
+        assertEquals(listOf(reply('p', "eA==")), tab.replies)
+        assertTrue(tab.reads.isCurrent(tab.tokens.single()))
+    }
+
+    @Test
+    fun newerReadReplacesOldBatchAndUsesTheNewNativeGeneration() {
+        val tab = Tab()
+        tab.reads.enqueue('p', 1)
+        assertTrue(tab.deliver())
+        assertTrue(tab.reads.enqueue('s', 1, readGeneration = 2))
+        assertEquals(2L, tab.reads.currentNativeGeneration)
+        assertEquals(1, tab.dismissals)
+        assertTrue(tab.replies.isEmpty())
+        assertTrue(tab.deliver())
+        tab.reads.answer("x")
+        assertEquals(listOf(reply('s', "eA==")), tab.replies)
+        assertEquals(ClipboardReads.Token(tab.reads.generation, 2), tab.tokens.single())
+        assertTrue(tab.reads.isCurrent(tab.tokens.single()))
+    }
+
+    @Test
+    fun writerChecksBothLocalAndNativeGenerations() {
+        val tab = Tab()
+        fun answeredRead(): ClipboardReads.Token {
+            assertTrue(tab.reads.enqueue('c', 1))
+            assertTrue(tab.deliver())
+            tab.reads.answer("x")
+            return tab.tokens.last().also { assertTrue(tab.reads.isCurrent(it)) }
+        }
+
+        val beforeClear = answeredRead()
+        tab.reads.clear()
+        assertFalse(tab.reads.isCurrent(beforeClear))
+        val beforeObservation = answeredRead()
+        tab.reads.observeNativeGeneration(1)
+        assertFalse(tab.reads.isCurrent(beforeObservation))
+        tab.reads.resetTo(1)
+        val beforeReset = answeredRead()
+        tab.reads.resetTo(2)
+        assertFalse(tab.reads.isCurrent(beforeReset))
+        answeredRead()
     }
 
     private fun reply(target: Char, data: String = "") = "\u001b]52;$target;$data\u001b\\"

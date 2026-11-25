@@ -69,6 +69,8 @@ struct RawEffects {
     statuses_len: usize,
     clipboard_reads: u32,
     clipboard_read_kind: u8,
+    clipboard_reset: bool,
+    clipboard_generation: u64,
     command_finished: bool,
     command_has_exit: bool,
     command_exit: i32,
@@ -220,7 +222,7 @@ unsafe extern "C" {
     fn appine_vt_search_rows(vt: *mut AppineVt, len: *mut usize, selected: *mut i64) -> *const u32;
     fn appine_vt_search_end(vt: *mut AppineVt);
     fn appine_vt_clear(vt: *mut AppineVt) -> i32;
-    fn appine_vt_reset(vt: *mut AppineVt) -> bool;
+    fn appine_vt_reset(vt: *mut AppineVt, clipboard_generation: *mut u64) -> bool;
     fn appine_vt_take_title_changed(vt: *mut AppineVt) -> bool;
     fn appine_vt_take_effects(vt: *mut AppineVt, out: *mut RawEffects);
     fn appine_vt_title(vt: *mut AppineVt, len: *mut usize) -> *const u8;
@@ -301,9 +303,7 @@ impl Term {
         unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
     }
 
-    /// The bells, clipboard write, notification, progress and status reports and clipboard reads
-    /// programs sent, the last command the shell's prompt marks saw finish, and whether tmux's
-    /// control mode, which vt.c detached, ended, since the last call.
+    /// Takes the pending effects and copies their payloads before releasing the terminal lock.
     fn take_effects(&mut self) -> Effects {
         let mut raw = RawEffects {
             bells: 0,
@@ -321,6 +321,8 @@ impl Term {
             statuses_len: 0,
             clipboard_reads: 0,
             clipboard_read_kind: 0,
+            clipboard_reset: false,
+            clipboard_generation: 0,
             command_finished: false,
             command_has_exit: false,
             command_exit: 0,
@@ -350,6 +352,8 @@ impl Term {
                 .then(|| (text(raw.title, raw.title_len), text(raw.body, raw.body_len))),
             progress: (raw.progress_state >= 0).then_some((raw.progress_state, raw.progress)),
             statuses: StatusReport::decode(bytes(raw.statuses, raw.statuses_len)),
+            clipboard_generation: raw.clipboard_generation,
+            clipboard_reset: raw.clipboard_reset,
             clipboard_reads: (raw.clipboard_reads > 0)
                 .then_some((raw.clipboard_reads, raw.clipboard_read_kind)),
             command: raw.command_finished.then_some((
@@ -405,6 +409,9 @@ struct Effects {
     notification: Option<(String, String)>,
     progress: Option<(i32, i32)>,
     statuses: Vec<StatusReport>,
+    /// Shared by the last RIS and all subsequent clipboard reads in this batch.
+    clipboard_generation: u64,
+    clipboard_reset: bool,
     clipboard_reads: Option<(u32, u8)>,
     command: Option<(Option<i32>, u64)>,
     tmux_detached: bool,
@@ -463,6 +470,10 @@ fn deliver_command_finished(
         .is_ok()
 }
 
+fn clipboard_generation(generation: u64) -> jlong {
+    (generation & i64::MAX as u64) as jlong
+}
+
 impl Effects {
     /// Whether a program reported its progress or status, which lasts while its process group
     /// keeps the foreground ([`pump`]).
@@ -471,10 +482,9 @@ impl Effects {
     }
 
     /// Hands them to the tab's `VtSession` (`onBell`, `onClipboard`, `onNotification`,
-    /// `onProgress`, `onStatus` for each status report, `onClipboardRead`, `onCommandFinished`,
-    /// `onTmuxDetached`);
-    /// false when a call threw. The strings are
-    /// local references, deleted after each call: the pump stays in native code for the tab's
+    /// `onProgress`, `onStatus` for each status report, `onClipboardReset`, `onClipboardRead`,
+    /// `onCommandFinished`, `onTmuxDetached`). Returns false when a call threw. The strings
+    /// are local references, deleted after each call: the pump stays in native code for the tab's
     /// whole life, so they would otherwise pile up.
     fn deliver(self, env: &mut JNIEnv<'_>, session: &JObject<'_>) -> bool {
         if self.bell && env.call_method(session, "onBell", "()V", &[]).is_err() {
@@ -540,10 +550,22 @@ impl Effects {
                 return false;
             }
         }
+        let generation = JValue::Long(clipboard_generation(self.clipboard_generation));
+        if self.clipboard_reset
+            && env
+                .call_method(session, "onClipboardReset", "(J)V", &[generation])
+                .is_err()
+        {
+            return false;
+        }
         if let Some((count, kind)) = self.clipboard_reads {
-            let args = [JValue::Int(i32::from(kind)), JValue::Int(count as i32)];
+            let args = [
+                JValue::Int(i32::from(kind)),
+                JValue::Int(count as i32),
+                generation,
+            ];
             if env
-                .call_method(session, "onClipboardRead", "(II)V", &args)
+                .call_method(session, "onClipboardRead", "(IIJ)V", &args)
                 .is_err()
             {
                 return false;
@@ -918,7 +940,7 @@ impl FallbackTracker {
 /// Moves the console's output into the terminal until the session ends or the console is closed;
 /// calls `session.onOutput()` whenever the screen changed after the last frame was taken,
 /// `session.onTitle()` when a program or foreground-process fallback changed the title, `onBell`,
-/// `onClipboard`, `onNotification`, `onProgress`, `onStatus`, `onClipboardRead`,
+/// `onClipboard`, `onNotification`, `onProgress`, `onStatus`, `onClipboardReset`, `onClipboardRead`,
 /// `onCommandFinished` and `onTmuxDetached` for what programs asked of the app and what the
 /// shell's prompt marks (or foreground-process fallback) told ([`Effects`]), and `onForeground()`
 /// once the process group that was in the foreground when progress or a status was last reported
@@ -1859,20 +1881,22 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_clear<'l>(
     })
 }
 
-/// Resets the terminal (a full reset, RIS); true when the shell was at its prompt (the caller
-/// sends it a form feed to draw it again).
+/// Returns the new clipboard generation, positive at a shell prompt, negative otherwise.
+/// Zero means the tab is gone.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_reset<'l>(
     _: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
-) -> jboolean {
+) -> jlong {
     guarded!("VtNative.reset", 0, {
-        tab(handle).is_some_and(|tab| {
-            let mut term = tab.term();
-            term.1 = None;
-            unsafe { appine_vt_reset(term.0) }
-        }) as jboolean
+        let Some(tab) = tab(handle) else { return 0 };
+        let mut term = tab.term();
+        term.1 = None;
+        let mut generation = 0;
+        let prompt = unsafe { appine_vt_reset(term.0, &mut generation) };
+        let generation = clipboard_generation(generation).max(1);
+        if prompt { generation } else { -generation }
     })
 }
 

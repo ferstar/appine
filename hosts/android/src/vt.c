@@ -371,6 +371,8 @@ typedef struct {
   // Clipboard reads (OSC 52 "?"): how many, and the clipboard the last one named ('c', 'p' or 's')
   uint32_t clipboard_reads;
   uint8_t clipboard_read_kind;
+  bool clipboard_reset;
+  uint64_t clipboard_generation;
   // The last command the shell's prompt marks (OSC 133) saw finish (on_semantic_prompt): whether
   // one did, whether the shell reported its exit code, the code, and how long it ran
   bool command_finished;
@@ -486,6 +488,8 @@ typedef struct AppineVt {
   // Clipboard reads (OSC 52 "?") since appine_vt_take_effects, and the clipboard of the last
   uint32_t clipboard_reads;
   uint8_t clipboard_read_kind;
+  bool clipboard_reset;
+  uint64_t clipboard_generation;
   // Commands as the prompt marks tell (on_semantic_prompt): when the one running started (0 for
   // none), whether the cursor was at the prompt after the last feed, and the last one finished
   // since appine_vt_take_effects
@@ -826,11 +830,14 @@ static void reset_prompt_state(AppineVt *vt) {
   drop_resumed(vt);
 }
 
-// A program's full reset (RIS): the screen forgets how its shell's prompt moves the cursor
+// Only clipboard reads after the last RIS in this feed can reach the session.
 static void on_reset(GhosttyTerminal t, void *userdata) {
   (void)t;
   AppineVt *vt = userdata;
   reset_prompt_state(vt);
+  vt->clipboard_generation++;
+  vt->clipboard_reads = 0;
+  vt->clipboard_reset = true;
 }
 
 // ---- PNG images (Kitty graphics) ----
@@ -3417,19 +3424,22 @@ void appine_vt_search_end(AppineVt *vt) {
 
 static bool is_alternate(AppineVt *vt);
 
-// Writes the app's own sequences into the terminal as if the console had sent them, after a CAN
-// when the parser is inside a sequence a program left unfinished (which would take them for its
-// payload); they ask for no answer, so the console's replies stay as they were
-static void write_own(AppineVt *vt, const Buf *seq) {
+// Cancel unfinished program output in both the stream parser and the OSC/DCS scanners.
+static void cancel_sequence(AppineVt *vt) {
   bool ground = true;
   if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground) == GHOSTTY_SUCCESS &&
       !ground) {
     static const uint8_t can = 0x18;
     ghostty_terminal_vt_write(vt->term, &can, 1);
-    vt->osc_open = false;
-    vt->dcs_open = false;
-    vt->tmux_control = false;
   }
+  vt->osc_open = false;
+  vt->dcs_open = false;
+  vt->tmux_control = false;
+}
+
+// The app's own sequences ask for no answer, so the console's replies stay as they were.
+static void write_own(AppineVt *vt, const Buf *seq) {
+  cancel_sequence(vt);
   size_t replies = vt->replies.len;
   if (seq->ptr != NULL) ghostty_terminal_vt_write(vt->term, seq->ptr, seq->len);
   vt->replies.len = replies;
@@ -3476,15 +3486,21 @@ int appine_vt_clear(AppineVt *vt) {
 // modes, colours programs set (but OSC 10, 11 and 12's), the title and images; the app's own
 // settings (default colours, limits, grapheme clustering) stay. Returns whether the shell was at
 // its prompt, which the caller then sends a form feed (^L) to draw it again on the empty screen.
-bool appine_vt_reset(AppineVt *vt) {
+bool appine_vt_reset(AppineVt *vt, uint64_t *clipboard_generation) {
   bool prompt = appine_vt_at_prompt(vt);
   appine_vt_select_clear(vt);
+  // ghostty_terminal_reset resets the screens but preserves the stream parser.
+  cancel_sequence(vt);
   ghostty_terminal_reset(vt->term);
   // A synchronized output hold ends with the modes, and the prompt's way of moving the cursor
   // with the screen's prompt state (on_reset hears only a program's reset)
   drop_held_state(vt);
   vt->held = false;
   reset_prompt_state(vt);
+  vt->clipboard_generation++;
+  vt->clipboard_reads = 0;
+  vt->clipboard_reset = false;
+  if (clipboard_generation != NULL) *clipboard_generation = vt->clipboard_generation;
   changed(vt);
   return prompt;
 }
@@ -3517,6 +3533,8 @@ void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   out->statuses_len = vt->statuses.len;
   out->clipboard_reads = vt->clipboard_reads;
   out->clipboard_read_kind = vt->clipboard_read_kind;
+  out->clipboard_reset = vt->clipboard_reset;
+  out->clipboard_generation = vt->clipboard_generation;
   out->command_finished = vt->command_finished;
   out->command_has_exit = vt->command_has_exit;
   out->command_exit = vt->command_exit;
@@ -3525,6 +3543,7 @@ void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   vt->tmux_detached = false;
   vt->command_finished = false;
   vt->clipboard_reads = 0;
+  vt->clipboard_reset = false;
   vt->bells = 0;
   vt->clipboard = APPINE_CLIPBOARD_NONE;
   vt->notified = false;

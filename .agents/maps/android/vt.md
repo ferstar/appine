@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 9 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification of the OSC 52 queue, timeout, writer and session cleanup)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: OSC 52 read capture, preview dismissal and writer invalidation across user resets and program RIS)
 
 ## Responsibilities
 
@@ -44,8 +44,9 @@ login script and prompt-mark producers (`android/setup`).
   (`Status?` selected from `LinkedHashMap<String, Status> records`, LRU-ordered, max 64),
   synchronized `reports` handoff buffer from `vt-pump`, `clipboardReads` (`ClipboardReads`), `AtomicBoolean
   hungUp`, and single-thread `vt-writer` executor.
-- `ClipboardReads` — main-thread OSC 52 read queue per session (max 64 targets, 60 s wait timer,
-  active-prompt handoff/dismissal and `@Volatile generation` counter for terminal resets).
+- `ClipboardReads` — main-thread OSC 52 read queue per session (max 64 targets, 60 s wait timer
+  and active preview). Each reply carries a `Token` with the local queue generation and the
+  native generation applied to that batch. The latest observed native generation is atomic.
 - `VtSession.Events` — main-thread callback interface implemented by `TerminalService`:
   `onTitleChanged`, `onBell`, `onClipboard`, `onNotification`, `onClipboardRead`,
   `onStatusChanged`, `onCommandFinished`, `onTmuxDetached`, `onFinished`.
@@ -67,7 +68,7 @@ login script and prompt-mark producers (`android/setup`).
   `takeSnapshot`, `showMessage`, `setCursor`, `clear`, `reset`.
 - Program reports and native pump callbacks: `progress`, `status`, `statusSeen`, `describe`,
   `answerClipboardRead`, `Events`; JNI callbacks invoked on `vt-pump`: `onOutput`, `onTitle`,
-  `onBell`, `onClipboard`, `onNotification`, `onClipboardRead`, `onProgress`, `onStatus`,
+  `onBell`, `onClipboard`, `onNotification`, `onClipboardReset`, `onClipboardRead`, `onProgress`, `onStatus`,
   `onForeground`, `onCommandFinished`, `onTmuxDetached`.
 
 ## Data flow / lifecycle
@@ -125,9 +126,11 @@ login script and prompt-mark producers (`android/setup`).
   before reading the clipboard and cancels the timer. An open preview has no timeout.
 - An answer formats one ST-terminated OSC 52 reply per queued target with unwrapped base64
   text. Denial, timeout and an empty clipboard send empty payloads. Reset, shell exit and
-  release cancel the timer, clear the batch and dismiss any preview without a reply. The pump's
-  posted read and queued clipboard writes check the session's clipboard generation, and reads
-  also require a running, unreleased session.
+  release cancel the timer, clear the batch and dismiss any preview without a reply.
+- `onClipboardReset(generation)` publishes the generation on the pump thread before posting
+  `resetTo` to main. `onClipboardRead(kind, count, generation)` rejects stale reads on the pump
+  and checks again on main, where the session must still be running and unreleased. A newer
+  read generation clears the old batch. An equal or older reset leaves the current batch alone.
 - Progress (`OSC 9;4`): `onProgress` maps `PROGRESS_REMOVE` to `null`, else `Progress(state,
   percent)`. `setProgress` cancels and re-posts the 15 s `dropProgress` timer (`PROGRESS_TIMEOUT_MS`)
   before checking `p == progress`, so identical heartbeats extend the timeout without firing
@@ -168,8 +171,9 @@ login script and prompt-mark producers (`android/setup`).
   `!hungUp.get()` inside the write runnable before calling `Native.write` (swallowing
   `RejectedExecutionException`).
 - `clear()` calls `VtNative.clear(tab)`: `-1` (alt screen / gone) is a no-op; `0` invalidates
-  `view`; `1` (at prompt) writes `^L` (`0x0c`) and invalidates. `reset()` returns early if
-  `tab == 0L || released`, calls `VtNative.reset`, writes `^L` if at prompt, calls `clearStatus()`
+  `view`; `1` (at prompt) writes `^L` (`0x0c`) and invalidates. `reset()` clears clipboard work
+  immediately, then returns early if `tab == 0L || released`. It applies the magnitude of a
+  nonzero `VtNative.reset` result and writes `^L` for a positive result (at prompt). It calls `clearStatus()`
   (cancelling `dropProgress`, clearing buffered `reports`/`records`, zeroing `progress`/`status`,
   and firing `onStatusChanged` when any existed), invalidates `view`, and emits
   `events.onTitleChanged(this)`.
@@ -192,7 +196,7 @@ login script and prompt-mark producers (`android/setup`).
 - `android/tabbar` (`TabBarView`, `TabListView`, `TabMarks`, `ProgressLine`): reads `id`, `title`,
   `isRunning`, `progress`, `status`, `describe` and protocol constants.
 - `android/vtview` (`VtView`): sets `view`, reads `tab`, calls `resize`.
-- `android/vtcore` (`vt.rs`): invokes the 11 `on*` callbacks on `vt-pump`.
+- `android/vtcore` (`vt.rs`): invokes the session callbacks on `vt-pump`.
 - `android/setup` / `android/settings` (`Rootfs`, `Settings`, `SettingsActivity`): reuse
   `ConsolePty.LOGIN_AUTO`, `LOGIN_ROOT`, `script`, `argv` and `ENVIRONMENT`.
 
@@ -235,14 +239,15 @@ login script and prompt-mark producers (`android/setup`).
 - Same-read OSC 52 `?` requests collapse to the last clipboard target's `kind` in `vt.c`; separate
   reads preserve individual targets in `clipboardReads`. Clipboard replies go through the
   session's `vt-writer` after native terminal locks are released.
+- Native `AppineVt` owns the clipboard generation for both `VtSession.reset()` and a program's RIS.
+  Reads retain the generation captured under the terminal lock. The writer checks both token
+  generations before calling `Native.write`. Once a write passes this final check, it can
+  complete across reset, including when it is already inside the native console call.
 - Release sessions and close consoles before stopping the kernel so `vt-pump` can return; native
   pumps must not hold a session-long `Arc<Machine>`.
 
 ## Confirmed bugs / technical debt
 
-- Clipboard generations start at the Kotlin pump callback. A native read effect already captured
-  while its JNI callback is still pending can arrive after a terminal reset as a new request.
-  A write already inside the native console call may also complete across reset.
 - **Shell mark coverage limits inherited from `android/vtcore`:** local unmarked shells (dash,
   mksh, tcsh, elvish, ash with overwritten `PS1`) now have foreground-process fallback for `busy`,
   command titles and exit-code-less completion timing, and Alpine `doas -s` preserves ash marks;
