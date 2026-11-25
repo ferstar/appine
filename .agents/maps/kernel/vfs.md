@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: named FIFO `fstatfs` reports underlying filesystem and removed-cwd `/proc/<pid>/cwd` readlink appends ` (deleted)`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `protected_regular`/`protected_fifos` sticky-directory open protection and open PTY `fstat` `st_blksize` 1024)
 
 ## Responsibilities
 
@@ -239,7 +239,7 @@ capabilities (`kernel/cred`).
   anonymous devices for pipes, sockets and anonymous inodes (owned by root), the queue
   filesystem's for message queues, the devpts instance's for an open PTY slave, and the root
   filesystem's on the fast path (which resolves only there); `st_blksize` 4096 (1024 for procfs
-  and devpts nodes stat'ed by path); ordinary files and host fds report the host’s `st_blocks`. Tracked
+  and devpts nodes, including `fstat` of open PTY masters and slaves); ordinary files and host fds report the host’s `st_blocks`. Tracked
   tmpfs files count host extents and logical guest pages together. Other nodes use size (sysfs
   files 0; symlinks under 60 bytes on the
   root filesystem or 128 elsewhere live in the inode); directories report size 4096 on the root
@@ -299,8 +299,10 @@ capabilities (`kernel/cred`).
   none). Seeking a directory is `kernel/fileio`'s lseek.
 - chdir/fchdir/chroot check search on store, overlay, FUSE and cgroup directories; chroot then
   needs `CAP_SYS_CHROOT` in the caller's user namespace. umask lives in the fs context.
-- `protected_symlinks` and `protected_hardlinks` exist (default 1); `protected_regular` and
-  `protected_fifos` do not.
+- `protected_symlinks`, `protected_hardlinks` and `protected_fifos` default to 1, and
+  `protected_regular` defaults to 2 (`may_create_in_sticky` on `O_CREAT` opens of existing regular
+  files and FIFOs in sticky world-writable or, at level 2, group-writable directories, reading
+  `Kernel::sysctls` for `/proc/sys/fs/protected_{regular,fifos}`).
 
 ### Devices
 
@@ -388,9 +390,8 @@ capabilities (`kernel/cred`).
   append-only, immutable, nodump and noatime (LTP unlink09, copy_file_range02).
 - **Fidelity gaps**, one per line:
   - statx: no btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`;
-  - no `protected_regular` or `protected_fifos`;
-  - fstat of an open PTY reports `st_blksize` 4096 (stat by path 1024), and epoll's fdinfo shows the
-    root filesystem's device for tmpfs files and an anonymous one for overlay and FUSE files;
+  - epoll's fdinfo shows the root filesystem's device for tmpfs files and an anonymous one for
+    overlay and FUSE files;
   - cgroup mkdir reports `EROFS` before `EEXIST`;
   - the store's rename errors come after permission.
 - **Scoped openat2 never returns `EAGAIN`:** the walk is atomic under the BKL, so a `..` walked
@@ -403,7 +404,6 @@ capabilities (`kernel/cred`).
 
 - Is skipping search permission on synthetic directories other than cgroup ones intended (only
   `/proc/<pid>/fd` and `fdinfo` gate access, by the ptrace-read check)?
-- Should `protected_regular` and `protected_fifos` be implemented?
 
 ## To verify
 

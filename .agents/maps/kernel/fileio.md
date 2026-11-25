@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: FUSE directory `lseek` delegates to `kernel/fuse` using directory inode size and `ESPIPE` for non-seekable/stream handles)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: host stdio interruptible writes and positional I/O on regular host files, and `MAX_RW_COUNT` caps on read/write/vectored/sendfile/copy_file_range)
 
 ## Responsibilities
 
@@ -98,10 +98,12 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   `RWF_DSYNC`, fsync for `O_SYNC`/`RWF_SYNC`, BKL released) or a FUSE file (`FUSE_FSYNC`); a sync
   error after writing is propagated cleanly. Host fds, core dumps and loop writes are not synced.
 - Zero-length scalar reads check the fd, positional I/O and read mode. Empty reads on pipes and regular files complete immediately. Directories return `EISDIR`, epoll and short fixed-size device reads return `EINVAL`. Socket reads retain their message semantics.
-- Host stdio fds (`FileKind::Host`): reads poll the host fd (`EAGAIN` when nonblocking,
-  interruptible), then read without the BKL; writes run without the BKL, ignore guest
-  `O_NONBLOCK`, retry `EINTR` and turn `EPIPE` into `SIGPIPE`; positional I/O is `ESPIPE` even on
-  a regular host file, while lseek reaches the host.
+- Host stdio fds (`FileKind::Host`): regular host files support positional I/O (`pread`/`pwrite`,
+  `preadv`/`pwritev`) and loop to fill on read without polling; non-regular host fds (pipes,
+  terminals, sockets) return `ESPIPE` on positional I/O, poll `POLLIN`/`POLLOUT` via `wait_host`
+  (honouring guest `O_NONBLOCK`, interruptible by guest signals, writing in `PIPE_BUF` chunks so
+  blocked writes do not stall in the host kernel) and turn `EPIPE` into `SIGPIPE`; lseek reaches
+  the host.
 - `SEEK_DATA` and `SEEK_HOLE` query host extents and include tmpfs pages instantiated by mapped
   access. Recorded fallocate reservations start as holes. Offsets outside the file
   give `ENXIO`. A host without sparse seeks assumes data up to EOF. lseek on a directory takes `SEEK_SET` and `SEEK_CUR`
@@ -118,8 +120,10 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   record. Numeric sysctl writes parse all iovecs as one value. Host stdio fds that are not regular
   files on the host take the pipe path. Everything else
   goes iovec by iovec and stops at an incomplete one, as Linux does for files with only
-  `read`/`write`. Over 1024 iovecs or a total over `isize::MAX` is `EINVAL`; a total of 0 returns
-  0 after the offset and mode checks.
+  `read`/`write`. Over 1024 iovecs or a total over `isize::MAX` is `EINVAL`, and accepted iovecs
+  (as well as scalar `read`/`write`/`pread`/`pwrite`, `sendfile`, `copy_file_range` and
+  `copy_data`) are capped at `MAX_RW_COUNT` (`0x7ffff000`, dropping trailing iovecs beyond the
+  cap); a total of 0 returns 0 after the offset and mode checks.
 - A copy to or from the guest buffer that faults grows a grows-down mapping below it
   (`kernel/mm`) and retries (not for vmsplice's write side or a `/dev/kmsg` writev). A read whose
   buffer faults partway returns the bytes before the faulting page (`EFAULT` when none): regular
@@ -272,16 +276,12 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   - a memfd uses an unlinked store object. Extending it to `INT64_MAX` with `ftruncate`
     returns `EFBIG` on the development store, while native Linux accepts that length
     (gVisor's `Pread64Test.Overflow`);
-  - read, write, their vector forms and the chunked copies are not capped at `MAX_RW_COUNT`;
-  - host stdio: positional I/O is `ESPIPE` on a regular host file, and a blocked write cannot be
-    interrupted;
   - sync_file_range on a loop device is `ESPIPE`.
 - **Error order in I/O calls:** pread and pwrite look up the fd before refusing a
   negative offset; fallocate checks its arguments before the fd, its mode after the fd's type, and
   on a socket is `ESPIPE` where 6.1 says `ENODEV`.
 - **Clone fidelity:** FICLONE and FICLONERANGE work on a store that reports ext4's magic (ext4
-  says `EOPNOTSUPP`); partial ranges are copied, not shared; `FIDEDUPERANGE` is `EOPNOTSUPP`; a
-  whole-file copy_file_range returns more than `MAX_RW_COUNT` in one call.
+  says `EOPNOTSUPP`); partial ranges are copied, not shared; `FIDEDUPERANGE` is `EOPNOTSUPP`.
 
 ## Open questions
 

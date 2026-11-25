@@ -291,6 +291,25 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     let node = super::fs::lookup_at(cx, super::fs::AT_FDCWD, &path, mask & IN_DONT_FOLLOW == 0)?;
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
+    // Magic links to unlinked regular files, memfds, or deleted executables resolve to the
+    // underlying inode so watches on `/proc/<pid>/fd/<n>` or `/proc/<pid>/exe` receive events.
+    let node = match &node {
+        Node::Pseudo(_, crate::pseudo::PseudoNode::OpenFd(proc, tid, fd)) => {
+            let source = view.open_file(*proc, *tid, *fd).ok_or(Errno::ENOENT)?;
+            let source = source.borrow();
+            if let Some(o) = source.ovl {
+                Node::Overlay(source.mnt, o)
+            } else if let Some((ino, ..)) = source.regular_backing() {
+                Node::Store(source.mnt, ino)
+            } else {
+                source.node().unwrap_or(node)
+            }
+        }
+        Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(proc)) => {
+            super::fs::exe_file(cx, *proc)?.backing(&vfs)?.0
+        }
+        _ => node,
+    };
     if mask & IN_ONLYDIR != 0 && !vfs.is_dir(&view, &node)? {
         return Err(Errno::ENOTDIR);
     }
@@ -302,8 +321,9 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     };
     let (ino, sdev) = match &node {
         Node::Store(_, ino) => {
-            cx.cred().permission(&vfs.store().stat(*ino)?, MAY_READ)?;
-            (*ino, 0x80_0001)
+            // Use the database row (`attrs`): unlinked files and memfds have no host path left.
+            cx.cred().permission(&vfs.store().attrs(*ino)?, MAY_READ)?;
+            (*ino, internal(vfs.dev_of(&node)))
         }
         Node::Overlay(_, o) => {
             let st = vfs.overlay_stat(*o)?;
@@ -492,6 +512,12 @@ impl Registry {
         self.opened
             .range((ino, 0)..=(ino, usize::MAX))
             .filter_map(|(_, f)| f.upgrade())
+    }
+
+    pub(crate) fn has_open(&self, ino: Ino) -> bool {
+        self.opened
+            .range((ino, 0)..=(ino, usize::MAX))
+            .any(|(_, f)| f.strong_count() > 0)
     }
 
     pub(crate) fn watches(&self, ino: Ino) -> bool {
@@ -852,6 +878,10 @@ fn file_key(f: &OpenFile) -> Option<(Ino, u32)> {
         FileKind::Pipe(_) | FileKind::Pty(_) => Some((key_of(&f.node()?)?, 0)),
         FileKind::Directory { node, .. } => Some((key_of(node)?, IN_ISDIR)),
         FileKind::Fuse(h) => Some((crate::vfs::fuse::key(h.id), 0)),
+        FileKind::Proc {
+            node: crate::pseudo::PseudoNode::Cgroup(id, name, _),
+            ..
+        } if !name.is_empty() => Some((crate::cgroup::key(*id, name), 0)),
         _ => None,
     }
 }
@@ -876,6 +906,13 @@ pub(crate) fn opened(
         return Some(Opened::new(&k.inotify, key_of(node)?, parent, 0, unlinked));
     }
     let (ino, dir) = file_key(f)?;
+    let parent = parent.or_else(|| match &f.kind {
+        FileKind::Proc {
+            node: crate::pseudo::PseudoNode::Cgroup(id, name, _),
+            ..
+        } if !name.is_empty() => Some((crate::cgroup::key(*id, b""), name.to_vec())),
+        _ => None,
+    });
     let close = close_mask(f.writable());
     Some(Opened::new(&k.inotify, ino, parent, dir | close, unlinked))
 }

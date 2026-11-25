@@ -2036,6 +2036,418 @@ static void test_fs_io_compat_fixes(void)
     CHECK(umount2("/tmp/ovl_cwd/merged", 0) == 0, "umount ovl_cwd");
 }
 
+static void test_max_rw_count_caps(void)
+{
+    const size_t max_rw = 0x7ffff000U;
+    int null_fd = open("/dev/null", O_WRONLY);
+    int zero_fd = open("/dev/zero", O_RDONLY);
+    CHECK(null_fd >= 0 && zero_fd >= 0, "open /dev/null and /dev/zero");
+
+    /* 4 MiB mapped buffer reused across iovecs, plus an unmapped trailing iovec past MAX_RW_COUNT */
+    const size_t chunk = 4U * 1024U * 1024U;
+    void *buf = mmap(NULL, chunk, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(buf != MAP_FAILED, "mmap 4 MiB");
+    void *bad = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(bad != MAP_FAILED && munmap(bad, 4096) == 0, "create unmapped address");
+
+    /* 512 * 4 MiB = 2 GiB (> MAX_RW_COUNT = 2 GiB - 4 KiB), plus trailing unmapped iovec. */
+    struct iovec vecs[513];
+    for (int i = 0; i < 512; i++) {
+        vecs[i].iov_base = buf;
+        vecs[i].iov_len = chunk;
+    }
+    vecs[512].iov_base = bad;
+    vecs[512].iov_len = 4096;
+
+    CHECK(writev(null_fd, vecs, 513) == (ssize_t)max_rw, "writev capped at MAX_RW_COUNT");
+    CHECK(pwritev(null_fd, vecs, 513, 0) == (ssize_t)max_rw, "pwritev capped at MAX_RW_COUNT");
+    CHECK(syscall(SYS_pwritev2, null_fd, vecs, 513, 0L, 0L, 0) == (long)max_rw,
+          "pwritev2 capped at MAX_RW_COUNT");
+    CHECK(readv(zero_fd, vecs, 513) == (ssize_t)max_rw, "readv capped at MAX_RW_COUNT");
+    CHECK(preadv(zero_fd, vecs, 513, 0) == (ssize_t)max_rw, "preadv capped at MAX_RW_COUNT");
+    CHECK(syscall(SYS_preadv2, zero_fd, vecs, 513, 0L, 0L, 0) == (long)max_rw,
+          "preadv2 capped at MAX_RW_COUNT");
+
+    /* Scalar write/pwrite capped at MAX_RW_COUNT using a 2 GiB + 8 KiB sparse file mapping. */
+    int sp = open("/tmp/maxrw_sparse", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    CHECK(sp >= 0, "create sparse file");
+    const size_t over = max_rw + 8192U;
+    CHECK(ftruncate(sp, (off_t)over) == 0, "ftruncate 2 GiB+ sparse");
+    void *smap = mmap(NULL, over, PROT_READ, MAP_SHARED, sp, 0);
+    CHECK(smap != MAP_FAILED, "mmap sparse file");
+    CHECK(write(null_fd, smap, over) == (ssize_t)max_rw, "write capped at MAX_RW_COUNT");
+    CHECK(pwrite(null_fd, smap, over, 0) == (ssize_t)max_rw, "pwrite capped at MAX_RW_COUNT");
+    CHECK(munmap(smap, over) == 0, "munmap sparse");
+    close(sp);
+    unlink("/tmp/maxrw_sparse");
+
+    CHECK(munmap(buf, chunk) == 0, "munmap 4 MiB");
+    close(null_fd);
+    close(zero_fd);
+}
+
+static int pipe_avail(int rfd)
+{
+    int n = -1;
+    CHECK(ioctl(rfd, FIONREAD, &n) == 0, "FIONREAD pipe");
+    return n;
+}
+
+static void test_splice_procfs_and_pipe_fault_writes(void)
+{
+    /* 1. Reject splice on procfs files lacking splice_read on Linux. */
+    static const char *const reject_paths[] = {
+        "/proc/self/status", "/proc/self/stat", "/proc/self/maps", "/proc/self/cmdline",
+        "/proc/self/comm",   "/proc/self/fdinfo/0", "/proc/self/ns/mnt",
+    };
+    for (size_t i = 0; i < sizeof(reject_paths) / sizeof(reject_paths[0]); i++) {
+        int fd = open(reject_paths[i], O_RDONLY);
+        CHECK(fd >= 0, "open %s", reject_paths[i]);
+        int p[2];
+        CHECK(pipe(p) == 0, "pipe");
+        errno = 0;
+        CHECK(splice(fd, NULL, p[1], NULL, 64, 0) == -1 && errno == EINVAL,
+              "splice from %s must return EINVAL", reject_paths[i]);
+        close(p[0]);
+        close(p[1]);
+        close(fd);
+    }
+
+    static const char *const ok_paths[] = {
+        "/proc/self/mounts", "/proc/self/mountinfo", "/proc/version",
+        "/sys/devices/system/cpu/online",
+    };
+    for (size_t i = 0; i < sizeof(ok_paths) / sizeof(ok_paths[0]); i++) {
+        int fd = open(ok_paths[i], O_RDONLY);
+        CHECK(fd >= 0, "open %s", ok_paths[i]);
+        int p[2];
+        CHECK(pipe(p) == 0, "pipe");
+        CHECK(splice(fd, NULL, p[1], NULL, 64, 0) > 0, "splice from %s must succeed", ok_paths[i]);
+        close(p[0]);
+        close(p[1]);
+        close(fd);
+    }
+
+    /* 2. Pipe write/writev with faulting buffers matches Linux 6.1 per-page commit semantics. */
+    const size_t P = 4096;
+    char *base = mmap(NULL, 4 * P, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(base != MAP_FAILED, "mmap 4 pages");
+    memset(base, 'p', 2 * P);
+    CHECK(munmap(base + 2 * P, 2 * P) == 0, "unmap upper 2 pages");
+
+    int p[2];
+    /* Sub-page writev faulting on 2nd iovec writes nothing and returns EFAULT. */
+    CHECK(pipe(p) == 0, "pipe");
+    struct iovec v1[2] = {{base, 100}, {base + 2 * P, 100}};
+    errno = 0;
+    CHECK(writev(p[1], v1, 2) == -1 && errno == EFAULT, "sub-page faulting writev");
+    CHECK(pipe_avail(p[0]) == 0, "sub-page faulting writev must write nothing");
+    close(p[0]);
+    close(p[1]);
+
+    /* Mergeable tail + sub-page faulting writev writes nothing and returns EFAULT. */
+    CHECK(pipe(p) == 0, "pipe");
+    CHECK(write(p[1], "x", 1) == 1, "seed mergeable slot");
+    errno = 0;
+    CHECK(writev(p[1], v1, 2) == -1 && errno == EFAULT, "mergeable faulting writev");
+    CHECK(pipe_avail(p[0]) == 1, "mergeable faulting writev must not alter pipe");
+    close(p[0]);
+    close(p[1]);
+
+    /* Aligned 16 KiB write faulting at 8 KiB writes 8192 bytes (not EFAULT on 64 KiB chunk). */
+    CHECK(pipe(p) == 0, "pipe");
+    CHECK(write(p[1], base, 4 * P) == (ssize_t)(2 * P), "aligned 16K write faulting at 8K");
+    CHECK(pipe_avail(p[0]) == (int)(2 * P), "pipe holds 8192 bytes");
+    close(p[0]);
+    close(p[1]);
+
+    /* Unaligned 8 KiB write with 5000 valid bytes before fault commits whole first page (4096). */
+    CHECK(pipe(p) == 0, "pipe");
+    CHECK(write(p[1], base + 2 * P - 5000, 8192) == (ssize_t)P, "unaligned write fault at 5000");
+    CHECK(pipe_avail(p[0]) == (int)P, "pipe holds 4096 bytes");
+    close(p[0]);
+    close(p[1]);
+
+    /* writev 5000 valid + faulting 2nd iovec commits whole first page (4096). */
+    CHECK(pipe(p) == 0, "pipe");
+    struct iovec v2[2] = {{base, 5000}, {base + 2 * P, 100}};
+    CHECK(writev(p[1], v2, 2) == (ssize_t)P, "writev 5000 + fault");
+    CHECK(pipe_avail(p[0]) == (int)P, "pipe holds 4096 bytes after writev");
+    close(p[0]);
+    close(p[1]);
+
+    CHECK(munmap(base, 2 * P) == 0, "munmap lower 2 pages");
+}
+
+static void test_protected_regular_fifos_and_pty_blksize(void)
+{
+    /* 1. PTY fstat reports st_blksize == 1024 matching stat by path. */
+    int m = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+    CHECK(m >= 0, "open /dev/ptmx");
+    int unlock = 0, ptyno = -1;
+    CHECK(ioctl(m, TIOCSPTLCK, &unlock) == 0, "TIOCSPTLCK");
+    CHECK(ioctl(m, TIOCGPTN, &ptyno) == 0, "TIOCGPTN");
+    char spath[64];
+    snprintf(spath, sizeof spath, "/dev/pts/%d", ptyno);
+    int s = open(spath, O_RDWR | O_NOCTTY);
+    CHECK(s >= 0, "open %s", spath);
+    struct stat st_path, st_slave, st_master;
+    CHECK(stat(spath, &st_path) == 0 && fstat(s, &st_slave) == 0 && fstat(m, &st_master) == 0,
+          "stat/fstat PTY");
+    CHECK(st_path.st_blksize == 1024, "stat slave st_blksize=%ld", (long)st_path.st_blksize);
+    CHECK(st_slave.st_blksize == 1024, "fstat slave st_blksize=%ld", (long)st_slave.st_blksize);
+    CHECK(st_master.st_blksize == 1024, "fstat master st_blksize=%ld", (long)st_master.st_blksize);
+    close(s);
+    close(m);
+
+    /* 2. protected_regular (default 2) and protected_fifos (default 1). */
+    const char *base = "/tmp/sticky_prot";
+    rm_rf(base);
+    CHECK(mkdir(base, 0755) == 0, "mkdir sticky_prot");
+    char d_world[96], d_group[96], d_plain[96];
+    snprintf(d_world, sizeof d_world, "%s/world", base);
+    snprintf(d_group, sizeof d_group, "%s/group", base);
+    snprintf(d_plain, sizeof d_plain, "%s/plain", base);
+    CHECK(mkdir(d_world, 0777) == 0 && chmod(d_world, 01777) == 0, "mkdir world sticky");
+    CHECK(mkdir(d_group, 0777) == 0 && chmod(d_group, 01775) == 0 && chown(d_group, 0, 1000) == 0,
+          "mkdir group sticky");
+    CHECK(mkdir(d_plain, 0777) == 0 && chmod(d_plain, 0777) == 0, "mkdir plain");
+
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork uid 1000");
+    if (pid == 0) {
+        CHECK(setgid(1000) == 0 && setuid(1000) == 0, "setuid 1000");
+        const char *dirs[3] = {d_world, d_group, d_plain};
+        for (int i = 0; i < 3; i++) {
+            char fp[128], ff[128];
+            snprintf(fp, sizeof fp, "%s/reg", dirs[i]);
+            snprintf(ff, sizeof ff, "%s/fifo", dirs[i]);
+            int fd = open(fp, O_CREAT | O_RDWR, 0666);
+            CHECK(fd >= 0, "create %s", fp);
+            close(fd);
+            CHECK(mkfifo(ff, 0666) == 0, "mkfifo %s", ff);
+        }
+        /* Owner opening own file in sticky dir with O_CREAT always succeeds. */
+        char own[128];
+        snprintf(own, sizeof own, "%s/reg", d_world);
+        int fd = open(own, O_CREAT | O_RDWR, 0666);
+        CHECK(fd >= 0, "owner O_CREAT own file");
+        close(fd);
+        _exit(0);
+    }
+    wait_ok(pid, "uid 1000 create files");
+
+    char p_wreg[128], p_wfifo[128], p_greg[128], p_gfifo[128], p_preg[128], p_pfifo[128];
+    snprintf(p_wreg, sizeof p_wreg, "%s/reg", d_world);
+    snprintf(p_wfifo, sizeof p_wfifo, "%s/fifo", d_world);
+    snprintf(p_greg, sizeof p_greg, "%s/reg", d_group);
+    snprintf(p_gfifo, sizeof p_gfifo, "%s/fifo", d_group);
+    snprintf(p_preg, sizeof p_preg, "%s/reg", d_plain);
+    snprintf(p_pfifo, sizeof p_pfifo, "%s/fifo", d_plain);
+
+    /* Sticky world-writable (1777): root O_CREAT denied for both regular and FIFO. */
+    errno = 0;
+    CHECK(open(p_wreg, O_CREAT | O_RDWR, 0666) == -1 && errno == EACCES, "root O_CREAT 1777 reg");
+    errno = 0;
+    CHECK(open(p_wfifo, O_CREAT | O_RDWR, 0666) == -1 && errno == EACCES, "root O_CREAT 1777 fifo");
+    /* O_CREAT | O_EXCL still reports EEXIST before sticky protection. */
+    errno = 0;
+    CHECK(open(p_wreg, O_CREAT | O_EXCL | O_RDWR, 0666) == -1 && errno == EEXIST, "O_EXCL EEXIST");
+    /* Opening without O_CREAT still succeeds. */
+    int fd = open(p_wreg, O_RDWR);
+    CHECK(fd >= 0, "root open 1777 reg without O_CREAT");
+    close(fd);
+    fd = open(p_wfifo, O_RDWR);
+    CHECK(fd >= 0, "root open 1777 fifo without O_CREAT");
+    close(fd);
+
+    /* Sticky group-writable (1775): regular denied (level 2), FIFO allowed (level 1). */
+    errno = 0;
+    CHECK(open(p_greg, O_CREAT | O_RDWR, 0666) == -1 && errno == EACCES, "root O_CREAT 1775 reg");
+    fd = open(p_gfifo, O_CREAT | O_RDWR, 0666);
+    CHECK(fd >= 0, "root O_CREAT 1775 fifo allowed at level 1");
+    close(fd);
+
+    /* Non-sticky (0777): both allowed. */
+    fd = open(p_preg, O_CREAT | O_RDWR, 0666);
+    CHECK(fd >= 0, "root O_CREAT 0777 reg");
+    close(fd);
+    fd = open(p_pfifo, O_CREAT | O_RDWR, 0666);
+    CHECK(fd >= 0, "root O_CREAT 0777 fifo");
+    close(fd);
+
+    /* Root-owned file in root-owned 1777 dir: uid 1000 O_CREAT allowed (file owner == dir owner). */
+    char p_rreg[128];
+    snprintf(p_rreg, sizeof p_rreg, "%s/rootreg", d_world);
+    fd = open(p_rreg, O_CREAT | O_RDWR, 0666);
+    CHECK(fd >= 0 && chmod(p_rreg, 0666) == 0, "create rootreg");
+    close(fd);
+    pid = fork();
+    CHECK(pid >= 0, "fork uid 1000 open rootreg");
+    if (pid == 0) {
+        CHECK(setgid(1000) == 0 && setuid(1000) == 0, "setuid 1000");
+        int f = open(p_rreg, O_CREAT | O_RDWR, 0666);
+        CHECK(f >= 0, "uid 1000 O_CREAT dir-owner file");
+        close(f);
+        _exit(0);
+    }
+    wait_ok(pid, "uid 1000 open rootreg");
+    rm_rf(base);
+}
+
+static void test_inotify_handle_memfd_cgroup_tmpfs(void)
+{
+    /* 1. open_by_handle_at emits IN_OPEN and IN_CLOSE_* (and IN_ISDIR for dirs). */
+    const char *hdir = "/tmp/ino_handle";
+    rm_rf(hdir);
+    CHECK(mkdir(hdir, 0755) == 0, "mkdir ino_handle");
+    char hfile[96];
+    snprintf(hfile, sizeof hfile, "%s/f", hdir);
+    write_file_bytes(hfile, "abc", 3, 0644);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    CHECK(ifd >= 0, "inotify_init1");
+    int f_wd = inotify_add_watch(ifd, hfile, IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_MODIFY);
+    int d_wd = inotify_add_watch(ifd, hdir, IN_OPEN | IN_CLOSE_NOWRITE);
+    CHECK(f_wd >= 0 && d_wd >= 0, "add watches for handle");
+
+    struct {
+        struct file_handle h;
+        unsigned char data[16];
+    } fh;
+    int mnt_id = 0;
+    fh.h.handle_bytes = sizeof fh.data;
+    CHECK(name_to_handle_at(AT_FDCWD, hfile, &fh.h, &mnt_id, 0) == 0, "name_to_handle_at file");
+    int mfd = open(hdir, O_RDONLY | O_DIRECTORY);
+    CHECK(mfd >= 0, "open mount fd");
+    int hfd = open_by_handle_at(mfd, &fh.h, O_RDWR | O_TRUNC);
+    CHECK(hfd >= 0, "open_by_handle_at file");
+    close(hfd);
+
+    struct ino_ev evs[16];
+    size_t cnt = read_inotify_events(ifd, evs, 16);
+    CHECK(has_event(evs, cnt, f_wd, IN_MODIFY, NULL) &&
+              has_event(evs, cnt, f_wd, IN_OPEN, NULL) &&
+              has_event(evs, cnt, f_wd, IN_CLOSE_WRITE, NULL),
+          "open_by_handle_at file events");
+
+    fh.h.handle_bytes = sizeof fh.data;
+    CHECK(name_to_handle_at(AT_FDCWD, hdir, &fh.h, &mnt_id, 0) == 0, "name_to_handle_at dir");
+    int dhfd = open_by_handle_at(mfd, &fh.h, O_RDONLY | O_DIRECTORY);
+    CHECK(dhfd >= 0, "open_by_handle_at dir");
+    close(dhfd);
+    cnt = read_inotify_events(ifd, evs, 16);
+    CHECK(has_event(evs, cnt, d_wd, IN_OPEN | IN_ISDIR, NULL) &&
+              has_event(evs, cnt, d_wd, IN_CLOSE_NOWRITE | IN_ISDIR, NULL),
+          "open_by_handle_at dir events");
+    close(mfd);
+    close(ifd);
+    rm_rf(hdir);
+
+    /* 2. memfd watched via /proc/self/fd/<mfd> reports IN_OPEN, IN_MODIFY, IN_CLOSE_*. */
+    for (int excl = 0; excl < 2; excl++) {
+        int mem = (int)syscall(SYS_memfd_create, "ino_mem", 0U);
+        CHECK(mem >= 0, "memfd_create");
+        int mifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        CHECK(mifd >= 0, "inotify_init1 memfd");
+        char mpath[64];
+        snprintf(mpath, sizeof mpath, "/proc/self/fd/%d", mem);
+        int wd = inotify_add_watch(
+            mifd, mpath,
+            IN_OPEN | IN_MODIFY | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | (excl ? IN_EXCL_UNLINK : 0));
+        CHECK(wd >= 0, "inotify_add_watch memfd excl=%d", excl);
+        int mem2 = open(mpath, O_RDONLY);
+        CHECK(mem2 >= 0, "reopen memfd");
+        CHECK(write(mem, "hi", 2) == 2, "write memfd");
+        close(mem2);
+        close(mem);
+        cnt = read_inotify_events(mifd, evs, 16);
+        CHECK(has_event(evs, cnt, wd, IN_OPEN, NULL) &&
+                  has_event(evs, cnt, wd, IN_MODIFY, NULL) &&
+                  has_event(evs, cnt, wd, IN_CLOSE_NOWRITE, NULL) &&
+                  has_event(evs, cnt, wd, IN_CLOSE_WRITE, NULL),
+              "memfd inotify excl=%d", excl);
+        close(mifd);
+    }
+
+    /* 3. cgroup2 file reports IN_OPEN, single IN_MODIFY, and IN_CLOSE_* on file & dir watches. */
+    const char *cg = "/sys/fs/cgroup/ino_close_test";
+    rmdir(cg);
+    CHECK(mkdir(cg, 0755) == 0, "mkdir cgroup2 child");
+    char cg_freeze[128];
+    snprintf(cg_freeze, sizeof cg_freeze, "%s/cgroup.freeze", cg);
+    int cifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    CHECK(cifd >= 0, "inotify_init1 cgroup2");
+    int cdir_wd = inotify_add_watch(cifd, cg, IN_OPEN | IN_MODIFY | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE);
+    int cfile_wd = inotify_add_watch(cifd, cg_freeze, IN_OPEN | IN_MODIFY | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE);
+    CHECK(cdir_wd >= 0 && cfile_wd >= 0, "add cgroup2 watches");
+
+    int cfd = open(cg_freeze, O_RDONLY);
+    CHECK(cfd >= 0, "open cgroup.freeze O_RDONLY");
+    close(cfd);
+    cfd = open(cg_freeze, O_WRONLY);
+    CHECK(cfd >= 0, "open cgroup.freeze O_WRONLY");
+    CHECK(write(cfd, "0\n", 2) == 2, "write cgroup.freeze");
+    close(cfd);
+
+    cnt = read_inotify_events(cifd, evs, 16);
+    int f_open = 0, f_mod = 0, f_cnw = 0, f_cw = 0;
+    int d_open = 0, d_mod = 0, d_cnw = 0, d_cw = 0;
+    for (size_t i = 0; i < cnt; i++) {
+        if (evs[i].wd == cfile_wd) {
+            f_open += (evs[i].mask == IN_OPEN);
+            f_mod += (evs[i].mask == IN_MODIFY);
+            f_cnw += (evs[i].mask == IN_CLOSE_NOWRITE);
+            f_cw += (evs[i].mask == IN_CLOSE_WRITE);
+        } else if (evs[i].wd == cdir_wd) {
+            d_open += (evs[i].mask == IN_OPEN);
+            d_mod += (evs[i].mask == IN_MODIFY);
+            d_cnw += (evs[i].mask == IN_CLOSE_NOWRITE);
+            d_cw += (evs[i].mask == IN_CLOSE_WRITE);
+        }
+    }
+    CHECK(f_open == 2 && f_mod == 1 && f_cnw == 1 && f_cw == 1,
+          "cgroup2 file events open=%d mod=%d cnw=%d cw=%d", f_open, f_mod, f_cnw, f_cw);
+    CHECK(d_open == 2 && d_mod == 1 && d_cnw == 1 && d_cw == 1,
+          "cgroup2 dir events open=%d mod=%d cnw=%d cw=%d", d_open, d_mod, d_cnw, d_cw);
+    close(cifd);
+    CHECK(rmdir(cg) == 0, "rmdir cgroup2 child");
+
+    /* 4. inotify fdinfo reports tmpfs device (not rootfs 8:1) for tmpfs files. */
+    const char *rfile = "/tmp/ino_dev_root";
+    const char *tfile = "/dev/shm/ino_dev_tmpfs";
+    write_file_bytes(rfile, "r", 1, 0644);
+    write_file_bytes(tfile, "t", 1, 0644);
+    struct stat rst, tst;
+    CHECK(stat(rfile, &rst) == 0 && stat(tfile, &tst) == 0, "stat root & tmpfs files");
+    CHECK(rst.st_dev != tst.st_dev, "tmpfs dev must differ from rootfs dev");
+
+    int difd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    CHECK(difd >= 0, "inotify_init1 fdinfo");
+    int rwd = inotify_add_watch(difd, rfile, IN_ATTRIB);
+    int twd = inotify_add_watch(difd, tfile, IN_ATTRIB);
+    CHECK(rwd >= 0 && twd >= 0, "add root & tmpfs watches");
+
+    char fipath[64], fibuf[2048];
+    snprintf(fipath, sizeof fipath, "/proc/self/fdinfo/%d", difd);
+    read_proc_str(fipath, fibuf, sizeof fibuf);
+
+    unsigned long want_rdev = ((unsigned long)major(rst.st_dev) << 20) | minor(rst.st_dev);
+    unsigned long want_tdev = ((unsigned long)major(tst.st_dev) << 20) | minor(tst.st_dev);
+    char want_rline[128], want_tline[128];
+    snprintf(want_rline, sizeof want_rline, "inotify wd:%x ino:%lx sdev:%lx ", rwd,
+             (unsigned long)rst.st_ino, want_rdev);
+    snprintf(want_tline, sizeof want_tline, "inotify wd:%x ino:%lx sdev:%lx ", twd,
+             (unsigned long)tst.st_ino, want_tdev);
+    CHECK(strstr(fibuf, want_rline) != NULL, "fdinfo missing root line '%s' in:\n%s", want_rline,
+          fibuf);
+    CHECK(strstr(fibuf, want_tline) != NULL, "fdinfo missing tmpfs line '%s' in:\n%s", want_tline,
+          fibuf);
+    close(difd);
+    unlink(rfile);
+    unlink(tfile);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "deleted-overlay-exe") == 0) {
@@ -2072,6 +2484,10 @@ int main(int argc, char **argv)
     test_splice_socket_offset();
     test_pipe_regressions();
     test_fs_io_compat_fixes();
+    test_max_rw_count_caps();
+    test_splice_procfs_and_pipe_fault_writes();
+    test_protected_regular_fifos_and_pty_blksize();
+    test_inotify_handle_memfd_cgroup_tmpfs();
 
     printf("all ok\n");
     return 0;

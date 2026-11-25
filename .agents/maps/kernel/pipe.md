@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: socket input offsets and error ordering in splice)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: reject `splice` on procfs nodes lacking `splice_read`/`splice_write` and per-page faulting-buffer semantics in `pipe_write_user`)
 
 ## Responsibilities
 
@@ -51,10 +51,12 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 - Pipe reads (`read`, `readv`, read-side `vmsplice`) peek and copy into guest memory via
   `pipe_read_user` (`write_user_partial`), draining only the bytes actually copied so a faulting
   user buffer (`EFAULT`) leaves unread bytes in the pipe.
-- Ordinary writes may merge the initial length modulo 4096 into the last anonymous write slot
-  if it all fits after the last byte. The remaining data occupies new slots. Reading a prefix
-  keeps its slot occupied until the final byte leaves. Freeing a slot from a full pipe wakes
-  blocked writers and advances the write-end edge counter.
+- Ordinary writes (`pipe_write_user` for guest `write`/`writev`) merge an initial `total % 4096`
+  prefix into the last anonymous write slot if it fits and copies completely, then copy and commit
+  remaining data one `PIPE_BUF` (4096-byte) page slot at a time; a fault discards the incomplete
+  page and returns bytes committed so far (`EFAULT` when none), so a sub-page faulting `writev`
+  writes nothing. Reading a prefix keeps its slot occupied until the final byte leaves. Freeing a
+  slot from a full pipe wakes blocked writers and advances the write-end edge counter.
 - FIFO open: one `Pipe` per inode; write-only nonblocking without a reader `ENXIO`; read-only
   nonblocking succeeds; read-write never waits; blocking one-ended opens wait for a peer present
   or opened since (`ERESTARTSYS` on a signal); access mode 3 `EINVAL` (`fifo_open`).
@@ -79,10 +81,12 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
   see).
 - Which files splice at each end follows Linux's `splice_read` and `splice_write`
   (`splice_reads`, `splice_writes`, also used by sendfile): pipes, regular and FUSE files,
-  sockets, terminals, host fds, `/dev/fuse`, procfs and sysfs files, and the devices, except that
-  `/dev/null` cannot be read from, `/dev/full` cannot be written to, and `/dev/kmsg` and
-  `/dev/loop-control` neither; directories, eventfd, epoll and the other anonymous files cannot
-  splice at all.
+  sockets, terminals, host fds, `/dev/fuse`, sysfs/cgroup2 and `/proc/sys` files, global/`net`/
+  `sysvipc` procfs files and `/proc/<pid>/{mounts,mountinfo}` (reads only), and the devices,
+  except that `/dev/null` cannot be read from, `/dev/full` cannot be written to, `/dev/kmsg` and
+  `/dev/loop-control` neither, and per-process procfs entries (other than `mounts`/`mountinfo`),
+  `fdinfo`, `ns/*` and `/proc/kmsg` cannot splice (`EINVAL`); directories, eventfd, epoll and the
+  other anonymous files cannot splice at all.
 - When splice waits follows 6.1: between two pipes and for tee, for data (going on at end of file)
   and then room, unless `SPLICE_F_NONBLOCK` or either end's `O_NONBLOCK`, then moving or copying
   what is there and fits (splice waits again if a race took it, tee returns 0); from a pipe, for
@@ -128,16 +132,9 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 - **splice's checks differ:** access modes (`EBADF`) come before a pipe given an offset
   (`ESPIPE`), where 6.1 returns `ESPIPE` first; some unseekable non-socket inputs return `ESPIPE`
   after waiting for room where Linux returns `EINVAL`.
-- **Pipe write I/O with faulting buffers:** a writev whose later iovec faults still writes what
-  precedes it (Linux commits only whole copied pages; a sub-page writev writes nothing); a write
-  copies up to 64 KiB at a time, so a fault in the first chunk is `EFAULT` and a later one
-  returns the preceding chunks (Linux returns the bytes up to the fault).
 - **Fidelity gaps**, one per line:
   - `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues);
-  - vmsplice copies at the call, so later changes to the buffer are not seen by the reader;
-  - every procfs and sysfs file is taken as splicing both ways, so splice reads a per-process
-    file such as `/proc/<pid>/status` into a pipe, which has no `splice_read` on Linux (`EINVAL`
-    on a native 6.8 kernel).
+  - vmsplice copies at the call, so later changes to the buffer are not seen by the reader.
 
 ## Open questions
 

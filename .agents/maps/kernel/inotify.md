@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cgroup2 attribute events through paths and file descriptors)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: tmpfs fdinfo device numbers, cgroup2 `IN_CLOSE_*`, and `open_by_handle_at`/memfd watch and open/close events)
 
 ## Responsibilities
 
@@ -71,8 +71,12 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   instances, 2^20 watches, 16384 queued events).
 - Watches are keyed by store inode number, an overlay node's key, a FUSE node's key or a cgroup2
   node's key, whose changes `kernel/cgroup` reports as `IN_MODIFY`; watches on other synthetic
-  nodes are accepted, counted and never report. Adding one needs read permission on what the
-  store or the overlay shows (a FUSE node `fuse_permission`'s; synthetic nodes are not checked);
+  nodes are accepted, counted and never report. `inotify_add_watch` unwraps `/proc/<pid>/fd/*`
+  (`OpenFd`) and `/proc/<pid>/exe` (`OpenExe`) magic links to watch the underlying store/overlay/
+  FUSE inode (including memfds and unlinked files, checking `MAY_READ` against `store.attrs`), and
+  records store-node `sdev` from `vfs.dev_of(&node)` so tmpfs watches show their tmpfs device in
+  fdinfo. Adding a watch needs read permission on what the store or the overlay shows (a FUSE node
+  `fuse_permission`'s; synthetic nodes are not checked);
   bind aliases of a node share one descriptor per instance. Store, overlay and FUSE use their
   respective node IDs; synthetic nodes are compared within their filesystem device. Adding an
   existing watch replaces its mask, merges it with `IN_MASK_ADD`, or fails with `EEXIST` for
@@ -109,10 +113,13 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   exist (`watched_at`, falling back to a FUSE node's recorded parent/name if cached attrs staled).
   fd-based events (I/O, truncation, close) go to the directory and name the open went through,
   recorded in `Opened` (the dentry a Linux open file references): every non-`O_PATH` open of a
-  regular file, named FIFO, device or directory (store, overlay, FUSE, cgroup2 directories) or FUSE file
-  records one, whether or not watches exist. Store, overlay and FUSE `O_PATH` fds track the dentry
-  with a zero close mask and emit no open or close event. A reopened FIFO gets its own record at the original dentry. Cgroup2 files
-  report `IN_OPEN` and never `IN_CLOSE_*`. Unlinks and renames update the records of open files,
+  regular file, named FIFO, device or directory (store, overlay, FUSE, cgroup2), FUSE file or
+  cgroup2 file — as well as `open_by_handle_at` and `memfd_create` — records one, whether or not
+  watches exist. Store, overlay and FUSE `O_PATH` fds track the dentry with a zero close mask and
+  emit no open or close event. A reopened FIFO gets its own record at the original dentry; memfds
+  and their `/proc/<pid>/fd/*` reopens are not marked unlinked for `IN_EXCL_UNLINK`. Cgroup2 files
+  report `IN_OPEN`, `IN_MODIFY` (via `file_io_event` on writes) and `IN_CLOSE_*`. Unlinks and
+  renames update the records of open files,
   looking up records for the affected key even with no watches; after a deletion the records stay (marked
   unlinked), so non-excluded events still go to the original directory.
 - Exec reports the program, nested scripts and ELF interpreter under the key each was opened
@@ -179,8 +186,6 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
 
 ## Confirmed bugs / technical debt
 
-- **fdinfo and event gaps:** fdinfo shows device 8:1 for every store-node watch, tmpfs files
-  included; cgroup2 files report `IN_OPEN` but never `IN_CLOSE_*`.
 - **Namespace-file watch lifetime:** repeated watches on `/proc/self/ns/mnt` reuse the descriptor
   by namespace ID. Native Linux 6.8 returned a new descriptor on each lookup when no fd pinned
   the nsfs inode, and reused it while an fd was open.

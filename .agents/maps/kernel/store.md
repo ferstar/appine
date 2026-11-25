@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cached relatime freshness state, packed connection open epoch, and host-modification invalidation)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: track deleted held regular files in `pending_release` and release their shared-object hold once closed/unmapped)
 
 ## Responsibilities
 
@@ -37,8 +37,9 @@ provider and rootfs installation UI (`android`).
 - `Store` — one SQLite connection with transaction state: pending deferred transaction, `writing`
   flag, `doomed` objects to delete after commit, `replaced` files to flush before commit, `created`
   objects to unlink on savepoint rollback, the waker, the read-snapshot state, the owning kernel
-  id, changed directories, cached `store_id` (`objects/` dev/ino), and `writable_maps` (inodes
-  excluded from `relatime` caching because they may be mutated via writable shared mappings).
+  id, changed directories, cached `store_id` (`objects/` dev/ino), `writable_maps` (inodes
+  excluded from `relatime` caching because they may be mutated via writable shared mappings), and
+  `pending_release` (deleted held regular files awaiting release once closed/unmapped).
 - `Meta` — state shared with readers and the reaper thread: the cache behind an `RwLock`, the
   commit counter, the reaper queue, the WAL path and durability watermark.
 - `Stat` includes the store inode’s access and default ACLs; `DirEntry`, `FileTime` (`Now` or `At(ns)`), the `mode` constants; `Ino = u64`, `ROOT = 1`.
@@ -163,9 +164,11 @@ provider and rootfs installation UI (`android`).
   under a reused number is truncated and reused.
 - Removing a regular file's last link leaves the row with nlink 0 and queues the object for deletion
   after commit when no other row uses it (open host fds keep working); a held file instead keeps
-  its row in `shared` until `release` (called by the kernel when nothing has it open or mapped) or
-  the next boot, since its descriptions still read the shared object and a write through them must
-  find it. rmdir likewise leaves an nlink-0 row. Rows stay until
+  its row in `shared` and records its inode in `pending_release` until `release` (called by the
+  kernel on unlink/rename when already closed, on post-syscall/thread-exit/`execve` sweeps once
+  its last open fd, mapping or executable reference closes, and before `make_private`) or the next
+  boot, so remaining sharers settle in place on their next write instead of copying. rmdir likewise
+  leaves an nlink-0 row. Rows stay until
   the next boot cleanup, so numbers are not reused while the store runs; after boot, numbers above
   the highest surviving row (and numbers of rolled-back inserts) are reused.
 - tmpfs trees and file-import staging directories are detached directories (their own parent) recorded in
@@ -357,9 +360,6 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
-- **Shared objects of deleted files:** a held file deleted while open keeps its share until boot,
-  so the next write to another file sharing the object copies it although nobody reads the deleted
-  one any more.
 - **Whole-file sharing:** the first change to a file sharing its object copies all of it, where
   btrfs and XFS copy only the extents written.
 

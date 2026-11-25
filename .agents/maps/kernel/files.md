@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `FIONREAD` on FUSE regular files)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: emit inotify `IN_OPEN`/`IN_CLOSE_*` for `open_by_handle_at`, `memfd_create` and cgroup2 files)
 
 ## Responsibilities
 
@@ -189,10 +189,12 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   `open_by_handle_at` needs `CAP_DAC_READ_SEARCH` in the initial user namespace (`EPERM`), a size
   of 1 to 128 (`EINVAL`) and a mount fd on a store node; a wrong handle or a missing or unlinked
   inode is `ESTALE`. It opens the inode on that mount (any store mount, with no same-filesystem
-  check) through `open_store` with every check, or as an `O_PATH` fd, without open events, display
-  path or validation of other open flags.
-- Opens through a path of a regular file, device, directory (store, overlay, FUSE, cgroup2) or FUSE
-  file record an inotify `Opened` (`kernel/inotify`), watches or not. `O_TMPFILE` is not
+  check) through `open_store` with every check, or as an `O_PATH` fd, emitting `IN_OPEN` (and
+  `IN_MODIFY` on `O_TRUNC`) and attaching an inotify `Opened` record, without a display path or
+  validation of other open flags.
+- Opens through a path of a regular file, device, directory (store, overlay, FUSE, cgroup2), FUSE
+  file or cgroup2 file, as well as `open_by_handle_at` and `memfd_create`, record an inotify
+  `Opened` (`kernel/inotify`), watches or not. `O_TMPFILE` is not
   implemented: invalid combinations are `EINVAL` as on Linux (with `O_CREAT`, or read-only), a
   valid one reaches the directory branch (`EISDIR`). `O_DIRECT` (6.1's `direct_IO` check, before
   the file's own open) passes regular files on mounts other than tmpfs, block devices and sockets;
@@ -284,8 +286,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   - no `O_TMPFILE`;
   - a write open on a read-only instance is `EROFS` only after permission (6.1's `sb_permission`
     comes first; overlay opens already do);
-  - open_by_handle_at and memfds report no `IN_OPEN`, and cgroup2 files no `IN_CLOSE_*`; handles
-    open a store inode through any store mount;
+  - handles open a store inode through any store mount;
   - table growth uses power-of-two capacity even when a lowered `nr_open` would cap Linux’s allocation.
 
 ## Open questions

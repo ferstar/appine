@@ -364,6 +364,9 @@ pub struct Store {
     /// object's mtime/ctime can advance via dirty-page writeback without a syscall into the store.
     /// Kept outside [`Cache`] because a mapping outlives cache clears.
     writable_maps: RefCell<HashSet<Ino>>,
+    /// Deleted regular files whose `shared` row was kept at unlink/rename because they might still
+    /// be open or mapped: released once nothing in the kernel references them (`Store::release`).
+    pending_release: RefCell<HashSet<Ino>>,
 }
 
 impl Store {
@@ -534,6 +537,7 @@ impl Store {
             waker: RefCell::new(None),
             fills: RefCell::default(),
             writable_maps: RefCell::default(),
+            pending_release: RefCell::default(),
         })
     }
 
@@ -1640,6 +1644,8 @@ impl Store {
             // through them must find what to copy ([`Store::release`])
             if data.held.is_none() {
                 self.drop_object(ino, data)?;
+            } else {
+                self.pending_release.borrow_mut().insert(ino);
             }
         } else {
             self.object_changed(ino);
@@ -2745,12 +2751,24 @@ impl Store {
         }
     }
 
+    /// Whether any deleted held regular files are waiting for their last reference to close so
+    /// their shared-object hold can be released.
+    pub(crate) fn has_pending_release(&self) -> bool {
+        !self.pending_release.borrow().is_empty()
+    }
+
+    /// Snapshot of deleted held regular files awaiting release.
+    pub(crate) fn pending_releases(&self) -> Vec<Ino> {
+        self.pending_release.borrow().iter().copied().collect()
+    }
+
     /// Deleted regular file `ino` is not open any more: if it was held, it stops sharing its
     /// object, which goes when no other file uses it (otherwise the next boot does this).
     pub fn release(&self, ino: Ino) -> Result<(), Errno> {
         self.writable_maps.borrow_mut().remove(&ino);
+        let was_pending = self.pending_release.borrow_mut().remove(&ino);
         let (st, data) = self.row(ino)?;
-        if st.nlink != 0 || st.kind() != mode::S_IFREG || !data.listed(ino) {
+        if st.nlink != 0 || st.kind() != mode::S_IFREG || (!data.listed(ino) && !was_pending) {
             return Ok(());
         }
         self.transaction(|s| s.drop_object(ino, data))
@@ -4821,6 +4839,66 @@ mod tests {
         assert_eq!(stats(&a), before_stats);
 
         drop((file, a));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_held_file_pending_release_avoids_copy_on_other_sharer() {
+        use std::io::Read;
+        let (s, dir) = temp_store("deleted_held_release");
+        let read = |s: &Store, ino| {
+            let mut v = Vec::new();
+            s.open_object(ino, false)
+                .unwrap()
+                .read_to_end(&mut v)
+                .unwrap();
+            v
+        };
+        let (a, mut fa) = s.create_file(ROOT, b"a", 0o644, 0, 0).unwrap();
+        fa.write_all(b"shared payload").unwrap();
+        drop(fa);
+        let (b, fb) = s.create_file(ROOT, b"b", 0o644, 0, 0).unwrap();
+        drop(fb);
+        s.share(a, b).unwrap();
+        assert!(s.held(a).unwrap() && s.held(b).unwrap());
+
+        // Unlink `a` while it might still be open: its share stays pending instead of being dropped.
+        s.unlink(ROOT, b"a").unwrap();
+        assert!(s.has_pending_release());
+        assert_eq!(s.pending_releases(), vec![a]);
+        assert_eq!(s.users_of(a).unwrap(), 2);
+
+        // Once `a` closes and `release(a)` runs, `b` is the sole user and settles in place with no copy.
+        s.release(a).unwrap();
+        assert!(!s.has_pending_release());
+        assert_eq!(s.users_of(a).unwrap(), 1);
+        assert!(
+            s.unshare(b, None).unwrap().is_none(),
+            "sole remaining sharer must settle in place without copying"
+        );
+        assert!(!s.held(b).unwrap());
+        assert_eq!(read(&s, b), b"shared payload");
+
+        // Also check the case where a deleted held file settles back to its own object before close:
+        // releasing it afterward must still doom its object once committed.
+        let (c, mut fc) = s.create_file(ROOT, b"c", 0o644, 0, 0).unwrap();
+        fc.write_all(b"payload c").unwrap();
+        drop(fc);
+        let (d, fd) = s.create_file(ROOT, b"d", 0o644, 0, 0).unwrap();
+        drop(fd);
+        s.share(c, d).unwrap();
+        s.unlink(ROOT, b"c").unwrap();
+        assert!(s.pending_releases().contains(&c));
+        s.unlink(ROOT, b"d").unwrap();
+        s.release(d).unwrap();
+        assert!(s.unshare(c, None).unwrap().is_none());
+        s.release(c).unwrap();
+        s.commit().unwrap();
+        drop(s);
+        assert!(
+            !dir.join("objects").join(c.to_string()).exists(),
+            "settled deleted held file's own object must be reaped after release"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -205,6 +205,7 @@ const FICLONERANGE: u32 = 0x4020_940d;
 const FIDEDUPERANGE: u32 = 0xc018_9436;
 
 const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
 
 // ---- Opening, closing, duplicating ----
 
@@ -398,7 +399,8 @@ fn open_path_with(
     } else {
         openat2_start(cx, dirfd, &path, res)?
     };
-    let create = flags & oflags::O_CREAT != 0;
+    let path_only = flags & oflags::O_PATH != 0;
+    let create = !path_only && flags & oflags::O_CREAT != 0;
     let excl = create && flags & oflags::O_EXCL != 0;
     let follow = flags & oflags::O_NOFOLLOW == 0 && !excl;
     let cred = cx.cred();
@@ -418,6 +420,9 @@ fn open_path_with(
     let (mut node, created, parent) = match resolved {
         Ok(_) if excl => return Err(Errno::EEXIST),
         Ok((node, found)) => {
+            if create {
+                may_create_in_sticky(cx, &vfs, &cred, &node, found.as_ref().map(|d| &d.entry.0))?;
+            }
             unlinked_name = found.as_ref().is_some_and(|d| d.unlinked);
             (node, None, found.map(|d| d.entry))
         }
@@ -565,7 +570,6 @@ fn open_path_with(
     let was_created = created.is_some() || fuse_created.is_some();
     let via_devpts = matches!(node, Node::Pseudo(_, PseudoNode::Pts(..)));
     let mut opened_ino = inotify::key_of(&node);
-    let path_only = flags & oflags::O_PATH != 0;
     let mut opened_mnt = match &node {
         Node::Store(mnt, _) | Node::Fuse(mnt, _) | Node::Pseudo(mnt, PseudoNode::Mq(..)) => {
             Some(*mnt)
@@ -599,9 +603,10 @@ fn open_path_with(
                 unlinked_name |= path_only
                     || source.ovl.is_some()
                     || source.dentry_unlinked()
-                    || backing.is_some_and(|(ino, ..)| {
-                        vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0)
-                    });
+                    || (!source.pseudo
+                        && backing.is_some_and(|(ino, ..)| {
+                            vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0)
+                        }));
             }
             if path_only {
                 if let Some((ino, host, writable)) = backing {
@@ -715,6 +720,75 @@ fn open_path_with(
         file.borrow_mut().watch = Some(watch);
     }
     Ok(file)
+}
+
+fn sticky_protection_allows(
+    mode: u32,
+    uid: u32,
+    fsuid: u32,
+    dir_mode: u32,
+    dir_uid: u32,
+    level: i64,
+) -> bool {
+    if !matches!(mode & mode::S_IFMT, mode::S_IFREG | mode::S_IFIFO) {
+        return true;
+    }
+    if level <= 0 || fsuid == uid || dir_mode & mode::S_ISVTX == 0 || uid == dir_uid {
+        return true;
+    }
+    !(dir_mode & 0o002 != 0 || (level >= 2 && dir_mode & 0o020 != 0))
+}
+
+/// Linux 6.1's `may_create_in_sticky` (`fs.protected_regular` and `fs.protected_fifos`):
+/// opening an existing regular file or FIFO with `O_CREAT` in a sticky directory (world-writable
+/// at level 1, or also group-writable at level 2) is `EACCES` unless the caller owns the file or
+/// the directory owner owns the file (even for root).
+fn may_create_in_sticky(
+    cx: &Cx<'_>,
+    vfs: &Vfs,
+    cred: &Cred,
+    node: &Node,
+    dir: Option<&Node>,
+) -> Result<(), Errno> {
+    let Some(dir) = dir else {
+        return Ok(());
+    };
+    let node_attrs = |n: &Node| -> Result<Option<(u32, u32)>, Errno> {
+        Ok(match n {
+            Node::Store(_, ino) => {
+                let st = vfs.store().attrs(*ino)?;
+                Some((st.mode, st.uid))
+            }
+            Node::Overlay(_, o) => {
+                let st = vfs.overlay_stat(*o)?;
+                Some((st.mode, st.uid))
+            }
+            Node::Fuse(_, f) => {
+                let st = crate::vfs::fuse::cached_attr(vfs, *f)?;
+                Some((st.mode, st.uid))
+            }
+            Node::Pseudo(..) => None,
+        })
+    };
+    let Some((mode, uid)) = node_attrs(node)? else {
+        return Ok(());
+    };
+    let key = match mode & mode::S_IFMT {
+        mode::S_IFREG => pseudo::PROTECTED_REGULAR,
+        mode::S_IFIFO => pseudo::PROTECTED_FIFOS,
+        _ => return Ok(()),
+    };
+    let level = pseudo::recorded_value(cx.kr(), key);
+    if level <= 0 || cred.fsuid == uid {
+        return Ok(());
+    }
+    let Some((dir_mode, dir_uid)) = node_attrs(dir)? else {
+        return Ok(());
+    };
+    if !sticky_protection_allows(mode, uid, cred.fsuid, dir_mode, dir_uid, level) {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
 }
 
 /// Start and root directory of openat2 (path_init). With a scope (`BENEATH`, `IN_ROOT`) the root
@@ -1253,6 +1327,7 @@ pub(super) fn open_by_handle_at(
     };
     let file = OpenFile::new(kind, flags & kept(flags) | largefile(flags));
     file.borrow_mut().mnt = mnt;
+    open_events(cx, &file, ino, None, false, flags, false);
     cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
@@ -1858,6 +1933,7 @@ pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult 
         Some(Rc::from(path)),
     );
     file.borrow_mut().pseudo = true;
+    open_events(cx, &file, ino, None, false, oflags::O_RDWR, false);
     cx.install_fd(file, flags & MFD_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
@@ -2720,6 +2796,13 @@ pub(super) fn append_offset(
         {
             Ok(Some(file.metadata().map_err(host_errno)?.len()))
         }
+        FileKind::Host(fd)
+            if offset.is_some()
+                && host_regular(*fd)
+                && (append || f.flags & oflags::O_APPEND != 0) =>
+        {
+            Ok(Some(appine_hal::fstat(*fd).map_err(Errno)?.st_size as u64))
+        }
         _ => Ok(offset),
     }
 }
@@ -2877,31 +2960,45 @@ const SPLICE_F_ALL: u32 = 0xf;
 
 /// Whether data can be spliced out of `f` (Linux's `splice_read`), which splice and sendfile from
 /// it need (EINVAL otherwise): see [`splice_kind`]; of the devices, not `/dev/null`, `/dev/kmsg`
-/// or `/dev/loop-control`.
+/// or `/dev/loop-control`; of procfs/sysfs, not per-process entries (other than `mounts`/
+/// `mountinfo`), `fdinfo`, `ns/*` or `/proc/kmsg`.
 fn splice_reads(f: &OpenFile) -> bool {
     match &f.kind {
         FileKind::Device { dev, .. } => {
             !matches!(dev, Device::Null | Device::Kmsg | Device::LoopControl)
         }
+        FileKind::Proc { node, .. } => proc_splice_reads(node),
         kind => splice_kind(kind),
     }
 }
 
 /// Whether data can be spliced into `f` (Linux's `splice_write`), which splice and sendfile into
 /// it need (EINVAL otherwise): see [`splice_kind`]; of the devices, not `/dev/full` (6.1's
-/// `full_fops` has none, so it never gets to ENOSPC), `/dev/kmsg` or `/dev/loop-control`.
+/// `full_fops` has none, so it never gets to ENOSPC), `/dev/kmsg` or `/dev/loop-control`; of
+/// synthetic files, only kernfs (sysfs, cgroup2) and `/proc/sys` sysctls (`pseudo::has_iter`).
 fn splice_writes(f: &OpenFile) -> bool {
     match &f.kind {
         FileKind::Device { dev, .. } => {
             !matches!(dev, Device::Full | Device::Kmsg | Device::LoopControl)
         }
+        FileKind::Proc { node, .. } => pseudo::has_iter(node, true),
         kind => splice_kind(kind),
     }
 }
 
+fn proc_splice_reads(node: &PseudoNode) -> bool {
+    match node {
+        PseudoNode::Entry(_, _, pseudo::Entry::Mounts | pseudo::Entry::MountInfo) => true,
+        PseudoNode::Entry(..)
+        | PseudoNode::FdInfo(..)
+        | PseudoNode::NsFile(..)
+        | PseudoNode::Global(pseudo::Global::Kmsg) => false,
+        _ => true,
+    }
+}
+
 /// The kinds of files that splice both ways (Linux's pipes, regular files, sockets, terminals,
-/// FUSE files and `/dev/fuse`; procfs and sysfs files are all taken as splicing). Directories,
-/// eventfd, epoll and the other anonymous files do not.
+/// FUSE files and `/dev/fuse`). Directories, eventfd, epoll and the other anonymous files do not.
 fn splice_kind(kind: &FileKind) -> bool {
     matches!(
         kind,
@@ -2909,7 +3006,6 @@ fn splice_kind(kind: &FileKind) -> bool {
             | FileKind::Pipe(_)
             | FileKind::Socket(_)
             | FileKind::Pty(_)
-            | FileKind::Proc { .. }
             | FileKind::Host(_)
             | FileKind::Fuse(_)
             | FileKind::FuseDev(_)
@@ -3397,7 +3493,16 @@ fn stream_vectored(
             let nonblock = file.borrow().nonblocking() || io.nowait;
             super::net::rw(cx, &s, nonblock, vecs, write)
         }
-        IoPath::Pipe(_) | IoPath::Pty(..) if write => write_gathered(cx, file, vecs, IO_CHUNK, io),
+        IoPath::Pipe(pipe) if write => {
+            let f = file.borrow();
+            if !f.writable() {
+                return Some(Err(Errno::EBADF));
+            }
+            let nonblock = f.nonblocking() || io.nowait;
+            drop(f);
+            pipe_write_user(cx, &pipe, nonblock, vecs)
+        }
+        IoPath::Pty(..) if write => write_gathered(cx, file, vecs, IO_CHUNK, io),
         IoPath::Pipe(_) | IoPath::Pty(..) | IoPath::EventFd(_) if !write => {
             read_scattered(cx, file, vecs, IO_CHUNK, io)
         }
@@ -3509,9 +3614,9 @@ fn read_scattered(
     Ok(done as u64)
 }
 
-/// writev on a pipe, terminal or `/dev/fuse`: the iovecs written as one stream, in pieces of up
-/// to `step` bytes that cross iovec boundaries, stopping at a short write; a fault ends the data
-/// there, and what came before it is still written.
+/// writev on a terminal, non-regular host stdio or `/dev/fuse`: the iovecs written as one stream,
+/// in pieces of up to `step` bytes that cross iovec boundaries, stopping at a short write; a fault
+/// ends the data there, and what came before it is still written.
 fn write_gathered(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -3526,22 +3631,8 @@ fn write_gathered(
     let mut cur = None;
     let mut done = 0;
     let total = vecs.iter().map(|v| v.1).sum();
-    let pipe = pipe_of(file);
-    let first_step = match &pipe {
-        Some((p, _)) if total > step => {
-            // End the first copy on a new pipe-page boundary even when it merges a prefix.
-            let merge = p.borrow().merge_len(total);
-            if merge == 0 {
-                step
-            } else {
-                step - PIPE_BUF + merge
-            }
-        }
-        _ => step,
-    };
     let mut chunk = Vec::with_capacity(step.min(total));
     loop {
-        let step = if done == 0 { first_step } else { step };
         chunk.clear();
         let mut fault = None;
         while chunk.len() < step {
@@ -3566,14 +3657,7 @@ fn write_gathered(
                 _ => Ok(done as u64),
             };
         }
-        let written = match &pipe {
-            Some((p, _)) => {
-                let nonblock = file.borrow().nonblocking() || io.nowait;
-                pipe_write(cx, p, nonblock, &chunk, done == 0)
-            }
-            None => write_bytes_with(cx, file, &chunk, None, io),
-        };
-        match written {
+        match write_bytes_with(cx, file, &chunk, None, io) {
             Ok(k) => {
                 done += k;
                 if k < chunk.len() || fault.is_some() {
@@ -3586,7 +3670,9 @@ fn write_gathered(
     }
 }
 
-/// Reads an iovec array.
+/// Reads an iovec array, rejecting counts over `UIO_MAXIOV` or totals over `isize::MAX` with
+/// `EINVAL`, and capping the total length at `MAX_RW_COUNT` (`MAX_COPY`) as Linux's
+/// `import_iovec` does so trailing iovecs beyond `MAX_RW_COUNT` are never touched.
 fn iovecs(cx: &Cx<'_>, iov: u64, count: usize) -> Result<Vec<(u64, usize)>, Errno> {
     if count > UIO_MAXIOV {
         return Err(Errno::EINVAL);
@@ -3603,7 +3689,24 @@ fn iovecs(cx: &Cx<'_>, iov: u64, count: usize) -> Result<Vec<(u64, usize)>, Errn
             .ok_or(Errno::EINVAL)?;
         out.push((base, len));
     }
+    cap_iovecs(&mut out);
     Ok(out)
+}
+
+fn cap_iovecs(vecs: &mut Vec<(u64, usize)>) {
+    let mut left = MAX_COPY;
+    let mut keep = 0;
+    for (_, len) in vecs.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        if *len > left {
+            *len = left;
+        }
+        left -= *len;
+        keep += 1;
+    }
+    vecs.truncate(keep);
 }
 
 pub(super) fn sendfile(
@@ -3645,6 +3748,7 @@ pub(super) fn sendfile(
         0 => None,
         addr => Some(u64::try_from(i64::from_le_bytes(get(cx, addr)?)).map_err(|_| Errno::EINVAL)?),
     };
+    let count = count.min(MAX_COPY);
     if let Some((pipe, _)) = pipe_of(&output) {
         if count == 0 {
             return Ok(0);
@@ -3765,15 +3869,14 @@ pub(super) fn copy_file_range(
     if flags != 0 {
         return Err(Errno::EINVAL);
     }
-    let len = copy_range_checks(cx, (&input, src), (&output, dst), len)?;
+    let len = copy_range_checks(cx, (&input, src), (&output, dst), len)?.min(MAX_COPY);
     let (src, dst) = (src.map(|s| s as u64), dst.map(|d| d as u64));
     if len == 0 {
         return Ok(0);
     }
-    // A copy of the whole input into an output no longer than it shares the input's object, as
-    // Linux's vfs_copy_file_range tries remap_file_range first on filesystems with reflinks. All
-    // of it is shared at once, beyond the MAX_RW_COUNT Linux remaps per call: copying the rest
-    // would first make a private copy of the part already shared
+    // A copy of the whole input (up to MAX_RW_COUNT, matching Linux's vfs_copy_file_range) into
+    // an output no longer than it shares the input's object, as Linux tries remap_file_range first
+    // on filesystems with reflinks.
     let shared = {
         let lock_in = src.is_none() && needs_pos_lock(&input.borrow());
         let lock_out = dst.is_none() && needs_pos_lock(&output.borrow());
@@ -3824,6 +3927,7 @@ fn copy_data(
     mut dst: Option<u64>,
     len: usize,
 ) -> Result<usize, Errno> {
+    let len = len.min(MAX_COPY);
     if let Some(r) = copy_regular(cx, input, src, output, dst, len) {
         return r;
     }
@@ -4199,6 +4303,7 @@ fn read_file_inner(
     pos_held: bool,
     mut touch_atime: bool,
 ) -> SysResult {
+    let len = len.min(MAX_COPY);
     // A socket receives one message of up to the whole length (super::net::rw). The borrow must
     // end before: receiving may wait with the BKL released
     let sock = socket(&file.borrow());
@@ -4235,7 +4340,7 @@ fn read_file_inner(
                 dev: Device::Zero | Device::Full | Device::Random | Device::Loop,
                 ..
             }
-    );
+    ) || matches!(file.borrow().kind, FileKind::Host(fd) if host_regular(fd));
     let step = io_chunk(&file.borrow());
     let mut chunk = vec![0u8; len.min(step)];
     let mut done = 0;
@@ -4345,6 +4450,7 @@ fn write_file_inner(
     pos_held: bool,
     defer_sync: bool,
 ) -> SysResult {
+    let len = len.min(MAX_COPY);
     if numeric_sysctl(&file.borrow()) {
         return write_sysctl_iov(cx, file, &[(buf, len)], offset);
     }
@@ -4364,8 +4470,9 @@ fn write_file_inner(
         let nonblock = file.borrow().nonblocking() || io.nowait;
         return super::net::rw(cx, &s, nonblock, &[(buf, len)], true);
     }
-    if matches!(file.borrow().kind, FileKind::Pipe(_)) {
-        return write_gathered(cx, file, &[(buf, len)], IO_CHUNK, io);
+    if let Some((pipe, _)) = pipe_of(file) {
+        let nonblock = file.borrow().nonblocking() || io.nowait;
+        return pipe_write_user(cx, &pipe, nonblock, &[(buf, len)]);
     }
     let _pos = PosGuard::lock_positioned(cx, file, !pos_held && offset.is_none(), io.nowait)?;
     let held = pos_held || _pos.is_some();
@@ -4495,10 +4602,17 @@ fn read_bytes_inner(
         return Ok(0);
     }
     match path {
-        IoPath::Host(fd) => {
-            wait_host(cx, fd, POLLIN, nonblock)?;
-            cx.unlocked(|| appine_hal::read(fd, buf)).map_err(Errno)
-        }
+        IoPath::Host(fd) => match offset {
+            Some(off) => cx
+                .unlocked(|| appine_hal::pread(fd, buf, off))
+                .map_err(Errno),
+            None => {
+                if !host_regular(fd) {
+                    wait_host(cx, fd, POLLIN, nonblock)?;
+                }
+                cx.unlocked(|| appine_hal::read(fd, buf)).map_err(Errno)
+            }
+        },
         IoPath::Pipe(pipe) => pipe_read(cx, &pipe, nonblock, buf),
         IoPath::Pty(t, side) => tty::read(cx, &t, side, nonblock, buf),
         IoPath::Socket(s) => {
@@ -4913,11 +5027,7 @@ fn write_bytes_inner(
         (path, f.nonblocking() || io.nowait)
     };
     match path {
-        IoPath::Host(fd) => match cx.unlocked(|| appine_hal::write(fd, data)) {
-            Ok(n) => Ok(n),
-            Err(e) if e == Errno::EPIPE.0 => Err(broken_pipe(cx)),
-            Err(e) => Err(Errno(e)),
-        },
+        IoPath::Host(fd) => write_host(cx, fd, data, offset, nonblock),
         IoPath::Pipe(pipe) => pipe_write(cx, &pipe, nonblock, data, true),
         IoPath::Pty(t, side) => tty::write(cx, &t, side, nonblock, data),
         IoPath::Socket(s) => super::net::send(cx, &s, nonblock, data, &[], &[], 0),
@@ -5065,16 +5175,179 @@ fn write_proc(
         cx.k().oom.recheck();
         crate::kernel::signal_later(&cx.shared.timers);
     }
-    // A write is IN_MODIFY (fsnotify_modify); of the synthetic files only cgroup2's can be
-    // watched
-    if let PseudoNode::Cgroup(id, name, _) = node {
-        let key = crate::cgroup::key(id, name);
-        super::kernfs_modified(cx.kr(), key, crate::cgroup::key(id, b""), name);
-    }
+    // A write is IN_MODIFY (fsnotify_modify); of the synthetic files only cgroup2's are tracked
+    // by `inotify::file_io_event`, which notifies both the parent directory and the file watch.
     if written > 0 {
         inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
     }
     Ok(written)
+}
+
+/// Writes to a host stdio fd: positional writes use host `pwrite`; regular host files write
+/// directly without polling; pipes/terminals/sockets poll `POLLOUT` via [`wait_host`] in
+/// `PIPE_BUF`-sized pieces so blocked writes are interruptible by guest signals and honour
+/// `O_NONBLOCK` without blocking inside the host kernel.
+fn write_host(
+    cx: &mut Cx<'_>,
+    fd: i32,
+    data: &[u8],
+    offset: Option<u64>,
+    nonblock: bool,
+) -> Result<usize, Errno> {
+    let map_err = |cx: &mut Cx<'_>, e: i32| {
+        if e == Errno::EPIPE.0 {
+            broken_pipe(cx)
+        } else {
+            Errno(e)
+        }
+    };
+    if let Some(off) = offset {
+        return cx
+            .unlocked(|| appine_hal::pwrite(fd, data, off))
+            .map_err(|e| map_err(cx, e));
+    }
+    if data.is_empty() || host_regular(fd) {
+        return cx
+            .unlocked(|| appine_hal::write(fd, data))
+            .map_err(|e| map_err(cx, e));
+    }
+    let mut done = 0;
+    while done < data.len() {
+        if let Err(e) = wait_host(cx, fd, POLLOUT, nonblock) {
+            return if done > 0 { Ok(done) } else { Err(e) };
+        }
+        let chunk = &data[done..(done + PIPE_BUF).min(data.len())];
+        match cx.unlocked(|| appine_hal::write(fd, chunk)) {
+            Ok(0) => break,
+            Ok(n) => {
+                done += n;
+                if n < chunk.len() {
+                    break;
+                }
+            }
+            Err(e) => {
+                let e = map_err(cx, e);
+                return if done > 0 { Ok(done) } else { Err(e) };
+            }
+        }
+    }
+    Ok(done)
+}
+
+struct IovCursor<'a> {
+    vecs: &'a [(u64, usize)],
+    idx: usize,
+    off: usize,
+    left: usize,
+}
+
+impl<'a> IovCursor<'a> {
+    fn new(vecs: &'a [(u64, usize)]) -> Self {
+        let left = vecs.iter().map(|v| v.1).sum();
+        Self {
+            vecs,
+            idx: 0,
+            off: 0,
+            left,
+        }
+    }
+
+    fn copy_exact(&mut self, cx: &mut Cx<'_>, dst: &mut [u8]) -> Result<(), Errno> {
+        let mut pos = 0;
+        while pos < dst.len() {
+            let &(base, len) = &self.vecs[self.idx];
+            if self.off == len {
+                self.idx += 1;
+                self.off = 0;
+                continue;
+            }
+            let n = (len - self.off).min(dst.len() - pos);
+            let addr = base.wrapping_add(self.off as u64);
+            cx.read_user(UserSlice::new(addr, n), &mut dst[pos..pos + n])?;
+            self.off += n;
+            self.left -= n;
+            pos += n;
+        }
+        Ok(())
+    }
+}
+
+/// Writes guest buffers `vecs` into a pipe matching Linux 6.1's `pipe_write`: an initial partial
+/// page (`total % PIPE_BUF`) may merge into the last mergeable slot if it copies completely, then
+/// each remaining pipe page (up to `PIPE_BUF`) is copied and committed whole; a fault while
+/// filling a page discards that incomplete page and returns the bytes committed so far (`EFAULT`
+/// if none).
+fn pipe_write_user(
+    cx: &mut Cx<'_>,
+    pipe: &Rc<RefCell<Pipe>>,
+    nonblock: bool,
+    vecs: &[(u64, usize)],
+) -> SysResult {
+    let mut iter = IovCursor::new(vecs);
+    let total = iter.left;
+    if total == 0 {
+        return Ok(0);
+    }
+    let mut done = 0;
+    let mut page = [0u8; PIPE_BUF];
+
+    let tail = {
+        let p = pipe.borrow();
+        if p.readers == 0 {
+            drop(p);
+            return Err(broken_pipe(cx));
+        }
+        p.merge_len(total)
+    };
+    if tail != 0 {
+        iter.copy_exact(cx, &mut page[..tail])?;
+        let mut p = pipe.borrow_mut();
+        if p.readers == 0 {
+            drop(p);
+            return Err(broken_pipe(cx));
+        }
+        p.write(&page[..tail], true);
+        pipe_arrival(cx, &mut p, tail);
+        done += tail;
+        if iter.left == 0 {
+            return Ok(done as u64);
+        }
+    }
+
+    loop {
+        let can_write = {
+            let p = pipe.borrow();
+            if p.readers == 0 {
+                drop(p);
+                let e = broken_pipe(cx);
+                return if done > 0 { Ok(done as u64) } else { Err(e) };
+            }
+            p.free_slots() > 0
+        };
+        if can_write {
+            let want = iter.left.min(PIPE_BUF);
+            if let Err(e) = iter.copy_exact(cx, &mut page[..want]) {
+                return if done > 0 { Ok(done as u64) } else { Err(e) };
+            }
+            let mut p = pipe.borrow_mut();
+            p.write(&page[..want], false);
+            pipe_arrival(cx, &mut p, want);
+            done += want;
+            if iter.left == 0 {
+                return Ok(done as u64);
+            }
+            continue;
+        }
+        if nonblock || cx.interrupted() {
+            let e = if nonblock {
+                Errno::EAGAIN
+            } else {
+                Errno::ERESTARTSYS
+            };
+            return if done > 0 { Ok(done as u64) } else { Err(e) };
+        }
+        cx.wait_object(crate::pipe::object(pipe))?;
+    }
 }
 
 fn pipe_write(
@@ -5222,7 +5495,8 @@ fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
             | IoPath::Kmsg
             | IoPath::ProcKmsg(_)
             | IoPath::Loop(_)
-    ) || matches!(&f.kind, FileKind::Fuse(h) if super::fuse::seekable(h));
+    ) || matches!(&f.kind, FileKind::Fuse(h) if super::fuse::seekable(h))
+        || matches!(path, IoPath::Host(fd) if host_regular(fd));
     if offset.is_some() && !seekable && f.flags & oflags::O_PATH == 0 {
         return Err(Errno::ESPIPE);
     }
@@ -5236,6 +5510,7 @@ pub(super) fn seekable(f: &OpenFile) -> bool {
         io_path(f),
         IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_) | IoPath::Loop(_)
     ) || matches!(&f.kind, FileKind::Fuse(h) if super::fuse::seekable(h))
+        || matches!(&f.kind, FileKind::Host(fd) if host_regular(*fd))
 }
 
 fn io_path(f: &OpenFile) -> IoPath {
@@ -5372,6 +5647,7 @@ pub(super) fn prepare_write(
 /// the file moves to its object ([`rehome`]).
 pub(super) fn make_private(cx: &mut Cx<'_>, ino: Ino, keep: Option<u64>) -> Result<(), Errno> {
     let vfs = cx.vfs()?;
+    release_deleted_shared(cx.kr(), &vfs);
     let was_held = vfs.store().held(ino).unwrap_or(true);
     loop {
         if cx.kr().unsharing.contains(&ino) {
@@ -6614,12 +6890,13 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
             Ok(encode_stat(&st, vfs.dev_of(&node)))
         }
         Node::Pseudo(_, p) => {
-            let mut b = encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node));
+            let b = encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node));
             // procfs and devpts have 1024-byte blocks (proc_fill_super, devpts_fill_super)
             if matches!(vfs.fs_of(node), Fs::Proc | Fs::Pts) {
-                b[56..60].copy_from_slice(&1024u32.to_le_bytes());
+                Ok(with_blksize(b, 1024))
+            } else {
+                Ok(b)
             }
-            Ok(b)
         }
     }
 }
@@ -6679,7 +6956,10 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
                 PIPE_DEV,
             )),
         },
-        FileKind::Pty(end) if end.master => Ok(anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV)),
+        FileKind::Pty(end) if end.master => Ok(with_blksize(
+            anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV),
+            1024,
+        )),
         FileKind::Socket(s) => Ok(anon(
             pseudo::socket_ino(s),
             mode::S_IFSOCK | 0o777,
@@ -6715,8 +6995,9 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
                 ..Stat::default()
             };
             // The device number is that of the devpts instance the terminal is in (ttyname
-            // compares it with that of /dev/pts/<n>)
-            Ok(encode_stat(&st, t.fs))
+            // compares it with that of /dev/pts/<n>); devpts has 1024-byte blocks
+            // (devpts_fill_super), matching stat by path.
+            Ok(with_blksize(encode_stat(&st, t.fs), 1024))
         }
         FileKind::Path(node) => {
             let vfs = cx.vfs()?;
@@ -6810,6 +7091,12 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     put(96, &mnsec.to_le_bytes());
     put(104, &csec.to_le_bytes());
     put(112, &cnsec.to_le_bytes());
+    b
+}
+
+/// Overrides `st_blksize` in an encoded `struct stat`.
+fn with_blksize(mut b: [u8; 128], blksize: u32) -> [u8; 128] {
+    b[56..60].copy_from_slice(&blksize.to_le_bytes());
     b
 }
 
@@ -7845,26 +8132,16 @@ fn not_mount_point(cx: &Cx<'_>, vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<Opti
 /// mapped ([`Store::release`]), rather than at the next boot: its object can go, and another file
 /// still sharing it need not copy it before a write.
 fn release_if_closed(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>) {
-    use std::os::unix::fs::MetadataExt;
     let Some(ino) = ino else {
         return;
     };
     let store = vfs.store();
-    if !store.attrs(ino).is_ok_and(|st| st.nlink == 0) || !opens_of(cx.kr(), ino).is_empty() {
+    if !store.attrs(ino).is_ok_and(|st| st.nlink == 0) {
         return;
     }
-    let Ok(meta) = store
-        .open_object(ino, false)
-        .and_then(|f| f.metadata().map_err(host_errno))
-    else {
-        return;
-    };
-    let mapped = cx
-        .kr()
-        .tasks
-        .values()
-        .any(|t| t.res.borrow().mm.borrow().maps_file(meta.dev(), meta.ino()));
-    if !mapped {
+    let k = cx.kr();
+    if !file_in_use(k, vfs, ino) && !k.unsharing.contains(&ino) && !k.inotify.borrow().has_open(ino)
+    {
         let _ = store.release(ino);
     }
 }
@@ -9687,10 +9964,87 @@ fn tmpfs_removed(cx: &Cx<'_>, vfs: &Vfs, victim: Option<TmpfsVictim>) {
 }
 
 fn tmpfs_open_inode(vfs: &Vfs, file: &OpenFile) -> Option<Ino> {
+    if let Some((ino, ..)) = file.path_object {
+        return Some(ino);
+    }
     match &file.kind {
         FileKind::Regular { ino, .. } | FileKind::Path(Node::Store(_, ino)) => Some(*ino),
         FileKind::Path(Node::Overlay(_, o)) => Some(vfs.overlay().node(*o).real()),
         _ => None,
+    }
+}
+
+/// Collects all store regular-file inodes currently held open (fd tables, AF_UNIX inflight, loop
+/// backing), mapped, or running as an executable. Returns `None` if a task resource is borrowed.
+fn live_store_inodes(
+    k: &crate::kernel::Kernel,
+    vfs: &Vfs,
+) -> Option<std::collections::HashSet<Ino>> {
+    let mut live = std::collections::HashSet::new();
+    let record = |live: &mut std::collections::HashSet<Ino>, file: &FileRef| -> Option<()> {
+        let f = file.try_borrow().ok()?;
+        if let Some(ino) = tmpfs_open_inode(vfs, &f) {
+            live.insert(ino);
+        }
+        Some(())
+    };
+    let mut seen_mm = std::collections::HashSet::new();
+    for task in k.tasks.values() {
+        let res = task.res.try_borrow().ok()?;
+        if seen_mm.insert(Rc::as_ptr(&res.mm) as usize) {
+            let mm = res.mm.try_borrow().ok()?;
+            mm.mapped_inos(&mut live);
+        }
+        let fds = res.fds.try_borrow().ok()?;
+        for fd in fds.open_fds() {
+            if let Ok(file) = fds.get(fd) {
+                record(&mut live, &file)?;
+            }
+        }
+    }
+    for file in crate::unix::try_inflight_files(k)?
+        .into_iter()
+        .chain(k.loops.try_backing_files()?)
+    {
+        record(&mut live, &file)?;
+    }
+    for group in k.groups.values() {
+        let g = group.try_borrow().ok()?;
+        if !g.threads.is_empty()
+            && let Some(exe) = &g.exe
+            && let Some((_, ino)) = exe.node
+        {
+            live.insert(ino);
+        }
+    }
+    Some(live)
+}
+
+/// Releases shared-object holds of deleted regular files once nothing in the kernel keeps them
+/// open, mapped, or executing.
+fn release_deleted_shared_with(
+    k: &crate::kernel::Kernel,
+    vfs: &Vfs,
+    live: &std::collections::HashSet<Ino>,
+) {
+    let store = vfs.store();
+    let Ok(inotify) = k.inotify.try_borrow() else {
+        return;
+    };
+    for ino in store.pending_releases() {
+        if !live.contains(&ino) && !k.unsharing.contains(&ino) && !inotify.has_open(ino) {
+            let _ = store.release(ino);
+        }
+    }
+}
+
+/// Sweeps deleted held files awaiting release when any exist.
+fn release_deleted_shared(k: &crate::kernel::Kernel, vfs: &Vfs) {
+    if !vfs.store().has_pending_release() {
+        return;
+    }
+    if let Some(live) = live_store_inodes(k, vfs) {
+        release_deleted_shared_with(k, vfs, &live);
     }
 }
 
@@ -9723,62 +10077,23 @@ fn file_in_use(k: &crate::kernel::Kernel, vfs: &Vfs, ino: Ino) -> bool {
     })
 }
 
-/// Releases tmpfs page and inode charges for unlinked regular files whose last descriptor,
-/// mapping or executable reference has gone away (and refreshes page counts of live ones).
+/// Releases tmpfs page and inode charges for unlinked regular files and shared-object holds for
+/// deleted held files whose last descriptor, mapping or executable reference has gone away.
 pub(crate) fn evict_unlinked_tmpfs(k: &crate::kernel::Kernel, vfs: &Vfs) {
-    if !vfs.has_unlinked_tmpfs() {
+    let has_tmpfs = vfs.has_unlinked_tmpfs();
+    let has_shared = vfs.store().has_pending_release();
+    if !has_tmpfs && !has_shared {
         return;
     }
-    let mut live = std::collections::HashSet::new();
-    let record = |live: &mut std::collections::HashSet<Ino>, file: &FileRef| -> Option<()> {
-        let f = file.try_borrow().ok()?;
-        if let Some(ino) = tmpfs_open_inode(vfs, &f) {
-            live.insert(ino);
-        }
-        Some(())
+    let Some(live) = live_store_inodes(k, vfs) else {
+        return;
     };
-    let mut seen_mm = std::collections::HashSet::new();
-    for task in k.tasks.values() {
-        let Ok(res) = task.res.try_borrow() else {
-            return;
-        };
-        if seen_mm.insert(Rc::as_ptr(&res.mm) as usize) {
-            let Ok(mm) = res.mm.try_borrow() else {
-                return;
-            };
-            mm.mapped_inos(&mut live);
-        }
-        let Ok(fds) = res.fds.try_borrow() else {
-            return;
-        };
-        for fd in fds.open_fds() {
-            if let Ok(file) = fds.get(fd)
-                && record(&mut live, &file).is_none()
-            {
-                return;
-            }
-        }
+    if has_tmpfs {
+        vfs.evict_tmpfs(&live);
     }
-    for file in crate::unix::inflight_files(k)
-        .into_iter()
-        .chain(k.loops.backing_files())
-    {
-        if record(&mut live, &file).is_none() {
-            return;
-        }
+    if has_shared {
+        release_deleted_shared_with(k, vfs, &live);
     }
-    for group in k.groups.values() {
-        let Ok(g) = group.try_borrow() else {
-            return;
-        };
-        if !g.threads.is_empty()
-            && let Some(exe) = &g.exe
-            && let Some((_, ino)) = exe.node
-        {
-            live.insert(ino);
-        }
-    }
-    vfs.evict_tmpfs(&live);
 }
 
 // ---- Shared helpers ----
@@ -9946,5 +10261,99 @@ mod tests {
     fn combined_sync_flags_are_valid_only_for_newfstatat() {
         assert_eq!(newfstatat_flags(AT_STATX_SYNC_TYPE), Ok(()));
         assert_eq!(statx_flags(AT_STATX_SYNC_TYPE, 0), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn cap_iovecs_caps_at_max_rw_count_and_drops_trailing_vecs() {
+        let mut vecs = vec![(0x1000, 0x5000_0000), (0x2000, 0x5000_0000), (0xdead, 4096)];
+        cap_iovecs(&mut vecs);
+        assert_eq!(vecs, vec![(0x1000, 0x5000_0000), (0x2000, 0x2fff_f000)]);
+
+        let mut exact = vec![(0x1000, MAX_COPY), (0xdead, 1)];
+        cap_iovecs(&mut exact);
+        assert_eq!(exact, vec![(0x1000, MAX_COPY)]);
+
+        let mut zeros = vec![(0x1000, 0), (0x2000, 0)];
+        cap_iovecs(&mut zeros);
+        assert_eq!(zeros, vec![(0x1000, 0), (0x2000, 0)]);
+    }
+
+    #[test]
+    fn proc_splice_predicates_reject_unsupported_procfs_nodes() {
+        let proc = pseudo::ProcId { pid: 1, serial: 0 };
+        assert!(!proc_splice_reads(&PseudoNode::Entry(
+            proc,
+            None,
+            pseudo::Entry::Status
+        )));
+        assert!(!proc_splice_reads(&PseudoNode::FdInfo(proc, None, 0)));
+        assert!(!proc_splice_reads(&PseudoNode::NsFile(
+            pseudo::NsKind::Mnt,
+            1
+        )));
+        assert!(!proc_splice_reads(&PseudoNode::Global(
+            pseudo::Global::Kmsg
+        )));
+        assert!(proc_splice_reads(&PseudoNode::Entry(
+            proc,
+            None,
+            pseudo::Entry::Mounts
+        )));
+        assert!(proc_splice_reads(&PseudoNode::Entry(
+            proc,
+            None,
+            pseudo::Entry::MountInfo
+        )));
+        assert!(proc_splice_reads(&PseudoNode::Global(
+            pseudo::Global::Version
+        )));
+        assert!(proc_splice_reads(&PseudoNode::Sys(
+            b"devices/system/cpu/online"
+        )));
+        assert!(proc_splice_reads(&PseudoNode::Cgroup(
+            1,
+            b"cgroup.procs",
+            0
+        )));
+        assert!(!pseudo::has_iter(
+            &PseudoNode::Entry(proc, None, pseudo::Entry::Comm),
+            true
+        ));
+        assert!(pseudo::has_iter(
+            &PseudoNode::Cgroup(1, b"cgroup.procs", 0),
+            true
+        ));
+        assert!(pseudo::has_iter(
+            &PseudoNode::Static(pseudo::PROTECTED_REGULAR),
+            true
+        ));
+    }
+
+    #[test]
+    fn sticky_protection_levels_match_linux_6_1() {
+        let sticky_world = mode::S_IFDIR | mode::S_ISVTX | 0o777;
+        let sticky_group = mode::S_IFDIR | mode::S_ISVTX | 0o775;
+        let non_sticky = mode::S_IFDIR | 0o777;
+        for kind in [mode::S_IFREG | 0o666, mode::S_IFIFO | 0o666] {
+            // Level 0 allows everything.
+            assert!(sticky_protection_allows(kind, 1000, 0, sticky_world, 0, 0));
+            // Level 1 denies in sticky world-writable dir (even for root), allows in sticky group-writable.
+            assert!(!sticky_protection_allows(kind, 1000, 0, sticky_world, 0, 1));
+            assert!(sticky_protection_allows(kind, 1000, 0, sticky_group, 0, 1));
+            // Level 2 denies in both sticky world-writable and sticky group-writable dirs.
+            assert!(!sticky_protection_allows(kind, 1000, 0, sticky_world, 0, 2));
+            assert!(!sticky_protection_allows(kind, 1000, 0, sticky_group, 0, 2));
+            // Owner of file, file owned by dir owner, and non-sticky dir are always allowed.
+            assert!(sticky_protection_allows(
+                kind,
+                1000,
+                1000,
+                sticky_world,
+                0,
+                2
+            ));
+            assert!(sticky_protection_allows(kind, 0, 1000, sticky_world, 0, 2));
+            assert!(sticky_protection_allows(kind, 1000, 0, non_sticky, 0, 2));
+        }
     }
 }

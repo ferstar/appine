@@ -835,6 +835,125 @@ fn readv_on_host_stdin_returns_what_has_arrived() {
 }
 
 #[test]
+fn host_stdio_positional_io_and_interruptible_writes() {
+    use std::fs::OpenOptions;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let Some(program) = build_c_guest("hoststdio") else {
+        return;
+    };
+    for tier in TIERS {
+        // 1. Regular host files on stdin and stdout support pread/pwrite/preadv/pwritev.
+        let (_, in_path) = output(&format!("hoststdio-in-t{tier}"));
+        let (_, out_path) = output(&format!("hoststdio-out-t{tier}"));
+        std::fs::write(&in_path, b"hello world!").unwrap();
+        std::fs::write(&out_path, b"____________").unwrap();
+        let stdin_file = OpenOptions::new().read(true).open(&in_path).unwrap();
+        let stdout_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&out_path)
+            .unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier, "--no-pty"])
+            .arg(&program)
+            .arg("regular")
+            .stdin(Stdio::from(stdin_file))
+            .stdout(Stdio::from(stdout_file))
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(out.status.code(), Some(0), "tier {tier}: {}", stderr(&out));
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            b"HELLO WORLD_",
+            "tier {tier}: host regular stdout pwrite/pwritev contents"
+        );
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_file(&out_path);
+
+        // 2. Host pipes reject pread/pwrite with ESPIPE, honour O_NONBLOCK, and allow SIGALRM to
+        // interrupt a blocked write when the host pipe is full.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier, "--no-pty"])
+            .arg(&program)
+            .arg("pipe-intr")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn appine-run");
+        // Keep the pipe read end open without reading so stdout fills and blocks the guest write.
+        let _stdout_keepalive = child.stdout.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("tier {tier}: blocked host pipe write was not interrupted by SIGALRM");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(_stdout_keepalive);
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(status.code(), Some(0), "tier {tier}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn deleted_held_file_releases_share_on_close() {
+    let Some(program) = build_c_guest("hoststdio") else {
+        return;
+    };
+    let bytes = std::fs::read(&program).unwrap();
+    let (_, empty_dir) = output("share-release-empty");
+    let (_, tar_path) = output("share-release-empty.tar.gz");
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_file(&tar_path);
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let tar = Command::new("tar")
+        .args(["-czf"])
+        .arg(&tar_path)
+        .args(["-C"])
+        .arg(&empty_dir)
+        .arg(".")
+        .status()
+        .expect("tar failed");
+    assert!(tar.success());
+
+    for tier in TIERS {
+        let (_, store) = output(&format!("share-release-store-t{tier}"));
+        let _ = std::fs::remove_dir_all(&store);
+        appine_kernel::import_rootfs(&store, &tar_path).unwrap();
+        appine_kernel::write_file(&store, "/hoststdio", &bytes, 0o755, true, 0, 0).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--rootfs"])
+            .arg(&store)
+            .args(["--tier", tier, "/hoststdio", "share-release"])
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(out.status.code(), Some(0), "tier {tier}: {}", stderr(&out));
+        // Only the program binary and the single shared object (reused in place by /tmp/share_b)
+        // should exist in `objects/`; without releasing the deleted open sharer on close, writing
+        // /tmp/share_b would have copied into a third object.
+        let objects: Vec<_> = std::fs::read_dir(store.join("objects"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            objects.len(),
+            2,
+            "tier {tier}: expected 2 objects (binary + in-place settled share_b), got {objects:?}"
+        );
+        let _ = std::fs::remove_dir_all(&store);
+    }
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_file(&tar_path);
+}
+
+#[test]
 fn missing_program_exits_127() {
     let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
         .arg("/nonexistent/program")
