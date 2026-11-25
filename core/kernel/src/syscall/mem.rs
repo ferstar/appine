@@ -96,8 +96,7 @@ pub(super) fn mmap(
     };
     let mut flags = (flags & !MAP_TYPE) | kind;
     // Shared anonymous memory cannot grow down
-    const MAP_GROWSDOWN: u32 = 0x0100;
-    let growsdown = flags & MAP_GROWSDOWN != 0;
+    let growsdown = flags & flags::MAP_GROWSDOWN != 0;
     if growsdown && flags & flags::MAP_ANONYMOUS != 0 && kind == flags::MAP_SHARED {
         return Err(Errno::EINVAL);
     }
@@ -272,9 +271,8 @@ pub(super) fn mmap(
             _ => return Err(Errno::ENODEV),
         }
     };
-    const MAP_LOCKED: u32 = 0x2000;
     if let Some(aligned) = len.checked_next_multiple_of(PAGE_SIZE).filter(|&l| l != 0) {
-        let map_locked = flags & MAP_LOCKED != 0;
+        let map_locked = flags & flags::MAP_LOCKED != 0;
         if map_locked && cx.memlock_limit() == 0 {
             // Linux 6.1 `do_mmap`: MAP_LOCKED checks `can_do_mlock` before `mlock_future_check`.
             return Err(Errno::EPERM);
@@ -299,11 +297,6 @@ pub(super) fn mmap(
     if flags & flags::MAP_FIXED != 0 {
         crate::ipc::reap_shm(cx.k());
     }
-    // MAP_GROWSDOWN on a file mapping does not grow (on Linux the grown part also maps the file,
-    // and no program uses it that way)
-    if growsdown && file.is_none() && kind == flags::MAP_PRIVATE {
-        cx.mm_mut().set_growsdown(start);
-    }
     if let Some((name, ino)) = label {
         cx.mm_mut().label(start, len, name, ino);
     }
@@ -316,7 +309,7 @@ pub(super) fn mmap(
     if deny_exec {
         cx.mm_mut().deny_exec(start, len);
     }
-    if flags & MAP_LOCKED != 0 {
+    if flags & flags::MAP_LOCKED != 0 {
         cx.mm_mut().set_locked(start, len, true)?;
     }
     // MAP_POPULATE (not with MAP_NONBLOCK), MAP_LOCKED and mlockall(MCL_FUTURE) all bring the
@@ -324,7 +317,7 @@ pub(super) fn mmap(
     const MAP_POPULATE: u32 = 0x8000;
     const MAP_NONBLOCK: u32 = 0x10000;
     let populate = flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE
-        || flags & MAP_LOCKED != 0
+        || flags & flags::MAP_LOCKED != 0
         || cx.mm().lock_future && !cx.mm().lock_onfault;
     if populate {
         let _ = populate_range(cx, start, len, false);

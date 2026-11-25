@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: expose allocated radix page-table byte count via `appine_mmu_table_bytes` / `Mmu::table_bytes`)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: untouched private anonymous mappings prefill without write permission until first write fault, and executable unmaps/growth/rollbacks record `exec_changed` and `code_ranges`)
 
 ## Responsibilities
 
@@ -96,13 +96,17 @@ fast path and refill (`engine/dbt`).
 
 - `map_pages` builds entries eagerly for new mappings when the part of the VMA before EOF is at
   most 1 MB, or when the mapping is executable and not private anonymous (file mappings, shared
-  anonymous, SysV shm). Tmpfs file mappings wait for per-page quota admission. `PROT_NONE` mappings get none. If building them fails it removes every
+  anonymous, SysV shm), using `Vma::prefill_prot` (which strips `PROT_WRITE` on unwritten private
+  anonymous pieces and software-tracked file mappings so the first store traps). Tmpfs file mappings wait for per-page quota admission. `PROT_NONE` mappings get none. If building them fails it removes every
   entry of the range. For existing or already-moved VMAs (`mprotect` out of `PROT_NONE`, `mremap`
   moves), `prefill_pages` performs the same eager `fill_shared` as best-effort without unmapping
   on failure, leaving existing entries intact so any unfilled pages fault in on demand.
-- Larger mappings are filled on demand by `fault_in`. It fails if no VMA covers the page, the page
+- Larger mappings are filled on demand by `fault_in` (`try_fault_in`). It fails if no VMA covers the page, the page
   is at or past EOF, the VMA prot (with write implying read) lacks the access, or the page already
-  has an entry (including a prot-0 one). Otherwise it fills every empty slot of the 2 MB leaf range
+  has an entry that already permits the access (or a prot-0 entry, or a CoW page on write). On the
+  first write to an unwritten private anonymous piece (`prepare_anon_write`), it marks the piece
+  written, attaches `has_anon_vma` across the logical VMA, and enables write permission on existing
+  entries via `protect_shared` (no TLB flush needed) before filling any absent leaf. Otherwise it fills every empty slot of the 2 MB leaf range
   — or 16 MB (`FILE_FAULT_SPAN`, 8 leaf spans) for read-only non-FUSE file mappings — clipped to
   the VMA and EOF; existing entries are left alone and no flush is needed. A `Fill` VMA gets
   entries only for pages already read (`kernel/mm`). Tmpfs admits a single page. A read fault leaves it write-protected, and its first
@@ -112,7 +116,8 @@ fast path and refill (`engine/dbt`).
   non-FUSE files, `MADV_POPULATE_READ` and `MADV_WILLNEED` can prefill read-only soft PTEs
   (up to 4 GB per call) via `fill_shared` without touching host pages.
 - `mprotect` to `PROT_NONE` keeps entries with prot 0 (the host page keeps its content); changing
-  back rewrites the kept entries and fills the rest under the eager rule above, otherwise on demand.
+  back rewrites the kept entries (keeping write stripped on unwritten private anonymous pieces until
+  their first store) and fills the rest under the eager rule above, otherwise on demand.
 - Execute-only mappings (`PROT_EXEC` without `PROT_READ`) do not gain read permission: data loads
   and kernel reads fault, instruction fetch works.
 
@@ -138,8 +143,9 @@ fast path and refill (`engine/dbt`).
 - Mutators run under the BKL and only record what changed: `dirty` (unmap, mremap moves, permission
   downgrades, fork lending, `unshare`, truncation, leaving a code group), the
   `graveyard` (always together with `dirty`), `code_ranges` (executable ranges unmapped, moved,
-  re-protected, discarded or truncated, and invalidations), and `exec_changed` (executable VMAs
-  inserted, re-protected or grown, kernel writes into them; never an unmap).
+  grown, re-protected, discarded, rolled back or truncated, and invalidations), and `exec_changed`
+  (executable VMAs inserted, unmapped, re-protected, grown or rolled back, and kernel writes into
+  them).
 - `Mm::sync` runs after every syscall that takes the BKL (except exit, `exit_group`,
   `rt_sigreturn`, a successful execve or execveat, a syscall a tracer or seccomp skipped, and a
   kill at the entry stop; the no-BKL fast path never changes the mm), on `ic ivau` exits (and any
@@ -186,8 +192,7 @@ fast path and refill (`engine/dbt`).
   `unshareable` (sticky) and drops its claims: a sole member closes the group, retires the shared
   blocks outside those of its mappings that agree with the registered ranges, and keeps the space;
   otherwise it leaves, drops its `CodeSpace`, bumps the space generation and sets `dirty`, so
-  `sync` quiesces. Unmapping an executable VMA does not count as an executable change, and
-  registered ranges never shrink.
+  `sync` quiesces. Registered ranges never shrink.
 - A forked child starts outside any group with its parent's executable and may join any open
   group for it. On drop a member leaves the group (its claims released, the group neither closed
   nor its ranges unregistered); only the last member (or a sole non-group owner) calls `set_sources`

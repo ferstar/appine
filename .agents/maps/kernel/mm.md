@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: enforce `RLIMIT_MEMLOCK` for `mlockall(MCL_FUTURE)`, `MAP_LOCKED`, locked `mremap`/stack growth, and `shmat`)
+> Maintained: 2026-11-26 (targeted verification of anonymous write faults, VMA boundaries, fork accounting, mremap growth and DONTUNMAP remnants)
 
 ## Responsibilities
 
@@ -37,15 +37,16 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `Arc<HostRegion>` (`kernel/hostmem`) + host pointer, file metadata (`file_len`, identity/version,
   mapped-file fd, display `name`/`ino`, optional `MountPin` `mnt` whose drop reports to
   `vfs::released`), SysV `shm`, optional `Fill`, and Linux VMA flags (locked, sticky `written`,
-  growsdown, dump/fork/noreserve, `anon`).
+  growsdown, dump/fork/noreserve, sticky commit charge `accounted`, anonymous page offset
+  `anon_pgoff`, logical `has_anon_vma` and fork identity `anon`).
 - `Fill` pins the mapping's FUSE open. All its VMA pieces share that handle. Mappings of one
   FUSE inode share `FillPages`, including its sparse memfd, current size, filled runs and
   read-ahead state. It tracks previously filled pages, shared-write baselines and writable opens.
-- `same_vma` — whether two adjacent VMAs are one VMA on Linux: same contents source (both
-  private and file-less, the same store inode at contiguous offsets, or contiguous offsets in
-  the same shared host region with the same SysV attachment if any), backing, prot, lock,
-  may_write, growsdown, dump and fork flags, `anon` and name (not `may_exec`, `noreserve` or the
-  fill).
+- `same_vma` joins adjacent pieces when their backing, permissions and permission limits, lock,
+  grows-down, dump/fork flags, noreserve, charge, name and fork identity agree. Private anonymous
+  offsets must be contiguous and the pieces must agree on whether they have an anon_vma. File mappings also require matching host and guest inode identities,
+  contiguous file offsets and compatible FUSE opens and page caches. File-less shared mappings
+  must be contiguous in one host region with the same SysV attachment.
 - `Backing` — `Anonymous` (private anonymous, private `/dev/zero`), `PrivateFile` (private file
   mapping), `Shared` (shared file, shared anonymous, shared `/dev/zero`, GPU or SysV shm; also
   `[vvar]`, whose host memory is shared with forked children).
@@ -132,8 +133,8 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   rules (a FUSE mapping gets its `Fill`; regular store mappings check access, noexec and seals
   before unsharing and pinning the store object), and `MAP_LOCKED` (`EPERM` when `RLIMIT_MEMLOCK` is
   0 without `CAP_IPC_LOCK`, `EAGAIN` above limit) or `mlockall(MCL_FUTURE)` (`EAGAIN` above limit).
-  After the mapping: `reap_shm` for `MAP_FIXED`, grows-down for
-  private anonymous memory, the label, write and exec denials, locking, and population
+  Private anonymous mappings record grows-down and lock flags at creation. After the mapping:
+  `reap_shm` for `MAP_FIXED`, the label, write and exec denials, locking, and population
   (`MAP_POPULATE`, `MAP_LOCKED`; a FUSE mapping's pages are read then).
 - Lengths round up to a page; zero or overflow is `EINVAL`.
 - With personality(2)'s `READ_IMPLIES_EXEC` (which every execve clears, as arm64's
@@ -154,10 +155,12 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   guest open, without a content version or `FileMaps` entry. Its `file_len` stays zero.
 - `new_vma` initializes `locked` from `mlockall(MCL_FUTURE)`. Once the mapping has its file
   and page-tracking state, `insert_vma` enforces `vm.max_map_count` (default 65530, writable
-  through procfs) and builds the initial page-table entries (`kernel/mmu`).
+  through procfs) and builds the initial page-table entries (`kernel/mmu`). A new private
+  anonymous mapping starts with `anon_pgoff = start / PAGE_SIZE`. Until its first write,
+  reads can translate through write-protected entries and leave its anonymous RSS at zero.
 - `brk`: below `brk_start` returns the current break; growth needs the range free; it grows in
   place inside the heap's host region when the last part is anonymous, unnamed, with the heap's
-  permissions and lock state and no other VMA on that host range (discarding the host range
+  permissions, charge and VMA flags and no other VMA on that host range (discarding the host range
   first), else at the first heap page reserves 256 MB (`MAP_NORESERVE`) for growth of at most that,
   else falls back to a separate accounted anonymous mapping. Shrinking unmaps. brk ignores
   `mmap_top`, the guard gap and `vm.mmap_min_addr`, and there is no `RLIMIT_DATA` or `RLIMIT_AS`
@@ -206,7 +209,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 
 1. A write fault where `cow_break` (`kernel/cow`) succeeds → re-execute.
 2. The page now translates (another thread fixed it while this one waited for the BKL) → re-execute.
-3. `try_fault_in` (`kernel/mmu`) succeeds → re-execute. A tmpfs page allocation failure delivers
+3. `try_fault_in` (`kernel/mmu`) succeeds → re-execute. The first private anonymous write
+   records an identity for the logical VMA and upgrades present entries of the faulting host
+   piece. A missing entry still follows the usual leaf-window fill. A tmpfs page allocation failure delivers
    `SIGBUS` / `BUS_ADRERR`.
 4. A page of a `Fill` mapping not yet read and allowing the access (`fill_wanted`) → read it through
    the daemon (above) and re-execute; a signal arriving before the daemon took the read is
@@ -223,7 +228,7 @@ signals may still be delivered).
 
 ### munmap, mprotect, mremap
 
-- VMAs are only ever split (`split_at` adjusts file offsets and host pointers), never merged;
+- VMAs are only ever split (`split_at` advances file or anonymous page offsets and host pointers), never merged;
   `same_vma` tells which pieces Linux would have as one VMA.
 - `munmap`: an unaligned address, zero or overflowing length or an end past 2^48 is `EINVAL`;
   `ENOMEM` only when one VMA would split in three at `vm.max_map_count`. It moves removed host
@@ -241,7 +246,8 @@ signals may still be delivered).
   (`unshare` remaps ordinary files and copies private pages as at fork; a `Fill` VMA maps its host file privately again, copies the pages
   it changed after reading them and drops its entries) before it becomes writable, and a
   `reserved` region gets real host memory (`back_reserved`) before it becomes accessible.
-  Tracked file pages revoke their entries on a protection change. For other mappings only a
+  Adding private write permission sets the commit charge unless the mapping has `MAP_NORESERVE`.
+  The charge survives later permission changes. Tracked file pages revoke their entries on a protection change. For other mappings only a
   permission downgrade sets `dirty`. For a private anonymous VMA with fork CoW
   pages, non-write perms apply first, then read-only CoW entries (`kernel/cow`, even where
   `PROT_NONE` had none), then write permission on other pages.
@@ -250,10 +256,16 @@ signals may still be delivered).
   at the old address is `EFAULT`; a `MREMAP_FIXED` target is validated (`EINVAL`) and unmapped and
   a shrunk tail unmapped; then the rest of the old range must lie in one Linux VMA (`EFAULT`,
   `same_vma`, as Linux before 6.17). Shrinking without a target only unmaps the tail. Growing in
-  place needs the old end to be a VMA end, free space above, the new end at or below `mmap_top`,
-  and room for one more VMA (the grown part is a separate VMA with the same lock, dump, fork,
-  `noreserve` and `anon` flags; a `Fill` VMA's maps more of its host file, sharing the fill);
-  growing or duplicating (`old_len == 0`) a locked VMA enforces `RLIMIT_MEMLOCK` (`EAGAIN`, after
+  place needs the old end to be a VMA end, free space above and a new end at or below `mmap_top`.
+  Reservations grow without host memory. Shared anonymous and SysV mappings extend the same
+  VMA, with contents capped at the original backing extent. A backed private anonymous tail
+  can reuse spare bytes when its host region has a single strong reference. It discards those
+  bytes before mapping them. Other supported mappings allocate a continuation piece with the next offset
+  and the source flags. A file or FUSE continuation maps the next part of the same file.
+  Private anonymous moves preserve offsets across all pieces of a faulted logical VMA.
+  For a logical VMA without an anonymous identity the destination address supplies the new
+  offset, so it can join compatible neighbours. In either case an extension continues from
+  the moved tail. Growing or duplicating (`old_len == 0`) a locked VMA enforces `RLIMIT_MEMLOCK` (`EAGAIN`, after
   any `MREMAP_FIXED` target unmap) and populates the added pages unless `MCL_ONFAULT`. Shared
   anonymous memory and SysV
   segments retain their backing region across shrink, growth and moves. Regrown pages alias the
@@ -264,14 +276,20 @@ signals may still be delivered).
   `MREMAP_DONTUNMAP`) is `ENOMEM` before anything changes unless the address space stays more
   than three VMAs below `vm.max_map_count` (`move_room`, 6.1's `move_vma`), with two more for a
   target's unmapping (`mremap_to`); the moved pieces go back in without the count check
-  (`place_vma`), so a move never fails for room halfway.
+  (`place_moved_vma`). A partial PTE move on allocation failure is reversed into the retained
+  source tables before the temporary destination ranges are withdrawn. Executable ranges at
+  the temporary destination are queued for invalidation.
 - `MREMAP_DONTUNMAP` follows 6.1's order: no mapping at the old address `EFAULT`, the target
   `EINVAL`, the margin `ENOMEM`, the target unmapped, the one-VMA rule `EFAULT`; it splits nothing
-  before these, and then also needs room for the splits and for one VMA per piece left at the old
-  address. What it leaves there: for anonymous memory a new empty VMA, for a private file a
-  `Refill` that the syscall maps from its retained descriptor, even after unlink (both keeping
-  `may_exec`, dump, fork, grows-down, `noreserve`, `anon` and `mnt`), and for shared memory and a `Fill` VMA a copy of the
-  old VMA (unlocked; a `Fill` one on its host file mapped privately again); the syscall then calls
+  before these, then checks room for the endpoint splits and the actual remnant count.
+  At the old address one empty anonymous VMA starts with the old address's page offset
+  and no anon_vma. A partial remnant has a boundary with faulted source fragments until
+  a later merge. A private FUSE remnant remaps the same memfd, retaining its fill
+  and zero `file_len`. Ordinary private files produce one `Refill` per compatible run of
+  retained descriptors, mount pins, tmpfs mappings and interpreter opens. The syscall
+  maps those descriptors even after unlink. Shared aliases coalesce over contiguous spans
+  in the same host region and attachment with compatible pins and one accessible prefix.
+  All remnants keep their source permissions, commit charge and non-lock flags. The syscall calls
   `reap_shm`. `shmat` also refuses non-zero fixed addresses below `vm.mmap_min_addr` without
   `CAP_SYS_RAWIO` (`EPERM`).
 - `mremap` with an old length of 0 duplicates (6.1's "duplicate shm area"): the VMA holding the
@@ -403,7 +421,8 @@ signals may still be delivered).
 - `dump_regions` applies `coredump_filter` and `MADV_DONTDUMP` (the vDSO is dumped whole anyway; a
   written private file VMA follows `ANON_PRIVATE`; ELF headers' first pages follow their own bit)
   and writes nothing of `[vvar]`; the core-dump writer leaves holes where `residency` reports pages
-  absent in sparse regions. FUSE mappings fetch missing pages before ELF checks and segment writes.
+  absent in sparse regions. For private anonymous memory, `ANON_PRIVATE` selects every piece
+  of a logical VMA with an anon_vma. FUSE mappings fetch missing pages before ELF checks and segment writes.
 - `Mm` drop leaves its code group (`kernel/mmu`), releases CoW (`kernel/cow`), defers the page
   table (`kernel/hostmem`), then drops VMAs and graveyard. RSS measures live in `kernel/oom`.
 
@@ -442,7 +461,7 @@ signals may still be delivered).
   `kernel/cow` adds): kernel writes, mlock and `MAP_POPULATE` fill entries, mremap moves them, and
   `PROT_NONE` keeps prot-0 entries (`kernel/cow` lending and `kernel/oom` RSS rely on this).
 - `Mm` (`Rc<RefCell>`) is BKL-only (checking builds assert no borrow across BKL release);
-  `shared_maps` is shared across threads for the fast futex path. `insert_vma` and `move_range`
+  `shared_maps` is shared across threads for the fast futex path. `install_vma`, `grow_tail` and `move_range`
   publish writable shared ranges in `shared_maps` before installing or moving PTEs (rolling back if
   `map_pages` fails), and `munmap`, `move_range`, and `deny_write` prune removed/non-writable
   ranges after old PTEs are gone.
@@ -450,7 +469,7 @@ signals may still be delivered).
   per address space.
 - VMAs never merge; adjacent anonymous VMAs are separate host mappings and are only joined (as
   `same_vma`) for display, mremap's one-VMA rule, `PROT_GROWSDOWN`, fork's `anon` identities and
-  (by its own rule) fork's commit estimate. Code creating a VMA that continues another (stack
+  fork's commit estimate. Code creating a VMA that continues another (stack
   chunks, mremap growth) must copy the flags `same_vma` compares.
 - Guest pages are always 4 KB (`AT_PAGESZ` 4096) whatever the host page size.
 - Host `mincore` reports pages swapped to zram as absent; RSS (`kernel/oom`), mincore(2), pagemap
@@ -458,9 +477,14 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
-- **Approximate Linux VMA boundaries:** anonymous pieces join ignoring page offsets (mremap-moved
-  VMAs join new neighbours); `MREMAP_DONTUNMAP` of a multi-piece VMA needs one VMA slot per piece,
-  and in-place growth adds a VMA.
+- In-place growth still costs a host piece and a VMA slot for a file mapping or when a backed
+  private anonymous tail lacks exclusively held spare backing. A split sibling, loan, active
+  host advice or pending graveyard release can keep the region shared. Moving the host allocation
+  would invalidate live guest translations or loans. Shared-file DONTUNMAP aliases spanning
+  distinct host regions retain one remnant per compatible region.
+- Appine creates a fresh anonymous remnant even on a partial DONTUNMAP or a move of a previously
+  relocated mapping. Linux 6.1 unlinks the old anon_vma only on a whole-VMA move and retains the
+  old page offset.
 
 ## Open questions
 

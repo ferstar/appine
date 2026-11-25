@@ -1627,8 +1627,8 @@ mod tests {
                 arg_limit: arg_limit(STACK_SIZE),
             };
             let image = load(&mut mm, &file, &args, &mut no_interp).unwrap();
-            assert!(mm.mmu().translate(0x41ffe8, prot::WRITE).is_some());
-            assert!(mm.mmu().translate(0x423fe0, prot::WRITE).is_some());
+            mm.write(UserSlice::new(0x41ffe8, 1), b"x").unwrap();
+            mm.write(UserSlice::new(0x423fe0, 1), b"x").unwrap();
             assert_eq!(read_u64(&mm, 0x420000), 0);
             let mut insn = [0u8; 4];
             mm.read(UserSlice::new(image.entry, 4), &mut insn).unwrap();

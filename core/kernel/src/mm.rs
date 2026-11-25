@@ -67,6 +67,8 @@ pub mod flags {
     pub const MAP_ANONYMOUS: u32 = 0x20;
     /// Grows downwards.
     pub const MAP_GROWSDOWN: u32 = 0x0100;
+    /// Lock the mapping on creation.
+    pub const MAP_LOCKED: u32 = 0x2000;
     /// Not counted in the memory commit.
     pub const MAP_NORESERVE: u32 = 0x4000;
     /// Fixed address, but never replacing existing mappings.
@@ -178,6 +180,7 @@ pub struct VmaFlags {
     growsdown: bool,
     noreserve: bool,
     anon: u64,
+    accounted: bool,
 }
 
 impl VmaFlags {
@@ -190,6 +193,7 @@ impl VmaFlags {
             growsdown: v.growsdown,
             noreserve: v.noreserve,
             anon: v.anon,
+            accounted: v.accounted,
         }
     }
 
@@ -202,6 +206,7 @@ impl VmaFlags {
         v.growsdown = self.growsdown;
         v.noreserve = self.noreserve;
         v.anon = self.anon;
+        v.accounted = self.accounted;
     }
 }
 
@@ -219,7 +224,7 @@ pub struct Refill {
     pub(crate) file: Option<Rc<OwnedFd>>,
     pub flags: VmaFlags,
     pub(crate) tmpfs: Option<Rc<crate::vfs::TmpfsMapping>>,
-    interp_open: Option<crate::syscall::Opened>,
+    interp_open: Option<Rc<crate::syscall::Opened>>,
 }
 
 /// A host-page-aligned slice of a live [`HostRegion`] retained across a BKL release so
@@ -959,7 +964,7 @@ struct Vma {
     name: Option<Rc<[u8]>>,
     ino: u64,
     /// The ELF interpreter's open file, retained by its file-backed segments.
-    interp_open: Option<crate::syscall::Opened>,
+    interp_open: Option<Rc<crate::syscall::Opened>>,
     /// The mount the mapped file was opened through (None for anonymous, memfd, vvar, SysV shm).
     mnt: Option<MountPin>,
     /// The host address corresponding to this VMA's start. For shared anonymous memory
@@ -989,7 +994,8 @@ struct Vma {
     /// Locked by mlock (only recorded; host memory is never swapped out anywhere the guest could
     /// notice).
     locked: bool,
-    /// The anonymous mapping has been writable, or the kernel wrote into it (the loader). Contents
+    /// Anonymous memory has taken a write fault or a direct kernel write. Private files keep
+    /// their conservative ever-writable bit for host page tracking. Anonymous contents
     /// never written are all zero and fork need not copy them: checking V8's 8 GB `PROT_NONE`
     /// wasm reservation page by page takes a second.
     written: Cell<bool>,
@@ -1005,6 +1011,12 @@ struct Vma {
     dontfork: bool,
     /// `MAP_NORESERVE`: not counted in the commit ([`Mm::commit_too_big`]).
     noreserve: bool,
+    /// Linux VM_ACCOUNT stays set after removing write permission.
+    accounted: bool,
+    /// Page offset for joining private anonymous pieces, preserved by a faulted mapping's moves.
+    anon_pgoff: u64,
+    /// The logical anonymous VMA has taken a write, possibly in another host piece.
+    has_anon_vma: Cell<bool>,
     /// The anon_vma this mapping would have on Linux, as far as it decides which VMAs are one
     /// ([`same_vma`]): 0 until a fork, after which each child VMA with contents of its own gets
     /// its own, shared by the pieces that were one VMA in the parent. On Linux such child VMAs no
@@ -1031,11 +1043,10 @@ impl Vma {
         self.pages.as_ref()?.tmpfs.as_ref()
     }
 
-    /// Regular file reads keep the usual prefill. When tracking writes in software, only
-    /// the first store to a page needs to fault.
+    /// Keep first writes observable for anonymous pieces and software-tracked file pages.
     fn prefill_prot(&self) -> u32 {
         let prot = mmu_prot(self.prot);
-        if self.pages.is_some() {
+        if self.pages.is_some() || self.backing == Backing::Anonymous && !self.written.get() {
             prot & !prot::WRITE
         } else {
             prot
@@ -1083,6 +1094,7 @@ impl Vma {
         match (&self.fill, &other.fill) {
             (Some(a), Some(b)) => {
                 Rc::ptr_eq(&a.source, &b.source)
+                    && Rc::ptr_eq(&a.pages, &b.pages)
                     && self.may_write == other.may_write
                     && self.may_exec == other.may_exec
             }
@@ -1132,14 +1144,23 @@ impl Vma {
 /// `PROT_GROWSDOWN`. Pieces of one shared anonymous mapping have contiguous offsets in the
 /// same host region.
 fn same_vma(a: &Vma, b: &Vma) -> bool {
+    // A fresh DONTUNMAP remnant can keep its original linear offset alongside a
+    // faulted source fragment. It has its own lifetime until a later VMA merge.
+    a.has_anon_vma.get() == b.has_anon_vma.get() && can_merge(a, b)
+}
+
+/// Merge eligibility before an untouched anonymous piece inherits its neighbour's anon_vma.
+fn can_merge(a: &Vma, b: &Vma) -> bool {
     let contents = match (a.file_id, b.file_id) {
         (None, None) if a.backing == Backing::Shared => {
             Arc::ptr_eq(&a.region, &b.region)
                 && a.shm == b.shm
                 && a.host.as_ptr().wrapping_add(a.len as usize) == b.host.as_ptr()
         }
-        (None, None) => true,
-        (Some((_, _, offset)), Some((_, _, next))) => a.ino == b.ino && offset + a.len == next,
+        (None, None) => a.anon_pgoff.wrapping_add(a.len / PAGE_SIZE) == b.anon_pgoff,
+        (Some((dev, ino, offset)), Some(next)) => {
+            (dev, ino, offset + a.len) == next && a.ino == b.ino
+        }
         _ => false,
     };
     contents
@@ -1148,6 +1169,9 @@ fn same_vma(a: &Vma, b: &Vma) -> bool {
         && (a.prot, a.locked, a.may_write) == (b.prot, b.locked, b.may_write)
         && (a.growsdown, a.dontdump) == (b.growsdown, b.dontdump)
         && (a.wipeonfork, a.dontfork) == (b.wipeonfork, b.dontfork)
+        && a.may_exec == b.may_exec
+        && a.noreserve == b.noreserve
+        && a.accounted == b.accounted
         && a.anon == b.anon
         && a.name == b.name
 }
@@ -1452,8 +1476,9 @@ impl Mm {
         // SAFETY: this host memory is at least len bytes
         let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - len as usize)) };
         let rw = prot::READ | prot::WRITE;
-        self.insert(start, len, len, rw, Backing::Anonymous, true, region, host)?;
-        self.vmas.get_mut(&start).unwrap().growsdown = true;
+        let mut v = self.new_vma(start, len, len, rw, Backing::Anonymous, true, region, host);
+        v.growsdown = true;
+        self.insert_vma(start, v)?;
         self.stack_low = start;
         Ok(())
     }
@@ -1475,9 +1500,10 @@ impl Mm {
     }
 
     pub(crate) fn keep_interp_open(&mut self, start: u64, end: u64, file: &crate::syscall::Opened) {
+        let open = Rc::new(file.clone());
         for (_, v) in self.vmas.range_mut(start..end) {
             if v.file_id.is_some() {
-                v.interp_open = Some(file.clone());
+                v.interp_open = Some(open.clone());
             }
         }
     }
@@ -1944,9 +1970,61 @@ impl Mm {
     /// none yet, and returns true; retrying the access then works. Pages of a file mapping past
     /// the end of the file get none ([`Mm::fault_past_eof`]). Needs only a shared borrow: it is
     /// also called when the kernel layer reads or writes another process's memory (ptrace,
-    /// process_vm_readv), and it only adds entries, so no TLB flush is needed.
+    /// process_vm_readv). Filling absent entries or granting write permission needs no TLB flush.
     pub fn fault_in(&self, addr: u64, need: u32) -> bool {
         self.try_fault_in(addr, need).unwrap_or(false)
+    }
+
+    /// Attach an anon_vma to every piece of this Linux VMA. Only the piece actually
+    /// written needs writable PTEs or lending at fork.
+    fn attach_anon_vma(&self, start: u64) {
+        let v = &self.vmas[&start];
+        if v.has_anon_vma.replace(true) {
+            return;
+        }
+        let (mut at, mut next) = (start, v);
+        for (&s, prev) in self.vmas.range(..start).rev() {
+            if s + prev.len != at || !can_merge(prev, next) || prev.has_anon_vma.replace(true) {
+                break;
+            }
+            (at, next) = (s, prev);
+        }
+        let (mut end, mut prev) = (start + v.len, v);
+        for (&s, next) in self.vmas.range(end..) {
+            if s != end || !can_merge(prev, next) || next.has_anon_vma.replace(true) {
+                break;
+            }
+            (end, prev) = (s + next.len, next);
+        }
+    }
+
+    /// A mapping or a flag change can join an untouched piece to a faulted Linux VMA.
+    fn join_anon_vmas_at(&self, addr: u64) {
+        let Some(right) = self.vmas.get(&addr) else {
+            return;
+        };
+        if right.backing == Backing::Anonymous
+            && let Some((&s, left)) = self.vmas.range(..addr).next_back()
+            && s + left.len == addr
+            && left.has_anon_vma.get() != right.has_anon_vma.get()
+            && can_merge(left, right)
+        {
+            self.attach_anon_vma(if left.has_anon_vma.get() { addr } else { s });
+        }
+    }
+
+    /// Before the first anonymous store, enable writes on existing entries. An unwritten
+    /// piece cannot have loans. Later writes must leave their permissions to the CoW path.
+    fn prepare_anon_write(&self, s: u64, v: &Vma) -> Result<(), Errno> {
+        if v.backing == Backing::Anonymous && !v.written.replace(true) {
+            self.attach_anon_vma(s);
+            if v.prot & prot::WRITE != 0 {
+                self.mmu
+                    .protect_shared(s, v.len, mmu_prot(v.prot))
+                    .map_err(map_err)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn try_fault_in(&self, addr: u64, need: u32) -> Result<bool, Errno> {
@@ -1976,6 +2054,24 @@ impl Mm {
                 unsafe { self.mmu.fill_shared(page, host, PAGE_SIZE, flags) }
             };
             return Ok(result.is_ok());
+        }
+        if v.backing == Backing::Anonymous && need & prot::WRITE != 0 {
+            if present && self.mmu.translate(page, need).is_some() {
+                return Ok(false);
+            }
+            self.prepare_anon_write(s, v)?;
+            if present {
+                if self.mmu.translate(page, need).is_some() {
+                    return Ok(true);
+                }
+                // A partial superpage demotion may have failed during the first upgrade.
+                // Mm::translate also comes here without breaking CoW.
+                let cow = self.cow.borrow();
+                if cow.lent.contains(&page) || cow.borrowed.contains_key(&page) {
+                    return Ok(false);
+                }
+                return Ok(self.mmu.protect_shared(page, PAGE_SIZE, p).is_ok());
+            }
         }
         if present {
             return Ok(false);
@@ -2235,15 +2331,20 @@ impl Mm {
         // The bottom of the stack grows back after being unmapped: what was written before must
         // read as zero again
         unsafe { discard_host(host, grow as usize) };
-        if Self::map_pages(&mut self.mmu, page, host, grow, prot, false).is_err() {
+        if Self::map_pages(&mut self.mmu, page, host, grow, v.prefill_prot(), false).is_err() {
             return false;
         }
-        self.exec_changed |= prot & prot::EXEC != 0;
+        if prot & prot::EXEC != 0 {
+            self.exec_changed = true;
+            self.code_ranges.push((page, grow));
+        }
         let mut v = self.vmas.remove(&start).unwrap();
         v.host = host;
+        v.anon_pgoff = v.anon_pgoff.wrapping_sub(grow / PAGE_SIZE);
         v.len += grow;
         v.file_len += grow;
         self.vmas.insert(page, v);
+        self.join_anon_vmas_at(page);
         true
     }
 
@@ -2260,20 +2361,22 @@ impl Mm {
         };
         // SAFETY: this host memory is at least grow bytes
         let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - grow as usize)) };
-        let (prot, backing) = (template.prot, Backing::Anonymous);
-        if self
-            .insert(page, grow, grow, prot, backing, true, region, host)
-            .is_err()
-        {
+        let chunk = Vma {
+            len: grow,
+            file_len: grow,
+            host,
+            region,
+            written: Cell::new(false),
+            anon_pgoff: template.anon_pgoff.wrapping_sub(grow / PAGE_SIZE),
+            ..template
+        };
+        let exec = chunk.prot & prot::EXEC != 0;
+        if self.insert_vma(page, chunk).is_err() {
             return false;
         }
-        let v = self.vmas.get_mut(&page).unwrap();
-        v.growsdown = true;
-        v.locked = template.locked;
-        v.dontdump = template.dontdump;
-        v.wipeonfork = template.wipeonfork;
-        v.dontfork = template.dontfork;
-        v.anon = template.anon;
+        if exec {
+            self.code_ranges.push((page, grow));
+        }
         true
     }
 
@@ -2559,17 +2662,9 @@ impl Mm {
                 let at = v.offset() + cur - s;
                 fill.track(at / PAGE_SIZE, (at + chunk as u64).div_ceil(PAGE_SIZE))?;
             }
+            self.prepare_anon_write(s, v)?;
             v.written.set(true);
             self.exec_changed |= v.prot & prot::EXEC != 0;
-            // SAFETY: [cur, cur + chunk) is in the part of this VMA with contents, and it holds
-            // the host memory
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data[done..].as_ptr(),
-                    v.host.as_ptr().add((cur - s) as usize),
-                    chunk,
-                )
-            };
             // Pages with contents in private anonymous memory must have entries
             // (Mm::touched_windows); PROT_NONE ones get permission 0
             if v.backing == Backing::Anonymous {
@@ -2580,6 +2675,15 @@ impl Mm {
                 unsafe { self.mmu.fill_shared(lo, host, hi - lo, v.prefill_prot()) }
                     .map_err(map_err)?;
             }
+            // SAFETY: [cur, cur + chunk) is in the part of this VMA with contents, and it holds
+            // the host memory
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data[done..].as_ptr(),
+                    v.host.as_ptr().add((cur - s) as usize),
+                    chunk,
+                )
+            };
             done += chunk;
         }
         Ok(())
@@ -2887,14 +2991,17 @@ impl Mm {
         };
         let track = tmpfs.is_some()
             || backing == Backing::PrivateFile && fill.is_none() && !appine_hal::pagemap_readable();
-        let mut v = self.new_vma(len, file_len, prot, backing, may_write, region, host);
+        let mut v = self.new_vma(start, len, file_len, prot, backing, may_write, region, host);
         v.pages = track.then(|| FilePages::new(tmpfs, BTreeSet::new()));
         v.snapshot = bundled_libc.is_some();
         v.file_id = file_id;
         v.content = content;
         v.cow = cached;
         v.file = dup;
+        v.locked |= flags & flags::MAP_LOCKED != 0;
+        v.growsdown = backing == Backing::Anonymous && flags & flags::MAP_GROWSDOWN != 0;
         v.noreserve = flags & flags::MAP_NORESERVE != 0;
+        v.accounted &= !v.noreserve;
         let has_fill = fill.is_some();
         v.fill = fill;
         self.insert_vma(start, v)?;
@@ -2955,6 +3062,7 @@ impl Mm {
 
     /// Marks the mapping starting at `start` as growing downwards (a private anonymous mapping
     /// with `MAP_GROWSDOWN`).
+    #[cfg(test)]
     pub fn set_growsdown(&mut self, start: u64) {
         if let Some(v) = self.vmas.get_mut(&start) {
             v.growsdown = true;
@@ -3021,59 +3129,95 @@ impl Mm {
             Some(d) => d,
             None => self.find_free(len).ok_or(Errno::ENOMEM)?,
         };
-        // Unmerged pieces make more VMAs here than on Linux: besides the splits, every piece
-        // leaves a new VMA at the old address (Refills are mapped by the caller), so there must be
-        // room for all of them before anything moves
-        let pieces = self
-            .vmas
-            .range(..end)
-            .rev()
-            .take_while(|&(&s, v)| s + v.len > old)
-            .count();
-        self.room_for(self.splits(&[old, end]) + pieces)?;
+        // Count the retained backing runs before splitting either endpoint.
+        let (&first, mut prev) = self.vmas.range(..=old).next_back().unwrap();
+        let mut bounds = vec![old];
+        for (&s, v) in self.vmas.range(first + 1..end) {
+            if !Self::same_remnant(prev, v) {
+                bounds.push(s);
+            }
+            prev = v;
+        }
+        self.room_for(self.splits(&[old, end]) + bounds.len())?;
+        bounds.push(end);
         self.split_at(old);
         self.split_at(end);
-        let (mut empty, mut alias, mut refill) = (Vec::new(), Vec::new(), Vec::new());
-        for (&s, v) in self.vmas.range(old..end) {
+        let (mut remnants, mut refill) = (Vec::new(), Vec::new());
+        for pair in bounds.windows(2) {
+            let (s, stop) = (pair[0], pair[1]);
+            let len = stop - s;
+            let v = &self.vmas[&s];
+            let mut remnant = v.clone();
+            remnant.len = len;
+            remnant.locked = false;
             match v.backing {
-                Backing::Anonymous => empty.push((s, v.len, v.prot, VmaFlags::of(v))),
+                Backing::Anonymous => {
+                    (remnant.region, remnant.host) = Self::private_anonymous(
+                        len,
+                        v.prot,
+                        v.prot & prot::WRITE != 0 && !v.noreserve,
+                    )?;
+                    remnant.file_len = len;
+                    remnant.anon = 0;
+                    remnant.anon_pgoff = s / PAGE_SIZE;
+                    remnant.written.set(false);
+                    remnant.has_anon_vma.set(false);
+                }
                 Backing::Shared => {
-                    let mut v = v.clone();
-                    v.locked = false;
-                    alias.push((s, v));
+                    remnant.file_len = self.vmas.range(s..stop).map(|(_, v)| v.file_len).sum();
                 }
-                // Read on demand: the host file holds what was read, as the page cache would
                 Backing::PrivateFile if v.fill.is_some() => {
-                    let (region, host) = Self::fill_host(v, v.offset(), v.len)?;
-                    let mut v = v.clone();
-                    (v.region, v.host, v.locked, v.cow) = (region, host, false, false);
-                    v.written.set(v.prot & prot::WRITE != 0);
-                    alias.push((s, v));
+                    (remnant.region, remnant.host) = Self::fill_host(v, v.offset(), len)?;
+                    remnant.cow = false;
+                    remnant.written.set(v.prot & prot::WRITE != 0);
                 }
-                Backing::PrivateFile => refill.push(Refill {
-                    start: s,
-                    len: v.len,
-                    prot: v.prot,
-                    ino: v.ino,
-                    offset: v.file_id.map_or(0, |f| f.2),
-                    name: v.name.clone(),
-                    mnt: v.mnt.as_ref().map(|m| m.0),
-                    flags: VmaFlags::of(v),
-                    file: v.file.as_ref().map(|(fd, _)| fd.clone()),
-                    tmpfs: v.tmpfs().cloned(),
-                    interp_open: v.interp_open.clone(),
-                }),
+                Backing::PrivateFile => {
+                    refill.push(Refill {
+                        start: s,
+                        len,
+                        prot: v.prot,
+                        ino: v.ino,
+                        offset: v.offset(),
+                        name: v.name.clone(),
+                        mnt: v.mnt.as_ref().map(|m| m.0),
+                        flags: VmaFlags::of(v),
+                        file: v.file.as_ref().map(|(fd, _)| fd.clone()),
+                        tmpfs: v.tmpfs().cloned(),
+                        interp_open: v.interp_open.clone(),
+                    });
+                    continue;
+                }
             }
+            remnants.push((s, remnant));
         }
         self.move_range(old, len, dst)?;
-        for (start, len, prot, flags) in empty {
-            self.map_anonymous(start, len, prot)?;
-            flags.apply_to(self.vmas.get_mut(&start).unwrap());
-        }
-        for (start, v) in alias {
-            self.insert_vma(start, v)?;
+        for (s, v) in remnants {
+            // The preflight reserved these slots. A fresh anonymous remnant starts
+            // without the source identity, including on a move of just part of a VMA.
+            self.install_vma(s, v)?;
         }
         Ok((dst, refill))
+    }
+
+    /// Adjacent pieces of one Linux VMA can leave one remnant if it can represent both
+    /// sets of pins and, for a shared alias, one continuous host span and accessible prefix.
+    fn same_remnant(a: &Vma, b: &Vma) -> bool {
+        if a.backing == Backing::Anonymous {
+            return true;
+        }
+        let fd = |v: &Vma| v.file.as_ref().map(|(f, _)| Rc::as_ptr(f));
+        if fd(a) != fd(b)
+            || a.tmpfs().map(Rc::as_ptr) != b.tmpfs().map(Rc::as_ptr)
+            || a.interp_open.as_ref().map(Rc::as_ptr) != b.interp_open.as_ref().map(Rc::as_ptr)
+            || a.mnt.as_ref().map(|m| m.0) != b.mnt.as_ref().map(|m| m.0)
+        {
+            return false;
+        }
+        a.backing != Backing::Shared
+            || Arc::ptr_eq(&a.region, &b.region)
+                && a.host.as_ptr().wrapping_add(a.len as usize) == b.host.as_ptr()
+                && a.shm == b.shm
+                && (a.file_len == a.len || b.file_len == 0)
     }
 
     /// Implements mremap(2): `fixed` is the `MREMAP_FIXED` target address. When growing it first
@@ -3143,10 +3287,7 @@ impl Mm {
             } else {
                 None
             };
-            self.move_range(old, kept, dst)?;
-            if let Some(ext) = ext {
-                self.insert_vma(dst + old_len, ext)?;
-            }
+            self.move_and_extend(old, kept, dst, ext)?;
             return Ok(dst);
         }
         if grow == 0 {
@@ -3167,9 +3308,19 @@ impl Mm {
             return Err(Errno::EAGAIN);
         }
         let offset = old_end - start;
-        if offset == tail.len && old_end + grow <= self.mmap_top && self.is_free(old_end, grow) {
-            let ext = Self::extension(tail, offset, grow, None)?;
+        if offset == tail.len
+            && grow <= self.mmap_top.saturating_sub(old_end)
+            && self.is_free(old_end, grow)
+        {
+            if self.grow_tail(start, grow)? {
+                return Ok(old);
+            }
+            let ext = Self::extension(&self.vmas[&start], offset, grow, None)?;
+            let exec = ext.prot & prot::EXEC != 0;
             self.insert_vma(old_end, ext)?;
+            if exec {
+                self.code_ranges.push((old_end, grow));
+            }
             return Ok(old);
         }
         if !may_move {
@@ -3178,9 +3329,96 @@ impl Mm {
         let dst = self.find_free(new_len).ok_or(Errno::ENOMEM)?;
         let ext = Self::extension(tail, offset, grow, Some(dst))?;
         self.move_room(0)?;
-        self.move_range(old, old_len, dst)?;
-        self.insert_vma(dst + old_len, ext)?;
+        self.move_and_extend(old, old_len, dst, Some(ext))?;
         Ok(dst)
+    }
+
+    /// Reuse an existing region when growing into a free guest range. A private region
+    /// must be exclusive even across address spaces, outstanding host advice and the graveyard.
+    fn grow_tail(&mut self, start: u64, grow: u64) -> Result<bool, Errno> {
+        let v = &self.vmas[&start];
+        let len = v.len + grow;
+        let end = start + v.len;
+        let shared = v.backing == Backing::Shared
+            && v.file.is_none()
+            && v.fill.is_none()
+            && !v.foreign()
+            && v.region.gpu.is_none();
+        let file_len = if v.reserved() {
+            len
+        } else if shared {
+            len.min(v.host_available())
+        } else if v.backing == Backing::Anonymous
+            && len <= v.host_available()
+            && Arc::strong_count(&v.region) == 1
+        {
+            len
+        } else {
+            return Ok(false);
+        };
+        let old_file_len = v.file_len;
+        let added = file_len - old_file_len;
+        let publish = shared && v.may_write;
+        let v = self.vmas.get_mut(&start).unwrap();
+        v.len = len;
+        if publish {
+            self.note_shared_maps();
+        }
+        let v = &self.vmas[&start];
+        if !v.reserved() && added != 0 {
+            // SAFETY: only a backed extension reaches here; the whole new slice is in the region.
+            let host = unsafe { v.host.add(old_file_len as usize) };
+            if !shared {
+                // SAFETY: no other mapping, loan or unflushed translation can use this slice.
+                unsafe { discard_host(host, added as usize) };
+            }
+            v.region.note_used(host, added as usize);
+            if let Err(e) =
+                Self::map_pages(&mut self.mmu, end, host, added, v.prefill_prot(), shared)
+            {
+                if v.prot & prot::EXEC != 0 {
+                    self.code_ranges.push((end, added));
+                    self.exec_changed = true;
+                }
+                self.vmas.get_mut(&start).unwrap().len -= grow;
+                // map_pages removed partial entries; flush before reusing their range.
+                self.shootdown();
+                if publish {
+                    self.note_shared_maps();
+                }
+                return Err(e);
+            }
+        }
+        let v = self.vmas.get_mut(&start).unwrap();
+        v.file_len = file_len;
+        if v.prot & prot::EXEC != 0 {
+            self.exec_changed = true;
+            self.code_ranges.push((end, grow));
+        }
+        self.join_anon_vmas_at(end + grow);
+        Ok(true)
+    }
+
+    fn move_and_extend(
+        &mut self,
+        old: u64,
+        len: u64,
+        dst: u64,
+        ext: Option<Vma>,
+    ) -> Result<(), Errno> {
+        self.move_range(old, len, dst)?;
+        if let Some(mut ext) = ext {
+            let end = dst + len;
+            let (_, tail) = self.vmas.range(..end).next_back().unwrap();
+            ext.anon_pgoff = tail.anon_pgoff.wrapping_add(tail.len / PAGE_SIZE);
+            ext.has_anon_vma.set(tail.has_anon_vma.get());
+            let (grow, exec) = (ext.len, ext.prot & prot::EXEC != 0);
+            self.insert_vma(end, ext)?;
+            if exec {
+                self.code_ranges.push((end, grow));
+            }
+        }
+        Ok(())
     }
 
     /// mremap_to's checks of a target address: page-aligned, inside the address space and not
@@ -3330,8 +3568,10 @@ impl Mm {
             shm: template
                 .shm
                 .map(|(id, base)| (id, destination.unwrap_or(base))),
-            written: Cell::new(template.prot & prot::WRITE != 0),
-            growsdown: false,
+            written: Cell::new(
+                template.backing != Backing::Anonymous && template.prot & prot::WRITE != 0,
+            ),
+            anon_pgoff: template.anon_pgoff.wrapping_add(offset / PAGE_SIZE),
             ..template.clone()
         })
     }
@@ -3401,22 +3641,41 @@ impl Mm {
                 .unwrap_or_else(PoisonError::into_inner)
                 .extend(moved_shared.iter().copied());
         }
+        // Retain every source VMA until all PTEs have moved. Reversing a partial move
+        // reuses the original leaf tables (or restores a whole aligned superpage).
+        if let Err(e) = self.mmu.move_entries(old, dst, len) {
+            self.mmu
+                .move_entries(dst, old, len)
+                .expect("restore moved PTEs to their original tables");
+            // A concurrent thread may have translated code at the temporary destination.
+            for &s in &starts {
+                let v = &self.vmas[&s];
+                if v.prot & prot::EXEC != 0 {
+                    self.code_ranges.push((dst + (s - old), v.len));
+                    self.exec_changed = true;
+                }
+            }
+            self.shootdown();
+            if !moved_shared.is_empty() {
+                self.note_shared_maps();
+            }
+            return Err(map_err(e));
+        }
         let mut moved = Vec::with_capacity(starts.len());
         for s in starts {
             let mut v = self.vmas.remove(&s).unwrap();
-            // Move the entries along: in large on-demand mappings every page with contents has an
-            // entry (Mm::touched_windows), and after the move prefill_pages leaves existing entries
-            // alone. The caller guarantees the two ranges do not overlap
-            self.mmu
-                .move_entries(s, dst + (s - old), v.len)
-                .map_err(map_err)?;
+            let new = dst + (s - old);
+            if v.backing == Backing::Anonymous && !v.has_anon_vma.get() {
+                v.anon_pgoff = new / PAGE_SIZE;
+            }
             if v.prot & prot::EXEC != 0 {
                 self.code_ranges.push((s, v.len));
+                self.code_ranges.push((new, v.len));
             }
             if let Some((id, _)) = v.shm {
                 v.shm = Some((id, dst));
             }
-            moved.push((dst + (s - old), v));
+            moved.push((new, v));
         }
         // Keep the recorded vDSO address in sync when the vDSO moves (Linux's arch_remap), and
         // clear it if only part of the vDSO was moved out.
@@ -3583,6 +3842,14 @@ impl Mm {
             return false;
         };
         let compatible = v.backing == Backing::Anonymous
+            && v.accounted
+            && !v.noreserve
+            && !v.dontfork
+            && !v.wipeonfork
+            && !v.dontdump
+            && !v.growsdown
+            && v.may_write
+            && v.may_exec
             && v.prot == heap
             && v.locked == self.lock_future
             && v.name.is_none();
@@ -3609,13 +3876,17 @@ impl Mm {
         v.region.note_used(host, hi);
         // Grown again after shrinking: what was written before must read as zero again
         unsafe { discard_host(host, hi) };
-        if Self::map_pages(&mut self.mmu, end, host, grow, heap, false).is_err() {
+        if Self::map_pages(&mut self.mmu, end, host, grow, v.prefill_prot(), false).is_err() {
             return false;
         }
         let v = self.vmas.get_mut(&s).unwrap();
         v.len += grow;
         v.file_len += grow;
-        v.written.set(true);
+        self.join_anon_vmas_at(end + grow);
+        if heap & prot::EXEC != 0 {
+            self.exec_changed = true;
+            self.code_ranges.push((end, grow));
+        }
         true
     }
 
@@ -3814,7 +4085,7 @@ impl Mm {
         for (&s, v) in self.vmas.range_mut(addr..end) {
             // Pages that were executable: their translations must be invalidated when they stop
             // being executable; a W^X JIT also removes execute permission before rewriting code
-            if v.prot & prot::EXEC != 0 && v.prot != prot {
+            if (v.prot | prot) & prot::EXEC != 0 && v.prot != prot {
                 self.code_ranges.push((s, v.len));
             }
             self.exec_changed |= (v.prot | prot) & prot::EXEC != 0 && v.prot != prot;
@@ -3822,6 +4093,7 @@ impl Mm {
             // refilled on a miss, so no flush is needed
             let (old, new) = (mmu_prot(v.prot), mmu_prot(prot));
             self.dirty |= old & !new != 0;
+            v.accounted |= prot & prot::WRITE != 0 && v.backing != Backing::Shared && !v.noreserve;
             if v.pages.is_some() {
                 v.prot = prot;
                 if old != new {
@@ -3852,6 +4124,11 @@ impl Mm {
                 Backing::Anonymous => Self::cow_pages(&cow, s, s + v.len),
                 _ => Vec::new(),
             };
+            let new = if v.backing == Backing::Anonymous && !v.written.get() {
+                new & !prot::WRITE
+            } else {
+                new
+            };
             let first = match cow_pages.is_empty() {
                 true => new,
                 false => new & !prot::WRITE,
@@ -3870,17 +4147,21 @@ impl Mm {
                 // Fills only pages without entries, so copy-on-write and pre-existing prot-0 pages
                 // keep theirs; a host allocation failure must not unmap existing entries.
                 let file = v.backing != Backing::Anonymous;
-                Self::prefill_pages(&mut self.mmu, s, v.host, v.eager_len(), prot, file);
+                Self::prefill_pages(&mut self.mmu, s, v.host, v.eager_len(), new, file);
             }
             if first != new {
                 Self::write_around(&mut self.mmu, s, v.len, &cow_pages, new)?;
             }
             drop(cow);
             v.prot = prot;
-            if prot & prot::WRITE != 0 {
+            if v.backing != Backing::Anonymous && prot & prot::WRITE != 0 {
                 v.written.set(true);
             }
         }
+        for (&s, _) in self.vmas.range(addr..end) {
+            self.join_anon_vmas_at(s);
+        }
+        self.join_anon_vmas_at(end);
         Ok(())
     }
 
@@ -4254,6 +4535,18 @@ impl Mm {
 
             // Fault host pages and install missing soft page-table entries.
             let cursor = walk.cursor;
+            if v.backing == Backing::Anonymous && write {
+                self.cow_settle(cursor, in_eof);
+                self.prepare_anon_write(s, v)?;
+            }
+            // SAFETY: `[cursor, in_eof)` lies within `[s, s + v.file_len)` and holds host memory.
+            let host = unsafe { v.host.add((cursor - s) as usize) };
+            unsafe {
+                self.mmu
+                    .fill_shared(cursor, host, in_eof - cursor, v.prefill_prot())
+            }
+            .map_err(|_| Errno::ENOMEM)?;
+
             if v.backing == Backing::Anonymous && !write {
                 // Read-populate without breaking CoW or setting `v.written`: touch borrowed pages
                 // via the owner's host memory and non-borrowed runs via our own.
@@ -4275,9 +4568,6 @@ impl Mm {
                     unsafe { v.populate_host((cur - s) as usize, (in_eof - cur) as usize, false) };
                 }
             } else {
-                if v.backing == Backing::Anonymous {
-                    self.cow_settle(cursor, in_eof);
-                }
                 // SAFETY: `[cursor, in_eof)` lies within `[s, s + v.file_len)` and is backed by
                 // live host memory (writable on the host whenever `write` is true: anonymous CoW
                 // was just settled, writable private files are never `v.cow`, and writable shared
@@ -4286,14 +4576,6 @@ impl Mm {
                     v.populate_host((cursor - s) as usize, (in_eof - cursor) as usize, write)
                 };
             }
-
-            // SAFETY: `[cursor, in_eof)` lies within `[s, s + v.file_len)` and holds host memory.
-            let host = unsafe { v.host.add((cursor - s) as usize) };
-            unsafe {
-                self.mmu
-                    .fill_shared(cursor, host, in_eof - cursor, v.prefill_prot())
-            }
-            .map_err(|_| Errno::ENOMEM)?;
 
             walk.cursor = in_eof;
         }
@@ -4631,6 +4913,8 @@ impl Mm {
             self.split_at(cursor);
             self.split_at(stop);
             f(self.vmas.get_mut(&cursor).unwrap());
+            self.join_anon_vmas_at(cursor);
+            self.join_anon_vmas_at(stop);
             cursor = stop;
         }
         if has_gap { Err(Errno::ENOMEM) } else { Ok(()) }
@@ -4685,6 +4969,8 @@ impl Mm {
             self.split_at(cursor);
             self.split_at(stop);
             self.vmas.get_mut(&cursor).unwrap().locked = locked;
+            self.join_anon_vmas_at(cursor);
+            self.join_anon_vmas_at(stop);
             cursor = stop;
         }
         Ok(())
@@ -4694,6 +4980,9 @@ impl Mm {
     pub fn set_all_locked(&mut self, locked: bool) {
         for v in self.vmas.values_mut() {
             v.locked = locked;
+        }
+        for &s in self.vmas.keys() {
+            self.join_anon_vmas_at(s);
         }
     }
 
@@ -4840,19 +5129,17 @@ impl Mm {
                 // with FOLL_WRITE, breaking CoW and allocating private host pages (not the zero
                 // page) so RSS reflects the populated pages without double-counting borrowed pages.
                 self.cow_settle(lo, hi);
-                // SAFETY: `[from, to)` is inside this VMA's own writable host memory.
-                unsafe { v.populate_host((from - s) as usize, (to - from) as usize, true) };
-            } else {
-                // SAFETY: [from, to) is inside this VMA, which holds the host memory, and before
-                // the end of the file
-                unsafe { v.populate_host((from - s) as usize, (to - from) as usize, false) };
+                self.prepare_anon_write(s, v)?;
             }
-            // Build the entries too (large on-demand mappings had none): populated pages must
-            // be found when measuring resident memory (Mm::touched_windows). Existing entries
-            // (copy-on-write ones) are left alone
-            // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
+            // Install entries before write-populating any host pages. Existing CoW entries
+            // retain their translations.
+            let write = v.backing == Backing::Anonymous;
+            // SAFETY: [lo, hi) lies within the VMA's accessible host extent.
             let host = unsafe { v.host.add((lo - s) as usize) };
-            let _ = unsafe { self.mmu.fill_shared(lo, host, hi - lo, v.prefill_prot()) };
+            unsafe { self.mmu.fill_shared(lo, host, hi - lo, v.prefill_prot()) }
+                .map_err(map_err)?;
+            // SAFETY: [from, to) is backed; write-populated anonymous pages have settled CoW.
+            unsafe { v.populate_host((from - s) as usize, (to - from) as usize, write) };
             *cursor = stop;
         }
         *cursor = end;
@@ -4965,6 +5252,7 @@ impl Mm {
             self.mmu.unmap(s, len).map_err(map_err)?;
             removed_shared |= vma.backing == Backing::Shared && vma.may_write;
             if vma.prot & prot::EXEC != 0 {
+                self.exec_changed = true;
                 self.code_ranges.push((s, len));
             }
             if vma.backing == Backing::Shared
@@ -5133,8 +5421,7 @@ impl Mm {
         let mut carved = Self::carve(&self.vmas, &pieces)?;
         // As Linux's anon_vma_fork, every child VMA with contents of its own (an anon_vma: a page
         // written since mapped) gets its own anon_vma: the pieces of one VMA keep sharing it, but
-        // no longer join their neighbours. Anonymous memory that has been writable counts as
-        // written; a private file mapping only once a page of the mapping holds a private copy
+        // no longer join their neighbours. A private file mapping counts once a page holds a private copy
         // (the anon_vma belongs to the whole mapping when it is split, so all its pieces count)
         let mut anon = HashMap::new();
         let mut private = HashMap::new();
@@ -5142,7 +5429,7 @@ impl Mm {
         for (&s, v) in &self.vmas {
             let own = match v.backing {
                 Backing::Shared => false,
-                Backing::Anonymous => v.written.get(),
+                Backing::Anonymous => v.has_anon_vma.get() && !v.wipeonfork,
                 Backing::PrivateFile => {
                     v.written.get()
                         && *private.entry(Arc::as_ptr(&v.region)).or_insert_with(|| {
@@ -5208,33 +5495,18 @@ impl Mm {
                 }
                 (region, host)
             };
-            let mut c = child.new_vma(
-                v.len,
-                v.file_len,
-                v.prot,
-                v.backing,
-                v.may_write,
+            let id = anon[&start];
+            let c = Vma {
                 region,
                 host,
-            );
-            c.pages = v.pages.as_ref().map(|p| p.detached(v.offset(), v.len));
-            c.snapshot = v.snapshot;
-            c.may_exec = v.may_exec;
-            c.written.set(v.written.get());
-            c.name = v.name.clone();
-            c.ino = v.ino;
-            c.cow = v.cow && share;
-            c.file_id = v.file_id;
-            c.content = v.content;
-            c.file = v.file.clone();
-            c.interp_open = v.interp_open.clone();
-            c.shm = v.shm;
-            c.growsdown = v.growsdown;
-            c.noreserve = v.noreserve;
-            c.dontdump = v.dontdump;
-            c.wipeonfork = v.wipeonfork;
-            c.anon = anon[&start];
-            c.fill = v.fill.clone();
+                locked: false,
+                cow: v.cow && share,
+                pages: v.pages.as_ref().map(|p| p.detached(v.offset(), v.len)),
+                written: Cell::new(v.written.get() && !v.wipeonfork),
+                has_anon_vma: Cell::new(v.backing == Backing::Anonymous && id != 0),
+                anon: id,
+                ..v.clone()
+            };
             child.insert_vma(start, c)?;
         }
         let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
@@ -5255,7 +5527,7 @@ impl Mm {
         Ok(shared)
     }
 
-    /// Before fork, like Linux's `dup_mmap`, checks every commit-accounted VMA (writable private
+    /// Before fork, like Linux's `dup_mmap`, checks every commit-accounted VMA (ever-writable private
     /// mappings without `MAP_NORESERVE`) against the commit estimate (`vm.overcommit_memory` is
     /// 0): if one exceeds `limit`, the total of memory and swap (in bytes, 0 if unknown), it is
     /// ENOMEM. In Appine every mmap is its own piece of host memory and VMAs cannot merge, while
@@ -5263,40 +5535,20 @@ impl Mm {
     /// maps 1 GB more each time and forks: natively, fork fails once the merged one exceeds total
     /// memory, while Appine used to always succeed, with the child's page table growing ever
     /// larger (2 MB per GB in the soft-MMU).
-    ///
-    /// Unlike Linux: Linux's `VM_ACCOUNT` stays set once the mapping has been writable, while
-    /// here only the current permissions count.
     fn commit_too_big(&self, limit: u64) -> bool {
         if limit == 0 {
             return false;
         }
-        // Mappings the child does not get are not counted (Linux checks after skipping them)
-        let accounted = |v: &Vma| {
-            v.backing != Backing::Shared && v.prot & prot::WRITE != 0 && !v.noreserve && !v.dontfork
-        };
-        // Linux's vma_merge: contiguous, with the same permissions, flags and name, and file
-        // offsets that line up for file mappings
-        let merges = |a: &Vma, b: &Vma| {
-            (a.backing, a.locked, a.dontdump, a.growsdown, &a.name)
-                == (b.backing, b.locked, b.dontdump, b.growsdown, &b.name)
-                && a.wipeonfork == b.wipeonfork
-                && match (a.file_id, b.file_id) {
-                    (None, None) => true,
-                    (Some((d, i, o)), Some(f)) => (d, i, o + a.len) == f,
-                    _ => false,
-                }
-                && a.prot == b.prot
-        };
         // The start of the previous accounted VMA, the VMA, and the merged length
         let mut run: Option<(u64, &Vma, u64)> = None;
         for (&s, v) in &self.vmas {
-            if !accounted(v) {
+            if !v.accounted || v.dontfork {
                 run = None;
                 continue;
             }
             let total = match run {
                 Some((last_start, last, total))
-                    if last_start + last.len == s && merges(last, v) =>
+                    if last_start + last.len == s && same_vma(last, v) =>
                 {
                     total + v.len
                 }
@@ -5342,6 +5594,9 @@ impl Mm {
     /// away by mremap) do not count.
     fn spare_below(&self, start: u64) -> u64 {
         let v = &self.vmas[&start];
+        if v.reserved() {
+            return 0;
+        }
         let host = v.host.as_ptr() as usize;
         let low = self
             .vmas
@@ -6054,8 +6309,7 @@ impl Mm {
     /// follows Linux's `vma_dump_size` and `coredump_filter` (`filter`, the bits of
     /// [`dump_filter`]): the vDSO is always written whole; shared mappings depend on whether they
     /// are anonymous (including memfd and SysV shared memory) or file-backed; written private
-    /// anonymous mappings are written whole (never-writable ones and `PROT_NONE` reservations are
-    /// not); private file mappings that have been writable are written whole (data segments),
+    /// anonymous VMAs include all their pieces once they acquire an anon_vma; private file mappings that have been writable are written whole (data segments),
     /// otherwise only the first page of an ELF file, so a debugger can tell what is mapped.
     pub fn dump_regions(&self, filter: u32) -> Vec<DumpRegion> {
         use dump_filter::*;
@@ -6078,7 +6332,9 @@ impl Mm {
                             };
                             if filter & bit != 0 { v.len } else { 0 }
                         }
-                        Backing::Anonymous if filter & ANON_PRIVATE != 0 && v.written.get() => {
+                        Backing::Anonymous
+                            if filter & ANON_PRIVATE != 0 && v.has_anon_vma.get() =>
+                        {
                             v.len
                         }
                         Backing::Anonymous => 0,
@@ -6386,13 +6642,14 @@ impl Mm {
         region: Arc<HostRegion>,
         host: NonNull<u8>,
     ) -> Result<(), Errno> {
-        let vma = self.new_vma(len, file_len, prot, backing, may_write, region, host);
+        let vma = self.new_vma(start, len, file_len, prot, backing, may_write, region, host);
         self.insert_vma(start, vma)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn new_vma(
         &self,
+        start: u64,
         len: u64,
         file_len: u64,
         prot: u32,
@@ -6420,13 +6677,16 @@ impl Mm {
             file: None,
             shm: None,
             locked: self.lock_future,
-            written: Cell::new(prot & prot::WRITE != 0),
+            written: Cell::new(backing != Backing::Anonymous && prot & prot::WRITE != 0),
             growsdown: false,
             dontdump: false,
             wipeonfork: false,
             dontfork: false,
             noreserve: false,
             anon: 0,
+            accounted: backing != Backing::Shared && prot & prot::WRITE != 0,
+            anon_pgoff: start / PAGE_SIZE,
+            has_anon_vma: Cell::new(false),
             fill: None,
             pages: None,
             snapshot: false,
@@ -6436,6 +6696,15 @@ impl Mm {
     /// Puts a whole VMA at `start`; the caller guarantees the range is free.
     fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
         self.room_for(1)?;
+        let end = start + v.len;
+        self.install_vma(start, v)?;
+        self.join_anon_vmas_at(start);
+        self.join_anon_vmas_at(end);
+        Ok(())
+    }
+
+    /// Install a mapping after its VMA slot has been checked.
+    fn install_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
         let shared_writable = v.backing == Backing::Shared && v.may_write;
         // Publish writable shared ranges before installing PTEs so concurrent threads on the
         // no-BKL futex fast path never observe a writable PTE before `shared_maps` sees it.
@@ -6460,7 +6729,15 @@ impl Mm {
             v.prefill_prot(),
             file,
         ) {
+            // Retain the backing until sync has flushed translations of any partial fill.
+            if v.prot & prot::EXEC != 0 {
+                self.code_ranges.push((start, v.len));
+                self.exec_changed = true;
+            }
+            self.graveyard.push(v.region);
+            self.dirty = true;
             if let Some(prev) = prev_shared_len {
+                self.shootdown();
                 // `map_pages` already unmapped any partial PTEs; roll back the tentative range.
                 self.shared_maps
                     .write()
@@ -6489,7 +6766,10 @@ impl Mm {
             file,
         );
         self.exec_changed |= v.prot & prot::EXEC != 0;
+        let end = start + v.len;
         self.vmas.insert(start, v);
+        self.join_anon_vmas_at(start);
+        self.join_anon_vmas_at(end);
     }
 
     /// The range check of msync(2): the range must be fully mapped.
@@ -6534,6 +6814,7 @@ impl Mm {
         let mut tail = v.clone();
         let head_len = addr - s;
         tail.len -= head_len;
+        tail.anon_pgoff = tail.anon_pgoff.wrapping_add(head_len / PAGE_SIZE);
         tail.file_len = v.file_len.saturating_sub(head_len);
         if let Some(f) = &mut tail.file_id {
             f.2 += head_len;
@@ -9534,7 +9815,8 @@ mod tests {
             mm.borrow_mut().mremap(r, PAGE_SIZE, 1 << 30, false, None),
             Ok(r)
         );
-        assert!(mm.borrow().vmas[&(r + PAGE_SIZE)].reserved());
+        assert!(mm.borrow().vmas[&r].reserved());
+        assert_eq!(mm.borrow().vmas[&r].len, 1 << 30);
         assert_eq!(backed(&mm).len(), 2);
         mm.borrow_mut().munmap(r, 1 << 30).unwrap();
         mm.borrow_mut().munmap(a, len).unwrap();
@@ -9648,6 +9930,7 @@ mod tests {
             .borrow_mut()
             .mmap(0, 3 * PAGE_SIZE, RW, anon, None)
             .unwrap();
+        parent.borrow().write(UserSlice::new(a, 1), b"x").unwrap();
         parent
             .borrow_mut()
             .mprotect(a + PAGE_SIZE, PAGE_SIZE, prot::READ)
@@ -9759,6 +10042,365 @@ mod tests {
         assert!(buf[..p].iter().all(|&b| b == 7));
         assert!(buf[p..6 * p].iter().all(|&b| b == 0));
         assert!(buf[6 * p..].iter().all(|&b| b == 7));
+    }
+
+    #[test]
+    fn anonymous_move_offsets_follow_the_logical_vma() {
+        let p = PAGE_SIZE;
+        let (src, dst) = (0x200000, 0x400000);
+        let mut mm = Mm::new();
+        mm.map_anonymous(src, p, RW).unwrap();
+        mm.map_anonymous(src + p, p, RW).unwrap();
+        mm.map_anonymous(dst - p, p, RW).unwrap();
+        mm.map_anonymous(dst + 3 * p, p, RW).unwrap();
+        mm.write(UserSlice::new(src + p, 1), b"x").unwrap();
+        assert_eq!(mm.mremap(src, 2 * p, 2 * p, true, Some(dst)), Ok(dst));
+        assert_eq!(mm.mremap(dst, 2 * p, 3 * p, false, None), Ok(dst));
+        assert!(mm.in_one_vma(dst, dst + 3 * p));
+        assert_eq!(mm.vmas[&dst].anon_pgoff, src / p);
+        assert_eq!(mm.vmas[&(dst + 2 * p)].anon_pgoff, src / p + 2);
+        assert!(
+            mm.regions()
+                .iter()
+                .any(|r| r.start == dst && r.end == dst + 3 * p)
+        );
+        assert_eq!(
+            mm.mremap(dst - p, 2 * p, 2 * p, true, Some(src)),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(mm.mremap(dst, 4 * p, 5 * p, true, None), Err(Errno::EFAULT));
+        assert!(!mm.commit_too_big(3 * p));
+
+        // Moving only the unwritten first host piece still preserves the logical identity.
+        assert_eq!(mm.mremap(dst, p, p, true, Some(src)), Ok(src));
+        assert_eq!(mm.vmas[&src].anon_pgoff, src / p);
+        assert_eq!(mm.mremap(src, p, p, true, Some(dst)), Ok(dst));
+        assert_eq!(mm.vmas[&dst].anon_pgoff, src / p);
+        assert!(mm.in_one_vma(dst, dst + 3 * p));
+
+        let fresh = dst + 8 * p;
+        mm.map_anonymous(src, p, RW).unwrap();
+        assert!(mm.translate(src, prot::READ).is_some());
+        mm.map_anonymous(fresh + p, p, RW).unwrap();
+        assert_eq!(mm.mremap(src, p, p, true, Some(fresh)), Ok(fresh));
+        assert!(mm.in_one_vma(fresh, fresh + 2 * p));
+        assert_eq!(mm.vmas[&fresh].anon_pgoff, fresh / p);
+    }
+
+    #[test]
+    fn anonymous_first_write_and_fork_identity() {
+        let p = PAGE_SIZE;
+        let a = 0x400000;
+        let parent = Mm::new().into_shared();
+        let mut mm = parent.borrow_mut();
+        mm.map_anonymous(a, p, RW).unwrap();
+        mm.map_anonymous(a + p, p, prot::READ).unwrap();
+        mm.mprotect(a + p, p, RW).unwrap();
+        assert!(mm.mmu().translate(a, prot::READ).is_some());
+        assert!(mm.mmu().translate(a + p, prot::WRITE).is_none());
+        let clean = mm.fork().unwrap();
+        {
+            let mut child = clean.borrow_mut();
+            assert!(child.cow.borrow().borrowed.is_empty());
+            assert_eq!(child.vmas[&a].anon, 0);
+            child.map_anonymous(a + 2 * p, p, RW).unwrap();
+            assert!(child.in_one_vma(a, a + 3 * p));
+        }
+        // A guest write fault grants write only in its host piece. The next fork
+        // assigns both pieces one identity and lends only the one that took the fault.
+        assert!(mm.try_fault_in(a + p, prot::WRITE).unwrap());
+        assert!(mm.mmu().translate(a + p, prot::WRITE).is_some());
+        assert!(mm.mmu().translate(a, prot::WRITE).is_none());
+        mm.write(UserSlice::new(a + p, 1), b"x").unwrap();
+        mm.discard(a + p, p).unwrap();
+        let forked = mm.fork().unwrap();
+        let mut child = forked.borrow_mut();
+        assert_eq!(child.cow.borrow().borrowed.len(), 1);
+        assert_ne!(child.vmas[&a].anon, 0);
+        assert_eq!(child.vmas[&a].anon, child.vmas[&(a + p)].anon);
+        assert!(child.translate(a + p, prot::WRITE).is_none());
+        child.map_anonymous(a + 2 * p, p, RW).unwrap();
+        assert!(!child.in_one_vma(a, a + 3 * p));
+        let id = child.vmas[&a].anon;
+        // Release the parent borrow before settling a borrower.
+        drop(mm);
+        let (dst, _) = child.mremap_dontunmap(a, 2 * p, None).unwrap();
+        assert_eq!(child.vmas[&dst].anon, id);
+        let remnant = &child.vmas[&a];
+        assert_eq!(
+            (remnant.len, remnant.anon_pgoff, remnant.anon),
+            (2 * p, a / p, 0)
+        );
+        assert!(!remnant.written.get() && !remnant.has_anon_vma.get());
+        assert!(remnant.accounted);
+    }
+
+    #[test]
+    fn partial_dontunmap_keeps_a_fresh_anonymous_remnant() {
+        let (a, dst) = (0x400000, 0x600000);
+        let p = PAGE_SIZE;
+        let mut mm = Mm::new();
+        mm.map_anonymous(a, 3 * p, RW).unwrap();
+        mm.write_kernel(a + p, b"x").unwrap();
+        mm.mremap_dontunmap(a + p, p, Some(dst)).unwrap();
+        assert!(!mm.in_one_vma(a, a + 3 * p));
+        assert!(!mm.vmas[&(a + p)].has_anon_vma.get());
+        assert_eq!(
+            mm.mremap(a, 3 * p, 3 * p, true, Some(dst + 4 * p)),
+            Err(Errno::EFAULT)
+        );
+        let child = mm.fork().unwrap();
+        assert_eq!(child.borrow().vmas[&(a + p)].anon, 0);
+        mm.mremap(a + p, p, p, true, Some(dst + 4 * p)).unwrap();
+        assert_eq!(mm.vmas[&(dst + 4 * p)].anon_pgoff, dst / p + 4);
+    }
+
+    #[test]
+    fn brk_growth_charges_pages_after_a_noreserve_replacement() {
+        let p = PAGE_SIZE;
+        let a = 0x400000;
+        let mut mm = Mm::new();
+        mm.set_brk(a);
+        assert_eq!(mm.brk(a + 2 * p, false), a + 2 * p);
+        mm.mmap(
+            a,
+            2 * p,
+            RW,
+            flags::MAP_FIXED | flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_NORESERVE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mm.brk(a + p, false), a + p);
+        mm.sync_except(None);
+        assert_eq!(mm.brk(a + 2 * p, false), a + 2 * p);
+        assert!(!mm.vmas[&a].accounted);
+        assert!(mm.vmas[&(a + p)].accounted);
+        assert!(mm.commit_too_big(p - 1));
+    }
+
+    #[test]
+    fn fork_commit_charge_survives_permission_changes() {
+        let p = PAGE_SIZE;
+        let a = 0x400000;
+        for prot in [0, prot::READ] {
+            let mut mm = Mm::new();
+            mm.map_anonymous(a, p, RW).unwrap();
+            mm.mprotect(a, p, prot).unwrap();
+            mm.map_anonymous(a + p, p, prot).unwrap();
+            assert!(!mm.in_one_vma(a, a + 2 * p));
+            assert!(mm.commit_too_big(p - 1));
+            assert!(!mm.commit_too_big(p));
+            mm.set_dontfork(a, p, true).unwrap();
+            mm.write_kernel(a + p, b"x").unwrap();
+            assert!(mm.vmas[&(a + p)].has_anon_vma.get());
+            assert!(!mm.commit_too_big(p - 1));
+            mm.mprotect(a + p, p, RW).unwrap();
+            mm.mprotect(a + p, p, prot).unwrap();
+            assert!(mm.fork().unwrap().borrow().commit_too_big(p - 1));
+            mm.munmap(a + p, p).unwrap();
+            mm.mmap(
+                a + p,
+                p,
+                prot,
+                flags::MAP_ANONYMOUS | flags::MAP_PRIVATE | flags::MAP_NORESERVE | flags::MAP_FIXED,
+                None,
+            )
+            .unwrap();
+            mm.mprotect(a + p, p, RW).unwrap();
+            assert!(!mm.commit_too_big(p - 1));
+        }
+    }
+
+    /// Leave a given number of free slots without changing the process-wide test limit.
+    fn leave_map_slots(mm: &mut Mm, free: usize) {
+        let limit = MAX_MAP_COUNT.load(Ordering::Relaxed) - free;
+        let mut at = 0x1_0000_0000;
+        while mm.vmas.len() < limit {
+            mm.map_anonymous(at, PAGE_SIZE, 0).unwrap();
+            at += 2 * PAGE_SIZE;
+        }
+    }
+
+    #[test]
+    fn dontunmap_charges_backing_runs_at_the_map_limit() {
+        use std::os::fd::AsRawFd;
+        let p = PAGE_SIZE;
+        let len = 8 * p;
+        let mut mm = Mm::new();
+        let (anon, file, fuse, shared) = (0x200000, 0x300000, 0x400000, 0x500000);
+        let object = appine_hal::memfd(c"remnant").unwrap();
+        object.set_len(len + p).unwrap();
+        let fd = object.as_raw_fd();
+        let source = crate::fd::OpenFile::new(crate::fd::FileKind::Host(-1), 0);
+        let cache = appine_hal::memfd(c"remnant-fill").unwrap();
+        cache.set_len(len + p).unwrap();
+        let fill = Fill::new(cache, len + p, source);
+        let fixed = flags::MAP_PRIVATE | flags::MAP_FIXED;
+        mm.map_anonymous(anon, len, RW).unwrap();
+        mm.mmap(file, len, RW, fixed, Some((fd, p, true))).unwrap();
+        mm.mmap_fill(fuse, len, RW, fixed, (fill.clone(), p))
+            .unwrap();
+        mm.mmap(
+            shared,
+            len,
+            RW,
+            flags::MAP_FIXED | flags::MAP_ANONYMOUS | flags::MAP_SHARED,
+            None,
+        )
+        .unwrap();
+        for a in [anon, file, fuse, shared] {
+            for page in 1..8 {
+                mm.split_at(a + page * p);
+            }
+        }
+        let dst = 0x700000;
+        leave_map_slots(&mut mm, 6);
+        for a in [anon, file, fuse, shared] {
+            let (_, refills) = mm.mremap_dontunmap(a, len, Some(dst)).unwrap();
+            if a == file {
+                assert_eq!(refills.len(), 1);
+                let r = &refills[0];
+                assert_eq!((r.start, r.len, r.offset), (a, len, p));
+                assert!(Rc::ptr_eq(
+                    r.file.as_ref().unwrap(),
+                    &mm.vmas[&dst].file.as_ref().unwrap().0
+                ));
+            } else {
+                assert!(refills.is_empty());
+                assert_eq!(mm.vmas[&a].len, len);
+                assert_eq!(mm.vmas.range(a..a + len).count(), 1);
+                if a == fuse {
+                    assert_eq!(mm.vmas[&a].file_len, 0);
+                    assert_eq!(mm.fill_wanted(a + 7 * p, prot::READ).unwrap().1, 8);
+                } else if a == shared {
+                    mm.write_kernel(dst + 7 * p, b"x").unwrap();
+                    let mut byte = [0];
+                    mm.read(UserSlice::new(a + 7 * p, 1), &mut byte).unwrap();
+                    assert_eq!(&byte, b"x");
+                }
+            }
+            // Keep the next move at the same map pressure.
+            mm.munmap(dst, len).unwrap();
+            if a != shared {
+                let remaining = MAX_MAP_COUNT.load(Ordering::Relaxed) - 6 - mm.vmas.len();
+                for n in 0..remaining {
+                    mm.map_anonymous(a + len + (n as u64) * 2 * p, p, 0)
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dontunmap_preserves_distinct_mount_pins_and_shared_host_regions() {
+        use std::os::fd::AsRawFd;
+        let p = PAGE_SIZE;
+        let (src, dst) = (0x100000, 0x200000);
+        let object = appine_hal::memfd(c"remnant-runs").unwrap();
+        object.set_len(2 * p).unwrap();
+        let file = Some((object.as_raw_fd(), 0, true));
+        let mut mm = Mm::new();
+        mm.mmap(src, 2 * p, RW, flags::MAP_PRIVATE | flags::MAP_FIXED, file)
+            .unwrap();
+        mm.split_at(src + p);
+        mm.set_mnt(src, p, 41);
+        mm.set_mnt(src + p, p, 42);
+        let (_, refills) = mm.mremap_dontunmap(src, 2 * p, Some(dst)).unwrap();
+        assert_eq!(
+            refills
+                .iter()
+                .map(|r| (r.offset, r.len, r.mnt))
+                .collect::<Vec<_>>(),
+            [(0, p, Some(41)), (p, p, Some(42))]
+        );
+        let child = mm.fork().unwrap();
+        assert_eq!(child.borrow().vmas[&(dst + p)].mnt.as_ref().unwrap().0, 42);
+
+        mm.mmap(src, p, RW, flags::MAP_SHARED | flags::MAP_FIXED, file)
+            .unwrap();
+        mm.mremap(src, p, 2 * p, false, None).unwrap();
+        mm.mremap_dontunmap(src, 2 * p, Some(dst)).unwrap();
+        assert_eq!(mm.vmas.range(src..src + 2 * p).count(), 2);
+        for at in [0, p] {
+            assert!(Arc::ptr_eq(
+                &mm.vmas[&(src + at)].region,
+                &mm.vmas[&(dst + at)].region
+            ));
+        }
+    }
+
+    #[test]
+    fn private_regrowth_keeps_other_host_views_and_shared_failure_rolls_back() {
+        let p = PAGE_SIZE;
+        let (a, dst) = (0x100000, 0x200000);
+        let mut mm = Mm::new();
+        mm.map_anonymous(a, 2 * p, RW).unwrap();
+        mm.write_kernel(a + p, b"x").unwrap();
+        mm.mremap(a + p, p, p, true, Some(dst)).unwrap();
+        mm.mremap(a, p, 2 * p, false, None).unwrap();
+        assert!(!Arc::ptr_eq(&mm.vmas[&a].region, &mm.vmas[&(a + p)].region));
+        let mut b = [0];
+        mm.read(UserSlice::new(dst, 1), &mut b).unwrap();
+        assert_eq!(&b, b"x");
+
+        // Exercise map_pages rollback on a shared extension beyond the MMU address limit.
+        let segment = SharedMemory::new(2 * p).unwrap();
+        let src = mm.attach_shm(None, &segment, RW, false, (1, 6)).unwrap();
+        let last = (1 << VA_BITS) - p;
+        mm.mremap(src, 0, p, true, Some(last)).unwrap();
+        let before = mm.shared_maps.read().unwrap().clone();
+        assert!(mm.grow_tail(last, p).is_err());
+        assert_eq!(mm.vmas[&last].len, p);
+        // A recount can reorder the classification ranges.
+        let mut after = mm.shared_maps.read().unwrap().clone();
+        let mut before = before;
+        before.sort_unstable();
+        after.sort_unstable();
+        assert_eq!(after, before);
+        assert!(mm.mmu().translate(last, prot::WRITE).is_some());
+    }
+
+    #[test]
+    fn growth_reuses_safe_backing_at_the_map_limit() {
+        let p = PAGE_SIZE;
+        let (reserved, private, shared, sysv) = (0x200000, 0x300000, 0x400000, 0x500000);
+        let mut mm = Mm::new();
+        mm.map_anonymous(reserved, p, 0).unwrap();
+        mm.map_anonymous(private, 2 * p, RW).unwrap();
+        mm.write_kernel(private + p, b"old").unwrap();
+        mm.mremap(private, 2 * p, p, false, None).unwrap();
+        mm.sync_except(None);
+        mm.mmap(
+            shared,
+            p,
+            RW,
+            flags::MAP_FIXED | flags::MAP_SHARED | flags::MAP_ANONYMOUS,
+            None,
+        )
+        .unwrap();
+        let segment = SharedMemory::new(2 * p).unwrap();
+        mm.attach_shm(Some(sysv), &segment, RW, false, (1, 5))
+            .unwrap();
+        mm.mremap(sysv, 2 * p, p, false, None).unwrap();
+        leave_map_slots(&mut mm, 0);
+        for a in [reserved, private, shared, sysv] {
+            assert_eq!(mm.mremap(a, p, 2 * p, false, None), Ok(a));
+            assert_eq!(mm.vmas[&a].len, 2 * p);
+        }
+        let mut byte = [1];
+        mm.read(UserSlice::new(private + p, 1), &mut byte).unwrap();
+        assert_eq!(byte, [0]);
+        assert!(mm.mmu().translate(reserved + p, 0).is_none());
+        assert_eq!(mm.fault_past_eof(shared + p, prot::READ), Some(true));
+        assert!(mm.mmu().translate(sysv + p, prot::WRITE).is_some());
+        for base in [shared, sysv] {
+            assert!(
+                mm.shared_maps
+                    .read()
+                    .unwrap()
+                    .contains(&(base, base + 2 * p))
+            );
+        }
     }
 
     #[test]
@@ -10791,6 +11433,7 @@ mod tests {
                 None,
             )
             .unwrap();
+        mm.write_kernel(anon_written, b"x").unwrap();
         let reserved = mm
             .mmap(
                 0,
@@ -11070,6 +11713,7 @@ mod tests {
         let before = mm.shared_maps().read().unwrap().clone();
         let (region, host) = Mm::new_anonymous(PAGE_SIZE, false).unwrap();
         let bad_vma = mm.new_vma(
+            1 << VA_BITS,
             PAGE_SIZE,
             PAGE_SIZE,
             RW,
@@ -11531,6 +12175,15 @@ mod tests {
             vec![true, true]
         );
 
+        assert!(!mm.vmas[&big_ro].has_anon_vma.get());
+        run_populate(&mut mm, big_ro, PAGE_SIZE, true).unwrap();
+        assert!(mm.vmas[&big_ro].has_anon_vma.get());
+        assert!(
+            mm.mmu()
+                .translate(big_ro + PAGE_SIZE, prot::WRITE)
+                .is_some()
+        );
+
         // Fork + CoW: POPULATE_READ preserves CoW sharing; POPULATE_WRITE breaks CoW.
         let parent_rc = Mm::new().into_shared();
         let cow = {
@@ -11962,7 +12615,7 @@ mod tests {
         // Eager mapping created page tables and mapped 64 private anonymous pages; untouched pages
         // are non-resident.
         assert!(mm.pgtables_bytes() > initial_pgtables);
-        assert_eq!(mm.swappable_nonresident_pages(), 64);
+        assert_eq!(mm.swappable_nonresident_pages(), 0);
 
         // Dirtying half the range makes those 32 pages resident, leaving 32 non-resident.
         mm.write_kernel(a, &vec![0xab; 32 * PAGE_SIZE as usize])
@@ -11992,6 +12645,8 @@ mod tests {
             .borrow_mut()
             .mmap(0, 5 * PAGE_SIZE, RW, anon, None)
             .unwrap();
+        // Stop at the first write fault, before the retried guest store touches host memory.
+        assert!(parent.borrow().fault_in(addr, prot::WRITE));
         let child = parent.borrow_mut().fork().unwrap();
         let mut child = child.borrow_mut();
         assert_eq!(child.swappable_nonresident_pages(), 5);

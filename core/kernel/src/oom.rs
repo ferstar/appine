@@ -1274,10 +1274,13 @@ mod tests {
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
 
         let mm_a = Mm::new().into_shared();
-        let _a = mm_a
+        let a = mm_a
             .borrow_mut()
             .mmap(0, 128 * PAGE_SIZE, rw, anon, None)
             .unwrap();
+        // Admit the first write without executing the retried store. The VMA can now
+        // contribute candidates while all its host pages are still nonresident.
+        assert!(mm_a.borrow().fault_in(a, prot::WRITE));
         assert_eq!(mm_a.borrow().resident_pages(), 0);
         assert_eq!(mm_a.borrow().swappable_nonresident_pages(), 128);
 

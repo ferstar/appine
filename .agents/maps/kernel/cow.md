@@ -1,11 +1,11 @@
 # kernel/cow Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/kernel/cow.md` for the paired decision history (not yet created; decisions from before the split are D6, D10, D11, D19, D24, D25 and the fork/copy-on-write parts of D15, D16, D18, D20, D22, D31 and D39 in `.agents/decisions/kernel/mm.md`).
+> See `.agents/decisions/kernel/cow.md` for the paired decision history (decisions from before the split are D6, D10, D11, D19, D24, D25 and the fork/copy-on-write parts of D15, D16, D18, D20, D22, D31 and D39 in `.agents/decisions/kernel/mm.md`).
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: fork installs the child VMA after setting up its private page tracking)
+> Maintained: 2026-11-26 (targeted verification of first-write anonymous identity, lending, fork inheritance and sticky commit charges)
 
 ## Responsibilities
 
@@ -43,6 +43,9 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   owner's `HostRegion` alive.
 - `Runs` — coalesces consecutive pages into runs for PTE updates; a run never crosses a VMA.
 - `MmRef` — weak self-handle (`me`) recorded in loans.
+- `Vma::accounted` records the sticky guest commit charge. For private anonymous memory,
+  `written` tracks potential contents in a host piece, `has_anon_vma` tracks the identity of the
+  logical VMA, and `anon` distinguishes child identities when comparing adjacent pieces.
 
 ## Public entry points
 
@@ -57,18 +60,23 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 ### fork
 
 - The caller quiesces the parent (`kernel/mmu`), then `fork` checks commit unless
-  `vm.overcommit_memory` is 1 (`commit_too_big`: counts private, currently writable,
-  non-`MAP_NORESERVE`, non-dontfork VMAs the child gets, merging adjacent ones the way Linux
-  `vma_merge` would; `ENOMEM` when one exceeds RAM plus swap; a limit of 0 disables it; mode 2's
+  `vm.overcommit_memory` is 1 (`commit_too_big`: counts `accounted` mappings the child inherits,
+  combining adjacent pieces using `same_vma`, including their page offsets and fork identity; `ENOMEM` when one exceeds RAM plus swap; a limit of 0 disables it; mode 2's
   strict accounting is not emulated). `fork` cannot fail after lending starts; the parent's TLB
   flush waits for its `sync`.
 - The child keeps the parent's membarrier registrations (Linux copies `membarrier_state`) and
   `memops`; execve starts a fresh `Mm` without them.
-- Each child VMA with contents of its own gets a new `anon` identity, shared by the pieces of one
-  Linux VMA (Linux's `anon_vma_fork`), so it no longer joins its neighbours while the parent's
-  pieces still do: a written anonymous VMA, or a written private file VMA when a page of its host
-  region holds a private copy (host pagemap: present without the file bit, or swapped; unreadable
-  pagemap counts as yes).
+- Private writable mmap or mprotect sets `accounted` unless the mapping has `MAP_NORESERVE`.
+  Removing write permission preserves the charge. Forced kernel writes alone do not charge it.
+  Splits, moves, extensions, DONTUNMAP remnants and fork preserve the charge.
+- Private anonymous entries prefill without write permission until a guest write fault, kernel
+  write or write-population. That transition marks the host piece written and propagates
+  `has_anon_vma` across the logical VMA. Compatible pieces joining it inherit that identity.
+  Read faults, read-population and permission grants do not create it. DONTNEED retains it.
+- Fork gives each faulted logical VMA a fresh child `anon` shared across its pieces; the
+  parent's identity stays unchanged. Untouched anonymous VMAs and wiped child VMAs start with
+  zero identity. Private files retain the host private-page test (present without the file bit,
+  or swapped; unreadable pagemap counts as yes).
 - Per VMA (`MADV_DONTFORK` VMAs are skipped; the child's VMAs keep `dontdump` and `wipeonfork`):
   - private tmpfs mappings get a fresh private view of the pinned file. Fork copies only pages
     already written privately. Clean pages keep following the backing file and its quota.
@@ -162,14 +170,15 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   debug-asserts that any re-lent page still has a live loan entry.
 - Host `mincore` reports pages swapped to zram as absent, which is why `fork`'s touched-page check
   reads `/proc/self/pagemap` instead.
-- `fork` cannot fail after lending starts; all host allocations (`carve`, `spare::anonymous`,
-  `new_anonymous`, `copy_private_file`, `child.insert_vma`) run before `lend`.
+- `fork` cannot return an error after lending starts. It prepares the child's host backing
+  (`carve`, `spare::anonymous`, `new_anonymous`, `copy_private_file`) and calls `child.insert_vma`
+  before `lend`.
 
 ## Confirmed bugs / technical debt
 
-- **`anon_vma` and commit approximation at fork:** anonymous memory that has been writable counts
-  as having an `anon_vma` although Linux creates one only at the first write fault, and
-  `commit_too_big` checks only current permissions rather than Linux's sticky `VM_ACCOUNT`.
+- `lend` and `cow_entries` discard errors from `map_shared`. If the host cannot allocate a
+  page table, an accessible borrowed page can lack its read-only entry. A later fault that
+  fills the missing range from the borrower's backing can then expose the wrong page.
 
 ## Open questions
 
