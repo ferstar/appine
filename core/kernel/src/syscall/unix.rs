@@ -28,6 +28,7 @@ const SO_TYPE: i32 = 3;
 const SO_ERROR: i32 = 4;
 const SO_PASSCRED: i32 = 16;
 const SO_PEERCRED: i32 = 17;
+const SO_SNDLOWAT: i32 = 19;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const SO_ACCEPTCONN: i32 = 30;
@@ -252,7 +253,7 @@ pub(super) fn connect(
     let (ty, timeout) = with(sock, |u| (u.ty, u.sndtimeo));
     if ty == SOCK_DGRAM && addr.starts_with(&[0, 0]) {
         // AF_UNSPEC disconnects without choosing a local name.
-        with(sock, |u| u.set_dgram_link(Link::None));
+        relink_dgram(cx, sock, Link::None);
         return Ok(());
     }
     autobind_passcred(cx, sock, Some(addr))?;
@@ -323,8 +324,16 @@ fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), E
         Socket::Unix(_) => return Err(Errno::EPROTOTYPE),
         _ => return Err(Errno::ECONNREFUSED),
     };
-    with(sock, |u| u.set_dgram_link(link));
+    relink_dgram(cx, sock, link);
     Ok(())
+}
+
+/// Replaces a datagram socket's link and releases any purged `SCM_RIGHTS` files after borrows end.
+fn relink_dgram(cx: &mut Cx<'_>, sock: &SocketRef, link: Link) {
+    let dropped = with(sock, |u| u.set_dgram_link(link));
+    if !dropped.is_empty() {
+        crate::unix::released(cx.k(), dropped);
+    }
 }
 
 // ---- Sending and receiving ----
@@ -349,7 +358,7 @@ pub(super) fn send(
     if ty == SOCK_SEQPACKET && with(sock, |u| matches!(u.link, Link::Stream { .. })) {
         autobind_passcred(cx, sock, None)?;
     }
-    let from = with(sock, |u| u.addr.clone());
+    let (from, outq) = with(sock, |u| (u.addr.clone(), u.outq.clone()));
     // A stream socket takes no destination (unix_stream_sendmsg); seqpacket ignores it
     if ty == SOCK_STREAM && !addr.is_empty() {
         let connected = with(sock, |u| matches!(u.link, Link::Stream { .. }));
@@ -381,7 +390,7 @@ pub(super) fn send(
                     return Err(Errno::EMSGSIZE);
                 }
                 if c.space() >= data.len() {
-                    c.push(packet(cx.k(), &tx, data, files, cred, from));
+                    c.push(packet(cx.k(), &tx, data, files, cred, from, &outq));
                     return Ok(data.len());
                 }
             } else {
@@ -400,6 +409,7 @@ pub(super) fn send(
                         files.take(),
                         cred,
                         from.clone(),
+                        &outq,
                     ));
                     done += n;
                     if done == data.len() {
@@ -416,7 +426,8 @@ pub(super) fn send(
 }
 
 /// Parses sendmsg's control messages, taking out the open files `SCM_RIGHTS` passes and the
-/// credentials `SCM_CREDENTIALS` declares (kernel IDs, global pid).
+/// credentials `SCM_CREDENTIALS` declares (kernel IDs, global pid). Non-`SOL_SOCKET` control
+/// messages are skipped after length validation (Linux's `__scm_send`).
 fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<(Vec<FileRef>, Option<Ucred>), Errno> {
     let mut files = Vec::new();
     let mut declared = None;
@@ -429,8 +440,12 @@ fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<(Vec<FileRef>, Option<Ucred>), 
         if len < CMSG_HDR || len > h.len() {
             return Err(Errno::EINVAL);
         }
-        match (level, ty) {
-            (SOL_SOCKET, SCM_RIGHTS) => {
+        if level != SOL_SOCKET {
+            off += len.next_multiple_of(8);
+            continue;
+        }
+        match ty {
+            SCM_RIGHTS => {
                 let n = (len - CMSG_HDR) / 4;
                 if files.len() + n > SCM_MAX_FD {
                     return Err(Errno::EINVAL);
@@ -439,7 +454,7 @@ fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<(Vec<FileRef>, Option<Ucred>), 
                     files.push(cx.fds().get(i32::from_le_bytes(fd.try_into().unwrap()))?);
                 }
             }
-            (SOL_SOCKET, SCM_CREDENTIALS) => {
+            SCM_CREDENTIALS => {
                 if len != CMSG_HDR + 12 {
                     return Err(Errno::EINVAL);
                 }
@@ -497,29 +512,27 @@ fn send_dgram(
     if destination.is_some() || with(sock, |u| matches!(u.link, Link::Dgram { .. })) {
         autobind_passcred(cx, sock, destination)?;
     }
-    let (own_rx, from, connected, shut_wr) = with(sock, |u| {
+    let (own_rx, from, outq, connected, shut_wr) = with(sock, |u| {
         let connected = match &u.link {
             Link::Dgram { tx, .. } => Some(tx.clone()),
             _ => None,
         };
-        (Rc::downgrade(&u.rx), u.addr.clone(), connected, u.shut_wr)
+        (
+            Rc::downgrade(&u.rx),
+            u.addr.clone(),
+            u.outq.clone(),
+            connected,
+            u.shut_wr,
+        )
     });
     // Datagram sends never raise SIGPIPE (only unix_stream_sendmsg sends it)
     if shut_wr {
         return Err(Errno::EPIPE);
     }
-    // unix_dgram_sendmsg: sending to a dead connected peer disconnects the socket, ECONNREFUSED
-    // this time and ENOTCONN from then on
-    let disconnect = |tx: &Weak<_>| {
-        with(sock, |u| {
-            if matches!(&u.link, Link::Dgram { tx: t, .. } if Weak::ptr_eq(t, tx)) {
-                u.set_dgram_link(Link::None);
-            }
-        });
-        Errno::ECONNREFUSED
-    };
     let rx: ChannelRef = if let Some(tx) = connected.as_ref().filter(|_| addr.is_empty()) {
-        let rx = tx.upgrade().ok_or_else(|| disconnect(tx))?;
+        let Some(rx) = tx.upgrade() else {
+            return Err(disconnect_dead_dgram(cx, sock, tx));
+        };
         // unix_may_send: even for a previously connected peer, if it has since connected to a
         // third socket it rejects datagrams from this one
         if !rx.borrow().may_receive_from(&own_rx) {
@@ -556,7 +569,7 @@ fn send_dgram(
             if c.closed {
                 drop(c);
                 return Err(match connected.as_ref().filter(|_| addr.is_empty()) {
-                    Some(tx) => disconnect(tx),
+                    Some(tx) => disconnect_dead_dgram(cx, sock, tx),
                     None => Errno::ECONNREFUSED,
                 });
             }
@@ -568,12 +581,32 @@ fn send_dgram(
             // one more datagram (unix_dgram_sendmsg's unix_recvq_full wait)
             if c.space() >= data.len() && !c.holds_back(&own_rx) {
                 let cred = packet_cred(cx, declared, passcred || c.passcred);
-                c.push(packet(cx.k(), &rx, data, files, cred, from));
+                c.push(packet(cx.k(), &rx, data, files, cred, from, &outq));
                 return Ok(data.len());
             }
         }
         block(cx, nonblock, deadline, &rx)?;
     }
+}
+
+/// unix_dgram_sendmsg: sending to a dead connected peer disconnects the socket, ECONNREFUSED
+/// this time and ENOTCONN from then on.
+fn disconnect_dead_dgram(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    tx: &Weak<RefCell<crate::unix::Channel>>,
+) -> Errno {
+    let dropped = with(sock, |u| {
+        if matches!(&u.link, Link::Dgram { tx: t, .. } if Weak::ptr_eq(t, tx)) {
+            u.set_dgram_link(Link::None)
+        } else {
+            Vec::new()
+        }
+    });
+    if !dropped.is_empty() {
+        crate::unix::released(cx.k(), dropped);
+    }
+    Errno::ECONNREFUSED
 }
 
 /// Record explicit credentials, or the sender's real IDs when either endpoint requests them.
@@ -590,7 +623,9 @@ fn packet(
     rights: Option<Rc<SendingRights>>,
     cred: Ucred,
     from: Vec<u8>,
+    outq: &Rc<std::cell::Cell<usize>>,
 ) -> Packet {
+    outq.set(outq.get() + data.len());
     Packet {
         data: data.to_vec(),
         off: 0,
@@ -599,6 +634,7 @@ fn packet(
             .unwrap_or_default(),
         cred,
         from,
+        outq: Some(outq.clone()),
     }
 }
 
@@ -659,7 +695,7 @@ fn recv_inner(
         recv_packet(
             cx,
             sock,
-            (ty, nonblock, peek, deadline),
+            (nonblock, peek, deadline),
             max,
             iovecs,
             control_len,
@@ -803,23 +839,22 @@ fn recv_stream(
 fn recv_packet(
     cx: &mut Cx<'_>,
     sock: &SocketRef,
-    (ty, nonblock, peek, deadline): (i32, bool, bool, Option<Instant>),
+    (nonblock, peek, deadline): (bool, bool, Option<Instant>),
     max: usize,
     iovecs: Option<&[(u64, usize)]>,
     control_len: usize,
 ) -> Result<(usize, Message), Errno> {
     loop {
         let rx = rx_channel(sock)?;
-        let (preview, eof, reset) = {
+        let (preview, eof) = {
             let mut c = rx.borrow_mut();
-            // A connection reset by the peer (Linux's sk_err): a seqpacket socket reports it
-            // before what is queued (__skb_try_recv_datagram)
-            if ty == SOCK_SEQPACKET && c.take_reset() {
+            // A connection reset by the peer (Linux's sk_err): datagram and seqpacket sockets
+            // report it before what is queued (__skb_try_recv_datagram)
+            if c.take_reset() {
                 return Err(Errno::ECONNRESET);
             }
             let preview = c.read_packet(max, true);
-            let reset = preview.is_none() && c.take_reset();
-            (preview, c.eof, reset)
+            (preview, c.eof)
         };
         if let Some(pre) = preview {
             if let Some(vecs) = iovecs
@@ -851,9 +886,6 @@ fn recv_packet(
             }
             let passcred = rx.borrow().passcred;
             return Ok((n, deliver(cx, r, truncated, passcred, control_len)));
-        }
-        if reset {
-            return Err(Errno::ECONNRESET);
         }
         if eof {
             return Ok((0, empty_message()));
@@ -957,6 +989,11 @@ pub(super) fn setsockopt(
         }
         SO_RCVTIMEO => u.rcvtimeo = timeval(value)?,
         SO_SNDTIMEO => u.sndtimeo = timeval(value)?,
+        // Read-only options (Linux's sk_setsockopt checks optlen < sizeof(int) before ENOPROTOOPT)
+        SO_SNDLOWAT | SO_ACCEPTCONN | SO_PEERCRED => {
+            value.get(..4).ok_or(Errno::EINVAL)?;
+            return Err(Errno::ENOPROTOOPT);
+        }
         // Buffer sizes, lingering and the like are only recorded; other options are accepted
         // without effect
         _ => {
@@ -985,10 +1022,13 @@ pub(super) fn getsockopt(
         SO_TYPE => int(u.ty),
         SO_PROTOCOL => int(0),
         // A connection reset by the peer, reported once (sock_error)
-        SO_ERROR => match &u.link {
-            Link::Stream { rx, .. } if rx.borrow_mut().take_reset() => int(Errno::ECONNRESET.0),
-            _ => int(0),
-        },
+        SO_ERROR => {
+            if u.receive_queue().borrow_mut().take_reset() {
+                int(Errno::ECONNRESET.0)
+            } else {
+                int(0)
+            }
+        }
         SO_DOMAIN => int(AF_UNIX),
         SO_PASSCRED => int(u.receive_queue().borrow().passcred as i32),
         SO_ACCEPTCONN => int(matches!(u.link, Link::Listening { .. }) as i32),

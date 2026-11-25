@@ -4281,6 +4281,7 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
 
 /// Socket ioctls, as [`ioctl`] without the notifications.
 fn socket_ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> SysResult {
+    const SIOCOUTQ: u32 = 0x5411;
     const FIONREAD: u32 = 0x541b;
     const SIOCATMARK: u32 = 0x8905;
     // Routes on an internet socket, in its namespace
@@ -4326,6 +4327,10 @@ fn socket_ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> Sy
         Socket::Inet(s) => Some(s.fd),
         Socket::Unix(u) if request == FIONREAD => {
             let n = u.unread().ok_or(Errno::EINVAL)? as i32;
+            return put(cx, arg, n.to_le_bytes()).map(|()| 0);
+        }
+        Socket::Unix(u) if request == SIOCOUTQ => {
+            let n = u.outq() as i32;
             return put(cx, arg, n.to_le_bytes()).map(|()| 0);
         }
         Socket::Netlink(_) | Socket::Unix(_) => None,

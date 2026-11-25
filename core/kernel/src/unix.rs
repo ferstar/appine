@@ -127,6 +127,8 @@ pub(crate) struct UnixSocket {
     /// The generic `SOL_SOCKET` options it only records (buffer sizes among them: the capacity
     /// stays [`CAPACITY`]).
     pub opts: crate::net::SockOpts,
+    /// Unread payload bytes currently queued in peers from this socket (`SIOCOUTQ`).
+    pub outq: Rc<std::cell::Cell<usize>>,
 }
 
 impl UnixSocket {
@@ -150,6 +152,7 @@ impl UnixSocket {
             embryo: false,
             net: None,
             opts: crate::net::SockOpts::default(),
+            outq: Rc::new(std::cell::Cell::new(0)),
         }
     }
 
@@ -170,13 +173,65 @@ impl UnixSocket {
     }
 
     /// Connects a datagram socket (`Link::Dgram`) or disconnects it (`Link::None`), noting the
-    /// peer in its own queue for senders ([`Channel::holds_back`], [`Channel::may_receive_from`]).
-    pub fn set_dgram_link(&mut self, link: Link) {
-        self.rx.borrow_mut().peer = match &link {
-            Link::Dgram { tx, .. } => Some(tx.clone()),
+    /// peer in its own queue for senders ([`Channel::holds_back`], [`Channel::may_receive_from`]),
+    /// updating Linux's datagram `TCP_ESTABLISHED` state for `/proc/net/unix`, and carrying out
+    /// `unix_dgram_disconnected` when leaving a previous peer. Returns any `SCM_RIGHTS` files
+    /// from purged queued datagrams so the caller can release them after borrows end.
+    pub fn set_dgram_link(&mut self, link: Link) -> Vec<FileRef> {
+        let old_tx = match std::mem::replace(&mut self.link, link) {
+            Link::Dgram { tx, .. } => Some(tx),
             _ => None,
         };
-        self.link = link;
+        let new_tx = match &self.link {
+            Link::Dgram { tx, .. } => Some(tx),
+            _ => None,
+        };
+        let same_peer = old_tx
+            .as_ref()
+            .zip(new_tx)
+            .is_some_and(|(old, new)| Weak::ptr_eq(old, new));
+        let own_rx = Rc::downgrade(&self.rx);
+        {
+            let mut rx = self.rx.borrow_mut();
+            rx.peer = new_tx.cloned();
+            rx.established = new_tx.is_some();
+        }
+        // Mark the new peer established (self is already updated above on self-connect).
+        if let Some(tx) = new_tx
+            && !Weak::ptr_eq(tx, &own_rx)
+            && let Some(peer) = tx.upgrade()
+        {
+            peer.borrow_mut().established = true;
+        }
+        let mut dropped_fds = Vec::new();
+        if let Some(old) = old_tx
+            && !same_peer
+        {
+            let stale = self.rx.borrow_mut().purge();
+            let had_unread = !stale.is_empty();
+            for mut p in stale {
+                dropped_fds.append(&mut p.fds);
+            }
+            if let Some(peer) = old.upgrade()
+                && !Rc::ptr_eq(&peer, &self.rx)
+            {
+                let mut p = peer.borrow_mut();
+                if p.peer.is_none() {
+                    p.established = false;
+                }
+                // Linux's unix_dgram_disconnected: if one end of a bidirectional dgram link
+                // disconnects with unread messages queued, signal ECONNRESET to the peer.
+                if !p.closed
+                    && had_unread
+                    && p.peer.as_ref().is_some_and(|w| Weak::ptr_eq(w, &own_rx))
+                {
+                    p.reset = true;
+                    drop(p);
+                    request_wake_object(wake::of(&peer));
+                }
+            }
+        }
+        dropped_fds
     }
 
     /// socketpair: two sockets connected to each other.
@@ -184,11 +239,11 @@ impl UnixSocket {
         let mut a = UnixSocket::new(ty);
         let mut b = UnixSocket::new(ty);
         if ty == SOCK_DGRAM {
-            a.set_dgram_link(Link::Dgram {
+            let _ = a.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&b.rx),
                 peer_addr: unnamed(),
             });
-            b.set_dgram_link(Link::Dgram {
+            let _ = b.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&a.rx),
                 peer_addr: unnamed(),
             });
@@ -255,6 +310,13 @@ impl UnixSocket {
         }
     }
 
+    /// SIOCOUTQ (`TIOCOUTQ`): unread bytes sent by this socket still queued in peer buffers
+    /// (Linux's `unix_outq_len`, returning 0 on listeners and unconnected sockets with nothing
+    /// queued).
+    pub fn outq(&self) -> usize {
+        self.outq.get()
+    }
+
     /// The events ppoll and epoll report, by the same rules as Linux's `unix_poll` and
     /// `unix_dgram_poll`.
     pub fn readiness(&self) -> i16 {
@@ -294,6 +356,9 @@ impl UnixSocket {
                 let mut ev = 0;
                 if !r.packets.is_empty() {
                     ev |= POLLIN | POLLRDNORM;
+                }
+                if r.reset {
+                    ev |= POLLERR;
                 }
                 if r.eof {
                     ev |= POLLIN | POLLRDNORM | POLLRDHUP;
@@ -509,11 +574,26 @@ pub(crate) struct Packet {
     pub cred: Ucred,
     /// The sender's address (recvfrom of datagrams).
     pub from: Vec<u8>,
+    /// The sender's `SIOCOUTQ` counter, decremented as bytes are read or dropped.
+    pub outq: Option<Rc<std::cell::Cell<usize>>>,
 }
 
 impl Packet {
     fn remaining(&self) -> usize {
         self.data.len() - self.off
+    }
+
+    /// Releases `n` bytes from the sender's `SIOCOUTQ` counter.
+    fn uncharge(&self, n: usize) {
+        if let Some(q) = &self.outq {
+            q.set(q.get().saturating_sub(n));
+        }
+    }
+}
+
+impl Drop for Packet {
+    fn drop(&mut self) {
+        self.uncharge(self.remaining());
     }
 }
 
@@ -553,8 +633,13 @@ pub(crate) struct Channel {
     /// The receive queue of the socket this one's datagram socket is connected to (Linux's
     /// `unix_peer`), `None` when unconnected.
     pub peer: Option<Weak<RefCell<Channel>>>,
+    /// Whether this datagram socket is in Linux's `TCP_ESTABLISHED` state for `/proc/net/unix`
+    /// (`SS_CONNECTED` = 3 vs `SS_UNCONNECTED` = 1): set on both ends by `connect()` and
+    /// `socketpair()`, cleared on disconnect and on the previous peer when unconnected.
+    pub established: bool,
     /// The sending end of a connection closed without reading everything sent to it, or before
-    /// it was accepted: the receiver's pending `ECONNRESET` (its `sk_err`), cleared once reported
+    /// it was accepted, or a bidirectional datagram peer disconnected with unread messages: the
+    /// receiver's pending `ECONNRESET` (its `sk_err`), cleared once reported
     /// ([`Channel::take_reset`]).
     pub reset: bool,
 }
@@ -607,6 +692,7 @@ impl Channel {
             } else {
                 p.off += n;
                 self.bytes -= n;
+                p.uncharge(n);
                 fds.append(&mut p.fds);
                 if p.remaining() == 0 {
                     self.packets.pop_front();
@@ -645,14 +731,23 @@ impl Channel {
             )
         } else {
             let mut p = self.packets.pop_front()?;
-            self.bytes -= p.data.len();
             let len = p.data.len();
-            p.data.truncate(max);
+            self.bytes -= len;
+            p.uncharge(len);
+            p.outq = None;
+            let mut data = std::mem::take(&mut p.data);
+            data.truncate(max);
             if self.writable() {
                 self.taken += 1;
             }
             request_wake_object(wake::of_value(self));
-            (p.data, len, std::mem::take(&mut p.fds), p.cred, p.from)
+            (
+                data,
+                len,
+                std::mem::take(&mut p.fds),
+                p.cred,
+                std::mem::take(&mut p.from),
+            )
         };
         Some(Received {
             data,
@@ -681,6 +776,20 @@ impl Channel {
     pub fn holds_back(&self, sender: &Weak<RefCell<Channel>>) -> bool {
         self.max_qlen.is_some_and(|m| self.packets.len() > m)
             && !self.peer.as_ref().is_some_and(|p| Weak::ptr_eq(p, sender))
+    }
+
+    /// Empties queued messages without closing the channel (Linux's `unix_dgram_disconnected`),
+    /// returning them so the caller can drop any open files after borrows end, and waking writers.
+    fn purge(&mut self) -> VecDeque<Packet> {
+        let stale = std::mem::take(&mut self.packets);
+        if !stale.is_empty() {
+            self.bytes = 0;
+            if self.writable() {
+                self.taken += 1;
+            }
+            request_wake_object(wake::of_value(self));
+        }
+        stale
     }
 
     /// The receiver closed: discard the buffered messages. The messages are handed to the caller
@@ -832,8 +941,15 @@ pub(crate) fn proc_listing(sockets: &[(crate::syscall::SocketRef, u32)]) -> Stri
         // __SO_ACCEPTCON; SS_UNCONNECTED, SS_CONNECTED
         let (flags, state) = match &u.link {
             Link::Listening { .. } => (0x10000, 1),
-            Link::Stream { .. } | Link::Dgram { .. } => (0, 3),
-            Link::None => (0, 1),
+            Link::Stream { .. } => (0, 3),
+            Link::Dgram { .. } | Link::None => (
+                0,
+                if u.ty == SOCK_DGRAM && u.rx.borrow().established {
+                    3
+                } else {
+                    1
+                },
+            ),
         };
         let ino = crate::pseudo::socket_ino(sock);
         line(&mut s, flags, u.ty, state, ino, &u.addr);
@@ -1063,6 +1179,7 @@ mod tests {
             fds: Vec::new(),
             cred: Ucred::of(pid, 0, 0),
             from: Vec::new(),
+            outq: None,
         }
     }
 
@@ -1244,5 +1361,112 @@ mod tests {
         collect_deferred(&mut k);
         assert!(gone.upgrade().is_none());
         assert!(inflight_sockets(&k).is_empty());
+    }
+
+    #[test]
+    fn dgram_disconnect_purges_resets_peer_and_updates_established_state() {
+        let mut a = UnixSocket::new(SOCK_DGRAM);
+        let mut b = UnixSocket::new(SOCK_DGRAM);
+        let c = UnixSocket::new(SOCK_DGRAM);
+        assert!(!a.rx.borrow().established && !b.rx.borrow().established);
+
+        // Unidirectional a -> b marks both established; disconnecting clears both.
+        assert!(
+            a.set_dgram_link(Link::Dgram {
+                tx: Rc::downgrade(&b.rx),
+                peer_addr: unnamed(),
+            })
+            .is_empty()
+        );
+        assert!(a.rx.borrow().established && b.rx.borrow().established);
+        assert!(a.set_dgram_link(Link::None).is_empty());
+        assert!(!a.rx.borrow().established && !b.rx.borrow().established);
+
+        // Mutual a <-> b: b disconnecting with unread data purges b and resets a.
+        assert!(
+            a.set_dgram_link(Link::Dgram {
+                tx: Rc::downgrade(&b.rx),
+                peer_addr: unnamed(),
+            })
+            .is_empty()
+        );
+        assert!(
+            b.set_dgram_link(Link::Dgram {
+                tx: Rc::downgrade(&a.rx),
+                peer_addr: unnamed(),
+            })
+            .is_empty()
+        );
+        let mut p = packet(b"hello", 1);
+        let f = OpenFile::new(FileKind::Host(1), oflags::O_RDONLY);
+        p.fds.push(f.clone());
+        a.outq.set(a.outq.get() + p.data.len());
+        p.outq = Some(a.outq.clone());
+        b.rx.borrow_mut().push(p);
+        assert_eq!(a.outq(), 5);
+
+        // Reconnecting to the same peer does not purge or reset.
+        assert!(
+            b.set_dgram_link(Link::Dgram {
+                tx: Rc::downgrade(&a.rx),
+                peer_addr: unnamed(),
+            })
+            .is_empty()
+        );
+        assert_eq!(b.rx.borrow().bytes, 5);
+        assert!(!a.rx.borrow().reset);
+
+        // Reconnecting b to c purges b's queue, returns its fds, uncharges a.outq, and resets a.
+        let dropped = b.set_dgram_link(Link::Dgram {
+            tx: Rc::downgrade(&c.rx),
+            peer_addr: unnamed(),
+        });
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(b.rx.borrow().bytes, 0);
+        assert_eq!(a.outq(), 0);
+        assert!(a.rx.borrow().established);
+        assert!(b.rx.borrow().established && c.rx.borrow().established);
+        assert_ne!(a.readiness() & POLLERR, 0);
+        assert!(a.rx.borrow_mut().take_reset());
+        assert_eq!(a.readiness() & POLLERR, 0);
+
+        // Self-connect and self-disconnect do not panic or self-reset.
+        let mut s = UnixSocket::new(SOCK_DGRAM);
+        let own = Rc::downgrade(&s.rx);
+        assert!(
+            s.set_dgram_link(Link::Dgram {
+                tx: own,
+                peer_addr: unnamed(),
+            })
+            .is_empty()
+        );
+        s.rx.borrow_mut().push(packet(b"self", 1));
+        assert!(s.set_dgram_link(Link::None).is_empty());
+        assert_eq!(s.rx.borrow().bytes, 0);
+        assert!(!s.rx.borrow().reset && !s.rx.borrow().established);
+    }
+
+    #[test]
+    fn outq_tracks_stream_dgram_and_drop_releases() {
+        let (a, b) = UnixSocket::pair(SOCK_STREAM, Ucred::of(1, 0, 0));
+        let Link::Stream { tx, .. } = &a.link else {
+            unreachable!()
+        };
+        let mut p = packet(b"abcdef", 1);
+        a.outq.set(6);
+        p.outq = Some(a.outq.clone());
+        tx.borrow_mut().push(p);
+        assert_eq!(a.outq(), 6);
+        // Peek leaves outq intact; partial stream read subtracts only consumed bytes.
+        let Link::Stream { rx, .. } = &b.link else {
+            unreachable!()
+        };
+        assert_eq!(rx.borrow_mut().read_stream(2, true, false).data, b"ab");
+        assert_eq!(a.outq(), 6);
+        assert_eq!(rx.borrow_mut().read_stream(2, false, false).data, b"ab");
+        assert_eq!(a.outq(), 4);
+        // Dropping the receiver discards the remainder and returns outq to zero.
+        drop(b);
+        assert_eq!(a.outq(), 0);
     }
 }

@@ -1986,6 +1986,7 @@ pub(crate) mod tests {
                 fds,
                 cred: Ucred::of(1, 0, 0),
                 from: Vec::new(),
+                outq: None,
             });
             drop((a_file, b_file, to_b));
 
