@@ -1011,6 +1011,11 @@ fn mm_mount_pseudo_regressions() {
 }
 
 #[test]
+fn new_mount_api_no_lift_and_nsfs_pinning() {
+    run_guest_in_empty_rootfs("mount_api");
+}
+
+#[test]
 fn exec_runs_post_syscall_sweeps() {
     run_guest_in_empty_rootfs("exec_sweep");
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: tag sysfs mounts with mounter's network namespace via per-netns devices and Vfs::sys_net_ns)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: stop lifting no-lookup paths in walk_at, lift move_tree target per lock_mount, and clone nsfs mounts with mnt_ns_loop checks in open_tree/move_mount)
 
 ## Responsibilities
 
@@ -87,7 +87,7 @@ Outside the module:
   detached mount's root, point, and `at`/`root_at` parent directories, which the FUSE and overlay
   node sweeps keep), `mount_events`
   (the counter polled through mounts and mountinfo).
-- **Changes**: `clone_mount`, `attach_tree`, `add_mount`/`add_mount_unattached`, `add_copies`,
+- **Changes**: `clone_mount`, `clone_ns_mount`, `attach_tree`, `add_mount`/`add_mount_unattached`, `add_copies`,
   `move_mount`, `set_root_at`, `umount_tree`, `propagation_targets`, `propagate`,
   `propagated_busy`, `set_propagation`, `attached`, `propagation`, `update_mount`,
   `set_mount_attrs`, `set_expiring`, `resolve_mountpoint`.
@@ -251,14 +251,17 @@ Outside the module:
   idmapped mounts end in `EINVAL` after the userns fd checks — `EBADF` for a bad fd, `EPERM` for
   the initial namespace — all before the path walk; set, clear and propagation all zero is a
   no-op; the caller's-namespace check exempts only a parentless mount of an anonymous namespace
-  (`point.is_none()`), enforcing it on child mounts per `do_mount_setattr`). open_tree, both paths
-  of move_mount and mount_setattr walk with `walk_at`,
-  which always lifts the result to the topmost mount; the ordinary walk already lifts after each
-  named component and `..`, so this changes only results reached without a lookup (an empty path,
-  `.`, `/`, magic links such as `/proc/<pid>/root`, symlinks to `/`), while mount(2)'s `MS_MOVE`
-  source is not lifted. open_tree has no namespace-file path: a clone takes the filesystem, flags
-  and pin of the mount the node was reached through, so cloning `/proc/<pid>/ns/*` gives a procfs
-  mount pinning nothing.
+  (`point.is_none()`), enforcing it on child mounts per `do_mount_setattr`). `open_tree`,
+  `move_mount`, and `mount_setattr` walk with `walk_at` (Linux 6.1's `user_path_at`): `Vfs::walk`
+  lifts after named component lookups and `..`, while no-lookup paths (an `AT_EMPTY_PATH` fd, `.`,
+  `/`, magic links such as `/proc/<pid>/root`, symlinks to `/`) stay on their mount; only
+  `move_tree`'s attachment target is lifted (`lock_mount`). Cloning a namespace file
+  (`PseudoNode::NsFile`) with `open_tree(OPEN_TREE_CLONE)` creates a pinning nsfs mount
+  (`Vfs::clone_ns_mount` for procfs/detached/derived ns files, or `Vfs::clone_mount` without
+  `check_mnt` and with `root_at` cleared for the root of an attached `Fs::Nsfs` mount per 6.1's
+  `NSFS_MAGIC` rule), and `move_tree` enforces `mnt_ns_loop` (`EINVAL` when any mount in the
+  moved/attached subtree pins a mount namespace whose id is `<=` the caller's namespace or any
+  propagation target's namespace).
 - `umount2`: unknown flags `EINVAL`; lookup via `Vfs::resolve_mountpoint` (which does not clear
   `MNT_EXPIRE`, matching `mntput_no_expire`); `may_mount` (`EPERM`); not a mount root, not in
   the caller's namespace or locked in place `EINVAL`; `MNT_EXPIRE` (with `MNT_FORCE`/
@@ -412,10 +415,6 @@ Outside the module:
 ## Confirmed bugs / technical debt
 
 - **Mount fidelity gaps:**
-  - `walk_at` lifts the source of open_tree, move_mount and mount_setattr reached without a lookup
-    (an `AT_EMPTY_PATH` fd, `.`, `/`), where 6.1's `user_path_at` stays on the mount it has;
-  - an open_tree clone of `/proc/<pid>/ns/*` is a procfs mount pinning nothing, not an nsfs mount
-    keeping the namespace;
   - turning an instance read-only (`sb_busy`) still ignores deleted files that are only mapped and
     deleted FUSE files, which 6.1's `s_remove_count` counts until the inode is evicted.
 

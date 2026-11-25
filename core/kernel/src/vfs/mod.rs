@@ -2683,6 +2683,40 @@ impl Vfs {
         Ok(id)
     }
 
+    /// open_tree(`OPEN_TREE_CLONE`) on a namespace file not rooted at an attached nsfs mount:
+    /// creates an nsfs mount in anonymous namespace `ns`, mounted nowhere, pinning `pin`.
+    pub(crate) fn clone_ns_mount(
+        &self,
+        src: &Node,
+        pin: crate::nsproxy::NsRef,
+        ns: u64,
+    ) -> MountId {
+        let mut mounts = self.mounts.borrow_mut();
+        let id = mounts.next;
+        mounts.next += 1;
+        mounts.push_attached(Mount {
+            id,
+            ns,
+            fs: Fs::Nsfs,
+            root: src.clone().in_mount(id),
+            point: None,
+            at: None,
+            root_at: None,
+            root_gone: false,
+            flags: 0,
+            dev: Fs::Nsfs.dev(),
+            source: b"nsfs".to_vec(),
+            expiring: false,
+            pin: Some(pin),
+            locks: 0,
+            prop: Propagation::default(),
+            owner: None,
+        });
+        drop(mounts);
+        self.mounts_changed();
+        id
+    }
+
     /// move_mount attaching a tree copied by open_tree: the root is mounted on `point`, and all
     /// mounts in the tree move into namespace `to`.
     pub(crate) fn attach_tree(&self, root: MountId, (point, at): (Node, Option<Dentry>), to: u64) {
@@ -6803,6 +6837,66 @@ mod tests {
         assert!(vfs.has_removed_dirs());
         vfs.prune_removed_dirs(&std::collections::HashSet::new());
         assert!(!vfs.has_removed_dirs());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clone_ns_mount_pins_and_collects_namespaces() {
+        let (vfs, dir) = sample("open-tree-nsfs");
+        let (pin, _) = vfs.store().create_file(ROOT, b"pin", 0o444, 0, 0).unwrap();
+        let point = (
+            Node::Store(ROOT_MOUNT, pin),
+            Some((Node::ROOT, b"pin".to_vec())),
+        );
+        // 1. Unattached clone_ns_mount keeps namespace alive and releases it when anon_ns drops.
+        let (ns1, _) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
+        let ns1_id = ns1.id;
+        let anon1 = vfs.anon_ns(crate::cred::UserNs::init());
+        let src1 = Node::Pseudo(
+            PROC_MOUNT,
+            PseudoNode::NsFile(crate::pseudo::NsKind::Mnt, ns1_id),
+        );
+        let mid1 = vfs.clone_ns_mount(&src1, crate::nsproxy::NsRef::Mnt(ns1.clone()), anon1.id);
+        let m1 = vfs.mount(mid1).unwrap();
+        assert_eq!(m1.fs, Fs::Nsfs);
+        assert_eq!(m1.dev, Fs::Nsfs.dev());
+        assert_eq!(m1.source, b"nsfs");
+        assert_eq!(m1.flags, 0);
+        assert!(m1.point.is_none());
+        assert!(m1.root_at.is_none());
+        assert_eq!(m1.pin.as_ref().map(|r| r.id()), Some(ns1_id));
+        drop(m1);
+        drop(ns1);
+        assert!(vfs.find_ns(ns1_id).is_some());
+        assert_eq!(vfs.pinned_ns(ns1_id).map(|r| r.id()), Some(ns1_id));
+        drop(anon1);
+        assert!(vfs.has_dead_ns());
+        vfs.collect(&std::collections::HashSet::new());
+        assert!(vfs.find_ns(ns1_id).is_none());
+        assert!(vfs.pinned_ns(ns1_id).is_none());
+
+        // 2. Attaching a clone_ns_mount keeps the pinned namespace alive after anon_ns drops,
+        //    and detaching releases it.
+        let (ns2, _) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
+        let ns2_id = ns2.id;
+        let anon2 = vfs.anon_ns(crate::cred::UserNs::init());
+        let src2 = Node::Pseudo(
+            PROC_MOUNT,
+            PseudoNode::NsFile(crate::pseudo::NsKind::Mnt, ns2_id),
+        );
+        let mid2 = vfs.clone_ns_mount(&src2, crate::nsproxy::NsRef::Mnt(ns2.clone()), anon2.id);
+        drop(ns2);
+        vfs.attach_tree(mid2, point, INIT_MNT_NS);
+        drop(anon2);
+        vfs.collect(&std::collections::HashSet::new());
+        assert!(vfs.find_ns(ns2_id).is_some());
+        assert_eq!(vfs.pinned_ns(ns2_id).map(|r| r.id()), Some(ns2_id));
+        assert_eq!(vfs.mount(mid2).unwrap().ns, INIT_MNT_NS);
+        vfs.remove_mount(mid2);
+        vfs.collect(&std::collections::HashSet::new());
+        assert!(vfs.find_ns(ns2_id).is_none());
+        assert!(vfs.pinned_ns(ns2_id).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
