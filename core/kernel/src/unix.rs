@@ -30,6 +30,44 @@ pub const SOCK_SEQPACKET: i32 = 5;
 /// The most bytes buffered per direction, the same as Linux's default `SO_SNDBUF` (208 KiB).
 pub const CAPACITY: usize = 212_992;
 
+/// Maximum payload of a single datagram or seqpacket message (Linux's `sk_sndbuf - 32`).
+pub(crate) const DGRAM_MAX_LEN: usize = CAPACITY - 32;
+
+/// Approximate Linux 64-bit `skb->truesize` for a queued AF_UNIX packet: every queued packet
+/// (including zero-length datagrams/seqpackets) charges at least 768 bytes, matching Linux's
+/// `sk_wmem_alloc` / `SIOCOUTQ` and preventing unbounded zero-byte floods.
+pub(crate) fn packet_truesize(len: usize) -> usize {
+    if len <= 128 {
+        768
+    } else if len <= 4096 {
+        256 + (len + 320).next_power_of_two()
+    } else {
+        len.next_multiple_of(4096).saturating_add(768)
+    }
+}
+
+/// Shared cell holding a socket's bound `sockaddr_un` bytes (empty while unbound) so packets and
+/// peers observe post-send/post-connect `bind()` at receive/`getpeername` time without retaining
+/// the sending `UnixSocket`.
+pub(crate) type AddrRef = Rc<RefCell<Vec<u8>>>;
+
+/// Shared sender state carried by queued packets: live bound address cell and `SIOCOUTQ`
+/// `truesize` counter, so packets resolve the sender's address at receive time and uncharge
+/// `SIOCOUTQ` on drop without retaining the sending `UnixSocket`.
+pub(crate) struct SenderState {
+    pub addr: AddrRef,
+    pub outq: std::cell::Cell<usize>,
+}
+
+impl SenderState {
+    fn new(addr: AddrRef) -> Rc<Self> {
+        Rc::new(Self {
+            addr,
+            outq: std::cell::Cell::new(0),
+        })
+    }
+}
+
 /// The default `net.unix.max_dgram_qlen`: datagrams a socket's queue holds before senders other
 /// than its peer wait.
 pub(crate) const MAX_DGRAM_QLEN: usize = 10;
@@ -93,20 +131,21 @@ pub(crate) enum Link {
     Stream {
         rx: ChannelRef,
         tx: ChannelRef,
-        peer_addr: Vec<u8>,
+        peer_addr: AddrRef,
     },
     /// A datagram socket connected to the peer's receive queue.
     Dgram {
         tx: Weak<RefCell<Channel>>,
-        peer_addr: Vec<u8>,
+        peer_addr: AddrRef,
     },
 }
 
 /// An AF_UNIX socket.
 pub(crate) struct UnixSocket {
     pub ty: i32,
-    /// The bound address (`sockaddr_un` bytes), empty when unbound.
-    pub addr: Vec<u8>,
+    /// The bound address (`sockaddr_un` bytes), empty when unbound. Shared with outgoing packets
+    /// and connected peers so later `bind()` calls are observed at receive/query time.
+    pub addr: AddrRef,
     pub link: Link,
     /// The datagram socket's own receive queue.
     pub rx: ChannelRef,
@@ -127,8 +166,8 @@ pub(crate) struct UnixSocket {
     /// The generic `SOL_SOCKET` options it only records (buffer sizes among them: the capacity
     /// stays [`CAPACITY`]).
     pub opts: crate::net::SockOpts,
-    /// Unread payload bytes currently queued in peers from this socket (`SIOCOUTQ`).
-    pub outq: Rc<std::cell::Cell<usize>>,
+    /// Shared sender state carried by outgoing packets (bound address cell + `SIOCOUTQ` counter).
+    pub outq: Rc<SenderState>,
     /// Creator's filesystem UID (`sock_i_uid`).
     pub uid: u32,
 }
@@ -139,11 +178,15 @@ impl UnixSocket {
     pub fn new(ty: i32) -> UnixSocket {
         let rx = ChannelRef::default();
         if ty == SOCK_DGRAM {
-            rx.borrow_mut().max_qlen = Some(MAX_DGRAM_QLEN);
+            let mut r = rx.borrow_mut();
+            r.max_qlen = Some(MAX_DGRAM_QLEN);
+            r.packet_budget = true;
         }
+        let addr = Rc::new(RefCell::new(Vec::new()));
+        let outq = SenderState::new(addr.clone());
         UnixSocket {
             ty,
-            addr: Vec::new(),
+            addr,
             link: Link::None,
             rx,
             peer_cred: None,
@@ -154,7 +197,7 @@ impl UnixSocket {
             embryo: false,
             net: None,
             opts: crate::net::SockOpts::default(),
-            outq: Rc::new(std::cell::Cell::new(0)),
+            outq,
             uid: 0,
         }
     }
@@ -241,26 +284,32 @@ impl UnixSocket {
     pub fn pair(ty: i32, cred: Ucred) -> (UnixSocket, UnixSocket) {
         let mut a = UnixSocket::new(ty);
         let mut b = UnixSocket::new(ty);
+        let a_addr = a.addr.clone();
+        let b_addr = b.addr.clone();
         if ty == SOCK_DGRAM {
             let _ = a.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&b.rx),
-                peer_addr: unnamed(),
+                peer_addr: b_addr,
             });
             let _ = b.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&a.rx),
-                peer_addr: unnamed(),
+                peer_addr: a_addr,
             });
         } else {
             let (ab, ba) = (ChannelRef::default(), ChannelRef::default());
+            if ty == SOCK_SEQPACKET {
+                ab.borrow_mut().packet_budget = true;
+                ba.borrow_mut().packet_budget = true;
+            }
             a.link = Link::Stream {
                 rx: ba.clone(),
                 tx: ab.clone(),
-                peer_addr: unnamed(),
+                peer_addr: b_addr,
             };
             b.link = Link::Stream {
                 rx: ab,
                 tx: ba,
-                peer_addr: unnamed(),
+                peer_addr: a_addr,
             };
         }
         a.peer_cred = Some(cred);
@@ -272,30 +321,38 @@ impl UnixSocket {
     /// which the caller puts into the listening socket's wait queue.
     pub fn connect_stream(
         &mut self,
-        server_addr: &[u8],
+        server_addr: &AddrRef,
         server_cred: Ucred,
         cred: Ucred,
     ) -> UnixSocket {
         let (up, down) = (ChannelRef::default(), ChannelRef::default());
-        down.borrow_mut().passcred = self.rx.borrow().passcred;
+        {
+            let mut d = down.borrow_mut();
+            d.passcred = self.rx.borrow().passcred;
+            d.packet_budget = self.ty == SOCK_SEQPACKET;
+        }
         // Linux records credentials for an unaccepted peer. accept installs the listener's setting.
-        up.borrow_mut().passcred = true;
+        {
+            let mut u = up.borrow_mut();
+            u.passcred = true;
+            u.packet_budget = self.ty == SOCK_SEQPACKET;
+        }
         let mut server = UnixSocket::new(self.ty);
         // As in Linux's unix_stream_connect, the new end is created in the connecting side's
         // network namespace
         server.net = self.net.clone();
-        server.addr = server_addr.to_vec();
+        *server.addr.borrow_mut() = server_addr.borrow().clone();
         server.embryo = true;
         server.link = Link::Stream {
             rx: up.clone(),
             tx: down.clone(),
-            peer_addr: self.name(),
+            peer_addr: self.addr.clone(),
         };
         server.peer_cred = Some(cred);
         self.link = Link::Stream {
             rx: down,
             tx: up,
-            peer_addr: server_addr.to_vec(),
+            peer_addr: server_addr.clone(),
         };
         self.peer_cred = Some(server_cred);
         server
@@ -313,11 +370,11 @@ impl UnixSocket {
         }
     }
 
-    /// SIOCOUTQ (`TIOCOUTQ`): unread bytes sent by this socket still queued in peer buffers
-    /// (Linux's `unix_outq_len`, returning 0 on listeners and unconnected sockets with nothing
-    /// queued).
+    /// SIOCOUTQ (`TIOCOUTQ`): queued packet truesize bytes sent by this socket still in peer
+    /// buffers (Linux's `unix_outq_len`, returning 0 on listeners and unconnected sockets with
+    /// nothing queued).
     pub fn outq(&self) -> usize {
-        self.outq.get()
+        self.outq.outq.get()
     }
 
     /// The events ppoll and epoll report, by the same rules as Linux's `unix_poll` and
@@ -461,10 +518,11 @@ impl UnixSocket {
 
     /// Its own address; only the address family when unbound.
     pub fn name(&self) -> Vec<u8> {
-        if self.addr.is_empty() {
+        let addr = self.addr.borrow();
+        if addr.is_empty() {
             unnamed()
         } else {
-            self.addr.clone()
+            addr.clone()
         }
     }
 
@@ -472,7 +530,12 @@ impl UnixSocket {
     pub fn peer_name(&self) -> Option<Vec<u8>> {
         match &self.link {
             Link::Stream { peer_addr, .. } | Link::Dgram { peer_addr, .. } => {
-                Some(peer_addr.clone())
+                let addr = peer_addr.borrow();
+                Some(if addr.is_empty() {
+                    unnamed()
+                } else {
+                    addr.clone()
+                })
             }
             Link::None | Link::Listening { .. } => None,
         }
@@ -526,12 +589,13 @@ pub(crate) enum Name {
     Abstract(u64, i32, Vec<u8>),
 }
 
-/// Bound addresses (kernel-wide). After a socket closes its weak reference dies, and the address
-/// is released with it.
+/// Bound addresses (kernel-wide) and pending server embryos waiting for accept. After a socket
+/// closes its weak reference dies, and the address or embryo entry is released with it.
 #[derive(Default)]
 pub(crate) struct Names {
     map: BTreeMap<Name, Weak<RefCell<Socket>>>,
     next_auto: u32,
+    embryos: Vec<Weak<RefCell<Socket>>>,
 }
 
 impl Names {
@@ -562,6 +626,20 @@ impl Names {
     pub fn lookup(&self, name: &Name) -> Option<Rc<RefCell<Socket>>> {
         self.map.get(name).and_then(Weak::upgrade)
     }
+
+    /// Records a server embryo queued on a listener so `/proc/net/unix` lists it in the
+    /// connecting socket's network namespace without borrowing any listener socket.
+    pub fn add_embryo(&mut self, sock: &Rc<RefCell<Socket>>) {
+        self.embryos.retain(|w| w.strong_count() > 0);
+        self.embryos.push(Rc::downgrade(sock));
+    }
+
+    /// Removes an embryo once accepted.
+    pub fn remove_embryo(&mut self, sock: &Rc<RefCell<Socket>>) {
+        let ptr = Rc::as_ptr(sock);
+        self.embryos
+            .retain(|w| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), ptr));
+    }
 }
 
 // ---- Channels ----
@@ -575,10 +653,10 @@ pub(crate) struct Packet {
     pub fds: Vec<FileRef>,
     /// The recorded sender credentials, or `Ucred::UNSTAMPED`.
     pub cred: Ucred,
-    /// The sender's address (recvfrom of datagrams).
+    /// Fallback static sender address (used when `outq` is `None`).
     pub from: Vec<u8>,
-    /// The sender's `SIOCOUTQ` counter, decremented as bytes are read or dropped.
-    pub outq: Option<Rc<std::cell::Cell<usize>>>,
+    /// Shared sender state (`addr` resolved at receive time + `SIOCOUTQ` counter uncharged on drop).
+    pub outq: Option<Rc<SenderState>>,
 }
 
 impl Packet {
@@ -586,17 +664,26 @@ impl Packet {
         self.data.len() - self.off
     }
 
-    /// Releases `n` bytes from the sender's `SIOCOUTQ` counter.
+    fn truesize(&self) -> usize {
+        packet_truesize(self.data.len())
+    }
+
+    fn sender_addr(&self) -> Vec<u8> {
+        self.outq
+            .as_ref()
+            .map_or_else(|| self.from.clone(), |s| s.addr.borrow().clone())
+    }
+
     fn uncharge(&self, n: usize) {
-        if let Some(q) = &self.outq {
-            q.set(q.get().saturating_sub(n));
+        if let Some(s) = &self.outq {
+            s.outq.set(s.outq.get().saturating_sub(n));
         }
     }
 }
 
 impl Drop for Packet {
     fn drop(&mut self) {
-        self.uncharge(self.remaining());
+        self.uncharge(self.truesize());
     }
 }
 
@@ -616,8 +703,13 @@ pub(crate) struct Channel {
     /// The receiving socket's SO_PASSCRED flag, also set while a connection is awaiting accept.
     pub passcred: bool,
     pub packets: VecDeque<Packet>,
-    /// Bytes not yet read.
+    /// Payload bytes not yet read (`FIONREAD`).
     pub bytes: usize,
+    /// Total `truesize` of packets currently queued (`sk_wmem_alloc` equivalent for packet room).
+    pub truesize: usize,
+    /// True for datagram and seqpacket channels (whose queue capacity and writability budget by
+    /// `truesize` rather than stream payload `bytes`).
+    pub packet_budget: bool,
     /// No new data will come (the sender closed or did `SHUT_WR`, or the receiver did `SHUT_RD`):
     /// EOF once everything is read.
     pub eof: bool,
@@ -650,9 +742,15 @@ pub(crate) struct Channel {
 pub(crate) type ChannelRef = Rc<RefCell<Channel>>;
 
 impl Channel {
-    /// The bytes that still fit.
+    /// The payload bytes that still fit for a stream write.
     pub fn space(&self) -> usize {
         CAPACITY.saturating_sub(self.bytes)
+    }
+
+    /// Whether another datagram, seqpacket, or zero-byte SCM_RIGHTS packet fits (Linux's
+    /// `sk_wmem_alloc < sk_sndbuf` check).
+    pub fn has_packet_room(&self) -> bool {
+        self.truesize < CAPACITY
     }
 
     /// Reports the pending `ECONNRESET` once (Linux's `sock_error`).
@@ -662,6 +760,7 @@ impl Channel {
 
     pub fn push(&mut self, p: Packet) {
         self.bytes += p.remaining();
+        self.truesize += p.truesize();
         self.packets.push_back(p);
         self.arrivals += 1;
         request_wake_object(wake::of_value(self));
@@ -676,7 +775,7 @@ impl Channel {
         let from = self
             .packets
             .front()
-            .map(|p| p.from.clone())
+            .map(Packet::sender_addr)
             .unwrap_or_default();
         let mut i = 0;
         while let Some(p) = self.packets.get_mut(i) {
@@ -695,10 +794,10 @@ impl Channel {
             } else {
                 p.off += n;
                 self.bytes -= n;
-                p.uncharge(n);
                 fds.append(&mut p.fds);
                 if p.remaining() == 0 {
-                    self.packets.pop_front();
+                    let popped = self.packets.pop_front().unwrap();
+                    self.truesize -= popped.truesize();
                 }
             }
             if had_fds || data.len() >= max {
@@ -730,27 +829,26 @@ impl Channel {
                 p.data.len(),
                 p.fds.clone(),
                 p.cred,
-                p.from.clone(),
+                p.sender_addr(),
             )
         } else {
             let mut p = self.packets.pop_front()?;
             let len = p.data.len();
+            let ts = p.truesize();
+            let from = p.sender_addr();
             self.bytes -= len;
-            p.uncharge(len);
+            self.truesize -= ts;
+            p.uncharge(ts);
             p.outq = None;
             let mut data = std::mem::take(&mut p.data);
             data.truncate(max);
+            let fds = std::mem::take(&mut p.fds);
+            let cred = p.cred;
             if self.writable() {
                 self.taken += 1;
             }
             request_wake_object(wake::of_value(self));
-            (
-                data,
-                len,
-                std::mem::take(&mut p.fds),
-                p.cred,
-                std::mem::take(&mut p.from),
-            )
+            (data, len, fds, cred, from)
         };
         Some(Received {
             data,
@@ -761,10 +859,15 @@ impl Channel {
         })
     }
 
-    /// As on Linux: writable is reported only when the buffered data is at most a quarter of the
-    /// capacity.
+    /// Writable when datagram/seqpacket queued truesize is at most half of capacity (Linux's
+    /// `unix_writable`), or for streams when buffered payload is at most a quarter of capacity
+    /// (also guarding zero-byte SCM_RIGHTS floods).
     pub fn writable(&self) -> bool {
-        self.bytes * 4 <= CAPACITY
+        if self.packet_budget {
+            self.truesize * 2 <= CAPACITY
+        } else {
+            self.bytes * 4 <= CAPACITY && (self.bytes > 0 || self.truesize * 2 <= CAPACITY)
+        }
     }
 
     /// Whether a datagram from the socket receiving into `sender` is allowed by `unix_may_send`:
@@ -787,6 +890,7 @@ impl Channel {
         let stale = std::mem::take(&mut self.packets);
         if !stale.is_empty() {
             self.bytes = 0;
+            self.truesize = 0;
             if self.writable() {
                 self.taken += 1;
             }
@@ -801,6 +905,7 @@ impl Channel {
     fn discard(&mut self) -> VecDeque<Packet> {
         self.closed = true;
         self.bytes = 0;
+        self.truesize = 0;
         std::mem::take(&mut self.packets)
     }
 }
@@ -896,14 +1001,17 @@ impl Drop for PendingRights {
     }
 }
 
-/// In-flight sockets (those only in `SCM_RIGHTS` messages): `/proc/net/*` lists them too.
+/// In-flight sockets (those only in `SCM_RIGHTS` messages) and pending server embryos waiting for
+/// `accept`: `/proc/net/unix` lists them too (filtered by each socket's own `net` namespace).
 /// Does not borrow any socket `RefCell`.
 pub(crate) fn inflight_sockets(k: &Kernel) -> Vec<Rc<RefCell<Socket>>> {
-    collect_inflight(k, |f| match &f.borrow().kind {
+    let mut out = collect_inflight(k, |f| match &f.borrow().kind {
         FileKind::Socket(s) => Some(s.clone()),
         _ => None,
     })
-    .expect("in-flight AF_UNIX channels are available")
+    .expect("in-flight AF_UNIX channels are available");
+    out.extend(k.unix.embryos.iter().filter_map(Weak::upgrade));
+    out
 }
 
 /// The open files carried by messages in flight (each as many times as it is carried).
@@ -946,6 +1054,13 @@ pub(crate) fn proc_listing(sockets: &[(crate::syscall::SocketRef, u32)]) -> Stri
         let Socket::Unix(u) = &*b else {
             continue;
         };
+        let addr = u.addr.borrow();
+        // Connections not yet accepted: as on Linux they belong to the connecting socket's network
+        // namespace, have no inode, carry the listening address, and show state SS_CONNECTING (2).
+        if u.embryo {
+            line(&mut s, 0, u.ty, 2, 0, &addr);
+            continue;
+        }
         // __SO_ACCEPTCON; SS_UNCONNECTED, SS_CONNECTED
         let (flags, state) = match &u.link {
             Link::Listening { .. } => (0x10000, 1),
@@ -960,14 +1075,7 @@ pub(crate) fn proc_listing(sockets: &[(crate::syscall::SocketRef, u32)]) -> Stri
             ),
         };
         let ino = crate::pseudo::socket_ino(sock);
-        line(&mut s, flags, u.ty, state, ino, &u.addr);
-        // Connections not yet accepted: as on Linux they have no inode, the address is the
-        // listening address and the state is SS_CONNECTING (there is no socket object yet)
-        if let Link::Listening { pending, .. } = &u.link {
-            for _ in pending {
-                line(&mut s, 0, u.ty, 2, 0, &u.addr);
-            }
-        }
+        line(&mut s, flags, u.ty, state, ino, &addr);
     }
     s
 }
@@ -1135,6 +1243,7 @@ fn collect_once(k: &mut Kernel) -> bool {
             for c in inboxes(u) {
                 let mut c = c.borrow_mut();
                 c.bytes = 0;
+                c.truesize = 0;
                 garbage.extend(std::mem::take(&mut c.packets));
             }
         }
@@ -1382,7 +1491,7 @@ mod tests {
         assert!(
             a.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&b.rx),
-                peer_addr: unnamed(),
+                peer_addr: b.addr.clone(),
             })
             .is_empty()
         );
@@ -1394,30 +1503,30 @@ mod tests {
         assert!(
             a.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&b.rx),
-                peer_addr: unnamed(),
+                peer_addr: b.addr.clone(),
             })
             .is_empty()
         );
         assert!(
             b.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&a.rx),
-                peer_addr: unnamed(),
+                peer_addr: a.addr.clone(),
             })
             .is_empty()
         );
         let mut p = packet(b"hello", 1);
         let f = OpenFile::new(FileKind::Host(1), oflags::O_RDONLY);
         p.fds.push(f.clone());
-        a.outq.set(a.outq.get() + p.data.len());
+        a.outq.outq.set(a.outq.outq.get() + p.truesize());
         p.outq = Some(a.outq.clone());
         b.rx.borrow_mut().push(p);
-        assert_eq!(a.outq(), 5);
+        assert_eq!(a.outq(), packet_truesize(5));
 
         // Reconnecting to the same peer does not purge or reset.
         assert!(
             b.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&a.rx),
-                peer_addr: unnamed(),
+                peer_addr: a.addr.clone(),
             })
             .is_empty()
         );
@@ -1427,10 +1536,11 @@ mod tests {
         // Reconnecting b to c purges b's queue, returns its fds, uncharges a.outq, and resets a.
         let dropped = b.set_dgram_link(Link::Dgram {
             tx: Rc::downgrade(&c.rx),
-            peer_addr: unnamed(),
+            peer_addr: c.addr.clone(),
         });
         assert_eq!(dropped.len(), 1);
         assert_eq!(b.rx.borrow().bytes, 0);
+        assert_eq!(b.rx.borrow().truesize, 0);
         assert_eq!(a.outq(), 0);
         assert!(a.rx.borrow().established);
         assert!(b.rx.borrow().established && c.rx.borrow().established);
@@ -1441,40 +1551,144 @@ mod tests {
         // Self-connect and self-disconnect do not panic or self-reset.
         let mut s = UnixSocket::new(SOCK_DGRAM);
         let own = Rc::downgrade(&s.rx);
+        let own_addr = s.addr.clone();
         assert!(
             s.set_dgram_link(Link::Dgram {
                 tx: own,
-                peer_addr: unnamed(),
+                peer_addr: own_addr,
             })
             .is_empty()
         );
         s.rx.borrow_mut().push(packet(b"self", 1));
         assert!(s.set_dgram_link(Link::None).is_empty());
         assert_eq!(s.rx.borrow().bytes, 0);
+        assert_eq!(s.rx.borrow().truesize, 0);
         assert!(!s.rx.borrow().reset && !s.rx.borrow().established);
     }
 
     #[test]
-    fn outq_tracks_stream_dgram_and_drop_releases() {
+    fn outq_tracks_truesize_across_partial_reads_zero_byte_packets_and_drop() {
         let (a, b) = UnixSocket::pair(SOCK_STREAM, Ucred::of(1, 0, 0));
         let Link::Stream { tx, .. } = &a.link else {
             unreachable!()
         };
         let mut p = packet(b"abcdef", 1);
-        a.outq.set(6);
+        let ts = p.truesize();
+        assert_eq!(ts, 768);
+        a.outq.outq.set(ts);
         p.outq = Some(a.outq.clone());
         tx.borrow_mut().push(p);
-        assert_eq!(a.outq(), 6);
-        // Peek leaves outq intact; partial stream read subtracts only consumed bytes.
+        assert_eq!(a.outq(), ts);
+        // Peek and partial stream reads retain packet truesize until the packet is fully consumed
+        // or dropped (matching Linux's sk_wmem_alloc), while FIONREAD reports exact payload bytes.
         let Link::Stream { rx, .. } = &b.link else {
             unreachable!()
         };
+        assert_eq!(b.unread(), Some(6));
         assert_eq!(rx.borrow_mut().read_stream(2, true, false).data, b"ab");
-        assert_eq!(a.outq(), 6);
+        assert_eq!(a.outq(), ts);
         assert_eq!(rx.borrow_mut().read_stream(2, false, false).data, b"ab");
-        assert_eq!(a.outq(), 4);
+        assert_eq!(b.unread(), Some(4));
+        assert_eq!(a.outq(), ts);
         // Dropping the receiver discards the remainder and returns outq to zero.
         drop(b);
         assert_eq!(a.outq(), 0);
+
+        // Zero-byte datagrams charge truesize and cap a mutual socketpair at 278 packets.
+        let (da, db) = UnixSocket::pair(SOCK_DGRAM, Ucred::of(1, 0, 0));
+        let mut queued = 0;
+        while db.rx.borrow().has_packet_room() {
+            let mut zp = packet(b"", 1);
+            da.outq.outq.set(da.outq.outq.get() + zp.truesize());
+            zp.outq = Some(da.outq.clone());
+            db.rx.borrow_mut().push(zp);
+            queued += 1;
+        }
+        assert_eq!(queued, 278);
+        assert_eq!(da.outq(), 278 * 768);
+        assert_eq!(db.unread(), Some(0));
+        assert_eq!(da.readiness() & POLLOUT, 0);
+        drop(db);
+        assert_eq!(da.outq(), 0);
+    }
+
+    #[test]
+    fn sender_addr_updates_at_receive_and_peer_query_time() {
+        let (a, b) = UnixSocket::pair(SOCK_DGRAM, Ucred::of(1, 0, 0));
+        let mut p = packet(b"hi", 1);
+        a.outq.outq.set(p.truesize());
+        p.outq = Some(a.outq.clone());
+        b.rx.borrow_mut().push(p);
+        assert_eq!(b.peer_name(), Some(unnamed()));
+
+        // Binding after send updates both getpeername and the queued packet's receive-time addr.
+        let mut bound = unnamed();
+        bound.extend_from_slice(b"\0late-bind");
+        *a.addr.borrow_mut() = bound.clone();
+        assert_eq!(b.peer_name(), Some(bound.clone()));
+
+        // Dropping the sender before receive still preserves its last bound address on the packet.
+        drop(a);
+        let received = b.rx.borrow_mut().read_packet(16, false).unwrap();
+        assert_eq!(received.from, bound);
+    }
+
+    #[test]
+    fn cross_netns_pending_embryo_appears_in_client_namespace() {
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let client_ns = Rc::new(crate::nsproxy::NetNs {
+            id: 2,
+            owner: crate::cred::UserNs::init(),
+            host_net: Some([0, 2]),
+            lo: RefCell::default(),
+            devs: RefCell::default(),
+            nft: Default::default(),
+            listeners: Default::default(),
+        });
+
+        // Listener lives in the initial network namespace; client lives in `client_ns`.
+        let mut listener = UnixSocket::new(SOCK_STREAM);
+        let mut srv_addr = unnamed();
+        srv_addr.extend_from_slice(b"/tmp/cross-ns.sock\0");
+        *listener.addr.borrow_mut() = srv_addr.clone();
+        let mut client = UnixSocket::new(SOCK_STREAM);
+        client.net = Some(client_ns.clone());
+        let embryo = client.connect_stream(&listener.addr, Ucred::of(1, 0, 0), Ucred::of(2, 0, 0));
+        let embryo_sock = Rc::new(RefCell::new(Socket::Unix(embryo)));
+        listener.link = Link::Listening {
+            backlog: 4,
+            pending: VecDeque::from([embryo_sock.clone()]),
+            cred: Ucred::of(1, 0, 0),
+        };
+        k.unix.add_embryo(&embryo_sock);
+        let listener_sock = Rc::new(RefCell::new(Socket::Unix(listener)));
+        let client_sock = Rc::new(RefCell::new(Socket::Unix(client)));
+
+        // inflight_sockets returns the embryo without borrowing any socket RefCell.
+        let _listener_mut = listener_sock.borrow_mut();
+        let inflight = inflight_sockets(&k);
+        assert_eq!(inflight.len(), 1);
+        assert!(Rc::ptr_eq(&inflight[0], &embryo_sock));
+        drop(_listener_mut);
+
+        // Listener's netns sees only the listening socket (state 01), NOT the cross-netns embryo.
+        let init_listing = proc_listing(&[(listener_sock.clone(), 0)]);
+        assert!(init_listing.contains("00010000 0001 01"));
+        assert!(!init_listing.contains("00000000 0001 02     0 /tmp/cross-ns.sock"));
+
+        // Client's netns sees its connected client (state 03) AND the state-02 inode-0 embryo.
+        let client_listing = proc_listing(&[(client_sock.clone(), 0), (embryo_sock.clone(), 0)]);
+        assert!(client_listing.contains("00000000 0001 02     0 /tmp/cross-ns.sock"));
+
+        // Once accepted, removing the embryo clears it from inflight_sockets and transitions state.
+        if let Socket::Unix(e) = &mut *embryo_sock.borrow_mut() {
+            e.embryo = false;
+        }
+        k.unix.remove_embryo(&embryo_sock);
+        assert!(inflight_sockets(&k).is_empty());
+        let after_accept = proc_listing(&[(embryo_sock.clone(), 0)]);
+        assert!(!after_accept.contains("00000000 0001 02     0"));
+        assert!(after_accept.contains("00000000 0001 03"));
+        assert!(after_accept.contains("/tmp/cross-ns.sock"));
     }
 }

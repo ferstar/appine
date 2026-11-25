@@ -17,8 +17,8 @@ use crate::fd::FileRef;
 use crate::kernel::{Cx, Kernel, request_wake_object, wake};
 use crate::net::{AF_UNIX, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, Socket};
 use crate::unix::{
-    CAPACITY, ChannelRef, Link, Name, Packet, Received, SOCK_SEQPACKET, SOCKADDR_UN_LEN,
-    SendingRights, Ucred, UnixSocket, unnamed,
+    ChannelRef, DGRAM_MAX_LEN, Link, Name, Packet, Received, SOCK_SEQPACKET, SOCKADDR_UN_LEN,
+    SenderState, SendingRights, Ucred, UnixSocket, packet_truesize, unnamed,
 };
 use crate::vfs::Node;
 use crate::vfs::store::mode;
@@ -102,7 +102,7 @@ fn socket_type(ty: i32, protocol: i32) -> Result<i32, Errno> {
 // ---- Names and connections ----
 
 pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), Errno> {
-    if with(sock, |u| !u.addr.is_empty()) {
+    if with(sock, |u| !u.addr.borrow().is_empty()) {
         return Err(Errno::EINVAL);
     }
     bind_addr(cx, sock, parse(addr)?)
@@ -171,14 +171,14 @@ fn bind_addr(cx: &mut Cx<'_>, sock: &SocketRef, addr: Addr<'_>) -> Result<(), Er
             bound.push(0);
         }
     }
-    with(sock, |u| u.addr = bound);
+    with(sock, |u| *u.addr.borrow_mut() = bound);
     Ok(())
 }
 
 /// Linux assigns a reply address before looking up the peer, even if that lookup fails.
 fn autobind_passcred(cx: &mut Cx<'_>, sock: &SocketRef, peer: Option<&[u8]>) -> Result<(), Errno> {
     let needs_name = with(sock, |u| {
-        u.addr.is_empty() && u.receive_queue().borrow().passcred
+        u.addr.borrow().is_empty() && u.receive_queue().borrow().passcred
     });
     if !needs_name {
         return Ok(());
@@ -196,7 +196,7 @@ pub(super) fn listen(u: &mut UnixSocket, backlog: i32, cred: Ucred) -> Result<()
     if u.ty == SOCK_DGRAM {
         return Err(Errno::EOPNOTSUPP);
     }
-    if u.addr.is_empty() {
+    if u.addr.borrow().is_empty() {
         return Err(Errno::EINVAL);
     }
     match &mut u.link {
@@ -246,6 +246,7 @@ pub(super) fn accept(
                 u.uid = uid;
                 u.receive_queue().borrow_mut().passcred = passcred;
             });
+            cx.k().unix.remove_embryo(&new);
             // Connects waiting for room in the backlog can go on now
             request_wake_object(wake::of(&queue));
             let peer = with(&new, |u| u.peer_name()).unwrap_or_else(unnamed);
@@ -307,11 +308,14 @@ pub(super) fn connect(
                         wake::of(&u.rx),
                     )
                 });
-                pending.push_back(Rc::new(RefCell::new(Socket::Unix(end))));
+                let embryo = Rc::new(RefCell::new(Socket::Unix(end)));
+                pending.push_back(embryo.clone());
                 server.connections += 1;
                 request_wake_object(wake::of(&server.rx));
                 // Connected: threads polling this socket registered its own receive queue
                 request_wake_object(own);
+                drop(t);
+                cx.k().unix.add_embryo(&embryo);
                 return Ok(());
             }
             server.rx.clone()
@@ -329,7 +333,7 @@ fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), E
             Link::Dgram { tx, .. } if !Weak::ptr_eq(tx, &own_rx) => return Err(Errno::EPERM),
             _ => Link::Dgram {
                 tx: Rc::downgrade(&p.rx),
-                peer_addr: p.name(),
+                peer_addr: p.addr.clone(),
             },
         },
         Socket::Unix(_) => return Err(Errno::EPROTOTYPE),
@@ -369,7 +373,7 @@ pub(super) fn send(
     if ty == SOCK_SEQPACKET && with(sock, |u| matches!(u.link, Link::Stream { .. })) {
         autobind_passcred(cx, sock, None)?;
     }
-    let (from, outq) = with(sock, |u| (u.addr.clone(), u.outq.clone()));
+    let outq = with(sock, |u| u.outq.clone());
     // A stream socket takes no destination (unix_stream_sendmsg); seqpacket ignores it
     if ty == SOCK_STREAM && !addr.is_empty() {
         let connected = with(sock, |u| matches!(u.link, Link::Stream { .. }));
@@ -391,17 +395,21 @@ pub(super) fn send(
                 drop(c);
                 return if done > 0 {
                     Ok(done)
+                } else if ty == SOCK_SEQPACKET {
+                    // Linux's unix_seqpacket_sendmsg delegates to unix_dgram_sendmsg, which
+                    // returns EPIPE without raising SIGPIPE.
+                    Err(Errno::EPIPE)
                 } else {
                     Err(epipe(cx, flags))
                 };
             }
             let cred = packet_cred(cx, declared, passcred || c.passcred);
             if ty == SOCK_SEQPACKET {
-                if data.len() > CAPACITY {
+                if data.len() > DGRAM_MAX_LEN {
                     return Err(Errno::EMSGSIZE);
                 }
-                if c.space() >= data.len() {
-                    c.push(packet(cx.k(), &tx, data, files, cred, from, &outq));
+                if c.has_packet_room() {
+                    c.push(packet(cx.k(), &tx, data, files, cred, &outq));
                     return Ok(data.len());
                 }
             } else {
@@ -411,15 +419,15 @@ pub(super) fn send(
                 // A stream socket may queue only part of it; open files go with the first part.
                 // Even a zero-byte send carrying SCM_RIGHTS must wait when the channel is full.
                 let n = c.space().min(data.len() - done);
-                if n > 0 || (data.is_empty() && c.space() > 0) {
-                    // The receiver's recvfrom gets the sender's address, as bound when sent
+                if n > 0
+                    || (data.is_empty() && c.space() > 0 && (c.bytes > 0 || c.has_packet_room()))
+                {
                     c.push(packet(
                         cx.k(),
                         &tx,
                         &data[done..done + n],
                         files.take(),
                         cred,
-                        from.clone(),
                         &outq,
                     ));
                     done += n;
@@ -523,18 +531,12 @@ fn send_dgram(
     if destination.is_some() || with(sock, |u| matches!(u.link, Link::Dgram { .. })) {
         autobind_passcred(cx, sock, destination)?;
     }
-    let (own_rx, from, outq, connected, shut_wr) = with(sock, |u| {
+    let (own_rx, outq, connected, shut_wr) = with(sock, |u| {
         let connected = match &u.link {
             Link::Dgram { tx, .. } => Some(tx.clone()),
             _ => None,
         };
-        (
-            Rc::downgrade(&u.rx),
-            u.addr.clone(),
-            u.outq.clone(),
-            connected,
-            u.shut_wr,
-        )
+        (Rc::downgrade(&u.rx), u.outq.clone(), connected, u.shut_wr)
     });
     // Datagram sends never raise SIGPIPE (only unix_stream_sendmsg sends it)
     if shut_wr {
@@ -569,7 +571,7 @@ fn send_dgram(
         }
         p.rx.clone()
     };
-    if data.len() > CAPACITY {
+    if data.len() > DGRAM_MAX_LEN {
         return Err(Errno::EMSGSIZE);
     }
     loop {
@@ -588,11 +590,11 @@ fn send_dgram(
             if c.eof {
                 return Err(Errno::EPIPE);
             }
-            // Room for the bytes, and unless the receiver is connected back to this socket, for
-            // one more datagram (unix_dgram_sendmsg's unix_recvq_full wait)
-            if c.space() >= data.len() && !c.holds_back(&own_rx) {
+            // Room in the peer's queue (truesize budget) and, unless the receiver is connected
+            // back to this socket, below max_dgram_qlen (unix_dgram_sendmsg's unix_recvq_full wait)
+            if c.has_packet_room() && !c.holds_back(&own_rx) {
                 let cred = packet_cred(cx, declared, passcred || c.passcred);
-                c.push(packet(cx.k(), &rx, data, files, cred, from, &outq));
+                c.push(packet(cx.k(), &rx, data, files, cred, &outq));
                 return Ok(data.len());
             }
         }
@@ -633,10 +635,10 @@ fn packet(
     data: &[u8],
     rights: Option<Rc<SendingRights>>,
     cred: Ucred,
-    from: Vec<u8>,
-    outq: &Rc<std::cell::Cell<usize>>,
+    sender: &Rc<SenderState>,
 ) -> Packet {
-    outq.set(outq.get() + data.len());
+    let truesize = packet_truesize(data.len());
+    sender.outq.set(sender.outq.get() + truesize);
     Packet {
         data: data.to_vec(),
         off: 0,
@@ -644,8 +646,8 @@ fn packet(
             .map(|r| r.into_packet(k, channel))
             .unwrap_or_default(),
         cred,
-        from,
-        outq: Some(outq.clone()),
+        from: Vec::new(),
+        outq: Some(sender.clone()),
     }
 }
 
@@ -1356,6 +1358,84 @@ mod tests {
             assert_eq!(cx.fds().capacity(), 192);
 
             drop(clients);
+            drop(cx);
+            cpu
+        };
+    }
+
+    #[test]
+    fn seqpacket_epipe_omits_sigpipe_while_stream_raises_it() {
+        use crate::process::Signal;
+
+        let shared = Arc::new(Shared::new(Kernel::new(Tier::Interpreter)));
+        let _cpu = {
+            let mut k = shared.lock();
+            let group = Rc::new(RefCell::new(ThreadGroup::new(
+                10,
+                1,
+                Rc::new(RefCell::new(SigHandlers::default())),
+            )));
+            let mm = Mm::new().into_shared();
+            let fds = Rc::new(RefCell::new(FdTable::with_host_stdio()));
+            let fs = Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: Rc::new(MntNs {
+                    id: INIT_MNT_NS,
+                    owner: crate::cred::UserNs::init(),
+                    anon: false,
+                }),
+            }));
+            let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+            let state = TaskState {
+                mm,
+                fds,
+                fs,
+                group: group.clone(),
+                vfs: None,
+                altstack: Default::default(),
+                clear_child_tid: 0,
+                vfork_done: None,
+                restart: None,
+                fast_sleep: None,
+                sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+            };
+            let task = Task::new(10, 10, &cpu, state, k.init_ns.clone(), 0, [0; 16]).unwrap();
+            group.borrow_mut().threads.push(10);
+            k.groups.insert(10, group);
+            k.tasks.insert(10, task.clone());
+
+            let mut t = task.state.borrow_mut();
+            let mut cx = Cx::new(&shared, k, &task, &mut t);
+
+            // SOCK_SEQPACKET: EPIPE without SIGPIPE on peer close, peer SHUT_RD, and local SHUT_WR.
+            for mode in 0..3 {
+                let (sa, sb) = pair(&cx, SOCK_SEQPACKET, 0).unwrap();
+                let a = Rc::new(RefCell::new(sa));
+                let b = Rc::new(RefCell::new(sb));
+                match mode {
+                    0 => drop(b),
+                    1 => with(&b, |u| shutdown(u, 0).unwrap()),
+                    _ => with(&a, |u| shutdown(u, 1).unwrap()),
+                }
+                assert_eq!(
+                    send(&mut cx, &a, true, b"x", &[], &[], 0),
+                    Err(Errno::EPIPE)
+                );
+                assert_eq!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
+            }
+
+            // SOCK_STREAM: EPIPE raises SIGPIPE when MSG_NOSIGNAL is not set.
+            let (sa, sb) = pair(&cx, SOCK_STREAM, 0).unwrap();
+            let a = Rc::new(RefCell::new(sa));
+            drop(sb);
+            assert_eq!(
+                send(&mut cx, &a, true, b"x", &[], &[], 0),
+                Err(Errno::EPIPE)
+            );
+            assert_ne!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
+
             drop(cx);
             cpu
         };

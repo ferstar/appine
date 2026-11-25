@@ -7,6 +7,7 @@ cat > unix_fixes.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -64,6 +65,23 @@ static int proc_state(int s)
     }
     fclose(f);
     return found;
+}
+
+static volatile sig_atomic_t got_sigpipe = 0;
+static void on_sigpipe(int s)
+{
+    (void)s;
+    got_sigpipe++;
+}
+
+static void show_addr(const char *tag, const struct sockaddr_un *a, socklen_t l)
+{
+    if (l <= 2)
+        printf("%s: len=%u (unnamed)\n", tag, (unsigned)l);
+    else if (a->sun_path[0] == 0)
+        printf("%s: len=%u @%.*s\n", tag, (unsigned)l, (int)(l - 3), a->sun_path + 1);
+    else
+        printf("%s: len=%u %.*s\n", tag, (unsigned)l, (int)(l - 2), a->sun_path);
 }
 
 static void show_outq(const char *tag, int s)
@@ -372,6 +390,99 @@ int main(void)
             close(got_fd);
         close(sv[0]);
         close(sv[1]);
+    }
+
+    /* 7. Receive-time sender address, zero-byte SIOCOUTQ/queue cap, and SEQPACKET SIGPIPE */
+    printf("-- recv-time addr & seqpacket sigpipe\n");
+    {
+        struct sockaddr_un got;
+        socklen_t lg;
+        int types[3] = {SOCK_DGRAM, SOCK_STREAM, SOCK_SEQPACKET};
+        const char *tnames[3] = {"dgram", "stream", "seqpacket"};
+        for (int i = 0; i < 3; i++) {
+            char sn[32], cn[32];
+            snprintf(sn, sizeof sn, "ufix_rt_s_%s", tnames[i]);
+            snprintf(cn, sizeof cn, "ufix_rt_c_%s", tnames[i]);
+            socklen_t lsa = mkabs(&sa, sn);
+            socklen_t lsb = mkabs(&sb, cn);
+            if (types[i] == SOCK_DGRAM) {
+                int srv = socket(AF_UNIX, SOCK_DGRAM, 0);
+                int cli = socket(AF_UNIX, SOCK_DGRAM, 0);
+                bind(srv, (struct sockaddr *)&sa, lsa);
+                sendto(cli, "hi", 2, 0, (struct sockaddr *)&sa, lsa);
+                bind(cli, (struct sockaddr *)&sb, lsb);
+                lg = sizeof got;
+                memset(&got, 0, sizeof got);
+                recvfrom(srv, buf, sizeof buf, 0, (struct sockaddr *)&got, &lg);
+                show_addr("dgram send->bind->recvfrom", &got, lg);
+                sendto(cli, "bye", 3, 0, (struct sockaddr *)&sa, lsa);
+                close(cli);
+                lg = sizeof got;
+                memset(&got, 0, sizeof got);
+                recvfrom(srv, buf, sizeof buf, 0, (struct sockaddr *)&got, &lg);
+                show_addr("dgram bind->send->close->recvfrom", &got, lg);
+                close(srv);
+            } else {
+                int srv = socket(AF_UNIX, types[i], 0);
+                int cli = socket(AF_UNIX, types[i], 0);
+                bind(srv, (struct sockaddr *)&sa, lsa);
+                listen(srv, 4);
+                connect(cli, (struct sockaddr *)&sa, lsa);
+                send(cli, "hi", 2, 0);
+                bind(cli, (struct sockaddr *)&sb, lsb);
+                lg = sizeof got;
+                memset(&got, 0, sizeof got);
+                int acc = accept(srv, (struct sockaddr *)&got, &lg);
+                char tag[64];
+                snprintf(tag, sizeof tag, "%s accept", tnames[i]);
+                show_addr(tag, &got, lg);
+                lg = sizeof got;
+                memset(&got, 0, sizeof got);
+                getpeername(acc, (struct sockaddr *)&got, &lg);
+                snprintf(tag, sizeof tag, "%s getpeername", tnames[i]);
+                show_addr(tag, &got, lg);
+                lg = sizeof got;
+                memset(&got, 0, sizeof got);
+                recvfrom(acc, buf, sizeof buf, 0, (struct sockaddr *)&got, &lg);
+                snprintf(tag, sizeof tag, "%s recvfrom", tnames[i]);
+                show_addr(tag, &got, lg);
+                close(cli);
+                close(acc);
+                close(srv);
+            }
+        }
+
+        /* Zero-byte datagram/seqpacket SIOCOUTQ is nonzero and bounded by truesize */
+        int sv[2];
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+        send(sv[0], "", 0, MSG_DONTWAIT);
+        show_outq("dgram 0B", sv[0]);
+        int n = 1;
+        while (n < 2000 && send(sv[0], "", 0, MSG_DONTWAIT) == 0)
+            n++;
+        printf("dgram 0B bounded=%d pollout=%d\n", n < 2000, !!(poll_ev(sv[0]) & POLLOUT));
+        close(sv[0]);
+        close(sv[1]);
+
+        /* SOCK_SEQPACKET EPIPE does not raise SIGPIPE */
+        signal(SIGPIPE, on_sigpipe);
+        for (int c = 0; c < 3; c++) {
+            socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv);
+            if (c == 0)
+                close(sv[1]);
+            else if (c == 1)
+                shutdown(sv[1], SHUT_RD);
+            else
+                shutdown(sv[0], SHUT_WR);
+            got_sigpipe = 0;
+            errno = 0;
+            ssize_t r = send(sv[0], "x", 1, 0);
+            printf("seqpacket case=%d: r=%zd err=%s sigpipe=%d\n", c, r,
+                   r < 0 ? strerror(errno) : "ok", (int)got_sigpipe);
+            close(sv[0]);
+            if (c != 0)
+                close(sv[1]);
+        }
     }
     return 0;
 }
