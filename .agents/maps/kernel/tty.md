@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: canonical overflow, flow-control lookahead, PTY ioctls and console completion)
+> Maintained: 2026-11-26 (targeted verification of `TIOCSETD` argument validation and slave-side job control)
 
 ## Responsibilities
 
@@ -272,7 +272,9 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   TCOOFF/TCOON; master: stops input; 2/3 send VSTOP/VSTART, on the master from the slave's
   termios into the input without a room check), `TCSBRK`/`TCSBRKP`/`TIOCSBRK`/`TIOCCBRK`
   (success after the slave-side background check, no break event for `BRKINT` or `IGNBRK`), `TIOCEXCL`/`TIOCNXCL`/`TIOCGEXCL` (set, clear and query the opened end's exclusive bit),
-  `TIOCSETD` (argument never read) / `TIOCGETD` (always 0),
+  `TIOCSETD` (checks background access first on the slave, then reads an `int` on either end,
+  returning `EFAULT` for an invalid pointer, accepting `N_TTY` (0) as a no-op and returning
+  `EINVAL` for any other value), `TIOCGETD` (always reports `N_TTY`, 0),
   `FIONREAD`, `TIOCOUTQ`, `TIOCSTI` and `TIOCGDEV` (the slave's encoded 136:index device
   number, including through the master or `/dev/tty`). Other requests are counted as
   unimplemented paths (`kernel/signal`) and return `ENOTTY`.
@@ -385,8 +387,8 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 - At canonical overflow, Appine preserves the stored line prefix even with `PARMRK`. Linux can
   overwrite earlier input when a doubled 0xff crosses the end of its circular buffer.
-- Only the default line discipline is implemented. `TIOCGETD` always returns 0 and `TIOCSETD`
-  succeeds without reading the requested discipline.
+- Only `N_TTY` (0) is implemented. `TIOCGETD` reports 0 and `TIOCSETD` returns `EINVAL`
+  for every other discipline.
 
 ## Open questions
 
