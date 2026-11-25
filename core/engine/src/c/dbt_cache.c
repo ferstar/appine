@@ -143,7 +143,7 @@ void *dbt_zalloc(size_t bytes)
 /* Return the first `bytes` bytes of memory from zalloc to the host; later reads see 0 */
 void dbt_release_pages(void *p, size_t bytes)
 {
-    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t page = dbt_host_page_size();
     if (bytes)
         madvise(p, (bytes + page - 1) & ~(page - 1), MADV_DONTNEED);
 }
@@ -959,6 +959,7 @@ static struct {
     pthread_mutex_t arena_lock;
     uint8_t *arena; /* mapped on first use, cleared when full */
     size_t used;
+    size_t high; /* furthest allocation since the last memory-pressure trim */
     bool full; /* full: cleared after the threads storing templates release their shard locks */
     struct template *buckets[1u << TEMPLATE_BUCKET_BITS];
 } templates = {
@@ -1118,11 +1119,15 @@ static void *template_alloc(size_t bytes)
         void *m = mmap(NULL, TEMPLATE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         templates.arena = m == MAP_FAILED ? NULL : m;
     }
-    if (templates.arena && templates.used + bytes <= TEMPLATE_BYTES) {
-        p = templates.arena + templates.used;
-        templates.used += bytes;
+    size_t used = __atomic_load_n(&templates.used, __ATOMIC_RELAXED);
+    if (templates.arena && bytes <= TEMPLATE_BYTES - used) {
+        p = templates.arena + used;
+        used += bytes;
+        __atomic_store_n(&templates.used, used, __ATOMIC_RELEASE);
+        if (used > __atomic_load_n(&templates.high, __ATOMIC_RELAXED))
+            __atomic_store_n(&templates.high, used, __ATOMIC_RELEASE);
     } else if (templates.arena) {
-        templates.full = true;
+        __atomic_store_n(&templates.full, true, __ATOMIC_RELAXED);
     }
     appine_guard_drop();
     pthread_mutex_unlock(&templates.arena_lock);
@@ -1138,19 +1143,46 @@ static void template_unlock_all(void *unused)
         pthread_mutex_unlock(&templates.shards[i].lock);
 }
 
-/* Discard all translation templates: the template arena is full (`if_full`; not cleared again if
- * another thread already cleared it), or a host fault occurred (the templates themselves may be
- * what is broken) */
-void dbt_template_clear(bool if_full)
+static void template_lock_all(void)
 {
     for (unsigned i = 0; i < TEMPLATE_SHARDS; i++)
         pthread_mutex_lock(&templates.shards[i].lock);
     pthread_mutex_lock(&templates.arena_lock);
     appine_guard_hold_fn(NULL, template_unlock_all);
-    if (templates.full || !if_full) {
+}
+
+/* All template locks held. Leave the pages resident for the next generation. */
+static void template_reset(void)
+{
+    if (__atomic_load_n(&templates.used, __ATOMIC_RELAXED))
         memset(templates.buckets, 0, sizeof(templates.buckets));
-        templates.used = 0;
-        templates.full = false;
+    __atomic_store_n(&templates.used, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&templates.full, false, __ATOMIC_RELAXED);
+}
+
+/* Discard all translation templates after filling the arena or encountering a host fault. */
+void dbt_template_clear(bool if_full)
+{
+    template_lock_all();
+    if (!if_full || __atomic_load_n(&templates.full, __ATOMIC_RELAXED))
+        template_reset();
+    appine_guard_drop();
+    template_unlock_all(NULL);
+}
+
+/* Called without the pool or instance lock. A previous reset may have rewound used while
+ * leaving an entire generation resident. */
+void dbt_template_trim(void)
+{
+    if (__atomic_load_n(&templates.used, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&templates.high, __ATOMIC_ACQUIRE) == 0)
+        return;
+    template_lock_all();
+    template_reset();
+    size_t high = __atomic_load_n(&templates.high, __ATOMIC_RELAXED);
+    if (templates.arena && high) {
+        dbt_release_pages(templates.arena, high);
+        __atomic_store_n(&templates.high, 0, __ATOMIC_RELEASE);
     }
     appine_guard_drop();
     template_unlock_all(NULL);

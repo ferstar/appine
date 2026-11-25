@@ -371,7 +371,7 @@ enum appine_dbt_regs {
 };
 struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs);
 void appine_dbt_free(struct appine_dbt *dbt, uint64_t key);
-/* Releases the translations kept in the pool (when host memory is tight) */
+/* Releases pooled instances, spare thread workspaces and resident translation-template pages */
 void appine_dbt_trim(void);
 /*
  * Unmaps the pages of every instance's code cache written through the writable view (the one used

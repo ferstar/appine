@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: clear the local exclusive monitor when the dispatcher returns a kick)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: reclaim pooled instances, detached threads and template arena pages under memory pressure)
 
 ## Responsibilities
 
@@ -294,15 +294,20 @@ triggers (`kernel/oom`).
   resets `used_words = routine_words`, bumps `generation`, and broadcasts `d->flushed`.
 - Templates: 32 MB anonymous arena (`65,536` buckets, 64 shard locks, `arena_lock`, max 4 versions
   per `pc`), keyed by `(pc, nogroup_key, regs, shared, guest words)`; cross-page templates validate
-  page 1 on fetch. Full arena triggers `dbt_template_clear` (acquiring all 64 shard locks +
-  `arena_lock` registered via `appine_guard_hold_fn`).
+  page 1 on fetch. A full arena triggers `dbt_template_clear(true)`, which rewinds the allocator
+  and keeps the pages resident for reuse. The high-water mark covers all allocations since the
+  last pressure trim, including earlier generations.
 - Pool: up to 16 `appine_dbt` instances (64 MB kept code budget) and 8 spare threads. Non-poisoned
   instances with non-zero `key`, `<= 131,072` blocks, `<= 64 MB` code, no `flush_wanted` (and
   fitting the 64 MB budget above 32 MB) drop shared/memop/private state and stay cached as `stale`;
   otherwise they flush (clearing `nogroup_count`, `strikes` and `strikes_next`), shrink table to `2^12`, and
   `MADV_REMOVE`/`MADV_FREE`/`MADV_DONTNEED` backing memory. `DbtSpace::new` prefers MRU matching
   `(key, regs)`, else an empty instance (regenerating routines if `regs` differs), else allocates.
-  `trim_dbt_pool` frees all pooled `appine_dbt` instances (not `templates.arena` or `pool.threads`).
+  `trim_dbt_pool` drains `pool.free` and `pool.threads` under `pool.lock`, then releases the
+  evicted instances and detached workspaces outside the lock. `dbt_template_trim` then takes
+  shard locks in ascending order followed by `arena_lock` (guarded together), clears the bucket
+  array if the cursor is nonzero, and applies `MADV_DONTNEED` through the arena high-water mark.
+  When both the cursor and high-water mark are zero, template trim skips the locks and buckets.
 - Stale reuse: `trust` marks exact `DbtSource` matches trusted and prior `set_sources` ranges
   parkable. First `dbt_run` runs `dbt_recheck`: unmapped single-page parkable blocks are parked;
   cross-page and other mismatches are invalidated; if non-parkable mismatches exceed half of live
@@ -331,8 +336,9 @@ triggers (`kernel/oom`).
   (`set_sources`/`trust`), and `set_memops`.
 - `kernel/exec`: `DbtRegs` selection (Go build-ID / `APPINE_DBT_REGS`) and bundled musl `DbtMemop`
   discovery.
-- `kernel/oom`: `unmap_written_code` (1 s timer), `written_code_bytes` (RSS accounting), and
-  `trim_dbt_pool` (`Machine::trim_memory`).
+- `kernel/oom` uses `written_code_bytes` for RSS accounting and periodically calls
+  `unmap_written_code`. Root pressure and cgroup `memory.high` trigger both `trim_dbt_pool` and
+  `unmap_written_code`. The host can also trigger `trim_dbt_pool` through `Machine::trim_memory`.
 - `engine` tests (`core/engine/tests/dbt.rs`) and `tests/lockstep`.
 
 ### Outbound
@@ -389,8 +395,7 @@ None.
 
 ## Open questions
 
-- Should `trim_dbt_pool` also reclaim `pool.threads` and `MADV_DONTNEED` `templates.arena` under
-  memory pressure?
+None.
 
 ## To verify
 

@@ -656,20 +656,6 @@ uint64_t appine_dbt_written_bytes(void)
     return pages * dbt_host_page_size();
 }
 
-/* Release every instance in the pool (when the app is short of memory; kept translations can be
- * rebuilt) */
-void appine_dbt_trim(void)
-{
-    struct appine_dbt *evicted[POOL_SIZE];
-    pthread_mutex_lock(&pool.lock);
-    unsigned n = 0;
-    while (pool.n)
-        evicted[n++] = pool_take(pool.n - 1);
-    pthread_mutex_unlock(&pool.lock);
-    for (unsigned i = 0; i < n; i++)
-        release(evicted[i]);
-}
-
 static void release_thread(struct appine_dbt_thread *t)
 {
     dbt_zfree(t->jc, JC_SIZE * sizeof(*t->jc));
@@ -680,6 +666,25 @@ static void release_thread(struct appine_dbt_thread *t)
     dbt_zfree(t->defined, DEFINED_CACHE * sizeof(*t->defined));
     free(t->prep);
     dbt_zfree(t, sizeof(*t));
+}
+
+/* Detach both idle pools in one pass. Freeing and template trimming take their own locks. */
+void appine_dbt_trim(void)
+{
+    struct appine_dbt *evicted[POOL_SIZE];
+    struct appine_dbt_thread *evicted_threads[THREAD_POOL_SIZE];
+    unsigned n = 0, nthreads = 0;
+    pthread_mutex_lock(&pool.lock);
+    while (pool.n)
+        evicted[n++] = pool_take(pool.n - 1);
+    while (pool.nthreads)
+        evicted_threads[nthreads++] = pool.threads[--pool.nthreads];
+    pthread_mutex_unlock(&pool.lock);
+    for (unsigned i = 0; i < n; i++)
+        release(evicted[i]);
+    for (unsigned i = 0; i < nthreads; i++)
+        release_thread(evicted_threads[i]);
+    dbt_template_trim();
 }
 
 /* Take d's lock, recording whom this round's translations and invalidations are charged to. The

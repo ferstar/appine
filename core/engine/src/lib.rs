@@ -900,9 +900,8 @@ impl Drop for Dbt {
     }
 }
 
-/// Releases the Tier 1 translations kept in the pool: nobody is using them, so they can be
-/// dropped when host memory is tight (Android's `onTrimMemory`), and the next run of the same
-/// program copies the templates again.
+/// Releases pooled Tier 1 instances, spare thread workspaces and resident translation-template
+/// pages under memory pressure. Live spaces keep their installed translations.
 pub fn trim_dbt_pool() {
     unsafe { appine_dbt_trim() }
 }

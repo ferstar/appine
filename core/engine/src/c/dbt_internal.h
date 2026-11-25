@@ -920,6 +920,7 @@ bool dbt_template_fetch(uint64_t pc, const uint32_t *src, uint32_t *words, unsig
                         uint64_t key, const struct regs *r, bool shared, struct prep *p,
                         uint32_t *scratch, struct appine_dbt_stats *st);
 void dbt_template_clear(bool if_full);
+void dbt_template_trim(void);
 void dbt_template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, uint64_t key,
                         const struct xlate *x, const struct appine_dbt_stats *before,
                         const struct link *links, unsigned nlinks);

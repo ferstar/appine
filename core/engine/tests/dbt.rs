@@ -13,7 +13,7 @@ use appine_engine::{
 };
 
 /// Serializes tests that rely on keyed [`DbtSpace`] instances staying in the process-wide pool
-/// across `drop` / `DbtSpace::new` (or that call `trim_dbt_pool` / churn keyed pool entries).
+/// across `drop` / `DbtSpace::new`, expect template hits, or trim or churn the pool.
 static POOL_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock_pool() -> MutexGuard<'static, ()> {
@@ -198,12 +198,177 @@ fn pooled_instances_keep_translations_of_the_same_program() {
     assert_eq!(g.run(&mut dbt), 8);
     assert_eq!(dbt.stats().blocks, 1);
     drop(dbt);
-    // Dropping the translations kept in the pool when host memory is tight: running again has to
-    // translate again (or copy templates)
+    // Memory pressure evicts both the keyed instance and its translation templates.
     appine_engine::trim_dbt_pool();
     let mut dbt = keyed_dbt(KEY).unwrap();
     assert_eq!(g.run(&mut dbt), 8);
     assert_eq!(dbt.stats().blocks, 1);
+    assert_eq!(dbt.stats().blocks_shared, 0);
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[test]
+fn trim_reclaims_template_high_water_after_arena_rollover() {
+    // RssAnon and the template arena belong to the whole process. Keep other tests' allocations
+    // out of both samples, including tests which never take the pool lock.
+    if std::env::var_os("APPINE_TEST_TEMPLATE_RSS").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trim_reclaims_template_high_water_after_arena_rollover",
+            ])
+            .env("APPINE_TEST_TEMPLATE_RSS", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let _pool = lock_pool();
+    let rss_anon_kb = || -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("RssAnon:"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let mut dbt = Dbt::new().unwrap();
+    let mut g = Guest::new();
+    let mut words = [0x9100_0400; 256]; // add x0, x0, #1
+    words[255] = SVC;
+    g.code(CODE, &words);
+    let page = NonNull::from(&mut g.pages[0]).cast();
+    // Each distinct PC needs over 2 KiB for guest and host words. Cross the 32 MiB arena
+    // boundary, leaving the bump cursor near the start while the first generation stays resident.
+    for i in 0..16384 {
+        let pc = 0x1_0000_0000 + i * PAGE_SIZE;
+        // SAFETY: the guest owns this executable page for the lifetime of its MMU.
+        unsafe {
+            g.mmu
+                .map(pc, page, PAGE_SIZE, prot::READ | prot::EXEC)
+                .unwrap();
+        }
+        g.cpu.state_mut().x[0] = i;
+        assert_eq!(g.run_at(&mut dbt, pc), i + 255);
+    }
+    let before = rss_anon_kb();
+    appine_engine::trim_dbt_pool();
+    let after = rss_anon_kb();
+    assert!(
+        before >= after + 24 * 1024,
+        "RssAnon {before} -> {after} KiB"
+    );
+    // The live instance and its thread stayed attached throughout the measurement.
+    g.cpu.state_mut().x[0] = 10;
+    assert_eq!(g.run_at(&mut dbt, 0x1_0000_0000), 265);
+}
+
+#[test]
+fn trim_discards_templates_and_new_translations_are_shareable() {
+    let _pool = lock_pool();
+    let Some(mut first) = Dbt::new() else { return };
+    let mut g = Guest::new();
+    let pcs = [CODE + 0x648, CODE + 0x12d8];
+    for (i, pc) in pcs.into_iter().enumerate() {
+        g.code(pc, &[movz_x0(0x3a00 + i as u16), SVC]);
+    }
+    let mut run = |dbt: &mut Dbt| {
+        for (i, pc) in pcs.into_iter().enumerate() {
+            assert_eq!(g.run_at(dbt, pc), 0x3a00 + i as u64);
+        }
+        assert_eq!(dbt.stats().blocks, 2);
+    };
+    run(&mut first);
+    let mut second = Dbt::new().unwrap();
+    run(&mut second);
+    assert_eq!(second.stats().blocks_shared, 2);
+    appine_engine::trim_dbt_pool();
+    let mut cold = Dbt::new().unwrap();
+    run(&mut cold);
+    assert_eq!(cold.stats().blocks_shared, 0);
+    let mut warm = Dbt::new().unwrap();
+    run(&mut warm);
+    assert_eq!(warm.stats().blocks_shared, 2);
+}
+
+// BL pushes a shadow return, BR goes through the jump cache, and the subroutine round-trips
+// the input through the inline store/load paths before returning to the caller's SVC.
+fn exercise_attachment(g: &mut Guest, dbt: &mut Dbt, pc: u64, input: u64) {
+    g.code(
+        pc,
+        &[bl(pc, pc + 8), SVC, 0xd61f_00a0, STR_X3_X4, LDR_X0_X2, RET],
+    );
+    let x = &mut g.cpu.state_mut().x;
+    x[2] = STACK - 8;
+    x[3] = input;
+    x[4] = STACK - 8;
+    x[5] = pc + 12;
+    assert_eq!(g.run_at(dbt, pc), input);
+    assert_eq!(g.cpu.state().x[30], pc + 4);
+    assert_eq!(dbt.stats().exits_interp, 0);
+}
+
+#[test]
+fn attachments_run_on_live_and_new_spaces_after_trim() {
+    let _pool = lock_pool();
+    let Some(live) = DbtSpace::new(0, DbtRegs::Default) else {
+        return;
+    };
+    let mut g = Guest::new();
+    let mut threads: Vec<_> = (0..8).map(|_| Dbt::attach(&live, 0).unwrap()).collect();
+    for (i, dbt) in threads.iter_mut().enumerate() {
+        exercise_attachment(&mut g, dbt, CODE, 100 + i as u64);
+    }
+    drop(threads);
+    appine_engine::trim_dbt_pool();
+    for space in [
+        live,
+        DbtSpace::new(0, DbtRegs::Default).unwrap(),
+        DbtSpace::new(0, DbtRegs::Go).unwrap(),
+    ] {
+        let mut dbt = Dbt::attach(&space, 0).unwrap();
+        exercise_attachment(&mut g, &mut dbt, CODE, 200);
+        exercise_attachment(&mut g, &mut dbt, CODE, 201);
+    }
+}
+
+#[test]
+fn concurrent_trim_preserves_running_translations() {
+    let _pool = lock_pool();
+    let Some(live) = DbtSpace::new(0, DbtRegs::Default) else {
+        return;
+    };
+    let start = std::sync::Barrier::new(5);
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for worker in 0..4 {
+            let (live, start) = (&live, &start);
+            workers.push(scope.spawn(move || {
+                let mut g = Guest::new();
+                start.wait();
+                for round in 0..64 {
+                    let pc = CODE + 32 * round;
+                    let mut shared = Dbt::attach(live, 0).unwrap();
+                    exercise_attachment(&mut g, &mut shared, pc, worker + round);
+                    let mut private = Dbt::with_regs(DbtRegs::Go).unwrap();
+                    exercise_attachment(&mut g, &mut private, pc, worker * 100 + round);
+                }
+            }));
+        }
+        start.wait();
+        loop {
+            appine_engine::trim_dbt_pool();
+            appine_engine::unmap_written_code();
+            if workers.iter().all(|worker| worker.is_finished()) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    });
 }
 
 #[test]
@@ -2058,6 +2223,7 @@ fn yield_is_emitted_verbatim_and_preserves_state() {
 
 #[test]
 fn long_blocks_run_past_64_insns_and_stop_on_host_budget() {
+    let _pool = lock_pool();
     for regs in [DbtRegs::Default, DbtRegs::Go] {
         let Some(mut dbt) = Dbt::with_regs(regs) else {
             return;
@@ -4087,6 +4253,7 @@ fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
 
 #[test]
 fn fast_loop_gemm_bloc_derived_index_sp_and_cross_page() {
+    let _pool = lock_pool();
     let add_x = |rd: u32, rn: u32, rm: u32| 0x8b00_0000u32 | (rm << 16) | (rn << 5) | rd;
     let lsl1 = |rd: u32, rn: u32| 0xd37f_f800u32 | (rn << 5) | rd;
     let ldr_q_reg = |rt: u32, rn: u32, rm: u32| 0x3ce0_6800u32 | (rm << 16) | (rn << 5) | rt;

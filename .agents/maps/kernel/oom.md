@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: page-table and swap attribution in OOM scoring, `VmPTE`/`VmSwap`/`pgtables`, and `memory.high` event/reclaim handling)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: root pressure reclaims idle DBT caches and writable aliases while retaining live code-group translations)
 
 ## Responsibilities
 
@@ -113,10 +113,11 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 - `check` runs under the BKL each time the timer thread wakes. With no root limit and no cgroup
   `memory.max` or `memory.high` limit it does nothing; otherwise it measures every 20 ms, every
   5 ms once a scope is above 3/4 of its limit, and never more often than 20 times the measurement's
-  own time. The root is measured first (`measure_root`): when root usage exceeds `k.oom.limit`, it
-  trims unused Tier 1 translations from the pool (`appine_engine::trim_dbt_pool`, which only briefly
-  takes the engine's leaf `pool.lock` and unmaps evicted instances outside it, never acquiring the
-  BKL) and re-measures, sparing guest processes if trimming brings root usage back within the limit.
+  own time. The root is measured first. When usage exceeds `k.oom.limit`, `measure_root` calls
+  `trim_dbt_pool` to free pooled instances, spare threads and resident template arena pages,
+  then `unmap_written_code` to drop writable W^X aliases from host RssShmem. The root footprint
+  already discounts those aliases. The check uses the post-reclaim measurement when available
+  and falls back to the original sample if the second read fails.
   Child cgroup measurements are deduplicated across `memory.max` and `memory.high` within a round.
   Exceeding `memory.high` (when `UNMAPPING == 0`, on new crossings or continued growth) records a
   `high` event and runs `handle_memory_high` (`trim_dbt_pool` and `unmap_written_code`) without
@@ -224,6 +225,11 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 - The OOM killer uses two measures: the root counts the whole app process (translations, metadata,
   swap, no file pages), while cgroups and victim scores count guest resident pages (file pages
   included, swap excluded; shared pages once per cgroup, but once per process in victim scores).
+- The code-group registry holds weak references. When the last sharer releases a `DbtSpace`,
+  its cached translations become eligible for pool reclaim. Flushing a live space synchronously
+  under the BKL would require kicking runners and waiting for them, risking a watchdog stall.
+  A null thread CPU also occurs during syscalls, including while waiting for the BKL. Keeping
+  live blocks lets all sharers continue running without retranslating after each 5 ms pressure poll.
 - The OOM killer polls, so a process that allocates and exits within one interval is never seen,
   and under Tier 1 a guest can touch gigabytes between polls: the limit needs headroom.
 - The OOM killer acts on no measurement while `UNMAPPING` is nonzero.
@@ -243,9 +249,7 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 
 ## Open questions
 
-- Root memory pressure now trims unused Tier 1 translations kept in the pool (`trim_dbt_pool`)
-  before killing a guest process, but active translations shared through `CodeGroups` stay until
-  all live sharers exit; is that acceptable when active shared translations dominate root usage?
+None.
 
 ## To verify
 

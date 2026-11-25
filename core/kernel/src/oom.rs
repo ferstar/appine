@@ -153,7 +153,7 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     let mut over = None;
     let mut near = false;
     if k.oom.limit != u64::MAX {
-        match measure_root(&k.oom, k.oom.limit, footprint, appine_engine::trim_dbt_pool) {
+        match measure_root(&k.oom, k.oom.limit, footprint, reclaim_dbt_memory) {
             Some(used) => {
                 near = used > k.oom.limit / 4 * 3;
                 if used > k.oom.limit {
@@ -217,21 +217,28 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
 }
 
 /// Handles a cgroup exceeding its `memory.high` throttle/reclaim threshold: records a `high` event
-/// in `memory.events` and `memory.events.local` and reclaims unused Tier 1 pool translations and
-/// writable code-cache views without killing any process.
+/// in `memory.events` and `memory.events.local` and reclaims idle Tier 1 memory and writable
+/// code-cache views without killing any process.
 pub(crate) fn handle_memory_high(k: &mut Kernel, id: u64) {
     crate::cgroup::memory_event(k, id, |e| e.high += 1);
+    reclaim_dbt_memory();
+}
+
+fn reclaim_dbt_memory() {
     appine_engine::trim_dbt_pool();
     appine_engine::unmap_written_code();
 }
 
-/// Measures root (whole-app) usage against `limit` and records the peak. When usage exceeds
-/// `limit`, reclaims unused Tier 1 translations kept in the pool (`trim`) and re-measures so a
-/// guest process is only killed if root usage remains over the limit.
+/// Measures whole-app usage and records the peak. Above the limit, reclaim idle Tier 1
+/// instances, thread workspaces, template pages and writable aliases, then measure again.
+/// Trim drains the pools under the leaf pool lock and releases their contents outside it.
+/// Template shard locks are taken in ascending order before the arena lock. Alias unmapping
+/// takes the pool lock separately. Neither operation acquires an instance lock or the BKL.
 ///
-/// Lock ordering: `appine_engine::trim_dbt_pool` only takes the engine's leaf `pool.lock` briefly
-/// and unmaps evicted idle instances outside it; it never acquires the BKL or calls back into the
-/// kernel layer.
+/// Live code groups retain their translations until the last sharer releases its space. A
+/// synchronous flush would kick runners and wait under the BKL, risking a watchdog stall.
+/// A null thread CPU can also mean a syscall waiting for this BKL. Flushing on 5 ms polls
+/// would make every sharer retranslate even when one runaway process still needs to exit.
 fn measure_root(
     oom: &Oom,
     limit: u64,
@@ -1044,6 +1051,28 @@ mod tests {
         assert_eq!(oom.peak.get(), 160);
     }
 
+    // Root footprint and the DBT caches are process-wide. Run each real-pressure measurement
+    // alone so unrelated kernel tests cannot trigger a kill or discard its written aliases.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_arch = "aarch64"
+    ))]
+    fn isolated_pressure_test() -> bool {
+        if std::env::var_os("APPINE_TEST_OOM_CHILD").is_some() {
+            return true;
+        }
+        let thread = std::thread::current();
+        let name = thread.name().unwrap();
+        assert!(name.starts_with("oom::tests::"));
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name])
+            .env("APPINE_TEST_OOM_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        false
+    }
+
     #[test]
     #[cfg(all(
         any(target_os = "linux", target_os = "android"),
@@ -1051,6 +1080,15 @@ mod tests {
     ))]
     fn oom_check_trims_real_dbt_pool_under_root_pressure() {
         use appine_engine::{Dbt, DbtRegs, DbtSpace, Mmu};
+
+        if !isolated_pressure_test() {
+            return;
+        }
+        let shared = Shared::new(Kernel::new(Tier::Dbt));
+        let mut k = shared.lock();
+        let mm = Mm::new().into_shared();
+        let _addr = dirty_anon(&mm, 4, 0xaa);
+        let (victim, _task, _cpu) = add_process(&mut k, 50, INIT, ROOT, mm.clone());
 
         // Start from a clean pool so we can observe real pooled DBT memory being reclaimed.
         appine_engine::trim_dbt_pool();
@@ -1091,14 +1129,7 @@ mod tests {
             "pooled DBT instances should increase footprint: baseline={baseline}, with_pool={with_pool}"
         );
 
-        // Put a live guest process in a kernel whose root limit sits halfway between baseline and
-        // with_pool: oom::check must trim the DBT pool, re-measure below the limit, and spare the
-        // live guest process.
-        let shared = Shared::new(Kernel::new(Tier::Dbt));
-        let mut k = shared.lock();
-        let mm = Mm::new().into_shared();
-        let _addr = dirty_anon(&mm, 4, 0xaa);
-        let (victim, _task, _cpu) = add_process(&mut k, 50, INIT, ROOT, mm.clone());
+        // Set the limit halfway into the measured pool growth. Reclaim should spare the guest.
         let limit = baseline + (with_pool - baseline) / 2;
         k.oom.limit = limit;
 
@@ -1116,6 +1147,83 @@ mod tests {
         );
         assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.oom, 0);
         assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.oom_kill, 0);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn root_pressure_reclaims_idle_dbt_memory_of_a_live_guest() {
+        use appine_engine::{Dbt, Exit};
+
+        if !isolated_pressure_test() {
+            return;
+        }
+        let shared = Shared::new(Kernel::new(Tier::Dbt));
+        let mut k = shared.lock();
+        let mm = Mm::new().into_shared();
+        let (guest, _task, mut cpu) = add_process(&mut k, 50, INIT, ROOT, mm.clone());
+        let pages = 512;
+        let start = mm
+            .borrow_mut()
+            .mmap(
+                0,
+                pages * PAGE_SIZE,
+                prot::READ | prot::EXEC,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        let mut code = 0x9100_0400u32.to_le_bytes().repeat(PAGE_SIZE as usize / 4); // add x0, x0, #1
+        code[PAGE_SIZE as usize - 4..].copy_from_slice(&0xd400_0001u32.to_le_bytes()); // svc #0
+        let space = mm.borrow_mut().code_space(&k.code_groups).unwrap();
+        let mut threads: Vec<_> = (0..8)
+            .map(|_| Dbt::attach(&space.space, space.tag).unwrap())
+            .collect();
+        let mut run = |dbt: &mut Dbt, pc| {
+            cpu.state_mut().pc = pc;
+            cpu.state_mut().x[0] = 1;
+            assert!(matches!(dbt.run(&mut cpu), Exit::Svc { imm: 0 }));
+            assert_eq!(cpu.state().x[0], PAGE_SIZE / 4);
+        };
+        for page in 0..pages {
+            let pc = start + page * PAGE_SIZE;
+            mm.borrow_mut().write_kernel(pc, &code).unwrap();
+            run(&mut threads[page as usize % 8], pc);
+        }
+        drop(threads);
+        assert!(appine_engine::written_code_bytes() > 0);
+        // Only the guest's live instance exists. Templates account for over 4 MiB. Releasing
+        // eight detached threads also unmaps at least their eight 64 KiB jump caches.
+        let virtual_bytes = || {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            statm
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                * appine_hal::page_size()
+        };
+        let mapped = virtual_bytes();
+        k.oom.limit = footprint().unwrap() - (2 << 20);
+        check(&mut k, &shared);
+        assert_eq!(appine_engine::written_code_bytes(), 0);
+        assert!(virtual_bytes() + 8 * 64 * 1024 <= mapped);
+        let after = footprint().unwrap();
+        assert!(
+            after <= k.oom.limit,
+            "footprint {after} exceeds {}",
+            k.oom.limit
+        );
+        assert!(guest.borrow().exiting.is_none());
+        assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.oom_kill, 0);
+
+        let mut live = Dbt::attach(&space.space, space.tag).unwrap();
+        run(&mut live, start);
+        assert_eq!(live.stats().blocks, 0);
+        let mut fresh = Dbt::new().unwrap();
+        run(&mut fresh, start);
+        assert!(fresh.stats().blocks > 0);
+        assert_eq!(fresh.stats().blocks_shared, 0);
     }
 
     #[test]
