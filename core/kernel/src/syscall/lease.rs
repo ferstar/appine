@@ -35,21 +35,34 @@ pub(crate) struct Lease {
     /// The process that set it (Linux's `lease_init` records the tgid, which a later change of
     /// type keeps), for `/proc/locks`.
     pid: Tid,
+    /// Acquisition order for `/proc/locks`, retained across type changes.
+    seq: u64,
 }
 
 impl Lease {
+    pub(crate) fn new(file: &FileRef, fd: i32, ty: i16, pid: Tid) -> Self {
+        Self {
+            file: Rc::downgrade(file),
+            fd,
+            ty,
+            breaking: None,
+            pid,
+            seq: crate::locks::next_seq(),
+        }
+    }
+
     fn is(&self, file: &FileRef) -> bool {
         self.file.as_ptr() == Rc::as_ptr(file)
     }
 
     /// What `/proc/locks` shows ([`crate::locks::proc_locks`]): the open file while it lives, a
     /// write lease (or, while being broken, whether the type it goes down to is one, Linux's
-    /// `target_leasetype`; None for `F_UNLCK`), whether it is being broken, and who set it.
-    pub(crate) fn shown(&self) -> Option<(FileRef, Option<bool>, bool, Tid)> {
+    /// `target_leasetype`; None for `F_UNLCK`), its break status, setter and acquisition sequence.
+    pub(crate) fn shown(&self) -> Option<(FileRef, Option<bool>, bool, Tid, u64)> {
         let file = self.file.upgrade()?;
         let ty = self.breaking.map_or(self.ty, |(target, _)| target);
         let write = (ty != F_UNLCK).then_some(ty == F_WRLCK);
-        Some((file, write, self.breaking.is_some(), self.pid))
+        Some((file, write, self.breaking.is_some(), self.pid, self.seq))
     }
 }
 
@@ -132,13 +145,7 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
         }
         None => {
             file.borrow_mut().holds_locks = true;
-            list.push(Lease {
-                file: Rc::downgrade(file),
-                fd,
-                ty: arg,
-                breaking: None,
-                pid: tgid,
-            });
+            list.push(Lease::new(file, fd, arg, tgid));
         }
     }
     // As on Linux (lease_setup's __f_setown without force), the signal for a break goes to the

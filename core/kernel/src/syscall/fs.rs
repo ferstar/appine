@@ -2432,18 +2432,36 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
         _ => return Err(Errno::EINVAL),
     };
     let tgid = cx.tgid();
-    while !cx.k().flocks.try_lock(key, &file, exclusive, tgid) {
+    let tid = cx.tid();
+    loop {
+        if cx.k().flocks.try_lock(key, &file, exclusive, tgid) {
+            cx.k().flocks.set_waiting(tid, None);
+            return Ok(0);
+        }
         if op & LOCK_NB != 0 {
             return Err(Errno::EAGAIN);
         }
+        cx.k().flocks.set_waiting(
+            tid,
+            Some(crate::locks::FlockWaiter {
+                tid,
+                key,
+                file: Rc::downgrade(&file),
+                exclusive,
+                pid: tgid,
+            }),
+        );
         if cx.interrupted() {
+            cx.k().flocks.set_waiting(tid, None);
             return Err(Errno::ERESTARTSYS);
         }
         // The file holding the lock requests a wakeup when it unlocks, converts or closes
         // (OpenFile's destructor)
-        cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
+        if let Err(e) = cx.wait_on(None, &mut [], crate::kernel::wake::LOCK) {
+            cx.k().flocks.set_waiting(tid, None);
+            return Err(e);
+        }
     }
-    Ok(0)
 }
 
 pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResult {

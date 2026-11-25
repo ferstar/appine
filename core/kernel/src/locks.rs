@@ -22,7 +22,7 @@ use crate::vfs::{Node, Vfs};
 /// Monotonic sequence number for lock acquisition order (`/proc/locks` lists newest first).
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn next_seq() -> u64 {
+pub(crate) fn next_seq() -> u64 {
     NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -73,9 +73,19 @@ struct FlockHolder {
     seq: u64,
 }
 
+/// A thread waiting for a whole-file lock in flock(2).
+pub(crate) struct FlockWaiter {
+    pub tid: Tid,
+    pub key: LockKey,
+    pub file: Weak<RefCell<OpenFile>>,
+    pub exclusive: bool,
+    pub pid: Tid,
+}
+
 #[derive(Default)]
 pub(crate) struct Flocks {
     by_key: BTreeMap<LockKey, Vec<FlockHolder>>,
+    waiters: Vec<FlockWaiter>,
     sweep_at: usize,
 }
 
@@ -95,6 +105,14 @@ fn sweep_dead<T>(
 }
 
 impl Flocks {
+    pub fn set_waiting(&mut self, tid: Tid, wait: Option<FlockWaiter>) {
+        self.waiters
+            .retain(|w| w.tid != tid && w.file.strong_count() > 0);
+        if let Some(w) = wait {
+            self.waiters.push(w);
+        }
+    }
+
     /// Returns false if another open file holds a conflicting lock.
     pub fn try_lock(&mut self, key: LockKey, file: &FileRef, exclusive: bool, pid: Tid) -> bool {
         sweep_dead(&mut self.by_key, &mut self.sweep_at, |holder| {
@@ -375,13 +393,12 @@ pub(crate) fn closed(k: &mut Kernel, fds: &Rc<RefCell<FdTable>>, files: &[FileRe
 
 // ---- /proc/locks ----
 
-/// `/proc/locks` (Linux 6.1's `locks_show` and `lock_get_status`): a line for every flock lock,
-/// POSIX and OFD lock and lease, listed newest first and numbered by position, with blocked
-/// `F_SETLKW` / `F_OFD_SETLKW` waiters immediately below the lock that blocks them (`->` lines),
-/// giving the process that took it as the reader's pid namespace `ns` sees it (-1 for OFD locks;
-/// the locks of processes `ns` cannot see are left out, their numbers skipped), the device and
-/// inode numbers stat shows for the file and, for record locks, the byte range. Entries whose file
-/// has no shown device/inode identity are omitted without advancing the line number.
+/// `/proc/locks` lists flocks, POSIX and OFD locks, and leases newest first by acquisition
+/// sequence (Linux 6.1's `locks_show` and `lock_get_status`). Blocked `flock`, `F_SETLKW` and
+/// `F_OFD_SETLKW` requests appear on `->` lines with their first conflicting holder's number.
+/// Each line shows the pid in the reader's namespace `ns` (-1 for OFD locks), the device and
+/// inode from stat, and the lock range. Invisible holders consume a number and hide their
+/// waiters. Entries without a shown device/inode identity are omitted without consuming a number.
 pub(crate) fn proc_locks(k: &Kernel, vfs: &Vfs, ns: &PidNs) -> String {
     let mut out = String::new();
     let mut pos = 0;
@@ -501,7 +518,8 @@ fn format_range(start: u64, end: u64) -> String {
 }
 
 /// Every lock and lease (only those on `only` when given), in the order Linux keeps an inode's:
-/// flock locks, then POSIX and OFD locks, then leases.
+/// flock locks, then POSIX and OFD locks, then leases. The global listing uses each entry's
+/// acquisition sequence and attaches blocked flock and record-lock waiters to their holders.
 fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
     let wanted = |ino: &Ino| only.is_none_or(|o| o == LockKey::Node(*ino));
     let mut out = Vec::new();
@@ -509,6 +527,8 @@ fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
         if only.is_some_and(|o| o != *key) {
             continue;
         }
+        let base = out.len();
+        let mut live = Vec::new();
         for holder in holders {
             if let Some(file) = holder.file.upgrade() {
                 out.push(Shown {
@@ -522,6 +542,26 @@ fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
                     table: None,
                     seq: holder.seq,
                     waiters: Vec::new(),
+                });
+                live.push(holder);
+            }
+        }
+        if only.is_none() && !live.is_empty() {
+            for w in k.flocks.waiters.iter().filter(|w| w.key == *key) {
+                let Some(file) = w.file.upgrade() else {
+                    continue;
+                };
+                let Some(idx) = live.iter().position(|holder| {
+                    !holder.file.ptr_eq(&w.file) && (w.exclusive || holder.exclusive)
+                }) else {
+                    continue;
+                };
+                out[base + idx].waiters.push(ShownLine {
+                    kind: "FLOCK  ADVISORY  ",
+                    write: Some(w.exclusive),
+                    pid: w.pid,
+                    file,
+                    range: "0 EOF".into(),
                 });
             }
         }
@@ -580,7 +620,7 @@ fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
     // Leases are keyed by the store inode, or by an overlay node's key (same as lock_ino)
     for (_, leases) in k.leases.iter().filter(|(i, _)| wanted(i)) {
         for lease in leases {
-            let Some((file, write, breaking, pid)) = lease.shown() else {
+            let Some((file, write, breaking, pid, seq)) = lease.shown() else {
                 continue;
             };
             out.push(Shown {
@@ -596,7 +636,7 @@ fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
                     range: "0 EOF".into(),
                 },
                 table: None,
-                seq: 0,
+                seq,
                 waiters: Vec::new(),
             });
         }
@@ -760,6 +800,142 @@ mod tests {
             },
             0,
         )
+    }
+
+    fn block_flock(k: &mut Kernel, file: &FileRef, exclusive: bool, tid: Tid, pid: Tid) {
+        let key = LockKey::of(&file.borrow()).unwrap();
+        assert!(!k.flocks.try_lock(key, file, exclusive, pid));
+        k.flocks.set_waiting(
+            tid,
+            Some(FlockWaiter {
+                tid,
+                key,
+                file: Rc::downgrade(file),
+                exclusive,
+                pid,
+            }),
+        );
+    }
+
+    #[test]
+    fn flock_waiter_is_shown_under_its_first_shared_blocker() {
+        let (dir, vfs) = temp_vfs("shared-flocks");
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let ns = PidNs::init();
+        let (first, second, waiter) = (null_file(42), null_file(42), null_file(42));
+        let key = LockKey::of(&first.borrow()).unwrap();
+        assert!(k.flocks.try_lock(key, &first, false, 100));
+        assert!(k.flocks.try_lock(key, &second, false, 200));
+        block_flock(&mut k, &waiter, true, 301, 300);
+
+        assert_eq!(
+            proc_locks(&k, &vfs, &ns),
+            "1: FLOCK  ADVISORY  READ 200 08:01:42 0 EOF\n\
+             2: FLOCK  ADVISORY  READ 100 08:01:42 0 EOF\n\
+             2: -> FLOCK  ADVISORY  WRITE 300 08:01:42 0 EOF\n"
+        );
+        let fds = Rc::new(RefCell::new(FdTable::new()));
+        assert!(fd_locks(&k, &vfs, &ns, &fds, &waiter).is_empty());
+        assert_eq!(
+            fd_locks(&k, &vfs, &ns, &fds, &first),
+            "lock:\t1: FLOCK  ADVISORY  READ 100 08:01:42 0 EOF\n"
+        );
+
+        let child = PidNs::child(&ns, crate::cred::Cred::root().user_ns.clone());
+        PidNs::register(&child, 200, &[]).unwrap();
+        PidNs::register(&child, 300, &[]).unwrap();
+        // A visible waiter stays hidden while its first blocker is invisible.
+        assert_eq!(
+            proc_locks(&k, &vfs, &child),
+            "1: FLOCK  ADVISORY  READ 1 08:01:42 0 EOF\n"
+        );
+        k.flocks.unlock(key, &first);
+        assert_eq!(
+            proc_locks(&k, &vfs, &child),
+            "1: FLOCK  ADVISORY  READ 1 08:01:42 0 EOF\n\
+             1: -> FLOCK  ADVISORY  WRITE 2 08:01:42 0 EOF\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exclusive_flock_lists_live_waiters_until_cleared() {
+        let (dir, vfs) = temp_vfs("exclusive-flock");
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let ns = PidNs::init();
+        let (holder, reader, writer) = (null_file(42), null_file(42), null_file(42));
+        let key = LockKey::of(&holder.borrow()).unwrap();
+        assert!(k.flocks.try_lock(key, &holder, true, 100));
+        block_flock(&mut k, &reader, false, 201, 200);
+        block_flock(&mut k, &writer, true, 202, 200);
+        assert_eq!(
+            proc_locks(&k, &vfs, &ns),
+            "1: FLOCK  ADVISORY  WRITE 100 08:01:42 0 EOF\n\
+             1: -> FLOCK  ADVISORY  READ 200 08:01:42 0 EOF\n\
+             1: -> FLOCK  ADVISORY  WRITE 200 08:01:42 0 EOF\n"
+        );
+        let child = PidNs::child(&ns, crate::cred::Cred::root().user_ns.clone());
+        PidNs::register(&child, 100, &[]).unwrap();
+        assert_eq!(
+            proc_locks(&k, &vfs, &child),
+            "1: FLOCK  ADVISORY  WRITE 1 08:01:42 0 EOF\n"
+        );
+        k.flocks.set_waiting(201, None);
+        assert_eq!(
+            proc_locks(&k, &vfs, &ns),
+            "1: FLOCK  ADVISORY  WRITE 100 08:01:42 0 EOF\n\
+             1: -> FLOCK  ADVISORY  WRITE 200 08:01:42 0 EOF\n"
+        );
+        drop(writer);
+        assert_eq!(
+            proc_locks(&k, &vfs, &ns),
+            "1: FLOCK  ADVISORY  WRITE 100 08:01:42 0 EOF\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lease_uses_acquisition_order_in_proc_locks_and_inode_order_in_fdinfo() {
+        let (dir, vfs) = temp_vfs("lease-order");
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let ns = PidNs::init();
+        let fds = Rc::new(RefCell::new(FdTable::new()));
+        let ino = 42;
+        let file = OpenFile::new(
+            FileKind::Regular {
+                ino,
+                file: std::fs::File::create(dir.join("file")).unwrap(),
+                cow: false,
+            },
+            0,
+        );
+        let key = LockKey::of(&file.borrow()).unwrap();
+        assert!(k.flocks.try_lock(key, &file, false, 100));
+        let lease = crate::syscall::Lease::new(&file, 3, libc::F_RDLCK as i16, 100);
+        k.leases.entry(ino).or_default().push(lease);
+        k.locks.set(
+            key,
+            Lock {
+                file: Rc::downgrade(&file),
+                pid: 100,
+                ..lock(&owner(&fds), 10, 20, false)
+            },
+            false,
+        );
+
+        assert_eq!(
+            proc_locks(&k, &vfs, &ns),
+            "1: POSIX  ADVISORY  READ 100 08:01:42 10 19\n\
+             2: LEASE  ACTIVE    READ 100 08:01:42 0 EOF\n\
+             3: FLOCK  ADVISORY  READ 100 08:01:42 0 EOF\n"
+        );
+        assert_eq!(
+            fd_locks(&k, &vfs, &ns, &fds, &file),
+            "lock:\t1: FLOCK  ADVISORY  READ 100 08:01:42 0 EOF\n\
+             lock:\t2: POSIX  ADVISORY  READ 100 08:01:42 10 19\n\
+             lock:\t3: LEASE  ACTIVE    READ 100 08:01:42 0 EOF\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
