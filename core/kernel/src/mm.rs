@@ -135,7 +135,7 @@ const LEAF_SPAN: u64 = PAGE_SIZE << 9;
 /// multiple threads stream through a large file (such as model weights).
 const FILE_FAULT_SPAN: u64 = 8 * LEAF_SPAN;
 
-/// Cap on soft page-table prefill per `madvise(MADV_WILLNEED | MADV_POPULATE_READ)` call
+/// Cap on soft page-table prefill per `madvise(MADV_WILLNEED)` call
 /// (4 GiB = at most 2048 L2 superpage entries, ~16 KiB of L2 tables).
 const FILE_PREFILL_MAX: u64 = 4 << 30;
 
@@ -289,6 +289,36 @@ pub(crate) enum MsyncStep {
         locked: bool,
         target: Option<MsyncTarget>,
     },
+}
+
+/// Progress of a resumable `madvise(MADV_POPULATE_READ | MADV_POPULATE_WRITE)` walk
+/// ([`Mm::populate_step`]).
+pub(crate) struct PopulateWalk {
+    pub cursor: u64,
+    pub end: u64,
+    pub warmed_until: u64,
+    pub has_gap: bool,
+}
+
+impl PopulateWalk {
+    pub(crate) fn new(addr: u64, len: u64) -> Self {
+        Self {
+            cursor: addr,
+            end: addr + len,
+            warmed_until: addr,
+            has_gap: false,
+        }
+    }
+}
+
+/// Unlocked work requested by [`Mm::populate_step`] before resuming under the BKL.
+pub(crate) enum PopulateStep {
+    /// Reached `end` (or no further VMA overlaps the remaining range).
+    Done,
+    /// Warm a regular file slice with host `MADV_WILLNEED` outside the BKL.
+    Advise(AdviseRange),
+    /// Read an unread FUSE page from the daemon outside the BKL.
+    Fill(Rc<Fill>, u64),
 }
 
 struct FilePages {
@@ -1006,6 +1036,27 @@ impl Vma {
             && (addr < start + self.contents_len() || fill.size_stale.get())
             && !fill.has(page))
         .then(|| (fill.clone(), page))
+    }
+
+    /// Touches host memory for `[off, off + len)` inside this VMA, marking private mappings
+    /// `written` on write-populate.
+    ///
+    /// # Safety
+    ///
+    /// `[off, off + len)` must lie within backed, in-EOF host memory of this VMA (and be
+    /// host-writable when `write` is true; for `Backing::Anonymous` writes, CoW must already be
+    /// settled).
+    unsafe fn populate_host(&self, off: usize, len: usize, write: bool) {
+        // SAFETY: guaranteed by the caller.
+        let host = unsafe { self.host.as_ptr().add(off) };
+        if write {
+            if self.backing != Backing::Shared {
+                self.written.set(true);
+            }
+            unsafe { populate_write_host(host, len) };
+        } else {
+            unsafe { appine_hal::populate(host, len) };
+        }
     }
 }
 
@@ -3777,10 +3828,15 @@ impl Mm {
         }
     }
 
-    /// `MADV_FREE`: walks mapped VMAs in `[addr, addr + len)` in order, returning `EINVAL` on the
-    /// first non-private-anonymous VMA (taking precedence over any earlier unmapped gap) and
-    /// `ENOMEM` at the end if any gap existed.
-    pub(crate) fn check_free(&self, addr: u64, len: u64) -> Result<(), Errno> {
+    /// Walks mapped VMAs in `[addr, addr + len)` like Linux 6.1's `do_madvise`: returns `EINVAL`
+    /// on the first VMA failing `allow` (overriding any earlier unmapped gap) and `ENOMEM` at the
+    /// end if any gap existed.
+    fn check_vmas(
+        &self,
+        addr: u64,
+        len: u64,
+        allow: impl Fn(u64, &Vma) -> bool,
+    ) -> Result<(), Errno> {
         let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
         let mut cursor = addr;
         let mut has_gap = false;
@@ -3792,7 +3848,7 @@ impl Mm {
             if cursor < s {
                 has_gap = true;
             }
-            if v.backing != Backing::Anonymous {
+            if !allow(s, v) {
                 return Err(Errno::EINVAL);
             }
             cursor = end.min(s + v.len);
@@ -3800,10 +3856,26 @@ impl Mm {
         if has_gap { Err(Errno::ENOMEM) } else { Ok(()) }
     }
 
+    /// `MADV_FREE`: refuses locked, non-private-anonymous, or `[vdso]` VMAs (`EINVAL`, matching
+    /// Linux 6.1's `madvise_dontneed_free` + `madvise_free_single_vma`) and reports gaps as
+    /// `ENOMEM`.
+    pub(crate) fn check_free(&self, addr: u64, len: u64) -> Result<(), Errno> {
+        self.check_vmas(addr, len, |s, v| {
+            !v.locked && v.backing == Backing::Anonymous && (self.vdso == 0 || s != self.vdso)
+        })
+    }
+
+    /// `MADV_COLD` and `MADV_PAGEOUT`: refuses locked, foreign (`[vvar]`), or GPU (`VM_PFNMAP`)
+    /// VMAs (`EINVAL`, matching Linux 6.1's `can_madv_lru_vma`) and reports gaps as `ENOMEM`.
+    pub(crate) fn check_lru(&self, addr: u64, len: u64) -> Result<(), Errno> {
+        self.check_vmas(addr, len, |_, v| {
+            !v.locked && !v.foreign() && v.region.gpu.is_none()
+        })
+    }
+
     /// Prefills soft page-table entries for read-only non-FUSE file mappings in `[addr, addr + len)`
-    /// (`MADV_WILLNEED`, `MADV_POPULATE_READ`), capped at [`FILE_PREFILL_MAX`] bytes per call.
-    /// On tmpfs, an explicit populate faults each requested page and reports allocation failure.
-    pub fn prefill_file_ptes(&self, addr: u64, len: u64, populate: bool) -> Result<(), Errno> {
+    /// (`MADV_WILLNEED`), capped at [`FILE_PREFILL_MAX`] bytes per call.
+    pub fn prefill_file_ptes(&self, addr: u64, len: u64) {
         let end = addr.saturating_add(len);
         let first = self
             .vmas
@@ -3816,21 +3888,6 @@ impl Mm {
             .range(first..end)
             .filter(|&(&s, v)| s + v.len > addr)
         {
-            if v.tmpfs().is_some() && populate {
-                if mmu_prot(v.prot) & prot::READ == 0 {
-                    return Err(Errno::EINVAL);
-                }
-                for page in (addr.max(s)..end.min(s + v.len)).step_by(PAGE_SIZE as usize) {
-                    if self.mmu.translate(page, prot::READ).is_none()
-                        && !self
-                            .try_fault_in(page, prot::READ)
-                            .map_err(|_| Errno::EFAULT)?
-                    {
-                        return Err(Errno::EFAULT);
-                    }
-                }
-                continue;
-            }
             if budget == 0
                 || v.file_id.is_none()
                 || v.tmpfs().is_some()
@@ -3858,7 +3915,22 @@ impl Mm {
             }
             budget -= span;
         }
-        Ok(())
+    }
+
+    /// Builds a host-page-aligned [`AdviseRange`] for `[from, to)` inside VMA `v` at `s`.
+    fn advise_slice(s: u64, v: &Vma, from: u64, to: u64) -> Option<AdviseRange> {
+        let page = appine_hal::page_size();
+        let reg_start = v.region.base.as_ptr() as usize;
+        let reg_end = reg_start + v.region.len.next_multiple_of(page);
+        let host_from = v.host.as_ptr() as usize + (from - s) as usize;
+        let host_to = v.host.as_ptr() as usize + (to - s) as usize;
+        let start = (host_from & !(page - 1)).max(reg_start);
+        let stop = host_to.next_multiple_of(page).min(reg_end);
+        (start < stop).then(|| AdviseRange {
+            _region: v.region.clone(),
+            ptr: NonNull::new(start as *mut u8).unwrap(),
+            len: stop - start,
+        })
     }
 
     /// Collects host-page-aligned slices of live host regions overlapping `[addr, addr + len)` for
@@ -3867,8 +3939,8 @@ impl Mm {
     /// Skips reserved (`PROT_NONE`), foreign (`[vvar]`), GPU, and FUSE on-demand mappings, and
     /// clips ranges to `file_len` so pages past EOF are never advised. When `file_only` is true
     /// (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`), only file-backed host mappings are
-    /// included so anonymous and recycled host VMAs are never split; otherwise (`MADV_WILLNEED`,
-    /// `MADV_POPULATE_READ`), untouched anonymous VMAs are still skipped.
+    /// included so anonymous and recycled host VMAs are never split; otherwise (`MADV_WILLNEED`),
+    /// untouched anonymous VMAs are still skipped.
     pub fn advise_ranges(&self, addr: u64, len: u64, file_only: bool) -> Vec<AdviseRange> {
         let end = addr.saturating_add(len);
         let first = self
@@ -3876,7 +3948,6 @@ impl Mm {
             .range(..=addr)
             .next_back()
             .map_or(addr, |(&s, _)| s);
-        let page = appine_hal::page_size();
         let mut out: Vec<AdviseRange> = Vec::new();
         for (&s, v) in self
             .vmas
@@ -3898,52 +3969,208 @@ impl Mm {
             if from >= to {
                 continue;
             }
-            let reg_start = v.region.base.as_ptr() as usize;
-            let reg_end = reg_start + v.region.len.next_multiple_of(page);
-            let host_from = v.host.as_ptr() as usize + (from - s) as usize;
-            let host_to = v.host.as_ptr() as usize + (to - s) as usize;
-            let start = (host_from & !(page - 1)).max(reg_start);
-            let stop = host_to.next_multiple_of(page).min(reg_end);
-            if start >= stop {
+            let Some(range) = Self::advise_slice(s, v, from, to) else {
                 continue;
-            }
+            };
+            let start = range.ptr.as_ptr() as usize;
+            let stop = start + range.len;
             if let Some(last) = out.last_mut()
-                && Arc::ptr_eq(&last._region, &v.region)
+                && Arc::ptr_eq(&last._region, &range._region)
                 && start >= last.ptr.as_ptr() as usize
                 && start <= last.ptr.as_ptr() as usize + last.len
             {
                 let new_end = (last.ptr.as_ptr() as usize + last.len).max(stop);
                 last.len = new_end - last.ptr.as_ptr() as usize;
             } else {
-                out.push(AdviseRange {
-                    _region: v.region.clone(),
-                    ptr: NonNull::new(start as *mut u8).unwrap(),
-                    len: stop - start,
-                });
+                out.push(range);
             }
         }
         out
     }
 
+    /// Faults one page of VMA `s` via [`Self::try_fault_in`] when absent, then touches its host
+    /// backing for `MADV_POPULATE_READ` / `MADV_POPULATE_WRITE`.
+    ///
+    /// # Safety
+    ///
+    /// `[page, page + bytes)` must lie within backed, in-EOF host memory of VMA `s` (and be
+    /// host-writable when `write` is true).
+    unsafe fn fault_populate_page(
+        &self,
+        s: u64,
+        page: u64,
+        bytes: usize,
+        need: u32,
+        write: bool,
+    ) -> Result<(), Errno> {
+        if self.mmu.translate(page, need).is_none()
+            && !self.try_fault_in(page, need).map_err(|_| Errno::EFAULT)?
+        {
+            return Err(Errno::EFAULT);
+        }
+        // SAFETY: guaranteed by the caller.
+        unsafe { self.vmas[&s].populate_host((page - s) as usize, bytes, write) };
+        Ok(())
+    }
+
+    /// Advances `madvise(MADV_POPULATE_READ | MADV_POPULATE_WRITE)` along `walk`, matching
+    /// Linux 6.1's `do_madvise` + `madvise_populate`:
+    /// - Skips unmapped gaps (`walk.has_gap`) so the caller reports `ENOMEM` at the end unless a
+    ///   later VMA fails with `EINVAL` or `EFAULT`.
+    /// - Refuses VMAs lacking the requested guest permission (`PROT_READ` / `PROT_WRITE`) or
+    ///   special `[vvar]` / GPU mappings with `EINVAL`.
+    /// - Refreshes stale file extents, faults tmpfs and software-tracked private files, yields for
+    ///   unlocked FUSE fills or `>= 64 KB` regular-file `MADV_WILLNEED` warming, preserves CoW on
+    ///   read while breaking CoW on write, installs missing soft PTEs, and stops with `EFAULT` at
+    ///   the first page past EOF or failing allocation.
+    pub(crate) fn populate_step(
+        &mut self,
+        walk: &mut PopulateWalk,
+        write: bool,
+    ) -> Result<PopulateStep, Errno> {
+        const ADVISE_MIN: u64 = 64 * 1024;
+        let need = if write { prot::WRITE } else { prot::READ };
+
+        while walk.cursor < walk.end {
+            let Some((s, v)) = self.next_vma(walk.cursor, walk.end) else {
+                walk.has_gap = true;
+                walk.cursor = walk.end;
+                break;
+            };
+            if walk.cursor < s {
+                walk.has_gap = true;
+                walk.cursor = s;
+            }
+            if v.foreign() || v.region.gpu.is_some() || v.prot & need == 0 {
+                return Err(Errno::EINVAL);
+            }
+            let stop = walk.end.min(s + v.len);
+
+            // On-demand FUSE mapping: request unlocked fills for missing pages, fail past EOF,
+            // install PTEs (including shared-write baselines), and touch host memory.
+            if v.fill.is_some() {
+                for page in (walk.cursor..stop).step_by(PAGE_SIZE as usize) {
+                    let v = &self.vmas[&s];
+                    if let Some((fill, fpage)) = v.unread(s, page) {
+                        walk.cursor = page;
+                        return Ok(PopulateStep::Fill(fill, fpage));
+                    }
+                    if page >= s + v.contents_len() {
+                        return Err(Errno::EFAULT);
+                    }
+                    // SAFETY: `page` lies within `[s, s + v.contents_len())`, is already filled in
+                    // the memfd, and is mapped writable on the host whenever `write` is true.
+                    unsafe { self.fault_populate_page(s, page, PAGE_SIZE as usize, need, write)? };
+                }
+                walk.cursor = stop;
+                continue;
+            }
+
+            // Non-FUSE mappings: refresh the host file extent when `walk.cursor` reaches recorded
+            // EOF; if still past EOF (or past a shared-anonymous host region end), fail `EFAULT`.
+            if walk.cursor >= s + v.file_len {
+                if self.refresh_file_extent(walk.cursor) == Some(true) {
+                    continue;
+                }
+                return Err(Errno::EFAULT);
+            }
+            let in_eof = stop.min(s + v.file_len);
+
+            // Tmpfs mappings (read or write) and software-tracked private files (write): admit
+            // each page through `try_fault_in` before touching host memory.
+            if v.pages.as_ref().is_some_and(|t| t.tmpfs.is_some() || write) {
+                for page in (walk.cursor..in_eof).step_by(PAGE_SIZE as usize) {
+                    let bytes = (in_eof - page).min(PAGE_SIZE) as usize;
+                    // SAFETY: `[page, page + bytes)` lies within `[s, s + v.file_len)` and is
+                    // backed by a live host mapping (writable when `write` is true).
+                    unsafe { self.fault_populate_page(s, page, bytes, need, write)? };
+                }
+                walk.cursor = in_eof;
+                continue;
+            }
+
+            // Warm large regular file slices with host `MADV_WILLNEED` outside the BKL so disk
+            // readahead does not stall other guest threads, then resume under the BKL to fault.
+            if v.file_id.is_some()
+                && v.region.anonymous.is_none()
+                && walk.cursor >= walk.warmed_until
+                && in_eof - walk.cursor >= ADVISE_MIN
+                && let Some(range) = Self::advise_slice(s, v, walk.cursor, in_eof)
+            {
+                walk.warmed_until = walk.warmed_until.max(in_eof);
+                return Ok(PopulateStep::Advise(range));
+            }
+
+            // Fault host pages and install missing soft page-table entries.
+            let cursor = walk.cursor;
+            if v.backing == Backing::Anonymous && !write {
+                // Read-populate without breaking CoW or setting `v.written`: touch borrowed pages
+                // via the owner's host memory and non-borrowed runs via our own.
+                let cow = self.cow.borrow();
+                let mut cur = cursor;
+                for (&page, b) in cow.borrowed.range(cursor..in_eof) {
+                    if page > cur {
+                        // SAFETY: `[cur, page)` lies inside this VMA's host memory.
+                        unsafe {
+                            v.populate_host((cur - s) as usize, (page - cur) as usize, false)
+                        };
+                    }
+                    // SAFETY: `b.region` retains the borrowed host page.
+                    unsafe { appine_hal::populate(b.host.as_ptr(), PAGE_SIZE as usize) };
+                    cur = page + PAGE_SIZE;
+                }
+                if cur < in_eof {
+                    // SAFETY: `[cur, in_eof)` lies inside this VMA's host memory.
+                    unsafe { v.populate_host((cur - s) as usize, (in_eof - cur) as usize, false) };
+                }
+            } else {
+                if v.backing == Backing::Anonymous {
+                    self.cow_settle(cursor, in_eof);
+                }
+                // SAFETY: `[cursor, in_eof)` lies within `[s, s + v.file_len)` and is backed by
+                // live host memory (writable on the host whenever `write` is true: anonymous CoW
+                // was just settled, writable private files are never `v.cow`, and writable shared
+                // files are mapped RW).
+                unsafe {
+                    v.populate_host((cursor - s) as usize, (in_eof - cursor) as usize, write)
+                };
+            }
+
+            // SAFETY: `[cursor, in_eof)` lies within `[s, s + v.file_len)` and holds host memory.
+            let host = unsafe { v.host.add((cursor - s) as usize) };
+            unsafe {
+                self.mmu
+                    .fill_shared(cursor, host, in_eof - cursor, v.prefill_prot())
+            }
+            .map_err(|_| Errno::ENOMEM)?;
+
+            walk.cursor = in_eof;
+        }
+        Ok(PopulateStep::Done)
+    }
+
     /// Test helper wrapping [`Mm::discard_range`] for callers that expect no gap/error.
     #[cfg(test)]
     fn discard(&mut self, addr: u64, len: u64) -> Result<Vec<Reread>, Errno> {
-        let (rereads, res) = self.discard_range(addr, len);
+        let (rereads, res) = self.discard_range(addr, len, false);
         res.map(|()| rereads)
     }
 
-    /// madvise(`MADV_DONTNEED`): anonymous memory goes back to the host (reading zero afterwards);
-    /// the written pages of private file mappings go back to the file's contents (Linux drops
-    /// their copies and reads the file again): whole host pages of a host file mapping through the
-    /// host, the rest returned as [`Reread`]s for the caller to read from the file; shared
-    /// mappings stay unchanged. Walks mapped VMAs in order like Linux 6.1's `do_madvise`: unmapped
-    /// gaps are skipped and reported as `ENOMEM` at the end, while a locked VMA stops immediately
-    /// with `EINVAL` (taking precedence over earlier gaps), still returning partial [`Reread`]s
-    /// collected beforehand.
+    /// madvise(`MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`): anonymous memory goes back to the host
+    /// (reading zero afterwards); the written pages of private file mappings go back to the file's
+    /// contents (Linux drops their copies and reads the file again): whole host pages of a host
+    /// file mapping through the host, the rest returned as [`Reread`]s for the caller to read from
+    /// the file; shared mappings stay unchanged. Walks mapped VMAs in order like Linux 6.1's
+    /// `do_madvise`: unmapped gaps are skipped and reported as `ENOMEM` at the end, while a
+    /// foreign (`[vvar]`), GPU (`VM_PFNMAP`), or (unless `allow_locked`) locked VMA stops
+    /// immediately with `EINVAL` (taking precedence over earlier gaps), still returning partial
+    /// [`Reread`]s collected beforehand. `MADV_DONTNEED_LOCKED` discards pages without unlocking
+    /// the VMA.
     pub(crate) fn discard_range(
         &mut self,
         addr: u64,
         len: u64,
+        allow_locked: bool,
     ) -> (Vec<Reread>, Result<(), Errno>) {
         let mut rereads = Vec::new();
         let Some(len) = page_up(len) else {
@@ -3963,7 +4190,7 @@ impl Mm {
                 has_gap = true;
                 cursor = s;
             }
-            if v.locked {
+            if (!allow_locked && v.locked) || v.foreign() || v.region.gpu.is_some() {
                 return (rereads, Err(Errno::EINVAL));
             }
             let stop = end.min(s + v.len);
@@ -4357,28 +4584,12 @@ impl Mm {
                 // with FOLL_WRITE, breaking CoW and allocating private host pages (not the zero
                 // page) so RSS reflects the populated pages without double-counting borrowed pages.
                 self.cow_settle(lo, hi);
-                v.written.set(true);
-                let page = appine_hal::page_size();
-                let ptr = unsafe { v.host.as_ptr().add((from - s) as usize) };
-                let mut at = ptr as usize & !(page - 1);
-                let stop = ptr as usize + (to - from) as usize;
-                while at < stop {
-                    let target = at.max(ptr as usize) as *const std::sync::atomic::AtomicU8;
-                    // SAFETY: [from, to) is inside this VMA's own writable host memory, and an
-                    // atomic OR of 0 triggers a host write fault without racing concurrent guest
-                    // stores.
-                    unsafe { (*target).fetch_or(0, Ordering::Relaxed) };
-                    at += page;
-                }
+                // SAFETY: `[from, to)` is inside this VMA's own writable host memory.
+                unsafe { v.populate_host((from - s) as usize, (to - from) as usize, true) };
             } else {
                 // SAFETY: [from, to) is inside this VMA, which holds the host memory, and before
                 // the end of the file
-                unsafe {
-                    appine_hal::populate(
-                        v.host.as_ptr().add((from - s) as usize),
-                        (to - from) as usize,
-                    )
-                };
+                unsafe { v.populate_host((from - s) as usize, (to - from) as usize, false) };
             }
             // Build the entries too (large on-demand mappings had none): populated pages must
             // be found when measuring resident memory (Mm::touched_windows). Existing entries
@@ -7627,6 +7838,25 @@ fn extent(size: i64, offset: u64, len: u64) -> u64 {
         .min(len)
 }
 
+/// Triggers a host write fault on each host page covering `[ptr, ptr + len)` without modifying
+/// any bytes or racing concurrent guest stores.
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` must lie inside a live writable host mapping within EOF.
+unsafe fn populate_write_host(ptr: *const u8, len: usize) {
+    let page = appine_hal::page_size();
+    let mut at = ptr as usize & !(page - 1);
+    let stop = ptr as usize + len;
+    while at < stop {
+        let target = at.max(ptr as usize) as *const AtomicU8;
+        // SAFETY: guaranteed by the caller; atomic OR of 0 leaves bytes unchanged while faulting
+        // writable host pages.
+        unsafe { (*target).fetch_or(0, Ordering::Relaxed) };
+        at += page;
+    }
+}
+
 /// Discards the contents of private anonymous host memory: whole pages go back to the host, and
 /// when host pages are larger than 4K the partial pages at both ends are zeroed. It used to zero
 /// everything, so the GCs of Go, the JVM and V8 touched every page they were giving back.
@@ -7730,6 +7960,31 @@ mod tests {
     use super::*;
 
     const RW: u32 = prot::READ | prot::WRITE;
+
+    fn mock_gpu(len: usize) -> Arc<dyn crate::gpu::Mapping> {
+        struct MockGpu {
+            base: NonNull<u8>,
+            len: usize,
+        }
+        unsafe impl Send for MockGpu {}
+        unsafe impl Sync for MockGpu {}
+        unsafe impl crate::gpu::Mapping for MockGpu {
+            fn base(&self) -> NonNull<u8> {
+                self.base
+            }
+            fn size(&self) -> usize {
+                self.len
+            }
+        }
+        impl Drop for MockGpu {
+            fn drop(&mut self) {
+                // SAFETY: allocated by appine_hal::map_anonymous below.
+                unsafe { appine_hal::unmap(self.base, self.len) };
+            }
+        }
+        let base = appine_hal::map_anonymous(len, false).unwrap();
+        Arc::new(MockGpu { base, len })
+    }
 
     #[test]
     fn code_groups_register_only_consistent_mappings() {
@@ -10079,7 +10334,7 @@ mod tests {
             .unwrap();
 
         // prefill_file_ptes fills only read-only non-FUSE file VMAs up to file_len.
-        mm.prefill_file_ptes(ro_file, map_len, false).unwrap();
+        mm.prefill_file_ptes(ro_file, map_len);
         assert!(mm.mmu().translate(ro_file, prot::READ).is_some());
         assert!(
             mm.mmu()
@@ -10091,13 +10346,12 @@ mod tests {
             ro_file + map_len
         );
 
-        mm.prefill_file_ptes(rw_file, 4 * LEAF_SPAN, false).unwrap();
+        mm.prefill_file_ptes(rw_file, 4 * LEAF_SPAN);
         assert_eq!(
             mm.mmu().next_present(rw_file, rw_file + 4 * LEAF_SPAN),
             rw_file + 4 * LEAF_SPAN
         );
-        mm.prefill_file_ptes(anon_untouched, 2 * LEAF_SPAN, false)
-            .unwrap();
+        mm.prefill_file_ptes(anon_untouched, 2 * LEAF_SPAN);
         assert_eq!(
             mm.mmu()
                 .next_present(anon_untouched, anon_untouched + 2 * LEAF_SPAN),
@@ -10288,27 +10542,6 @@ mod tests {
 
     #[test]
     fn shared_maps_published_before_ptes_and_rolled_back_on_failure() {
-        struct MockGpuMapping {
-            base: NonNull<u8>,
-            len: usize,
-        }
-        unsafe impl Send for MockGpuMapping {}
-        unsafe impl Sync for MockGpuMapping {}
-        unsafe impl crate::gpu::Mapping for MockGpuMapping {
-            fn base(&self) -> NonNull<u8> {
-                self.base
-            }
-            fn size(&self) -> usize {
-                self.len
-            }
-        }
-        impl Drop for MockGpuMapping {
-            fn drop(&mut self) {
-                // SAFETY: allocated by appine_hal::map_anonymous below.
-                unsafe { appine_hal::unmap(self.base, self.len) };
-            }
-        }
-
         let has_range = |mm: &Mm, addr: u64| {
             mm.shared_maps()
                 .read()
@@ -10351,13 +10584,14 @@ mod tests {
         assert!(has_range(&mm, shm_a));
 
         // 4. mmap_gpu publishes in shared_maps; deny_write removes it when non-writable.
-        let gpu_base = appine_hal::map_anonymous(PAGE_SIZE as usize, false).unwrap();
-        let gpu: Arc<dyn crate::gpu::Mapping> = Arc::new(MockGpuMapping {
-            base: gpu_base,
-            len: PAGE_SIZE as usize,
-        });
         let gpu_a = mm
-            .mmap_gpu(0, PAGE_SIZE, prot::READ, flags::MAP_SHARED, gpu)
+            .mmap_gpu(
+                0,
+                PAGE_SIZE,
+                prot::READ,
+                flags::MAP_SHARED,
+                mock_gpu(PAGE_SIZE as usize),
+            )
             .unwrap();
         assert!(has_range(&mm, gpu_a));
         mm.deny_write(gpu_a, PAGE_SIZE);
@@ -10428,7 +10662,7 @@ mod tests {
         mm.write(UserSlice::new(base, 4), b"AAAA").unwrap();
         mm.write(UserSlice::new(base + 2 * PAGE_SIZE, 4), b"BBBB")
             .unwrap();
-        let (rereads, res) = mm.discard_range(base, 3 * PAGE_SIZE);
+        let (rereads, res) = mm.discard_range(base, 3 * PAGE_SIZE, false);
         assert!(rereads.is_empty());
         assert_eq!(res, Err(Errno::ENOMEM));
         let mut b0 = [1u8; 4];
@@ -10444,7 +10678,7 @@ mod tests {
             .unwrap();
         mm.set_locked(base + 2 * PAGE_SIZE, PAGE_SIZE, true)
             .unwrap();
-        let (_, res) = mm.discard_range(base + PAGE_SIZE, 2 * PAGE_SIZE);
+        let (_, res) = mm.discard_range(base + PAGE_SIZE, 2 * PAGE_SIZE, false);
         assert_eq!(res, Err(Errno::EINVAL));
         mm.read(UserSlice::new(base + 2 * PAGE_SIZE, 4), &mut b2)
             .unwrap();
@@ -10627,5 +10861,368 @@ mod tests {
             mm.next_msync(fbase + 3 * PAGE_SIZE, fbase + 4 * PAGE_SIZE, true),
             MsyncStep::Unmapped
         ));
+    }
+
+    #[test]
+    fn madvise_dontneed_locked_and_lru_locked_checks() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let read4 = |mm: &Mm, addr: u64| {
+            let mut b = [1u8; 4];
+            mm.read(UserSlice::new(addr, 4), &mut b).unwrap();
+            b
+        };
+
+        let mut mm = Mm::new();
+        let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let base = 0x3600_0000;
+        // [p0: anon, p1: gap, p2: anon]
+        mm.mmap(base, 3 * PAGE_SIZE, RW, fixed, None).unwrap();
+        mm.munmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+        mm.write(UserSlice::new(base, 4), b"LOCK").unwrap();
+        mm.write(UserSlice::new(base + 2 * PAGE_SIZE, 4), b"DATA")
+            .unwrap();
+        mm.set_locked(base, PAGE_SIZE, true).unwrap();
+        mm.set_locked(base + 2 * PAGE_SIZE, PAGE_SIZE, true)
+            .unwrap();
+
+        // Locked anon refuses MADV_DONTNEED, MADV_FREE, and MADV_COLD/MADV_PAGEOUT (check_lru).
+        assert_eq!(
+            mm.discard_range(base, PAGE_SIZE, false).1,
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(mm.check_free(base, PAGE_SIZE), Err(Errno::EINVAL));
+        assert_eq!(mm.check_lru(base, PAGE_SIZE), Err(Errno::EINVAL));
+        // EINVAL on locked VMA overrides an earlier unmapped gap.
+        assert_eq!(
+            mm.check_free(base + PAGE_SIZE, 2 * PAGE_SIZE),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            mm.check_lru(base + PAGE_SIZE, 2 * PAGE_SIZE),
+            Err(Errno::EINVAL)
+        );
+
+        // MADV_DONTNEED_LOCKED across [locked p0, gap, locked p2]: zeroes both, returns ENOMEM,
+        // and keeps both VMAs locked.
+        let (rereads, res) = mm.discard_range(base, 3 * PAGE_SIZE, true);
+        assert!(rereads.is_empty());
+        assert_eq!(res, Err(Errno::ENOMEM));
+        assert_eq!(read4(&mm, base), [0; 4]);
+        assert_eq!(read4(&mm, base + 2 * PAGE_SIZE), [0; 4]);
+        assert!(mm.vmas[&base].locked);
+        assert!(mm.vmas[&(base + 2 * PAGE_SIZE)].locked);
+        // Subsequent MADV_DONTNEED still returns EINVAL because MADV_DONTNEED_LOCKED did not unlock.
+        assert_eq!(
+            mm.discard_range(base, PAGE_SIZE, false).1,
+            Err(Errno::EINVAL)
+        );
+
+        // Unlocked private anon passes check_free and check_lru, and MADV_DONTNEED_LOCKED works on
+        // unlocked ranges too.
+        mm.set_locked(base, PAGE_SIZE, false).unwrap();
+        mm.set_locked(base + 2 * PAGE_SIZE, PAGE_SIZE, false)
+            .unwrap();
+        assert_eq!(mm.check_free(base, PAGE_SIZE), Ok(()));
+        assert_eq!(mm.check_lru(base, PAGE_SIZE), Ok(()));
+        assert_eq!(mm.check_free(base, 3 * PAGE_SIZE), Err(Errno::ENOMEM));
+        assert_eq!(mm.check_lru(base, 3 * PAGE_SIZE), Err(Errno::ENOMEM));
+        mm.write(UserSlice::new(base, 4), b"UNLK").unwrap();
+        assert_eq!(mm.discard_range(base, PAGE_SIZE, true).1, Ok(()));
+        assert_eq!(read4(&mm, base), [0; 4]);
+
+        // MADV_DONTNEED_LOCKED on locked CoW anonymous memory settles CoW without corrupting peer.
+        let parent_rc = Mm::new().into_shared();
+        let cow_addr = {
+            let mut p = parent_rc.borrow_mut();
+            let a = p
+                .mmap(
+                    0,
+                    PAGE_SIZE,
+                    RW,
+                    flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                    None,
+                )
+                .unwrap();
+            p.write(UserSlice::new(a, 4), b"PEEK").unwrap();
+            a
+        };
+        let child_rc = parent_rc.borrow_mut().fork().unwrap();
+        {
+            let mut child = child_rc.borrow_mut();
+            child.set_locked(cow_addr, PAGE_SIZE, true).unwrap();
+            assert_eq!(
+                child.discard_range(cow_addr, PAGE_SIZE, false).1,
+                Err(Errno::EINVAL)
+            );
+            assert_eq!(child.discard_range(cow_addr, PAGE_SIZE, true).1, Ok(()));
+            assert!(child.vmas[&cow_addr].locked);
+            assert_eq!(read4(&child, cow_addr), [0; 4]);
+        }
+        assert_eq!(&read4(&parent_rc.borrow(), cow_addr), b"PEEK");
+
+        // Locked private file: MADV_DONTNEED_LOCKED reverts written data to file contents.
+        let mut f = appine_hal::memfd(c"mm-dontneed-locked-file").unwrap();
+        f.write_all(&[b'F'; PAGE_SIZE as usize]).unwrap();
+        let pf = mm
+            .mmap(
+                0,
+                PAGE_SIZE,
+                RW,
+                flags::MAP_PRIVATE,
+                Some((f.as_raw_fd(), 0, true)),
+            )
+            .unwrap();
+        mm.write(UserSlice::new(pf, 4), b"EDIT").unwrap();
+        mm.set_locked(pf, PAGE_SIZE, true).unwrap();
+        assert_eq!(mm.check_lru(pf, PAGE_SIZE), Err(Errno::EINVAL));
+        let (rereads, res) = mm.discard_range(pf, PAGE_SIZE, true);
+        assert_eq!(res, Ok(()));
+        for r in rereads {
+            mm.fill_private(r.addr, &vec![b'F'; r.len as usize]);
+        }
+        assert!(mm.vmas[&pf].locked);
+        assert_eq!(&read4(&mm, pf), b"FFFF");
+        mm.set_locked(pf, PAGE_SIZE, false).unwrap();
+        assert_eq!(mm.check_lru(pf, PAGE_SIZE), Ok(()));
+        assert_eq!(mm.check_free(pf, PAGE_SIZE), Err(Errno::EINVAL));
+
+        // GPU (VM_PFNMAP) mapping refuses DONTNEED, DONTNEED_LOCKED, FREE, and COLD/PAGEOUT.
+        let gpu_a = mm
+            .mmap_gpu(
+                0,
+                PAGE_SIZE,
+                RW,
+                flags::MAP_SHARED,
+                mock_gpu(PAGE_SIZE as usize),
+            )
+            .unwrap();
+        assert_eq!(
+            mm.discard_range(gpu_a, PAGE_SIZE, false).1,
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            mm.discard_range(gpu_a, PAGE_SIZE, true).1,
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(mm.check_free(gpu_a, PAGE_SIZE), Err(Errno::EINVAL));
+        assert_eq!(mm.check_lru(gpu_a, PAGE_SIZE), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn madvise_populate_read_and_write_semantics() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        fn run_populate(mm: &mut Mm, addr: u64, len: u64, write: bool) -> Result<(), Errno> {
+            let mut walk = PopulateWalk::new(addr, len);
+            loop {
+                match mm.populate_step(&mut walk, write)? {
+                    PopulateStep::Done => break,
+                    PopulateStep::Advise(range) => range.apply(libc::MADV_WILLNEED),
+                    PopulateStep::Fill(_, _) => panic!("unexpected FUSE fill in non-FUSE test"),
+                }
+            }
+            if walk.has_gap {
+                Err(Errno::ENOMEM)
+            } else {
+                Ok(())
+            }
+        }
+
+        let mut mm = Mm::new();
+        let priv_anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let fixed = priv_anon | flags::MAP_FIXED;
+
+        // Permission checks: EINVAL when VMA lacks PROT_READ (POPULATE_READ) or PROT_WRITE
+        // (POPULATE_WRITE).
+        for (prot, read_res, write_res) in [
+            (0, Err(Errno::EINVAL), Err(Errno::EINVAL)),
+            (prot::READ, Ok(()), Err(Errno::EINVAL)),
+            (prot::WRITE, Err(Errno::EINVAL), Ok(())),
+            (prot::EXEC, Err(Errno::EINVAL), Err(Errno::EINVAL)),
+        ] {
+            let a = mm.mmap(0, PAGE_SIZE, prot, priv_anon, None).unwrap();
+            assert_eq!(run_populate(&mut mm, a, PAGE_SIZE, false), read_res);
+            assert_eq!(run_populate(&mut mm, a, PAGE_SIZE, true), write_res);
+        }
+
+        // Large (> EAGER_MAX) anonymous mapping: POPULATE_READ installs PTEs and makes pages
+        // resident.
+        let big_ro = mm.mmap(0, 2 * LEAF_SPAN, RW, priv_anon, None).unwrap();
+        assert_eq!(
+            mm.mmu().next_present(big_ro, big_ro + 2 * LEAF_SPAN),
+            big_ro + 2 * LEAF_SPAN
+        );
+        run_populate(&mut mm, big_ro, 2 * PAGE_SIZE, false).unwrap();
+        assert!(mm.mmu().translate(big_ro, prot::READ).is_some());
+        assert!(mm.mmu().translate(big_ro + PAGE_SIZE, prot::READ).is_some());
+        assert_eq!(
+            mm.residency(big_ro, 2 * PAGE_SIZE).unwrap(),
+            vec![true, true]
+        );
+
+        // Fork + CoW: POPULATE_READ preserves CoW sharing; POPULATE_WRITE breaks CoW.
+        let parent_rc = Mm::new().into_shared();
+        let cow = {
+            let mut p = parent_rc.borrow_mut();
+            let a = p.mmap(0, 2 * PAGE_SIZE, RW, priv_anon, None).unwrap();
+            p.write(UserSlice::new(a, 4), b"ONE1").unwrap();
+            p.write(UserSlice::new(a + PAGE_SIZE, 4), b"TWO2").unwrap();
+            a
+        };
+        let child_rc = parent_rc.borrow_mut().fork().unwrap();
+        {
+            let mut child = child_rc.borrow_mut();
+            assert_eq!(child.cow_shared(cow, cow + 2 * PAGE_SIZE).0, 2);
+            run_populate(&mut child, cow, PAGE_SIZE, false).unwrap();
+            assert_eq!(child.cow_shared(cow, cow + 2 * PAGE_SIZE).0, 2);
+            run_populate(&mut child, cow + PAGE_SIZE, PAGE_SIZE, true).unwrap();
+            assert_eq!(child.cow_shared(cow, cow + PAGE_SIZE).0, 1);
+            assert_eq!(child.cow_shared(cow + PAGE_SIZE, cow + 2 * PAGE_SIZE).0, 0);
+            assert!(
+                child
+                    .mmu()
+                    .translate(cow + PAGE_SIZE, prot::WRITE)
+                    .is_some()
+            );
+            let mut buf = [0u8; 4];
+            child
+                .read(UserSlice::new(cow + PAGE_SIZE, 4), &mut buf)
+                .unwrap();
+            assert_eq!(&buf, b"TWO2");
+        }
+        drop(child_rc);
+        assert!(parent_rc.borrow().cow.borrow().lent.is_empty());
+
+        // Gaps: [rw p0, gap, rw p2] populates both and returns ENOMEM; [gap, PROT_NONE] -> EINVAL.
+        let gbase = 0x3700_0000;
+        mm.mmap(gbase, 3 * PAGE_SIZE, RW, fixed, None).unwrap();
+        mm.munmap(gbase + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(
+            run_populate(&mut mm, gbase, 3 * PAGE_SIZE, true),
+            Err(Errno::ENOMEM)
+        );
+        assert_eq!(mm.residency(gbase, PAGE_SIZE).unwrap(), vec![true]);
+        assert_eq!(
+            mm.residency(gbase + 2 * PAGE_SIZE, PAGE_SIZE).unwrap(),
+            vec![true]
+        );
+        mm.mprotect(gbase + 2 * PAGE_SIZE, PAGE_SIZE, 0).unwrap();
+        assert_eq!(
+            run_populate(&mut mm, gbase + PAGE_SIZE, 2 * PAGE_SIZE, false),
+            Err(Errno::EINVAL)
+        );
+
+        // File mappings: Advise step on large (>= 64 KB) file, EFAULT past EOF with partial
+        // population, EINVAL on PROT_NONE past EOF, and extent refresh after file growth.
+        let mut f = appine_hal::memfd(c"mm-populate-file").unwrap();
+        let file_bytes = 20 * PAGE_SIZE; // 80 KB >= ADVISE_MIN (64 KB)
+        f.write_all(&vec![b'P'; file_bytes as usize]).unwrap();
+        let fm = mm
+            .mmap(
+                0,
+                file_bytes + PAGE_SIZE,
+                RW,
+                flags::MAP_PRIVATE,
+                Some((f.as_raw_fd(), 0, true)),
+            )
+            .unwrap();
+        // First step on a >= 64 KB file requests unlocked MADV_WILLNEED readahead.
+        let mut walk = PopulateWalk::new(fm, file_bytes);
+        match mm.populate_step(&mut walk, false).unwrap() {
+            PopulateStep::Advise(range) => {
+                assert_eq!(walk.cursor, fm);
+                assert_eq!(walk.warmed_until, fm + file_bytes);
+                assert!(!walk.has_gap);
+                range.apply(libc::MADV_WILLNEED);
+                assert!(matches!(
+                    mm.populate_step(&mut walk, false).unwrap(),
+                    PopulateStep::Done
+                ));
+                assert!(!walk.has_gap);
+            }
+            _ => panic!("expected Advise step for >= 64 KB regular file"),
+        }
+        // Past EOF returns EFAULT.
+        assert_eq!(
+            run_populate(&mut mm, fm, file_bytes + PAGE_SIZE, false),
+            Err(Errno::EFAULT)
+        );
+        // PROT_NONE past EOF checks permissions first -> EINVAL.
+        let pnf = mm
+            .mmap(
+                0,
+                file_bytes + PAGE_SIZE,
+                0,
+                flags::MAP_PRIVATE,
+                Some((f.as_raw_fd(), 0, true)),
+            )
+            .unwrap();
+        assert_eq!(
+            run_populate(&mut mm, pnf + file_bytes, PAGE_SIZE, false),
+            Err(Errno::EINVAL)
+        );
+        // After extending the file, the previously past-EOF page populates cleanly.
+        f.set_len(file_bytes + PAGE_SIZE).unwrap();
+        assert_eq!(
+            run_populate(&mut mm, fm + file_bytes, PAGE_SIZE, true),
+            Ok(())
+        );
+
+        // Partial failure across VMAs: [rw p0, past-EOF file p1, rw p2] populates p0, returns
+        // EFAULT at p1, and leaves p2 unpopulated.
+        let small = appine_hal::memfd(c"mm-populate-eof").unwrap();
+        small.set_len(PAGE_SIZE).unwrap();
+        let pbase = 0x3800_0000;
+        mm.mmap(pbase, 3 * PAGE_SIZE, RW, fixed, None).unwrap();
+        mm.mmap(
+            pbase + PAGE_SIZE,
+            PAGE_SIZE,
+            RW,
+            flags::MAP_PRIVATE | flags::MAP_FIXED,
+            Some((small.as_raw_fd(), PAGE_SIZE, true)),
+        )
+        .unwrap();
+        assert_eq!(
+            run_populate(&mut mm, pbase, 3 * PAGE_SIZE, true),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(mm.residency(pbase, PAGE_SIZE).unwrap(), vec![true]);
+        assert_eq!(
+            mm.residency(pbase + 2 * PAGE_SIZE, PAGE_SIZE).unwrap(),
+            vec![false]
+        );
+
+        // FUSE Fill mapping: requests Fill for unread pages, installs PTEs once filled, and
+        // returns EFAULT past EOF.
+        let fuse_host = appine_hal::memfd(c"mm-populate-fuse").unwrap();
+        fuse_host.set_len(PAGE_SIZE).unwrap();
+        let source = crate::fd::OpenFile::new(crate::fd::FileKind::Host(-1), 0);
+        let fill = Fill::new(fuse_host, PAGE_SIZE, source);
+        let fa = mm
+            .mmap_fill(0, 2 * PAGE_SIZE, RW, flags::MAP_PRIVATE, (fill.clone(), 0))
+            .unwrap();
+        let mut fwalk = PopulateWalk::new(fa, 2 * PAGE_SIZE);
+        match mm.populate_step(&mut fwalk, true).unwrap() {
+            PopulateStep::Fill(_, page) => {
+                assert_eq!(fwalk.cursor, fa);
+                assert_eq!(page, 0);
+                assert!(!fwalk.has_gap);
+            }
+            _ => panic!("expected Fill step for unread FUSE page"),
+        }
+        fill.store((0, PAGE_SIZE), &vec![b'U'; PAGE_SIZE as usize], true)
+            .unwrap();
+        // Now page 0 succeeds and page 1 (past EOF) fails with EFAULT.
+        assert_eq!(
+            mm.populate_step(&mut fwalk, true).err(),
+            Some(Errno::EFAULT)
+        );
+        assert!(mm.mmu().translate(fa, prot::WRITE).is_some());
+        let mut fbuf = [0u8; 4];
+        mm.read(UserSlice::new(fa, 4), &mut fbuf).unwrap();
+        assert_eq!(&fbuf, b"UUUU");
     }
 }

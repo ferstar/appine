@@ -32,6 +32,21 @@
 #ifndef MADV_WIPEONFORK
 #define MADV_WIPEONFORK 18
 #endif
+#ifndef MADV_COLD
+#define MADV_COLD 20
+#endif
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+#ifndef MADV_DONTNEED_LOCKED
+#define MADV_DONTNEED_LOCKED 24
+#endif
 
 static void die(const char *msg, int line) {
     fprintf(stderr, "FAIL line %d: %s (errno=%d: %s)\n", line, msg, errno, strerror(errno));
@@ -39,6 +54,8 @@ static void die(const char *msg, int line) {
 }
 
 #define CHECK(cond) do { if (!(cond)) die(#cond, __LINE__); } while (0)
+#define CHECK_MADVISE_ERR(addr, len, advice, err) \
+    do { errno = 0; CHECK(madvise((addr), (len), (advice)) == -1 && errno == (err)); } while (0)
 
 static long sys_futex(uint32_t *uaddr, int op, uint32_t val) {
     return syscall(SYS_futex, uaddr, op, val, NULL, NULL, 0);
@@ -309,9 +326,151 @@ static void test_shared_futex_maps(size_t P) {
     CHECK(pthread_join(th, NULL) == 0);
 }
 
+static void test_madvise_populate_and_locked(size_t P) {
+    // 1. MADV_DONTNEED_LOCKED zeroes mlock'd anonymous memory while keeping it locked, while
+    //    MADV_DONTNEED, MADV_FREE, MADV_COLD, and MADV_PAGEOUT refuse locked ranges with EINVAL.
+    char *m = mmap(NULL, 3 * P, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(m != MAP_FAILED);
+    CHECK(munmap(m + P, P) == 0);
+    m[0] = 0x5a;
+    m[2 * P] = 0x3c;
+    CHECK(mlock(m, P) == 0);
+    CHECK(mlock(m + 2 * P, P) == 0);
+
+    CHECK_MADVISE_ERR(m, P, MADV_DONTNEED, EINVAL);
+    CHECK_MADVISE_ERR(m, P, MADV_FREE, EINVAL);
+    CHECK_MADVISE_ERR(m, P, MADV_COLD, EINVAL);
+    CHECK_MADVISE_ERR(m, P, MADV_PAGEOUT, EINVAL);
+    // EINVAL on locked VMA overrides earlier gap ENOMEM.
+    CHECK_MADVISE_ERR(m + P, 2 * P, MADV_FREE, EINVAL);
+    CHECK_MADVISE_ERR(m + P, 2 * P, MADV_COLD, EINVAL);
+    CHECK_MADVISE_ERR(m + P, 2 * P, MADV_PAGEOUT, EINVAL);
+
+    // MADV_DONTNEED_LOCKED across [locked p0, gap, locked p2]: zeroes both, returns ENOMEM, stays locked.
+    CHECK_MADVISE_ERR(m, 3 * P, MADV_DONTNEED_LOCKED, ENOMEM);
+    unsigned char v0 = 0xff, v2 = 0xff;
+    CHECK(mincore(m, P, &v0) == 0 && (v0 & 1) == 0);
+    CHECK(mincore(m + 2 * P, P, &v2) == 0 && (v2 & 1) == 0);
+    CHECK(m[0] == 0 && m[2 * P] == 0);
+    // Still locked: MADV_DONTNEED must still return EINVAL.
+    CHECK_MADVISE_ERR(m, P, MADV_DONTNEED, EINVAL);
+    CHECK(munlock(m, P) == 0 && munlock(m + 2 * P, P) == 0);
+
+    // Unlocked ranges succeed for MADV_FREE, MADV_COLD, MADV_PAGEOUT, and MADV_DONTNEED_LOCKED.
+    CHECK(madvise(m, P, MADV_FREE) == 0);
+    CHECK(madvise(m, P, MADV_COLD) == 0);
+    CHECK(madvise(m, P, MADV_PAGEOUT) == 0);
+    m[0] = 0x77;
+    CHECK(madvise(m, P, MADV_DONTNEED_LOCKED) == 0);
+    CHECK(m[0] == 0);
+    CHECK(munmap(m, P) == 0 && munmap(m + 2 * P, P) == 0);
+
+    // 2. MADV_DONTNEED_LOCKED on locked private file reverts written bytes to file contents.
+    int fd = memfd_create("mm_fixes_pop", 0);
+    CHECK(fd >= 0);
+    char *fbuf = malloc(P);
+    CHECK(fbuf != NULL);
+    memset(fbuf, 'A', P);
+    CHECK(write(fd, fbuf, P) == (ssize_t)P);
+    free(fbuf);
+
+    char *pf = mmap(NULL, 2 * P, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    CHECK(pf != MAP_FAILED);
+    pf[0] = 'Z';
+    CHECK(mlock(pf, P) == 0);
+    CHECK(madvise(pf, P, MADV_DONTNEED_LOCKED) == 0);
+    CHECK(pf[0] == 'A');
+    CHECK_MADVISE_ERR(pf, P, MADV_DONTNEED, EINVAL);
+    CHECK(munlock(pf, P) == 0);
+
+    // 3. MADV_POPULATE_READ and MADV_POPULATE_WRITE permission matrix (EINVAL).
+    static const struct { int prot; int read_ok; int write_ok; } perm_matrix[] = {
+        {PROT_NONE, 0, 0},
+        {PROT_READ, 1, 0},
+        {PROT_WRITE, 0, 1},
+        {PROT_EXEC, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof(perm_matrix) / sizeof(perm_matrix[0]); i++) {
+        char *p = mmap(NULL, P, perm_matrix[i].prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(p != MAP_FAILED);
+        if (perm_matrix[i].read_ok) {
+            CHECK(madvise(p, P, MADV_POPULATE_READ) == 0);
+        } else {
+            CHECK_MADVISE_ERR(p, P, MADV_POPULATE_READ, EINVAL);
+        }
+        if (perm_matrix[i].write_ok) {
+            CHECK(madvise(p, P, MADV_POPULATE_WRITE) == 0);
+        } else {
+            CHECK_MADVISE_ERR(p, P, MADV_POPULATE_WRITE, EINVAL);
+        }
+        if (perm_matrix[i].read_ok || perm_matrix[i].write_ok) {
+            unsigned char v = 0;
+            CHECK(mincore(p, P, &v) == 0 && (v & 1) == 1);
+        }
+        CHECK(munmap(p, P) == 0);
+    }
+
+    // 4. Past-EOF returns EFAULT (after populating in-EOF prefix); file growth fixes it.
+    CHECK_MADVISE_ERR(pf, 2 * P, MADV_POPULATE_READ, EFAULT);
+    CHECK_MADVISE_ERR(pf, 2 * P, MADV_POPULATE_WRITE, EFAULT);
+    CHECK(ftruncate(fd, (off_t)(2 * P)) == 0);
+    CHECK(madvise(pf, 2 * P, MADV_POPULATE_READ) == 0);
+    CHECK(madvise(pf, 2 * P, MADV_POPULATE_WRITE) == 0);
+    CHECK(munmap(pf, 2 * P) == 0);
+
+    // 5. Partial failure: [rw p0, past-EOF file p1, rw p2] populates p0, returns EFAULT, leaves p2 cold.
+    CHECK(ftruncate(fd, (off_t)P) == 0);
+    char *tri = mmap(NULL, 3 * P, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(tri != MAP_FAILED);
+    CHECK(mmap(tri + P, P, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, (off_t)P) == tri + P);
+    CHECK_MADVISE_ERR(tri, 3 * P, MADV_POPULATE_WRITE, EFAULT);
+    unsigned char tv[3] = {0, 0, 0};
+    CHECK(mincore(tri, 3 * P, tv) == 0);
+    CHECK((tv[0] & 1) == 1 && (tv[2] & 1) == 0);
+    // [gap, past-EOF]: EFAULT overrides ENOMEM.
+    CHECK(munmap(tri, P) == 0);
+    CHECK_MADVISE_ERR(tri, 2 * P, MADV_POPULATE_READ, EFAULT);
+    CHECK(munmap(tri + P, 2 * P) == 0);
+
+    // 6. Gaps: [rw p0, gap, rw p2] populates both and returns ENOMEM; [gap, PROT_NONE] -> EINVAL.
+    char *g = mmap(NULL, 3 * P, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(g != MAP_FAILED);
+    CHECK(munmap(g + P, P) == 0);
+    CHECK_MADVISE_ERR(g, 3 * P, MADV_POPULATE_WRITE, ENOMEM);
+    CHECK(mincore(g, P, &v0) == 0 && (v0 & 1) == 1);
+    CHECK(mincore(g + 2 * P, P, &v2) == 0 && (v2 & 1) == 1);
+    CHECK(mprotect(g + 2 * P, P, PROT_NONE) == 0);
+    CHECK_MADVISE_ERR(g + P, 2 * P, MADV_POPULATE_READ, EINVAL);
+    CHECK(munmap(g, P) == 0 && munmap(g + 2 * P, P) == 0);
+
+    // 7. Fork + CoW with MADV_POPULATE_READ / MADV_POPULATE_WRITE and MADV_DONTNEED_LOCKED.
+    char *cow = mmap(NULL, 2 * P, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(cow != MAP_FAILED);
+    cow[0] = 0x11;
+    cow[P] = 0x22;
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        if (madvise(cow, P, MADV_POPULATE_READ) != 0) _exit(10);
+        if (madvise(cow + P, P, MADV_POPULATE_WRITE) != 0) _exit(11);
+        if (cow[0] != 0x11 || cow[P] != 0x22) _exit(12);
+        if (mlock(cow, P) != 0) _exit(13);
+        if (madvise(cow, P, MADV_DONTNEED_LOCKED) != 0) _exit(14);
+        if (cow[0] != 0) _exit(15);
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(cow[0] == 0x11 && cow[P] == 0x22);
+    CHECK(munmap(cow, 2 * P) == 0);
+
+    close(fd);
+}
+
 int main(void) {
     size_t P = (size_t)sysconf(_SC_PAGESIZE);
     test_madvise_gaps(P);
+    test_madvise_populate_and_locked(P);
     test_mlock_and_mincore_gaps(P);
     test_msync_gaps(P);
     test_shared_futex_maps(P);

@@ -9,7 +9,7 @@ use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile};
 use crate::kernel::Cx;
-use crate::mm::{FileSource, MsyncStep, MsyncTarget, flags};
+use crate::mm::{FileSource, MsyncStep, MsyncTarget, PopulateStep, PopulateWalk, flags};
 use crate::process::RLIMIT_MEMLOCK;
 use crate::vfs::dev::Device;
 use crate::vfs::ms;
@@ -55,7 +55,11 @@ const MADV_DONTDUMP: i32 = 16;
 const MADV_DODUMP: i32 = 17;
 const MADV_WIPEONFORK: i32 = 18;
 const MADV_KEEPONFORK: i32 = 19;
+const MADV_COLD: i32 = 20;
+const MADV_PAGEOUT: i32 = 21;
 const MADV_POPULATE_READ: i32 = 22;
+const MADV_POPULATE_WRITE: i32 = 23;
+const MADV_DONTNEED_LOCKED: i32 = 24;
 const MCL_CURRENT: u32 = 1;
 const MCL_FUTURE: u32 = 2;
 const MCL_ONFAULT: u32 = 4;
@@ -511,14 +515,17 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
             }
             plan.result.map(|()| 0)
         }
-        // After DONTNEED anonymous memory must read back as 0, and private file mappings as the
-        // file.
-        MADV_DONTNEED => {
-            let (rereads, res) = cx.mm_mut().discard_range(addr, len);
+        // After DONTNEED / DONTNEED_LOCKED anonymous memory must read back as 0, and private file
+        // mappings as the file. DONTNEED_LOCKED also discards mlock'd ranges without unlocking.
+        MADV_DONTNEED | MADV_DONTNEED_LOCKED => {
+            let (rereads, res) =
+                cx.mm_mut()
+                    .discard_range(addr, len, advice == MADV_DONTNEED_LOCKED);
             reread(cx, rereads)?;
             res.map(|()| 0)
         }
         MADV_FREE => cx.mm().check_free(addr, len).map(|()| 0),
+        MADV_COLD | MADV_PAGEOUT => cx.mm().check_lru(addr, len).map(|()| 0),
         MADV_WIPEONFORK | MADV_KEEPONFORK => cx
             .mm_mut()
             .set_wipeonfork(addr, len, advice == MADV_WIPEONFORK)
@@ -532,45 +539,71 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
             .mm_mut()
             .set_dontdump(addr, len, advice == MADV_DONTDUMP)
             .map(|()| 0),
+        MADV_POPULATE_READ | MADV_POPULATE_WRITE => {
+            madvise_populate(cx, addr, len, advice == MADV_POPULATE_WRITE)
+        }
         // Forward readahead/access-pattern hints to the host outside the BKL so host readahead
         // never stalls other guest threads, and prefill soft PTEs for read-only file mappings.
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_POPULATE_READ => {
-            let prefill = matches!(advice, MADV_WILLNEED | MADV_POPULATE_READ);
-            let file_only = !prefill;
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED => {
+            let willneed = advice == MADV_WILLNEED;
             let (ranges, res) = {
                 let mm = cx.mm();
-                let prefill_res = if prefill {
-                    mm.prefill_file_ptes(addr, len, advice == MADV_POPULATE_READ)
-                } else {
-                    Ok(())
-                };
-                match prefill_res {
-                    Err(e) => (Vec::new(), Err(e)),
-                    Ok(()) => {
-                        let ranges = mm.advise_ranges(addr, len, file_only);
-                        let res = mm.check_mapped(addr, len);
-                        (ranges, res)
-                    }
+                if willneed {
+                    mm.prefill_file_ptes(addr, len);
                 }
+                let ranges = mm.advise_ranges(addr, len, !willneed);
+                let res = mm.check_mapped(addr, len);
+                (ranges, res)
             };
             if !ranges.is_empty() {
-                // Use MADV_WILLNEED on the host for MADV_POPULATE_READ so older host kernels
-                // (< 5.14) still perform readahead without failing with EINVAL or inflating RSS.
-                let host_advice = if advice == MADV_POPULATE_READ {
-                    MADV_WILLNEED
-                } else {
-                    advice
-                };
                 cx.unlocked(move || {
                     for range in ranges {
-                        range.apply(host_advice);
+                        range.apply(advice);
                     }
                 });
             }
             res.map(|()| 0)
         }
-        _ => cx.mm().check_mapped(addr, len).map(|()| 0),
+        _ => unreachable!("advice validated above"),
     }
+}
+
+/// Synchronous prefaulting (Linux 6.1's `madvise_populate`): validates permissions (`EINVAL`) and
+/// backing extents (`EFAULT`), faults host/tmpfs/FUSE pages, breaks CoW on write, and reports
+/// skipped unmapped gaps as `ENOMEM` at the end.
+fn madvise_populate(cx: &mut Cx<'_>, addr: u64, len: u64, write: bool) -> SysResult {
+    let mut walk = PopulateWalk::new(addr, len);
+    let mut retries = 0;
+    loop {
+        let prev = walk.cursor;
+        let step = cx.mm_mut().populate_step(&mut walk, write)?;
+        match step {
+            PopulateStep::Done => break,
+            PopulateStep::Advise(range) => {
+                retries = 0;
+                cx.unlocked(move || range.apply(MADV_WILLNEED));
+            }
+            PopulateStep::Fill(fill, page) => {
+                if walk.cursor > prev {
+                    retries = 0;
+                } else {
+                    retries += 1;
+                    if retries > super::FUSE_RETRIES {
+                        return Err(Errno::EFAULT);
+                    }
+                }
+                match super::fuse::fill(cx, (fill, page)) {
+                    Ok(()) => {}
+                    Err(Errno::EINTR) => return Err(Errno::EINTR),
+                    Err(_) => return Err(Errno::EFAULT),
+                }
+            }
+        }
+    }
+    if walk.has_gap {
+        return Err(Errno::ENOMEM);
+    }
+    Ok(0)
 }
 
 /// mlock, munlock, mlock2: records which mappings are locked (host memory is never swapped out

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `write_kernel` validates mapped contents across the full range before mutating, and ptrace PEEK/POKE fill cold FUSE pages)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: Linux 6.1 `madvise` semantics for `MADV_DONTNEED_LOCKED`, `MADV_POPULATE_READ`/`WRITE`, and locked/special-VMA checks for `MADV_DONTNEED`/`FREE`/`COLD`/`PAGEOUT`)
 
 ## Responsibilities
 
@@ -51,8 +51,10 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `[vvar]`, whose host memory is shared with forked children).
 - `flags` — guest ABI values of the `MAP_*` flags the mm interprets.
 - `Refill` (private-file piece remapped at old address after `MREMAP_DONTUNMAP`), `Reread` (written
-  private-file piece reread after `MADV_DONTNEED`), and `AdviseRange` (host-page-aligned slice of a
-  retained `Arc<HostRegion>` for unlocked non-destructive `madvise`).
+  private-file piece reread after `MADV_DONTNEED`/`MADV_DONTNEED_LOCKED`), `AdviseRange`
+  (host-page-aligned slice of a retained `Arc<HostRegion>` for unlocked non-destructive `madvise`),
+  and `PopulateWalk`/`PopulateStep` (resumable state and unlocked `MADV_WILLNEED`/FUSE `Fill`
+  yields for `MADV_POPULATE_READ`/`MADV_POPULATE_WRITE`).
 - `WANTED` (thread-local) — the page of a `Fill` a kernel access found not read, for the dispatcher
   or a local result copy to service (`take_wanted`).
 - `UserSlice` — an unchecked guest range passed to kernel-side accessors.
@@ -303,24 +305,34 @@ signals may still be delivered).
   VMAs locked, uncharged.
 - `madvise`: alignment/length/unknown advice (counted as unimplemented) `EINVAL`; length 0 succeeds.
   Walks mapped VMAs in order like Linux 6.1's `do_madvise`: unmapped gaps are skipped and reported
-  as `ENOMEM` at the end, while per-VMA errors (`EINVAL` on locked VMAs for `MADV_DONTNEED`,
-  `EINVAL` on non-private-anon VMAs for `MADV_FREE`/`MADV_WIPEONFORK`, `EINVAL`/`EACCES` for
-  `MADV_REMOVE`, or split `ENOMEM`) stop immediately (taking precedence over earlier gaps) while
-  leaving earlier mapped portions applied. Flag advice (`DONTDUMP`/`DODUMP`, `WIPEONFORK`/
-  `KEEPONFORK`, `DONTFORK`/`DOFORK`) splits each mapped VMA at slice ends and sets the flag.
-  Non-destructive hints (`NORMAL`/`RANDOM`/`SEQUENTIAL`/`WILLNEED`/`POPULATE_READ`) prefill RO
-  non-FUSE file soft PTEs up to 4 GB/call and forward to `appine_hal::advise` unlocked via
-  coalesced `AdviseRange`s clipped to `file_len` (skipping reserved/foreign/GPU/`Fill` VMAs;
-  `NORMAL`/`RANDOM`/`SEQUENTIAL` file-backed only; `WILLNEED`/`POPULATE_READ` skip untouched anon
-  and pass `MADV_WILLNEED`) before reporting any gap as `ENOMEM`. Other unlisted advice returns 0
-  if fully mapped (`ENOMEM` on gaps).
-- `MADV_DONTNEED` (`discard_range` / `discard`): private anon returns to host and zeroes (CoW
-  settled via `kernel/cow`); written private file pages before EOF unshare first if marked `cow`
-  (so reverting never corrupts a fork peer), then revert via `kernel/hostmem`'s `discard_file_host`
-  (whole host pages) and `Reread`s read from the store (`fill_private`, zeros past EOF or open
-  failure; `Fill` partial host pages reread from its memfd so entries stay). Executable ranges
-  queue code invalidation; shared/unwritten VMAs untouched; vDSO refills from kernel image (with
-  svc stubs when `vdso_svc`).
+  as `ENOMEM` at the end, while per-VMA errors (`EINVAL` on locked/foreign/GPU VMAs for
+  `MADV_DONTNEED`/`FREE`/`COLD`/`PAGEOUT`, foreign/GPU for `MADV_DONTNEED_LOCKED`, non-private-anon
+  or `[vdso]` for `MADV_FREE`, non-private-anon for `MADV_WIPEONFORK`, `EINVAL`/`EACCES` for
+  `MADV_REMOVE`, `EINVAL`/`EFAULT` for `MADV_POPULATE_READ`/`WRITE`, or split `ENOMEM`) stop
+  immediately (overriding earlier gaps) while leaving earlier mapped portions applied. Flag advice
+  (`DONTDUMP`/`DODUMP`, `WIPEONFORK`/`KEEPONFORK`, `DONTFORK`/`DOFORK`) splits each mapped VMA at
+  slice ends and sets the flag. `MADV_COLD`/`MADV_PAGEOUT` (`check_lru`) and `MADV_FREE`
+  (`check_free`) validate every mapped VMA in range via `check_vmas`. Non-destructive hints
+  (`NORMAL`/`RANDOM`/`SEQUENTIAL`/`WILLNEED`) prefill RO non-FUSE file soft PTEs up to 4 GB/call
+  for `WILLNEED` (`prefill_file_ptes`) and forward to `appine_hal::advise` unlocked via coalesced
+  `AdviseRange`s clipped to `file_len` (skipping reserved/foreign/GPU/`Fill` VMAs;
+  `NORMAL`/`RANDOM`/`SEQUENTIAL` file-backed only; `WILLNEED` skips untouched anon) before
+  reporting any gap as `ENOMEM`.
+- `MADV_POPULATE_READ` / `MADV_POPULATE_WRITE` (`madvise_populate` → `populate_step`): check guest
+  `PROT_READ`/`PROT_WRITE` and refuse `[vvar]`/GPU (`EINVAL`), refresh stale file extents, fault
+  tmpfs (charging quota and updating shared write times) and software-tracked private files, read
+  missing FUSE `Fill` pages unlocked (`EINTR` on signal, `EFAULT` on read error or past EOF), warm
+  regular file slices ≥ 64 KB with unlocked `MADV_WILLNEED`, preserve CoW on `POPULATE_READ` while
+  settling CoW and atomically write-faulting (`populate_write_host`) on `POPULATE_WRITE`, install
+  missing soft PTEs, and stop with `EFAULT` at the first page past EOF.
+- `MADV_DONTNEED` / `MADV_DONTNEED_LOCKED` (`discard_range`): `MADV_DONTNEED_LOCKED` allows
+  `mlock`'d VMAs without unlocking them; both refuse foreign (`[vvar]`) and GPU VMAs (`EINVAL`).
+  Private anon returns to host and zeroes (CoW settled via `kernel/cow`); written private file
+  pages before EOF unshare first if marked `cow` (so reverting never corrupts a fork peer), then
+  revert via `kernel/hostmem`'s `discard_file_host` (whole host pages) and `Reread`s read from the
+  store (`fill_private`, zeros past EOF or open failure; `Fill` partial host pages reread from its
+  memfd so entries stay). Executable ranges queue code invalidation; shared/unwritten VMAs
+  untouched; vDSO refills from kernel image (with svc stubs when `vdso_svc`).
 - `MADV_REMOVE` (`remove`): per-VMA check (`EINVAL` on locked, private anon or GPU; `EACCES` on
   other private or never-writable, 6.7); shared host ranges use `remove_host`, tmpfs and FUSE
   ranges punch holes through tmpfs / the daemon. Neither path requests code invalidation.
@@ -439,9 +451,6 @@ signals may still be delivered).
   A handler that has already consumed input can repeat its effects on a whole-syscall retry
   or return a short count. The dispatcher prefaults read/write, positional
   and vectored I/O buffers. Socket receives, wait4/waitid, msgrcv, mq_timedreceive and rt_sigtimedwait retry their result copies locally.
-- **Approximate madvise:** `MADV_DONTNEED_LOCKED`/`MADV_POPULATE_WRITE` are no-ops;
-  `MADV_POPULATE_READ` runs advisory host readahead + RO file soft-PTE prefill without faulting or
-  failing on inaccessible ranges; `MADV_FREE`/`COLD`/`PAGEOUT` are not refused on locked ranges.
 - **Approximate Linux VMA boundaries:** anonymous pieces join ignoring page offsets (mremap-moved
   VMAs join new neighbours); `MREMAP_DONTUNMAP` of a multi-piece VMA needs one VMA slot per piece,
   and in-place growth adds a VMA.
