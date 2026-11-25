@@ -397,7 +397,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 - **Inotify on synthetic files is partial:** synthetic files outside cgroup2's four notifying files
   report no inotify events (opens, reads, writes).
-- **Fidelity gaps:** PTY master fstat reports fixed metadata across devpts instances. Procfs ignores mount options and omits many standard files.
+- **Fidelity gaps:** Procfs ignores mount options and omits many standard files.
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
   and symbol lookups (perf, bpftrace) find nothing.
