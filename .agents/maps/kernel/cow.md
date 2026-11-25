@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification of first-write anonymous identity, lending, fork inheritance and sticky commit charges)
+> Maintained: 2026-11-26 (targeted verification of fork rollback, CoW fault and mprotect permissions, and loan retention on page-table allocation failure)
 
 ## Responsibilities
 
@@ -62,8 +62,7 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 - The caller quiesces the parent (`kernel/mmu`), then `fork` checks commit unless
   `vm.overcommit_memory` is 1 (`commit_too_big`: counts `accounted` mappings the child inherits,
   combining adjacent pieces using `same_vma`, including their page offsets and fork identity; `ENOMEM` when one exceeds RAM plus swap; a limit of 0 disables it; mode 2's
-  strict accounting is not emulated). `fork` cannot fail after lending starts; the parent's TLB
-  flush waits for its `sync`.
+  strict accounting is not emulated). After a successful fork the parent's TLB flush waits for its `sync`.
 - The child keeps the parent's membarrier registrations (Linux copies `membarrier_state`) and
   `memops`; execve starts a fresh `Mm` without them.
 - Private writable mmap or mprotect sets `accounted` unless the mapping has `MAP_NORESERVE`.
@@ -104,20 +103,32 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   (`touched_windows`, merged up to 1 GB); untouched pages are known zero and the child keeps its
   own. If pagemap is unreadable, every page in the windows is lent. Pages the parent itself
   borrowed are re-lent from their owner. Parent and child get read-only entries for the lent pages
-  (none for `PROT_NONE` VMAs; a later mprotect rebuilds them).
+  (fork skips PTE installation for `PROT_NONE` VMAs). Fork maps all child runs first, then
+  downgrades newly lent parent runs. On allocation failure it restores the attempted parent runs,
+  including a partially mapped run. The lending plan pins the borrowed host regions until the
+  unpublished child drops.
 - Borrower write (`cow_break`): only for a writable private anonymous VMA whose page is borrowed
   or lent. A borrowed page is copied into the VMA's own slot (`materialize`), re-mapped with the
   VMA prot, the borrower's threads are shot down (`kernel/mmu`), and the loan is returned.
+  A failed remap leaves the borrowed record, host region and loan in place.
 - Owner write, munmap, mremap move or `MADV_DONTNEED` of a lent page (`recall`): every borrower
   copies first (interrupting its guest threads), then the owner gets write permission back
-  (`repossess`).
+  (`repossess`). If a borrower cannot remap its copy, recall retains the failed borrowers in the
+  loan and the owner stays read-only. Range operations propagate the error before using that page.
 - Borrower munmap (`cow_unmap`/`give_back`) returns borrowed pages without copying; borrower
   mremap and `MADV_DONTNEED` copy first (`cow_settle`).
 - When the last borrower returns a page (`return_loans`), the owner's entries are restored at once
-  (`repossess`), in runs that never cross VMAs, without a flush.
-- mprotect over CoW pages (`cow_pages`, `cow_entries`, `write_around`) never gives a CoW page
-  write permission or a borrowed page an entry at the borrower's own host page, not even between
-  steps (see `kernel/mm`'s mprotect), since other threads may run guest code meanwhile.
+  (`repossess`), in runs that never cross VMAs, without a flush. If demotion fails, the next write
+  fault can retry. An owner write fault counts as handled only when the page translates writable.
+- Before mprotect grants access, `cow_entries` installs CoW pages at their owners' host addresses
+  with the old non-writable permissions (zero when leaving `PROT_NONE`). An allocation failure
+  leaves the VMA permissions intact. The range then gets its new non-writable permissions before
+  `write_around` grants writes to the intervening pages. Eager fill preserves existing entries.
+- `try_fault_in` restores a missing CoW entry on read or execute at the owner's host address.
+  Writes require a CoW break. Anonymous leaf-window fills and read-population skip CoW slots
+  when filling PTEs. Read-population touches borrowed contents in the owner’s host memory.
+- `Mm::release` returns borrowed pages only after redirecting their entries and flushing stale
+  translations. A failed remap retains the loan for a later release or address-space destruction.
 - Futex keys of private memory are the address space's id and the address, so computing a key does
   not copy a borrowed page (writing the word, as PI locks, robust lists and `FUTEX_WAKE_OP` do,
   breaks CoW); see `kernel/futex` and `kernel/mm`.
@@ -166,19 +177,16 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 - CoW never mutably borrows two address spaces at once: borrower-side loan returns run inside the
   borrower's own operation or drop, and owner-side `recall` only takes shared borrows of
   borrowers. `return_loans` therefore borrows the owner directly (`owner.borrow().repossess`) so a
-  violation fails loudly instead of silently leaking a loan-less lent entry, and `lend`
+  violation fails loudly instead of silently leaking a loan-less lent entry, and fork
   debug-asserts that any re-lent page still has a live loan entry.
 - Host `mincore` reports pages swapped to zram as absent, which is why `fork`'s touched-page check
   reads `/proc/self/pagemap` instead.
-- `fork` cannot return an error after lending starts. It prepares the child's host backing
-  (`carve`, `spare::anonymous`, `new_anonymous`, `copy_private_file`) and calls `child.insert_vma`
-  before `lend`.
+- Fork publishes the loan table, both CoW sets and the parent's flush requirement only after all
+  lending runs succeed. Rollback covers newly lent pages exclusively, so earlier loans stay read-only.
 
 ## Confirmed bugs / technical debt
 
-- `lend` and `cow_entries` discard errors from `map_shared`. If the host cannot allocate a
-  page table, an accessible borrowed page can lack its read-only entry. A later fault that
-  fills the missing range from the borrower's backing can then expose the wrong page.
+- None.
 
 ## Open questions
 

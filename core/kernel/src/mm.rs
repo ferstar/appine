@@ -2059,6 +2059,24 @@ impl Mm {
             };
             return Ok(result.is_ok());
         }
+        if v.backing == Backing::Anonymous {
+            let cow = self.cow.borrow();
+            let host = if let Some(b) = cow.borrowed.get(&page) {
+                Some(b.host)
+            } else {
+                cow.lent.contains(&page).then(|| Self::own_page(s, v, page))
+            };
+            if let Some(host) = host {
+                if need & prot::WRITE != 0 || present {
+                    return Ok(false);
+                }
+                // SAFETY: the VMA or borrowed record retains this page.
+                return Ok(unsafe {
+                    cow_map_shared(&self.mmu, page, host, PAGE_SIZE, Self::read_only(v))
+                }
+                .is_ok());
+            }
+        }
         if v.backing == Backing::Anonymous && need & prot::WRITE != 0 {
             if present && self.mmu.translate(page, need).is_some() {
                 return Ok(false);
@@ -2069,11 +2087,6 @@ impl Mm {
                     return Ok(true);
                 }
                 // A partial superpage demotion may have failed during the first upgrade.
-                // Mm::translate also comes here without breaking CoW.
-                let cow = self.cow.borrow();
-                if cow.lent.contains(&page) || cow.borrowed.contains_key(&page) {
-                    return Ok(false);
-                }
                 return Ok(self.mmu.protect_shared(page, PAGE_SIZE, p).is_ok());
             }
         }
@@ -2087,6 +2100,9 @@ impl Mm {
         };
         let lo = (page & !(span - 1)).max(s);
         let hi = ((page | (span - 1)) + 1).min(end);
+        if v.backing == Backing::Anonymous {
+            return Ok(self.fill_anon_non_cow(s, v, lo, hi).is_ok());
+        }
         let Some(fill) = &v.fill else {
             // SAFETY: [lo, hi) is inside the part of this VMA with contents, and it holds the host
             // memory
@@ -2601,7 +2617,7 @@ impl Mm {
                 .ok_or(Errno::EFAULT)?;
             check = s + v.contents_len();
         }
-        self.cow_settle(addr & !(PAGE_SIZE - 1), end);
+        self.cow_settle(addr & !(PAGE_SIZE - 1), end)?;
         let first = self
             .vmas
             .range(..=addr)
@@ -3617,7 +3633,7 @@ impl Mm {
     /// Moves the mappings in `[old, old + len)` to `dst` as they are (the host memory stays put).
     fn move_range(&mut self, old: u64, len: u64, dst: u64) -> Result<(), Errno> {
         // Copy-on-write pages are recorded by guest address: each side copies before the move
-        self.cow_settle(old, old + len);
+        self.cow_settle(old, old + len)?;
         self.split_at(old);
         self.split_at(old + len);
         let starts: Vec<u64> = self.vmas.range(old..old + len).map(|(&s, _)| s).collect();
@@ -4082,18 +4098,8 @@ impl Mm {
             }
         }
         for (&s, v) in self.vmas.range_mut(addr..end) {
-            // A permission change on an old or new executable range invalidates translations.
-            if (v.prot | prot) & prot::EXEC != 0 && v.prot != prot {
-                self.code_ranges.push((s, v.len));
-                self.exec_changed = true;
-            }
-            // When permissions are only added, stale TLB entries merely lack permissions and are
-            // refilled on a miss, so no flush is needed
             let (old, new) = (mmu_prot(v.prot), mmu_prot(prot));
-            self.dirty |= old & !new != 0;
-            v.accounted |= prot & prot::WRITE != 0 && v.backing != Backing::Shared && !v.noreserve;
             if v.pages.is_some() {
-                v.prot = prot;
                 if old != new {
                     self.mmu.unmap(s, v.len).map_err(map_err)?;
                     self.dirty = true;
@@ -4102,55 +4108,56 @@ impl Mm {
                         s,
                         v.host,
                         v.eager_len(),
-                        v.prefill_prot(),
+                        new & !prot::WRITE,
                         true,
                     );
                 }
-                if new & prot::WRITE != 0 {
-                    v.written.set(true);
+            } else if old != 0 || new != 0 {
+                let cow = self.cow.borrow();
+                let pages = if v.backing == Backing::Anonymous {
+                    Self::cow_pages(&cow, s, s + v.len)
+                } else {
+                    Vec::new()
+                };
+                // Establish the correct backing under the old permissions before exposing any
+                // new permission, including when fork left a PROT_NONE borrower without a PTE.
+                if new != 0 {
+                    Self::cow_entries(&self.mmu, &cow, s, v, &pages, old & !prot::WRITE)?;
                 }
-                continue;
+                let effective = if v.backing == Backing::Anonymous && !v.written.get() {
+                    new & !prot::WRITE
+                } else {
+                    new
+                };
+                if let Err(e) =
+                    Self::protect_entries(&mut self.mmu, s, v, &pages, effective, old == 0)
+                {
+                    // A partial superpage demotion can fail after earlier leaves changed. Restore
+                    // their permissions and invalidate translations gained during the attempt.
+                    let old_eff = v.prefill_prot();
+                    let base = if pages.is_empty() {
+                        old_eff
+                    } else {
+                        old & !prot::WRITE
+                    };
+                    let _ = self.mmu.protect(s, v.len, base);
+                    if old_eff != base {
+                        let _ = Self::write_around(&mut self.mmu, s, v.len, &pages, old_eff);
+                    }
+                    self.dirty |= effective & !base != 0;
+                    if (old | effective) & prot::EXEC != 0 && old != effective {
+                        self.code_ranges.push((s, v.len));
+                        self.exec_changed = true;
+                    }
+                    return Err(e);
+                }
             }
-            // Fork's copy-on-write pages never get write permission, and borrowed ones keep
-            // pointing at the owner's host pages. Other threads may run guest code meanwhile (a
-            // shootdown does not hold back one entering guest code after it), so no entry may be
-            // writable or point elsewhere even for a moment: the VMA first gets the new
-            // permissions without write, then the copy-on-write pages their entries, and only
-            // then the other pages write permission
-            let cow = self.cow.borrow();
-            let cow_pages = match v.backing {
-                Backing::Anonymous => Self::cow_pages(&cow, s, s + v.len),
-                _ => Vec::new(),
-            };
-            let new = if v.backing == Backing::Anonymous && !v.written.get() {
-                new & !prot::WRITE
-            } else {
-                new
-            };
-            let first = match cow_pages.is_empty() {
-                true => new,
-                false => new & !prot::WRITE,
-            };
-            // Change the permissions of existing entries; when all permissions are removed the
-            // entries stay with permissions cleared (the host page may have contents, and fork's
-            // lending and resident-memory measurement find pages by entry, see
-            // [`Mm::touched_windows`]). A new PROT_NONE mapping has no entries
-            // ([`Mm::map_pages`]), so they are added when it goes from no permissions to some
-            // (file mappings only up to the end of the file, and large ones on demand at access)
-            self.mmu.protect(s, v.len, first).map_err(map_err)?;
-            if first != 0 {
-                Self::cow_entries(&self.mmu, &cow, s, v, &cow_pages, first);
+            if (v.prot | prot) & prot::EXEC != 0 && v.prot != prot {
+                self.code_ranges.push((s, v.len));
+                self.exec_changed = true;
             }
-            if old == 0 && new != 0 {
-                // Fills only pages without entries, so copy-on-write and pre-existing prot-0 pages
-                // keep theirs; a host allocation failure must not unmap existing entries.
-                let file = v.backing != Backing::Anonymous;
-                Self::prefill_pages(&mut self.mmu, s, v.host, v.eager_len(), new, file);
-            }
-            if first != new {
-                Self::write_around(&mut self.mmu, s, v.len, &cow_pages, new)?;
-            }
-            drop(cow);
+            self.dirty |= old & !new != 0;
+            v.accounted |= prot & prot::WRITE != 0 && v.backing != Backing::Shared && !v.noreserve;
             v.prot = prot;
             if v.backing != Backing::Anonymous && prot & prot::WRITE != 0 {
                 v.written.set(true);
@@ -4160,6 +4167,38 @@ impl Mm {
             self.join_anon_vmas_at(s);
         }
         self.join_anon_vmas_at(end);
+        Ok(())
+    }
+
+    /// Change existing PTEs first. After leaving PROT_NONE, eager fill can populate holes
+    /// because every CoW page already has its owner-backed entry, even if inaccessible.
+    fn protect_entries(
+        mmu: &mut Mmu,
+        s: u64,
+        v: &Vma,
+        cow_pages: &[u64],
+        new: u32,
+        prefill: bool,
+    ) -> Result<(), Errno> {
+        let first = if cow_pages.is_empty() {
+            new
+        } else {
+            new & !prot::WRITE
+        };
+        mmu.protect(s, v.len, first).map_err(map_err)?;
+        if prefill && new != 0 {
+            Self::prefill_pages(
+                mmu,
+                s,
+                v.host,
+                v.eager_len(),
+                new,
+                v.backing != Backing::Anonymous,
+            );
+        }
+        if first != new {
+            Self::write_around(mmu, s, v.len, cow_pages, new)?;
+        }
         Ok(())
     }
 
@@ -4534,18 +4573,12 @@ impl Mm {
             // Fault host pages and install missing soft page-table entries.
             let cursor = walk.cursor;
             if v.backing == Backing::Anonymous && write {
-                self.cow_settle(cursor, in_eof);
+                self.cow_settle(cursor, in_eof)?;
                 self.prepare_anon_write(s, v)?;
             }
-            // SAFETY: `[cursor, in_eof)` lies within `[s, s + v.file_len)` and holds host memory.
-            let host = unsafe { v.host.add((cursor - s) as usize) };
-            unsafe {
-                self.mmu
-                    .fill_shared(cursor, host, in_eof - cursor, v.prefill_prot())
-            }
-            .map_err(|_| Errno::ENOMEM)?;
-
             if v.backing == Backing::Anonymous && !write {
+                self.fill_anon_non_cow(s, v, cursor, in_eof)
+                    .map_err(map_err)?;
                 // Read-populate without breaking CoW or setting `v.written`: touch borrowed pages
                 // via the owner's host memory and non-borrowed runs via our own.
                 let cow = self.cow.borrow();
@@ -4566,6 +4599,13 @@ impl Mm {
                     unsafe { v.populate_host((cur - s) as usize, (in_eof - cur) as usize, false) };
                 }
             } else {
+                // SAFETY: `[cursor, in_eof)` lies within `[s, s + v.file_len)` and holds host memory.
+                let host = unsafe { v.host.add((cursor - s) as usize) };
+                unsafe {
+                    self.mmu
+                        .fill_shared(cursor, host, in_eof - cursor, v.prefill_prot())
+                }
+                .map_err(|_| Errno::ENOMEM)?;
                 // SAFETY: `[cursor, in_eof)` lies within `[s, s + v.file_len)` and is backed by
                 // live host memory (writable on the host whenever `write` is true: anonymous CoW
                 // was just settled, writable private files are never `v.cow`, and writable shared
@@ -4632,7 +4672,9 @@ impl Mm {
                 }
                 // Borrowers still need lent pages, and borrowed pages are replaced by our own
                 // (reading zero afterwards)
-                self.cow_settle(cursor, stop);
+                if let Err(e) = self.cow_settle(cursor, stop) {
+                    return (rereads, Err(e));
+                }
                 // SAFETY: [cursor, stop) is inside this VMA, and its host memory is the VMA's
                 // private anonymous memory
                 unsafe { discard_host(host.add((cursor - s) as usize), (stop - cursor) as usize) };
@@ -4786,45 +4828,34 @@ impl Mm {
     /// goes back to the host now, as Linux's `__oom_reap_task_mm` unmaps the pages of every VMA
     /// that is anonymous or not shared, while the VMAs (and `/proc/<pid>/maps`) stay as they are.
     /// Written private anonymous memory reads zero afterwards; borrowed pages are returned without
-    /// copying, their entries pointing at the VMA's own (zero) page; lent pages stay for their
-    /// borrowers; the written pages of a private file mapping go back to the file (whole host
-    /// pages of a host file mapping, the rest kept) or, copied into anonymous memory, to zeros.
+    /// copying once their entries point at the VMA's own page. A failed remap keeps the loan.
+    /// Lent pages stay for their borrowers. Written private file mappings revert to the file
+    /// on whole host pages, or to zeros if copied into anonymous memory.
     /// On Linux a later fault anywhere in a reaped address space is `SIGBUS` (`MMF_UNSTABLE`), so
     /// what the dying threads would see is never relied on. Executable and `PROT_NONE`-reserved
     /// mappings are left alone: the former's translations would have to be invalidated (the vDSO
     /// among them), the latter hold nothing.
     pub fn release(&mut self) {
         let kept = |v: &Vma| v.prot & prot::EXEC != 0 || v.reserved();
-        let pages: Vec<u64> = self
+        let remapped: Vec<u64> = self
             .cow
             .borrow()
             .borrowed
             .keys()
-            .copied()
-            .filter(|&p| self.anon_vma(p).is_some_and(|(_, v)| !kept(v)))
+            .filter_map(|&page| {
+                let (s, v) = self.anon_vma(page).filter(|(_, v)| !kept(v))?;
+                let own = Self::own_page(s, v, page);
+                // SAFETY: the VMA retains its own page, which will be discarded below.
+                unsafe { cow_map_shared(&self.mmu, page, own, PAGE_SIZE, mmu_prot(v.prot)) }
+                    .ok()?;
+                Some(page)
+            })
             .collect();
-        let returned: Vec<(u64, Borrowed)> = {
-            let mut c = self.cow.borrow_mut();
-            pages
-                .into_iter()
-                .filter_map(|p| Some((p, c.borrowed.remove(&p)?)))
-                .collect()
-        };
-        for &(page, _) in &returned {
-            if let Some((s, v)) = self.anon_vma(page) {
-                // As in materialize, but without the copy: the page reads zero once discarded
-                // below
-                // SAFETY: the host page belongs to this VMA
-                let _ = unsafe {
-                    self.mmu.map_shared(
-                        page,
-                        Self::own_page(s, v, page),
-                        PAGE_SIZE,
-                        mmu_prot(v.prot),
-                    )
-                };
-            }
-        }
+        let borrowed = &mut self.cow.get_mut().borrowed;
+        let returned = remapped
+            .into_iter()
+            .filter_map(|page| borrowed.remove_entry(&page))
+            .collect();
         // Threads still running guest code flush before the owners get their pages back
         self.give_back(returned);
         let lent = self.cow.borrow().lent.clone();
@@ -5126,7 +5157,7 @@ impl Mm {
                 // Writable private anonymous memory: Linux 6.1's populate_vma_page_range faults
                 // with FOLL_WRITE, breaking CoW and allocating private host pages (not the zero
                 // page) so RSS reflects the populated pages without double-counting borrowed pages.
-                self.cow_settle(lo, hi);
+                self.cow_settle(lo, hi)?;
                 self.prepare_anon_write(s, v)?;
             }
             // Install entries before write-populating any host pages. Existing CoW entries
@@ -5236,7 +5267,7 @@ impl Mm {
         }
         self.split_at(addr);
         self.split_at(end);
-        let borrowed = self.cow_unmap(addr, end);
+        let borrowed = self.cow_unmap(addr, end)?;
         // The page table unmaps page by page, so only VMAs that actually exist are handled: a guest
         // passing a length that covers the whole address space is still fast
         let doomed: Vec<(u64, u64)> = self
@@ -5364,6 +5395,8 @@ impl Mm {
         {
             return Err(Errno::ENOMEM);
         }
+        // On failure the unpublished child drops before the regions backing its borrowed PTEs.
+        let mut plan = LendingPlan::default();
         let shared = Mm::new().into_shared();
         let mut child = shared.borrow_mut();
         child.loans = self.loans.clone();
@@ -5507,18 +5540,35 @@ impl Mm {
             };
             child.insert_vma(start, c)?;
         }
-        let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
         for start in cow {
-            // Our own entries lost write permission: the TLBs of the other threads (already stopped
-            // outside guest code) must be flushed
-            self.dirty |= self.lend(start, &child, &mut borrowed, &mut lent);
+            self.lend(start, &mut plan);
         }
-        // Everything was added in address order, so build it in one go
-        child.cow.get_mut().borrowed = borrowed.into_iter().collect();
+        plan.map(self, &child)?;
+
+        // Both lists are in address order. Publish all loans together now that the PTEs exist.
+        let mut newly_lent = plan.lent.iter().peekable();
+        let mut loans = self.loans.borrow_mut();
+        loans.reserve(plan.lent.len());
+        for (page, b) in &plan.borrowed {
+            let key = b.host.as_ptr() as usize;
+            let borrower = (child.me.clone(), *page);
+            if newly_lent.next_if(|p| *p == page).is_some() {
+                loans.insert(key, Loan::new(Some((self.me.clone(), *page)), borrower));
+            } else {
+                let loan = loans.get_mut(&key);
+                debug_assert!(loan.is_some(), "lent page missing from loan table");
+                if let Some(loan) = loan {
+                    loan.lend(borrower);
+                }
+            }
+        }
+        drop(loans);
+        self.dirty |= !plan.lent.is_empty();
+        child.cow.get_mut().borrowed = plan.borrowed.into_iter().collect();
         self.cow
             .get_mut()
             .lent
-            .append(&mut lent.into_iter().collect());
+            .append(&mut plan.lent.into_iter().collect());
         // `child.insert_vma` already populated `child.shared_maps` for every copied writable
         // shared VMA.
         drop(child);
@@ -7281,8 +7331,12 @@ impl Loan {
         self.first.is_some()
     }
 
-    fn borrowers(self) -> impl Iterator<Item = (MmRef, u64)> {
-        self.first.into_iter().chain(self.others)
+    fn retain_borrowers(&mut self, mut keep: impl FnMut(&(MmRef, u64)) -> bool) {
+        self.first = self.first.take().filter(&mut keep);
+        self.others.retain(keep);
+        if self.first.is_none() {
+            self.first = self.others.pop();
+        }
     }
 
     /// Number of address spaces mapping this page (Linux's mapcount): the owner (if still there)
@@ -7323,16 +7377,15 @@ type Loans = Rc<RefCell<HashMap<usize, Loan, std::hash::BuildHasherDefault<PageH
 /// be contiguous while their permissions differ.
 #[derive(Default)]
 struct Runs {
-    runs: Vec<(u64, u64, usize, u64)>,
+    runs: Vec<(u64, u64, NonNull<u8>, u64)>,
 }
 
 impl Runs {
     fn push(&mut self, vma: u64, page: u64, host: NonNull<u8>) {
-        let host = host.as_ptr() as usize;
         if let Some((v, g, h, len)) = self.runs.last_mut()
             && *v == vma
             && *g + *len == page
-            && *h + *len as usize == host
+            && h.as_ptr().wrapping_add(*len as usize) == host.as_ptr()
         {
             *len += PAGE_SIZE;
             return;
@@ -7358,23 +7411,68 @@ struct Cow {
     borrowed: BTreeMap<u64, Borrowed>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// One-based countdown to a single simulated page-table allocation failure.
+    static COW_MAP_FAIL: Cell<usize> = const { Cell::new(0) };
+}
+
+/// # Safety
+/// The host range must satisfy the lifetime and alignment requirements of [`Mmu::map_shared`].
+#[inline]
+unsafe fn cow_map_shared(
+    mmu: &Mmu,
+    gva: u64,
+    host: NonNull<u8>,
+    len: u64,
+    prot: u32,
+) -> Result<(), MapError> {
+    #[cfg(test)]
+    if COW_MAP_FAIL.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
+        return Err(MapError::OutOfMemory);
+    }
+    unsafe { mmu.map_shared(gva, host, len, prot) }
+}
+
+#[derive(Default)]
+struct LendingPlan {
+    borrowed: Vec<(u64, Borrowed)>,
+    lent: Vec<u64>,
+    child_runs: Runs,
+    parent_runs: Runs,
+}
+
+impl LendingPlan {
+    fn map(&self, parent: &Mm, child: &Mm) -> Result<(), Errno> {
+        for &(s, page, host, len) in &self.child_runs.runs {
+            // SAFETY: borrowed holds the regions until the child takes them or drops.
+            unsafe { cow_map_shared(&child.mmu, page, host, len, Mm::read_only(&parent.vmas[&s])) }
+                .map_err(|_| Errno::ENOMEM)?;
+        }
+        let runs = &self.parent_runs.runs;
+        for (i, &(s, page, host, len)) in runs.iter().enumerate() {
+            let ro = Mm::read_only(&parent.vmas[&s]);
+            // SAFETY: these runs contain only pages owned by the parent VMA.
+            if unsafe { cow_map_shared(&parent.mmu, page, host, len, ro) }.is_err() {
+                // The failed run may have changed a prefix before reaching the next leaf.
+                for &(s, page, _, len) in &runs[..=i] {
+                    let full = mmu_prot(parent.vmas[&s].prot);
+                    let _ = parent.mmu.protect_shared(page, len, full);
+                }
+                return Err(Errno::ENOMEM);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Copy-on-write (module docs, the kernel/cow map). Done through shared borrows: when the kernel
 /// writes into guest memory it has only `&Mm`, and an owner recalling pages must also change its
 /// borrowers' page tables.
 impl Mm {
-    /// fork: lends the pages with contents in VMA `start` (private anonymous, written) to child
-    /// `child`, whose VMA at the same address already maps its own (all-zero) host memory. Pages
-    /// we borrowed ourselves are borrowed by the child from their original owner. The child's
-    /// borrowed pages go into `borrowed` in address order and newly lent ones into `lent`, and the
-    /// caller builds their entries together. Returns whether pages were newly lent (our own entries
-    /// lost write permission, so a shootdown is needed).
-    fn lend(
-        &self,
-        start: u64,
-        child: &Mm,
-        borrowed: &mut Vec<(u64, Borrowed)>,
-        lent: &mut Vec<u64>,
-    ) -> bool {
+    /// Plan lending the written pages of one private anonymous VMA. The child borrows
+    /// any pages we borrowed ourselves directly from their original owner.
+    fn lend(&self, start: u64, plan: &mut LendingPlan) {
         let v = &self.vmas[&start];
         let end = start + v.len;
         // Look only at the spans that may have contents (Mm::touched_windows): untouched parts of
@@ -7390,13 +7488,10 @@ impl Mm {
         };
         let ro = Self::read_only(v);
         let cow = self.cow.borrow();
-        let mut loans = self.loans.borrow_mut();
         // Pages we borrowed and pages already lent are merged with the page-by-page walk in address
         // order instead of a lookup per page; they all lie in windows
         let mut mine = cow.borrowed.range(start..end).peekable();
         let mut out = cow.lent.range(start..end).peekable();
-        let (mut parent_runs, mut child_runs) = (Runs::default(), Runs::default());
-        let before = lent.len();
         for (lo, hi) in windows {
             let touched = (!small)
                 .then(|| {
@@ -7404,61 +7499,29 @@ impl Mm {
                     appine_hal::touched_pages(host.as_ptr(), (hi - lo) as usize)
                 })
                 .flatten();
-            loans.reserve(
-                touched
-                    .as_ref()
-                    .map_or(0, |t| t.iter().filter(|&&t| t).count()),
-            );
             for (i, page) in (lo..hi).step_by(PAGE_SIZE as usize).enumerate() {
                 let (host, region) = if let Some((_, b)) = mine.next_if(|&(&p, _)| p == page) {
-                    if let Some(loan) = loans.get_mut(&(b.host.as_ptr() as usize)) {
-                        loan.lend((child.me.clone(), page));
-                    }
                     (b.host, b.region.clone())
-                } else if touched.as_ref().is_none_or(|t| t[i]) {
+                } else {
+                    let already_lent = out.next_if(|&&p| p == page).is_some();
+                    if !already_lent && touched.as_ref().is_some_and(|t| !t[i]) {
+                        continue;
+                    }
                     let host = Self::own_page(start, v, page);
-                    let key = host.as_ptr() as usize;
-                    if out.next_if(|&&p| p == page).is_some() {
-                        let loan = loans.get_mut(&key);
-                        debug_assert!(loan.is_some(), "lent page missing from loan table");
-                        if let Some(loan) = loan {
-                            loan.lend((child.me.clone(), page));
+                    if !already_lent {
+                        plan.lent.push(page);
+                        if ro != 0 {
+                            plan.parent_runs.push(start, page, host);
                         }
-                    } else {
-                        let owner = Some((self.me.clone(), page));
-                        loans.insert(key, Loan::new(owner, (child.me.clone(), page)));
-                        lent.push(page);
-                        parent_runs.push(start, page, host);
                     }
                     (host, v.region.clone())
-                } else {
-                    continue;
                 };
-                child_runs.push(start, page, host);
-                borrowed.push((page, Borrowed { host, region }));
+                if ro != 0 {
+                    plan.child_runs.push(start, page, host);
+                }
+                plan.borrowed.push((page, Borrowed { host, region }));
             }
         }
-        if ro != 0 {
-            for (_, page, host, len) in parent_runs.runs {
-                // Build the entry, not just change its permissions: this does not rely on every
-                // page the host touched already having an entry
-                // SAFETY: the host page belongs to this VMA
-                let _ = unsafe {
-                    self.mmu
-                        .map_shared(page, NonNull::new_unchecked(host as *mut u8), len, ro)
-                };
-            }
-            for (_, page, host, len) in child_runs.runs {
-                // SAFETY: Borrowed::region holds the borrowed host page, recorded in the child's
-                // borrowed
-                let _ = unsafe {
-                    child
-                        .mmu
-                        .map_shared(page, NonNull::new_unchecked(host as *mut u8), len, ro)
-                };
-            }
-        }
-        lent.len() > before
     }
 
     /// Called before writing to `page` (a write fault, the kernel writing guest memory): a borrowed
@@ -7478,17 +7541,15 @@ impl Mm {
             (c.borrowed.contains_key(&page), c.lent.contains(&page))
         };
         if borrowed {
-            self.materialize(page, true);
-        } else if lent {
-            self.recall(page);
+            return self.materialize(page, true).is_ok();
         }
-        borrowed || lent
+        lent && self.recall(page).is_ok() && self.mmu.translate(page, prot::WRITE).is_some()
     }
 
     /// Pages in `[start, end)` stop being copy-on-write, keeping their contents in our own host
     /// memory: lent pages are recalled first, and borrowed ones are copied (before mremap moves,
     /// discarding, or the kernel writing host memory directly).
-    fn cow_settle(&self, start: u64, end: u64) {
+    fn cow_settle(&self, start: u64, end: u64) -> Result<(), Errno> {
         let (lent, borrowed): (Vec<u64>, Vec<u64>) = {
             let c = self.cow.borrow();
             (
@@ -7497,27 +7558,28 @@ impl Mm {
             )
         };
         for page in lent {
-            self.recall(page);
+            self.recall(page)?;
         }
         for page in borrowed {
-            self.materialize(page, true);
+            self.materialize(page, true)?;
         }
+        Ok(())
     }
 
     /// `[start, end)` is about to be unmapped: lent pages are recalled first; borrowed ones are
     /// taken out of the records and returned with [`Mm::give_back`] after the caller has changed
     /// the entries and flushed the TLB (their contents are no longer wanted, so no copy).
-    fn cow_unmap(&self, start: u64, end: u64) -> Vec<(u64, Borrowed)> {
+    fn cow_unmap(&self, start: u64, end: u64) -> Result<Vec<(u64, Borrowed)>, Errno> {
         let lent: Vec<u64> = self.cow.borrow().lent.range(start..end).copied().collect();
         for page in lent {
-            self.recall(page);
+            self.recall(page)?;
         }
         let mut c = self.cow.borrow_mut();
         let pages: Vec<u64> = c.borrowed.range(start..end).map(|(&p, _)| p).collect();
-        pages
+        Ok(pages
             .into_iter()
             .map(|p| (p, c.borrowed.remove(&p).unwrap()))
-            .collect()
+            .collect())
     }
 
     /// Returns the pages [`Mm::cow_unmap`] took.
@@ -7539,19 +7601,35 @@ impl Mm {
         pages
     }
 
-    /// mprotect of private anonymous VMA `v` at `s`, once its entries have page-table permissions
-    /// `prot` (without write permission): copy-on-write `pages` get entries with `prot`, lent
-    /// ones at our own host pages and borrowed ones at the owner's. Built, not just changed: a
-    /// `PROT_NONE` VMA may have had none.
-    fn cow_entries(mmu: &Mmu, c: &Cow, s: u64, v: &Vma, pages: &[u64], prot: u32) {
+    /// Fill only unshared anonymous runs. A single empty leaf can still become a superpage.
+    fn fill_anon_non_cow(&self, s: u64, v: &Vma, lo: u64, hi: u64) -> Result<(), MapError> {
+        let pages = Self::cow_pages(&self.cow.borrow(), lo, hi);
+        for (from, len) in Self::non_cow_runs(lo, hi, &pages) {
+            let host = Self::own_page(s, v, from);
+            // SAFETY: the VMA holds the whole run and every page uses its own backing.
+            unsafe { self.mmu.fill_shared(from, host, len, v.prefill_prot()) }?;
+        }
+        Ok(())
+    }
+
+    /// Install each CoW entry with the old non-writable permissions before mprotect grants access.
+    fn cow_entries(
+        mmu: &Mmu,
+        c: &Cow,
+        s: u64,
+        v: &Vma,
+        pages: &[u64],
+        prot: u32,
+    ) -> Result<(), Errno> {
         for &page in pages {
             let host = match c.borrowed.get(&page) {
                 Some(b) => b.host,
                 None => Self::own_page(s, v, page),
             };
             // SAFETY: the host page belongs to this VMA, or b.region holds the borrowed one
-            let _ = unsafe { mmu.map_shared(page, host, PAGE_SIZE, prot) };
+            unsafe { cow_map_shared(mmu, page, host, PAGE_SIZE, prot) }.map_err(map_err)?;
         }
+        Ok(())
     }
 
     /// Then the other pages of VMA `[s, s + len)`, around copy-on-write `pages` (in order), get
@@ -7563,14 +7641,18 @@ impl Mm {
         pages: &[u64],
         prot: u32,
     ) -> Result<(), Errno> {
-        let mut from = s;
-        for &page in pages.iter().chain(&[s + len]) {
-            if page > from {
-                mmu.protect(from, page - from, prot).map_err(map_err)?;
-            }
-            from = page + PAGE_SIZE;
+        for (from, len) in Self::non_cow_runs(s, s + len, pages) {
+            mmu.protect(from, len, prot).map_err(map_err)?;
         }
         Ok(())
+    }
+
+    fn non_cow_runs(mut from: u64, end: u64, pages: &[u64]) -> impl Iterator<Item = (u64, u64)> {
+        pages.iter().copied().chain([end]).filter_map(move |page| {
+            let start = from;
+            from = page + PAGE_SIZE;
+            (start < page).then(|| (start, page - start))
+        })
     }
 
     /// When the address space is destroyed: pages of private anonymous memory that are not lent go
@@ -7604,44 +7686,57 @@ impl Mm {
 
     /// Before the owner changes lent page `page`: every borrower copies its own, then write
     /// permission is restored.
-    fn recall(&self, page: u64) {
+    fn recall(&self, page: u64) -> Result<(), Errno> {
         let Some((s, v)) = self.anon_vma(page) else {
             self.cow.borrow_mut().lent.remove(&page);
-            return;
+            return Ok(());
         };
         let key = Self::own_page(s, v, page).as_ptr() as usize;
         let loan = self.loans.borrow_mut().remove(&key);
-        for (b, addr) in loan.into_iter().flat_map(Loan::borrowers) {
-            if let Some(b) = b.upgrade() {
-                b.borrow().materialize(addr, false);
+        if let Some(mut loan) = loan {
+            // Reuse the loan's borrower list so retaining failed borrowers needs no allocation.
+            let mut error = None;
+            loan.retain_borrowers(|(borrower, addr)| {
+                if let Some(mm) = borrower.upgrade()
+                    && let Err(e) = mm.borrow().materialize(*addr, false)
+                {
+                    error = Some(e);
+                    return true;
+                }
+                false
+            });
+            if let Some(e) = error {
+                self.loans.borrow_mut().insert(key, loan);
+                return Err(e);
             }
         }
         self.repossess(&[page]);
+        Ok(())
     }
 
     /// Replaces borrowed page `page` with our own copy: copies it to the matching place in our own
     /// VMA and points the entry there. With `notify`, if this returns the last borrow, the owner
     /// gets write permission back; not needed when the owner itself is recalling.
-    fn materialize(&self, page: u64, notify: bool) {
-        let Some(b) = self.cow.borrow_mut().borrowed.remove(&page) else {
-            return;
+    fn materialize(&self, page: u64, notify: bool) -> Result<(), Errno> {
+        let mut cow = self.cow.borrow_mut();
+        let Some(b) = cow.borrowed.get(&page) else {
+            return Ok(());
         };
-        if let Some((s, v)) = self.anon_vma(page) {
-            let own = Self::own_page(s, v, page);
-            // SAFETY: both sides are a whole page, and b.region holds the borrowed page
-            unsafe {
-                std::ptr::copy_nonoverlapping(b.host.as_ptr(), own.as_ptr(), PAGE_SIZE as usize)
-            };
-            // Built even for PROT_NONE (permission 0): pages with contents must have entries
-            // (Mm::touched_windows); there may be an entry with permission 0 pointing at the
-            // borrowed page, which must not stay
-            // SAFETY: the host page belongs to this VMA
-            let _ = unsafe { self.mmu.map_shared(page, own, PAGE_SIZE, mmu_prot(v.prot)) };
-        }
+        let (s, v) = self.anon_vma(page).expect("borrowed page missing its VMA");
+        let own = Self::own_page(s, v, page);
+        // SAFETY: both sides are a whole page, and b.region holds the borrowed page.
+        unsafe { std::ptr::copy_nonoverlapping(b.host.as_ptr(), own.as_ptr(), PAGE_SIZE as usize) };
+        // Even PROT_NONE must retain a PTE for these contents before the loan is returned.
+        // SAFETY: the host page belongs to this VMA.
+        unsafe { cow_map_shared(&self.mmu, page, own, PAGE_SIZE, mmu_prot(v.prot)) }
+            .map_err(|_| Errno::ENOMEM)?;
+        let b = cow.borrowed.remove(&page).unwrap();
+        drop(cow);
         // Threads' TLBs may still point at the borrowed page: return it only after flushing, since
         // the owner may write it right after
         self.shootdown();
         self.return_loan(b.host, page, notify);
+        Ok(())
     }
 
     /// Returns borrowed host page `host` (at guest address `page` here).
@@ -7701,6 +7796,7 @@ impl Mm {
             }
         }
         for (s, page, _, len) in runs.runs {
+            // All loans are gone. If demotion fails, the next write fault retries in try_fault_in.
             let _ = self
                 .mmu
                 .protect_shared(page, len, mmu_prot(self.vmas[&s].prot));
@@ -10643,6 +10739,204 @@ mod tests {
 
     fn writable(mm: &Rc<RefCell<Mm>>, addr: u64) -> bool {
         mm.borrow().mmu().translate(addr, prot::WRITE).is_some()
+    }
+
+    /// Fail exactly the nth CoW map on this thread, restoring the hook even on unwind.
+    fn with_cow_map_failure<T>(nth: usize, f: impl FnOnce() -> T) -> T {
+        struct Reset(usize);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                COW_MAP_FAIL.set(self.0);
+            }
+        }
+        assert!(nth > 0);
+        let _guard = Reset(COW_MAP_FAIL.replace(nth));
+        let result = f();
+        assert_eq!(COW_MAP_FAIL.get(), 0, "CoW map failpoint was not reached");
+        result
+    }
+
+    #[test]
+    fn try_fault_in_never_exposes_borrower_backing_for_borrowed_page() {
+        let parent = Mm::new().into_shared();
+        let a = LEAF_SPAN;
+        let sibling = a + PAGE_SIZE;
+        parent
+            .borrow_mut()
+            .map_anonymous(a, 2 * PAGE_SIZE, RW)
+            .unwrap();
+        poke(&parent, a, b'p');
+        let owner = parent.borrow().mmu.translate(a, prot::READ).unwrap();
+        let child = parent.borrow_mut().fork().unwrap();
+        assert!(child.borrow().cow_break(sibling));
+        assert_ne!(child.borrow().vmas[&a].host, owner);
+
+        for mm in [&child, &parent] {
+            let mut mm = mm.borrow_mut();
+            mm.mmu.unmap(a, 2 * PAGE_SIZE).unwrap();
+            assert_eq!(mm.try_fault_in(a, prot::WRITE), Ok(false));
+            assert_eq!(mm.mmu.next_present(a, sibling), sibling);
+            assert_eq!(mm.try_fault_in(sibling, prot::READ), Ok(true));
+            assert!(mm.mmu.translate(sibling, prot::READ).is_some());
+            assert_eq!(mm.mmu.next_present(a, sibling), sibling);
+
+            mm.mmu.unmap(sibling, PAGE_SIZE).unwrap();
+            let mut walk = PopulateWalk::new(a, 2 * PAGE_SIZE);
+            assert!(matches!(
+                mm.populate_step(&mut walk, false),
+                Ok(PopulateStep::Done)
+            ));
+            assert!(mm.mmu.translate(sibling, prot::READ).is_some());
+            assert_eq!(mm.mmu.next_present(a, sibling), sibling);
+            assert_eq!(
+                with_cow_map_failure(1, || mm.try_fault_in(a, prot::READ)),
+                Ok(false)
+            );
+            assert_eq!(mm.try_fault_in(a, prot::READ), Ok(true));
+            assert_eq!(mm.mmu.translate(a, prot::READ), Some(owner));
+            assert!(mm.mmu.translate(a, prot::WRITE).is_none());
+        }
+        assert_eq!(byte(&child, a), b'p');
+        // Repossession cannot upgrade an absent PTE. The ordinary write fault must finish it.
+        parent.borrow_mut().mmu.unmap(a, PAGE_SIZE).unwrap();
+        assert!(!parent.borrow().cow_break(a));
+        assert!(parent.borrow().cow.borrow().lent.is_empty());
+        assert_eq!(parent.borrow().try_fault_in(a, prot::WRITE), Ok(true));
+        assert!(writable(&parent, a));
+    }
+
+    #[test]
+    fn fork_lend_map_shared_failure_rolls_back_and_preserves_isolation() {
+        let parent = Mm::new().into_shared();
+        let (a, b) = (LEAF_SPAN, 2 * LEAF_SPAN);
+        for page in [a, b] {
+            parent
+                .borrow_mut()
+                .map_anonymous(page, PAGE_SIZE, RW)
+                .unwrap();
+            poke(&parent, page, b'p');
+        }
+        parent.borrow_mut().dirty = false;
+        // Two child runs, then two parent runs. Fail each, including after the first downgrade.
+        for nth in 1..=4 {
+            assert!(matches!(
+                with_cow_map_failure(nth, || parent.borrow_mut().fork()),
+                Err(Errno::ENOMEM)
+            ));
+            let mm = parent.borrow();
+            assert!(mm.cow.borrow().lent.is_empty());
+            assert!(mm.loans.borrow().is_empty());
+            assert!(!mm.dirty);
+            for page in [a, b] {
+                assert!(mm.mmu.translate(page, prot::WRITE).is_some());
+            }
+        }
+
+        let child = parent.borrow_mut().fork().unwrap();
+        poke(&child, b, b'c');
+        // Only a remains lent. A failed downgrade of b must preserve the first child's loan.
+        assert!(matches!(
+            with_cow_map_failure(3, || parent.borrow_mut().fork()),
+            Err(Errno::ENOMEM)
+        ));
+        assert_eq!(parent.borrow().cow.borrow().lent, BTreeSet::from([a]));
+        let key = parent.borrow().vmas[&a].host.as_ptr() as usize;
+        assert_eq!(parent.borrow().loans.borrow()[&key].users(), 2);
+        assert!(!writable(&parent, a));
+        assert!(writable(&parent, b));
+        poke(&parent, a, b'q');
+        assert_eq!((byte(&child, a), byte(&child, b)), (b'p', b'c'));
+        assert!(parent.borrow().loans.borrow().is_empty());
+    }
+
+    #[test]
+    fn mprotect_cow_entries_failure_preserves_cow_isolation() {
+        let parent = Mm::new().into_shared();
+        let a = LEAF_SPAN;
+        let len = 2 * PAGE_SIZE;
+        parent.borrow_mut().map_anonymous(a, len, RW).unwrap();
+        parent.borrow().write(UserSlice::new(a, 2), b"ab").unwrap();
+        parent.borrow_mut().mprotect(a, len, 0).unwrap();
+        for new in [RW, prot::WRITE] {
+            let child = parent.borrow_mut().fork().unwrap();
+            {
+                let mut mm = child.borrow_mut();
+                assert_eq!(mm.mmu.next_present(a, a + len), a + len);
+                assert_eq!(
+                    with_cow_map_failure(2, || mm.mprotect(a, len, new)),
+                    Err(Errno::ENOMEM)
+                );
+                assert_eq!(mm.vmas[&a].prot, 0);
+                // The first entry was installed with prot 0. The failed second one is still absent.
+                assert_eq!(mm.mmu.next_present(a, a + len), a);
+                assert_eq!(mm.mmu.next_present(a + PAGE_SIZE, a + len), a + len);
+                for page in [a, a + PAGE_SIZE] {
+                    assert!(mm.mmu.translate(page, 0).is_none());
+                }
+                // Inspect the host address retained by the prot-0 entry without invoking a fault.
+                mm.mmu.protect(a, PAGE_SIZE, prot::READ).unwrap();
+                assert_eq!(
+                    mm.mmu.translate(a, prot::READ),
+                    Some(parent.borrow().vmas[&a].host)
+                );
+                mm.mmu.protect(a, PAGE_SIZE, 0).unwrap();
+                mm.mprotect(a, len, new).unwrap();
+                assert_eq!(mm.vmas[&a].prot, new);
+                assert_eq!(
+                    mm.mmu.translate(a, prot::READ),
+                    Some(parent.borrow().vmas[&a].host)
+                );
+                assert!(mm.mmu.translate(a, prot::WRITE).is_none());
+            }
+            assert_eq!(byte(&child, a), b'a');
+            poke(&child, a, b'x');
+            assert_eq!((byte(&child, a), byte(&child, a + 1)), (b'x', b'b'));
+        }
+        parent.borrow_mut().mprotect(a, len, RW).unwrap();
+        assert_eq!((byte(&parent, a), byte(&parent, a + 1)), (b'a', b'b'));
+    }
+
+    #[test]
+    fn materialize_map_shared_failure_preserves_loan_and_isolation() {
+        let parent = Mm::new().into_shared();
+        let a = LEAF_SPAN;
+        parent.borrow_mut().map_anonymous(a, PAGE_SIZE, RW).unwrap();
+        poke(&parent, a, b'p');
+        let child = parent.borrow_mut().fork().unwrap();
+        let key = parent.borrow().vmas[&a].host.as_ptr() as usize;
+        let check_loan = || {
+            assert!(child.borrow().cow.borrow().borrowed.contains_key(&a));
+            assert!(parent.borrow().cow.borrow().lent.contains(&a));
+            assert_eq!(parent.borrow().loans.borrow()[&key].users(), 2);
+            assert!(!writable(&parent, a) && !writable(&child, a));
+            assert_eq!((byte(&parent, a), byte(&child, a)), (b'p', b'p'));
+        };
+        assert!(!with_cow_map_failure(1, || child.borrow().cow_break(a)));
+        check_loan();
+        with_cow_map_failure(1, || child.borrow_mut().release());
+        check_loan();
+        let other = parent.borrow_mut().fork().unwrap();
+        assert!(!with_cow_map_failure(1, || parent.borrow().cow_break(a)));
+        // Recall succeeded for the second borrower. Only the failed borrower remains.
+        assert!(writable(&other, a));
+        check_loan();
+        assert_eq!(
+            with_cow_map_failure(1, || parent.borrow_mut().discard_range(a, PAGE_SIZE, false)).1,
+            Err(Errno::ENOMEM)
+        );
+        check_loan();
+        assert_eq!(
+            with_cow_map_failure(1, || parent.borrow_mut().munmap(a, PAGE_SIZE)),
+            Err(Errno::ENOMEM)
+        );
+        check_loan();
+        assert!(parent.borrow().cow_break(a));
+        poke(&parent, a, b'q');
+        assert_eq!(
+            (byte(&parent, a), byte(&child, a), byte(&other, a)),
+            (b'q', b'p', b'p')
+        );
+        assert!(parent.borrow().loans.borrow().is_empty());
     }
 
     #[test]

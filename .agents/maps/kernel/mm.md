@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification of anonymous write faults, VMA boundaries, fork accounting, mremap growth, DONTUNMAP remnants, and regular-file `MAP_SHARED` `FS_IMMUTABLE_FL`/`FS_APPEND_FL` checks)
+> Maintained: 2026-11-26 (targeted verification of regular-file `MAP_SHARED` `FS_IMMUTABLE_FL`/`FS_APPEND_FL` checks, and anonymous fault fills, mprotect ordering and munmap errors for fork CoW pages)
 
 ## Responsibilities
 
@@ -214,7 +214,8 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 2. The page now translates (another thread fixed it while this one waited for the BKL) → re-execute.
 3. `try_fault_in` (`kernel/mmu`) succeeds → re-execute. The first private anonymous write
    records an identity for the logical VMA and upgrades present entries of the faulting host
-   piece. A missing entry still follows the usual leaf-window fill. A tmpfs page allocation failure delivers
+   piece. Anonymous leaf-window fills skip CoW pages. A read or execute fault on a missing CoW
+   page installs only its owner-backed entry with write permission stripped. A tmpfs page allocation failure delivers
    `SIGBUS` / `BUS_ADRERR`.
 4. A page of a `Fill` mapping not yet read and allowing the access (`fill_wanted`) → read it through
    the daemon (above) and re-execute; a signal arriving before the daemon took the read is
@@ -234,7 +235,8 @@ signals may still be delivered).
 - VMAs are only ever split (`split_at` advances file or anonymous page offsets and host pointers), never merged;
   `same_vma` tells which pieces Linux would have as one VMA.
 - `munmap`: an unaligned address, zero or overflowing length or an end past 2^48 is `EINVAL`;
-  `ENOMEM` only when one VMA would split in three at `vm.max_map_count`. It moves removed host
+  `ENOMEM` can result from a three-way VMA split at `vm.max_map_count`, a failed CoW recall or
+  a page-table allocation during superpage demotion. It moves removed host
   regions to the `graveyard`, clears `vdso` when overlapping it, sets `dirty`, records executable
   ranges in `code_ranges`, returns borrowed pages (`kernel/cow`), and the syscall reaps SysV
   segments left without attachments.
@@ -250,10 +252,11 @@ signals may still be delivered).
   it changed after reading them and drops its entries) before it becomes writable, and a
   `reserved` region gets real host memory (`back_reserved`) before it becomes accessible.
   Adding private write permission sets the commit charge unless the mapping has `MAP_NORESERVE`.
-  The charge survives later permission changes. Tracked file pages revoke their entries on a protection change. For other mappings only a
-  permission downgrade sets `dirty`. For a private anonymous VMA with fork CoW
-  pages, non-write perms apply first, then read-only CoW entries (`kernel/cow`, even where
-  `PROT_NONE` had none), then write permission on other pages.
+  The charge survives later permission changes. Tracked file pages revoke their entries on a protection change.
+  For other mappings, a successful permission downgrade sets `dirty`. Before granting access to a private anonymous VMA
+  with fork CoW pages, mprotect installs their owner-backed entries under the old non-writable
+  permissions. It then changes the range permissions and grants write only outside the CoW pages.
+  A failed permission change preserves the VMA prot and queues any needed rollback invalidation.
 - `mremap`: the syscall checks the flags (`MREMAP_DONTUNMAP` needs equal lengths) and gives `EPERM`
   for a fixed target below `vm.mmap_min_addr` before anything else. Then Linux's order: no mapping
   at the old address is `EFAULT`; a `MREMAP_FIXED` target is validated (`EINVAL`) and unmapped and
@@ -488,6 +491,9 @@ signals may still be delivered).
 - Appine creates a fresh anonymous remnant even on a partial DONTUNMAP or a move of a previously
   relocated mapping. Linux 6.1 unlinks the old anon_vma only on a whole-VMA move and retains the
   old page offset.
+- A failure in `Mmu::unmap` can interrupt munmap after it has taken borrowed records
+  and removed the current VMA. A failed superpage demotion can leave surviving PTEs without
+  their backing records.
 
 ## Open questions
 
