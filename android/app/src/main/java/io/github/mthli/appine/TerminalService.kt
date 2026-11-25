@@ -107,6 +107,85 @@ internal class ConsoleTracker(
 }
 
 /**
+ * Tracks inactive tabs' Kitty image caches ([VtNative.dropImages]) on Android 14+, where foreground
+ * services no longer receive `onTrimMemory`'s `RUNNING_*` or cached-background callbacks. Keeps up
+ * to [maxRetained] most recently left tabs untrimmed for [delayMs], evicts older ones immediately,
+ * and remembers trimmed tabs so periodic saves re-trim unseen tabs that keep emitting images.
+ */
+internal class BackgroundImageTrim(
+    private val delayMs: Long = DELAY_MS,
+    private val maxRetained: Int = MAX_RETAINED,
+) {
+    /** Started background tab IDs in LRU order (oldest first) to when they left the foreground. */
+    private val pending = LinkedHashMap<Int, Long>()
+
+    /** Already-trimmed background tab IDs still unseen (eligible for periodic re-trim). */
+    private val trimmed = LinkedHashSet<Int>()
+
+    /**
+     * Records a foreground change from [previousId] (when still open and started) to [currentId]
+     * at monotonic [now], returning background tab IDs evicted past [maxRetained].
+     */
+    fun onCurrentChanged(previousId: Int?, currentId: Int?, now: Long): List<Int> {
+        if (currentId != null) remove(currentId)
+        if (previousId != null && previousId != currentId) {
+            remove(previousId)
+            pending[previousId] = now
+        }
+        if (pending.size <= maxRetained) return emptyList()
+        val evicted = ArrayList<Int>(pending.size - maxRetained)
+        while (pending.size > maxRetained && pending.isNotEmpty()) {
+            val id = pending.keys.first()
+            pending.remove(id)
+            trimmed.add(id)
+            evicted.add(id)
+        }
+        return evicted
+    }
+
+    /** Returns background tab IDs unseen for at least [delayMs] as of [now] and marks them trimmed. */
+    fun takeDue(now: Long): List<Int> {
+        val due = pending.entries.mapNotNull { (id, leftAt) -> id.takeIf { now - leftAt >= delayMs } }
+        for (id in due) {
+            pending.remove(id)
+            trimmed.add(id)
+        }
+        return due
+    }
+
+    /** Milliseconds until the next pending tab becomes due, or null when none wait. */
+    fun nextDelayMs(now: Long): Long? {
+        val earliest = pending.values.minOrNull() ?: return null
+        return (delayMs - (now - earliest)).coerceAtLeast(0L)
+    }
+
+    /** Records that every started tab in [openIds] except [currentId] was just trimmed. */
+    fun markAllTrimmed(currentId: Int?, openIds: Iterable<Int>) {
+        clear()
+        for (id in openIds) {
+            if (id != currentId) trimmed.add(id)
+        }
+    }
+
+    fun trimmedIds(): Set<Int> = trimmed.toSet()
+
+    fun remove(id: Int) {
+        pending.remove(id)
+        trimmed.remove(id)
+    }
+
+    fun clear() {
+        pending.clear()
+        trimmed.clear()
+    }
+
+    companion object {
+        const val DELAY_MS = 60_000L
+        const val MAX_RETAINED = 2
+    }
+}
+
+/**
  * The foreground service that holds the guest kernel and all terminal sessions (the android/service
  * map). The sessions' lifecycle hangs on the service, not on an Activity: shells keep running after
  * the Activity is closed. The notification shows the number of sessions and offers "Exit all".
@@ -199,10 +278,11 @@ class TerminalService : Service() {
     /**
      * The visible UIs (terminal, settings), added by Activities in onStart and removed in onStop;
      * when all have stopped (switched to another app, screen off) and none has come back after
-     * [TRIM_DELAY_MS], the kernel's rebuildable caches are released and the tabs' scrollback is
-     * compressed ([trimMemory]): since Android 14 a process with a foreground service no longer
-     * gets `onTrimMemory`'s `UI_HIDDEN`, so it has to watch whether the UI is there itself; when
-     * the user switches back quickly, nothing has to be translated again either.
+     * [TRIM_DELAY_MS], the kernel's rebuildable caches are released, background tabs' Kitty image
+     * caches are trimmed, and the tabs' scrollback is compressed ([trimMemory]): since Android 14
+     * a process with a foreground service no longer gets `onTrimMemory`'s `RUNNING_*` or cached
+     * background callbacks, so it has to watch whether the UI is there itself; when the user
+     * switches back quickly, nothing has to be translated or discarded either.
      */
     private val listeners = mutableListOf<Listener>()
 
@@ -211,6 +291,15 @@ class TerminalService : Service() {
      * ([addListener]).
      */
     private val trimWhenHidden = Runnable { trimMemory() }
+
+    /** Tracks inactive background tabs so their Kitty images are trimmed even while the UI stays visible. */
+    private val backgroundImages = BackgroundImageTrim()
+
+    /** Trims background tabs whose grace window in [backgroundImages] has expired. */
+    private val trimBackgroundImages = Runnable {
+        dropImagesForIds(backgroundImages.takeDue(SystemClock.elapsedRealtime()))
+        scheduleBackgroundImageTrim()
+    }
 
     /**
      * Every [POLL_MS], asks the kernel on [worker] (this takes the BKL):
@@ -368,14 +457,20 @@ class TerminalService : Service() {
 
     /**
      * The tab the Activity is showing (saving tabs records which one it is); showing a tab takes
-     * away its notification ([Notifications.cancelTab]), and the done and error statuses it was
-     * showing have been seen.
+     * away its notification ([Notifications.cancelTab]), marks its done and error statuses seen,
+     * and protects its Kitty image cache while scheduling the previous tab for background trimming.
      */
     internal var current: VtSession? = null
         set(value) {
+            val previous = field
             field = value
             value?.let(notifications::cancelTab)
             value?.takeIf(::inFront)?.statusSeen()
+            if (previous !== value) {
+                val previousId = previous?.takeIf { it in sessions && it.tab != 0L }?.id
+                dropImagesForIds(backgroundImages.onCurrentChanged(previousId, value?.id, SystemClock.elapsedRealtime()))
+                scheduleBackgroundImageTrim()
+            }
         }
 
     /**
@@ -446,10 +541,12 @@ class TerminalService : Service() {
 
     /**
      * Tabs are saved every [SAVE_MS] while the kernel runs, and at once when the UI is hidden or
-     * memory is short.
+     * memory is short. Already-trimmed background tabs are also re-trimmed here so unseen tabs
+     * emitting new Kitty images stay capped.
      */
     private val periodicSave = object : Runnable {
         override fun run() {
+            dropImagesForIds(backgroundImages.trimmedIds())
             saveTabs()
             main.postDelayed(this, SAVE_MS)
         }
@@ -878,6 +975,8 @@ class TerminalService : Service() {
         session.release()
         sessions.remove(session)
         unshown.remove(session)
+        backgroundImages.remove(session.id)
+        if (current === session) current = null else scheduleBackgroundImageTrim()
         notifications.cancelTab(session)
         sessionsChanged()
     }
@@ -1018,40 +1117,60 @@ class TerminalService : Service() {
 
     /**
      * When host memory is short, drops the kernel's rebuildable caches at once (the Tier 1
-     * translations kept in the pool take up to 70–80 MB), compresses the tabs' scrollback and
-     * cuts the images of the tabs other than [current] down ([trimMemory]). Since Android 14 the
-     * `RUNNING_*` levels are no longer sent; the UI being hidden (`UI_HIDDEN`) is handled by
-     * [removeListener].
+     * translations kept in the pool take up to 70–80 MB), cuts the images of the tabs other than
+     * [current] down, and compresses the tabs' scrollback ([trimMemory]). Since Android 14 the
+     * `RUNNING_*` levels are no longer sent and a foreground service never receives cached
+     * background trims; UI hiding is handled by [removeListener] and inactive background tabs by
+     * [backgroundImages].
      */
     @Suppress("DEPRECATION") // RUNNING_LOW and RUNNING_CRITICAL are sent only before Android 14
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) {
-            trimMemory(pressure = true)
+            trimMemory()
             saveTabs()
         }
     }
 
     /**
-     * Drops the kernel's rebuildable caches and compresses every tab's cold scrollback, including
-     * that of tabs whose output never paused long enough for the idle compression (`vt.rs`). Under
-     * [pressure], also deletes the oldest Kitty images of every tab but [current] (the one shown,
-     * or to be shown when the app comes back) down to a few MiB per screen: they are gone, not
-     * kept elsewhere ([VtNative.dropImages]).
+     * Drops the kernel's rebuildable caches, deletes the oldest Kitty images of every started tab
+     * other than [current] (the one shown, or to be shown when the app comes back) down to a few
+     * MiB per screen ([VtNative.dropImages]), and compresses every tab's cold scrollback,
+     * including that of tabs whose output never paused long enough for the idle compression
+     * (`vt.rs`).
      */
-    private fun trimMemory(pressure: Boolean = false) {
+    private fun trimMemory() {
         val m = machine
-        if (m != 0L) {
-            val others = if (pressure) {
-                sessions.filter { it !== current && it.tab != 0L }.map { it.tab }
-            } else {
-                emptyList()
-            }
+        if (m == 0L) return
+        val active = current?.takeIf { it in sessions }
+        val started = sessions.filter { it.tab != 0L }
+        val others = started.filter { it !== active }.map { it.tab }
+        backgroundImages.markAllTrimmed(active?.id, started.map { it.id })
+        main.removeCallbacks(trimBackgroundImages)
+        runCatching {
             worker.execute {
                 Native.trimMemory(m)
                 others.forEach(VtNative::dropImages)
                 VtNative.compressAll()
             }
+        }
+    }
+
+    /** Schedules [trimBackgroundImages] for the next pending background tab, or cancels it. */
+    private fun scheduleBackgroundImageTrim() {
+        main.removeCallbacks(trimBackgroundImages)
+        val delay = backgroundImages.nextDelayMs(SystemClock.elapsedRealtime()) ?: return
+        main.postDelayed(trimBackgroundImages, delay)
+    }
+
+    /** Trims Kitty images on [worker] for every started non-current session whose id is in [ids]. */
+    private fun dropImagesForIds(ids: Collection<Int>) {
+        if (machine == 0L || ids.isEmpty()) return
+        val active = current
+        val tabs = sessions.filter { it !== active && it.tab != 0L && it.id in ids }.map { it.tab }
+        if (tabs.isEmpty()) return
+        runCatching {
+            worker.execute { tabs.forEach(VtNative::dropImages) }
         }
     }
 
@@ -1353,6 +1472,9 @@ class TerminalService : Service() {
         }
         sessions.clear()
         unshown.clear()
+        backgroundImages.clear()
+        main.removeCallbacks(trimBackgroundImages)
+        current = null
     }
 
     override fun onDestroy() {
@@ -1364,6 +1486,7 @@ class TerminalService : Service() {
         switching?.cancelled = true
         switching = null
         main.removeCallbacks(trimWhenHidden)
+        main.removeCallbacks(trimBackgroundImages)
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
         main.removeCallbacks(saveSoon)
@@ -1423,7 +1546,7 @@ class TerminalService : Service() {
         private const val ACTION_CANCEL_SWITCH = "io.github.mthli.appine.CANCEL_SWITCH"
         private const val ACTION_TOGGLE_KEEP_AWAKE = "io.github.mthli.appine.TOGGLE_KEEP_AWAKE"
         private const val WAKE_LOCK_TAG = "appine:keep-awake"
-        private const val TRIM_DELAY_MS = 60_000L
+        private const val TRIM_DELAY_MS = BackgroundImageTrim.DELAY_MS
         private const val SAVE_MS = 60_000L
         private const val SAVE_SOON_MS = 2_000L
     }

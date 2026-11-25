@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint scrolling, selection and native Selection-helper references to android/vtgestures)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: removed Android 14+ untrimmed Kitty image bug entry and recorded background-tab trimming invariant)
 
 ## Responsibilities
 
@@ -213,6 +213,15 @@ it does not transfer those lifecycle methods here.
   format or its view consumers requires checking this map, `android/vtview` and
   `android/vtgestures`; search queries, selection and scrolling use the same terminal state
   through `android/vtcore`'s lock.
+- Each screen of each tab keeps up to 32 MiB of decoded Kitty images in libghostty-vt, and while a
+  tab is shown the view holds a second copy of those placed on its screen (dropped on tab switch or
+  window hide). `android/service` trims non-current tabs down to 4 MiB a screen via
+  `VtNative.dropImages` (after 60 s with the UI hidden, after 60 s unseen or beyond 2 recently left
+  background tabs while switching, on periodic saves for already-trimmed unseen tabs, and under
+  system memory pressure); a tab restored from a snapshot saved before trimming gets its pre-trim
+  images back (libghostty-vt's snapshot encoder writes them when built with Kitty graphics, though
+  a comment in its `snapshot/terminal.zig` says otherwise), while one restored from its plain
+  transcript has text only.
 
 ## Confirmed bugs / technical debt
 
@@ -224,15 +233,6 @@ it does not transfer those lifecycle methods here.
   in place of the four to six reads `frame` makes per cell (it stops at the first failing key, so
   the colours would go last; gain unmeasured); the colour utilities (`palette_generate`, contrast
   and luminance), of use only with themes.
-- **libghostty-vt's images are trimmed only under pressure before Android 14**: each screen of
-  each tab keeps up to 32 MiB of decoded Kitty images, and while a tab is shown the view holds a
-  second copy of those placed on its screen (dropped while the window is hidden). Only the
-  `RUNNING_LOW` and higher trim levels, which Android 14 and later no longer send, cut the tabs
-  not shown down to 4 MiB a screen (android/vtcore), deleting the oldest images outright; the routine
-  trim after the UI leaves keeps them all. A tab restored from its snapshot gets its images back
-  (libghostty-vt's snapshot encoder writes them when built with Kitty graphics, though a comment
-  in its `snapshot/terminal.zig` says otherwise); one restored from its plain transcript has text
-  only.
 
 ## Open questions
 

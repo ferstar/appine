@@ -106,6 +106,7 @@ dependencies {
     implementation(libs.androidx.recyclerview)
     implementation(libs.androidx.webkit)
     implementation(libs.material)
+    testImplementation(libs.junit4)
     androidTestImplementation(libs.androidx.runner)
     androidTestImplementation(libs.androidx.junit)
 }

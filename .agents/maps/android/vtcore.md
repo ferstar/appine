@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: preserve stream order when prompt marks expire transient reports)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: updated VtNative.dropImages triggers for Android 14+ background-tab trimming)
 
 ## Responsibilities
 
@@ -177,7 +177,9 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   64 KiB.
 - Memory trimming (`VtNative.compressAll`, from android/service) compresses every tab's cold pages
   at once, idle or not, one tab's lock at a time.
-- Under memory pressure the service also cuts the images of the tabs not shown
+- When trimming background tabs (after 60 s with the UI hidden, after 60 s unseen or beyond 2
+  recently left background tabs while switching, on periodic saves for already-trimmed unseen tabs,
+  or under system memory pressure), the service also cuts the images of tabs not shown
   (`VtNative.dropImages`): vt.c lowers the tab's Kitty storage limit to 4 MiB and puts it back to
   32 MiB, the only way libghostty-vt gives image memory back. On each screen it deletes whole
   images with their placements, those no placement shows first, then the oldest sent, until the

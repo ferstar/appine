@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: selecting and verifying APK assets from the release inventory)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: added junit4 testImplementation dependency for JVM unit tests)
 
 ## Responsibilities
 
@@ -29,7 +29,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Public entry points
 
-- Build: `./gradlew assembleDebug lintDebug` (what CI runs), `assembleRelease` (the optimized APK), `connectedDebugAndroidTest` (with
+- Build: `./gradlew assembleDebug lintDebug` (what CI runs), `testDebugUnitTest` (JVM unit tests),
+  `assembleRelease` (the optimized APK), `connectedDebugAndroidTest` (with
   `-Pandroid.testInstrumentationRunnerArguments.network=true` for the download of a distribution),
   `scripts/fetch-ghostty [dir]` (default `target/ghostty`), `scripts/release-sources [dir]` (default
   `target/release-sources`).
@@ -81,7 +82,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   is in `android/build.gradle.kts`. Android libraries: `androidx.core` 1.19.1,
   `androidx.biometric:biometric` 1.1.0 (including its merged biometric permission), `androidx.preference:preference` 1.2.1, `androidx.browser:browser` 1.10.0,
   `androidx.webkit:webkit` 1.18.0, `androidx.recyclerview:recyclerview` 1.2.1 and Material Components 1.14.0 (which
-  brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
+  brings AppCompat and androidx.activity); JVM unit tests use `junit:junit` 4.13.2
+  (`testImplementation`), and instrumentation tests use androidx.test's runner 1.7.0 and ext.junit
   1.3.0.
 - Assets: the pinned Alpine minirootfs tarball from `target/rootfs` (as `rootfs.tgz`,
   since AAPT would unpack `.gz`), the pinned doas package as `doas.apk`, and bash's four packages under `bash/`

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: routing clipboard requests by session ID and answering unhandled reads)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: background-tab Kitty image trimming on UI hide, tab switches, LRU budget and periodic re-trim)
 
 ## Responsibilities
 
@@ -58,11 +58,17 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 - Session state (internal): `sessions` (every tab, ended ones included), `unshown` (restored tabs
   whose terminal does not exist yet, with their saved copy), `restore` (saved tabs from a killed
   run, kept until a start restores them), `ended` (why that run ended), `focus` (set only by the
-  restore), `current` (written only by `MainActivity`; setting it takes the tab's notification and
-  bell throttle away and, with the terminal Activity listening, marks the tab's statuses seen),
+  restore), `current` (written by `MainActivity` and cleared by `removeSession`/`releaseSessions`;
+  setting it takes the tab's notification and bell throttle away, marks the tab's statuses seen
+  with the terminal Activity listening, and notifies `backgroundImages` to protect the shown tab
+  and schedule the previous started tab for background image trimming),
   `nextSessionId` (counting up from the clock, never wrapped); `sessionEvents` (title changed,
   bell, clipboard write, notification, clipboard read, progress or status changed, a command
   finished, tmux's control mode detached, the shell finished).
+- `BackgroundImageTrim` — pure-Kotlin LRU and dwell-time tracker for background tabs' Kitty image
+  caches: protects `current`, keeps at most `MAX_RETAINED` (2) most recently left started tabs
+  untrimmed for `DELAY_MS` (60 s), evicts older background tabs immediately, and keeps trimmed tab
+  IDs for periodic re-trim while they remain unseen.
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace, between letting go of the old kernel and starting the new one),
   `booting` (boot work is outstanding), `destroyed` (late completions cannot restart the service),
@@ -90,8 +96,9 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   (`s-<128-bit SHA-256 prefix of the snapshot>.snap`); `Tab(login, cwd, transcript, snapshot)`
   (the snapshot's file name, null for none), `Saved(tabs, current, time)`, `Killed(pid, saved)`;
   transcripts capped at 256 K chars, snapshots read back at most 16 MiB.
-- Constants: poll 2 s, trim delay 60 s, periodic save 60 s, save-soon 2 s, commands notifying from
-  10 s.
+- Constants: poll 2 s, trim delay 60 s (`TRIM_DELAY_MS = BackgroundImageTrim.DELAY_MS`),
+  background-tab image retention budget 2 (`BackgroundImageTrim.MAX_RETAINED`), periodic save 60 s,
+  save-soon 2 s, commands notifying from 10 s.
 
 ## Public entry points
 
@@ -246,14 +253,23 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 
 ### Memory
 
-- The last listener leaving saves tabs at once and starts a 60 s timer that trims memory (on the
-  worker: `Native.trimMemory`, the kernel's rebuildable caches, then `VtNative.compressAll`, every
-  tab's cold scrollback at once, android/vtcore); a returning listener cancels it. `onTrimMemory` at
-  `RUNNING_LOW` and above (except `UI_HIDDEN`) trims and saves immediately, and also cuts the Kitty
-  images of every started tab but `current` down to 4 MiB a screen, deleting the oldest
-  (`VtNative.dropImages`, android/vtcore); since Android 14 those levels are no longer sent, so this
-  happens only on Android 11–13. Tabs also compress their own scrollback within seconds of their
-  output, so the trim mostly finds what the last few seconds left.
+- The last listener leaving saves tabs at once and starts a 60 s timer (`trimWhenHidden`) that runs
+  `trimMemory()` on the worker: `Native.trimMemory` (the kernel's rebuildable caches),
+  `VtNative.dropImages` on every started tab other than `current` (cutting each screen's Kitty
+  images down to 4 MiB, deleting the oldest, android/vtcore), and `VtNative.compressAll` (every
+  tab's cold scrollback at once); a returning listener cancels it. `onTrimMemory` at `RUNNING_LOW`
+  and above (except `UI_HIDDEN`) runs `trimMemory()` and `saveTabs()` immediately (for Android
+  11–13 or any cached-background trim Android delivers).
+- While the UI stays visible (important on Android 14+, where foreground services do not receive
+  `RUNNING_*` or cached-background `onTrimMemory` callbacks), `BackgroundImageTrim` trims inactive
+  background tabs' Kitty image caches on tab switches: `current` is never trimmed; up to 2 most
+  recently left started tabs keep their full image cache for 60 s so quick switching back and forth
+  loses nothing; leaving a tab when more than 2 background tabs are pending immediately trims the
+  oldest pending tab on the worker; and any remaining pending background tab is trimmed once 60 s
+  elapse unseen (`trimBackgroundImages`). Already-trimmed tabs stay recorded in `backgroundImages`
+  so the 60 s `periodicSave` re-trims them before saving if a background program emitted new images
+  while unseen. Tabs also compress their own scrollback within seconds of their output, so the trim
+  mostly finds what the last few seconds left.
 
 ### Sessions, saving and restore
 
@@ -393,6 +409,10 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   main thread after `onDestroy`: it reaches notification 1 only through `updateNotification`, which does nothing once
   destroyed, so a new way of posting it must go through that too. Ongoing notification id 1 must
   not collide with `android/reports`'s notification id ranges.
+- `removeSession` and `releaseSessions` clear `current` when it refers to a removed session and
+  update `backgroundImages` / cancel `trimBackgroundImages`; `trimMemory` and `dropImagesForIds`
+  also verify `it !== active` and `it.tab != 0L` before dispatching `VtNative.dropImages` to the
+  worker, so `current` is never trimmed and closed or unstarted tabs are never passed to native.
 - The marker is rewritten at a start before the first save replaces the old run's index, so a kill
   in between restores the old tabs again; tabs of a killed run kept through a replacement are
   restored into the new distro, where their directories may not exist.
