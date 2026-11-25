@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: per-mount-namespace mounts/mountinfo notifications without propagation-only triggers, and uid_map/gid_map position-advancing writes returning EINVAL on second write)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: align non-sysctl synthetic write positions and return counts with Linux 6.1)
 
 ## Responsibilities
 
@@ -164,13 +164,16 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   since open, returning empty/EOF once freed or replaced by execve). Memory transfers fill missing
   FUSE pages one at a time, retaining the byte count across fills. Nsfs files cannot be read
   (`EINVAL`), nor can write-only files.
-- Writes pass each chunk or iovec (one gathered input for numeric sysctls) to `pseudo::write` with the
-  writer's credentials and namespaces (the id maps, `setgroups`, `timens_offsets` and cgroup
-  migration also check the opener's), apply at the current position for `mem`, `uid_map`/`gid_map`
-  (Linux's `map_write`: requires offset 0 and `< 4096` bytes, else `EINVAL`, advancing the open
-  position by `count`, while offset-0 rewrites after the map is set return `EPERM`), and numeric
-  sysctls, and mark the snapshot stale. Per-process numbers use `proc_number`/`kstrto` (first 12
-  bytes, base 0, `EINVAL`/`ERANGE`).
+- Writes pass each chunk or iovec (one gathered input for `/proc/sys` sysctls, `kernel/sysctl`) to
+  `pseudo::write` with the writer's credentials and namespaces (the id maps, `setgroups`,
+  `timens_offsets` and cgroup migration also check the opener's), apply Linux 6.1 position rules —
+  `mem`, `uid_map`/`gid_map` (`map_write`: requires offset 0 and `< 4096` bytes, else `EINVAL`),
+  `setgroups` (`proc_setgroups_write`: requires offset 0, else `EINVAL`), cgroup2 files
+  (`kernfs_fop_write_iter`) and advancing sysctls advance the open position; `timens_offsets`
+  requires offset 0 and `< 4096` bytes (`EINVAL` otherwise) while keeping position unchanged;
+  `comm`, `oom_score_adj` (consuming at most `PROC_NUMBUF - 1` = 12 bytes via `proc_number`/
+  `kstrto`) and `coredump_filter` (consuming the full count via `kstrto`) leave the open position
+  unchanged — and mark the snapshot stale.
 - Change notifications (`fd::ProcEvent`, built by `pseudo::poll_event`): epoll accepts the files
   with a Linux poll operation (`pseudo::pollable`: global procfs files, `/proc/sys`,
   `/proc/sysvipc`, `/proc/<pid>/net`, mounts, mountinfo, every sysfs and cgroup2 file; other
@@ -393,8 +396,6 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   and symbol lookups (perf, bpftrace) find nothing.
 - **Per-thread values that are the process's:** `task/<tid>/stat`'s start time is the process's
   (Appine keeps none per thread).
-- **Non-sysctl synthetic writes other than `mem`, `uid_map`, and `gid_map` leave the position
-  unchanged.**
 
 ## Open questions
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 16 claims checked by 3 independent verifiers — 12 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `NO_SYSCALL` passes `syscall = false` except interrupted `USER_NOTIF`, core dumps ignore `umask` and honor `fs.suid_dumpable` 0/1/2, seccomp logs audit records to `klog`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: preserve `SI_TIMER` `SigInfo` on `RLIMIT_SIGPENDING` overflow and align RT signal overflow rules with Linux 6.1)
 
 ## Responsibilities
 
@@ -99,9 +99,13 @@ construction (`kernel/vdso`).
   unblocked untraced signals are discarded at send time (`send_group` checks `threads.first()`).
 - Queueing: standard signals (1–31) coalesce, keeping the first sender's `SigInfo`; RT signals
   (32–64) queue FIFO bounded per thread group by `RLIMIT_SIGPENDING` (default 16384). On overflow,
-  `kill` and kernel senders still set the pending bit without `SigInfo`; `tkill`/`tgkill` on RT
-  signals and `rt_sigqueueinfo`/`rt_tgsigqueueinfo`/`pidfd_send_signal` with non-`SI_USER` `uinfo`
-  return `EAGAIN`.
+  `SI_TIMER` overrides the limit and still queues with its `SigInfo` preserved (matching Linux
+  6.1's preallocated `send_sigqueue`); `SI_USER` (`kill`, `pdeathsig`) and `SI_KERNEL` still set
+  the pending bit without `SigInfo`; other RT senders (`SI_MESGQ`, `CLD_*`, `POLL_*`) fail to
+  queue instead of delivering corrupted `SI_USER` info (`F_SETSIG` falls back to `SIGIO` with
+  `SI_KERNEL`, matching Linux 6.1's `send_sigio_to_task`), while `tkill`/`tgkill` on RT signals and
+  `rt_sigqueueinfo`/`rt_tgsigqueueinfo`/`pidfd_send_signal` with non-`SI_USER` `uinfo` return
+  `EAGAIN`.
 - Waking & retargeting: `send_to_task` wakes the thread if unblocked; `send_group` picks the first
   thread with the signal unmasked and not in a ptrace stop (`send_cpu_timer` rotates among running
   unmasked threads via a global counter); if none qualifies, requests `wake::SIGNAL`. `retarget`
@@ -329,7 +333,6 @@ construction (`kernel/vdso`).
 - **Synthesized abort ESRs differ from Linux's:** every translation fault reports level-3 FSC `0x07`
   and every fault inside a mapping reports level-3 permission FSC `0x0f`, rather than the real
   table walk level or translation-fault-on-unpopulated-page semantics.
-- **Minor divergences:** kernel-generated RT signals lose `SigInfo` when the queue is full.
 
 ## Open questions
 

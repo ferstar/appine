@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: emit inotify `IN_OPEN`/`IN_CLOSE_*` for `open_by_handle_at`, `memfd_create` and cgroup2 files)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: enforce store/tmpfs superblock boundary in `open_by_handle_at`)
 
 ## Responsibilities
 
@@ -187,11 +187,11 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   `AT_HANDLE_FID` ignored) encodes store nodes only (else `EOPNOTSUPP`) as 8 bytes of type 1 holding
   the inode number, and returns the mount id; over 128 bytes is `EINVAL`, too small `EOVERFLOW`.
   `open_by_handle_at` needs `CAP_DAC_READ_SEARCH` in the initial user namespace (`EPERM`), a size
-  of 1 to 128 (`EINVAL`) and a mount fd on a store node; a wrong handle or a missing or unlinked
-  inode is `ESTALE`. It opens the inode on that mount (any store mount, with no same-filesystem
-  check) through `open_store` with every check, or as an `O_PATH` fd, emitting `IN_OPEN` (and
-  `IN_MODIFY` on `O_TRUNC`) and attaching an inotify `Opened` record, without a display path or
-  validation of other open flags.
+  of 1 to 128 (`EINVAL`) and a mount fd on a store node; a wrong handle, a missing or unlinked
+  inode, or an inode belonging to a different store/tmpfs superblock (`Vfs::store_sb_root` vs
+  `Store::tree_root`) is `ESTALE`. It opens the inode on that mount through `open_store` with every
+  check, or as an `O_PATH` fd, emitting `IN_OPEN` (and `IN_MODIFY` on `O_TRUNC`) and attaching an
+  inotify `Opened` record, without a display path or validation of other open flags.
 - Opens through a path of a regular file, device, directory (store, overlay, FUSE, cgroup2), FUSE
   file or cgroup2 file, as well as `open_by_handle_at` and `memfd_create`, record an inotify
   `Opened` (`kernel/inotify`), watches or not. `O_TMPFILE` is not
@@ -286,7 +286,6 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   - no `O_TMPFILE`;
   - a write open on a read-only instance is `EROFS` only after permission (6.1's `sb_permission`
     comes first; overlay opens already do);
-  - handles open a store inode through any store mount;
   - table growth uses power-of-two capacity even when a lowered `nr_open` would cap Linux’s allocation.
 
 ## Open questions

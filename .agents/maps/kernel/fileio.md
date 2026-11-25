@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: host stdio interruptible writes and positional I/O on regular host files, and `MAX_RW_COUNT` caps on read/write/vectored/sendfile/copy_file_range)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: gather vectored writes for all writable `/proc/sys` sysctls, including string and bitmap sysctls)
 
 ## Responsibilities
 
@@ -117,7 +117,8 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   order; writes in 64 KiB pieces across iovecs until one is short; sockets through `kernel/net`),
   so a pipe readv returns what was there and small pipe writes stay atomic; `/dev/fuse` does the
   same in pieces of up to 8 MiB, since a FUSE message moves whole, and a `/dev/kmsg` writev is one
-  record. Numeric sysctl writes parse all iovecs as one value. Host stdio fds that are not regular
+  record. Writable `/proc/sys` sysctl writes (numeric, string and bitmap) parse all iovecs as one
+  value. Host stdio fds that are not regular
   files on the host take the pipe path. Everything else
   goes iovec by iovec and stops at an incomplete one, as Linux does for files with only
   `read`/`write`. Over 1024 iovecs or a total over `isize::MAX` is `EINVAL`, and accepted iovecs

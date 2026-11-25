@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: enforce kernel/pid_max writes, wake hostname/domainname pollers with POLLPRI, and add protected_fifos/protected_regular)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: handle file position and gathered writes for string and bitmap sysctls)
 
 ## Responsibilities
 
@@ -114,11 +114,20 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
   root never passes): `dmesg_restrict`, `kernel.tainted`, `kptr_restrict`,
   `unprivileged_bpf_disabled` and seccomp `actions_logged` need `CAP_SYS_ADMIN`; `mmap_min_addr`
   needs `CAP_SYS_RAWIO`.
-- Numeric handlers parse a write or writev once at offset zero. Signed integer and unsigned-long
-  writes advance the open position. Linux 6.1 unsigned-int and byte handlers keep an initial
-  write at zero. Nonzero offsets consume input without changing the value. The IPv6 forwarding
-  and linkdown fixups for `all` and device entries return one byte and keep their position.
-  Positioned writes preserve the open position. Successful writes mark the snapshot stale.
+- Writable `/proc/sys` handlers gather a `write` or `writev` into one input buffer (validating
+  all iovecs before mutating):
+  - signed integer, unsigned-long and string (`proc_dostring`: `hostname`, `domainname`,
+    `core_pattern`, `modprobe`, `printk_devkmsg`, `seccomp/actions_logged`,
+    `tcp_congestion_control`, `tcp_fastopen_key`, `stable_secret`) handlers apply writes at offset
+    zero, ignore nonzero-offset writes without changing the value, and advance the open position;
+  - Linux 6.1 unsigned-int and byte handlers keep an initial write at zero and advance on nonzero
+    offsets without changing the value;
+  - bitmap (`ipv4/ip_local_reserved_ports`, Linux 6.1's `proc_do_large_bitmap`) replaces the port
+    set at offset zero, ORs/merges new port ranges at nonzero offsets (rejecting invalid input with
+    `EINVAL`), and advances the open position;
+  - the IPv6 forwarding and linkdown fixups for `all` and device entries return one byte and keep
+    their position;
+  - positioned writes preserve the open position, and successful writes mark the snapshot stale.
 
 ### Recorded sysctls and constants
 
@@ -183,7 +192,7 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
 
 ## Confirmed bugs / technical debt
 
-- String and bitmap sysctls still process successive writes independently of the file position.
+- None recorded.
 
 ## Open questions
 

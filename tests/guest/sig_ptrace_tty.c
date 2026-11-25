@@ -106,8 +106,29 @@
 #ifndef PTRACE_EVENT_EXIT
 #define PTRACE_EVENT_EXIT 6
 #endif
+#ifndef SYS_timer_create
+#define SYS_timer_create 107
+#endif
+#ifndef SYS_timer_settime
+#define SYS_timer_settime 110
+#endif
+#ifndef SYS_timer_delete
+#define SYS_timer_delete 111
+#endif
 #ifndef SYS_settimeofday
 #define SYS_settimeofday 170
+#endif
+#ifndef SYS_mq_open
+#define SYS_mq_open 180
+#endif
+#ifndef SYS_mq_unlink
+#define SYS_mq_unlink 181
+#endif
+#ifndef SYS_mq_timedsend
+#define SYS_mq_timedsend 182
+#endif
+#ifndef SYS_mq_notify
+#define SYS_mq_notify 184
 #endif
 #ifndef SYS_process_vm_readv
 #define SYS_process_vm_readv 270
@@ -1998,6 +2019,126 @@ static void test_mrs_unallocated_id_regs_sigill(void)
     }
 }
 
+/* RT signals when RLIMIT_SIGPENDING is full: POSIX timer preserves SI_TIMER SigInfo,
+ * mq_notify is dropped rather than corrupted to SI_USER, F_SETSIG falls back to SIGIO/SI_KERNEL,
+ * and kill still sets the pending bit with default SI_USER. */
+static void test_rt_signal_rlimit_sigpending(void)
+{
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork rt rlimit test");
+    if (pid == 0) {
+        int rt0 = SIGRTMIN;
+        int rt_timer = SIGRTMIN + 1;
+        int rt_mq = SIGRTMIN + 2;
+        int rt_io = SIGRTMIN + 3;
+        int rt_kill = SIGRTMIN + 4;
+
+        sigset_t set;
+        sigemptyset(&set);
+        int sigs[] = {SIGIO, rt0, rt_timer, rt_mq, rt_io, rt_kill};
+        for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
+            sigaddset(&set, sigs[i]);
+        CHECK(sigprocmask(SIG_BLOCK, &set, NULL) == 0, "block test signals");
+
+        /* Create POSIX timer before lowering RLIMIT_SIGPENDING */
+        int timer_id = -1;
+        struct k_sigevent {
+            union sigval sigev_value;
+            int sigev_signo;
+            int sigev_notify;
+            char pad[48];
+        };
+        struct k_sigevent sev = {
+            .sigev_value.sival_int = 4242, .sigev_signo = rt_timer, .sigev_notify = 0};
+        CHECK(syscall(SYS_timer_create, CLOCK_MONOTONIC, &sev, &timer_id) == 0, "timer_create");
+
+        /* Create POSIX mqueue and register mq_notify */
+        struct {
+            long mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs;
+            long reserved[4];
+        } attr = {.mq_maxmsg = 4, .mq_msgsize = 16};
+        int mq = (int)syscall(SYS_mq_open, "rt_rlimit_test", O_CREAT | O_RDWR, 0600, &attr);
+        CHECK(mq >= 0, "mq_open");
+        syscall(SYS_mq_unlink, "rt_rlimit_test");
+        struct k_sigevent mq_sev = {
+            .sigev_value.sival_int = 7777, .sigev_signo = rt_mq, .sigev_notify = 0};
+        CHECK(syscall(SYS_mq_notify, mq, &mq_sev) == 0, "mq_notify");
+
+        /* Lower RLIMIT_SIGPENDING to 1 and fill that 1 slot with sigqueue */
+        struct rlimit rl = {1, 1};
+        CHECK(setrlimit(RLIMIT_SIGPENDING, &rl) == 0, "setrlimit RLIMIT_SIGPENDING");
+        union sigval sv = {.sival_int = 111};
+        CHECK(sigqueue(getpid(), rt0, sv) == 0, "first sigqueue fills slot");
+        CHECK(sigqueue(getpid(), rt0, sv) < 0 && errno == EAGAIN, "second sigqueue -> EAGAIN");
+
+        /* 1. Fire POSIX timer while queue is full */
+        struct itimerspec its = {{0, 0}, {0, 1000000}};
+        CHECK(syscall(SYS_timer_settime, timer_id, 0, &its, NULL) == 0, "timer_settime");
+        usleep(20000);
+
+        /* 2. Fire mq_notify while queue is full */
+        CHECK(syscall(SYS_mq_timedsend, mq, "hi", 2, 0, NULL) == 0, "mq_timedsend");
+
+        /* 3. Fire F_SETSIG (O_ASYNC pipe) while queue is full */
+        int pfd[2];
+        CHECK(pipe(pfd) == 0, "pipe");
+        CHECK(fcntl(pfd[0], F_SETOWN, getpid()) == 0, "F_SETOWN");
+        CHECK(fcntl(pfd[0], F_SETSIG, rt_io) == 0, "F_SETSIG");
+        CHECK(fcntl(pfd[0], F_SETFL, O_ASYNC) == 0, "O_ASYNC");
+        CHECK(write(pfd[1], "x", 1) == 1, "write pipe");
+        usleep(20000);
+
+        /* 4. Fire kill() on RT signal while queue is full */
+        CHECK(kill(getpid(), rt_kill) == 0, "kill RT");
+
+        int got_rt0 = 0, got_timer = 0, got_mq = 0, got_rt_io = 0, got_sigio = 0, got_kill = 0;
+        struct timespec zero = {0, 0};
+        for (;;) {
+            siginfo_t si;
+            memset(&si, 0, sizeof(si));
+            int s = sigtimedwait(&set, &si, &zero);
+            if (s < 0)
+                break;
+            if (s == rt0) {
+                CHECK(si.si_code == SI_QUEUE && si.si_value.sival_int == 111, "rt0 siginfo");
+                got_rt0++;
+            } else if (s == rt_timer) {
+                CHECK(si.si_code == SI_TIMER && si.si_value.sival_int == 4242,
+                      "timer lost siginfo: code=%d val=%d", si.si_code, si.si_value.sival_int);
+                got_timer++;
+            } else if (s == rt_mq) {
+                got_mq++;
+            } else if (s == rt_io) {
+                got_rt_io++;
+            } else if (s == SIGIO) {
+                CHECK(si.si_code == SI_KERNEL, "SIGIO fallback expected SI_KERNEL, got %d",
+                      si.si_code);
+                got_sigio++;
+            } else if (s == rt_kill) {
+                CHECK(si.si_code == SI_USER && si.si_pid == 0 && si.si_uid == 0,
+                      "kill overflow expected SI_USER/0/0, got %d/%d/%u", si.si_code, si.si_pid,
+                      si.si_uid);
+                got_kill++;
+            }
+        }
+        CHECK(got_rt0 == 1, "expected 1 rt0, got %d", got_rt0);
+        CHECK(got_timer == 1, "expected 1 timer with SI_TIMER, got %d", got_timer);
+        CHECK(got_mq == 0, "expected mq_notify dropped on full queue, got %d", got_mq);
+        CHECK(got_rt_io == 0 && got_sigio == 1,
+              "expected F_SETSIG fallback to SIGIO (rt_io=%d sigio=%d)", got_rt_io, got_sigio);
+        CHECK(got_kill == 1, "expected 1 kill overflow, got %d", got_kill);
+
+        close(pfd[0]);
+        close(pfd[1]);
+        close(mq);
+        syscall(SYS_timer_delete, timer_id);
+        _exit(0);
+    }
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+          "rt rlimit child failed (status=%#x)", st);
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "--exec-helper") == 0) {
@@ -2026,6 +2167,7 @@ int main(int argc, char **argv)
     test_coredump_umask_fsize_suid_dumpable();
     test_seccomp_klog_and_user_notif_log();
     test_mrs_unallocated_id_regs_sigill();
+    test_rt_signal_rlimit_sigpending();
 
     puts("all ok");
     return 0;

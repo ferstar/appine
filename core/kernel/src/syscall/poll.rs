@@ -2669,10 +2669,20 @@ pub(crate) fn send_to_owner(
             euid == 0 || [uid, euid].iter().any(|&id| id == c.ruid || id == c.suid)
         })
     };
+    // Linux 6.1's send_sigio_to_task falls back to SIGIO/SI_KERNEL on RT RLIMIT_SIGPENDING overflow.
+    let sigio = crate::process::Signal::new(29).unwrap();
+    let send_group = |tgid| {
+        if !signal::try_send_to_group(k, tgid, sig, info) && sig != sigio {
+            signal::send_to_group(k, tgid, sigio, signal::SigInfo::kernel());
+        }
+    };
     match ty {
         F_OWNER_TID => {
-            if let Some(t) = k.tasks.get(&pid).filter(|_| allowed(pid)) {
-                signal::send_to_task(k, t, sig, info);
+            if let Some(t) = k.tasks.get(&pid).filter(|_| allowed(pid))
+                && !signal::try_send_to_task(k, t, sig, info)
+                && sig != sigio
+            {
+                signal::send_to_task(k, t, sigio, signal::SigInfo::kernel());
             }
         }
         F_OWNER_PGRP => {
@@ -2683,10 +2693,10 @@ pub(crate) fn send_to_owner(
                 .map(|g| g.borrow().tgid)
                 .collect();
             for tgid in members.into_iter().filter(|&g| allowed(g)) {
-                signal::send_to_group(k, tgid, sig, info);
+                send_group(tgid);
             }
         }
-        _ if allowed(pid) => signal::send_to_group(k, pid, sig, info),
+        _ if allowed(pid) => send_group(pid),
         _ => {}
     }
 }

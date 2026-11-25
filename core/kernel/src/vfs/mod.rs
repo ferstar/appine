@@ -2999,6 +2999,20 @@ impl Vfs {
         (self.fs_of(node) == Fs::Tmpfs).then(|| self.dev_of(node))
     }
 
+    /// The store inode at the root of the superblock (filesystem instance) containing store
+    /// `node`: `ROOT` for the root filesystem and the instance's detached root inode for tmpfs.
+    pub(crate) fn store_sb_root(&self, node: &Node) -> Option<Ino> {
+        let Node::Store(mnt, _) = *node else {
+            return None;
+        };
+        let (fs, dev) = self.with_mount(mnt, |m| (m.fs, m.dev))?;
+        match fs {
+            Fs::Store => Some(ROOT),
+            Fs::Tmpfs => self.mounts.borrow().tmpfs.get(&dev).map(|t| t.root),
+            _ => None,
+        }
+    }
+
     /// Charge a mapped overlay file to the tmpfs layer that supplies its data.
     pub(crate) fn mapped_tmpfs_dev(&self, node: &Node, ino: Ino) -> Option<u64> {
         let Node::Overlay(_, id) = node else {

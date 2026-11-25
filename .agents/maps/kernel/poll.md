@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-17 (full mapping: 3 research concerns, 14 claims checked by 2 independent verifiers)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: event-driven epoll ready list with HostEpoll/EpollWatches, batched ppoll/pselect6 and host-fd reuse in Waits, stable EPOLLEXCLUSIVE waiter order, and Vfs-aware epoll fdinfo sdev/ino)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: fall back to `SIGIO` with `SI_KERNEL` when an `F_SETSIG` RT signal fails on `RLIMIT_SIGPENDING` overflow)
 
 ## Responsibilities
 
@@ -253,7 +253,9 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   clears reported read/write bits when the counters moved (`drained`, `reads` — bumped by read-file
   syscalls only — and arrivals), computes new events, adds host fds' not-yet-ready bits to its
   host poll, and sends: `SIGIO` with kernel siginfo, or the `F_SETSIG` signal with `POLL_*` code,
-  band (Linux's band table) and fd. Owners are a thread, process or process group
+  band (Linux's band table) and fd (falling back to `SIGIO` with `SI_KERNEL` if an RT `F_SETSIG`
+  signal fails to queue on `RLIMIT_SIGPENDING` overflow, matching Linux 6.1's `send_sigio_to_task`).
+  Owners are a thread, process or process group
   (`send_to_owner`), stored as global ids with the setter's real and effective user IDs; a thread
   owner, or a process through its main thread's credentials (the process's once that thread is
   gone), gets the signal only when that effective ID is root or either ID is its real or saved user

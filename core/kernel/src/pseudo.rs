@@ -3115,9 +3115,9 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             | b"devices/system/cpu/possible"
             | b"devices/system/cpu/present" => cpu_list(0..cpus()),
             b"devices/system/cpu/offline" => "\n".to_owned(),
-            // The defaults of 6.1's Kconfig, which are what the overlay does: no index, redirects,
-            // metacopy, NFS export or xino
-            b"module/overlay/parameters/redirect_always_follow" => "Y\n".to_owned(),
+            // The defaults of 6.1's Kconfig, except redirect_always_follow which is N because
+            // Appine does not follow trusted.overlay.redirect (no index, redirects, metacopy,
+            // NFS export or xino)
             b"module/overlay/parameters/redirect_max" => "256\n".to_owned(),
             p if p.starts_with(b"module/overlay/parameters/") => "N\n".to_owned(),
             _ => return Err(Errno::EISDIR),
@@ -4656,31 +4656,30 @@ fn host_cpu(n: u32) -> Option<usize> {
 // ---- Writing ----
 
 #[derive(Clone, Copy)]
-enum NumericWrite {
+enum SysctlWrite {
+    // Signed ints, unsigned longs and strings (proc_dostring): update at 0, advance pos.
     Advance,
     // Linux 6.1's proc_douintvec and proc_dou8vec leave a successful initial write at zero.
     Unsigned,
     // addrconf returns one byte for a forwarding or linkdown fixup and restores the position.
     Ipv6Fixup,
+    // Linux 6.1's proc_do_large_bitmap replaces at 0, ORs at nonzero offsets, and advances pos.
+    Bitmap,
 }
 
-/// Position rule of a numeric sysctl. Text, bitmaps and ordinary proc files have other handlers.
-fn numeric_write(node: &PseudoNode) -> Option<NumericWrite> {
-    use NumericWrite::*;
+/// Position rule of a writable `/proc/sys` sysctl. Ordinary procfs and cgroup files return None.
+fn sysctl_write(node: &PseudoNode) -> Option<SysctlWrite> {
+    use SysctlWrite::*;
+    if !writable(node) {
+        return None;
+    }
     let rule = match node {
-        PseudoNode::UtsSysctl(..) => return None,
-        PseudoNode::Static(
-            b"sys/kernel/modprobe"
-            | b"sys/kernel/core_pattern"
-            | b"sys/kernel/printk_devkmsg"
-            | b"sys/kernel/seccomp/actions_logged",
-        ) => return None,
         PseudoNode::Static(b"sys/fs/pipe-max-size") => Unsigned,
-        PseudoNode::Static(p) if p.starts_with(b"sys/") && writable(node) => Advance,
-        PseudoNode::IpcSysctl(..) | PseudoNode::PidSysctl(..) | PseudoNode::NetStatic(..) => {
-            Advance
-        }
-        PseudoNode::NetConf(true, _, b"stable_secret", _) => return None,
+        PseudoNode::Static(p) if p.starts_with(b"sys/") => Advance,
+        PseudoNode::UtsSysctl(..)
+        | PseudoNode::IpcSysctl(..)
+        | PseudoNode::PidSysctl(..)
+        | PseudoNode::NetStatic(..) => Advance,
         PseudoNode::NetConf(true, dir, b"forwarding" | b"ignore_routes_with_linkdown", _)
             if *dir != crate::netdev::ConfDir::Default =>
         {
@@ -4699,12 +4698,12 @@ fn numeric_write(node: &PseudoNode) -> Option<NumericWrite> {
         ) => Unsigned,
         PseudoNode::NetConf(..) => Advance,
         PseudoNode::NetSysctl(path, _) => match path.split_once('/')? {
-            ("ipv4", "tcp_congestion_control" | "ip_local_reserved_ports" | "tcp_fastopen_key") => {
-                return None;
-            }
+            ("ipv4", "ip_local_reserved_ports") => Bitmap,
             (
                 "ipv4",
-                "icmp_ratelimit"
+                "tcp_congestion_control"
+                | "tcp_fastopen_key"
+                | "icmp_ratelimit"
                 | "icmp_ratemask"
                 | "igmp_max_memberships"
                 | "igmp_max_msf"
@@ -4764,8 +4763,8 @@ fn numeric_write(node: &PseudoNode) -> Option<NumericWrite> {
     Some(rule)
 }
 
-pub(crate) fn is_numeric_sysctl(node: &PseudoNode) -> bool {
-    numeric_write(node).is_some()
+pub(crate) fn is_sysctl_write(node: &PseudoNode) -> bool {
+    sysctl_write(node).is_some()
 }
 
 /// Writes a synthetic file: cgroup files go to [`crate::cgroup::write`], the id maps,
@@ -4798,28 +4797,29 @@ pub(crate) fn write(
     if required.is_some_and(|cap| !cred.capable(cap)) {
         return Err(Errno::EPERM);
     }
-    let numeric = numeric_write(node);
-    if numeric.is_none() || (pos == 0 && !data.is_empty()) {
+    let sysctl = sysctl_write(node);
+    let apply = match sysctl {
+        None => true,
+        Some(SysctlWrite::Bitmap) => !data.is_empty(),
+        Some(_) => pos == 0 && !data.is_empty(),
+    };
+    if apply {
         write_value(k, (tid, cred, opener), (ns, pid_ns), node, data, pos)?;
     }
-    // Per-process numbers consume at most the 12 bytes parsed by proc_number.
-    // ID map writes advance the file position (Linux's map_write: `*ppos += count`), so a second
-    // write on the same descriptor without rewinding sees a nonzero offset and fails with EINVAL.
-    let result = match numeric {
-        Some(NumericWrite::Ipv6Fixup) => (count.min(1), pos),
-        Some(NumericWrite::Unsigned) if pos == 0 => (count, pos),
-        Some(_) => (count, pos + count as u64),
-        None if matches!(node, PseudoNode::Entry(_, _, Entry::UidMap | Entry::GidMap)) => {
-            (count, pos + count as u64)
-        }
-        None if matches!(
-            node,
-            PseudoNode::Entry(_, _, Entry::OomScoreAdj | Entry::CoredumpFilter)
-        ) =>
-        {
-            (count.min(12), pos)
-        }
-        None => (count, pos),
+    // Linux 6.1 position/count rules: sysctls advance (except Unsigned at 0 and Ipv6Fixup);
+    // uid_map/gid_map/setgroups and cgroup2 (kernfs) advance; oom_score_adj clamps to 12 and
+    // preserves pos; comm, coredump_filter and timens_offsets return count and preserve pos.
+    let result = match (sysctl, node) {
+        (Some(SysctlWrite::Ipv6Fixup), _) => (count.min(1), pos),
+        (Some(SysctlWrite::Unsigned), _) if pos == 0 => (count, pos),
+        (Some(_), _)
+        | (
+            None,
+            PseudoNode::Entry(_, _, Entry::UidMap | Entry::GidMap | Entry::Setgroups)
+            | PseudoNode::Cgroup(..),
+        ) => (count, pos + count as u64),
+        (None, PseudoNode::Entry(_, _, Entry::OomScoreAdj)) => (count.min(12), pos),
+        (None, _) => (count, pos),
     };
     Ok(result)
 }
@@ -4853,16 +4853,22 @@ fn write_value(
             return write_id_map(k, (cred, opener), *proc, *e == Entry::GidMap, data, pos);
         }
         PseudoNode::Entry(proc, _, Entry::Setgroups) => {
-            return write_setgroups(k, opener, *proc, data);
+            return write_setgroups(k, opener, *proc, data, pos);
         }
         PseudoNode::Entry(proc, None, Entry::TimensOffsets) => {
-            return write_timens_offsets(k, opener, *proc, data);
+            return write_timens_offsets(k, opener, *proc, data, pos);
         }
         // Network namespace sysctls: the pinned lookup namespace (crate::netconf)
         PseudoNode::NetConf(v6, dir, name, net) => {
             return crate::netdev::conf_write(&net.0, *v6, *dir, name, data);
         }
         PseudoNode::NetSysctl(path, net) => {
+            if *path == "ipv4/ip_local_reserved_ports" && pos != 0 {
+                let mut devs = net.0.devs.borrow_mut();
+                let current = crate::netconf::sysctl_read(&devs.conf, path);
+                let merged = merge_port_bitmap(&current, data)?;
+                return crate::netconf::sysctl_write(&mut devs.conf, path, merged.as_bytes());
+            }
             return crate::netconf::sysctl_write(&mut net.0.devs.borrow_mut().conf, path, data);
         }
         PseudoNode::NetStatic(b"sys/net/ipv4/ip_forward", net) => {
@@ -5198,10 +5204,13 @@ fn write_value(
             .ok_or(Errno::EINVAL)?;
         k.core_uses_pid = v != 0;
     }
-    // Parsed the C way, as on Linux (0x prefix is hexadecimal, 0 prefix octal), keeping only 9
-    // bits
+    // Parsed the C way, as on Linux (`kstrtouint_from_user` base 0), keeping only 9 bits
     if let PseudoNode::Entry(proc, _, Entry::CoredumpFilter) = node {
-        let value = kstrto(proc_number(data)?, false)?;
+        let trimmed = data.split(|&b| b == 0).next().unwrap_or(data);
+        let text = std::str::from_utf8(trimmed)
+            .map_err(|_| Errno::EINVAL)?
+            .trim();
+        let value = kstrto(text, false)?;
         let group = group_of_id(k, *proc).ok_or(Errno::ESRCH)?;
         group.borrow_mut().coredump_filter = value as u32 & 0x1ff;
     }
@@ -5318,8 +5327,18 @@ fn write_id_map(
 /// only by whitespace (EINVAL); the opener needs `CAP_SYS_ADMIN` in that user namespace (checked
 /// at open as Linux's `proc_setgroups_open` does, `EACCES`, and again here in case the process has
 /// moved to another namespace since, EPERM). Once denied it cannot be allowed again, and it cannot
-/// be denied after gid_map has been written (EPERM).
-fn write_setgroups(k: &Kernel, opener: &Cred, proc: ProcId, data: &[u8]) -> Result<(), Errno> {
+/// be denied after gid_map has been written (EPERM). Only writes starting at offset 0 are
+/// accepted (EINVAL otherwise).
+fn write_setgroups(
+    k: &Kernel,
+    opener: &Cred,
+    proc: ProcId,
+    data: &[u8],
+    pos: u64,
+) -> Result<(), Errno> {
+    if pos != 0 {
+        return Err(Errno::EINVAL);
+    }
     let g = group_of_id(k, proc).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
     if !opener.ns_capable(&ns, cap::SYS_ADMIN) {
@@ -5351,12 +5370,19 @@ fn write_setgroups(k: &Kernel, opener: &Cred, proc: ProcId, data: &[u8]) -> Resu
 /// Writes `/proc/<pid>/timens_offsets` (Linux 6.1's `timens_offsets_write`,
 /// `proc_timens_set_offset`): one or two lines of `<clock> <seconds> <nanoseconds>`, where the
 /// clock is `monotonic`, `boottime` or their numbers 1 and 7. Writes into the time namespace that
-/// process uses for children: the opener needs `CAP_SYS_TIME` in its owner (EPERM; Linux's
-/// `file_ns_capable`), the clocks with the offsets added must be within [0, KTIME_SEC_MAX / 2]
-/// (ERANGE), and once a process has entered it is EACCES.
-fn write_timens_offsets(k: &Kernel, cred: &Cred, proc: ProcId, data: &[u8]) -> Result<(), Errno> {
+/// process uses for children: only writes at offset 0 and `< PAGE_SIZE` are accepted (`EINVAL`),
+/// the opener needs `CAP_SYS_TIME` in its owner (EPERM; Linux's `file_ns_capable`), the clocks
+/// with the offsets added must be within [0, KTIME_SEC_MAX / 2] (ERANGE), and once a process has
+/// entered it is EACCES.
+fn write_timens_offsets(
+    k: &Kernel,
+    cred: &Cred,
+    proc: ProcId,
+    data: &[u8],
+    pos: u64,
+) -> Result<(), Errno> {
     const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
-    if data.len() >= 4096 {
+    if pos != 0 || data.len() >= 4096 {
         return Err(Errno::EINVAL);
     }
     let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
@@ -5415,9 +5441,66 @@ fn write_timens_offsets(k: &Kernel, cred: &Cred, proc: ProcId, data: &[u8]) -> R
     Ok(())
 }
 
-/// The buffer of the number-taking files in `/proc/<pid>` (oom_score_adj, coredump_filter): as
-/// with Linux's `PROC_NUMBUF`, only the first 12 bytes up to a NUL are looked at (values runc
-/// writes end in a NUL), with whitespace stripped from both ends (`strstrip`).
+/// Merges a nonzero-offset write to `net.ipv4.ip_local_reserved_ports` into the existing port
+/// bitmap (Linux 6.1's `proc_do_large_bitmap`: offset 0 replaces, nonzero offsets OR into the
+/// bitmap) and formats the sorted coalesced range list.
+fn merge_port_bitmap(current: &str, data: &[u8]) -> Result<String, Errno> {
+    let mut bits = vec![0u64; 1024]; // 65536 ports
+    let parse_into = |text: &str, bits: &mut [u64]| -> Result<(), Errno> {
+        let text = text.trim_end_matches(['\n', '\0']).trim();
+        for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let (lo, hi) = match part.split_once('-') {
+                Some((a, b)) => {
+                    let lo: u16 = a.trim().parse().map_err(|_| Errno::EINVAL)?;
+                    let hi: u16 = b.trim().parse().map_err(|_| Errno::EINVAL)?;
+                    if lo > hi {
+                        return Err(Errno::EINVAL);
+                    }
+                    (lo, hi)
+                }
+                None => {
+                    let p: u16 = part.parse().map_err(|_| Errno::EINVAL)?;
+                    (p, p)
+                }
+            };
+            for p in usize::from(lo)..=usize::from(hi) {
+                bits[p / 64] |= 1u64 << (p % 64);
+            }
+        }
+        Ok(())
+    };
+    let incoming = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+    parse_into(current, &mut bits)?;
+    parse_into(incoming, &mut bits)?;
+    let has = |p: usize| bits[p / 64] & (1u64 << (p % 64)) != 0;
+    let mut ranges = Vec::new();
+    let mut p = 0;
+    while p < 65536 {
+        if bits[p / 64] == 0 {
+            p += 64 - (p % 64);
+            continue;
+        }
+        if !has(p) {
+            p += 1;
+            continue;
+        }
+        let start = p;
+        while p + 1 < 65536 && has(p + 1) {
+            p += 1;
+        }
+        ranges.push(if start == p {
+            start.to_string()
+        } else {
+            format!("{start}-{p}")
+        });
+        p += 1;
+    }
+    Ok(ranges.join(","))
+}
+
+/// The buffer of `/proc/<pid>/oom_score_adj`: as with Linux's `PROC_NUMBUF`, only the first 12
+/// bytes up to a NUL are looked at (values runc writes end in a NUL), with whitespace stripped
+/// from both ends (`strstrip`).
 fn proc_number(data: &[u8]) -> Result<&str, Errno> {
     let data = &data[..data.len().min(12)];
     let data = data.split(|&b| b == 0).next().unwrap_or(data);
@@ -5671,5 +5754,127 @@ mod tests {
         let k = Kernel::new(crate::process::Tier::Interpreter);
         assert_eq!(recorded_value(&k, PROTECTED_FIFOS), 1);
         assert_eq!(recorded_value(&k, PROTECTED_REGULAR), 2);
+    }
+
+    #[test]
+    fn overlay_redirect_always_follow_reports_n() {
+        let dir = std::env::temp_dir().join(format!("appine-pseudo-ovl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::vfs::store::Store::create(&dir).unwrap());
+        let vfs = crate::vfs::Vfs::open(&dir).unwrap();
+        let k = Kernel::new(crate::process::Tier::Interpreter);
+        let view = View {
+            k: &k,
+            vfs: &vfs,
+            tid: 1,
+            tgid: 1,
+            cred: None,
+            opening: false,
+        };
+        assert_eq!(
+            content(
+                &view,
+                crate::vfs::SYS_MOUNT,
+                &PseudoNode::Sys(b"module/overlay/parameters/redirect_always_follow"),
+            )
+            .unwrap(),
+            b"N\n"
+        );
+        assert_eq!(
+            content(
+                &view,
+                crate::vfs::SYS_MOUNT,
+                &PseudoNode::Sys(b"module/overlay/parameters/redirect_max"),
+            )
+            .unwrap(),
+            b"256\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn string_bitmap_sysctl_and_synthetic_write_positions() {
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let cred = Cred::root();
+        let ns = k.init_ns.clone();
+        let pid_ns = PidNs::init();
+        let uts = PinnedUts(ns.uts.clone());
+        let net = PinnedNet(ns.net.clone());
+        let hostname = PseudoNode::UtsSysctl(b"sys/kernel/hostname", uts.clone());
+        let reserved = PseudoNode::NetSysctl("ipv4/ip_local_reserved_ports", net.clone());
+
+        // String and bitmap sysctls are classified as sysctl writes (gathered writev + pos rules).
+        for node in [
+            hostname.clone(),
+            reserved.clone(),
+            PseudoNode::NetSysctl("ipv4/tcp_congestion_control", net.clone()),
+            PseudoNode::Static(b"sys/kernel/core_pattern"),
+            PseudoNode::Static(b"sys/kernel/modprobe"),
+            PseudoNode::Static(b"sys/kernel/printk_devkmsg"),
+            PseudoNode::Static(b"sys/kernel/seccomp/actions_logged"),
+        ] {
+            assert!(is_sysctl_write(&node));
+        }
+
+        // Bitmap merging helper for nonzero-offset writes to ip_local_reserved_ports.
+        assert_eq!(merge_port_bitmap("1000\n", b"2000\n").unwrap(), "1000,2000");
+        assert_eq!(
+            merge_port_bitmap("1000-1005\n", b"1003-1010,500\n").unwrap(),
+            "500,1000-1010"
+        );
+        assert_eq!(merge_port_bitmap("1000\n", b"\n").unwrap(), "1000");
+        assert_eq!(merge_port_bitmap("1000\n", b"bad\n"), Err(Errno::EINVAL));
+        assert_eq!(
+            merge_port_bitmap("1000\n", b"2000-1000\n"),
+            Err(Errno::EINVAL)
+        );
+
+        let sub = k
+            .cgroups
+            .mkdir(crate::cgroup::ROOT, b"sub", &cred, 0o755)
+            .unwrap();
+        let cg = PseudoNode::Cgroup(sub, b"cgroup.max.depth", 0);
+        let mut do_write = |node: &PseudoNode, data: &[u8], pos: u64| {
+            write(
+                &mut k,
+                (1, &cred, &cred),
+                (&ns, &pid_ns),
+                node,
+                data,
+                (pos, data.len()),
+            )
+        };
+        let read_reserved = || {
+            crate::netconf::sysctl_read(&net.0.devs.borrow().conf, "ipv4/ip_local_reserved_ports")
+        };
+
+        // String sysctl: offset 0 updates and advances pos; nonzero offset ignores and advances.
+        let (n, pos) = do_write(&hostname, b"hostA\n", 0).unwrap();
+        assert_eq!((n, pos), (6, 6));
+        assert_eq!(uts.0.hostname.borrow().as_slice(), b"hostA");
+        let (n, pos) = do_write(&hostname, b"hostB\n", pos).unwrap();
+        assert_eq!((n, pos), (6, 12));
+        assert_eq!(uts.0.hostname.borrow().as_slice(), b"hostA");
+
+        // Bitmap sysctl: offset 0 replaces and advances pos; nonzero offset ORs into bitmap.
+        let (n, pos) = do_write(&reserved, b"1000\n", 0).unwrap();
+        assert_eq!((n, pos), (5, 5));
+        assert_eq!(read_reserved(), "1000\n");
+        let (n, pos) = do_write(&reserved, b"2000,1001\n", pos).unwrap();
+        assert_eq!((n, pos), (10, 15));
+        assert_eq!(read_reserved(), "1000-1001,2000\n");
+        // Invalid write at nonzero offset fails with EINVAL and leaves value intact.
+        assert_eq!(do_write(&reserved, b"oops\n", pos), Err(Errno::EINVAL));
+        assert_eq!(read_reserved(), "1000-1001,2000\n");
+        // Offset 0 replaces again.
+        let (n, pos) = do_write(&reserved, b"3000\n", 0).unwrap();
+        assert_eq!((n, pos), (5, 5));
+        assert_eq!(read_reserved(), "3000\n");
+
+        // Cgroup2 file write advances position (kernfs_fop_write_iter) and accepts subsequent writes.
+        let (n, pos) = do_write(&cg, b"10\n", 0).unwrap();
+        assert_eq!((n, pos), (3, 3));
+        let (n, pos) = do_write(&cg, b"20\n", pos).unwrap();
+        assert_eq!((n, pos), (3, 6));
     }
 }

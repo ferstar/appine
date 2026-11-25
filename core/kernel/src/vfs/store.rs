@@ -1094,6 +1094,38 @@ impl Store {
         Ok(parent)
     }
 
+    /// The root directory of the filesystem tree containing live inode `ino` (`ROOT` for the
+    /// root filesystem, or the detached root inode for a tmpfs/staging tree); `None` if `ino` is
+    /// unlinked.
+    pub fn tree_root(&self, ino: Ino) -> Result<Option<Ino>, Errno> {
+        let st = self.attrs(ino)?;
+        if st.nlink == 0 {
+            return Ok(None);
+        }
+        let mut dir = if st.is_dir() {
+            ino
+        } else {
+            self.begin_read()?;
+            let Some(parent) = self
+                .db()
+                .prepare_cached("SELECT parent FROM dentries WHERE ino = ?1 LIMIT 1")
+                .and_then(|mut st| st.query_row(params![ino], |r| r.get::<_, Ino>(0)))
+                .optional()
+                .map_err(db_err)?
+            else {
+                return Ok(None);
+            };
+            parent
+        };
+        loop {
+            let up = self.parent(dir)?;
+            if up == dir {
+                return Ok(Some(dir));
+            }
+            dir = up;
+        }
+    }
+
     /// Lists a directory's contents, sorted by name, without `.` and `..`.
     pub fn readdir(&self, dir: Ino) -> Result<Vec<DirEntry>, Errno> {
         let generation = self.cache_generation();
@@ -4899,6 +4931,34 @@ mod tests {
             !dir.join("objects").join(c.to_string()).exists(),
             "settled deleted held file's own object must be reaped after release"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tree_root_separates_rootfs_and_detached_trees() {
+        let (s, dir) = temp_store("tree_root");
+        let sub = s.mkdir(ROOT, b"sub", 0o755, 0, 0).unwrap();
+        let (rf, _) = s.create_file(sub, b"rf", 0o644, 0, 0).unwrap();
+        s.link(ROOT, b"rf_link", rf).unwrap();
+        let t1 = s.create_detached_dir(0o1777, 0, 0).unwrap();
+        let t1_sub = s.mkdir(t1, b"nested", 0o755, 0, 0).unwrap();
+        let (t1_file, _) = s.create_file(t1_sub, b"f", 0o644, 0, 0).unwrap();
+        let t2 = s.create_detached_dir(0o1777, 0, 0).unwrap();
+        let (t2_file, _) = s.create_file(t2, b"g", 0o644, 0, 0).unwrap();
+        let (gone, _) = s.create_file(ROOT, b"gone", 0o644, 0, 0).unwrap();
+        s.unlink(ROOT, b"gone").unwrap();
+
+        assert_eq!(s.tree_root(ROOT).unwrap(), Some(ROOT));
+        assert_eq!(s.tree_root(sub).unwrap(), Some(ROOT));
+        assert_eq!(s.tree_root(rf).unwrap(), Some(ROOT));
+        assert_eq!(s.tree_root(t1).unwrap(), Some(t1));
+        assert_eq!(s.tree_root(t1_sub).unwrap(), Some(t1));
+        assert_eq!(s.tree_root(t1_file).unwrap(), Some(t1));
+        assert_eq!(s.tree_root(t2).unwrap(), Some(t2));
+        assert_eq!(s.tree_root(t2_file).unwrap(), Some(t2));
+        assert_eq!(s.tree_root(gone).unwrap(), None);
+
+        drop(s);
         let _ = fs::remove_dir_all(&dir);
     }
 }

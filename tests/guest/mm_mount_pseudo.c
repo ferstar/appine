@@ -115,6 +115,12 @@
 #ifndef SYS_io_getevents
 #define SYS_io_getevents 4
 #endif
+#ifndef SYS_name_to_handle_at
+#define SYS_name_to_handle_at 264
+#endif
+#ifndef SYS_open_by_handle_at
+#define SYS_open_by_handle_at 265
+#endif
 #ifndef SYS_mlock2
 #define SYS_mlock2 284
 #endif
@@ -214,6 +220,13 @@ static void pread_str(int fd, char *buf, size_t cap)
     ssize_t n = pread(fd, buf, cap - 1, 0);
     CHECK(n >= 0, "pread fd %d", fd);
     buf[n] = '\0';
+}
+
+static void check_pread_eq(int fd, const char *want, const char *label)
+{
+    char got[64];
+    pread_str(fd, got, sizeof(got));
+    CHECK(strcmp(got, want) == 0, "%s: expected %s, got %s", label, want, got);
 }
 
 static void wait_ok(pid_t pid, const char *label)
@@ -552,6 +565,184 @@ static void test_sysctl_write_position(void)
           "unsigned writes at zero keep the offset");
     CHECK(write(fd, saved, strlen(saved)) == (ssize_t)strlen(saved), "restore tcp_timestamps");
     close(fd);
+
+    /* String sysctl (hostname) & bitmap sysctl (ip_local_reserved_ports) in isolated ns */
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork string/bitmap sysctl test");
+    if (pid == 0) {
+        CHECK(unshare(CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWUSER | CLONE_NEWTIME) == 0,
+              "unshare uts+net+user+time");
+
+        /* setgroups advances offset and rejects nonzero offset with EINVAL */
+        int sg = open("/proc/self/setgroups", O_RDWR);
+        CHECK(sg >= 0, "open setgroups");
+        CHECK(write(sg, "allow\n", 6) == 6 && lseek(sg, 0, SEEK_CUR) == 6,
+              "setgroups write advances offset");
+        CHECK_ERR(write(sg, "deny\n", 5), EINVAL, "setgroups nonzero offset must fail EINVAL");
+        CHECK(pwrite(sg, "deny\n", 5, 0) == 5 && lseek(sg, 0, SEEK_CUR) == 6,
+              "setgroups pwrite at 0 succeeds and preserves offset");
+        close(sg);
+
+        /* timens_offsets rejects nonzero offset with EINVAL and leaves offset at 0 */
+        int tn = open("/proc/self/timens_offsets", O_RDWR);
+        CHECK(tn >= 0, "open timens_offsets");
+        CHECK_ERR(pwrite(tn, "monotonic 1 0\n", 14, 1), EINVAL,
+                  "timens_offsets nonzero offset must fail EINVAL");
+        CHECK(write(tn, "monotonic 1 0\n", 14) == 14 && lseek(tn, 0, SEEK_CUR) == 0,
+              "timens_offsets keeps offset at 0");
+        CHECK(write(tn, "boottime 2 0\n", 13) == 13 && lseek(tn, 0, SEEK_CUR) == 0,
+              "second timens_offsets write succeeds at offset 0");
+        close(tn);
+
+        /* oom_score_adj clamps return to 12 and keeps offset 0; coredump_filter returns full count */
+        int oom = open("/proc/self/oom_score_adj", O_RDWR);
+        CHECK(oom >= 0, "open oom_score_adj");
+        CHECK(write(oom, "0000000000015\n", 14) == 12 && lseek(oom, 0, SEEK_CUR) == 0,
+              "oom_score_adj clamps return to 12 and keeps offset 0");
+        close(oom);
+
+        int cdf = open("/proc/self/coredump_filter", O_RDWR);
+        CHECK(cdf >= 0, "open coredump_filter");
+        CHECK(write(cdf, "000000000033\n", 13) == 13 && lseek(cdf, 0, SEEK_CUR) == 0,
+              "coredump_filter returns full count and keeps offset 0");
+        close(cdf);
+
+        /* String sysctl: gathered writev, advances offset, ignores nonzero offset */
+        int hfd = open("/proc/sys/kernel/hostname", O_RDWR);
+        CHECK(hfd >= 0, "open hostname");
+        struct iovec hp[] = {{"host", 4}, {"A\n", 2}};
+        CHECK(writev(hfd, hp, 2) == 6 && lseek(hfd, 0, SEEK_CUR) == 6,
+              "hostname writev advances offset");
+        check_pread_eq(hfd, "hostA\n", "hostname writev");
+        CHECK(write(hfd, "hostB\n", 6) == 6 && lseek(hfd, 0, SEEK_CUR) == 12,
+              "hostname nonzero offset consumes input and advances");
+        check_pread_eq(hfd, "hostA\n", "hostname nonzero offset preserved");
+        CHECK(pwrite(hfd, "hostC\n", 6, 0) == 6 && lseek(hfd, 0, SEEK_CUR) == 12,
+              "hostname pwrite at 0 updates and preserves offset");
+        check_pread_eq(hfd, "hostC\n", "hostname pwrite");
+        close(hfd);
+
+        /* Bitmap sysctl: offset 0 replaces, nonzero offset ORs/merges, invalid nonzero -> EINVAL */
+        int pfd = open("/proc/sys/net/ipv4/ip_local_reserved_ports", O_RDWR);
+        CHECK(pfd >= 0, "open ip_local_reserved_ports");
+        CHECK(write(pfd, "1000\n", 5) == 5 && lseek(pfd, 0, SEEK_CUR) == 5,
+              "bitmap write at 0 advances offset");
+        check_pread_eq(pfd, "1000\n", "bitmap initial");
+        CHECK(write(pfd, "2000,1001\n", 10) == 10 && lseek(pfd, 0, SEEK_CUR) == 15,
+              "bitmap write at nonzero offset merges and advances");
+        check_pread_eq(pfd, "1000-1001,2000\n", "bitmap merged");
+        CHECK_ERR(write(pfd, "bad\n", 4), EINVAL, "invalid bitmap write at nonzero offset");
+        CHECK(lseek(pfd, 0, SEEK_CUR) == 15, "failed bitmap write preserves offset");
+        CHECK(pwrite(pfd, "3000\n", 5, 0) == 5 && lseek(pfd, 0, SEEK_CUR) == 15,
+              "bitmap pwrite at 0 replaces and preserves offset");
+        check_pread_eq(pfd, "3000\n", "bitmap replaced");
+        close(pfd);
+
+        _exit(0);
+    }
+    wait_ok(pid, "string/bitmap sysctl and proc write positions");
+
+    /* Cgroup2 file write advances position (kernfs_fop_write_iter) */
+    CHECK(mkdir("/sys/fs/cgroup/pos_cg", 0755) == 0, "mkdir pos_cg");
+    int cgfd = open("/sys/fs/cgroup/pos_cg/cgroup.max.depth", O_RDWR);
+    CHECK(cgfd >= 0, "open cgroup.max.depth");
+    CHECK(write(cgfd, "10\n", 3) == 3 && lseek(cgfd, 0, SEEK_CUR) == 3,
+          "cgroup write #1 advances pos");
+    CHECK(write(cgfd, "20\n", 3) == 3 && lseek(cgfd, 0, SEEK_CUR) == 6,
+          "cgroup write #2 advances pos");
+    check_pread_eq(cgfd, "20\n", "cgroup write #2 applied");
+    close(cgfd);
+    CHECK(rmdir("/sys/fs/cgroup/pos_cg") == 0, "rmdir pos_cg");
+}
+
+static void test_overlay_redirect_always_follow(void)
+{
+    char buf[32];
+    read_str("/sys/module/overlay/parameters/redirect_always_follow", buf, sizeof(buf));
+    CHECK(strcmp(buf, "N\n") == 0,
+          "redirect_always_follow must report N, got %s", buf);
+}
+
+static void test_open_by_handle_at_superblock_boundary(void)
+{
+    struct {
+        unsigned int handle_bytes;
+        int handle_type;
+        unsigned char f_handle[16];
+    } h_root = {.handle_bytes = 16}, h_t1 = {.handle_bytes = 16},
+      h_forged = {.handle_bytes = 8, .handle_type = 1};
+    int mnt_id = 0;
+
+    static const char *const dirs[] = {
+        "/tmp/obh_root_bind",
+        "/tmp/obh_t1",
+        "/tmp/obh_t1_bind",
+        "/tmp/obh_t2",
+    };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+        CHECK(mkdir(dirs[i], 0755) == 0, "mkdir %s", dirs[i]);
+    CHECK(mount("/tmp", dirs[0], NULL, MS_BIND, NULL) == 0, "bind rootfs");
+    CHECK(mount("tmpfs", dirs[1], "tmpfs", 0, "size=64k") == 0, "mount t1");
+    CHECK(mount(dirs[1], dirs[2], NULL, MS_BIND, NULL) == 0, "bind t1");
+    CHECK(mount("tmpfs", dirs[3], "tmpfs", 0, "size=64k") == 0, "mount t2");
+
+    write_file_bytes("/tmp/obh_root_file", "root-data", 9, 0644);
+    write_file_bytes("/tmp/obh_t1/file", "t1-data", 7, 0644);
+
+    CHECK(syscall(SYS_name_to_handle_at, AT_FDCWD, "/tmp/obh_root_file", &h_root, &mnt_id, 0) == 0,
+          "name_to_handle_at rootfs file");
+    CHECK(syscall(SYS_name_to_handle_at, AT_FDCWD, "/tmp/obh_t1/file", &h_t1, &mnt_id, 0) == 0,
+          "name_to_handle_at t1 file");
+
+    int fd_root = open("/tmp", O_RDONLY | O_DIRECTORY);
+    int fd_root_bind = open(dirs[0], O_RDONLY | O_DIRECTORY);
+    int fd_t1 = open(dirs[1], O_RDONLY | O_DIRECTORY);
+    int fd_t1_bind = open(dirs[2], O_RDONLY | O_DIRECTORY);
+    int fd_t2 = open(dirs[3], O_RDONLY | O_DIRECTORY);
+    CHECK(fd_root >= 0 && fd_root_bind >= 0 && fd_t1 >= 0 && fd_t1_bind >= 0 && fd_t2 >= 0,
+          "open mount fds");
+
+    /* Same superblock (including bind mounts) succeeds */
+    int o = (int)syscall(SYS_open_by_handle_at, fd_root, &h_root, O_RDONLY);
+    CHECK(o >= 0, "open root handle via root fd");
+    check_pread_eq(o, "root-data", "root handle content");
+    close(o);
+
+    o = (int)syscall(SYS_open_by_handle_at, fd_root_bind, &h_root, O_RDONLY);
+    CHECK(o >= 0, "open root handle via root bind fd");
+    close(o);
+
+    o = (int)syscall(SYS_open_by_handle_at, fd_t1, &h_t1, O_RDONLY);
+    CHECK(o >= 0, "open t1 handle via t1 fd");
+    check_pread_eq(o, "t1-data", "t1 handle content");
+    close(o);
+
+    o = (int)syscall(SYS_open_by_handle_at, fd_t1_bind, &h_t1, O_RDONLY);
+    CHECK(o >= 0, "open t1 handle via t1 bind fd");
+    close(o);
+
+    /* Cross-superblock handles must fail with ESTALE */
+    CHECK_ERR(syscall(SYS_open_by_handle_at, fd_t1, &h_root, O_RDONLY), ESTALE,
+              "root handle via tmpfs1 fd must be ESTALE");
+    CHECK_ERR(syscall(SYS_open_by_handle_at, fd_root, &h_t1, O_RDONLY), ESTALE,
+              "tmpfs1 handle via root fd must be ESTALE");
+    CHECK_ERR(syscall(SYS_open_by_handle_at, fd_t2, &h_t1, O_RDONLY), ESTALE,
+              "tmpfs1 handle via tmpfs2 fd must be ESTALE");
+
+    /* Crafted handle naming rootfs inode 1 opened via tmpfs1 must be ESTALE */
+    uint64_t root_ino = 1;
+    memcpy(h_forged.f_handle, &root_ino, sizeof(root_ino));
+    CHECK_ERR(syscall(SYS_open_by_handle_at, fd_t1, &h_forged, O_RDONLY), ESTALE,
+              "forged rootfs ino=1 handle via tmpfs1 fd must be ESTALE");
+
+    int fds[] = {fd_t2, fd_t1_bind, fd_t1, fd_root_bind, fd_root};
+    for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
+        close(fds[i]);
+    unlink("/tmp/obh_root_file");
+    for (size_t i = sizeof(dirs) / sizeof(dirs[0]); i-- > 0;) {
+        CHECK(umount2(dirs[i], 0) == 0, "umount %s", dirs[i]);
+        rmdir(dirs[i]);
+    }
 }
 
 /* 7. /proc/sys/net and IPC sysctls pin namespace at open/lookup time */
@@ -1477,6 +1668,8 @@ int main(int argc, char **argv, char **envp)
     test_proc_pid_net_zombie_leader();
     test_proc_net_snmp_forwarding();
     test_sysctl_write_position();
+    test_overlay_redirect_always_follow();
+    test_open_by_handle_at_superblock_boundary();
     test_sysctl_namespace_pinning();
     test_proc_comm_write();
     test_proc_status_cpus_allowed();

@@ -500,8 +500,16 @@ impl Pending {
 
 /// Sends a signal to one thread (tkill, SIGPIPE and so on).
 pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) {
+    try_send_to_task(k, task, sig, info);
+}
+
+/// Like [`send_to_task`], returning `false` if a real-time signal could not be queued because
+/// `RLIMIT_SIGPENDING` was exceeded (other than `SI_TIMER`, which overrides the limit like Linux
+/// 6.1's preallocated `send_sigqueue`, and `SI_USER`/`SI_KERNEL`, which fall back to setting the
+/// pending bit without `SigInfo`).
+pub(crate) fn try_send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) -> bool {
     let Some(group) = k.groups.get(&task.tgid).cloned() else {
-        return;
+        return true;
     };
     let blocked = task.sigmask.get() & sig.bit() != 0;
     let traced = crate::ptrace::traced(task);
@@ -510,21 +518,23 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
         if target.is_some() {
             group_exit(k, &group, killed_by(sig));
         }
-        return;
+        return true;
     }
     // Side effects such as SIGCONT resuming the process happen even if the signal is then dropped
     // (Linux's prepare_signal)
     prepare(k, &group, sig);
     let Some(info) = target else {
-        return;
+        return true;
     };
     // A blocked signal is made pending even if currently ignored: the disposition may change
     // before it is unblocked. It is also made pending for a traced thread, since the tracer must
     // see it
     if !blocked && group.borrow().sighand.borrow().ignores(sig) && !traced {
-        return;
+        return true;
     }
-    let room = sig.is_realtime() && queue_room(k, &group.borrow());
+    let Some(room) = rt_queue_room(k, &group.borrow(), sig, &info) else {
+        return false;
+    };
     task.pending.borrow_mut().add(sig, info, room);
     if !blocked {
         wake(task);
@@ -533,6 +543,7 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
         // only those waiting for them (wake::SIGNAL)
         request_wake_on(wake::SIGNAL);
     }
+    true
 }
 
 /// Sends a signal to every process in a process group (terminal-generated signals, kill with a
@@ -554,6 +565,12 @@ pub(crate) fn send_to_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) {
     send_group(k, tgid, sig, info, false);
 }
 
+/// Like [`send_to_group`], returning `false` if a real-time signal could not be queued due to
+/// `RLIMIT_SIGPENDING`.
+pub(crate) fn try_send_to_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) -> bool {
+    send_group(k, tgid, sig, info, false)
+}
+
 /// A timer counting process CPU time expired: as on Linux the signal is sent to the process, but a
 /// running thread is woken to handle it. Linux notices the expiry in the clock interrupt of the
 /// thread consuming CPU, so that thread handles it; CPU profilers rely on this to sample a thread
@@ -562,9 +579,9 @@ pub(crate) fn send_cpu_timer(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) 
     send_group(k, tgid, sig, info, true);
 }
 
-fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) {
+fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) -> bool {
     let Some(group) = k.groups.get(&tgid).cloned() else {
-        return;
+        return true;
     };
     let threads: Vec<Rc<Task>> = group
         .borrow()
@@ -573,7 +590,7 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
         .filter_map(|t| k.tasks.get(t).cloned())
         .collect();
     let Some(leader) = threads.first() else {
-        return;
+        return true;
     };
     let blocked = leader.sigmask.get() & sig.bit() != 0;
     let traced = crate::ptrace::traced(leader);
@@ -582,20 +599,20 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
         if target.is_some() {
             group_exit(k, &group, killed_by(sig));
         }
-        return;
+        return true;
     }
     prepare(k, &group, sig);
     let Some(info) = target else {
-        return;
+        return true;
     };
     let ignored = group.borrow().sighand.borrow().ignores(sig);
     if ignored && !blocked && !traced {
-        return;
+        return true;
     }
-    {
-        let room = sig.is_realtime() && queue_room(k, &group.borrow());
-        group.borrow_mut().pending.add(sig, info, room);
-    }
+    let Some(room) = rt_queue_room(k, &group.borrow(), sig, &info) else {
+        return false;
+    };
+    group.borrow_mut().pending.add(sig, info, room);
     // Linux's wants_signal: a thread that blocks the signal, or sits in a ptrace stop, does not
     // take it; another one is chosen
     let unmasked =
@@ -618,6 +635,7 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
         // Every thread blocks it: threads waiting in sigtimedwait or signalfd must recheck
         None => request_wake_on(wake::SIGNAL),
     }
+    true
 }
 
 /// Before a signal is sent to `group` (Linux's `send_signal_locked`, `sig_task_ignored`): when
@@ -788,6 +806,20 @@ pub(crate) fn can_queue(k: &Kernel, tgid: Tid, sig: Signal) -> bool {
 /// `RLIMIT_SIGPENDING` (Linux counts per user).
 fn queue_room(k: &Kernel, group: &ThreadGroup) -> bool {
     (queued(k, group) as u64) < group.rlimits[RLIMIT_SIGPENDING as usize].0
+}
+
+/// Decides whether `sig` queues its `SigInfo` under Linux 6.1's `__send_signal_locked`
+/// `RLIMIT_SIGPENDING` rules: `Some(true)` queues with info (`SI_TIMER` overrides the limit like
+/// Linux's preallocated `send_sigqueue`), `Some(false)` sets only the pending bit (standard
+/// signals, or `SI_USER`/`SI_KERNEL` RT overflow), and `None` drops the RT signal on overflow.
+fn rt_queue_room(k: &Kernel, group: &ThreadGroup, sig: Signal, info: &SigInfo) -> Option<bool> {
+    if !sig.is_realtime() {
+        return Some(false);
+    }
+    if info.code == code::SI_TIMER || queue_room(k, group) {
+        return Some(true);
+    }
+    matches!(info.code, code::SI_USER | code::SI_KERNEL).then_some(false)
 }
 
 /// The number of real-time signals queued in the thread group (SigQ in `/proc/<pid>/status`).
@@ -2151,5 +2183,95 @@ mod tests {
         assert_eq!(group.borrow().stop_pending, 0);
         assert!(!group.borrow().cont_report);
         assert!(!tasks[0].stop_pending.get());
+    }
+
+    #[test]
+    fn rt_signals_at_rlimit_sigpending_match_linux_6_1() {
+        use crate::kernel::Shared;
+
+        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            10,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        group.borrow_mut().rlimits[RLIMIT_SIGPENDING as usize] = (1, 1);
+        k.groups.insert(10, group.clone());
+
+        let rt = |n| Signal::new(34 + n).unwrap();
+        let block_all = (0..6).fold(0u64, |m, n| m | rt(n).bit());
+        let (_cpus, tasks) = spawn_test_tasks(&mut k, &group, &[(10, block_all)]);
+
+        // Fill the single RLIMIT_SIGPENDING slot with a queued RT signal.
+        let q_info = SigInfo {
+            code: -1, // SI_QUEUE
+            fields: InfoFields::Queue {
+                pid: 10,
+                uid: 0,
+                value: 111,
+            },
+            ..SigInfo::default()
+        };
+        assert!(try_send_to_group(&k, 10, rt(0), q_info));
+        assert!(!can_queue(&k, 10, rt(0)));
+
+        // 1. POSIX timer (SI_TIMER) overrides RLIMIT_SIGPENDING and preserves its SigInfo.
+        let timer_info = SigInfo {
+            code: code::SI_TIMER,
+            fields: InfoFields::Timer {
+                id: 7,
+                overrun: 2,
+                value: 4242,
+            },
+            ..SigInfo::default()
+        };
+        assert!(try_send_to_group(&k, 10, rt(1), timer_info));
+        assert!(try_send_to_task(&k, &tasks[0], rt(1), timer_info));
+
+        // 2. Non-SI_USER/SI_KERNEL RT signals (SI_MESGQ, CLD_EXITED, POLL_IN) fail instead of
+        //    setting the pending bit with corrupted SI_USER info.
+        for (sig, info) in [
+            (
+                rt(2),
+                SigInfo {
+                    code: -3, // SI_MESGQ
+                    fields: InfoFields::Queue {
+                        pid: 10,
+                        uid: 0,
+                        value: 7777,
+                    },
+                    ..SigInfo::default()
+                },
+            ),
+            (rt(3), SigInfo::child_event(11, 0, code::CLD_EXITED, 33)),
+            (
+                rt(4),
+                SigInfo {
+                    code: 1, // POLL_IN
+                    fields: InfoFields::Poll { band: 1, fd: 5 },
+                    ..SigInfo::default()
+                },
+            ),
+        ] {
+            assert!(!try_send_to_group(&k, 10, sig, info));
+            assert_eq!(group.borrow().pending.set() & sig.bit(), 0);
+        }
+
+        // 3. SI_USER (kill / pdeathsig) still sets the pending bit without SigInfo.
+        let kill_info = SigInfo::kill(code::SI_USER, 10, 0).from(10);
+        assert!(try_send_to_group(&k, 10, rt(5), kill_info));
+        assert_ne!(group.borrow().pending.set() & rt(5).bit(), 0);
+
+        // Verify dequeued SigInfo values.
+        assert_eq!(group.borrow_mut().pending.take(rt(0)).code, -1);
+        for got in [
+            group.borrow_mut().pending.take(rt(1)),
+            tasks[0].pending.borrow_mut().take(rt(1)),
+        ] {
+            assert_eq!(got.code, code::SI_TIMER);
+            assert_eq!(got.fields, timer_info.fields);
+        }
+        assert_eq!(group.borrow_mut().pending.take(rt(5)), SigInfo::default());
     }
 }

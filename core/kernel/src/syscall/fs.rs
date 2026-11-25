@@ -1305,11 +1305,12 @@ pub(super) fn open_by_handle_at(
         _ => return Err(Errno::ESTALE),
     };
     let vfs = cx.vfs()?;
-    // The file has been deleted (or the handle was not issued here): ESTALE
-    let st = match vfs.store().stat(ino) {
-        Ok(st) if st.nlink > 0 => st,
-        _ => return Err(Errno::ESTALE),
-    };
+    let sb_root = vfs.store_sb_root(&node).ok_or(Errno::ESTALE)?;
+    // Deleted or in another store/tmpfs superblock: ESTALE (exportfs_decode_fh).
+    let st = vfs.store().stat(ino).map_err(|_| Errno::ESTALE)?;
+    if st.nlink == 0 || vfs.store().tree_root(ino).ok().flatten() != Some(sb_root) {
+        return Err(Errno::ESTALE);
+    }
     let kind = if flags & oflags::O_PATH != 0 {
         if flags & oflags::O_DIRECTORY != 0 && !st.is_dir() {
             return Err(Errno::ENOTDIR);
@@ -3408,7 +3409,7 @@ fn vectored_inner(
         }
         return Ok(0);
     }
-    if write && numeric_sysctl(&file.borrow()) {
+    if write && sysctl_write(&file.borrow()) {
         return write_sysctl_iov(cx, &file, &vecs, offset);
     }
     if let Some(r) = stream_vectored(cx, &file, &vecs, offset, write, io) {
@@ -3521,12 +3522,12 @@ fn stream_vectored(
     })
 }
 
-fn numeric_sysctl(f: &OpenFile) -> bool {
-    matches!(&f.kind, FileKind::Proc { node, .. } if pseudo::is_numeric_sysctl(node))
+fn sysctl_write(f: &OpenFile) -> bool {
+    matches!(&f.kind, FileKind::Proc { node, .. } if pseudo::is_sysctl_write(node))
 }
 
 /// proc_sys_write sees one buffer. Validate the full transfer before changing the value;
-/// the numeric handlers parse at most the first page minus its terminating NUL.
+/// the sysctl handlers parse at most the first page minus its terminating NUL.
 fn write_sysctl_iov(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -4451,7 +4452,7 @@ fn write_file_inner(
     defer_sync: bool,
 ) -> SysResult {
     let len = len.min(MAX_COPY);
-    if numeric_sysctl(&file.borrow()) {
+    if sysctl_write(&file.borrow()) {
         return write_sysctl_iov(cx, file, &[(buf, len)], offset);
     }
     // ESPIPE and EBADF are reported before an unreadable buffer

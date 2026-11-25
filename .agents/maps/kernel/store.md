@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: track deleted held regular files in `pending_release` and release their shared-object hold once closed/unmapped)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: preserve PAX `SCHILY.xattr.*` xattrs and file capabilities during rootfs import and add `Store::tree_root`)
 
 ## Responsibilities
 
@@ -66,7 +66,7 @@ provider and rootfs installation UI (`android`).
 - **Lifecycle**: `Store::create(dir)` (new store, `EEXIST` if one exists), `Store::open(dir,
   volatile)`, `Drop` (final commit, reaper join), `guard_with_bkl`.
 - **Reads**: `lookup`, `name_of`, `stat`, `stat_open`, `attrs`, `kind`, `readlink`, `parent`,
-  `readdir`, xattr reads, `has_file_caps`, `fs_stats`; `snapshot` (one read transaction);
+  `tree_root`, `readdir`, xattr reads, `has_file_caps`, `fs_stats`; `snapshot` (one read transaction);
   `Meta::reader` (no-BKL).
 - **Objects**: `open_object`, `open_object_append`, `truncate` (each makes a held file private
   first when it writes), `copy_object` (data with holes).
@@ -287,8 +287,11 @@ provider and rootfs installation UI (`android`).
   onto an existing non-directory of that name) and their mtimes set last; files, symlinks,
   hardlinks (to earlier entries), device nodes and FIFOs are created with their mode bits (setuid
   included), numeric owner and whole-second mtime; a non-directory entry whose name already exists
-  aborts with `EEXIST`; xattrs (and file capabilities), pax metadata and whiteouts are not
-  imported. Afterwards the host calls `sync_store` (host `syncfs`). The Android caller imports into
+  aborts with `EEXIST`; PAX `SCHILY.xattr.*` extended attributes in supported namespaces
+  (`security.*` including validated v2/v3 `security.capability`, `trusted.*`, `user.*` on regular
+  files and directories, and validated POSIX ACLs under `system.*`) are preserved, while
+  unsupported/invalid xattrs, other PAX metadata and whiteouts are skipped. Afterwards the host
+  calls `sync_store` (host `syncfs`). The Android caller imports into
   a temporary store directory that is discarded before a retry.
 
 ### Browse API
@@ -366,7 +369,6 @@ provider and rootfs installation UI (`android`).
 
 ## Open questions
 
-- Should importing a rootfs keep xattrs and file capabilities (the store supports them)?
 - Should `top` for provider writes be validated in the kernel, or is the JNI caller fully trusted?
 
 ## To verify

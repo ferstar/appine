@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: detach other namespaces' mounts on removed or overwritten overlay names)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: report `N` for `/sys/module/overlay/parameters/redirect_always_follow`)
 
 ## Responsibilities
 
@@ -245,8 +245,8 @@ holding its node (`kernel/exec`).
   - the no-BKL stat never serves overlay paths;
   - no persistent `trusted.overlay.origin`, `impure` or shared whiteout inode: a copied-up file's
     inode number changes at the next mount;
-  - a lower layer's `trusted.overlay.redirect` is not followed, though sysfs shows
-    `redirect_always_follow` as Y (nothing Appine runs writes one).
+  - a lower layer's `trusted.overlay.redirect` is not followed (sysfs reports
+    `redirect_always_follow` as N; nothing Appine runs writes one).
 
 ## Open questions
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: tag sysfs mounts with mounter's network namespace for /sys/class/net)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: report `N` for `/sys/module/overlay/parameters/redirect_always_follow`)
 
 ## Responsibilities
 
@@ -50,10 +50,10 @@ CPU and `tx_queue_len` helpers (`hal`).
 ### Tree layout and read-only rules
 
 - Tree: `block/`, `class/net/`, `devices/system/cpu/`, the empty `fs/cgroup/` mount point, and
-  `module/overlay/parameters/` with Linux 6.1's Kconfig defaults, which match what `kernel/overlay`
-  does (`redirect_always_follow` Y, `redirect_max` 256, `check_copy_up`, `index`, `metacopy`,
-  `nfs_export`, `redirect_dir`, `xino_auto` N; containerd adds `index=off` and BuildKit
-  `redirect_dir=off` because the files exist).
+  `module/overlay/parameters/` matching what `kernel/overlay` does (`redirect_max` 256,
+  `redirect_always_follow`, `check_copy_up`, `index`, `metacopy`, `nfs_export`, `redirect_dir`,
+  `xino_auto` N; containerd adds `index=off` and BuildKit `redirect_dir=off` because the files
+  exist).
 - `SYS_GPU` supplies the platform bus and `dev/char/226:128/device` paths on renderer-enabled
   kernels: `libdrm` enumerates `drm/renderD128`, reads the `subsystem` link to `/sys/bus/platform`,
   and reads the device-tree name and compatible string from `uevent`.
