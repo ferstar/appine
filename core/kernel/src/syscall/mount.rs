@@ -213,11 +213,18 @@ fn new_mount(
     may_mount_on(&target)?;
     check_mnt(cx, &vfs, target.mnt())?;
     // A filesystem with a single instance cannot be mounted again on the root of its own mount
-    // (Linux's do_add_mount); mqueue has one instance per IPC namespace
+    // (Linux's do_add_mount); mqueue has one instance per IPC namespace and sysfs one per network
+    // namespace
+    let net = cx.ns().net;
     let same_instance = |m: &Mount| {
         m.fs == fs
             && (fs != Fs::Mqueue
                 || matches!(&m.root, Node::Pseudo(_, PseudoNode::MqRoot(n)) if *n == ipc.id))
+            && (fs != Fs::Sys
+                || vfs
+                    .sys_net_ns(m.id)
+                    .map_or(crate::nsproxy::INIT_NET_NS, |n| n.id)
+                    == net.id)
     };
     if !fs.new_instance()
         && let Some(id) = vfs.mount_root(&target)
@@ -267,11 +274,13 @@ fn new_mount(
         propagate(cx, &vfs, id, &targets);
         return Ok(0);
     }
+    let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), 1, 1)?;
     let (root, dev) = match fs {
         Fs::Mqueue => (
             Node::Pseudo(0, PseudoNode::MqRoot(ipc.id)),
             Some(vfs.mq_dev(ipc.id)),
         ),
+        Fs::Sys => (fs.root(), Some(vfs.sys_dev(&net))),
         // The root of cgroup2 is the root of the caller's cgroup namespace (Linux's
         // cgroup_get_tree)
         Fs::Cgroup => (
@@ -280,7 +289,6 @@ fn new_mount(
         ),
         _ => (fs.root(), (!fs.own_dev()).then(|| fs.dev())),
     };
-    let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), 1, 1)?;
     let id = vfs.add_mount(
         fs,
         root,

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cold proc memory transfers and cgroup2 per-node attributes)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: writable /proc/<pid>/comm and Cpus_allowed mask line in status)
 
 ## Responsibilities
 
@@ -108,9 +108,9 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - Modes: directories 0555 (0755 on sysfs, a cgroup's from its node attributes); `fd/<n>` links by the open
   mode as `proc_fd_instantiate` (0500 readable, 0300 writable, 0700 both, 0 for `O_PATH`); other
   symlinks 0777; `mem` 0600; `syscall`, `pagemap`, `auxv` and `/proc/kmsg` 0400; sysctls follow
-  `kernel/sysctl`; other writable files 0644; everything else 0444 (so `fd/`, `fdinfo/`, `ns/` are
-  0555, `environ` 0444, `comm` and `projid_map` read-only); cgroup files their current modes;
-  devpts nodes the terminal's mode and `ptmxmode`.
+  `kernel/sysctl`; other writable files 0644 (`comm` included); everything else 0444 (so `fd/`,
+  `fdinfo/`, `ns/` are 0555, `environ` 0444, `projid_map` read-only); cgroup files their current
+  modes; devpts nodes the terminal's mode and `ptmxmode`.
 - Owners: per-process nodes (`Pid`, `Entry`, `Fd`, including the `fd/`, `fdinfo/`, `ns/`, `net/`
   directories) belong to the euid/egid of the thread (under `task/<tid>`) or the main thread, or
   to root of those credentials' user namespace when the process is not dumpable; `net.*` sysctls
@@ -216,13 +216,16 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, `VmRSS` the sum of
   `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmStk` the grows-down mappings,
   exe/lib/PTE/swap 0; omitted with no live task); `FDSize` the open fds rounded up to 64;
-  `Cpus_allowed_list` is the thread's affinity (the main thread's in the process's `status`)
-  within the online CPUs. `statm` is `size rss 0 0 0 rss 0`.
+  `Cpus_allowed` and `Cpus_allowed_list` show the thread's affinity (the main thread's in the
+  process's `status`) within the online CPUs as a hex mask (`cpu_mask_of`) and CPU list. `statm` is
+  `size rss 0 0 0 rss 0`.
 - `maps` and `smaps` escape a newline in a mapped file's path as `\012` (Linux's
   `seq_file_path`); file mappings show device `08:01`; smaps counts anonymous resident pages as
   dirty, file pages as clean, and copy-on-write-shared pages as shared with a divided Pss.
 - `cmdline`/`environ` copy the argument and environment ranges of the current mm (empty over
-  1 MiB or when unreadable); `comm` is read-only; `limits` lists the rlimits. The thread name is
+  1 MiB or when unreadable); `comm` is writable (0644) for tasks in the writer's thread group
+  (Linux's `comm_write`: up to 15 bytes up to the first NUL verbatim, `EINVAL` across thread groups,
+  `ESRCH` once exited); `limits` lists the rlimits. The thread name is
   bytes, not text: `comm` and `stat` give it as set, `status` escapes only a newline and a
   backslash (Linux's `proc_task_name`).
 - `fd/` and `fdinfo/` list and inspect the fd table of the thread named: the main thread's for
@@ -254,7 +257,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `lazytime` (`Vfs::sb_flags`), which `mounts` puts after its `ro` (the mount's or the instance's)
   as `show_vfsmnt` does; `cgroup` is the path relative to the reader's cgroup-namespace root;
   `net/` uses the target's network namespace.
-- Writable: `oom_score_adj` (-1000..1000; going below the minimum needs `CAP_SYS_RESOURCE`, and a
+- Writable: `comm` (same thread group only, `EINVAL` otherwise, up to 15 bytes verbatim),
+  `oom_score_adj` (-1000..1000; going below the minimum needs `CAP_SYS_RESOURCE`, and a
   privileged write sets the new minimum), `coredump_filter` (masked to 0x1ff), `mem`, the id maps,
   `setgroups`, `timens_offsets`.
 - Zombies keep their group without tasks: stat/status work (state Z), cmdline/environ/auxv are
@@ -374,10 +378,9 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   mountinfo reader (Linux counts per namespace), as do propagation-type changes (Linux does not
   touch the namespace for them); synthetic files outside mounts/mountinfo/cgroup2 report no inotify
   events (opens, reads, writes).
-- **Fidelity gaps:** modes and owners differ (`environ` 0444, `fd/` and `ns/` 0555, `comm`
-  read-only, `fdinfo/<n>` and `ns/*` owned by root, devpts root 0555, a master's fstat fixed);
-  procfs mount options are ignored; many standard files are absent; `status` has no `Cpus_allowed`
-  mask line.
+- **Fidelity gaps:** modes and owners differ (`environ` 0444, `fd/` and `ns/` 0555,
+  `fdinfo/<n>` and `ns/*` owned by root, devpts root 0555, a master's fstat fixed);
+  procfs mount options are ignored; many standard files are absent.
 - **Socket owners in `/proc/net/*` can differ from Linux:** the uid column is the fsuid of the
   first process (lowest tid) holding the socket in its fd table, where Linux shows the creator's
   (`sock_i_uid`); sockets passed on, or whose creator closed its copy, show another uid, and

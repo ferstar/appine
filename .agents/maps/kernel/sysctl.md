@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: honor numeric write positions and parse vectored input once)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: pin UTS, pid and user-namespace sysctls to lookup/open namespace)
 
 ## Responsibilities
 
@@ -33,12 +33,17 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
 
 ## Key types
 
-- `PseudoNode::Static(b"sys/...")` — fixed `/proc/sys` directories and kernel-wide/UTS/pid/user
-  files from `STATIC` (the non-`sysvipc/` portion of `STATIC`).
+- `PseudoNode::Static(b"sys/...")` — fixed `/proc/sys` directories and kernel-wide/user-limit
+  files from `STATIC` (the non-`sysvipc/` portion of `STATIC`); `sys/user/max_*` reads and writes
+  use the opener's credentials' user namespace.
 - `PseudoNode::NetStatic(path, PinnedNet)` — static `/proc/sys/net/*` files pinned to the
   `Rc<NetNs>` captured at lookup time.
 - `PseudoNode::IpcSysctl(path, PinnedIpc)` — SysV IPC and `fs/mqueue/*` sysctl files pinned to
   the `Rc<IpcNs>` captured at lookup time.
+- `PseudoNode::UtsSysctl(path, PinnedUts)` — `/proc/sys/kernel/{hostname,domainname}` pinned to
+  the `Rc<UtsNs>` captured at lookup time.
+- `PseudoNode::PidSysctl(path, PinnedPid)` — `/proc/sys/kernel/ns_last_pid` pinned to the
+  `Rc<PidNs>` captured at lookup time.
 - `PseudoNode::NetConf(v6, dir, name, PinnedNet)` — `/proc/sys/net/ipv4/conf/<dir>` and
   `ipv6/conf/<dir>` per-interface directories and entries (`NET_CONF4`, `NET_CONF6`, backed by
   `kernel/netns`) pinned to their lookup `Rc<NetNs>`.
@@ -82,16 +87,19 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
 - Reads and writes scope by namespace:
   - SysV IPC limits and `fs/mqueue/*` per IPC namespace, pinned at lookup time (`IpcSysctl`) so
     offset-0 rereads and writes through an open descriptor keep targeting the lookup namespace;
-  - `hostname`/`domainname` per UTS namespace (one trailing newline stripped, over 64 bytes
-    `EINVAL`);
-  - `ns_last_pid` per pid namespace (the process's, not the mount's);
+  - `hostname`/`domainname` per UTS namespace, pinned at lookup time (`UtsSysctl`) so offset-0
+    rereads and writes keep targeting the lookup namespace (one trailing newline stripped, over 64
+    bytes `EINVAL`);
+  - `ns_last_pid` per pid namespace (the process's, not the mount's), pinned at lookup time
+    (`PidSysctl`) so offset-0 rereads and writes keep targeting the lookup namespace;
   - `net.*` per network namespace, pinned at lookup time (`NetStatic`, `NetConf`, `NetSysctl`) so
     offset-0 rereads and writes keep targeting the lookup namespace (`ip_forward` aliases
     `conf/all/forwarding`; `NetConf` directories per interface; entries flagged init-only exist
     only in the initial namespace). The static `net/bridge/bridge-nf-call-iptables` leaf defaults
     to 1 in each namespace. Zero disables IPv4 bridge hooks there and a nonzero signed integer
     enables them and reads back as 1;
-  - `user/max_*_namespaces` per user namespace (the reader's or writer's: the limits of
+  - `user/max_*_namespaces` per user namespace, scoped to the opener's user namespace on both
+    offset-0 rereads (`ps.reader().user_ns`) and writes (`opener.user_ns`: the limits of
     `kernel/ns`'s namespace counts, `INT_MAX` by default in a new one, 0 to `INT_MAX`);
   - everything else kernel-wide (`max_map_count`, `mmap_min_addr`, inotify limits, `aio-max-nr`,
     `lease-break-time`, `nr_open`, `threads-max`, `mount-max` (1 to `INT_MAX`; the mount limit of
@@ -169,9 +177,6 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
 
 ## Confirmed bugs / technical debt
 
-- **UTS/pid/user regeneration uses the current reader's namespaces:** network and IPC sysctls pin
-  the namespace captured at lookup time, while UTS, pid and user-namespace sysctls reread from
-  offset 0 still read the current reader's namespace.
 - **Sysctl poll never reports `POLLPRI`:** `hostname` and `domainname` never wake pollers on
   change.
 - String and bitmap sysctls still process successive writes independently of the file position.

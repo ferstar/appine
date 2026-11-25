@@ -8,7 +8,8 @@
  *  4. move_mount(MOVE_MOUNT_SET_GROUP) joins a private mount to a shared/slave peer group;
  *  5. /proc/<pid>/net entries of a process with an exited (zombie) main thread use its netns;
  *  6. /proc/net/snmp reflects the namespace's ipv4 ip_forward (1 enabled, 2 disabled);
- *  7. /proc/sys/net and IPC sysctls stay pinned to the namespace captured at open/lookup time;
+ *  7. /proc/sys/{net,ipc,uts,pid,user} sysctls stay pinned to the namespace captured at lookup
+ *     time (plus writable /proc/<pid>/comm, Cpus_allowed mask, and sysfs netns tagging);
  *  8. Cgroup writes/reads on a disabled controller or removed cgroup return ENODEV without storing;
  *  9. Native AIO refuses procfs files without read_iter/write_iter (/proc/self/mem, pagemap) with
  *     EINVAL while allowing seq_file and sysctl reads;
@@ -27,6 +28,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sched.h>
@@ -37,8 +39,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -625,6 +629,91 @@ static void test_sysctl_namespace_pinning(void)
                   cases[i].path, cases[i].val_a2, buf);
             close(fds[i]);
         }
+
+        /* UTS sysctls pin lookup UTS namespace while /proc/sys/kernel stays unpinned */
+        CHECK(unshare(CLONE_NEWUTS) == 0, "unshare uts A");
+        CHECK(chdir("/proc/sys/kernel") == 0, "chdir /proc/sys/kernel");
+        write_str("hostname", "uts-host-a\n");
+        write_str("domainname", "uts-dom-a\n");
+        int hfd = open("hostname", O_RDWR);
+        int dfd = open("domainname", O_RDWR);
+        CHECK(hfd >= 0 && dfd >= 0, "open uts sysctls in uts A");
+
+        CHECK(unshare(CLONE_NEWUTS) == 0, "unshare uts B");
+        write_str("hostname", "uts-host-b\n");
+        write_str("domainname", "uts-dom-b\n");
+        pread_str(hfd, buf, sizeof(buf));
+        CHECK(strcmp(buf, "uts-host-a\n") == 0, "pinned hostname expected uts-host-a, got %s", buf);
+        pread_str(dfd, buf, sizeof(buf));
+        CHECK(strcmp(buf, "uts-dom-a\n") == 0, "pinned domainname expected uts-dom-a, got %s", buf);
+        CHECK(pwrite(hfd, "uts-host-a2\n", 12, 0) == 12, "pwrite pinned hostname");
+        CHECK(pwrite(dfd, "uts-dom-a2\n", 11, 0) == 11, "pwrite pinned domainname");
+        read_str("hostname", buf, sizeof(buf));
+        CHECK(strcmp(buf, "uts-host-b\n") == 0, "uts B hostname must remain uts-host-b, got %s",
+              buf);
+        read_str("domainname", buf, sizeof(buf));
+        CHECK(strcmp(buf, "uts-dom-b\n") == 0, "uts B domainname must remain uts-dom-b, got %s",
+              buf);
+        pread_str(hfd, buf, sizeof(buf));
+        CHECK(strcmp(buf, "uts-host-a2\n") == 0, "uts A hostname must be uts-host-a2, got %s", buf);
+        pread_str(dfd, buf, sizeof(buf));
+        CHECK(strcmp(buf, "uts-dom-a2\n") == 0, "uts A domainname must be uts-dom-a2, got %s", buf);
+        close(hfd);
+        close(dfd);
+
+        /* User-namespace sysctl pins open/lookup user namespace across nested unshare(CLONE_NEWUSER) */
+        pid_t uchild = fork();
+        CHECK(uchild >= 0, "fork userns child");
+        if (uchild == 0) {
+            CHECK(unshare(CLONE_NEWUSER) == 0, "unshare userns A");
+            write_str("/proc/self/setgroups", "deny\n");
+            write_str("/proc/self/uid_map", "0 0 1\n");
+            write_str("/proc/self/gid_map", "0 0 1\n");
+            write_str("/proc/sys/user/max_uts_namespaces", "111\n");
+            int ufd = open("/proc/sys/user/max_uts_namespaces", O_RDWR);
+            CHECK(ufd >= 0, "open max_uts_namespaces in userns A");
+
+            CHECK(unshare(CLONE_NEWUSER) == 0, "unshare userns B");
+            write_str("/proc/self/setgroups", "deny\n");
+            write_str("/proc/self/uid_map", "0 0 1\n");
+            write_str("/proc/self/gid_map", "0 0 1\n");
+            write_str("/proc/sys/user/max_uts_namespaces", "222\n");
+
+            pread_str(ufd, buf, sizeof(buf));
+            CHECK(strcmp(buf, "111\n") == 0, "pinned userns A limit expected 111, got %s", buf);
+            CHECK(pwrite(ufd, "333\n", 4, 0) == 4, "pwrite pinned userns A limit");
+            read_str("/proc/sys/user/max_uts_namespaces", buf, sizeof(buf));
+            CHECK(strcmp(buf, "222\n") == 0, "userns B limit must remain 222, got %s", buf);
+            pread_str(ufd, buf, sizeof(buf));
+            CHECK(strcmp(buf, "333\n") == 0, "pinned userns A limit must be 333, got %s", buf);
+            close(ufd);
+            _exit(0);
+        }
+        wait_ok(uchild, "userns sysctl pinning child");
+
+        /* Pid sysctl pins lookup pid namespace across fork into a child pid namespace */
+        int pfd = open("/proc/sys/kernel/ns_last_pid", O_RDWR);
+        CHECK(pfd >= 0, "open ns_last_pid in parent pidns");
+        CHECK(pwrite(pfd, "420\n", 4, 0) == 4, "seed parent ns_last_pid");
+        CHECK(unshare(CLONE_NEWPID) == 0, "unshare CLONE_NEWPID");
+        pid_t pchild = fork();
+        CHECK(pchild >= 0, "fork pidns child");
+        if (pchild == 0) {
+            write_str("/proc/sys/kernel/ns_last_pid", "77\n");
+            pread_str(pfd, buf, sizeof(buf));
+            CHECK(strcmp(buf, "77\n") != 0,
+                  "pinned parent ns_last_pid must not read child pidns value 77");
+            CHECK(pwrite(pfd, "450\n", 4, 0) == 4, "pwrite pinned parent ns_last_pid");
+            read_str("/proc/sys/kernel/ns_last_pid", buf, sizeof(buf));
+            CHECK(strcmp(buf, "77\n") == 0, "child ns_last_pid must remain 77, got %s", buf);
+            pread_str(pfd, buf, sizeof(buf));
+            CHECK(strcmp(buf, "450\n") == 0, "pinned parent ns_last_pid expected 450, got %s", buf);
+            close(pfd);
+            _exit(0);
+        }
+        close(pfd);
+        wait_ok(pchild, "pidns sysctl pinning child");
+
         _exit(0);
     }
     wait_ok(pid, "sysctl namespace pinning");
@@ -1125,6 +1214,226 @@ static void test_secure_exec_arg_limit(const char *self_path)
     unlink("/tmp/suid_exec");
 }
 
+struct comm_worker_args {
+    int ready_fd;
+    int done_fd;
+    pid_t tid;
+};
+
+static void *comm_worker(void *arg)
+{
+    struct comm_worker_args *a = arg;
+    a->tid = (pid_t)syscall(SYS_gettid);
+    char b = 'r';
+    CHECK(write(a->ready_fd, &b, 1) == 1, "comm worker ready");
+    CHECK(read(a->done_fd, &b, 1) == 1, "comm worker wait");
+    return NULL;
+}
+
+static void test_proc_comm_write(void)
+{
+    struct stat st;
+    CHECK(stat("/proc/self/comm", &st) == 0, "stat /proc/self/comm");
+    CHECK((st.st_mode & 0777) == 0644, "expected /proc/self/comm mode 0644, got %04o",
+          st.st_mode & 0777);
+
+    char orig[16] = {0};
+    CHECK(prctl(PR_GET_NAME, orig, 0, 0, 0) == 0, "PR_GET_NAME");
+
+    /* Write verbatim, matching Linux comm_write (no newline strip, 15-byte truncation, NUL stop) */
+    int fd = open("/proc/self/comm", O_RDWR);
+    CHECK(fd >= 0, "open /proc/self/comm O_RDWR");
+    CHECK(write(fd, "myproc", 6) == 6, "write comm");
+    char buf[64], prname[16];
+    pread_str(fd, buf, sizeof(buf));
+    CHECK(strcmp(buf, "myproc\n") == 0, "comm expected myproc\\n, got %s", buf);
+    memset(prname, 0, sizeof(prname));
+    CHECK(prctl(PR_GET_NAME, prname, 0, 0, 0) == 0, "PR_GET_NAME after write");
+    CHECK(strcmp(prname, "myproc") == 0, "PR_GET_NAME expected myproc, got %s", prname);
+
+    /* Trailing newline is stored verbatim (just like Linux comm_write) and escaped in status */
+    CHECK(write(fd, "abc\n", 4) == 4, "write comm with newline");
+    pread_str(fd, buf, sizeof(buf));
+    CHECK(strcmp(buf, "abc\n\n") == 0, "comm with newline expected abc\\n\\n, got %s", buf);
+    char status[4096];
+    read_str("/proc/self/status", status, sizeof(status));
+    CHECK(strstr(status, "Name:\tabc\\n\n") != NULL, "status must escape newline in Name: %s",
+          status);
+
+    /* 15-byte truncation returns full count */
+    CHECK(write(fd, "0123456789abcdef\n", 17) == 17, "write long comm");
+    pread_str(fd, buf, sizeof(buf));
+    CHECK(strcmp(buf, "0123456789abcde\n") == 0, "long comm expected 15 bytes, got %s", buf);
+
+    /* NUL terminates the stored name */
+    CHECK(write(fd, "xy\0z", 4) == 4, "write comm with NUL");
+    pread_str(fd, buf, sizeof(buf));
+    CHECK(strcmp(buf, "xy\n") == 0, "NUL comm expected xy\\n, got %s", buf);
+
+    /* Sibling thread in the same thread group can be renamed via /proc/self/task/<tid>/comm */
+    int ready[2], done[2];
+    CHECK(pipe(ready) == 0 && pipe(done) == 0, "pipes for comm worker");
+    struct comm_worker_args wa = {.ready_fd = ready[1], .done_fd = done[0], .tid = 0};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, comm_worker, &wa) == 0, "pthread_create comm_worker");
+    char c;
+    CHECK(read(ready[0], &c, 1) == 1, "wait comm worker");
+    char tpath[64];
+    snprintf(tpath, sizeof(tpath), "/proc/self/task/%d/comm", (int)wa.tid);
+    CHECK(stat(tpath, &st) == 0 && (st.st_mode & 0777) == 0644, "task comm mode 0644");
+    int tfd = open(tpath, O_RDWR);
+    CHECK(tfd >= 0, "open sibling task comm");
+    CHECK(write(tfd, "worker7", 7) == 7, "write sibling task comm");
+    pread_str(tfd, buf, sizeof(buf));
+    CHECK(strcmp(buf, "worker7\n") == 0, "sibling comm expected worker7\\n, got %s", buf);
+    pread_str(fd, buf, sizeof(buf));
+    CHECK(strcmp(buf, "xy\n") == 0, "main thread comm must remain xy\\n, got %s", buf);
+    close(tfd);
+    CHECK(write(done[1], "x", 1) == 1, "release comm worker");
+    CHECK(pthread_join(th, NULL) == 0, "join comm worker");
+    close(ready[0]);
+    close(ready[1]);
+    close(done[0]);
+    close(done[1]);
+
+    /* Writing another process's comm fails with EINVAL; after reap fails with ESRCH */
+    int p2[2];
+    CHECK(pipe(p2) == 0, "pipe for other proc comm");
+    pid_t child = fork();
+    CHECK(child >= 0, "fork other proc comm");
+    if (child == 0) {
+        close(p2[1]);
+        char b;
+        (void)read(p2[0], &b, 1);
+        _exit(0);
+    }
+    close(p2[0]);
+    char opath[64];
+    snprintf(opath, sizeof(opath), "/proc/%d/comm", (int)child);
+    int ofd = open(opath, O_WRONLY);
+    CHECK(ofd >= 0, "open other process comm");
+    CHECK_ERR(write(ofd, "nope", 4), EINVAL, "writing other process comm must fail with EINVAL");
+    close(p2[1]);
+    wait_ok(child, "other proc comm child");
+    CHECK_ERR(write(ofd, "gone", 4), ESRCH, "writing reaped process comm must fail with ESRCH");
+    close(ofd);
+
+    /* Restore original name */
+    CHECK(write(fd, orig, strlen(orig)) == (ssize_t)strlen(orig), "restore comm");
+    close(fd);
+}
+
+static void test_proc_status_cpus_allowed(void)
+{
+    cpu_set_t saved;
+    CPU_ZERO(&saved);
+    CHECK(sched_getaffinity(0, sizeof(saved), &saved) == 0, "sched_getaffinity");
+
+    char status[4096];
+    read_str("/proc/self/status", status, sizeof(status));
+    const char *mask_line = strstr(status, "\nCpus_allowed:\t");
+    CHECK(mask_line != NULL, "status missing Cpus_allowed: line: %s", status);
+    const char *mask_end = strchr(mask_line + 1, '\n');
+    CHECK(mask_end != NULL, "unterminated Cpus_allowed line");
+    CHECK(strncmp(mask_end + 1, "Cpus_allowed_list:\t", 19) == 0,
+          "Cpus_allowed_list must immediately follow Cpus_allowed");
+
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(0, &one);
+    CHECK(sched_setaffinity(0, sizeof(one), &one) == 0, "sched_setaffinity cpu 0");
+    read_str("/proc/self/status", status, sizeof(status));
+    mask_line = strstr(status, "\nCpus_allowed:\t");
+    CHECK(mask_line != NULL, "status missing Cpus_allowed after setaffinity");
+    mask_line += strlen("\nCpus_allowed:\t");
+    mask_end = strchr(mask_line, '\n');
+    CHECK(mask_end != NULL && mask_end > mask_line, "invalid Cpus_allowed value");
+    /* With only CPU 0 allowed, every hex digit except the final '1' must be '0' or ',' */
+    for (const char *p = mask_line; p + 1 < mask_end; p++) {
+        CHECK(*p == '0' || *p == ',', "unexpected digit in cpu-0 Cpus_allowed: %.*s",
+              (int)(mask_end - mask_line), mask_line);
+    }
+    CHECK(mask_end[-1] == '1', "expected final hex digit 1 in cpu-0 Cpus_allowed: %.*s",
+          (int)(mask_end - mask_line), mask_line);
+    CHECK(strncmp(mask_end + 1, "Cpus_allowed_list:\t0\n", 21) == 0,
+          "expected Cpus_allowed_list 0 after setaffinity");
+
+    CHECK(sched_setaffinity(0, sizeof(saved), &saved) == 0, "restore sched_setaffinity");
+}
+
+static void set_lo_mtu(int mtu)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(s >= 0, "socket for SIOCSIFMTU");
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strcpy(ifr.ifr_name, "lo");
+    ifr.ifr_mtu = mtu;
+    CHECK(ioctl(s, SIOCSIFMTU, &ifr) == 0, "SIOCSIFMTU lo=%d", mtu);
+    close(s);
+}
+
+static void test_sysfs_net_follows_mounter_ns(void)
+{
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork sysfs netns");
+    if (pid == 0) {
+        CHECK(unshare(CLONE_NEWNS | CLONE_NEWNET) == 0, "unshare mnt+net B");
+        set_lo_mtu(16384);
+
+        const char *sys_b = "/tmp/sys_net_b";
+        const char *sys_b_bind = "/tmp/sys_net_b_bind";
+        const char *sys_c = "/tmp/sys_net_c";
+        CHECK(mkdir(sys_b, 0755) == 0 || errno == EEXIST, "mkdir sys_b");
+        CHECK(mkdir(sys_b_bind, 0755) == 0 || errno == EEXIST, "mkdir sys_b_bind");
+        CHECK(mkdir(sys_c, 0755) == 0 || errno == EEXIST, "mkdir sys_c");
+
+        CHECK(mount("sysfs", sys_b, "sysfs", 0, NULL) == 0, "mount sysfs B");
+        CHECK_ERR(mount("sysfs", sys_b, "sysfs", 0, NULL), EBUSY,
+                  "stacking same-netns sysfs must return EBUSY");
+        CHECK(mount(sys_b, sys_b_bind, NULL, MS_BIND, NULL) == 0, "bind mount sysfs B");
+
+        struct stat st_boot, st_b, st_mtu;
+        CHECK(stat("/sys", &st_boot) == 0 && stat(sys_b, &st_b) == 0, "stat sysfs mounts");
+        CHECK(st_boot.st_dev != st_b.st_dev, "new netns sysfs must have distinct st_dev");
+        CHECK(stat("/tmp/sys_net_b/class/net/lo/mtu", &st_mtu) == 0 && st_mtu.st_size == 4096 &&
+                  st_mtu.st_blocks == 0,
+              "non-initial sysfs regular file must report size 4096 and 0 blocks");
+
+        /* Switch into netns C with a different lo MTU */
+        CHECK(unshare(CLONE_NEWNET) == 0, "unshare net C");
+        set_lo_mtu(32768);
+        CHECK(mount("sysfs", sys_c, "sysfs", 0, NULL) == 0, "mount sysfs C");
+
+        char buf[64];
+        read_str("/tmp/sys_net_b/class/net/lo/mtu", buf, sizeof(buf));
+        CHECK(strcmp(buf, "16384\n") == 0, "sys_b must follow mounter netns B (16384), got %s",
+              buf);
+        read_str("/tmp/sys_net_b_bind/class/net/lo/mtu", buf, sizeof(buf));
+        CHECK(strcmp(buf, "16384\n") == 0,
+              "bind of sys_b must follow mounter netns B (16384), got %s", buf);
+        read_str("/tmp/sys_net_c/class/net/lo/mtu", buf, sizeof(buf));
+        CHECK(strcmp(buf, "32768\n") == 0, "sys_c must follow mounter netns C (32768), got %s",
+              buf);
+
+        /* Mounting a fresh sysfs over boot /sys in netns C succeeds (different instance) */
+        CHECK(mount("sysfs", "/sys", "sysfs", 0, NULL) == 0, "mount netns C sysfs over /sys");
+        read_str("/sys/class/net/lo/mtu", buf, sizeof(buf));
+        CHECK(strcmp(buf, "32768\n") == 0, "remounted /sys must see netns C (32768), got %s", buf);
+        CHECK_ERR(mount("sysfs", "/sys", "sysfs", 0, NULL), EBUSY,
+                  "stacking netns C sysfs on itself must return EBUSY");
+
+        CHECK(umount2(sys_b_bind, 0) == 0, "umount sys_b_bind");
+        CHECK(umount2(sys_b, 0) == 0, "umount sys_b");
+        CHECK(umount2(sys_c, 0) == 0, "umount sys_c");
+        rmdir(sys_b_bind);
+        rmdir(sys_b);
+        rmdir(sys_c);
+        _exit(0);
+    }
+    wait_ok(pid, "sysfs netns mounter");
+}
+
 static void test_proc_self_auxv(char **envp)
 {
     while (*envp)
@@ -1169,6 +1478,9 @@ int main(int argc, char **argv, char **envp)
     test_proc_net_snmp_forwarding();
     test_sysctl_write_position();
     test_sysctl_namespace_pinning();
+    test_proc_comm_write();
+    test_proc_status_cpus_allowed();
+    test_sysfs_net_follows_mounter_ns();
     test_cgroup_enodev();
     test_cgroup_delegation();
     test_aio_procfs_has_iter();

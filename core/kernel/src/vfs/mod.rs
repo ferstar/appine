@@ -597,6 +597,10 @@ struct Mounts {
     /// The pid namespace (the mounting process's) of each procfs instance mounted by mount(2),
     /// by device number; the boot one and those not recorded use the boot pid namespace.
     proc_ns: std::collections::HashMap<u64, std::rc::Rc<crate::pidns::PidNs>>,
+    /// The network namespace (the mounting process's) of each non-initial sysfs instance, by
+    /// device number; the boot instance and mounts in the initial network namespace use
+    /// [`Fs::Sys`]'s boot device and are not recorded here.
+    sys_ns: std::collections::HashMap<u64, std::rc::Rc<crate::nsproxy::NetNs>>,
     /// Device numbers of each IPC namespace's mqueue instance ([`Vfs::mq_dev`]), by namespace
     /// id.
     mq_dev: std::collections::HashMap<u64, u64>,
@@ -1424,6 +1428,7 @@ impl Vfs {
             next_dev: 0x30,
             tmpfs: Default::default(),
             proc_ns: Default::default(),
+            sys_ns: Default::default(),
             mq_dev: Default::default(),
             devpts: Default::default(),
             sb_flags: Default::default(),
@@ -2358,7 +2363,8 @@ impl Vfs {
         }
         // A deep stack (propagation can pile thousands of mounts on one directory) is climbed
         // through an index built once, the later mount on a point winning as above.
-        // PinnedNet/PinnedIpc inside PseudoNode hash and compare only by immutable namespace id.
+        // PinnedNet/PinnedIpc/PinnedUts/PinnedPid inside PseudoNode hash and compare only by
+        // immutable namespace id.
         #[allow(clippy::mutable_key_type)]
         let mut tops: HashMap<&Node, &Node> = HashMap::new();
         for m in mounts.detached.iter().chain(&mounts.list) {
@@ -3737,6 +3743,14 @@ impl Vfs {
         mounts.proc_ns.get(&m.dev).cloned()
     }
 
+    /// When mount `id` is a non-initial sysfs instance, the network namespace of the process that
+    /// mounted it (None for the boot instance and mounts in the initial network namespace).
+    pub(crate) fn sys_net_ns(&self, id: MountId) -> Option<std::rc::Rc<crate::nsproxy::NetNs>> {
+        let mounts = self.mounts.borrow();
+        let m = mounts.get(id)?;
+        mounts.sys_ns.get(&m.dev).cloned()
+    }
+
     /// Adds copies of mounts below mount `to` at once (Linux's `copy_tree`, for recursive binds and
     /// open_tree): `plan` lists the mounts to copy, each after its parent, with the index in `plan`
     /// of its parent's copy (None for `to` itself). Each copy is mounted at the same place in its
@@ -3810,6 +3824,23 @@ impl Vfs {
         if let Some(dev) = mounts.get_attached(id).map(|m| m.dev) {
             mounts.proc_ns.insert(dev, ns);
         }
+    }
+
+    /// Device number of the sysfs instance for network namespace `net`: [`Fs::Sys`]'s boot device
+    /// for the initial network namespace, or one device per non-initial network namespace (reused
+    /// while a sysfs mount of that namespace exists, matching Linux's `sget_fc` keyed by `net`).
+    pub(crate) fn sys_dev(&self, net: &std::rc::Rc<crate::nsproxy::NetNs>) -> u64 {
+        if net.id == crate::nsproxy::INIT_NET_NS {
+            return Fs::Sys.dev();
+        }
+        let mut mounts = self.mounts.borrow_mut();
+        if let Some((&dev, _)) = mounts.sys_ns.iter().find(|(_, n)| n.id == net.id) {
+            return dev;
+        }
+        mounts.next_dev += 1;
+        let dev = mounts.next_dev - 1;
+        mounts.sys_ns.insert(dev, net.clone());
+        dev
     }
 
     /// Mounts mounted directly in mount `id`, in mount order.
@@ -3910,15 +3941,18 @@ impl Vfs {
                     ovl.remove_instance(dev);
                 }
             }
+            let devs_of = |mounts: &Mounts, fs| -> std::collections::HashSet<u64> {
+                mounts
+                    .list
+                    .iter()
+                    .chain(&mounts.detached)
+                    .filter(|m| m.fs == fs)
+                    .map(|m| m.dev)
+                    .collect()
+            };
             // A FUSE instance without a mount aborts its connection, so its daemon's reads fail
             // and it exits (6.1's `fuse_sb_destroy`)
-            let fuses: std::collections::HashSet<u64> = mounts
-                .list
-                .iter()
-                .chain(&mounts.detached)
-                .filter(|m| m.fs == Fs::Fuse)
-                .map(|m| m.dev)
-                .collect();
+            let fuses = devs_of(&mounts, Fs::Fuse);
             let mut fuse = self.fuse.borrow_mut();
             for dev in fuse.devs() {
                 if !fuses.contains(&dev) {
@@ -3926,14 +3960,8 @@ impl Vfs {
                 }
             }
             drop(fuse);
-            let live: std::collections::HashSet<u64> = mounts
-                .list
-                .iter()
-                .chain(&mounts.detached)
-                .filter(|m| m.fs == Fs::Tmpfs)
-                .map(|m| m.dev)
-                .chain(ovl.pinned())
-                .collect();
+            let mut live = devs_of(&mounts, Fs::Tmpfs);
+            live.extend(ovl.pinned());
             drop(ovl);
             let dead: std::collections::HashSet<u64> = mounts
                 .tmpfs
@@ -3941,21 +3969,11 @@ impl Vfs {
                 .filter(|dev| !live.contains(dev))
                 .copied()
                 .collect();
-            let procs: std::collections::HashSet<u64> = mounts
-                .list
-                .iter()
-                .chain(&mounts.detached)
-                .filter(|m| m.fs == Fs::Proc)
-                .map(|m| m.dev)
-                .collect();
+            let procs = devs_of(&mounts, Fs::Proc);
             mounts.proc_ns.retain(|dev, _| procs.contains(dev));
-            let pts: std::collections::HashSet<u64> = mounts
-                .list
-                .iter()
-                .chain(&mounts.detached)
-                .filter(|m| m.fs == Fs::Pts)
-                .map(|m| m.dev)
-                .collect();
+            let syss = devs_of(&mounts, Fs::Sys);
+            mounts.sys_ns.retain(|dev, _| syss.contains(dev));
+            let pts = devs_of(&mounts, Fs::Pts);
             mounts.devpts.retain(|dev, _| pts.contains(dev));
             self.tmpfs_file_ranges
                 .borrow_mut()
@@ -4065,7 +4083,8 @@ impl Vfs {
 
     /// `start` (mount-id 0) and every ancestor directory above it within its underlying
     /// filesystem, stopping at the filesystem root (or on error / cycle).
-    // PinnedNet/PinnedIpc inside PseudoNode hash and compare only by immutable namespace id.
+    // PinnedNet/PinnedIpc/PinnedUts/PinnedPid inside PseudoNode hash and compare only by immutable
+    // namespace id.
     #[allow(clippy::mutable_key_type)]
     fn fs_ancestors(&self, ps: &dyn Pseudo, start: &Node) -> std::collections::HashSet<Node> {
         let mut ancestors = std::collections::HashSet::new();
@@ -4317,7 +4336,8 @@ impl Vfs {
         let index = self.prop_index(list);
         let gone: std::collections::HashSet<MountId> = order.iter().copied().collect();
         // The mounts on the same places elsewhere, each place of a peer group visited once.
-        // PinnedNet/PinnedIpc inside PseudoNode hash and compare only by immutable namespace id.
+        // PinnedNet/PinnedIpc/PinnedUts/PinnedPid inside PseudoNode hash and compare only by
+        // immutable namespace id.
         #[allow(clippy::mutable_key_type)]
         let mut visited = std::collections::HashSet::new();
         let mut candidates: Vec<usize> = Vec::new();
@@ -5861,6 +5881,51 @@ mod tests {
         assert!(vfs.mount(t).is_none());
         assert_eq!(vfs.store().stat(troot).unwrap().nlink, 0);
         assert_eq!(vfs.mounts_in(INIT_MNT_NS).len(), before.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sysfs_net_ns_tagged_per_mount_and_pruned_on_collect() {
+        let (vfs, dir) = sample("sysfs-net");
+        let init_net = crate::nsproxy::NsProxy::init().net;
+        assert_eq!(vfs.sys_dev(&init_net), Fs::Sys.dev());
+        assert!(vfs.sys_net_ns(SYS_MOUNT).is_none());
+
+        let net_b = std::rc::Rc::new(crate::nsproxy::NetNs {
+            id: new_ns_id(),
+            owner: crate::cred::UserNs::init(),
+            host_net: Some([0, 1]),
+            lo: Default::default(),
+            devs: Default::default(),
+            nft: Default::default(),
+            listeners: Default::default(),
+        });
+        let dev_b = vfs.sys_dev(&net_b);
+        assert_ne!(dev_b, Fs::Sys.dev());
+        // A second lookup for the same network namespace reuses the device number.
+        assert_eq!(vfs.sys_dev(&net_b), dev_b);
+
+        let usr = Node::Store(
+            ROOT_MOUNT,
+            vfs.store().lookup(ROOT, b"usr").unwrap().unwrap(),
+        );
+        let mnt_b = vfs.add_mount(
+            Fs::Sys,
+            Fs::Sys.root(),
+            (usr, None),
+            0,
+            Vec::new(),
+            Some(dev_b),
+        );
+        assert_eq!(vfs.sys_net_ns(mnt_b).map(|n| n.id), Some(net_b.id));
+
+        // Unmounting and collecting drops the sysfs netns mapping.
+        vfs.umount_tree(mnt_b);
+        assert_eq!(vfs.sys_net_ns(mnt_b).map(|n| n.id), Some(net_b.id));
+        vfs.collect(&std::collections::HashSet::new());
+        assert!(vfs.sys_net_ns(mnt_b).is_none());
+        assert!(vfs.mounts.borrow().sys_ns.is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -658,7 +658,12 @@ static void test_sysfs_lo_stats_isolated(void)
     pid_t pid = fork();
     CHECK(pid >= 0, "fork netns child");
     if (pid == 0) {
-        CHECK(unshare(CLONE_NEWNET) == 0, "unshare(CLONE_NEWNET)");
+        CHECK(unshare(CLONE_NEWNS | CLONE_NEWNET) == 0, "unshare(CLONE_NEWNS | CLONE_NEWNET)");
+        /* Boot /sys stays tagged with the initial netns until sysfs is remounted in the new netns */
+        read_file_str("/sys/class/net/lo/statistics/tx_bytes", val, sizeof(val));
+        CHECK(strtoull(val, NULL, 10) > 0,
+              "boot /sys before remount must still reflect init netns tx_bytes > 0, got %s", val);
+        CHECK(mount("sysfs", "/sys", "sysfs", 0, NULL) == 0, "mount fresh sysfs in new netns");
         const char *stat_files[] = {
             "/sys/class/net/lo/statistics/tx_bytes",
             "/sys/class/net/lo/statistics/rx_bytes",

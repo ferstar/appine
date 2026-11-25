@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: incremental mount id/children indices and linear-time propagation, mount_setattr, move_tree and propagation_targets)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: tag sysfs mounts with mounter's network namespace via per-netns devices and Vfs::sys_net_ns)
 
 ## Responsibilities
 
@@ -58,13 +58,15 @@ Outside the module:
   (`MountId -> Vec<MountId>`, in mount order) indices kept in sync across mount/move/detach/collect,
   the `collect_pending` flag (kernel-wide under the BKL, set when `detach_store_point` detaches
   mounts or `defer_collect` postpones collection), the id counter (from 11) and device counter
-  (from 0x30), and per-instance side tables by device number (tmpfs, procfs pid namespaces, devpts
-  options, superblock flags), plus mqueue devices by IPC namespace.
+  (from 0x30), and per-instance side tables by device number (tmpfs, procfs pid namespaces, sysfs
+  network namespaces, devpts options, superblock flags), plus mqueue devices by IPC namespace.
 - `Fs` — Store, Tmpfs, Proc, Pts, Sys, Cgroup, Nsfs, Mqueue, Overlay, Fuse. Tmpfs, procfs, devpts,
   overlay and FUSE mounts are new instances with their own device numbers (`new_instance`,
   `own_dev`), except that a FUSE mount given a `/dev/fuse` fd already mounted mounts that instance
-  again; sysfs and cgroup2 use the boot device, nsfs 0x4, mqueue one device per IPC namespace
-  (`mq_dev`, allocated the first time a non-initial IPC namespace asks), the store 0x801.
+  again; cgroup2 uses the boot device, sysfs one device per network namespace (`sys_dev`: boot
+  device for the initial namespace, allocated per non-initial namespace and pruned in `collect`),
+  nsfs 0x4, mqueue one device per IPC namespace (`mq_dev`, allocated the first time a non-initial
+  IPC namespace asks), the store 0x801.
 - `MntNs` — namespace id (from `new_ns_id`, increasing), owning user namespace, `anon` flag
   (open_tree clones). A task's namespace lives in its `FsContext` (root, cwd, umask, mount
   namespace), not in nsproxy.
@@ -91,8 +93,8 @@ Outside the module:
   `set_mount_attrs`, `set_expiring`, `resolve_mountpoint`.
 - **Instances**: `sb_flags`/`set_sb_flags`, `sb_readonly`, `readonly`, `mount_flags` (read by
   `kernel/vfs`'s checks), `dev_of`, `mount_dev` (None for a mount that is gone), `fs_of`,
-  `proc_pid_ns`/`set_proc_pid_ns`, `devpts_options`/`set_devpts_options` (`kernel/tty`), `mq_dev`
-  (`kernel/ipc`).
+  `proc_pid_ns`/`set_proc_pid_ns`, `sys_net_ns`/`sys_dev` (`kernel/sysfs`),
+  `devpts_options`/`set_devpts_options` (`kernel/tty`), `mq_dev` (`kernel/ipc`).
 - **Mount points that file operations remove**: `is_store_point`, `detach_store_point`,
   `roots_removed` (from `kernel/vfs`'s unlink and rename).
 - **Collection**: `collect`, `released_detached`, `defer_collect`, `has_dead_ns`, `vfs::released`;
@@ -123,8 +125,9 @@ Outside the module:
   mount whose point directory is missing is skipped; `/tmp` is a store directory. Boot
   instances have no superblock flags entry, and boot mounts are private and unlocked.
 - Instances: procfs, devpts, tmpfs, overlay and FUSE mounts are new instances with their own
-  device numbers; mqueue maps to the mounter's IPC namespace; sysfs and cgroup2 share the boot
-  device, and a cgroup2 mount is rooted at the caller's cgroup-namespace root. Superblock flags
+  device numbers; mqueue maps to the mounter's IPC namespace; sysfs maps to the mounter's network
+  namespace (boot device in the initial namespace, per-netns device otherwise); cgroup2 shares the
+  boot device and is rooted at the caller's cgroup-namespace root. Superblock flags
   and mqueue device entries of dead instances are never pruned (device numbers only grow, so they
   are never reused).
 - Every change calls `mounts_changed`, which bumps the mount event counter polled through mounts
@@ -153,9 +156,9 @@ Outside the module:
   copies and propagated copies keep): the mounter's for tmpfs, devpts, overlay and a new FUSE
   connection, the owner of the pid namespace for procfs and of the IPC namespace for mqueue, the
   initial one for sysfs and cgroup2 (Linux's are global superblocks), and a FUSE connection's
-  mounter's when it is mounted again. sysfs, cgroup2 and same-IPC-namespace mqueue mounted on the
-  root of a mount of the same filesystem are `EBUSY` (sysfs and cgroup2 compared by filesystem
-  only, whatever their namespaces).
+  mounter's when it is mounted again. Same-network-namespace sysfs, cgroup2 and same-IPC-namespace
+  mqueue mounted on the root of a mount of the same filesystem are `EBUSY` (cgroup2 compared by
+  filesystem only, whatever its namespace).
   mqueue needs `CAP_SYS_ADMIN` over the IPC namespace, proc over the owner of the caller's pid
   namespace, sysfs over the owner of its network namespace and cgroup2 over the owner of its
   cgroup namespace (`EPERM`). In a mount namespace
@@ -291,8 +294,8 @@ Outside the module:
   mounts no longer in use and not connected below one that is (disconnecting a connected mount
   whose parent goes), forgets overlay instances (and their nodes) with no mount, aborts and
   forgets FUSE instances with none (their daemons' reads then fail with `ENODEV`), deletes tmpfs
-  instances with no remaining mount and no live overlay with a layer in them, prunes procfs and
-  devpts instance entries, and repeats if releasing pins killed another namespace.
+  instances with no remaining mount and no live overlay with a layer in them, prunes procfs, sysfs
+  and devpts instance entries, and repeats if releasing pins killed another namespace.
   It runs after every successful `umount2`; at the end of a syscall when that thread let go of an
   open file (`self.mnt`, `node.mnt()`, or `ANY_MOUNT` when `tree` was set), mapping (`MountPin`),
   executable (`ExeFile`), pinned PTY, cwd or root in a detached mount (`released`, recorded per
@@ -420,8 +423,8 @@ Outside the module:
 
 - Should loop devices' backing files make a mount busy for `umount2`, as they already do for
   remount's writer check?
-- Should sysfs and cgroup2 mounted in different network or cgroup namespaces count as different
-  instances for the same-instance `EBUSY`?
+- Should cgroup2 mounted in different cgroup namespaces count as different instances for the
+  same-instance `EBUSY`?
 
 ## To verify
 

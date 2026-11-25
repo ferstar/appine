@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: gate /sys/class/net statistics and tx_queue_len to initial network namespace)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: tag sysfs mounts with mounter's network namespace for /sys/class/net)
 
 ## Responsibilities
 
@@ -62,8 +62,10 @@ CPU and `tx_queue_len` helpers (`hal`).
 - Modes and metadata: directories are 0755, files 0444 with reported size 4096 and `st_blksize`
   4096, owned by root, root inode 1.
 - sysfs is read-only (write opens `EACCES`, chmod/chown `EACCES`; like `kernfs_fop_open`, it
-  refuses only a write access mode so `O_TRUNC` alone opens); one instance, so new mounts share the
-  boot device and stacking on its root is `EBUSY`; mounting it needs `CAP_SYS_ADMIN` over the owner
+  refuses only a write access mode so `O_TRUNC` alone opens); one instance per network namespace
+  (the boot device in the initial namespace and a per-namespace device otherwise, `Vfs::sys_dev`),
+  so stacking a sysfs mount of the same network namespace on its own root is `EBUSY` while mounting
+  sysfs in a different network namespace succeeds; mounting it needs `CAP_SYS_ADMIN` over the owner
   of the caller's network namespace (`kernel/mount`).
 - Every sysfs file is pollable (`pseudo::pollable`): always readable and writable, plus
   `POLLERR|POLLPRI` before its first read from offset 0 (`fd::ProcEvent`).
@@ -80,7 +82,9 @@ CPU and `tx_queue_len` helpers (`hal`).
 - The guest CPU count is a snapshot of the host process's affinity at kernel creation (capped at
   64); the same count drives sysfs, `/proc/cpuinfo`, `/proc/stat`, `status`, `sched_getaffinity`
   and cgroup `cpuset`; guest CPU `i` is host CPU `host_cpus()[i]`.
-- `/sys/class/net/<if>/` follows the reader thread's network namespace; interfaces are directories
+- `/sys/class/net/<if>/` follows the sysfs mount's network namespace (`View::sys_net_ns`, tagged at
+  mount time via `Vfs::sys_net_ns`, falling back to the initial network namespace for the boot
+  mount); interfaces are directories
   (Linux uses symlinks into `/sys/devices`); bridges have `bridge/` and `brif/` (symlinks to the
   ports' `brport/`), ports `brport/`; byte and packet counters from `k.traffic` and host
   `tx_queue_len` are read only in the initial network namespace (`ns.host_net.is_none()`), while new
@@ -124,10 +128,9 @@ CPU and `tx_queue_len` helpers (`hal`).
 - **No `/sys/dev/block` or block `uevent`s:** tools that go from a device number to sysfs
   (`tst_find_backing_dev`, so LTP ioctl_loop05; udev-style lookups) find nothing, and the root
   filesystem has no block device behind it at all.
-- **Fidelity gaps:** `/sys/class/net` follows the reader rather than the mounter's network
-  namespace; interfaces and loop devices are directories rather than symlinks into `/sys/devices`;
-  `kernel/`, other modules, `firmware/`, `power/` and NUMA nodes are absent.
+- **Fidelity gaps:** interfaces and loop devices are directories rather than symlinks into
+  `/sys/devices`; `kernel/`, other modules, `firmware/`, `power/` and NUMA nodes are absent.
 
 ## Open questions
 
-- Should `/sys/class/net` follow the mounter's network namespace, as Linux tags sysfs mounts?
+- None.

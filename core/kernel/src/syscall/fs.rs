@@ -6797,14 +6797,13 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     };
     put(48, &size.to_le_bytes());
     put(56, &4096u32.to_le_bytes());
-    // sysfs files report a size of one page but take no blocks. Short symlinks live in the inode
-    // and take no blocks: on ext4 targets shorter than 60 bytes (`ext4_symlink`; with the
-    // trailing NUL they fit in `i_data`), on others such as tmpfs within 128 bytes
-    // (`shmem_symlink`'s `SHORT_SYMLINK_LEN`)
+    // Short symlinks live in the inode and take no blocks: on ext4 targets shorter than 60 bytes
+    // (`ext4_symlink`; with the trailing NUL they fit in `i_data`), on others such as tmpfs within
+    // 128 bytes (`shmem_symlink`'s `SHORT_SYMLINK_LEN`)
     let inline = if dev == ROOT_DEV { 60 } else { 128 };
     let blocks = if let Some(blocks) = st.blocks {
         blocks
-    } else if dev == Fs::Sys.dev() || (st.is_symlink() && size < inline) {
+    } else if st.is_symlink() && size < inline {
         0
     } else {
         size.div_ceil(4096) * 8
