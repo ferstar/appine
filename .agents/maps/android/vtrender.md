@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: split frame capture into two-phase begin/end update so deferred style work and row encoding run outside the terminal lock)
+> Maintained: 2026-11-26 (targeted verification of SGR 8 drawing and alternate-screen cursor behavior against libghostty-vt 1.0.0 and a native C harness)
 
 ## Responsibilities
 
@@ -140,7 +140,8 @@ it does not transfer those lifecycle methods here.
   (U+10EEEE, with or without their diacritics) have no glyph drawn, as in Ghostty; four paints
   (regular/bold × upright/italic) from the variable font with ligatures off. Underlines (single,
   double, curly, dotted, dashed), strikethrough and overline are drawn; inverse and faint apply;
-  invisible hides the glyph but not its decorations; blink is ignored.
+  SGR 8 hides both glyph and decorations. Cell, search and selection backgrounds still draw.
+  Text blink is ignored.
 - The cursor (bar and underline two light lines thick, block with the glyph redrawn in the
   background colour, underline, hollow; a block is drawn hollow while the view lacks focus; all
   but the bar cover two cells on a wide cell; in the OSC 12 colour, else the default foreground;
@@ -198,11 +199,15 @@ it does not transfer those lifecycle methods here.
 
 ## Invariants and gotchas
 
-- A cursor shape set while a full-screen program shows the alternate screen reaches only that
-  screen: libghostty-vt keeps the shape per screen, and leaving the alternate screen with mode 1049
-  restores no shape (its saved cursor carries none), so the primary keeps the old one until the
-  next DECSCUSR 0, DECSTR, RIS or setting change; leaving with mode 47 or 1047 copies the whole
-  cursor, shape included, back (from libghostty-vt's source, not tried).
+- libghostty-vt 1.0.0 stores the concrete cursor shape per screen. DECSCUSR on the alternate
+  screen carries its shape back through modes 47 and 1047, which copy the cursor in both
+  directions. Mode 1049 copies on entry and restores a saved cursor without a shape on exit,
+  leaving the primary shape intact. Blink mode and the flag that selects default or explicit
+  appearance are terminal-wide. Desktop Ghostty uses the same code. xterm uses one shape across
+  both buffers, including mode 1049.
+- Settings always updates the stored defaults. While following defaults, only the active shape
+  changes immediately, along with the global blink mode. With an explicit DECSCUSR appearance,
+  both new defaults wait for DECSCUSR 0, DECSTR or RIS.
 - The frame format is defined in `vt.c` and read by `VtFrame`; the two change together.
 - The render state's source rectangles are whole image pixels, so a virtual placement's rows,
   drawn one by one, overlap or gap by a pixel each and show seams (Ghostty's renderer draws them
@@ -234,6 +239,11 @@ it does not transfer those lifecycle methods here.
 
 ## Confirmed bugs / technical debt
 
+- Changing cursor Settings on the alternate screen can leave the primary screen showing its
+  previous default shape after mode 1049 exits. The C API exposes neither an inactive-screen
+  shape setter nor per-screen default ownership. Reapplying defaults on exit could overwrite
+  a primary shape chosen by a program.
+
 - **libghostty-vt's drawing features left unused**: the default palette option (the colour scheme
   reply is fixed to dark); overscan above the viewport; `row_iterator_next_dirty`;
   `ghostty_render_state_row_cells_get_multi` in place of the four to six reads `frame` makes per
@@ -243,8 +253,6 @@ it does not transfer those lifecycle methods here.
 ## Open questions
 
 - Should a Nerd Font or a CJK fallback font be bundled?
-- Should invisible cells keep their decorations (as now) or hide them as Ghostty's renderer does?
-- Should a cursor shape changed while a full-screen program shows reach the primary screen too?
 
 ## To verify
 
