@@ -252,8 +252,10 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
 // separated by tabs) and bytes that are not UTF-8 are written as `%XX`, so they convert back
 // exactly.
 // Each entry is `<type d|f>\t<bytes>\t<modification time (ms)>\t<permission bits>`; list and search
-// results are also prefixed with the name or path and a tab. Errors throw FileNotFoundException (a
-// subclass of IOException).
+// results are also prefixed with the name or path and a tab. Errors map by errno to `IOException`
+// subclasses: `ENOENT`/`ENOTDIR` throw `FileNotFoundException`, `EEXIST` throws
+// `FileAlreadyExistsException`, `EACCES` throws `AccessDeniedException`, and all other errnos
+// throw `IOException`.
 
 /// The most entries (directory entries) one search looks at: it does not search forever in a big
 /// tree like /usr.
@@ -280,7 +282,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseStat<'l>(
                 .map(|s| s.into_raw())
                 .unwrap_or(std::ptr::null_mut()),
             Err(e) => {
-                not_found(&mut env, "find", &path, e);
+                browse_error(&mut env, "find", &path, e);
                 std::ptr::null_mut()
             }
         }
@@ -312,7 +314,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseList<'l>(
                 string_array(&mut env, &lines)
             }
             Err(e) => {
-                not_found(&mut env, "list", &dir, e);
+                browse_error(&mut env, "list", &dir, e);
                 std::ptr::null_mut()
             }
         }
@@ -338,7 +340,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseGenerations<'l>(
         let generations = match result {
             Ok(g) => g.into_iter().map(|n| n as i64).collect::<Vec<_>>(),
             Err(e) => {
-                not_found(&mut env, "lookup document generations in", &store, e);
+                browse_error(&mut env, "lookup document generations in", &store, e);
                 return std::ptr::null_mut();
             }
         };
@@ -366,7 +368,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpen<'l>(
         match r {
             Ok(file) => file.into_raw_fd(),
             Err(e) => {
-                not_found(&mut env, "open", &path, e);
+                browse_error(&mut env, "open", &path, e);
                 -1
             }
         }
@@ -403,7 +405,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseSniff<'l>(
         let texts = match r {
             Ok(t) => t,
             Err(e) => {
-                not_found(&mut env, "open", &store, e);
+                browse_error(&mut env, "open", &store, e);
                 return std::ptr::null_mut();
             }
         };
@@ -453,7 +455,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseSearch<'l>(
                 string_array(&mut env, &lines)
             }
             Err(e) => {
-                not_found(&mut env, "search", &dir, e);
+                browse_error(&mut env, "search", &dir, e);
                 std::ptr::null_mut()
             }
         }
@@ -508,7 +510,10 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseImport<'l>(
                 .unwrap_or(std::ptr::null_mut()),
             Err(e) => {
                 if !env.exception_check().unwrap_or(true) {
-                    throw(&mut env, format!("cannot import {name} into {home}: {e}"));
+                    let _ = env.throw_new(
+                        browse_error_class(e),
+                        format!("cannot import {name} into {home}: {e}"),
+                    );
                 }
                 std::ptr::null_mut()
             }
@@ -557,7 +562,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseCreate<'l>(
                 .map(|s| s.into_raw())
                 .unwrap_or(std::ptr::null_mut()),
             Err(e) => {
-                not_found(&mut env, "create in", &dir, e);
+                browse_error(&mut env, "create in", &dir, e);
                 std::ptr::null_mut()
             }
         }
@@ -590,7 +595,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseRemove<'l>(
             )
         });
         if let Err(e) = r {
-            not_found(&mut env, "delete", &path, e);
+            browse_error(&mut env, "delete", &path, e);
         }
     })
 }
@@ -629,7 +634,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseRename<'l>(
                 .map(|s| s.into_raw())
                 .unwrap_or(std::ptr::null_mut()),
             Err(e) => {
-                not_found(&mut env, "rename", &path, e);
+                browse_error(&mut env, "rename", &path, e);
                 std::ptr::null_mut()
             }
         }
@@ -665,7 +670,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseMove<'l>(
             )
         });
         if let Err(e) = r {
-            not_found(&mut env, "move", &path, e);
+            browse_error(&mut env, "move", &path, e);
         }
     })
 }
@@ -704,7 +709,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpenWrite<'l>(
         match r {
             Ok(file) => file.into_raw_fd(),
             Err(e) => {
-                not_found(&mut env, "open", &path, e);
+                browse_error(&mut env, "open", &path, e);
                 -1
             }
         }
@@ -751,11 +756,18 @@ fn stat_fields(st: &appine_kernel::vfs::store::Stat) -> String {
     )
 }
 
-fn not_found(env: &mut JNIEnv<'_>, what: &str, path: &str, e: appine_kernel::errno::Errno) {
-    let _ = env.throw_new(
-        "java/io/FileNotFoundException",
-        format!("cannot {what} {path}: {e}"),
-    );
+fn browse_error_class(e: appine_kernel::errno::Errno) -> &'static str {
+    use appine_kernel::errno::Errno;
+    match e {
+        Errno::ENOENT | Errno::ENOTDIR => "java/io/FileNotFoundException",
+        Errno::EEXIST => "java/nio/file/FileAlreadyExistsException",
+        Errno::EACCES => "java/nio/file/AccessDeniedException",
+        _ => "java/io/IOException",
+    }
+}
+
+fn browse_error(env: &mut JNIEnv<'_>, what: &str, path: &str, e: appine_kernel::errno::Errno) {
+    let _ = env.throw_new(browse_error_class(e), format!("cannot {what} {path}: {e}"));
 }
 
 // ---- The kernel ----

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: delete JNI local refs in `string_array` and reuse it in `takeListens`/`takeKills`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: map browse JNI errnos to `FileNotFoundException`, `FileAlreadyExistsException`, `AccessDeniedException` and `IOException`)
 
 ## Responsibilities
 
@@ -79,10 +79,15 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   throw "the machine is stopped", `takeListens`, `takeKills` and `takeChangedDirs` return empty
   arrays, `bklStall`, `loginRuleInputs` and `consoleCwd` null, `takePower` and `processes` 0, `guestCpuTime` −1, and the rest
   (`boot`, `setRoutes`, `resize`, `closeConsole`, `trimMemory`, `shutdown`, `stop`) do nothing.
-- `browseImport` calls an `IntConsumer` synchronously with a borrowed staging fd. It returns
-  the encoded name after publication, propagates the writer's exception, and throws `IOException`
-  on store errors. Other throwing browse calls use `FileNotFoundException` for every errno.
-  Other runtime calls use `IOException` or sentinel values. `openConsole` and `resize` clamp rows and columns to 1–65535.
+- `browseImport` calls an `IntConsumer` synchronously with a borrowed staging fd, returns the
+  encoded name after publication, and propagates any exception thrown by the writer. All throwing
+  browse calls (`browseStat`, `browseGenerations`, `browseList`, `browseOpen`, `browseSniff`,
+  `browseSearch`, `browseImport`, `browseCreate`, `browseRemove`, `browseRename`, `browseMove`,
+  `browseOpenWrite`) map store/browse errnos via `browse_error_class`: `ENOENT`/`ENOTDIR` to
+  `FileNotFoundException`, `EEXIST` to `FileAlreadyExistsException`, `EACCES` to
+  `AccessDeniedException`, and all other errnos (`ENOSPC`, `EISDIR`, `EINVAL`, `ENAMETOOLONG`,
+  `ELOOP`, `EIO`, etc.) to `IOException`. Other runtime calls use `IOException` or sentinel values.
+  `openConsole` and `resize` clamp rows and columns to 1–65535.
 - `setRoutes` parses lines of `<hex destination>/<prefix> <hex gateway or -> <interface>` (later
   fields ignored); hex fields must be ASCII and even, the destination 4 or 16 bytes and the gateway
   the same length; the metric is 0 for IPv4, and for IPv6 1024 for a default route, else 256.
@@ -171,9 +176,6 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 ## Open questions
 
 - Successful hardware-backed 16 KiB-page operation still awaits a device test. Both tested AHB paths use one physical device.
-
-- Should browse errors other than a missing file (`EEXIST`, `EACCES`, `ENOSPC`) surface as
-  `FileNotFoundException`?
 
 ## To verify
 

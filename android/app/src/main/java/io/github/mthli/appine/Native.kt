@@ -62,9 +62,10 @@ internal object Native {
     // Paths are document IDs: the guest's absolute paths, with `%`, control characters and bytes
     // that are not UTF-8 written as `%XX`. Each call opens the store separately, which also works
     // while the kernel runs; the caller holds the read lock of [Rootfs.access]. Metadata is
-    // `<d|f>\t<bytes>\t<modification time (ms)>\t<permission bits>`. Only directories and regular
-    // files (following symbolic links); anything else, or anything missing, throws
-    // FileNotFoundException.
+    // Metadata is `<d|f>\t<bytes>\t<modification time (ms)>\t<permission bits>`. Only directories
+    // and regular files (following symbolic links) are exposed; missing paths (`ENOENT`/`ENOTDIR`)
+    // throw `FileNotFoundException`, `EEXIST` throws `FileAlreadyExistsException`, `EACCES` throws
+    // `AccessDeniedException`, and other store/I/O errnos throw `IOException`.
 
     /** Metadata of the directory or regular file a path points at. */
     @JvmStatic

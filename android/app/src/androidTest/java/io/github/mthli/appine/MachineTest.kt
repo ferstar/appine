@@ -151,9 +151,12 @@ class MachineTest {
      * step by step: each step waits up to two minutes for `wait` to appear in the output (after the
      * point the previous step waited for), then types `send`. Returns all the output.
      */
-    private fun loginSteps(machine: Long, vararg steps: Pair<String, String>): String {
+    private fun loginSteps(machine: Long, vararg steps: Pair<String, String>): String =
+        loginSteps(machine, ConsolePty.LOGIN_AUTO, *steps)
+
+    private fun loginSteps(machine: Long, account: String, vararg steps: Pair<String, String>): String {
         val console = Native.openConsole(machine, 24, 200)
-        val argv = ConsolePty.argv(ConsolePty.script(context), ConsolePty.LOGIN_AUTO, null)
+        val argv = ConsolePty.argv(ConsolePty.script(context), account, null)
         val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
         val bytes = ByteArrayOutputStream()
         val text = { synchronized(bytes) { bytes.toString("UTF-8") } }
@@ -984,6 +987,103 @@ class MachineTest {
     }
 
     /**
+     * Ctrl-C during `login.sh` must not disrupt short setup commands (passwd lookup, group check,
+     * shadow read) or log a named user in as root, while still interrupting cancellable `apk`
+     * lock waits and working normally once the user's shell starts.
+     */
+    @Test
+    fun loginProtectsSetupFromCtrlCAndRestoresItForInstallAndShell() = withAlpineStore("login-sigint") { store ->
+        context.assets.open("doas.apk").use {
+            Native.writeFile(store, "/var/cache/appine/doas.apk", it.readBytes(), 420, true)
+        }
+        withMachine(store) { machine ->
+            checkedShell(machine, "adduser -D -s /bin/sh alice")
+            // First login installs doas and records alice in /var/lib/appine/admins.
+            val first = login(machine, "id -un; doas -n id -un; exit\n", "alice")
+            assertTrue(first, becameAdmin(first, "wheel"))
+
+            // Slow down awk during passwd/shadow lookups; Ctrl-C arriving then must be ignored so
+            // alice is not logged in as root and NOPASSWD rules stay intact, while Ctrl-C inside
+            // the launched shell still interrupts foreground commands.
+            checkedShell(
+                machine,
+                "mkdir -p /usr/local/bin && printf '#!/bin/sh\\necho READY_AWK >&2\\nsleep 1\\nexec /usr/bin/awk \"\$@\"\\n' > /usr/local/bin/awk && chmod +x /usr/local/bin/awk",
+            )
+            val protectedOut = plain(
+                loginSteps(
+                    machine,
+                    "alice",
+                    "READY_AWK" to "\u0003",
+                    "$ " to "id -un; doas -n id -un; echo sl''eeping; sleep 30\n",
+                    "sleeping" to "\u0003",
+                    "$ " to "echo shell-ctrlc-ok; exit\n",
+                ),
+            )
+            checkedShell(machine, "rm -f /usr/local/bin/awk")
+            assertFalse(protectedOut, protectedOut.contains("there is no user alice"))
+            assertTrue(protectedOut, protectedOut.contains("\nalice\nroot\n"))
+            assertTrue(protectedOut, protectedOut.contains("\nshell-ctrlc-ok\n"))
+
+            // Ctrl-C during an apk lock wait must skip installing immediately and still launch a
+            // working shell with SIGINT restored.
+            checkedShell(machine, "apk del -q --no-network --repositories-file /dev/null doas && rm -f /var/lib/appine/doas-installed")
+            val holder = Native.spawn(
+                machine, -1, "/bin/sh",
+                arrayOf("sh", "-c", "flock /lib/apk/db/lock sh -c 'touch /tmp/apk-held; sleep 30'; rm -f /tmp/apk-held"),
+                ConsolePty.ENVIRONMENT,
+            )
+            try {
+                checkedShell(
+                    machine,
+                    "i=0; while [ ! -e /tmp/apk-held ] && [ \$i -lt 100 ]; do sleep 0.05; i=\$((i + 1)); done; [ -e /tmp/apk-held ]",
+                )
+                val skipped = plain(
+                    loginSteps(
+                        machine,
+                        "alice",
+                        "another apk is running; waiting for it to finish" to "\u0003",
+                        "$ " to "id -un; echo sl''eeping; sleep 30\n",
+                        "sleeping" to "\u0003",
+                        "$ " to "echo after-apk-skip; exit\n",
+                    ),
+                )
+                assertTrue(skipped, skipped.contains("appine: skipped installing doas"))
+                assertTrue(skipped, skipped.contains("\nalice\n"))
+                assertTrue(skipped, skipped.contains("\nafter-apk-skip\n"))
+            } finally {
+                sh(machine, "kill -KILL $holder 2>/dev/null; rm -f /tmp/apk-held")
+                Native.waitFor(machine, holder)
+            }
+        }
+    }
+
+    /**
+     * [Rootfs.deleteTarball] removes only the abandoned distribution's cached tarball and `.part`
+     * file, leaving other distributions' cached tarballs intact.
+     */
+    @Test
+    fun deleteTarballRemovesOnlyAbandonedDistroCache() {
+        val debian = Rootfs.tarball(context, Rootfs.Distro.DEBIAN)
+        val debianPart = File(debian.path + ".part")
+        val alpine = Rootfs.tarball(context, Rootfs.Distro.ALPINE)
+        val alpineExisted = alpine.exists()
+        val alpineBytes = if (alpineExisted) alpine.readBytes() else null
+        try {
+            debian.writeText("debian-tarball")
+            debianPart.writeText("debian-part")
+            alpine.writeText("alpine-tarball")
+            Rootfs.deleteTarball(context, Rootfs.Distro.DEBIAN)
+            assertFalse(debian.exists())
+            assertFalse(debianPart.exists())
+            assertTrue(alpine.exists())
+        } finally {
+            debian.delete()
+            debianPart.delete()
+            if (alpineExisted && alpineBytes != null) alpine.writeBytes(alpineBytes) else alpine.delete()
+        }
+    }
+
+    /**
      * In the login script's output: `id -un` is alice, `id -nG` contains [group],
      * `doas`/`sudo -n id -un` is root (compared by line, without the control sequences and CRs
      * terminal output has mixed in).
@@ -1668,8 +1768,8 @@ class MachineTest {
             assertEquals(home, flags("/home/bob"))
             assertTrue(flags("$dw/notes.txt") and DocumentsContract.Document.FLAG_SUPPORTS_WRITE != 0)
             assertTrue(flags("$dw/sub") and DocumentsContract.Document.FLAG_SUPPORTS_DELETE != 0)
-            // Renaming does not replace; moving; deleting a whole directory
-            assertThrows(Exception::class.java) {
+            // Renaming does not replace (EEXIST -> IllegalStateException); moving; deleting a whole directory
+            assertThrows(IllegalStateException::class.java) {
                 DocumentsContract.renameDocument(resolver, uri("$dw/notes (1).txt"), "notes.txt")
             }
             val renamed = DocumentsContract.renameDocument(resolver, uri("$dw/notes (1).txt"), "renamed.txt")
@@ -1708,10 +1808,10 @@ class MachineTest {
             // Outside the home directory, leading out through a symbolic link, the home directory
             // itself
             val motd = sh(machine, "cat /etc/motd").first
-            assertThrows(Exception::class.java) { create("/etc", "text/plain", "x") }
-            assertThrows(Exception::class.java) { create("$dw/etc-link", "text/plain", "x") }
-            assertThrows(Exception::class.java) { write("$dw/etc-link/motd", "wt", "gone") }
-            assertThrows(Exception::class.java) { DocumentsContract.deleteDocument(resolver, uri("/home/bob")) }
+            assertThrows(UnsupportedOperationException::class.java) { create("/etc", "text/plain", "x") }
+            assertThrows(SecurityException::class.java) { create("$dw/etc-link", "text/plain", "x") }
+            assertThrows(SecurityException::class.java) { write("$dw/etc-link/motd", "wt", "gone") }
+            assertThrows(UnsupportedOperationException::class.java) { DocumentsContract.deleteDocument(resolver, uri("/home/bob")) }
             assertEquals(motd to 0, sh(machine, "cat /etc/motd"))
             assertEquals(1, sh(machine, "test -e /etc/x").second)
             // Deleting a symbolic link deletes only the link
@@ -1943,6 +2043,48 @@ class MachineTest {
             prefs.edit().remove("login").remove("file_access").commit()
             sh(machine, cleanup)
             Documents.rootsChanged(context)
+        }
+    }
+
+    /**
+     * Browse JNI errors map by errno rather than collapsing everything into `FileNotFoundException`:
+     * `ENOENT`/`ENOTDIR` throw `FileNotFoundException`, `EEXIST` throws
+     * `FileAlreadyExistsException`, `EACCES` throws `AccessDeniedException`, and other errnos
+     * (`EISDIR`, `EINVAL`) throw `IOException`.
+     */
+    @Test
+    fun browseJniErrorsMapByErrno() = withAlpineStore("browse-errors") { store ->
+        withMachine(store) { machine ->
+            checkedShell(
+                machine,
+                "mkdir -p /root/be/dir/sub && printf a > /root/be/a.txt && printf b > /root/be/b.txt && ln -s /etc /root/be/etc-link",
+            )
+            assertThrows(java.io.FileNotFoundException::class.java) {
+                Native.browseStat(store, "/root/be/missing")
+            }
+            assertThrows(java.io.FileNotFoundException::class.java) {
+                Native.browseList(store, "/root/be/a.txt")
+            }
+            assertThrows(java.nio.file.FileAlreadyExistsException::class.java) {
+                Native.browseRename(store, "/root", "/root/be/a.txt", "b.txt")
+            }
+            assertThrows(java.nio.file.AccessDeniedException::class.java) {
+                Native.browseCreate(store, "/root", "/root/be/etc-link", "x", false, 0, 0)
+            }
+            assertThrows(java.nio.file.AccessDeniedException::class.java) {
+                Native.browseOpenWrite(store, "/root", "/root/be/etc-link/passwd", false, false)
+            }
+            assertThrows(java.nio.file.AccessDeniedException::class.java) {
+                Native.browseImport(store, "/", "x.txt", 0, 0) {}
+            }
+            val isDir = assertThrows(IOException::class.java) {
+                Native.browseOpen(store, "/root/be/dir")
+            }
+            assertEquals(IOException::class.java, isDir.javaClass)
+            val invalid = assertThrows(IOException::class.java) {
+                Native.browseMove(store, "/root", "/root/be/dir", "/root/be/dir/sub")
+            }
+            assertEquals(IOException::class.java, invalid.javaClass)
         }
     }
 

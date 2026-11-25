@@ -834,8 +834,9 @@ class TerminalService : Service() {
             // The import failed while switching to another distro (the download was already
             // verified, so most likely space ran out) or while resuming one the app was killed
             // in (its download may have been needed again): the old store is already deleted,
-            // so fall back to the Alpine in the APK rather than leave the user facing an app
-            // that does not work
+            // so drop the abandoned tarball and fall back to the Alpine in the APK rather than
+            // leave the user facing an app that does not work
+            Rootfs.deleteTarball(this, distro)
             tell(getString(R.string.switch_failed, distro.label, error, Rootfs.Distro.ALPINE.label))
             start(Rootfs.Distro.ALPINE)
         } else {

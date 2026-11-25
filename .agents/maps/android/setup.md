@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: added Debian/nested bash and zsh rc hooks, ZDOTDIR login bootstrap for Debian zsh, zsh RPROMPT/RPS2 prompt wrapping, and multi-line PS1 k=c continuation marks)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: protected `login.sh` non-install commands from `SIGINT` and added `Rootfs.deleteTarball` for Alpine fallback cleanup)
 
 ## Responsibilities
 
@@ -80,7 +80,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 ## Public entry points
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
-  `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
+  `fetch`, `tarball`, `deleteTarball`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
 - Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
   `ensureBashStartup`, `ensureGpuCommand`, `ensureBrowser`, `updateProfile`; around boot:
   `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
@@ -314,8 +314,12 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   `nologin` or `false`) with the lowest UID, else root; `root`; or a named passwd entry, falling
   back to root. `regularAccounts` lists the same accounts for `android/settings`. `login.sh` picks
   the account by the same rules, except that it does not require a numeric GID or all seven fields.
-- `login.sh` traps SIGINT, so Ctrl-C does not end the login but still interrupts the command
-  running (normally apk or apt, skipping the install until the next login), chooses wheel, doas and
+- `login.sh` ignores `SIGINT` (`trap '' INT`) by default so Ctrl-C cannot disrupt short setup
+  commands (passwd lookup, group checks, shadow reads, rules publication, or the `su --help`
+  probe), temporarily catches `SIGINT` (`trap 'interrupted=1' INT`, restoring default disposition
+  in child processes) only around cancellable package-lock waits (`flock 9` in `locked`, `apk add
+  --wait 3600`) and Debian `apt-get` update/sleep/install calls, and restores `trap - INT` right
+  before `exec` into the user shell or `su`. It chooses wheel, doas and
   `/etc/doas.d/30-appine.conf` on Alpine (`/etc/alpine-release`), else sudo, sudo and
   `/etc/sudoers.d/appine`, picks the account, and:
   - every login, root's included: rewrite the NOPASSWD rules for recorded admins still in the
@@ -394,7 +398,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   `rootfs.tmp` never counts and is deleted by the next `prepare` or `reset`.
 - An import interrupted by a kill (a first run, a distro switch, a reset) is redone with the same
   distro on the next launch, from the verified tarball still in the cache or by downloading it
-  again with the usual progress; if that fails, the service falls back to Alpine with its notice.
+  again with the usual progress; if that fails and the service falls back to Alpine,
+  `Rootfs.deleteTarball` deletes the abandoned cached tarball (and any `.part` file) before
+  starting the Alpine fallback import.
 - The distro record is committed before the import starts, so an existing store always has it;
   only the app's own store writes it, but an import into another store (only the
   instrumentation tests make one) still overwrites (Alpine) and deletes the shared cached tarball.
@@ -419,10 +425,10 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   through publication or removal. A failed publication attempts to remove stale grants.
   Reading account files and publishing in the rules subdirectory do not change the sampled
   inputs. The service polls every 2 s independently of the Files app's directory notifications.
-- `login.sh` runs without job control, so its children share its process group: a Ctrl-C that
-  lands during another command than an install (the passwd lookup, the group check, the shadow
-  read, the `su --help` probe) can log a named account in as root, leave an admin out of the
-  NOPASSWD rules until the next refresh, or make Debian fall back to `su -c`. The window is short.
+- `login.sh` runs without job control (its children share its process group), so `SIGINT` stays
+  ignored except inside `cancellable` waits/installs (`locked` uses a braced group rather than a
+  subshell so `interrupted=1` propagates while fd 9 still closes on exit) and is reset with
+  `trap - INT` immediately before every `exec`.
 
 ## Confirmed bugs / technical debt
 
@@ -434,8 +440,6 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - Should a failed optional per-start write (the network, containers, doas package or profile file,
   for example through a directory the user replaced with a symlink, which `writeFile` refuses) fail
   the whole start rather than be logged?
-- Should a Debian tarball left in the cache after its import failed and fell back to Alpine be
-  deleted?
 
 ## To verify
 

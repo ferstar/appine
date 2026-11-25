@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: refresh roots via `AutoRootsWatcher` when `login` is `"auto"` and `/etc/passwd` changes the resolved home)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: translate native browse `AccessDeniedException` to `SecurityException` and other non-`FileNotFoundException` `IOException`s to `IllegalStateException` in `DocumentsProvider` callbacks)
 
 ## Responsibilities
 
@@ -105,12 +105,15 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
 
 ### Operations, locking and grant revocation
 
-- **Locking and errors**: provider callbacks serialize ID validation with namespace mutations. Every `Native.browse*` call runs inside `Rootfs.access.read` and opens a
+- **Locking and errors**: provider callbacks serialize ID validation with namespace mutations. Every `Native.browse*` call runs inside `Rootfs.access.read` (including `providerIds`/`providerId`/`providerPath` generation checks) and opens a
   fresh `Store` connection per JNI call (forcing a running kernel to flush deferred commits, then
-  closing immediately). Native `Errno` maps to `FileNotFoundException`; non-`FileNotFoundException`
-  `IOException`s are rethrown as `FileNotFoundException`; writes outside `home` (or targeting
-  `home` itself when `top = false`) throw `UnsupportedOperationException`. During `Rootfs.reset`,
-  `Rootfs.access.write` blocks provider calls until the store is removed.
+  closing immediately). Native `ENOENT`/`ENOTDIR` (`FileNotFoundException`) propagates as
+  `FileNotFoundException`; `EACCES` (`AccessDeniedException`) maps to `SecurityException`; other
+  `IOException`s (`FileAlreadyExistsException`, `ENOSPC`, `EISDIR`, `EINVAL`, `EIO`, etc.) map to
+  `IllegalStateException` (all Binder-parcelable under `DocumentsProvider`'s contract); writes
+  outside `home` (or targeting `home` itself when `top = false`) throw
+  `UnsupportedOperationException`. During `Rootfs.reset`, `Rootfs.access.write` blocks provider
+  calls until the store is removed.
 - **`openDocument`**: read-only (`MODE_READ_ONLY`) checks visibility and adopts the host object fd
   from `Native.browseOpen` (follows symlinks without home confinement; regular files only). Any
   non-read-only mode requires a strict child of `home`, passes `truncate` (`MODE_TRUNCATE`) and

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: poll `Documents.AutoRootsWatcher` per kernel to refresh Files roots on `/etc/passwd` changes when `login` is `"auto"`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: delete abandoned cached distro tarball via `Rootfs.deleteTarball` when falling back to Alpine in `startFailed`)
 
 ## Responsibilities
 
@@ -147,8 +147,9 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   lock, write the running marker, restore the killed run's tabs (once), schedule periodic saves,
   start the boot thread, register a default-network callback (routes), post the poll, update the
   notification, `onMachineReady(null)`.
-- On failure: a failed import of a downloaded distro (not Alpine, store not ready) falls back to
-  Alpine with a notice; with a `pendingReplace` the store is replaced; any other failure records
+- On failure: a failed import of a downloaded distro (not Alpine, store not ready) deletes the
+  abandoned cached tarball via `Rootfs.deleteTarball` and falls back to Alpine with a notice; with
+  a `pendingReplace` the store is replaced; any other failure records
   the exception in `Diagnostics`, sets `startError`, updates the wake lock and notification
   ("Cannot start" with the error in its body, unless privacy mode hides it), reports it to the
   listeners, and stops the service as soon as no UI is left and no distro switch is downloading

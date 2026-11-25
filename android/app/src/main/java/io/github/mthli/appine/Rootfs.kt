@@ -206,7 +206,17 @@ internal object Rootfs {
         tarball.delete()
     }
 
-    private fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
+    fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
+
+    /**
+     * Deletes any cached tarball (and partial download) for [distro]: called when abandoning a
+     * failed import and falling back to Alpine, so the downloaded tarball does not stay in cache.
+     */
+    fun deleteTarball(context: Context, distro: Distro) {
+        val file = tarball(context, distro)
+        file.delete()
+        File(file.path + ".part").delete()
+    }
 
     @Throws(IOException::class)
     private fun configure(context: Context, store: String, distro: Distro) {

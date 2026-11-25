@@ -20,6 +20,7 @@ import android.webkit.MimeTypeMap
 import java.io.ByteArrayOutputStream
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.nio.file.AccessDeniedException
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.read
@@ -91,7 +92,7 @@ class Documents : DocumentsProvider() {
         val home = home(context)
         if (home != null) result.newRow().apply {
             add(Root.COLUMN_ROOT_ID, ROOT_HOME)
-            add(Root.COLUMN_DOCUMENT_ID, currentId(context, home.path))
+            add(Root.COLUMN_DOCUMENT_ID, providerId(home.path))
             add(Root.COLUMN_TITLE, context.getString(R.string.app_name))
             add(Root.COLUMN_SUMMARY, context.getString(R.string.documents_home, home.account, distro))
             // Creating is supported: so it also appears in other apps' "Save to"
@@ -178,7 +179,7 @@ class Documents : DocumentsProvider() {
     /** The guest path of a current document ID while file access is enabled. */
     private fun visible(context: Context, documentId: String): String {
         requireFileAccess(context)
-        return currentPath(context, documentId) ?: throw FileNotFoundException("unknown document $documentId")
+        return providerPath(documentId) ?: throw FileNotFoundException("unknown document $documentId")
     }
 
     private fun requireFileAccess(context: Context) {
@@ -191,10 +192,19 @@ class Documents : DocumentsProvider() {
             Rootfs.access.read { call(store) }
         } catch (e: FileNotFoundException) {
             throw e
+        } catch (e: AccessDeniedException) {
+            throw SecurityException(e.message, e)
         } catch (e: IOException) {
-            throw FileNotFoundException(e.message)
+            throw IllegalStateException(e.message, e)
         }
     }
+
+    private fun providerIds(paths: List<String>): List<String> =
+        if (paths.isEmpty()) emptyList() else browse { readCurrentIds(it, paths) }
+
+    private fun providerId(path: String): String = providerIds(listOf(path)).single()
+
+    private fun providerPath(id: String): String? = idPath(id)?.takeIf { providerId(it) == id }
 
     /**
      * The regular files in [docs] (paths and metadata) whose type the extension cannot tell and
@@ -219,7 +229,7 @@ class Documents : DocumentsProvider() {
         val cursor = MatrixCursor(projection ?: DOCUMENT_COLUMNS)
         val home = home(context)
         val texts = sniff(entries)
-        val ids = currentIds(context, entries.map { it.first })
+        val ids = providerIds(entries.map { it.first })
         entries.forEachIndexed { i, (path, meta) -> row(cursor, ids[i], path, meta, home, texts) }
         return cursor
     }
@@ -261,8 +271,8 @@ class Documents : DocumentsProvider() {
     @Synchronized
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
         if (!Settings.fileAccess(attached())) return false
-        val parent = currentPath(attached(), parentDocumentId) ?: return false
-        val doc = currentPath(attached(), documentId) ?: return false
+        val parent = runCatching { providerPath(parentDocumentId) }.getOrNull() ?: return false
+        val doc = runCatching { providerPath(documentId) }.getOrNull() ?: return false
         return doc != parent && within(parent, doc)
     }
 
@@ -284,7 +294,7 @@ class Documents : DocumentsProvider() {
         if (!within(top, child)) throw FileNotFoundException("$childDocumentId is not under $top")
         val path = mutableListOf(child)
         while (path.last() != top) path.add(parent(path.last()))
-        return DocumentsContract.Path(rootId, currentIds(context, path.asReversed()))
+        return DocumentsContract.Path(rootId, providerIds(path.asReversed()))
     }
 
     @Synchronized
@@ -343,7 +353,7 @@ class Documents : DocumentsProvider() {
         val name = fileName(displayName, mimeType, directory)
         val created = browse { Native.browseCreate(it, home.path, dir, name, directory, home.uid, home.gid) }
         childrenChanged(context, dir)
-        return currentId(context, child(dir, created))
+        return providerId(child(dir, created))
     }
 
     @Synchronized
@@ -365,7 +375,7 @@ class Documents : DocumentsProvider() {
         val renamed = child(parent(path), name)
         if (renamed != path) revokeTree(context, documentId, path)
         childrenChanged(context, parent(path))
-        return currentId(context, renamed)
+        return providerId(renamed)
     }
 
     @Synchronized
@@ -383,12 +393,12 @@ class Documents : DocumentsProvider() {
         revokeTree(context, sourceDocumentId, path)
         childrenChanged(context, parent(path))
         childrenChanged(context, target)
-        return currentId(context, child(target, path.substringAfterLast('/')))
+        return providerId(child(target, path.substringAfterLast('/')))
     }
 
     /** Something in directory [dir] changed: the Files app lists it again. */
     private fun childrenChanged(context: Context, dir: String) {
-        context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), currentId(context, dir)), null)
+        context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), providerId(dir)), null)
     }
 
     /**
@@ -469,12 +479,14 @@ class Documents : DocumentsProvider() {
             Home(account.name, account.uid, account.gid, path) to path
         }
 
+        private fun readCurrentIds(store: String, paths: List<String>): List<String> {
+            val generations = Native.browseGenerations(store, paths.toTypedArray())
+            return paths.mapIndexed { i, path -> if (generations[i] == 0L) path else "${generations[i]}$path" }
+        }
+
         private fun currentIds(context: Context, paths: List<String>, store: String = Rootfs.store(context).path): List<String> {
             if (paths.isEmpty()) return emptyList()
-            val generations = Rootfs.access.read {
-                Native.browseGenerations(store, paths.toTypedArray())
-            }
-            return paths.mapIndexed { i, path -> if (generations[i] == 0L) path else "${generations[i]}$path" }
+            return Rootfs.access.read { readCurrentIds(store, paths) }
         }
 
         private fun currentId(context: Context, path: String) = currentIds(context, listOf(path)).single()
@@ -489,8 +501,6 @@ class Documents : DocumentsProvider() {
             }
             return canonical(id.substring(slash))
         }
-
-        private fun currentPath(context: Context, id: String) = idPath(id)?.takeIf { currentId(context, it) == id }
 
         /** The most results one search gives. */
         private const val SEARCH_LIMIT = 200

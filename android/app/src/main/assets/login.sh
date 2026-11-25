@@ -30,16 +30,27 @@
 # The install commands all read from /dev/null: what the user types before the prompt appears is
 # left for the login shell.
 #
-# Ctrl-C does not end the login: the script catches SIGINT itself (child processes are still
-# interrupted), and pressing it while sudo installs skips installing this time.
-# Caught rather than ignored: an ignored SIGINT is inherited by child processes, and apt-get could
-# not be stopped; the default is restored after exec
+# Ctrl-C must not end the login or interrupt short setup commands (passwd lookup, group checks,
+# shadow reads, rules publication, or the su --help probe): SIGINT is ignored by default and only
+# caught around the cancellable package-lock waits and apt installs (setting interrupted=1 while
+# letting the child be interrupted). Before exec into the user's shell or su, SIGINT is restored to
+# default so interactive Ctrl-C works normally.
 set -u
 interrupted=
-trap 'interrupted=1' INT
+trap '' INT
 want=${1:-auto}
 dir=${2:-}
 user=root
+
+# Runs "$@" with SIGINT caught in this shell (and default in the child) so Ctrl-C interrupts a
+# long-running install or lock wait and records it in interrupted, then ignores SIGINT again.
+cancellable() {
+    trap 'interrupted=1' INT
+    "$@"
+    cancellable_rc=$?
+    trap '' INT
+    return "$cancellable_rc"
+}
 
 # The first regular user created
 first() {
@@ -73,11 +84,12 @@ ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -Fqx "$group"; }
 
 # Runs "$@" holding the lock that every login's installs of bundled packages share, so they run one
 # after another: whatever the command installs, it checks first whether a login that held the lock
-# before has installed it already
+# before has installed it already. Uses a braced group rather than a subshell so interrupted=1 set
+# during a cancelled lock or apk wait propagates back to the caller, while closing fd 9 on exit.
 locked() {
-    (
-        flock 9 && "$@"
-    ) 9>/run/appine-install.lock
+    {
+        cancellable flock 9 && "$@"
+    } 9>/run/appine-install.lock
 }
 
 # apk add, offline (without reading the repository index). When another apk holds apk's lock (the
@@ -88,7 +100,7 @@ apk_add() {
     case $apk_errors in
     *'Unable to lock database'*)
         echo "appine: another apk is running; waiting for it to finish (Ctrl-C skips installing until the next login)" >&2
-        apk add -q --wait 3600 --no-network --repositories-file /dev/null "$@" </dev/null
+        cancellable apk add -q --wait 3600 --no-network --repositories-file /dev/null "$@" </dev/null
         ;;
     *)
         printf '%s\n' "$apk_errors" >&2
@@ -141,7 +153,7 @@ apt_update() {
     apt_errors=$(mktemp) || return 1
     waiting=
     while :; do
-        if apt-get update </dev/null 2>"$apt_errors"; then
+        if cancellable apt-get update </dev/null 2>"$apt_errors"; then
             status=0
             break
         fi
@@ -151,7 +163,7 @@ apt_update() {
             echo "appine: another apt is running; waiting for it to finish (Ctrl-C skips installing until the next login)" >&2
             waiting=1
         fi
-        sleep 2
+        cancellable sleep 2
         [ -z "$interrupted" ] || break
     done
     grep -q 'Could not get lock' "$apt_errors" || cat "$apt_errors" >&2
@@ -255,6 +267,7 @@ if [ "$user" = root ]; then
     case ${shell##*/} in
     zsh) [ -z "${ZDOTDIR+x}" ] && [ -r /etc/appine/zsh/.zshenv ] && export ZDOTDIR=/etc/appine/zsh ;;
     esac
+    trap - INT
     exec "$shell" -l
 fi
 
@@ -285,6 +298,7 @@ fi
 # retried at every later login
 installed=/var/lib/appine/$tool-installed
 tried=
+interrupted=
 if [ ! -e "$installed" ] && ! command -v "$tool" >/dev/null; then
     tried=1
     if [ "$group" = wheel ]; then
@@ -297,8 +311,11 @@ if [ ! -e "$installed" ] && ! command -v "$tool" >/dev/null; then
         # finished installing. While another apt runs, apt-get install waits for dpkg's lock itself
         # (an hour at most), saying so
         echo "appine: installing sudo so that $user can become root (Ctrl-C skips it until the next login)"
-        apt_update &&
+        if apt_update && [ -z "$interrupted" ]; then
+            trap 'interrupted=1' INT
             DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=3600 install -y sudo </dev/null
+            trap '' INT
+        fi
     fi
 fi
 if command -v "$tool" >/dev/null; then
@@ -345,6 +362,8 @@ cmd="{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; ${zdot}exec \"\$
 # reading the terminal as root. busybox su (Alpine) never starts a new session and has no such
 # option
 if su --help 2>&1 | grep -q -- --session-command; then
+    trap - INT
     exec su "$@" --session-command="$cmd" "$user"
 fi
+trap - INT
 exec su "$@" "$user" -c "$cmd"
