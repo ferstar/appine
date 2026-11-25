@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: escaped default ash prompt paths and titles)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: added Debian/nested bash and zsh rc hooks, ZDOTDIR login bootstrap for Debian zsh, zsh RPROMPT/RPS2 prompt wrapping, and multi-line PS1 k=c continuation marks)
 
 ## Responsibilities
 
@@ -57,16 +57,25 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - `ashrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.ashrc` (not `.sh`, so
   `/etc/profile` does not read it): ash's prompt marks, read through `ENV`.
 - `bashrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.bashrc`: bash's prompt
-  marks, read by the profile and, on Alpine, by `/etc/bash/appine.sh` (`BASH_HOOK`, a line sourcing
-  it).
+  marks (including `k=c` continuation marks on multi-line `PS1` and scalar/array `PROMPT_COMMAND`
+  handling), read by the profile, by `/etc/bash/appine.sh` (`BASH_HOOK`) on Alpine, and via
+  `DEBIAN_BASH_HOOK` appended once to `/etc/bash.bashrc` on Debian.
 - `zshrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.zshrc`, read by the
-  profile only in zsh. Its anonymous function registers the hooks in local zsh emulation,
-  preserving the caller's options. `Rootfs.writeProfile(context, store, distro)` writes all three
-  companion files and then the profile.
+  profile (on Alpine via `/etc/zsh/zprofile`, on Debian via `/etc/appine/zsh/.zshenv` written from
+  `ZSHENV` and selected by `login.sh` via `ZDOTDIR`), and by `/etc/zsh/zshrc` (`ZSH_RC_HOOK`,
+  installed once after `zsh` is present) for nested interactive zsh. Its anonymous function
+  registers the hooks in local zsh emulation, preserving the caller's options, and wraps `PS1`
+  (with `k=c` continuation marks on multi-line prompts), `PS2`, non-empty `RPROMPT` (`k=r` on
+  single-line `PS1`, `k=c` on multi-line `PS1`) and `RPS2` (`k=s`), restoring clean prompts before
+  commands and respecting `nopromptpercent`. `Rootfs.writeProfile(context, store, distro)` writes
+  the three companion files, `/etc/appine/zsh/.zshenv`, Alpine's `/etc/bash/appine.sh`, and then
+  the profile, and runs `ensureShellRcHooks`.
 - Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`,
-  `sudo-installed` and `bash-startup-done` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
-  (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`,
-  `/var/cache/appine/{bash,procps,bubblewrap,openrc}/` (packages until installed), `/run/appine-install.lock` and `/run/appine-rules.lock`.
+  `sudo-installed`, `bash-startup-done`, `debian-bashrc-hook-done` and `zsh-rc-hook-done`
+  (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules (`/etc/doas.d/30-appine.conf` or
+  `/etc/sudoers.d/appine`), `/etc/appine/zsh/.zshenv`, `/var/cache/appine/doas.apk`,
+  `/var/cache/appine/{bash,procps,bubblewrap,openrc}/` (packages until installed),
+  `/run/appine-install.lock` and `/run/appine-rules.lock`.
 
 ## Public entry points
 
@@ -224,18 +233,21 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - For the terminal's shell integration (android/vtcore) the profile has login shells mark their
   prompts with OSC 133:
   - bash: the profile sets the coloured PS1 and reads `appine.bashrc`, whose `__appine_prompt`
-    function, put first in `PROMPT_COMMAND` (once, however often the file is read), prints, before
-    each prompt, the last command's end with its status (D) and the prompt's start on a fresh line
-    (A, `redraw=last;cl=line`), and wraps PS1 (P with `k=i` … B, the input starting) and PS2
-    (`k=s`), and appends the output's start (C) to PS0, each again whenever it is missing, so a PS1
-    that `~/.bashrc` or anything later sets is wrapped from the next prompt on; a later plain
-    assignment to `PROMPT_COMMAND` drops the function and with it every mark. On Alpine,
+    function, put first in `PROMPT_COMMAND` (scalar or bash 5.1+ array, once, however often the
+    file is read), prints, before each prompt, the last command's end with its status (D) and the
+    prompt's start on a fresh line (A, `redraw=last;cl=line`), wraps PS1 (P with `k=i`, `k=c`
+    after `\n` escapes and command-substitution-free literal newlines, … B, the input starting)
+    and PS2 (`k=s`), and appends the output's start (C) to PS0, each again whenever it is missing,
+    so a PS1 that `~/.bashrc` or anything later sets is wrapped from the next prompt on; a later
+    plain assignment to `PROMPT_COMMAND` drops the function and with it every mark. On Alpine,
     `/etc/bash/bashrc` reads `/etc/bash/appine.sh`, hence `appine.bashrc`, in every interactive
-    bash (a login one first, through `/etc/profile.d/00-bashrc.sh`), so a nested bash (`bash`, `su`
-    without `-l`) marks its own prompt, Alpine's `\h:\w\$ `;
+    bash; on Debian, `ensureShellRcHooks` appends `DEBIAN_BASH_HOOK` once to `/etc/bash.bashrc`
+    (gated by `/var/lib/appine/debian-bashrc-hook-done`), so a nested bash (`bash`, `su` without
+    `-l`) marks its own prompt on both distros;
   - busybox ash, which has no hook before a command or a prompt (1.37 has no `PROMPT_COMMAND`):
-    PS1 itself carries D with `$?` (expanded at each prompt and redraw), A with `cl=line`, and
-    after the prompt B (the input starts); PS2 is P with `k=s` and B. ash marks no output start
+    PS1 itself carries D with `$?` (expanded at each prompt and redraw), A with `cl=line`, `P;k=c`
+    with `appine_lf=output` after `\n` escapes in multi-line prompts, and after the prompt B (the
+    input starts); PS2 is P with `k=s` and B. ash marks no output start
     and breaks a command longer than the screen's width into rows itself, so A and P also carry
     `appine_lf=output`, the app's own option, asking the terminal to read ash's line feeds
     (android/vtcore): one ash breaks a line with continues the input, any other ends it. `appine.ashrc`
@@ -246,28 +258,38 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     The profile sources it after setting its coloured PS1, and every interactive ash reads it through
     `ENV`, a login shell after `/etc/profile` and `~/.profile`, so a PS1 that `~/.profile` sets is
     marked; one set later (typed, or by a file the user's own `ENV` names) goes without.
-  - zsh: the profile sets the coloured PS1 and reads `appine.zshrc`. Its `__appine_precmd`,
-    appended to `precmd_functions`, prints D with the status before each
-    prompt, wraps PS1 (A with `cl=line` … B) and PS2 (P with `k=s` … B) in `%{ %}` whenever the
-    marks are missing, and moves itself last in `precmd_functions`, so a PS1 that `~/.zshrc` or a
-    theme's own hook sets is wrapped (a theme setting PS1 before each prompt gets its first prompt
-    unmarked); `__appine_preexec`, appended to `preexec_functions`, prints the output's start (C)
-    and the command title. Reloading the profile or companion file deduplicates both hook
-    registrations while preserving other hooks, including when sourced in sh emulation.
-    A and B are in PS1, so every redraw by zle sends them again; D is sent once per prompt.
+  - zsh: the profile sets the coloured PS1 and reads `appine.zshrc`. On Debian (where
+    `/etc/zsh/zprofile` does not read `/etc/profile`), `login.sh` starts login `zsh` with
+    `ZDOTDIR=/etc/appine/zsh` when `ZDOTDIR` is unset; `/etc/appine/zsh/.zshenv` unsets `ZDOTDIR`
+    immediately, sources `~/.zshenv`, and for interactive login shells on non-Alpine systems
+    sources `/etc/profile.d/appine.sh` in sh emulation (with `__appine_profile_seen` guarding
+    `cat /etc/motd` against double display if `~/.zprofile` also sources it). Once `zsh` is
+    installed, `ensureShellRcHooks` appends `ZSH_RC_HOOK` to `/etc/zsh/zshrc` (Debian) or writes
+    `/etc/zsh/zshrc` beside Alpine's `/etc/zsh/zprofile` once (gated by
+    `/var/lib/appine/zsh-rc-hook-done`), so nested interactive `zsh` (`zsh`, `su` without `-l`)
+    also loads `appine.zshrc`. `__appine_precmd`, appended to `precmd_functions`, prints D with
+    the status before each prompt, restores saved clean prompts, wraps PS1 (A with `cl=line`,
+    `k=c` after `$'\n'` on multi-line prompts, … B), PS2 (`k=s`, `k=c` after `$'\n'`, … B),
+    non-empty `RPROMPT` (`k=r` on single-line PS1, `k=c` on multi-line PS1 so it keeps the
+    continuation row mark, … B so right-prompt cells are prompt rather than input) and non-empty
+    `RPS2` (`k=s` … B) in `%{ %}` (doubling a trailing bare `%`, or emitting `A;cl=line` directly
+    when `prompt_percent` is unset), and moves itself last in `precmd_functions`;
+    `__appine_preexec`, appended to `preexec_functions`, restores the clean prompts before
+    commands and prints the output's start (C) and the command title. Reloading the profile or
+    companion file deduplicates both hook registrations while preserving other hooks, including
+    when sourced in sh emulation. A and B are in PS1, so every redraw by zle sends them again; D
+    is sent once per prompt.
   - `cl=line` tells the terminal that the three line editors move the cursor with the left and
     right arrows, so a tap on the typed command moves the cursor there.
-- Every login shell of a tab reads it (root's shell `-l`, and `su <account> -c … exec "$SHELL" -l`
-  for others) when the shell reads `/etc/profile`: zsh does only where its `/etc/zsh/zprofile`
-  sources it (Alpine's does, in sh emulation; Debian trixie's does not, so zsh there has no marks
-  unless the user's `~/.zprofile` sources `/etc/profile.d/appine.sh`). `ENV` is exported from every
-  shell that reads the profile, so a nested interactive ash that inherits it (`ash`, `sh` on
-  Alpine, `su` without `-l`, also under bash or zsh) marks its own prompt, the distro's; one
-  started through `doas -s`, which resets the environment, does not. Other nested non-login shells
-  (but bash on Alpine, above; a nested bash on Debian has none) and
-  other shells get no marks from it (fish and nushell send their own, android/vtcore), and shells that
-  do not read it still have `TERM`, `LANG` and `NMAP_UNPRIVILEGED` from the console's fixed login
-  environment (android/vt), but show no motd.
+- Every login shell of a tab reads the profile (root's shell `-l`, and `su <account> -c … exec "$SHELL" -l`
+  for others), including login `zsh` on Debian through `/etc/appine/zsh/.zshenv`. `ENV` is
+  exported from every shell that reads the profile, so a nested interactive ash that inherits it
+  (`ash`, `sh` on Alpine, `su` without `-l`, also under bash or zsh) marks its own prompt, the
+  distro's; one started through `doas -s`, which resets the environment, does not. Nested
+  non-login `bash` (both distros) and `zsh` (once `ensureShellRcHooks` runs after `zsh` is
+  installed) also get prompt marks. Other shells get no marks from it (fish and nushell send
+  their own, android/vtcore), and shells that do not read it still have `TERM`, `LANG` and
+  `NMAP_UNPRIVILEGED` from the console's fixed login environment (android/vt), but show no motd.
 - The shared profile contains no zsh array syntax; only zsh sources `appine.zshrc`. The companion
   uses an anonymous function with `emulate -L zsh` for registration, so Alpine's sh emulation
   does not change array filtering or indexing and the caller's options are restored afterwards.
@@ -428,9 +450,10 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - That Alpine's doas reads `/etc/doas.d/*.conf` in lexical order (the NOPASSWD file relies on coming
   after `20-wheel.conf`), and that doas reads only `*.conf` and sudo skips names with a dot (the
   temporary rules files rely on it).
-- The profile's bash marks in the app on Debian (tried only in a container with Ubuntu 26.04's
-  bash 5.3) and with a `PROMPT_COMMAND` array or a prompt tool that rewrites PS1 after it each time.
-- The profile's zsh marks in the app (tried only in a container with Alpine's zsh 5.9) and with a
-  right prompt (its cells follow B, so they count as input), a multiline PS1 (rows after the first
-  are not marked as continuation rows), `prompt_percent` unset or a prompt framework (oh-my-zsh,
-  powerlevel10k).
+- The profile's bash marks in the app on Debian (verified in Debian trixie container for nested
+  bash and on Pixel 4a API 34 emulator for Alpine multi-line PS1/hook installation) and with a
+  prompt tool that rewrites PS1 after it each time.
+- The profile's zsh marks in the app (verified in macOS zsh 5.9 PTY, Alpine/Debian trixie
+  containers, and `VtShellIntegrationTest` on Pixel 4a API 34 emulator for right prompts,
+  multi-line PS1 continuations, `nopromptpercent` and Debian `ZDOTDIR`/rc hooks) with third-party
+  prompt frameworks (oh-my-zsh, powerlevel10k).

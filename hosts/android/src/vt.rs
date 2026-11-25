@@ -18,9 +18,12 @@
 //! pastes, selects, searches and copies, and reads the title and transcript; the service's worker
 //! takes snapshots for saving tabs and compresses every tab's scrollback when memory is trimmed;
 //! the `vt-compress` thread compresses idle tabs' scrollback ([`compressor`]). The terminal is not
-//! thread-safe, so every call into vt.c holds the tab's lock; the frame buffer it returns is only
-//! written by `frame`, which only the main thread calls, so the main thread may read it after the
-//! lock is released.
+//! thread-safe, so every terminal call into vt.c holds the tab's terminal lock (`term`); frames
+//! hold a separate render lock (`render`, always acquired before `term`), taking `term` only for
+//! the short snapshot phase (`appine_vt_frame_begin`) and releasing it before deferred style work
+//! and row encoding (`appine_vt_frame_end`). The frame buffer `appine_vt_frame_end` returns is
+//! only written by `frame`, which only the main thread calls, so the main thread may read it after
+//! the render lock is released.
 //!
 //! [`pump`]: Java_io_github_mthli_appine_VtNative_pump
 
@@ -40,6 +43,11 @@ use super::{machine, string, throw};
 
 #[repr(C)]
 struct AppineVt {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
+struct AppineVtRender {
     _opaque: [u8; 0],
 }
 
@@ -110,7 +118,10 @@ unsafe extern "C" {
     fn appine_vt_scroll(vt: *mut AppineVt, delta: i32);
     fn appine_vt_at_prompt(vt: *mut AppineVt) -> bool;
     fn appine_vt_jump_prompt(vt: *mut AppineVt, delta: i32);
-    fn appine_vt_frame(vt: *mut AppineVt, full: bool, len: *mut usize) -> *const u8;
+    fn appine_vt_render_new() -> *mut AppineVtRender;
+    fn appine_vt_render_free(render: *mut AppineVtRender);
+    fn appine_vt_frame_begin(vt: *mut AppineVt, render: *mut AppineVtRender, full: bool) -> bool;
+    fn appine_vt_frame_end(render: *mut AppineVtRender, len: *mut usize) -> *const u8;
     fn appine_vt_image(
         vt: *mut AppineVt,
         id: u32,
@@ -341,6 +352,18 @@ impl Drop for Term {
     }
 }
 
+/// Owns one vt.c render state and frame buffers, locked independently from [`Term`].
+struct Render(*mut AppineVtRender);
+
+// SAFETY: the render state is only used under the tab's render lock (module docs)
+unsafe impl Send for Render {}
+
+impl Drop for Render {
+    fn drop(&mut self) {
+        unsafe { appine_vt_render_free(self.0) };
+    }
+}
+
 /// What programs asked of the app in one read of the console: the bell (any number of BELs
 /// counts once), a clipboard write (`Some(None)` clears it), a notification (title, body), the
 /// last progress report (OSC 9;4: libghostty-vt's state and the percentage, -1 for none), the
@@ -515,6 +538,9 @@ struct Tab {
     machine: jlong,
     console: u32,
     term: Mutex<Term>,
+    /// Separate from `term` so row encoding and deferred style work run without holding the
+    /// terminal lock. Lock order: `render` before `term` before `COMPRESS`.
+    render: Mutex<Render>,
     /// Output changed the terminal since the last frame. The pump tells the view only when it sets
     /// this, so a burst of output asks for one frame; `frame` clears it before capturing.
     dirty: AtomicBool,
@@ -617,7 +643,11 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_create<'l>(
             throw(&mut env, "cannot create a terminal");
             return 0;
         }
-        register(handle, console, raw)
+        let Some(id) = register(handle, console, raw) else {
+            throw(&mut env, "cannot create a terminal");
+            return 0;
+        };
+        id
     })
 }
 
@@ -652,24 +682,31 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_restore<'l>(
         if raw.is_null() {
             return 0;
         }
-        register(handle, console, raw)
+        register(handle, console, raw).unwrap_or(0)
     })
 }
 
-/// Registers a new terminal of kernel `machine`'s `console` in [`TABS`]; returns its handle.
-fn register(machine: jlong, console: jint, raw: *mut AppineVt) -> jlong {
+/// Registers a new terminal of kernel `machine`'s `console` in [`TABS`]; returns its handle, or
+/// None when the render state cannot be allocated (freeing `raw`).
+fn register(machine: jlong, console: jint, raw: *mut AppineVt) -> Option<jlong> {
+    let term = Term(raw);
+    let render_raw = unsafe { appine_vt_render_new() };
+    if render_raw.is_null() {
+        return None;
+    }
     let id = NEXT_TAB.fetch_add(1, Ordering::Relaxed);
     let tab = Tab {
         id,
         machine,
         console: console as u32,
-        term: Mutex::new(Term(raw)),
+        term: Mutex::new(term),
+        render: Mutex::new(Render(render_raw)),
         dirty: AtomicBool::new(false),
     };
     TABS.lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert(id, Arc::new(tab));
-    id
+    Some(id)
 }
 
 /// Sets the cursor's default shape (`style`, libghostty-vt's `GhosttyCursorStyle`) and whether it
@@ -827,12 +864,21 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_frame<'l>(
             return std::ptr::null_mut();
         };
         tab.dirty.store(false, Ordering::Release);
+        let render = tab.render.lock().unwrap_or_else(PoisonError::into_inner);
+        let ok = {
+            let term = tab.term();
+            unsafe { appine_vt_frame_begin(term.0, render.0, full != 0) }
+        };
+        if !ok {
+            return std::ptr::null_mut();
+        }
         let mut len = 0;
-        let p = unsafe { appine_vt_frame(tab.term().0, full != 0, &mut len) };
+        let p = unsafe { appine_vt_frame_end(render.0, &mut len) };
+        drop(render);
         if p.is_null() {
             return std::ptr::null_mut();
         }
-        // SAFETY: vt.c keeps the frame until the next appine_vt_frame call (above)
+        // SAFETY: vt.c keeps the frame until the next appine_vt_frame_end call (above)
         match unsafe { env.new_direct_byte_buffer(p as *mut u8, len) } {
             Ok(b) => b.into_raw(),
             Err(_) => std::ptr::null_mut(),

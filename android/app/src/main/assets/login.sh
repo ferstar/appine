@@ -252,6 +252,9 @@ if [ "$user" = root ]; then
     ensure_shell "$shell"
     [ -x "$shell" ] || shell=/bin/sh
     export SHELL="$shell" HOME="$home"
+    case ${shell##*/} in
+    zsh) [ -z "${ZDOTDIR+x}" ] && [ -r /etc/appine/zsh/.zshenv ] && export ZDOTDIR=/etc/appine/zsh ;;
+    esac
     exec "$shell" -l
 fi
 
@@ -319,7 +322,14 @@ refresh_rules
 shell=$(field "$user" 7 /etc/passwd)
 ensure_shell "$shell"
 set --
-[ -x "$shell" ] || set -- -s /bin/sh
+zdot=
+if [ -x "$shell" ]; then
+    case ${shell##*/} in
+    zsh) [ -r /etc/appine/zsh/.zshenv ] && zdot='[ -z "${ZDOTDIR+x}" ] && export ZDOTDIR=/etc/appine/zsh; ' ;;
+    esac
+else
+    set -- -s /bin/sh
+fi
 
 # Run as a login shell (reads /etc/profile); su sets HOME, SHELL, USER and LOGNAME. su -l is not
 # used: it always goes to the home directory. The restored directory is entered as this account (a
@@ -327,7 +337,7 @@ set --
 # home directory
 cd /
 q=$(printf '%s' "$dir" | sed "s/'/'\\\\''/g")
-cmd="{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; exec \"\$SHELL\" -l"
+cmd="{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; ${zdot}exec \"\$SHELL\" -l"
 # util-linux's su (Debian) starts a new session for the -c command (to stop TIOCSTI from pushing
 # input into root's terminal): the shell has no controlling terminal and no job control, and on
 # Ctrl-C su ends the whole session, closing the tab. Its --session-command starts no new session;

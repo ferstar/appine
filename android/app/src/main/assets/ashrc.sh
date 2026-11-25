@@ -34,7 +34,15 @@ if [ -n "${BB_ASH_VERSION-}" ]; then
     # with goes on with the command, and any other ends it and starts the output
     case ${PS1-} in
     *'133;A'*) ;;
-    *) PS1='\[\e]133;D;$?\a\e]133;A;cl=line;appine_lf=output\a\]'${PS1-}'\[\e]133;B\a\e]2;$(__appine_ash_path title)\a\]' ;;
+    *)
+        __appine_ps1=${PS1-}
+        __appine_cont='\[\e]133;P;k=c;appine_lf=output\a\]'
+        case $__appine_ps1 in
+        *'\n'*) __appine_ps1=${__appine_ps1//\\n/\\n$__appine_cont} ;;
+        esac
+        PS1='\[\e]133;D;$?\a\e]133;A;cl=line;appine_lf=output\a\]'$__appine_ps1'\[\e]133;B\a\e]2;$(__appine_ash_path title)\a\]'
+        unset __appine_ps1 __appine_cont
+        ;;
     esac
     case ${PS2-} in
     *'133;P'*) ;;

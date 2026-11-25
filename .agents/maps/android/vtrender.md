@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: removed Android 14+ untrimmed Kitty image bug entry and recorded background-tab trimming invariant)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: split frame capture into two-phase begin/end update so deferred style work and row encoding run outside the terminal lock)
 
 ## Responsibilities
 
@@ -43,8 +43,10 @@ it does not transfer those lifecycle methods here.
 
 ## Public entry points
 
-- Native: `appine_vt_frame` and `appine_vt_image`, reached through android/vtcore's `VtNative.frame`
-  and `VtNative.image` with its tab lock and JNI buffer/bitmap handling.
+- Native: `appine_vt_render_new`, `appine_vt_render_free`, `appine_vt_frame_begin`,
+  `appine_vt_frame_end` and `appine_vt_image`, reached through android/vtcore's `VtNative.frame`
+  (holding `Tab.render` across both phases and `Tab.term` only during `begin`) and
+  `VtNative.image` (holding `Tab.term`) with its JNI buffer/bitmap handling.
 - `VtFrame`: header accessors, `placement` and `takeRows`; the format is shared with vt.c.
 - `VtScreen`: `resize`, `span`, cell arrays, default colours and cursor state.
 - `VtRenderer`: `setFont`, cell metrics, `resize`, `hasGrid`, `takeRows`, `drawGrid`, `drawCursor`,
@@ -55,16 +57,18 @@ it does not transfer those lifecycle methods here.
 ### Frames and drawing
 
 - `onOutput` posts an invalidate on animation to the attached view; `onDraw` takes a frame
-  (`VtNative.frame`, main thread only) and applies it: `frame` clears `dirty`, shows the animation
-  frames due (unless a synchronized-output hold is active), updates the render state (likewise),
-  reads the image placements again when their generation changed, catches a running search up
-  with the terminal for at most 4 ms and marks its matches in the viewport, and writes a 64-byte
-  header, the image placements (56 bytes each) and the dirty rows and the rows whose search marks
-  changed since the last frame (all rows when the view asks for a full frame, or when the
-  placements changed while some were or are on the screen) in the format documented in `vt.c`
-  (12-byte row headers, 16-byte cells, a grapheme's extra codepoints after its row); the direct
-  `ByteBuffer` is valid until the next `frame`. A search not yet caught up sets a header flag, and
-  the view draws again on the next animation frame to go on.
+  (`VtNative.frame`, main thread only) in two phases and applies it: `frame` clears `dirty`, locks
+  `Tab.render`, then locks `Tab.term` only for `appine_vt_frame_begin` (shows animation frames due
+  unless held, runs `ghostty_render_state_begin_update` or hands off `vt->held_state`, reads image
+  placements when their generation changed, catches a running search up for at most 4 ms and marks
+  its viewport matches, and snapshots terminal-owned header metadata into `FrameSnap`). After
+  releasing `Tab.term`, `appine_vt_frame_end` runs under `Tab.render` alone: calls
+  `ghostty_render_state_end_update` to finish deferred style denormalization, writes the 64-byte
+  header, image placements (56 bytes each) and dirty/mark-changed rows (all rows when full or
+  placements changed while some were or are shown) in the format documented in `vt.c` (12-byte row
+  headers, 16-byte cells, a grapheme's extra codepoints after its row), and cleans the render
+  state; the direct `ByteBuffer` is valid until the next `frame`. A search not yet caught up sets
+  a header flag, and the view draws again on the next animation frame to go on.
 - Overscan: while the viewport is scrolled back the render state captures the row after it too,
   the header says so (byte 58) and that row comes as row `rows` (vt.c numbers rows by the
   iterator, which is right while nothing above the viewport is asked for), with the same cells,
@@ -90,10 +94,14 @@ it does not transfer those lifecycle methods here.
   which the next frame copies them again from libghostty-vt while the backing bitmap still holds
   the rows painted with them. Pixels that arrive in a frame that does not repaint every row ask
   for a full frame.
-- A hold (mode 2026) captures the screen when it begins; it ends with the program, a resize or a
-  full reset, or by force once a frame is taken more than 1 s after it began. During a hold the
-  rows, cursor and colours come from the capture, and so does the overscan byte, while the
-  header's modes, selection and scroll position are read live.
+- A hold (mode 2026) captures the screen into `vt->held_state` (under `Tab.term` only, never
+  racing with `AppineVtRender`) when it begins; it ends with the program, a resize or a full
+  reset, or by force once a frame is taken more than 1 s after it began. On the first frame while
+  held, `vt->held_state` is moved into `AppineVtRender.state`; if a hold began and ended between
+  frames, `AppineVtRender.state` is rebuilt fresh before `begin_update` so rows whose dirty flags
+  `held_state` consumed are never missed. During a hold the rows, cursor and colours come from the
+  capture, and so does the overscan byte, while the header's modes, selection and scroll position
+  are read live.
 - The view asks for a full frame after a regrid, a new bitmap, new default colours (OSC 10 or 11,
   reverse video), a change of the wide-cell setting, attaching another tab or the attached tab's
   shell starting; a frame captured at an old size is dropped and a full one requested. Attaching
@@ -207,8 +215,9 @@ it does not transfer those lifecycle methods here.
   them: vt.c marks the matches itself, from the viewport's matches in screen coordinates (viewport
   ones fail for a match that starts above the viewport), and resends a row whose marks differ from
   the last frame's, since the render state does not count them as a change.
-- Capture and consume frames on the main thread. android/vtcore holds the tab lock during native
-  capture; the direct buffer remains valid until the next frame call, so it is read after unlocking.
+- Capture and consume frames on the main thread. android/vtcore holds `Tab.render` across both
+  phases and `Tab.term` only during `appine_vt_frame_begin`; the direct buffer remains valid until
+  the next frame call, so it is read after unlocking.
 - `VtView` remains the owner of full-frame requests and repaint scheduling. Changing the frame
   format or its view consumers requires checking this map, `android/vtview` and
   `android/vtgestures`; search queries, selection and scrolling use the same terminal state
@@ -226,13 +235,10 @@ it does not transfer those lifecycle methods here.
 ## Confirmed bugs / technical debt
 
 - **libghostty-vt's drawing features left unused**: the default palette option (the colour scheme
-  reply is fixed to dark); overscan above the viewport; `row_iterator_next_dirty`; the two-phase render update: `frame` holds the tab's
-  lock while it encodes every row (about 95% of its time on a macOS build), where only
-  libghostty-vt's deferred style work would leave it, and taking the encoding out would need the
-  render state kept apart from the terminal's lock; `ghostty_render_state_row_cells_get_multi`
-  in place of the four to six reads `frame` makes per cell (it stops at the first failing key, so
-  the colours would go last; gain unmeasured); the colour utilities (`palette_generate`, contrast
-  and luminance), of use only with themes.
+  reply is fixed to dark); overscan above the viewport; `row_iterator_next_dirty`;
+  `ghostty_render_state_row_cells_get_multi` in place of the four to six reads `frame` makes per
+  cell (it stops at the first failing key, so the colours would go last; gain unmeasured); the
+  colour utilities (`palette_generate`, contrast and luminance), of use only with themes.
 
 ## Open questions
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 9 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: expire transient program reports at command and primary prompt boundaries)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: updated inherited shell-mark coverage note after Debian/nested shell integration and ash prompt-tap fixes)
 
 ## Responsibilities
 
@@ -235,7 +235,8 @@ login script and prompt-mark producers (`android/setup`).
 ## Confirmed bugs / technical debt
 
 - **Shell mark coverage debt inherited from `android/vtcore`:** `busy` and command-completion
-  events inherit `android/vtcore`'s prompt-marking and ash/bash parsing limitations.
+  events still do not cover shells without OSC 133 marks (dash, mksh, tcsh, elvish, remote ssh
+  shells without marks, `doas -s` ash, or ash `PS1` set after `ENV`).
 
 ## Open questions
 

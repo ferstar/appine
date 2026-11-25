@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: updated VtNative.dropImages triggers for Android 14+ background-tab trimming)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: split render state/lock from terminal lock for two-phase frame capture, tracked ash background-output resumed row for prompt taps, and updated shell-integration coverage)
 
 ## Responsibilities
 
@@ -35,20 +35,24 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 - `VtNative` — 48 `@JvmStatic external` functions on the native library, plus raw libghostty-vt
   cursor style (`CURSOR_*`), selection gesture (`GESTURE_*`) and adjustment (`ADJUST_*`) constants
   that must match libghostty-vt's headers.
-- In `vt.rs`: `Tab` (handle, kernel handle, console number, mutex-guarded `Term`, `dirty` flag) in
-  monotonically keyed `TABS` (handles from 1, never reused); `TermGuard` (releases the tab lock and
-  schedules compression when work remains); `Term` (owns `AppineVt`, freed on drop); `RawEffects`
-  (C-ABI mirror of `AppineVtEffects`) decoded into `Effects` (`StatusReport` queue, clipboard
-  reads, last finished command, `tmux_detached`); `COMPRESS` (`Due` per tab) served by `vt-compress`
-  (`compressor`).
-- In `vt.c`: `AppineVt` — per-terminal native state holding the libghostty-vt terminal, render
-  state, key/mouse encoders, grid/cell geometry, shared reply/frame/scratch/text buffers, resize
-  settle and synchronized-output/password flags, selection-gesture and search scratch, queued
-  `AppineVtEffects`, OSC/DCS prefix scanners and `tmux_control` state, command-timing and
-  `prompt_click` state, compression/transcript/snapshot dirty flags, and the render state's
-  `Placement` list with its generation. Process-wide (`install_sys`, installed with the first
-  terminal): the Wuffs PNG decoder and `on_log` (sharing a 20 lines/s rate limit with
-  `on_unknown_sequence`, `log_allowed`).
+- In `vt.rs`: `Tab` (handle, kernel handle, console number, mutex-guarded `Term`, separately
+  mutex-guarded `Render`, `dirty` flag) in monotonically keyed `TABS` (handles from 1, never
+  reused); `TermGuard` (releases the tab's terminal lock and schedules compression when work
+  remains); `Term` (owns `AppineVt`, freed on drop); `Render` (owns `AppineVtRender`, freed on
+  drop); `RawEffects` (C-ABI mirror of `AppineVtEffects`) decoded into `Effects` (`StatusReport`
+  queue, clipboard reads, last finished command, `tmux_detached`); `COMPRESS` (`Due` per tab)
+  served by `vt-compress` (`compressor`).
+- In `vt.c`: `AppineVt` — per-terminal native state holding the libghostty-vt terminal,
+  key/mouse encoders, grid/cell geometry, shared reply/text buffers, resize settle and
+  synchronized-output (`held_state`, `held`, `held_since`)/password flags, selection-gesture and
+  search scratch, queued `AppineVtEffects`, OSC/DCS prefix scanners and `tmux_control` state,
+  command-timing, `prompt_click` and `lf_resumed` state, and compression/transcript/snapshot dirty
+  flags. `AppineVtRender` — per-tab render state guarded by `Tab.render`, holding the
+  `GhosttyRenderState`, row/cell/image iterators, frame/extras/grapheme buffers, viewport search
+  marks (`marks`/`marks_sent`), Kitty `Placement` list with generation/validity, and the
+  `FrameSnap` captured under `Tab.term` in `appine_vt_frame_begin`. Process-wide (`install_sys`,
+  installed with the first terminal): the Wuffs PNG decoder and `on_log` (sharing a 20 lines/s
+  rate limit with `on_unknown_sequence`, `log_allowed`).
 
 ## Public entry points
 
@@ -243,18 +247,21 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 
 ### Shell integration
 
-- The guest's login shells mark their prompts with OSC 133 (android/setup's profile: bash marks the
-  prompt, the typed command and the output's start, and so does zsh where it reads the profile;
-  busybox ash the prompt and the typed command, asking with `appine_lf=output` for its line feeds
-  to be read, below; fish 4 and nushell send their own,
-  all four marks, fish's prompt start with `click_events=1` and nushell's with no way for taps to
-  move the cursor). libghostty-vt keeps the marks in the rows and cells it writes (prompt, input,
-  output) and the cursor's place among them, which closing, jumping, Select output and taps on the
-  input read through vt.c's shell integration functions; a mouse's Ctrl+triple-click selects a
-  command's output through libghostty-vt's selection gesture, and a right-click looks for one for
-  the menu's Select output. A shell without the marks (zsh on Debian, dash, mksh, tcsh, elvish, a
-  nested non-login shell other than busybox ash and, on Alpine, bash, a remote one over ssh that sends none) leaves every cell output: it is
-  never at a prompt, there is nothing to jump to and no output to select, and no command is timed.
+- The guest's login and interactive shells mark their prompts with OSC 133 (android/setup's
+  profile and rc hooks: bash marks the prompt, multi-line continuation rows, typed command and
+  output start on both distros including nested shells; zsh does likewise including on Debian via
+  `/etc/appine/zsh/.zshenv` and in nested shells via `/etc/zsh/zshrc`, wrapping `RPROMPT`/`RPS2`
+  so right prompts are not counted as input; busybox ash marks the prompt, continuation rows and
+  typed command, asking with `appine_lf=output` for its line feeds to be read, below; fish 4 and
+  nushell send their own, all four marks, fish's prompt start with `click_events=1` and nushell's
+  with no way for taps to move the cursor). libghostty-vt keeps the marks in the rows and cells it
+  writes (prompt, input, output) and the cursor's place among them, which closing, jumping, Select
+  output and taps on the input read through vt.c's shell integration functions; a mouse's
+  Ctrl+triple-click selects a command's output through libghostty-vt's selection gesture, and a
+  right-click looks for one for the menu's Select output. A shell without the marks (dash, mksh,
+  tcsh, elvish, an ash started through `doas -s`, a remote shell over ssh that sends none) leaves
+  every cell output: it is never at a prompt, there is nothing to jump to and no output to select,
+  and no command is timed.
 - A prompt start or prompt mark (OSC 133;A or P, on the primary screen) with `appine_lf=output`
   has `appine_vt_feed` read the shell's line feeds from there on, outside OSC and DCS strings,
   until one ends the input: a line feed after two carriage returns is ash breaking a long command
@@ -266,12 +273,15 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   not write are not read so: the pump reads output in runs by writer
   (`Machine::read_console_run`, kernel/tty) and feeds each with whether another group wrote it,
   so a line from a job left in the background ends no input. At the prompt vt.c marks such bytes
-  as output itself: an output start before them, and after them a continuation prompt with no
-  text and an input start (OSC 133;P;k=s and B), unless an OSC or DCS string is open. So the
-  cursor stays at the prompt, what is typed after them is input again, and they are selected as
-  one output (from the prompt's row down to the row the input resumes on). A primary prompt without the option, a program's
-  full reset and the app's Reset terminal end the reading. So a command of several rows is all
-  input: the cursor stays at the prompt while it is typed, and its rows are not selected as output.
+  as output itself: an output start before them, and after them, when the output moved to a new
+  row, a continuation prompt with no text and an input start (OSC 133;P;k=s and B) plus a tracked
+  `lf_resumed` reference on that row (or only OSC 133;B when it stayed on the same row), unless
+  an OSC or DCS string is open. So the cursor stays at the prompt, what is typed after them is
+  input again, they are selected as one output, and `appine_vt_prompt_click` rejects taps above
+  `lf_resumed` and never treats `lf_resumed` as an ash-broken row. A primary prompt without the
+  option, a program's full reset and the app's Reset terminal end the reading and clear
+  `lf_resumed`. So a command of several rows is all input: the cursor stays at the prompt while it
+  is typed, and its rows are not selected as output.
 - Commands are timed through libghostty-vt's OSC 133 callback (`on_semantic_prompt`): a command
   starts at the output's mark (bash's PS0 and zsh's preexec hook, `C`) or, as busybox ash marks
   none, when a feed ends with the cursor no longer at the prompt where the one before left it there
@@ -340,13 +350,18 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   continuation limit, terminfo name and clipboard/unknown-sequence limits are not in the snapshot
   and must be re-applied after `settle` (before `VtNative.setCursor`); `settle`'s DECSTR resets the
   cursor to its defaults.
-- libghostty-vt is not thread-safe: every `vt.c` call holds the tab lock (recovered if poisoned),
-  so callbacks must never block on the main thread (hence async OSC 52 reads and refused OSC 5522
-  reads). `frame` writes the frame buffer only on the main thread; the shared text buffer (title,
-  copy, link, transcript) is copied to a Java string under the lock.
+- libghostty-vt is not thread-safe: every terminal `vt.c` call holds `Tab.term` (recovered if
+  poisoned), while `VtNative.frame` holds `Tab.render` around `appine_vt_frame_begin` (which
+  takes `Tab.term` only for `ghostty_render_state_begin_update`, images/search and metadata) and
+  `appine_vt_frame_end` (which runs `ghostty_render_state_end_update` and row encoding with
+  `Tab.term` released). `on_render_hold` captures mode-2026 holds into `vt->held_state` under
+  `Tab.term` alone and hands it off to `AppineVtRender` under both locks. Callbacks must never
+  block on the main thread (hence async OSC 52 reads and refused OSC 5522 reads). `frame` writes
+  the frame buffer only on the main thread; the shared text buffer (title, copy, link,
+  transcript) is copied to a Java string under `Tab.term`.
 - Compression schedules only when `TermGuard` drops, so mutating calls must lock via `Tab::term`,
   while `compressor`/`compressAll` lock the mutex directly to avoid self-rescheduling. Lock order:
-  tab lock before `COMPRESS` lock, never reversed.
+  `Tab.render` before `Tab.term` before `COMPRESS`, never reversed.
 - Because libghostty-vt's activity token ignores read-triggered decompression, any `vt.c` path
   reading beyond the viewport must set `compress_touched`; any path mutating terminal state must
   clear `transcribed`.
@@ -390,14 +405,10 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 
 ## Confirmed bugs / technical debt
 
-- **Shell integration is partial**: the profile marks prompts only for bash, busybox ash and zsh
-  (not for nested non-login shells other than ash and, on Alpine, bash, or zsh on Debian, whose
-  zprofile does not read `/etc/profile`;
-  fish and nushell mark their own); zsh's right prompt counts as input and the later rows of a PS1
-  of several lines are not continuation rows; after a background
-  job's output at ash's prompt, a tap on a row above the one the input resumed on counts arrow
-  keys as if ash had broken the command there (ash still has its cursor on the prompt's row),
-  and an ash PS1 set after its `ENV` file was read has none.
+- **Shell integration is partial**: the profile and rc hooks mark prompts for bash, busybox ash
+  and zsh (fish and nushell mark their own); dash, mksh, tcsh, elvish, an ash started through
+  `doas -s` (which clears `ENV`), a remote shell over ssh that sends no OSC 133 marks, and an ash
+  `PS1` set after its `ENV` file was read still go without marks.
 - **libghostty-vt features not wired**: ENQ, the title report (CSI 21 t),
   XTCHECKSUM and window resizing (CSI 8 t) are left unanswered, as Ghostty's defaults leave them
   (`enquiry-response` empty, `title-report`, `vt-xt-checksum-report` and
@@ -416,7 +427,7 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 
 ## Open questions
 
-- Should zsh on Debian get prompt marks too (the app would have to write or inject a zprofile)?
+(None currently.)
 
 ## To verify
 
