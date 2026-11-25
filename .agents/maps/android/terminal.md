@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: route extra keys to the focused search bar so they never leak to the terminal)
+> Maintained: 2026-11-26 (targeted verification of deferred OSC 52 reads and clipboard dialog lifecycle)
 
 ## Responsibilities
 
@@ -292,13 +292,15 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   hint names the localized "Allow other apps to access files" setting in all five locales,
   matching Settings' consent dialog.
   The lookup result returns on the UI thread and is ignored if its activity is destroyed or locked.
-- A tab's clipboard read reaches the activity through the service (`onClipboardRead`; the queue and
-  the answers are `VtSession`'s, android/vt). `MainActivity` reads the clipboard's first item as
-  text and, when there is some, asks ("Let the program read the clipboard?", up to 300 characters
-  shown, Allow and Deny). Its answer covers every read queued by that session. Switching tabs or
-  stopping denies the old session's pending reads before another question can open; a delayed
-  dismissal only handles its own dialog. A listener only accepts requests for its current tab;
-  an empty clipboard, or one without text, is answered at once (`VtSession.answerClipboardRead`).
+- The service offers a tab's first OSC 52 read to the activity. Pending reads belong to the
+  session (`android/vt`). The activity retries after showing the tab, resuming, gaining window
+  focus, unlocking privacy or dismissing a clipboard question. Only the current service tab in
+  a resumed, focused, unlocked activity may read the first clipboard item's text.
+- Empty or non-text content receives an empty answer immediately. For text, one `showPrivate`
+  dialog previews up to 300 characters and asks Allow or Deny for that session's batch.
+  Returning text requires Allow while resumed and unlocked. Switching tabs, stopping, or
+  pausing with privacy mode enabled denies an open question. A deferred dismissal callback
+  checks the dialog's identity before answering.
 
 ## Dependencies (inbound / outbound)
 
@@ -386,9 +388,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 ## Open questions
 
 - Should "Close other tabs" name the tab when only one other tab is open?
-- Should a clipboard read from a tab not in front wait until the tab is shown rather than get an
-  empty clipboard, and should the question offer to remember the answer for the tab (Ghostty asks
-  every time)?
+- Should the clipboard question offer to remember the answer for the tab (Ghostty asks every time)?
 - Should typing in the search bar select the newest match at once, as Chrome's find bar does,
   rather than wait for a step, as Ghostty does?
 

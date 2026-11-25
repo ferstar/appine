@@ -3,7 +3,6 @@ package io.github.mthli.appine
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.util.Base64
 import android.util.Log
 import io.github.mthli.appine.VtSession.Companion.MAX_STATUS_RECORDS
 import io.github.mthli.appine.VtSession.Companion.PROGRESS_TIMEOUT_MS
@@ -221,7 +220,11 @@ internal class VtSession(
      * Clipboard reads (OSC 52) waiting for the user's answer: the clipboard each named, `c`, `p`
      * or `s`, which the answer names too.
      */
-    private val clipboardReads = ArrayList<Char>()
+    val clipboardReads = ClipboardReads(
+        schedule = { timeout, delay -> main.postDelayed(timeout, delay) },
+        cancelTimeout = main::removeCallbacks,
+        reply = ::write,
+    )
 
     private val dropProgress = Runnable { setProgress(null) }
 
@@ -399,32 +402,18 @@ internal class VtSession(
 
     /**
      * From vt.rs, on the pump thread: programs asked to read the clipboard (OSC 52 "?") [count]
-     * times, the last naming clipboard [kind] (`c`, `p` or `s`). They wait for the answer: the
-     * service has the user asked, or answers with an empty clipboard ([answerClipboardRead]).
+     * times, the last naming clipboard [kind]. Only the first waiting read needs a UI callback.
      */
     @Suppress("unused")
     fun onClipboardRead(kind: Int, count: Int) {
+        val generation = clipboardReads.generation
         main.post {
-            if (released) return@post
-            val first = clipboardReads.isEmpty()
-            repeat(count) { clipboardReads.add(kind.toChar()) }
-            if (first) events.onClipboardRead(this)
+            if (released || !isRunning || generation != clipboardReads.generation) return@post
+            if (clipboardReads.enqueue(kind.toChar(), count)) events.onClipboardRead(this)
         }
     }
 
-    /**
-     * Answers the clipboard reads that wait with [text], or, denied, with an empty clipboard
-     * (as libghostty-vt answers a read it refuses), so programs do not wait for a timeout. The
-     * answer names the clipboard asked for, ends with ST and carries the text in base64, as
-     * Ghostty's does.
-     */
-    fun answerClipboardRead(text: String?) {
-        if (clipboardReads.isEmpty()) return
-        val data = Base64.encodeToString(text.orEmpty().toByteArray(), Base64.NO_WRAP)
-        val answer = clipboardReads.joinToString("") { "\u001b]52;$it;$data\u001b\\" }
-        clipboardReads.clear()
-        write(answer.toByteArray())
-    }
+    fun answerClipboardRead(text: String?) = clipboardReads.answer(text)
 
     /**
      * From vt.rs, on the pump thread: a program reported its progress (OSC 9;4), [state] being
@@ -554,13 +543,16 @@ internal class VtSession(
     }
 
     /** Input for the program, written on the tab's writer thread; dropped once the shell exited. */
-    fun write(data: ByteArray) {
+    fun write(data: ByteArray) = write(data, null)
+
+    private fun write(data: ByteArray, clipboardGeneration: Long?) {
         val w = writer ?: return
         if (!isRunning || hungUp.get()) return
         val console = pty.console
         if (console < 0) return
         try {
             w.execute {
+                if (clipboardGeneration != null && clipboardGeneration != clipboardReads.generation) return@execute
                 if (!hungUp.get()) Native.write(machine, console, data, 0, data.size)
             }
         } catch (_: RejectedExecutionException) {
@@ -588,6 +580,7 @@ internal class VtSession(
      * matching a program's RIS.
      */
     fun reset() {
+        clipboardReads.clear()
         if (tab == 0L || released) return
         if (VtNative.reset(tab)) write(FORM_FEED)
         clearStatus()
@@ -610,6 +603,7 @@ internal class VtSession(
     private fun exited(code: Int) {
         if (exit != null) return
         exit = code
+        clipboardReads.clear()
         hangUp()
         writer?.shutdownNow()
         if (released) {
@@ -634,6 +628,7 @@ internal class VtSession(
     fun release() {
         if (released) return
         released = true
+        clipboardReads.clear()
         finishIfRunning()
         writer?.shutdownNow()
         main.removeCallbacks(dropProgress)

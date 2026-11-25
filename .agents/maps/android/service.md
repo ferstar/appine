@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: delete abandoned cached distro tarball via `Rootfs.deleteTarball` when falling back to Alpine in `startFailed`)
+> Maintained: 2026-11-26 (targeted verification of foreground OSC 52 delivery and cleanup on session removal or service teardown)
 
 ## Responsibilities
 
@@ -319,8 +319,8 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 ### What programs ask of the app
 
 - With privacy mode enabled, `Privacy.locked` excludes the current tab from `inFront` and drops
-  clipboard writes while locked or with no resumed page; clipboard reads then receive an empty
-  answer. With privacy mode off this gate does not restrict delivery. The terminal independently
+  clipboard writes while locked or with no resumed page. Clipboard reads stay queued in their
+  sessions until eligible for delivery or their wait expires. The terminal independently
   guards browser requests and input. Guest programs continue running.
 - `BrowserBridge` owns a random-port IPv4 loopback listener and per-kernel UUID capability.
   Start creates it before `ensureBrowser` writes the guest configuration; failed/abandoned starts,
@@ -347,12 +347,10 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   (the program was killed or stopped waiting) takes its notification away, unless a bell or a
   program's notification has replaced it since. A clipboard write sets the clipboard from any tab
   (labelled Appine), or clears it; before Android 13, which shows copies itself, a toast says a
-  program copied text. A clipboard read (OSC 52) from the tab in front goes to the
-  first `onClipboardRead(sessionId)` handler that accepts it. With no matching listener, or for
-  any other tab, it is answered
-  at once with an empty clipboard (`VtSession.answerClipboardRead(null)`): Android lets an app
-  read the clipboard only while it has the focus, and the program would otherwise wait for a
-  timeout.
+  program copied text. For an OSC 52 read from the tab in front, the service tries listeners
+  until one accepts `onClipboardRead(sessionId)`. Other tabs and unclaimed reads wait in
+  `VtSession`. Its 60 s timeout answers empty while waiting. Removing a tab, detaching the
+  machine and destroying the service release the affected sessions and cancel their timers.
 - tmux's control mode (tmux -CC), which the terminal detaches as it starts (android/vtcore),
   ending (`onTmuxDetached`) is told in that tab as a yellow `[appine]` line
   (`VtSession.showMessage`): it cannot be shown, its session goes on, and `tmux attach` brings it

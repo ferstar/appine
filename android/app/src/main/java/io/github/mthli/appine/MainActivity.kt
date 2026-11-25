@@ -178,6 +178,13 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     override fun onResume() {
         super.onResume()
         updatePermissionPrompts()
+        // Lifecycle reaches RESUMED after onResume returns, even if the window already has focus.
+        layout.root.post { deliverClipboardRead() }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) deliverClipboardRead()
     }
 
     override fun onPause() {
@@ -211,6 +218,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     override fun onPrivacyUnlocked() {
         updateImport()
         onNotice()
+        deliverClipboardRead()
     }
 
     // ---- Permission prompts ----
@@ -293,11 +301,19 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
      */
     override fun onClipboardRead(sessionId: Int): Boolean {
         val session = current?.takeIf { it.id == sessionId } ?: return false
-        if (Privacy.locked(this)) {
-            session.answerClipboardRead(null)
-            return true
-        }
-        if (clipboardQuestion != null) return true
+        if (service?.current !== session) return false
+        if (clipboardQuestion != null) return session.clipboardReads.promptActive
+        val claimed = session.clipboardReads.beginPrompt(
+            resumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
+            focused = hasWindowFocus(),
+            locked = Privacy.locked(this),
+            dismiss = {
+                val dialog = clipboardQuestion
+                clipboardQuestion = null
+                dialog?.dismiss()
+            },
+        )
+        if (!claimed) return false
         val clip = getSystemService(ClipboardManager::class.java).primaryClip?.takeIf { it.itemCount > 0 }
         val text = clip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
         if (text.isEmpty()) {
@@ -350,28 +366,31 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     // ---- Clipboard and notices ----
 
+    private fun deliverClipboardRead() {
+        current?.let { onClipboardRead(it.id) }
+    }
+
     /** Settle the old session's reads before a switch or stop. A queued dismiss callback is stale. */
     private fun dismissClipboardQuestion() {
-        val dialog = clipboardQuestion ?: return
-        clipboardQuestion = null
-        current?.answerClipboardRead(null)
-        dialog.dismiss()
+        if (clipboardQuestion != null) current?.clipboardReads?.denyPrompt()
     }
 
     private fun confirmClipboardRead(session: VtSession, text: String) {
         val preview = if (text.length > CLIPBOARD_PREVIEW) text.take(CLIPBOARD_PREVIEW) + "…" else text
+        fun mayAllow() = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && !Privacy.locked(this)
         var allowed = false
         clipboardQuestion = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.clipboard_read_title)
             .setMessage(getString(R.string.clipboard_read, preview))
-            .setPositiveButton(R.string.allow) { _, _ -> allowed = true }
+            .setPositiveButton(R.string.allow) { _, _ -> allowed = mayAllow() }
             .setNegativeButton(R.string.deny, null)
             .setOnDismissListener { dialog ->
                 if (clipboardQuestion !== dialog) return@setOnDismissListener
                 clipboardQuestion = null
-                session.answerClipboardRead(if (allowed && !Privacy.locked(this)) text else null)
+                session.answerClipboardRead(if (allowed && mayAllow()) text else null)
                 // The terminal takes the keyboard again
                 layout.screen.requestFocus()
+                deliverClipboardRead()
             }
             .showPrivate()
     }
@@ -480,6 +499,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         layout.screen.attach(session)
         layout.screen.requestFocus()
         renderTabs()
+        deliverClipboardRead()
     }
 
     /**

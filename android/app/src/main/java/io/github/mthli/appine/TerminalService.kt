@@ -511,16 +511,9 @@ class TerminalService : Service() {
             if (inFront(session)) each { it.onBell() } else notifications.program(session, title, body)
         }
 
-        /**
-         * Programs read the clipboard as Ghostty lets them by default (clipboard-read = ask): the
-         * user is asked, in the tab in front only. A tab elsewhere gets an empty clipboard at once:
-         * Android lets an app read the clipboard only while it has the focus, and the program
-         * would otherwise wait for a timeout.
-         */
+        /** Offer the first read to the current listener. The session owns the waiting deadline. */
         override fun onClipboardRead(session: VtSession) {
-            if (!inFront(session) || listeners.toList().none { it.onClipboardRead(session.id) }) {
-                session.answerClipboardRead(null)
-            }
+            if (inFront(session)) listeners.toList().any { it.onClipboardRead(session.id) }
         }
 
         override fun onStatusChanged(session: VtSession) {

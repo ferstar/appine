@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 9 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: wired `VtSession.busy` to `VtNative.busy` with foreground-process fallback for unmarked shells and ash, and documented fallback command titles and completion events)
+> Maintained: 2026-11-26 (targeted verification of the OSC 52 queue, timeout, writer and session cleanup)
 
 ## Responsibilities
 
@@ -20,7 +20,7 @@
   three-way native snapshots for persistence, and executing session-side message, cursor, clear
   and reset actions.
 
-Root: `VtSession.kt` and `ConsolePty.kt` in
+Root: `VtSession.kt`, `ClipboardReads.kt` and `ConsolePty.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`.
 
 Outside the module: `VtNative`, JNI, the pump implementation, terminal ownership and locks,
@@ -42,8 +42,10 @@ login script and prompt-mark producers (`android/setup`).
   metadata (`resolvedLogin`, `savedSnapshot`), cursor defaults (`cursorStyle`, `cursorBlink`),
   grid cache, main-thread `progress` (`Progress?`, 15 s `dropProgress` timer) and `status`
   (`Status?` selected from `LinkedHashMap<String, Status> records`, LRU-ordered, max 64),
-  synchronized `reports` handoff buffer from `vt-pump`, `clipboardReads` queue, `AtomicBoolean
+  synchronized `reports` handoff buffer from `vt-pump`, `clipboardReads` (`ClipboardReads`), `AtomicBoolean
   hungUp`, and single-thread `vt-writer` executor.
+- `ClipboardReads` — main-thread OSC 52 read queue per session (max 64 targets, 60 s wait timer,
+  active-prompt handoff/dismissal and `@Volatile generation` counter for terminal resets).
 - `VtSession.Events` — main-thread callback interface implemented by `TerminalService`:
   `onTitleChanged`, `onBell`, `onClipboard`, `onNotification`, `onClipboardRead`,
   `onStatusChanged`, `onCommandFinished`, `onTmuxDetached`, `onFinished`.
@@ -115,14 +117,17 @@ login script and prompt-mark producers (`android/setup`).
 - `onOutput()` runs directly on `vt-pump` without checking `released` and calls
   `view?.postInvalidateOnAnimation()`. All other native callbacks post to `main`: `onProgress` and
   `applyReports` guard `!released && isRunning`; `onTitle`, `onBell`, `onClipboard`,
-  `onNotification`, `onClipboardRead`, `onCommandFinished` and `onTmuxDetached` guard `!released`.
+  `onNotification`, `onCommandFinished` and `onTmuxDetached` guard `!released`.
   `onForeground` uses the progress and status queues.
-- Clipboard reads (`OSC 52 ; <clipboard> ; ?`): `onClipboardRead(kind, count)` appends `count`
-  entries to `clipboardReads` and notifies `events.onClipboardRead(this)` only when the queue was
-  empty (coalescing concurrent reads into one user prompt). `answerClipboardRead(text)` formats
-  one `ESC ] 52 ; <clipboard> ; <base64> ESC \` (ST, `Base64.NO_WRAP`; empty payload for `null` or
-  `""` when denied/dismissed/background) per queued entry, clears `clipboardReads`, and sends via
-  `write(...)` on `vt-writer`.
+- `ClipboardReads` retains up to 64 OSC 52 targets per session. The first read starts a 60 s
+  main-handler timeout and notifies the service. Further reads share the first deadline and
+  question. Excess requests receive empty replies immediately. The activity claims a batch
+  before reading the clipboard and cancels the timer. An open preview has no timeout.
+- An answer formats one ST-terminated OSC 52 reply per queued target with unwrapped base64
+  text. Denial, timeout and an empty clipboard send empty payloads. Reset, shell exit and
+  release cancel the timer, clear the batch and dismiss any preview without a reply. The pump's
+  posted read and queued clipboard writes check the session's clipboard generation, and reads
+  also require a running, unreleased session.
 - Progress (`OSC 9;4`): `onProgress` maps `PROGRESS_REMOVE` to `null`, else `Progress(state,
   percent)`. `setProgress` cancels and re-posts the 15 s `dropProgress` timer (`PROGRESS_TIMEOUT_MS`)
   before checking `p == progress`, so identical heartbeats extend the timeout without firing
@@ -228,13 +233,16 @@ login script and prompt-mark producers (`android/setup`).
 - Both a program's RIS (via libghostty-vt callbacks) and `VtSession.reset()` clear `progress`,
   `dropProgress`, buffered `reports`, `records` and `status`.
 - Same-read OSC 52 `?` requests collapse to the last clipboard target's `kind` in `vt.c`; separate
-  reads preserve individual targets in `clipboardReads`. Clipboard answers must always go through
-  `answerClipboardRead` -> `vt-writer`, never synchronously under native terminal locks.
+  reads preserve individual targets in `clipboardReads`. Clipboard replies go through the
+  session's `vt-writer` after native terminal locks are released.
 - Release sessions and close consoles before stopping the kernel so `vt-pump` can return; native
   pumps must not hold a session-long `Arc<Machine>`.
 
 ## Confirmed bugs / technical debt
 
+- Clipboard generations start at the Kotlin pump callback. A native read effect already captured
+  while its JNI callback is still pending can arrive after a terminal reset as a new request.
+  A write already inside the native console call may also complete across reset.
 - **Shell mark coverage limits inherited from `android/vtcore`:** local unmarked shells (dash,
   mksh, tcsh, elvish, ash with overwritten `PS1`) now have foreground-process fallback for `busy`,
   command titles and exit-code-less completion timing, and Alpine `doas -s` preserves ash marks;
