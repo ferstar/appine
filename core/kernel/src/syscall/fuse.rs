@@ -7,6 +7,7 @@
 //! (`allow_other`), and only with `default_permissions` does the kernel check modes; otherwise the
 //! daemon decides, and the kernel asks it only for access(2) and chdir (`FUSE_ACCESS`).
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::fs::encode_stat;
@@ -2126,13 +2127,13 @@ pub(super) fn sweep(cx: &mut Cx<'_>) {
     }
 }
 
-/// The FUSE nodes that processes' root directories, cwds, open files (O_PATH ones too) and
-/// running programs and mapped ELF interpreters are, that mounts are on or of, and that inotify watches; None when some of
-/// it is borrowed.
-fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<std::collections::HashSet<FuseId>> {
-    let mut used = std::collections::HashSet::new();
-    let mut mapped = std::collections::HashSet::new();
-    let mut seen_mm = std::collections::HashSet::new();
+/// FUSE nodes pinned by process roots, cwds, open files (including O_PATH), running programs,
+/// mapped ELF interpreters, mount roots and points, or inotify watches. A busy borrow defers
+/// the sweep.
+fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<HashSet<FuseId>> {
+    let mut used = HashSet::new();
+    let mut inodes = HashSet::new();
+    let mut seen_mm = HashSet::new();
     let mut add = |n: Node| {
         if let Node::Fuse(_, id) = n {
             used.insert(id);
@@ -2147,12 +2148,10 @@ fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<std::collections::Hash
         }
         if seen_mm.insert(Rc::as_ptr(&res.mm)) {
             let mm = res.mm.try_borrow().ok()?;
-            if let Some(id) = mm.exe.and_then(fuse::id_of) {
-                add(Node::Fuse(0, id));
-            }
+            inodes.extend(mm.exe);
             // ELF snapshots carry keys. Ordinary FUSE mmap inodes belong to the daemon
             // and are excluded by mapped_inos.
-            mm.mapped_inos(&mut mapped);
+            mm.mapped_inos(&mut inodes);
         }
         let fds = res.fds.try_borrow().ok()?;
         for file in fds.files() {
@@ -2164,12 +2163,9 @@ fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<std::collections::Hash
     for n in vfs.mount_nodes() {
         add(n);
     }
-    for key in k.inotify.try_borrow().ok()?.watched() {
-        if let Some(id) = fuse::id_of(key) {
-            add(Node::Fuse(0, id));
-        }
-    }
-    used.extend(mapped.into_iter().filter_map(fuse::id_of));
+    used.extend(inodes.into_iter().filter_map(fuse::id_of));
+    let inotify = k.inotify.try_borrow().ok()?;
+    used.extend(inotify.watched().filter_map(fuse::id_of));
     Some(used)
 }
 
@@ -2201,7 +2197,6 @@ pub(crate) fn flush_at_exit(cx: &mut Cx<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

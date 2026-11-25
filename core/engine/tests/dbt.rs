@@ -272,13 +272,13 @@ fn trim_discards_templates_and_new_translations_are_shareable() {
     let _pool = lock_pool();
     let Some(mut first) = Dbt::new() else { return };
     let mut g = Guest::new();
-    let pcs = [CODE + 0x648, CODE + 0x12d8];
-    for (i, pc) in pcs.into_iter().enumerate() {
-        g.code(pc, &[movz_x0(0x3a00 + i as u16), SVC]);
+    let blocks = [(CODE + 0x648, 0x3a00), (CODE + 0x12d8, 0x3a01)];
+    for (pc, value) in blocks {
+        g.code(pc, &[movz_x0(value), SVC]);
     }
     let mut run = |dbt: &mut Dbt| {
-        for (i, pc) in pcs.into_iter().enumerate() {
-            assert_eq!(g.run_at(dbt, pc), 0x3a00 + i as u64);
+        for (pc, value) in blocks {
+            assert_eq!(g.run_at(dbt, pc), u64::from(value));
         }
         assert_eq!(dbt.stats().blocks, 2);
     };

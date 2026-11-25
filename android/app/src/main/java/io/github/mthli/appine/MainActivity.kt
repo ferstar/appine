@@ -294,10 +294,8 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     override fun onOpenUrl(url: String): Boolean = !Privacy.locked(this) && hasWindowFocus() && links.openBrowser(url)
 
     /**
-     * A program in the tab shown asks to read the clipboard (OSC 52): the user is asked, with what
-     * it holds shown, as Ghostty's clipboard-read = ask does; nothing to read (an empty clipboard,
-     * or no text) is answered at once. Denying, or leaving the question unanswered, gives the
-     * program an empty clipboard.
+     * Claim the current tab's OSC 52 reads before accessing the clipboard. An empty clipboard
+     * gets an immediate reply. For text, the preview stays open until answered or dismissed.
      */
     override fun onClipboardRead(sessionId: Int): Boolean {
         val session = current?.takeIf { it.id == sessionId } ?: return false

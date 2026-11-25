@@ -66,6 +66,12 @@ impl SenderState {
             outq: std::cell::Cell::new(0),
         })
     }
+
+    /// Charges one packet and gives it a sender reference to release on dequeue or drop.
+    pub(crate) fn charge(self: &Rc<Self>, truesize: usize) -> Rc<Self> {
+        self.outq.set(self.outq.get() + truesize);
+        self.clone()
+    }
 }
 
 /// The default `net.unix.max_dgram_qlen`: datagrams a socket's queue holds before senders other
@@ -296,11 +302,8 @@ impl UnixSocket {
                 peer_addr: a_addr,
             });
         } else {
-            let (ab, ba) = (ChannelRef::default(), ChannelRef::default());
-            if ty == SOCK_SEQPACKET {
-                ab.borrow_mut().packet_budget = true;
-                ba.borrow_mut().packet_budget = true;
-            }
+            let ab = Channel::connected(ty, false);
+            let ba = Channel::connected(ty, false);
             a.link = Link::Stream {
                 rx: ba.clone(),
                 tx: ab.clone(),
@@ -325,18 +328,9 @@ impl UnixSocket {
         server_cred: Ucred,
         cred: Ucred,
     ) -> UnixSocket {
-        let (up, down) = (ChannelRef::default(), ChannelRef::default());
-        {
-            let mut d = down.borrow_mut();
-            d.passcred = self.rx.borrow().passcred;
-            d.packet_budget = self.ty == SOCK_SEQPACKET;
-        }
+        let down = Channel::connected(self.ty, self.rx.borrow().passcred);
         // Linux records credentials for an unaccepted peer. accept installs the listener's setting.
-        {
-            let mut u = up.borrow_mut();
-            u.passcred = true;
-            u.packet_budget = self.ty == SOCK_SEQPACKET;
-        }
+        let up = Channel::connected(self.ty, true);
         let mut server = UnixSocket::new(self.ty);
         // As in Linux's unix_stream_connect, the new end is created in the connecting side's
         // network namespace
@@ -518,24 +512,14 @@ impl UnixSocket {
 
     /// Its own address; only the address family when unbound.
     pub fn name(&self) -> Vec<u8> {
-        let addr = self.addr.borrow();
-        if addr.is_empty() {
-            unnamed()
-        } else {
-            addr.clone()
-        }
+        socket_name(&self.addr)
     }
 
     /// The peer's address, None when not connected.
     pub fn peer_name(&self) -> Option<Vec<u8>> {
         match &self.link {
             Link::Stream { peer_addr, .. } | Link::Dgram { peer_addr, .. } => {
-                let addr = peer_addr.borrow();
-                Some(if addr.is_empty() {
-                    unnamed()
-                } else {
-                    addr.clone()
-                })
+                Some(socket_name(peer_addr))
             }
             Link::None | Link::Listening { .. } => None,
         }
@@ -567,6 +551,15 @@ impl Drop for UnixSocket {
         if had_fds || had_pending {
             defer_collect();
         }
+    }
+}
+
+fn socket_name(addr: &AddrRef) -> Vec<u8> {
+    let addr = addr.borrow();
+    if addr.is_empty() {
+        unnamed()
+    } else {
+        addr.clone()
     }
 }
 
@@ -674,8 +667,8 @@ impl Packet {
             .map_or_else(|| self.from.clone(), |s| s.addr.borrow().clone())
     }
 
-    fn uncharge(&self, n: usize) {
-        if let Some(s) = &self.outq {
+    fn uncharge(&mut self, n: usize) {
+        if let Some(s) = self.outq.take() {
             s.outq.set(s.outq.get().saturating_sub(n));
         }
     }
@@ -742,6 +735,15 @@ pub(crate) struct Channel {
 pub(crate) type ChannelRef = Rc<RefCell<Channel>>;
 
 impl Channel {
+    /// One direction of a stream or seqpacket connection.
+    fn connected(ty: i32, passcred: bool) -> ChannelRef {
+        Rc::new(RefCell::new(Self {
+            packet_budget: ty == SOCK_SEQPACKET,
+            passcred,
+            ..Self::default()
+        }))
+    }
+
     /// The payload bytes that still fit for a stream write.
     pub fn space(&self) -> usize {
         CAPACITY.saturating_sub(self.bytes)
@@ -840,8 +842,8 @@ impl Channel {
             let from = p.sender_addr();
             self.bytes -= len;
             self.truesize -= ts;
+            // Taking the payload changes truesize. Release the original charge before the move.
             p.uncharge(ts);
-            p.outq = None;
             let mut data = std::mem::take(&mut p.data);
             data.truncate(max);
             let fds = std::mem::take(&mut p.fds);
@@ -1519,8 +1521,7 @@ mod tests {
         let mut p = packet(b"hello", 1);
         let f = OpenFile::new(FileKind::Host(1), oflags::O_RDONLY);
         p.fds.push(f.clone());
-        a.outq.outq.set(a.outq.outq.get() + p.truesize());
-        p.outq = Some(a.outq.clone());
+        p.outq = Some(a.outq.charge(p.truesize()));
         b.rx.borrow_mut().push(p);
         assert_eq!(a.outq(), packet_truesize(5));
 
@@ -1577,8 +1578,7 @@ mod tests {
         let mut p = packet(b"abcdef", 1);
         let ts = p.truesize();
         assert_eq!(ts, 768);
-        a.outq.outq.set(ts);
-        p.outq = Some(a.outq.clone());
+        p.outq = Some(a.outq.charge(ts));
         tx.borrow_mut().push(p);
         assert_eq!(a.outq(), ts);
         // Peek and partial stream reads retain packet truesize until the packet is fully consumed
@@ -1601,8 +1601,7 @@ mod tests {
         let mut queued = 0;
         while db.rx.borrow().has_packet_room() {
             let mut zp = packet(b"", 1);
-            da.outq.outq.set(da.outq.outq.get() + zp.truesize());
-            zp.outq = Some(da.outq.clone());
+            zp.outq = Some(da.outq.charge(zp.truesize()));
             db.rx.borrow_mut().push(zp);
             queued += 1;
         }
@@ -1610,6 +1609,8 @@ mod tests {
         assert_eq!(da.outq(), 278 * 768);
         assert_eq!(db.unread(), Some(0));
         assert_eq!(da.readiness() & POLLOUT, 0);
+        db.rx.borrow_mut().read_packet(0, false).unwrap();
+        assert_eq!(da.outq(), 277 * 768);
         drop(db);
         assert_eq!(da.outq(), 0);
     }
@@ -1628,8 +1629,7 @@ mod tests {
         while tx.borrow().has_packet_room() {
             let mut p = packet(b"", 1);
             p.fds.push(dummy.clone());
-            sa.outq.outq.set(sa.outq.outq.get() + p.truesize());
-            p.outq = Some(sa.outq.clone());
+            p.outq = Some(sa.outq.charge(p.truesize()));
             tx.borrow_mut().push(p);
             queued += 1;
         }
@@ -1660,8 +1660,7 @@ mod tests {
     fn sender_addr_updates_at_receive_and_peer_query_time() {
         let (a, b) = UnixSocket::pair(SOCK_DGRAM, Ucred::of(1, 0, 0));
         let mut p = packet(b"hi", 1);
-        a.outq.outq.set(p.truesize());
-        p.outq = Some(a.outq.clone());
+        p.outq = Some(a.outq.charge(p.truesize()));
         b.rx.borrow_mut().push(p);
         assert_eq!(b.peer_name(), Some(unnamed()));
 

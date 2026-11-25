@@ -1068,6 +1068,10 @@ impl Vma {
         self.file_id.map_or(0, |f| f.2)
     }
 
+    fn anon_pgoff_at(&self, byte_offset: u64) -> u64 {
+        self.anon_pgoff.wrapping_add(byte_offset / PAGE_SIZE)
+    }
+
     /// Bytes of the host region available from this start, even after a VMA split or shrink.
     fn host_available(&self) -> u64 {
         let end = self.region.base.as_ptr() as usize + self.region.len;
@@ -1157,7 +1161,7 @@ fn can_merge(a: &Vma, b: &Vma) -> bool {
                 && a.shm == b.shm
                 && a.host.as_ptr().wrapping_add(a.len as usize) == b.host.as_ptr()
         }
-        (None, None) => a.anon_pgoff.wrapping_add(a.len / PAGE_SIZE) == b.anon_pgoff,
+        (None, None) => a.anon_pgoff_at(a.len) == b.anon_pgoff,
         (Some((dev, ino, offset)), Some(next)) => {
             (dev, ino, offset + a.len) == next && a.ino == b.ino
         }
@@ -2370,14 +2374,7 @@ impl Mm {
             anon_pgoff: template.anon_pgoff.wrapping_sub(grow / PAGE_SIZE),
             ..template
         };
-        let exec = chunk.prot & prot::EXEC != 0;
-        if self.insert_vma(page, chunk).is_err() {
-            return false;
-        }
-        if exec {
-            self.code_ranges.push((page, grow));
-        }
-        true
+        self.insert_extension(page, chunk).is_ok()
     }
 
     /// Before the kernel gives up on an access to `[addr, addr + len)`: grows the grows-down
@@ -3316,11 +3313,7 @@ impl Mm {
                 return Ok(old);
             }
             let ext = Self::extension(&self.vmas[&start], offset, grow, None)?;
-            let exec = ext.prot & prot::EXEC != 0;
-            self.insert_vma(old_end, ext)?;
-            if exec {
-                self.code_ranges.push((old_end, grow));
-            }
+            self.insert_extension(old_end, ext)?;
             return Ok(old);
         }
         if !may_move {
@@ -3410,13 +3403,19 @@ impl Mm {
         if let Some(mut ext) = ext {
             let end = dst + len;
             let (_, tail) = self.vmas.range(..end).next_back().unwrap();
-            ext.anon_pgoff = tail.anon_pgoff.wrapping_add(tail.len / PAGE_SIZE);
+            ext.anon_pgoff = tail.anon_pgoff_at(tail.len);
             ext.has_anon_vma.set(tail.has_anon_vma.get());
-            let (grow, exec) = (ext.len, ext.prot & prot::EXEC != 0);
-            self.insert_vma(end, ext)?;
-            if exec {
-                self.code_ranges.push((end, grow));
-            }
+            self.insert_extension(end, ext)?;
+        }
+        Ok(())
+    }
+
+    fn insert_extension(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
+        let len = v.len;
+        let executable = v.prot & prot::EXEC != 0;
+        self.insert_vma(start, v)?;
+        if executable {
+            self.code_ranges.push((start, len));
         }
         Ok(())
     }
@@ -3571,7 +3570,7 @@ impl Mm {
             written: Cell::new(
                 template.backing != Backing::Anonymous && template.prot & prot::WRITE != 0,
             ),
-            anon_pgoff: template.anon_pgoff.wrapping_add(offset / PAGE_SIZE),
+            anon_pgoff: template.anon_pgoff_at(offset),
             ..template.clone()
         })
     }
@@ -4083,12 +4082,11 @@ impl Mm {
             }
         }
         for (&s, v) in self.vmas.range_mut(addr..end) {
-            // Pages that were executable: their translations must be invalidated when they stop
-            // being executable; a W^X JIT also removes execute permission before rewriting code
+            // A permission change on an old or new executable range invalidates translations.
             if (v.prot | prot) & prot::EXEC != 0 && v.prot != prot {
                 self.code_ranges.push((s, v.len));
+                self.exec_changed = true;
             }
-            self.exec_changed |= (v.prot | prot) & prot::EXEC != 0 && v.prot != prot;
             // When permissions are only added, stale TLB entries merely lack permissions and are
             // refilled on a miss, so no flush is needed
             let (old, new) = (mmu_prot(v.prot), mmu_prot(prot));
@@ -6814,7 +6812,7 @@ impl Mm {
         let mut tail = v.clone();
         let head_len = addr - s;
         tail.len -= head_len;
-        tail.anon_pgoff = tail.anon_pgoff.wrapping_add(head_len / PAGE_SIZE);
+        tail.anon_pgoff = v.anon_pgoff_at(head_len);
         tail.file_len = v.file_len.saturating_sub(head_len);
         if let Some(f) = &mut tail.file_id {
             f.2 += head_len;
@@ -10212,12 +10210,11 @@ mod tests {
     }
 
     /// Leave a given number of free slots without changing the process-wide test limit.
-    fn leave_map_slots(mm: &mut Mm, free: usize) {
+    fn leave_map_slots(mm: &mut Mm, start: u64, free: usize) {
         let limit = MAX_MAP_COUNT.load(Ordering::Relaxed) - free;
-        let mut at = 0x1_0000_0000;
-        while mm.vmas.len() < limit {
+        for i in 0..limit - mm.vmas.len() {
+            let at = start + i as u64 * 2 * PAGE_SIZE;
             mm.map_anonymous(at, PAGE_SIZE, 0).unwrap();
-            at += 2 * PAGE_SIZE;
         }
     }
 
@@ -10254,7 +10251,7 @@ mod tests {
             }
         }
         let dst = 0x700000;
-        leave_map_slots(&mut mm, 6);
+        leave_map_slots(&mut mm, 0x1_0000_0000, 6);
         for a in [anon, file, fuse, shared] {
             let (_, refills) = mm.mremap_dontunmap(a, len, Some(dst)).unwrap();
             if a == file {
@@ -10282,11 +10279,7 @@ mod tests {
             // Keep the next move at the same map pressure.
             mm.munmap(dst, len).unwrap();
             if a != shared {
-                let remaining = MAX_MAP_COUNT.load(Ordering::Relaxed) - 6 - mm.vmas.len();
-                for n in 0..remaining {
-                    mm.map_anonymous(a + len + (n as u64) * 2 * p, p, 0)
-                        .unwrap();
-                }
+                leave_map_slots(&mut mm, a + len, 6);
             }
         }
     }
@@ -10382,7 +10375,7 @@ mod tests {
         mm.attach_shm(Some(sysv), &segment, RW, false, (1, 5))
             .unwrap();
         mm.mremap(sysv, 2 * p, p, false, None).unwrap();
-        leave_map_slots(&mut mm, 0);
+        leave_map_slots(&mut mm, 0x1_0000_0000, 0);
         for a in [reserved, private, shared, sysv] {
             assert_eq!(mm.mremap(a, p, 2 * p, false, None), Ok(a));
             assert_eq!(mm.vmas[&a].len, 2 * p);

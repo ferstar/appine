@@ -216,48 +216,33 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     k.oom.next
 }
 
-/// Handles a cgroup exceeding its `memory.high` throttle/reclaim threshold: records a `high` event
-/// in `memory.events` and `memory.events.local` and reclaims idle Tier 1 memory and writable
-/// code-cache views without killing any process.
+/// Records a cgroup's `memory.high` event and reclaims idle Tier 1 memory and writable aliases.
 pub(crate) fn handle_memory_high(k: &mut Kernel, id: u64) {
     crate::cgroup::memory_event(k, id, |e| e.high += 1);
     reclaim_dbt_memory();
 }
 
+/// Live code groups keep their translations. Flushing them would wait for runners under the BKL.
 fn reclaim_dbt_memory() {
     appine_engine::trim_dbt_pool();
     appine_engine::unmap_written_code();
 }
 
-/// Measures whole-app usage and records the peak. Above the limit, reclaim idle Tier 1
-/// instances, thread workspaces, template pages and writable aliases, then measure again.
-/// Trim drains the pools under the leaf pool lock and releases their contents outside it.
-/// Template shard locks are taken in ascending order before the arena lock. Alias unmapping
-/// takes the pool lock separately. Neither operation acquires an instance lock or the BKL.
-///
-/// Live code groups retain their translations until the last sharer releases its space. A
-/// synchronous flush would kick runners and wait under the BKL, risking a watchdog stall.
-/// A null thread CPU can also mean a syscall waiting for this BKL. Flushing on 5 ms polls
-/// would make every sharer retranslate even when one runaway process still needs to exit.
+/// Records each whole-app sample in the peak. Above the limit, reclaims memory and returns
+/// the latest successful sample.
 fn measure_root(
     oom: &Oom,
     limit: u64,
     measure: impl Fn() -> Option<u64>,
-    trim: impl FnOnce(),
+    reclaim: impl FnOnce(),
 ) -> Option<u64> {
-    let used = measure()?;
-    oom.note(used);
+    let sample = || measure().inspect(|&used| oom.note(used));
+    let used = sample()?;
     if used <= limit {
         return Some(used);
     }
-    trim();
-    match measure() {
-        Some(after) => {
-            oom.note(after);
-            Some(after)
-        }
-        None => Some(used),
-    }
+    reclaim();
+    sample().or(Some(used))
 }
 
 /// The app's memory usage (bytes): the sum of the items of [`app_memory`]. Returns None when it
@@ -1049,6 +1034,14 @@ mod tests {
         assert_eq!(got, Some(120));
         assert_eq!(trimmed.get(), 2);
         assert_eq!(oom.peak.get(), 160);
+
+        // A failed post-reclaim read leaves the original over-limit sample in force.
+        let reading = Cell::new(Some(180));
+        assert_eq!(
+            measure_root(&oom, 100, || reading.get(), || reading.set(None)),
+            Some(180)
+        );
+        assert_eq!(oom.peak.get(), 180);
     }
 
     // Root footprint and the DBT caches are process-wide. Run each real-pressure measurement

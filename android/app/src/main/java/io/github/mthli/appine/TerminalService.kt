@@ -511,9 +511,12 @@ class TerminalService : Service() {
             if (inFront(session)) each { it.onBell() } else notifications.program(session, title, body)
         }
 
-        /** Offer the first read to the current listener. The session owns the waiting deadline. */
+        /** The session keeps an unclaimed read until its waiting deadline. */
         override fun onClipboardRead(session: VtSession) {
-            if (inFront(session)) listeners.toList().any { it.onClipboardRead(session.id) }
+            if (!inFront(session)) return
+            for (listener in listeners.toList()) {
+                if (listener.onClipboardRead(session.id)) return
+            }
         }
 
         override fun onStatusChanged(session: VtSession) {

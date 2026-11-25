@@ -479,6 +479,16 @@ struct ShownLine {
 }
 
 impl ShownLine {
+    fn flock(file: FileRef, exclusive: bool, pid: Tid) -> Self {
+        Self {
+            kind: "FLOCK  ADVISORY  ",
+            write: Some(exclusive),
+            pid,
+            file,
+            range: "0 EOF".into(),
+        }
+    }
+
     /// The line after the number, for device/inode `(dev, ino)` and `pid` as the reader sees it.
     fn status(&self, (dev, ino): (u64, u64), pid: Tid) -> String {
         let ty = match self.write {
@@ -528,41 +538,30 @@ fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
             continue;
         }
         let base = out.len();
-        let mut live = Vec::new();
         for holder in holders {
             if let Some(file) = holder.file.upgrade() {
                 out.push(Shown {
-                    line: ShownLine {
-                        kind: "FLOCK  ADVISORY  ",
-                        write: Some(holder.exclusive),
-                        pid: holder.pid,
-                        file,
-                        range: "0 EOF".into(),
-                    },
+                    line: ShownLine::flock(file, holder.exclusive, holder.pid),
                     table: None,
                     seq: holder.seq,
                     waiters: Vec::new(),
                 });
-                live.push(holder);
             }
         }
-        if only.is_none() && !live.is_empty() {
-            for w in k.flocks.waiters.iter().filter(|w| w.key == *key) {
-                let Some(file) = w.file.upgrade() else {
-                    continue;
-                };
-                let Some(idx) = live.iter().position(|holder| {
-                    !holder.file.ptr_eq(&w.file) && (w.exclusive || holder.exclusive)
-                }) else {
-                    continue;
-                };
-                out[base + idx].waiters.push(ShownLine {
-                    kind: "FLOCK  ADVISORY  ",
-                    write: Some(w.exclusive),
-                    pid: w.pid,
-                    file,
-                    range: "0 EOF".into(),
-                });
+        let live = &mut out[base..];
+        if only.is_some() || live.is_empty() {
+            continue;
+        }
+        for w in k.flocks.waiters.iter().filter(|w| w.key == *key) {
+            let Some(file) = w.file.upgrade() else {
+                continue;
+            };
+            if let Some(holder) = live.iter_mut().find(|h| {
+                !Rc::ptr_eq(&h.line.file, &file) && (w.exclusive || h.line.write == Some(true))
+            }) {
+                holder
+                    .waiters
+                    .push(ShownLine::flock(file, w.exclusive, w.pid));
             }
         }
     }

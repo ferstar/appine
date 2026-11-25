@@ -475,6 +475,12 @@ enum Echo {
     MoveBackColumn,
 }
 
+struct InputByte {
+    byte: u8,
+    /// Lookahead already acted on this byte as VSTART or VSTOP.
+    flow_handled: bool,
+}
+
 /// A PTY pair.
 pub struct Tty {
     /// `/dev/pts/<index>`.
@@ -484,9 +490,8 @@ pub struct Tty {
     pub termios: Termios,
     pub winsize: Winsize,
     /// Master writes the line discipline has not taken yet (Linux's flip buffer): taken as it
-    /// gets room, when the slave reads or termios changes. The bool marks bytes whose flow
-    /// control action already ran during lookahead.
-    unprocessed: VecDeque<(u8, bool)>,
+    /// gets room, when the slave reads or termios changes.
+    unprocessed: VecDeque<InputByte>,
     /// Prefix of `unprocessed` already scanned for VSTART and VSTOP under IXON.
     lookahead: usize,
     /// The line being edited in canonical mode.
@@ -642,7 +647,10 @@ impl Tty {
     /// A master write (input from the terminal); returns the signals to send to the foreground
     /// process group. The caller keeps `data` within [`Tty::input_room`].
     pub fn write_input(&mut self, data: &[u8]) -> Vec<Signal> {
-        self.unprocessed.extend(data.iter().map(|&b| (b, false)));
+        self.unprocessed.extend(data.iter().map(|&byte| InputByte {
+            byte,
+            flow_handled: false,
+        }));
         self.process_input();
         self.take_signals()
     }
@@ -699,9 +707,9 @@ impl Tty {
     fn process_input(&mut self) {
         let mut taken = false;
         while !self.unprocessed.is_empty() && self.ldisc_room() > 0 {
-            let (c, looked_ahead) = self.unprocessed.pop_front().unwrap();
+            let input = self.unprocessed.pop_front().unwrap();
             self.lookahead = self.lookahead.saturating_sub(1);
-            self.input_char(c, looked_ahead);
+            self.input_char(input.byte, input.flow_handled);
             taken = true;
         }
         self.commit_echoes();
@@ -709,9 +717,9 @@ impl Tty {
         // Keep them for quoting, input mapping and the termios in effect when room opens up.
         if self.termios.i(IXON) {
             for i in self.lookahead..self.unprocessed.len() {
-                let c = self.unprocessed[i].0;
+                let c = self.unprocessed[i].byte;
                 if self.flow_char(c, false) {
-                    self.unprocessed[i].1 = true;
+                    self.unprocessed[i].flow_handled = true;
                 }
             }
             self.lookahead = self.unprocessed.len();
@@ -753,7 +761,7 @@ impl Tty {
     /// One byte of input (Linux's `n_tty_receive_buf_standard`): ISTRIP and IUCLC first; after
     /// VLNEXT the byte is literal, with EXTPROC it is queued as it is, and otherwise characters
     /// that may be special ([`Tty::special`]) are told apart from ordinary ones.
-    fn input_char(&mut self, c: u8, looked_ahead: bool) {
+    fn input_char(&mut self, c: u8, flow_handled: bool) {
         let t = self.termios;
         let c = if t.i(ISTRIP) { c & 0x7f } else { c };
         let c = if t.i(IUCLC) && t.l(IEXTEN) {
@@ -766,7 +774,7 @@ impl Tty {
         } else if t.l(EXTPROC) {
             self.raw.push_back(c);
         } else if self.special(c) {
-            self.receive_special(c, looked_ahead);
+            self.receive_special(c, flow_handled);
         } else {
             self.receive(c);
         }
@@ -790,8 +798,8 @@ impl Tty {
                 || t.l(ISIG) && any(&[VINTR, VQUIT, VSUSP]))
     }
 
-    /// An ordinary character (Linux's `n_tty_receive_char`): restarts output with IXANY, is echoed
-    /// and queued. In canonical mode a full line drops it.
+    /// Handles IXANY, echo and queueing for an ordinary character (Linux's `n_tty_receive_char`).
+    /// With ECHO, even a character discarded on canonical overflow is echoed.
     fn receive(&mut self, c: u8) {
         self.restart_on_any();
         if self.termios.l(ECHO) {
@@ -804,11 +812,11 @@ impl Tty {
 
     /// A character that may be special (Linux's `n_tty_receive_char_special`), in this order: flow
     /// control (IXON), signal characters (ISIG), IXANY, CR and NL translation, then in canonical
-    /// mode erasing, VLNEXT, VREPRINT and the line ends; anything left is queued as an ordinary
-    /// character, a newline echoed as itself even with ECHOCTL.
-    fn receive_special(&mut self, mut c: u8, looked_ahead: bool) {
+    /// mode erasing, VLNEXT, VREPRINT and the line ends. Remaining characters follow ordinary
+    /// queue limits. When echoed, a newline is shown as itself even with ECHOCTL.
+    fn receive_special(&mut self, mut c: u8, flow_handled: bool) {
         let t = self.termios;
-        if t.i(IXON) && self.flow_char(c, looked_ahead) {
+        if t.i(IXON) && self.flow_char(c, flow_handled) {
             return;
         }
         if t.l(ISIG) {
@@ -928,13 +936,13 @@ impl Tty {
 
     /// Recognizes a flow character under IXON. Lookahead acts on the raw byte once, and
     /// normal input processing consumes a matching special character when the slave makes room.
-    fn flow_char(&mut self, c: u8, looked_ahead: bool) -> bool {
+    fn flow_char(&mut self, c: u8, flow_handled: bool) -> bool {
         if self.termios.is(c, VSTART) {
-            if !looked_ahead {
+            if !flow_handled {
                 self.start();
             }
         } else if self.termios.is(c, VSTOP) {
-            if !looked_ahead {
+            if !flow_handled {
                 self.stop();
             }
         } else {
@@ -1880,6 +1888,13 @@ mod tests {
         assert_eq!(t.take_output(16), b"out");
     }
 
+    // A completed line fills the line discipline in both canonical and noncanonical mode.
+    const FULL_LINE: [u8; INPUT_MAX - 1] = {
+        let mut line = [b'x'; INPUT_MAX - 1];
+        line[INPUT_MAX - 2] = b'\n';
+        line
+    };
+
     #[test]
     fn flow_lookahead_stops_and_starts_before_the_slave_reads() {
         for canon in [0, ICANON] {
@@ -1888,9 +1903,8 @@ mod tests {
                 t.termios.lflag = t.termios.lflag & !(ICANON | ECHO) | canon;
                 t.termios.iflag |= any;
                 t.packet = true;
-                let mut full = [b'x'; INPUT_MAX - 1];
-                full[INPUT_MAX - 2] = b'\n';
-                t.write_input(&full);
+
+                t.write_input(&FULL_LINE);
                 t.write_input(b"\x13");
                 assert_eq!(t.take_pktstatus(), Some(pkt::STOP));
                 assert_eq!(t.write_output(b"blocked"), 0);
@@ -1904,8 +1918,8 @@ mod tests {
 
                 // Only the ordinary byte can restart output during the drain (IXANY).
                 let mut buf = [0; INPUT_MAX];
-                assert_eq!(t.read(&mut buf), Some(full.len()));
-                assert_eq!(&buf[..full.len()], &full);
+                assert_eq!(t.read(&mut buf), Some(FULL_LINE.len()));
+                assert_eq!(&buf[..FULL_LINE.len()], &FULL_LINE);
                 assert_eq!(t.take_pktstatus(), (any != 0).then_some(pkt::START));
                 assert_eq!(t.output_room() > 0, any != 0);
                 t.write_input(b"\n");
@@ -1919,15 +1933,14 @@ mod tests {
         let mut t = Tty::new(0);
         t.termios.lflag &= !ECHO;
         t.packet = true;
-        let mut full = [b'x'; INPUT_MAX - 1];
-        full[INPUT_MAX - 2] = b'\n';
-        t.write_input(&full);
+
+        t.write_input(&FULL_LINE);
         t.write_input(b"\x16\x13\n");
         assert_eq!(t.take_pktstatus(), Some(pkt::STOP));
         let mut buf = [0; INPUT_MAX];
         t.read(&mut buf);
         assert_eq!(read_all(&mut t), b"\x13\n");
-        t.write_input(&full);
+        t.write_input(&FULL_LINE);
         t.write_input(b"\x11\n");
         assert_eq!(t.take_pktstatus(), Some(pkt::START));
         let mut settings = t.termios;
@@ -1936,7 +1949,7 @@ mod tests {
         t.read(&mut buf);
         assert_eq!(read_all(&mut t), b"\x11\n");
 
-        t.write_input(&full);
+        t.write_input(&FULL_LINE);
         t.write_input(b"abc");
         t.discard_unprocessed();
         t.write_input(b"\x13");
@@ -1948,20 +1961,19 @@ mod tests {
         let mut t = Tty::new(0);
         t.termios.lflag &= !ECHO;
         t.packet = true;
-        let mut full = [b'x'; INPUT_MAX - 1];
-        full[INPUT_MAX - 2] = b'\n';
+
         // Disabled VSTOP/VSTART (0) must never match NUL bytes waiting in unprocessed.
         let mut settings = t.termios;
         settings.cc[VSTOP] = 0;
         settings.cc[VSTART] = 0;
         t.set_termios(settings);
         t.take_pktstatus();
-        t.write_input(&full);
+        t.write_input(&FULL_LINE);
         t.write_input(b"\x00\n");
         assert_eq!(t.take_pktstatus(), None);
         assert!(t.output_room() > 0);
         let mut buf = [0; INPUT_MAX];
-        assert_eq!(t.read(&mut buf), Some(full.len()));
+        assert_eq!(t.read(&mut buf), Some(FULL_LINE.len()));
         assert_eq!(read_all(&mut t), b"\x00\n");
 
         // Bytes queued while IXON is off must still trigger flow control if IXON turns on.
@@ -1969,7 +1981,7 @@ mod tests {
         t.termios.lflag &= !ECHO;
         t.termios.iflag &= !IXON;
         t.packet = true;
-        t.write_input(&full);
+        t.write_input(&FULL_LINE);
         t.write_input(b"\x13");
         assert!(t.output_room() > 0);
         let mut on = t.termios;
@@ -1977,7 +1989,7 @@ mod tests {
         t.set_termios(on);
         assert_eq!(t.output_room(), 0);
         assert_eq!(t.take_pktstatus(), Some(pkt::DOSTOP | pkt::STOP));
-        assert_eq!(t.read(&mut buf), Some(full.len()));
+        assert_eq!(t.read(&mut buf), Some(FULL_LINE.len()));
         assert_eq!(t.take_pktstatus(), None);
     }
 

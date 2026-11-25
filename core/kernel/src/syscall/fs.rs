@@ -751,8 +751,7 @@ fn open_tmpfile(
         Node::Overlay(_, o) => {
             let real = vfs.overlay().node(*o).real();
             let st = vfs.store().attrs(real)?;
-            reject_flags(st.flags, inode_flags::IMMUTABLE)?;
-            cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
+            may_add_name(cred, &st)?;
             return Err(Errno::EOPNOTSUPP);
         }
         Node::Fuse(_, d) => {
@@ -765,8 +764,7 @@ fn open_tmpfile(
         }
     };
     let dir_st = vfs.store().stat(d)?;
-    reject_flags(dir_st.flags, inode_flags::IMMUTABLE)?;
-    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+    may_add_name(cred, &dir_st)?;
     // tmpfs does not support O_DIRECT (do_dentry_open's direct_IO check).
     if flags & oflags::O_DIRECT != 0 && vfs.fs_of(dir) == Fs::Tmpfs {
         return Err(Errno::EINVAL);
@@ -2476,10 +2474,9 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     };
     let tgid = cx.tgid();
     let tid = cx.tid();
-    loop {
+    let result = loop {
         if cx.k().flocks.try_lock(key, &file, exclusive, tgid) {
-            cx.k().flocks.set_waiting(tid, None);
-            return Ok(0);
+            break Ok(0);
         }
         if op & LOCK_NB != 0 {
             return Err(Errno::EAGAIN);
@@ -2495,16 +2492,16 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
             }),
         );
         if cx.interrupted() {
-            cx.k().flocks.set_waiting(tid, None);
-            return Err(Errno::ERESTARTSYS);
+            break Err(Errno::ERESTARTSYS);
         }
         // The file holding the lock requests a wakeup when it unlocks, converts or closes
         // (OpenFile's destructor)
         if let Err(e) = cx.wait_on(None, &mut [], crate::kernel::wake::LOCK) {
-            cx.k().flocks.set_waiting(tid, None);
-            return Err(e);
+            break Err(e);
         }
-    }
+    };
+    cx.k().flocks.set_waiting(tid, None);
+    result
 }
 
 fn real_inode(vfs: &Vfs, node: &Node) -> Option<Ino> {
@@ -6237,11 +6234,12 @@ fn read_sparse_memfd(fd: i32, buf: &mut [u8], pos: u64, logical: u64) -> Result<
 }
 
 fn regular_size(vfs: &Vfs, ino: Ino, host: &std::fs::File) -> Result<u64, Errno> {
-    Ok(host
-        .metadata()
-        .map_err(host_errno)?
-        .len()
-        .max(vfs.memfd_size(ino).unwrap_or(0)))
+    let host_size = host.metadata().map_err(host_errno)?.len();
+    Ok(logical_size(vfs, ino, host_size))
+}
+
+fn logical_size(vfs: &Vfs, ino: Ino, host_size: u64) -> u64 {
+    host_size.max(vfs.memfd_size(ino).unwrap_or(0))
 }
 
 fn regular_fd(f: &OpenFile) -> Option<i32> {
@@ -6627,9 +6625,9 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
             return Ok(new as u64);
         }
         FileKind::Regular { ino, file, .. } => {
-            let host_size = file.metadata().map_err(host_errno)?.len() as i64;
+            let host_size = file.metadata().map_err(host_errno)?.len();
             let vfs = cx.vfs()?;
-            let size = host_size.max(vfs.memfd_size(*ino).unwrap_or(0) as i64);
+            let size = logical_size(&vfs, *ino, host_size) as i64;
             match whence {
                 SEEK_SET => 0,
                 SEEK_CUR => *pos as i64,
@@ -6637,20 +6635,15 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
                 SEEK_DATA | SEEK_HOLE if offset < 0 || offset >= size => {
                     return Err(Errno::ENXIO);
                 }
-                SEEK_DATA if offset >= host_size => return Err(Errno::ENXIO),
-                SEEK_HOLE if offset >= host_size => {
+                SEEK_DATA if offset as u64 >= host_size => return Err(Errno::ENXIO),
+                SEEK_HOLE if offset as u64 >= host_size => {
                     *pos = offset as u64;
                     return Ok(*pos);
                 }
                 SEEK_DATA | SEEK_HOLE => {
                     let fd = std::os::fd::AsRawFd::as_raw_fd(file);
-                    *pos = vfs.seek_data_or_hole(
-                        *ino,
-                        fd,
-                        offset as u64,
-                        host_size as u64,
-                        whence as i32,
-                    )?;
+                    *pos =
+                        vfs.seek_data_or_hole(*ino, fd, offset as u64, host_size, whence as i32)?;
                     return Ok(*pos);
                 }
                 _ => return Err(Errno::EINVAL),
@@ -7361,7 +7354,7 @@ fn node_stat(
     let stat = match node {
         Node::Store(_, ino) => {
             let mut st = vfs.store().stat(*ino)?;
-            st.size = st.size.max(vfs.memfd_size(*ino).unwrap_or(0));
+            st.size = logical_size(&vfs, *ino, st.size);
             vfs.tmpfs_stat_blocks(*ino, None, &mut st)?;
             *inode_flags = Some(st.flags);
             encode_stat(&st, vfs.dev_of(node))
@@ -7390,7 +7383,7 @@ fn node_stat(
             let exe = exe_file(cx, *proc)?;
             let (node, ino, host) = exe.backing(&vfs)?;
             let mut st = vfs.store().stat_open(ino, host)?;
-            st.size = st.size.max(vfs.memfd_size(ino).unwrap_or(0));
+            st.size = logical_size(&vfs, ino, st.size);
             vfs.tmpfs_stat_blocks(ino, Some(host), &mut st)?;
             if let Node::Overlay(_, o) = node {
                 st.ino = vfs.overlay().shown_ino(o);
@@ -7430,7 +7423,7 @@ fn file_stat_attrs(
         let vfs = cx.vfs()?;
         let dev = vfs.dev_of(&Node::Store(f.mnt, ino));
         let mut st = vfs.store().stat_open(ino, file)?;
-        st.size = st.size.max(vfs.memfd_size(ino).unwrap_or(0));
+        st.size = logical_size(&vfs, ino, st.size);
         vfs.tmpfs_stat_blocks(ino, Some(file), &mut st)?;
         // Through an overlay: the inode number stat shows for its node
         if let Some(o) = f.ovl {
@@ -8239,22 +8232,7 @@ pub(super) fn linkat(
     }
     // A deleted source can still have a row after its host object has gone.
     let st = vfs.store().attrs(src)?;
-    // fs.protected_hardlinks (Linux's may_linkat, after EXDEV and before the directory's
-    // permission): without being the owner or having CAP_FOWNER, only readable and writable
-    // regular files can be linked, and not setuid ones or executable setgid ones
-    if cx.kr().protected_hardlinks {
-        let setgid_exec = mode::S_ISGID | 0o010;
-        let safe = st.mode & mode::S_IFMT == mode::S_IFREG
-            && st.mode & mode::S_ISUID == 0
-            && st.mode & setgid_exec != setgid_exec
-            && cred.permission(&st, MAY_READ | MAY_WRITE).is_ok();
-        if !safe && !cred.owns(&st) {
-            return Err(Errno::EPERM);
-        }
-    }
-    reject_flags(dir_st.flags, inode_flags::IMMUTABLE)?;
-    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
-    reject_flags(st.flags, inode_flags::PROTECTED)?;
+    may_link(&cred, &dir_st, &st, cx.kr().protected_hardlinks)?;
     // The first link of a tmpfile moves its existing charge from the unlinked table.
     // Store::link checks whether a nameless inode can be linked before we change any charge.
     let tmpfs = backing_tmpfs_dev(&vfs, &Node::Store(mnt, dir));
@@ -8274,6 +8252,22 @@ pub(super) fn linkat(
     inotify::path_event(cx.kr(), src, None, inotify::IN_ATTRIB);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
+}
+
+fn may_link(cred: &Cred, dir: &Stat, src: &Stat, protected_hardlinks: bool) -> Result<(), Errno> {
+    // Linux checks protected_hardlinks after EXDEV and before directory write permission.
+    if protected_hardlinks {
+        let setgid_exec = mode::S_ISGID | 0o010;
+        let safe = src.kind() == mode::S_IFREG
+            && src.mode & mode::S_ISUID == 0
+            && src.mode & setgid_exec != setgid_exec
+            && cred.permission(src, MAY_READ | MAY_WRITE).is_ok();
+        if !safe && !cred.owns(src) {
+            return Err(Errno::EPERM);
+        }
+    }
+    may_add_name(cred, dir)?;
+    reject_flags(src.flags, inode_flags::PROTECTED)
 }
 
 /// linkat within an overlay (6.1's `ovl_link`, after `do_linkat`'s checks in the same order as
@@ -8305,19 +8299,7 @@ fn link_overlay(
         return Err(Errno::EXDEV);
     }
     let st = vfs.store().attrs(vfs.overlay().node(so).real())?;
-    if cx.kr().protected_hardlinks {
-        let setgid_exec = mode::S_ISGID | 0o010;
-        let safe = st.mode & mode::S_IFMT == mode::S_IFREG
-            && st.mode & mode::S_ISUID == 0
-            && st.mode & setgid_exec != setgid_exec
-            && cred.permission(&st, MAY_READ | MAY_WRITE).is_ok();
-        if !safe && !cred.owns(&st) {
-            return Err(Errno::EPERM);
-        }
-    }
-    reject_flags(dir_st.flags, inode_flags::IMMUTABLE)?;
-    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
-    reject_flags(st.flags, inode_flags::PROTECTED)?;
+    may_link(&cred, &dir_st, &st, cx.kr().protected_hardlinks)?;
     if st.is_dir() {
         return Err(Errno::EPERM);
     }
@@ -8570,8 +8552,7 @@ fn rename_overlay(
             Some((d, st))
         }
         _ => {
-            reject_flags(nd_st.flags, inode_flags::IMMUTABLE)?;
-            cred.permission(&nd_st, MAY_WRITE | MAY_EXEC)?;
+            may_add_name(&cred, &nd_st)?;
             None
         }
     };
@@ -8749,8 +8730,7 @@ fn may_rename(
             });
         }
     } else {
-        reject_flags(parent.flags, inode_flags::IMMUTABLE)?;
-        cred.permission(&parent, MAY_WRITE | MAY_EXEC)?;
+        may_add_name(cred, &parent)?;
     }
     if old_dir != new_dir {
         for st in [Some(src), dst.filter(|_| exchange)]
@@ -10235,6 +10215,11 @@ fn create_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
     }
 }
 
+fn may_add_name(cred: &Cred, dir: &Stat) -> Result<(), Errno> {
+    reject_flags(dir.flags, inode_flags::IMMUTABLE)?;
+    cred.permission(dir, MAY_WRITE | MAY_EXEC)
+}
+
 /// Checks before creating `name` in overlay directory `(mnt, o)`, before copying up any parent
 /// directories: directory search permission, `EEXIST` on the merged view, read-only mount
 /// (`EROFS`), and write permission (`EACCES`). Returns the directory's metadata.
@@ -10255,8 +10240,7 @@ fn may_create_overlay(
     if vfs.readonly(&dir) {
         return Err(Errno::EROFS);
     }
-    reject_flags(st.flags, inode_flags::IMMUTABLE)?;
-    cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
+    may_add_name(cred, &st)?;
     Ok(st)
 }
 
@@ -10277,8 +10261,7 @@ pub(super) fn may_create(
     name: &[u8],
 ) -> Result<Stat, Errno> {
     let st = may_create_name(vfs, cred, dir, name)?;
-    reject_flags(st.flags, inode_flags::IMMUTABLE)?;
-    cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
+    may_add_name(cred, &st)?;
     Ok(st)
 }
 

@@ -637,8 +637,6 @@ fn packet(
     cred: Ucred,
     sender: &Rc<SenderState>,
 ) -> Packet {
-    let truesize = packet_truesize(data.len());
-    sender.outq.set(sender.outq.get() + truesize);
     Packet {
         data: data.to_vec(),
         off: 0,
@@ -647,7 +645,7 @@ fn packet(
             .unwrap_or_default(),
         cred,
         from: Vec::new(),
-        outq: Some(sender.clone()),
+        outq: Some(sender.charge(packet_truesize(data.len()))),
     }
 }
 
@@ -1367,77 +1365,39 @@ mod tests {
     fn seqpacket_epipe_omits_sigpipe_while_stream_raises_it() {
         use crate::process::Signal;
 
-        let shared = Arc::new(Shared::new(Kernel::new(Tier::Interpreter)));
-        let _cpu = {
-            let mut k = shared.lock();
-            let group = Rc::new(RefCell::new(ThreadGroup::new(
-                10,
-                1,
-                Rc::new(RefCell::new(SigHandlers::default())),
-            )));
-            let mm = Mm::new().into_shared();
-            let fds = Rc::new(RefCell::new(FdTable::with_host_stdio()));
-            let fs = Rc::new(RefCell::new(FsContext {
-                root: Node::ROOT,
-                cwd: Node::ROOT,
-                umask: 0o022,
-                mnt_ns: Rc::new(MntNs {
-                    id: INIT_MNT_NS,
-                    owner: crate::cred::UserNs::init(),
-                    anon: false,
-                }),
-            }));
-            let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
-            let state = TaskState {
-                mm,
-                fds,
-                fs,
-                group: group.clone(),
-                vfs: None,
-                altstack: Default::default(),
-                clear_child_tid: 0,
-                vfork_done: None,
-                restart: None,
-                fast_sleep: None,
-                sem_undo: Rc::new(crate::ipc::SemUndo::new()),
-            };
-            let task = Task::new(10, 10, &cpu, state, k.init_ns.clone(), 0, [0; 16]).unwrap();
-            group.borrow_mut().threads.push(10);
-            k.groups.insert(10, group);
-            k.tasks.insert(10, task.clone());
+        let mut k = Kernel::new(Tier::Interpreter);
+        let (_, _, _cpu) = crate::pseudo::tests::add_task(&mut k, 10, 0, true, b"");
+        let shared = Arc::new(Shared::new(k));
+        let k = shared.lock();
+        let task = k.tasks[&10].clone();
+        let mut state = task.state.borrow_mut();
+        let mut cx = Cx::new(&shared, k, &task, &mut state);
 
-            let mut t = task.state.borrow_mut();
-            let mut cx = Cx::new(&shared, k, &task, &mut t);
-
-            // SOCK_SEQPACKET: EPIPE without SIGPIPE on peer close, peer SHUT_RD, and local SHUT_WR.
-            for mode in 0..3 {
-                let (sa, sb) = pair(&cx, SOCK_SEQPACKET, 0).unwrap();
-                let a = Rc::new(RefCell::new(sa));
-                let b = Rc::new(RefCell::new(sb));
-                match mode {
-                    0 => drop(b),
-                    1 => with(&b, |u| shutdown(u, 0).unwrap()),
-                    _ => with(&a, |u| shutdown(u, 1).unwrap()),
-                }
-                assert_eq!(
-                    send(&mut cx, &a, true, b"x", &[], &[], 0),
-                    Err(Errno::EPIPE)
-                );
-                assert_eq!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
-            }
-
-            // SOCK_STREAM: EPIPE raises SIGPIPE when MSG_NOSIGNAL is not set.
-            let (sa, sb) = pair(&cx, SOCK_STREAM, 0).unwrap();
+        // SOCK_SEQPACKET: EPIPE without SIGPIPE on peer close, peer SHUT_RD, and local SHUT_WR.
+        for mode in 0..3 {
+            let (sa, sb) = pair(&cx, SOCK_SEQPACKET, 0).unwrap();
             let a = Rc::new(RefCell::new(sa));
-            drop(sb);
+            let b = Rc::new(RefCell::new(sb));
+            match mode {
+                0 => drop(b),
+                1 => with(&b, |u| shutdown(u, 0).unwrap()),
+                _ => with(&a, |u| shutdown(u, 1).unwrap()),
+            }
             assert_eq!(
                 send(&mut cx, &a, true, b"x", &[], &[], 0),
                 Err(Errno::EPIPE)
             );
-            assert_ne!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
+            assert_eq!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
+        }
 
-            drop(cx);
-            cpu
-        };
+        // SOCK_STREAM: EPIPE raises SIGPIPE when MSG_NOSIGNAL is not set.
+        let (sa, sb) = pair(&cx, SOCK_STREAM, 0).unwrap();
+        let a = Rc::new(RefCell::new(sa));
+        drop(sb);
+        assert_eq!(
+            send(&mut cx, &a, true, b"x", &[], &[], 0),
+            Err(Errno::EPIPE)
+        );
+        assert_ne!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
     }
 }

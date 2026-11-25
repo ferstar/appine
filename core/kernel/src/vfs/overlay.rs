@@ -160,12 +160,16 @@ fn private_xattr(store: &Store, ino: Ino, name: &[u8]) -> Result<Option<Vec<u8>>
     }
 }
 
+fn has_marker(store: &Store, ino: Ino, name: &[u8]) -> Result<bool, Errno> {
+    Ok(private_xattr(store, ino, name)?.as_deref() == Some(b"y"))
+}
+
 impl Instance {
     fn origin(&self, store: &Store, upper: Ino, kind: u32) -> Result<Option<Ino>, Errno> {
         if let Some(&origin) = self.origins.get(&upper) {
             return Ok(Some(origin));
         }
-        let name = [self.options.private_prefix(), b"origin"].concat();
+        let name = self.options.private_name(b"origin");
         let Some(handle) = private_xattr(store, upper, &name)? else {
             return Ok(None);
         };
@@ -205,14 +209,9 @@ impl Instance {
         }
     }
 
-    fn impure(&self, store: &Store, dir: Ino) -> Result<bool, Errno> {
-        let name = [self.options.private_prefix(), b"impure"].concat();
-        Ok(private_xattr(store, dir, &name)?.as_deref() == Some(b"y"))
-    }
-
     fn mark_impure(&self, store: &Store, dir: Ino) -> Result<(), Errno> {
-        if !self.impure(store, dir)? {
-            let name = [self.options.private_prefix(), b"impure"].concat();
+        let name = self.options.private_name(b"impure");
+        if !has_marker(store, dir, &name)? {
             store.set_xattr(dir, &name, b"y", false, false)?;
         }
         Ok(())
@@ -424,6 +423,10 @@ impl Options {
         } else {
             b"trusted.overlay."
         }
+    }
+
+    fn private_name(&self, suffix: &[u8]) -> Vec<u8> {
+        [self.private_prefix(), suffix].concat()
     }
 }
 
@@ -754,11 +757,8 @@ impl Overlays {
         name: &[u8],
     ) -> Result<OvlId, Errno> {
         let d = self.node(dir);
-        let prefix = self.options_of(dir).private_prefix();
-        let opaque = |ino| {
-            private_xattr(store, ino, &[prefix, b"opaque"].concat())
-                .map(|value| value.as_deref() == Some(b"y"))
-        };
+        let options = self.options_of(dir);
+        let opaque = |ino| has_marker(store, ino, &options.private_name(b"opaque"));
         let mut upper = None;
         let mut origin = None;
         let mut stop = false;
@@ -839,7 +839,7 @@ impl Overlays {
         let d = self.node(dir);
         let instance = &self.instances[&d.dev];
         let impure = match d.upper {
-            Some(u) => instance.impure(store, u)?,
+            Some(u) => has_marker(store, u, &instance.options.private_name(b"impure"))?,
             None => false,
         };
         let layers = d.upper.iter().chain(&d.lower);
@@ -937,7 +937,7 @@ impl Overlays {
         let n = self.node(id);
         let lower = *n.lower.first().ok_or(Errno::EIO)?;
         let name = n.name.clone();
-        let prefix = self.options_of(id).private_prefix();
+        let options = self.options_of(id);
         let st = store.stat(lower)?;
         let record_origin = st.is_dir() || st.nlink == 1;
         let upper = store.transaction(|s| {
@@ -968,14 +968,14 @@ impl Overlays {
                 kind => s.mknod(dir, &name, kind | perm, st.rdev, st.uid, st.gid)?,
             };
             for x in s.list_xattr(lower)? {
-                if !x.starts_with(prefix) {
+                if !x.starts_with(options.private_prefix()) {
                     s.set_xattr(ino, &x, &s.get_xattr(lower, &x)?, false, false)?;
                 }
             }
             s.set_flags(ino, st.flags)?;
             if record_origin {
                 let handle = [ORIGIN_V1, &lower.to_le_bytes()].concat();
-                s.set_xattr(ino, &[prefix, b"origin"].concat(), &handle, false, false)?;
+                s.set_xattr(ino, &options.private_name(b"origin"), &handle, false, false)?;
                 self.instance_of(id).mark_impure(s, dir)?;
             }
             let at = super::store::FileTime::At;
@@ -1014,8 +1014,9 @@ impl Overlays {
     ) -> Result<(), Errno> {
         let n = self.node(id);
         let instance = &self.instances[&n.dev];
-        let name = [instance.options.private_prefix(), b"origin"].concat();
-        if n.origin.is_some() || private_xattr(store, n.real(), &name)?.is_some() {
+        if n.origin.is_some()
+            || private_xattr(store, n.real(), &instance.options.private_name(b"origin"))?.is_some()
+        {
             instance.mark_impure(store, dir)?;
         }
         Ok(())
@@ -1132,7 +1133,7 @@ impl Overlays {
         let old_lower = !exchange && self.lower_has(store, old, old_name)?;
         // A directory moving into a merged one would merge with what the lower layers have under
         // its new name
-        let opaque = [self.options_of(src).private_prefix(), b"opaque"].concat();
+        let opaque = self.options_of(src).private_name(b"opaque");
         let merged = |o: &Self, id: OvlId| !o.node(id).lower.is_empty();
         let src_opaque = src_dir && merged(self, new);
         let dst_opaque =

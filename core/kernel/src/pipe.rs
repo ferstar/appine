@@ -67,6 +67,12 @@ struct Slot {
     vm: Option<VmSource>,
 }
 
+impl Slot {
+    fn read_live(&self, out: &mut [u8]) -> bool {
+        self.vm.as_ref().is_some_and(|vm| vm.read(self.start, out))
+    }
+}
+
 /// A pipe.
 pub struct Pipe {
     /// Buffered data.
@@ -198,9 +204,7 @@ impl Pipe {
                 break;
             }
             let n = (slot.end - slot.start).min(total - pos);
-            if let Some(vm) = &slot.vm {
-                vm.read(slot.start, &mut out[pos..pos + n]);
-            }
+            slot.read_live(&mut out[pos..pos + n]);
             pos += n;
         }
         pos
@@ -254,11 +258,7 @@ impl Pipe {
                 mergeable: take && slot.mergeable && slot.start + n == slot.end,
                 vm: slot.vm.clone(),
             });
-            if slot
-                .vm
-                .as_ref()
-                .is_some_and(|vm| vm.read(slot.start, &mut page[..n]))
-            {
+            if slot.read_live(&mut page[..n]) {
                 dst.buf.extend(&page[..n]);
             } else {
                 dst.buf.extend(self.buf.range(done..done + n));
