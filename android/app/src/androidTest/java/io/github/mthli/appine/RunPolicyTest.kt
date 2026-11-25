@@ -1,5 +1,8 @@
 package io.github.mthli.appine
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
 import android.content.ContextWrapper
 import androidx.core.content.edit
@@ -8,6 +11,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -135,5 +139,49 @@ class RunPolicyTest {
         // If second is later closed and removed, its kill is not misdelivered back to first.
         tracker.close(close = {}, onClosed = { closedField.setLong(secondPty, it) })
         assertNull(TerminalService.sessionForKill(listOf(first), 0, secondEpoch))
+    }
+
+    @Test
+    fun listenNotificationKeysDistinguishHostPortRemappings() {
+        val first = Notifications.listenKey(22, 10022)
+        val second = Notifications.listenKey(22, 20022)
+        val direct = Notifications.listenKey(22, 22)
+        val swapped = Notifications.listenKey(10022, 10022)
+
+        assertNotEquals(first, second)
+        assertNotEquals(first, direct)
+        assertNotEquals(first, swapped)
+        assertEquals(first, Notifications.listenKey(22, 10022))
+        // Listen IDs stay disjoint from ongoing (1), fixed reports (2..4), kills (100000+) and tabs (200000+).
+        for (port in listOf(0, 22, 80, 10022, 65535)) {
+            val (_, id) = Notifications.listenKey(port, port)
+            assertTrue("listen ID $id out of expected range", id in 1000..66535)
+        }
+
+        val target = InstrumentationRegistry.getInstrumentation().targetContext
+        val manager = target.getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel("network", "Network", NotificationManager.IMPORTANCE_DEFAULT),
+        )
+        fun post(key: Pair<String, Int>, text: String) {
+            val n = Notification.Builder(target, "network")
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("sshd")
+                .setContentText(text)
+                .build()
+            manager.notify(key.first, key.second, n)
+        }
+        try {
+            post(first, "port 10022")
+            post(second, "port 20022")
+            if (manager.areNotificationsEnabled()) {
+                val active = manager.activeNotifications.map { it.tag to it.id }.toSet()
+                assertTrue("Expected first listen notification $first in $active", first in active)
+                assertTrue("Expected second listen notification $second in $active", second in active)
+            }
+        } finally {
+            manager.cancel(first.first, first.second)
+            manager.cancel(second.first, second.second)
+        }
     }
 }

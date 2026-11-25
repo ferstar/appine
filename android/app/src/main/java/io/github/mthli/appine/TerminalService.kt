@@ -321,6 +321,7 @@ class TerminalService : Service() {
             if (m == 0L) return
             val tracker = consoleTracker
             val rules = loginRules
+            val roots = autoRoots
             Native.bklStall(m)?.let { notifications.stall(m, it) }
             runCatching {
                 worker.execute {
@@ -328,9 +329,11 @@ class TerminalService : Service() {
                     val (kills, killsEpoch) = tracker?.take() ?: (Native.takeKills(m) to 0L)
                     val power = Native.takePower(m)
                     val processes = Native.processes(m)
-                    Native.takeChangedDirs(m)?.let {
+                    val changedDirs = Native.takeChangedDirs(m)
+                    changedDirs?.let {
                         Documents.dirsChanged(this@TerminalService, it)
                     }
+                    roots?.poll(this@TerminalService, changedDirs)
                     rules?.poll(this@TerminalService)
                     val cpu = Native.guestCpuTime(m)
                     val sampledAt = SystemClock.elapsedRealtime()
@@ -363,6 +366,7 @@ class TerminalService : Service() {
     /** Console-lifetime epoch tracker for the current kernel's kill reports. */
     private var consoleTracker: ConsoleTracker? = null
     private var loginRules: Rootfs.LoginRules? = null
+    private var autoRoots: Documents.AutoRootsWatcher? = null
 
     /**
      * [onDestroy] has run: a thread that outlives the service (a download) must not
@@ -774,6 +778,7 @@ class TerminalService : Service() {
             },
         )
         loginRules = Rootfs.LoginRules(m)
+        autoRoots = Documents.AutoRootsWatcher(m)
         machine = m
         gpuAvailable = kernel.gpuAvailable
         booting = true
@@ -1460,6 +1465,7 @@ class TerminalService : Service() {
         releaseSessions()
         consoleTracker = null
         loginRules = null
+        autoRoots = null
         sessionsChanged()
         return m
     }
@@ -1501,6 +1507,7 @@ class TerminalService : Service() {
         releaseSessions()
         consoleTracker = null
         loginRules = null
+        autoRoots = null
         // Stopped without going through exitAll: shut down anyway, best effort. It has to wait for
         // guest threads to exit, so not on the main thread
         if (m != 0L) worker.execute { Native.shutdown(m) }

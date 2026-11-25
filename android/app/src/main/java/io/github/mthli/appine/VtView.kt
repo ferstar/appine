@@ -83,8 +83,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         /** The grid's size, first known or changed. */
         fun onGrid(cols: Int, rows: Int, cellWidth: Int, cellHeight: Int)
 
-        /** Bytes for the program: keys, text, pastes, mouse and focus events. */
+        /** Bytes for the program: keys, text, pastes and mouse events. */
         fun onInput(data: ByteArray)
+
+        /**
+         * Focus bytes (mode 1004) for a specific [session], so tab switches deliver focus-out to
+         * the outgoing session and focus-in to the incoming session. Defaults to [onInput].
+         */
+        fun onFocus(session: VtSession, data: ByteArray) = onInput(data)
 
         /** Pinch zoom changed the font size (pixels), to keep for next time. */
         fun onZoom(fontPx: Int)
@@ -110,6 +116,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The tab shown, null for none. */
     var session: VtSession? = null
         private set
+
+    /**
+     * Whether this view's window currently has focus, or null before the first
+     * [onWindowFocusChanged] callback (or after detach), and the session that currently holds
+     * terminal focus (mode 1004) in this view.
+     */
+    private var windowFocused: Boolean? = null
+    private var focusedSession: VtSession? = null
 
     private var pasteQuestion: AlertDialog? = null
 
@@ -403,12 +417,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      * again, and a selection drag, menu, fling or search of the previous tab ends.
      */
     fun attach(s: VtSession?) {
-        if (s === session) return
+        val previous = session
+        if (s === previous) return
+        if (windowFocused == true && previous != null) clearSessionFocus(previous)
         pasteQuestion?.dismiss()
         pasteQuestion = null
         clearResizePreview()
         endSearch()
-        session?.let { if (it.view === this) it.view = null }
+        previous?.let { if (it.view === this) it.view = null }
         menu?.finish()
         if (drag == DRAG_WORD || drag == DRAG_TAPS || drag == DRAG_PRESS || drag == DRAG_POINTER) {
             VtNative.gestureEnd(tab)
@@ -421,7 +437,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val hadIme = imePassword || preedit.isNotEmpty()
         imePassword = false
         setPreedit("")
-        if (session != null || hadIme) restartInput()
+        if (previous != null || hadIme) restartInput()
         hoverCell = -1
         hoverLink = false
         scroller.forceFinished(true)
@@ -431,6 +447,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         scrollOffset = 0
         scrollLen = 0
         dropImages()
+        val hadTerminal = s != null && s.tab != 0L
         session = s
         hasFrame = false
         s?.view = this
@@ -438,6 +455,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             s.resize(cols, rows, cellWidth, cellHeight)
             // A tab whose shell has not started yet starts on this grid
             host.onGrid(cols, rows, cellWidth, cellHeight)
+        }
+        if (windowFocused == true && s != null) {
+            focusedSession = s
+            if (hadTerminal) sendFocus(s, true)
+        } else {
+            focusedSession = null
         }
         updateBlink()
         full = true
@@ -837,8 +860,33 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     // ---- Focus and visibility ----
 
+    private fun sendFocus(target: VtSession, gained: Boolean) {
+        val t = target.tab
+        if (t == 0L) return
+        VtNative.focus(t, gained)?.takeIf { it.isNotEmpty() }?.let { host.onFocus(target, it) }
+    }
+
+    private fun clearSessionFocus(fallback: VtSession? = session) {
+        val target = focusedSession ?: fallback
+        focusedSession = null
+        if (target != null) sendFocus(target, false)
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (windowFocused == null && hasWindowFocus()) {
+            windowFocused = true
+            session?.let {
+                focusedSession = it
+                sendFocus(it, true)
+            }
+        }
+    }
+
     override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
         super.onWindowFocusChanged(hasWindowFocus)
+        val changed = windowFocused != hasWindowFocus
+        windowFocused = hasWindowFocus
         // A fling not drawn to its end would jump there when the window draws again; a viewport it
         // leaves between rows comes to rest on the nearest (a short scroll that may end unseen)
         if (!hasWindowFocus) {
@@ -848,8 +896,16 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         // Focus events (mode 1004): editors reload changed files when they regain focus. Sent
         // directly so losing or regaining focus does not cancel settle() or jump a scrolled-back
         // viewport to the bottom.
-        if (tab != 0L) {
-            VtNative.focus(tab, hasWindowFocus)?.takeIf { it.isNotEmpty() }?.let(host::onInput)
+        val current = session
+        if (changed) {
+            if (hasWindowFocus) {
+                if (current != null && focusedSession !== current) {
+                    focusedSession = current
+                    sendFocus(current, true)
+                }
+            } else {
+                clearSessionFocus(current)
+            }
         }
         updateBlink()
         invalidate()
@@ -862,6 +918,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        if (windowFocused == true) clearSessionFocus() else focusedSession = null
+        windowFocused = null
         clearResizePreview()
         // Still counted as attached during this call
         blinkRunning = false

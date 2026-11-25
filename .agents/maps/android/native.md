@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: sample login rule input metadata on the running machine)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: delete JNI local refs in `string_array` and reuse it in `takeListens`/`takeKills`)
 
 ## Responsibilities
 
@@ -165,9 +165,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 
 ## Confirmed bugs / technical debt
 
-- Local references are never deleted in lib.rs's loops that build arrays (`string_array`,
-  `takeListens`, `takeKills`; harmless with ART's large table on every supported
-  version); a failed string conversion with no pending exception makes void calls return silently
+- A failed string conversion with no pending exception makes void calls return silently
   (unreachable from the non-null Kotlin signatures).
 
 ## Open questions
@@ -180,4 +178,3 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 ## To verify
 
 - The static browser launcher on Debian and a 16 KB-page device; current bridge tests use Alpine on API 34.
-- ART's local-reference limit on API 30 and later.

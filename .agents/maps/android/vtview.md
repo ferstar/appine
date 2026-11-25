@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 9 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: unsafe paste confirmation lifetime and checks on both actions)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: deliver mode 1004 focus-out / focus-in when switching tabs while window-focused)
 
 ## Responsibilities
 
@@ -37,7 +37,8 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
   `matchMarkHeight`) and `stepFrom`; timers (`blinkTick`, `passwordCheck`, `animationTick`,
   `imePassword`, `lastBell`); the IME connection (`Connection`, `preedit`, `monitorCursor`); plus
   the gesture/selection/scrolling state owned by `android/vtgestures`.
-- `VtView.Host` — the activity's callback interface: `onGrid`, `onInput`, `onZoom`, extra-key
+- `VtView.Host` — the activity's callback interface: `onGrid`, `onInput`, `onFocus` (delivers mode
+  1004 focus bytes to a specific `VtSession`, defaulting to `onInput`), `onZoom`, extra-key
   modifiers (`ctrl`, `alt`, `shift`, `modifiersUsed`), `onLink` (invoked by `android/vtgestures`)
   and `onSearchCount`.
 - `VtKeys` — stateless mapper from Android `KeyEvent.KEYCODE_*` to libghostty-vt `GhosttyKey`
@@ -195,13 +196,19 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
   choosing it re-calls `paste(trimmed)` to recheck the terminal modes. Both actions require the
   original dialog, the requesting session, a live terminal and an unlocked page. Changing or
   detaching the session dismisses the dialog and invalidates queued clicks.
-- Focus: `onWindowFocusChanged` finishes flings and calls `settle()` if `scrollPx != 0` on focus
-  loss, sends non-empty `VtNative.focus(tab, hasWindowFocus)` bytes (encoded via
-  `ghostty_focus_encode` into a 16-byte buffer only when mode 1004 is enabled, queried directly by
-  `appine_vt_focus` via `mode_on`, while `FLAG_FOCUS_EVENTS` in the frame header goes unread by
-  `VtFrame`) directly to `host.onInput` without calling `send(...)` (preserving `settle()` and
-  scrolled-back viewports), updates cursor blinking and invalidates. Switching tabs (`attach`) sends
-  no focus events. `onFocusChanged` only updates blink.
+- Focus: `VtView` tracks window focus (`windowFocused: Boolean?`) and the session holding terminal
+  focus (`focusedSession`), delivering non-empty `VtNative.focus(session.tab, gained)` bytes
+  (encoded via `ghostty_focus_encode` into a 16-byte buffer only when mode 1004 is enabled, queried
+  directly by `appine_vt_focus` via `mode_on`, while `FLAG_FOCUS_EVENTS` in the frame header goes
+  unread by `VtFrame`) through `host.onFocus(session, bytes)` (checked against `Privacy.locked` in
+  `MainActivity.Host` and written directly to `session.write` without calling `send(...)`,
+  preserving `settle()` and scrolled-back viewports). `onWindowFocusChanged` finishes flings and
+  calls `settle()` if `scrollPx != 0` on focus loss, deduplicates repeated states, updates cursor
+  blinking and invalidates. Switching tabs (`attach`) while `windowFocused == true` sends focus-out
+  to the outgoing session and focus-in to an already-started incoming session; tab switches while
+  unfocused, repeated attaches, and detaches after focus loss emit no duplicate or spurious events.
+  `onAttachedToWindow` syncs an already-focused window; `onDetachedFromWindow` clears focus state
+  (sending focus-out if still focused). `onFocusChanged` only updates blink.
 
 ### Search and prompt jumps
 
@@ -293,8 +300,10 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
 - `appine_vt_paste` relies on `vt->replies` being empty before `ghostty_terminal_paste` because
   `vt.rs` drains the whole buffer (maintained by `feed`, `resize` and `promptClick` draining before
   unlocking).
-- When mode 1004 is active, `onWindowFocusChanged` sends focus bytes directly to `host.onInput`
-  rather than `send(...)`, preserving `settle()` and any scrolled-back viewport position.
+- When mode 1004 is active, focus events (`onWindowFocusChanged`, `attach`, `onAttachedToWindow`,
+  `onDetachedFromWindow`) go directly to `host.onFocus(session, bytes)` rather than `send(...)`,
+  preserving `settle()` and any scrolled-back viewport position and targeting each session even
+  after `MainActivity.show` updates `current`.
 - With IME shown, a hardware Esc press is consumed by the IME (e.g. Gboard hides itself), so a
   Kitty-protocol program receives only the `ACTION_UP` release.
 - Scroll bar metrics (`computeVerticalScroll*`) return pixels with `scrollPx` added to offset so
@@ -320,7 +329,7 @@ None.
 
 ## Open questions
 
-- Should showing another tab send focus-out and focus-in (mode 1004) to the two tabs?
+None.
 
 ## To verify
 

@@ -49,7 +49,12 @@ class TerminalInputTest {
 
     private class Host : VtView.Host {
         val bytes = ByteArrayOutputStream()
+        val focusEvents = mutableListOf<Pair<Int, String>>()
         override fun onInput(data: ByteArray) { bytes.write(data) }
+        override fun onFocus(session: VtSession, data: ByteArray) {
+            focusEvents.add(session.id to String(data, Charsets.UTF_8))
+            onInput(data)
+        }
         override fun onGrid(cols: Int, rows: Int, cellWidth: Int, cellHeight: Int) {}
         override fun onZoom(fontPx: Int) {}
         override val ctrl = false
@@ -450,6 +455,80 @@ class TerminalInputTest {
                 } finally {
                     bitmap.recycle()
                 }
+            }
+        }
+    }
+
+    @Test
+    fun switchingTabsSendsMode1004FocusOutAndFocusInWithoutDuplicates() {
+        withFixture { f ->
+            val console2 = Native.openConsole(f.machine, 24, 80)
+            val tab2 = VtNative.create(f.machine, console2, 80, 24, 8, 16)
+            val console3 = Native.openConsole(f.machine, 24, 80)
+            val tab3 = VtNative.create(f.machine, console3, 80, 24, 8, 16)
+            try {
+                val session2 = VtSession(2, ConsolePty(f.machine, "", "root"), f.machine, fakeEvents())
+                field(VtSession::class.java, "tab").setLong(session2, tab2)
+                val session3 = VtSession(3, ConsolePty(f.machine, "", "root"), f.machine, fakeEvents())
+                field(VtSession::class.java, "tab").setLong(session3, tab3)
+                onMain {
+                    VtNative.print(f.tab, "\u001b[?1004h".toByteArray())
+                    VtNative.print(tab2, "\u001b[?1004h".toByteArray())
+                    // Initial attach before window focus must not emit spurious focus events.
+                    assertEquals(emptyList<Pair<Int, String>>(), f.host.focusEvents)
+
+                    // Window gains focus once; repeated focus-in and re-attaching the same session are ignored.
+                    f.view.onWindowFocusChanged(true)
+                    f.view.onWindowFocusChanged(true)
+                    f.view.attach(f.session)
+                    assertEquals(listOf(1 to "\u001b[I"), f.host.focusEvents)
+
+                    // Switching tabs while focused delivers focus-out to old session and focus-in to new session.
+                    f.host.focusEvents.clear()
+                    f.view.attach(session2)
+                    assertEquals(listOf(1 to "\u001b[O", 2 to "\u001b[I"), f.host.focusEvents)
+
+                    // Switching to a tab without mode 1004 sends focus-out to old tab and nothing to new tab.
+                    f.host.focusEvents.clear()
+                    f.view.attach(session3)
+                    assertEquals(listOf(2 to "\u001b[O"), f.host.focusEvents)
+
+                    // Switching back to a mode-1004 tab sends only focus-in to the incoming tab.
+                    f.host.focusEvents.clear()
+                    f.view.attach(f.session)
+                    assertEquals(listOf(1 to "\u001b[I"), f.host.focusEvents)
+
+                    // Backgrounding sends focus-out once; switching tabs while backgrounded emits nothing.
+                    f.host.focusEvents.clear()
+                    f.view.onWindowFocusChanged(false)
+                    f.view.onWindowFocusChanged(false)
+                    f.view.attach(session2)
+                    assertEquals(listOf(1 to "\u001b[O"), f.host.focusEvents)
+
+                    // Returning to foreground sends focus-in to the newly attached tab.
+                    f.host.focusEvents.clear()
+                    f.view.onWindowFocusChanged(true)
+                    assertEquals(listOf(2 to "\u001b[I"), f.host.focusEvents)
+
+                    // Losing focus then detaching (e.g. Activity.onDestroy) must not send duplicate focus-out.
+                    f.host.focusEvents.clear()
+                    f.view.onWindowFocusChanged(false)
+                    f.view.attach(null)
+                    assertEquals(listOf(2 to "\u001b[O"), f.host.focusEvents)
+
+                    // Reattaching after window focus was already gained delivers a single focus-in.
+                    f.host.focusEvents.clear()
+                    f.view.onWindowFocusChanged(true)
+                    assertEquals(emptyList<Pair<Int, String>>(), f.host.focusEvents)
+                    f.view.attach(f.session)
+                    assertEquals(listOf(1 to "\u001b[I"), f.host.focusEvents)
+                }
+            } finally {
+                onMain { f.view.attach(null) }
+                VtNative.destroy(tab2)
+                Native.closeConsole(f.machine, console2)
+                VtNative.destroy(tab3)
+                Native.closeConsole(f.machine, console3)
             }
         }
     }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: capability handling when opening documents for writing)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: refresh roots via `AutoRootsWatcher` when `login` is `"auto"` and `/etc/passwd` changes the resolved home)
 
 ## Responsibilities
 
@@ -42,6 +42,10 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   `cacheGeneration: AtomicLong`.
 - `Documents.Home(account, uid, gid, path)` — resolved login account and non-`/` canonical home
   document ID, cached 5 s per `(cacheGeneration, Settings.login)` value (`HomeCache`).
+- `Documents.AutoRootsWatcher(machine)` — per-kernel watcher polled on `TerminalService`'s worker
+  that samples `/etc/passwd` metadata via `Native.loginRuleInputs` (elements 4..7) and checks the
+  auto account's home parent in `changedDirs`, calling `rootsChanged` only when `fileAccess` is on,
+  `login` is `"auto"`, and the resolved `Home` actually changes.
 - `Documents.FileLink` — sealed interface returned by `fileLink`: `Found(uri, mime)`,
   `Remote(host)`, `Hidden`, `Missing`.
 
@@ -168,8 +172,11 @@ numbering and ownership (`kernel/store`); the 2 s poll that delivers guest direc
   `moveDocument` call `childrenChanged` on affected parent directory URI(s).
 - **Kernel/lifecycle -> Files app**: `TerminalService`'s 2 s poll drains `Native.takeChangedDirs`
   (lazy recording, capped at 256 dirs per window) and passes encoded IDs to `Documents.dirsChanged`,
-  which issues one batched `contentResolver.notifyChange(uris, null, 0)` call. `rootsChanged` is
-  called on kernel start, login change, file-access toggle and privacy-mode toggle.
+  which issues one batched `contentResolver.notifyChange(uris, null, 0)` call, and polls
+  `Documents.AutoRootsWatcher` to call `rootsChanged` when `login` is `"auto"`, `fileAccess` is on,
+  and `/etc/passwd` (or the auto account's home parent directory) changes the resolved `Home`.
+  `rootsChanged` is also called on kernel start, login change, file-access toggle and privacy-mode
+  toggle.
 
 ## Dependencies (inbound / outbound)
 
@@ -215,7 +222,7 @@ None recorded.
 
 ## Open questions
 
-- Should `/etc/passwd` changes (such as `adduser` while `login` is `"auto"`) refresh the roots?
+None.
 
 ## To verify
 

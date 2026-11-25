@@ -784,6 +784,11 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
             }
         }
 
+        override fun onFocus(session: VtSession, data: ByteArray) {
+            if (Privacy.locked(this@MainActivity)) return
+            if (session.isRunning) session.write(data)
+        }
+
         override fun onZoom(fontPx: Int) {
             getPreferences(MODE_PRIVATE).edit { putFloat(PREF_FONT_SIZE, fontPx / resources.displayMetrics.density) }
         }

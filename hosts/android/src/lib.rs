@@ -1130,24 +1130,13 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeListens<'l>(
     handle: jlong,
 ) -> jobjectArray {
     guarded!("Native.takeListens", std::ptr::null_mut(), {
-        let events = machine(handle)
+        let lines: Vec<String> = machine(handle)
             .map(|m| m.take_listens())
-            .unwrap_or_default();
-        let Ok(array) =
-            env.new_object_array(events.len() as jint, "java/lang/String", JObject::null())
-        else {
-            return std::ptr::null_mut();
-        };
-        for (i, e) in events.iter().enumerate() {
-            let line = format!("{}\t{}\t{}", e.comm, e.port, e.host_port);
-            let Ok(s) = env.new_string(line) else {
-                return std::ptr::null_mut();
-            };
-            if env.set_object_array_element(&array, i as jint, s).is_err() {
-                return std::ptr::null_mut();
-            }
-        }
-        array.into_raw()
+            .unwrap_or_default()
+            .iter()
+            .map(|e| format!("{}\t{}\t{}", e.comm, e.port, e.host_port))
+            .collect();
+        string_array(&mut env, &lines)
     })
 }
 
@@ -1164,44 +1153,37 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     handle: jlong,
 ) -> jobjectArray {
     guarded!("Native.takeKills", std::ptr::null_mut(), {
-        let kills = machine(handle).map(|m| m.take_kills()).unwrap_or_default();
-        let Ok(array) =
-            env.new_object_array(kills.len() as jint, "java/lang/String", JObject::null())
-        else {
-            return std::ptr::null_mut();
-        };
         let clean = |s: &str| s.replace(['\t', '\n', '\r', '\u{1e}'], " ");
-        for (i, k) in kills.iter().enumerate() {
-            let console = k.console.map_or(-1, i64::from);
-            let tail = match &k.reason {
-                appine_kernel::KillReason::Bug { report, log, stubs } => {
-                    let join = |lines: &[String]| {
-                        lines
-                            .iter()
-                            .map(|l| clean(l))
-                            .collect::<Vec<_>>()
-                            .join("\u{1e}")
-                    };
-                    format!("bug\t{}\t{}\t{}", clean(report), join(log), join(stubs))
-                }
-                appine_kernel::KillReason::OutOfMemory {
-                    cgroup,
-                    used,
-                    limit,
-                } => format!(
-                    "oom\t{}\t{used}\t{limit}",
-                    clean(cgroup.as_deref().unwrap_or(""))
-                ),
-            };
-            let line = format!("{console}\t{}\t{}\t{tail}", k.pid, clean(&k.comm));
-            let Ok(s) = env.new_string(line) else {
-                return std::ptr::null_mut();
-            };
-            if env.set_object_array_element(&array, i as jint, s).is_err() {
-                return std::ptr::null_mut();
-            }
-        }
-        array.into_raw()
+        let lines: Vec<String> = machine(handle)
+            .map(|m| m.take_kills())
+            .unwrap_or_default()
+            .iter()
+            .map(|k| {
+                let console = k.console.map_or(-1, i64::from);
+                let tail = match &k.reason {
+                    appine_kernel::KillReason::Bug { report, log, stubs } => {
+                        let join = |lines: &[String]| {
+                            lines
+                                .iter()
+                                .map(|l| clean(l))
+                                .collect::<Vec<_>>()
+                                .join("\u{1e}")
+                        };
+                        format!("bug\t{}\t{}\t{}", clean(report), join(log), join(stubs))
+                    }
+                    appine_kernel::KillReason::OutOfMemory {
+                        cgroup,
+                        used,
+                        limit,
+                    } => format!(
+                        "oom\t{}\t{used}\t{limit}",
+                        clean(cgroup.as_deref().unwrap_or(""))
+                    ),
+                };
+                format!("{console}\t{}\t{}\t{tail}", k.pid, clean(&k.comm))
+            })
+            .collect();
+        string_array(&mut env, &lines)
     })
 }
 
@@ -1271,7 +1253,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_guestCpuTime<'l>(
 }
 
 /// Identity, size and nanosecond change times of the login rule inputs, excluding access times
-/// (reading the inputs to refresh the rules must not trigger another refresh).
+/// (reading the inputs to refresh the rules must not trigger another refresh). Entry 1
+/// (`/etc/passwd`, elements 4..8) is also read by `Documents.AutoRootsWatcher` to refresh Files
+/// roots when `login` is `"auto"`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_loginRuleInputs<'l>(
     env: JNIEnv<'l>,
@@ -1410,7 +1394,9 @@ fn string_array(env: &mut JNIEnv<'_>, items: &[String]) -> jobjectArray {
         let Ok(s) = env.new_string(item) else {
             return std::ptr::null_mut();
         };
-        if env.set_object_array_element(&array, i as jint, s).is_err() {
+        let set = env.set_object_array_element(&array, i as jint, &s);
+        let _ = env.delete_local_ref(s);
+        if set.is_err() {
             return std::ptr::null_mut();
         }
     }

@@ -124,15 +124,7 @@ class Documents : DocumentsProvider() {
                 return entry.home
             }
         }
-        val home = Rootfs.access.read {
-            val account = Rootfs.loginAccount(context, login)
-            val path = documentId(account.home)?.takeIf { it != "/" } ?: return@read null
-            // No root is listed when the home directory does not exist or is not a directory
-            val meta = runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull()
-                ?: return@read null
-            if (!meta.startsWith("d\t")) return@read null
-            Home(account.name, account.uid, account.gid, path)
-        }
+        val home = resolveHome(context, login).first
         if (cacheGeneration.get() == generation) {
             cache = HomeCache(generation, SystemClock.elapsedRealtime(), login, home)
         }
@@ -412,11 +404,70 @@ class Documents : DocumentsProvider() {
         grantedUnder(held.map { it.uri }, authority(context), path).forEach(::revokeDocumentPermission)
     }
 
+    /**
+     * Watches `/etc/passwd` (via [Native.loginRuleInputs]) and the auto account's home parent
+     * directory on a running kernel so the Files app refreshes its roots when `login` is `"auto"`
+     * and the resolved home root actually changes (e.g. `adduser` or `deluser`), without
+     * notifying on unrelated `/etc/passwd` edits or when file access is off.
+     */
+    internal class AutoRootsWatcher(private val machine: Long) {
+        private var passwdStamp: LongArray? = null
+        private var lastHome: Home? = null
+        private var homeParent: String? = null
+
+        /**
+         * Samples `/etc/passwd` metadata and [changedDirs] on the service worker. Returns true
+         * when [rootsChanged] was triggered.
+         */
+        fun poll(context: Context, changedDirs: Array<String>? = null): Boolean {
+            if (!Settings.fileAccess(context) || Settings.login(context) != ConsolePty.LOGIN_AUTO || !Rootfs.isReady(context)) {
+                reset()
+                return false
+            }
+            val inputs = Native.loginRuleInputs(machine) ?: return false
+            if (inputs.size < PASSWD_STAMP_END) return false
+            val stamp = inputs.copyOfRange(PASSWD_STAMP_START, PASSWD_STAMP_END)
+            val previous = passwdStamp
+            if (previous != null) {
+                val passwdChanged = !stamp.contentEquals(previous)
+                val parentChanged = homeParent != null && changedDirs != null && homeParent in changedDirs
+                if (!passwdChanged && !parentChanged) return false
+            }
+            passwdStamp = stamp
+            val (home, path) = resolveHome(context, ConsolePty.LOGIN_AUTO)
+            homeParent = path?.let(::parent)
+            val changed = previous != null && home != lastHome
+            lastHome = home
+            if (changed) rootsChanged(context)
+            return changed
+        }
+
+        private fun reset() {
+            passwdStamp = null
+            lastHome = null
+            homeParent = null
+        }
+    }
+
     companion object {
         const val ROOT_HOME = "home"
         const val ROOT_SYSTEM = "system"
 
         private const val TAG = "Documents"
+
+        // Entry 1 of Native.loginRuleInputs is `/etc/passwd` (ino, size, mtime_ns, ctime_ns).
+        private const val PASSWD_STAMP_START = 4
+        private const val PASSWD_STAMP_END = 8
+
+        private fun resolveHome(context: Context, login: String): Pair<Home?, String?> = Rootfs.access.read {
+            val account = Rootfs.loginAccount(context, login)
+            val path = documentId(account.home)?.takeIf { it != "/" } ?: return@read null to null
+            // No root is listed when the home directory does not exist or is not a directory
+            val meta = runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull()
+                ?: return@read null to path
+            if (!meta.startsWith("d\t")) return@read null to path
+            Home(account.name, account.uid, account.gid, path) to path
+        }
 
         private fun currentIds(context: Context, paths: List<String>, store: String = Rootfs.store(context).path): List<String> {
             if (paths.isEmpty()) return emptyList()

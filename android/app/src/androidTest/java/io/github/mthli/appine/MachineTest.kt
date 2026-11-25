@@ -1,5 +1,7 @@
 package io.github.mthli.appine
 
+import android.content.Context
+import android.database.ContentObserver
 import android.net.ConnectivityManager
 import android.provider.DocumentsContract
 import android.system.Os
@@ -27,6 +29,9 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
@@ -1844,6 +1849,121 @@ class MachineTest {
         } finally {
             prefs.edit().remove("login").remove("file_access").commit()
             sh(machine, "deluser --remove-home bob")
+        }
+    }
+
+    /**
+     * When `login` is `"auto"` and file access is enabled, `/etc/passwd` changes that change the
+     * resolved home root (e.g. `adduser` / `deluser`) invalidate the cached home and notify
+     * observers on the roots URI, while unrelated `/etc/passwd` edits (system users, second user,
+     * non-auto login, disabled file access) cause no churn.
+     */
+    @Test
+    fun documentsRefreshRootsWhenAutoLoginPasswdChanges() {
+        val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val machine = start(1)
+        val cleanup = "deluser --remove-home autoalice 2>/dev/null; deluser --remove-home autobob 2>/dev/null; " +
+            "deluser autocara 2>/dev/null; deluser syswatch 2>/dev/null; rm -rf /home/autocara"
+        sh(machine, cleanup)
+        val resolver = context.contentResolver
+        val authority = Documents.authority(context)
+        val rootsUri = DocumentsContract.buildRootsUri(authority)
+        fun homeDocId(): String? = resolver.query(rootsUri, null, null, null)?.use { c ->
+            val rootCol = c.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_ROOT_ID)
+            val docCol = c.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_DOCUMENT_ID)
+            while (c.moveToNext()) {
+                if (c.getString(rootCol) == Documents.ROOT_HOME) return@use c.getString(docCol)
+            }
+            null
+        }
+        val notifications = AtomicInteger()
+        var latch = CountDownLatch(1)
+        val observer = object : ContentObserver(null) {
+            override fun onChange(selfChange: Boolean) {
+                notifications.incrementAndGet()
+                latch.countDown()
+            }
+        }
+        prefs.edit().putString("login", ConsolePty.LOGIN_AUTO).putBoolean("file_access", true).commit()
+        Documents.rootsChanged(context)
+        resolver.registerContentObserver(rootsUri, false, observer)
+        try {
+            val watcher = Documents.AutoRootsWatcher(machine)
+            fun expectRootChange(
+                command: String,
+                expectedHome: String?,
+                changedDirs: Array<String>? = null,
+            ) {
+                latch = CountDownLatch(1)
+                assertEquals(0, sh(machine, command).second)
+                assertTrue(watcher.poll(context, changedDirs))
+                assertTrue(latch.await(5, TimeUnit.SECONDS))
+                assertEquals(expectedHome, homeDocId())
+            }
+            assertEquals("/root", homeDocId())
+            // Baseline and steady-state polls must not notify.
+            assertFalse(watcher.poll(context))
+            assertFalse(watcher.poll(context))
+            assertEquals(0, notifications.get())
+
+            // Unrelated system-user / nologin /etc/passwd edit leaves auto home at /root: no churn.
+            assertEquals(0, sh(machine, "adduser -D -S -H -s /sbin/nologin syswatch").second)
+            assertFalse(watcher.poll(context))
+            assertEquals(0, notifications.get())
+
+            // Adding the first regular user switches auto home to /home/autoalice and notifies roots.
+            expectRootChange("adduser -D -u 1500 autoalice", "/home/autoalice")
+            assertFalse(watcher.poll(context))
+
+            // Adding a second user with a higher UID leaves auto home at /home/autoalice: no churn.
+            val beforeSecond = notifications.get()
+            assertEquals(0, sh(machine, "adduser -D -u 1501 autobob").second)
+            assertFalse(watcher.poll(context))
+            assertEquals(beforeSecond, notifications.get())
+
+            // Removing autoalice shifts auto home to autobob, then removing autobob reverts to /root.
+            expectRootChange("deluser --remove-home autoalice", "/home/autobob")
+            expectRootChange("deluser --remove-home autobob", "/root")
+
+            // Adding an account without a home directory drops the home root, then mkdir restores it.
+            expectRootChange("adduser -D -H -u 1502 autocara", null)
+            expectRootChange("mkdir -p /home/autocara", "/home/autocara", changedDirs = arrayOf("/home"))
+
+            // Explicit non-auto login and disabled file access must not refresh roots.
+            val beforeFixed = notifications.get()
+            prefs.edit().putString("login", ConsolePty.LOGIN_ROOT).commit()
+            assertEquals(0, sh(machine, "deluser autocara && rm -rf /home/autocara").second)
+            assertFalse(watcher.poll(context))
+            prefs.edit().putString("login", ConsolePty.LOGIN_AUTO).putBoolean("file_access", false).commit()
+            assertEquals(0, sh(machine, "adduser -D -u 1500 autoalice").second)
+            assertFalse(watcher.poll(context))
+            assertEquals(beforeFixed, notifications.get())
+        } finally {
+            resolver.unregisterContentObserver(observer)
+            prefs.edit().remove("login").remove("file_access").commit()
+            sh(machine, cleanup)
+            Documents.rootsChanged(context)
+        }
+    }
+
+    /**
+     * Building large JNI string arrays (`string_array`, shared by `browseList`, `browseSearch`,
+     * `takeChangedDirs`, `takeListens` and `takeKills`) deletes per-element local references inside
+     * the loop rather than accumulating them past a small local-ref table.
+     */
+    @Test
+    fun browseListHandlesLargeDirectoriesWithoutLocalRefLeaks() {
+        val machine = start(1)
+        val dir = "/tmp/jni-ref-many"
+        try {
+            assertEquals(
+                0,
+                sh(machine, "rm -rf $dir && mkdir -p $dir && i=0; while [ \$i -lt 1200 ]; do : > $dir/f\$i; i=\$((i+1)); done").second,
+            )
+            val entries = Native.browseList(Rootfs.store(context).path, dir)
+            assertEquals(1200, entries.size)
+        } finally {
+            sh(machine, "rm -rf $dir")
         }
     }
 

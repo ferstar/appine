@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: background-tab Kitty image trimming on UI hide, tab switches, LRU budget and periodic re-trim)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: poll `Documents.AutoRootsWatcher` per kernel to refresh Files roots on `/etc/passwd` changes when `login` is `"auto"`)
 
 ## Responsibilities
 
@@ -167,7 +167,9 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   `Notifications`; then the worker fetches `takeListens`, `takeKills`, `takePower`, `processes`
   and `takeChangedDirs`, checks the login rule inputs, then fetches `guestCpuTime`. The poll
   reschedules itself without waiting for the fetch.
-- The worker passes changed directories to `Documents.dirsChanged`. Each machine has its own
+- The worker passes changed directories to `Documents.dirsChanged` and polls each kernel's
+  `Documents.AutoRootsWatcher` (refreshing Files roots when `login` is `"auto"` and `/etc/passwd`
+  or the auto home's parent changes the resolved home). Each machine also has its own
   `Rootfs.LoginRules` captured when its poll is queued. The worker starts a needed refresh in
   order with shutdown. A separate thread waits for completion (android/setup).
 - The rest is applied on the main thread only if the kernel is still the same: listens (to
