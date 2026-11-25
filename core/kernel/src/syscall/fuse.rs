@@ -640,6 +640,9 @@ fn with_io<T>(
     wait_lock(cx, forced, || {
         let mut f = vfs.fuse_mut();
         let n = f.get_mut(id).ok_or(Errno::ENOTCONN)?;
+        if n.pages.upgrade().is_some_and(|p| p.bg_busy.get()) {
+            return Ok(false);
+        }
         Ok(!std::mem::replace(&mut n.io_busy, true))
     })?;
     struct Unlock<'a>(&'a Vfs, FuseId);
@@ -1269,6 +1272,7 @@ fn may_create(
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
+    vfs.fuse_permission(cred, dir, MAY_EXEC)?;
     match vfs.fuse_child(dir, name) {
         Ok(_) => return Err(Errno::EEXIST),
         Err(e) if e == Errno::ENOENT => {}
@@ -1278,6 +1282,44 @@ fn may_create(
         return Err(Errno::EROFS);
     }
     vfs.fuse_permission(cred, dir, MAY_WRITE | MAY_EXEC)
+}
+
+/// Creates a Unix-domain socket node for `bind(2)` in a FUSE directory (`FUSE_MKNOD` with
+/// `S_IFSOCK`), pinning the node against cache eviction while `sock` stays bound. Returns
+/// `Ok(None)` when `path`'s parent directory is not on a FUSE mount.
+pub(super) fn bind_socket(
+    cx: &mut Cx<'_>,
+    path: &[u8],
+    sock: &super::SocketRef,
+) -> Result<Option<crate::vfs::store::Ino>, Errno> {
+    let Some((mnt, dir, name)) = parent(cx, super::fs::AT_FDCWD, path)? else {
+        return Ok(None);
+    };
+    let in_use = |e: Errno| {
+        if e == Errno::EEXIST {
+            Errno::EADDRINUSE
+        } else {
+            e
+        }
+    };
+    if name == b"." || name == b".." {
+        return Err(Errno::EADDRINUSE);
+    }
+    let vfs = cx.vfs()?;
+    let cred = cx.cred();
+    if path.ends_with(b"/") {
+        vfs.fuse_permission(&cred, dir, MAY_EXEC)?;
+        return Err(match vfs.fuse_child(dir, name) {
+            Ok(_) => Errno::EADDRINUSE,
+            Err(e) => e,
+        });
+    }
+    may_create(&vfs, &cred, (mnt, dir), name).map_err(in_use)?;
+    let (conn, _) = fuse::target(&vfs, dir)?;
+    let perm = masked(&conn, 0o777, cx.umask());
+    let id = make(cx, &vfs, dir, name, Make::Node(mode::S_IFSOCK | perm, 0)).map_err(in_use)?;
+    vfs.fuse_mut().pin_socket(id, sock);
+    Ok(Some(fuse::key(id)))
 }
 
 /// mkdir in FUSE directory `dir` (`FUSE_MKDIR`).
@@ -1688,7 +1730,11 @@ pub(super) fn map_fill(
         host.set_len(size)
             .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
         let pages = FillPages::new(host, size);
-        vfs.fuse_mut().get_mut(id).ok_or(Errno::ENOTCONN)?.pages = Rc::downgrade(&pages);
+        {
+            let mut f = vfs.fuse_mut();
+            f.get_mut(id).ok_or(Errno::ENOTCONN)?.pages = Rc::downgrade(&pages);
+            f.track_mapped(id);
+        }
         pages
     };
     let fill = Rc::new(Fill {
@@ -1713,7 +1759,7 @@ fn refresh_mapping_size(
 ) -> Result<(), Errno> {
     while pages.size_stale.get() {
         let generation = pages.generation.get();
-        let reply = fuse::getattr(cx, vfs, io.id, io.fh(), forced);
+        let reply = fuse::getattr_no_inval(cx, vfs, io.id, io.fh(), forced);
         if generation == pages.generation.get() {
             resize_mapping(cx, vfs, io.id, reply?.size)?;
             pages.size_stale.set(false);
@@ -1881,49 +1927,167 @@ fn flush_ranges(cx: &mut Cx<'_>, ranges: Vec<(Rc<Fill>, u64, u64)>) {
     }
 }
 
-/// Before a read or write syscall (`nr`, arguments `a`): the pages of its buffers in on-demand
-/// mappings ([`Fill`]) are read in first, as Linux's `fault_in_iov_iter_readable` does, since a
-/// syscall that already consumed input cannot simply run again when its copy finds one missing
-/// ([`Errno::FUSE_RETRY`]). Errors are left for the syscall to meet.
+/// Prefaults any cold FUSE `Fill` pages overlapping `[addr, addr + len)` that permit `need`.
+/// Errors are swallowed so the syscall itself surfaces them with Linux's error order.
+pub(super) fn prefault_range(cx: &mut Cx<'_>, addr: u64, len: u64, need: u32) {
+    if len == 0 || addr == 0 || !cx.mm().has_fills() {
+        return;
+    }
+    let mut retries = 0;
+    let mut last: Option<(usize, u64)> = None;
+    loop {
+        let Some(w) = cx.mm().first_unread(addr, len, need) else {
+            return;
+        };
+        let key = (Rc::as_ptr(&w.0.pages) as usize, w.1);
+        if last == Some(key) {
+            retries += 1;
+            if retries > super::FUSE_RETRIES {
+                return;
+            }
+        } else {
+            last = Some(key);
+            retries = 0;
+        }
+        if fill(cx, w).is_err() {
+            return;
+        }
+    }
+}
+
+/// Prefaults an `iovec[count]` array (for reading) and each pointed-to buffer (for `need`).
+pub(super) fn prefault_iov(cx: &mut Cx<'_>, iov: u64, count: usize, need: u32) {
+    use appine_engine::prot;
+    if count == 0 || iov == 0 || !cx.mm().has_fills() {
+        return;
+    }
+    let n = count.min(1024);
+    let bytes = n * 16;
+    prefault_range(cx, iov, bytes as u64, prot::READ);
+    let mut raw = vec![0u8; bytes];
+    if cx
+        .read_user(crate::uaccess::UserSlice::new(iov, bytes), &mut raw)
+        .is_err()
+    {
+        return;
+    }
+    for c in raw.chunks_exact(16) {
+        let base = u64::from_le_bytes(c[..8].try_into().unwrap());
+        let len = u64::from_le_bytes(c[8..].try_into().unwrap());
+        prefault_range(cx, base, len, need);
+    }
+}
+
+/// Prefaults a `struct msghdr` (for reading) and its `msg_iov` buffers (for `need`).
+fn prefault_msghdr(cx: &mut Cx<'_>, msg: u64, need: u32) {
+    use appine_engine::prot;
+    if msg == 0 || !cx.mm().has_fills() {
+        return;
+    }
+    prefault_range(cx, msg, 56, prot::READ);
+    let mut hdr = [0u8; 56];
+    if cx
+        .read_user(crate::uaccess::UserSlice::new(msg, 56), &mut hdr)
+        .is_err()
+    {
+        return;
+    }
+    let iov = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+    let iovlen = u64::from_le_bytes(hdr[24..32].try_into().unwrap()) as usize;
+    prefault_iov(cx, iov, iovlen, need);
+}
+
+/// Before a syscall (`nr`, arguments `a`): prefaults user buffers in on-demand FUSE mappings
+/// ([`Fill`]) for syscalls that consume input or mutate state before copying results/buffers, as
+/// Linux's `fault_in_iov_iter_readable`/`writeable` does, so a whole-syscall `FUSE_RETRY` cannot
+/// repeat side effects or return unexpected short counts. Errors are left for the syscall to meet.
 pub(super) fn prefault(cx: &mut Cx<'_>, nr: u64, a: &[u64; 6]) {
     use appine_engine::prot;
     if !cx.mm().has_fills() {
         return;
     }
-    // (buffers, whether the syscall writes into them)
-    let (ranges, into) = match nr {
-        63 | 67 => (vec![(a[1], a[2])], true),
-        64 | 68 => (vec![(a[1], a[2])], false),
-        65 | 69 | 286 | 66 | 70 | 287 => {
-            let n = (a[2] as usize).min(1024);
-            let mut raw = vec![0u8; n * 16];
-            if cx
-                .read_user(crate::uaccess::UserSlice::new(a[1], raw.len()), &mut raw)
-                .is_err()
+    match nr {
+        // epoll_pwait / epoll_pwait2: events array written after consuming EPOLLONESHOT/EPOLLET
+        22 | 441 => {
+            let max = (a[2] as i32).clamp(0, 65536) as u64;
+            prefault_range(cx, a[1], max * 16, prot::WRITE);
+        }
+        // pipe2: pipefd[2]
+        59 => prefault_range(cx, a[0], 8, prot::WRITE),
+        // getdents64: advances directory pos before write_user_partial
+        61 => prefault_range(cx, a[1], a[2].min(super::FUSE_CHUNK as u64), prot::WRITE),
+        // read / pread64
+        63 | 67 => prefault_range(cx, a[1], a[2], prot::WRITE),
+        // write / pwrite64
+        64 | 68 => prefault_range(cx, a[1], a[2], prot::READ),
+        // readv / preadv / preadv2
+        65 | 69 | 286 => prefault_iov(cx, a[1], a[2] as usize, prot::WRITE),
+        // writev / pwritev / pwritev2
+        66 | 70 | 287 => prefault_iov(cx, a[1], a[2] as usize, prot::READ),
+        // sendfile: writes updated *offset after transferring data
+        71 => prefault_range(cx, a[2], 8, prot::WRITE),
+        // pselect6: writes fd_sets and remaining timeout after waiting
+        72 => {
+            let nfds = (a[0] as i32).clamp(0, 1024 * 1024) as u64;
+            let bytes = nfds.div_ceil(8);
+            for idx in [1, 2, 3] {
+                prefault_range(cx, a[idx], bytes, prot::WRITE);
+            }
+            prefault_range(cx, a[4], 16, prot::WRITE);
+        }
+        // ppoll: writes pollfd revents and remaining timeout after waiting
+        73 => {
+            let nfds = (a[1] as usize).min(65536) as u64;
+            prefault_range(cx, a[0], nfds * 8, prot::WRITE);
+            prefault_range(cx, a[2], 16, prot::WRITE);
+        }
+        // vmsplice: transfers between pipe and iovec buffers
+        75 => {
+            let need = cx
+                .fds()
+                .get(a[0] as i32)
+                .ok()
+                .is_some_and(|f| f.borrow().writable());
+            prefault_iov(
+                cx,
+                a[1],
+                a[2] as usize,
+                if need { prot::READ } else { prot::WRITE },
+            );
+        }
+        // splice / copy_file_range: writes updated *off_in and *off_out after moving bytes
+        76 | 285 => {
+            prefault_range(cx, a[1], 8, prot::WRITE);
+            prefault_range(cx, a[3], 8, prot::WRITE);
+        }
+        // socketpair: sv[2]
+        199 => prefault_range(cx, a[3], 8, prot::WRITE),
+        // sendto: payload buffer
+        206 => prefault_range(cx, a[1], a[2], prot::READ),
+        // getsockopt: SO_ERROR clears pending error before writing optval/optlen
+        209 => {
+            prefault_range(cx, a[4], 4, prot::WRITE);
+            let mut b = [0u8; 4];
+            if a[4] != 0
+                && cx
+                    .read_user(crate::uaccess::UserSlice::new(a[4], 4), &mut b)
+                    .is_ok()
             {
-                return;
-            }
-            let iov = raw
-                .chunks_exact(16)
-                .map(|c| {
-                    let base = u64::from_le_bytes(c[..8].try_into().unwrap());
-                    (base, u64::from_le_bytes(c[8..].try_into().unwrap()))
-                })
-                .collect();
-            (iov, matches!(nr, 65 | 69 | 286))
-        }
-        _ => return,
-    };
-    let need = if into { prot::WRITE } else { prot::READ };
-    for (addr, len) in ranges {
-        loop {
-            let Some(w) = cx.mm().first_unread(addr, len, need) else {
-                break;
-            };
-            if fill(cx, w).is_err() {
-                return;
+                let len = u32::from_le_bytes(b).min(65536) as u64;
+                prefault_range(cx, a[3], len, prot::WRITE);
             }
         }
+        // sendmsg: msghdr and iovecs
+        211 => prefault_msghdr(cx, a[1], prot::READ),
+        // sendmmsg: writes msg_len after each message sent
+        269 => {
+            let vlen = (a[2] as usize).min(1024);
+            prefault_range(cx, a[1], (vlen * 64) as u64, prot::WRITE);
+            for i in 0..vlen {
+                prefault_msghdr(cx, a[1].wrapping_add((i * 64) as u64), prot::READ);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2067,10 +2231,17 @@ mod tests {
     }
 
     fn attr_bytes(ino: u64, mode: u32, size: u64, nlink: u32) -> Vec<u8> {
-        let mut a = Args::default().u64(ino).u64(size);
-        for _ in 0..4 {
-            a = a.u64(0);
-        }
+        attr_bytes_mtime(ino, mode, size, nlink, 0)
+    }
+
+    fn attr_bytes_mtime(ino: u64, mode: u32, size: u64, nlink: u32, mtime: u64) -> Vec<u8> {
+        let mut a = Args::default()
+            .u64(ino)
+            .u64(size)
+            .u64(0)
+            .u64(0)
+            .u64(mtime)
+            .u64(mtime);
         for _ in 0..3 {
             a = a.u32(0);
         }
@@ -2097,11 +2268,22 @@ mod tests {
     }
 
     fn attr_out_bytes(ino: u64, mode: u32, size: u64, nlink: u32, valid_secs: u64) -> Vec<u8> {
+        attr_out_mtime(ino, mode, size, nlink, 0, valid_secs)
+    }
+
+    fn attr_out_mtime(
+        ino: u64,
+        mode: u32,
+        size: u64,
+        nlink: u32,
+        mtime: u64,
+        valid_secs: u64,
+    ) -> Vec<u8> {
         Args::default()
             .u64(valid_secs)
             .u32(0)
             .u32(0)
-            .bytes(&attr_bytes(ino, mode, size, nlink))
+            .bytes(&attr_bytes_mtime(ino, mode, size, nlink, mtime))
             .0
     }
 
@@ -2359,6 +2541,10 @@ mod tests {
     }
 
     fn new_rig(name: &str, worker_tids: &[Tid]) -> TestRig {
+        new_rig_with_init_flags(name, worker_tids, 0)
+    }
+
+    fn new_rig_with_init_flags(name: &str, worker_tids: &[Tid], init_flags: u32) -> TestRig {
         let dir = std::env::temp_dir().join(format!(
             "appine-fuse-test-{name}-{}-{}",
             std::process::id(),
@@ -2437,7 +2623,7 @@ mod tests {
             .u32(7)
             .u32(37)
             .u32(0)
-            .u32(0)
+            .u32(init_flags)
             .u32(0)
             .u32(65536)
             .u32(1)
@@ -3059,5 +3245,441 @@ mod tests {
         });
 
         assert_eq!(getattrs.load(Ordering::Relaxed), 1);
+    }
+
+    fn unix_sockaddr(path: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + path.len() + 1);
+        out.extend_from_slice(&1u16.to_le_bytes()); // AF_UNIX
+        out.extend_from_slice(path);
+        out.push(0);
+        out
+    }
+
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn unix_bind_in_fuse_mknod_connect_and_eviction_pinning() {
+        let _sweep_guard = fuse::tests::SWEEP_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let rig = new_rig("unix-bind", &[60, 61]);
+        let h = &rig.h;
+
+        let mknod_modes = std::sync::Mutex::new(Vec::<u32>::new());
+        let sock_exists = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let daemon = s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let (opcode, unique, nodeid, msg) = match h.read_req(true) {
+                        Ok(r) => r,
+                        Err(Errno::EAGAIN) => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("dev_read failed: {e:?}"),
+                    };
+                    match opcode {
+                        op::LOOKUP => {
+                            assert_eq!(nodeid, 1);
+                            let name = msg[40..].split(|&b| b == 0).next().unwrap();
+                            if name == b"s.sock" && sock_exists.load(Ordering::Relaxed) {
+                                h.reply_ok(
+                                    unique,
+                                    &entry_out(42, mode::S_IFSOCK | 0o755, 0, 1, 60),
+                                );
+                            } else {
+                                h.reply(unique, Errno::ENOENT.0, &[]);
+                            }
+                        }
+                        op::MKNOD => {
+                            assert_eq!(nodeid, 1);
+                            let m = u32::from_le_bytes(msg[40..44].try_into().unwrap());
+                            let name = msg[56..].split(|&b| b == 0).next().unwrap();
+                            assert_eq!(name, b"s.sock");
+                            mknod_modes.lock().unwrap().push(m);
+                            sock_exists.store(true, Ordering::Relaxed);
+                            h.reply_ok(
+                                unique,
+                                &entry_out(42, mode::S_IFSOCK | (m & 0o777), 0, 1, 60),
+                            );
+                        }
+                        other => panic!("unexpected opcode {other}"),
+                    }
+                }
+            });
+            let _stop_guard = StopOnDrop(&stop);
+
+            let addr = unix_sockaddr(b"/mnt/s.sock");
+            let server_sock = Rc::new(RefCell::new(
+                super::super::unix::socket(1 /* SOCK_STREAM */, 0).unwrap(),
+            ));
+            let dup_sock = Rc::new(RefCell::new(
+                super::super::unix::socket(1 /* SOCK_STREAM */, 0).unwrap(),
+            ));
+            let client_sock = Rc::new(RefCell::new(
+                super::super::unix::socket(1 /* SOCK_STREAM */, 0).unwrap(),
+            ));
+
+            h.cx(60, |cx| {
+                run_with_retries(cx, |cx| super::super::unix::bind(cx, &server_sock, &addr))
+                    .unwrap();
+                if let crate::net::Socket::Unix(u) = &mut *server_sock.borrow_mut() {
+                    let ucred = crate::unix::Ucred {
+                        pid: 60,
+                        uid: 0,
+                        gid: 0,
+                    };
+                    super::super::unix::listen(u, 4, ucred).unwrap();
+                }
+                // Second bind on the same FUSE socket returns EADDRINUSE.
+                assert_eq!(
+                    run_with_retries(cx, |cx| super::super::unix::bind(cx, &dup_sock, &addr)),
+                    Err(Errno::EADDRINUSE)
+                );
+                // Trailing slash also returns EADDRINUSE.
+                let slash = unix_sockaddr(b"/mnt/s.sock/");
+                assert_eq!(
+                    run_with_retries(cx, |cx| super::super::unix::bind(cx, &dup_sock, &slash)),
+                    Err(Errno::EADDRINUSE)
+                );
+            });
+
+            // Drop caches while bound: socket node stays pinned so connect still finds the server.
+            assert_eq!(h.evict_all(), 0);
+
+            h.cx(61, |cx| {
+                run_with_retries(cx, |cx| {
+                    super::super::unix::connect(cx, &client_sock, true, &addr)
+                })
+                .unwrap();
+            });
+
+            // Closing the bound socket unpins the FUSE node so eviction can reclaim it.
+            drop(client_sock);
+            drop(server_sock);
+            assert!(h.evict_all() >= 1);
+
+            stop.store(true, Ordering::Relaxed);
+            daemon.join().unwrap();
+        });
+
+        // Default umask is 0o022 -> S_IFSOCK | 0o755.
+        assert_eq!(*mknod_modes.lock().unwrap(), vec![mode::S_IFSOCK | 0o755]);
+    }
+
+    #[test]
+    fn uncached_lookup_walk_batches_and_caches_errors() {
+        let rig = new_rig("lookup-walk", &[70]);
+        let h = &rig.h;
+
+        let lookups = std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new());
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let daemon = s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let (opcode, unique, nodeid, msg) = match h.read_req(true) {
+                        Ok(r) => r,
+                        Err(Errno::EAGAIN) => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("dev_read failed: {e:?}"),
+                    };
+                    assert_eq!(opcode, op::LOOKUP);
+                    let name = msg[40..].split(|&b| b == 0).next().unwrap().to_vec();
+                    lookups.lock().unwrap().push((nodeid, name.clone()));
+                    match (nodeid, name.as_slice()) {
+                        (1, b"a") => {
+                            h.reply_ok(unique, &entry_out(10, mode::S_IFDIR | 0o755, 4096, 2, 60))
+                        }
+                        (10, b"b") => {
+                            h.reply_ok(unique, &entry_out(11, mode::S_IFDIR | 0o755, 4096, 2, 60))
+                        }
+                        (11, b"c") => {
+                            h.reply_ok(unique, &entry_out(12, mode::S_IFDIR | 0o755, 4096, 2, 60))
+                        }
+                        (12, b"d") => {
+                            h.reply_ok(unique, &entry_out(13, mode::S_IFDIR | 0o755, 4096, 2, 60))
+                        }
+                        (13, b"e") => {
+                            h.reply_ok(unique, &entry_out(14, mode::S_IFREG | 0o644, 7, 1, 60))
+                        }
+                        (1, b"bad") => h.reply(unique, Errno::EIO.0, &[]),
+                        _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                    }
+                }
+            });
+            let _stop_guard = StopOnDrop(&stop);
+
+            // 5-component cold FUSE path resolves in ONE retry cycle (batched LookupWalk).
+            h.cx(70, |cx| {
+                let vfs = cx.vfs().unwrap();
+                let cred = cx.cred();
+                let root = cx.root();
+                fuse::new_syscall();
+                let mut retries = 0usize;
+                let node = loop {
+                    match vfs.resolve(&cx.view(&vfs), &cred, &root, &root, b"/mnt/a/b/c/d/e", true)
+                    {
+                        Err(Errno::FUSE_RETRY) => {
+                            retries += 1;
+                            fuse::serve(cx, |_, _| {}).unwrap();
+                        }
+                        Ok(n) => break n,
+                        Err(e) => panic!("unexpected resolve error: {e:?}"),
+                    }
+                };
+                assert_eq!(retries, 1, "expected 1 batched retry, got {retries}");
+                assert!(matches!(node, Node::Fuse(_, _)));
+
+                // Non-ENOENT lookup error (EIO) does NOT abort serve(); it is cached for the
+                // syscall and returned directly by vfs.resolve on retry.
+                fuse::new_syscall();
+                let mut err_retries = 0usize;
+                let res = loop {
+                    match vfs.resolve(&cx.view(&vfs), &cred, &root, &root, b"/mnt/bad", true) {
+                        Err(Errno::FUSE_RETRY) => {
+                            err_retries += 1;
+                            fuse::serve(cx, |_, _| {}).unwrap();
+                        }
+                        r => break r,
+                    }
+                };
+                assert_eq!(err_retries, 1);
+                assert_eq!(res, Err(Errno::EIO));
+
+                // Same syscall still sees cached EIO without another daemon LOOKUP.
+                assert_eq!(
+                    vfs.resolve(&cx.view(&vfs), &cred, &root, &root, b"/mnt/bad", true),
+                    Err(Errno::EIO)
+                );
+                // Next syscall clears per-syscall LOOKUP_ERRORS and asks the daemon again.
+                fuse::new_syscall();
+                assert_eq!(
+                    vfs.resolve(&cx.view(&vfs), &cred, &root, &root, b"/mnt/bad", true),
+                    Err(Errno::FUSE_RETRY)
+                );
+                fuse::serve(cx, |_, _| {}).unwrap();
+                assert_eq!(
+                    vfs.resolve(&cx.view(&vfs), &cred, &root, &root, b"/mnt/bad", true),
+                    Err(Errno::EIO)
+                );
+            });
+
+            stop.store(true, Ordering::Relaxed);
+            daemon.join().unwrap();
+        });
+
+        let seen = lookups.into_inner().unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                (1, b"a".to_vec()),
+                (10, b"b".to_vec()),
+                (11, b"c".to_vec()),
+                (12, b"d".to_vec()),
+                (13, b"e".to_vec()),
+                (1, b"bad".to_vec()),
+                (1, b"bad".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn periodic_writeback_notify_store_auto_inval_and_mlock_willneed() {
+        const PAGE: u64 = appine_engine::PAGE_SIZE;
+        const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
+        const FILE_LEN: u64 = 64 * PAGE;
+        let rig = new_rig_with_init_flags("mm-wb-store", &[80], FUSE_AUTO_INVAL_DATA);
+        let h = &rig.h;
+        let file_id = h.seed_file(h.root, b"f", 20, FILE_LEN, 0);
+        let fd = h.install_fd(
+            80,
+            OpenFile::new(
+                FileKind::Fuse(Box::new(h.make_handle(file_id, 20, 77, false, false, 0))),
+                oflags::O_RDWR,
+            ),
+        );
+        // Set dirty_writeback_centisecs to 1 (10ms) for fast periodic writeback.
+        h.shared
+            .lock()
+            .sysctls
+            .insert(b"sys/vm/dirty_writeback_centisecs", 1);
+
+        let reads = AtomicUsize::new(0);
+        let bg_writes = std::sync::Mutex::new(Vec::<(u64, u32, Vec<u8>)>::new());
+        let file_ver = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let daemon = s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let (opcode, unique, nodeid, msg) = match h.read_req(true) {
+                        Ok(r) => r,
+                        Err(Errno::EAGAIN) => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("dev_read failed: {e:?}"),
+                    };
+                    assert_eq!(nodeid, 20);
+                    match opcode {
+                        op::READ => {
+                            let off = u64::from_le_bytes(msg[48..56].try_into().unwrap());
+                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap()) as usize;
+                            reads.fetch_add(1, Ordering::Relaxed);
+                            let mut buf = vec![0u8; sz];
+                            for (i, b) in buf.iter_mut().enumerate() {
+                                let page = (off + i as u64) / PAGE;
+                                *b = if file_ver.load(Ordering::Relaxed) == 0 {
+                                    if page == 0 { b'A' } else { b'B' }
+                                } else {
+                                    b'Z'
+                                };
+                            }
+                            h.reply_ok(unique, &buf);
+                        }
+                        op::WRITE => {
+                            let off = u64::from_le_bytes(msg[48..56].try_into().unwrap());
+                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap()) as usize;
+                            let wflags = u32::from_le_bytes(msg[60..64].try_into().unwrap());
+                            let payload = msg[80..80 + sz].to_vec();
+                            bg_writes.lock().unwrap().push((off, wflags, payload));
+                            h.reply_ok(unique, &Args::default().u32(sz as u32).u32(0).0);
+                        }
+                        op::GETATTR => {
+                            let ver = file_ver.load(Ordering::Relaxed) as u64;
+                            h.reply_ok(
+                                unique,
+                                &attr_out_mtime(
+                                    20,
+                                    mode::S_IFREG | 0o644,
+                                    FILE_LEN,
+                                    1,
+                                    100 + ver,
+                                    0,
+                                ),
+                            );
+                        }
+                        other => panic!("unexpected opcode {other}"),
+                    }
+                }
+            });
+            let _stop_guard = StopOnDrop(&stop);
+
+            // 1. Map the 64-page file shared RW (cold), then fetch page 0 via MADV_WILLNEED.
+            let addr = h.cx(80, |cx| {
+                run_with_retries(cx, |cx| {
+                    super::super::mem::mmap(
+                        cx,
+                        0,
+                        FILE_LEN,
+                        appine_engine::prot::READ | appine_engine::prot::WRITE,
+                        0x01, /* MAP_SHARED */
+                        fd,
+                        0,
+                    )
+                })
+                .unwrap() as u64
+            });
+            assert_eq!(reads.load(Ordering::Relaxed), 0);
+
+            h.cx(80, |cx| {
+                super::super::mem::madvise(cx, addr, PAGE, 3 /* MADV_WILLNEED */).unwrap();
+            });
+            let reads_after_willneed = reads.load(Ordering::Relaxed);
+            assert!(reads_after_willneed >= 1);
+
+            // 2. mlock on far-away cold page 63 fetches it via FUSE_READ.
+            h.cx(80, |cx| {
+                super::super::mem::mlock(cx, addr + 63 * PAGE, PAGE, 0, true).unwrap();
+            });
+            assert!(reads.load(Ordering::Relaxed) > reads_after_willneed);
+            h.cx(80, |cx| {
+                let mut b = [0u8; 2];
+                cx.read_user(crate::uaccess::UserSlice::new(addr, 1), &mut b[0..1])
+                    .unwrap();
+                cx.read_user(
+                    crate::uaccess::UserSlice::new(addr + 63 * PAGE, 1),
+                    &mut b[1..2],
+                )
+                .unwrap();
+                assert_eq!(&b, b"AB");
+            });
+
+            // 3. FUSE_NOTIFY_STORE updates resident page 0 directly without a FUSE_READ.
+            let store_payload = b"STORED!";
+            let store_body = Args::default()
+                .u64(20)
+                .u64(0)
+                .u32(store_payload.len() as u32)
+                .u32(0)
+                .bytes(store_payload)
+                .0;
+            // Notification uses unique=0 and positive code=4 (fuse_reply negates error).
+            h.reply(0, -4, &store_body);
+            h.cx(80, |cx| {
+                let mut b = [0u8; 7];
+                cx.read_user(crate::uaccess::UserSlice::new(addr, 7), &mut b)
+                    .unwrap();
+                assert_eq!(&b, b"STORED!");
+            });
+
+            // 4. Dirty page 0 and let flush_dirty queue periodic background FUSE_WRITE.
+            h.cx(80, |cx| {
+                cx.write_user(crate::uaccess::UserSlice::new(addr + 16, 5), b"DIRTY")
+                    .unwrap();
+            });
+            // First tick schedules the deadline; wait 15ms and tick again to flush.
+            let due = {
+                let k = h.shared.lock();
+                fuse::flush_dirty(&k)
+            };
+            assert!(due.is_some());
+            std::thread::sleep(Duration::from_millis(20));
+            {
+                let k = h.shared.lock();
+                let _ = fuse::flush_dirty(&k);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while bg_writes.lock().unwrap().is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "periodic writeback never arrived"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let writes = bg_writes.lock().unwrap().clone();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].0, 16);
+            assert_ne!(writes[0].1 & 1, 0, "expected FUSE_WRITE_CACHE flag");
+            assert_eq!(writes[0].2, b"DIRTY");
+
+            // 5. FUSE_AUTO_INVAL_DATA: changing mtime on GETATTR invalidates resident clean pages
+            // so the next read re-fetches 'Z' from the daemon.
+            file_ver.store(1, Ordering::Relaxed);
+            h.cx(80, |cx| {
+                let vfs = cx.vfs().unwrap();
+                let _ = fuse::getattr(cx, &vfs, file_id, None, true).unwrap();
+            });
+            let reads_before = reads.load(Ordering::Relaxed);
+            h.cx(80, |cx| {
+                let mut b = [0u8; 1];
+                super::super::retry_user_pages(cx, Errno::EINTR, |cx| {
+                    cx.read_user(crate::uaccess::UserSlice::new(addr, 1), &mut b)
+                })
+                .unwrap();
+                assert_eq!(&b, b"Z");
+            });
+            assert!(reads.load(Ordering::Relaxed) > reads_before);
+
+            stop.store(true, Ordering::Relaxed);
+            daemon.join().unwrap();
+        });
     }
 }

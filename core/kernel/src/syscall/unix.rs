@@ -126,38 +126,44 @@ fn bind_addr(cx: &mut Cx<'_>, sock: &SocketRef, addr: Addr<'_>) -> Result<(), Er
         Addr::Path(p) => {
             // As on Linux, create a socket node in the file system; fail when it already
             // exists. When the path is / or ends with ., it refers to an existing directory
-            let in_use = |e: Errno| {
-                if e == Errno::EEXIST {
-                    Errno::EADDRINUSE
-                } else {
-                    e
+            let key = if let Some(key) = super::fuse::bind_socket(cx, p, sock)? {
+                key
+            } else {
+                let in_use = |e: Errno| {
+                    if e == Errno::EEXIST {
+                        Errno::EADDRINUSE
+                    } else {
+                        e
+                    }
+                };
+                let (mnt, dir, name, ovl) = create_parent_at(cx, AT_FDCWD, p).map_err(in_use)?;
+                if name == b"." || name == b".." {
+                    return Err(Errno::EADDRINUSE);
                 }
+                let vfs = cx.vfs()?;
+                super::fs::reject_trailing_slash(&vfs, (mnt, dir), name, p).map_err(in_use)?;
+                let cred = cx.cred();
+                let dir_st =
+                    super::fs::may_create(&vfs, &cred, (mnt, dir), name).map_err(in_use)?;
+                let (uid, gid, perm) = cred.new_owner(&dir_st, 0o777, cx.umask(), false);
+                let tmpfs = super::fs::tmpfs_reserve(&vfs, (mnt, dir), 0)?;
+                let ino = super::fs::create_in(
+                    &vfs,
+                    (mnt, dir),
+                    name,
+                    dir_st.default_acl.as_deref(),
+                    || {
+                        vfs.store()
+                            .mknod(dir, name, mode::S_IFSOCK | perm, 0, uid, gid)
+                    },
+                    |&ino| ino,
+                )
+                .map_err(in_use)?;
+                super::fs::tmpfs_created(&vfs, tmpfs, 0);
+                super::fs::created_events(cx.kr(), (dir, ovl), name, 0);
+                ino
             };
-            let (mnt, dir, name, ovl) = create_parent_at(cx, AT_FDCWD, p).map_err(in_use)?;
-            if name == b"." || name == b".." {
-                return Err(Errno::EADDRINUSE);
-            }
-            let vfs = cx.vfs()?;
-            super::fs::reject_trailing_slash(&vfs, (mnt, dir), name, p).map_err(in_use)?;
-            let cred = cx.cred();
-            let dir_st = super::fs::may_create(&vfs, &cred, (mnt, dir), name).map_err(in_use)?;
-            let (uid, gid, perm) = cred.new_owner(&dir_st, 0o777, cx.umask(), false);
-            let tmpfs = super::fs::tmpfs_reserve(&vfs, (mnt, dir), 0)?;
-            let ino = super::fs::create_in(
-                &vfs,
-                (mnt, dir),
-                name,
-                dir_st.default_acl.as_deref(),
-                || {
-                    vfs.store()
-                        .mknod(dir, name, mode::S_IFSOCK | perm, 0, uid, gid)
-                },
-                |&ino| ino,
-            )
-            .map_err(in_use)?;
-            super::fs::tmpfs_created(&vfs, tmpfs, 0);
-            super::fs::created_events(cx.kr(), (dir, ovl), name, 0);
-            cx.k().unix.insert(Name::Path(ino), sock);
+            cx.k().unix.insert(Name::Path(key), sock);
             bound.extend_from_slice(p);
             bound.push(0);
         }
@@ -1105,28 +1111,34 @@ fn find(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<SocketRef, Errno> 
             let node = lookup_at(cx, AT_FDCWD, p, true)?;
             let vfs = cx.vfs()?;
             // Linux's unix_find_bsd checks MAY_WRITE before S_ISSOCK (EACCES before ECONNREFUSED)
-            let st = match &node {
-                Node::Store(_, ino) => vfs.store().stat(*ino)?,
-                Node::Overlay(_, o) => vfs.store().stat(vfs.overlay().node(*o).real())?,
-                Node::Pseudo(_, p) => crate::pseudo::stat(&cx.view(&vfs), p)?,
-                Node::Fuse(_, f) => vfs.fuse().get(*f).ok_or(Errno::ENOTCONN)?.attr.stat(),
+            let ino = match node {
+                Node::Fuse(_, f) => {
+                    vfs.fuse_permission(&cx.cred(), f, crate::cred::MAY_WRITE)?;
+                    if vfs.fuse().get(f).ok_or(Errno::ENOTCONN)?.kind() != mode::S_IFSOCK {
+                        return Err(Errno::ECONNREFUSED);
+                    }
+                    return cx
+                        .kr()
+                        .unix
+                        .lookup(&Name::Path(crate::vfs::fuse::key(f)))
+                        .ok_or(Errno::ECONNREFUSED);
+                }
+                Node::Pseudo(_, p) => {
+                    let st = crate::pseudo::stat(&cx.view(&vfs), &p)?;
+                    cx.cred().permission(&st, crate::cred::MAY_WRITE)?;
+                    return Err(Errno::ECONNREFUSED);
+                }
+                Node::Store(_, ino) => ino,
+                // The socket file behind an overlay's node (in the upper layer when it was
+                // bound through the overlay)
+                Node::Overlay(_, o) => vfs.overlay().node(o).real(),
             };
+            let st = vfs.store().stat(ino)?;
             cx.cred().permission(&st, crate::cred::MAY_WRITE)?;
             if st.mode & mode::S_IFMT != mode::S_IFSOCK {
                 return Err(Errno::ECONNREFUSED);
             }
-            match node {
-                Node::Store(..) | Node::Overlay(..) => {
-                    // The socket file behind an overlay's node (in the upper layer when it was
-                    // bound through the overlay)
-                    let ino = match node {
-                        Node::Overlay(_, o) => vfs.overlay().node(o).real(),
-                        _ => node.ino().unwrap_or(0),
-                    };
-                    Name::Path(ino)
-                }
-                _ => return Err(Errno::ECONNREFUSED),
-            }
+            Name::Path(ino)
         }
     };
     cx.kr().unix.lookup(&name).ok_or(Errno::ECONNREFUSED)

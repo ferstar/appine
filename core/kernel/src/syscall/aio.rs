@@ -108,16 +108,18 @@ pub(super) fn io_submit(cx: &mut Cx<'_>, ctx: u64, nr: i64, iocbpp: u64) -> SysR
     }
     let mut done = 0;
     for i in 0..nr as u64 {
-        let r = get::<8>(cx, iocbpp.wrapping_add(i * 8))
-            .map(u64::from_le_bytes)
-            .and_then(|obj| {
-                if obj == 0 {
-                    Err(Errno::EFAULT)
-                } else {
-                    Ok(obj)
-                }
-            })
-            .and_then(|obj| submit_one(cx, &c, obj));
+        let r = super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| {
+            get::<8>(cx, iocbpp.wrapping_add(i * 8))
+        })
+        .map(u64::from_le_bytes)
+        .and_then(|obj| {
+            if obj == 0 {
+                Err(Errno::EFAULT)
+            } else {
+                Ok(obj)
+            }
+        })
+        .and_then(|obj| submit_one(cx, &c, obj));
         match r {
             Ok(()) => done += 1,
             Err(e) if done == 0 => return Err(e),
@@ -133,7 +135,7 @@ pub(super) fn io_submit(cx: &mut Cx<'_>, ctx: u64, nr: i64, iocbpp: u64) -> SysR
 /// stays pending. What is refused, and in which order, follows 6.1's io_submit_one and the
 /// per-opcode preparation (aio_prep_rw with aio_read/aio_write, aio_fsync, aio_poll).
 fn submit_one(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>, obj: u64) -> Result<(), Errno> {
-    let b: [u8; 64] = get(cx, obj)?;
+    let b: [u8; 64] = super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| get(cx, obj))?;
     let u64_at = |off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
     let u32_at = |off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
     let data = u64_at(0);
@@ -163,7 +165,9 @@ fn submit_one(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>, obj: u64) -> Result<
         None
     };
     // The kernel writes aio_key as 0 (KIOCB_KEY), and io_cancel checks against it
-    put(cx, obj + 8, 0u32.to_le_bytes())?;
+    super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| {
+        put(cx, obj + 8, 0u32.to_le_bytes())
+    })?;
     let res = match op {
         IOCB_CMD_PREAD | IOCB_CMD_PREADV | IOCB_CMD_PWRITE | IOCB_CMD_PWRITEV => {
             let write = matches!(op, IOCB_CMD_PWRITE | IOCB_CMD_PWRITEV);
@@ -286,7 +290,18 @@ fn read_write(
         nowait: rw_flags & RWF_NOWAIT != 0,
         append: rw_flags & RWF_APPEND != 0,
     };
-    let r = transfer(cx, file, fd, op, (buf, len as usize, at), rw_flags, io);
+    // Prefault cold FUSE-mapped buffers so `transfer` does not surface `FUSE_RETRY` as an event
+    // error.
+    match op {
+        IOCB_CMD_PREAD => super::fuse::prefault_range(cx, buf, len, prot::WRITE),
+        IOCB_CMD_PWRITE => super::fuse::prefault_range(cx, buf, len, prot::READ),
+        IOCB_CMD_PREADV => super::fuse::prefault_iov(cx, buf, len as usize, prot::WRITE),
+        IOCB_CMD_PWRITEV => super::fuse::prefault_iov(cx, buf, len as usize, prot::READ),
+        _ => {}
+    }
+    let r = super::retry_user_pages(cx, Errno::EINTR, |cx| {
+        transfer(cx, file, fd, op, (buf, len as usize, at), rw_flags, io)
+    });
     match r {
         Ok(n) => n as i64,
         // A request interrupted by a signal cannot be restarted with the others already done
@@ -417,7 +432,9 @@ pub(super) fn io_getevents(
     }
     let out: Vec<[u8; 32]> = c.borrow_mut().events.drain(..take).collect();
     let bytes: Vec<u8> = out.concat();
-    if let Err(e) = cx.mm().write(UserSlice::new(events, bytes.len()), &bytes) {
+    if let Err(e) = super::copy_result(cx, |cx| {
+        cx.mm().write(UserSlice::new(events, bytes.len()), &bytes)
+    }) {
         // Linux leaves the events in the ring when copying them out faults: the next call takes
         // them
         let mut c = c.borrow_mut();

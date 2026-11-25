@@ -423,6 +423,9 @@ pub struct FillPages {
     materialized: RefCell<BTreeMap<u64, u64>>,
     pub(crate) generation: Cell<u64>,
     pub(crate) size_stale: Cell<bool>,
+    /// A periodic background `FUSE_WRITE` is currently in flight for this inode; foreground I/O
+    /// waits for it via `wake::LOCK` so writeback and mutations stay serialized.
+    pub(crate) bg_busy: Cell<bool>,
     /// The file page where the last read ended and how many pages it took: a fault right there
     /// reads twice as much, up to [`FILL_MAX`] (Linux ramps up its read-ahead the same way).
     ahead: Cell<(u64, u64)>,
@@ -475,8 +478,13 @@ impl FillPages {
             materialized: RefCell::new(BTreeMap::new()),
             generation: Cell::new(0),
             size_stale: Cell::new(false),
+            bg_busy: Cell::new(false),
             ahead: Cell::new((u64::MAX, 0)),
         })
+    }
+
+    pub(crate) fn has_tracked(&self) -> bool {
+        !self.clean.borrow().is_empty()
     }
 
     pub(crate) fn add_writer(&self, fill: &Rc<Fill>) {
@@ -501,6 +509,7 @@ impl FillPages {
     fn track(&self, lo: u64, hi: u64) -> Result<(), Errno> {
         use std::os::unix::fs::FileExt;
         let mut clean = self.clean.borrow_mut();
+        let was_empty = clean.is_empty();
         for page in lo..hi {
             if let std::collections::btree_map::Entry::Vacant(entry) = clean.entry(page) {
                 let mut data = vec![0; PAGE_SIZE as usize];
@@ -510,6 +519,11 @@ impl FillPages {
                     .map_err(fill_errno)?;
                 entry.insert(data);
             }
+        }
+        let now_non_empty = !clean.is_empty();
+        drop(clean);
+        if was_empty && now_non_empty {
+            crate::kernel::request_wake();
         }
         Ok(())
     }
@@ -675,13 +689,63 @@ impl FillPages {
         self.size.get()
     }
 
-    /// Whether file page `page` has been read.
-    pub fn has(&self, page: u64) -> bool {
-        self.filled
-            .borrow()
-            .range(..=page)
+    fn in_runs(runs: &BTreeMap<u64, u64>, page: u64) -> bool {
+        runs.range(..=page)
             .next_back()
             .is_some_and(|(_, &end)| page < end)
+    }
+
+    /// Whether file page `page` has been read.
+    pub fn has(&self, page: u64) -> bool {
+        Self::in_runs(&self.filled.borrow(), page)
+    }
+
+    fn is_materialized(&self, page: u64) -> bool {
+        Self::in_runs(&self.materialized.borrow(), page)
+    }
+
+    /// Applies `FUSE_NOTIFY_STORE` data to the shared mapping backing: extends the backing if
+    /// needed, updates resident/materialized pages (advancing their clean baseline), and marks
+    /// newly supplied whole pages (or tail pages up to EOF) as filled so subsequent accesses need
+    /// no `FUSE_READ`. Returns whether any previously materialized page was modified.
+    pub(crate) fn notify_store(&self, offset: u64, data: &[u8]) -> Result<bool, Errno> {
+        use std::os::unix::fs::FileExt;
+        let end = offset.checked_add(data.len() as u64).ok_or(Errno::EINVAL)?;
+        if end > self.size() {
+            self.resize(end)?;
+        }
+        if data.is_empty() {
+            return Ok(false);
+        }
+        let mut changed_resident = false;
+        let mut pos = offset;
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let page = pos / PAGE_SIZE;
+            let page_start = page * PAGE_SIZE;
+            let page_end = (page_start + PAGE_SIZE).min(self.size());
+            let n = remaining.len().min((page_end - pos) as usize);
+            let slice = &remaining[..n];
+            let full_page = pos == page_start && pos + n as u64 == page_end;
+            let was_materialized = self.is_materialized(page);
+            if full_page {
+                self.host.write_all_at(slice, pos).map_err(fill_errno)?;
+                if let Some(old) = self.clean.borrow_mut().get_mut(&page) {
+                    old[..n].copy_from_slice(slice);
+                    old[n..].fill(0);
+                }
+                Self::insert_run(&mut self.filled.borrow_mut(), page, page + 1);
+                Self::insert_run(&mut self.materialized.borrow_mut(), page, page + 1);
+                changed_resident |= was_materialized;
+            } else if self.has(page) || was_materialized {
+                self.write_resident(pos, slice)?;
+                changed_resident = true;
+            }
+            pos += n as u64;
+            remaining = &remaining[n..];
+        }
+        self.generation.set(self.generation.get().wrapping_add(1));
+        Ok(changed_resident)
     }
 
     /// The first file page in `[lo, hi)` not yet read.
@@ -4543,42 +4607,122 @@ impl Mm {
         }
     }
 
-    /// Brings the pages of `[addr, addr + len)` into host memory (`MAP_POPULATE`, `MAP_LOCKED`,
-    /// `mlockall`, `remap_file_pages`), ignoring `PROT_NONE` mappings. The part of a file mapping
-    /// past the end of the file is not touched.
-    pub fn populate(&self, addr: u64, len: u64) {
-        let _ = self.populate_range(addr, len, false);
-    }
-
     /// Populates `[addr, addr + len)` for `mlock`/`mlock2` without `MLOCK_ONFAULT` (Linux 6.1's
     /// `__mm_populate(ignore_errors=false)`): stops immediately and returns `ENOMEM` when a
     /// `PROT_NONE` mapping is encountered (leaving earlier VMAs populated and later ones
     /// untouched).
+    #[cfg(test)]
     pub fn populate_mlock(&self, addr: u64, len: u64) -> Result<(), Errno> {
-        self.populate_range(addr, len, true)
+        let mut cursor = addr;
+        let end = addr.saturating_add(len);
+        while cursor < end {
+            match self.populate_mlock_step(&mut cursor, end, true)? {
+                Some((_, _, stop)) => cursor = stop,
+                None => break,
+            }
+        }
+        Ok(())
     }
 
-    fn populate_range(&self, addr: u64, len: u64, fail_on_none: bool) -> Result<(), Errno> {
-        let end = addr.saturating_add(len);
+    /// The next unread FUSE `Fill` page at or after `cursor` within `[cursor, end)` regardless of
+    /// guest permissions (Linux 6.1's `madvise_willneed` reads ahead into the page cache even on
+    /// `PROT_NONE` file mappings). Returns `(guest_page_addr, vma_stop, fill, file_page)`.
+    pub(crate) fn next_unread_fill(
+        &self,
+        cursor: u64,
+        end: u64,
+    ) -> Option<(u64, u64, Rc<Fill>, u64)> {
+        if !self.fills || cursor >= end {
+            return None;
+        }
         let first = self
             .vmas
-            .range(..=addr)
+            .range(..=cursor)
             .next_back()
-            .map_or(addr, |(&s, _)| s);
+            .map_or(cursor, |(&s, _)| s);
         for (&s, v) in self
             .vmas
             .range(first..end)
-            .filter(|&(&s, v)| s + v.len > addr)
+            .filter(|&(&s, v)| s + v.len > cursor)
         {
+            let Some(fill) = &v.fill else {
+                continue;
+            };
+            let stop = end.min(s + v.len);
+            let extent = if fill.size_stale.get() {
+                v.len
+            } else {
+                v.contents_len()
+            };
+            let from = cursor.max(s);
+            let to = stop.min(s + extent);
+            if from >= to {
+                continue;
+            }
+            let base_page = v.offset() / PAGE_SIZE;
+            let lo = (from - s) / PAGE_SIZE;
+            let hi = (to - s).div_ceil(PAGE_SIZE);
+            if let Some(fpage) = fill.first_missing(base_page + lo, base_page + hi) {
+                let guest_page = s + (fpage - base_page) * PAGE_SIZE;
+                return Some((guest_page, stop, fill.clone(), fpage));
+            }
+        }
+        None
+    }
+
+    /// Populates `[cursor, end)` for `mlock`/`mlock2`/`mlockall`/`MAP_POPULATE`/`remap_file_pages`,
+    /// yielding `Ok(Some((fill, page, vma_stop)))` when a cold FUSE `Fill` page must be fetched
+    /// outside the BKL. With `fail_on_none`, stops immediately and returns `ENOMEM` on `PROT_NONE`.
+    pub(crate) fn populate_mlock_step(
+        &self,
+        cursor: &mut u64,
+        end: u64,
+        fail_on_none: bool,
+    ) -> Result<Option<(Rc<Fill>, u64, u64)>, Errno> {
+        let start = *cursor;
+        let first = self
+            .vmas
+            .range(..=start)
+            .next_back()
+            .map_or(start, |(&s, _)| s);
+        for (&s, v) in self
+            .vmas
+            .range(first..end)
+            .filter(|&(&s, v)| s + v.len > start)
+        {
+            let from = (*cursor).max(s);
+            let stop = end.min(s + v.len);
             if v.prot == 0 {
                 if fail_on_none {
                     return Err(Errno::ENOMEM);
                 }
+                *cursor = stop;
                 continue;
             }
-            let from = addr.max(s);
+            if v.fill.is_some() {
+                let lo = from & !(PAGE_SIZE - 1);
+                let hi = page_up(stop).unwrap_or(stop);
+                let need = mmu_prot(v.prot);
+                for page in (lo..hi).step_by(PAGE_SIZE as usize) {
+                    if let Some((fill, fpage)) = v.unread(s, page) {
+                        *cursor = page;
+                        return Ok(Some((fill, fpage, stop)));
+                    }
+                    if page >= s + v.contents_len() {
+                        break;
+                    }
+                    if self.mmu.next_present(page, page + PAGE_SIZE) != page {
+                        let _ = self.try_fault_in(page, need);
+                    }
+                    // SAFETY: `page` lies within `[s, s + v.contents_len())` and is already filled.
+                    unsafe { v.populate_host((page - s) as usize, PAGE_SIZE as usize, false) };
+                }
+                *cursor = stop;
+                continue;
+            }
             let to = end.min(s + v.file_len);
             if from >= to {
+                *cursor = stop;
                 continue;
             }
             let (lo, hi) = (from & !(PAGE_SIZE - 1), page_up(to).unwrap_or(to));
@@ -4588,15 +4732,18 @@ impl Mm {
                         self.try_fault_in(page, 0).map_err(|_| Errno::EFAULT)?;
                     }
                 }
+                *cursor = stop;
                 continue;
             } else if v.backing == Backing::Anonymous {
                 if v.prot & prot::WRITE == 0 {
                     // Read-only private anonymous memory: Linux 6.1 maps the shared zero page
                     // (not counted as RSS) and does not break CoW. Skipping host touches avoids
                     // inflating mincore RSS or double-counting borrowed CoW pages in smaps.
+                    *cursor = stop;
                     continue;
                 }
                 if v.foreign() || v.region.gpu.is_some() || v.reserved() {
+                    *cursor = stop;
                     continue;
                 }
                 // Writable private anonymous memory: Linux 6.1's populate_vma_page_range faults
@@ -4616,8 +4763,10 @@ impl Mm {
             // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
             let host = unsafe { v.host.add((lo - s) as usize) };
             let _ = unsafe { self.mmu.fill_shared(lo, host, hi - lo, v.prefill_prot()) };
+            *cursor = stop;
         }
-        Ok(())
+        *cursor = end;
+        Ok(None)
     }
 
     /// File offsets intersecting shared FUSE VMAs for msync and address-space teardown.
@@ -5213,6 +5362,30 @@ impl Mm {
                 }
                 changed = true;
             }
+        }
+        self.dirty |= changed;
+        changed
+    }
+
+    /// Queue code-cache invalidation for executable mappings of `pages` overlapping `[lo, hi)`.
+    pub(crate) fn invalidate_fill_code(&mut self, pages: &Rc<FillPages>, lo: u64, hi: u64) -> bool {
+        let mut changed = false;
+        for (&start, v) in &self.vmas {
+            if v.prot & prot::EXEC == 0
+                || !v.fill.as_ref().is_some_and(|f| Rc::ptr_eq(&f.pages, pages))
+            {
+                continue;
+            }
+            let first = v.offset() / PAGE_SIZE;
+            let from = lo.max(first);
+            let to = hi.min(first + v.contents_len() / PAGE_SIZE);
+            if from >= to {
+                continue;
+            }
+            let addr = start + (from - first) * PAGE_SIZE;
+            let len = (to - from) * PAGE_SIZE;
+            self.code_ranges.push((addr, len));
+            changed = true;
         }
         self.dirty |= changed;
         changed

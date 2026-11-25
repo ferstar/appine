@@ -1738,7 +1738,7 @@ impl Vfs {
                 found = None;
                 continue;
             }
-            let node = match self.lookup(ps, &dir, &comp) {
+            let node = match self.lookup_walk(ps, &dir, &comp, &pending) {
                 Err(e) if e == Errno::ENOENT => {
                     ps.missing(&dir, &comp);
                     return Err(e);
@@ -2332,14 +2332,56 @@ impl Vfs {
         Ok(self.mounted(child))
     }
 
+    /// Looks up a name during [`walk_in`], batching consecutive uncached plain FUSE components
+    /// into one [`fuse::Query::LookupWalk`] retry so multi-component walks stay O(n) instead of
+    /// restarting from the root on every component.
+    fn lookup_walk(
+        &self,
+        ps: &dyn Pseudo,
+        dir: &Node,
+        name: &[u8],
+        pending: &VecDeque<Step>,
+    ) -> Result<Node, Errno> {
+        let Node::Fuse(mnt, f) = *dir else {
+            return self.lookup(ps, dir, name);
+        };
+        if name.len() > fuse::NAME_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        if let Some(res) = self.fuse.borrow().cached_child(f, name) {
+            return Ok(self.mounted(Node::Fuse(mnt, res?)));
+        }
+        let mut extra = pending
+            .iter()
+            .map_while(|step| match step {
+                Step::Name(c)
+                    if !c.is_empty()
+                        && c.as_slice() != b"."
+                        && c.as_slice() != b".."
+                        && c.len() <= fuse::NAME_MAX =>
+                {
+                    Some(c)
+                }
+                _ => None,
+            })
+            .peekable();
+        let q = if extra.peek().is_none() {
+            fuse::Query::Lookup(f, name.to_vec())
+        } else {
+            let mut names = vec![name.to_vec()];
+            names.extend(extra.cloned());
+            fuse::Query::LookupWalk { mnt, dir: f, names }
+        };
+        Err(fuse::need(q))
+    }
+
     /// `name` in FUSE directory `dir` from the cache, or a retry to look it up ([`fuse::need`]).
     pub(crate) fn fuse_child(&self, dir: fuse::FuseId, name: &[u8]) -> Result<fuse::FuseId, Errno> {
         if name.len() > fuse::NAME_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
         match self.fuse.borrow().cached_child(dir, name) {
-            Some(Some(id)) => Ok(id),
-            Some(None) => Err(Errno::ENOENT),
+            Some(res) => res,
             None => Err(fuse::need(fuse::Query::Lookup(dir, name.to_vec()))),
         }
     }

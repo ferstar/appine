@@ -599,7 +599,9 @@ fn sleep_rest(cx: &mut Cx<'_>, deadline: Expiry, rem: u64) -> SysResult {
         Ok(()) => Ok(0),
         Err(left) => {
             if rem != 0 {
-                write_pair(cx, rem, left.as_secs() as i64, left.subsec_nanos() as i64)?;
+                super::copy_result(cx, |cx| {
+                    write_pair(cx, rem, left.as_secs() as i64, left.subsec_nanos() as i64)
+                })?;
             }
             cx.t.restart = Some(Restart::Sleep { deadline, rem });
             Err(Errno::ERESTART_RESTARTBLOCK)
@@ -975,7 +977,9 @@ pub(crate) fn do_syslog(
                 cx.wait_object(wake::of(&*log))?;
             }
             let text = log.borrow_mut().syslog_read(len as usize);
-            cx.mm().write(UserSlice::new(buf, text.len()), &text)?;
+            super::copy_result(cx, |cx| {
+                cx.mm().write(UserSlice::new(buf, text.len()), &text)
+            })?;
             Ok(text.len() as u64)
         }
         READ_ALL | READ_CLEAR => {
@@ -983,7 +987,9 @@ pub(crate) fn do_syslog(
                 return Ok(0);
             }
             let text = log.borrow_mut().read_all(len as usize, kind == READ_CLEAR);
-            cx.mm().write(UserSlice::new(buf, text.len()), &text)?;
+            super::copy_result(cx, |cx| {
+                cx.mm().write(UserSlice::new(buf, text.len()), &text)
+            })?;
             Ok(text.len() as u64)
         }
         CLEAR => {
@@ -1567,10 +1573,12 @@ pub(super) fn getrandom(cx: &mut Cx<'_>, buf: u64, len: usize, flags: u32) -> Sy
     while done < len {
         let n = (len - done).min(IO_CHUNK);
         appine_hal::fill_random(&mut chunk[..n]).map_err(Errno)?;
-        if let Err(e) = cx.mm().write(
-            UserSlice::new(buf.wrapping_add(done as u64), n),
-            &chunk[..n],
-        ) {
+        if let Err(e) = super::copy_result(cx, |cx| {
+            cx.mm().write(
+                UserSlice::new(buf.wrapping_add(done as u64), n),
+                &chunk[..n],
+            )
+        }) {
             if done == 0 {
                 return Err(e);
             }

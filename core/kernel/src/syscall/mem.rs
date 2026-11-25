@@ -1,6 +1,7 @@
 //! Memory syscalls (the kernel/mm map; process_mrelease: the kernel/oom map).
 
 use std::os::fd::AsRawFd;
+use std::rc::Rc;
 
 use appine_engine::{PAGE_SIZE, VA_BITS, prot};
 
@@ -9,7 +10,7 @@ use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile};
 use crate::kernel::Cx;
-use crate::mm::{FileSource, MsyncStep, MsyncTarget, PopulateStep, PopulateWalk, flags};
+use crate::mm::{FileSource, Fill, Mm, MsyncStep, MsyncTarget, PopulateStep, PopulateWalk, flags};
 use crate::process::RLIMIT_MEMLOCK;
 use crate::vfs::dev::Device;
 use crate::vfs::ms;
@@ -320,19 +321,7 @@ pub(super) fn mmap(
         || flags & MAP_LOCKED != 0
         || cx.mm().lock_future && !cx.mm().lock_onfault;
     if populate {
-        cx.mm().populate(start, len);
-        // A FUSE file's pages are read now, the BKL released (errors are not reported, as on
-        // Linux)
-        if fuse_fill.is_some() && prot != 0 {
-            loop {
-                let Some(w) = cx.mm().first_unread(start, len, 0) else {
-                    break;
-                };
-                if super::fuse::fill(cx, w).is_err() {
-                    break;
-                }
-            }
-        }
+        let _ = populate_range(cx, start, len, false);
     }
     Ok(start)
 }
@@ -450,7 +439,7 @@ pub(super) fn remap_file_pages(
         .ok_or(Errno::EINVAL)?;
     cx.mm_mut().remap_file_pages(start, size, offset)?;
     if flags & MAP_NONBLOCK == 0 {
-        cx.mm().populate(start, size);
+        let _ = populate_range(cx, start, size, false);
     }
     Ok(0)
 }
@@ -562,10 +551,86 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
                     }
                 });
             }
+            if willneed && cx.mm().has_fills() {
+                willneed_fuse(cx, addr, addr.saturating_add(len));
+            }
             res.map(|()| 0)
         }
         _ => unreachable!("advice validated above"),
     }
+}
+
+/// Drives a resumable FUSE `Fill` cursor walk across `[start, end)`, fetching cold pages outside
+/// the BKL. With `strict`, daemon read errors return `ENOMEM` (`EINTR` on kill); otherwise errors
+/// skip the remainder of that VMA.
+fn fill_vma_range(
+    cx: &mut Cx<'_>,
+    start: u64,
+    end: u64,
+    strict: bool,
+    mut next: impl FnMut(&Mm, &mut u64, u64) -> Result<Option<(Rc<Fill>, u64, u64)>, Errno>,
+) -> Result<(), Errno> {
+    let mut cursor = start;
+    let mut retries = 0;
+    while cursor < end {
+        let prev = cursor;
+        let Some((fill, fpage, vma_stop)) = next(&cx.mm(), &mut cursor, end)? else {
+            break;
+        };
+        if cursor > prev {
+            retries = 0;
+        } else {
+            retries += 1;
+            if retries > super::FUSE_RETRIES {
+                if strict {
+                    return Err(Errno::ENOMEM);
+                }
+                cursor = vma_stop;
+                retries = 0;
+                continue;
+            }
+        }
+        if let Err(e) = super::fuse::fill(cx, (fill, fpage)) {
+            if strict {
+                return Err(if e == Errno::EINTR {
+                    Errno::EINTR
+                } else {
+                    Errno::ENOMEM
+                });
+            }
+            cursor = vma_stop;
+            retries = 0;
+        }
+    }
+    Ok(())
+}
+
+/// Advisory FUSE demand-readahead for `madvise(MADV_WILLNEED)`: fetches missing `Fill` pages in
+/// `[addr, end)` outside the BKL without surfacing daemon I/O errors (still returning `ENOMEM`
+/// from the caller if any unmapped gap existed).
+fn willneed_fuse(cx: &mut Cx<'_>, addr: u64, end: u64) {
+    let _ = fill_vma_range(cx, addr, end, false, |mm, cursor, end| {
+        Ok(mm
+            .next_unread_fill(*cursor, end)
+            .map(|(page, stop, fill, fpage)| {
+                *cursor = page;
+                (fill, fpage, stop)
+            }))
+    });
+}
+
+/// Populates `[start, start + len)` for `mlock`, `mlock2`, `mlockall`, `MAP_POPULATE`/`MAP_LOCKED`,
+/// and `remap_file_pages`, fetching cold FUSE `Fill` pages outside the BKL. With `fail_on_none`
+/// (`mlock`/`mlock2`), `PROT_NONE` and FUSE daemon read errors stop and return `ENOMEM` (`EINTR`
+/// on kill); otherwise (`mlockall`, `MAP_POPULATE`, `remap_file_pages`), errors are ignored.
+fn populate_range(cx: &mut Cx<'_>, start: u64, len: u64, fail_on_none: bool) -> Result<(), Errno> {
+    fill_vma_range(
+        cx,
+        start,
+        start.saturating_add(len),
+        fail_on_none,
+        |mm, cursor, end| mm.populate_mlock_step(cursor, end, fail_on_none),
+    )
 }
 
 /// Synchronous prefaulting (Linux 6.1's `madvise_populate`): validates permissions (`EINVAL`) and
@@ -635,7 +700,7 @@ pub(super) fn mlock(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32, lock: bool
     }
     cx.mm_mut().set_locked(start, span, lock)?;
     if lock && flags & MLOCK_ONFAULT == 0 {
-        cx.mm().populate_mlock(start, span)?;
+        populate_range(cx, start, span, true)?;
     }
     Ok(0)
 }
@@ -654,7 +719,7 @@ pub(super) fn mlockall(cx: &mut Cx<'_>, flags: u32) -> SysResult {
         check_memlock(cx, more)?;
         cx.mm_mut().set_all_locked(true);
         if flags & MCL_ONFAULT == 0 {
-            cx.mm().populate(0, u64::MAX);
+            let _ = populate_range(cx, 0, u64::MAX, false);
         }
     } else {
         check_memlock(cx, 0)?;

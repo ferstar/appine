@@ -1175,6 +1175,11 @@ fn ptrace_and_process_vm_cold_fuse_pages() {
 }
 
 #[test]
+fn fuse_mm_writeback_unix_lookup_and_prefault() {
+    run_guest_in_empty_rootfs("fuse_mm_fixes");
+}
+
+#[test]
 fn store_relatime_semantics_and_multichunk_reads() {
     run_guest_in_empty_rootfs("store_relatime");
 }

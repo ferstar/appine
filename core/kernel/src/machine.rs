@@ -1002,6 +1002,15 @@ fn timers(shared: Arc<Shared>) {
                 )),
             }
         }
+        // Periodic dirty-page writeback for shared FUSE mappings (honours
+        // vm.dirty_writeback_centisecs without blocking the timer thread)
+        match crate::bug::catch(|| crate::vfs::fuse::flush_dirty(&k)) {
+            Some(Some(due)) => next = Some(next.map_or(due, |n| n.min(due))),
+            Some(None) => {}
+            None => crate::bug::report(format_args!(
+                "kernel panic while flushing dirty FUSE mappings"
+            )),
+        }
         // Signal-driven I/O: every change wakes this thread, which checks along the way; host
         // sockets are waited on together
         let fasync = crate::bug::catch(|| crate::syscall::check_fasync(&mut k));

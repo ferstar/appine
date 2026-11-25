@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: Linux 6.1 `madvise` semantics for `MADV_DONTNEED_LOCKED`, `MADV_POPULATE_READ`/`WRITE`, and locked/special-VMA checks for `MADV_DONTNEED`/`FREE`/`COLD`/`PAGEOUT`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: FUSE demand-read fetching in `mlock`/`mlock2`/`mlockall` and `MADV_WILLNEED`, `FillPages::notify_store` and background writeback coordination (`bg_busy`), and FUSE syscall prefault/local-retry coverage)
 
 ## Responsibilities
 
@@ -74,10 +74,11 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `map_anonymous`, `map_vvar`, `find_free`, `set_brk`, `map_stack`, `set_start_stack`, `label`,
   `vdso_syscalls`; `fill_wanted`, `fault_past_eof`, `Cx::grow_stack`/`grow_stack_to`/`grow_for`,
   `is_mapped` (`cow_break` is `kernel/cow`'s; `mmu().translate`/`fault_in` `kernel/mmu`'s).
-- **FUSE fills & kernel access**: `FillPages::new`/`size`/`has`/`window`/`window_from`/`store`/`fd`,
-  `take_wanted`, `has_fills`, `first_unread`; `read`, `write` (breaks CoW via `kernel/cow`),
-  `translate` (no CoW break), `read_cstr`, `read_force`, `write_kernel`, `write_force`, `populate`,
-  `populate_mlock`, `mapped_above`, `check_mapped`.
+- **FUSE fills & kernel access**: `FillPages::new`/`size`/`has`/`window`/`window_from`/`store`/
+  `notify_store`/`has_tracked`/`fd`, `take_wanted`, `has_fills`, `first_unread`,
+  `next_unread_fill`, `invalidate_fill`, `invalidate_fill_code`; `read`, `write` (breaks CoW via
+  `kernel/cow`), `translate` (no CoW break), `read_cstr`, `read_force`, `write_kernel`,
+  `write_force`, `populate_mlock_step`, `mapped_above`, `check_mapped`.
 - **Files, shm, futex & introspection**: `futex_key`, `shared_maps`, `id`; `file_truncated`,
   `writably_maps`, `maps_file`, `maps_ino`, `mapped_inos`, `set_mnt`, `mapped_mounts`,
   `next_msync`, `residency_chunk`; `attach_shm`/`detach_shm`/`shm_attachments`;
@@ -296,12 +297,14 @@ signals may still be delivered).
   (`EPERM` with a limit of 0, `ENOMEM` above it; skipped with `CAP_IPC_LOCK`) a range that wraps
   past the end is `EINVAL` and an empty one succeeds; `set_locked` walks contiguous mapped VMAs
   from `start` and stops at the first unmapped gap (`ENOMEM`, leaving earlier contiguous VMAs
-  updated, later VMAs untouched, and skipping `populate_mlock`); on a fully mapped lock without
-  `MLOCK_ONFAULT`, `populate_mlock` stops at the first `PROT_NONE` VMA (`ENOMEM`, leaving the range
-  locked), skips read-only private anonymous VMAs so RSS stays 0 and CoW stays intact, and settles
-  CoW plus atomically write-faults writable private anonymous VMAs so real private host pages are
-  resident. `mlockall(MCL_CURRENT)` checks the whole size (`PROT_NONE` reservations included)
-  against the limit, locks every VMA and populates unless `MCL_ONFAULT`; `MCL_FUTURE` makes new
+  updated, later VMAs untouched, and skipping population); on a fully mapped lock without
+  `MLOCK_ONFAULT`, `populate_range` (`populate_mlock_step`) fetches missing FUSE `Fill` pages
+  unlocked via `fuse::fill` (`ENOMEM` on daemon read error, `EINTR` on kill), stops at the first
+  `PROT_NONE` VMA (`ENOMEM`, leaving the range locked), skips read-only private anonymous VMAs so
+  RSS stays 0 and CoW stays intact, and settles CoW plus atomically write-faults writable private
+  anonymous VMAs so real private host pages are resident. `mlockall(MCL_CURRENT)` checks the whole
+  size (`PROT_NONE` reservations included) against the limit, locks every VMA and populates
+  (including cold FUSE `Fill` pages, ignoring errors) unless `MCL_ONFAULT`; `MCL_FUTURE` makes new
   VMAs locked, uncharged.
 - `madvise`: alignment/length/unknown advice (counted as unimplemented) `EINVAL`; length 0 succeeds.
   Walks mapped VMAs in order like Linux 6.1's `do_madvise`: unmapped gaps are skipped and reported
@@ -314,10 +317,11 @@ signals may still be delivered).
   slice ends and sets the flag. `MADV_COLD`/`MADV_PAGEOUT` (`check_lru`) and `MADV_FREE`
   (`check_free`) validate every mapped VMA in range via `check_vmas`. Non-destructive hints
   (`NORMAL`/`RANDOM`/`SEQUENTIAL`/`WILLNEED`) prefill RO non-FUSE file soft PTEs up to 4 GB/call
-  for `WILLNEED` (`prefill_file_ptes`) and forward to `appine_hal::advise` unlocked via coalesced
-  `AdviseRange`s clipped to `file_len` (skipping reserved/foreign/GPU/`Fill` VMAs;
-  `NORMAL`/`RANDOM`/`SEQUENTIAL` file-backed only; `WILLNEED` skips untouched anon) before
-  reporting any gap as `ENOMEM`.
+  for `WILLNEED` (`prefill_file_ptes`), fetch missing FUSE `Fill` pages unlocked for `WILLNEED`
+  (`willneed_fuse` → `next_unread_fill` + `fuse::fill`, advisory regardless of guest `prot`), and
+  forward non-FUSE ranges to `appine_hal::advise` unlocked via coalesced `AdviseRange`s clipped to
+  `file_len` (skipping reserved/foreign/GPU/`Fill` VMAs; `NORMAL`/`RANDOM`/`SEQUENTIAL` file-backed
+  only; `WILLNEED` skips untouched anon) before reporting any gap as `ENOMEM`.
 - `MADV_POPULATE_READ` / `MADV_POPULATE_WRITE` (`madvise_populate` → `populate_step`): check guest
   `PROT_READ`/`PROT_WRITE` and refuse `[vvar]`/GPU (`EINVAL`), refresh stale file extents, fault
   tmpfs (charging quota and updating shared write times) and software-tracked private files, read
@@ -447,10 +451,6 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
-- **FUSE demand reads:** mlock and `MADV_WILLNEED` do not fetch missing pages.
-  A handler that has already consumed input can repeat its effects on a whole-syscall retry
-  or return a short count. The dispatcher prefaults read/write, positional
-  and vectored I/O buffers. Socket receives, wait4/waitid, msgrcv, mq_timedreceive and rt_sigtimedwait retry their result copies locally.
 - **Approximate Linux VMA boundaries:** anonymous pieces join ignoring page offsets (mremap-moved
   VMAs join new neighbours); `MREMAP_DONTUNMAP` of a multi-piece VMA needs one VMA slot per piece,
   and in-place growth adds a VMA.

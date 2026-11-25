@@ -131,6 +131,7 @@ mod init {
     pub const EXPORT_SUPPORT: u32 = 1 << 4;
     pub const BIG_WRITES: u32 = 1 << 5;
     pub const DONT_MASK: u32 = 1 << 6;
+    pub const AUTO_INVAL_DATA: u32 = 1 << 12;
     pub const NO_OPEN_SUPPORT: u32 = 1 << 17;
     pub const PARALLEL_DIROPS: u32 = 1 << 18;
     pub const HANDLE_KILLPRIV: u32 = 1 << 19;
@@ -147,6 +148,7 @@ mod init {
         | EXPORT_SUPPORT
         | BIG_WRITES
         | DONT_MASK
+        | AUTO_INVAL_DATA
         | NO_OPEN_SUPPORT
         | PARALLEL_DIROPS
         | HANDLE_KILLPRIV
@@ -520,18 +522,36 @@ pub(crate) mod no {
     pub const RENAME2: u64 = 1 << 14;
 }
 
+/// In-flight periodic background writeback state: clears `FillPages::bg_busy` and wakes
+/// foreground I/O waiters on completion, error, oversized-request drop, or connection abort.
+struct BgWriteback {
+    id: FuseId,
+    pages: Rc<FillPages>,
+    offset: u64,
+    data: Vec<u8>,
+}
+
+impl Drop for BgWriteback {
+    fn drop(&mut self) {
+        self.pages.bg_busy.set(false);
+        crate::kernel::request_wake_locks();
+    }
+}
+
 /// One request (Linux's `struct fuse_req`).
 struct Req {
     /// The whole message, header included.
     message: Vec<u8>,
     state: ReqState,
-    /// Nobody waits for the reply (RELEASE, INIT): it is dropped, or for INIT handled by the
-    /// connection.
+    /// Nobody waits for the reply (RELEASE, INIT, periodic writeback): it is dropped, or handled
+    /// in `dev_write` when the reply arrives.
     background: bool,
     /// Waited for even by a killed caller (6.1's `FR_FORCE`: FLUSH).
     force: bool,
     /// An interrupt was queued for it.
     interrupted: bool,
+    /// Present for periodic background `FUSE_WRITE` requests.
+    writeback: Option<BgWriteback>,
 }
 
 enum ReqState {
@@ -668,9 +688,28 @@ impl Conn {
                 background,
                 force,
                 interrupted: false,
+                writeback: None,
             },
         );
         self.pending.push_back(unique);
+        unique
+    }
+
+    /// Queues a periodic background `FUSE_WRITE` with `FUSE_WRITE_CACHE` for a dirty mapped range.
+    fn queue_writeback(&mut self, nodeid: u64, fh: u64, flags: u32, wb: BgWriteback) -> u64 {
+        let args = Args::default()
+            .u64(fh)
+            .u64(wb.offset)
+            .u32(wb.data.len() as u32)
+            .u32(1) // FUSE_WRITE_CACHE
+            .u64(0)
+            .u32(flags)
+            .u32(0)
+            .bytes(&wb.data);
+        let unique = self.queue(op::WRITE, nodeid, None, &args.0, (true, false));
+        if let Some(r) = self.requests.get_mut(&unique) {
+            r.writeback = Some(wb);
+        }
         unique
     }
 
@@ -1167,6 +1206,12 @@ pub(crate) fn dev_read(
                 // A request the buffer cannot hold ends with EIO (E2BIG for a SETXATTR, whose
                 // value may be too large), and the read goes on with the next one
                 if r.message.len() > len {
+                    if r.background {
+                        if let Some(r) = c.requests.remove(&unique) {
+                            c.note_request_done(&r.message);
+                        }
+                        continue;
+                    }
                     let opcode = u32::from_le_bytes(r.message[4..8].try_into().unwrap());
                     let e = if opcode == op::SETXATTR {
                         Errno::E2BIG
@@ -1291,7 +1336,8 @@ pub(crate) fn dev_write(
     if background {
         // A release for a doomed node (from drop_caches or unlink): once no open handle remains,
         // forget it at the end of this syscall.
-        if let Some(r) = c.requests.remove(&unique)
+        let removed = c.requests.remove(&unique);
+        if let Some(r) = &removed
             && matches!(opcode, op::RELEASE | op::RELEASEDIR)
         {
             c.note_request_done(&r.message);
@@ -1300,6 +1346,12 @@ pub(crate) fn dev_write(
             init_reply(&mut c, reply);
             drop(c);
             request_wake_object(answers(&conn));
+            return Ok(len);
+        }
+        let wb = removed.and_then(|r| r.writeback);
+        drop(c);
+        if let Some(wb) = wb {
+            finish_bg_writeback(vfs, wb, reply);
         }
         return Ok(len);
     }
@@ -1315,20 +1367,207 @@ pub(crate) fn mapped_pages(vfs: &super::Vfs, id: FuseId) -> Option<Rc<FillPages>
     vfs.fuse().get(id)?.pages.upgrade()
 }
 
-/// Revoke all translations before marking the file pages stale. The daemon may still owe a
-/// READ reply, so this runs under the BKL without acquiring the inode I/O lock.
-fn invalidate_pages(cx: &Cx<'_>, pages: &Rc<FillPages>, lo: u64, hi: u64) {
+fn for_each_mm(cx: &Cx<'_>, mut f: impl FnMut(&mut crate::mm::Mm) -> bool) {
     let mut seen = HashSet::new();
     for task in cx.kr().tasks.values() {
         let mm = task.res.borrow().mm.clone();
         if seen.insert(Rc::as_ptr(&mm)) {
             let mut mm = mm.borrow_mut();
-            if mm.invalidate_fill(pages, lo, hi) {
+            if f(&mut mm) {
                 mm.sync(&cx.task.sync);
             }
         }
     }
+}
+
+/// Revoke all translations before marking the file pages stale. The daemon may still owe a
+/// READ reply, so this runs under the BKL without acquiring the inode I/O lock.
+fn invalidate_pages(cx: &Cx<'_>, pages: &Rc<FillPages>, lo: u64, hi: u64) {
+    for_each_mm(cx, |mm| mm.invalidate_fill(pages, lo, hi));
     pages.invalidate(lo, hi);
+}
+
+/// Queue Tier 1 code-cache invalidation for executable mappings of `pages` overlapping `[lo, hi)`.
+fn invalidate_code_pages(cx: &Cx<'_>, pages: &Rc<FillPages>, lo: u64, hi: u64) {
+    for_each_mm(cx, |mm| mm.invalidate_fill_code(pages, lo, hi));
+}
+
+/// Processes the daemon's reply to a periodic background `FUSE_WRITE`, advancing the clean
+/// baseline for acknowledged bytes and chaining the next dirty chunk if the node is still idle.
+fn finish_bg_writeback(vfs: &super::Vfs, wb: BgWriteback, reply: Result<Vec<u8>, Errno>) {
+    let id = wb.id;
+    let acked = match reply {
+        Ok(r) => Fields::new(&r)
+            .u32()
+            .ok()
+            .map(|n| n as usize)
+            .filter(|&n| n <= wb.data.len()),
+        Err(_) => None,
+    };
+    let mut chain = false;
+    if let Some(n) = acked {
+        wb.pages.acknowledge(wb.offset, &wb.data[..n]);
+        if let Ok(mut f) = vfs.fuse.try_borrow_mut() {
+            f.stale(id);
+        }
+        chain = n == wb.data.len();
+    }
+    // Drops `wb`, clearing `FillPages::bg_busy` and waking any foreground `with_io` waiter.
+    drop(wb);
+    if chain {
+        let _ = queue_next_bg_writeback(vfs, id);
+    }
+}
+
+/// Queues the next dirty byte run for node `id` as a background `FUSE_WRITE` when no foreground
+/// I/O or background writeback is in progress. Returns whether a request was queued.
+fn queue_next_bg_writeback(vfs: &super::Vfs, id: FuseId) -> bool {
+    let (conn, nodeid, pages, fh, flags) = {
+        let Ok(mut f) = vfs.fuse.try_borrow_mut() else {
+            return false;
+        };
+        let Some(n) = f.nodes.get_mut(&id) else {
+            return false;
+        };
+        if n.io_busy {
+            return false;
+        }
+        let Some(pages) = n.pages.upgrade() else {
+            n.retry_writeback = None;
+            return false;
+        };
+        if pages.bg_busy.get() || pages.size_stale.get() || !pages.has_tracked() {
+            return false;
+        }
+        let Some(writer) = pages.writer() else {
+            return false;
+        };
+        let (conn, nodeid, fh, flags) = {
+            let Ok(file) = writer.source.try_borrow() else {
+                return false;
+            };
+            match &file.kind {
+                crate::fd::FileKind::Fuse(h) => (h.conn.clone(), h.nodeid, h.fh, h.flags),
+                _ => return false,
+            }
+        };
+        (conn, nodeid, pages, fh, flags)
+    };
+    let max_write = {
+        let Ok(c) = conn.try_borrow() else {
+            return false;
+        };
+        if c.aborted || c.state != InitState::Ready {
+            return false;
+        }
+        c.max_write as usize
+    };
+    let mut next_run = None;
+    for page in pages.tracked(0, u64::MAX) {
+        let Ok(runs) = pages.dirty_runs(page) else {
+            return false;
+        };
+        if let Some((at, mut data)) = runs.into_iter().next() {
+            let len = (data.len() as u64)
+                .min(pages.size().saturating_sub(at))
+                .min(max_write as u64) as usize;
+            if len != 0 {
+                data.truncate(len);
+                next_run = Some((at, data));
+                break;
+            }
+        }
+    }
+    let Some((offset, data)) = next_run else {
+        if let Ok(mut f) = vfs.fuse.try_borrow_mut()
+            && let Some(n) = f.nodes.get_mut(&id)
+        {
+            n.retry_writeback = None;
+        }
+        return false;
+    };
+    let Ok(mut c) = conn.try_borrow_mut() else {
+        return false;
+    };
+    if c.aborted || c.state != InitState::Ready {
+        return false;
+    }
+    pages.bg_busy.set(true);
+    let wb = BgWriteback {
+        id,
+        pages,
+        offset,
+        data,
+    };
+    c.queue_writeback(nodeid, fh, flags, wb);
+    drop(c);
+    request_wake_object(readers(&conn));
+    true
+}
+
+/// Periodic dirty-page writeback for shared writable FUSE mappings (called from the timer thread
+/// under the BKL; never blocks). Honours `/proc/sys/vm/dirty_writeback_centisecs` (default 500 =
+/// 5 s; `<= 0` disables periodic writeback) and returns `None` when no writable shared FUSE
+/// mapping exists so the timer thread stays idle.
+pub(crate) fn flush_dirty(k: &crate::kernel::Kernel) -> Option<Instant> {
+    let vfs = k.vfs.as_ref()?;
+    let centisecs = k
+        .sysctls
+        .get(b"sys/vm/dirty_writeback_centisecs".as_slice())
+        .copied()
+        .unwrap_or(500);
+    if centisecs <= 0 {
+        if let Ok(mut f) = vfs.fuse.try_borrow_mut() {
+            f.next_writeback = None;
+        }
+        return None;
+    }
+    let interval = Duration::from_millis((centisecs as u64).saturating_mul(10).max(10));
+    let now = Instant::now();
+    let (ids, due) = {
+        let Ok(mut f) = vfs.fuse.try_borrow_mut() else {
+            return Some(now + interval);
+        };
+        let Fuses {
+            mapped,
+            nodes,
+            next_writeback,
+            ..
+        } = &mut *f;
+        let mut active = Vec::new();
+        mapped.retain(|&id| {
+            let Some(n) = nodes.get(&id) else {
+                return false;
+            };
+            let Some(p) = n.pages.upgrade() else {
+                return false;
+            };
+            if n.retry_writeback.is_some() || (p.writer().is_some() && p.has_tracked()) {
+                active.push(id);
+            }
+            true
+        });
+        if active.is_empty() {
+            *next_writeback = None;
+            return None;
+        }
+        let Some(target) = next_writeback.map(|due| due.min(now + interval)) else {
+            let first = now + interval;
+            *next_writeback = Some(first);
+            return Some(first);
+        };
+        if now < target {
+            *next_writeback = Some(target);
+            return Some(target);
+        }
+        let next = now + interval;
+        *next_writeback = Some(next);
+        (active, next)
+    };
+    for id in ids {
+        let _ = queue_next_bg_writeback(vfs, id);
+    }
+    Some(due)
 }
 
 /// Daemon notifications for cached attributes, directory entries and mapped file ranges.
@@ -1383,7 +1622,37 @@ fn notification(
             vfs.fuse_mut().invalidate_entry(dev, parent, name);
             Ok(())
         }
-        notify::POLL | notify::STORE => Ok(()),
+        notify::STORE => {
+            let nodeid = f.u64()?;
+            let offset = f.u64()?;
+            let size = f.u32()?;
+            let _padding = f.u32()?;
+            let data = f.rest();
+            if data.len() != size as usize {
+                return Err(Errno::EINVAL);
+            }
+            let end = offset.checked_add(u64::from(size)).ok_or(Errno::EINVAL)?;
+            let pages = {
+                let mut nodes = vfs.fuse_mut();
+                let id = *nodes.by_nodeid.get(&(dev, nodeid)).ok_or(Errno::ENOENT)?;
+                let n = nodes.nodes.get_mut(&id).ok_or(Errno::ENOENT)?;
+                if end > n.attr.size {
+                    n.attr.size = end;
+                }
+                n.pages.upgrade()
+            };
+            if let Some(pages) = pages
+                && size > 0
+                && pages.notify_store(offset, data)?
+            {
+                use appine_engine::PAGE_SIZE;
+                let lo = offset / PAGE_SIZE;
+                let hi = end.div_ceil(PAGE_SIZE);
+                invalidate_code_pages(cx, &pages, lo, hi);
+            }
+            Ok(())
+        }
+        notify::POLL => Ok(()),
         notify::RETRIEVE => Err(Errno::ENOSYS),
         _ => Err(Errno::EINVAL),
     }
@@ -1405,6 +1674,10 @@ pub(crate) struct Fuses {
     /// backs off above remaining live nodes after a sweep so working sets above [`NODES_MAX`] do
     /// not scan on every entry, and resets as nodes drop or `drop_caches` runs.
     sweep_at: usize,
+    /// Nodes that currently have a live [`FillPages`] (tracked for periodic writeback).
+    mapped: HashSet<FuseId>,
+    /// Next periodic dirty-page writeback tick, or `None` when idle.
+    next_writeback: Option<Instant>,
 }
 
 impl Default for Fuses {
@@ -1416,6 +1689,8 @@ impl Default for Fuses {
             next: 0,
             clock: 0,
             sweep_at: NODES_MAX,
+            mapped: HashSet::new(),
+            next_writeback: None,
         }
     }
 }
@@ -1457,6 +1732,8 @@ pub(crate) struct Node {
     /// Until when they are valid (None: no longer), or the syscall that fetched them ([`token`]).
     attr_until: Option<Instant>,
     attr_token: u64,
+    /// Whether `attr` has been populated by a daemon reply (`LOOKUP`, `GETATTR`, `SETATTR`).
+    attr_seen: bool,
     /// What lookups said about names in this directory: the node (None: no such name), until
     /// when, and the syscall that asked.
     children: HashMap<Vec<u8>, (Option<FuseId>, Option<Instant>, u64)>,
@@ -1478,6 +1755,8 @@ pub(crate) struct Node {
     nlookup: u64,
     /// Shared by O_PATH descriptions, which have no daemon file handle.
     path_pin: Weak<()>,
+    /// Live AF_UNIX socket bound to this node, pinning it against cache eviction while bound.
+    sock_pin: Weak<RefCell<crate::net::Socket>>,
     /// True once `unlink`, `rmdir`, or an overwriting `rename` removed the node's last link.
     pub unlinked: bool,
     /// When it was last entered ([`Fuses::clock`]): the oldest go first.
@@ -1541,6 +1820,7 @@ impl Fuses {
                 },
                 attr_until: None,
                 attr_token: 0,
+                attr_seen: false,
                 children: HashMap::new(),
                 link: None,
                 io_busy: false,
@@ -1550,6 +1830,7 @@ impl Fuses {
                 retry_writeback: None,
                 nlookup: 0,
                 path_pin: Weak::new(),
+                sock_pin: Weak::new(),
                 unlinked: false,
                 seen: 0,
             },
@@ -1579,10 +1860,23 @@ impl Fuses {
         let wake_locks = self.nodes.values().any(|n| n.dev == dev && n.is_locked());
         self.nodes.retain(|_, n| n.dev != dev);
         self.by_nodeid.retain(|&(d, _), _| d != dev);
+        self.mapped.retain(|id| self.nodes.contains_key(id));
         self.sweep_at = self.sweep_at.min(Self::next_sweep_at(self.nodes.len()));
         if wake_locks {
             crate::kernel::request_wake_locks();
         }
+    }
+
+    /// Pins node `id` against cache eviction while AF_UNIX socket `sock` stays bound to it.
+    pub fn pin_socket(&mut self, id: FuseId, sock: &Rc<RefCell<crate::net::Socket>>) {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.sock_pin = Rc::downgrade(sock);
+        }
+    }
+
+    /// Records node `id` as having a live [`FillPages`] so periodic writeback can find it.
+    pub fn track_mapped(&mut self, id: FuseId) {
+        self.mapped.insert(id);
     }
 
     /// The device numbers of every instance.
@@ -1620,11 +1914,16 @@ impl Fuses {
         self.conn(n.dev).ok_or(Errno::ENOTCONN)
     }
 
-    /// What the cache knows of `name` in directory `dir`: Some(Some(node)), Some(None) for no such
-    /// name, None when it must be looked up.
-    pub fn cached_child(&self, dir: FuseId, name: &[u8]) -> Option<Option<FuseId>> {
-        let (node, until, t) = self.nodes.get(&dir)?.children.get(name)?;
-        fresh(*until, *t).then_some(*node)
+    /// What the cache knows of `name` in directory `dir`: `Some(Ok(node))`, `Some(Err(ENOENT))`
+    /// for a cached negative entry, `Some(Err(e))` for a non-`ENOENT` lookup error recorded for
+    /// this syscall, or `None` when it must be looked up.
+    pub fn cached_child(&self, dir: FuseId, name: &[u8]) -> Option<Result<FuseId, Errno>> {
+        if let Some((node, until, t)) = self.nodes.get(&dir)?.children.get(name)
+            && fresh(*until, *t)
+        {
+            return Some(node.ok_or(Errno::ENOENT));
+        }
+        lookup_error(dir, name).map(Err)
     }
 
     /// The node of an entry the daemon returned for `name` in directory `dir` (a lookup, or a
@@ -1676,6 +1975,7 @@ impl Fuses {
                         attr: e.attr,
                         attr_until: None,
                         attr_token: 0,
+                        attr_seen: false,
                         children: HashMap::new(),
                         link: None,
                         io_busy: false,
@@ -1685,6 +1985,7 @@ impl Fuses {
                         retry_writeback: None,
                         nlookup: 1,
                         path_pin: Weak::new(),
+                        sock_pin: Weak::new(),
                         unlinked: false,
                         seen: 0,
                     },
@@ -1712,7 +2013,9 @@ impl Fuses {
         n.attr = e.attr;
         n.attr_until = e.attr_until;
         n.attr_token = t;
+        n.attr_seen = true;
         n.link = None;
+        clear_lookup_error(dir, name);
         self.nodes
             .get_mut(&dir)
             .unwrap()
@@ -1770,7 +2073,9 @@ impl Fuses {
                 if n.dev != c.dev {
                     continue;
                 }
-                let open = n.path_pin.strong_count() != 0 || c.opens.contains_key(&n.nodeid);
+                let open = n.path_pin.strong_count() != 0
+                    || n.sock_pin.strong_count() != 0
+                    || c.opens.contains_key(&n.nodeid);
                 let locked = n.is_locked();
                 if n.nodeid == ROOT_ID || open || locked || busy.contains(&n.nodeid) {
                     kept.insert(id);
@@ -1946,6 +2251,7 @@ impl Fuses {
     /// and its lookups are queued as a forget.
     fn forget_node(&mut self, id: FuseId) {
         let n = self.nodes.remove(&id).unwrap();
+        self.mapped.remove(&id);
         if self.by_nodeid.get(&(n.dev, n.nodeid)) == Some(&id) {
             self.by_nodeid.remove(&(n.dev, n.nodeid));
         }
@@ -1974,6 +2280,7 @@ impl Fuses {
 
     /// Records that directory `dir` has no `name`, for `until` and this syscall.
     pub fn enter_negative(&mut self, dir: FuseId, name: &[u8], until: Option<Instant>) {
+        clear_lookup_error(dir, name);
         if let Some(n) = self.nodes.get_mut(&dir) {
             n.children.insert(name.to_vec(), (None, until, token()));
         }
@@ -1982,6 +2289,7 @@ impl Fuses {
     /// Drops what the cache knows of `name` in directory `dir` (removed or renamed through the
     /// mount, or invalidated by the daemon).
     pub fn forget_child(&mut self, dir: FuseId, name: &[u8]) {
+        clear_lookup_error(dir, name);
         if let Some(n) = self.nodes.get_mut(&dir) {
             n.children.remove(name);
         }
@@ -2012,6 +2320,7 @@ impl Fuses {
             };
             n.attr_until = until;
             n.attr_token = token();
+            n.attr_seen = true;
         }
     }
 
@@ -2090,6 +2399,14 @@ pub(crate) fn attr_out(reply: &[u8], ns: &UserNs) -> Result<(Attr, Option<Instan
 #[derive(Debug, Clone)]
 pub(crate) enum Query {
     Lookup(FuseId, Vec<u8>),
+    /// A batch of consecutive plain components from a path walk inside mount `mnt`, resolved in
+    /// one retry while checking directory type, mount crossings, and search permission at each
+    /// step.
+    LookupWalk {
+        mnt: super::MountId,
+        dir: FuseId,
+        names: Vec<Vec<u8>>,
+    },
     Getattr(FuseId, Option<u64>),
     Readlink(FuseId),
     /// A program to execute, read whole ([`program`]).
@@ -2103,11 +2420,43 @@ thread_local! {
     /// The query the last [`Errno::FUSE_RETRY`] stands for.
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static QUERY: std::cell::RefCell<Option<Query>> = const { std::cell::RefCell::new(None) };
+    /// Non-`ENOENT` lookup errors seen in this syscall, keyed by `(dir, name)`, so walks and
+    /// syscall handlers receive the error directly on retry (and can tolerate it when appropriate)
+    /// instead of `serve()` aborting the syscall prematurely.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static LOOKUP_ERRORS: std::cell::RefCell<Vec<(FuseId, Vec<u8>, Errno)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// The programs execve read from FUSE nodes in this syscall (the program, its interpreters):
     /// dropped when the next syscall starts.
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static PROGRAMS: std::cell::RefCell<Vec<(FuseId, std::fs::File)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn lookup_error(dir: FuseId, name: &[u8]) -> Option<Errno> {
+    LOOKUP_ERRORS.with_borrow(|errs| {
+        errs.iter()
+            .find(|(d, n, _)| *d == dir && n.as_slice() == name)
+            .map(|(_, _, e)| *e)
+    })
+}
+
+fn record_lookup_error(dir: FuseId, name: Vec<u8>, err: Errno) {
+    LOOKUP_ERRORS.with_borrow_mut(|errs| {
+        if let Some(slot) = errs.iter_mut().find(|(d, n, _)| *d == dir && *n == name) {
+            slot.2 = err;
+        } else {
+            errs.push((dir, name, err));
+        }
+    });
+}
+
+fn clear_lookup_error(dir: FuseId, name: &[u8]) {
+    LOOKUP_ERRORS.with_borrow_mut(|errs| {
+        if !errs.is_empty() {
+            errs.retain(|(d, n, _)| !(*d == dir && n.as_slice() == name));
+        }
+    });
 }
 
 /// A copy of FUSE node `id`'s data for execve, when this syscall has read it ([`Query::Program`]):
@@ -2131,6 +2480,9 @@ pub(crate) fn token() -> u64 {
 pub(crate) fn new_syscall() {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     TOKEN.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    if LOOKUP_ERRORS.with_borrow(|e| !e.is_empty()) {
+        LOOKUP_ERRORS.with_borrow_mut(Vec::clear);
+    }
     if PROGRAMS.with_borrow(|p| !p.is_empty()) {
         PROGRAMS.with_borrow_mut(Vec::clear);
     }
@@ -2143,10 +2495,53 @@ pub(crate) fn need(q: Query) -> Errno {
     Errno::FUSE_RETRY
 }
 
+/// Checks whether the caller may search directory `dir` before continuing a batched
+/// [`Query::LookupWalk`], matching [`super::Vfs::fuse_permission`] without issuing a nested retry.
+fn may_search_in_walk(
+    cx: &mut Cx<'_>,
+    vfs: &super::Vfs,
+    cred: &Cred,
+    dir: FuseId,
+) -> Result<bool, Errno> {
+    let (allowed, default_permissions, cached) = {
+        let f = vfs.fuse();
+        let Some(n) = f.get(dir) else {
+            return Ok(false);
+        };
+        if n.kind() != mode::S_IFDIR {
+            return Ok(false);
+        }
+        let Ok(conn) = f.conn_of(dir) else {
+            return Ok(false);
+        };
+        let c = conn.borrow();
+        (
+            c.allows(cred),
+            c.opts.default_permissions,
+            n.fresh_attr().copied(),
+        )
+    };
+    if !allowed {
+        return Ok(false);
+    }
+    if !default_permissions || cred.searches_all() {
+        return Ok(true);
+    }
+    let attr = match cached {
+        Some(a) => a,
+        None => match getattr(cx, vfs, dir, None, false) {
+            Ok(a) => a,
+            Err(Errno::EINTR) => return Err(Errno::EINTR),
+            Err(_) => return Ok(false),
+        },
+    };
+    Ok(cred.permission(&attr.stat(), crate::cred::MAY_EXEC).is_ok())
+}
+
 /// Asks the daemon what the last [`need`] recorded and caches the answer for this syscall, with
-/// the BKL released; the dispatcher then runs the syscall again. A lookup of a missing name is
-/// cached as such; any other error ends the syscall with it, as a failed lookup ends Linux's
-/// walk.
+/// the BKL released; the dispatcher then runs the syscall again. Lookup errors (other than
+/// `EINTR`) are cached for this syscall so walks and handlers receive them directly and can
+/// tolerate them when Linux VFS rules allow.
 pub(crate) fn serve(
     cx: &mut Cx<'_>,
     program_opened: impl FnOnce(&crate::kernel::Kernel, FuseId),
@@ -2158,8 +2553,46 @@ pub(crate) fn serve(
     match q {
         Query::Lookup(dir, name) => match lookup(cx, &vfs, dir, &name) {
             Ok(_) | Err(Errno::ENOENT) => Ok(()),
-            Err(e) => Err(e),
+            Err(Errno::EINTR) => Err(Errno::EINTR),
+            Err(e) => {
+                record_lookup_error(dir, name, e);
+                Ok(())
+            }
         },
+        Query::LookupWalk { mnt, dir, names } => {
+            let cred = cx.cred();
+            let mut cur = dir;
+            for (i, name) in names.into_iter().enumerate() {
+                if i > 0 {
+                    if cx.task.killed.get() {
+                        return Err(Errno::EINTR);
+                    }
+                    // Never cross a mount point inside the batched FUSE walk.
+                    let node = super::Node::Fuse(mnt, cur);
+                    if vfs.mounted(node.clone()) != node {
+                        break;
+                    }
+                    if !may_search_in_walk(cx, &vfs, &cred, cur)? {
+                        break;
+                    }
+                }
+                let cached = vfs.fuse().cached_child(cur, &name);
+                match cached {
+                    Some(Ok(next)) => cur = next,
+                    Some(Err(_)) => break,
+                    None => match lookup(cx, &vfs, cur, &name) {
+                        Ok(next) => cur = next,
+                        Err(Errno::ENOENT) => break,
+                        Err(Errno::EINTR) => return Err(Errno::EINTR),
+                        Err(e) => {
+                            record_lookup_error(cur, name, e);
+                            break;
+                        }
+                    },
+                }
+            }
+            Ok(())
+        }
         Query::Getattr(id, fh) => getattr(cx, &vfs, id, fh, false).map(|_| ()),
         Query::Program(id) => {
             use crate::fd::oflags;
@@ -2209,9 +2642,34 @@ pub(crate) fn lookup(
         }
         r => r?,
     };
-    let ns = conn.borrow().user_ns.clone();
+    let (ns, dev, auto_inval) = {
+        let c = conn.borrow();
+        (
+            c.user_ns.clone(),
+            c.dev,
+            c.flags & init::AUTO_INVAL_DATA != 0,
+        )
+    };
     match Entry::parse(&reply, &ns)? {
-        Ok(e) => vfs.fuse_mut().enter(dir, name, &e),
+        Ok(e) => {
+            let inval = auto_inval
+                .then(|| {
+                    let f = vfs.fuse();
+                    let id = *f.by_nodeid.get(&(dev, e.nodeid))?;
+                    let n = f.get(id)?;
+                    ((n.attr.mode ^ e.attr.mode) & mode::S_IFMT == 0
+                        && n.attr_seen
+                        && (e.attr.size != n.attr.size || e.attr.mtime_ns != n.attr.mtime_ns))
+                        .then(|| n.pages.upgrade())
+                        .flatten()
+                })
+                .flatten();
+            let id = vfs.fuse_mut().enter(dir, name, &e)?;
+            if let Some(pages) = inval {
+                invalidate_pages(cx, &pages, 0, u64::MAX);
+            }
+            Ok(id)
+        }
         Err(until) => {
             vfs.fuse_mut().enter_negative(dir, name, until);
             Err(Errno::ENOENT)
@@ -2220,13 +2678,37 @@ pub(crate) fn lookup(
 }
 
 /// `FUSE_GETATTR` of node `id` (through open file handle `fh` when given, `FUSE_GETATTR_FH`),
-/// cached.
+/// cached. Under `FUSE_AUTO_INVAL_DATA`, invalidates resident mapped pages if size or mtime
+/// changed on the daemon.
 pub(crate) fn getattr(
     cx: &mut Cx<'_>,
     vfs: &super::Vfs,
     id: FuseId,
     fh: Option<u64>,
     forced: bool,
+) -> Result<Attr, Errno> {
+    getattr_inner(cx, vfs, id, fh, forced, true)
+}
+
+/// [`getattr`] without `FUSE_AUTO_INVAL_DATA` page invalidation (used by `refresh_mapping_size`
+/// while servicing an invalidation so it cannot trigger a second invalidation loop).
+pub(crate) fn getattr_no_inval(
+    cx: &mut Cx<'_>,
+    vfs: &super::Vfs,
+    id: FuseId,
+    fh: Option<u64>,
+    forced: bool,
+) -> Result<Attr, Errno> {
+    getattr_inner(cx, vfs, id, fh, forced, false)
+}
+
+fn getattr_inner(
+    cx: &mut Cx<'_>,
+    vfs: &super::Vfs,
+    id: FuseId,
+    fh: Option<u64>,
+    forced: bool,
+    auto_inval_check: bool,
 ) -> Result<Attr, Errno> {
     const GETATTR_FH: u32 = 1;
     let (conn, nodeid) = target(vfs, id)?;
@@ -2242,15 +2724,30 @@ pub(crate) fn getattr(
         &args.0,
         forced,
     )?;
-    let ns = conn.borrow().user_ns.clone();
+    let (ns, auto_inval) = {
+        let c = conn.borrow();
+        (c.user_ns.clone(), c.flags & init::AUTO_INVAL_DATA != 0)
+    };
     let (attr, until) = attr_out(&reply, &ns)?;
-    let mut f = vfs.fuse_mut();
-    let old = f.get(id).ok_or(Errno::ENOTCONN)?.attr.mode;
-    if (attr.mode ^ old) & mode::S_IFMT != 0 {
-        return Err(Errno::EIO);
+    let (res, inval_pages) = {
+        let mut f = vfs.fuse_mut();
+        let n = f.get(id).ok_or(Errno::ENOTCONN)?;
+        if (attr.mode ^ n.attr.mode) & mode::S_IFMT != 0 {
+            return Err(Errno::EIO);
+        }
+        let inval = (auto_inval_check
+            && auto_inval
+            && n.attr_seen
+            && (attr.size != n.attr.size || attr.mtime_ns != n.attr.mtime_ns))
+            .then(|| n.pages.upgrade())
+            .flatten();
+        f.set_attr(id, attr, until);
+        (f.node(id).attr, inval)
+    };
+    if let Some(pages) = inval_pages {
+        invalidate_pages(cx, &pages, 0, u64::MAX);
     }
-    f.set_attr(id, attr, until);
-    Ok(f.node(id).attr)
+    Ok(res)
 }
 
 /// Node `id`'s attributes from the cache, or a retry to fetch them ([`need`]).
@@ -2874,10 +3371,10 @@ pub(crate) mod tests {
             attr_until: None,
         };
         let a = f.enter(root, b"a", &e).unwrap();
-        assert_eq!(f.cached_child(root, b"a"), Some(Some(a)));
+        assert_eq!(f.cached_child(root, b"a"), Some(Ok(a)));
         assert!(f.node(a).fresh_attr().is_some());
         f.enter_negative(root, b"gone", None);
-        assert_eq!(f.cached_child(root, b"gone"), Some(None));
+        assert_eq!(f.cached_child(root, b"gone"), Some(Err(Errno::ENOENT)));
         // The same node id gives the same node, which a directory takes to its new place
         // A directory moving below itself is a loop
         assert_eq!(f.enter(a, b"b", &e), Err(Errno::ELOOP));
