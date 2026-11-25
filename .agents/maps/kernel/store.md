@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/store.md` for the paired decision history.
 >
 > Verified: 2026-11-26 (namespace and cache, object sharing and lifetimes, transaction and recovery ordering, import and provider authorization checked against the store and its callers)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: WAL-sync-before-reap ordering in background reaper and inline fallback)
 
 ## Responsibilities
 
@@ -206,8 +208,10 @@ provider and rootfs installation UI (`android`).
     flushed before the commit containing the rename (`sync_file_range` + `fdatasync` per file, or
     one `syncfs` beyond 16 files), done inside the commit with the BKL held; errors are only logged
     and the first `fdatasync` error skips the remaining files.
-  - The reaper requests a WAL sync before deleting an object. If that sync fails, deletion
-    proceeds in both the background and inline paths.
+  - The background reaper and inline fallback delete doomed objects only after the commit that
+    made them unused is durable. `Meta::sync_metadata` skips the WAL flush if there have
+    been no commits since the last sync. If syncing still fails at teardown, the objects and
+    their nlink-0 rows survive for boot cleanup.
   - A held file's private copy is flushed before the commit that points it there, through the same
     `replaced` list as a rename-over.
 - New regular files' objects exist immediately; the `lock` header records the uncommitted inode
@@ -219,14 +223,18 @@ provider and rootfs installation UI (`android`).
 
 ### Reaper and checkpoints
 
-- One background thread per connection (every short-lived host connection spawns and joins one):
-  when objects are queued it syncs the WAL (unless nothing was committed since the last sync) and
-  unlinks them (pinning the host inode with `O_PATH` across `unlink_at` and clearing any
-  `kernel/hostmem` `WRITABLY_SHARED` tracking once the unlink succeeds); it runs PASSIVE checkpoints on its own lazily opened connection whenever the WAL has
-  grown 1000 pages since the last request, or after 100 ms without commits while the WAL is at least
-  1000 pages and not fully backfilled. The committing thread checkpoints in place only when the WAL
-  reaches 10,000 pages. Without a reaper thread SQLite's auto-checkpoint is kept and deletions
-  happen inline.
+- Each store connection, including a short-lived host connection, starts and joins its own reaper.
+  A failed WAL sync leaves the objects queued. The retry delay doubles from 50 ms to 1 s.
+  A successful external `Meta::sync_metadata` or `Meta::sync_all` wakes a pending retry immediately.
+  On shutdown the reaper bypasses the delay and exits if the final sync fails. When unlinking an
+  object it pins the host inode with `O_PATH` across `unlink_at` and clears any `kernel/hostmem`
+  `WRITABLY_SHARED` tracking after a successful unlink.
+- Checkpoints continue during backoff. The reaper lazily opens a separate connection for PASSIVE
+  checkpoints when the WAL grows 1000 pages since the last request, or after 100 ms without commits
+  if at least 1000 pages remain in the WAL and some frames still need backfilling. At 10,000 pages
+  the committing thread checkpoints in place. If the reaper thread could not start, SQLite keeps
+  its auto-checkpoint and the store retries `inline_pending` deletions on later commits and at
+  shutdown.
 
 ### Opening and boot cleanup
 
@@ -378,7 +386,6 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
-- A failed WAL sync can leave an earlier durable namespace pointing to a reaped object after power loss.
 - **Whole-file sharing:** the first change to a file sharing its object copies all of it, where
   btrfs and XFS copy only the extents written.
 

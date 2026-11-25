@@ -65,7 +65,7 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -97,6 +97,10 @@ const INLINE_CHECKPOINT_PAGES: c_int = 10 * CHECKPOINT_PAGES;
 /// After writes have stopped for this long, the background thread writes back the frames left in
 /// the WAL ([`reap`]).
 const CHECKPOINT_QUIET: Duration = Duration::from_millis(100);
+
+/// Backoff after a failed WAL sync in the reaper.
+const REAP_RETRY_MIN: Duration = Duration::from_millis(50);
+const REAP_RETRY_MAX: Duration = Duration::from_secs(1);
 
 /// The length the WAL is truncated to when reused from the start (`journal_size_limit`), so it
 /// does not keep for long the space it grew to during sustained writes.
@@ -374,6 +378,8 @@ pub struct Store {
     waker: RefCell<Option<Box<dyn Fn()>>>,
     /// The background thread that deletes objects ([`reap`]).
     reaper: Option<JoinHandle<()>>,
+    /// Committed deletions waiting for a successful WAL sync when the thread was not started.
+    inline_pending: RefCell<Vec<Ino>>,
     /// What goes into the cache after this operation succeeds ([`Fill`]).
     fills: RefCell<Vec<Fill>>,
     /// Inodes that may have a writable shared mapping (or are anonymous memfds), so their host
@@ -519,6 +525,10 @@ impl Store {
             #[cfg(test)]
             syncs: AtomicU64::new(0),
             #[cfg(test)]
+            fail_sync_metadata: AtomicBool::new(false),
+            #[cfg(test)]
+            sync_failures: AtomicU64::new(0),
+            #[cfg(test)]
             flushes: AtomicU64::new(0),
             #[cfg(test)]
             accessed_stats: AtomicU64::new(0),
@@ -552,6 +562,7 @@ impl Store {
             lock,
             meta,
             reaper,
+            inline_pending: RefCell::default(),
             writing: Cell::new(false),
             snapshot_at: Cell::new(None),
             pending: Cell::new(None),
@@ -2464,14 +2475,12 @@ impl Store {
     /// Hands objects to the background thread for deletion; deletes them itself when the thread
     /// was not started.
     fn reap_later(&self, inos: Vec<Ino>) {
-        if inos.is_empty() {
+        if self.reaper.is_none() {
+            self.inline_pending.borrow_mut().extend(inos);
+            self.reap_inline();
             return;
         }
-        if self.reaper.is_none() {
-            let _ = self.meta.sync_metadata();
-            for ino in inos {
-                let _ = self.remove_object(ino);
-            }
+        if inos.is_empty() {
             return;
         }
         let r = &self.meta.reaper;
@@ -2483,6 +2492,20 @@ impl Store {
         st.queue.extend(inos);
         drop(st);
         r.work.notify_one();
+    }
+
+    fn reap_inline(&self) {
+        let mut pending = self.inline_pending.borrow_mut();
+        if pending.is_empty() {
+            return;
+        }
+        if let Err(e) = self.meta.sync_metadata() {
+            crate::debug::log(format_args!("inode store: syncing the WAL: {e:?}"));
+            return;
+        }
+        for ino in pending.drain(..) {
+            let _ = self.remove_object(ino);
+        }
     }
 
     // ---- Metadata cache ----
@@ -3116,7 +3139,9 @@ impl Drop for Store {
         // use it
         #[cfg(any(debug_assertions, feature = "borrow-check"))]
         self.owner.store(0, Ordering::Relaxed);
-        if let Err(e) = self.commit() {
+        let pending = self.pending.get().is_some();
+        let commit = self.commit();
+        if let Err(e) = commit {
             crate::debug::log(format_args!("inode store: final commit failed: {e:?}"));
         }
         if let Some(t) = self.reaper.take() {
@@ -3124,6 +3149,9 @@ impl Drop for Store {
             r.state.lock().unwrap_or_else(PoisonError::into_inner).quit = true;
             r.work.notify_one();
             let _ = t.join();
+        } else if !pending || commit.is_err() {
+            // A successful transaction already tried the inline queue.
+            self.reap_inline();
         }
         self.meta.commits.leave();
     }
@@ -3240,6 +3268,10 @@ pub(crate) struct Meta {
     syncs: AtomicU64,
     #[cfg(test)]
     flushes: AtomicU64,
+    #[cfg(test)]
+    fail_sync_metadata: AtomicBool,
+    #[cfg(test)]
+    sync_failures: AtomicU64,
     /// Host object stat calls made from [`Store::accessed`] (for tests).
     #[cfg(test)]
     accessed_stats: AtomicU64,
@@ -3254,7 +3286,13 @@ impl Meta {
     pub(crate) fn sync_metadata(&self) -> Result<(), Errno> {
         let seen = self.commits.get();
         if self.durable.load(Ordering::Acquire) > seen {
+            self.reaper.wake_retry();
             return Ok(());
+        }
+        #[cfg(test)]
+        if self.fail_sync_metadata.load(Ordering::Relaxed) {
+            self.sync_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(Errno::EIO);
         }
         match File::open(&self.wal) {
             Ok(f) => f.sync_data().map_err(io_err)?,
@@ -3263,7 +3301,7 @@ impl Meta {
         }
         #[cfg(test)]
         self.syncs.fetch_add(1, Ordering::Relaxed);
-        self.durable.fetch_max(seen + 1, Ordering::AcqRel);
+        self.mark_durable(seen);
         Ok(())
     }
 
@@ -3272,8 +3310,13 @@ impl Meta {
     pub(crate) fn sync_all(&self) -> Result<(), Errno> {
         let seen = self.commits.get();
         appine_hal::syncfs(self.fs.as_raw_fd()).map_err(Errno)?;
-        self.durable.fetch_max(seen + 1, Ordering::AcqRel);
+        self.mark_durable(seen);
         Ok(())
+    }
+
+    fn mark_durable(&self, seen: u64) {
+        self.durable.fetch_max(seen + 1, Ordering::AcqRel);
+        self.reaper.wake_retry();
     }
 }
 
@@ -3575,15 +3618,18 @@ impl Drop for Commits {
 #[derive(Default)]
 struct Reaper {
     state: Mutex<Reaping>,
+    /// Mirrors `retry_at.is_some()` so a successful sync normally needs no reaper lock.
+    sync_failed: AtomicBool,
     /// There is work to do, or it is time to quit.
     work: Condvar,
-    /// The queue is empty and nothing is being deleted (tests wait for this).
+    /// Work has finished or is waiting for a WAL sync retry (for tests).
     idle: Condvar,
 }
 
 #[derive(Default)]
 struct Reaping {
     queue: Vec<Ino>,
+    retry_at: Option<Instant>,
     /// The committing thread asks it for a checkpoint.
     checkpoint: bool,
     /// The number of pages in the WAL at the last checkpoint request: once done, the checkpoint
@@ -3609,6 +3655,19 @@ struct Reaping {
 }
 
 impl Reaper {
+    fn set_retry(&self, st: &mut Reaping, at: Option<Instant>) {
+        st.retry_at = at;
+        self.sync_failed.store(at.is_some(), Ordering::Release);
+    }
+
+    fn wake_retry(&self) {
+        if self.sync_failed.load(Ordering::Acquire) {
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            self.set_retry(&mut st, None);
+            self.work.notify_one();
+        }
+    }
+
     /// After a commit the WAL has `pages` pages ([`wal_hook`]): once that is [`CHECKPOINT_PAGES`]
     /// pages more than at the last request, asks the background thread for a checkpoint.
     fn committed(&self, pages: c_int) {
@@ -3631,15 +3690,21 @@ impl Reaper {
 }
 
 /// The store's background thread, until the Store closes: deletes objects (finishing the queue
-/// before closing) and does checkpoints.
+/// before closing if the WAL can be synced) and does checkpoints.
 fn reap(meta: Arc<Meta>, db: PathBuf) {
     let r = &meta.reaper;
     // Checkpoints use their own connection, opened the first time one is needed
     let mut conn = None;
     let mut st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut backoff = REAP_RETRY_MIN;
+    let mut quiet = None;
     loop {
-        if !st.queue.is_empty() {
-            let inos = std::mem::take(&mut st.queue);
+        let now = Instant::now();
+        if !st.queue.is_empty() && (st.quit || st.retry_at.is_none_or(|at| at <= now)) {
+            if st.retry_at.is_some() {
+                r.set_retry(&mut st, None);
+            }
+            let mut inos = std::mem::take(&mut st.queue);
             st.busy = true;
             drop(st);
             // The commit that removed their last links goes to disk first: otherwise after power
@@ -3648,12 +3713,25 @@ fn reap(meta: Arc<Meta>, db: PathBuf) {
             // round
             if let Err(e) = meta.sync_metadata() {
                 crate::debug::log(format_args!("inode store: syncing the WAL: {e:?}"));
+                st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+                inos.append(&mut st.queue);
+                st.queue = inos;
+                st.busy = false;
+                r.set_retry(&mut st, Some(Instant::now() + backoff));
+                r.idle.notify_all();
+                if st.quit {
+                    // Boot cleanup will remove the objects after syncing the WAL.
+                    return;
+                }
+                backoff = (2 * backoff).min(REAP_RETRY_MAX);
+                continue;
             }
             for ino in inos {
                 let _ = remove_object(&meta.objects_dir, ino);
             }
             st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.busy = false;
+            backoff = REAP_RETRY_MIN;
             continue;
         }
         #[cfg(test)]
@@ -3674,6 +3752,7 @@ fn reap(meta: Arc<Meta>, db: PathBuf) {
             {
                 st.checkpoints += 1;
             }
+            quiet = None;
             continue;
         }
         r.idle.notify_all();
@@ -3683,19 +3762,28 @@ fn reap(meta: Arc<Meta>, db: PathBuf) {
         // The WAL has grown past one checkpoint and has frames not written back: once writes
         // stop, write back the rest, so the next write transaction reuses the WAL from the start
         // ([`wal_hook`]). Sporadic small writes never get this long, and no fsync is spent on them
-        if st.pages >= CHECKPOINT_PAGES && st.pages > st.backfilled {
-            let seen = st.commits;
-            let (g, wait) = r
-                .work
-                .wait_timeout(st, CHECKPOINT_QUIET)
-                .unwrap_or_else(PoisonError::into_inner);
-            st = g;
-            if wait.timed_out() && st.commits == seen {
+        let mut deadline = st.retry_at;
+        if !paused && st.pages >= CHECKPOINT_PAGES && st.pages > st.backfilled {
+            let quiet_at = match quiet {
+                Some((seen, at)) if seen == st.commits => at,
+                _ => now + CHECKPOINT_QUIET,
+            };
+            quiet = Some((st.commits, quiet_at));
+            if now >= quiet_at {
                 st.checkpoint = true;
+                continue;
             }
-            continue;
+            deadline = Some(deadline.map_or(quiet_at, |at| at.min(quiet_at)));
         }
-        st = r.work.wait(st).unwrap_or_else(PoisonError::into_inner);
+        st = match deadline {
+            Some(at) => {
+                r.work
+                    .wait_timeout(st, at.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            }
+            None => r.work.wait(st).unwrap_or_else(PoisonError::into_inner),
+        };
     }
 }
 
@@ -3865,14 +3953,32 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    impl Reaping {
+        fn postpone_retry(&mut self) {
+            *self.retry_at.as_mut().unwrap() = Instant::now() + Duration::from_secs(60);
+        }
+    }
+
+    impl Reaper {
+        #[track_caller]
+        fn wait_while(
+            &self,
+            busy: impl FnMut(&mut Reaping) -> bool,
+        ) -> std::sync::MutexGuard<'_, Reaping> {
+            let (st, wait) = self
+                .idle
+                .wait_timeout_while(self.state.lock().unwrap(), Duration::from_secs(5), busy)
+                .unwrap();
+            assert!(!wait.timed_out(), "timed out waiting for the reaper");
+            st
+        }
+    }
+
     impl Store {
-        /// Waits for the background thread to finish deleting the objects handed to it.
+        /// Waits until the background thread finishes or backs off after a sync failure.
         fn reaped(&self) {
             let r = &self.meta.reaper;
-            let mut st = r.state.lock().unwrap();
-            while !st.queue.is_empty() || st.busy {
-                st = r.idle.wait(st).unwrap();
-            }
+            drop(r.wait_while(|st| st.busy || (!st.queue.is_empty() && st.retry_at.is_none())));
         }
 
         /// Simulates the process being killed before committing: the deferred changes are lost,
@@ -4637,6 +4743,142 @@ mod tests {
         assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
         drop(s);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn reap_test_file(s: &Store, name: &[u8]) -> (Ino, PathBuf) {
+        let (ino, mut file) = s.create_file(ROOT, name, 0o644, 0, 0).unwrap();
+        file.write_all(name).unwrap();
+        (ino, s.objects.join(ino.to_string()))
+    }
+
+    #[test]
+    fn reaper_retries_failed_wal_sync() {
+        let (s, dir) = temp_store("reap-retry");
+        let (a, object) = reap_test_file(&s, b"a");
+        let (_, other) = reap_test_file(&s, b"b");
+        s.commit().unwrap();
+        s.reaped();
+        let syncs = s.meta.syncs.load(Ordering::Relaxed);
+        s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+        let start = Instant::now();
+        s.unlink(ROOT, b"a").unwrap();
+        s.commit().unwrap();
+        s.reaped();
+        assert_eq!(fs::read(&object).unwrap(), b"a");
+        let r = &s.meta.reaper;
+        let failures = || s.meta.sync_failures.load(Ordering::Relaxed);
+        assert_eq!(r.wait_while(|st| st.busy || failures() < 2).queue, [a]);
+        let retries = u32::try_from(failures() - 1).unwrap();
+        assert!(start.elapsed() >= REAP_RETRY_MIN * retries);
+        let wait_for_reap = || drop(r.wait_while(|st| st.busy || !st.queue.is_empty()));
+        s.meta.fail_sync_metadata.store(false, Ordering::Relaxed);
+        wait_for_reap();
+        assert!(!object.exists());
+        assert!(s.meta.syncs.load(Ordering::Relaxed) > syncs);
+
+        s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+        s.unlink(ROOT, b"b").unwrap();
+        s.commit().unwrap();
+        s.reaped();
+        assert_eq!(fs::read(&other).unwrap(), b"b");
+
+        // Wait for a requested checkpoint with the retry timer beyond the test timeout.
+        // Only an external sync can then wake the reaper in time.
+        let mut st = r.wait_while(|st| st.busy);
+        st.postpone_retry();
+        st.checkpoint = true;
+        drop(st);
+        r.work.notify_one();
+        drop(r.wait_while(|st| st.checkpoint || st.busy));
+
+        s.meta.fail_sync_metadata.store(false, Ordering::Relaxed);
+        s.meta.sync_metadata().unwrap();
+        wait_for_reap();
+        assert!(!other.exists());
+        drop(s);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reaper_shutdown_after_failed_wal_sync() {
+        for (wait, recover) in [(true, false), (false, false), (true, true)] {
+            let (done, result) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let (s, dir) = temp_store("reap-shutdown");
+                let (_, object) = reap_test_file(&s, b"a");
+                s.commit().unwrap();
+                s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+                s.unlink(ROOT, b"a").unwrap();
+                s.commit().unwrap();
+                if wait {
+                    s.reaped();
+                    assert_eq!(fs::read(&object).unwrap(), b"a");
+                }
+                if recover {
+                    let r = &s.meta.reaper;
+                    r.wait_while(|st| st.busy).postpone_retry();
+                    s.meta.fail_sync_metadata.store(false, Ordering::Release);
+                }
+                drop(s);
+                done.send((dir, object)).unwrap();
+            });
+            let (dir, object) = result.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            if !recover {
+                assert_eq!(fs::read(&object).unwrap(), b"a");
+                drop(Store::open(&dir, &[]).unwrap());
+            }
+            assert!(!object.exists());
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn inline_reap_retries_failed_wal_sync() {
+        check_inline_reap(true);
+        check_inline_reap(false);
+    }
+
+    fn check_inline_reap(commit_before_drop: bool) {
+        let (mut s, dir) = temp_store("reap-inline");
+        let r = &s.meta.reaper;
+        r.state.lock().unwrap().quit = true;
+        r.work.notify_one();
+        s.reaper.take().unwrap().join().unwrap();
+
+        let (_, a) = reap_test_file(&s, b"a");
+        let (_, b) = reap_test_file(&s, b"b");
+        let (_, c) = reap_test_file(&s, b"c");
+        let (_, d) = reap_test_file(&s, b"d");
+        s.commit().unwrap();
+        s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+        s.unlink(ROOT, b"a").unwrap();
+        s.commit().unwrap();
+        assert_eq!(fs::read(&a).unwrap(), b"a");
+        s.unlink(ROOT, b"b").unwrap();
+        s.commit().unwrap();
+        assert_eq!(fs::read(&a).unwrap(), b"a");
+        assert_eq!(fs::read(&b).unwrap(), b"b");
+
+        s.meta.fail_sync_metadata.store(false, Ordering::Relaxed);
+        s.unlink(ROOT, b"c").unwrap();
+        s.commit().unwrap();
+        assert!(!a.exists() && !b.exists() && !c.exists());
+
+        s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+        s.unlink(ROOT, b"d").unwrap();
+        if commit_before_drop {
+            s.commit().unwrap();
+        }
+        let meta = s.meta.clone();
+        let failures = meta.sync_failures.load(Ordering::Relaxed);
+        drop(s);
+        assert_eq!(meta.sync_failures.load(Ordering::Relaxed), failures + 1);
+        drop(meta);
+        assert_eq!(fs::read(&d).unwrap(), b"d");
+        drop(Store::open(&dir, &[]).unwrap());
+        assert!(!d.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Files sharing an object ([`Store::share`]) read the same data from it and keep their own
