@@ -140,6 +140,8 @@ pub(crate) struct Task {
     /// The thread's serial number, never repeated: after a tid is reused by a new thread it tells
     /// the old and new thread apart (a POSIX timer on the old one's CPU clock, `crate::itimer`).
     pub serial: u64,
+    /// Creation time, in clock ticks since boot.
+    pub start_ticks: u64,
     /// The thread group it belongs to.
     pub tgid: Tid,
     /// Signals sent to this thread and not yet handled.
@@ -320,6 +322,7 @@ impl Task {
         Ok(Rc::new(Task {
             tid: Cell::new(tid),
             serial: SERIAL.fetch_add(1, Ordering::Relaxed),
+            start_ticks: crate::pseudo::uptime_ns() / (1_000_000_000 / crate::loader::CLOCK_TICKS),
             tgid,
             pending: RefCell::default(),
             sigmask: Cell::new(sigmask),

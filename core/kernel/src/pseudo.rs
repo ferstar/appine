@@ -29,7 +29,7 @@ use crate::signal::SigAction;
 use crate::syscall::SocketRef;
 use crate::task::Task;
 use crate::tty::{PTS_MAJOR, Tty};
-use crate::vfs::dev::rdev;
+use crate::vfs::dev::{LOOP_MAJOR, rdev};
 use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
 use crate::vfs::{Fs, MountId, Node, Pseudo, Vfs};
 
@@ -292,7 +292,6 @@ const PROC_NET: [&[u8]; 18] = [
 const SYS_GPU: &[&[u8]] = &[
     b"bus/",
     b"bus/platform/",
-    b"dev/",
     b"dev/char/",
     b"dev/char/226:128/",
     b"dev/char/226:128/device/",
@@ -584,10 +583,12 @@ pub(crate) fn recorded_value(k: &Kernel, path: &[u8]) -> i64 {
 /// `cpu<n>` is a [`PseudoNode::SysCpu`]; network interfaces (btop reads the traffic counters),
 /// each interface a [`PseudoNode::SysNet`]; overlayfs's module parameters (containerd adds
 /// `index=off` when `index` exists, BuildKit `redirect_dir=off` when `redirect_dir` does).
-const SYS_STATIC: [&[u8]; 23] = [
+const SYS_STATIC: [&[u8]; 25] = [
     b"block/",
     b"class/",
     b"class/net/",
+    b"dev/",
+    b"dev/block/",
     b"devices/",
     b"devices/system/",
     b"devices/system/cpu/",
@@ -616,15 +617,19 @@ const SYS_NET_DIR: &[u8] = b"class/net/";
 /// `/sys/block`: the loop devices are under it.
 const SYS_BLOCK_DIR: &[u8] = b"block/";
 
+/// `/sys/dev/block`: links to block devices by major and minor number.
+const SYS_DEV_BLOCK_DIR: &[u8] = b"dev/block/";
+
 /// The directories and files under `/sys/block/loop<n>` (paths relative to the device directory),
-/// with values from [`crate::syscall::Loops::sysfs_read`]; `loop/` exists only while the device is
-/// bound. On Linux the device directories are symlinks into `/sys/devices/virtual/block`; here
-/// they are directories, as for `/sys/class/net`.
-const BLOCK_FILES: [&[u8]; 22] = [
+/// with driver attributes from [`crate::syscall::Loops::sysfs_read`]. The `loop/` directory exists
+/// only while the device is bound. Linux links to `/sys/devices/virtual/block` from `/sys/block`.
+/// Appine uses plain directories, as for `/sys/class/net`.
+const BLOCK_FILES: [&[u8]; 23] = [
     b"dev",
     b"removable",
     b"ro",
     b"size",
+    b"uevent",
     b"loop/",
     b"loop/autoclear",
     b"loop/backing_file",
@@ -989,6 +994,8 @@ pub(crate) enum PseudoNode {
     /// `/sys/block/loop<n>` (empty path), or a directory or file under it (paths from
     /// [`BLOCK_FILES`]).
     SysBlock(u32, &'static [u8]),
+    /// `/sys/dev/block/7:<n>`, a relative symlink to `/sys/block/loop<n>`.
+    SysDevBlock(u32),
     /// A cgroup directory (empty name), or a file in it (names from [`crate::cgroup::FILES`]): the
     /// cgroup id and the file name.
     Cgroup(u64, &'static [u8], u64),
@@ -1293,6 +1300,7 @@ impl Pseudo for View<'_> {
                 .or_else(|| tree_parent(&PORT_FILES, path))
                 .map_or(SysNet(*n, b""), |p| SysNet(*n, p)),
             SysBrif(n, _) => SysNet(*n, b"brif/"),
+            SysDevBlock(_) => Sys(SYS_DEV_BLOCK_DIR),
             SysBlock(_, b"") => Sys(SYS_BLOCK_DIR),
             SysBlock(n, path) => {
                 tree_parent(&BLOCK_FILES, path).map_or(SysBlock(*n, b""), |p| SysBlock(*n, p))
@@ -1353,6 +1361,7 @@ impl Pseudo for View<'_> {
             NetSysctl(path, _) => tree_name(path.as_bytes()).to_vec(),
             SysNet(_, path) => tree_name(path).to_vec(),
             SysBlock(n, b"") => format!("loop{n}").into_bytes(),
+            SysDevBlock(n) => format!("{LOOP_MAJOR}:{n}").into_bytes(),
             SysBlock(_, path) => tree_name(path).to_vec(),
             SysBrif(_, p) => self
                 .interface(mnt, *p)
@@ -1488,6 +1497,14 @@ impl Pseudo for View<'_> {
                             .sysfs_exists(n, b"")
                             .then_some(SysBlock(n, b""));
                     }
+                    if *path == SYS_DEV_BLOCK_DIR {
+                        let colon = name.iter().position(|&b| b == b':')?;
+                        let major = parse_num(&name[..colon])?;
+                        let minor = u32::try_from(parse_num(&name[colon + 1..])?).ok()?;
+                        return (major == i64::from(LOOP_MAJOR)
+                            && self.k.loops.sysfs_exists(minor, b""))
+                        .then_some(SysDevBlock(minor));
+                    }
                     let n = name.strip_prefix(b"cpu").and_then(parse_num)?;
                     let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
                     (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
@@ -1603,7 +1620,7 @@ impl Pseudo for View<'_> {
                 | self::Entry::Ns,
             ) => mode::S_IFDIR,
             Pts(..) | PtsPtmx(_) => mode::S_IFCHR,
-            SelfLink | ThreadSelf | Fd(..) | Ns(..) | SysBrif(..) => mode::S_IFLNK,
+            SelfLink | ThreadSelf | Fd(..) | Ns(..) | SysBrif(..) | SysDevBlock(_) => mode::S_IFLNK,
             Global(self::Global::Mounts | self::Global::Net) => mode::S_IFLNK,
             Entry(_, _, self::Entry::Cwd | self::Entry::Exe | self::Entry::Root) => mode::S_IFLNK,
             OpenFd(proc, tid, fd) => {
@@ -1707,6 +1724,12 @@ impl Pseudo for View<'_> {
             SysBrif(_, p) => {
                 let i = self.interface(mnt, *p).ok_or(Errno::ENOENT)?;
                 Ok(format!("../../{}/brport", i.name).into_bytes())
+            }
+            SysDevBlock(n) => {
+                if !self.k.loops.sysfs_exists(*n, b"") {
+                    return Err(Errno::ENOENT);
+                }
+                Ok(format!("../../block/loop{n}").into_bytes())
             }
             _ => Err(Errno::EINVAL),
         }
@@ -1880,7 +1903,7 @@ impl View<'_> {
             }
             SysRoot => format!("/sys/{name_text}"),
             // Interfaces, loop devices, CPUs
-            Sys(path) if *path == SYS_NET_DIR || *path == SYS_BLOCK_DIR => return None,
+            Sys(SYS_NET_DIR | SYS_BLOCK_DIR | SYS_DEV_BLOCK_DIR) => return None,
             Sys(path) if *path == SYS_CPU_DIR && numbered(b"cpu") => return None,
             Sys(path) => format!("/sys/{}{name_text}", text(path)),
             SysCpu(_, path) => {
@@ -2060,7 +2083,8 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let sysfs = matches!(fs_of(node), Fs::Sys | Fs::Cgroup);
     let perm = match (kind, node) {
         (mode::S_IFDIR, _) if sysfs => 0o755,
-        (mode::S_IFDIR, PseudoNode::Entry(_, _, Entry::Fd | Entry::Ns)) => 0o500,
+        (mode::S_IFDIR, PseudoNode::PtsRoot(_)) => 0o755,
+        (mode::S_IFDIR, PseudoNode::Entry(_, _, Entry::Fd | Entry::FdInfo | Entry::Ns)) => 0o500,
         (mode::S_IFDIR, _) => 0o555,
         // proc_fd_instantiate: read and search bits for a readable file, write and search for a
         // writable one (none for O_PATH)
@@ -2158,6 +2182,7 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
         | PseudoNode::SysCpu(..)
         | PseudoNode::SysNet(..)
         | PseudoNode::SysBrif(..)
+        | PseudoNode::SysDevBlock(_)
         | PseudoNode::SysBlock(..) => Fs::Sys,
         PseudoNode::Cgroup(..) => Fs::Cgroup,
         PseudoNode::NsFile(..) => Fs::Nsfs,
@@ -2209,7 +2234,9 @@ fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
         // task_dump_owner)
         PseudoNode::Pid(proc, tid)
         | PseudoNode::Entry(proc, tid, _)
-        | PseudoNode::Fd(proc, tid, _) => dump_owner(k, *proc, *tid),
+        | PseudoNode::Fd(proc, tid, _)
+        | PseudoNode::FdInfo(proc, tid, _)
+        | PseudoNode::Ns(proc, tid, _) => dump_owner(k, *proc, *tid),
         PseudoNode::Pts(fs, n) => pty(k, *fs, *n).map_or((0, 0), |t| t.borrow().owner),
         _ => (0, 0),
     }
@@ -2328,6 +2355,9 @@ pub(crate) fn readdir(
             }
             if *path == SYS_BLOCK_DIR {
                 nodes.extend(ps.k.loops.numbers().into_iter().map(|n| SysBlock(n, b"")));
+            }
+            if *path == SYS_DEV_BLOCK_DIR {
+                nodes.extend(ps.k.loops.numbers().into_iter().map(SysDevBlock));
             }
         }
         SysBlock(n, path) => nodes.extend(
@@ -3158,6 +3188,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         },
         SysCpu(n, path) => cpu_file(*n as usize, path)?,
         SysNet(n, path) => net_file(ps.k, &ps.sys_net_ns(mnt), *n, path)?,
+        SysBlock(n, b"uevent") => {
+            if !ps.k.loops.sysfs_exists(*n, b"uevent") {
+                return Err(Errno::ENOENT);
+            }
+            format!("MAJOR={LOOP_MAJOR}\nMINOR={n}\nDEVNAME=loop{n}\nDEVTYPE=disk\n")
+        }
         SysBlock(n, path) => ps.k.loops.sysfs_read(*n, path).ok_or(Errno::EISDIR)?,
         NetConf(v6, dir, name, net) => crate::netdev::conf_read(&net.0, *v6, *dir, name)?,
         NetSysctl(path, net) => crate::netconf::sysctl_read(&net.0.devs.borrow().conf, path),
@@ -3184,6 +3220,11 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Result
     let g = ps.group(proc).ok_or(Errno::ESRCH)?;
     let g = g.borrow();
     let task = ps.task(proc, tid);
+    let start_ticks = if tid.unwrap_or(proc.pid) == g.tgid {
+        g.start_ticks
+    } else {
+        task.as_ref().map_or(g.start_ticks, |t| t.start_ticks)
+    };
     let nice = task.as_ref().map_or(0, |t| t.nice.get());
     let (state, _) = state_of(ps, &g, proc, tid);
     let (tty_nr, tpgid) = ctty_info(ns, &g);
@@ -3237,7 +3278,7 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Result
         20 + nice,
         nice,
         thread_count(&g).max(1),
-        ps.with_boot_offset(g.start_ticks * (1_000_000_000 / HZ)) / (1_000_000_000 / HZ),
+        ps.with_boot_offset(start_ticks * (1_000_000_000 / HZ)) / (1_000_000_000 / HZ),
         vsize,
         rss,
     )
@@ -6136,8 +6177,6 @@ pub(crate) mod tests {
     ) -> (ProcId, u64, appine_engine::Cpu) {
         use crate::process::ThreadGroup;
         use crate::signal::SigHandlers;
-        use crate::task::{FsContext, Task, TaskState};
-        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
         let group = Rc::new(RefCell::new(ThreadGroup::new(
             tid,
             1,
@@ -6151,6 +6190,21 @@ pub(crate) mod tests {
             cred.setuid(uid).unwrap();
         }
         group.borrow_mut().cred = cred;
+        let proc = ProcId::of(tid, &group.borrow());
+        let (addr, cpu) = add_thread(k, tid, &group, env);
+        k.groups.insert(tid, group);
+        (proc, addr, cpu)
+    }
+
+    fn add_thread(
+        k: &mut Kernel,
+        tid: Tid,
+        group: &Rc<RefCell<ThreadGroup>>,
+        env: &[u8],
+    ) -> (u64, appine_engine::Cpu) {
+        use crate::task::{FsContext, Task, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
         let (mm, addr) = mm_with_env(env);
         let mm = mm.into_shared();
         let fds = Rc::new(RefCell::new(crate::fd::FdTable::new()));
@@ -6178,12 +6232,19 @@ pub(crate) mod tests {
             fast_sleep: None,
             sem_undo: Rc::new(crate::ipc::SemUndo::new()),
         };
-        let task = Task::new(tid, tid, &cpu, state, k.init_ns.clone(), 0, [0; 16]).unwrap();
-        let serial = group.borrow().serial;
+        let task = Task::new(
+            tid,
+            group.borrow().tgid,
+            &cpu,
+            state,
+            k.init_ns.clone(),
+            0,
+            [0; 16],
+        )
+        .unwrap();
         group.borrow_mut().threads.push(tid);
-        k.groups.insert(tid, group);
         k.tasks.insert(tid, task);
-        (ProcId { pid: tid, serial }, addr, cpu)
+        (addr, cpu)
     }
 
     #[test]
@@ -6247,5 +6308,246 @@ pub(crate) mod tests {
         assert_eq!(read_environ(None), Vec::<u8>::new());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn with_test_mount(name: &[u8], test: impl FnOnce(&Vfs)) {
+        let dir = std::env::temp_dir().join(format!(
+            "appine-pseudo-mount-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = Store::create(&dir).unwrap();
+        store
+            .mkdir(crate::vfs::store::ROOT, name, 0o755, 0, 0)
+            .unwrap();
+        drop(store);
+        test(&Vfs::open(&dir).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_view<'a>(k: &'a Kernel, vfs: &'a Vfs) -> View<'a> {
+        View {
+            k,
+            vfs,
+            tid: INIT,
+            tgid: INIT,
+            cred: None,
+            opening: false,
+        }
+    }
+
+    #[test]
+    fn fdinfo_and_namespace_link_owners_follow_target_credentials() {
+        use crate::cred::{IdMap, UserNs};
+        with_test_mount(b"proc", |vfs| {
+            let mut k = Kernel::new(crate::process::Tier::Interpreter);
+            let (proc, _, _leader_cpu) = add_task(&mut k, 10, 1000, true, b"");
+            let group = k.groups[&10].clone();
+            let (_, _worker_cpu) = add_thread(&mut k, 11, &group, b"");
+            let user_ns = UserNs::child(&k.init_ns.ipc.owner, 1000, false);
+            *user_ns.uid_map.borrow_mut() = IdMap::parse(b"0 2000 10").unwrap();
+            *user_ns.gid_map.borrow_mut() = IdMap::parse(b"0 3000 10").unwrap();
+            let mut worker = k.tasks[&11].cred.borrow_mut();
+            worker.user_ns = user_ns;
+            worker.euid = 2001;
+            worker.egid = 3002;
+            drop(worker);
+
+            let view = test_view(&k, vfs);
+            for (dumpable, leader_owner, worker_owner) in [
+                (true, (1000, 1000), (2001, 3002)),
+                (false, (0, 0), (2000, 3000)),
+            ] {
+                group.borrow_mut().dumpable = dumpable;
+                for (tid, owner) in [(None, leader_owner), (Some(11), worker_owner)] {
+                    let dir = PseudoNode::Entry(proc, tid, Entry::FdInfo);
+                    assert_eq!(stat(&view, &dir).unwrap().mode, mode::S_IFDIR | 0o500);
+                    for node in [
+                        PseudoNode::FdInfo(proc, tid, 0),
+                        PseudoNode::Ns(proc, tid, NsKind::Net),
+                    ] {
+                        let st = stat(&view, &node).unwrap();
+                        assert_eq!((st.uid, st.gid), owner);
+                    }
+                }
+                let nsfs = stat(&view, &PseudoNode::NsFile(NsKind::Net, k.init_ns.net.id)).unwrap();
+                assert_eq!((nsfs.uid, nsfs.gid), (0, 0));
+            }
+            assert_eq!(
+                stat(&view, &PseudoNode::PtsRoot(Fs::Pts.dev()))
+                    .unwrap()
+                    .mode,
+                mode::S_IFDIR | 0o755
+            );
+        });
+    }
+
+    #[test]
+    fn stat_start_time_follows_the_named_thread() {
+        with_test_mount(b"proc", |vfs| {
+            let mut k = Kernel::new(crate::process::Tier::Interpreter);
+            let (_, _, _leader_cpu) = add_task(&mut k, 10, 0, true, b"");
+            let group = k.groups[&10].clone();
+            let (_, _worker_cpu) = add_thread(&mut k, 11, &group, b"");
+            // Distinguish all three creation ticks even when the tasks were created in one tick.
+            group.borrow_mut().start_ticks = 10;
+            for (tid, ticks) in [(10, 11), (11, 20)] {
+                Rc::get_mut(k.tasks.get_mut(&tid).unwrap())
+                    .unwrap()
+                    .start_ticks = ticks;
+            }
+            let view = test_view(&k, vfs);
+            for (path, expected) in [
+                (b"/proc/10/stat".as_slice(), 10),
+                (b"/proc/10/task/10/stat", 10),
+                (b"/proc/11/stat", 20),
+                (b"/proc/10/task/11/stat", 20),
+            ] {
+                let Node::Pseudo(mnt, node) = vfs
+                    .resolve(&view, &Cred::root(), &Node::ROOT, &Node::ROOT, path, true)
+                    .unwrap()
+                else {
+                    panic!("expected a procfs stat file");
+                };
+                let line = String::from_utf8(content(&view, mnt, &node).unwrap()).unwrap();
+                // Field 3 (state) follows the parenthesized comm. Field 22 is starttime.
+                let (_, fields) = line.rsplit_once(')').unwrap();
+                let start = fields.split_whitespace().nth(19).unwrap();
+                assert_eq!(start.parse::<u64>().unwrap(), expected, "{path:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn loop_device_numbers_resolve_to_block_attributes() {
+        use crate::vfs::SYS_MOUNT;
+        with_test_mount(b"sys", |vfs| {
+            let k = Kernel::new(crate::process::Tier::Interpreter);
+            let view = test_view(&k, vfs);
+            let resolve = |path: &[u8], follow| {
+                vfs.resolve(&view, &Cred::root(), &Node::ROOT, &Node::ROOT, path, follow)
+            };
+            let dir = resolve(b"/sys/dev/block", true).unwrap();
+            let Node::Pseudo(_, ref block) = dir else {
+                panic!("expected sysfs");
+            };
+            let entries = readdir(&view, SYS_MOUNT, block).unwrap();
+            let numbers = k.loops.numbers();
+            assert_eq!(entries.len(), numbers.len());
+            for (entry, n) in entries.iter().zip(numbers) {
+                assert_eq!(entry.name, format!("7:{n}").as_bytes());
+                assert_eq!(entry.mode, mode::S_IFLNK);
+            }
+            for name in [
+                b"7".as_slice(),
+                b"7:",
+                b":0",
+                b"07:0",
+                b"7:00",
+                b"7:+0",
+                b"7:0:1",
+                b"7:4294967296",
+                b"8:1",
+                b"7:99999",
+            ] {
+                assert_eq!(
+                    view.lookup(SYS_MOUNT, block, name),
+                    Err(Errno::ENOENT),
+                    "{name:?}"
+                );
+            }
+            assert_eq!(view.missing_path(&dir, b"8:1"), None);
+            let Node::Pseudo(_, link) = resolve(b"/sys/dev/block/7:0", false).unwrap() else {
+                panic!("expected sysfs");
+            };
+            assert_eq!(view.parent(&link).as_ref(), Some(block));
+            assert_eq!(stat(&view, &link).unwrap().mode, mode::S_IFLNK | 0o777);
+            assert_eq!(
+                view.readlink(SYS_MOUNT, &link).unwrap(),
+                b"../../block/loop0"
+            );
+            let direct = resolve(b"/sys/block/loop0/uevent", true).unwrap();
+            assert_eq!(
+                resolve(b"/sys/dev/block/7:0/uevent", true),
+                Ok(direct.clone())
+            );
+            let Node::Pseudo(mnt, file) = direct else {
+                panic!("expected sysfs");
+            };
+            assert_eq!(
+                content(&view, mnt, &file).unwrap(),
+                b"MAJOR=7\nMINOR=0\nDEVNAME=loop0\nDEVTYPE=disk\n"
+            );
+            let st = stat(&view, &file).unwrap();
+            assert_eq!(
+                (st.mode, st.size, st.blocks),
+                (mode::S_IFREG | 0o444, 4096, Some(0))
+            );
+            assert!(pollable(&file) && has_iter(&file, false) && has_iter(&file, true));
+            let queue_file = resolve(b"/sys/block/loop1/queue/rotational", true).unwrap();
+            assert_eq!(
+                resolve(b"/sys/dev/block/7:1/queue/rotational", true),
+                Ok(queue_file)
+            );
+            let absent = 99999;
+            assert_eq!(
+                view.readlink(mnt, &PseudoNode::SysDevBlock(absent)),
+                Err(Errno::ENOENT)
+            );
+            assert_eq!(
+                content(&view, mnt, &PseudoNode::SysBlock(absent, b"uevent")),
+                Err(Errno::ENOENT)
+            );
+        });
+    }
+
+    #[test]
+    fn sys_dev_lists_each_available_directory_once() {
+        use crate::gpu::{Context, Renderer};
+        use crate::vfs::SYS_MOUNT;
+        use std::sync::Arc;
+
+        struct TestRenderer;
+        impl Renderer for TestRenderer {
+            fn capset(&self) -> &[u8] {
+                &[]
+            }
+            fn open(&self) -> Result<Arc<dyn Context>, Errno> {
+                unreachable!()
+            }
+        }
+        with_test_mount(b"sys", |vfs| {
+            let mut k = Kernel::new(crate::process::Tier::Interpreter);
+            for gpu in [false, true] {
+                k.gpu = gpu.then(|| Arc::new(TestRenderer) as Arc<dyn Renderer>);
+                let view = test_view(&k, vfs);
+                let root = PseudoNode::SysRoot;
+                let dev = view.lookup(SYS_MOUNT, &root, b"dev").unwrap();
+                assert_eq!(
+                    readdir(&view, SYS_MOUNT, &root)
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e.name == b"dev")
+                        .count(),
+                    1
+                );
+                let names: Vec<_> = readdir(&view, SYS_MOUNT, &dev)
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.name)
+                    .collect();
+                let mut expected = vec![b"block".to_vec()];
+                let block = view.lookup(SYS_MOUNT, &dev, b"block").unwrap();
+                assert_eq!(view.parent(&block).as_ref(), Some(&dev));
+                let char_dir = view.lookup(SYS_MOUNT, &dev, b"char");
+                if gpu {
+                    expected.push(b"char".to_vec());
+                    assert_eq!(view.parent(&char_dir.unwrap()).as_ref(), Some(&dev));
+                } else {
+                    assert_eq!(char_dir, Err(Errno::ENOENT));
+                }
+                assert_eq!(names, expected);
+            }
+        });
     }
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: environ reads return EOF at every offset once the pinned address space is gone)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: fdinfo permissions, namespace-link ownership, devpts root mode and per-thread stat start times)
 
 ## Responsibilities
 
@@ -105,19 +105,19 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   fd or open process file never resolves to a new process reusing that pid: once the pinned thread
   group is reaped, lookups and directory listings under it fail with `ENOENT` and offset-0 reads of
   open files fail with `ESRCH`.
-- Modes: directories 0555 (0755 on sysfs, 0500 for per-process `fd/` and `ns/`, a cgroup's from its node attributes); `fd/<n>` links by the open
-  mode as `proc_fd_instantiate` (0500 readable, 0300 writable, 0700 both, 0 for `O_PATH`); other
-  symlinks 0777; `mem` 0600; `syscall`, `pagemap`, `auxv`, `environ` and `/proc/kmsg` 0400; sysctls follow
-  `kernel/sysctl`; other writable files 0644 (`comm` included); everything else 0444 (so `fdinfo/`
-  is 0555, `projid_map` read-only); cgroup files their current
-  modes; devpts nodes the terminal's mode and `ptmxmode`.
-- Owners: per-process nodes (`Pid`, `Entry`, `Fd`, including the `fd/`, `fdinfo/`, `ns/`, `net/`
-  directories) belong to the euid/egid of the thread (under `task/<tid>`) or the main thread, or
+- Directories default to 0555. Sysfs directories and the devpts root are 0755. Process and thread
+  `fd/`, `fdinfo/` and `ns/` directories are 0500. Cgroup nodes use their current attributes.
+  `fd/<n>` links use the open mode (0500 readable, 0300 writable, 0700 both, 0 for `O_PATH`).
+  Other symlinks are 0777. `mem` is 0600. `syscall`, `pagemap`, `auxv`, `environ` and `/proc/kmsg`
+  are 0400. Sysctls follow `kernel/sysctl`. Other writable files, including `comm`, are 0644 and
+  other regular files are 0444. Devpts device nodes use the terminal's mode or `ptmxmode`.
+- Owners: `Pid`, `Entry`, `Fd`, `FdInfo` and `Ns` belong to the named thread's euid/egid, or
   to root of those credentials' user namespace when the process is not dumpable; `net.*` sysctls
   follow `kernel/sysctl`; cgroup nodes have individual owners; terminals to their owner; the entries
-  inside `fdinfo/`, `ns/` and `net/`, reopened open files and everything else to root.
-- Stat reports `st_blksize` 1024 for procfs and devpts paths, 4096 elsewhere (slave and master
-  fds included). Times are "now" except devpts terminals; directories have nlink 2 (`task/` 2
+  inside `net/`, nsfs files, reopened open files and everything else to root.
+- Stat reports `st_blksize` 1024 for procfs and devpts paths, PTY masters and devpts slave fds.
+  Other synthetic filesystems report 4096.
+  Times are "now" except devpts terminals; directories have nlink 2 (`task/` 2
   plus threads, an exited main thread included); sizes are 0 except sysfs and cgroup2 files
   (4096).
 - Names path resolution does not find (`View::missing`, Starnix's `not_found`) are counted as
@@ -216,7 +216,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   filesystem credentials (6.1's `do_task_stat`), others getting 1 for the code bounds and 0 for the
   rest (0 everywhere for a process without an address space); fault counters, `kstkesp`,
   `kstkeip`, `wchan`, `processor`, priority and policy are 0; the `signal` field is the thread's
-  and the group's pending sets; start time is the process's, in clock ticks plus the reader's
+  and the group's pending sets. Field 22 uses the named thread's creation time in ticks plus the reader's
   time-namespace boottime offset; the thread's or the group's CPU times depending on the view
   (`/proc/<tid>` the group's); `tty_nr` from the controlling terminal.
 - `status`: the thread's ids (the main thread's for `/proc/<pid>`) translated into the reader's
@@ -330,7 +330,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   option's uid/gid or the opener's fsuid/fsgid, its mode the option's mode; chmod, chown and
   utimensat are stored on the terminal (on the root and `ptmx` they are `EACCES`). Nodes exist
   while the terminal does; readdir lists `ptmx` and every live terminal. Devices 136:n and 5:2;
-  the root is 0555 (Linux 0755). fstat on a master fd always reports inode 2, mode 0666, rdev 5:2
+  the root is 0755. fstat on a master fd always reports inode 2, mode 0666, rdev 5:2
   on the root filesystem's device, uid/gid 0 and zero times, whatever the instance and
   `ptmxmode`; a slave fd reports its terminal.
 - nsfs: following `/proc/<pid>/ns/*` (after the ptrace-read check; `ENOENT` when the namespace has
@@ -373,6 +373,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 ## Invariants and gotchas
 
+- Both leader stat paths use `ThreadGroup::start_ticks`, including after leader exit or takeover
+  by execve. Both worker paths use `Task::start_ticks`.
 - Content always reflects the kernel at generation time; nothing is cached across opens, and a
   regeneration uses the opener's credentials but the current reader's namespaces.
 - `/proc/<pid>/net` uses the target's network namespace (while `/proc/sys` uses the reader's,
@@ -395,14 +397,10 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 - **Inotify on synthetic files is partial:** synthetic files outside cgroup2's four notifying files
   report no inotify events (opens, reads, writes).
-- **Fidelity gaps:** some modes and owners still differ (`fdinfo/` 0555,
-  `fdinfo/<n>` and `ns/*` owned by root, devpts root 0555, a master's fstat fixed);
-  procfs mount options are ignored; many standard files are absent.
+- **Fidelity gaps:** PTY master fstat reports fixed metadata across devpts instances. Procfs ignores mount options and omits many standard files.
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
   and symbol lookups (perf, bpftrace) find nothing.
-- **Per-thread values that are the process's:** `task/<tid>/stat`'s start time is the process's
-  (Appine keeps none per thread).
 
 ## Open questions
 
