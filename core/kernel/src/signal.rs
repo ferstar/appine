@@ -2277,11 +2277,8 @@ mod tests {
 
     #[test]
     fn restore_frame_masks_fpcr() {
-        use crate::fd::FdTable;
         use crate::kernel::{Cx, Shared};
         use crate::mm::flags;
-        use crate::task::{FsContext, TaskState};
-        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
         use std::sync::Arc;
 
         let shared = Arc::new(Shared::new(Kernel::new(crate::process::Tier::Interpreter)));
@@ -2295,9 +2292,10 @@ mod tests {
         let (mut cpus, tasks) = spawn_test_tasks(&mut k, &group, &[(20, 0)]);
         let mut cpu = cpus.pop().unwrap();
         let task = tasks.into_iter().next().unwrap();
-        let mm = task.res.borrow().mm.clone();
+        let mut state = task.state.borrow_mut();
 
-        let stack = mm
+        let stack = state
+            .mm
             .borrow_mut()
             .mmap(
                 0,
@@ -2313,33 +2311,13 @@ mod tests {
         w32(&mut buf, RESERVED + 4, FPSIMD_SIZE as u32);
         w32(&mut buf, RESERVED + 8, 0x1f); // fpsr
         w32(&mut buf, RESERVED + 12, u32::MAX); // fpcr with reserved/unwritable bits set
-        mm.borrow()
+        state
+            .mm
+            .borrow()
             .write(UserSlice::new(frame, buf.len()), &buf)
             .unwrap();
         cpu.state_mut().sp = frame;
 
-        let mut state = TaskState {
-            mm,
-            fds: Rc::new(RefCell::new(FdTable::new())),
-            fs: Rc::new(RefCell::new(FsContext {
-                root: Node::ROOT,
-                cwd: Node::ROOT,
-                umask: 0o022,
-                mnt_ns: Rc::new(MntNs {
-                    id: INIT_MNT_NS,
-                    owner: crate::cred::UserNs::init(),
-                    anon: false,
-                }),
-            })),
-            group,
-            vfs: None,
-            altstack: Default::default(),
-            clear_child_tid: 0,
-            vfork_done: None,
-            restart: None,
-            fast_sleep: None,
-            sem_undo: Rc::new(crate::ipc::SemUndo::new()),
-        };
         let mut cx = Cx::new(&shared, k, &task, &mut state);
         restore_frame(&mut cx, &mut cpu).unwrap();
         assert_eq!(cpu.state().fpcr, appine_engine::fpcr_write_mask());

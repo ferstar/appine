@@ -2773,10 +2773,9 @@ impl Mm {
             .zip(file)
             .map(|(s, (_, offset, _))| (s.st_dev, s.st_ino, offset));
         let content = match (&st, file_id) {
-            _ if fill.is_some() => None,
-            (Some(_), Some(_)) if shared && file.is_some_and(|f| f.2) => None,
-            _ if tmpfs.is_some() => None,
-            (Some(s), Some((dev, ino, _))) if !shared => content::version(s, dev, ino),
+            (Some(s), Some((dev, ino, _))) if !shared && fill.is_none() && tmpfs.is_none() => {
+                content::version(s, dev, ino)
+            }
             _ => None,
         };
         #[allow(clippy::unnecessary_cast)]
@@ -2901,10 +2900,10 @@ impl Mm {
         self.insert_vma(start, v)?;
         if shared
             && !has_fill
-            && let (Some((fd, _, true)), Some(s), Some((dev, ino, _))) = (file, &st, file_id)
+            && let (Some((fd, _, true)), Some(s)) = (file, &st)
             && s.st_nlink > 0
         {
-            content::writably_shared(fd, dev, ino);
+            content::writably_shared(fd, s.st_dev, s.st_ino);
         }
         self.fills |= has_fill;
         if let (Some(libc), Some((_, offset, _))) = (bundled_libc, file) {
@@ -7799,7 +7798,7 @@ pub(crate) fn forget_writably_shared(dev: u64, ino: u64) {
 mod content {
     use std::collections::HashSet;
     use std::os::fd::RawFd;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
     /// Linked host files `(device, inode)` that have had a writable shared mapping: contents
     /// written through a shared mapping do not necessarily change ctime (a page that stays dirty
@@ -7807,37 +7806,33 @@ mod content {
     /// their host object is unlinked ([`forget`]).
     static WRITABLY_SHARED: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
 
+    fn lock() -> MutexGuard<'static, Option<HashSet<(u64, u64)>>> {
+        WRITABLY_SHARED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// File (`dev`, `ino`) got a writable shared mapping.
     ///
     /// Re-checks `fstat(fd)` under the lock so a concurrent object unlink (`unlink_at` followed by
     /// [`forget`]) cannot leave a stale `(dev, ino)` behind once `st_nlink == 0`.
     pub(super) fn writably_shared(fd: RawFd, dev: u64, ino: u64) {
-        let mut set = WRITABLY_SHARED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let s = set.get_or_insert_with(HashSet::new);
-        s.insert((dev, ino));
-        if !appine_hal::fstat(fd).is_ok_and(|st| st.st_nlink > 0) {
-            s.remove(&(dev, ino));
+        let mut set = lock();
+        if appine_hal::fstat(fd).is_ok_and(|st| st.st_nlink > 0) {
+            set.get_or_insert_with(HashSet::new).insert((dev, ino));
         }
     }
 
     /// Removes (`dev`, `ino`) after its host object has been unlinked.
     pub(super) fn forget(dev: u64, ino: u64) {
-        let mut set = WRITABLY_SHARED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(s) = set.as_mut() {
+        if let Some(s) = lock().as_mut() {
             s.remove(&(dev, ino));
         }
     }
 
     #[cfg(test)]
     pub(super) fn contains(dev: u64, ino: u64) -> bool {
-        let set = WRITABLY_SHARED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set.as_ref().is_some_and(|s| s.contains(&(dev, ino)))
+        lock().as_ref().is_some_and(|s| s.contains(&(dev, ino)))
     }
 
     /// The version of a host file's contents: ctime (nanoseconds) and size. Every change to the
@@ -7861,10 +7856,7 @@ mod content {
         if ctime + RACY_NS > now {
             return None;
         }
-        let set = WRITABLY_SHARED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if set.as_ref().is_some_and(|s| s.contains(&(dev, ino))) {
+        if lock().as_ref().is_some_and(|s| s.contains(&(dev, ino))) {
             return None;
         }
         Some((ctime as u64, st.st_size as u64))
@@ -11760,65 +11752,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::create(&dir).unwrap();
 
-        let aged = |mut st: libc::stat| -> libc::stat {
+        let trusted = |mut st: libc::stat| {
             st.st_ctime = 1_000_000;
             st.st_ctime_nsec = 0;
-            st
+            content_version(&st, st.st_dev, st.st_ino).is_some()
+        };
+        let map_shared = |mm: &mut Mm, fd, off| {
+            mm.mmap(0, PAGE_SIZE, RW, flags::MAP_SHARED, Some((fd, off, true)))
         };
 
         // 1. A failed writable MAP_SHARED (misaligned offset) must not poison WRITABLY_SHARED.
         let (_, mut failed_file) = store.create_file(ROOT, b"failed", 0o600, 0, 0).unwrap();
-        failed_file.write_all(&[0u8; 4096]).unwrap();
+        failed_file.write_all(&[0u8; PAGE_SIZE as usize]).unwrap();
         let failed_st = appine_hal::fstat(failed_file.as_raw_fd()).unwrap();
         let mut mm = Mm::new();
         assert_eq!(
-            mm.mmap(
-                0,
-                PAGE_SIZE,
-                RW,
-                flags::MAP_SHARED,
-                Some((failed_file.as_raw_fd(), 1, true)),
-            ),
+            map_shared(&mut mm, failed_file.as_raw_fd(), 1),
             Err(Errno::EINVAL)
         );
         assert!(!content::contains(failed_st.st_dev, failed_st.st_ino));
-        assert!(content_version(&aged(failed_st), failed_st.st_dev, failed_st.st_ino).is_some());
+        assert!(trusted(failed_st));
 
         // 2. An anonymous memfd (st_nlink == 0) is never inserted into WRITABLY_SHARED and never
         //    receives a trusted content version.
         let (_, mut memfd) = store.create_anonymous(0o600, 0, 0).unwrap();
-        memfd.write_all(&[1u8; 4096]).unwrap();
+        memfd.write_all(&[1u8; PAGE_SIZE as usize]).unwrap();
         let memfd_st = appine_hal::fstat(memfd.as_raw_fd()).unwrap();
         assert_eq!(memfd_st.st_nlink, 0);
-        let _m = mm
-            .mmap(
-                0,
-                PAGE_SIZE,
-                RW,
-                flags::MAP_SHARED,
-                Some((memfd.as_raw_fd(), 0, true)),
-            )
-            .unwrap();
+        let _m = map_shared(&mut mm, memfd.as_raw_fd(), 0).unwrap();
         assert!(!content::contains(memfd_st.st_dev, memfd_st.st_ino));
-        assert!(content_version(&aged(memfd_st), memfd_st.st_dev, memfd_st.st_ino).is_none());
+        assert!(!trusted(memfd_st));
 
         // 3. A linked regular file mapped MAP_SHARED writable is recorded in WRITABLY_SHARED and
         //    suppresses content_version while linked.
         let (_, mut shared_file) = store.create_file(ROOT, b"shared", 0o600, 0, 0).unwrap();
-        shared_file.write_all(&[2u8; 4096]).unwrap();
+        shared_file.write_all(&[2u8; PAGE_SIZE as usize]).unwrap();
         let shared_st = appine_hal::fstat(shared_file.as_raw_fd()).unwrap();
         assert_eq!(shared_st.st_nlink, 1);
-        let mapped = mm
-            .mmap(
-                0,
-                PAGE_SIZE,
-                RW,
-                flags::MAP_SHARED,
-                Some((shared_file.as_raw_fd(), 0, true)),
-            )
-            .unwrap();
+        let mapped = map_shared(&mut mm, shared_file.as_raw_fd(), 0).unwrap();
         assert!(content::contains(shared_st.st_dev, shared_st.st_ino));
-        assert!(content_version(&aged(shared_st), shared_st.st_dev, shared_st.st_ino).is_none());
+        assert!(!trusted(shared_st));
 
         // 4. Unlinking the file and letting the reaper delete its host object clears
         //    WRITABLY_SHARED while keeping the still-open unlinked fd untrusted (st_nlink == 0).
@@ -11828,14 +11801,12 @@ mod tests {
 
         let unlinked_st = appine_hal::fstat(shared_file.as_raw_fd()).unwrap();
         assert_eq!(unlinked_st.st_nlink, 0);
-        assert!(
-            content_version(&aged(unlinked_st), unlinked_st.st_dev, unlinked_st.st_ino).is_none()
-        );
+        assert!(!trusted(unlinked_st));
 
         // 5. A new linked file reusing the same (dev, ino) is no longer poisoned.
         mm.munmap(mapped, PAGE_SIZE).unwrap();
         drop(shared_file);
-        assert!(content_version(&aged(shared_st), shared_st.st_dev, shared_st.st_ino).is_some());
+        assert!(trusted(shared_st));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

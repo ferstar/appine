@@ -3539,12 +3539,11 @@ fn unlink_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
 /// its host inode; not an error if it is already gone.
 fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
     let mut name = [0u8; 21];
-    let name = object_name(ino, &mut name);
     // Keep an O_PATH handle open across unlink_at + forget_writably_shared so the host filesystem
     // cannot recycle (st_dev, st_ino) for a new object before the old tracking entry is removed.
     let pinned = appine_hal::open_at(
         objects_dir.as_raw_fd(),
-        name,
+        object_name(ino, &mut name),
         libc::O_PATH | libc::O_NOFOLLOW,
         0,
     )
@@ -3555,10 +3554,7 @@ fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
             (st.st_dev as u64, st.st_ino as u64)
         })
     });
-    let res = match appine_hal::unlink_at(objects_dir.as_raw_fd(), name) {
-        Err(e) if e != libc::ENOENT => Err(object_err(ino, e)),
-        _ => Ok(()),
-    };
+    let res = unlink_object(objects_dir, ino);
     if res.is_ok()
         && let Some((dev, host_ino)) = host_id
     {
