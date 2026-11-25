@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (namespace and cache, object sharing and lifetimes, transaction and recovery ordering, import and provider authorization checked against the store and its callers)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: WAL-sync-before-reap ordering in background reaper and inline fallback)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: WAL sync and transaction ordering during exclusive boot cleanup)
 
 ## Responsibilities
 
@@ -239,14 +239,15 @@ provider and rootfs installation UI (`android`).
 ### Opening and boot cleanup
 
 - Every connection takes a shared `flock` on `lock`. If it can get the lock exclusively (nobody else
-  has the store open), it runs boot cleanup: reset `users`, reconcile objects when the boot token changes, delete objects in the recorded
-  uncommitted range that have no row, empty the volatile directories passed in (the kernel passes
-  `/dev/shm` and `/run`; host-side openers pass none), remove detached trees, sync, drop the
-  `shared` rows of deleted files, delete nlink-0 rows no `shared` row uses as an object and their
-  objects, delete the objects those dropped rows used that no row uses any more (unless one is a
-  live file's own data), taking all those numbers back out of the doomed list the emptying filled,
-  commit. Then it downgrades to shared and increments `users`; if
-  others are open it waits (`BEGIN IMMEDIATE; COMMIT`) for their deferred transaction.
+  has the store open), it resets `users`, reconciles objects when the boot token changes, removes
+  objects in the recorded uncommitted range that have no row, and syncs the previous run's WAL.
+- In one transaction it empties the volatile directories (the kernel passes `/dev/shm` and `/run`,
+  host-side openers pass none), removes detached trees, then drops the `shared` rows of deleted
+  files. It removes nlink-0 rows whose numbers no remaining share uses, their objects, and any
+  formerly shared objects that no live file needs. It strips the removed numbers from the doomed
+  list before the transaction can commit, even when cleanup exceeds the commit delay.
+- After committing, it downgrades to a shared lock and increments `users`. If others are open it
+  waits (`BEGIN IMMEDIATE; COMMIT`) for their deferred transaction.
 
 ### Metadata cache
 
@@ -386,6 +387,9 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
+- If boot cleanup rolls back or loses its commit after unlinking a host object, SQLite can restore
+  the volatile dentry that pointed to it. An opener that omits that volatile directory can then
+  see the name with its object missing.
 - **Whole-file sharing:** the first change to a file sharing its object copies all of it, where
   btrfs and XFS copy only the extents written.
 

@@ -407,7 +407,7 @@ impl Store {
         if dir.join("meta.db").exists() {
             return Err(Errno::EEXIST);
         }
-        let store = Self::connect(dir)?;
+        let store = Self::connect(dir, COMMIT_DELAY)?;
         let now = now_ns();
         store
             .db()
@@ -425,25 +425,32 @@ impl Store {
     /// empties the directories in `volatile` (paths relative to the root directory, such as
     /// `dev/shm`: on Linux they are tmpfs) and cleans up deleted inodes left by the last run.
     pub fn open(dir: &Path, volatile: &[&[u8]]) -> Result<Store, Errno> {
+        Self::open_with_delay(dir, volatile, COMMIT_DELAY)
+    }
+
+    fn open_with_delay(dir: &Path, volatile: &[&[u8]], delay: Duration) -> Result<Store, Errno> {
         if !dir.join("meta.db").exists() {
             return Err(Errno::ENOENT);
         }
-        let store = Self::connect(dir)?;
+        let store = Self::connect(dir, delay)?;
         let fd = store.lock.as_raw_fd();
         if appine_hal::flock(fd, true, false).is_ok() {
             store.meta.commits.reset_users();
             store.recover_objects()?;
             store.remove_lost_objects()?;
-            for path in volatile {
-                store.empty_dir(path)?;
-            }
-            store.remove_detached_dirs()?;
             // The last run may have been killed, and its last commit may still be only in the
             // host's page cache: make it durable before deleting objects according to the
             // database, or with power lost right afterwards the database returns to its earlier
             // state but the objects are gone ([`reap`])
             store.meta.sync_metadata()?;
-            store.transaction(|s| s.remove_orphans())?;
+            // Keep doomed numbers in this operation until remove_orphans frees them for reuse.
+            store.transaction(|s| {
+                for path in volatile {
+                    s.empty_dir(path)?;
+                }
+                s.remove_detached_dirs()?;
+                s.remove_orphans()
+            })?;
             store.commit()?;
         }
         appine_hal::flock(fd, false, true).map_err(Errno)?;
@@ -457,7 +464,7 @@ impl Store {
         Ok(store)
     }
 
-    fn connect(dir: &Path) -> Result<Store, Errno> {
+    fn connect(dir: &Path, delay: Duration) -> Result<Store, Errno> {
         let mut db = Connection::open(dir.join("meta.db")).map_err(db_err)?;
         db.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;
@@ -566,7 +573,7 @@ impl Store {
             writing: Cell::new(false),
             snapshot_at: Cell::new(None),
             pending: Cell::new(None),
-            delay: COMMIT_DELAY,
+            delay,
             doomed: RefCell::default(),
             replaced: RefCell::default(),
             created: RefCell::default(),
@@ -776,8 +783,7 @@ impl Store {
         for &(ino, m) in &orphans {
             // Not handed to the background thread: once the row is deleted, its number may be
             // given to a newly created file, and a background thread deleting a bit later would
-            // delete the new file's object. Deleting before the commit does no harm: no dentry has
-            // pointed at these rows for a long time
+            // delete the new file's object.
             if m & mode::S_IFMT == mode::S_IFREG {
                 self.remove_object(ino)?;
             }
@@ -4603,6 +4609,38 @@ mod tests {
             assert!(inos.contains(&ino));
             let object = dir.join("objects").join(ino.to_string());
             assert_eq!(fs::read(object).unwrap(), b"data");
+        }
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overdue_boot_cleanup_keeps_reused_and_shared_objects() {
+        let (s, dir) = temp_store("overdue-boot");
+        let detached = s.create_detached_dir(0o755, 0, 0).unwrap();
+        let run = s.mkdir(ROOT, b"run", 0o755, 0, 0).unwrap();
+        let (keep, _) = s.create_file(ROOT, b"keep", 0o644, 0, 0).unwrap();
+        let (source, mut file) = s.create_file(detached, b"source", 0o644, 0, 0).unwrap();
+        file.write_all(b"shared").unwrap();
+        drop(file);
+        s.share(source, keep).unwrap();
+        let (a, _) = s.create_file(run, b"a", 0o644, 0, 0).unwrap();
+        let (b, _) = s.create_file(detached, b"b", 0o644, 0, 0).unwrap();
+        drop(s);
+
+        // Every top-level operation is overdue as soon as it finishes.
+        let s = Store::open_with_delay(&dir, &[b"run"], Duration::ZERO).unwrap();
+        assert!(s.reaper.is_some());
+        assert_eq!(s.meta.reaper.state.lock().unwrap().handed, 0);
+        assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
+        for (expected, name) in [(a, b"a"), (b, b"b")] {
+            let (ino, mut file) = s.create_file(ROOT, name, 0o644, 0, 0).unwrap();
+            assert_eq!(ino, expected);
+            file.write_all(name).unwrap();
+        }
+        s.reaped();
+        for (ino, data) in [(a, &b"a"[..]), (b, b"b"), (source, b"shared")] {
+            assert_eq!(fs::read(s.objects.join(ino.to_string())).unwrap(), data);
         }
         drop(s);
         let _ = fs::remove_dir_all(&dir);
