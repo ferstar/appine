@@ -12,7 +12,9 @@
 //! Appine has no disk filesystems. What it is for: LTP acquires its test device this way (and runs
 //! on tmpfs over it), `losetup` works, and tools such as mkfs can write images through it.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 use super::{IO_CHUNK, SysResult, get, put};
@@ -296,27 +298,24 @@ pub(super) fn sync_range(dev: &LoopRef, offset: i64, len: i64) -> Option<(FileRe
             return None;
         }
         let next_off = base.checked_add(off)?;
-        let next = match &backing.borrow().kind {
+        let raw = match &backing.borrow().kind {
             FileKind::Regular { file, .. } => {
-                let end = next_off.checked_add(span)?;
-                if end > i64::MAX as u64 {
+                if next_off.checked_add(span)? > i64::MAX as u64 {
                     return None;
                 }
-                Err(std::os::fd::AsRawFd::as_raw_fd(file))
+                file.as_raw_fd()
             }
             FileKind::Device {
                 block: Some(open), ..
-            } => Ok(open.dev.clone()),
-            _ => return None,
-        };
-        match next {
-            Err(raw) => return Some((backing, raw, next_off as i64, span as i64)),
-            Ok(next_dev) => {
-                cur = next_dev;
+            } => {
+                cur = open.dev.clone();
                 off = next_off;
                 rem = span;
+                continue;
             }
-        }
+            _ => return None,
+        };
+        return Some((backing, raw, next_off as i64, span as i64));
     }
 }
 
@@ -741,7 +740,7 @@ pub(crate) struct Loops {
     /// The last disk sequence number handed out (Linux's global `diskseq`, which advances when a
     /// device is created, bound or unbound). Shared with each [`Loop`] so autoclear unbinds in
     /// [`LoopOpen::drop`] can advance it without a kernel reference.
-    seq: Rc<std::cell::Cell<u64>>,
+    seq: Rc<Cell<u64>>,
 }
 
 impl Loops {
@@ -768,7 +767,7 @@ impl Loops {
     pub(crate) fn new() -> Loops {
         let mut loops = Loops {
             devices: BTreeMap::new(),
-            seq: Rc::new(std::cell::Cell::new(0)),
+            seq: Rc::new(Cell::new(0)),
         };
         for n in 0..LOOP_MIN_COUNT {
             loops.insert(n);
@@ -929,21 +928,21 @@ pub(crate) struct Loop {
     /// Disk sequence number (`BLKGETDISKSEQ`).
     seq: u64,
     /// Shared kernel diskseq counter (see [`Loops::seq`]).
-    seq_gen: Rc<std::cell::Cell<u64>>,
+    seq_gen: Rc<Cell<u64>>,
     /// Open files of the device (`disk_openers`).
     opens: u32,
     /// An `O_EXCL` open holds the device.
     claimed: bool,
 }
 
-fn bump_seq(counter: &std::cell::Cell<u64>) -> u64 {
+fn bump_seq(counter: &Cell<u64>) -> u64 {
     let next = counter.get() + 1;
     counter.set(next);
     next
 }
 
 impl Loop {
-    fn new(number: u32, seq: u64, seq_gen: Rc<std::cell::Cell<u64>>) -> Loop {
+    fn new(number: u32, seq: u64, seq_gen: Rc<Cell<u64>>) -> Loop {
         Loop {
             number,
             backing: None,

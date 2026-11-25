@@ -65,6 +65,14 @@
         }                                                                                          \
     } while (0)
 
+#define CHECK_ERRNO(expr, expected, ...)                                                           \
+    do {                                                                                           \
+        errno = 0;                                                                                 \
+        CHECK((expr) == -1 && errno == (expected), __VA_ARGS__);                                   \
+    } while (0)
+
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
 #ifndef F_SETLEASE
 #define F_SETLEASE 1024
 #endif
@@ -2449,473 +2457,379 @@ static void test_inotify_handle_memfd_cgroup_tmpfs(void)
     unlink(tfile);
 }
 
-static void test_fs_io_pipe_vfs_xattr_loop_fixes(void)
+/* kernel/pipe: splice ESPIPE before EBADF, O_PATH EBADF, and unseekable offsets EINVAL before
+ * waiting for pipe room or data. */
+static void test_splice_order_and_unseekable_offsets(void)
 {
-    /* 1. kernel/pipe: splice ESPIPE before EBADF, O_PATH EBADF, and unseekable offsets EINVAL
-     *    before waiting for pipe room or data. */
-    {
-        int p1[2], p2[2];
-        CHECK(pipe(p1) == 0 && pipe(p2) == 0, "pipe");
-        loff_t off = 0, negoff = -1;
-        /* Pipe end with offset returns ESPIPE before access-mode EBADF. */
-        errno = 0;
-        CHECK(splice(p1[1], &off, p2[1], NULL, 4, 0) == -1 && errno == ESPIPE,
-              "splice wr-end pipe+off must return ESPIPE before EBADF");
-        errno = 0;
-        CHECK(splice(p1[0], NULL, p2[0], &off, 4, 0) == -1 && errno == ESPIPE,
-              "splice rd-end pipe+off must return ESPIPE before EBADF");
-        int reg = open("/tmp/sp_fix_reg", O_RDWR | O_CREAT | O_TRUNC, 0600);
-        CHECK(reg >= 0 && write(reg, "abcd", 4) == 4, "create sp_fix_reg");
-        int reg_ro = open("/tmp/sp_fix_reg", O_RDONLY);
-        int reg_path = open("/tmp/sp_fix_reg", O_PATH);
-        CHECK(reg_ro >= 0 && reg_path >= 0, "open reg_ro / reg_path");
-        errno = 0;
-        CHECK(splice(reg_ro, NULL, p2[0], &off, 4, 0) == -1 && errno == ESPIPE,
-              "splice reg -> rd-end pipe+off ESPIPE");
-        errno = 0;
-        CHECK(splice(p1[1], &off, reg_ro, NULL, 4, 0) == -1 && errno == ESPIPE,
-              "splice wr-end pipe+off -> reg_ro ESPIPE");
-        /* O_PATH fails with EBADF before pipe ESPIPE. */
-        errno = 0;
-        CHECK(splice(p1[1], &off, reg_path, NULL, 4, 0) == -1 && errno == EBADF,
-              "splice with O_PATH fd must return EBADF before ESPIPE");
-        /* Invalid user offset pointer fails with EFAULT before access-mode EBADF;
-         * negative offset on bad mode fails with EBADF first. */
-        errno = 0;
-        CHECK(splice(reg_ro, (loff_t *)1, p2[0], NULL, 4, 0) == -1 && errno == EFAULT,
-              "splice bad off_in ptr EFAULT before EBADF");
-        errno = 0;
-        CHECK(splice(reg_ro, &negoff, p2[0], NULL, 4, 0) == -1 && errno == EBADF,
-              "splice negative off_in with bad mode EBADF");
+    int p1[2], p2[2];
+    CHECK(pipe(p1) == 0 && pipe(p2) == 0, "pipe");
+    loff_t off = 0, negoff = -1;
+    CHECK_ERRNO(splice(p1[1], &off, p2[1], NULL, 4, 0), ESPIPE,
+                "splice wr-end pipe+off must return ESPIPE before EBADF");
+    CHECK_ERRNO(splice(p1[0], NULL, p2[0], &off, 4, 0), ESPIPE,
+                "splice rd-end pipe+off must return ESPIPE before EBADF");
 
-        /* Fill p2 completely so a blocking splice into p2 would block if it waited for room. */
-        CHECK(fcntl(p2[1], F_SETFL, O_NONBLOCK) == 0, "set O_NONBLOCK on p2[1]");
-        char big[4096];
-        memset(big, 'x', sizeof big);
-        while (write(p2[1], big, sizeof big) > 0) {}
-        CHECK(fcntl(p2[1], F_SETFL, 0) == 0, "clear O_NONBLOCK on p2[1]");
+    int reg = open("/tmp/sp_fix_reg", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    CHECK(reg >= 0 && write(reg, "abcd", 4) == 4, "create sp_fix_reg");
+    int reg_ro = open("/tmp/sp_fix_reg", O_RDONLY);
+    int reg_path = open("/tmp/sp_fix_reg", O_PATH);
+    CHECK(reg_ro >= 0 && reg_path >= 0, "open reg_ro / reg_path");
 
-        /* Unseekable inputs (PTY slave, PTY master, socket) with off_in into full pipe must
-         * return EINVAL immediately without blocking or returning ESPIPE. */
-        int ptm = open("/dev/ptmx", O_RDWR | O_NOCTTY);
-        CHECK(ptm >= 0, "open /dev/ptmx for splice");
-        int unlock = 0, ptyno = -1;
-        CHECK(ioctl(ptm, TIOCSPTLCK, &unlock) == 0 && ioctl(ptm, TIOCGPTN, &ptyno) == 0,
-              "unlock pty");
-        char spath[64];
-        snprintf(spath, sizeof spath, "/dev/pts/%d", ptyno);
-        int pts = open(spath, O_RDWR | O_NOCTTY);
-        CHECK(pts >= 0, "open %s", spath);
-        int sp[2];
-        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "socketpair");
-        off = 0;
-        errno = 0;
-        CHECK(splice(pts, &off, p2[1], NULL, 4, 0) == -1 && errno == EINVAL,
-              "splice pts+off into full pipe must return EINVAL immediately");
-        errno = 0;
-        CHECK(splice(ptm, &off, p2[1], NULL, 4, 0) == -1 && errno == EINVAL,
-              "splice ptm+off into full pipe must return EINVAL immediately");
-        errno = 0;
-        CHECK(splice(sp[0], &off, p2[1], NULL, 4, 0) == -1 && errno == EINVAL,
-              "splice sock+off into full pipe must return EINVAL immediately");
-        /* Unseekable outputs from empty pipe with off_out must also return EINVAL immediately. */
-        errno = 0;
-        CHECK(splice(p1[0], NULL, pts, &off, 4, 0) == -1 && errno == EINVAL,
-              "splice empty pipe -> pts+off must return EINVAL immediately");
-        errno = 0;
-        CHECK(splice(p1[0], NULL, sp[0], &off, 4, 0) == -1 && errno == EINVAL,
-              "splice empty pipe -> sock+off must return EINVAL immediately");
+    CHECK_ERRNO(splice(reg_ro, NULL, p2[0], &off, 4, 0), ESPIPE,
+                "splice reg -> rd-end pipe+off ESPIPE");
+    CHECK_ERRNO(splice(p1[1], &off, reg_ro, NULL, 4, 0), ESPIPE,
+                "splice wr-end pipe+off -> reg_ro ESPIPE");
+    CHECK_ERRNO(splice(p1[1], &off, reg_path, NULL, 4, 0), EBADF,
+                "splice with O_PATH fd must return EBADF before ESPIPE");
+    CHECK_ERRNO(splice(reg_ro, (loff_t *)1, p2[0], NULL, 4, 0), EFAULT,
+                "splice bad off_in ptr EFAULT before EBADF");
+    CHECK_ERRNO(splice(reg_ro, &negoff, p2[0], NULL, 4, 0), EBADF,
+                "splice negative off_in with bad mode EBADF");
 
-        close(sp[0]);
-        close(sp[1]);
-        close(pts);
-        close(ptm);
-        close(reg);
-        close(reg_ro);
-        close(reg_path);
-        unlink("/tmp/sp_fix_reg");
-        close(p1[0]);
-        close(p1[1]);
-        close(p2[0]);
-        close(p2[1]);
+    /* Fill p2 completely so a blocking splice into p2 would block if it waited for room. */
+    CHECK(fcntl(p2[1], F_SETFL, O_NONBLOCK) == 0, "set O_NONBLOCK on p2[1]");
+    char big[4096];
+    memset(big, 'x', sizeof big);
+    while (write(p2[1], big, sizeof big) > 0) {}
+    CHECK(fcntl(p2[1], F_SETFL, 0) == 0, "clear O_NONBLOCK on p2[1]");
+
+    /* Unseekable inputs/outputs with explicit offsets must return EINVAL immediately. */
+    int ptm = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+    CHECK(ptm >= 0, "open /dev/ptmx for splice");
+    int unlock = 0, ptyno = -1;
+    CHECK(ioctl(ptm, TIOCSPTLCK, &unlock) == 0 && ioctl(ptm, TIOCGPTN, &ptyno) == 0, "unlock pty");
+    char spath[64];
+    snprintf(spath, sizeof spath, "/dev/pts/%d", ptyno);
+    int pts = open(spath, O_RDWR | O_NOCTTY);
+    CHECK(pts >= 0, "open %s", spath);
+    int sp[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "socketpair");
+
+    off = 0;
+    CHECK_ERRNO(splice(pts, &off, p2[1], NULL, 4, 0), EINVAL,
+                "splice pts+off into full pipe must return EINVAL immediately");
+    CHECK_ERRNO(splice(ptm, &off, p2[1], NULL, 4, 0), EINVAL,
+                "splice ptm+off into full pipe must return EINVAL immediately");
+    CHECK_ERRNO(splice(sp[0], &off, p2[1], NULL, 4, 0), EINVAL,
+                "splice sock+off into full pipe must return EINVAL immediately");
+    CHECK_ERRNO(splice(p1[0], NULL, pts, &off, 4, 0), EINVAL,
+                "splice empty pipe -> pts+off must return EINVAL immediately");
+    CHECK_ERRNO(splice(p1[0], NULL, sp[0], &off, 4, 0), EINVAL,
+                "splice empty pipe -> sock+off must return EINVAL immediately");
+
+    close(sp[0]);
+    close(sp[1]);
+    close(pts);
+    close(ptm);
+    close(reg);
+    close(reg_ro);
+    close(reg_path);
+    unlink("/tmp/sp_fix_reg");
+    close(p1[0]);
+    close(p1[1]);
+    close(p2[0]);
+    close(p2[1]);
+}
+
+/* kernel/files: RO superblock checks EROFS (sb_permission) before DAC permission, while a
+ * read-only bind over a writable instance checks DAC permission first (except O_TRUNC). */
+static void test_ro_mount_vs_sb_open_order(void)
+{
+    const char *t_rw = "/tmp/ro_sb_rw";
+    const char *t_bind = "/tmp/ro_sb_bind";
+    rm_rf(t_rw);
+    rm_rf(t_bind);
+    CHECK(mkdir(t_rw, 0755) == 0 && mkdir(t_bind, 0755) == 0, "mkdir ro_sb dirs");
+    CHECK(mount("none", t_rw, "tmpfs", 0, "size=1m") == 0, "mount tmpfs rw");
+
+    static const struct {
+        const char *name;
+        mode_t mode;
+    } files[] = {{"f444", 0444}, {"f000", 0000}, {"f666", 0666}};
+    char p[3][96];
+    for (size_t i = 0; i < ARRAY_LEN(files); i++) {
+        snprintf(p[i], sizeof p[i], "%s/%s", t_rw, files[i].name);
+        write_file_bytes(p[i], "a", 1, files[i].mode);
+        CHECK(chmod(p[i], files[i].mode) == 0, "chmod %s", p[i]);
+    }
+    CHECK(mount(t_rw, t_bind, NULL, MS_BIND, NULL) == 0, "bind mount tmpfs");
+    CHECK(mount(NULL, t_bind, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) == 0,
+          "remount bind ro");
+
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork ro-bind check");
+    if (pid == 0) {
+        CHECK(setgid(1000) == 0 && setuid(1000) == 0, "setuid 1000");
+        char bp[3][96];
+        for (size_t i = 0; i < ARRAY_LEN(files); i++)
+            snprintf(bp[i], sizeof bp[i], "%s/%s", t_bind, files[i].name);
+        CHECK_ERRNO(open(bp[0], O_WRONLY), EACCES, "ro-bind f444 O_WRONLY EACCES");
+        CHECK_ERRNO(open(bp[1], O_RDWR), EACCES, "ro-bind f000 O_RDWR EACCES");
+        CHECK_ERRNO(open(bp[0], O_RDONLY | O_TRUNC), EROFS, "ro-bind f444 O_RDONLY|O_TRUNC EROFS");
+        CHECK_ERRNO(open(bp[2], O_WRONLY), EROFS, "ro-bind f666 O_WRONLY EROFS");
+        _exit(0);
+    }
+    wait_ok(pid, "ro-bind non-root open checks");
+
+    /* Remount superblock itself read-only: EROFS must come before DAC permission. */
+    CHECK(mount(NULL, t_rw, NULL, MS_REMOUNT | MS_RDONLY, "size=1m") == 0, "remount tmpfs sb ro");
+    pid = fork();
+    CHECK(pid >= 0, "fork ro-sb check");
+    if (pid == 0) {
+        CHECK(setgid(1000) == 0 && setuid(1000) == 0, "setuid 1000");
+        CHECK_ERRNO(open(p[0], O_WRONLY), EROFS, "ro-sb f444 O_WRONLY EROFS");
+        CHECK_ERRNO(open(p[1], O_WRONLY), EROFS, "ro-sb f000 O_WRONLY EROFS");
+        CHECK_ERRNO(open(p[1], O_RDWR), EROFS, "ro-sb f000 O_RDWR EROFS");
+        CHECK_ERRNO(open(p[2], O_WRONLY | O_NOATIME), EROFS, "ro-sb f666 O_WRONLY|O_NOATIME EROFS");
+        _exit(0);
+    }
+    wait_ok(pid, "ro-sb non-root open checks");
+    CHECK(umount(t_bind) == 0 && umount(t_rw) == 0, "umount ro_sb");
+    rm_rf(t_bind);
+    rm_rf(t_rw);
+}
+
+/* kernel/files: FD table growth respects lowered nr_open cap (verified via dup3/F_DUPFD and
+ * select(2) clamping nfds to capped table capacity). */
+static void test_nr_open_fd_table_growth(void)
+{
+    char saved_nr[64];
+    read_proc_str("/proc/sys/fs/nr_open", saved_nr, sizeof saved_nr);
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork nr_open growth test");
+    if (pid == 0) {
+        struct rlimit rl = {4096, 4096};
+        CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0, "setrlimit 4096");
+        write_proc_str("/proc/sys/fs/nr_open", "1536\n");
+        CHECK(dup3(1, 1500, 0) == 1500, "dup3 to 1500 within nr_open=1536");
+        CHECK_ERRNO(dup3(1, 1600, 0), EBADF, "dup3 to 1600 > nr_open EBADF");
+        CHECK(fcntl(1, F_DUPFD, 1535) == 1535, "F_DUPFD 1535");
+        CHECK_ERRNO(fcntl(1, F_DUPFD, 1536), EMFILE, "F_DUPFD 1536 >= nr_open EMFILE");
+        /* Capacity is capped at 1536 (192 bytes) rather than rounded up to 2048 (256 bytes). */
+        char *pages =
+            mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(pages != MAP_FAILED && munmap(pages + 4096, 4096) == 0, "guard page");
+        fd_set *s192 = (fd_set *)(pages + 4096 - 192);
+        memset(s192, 0, 192);
+        struct timeval tv = {0, 0};
+        CHECK(select(2048, s192, NULL, NULL, &tv) == 0, "select(2048) clamped to 1536 (192B)");
+        fd_set *s128 = (fd_set *)(pages + 4096 - 128);
+        memset(s128, 0, 128);
+        CHECK_ERRNO(select(2048, s128, NULL, NULL, &tv), EFAULT, "select(2048) with 128B faults");
+        munmap(pages, 4096);
+        close(1500);
+        close(1535);
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid, "waitpid nr_open child");
+    write_proc_str("/proc/sys/fs/nr_open", saved_nr);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "nr_open growth child failed");
+}
+
+/* kernel/fileio: fallocate check order & socket ENODEV; sync_file_range O_PATH; pread/pwrite
+ * offset before fd. */
+static void test_fallocate_and_pread_order(void)
+{
+    const int FL_KEEP = 0x1, FL_PUNCH = 0x2, FL_COLLAPSE = 0x8;
+    int s[2], pp[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0 && pipe(pp) == 0, "sock/pipe");
+    int tf = open("/tmp/falloc_order", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int tro = open("/tmp/falloc_order", O_RDONLY);
+    int tpath = open("/tmp/falloc_order", O_PATH);
+    CHECK(tf >= 0 && tro >= 0 && tpath >= 0, "open falloc_order");
+
+    CHECK_ERRNO(fallocate(999, 0, -1, 0), EBADF, "fallocate badfd EBADF first");
+    CHECK_ERRNO(fallocate(tpath, 0, -1, 0), EBADF, "fallocate O_PATH EBADF first");
+    CHECK_ERRNO(fallocate(tro, 0, -1, 10), EINVAL, "fallocate ro neg off EINVAL");
+    CHECK_ERRNO(fallocate(tro, 0, 0, 0), EINVAL, "fallocate ro zero len EINVAL");
+    CHECK_ERRNO(fallocate(tro, 0x8000, 0, 10), EOPNOTSUPP, "fallocate ro unknown mode EOPNOTSUPP");
+    CHECK_ERRNO(fallocate(tro, FL_PUNCH, 0, 10), EOPNOTSUPP,
+                "fallocate ro PUNCH without KEEP EOPNOTSUPP");
+    CHECK_ERRNO(fallocate(tro, FL_COLLAPSE | FL_KEEP, 0, 10), EOPNOTSUPP,
+                "fallocate ro COLLAPSE|KEEP EOPNOTSUPP");
+    CHECK_ERRNO(fallocate(tro, FL_COLLAPSE, 0, 10), EBADF, "fallocate ro valid COLLAPSE EBADF");
+    CHECK_ERRNO(fallocate(tro, 0, INT64_MAX, 10), EBADF, "fallocate ro overflow EBADF before EFBIG");
+    CHECK_ERRNO(fallocate(s[0], 0, 0, 10), ENODEV, "fallocate socket ENODEV");
+    CHECK_ERRNO(fallocate(s[0], 0, INT64_MAX, 10), ENODEV, "fallocate socket overflow ENODEV");
+    CHECK_ERRNO(fallocate(pp[1], 0, 0, 10), ESPIPE, "fallocate pipe wr ESPIPE");
+    CHECK_ERRNO(fallocate(pp[1], 0, INT64_MAX, 10), ESPIPE, "fallocate pipe overflow ESPIPE");
+    CHECK_ERRNO(fallocate(pp[0], 0, 0, 10), EBADF, "fallocate pipe rd EBADF");
+
+    CHECK_ERRNO(sync_file_range(tpath, -1, -1, 99), EBADF,
+                "sync_file_range O_PATH EBADF before EINVAL");
+    char b[4] = {0};
+    CHECK_ERRNO(pread(999, b, 4, -1), EINVAL, "pread badfd neg off EINVAL");
+    CHECK_ERRNO(pwrite(999, b, 4, -1), EINVAL, "pwrite badfd neg off EINVAL");
+
+    close(s[0]);
+    close(s[1]);
+    close(pp[0]);
+    close(pp[1]);
+    close(tf);
+    close(tro);
+    close(tpath);
+    unlink("/tmp/falloc_order");
+}
+
+/* kernel/vfs: cgroup mkdir reports search EACCES, then EEXIST, before EROFS. */
+static void test_cgroup_mkdir_error_order(void)
+{
+    const char *cg_sub = "/sys/fs/cgroup/cg_ro_test";
+    const char *cg_ro = "/tmp/cg_ro_bind";
+    rmdir(cg_sub);
+    rm_rf(cg_ro);
+    CHECK(mkdir(cg_sub, 0755) == 0 && mkdir(cg_ro, 0755) == 0, "mkdir cg_sub/cg_ro");
+    CHECK(mount("/sys/fs/cgroup", cg_ro, NULL, MS_BIND, NULL) == 0, "bind cgroup");
+    CHECK(mount(NULL, cg_ro, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) == 0,
+          "remount cgroup bind ro");
+
+    static const char *const existing[] = {"cg_ro_test", "cgroup.procs", ".", ".."};
+    for (size_t i = 0; i < ARRAY_LEN(existing); i++) {
+        char p[96];
+        snprintf(p, sizeof p, "%s/%s", cg_ro, existing[i]);
+        CHECK_ERRNO(mkdir(p, 0755), EEXIST, "cg_ro mkdir %s EEXIST", existing[i]);
+    }
+    char p_new[96];
+    snprintf(p_new, sizeof p_new, "%s/brand_new", cg_ro);
+    CHECK_ERRNO(mkdir(p_new, 0755), EROFS, "cg_ro mkdir new EROFS");
+
+    CHECK(chmod(cg_sub, 0000) == 0, "chmod cg_sub 0000");
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork cg_ro non-root");
+    if (pid == 0) {
+        CHECK(setgid(1000) == 0 && setuid(1000) == 0, "setuid 1000");
+        char p_in[128];
+        snprintf(p_in, sizeof p_in, "%s/cg_ro_test/cgroup.procs", cg_ro);
+        CHECK_ERRNO(mkdir(p_in, 0755), EACCES, "cg_ro no-exec EACCES before EEXIST");
+        _exit(0);
+    }
+    wait_ok(pid, "cg_ro non-root search check");
+    CHECK(chmod(cg_sub, 0755) == 0, "restore cg_sub mode");
+    CHECK(umount(cg_ro) == 0 && rmdir(cg_ro) == 0 && rmdir(cg_sub) == 0, "cleanup cg_ro");
+}
+
+/* kernel/xattr: procfs/devpts/nsfs/mqueue getxattr returns EOPNOTSUPP (after xattr_permission),
+ * kernfs (sysfs/cgroup2) returns ENODATA, listxattr returns 0, and tmpfs xattrs keep working. */
+static void test_synthetic_xattr_errors(void)
+{
+    char xbuf[64];
+    static const char *const no_xattr_paths[] = {
+        "/proc/self/stat", "/proc", "/proc/self/ns/mnt", "/dev/pts", "/dev/mqueue",
+    };
+    static const char *const attrs[] = {
+        "user.a", "trusted.a", "security.a", "system.posix_acl_access",
+    };
+    for (size_t i = 0; i < ARRAY_LEN(no_xattr_paths); i++) {
+        for (size_t j = 0; j < ARRAY_LEN(attrs); j++) {
+            CHECK_ERRNO(getxattr(no_xattr_paths[i], attrs[j], xbuf, sizeof xbuf), EOPNOTSUPP,
+                        "getxattr(%s, %s) must return EOPNOTSUPP", no_xattr_paths[i], attrs[j]);
+        }
+        CHECK(listxattr(no_xattr_paths[i], xbuf, sizeof xbuf) == 0, "listxattr(%s) == 0",
+              no_xattr_paths[i]);
+    }
+    /* /dev/pts/ptmx is a character device: user.* hits xattr_permission -> ENODATA. */
+    CHECK_ERRNO(getxattr("/dev/pts/ptmx", "user.a", xbuf, sizeof xbuf), ENODATA,
+                "getxattr(/dev/pts/ptmx, user.a) ENODATA");
+    CHECK_ERRNO(getxattr("/dev/pts/ptmx", "trusted.a", xbuf, sizeof xbuf), EOPNOTSUPP,
+                "getxattr(/dev/pts/ptmx, trusted.a) EOPNOTSUPP");
+
+    static const char *const kernfs_paths[] = {"/sys", "/sys/fs/cgroup"};
+    for (size_t i = 0; i < ARRAY_LEN(kernfs_paths); i++) {
+        for (size_t j = 0; j < 3; j++) {
+            CHECK_ERRNO(getxattr(kernfs_paths[i], attrs[j], xbuf, sizeof xbuf), ENODATA,
+                        "getxattr(%s, %s) ENODATA", kernfs_paths[i], attrs[j]);
+        }
+        CHECK_ERRNO(getxattr(kernfs_paths[i], "system.posix_acl_access", xbuf, sizeof xbuf),
+                    EOPNOTSUPP, "getxattr(%s, system.posix_acl_access) EOPNOTSUPP",
+                    kernfs_paths[i]);
+        CHECK(listxattr(kernfs_paths[i], xbuf, sizeof xbuf) == 0, "listxattr(%s) == 0",
+              kernfs_paths[i]);
     }
 
-    /* 2. kernel/files: RO filesystem instance checks EROFS (sb_permission) before DAC permission,
-     *    while a read-only bind over a writable instance checks DAC permission first (except
-     *    O_TRUNC). */
-    {
-        const char *t_rw = "/tmp/ro_sb_rw";
-        const char *t_bind = "/tmp/ro_sb_bind";
-        rm_rf(t_rw);
-        rm_rf(t_bind);
-        CHECK(mkdir(t_rw, 0755) == 0 && mkdir(t_bind, 0755) == 0, "mkdir ro_sb dirs");
-        CHECK(mount("none", t_rw, "tmpfs", 0, "size=1m") == 0, "mount tmpfs rw");
-        char f444[96], f000[96], f666[96];
-        snprintf(f444, sizeof f444, "%s/f444", t_rw);
-        snprintf(f000, sizeof f000, "%s/f000", t_rw);
-        snprintf(f666, sizeof f666, "%s/f666", t_rw);
-        write_file_bytes(f444, "a", 1, 0444);
-        write_file_bytes(f000, "a", 1, 0000);
-        write_file_bytes(f666, "a", 1, 0666);
-        CHECK(chmod(f444, 0444) == 0 && chmod(f000, 0000) == 0 && chmod(f666, 0666) == 0,
-              "chmod ro_sb files");
-        CHECK(mount(t_rw, t_bind, NULL, MS_BIND, NULL) == 0, "bind mount tmpfs");
-        CHECK(mount(NULL, t_bind, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) == 0,
-              "remount bind ro");
+    const char *tf = "/dev/shm/xattr_tmpfs_ok";
+    write_file_bytes(tf, "x", 1, 0644);
+    CHECK(setxattr(tf, "user.k", "val", 3, 0) == 0, "tmpfs setxattr");
+    CHECK(getxattr(tf, "user.k", xbuf, sizeof xbuf) == 3 && memcmp(xbuf, "val", 3) == 0,
+          "tmpfs getxattr");
+    unlink(tf);
+}
 
-        pid_t pid = fork();
-        CHECK(pid >= 0, "fork ro-bind check");
-        if (pid == 0) {
-            CHECK(setgid(1000) == 0 && setuid(1000) == 0, "setuid 1000");
-            char p444[96], p000[96], p666[96];
-            snprintf(p444, sizeof p444, "%s/f444", t_bind);
-            snprintf(p000, sizeof p000, "%s/f000", t_bind);
-            snprintf(p666, sizeof p666, "%s/f666", t_bind);
-            errno = 0;
-            CHECK(open(p444, O_WRONLY) == -1 && errno == EACCES, "ro-bind f444 O_WRONLY EACCES");
-            errno = 0;
-            CHECK(open(p000, O_RDWR) == -1 && errno == EACCES, "ro-bind f000 O_RDWR EACCES");
-            errno = 0;
-            CHECK(open(p444, O_RDONLY | O_TRUNC) == -1 && errno == EROFS,
-                  "ro-bind f444 O_RDONLY|O_TRUNC EROFS");
-            errno = 0;
-            CHECK(open(p666, O_WRONLY) == -1 && errno == EROFS, "ro-bind f666 O_WRONLY EROFS");
-            _exit(0);
-        }
-        wait_ok(pid, "ro-bind non-root open checks");
+/* kernel/loop + kernel/fileio: BLKGETDISKSEQ advances on unbind (LOOP_CLR_FD and autoclear),
+ * zone/tracing/PR ioctls return Linux 6.1 results, and sync_file_range works on loop devices. */
+static void test_loop_diskseq_ioctls_and_sync_file_range(void)
+{
+    const unsigned long LP_SET_FD = 0x4c00, LP_CLR_FD = 0x4c01, LP_SET_STATUS64 = 0x4c04,
+                        LP_CTL_GET_FREE = 0x4c82;
+    const unsigned long IO_BLKGETDISKSEQ = 0x80081280UL, IO_BLKGETZONESZ = 0x80041284UL,
+                        IO_BLKGETNRZONES = 0x80041285UL;
+    static const unsigned long enotty_ioctls[] = {
+        0xc0101282UL, 0x40101283UL, 0x40101286UL, 0x40101287UL, 0x40101288UL, /* zone */
+        0xc0481273UL, 0x1274UL,     0x1275UL,     0x1276UL,                   /* blktrace */
+    };
+    static const unsigned long pr_ioctls[] = {
+        0x401870c8UL, 0x401070c9UL, 0x401070caUL, 0x401870cbUL, 0x401870ccUL, 0x401070cdUL,
+    };
 
-        /* Remount superblock itself read-only: EROFS must come before DAC permission. */
-        CHECK(mount(NULL, t_rw, NULL, MS_REMOUNT | MS_RDONLY, "size=1m") == 0,
-              "remount tmpfs sb ro");
-        pid = fork();
-        CHECK(pid >= 0, "fork ro-sb check");
-        if (pid == 0) {
-            CHECK(setgid(1000) == 0 && setuid(1000) == 0, "setuid 1000");
-            errno = 0;
-            CHECK(open(f444, O_WRONLY) == -1 && errno == EROFS, "ro-sb f444 O_WRONLY EROFS");
-            errno = 0;
-            CHECK(open(f000, O_WRONLY) == -1 && errno == EROFS, "ro-sb f000 O_WRONLY EROFS");
-            errno = 0;
-            CHECK(open(f000, O_RDWR) == -1 && errno == EROFS, "ro-sb f000 O_RDWR EROFS");
-            errno = 0;
-            CHECK(open(f666, O_WRONLY | O_NOATIME) == -1 && errno == EROFS,
-                  "ro-sb f666 O_WRONLY|O_NOATIME EROFS");
-            _exit(0);
-        }
-        wait_ok(pid, "ro-sb non-root open checks");
-        CHECK(umount(t_bind) == 0 && umount(t_rw) == 0, "umount ro_sb");
-        rm_rf(t_bind);
-        rm_rf(t_rw);
+    int ctl = open("/dev/loop-control", O_RDWR);
+    CHECK(ctl >= 0, "open /dev/loop-control");
+    int idx = ioctl(ctl, LP_CTL_GET_FREE);
+    CHECK(idx >= 0, "LOOP_CTL_GET_FREE");
+    char lpath[64];
+    snprintf(lpath, sizeof lpath, "/dev/loop%d", idx);
+    int lp = open(lpath, O_RDWR);
+    CHECK(lp >= 0, "open %s", lpath);
+
+    uint64_t seq0 = 0, seq1 = 0, seq2 = 0, seq3 = 0, seq4 = 0;
+    CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq0) == 0 && seq0 > 0, "BLKGETDISKSEQ unbound");
+    CHECK(sync_file_range(lp, 0, 0, 0) == 0, "sync_file_range unbound flags=0");
+    CHECK(sync_file_range(lp, 0, 4096, SYNC_FILE_RANGE_WRITE) == 0,
+          "sync_file_range unbound WRITE");
+
+    int bf = open("/tmp/loop_fix_back", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    CHECK(bf >= 0 && ftruncate(bf, 65536) == 0, "create loop_fix_back");
+    CHECK(ioctl(lp, LP_SET_FD, bf) == 0, "LOOP_SET_FD");
+    CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq1) == 0 && seq1 > seq0, "BLKGETDISKSEQ advances on bind");
+    CHECK(sync_file_range(lp, 0, 4096, SYNC_FILE_RANGE_WRITE) == 0, "sync_file_range bound WRITE");
+    CHECK(sync_file_range(lp, 1000000, 4096, SYNC_FILE_RANGE_WRITE) == 0,
+          "sync_file_range bound past-end");
+
+    uint32_t zu32 = 99;
+    CHECK(ioctl(lp, IO_BLKGETZONESZ, &zu32) == 0 && zu32 == 0, "BLKGETZONESZ == 0");
+    zu32 = 99;
+    CHECK(ioctl(lp, IO_BLKGETNRZONES, &zu32) == 0 && zu32 == 0, "BLKGETNRZONES == 0");
+    char zbuf[128] = {0};
+    for (size_t i = 0; i < ARRAY_LEN(enotty_ioctls); i++) {
+        CHECK_ERRNO(ioctl(lp, enotty_ioctls[i], zbuf), ENOTTY, "loop ioctl 0x%lx must return ENOTTY",
+                    enotty_ioctls[i]);
+    }
+    for (size_t i = 0; i < ARRAY_LEN(pr_ioctls); i++) {
+        CHECK_ERRNO(ioctl(lp, pr_ioctls[i], zbuf), EOPNOTSUPP,
+                    "loop PR ioctl 0x%lx must return EOPNOTSUPP", pr_ioctls[i]);
     }
 
-    /* 3. kernel/files: FD table growth respects lowered nr_open cap (verified via dup3/F_DUPFD
-     *    and select(2) clamping nfds to capped table capacity). */
-    {
-        char saved_nr[64];
-        read_proc_str("/proc/sys/fs/nr_open", saved_nr, sizeof saved_nr);
-        pid_t pid = fork();
-        CHECK(pid >= 0, "fork nr_open growth test");
-        if (pid == 0) {
-            struct rlimit rl = {4096, 4096};
-            CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0, "setrlimit 4096");
-            write_proc_str("/proc/sys/fs/nr_open", "1536\n");
-            CHECK(dup3(1, 1500, 0) == 1500, "dup3 to 1500 within nr_open=1536");
-            errno = 0;
-            CHECK(dup3(1, 1600, 0) == -1 && errno == EBADF, "dup3 to 1600 > nr_open EBADF");
-            CHECK(fcntl(1, F_DUPFD, 1535) == 1535, "F_DUPFD 1535");
-            errno = 0;
-            CHECK(fcntl(1, F_DUPFD, 1536) == -1 && errno == EMFILE, "F_DUPFD 1536 >= nr_open EMFILE");
-            /* Capacity is capped at 1536 (192 bytes) rather than rounded up to 2048 (256 bytes). */
-            char *pages =
-                mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            CHECK(pages != MAP_FAILED && munmap(pages + 4096, 4096) == 0, "guard page");
-            fd_set *s192 = (fd_set *)(pages + 4096 - 192);
-            memset(s192, 0, 192);
-            struct timeval tv = {0, 0};
-            CHECK(select(2048, s192, NULL, NULL, &tv) == 0, "select(2048) clamped to 1536 (192B)");
-            fd_set *s128 = (fd_set *)(pages + 4096 - 128);
-            memset(s128, 0, 128);
-            errno = 0;
-            CHECK(select(2048, s128, NULL, NULL, &tv) == -1 && errno == EFAULT,
-                  "select(2048) with 128B faults");
-            munmap(pages, 4096);
-            close(1500);
-            close(1535);
-            _exit(0);
-        }
-        int status = 0;
-        CHECK(waitpid(pid, &status, 0) == pid, "waitpid nr_open child");
-        write_proc_str("/proc/sys/fs/nr_open", saved_nr);
-        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "nr_open growth child failed");
-    }
+    CHECK(ioctl(lp, LP_CLR_FD, 0) == 0, "LOOP_CLR_FD");
+    CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq2) == 0 && seq2 > seq1,
+          "BLKGETDISKSEQ advances on LOOP_CLR_FD unbind");
 
-    /* 4. kernel/fileio: fallocate check order & socket ENODEV; pread/pwrite offset before fd. */
-    {
-        const int FL_KEEP = 0x1;
-        const int FL_PUNCH = 0x2;
-        const int FL_COLLAPSE = 0x8;
-        int s[2], pp[2];
-        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0 && pipe(pp) == 0, "sock/pipe");
-        int tf = open("/tmp/falloc_order", O_RDWR | O_CREAT | O_TRUNC, 0600);
-        int tro = open("/tmp/falloc_order", O_RDONLY);
-        int tpath = open("/tmp/falloc_order", O_PATH);
-        CHECK(tf >= 0 && tro >= 0 && tpath >= 0, "open falloc_order");
-        errno = 0;
-        CHECK(fallocate(999, 0, -1, 0) == -1 && errno == EBADF, "fallocate badfd EBADF first");
-        errno = 0;
-        CHECK(fallocate(tpath, 0, -1, 0) == -1 && errno == EBADF, "fallocate O_PATH EBADF first");
-        errno = 0;
-        CHECK(fallocate(tro, 0, -1, 10) == -1 && errno == EINVAL, "fallocate ro neg off EINVAL");
-        errno = 0;
-        CHECK(fallocate(tro, 0, 0, 0) == -1 && errno == EINVAL, "fallocate ro zero len EINVAL");
-        errno = 0;
-        CHECK(fallocate(tro, 0x8000, 0, 10) == -1 && errno == EOPNOTSUPP,
-              "fallocate ro unknown mode EOPNOTSUPP");
-        errno = 0;
-        CHECK(fallocate(tro, FL_PUNCH, 0, 10) == -1 && errno == EOPNOTSUPP,
-              "fallocate ro PUNCH without KEEP EOPNOTSUPP");
-        errno = 0;
-        CHECK(fallocate(tro, FL_COLLAPSE | FL_KEEP, 0, 10) == -1 && errno == EOPNOTSUPP,
-              "fallocate ro COLLAPSE|KEEP EOPNOTSUPP");
-        errno = 0;
-        CHECK(fallocate(tro, FL_COLLAPSE, 0, 10) == -1 && errno == EBADF,
-              "fallocate ro valid COLLAPSE EBADF");
-        errno = 0;
-        CHECK(fallocate(tro, 0, INT64_MAX, 10) == -1 && errno == EBADF,
-              "fallocate ro overflow EBADF before EFBIG");
-        errno = 0;
-        CHECK(fallocate(s[0], 0, 0, 10) == -1 && errno == ENODEV, "fallocate socket ENODEV");
-        errno = 0;
-        CHECK(fallocate(s[0], 0, INT64_MAX, 10) == -1 && errno == ENODEV,
-              "fallocate socket overflow ENODEV");
-        errno = 0;
-        CHECK(fallocate(pp[1], 0, 0, 10) == -1 && errno == ESPIPE, "fallocate pipe wr ESPIPE");
-        errno = 0;
-        CHECK(fallocate(pp[1], 0, INT64_MAX, 10) == -1 && errno == ESPIPE,
-              "fallocate pipe overflow ESPIPE");
-        errno = 0;
-        CHECK(fallocate(pp[0], 0, 0, 10) == -1 && errno == EBADF, "fallocate pipe rd EBADF");
-        /* sync_file_range rejects O_PATH with EBADF before invalid flags/offset. */
-        errno = 0;
-        CHECK(sync_file_range(tpath, -1, -1, 99) == -1 && errno == EBADF,
-              "sync_file_range O_PATH EBADF before EINVAL");
-        /* pread/pwrite check negative offset (EINVAL) before fd lookup (EBADF). */
-        char b[4] = {0};
-        errno = 0;
-        CHECK(pread(999, b, 4, -1) == -1 && errno == EINVAL, "pread badfd neg off EINVAL");
-        errno = 0;
-        CHECK(pwrite(999, b, 4, -1) == -1 && errno == EINVAL, "pwrite badfd neg off EINVAL");
-        close(s[0]);
-        close(s[1]);
-        close(pp[0]);
-        close(pp[1]);
-        close(tf);
-        close(tro);
-        close(tpath);
-        unlink("/tmp/falloc_order");
-    }
+    /* Re-bind with LO_FLAGS_AUTOCLEAR (4), close last opener -> autoclear advances seq. */
+    CHECK(ioctl(lp, LP_SET_FD, bf) == 0, "re-bind LOOP_SET_FD");
+    CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq3) == 0 && seq3 > seq2,
+          "BLKGETDISKSEQ advances on re-bind");
+    unsigned char info64[232] = {0};
+    uint32_t autoclear = 4;
+    memcpy(info64 + 52, &autoclear, 4);
+    CHECK(ioctl(lp, LP_SET_STATUS64, info64) == 0, "set LO_FLAGS_AUTOCLEAR");
+    close(lp);
+    lp = open(lpath, O_RDWR);
+    CHECK(lp >= 0, "reopen %s after autoclear", lpath);
+    CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq4) == 0 && seq4 > seq3,
+          "BLKGETDISKSEQ advances on autoclear unbind");
 
-    /* 5. kernel/vfs: cgroup mkdir reports search EACCES, then EEXIST, before EROFS. */
-    {
-        const char *cg_sub = "/sys/fs/cgroup/cg_ro_test";
-        const char *cg_ro = "/tmp/cg_ro_bind";
-        rmdir(cg_sub);
-        rm_rf(cg_ro);
-        CHECK(mkdir(cg_sub, 0755) == 0 && mkdir(cg_ro, 0755) == 0, "mkdir cg_sub/cg_ro");
-        CHECK(mount("/sys/fs/cgroup", cg_ro, NULL, MS_BIND, NULL) == 0, "bind cgroup");
-        CHECK(mount(NULL, cg_ro, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) == 0,
-              "remount cgroup bind ro");
-        char p_sub[96], p_procs[96], p_dot[96], p_dotdot[96], p_new[96];
-        snprintf(p_sub, sizeof p_sub, "%s/cg_ro_test", cg_ro);
-        snprintf(p_procs, sizeof p_procs, "%s/cgroup.procs", cg_ro);
-        snprintf(p_dot, sizeof p_dot, "%s/.", cg_ro);
-        snprintf(p_dotdot, sizeof p_dotdot, "%s/..", cg_ro);
-        snprintf(p_new, sizeof p_new, "%s/brand_new", cg_ro);
-        errno = 0;
-        CHECK(mkdir(p_sub, 0755) == -1 && errno == EEXIST, "cg_ro mkdir existing child EEXIST");
-        errno = 0;
-        CHECK(mkdir(p_procs, 0755) == -1 && errno == EEXIST, "cg_ro mkdir existing file EEXIST");
-        errno = 0;
-        CHECK(mkdir(p_dot, 0755) == -1 && errno == EEXIST, "cg_ro mkdir . EEXIST");
-        errno = 0;
-        CHECK(mkdir(p_dotdot, 0755) == -1 && errno == EEXIST, "cg_ro mkdir .. EEXIST");
-        errno = 0;
-        CHECK(mkdir(p_new, 0755) == -1 && errno == EROFS, "cg_ro mkdir new EROFS");
-        CHECK(chmod(cg_sub, 0000) == 0, "chmod cg_sub 0000");
-        pid_t pid = fork();
-        CHECK(pid >= 0, "fork cg_ro non-root");
-        if (pid == 0) {
-            CHECK(setgid(1000) == 0 && setuid(1000) == 0, "setuid 1000");
-            char p_in[128];
-            snprintf(p_in, sizeof p_in, "%s/cgroup.procs", p_sub);
-            errno = 0;
-            CHECK(mkdir(p_in, 0755) == -1 && errno == EACCES, "cg_ro no-exec EACCES before EEXIST");
-            _exit(0);
-        }
-        wait_ok(pid, "cg_ro non-root search check");
-        CHECK(chmod(cg_sub, 0755) == 0, "restore cg_sub mode");
-        CHECK(umount(cg_ro) == 0 && rmdir(cg_ro) == 0 && rmdir(cg_sub) == 0, "cleanup cg_ro");
-    }
-
-    /* 6. kernel/xattr: procfs/devpts/nsfs/mqueue getxattr returns EOPNOTSUPP (after
-     *    xattr_permission), kernfs (sysfs/cgroup2) returns ENODATA, listxattr returns 0, and
-     *    tmpfs xattrs continue working. */
-    {
-        char xbuf[64];
-        static const char *const no_xattr_paths[] = {
-            "/proc/self/stat", "/proc", "/proc/self/ns/mnt", "/dev/pts", "/dev/mqueue",
-        };
-        static const char *const attrs[] = {
-            "user.a", "trusted.a", "security.a", "system.posix_acl_access",
-        };
-        for (size_t i = 0; i < sizeof(no_xattr_paths) / sizeof(no_xattr_paths[0]); i++) {
-            for (size_t j = 0; j < sizeof(attrs) / sizeof(attrs[0]); j++) {
-                errno = 0;
-                CHECK(getxattr(no_xattr_paths[i], attrs[j], xbuf, sizeof xbuf) == -1 &&
-                          errno == EOPNOTSUPP,
-                      "getxattr(%s, %s) must return EOPNOTSUPP", no_xattr_paths[i], attrs[j]);
-            }
-            CHECK(listxattr(no_xattr_paths[i], xbuf, sizeof xbuf) == 0, "listxattr(%s) == 0",
-                  no_xattr_paths[i]);
-        }
-        /* /dev/pts/ptmx is a character device: user.* hits xattr_permission -> ENODATA. */
-        errno = 0;
-        CHECK(getxattr("/dev/pts/ptmx", "user.a", xbuf, sizeof xbuf) == -1 && errno == ENODATA,
-              "getxattr(/dev/pts/ptmx, user.a) ENODATA");
-        errno = 0;
-        CHECK(getxattr("/dev/pts/ptmx", "trusted.a", xbuf, sizeof xbuf) == -1 &&
-                  errno == EOPNOTSUPP,
-              "getxattr(/dev/pts/ptmx, trusted.a) EOPNOTSUPP");
-        /* sysfs and cgroup2 (kernfs) return ENODATA for user/trusted/security, EOPNOTSUPP for ACL. */
-        static const char *const kernfs_paths[] = {"/sys", "/sys/fs/cgroup"};
-        for (size_t i = 0; i < 2; i++) {
-            for (size_t j = 0; j < 3; j++) {
-                errno = 0;
-                CHECK(getxattr(kernfs_paths[i], attrs[j], xbuf, sizeof xbuf) == -1 &&
-                          errno == ENODATA,
-                      "getxattr(%s, %s) ENODATA", kernfs_paths[i], attrs[j]);
-            }
-            errno = 0;
-            CHECK(getxattr(kernfs_paths[i], "system.posix_acl_access", xbuf, sizeof xbuf) == -1 &&
-                      errno == EOPNOTSUPP,
-                  "getxattr(%s, system.posix_acl_access) EOPNOTSUPP", kernfs_paths[i]);
-            CHECK(listxattr(kernfs_paths[i], xbuf, sizeof xbuf) == 0, "listxattr(%s) == 0",
-                  kernfs_paths[i]);
-        }
-        /* tmpfs xattrs remain functional. */
-        const char *tf = "/dev/shm/xattr_tmpfs_ok";
-        write_file_bytes(tf, "x", 1, 0644);
-        CHECK(setxattr(tf, "user.k", "val", 3, 0) == 0, "tmpfs setxattr");
-        CHECK(getxattr(tf, "user.k", xbuf, sizeof xbuf) == 3 && memcmp(xbuf, "val", 3) == 0,
-              "tmpfs getxattr");
-        unlink(tf);
-    }
-
-    /* 7. kernel/loop + kernel/fileio: BLKGETDISKSEQ advances on unbind (LOOP_CLR_FD and
-     *    autoclear), zone/tracing/PR ioctls return Linux 6.1 results, and sync_file_range works
-     *    on loop devices. */
-    {
-        const unsigned long LP_SET_FD = 0x4c00;
-        const unsigned long LP_CLR_FD = 0x4c01;
-        const unsigned long LP_SET_STATUS64 = 0x4c04;
-        const unsigned long LP_CTL_GET_FREE = 0x4c82;
-        const unsigned long IO_BLKGETDISKSEQ = 0x80081280UL;
-        const unsigned long IO_BLKTRACESETUP = 0xc0481273UL;
-        const unsigned long IO_BLKTRACESTART = 0x1274UL;
-        const unsigned long IO_BLKTRACESTOP = 0x1275UL;
-        const unsigned long IO_BLKTRACETEARDOWN = 0x1276UL;
-        const unsigned long IO_BLKREPORTZONE = 0xc0101282UL;
-        const unsigned long IO_BLKRESETZONE = 0x40101283UL;
-        const unsigned long IO_BLKGETZONESZ = 0x80041284UL;
-        const unsigned long IO_BLKGETNRZONES = 0x80041285UL;
-        const unsigned long IO_BLKOPENZONE = 0x40101286UL;
-        const unsigned long IO_BLKCLOSEZONE = 0x40101287UL;
-        const unsigned long IO_BLKFINISHZONE = 0x40101288UL;
-        const unsigned long IO_PR_REGISTER = 0x401870c8UL;
-        const unsigned long IO_PR_RESERVE = 0x401070c9UL;
-        const unsigned long IO_PR_RELEASE = 0x401070caUL;
-        const unsigned long IO_PR_PREEMPT = 0x401870cbUL;
-        const unsigned long IO_PR_PREEMPT_ABORT = 0x401870ccUL;
-        const unsigned long IO_PR_CLEAR = 0x401070cdUL;
-
-        int ctl = open("/dev/loop-control", O_RDWR);
-        CHECK(ctl >= 0, "open /dev/loop-control");
-        int idx = ioctl(ctl, LP_CTL_GET_FREE);
-        CHECK(idx >= 0, "LOOP_CTL_GET_FREE");
-        char lpath[64];
-        snprintf(lpath, sizeof lpath, "/dev/loop%d", idx);
-        int lp = open(lpath, O_RDWR);
-        CHECK(lp >= 0, "open %s", lpath);
-
-        uint64_t seq0 = 0, seq1 = 0, seq2 = 0, seq3 = 0, seq4 = 0;
-        CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq0) == 0 && seq0 > 0, "BLKGETDISKSEQ unbound");
-        /* sync_file_range on unbound loop device succeeds. */
-        CHECK(sync_file_range(lp, 0, 0, 0) == 0, "sync_file_range unbound flags=0");
-        CHECK(sync_file_range(lp, 0, 4096, SYNC_FILE_RANGE_WRITE) == 0,
-              "sync_file_range unbound WRITE");
-
-        int bf = open("/tmp/loop_fix_back", O_RDWR | O_CREAT | O_TRUNC, 0600);
-        CHECK(bf >= 0 && ftruncate(bf, 65536) == 0, "create loop_fix_back");
-        CHECK(ioctl(lp, LP_SET_FD, bf) == 0, "LOOP_SET_FD");
-        CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq1) == 0 && seq1 > seq0,
-              "BLKGETDISKSEQ advances on bind");
-        /* sync_file_range on bound loop device (in-range and past-end) succeeds. */
-        CHECK(sync_file_range(lp, 0, 4096, SYNC_FILE_RANGE_WRITE) == 0,
-              "sync_file_range bound WRITE");
-        CHECK(sync_file_range(lp, 1000000, 4096, SYNC_FILE_RANGE_WRITE) == 0,
-              "sync_file_range bound past-end");
-
-        /* Zone, tracing, and persistent-reservation ioctls. */
-        uint32_t zu32 = 99;
-        CHECK(ioctl(lp, IO_BLKGETZONESZ, &zu32) == 0 && zu32 == 0, "BLKGETZONESZ == 0");
-        zu32 = 99;
-        CHECK(ioctl(lp, IO_BLKGETNRZONES, &zu32) == 0 && zu32 == 0, "BLKGETNRZONES == 0");
-        char zbuf[128] = {0};
-        const unsigned long enotty_ioctls[] = {
-            IO_BLKREPORTZONE, IO_BLKRESETZONE, IO_BLKOPENZONE, IO_BLKCLOSEZONE,
-            IO_BLKFINISHZONE, IO_BLKTRACESETUP, IO_BLKTRACESTART, IO_BLKTRACESTOP,
-            IO_BLKTRACETEARDOWN,
-        };
-        for (size_t i = 0; i < sizeof(enotty_ioctls) / sizeof(enotty_ioctls[0]); i++) {
-            errno = 0;
-            CHECK(ioctl(lp, enotty_ioctls[i], zbuf) == -1 && errno == ENOTTY,
-                  "loop ioctl 0x%lx must return ENOTTY", enotty_ioctls[i]);
-        }
-        const unsigned long pr_ioctls[] = {
-            IO_PR_REGISTER, IO_PR_RESERVE, IO_PR_RELEASE,
-            IO_PR_PREEMPT, IO_PR_PREEMPT_ABORT, IO_PR_CLEAR,
-        };
-        for (size_t i = 0; i < sizeof(pr_ioctls) / sizeof(pr_ioctls[0]); i++) {
-            errno = 0;
-            CHECK(ioctl(lp, pr_ioctls[i], zbuf) == -1 && errno == EOPNOTSUPP,
-                  "loop PR ioctl 0x%lx must return EOPNOTSUPP", pr_ioctls[i]);
-        }
-
-        /* Explicit LOOP_CLR_FD unbind advances BLKGETDISKSEQ. */
-        CHECK(ioctl(lp, LP_CLR_FD, 0) == 0, "LOOP_CLR_FD");
-        CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq2) == 0 && seq2 > seq1,
-              "BLKGETDISKSEQ advances on LOOP_CLR_FD unbind");
-
-        /* Re-bind with LO_FLAGS_AUTOCLEAR (4), close last opener -> autoclear advances seq. */
-        CHECK(ioctl(lp, LP_SET_FD, bf) == 0, "re-bind LOOP_SET_FD");
-        CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq3) == 0 && seq3 > seq2,
-              "BLKGETDISKSEQ advances on re-bind");
-        unsigned char info64[232];
-        memset(info64, 0, sizeof info64);
-        uint32_t autoclear = 4;
-        memcpy(info64 + 52, &autoclear, 4);
-        CHECK(ioctl(lp, LP_SET_STATUS64, info64) == 0, "set LO_FLAGS_AUTOCLEAR");
-        close(lp);
-        lp = open(lpath, O_RDWR);
-        CHECK(lp >= 0, "reopen %s after autoclear", lpath);
-        CHECK(ioctl(lp, IO_BLKGETDISKSEQ, &seq4) == 0 && seq4 > seq3,
-              "BLKGETDISKSEQ advances on autoclear unbind");
-
-        close(lp);
-        close(bf);
-        close(ctl);
-        unlink("/tmp/loop_fix_back");
-    }
+    close(lp);
+    close(bf);
+    close(ctl);
+    unlink("/tmp/loop_fix_back");
 }
 
 int main(int argc, char **argv)
@@ -2958,7 +2872,13 @@ int main(int argc, char **argv)
     test_splice_procfs_and_pipe_fault_writes();
     test_protected_regular_fifos_and_pty_blksize();
     test_inotify_handle_memfd_cgroup_tmpfs();
-    test_fs_io_pipe_vfs_xattr_loop_fixes();
+    test_splice_order_and_unseekable_offsets();
+    test_ro_mount_vs_sb_open_order();
+    test_nr_open_fd_table_growth();
+    test_fallocate_and_pread_order();
+    test_cgroup_mkdir_error_order();
+    test_synthetic_xattr_errors();
+    test_loop_diskseq_ioctls_and_sync_file_range();
 
     printf("all ok\n");
     return 0;

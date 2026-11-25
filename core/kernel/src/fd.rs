@@ -804,6 +804,15 @@ impl Default for FdTable {
     }
 }
 
+/// Logical capacity for `need` slots: at least 64, power-of-two growth, capped at `nr_open`
+/// rounded up to 64 (never below the 64-aligned slot count required for `need`).
+fn capacity_for(need: usize, nr_open: usize) -> usize {
+    let min_cap = need.next_multiple_of(MIN_CAPACITY).max(MIN_CAPACITY);
+    let pow2 = need.max(MIN_CAPACITY).next_power_of_two();
+    let cap = nr_open.next_multiple_of(MIN_CAPACITY).max(min_cap);
+    pow2.min(cap)
+}
+
 impl FdTable {
     /// An empty table.
     pub fn new() -> Self {
@@ -825,9 +834,7 @@ impl FdTable {
         if fd >= nr_open {
             return Err(Errno::EMFILE);
         }
-        let pow2 = (fd + 1).max(MIN_CAPACITY).next_power_of_two();
-        let cap = nr_open.next_multiple_of(MIN_CAPACITY).max(MIN_CAPACITY);
-        self.capacity = pow2.min(cap).max(self.capacity);
+        self.capacity = capacity_for(fd + 1, nr_open).max(self.capacity);
         Ok(())
     }
 
@@ -938,9 +945,7 @@ impl FdTable {
         if self.reserved.contains(&i) {
             return Err(Errno::EBUSY);
         }
-        if self.grow_for(i, nr_open).is_err() {
-            return Err(Errno::EBADF);
-        }
+        self.grow_for(i, nr_open).map_err(|_| Errno::EBADF)?;
         Ok(self.replace_slot(i, Slot { file, cloexec }))
     }
 
@@ -1034,12 +1039,9 @@ impl FdTable {
     }
 
     fn copy_slots(&self, len: usize, nr_open: usize) -> Self {
-        let min_cap = len.next_multiple_of(MIN_CAPACITY).max(MIN_CAPACITY);
-        let pow2 = len.max(MIN_CAPACITY).next_power_of_two();
-        let cap = nr_open.next_multiple_of(MIN_CAPACITY).max(min_cap);
         Self {
             slots: self.slots[..len].to_vec(),
-            capacity: pow2.min(cap),
+            capacity: capacity_for(len, nr_open),
             reserved: Vec::new(),
             holds_locks: false,
         }
@@ -1061,7 +1063,7 @@ impl FdTable {
         nr_open: usize,
     ) -> Result<(Self, Vec<FileRef>), Errno> {
         let len = self.copy_len(|fd| cloexec || fd < first || fd > last);
-        if len.next_multiple_of(64) > nr_open {
+        if len.next_multiple_of(MIN_CAPACITY) > nr_open {
             return Err(Errno::EMFILE);
         }
         let mut copy = self.copy_slots(len, nr_open);

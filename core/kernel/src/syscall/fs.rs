@@ -5640,6 +5640,14 @@ fn overlay_uncopied_chain(vfs: &Vfs, nodes: &[OvlId]) -> Vec<OvlId> {
     out
 }
 
+fn store_dir_flag(vfs: &Vfs, ino: Ino) -> u32 {
+    if vfs.store().kind(ino).is_ok_and(|k| k == mode::S_IFDIR) {
+        inotify::IN_ISDIR
+    } else {
+        0
+    }
+}
+
 /// Reports upper-layer `IN_CREATE` events for overlay nodes that were just copied up.
 fn overlay_copy_up_events(k: &Kernel, vfs: &Vfs, copied: &[OvlId]) {
     if copied.is_empty() || !inotify::active(k) {
@@ -5657,12 +5665,13 @@ fn overlay_copy_up_events(k: &Kernel, vfs: &Vfs, copied: &[OvlId]) {
         let Some(parent_up) = ovl.node(n.parent).upper else {
             continue;
         };
-        let isdir = if vfs.store().kind(up).is_ok_and(|k| k == mode::S_IFDIR) {
-            inotify::IN_ISDIR
-        } else {
-            0
-        };
-        inotify::dir_event(k, parent_up, &n.name, inotify::IN_CREATE | isdir, 0);
+        inotify::dir_event(
+            k,
+            parent_up,
+            &n.name,
+            inotify::IN_CREATE | store_dir_flag(vfs, up),
+            0,
+        );
     }
 }
 
@@ -5688,33 +5697,37 @@ pub(super) fn copy_up(cx: &Cx<'_>, vfs: &Vfs, o: OvlId, what: CopyUp) -> Result<
     } else {
         Vec::new()
     };
-    if what != CopyUp::All || vfs.store().attrs(lower)?.kind() != mode::S_IFREG {
-        let up = overlay_upper_charged(vfs, o, what)?;
-        overlay_copy_up_events(k, vfs, &copied);
-        return Ok(up);
-    }
-    let host = vfs.store().open_object(lower, false)?;
-    let host = host.metadata().map_err(host_errno)?;
-    let mapped = k.tasks.values().any(|t| {
-        t.res
-            .borrow()
-            .mm
-            .borrow()
-            .writably_maps(host.dev(), host.ino())
-    });
-    if mapped || vfs.store().host_writing(lower)? {
-        let up = overlay_upper_charged(vfs, o, CopyUp::Copied)?;
-        overlay_copy_up_events(k, vfs, &copied);
-        return Ok(up);
-    }
-    let up = overlay_upper_charged(vfs, o, CopyUp::All)?;
-    overlay_copy_up_events(k, vfs, &copied);
-    let writer = |f: &FileRef| {
-        f.try_borrow()
-            .is_ok_and(|f| f.writable() && matches!(f.kind, FileKind::Regular { cow: false, .. }))
+    let mut share = what == CopyUp::All && vfs.store().attrs(lower)?.kind() == mode::S_IFREG;
+    let actual = if share {
+        let host = vfs.store().open_object(lower, false)?;
+        let host = host.metadata().map_err(host_errno)?;
+        let mapped = k.tasks.values().any(|t| {
+            t.res
+                .borrow()
+                .mm
+                .borrow()
+                .writably_maps(host.dev(), host.ino())
+        });
+        if mapped || vfs.store().host_writing(lower)? {
+            share = false;
+            CopyUp::Copied
+        } else {
+            CopyUp::All
+        }
+    } else {
+        what
     };
-    if opens_of(k, lower).iter().any(writer) {
-        rehome(k, vfs, lower);
+    let up = overlay_upper_charged(vfs, o, actual)?;
+    overlay_copy_up_events(k, vfs, &copied);
+    if share {
+        let writer = |f: &FileRef| {
+            f.try_borrow().is_ok_and(|f| {
+                f.writable() && matches!(f.kind, FileKind::Regular { cow: false, .. })
+            })
+        };
+        if opens_of(k, lower).iter().any(writer) {
+            rehome(k, vfs, lower);
+        }
     }
     Ok(up)
 }
@@ -7571,41 +7584,33 @@ fn unlink_overlay(
         // Report upper-layer changes first (parent dir copy-up, removed upper entry, and any
         // whiteout created in the upper directory), then the overlay node's events.
         overlay_copy_up_events(k, &vfs, &copied_dirs);
-        let upper_dir = vfs.overlay().node(d).upper;
         let upper_gone = child_upper.map(|u| vfs.store().attrs(u).map_or(0, |s| s.nlink) == 0);
-        if let Some(up) = upper_dir {
-            if let Some(u) = child_upper {
-                inotify::unlinked(k, u, up, name);
-                if rmdir {
-                    inotify::deleted(k, u, up, name);
-                    inotify::dir_event(k, up, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
-                } else {
-                    inotify::path_event(k, u, None, inotify::IN_ATTRIB);
-                    if upper_gone == Some(true) {
-                        inotify::deleted(k, u, up, name);
-                    }
-                    inotify::dir_event(k, up, name, inotify::IN_DELETE, 0);
+        let notify_removed = |target: Ino, dir: Ino, gone: bool| {
+            inotify::unlinked(k, target, dir, name);
+            if rmdir {
+                inotify::deleted(k, target, dir, name);
+                inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
+            } else {
+                inotify::path_event(k, target, None, inotify::IN_ATTRIB);
+                if gone {
+                    inotify::deleted(k, target, dir, name);
                 }
+                inotify::dir_event(k, dir, name, inotify::IN_DELETE, 0);
+            }
+        };
+        if let Some(up) = vfs.overlay().node(d).upper {
+            if let Some(u) = child_upper {
+                notify_removed(u, up, upper_gone == Some(true));
             }
             if lower_has {
                 inotify::dir_event(k, up, name, inotify::IN_CREATE, 0);
             }
         }
-        // As the store's removals report: a file's link count changed, the node is deleted with
-        // its last link (once the files opened through it have closed), then the directory's
-        // entry goes
-        let (key, dir) = (overlay::key(c), overlay::key(d));
-        inotify::unlinked(k, key, dir, name);
-        if rmdir {
-            inotify::deleted(k, key, dir, name);
-            inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
-        } else {
-            inotify::path_event(k, key, None, inotify::IN_ATTRIB);
-            if upper_gone.unwrap_or(st.nlink <= 1) {
-                inotify::deleted(k, key, dir, name);
-            }
-            inotify::dir_event(k, dir, name, inotify::IN_DELETE, 0);
-        }
+        notify_removed(
+            overlay::key(c),
+            overlay::key(d),
+            upper_gone.unwrap_or(st.nlink <= 1),
+        );
         Ok(())
     })())
 }
@@ -8215,73 +8220,69 @@ fn rename_overlay(
         inotify::dir_event(k, from.0, from.1, inotify::IN_MOVED_FROM | isdir, cookie);
         inotify::dir_event(k, to.0, to.1, inotify::IN_MOVED_TO | isdir, cookie);
     };
-    // Report upper-layer copy-up and rename changes first so watches on the upper layer see them.
+    // Report upper-layer copy-up and rename changes first so watches on the upper layer see them,
+    // then the overlay's own nodes in Linux's fsnotify_move order.
     overlay_copy_up_events(k, &vfs, &copied_dirs);
     let dst_upper_gone = dst_upper.map(|du| vfs.store().attrs(du).map_or(0, |s| s.nlink) == 0);
+    let notify_rename = |old: (Ino, &[u8]),
+                         new: (Ino, &[u8]),
+                         src_ino: Option<Ino>,
+                         dst_info: Option<(Ino, &Stat, bool)>| {
+        if !exchange && let Some((d, _, _)) = dst_info {
+            inotify::unlinked(k, d, new.0, new.1);
+        }
+        if let Some(s) = src_ino {
+            inotify::renamed(k, old, new, || Some(s));
+        }
+        if exchange && let Some((d, _, _)) = dst_info {
+            inotify::renamed(k, new, old, || Some(d));
+        }
+        if inotify::active(k)
+            && let Some(s) = src_ino
+        {
+            moved(isdir(&src_st), old, new);
+            match dst_info {
+                Some((d, st, _)) if exchange => {
+                    inotify::path_event(k, s, None, inotify::IN_MOVE_SELF);
+                    moved(isdir(st), new, old);
+                    inotify::path_event(k, d, None, inotify::IN_MOVE_SELF);
+                }
+                Some((d, st, gone)) => {
+                    inotify::path_event(k, d, None, inotify::IN_ATTRIB | isdir(st));
+                    inotify::path_event(k, s, None, inotify::IN_MOVE_SELF);
+                    if st.is_dir() || gone {
+                        inotify::deleted(k, d, new.0, new.1);
+                    }
+                }
+                None => inotify::path_event(k, s, None, inotify::IN_MOVE_SELF),
+            }
+        }
+    };
     if let (Some(old_up), Some(new_up)) =
         (vfs.overlay().node(od).upper, vfs.overlay().node(nd).upper)
     {
-        if !exchange && let Some(du) = dst_upper {
-            inotify::unlinked(k, du, new_up, new_name);
-        }
-        if let Some(su) = src_upper {
-            inotify::renamed(k, (old_up, old_name), (new_up, new_name), || Some(su));
-        }
-        if exchange && let Some(du) = dst_upper {
-            inotify::renamed(k, (new_up, new_name), (old_up, old_name), || Some(du));
-        }
-        if inotify::active(k)
-            && let Some(su) = src_upper
-        {
-            moved(isdir(&src_st), (old_up, old_name), (new_up, new_name));
-            match (&dst, dst_upper) {
-                (Some((_, st)), Some(du)) if exchange => {
-                    inotify::path_event(k, su, None, inotify::IN_MOVE_SELF);
-                    moved(isdir(st), (new_up, new_name), (old_up, old_name));
-                    inotify::path_event(k, du, None, inotify::IN_MOVE_SELF);
-                }
-                (Some((_, st)), Some(du)) => {
-                    inotify::path_event(k, du, None, inotify::IN_ATTRIB | isdir(st));
-                    inotify::path_event(k, su, None, inotify::IN_MOVE_SELF);
-                    if st.is_dir() || dst_upper_gone == Some(true) {
-                        inotify::deleted(k, du, new_up, new_name);
-                    }
-                }
-                _ => inotify::path_event(k, su, None, inotify::IN_MOVE_SELF),
-            }
-            if old_lower {
-                inotify::dir_event(k, old_up, old_name, inotify::IN_CREATE, 0);
-            }
+        let upper_dst = dst
+            .as_ref()
+            .zip(dst_upper)
+            .map(|((_, st), du)| (du, st, dst_upper_gone == Some(true)));
+        notify_rename((old_up, old_name), (new_up, new_name), src_upper, upper_dst);
+        if old_lower && src_upper.is_some() {
+            inotify::dir_event(k, old_up, old_name, inotify::IN_CREATE, 0);
         }
     }
-    // As the store's rename reports, on the overlay's nodes: mark an overwritten destination
-    // unlinked first, then files open through a moved name follow it, then fsnotify_move's order
-    let (old, new) = ((overlay::key(od), old_name), (overlay::key(nd), new_name));
-    if !exchange && let Some((d, _)) = &dst {
-        inotify::unlinked(k, overlay::key(*d), new.0, new.1);
-    }
-    inotify::renamed(k, old, new, || Some(overlay::key(src)));
-    if exchange && let Some(d) = dst.as_ref().map(|d| d.0) {
-        inotify::renamed(k, new, old, || Some(overlay::key(d)));
-    }
-    let src = overlay::key(src);
-    moved(isdir(&src_st), old, new);
-    match dst {
-        Some((d, st)) if exchange => {
-            inotify::path_event(k, src, None, inotify::IN_MOVE_SELF);
-            moved(isdir(&st), new, old);
-            inotify::path_event(k, overlay::key(d), None, inotify::IN_MOVE_SELF);
-        }
-        Some((d, st)) => {
-            let d = overlay::key(d);
-            inotify::path_event(k, d, None, inotify::IN_ATTRIB | isdir(&st));
-            inotify::path_event(k, src, None, inotify::IN_MOVE_SELF);
-            if st.is_dir() || dst_upper_gone.unwrap_or(st.nlink <= 1) {
-                inotify::deleted(k, d, new.0, new.1);
-            }
-        }
-        None => inotify::path_event(k, src, None, inotify::IN_MOVE_SELF),
-    }
+    let ovl_dst = dst.as_ref().map(|(d, st)| {
+        (
+            overlay::key(*d),
+            st,
+            dst_upper_gone.unwrap_or(st.nlink <= 1),
+        )
+    });
+    notify_rename(
+        (overlay::key(od), old_name),
+        (overlay::key(nd), new_name),
+        Some(overlay::key(src)),
+        ovl_dst,
+    );
     Ok(0)
 }
 
@@ -8989,10 +8990,7 @@ fn event_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool, event:
                 0
             }
         } else {
-            match cx.vfs().map(|v| v.store().kind(ino)) {
-                Ok(Ok(mode::S_IFDIR)) => inotify::IN_ISDIR,
-                _ => 0,
-            }
+            cx.vfs().map_or(0, |v| store_dir_flag(&v, ino))
         };
         // For overlay attribute changes, notify the upper inode first (as Linux's overlay calls
         // notify_change on the upper dentry), then the overlay node itself.
@@ -9035,12 +9033,7 @@ fn event_fd(cx: &Cx<'_>, fd: i32, event: u32) {
                 let upper_parent = (n.parent != o)
                     .then(|| ovl.node(n.parent).upper.map(|pu| (pu, n.name.as_slice())))
                     .flatten();
-                let dir = if vfs.store().kind(up).is_ok_and(|k| k == mode::S_IFDIR) {
-                    inotify::IN_ISDIR
-                } else {
-                    0
-                };
-                inotify::path_event(cx.kr(), up, upper_parent, event | dir);
+                inotify::path_event(cx.kr(), up, upper_parent, event | store_dir_flag(&vfs, up));
             }
             inotify::file_event(cx.kr(), &file, event);
         }
@@ -9260,27 +9253,28 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     if len == 0 {
         return Err(Errno::EINVAL);
     }
-    let valid_mode = matches!(
-        mode,
-        0 | FALLOC_FL_KEEP_SIZE
-            | FALLOC_FL_COLLAPSE_RANGE
-            | FALLOC_FL_INSERT_RANGE
-            | FALLOC_FL_ZERO_RANGE
-            | FALLOC_FL_UNSHARE_RANGE
-    ) || mode == FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
-        || mode == FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE
-        || mode == FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE;
+    let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
+    let valid_mode = match mode & !FALLOC_FL_KEEP_SIZE {
+        0 | FALLOC_FL_ZERO_RANGE | FALLOC_FL_UNSHARE_RANGE => true,
+        FALLOC_FL_PUNCH_HOLE => keep,
+        FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE => !keep,
+        _ => false,
+    };
     if !valid_mode {
         return Err(Errno::EOPNOTSUPP);
     }
     if !file.borrow().writable() {
         return Err(Errno::EBADF);
     }
-    if let Some(io) = super::fuse::file_io(&file) {
+    // Beyond the largest file length (i64::MAX)
+    let end_of = || {
         offset
             .checked_add(len)
             .filter(|&e| e <= i64::MAX as u64)
-            .ok_or(Errno::EFBIG)?;
+            .ok_or(Errno::EFBIG)
+    };
+    if let Some(io) = super::fuse::file_io(&file) {
+        end_of()?;
         super::fuse::fallocate(cx, &io, mode, offset, len)?;
         inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
         return Ok(0);
@@ -9291,11 +9285,7 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         FileKind::Directory { .. } => return Err(Errno::EISDIR),
         _ => return Err(Errno::ENODEV),
     }
-    // Beyond the largest file length (i64::MAX)
-    let end = offset
-        .checked_add(len)
-        .filter(|&e| e <= i64::MAX as u64)
-        .ok_or(Errno::EFBIG)?;
+    let end = end_of()?;
     prepare_write(cx, &file, None)?;
     let f = file.borrow();
     let FileKind::Regular {
@@ -9306,7 +9296,6 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     };
     let ino = *ino;
     let size = host.metadata().map_err(host_errno)?.len();
-    let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
     let vfs = cx.vfs()?;
     let tmpfs = open_tmpfs_size(&vfs, &f, ino, host)?;
     // Store files stand in for ext4's, which can also zero a range; tmpfs only reserves and
@@ -9902,25 +9891,7 @@ fn backing_tmpfs_dev(vfs: &Vfs, node: &Node) -> Option<u64> {
 
 /// Counts distinct uncopied overlay nodes along the ancestor chains of `nodes`.
 fn overlay_uncopied_dirs(vfs: &Vfs, nodes: &[OvlId]) -> u64 {
-    let ovl = vfs.overlay();
-    let mut seen = Vec::new();
-    for &start in nodes {
-        let mut cur = start;
-        loop {
-            let n = ovl.node(cur);
-            if n.upper.is_some() {
-                break;
-            }
-            if !seen.contains(&cur) {
-                seen.push(cur);
-            }
-            if n.parent == cur {
-                break;
-            }
-            cur = n.parent;
-        }
-    }
-    seen.len() as u64
+    overlay_uncopied_chain(vfs, nodes).len() as u64
 }
 
 /// Copies an overlay node and its missing parent directories to the upper layer. A tmpfs upper

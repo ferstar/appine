@@ -401,12 +401,7 @@ fn writable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
         permission(cx, &vfs.store().attrs(real)?, name, true)?;
         return super::fs::copy_up(cx, &vfs, o, crate::vfs::overlay::CopyUp::All);
     }
-    store_ino(node, Errno::EOPNOTSUPP)
-}
-
-/// The inode in the store; `pseudo` for nodes of synthetic filesystems.
-fn store_ino(node: Node, pseudo: Errno) -> Result<Ino, Errno> {
-    node.ino().ok_or(pseudo)
+    node.ino().ok_or(Errno::EOPNOTSUPP)
 }
 
 /// Whether synthetic node `node` belongs to a filesystem with xattr handlers in Linux 6.1:
@@ -440,7 +435,7 @@ fn readable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
             }
             Ok(ovl.node(o).real())
         }
-        node => store_ino(node, Errno::EOPNOTSUPP),
+        node => node.ino().ok_or(Errno::EOPNOTSUPP),
     }
 }
 
