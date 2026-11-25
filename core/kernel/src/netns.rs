@@ -1383,7 +1383,7 @@ pub(crate) fn path_filter(
         None if ip[0] == 127 => ip,
         None => source(me, ip).unwrap_or([0; 4]),
     };
-    let packet = |hook: u32, iif: Option<crate::nft::Iif>, ns: &NetNs| NatPacket {
+    let packet = |hook: u32, iif: Option<crate::nft::Iif>, ns: &NetNs, mark: u32| NatPacket {
         hook,
         proto: f.proto,
         src: src.to_vec(),
@@ -1395,47 +1395,71 @@ pub(crate) fn path_filter(
         original_dst: f
             .origs
             .iter()
-            .find(|(id, _)| *id == ns.id)
+            .rfind(|(id, _)| *id == ns.id)
             .and_then(|(_, addr)| nat_ip(addr).map(|(ip, _)| ip)),
-        mark: if std::ptr::eq(ns, me.as_ref()) {
-            f.mark
-        } else {
-            0
-        },
+        mark,
     };
     let pass = |o: &Outcome| matches!(o, Outcome::Accept | Outcome::Dnat(..));
     // 1. OUTPUT
+    let mut out_mark = f.mark;
     if me.nft.borrow().has_filter(HOOK_LOCAL_OUT) {
-        let o = hook_eval(me, &packet(HOOK_LOCAL_OUT, None, me), f.dst, None, true);
+        let (o, m) = hook_filter(me, &packet(HOOK_LOCAL_OUT, None, me, out_mark), f.dst, None);
+        out_mark = m;
         if !pass(&o) {
             return (o, true);
         }
     }
     let steps = filter_steps(w.init(), me, t, f.bridge, src, ip, final_ip);
-    for Step { ns, hook, iif, oif } in steps {
-        let dst = f
-            .bridge
-            .filter(|b| Rc::ptr_eq(&b.ns, ns))
-            .map_or(f.there, |b| &b.dst);
+    let step_count = steps.len();
+    let init_dnated = f.bridge.is_none()
+        && !Rc::ptr_eq(w.init(), me)
+        && f.origs.iter().any(|(id, _)| *id == w.init().id);
+    for (idx, Step { ns, hook, iif, oif }) in steps.into_iter().enumerate() {
+        let (pre_dst, post_dst) = if let Some(b) = f.bridge {
+            if Rc::ptr_eq(&b.ns, ns) {
+                (f.dst, b.dst.as_slice())
+            } else {
+                (b.dst.as_slice(), f.there)
+            }
+        } else if step_count == 2 {
+            if init_dnated {
+                if idx == 0 {
+                    (f.dst, f.there)
+                } else {
+                    (f.there, f.there)
+                }
+            } else if idx == 0 {
+                (f.dst, f.dst)
+            } else {
+                (f.dst, f.there)
+            }
+        } else {
+            (f.dst, f.there)
+        };
         let (pre, this) = {
             let nft = ns.nft.borrow();
             (nft.has_filter(HOOK_PRE_ROUTING), nft.has_filter(hook))
         };
-        // What a namespace sends to itself over loopback also passes PREROUTING, as on Linux
+        let mut mark = if Rc::ptr_eq(ns, me) { out_mark } else { 0 };
+        // What a namespace sends to itself over loopback also passes PREROUTING, as on Linux.
+        // Chains ordered before NF_IP_PRI_NAT_DST (-100) see the pre-DNAT destination; chains at
+        // or after -100 see the post-DNAT destination.
         if pre {
-            let o = hook_eval(
+            let dnated = pre_dst != post_dst && f.origs.iter().any(|(id, _)| *id == ns.id);
+            let (o, m) = hook_filter_prerouting(
                 ns,
-                &packet(HOOK_PRE_ROUTING, Some(iif.clone()), ns),
-                dst,
-                None,
-                true,
+                &packet(HOOK_PRE_ROUTING, Some(iif.clone()), ns, mark),
+                pre_dst,
+                post_dst,
+                dnated,
             );
+            mark = m;
             if !pass(&o) {
                 return (o, false);
             }
         }
         if this {
-            let o = hook_eval(ns, &packet(hook, Some(iif), ns), dst, oif, true);
+            let (o, _) = hook_filter(ns, &packet(hook, Some(iif), ns, mark), post_dst, oif);
             if !pass(&o) {
                 return (o, false);
             }
@@ -1548,9 +1572,10 @@ pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<(Vec<u
 }
 
 /// Forwarding from outside the host through the initial namespace `init` to the DNAT
-/// destination `there` (a guest address in namespace `t`): passes `init`'s FORWARD (entering on
-/// the host's interface) and the filter chains on `t`'s PREROUTING and INPUT; what is dropped or
-/// rejected is not forwarded.
+/// destination `there` (a guest address in namespace `t`): passes `init`'s PREROUTING filter
+/// chains (pre-DNAT chains seeing `original`, post-DNAT chains seeing `there`), `init`'s FORWARD
+/// (or INPUT when staying in `init`), and the filter chains on `t`'s PREROUTING and INPUT; what is
+/// dropped or rejected is not forwarded.
 pub(crate) fn external_filter(
     init: &NetNs,
     t: Option<&NetNs>,
@@ -1562,7 +1587,7 @@ pub(crate) fn external_filter(
     let Some(ip) = ipv4_of(there) else {
         return true;
     };
-    let packet = |hook: u32, iif: crate::nft::Iif, ns: &NetNs| NatPacket {
+    let packet = |hook: u32, iif: crate::nft::Iif, ns: &NetNs, mark: u32| NatPacket {
         hook,
         proto,
         src: EXTERNAL.to_vec(),
@@ -1576,47 +1601,58 @@ pub(crate) fn external_filter(
         } else {
             None
         },
-        mark: 0,
+        mark,
     };
     let pass = |o: Outcome| matches!(o, Outcome::Accept | Outcome::Dnat(..));
     let outer = outer_iface(init).map(|(i, _)| i).unwrap_or_default();
+    let mut init_mark = 0;
+    if init.nft.borrow().has_filter(HOOK_PRE_ROUTING) {
+        let (o, m) = hook_filter_prerouting(
+            init,
+            &packet(HOOK_PRE_ROUTING, outer.clone(), init, 0),
+            original,
+            there,
+            original != there,
+        );
+        init_mark = m;
+        if !pass(o) {
+            return false;
+        }
+    }
     if let Some(t) = t.filter(|t| !std::ptr::eq(*t, init)) {
         if init.nft.borrow().has_filter(HOOK_FORWARD) {
             let oif = iif_facing(init, ip).name;
-            if !pass(hook_eval(
+            let (o, _) = hook_filter(
                 init,
-                &packet(HOOK_FORWARD, outer.clone(), init),
+                &packet(HOOK_FORWARD, outer.clone(), init, init_mark),
                 there,
                 Some(oif),
-                true,
-            )) {
+            );
+            if !pass(o) {
                 return false;
             }
         }
         let iif = iif_facing(t, EXTERNAL);
+        let mut t_mark = 0;
         for hook in [HOOK_PRE_ROUTING, HOOK_LOCAL_IN] {
-            if t.nft.borrow().has_filter(hook)
-                && !pass(hook_eval(
-                    t,
-                    &packet(hook, iif.clone(), t),
-                    there,
-                    None,
-                    true,
-                ))
-            {
-                return false;
+            if t.nft.borrow().has_filter(hook) {
+                let (o, m) = hook_filter(t, &packet(hook, iif.clone(), t, t_mark), there, None);
+                t_mark = m;
+                if !pass(o) {
+                    return false;
+                }
             }
         }
-    } else if init.nft.borrow().has_filter(HOOK_LOCAL_IN)
-        && !pass(hook_eval(
+    } else if init.nft.borrow().has_filter(HOOK_LOCAL_IN) {
+        let (o, _) = hook_filter(
             init,
-            &packet(HOOK_LOCAL_IN, outer, init),
+            &packet(HOOK_LOCAL_IN, outer, init, init_mark),
             there,
             None,
-            true,
-        ))
-    {
-        return false;
+        );
+        if !pass(o) {
+            return false;
+        }
     }
     true
 }
@@ -1675,8 +1711,109 @@ fn hook_eval(
     oif: Option<Vec<u8>>,
     filter: bool,
 ) -> crate::nft::Outcome {
+    if filter {
+        hook_filter(ns, p, dst, oif).0
+    } else {
+        hook_eval_inner(ns, p, dst, oif, false).0
+    }
+}
+
+/// Runs the filter chains on hook `p.hook` of `ns`, returning the verdict and resulting mark.
+fn hook_filter(
+    ns: &NetNs,
+    p: &NatPacket,
+    dst: &[u8],
+    oif: Option<Vec<u8>>,
+) -> (crate::nft::Outcome, u32) {
+    hook_eval_inner(ns, p, dst, oif, true)
+}
+
+/// Runs the PREROUTING filter chains of `ns`, giving chains ordered before `NF_IP_PRI_NAT_DST`
+/// (`-100`) the pre-DNAT destination `pre_dst` (when `dnated`) and chains at or after `-100` the
+/// post-DNAT destination `post_dst`.
+fn hook_filter_prerouting(
+    ns: &NetNs,
+    p: &NatPacket,
+    pre_dst: &[u8],
+    post_dst: &[u8],
+    dnated: bool,
+) -> (crate::nft::Outcome, u32) {
+    let Some((post_ip, _)) = nat_ip(post_dst) else {
+        return (crate::nft::Outcome::Accept, p.mark);
+    };
+    let (pre_ip, pre_port) = nat_ip(pre_dst).map_or_else(
+        || {
+            (
+                post_ip.clone(),
+                u16::from_be_bytes([post_dst[2], post_dst[3]]),
+            )
+        },
+        |(ip, _)| (ip, u16::from_be_bytes([pre_dst[2], pre_dst[3]])),
+    );
+    let local = |a: &[u8]| {
+        is_loopback(a)
+            || crate::netdev::interfaces(ns)
+                .iter()
+                .any(|i| i.addrs.iter().any(|(_, x, _)| x == a))
+    };
+    let pre_src = if p.src.len() == pre_ip.len() {
+        p.src.clone()
+    } else {
+        vec![0; pre_ip.len()]
+    };
+    let post_src = if p.src.len() == post_ip.len() {
+        p.src.clone()
+    } else {
+        vec![0; post_ip.len()]
+    };
+    let addr_type = |a: &[u8]| crate::nft::addr_type(a, local);
+    let no_oif = || -> (u32, Vec<u8>) { (0, Vec::new()) };
+    let pre_packet = crate::nft::Packet {
+        src: &pre_src,
+        dst: &pre_ip,
+        original_dst: &pre_ip,
+        proto: p.proto,
+        sport: p.sport,
+        dport: pre_port,
+        uid: p.uid,
+        gid: p.gid,
+        addr_type: &addr_type,
+        oif: &no_oif,
+        hook: crate::nft::HOOK_PRE_ROUTING,
+        iif: p.iif.clone(),
+        ct_state: p.ct_state,
+        mark: p.mark,
+    };
+    let post_packet = crate::nft::Packet {
+        src: &post_src,
+        dst: &post_ip,
+        original_dst: p.original_dst.as_deref().unwrap_or(&pre_ip),
+        proto: p.proto,
+        sport: p.sport,
+        dport: u16::from_be_bytes([post_dst[2], post_dst[3]]),
+        uid: p.uid,
+        gid: p.gid,
+        addr_type: &addr_type,
+        oif: &no_oif,
+        hook: crate::nft::HOOK_PRE_ROUTING,
+        iif: p.iif.clone(),
+        ct_state: p.ct_state,
+        mark: p.mark,
+    };
+    ns.nft
+        .borrow()
+        .filter_prerouting(&pre_packet, &post_packet, dnated)
+}
+
+fn hook_eval_inner(
+    ns: &NetNs,
+    p: &NatPacket,
+    dst: &[u8],
+    oif: Option<Vec<u8>>,
+    filter: bool,
+) -> (crate::nft::Outcome, u32) {
     let Some((ip, v4)) = nat_ip(dst) else {
-        return crate::nft::Outcome::Accept;
+        return (crate::nft::Outcome::Accept, p.mark);
     };
     let local = |a: &[u8]| {
         is_loopback(a)
@@ -1729,9 +1866,9 @@ fn hook_eval(
     };
     let nft = ns.nft.borrow();
     if filter {
-        nft.filter(&packet)
+        nft.filter_with_mark(&packet)
     } else {
-        nft.nat(&packet)
+        (nft.nat(&packet), p.mark)
     }
 }
 
@@ -3303,6 +3440,275 @@ mod tests {
             !to_host(&w2, &init, &v4([127, 0, 3, 1], 8080), Use::Reach, false)
                 .unwrap()
                 .isolated
+        );
+    }
+
+    /// PREROUTING filter chains ordered before a namespace's DNAT see the pre-DNAT destination
+    /// while chains ordered after DNAT see the post-DNAT destination, in both `path_filter`
+    /// (single-hop and 2-hop routed via `init`) and `external_filter`.
+    #[test]
+    fn prerouting_filter_chains_respect_dnat_priority() {
+        let root = Cred::root();
+        let peer = crate::nft::Peer {
+            pid: 1,
+            ext_ack: false,
+            cap_ack: false,
+            proc_pid: 1,
+            comm: b"nft",
+        };
+        let be32 = |v: u32| v.to_be_bytes().to_vec();
+        let cstr = |s: &[u8]| [s, &[0]].concat();
+        let val = |v: &[u8]| {
+            let mut d = Vec::new();
+            crate::net::attr(&mut d, 1, v);
+            d
+        };
+        let expr = |name: &str, args: &[(u16, Vec<u8>)]| {
+            let mut d = Vec::new();
+            for (t, v) in args {
+                crate::net::attr(&mut d, *t, v);
+            }
+            let mut e = Vec::new();
+            crate::net::attr(&mut e, 1, &cstr(name.as_bytes()));
+            crate::net::attr(&mut e, 2, &d);
+            let mut l = Vec::new();
+            crate::net::attr(&mut l, 1 | 0x8000, &e);
+            l
+        };
+        let dport = |p: u16| {
+            [
+                expr(
+                    "payload",
+                    &[(1, be32(1)), (2, be32(2)), (3, be32(2)), (4, be32(2))],
+                ),
+                expr(
+                    "cmp",
+                    &[(1, be32(1)), (2, be32(0)), (3, val(&p.to_be_bytes()))],
+                ),
+            ]
+        };
+        let daddr = |ip: [u8; 4]| {
+            [
+                expr(
+                    "payload",
+                    &[(1, be32(1)), (2, be32(1)), (3, be32(16)), (4, be32(4))],
+                ),
+                expr("cmp", &[(1, be32(1)), (2, be32(0)), (3, val(&ip))]),
+            ]
+        };
+        let drop_expr = || {
+            let mut v = Vec::new();
+            crate::net::attr(&mut v, 1, &be32(0)); // NF_DROP = 0
+            let mut d = Vec::new();
+            crate::net::attr(&mut d, 2, &v);
+            expr("immediate", &[(1, be32(0)), (2, d)])
+        };
+        let reject_rst = || expr("reject", &[(1, be32(1))]);
+        let dnat_exprs = |ip: [u8; 4], port: u16| {
+            [
+                expr("immediate", &[(1, be32(1)), (2, val(&ip))]),
+                expr("immediate", &[(1, be32(2)), (2, val(&port.to_be_bytes()))]),
+                expr(
+                    "nat",
+                    &[(1, be32(1)), (2, be32(2)), (3, be32(1)), (5, be32(2))],
+                ),
+            ]
+        };
+        let nfmsg = |ty: u16, flags: u16, fam: u8, attrs: &[u8]| {
+            let mut b = vec![fam, 0, 0, 0];
+            b.extend_from_slice(attrs);
+            crate::net::message(ty, flags | 1, 1, 0, &b)
+        };
+        let batch = |ns: &NetNs, msgs: &[Vec<u8>]| {
+            let mut all = crate::net::message(16, 1, 0, 0, &[0, 0, 0, 10]); // BATCH_BEGIN
+            for m in msgs {
+                all.extend(m);
+            }
+            all.extend(crate::net::message(17, 1, 9, 0, &[0, 0, 0, 10])); // BATCH_END
+            let replies = crate::nft::handle(ns, &root, &all, &peer);
+            assert!(
+                replies.is_empty(),
+                "nft batch failed ({} replies)",
+                replies.len()
+            );
+        };
+        let table = |name: &[u8]| {
+            let mut p = Vec::new();
+            crate::net::attr(&mut p, 1, &cstr(name));
+            nfmsg(10 << 8, 0x400, 2, &p)
+        };
+        let chain = |tbl: &[u8], name: &[u8], hook: u32, prio: i32, ty: &[u8]| {
+            let mut h = Vec::new();
+            crate::net::attr(&mut h, 1, &be32(hook));
+            crate::net::attr(&mut h, 2, &be32(prio as u32));
+            let mut p = Vec::new();
+            crate::net::attr(&mut p, 1, &cstr(tbl));
+            crate::net::attr(&mut p, 3, &cstr(name));
+            crate::net::attr(&mut p, 4 | 0x8000, &h);
+            crate::net::attr(&mut p, 5, &be32(1)); // NF_ACCEPT
+            crate::net::attr(&mut p, 7, &cstr(ty));
+            nfmsg(10 << 8 | 3, 0x400, 2, &p)
+        };
+        let rule = |tbl: &[u8], ch: &[u8], exprs: &[Vec<u8>]| {
+            let mut list = Vec::new();
+            for e in exprs {
+                list.extend(e);
+            }
+            let mut p = Vec::new();
+            crate::net::attr(&mut p, 1, &cstr(tbl));
+            crate::net::attr(&mut p, 2, &cstr(ch));
+            crate::net::attr(&mut p, 4 | 0x8000, &list);
+            nfmsg(10 << 8 | 6, 0xc00, 2, &p)
+        };
+
+        let init = crate::nsproxy::NsProxy::init().net;
+        let mk_ns = |id: u64, b: u8| {
+            Rc::new(NetNs {
+                id,
+                owner: crate::cred::UserNs::init(),
+                host_net: Some([9, b]),
+                lo: Default::default(),
+                devs: RefCell::new(crate::netdev::Devices::for_new_ns(&Default::default())),
+                nft: Default::default(),
+                listeners: Default::default(),
+            })
+        };
+        let a = mk_ns(10, 1);
+        let b = mk_ns(11, 2);
+        let gw0 = [10, 80, 0, 1];
+        let gw1 = [10, 81, 0, 1];
+        let a_ip = [10, 80, 0, 2];
+        let b_ip = [10, 81, 0, 3];
+        crate::netdev::test_dev(&init, "br0", gw0, 24, None);
+        crate::netdev::test_dev(&init, "br1", gw1, 24, None);
+        crate::netdev::test_dev(&a, "eth0", a_ip, 24, Some(gw0));
+        crate::netdev::test_dev(&b, "eth0", b_ip, 24, Some(gw1));
+        let w = World {
+            all: vec![init.clone(), a.clone(), b.clone()],
+        };
+
+        // Case 1: init DNATs 10.80.0.1:8080 -> 10.81.0.3:80 at priority -100, and has:
+        // - raw (-300): drops dport 80 (must NOT match pre-DNAT 8080), rejects dport 8081
+        // - post (0): drops dport 8080 (must NOT match post-DNAT 80), rejects dport 8082->82
+        let mut r_nat1 = dport(8080).to_vec();
+        r_nat1.extend(dnat_exprs(b_ip, 80));
+        let mut r_nat2 = dport(8081).to_vec();
+        r_nat2.extend(dnat_exprs(b_ip, 81));
+        let mut r_nat3 = dport(8082).to_vec();
+        r_nat3.extend(dnat_exprs(b_ip, 82));
+
+        let mut raw_drop_80 = dport(80).to_vec();
+        raw_drop_80.push(drop_expr());
+        let mut raw_rej_8081 = daddr(gw0).to_vec();
+        raw_rej_8081.extend(dport(8081));
+        raw_rej_8081.push(reject_rst());
+        let mut post_drop_8080 = dport(8080).to_vec();
+        post_drop_8080.push(drop_expr());
+        let mut post_rej_82 = daddr(b_ip).to_vec();
+        post_rej_82.extend(dport(82));
+        post_rej_82.push(reject_rst());
+
+        batch(
+            &init,
+            &[
+                table(b"t"),
+                chain(b"t", b"raw", crate::nft::HOOK_PRE_ROUTING, -300, b"filter"),
+                chain(b"t", b"nat", crate::nft::HOOK_PRE_ROUTING, -100, b"nat"),
+                chain(b"t", b"post", crate::nft::HOOK_PRE_ROUTING, 0, b"filter"),
+                rule(b"t", b"nat", &r_nat1),
+                rule(b"t", b"nat", &r_nat2),
+                rule(b"t", b"nat", &r_nat3),
+                rule(b"t", b"raw", &raw_drop_80),
+                rule(b"t", b"raw", &raw_rej_8081),
+                rule(b"t", b"post", &post_drop_8080),
+                rule(b"t", b"post", &post_rej_82),
+            ],
+        );
+
+        let run_init_dnat = |pre_port: u16| {
+            let dst = v4(gw0, pre_port);
+            let NatResult::Dnat(there) = prerouting_nat(&a, &init, 6, 40000, &dst, None).unwrap()
+            else {
+                panic!("expected DNAT for port {pre_port}");
+            };
+            let origs = vec![(init.id, dst.clone())];
+            let flow = Flow {
+                proto: 6,
+                vaddr: Some(a_ip),
+                sport: 40000,
+                dst: &dst,
+                bridge: None,
+                origs: &origs,
+                there: &there,
+                uid: 0,
+                gid: 0,
+                established: false,
+                mark: 0,
+            };
+            path_filter(&w, &a, Some(&b), &flow)
+        };
+        // 8080 -> 80: passes both raw (-300, sees 8080 != 80) and post (0, sees 80 != 8080).
+        assert_eq!(run_init_dnat(8080), (crate::nft::Outcome::Accept, false));
+        // 8081 -> 81: raw (-300) sees pre-DNAT 10.80.0.1:8081 and rejects.
+        assert_eq!(
+            run_init_dnat(8081),
+            (crate::nft::Outcome::Reject(Errno::ECONNREFUSED.0), false)
+        );
+        // 8082 -> 82: post (0) sees post-DNAT 10.81.0.3:82 and rejects.
+        assert_eq!(
+            run_init_dnat(8082),
+            (crate::nft::Outcome::Reject(Errno::ECONNREFUSED.0), false)
+        );
+
+        // Case 2: external_nat + external_filter also splits init's PREROUTING filter chains.
+        let (orig_8080, dnat_8080) = external_nat(&init, 6, &v4(gw0, 8080)).unwrap();
+        assert!(external_filter(&init, Some(&b), 6, &orig_8080, &dnat_8080));
+        let (orig_8081, dnat_8081) = external_nat(&init, 6, &v4(gw0, 8081)).unwrap();
+        assert!(!external_filter(&init, Some(&b), 6, &orig_8081, &dnat_8081));
+        let (orig_8082, dnat_8082) = external_nat(&init, 6, &v4(gw0, 8082)).unwrap();
+        assert!(!external_filter(&init, Some(&b), 6, &orig_8082, &dnat_8082));
+
+        // Case 3: A -> init -> B where B (not init) DNATs 9000 -> 9001; init sees pre-DNAT 9000,
+        // B's pre-DNAT chain (-150) sees 9000, and B's post-DNAT chain (0) sees 9001.
+        let mut b_nat = dport(9000).to_vec();
+        b_nat.extend(dnat_exprs(b_ip, 9001));
+        let mut b_pre_drop_9001 = dport(9001).to_vec();
+        b_pre_drop_9001.push(drop_expr());
+        let mut b_post_drop_9000 = dport(9000).to_vec();
+        b_post_drop_9000.push(drop_expr());
+        batch(
+            &b,
+            &[
+                table(b"tb"),
+                chain(b"tb", b"pre", crate::nft::HOOK_PRE_ROUTING, -150, b"filter"),
+                chain(b"tb", b"nat", crate::nft::HOOK_PRE_ROUTING, -100, b"nat"),
+                chain(b"tb", b"post", crate::nft::HOOK_PRE_ROUTING, 0, b"filter"),
+                rule(b"tb", b"nat", &b_nat),
+                rule(b"tb", b"pre", &b_pre_drop_9001),
+                rule(b"tb", b"post", &b_post_drop_9000),
+            ],
+        );
+        let dst = v4(b_ip, 9000);
+        let NatResult::Dnat(there) = prerouting_nat(&a, &b, 6, 40000, &dst, None).unwrap() else {
+            panic!("expected B DNAT");
+        };
+        let origs = vec![(b.id, dst.clone())];
+        let flow = Flow {
+            proto: 6,
+            vaddr: Some(a_ip),
+            sport: 40000,
+            dst: &dst,
+            bridge: None,
+            origs: &origs,
+            there: &there,
+            uid: 0,
+            gid: 0,
+            established: false,
+            mark: 0,
+        };
+        assert_eq!(
+            path_filter(&w, &a, Some(&b), &flow),
+            (crate::nft::Outcome::Accept, false)
         );
     }
 }

@@ -1337,10 +1337,14 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
         PR_GET_SECCOMP => Ok(u64::from(cx.task.seccomp.borrow().mode)),
         PR_SET_SECCOMP => crate::seccomp::prctl_set(cx, arg, args[1]),
         PR_CAPBSET_READ if arg <= CAP_LAST_CAP => Ok((cx.cred().cap_bounding >> arg) & 1),
-        PR_CAPBSET_DROP if arg <= CAP_LAST_CAP => {
+        // Linux's cap_prctl_drop checks CAP_SETPCAP (EPERM) before cap_valid (EINVAL).
+        PR_CAPBSET_DROP => {
             let mut c = cx.cred();
             if !c.capable_here(cap::SETPCAP) {
                 return Err(Errno::EPERM);
+            }
+            if arg > CAP_LAST_CAP {
+                return Err(Errno::EINVAL);
             }
             c.cap_bounding &= !(1 << arg);
             cx.set_cred(c);
@@ -1402,7 +1406,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
         }
         // Options handled above whose arguments were refused
         PR_SET_DUMPABLE | PR_SET_NO_NEW_PRIVS | PR_SET_KEEPCAPS | PR_CAPBSET_READ
-        | PR_CAPBSET_DROP | PR_SET_TIMING => Err(Errno::EINVAL),
+        | PR_SET_TIMING => Err(Errno::EINVAL),
         _ => {
             crate::stub::hit(cx, crate::stub::Stub::Prctl(option));
             Err(Errno::EINVAL)

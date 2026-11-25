@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: initial-netns guest-side isolation of allocated container `127.a.b.x` blocks and container blocks starting at `127.0.2.0/24` to preserve `127.0.1.1`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: PREROUTING filter chains split around DNAT priority so pre-DNAT chains see the pre-DNAT destination and post-DNAT chains see the post-DNAT destination, including initial-ns PREROUTING in `external_filter`)
 
 ## Responsibilities
 
@@ -223,11 +223,14 @@ sockets (`hal`).
      that bridge owner's PREROUTING when its `bridge-nf-call-iptables` is enabled. A bridge DNAT
      can change which namespace is entered next; the endpoint can apply its own DNAT;
   3. filter chains along the path (IPv4 only): the sender's OUTPUT, then per step PREROUTING
-     filter chains (evaluated after DNAT) and the step's own hook — INPUT on lo, the initial
-     namespace's INPUT or FORWARD, the target's INPUT. A filtered bridge hop sees its logical
-     bridge interface and its own post-DNAT destination on FORWARD (INPUT for local delivery).
-     Routed traffic still takes its usual hooks when bridge filtering is disabled. The mark is
-     cleared outside the sender.
+     filter chains (split at `NF_IP_PRI_NAT_DST = -100` as Linux netfilter does, so chains with
+     `priority < -100` see the pre-DNAT destination and chains at `priority >= -100` see the
+     post-DNAT destination, carrying `meta mark set` into the step's next hook) and the step's own
+     hook — INPUT on lo, the initial namespace's INPUT or FORWARD, the target's INPUT. On a 2-hop
+     routed path where only the target DNATs, the initial namespace sees the pre-DNAT destination. A
+     filtered bridge hop sees its logical bridge interface and its own post-DNAT destination on
+     FORWARD (INPUT for local delivery). Routed traffic still takes its usual hooks when bridge
+     filtering is disabled. The mark is cleared outside the sender.
   POSTROUTING (nat and filter), INPUT-hook nat and arp/bridge/netdev tables are never evaluated.
   (Inbound forwarding's probe can evaluate IPv6 PREROUTING nat.)
 - Effects: nat-chain drops and rejects flow into the same verdict handling as filter chains
@@ -247,7 +250,8 @@ sockets (`hal`).
   when the initial namespace has PREROUTING nat. A synthetic packet from 192.0.2.1:40000 to the
   socket's port (wildcards become the first non-loopback IPv4 interface address) runs PREROUTING
   nat; a DNAT result is translated to the target's host address and gateway source, filtered
-  through the initial FORWARD and the target's PREROUTING/INPUT chains (a drop or reject means no
+  through the initial namespace's PREROUTING (split around DNAT priority) and FORWARD/INPUT and
+  the target's PREROUTING/INPUT chains (a drop or reject means no
   forwarding), and target endpoints in new namespaces are resolved via `resolve_target` (or
   initial-namespace low ports via `portmap`). Re-evaluated on listen (both initial and new
   namespaces), UDP bind, initial-namespace nft commits and explicit-port binds in namespaces (when
@@ -324,9 +328,8 @@ sockets (`hal`).
   directly accessing allocated container `127.a.b.x` blocks, other apps on the host device can
   still reach a container's host loopback sockets directly.
 - **Smaller deviations:** only 127.0.0.0/24 works as loopback in a namespace (Linux: 127/8); IPv6 on
-  virtual devices is unusable and on-link IPv6 is handed to the host; PREROUTING filter chains see
-  the post-DNAT destination at every priority. `kernel/nft` records the unsupported POSTROUTING,
-  SNAT and MASQUERADE effects.
+  virtual devices is unusable and on-link IPv6 is handed to the host. `kernel/nft` records the
+  unsupported POSTROUTING, SNAT and MASQUERADE effects.
 - **Route requests insist on exact address sizes:** `RTA_DST`, `RTA_GATEWAY` and `RTA_PREFSRC` in
   `RTM_NEWROUTE`/`RTM_DELROUTE` must be exactly 4 or 16 bytes, otherwise `EINVAL`; Linux 6.1
   answers `ERANGE` for a short IPv4 attribute or IPv6 gateway, uses the first 4 bytes of a longer

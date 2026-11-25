@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: seccomp logs `audit: type=1326` records to guest `klog` including `USER_NOTIF` under `SECCOMP_FILTER_FLAG_LOG`; `dumpable` tracks `fs.suid_dumpable` 0/1/2)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `setgroups` and `PR_CAPBSET_DROP` check permissions (`EPERM`) before argument validation (`EINVAL`/`EFAULT`), matching Linux 6.1)
 
 ## Responsibilities
 
@@ -102,9 +102,10 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   effective = permitted; `setfsuid` drops or raises the filesystem capabilities;
   `SECBIT_NO_SETUID_FIXUP` disables all of it.
 - `setfsuid`/`setfsgid` never fail: bad values are ignored and the old value is returned.
-  `getgroups` (negative size `EINVAL`, 0 returns the count, too small `EINVAL`); `setgroups` (size
-  0..65536, mapped ids, then `CAP_SETGID` and the namespace's setgroups permission with a written
-  gid map, else `EPERM`; stored sorted).
+  `getgroups` (negative size `EINVAL`, 0 returns the count, too small `EINVAL`); `setgroups` checks
+  `CAP_SETGID` and the namespace's setgroups permission with a written gid map (`Cred::may_setgroups`,
+  `EPERM`) before size `0..=65536` (`EINVAL`), full user-list read (`EFAULT`), and gid mapping
+  (`EINVAL`), then stores the list sorted.
 
 ### Capabilities
 
@@ -116,7 +117,8 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   before checking; new permitted ⊆ old permitted, effective ⊆ new permitted,
   inheritable ⊆ old inheritable ∪ (`CAP_SETPCAP` ? all : old permitted) and ⊆ old inheritable ∪
   bounding; ambient is then masked to permitted ∩ inheritable.
-- prctl: bounding drop needs `CAP_SETPCAP`; ambient raise needs the capability in permitted and
+- prctl: bounding drop checks `CAP_SETPCAP` (`EPERM`) before capability range `<= 40` (`EINVAL`);
+  ambient raise needs the capability in permitted and
   inheritable and no `NO_CAP_AMBIENT_RAISE`; securebits need `CAP_SETPCAP`, cannot change locked
   bits or unlock; keepcaps fails when locked.
 
@@ -255,8 +257,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ## Confirmed bugs / technical debt
 
-- **Errno order differences.** setgroups reports `EINVAL`/`EFAULT` before the permission check's
-  `EPERM`; `PR_CAPBSET_DROP` beyond 40 is `EINVAL` before `EPERM`.
+None.
 
 ## Open questions
 

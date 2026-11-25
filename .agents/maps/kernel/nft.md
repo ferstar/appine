@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/netns full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: chunked resumable set-element and ruleset dumps)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `filter_with_mark`, `filter_prerouting` and `PRI_NAT_DST` (`-100`) split PREROUTING filter chains around Linux's `NF_IP_PRI_NAT_DST` hook priority)
 
 ## Responsibilities
 
@@ -24,7 +24,8 @@ and netlink transport in `kernel/netlink`.
 ## Public entry points
 
 - `nft::handle` handles one netfilter datagram.
-- `Nft::nat`, `Nft::filter`, `has_nat`, `has_filter` and `tracks` serve namespace and socket callers.
+- `Nft::nat`, `Nft::filter_with_mark`, `Nft::filter_prerouting`, `PRI_NAT_DST`, `has_nat`,
+  `has_filter` and `tracks` serve namespace and socket callers.
 
 ## Data flow / lifecycle
 

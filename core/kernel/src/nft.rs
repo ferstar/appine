@@ -2420,6 +2420,8 @@ const NFT_RETURN: i32 = -5;
 const JUMP_STACK: usize = 16;
 /// The PREROUTING and OUTPUT hooks (`NF_INET_PRE_ROUTING`, `NF_INET_LOCAL_OUT`).
 pub(crate) const HOOK_PRE_ROUTING: u32 = 0;
+/// Linux's `NF_IP_PRI_NAT_DST` (`-100`): default priority of PREROUTING DNAT chains.
+pub(crate) const PRI_NAT_DST: i32 = -100;
 const HOOK_FORWARD: u32 = 2;
 pub(crate) const HOOK_LOCAL_OUT: u32 = 3;
 const RTN_UNICAST: u32 = 1;
@@ -2572,7 +2574,14 @@ impl Nft {
     /// Runs the filter- and route-type chains on hook `p.hook`: one by one by priority, stopping
     /// at the first drop (reject), and running the next one after an accept (each base chain gives
     /// its own verdict).
+    #[cfg(test)]
     pub(crate) fn filter(&self, p: &Packet<'_>) -> Outcome {
+        self.filter_with_mark(p).0
+    }
+
+    /// Like [`Self::filter`], also returning the resulting packet mark so the next hook in the
+    /// same namespace observes `meta mark set`.
+    pub(crate) fn filter_with_mark(&self, p: &Packet<'_>) -> (Outcome, u32) {
         let fam = if p.dst.len() == 4 { 2 } else { 10 };
         let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
         for t in &self.tables {
@@ -2609,10 +2618,73 @@ impl Nft {
             let v = run_chain(&mut e, t, c);
             mark = e.mark;
             if v == NF_DROP {
-                return e.reject.map_or(Outcome::Drop, Outcome::Reject);
+                return (e.reject.map_or(Outcome::Drop, Outcome::Reject), mark);
             }
         }
-        Outcome::Accept
+        (Outcome::Accept, mark)
+    }
+
+    /// Runs the filter- and route-type chains on `HOOK_PRE_ROUTING` in priority order: on Linux,
+    /// PREROUTING DNAT is always registered at `NF_IP_PRI_NAT_DST` ([`PRI_NAT_DST`], `-100`), so
+    /// when `dnated` is true, chains with `priority < PRI_NAT_DST` see `pre` (the pre-DNAT
+    /// destination) while chains with `priority >= PRI_NAT_DST` see `post` (the post-DNAT
+    /// destination). Returns the verdict and resulting packet mark.
+    pub(crate) fn filter_prerouting(
+        &self,
+        pre: &Packet<'_>,
+        post: &Packet<'_>,
+        dnated: bool,
+    ) -> (Outcome, u32) {
+        let fam = if post.dst.len() == 4 { 2 } else { 10 };
+        let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
+        for t in &self.tables {
+            if (t.family != fam && t.family != 1) || t.flags & 1 != 0 {
+                continue;
+            }
+            for c in &t.chains {
+                if let Some(b) = &c.base
+                    && b.hooknum == HOOK_PRE_ROUTING
+                    && b.ty != b"nat"
+                {
+                    chains.push((t, c, b.priority));
+                }
+            }
+        }
+        if chains.is_empty() {
+            return (Outcome::Accept, pre.mark);
+        }
+        chains.sort_by_key(|(_, _, prio)| *prio);
+        let (post_nh, post_th) = headers(post);
+        let pre_hdrs = dnated.then(|| headers(pre));
+        let mut mark = pre.mark;
+        for (t, c, prio) in chains {
+            let (p, nh, th) = if dnated && prio < PRI_NAT_DST {
+                let (pre_nh, pre_th) = pre_hdrs.as_ref().unwrap();
+                (pre, pre_nh, pre_th)
+            } else {
+                (post, &post_nh, &post_th)
+            };
+            let mut e = Eval {
+                recent: &self.recent,
+                p,
+                nh: nh.clone(),
+                th: th.clone(),
+                regs: [0; 80],
+                verdict: NFT_CONTINUE,
+                chain: None,
+                mark,
+                dnat: None,
+                reject: None,
+                rates: None,
+                at: 0,
+            };
+            let v = run_chain(&mut e, t, c);
+            mark = e.mark;
+            if v == NF_DROP {
+                return (e.reject.map_or(Outcome::Drop, Outcome::Reject), mark);
+            }
+        }
+        (Outcome::Accept, mark)
     }
 
     /// Whether IPv4 (with `v6`, IPv6) packets in this namespace go through connection tracking:
@@ -5027,5 +5099,145 @@ mod tests {
         assert_eq!(tiny.len(), 2);
         assert_eq!(tiny[0].len(), empty_msg_len);
         assert_eq!(u16::from_le_bytes([tiny[1][4], tiny[1][5]]), NLMSG_DONE);
+    }
+
+    /// PREROUTING filter chains ordered before the matching DNAT chain see the pre-DNAT
+    /// destination (IP, port, `fib daddr type`), while chains ordered after DNAT see the
+    /// post-DNAT destination (with `original_dst` preserved); `meta mark set` carries across
+    /// both halves and into the returned mark.
+    #[test]
+    fn prerouting_filter_priority_splits_around_dnat() {
+        let root = Cred::root();
+        let reg = |r: u32| be32(r).to_vec();
+        let daddr = |ip: [u8; 4]| [payload(1, 16, 4), cmp_eq(&ip)];
+        let dport = |p: u16| [payload(2, 2, 2), cmp_eq(&p.to_be_bytes())];
+        let verdict_expr = |code: i32| expr("immediate", &[(1, reg(0)), (2, verdict(code, None))]);
+        let set_mark = |m: u32| {
+            [
+                expr("immediate", &[(1, reg(1)), (2, value(&m.to_ne_bytes()))]),
+                expr("meta", &[(2, reg(3)), (3, reg(1))]), // NFTA_META_KEY=2 (MARK=3), SREG=3
+            ]
+        };
+        let match_mark = |m: u32| {
+            [
+                expr("meta", &[(2, reg(3)), (1, reg(1))]),
+                cmp_eq(&m.to_ne_bytes()),
+            ]
+        };
+        let dnat_to = |ip: [u8; 4], port: u16| {
+            [
+                expr("immediate", &[(1, reg(1)), (2, value(&ip))]),
+                expr("immediate", &[(1, reg(2)), (2, value(&port.to_be_bytes()))]),
+                expr(
+                    "nat",
+                    &[
+                        (1, be32(1).to_vec()), // NFT_NAT_DNAT
+                        (2, be32(2).to_vec()), // NFPROTO_IPV4
+                        (3, reg(1)),
+                        (5, reg(2)),
+                    ],
+                ),
+            ]
+        };
+
+        let pre_ip = [10, 80, 0, 1];
+        let post_ip = [10, 81, 0, 3];
+        let addr_type = |a: &[u8]| if a == pre_ip { RTN_LOCAL } else { RTN_UNICAST };
+
+        // 1. Default dstnat (-100): raw (-300) sees pre-DNAT, filter (0) sees post-DNAT, and
+        //    mark set at -150 carries into priority 0 and out of filter_prerouting.
+        let ns1 = ns();
+        let mut raw_rule = daddr(pre_ip).to_vec();
+        raw_rule.extend(dport(8080));
+        raw_rule.extend(set_mark(0x42));
+        let mut post_drop_pre_port = dport(8080).to_vec();
+        post_drop_pre_port.push(verdict_expr(NF_DROP));
+        let mut post_reject_marked_post = match_mark(0x42).to_vec();
+        post_reject_marked_post.extend(daddr(post_ip));
+        post_reject_marked_post.extend(dport(80));
+        post_reject_marked_post.push(expr("reject", &[(1, be32(1).to_vec())]));
+        let mut nat_rule = daddr(pre_ip).to_vec();
+        nat_rule.extend(dport(8080));
+        nat_rule.extend(dnat_to(post_ip, 80));
+
+        let r = handle(
+            &ns1,
+            &root,
+            &batch(&[
+                table_msg(2, b"t"),
+                chain_msg(2, b"t", b"raw", Some((HOOK_PRE_ROUTING, -300, b"filter"))),
+                chain_msg(2, b"t", b"nat", Some((HOOK_PRE_ROUTING, -100, b"nat"))),
+                chain_msg(2, b"t", b"post", Some((HOOK_PRE_ROUTING, 0, b"filter"))),
+                rule_msg(2, b"t", b"raw", &raw_rule),
+                rule_msg(2, b"t", b"nat", &nat_rule),
+                rule_msg(2, b"t", b"post", &post_drop_pre_port),
+                rule_msg(2, b"t", b"post", &post_reject_marked_post),
+            ]),
+            &peer(),
+        );
+        assert!(r.is_empty(), "{:?}", errors(&r));
+
+        let st = ns1.nft.borrow();
+        let mut pre = packet(IPPROTO_TCP, &pre_ip, 8080, &addr_type);
+        pre.hook = HOOK_PRE_ROUTING;
+        assert_eq!(st.nat(&pre), Outcome::Dnat(post_ip.to_vec(), Some(80)));
+
+        let mut post = packet(IPPROTO_TCP, &post_ip, 80, &addr_type);
+        post.hook = HOOK_PRE_ROUTING;
+        post.original_dst = &pre_ip;
+        // Post-DNAT chain at 0 must NOT match pre-DNAT port 8080 (so not Drop), and MUST match
+        // mark 0x42 + post-DNAT 10.81.0.3:80 (Reject ECONNREFUSED).
+        assert_eq!(
+            st.filter_prerouting(&pre, &post, true),
+            (Outcome::Reject(Errno::ECONNREFUSED.0), 0x42)
+        );
+
+        // 2. Boundary around NF_IP_PRI_NAT_DST (-100): -101 sees pre-DNAT (8080) while -100 sees
+        //    post-DNAT (80), matching Linux regardless of the nat chain's declared priority.
+        let ns2 = ns();
+        let mut pre_drop_80 = dport(80).to_vec();
+        pre_drop_80.push(verdict_expr(NF_DROP));
+        let mut pre_mark_8080 = dport(8080).to_vec();
+        pre_mark_8080.extend(set_mark(7));
+        let mut at_m100_drop_80 = match_mark(7).to_vec();
+        at_m100_drop_80.extend(dport(80));
+        at_m100_drop_80.push(verdict_expr(NF_DROP));
+        let r = handle(
+            &ns2,
+            &root,
+            &batch(&[
+                table_msg(2, b"t"),
+                chain_msg(
+                    2,
+                    b"t",
+                    b"f_m101",
+                    Some((HOOK_PRE_ROUTING, -101, b"filter")),
+                ),
+                chain_msg(
+                    2,
+                    b"t",
+                    b"f_m100",
+                    Some((HOOK_PRE_ROUTING, -100, b"filter")),
+                ),
+                chain_msg(2, b"t", b"n50", Some((HOOK_PRE_ROUTING, 50, b"nat"))),
+                rule_msg(2, b"t", b"f_m101", &pre_drop_80),
+                rule_msg(2, b"t", b"f_m101", &pre_mark_8080),
+                rule_msg(2, b"t", b"f_m100", &at_m100_drop_80),
+                rule_msg(2, b"t", b"n50", &nat_rule),
+            ]),
+            &peer(),
+        );
+        assert!(r.is_empty(), "{:?}", errors(&r));
+        let st2 = ns2.nft.borrow();
+        assert_eq!(st2.nat(&pre), Outcome::Dnat(post_ip.to_vec(), Some(80)));
+        // f_m101 (-101 < -100) sees 8080 (does not drop on 80, sets mark 7), then f_m100 (-100)
+        // sees mark 7 + post-DNAT port 80 and drops.
+        assert_eq!(st2.filter_prerouting(&pre, &post, true), (Outcome::Drop, 7));
+        // Without DNAT (dnated == false), f_m101 sees post (port 80) and drops immediately before
+        // setting mark 7.
+        assert_eq!(
+            st2.filter_prerouting(&pre, &post, false),
+            (Outcome::Drop, 0)
+        );
     }
 }

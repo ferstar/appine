@@ -634,12 +634,15 @@ pub(super) fn process_vm(
     write: bool,
 ) -> SysResult {
     const IOV_MAX: u64 = 1024;
-    if flags != 0 || local_count > IOV_MAX || remote_count > IOV_MAX {
+    if flags != 0 || local_count > IOV_MAX {
         return Err(Errno::EINVAL);
     }
     let local = iovecs(cx, local, local_count)?;
     if local.iter().all(|&(_, len)| len == 0) {
         return Ok(0);
+    }
+    if remote_count > IOV_MAX {
+        return Err(Errno::EINVAL);
     }
     let remote = iovecs(cx, remote, remote_count)?;
     if remote.iter().all(|&(_, len)| len == 0) {
@@ -713,6 +716,9 @@ pub(super) fn process_vm(
 
 /// Reads `count` iovecs.
 fn iovecs(cx: &Cx<'_>, addr: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let mut b = vec![0u8; count as usize * 16];
     cx.mm().read(UserSlice::new(addr, b.len()), &mut b)?;
     let mut total = 0u64;

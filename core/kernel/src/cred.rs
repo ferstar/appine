@@ -353,12 +353,18 @@ impl Cred {
         old
     }
 
-    /// setgroups(2): allowed only when the user namespace's gid_map has been written and
-    /// setgroups is not denied (`userns_may_setgroups`).
-    pub fn setgroups(&mut self, mut groups: Vec<u32>) -> Result<(), Errno> {
+    /// Whether `setgroups(2)` is permitted (Linux's `may_setgroups`): requires `CAP_SETGID` in our
+    /// own user namespace, a written `gid_map`, and `/proc/<pid>/setgroups` not set to `"deny"`.
+    pub fn may_setgroups(&self) -> bool {
         let ns = &self.user_ns;
-        let allowed = ns.setgroups.get() && !ns.gid_map.borrow().extents().is_empty();
-        if !self.capable_here(cap::SETGID) || !allowed {
+        self.capable_here(cap::SETGID)
+            && ns.setgroups.get()
+            && !ns.gid_map.borrow().extents().is_empty()
+    }
+
+    /// setgroups(2): allowed only when [`Self::may_setgroups`] holds.
+    pub fn setgroups(&mut self, mut groups: Vec<u32>) -> Result<(), Errno> {
+        if !self.may_setgroups() {
             return Err(Errno::EPERM);
         }
         groups.sort_unstable();
@@ -1627,5 +1633,30 @@ mod tests {
             .capset(u64::MAX, u64::MAX, u64::MAX & !last_bit)
             .unwrap();
         assert_eq!(bounded.cap_inheritable, CAP_FULL & !last_bit);
+    }
+
+    #[test]
+    fn may_setgroups_checks_capability_and_userns_state() {
+        let root = Cred::root();
+        assert!(root.may_setgroups());
+
+        // Without CAP_SETGID, may_setgroups is false even in init_user_ns
+        let mut no_cap = root.clone();
+        no_cap.cap_effective &= !(1 << cap::SETGID);
+        assert!(!no_cap.may_setgroups());
+
+        // Child userns before gid_map is written: not allowed
+        let child_ns = UserNs::child(&root.user_ns, 0, true);
+        let mut in_child = root.clone();
+        in_child.enter_user_ns(child_ns.clone());
+        assert!(!in_child.may_setgroups());
+
+        // After writing gid_map with setgroups allowed: allowed
+        *child_ns.gid_map.borrow_mut() = IdMap(vec![(0, 0, 1)]);
+        assert!(in_child.may_setgroups());
+
+        // After denying setgroups: disallowed again
+        child_ns.setgroups.set(false);
+        assert!(!in_child.may_setgroups());
     }
 }

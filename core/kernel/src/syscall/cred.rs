@@ -98,13 +98,23 @@ pub(super) fn getgroups(cx: &mut Cx<'_>, size: i32, list: u64) -> SysResult {
 }
 
 pub(super) fn setgroups(cx: &mut Cx<'_>, size: i32, list: u64) -> SysResult {
+    // Linux's sys_setgroups checks may_setgroups() (EPERM) before gidsetsize (EINVAL),
+    // copying the full list from user space (EFAULT), and mapping each gid (EINVAL).
+    if !cx.cred().may_setgroups() {
+        return Err(Errno::EPERM);
+    }
     let size = usize::try_from(size)
         .ok()
         .filter(|&n| n <= NGROUPS_MAX)
         .ok_or(Errno::EINVAL)?;
+    let mut raw = vec![0u8; size * 4];
+    if !raw.is_empty() {
+        cx.mm()
+            .read(crate::uaccess::UserSlice::new(list, raw.len()), &mut raw)?;
+    }
     let mut groups = Vec::with_capacity(size);
-    for i in 0..size {
-        let gid = u32::from_le_bytes(get(cx, list + 4 * i as u64)?);
+    for chunk in raw.chunks_exact(4) {
+        let gid = u32::from_le_bytes(chunk.try_into().unwrap());
         groups.push(gid_arg(cx, gid as u64)?.ok_or(Errno::EINVAL)?);
     }
     update(cx, |c| c.setgroups(groups)).map(|()| 0)

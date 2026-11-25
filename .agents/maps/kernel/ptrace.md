@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/signal full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `PEEK*`/`POKE*` and `process_vm_readv`/`writev` fill cold FUSE pages locally, re-validating tracee state after BKL release)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `process_vm_readv`/`writev` validates local iovecs and returns 0 on zero local bytes before checking remote iovec count or pointers, matching Linux 6.1)
 
 ## Responsibilities
 
@@ -87,8 +87,9 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
   tracer becomes the parent first, the pending exit is taken once through the ordinary child wait. When the tracer
   process exits, tracees are killed with `EXITKILL`, otherwise detached; detaching a tracee in a
   stopped group returns it to the group stop silently without dequeuing attach-time `SIGSTOP` or
-  re-notifying the parent. `process_vm_readv`/`writev` with zero local or zero remote bytes return
-  0 before PID lookup and access checks.
+  re-notifying the parent. `process_vm_readv`/`writev` check `flags` and `liovcnt`, copy/sum local
+  iovecs and return 0 on zero local bytes before checking `riovcnt` (`> 1024`) or reading remote
+  iovecs (also returning 0 on zero remote bytes before PID lookup and access checks).
 
 ## Dependencies (inbound / outbound)
 
@@ -121,8 +122,6 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 
 ## Confirmed bugs / technical debt
 
-- `process_vm_readv/writev` check both iovec counts before summing local lengths. With zero local
-  bytes and more than 1024 remote iovecs, Appine returns `EINVAL` where Linux returns 0.
 - `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
 
 ## Open questions
