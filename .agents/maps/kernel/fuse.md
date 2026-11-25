@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cache sweep high-water mark backoff and prompt forgetting of unlinked nodes)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: per-directory mutation serialization with deadlock-free cross-directory rename locking, fstat FUSE_GETATTR_FH, and FUSE directory lseek)
 
 ## Responsibilities
 
@@ -40,8 +40,9 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   `max_write`, `max_read`), `no` (operations the daemon answered ENOSYS to), the number of attached
   device files, the next `unique` (even, from 2), the queues `pending` and `interrupts` plus
   `requests` by unique, the `forgets` to send with Linux's `forget_batch`, `opens`, the open
-  handles of each node id, and `doomed`, the node ids marked for prompt forgetting (either kept at
-  `drop_caches` only for a release in flight, or whose last link was removed through the mount).
+  handles of each node id, `doomed`, the node ids marked for prompt forgetting (either kept at
+  `drop_caches` only for a release in flight, or whose last link was removed through the mount),
+  and `rename_busy`, which serializes cross-directory directory moves on the instance.
 - `Req` — the whole message, its state (`Pending` until read, `Sent` until answered, `Done` with
   the reply or error), whether nobody waits for it (`background`: INIT, RELEASE) and whether its
   caller was interrupted.
@@ -58,10 +59,14 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   parent is itself), the last attributes (`Attr`, owners as kernel IDs) with their validity and
   the syscall that fetched them, the directory's cached names (node, or None for a missing name,
   with validity and syscall), a symlink target read in this syscall, `nlookup` (entries the daemon
-  returned for it) and `seen` (the clock when last entered). It holds a weak reference to live mapped pages
-  and pins a writable mapping if teardown writeback needs a retry.
+  returned for it) and `seen` (the clock when last entered). It also holds `io_busy` (serializing
+  fills, writeback, writes and size changes), `dir_busy`/`dir_waiters` (serializing
+  directory-modifying operations and keeping waited directories pinned against eviction), a weak
+  reference to live mapped pages, and a pinned writable mapping if teardown writeback needs a
+  retry.
 - `Entry` — a `fuse_entry_out`: node id (0 for a missing name), attributes, both validities.
-- `Query` — what a walk lacked: `Lookup`, `Getattr`, `Readlink`, `Program`.
+- `Query` — what a walk lacked: `Lookup`, `Getattr` (with optional open file handle), `Readlink`,
+  `Program`.
 - `Handle` (`FileKind::Fuse`, or a FUSE `Directory`'s `fuse`) — Linux's `fuse_file`: connection,
   node, node id, the daemon's file handle, the `FOPEN_*` flags, the open flags sent,
   directory or not, and `no_release` when no open was made. Every handle is counted in its
@@ -82,14 +87,14 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 - Cache and retries: `Fuses` (`add`, `remove`, `root_of`, `conn`, `conn_of`, `get`, `node`,
   `cached_child`, `enter`, `enter_negative`, `forget_child`, `moved`, `is_within`, `set_attr`,
   `stale`, `link`, `set_link`, `evict`, `unlinked`), `token`, `new_syscall`, `need`, `serve`, `program`,
-  `lookup`, `getattr`, `cached_attr`, `target`, `key`, `id_of`, `drop_caches`.
+  `lookup`, `getattr`, `cached_attr`, `cached_attr_fh`, `target`, `key`, `id_of`, `drop_caches`.
 - Request helpers: `open`, `read`, `write`, `readdir`, `statfs`, `access`, `getxattr`,
   `lock_owner`, `snapshot`.
-- File syscalls (`syscall::fuse`): `open`, `create`, `make`, `remove`, `rename`, `rename_at`,
+- File syscalls (`syscall::fuse`): `open`, `create`, `make`, `remove`, `rename_at`,
   `setattr`, `read`, `write`, `lseek`, `fill_dir`, `fsync`, `fallocate`, `flush`, `flush_all`,
-  `flush_at_exit`, `stat`, `statfs`, `access`, `may_chdir`, `xattr_permission`, `set_xattr`,
-  `parent`, `mkdir`, `mknod`, `symlink`, `link`, `unlink`, `truncate`, `ftruncate`, `file_io`,
-  `io_of`, `map_fill`, `fill`, `prefault`, `sweep`, `dev_ioctl`, `seekable`,
+  `flush_at_exit`, `stat`, `stat_fh`, `statfs`, `access`, `may_chdir`, `xattr_permission`,
+  `set_xattr`, `parent`, `mkdir`, `mknod`, `symlink`, `link`, `unlink`, `truncate`, `ftruncate`,
+  `file_io`, `io_of`, `map_fill`, `fill`, `prefault`, `sweep`, `dev_ioctl`, `seekable`,
   `checks_permissions`.
 - VFS hooks this module relies on: `Vfs::new_fuse`, `add_fuse_mount`, `fuse`/`fuse_mut`,
   `fuse_child`, `fuse_permission`, `type_of`, `mount_nodes`.
@@ -212,8 +217,9 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   dispatcher calls `sweep` at the end of a syscall. It keeps what `in_use` finds (every task's root
   and cwd, the node of every open file in every fd table, O_PATH ones included, every running
   program's key, every mount's root and point attached or detached, every inotify watch), each
-  connection's roots, nodes with an open handle or live O_PATH description, and nodes a request in
-  flight refers to (its node, a rename's other directory, or a link's file). It keeps their ancestor
+  connection's roots, nodes with an open handle, live O_PATH description, or active/waited lock
+  (`io_busy`, `dir_busy`, `dir_waiters`), and nodes a request in flight refers to (its node, a
+  rename's other directory, or a link's file). It keeps their ancestor
   directories and retries if it finds a borrow. `evict` first forgets unused `doomed` nodes (and any
   unused cached descendants of a doomed directory) leaves-first without waiting for 16384 nodes,
   then runs bulk LRU eviction only on `drop_caches` (all unused nodes) or while the cache still
@@ -242,7 +248,11 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 - access(2), chdir, fchdir and chroot: the mount's check, then the cached attributes with
   `default_permissions`, otherwise the daemon's answer to `FUSE_ACCESS` (a daemon without it
   allows).
-- stat is EACCES for a process the mount does not allow; statfs gives it only the magic.
+- stat is EACCES for a process the mount does not allow; statfs gives it only the magic. `fstat`,
+  `AT_EMPTY_PATH` stats (`newfstatat`/`statx`), `/proc/<pid>/fd` stats, `copy_file_range`, `mmap`,
+  and fd-based `setattr` attribute fetches on an open FUSE regular file (with `!no_release`) pass
+  its open file handle (`FUSE_GETATTR_FH`) when refreshing stale attributes (directories and
+  `O_PATH` descriptors do not).
 
 ### Opening and creating
 
@@ -288,10 +298,21 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 
 - getdents64 lists through `FUSE_READDIR` a page at a time on the first call and after a seek to
   0, keeping the daemon's own `.` and `..`; an empty name, one over 1024 bytes or with `/` is EIO.
-  Seeking takes only `SEEK_SET` and `SEEK_CUR`.
+  Directory `lseek` follows 6.1's `generic_file_llseek` on `fuse_dir_operations`: `SEEK_SET`,
+  `SEEK_CUR`, `SEEK_END` and `SEEK_DATA`/`SEEK_HOLE` counted from the directory inode's size
+  (fetching stale attributes via `FUSE_GETATTR` without `FUSE_GETATTR_FH`, never `FUSE_LSEEK`),
+  resetting cached entries on a seek to 0; `FOPEN_NONSEEKABLE` and `FOPEN_STREAM` directories
+  return `ESPIPE`.
 
 ### Namespace changes
 
+- Directory-modifying operations (`create` including its `MKNOD` fallback, `mkdir`, `mknod`,
+  `symlink`, `link`, `unlink`, `rmdir`, `rename`) serialize per directory under `Node::dir_busy`
+  (Linux's directory `i_rwsem`), sleeping on `wake::LOCK` (killable, RAII-released on error, abort
+  or kill, with `dir_waiters` preventing eviction while waiting). Operations in different
+  directories run concurrently. Cross-directory `rename` locks both directories in canonical
+  `FuseId` order (`lo < hi`) to prevent deadlock; cross-directory directory moves also acquire
+  `Conn::rename_busy` first and re-check `is_within` under the locks to prevent cycles.
 - mkdir, mknod (devices need `CAP_MKNOD` and the cgroup device BPF filter unless character 0:0
   whiteout), symlink: `.`, `..` or an existing name
   EEXIST, then EROFS, then the directory's permission; the reply's type must be the one asked
@@ -442,14 +463,9 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   in a FUSE directory is EXDEV (Linux makes the socket with `FUSE_MKNOD`).
 - **Programs:** set-id bits and file capabilities of FUSE programs never apply (even on a mount
   without nosuid), `/proc/<pid>/exe` is followed by path, and maps show the node's key as inode.
-- **Directory changes run concurrently:** creations, removals and renames in one directory reach
-  the daemon in parallel where Linux serializes them under the directory's lock; only the
-  create-after-create race is handled (EEXIST without `O_EXCL` opens the file).
 - **Retries cost:** an uncached path of n components takes n retries, each walking again from the
   start; any error but ENOENT of a lookup ends the syscall even where the walk would tolerate it.
-- **Small fidelity gaps:** fstat asks `FUSE_GETATTR` without the open file's handle; seeking a
-  FUSE directory to its end is EINVAL; spliced replies have their header length replaced
-  (`kernel/pipe`).
+- **Small fidelity gaps:** spliced replies have their header length replaced (`kernel/pipe`).
 
 ## Open questions
 

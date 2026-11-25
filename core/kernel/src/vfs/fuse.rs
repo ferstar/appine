@@ -489,6 +489,9 @@ pub(crate) struct Conn {
     /// `rename`). Each is forgotten in the first sweep once nothing keeps it ([`Fuses::evict`]),
     /// without waiting for [`NODES_MAX`].
     doomed: HashSet<u64>,
+    /// Serializes cross-directory directory renames on this instance (Linux's
+    /// `s_vfs_rename_mutex`), preventing concurrent moves from forming a directory cycle.
+    pub rename_busy: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,6 +587,7 @@ impl Conn {
             forget_batch: 16,
             opens: HashMap::new(),
             doomed: HashSet::new(),
+            rename_busy: false,
         }
     }
 
@@ -690,6 +694,7 @@ impl Conn {
             true
         });
         wake_connection(wake::of_value(self));
+        crate::kernel::request_wake_locks();
     }
 
     /// The next forget message for a read of `len` bytes (6.1's `fuse_read_forget`): one
@@ -1460,6 +1465,10 @@ pub(crate) struct Node {
     link: Option<(Vec<u8>, u64)>,
     /// Serializes page fills, writeback and mutations, including append offset selection.
     pub io_busy: bool,
+    /// Serializes directory-modifying operations (Linux's directory `i_rwsem`).
+    pub dir_busy: bool,
+    /// Threads waiting to acquire [`Node::dir_busy`]; keeps the node alive in [`Fuses::evict`].
+    pub dir_waiters: u32,
     pub pages: Weak<FillPages>,
     /// A last unmap or exit could not write back. Keep dirty data for a later sync on
     /// this inode, or until the connection is torn down.
@@ -1493,6 +1502,11 @@ impl Node {
     /// The attributes when still valid, or fetched by this syscall.
     pub fn fresh_attr(&self) -> Option<&Attr> {
         fresh(self.attr_until, self.attr_token).then_some(&self.attr)
+    }
+
+    /// Whether any I/O or directory lock (or waiter) pins this node.
+    fn is_locked(&self) -> bool {
+        self.io_busy || self.dir_busy || self.dir_waiters != 0
     }
 }
 
@@ -1530,6 +1544,8 @@ impl Fuses {
                 children: HashMap::new(),
                 link: None,
                 io_busy: false,
+                dir_busy: false,
+                dir_waiters: 0,
                 pages: Weak::new(),
                 retry_writeback: None,
                 nlookup: 0,
@@ -1560,9 +1576,13 @@ impl Fuses {
                 wake_connection(readers(&conn));
             }
         }
+        let wake_locks = self.nodes.values().any(|n| n.dev == dev && n.is_locked());
         self.nodes.retain(|_, n| n.dev != dev);
         self.by_nodeid.retain(|&(d, _), _| d != dev);
         self.sweep_at = self.sweep_at.min(Self::next_sweep_at(self.nodes.len()));
+        if wake_locks {
+            crate::kernel::request_wake_locks();
+        }
     }
 
     /// The device numbers of every instance.
@@ -1659,6 +1679,8 @@ impl Fuses {
                         children: HashMap::new(),
                         link: None,
                         io_busy: false,
+                        dir_busy: false,
+                        dir_waiters: 0,
                         pages: Weak::new(),
                         retry_writeback: None,
                         nlookup: 1,
@@ -1749,11 +1771,13 @@ impl Fuses {
                     continue;
                 }
                 let open = n.path_pin.strong_count() != 0 || c.opens.contains_key(&n.nodeid);
-                if n.nodeid == ROOT_ID || open || busy.contains(&n.nodeid) {
+                let locked = n.is_locked();
+                if n.nodeid == ROOT_ID || open || locked || busy.contains(&n.nodeid) {
                     kept.insert(id);
                     if all
                         && n.nodeid != ROOT_ID
                         && !open
+                        && !locked
                         && only.contains(&n.nodeid)
                         && !keep.contains(&id)
                     {
@@ -2066,7 +2090,7 @@ pub(crate) fn attr_out(reply: &[u8], ns: &UserNs) -> Result<(Attr, Option<Instan
 #[derive(Debug, Clone)]
 pub(crate) enum Query {
     Lookup(FuseId, Vec<u8>),
-    Getattr(FuseId),
+    Getattr(FuseId, Option<u64>),
     Readlink(FuseId),
     /// A program to execute, read whole ([`program`]).
     Program(FuseId),
@@ -2136,12 +2160,12 @@ pub(crate) fn serve(
             Ok(_) | Err(Errno::ENOENT) => Ok(()),
             Err(e) => Err(e),
         },
-        Query::Getattr(id) => getattr(cx, &vfs, id, None, false).map(|_| ()),
+        Query::Getattr(id, fh) => getattr(cx, &vfs, id, fh, false).map(|_| ()),
         Query::Program(id) => {
             use crate::fd::oflags;
             let h = open(cx, &vfs, id, oflags::O_RDONLY | oflags::O_LARGEFILE, false)?;
             program_opened(cx.kr(), id);
-            let size = getattr(cx, &vfs, id, Some(h.fh), false)?.size;
+            let size = getattr(cx, &vfs, id, h.fh(), false)?.size;
             let copy = snapshot(cx, (&h.conn, h.nodeid, h.fh, h.flags), 0, size)?;
             drop(h);
             PROGRAMS.with_borrow_mut(|p| p.push((id, copy)));
@@ -2231,11 +2255,16 @@ pub(crate) fn getattr(
 
 /// Node `id`'s attributes from the cache, or a retry to fetch them ([`need`]).
 pub(crate) fn cached_attr(vfs: &super::Vfs, id: FuseId) -> Result<Attr, Errno> {
+    cached_attr_fh(vfs, id, None)
+}
+
+/// [`cached_attr`], passing open file handle `fh` (`FUSE_GETATTR_FH`) if a retry fetches them.
+pub(crate) fn cached_attr_fh(vfs: &super::Vfs, id: FuseId, fh: Option<u64>) -> Result<Attr, Errno> {
     let f = vfs.fuse();
     let n = f.get(id).ok_or(Errno::ENOTCONN)?;
     match n.fresh_attr() {
         Some(a) => Ok(*a),
-        None => Err(need(Query::Getattr(id))),
+        None => Err(need(Query::Getattr(id, fh))),
     }
 }
 
@@ -2259,6 +2288,11 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
+    /// The daemon file handle when an open request actually succeeded (`!no_release`).
+    pub(crate) fn fh(&self) -> Option<u64> {
+        (!self.no_release).then_some(self.fh)
+    }
+
     /// OPEN and CREATE use the same cache policy. An atomic truncate resizes the backing
     /// in the caller, even for a handle that otherwise keeps the cache.
     pub(crate) fn finish_open(self, cx: &Cx<'_>, vfs: &super::Vfs) -> Self {
@@ -2658,7 +2692,7 @@ pub(crate) fn snapshot(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn conn(opts: Options) -> Conn {
@@ -2989,7 +3023,7 @@ mod tests {
         assert!(f.get(b).is_some());
     }
 
-    static SWEEP_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static SWEEP_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn live_working_set_above_nodes_max_backs_off_and_recovers() {

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `fadvise64` rejects `O_PATH` descriptors with `EBADF`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: FUSE directory `lseek` delegates to `kernel/fuse` using directory inode size and `ESPIPE` for non-seekable/stream handles)
 
 ## Responsibilities
 
@@ -105,9 +105,11 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - `SEEK_DATA` and `SEEK_HOLE` query host extents and include tmpfs pages instantiated by mapped
   access. Recorded fallocate reservations start as holes. Offsets outside the file
   give `ENXIO`. A host without sparse seeks assumes data up to EOF. lseek on a directory takes `SEEK_SET` and `SEEK_CUR`
-  everywhere; `SEEK_END`, `SEEK_DATA` and `SEEK_HOLE` count from the end as the filesystem's
-  `llseek` does: store directories end at the largest position (ext4's hashed directories),
-  procfs, sysfs and cgroup2 at 0, every other filesystem refuses them (`EINVAL`).
+  everywhere (except `FOPEN_NONSEEKABLE`/`FOPEN_STREAM` FUSE directories, which return `ESPIPE`);
+  `SEEK_END`, `SEEK_DATA` and `SEEK_HOLE` count from the end as the filesystem's `llseek` does:
+  store directories end at the largest position (ext4's hashed directories), procfs, sysfs and
+  cgroup2 at 0, FUSE directories at the directory inode's size (via `kernel/fuse`, refreshing
+  stale attributes with `FUSE_GETATTR`), and every other filesystem refuses them (`EINVAL`).
 - readv and writev follow Linux's `read_iter`/`write_iter` split: pipes, terminals and sockets
   (and eventfd reads) do one read or write over all iovecs (one read of up to 64 KiB scattered in
   order; writes in 64 KiB pieces across iovecs until one is short; sockets through `kernel/net`),

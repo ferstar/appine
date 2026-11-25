@@ -32,6 +32,7 @@ pub(super) struct Io {
     fh: u64,
     flags: u32,
     stream: bool,
+    no_release: bool,
 }
 
 impl Io {
@@ -44,11 +45,17 @@ impl Io {
             fh: h.fh,
             flags: h.flags,
             stream: h.open_flags & fuse::fopen::STREAM != 0,
+            no_release: h.no_release,
         }
     }
 
     fn handle(&self) -> (&Rc<RefCell<Conn>>, u64, u64, u32) {
         (&self.conn, self.nodeid, self.fh, self.flags)
+    }
+
+    /// The daemon file handle when an open request actually succeeded (`!no_release`).
+    fn fh(&self) -> Option<u64> {
+        (!self.no_release).then_some(self.fh)
     }
 }
 
@@ -135,7 +142,7 @@ pub(super) fn open(
                         size: Some(0),
                         ..SetAttr::default()
                     };
-                    setattr(cx, vfs, id, &set, Some(h.fh))?;
+                    setattr(cx, vfs, id, &set, h.fh())?;
                 }
                 h
             };
@@ -168,69 +175,78 @@ pub(super) fn create(
     }
     vfs.fuse_permission(cred, dir, MAY_WRITE | MAY_EXEC)?;
     let umask = cx.umask();
-    let (conn, nodeid) = fuse::target(vfs, dir)?;
-    let mode = mode::S_IFREG | masked(&conn, perm & 0o7777, umask);
-    if conn.borrow().no & fuse::no::CREATE == 0 {
-        let args = Args::default()
-            .u32(flags & !oflags::O_NOCTTY)
-            .u32(mode)
-            .u32(umask)
-            .u32(0)
-            .name(name);
-        match fuse::call(cx, &conn, op::CREATE, nodeid, &args.0) {
-            Ok(reply) => {
-                let ns = conn.borrow().user_ns().clone();
-                let e = match Entry::parse(&reply, &ns)? {
-                    Ok(e) if e.attr.mode & mode::S_IFMT == mode::S_IFREG => e,
-                    _ => return Err(Errno::EIO),
-                };
-                let mut f = fuse::Fields::new(reply.get(128..).ok_or(Errno::EIO)?);
-                let (fh, open_flags) = (f.u64()?, f.u32()?);
-                let id = {
-                    let mut fuse = vfs.fuse_mut();
-                    fuse.stale(dir);
-                    fuse.enter(dir, name, &e)?
-                };
-                let kept = fuse::handle_flags(&conn.borrow(), flags);
-                let h = Handle {
-                    conn: conn.clone(),
-                    id,
-                    nodeid: e.nodeid,
-                    fh,
-                    open_flags,
-                    flags: kept,
-                    dir: false,
-                    no_release: false,
+    let created = with_dir_lock(cx, vfs, dir, |cx| {
+        let (conn, nodeid) = fuse::target(vfs, dir)?;
+        let mode = mode::S_IFREG | masked(&conn, perm & 0o7777, umask);
+        if conn.borrow().no & fuse::no::CREATE == 0 {
+            let args = Args::default()
+                .u32(flags & !oflags::O_NOCTTY)
+                .u32(mode)
+                .u32(umask)
+                .u32(0)
+                .name(name);
+            match fuse::call(cx, &conn, op::CREATE, nodeid, &args.0) {
+                Ok(reply) => {
+                    let ns = conn.borrow().user_ns().clone();
+                    let e = match Entry::parse(&reply, &ns)? {
+                        Ok(e) if e.attr.mode & mode::S_IFMT == mode::S_IFREG => e,
+                        _ => return Err(Errno::EIO),
+                    };
+                    let mut f = fuse::Fields::new(reply.get(128..).ok_or(Errno::EIO)?);
+                    let (fh, open_flags) = (f.u64()?, f.u32()?);
+                    let id = {
+                        let mut fuse = vfs.fuse_mut();
+                        fuse.stale(dir);
+                        fuse.enter(dir, name, &e)?
+                    };
+                    let kept = fuse::handle_flags(&conn.borrow(), flags);
+                    let h = Handle {
+                        conn: conn.clone(),
+                        id,
+                        nodeid: e.nodeid,
+                        fh,
+                        open_flags,
+                        flags: kept,
+                        dir: false,
+                        no_release: false,
+                    }
+                    .finish_open(cx, vfs);
+                    return Ok((id, Some((h, kept))));
                 }
-                .finish_open(cx, vfs);
-                if kept & oflags::O_TRUNC != 0 && mapped_pages(vfs, id).is_some() {
-                    // CREATE can return an inode already mapped through another name.
-                    with_io(cx, vfs, id, false, |cx| resize_mapping(cx, vfs, id, 0))?;
+                Err(Errno::ENOSYS) => {}
+                // Created meanwhile by another process (Linux holds the directory's lock from the
+                // lookup to the create, so it opens what is there): look it up again and open it
+                Err(Errno::EEXIST) if flags & oflags::O_EXCL == 0 => {
+                    vfs.fuse_mut().forget_child(dir, name);
+                    return Err(fuse::need(fuse::Query::Lookup(dir, name.to_vec())));
                 }
-                return Ok((id, FileKind::Fuse(Box::new(h))));
+                Err(e) => return Err(e),
             }
-            Err(Errno::ENOSYS) => {}
-            // Created meanwhile by another process (Linux holds the directory's lock from the
-            // lookup to the create, so it opens what is there): look it up again and open it
+        }
+        // open_path_with emits IN_CREATE + IN_OPEN for newly created files, so the MKNOD fallback
+        // uses make_node_locked to avoid emitting IN_CREATE twice.
+        let id = match make_node_locked(cx, vfs, dir, name, Make::Node(mode, 0)) {
             Err(Errno::EEXIST) if flags & oflags::O_EXCL == 0 => {
                 vfs.fuse_mut().forget_child(dir, name);
                 return Err(fuse::need(fuse::Query::Lookup(dir, name.to_vec())));
             }
-            Err(e) => return Err(e),
+            r => r?,
+        };
+        Ok((id, None))
+    })?;
+    match created {
+        (id, Some((h, kept))) => {
+            if kept & oflags::O_TRUNC != 0 && mapped_pages(vfs, id).is_some() {
+                // CREATE can return an inode already mapped through another name.
+                with_io(cx, vfs, id, false, |cx| resize_mapping(cx, vfs, id, 0))?;
+            }
+            Ok((id, FileKind::Fuse(Box::new(h))))
+        }
+        (id, None) => {
+            let h = fuse::open(cx, vfs, id, flags & !oflags::O_TRUNC, false)?;
+            Ok((id, FileKind::Fuse(Box::new(h))))
         }
     }
-    // open_path_with emits IN_CREATE + IN_OPEN for newly created files, so the MKNOD fallback
-    // uses make_node to avoid emitting IN_CREATE twice.
-    let made = make_node(cx, vfs, dir, name, Make::Node(mode, 0));
-    let id = match made {
-        Err(Errno::EEXIST) if flags & oflags::O_EXCL == 0 => {
-            vfs.fuse_mut().forget_child(dir, name);
-            return Err(fuse::need(fuse::Query::Lookup(dir, name.to_vec())));
-        }
-        r => r?,
-    };
-    let h = fuse::open(cx, vfs, id, flags & !oflags::O_TRUNC, false)?;
-    Ok((id, FileKind::Fuse(Box::new(h))))
 }
 
 /// Permission bits `perm` of something created by a process with umask `umask`: masked here,
@@ -280,9 +296,22 @@ pub(super) fn make(
 }
 
 /// Creates `name` in FUSE directory `dir` (6.1's `create_new_entry`) without emitting inotify
-/// events: the reply's entry must be of the type asked for (EIO). The new entry is cached, and the
-/// directory's attributes go stale.
+/// events: serializes under `dir`'s lock, checks the reply type (EIO), caches the new entry, and
+/// marks `dir`'s attributes stale.
 fn make_node(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    dir: FuseId,
+    name: &[u8],
+    what: Make<'_>,
+) -> Result<FuseId, Errno> {
+    with_dir_lock(cx, vfs, dir, |cx| {
+        make_node_locked(cx, vfs, dir, name, what)
+    })
+}
+
+/// [`make_node`], with `dir`'s directory lock already held.
+fn make_node_locked(
     cx: &mut Cx<'_>,
     vfs: &Vfs,
     dir: FuseId,
@@ -326,7 +355,8 @@ fn make_node(
 }
 
 /// Removes `name` from FUSE directory `dir` (`FUSE_UNLINK`, or `FUSE_RMDIR` for a directory):
-/// the name leaves the cache, and the directory's and the removed node's attributes go stale.
+/// serialized under `dir`'s lock; the name leaves the cache, and the directory's and the removed
+/// node's attributes go stale.
 pub(super) fn remove(
     cx: &mut Cx<'_>,
     vfs: &Vfs,
@@ -335,16 +365,16 @@ pub(super) fn remove(
     child: FuseId,
     rmdir: bool,
 ) -> Result<(), Errno> {
-    let (conn, nodeid) = fuse::target(vfs, dir)?;
-    let opcode = if rmdir { op::RMDIR } else { op::UNLINK };
-    fuse::call(cx, &conn, opcode, nodeid, &Args::default().name(name).0)?;
-    let last = {
+    let last = with_dir_lock(cx, vfs, dir, |cx| {
+        let (conn, nodeid) = fuse::target(vfs, dir)?;
+        let opcode = if rmdir { op::RMDIR } else { op::UNLINK };
+        fuse::call(cx, &conn, opcode, nodeid, &Args::default().name(name).0)?;
         let mut f = vfs.fuse_mut();
         f.forget_child(dir, name);
         f.stale(dir);
         f.stale(child);
-        f.unlinked(child, rmdir)
-    };
+        Ok(f.unlinked(child, rmdir))
+    })?;
     // As the store's removals report: mark open descriptions unlinked, then report the file's
     // link count, its deletion with its last link, and the directory's entry
     let k = cx.kr();
@@ -364,10 +394,10 @@ pub(super) fn remove(
 }
 
 /// Renames `old` in FUSE directory `from` to `new` in `to` (`FUSE_RENAME`, or `FUSE_RENAME2`
-/// with flags; a daemon without it makes flags EINVAL, as 6.1's `fuse_rename2`): both names leave
-/// the cache, both directories' attributes go stale, and a directory moved keeps its new place
-/// for `..` and getcwd.
-pub(super) fn rename(
+/// with flags; a daemon without it makes flags EINVAL, as 6.1's `fuse_rename2`), with both
+/// directories' locks already held: both names leave the cache, both directories' attributes go
+/// stale, and a directory moved keeps its new place for `..` and getcwd.
+fn rename_locked(
     cx: &mut Cx<'_>,
     vfs: &Vfs,
     (from, old): (FuseId, &[u8]),
@@ -557,7 +587,7 @@ pub(super) fn write(
     // Appends to one node go one at a time from asking for the size to writing there
     let (n, at) = with_io(cx, &vfs, io.id, false, |cx| {
         let at = if append {
-            fuse::getattr(cx, &vfs, io.id, Some(io.fh), false)?.size
+            fuse::getattr(cx, &vfs, io.id, io.fh(), false)?.size
         } else {
             start
         };
@@ -582,6 +612,22 @@ pub(super) fn write(
     Ok(n)
 }
 
+/// Waits on `wake::LOCK` until `try_lock` succeeds, returning `EINTR` when stopping or killed
+/// (unless `forced`). `try_lock` must drop any `RefCell` borrows before returning.
+fn wait_lock(
+    cx: &mut Cx<'_>,
+    forced: bool,
+    mut try_lock: impl FnMut() -> Result<bool, Errno>,
+) -> Result<(), Errno> {
+    while !try_lock()? {
+        if cx.kr().stopping || !forced && cx.task.killed.get() {
+            return Err(Errno::EINTR);
+        }
+        cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
+    }
+    Ok(())
+}
+
 /// Serializes daemon operations that change the page cache. A fill cannot publish an old
 /// reply after a descriptor write or truncate, and overlapping writebacks complete in order.
 fn with_io<T>(
@@ -591,17 +637,11 @@ fn with_io<T>(
     forced: bool,
     run: impl FnOnce(&mut Cx<'_>) -> Result<T, Errno>,
 ) -> Result<T, Errno> {
-    loop {
-        let busy = vfs.fuse().get(id).ok_or(Errno::ENOTCONN)?.io_busy;
-        if !busy {
-            break;
-        }
-        if cx.kr().stopping || !forced && cx.task.killed.get() {
-            return Err(Errno::EINTR);
-        }
-        cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
-    }
-    vfs.fuse_mut().get_mut(id).ok_or(Errno::ENOTCONN)?.io_busy = true;
+    wait_lock(cx, forced, || {
+        let mut f = vfs.fuse_mut();
+        let n = f.get_mut(id).ok_or(Errno::ENOTCONN)?;
+        Ok(!std::mem::replace(&mut n.io_busy, true))
+    })?;
     struct Unlock<'a>(&'a Vfs, FuseId);
     impl Drop for Unlock<'_> {
         fn drop(&mut self) {
@@ -615,6 +655,130 @@ fn with_io<T>(
     run(cx)
 }
 
+/// Pins a FUSE directory against `Fuses::evict` via `Node::dir_waiters` while a thread waits
+/// to acquire its `dir_busy` lock (or `Conn::rename_busy` ahead of it).
+struct DirWaiter<'a>(&'a Vfs, FuseId);
+
+impl<'a> DirWaiter<'a> {
+    fn enter(vfs: &'a Vfs, id: FuseId) -> Result<Self, Errno> {
+        vfs.fuse_mut()
+            .get_mut(id)
+            .ok_or(Errno::ENOTCONN)?
+            .dir_waiters += 1;
+        Ok(Self(vfs, id))
+    }
+}
+
+impl Drop for DirWaiter<'_> {
+    fn drop(&mut self) {
+        if let Some(node) = self.0.fuse_mut().get_mut(self.1) {
+            node.dir_waiters = node.dir_waiters.saturating_sub(1);
+        }
+    }
+}
+
+/// RAII guard holding `Node::dir_busy` on one FUSE directory (Linux's directory `i_rwsem`).
+/// Lock order: `RenameGuard` -> `DirGuard(lo)` -> `DirGuard(hi)`, never held with `io_busy` or
+/// `pos_busy`.
+struct DirGuard<'a>(&'a Vfs, FuseId);
+
+impl<'a> DirGuard<'a> {
+    fn lock(cx: &mut Cx<'_>, vfs: &'a Vfs, id: FuseId) -> Result<Self, Errno> {
+        Self::lock_pinned(cx, DirWaiter::enter(vfs, id)?)
+    }
+
+    /// Acquires `Node::dir_busy` while `waiter` pins the directory, releasing the waiter pin once
+    /// `dir_busy` is held (or on error).
+    fn lock_pinned(cx: &mut Cx<'_>, waiter: DirWaiter<'a>) -> Result<Self, Errno> {
+        let (vfs, id) = (waiter.0, waiter.1);
+        wait_lock(cx, false, || {
+            let mut fuse = vfs.fuse_mut();
+            if fuse.conn_of(id)?.borrow().aborted {
+                return Err(Errno::ENOTCONN);
+            }
+            let node = fuse.get_mut(id).ok_or(Errno::ENOTCONN)?;
+            Ok(!std::mem::replace(&mut node.dir_busy, true))
+        })?;
+        Ok(Self(vfs, id))
+    }
+}
+
+impl Drop for DirGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(node) = self.0.fuse_mut().get_mut(self.1) {
+            node.dir_busy = false;
+        }
+        crate::kernel::request_wake_locks();
+    }
+}
+
+/// RAII guard holding `Conn::rename_busy` for cross-directory directory moves (Linux's
+/// `s_vfs_rename_mutex`), always acquired before any [`DirGuard`].
+struct RenameGuard(Rc<RefCell<Conn>>);
+
+impl RenameGuard {
+    fn lock(cx: &mut Cx<'_>, conn: Rc<RefCell<Conn>>) -> Result<Self, Errno> {
+        wait_lock(cx, false, || {
+            let mut c = conn.borrow_mut();
+            if c.aborted {
+                return Err(Errno::ENOTCONN);
+            }
+            Ok(!std::mem::replace(&mut c.rename_busy, true))
+        })?;
+        Ok(Self(conn))
+    }
+}
+
+impl Drop for RenameGuard {
+    fn drop(&mut self) {
+        if let Ok(mut c) = self.0.try_borrow_mut() {
+            c.rename_busy = false;
+        }
+        crate::kernel::request_wake_locks();
+    }
+}
+
+/// Serializes directory-modifying operations in one FUSE directory under its `dir_busy` lock.
+fn with_dir_lock<T>(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    dir: FuseId,
+    run: impl FnOnce(&mut Cx<'_>) -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    let _dir = DirGuard::lock(cx, vfs, dir)?;
+    run(cx)
+}
+
+/// Serializes a FUSE rename across `from` and `to`: locks one directory when `from == to`,
+/// otherwise pins both, takes `Conn::rename_busy` first for cross-directory directory moves, and
+/// locks `(lo, hi)` in canonical `FuseId` order.
+fn with_dir_locks<T>(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    from: FuseId,
+    to: FuseId,
+    dir_move: bool,
+    run: impl FnOnce(&mut Cx<'_>) -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    if from == to {
+        return with_dir_lock(cx, vfs, from, run);
+    }
+    let (lo, hi) = if from < to { (from, to) } else { (to, from) };
+    // Pin both directories (and their ancestors for `is_within`) before any wait so `Fuses::evict`
+    // cannot evict either while parked on `rename_busy` or `lo`.
+    let wait_lo = DirWaiter::enter(vfs, lo)?;
+    let wait_hi = DirWaiter::enter(vfs, hi)?;
+    let _rename = if dir_move {
+        let conn = vfs.fuse().conn_of(from)?;
+        Some(RenameGuard::lock(cx, conn)?)
+    } else {
+        None
+    };
+    let _lo = DirGuard::lock_pinned(cx, wait_lo)?;
+    let _hi = DirGuard::lock_pinned(cx, wait_hi)?;
+    run(cx)
+}
+
 fn resize_mapping(cx: &Cx<'_>, vfs: &Vfs, id: FuseId, size: u64) -> Result<(), Errno> {
     if let Some(pages) = mapped_pages(vfs, id) {
         if size < pages.size() {
@@ -625,10 +789,11 @@ fn resize_mapping(cx: &Cx<'_>, vfs: &Vfs, id: FuseId, size: u64) -> Result<(), E
     Ok(())
 }
 
-/// lseek on an open FUSE file (6.1's `fuse_file_llseek`): `SEEK_END` from the size the daemon
-/// reports, `SEEK_DATA` and `SEEK_HOLE` through `FUSE_LSEEK` (a daemon without it has data up to
-/// the end); a file opened nonseekable is ESPIPE. Holds `pos_busy` so concurrent FUSE I/O cannot
-/// overwrite the sought position.
+/// lseek on an open FUSE file or directory: regular files follow 6.1's `fuse_file_llseek`
+/// (`SEEK_END` from the daemon's size, `SEEK_DATA`/`SEEK_HOLE` via `FUSE_LSEEK` with a size-based
+/// fallback); directories follow `generic_file_llseek` (inode size via cache or `FUSE_GETATTR`
+/// without `FUSE_GETATTR_FH`, clearing cached entries on seek to 0). `FOPEN_NONSEEKABLE` and
+/// `FOPEN_STREAM` return `ESPIPE`. Holds `pos_busy` against concurrent FUSE I/O.
 pub(super) fn lseek(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -640,12 +805,13 @@ pub(super) fn lseek(
     const SEEK_END: u32 = 2;
     const SEEK_DATA: u32 = 3;
     const SEEK_HOLE: u32 = 4;
-    let (io, seekable) = {
+    let (io, dir, seekable) = {
         let f = file.borrow();
-        let FileKind::Fuse(h) = &f.kind else {
-            return Err(Errno::EBADF);
-        };
-        (Io::of(h), seekable(h))
+        match &f.kind {
+            FileKind::Fuse(h) => (Io::of(h), false, seekable(h)),
+            FileKind::Directory { fuse: Some(h), .. } => (Io::of(h), true, seekable(h)),
+            _ => return Err(Errno::EBADF),
+        }
     };
     if !seekable {
         return Err(Errno::ESPIPE);
@@ -653,15 +819,29 @@ pub(super) fn lseek(
     let _pos = super::fs::PosGuard::lock(cx, file)?;
     let pos = file.borrow().pos;
     let vfs = cx.vfs()?;
+    let size = |cx: &mut Cx<'_>| -> Result<i64, Errno> {
+        let sz = if dir {
+            let cached = vfs
+                .fuse()
+                .get(io.id)
+                .ok_or(Errno::ENOTCONN)?
+                .fresh_attr()
+                .map(|a| a.size);
+            match cached {
+                Some(s) => s,
+                None => fuse::getattr(cx, &vfs, io.id, None, false)?.size,
+            }
+        } else {
+            fuse::getattr(cx, &vfs, io.id, io.fh(), false)?.size
+        };
+        i64::try_from(sz).map_err(|_| Errno::EINVAL)
+    };
     let new = match whence {
         SEEK_SET => offset,
         SEEK_CUR => (pos as i64).checked_add(offset).ok_or(Errno::EINVAL)?,
-        SEEK_END => {
-            let size = fuse::getattr(cx, &vfs, io.id, Some(io.fh), false)?.size as i64;
-            size.checked_add(offset).ok_or(Errno::EINVAL)?
-        }
+        SEEK_END => size(cx)?.checked_add(offset).ok_or(Errno::EINVAL)?,
         SEEK_DATA | SEEK_HOLE => {
-            let found = if io.conn.borrow().no & fuse::no::LSEEK == 0 {
+            let found = if !dir && io.conn.borrow().no & fuse::no::LSEEK == 0 {
                 let args = Args::default()
                     .u64(io.fh)
                     .u64(offset as u64)
@@ -678,11 +858,11 @@ pub(super) fn lseek(
             match found {
                 Some(at) => at,
                 None => {
-                    let size = fuse::getattr(cx, &vfs, io.id, Some(io.fh), false)?.size as i64;
-                    if offset < 0 || offset >= size {
+                    let eof = size(cx)?;
+                    if offset < 0 || offset >= eof {
                         return Err(Errno::ENXIO);
                     }
-                    if whence == SEEK_DATA { offset } else { size }
+                    if whence == SEEK_DATA { offset } else { eof }
                 }
             }
         }
@@ -691,7 +871,14 @@ pub(super) fn lseek(
     if new < 0 {
         return Err(Errno::EINVAL);
     }
-    file.borrow_mut().pos = new as u64;
+    let mut f = file.borrow_mut();
+    if dir
+        && new == 0
+        && let FileKind::Directory { entries, .. } = &mut f.kind
+    {
+        *entries = None;
+    }
+    f.pos = new as u64;
     Ok(new as u64)
 }
 
@@ -846,13 +1033,24 @@ pub(super) fn flush_as(cx: &mut Cx<'_>, file: &FileRef, table: usize) -> Result<
 /// otherwise the cached attributes (fetched again when out of date), with the instance's device
 /// number and the block size the daemon gave.
 pub(super) fn stat(vfs: &Vfs, cred: &Cred, node: &Node) -> Result<[u8; 128], Errno> {
+    stat_fh(vfs, cred, node, None)
+}
+
+/// [`stat`], passing open file handle `fh` (`FUSE_GETATTR_FH`) when fetching stale attributes on
+/// an open FUSE regular file (`fstat`, `fstatat`/`statx` with `AT_EMPTY_PATH`, `/proc/pid/fd`).
+pub(super) fn stat_fh(
+    vfs: &Vfs,
+    cred: &Cred,
+    node: &Node,
+    fh: Option<u64>,
+) -> Result<[u8; 128], Errno> {
     let Node::Fuse(_, id) = node else {
         return Err(Errno::EINVAL);
     };
     if !vfs.fuse().conn_of(*id)?.borrow().allows(cred) {
         return Err(Errno::EACCES);
     }
-    let attr = fuse::cached_attr(vfs, *id)?;
+    let attr = fuse::cached_attr_fh(vfs, *id, fh)?;
     let mut b = encode_stat(&attr.stat(), vfs.dev_of(node));
     if attr.blksize != 0 {
         b[56..60].copy_from_slice(&attr.blksize.to_le_bytes());
@@ -1328,37 +1526,48 @@ pub(super) fn rename_at(
     if vfs.is_point_in(&Node::Fuse(mnt, src), cx.mnt_ns()) {
         return Err(Errno::EBUSY);
     }
-    // A directory cannot move under itself
-    if src_dir && vfs.fuse().is_within(to, src) {
-        return Err(Errno::EINVAL);
-    }
     // What the replaced name was: a directory, or a file whose last link may be gone
     let dst_seen = dst.and_then(|d| {
         let f = vfs.fuse();
-        let n = f.get(d)?;
-        Some((d, n.kind() == mode::S_IFDIR))
+        Some((d, f.get(d)?.kind() == mode::S_IFDIR))
     });
-    rename(
-        cx,
-        &vfs,
-        (from, old),
-        (to, new),
-        src_dir.then_some(src),
-        flags,
-    )?;
-    let dst_seen = dst_seen.map(|(d, dir)| {
-        let mut f = vfs.fuse_mut();
-        f.stale(d);
-        let last = if flags & RENAME_EXCHANGE != 0 {
-            if dir {
-                f.moved(d, from, old);
-            }
-            false
-        } else {
-            f.unlinked(d, dir)
-        };
-        (d, dir, last)
-    });
+    let exchange = flags & RENAME_EXCHANGE != 0;
+    // A directory cannot move under itself (checked now and re-checked under the directory locks)
+    let check_loop = || {
+        let f = vfs.fuse();
+        if src_dir && f.is_within(to, src)
+            || exchange && matches!(dst_seen, Some((d, true)) if f.is_within(from, d))
+        {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    };
+    check_loop()?;
+    let dir_move = src_dir || (exchange && dst_seen.is_some_and(|(_, d)| d));
+    let dst_seen = with_dir_locks(cx, &vfs, from, to, dir_move, |cx| {
+        check_loop()?;
+        rename_locked(
+            cx,
+            &vfs,
+            (from, old),
+            (to, new),
+            src_dir.then_some(src),
+            flags,
+        )?;
+        Ok(dst_seen.map(|(d, dir)| {
+            let mut f = vfs.fuse_mut();
+            f.stale(d);
+            let last = if exchange {
+                if dir {
+                    f.moved(d, from, old);
+                }
+                false
+            } else {
+                f.unlinked(d, dir)
+            };
+            (d, dir, last)
+        }))
+    })?;
     // fsnotify_move: mark any replaced target unlinked, move open files to their new names, then
     // emit the pair of moves with one cookie, the replaced file's events and the moved file's own
     // event
@@ -1437,7 +1646,7 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, io: &Io, len: u64) -> Result<(), Errno>
         size: Some(len),
         ..SetAttr::default()
     };
-    setattr(cx, &vfs, io.id, &set, Some(io.fh))
+    setattr(cx, &vfs, io.id, &set, io.fh())
 }
 
 /// The open FUSE regular file of descriptor `file`.
@@ -1458,11 +1667,11 @@ pub(super) fn map_fill(
     shared: bool,
     refused: bool,
 ) -> Result<Option<Rc<Fill>>, Errno> {
-    let (id, direct) = {
+    let (id, fh, direct) = {
         let f = file.borrow();
         match &f.kind {
             FileKind::Fuse(h) if f.readable() && !refused => {
-                (h.id, h.open_flags & fuse::fopen::DIRECT_IO != 0)
+                (h.id, h.fh(), h.open_flags & fuse::fopen::DIRECT_IO != 0)
             }
             _ => return Ok(None),
         }
@@ -1474,7 +1683,7 @@ pub(super) fn map_fill(
     let pages = if let Some(pages) = mapped_pages(&vfs, id) {
         pages
     } else {
-        let size = fuse::cached_attr(&vfs, id)?.size;
+        let size = fuse::cached_attr_fh(&vfs, id, fh)?.size;
         let host = appine_hal::memfd(c"appine-fuse").map_err(Errno)?;
         host.set_len(size)
             .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
@@ -1504,7 +1713,7 @@ fn refresh_mapping_size(
 ) -> Result<(), Errno> {
     while pages.size_stale.get() {
         let generation = pages.generation.get();
-        let reply = fuse::getattr(cx, vfs, io.id, Some(io.fh), forced);
+        let reply = fuse::getattr(cx, vfs, io.id, io.fh(), forced);
         if generation == pages.generation.get() {
             resize_mapping(cx, vfs, io.id, reply?.size)?;
             pages.size_stale.set(false);
@@ -1815,4 +2024,1040 @@ pub(crate) fn flush_at_exit(cx: &mut Cx<'_>) {
             .collect()
     };
     flush_all(cx, &files);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::fd::{FdTable, OpenFile};
+    use crate::kernel::{Kernel, Shared, Tid};
+    use crate::mm::Mm;
+    use crate::process::{ThreadGroup, Tier};
+    use crate::signal::SigHandlers;
+    use crate::task::{FsContext, Task, TaskState};
+    use crate::vfs::fuse::{Attr, DevFile, Fuses, Options};
+    use crate::vfs::store::{ROOT, Store};
+    use crate::vfs::{INIT_MNT_NS, MntNs};
+
+    /// Thread-safe handle shared across scoped worker and daemon threads.
+    struct Harness {
+        shared: Arc<Shared>,
+        mnt: MountId,
+        root: FuseId,
+        dev_fd: i32,
+        daemon_tid: Tid,
+    }
+
+    struct TestRig {
+        h: Harness,
+        dir: PathBuf,
+        _cpus: Vec<appine_engine::Cpu>,
+    }
+
+    impl Drop for TestRig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn attr_bytes(ino: u64, mode: u32, size: u64, nlink: u32) -> Vec<u8> {
+        let mut a = Args::default().u64(ino).u64(size);
+        for _ in 0..4 {
+            a = a.u64(0);
+        }
+        for _ in 0..3 {
+            a = a.u32(0);
+        }
+        a.u32(mode)
+            .u32(nlink)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(4096)
+            .u32(0)
+            .0
+    }
+
+    fn entry_out(nodeid: u64, mode: u32, size: u64, nlink: u32, valid_secs: u64) -> Vec<u8> {
+        Args::default()
+            .u64(nodeid)
+            .u64(0)
+            .u64(valid_secs)
+            .u64(valid_secs)
+            .u32(0)
+            .u32(0)
+            .bytes(&attr_bytes(nodeid, mode, size, nlink))
+            .0
+    }
+
+    fn attr_out_bytes(ino: u64, mode: u32, size: u64, nlink: u32, valid_secs: u64) -> Vec<u8> {
+        Args::default()
+            .u64(valid_secs)
+            .u32(0)
+            .u32(0)
+            .bytes(&attr_bytes(ino, mode, size, nlink))
+            .0
+    }
+
+    fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> Vec<u8> {
+        Args::default()
+            .u32((16 + body.len()) as u32)
+            .u32((-error) as u32)
+            .u64(unique)
+            .bytes(body)
+            .0
+    }
+
+    fn parse_header(msg: &[u8]) -> (u32, u64, u64) {
+        (
+            u32::from_le_bytes(msg[4..8].try_into().unwrap()),
+            u64::from_le_bytes(msg[8..16].try_into().unwrap()),
+            u64::from_le_bytes(msg[16..24].try_into().unwrap()),
+        )
+    }
+
+    fn task_state(
+        mm: Rc<RefCell<Mm>>,
+        fds: Rc<RefCell<FdTable>>,
+        fs: Rc<RefCell<FsContext>>,
+        group: Rc<RefCell<ThreadGroup>>,
+        vfs: Option<Rc<Vfs>>,
+    ) -> TaskState {
+        TaskState {
+            mm,
+            fds,
+            fs,
+            group,
+            vfs,
+            altstack: Default::default(),
+            clear_child_tid: 0,
+            vfork_done: None,
+            restart: None,
+            fast_sleep: None,
+            sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+        }
+    }
+
+    fn add_task(k: &mut Kernel, tid: Tid, user_ns: &Rc<crate::cred::UserNs>) -> appine_engine::Cpu {
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            tid,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        let mm = Mm::new().into_shared();
+        let fds = Rc::new(RefCell::new(FdTable::new()));
+        let fs = Rc::new(RefCell::new(FsContext {
+            root: Node::ROOT,
+            cwd: Node::ROOT,
+            umask: 0o022,
+            mnt_ns: Rc::new(MntNs {
+                id: INIT_MNT_NS,
+                owner: user_ns.clone(),
+                anon: false,
+            }),
+        }));
+        let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+        let state = task_state(mm, fds, fs, group.clone(), k.vfs.clone());
+        let task = Task::new(tid, tid, &cpu, state, k.init_ns.clone(), 0, [0; 16]).unwrap();
+        task.cred.borrow_mut().user_ns = user_ns.clone();
+        group.borrow_mut().threads.push(tid);
+        k.groups.insert(tid, group);
+        k.tasks.insert(tid, task);
+        cpu
+    }
+
+    impl Harness {
+        fn cx<R>(&self, tid: Tid, f: impl FnOnce(&mut Cx<'_>) -> R) -> R {
+            let mut held: Option<(Rc<Task>, TaskState)> = None;
+            let out = {
+                let k = self.shared.lock();
+                let task = k.tasks[&tid].clone();
+                let r = task.res.borrow();
+                let t = task_state(
+                    r.mm.clone(),
+                    r.fds.clone(),
+                    r.fs.clone(),
+                    k.groups[&tid].clone(),
+                    k.vfs.clone(),
+                );
+                drop(r);
+                let (task, t) = held.insert((task, t));
+                f(&mut Cx::new(&self.shared, k, task, t))
+            };
+            let _k = self.shared.lock();
+            drop(held);
+            out
+        }
+
+        /// Reads the next daemon request, silently skipping forgets and acking releases.
+        fn read_req(&self, nonblock: bool) -> Result<(u32, u64, u64, Vec<u8>), Errno> {
+            loop {
+                let msg = self.cx(self.daemon_tid, |cx| {
+                    let file = cx.fds().get(self.dev_fd).unwrap();
+                    fuse::dev_read(cx, &file, 131072, nonblock)
+                })?;
+                let (opcode, unique, nodeid) = parse_header(&msg);
+                if matches!(opcode, op::FORGET | op::BATCH_FORGET) {
+                    continue;
+                }
+                if matches!(opcode, op::RELEASE | op::RELEASEDIR) {
+                    self.reply_ok(unique, &[]);
+                    continue;
+                }
+                return Ok((opcode, unique, nodeid, msg));
+            }
+        }
+
+        fn reply(&self, unique: u64, error: i32, body: &[u8]) {
+            let raw = fuse_reply(unique, error, body);
+            self.cx(self.daemon_tid, |cx| {
+                let file = cx.fds().get(self.dev_fd).unwrap();
+                let vfs = cx.vfs().unwrap();
+                fuse::dev_write(cx, &vfs, &file, &raw).unwrap();
+            });
+        }
+
+        fn reply_ok(&self, unique: u64, body: &[u8]) {
+            self.reply(unique, 0, body);
+        }
+
+        fn seed_dir(
+            &self,
+            parent: FuseId,
+            name: &[u8],
+            nodeid: u64,
+            size: u64,
+            valid: u64,
+        ) -> FuseId {
+            self.seed(parent, name, nodeid, mode::S_IFDIR | 0o755, size, 2, valid)
+        }
+
+        fn seed_file(
+            &self,
+            parent: FuseId,
+            name: &[u8],
+            nodeid: u64,
+            size: u64,
+            valid: u64,
+        ) -> FuseId {
+            self.seed(parent, name, nodeid, mode::S_IFREG | 0o644, size, 1, valid)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn seed(
+            &self,
+            parent: FuseId,
+            name: &[u8],
+            nodeid: u64,
+            mode: u32,
+            size: u64,
+            nlink: u32,
+            valid_secs: u64,
+        ) -> FuseId {
+            let k = self.shared.lock();
+            let vfs = k.vfs.as_ref().unwrap();
+            let until = (valid_secs > 0).then(|| Instant::now() + Duration::from_secs(valid_secs));
+            let e = Entry {
+                nodeid,
+                attr: Attr {
+                    ino: nodeid,
+                    size,
+                    mode,
+                    nlink,
+                    blksize: 4096,
+                    ..Attr::default()
+                },
+                entry_until: until,
+                attr_until: until,
+            };
+            vfs.fuse_mut().enter(parent, name, &e).unwrap()
+        }
+
+        fn seed_negatives(&self, dir: FuseId, names: &[&[u8]]) {
+            let k = self.shared.lock();
+            let until = Some(Instant::now() + Duration::from_secs(3600));
+            let mut f = k.vfs.as_ref().unwrap().fuse_mut();
+            for name in names {
+                f.enter_negative(dir, name, until);
+            }
+        }
+
+        fn wait_until(&self, msg: &str, mut cond: impl FnMut(&Fuses) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if cond(&self.shared.lock().vfs.as_ref().unwrap().fuse()) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "{msg}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn evict_all(&self) -> usize {
+            self.shared
+                .lock()
+                .vfs
+                .as_ref()
+                .unwrap()
+                .fuse_mut()
+                .evict(&HashSet::new(), true)
+        }
+
+        fn assert_unlocked(&self, dirs: &[FuseId]) {
+            let k = self.shared.lock();
+            let f = k.vfs.as_ref().unwrap().fuse();
+            for &d in dirs {
+                assert!(!f.node(d).dir_busy && f.node(d).dir_waiters == 0);
+            }
+        }
+
+        fn make_handle(
+            &self,
+            id: FuseId,
+            nodeid: u64,
+            fh: u64,
+            dir: bool,
+            no_release: bool,
+            open_flags: u32,
+        ) -> Handle {
+            let conn = self
+                .shared
+                .lock()
+                .vfs
+                .as_ref()
+                .unwrap()
+                .fuse()
+                .conn_of(id)
+                .unwrap();
+            Handle {
+                conn,
+                id,
+                nodeid,
+                fh,
+                open_flags,
+                flags: oflags::O_RDONLY,
+                dir,
+                no_release,
+            }
+        }
+
+        fn install_fd(&self, tid: Tid, file: FileRef) -> i32 {
+            self.shared.lock().tasks[&tid]
+                .res
+                .borrow()
+                .fds
+                .borrow_mut()
+                .install(file, false, 0..64)
+                .unwrap()
+        }
+    }
+
+    fn new_rig(name: &str, worker_tids: &[Tid]) -> TestRig {
+        let dir = std::env::temp_dir().join(format!(
+            "appine-fuse-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        Store::create(&dir)
+            .unwrap()
+            .mkdir(ROOT, b"mnt", 0o755, 0, 0)
+            .unwrap();
+        let shared = Arc::new(Shared::new(Kernel::new(Tier::Interpreter)));
+        let daemon_tid = 100;
+        let (mnt, root, dev_fd, cpus) = {
+            let mut k = shared.lock();
+            let vfs = Rc::new(Vfs::open(&dir).unwrap());
+            k.vfs = Some(vfs.clone());
+            let user_ns = crate::cred::UserNs::init();
+            let mut cpus = vec![add_task(&mut k, daemon_tid, &user_ns)];
+            cpus.extend(worker_tids.iter().map(|&t| add_task(&mut k, t, &user_ns)));
+            let dev = 0x99u64;
+            let opts = Options {
+                rootmode: Some(mode::S_IFDIR | 0o755),
+                user_id: Some(0),
+                group_id: Some(0),
+                allow_other: true,
+                max_read: u32::MAX,
+                ..Options::default()
+            };
+            let cred = k.tasks[&daemon_tid].cred.borrow().clone();
+            let conn = Rc::new(RefCell::new(Conn::new(
+                dev,
+                opts,
+                &cred,
+                crate::pidns::PidNs::init(),
+            )));
+            let root = vfs.fuse_mut().add(conn.clone());
+            let mut devfile = DevFile::new(&cred, 1);
+            devfile.attach(&conn);
+            fuse::send_init(&conn);
+            let mnt_ino = vfs.store().lookup(ROOT, b"mnt").unwrap().unwrap();
+            let mnt = vfs
+                .add_fuse_mount(
+                    (Node::Store(crate::vfs::ROOT_MOUNT, mnt_ino), None),
+                    0,
+                    b"testfuse".to_vec(),
+                    dev,
+                )
+                .unwrap();
+            let dev_fd = k.tasks[&daemon_tid]
+                .res
+                .borrow()
+                .fds
+                .borrow_mut()
+                .install(
+                    OpenFile::new(FileKind::FuseDev(devfile), oflags::O_RDWR),
+                    false,
+                    0..64,
+                )
+                .unwrap();
+            (mnt, root, dev_fd, cpus)
+        };
+        let h = Harness {
+            shared,
+            mnt,
+            root,
+            dev_fd,
+            daemon_tid,
+        };
+        // Complete FUSE_INIT handshake.
+        let (opcode, unique, _, _) = h.read_req(true).unwrap();
+        assert_eq!(opcode, op::INIT);
+        let init_body = Args::default()
+            .u32(7)
+            .u32(37)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(65536)
+            .u32(1)
+            .u32(0)
+            .0;
+        h.reply_ok(unique, &init_body);
+        TestRig {
+            h,
+            dir,
+            _cpus: cpus,
+        }
+    }
+
+    fn run_with_retries<R>(
+        cx: &mut Cx<'_>,
+        mut f: impl FnMut(&mut Cx<'_>) -> Result<R, Errno>,
+    ) -> Result<R, Errno> {
+        fuse::new_syscall();
+        for _ in 0..32 {
+            match f(cx) {
+                Err(Errno::FUSE_RETRY) => fuse::serve(cx, |_, _| {})?,
+                r => return r,
+            }
+        }
+        Err(Errno::EIO)
+    }
+
+    #[test]
+    fn same_directory_mutations_are_serialized_and_other_dirs_stay_parallel() {
+        let _sweep_guard = fuse::tests::SWEEP_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let rig = new_rig("dir-serial", &[10, 11, 12, 13, 14, 15, 16, 17, 18]);
+        let h = &rig.h;
+        let dir1 = h.seed_dir(h.root, b"d1", 2, 4096, 3600);
+        let dir2 = h.seed_dir(h.root, b"d2", 3, 4096, 3600);
+        h.seed_file(dir1, b"c", 4, 0, 3600);
+        h.seed_file(dir1, b"d", 5, 0, 3600);
+        h.seed_dir(dir1, b"rmsub", 6, 4096, 3600);
+        let link_src = h.seed_file(dir2, b"lsrc", 7, 0, 3600);
+        h.seed_negatives(dir1, &[b"a", b"b", b"e", b"mk", b"sl", b"hl"]);
+        h.seed_negatives(dir2, &[b"p"]);
+
+        let observed_parallel = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            // 8 concurrent mutations in dir1 + 1 in dir2 to prove per-directory serialization.
+            let mnt = h.mnt;
+            let threads = [
+                s.spawn(move || h.cx(10, |cx| mkdir(cx, (mnt, dir1), b"a", 0o755))),
+                s.spawn(move || {
+                    h.cx(11, |cx| {
+                        let (vfs, cred) = (cx.vfs()?, cx.cred());
+                        let fl = oflags::O_CREAT | oflags::O_RDWR;
+                        create(cx, &cred, &vfs, (mnt, dir1), b"b", 0o644, fl).map(|_| ())
+                    })
+                }),
+                s.spawn(move || h.cx(12, |cx| unlink(cx, (mnt, dir1), b"c", false, false))),
+                s.spawn(move || {
+                    h.cx(13, |cx| {
+                        rename_at(cx, (mnt, dir1, b"d"), (mnt, dir1, b"e"), 0)
+                    })
+                }),
+                s.spawn(move || {
+                    h.cx(15, |cx| {
+                        mknod(cx, (mnt, dir1), b"mk", mode::S_IFREG | 0o644, 0)
+                    })
+                }),
+                s.spawn(move || h.cx(16, |cx| symlink(cx, (mnt, dir1), b"sl", b"target"))),
+                s.spawn(move || {
+                    h.cx(17, |cx| {
+                        link(cx, &Node::Fuse(mnt, link_src), (mnt, dir1), b"hl")
+                    })
+                }),
+                s.spawn(move || h.cx(18, |cx| unlink(cx, (mnt, dir1), b"rmsub", true, false))),
+                s.spawn(move || h.cx(14, |cx| mkdir(cx, (mnt, dir2), b"p", 0o755))),
+            ];
+
+            let (mut next_node, mut done_dir1, mut done_dir2) = (100u64, 0usize, 0usize);
+            let mut pending1: Option<(u32, u64)> = None;
+            let mut pending2: Option<(u32, u64)> = None;
+            let mut reply_op = |opcode: u32, unique: u64| {
+                let nid = next_node;
+                let body = match opcode {
+                    op::MKDIR => {
+                        next_node += 1;
+                        entry_out(nid, mode::S_IFDIR | 0o755, 4096, 2, 60)
+                    }
+                    op::CREATE => {
+                        next_node += 1;
+                        let mut b = entry_out(nid, mode::S_IFREG | 0o644, 0, 1, 60);
+                        b.extend_from_slice(&Args::default().u64(77).u32(0).u32(0).0);
+                        b
+                    }
+                    op::MKNOD => {
+                        next_node += 1;
+                        entry_out(nid, mode::S_IFREG | 0o644, 0, 1, 60)
+                    }
+                    op::SYMLINK => {
+                        next_node += 1;
+                        entry_out(nid, mode::S_IFLNK | 0o777, 6, 1, 60)
+                    }
+                    op::LINK => entry_out(7, mode::S_IFREG | 0o644, 0, 2, 60),
+                    op::UNLINK | op::RMDIR | op::RENAME => Vec::new(),
+                    other => panic!("unexpected opcode {other}"),
+                };
+                h.reply_ok(unique, &body);
+            };
+            let record =
+                |opcode, unique, nodeid, p1: &mut Option<_>, p2: &mut Option<_>| match nodeid {
+                    2 => {
+                        assert!(
+                            p1.is_none(),
+                            "concurrent mutations reached daemon for dir1! op={opcode}"
+                        );
+                        *p1 = Some((opcode, unique));
+                    }
+                    3 => {
+                        assert!(p2.is_none());
+                        if p1.is_some() {
+                            observed_parallel.store(true, Ordering::Relaxed);
+                        }
+                        *p2 = Some((opcode, unique));
+                    }
+                    _ => panic!("unexpected nodeid {nodeid} for op {opcode}"),
+                };
+
+            while done_dir1 < 8 || done_dir2 < 1 {
+                if pending1.is_none() && pending2.is_none() {
+                    let (op, u, nid, _) = h.read_req(false).unwrap();
+                    record(op, u, nid, &mut pending1, &mut pending2);
+                    continue;
+                }
+                let deadline = Instant::now() + Duration::from_millis(15);
+                while Instant::now() < deadline {
+                    match h.read_req(true) {
+                        Ok((op, u, nid, _)) => record(op, u, nid, &mut pending1, &mut pending2),
+                        Err(Errno::EAGAIN) => std::thread::sleep(Duration::from_millis(2)),
+                        Err(e) => panic!("dev_read failed: {e:?}"),
+                    }
+                }
+                if let Some((op, u)) = pending1.take() {
+                    reply_op(op, u);
+                    done_dir1 += 1;
+                }
+                if let Some((op, u)) = pending2.take() {
+                    reply_op(op, u);
+                    done_dir2 += 1;
+                }
+            }
+            for t in threads {
+                t.join().unwrap().unwrap();
+            }
+        });
+
+        assert!(
+            observed_parallel.load(Ordering::Relaxed),
+            "mutation on dir2 should proceed in parallel with dir1"
+        );
+        h.assert_unlocked(&[dir1, dir2]);
+    }
+
+    #[test]
+    fn cross_directory_renames_serialize_without_deadlock_and_prevent_cycles() {
+        let rig = new_rig("cross-rename", &[20, 21, 22, 23]);
+        let h = &rig.h;
+        let dir_a = h.seed_dir(h.root, b"da", 2, 4096, 3600);
+        let dir_b = h.seed_dir(h.root, b"db", 3, 4096, 3600);
+        assert!(dir_a < dir_b);
+        h.seed_file(dir_a, b"fa", 4, 0, 3600);
+        h.seed_file(dir_b, b"fb", 5, 0, 3600);
+        h.seed_negatives(dir_b, &[b"fa_dst"]);
+        h.seed_negatives(dir_a, &[b"fb_dst"]);
+
+        let mnt = h.mnt;
+
+        // 1. Opposing cross-directory renames serialize without deadlock and survive eviction.
+        std::thread::scope(|s| {
+            let t1 = s.spawn(move || {
+                h.cx(20, |cx| {
+                    rename_at(cx, (mnt, dir_a, b"fa"), (mnt, dir_b, b"fa_dst"), 0)
+                })
+            });
+            let t2 = s.spawn(move || {
+                h.cx(21, |cx| {
+                    rename_at(cx, (mnt, dir_b, b"fb"), (mnt, dir_a, b"fb_dst"), 0)
+                })
+            });
+            for round in 0..2 {
+                let (opcode, unique, _, _) = h.read_req(false).unwrap();
+                assert_eq!(opcode, op::RENAME);
+                if round == 0 {
+                    h.wait_until("opposing rename did not park", |f| {
+                        f.node(dir_a).dir_waiters == 1 && f.node(dir_b).dir_waiters == 1
+                    });
+                    h.evict_all();
+                    let k = h.shared.lock();
+                    let f = k.vfs.as_ref().unwrap().fuse();
+                    assert!(f.get(dir_a).is_some() && f.get(dir_b).is_some());
+                } else {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert_eq!(
+                    h.read_req(true).err(),
+                    Some(Errno::EAGAIN),
+                    "opposing cross-dir renames must not overlap at daemon"
+                );
+                h.reply_ok(unique, &[]);
+            }
+            t1.join().unwrap().unwrap();
+            t2.join().unwrap().unwrap();
+        });
+
+        // 2. Concurrent opposing directory moves: one succeeds, the other sees EINVAL under
+        //    rename_busy without sending a second FUSE_RENAME, and parked waiters pin all dirs.
+        let sub_a = h.seed_dir(dir_a, b"sub_a", 6, 4096, 3600);
+        let sub_b = h.seed_dir(dir_b, b"sub_b", 7, 4096, 3600);
+        h.seed_negatives(sub_b, &[b"sub_a"]);
+        h.seed_negatives(sub_a, &[b"sub_b"]);
+
+        let renames_seen = AtomicUsize::new(0);
+        let (r1, r2) = std::thread::scope(|s| {
+            let t1 = s.spawn(move || {
+                h.cx(22, |cx| {
+                    rename_at(cx, (mnt, dir_a, b"sub_a"), (mnt, sub_b, b"sub_a"), 0)
+                })
+            });
+            let t2 = s.spawn(move || {
+                h.cx(23, |cx| {
+                    rename_at(cx, (mnt, dir_b, b"sub_b"), (mnt, sub_a, b"sub_b"), 0)
+                })
+            });
+            let (opcode, unique, _, _) = h.read_req(false).unwrap();
+            assert_eq!(opcode, op::RENAME);
+            renames_seen.fetch_add(1, Ordering::Relaxed);
+            h.wait_until(
+                "opposing dir-move rename did not park on rename_busy",
+                |f| {
+                    (f.node(dir_a).dir_waiters == 1 && f.node(sub_b).dir_waiters == 1)
+                        || (f.node(dir_b).dir_waiters == 1 && f.node(sub_a).dir_waiters == 1)
+                },
+            );
+            h.evict_all();
+            {
+                let k = h.shared.lock();
+                let f = k.vfs.as_ref().unwrap().fuse();
+                for d in [dir_a, dir_b, sub_a, sub_b] {
+                    assert!(
+                        f.get(d).is_some(),
+                        "directory {d} evicted while rename waiter parked"
+                    );
+                }
+            }
+            assert_eq!(h.read_req(true).err(), Some(Errno::EAGAIN));
+            h.reply_ok(unique, &[]);
+            (t1.join().unwrap(), t2.join().unwrap())
+        });
+
+        assert_eq!(renames_seen.load(Ordering::Relaxed), 1);
+        assert!(
+            matches!(
+                (r1, r2),
+                (Ok(()), Err(Errno::EINVAL)) | (Err(Errno::EINVAL), Ok(()))
+            ),
+            "expected one success and one EINVAL, got ({r1:?}, {r2:?})"
+        );
+        assert!(
+            !h.shared
+                .lock()
+                .vfs
+                .as_ref()
+                .unwrap()
+                .fuse()
+                .conn_of(dir_a)
+                .unwrap()
+                .borrow()
+                .rename_busy
+        );
+        h.assert_unlocked(&[dir_a, dir_b, sub_a, sub_b]);
+    }
+
+    #[test]
+    fn directory_lock_releases_on_error_kill_abort_and_prevents_eviction() {
+        let rig = new_rig("dir-cleanup", &[30, 31, 32]);
+        let h = &rig.h;
+        let dir = h.seed_dir(h.root, b"d", 2, 4096, 3600);
+        h.seed_negatives(dir, &[b"err", b"ok", b"killed", b"ab1", b"ab2"]);
+        let mnt = h.mnt;
+
+        // 1. Daemon error releases the lock, killed waiter returns EINTR, eviction pins dir.
+        std::thread::scope(|s| {
+            let t1 = s.spawn(move || h.cx(30, |cx| mkdir(cx, (mnt, dir), b"err", 0o755)));
+            let (op1, u1, _, _) = h.read_req(false).unwrap();
+            assert_eq!(op1, op::MKDIR);
+
+            let t2 = s.spawn(move || h.cx(31, |cx| mkdir(cx, (mnt, dir), b"ok", 0o755)));
+            let t3 = s.spawn(move || h.cx(32, |cx| mkdir(cx, (mnt, dir), b"killed", 0o755)));
+            h.wait_until("waiters did not park on dir", |f| {
+                f.node(dir).dir_waiters == 2
+            });
+
+            assert_eq!(h.evict_all(), 0);
+            assert!(
+                h.shared
+                    .lock()
+                    .vfs
+                    .as_ref()
+                    .unwrap()
+                    .fuse()
+                    .get(dir)
+                    .is_some()
+            );
+
+            {
+                let k = h.shared.lock();
+                let task3 = &k.tasks[&32];
+                task3.killed.set(true);
+                task3.event.signal();
+            }
+            assert_eq!(t3.join().unwrap(), Err(Errno::EINTR));
+            assert_eq!(
+                h.shared
+                    .lock()
+                    .vfs
+                    .as_ref()
+                    .unwrap()
+                    .fuse()
+                    .node(dir)
+                    .dir_waiters,
+                1
+            );
+
+            h.reply(u1, Errno::EACCES.0, &[]);
+            assert_eq!(t1.join().unwrap(), Err(Errno::EACCES));
+
+            let (op2, u2, _, _) = h.read_req(false).unwrap();
+            assert_eq!(op2, op::MKDIR);
+            h.reply_ok(u2, &entry_out(10, mode::S_IFDIR | 0o755, 4096, 2, 60));
+            t2.join().unwrap().unwrap();
+        });
+
+        // 2. Connection abort wakes holder (ECONNABORTED) and waiter (ENOTCONN).
+        std::thread::scope(|s| {
+            let t1 = s.spawn(move || h.cx(30, |cx| mkdir(cx, (mnt, dir), b"ab1", 0o755)));
+            assert_eq!(h.read_req(false).unwrap().0, op::MKDIR);
+
+            let t2 = s.spawn(move || h.cx(31, |cx| mkdir(cx, (mnt, dir), b"ab2", 0o755)));
+            h.wait_until("waiter did not park on dir", |f| {
+                f.node(dir).dir_waiters == 1
+            });
+
+            {
+                let k = h.shared.lock();
+                let conn = k.vfs.as_ref().unwrap().fuse().conn_of(dir).unwrap();
+                conn.borrow_mut().abort();
+            }
+            assert_eq!(t1.join().unwrap(), Err(Errno::ECONNABORTED));
+            assert_eq!(t2.join().unwrap(), Err(Errno::ENOTCONN));
+        });
+
+        h.assert_unlocked(&[dir]);
+    }
+
+    #[test]
+    fn fstat_and_at_empty_path_send_getattr_fh() {
+        let rig = new_rig("fstat-fh", &[40]);
+        let h = &rig.h;
+        let file_id = h.seed_file(h.root, b"unlinked", 20, 10, 0);
+        let noopen_id = h.seed_file(h.root, b"noopen", 21, 10, 0);
+        let dir_id = h.seed_dir(h.root, b"sub", 22, 4096, 0);
+
+        let expected_fh = 0x1234_5678_9abc_def0u64;
+        let install_reg = |id, nid, fh, no_release| {
+            let f = OpenFile::new(
+                FileKind::Fuse(Box::new(h.make_handle(id, nid, fh, false, no_release, 0))),
+                oflags::O_RDONLY,
+            );
+            f.borrow_mut().mnt = h.mnt;
+            h.install_fd(40, f)
+        };
+        let fd_open = install_reg(file_id, 20, expected_fh, false);
+        let fd_noopen = install_reg(noopen_id, 21, 0, true);
+        let f_opath = OpenFile::new(FileKind::Path(Node::Fuse(h.mnt, file_id)), oflags::O_PATH);
+        f_opath.borrow_mut().mnt = h.mnt;
+        let fd_opath = h.install_fd(40, f_opath);
+        let fd_dir = h.install_fd(
+            40,
+            OpenFile::new(
+                FileKind::Directory {
+                    node: Node::Fuse(h.mnt, dir_id),
+                    entries: None,
+                    process: None,
+                    fuse: Some(Box::new(h.make_handle(dir_id, 22, 0xdead, true, false, 0))),
+                },
+                oflags::O_RDONLY,
+            ),
+        );
+
+        let (empty_path_addr, buf_addr) = {
+            let k = h.shared.lock();
+            let res = k.tasks[&40].res.borrow();
+            let mut mm = res.mm.borrow_mut();
+            let page = mm
+                .mmap(
+                    0,
+                    PAGE_SIZE,
+                    appine_engine::prot::READ | appine_engine::prot::WRITE,
+                    0x22,
+                    None,
+                )
+                .unwrap();
+            mm.write(crate::uaccess::UserSlice::new(page, 1), &[0u8])
+                .unwrap();
+            (page, page + 64)
+        };
+
+        let seen = std::sync::Mutex::new(Vec::<(u64, u32, u64)>::new());
+        std::thread::scope(|s| {
+            let seen_ref = &seen;
+            let daemon = s.spawn(move || {
+                for _ in 0..6 {
+                    let (opcode, unique, nodeid, msg) = h.read_req(false).unwrap();
+                    assert_eq!(opcode, op::GETATTR);
+                    let flags = u32::from_le_bytes(msg[40..44].try_into().unwrap());
+                    let fh = u64::from_le_bytes(msg[48..56].try_into().unwrap());
+                    seen_ref.lock().unwrap().push((nodeid, flags, fh));
+                    let (m, sz) = if nodeid == 22 {
+                        (mode::S_IFDIR | 0o755, 4096)
+                    } else {
+                        (mode::S_IFREG | 0o644, 12345)
+                    };
+                    // attr_valid = 0 so every syscall exercises FUSE_GETATTR afresh.
+                    h.reply_ok(unique, &attr_out_bytes(nodeid, m, sz, 0, 0));
+                }
+            });
+
+            {
+                let k = h.shared.lock();
+                let mut f = k.vfs.as_ref().unwrap().fuse_mut();
+                for id in [file_id, noopen_id, dir_id] {
+                    f.stale(id);
+                }
+            }
+
+            const AT_EMPTY_PATH: u32 = 0x1000;
+            const STATX_BASIC_STATS: u32 = 0x7ff;
+
+            h.cx(40, |cx| {
+                // 1. fstat(fd_open) -> FUSE_GETATTR_FH + expected_fh
+                run_with_retries(cx, |cx| super::super::fs::fstat(cx, fd_open, buf_addr)).unwrap();
+                let mut st = [0u8; 128];
+                cx.mm()
+                    .read(crate::uaccess::UserSlice::new(buf_addr, 128), &mut st)
+                    .unwrap();
+                assert_eq!(u64::from_le_bytes(st[48..56].try_into().unwrap()), 12345);
+
+                // 2. newfstatat(fd_open, "", AT_EMPTY_PATH) -> FUSE_GETATTR_FH + expected_fh
+                run_with_retries(cx, |cx| {
+                    super::super::fs::newfstatat(
+                        cx,
+                        fd_open,
+                        empty_path_addr,
+                        buf_addr,
+                        AT_EMPTY_PATH,
+                    )
+                })
+                .unwrap();
+
+                // 3. statx(fd_open, "", AT_EMPTY_PATH) -> FUSE_GETATTR_FH + expected_fh
+                run_with_retries(cx, |cx| {
+                    super::super::fs::statx(
+                        cx,
+                        fd_open,
+                        empty_path_addr,
+                        AT_EMPTY_PATH,
+                        STATX_BASIC_STATS,
+                        buf_addr,
+                    )
+                })
+                .unwrap();
+                let mut stx = [0u8; 256];
+                cx.mm()
+                    .read(crate::uaccess::UserSlice::new(buf_addr, 256), &mut stx)
+                    .unwrap();
+                assert_eq!(u64::from_le_bytes(stx[40..48].try_into().unwrap()), 12345);
+
+                // 4-6. no_release, O_PATH, and OPENDIR handles must never send FUSE_GETATTR_FH
+                for fd in [fd_noopen, fd_opath, fd_dir] {
+                    run_with_retries(cx, |cx| super::super::fs::fstat(cx, fd, buf_addr)).unwrap();
+                }
+            });
+            daemon.join().unwrap();
+        });
+
+        assert_eq!(
+            seen.into_inner().unwrap(),
+            vec![
+                (20, 1, expected_fh),
+                (20, 1, expected_fh),
+                (20, 1, expected_fh),
+                (21, 0, 0),
+                (20, 0, 0),
+                (22, 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn directory_lseek_matches_linux_61() {
+        const SEEK_SET: u32 = 0;
+        const SEEK_CUR: u32 = 1;
+        const SEEK_END: u32 = 2;
+        const SEEK_DATA: u32 = 3;
+        const SEEK_HOLE: u32 = 4;
+
+        let rig = new_rig("dir-lseek", &[50]);
+        let h = &rig.h;
+        let dir_sized = h.seed_dir(h.root, b"sized", 30, 4096, 0);
+        let dir_zero = h.seed_dir(h.root, b"zero", 31, 0, 3600);
+
+        let open_dir = |id, nodeid, open_flags, with_entries: bool| {
+            let entries = with_entries.then(|| {
+                vec![DirEntry {
+                    name: b".".to_vec(),
+                    ino: nodeid,
+                    mode: mode::S_IFDIR,
+                }]
+            });
+            h.install_fd(
+                50,
+                OpenFile::new(
+                    FileKind::Directory {
+                        node: Node::Fuse(h.mnt, id),
+                        entries,
+                        process: None,
+                        fuse: Some(Box::new(
+                            h.make_handle(id, nodeid, 9, true, false, open_flags),
+                        )),
+                    },
+                    oflags::O_RDONLY,
+                ),
+            )
+        };
+        let fd_sized = open_dir(dir_sized, 30, 0, true);
+        let fd_zero = open_dir(dir_zero, 31, 0, true);
+        let fd_nonseek = open_dir(dir_sized, 30, fuse::fopen::NONSEEKABLE, false);
+        let fd_stream = open_dir(dir_sized, 30, fuse::fopen::STREAM, false);
+
+        let getattrs = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            // Daemon answers one FUSE_GETATTR for dir_sized and verifies no FUSE_GETATTR_FH / LSEEK.
+            let daemon = s.spawn(|| {
+                let (opcode, unique, nodeid, msg) = h.read_req(false).unwrap();
+                assert_eq!(opcode, op::GETATTR);
+                assert_eq!(nodeid, 30);
+                let flags = u32::from_le_bytes(msg[40..44].try_into().unwrap());
+                assert_eq!(flags, 0, "dir GETATTR must not set FUSE_GETATTR_FH");
+                getattrs.fetch_add(1, Ordering::Relaxed);
+                h.reply_ok(
+                    unique,
+                    &attr_out_bytes(30, mode::S_IFDIR | 0o755, 4096, 2, 60),
+                );
+            });
+
+            fuse::new_syscall();
+            h.cx(50, |cx| {
+                let seek = |cx: &mut Cx<'_>, fd, off, w| super::super::fs::lseek(cx, fd, off, w);
+                let has_entries = |cx: &Cx<'_>, fd| {
+                    matches!(
+                        cx.fds().get(fd).unwrap().borrow().kind,
+                        FileKind::Directory {
+                            entries: Some(_),
+                            ..
+                        }
+                    )
+                };
+
+                // SEEK_SET and SEEK_CUR skip GETATTR and preserve entries when != 0.
+                assert_eq!(seek(cx, fd_sized, 5, SEEK_SET), Ok(5));
+                assert_eq!(seek(cx, fd_sized, 3, SEEK_CUR), Ok(8));
+                assert_eq!(seek(cx, fd_sized, -2, SEEK_CUR), Ok(6));
+                assert_eq!(seek(cx, fd_sized, -10, SEEK_CUR), Err(Errno::EINVAL));
+                assert_eq!(cx.fds().get(fd_sized).unwrap().borrow().pos, 6);
+                assert!(has_entries(cx, fd_sized));
+
+                // SEEK_END fetches stale dir_sized size (4096) via FUSE_GETATTR.
+                assert_eq!(seek(cx, fd_sized, 0, SEEK_END), Ok(4096));
+                assert_eq!(seek(cx, fd_sized, -100, SEEK_END), Ok(3996));
+                assert_eq!(seek(cx, fd_sized, 10, SEEK_END), Ok(4106));
+                assert_eq!(seek(cx, fd_sized, -5000, SEEK_END), Err(Errno::EINVAL));
+
+                // SEEK_DATA and SEEK_HOLE use generic_file_llseek against dir size (never FUSE_LSEEK).
+                assert_eq!(seek(cx, fd_sized, 100, SEEK_DATA), Ok(100));
+                assert_eq!(seek(cx, fd_sized, 100, SEEK_HOLE), Ok(4096));
+                assert_eq!(seek(cx, fd_sized, 4096, SEEK_DATA), Err(Errno::ENXIO));
+                assert_eq!(seek(cx, fd_sized, -1, SEEK_DATA), Err(Errno::ENXIO));
+                assert_eq!(seek(cx, fd_sized, 4096, SEEK_HOLE), Err(Errno::ENXIO));
+
+                // Seeking to 0 clears cached entries; negative offset or unknown whence is EINVAL.
+                assert_eq!(seek(cx, fd_sized, 0, SEEK_SET), Ok(0));
+                assert!(!has_entries(cx, fd_sized));
+                assert_eq!(seek(cx, fd_sized, -1, SEEK_SET), Err(Errno::EINVAL));
+                assert_eq!(seek(cx, fd_sized, 0, 99), Err(Errno::EINVAL));
+
+                // Zero-sized directory: cached size (0) without RPC, SEEK_END(0) resets entries.
+                assert_eq!(seek(cx, fd_zero, 2, SEEK_SET), Ok(2));
+                assert_eq!(seek(cx, fd_zero, 0, SEEK_END), Ok(0));
+                assert!(!has_entries(cx, fd_zero));
+                assert_eq!(seek(cx, fd_zero, -1, SEEK_END), Err(Errno::EINVAL));
+                assert_eq!(seek(cx, fd_zero, 0, SEEK_DATA), Err(Errno::ENXIO));
+                assert_eq!(seek(cx, fd_zero, 0, SEEK_HOLE), Err(Errno::ENXIO));
+
+                // FOPEN_NONSEEKABLE and FOPEN_STREAM directories return ESPIPE.
+                for fd in [fd_nonseek, fd_stream] {
+                    assert_eq!(seek(cx, fd, 0, SEEK_SET), Err(Errno::ESPIPE));
+                    assert_eq!(seek(cx, fd, 0, SEEK_END), Err(Errno::ESPIPE));
+                }
+            });
+            daemon.join().unwrap();
+        });
+
+        assert_eq!(getattrs.load(Ordering::Relaxed), 1);
+    }
 }

@@ -4046,7 +4046,7 @@ fn copy_range_checks(
     }
     let size_in = match &i.kind {
         FileKind::Regular { ino, file, .. } => vfs.store().stat_open(*ino, file)?.size as i64,
-        FileKind::Fuse(h) => crate::vfs::fuse::cached_attr(&vfs, h.id)?.size as i64,
+        FileKind::Fuse(h) => crate::vfs::fuse::cached_attr_fh(&vfs, h.id, h.fh())?.size as i64,
         _ => return Err(Errno::EINVAL),
     };
     count = if pos_in >= size_in {
@@ -5821,7 +5821,10 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
 
 pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysResult {
     let file = cx.fds().get(fd)?;
-    if matches!(file.borrow().kind, FileKind::Fuse(_)) {
+    if matches!(
+        file.borrow().kind,
+        FileKind::Fuse(_) | FileKind::Directory { fuse: Some(_), .. }
+    ) {
         return super::fuse::lseek(cx, &file, offset, whence);
     }
     follow_copy_up(cx, &file)?;
@@ -6746,6 +6749,12 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
                 drop(f);
                 node_stat(cx, &node)
             }
+        }
+        FileKind::Fuse(h) => {
+            let node = Node::Fuse(f.mnt, h.id);
+            let fh = h.fh();
+            drop(f);
+            super::fuse::stat_fh(&*cx.vfs()?, &cx.cred(), &node, fh)
         }
         _ => {
             let node = f.node().ok_or(Errno::EBADF)?;
@@ -8026,7 +8035,7 @@ impl Attrs {
                     return Err(Errno::EROFS);
                 }
                 let fh = match &f.kind {
-                    FileKind::Fuse(h) => Some(h.fh),
+                    FileKind::Fuse(h) => h.fh(),
                     _ => None,
                 };
                 Ok(Attrs::Fuse(id, fh))
@@ -8080,7 +8089,9 @@ impl Attrs {
                 let ipc = cx.kr().ipc(*ns);
                 Ok(ipc.mq_dir.borrow().stat(ipc.mqueues.len()))
             }
-            Attrs::Fuse(id, _) => Ok(crate::vfs::fuse::cached_attr(&*cx.vfs()?, *id)?.stat()),
+            Attrs::Fuse(id, fh) => {
+                Ok(crate::vfs::fuse::cached_attr_fh(&*cx.vfs()?, *id, *fh)?.stat())
+            }
         }
     }
 
