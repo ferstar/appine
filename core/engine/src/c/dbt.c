@@ -578,6 +578,7 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
         dbt_flush_locked(d);
         d->nogroup_count = 0;
         memset(d->strikes, 0, sizeof(d->strikes));
+        d->strikes_next = 0;
         if (d->table->bits > TABLE_MIN_BITS) /* next user is most likely a short-lived process */
             dbt_table_resize(d, TABLE_MIN_BITS);
         /* Block records and instruction words are mapped in advance at their limits, and the used
@@ -813,13 +814,6 @@ void appine_dbt_detach(struct appine_dbt_thread *t)
 void appine_dbt_flush(struct appine_dbt_thread *t)
 {
     __atomic_store_n(&t->d->flush_wanted, true, __ATOMIC_SEQ_CST);
-}
-
-void appine_dbt_recheck(struct appine_dbt_thread *t)
-{
-    lock_dbt(t->d, &t->stats);
-    t->d->stale = t->d->table_count > 0;
-    unlock_dbt(t->d);
 }
 
 void appine_dbt_invalidate(struct appine_dbt_thread *t, const struct appine_cpu *cpu, uint64_t start,
@@ -1663,11 +1657,6 @@ void appine_dbt_detach(struct appine_dbt_thread *t)
 }
 
 void appine_dbt_flush(struct appine_dbt_thread *t)
-{
-    (void)t;
-}
-
-void appine_dbt_recheck(struct appine_dbt_thread *t)
 {
     (void)t;
 }

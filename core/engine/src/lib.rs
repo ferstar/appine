@@ -202,6 +202,7 @@ unsafe extern "C" {
     fn appine_guest_hwcap() -> u64;
     fn appine_guest_hwcap2() -> u64;
     fn appine_guest_midr() -> u64;
+    fn appine_fpcr_write_mask() -> u64;
 
     fn appine_dbt_new(key: u64, regs: DbtRegs) -> *mut RawDbt;
     fn appine_dbt_trim();
@@ -217,7 +218,6 @@ unsafe extern "C" {
     fn appine_dbt_attach(dbt: *mut RawDbt, tag: c_uint) -> *mut RawDbtThread;
     fn appine_dbt_detach(t: *mut RawDbtThread);
     fn appine_dbt_flush(t: *mut RawDbtThread);
-    fn appine_dbt_recheck(t: *mut RawDbtThread);
     fn appine_dbt_invalidate(t: *mut RawDbtThread, cpu: *const CpuState, start: u64, len: u64);
     fn appine_dbt_run(t: *mut RawDbtThread, cpu: *mut CpuState) -> c_int;
     fn appine_dbt_get_stats(t: *const RawDbtThread, out: *mut DbtStats);
@@ -854,14 +854,6 @@ impl Dbt {
         unsafe { appine_dbt_flush(self.raw.as_ptr()) }
     }
 
-    /// About to run in a different address space (after exec): keeps the translations and,
-    /// before the next run, checks the guest instruction words block by block, invalidating the
-    /// ones that do not match, and clearing everything when most do not match. Cheaper than
-    /// copying the translation templates again after [`Dbt::flush`].
-    pub fn recheck(&mut self) {
-        unsafe { appine_dbt_recheck(self.raw.as_ptr()) }
-    }
-
     /// Invalidates, among the blocks starting in the pages covered by `[start, start + len)`,
     /// those whose guest instruction words differ from the current ones in `cpu`'s address space
     /// (a translation depends only on the pc and the instruction words); when there is no room,
@@ -937,6 +929,12 @@ pub fn guest_hwcap2() -> u64 {
 /// reading ID registers.
 pub fn guest_midr() -> u64 {
     unsafe { appine_guest_midr() }
+}
+
+/// FPCR bits writable by the guest (`AHP`, `DN`, `FZ`, `RMode` and, with FP16, `FZ16`), matching
+/// Tier 0's `msr fpcr` mask.
+pub fn fpcr_write_mask() -> u64 {
+    unsafe { appine_fpcr_write_mask() }
 }
 
 /// HWCAP bits, with the same values as Linux's `HWCAP_*`.
@@ -1028,6 +1026,16 @@ mod tests {
     #[test]
     fn layout_matches_c() {
         assert!(super::layout_matches());
+    }
+
+    #[test]
+    fn fpcr_write_mask_matches_tier0_msr() {
+        let mmu = super::Mmu::new();
+        let mut cpu = unsafe { super::Cpu::new(&mmu) };
+        cpu.state_mut().x[0] = u64::MAX;
+        // msr fpcr, x0
+        assert_eq!(cpu.exec_insn(0xd51b_4400), None);
+        assert_eq!(cpu.state().fpcr, super::fpcr_write_mask());
     }
 
     /// A failed internal check (an engine bug found without a host fault) under the guard ends

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: scope conditional-branch relinking to same-tag threads for private code-group blocks and document CMODX requirement for shared blocks)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: replace direct-mapped `strikes[64]` with a 64-entry ring and remove test-only `Dbt::recheck`)
 
 ## Responsibilities
 
@@ -46,8 +46,9 @@ triggers (`kernel/oom`).
   with shared routines at its base, dirty-page `struct written` bitmap, lock-free translation
   table, block log (`struct block`), saved guest words, per-page block buckets and parked counts,
   `cross_page_blocks`, stale-reuse `sources`/`trusted`/`parkable` lists (up to 64 each), immutable
-  sorted `shared_ranges` and `memop_table` (with `older` chains), ungroup `strikes[64]` and
-  `nogroup[64]` ring, register set, lock/flush/generation/poisoned state, and `pool.all` links.
+  sorted `shared_ranges` and `memop_table` (with `older` chains), ungroup `strikes[64]` ring
+  (`strikes_next`) and `nogroup[64]` ring, register set, lock/flush/generation/poisoned state, and
+  `pool.all` links.
 - `Dbt` (`struct appine_dbt_thread`, `Send`) — one thread's attachment: `Arc<DbtSpace>`, code-group
   tag, atomic active `cpu`, 4096-entry direct-mapped jump cache (`jc`), 1 KB-aligned 64-entry
   shadow return stack (`rs`), statistics (`DbtStats`), and lock-free translation workspace
@@ -72,7 +73,7 @@ triggers (`kernel/oom`).
 
 - **Instances and threads**: `DbtSpace::new(key, regs)`, `set_sources`, `set_memops`, `trust`,
   `retire_outside`, `share`, `new_tag`; `Dbt::new`, `with_regs`, `attach(space, tag)`, `run(cpu)`,
-  `flush`, `recheck`, `invalidate(cpu, start, len)`, `stats`.
+  `flush`, `invalidate(cpu, start, len)`, `stats`.
 - **Process-wide memory management**: `trim_dbt_pool`, `unmap_written_code`, `written_code_bytes`.
 - Non-aarch64-Linux builds compile stub entry points (`appine_dbt_run` delegates to
   `appine_cpu_run`).
@@ -168,10 +169,12 @@ triggers (`kernel/oom`).
   `ADR`/`ADRP`, SIMD DP, conditional branches, hints, barriers/`CLREX`, prefetches and other
   non-atomic memory ops (spilling/reloading `T2` via `dbt_groups[slot]` when clobbered). Stolen
   bases compute into `T0` and recover `host(base)` into `T2`. Leader refill failures exit
-  `R_UNGROUP`: unless `c->nwatch != 0`, `dbt_ungroup` records the first miss in direct-mapped
-  `strikes[64]` and on the second miss appends `pc` to the 64-entry FIFO `nogroup` ring (disabling
-  grouping for 256 bytes, versioned into template keys via `dbt_nogroup_key`) and retires blocks
-  covering `pc` in its page bucket.
+  `R_UNGROUP`: unless `c->nwatch != 0`, `dbt_ungroup` searches the 64-entry `strikes[64]` ring
+  linearly on the cold slow path, recording a first miss in the first empty slot (or overwriting
+  FIFO via `strikes_next`) so alternating leaders cannot collide, and on the second miss clears the
+  slot, appends `pc` to the 64-entry FIFO `nogroup` ring (disabling grouping for 256 bytes,
+  versioned into template keys via `dbt_nogroup_key`), and retires blocks covering `pc` in its page
+  bucket.
 
 ### Strip-mined native fast loops
 
@@ -295,7 +298,7 @@ triggers (`kernel/oom`).
 - Pool: up to 16 `appine_dbt` instances (64 MB kept code budget) and 8 spare threads. Non-poisoned
   instances with non-zero `key`, `<= 131,072` blocks, `<= 64 MB` code, no `flush_wanted` (and
   fitting the 64 MB budget above 32 MB) drop shared/memop/private state and stay cached as `stale`;
-  otherwise they flush (clearing `nogroup_count` and `strikes`), shrink table to `2^12`, and
+  otherwise they flush (clearing `nogroup_count`, `strikes` and `strikes_next`), shrink table to `2^12`, and
   `MADV_REMOVE`/`MADV_FREE`/`MADV_DONTNEED` backing memory. `DbtSpace::new` prefers MRU matching
   `(key, regs)`, else an empty instance (regenerating routines if `regs` differs), else allocates.
   `trim_dbt_pool` frees all pooled `appine_dbt` instances (not `templates.arena` or `pool.threads`).
@@ -381,13 +384,10 @@ triggers (`kernel/oom`).
 
 ## Confirmed bugs / technical debt
 
-- **Test-only public API:** `Dbt::recheck` (`appine_dbt_recheck`) is called only by
-  `core/engine/tests/dbt.rs`; production reuse sets `d->stale` internally on pool return.
+None.
 
 ## Open questions
 
-- Two group leaders alternating failures in the same `strikes[64]` slot are never ungrouped;
-  accepted?
 - Should `trim_dbt_pool` also reclaim `pool.threads` and `MADV_DONTNEED` `templates.arena` under
   memory pressure?
 

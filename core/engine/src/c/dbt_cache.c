@@ -652,12 +652,19 @@ full:
  */
 void dbt_ungroup(struct appine_dbt *d, uint64_t pc)
 {
-    uint64_t *strike = &d->strikes[(pc >> 2) % STRIKES];
-    if (*strike != pc) {
-        *strike = pc;
-        return;
+    int empty = -1;
+    for (unsigned i = 0; i < STRIKES; i++) {
+        if (d->strikes[i] == pc) {
+            d->strikes[i] = 0;
+            goto ungroup;
+        }
+        if (empty < 0 && d->strikes[i] == 0)
+            empty = (int)i;
     }
-    *strike = 0;
+    unsigned slot = empty >= 0 ? (unsigned)empty : d->strikes_next++ % STRIKES;
+    d->strikes[slot] = pc;
+    return;
+ungroup:
     d->nogroup[d->nogroup_count++ % NOGROUP_MAX] = pc;
     d->st->ungrouped++;
     uint64_t page = pc >> APPINE_PAGE_SHIFT;

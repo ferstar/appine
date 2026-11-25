@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `mrs` of unallocated CRm=0 and CRm=1 ID registers exits `Undefined` / `SIGILL` matching Linux 6.1 arm64)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: expose `fpcr_write_mask` and mask FPCR in `rt_sigreturn` and ptrace resume)
 
 ## Responsibilities
 
@@ -56,7 +56,7 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
   kicks), `exec_insn` (run a given word; tests and lockstep only), `translate`, `tlb_flush`,
   `state`/`state_mut`, `kicker`; `CpuState::set_hw_debug`, `hw_breakpoints_active`.
 - **Process-wide**: `install_fault_guard`, `guest_hwcap`, `guest_hwcap2`, `guest_midr`,
-  `layout_matches`.
+  `fpcr_write_mask`, `layout_matches`.
 - **C-internal** (used across engine files and by `engine/dbt`):
   `appine_interp_step`/`appine_interp_exec`, `appine_native_exec`, `appine_simd_dp_decode`,
   `appine_atomic_exec`, `appine_id_register`, `appine_guard_run`/`hold`/`hold_fn`/`drop`/`fail`,
@@ -193,8 +193,8 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
   `appine_map_code` and the fault guard (`appine_guard_run`/`hold`/`hold_fn`/`drop`/`fail`).
 - `kernel/process`: task run loop (`Cpu::run`/`step`, exit handling, `ivau_page`, kicks).
 - `kernel/mmu`: `Cpu::tlb_flush`, `Kicker`; `kernel/exec` (`AT_HWCAP`); `kernel/signal` and
-  `kernel/ptrace` (FP registers, kicks, hardware debug slots); `kernel/procfs` (`/proc/cpuinfo`,
-  MIDR); `kernel/boot` (`install_fault_guard`).
+  `kernel/ptrace` (FP registers, `fpcr_write_mask`, kicks, hardware debug slots); `kernel/procfs`
+  (`/proc/cpuinfo`, MIDR); `kernel/boot` (`install_fault_guard`).
 - Tests: `core/engine/tests/interp.rs`, `guard.rs` and `tests/lockstep` (random instruction
   sequences compared between hardware, Tier 0 and Tier 1; the whitelist check against `llvm-mc`,
   which runs only on Linux aarch64 and is skipped without `llvm-mc`).
@@ -235,7 +235,6 @@ None.
 
 - Is it intended that FAULT, KICK and signal exits leave the exclusive monitor set (architecturally
   an exception return clears it)? The compare-and-swap semantics make this mostly harmless.
-- Should FPCR written by sigreturn or ptrace be masked like `msr fpcr` in Tier 0?
 
 ## To verify
 

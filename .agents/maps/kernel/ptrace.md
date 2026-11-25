@@ -47,7 +47,7 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 - Attaching: `ATTACH` sends `SIGSTOP`; `SEIZE` takes options and never stops. Requests other than
   `KILL` and `INTERRUPT` need the tracee in a ptrace stop (else `ESRCH`); unknown requests are `EIO`.
 - Every ptrace stop saves a copy of the registers; the tracer reads and writes the copy and it is
-  written back on resume. Stopping notifies the tracer (`CLD_STOPPED` or `CLD_TRAPPED`, `SIGCHLD`
+  written back on resume (masking `fpcr` with `appine_engine::fpcr_write_mask`). Stopping notifies the tracer (`CLD_STOPPED` or `CLD_TRAPPED`, `SIGCHLD`
   unless suppressed) and waits until resumed, detached or killed.
 - Signal-delivery stops: resuming with 0 suppresses the signal, another number replaces it (as
   `SI_USER` unless `SETSIGINFO` was used); blocked replacements are re-queued.

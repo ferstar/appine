@@ -1,9 +1,14 @@
 //! Tier 1 keeping translations after the address space changes and checking guest instruction
-//! words block by block (`Dbt::recheck`, and instances taken from the pool), function return
-//! prediction (the shadow return stack), cross-page accesses, and hardware watchpoints. When the
-//! host is not aarch64 Linux there is no Tier 1 and the tests pass trivially.
+//! words block by block (instances taken from the pool), function return prediction (the shadow
+//! return stack), cross-page accesses, and hardware watchpoints. When the host is not aarch64
+//! Linux there is no Tier 1 and the tests pass trivially.
 
 use std::ptr::NonNull;
+use std::sync::Mutex;
+
+/// Serializes tests that rely on keyed [`DbtSpace`] instances staying in the process-wide pool
+/// across `drop` / `DbtSpace::new` (or that call `trim_dbt_pool` / churn keyed pool entries).
+static POOL_LOCK: Mutex<()> = Mutex::new(());
 
 use appine_engine::{
     Access, Cpu, Dbt, DbtMemop, DbtRegs, DbtSource, DbtSpace, Exit, FaultKind, MEMOP_MEMCHR,
@@ -125,21 +130,27 @@ impl Guest {
 
 #[test]
 fn recheck_after_exec_runs_the_new_code() {
-    let Some(mut dbt) = Dbt::new() else {
+    let _pool = POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const KEY: u64 = 0x5eed_0002;
+    let Some(space) = DbtSpace::new(KEY, DbtRegs::Default) else {
         return;
     };
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     let mut g = Guest::new();
     g.code(CODE, &[movz_x0(1), SVC]);
     assert_eq!(g.run(&mut dbt), 1);
-    // The same address now holds another program (exec); after the check, the new code runs
+    drop((dbt, space));
+    // The same address now holds another program (exec); after pool recheck, the new code runs
     g.code(CODE, &[movz_x0(2), SVC]);
-    dbt.recheck();
+    let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 2);
+    drop((dbt, space));
     // When the code has not changed it is still usable after the check, without retranslation
-    let blocks = dbt.stats().blocks;
-    dbt.recheck();
+    let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 2);
-    assert_eq!(dbt.stats().blocks, blocks);
+    assert_eq!(dbt.stats().blocks, 0);
 }
 
 #[test]
@@ -160,6 +171,7 @@ fn pooled_instances_are_checked_before_use() {
 
 #[test]
 fn pooled_instances_keep_translations_of_the_same_program() {
+    let _pool = POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // No other test uses this key; a pooled instance with the same key is only given back to it
     const KEY: u64 = 0x5eed_0001;
     let Some(space) = DbtSpace::new(KEY, DbtRegs::Default) else {
@@ -201,7 +213,7 @@ fn fpcr_reads_use_the_guest_state_inside_translated_code() {
         let Some(mut dbt) = Dbt::with_regs(regs) else {
             return;
         };
-        // Signal and ptrace restores can supply bits the host FPCR does not retain.
+        // Translated `mrs fpcr` reads `CpuState::fpcr` directly, even for bits host FPCR ignores.
         let fpcr = 0x0040_8000;
         let s = g.cpu.state_mut();
         s.fpcr = fpcr;
@@ -506,27 +518,33 @@ fn invalidation_keeps_blocks_whose_code_did_not_change() {
 
 #[test]
 fn recheck_retires_only_blocks_that_changed() {
-    let Some(mut dbt) = Dbt::new() else {
+    let _pool = POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const KEY: u64 = 0x5eed_0003;
+    let Some(space) = DbtSpace::new(KEY, DbtRegs::Default) else {
         return;
     };
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     let mut g = Guest::new();
     let second = CODE + PAGE_SIZE;
     g.code(CODE, &[b(CODE, second)]);
     g.code(second, &[movz_x0(5), SVC]);
     assert_eq!(g.run(&mut dbt), 5);
+    drop((dbt, space));
     // Change only the second page: the first page's block and its link to the second page are
     // kept, and the second page's block is invalidated and translated again
     g.code(second, &[movz_x0(6), SVC]);
-    let before = dbt.stats();
-    dbt.recheck();
+    let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 6);
     let after = dbt.stats();
-    assert_eq!(after.invalidated - before.invalidated, 1);
-    assert_eq!(after.blocks - before.blocks, 1);
+    assert_eq!(after.invalidated, 1);
+    assert_eq!(after.blocks, 1);
 }
 
 #[test]
 fn parking_and_flushing_over_and_over_keeps_free_slots() {
+    let _pool = POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const KEY: u64 = 0x5eed_0004;
     if Dbt::new().is_none() {
         return;
     }
@@ -534,7 +552,8 @@ fn parking_and_flushing_over_and_over_keeps_free_slots() {
     // thread, and a timeout counts as failure
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut dbt = Dbt::new().unwrap();
+        let mut space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
+        let mut dbt = Dbt::attach(&space, 0).unwrap();
         let mut g = Guest::new();
         let second = CODE + PAGE_SIZE;
         g.code(CODE, &[movz_x0(1), SVC]);
@@ -551,10 +570,12 @@ fn parking_and_flushing_over_and_over_keeps_free_slots() {
             assert_eq!(g.run(&mut dbt), 1);
             assert_eq!(g.run_at(&mut dbt, second), 2);
             // The address space changed (exec of the same program) and the second page is not
-            // mapped yet: the blocks there are parked
-            dbt.space().set_sources(&[source]);
-            dbt.recheck();
-            dbt.space().trust(&[]);
+            // mapped yet: returning to the pool marks it stale so the blocks there are parked
+            space.set_sources(&[source]);
+            drop((dbt, space));
+            space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
+            space.trust(&[]);
+            dbt = Dbt::attach(&space, 0).unwrap();
             g.mmu.unmap(second, PAGE_SIZE).unwrap();
             g.cpu.tlb_flush();
             assert_eq!(g.run(&mut dbt), 1);
@@ -1009,6 +1030,44 @@ fn shared_checks_cover_accesses_behind_branches() {
 }
 
 #[test]
+fn alternating_group_leaders_in_same_slot_are_both_ungrouped() {
+    let Some(mut dbt) = Dbt::new() else {
+        return;
+    };
+    let mut g = Guest::with_data();
+    // Three leaders spaced by 64 * 4 = 256 bytes: all three mapped to the same direct-mapped
+    // strikes[64] slot previously, so alternating failures evicted each other forever.
+    let leaders = [CODE + 0x200, CODE + 0x300, CODE + 0x400];
+    for &f in &leaders {
+        g.code(f, &[LDR_X0_X2, LDR_X1_X2_8, SVC]);
+    }
+    // Round 1: each leader records its first strike (0 ungrouped, 3 Tier 0 fallbacks).
+    for &f in &leaders {
+        g.cpu.state_mut().x[2] = before_page(3, 8);
+        g.run_at(&mut dbt, f);
+        assert_eq!(g.cpu.state().x[0], g.data(2, 4096 - 8));
+        assert_eq!(g.cpu.state().x[1], g.data(3, 0));
+    }
+    assert_eq!((dbt.stats().ungrouped, dbt.stats().exits_interp), (0, 3));
+    // Round 2: each leader hits its second strike and is ungrouped.
+    for &f in &leaders {
+        g.cpu.state_mut().x[2] = before_page(3, 8);
+        g.run_at(&mut dbt, f);
+        assert_eq!(g.cpu.state().x[0], g.data(2, 4096 - 8));
+        assert_eq!(g.cpu.state().x[1], g.data(3, 0));
+    }
+    assert_eq!((dbt.stats().ungrouped, dbt.stats().exits_interp), (3, 6));
+    // Round 3: all three stay ungrouped with zero additional Tier 0 exits.
+    for &f in &leaders {
+        g.cpu.state_mut().x[2] = before_page(3, 8);
+        g.run_at(&mut dbt, f);
+        assert_eq!(g.cpu.state().x[0], g.data(2, 4096 - 8));
+        assert_eq!(g.cpu.state().x[1], g.data(3, 0));
+    }
+    assert_eq!((dbt.stats().ungrouped, dbt.stats().exits_interp), (3, 6));
+}
+
+#[test]
 fn watchpoints_send_only_watched_pages_to_tier0() {
     let Some(mut dbt) = Dbt::new() else {
         return;
@@ -1327,6 +1386,7 @@ fn memops_accelerate_large_and_preserve_small_and_fallbacks() {
 
 #[test]
 fn memops_bypass_templates_retire_on_update_and_clear_on_pool_reuse() {
+    let _pool = POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(space_a) = DbtSpace::new(0xfeed_cafe, DbtRegs::Default) else {
         return;
     };
@@ -4544,9 +4604,12 @@ fn memop_self_copy_validates_pages_before_returning() {
 
 #[test]
 fn revive_does_not_insert_duplicate_key_after_early_stop() {
-    let Some(mut dbt) = Dbt::new() else {
+    let _pool = POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const KEY: u64 = 0x5eed_0005;
+    let Some(space) = DbtSpace::new(KEY, DbtRegs::Default) else {
         return;
     };
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     // 2 initial code pages (CODE, CODE+PAGE_SIZE) + 1 stack page + 6 extra code pages.
     let mut g = Guest::with_pages(9);
     let base = NonNull::new(g.pages.as_mut_ptr().cast::<u8>()).unwrap();
@@ -4592,9 +4655,11 @@ fn revive_does_not_insert_duplicate_key_after_early_stop() {
         len: PAGE_SIZE,
         id: [1, 2, 0, 0, PAGE_SIZE],
     };
-    dbt.space().set_sources(&[source]);
-    dbt.recheck();
-    dbt.space().trust(&[]);
+    space.set_sources(&[source]);
+    drop((dbt, space));
+    let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
+    space.trust(&[]);
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     g.mmu.unmap(park_page, PAGE_SIZE).unwrap();
     g.cpu.tlb_flush();
     assert_eq!(g.run_at(&mut dbt, extra_base), 1);
@@ -4688,6 +4753,7 @@ fn concurrent_attach_during_conditional_branch_linking() {
 
 #[test]
 fn concurrent_instances_update_spare_stats_independently() {
+    let _pool = POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if DbtSpace::new(0, DbtRegs::Default).is_none() {
         return;
     }

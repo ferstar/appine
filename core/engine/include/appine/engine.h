@@ -224,6 +224,9 @@ uint64_t appine_guest_hwcap2(void);
 /* The MIDR_EL1 the guest reads (0 when the host does not allow reading ID registers) */
 uint64_t appine_guest_midr(void);
 
+/* FPCR bits writable by the guest (AHP, DN, FZ, RMode and, with FP16, FZ16) */
+uint64_t appine_fpcr_write_mask(void);
+
 /* ---- soft-MMU page table (the kernel/mmu map) ---- */
 
 enum {
@@ -453,11 +456,6 @@ void appine_dbt_detach(struct appine_dbt_thread *t);
 /* Discards all translations: this has to wait until every thread has left translated code, so it
  * is only a request, completed by the next thread to enter appine_dbt_run() */
 void appine_dbt_flush(struct appine_dbt_thread *t);
-
-/* About to run in a different address space (after exec): keeps the translations and, before the
- * next run, checks the guest instruction words block by block, invalidating the ones that do not
- * match. Instances taken from the pool are handled the same way. */
-void appine_dbt_recheck(struct appine_dbt_thread *t);
 
 /* Invalidates the blocks starting in the pages covered by [start, start + len); when `cpu` is
  * given, only those whose guest instruction words differ from the current ones in its address

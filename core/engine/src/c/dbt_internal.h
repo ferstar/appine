@@ -232,8 +232,9 @@ static inline uint64_t block_key(const struct block *b)
 
 /* After a group of accesses fails the shared check a second time, the leader's pc is recorded
  * here, and on retranslation neither it nor the accesses after it in the same block lead a group
- * any more; when full, the oldest entries are overwritten first. A first failure is only recorded
- * in strikes (direct-mapped by pc) */
+ * any more; when full, the oldest entries are overwritten first. A first failure is recorded in
+ * the 64-entry strikes ring (searched linearly on the cold R_UNGROUP path, reusing cleared slots
+ * before overwriting FIFO so alternating leaders never collide). */
 #define NOGROUP_MAX 64
 #define NOGROUP_SPAN 256 /* bytes after a failed leader where grouping stays disabled */
 #define STRIKES 64
@@ -322,6 +323,7 @@ struct appine_dbt {
     uint64_t nogroup[NOGROUP_MAX];
     unsigned nogroup_count;
     uint64_t strikes[STRIKES];
+    unsigned strikes_next;
     /* Incremented on every flush: invalidates links not yet patched, and threads use it to clear
      * their own jump cache and shadow return stack */
     uint64_t generation;

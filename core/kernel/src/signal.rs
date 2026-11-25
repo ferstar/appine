@@ -1772,7 +1772,7 @@ fn restore_frame(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Result<(), Errno> {
     st.pc = r64(&b, PC);
     crate::ptrace::set_pstate(st, pstate);
     st.fpsr = r32(&b, fp + 8) as u64;
-    st.fpcr = r32(&b, fp + 12) as u64;
+    st.fpcr = u64::from(r32(&b, fp + 12)) & appine_engine::fpcr_write_mask();
     for (i, v) in st.v.iter_mut().enumerate() {
         v[0] = r64(&b, fp + 16 + 16 * i);
         v[1] = r64(&b, fp + 24 + 16 * i);
@@ -2273,5 +2273,76 @@ mod tests {
             assert_eq!(got.fields, timer_info.fields);
         }
         assert_eq!(group.borrow_mut().pending.take(rt(5)), SigInfo::default());
+    }
+
+    #[test]
+    fn restore_frame_masks_fpcr() {
+        use crate::fd::FdTable;
+        use crate::kernel::{Cx, Shared};
+        use crate::mm::flags;
+        use crate::task::{FsContext, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+        use std::sync::Arc;
+
+        let shared = Arc::new(Shared::new(Kernel::new(crate::process::Tier::Interpreter)));
+        let mut k = shared.lock();
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            20,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        k.groups.insert(20, group.clone());
+        let (mut cpus, tasks) = spawn_test_tasks(&mut k, &group, &[(20, 0)]);
+        let mut cpu = cpus.pop().unwrap();
+        let task = tasks.into_iter().next().unwrap();
+        let mm = task.res.borrow().mm.clone();
+
+        let stack = mm
+            .borrow_mut()
+            .mmap(
+                0,
+                2 * appine_engine::PAGE_SIZE,
+                appine_engine::prot::READ | appine_engine::prot::WRITE,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        let frame = stack + 0x100;
+        let mut buf = vec![0u8; FRAME_SIZE];
+        w32(&mut buf, RESERVED, FPSIMD_MAGIC);
+        w32(&mut buf, RESERVED + 4, FPSIMD_SIZE as u32);
+        w32(&mut buf, RESERVED + 8, 0x1f); // fpsr
+        w32(&mut buf, RESERVED + 12, u32::MAX); // fpcr with reserved/unwritable bits set
+        mm.borrow()
+            .write(UserSlice::new(frame, buf.len()), &buf)
+            .unwrap();
+        cpu.state_mut().sp = frame;
+
+        let mut state = TaskState {
+            mm,
+            fds: Rc::new(RefCell::new(FdTable::new())),
+            fs: Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: Rc::new(MntNs {
+                    id: INIT_MNT_NS,
+                    owner: crate::cred::UserNs::init(),
+                    anon: false,
+                }),
+            })),
+            group,
+            vfs: None,
+            altstack: Default::default(),
+            clear_child_tid: 0,
+            vfork_done: None,
+            restart: None,
+            fast_sleep: None,
+            sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+        };
+        let mut cx = Cx::new(&shared, k, &task, &mut state);
+        restore_frame(&mut cx, &mut cpu).unwrap();
+        assert_eq!(cpu.state().fpcr, appine_engine::fpcr_write_mask());
+        assert_eq!(cpu.state().fpsr, 0x1f);
     }
 }

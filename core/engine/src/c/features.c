@@ -100,6 +100,11 @@ uint64_t appine_guest_midr(void)
     return host_midr;
 }
 
+uint64_t appine_fpcr_write_mask(void)
+{
+    return fpcr_write_mask();
+}
+
 bool appine_has(uint64_t hwcap)
 {
     return (appine_guest_hwcap() & hwcap) == hwcap;

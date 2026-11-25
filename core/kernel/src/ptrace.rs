@@ -120,7 +120,7 @@ impl Regs {
         s.sp = self.sp;
         s.pc = self.pc;
         set_pstate(s, self.pstate);
-        s.fpcr = self.fpcr;
+        s.fpcr = self.fpcr & appine_engine::fpcr_write_mask();
         s.fpsr = self.fpsr;
         s.tpidr_el0 = self.tpidr;
         s.v = self.v;
@@ -975,5 +975,15 @@ mod tests {
         hw.brk[0] = (0x4000, 0xf << 5 | 4 | 1);
         assert_eq!(hw.watchpoints(), vec![(0x1004, 0x1008, 3)]);
         assert_eq!(hw.breakpoints(), vec![0x4000]);
+    }
+
+    #[test]
+    fn regs_restore_masks_fpcr() {
+        let mmu = appine_engine::Mmu::new();
+        let mut cpu = unsafe { Cpu::new(&mmu) };
+        let mut regs = Regs::save(cpu.state());
+        regs.fpcr = u64::MAX;
+        regs.restore(cpu.state_mut());
+        assert_eq!(cpu.state().fpcr, appine_engine::fpcr_write_mask());
     }
 }

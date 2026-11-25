@@ -220,7 +220,8 @@ provider and rootfs installation UI (`android`).
 
 - One background thread per connection (every short-lived host connection spawns and joins one):
   when objects are queued it syncs the WAL (unless nothing was committed since the last sync) and
-  unlinks them; it runs PASSIVE checkpoints on its own lazily opened connection whenever the WAL has
+  unlinks them (clearing any `kernel/hostmem` `WRITABLY_SHARED` tracking for the unlinked host
+  inode); it runs PASSIVE checkpoints on its own lazily opened connection whenever the WAL has
   grown 1000 pages since the last request, or after 100 ms without commits while the WAL is at least
   1000 pages and not fully backfilled. The committing thread checkpoints in place only when the WAL
   reaches 10,000 pages. Without a reaper thread SQLite's auto-checkpoint is kept and deletions
@@ -334,7 +335,8 @@ provider and rootfs installation UI (`android`).
 
 - rusqlite with bundled SQLite (WAL hook, checkpoints); `appine_hal` (`open_at`, `stat_at`,
   `chmod_at`, `unlink_at`, times, `flock`, `map_file`, `fsync`, `syncfs`, `sync_file_range`,
-  `statvfs`); the `tar` and `flate2` crates; `kernel::bkl_holder`; `bug::catch` (`kernel/bug`).
+  `statvfs`); the `tar` and `flate2` crates; `kernel::bkl_holder`; `bug::catch` (`kernel/bug`);
+  `mm::forget_writably_shared` (`kernel/hostmem`).
 
 ## Invariants and gotchas
 

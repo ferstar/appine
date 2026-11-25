@@ -164,7 +164,7 @@ construction (`kernel/vdso`).
   16-byte-aligned SP, 4688 readable bytes, `pstate & (0x1f | 0x3c0) == 0` (EL0t AArch64 with DAIF
   clear), valid 16-byte-aligned `>= 16` `__reserved` records with exactly one 528-byte
   `fpsimd_context`, at most one 16-byte `esr_context`, other magics `EINVAL`. Restores GPRs, SP,
-  PC, pstate (`NZCV`, plus `DIT` if advertised), FPSR/FPCR/V0–V31, `sigmask` and `altstack`
+  PC, pstate (`NZCV`, plus `DIT` if advertised), FPSR, FPCR (masked with `appine_engine::fpcr_write_mask`), V0–V31, `sigmask` and `altstack`
   (ignoring altstack errors). A bad frame leaves state intact, calls `show_unhandled` with
   `illegal memory access` (logging original `x0`), forces `SIGSEGV` at SP (`SEGV_ACCERR` if
   `Mm::mapped_above`, else `SEGV_MAPERR`), and then sets `x0 = 0`; both valid and bad paths run

@@ -1258,7 +1258,7 @@ impl Store {
         let (ino, file) = self.transaction(|s| {
             let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 0, 0)?;
             let file = s.new_object(ino)?;
-            s.remove_object(ino)?;
+            s.unlink_new_object(ino)?;
             Ok((ino, file))
         })?;
         // memfd mappings bypass `mapping_object`, so never cache host-backed relatime state.
@@ -2762,7 +2762,7 @@ impl Store {
     /// The copy of [`Store::unshare`] failed: the new object goes (its row, which nothing uses,
     /// goes at the next boot).
     pub fn abandon_unshare(&self, job: Unshare) {
-        let _ = self.remove_object(job.objects.1);
+        let _ = self.unlink_new_object(job.objects.1);
     }
 
     /// Gives held file `ino` an object of its own ([`Store::unshare`]), copying the data with the
@@ -2894,9 +2894,14 @@ impl Store {
         Ok(st)
     }
 
-    /// Deletes an object; not an error if it is already gone.
+    /// Deletes an object and clears any `WRITABLY_SHARED` tracking; not an error if already gone.
     fn remove_object(&self, ino: Ino) -> Result<(), Errno> {
         remove_object(&self.meta.objects_dir, ino)
+    }
+
+    /// Deletes a freshly created, never-exposed object; not an error if it is already gone.
+    fn unlink_new_object(&self, ino: Ino) -> Result<(), Errno> {
+        unlink_object(&self.meta.objects_dir, ino)
     }
 
     // ---- Database connection ----
@@ -2985,7 +2990,7 @@ impl Drop for Op<'_> {
                 s.doomed.borrow_mut().truncate(self.doomed);
                 s.replaced.borrow_mut().truncate(self.replaced);
                 for ino in created {
-                    let _ = s.remove_object(ino);
+                    let _ = s.unlink_new_object(ino);
                 }
             }
             return;
@@ -3521,13 +3526,34 @@ fn reap(meta: Arc<Meta>, db: PathBuf) {
     }
 }
 
-/// Deletes an object in the `objects` directory; not an error if it is already gone.
-fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
+/// Unlinks an object in the `objects` directory; not an error if it is already gone.
+fn unlink_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
     let mut name = [0u8; 21];
     match appine_hal::unlink_at(objects_dir.as_raw_fd(), object_name(ino, &mut name)) {
         Err(e) if e != libc::ENOENT => Err(object_err(ino, e)),
         _ => Ok(()),
     }
+}
+
+/// Deletes an object in the `objects` directory and forgets any `WRITABLY_SHARED` tracking for
+/// its host inode; not an error if it is already gone.
+fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
+    let mut name = [0u8; 21];
+    let name = object_name(ino, &mut name);
+    let host_id = appine_hal::stat_at(objects_dir.as_raw_fd(), name)
+        .ok()
+        .map(|st| {
+            #[allow(clippy::unnecessary_cast)]
+            (st.st_dev as u64, st.st_ino as u64)
+        });
+    let res = match appine_hal::unlink_at(objects_dir.as_raw_fd(), name) {
+        Err(e) if e != libc::ENOENT => Err(object_err(ino, e)),
+        _ => Ok(()),
+    };
+    if let Some((dev, host_ino)) = host_id {
+        crate::mm::forget_writably_shared(dev, host_ino);
+    }
+    res
 }
 
 /// A PASSIVE checkpoint: waits for no readers and blocks no writers; frames that cannot be written
