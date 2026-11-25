@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: matching overlapping echo requests on replies and quoted errors)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: raw ICMP receive queue honors `SO_RCVBUF`, and rebinding to another address atomically replaces the host ping socket with copied options)
 
 ## Responsibilities
 
@@ -31,7 +31,8 @@ socket and epoll `Watch` wrappers (`hal`).
 ## Key types
 
 - `RawIcmp` — per raw socket: family, `ICMP_FILTER`, guest `IP_RECVTTL`,
-  `IP_PKTINFO` and `IP_RECVERR`, `IPV6_CHECKSUM`, and its `Tap`.
+  `IP_PKTINFO` and `IP_RECVERR`, `IPV6_CHECKSUM`, cached `SO_RCVBUF` byte limit (`rcvbuf`), and
+  its `Tap`.
 - `Tap` — per-namespace aggregation point on a host epoll: sources and receivers; held weakly in
   `Kernel::icmp_taps`. Its `Echoes` history matches wire sequences to successful requests.
 - `Source` — one host fd watched by a `Tap` (a raw socket's ping socket, or an error-only UDP
@@ -41,8 +42,8 @@ socket and epoll `Watch` wrappers (`hal`).
 
 ## Public entry points
 
-- `rawicmp::{tap_for, register, udp_setsockopt, before_io, untap, dispatch, check_taps}` and
-  `RawIcmp::{send, setsockopt, getsockopt, present}`.
+- `rawicmp::{tap_for, register, replace_source, udp_setsockopt, before_io, untap, dispatch, check_taps}` and
+  `RawIcmp::{send, setsockopt, getsockopt, sync_rcvbuf, rcvbuf, present}`.
 - `raw_recv` and `take_errors` in `core/kernel/src/syscall/net.rs` (called from `kernel/net`'s
   socket receive and send/option paths).
 
@@ -55,8 +56,14 @@ socket and epoll `Watch` wrappers (`hal`).
   opens a host ping socket (host `SOCK_DGRAM`) with host `IP_RECVTTL`, `IP_PKTINFO` and
   `IP_RECVERR` (or `IPV6_RECVERR`), and registers it with its namespace's `Tap` (created on demand;
   the timer thread waits on every `Tap`'s epoll fd and dispatches them all on each wake).
-- Binding drops the port (an already-bound raw socket bound again to the same address succeeds
-  without binding again on the host); getsockname reports the protocol number; `SO_TYPE` reports
+- Binding drops the port. A connected raw socket (`peer.is_some()`) refuses rebind with `EINVAL`
+  as in Linux's `raw_bind`/`rawv6_bind`; an already-bound unconnected raw socket bound again to the
+  same host address succeeds without replacing the host fd (updating `any`/`vaddr` in new
+  namespaces), while binding to a different host address atomically creates and binds a replacement
+  host ping socket with host options copied (`SO_RCVBUF`/`SO_SNDBUF` halved to compensate for Linux
+  doubling, socket/IP/IPv6 options, `SO_BINDTODEVICE`, classic BPF filter and lock), drains `old_fd`
+  outside the socket borrow, swaps the source fd in `Tap` (`replace_source`, keeping the receiver
+  queue intact), and closes `old_fd`. getsockname reports the protocol number; `SO_TYPE` reports
   `SOCK_RAW`. nftables nat and filters do not apply to raw ICMP sockets; namespace address
   translation does.
 - Raw ICMP options (`RawIcmp::setsockopt`/`getsockopt`): `ICMP_FILTER`, `IP_RECVTTL`, `IP_PKTINFO`,
@@ -87,7 +94,9 @@ socket and epoll `Watch` wrappers (`hal`).
   replies. The wire sequence, family and host ping ident select the guest id and sequence for
   replies, quoted echo requests and original datagrams returned by `MSG_ERRQUEUE`.
   Every live raw socket of the same family whose `ICMP_FILTER` passes gets a copy of replies and
-  errors (queue capped at 212992 bytes of ICMP data, overflow dropped).
+  errors (queue capped by the socket's `SO_RCVBUF`, synced from the host ping socket on create,
+  `SO_RCVBUF`/`SO_RCVBUFFORCE`, and rebind; an empty queue always admits one packet, and overflow
+  is dropped silently).
 - `raw_recv` / `RawIcmp::present` prepends a synthesized IPv4 header (TTL from the host, protocol
   1, translated source, `IP_PKTINFO` destination, checksum) or returns ICMPv6 as is;
   `IP_PKTINFO`/`IP_TTL` control messages only when enabled, other control messages only for what
@@ -122,10 +131,8 @@ socket and epoll `Watch` wrappers (`hal`).
 
 ## Confirmed bugs / technical debt
 
-- The queue cap ignores `SO_RCVBUF` and drops silently.
-- **A raw socket cannot be bound to another address:** Linux's `raw_bind` lets a raw socket be
-  bound any number of times; the host ping socket that emulates a raw ICMP socket refuses a second
-  bind, so binding it again succeeds only for the address it already has (`EINVAL` otherwise).
+- None currently recorded. (Host-level privileged options such as `SO_PRIORITY > 6` or
+  `IP_TRANSPARENT` are still subject to host-socket passthrough semantics; see `kernel/net`.)
 
 ## Open questions
 

@@ -1637,27 +1637,48 @@ fn route_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
     } else {
         table
     };
-    let len = match family {
-        AF_INET => 4,
-        AF_INET6 => 16,
+    let v4 = match family {
+        AF_INET => true,
+        AF_INET6 => false,
         _ => return Err(Errno::EOPNOTSUPP.into()),
     };
-    let v4 = family == AF_INET;
-    if usize::from(dst_len) > len * 8 {
-        return Err(fail(Errno::EINVAL, "Invalid prefix length"));
-    }
-    let addr = |t| -> Result<Option<Vec<u8>>, Fail> {
-        match get(&attrs, t) {
-            Some(d) if d.len() == len => Ok(Some(d.to_vec())),
-            Some(_) => Err(Errno::EINVAL.into()),
-            None => Ok(None),
+    // Linux 6.1 applies the netlink policy before checking the prefix length.
+    let policy = fail(Errno::ERANGE, "Attribute failed policy validation");
+    let (mut dst, gw, prefsrc) = if v4 {
+        let addr4 = |ty| route_addr(&attrs, ty, 4, policy);
+        let dst = addr4(RTA_DST)?.unwrap_or_else(|| vec![0; 4]);
+        let gw = addr4(RTA_GATEWAY)?;
+        let prefsrc = addr4(RTA_PREFSRC)?;
+        if dst_len > 32 {
+            return Err(fail(Errno::EINVAL, "Invalid prefix length"));
         }
+        (dst, gw, prefsrc)
+    } else {
+        // Only the gateway has a policy minimum. rtm_to_fib6_config checks the
+        // prefix length, prefix bytes and preferred source in that order.
+        let gw = route_addr(&attrs, RTA_GATEWAY, 16, policy)?;
+        if dst_len > 128 {
+            return Err(fail(Errno::EINVAL, "Invalid prefix length"));
+        }
+        let mut dst = vec![0u8; 16];
+        if let Some(d) = get(&attrs, RTA_DST) {
+            if d.len() < usize::from(dst_len).div_ceil(8) {
+                return Err(fail(Errno::EINVAL, "Invalid dst address"));
+            }
+            let n = d.len().min(16);
+            dst[..n].copy_from_slice(&d[..n]);
+        }
+        let prefsrc = route_addr(
+            &attrs,
+            RTA_PREFSRC,
+            16,
+            fail(Errno::EINVAL, "Invalid prefsrc address"),
+        )?;
+        (dst, gw, prefsrc)
     };
-    let mut dst = addr(RTA_DST)?.unwrap_or_else(|| vec![0; len]);
     // An all-zero RTA_GATEWAY (0.0.0.0 or ::) counts as no gateway, as in Linux's
     // rtm_to_fib_config / rtm_to_fib6_config.
-    let gw = addr(RTA_GATEWAY)?.filter(|g| g.iter().any(|&b| b != 0));
-    let prefsrc = addr(RTA_PREFSRC)?;
+    let gw = gw.filter(|g| g.iter().any(|&b| b != 0));
     let oif = get_u32(&attrs, RTA_OIF);
     let metric = get_u32(&attrs, RTA_PRIORITY).unwrap_or(0);
     let masked = crate::route::network(&dst, dst_len);
@@ -1780,6 +1801,20 @@ fn route_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
     }
     d.routes.push(r);
     Ok(())
+}
+
+/// Fixed-width route attributes ignore trailing bytes. Each family supplies the
+/// error used at this point in its route validation.
+fn route_addr(
+    attrs: &[(u16, &[u8])],
+    ty: u16,
+    width: usize,
+    short: Fail,
+) -> Result<Option<Vec<u8>>, Fail> {
+    match get(attrs, ty) {
+        Some(data) => Ok(Some(data.get(..width).ok_or(short)?.to_vec())),
+        None => Ok(None),
+    }
 }
 
 /// A next hop (`fib_check_nh`, `fib6_nh_init`): the interface must be a virtual device (host
@@ -3423,8 +3458,26 @@ mod tests {
         gw: Option<[u8; 4]>,
         oif: Option<u32>,
     ) -> Vec<u8> {
+        let oif = oif.map(u32::to_le_bytes);
+        let mut attrs = vec![(RTA_DST, dst.as_slice())];
+        if let Some(g) = &gw {
+            attrs.push((RTA_GATEWAY, g));
+        }
+        if let Some(o) = &oif {
+            attrs.push((RTA_OIF, o));
+        }
+        route_with_attrs(ty, flags, AF_INET, prefix, &attrs)
+    }
+
+    fn route_with_attrs(
+        ty: u16,
+        flags: u16,
+        family: i32,
+        prefix: u8,
+        attrs: &[(u16, &[u8])],
+    ) -> Vec<u8> {
         let mut p = vec![
-            AF_INET as u8,
+            family as u8,
             prefix,
             0,
             0,
@@ -3440,12 +3493,8 @@ mod tests {
         if ty == RTM_DELROUTE {
             p[6] = RT_SCOPE_NOWHERE;
         }
-        attr(&mut p, RTA_DST, &dst);
-        if let Some(g) = gw {
-            attr(&mut p, RTA_GATEWAY, &g);
-        }
-        if let Some(o) = oif {
-            attr(&mut p, RTA_OIF, &o.to_le_bytes());
+        for &(ty, value) in attrs {
+            attr(&mut p, ty, value);
         }
         message(ty, flags | 1, 1, 0, &p)
     }
@@ -3772,5 +3821,120 @@ mod tests {
                 .errno,
             Errno::EHOSTUNREACH.0
         );
+    }
+
+    #[test]
+    fn route_attribute_lengths_match_linux_6_1() {
+        let n = ns(7);
+        run(
+            &n,
+            &link(RTM_NEWLINK, CREATE, 0, None, &[name("d0"), kind("dummy")]),
+            &[],
+        )
+        .unwrap();
+        let i0 = view_of(&n, "d0").index;
+        up(&n, "d0", true);
+        run(
+            &n,
+            &addr(RTM_NEWADDR, CREATE, AF_INET, 24, i0, &[10, 70, 0, 1], None),
+            &[],
+        )
+        .unwrap();
+        let src6 = [0x20, 0x01, 0x0d, 0xb8, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        run(
+            &n,
+            &addr(RTM_NEWADDR, CREATE, AF_INET6, 64, i0, &src6, None),
+            &[],
+        )
+        .unwrap();
+
+        let request = |ty, family, prefix, attrs: &[(u16, &[u8])]| {
+            let flags = if ty == RTM_NEWROUTE { CREATE } else { 0 };
+            run(&n, &route_with_attrs(ty, flags, family, prefix, attrs), &[])
+        };
+        let policy = fail(Errno::ERANGE, "Attribute failed policy validation");
+        let prefix_error = fail(Errno::EINVAL, "Invalid prefix length");
+        let dst_error = fail(Errno::EINVAL, "Invalid dst address");
+        let src_error = fail(Errno::EINVAL, "Invalid prefsrc address");
+        let prefix8 = [0x20, 0x01, 0x0d, 0xb8, 0, 8, 0, 0];
+        for ty in [RTM_NEWROUTE, RTM_DELROUTE] {
+            for attr in [RTA_DST, RTA_GATEWAY, RTA_PREFSRC] {
+                for prefix in [24, 33] {
+                    assert_eq!(
+                        request(ty, AF_INET, prefix, &[(attr, &[10, 70])]),
+                        Err(policy)
+                    );
+                }
+            }
+            assert_eq!(request(ty, AF_INET, 33, &[]), Err(prefix_error));
+            for prefix in [64, 129] {
+                assert_eq!(
+                    request(ty, AF_INET6, prefix, &[(RTA_GATEWAY, &[0xfe, 0x80])]),
+                    Err(policy)
+                );
+            }
+            assert_eq!(
+                request(ty, AF_INET6, 129, &[(RTA_DST, &[])]),
+                Err(prefix_error)
+            );
+            for (prefix, len) in [(64, 7), (65, 8)] {
+                let attrs = [(RTA_DST, &prefix8[..len]), (RTA_PREFSRC, &[][..])];
+                assert_eq!(request(ty, AF_INET6, prefix, &attrs), Err(dst_error));
+            }
+            assert_eq!(
+                request(ty, AF_INET6, 64, &[(RTA_PREFSRC, &prefix8)]),
+                Err(src_error)
+            );
+        }
+
+        let long_dst4 = [10, 71, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd];
+        let long_gw4 = [10, 70, 0, 254, 0x11, 0x22];
+        let long_src4 = [10, 70, 0, 1, 0x99, 0x88, 0x77];
+        let attrs4 = [
+            (RTA_DST, long_dst4.as_slice()),
+            (RTA_GATEWAY, &long_gw4),
+            (RTA_PREFSRC, &long_src4),
+        ];
+        request(RTM_NEWROUTE, AF_INET, 24, &attrs4).unwrap();
+        let added4 = entries(&n)
+            .into_iter()
+            .find(|e| e.family == AF_INET && e.dst == long_dst4[..4])
+            .unwrap();
+        assert_eq!(added4.gateway.as_deref(), Some(&long_gw4[..4]));
+        assert_eq!(added4.prefsrc.as_deref(), Some(&long_src4[..4]));
+        request(RTM_DELROUTE, AF_INET, 24, &attrs4).unwrap();
+        assert!(!entries(&n).iter().any(|e| e.dst == long_dst4[..4]));
+
+        let oif = i0.to_le_bytes();
+        let mut long_gw6 = vec![0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        long_gw6.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let mut long_src6 = src6.to_vec();
+        long_src6.extend_from_slice(&[0x12, 0x34]);
+        let attrs6 = [
+            (RTA_DST, prefix8.as_slice()),
+            (RTA_GATEWAY, &long_gw6),
+            (RTA_PREFSRC, &long_src6),
+            (RTA_OIF, &oif),
+        ];
+        let mut full_dst6 = [0; 16];
+        full_dst6[..8].copy_from_slice(&prefix8);
+        request(RTM_NEWROUTE, AF_INET6, 64, &attrs6).unwrap();
+        let added6 = entries(&n)
+            .into_iter()
+            .find(|e| e.family == AF_INET6 && e.dst == full_dst6)
+            .unwrap();
+        assert_eq!(added6.gateway.as_deref(), Some(&long_gw6[..16]));
+        assert_eq!(added6.prefsrc.as_deref(), Some(src6.as_slice()));
+        request(RTM_DELROUTE, AF_INET6, 64, &attrs6).unwrap();
+        assert!(!entries(&n).iter().any(|e| e.dst == full_dst6));
+
+        let mut long_dst6 = full_dst6.to_vec();
+        long_dst6.extend_from_slice(&[0xff; 4]);
+        for (prefix, dst) in [(0, &[][..]), (64, long_dst6.as_slice())] {
+            let attrs = [(RTA_DST, dst), (RTA_OIF, &oif)];
+            for ty in [RTM_NEWROUTE, RTM_DELROUTE] {
+                request(ty, AF_INET6, prefix, &attrs).unwrap();
+            }
+        }
     }
 }

@@ -6,7 +6,7 @@
 //! ready through [`Cx::wait`], releasing the BKL meanwhile; it can be interrupted by signals and
 //! times out according to `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,9 @@ pub(crate) type SocketRef = Rc<RefCell<Socket>>;
 const SOCK_TYPE_MASK: u32 = 0xf;
 const SOCK_NONBLOCK: u32 = oflags::O_NONBLOCK;
 const SOCK_CLOEXEC: u32 = oflags::O_CLOEXEC;
+const SOL_IP: i32 = 0;
+const IP_TOS: i32 = 1;
+const IP_TTL: i32 = 2;
 const IPPROTO_ICMP: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_IPV6: i32 = 41;
@@ -55,7 +58,12 @@ const NETLINK_EXT_ACK: i32 = 11;
 const NETLINK_GET_STRICT_CHK: i32 = 12;
 const SCM_CREDENTIALS: i32 = 2;
 const SO_REUSEADDR: i32 = 2;
+const SO_SNDBUF: i32 = 7;
+const SO_RCVBUF: i32 = 8;
+const SO_PRIORITY: i32 = 12;
+const SO_LINGER: i32 = 13;
 const SO_REUSEPORT: i32 = 15;
+const SO_RCVLOWAT: i32 = 18;
 const SO_BINDTODEVICE: i32 = 25;
 const SO_BINDTOIFINDEX: i32 = 62;
 const SO_ACCEPTCONN: i32 = 30;
@@ -140,7 +148,9 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
                     let _ = appine_hal::net::setsockopt(fd, level, name, &1i32.to_le_bytes());
                 }
                 let tap = crate::rawicmp::tap_for(cx.k(), &net)?;
-                s.icmp = Some(crate::rawicmp::RawIcmp::new(domain, tap));
+                let mut raw = crate::rawicmp::RawIcmp::new(domain, tap);
+                raw.sync_rcvbuf(fd);
+                s.icmp = Some(raw);
                 // The timer thread watches aggregation points for waiters in poll and epoll: this
                 // one may be new, so wake it
                 crate::kernel::signal_later(&cx.shared.timers);
@@ -266,18 +276,6 @@ pub(super) fn socketpair(
 
 // ---- Binding, listening, connecting, accepting ----
 
-/// Whether two host socket addresses name the same address (family and address, not the port).
-fn same_host(a: &[u8], b: &[u8]) -> bool {
-    match (a.get(..2), b.get(..2)) {
-        (Some(fa), Some(fb)) if fa == fb => match u16::from_le_bytes([fa[0], fa[1]]) as i32 {
-            AF_INET => a.get(4..8) == b.get(4..8),
-            AF_INET6 => a.get(8..24) == b.get(8..24),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
 pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     let (_file, sock, _) = socket_of(cx, fd)?;
     let addr = read_addr(cx, addr, len)?;
@@ -287,37 +285,38 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     if matches!(&*sock.borrow(), Socket::Netlink(_)) {
         return netlink_bind(cx, &sock, &addr).map(|()| 0);
     }
-    let kind = match &*sock.borrow() {
-        Socket::Inet(s) => Some((s.family, s.raw)),
-        _ => None,
-    };
-    let addr = match kind {
-        Some((family, raw)) => inet_bind_addr(family, raw, addr)?,
-        None => addr,
-    };
-    // In a new network namespace, translate to the host address first (EADDRNOTAVAIL when it is
-    // not a local address)
-    let (net, icmp6, raw) = match &*sock.borrow() {
-        Socket::Inet(s) => (s.net.clone(), s.icmp6(), s.icmp.is_some()),
-        _ => (None, false, false),
+    let (mut addr, net, icmp6, raw) = {
+        let socket = sock.borrow();
+        let Socket::Inet(s) = &*socket else {
+            unreachable!("inet bind")
+        };
+        let addr = inet_bind_addr(s.family, s.raw, addr)?;
+        let raw = s.icmp.is_some();
+        // raw_bind / rawv6_bind check the socket state before resolving the local address.
+        if raw && s.peer.is_some() {
+            return Err(Errno::EINVAL);
+        }
+        (addr, s.net.clone(), s.icmp6(), raw)
     };
     // Raw sockets have no port (Linux's raw_bind ignores it). The host's ping socket, however,
     // takes it as the echo number: busybox's traceroute binds the receiving socket to the sending
     // socket's address (got from getsockname, with the port), so the two would share one number
     // and replies would arrive on the other one
-    let mut addr = addr;
-    if raw && addr.len() >= 4 {
+    if raw {
         addr[2..4].fill(0);
     }
     let w = cx.kr().world();
     let me = net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone());
     let mapped = crate::netns::to_host(&w, &me, &addr, crate::netns::Use::Bind, icmp6)?;
+    if raw {
+        bind_raw(cx, &sock, &mapped.addr, &addr, mapped.vaddr)?;
+        return Ok(0);
+    }
     // In a new network namespace a datagram socket binding the wildcard address with port 0
     // (busybox's ping and Java's DatagramSocket do this): bind the wildcard address on the host
     // too, otherwise it cannot send to the outside (Socket::wide)
     let wide = net.is_some()
         && !icmp6
-        && !raw
         && matches!(&*sock.borrow(), Socket::Inet(s) if s.ty == SOCK_DGRAM)
         && crate::netns::is_any(&addr)
         && port_of(&addr) == Some(0);
@@ -465,12 +464,6 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                     s.lease = Some(lease);
                     s.local_map = Some((port, host));
                 }
-                // A raw socket may be bound again (raw_bind), but its host ping socket refuses a
-                // second bind: binding the address it already has succeeds without one
-                None if s.icmp.is_some()
-                    && appine_hal::net::sockname(s.fd, false).is_ok_and(|cur| {
-                        port_of(&cur) != Some(0) && same_host(&cur, &host_addr)
-                    }) => {}
                 None => {
                     appine_hal::net::bind(s.fd, &host_addr).map_err(Errno)?;
                     if s.net.is_some() {
@@ -502,6 +495,193 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         forward_all(cx.kr());
     }
     Ok(0)
+}
+
+/// Linux permits repeated binds on an unconnected raw socket. Its host ping socket
+/// permits only the first, so a change of host address needs a replacement fd.
+fn bind_raw(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    host_addr: &[u8],
+    addr: &[u8],
+    vaddr: Option<[u8; 4]>,
+) -> Result<(), Errno> {
+    let replacement = {
+        let socket = sock.borrow();
+        let Socket::Inet(s) = &*socket else {
+            unreachable!("raw ICMP socket")
+        };
+        let current = appine_hal::net::sockname(s.fd, false).map_err(Errno)?;
+        if port_of(&current) == Some(0) {
+            appine_hal::net::bind(s.fd, host_addr).map_err(Errno)?;
+            None
+        } else if same_host(&current, host_addr) {
+            None
+        } else {
+            let new = rebind_raw_host_fd(s, host_addr)?;
+            let (old, family, tap) = (s.fd, s.family, s.icmp.as_ref().unwrap().tap.clone());
+            // Dispatch may borrow any receiver, including this socket.
+            drop(socket);
+            take_errors(cx, &tap, old);
+            crate::rawicmp::replace_source(&tap, sock, old, new.as_raw_fd(), family)?;
+            Some(new)
+        }
+    };
+    let Socket::Inet(s) = &mut *sock.borrow_mut() else {
+        unreachable!("raw ICMP socket")
+    };
+    if let Some(new) = replacement {
+        let old = std::mem::replace(&mut s.fd, new.into_raw_fd());
+        s.icmp.as_mut().unwrap().sync_rcvbuf(s.fd);
+        appine_hal::net::close(old);
+    }
+    s.route = None;
+    s.any = s.net.is_some() && crate::netns::is_any(addr);
+    if s.net.is_some() {
+        s.bound = true;
+        s.vaddr = vaddr;
+        s.wide = false;
+    }
+    Ok(())
+}
+
+/// Whether two host socket addresses name the same address (family and address, not the port).
+fn same_host(a: &[u8], b: &[u8]) -> bool {
+    match (a.get(..2), b.get(..2)) {
+        (Some(fa), Some(fb)) if fa == fb => match u16::from_le_bytes([fa[0], fa[1]]) as i32 {
+            AF_INET => a.get(4..8) == b.get(4..8),
+            AF_INET6 => a.get(8..24) == b.get(8..24),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Creates a replacement host ping socket for rebinding a raw ICMP socket to `host_addr`,
+/// copying host-side options and binding atomically (closing the new fd on failure so the old
+/// socket stays untouched).
+fn rebind_raw_host_fd(s: &InetSocket, host_addr: &[u8]) -> Result<OwnedFd, Errno> {
+    let fd = appine_hal::net::socket(s.family, SOCK_DGRAM, s.proto).map_err(Errno)?;
+    // SAFETY: socket returned a new fd, owned here until bind commits the replacement.
+    let new = unsafe { OwnedFd::from_raw_fd(fd) };
+    copy_raw_host_options(s, fd)?;
+    appine_hal::net::bind(fd, host_addr).map_err(Errno)?;
+    Ok(new)
+}
+
+/// Copies host-side options to a freshly created ping socket before its first bind.
+fn copy_raw_host_options(s: &InetSocket, new_fd: i32) -> Result<(), Errno> {
+    const SO_DONTROUTE: i32 = 5;
+    const SO_BROADCAST: i32 = 6;
+    const SO_OOBINLINE: i32 = 10;
+    const SO_TIMESTAMP: i32 = 29;
+    const SO_TIMESTAMPNS: i32 = 35;
+    const SO_TIMESTAMPING: i32 = 37;
+    const SO_TIMESTAMP_NEW: i32 = 63;
+    const SO_TIMESTAMPNS_NEW: i32 = 64;
+    const SO_TIMESTAMPING_NEW: i32 = 65;
+
+    let old_fd = s.fd;
+    // Linux doubles SO_RCVBUF / SO_SNDBUF on setsockopt.
+    for opt in [SO_RCVBUF, SO_SNDBUF] {
+        let size = int_option(old_fd, opt)?;
+        if int_option(new_fd, opt)? != size {
+            appine_hal::net::setsockopt(new_fd, SOL_SOCKET, opt, &(size / 2).to_ne_bytes())
+                .map_err(Errno)?;
+        }
+    }
+
+    // Some options are unavailable on older hosts. A fresh socket already has the
+    // defaults, including disabled privileged options such as IP_TRANSPARENT.
+    let copy = |level, name, len| -> Result<(), Errno> {
+        if let Ok(value) = appine_hal::net::getsockopt(old_fd, level, name, len)
+            && !value.is_empty()
+            && appine_hal::net::getsockopt(new_fd, level, name, len).as_ref() != Ok(&value)
+        {
+            appine_hal::net::setsockopt(new_fd, level, name, &value).map_err(Errno)?;
+        }
+        Ok(())
+    };
+    for &(level, name) in crate::rawicmp::RawIcmp::host_options(s.family) {
+        copy(level, name, 4)?;
+    }
+    for opt in [
+        SO_REUSEADDR,
+        SO_DONTROUTE,
+        SO_BROADCAST,
+        SO_OOBINLINE,
+        SO_RCVLOWAT,
+        SO_REUSEPORT,
+        SO_TIMESTAMP,
+        SO_TIMESTAMPNS,
+        SO_TIMESTAMPING,
+        SO_TIMESTAMP_NEW,
+        SO_TIMESTAMPNS_NEW,
+        SO_TIMESTAMPING_NEW,
+    ] {
+        copy(SOL_SOCKET, opt, 4)?;
+    }
+    copy(SOL_SOCKET, SO_LINGER, 8)?;
+    if s.family == AF_INET {
+        for opt in [
+            6,  // IP_RECVOPTS
+            7,  // IP_RETOPTS
+            10, // IP_MTU_DISCOVER
+            13, // IP_RECVTOS
+            15, // IP_FREEBIND
+            18, // IP_PASSSEC
+            19, // IP_TRANSPARENT
+            20, // IP_RECVORIGDSTADDR
+            21, // IP_MINTTL
+            IP_TOS, IP_TTL,
+        ] {
+            copy(SOL_IP, opt, 4)?;
+        }
+    } else {
+        for opt in [
+            16, // IPV6_UNICAST_HOPS
+            23, // IPV6_MTU_DISCOVER
+            49, // IPV6_RECVPKTINFO
+            51, // IPV6_RECVHOPLIMIT
+            53, // IPV6_RECVHOPOPTS
+            56, // IPV6_RECVRTHDR
+            58, // IPV6_RECVDSTOPTS
+            66, // IPV6_RECVTCLASS
+            67, // IPV6_TCLASS
+            78, // IPV6_FREEBIND
+        ] {
+            copy(IPPROTO_IPV6, opt, 4)?;
+        }
+        if s.net.is_none() {
+            copy(IPPROTO_IPV6, IPV6_V6ONLY, 4)?;
+        }
+    }
+    // IP_TOS changes sk_priority, even when the guest subsequently reset it to zero.
+    copy(SOL_SOCKET, SO_PRIORITY, 4)?;
+    if s.net.is_none() && s.bound_dev_if != 0 {
+        let dev =
+            appine_hal::net::getsockopt(old_fd, SOL_SOCKET, SO_BINDTODEVICE, 16).map_err(Errno)?;
+        if !dev.is_empty() {
+            appine_hal::net::setsockopt(new_fd, SOL_SOCKET, SO_BINDTODEVICE, &dev)
+                .map_err(Errno)?;
+        }
+    }
+    let n = match appine_hal::net::get_filter(old_fd, 0) {
+        Ok((count, _)) => count,
+        Err(e) if e == Errno::ENOPROTOOPT.0 => 0,
+        Err(e) => return Err(Errno(e)),
+    };
+    if n > 0 {
+        if n as usize > BPF_MAXINSNS {
+            return Err(Errno::EINVAL);
+        }
+        let (got, insns) = appine_hal::net::get_filter(old_fd, n).map_err(Errno)?;
+        if got != n || insns.len() != n as usize * 8 {
+            return Err(Errno::EINVAL);
+        }
+        attach_host_filter(new_fd, SO_ATTACH_FILTER, &insns).map_err(Errno)?;
+    }
+    copy(SOL_SOCKET, SO_LOCK_FILTER, 4)
 }
 
 /// bind on a netlink socket (Linux's `netlink_bind`): the address must be a whole
@@ -1682,8 +1862,6 @@ pub(super) fn setsockopt(
     value: u64,
     len: u32,
 ) -> SysResult {
-    const SO_SNDBUF: i32 = 7;
-    const SO_RCVBUF: i32 = 8;
     const SO_SNDBUFFORCE: i32 = 32;
     const SO_RCVBUFFORCE: i32 = 33;
     let (_file, sock, _) = socket_of(cx, fd)?;
@@ -1857,6 +2035,12 @@ fn set_inet_option(
         _ => {
             appine_hal::net::setsockopt(s.fd, level, name, v).map_err(Errno)?;
             if level == SOL_SOCKET
+                && name == SO_RCVBUF
+                && let Some(r) = &mut s.icmp
+            {
+                r.sync_rcvbuf(s.fd);
+            }
+            if level == SOL_SOCKET
                 && matches!(name, SO_REUSEADDR | SO_REUSEPORT)
                 && let (Some(net), Some(id)) = (&s.net, s.listener)
             {
@@ -1980,10 +2164,7 @@ fn attach_classic_filter(
     }
     let mut insns = vec![0u8; n * 8];
     cx.mm().read(UserSlice::new(ptr, n * 8), &mut insns)?;
-    let mut host = [0u8; 16];
-    host[..2].copy_from_slice(&(n as u16).to_le_bytes());
-    host[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
-    let attach = |fd: i32| appine_hal::net::setsockopt(fd, SOL_SOCKET, name, &host);
+    let attach = |fd| attach_host_filter(fd, name, &insns);
     let emulate = tcp_filter && (crate::bug::host_refuses_tcp_filters() || s.deferred.is_some());
     if !emulate {
         match attach(s.fd) {
@@ -2009,6 +2190,14 @@ fn attach_classic_filter(
         return Err(Errno::EOPNOTSUPP);
     }
     Ok(Some(insns))
+}
+
+/// Pass a validated instruction count and a live host pointer as a sock_fprog.
+fn attach_host_filter(fd: i32, name: i32, insns: &[u8]) -> Result<(), i32> {
+    let mut prog = [0u8; 16];
+    prog[..2].copy_from_slice(&((insns.len() / 8) as u16).to_ne_bytes());
+    prog[8..].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
+    appine_hal::net::setsockopt(fd, SOL_SOCKET, name, &prog)
 }
 
 /// A validated straight-line program ending in RET UINT_MAX. The preceding immediate/length
@@ -3892,7 +4081,6 @@ fn wait_peek(
     nonblock: bool,
     deadline: Option<Instant>,
 ) -> Result<bool, Errno> {
-    const SO_RCVLOWAT: i32 = 18;
     if nonblock {
         return Err(Errno::EAGAIN);
     }
@@ -4987,7 +5175,6 @@ pub(crate) fn deliver_dns(k: &mut crate::kernel::Kernel, answers: &crate::kernel
         if let Socket::Inet(s) = &mut *sock.borrow_mut() {
             // A full receive queue drops the answer (__udp_enqueue_schedule_skb: what is queued
             // already exceeds SO_RCVBUF), counting answers by their length
-            const SO_RCVBUF: i32 = 8;
             let rcvbuf = appine_hal::net::getsockopt(s.fd, SOL_SOCKET, SO_RCVBUF, 4)
                 .ok()
                 .and_then(|v| Some(i32::from_le_bytes(v.get(..4)?.try_into().ok()?)))
@@ -5566,4 +5753,87 @@ fn is_outside_host(addr: &[u8]) -> bool {
         std::net::IpAddr::V4(v) => v.octets()[..2] == [127, crate::forward::OUTSIDE_BLOCK],
         std::net::IpAddr::V6(_) => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sockaddr_in(ip: [u8; 4], port: u16) -> Vec<u8> {
+        let mut a = vec![0u8; 16];
+        a[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        a[2..4].copy_from_slice(&port.to_be_bytes());
+        a[4..8].copy_from_slice(&ip);
+        a
+    }
+
+    #[test]
+    fn rebind_raw_host_fd_copies_options_and_is_atomic_on_error() {
+        let fd1 = match appine_hal::net::socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP) {
+            Err(e) if e == Errno::EACCES.0 || e == Errno::EPERM.0 => return,
+            result => result.unwrap(),
+        };
+        let mut inet = InetSocket::new(fd1, AF_INET, SOCK_DGRAM);
+        inet.raw = true;
+        inet.proto = IPPROTO_ICMP;
+        let lo1 = sockaddr_in([127, 0, 0, 1], 0);
+        let lo2 = sockaddr_in([127, 0, 0, 2], 0);
+        appine_hal::net::bind(fd1, &lo1).unwrap();
+        appine_hal::net::setsockopt(fd1, SOL_SOCKET, SO_BINDTODEVICE, b"lo\0").unwrap();
+        inet.bound_dev_if = int_option(fd1, SO_BINDTOIFINDEX).unwrap();
+        for (level, opt, value) in [
+            (SOL_SOCKET, SO_RCVBUF, 8192i32),
+            (SOL_SOCKET, SO_SNDBUF, 4096),
+            (SOL_SOCKET, SO_RCVLOWAT, 17),
+            (SOL_IP, IP_TTL, 42),
+            (SOL_IP, IP_TOS, 16),
+            (SOL_SOCKET, SO_PRIORITY, 0),
+        ] {
+            appine_hal::net::setsockopt(fd1, level, opt, &value.to_ne_bytes()).unwrap();
+        }
+        let linger = [1i32.to_ne_bytes(), 7i32.to_ne_bytes()].concat();
+        appine_hal::net::setsockopt(fd1, SOL_SOCKET, SO_LINGER, &linger).unwrap();
+        attach_host_filter(fd1, SO_ATTACH_FILTER, DROP_TCP).unwrap();
+        appine_hal::net::setsockopt(fd1, SOL_SOCKET, SO_LOCK_FILTER, &1i32.to_ne_bytes()).unwrap();
+
+        // Rebinding to an invalid non-local address fails cleanly without touching fd1.
+        let bogus = sockaddr_in([203, 0, 113, 9], 0);
+        assert_eq!(
+            rebind_raw_host_fd(&inet, &bogus).unwrap_err(),
+            Errno::EADDRNOTAVAIL
+        );
+        assert!(same_host(
+            &appine_hal::net::sockname(fd1, false).unwrap(),
+            &lo1
+        ));
+
+        // Rebinding to a different local address succeeds and preserves host options.
+        let replacement = rebind_raw_host_fd(&inet, &lo2).unwrap();
+        let fd2 = replacement.as_raw_fd();
+        assert!(same_host(
+            &appine_hal::net::sockname(fd2, false).unwrap(),
+            &lo2
+        ));
+        for (level, opt, size) in [
+            (SOL_SOCKET, SO_RCVBUF, 4),
+            (SOL_SOCKET, SO_SNDBUF, 4),
+            (SOL_SOCKET, SO_RCVLOWAT, 4),
+            (SOL_SOCKET, SO_LINGER, 8),
+            (SOL_SOCKET, SO_BINDTODEVICE, 16),
+            (SOL_IP, IP_TTL, 4),
+            (SOL_IP, IP_TOS, 4),
+            (SOL_SOCKET, SO_PRIORITY, 4),
+        ] {
+            assert_eq!(
+                appine_hal::net::getsockopt(fd2, level, opt, size).unwrap(),
+                appine_hal::net::getsockopt(fd1, level, opt, size).unwrap(),
+                "option {level}/{opt}"
+            );
+        }
+        assert_eq!(
+            appine_hal::net::get_filter(fd2, 1).unwrap(),
+            (1, DROP_TCP.to_vec())
+        );
+        assert!(filter_locked(fd2));
+    }
 }

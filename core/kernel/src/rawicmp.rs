@@ -48,6 +48,7 @@ use crate::net::{AF_INET, AF_INET6, IPPROTO_ICMP, IPPROTO_UDP, InetSocket, SOCK_
 use crate::nsproxy::NetNs;
 
 const SOL_SOCKET: i32 = 1;
+const SO_RCVBUF: i32 = 8;
 const SOL_IP: i32 = 0;
 const SOL_IPV6: i32 = 41;
 const SOL_ICMPV6: i32 = 58;
@@ -81,9 +82,9 @@ const MSG_CTRUNC: u32 = 0x08;
 const CMSG_HDR: usize = 16;
 /// The longest an ICMP message can be (the IP total length is 16 bits).
 const PACKET_MAX: usize = 1 << 16;
-/// The most bytes queued per raw socket (Linux's default `rmem_default`); what does not fit is
-/// dropped.
-const QUEUE_MAX: usize = 212_992;
+/// Fallback receive-queue byte cap when the host socket's `SO_RCVBUF` cannot be queried
+/// (Linux's default `rmem_default`).
+const DEFAULT_RCVBUF: usize = 212_992;
 /// Room for control messages the host may leave when sending and receiving.
 const CONTROL_ROOM: usize = 512;
 
@@ -103,6 +104,9 @@ pub(crate) struct RawIcmp {
     recverr: bool,
     /// The value of `IPV6_CHECKSUM`; -1 means not computed.
     checksum: i32,
+    /// Receive-queue byte cap synced from the host socket's `SO_RCVBUF` (which already applies
+    /// Linux's doubling, `SOCK_MIN_RCVBUF` floor, and `rmem_max` clamp).
+    rcvbuf: usize,
     /// Every received message goes through it and is queued there.
     pub tap: Rc<RefCell<Tap>>,
 }
@@ -116,8 +120,25 @@ impl RawIcmp {
             pktinfo: false,
             recverr: false,
             checksum: 2,
+            rcvbuf: DEFAULT_RCVBUF,
             tap,
         }
+    }
+
+    /// Refreshes the receive-queue byte limit from host socket `fd`'s `SO_RCVBUF`.
+    pub fn sync_rcvbuf(&mut self, fd: i32) {
+        if let Ok(v) = appine_hal::net::getsockopt(fd, SOL_SOCKET, SO_RCVBUF, 4)
+            && let Some(bytes) = v.first_chunk()
+            && let n = i32::from_ne_bytes(*bytes)
+            && n > 0
+        {
+            self.rcvbuf = n as usize;
+        }
+    }
+
+    /// Current receive-queue byte cap (`SO_RCVBUF`).
+    pub fn rcvbuf(&self) -> usize {
+        self.rcvbuf
     }
 
     /// The options to enable on the host's ping socket for the guest.
@@ -416,17 +437,23 @@ impl Tap {
         self.watch.fd()
     }
 
-    fn add_source(&mut self, sock: &Rc<RefCell<Socket>>, fd: i32, family: i32, udp: bool) {
+    fn add_source(
+        &mut self,
+        sock: &Rc<RefCell<Socket>>,
+        fd: i32,
+        family: i32,
+        udp: bool,
+    ) -> Result<(), Errno> {
         // Watch only the UDP socket's errors (the error queue), not the data it receives
-        if self.watch.add(fd, !udp).is_ok() {
-            self.sources.push(Source {
-                fd,
-                sock: Rc::downgrade(sock),
-                family,
-                udp,
-                key: wake::of(sock),
-            });
-        }
+        self.watch.add(fd, !udp).map_err(Errno)?;
+        self.sources.push(Source {
+            fd,
+            sock: Rc::downgrade(sock),
+            family,
+            udp,
+            key: wake::of(sock),
+        });
+        Ok(())
     }
 
     fn remove_source(&mut self, fd: i32) {
@@ -472,7 +499,7 @@ fn find_tap(k: &Kernel, net: &Option<Rc<NetNs>>) -> Option<Rc<RefCell<Tap>>> {
 /// a source, and it has a queue of its own.
 pub(crate) fn register(tap: &Rc<RefCell<Tap>>, sock: &Rc<RefCell<Socket>>, fd: i32, family: i32) {
     let mut t = tap.borrow_mut();
-    t.add_source(sock, fd, family, false);
+    let _ = t.add_source(sock, fd, family, false);
     t.receivers.push(Receiver {
         key: wake::of(sock),
         sock: Rc::downgrade(sock),
@@ -482,6 +509,22 @@ pub(crate) fn register(tap: &Rc<RefCell<Tap>>, sock: &Rc<RefCell<Socket>>, fd: i
         arrivals: 0,
         errors: VecDeque::new(),
     });
+}
+
+/// Replaces a raw socket's host ping fd in its aggregation point (after rebinding to another host
+/// address). Watch the replacement before retiring the old source so registration failure
+/// preserves the socket's watch. Both receive queues belong to the receiver.
+pub(crate) fn replace_source(
+    tap: &Rc<RefCell<Tap>>,
+    sock: &Rc<RefCell<Socket>>,
+    old_fd: i32,
+    new_fd: i32,
+    family: i32,
+) -> Result<(), Errno> {
+    let mut t = tap.borrow_mut();
+    t.add_source(sock, new_fd, family, false)?;
+    t.remove_source(old_fd);
+    Ok(())
 }
 
 // ---- UDP sockets that set a TTL ----
@@ -561,7 +604,7 @@ pub(crate) fn before_io(k: &Kernel, sock: &Rc<RefCell<Socket>>) -> Option<Rc<Ref
     let tap = find_tap(k, &net).filter(|t| t.borrow_mut().has_receivers(family))?;
     let (level, name) = recverr_option(family);
     appine_hal::net::setsockopt(fd, level, name, &1i32.to_le_bytes()).ok()?;
-    tap.borrow_mut().add_source(sock, fd, family, true);
+    let _ = tap.borrow_mut().add_source(sock, fd, family, true);
     if let Socket::Inet(s) = &mut *sock.borrow_mut() {
         s.udp_tap = Some(tap.clone());
     }
@@ -1150,9 +1193,12 @@ fn deliver(tap: &Rc<RefCell<Tap>>, items: Vec<(i32, Item)>) {
         else {
             continue;
         };
+        let limit = raw.rcvbuf();
         let mut got = false;
         for (family, it) in &items {
-            if *family != r.family || !raw.passes(it.icmp[0]) || r.bytes + it.icmp.len() > QUEUE_MAX
+            if *family != r.family
+                || !raw.passes(it.icmp[0])
+                || (!r.queue.is_empty() && r.bytes.saturating_add(it.icmp.len()) > limit)
             {
                 continue;
             }
@@ -1409,5 +1455,118 @@ mod tests {
         assert_eq!(fit_control(&control, 32 + 20), (control[..52].to_vec(), 0));
         assert_eq!(fit_control(&control, 8), (Vec::new(), MSG_CTRUNC));
         assert_eq!(fit_control(&control, 64), (control.clone(), 0));
+    }
+
+    fn receiver() -> (Rc<RefCell<Tap>>, Rc<RefCell<Socket>>, i32) {
+        let tap = Rc::new(RefCell::new(Tap {
+            watch: Watch::new().unwrap(),
+            net: None,
+            echoes: Echoes::default(),
+            sources: Vec::new(),
+            receivers: Vec::new(),
+        }));
+        let fd = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        let mut inet = InetSocket::new(fd, AF_INET, SOCK_DGRAM);
+        inet.raw = true;
+        inet.proto = IPPROTO_ICMP;
+        inet.icmp = Some(RawIcmp::new(AF_INET, tap.clone()));
+        let sock = Rc::new(RefCell::new(Socket::Inet(inet)));
+        register(&tap, &sock, fd, AF_INET);
+        (tap, sock, fd)
+    }
+
+    fn reply(key: usize, len: usize) -> (i32, Item) {
+        let item = data_item(
+            AF_INET,
+            vec![ICMP_ECHOREPLY; len],
+            sockaddr_in([127, 0, 0, 1], 0),
+            &[],
+            key,
+        );
+        (AF_INET, item)
+    }
+
+    #[test]
+    fn receive_queue_cap_honors_so_rcvbuf_and_empty_queue_admission() {
+        let (tap, sock, _) = receiver();
+        let key = wake::of(&sock);
+        let set_limit = |limit| {
+            let Socket::Inet(s) = &mut *sock.borrow_mut() else {
+                unreachable!()
+            };
+            s.icmp.as_mut().unwrap().rcvbuf = limit;
+        };
+        set_limit(2304);
+
+        // Two 1000-byte packets fit within 2304; the third (3000 > 2304) is dropped.
+        deliver(&tap, vec![reply(key, 1000); 3]);
+        assert_eq!(queued(&tap, key), (true, 2));
+        assert!(take(&tap, key, false).is_some());
+        // Draining 1000 bytes frees room for another 1000-byte packet.
+        deliver(&tap, vec![reply(key, 1000)]);
+        assert_eq!(queued(&tap, key), (true, 3));
+        assert!(take(&tap, key, false).is_some());
+        assert!(take(&tap, key, false).is_some());
+        assert_eq!(queued(&tap, key), (false, 3));
+
+        // Empty queue admits a single packet larger than SO_RCVBUF, then drops subsequent ones.
+        deliver(&tap, vec![reply(key, 3000), reply(key, 64)]);
+        assert_eq!(queued(&tap, key), (true, 4));
+        assert_eq!(take(&tap, key, false).unwrap().icmp.len(), 3000);
+        assert!(take(&tap, key, false).is_none());
+
+        // Raising SO_RCVBUF above the old 212,992 constant allows queueing more than 212,992 bytes.
+        set_limit(300_000);
+        deliver(&tap, vec![reply(key, 60_000); 6]);
+        // 5 * 60_000 = 300_000 fit; the 6th is dropped.
+        assert_eq!(queued(&tap, key), (true, 9));
+        let mut drained = 0;
+        while take(&tap, key, false).is_some() {
+            drained += 1;
+        }
+        assert_eq!(drained, 5);
+    }
+
+    #[test]
+    fn sync_rcvbuf_and_replace_source_preserve_receiver_queue() {
+        let (tap, sock, fd1) = receiver();
+        let key = wake::of(&sock);
+        appine_hal::net::setsockopt(fd1, SOL_SOCKET, SO_RCVBUF, &8192i32.to_ne_bytes()).unwrap();
+        let expected = appine_hal::net::getsockopt(fd1, SOL_SOCKET, SO_RCVBUF, 4).unwrap();
+        {
+            let Socket::Inet(s) = &mut *sock.borrow_mut() else {
+                unreachable!()
+            };
+            let raw = s.icmp.as_mut().unwrap();
+            assert_eq!(raw.rcvbuf(), DEFAULT_RCVBUF);
+            raw.sync_rcvbuf(fd1);
+            assert_eq!(
+                raw.rcvbuf(),
+                i32::from_ne_bytes(expected.try_into().unwrap()) as usize
+            );
+            assert!(raw.rcvbuf() >= 2304);
+        }
+        deliver(&tap, vec![reply(key, 64)]);
+        // A failed registration must keep the old source watched.
+        assert_eq!(
+            replace_source(&tap, &sock, fd1, -1, AF_INET),
+            Err(Errno::EBADF)
+        );
+        assert_eq!(tap.borrow().sources[0].fd, fd1);
+        let fd2 = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        let mut replacement = InetSocket::new(fd2, AF_INET, SOCK_DGRAM);
+        replace_source(&tap, &sock, fd1, fd2, AF_INET).unwrap();
+        {
+            let t = tap.borrow();
+            assert_eq!(t.sources.len(), 1);
+            assert_eq!(t.sources[0].fd, fd2);
+            assert_eq!(t.receivers.len(), 1);
+        }
+        // Queued reply survives source replacement.
+        assert!(take(&tap, key, false).is_some());
+        let Socket::Inet(s) = &mut *sock.borrow_mut() else {
+            unreachable!()
+        };
+        std::mem::swap(&mut s.fd, &mut replacement.fd);
     }
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: PREROUTING filter chains split around DNAT priority so pre-DNAT chains see the pre-DNAT destination and post-DNAT chains see the post-DNAT destination, including initial-ns PREROUTING in `external_filter`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: full `127.0.0.0/8` loopback range in non-init namespaces and Linux 6.1 `RTA_DST`/`RTA_GATEWAY`/`RTA_PREFSRC` length handling in `RTM_NEWROUTE`/`RTM_DELROUTE`)
 
 ## Responsibilities
 
@@ -91,12 +91,16 @@ sockets (`hal`).
 
 ### Address translation
 
-- Binding in a new namespace: the wildcard and `::` → 127.a.b.1 (flag `any`); 127.0.0.x →
-  127.a.b.x (bindable even with lo down); other 127/8 addresses `EADDRNOTAVAIL`; the namespace's
-  own virtual IPv4 address → 127.a.b.1 (recording `vaddr`); anything else `EADDRNOTAVAIL`. IPv6
-  `::1`/`::` become `::ffff:127.a.b.1` (host sockets stay dual-stack). A wildcard UDP bind to port
-  0 gets a real host wildcard bind (`wide`) so it can also reach outside.
-- Reaching from a new namespace: 127.0.0.x needs lo up and a covering address; `::1` needs lo up
+- Binding in a new namespace: the wildcard and `::` → 127.a.b.1 (flag `any`); `127.0.0.1..=253` →
+  `127.a.b.1..=253` (bindable even with lo down), and all other `127.0.0.0/8` addresses (including
+  `127.0.1.1`, `127.1.2.3`, and `127.0.0.254` so it does not collide with `SELF_VIA_VADDR`) →
+  `127.a.b.1` with `vaddr` recording the exact guest IP (`Bindings` separates host ports per guest
+  address); the namespace's own virtual IPv4 address → 127.a.b.1 (recording `vaddr`); anything else
+  `EADDRNOTAVAIL`. IPv6 `::1`/`::` become `::ffff:127.a.b.1` (host sockets stay dual-stack). A
+  wildcard UDP bind to port 0 gets a real host wildcard bind (`wide`) so it can also reach outside.
+- Reaching from a new namespace: any `127.0.0.0/8` address needs lo up and a covering address
+  (`127.0.0.1..=253` → `127.a.b.1..=253`, others → `127.a.b.1` and resolved to the matching
+  listener's host port via `Bindings`); `::1` needs lo up
   with IPv6; the own virtual address → 127.a.b.1 with source 127.a.b.254; another namespace's
   virtual address (through a route over a virtual device) → its 127.c.d.1, or 127.255.x.y for the
   initial namespace's; an address nobody owns, routed through a gateway, goes to the host network
@@ -194,7 +198,11 @@ sockets (`hal`).
 - IPv4 addresses: same-subnet extras become secondary; duplicates `EEXIST` unless replacing; local
   route always, subnet and broadcast routes while up; deleting a primary deletes its secondaries.
   IPv6 addresses: `EACCES` with IPv6 disabled; removed on down unless `keep_addr_on_down`.
-- Routes: unicast only, table ≤ 255, next hop an up virtual device (host interfaces and lo
+- Routes: unicast only, table ≤ 255, address-attribute lengths match Linux 6.1 (`rtm_ipv4_policy` /
+  `rtm_ipv6_policy` + `rtm_to_fib6_config`: IPv4 `RTA_DST`/`RTA_GATEWAY`/`RTA_PREFSRC` < 4 bytes
+  `ERANGE` and ≥ 4 uses first 4 bytes; IPv6 `RTA_GATEWAY` < 16 bytes `ERANGE` and ≥ 16 uses first
+  16 bytes; IPv6 `RTA_DST` < `ceil(dst_len / 8)` bytes `EINVAL` and zero-pads up to 16 bytes; IPv6
+  `RTA_PREFSRC` < 16 bytes `EINVAL` and ≥ 16 uses first 16 bytes), next hop an up virtual device (host interfaces and lo
   `EOPNOTSUPP`), all-zero `RTA_GATEWAY` counts as no gateway, gateways without a device resolve to
   the first (lowest-index) matching longest-prefix subnet, IPv6 link-local gateways with an explicit
   up device are accepted without routing-table lookup (working without carrier; `EINVAL` without a
@@ -327,14 +335,8 @@ sockets (`hal`).
 - **Namespace isolation is guest-side only:** although initial-namespace guests are blocked from
   directly accessing allocated container `127.a.b.x` blocks, other apps on the host device can
   still reach a container's host loopback sockets directly.
-- **Smaller deviations:** only 127.0.0.0/24 works as loopback in a namespace (Linux: 127/8); IPv6 on
-  virtual devices is unusable and on-link IPv6 is handed to the host. `kernel/nft` records the
-  unsupported POSTROUTING, SNAT and MASQUERADE effects.
-- **Route requests insist on exact address sizes:** `RTA_DST`, `RTA_GATEWAY` and `RTA_PREFSRC` in
-  `RTM_NEWROUTE`/`RTM_DELROUTE` must be exactly 4 or 16 bytes, otherwise `EINVAL`; Linux 6.1
-  answers `ERANGE` for a short IPv4 attribute or IPv6 gateway, uses the first 4 bytes of a longer
-  IPv4 attribute, and needs only the prefix's bytes of an IPv6 destination. iproute2 sends exact
-  sizes, so only oddly encoded requests are affected.
+- **Smaller deviations:** IPv6 on virtual devices is unusable and on-link IPv6 is handed to the
+  host. `kernel/nft` records the unsupported POSTROUTING, SNAT and MASQUERADE effects.
 
 ## Open questions
 

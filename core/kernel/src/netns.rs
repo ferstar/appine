@@ -2,14 +2,15 @@
 //! devices are in [`crate::netdev`]).
 //!
 //! Sockets stay host sockets, and addresses are translated at the syscall boundary: the guest's
-//! 127.0.0.x is the host's 127.a.b.x given to this namespace, and binding the wildcard address
-//! binds 127.a.b.1; AF_INET6 ::1 and :: are the IPv4-mapped ::ffff:127.a.b.1 (host sockets do not
-//! set `IPV6_V6ONLY`). As seen on Linux, 127.0.0.x can be bound even while lo is down or has no
-//! address, but is reachable only while lo is up with an address covering it. Virtual addresses
-//! and routed destinations are translated as [`to_host`] describes; other addresses cannot be
-//! bound (EADDRNOTAVAIL) or reached (ENETUNREACH). A socket that connects, sends or listens
-//! without being bound is first bound to 127.a.b.1, so that the host does not bind it to all
-//! interfaces instead.
+//! 127.0.0.1..=253 map to the host's 127.a.b.1..=253 given to this namespace, other 127.0.0.0/8
+//! addresses and the wildcard address bind 127.a.b.1 (with `vaddr` and `Bindings` preserving each
+//! distinct guest address), and AF_INET6 ::1 and :: are the IPv4-mapped ::ffff:127.a.b.1 (host
+//! sockets do not set `IPV6_V6ONLY`). As seen on Linux, 127.0.0.0/8 can be bound even while lo is
+//! down or has no address, but is reachable only while lo is up with an address covering it.
+//! Virtual addresses and routed destinations are translated as [`to_host`] describes; other
+//! addresses cannot be bound (EADDRNOTAVAIL) or reached (ENETUNREACH). A socket that connects,
+//! sends or listens without being bound is first bound to 127.a.b.1, so that the host does not
+//! bind it to all interfaces instead.
 //!
 //! lo's configuration is read and written through netlink (`RTM_NEWADDR`, `RTM_DELADDR`,
 //! `RTM_NEWLINK`) and interface ioctls, which is how bubblewrap brings lo up.
@@ -49,8 +50,8 @@ pub(crate) const FIRST_BLOCK: u16 = 2;
 pub(crate) const INIT_BLOCK: u8 = 255;
 
 /// 127.a.b.254, which a new namespace binds as the source when connecting to its own virtual
-/// address: translated back, it is this namespace's virtual address (so the guest's 127.0.0.254
-/// is reported as the virtual address).
+/// address: translated back, it is this namespace's virtual address (guest `127.0.0.254` maps onto
+/// `127.a.b.1` with `vaddr` so it never collides with this host address).
 const SELF_VIA_VADDR: u8 = 254;
 
 impl World {
@@ -224,14 +225,17 @@ pub(crate) fn to_host(
                 };
             }
             if ip[0] == 127 {
-                return if ip[..3] == [127, 0, 0] && lo.has_v4(ip, usage) {
-                    let vaddr =
-                        (usage == Use::Bind && family(addr) == Some(AF_INET6) && ip[3] == 1)
-                            .then_some(ip);
-                    Ok(mapped_to(block(ip[3]), me, vaddr))
-                } else {
-                    Err(fail())
-                };
+                if !lo.has_v4(ip, usage) {
+                    return Err(fail());
+                }
+                // Keep the direct host suffixes below SELF_VIA_VADDR. Other loopback
+                // addresses share .1, with Bindings separating their host ports.
+                let direct = ip[..3] == [127, 0, 0] && (1..SELF_VIA_VADDR).contains(&ip[3]);
+                let host_ip = block(if direct { ip[3] } else { 1 });
+                let vaddr = (usage == Use::Bind
+                    && (!direct || (family(addr) == Some(AF_INET6) && ip[3] == 1)))
+                    .then_some(ip);
+                return Ok(mapped_to(host_ip, me, vaddr));
             }
             drop(lo);
             if crate::netdev::local_v4(me).iter().any(|(x, _)| *x == ip) {
@@ -2278,6 +2282,35 @@ mod tests {
         assert_ne!(other[4..8], [192, 168, 1, 50]);
     }
 
+    fn bind_listener(
+        ns: &NetNs,
+        proto: i32,
+        port: u16,
+        addr: BindAddr,
+        v6only: bool,
+        host_ip: [u8; 4],
+        host_port: u16,
+    ) -> std::num::NonZeroU64 {
+        add_binding(
+            ns,
+            port,
+            NewBinding {
+                proto,
+                addr,
+                v6only,
+                reuseaddr: false,
+                reuseport: false,
+                euid: 0,
+                bound_dev_if: 0,
+                listening: true,
+                accepted: false,
+                host_ip,
+                host_port,
+                wide: false,
+            },
+        )
+    }
+
     /// Listener resolution: wildcard addresses go by address family and `IPV6_V6ONLY`; exact
     /// guest addresses take priority over wildcards and return their own distinct host endpoints
     /// (`127.0.0.1:P` vs `<vaddr>:P` vs `[::1]:P` vs `0.0.0.0:P`).
@@ -2289,24 +2322,7 @@ mod tests {
         let eth0 = [10, 9, 0, 2];
         let eth1 = [10, 9, 1, 2];
         let bind = |proto, port, addr, v6only, host_ip, host_port| {
-            add_binding(
-                &n,
-                port,
-                NewBinding {
-                    proto,
-                    addr,
-                    v6only,
-                    reuseaddr: false,
-                    reuseport: false,
-                    euid: 0,
-                    bound_dev_if: 0,
-                    listening: true,
-                    accepted: false,
-                    host_ip,
-                    host_port,
-                    wide: false,
-                },
-            )
+            bind_listener(&n, proto, port, addr, v6only, host_ip, host_port)
         };
         let a = bind(tcp, 7000, BindAddr::AnyV4, false, [127, 1, 2, 1], 41000);
         bind(tcp, 7001, BindAddr::AnyV6, true, [127, 1, 2, 1], 41001);
@@ -2857,10 +2873,6 @@ mod tests {
             th(&ns, &v4([8, 8, 8, 8], 53), Use::Reach, false),
             Err(Errno::ENETUNREACH)
         );
-        assert_eq!(
-            th(&ns, &v4([127, 1, 0, 1], 80), Use::Bind, false),
-            Err(Errno::EADDRNOTAVAIL)
-        );
         // ::1 and :: are the IPv4-mapped 127.a.b.1, and back again ::1
         let mapped = {
             let mut ip = [0u8; 16];
@@ -2912,6 +2924,86 @@ mod tests {
             v4([8, 8, 8, 8], 53)
         );
         let _ = Rc::clone(&init);
+    }
+
+    #[test]
+    fn loopback_aliases_share_host_ip_and_keep_guest_endpoints() {
+        let ns = Rc::new(ns());
+        up(&ns);
+        // Every shared host address must round-trip through the bound guest address,
+        // including IPv4-mapped IPv6 and the suffix reserved for the virtual address.
+        let w = World {
+            all: vec![crate::nsproxy::NsProxy::init().net, ns.clone()],
+        };
+        let host_ip = [127, 1, 2, 1];
+        for ip in [
+            [127, 0, 0, 0],
+            [127, 0, 1, 1],
+            [127, 1, 0, 1],
+            [127, 1, 2, 3],
+            [127, 0, 0, 254],
+            [127, 0, 0, 255],
+            [127, 255, 255, 254],
+        ] {
+            let mapped6 = |ip| v6(std::net::Ipv4Addr::from(ip).to_ipv6_mapped().octets(), 80);
+            for (guest, host) in [
+                (v4(ip, 80), v4(host_ip, 80)),
+                (mapped6(ip), mapped6(host_ip)),
+            ] {
+                let m = to_host(&w, &ns, &guest, Use::Bind, false).unwrap();
+                assert_eq!(m.addr, host);
+                assert_eq!(m.vaddr, Some(ip));
+                let role = Role::Local {
+                    any: false,
+                    vaddr: m.vaddr,
+                    peer: None,
+                };
+                assert_eq!(from_host(&w, &ns, &host, role, false), guest);
+                let reach = to_host(&w, &ns, &guest, Use::Reach, false).unwrap();
+                assert_eq!(reach.addr, host);
+                assert!(Rc::ptr_eq(reach.target.as_ref().unwrap(), &ns));
+            }
+        }
+        assert_eq!(
+            th(&ns, &v4([127, 0, 0, 253], 80), Use::Bind, false),
+            Ok(v4([127, 1, 2, 253], 80))
+        );
+        ns.lo.borrow_mut().v4 = vec![([127, 0, 0, 1], 24)];
+        let outside = v4([127, 0, 1, 1], 80);
+        assert!(th(&ns, &outside, Use::Bind, false).is_ok());
+        assert_eq!(
+            th(&ns, &outside, Use::Reach, false),
+            Err(Errno::ENETUNREACH)
+        );
+        ns.lo.borrow_mut().v4 = vec![([127, 0, 0, 1], 8)];
+
+        let tcp = crate::net::IPPROTO_TCP;
+        let listeners = [([127, 0, 1, 1], 49101), ([127, 1, 2, 3], 49102)];
+        for (ip, port) in listeners {
+            bind_listener(&ns, tcp, 8080, BindAddr::V4(ip), false, host_ip, port);
+        }
+        assert!(!bind_conflict(
+            &ns,
+            &BindReq {
+                proto: tcp,
+                guest_port: 8080,
+                addr: BindAddr::V4([127, 0, 0, 1]),
+                v6only: false,
+                reuseaddr: false,
+                reuseport: false,
+                euid: 0,
+                bound_dev_if: 0,
+            },
+            None,
+        ));
+        for (ip, port) in listeners {
+            let guest = v4(ip, 8080);
+            assert_eq!(resolve_target(&ns, tcp, &guest), Some((host_ip, port)));
+            assert_eq!(
+                from_host_peer(&w, &ns, tcp, &v4(host_ip, port), false, false, |_, g, _| g),
+                guest
+            );
+        }
     }
 
     #[test]

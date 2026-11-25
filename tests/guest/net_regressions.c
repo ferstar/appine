@@ -31,6 +31,9 @@
 #ifndef SO_ATTACH_REUSEPORT_EBPF
 #define SO_ATTACH_REUSEPORT_EBPF 52
 #endif
+#ifndef ICMP_FILTER
+#define ICMP_FILTER 1
+#endif
 #ifndef AF_NETLINK
 #define AF_NETLINK 16
 #endif
@@ -120,6 +123,7 @@ enum {
     RTM_GETLINK = 18,
     RTM_NEWADDR = 20,
     RTM_NEWROUTE = 24,
+    RTM_DELROUTE = 25,
     RTM_GETNEIGH = 30,
 
     IFLA_IFNAME = 3,
@@ -135,6 +139,7 @@ enum {
     RTPROT_BOOT = 3,
     RT_SCOPE_UNIVERSE = 0,
     RT_SCOPE_LINK = 253,
+    RT_SCOPE_NOWHERE = 255,
     RTN_UNICAST = 1,
     RTA_DST = 1,
     RTA_OIF = 4,
@@ -2114,6 +2119,289 @@ static void test_nat_drop_reject(void)
     ok("nat_drop_reject");
 }
 
+/* ---- 15. kernel/netns: full 127.0.0.0/8 loopback range ---- */
+
+static struct sockaddr_in addr4(const char *ip, uint16_t port)
+{
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(port)};
+    CHECK(inet_pton(AF_INET, ip, &addr.sin_addr) == 1, "invalid IPv4 address %s", ip);
+    return addr;
+}
+
+static void check_local4(int fd, const char *ip, uint16_t port)
+{
+    struct sockaddr_in want = addr4(ip, port), got = {0};
+    socklen_t len = sizeof got;
+    CHECK(getsockname(fd, (struct sockaddr *)&got, &len) == 0, "getsockname %s:%u", ip, port);
+    CHECK(len == sizeof got && got.sin_family == AF_INET &&
+              got.sin_addr.s_addr == want.sin_addr.s_addr && got.sin_port == want.sin_port,
+          "getsockname wanted %s:%u, got %s:%u", ip, port, inet_ntoa(got.sin_addr),
+          ntohs(got.sin_port));
+}
+
+static void test_netns_full_loopback_slash8_child(void)
+{
+    CHECK(unshare(CLONE_NEWNET) == 0, "unshare net");
+    int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    CHECK(rtnl >= 0, "rtnl");
+    set_link_up(rtnl, 1);
+    create_dummy(rtnl, "eth0");
+    int eth0 = (int)if_nametoindex("eth0");
+    CHECK(eth0 > 0, "eth0 index");
+    set_link_up(rtnl, eth0);
+    add_v4_addr(rtnl, eth0, "10.99.0.2", 24);
+    close(rtnl);
+
+    const char *ips[] = {"127.0.0.1", "127.0.1.1", "127.1.2.3", "127.0.0.254"};
+    enum { n = sizeof ips / sizeof ips[0], port = 19401 };
+    int srvs[n];
+    for (int i = 0; i < n; i++) {
+        srvs[i] = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(srvs[i] >= 0, "srv socket %s", ips[i]);
+        struct sockaddr_in a = addr4(ips[i], port);
+        CHECK(bind(srvs[i], (struct sockaddr *)&a, sizeof a) == 0, "bind %s", ips[i]);
+        CHECK(listen(srvs[i], 4) == 0, "listen %s", ips[i]);
+        check_local4(srvs[i], ips[i], port);
+    }
+
+    for (int i = 0; i < n; i++) {
+        int cli = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(cli >= 0, "cli");
+        struct sockaddr_in ca = addr4("127.2.3.4", 0);
+        CHECK(bind(cli, (struct sockaddr *)&ca, sizeof ca) == 0, "bind cli 127.2.3.4");
+        struct sockaddr_in dst = addr4(ips[i], port);
+        CHECK(connect(cli, (struct sockaddr *)&dst, sizeof dst) == 0, "connect %s", ips[i]);
+
+        struct sockaddr_in peer = {0};
+        socklen_t pl = sizeof peer;
+        int acc = accept(srvs[i], (struct sockaddr *)&peer, &pl);
+        CHECK(acc >= 0, "accept %s", ips[i]);
+        CHECK(peer.sin_addr.s_addr == ca.sin_addr.s_addr, "accept peer %s", inet_ntoa(peer.sin_addr));
+        check_local4(acc, ips[i], port);
+
+        char msg[8] = "ping!";
+        CHECK(send(cli, msg, 5, 0) == 5, "send");
+        char rbuf[8] = {0};
+        CHECK(recv(acc, rbuf, 5, MSG_WAITALL) == 5 && memcmp(rbuf, "ping!", 5) == 0, "recv");
+        close(acc);
+        close(cli);
+    }
+    for (int i = 0; i < n; i++)
+        close(srvs[i]);
+
+    /* UDP between 127.0.1.1 and 127.1.2.3 on the same port */
+    int u1 = socket(AF_INET, SOCK_DGRAM, 0), u2 = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ua1 = addr4("127.0.1.1", 19402), ua2 = addr4("127.1.2.3", 19402);
+    CHECK(bind(u1, (struct sockaddr *)&ua1, sizeof ua1) == 0, "bind u1");
+    CHECK(bind(u2, (struct sockaddr *)&ua2, sizeof ua2) == 0, "bind u2");
+    CHECK(sendto(u1, "hi", 2, 0, (struct sockaddr *)&ua2, sizeof ua2) == 2, "sendto u2");
+    char ubuf[8] = {0};
+    struct sockaddr_in from = {0};
+    socklen_t fl = sizeof from;
+    CHECK(recvfrom(u2, ubuf, sizeof ubuf, 0, (struct sockaddr *)&from, &fl) == 2, "recvfrom u2");
+    CHECK(from.sin_addr.s_addr == ua1.sin_addr.s_addr && from.sin_port == ua1.sin_port,
+          "unexpected UDP peer %s:%u", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+    CHECK(memcmp(ubuf, "hi", 2) == 0, "UDP payload");
+    close(u1);
+    close(u2);
+}
+
+static void test_netns_full_loopback_slash8(void)
+{
+    CHECK(run_in_child(test_netns_full_loopback_slash8_child) == 0, "netns 127/8");
+    ok("netns_full_loopback_slash8");
+}
+
+/* ---- 16. kernel/rawicmp: rebind to another address & SO_RCVBUF ---- */
+
+static void test_rawicmp_rebind_and_rcvbuf_child(void)
+{
+    int s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (s < 0 && (errno == EACCES || errno == EPERM))
+        return; /* host disallows unprivileged ping sockets */
+    CHECK(s >= 0, "raw icmp socket");
+
+    int rcv = 8192, ttl = 42, one = 1;
+    uint32_t filt = 0x10;
+    CHECK(setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv) == 0, "SO_RCVBUF");
+    CHECK(setsockopt(s, IPPROTO_IP, IP_TTL, &ttl, sizeof ttl) == 0, "IP_TTL");
+    CHECK(setsockopt(s, IPPROTO_IP, IP_RECVTTL, &one, sizeof one) == 0, "IP_RECVTTL");
+    CHECK(setsockopt(s, SOL_RAW, ICMP_FILTER, &filt, sizeof filt) == 0, "ICMP_FILTER");
+    int want_rcv = 0;
+    socklen_t optl = sizeof want_rcv;
+    CHECK(getsockopt(s, SOL_SOCKET, SO_RCVBUF, &want_rcv, &optl) == 0 && want_rcv >= 2304,
+          "get SO_RCVBUF");
+
+    struct sockaddr_in a1 = addr4("127.0.0.1", 0), a2 = addr4("127.0.0.2", 0);
+    struct sockaddr_in a3 = addr4("127.0.0.3", 0), bogus = addr4("203.0.113.9", 0);
+    struct sockaddr_in any = addr4("0.0.0.0", 0);
+    CHECK(bind(s, (struct sockaddr *)&a1, sizeof a1) == 0, "bind 127.0.0.1");
+    CHECK(bind(s, (struct sockaddr *)&a2, sizeof a2) == 0, "rebind 127.0.0.2");
+
+    check_local4(s, "127.0.0.2", IPPROTO_ICMP);
+
+    /* Options survive host ping socket replacement. */
+    int got_rcv = 0, got_ttl = 0, got_recvttl = 0;
+    uint32_t got_filt = 0;
+    optl = sizeof got_rcv;
+    CHECK(getsockopt(s, SOL_SOCKET, SO_RCVBUF, &got_rcv, &optl) == 0 && got_rcv == want_rcv,
+          "SO_RCVBUF preserved %d != %d", got_rcv, want_rcv);
+    optl = sizeof got_ttl;
+    CHECK(getsockopt(s, IPPROTO_IP, IP_TTL, &got_ttl, &optl) == 0 && got_ttl == 42,
+          "IP_TTL preserved %d", got_ttl);
+    optl = sizeof got_recvttl;
+    CHECK(getsockopt(s, IPPROTO_IP, IP_RECVTTL, &got_recvttl, &optl) == 0 && got_recvttl == 1,
+          "IP_RECVTTL preserved");
+    optl = sizeof got_filt;
+    CHECK(getsockopt(s, SOL_RAW, ICMP_FILTER, &got_filt, &optl) == 0 && got_filt == filt,
+          "ICMP_FILTER preserved");
+
+    /* Invalid rebind fails atomically without disturbing existing bind. */
+    errno = 0;
+    CHECK(bind(s, (struct sockaddr *)&bogus, sizeof bogus) == -1 && errno == EADDRNOTAVAIL,
+          "bogus rebind -> EADDRNOTAVAIL");
+    check_local4(s, "127.0.0.2", IPPROTO_ICMP);
+
+    /* Connected raw socket refuses rebind with EINVAL; disconnect restores rebindability. */
+    CHECK(connect(s, (struct sockaddr *)&a1, sizeof a1) == 0, "connect raw");
+    errno = 0;
+    CHECK(bind(s, (struct sockaddr *)&a3, sizeof a3) == -1 && errno == EINVAL,
+          "connected raw rebind -> EINVAL");
+    struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+    CHECK(connect(s, &unspec, sizeof unspec) == 0, "disconnect raw");
+    CHECK(bind(s, (struct sockaddr *)&any, sizeof any) == 0, "rebind wildcard after disconnect");
+    check_local4(s, "0.0.0.0", IPPROTO_ICMP);
+    close(s);
+
+    /* The replacement host ICMPv6 ping socket can default to IPV6_V6ONLY=1. */
+    int s6 = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    if (s6 >= 0) {
+        struct sockaddr_in6 lo6 = {.sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT};
+        struct sockaddr_in6 any6 = {.sin6_family = AF_INET6};
+        int only = 0;
+        CHECK(setsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, &only, sizeof only) == 0, "clear V6ONLY");
+        CHECK(bind(s6, (struct sockaddr *)&lo6, sizeof lo6) == 0, "bind ::1");
+        CHECK(bind(s6, (struct sockaddr *)&any6, sizeof any6) == 0, "rebind ::");
+        optl = sizeof only;
+        CHECK(getsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, &only, &optl) == 0 && only == 0,
+              "IPV6_V6ONLY after rebind: %d", only);
+        close(s6);
+    } else {
+        CHECK(errno == EACCES || errno == EPERM || errno == EAFNOSUPPORT ||
+                  errno == EPROTONOSUPPORT, "raw icmpv6 socket");
+    }
+
+    /* New netns: rebind across 127.0.0.1, 127.0.1.1, 127.0.0.2, and 0.0.0.0 */
+    CHECK(unshare(CLONE_NEWNET) == 0, "unshare net raw");
+    int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    set_link_up(rtnl, 1);
+    close(rtnl);
+    int ns = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    CHECK(ns >= 0, "netns raw icmp");
+    const char *ips[] = {"127.0.0.1", "127.0.1.1", "127.0.0.2", "0.0.0.0"};
+    for (size_t i = 0; i < sizeof ips / sizeof ips[0]; i++) {
+        struct sockaddr_in addr = addr4(ips[i], 0);
+        CHECK(bind(ns, (struct sockaddr *)&addr, sizeof addr) == 0, "netns raw bind %s", ips[i]);
+        check_local4(ns, ips[i], IPPROTO_ICMP);
+    }
+    CHECK(connect(ns, (struct sockaddr *)&a1, sizeof a1) == 0, "connect netns raw");
+    CHECK(bind(ns, (struct sockaddr *)&bogus, sizeof bogus) == -1 && errno == EINVAL,
+          "connected raw bind checks state before the namespace address");
+    close(ns);
+}
+
+static void test_rawicmp_rebind_and_rcvbuf(void)
+{
+    CHECK(run_in_child(test_rawicmp_rebind_and_rcvbuf_child) == 0, "rawicmp rebind/rcvbuf");
+    ok("rawicmp_rebind_and_rcvbuf");
+}
+
+/* ---- 17. kernel/netns: Linux 6.1 route attribute lengths ---- */
+
+static void route_msg(struct nlbuf *b, uint16_t type, uint32_t seq, const struct rtmsg *route)
+{
+    uint16_t flags = NLM_F_REQUEST | NLM_F_ACK;
+    if (type == RTM_NEWROUTE)
+        flags |= NLM_F_CREATE | NLM_F_EXCL;
+    nl_init(b, type, flags, seq);
+    nl_put_raw(b, route, sizeof *route);
+}
+
+static void test_route_attr_lengths_child(void)
+{
+    CHECK(unshare(CLONE_NEWNET) == 0, "unshare net");
+    int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    CHECK(rtnl >= 0, "rtnl");
+    create_dummy(rtnl, "d0");
+    int i0 = (int)if_nametoindex("d0");
+    CHECK(i0 > 0, "d0 idx");
+    set_link_up(rtnl, i0);
+    add_v4_addr(rtnl, i0, "10.72.0.1", 24);
+
+    /* Short IPv4 RTA_DST -> ERANGE */
+    struct nlbuf b;
+    struct rtmsg r4 = {.rtm_family = AF_INET,
+                       .rtm_dst_len = 24,
+                       .rtm_table = RT_TABLE_MAIN,
+                       .rtm_protocol = RTPROT_BOOT,
+                       .rtm_scope = RT_SCOPE_UNIVERSE,
+                       .rtm_type = RTN_UNICAST};
+    route_msg(&b, RTM_NEWROUTE, 10, &r4);
+    uint8_t short2[2] = {10, 73};
+    nl_attr(&b, RTA_DST, short2, sizeof short2);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)i0);
+    CHECK(nl_send_ack(rtnl, &b) == ERANGE, "short IPv4 RTA_DST -> ERANGE");
+
+    /* Oversized IPv4 RTA_DST & RTA_GATEWAY -> first 4 bytes accepted on add & del */
+    uint8_t long_dst4[6] = {10, 73, 0, 0, 0xaa, 0xbb};
+    uint8_t long_gw4[6] = {10, 72, 0, 254, 0x11, 0x22};
+    route_msg(&b, RTM_NEWROUTE, 11, &r4);
+    nl_attr(&b, RTA_DST, long_dst4, sizeof long_dst4);
+    nl_attr(&b, RTA_GATEWAY, long_gw4, sizeof long_gw4);
+    CHECK(nl_send_ack(rtnl, &b) == 0, "long IPv4 route add");
+
+    r4.rtm_scope = RT_SCOPE_NOWHERE;
+    route_msg(&b, RTM_DELROUTE, 12, &r4);
+    nl_attr(&b, RTA_DST, long_dst4, sizeof long_dst4);
+    nl_attr(&b, RTA_GATEWAY, long_gw4, sizeof long_gw4);
+    CHECK(nl_send_ack(rtnl, &b) == 0, "long IPv4 route del");
+
+    /* Short IPv6 RTA_GATEWAY -> ERANGE; 8-byte IPv6 RTA_DST for /64 -> OK; 7-byte -> EINVAL */
+    struct rtmsg r6 = r4;
+    r6.rtm_family = AF_INET6;
+    r6.rtm_dst_len = 64;
+    r6.rtm_scope = RT_SCOPE_UNIVERSE;
+    route_msg(&b, RTM_NEWROUTE, 13, &r6);
+    uint8_t short_gw6[4] = {0xfe, 0x80, 0, 0};
+    nl_attr(&b, RTA_GATEWAY, short_gw6, sizeof short_gw6);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)i0);
+    CHECK(nl_send_ack(rtnl, &b) == ERANGE, "short IPv6 RTA_GATEWAY -> ERANGE");
+
+    uint8_t dst6[8] = {0x20, 0x01, 0x0d, 0xb8, 0, 0x72, 0, 0};
+    route_msg(&b, RTM_NEWROUTE, 14, &r6);
+    nl_attr(&b, RTA_DST, dst6, sizeof dst6 - 1);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)i0);
+    CHECK(nl_send_ack(rtnl, &b) == EINVAL, "7-byte IPv6 /64 RTA_DST -> EINVAL");
+
+    route_msg(&b, RTM_NEWROUTE, 15, &r6);
+    nl_attr(&b, RTA_DST, dst6, sizeof dst6);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)i0);
+    CHECK(nl_send_ack(rtnl, &b) == 0, "8-byte IPv6 /64 RTA_DST add");
+
+    route_msg(&b, RTM_DELROUTE, 16, &r6);
+    nl_attr(&b, RTA_DST, dst6, sizeof dst6);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)i0);
+    CHECK(nl_send_ack(rtnl, &b) == 0, "8-byte IPv6 /64 RTA_DST del");
+
+    close(rtnl);
+}
+
+static void test_route_attr_lengths(void)
+{
+    CHECK(run_in_child(test_route_attr_lengths_child) == 0, "route attr lengths");
+    ok("route_attr_lengths");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "filtered-dnat") == 0) {
@@ -2135,6 +2423,9 @@ int main(int argc, char **argv)
     test_route_get_iif();
     test_so_bindtodevice_netns();
     test_nat_drop_reject();
+    test_netns_full_loopback_slash8();
+    test_rawicmp_rebind_and_rcvbuf();
+    test_route_attr_lengths();
     printf("all ok\n");
     return 0;
 }
