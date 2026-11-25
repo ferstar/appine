@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: AF_UNIX bind via FUSE_MKNOD with eviction pinning, batched uncached lookup walks and per-syscall lookup error caching, periodic background dirty-page writeback, FUSE_NOTIFY_STORE, FUSE_AUTO_INVAL_DATA, and expanded syscall prefaulting)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: program and interpreter inodes in maps and smaps, interpreter cache pinning, and spliced reply length validation)
 
 ## Responsibilities
 
@@ -188,8 +188,8 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   returns ENOSYS.
 - read, write, readv and writev of the device move one whole message (up to 8 MiB); splice into a
   pipe takes one whole request (the device's own `O_NONBLOCK`, EIO when the pipe lacks room, the
-  request then lost as in Linux), and splice from a pipe takes a reply of the length asked, its
-  header's length set to it (`kernel/pipe`).
+  request then lost as in Linux). Splice from a pipe validates the header against the bytes
+  available up to the requested length. A mismatch returns EINVAL and leaves the pipe intact.
 - poll: always writable, readable while a request, a forget, or an interrupt for a held request waits,
   `POLLERR` once aborted or unattached.
 - `FUSE_DEV_IOC_CLONE` attaches an unattached device file to the connection of another, both
@@ -230,7 +230,7 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   handle or request finishes, or a write of 2 or 3 to `vm.drop_caches` runs, `SWEEP` is set and the
   dispatcher calls `sweep` at the end of a syscall. It keeps what `in_use` finds (every task's root
   and cwd, the node of every open file in every fd table, O_PATH ones included, every running
-  program's key, every mount's root and point attached or detached, every inotify watch), each
+  program's key and mapped interpreter key, every mount's root and point attached or detached, every inotify watch), each
   connection's roots, nodes with an open handle, live O_PATH description, bound AF_UNIX socket
   (`sock_pin`), or active/waited lock (`io_busy`, `dir_busy`, `dir_waiters`), and nodes a request
   in flight refers to (its node, a rename's other directory, or a link's file). It keeps their
@@ -402,7 +402,9 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   node via `Node::sock_pin` so `connect` finds the bound socket by `key(id)` across cache eviction.
 - execve of a FUSE program (or interpreter) reads it whole into a memfd through a retry
   (`Query::Program`, one copy per file per syscall), runs it as from a nosuid mount, and gives it
-  its node's key as inode number, so running it and writing it exclude each other (ETXTBSY).
+  its node's key as the internal image inode. The main program's key enforces ETXTBSY.
+  Procfs resolves image keys to daemon inodes for maps and smaps and skips the store's
+  deleted-file lookup for FUSE paths. Ordinary FUSE mappings already carry the daemon inode.
 
 ### inotify
 
@@ -433,7 +435,7 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   (`flush_at_exit`).
 - `kernel/exec`: execve (`open_fuse`, close-on-exec flush).
 - `kernel/mm` (`map_fill` for mmap, `fill` from the fault path), `kernel/poll` (device readiness
-  and wake object), `kernel/procfs` (mountinfo type and options), `kernel/sysctl` (`drop_caches`).
+  and wake object), `kernel/procfs` (mountinfo type and options, mapping inodes), `kernel/sysctl` (`drop_caches`).
 - The dispatcher: `fill` and `prefault` for mapped pages, `sweep` after every syscall.
 - `kernel/net` calls `fill` for socket output copies, including payload, address, control data
   and message header fields. recvmmsg also fills pages when importing the current record.
@@ -451,7 +453,7 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 - `kernel/signal`: `SIGXFSZ` through the VFS's `file_too_big`.
 - `hal`: `memfd` for program copies and mapping fills.
 - `kernel/mm`: `Fill` and `FillPages` for reads and dirty byte runs, and `Mm::invalidate_fill` for notification and open-time shootdowns.
-- The task table, fd tables, mm `exe`, `Vfs::mount_nodes` and `kernel/inotify`'s registry
+- The task table, fd tables, mm `exe` and `mapped_inos`, `Vfs::mount_nodes` and `kernel/inotify`'s registry
   (`watched`) for `in_use`.
 
 ## Invariants and gotchas
@@ -487,8 +489,7 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   `abort`), no `FUSE_IOCTL`, `FUSE_POLL`, `FUSE_COPY_FILE_RANGE`, `FUSE_TMPFILE` or notify
   retrieve; device nodes and FIFOs on FUSE cannot be opened (ENXIO).
 - **Programs:** set-id bits and file capabilities of FUSE programs never apply (even on a mount
-  without nosuid), `/proc/<pid>/exe` is followed by path, and maps show the node's key as inode.
-- **Small fidelity gaps:** spliced replies have their header length replaced (`kernel/pipe`).
+  without nosuid), and `/proc/<pid>/exe` is followed by path.
 
 ## Open questions
 

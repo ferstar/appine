@@ -3045,12 +3045,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     limits(&g.borrow().rlimits)
                 }
-                self::Entry::Maps => task.map_or(String::new(), |t| maps(ps.vfs.store(), &t)),
+                self::Entry::Maps => task.map_or(String::new(), |t| maps(ps.vfs, &t)),
                 self::Entry::Smaps => {
-                    task.map_or(String::new(), |t| smaps(ps.vfs.store(), &t, false))
+                    task.map_or(String::new(), |t| smaps(ps.vfs, &t, false))
                 }
                 self::Entry::SmapsRollup => {
-                    task.map_or(String::new(), |t| smaps(ps.vfs.store(), &t, true))
+                    task.map_or(String::new(), |t| smaps(ps.vfs, &t, true))
                 }
                 // Binary, computed from the read or write position (`read_pagemap`, `access_mem`).
                 self::Entry::Pagemap | self::Entry::Mem => String::new(),
@@ -3647,10 +3647,14 @@ fn limits(rlimits: &[(u64, u64); crate::process::RLIM_NLIMITS]) -> String {
     s
 }
 
-fn maps(store: &Store, task: &Task) -> String {
+fn maps(vfs: &Vfs, task: &Task) -> String {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
-    mm.regions().iter().map(|r| map_line(store, r)).collect()
+    let fuse_paths = crate::vfs::fuse::mapped_paths(&mm);
+    mm.regions()
+        .iter()
+        .map(|r| map_line(vfs, r, &fuse_paths))
+        .collect()
 }
 
 /// smaps counts, in kB. The host cannot tell which pages have been written: resident pages of
@@ -3727,12 +3731,17 @@ impl Usage {
 
 /// `/proc/<pid>/smaps`, or `smaps_rollup` with `rollup` (the total over all mappings). Resident
 /// pages are counted in host memory (mincore).
-fn smaps(store: &Store, task: &Task, rollup: bool) -> String {
+fn smaps(vfs: &Vfs, task: &Task, rollup: bool) -> String {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
     let regions = mm.regions();
     let mut s = String::new();
     let mut total = Usage::default();
+    let fuse_paths = if rollup {
+        HashSet::new()
+    } else {
+        crate::vfs::fuse::mapped_paths(&mm)
+    };
     for r in &regions {
         let rss = mm.resident_in(r.start, r.end - r.start) * 4;
         let mut u = Usage {
@@ -3756,7 +3765,7 @@ fn smaps(store: &Store, task: &Task, rollup: bool) -> String {
         if rollup {
             continue;
         }
-        s += &map_line(store, r);
+        s += &map_line(vfs, r, &fuse_paths);
         let kb = (r.end - r.start) / 1024;
         writeln!(s, "{:<16}{kb:>8} kB", "Size:").unwrap();
         writeln!(s, "{:<16}{:>8} kB", "KernelPageSize:", 4).unwrap();
@@ -3808,7 +3817,7 @@ fn vm_flags(r: &Region) -> String {
 
 /// One line of maps. As on Linux, lines without a name also end in a space, the name starts at
 /// column 74, and a newline in a file's path is escaped as `\012` (seq_file_path).
-fn map_line(store: &Store, r: &Region) -> String {
+fn map_line(vfs: &Vfs, r: &Region, fuse_paths: &HashSet<*const u8>) -> String {
     let perms = format!(
         "{}{}{}{}",
         if r.prot & 1 != 0 { 'r' } else { '-' },
@@ -3816,12 +3825,18 @@ fn map_line(store: &Store, r: &Region) -> String {
         if r.prot & 4 != 0 { 'x' } else { '-' },
         if r.shared { 's' } else { 'p' },
     );
-    // The device number of file mappings is the root filesystem's 8:1 (the same as stat's
-    // st_dev)
-    let (offset, dev, ino) = match r.file {
+    let fuse_mmap = r
+        .name
+        .as_ref()
+        .is_some_and(|name| fuse_paths.contains(&name.as_ptr()));
+    let (offset, dev, raw_ino) = match r.file {
         Some((offset, ino)) => (offset, "08:01", ino),
         None => (0, "00:00", 0),
     };
+    // Exec labels carry keys for cache pinning and ETXTBSY. Ordinary FUSE mmap labels
+    // already carry the daemon inode, which can have any of its high bits set.
+    let image = crate::vfs::fuse::id_of(raw_ino).filter(|_| r.name.is_some() && !fuse_mmap);
+    let ino = image.map_or(raw_ino, |id| vfs.fuse().get(id).map_or(0, |n| n.attr.ino));
     let line = format!(
         "{:08x}-{:08x} {perms} {offset:08x} {dev} {ino} ",
         r.start, r.end
@@ -3830,7 +3845,11 @@ fn map_line(store: &Store, r: &Region) -> String {
         Some(name) => {
             let name = match r.file {
                 Some((_, ino)) => {
-                    let path = mark_deleted(store, ino, name.to_vec());
+                    let path = if fuse_mmap || image.is_some() {
+                        name.to_vec()
+                    } else {
+                        mark_deleted(vfs.store(), ino, name.to_vec())
+                    };
                     let mut escaped = Vec::with_capacity(path.len());
                     for b in path {
                         match b {

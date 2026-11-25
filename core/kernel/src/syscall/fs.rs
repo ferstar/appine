@@ -3004,16 +3004,8 @@ pub(super) fn splice(
             // The data stays in the pipe until written; other consumers wait meanwhile, since
             // writing can release the BKL or wait
             let _splicing = Splicing::start(&pipe);
-            let mut data: Vec<u8> = pipe.borrow().bytes().iter().take(len).copied().collect();
-            // A FUSE reply spliced from a pipe is the `len` bytes asked for (6.1's
-            // fuse_dev_splice_write). libfuse vmsplices the header first and sets its length only
-            // after splicing the data behind it, which Linux sees because vmsplice puts the
-            // caller's pages into the pipe; here vmsplice copied the header with the old length,
-            // so the length given to splice stands in for it
-            if matches!(output.borrow().kind, FileKind::FuseDev(_)) && data.len() >= 4 {
-                let n = data.len() as u32;
-                data[..4].copy_from_slice(&n.to_le_bytes());
-            }
+            // Snapshot live vmsplice pages here, including headers the daemon filled in later.
+            let data = pipe.borrow().snapshot(len);
             let file_out = needs_pos_lock(&output.borrow());
             let _out_pos = PosGuard::lock_if(cx, &output, dst.is_none() && file_out)?;
             let pos_held = _out_pos.is_some();
@@ -3378,7 +3370,7 @@ pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: 
                 }
                 break 'iov;
             }
-            p.push_pages(&page[..n], offset, false);
+            p.push_vmsplice(&page[..n], offset, &cx.t.mm, base);
             done += n;
             base = base.wrapping_add(n as u64);
             len -= n;
@@ -4881,7 +4873,7 @@ fn pipe_read_user(
         }
         cx.wait_object(crate::pipe::object(pipe))?;
     }
-    let data: Vec<u8> = pipe.borrow().bytes().iter().take(total).copied().collect();
+    let data = pipe.borrow().snapshot(total);
     let mut done = 0;
     for &(base, len) in vecs {
         let n = len.min(data.len() - done);
@@ -4915,10 +4907,7 @@ fn pipe_read(
         {
             let mut p = pipe.borrow_mut();
             if !p.bytes().is_empty() || buf.is_empty() {
-                let n = buf.len().min(p.bytes().len());
-                for (d, s) in buf.iter_mut().zip(p.bytes()) {
-                    *d = *s;
-                }
+                let n = p.copy_out(buf);
                 p.consume(n, false);
                 return Ok(n);
             }

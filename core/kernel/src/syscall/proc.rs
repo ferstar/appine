@@ -1234,7 +1234,10 @@ pub(crate) fn interp_label(
     let name = vfs
         .found_path(ps, root, &node, found.as_ref())
         .unwrap_or_else(|_| path.clone());
-    let ino = node.ino().unwrap_or(0);
+    let ino = match node {
+        Node::Fuse(_, id) => crate::vfs::fuse::key(id),
+        _ => node.ino().unwrap_or(0),
+    };
     Some((Rc::from(name), ino, Some(node.mnt())))
 }
 

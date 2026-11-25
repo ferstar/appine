@@ -1363,6 +1363,23 @@ pub(crate) fn dev_write(
     Ok(len)
 }
 
+/// Ordinary FUSE mmap labels share their path allocation with the pinned open file. ELF
+/// snapshots have separately allocated labels. This distinguishes a daemon's full-width inode
+/// from an internal program key even when both numbers occur in the same address space.
+pub(crate) fn mapped_paths(mm: &crate::mm::Mm) -> HashSet<*const u8> {
+    let mut paths = HashSet::new();
+    if mm.has_fills() {
+        let mut files = Vec::new();
+        mm.mapped_file_inos(&mut Vec::new(), &mut files);
+        for file in files {
+            if let Some(path) = &file.borrow().path {
+                paths.insert(path.as_ptr());
+            }
+        }
+    }
+    paths
+}
+
 pub(crate) fn mapped_pages(vfs: &super::Vfs, id: FuseId) -> Option<Rc<FillPages>> {
     vfs.fuse().get(id)?.pages.upgrade()
 }

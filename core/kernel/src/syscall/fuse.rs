@@ -2127,10 +2127,12 @@ pub(super) fn sweep(cx: &mut Cx<'_>) {
 }
 
 /// The FUSE nodes that processes' root directories, cwds, open files (O_PATH ones too) and
-/// running programs are, that mounts are on or of, and that inotify watches; None when some of
+/// running programs and mapped ELF interpreters are, that mounts are on or of, and that inotify watches; None when some of
 /// it is borrowed.
 fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<std::collections::HashSet<FuseId>> {
     let mut used = std::collections::HashSet::new();
+    let mut mapped = std::collections::HashSet::new();
+    let mut seen_mm = std::collections::HashSet::new();
     let mut add = |n: Node| {
         if let Node::Fuse(_, id) = n {
             used.insert(id);
@@ -2143,8 +2145,14 @@ fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<std::collections::Hash
             add(fs.root.clone());
             add(fs.cwd.clone());
         }
-        if let Some(id) = res.mm.try_borrow().ok()?.exe.and_then(fuse::id_of) {
-            add(Node::Fuse(0, id));
+        if seen_mm.insert(Rc::as_ptr(&res.mm)) {
+            let mm = res.mm.try_borrow().ok()?;
+            if let Some(id) = mm.exe.and_then(fuse::id_of) {
+                add(Node::Fuse(0, id));
+            }
+            // ELF snapshots carry keys. Ordinary FUSE mmap inodes belong to the daemon
+            // and are excluded by mapped_inos.
+            mm.mapped_inos(&mut mapped);
         }
         let fds = res.fds.try_borrow().ok()?;
         for file in fds.files() {
@@ -2161,6 +2169,7 @@ fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<std::collections::Hash
             add(Node::Fuse(0, id));
         }
     }
+    used.extend(mapped.into_iter().filter_map(fuse::id_of));
     Some(used)
 }
 
@@ -2649,6 +2658,268 @@ mod tests {
             }
         }
         Err(Errno::EIO)
+    }
+
+    #[test]
+    fn maps_and_smaps_show_fuse_image_inodes_and_keep_the_internal_keys() {
+        use crate::loader::Image;
+        use crate::mm::flags::MAP_PRIVATE;
+        use crate::pseudo::{self, ProcId, PseudoNode};
+        use std::os::fd::AsRawFd;
+
+        let rig = new_rig("image-maps", &[10]);
+        let h = &rig.h;
+        let (ino, host) = h.cx(10, |cx| {
+            let vfs = cx.vfs().unwrap();
+            let store = vfs.store();
+            let pair = store.create_file(ROOT, b"unlinked", 0o700, 0, 0).unwrap();
+            store.unlink(ROOT, b"unlinked").unwrap();
+            assert_eq!(store.attrs(pair.0).unwrap().nlink, 0);
+            pair
+        });
+        host.set_len(PAGE_SIZE).unwrap();
+        let prog = h.seed_file(h.root, b"prog", ino, PAGE_SIZE, 3600);
+        let interp = h.seed_file(h.root, b"ld", ino + 1, PAGE_SIZE, 3600);
+        // A daemon can also choose an ordinary mmap inode numerically equal to the program key.
+        let raw_ino = fuse::key(prog);
+        let regular = h.seed_file(h.root, b"mapped", raw_ino, PAGE_SIZE, 3600);
+        let handle = h.make_handle(regular, raw_ino, 0, false, true, 0);
+        h.cx(10, |cx| {
+            let vfs = cx.vfs().unwrap();
+            let cred = cx.cred();
+            let map_segment = || {
+                cx.mm_mut()
+                    .mmap(
+                        0,
+                        PAGE_SIZE,
+                        5,
+                        MAP_PRIVATE,
+                        Some((host.as_raw_fd(), 0, false)),
+                    )
+                    .unwrap()
+            };
+            let main = map_segment();
+            let ld = map_segment();
+            let image = Image {
+                main: (main, main + PAGE_SIZE),
+                interp: Some((b"/mnt/ld".to_vec(), ld, ld + PAGE_SIZE)),
+                entry: main,
+                sp: 0,
+                doomed: false,
+            };
+            let label = super::super::proc::interp_label(
+                Some(&vfs),
+                &cx.view(&vfs),
+                &cred,
+                &Node::ROOT,
+                &Node::ROOT,
+                &image,
+            );
+            let path = Rc::from(b"/mnt/prog".as_slice());
+            super::super::proc::label_image(
+                &mut cx.mm_mut(),
+                &image,
+                (&path, fuse::key(prog), Some(h.mnt)),
+                label,
+            );
+            cx.mm_mut().exe = Some(fuse::key(prog));
+
+            let mapped_path: Rc<[u8]> = Rc::from(b"/mnt/mapped".as_slice());
+            let file = OpenFile::with_path(
+                FileKind::Fuse(Box::new(handle)),
+                oflags::O_RDONLY,
+                Some(mapped_path.clone()),
+            );
+            let fill = map_fill(cx, &file, false, false).unwrap().unwrap();
+            let addr = cx
+                .mm_mut()
+                .mmap_fill(0, PAGE_SIZE, 1, MAP_PRIVATE, (fill, 0))
+                .unwrap();
+            cx.mm_mut()
+                .label(addr, PAGE_SIZE, Some(mapped_path), raw_ino);
+
+            let pid = ProcId {
+                pid: 10,
+                serial: cx.t.group.borrow().serial,
+            };
+            for entry in [pseudo::Entry::Maps, pseudo::Entry::Smaps] {
+                let content = pseudo::content(
+                    &cx.view(&vfs),
+                    crate::vfs::ROOT_MOUNT,
+                    &PseudoNode::Entry(pid, None, entry),
+                )
+                .unwrap();
+                let text = String::from_utf8(content).unwrap();
+                for (addr, name, expected) in [
+                    (main, "/mnt/prog", ino),
+                    (ld, "/mnt/ld", ino + 1),
+                    (addr, "/mnt/mapped", raw_ino),
+                ] {
+                    let prefix = format!("{addr:08x}-");
+                    let fields: Vec<_> = text
+                        .lines()
+                        .find(|l| l.starts_with(&prefix))
+                        .unwrap()
+                        .split_whitespace()
+                        .skip(3)
+                        .collect();
+                    assert_eq!(fields, ["08:01", &expected.to_string(), name]);
+                }
+            }
+            assert!(cx.mm().maps_ino(fuse::key(prog)));
+            assert!(cx.mm().maps_ino(fuse::key(interp)));
+            assert!(!cx.mm().maps_ino(ino));
+            assert!(super::super::fs::executing(cx, fuse::key(prog)));
+            assert!(matches!(
+                open(cx, &cred, &vfs, (h.mnt, prog), oflags::O_WRONLY),
+                Err(Errno::ETXTBSY)
+            ));
+            let used = in_use(cx.kr(), &vfs).unwrap();
+            assert!(used.contains(&prog) && used.contains(&interp));
+            cx.mm_mut().munmap(ld, PAGE_SIZE).unwrap();
+            cx.mm_mut().munmap(main, PAGE_SIZE).unwrap();
+            let used = in_use(cx.kr(), &vfs).unwrap();
+            vfs.fuse_mut().evict(&used, true);
+            assert!(vfs.fuse().get(prog).is_some());
+            assert!(vfs.fuse().get(interp).is_none());
+        });
+    }
+
+    fn test_pipe(cx: &mut Cx<'_>, addr: u64) -> (i32, i32) {
+        super::super::fs::pipe2(cx, addr, oflags::O_NONBLOCK).unwrap();
+        let mut fds = [0; 8];
+        cx.read_user(crate::uaccess::UserSlice::new(addr, 8), &mut fds)
+            .unwrap();
+        (
+            i32::from_le_bytes(fds[..4].try_into().unwrap()),
+            i32::from_le_bytes(fds[4..].try_into().unwrap()),
+        )
+    }
+
+    fn vmsplice_bytes(cx: &mut Cx<'_>, fd: i32, iov: u64, addr: u64, data: &[u8]) {
+        use crate::uaccess::UserSlice;
+        cx.write_user(UserSlice::new(addr, data.len()), data)
+            .unwrap();
+        let vec = Args::default().u64(addr).u64(data.len() as u64).0;
+        cx.write_user(UserSlice::new(iov, vec.len()), &vec).unwrap();
+        assert_eq!(
+            super::super::fs::vmsplice(cx, fd, iov, 1, 0),
+            Ok(data.len() as u64)
+        );
+    }
+
+    #[test]
+    fn vmsplice_reads_follow_partial_transfers_and_fall_back_after_unmap() {
+        use super::super::fs;
+        use crate::uaccess::UserSlice;
+
+        let rig = new_rig("vmsplice-transfer", &[]);
+        rig.h.cx(rig.h.daemon_tid, |cx| {
+            let base = 0x10000;
+            cx.mm_mut().map_anonymous(base, 3 * PAGE_SIZE, 3).unwrap();
+            let (src, write) = test_pipe(cx, base);
+            let (copy, copy_write) = test_pipe(cx, base);
+            let (moved, move_write) = test_pipe(cx, base);
+            let addr = base + 2 * PAGE_SIZE - 2;
+            vmsplice_bytes(cx, write, base, addr, b"abcdef");
+            cx.write_user(UserSlice::new(addr, 6), b"ABCDEF").unwrap();
+            assert_eq!(fs::read(cx, src, base, 1), Ok(1));
+            let mut byte = [0];
+            cx.read_user(UserSlice::new(base, 1), &mut byte).unwrap();
+            assert_eq!(&byte, b"A");
+            assert_eq!(fs::tee(cx, src, copy_write, 4, 0), Ok(4));
+            assert_eq!(fs::splice(cx, src, 0, move_write, 0, 3, 0), Ok(3));
+            cx.write_user(UserSlice::new(addr + 1, 5), b"12345")
+                .unwrap();
+            let read = |cx: &mut Cx<'_>, fd, expected: &[u8]| {
+                let mut buf = vec![0; expected.len()];
+                let file = cx.fds().get(fd).unwrap();
+                assert_eq!(
+                    fs::read_bytes(cx, &file, &mut buf, None),
+                    Ok(expected.len())
+                );
+                assert_eq!(buf, expected);
+            };
+            read(cx, copy, b"1");
+            read(cx, moved, b"1");
+            read(cx, src, b"4");
+            cx.mm_mut().munmap(base + 2 * PAGE_SIZE, PAGE_SIZE).unwrap();
+            read(cx, copy, b"CDE");
+            cx.mm_mut()
+                .map_anonymous(base + 2 * PAGE_SIZE, PAGE_SIZE, 3)
+                .unwrap();
+            cx.write_user(UserSlice::new(addr + 2, 4), b"WXYZ").unwrap();
+            read(cx, moved, b"CD");
+            read(cx, src, b"f");
+        });
+    }
+
+    #[test]
+    fn spliced_fuse_reply_uses_live_header_and_rejects_wrong_lengths() {
+        use super::super::fs;
+        use crate::uaccess::UserSlice;
+
+        let rig = new_rig("splice-reply", &[10]);
+        let h = &rig.h;
+        let base = 0x10000;
+        let (read, write) = h.cx(h.daemon_tid, |cx| {
+            cx.mm_mut().map_anonymous(base, PAGE_SIZE, 3).unwrap();
+            test_pipe(cx, base)
+        });
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                h.cx(10, |cx| {
+                    let conn = cx.vfs()?.fuse().conn_of(h.root)?;
+                    fuse::call(cx, &conn, op::READ, 1, &[])
+                })
+            });
+            let (_, unique, _, _) = h.read_req(false).unwrap();
+            let payload = b"spliced data";
+            let len = 16 + payload.len();
+            let result = h.cx(h.daemon_tid, |cx| {
+                let header = base + 32;
+                let mut bytes = fuse_reply(unique, 0, &[]);
+                bytes[..4].fill(0);
+                vmsplice_bytes(cx, write, base, header, &bytes);
+                let body = base + 64;
+                cx.write_user(UserSlice::new(body, payload.len()), payload)
+                    .unwrap();
+                assert_eq!(
+                    fs::write(cx, write, body, payload.len()),
+                    Ok(payload.len() as u64)
+                );
+                cx.write_user(UserSlice::new(header, 4), &(len as u32).to_le_bytes())
+                    .unwrap();
+                fs::splice(cx, read, 0, h.dev_fd, 0, len + 1, 0)
+            });
+            if result.is_err() {
+                h.reply(unique, Errno::EIO.0, &[]);
+            }
+            assert_eq!(result, Ok(len as u64));
+            assert_eq!(worker.join().unwrap().unwrap(), payload);
+        });
+        h.cx(h.daemon_tid, |cx| {
+            let conn = cx.vfs().unwrap().fuse().conn_of(h.root).unwrap();
+            fuse::background(&conn, op::READ, 1, &[]);
+        });
+        let (_, unique, _, _) = h.read_req(true).unwrap();
+        h.cx(h.daemon_tid, |cx| {
+            let reply = fuse_reply(unique, 0, b"12345678");
+            cx.write_user(UserSlice::new(base, reply.len()), &reply)
+                .unwrap();
+            fs::write(cx, write, base, reply.len()).unwrap();
+            assert_eq!(
+                fs::splice(cx, read, 0, h.dev_fd, 0, 16, 0),
+                Err(Errno::EINVAL)
+            );
+            let mut remaining = [0; 24];
+            let file = cx.fds().get(read).unwrap();
+            assert_eq!(fs::read_bytes(cx, &file, &mut remaining, None), Ok(24));
+            assert_eq!(remaining.as_slice(), reply);
+            let dev = cx.fds().get(h.dev_fd).unwrap();
+            let vfs = cx.vfs().unwrap();
+            assert_eq!(fuse::dev_write(cx, &vfs, &dev, &remaining), Ok(24));
+        });
     }
 
     #[test]

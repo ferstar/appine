@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: align `splice` pipe-offset (`ESPIPE`) before access-mode (`EBADF`) order and validate unseekable input/output offsets (`EINVAL`) before waiting)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: live vmsplice reads, snapshot fallback on pipe transfers, and validation of spliced FUSE replies)
 
 ## Responsibilities
 
@@ -77,9 +77,8 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
   way), then rejects explicit offsets on any unseekable end or negative offsets (`EINVAL`) before
   waiting for pipe room or data. `/dev/fuse` splices
   one whole request into a pipe (waiting as the device's own `O_NONBLOCK` says, `EIO` without
-  room) and takes a reply of exactly the length asked, setting its header length to it (libfuse
-  fixes the length in user memory after vmsplicing the header, which a copying vmsplice does not
-  see).
+  room). A spliced reply must declare the number of bytes supplied. A mismatch returns EINVAL
+  and leaves the bytes in the pipe.
 - Which files splice at each end follows Linux's `splice_read` and `splice_write`
   (`splice_reads`, `splice_writes`, also used by sendfile): pipes, regular and FUSE files,
   sockets, terminals, host fds, `/dev/fuse`, sysfs/cgroup2 and `/proc/sys` files, global/`net`/
@@ -100,6 +99,9 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
   pipe's `O_NONBLOCK`. Regular-file splice and sendfile split at file page boundaries, vmsplice
   at each iovec's guest page boundaries. Each fragment occupies a separate slot. A whole slot moved between
   pipes keeps its merge flag; tee and partial moves create nonmergeable destination slots.
+- A vmspliced slot keeps a weak reference to the source address space and a snapshot of the bytes.
+  Reads and splice sample the live page at the slot's current offset. Tee and pipe-to-pipe splice
+  carry the same source and capture the transferred bytes as the destination's fallback snapshot.
 - vmsplice's write side reads guest memory directly; every other copy to or from a guest buffer
   first grows a grows-down mapping below it (`kernel/fileio`).
 
@@ -117,7 +119,7 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 - `kernel/fileio` (the read and write paths of the other end, file checks, `RLIMIT_FSIZE`),
   `kernel/files` (fd tables and `FileKind::Pipe`),
   `kernel/process` (waits and wake objects), `kernel/signal` (`SIGPIPE`), `kernel/sysctl`
-  (`pipe-max-size`), `kernel/cred` (`CAP_SYS_RESOURCE`).
+  (`pipe-max-size`), `kernel/cred` (`CAP_SYS_RESOURCE`), `kernel/mm` (readable guest page translations and TLB shootdown generations).
 
 ## Invariants and gotchas
 
@@ -130,9 +132,10 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 
 ## Confirmed bugs / technical debt
 
-- **Fidelity gaps**, one per line:
-  - `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues);
-  - vmsplice copies at the call, so later changes to the buffer are not seen by the reader.
+- `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues).
+- vmsplice does not pin guest pages. If the address space is gone or mutably borrowed, the
+  translation is missing or replaced, or the address space has had a TLB shootdown, the reader
+  gets the slot's snapshot. This can omit later writes even when a shootdown affected another page.
 
 ## Open questions
 
