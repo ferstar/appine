@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: shared lock identities and ownership for pipes, sockets and PTYs)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: show FUSE locks in `/proc/locks` and fdinfo, and omit unshown entries without advancing line numbers)
 
 ## Responsibilities
 
@@ -83,10 +83,11 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
   by inode, as `FLOCK  ADVISORY  `, `POSIX  ADVISORY  `, `OFDLCK ADVISORY  ` or
   `LEASE  ACTIVE    `/`LEASE  BREAKING  `, the type (a lease being broken shows its target type),
   the taker's pid (the caller's tgid at flock, F_SETLK or F_SETLEASE; -1 for OFD locks), the device
-  and inode fstat shows through the holding open file (the shown inode on overlayfs, the pipefs
-  inode for an anonymous pipe, sockfs or PTY fstat identity for those files), and the range with an inclusive end (`EOF` from `OFFSET_MAX`)
-  or `0 EOF`. `/proc/locks` numbers lines by
-  position, leaving out (numbers included) locks whose pid the reader's procfs cannot see; fdinfo
+  and inode fstat shows through the holding open file (the shown inode on overlayfs, the cached
+  inode on FUSE, the pipefs inode for an anonymous pipe, sockfs or PTY fstat identity for those
+  files), and the range with an inclusive end (`EOF` from `OFFSET_MAX`) or `0 EOF`. `/proc/locks`
+  numbers lines by position, omitting entries without a shown identity without advancing the count
+  and leaving out (numbers included) locks whose pid the reader's procfs cannot see; fdinfo
   numbers from 1 the locks held through that open file, a POSIX lock through the open file of its
   table's lowest fd on the file.
 
@@ -118,7 +119,7 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
 - **Lock listings differ:** `/proc/locks` goes by kind and inode where Linux lists newest first
   (lslocks prints another order) and leaves out `F_SETLKW` waiters (Linux's `->` lines); a POSIX
   lock shows in the fdinfo of its table's lowest fd on the file, not of the open file that took
-  it; locks on FUSE files are left out of both, still using up `/proc/locks` line numbers.
+  it.
 
 ## Open questions
 

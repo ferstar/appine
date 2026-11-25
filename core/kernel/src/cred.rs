@@ -366,16 +366,20 @@ impl Cred {
         Ok(())
     }
 
-    /// capset(2): the permitted set can only shrink, the effective set cannot exceed the
-    /// permitted set, and the inheritable set cannot exceed the old inheritable and permitted sets
-    /// (the bounding set with `CAP_SETPCAP`). Ambient capabilities not in the new permitted and
-    /// inheritable sets are dropped along with them.
+    /// capset(2): bits above [`cap::LAST`] ([`CAP_FULL`]) are ignored as on Linux; the permitted
+    /// set can only shrink, the effective set cannot exceed the permitted set, and the inheritable
+    /// set cannot exceed the old inheritable and permitted sets (the bounding set with
+    /// `CAP_SETPCAP`). Ambient capabilities not in the new permitted and inheritable sets are
+    /// dropped along with them.
     pub fn capset(
         &mut self,
         effective: u64,
         permitted: u64,
         inheritable: u64,
     ) -> Result<(), Errno> {
+        let effective = effective & CAP_FULL;
+        let permitted = permitted & CAP_FULL;
+        let inheritable = inheritable & CAP_FULL;
         let inh_limit = self.cap_inheritable
             | if self.capable_here(cap::SETPCAP) {
                 CAP_FULL
@@ -1580,5 +1584,48 @@ mod tests {
 
         // Entering a parent user namespace is NOT a subset
         assert!(!root_init.caps_subset_of(&in_child));
+    }
+
+    #[test]
+    fn capset_masks_bits_above_last_cap() {
+        let high = !CAP_FULL;
+        assert_ne!(high, 0);
+
+        // Root passing all-ones masks off bits above cap::LAST instead of failing with EPERM
+        let mut root = Cred::root();
+        root.capset(u64::MAX, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(root.cap_effective, CAP_FULL);
+        assert_eq!(root.cap_permitted, CAP_FULL);
+        assert_eq!(root.cap_inheritable, CAP_FULL);
+
+        // Unprivileged caller passing only reserved bits succeeds and stores 0
+        let mut u = user(1000, 100);
+        u.capset(high, high, high).unwrap();
+        assert_eq!(
+            (u.cap_effective, u.cap_permitted, u.cap_inheritable),
+            (0, 0, 0)
+        );
+        u.capset(high, 0, 0).unwrap();
+        assert_eq!(u.cap_effective, 0);
+
+        // Disallowed valid capability bits still return EPERM even when combined with reserved bits
+        let last_bit = 1u64 << cap::LAST;
+        let before = u.clone();
+        assert_eq!(u.capset(0, high | last_bit, 0), Err(Errno::EPERM));
+        assert_eq!(u.capset(high | last_bit, 0, 0), Err(Errno::EPERM));
+        assert_eq!(u.capset(0, 0, high | last_bit), Err(Errno::EPERM));
+        assert_eq!(u, before);
+
+        // Bounding set limit still applies to valid bits while ignoring reserved bits
+        let mut bounded = Cred::root();
+        bounded.cap_bounding &= !last_bit;
+        assert_eq!(
+            bounded.capset(CAP_FULL, CAP_FULL, u64::MAX),
+            Err(Errno::EPERM)
+        );
+        bounded
+            .capset(u64::MAX, u64::MAX, u64::MAX & !last_bit)
+            .unwrap();
+        assert_eq!(bounded.cap_inheritable, CAP_FULL & !last_bit);
     }
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-thread no_new_privs and seccomp synchronization)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `capset` masks bits above `CAP_LAST_CAP`)
 
 ## Responsibilities
 
@@ -108,7 +108,8 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   `ns_capable` in a given namespace (including the parent-owner rule); `capable_wrt` additionally
   requires the inode's uid and gid to be mapped in the caller's namespace.
 - `capset`: v1 (one word) or v2/v3 (two); unknown versions write v3 back and fail `EINVAL`; null
-  data is a probe; another pid `EPERM`; new permitted ⊆ old permitted, effective ⊆ new permitted,
+  data is a probe; another pid `EPERM`; bits above `cap::LAST` (`CAP_FULL`) are masked and ignored
+  before checking; new permitted ⊆ old permitted, effective ⊆ new permitted,
   inheritable ⊆ old inheritable ∪ (`CAP_SETPCAP` ? all : old permitted) and ⊆ old inheritable ∪
   bounding; ambient is then masked to permitted ∩ inheritable.
 - prctl: bounding drop needs `CAP_SETPCAP`; ambient raise needs the capability in permitted and
@@ -251,8 +252,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   kernel log, where Linux's audit records appear without auditd), and USER_NOTIF is never logged
   although `SECCOMP_FILTER_FLAG_LOG` asks for it.
 - **Errno order differences.** setgroups reports `EINVAL`/`EFAULT` before the permission check's
-  `EPERM`; capset does not mask bits above `CAP_LAST_CAP` (`EPERM` instead of silently ignoring
-  them); `PR_CAPBSET_DROP` beyond 40 is `EINVAL` before `EPERM`.
+  `EPERM`; `PR_CAPBSET_DROP` beyond 40 is `EINVAL` before `EPERM`.
 
 ## Open questions
 

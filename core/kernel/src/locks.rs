@@ -322,22 +322,26 @@ pub(crate) fn closed(k: &mut Kernel, fds: &Rc<RefCell<FdTable>>, files: &[FileRe
 /// POSIX and OFD lock and lease, numbered by position, giving the process that took it as the
 /// reader's pid namespace `ns` sees it (-1 for OFD locks; the locks of processes `ns` cannot see
 /// are left out, their numbers skipped), the device and inode numbers stat shows for the file and,
-/// for record locks, the byte range. Linux lists them newest first and the requests waiting for
-/// each below it (`->` lines); here they come by kind and inode, and waiting requests are not
-/// listed.
+/// for record locks, the byte range. Entries whose file has no shown device/inode identity are
+/// omitted without advancing the line number. Linux lists them newest first and the requests
+/// waiting for each below it (`->` lines); here they come by kind and inode, and waiting requests
+/// are not listed.
 pub(crate) fn proc_locks(k: &Kernel, vfs: &Vfs, ns: &PidNs) -> String {
     let mut out = String::new();
-    for (i, s) in shown(k, None).iter().enumerate() {
+    let mut pos = 0;
+    for s in shown(k, None) {
+        let Some(id) = shown_id(vfs, &s.file.borrow()) else {
+            continue;
+        };
+        pos += 1;
         let pid = match s.pid {
             -1 => Some(-1),
             // As Linux's locks_translate_pid: the initial namespace shows the number as recorded
             p if ns.level == 0 => Some(p),
             p => ns.vnr(p).filter(|&p| p != 0),
         };
-        if let Some(pid) = pid
-            && let Some(line) = s.status(vfs, pid)
-        {
-            writeln!(out, "{}: {line}", i + 1).unwrap();
+        if let Some(pid) = pid {
+            writeln!(out, "{pos}: {}", s.status(id, pid)).unwrap();
         }
     }
     out
@@ -366,15 +370,16 @@ pub(crate) fn fd_locks(
                 .as_ref()
                 .is_none_or(|t| std::ptr::eq(t.as_ptr(), Rc::as_ptr(fds)))
     }) {
+        let Some(id) = shown_id(vfs, &s.file.borrow()) else {
+            continue;
+        };
         let pid = match s.pid {
             -1 => -1,
             p if ns.level == 0 => p,
             p => ns.vnr(p).unwrap_or(0),
         };
-        if let Some(line) = s.status(vfs, pid) {
-            n += 1;
-            writeln!(out, "lock:\t{n}: {line}").unwrap();
-        }
+        n += 1;
+        writeln!(out, "lock:\t{n}: {}", s.status(id, pid)).unwrap();
     }
     out
 }
@@ -396,10 +401,8 @@ struct Shown {
 }
 
 impl Shown {
-    /// The line after the number, with `pid` as the reader sees it; None when the file has no
-    /// inode to show.
-    fn status(&self, vfs: &Vfs, pid: Tid) -> Option<String> {
-        let (dev, ino) = shown_id(vfs, &self.file.borrow())?;
+    /// The line after the number, for device/inode `(dev, ino)` and `pid` as the reader sees it.
+    fn status(&self, (dev, ino): (u64, u64), pid: Tid) -> String {
         let ty = match self.write {
             Some(true) => "WRITE",
             Some(false) => "READ",
@@ -409,9 +412,7 @@ impl Shown {
         let major = (dev >> 8 & 0xfff) | (dev >> 32 & !0xfff);
         let minor = (dev & 0xff) | (dev >> 12 & !0xff);
         let (kind, range) = (self.kind, &self.range);
-        Some(format!(
-            "{kind}{ty} {pid} {major:02x}:{minor:02x}:{ino} {range}"
-        ))
+        format!("{kind}{ty} {pid} {major:02x}:{minor:02x}:{ino} {range}")
     }
 }
 
@@ -508,19 +509,18 @@ impl Owner {
 }
 
 /// The device and inode numbers stat shows for `file` (`/proc/locks` prints the inode's): those of
-/// its node, with an overlay node's shown inode number.
+/// its node, with an overlay node's shown inode number or a FUSE node's cached inode number.
 fn shown_id(vfs: &Vfs, file: &OpenFile) -> Option<(u64, u64)> {
-    if let FileKind::Pipe(end) = &file.kind
-        && end.pipe.borrow().fifo.is_none()
-    {
-        return Some((crate::pipe::PIPE_DEV, end.pipe.borrow().ino));
-    }
-    if matches!(file.kind, FileKind::Socket(_) | FileKind::Pty(_)) {
-        return Some(crate::syscall::dev_ino(file));
-    }
-    let node = file.node()?;
+    let Some(node) = file.node() else {
+        return matches!(
+            file.kind,
+            FileKind::Pipe(_) | FileKind::Socket(_) | FileKind::Pty(_)
+        )
+        .then(|| crate::syscall::dev_ino(file));
+    };
     let ino = match &node {
         Node::Overlay(_, o) => vfs.overlay().shown_ino(*o),
+        Node::Fuse(_, f) => vfs.fuse().get(*f)?.attr.ino,
         n => n.ino()?,
     };
     Some((vfs.dev_of(&node), ino))
@@ -610,5 +610,193 @@ mod tests {
         assert!(!l.deadlock(key, &wait));
         l.set_waiting(&oa, Some(Waiter { key, req: wait }));
         assert!(l.deadlock(key, &lock(&ob, 0, 10, true)));
+    }
+
+    #[test]
+    fn proc_locks_and_fd_locks_handle_fuse_and_omitted_entries() {
+        use crate::cred::Cred;
+        use crate::vfs::dev::Device;
+        use crate::vfs::fuse;
+        use crate::vfs::store::mode;
+
+        let dir = std::env::temp_dir().join(format!(
+            "appine-locks-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::vfs::store::Store::create(&dir).unwrap());
+        let vfs = Vfs::open(&dir).unwrap();
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let init_ns = PidNs::init();
+        let root_cred = Cred::root();
+
+        fuse::new_syscall();
+        let (fuse_mnt, conn) = vfs.new_fuse((Node::ROOT, None), 0, b"testfuse".to_vec(), |dev| {
+            fuse::Conn::new(dev, fuse::Options::default(), &root_cred, init_ns.clone())
+        });
+        let fuse_dev = conn.borrow().dev;
+        let fuse_root = vfs.fuse().root_of(fuse_dev).unwrap();
+        let fuse_id = vfs
+            .fuse_mut()
+            .enter(
+                fuse_root,
+                b"locked",
+                &fuse::Entry {
+                    nodeid: 2,
+                    attr: fuse::Attr {
+                        ino: 4242,
+                        mode: mode::S_IFREG | 0o644,
+                        nlink: 1,
+                        ..fuse::Attr::default()
+                    },
+                    entry_until: None,
+                    attr_until: None,
+                },
+            )
+            .unwrap();
+
+        let store_a = OpenFile::new(
+            FileKind::Device {
+                ino: 10,
+                dev: Device::Null,
+                kmsg: None,
+                block: None,
+            },
+            0,
+        );
+        let store_b = OpenFile::new(
+            FileKind::Device {
+                ino: 20,
+                dev: Device::Null,
+                kmsg: None,
+                block: None,
+            },
+            0,
+        );
+        let fuse_file = OpenFile::new(
+            FileKind::Fuse(Box::new(fuse::Handle {
+                conn: conn.clone(),
+                id: fuse_id,
+                nodeid: 2,
+                fh: 1,
+                open_flags: 0,
+                flags: 0,
+                dir: false,
+                no_release: true,
+            })),
+            0,
+        );
+        fuse_file.borrow_mut().mnt = fuse_mnt;
+
+        let fds = Rc::new(RefCell::new(FdTable::new()));
+        fds.borrow_mut()
+            .install(fuse_file.clone(), false, 0..16)
+            .unwrap();
+
+        let key_a = LockKey::of(&store_a.borrow()).unwrap();
+        let key_b = LockKey::of(&store_b.borrow()).unwrap();
+        let key_fuse = LockKey::of(&fuse_file.borrow()).unwrap();
+
+        assert!(k.flocks.try_lock(key_a, &store_a, true, 100));
+        assert!(k.flocks.try_lock(key_fuse, &fuse_file, true, 100));
+        assert!(k.flocks.try_lock(key_b, &store_b, false, 200));
+        k.locks.set(
+            key_fuse,
+            Lock {
+                owner: Owner::Ofd(Rc::downgrade(&fuse_file)),
+                pid: -1,
+                start: 10,
+                end: 20,
+                write: true,
+            },
+            false,
+        );
+        k.locks.set(
+            key_fuse,
+            Lock {
+                owner: Owner::Posix(Rc::downgrade(&fds)),
+                pid: 100,
+                start: 30,
+                end: u64::MAX,
+                write: false,
+            },
+            false,
+        );
+
+        let major = (fuse_dev >> 8 & 0xfff) | (fuse_dev >> 32 & !0xfff);
+        let minor = (fuse_dev & 0xff) | (fuse_dev >> 12 & !0xff);
+        let fuse_dev_ino = format!("{major:02x}:{minor:02x}:4242");
+
+        // Live FUSE locks show in both /proc/locks and fdinfo with consecutive numbering
+        let listing = proc_locks(&k, &vfs, &init_ns);
+        let lines: Vec<&str> = listing.lines().collect();
+        assert_eq!(lines.len(), 5, "{listing}");
+        assert!(lines[0].starts_with("1: FLOCK  ADVISORY  WRITE 100 08:01:10 0 EOF"));
+        assert!(lines[1].starts_with("2: FLOCK  ADVISORY  READ 200 08:01:20 0 EOF"));
+        assert_eq!(
+            lines[2],
+            format!("3: FLOCK  ADVISORY  WRITE 100 {fuse_dev_ino} 0 EOF")
+        );
+        assert_eq!(
+            lines[3],
+            format!("4: OFDLCK ADVISORY  WRITE -1 {fuse_dev_ino} 10 19")
+        );
+        assert_eq!(
+            lines[4],
+            format!("5: POSIX  ADVISORY  READ 100 {fuse_dev_ino} 30 EOF")
+        );
+
+        let fdinfo = fd_locks(&k, &vfs, &init_ns, &fds, &fuse_file);
+        let fd_lines: Vec<&str> = fdinfo.lines().collect();
+        assert_eq!(fd_lines.len(), 3, "{fdinfo}");
+        assert_eq!(
+            fd_lines[0],
+            format!("lock:\t1: FLOCK  ADVISORY  WRITE 100 {fuse_dev_ino} 0 EOF")
+        );
+        assert_eq!(
+            fd_lines[1],
+            format!("lock:\t2: OFDLCK ADVISORY  WRITE -1 {fuse_dev_ino} 10 19")
+        );
+        assert_eq!(
+            fd_lines[2],
+            format!("lock:\t3: POSIX  ADVISORY  READ 100 {fuse_dev_ino} 30 EOF")
+        );
+
+        // Once the FUSE instance is gone, its locks are omitted without consuming line numbers
+        vfs.fuse_mut().remove(fuse_dev);
+        // Add a store record lock ordered after the FUSE flock/record entries to verify no gap
+        k.locks.set(
+            key_a,
+            Lock {
+                owner: Owner::Ofd(Rc::downgrade(&store_a)),
+                pid: -1,
+                start: 0,
+                end: 10,
+                write: true,
+            },
+            false,
+        );
+        let after_remove = proc_locks(&k, &vfs, &init_ns);
+        let after_lines: Vec<&str> = after_remove.lines().collect();
+        assert_eq!(after_lines.len(), 3, "{after_remove}");
+        assert!(after_lines[0].starts_with("1: FLOCK  ADVISORY  WRITE 100 08:01:10 0 EOF"));
+        assert!(after_lines[1].starts_with("2: FLOCK  ADVISORY  READ 200 08:01:20 0 EOF"));
+        assert!(after_lines[2].starts_with("3: OFDLCK ADVISORY  WRITE -1 08:01:10 0 9"));
+        assert!(fd_locks(&k, &vfs, &init_ns, &fds, &fuse_file).is_empty());
+
+        // Pid-namespace filtering still skips line numbers for invisible PIDs on shown locks
+        let child_ns = PidNs::child(&init_ns, root_cred.user_ns.clone());
+        PidNs::register(&child_ns, 100, &[]).unwrap();
+        let child_listing = proc_locks(&k, &vfs, &child_ns);
+        let child_lines: Vec<&str> = child_listing.lines().collect();
+        assert_eq!(child_lines.len(), 2, "{child_listing}");
+        assert!(child_lines[0].starts_with("1: FLOCK  ADVISORY  WRITE 1 08:01:10 0 EOF"));
+        assert!(child_lines[1].starts_with("3: OFDLCK ADVISORY  WRITE -1 08:01:10 0 9"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
