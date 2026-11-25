@@ -21,12 +21,15 @@ import org.junit.runner.RunWith
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.IOException
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.file.AccessDeniedException
+import java.nio.file.FileAlreadyExistsException
 import java.security.MessageDigest
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
@@ -999,7 +1002,7 @@ class MachineTest {
         withMachine(store) { machine ->
             checkedShell(machine, "adduser -D -s /bin/sh alice")
             // First login installs doas and records alice in /var/lib/appine/admins.
-            val first = login(machine, "id -un; doas -n id -un; exit\n", "alice")
+            val first = login(machine, "id -un; id -nG; doas -n id -un; exit\n", "alice")
             assertTrue(first, becameAdmin(first, "wheel"))
 
             // Slow down awk during passwd/shadow lookups; Ctrl-C arriving then must be ignored so
@@ -1009,16 +1012,13 @@ class MachineTest {
                 machine,
                 "mkdir -p /usr/local/bin && printf '#!/bin/sh\\necho READY_AWK >&2\\nsleep 1\\nexec /usr/bin/awk \"\$@\"\\n' > /usr/local/bin/awk && chmod +x /usr/local/bin/awk",
             )
-            val protectedOut = plain(
-                loginSteps(
-                    machine,
-                    "alice",
-                    "READY_AWK" to "\u0003",
-                    "$ " to "id -un; doas -n id -un; echo sl''eeping; sleep 30\n",
-                    "sleeping" to "\u0003",
-                    "$ " to "echo shell-ctrlc-ok; exit\n",
-                ),
-            )
+            val protectedOut = plain(loginSteps(
+                machine, "alice",
+                "READY_AWK" to "\u0003",
+                "$ " to "id -un; doas -n id -un; echo sl''eeping; sleep 30\n",
+                "sleeping" to "\u0003",
+                "$ " to "echo shell-ctrlc-ok; exit\n",
+            ))
             checkedShell(machine, "rm -f /usr/local/bin/awk")
             assertFalse(protectedOut, protectedOut.contains("there is no user alice"))
             assertTrue(protectedOut, protectedOut.contains("\nalice\nroot\n"))
@@ -1037,16 +1037,13 @@ class MachineTest {
                     machine,
                     "i=0; while [ ! -e /tmp/apk-held ] && [ \$i -lt 100 ]; do sleep 0.05; i=\$((i + 1)); done; [ -e /tmp/apk-held ]",
                 )
-                val skipped = plain(
-                    loginSteps(
-                        machine,
-                        "alice",
-                        "another apk is running; waiting for it to finish" to "\u0003",
-                        "$ " to "id -un; echo sl''eeping; sleep 30\n",
-                        "sleeping" to "\u0003",
-                        "$ " to "echo after-apk-skip; exit\n",
-                    ),
-                )
+                val skipped = plain(loginSteps(
+                    machine, "alice",
+                    "another apk is running; waiting for it to finish" to "\u0003",
+                    "$ " to "id -un; echo sl''eeping; sleep 30\n",
+                    "sleeping" to "\u0003",
+                    "$ " to "echo after-apk-skip; exit\n",
+                ))
                 assertTrue(skipped, skipped.contains("appine: skipped installing doas"))
                 assertTrue(skipped, skipped.contains("\nalice\n"))
                 assertTrue(skipped, skipped.contains("\nafter-apk-skip\n"))
@@ -1066,8 +1063,7 @@ class MachineTest {
         val debian = Rootfs.tarball(context, Rootfs.Distro.DEBIAN)
         val debianPart = File(debian.path + ".part")
         val alpine = Rootfs.tarball(context, Rootfs.Distro.ALPINE)
-        val alpineExisted = alpine.exists()
-        val alpineBytes = if (alpineExisted) alpine.readBytes() else null
+        val alpineBytes = if (alpine.exists()) alpine.readBytes() else null
         try {
             debian.writeText("debian-tarball")
             debianPart.writeText("debian-part")
@@ -1079,7 +1075,7 @@ class MachineTest {
         } finally {
             debian.delete()
             debianPart.delete()
-            if (alpineExisted && alpineBytes != null) alpine.writeBytes(alpineBytes) else alpine.delete()
+            if (alpineBytes != null) alpine.writeBytes(alpineBytes) else alpine.delete()
         }
     }
 
@@ -2059,31 +2055,15 @@ class MachineTest {
                 machine,
                 "mkdir -p /root/be/dir/sub && printf a > /root/be/a.txt && printf b > /root/be/b.txt && ln -s /etc /root/be/etc-link",
             )
-            assertThrows(java.io.FileNotFoundException::class.java) {
-                Native.browseStat(store, "/root/be/missing")
-            }
-            assertThrows(java.io.FileNotFoundException::class.java) {
-                Native.browseList(store, "/root/be/a.txt")
-            }
-            assertThrows(java.nio.file.FileAlreadyExistsException::class.java) {
-                Native.browseRename(store, "/root", "/root/be/a.txt", "b.txt")
-            }
-            assertThrows(java.nio.file.AccessDeniedException::class.java) {
-                Native.browseCreate(store, "/root", "/root/be/etc-link", "x", false, 0, 0)
-            }
-            assertThrows(java.nio.file.AccessDeniedException::class.java) {
-                Native.browseOpenWrite(store, "/root", "/root/be/etc-link/passwd", false, false)
-            }
-            assertThrows(java.nio.file.AccessDeniedException::class.java) {
-                Native.browseImport(store, "/", "x.txt", 0, 0) {}
-            }
-            val isDir = assertThrows(IOException::class.java) {
-                Native.browseOpen(store, "/root/be/dir")
-            }
+            assertThrows(FileNotFoundException::class.java) { Native.browseStat(store, "/root/be/missing") }
+            assertThrows(FileNotFoundException::class.java) { Native.browseList(store, "/root/be/a.txt") }
+            assertThrows(FileAlreadyExistsException::class.java) { Native.browseRename(store, "/root", "/root/be/a.txt", "b.txt") }
+            assertThrows(AccessDeniedException::class.java) { Native.browseCreate(store, "/root", "/root/be/etc-link", "x", false, 0, 0) }
+            assertThrows(AccessDeniedException::class.java) { Native.browseOpenWrite(store, "/root", "/root/be/etc-link/passwd", false, false) }
+            assertThrows(AccessDeniedException::class.java) { Native.browseImport(store, "/", "x.txt", 0, 0) {} }
+            val isDir = assertThrows(IOException::class.java) { Native.browseOpen(store, "/root/be/dir") }
             assertEquals(IOException::class.java, isDir.javaClass)
-            val invalid = assertThrows(IOException::class.java) {
-                Native.browseMove(store, "/root", "/root/be/dir", "/root/be/dir/sub")
-            }
+            val invalid = assertThrows(IOException::class.java) { Native.browseMove(store, "/root", "/root/be/dir", "/root/be/dir/sub") }
             assertEquals(IOException::class.java, invalid.javaClass)
         }
     }

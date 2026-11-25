@@ -312,9 +312,7 @@ if [ ! -e "$installed" ] && ! command -v "$tool" >/dev/null; then
         # (an hour at most), saying so
         echo "appine: installing sudo so that $user can become root (Ctrl-C skips it until the next login)"
         if apt_update && [ -z "$interrupted" ]; then
-            trap 'interrupted=1' INT
-            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=3600 install -y sudo </dev/null
-            trap '' INT
+            cancellable env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=3600 install -y sudo </dev/null
         fi
     fi
 fi
@@ -362,8 +360,9 @@ cmd="{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; ${zdot}exec \"\$
 # reading the terminal as root. busybox su (Alpine) never starts a new session and has no such
 # option
 if su --help 2>&1 | grep -q -- --session-command; then
-    trap - INT
-    exec su "$@" --session-command="$cmd" "$user"
+    set -- "$@" --session-command="$cmd" "$user"
+else
+    set -- "$@" "$user" -c "$cmd"
 fi
 trap - INT
-exec su "$@" "$user" -c "$cmd"
+exec su "$@"

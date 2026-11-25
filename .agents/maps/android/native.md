@@ -83,7 +83,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   encoded name after publication, and propagates any exception thrown by the writer. All throwing
   browse calls (`browseStat`, `browseGenerations`, `browseList`, `browseOpen`, `browseSniff`,
   `browseSearch`, `browseImport`, `browseCreate`, `browseRemove`, `browseRename`, `browseMove`,
-  `browseOpenWrite`) map store/browse errnos via `browse_error_class`: `ENOENT`/`ENOTDIR` to
+  `browseOpenWrite`) map store/browse errnos via `browse_error`: `ENOENT`/`ENOTDIR` to
   `FileNotFoundException`, `EEXIST` to `FileAlreadyExistsException`, `EACCES` to
   `AccessDeniedException`, and all other errnos (`ENOSPC`, `EISDIR`, `EINVAL`, `ENAMETOOLONG`,
   `ELOOP`, `EIO`, etc.) to `IOException`. Other runtime calls use `IOException` or sentinel values.

@@ -510,10 +510,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseImport<'l>(
                 .unwrap_or(std::ptr::null_mut()),
             Err(e) => {
                 if !env.exception_check().unwrap_or(true) {
-                    let _ = env.throw_new(
-                        browse_error_class(e),
-                        format!("cannot import {name} into {home}: {e}"),
-                    );
+                    browse_error(&mut env, &format!("import {name} into"), &home, e);
                 }
                 std::ptr::null_mut()
             }
@@ -756,18 +753,15 @@ fn stat_fields(st: &appine_kernel::vfs::store::Stat) -> String {
     )
 }
 
-fn browse_error_class(e: appine_kernel::errno::Errno) -> &'static str {
+fn browse_error(env: &mut JNIEnv<'_>, what: &str, path: &str, e: appine_kernel::errno::Errno) {
     use appine_kernel::errno::Errno;
-    match e {
+    let class = match e {
         Errno::ENOENT | Errno::ENOTDIR => "java/io/FileNotFoundException",
         Errno::EEXIST => "java/nio/file/FileAlreadyExistsException",
         Errno::EACCES => "java/nio/file/AccessDeniedException",
         _ => "java/io/IOException",
-    }
-}
-
-fn browse_error(env: &mut JNIEnv<'_>, what: &str, path: &str, e: appine_kernel::errno::Errno) {
-    let _ = env.throw_new(browse_error_class(e), format!("cannot {what} {path}: {e}"));
+    };
+    let _ = env.throw_new(class, format!("cannot {what} {path}: {e}"));
 }
 
 // ---- The kernel ----
