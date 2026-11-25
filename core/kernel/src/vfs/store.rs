@@ -367,6 +367,12 @@ pub struct Store {
     /// Deleted regular files whose `shared` row was kept at unlink/rename because they might still
     /// be open or mapped: released once nothing in the kernel references them (`Store::release`).
     pending_release: RefCell<HashSet<Ino>>,
+    /// Unlinked `O_TMPFILE` regular files opened without `O_EXCL` (Linux's `I_LINKABLE`): their
+    /// host objects stay on disk until linked once by [`Store::link`] or reaped by
+    /// [`Store::release_tmpfile`] after the last guest reference closes.
+    linkable_tmpfiles: RefCell<HashSet<Ino>>,
+    /// Previous linkability at each change in the pending transaction, in operation order.
+    tmpfile_undo: RefCell<Vec<(Ino, bool)>>,
 }
 
 impl Store {
@@ -538,6 +544,8 @@ impl Store {
             fills: RefCell::default(),
             writable_maps: RefCell::default(),
             pending_release: RefCell::default(),
+            linkable_tmpfiles: RefCell::default(),
+            tmpfile_undo: RefCell::default(),
         })
     }
 
@@ -1255,14 +1263,38 @@ impl Store {
     /// deleted from the start, so the data goes away once it is closed; the inode is cleaned up
     /// the next time the store is opened. The owner is the creator's (filesystem) ids.
     pub fn create_anonymous(&self, perm: u32, uid: u32, gid: u32) -> Result<(Ino, File), Errno> {
+        self.create_tmpfile(perm, uid, gid, false, None)
+    }
+
+    /// Creates an unnamed regular file (`O_TMPFILE`): its link count is 0 and it has no directory
+    /// entry. With `linkable` false (`O_EXCL`), its host object is unlinked immediately; with
+    /// `linkable` true, its object stays on disk and the inode is marked linkable until linked
+    /// once by [`Store::link`] or reaped by [`Store::release_tmpfile`].
+    pub fn create_tmpfile(
+        &self,
+        perm: u32,
+        uid: u32,
+        gid: u32,
+        linkable: bool,
+        default_acl: Option<&[crate::vfs::acl::AclEntry]>,
+    ) -> Result<(Ino, File), Errno> {
         let (ino, file) = self.transaction(|s| {
             let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 0, 0)?;
             let file = s.new_object(ino)?;
-            s.unlink_new_object(ino)?;
+            if let Some(acl) = default_acl {
+                crate::vfs::acl::inherit(s, ino, acl)?;
+            }
+            if linkable {
+                s.set_tmpfile_linkable(ino, true);
+            } else {
+                s.unlink_new_object(ino)?;
+            }
             Ok((ino, file))
         })?;
-        // memfd mappings bypass `mapping_object`, so never cache host-backed relatime state.
-        self.writable_maps.borrow_mut().insert(ino);
+        if !linkable {
+            // Unlinked from the start: mappings bypass `mapping_object`'s path open.
+            self.writable_maps.borrow_mut().insert(ino);
+        }
         Ok((ino, file))
     }
 
@@ -1315,7 +1347,9 @@ impl Store {
         })
     }
 
-    /// Adds a hard link to an existing non-directory inode.
+    /// Adds a hard link to an existing non-directory inode (or links an unlinked `O_TMPFILE`
+    /// created without `O_EXCL` for the first time, clearing its linkable state as Linux clears
+    /// `I_LINKABLE`).
     pub fn link(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
         self.transaction(|s| {
             let row = s.stat_row(ino)?;
@@ -1323,8 +1357,10 @@ impl Store {
                 return Err(Errno::EPERM);
             }
             // Linux's vfs_link: an inode whose last name is gone (a deleted file still open, a
-            // memfd) gets no new one; its object is doomed and would be deleted under the new name
-            if row.nlink == 0 {
+            // memfd, or an O_TMPFILE|O_EXCL file) gets no new one; only a linkable O_TMPFILE may
+            // be materialized from nlink 0.
+            let tmpfile = row.nlink == 0;
+            if tmpfile && !s.is_linkable_tmpfile(ino) {
                 return Err(Errno::ENOENT);
             }
             s.add_dentry(parent, name, ino)?;
@@ -1335,6 +1371,9 @@ impl Store {
                 .map_err(db_err)?;
             s.touch_ino(ino);
             s.object_changed(ino);
+            if tmpfile {
+                s.set_tmpfile_linkable(ino, false);
+            }
             Ok(())
         })
     }
@@ -2198,6 +2237,7 @@ impl Store {
                 savepoint,
                 doomed: self.doomed.borrow().len(),
                 replaced: self.replaced.borrow().len(),
+                tmpfile_undo: self.tmpfile_undo.borrow().len(),
                 done: false,
             };
             self.writing.set(true);
@@ -2273,9 +2313,11 @@ impl Store {
                 let _ = self.exec("ROLLBACK");
             }
             self.update(|c| c.clear(c.generation));
+            self.rollback_tmpfiles(0);
             let _ = self.remove_lost_objects();
             return r;
         }
+        self.tmpfile_undo.borrow_mut().clear();
         let (lo, hi) = self.meta.commits.fresh();
         lo.store(0, Ordering::SeqCst);
         hi.store(0, Ordering::SeqCst);
@@ -2794,6 +2836,59 @@ impl Store {
         self.pending_release.borrow().iter().copied().collect()
     }
 
+    fn set_tmpfile_linkable(&self, ino: Ino, linkable: bool) {
+        let mut links = self.linkable_tmpfiles.borrow_mut();
+        let was_linkable = if linkable {
+            !links.insert(ino)
+        } else {
+            links.remove(&ino)
+        };
+        self.tmpfile_undo.borrow_mut().push((ino, was_linkable));
+    }
+
+    fn rollback_tmpfiles(&self, from: usize) {
+        let mut links = self.linkable_tmpfiles.borrow_mut();
+        for (ino, was_linkable) in self.tmpfile_undo.borrow_mut().drain(from..).rev() {
+            if was_linkable {
+                links.insert(ino);
+            } else {
+                links.remove(&ino);
+            }
+        }
+    }
+
+    /// Whether `ino` is an unlinked `O_TMPFILE` that can still be linked into a directory.
+    pub(crate) fn is_linkable_tmpfile(&self, ino: Ino) -> bool {
+        self.linkable_tmpfiles.borrow().contains(&ino)
+    }
+
+    /// Whether any unlinked linkable `O_TMPFILE` inodes are still tracked.
+    pub(crate) fn has_linkable_tmpfiles(&self) -> bool {
+        !self.linkable_tmpfiles.borrow().is_empty()
+    }
+
+    /// Snapshot of unlinked linkable `O_TMPFILE` inodes awaiting either linking or close cleanup.
+    pub(crate) fn linkable_tmpfiles(&self) -> Vec<Ino> {
+        self.linkable_tmpfiles.borrow().iter().copied().collect()
+    }
+
+    /// Unlinked `O_TMPFILE` `ino` is no longer referenced anywhere: clear its linkable state and
+    /// schedule its host object for reaping if it was never linked.
+    pub fn release_tmpfile(&self, ino: Ino) -> Result<(), Errno> {
+        if self.is_linkable_tmpfile(ino) {
+            self.transaction(|s| {
+                let (st, data) = s.row(ino)?;
+                if st.nlink == 0 && st.kind() == mode::S_IFREG {
+                    s.drop_object(ino, data)?;
+                }
+                s.set_tmpfile_linkable(ino, false);
+                Ok(())
+            })?;
+        }
+        self.writable_maps.borrow_mut().remove(&ino);
+        Ok(())
+    }
+
     /// Deleted regular file `ino` is not open any more: if it was held, it stops sharing its
     /// object, which goes when no other file uses it (otherwise the next boot does this).
     pub fn release(&self, ino: Ino) -> Result<(), Errno> {
@@ -2968,6 +3063,7 @@ struct Op<'a> {
     savepoint: bool,
     doomed: usize,
     replaced: usize,
+    tmpfile_undo: usize,
     done: bool,
 }
 
@@ -2989,6 +3085,7 @@ impl Drop for Op<'_> {
                 let _ = s.exec("RELEASE op");
                 s.doomed.borrow_mut().truncate(self.doomed);
                 s.replaced.borrow_mut().truncate(self.replaced);
+                s.rollback_tmpfiles(self.tmpfile_undo);
                 for ino in created {
                     let _ = s.unlink_new_object(ino);
                 }
@@ -4993,6 +5090,107 @@ mod tests {
         assert_eq!(s.tree_root(gone).unwrap(), None);
 
         drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tmpfile_linkability_follows_store_rollback() {
+        let (s, dir) = temp_store("tmpfile-rollback");
+        let (ino, _file) = s.create_tmpfile(0o600, 0, 0, true, None).unwrap();
+        s.commit().unwrap();
+        let result = s.transaction(|s| {
+            s.link(ROOT, b"rolled-back", ino)?;
+            s.create_tmpfile(0o600, 0, 0, true, None)?;
+            Err::<(), _>(Errno::EIO)
+        });
+        assert_eq!(result, Err(Errno::EIO));
+        assert_eq!(s.linkable_tmpfiles(), vec![ino]);
+        assert_eq!(s.lookup(ROOT, b"rolled-back").unwrap(), None);
+        let result = s.transaction(|s| {
+            s.release_tmpfile(ino)?;
+            Err::<(), _>(Errno::EIO)
+        });
+        assert_eq!(result, Err(Errno::EIO));
+        // Make SQLite reject the deferred commit after link has already returned success.
+        s.commit().unwrap();
+        s.exec("PRAGMA foreign_keys = ON").unwrap();
+        s.exec("CREATE TEMP TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        s.exec(
+            "CREATE TEMP TABLE child (id INTEGER REFERENCES parent DEFERRABLE INITIALLY DEFERRED)",
+        )
+        .unwrap();
+        s.link(ROOT, b"deferred", ino).unwrap();
+        s.exec("INSERT INTO child VALUES (1)").unwrap();
+        assert_eq!(s.commit(), Err(Errno::EIO));
+        assert!(s.is_linkable_tmpfile(ino));
+        assert_eq!(s.lookup(ROOT, b"deferred").unwrap(), None);
+        s.link(ROOT, b"retry", ino).unwrap();
+        drop(s);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tmpfile_create_link_and_release_lifecycle() {
+        use std::io::Read;
+        let (s, dir) = temp_store("tmpfile_lifecycle");
+
+        // 1. Linkable O_TMPFILE (without O_EXCL): nlink 0, object kept on disk until linked.
+        let (ino, mut file) = s.create_tmpfile(0o600, 1000, 1000, true, None).unwrap();
+        assert_eq!(s.stat(ino).unwrap().nlink, 0);
+        assert!(s.is_linkable_tmpfile(ino));
+        assert!(dir.join("objects").join(ino.to_string()).exists());
+        file.write_all(b"tmpfile payload").unwrap();
+
+        // Linking onto an existing name fails with EEXIST and leaves it linkable.
+        let (_existing, _) = s.create_file(ROOT, b"taken", 0o644, 0, 0).unwrap();
+        assert_eq!(s.link(ROOT, b"taken", ino), Err(Errno::EEXIST));
+        assert!(s.is_linkable_tmpfile(ino));
+        assert_eq!(s.stat(ino).unwrap().nlink, 0);
+
+        // Linking to a new name materializes it (nlink 0 -> 1) and clears I_LINKABLE.
+        s.link(ROOT, b"materialized", ino).unwrap();
+        assert!(!s.is_linkable_tmpfile(ino));
+        assert_eq!(s.stat(ino).unwrap().nlink, 1);
+        assert_eq!(s.tree_root(ino).unwrap(), Some(ROOT));
+        let mut buf = Vec::new();
+        s.open_object(ino, false)
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        assert_eq!(buf, b"tmpfile payload");
+        drop(file);
+
+        // Unlinking back to nlink 0 does NOT make it linkable again.
+        s.unlink(ROOT, b"materialized").unwrap();
+        assert_eq!(s.stat(ino).unwrap().nlink, 0);
+        assert_eq!(s.link(ROOT, b"relinked", ino), Err(Errno::ENOENT));
+
+        // 2. Linkable O_TMPFILE closed without linking: release_tmpfile reaps its object on disk.
+        let (unlinked_ino, mut f2) = s.create_tmpfile(0o600, 0, 0, true, None).unwrap();
+        f2.write_all(b"discarded").unwrap();
+        drop(f2);
+        assert!(s.has_linkable_tmpfiles());
+        assert!(dir.join("objects").join(unlinked_ino.to_string()).exists());
+        s.release_tmpfile(unlinked_ino).unwrap();
+        assert!(!s.is_linkable_tmpfile(unlinked_ino));
+
+        // 3. Non-linkable O_TMPFILE | O_EXCL: object unlinked immediately, link refused with ENOENT.
+        let (excl_ino, mut f3) = s.create_tmpfile(0o600, 0, 0, false, None).unwrap();
+        assert_eq!(s.attrs(excl_ino).unwrap().nlink, 0);
+        assert_eq!(s.stat_open(excl_ino, &f3).unwrap().nlink, 0);
+        assert!(!s.is_linkable_tmpfile(excl_ino));
+        assert!(!dir.join("objects").join(excl_ino.to_string()).exists());
+        f3.write_all(b"private").unwrap();
+        assert_eq!(s.link(ROOT, b"cant_link", excl_ino), Err(Errno::ENOENT));
+        drop(f3);
+
+        s.commit().unwrap();
+        drop(s);
+        assert!(
+            !dir.join("objects").join(unlinked_ino.to_string()).exists(),
+            "closed unlinked O_TMPFILE object must be reaped"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: record socket creator fsuid (`sock_i_uid`) for `/proc/net/*`, align `ino_of`/`fdinfo`/epoll/inotify with `stat`, and align `statm` and `status` `VmData`/`VmExe`/`VmLib` with Linux 6.1)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: environ reads return EOF at every offset once the pinned address space is gone)
 
 ## Responsibilities
 
@@ -59,7 +59,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `Offline::Boot` serves empty synthetic roots for boot and host spawns.
   `Offline::HostStat` reports synthetic child lookups as unavailable to host metadata samples.
 - `FileKind::Proc` — an open synthetic file: mount, node, snapshot `data`, `fresh` flag, a weak
-  address space for `mem` and `pagemap`, the namespace reference of an nsfs file, the kernel-log reader for
+  address space for `mem`, `pagemap` and `environ`, the namespace reference of an nsfs file, the kernel-log reader for
   `/proc/kmsg`, the opener's credentials (`opener`, Linux's `f_cred`) and change state
   (`fd::ProcEvent`: a shared counter, what the file last reported and when its contents were
   made).
@@ -105,11 +105,11 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   fd or open process file never resolves to a new process reusing that pid: once the pinned thread
   group is reaped, lookups and directory listings under it fail with `ENOENT` and offset-0 reads of
   open files fail with `ESRCH`.
-- Modes: directories 0555 (0755 on sysfs, a cgroup's from its node attributes); `fd/<n>` links by the open
+- Modes: directories 0555 (0755 on sysfs, 0500 for per-process `fd/` and `ns/`, a cgroup's from its node attributes); `fd/<n>` links by the open
   mode as `proc_fd_instantiate` (0500 readable, 0300 writable, 0700 both, 0 for `O_PATH`); other
-  symlinks 0777; `mem` 0600; `syscall`, `pagemap`, `auxv` and `/proc/kmsg` 0400; sysctls follow
-  `kernel/sysctl`; other writable files 0644 (`comm` included); everything else 0444 (so `fd/`,
-  `fdinfo/`, `ns/` are 0555, `environ` 0444, `projid_map` read-only); cgroup files their current
+  symlinks 0777; `mem` 0600; `syscall`, `pagemap`, `auxv`, `environ` and `/proc/kmsg` 0400; sysctls follow
+  `kernel/sysctl`; other writable files 0644 (`comm` included); everything else 0444 (so `fdinfo/`
+  is 0555, `projid_map` read-only); cgroup files their current
   modes; devpts nodes the terminal's mode and `ptmxmode`.
 - Owners: per-process nodes (`Pid`, `Entry`, `Fd`, including the `fd/`, `fdinfo/`, `ns/`, `net/`
   directories) belong to the euid/egid of the thread (under `task/<tid>`) or the main thread, or
@@ -137,7 +137,9 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   (found through `group_of_id` matching the pinned `ProcId`, else `ESRCH`) and the named thread pass one
   ptrace check with filesystem credentials and no read/attach distinction (`EACCES`, as Linux's
   `proc_mem_open`); `mem` and `pagemap` also need a live thread (`ESRCH`) and pin a weak reference
-  to its address space (`Mm`) at open; writing `setgroups`
+  to its address space (`Mm`) at open, while `environ` pins a weak `Mm` when live (leaving `None`
+  for a zombie so open succeeds and reads EOF). Once the old address space is freed after exit or
+  `execve`, an open `environ` fd returns EOF at every offset. Writing `setgroups`
   needs `CAP_SYS_ADMIN` in the process's user namespace (`EACCES`, `proc_setgroups_open`); devpts
   nodes on nodev mounts `EACCES`, then the cgroup device filter; `O_DIRECT` `EINVAL`; directories
   open read-only (`EISDIR` for a write mode); write modes on ro mounts `EROFS`.
@@ -156,8 +158,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   the first one keeps a fresh snapshot unless its change counter moved or the pinned process has
   been reaped (`pseudo::gone`, yielding `ESRCH`), later ones regenerate with
   the opener's credentials and the current reader's namespaces, root and cgroup root; reads
-  elsewhere use the current snapshot, so a first read at a non-zero offset leaves the snapshot
-  fresh (only a write marks it stale). The opener's credentials include their user namespace, which
+  elsewhere use the current snapshot while the pinned address space for `environ` is live.
+  A first read at a non-zero offset leaves the snapshot fresh (only a write marks it stale). The opener's credentials include their user namespace, which
   translates the ids shown; pid numbers follow the mount's pid namespace. lseek
   (`SEEK_SET`/`CUR`/`END` against the snapshot length) never regenerates. `pagemap`, `mem` and
   `/proc/kmsg` are computed at read time (`mem` and `pagemap` from the address space held weakly
@@ -249,6 +251,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `cwd`, `exe`, `ns/*` and `stat`'s layout fields, checked against the target thread's credentials
   (`tid.unwrap_or(proc.pid)`); named fd links resolve their tracked parent and name against the reader's root.
   Renames follow the opened name. Unlinking it appends ` (deleted)` even with other hard links.
+  An original `O_TMPFILE` fd keeps its `#<ino> (deleted)` name after linking.
   Reopening a deleted regular store file via `fd/N` with `O_PATH` pins its backing object.
   Stat and subsequent reopens keep the original inode across source-fd close and reuse.
   Synthetic descriptors and unreachable paths use their recorded description; `fdinfo/N` has `pos`, `flags` (octal, with
@@ -390,7 +393,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 - **Inotify on synthetic files is partial:** synthetic files outside cgroup2's four notifying files
   report no inotify events (opens, reads, writes).
-- **Fidelity gaps:** modes and owners differ (`environ` 0444, `fd/` and `ns/` 0555,
+- **Fidelity gaps:** some modes and owners still differ (`fdinfo/` 0555,
   `fdinfo/<n>` and `ns/*` owned by root, devpts root 0555, a master's fstat fixed);
   procfs mount options are ignored; many standard files are absent.
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons

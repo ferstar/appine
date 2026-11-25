@@ -3280,6 +3280,14 @@ impl Vfs {
         }
     }
 
+    /// Removes an unlinked tmpfs `O_TMPFILE` from the unlinked table once `linkat` attaches it
+    /// to the directory tree; its inode and page charges remain in `used` via the new tree entry.
+    pub(crate) fn tmpfs_take_unlinked(&self, dev: u64, ino: Ino) {
+        if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
+            t.unlinked.remove(&ino);
+        }
+    }
+
     /// Whether any tmpfs instance currently tracks unlinked regular files still held open or
     /// mapped.
     pub(crate) fn has_unlinked_tmpfs(&self) -> bool {

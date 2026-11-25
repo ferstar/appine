@@ -2059,6 +2059,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let sysfs = matches!(fs_of(node), Fs::Sys | Fs::Cgroup);
     let perm = match (kind, node) {
         (mode::S_IFDIR, _) if sysfs => 0o755,
+        (mode::S_IFDIR, PseudoNode::Entry(_, _, Entry::Fd | Entry::Ns)) => 0o500,
         (mode::S_IFDIR, _) => 0o555,
         // proc_fd_instantiate: read and search bits for a readable file, write and search for a
         // writable one (none for O_PATH)
@@ -2080,7 +2081,10 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         }
         (_, PseudoNode::Static(p)) if recorded(p).is_some() => recorded(p).map_or(0o444, |e| e.1),
         (_, n) if writable(n) => 0o644,
-        (_, PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv | Entry::Syscall)) => 0o400,
+        (
+            _,
+            PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv | Entry::Environ | Entry::Syscall),
+        ) => 0o400,
         (_, PseudoNode::Global(Global::Kmsg)) => 0o400,
         _ => 0o444,
     };
@@ -3031,6 +3035,9 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.args)));
                 }
                 self::Entry::Environ => {
+                    if !ps.may_read(*proc, *tid) {
+                        return Err(Errno::EACCES);
+                    }
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.env)));
                 }
                 self::Entry::Limits => {
@@ -3567,11 +3574,20 @@ pub(crate) fn comm_str(task: Option<&Task>, pid: Tid) -> String {
     }
 }
 
+/// Reads `/proc/<pid>/environ` from the address space pinned at open (`proc_environ_operations`):
+/// returns empty/EOF once the process has exited or replaced its address space via `execve`.
+pub(crate) fn read_environ(mm: Option<&Rc<RefCell<crate::mm::Mm>>>) -> Vec<u8> {
+    mm.map_or_else(Vec::new, |mm| mm_bytes(&mm.borrow(), |m| m.env))
+}
+
 /// A range of guest memory (cmdline, environ); empty when it cannot be read.
 fn guest_bytes(task: &Task, range: fn(&crate::mm::Mm) -> (u64, u64)) -> Vec<u8> {
     let res = task.res.borrow();
-    let mm = res.mm.borrow();
-    let (start, end) = range(&mm);
+    mm_bytes(&res.mm.borrow(), range)
+}
+
+fn mm_bytes(mm: &crate::mm::Mm, range: fn(&crate::mm::Mm) -> (u64, u64)) -> Vec<u8> {
+    let (start, end) = range(mm);
     if end <= start || end - start > 1 << 20 {
         return Vec::new();
     }
@@ -4111,7 +4127,7 @@ fn fdinfo(
         0
     };
     let f = file.borrow();
-    let mnt_id = f.node().map_or(crate::vfs::ANON_MOUNT, |n| n.mnt());
+    let mnt_id = f.mnt_id();
     let ino = match &f.kind {
         FileKind::Host(hfd) => appine_hal::fstat(*hfd).map_or(0, |st| st.st_ino),
         FileKind::MessageQueue(q) => q.borrow().stat().ino,
@@ -5712,7 +5728,7 @@ fn tree_name(path: &[u8]) -> &[u8] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Number-taking /proc files: up to a NUL, only the first 12 bytes, base 0, beyond 32 bits is
@@ -6061,5 +6077,149 @@ mod tests {
         assert_eq!(lib, PAGE_SIZE);
         // statm data field = (VmData + VmStk) in pages = 6
         assert_eq!((layout.data + layout.stack) / PAGE_SIZE, 6);
+    }
+
+    pub(crate) fn mm_with_env(env: &[u8]) -> (crate::mm::Mm, u64) {
+        use crate::mm::{Mm, flags};
+        use appine_engine::prot;
+        let mut mm = Mm::new();
+        let addr = mm
+            .mmap(
+                0,
+                2 * PAGE_SIZE,
+                prot::READ | prot::WRITE,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        mm.write(
+            crate::uaccess::UserSlice::new(addr + PAGE_SIZE, env.len()),
+            env,
+        )
+        .unwrap();
+        mm.env = (addr + PAGE_SIZE, addr + PAGE_SIZE + env.len() as u64);
+        (mm, addr)
+    }
+
+    pub(crate) fn add_task(
+        k: &mut Kernel,
+        tid: Tid,
+        uid: u32,
+        dumpable: bool,
+        env: &[u8],
+    ) -> (ProcId, u64, appine_engine::Cpu) {
+        use crate::process::ThreadGroup;
+        use crate::signal::SigHandlers;
+        use crate::task::{FsContext, Task, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            tid,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        group.borrow_mut().dumpable = dumpable;
+        let mut cred = Cred::root();
+        cred.user_ns = k.init_ns.ipc.owner.clone();
+        if uid != 0 {
+            cred.setgid(uid).unwrap();
+            cred.setuid(uid).unwrap();
+        }
+        group.borrow_mut().cred = cred;
+        let (mm, addr) = mm_with_env(env);
+        let mm = mm.into_shared();
+        let fds = Rc::new(RefCell::new(crate::fd::FdTable::new()));
+        let fs = Rc::new(RefCell::new(FsContext {
+            root: Node::ROOT,
+            cwd: Node::ROOT,
+            umask: 0o022,
+            mnt_ns: Rc::new(MntNs {
+                id: INIT_MNT_NS,
+                owner: k.init_ns.ipc.owner.clone(),
+                anon: false,
+            }),
+        }));
+        let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+        let state = TaskState {
+            mm,
+            fds,
+            fs,
+            group: group.clone(),
+            vfs: k.vfs.clone(),
+            altstack: Default::default(),
+            clear_child_tid: 0,
+            vfork_done: None,
+            restart: None,
+            fast_sleep: None,
+            sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+        };
+        let task = Task::new(tid, tid, &cpu, state, k.init_ns.clone(), 0, [0; 16]).unwrap();
+        let serial = group.borrow().serial;
+        group.borrow_mut().threads.push(tid);
+        k.groups.insert(tid, group);
+        k.tasks.insert(tid, task);
+        (ProcId { pid: tid, serial }, addr, cpu)
+    }
+
+    #[test]
+    fn environ_fd_and_ns_modes_and_ptrace_access_match_linux() {
+        let dir = std::env::temp_dir().join(format!(
+            "appine-pseudo-environ-{}-{}",
+            std::process::id(),
+            crate::tty::wall_ns()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::vfs::store::Store::create(&dir).unwrap());
+        let vfs = Rc::new(Vfs::open(&dir).unwrap());
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        k.vfs = Some(vfs.clone());
+
+        let (root_proc, _, _c1) = add_task(&mut k, 10, 0, true, b"SECRET=root\0");
+        let (alice_proc, _, _c2) = add_task(&mut k, 20, 1000, true, b"USER=alice\0");
+        let (nondump_proc, _, _c3) = add_task(&mut k, 21, 1000, false, b"SECRET=nondump\0");
+
+        let view_as = |tid: Tid| View {
+            k: &k,
+            vfs: &vfs,
+            tid,
+            tgid: tid,
+            cred: None,
+            opening: false,
+        };
+
+        // Modes: environ is 0o400, fd/ and ns/ are 0o500.
+        let v_root = view_as(10);
+        for (entry, mode) in [
+            (Entry::Environ, mode::S_IFREG | 0o400),
+            (Entry::Fd, mode::S_IFDIR | 0o500),
+            (Entry::Ns, mode::S_IFDIR | 0o500),
+        ] {
+            assert_eq!(
+                stat(&v_root, &PseudoNode::Entry(root_proc, None, entry))
+                    .unwrap()
+                    .mode,
+                mode
+            );
+        }
+        let environ = |reader: &View<'_>, target| {
+            content(
+                reader,
+                crate::vfs::PROC_MOUNT,
+                &PseudoNode::Entry(target, None, Entry::Environ),
+            )
+        };
+        let v_alice = view_as(20);
+        assert_eq!(environ(&v_alice, root_proc), Err(Errno::EACCES));
+        assert_eq!(environ(&v_alice, nondump_proc), Err(Errno::EACCES));
+        assert_eq!(environ(&v_alice, alice_proc).unwrap(), b"USER=alice\0");
+        assert_eq!(environ(&v_root, alice_proc).unwrap(), b"USER=alice\0");
+
+        // read_environ uses the pinned mm and yields EOF once the mm is gone.
+        assert_eq!(
+            read_environ(Some(&k.tasks[&20].res.borrow().mm)),
+            b"USER=alice\0"
+        );
+        assert_eq!(read_environ(None), Vec::<u8>::new());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

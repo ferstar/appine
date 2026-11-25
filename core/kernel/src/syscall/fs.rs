@@ -8,6 +8,7 @@
 //! pipes may block; while blocked they release the BKL and hold no borrow of any open file (other
 //! threads may be using the same open file).
 
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -221,7 +222,8 @@ const KEPT_AT_OPEN: u32 = oflags::O_ACCMODE
     | oflags::O_DIRECT
     | oflags::O_NOATIME
     | oflags::O_DIRECTORY
-    | oflags::O_NOFOLLOW;
+    | oflags::O_NOFOLLOW
+    | oflags::O_TMPFILE_BIT;
 
 /// The status flags an open file keeps from `flags`: with `O_PATH` only `O_PATH`, `O_DIRECTORY`
 /// and `O_NOFOLLOW` (Linux's `build_open_flags` drops the access mode and every other flag but
@@ -244,20 +246,24 @@ const MAX_HANDLE_SZ: u32 = 128;
 const AT_HANDLE_FID: u32 = 0x200;
 
 pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u32) -> SysResult {
-    // build_open_flags checks O_TMPFILE for open(2) as for openat2 (O_PATH has dropped it): it
-    // must come with O_DIRECTORY and without O_CREAT, and be writable
-    const O_TMPFILE_BIT: u32 = 0o20000000; // __O_TMPFILE
-    let o_tmpfile = O_TMPFILE_BIT | oflags::O_DIRECTORY;
-    if flags & (O_TMPFILE_BIT | oflags::O_PATH) == O_TMPFILE_BIT
-        && (flags & (o_tmpfile | oflags::O_CREAT) != o_tmpfile
-            || flags & oflags::O_ACCMODE == oflags::O_RDONLY)
-    {
-        return Err(Errno::EINVAL);
+    // Legacy open ignores the tmpfile bit when O_PATH is set.
+    if flags & oflags::O_PATH == 0 {
+        validate_tmpfile_flags(flags)?;
     }
     let path = read_path(cx, path)?;
     let file = open_path(cx, dirfd, path, flags, perm)?;
     cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
+}
+
+fn validate_tmpfile_flags(flags: u32) -> Result<(), Errno> {
+    if flags & oflags::O_TMPFILE_BIT != 0
+        && (flags & (oflags::O_TMPFILE | oflags::O_CREAT) != oflags::O_TMPFILE
+            || flags & oflags::O_ACCMODE == oflags::O_RDONLY)
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 /// openat2 (Linux 6.1's `fs/open.c`): the flags, mode and resolve of `struct open_how`. Unlike
@@ -269,10 +275,10 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
     /// `FMODE_NONOTIFY`: user space should not pass it; it is removed along with `O_CLOEXEC`
     /// and is not an error.
     const FMODE_NONOTIFY: u64 = 0x400_0000;
-    const O_SYNC_BIT: u64 = 0o4000000; // __O_SYNC
-    const O_DSYNC: u64 = 0o10000;
+    const O_SYNC_BIT: u64 = oflags::O_SYNC_BIT as u64;
+    const O_DSYNC: u64 = oflags::O_DSYNC as u64;
     const O_NOATIME: u64 = oflags::O_NOATIME as u64;
-    const O_TMPFILE_BIT: u64 = 0o20000000; // __O_TMPFILE
+    const O_TMPFILE_BIT: u64 = oflags::O_TMPFILE_BIT as u64;
     const VALID_OPEN_FLAGS: u64 = (oflags::O_ACCMODE
         | oflags::O_CREAT
         | oflags::O_EXCL
@@ -324,14 +330,7 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
     if (will_create && mode & !0o7777 != 0) || (!will_create && mode != 0) {
         return Err(Errno::EINVAL);
     }
-    // O_TMPFILE must come with O_DIRECTORY and without O_CREAT, and must be writable
-    let o_tmpfile = O_TMPFILE_BIT | oflags::O_DIRECTORY as u64;
-    if f & O_TMPFILE_BIT != 0
-        && (f & (o_tmpfile | oflags::O_CREAT as u64) != o_tmpfile
-            || f & oflags::O_ACCMODE as u64 == oflags::O_RDONLY as u64)
-    {
-        return Err(Errno::EINVAL);
-    }
+    validate_tmpfile_flags(f as u32)?;
     if f & oflags::O_PATH as u64 != 0 && f & !O_PATH_FLAGS != 0 {
         return Err(Errno::EINVAL);
     }
@@ -410,6 +409,10 @@ fn open_path_with(
         ..cx.view(&vfs)
     };
     let resolved = vfs.walk_resolve(&view, &cred, &root, &start, &path, follow, res);
+    if !path_only && flags & oflags::O_TMPFILE_BIT != 0 {
+        let (dir, _) = resolved?;
+        return open_tmpfile(cx, &vfs, &cred, &dir, (&start, &path), flags, perm);
+    }
     // A queue was created in the mqueue filesystem (open permission is not checked again, as for
     // files just created in the store)
     let mut mq_created = false;
@@ -722,6 +725,84 @@ fn open_path_with(
     Ok(file)
 }
 
+/// Opens an unnamed temporary file (`O_TMPFILE`, Linux 6.1's `do_tmpfile`/`vfs_tmpfile`) in the
+/// directory named by `path`. Supported on store and tmpfs directories; other filesystems check
+/// read-only mount and directory write/search permission and return `EOPNOTSUPP`.
+fn open_tmpfile(
+    cx: &Cx<'_>,
+    vfs: &Vfs,
+    cred: &Cred,
+    dir: &Node,
+    (start, path): (&Node, &[u8]),
+    flags: u32,
+    perm: u32,
+) -> Result<FileRef, Errno> {
+    let view = cx.view(vfs);
+    if !vfs.is_dir(&view, dir)? {
+        return Err(Errno::ENOTDIR);
+    }
+    if vfs.readonly(dir) {
+        return Err(Errno::EROFS);
+    }
+    let (mnt, d) = match dir {
+        Node::Store(mnt, d) => (*mnt, *d),
+        Node::Overlay(_, o) => {
+            let real = vfs.overlay().node(*o).real();
+            cred.permission(&vfs.store().stat(real)?, MAY_WRITE | MAY_EXEC)?;
+            return Err(Errno::EOPNOTSUPP);
+        }
+        Node::Fuse(_, d) => {
+            vfs.fuse_permission(cred, *d, MAY_WRITE | MAY_EXEC)?;
+            return Err(Errno::EOPNOTSUPP);
+        }
+        Node::Pseudo(_, p) => {
+            cred.permission(&pseudo::stat(&view, p)?, MAY_WRITE | MAY_EXEC)?;
+            return Err(Errno::EOPNOTSUPP);
+        }
+    };
+    let dir_st = vfs.store().stat(d)?;
+    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+    // tmpfs does not support O_DIRECT (do_dentry_open's direct_IO check).
+    if flags & oflags::O_DIRECT != 0 && vfs.fs_of(dir) == Fs::Tmpfs {
+        return Err(Errno::EINVAL);
+    }
+    let (uid, gid, mode) = cred.new_owner(&dir_st, perm, cx.umask(), false);
+    let tmpfs = tmpfs_reserve(vfs, (mnt, d), 0)?;
+    let linkable = flags & oflags::O_EXCL == 0;
+    let (ino, host, tracked) = vfs.store().transaction(|store| {
+        let (ino, host) =
+            store.create_tmpfile(mode, uid, gid, linkable, dir_st.default_acl.as_deref())?;
+        let tracked = tmpfs
+            .map(|dev| host.try_clone().map(|file| (dev, file)))
+            .transpose()
+            .map_err(host_errno)?;
+        Ok((ino, host, tracked))
+    })?;
+    if let Some((dev, tracked)) = tracked {
+        vfs.tmpfs_charge(dev, 0, 1);
+        vfs.tmpfs_unlinked(dev, ino, 0, tracked);
+    }
+    // The unnamed dentry is displayed as <dir>/#<ino>, including at the root.
+    let base = display_path(cx, vfs, start, path, dir, None);
+    let mut name = base.as_deref().unwrap_or_default().to_vec();
+    if !name.ends_with(b"/") {
+        name.push(b'/');
+    }
+    write!(name, "#{ino}").unwrap();
+    let file = OpenFile::with_path(
+        FileKind::Regular {
+            ino,
+            file: host,
+            cow: false,
+        },
+        flags & kept(flags) | largefile(flags),
+        Some(Rc::from(name)),
+    );
+    file.borrow_mut().mnt = mnt;
+    open_events(cx, &file, ino, None, true, flags, true);
+    Ok(file)
+}
+
 fn sticky_protection_allows(
     mode: u32,
     uid: u32,
@@ -927,10 +1008,21 @@ fn open_pseudo(
         }
         // mem and pagemap pin the named thread's address space at open (Linux's proc_mem_open /
         // pagemap_open): one that has exited (a zombie, a main thread whose process lives on) has
-        // none, ESRCH at open as on Linux
-        if matches!(e, pseudo::Entry::Mem | pseudo::Entry::Pagemap) {
-            let task = cx.kr().tasks.get(&thread).cloned().ok_or(Errno::ESRCH)?;
-            mm = Some(Rc::downgrade(&task.res.borrow().mm));
+        // none, ESRCH at open as on Linux. environ also pins the address space at open
+        // (proc_environ_operations / __mem_open), staying None (EOF on read) for a zombie so an
+        // open fd cannot later read a new address space after execve.
+        if matches!(
+            e,
+            pseudo::Entry::Mem | pseudo::Entry::Pagemap | pseudo::Entry::Environ
+        ) {
+            mm = cx
+                .kr()
+                .tasks
+                .get(&thread)
+                .map(|t| Rc::downgrade(&t.res.borrow().mm));
+            if mm.is_none() && e != pseudo::Entry::Environ {
+                return Err(Errno::ESRCH);
+            }
         }
     }
     // Writing setgroups needs CAP_SYS_ADMIN in the process's user namespace, checked at open
@@ -1022,6 +1114,8 @@ fn open_pseudo(
     } else if matches!(node, PseudoNode::Entry(_, _, pseudo::Entry::Syscall)) {
         fresh = false;
         Vec::new()
+    } else if matches!(node, PseudoNode::Entry(_, _, pseudo::Entry::Environ)) {
+        pseudo::read_environ(mm.as_ref().and_then(Weak::upgrade).as_ref())
     } else {
         match pseudo::content(&view, mnt, &node) {
             Err(_) if matches!(node, PseudoNode::NetConf(..)) => {
@@ -4923,6 +5017,22 @@ fn refresh_pseudo(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Resul
         let mut f = file.borrow_mut();
         let pos = offset.unwrap_or(f.pos);
         match &mut f.kind {
+            // environ pins the old mm. Its cached bytes expire at every offset when the mm dies.
+            FileKind::Proc {
+                node: PseudoNode::Entry(_, _, pseudo::Entry::Environ),
+                data,
+                fresh,
+                mm,
+                ..
+            } => {
+                let pinned = mm.as_ref().and_then(Weak::upgrade);
+                if pinned.is_none() {
+                    data.clear();
+                } else if pos == 0 && !std::mem::take(fresh) {
+                    *data = pseudo::read_environ(pinned.as_ref());
+                }
+                return Ok(());
+            }
             FileKind::Proc {
                 mnt,
                 node,
@@ -6552,7 +6662,7 @@ pub(super) fn faccessat(
     if amode == 0 {
         return Ok(0);
     }
-    let b = node_stat(cx, &node)?;
+    let (b, _) = node_stat(cx, &node)?;
     let word = |off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
     let st = Stat {
         mode: word(16),
@@ -6711,7 +6821,7 @@ pub(super) fn newfstatat(
 ) -> SysResult {
     newfstatat_flags(flags)?;
     let path = read_path(cx, path)?;
-    let st = stat_at(cx, dirfd, &path, flags)?;
+    let (st, _) = stat_at(cx, dirfd, &path, flags)?;
     put(cx, buf, st).map(|()| 0)
 }
 
@@ -6734,8 +6844,8 @@ pub(super) fn statx(
 ) -> SysResult {
     let flags = statx_flags(flags, mask)?;
     let path = read_path(cx, path)?;
-    let st = stat_at(cx, dirfd, &path, flags)?;
-    put(cx, buf, encode_statx(&st)).map(|()| 0)
+    let (st, mnt_id) = stat_at(cx, dirfd, &path, flags)?;
+    put(cx, buf, encode_statx(&st, mnt_id)).map(|()| 0)
 }
 
 /// The `flags` and `mask` checks of statx; returns the flags for [`stat_at`].
@@ -6749,9 +6859,11 @@ pub(super) fn statx_flags(flags: u32, mask: u32) -> Result<u32, Errno> {
 }
 
 /// Builds a `struct statx` from a `struct stat`: always gives all the basic fields
-/// (`STATX_BASIC_STATS`), with no creation time.
-pub(super) fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
+/// (`STATX_BASIC_STATS`) and `STATX_MNT_ID` and `stx_mnt_id`
+/// (Linux 6.1's `vfs_statx`), with no creation time.
+pub(super) fn encode_statx(st: &[u8; 128], mnt_id: MountId) -> [u8; 256] {
     const STATX_BASIC_STATS: u32 = 0x7ff;
+    const STATX_MNT_ID: u32 = 0x1000;
     let u32_at = |o: usize| u32::from_le_bytes(st[o..o + 4].try_into().unwrap());
     let u64_at = |o: usize| u64::from_le_bytes(st[o..o + 8].try_into().unwrap());
     // glibc's and musl's major()/minor()
@@ -6759,7 +6871,8 @@ pub(super) fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
     let minor = |d: u64| ((d & 0xff) | ((d >> 12) & !0xff)) as u32;
     let mut b = [0u8; 256];
     let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
-    put(0, &STATX_BASIC_STATS.to_le_bytes());
+    let mask = STATX_BASIC_STATS | STATX_MNT_ID;
+    put(0, &mask.to_le_bytes());
     put(4, &u32_at(56).to_le_bytes()); // blksize
     put(16, &u32_at(20).to_le_bytes()); // nlink
     put(20, &u32_at(24).to_le_bytes()); // uid
@@ -6778,18 +6891,21 @@ pub(super) fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
     put(132, &minor(rdev).to_le_bytes());
     put(136, &major(dev).to_le_bytes());
     put(140, &minor(dev).to_le_bytes());
+    put(144, &u64::from(mnt_id).to_le_bytes());
     b
 }
 
-/// Shared by newfstatat and statx: finds the object `*at`-style and returns its `struct stat`.
-fn stat_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
-    stat_at_kernel(cx, dirfd, path, flags).map(|st| owner_out(cx, st))
-}
-
-/// [`stat_at`], with the owner and group as kernel IDs.
-fn stat_at_kernel(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
+/// Resolves the stat and mount together in one snapshot. Magic links take both from their target.
+fn stat_at(
+    cx: &Cx<'_>,
+    dirfd: i32,
+    path: &[u8],
+    flags: u32,
+) -> Result<([u8; 128], MountId), Errno> {
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
-        file_stat(cx, &cx.fds().get(dirfd)?)
+        let file = cx.fds().get(dirfd)?;
+        let st = file_stat(cx, &file)?;
+        Ok((owner_out(cx, st), file.borrow().mnt_id()))
     } else {
         // Resolution and fetching the attributes share one read transaction (which really starts
         // only on a cache miss)
@@ -6804,7 +6920,8 @@ fn stat_at_kernel(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u
                 flags,
                 flags & AT_SYMLINK_NOFOLLOW == 0,
             )?;
-            node_stat(cx, &node)
+            let (st, mnt) = node_stat(cx, &node)?;
+            Ok((owner_out(cx, st), mnt))
         })
     }
 }
@@ -6978,29 +7095,29 @@ fn statfs_flags(flags: u64) -> u64 {
 // ---- stat ----
 
 /// Metadata of a filesystem node.
-fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
+fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<([u8; 128], MountId), Errno> {
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
-    match node {
+    let stat = match node {
         Node::Store(_, ino) => {
             let mut st = vfs.store().stat(*ino)?;
             vfs.tmpfs_stat_blocks(*ino, None, &mut st)?;
-            Ok(encode_stat(&st, vfs.dev_of(node)))
+            encode_stat(&st, vfs.dev_of(node))
         }
         Node::Overlay(_, o) => {
             let mut st = vfs.overlay_stat(*o)?;
             vfs.tmpfs_stat_blocks(vfs.overlay().node(*o).real(), None, &mut st)?;
-            Ok(encode_stat(&st, vfs.dev_of(node)))
+            encode_stat(&st, vfs.dev_of(node))
         }
-        Node::Fuse(..) => super::fuse::stat(&vfs, &cx.cred(), node),
+        Node::Fuse(..) => super::fuse::stat(&vfs, &cx.cred(), node)?,
         // Namespaces are in nsfs
         Node::Pseudo(_, p @ PseudoNode::NsFile(..)) => {
-            Ok(encode_stat(&pseudo::stat(&view, p)?, Fs::Nsfs.dev()))
+            encode_stat(&pseudo::stat(&view, p)?, Fs::Nsfs.dev())
         }
         // The open file a magic link points at: report that file itself
         Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
             let file = view.open_file(*proc, *tid, *fd).ok_or(Errno::ENOENT)?;
-            file_stat(cx, &file)
+            return Ok((file_stat(cx, &file)?, file.borrow().mnt_id()));
         }
         // A deleted program file
         Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
@@ -7011,18 +7128,19 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
             if let Node::Overlay(_, o) = node {
                 st.ino = vfs.overlay().shown_ino(o);
             }
-            Ok(encode_stat(&st, vfs.dev_of(&node)))
+            return Ok((encode_stat(&st, vfs.dev_of(&node)), node.mnt()));
         }
         Node::Pseudo(_, p) => {
             let b = encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node));
             // procfs and devpts have 1024-byte blocks (proc_fill_super, devpts_fill_super)
             if matches!(vfs.fs_of(node), Fs::Proc | Fs::Pts) {
-                Ok(with_blksize(b, 1024))
+                with_blksize(b, 1024)
             } else {
-                Ok(b)
+                b
             }
         }
-    }
+    };
+    Ok((stat, node.mnt()))
 }
 
 pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
@@ -7136,7 +7254,7 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
             } else {
                 let node = node.clone();
                 drop(f);
-                node_stat(cx, &node)
+                node_stat(cx, &node).map(|(st, _)| st)
             }
         }
         FileKind::Fuse(h) => {
@@ -7148,7 +7266,7 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
         _ => {
             let node = f.node().ok_or(Errno::EBADF)?;
             drop(f);
-            node_stat(cx, &node)
+            node_stat(cx, &node).map(|(st, _)| st)
         }
     }
 }
@@ -7831,12 +7949,12 @@ pub(super) fn linkat(
     if src_mnt != mnt {
         return Err(Errno::EXDEV);
     }
+    // A deleted source can still have a row after its host object has gone.
+    let st = vfs.store().attrs(src)?;
     // fs.protected_hardlinks (Linux's may_linkat, after EXDEV and before the directory's
     // permission): without being the owner or having CAP_FOWNER, only readable and writable
     // regular files can be linked, and not setuid ones or executable setgid ones
     if cx.kr().protected_hardlinks {
-        // The database row: a deleted file's object may already be gone
-        let st = vfs.store().attrs(src)?;
         let setgid_exec = mode::S_ISGID | 0o010;
         let safe = st.mode & mode::S_IFMT == mode::S_IFREG
             && st.mode & mode::S_ISUID == 0
@@ -7847,10 +7965,22 @@ pub(super) fn linkat(
         }
     }
     cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
-    // In tmpfs every hard link also takes an inode (Linux's shmem_link)
-    let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
+    // The first link of a tmpfile moves its existing charge from the unlinked table.
+    // Store::link checks whether a nameless inode can be linked before we change any charge.
+    let tmpfs = backing_tmpfs_dev(&vfs, &Node::Store(mnt, dir));
+    if let Some(dev) = tmpfs
+        && st.nlink != 0
+    {
+        vfs.tmpfs_check(dev, 0, 1)?;
+    }
     vfs.store().link(dir, name, src)?;
-    tmpfs_created(&vfs, tmpfs, 0);
+    if let Some(dev) = tmpfs {
+        if st.nlink == 0 {
+            vfs.tmpfs_take_unlinked(dev, src);
+        } else {
+            vfs.tmpfs_charge(dev, 0, 1);
+        }
+    }
     inotify::path_event(cx.kr(), src, None, inotify::IN_ATTRIB);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
@@ -10242,31 +10372,31 @@ fn live_store_inodes(
     Some(live)
 }
 
-/// Releases shared-object holds of deleted regular files once nothing in the kernel keeps them
-/// open, mapped, or executing.
-fn release_deleted_shared_with(
-    k: &crate::kernel::Kernel,
-    vfs: &Vfs,
+/// Releases candidates with no remaining file, mapping, executable, unshare or inotify reference.
+fn release_unused_inodes(
+    k: &Kernel,
     live: &std::collections::HashSet<Ino>,
+    candidates: Vec<Ino>,
+    release: impl Fn(Ino) -> Result<(), Errno>,
 ) {
-    let store = vfs.store();
     let Ok(inotify) = k.inotify.try_borrow() else {
         return;
     };
-    for ino in store.pending_releases() {
+    for ino in candidates {
         if !live.contains(&ino) && !k.unsharing.contains(&ino) && !inotify.has_open(ino) {
-            let _ = store.release(ino);
+            let _ = release(ino);
         }
     }
 }
 
 /// Sweeps deleted held files awaiting release when any exist.
 fn release_deleted_shared(k: &crate::kernel::Kernel, vfs: &Vfs) {
-    if !vfs.store().has_pending_release() {
+    let store = vfs.store();
+    if !store.has_pending_release() {
         return;
     }
     if let Some(live) = live_store_inodes(k, vfs) {
-        release_deleted_shared_with(k, vfs, &live);
+        release_unused_inodes(k, &live, store.pending_releases(), |ino| store.release(ino));
     }
 }
 
@@ -10299,12 +10429,15 @@ fn file_in_use(k: &crate::kernel::Kernel, vfs: &Vfs, ino: Ino) -> bool {
     })
 }
 
-/// Releases tmpfs page and inode charges for unlinked regular files and shared-object holds for
-/// deleted held files whose last descriptor, mapping or executable reference has gone away.
+/// Releases tmpfs page and inode charges for unlinked regular files, shared-object holds for
+/// deleted held files, and unlinked linkable `O_TMPFILE` objects whose last descriptor, mapping
+/// or executable reference has gone away.
 pub(crate) fn evict_unlinked_tmpfs(k: &crate::kernel::Kernel, vfs: &Vfs) {
     let has_tmpfs = vfs.has_unlinked_tmpfs();
-    let has_shared = vfs.store().has_pending_release();
-    if !has_tmpfs && !has_shared {
+    let store = vfs.store();
+    let has_shared = store.has_pending_release();
+    let has_tmpfiles = store.has_linkable_tmpfiles();
+    if !has_tmpfs && !has_shared && !has_tmpfiles {
         return;
     }
     let Some(live) = live_store_inodes(k, vfs) else {
@@ -10314,7 +10447,12 @@ pub(crate) fn evict_unlinked_tmpfs(k: &crate::kernel::Kernel, vfs: &Vfs) {
         vfs.evict_tmpfs(&live);
     }
     if has_shared {
-        release_deleted_shared_with(k, vfs, &live);
+        release_unused_inodes(k, &live, store.pending_releases(), |ino| store.release(ino));
+    }
+    if has_tmpfiles {
+        release_unused_inodes(k, &live, store.linkable_tmpfiles(), |ino| {
+            store.release_tmpfile(ino)
+        });
     }
 }
 
@@ -10577,5 +10715,483 @@ mod tests {
             assert!(sticky_protection_allows(kind, 0, 1000, sticky_world, 0, 2));
             assert!(sticky_protection_allows(kind, 1000, 0, non_sticky, 0, 2));
         }
+    }
+
+    #[test]
+    fn encode_statx_populates_stx_mnt_id_and_mask() {
+        let st = encode_stat(&Stat::default(), ROOT_DEV);
+        for id in [0, 42] {
+            let raw = encode_statx(&st, id);
+            assert_eq!(u32::from_le_bytes(raw[..4].try_into().unwrap()), 0x17ff);
+            assert_eq!(
+                u64::from_le_bytes(raw[144..152].try_into().unwrap()),
+                u64::from(id)
+            );
+        }
+    }
+
+    fn with_guest(uid: u32, run: impl FnOnce(&mut Cx<'_>, u64, &mut appine_engine::Cpu)) {
+        use crate::kernel::Shared;
+        let dir = std::env::temp_dir().join(format!(
+            "appine-fs-{}-{}-{}",
+            std::process::id(),
+            crate::tty::wall_ns(),
+            crate::vfs::new_ns_id()
+        ));
+        {
+            let store = Store::create(&dir).unwrap();
+            dev::ensure_dev_nodes(&store).unwrap();
+            store
+                .mkdir(crate::vfs::store::ROOT, b"tmp", 0o1777, 0, 0)
+                .unwrap();
+        }
+        let mut kernel = Kernel::new(crate::process::Tier::Interpreter);
+        kernel.vfs = Some(Rc::new(Vfs::open(&dir).unwrap()));
+        let (proc, buf, mut cpu) =
+            pseudo::tests::add_task(&mut kernel, 20, uid, true, b"USER_KEY=hello\0");
+        let shared = std::sync::Arc::new(Shared::new(kernel));
+        {
+            let k = shared.lock();
+            let task = k.tasks[&proc.pid].clone();
+            let mut state = task.state.borrow_mut();
+            run(&mut Cx::new(&shared, k, &task, &mut state), buf, &mut cpu);
+        }
+        drop(cpu);
+        drop(shared);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn mountpoint(vfs: &Vfs, name: &[u8]) -> (Node, Option<Dentry>) {
+        let ino = vfs
+            .store()
+            .mkdir(crate::vfs::store::ROOT, name, 0o755, 0, 0)
+            .unwrap();
+        (
+            Node::Store(crate::vfs::ROOT_MOUNT, ino),
+            Some((Node::ROOT, name.to_vec())),
+        )
+    }
+
+    fn mount_tmpfs(vfs: &Vfs, inodes: u64) -> MountId {
+        vfs.new_tmpfs(
+            mountpoint(vfs, b"mnt"),
+            0,
+            b"tmpfs".to_vec(),
+            crate::vfs::TmpfsParams {
+                blocks: 16,
+                inodes,
+                perm: 0o1777,
+                uid: 0,
+                gid: 0,
+                inode64: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn bind_tmp(vfs: &Vfs, name: &[u8], flags: u64) -> MountId {
+        let tmp = vfs
+            .store()
+            .lookup(crate::vfs::store::ROOT, b"tmp")
+            .unwrap()
+            .unwrap();
+        vfs.add_mount(
+            Fs::Store,
+            Node::Store(crate::vfs::ROOT_MOUNT, tmp),
+            mountpoint(vfs, name),
+            flags,
+            b"rootfs".to_vec(),
+            Some(ROOT_DEV),
+        )
+    }
+
+    fn write_cstr(cx: &Cx<'_>, addr: u64, path: &[u8]) {
+        let mut bytes = path.to_vec();
+        bytes.push(0);
+        cx.mm()
+            .write(UserSlice::new(addr, bytes.len()), &bytes)
+            .unwrap();
+    }
+
+    fn open(cx: &mut Cx<'_>, addr: u64, path: &[u8], flags: u32, mode: u32) -> Result<i32, Errno> {
+        write_cstr(cx, addr, path);
+        openat(cx, AT_FDCWD, addr, flags, mode).map(|fd| fd as i32)
+    }
+
+    fn link_fd(cx: &mut Cx<'_>, addr: u64, fd: i32, dst: &[u8], flags: u32) -> SysResult {
+        let (src, dirfd) = if flags == AT_EMPTY_PATH {
+            (String::new(), fd)
+        } else {
+            (format!("/proc/self/fd/{fd}"), AT_FDCWD)
+        };
+        write_cstr(cx, addr, src.as_bytes());
+        write_cstr(cx, addr + 256, dst);
+        linkat(cx, dirfd, addr, AT_FDCWD, addr + 256, flags)
+    }
+
+    fn check_statx_mount(
+        cx: &mut Cx<'_>,
+        addr: u64,
+        dirfd: i32,
+        path: &[u8],
+        flags: u32,
+        expected: MountId,
+    ) {
+        write_cstr(cx, addr, path);
+        let buf = addr + 512;
+        assert_eq!(statx(cx, dirfd, addr, flags, 0x17ff, buf), Ok(0));
+        let raw = get::<256>(cx, buf).unwrap();
+        assert_ne!(
+            u32::from_le_bytes(raw[..4].try_into().unwrap()) & 0x1000,
+            0,
+            "{path:?}"
+        );
+        assert_eq!(
+            u64::from_le_bytes(raw[144..152].try_into().unwrap()),
+            u64::from(expected),
+            "{path:?}"
+        );
+    }
+
+    #[test]
+    fn cached_statx_agrees_with_the_slow_path() {
+        with_guest(0, |cx, addr, cpu| {
+            let buf = addr + 512;
+            check_statx_mount(cx, addr, AT_FDCWD, b"/tmp", 0, crate::vfs::ROOT_MOUNT);
+            let slow = get::<256>(cx, buf).unwrap();
+            put(cx, buf, [0; 256]).unwrap();
+            let fast = super::super::fast::Fast::new(cx.shared, cx.task, cx.t);
+            let regs = &mut cpu.state_mut().x;
+            regs[..5].copy_from_slice(&[AT_FDCWD as u64, addr, 0, 0x17ff, buf]);
+            regs[8] = 291; // arm64 statx
+            assert!(fast.syscall(cx.shared, cx.task, cpu));
+            assert_eq!(cpu.state().x[0], 0);
+            assert_eq!(get::<256>(cx, buf).unwrap(), slow);
+        });
+    }
+
+    #[test]
+    fn statx_reports_path_fd_and_magic_link_mounts() {
+        use crate::vfs::{ANON_MOUNT, DEV_MOUNT, PROC_MOUNT, ROOT_MOUNT};
+        with_guest(0, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            let tmpfs = mount_tmpfs(&vfs, 16);
+            let bind = bind_tmp(&vfs, b"bind", 0);
+            assert_ne!(bind, ROOT_MOUNT);
+            for (path, mnt) in [
+                (b"/".as_slice(), ROOT_MOUNT),
+                (b"/proc", PROC_MOUNT),
+                (b"/dev", DEV_MOUNT),
+                (b"/mnt", tmpfs),
+                (b"/bind", bind),
+            ] {
+                check_statx_mount(cx, addr, AT_FDCWD, path, 0, mnt);
+            }
+            let dirfd = open(cx, addr, b"/mnt", oflags::O_DIRECTORY, 0).unwrap();
+            check_statx_mount(cx, addr, dirfd, b"", AT_EMPTY_PATH, tmpfs);
+            close(cx, dirfd).unwrap();
+
+            let fd = open(cx, addr, b"/mnt", oflags::O_TMPFILE | oflags::O_RDWR, 0o600).unwrap();
+            let path = format!("/proc/self/fd/{fd}");
+            check_statx_mount(cx, addr, AT_FDCWD, path.as_bytes(), 0, tmpfs);
+            check_statx_mount(
+                cx,
+                addr,
+                AT_FDCWD,
+                path.as_bytes(),
+                AT_SYMLINK_NOFOLLOW,
+                PROC_MOUNT,
+            );
+            close(cx, fd).unwrap();
+            let (ino, host) = vfs
+                .store()
+                .create_file(crate::vfs::store::ROOT, b"exe", 0o755, 0, 0)
+                .unwrap();
+            vfs.store().unlink(crate::vfs::store::ROOT, b"exe").unwrap();
+            cx.t.group.borrow_mut().exe = Some(Rc::new(crate::process::ExeFile {
+                path: Rc::from(b"/exe".as_slice()),
+                node: Some((ROOT_MOUNT, ino)),
+                dentry: None,
+                host: Some(std::sync::Arc::new(host)),
+                ovl: None,
+            }));
+            check_statx_mount(cx, addr, AT_FDCWD, b"/proc/self/exe", 0, ROOT_MOUNT);
+
+            let fd = cx
+                .install_fd(OpenFile::new(FileKind::Host(1), oflags::O_WRONLY), false)
+                .unwrap();
+            check_statx_mount(cx, addr, fd, b"", AT_EMPTY_PATH, ANON_MOUNT);
+            check_statx_mount(
+                cx,
+                addr,
+                AT_FDCWD,
+                format!("/proc/self/fd/{fd}").as_bytes(),
+                0,
+                ANON_MOUNT,
+            );
+            close(cx, fd).unwrap();
+        });
+    }
+
+    #[test]
+    fn environ_checks_access_and_reads_eof_after_exec() {
+        with_guest(1000, |cx, addr, cpu| {
+            let (_, _, _root_cpu) =
+                pseudo::tests::add_task(cx.k(), 10, 0, true, b"ROOT_KEY=secret\0");
+            assert_eq!(
+                open(cx, addr, b"/proc/10/environ", oflags::O_RDONLY, 0),
+                Err(Errno::EACCES)
+            );
+            let fd = open(cx, addr, b"/proc/self/environ", oflags::O_RDONLY, 0).unwrap();
+            let file = cx.fds().get(fd).unwrap();
+            let mut out = [0; 64];
+            let n = read_bytes(cx, &file, &mut out, Some(0)).unwrap();
+            assert_eq!(&out[..n], b"USER_KEY=hello\0");
+
+            let (mm, _) = pseudo::tests::mm_with_env(b"SETUID_SECRET=1\0");
+            let mm = mm.into_shared();
+            unsafe { cpu.reset(mm.borrow().mmu()) };
+            cx.task.res.borrow_mut().mm = mm.clone();
+            cx.t.mm = mm;
+            assert_eq!(read_bytes(cx, &file, &mut out, Some(1)), Ok(0));
+            assert_eq!(read_bytes(cx, &file, &mut out, Some(0)), Ok(0));
+            close(cx, fd).unwrap();
+        });
+    }
+
+    #[test]
+    fn zombie_environ_opens_at_eof() {
+        with_guest(0, |cx, addr, _| {
+            let (_, _, cpu) = pseudo::tests::add_task(cx.k(), 10, 1000, true, b"OLD=1\0");
+            cx.k().groups[&10].borrow_mut().threads.clear();
+            drop(cpu);
+            cx.k().tasks.remove(&10).unwrap();
+            let fd = open(cx, addr, b"/proc/10/environ", oflags::O_RDONLY, 0).unwrap();
+            let file = cx.fds().get(fd).unwrap();
+            assert_eq!(read_bytes(cx, &file, &mut [0; 8], None), Ok(0));
+            close(cx, fd).unwrap();
+        });
+    }
+
+    #[test]
+    fn tmpfile_checks_flags_and_directory() {
+        use oflags::*;
+        with_guest(0, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            bind_tmp(&vfs, b"ro", ms::RDONLY);
+            mount_tmpfs(&vfs, 16);
+            vfs.store()
+                .create_file(crate::vfs::store::ROOT, b"regfile", 0o644, 0, 0)
+                .unwrap();
+            vfs.store()
+                .symlink(crate::vfs::store::ROOT, b"sym", b"/tmp", 0, 0)
+                .unwrap();
+            for (path, flags, error) in [
+                (b"/tmp".as_slice(), O_TMPFILE | O_RDONLY, Errno::EINVAL),
+                (b"/tmp", O_TMPFILE_BIT | O_RDWR, Errno::EINVAL),
+                (b"/tmp", O_TMPFILE | O_CREAT | O_RDWR, Errno::EINVAL),
+                (b"/regfile", O_TMPFILE | O_RDWR, Errno::ENOTDIR),
+                (b"/ro", O_TMPFILE | O_RDWR, Errno::EROFS),
+                (b"/proc", O_TMPFILE | O_RDWR, Errno::EOPNOTSUPP),
+                (b"/mnt", O_TMPFILE | O_RDWR | O_DIRECT, Errno::EINVAL),
+                (b"/sym", O_TMPFILE | O_RDWR | O_NOFOLLOW, Errno::ENOTDIR),
+            ] {
+                assert_eq!(
+                    open(cx, addr, path, flags, 0o600),
+                    Err(error),
+                    "{path:?} {flags:#x}"
+                );
+            }
+            // openat2 rejects O_PATH combined with extra flags and validates tmpfiles before lookup.
+            write_cstr(cx, addr, b"/tmp");
+            for flags in [
+                O_PATH | O_TMPFILE | O_RDWR,
+                O_TMPFILE_BIT | O_RDWR,
+                O_TMPFILE | O_RDONLY,
+                O_TMPFILE | O_CREAT | O_RDWR,
+            ] {
+                let mut how = [0; 24];
+                how[..8].copy_from_slice(&u64::from(flags).to_le_bytes());
+                put(cx, addr + 256, how).unwrap();
+                assert_eq!(
+                    openat2(cx, AT_FDCWD, addr, addr + 256, 24),
+                    Err(Errno::EINVAL)
+                );
+            }
+            let fd = open(cx, addr, b"/tmp", O_PATH | O_TMPFILE, 0).unwrap();
+            assert_eq!(
+                fcntl(cx, fd, F_GETFL, 0),
+                Ok(u64::from(O_PATH | O_DIRECTORY))
+            );
+            close(cx, fd).unwrap();
+        });
+    }
+
+    #[test]
+    fn tmpfile_link_and_exclusive_open() {
+        with_guest(0, |cx, p1, _| {
+            let vfs = cx.vfs().unwrap();
+            bind_tmp(&vfs, b"bind", 0);
+            let fd = open(cx, p1, b"/tmp", oflags::O_TMPFILE | oflags::O_RDWR, 0o666).unwrap();
+            let fl = fcntl(cx, fd, F_GETFL, 0).unwrap() as u32;
+            assert_eq!(fl & oflags::O_TMPFILE, oflags::O_TMPFILE);
+            let f = cx.fds().get(fd).unwrap();
+            let ino = f.borrow().ino().unwrap();
+            let st = vfs.store().stat(ino).unwrap();
+            assert_eq!(st.nlink, 0);
+            assert_eq!(st.mode, mode::S_IFREG | 0o644); // 0o666 & !umask(0o022)
+            assert_eq!(write_bytes(cx, &f, b"hello tmpfile", Some(0)).unwrap(), 13);
+
+            // Cross-mount linkat fails with EXDEV.
+            assert_eq!(
+                link_fd(cx, p1, fd, b"/bind/xdev", AT_EMPTY_PATH),
+                Err(Errno::EXDEV)
+            );
+
+            // Link via AT_EMPTY_PATH (root has CAP_DAC_READ_SEARCH).
+            assert_eq!(
+                link_fd(cx, p1, fd, b"/tmp/linked_store", AT_EMPTY_PATH),
+                Ok(0)
+            );
+            assert_eq!(vfs.store().stat(ino).unwrap().nlink, 1);
+            let proc_fd = format!("/proc/self/fd/{fd}");
+            let node = lookup_at(cx, AT_FDCWD, proc_fd.as_bytes(), false).unwrap();
+            assert_eq!(
+                vfs.readlink(&cx.view(&vfs), &node).unwrap(),
+                format!("/tmp/#{ino} (deleted)").as_bytes()
+            );
+            let mut back = [0u8; 32];
+            let linked_fd = open(cx, p1, b"/tmp/linked_store", oflags::O_RDONLY, 0).unwrap();
+            let linked_f = cx.fds().get(linked_fd).unwrap();
+            let n = read_bytes(cx, &linked_f, &mut back, Some(0)).unwrap();
+            assert_eq!(&back[..n], b"hello tmpfile");
+            drop(linked_f);
+            close(cx, linked_fd).unwrap();
+            close(cx, fd).unwrap();
+
+            // O_TMPFILE | O_EXCL refuses linkat with ENOENT.
+            let efd = open(
+                cx,
+                p1,
+                b"/tmp",
+                oflags::O_TMPFILE | oflags::O_EXCL | oflags::O_RDWR,
+                0o600,
+            )
+            .unwrap();
+            let ef = cx.fds().get(efd).unwrap();
+            assert_eq!(write_bytes(cx, &ef, b"secret", Some(0)).unwrap(), 6);
+            assert_eq!(
+                link_fd(cx, p1, efd, b"/tmp/should_fail", AT_EMPTY_PATH),
+                Err(Errno::ENOENT)
+            );
+            assert_eq!(
+                link_fd(cx, p1, efd, b"/tmp/should_fail", AT_SYMLINK_FOLLOW),
+                Err(Errno::ENOENT)
+            );
+            close(cx, efd).unwrap();
+        });
+    }
+
+    #[test]
+    fn tmpfile_tmpfs_charges_follow_link_and_close() {
+        with_guest(0, |cx, p1, _| {
+            let vfs = cx.vfs().unwrap();
+            let mnt = mount_tmpfs(&vfs, 16);
+            let tmpfs_dev = vfs.mount(mnt).unwrap().dev;
+            let check_usage = |pages, inodes| {
+                for fresh in [false, true] {
+                    let (_, p, i) = vfs.tmpfs_usage(tmpfs_dev, fresh).unwrap();
+                    assert_eq!((p, i), (pages, inodes));
+                }
+            };
+            check_usage(0, 1);
+            let tfd = open(cx, p1, b"/mnt", oflags::O_TMPFILE | oflags::O_RDWR, 0o600).unwrap();
+            let tf = cx.fds().get(tfd).unwrap();
+            let tino = tf.borrow().ino().unwrap();
+            check_usage(0, 2);
+            assert_eq!(write_bytes(cx, &tf, &[0xab; 4096], Some(0)).unwrap(), 4096);
+            check_usage(1, 2);
+
+            assert_eq!(
+                link_fd(cx, p1, tfd, b"/tmp/cross-mount", AT_EMPTY_PATH),
+                Err(Errno::EXDEV)
+            );
+            check_usage(1, 2);
+            // Link into tmpfs via /proc/self/fd/N: must NOT double-charge inode or pages.
+            assert_eq!(
+                link_fd(cx, p1, tfd, b"/mnt/materialized", AT_SYMLINK_FOLLOW),
+                Ok(0)
+            );
+            assert_eq!(vfs.store().stat(tino).unwrap().nlink, 1);
+            check_usage(1, 2);
+            close(cx, tfd).unwrap();
+
+            // Unlinked tmpfs O_TMPFILE closed without linking releases both quota and host object.
+            let tfd2 = open(cx, p1, b"/mnt", oflags::O_TMPFILE | oflags::O_RDWR, 0o600).unwrap();
+            let tf2 = cx.fds().get(tfd2).unwrap();
+            let tino2 = tf2.borrow().ino().unwrap();
+            assert_eq!(write_bytes(cx, &tf2, &[0xcd; 4096], Some(0)).unwrap(), 4096);
+            drop(tf2);
+            check_usage(2, 3);
+            close(cx, tfd2).unwrap();
+            evict_unlinked_tmpfs(cx.kr(), &vfs);
+            assert!(!vfs.store().is_linkable_tmpfile(tino2));
+            check_usage(1, 2);
+        });
+    }
+
+    #[test]
+    fn tmpfile_link_on_full_tmpfs() {
+        use oflags::*;
+        with_guest(0, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            mount_tmpfs(&vfs, 2); // The root and one unnamed inode.
+            for (extra, expected) in [(O_EXCL, Err(Errno::ENOENT)), (0, Ok(0))] {
+                let fd = open(cx, addr, b"/mnt", O_TMPFILE | O_RDWR | extra, 0o600).unwrap();
+                assert_eq!(
+                    open(cx, addr, b"/mnt", O_TMPFILE | O_RDWR, 0o600),
+                    Err(Errno::ENOSPC)
+                );
+                assert_eq!(link_fd(cx, addr, fd, b"/mnt/file", AT_EMPTY_PATH), expected);
+                close(cx, fd).unwrap();
+                evict_unlinked_tmpfs(cx.kr(), &vfs);
+            }
+        });
+    }
+
+    #[test]
+    fn tmpfile_unprivileged_link_requires_proc_fd() {
+        with_guest(1000, |cx, p1, _| {
+            cx.vfs()
+                .unwrap()
+                .store()
+                .mkdir(crate::vfs::store::ROOT, b"locked", 0o755, 0, 0)
+                .unwrap();
+            assert_eq!(
+                open(
+                    cx,
+                    p1,
+                    b"/locked",
+                    oflags::O_TMPFILE | oflags::O_RDWR,
+                    0o600
+                ),
+                Err(Errno::EACCES)
+            );
+
+            let fd = open(cx, p1, b"/tmp", oflags::O_TMPFILE | oflags::O_RDWR, 0o600).unwrap();
+            let f = cx.fds().get(fd).unwrap();
+            assert_eq!(write_bytes(cx, &f, b"from user", Some(0)).unwrap(), 9);
+            // Without CAP_DAC_READ_SEARCH, AT_EMPTY_PATH is ENOENT (Linux 6.1).
+            assert_eq!(
+                link_fd(cx, p1, fd, b"/tmp/user_empty_path", AT_EMPTY_PATH),
+                Err(Errno::ENOENT)
+            );
+            // Via /proc/self/fd/N with AT_SYMLINK_FOLLOW succeeds for unprivileged user.
+            assert_eq!(
+                link_fd(cx, p1, fd, b"/tmp/user_linked", AT_SYMLINK_FOLLOW),
+                Ok(0)
+            );
+            close(cx, fd).unwrap();
+        });
     }
 }

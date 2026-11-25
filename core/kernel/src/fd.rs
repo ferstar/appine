@@ -68,6 +68,10 @@ pub mod oflags {
     pub const O_CLOEXEC: u32 = 0o2000000;
     /// Path only.
     pub const O_PATH: u32 = 0o10000000;
+    /// `__O_TMPFILE`: unnamed temporary file bit (must be combined with [`O_DIRECTORY`]).
+    pub const O_TMPFILE_BIT: u32 = 0o20000000;
+    /// Create an unnamed temporary file in the named directory.
+    pub const O_TMPFILE: u32 = O_TMPFILE_BIT | O_DIRECTORY;
     /// The flags fcntl(F_SETFL) can change.
     pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK | O_ASYNC | O_DIRECT | O_NOATIME;
 }
@@ -457,6 +461,11 @@ impl OpenFile {
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
             FileKind::Proc { mnt, node, .. } => Some(Node::Pseudo(*mnt, node.clone())),
         }
+    }
+
+    /// Mount ID reported by statx and procfs fdinfo, including for node-less descriptors.
+    pub(crate) fn mnt_id(&self) -> crate::vfs::MountId {
+        self.node().map_or(crate::vfs::ANON_MOUNT, |n| n.mnt())
     }
 
     /// The inode in the store (chmod, chown and the like only make sense for these).

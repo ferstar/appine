@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: check search permission and `EEXIST` before `EROFS` in cgroup `mkdir`, and expose `Vfs::sb_readonly_node` for `sb_permission`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: populate `stx_mnt_id` and `STATX_MNT_ID` in `statx` across both slow and fast paths, and support `O_TMPFILE` linking and tmpfs unlinked-to-linked transitions)
 
 ## Responsibilities
 
@@ -246,7 +246,9 @@ capabilities (`kernel/cred`).
   root filesystem or 128 elsewhere live in the inode); directories report size 4096 on the root
   filesystem. newfstatat and statx accept `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`,
   `AT_NO_AUTOMOUNT` and the `AT_STATX_*` sync flags. newfstatat accepts both sync bits together.
-  statx rejects that combination with `EINVAL` and reports only `STATX_BASIC_STATS` on success.
+  statx rejects that combination with `EINVAL` and reports `STATX_BASIC_STATS | STATX_MNT_ID` with
+  `stx_mnt_id` set from the resolved node's or fd's `MountId` (`ROOT_MOUNT` on the fast path,
+  `ANON_MOUNT` for node-less fds, matching mountinfo and fdinfo).
 - statfs: the store reports ext4's magic with the host's `statvfs` of the objects directory, tmpfs
   its magic and limits (recounted), an overlay overlayfs's magic with the store's capacity, FUSE
   what the daemon answers, synthetic nodes the magic of their kind with zero sizes; `f_flags` from
@@ -292,7 +294,9 @@ capabilities (`kernel/cred`).
   search, `EEXIST` and `EROFS`, `EXDEV` across mounts, `protected_hardlinks` (judged on the database
   row), directory write permission and tmpfs room; a magic link followed with `AT_SYMLINK_FOLLOW`
   reaches the same store node, a deleted file's link the store node on the mount it was opened
-  through, a memfd's nothing (`EXDEV`); a source with link count 0 is `ENOENT`; no `EMLINK` limit.
+  through, a memfd's nothing (`EXDEV`); a source with link count 0 is `ENOENT` unless it is an
+  unlinked `O_TMPFILE` created without `O_EXCL` (materializing it clears its linkable state and
+  removes it from `Tmpfs::unlinked` without double-charging an inode); no `EMLINK` limit.
 - getdents64 takes the listing (with `.` and `..`) on the first call and refreshes it only after an
   lseek lands on 0; `d_off` is index+1. `O_PATH` `EBADF`, a non-directory `ENOTDIR`, a removed
   store directory `ENOENT`; while entries remain, a count above `INT_MAX` or a buffer too small for
@@ -390,7 +394,7 @@ capabilities (`kernel/cred`).
 - **No inode flags:** `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` are unsupported, while 6.1's tmpfs has
   append-only, immutable, nodump and noatime (LTP unlink09, copy_file_range02).
 - **Fidelity gaps**, one per line:
-  - statx: no btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`;
+  - statx: no btime, attributes or `STATX_DIOALIGN`;
   - the store's rename errors come after permission.
 - **Scoped openat2 never returns `EAGAIN`:** the walk is atomic under the BKL, so a `..` walked
   while another thread mounts or renames never asks the caller to retry. Safe.

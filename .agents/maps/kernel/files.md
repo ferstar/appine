@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cap `FdTable::reserve` (`accept4` and `SCM_RIGHTS`) against `nr_open` alongside `install_capped`/`install_at_capped`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: implement Linux 6.1 `O_TMPFILE` support for store and tmpfs directories, and pin weak `Mm` on `/proc/<pid>/environ`)
 
 ## Responsibilities
 
@@ -104,7 +104,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   `SECCOMP_ADDFD_FLAG_SETFD` replaces in another process's table is closed as that process's (its
   locks, message-queue notifications and FUSE flush; `close_replaced`).
 - Open keeps the access mode, `O_APPEND`, `O_NONBLOCK`, `O_PATH`, `O_DSYNC`, `__O_SYNC`,
-  `O_ASYNC`, `O_DIRECT`, `O_NOATIME`, `O_DIRECTORY` and `O_NOFOLLOW` (`kept`; with `O_PATH` only
+  `O_ASYNC`, `O_DIRECT`, `O_NOATIME`, `O_DIRECTORY`, `O_NOFOLLOW` and `__O_TMPFILE` (`kept`; with `O_PATH` only
   `O_PATH|O_DIRECTORY|O_NOFOLLOW`), and every other open adds `O_LARGEFILE`. An `O_PATH` fd
   takes only `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD` and `F_GETFL` (else `EBADF`), and
   flock on it is `EBADF`. `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME`
@@ -169,7 +169,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   for write; the ptrace read check for `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup`
   and `pagemap` (the process found through `pseudo::group_of_id` matching the pinned `ProcId`, so
   `/proc/<tid>` works and a reused pid does not match; `mem` and `pagemap` of a gone thread `ESRCH`,
-  both pinning a weak `Mm` at open); `setgroups` writes also need `CAP_SYS_ADMIN` over the
+  both pinning a weak `Mm` at open; `environ` also pins a weak `Mm` when live and reads EOF for a
+  zombie or once the `Mm` is freed or replaced by `execve`); `setgroups` writes also need `CAP_SYS_ADMIN` over the
   target's user namespace; nodev and the device filter for PTYs; `O_DIRECT` `EINVAL`;
   `EISDIR`/`ENOTDIR`/`EROFS`; `EACCES` for writes the filesystem does not allow except read-only
   procfs files outside `/proc/sys`, which root opens and whose writes fail (`kernel/procfs`).
@@ -195,10 +196,15 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   check, or as an `O_PATH` fd, emitting `IN_OPEN` (and `IN_MODIFY` on `O_TRUNC`) and attaching an
   inotify `Opened` record, without a display path or validation of other open flags.
 - Opens through a path of a regular file, device, directory (store, overlay, FUSE, cgroup2), FUSE
-  file or cgroup2 file, as well as `open_by_handle_at` and `memfd_create`, record an inotify
-  `Opened` (`kernel/inotify`), watches or not. `O_TMPFILE` is not
-  implemented: invalid combinations are `EINVAL` as on Linux (with `O_CREAT`, or read-only), a
-  valid one reaches the directory branch (`EISDIR`). `O_DIRECT` (6.1's `direct_IO` check, before
+  file or cgroup2 file, as well as `open_by_handle_at`, `O_TMPFILE` and `memfd_create`, record an inotify
+  `Opened` (`kernel/inotify`), watches or not. `O_TMPFILE` (`open_tmpfile`, Linux 6.1's `do_tmpfile`/
+  `vfs_tmpfile`) is supported on store and tmpfs directories (invalid flag combinations `EINVAL`,
+  non-directories `ENOTDIR`, read-only mounts `EROFS`, missing `MAY_WRITE|MAY_EXEC` `EACCES`,
+  unsupported filesystems `EOPNOTSUPP`, `O_DIRECT` on tmpfs `EINVAL`); it creates an unlinked
+  `nlink == 0` regular file inheriting ownership/umask/default ACLs, tracks tmpfs quota in
+  `Tmpfs::unlinked`, allows linking once via `linkat` (`AT_EMPTY_PATH` with `CAP_DAC_READ_SEARCH`,
+  or `/proc/self/fd/N` with `AT_SYMLINK_FOLLOW`) unless `O_EXCL` was set, and reaps unlinked
+  host objects via `Store::release_tmpfile` when the last reference closes. `O_DIRECT` (6.1's `direct_IO` check, before
   the file's own open) passes regular files on mounts other than tmpfs, block devices and sockets;
   directories, tmpfs files, character devices, FIFOs and synthetic files are `EINVAL`.
 
@@ -284,9 +290,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 
 ## Confirmed bugs / technical debt
 
-- **Fidelity gaps**, one per line:
-  - no `O_TMPFILE`.
+- None.
 
 ## Open questions
 
-- Should `O_TMPFILE` be implemented?
+- Should `O_TMPFILE` also be extended to overlayfs and FUSE directories?
