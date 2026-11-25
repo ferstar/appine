@@ -2898,6 +2898,7 @@ impl Mm {
         v.noreserve = flags & flags::MAP_NORESERVE != 0;
         let has_fill = fill.is_some();
         v.fill = fill;
+        self.insert_vma(start, v)?;
         if shared
             && !has_fill
             && let (Some((fd, _, true)), Some(s), Some((dev, ino, _))) = (file, &st, file_id)
@@ -2905,7 +2906,6 @@ impl Mm {
         {
             content::writably_shared(fd, dev, ino);
         }
-        self.insert_vma(start, v)?;
         self.fills |= has_fill;
         if let (Some(libc), Some((_, offset, _))) = (bundled_libc, file) {
             let before = self.memops.len();

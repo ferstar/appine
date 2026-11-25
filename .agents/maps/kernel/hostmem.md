@@ -109,9 +109,9 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
     TLB shootdown (growth and hole punching refused).
 - A file has no trusted content version when unlinked (`st_nlink == 0`, including memfds and
   deleted store objects), while its ctime is within the last 2 s, or once a linked host object has
-  been mapped shared from a writably opened descriptor (`WRITABLY_SHARED`, recorded after mapping
-  validation succeeds and cleared by `forget_writably_shared` when `kernel/store` unlinks the host
-  object; sealed memfds count as not writable).
+  been mapped shared from a writably opened descriptor (`WRITABLY_SHARED`, recorded after VMA
+  insertion succeeds and cleared by `forget_writably_shared` while `kernel/store` holds an `O_PATH`
+  pin across a successful `unlink_at`; sealed memfds count as not writable).
 - Shared file mappings map the same host object file with host `MAP_SHARED`, so they stay coherent
   with `read`/`write`, which go to that file through the host page cache.
 - On a 16 KB-page host, a file mapping covers the 16 KB-aligned host range around the target and

@@ -3540,19 +3540,31 @@ fn unlink_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
 fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
     let mut name = [0u8; 21];
     let name = object_name(ino, &mut name);
-    let host_id = appine_hal::stat_at(objects_dir.as_raw_fd(), name)
-        .ok()
-        .map(|st| {
+    // Keep an O_PATH handle open across unlink_at + forget_writably_shared so the host filesystem
+    // cannot recycle (st_dev, st_ino) for a new object before the old tracking entry is removed.
+    let pinned = appine_hal::open_at(
+        objects_dir.as_raw_fd(),
+        name,
+        libc::O_PATH | libc::O_NOFOLLOW,
+        0,
+    )
+    .ok();
+    let host_id = pinned.as_ref().and_then(|f| {
+        appine_hal::fstat(f.as_raw_fd()).ok().map(|st| {
             #[allow(clippy::unnecessary_cast)]
             (st.st_dev as u64, st.st_ino as u64)
-        });
+        })
+    });
     let res = match appine_hal::unlink_at(objects_dir.as_raw_fd(), name) {
         Err(e) if e != libc::ENOENT => Err(object_err(ino, e)),
         _ => Ok(()),
     };
-    if let Some((dev, host_ino)) = host_id {
+    if res.is_ok()
+        && let Some((dev, host_ino)) = host_id
+    {
         crate::mm::forget_writably_shared(dev, host_ino);
     }
+    drop(pinned);
     res
 }
 
