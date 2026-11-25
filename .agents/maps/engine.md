@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: expose `fpcr_write_mask` and mask FPCR in `rt_sigreturn` and ptrace resume)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: clear the local exclusive monitor on exceptions, signal delivery, signal return and debug stops)
 
 ## Responsibilities
 
@@ -54,7 +54,7 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 - **CPU**: `Cpu::new`, `reset`, `run` (guarded loop until an exit), `step` (one instruction, ignores
   kicks), `exec_insn` (run a given word; tests and lockstep only), `translate`, `tlb_flush`,
-  `state`/`state_mut`, `kicker`; `CpuState::set_hw_debug`, `hw_breakpoints_active`.
+  `state`/`state_mut`, `kicker`; `CpuState::set_hw_debug`, `hw_breakpoints_active`, `clear_exclusive`.
 - **Process-wide**: `install_fault_guard`, `guest_hwcap`, `guest_hwcap2`, `guest_midr`,
   `fpcr_write_mask`, `layout_matches`.
 - **C-internal** (used across engine files and by `engine/dbt`):
@@ -98,8 +98,8 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 - A failing or undefined instruction leaves PC and registers untouched; only `svc` and `ic ivau`
   exits advance PC.
 - Data addresses have the top byte ignored (TBI); PC and branch targets are not untagged.
-- Memory accesses check every page touched before copying anything, so a fault has no side
-  effects; SP-based accesses require 16-byte SP alignment; watchpoints are checked on every access.
+- Memory accesses check every page touched before copying anything, so faults cause no
+  partial writes or register writeback. SP-based accesses require 16-byte SP alignment, and every access checks watchpoints.
 - Ordinary single-register integer loads and stores use fixed-width copies on same-page data TLB hits
   when the thread has no watchpoints. Misses, cross-page accesses and watched threads use the
   shared memory helpers.
@@ -137,7 +137,8 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 - LDXR records address, size and the loaded value; STXR succeeds only if address and size match
   and a compare-and-swap against the recorded value succeeds on the host address (ABA allowed).
-  Every STXR clears the monitor; CLREX and `svc` clear it. Natural alignment is required.
+  STXR, STXP and CLREX clear the local monitor. SVC, FAULT, KICK, UNDEF and BRK clear it on exit
+  in both tiers, including faults the kernel resolves by retrying the same PC. Natural alignment is required.
 - 16-byte pairs use host `ldaxp`/`stlxp`; LDAR/STLR are C acquire/release accesses; LDAPR
   and LDAPUR are implemented as acquire; LSE and CAS/CASP run as native stubs on the translated
   host pointer. (`engine/dbt` implements the same compare-and-swap semantics inline for Tier 1.)
@@ -222,6 +223,9 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
   registered users of an address space, and by removing a thread from both before its `Cpu` is
   freed; `Cpu::reset` (execve) zeroes `pending`, and the kernel re-kicks afterwards if the task was
   interrupted. `engine/dbt`'s own flush kick may race a reset harmlessly.
+- The engine models ERET by clearing `excl_size` on architectural exception and interrupt exits.
+  Signal delivery, `rt_sigreturn` (including invalid frames), single-step traps and ptrace stops
+  also clear it. Ordinary instruction completion and code invalidation alone preserve the reservation.
 - Atomic instructions act directly on host memory reached through the page table, so threads and
   processes sharing a page get correct atomicity for free.
 - The `llvm-mc` whitelist check follows LLVM on should-be-one fields: exclusives and LDAR/STLR
@@ -233,8 +237,7 @@ None.
 
 ## Open questions
 
-- Is it intended that FAULT, KICK and signal exits leave the exclusive monitor set (architecturally
-  an exception return clears it)? The compare-and-swap semantics make this mostly harmless.
+None.
 
 ## To verify
 

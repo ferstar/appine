@@ -2139,6 +2139,107 @@ static void test_rt_signal_rlimit_sigpending(void)
           "rt rlimit child failed (status=%#x)", st);
 }
 
+/* ---- Local exclusive monitor across signals and transparent CoW ---- */
+
+enum { VALUE_A = 17, VALUE_B = 29 };
+static volatile sig_atomic_t exclusive_target, got_sig;
+struct exclusive_sender {
+    _Atomic int ready;
+    pthread_t receiver;
+};
+
+static void exclusive_handler(int sig, siginfo_t *info, void *ctx)
+{
+    if (sig == SIGSEGV) {
+        if (info->si_code != SEGV_MAPERR || info->si_addr != NULL)
+            _exit(2);
+        ((ucontext_t *)ctx)->uc_mcontext.pc += 4;
+    }
+    exclusive_target = VALUE_B;
+    exclusive_target = VALUE_A;
+    got_sig = 1;
+}
+
+static void *send_exclusive_signal(void *arg)
+{
+    struct exclusive_sender *sender = arg;
+    while (!atomic_load_explicit(&sender->ready, memory_order_acquire))
+        sched_yield();
+    CHECK(pthread_kill(sender->receiver, SIGUSR1) == 0, "send SIGUSR1");
+    return NULL;
+}
+
+static int exclusive_store(volatile sig_atomic_t *target)
+{
+    int loaded, status;
+    __asm__ volatile("ldaxr %w0, [%2]\n"
+                     "stlxr %w1, %w3, [%2]"
+                     : "=&r"(loaded), "=&r"(status)
+                     : "r"(target), "r"(VALUE_B)
+                     : "memory");
+    CHECK(loaded == VALUE_A, "LDAXR read %d", loaded);
+    return status;
+}
+
+static void test_exclusive_monitor(void)
+{
+    exclusive_target = VALUE_A;
+    CHECK(exclusive_store(&exclusive_target) == 0 && exclusive_target == VALUE_B,
+          "uninterrupted STLXR");
+
+    struct sigaction sa = {.sa_sigaction = exclusive_handler, .sa_flags = SA_SIGINFO};
+    struct sigaction old_segv, old_usr1;
+    sigemptyset(&sa.sa_mask);
+    CHECK(sigaction(SIGSEGV, &sa, &old_segv) == 0, "install exclusive SIGSEGV handler");
+    exclusive_target = VALUE_A;
+    got_sig = 0;
+    int loaded, status;
+    __asm__ volatile("ldaxr %w0, [%2]\n"
+                     "ldr wzr, [%3]\n"
+                     "stlxr %w1, %w4, [%2]"
+                     : "=&r"(loaded), "=&r"(status)
+                     : "r"(&exclusive_target), "r"((uintptr_t)0), "r"(VALUE_B)
+                     : "memory");
+    CHECK(got_sig && loaded == VALUE_A && status == 1 && exclusive_target == VALUE_A,
+          "STLXR after SIGSEGV returned %d", status);
+    CHECK(sigaction(SIGSEGV, &old_segv, NULL) == 0, "restore SIGSEGV");
+
+    CHECK(sigaction(SIGUSR1, &sa, &old_usr1) == 0, "install exclusive SIGUSR1 handler");
+    got_sig = 0;
+    struct exclusive_sender sender = {.receiver = pthread_self()};
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, send_exclusive_signal, &sender) == 0, "create sender");
+    /* Publish readiness after LDAXR. Only the receiver's signal handler releases the loop. */
+    __asm__ volatile("ldaxr %w[loaded], [%[target]]\n"
+                     "stlr %w[one], [%[ready]]\n"
+                     "1: ldr %w[status], [%[got]]\n"
+                     "cbz %w[status], 1b\n"
+                     "stlxr %w[status], %w[value], [%[target]]"
+                     : [loaded] "=&r"(loaded), [status] "=&r"(status)
+                     : [target] "r"(&exclusive_target), [value] "r"(VALUE_B),
+                       [ready] "r"(&sender.ready), [got] "r"(&got_sig), [one] "r"(1)
+                     : "memory");
+    CHECK(loaded == VALUE_A && status == 1 && exclusive_target == VALUE_A,
+          "STLXR after SIGUSR1 returned %d", status);
+    CHECK(pthread_join(thread, NULL) == 0, "join sender");
+    CHECK(sigaction(SIGUSR1, &old_usr1, NULL) == 0, "restore SIGUSR1");
+
+    volatile sig_atomic_t *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(page != MAP_FAILED, "mmap private page");
+    *page = VALUE_A;
+    pid_t child = fork();
+    CHECK(child >= 0, "fork CoW child");
+    if (child == 0) {
+        CHECK(exclusive_store(page) == 1 && *page == VALUE_A, "STLXR across CoW fault");
+        CHECK(exclusive_store(page) == 0 && *page == VALUE_B, "STLXR after CoW retry");
+        _exit(0);
+    }
+    wait_exit(child, 0);
+    CHECK(*page == VALUE_A, "child changed parent's page");
+    CHECK(munmap((void *)page, 4096) == 0, "munmap private page");
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "--exec-helper") == 0) {
@@ -2146,6 +2247,7 @@ int main(int argc, char **argv)
     }
     const char *self = argv[0];
 
+    test_exclusive_monitor();
     test_group_stop_waits_for_all_threads();
     test_sigill_omits_esr_context();
     test_sigaction_clone_sighand_discard();

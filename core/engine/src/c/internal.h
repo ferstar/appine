@@ -187,8 +187,22 @@ static inline void *tlb_lookup(struct appine_cpu *cpu, uint64_t va, uint32_t acc
     return appine_tlb_fill(cpu, va, access);
 }
 
+/* Model ERET on guest exception exits, before the kernel can retry the instruction. */
+static inline void clear_exclusive(struct appine_cpu *cpu)
+{
+    cpu->excl_size = 0;
+}
+
+static inline enum appine_exit undef(struct appine_cpu *cpu, uint32_t insn)
+{
+    cpu->exit_info = insn;
+    clear_exclusive(cpu);
+    return APPINE_EXIT_UNDEF;
+}
+
 static inline bool raise_fault(struct appine_cpu *cpu, uint64_t va, uint32_t access, uint32_t kind)
 {
+    clear_exclusive(cpu);
     cpu->fault_addr = va;
     cpu->fault_access = access;
     cpu->fault_kind = kind;
@@ -216,7 +230,7 @@ static inline bool watch_hit(const struct appine_cpu *cpu, uint64_t va, uint64_t
 /*
  * Read and write guest memory (n ≤ 16). A cross-page access first confirms that both pages are
  * accessible, then copies.
- * On failure, record the fault and return false, without any side effect.
+ * On failure, record the fault and return false before copying any bytes.
  */
 static inline bool mem_read(struct appine_cpu *cpu, uint64_t va, void *out, unsigned n)
 {

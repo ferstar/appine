@@ -315,6 +315,63 @@ fn exclusive_store_succeeds_only_after_a_matching_load() {
 }
 
 #[test]
+fn exceptions_clear_exclusive_reservations() {
+    let mut g = Guest::new();
+    g.set_x(1, DATA);
+    g.set_x(3, 9);
+    g.set_x(5, 10);
+    g.set_x(6, DATA + 1);
+    g.set_x(7, DATA + 16);
+    g.cpu
+        .state_mut()
+        .set_hw_debug(&[], &[(DATA + 16, DATA + 24, appine_engine::WATCH_LOAD)]);
+    for (load, store) in [
+        (0xc85f_7c20, 0xc802_7c23), // ldxr x0, [x1]; stxr w2, x3, [x1]
+        (0xc87f_1020, 0xc822_1423), // ldxp x0, x4, [x1]; stxp w2, x3, x5, [x1]
+    ] {
+        g.put_u64(DATA, 5);
+        g.put_u64(DATA + 8, 6);
+        let fault = |addr, kind| Exit::Fault {
+            addr,
+            access: Access::Read,
+            kind,
+        };
+        for (insn, expected) in [
+            (0xf940_03e0, fault(0, FaultKind::Page)), // ldr x0, [sp]
+            (0xc85f_7cc0, fault(DATA + 1, FaultKind::Alignment)), // ldxr x0, [x6]
+            (0xf940_00e0, fault(DATA + 16, FaultKind::Watchpoint)), // ldr x0, [x7]
+            (0, Exit::Undefined { insn: 0 }),
+            (0xd420_0020, Exit::Breakpoint { imm: 1 }),
+            (0xd400_0001, Exit::Svc { imm: 0 }),
+        ] {
+            g.step(load);
+            assert_eq!(g.x(0), 5);
+            assert_eq!(g.cpu.exec_insn(insn), Some(expected));
+            g.step(store);
+            assert_eq!(
+                (g.x(2), g.get_u64(DATA), g.get_u64(DATA + 8)),
+                (1, 5, 6),
+                "{expected:?}"
+            );
+        }
+
+        g.step(load);
+        unsafe { g.cpu.kicker().kick() };
+        assert_eq!(g.cpu.run(), Exit::Kick);
+        g.step(store);
+        assert_eq!((g.x(2), g.get_u64(DATA), g.get_u64(DATA + 8)), (1, 5, 6));
+
+        g.step(load);
+        assert_eq!(
+            g.cpu.exec_insn(0xd50b_7521), // ic ivau, x1
+            Some(Exit::InvalidateCode { addr: DATA })
+        );
+        g.step(store);
+        assert_eq!((g.x(2), g.get_u64(DATA)), (0, 9));
+    }
+}
+
+#[test]
 fn simd_and_fp_round_trip() {
     if !has_simd() {
         return;

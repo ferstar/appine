@@ -823,6 +823,98 @@ fn tagged_group_writeback_and_exclusive_aliases() {
 }
 
 #[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn exceptions_clear_translated_exclusive_reservations() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const LDAXR: u32 = 0xc85f_fc20; // ldaxr x0, [x1]
+    const STLXR: u32 = 0xc802_fc23; // stlxr w2, x3, [x1]
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let mut dbt = Dbt::with_regs(regs).expect("tier 1");
+        let mut g = Guest::with_data();
+        let original = g.data(0, 0);
+        g.cpu.state_mut().x[1] = DATA;
+        g.cpu.state_mut().x[3] = 99;
+        let retry = CODE + 0x100;
+        g.code(retry, &[STLXR, SVC]);
+        for (i, (insn, expected)) in [
+            (
+                STLXR,
+                Exit::Fault {
+                    addr: DATA,
+                    access: Access::Write,
+                    kind: FaultKind::Page,
+                },
+            ),
+            (0, Exit::Undefined { insn: 0 }),
+            (0xd420_0020, Exit::Breakpoint { imm: 1 }),
+            (SVC, Exit::Svc { imm: 0 }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if insn == STLXR {
+                g.mmu.protect(DATA, PAGE_SIZE, prot::READ).unwrap();
+                g.cpu.tlb_flush();
+            }
+            let pc = CODE + 16 * i as u64;
+            g.code(pc, &[LDAXR, insn]);
+            assert_eq!(go(&mut g, &mut dbt, pc), expected, "{regs:?}");
+            assert_eq!(g.cpu.state().x[0], original);
+            if insn == STLXR {
+                g.mmu
+                    .protect(DATA, PAGE_SIZE, prot::READ | prot::WRITE)
+                    .unwrap();
+                g.cpu.tlb_flush();
+            }
+            g.run_at(&mut dbt, retry);
+            assert_eq!(
+                (g.cpu.state().x[2], g.data(0, 0)),
+                (1, original),
+                "{regs:?} {expected:?}"
+            );
+        }
+
+        // Publish readiness after LDAXR, then spin at a block entry until the host kicks.
+        let pc = CODE + 0x200;
+        g.code(pc, &[LDAXR, 0x889f_fc83, 0x1400_0000]); // stlr w3, [x4]; b .
+        g.cpu.state_mut().x[4] = STACK - PAGE_SIZE;
+        g.cpu.state_mut().pc = pc;
+        let kicker = g.cpu.kicker();
+        // The guest publishes to this aligned word with STLR.
+        let ready = unsafe { AtomicU32::from_ptr(g.pages[2].0.as_mut_ptr().cast()) };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while ready.load(Ordering::Acquire) == 0 {
+                    std::thread::yield_now();
+                }
+                unsafe { kicker.kick() };
+            });
+            let exit = dbt.run(&mut g.cpu);
+            ready.store(1, Ordering::Release); // release the helper on an unexpected early exit
+            assert_eq!(exit, Exit::Kick, "{regs:?}");
+        });
+        assert_eq!(g.cpu.state().pc, pc + 8);
+        assert_eq!(g.cpu.state().x[0], original);
+        g.run_at(&mut dbt, retry);
+        assert_eq!(
+            (g.cpu.state().x[2], g.data(0, 0)),
+            (1, original),
+            "{regs:?}"
+        );
+
+        // DSB drains this IC IVAU through R_CODE between the exclusive instructions.
+        let pc = CODE + 0x300;
+        g.code(pc, &[LDAXR, 0xd50b_7521, 0xd503_3f9f, STLXR, SVC]);
+        g.run_at(&mut dbt, pc);
+        assert_eq!((g.cpu.state().x[2], g.data(0, 0)), (0, 99), "{regs:?}");
+    }
+}
+
+#[test]
 fn a_write_only_mapping_cannot_authorize_a_grouped_read() {
     let Some(mut dbt) = Dbt::new() else { return };
     let mut g = Guest::with_data();
@@ -3577,6 +3669,10 @@ fn fast_loop_flash_attn_mreg_regstride_and_nzcv() {
 }
 
 #[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
 fn superpage_refill_prefill_fast_loops_demotion_and_memops() {
     const SUPER: u64 = PAGE_SIZE << 9; // 2 MiB
     const RW: u32 = prot::READ | prot::WRITE;

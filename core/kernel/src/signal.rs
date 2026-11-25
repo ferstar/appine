@@ -1144,7 +1144,7 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         // (crate::ptrace). As in Linux's get_signal, this is done before each signal is dequeued:
         // a thread PTRACE_ATTACHed while stopped first reports the group-stop, then the SIGSTOP
         // that ATTACH sent
-        if let Flow::Exit = wait_while_stopped(cx) {
+        if let Flow::Exit = wait_while_stopped(cx, cpu) {
             return Flow::Exit;
         }
         if crate::ptrace::traced(cx.task) {
@@ -1158,7 +1158,10 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             };
             match stop {
                 StopResult::Killed => return Flow::Exit,
-                StopResult::Stopped => continue,
+                StopResult::Stopped => {
+                    cpu.state_mut().clear_exclusive();
+                    continue;
+                }
                 StopResult::None => {}
             }
         }
@@ -1170,6 +1173,8 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         // signals forced by seccomp do not stop either (SA_IMMUTABLE)
         let immutable = cx.t.group.borrow().sighand.borrow().get(sig).immutable;
         let (sig, info) = if crate::ptrace::traced(cx.task) && !immutable {
+            // A tracer may suppress the signal, so there may be no frame on resume.
+            cpu.state_mut().clear_exclusive();
             match crate::ptrace::signal_stop(cx, cpu, sig, info) {
                 Ok(Some(delivered)) => delivered,
                 Ok(None) => continue,
@@ -1338,7 +1343,7 @@ pub(crate) fn retarget(
 /// becomes ptrace-traced while stopped also leaves, to stop in a ptrace-stop instead
 /// ([`deliver`]). While its cgroup is frozen it also waits here until thawed (Linux's
 /// `do_freezer_trap`), traced threads too; meanwhile it is recorded as stopped (`cgroup.events`).
-fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
+fn wait_while_stopped(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     let flow = loop {
         if cx.task.killed.get() {
             break Flow::Exit;
@@ -1350,6 +1355,7 @@ fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
         if !stopped && !frozen {
             break Flow::Continue;
         }
+        cpu.state_mut().clear_exclusive();
         if stopped {
             participate_group_stop(cx.kr(), &cx.t.group, cx.task);
         }
@@ -1622,6 +1628,7 @@ fn setup_frame(
 ) -> Result<(), Errno> {
     let alt = cx.t.altstack;
     let st = cpu.state_mut();
+    st.clear_exclusive();
     let mut top = st.sp;
     if act.flags & sa::ONSTACK != 0 && alt.size != 0 && !alt.on_stack(st.sp) {
         top = alt.sp.wrapping_add(alt.size);
@@ -1698,9 +1705,10 @@ fn w64(b: &mut [u8], off: usize, v: u64) {
 }
 
 /// rt_sigreturn: restores registers, the signal mask and the alternate stack from the signal
-/// frame on the stack. An invalid frame changes nothing, returns 0 and forces a SIGSEGV at the
-/// stack pointer (arm64's `arm64_notify_segfault`), which a handler may catch.
+/// frame on the stack. An invalid frame returns 0 and forces a SIGSEGV at the stack pointer
+/// (arm64's `arm64_notify_segfault`), which a handler may catch.
 pub(crate) fn sigreturn(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
+    cpu.state_mut().clear_exclusive();
     if restore_frame(cx, cpu).is_err() {
         crate::debug::log(format_args!("rt_sigreturn: bad signal frame"));
         let sp = cpu.state().sp;

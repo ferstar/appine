@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: replace direct-mapped `strikes[64]` with a 64-entry ring and remove test-only `Dbt::recheck`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: clear the local exclusive monitor when the dispatcher returns a kick)
 
 ## Responsibilities
 
@@ -241,8 +241,9 @@ triggers (`kernel/oom`).
   `APPINE_EXIT_HOST_FAULT`, sets `d->poisoned = true`, wakes parked flush waiters and clears the
   global template arena (`dbt_template_clear(false)`).
 - Each `dbt_run` iteration: join (`park`) or perform (`flush_world`) a pending flush; catch up
-  generation (reset `rs`, clear dirty `jc`); check `c->pending` -> `APPINE_EXIT_KICK`; lock-free
-  `dbt_table_lookup`; if missed and `page_parked` is non-zero, lock and `dbt_revive`; else lock-free
+  generation (reset `rs`, clear dirty `jc`); on consuming `c->pending`, clear `excl_size` and return
+  `APPINE_EXIT_KICK`. Otherwise, try lock-free `dbt_table_lookup`. On a miss with non-zero
+  `page_parked`, lock and call `dbt_revive`; else lock-free
   `prepare` + locked `install` (re-verifying guest words and `memop_kind`), or `appine_interp_step`
   for unfetchable PCs; fill jump cache if requested; call `enter(c, code)` and dispatch the exit:
   - `R_CHAIN`/`R_CHAIN_FWD`: record patch site/branch delta/shared flag for next lookup;

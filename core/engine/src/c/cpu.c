@@ -174,8 +174,10 @@ static enum appine_exit cpu_run(void *ctx, struct appine_cpu *cpu)
         /* Check quickly with a plain load first, and clear with an atomic exchange only when there
          * really is a request, so a concurrently arriving kick is not swallowed */
         if (UNLIKELY(__atomic_load_n(&cpu->pending, __ATOMIC_RELAXED)) &&
-            __atomic_exchange_n(&cpu->pending, 0, __ATOMIC_ACQUIRE))
+            __atomic_exchange_n(&cpu->pending, 0, __ATOMIC_ACQUIRE)) {
+            clear_exclusive(cpu);
             return APPINE_EXIT_KICK;
+        }
         uint64_t pc = cpu->pc, page = pc >> APPINE_PAGE_SHIFT;
         enum appine_exit r;
         if (UNLIKELY((pc & 3) || cpu->nbrk)) {

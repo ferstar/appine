@@ -128,6 +128,11 @@ pub struct CpuState {
 }
 
 impl CpuState {
+    /// Clears the local exclusive monitor on a guest exception return.
+    pub fn clear_exclusive(&mut self) {
+        self.excl_size = 0;
+    }
+
     /// Sets hardware breakpoints (instruction addresses) and watchpoints (start, end,
     /// [`WATCH_LOAD`]/[`WATCH_STORE`]), at most [`HW_SLOTS`] of each. Only the interpreter checks
     /// them ([`Cpu::run`], [`Cpu::step`]): a hit exits with [`FaultKind::HwBreakpoint`] or
@@ -441,7 +446,8 @@ pub enum Exit {
         /// The brk immediate.
         imm: u16,
     },
-    /// Memory access failure; pc points at the faulting instruction, which had no side effects.
+    /// Memory access failure. The local exclusive monitor is clear and pc points at the
+    /// faulting instruction.
     Fault {
         /// The faulting guest address (TBI tag removed).
         addr: u64,

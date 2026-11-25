@@ -1347,8 +1347,10 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         }
         dbt_thread_catch_up(t);
         if (UNLIKELY(__atomic_load_n(&c->pending, __ATOMIC_RELAXED)) &&
-            __atomic_exchange_n(&c->pending, 0, __ATOMIC_ACQUIRE))
+            __atomic_exchange_n(&c->pending, 0, __ATOMIC_ACQUIRE)) {
+            clear_exclusive(c);
             return APPINE_EXIT_KICK;
+        }
 
         /* Tag of the found block: shared blocks do not link to private blocks (LINK_SHARED) */
         unsigned found;
@@ -1535,7 +1537,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         case R_SVC:
             t->stats.exits_svc++;
             c->exit_info = 0;
-            c->excl_size = 0; /* as in Tier 0: an exception return clears the exclusive marker */
+            clear_exclusive(c);
             return APPINE_EXIT_SVC;
         default:
             t->stats.exits_kick++;

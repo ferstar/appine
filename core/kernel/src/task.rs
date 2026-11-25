@@ -796,6 +796,8 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             let mut state = task.state.borrow_mut();
             let mut cx = Cx::new(shared, k, &task, &mut state);
             if stepped {
+                // A tracer can suppress SIGTRAP after this single-step exception.
+                cpu.state_mut().clear_exclusive();
                 crate::ptrace::step_done(&mut cx, cpu);
             }
             let flow = handle(&mut cx, cpu, exit);

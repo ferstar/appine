@@ -52,7 +52,8 @@ enum appine_fault_kind {
     APPINE_FAULT_BREAK = 5,
 };
 
-/* Exit reasons of appine_cpu_run() */
+/* Guest exceptions and interrupts (SVC, UNDEF, BRK, FAULT, KICK) clear the local exclusive
+ * monitor before returning to the caller. */
 enum appine_exit {
     /* used only by appine_cpu_exec_insn() and appine_cpu_step(): the instruction completed
      * normally */
