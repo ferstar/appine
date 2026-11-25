@@ -571,6 +571,9 @@ pub(crate) enum Verdict {
     Run(u64),
     /// Do not run it; x0 already holds the return value (or SIGSYS is already pending).
     Skip,
+    /// Interrupted while waiting for a user notification: x0 holds `-ERESTARTSYS`, so signal
+    /// delivery should apply syscall restart rules (rewind pc on `SA_RESTART`, else `-EINTR`).
+    Restart,
     /// The thread has exited.
     Exit,
 }
@@ -595,7 +598,7 @@ pub(crate) fn check(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64) -> Verdict {
         (mode::FILTER, Some(top)) => filter(cx, cpu, &top, nr, false),
         (mode::STRICT, _) if STRICT_ALLOWED.contains(&nr) => Verdict::Run(nr),
         (mode::STRICT, _) => {
-            log(cx, nr, Signal::KILL.number(), ret::KILL_THREAD, true);
+            log(cx, cpu, nr, Signal::KILL.number(), ret::KILL_THREAD, true);
             cx.task.seccomp.borrow_mut().mode = mode::DEAD;
             publish(cx.task);
             exit_thread(cx, cpu, Signal::KILL)
@@ -624,20 +627,20 @@ fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bo
     let (action, value) = (r & ret::ACTION_FULL, r & ret::DATA);
     // The syscall is not run: logged only when the filter set SECCOMP_FILTER_FLAG_LOG
     let requested = matched.as_ref().is_some_and(|m| m.log);
-    let skip = |cx: &Cx<'_>| {
-        log(cx, nr, 0, action, requested);
+    let skip = |cx: &Cx<'_>, cpu: &Cpu| {
+        log(cx, cpu, nr, 0, action, requested);
         Verdict::Skip
     };
     match action {
         ret::ERRNO => {
             cpu.state_mut().x[0] = (-i64::from(value.min(MAX_ERRNO))) as u64;
-            skip(cx)
+            skip(cx, cpu)
         }
         ret::TRAP => {
             // The handler sees the original registers
             cpu.state_mut().x[0] = cpu.state().orig_x0;
             signal::force(cx, Signal::SYS, sigsys(cpu, nr, value));
-            skip(cx)
+            skip(cx, cpu)
         }
         ret::TRACE if recheck => Verdict::Run(nr),
         ret::TRACE => {
@@ -648,24 +651,28 @@ fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bo
                 .enabled(crate::ptrace::event::SECCOMP)
             {
                 cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
-                return skip(cx);
+                return skip(cx, cpu);
             }
             // The tracer may change the number (-1 skips) and the arguments; check again after
-            let Some(nr) = crate::ptrace::seccomp_stop(cx, cpu, nr, value) else {
+            let Some(new_nr) = crate::ptrace::seccomp_stop(cx, cpu, nr, value) else {
                 return Verdict::Exit;
             };
-            if nr as i64 >= 0 {
-                filter(cx, cpu, top, nr, true)
+            if new_nr as i64 >= 0 {
+                log(cx, cpu, nr, 0, action, requested);
+                filter(cx, cpu, top, new_nr, true)
             } else {
-                skip(cx)
+                skip(cx, cpu)
             }
         }
         ret::USER_NOTIF => match matched {
-            Some(m) => notify(cx, cpu, &m, data, nr),
+            Some(m) => {
+                log(cx, cpu, nr, 0, action, requested);
+                notify(cx, cpu, &m, data, nr)
+            }
             None => Verdict::Run(nr),
         },
         ret::LOG => {
-            log(cx, nr, 0, action, true);
+            log(cx, cpu, nr, 0, action, true);
             Verdict::Run(nr)
         }
         ret::ALLOW => Verdict::Run(nr),
@@ -673,7 +680,7 @@ fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bo
         // is the same as killing the process: deliver a SIGSYS that cannot be handled or stopped
         // by a tracer, and write a core
         _ => {
-            log(cx, nr, Signal::SYS.number(), action, true);
+            log(cx, cpu, nr, Signal::SYS.number(), action, true);
             cx.task.seccomp.borrow_mut().mode = mode::DEAD;
             publish(cx.task);
             if action != ret::KILL_THREAD || cx.t.group.borrow().threads.len() == 1 {
@@ -787,7 +794,7 @@ fn notify(
         Err(None) => Verdict::Exit,
         Err(Some(e)) => {
             cpu.state_mut().x[0] = e.to_syscall_return();
-            Verdict::Skip
+            Verdict::Restart
         }
         Ok(()) if k.flags & USER_NOTIF_FLAG_CONTINUE != 0 => Verdict::Run(nr),
         Ok(()) => {
@@ -802,10 +809,12 @@ fn notify(
     }
 }
 
-/// Logs (Linux emits an audit record, here the debug log is written): kills and LOG are always
-/// logged, TRAP, ERRNO, TRACE and USER_NOTIF only when the filter set `SECCOMP_FILTER_FLAG_LOG`,
-/// and all of them must be in `actions_logged`.
-fn log(cx: &Cx<'_>, nr: u64, sig: i32, action: u32, requested: bool) {
+/// Logs a seccomp event (`seccomp_log` + `audit_seccomp` + `audit_printk_skb`): kills and LOG are
+/// always logged, TRAP, ERRNO, TRACE and USER_NOTIF only when the filter set
+/// `SECCOMP_FILTER_FLAG_LOG`, and all of them must be enabled in `actions_logged`. Emits an
+/// `audit: type=1326 ...` record to the guest kernel log (as Linux does without auditd) in
+/// addition to Appine's host debug log.
+fn log(cx: &Cx<'_>, cpu: &Cpu, nr: u64, sig: i32, action: u32, requested: bool) {
     let (bit, always) = match action {
         ret::ALLOW => return,
         ret::TRAP => (logged::TRAP, false),
@@ -822,6 +831,56 @@ fn log(cx: &Cx<'_>, nr: u64, sig: i32, action: u32, requested: bool) {
             cx.tgid(),
             cx.tid(),
         ));
+        let cred = cx.cred();
+        let comm_raw = cx.task.comm.get();
+        let comm_len = comm_raw
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(comm_raw.len());
+        let comm = audit_string(&comm_raw[..comm_len]);
+        let exe =
+            cx.t.group
+                .borrow()
+                .exe
+                .as_ref()
+                .map_or_else(|| "(null)".to_owned(), |e| audit_string(&e.path));
+        let ip = cpu.state().pc;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let klog = cx.kr().klog.clone();
+        crate::klog::printk(
+            &klog,
+            crate::klog::level::NOTICE,
+            format_args!(
+                "audit: type=1326 audit({}.{:03}:{serial}): auid=4294967295 uid={} gid={} ses=4294967295 pid={} comm={comm} exe={exe} sig={sig} arch={AUDIT_ARCH_AARCH64:x} syscall={nr} compat=0 ip=0x{ip:x} code=0x{action:x}",
+                now.as_secs(),
+                now.subsec_millis(),
+                cred.ruid,
+                cred.rgid,
+                cx.tgid(),
+            ),
+        );
+    }
+}
+
+/// Formats a byte string as Linux's `audit_log_untrustedstring`: quoted when it contains only
+/// printable ASCII without `"` or whitespace, else uppercase hex.
+fn audit_string(bytes: &[u8]) -> String {
+    let safe = bytes
+        .iter()
+        .all(|&b| (0x21..=0x7e).contains(&b) && b != b'"');
+    if safe {
+        format!("\"{}\"", String::from_utf8_lossy(bytes))
+    } else {
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            let _ = write!(hex, "{b:02X}");
+        }
+        hex
     }
 }
 
@@ -1754,5 +1813,15 @@ mod tests {
             !allowed(&cache(&all, None), CACHED_NRS as u64)
                 && !allowed(&cache(&all, None), u64::MAX)
         );
+    }
+
+    #[test]
+    fn audit_string_quotes_safe_and_hex_encodes_untrusted() {
+        assert_eq!(audit_string(b"prog"), "\"prog\"");
+        assert_eq!(audit_string(b"/usr/bin/a.out"), "\"/usr/bin/a.out\"");
+        assert_eq!(audit_string(b""), "\"\"");
+        assert_eq!(audit_string(b"a b"), "612062");
+        assert_eq!(audit_string(b"a\"b"), "612262");
+        assert_eq!(audit_string(b"x\n"), "780A");
     }
 }

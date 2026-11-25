@@ -384,7 +384,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.pgid = parent.pgid;
         g.sid = parent.sid;
         g.rlimits = parent.rlimits;
-        g.dumpable = parent.dumpable;
+        g.set_dumpable_mode(parent.dumpable_mode());
         g.mm_user_ns = parent.mm_user_ns.clone();
         g.oom_score_adj = parent.oom_score_adj;
         g.oom_score_adj_min = parent.oom_score_adj_min;
@@ -1050,22 +1050,25 @@ fn exec(
             &file,
             ovl,
         )));
-        // As with Linux's commit_creds, changing the effective IDs or gaining new capabilities
-        // makes the process non-dumpable, and the parent's exit no longer signals it; a
-        // privileged exec likewise no longer signals it. Other execs make it dumpable again
-        // (begin_new_exec), except when the program file or its interpreter is not readable by
-        // the caller (would_dump)
+        // As with Linux's commit_creds and begin_new_exec, changing the effective IDs or gaining
+        // new capabilities sets dumpable to fs.suid_dumpable and clears pdeathsig; a privileged
+        // exec likewise clears pdeathsig. Other execs set SUID_DUMP_USER (1), except when the
+        // program file or its interpreter is not readable by the caller (would_dump), which also
+        // uses fs.suid_dumpable.
+        let suid_dump = crate::coredump::suid_dumpable(cx.kr());
         let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
         let gained = new_cred.cap_permitted & !cred.cap_permitted != 0;
         if (new_cred.euid, new_cred.egid) != (new_cred.ruid, new_cred.rgid)
             || ids(&new_cred) != ids(&cred)
             || gained
         {
-            g.dumpable = false;
+            g.set_dumpable_mode(suid_dump);
             cx.task.pdeathsig.set(0);
+        } else if cred.permission(&st, crate::cred::MAY_READ).is_ok() && interp_unreadable.is_none()
+        {
+            g.set_dumpable_mode(crate::coredump::SUID_DUMP_USER);
         } else {
-            g.dumpable =
-                cred.permission(&st, crate::cred::MAY_READ).is_ok() && interp_unreadable.is_none();
+            g.set_dumpable_mode(suid_dump);
         }
         // The new address space belongs to the caller's user namespace, or to the nearest
         // ancestor where a program file it could not read is owned by mapped IDs (would_dump's

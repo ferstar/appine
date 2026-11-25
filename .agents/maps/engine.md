@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: preserve guest page 0 on explicit Tier 0 InvalidateCode exits)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `mrs` of unallocated CRm=0 and CRm=1 ID registers exits `Undefined` / `SIGILL` matching Linux 6.1 arm64)
 
 ## Responsibilities
 
@@ -157,9 +157,11 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 - Adding a SIMD/FP extension only needs whitelisting its encodings: Tier 0 executes them through
   native stubs and `engine/dbt` copies them.
 - The same set feeds `AT_HWCAP`/`AT_HWCAP2`, `/proc/cpuinfo` and `mrs` of the ID registers
-  (op0=3, op1=0, CRn=0, CRm 0–7): MIDR is the host value (0 if the host does not advertise CPUID),
-  MPIDR has only bit 31, PFR0 (AArch64-only EL0/EL1 plus FP, AdvSIMD, DIT) and ISAR0/ISAR1 are
-  derived from the set, every other register in that range reads 0; CRm 8–15 is undefined.
+  (op0=3, op1=0, CRn=0, matching Linux 6.1 `is_emulated`/`emulate_id_reg`): CRm=0 allows only
+  MIDR (op2=0, host value or 0 without CPUID), MPIDR (op2=5, bit 31 only) and REVIDR (op2=6,
+  reads 0) with all other CRm=0 encodings undefined; CRm=1 is undefined; CRm=2–7 expose PFR0
+  (AArch64-only EL0/EL1 plus FP, AdvSIMD, DIT) and ISAR0/ISAR1 from the set and read 0 otherwise;
+  CRm=8–15 is undefined.
 - DIT is kept in the CPU state; the host thread's DIT follows the guest's at each entry.
 
 ### Host fault guard
@@ -227,8 +229,7 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 ## Confirmed bugs / technical debt
 
-- **Unallocated ID registers read 0:** `mrs` of CRm=1 and unallocated CRm=0 registers returns 0
-  where Linux 6.1 delivers `SIGILL`.
+None.
 
 ## Open questions
 

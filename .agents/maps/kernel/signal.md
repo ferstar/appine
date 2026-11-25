@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 16 claims checked by 3 independent verifiers — 12 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: core dumps fetch FUSE file contents for ELF headers and data)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `NO_SYSCALL` passes `syscall = false` except interrupted `USER_NOTIF`, core dumps ignore `umask` and honor `fs.suid_dumpable` 0/1/2, seccomp logs audit records to `klog`)
 
 ## Responsibilities
 
@@ -114,7 +114,10 @@ construction (`kernel/vdso`).
   sigreturn and exec). When `syscall == true`, BEFORE checking `killed`, it rewinds any restart
   code (`-ERESTARTSYS`, `-ERESTARTNOINTR`, `-ERESTARTNOHAND`, `-ERESTART_RESTARTBLOCK`: restores
   `x0 = orig_x0`, `pc -= 4` onto `svc`) and calls `KernelEntry::forget_syscall` so `/proc/<pid>/
-  syscall` shows `-1` with current `sp` and rewound `pc`.
+  syscall` shows `-1` with current `sp` and rewound `pc`. When a tracer or seccomp skips a syscall
+  via `NO_SYSCALL`, `syscall::dispatch` calls `forget_syscall` and passes `syscall = false` (matching
+  arm64 Linux `in_syscall(regs) == false` so `-512..-516` in `x0` never rewinds `pc`), except for a
+  signal-interrupted `SECCOMP_RET_USER_NOTIF` (`Verdict::Restart`) which still passes `syscall = true`.
 - Loop: waits while `(g.stopped && !traced) || g.frozen` (entering cgroup freeze via
   `cgroup::enter_frozen` and notifying observations); handles ptrace group-stop and trap checks;
   dequeues thread-pending before group-pending, synchronous signals (`SEGV`/`BUS`/`ILL`/`TRAP`/
@@ -209,14 +212,18 @@ construction (`kernel/vdso`).
 
 - Triggered on default action of `SIGQUIT`, `SIGILL`, `SIGTRAP`, `SIGABRT`, `SIGBUS`, `SIGFPE`,
   `SIGSEGV`, `SIGXCPU`, `SIGXFSZ` or `SIGSYS` as the group's first exit when `RLIMIT_CORE >=
-  PAGE_SIZE` and `dumpable` is true. Pipe `core_pattern` (`|...`) is unsupported (debug-logged and
-  skipped).
+  PAGE_SIZE` and `dumpable_mode() != SUID_DUMP_DISABLE` (`0`). Pipe `core_pattern` (`|...`) is
+  unsupported (debug-logged and skipped).
 - Arms `group.core` under BKL before releasing BKL to wait uninterruptibly on `wake::EXITED` while
   siblings save `ThreadCore` in `task::exit`.
 - Expands `core_pattern` (max 127 B, root-writable 0644 sysctl: `%%`, `%p`, `%P`, `%i`, `%I`,
   `%u`, `%g`, `%s`, `%t`, `%h`, `%e`, `%E`, `%c`, `%d`) plus `.pid` when `core_uses_pid` and no
-  pid token. Unlinks existing name in cwd and creates with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600
-  (through `create_exclusive` / `write_at`, inheriting umask and `RLIMIT_FSIZE`).
+  pid token. Under `SUID_DUMP_ROOT` (`2`, set from `/proc/sys/fs/suid_dumpable`), non-pipe patterns
+  must be absolute paths (relative paths log a `WARNING` to `klog` and skip), existing files are
+  not unlinked (`O_EXCL` prevents clobbering), and `fsuid` is temporarily overridden to root (`0`).
+  Regular dumps (`1`) unlink an existing name in cwd first. Creation always uses fixed mode `0600`
+  ignoring the process `umask` (via a private `FsContext` with `umask: 0`) and `O_CREAT|O_EXCL|
+  O_NOFOLLOW`; writes honour both `RLIMIT_CORE` and `RLIMIT_FSIZE`.
 - Writes 64-bit LE arm64 `ET_CORE` (supporting `PN_XNUM` overflow): `PT_NOTE` (`NT_PRSTATUS`,
   `NT_PRPSINFO`, `NT_SIGINFO`, `NT_AUXV`, `NT_FILE`, `NT_PRFPREG`, `NT_ARM_TLS`,
   `NT_ARM_HW_BREAK`, `NT_ARM_HW_WATCH`, `NT_ARM_SYSTEM_CALL`) and `PT_LOAD` filtered by
@@ -231,13 +238,16 @@ construction (`kernel/vdso`).
   arrives. `LOG_CONT` is never set (no continuation merging), and `printk_time` defaults to `true`
   with no sysfs knob exposing it.
 - Kernel writers: `KmsgFile::drop` ratelimit warning, `CAP_SYS_ADMIN` syslog deprecation warning,
-  `show_unhandled`, OOM killer, `bug::log` (also reads back via `lines_from`), BKL watchdog,
+  `show_unhandled`, seccomp `audit: type=1326` records (`KERN_NOTICE`), `suid_dumpable=2` unsafe
+  `core_pattern` warning, OOM killer, `bug::log` (also reads back via `lines_from`), BKL watchdog,
   cgroup pids fork rejection, and low-port remap notice. Host kernel log is not exposed.
 - `/dev/kmsg` (char `1:11`, 0644): per-open sequence, `EPIPE` on evicted records, `EINVAL` on a
   non-zero short read buffer (record still consumed; zero-length `read` returns `Ok(0)` early),
   offset-0 seeks (`SEEK_SET`/`SEEK_DATA`/`SEEK_END`), write prefix `<pri>` parsing (`> 992` ->
-  `EINVAL`, 10/5 s ratelimit reporting drops on close), polls `POLLIN|POLLRDNORM` (+ `POLLERR|
-  POLLPRI` on missed records). `printk_devkmsg=off` makes open `EPERM`.
+  `EINVAL`, 10/5 s ratelimit reporting drops on close; zero-length `write` logs an empty
+  unfinalized record while zero-total `writev` returns 0 without logging, matching Linux 6.1's
+  `vfs_write` vs `do_iter_write`), polls `POLLIN|POLLRDNORM` (+ `POLLERR|POLLPRI` on missed
+  records). `printk_devkmsg=off` makes open `EPERM`.
 - `syslog(2)` & `/proc/kmsg` (0400): share `syslog_seq`/`syslog_partial` cursor; `READ_ALL`/
   `READ_CLEAR`/`CLEAR` use `clear_seq`; actions 6/7/8 update `Kernel::printk` console loglevel
   state (no console sink). Permissions enforce `dmesg_restrict`, `CAP_SYSLOG`, and deprecated
@@ -319,10 +329,7 @@ construction (`kernel/vdso`).
 - **Synthesized abort ESRs differ from Linux's:** every translation fault reports level-3 FSC `0x07`
   and every fault inside a mapping reports level-3 permission FSC `0x0f`, rather than the real
   table walk level or translation-fault-on-unpopulated-page semantics.
-- **Minor divergences:** kernel-generated RT signals lose `SigInfo` when the queue is full;
-  core file creation inherits process `umask` and `RLIMIT_FSIZE`, and `/proc/sys/fs/suid_dumpable`
-  is recorded without affecting `bool dumpable`; `/dev/kmsg` zero-length `write` logs an empty
-  record while zero-total `writev` does not.
+- **Minor divergences:** kernel-generated RT signals lose `SigInfo` when the queue is full.
 
 ## Open questions
 
@@ -330,8 +337,6 @@ construction (`kernel/vdso`).
   simplification?
 - Should `Klog::printk_time` be exposed under `/sys/module/printk/parameters/time`, or remain
   fixed `true`?
-- Is passing `syscall = true` to `deliver` on tracer/seccomp-skipped `NO_SYSCALL` intended to
-  allow restart-code rewinding if a tracer writes `-512..-516` into `x0`?
 
 ## To verify
 

@@ -1296,9 +1296,9 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             let on = cx.t.group.borrow().child_subreaper as i32;
             put(cx, arg, on.to_le_bytes()).map(|()| 0)
         }
-        PR_GET_DUMPABLE => Ok(cx.t.group.borrow().dumpable as u64),
+        PR_GET_DUMPABLE => Ok(u64::from(cx.t.group.borrow().dumpable_mode())),
         PR_SET_DUMPABLE if arg <= 1 => {
-            cx.t.group.borrow_mut().dumpable = arg == 1;
+            cx.t.group.borrow_mut().set_dumpable_mode(arg as u8);
             Ok(0)
         }
         PR_SET_NO_NEW_PRIVS if arg == 1 => {

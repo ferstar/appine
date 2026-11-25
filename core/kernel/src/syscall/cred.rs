@@ -216,7 +216,8 @@ fn update<T>(cx: &Cx<'_>, f: impl FnOnce(&mut Cred) -> Result<T, Errno>) -> Resu
     let r = f(&mut cred)?;
     let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
     if ids(&cred) != ids(&old) || cred.cap_permitted & !old.cap_permitted != 0 {
-        cx.t.group.borrow_mut().dumpable = false;
+        let mode = crate::coredump::suid_dumpable(cx.kr());
+        cx.t.group.borrow_mut().set_dumpable_mode(mode);
         cx.task.pdeathsig.set(0);
     }
     cx.set_cred(cred);

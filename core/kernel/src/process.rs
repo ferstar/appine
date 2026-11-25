@@ -401,8 +401,12 @@ pub(crate) struct ThreadGroup {
     /// `PR_SET_CHILD_SUBREAPER`: orphaned descendants are reparented to the nearest such ancestor
     /// instead of init ([`finish_group`]); not inherited by fork, kept by execve.
     pub child_subreaper: bool,
-    /// `PR_SET_DUMPABLE`, inherited by fork.
+    /// `PR_SET_DUMPABLE` / `fs.suid_dumpable`: true iff `SUID_DUMP_USER` (1), kept as `bool` so
+    /// procfs ownership and ptrace checks treat both `SUID_DUMP_DISABLE` (0) and
+    /// `SUID_DUMP_ROOT` (2) as non-user-dumpable; inherited by fork.
     pub dumpable: bool,
+    /// True iff dumpable mode is `SUID_DUMP_ROOT` (2, `suidsafe`); inherited by fork.
+    pub dumpable_root: bool,
     /// The user namespace of the address space (Linux's `mm->user_ns`): the credentials' at
     /// execve, or the nearest ancestor where the owner and group of a program file (or
     /// interpreter) the caller could not read are mapped (`would_dump`); kept by fork. A process
@@ -506,6 +510,7 @@ impl ThreadGroup {
             cpu_itimers: [None; 2],
             child_subreaper: false,
             dumpable: true,
+            dumpable_root: false,
             mm_user_ns: None,
             leader_no_new_privs: false,
             oom_score_adj: 0,
@@ -538,9 +543,26 @@ impl ThreadGroup {
     }
 
     /// What decides access to a process that is not dumpable ([`crate::cred::Cred::may_ptrace`]):
-    /// whether it is dumpable, and its address space's user namespace.
+    /// whether it is user-dumpable (`SUID_DUMP_USER`), and its address space's user namespace.
     pub fn dump_scope(&self) -> (bool, Option<&crate::cred::UserNs>) {
         (self.dumpable, self.mm_user_ns.as_deref())
+    }
+
+    /// Current dumpable mode (Linux's `get_dumpable`: 0 = disable, 1 = user, 2 = root/suidsafe).
+    pub fn dumpable_mode(&self) -> u8 {
+        if self.dumpable {
+            crate::coredump::SUID_DUMP_USER
+        } else if self.dumpable_root {
+            crate::coredump::SUID_DUMP_ROOT
+        } else {
+            crate::coredump::SUID_DUMP_DISABLE
+        }
+    }
+
+    /// Sets the dumpable mode (0 = disable, 1 = user, 2 = root/suidsafe).
+    pub fn set_dumpable_mode(&mut self, mode: u8) {
+        self.dumpable = mode == crate::coredump::SUID_DUMP_USER;
+        self.dumpable_root = mode == crate::coredump::SUID_DUMP_ROOT;
     }
 
     /// The sample before execve replaces the address space: a process that was forked, has not

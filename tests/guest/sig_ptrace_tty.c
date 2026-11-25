@@ -40,7 +40,10 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -1408,6 +1411,593 @@ static void test_zombie_leader_cpu_clock(void)
     CHECK(timer_delete(tid_timer) == 0, "timer_delete");
 }
 
+/* ---- Local seccomp UAPI definitions (musl has no linux/seccomp.h) ---- */
+
+struct sc_sock_filter {
+    uint16_t code;
+    uint8_t jt, jf;
+    uint32_t k;
+};
+struct sc_sock_fprog {
+    unsigned short len;
+    struct sc_sock_filter *filter;
+};
+struct sc_seccomp_data {
+    int nr;
+    uint32_t arch;
+    uint64_t instruction_pointer;
+    uint64_t args[6];
+};
+struct sc_notif {
+    uint64_t id;
+    uint32_t pid, flags;
+    struct sc_seccomp_data data;
+};
+struct sc_notif_resp {
+    uint64_t id;
+    int64_t val;
+    int32_t error;
+    uint32_t flags;
+};
+
+#define SC_BPF_LD   0x00
+#define SC_BPF_JMP  0x05
+#define SC_BPF_RET  0x06
+#define SC_BPF_W    0x00
+#define SC_BPF_ABS  0x20
+#define SC_BPF_JEQ  0x10
+#define SC_BPF_K    0x00
+#define SC_STMT(c, k) {(uint16_t)(c), 0, 0, (uint32_t)(k)}
+#define SC_JUMP(c, k, t, f) {(uint16_t)(c), (t), (f), (uint32_t)(k)}
+#define SC_RET_ERRNO      0x00050000U
+#define SC_RET_USER_NOTIF 0x7fc00000U
+#define SC_RET_LOG        0x7ffc0000U
+#define SC_RET_ALLOW      0x7fff0000U
+#define SC_FLAG_LOG          2U
+#define SC_FLAG_NEW_LISTENER 8U
+#define SC_NOTIF_RECV 0xc0502100U
+#define SC_NOTIF_SEND 0xc0182101U
+
+struct sc_pt_regs {
+    uint64_t regs[31];
+    uint64_t sp, pc, pstate;
+};
+
+static volatile sig_atomic_t g_skip_usr1 = 0;
+static void on_skip_usr1(int sig)
+{
+    (void)sig;
+    g_skip_usr1++;
+}
+
+static long raw_svc_getpid(void)
+{
+    register long x8 __asm__("x8") = SYS_getpid;
+    register long x0 __asm__("x0") = 0x1234;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static void send_fd_over_unix(int sock, int fd)
+{
+    char c = 'x';
+    struct iovec iov = {&c, 1};
+    char ctrl[CMSG_SPACE(sizeof(int))] = {0};
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl;
+    msg.msg_controllen = sizeof(ctrl);
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+    CHECK(sendmsg(sock, &msg, 0) == 1, "sendmsg fd");
+}
+
+static int recv_fd_over_unix(int sock)
+{
+    char c = 0;
+    struct iovec iov = {&c, 1};
+    char ctrl[CMSG_SPACE(sizeof(int))] = {0};
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl;
+    msg.msg_controllen = sizeof(ctrl);
+    CHECK(recvmsg(sock, &msg, 0) == 1, "recvmsg fd");
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    CHECK(cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS, "cmsg");
+    int fd = -1;
+    memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+    return fd;
+}
+
+static void write_str_file(const char *path, const char *s)
+{
+    int fd = open(path, O_WRONLY | O_TRUNC);
+    CHECK(fd >= 0, "open %s", path);
+    ssize_t len = (ssize_t)strlen(s);
+    CHECK(write(fd, s, (size_t)len) == len, "write %s", path);
+    close(fd);
+}
+
+/*
+ * 1. Skipped syscalls (NO_SYSCALL via ptrace or seccomp) must pass syscall=false to
+ * signal::deliver so x0=-512..-516 does not rewind pc; interrupted USER_NOTIF still restarts.
+ */
+static void test_skipped_syscall_no_restart(void)
+{
+    /* Case A: tracer skips SYS_getpid with NO_SYSCALL and writes -512 (-ERESTARTSYS) + SIGUSR1,
+     * and then skips a second SYS_getpid with -513 (-ERESTARTNOINTR) and no signal. */
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        g_skip_usr1 = 0;
+        struct sigaction sa = {0};
+        sa.sa_handler = on_skip_usr1;
+        sa.sa_flags = SA_RESTART;
+        CHECK(sigaction(SIGUSR1, &sa, NULL) == 0, "sigaction");
+        CHECK(ptrace(PTRACE_TRACEME, 0, 0, 0) == 0, "PTRACE_TRACEME");
+        raise(SIGSTOP);
+        long r1 = raw_svc_getpid();
+        CHECK(r1 == -512, "ptrace skip -512 got %ld", r1);
+        CHECK(g_skip_usr1 == 1, "expected 1 SIGUSR1, got %d", (int)g_skip_usr1);
+        long r2 = raw_svc_getpid();
+        CHECK(r2 == -513, "ptrace skip -513 got %ld", r2);
+        _exit(0);
+    }
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSTOPPED(st), "initial stop");
+    CHECK(ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD) == 0, "setoptions");
+    CHECK(ptrace(PTRACE_SYSCALL, pid, 0, 0) == 0, "cont1");
+    int skips = 0;
+    for (;;) {
+        CHECK(waitpid(pid, &st, 0) == pid, "waitpid");
+        if (WIFEXITED(st)) {
+            CHECK(WEXITSTATUS(st) == 0, "child exit %d", WEXITSTATUS(st));
+            break;
+        }
+        CHECK(WIFSTOPPED(st), "unexpected status %#x", st);
+        int sig = WSTOPSIG(st);
+        if (sig == (SIGTRAP | 0x80)) {
+            int scno = 0;
+            struct iovec siov = {&scno, sizeof(scno)};
+            CHECK(ptrace(PTRACE_GETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &siov) == 0,
+                  "get scno");
+            if (scno == SYS_getpid) {
+                int neg1 = -1;
+                struct iovec niov = {&neg1, sizeof(neg1)};
+                CHECK(ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &niov) == 0,
+                      "set NO_SYSCALL");
+                struct sc_pt_regs regs;
+                struct iovec riov = {&regs, sizeof(regs)};
+                CHECK(ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &riov) == 0, "get regs");
+                regs.regs[0] = (skips == 0) ? (uint64_t)(-512LL) : (uint64_t)(-513LL);
+                CHECK(ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &riov) == 0, "set regs");
+                if (skips == 0)
+                    CHECK(kill(pid, SIGUSR1) == 0, "kill SIGUSR1");
+                skips++;
+            }
+            CHECK(ptrace(PTRACE_SYSCALL, pid, 0, 0) == 0, "syscall cont");
+        } else {
+            CHECK(ptrace(PTRACE_SYSCALL, pid, 0, sig) == 0, "sig cont");
+        }
+    }
+    CHECK(skips == 2, "expected 2 skipped syscalls (no rewind), got %d", skips);
+
+    /* Case B: seccomp SECCOMP_RET_ERRNO | 512 must return -512 without rewinding pc. */
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0, "nnp");
+        struct sc_sock_filter f[] = {
+            SC_STMT(SC_BPF_LD | SC_BPF_W | SC_BPF_ABS, offsetof(struct sc_seccomp_data, nr)),
+            SC_JUMP(SC_BPF_JMP | SC_BPF_JEQ | SC_BPF_K, SYS_getppid, 0, 1),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ERRNO | 512),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ALLOW),
+        };
+        struct sc_sock_fprog p = {4, f};
+        CHECK(syscall(SYS_seccomp, 1, 0, &p) == 0, "seccomp errno 512");
+        errno = 0;
+        long r = syscall(SYS_getppid);
+        CHECK(r == -1 && errno == 512, "seccomp ERRNO|512 got r=%ld errno=%d", r, errno);
+        _exit(0);
+    }
+    wait_exit(pid, 0);
+
+    /* Case C: interrupted SECCOMP_RET_USER_NOTIF with SA_RESTART must still restart. */
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        close(sv[0]);
+        g_skip_usr1 = 0;
+        struct sigaction sa = {0};
+        sa.sa_handler = on_skip_usr1;
+        sa.sa_flags = SA_RESTART;
+        CHECK(sigaction(SIGUSR1, &sa, NULL) == 0, "sigaction");
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0, "nnp");
+        struct sc_sock_filter f[] = {
+            SC_STMT(SC_BPF_LD | SC_BPF_W | SC_BPF_ABS, offsetof(struct sc_seccomp_data, nr)),
+            SC_JUMP(SC_BPF_JMP | SC_BPF_JEQ | SC_BPF_K, SYS_getppid, 0, 1),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_USER_NOTIF),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ALLOW),
+        };
+        struct sc_sock_fprog p = {4, f};
+        int l = (int)syscall(SYS_seccomp, 1, SC_FLAG_NEW_LISTENER, &p);
+        CHECK(l >= 0, "seccomp listener");
+        send_fd_over_unix(sv[1], l);
+        close(l);
+        close(sv[1]);
+        long r = syscall(SYS_getppid);
+        CHECK(r == 77 && g_skip_usr1 == 1, "restarted notif got r=%ld usr1=%d", r, (int)g_skip_usr1);
+        _exit(0);
+    }
+    close(sv[1]);
+    int lfd = recv_fd_over_unix(sv[0]);
+    close(sv[0]);
+    struct sc_notif n1 = {0};
+    CHECK(ioctl(lfd, SC_NOTIF_RECV, &n1) == 0, "notif recv 1");
+    CHECK(kill(pid, SIGUSR1) == 0, "kill SIGUSR1");
+    struct sc_notif n2 = {0};
+    CHECK(ioctl(lfd, SC_NOTIF_RECV, &n2) == 0, "notif recv 2 (restarted)");
+    CHECK(n2.id != n1.id, "restarted notif id");
+    struct sc_notif_resp resp = {n2.id, 77, 0, 0};
+    CHECK(ioctl(lfd, SC_NOTIF_SEND, &resp) == 0, "notif send");
+    close(lfd);
+    wait_exit(pid, 0);
+}
+
+/*
+ * 2. Core dumps ignore umask (always 0600), honor RLIMIT_FSIZE, and follow /proc/sys/fs/suid_dumpable
+ * (0 = disable, 1 = user, 2 = root/suidsafe with absolute core_pattern and no overwrite).
+ */
+static void test_coredump_umask_fsize_suid_dumpable(void)
+{
+    const char *dir = "/tmp/coredump-reg";
+    mkdir(dir, 0777);
+    CHECK(chmod(dir, 0777) == 0, "chmod dir");
+    char old_cwd[256];
+    CHECK(getcwd(old_cwd, sizeof(old_cwd)) != NULL, "getcwd");
+    CHECK(chdir(dir) == 0, "chdir");
+    write_str_file("/proc/sys/kernel/core_pattern", "core\n");
+    write_str_file("/proc/sys/fs/suid_dumpable", "0\n");
+
+    /* A. umask(0777) must still produce mode 0600 core file. */
+    unlink("/tmp/coredump-reg/core");
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        umask(0777);
+        struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+        CHECK(setrlimit(RLIMIT_CORE, &rl) == 0, "setrlimit core");
+        *(volatile int *)0 = 1;
+        _exit(0);
+    }
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && WCOREDUMP(st), "umask dump");
+    struct stat sb;
+    CHECK(stat("/tmp/coredump-reg/core", &sb) == 0, "stat core");
+    CHECK((sb.st_mode & 0777) == 0600, "core mode %04o expected 0600", sb.st_mode & 0777);
+    unlink("/tmp/coredump-reg/core");
+
+    /* B. RLIMIT_FSIZE truncates the core file. */
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        struct rlimit rl_c = {RLIM_INFINITY, RLIM_INFINITY};
+        struct rlimit rl_f = {4096, 4096};
+        CHECK(setrlimit(RLIMIT_CORE, &rl_c) == 0, "setrlimit core");
+        CHECK(setrlimit(RLIMIT_FSIZE, &rl_f) == 0, "setrlimit fsize");
+        *(volatile int *)0 = 1;
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && WCOREDUMP(st), "fsize dump");
+    CHECK(stat("/tmp/coredump-reg/core", &sb) == 0 && sb.st_size > 0 && sb.st_size <= 4096,
+          "fsize core size %ld", (long)sb.st_size);
+    unlink("/tmp/coredump-reg/core");
+
+    /* C. fs/suid_dumpable = 0: setresuid(1000) sets dumpable=0, no core dumped. */
+    write_str_file("/proc/sys/fs/suid_dumpable", "0\n");
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+        CHECK(setrlimit(RLIMIT_CORE, &rl) == 0, "setrlimit");
+        CHECK(setresuid(1000, 1000, 1000) == 0, "setresuid");
+        CHECK(prctl(PR_GET_DUMPABLE) == 0, "suid_dumpable=0 get");
+        *(volatile int *)0 = 1;
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && !WCOREDUMP(st), "suid=0 no dump");
+    CHECK(stat("/tmp/coredump-reg/core", &sb) == -1 && errno == ENOENT, "suid=0 no file");
+
+    /* D. fs/suid_dumpable = 1: setresuid(1000) sets dumpable=1, core owned by uid 1000. */
+    write_str_file("/proc/sys/fs/suid_dumpable", "1\n");
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+        CHECK(setrlimit(RLIMIT_CORE, &rl) == 0, "setrlimit");
+        CHECK(setresuid(1000, 1000, 1000) == 0, "setresuid");
+        CHECK(prctl(PR_GET_DUMPABLE) == 1, "suid_dumpable=1 get");
+        *(volatile int *)0 = 1;
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && WCOREDUMP(st), "suid=1 dump");
+    CHECK(stat("/tmp/coredump-reg/core", &sb) == 0 && sb.st_uid == 1000 &&
+              (sb.st_mode & 0777) == 0600,
+          "suid=1 uid=%u mode=%04o", sb.st_uid, sb.st_mode & 0777);
+    unlink("/tmp/coredump-reg/core");
+
+    /* E. fs/suid_dumpable = 2: setresuid(1000) sets dumpable=2; PR_SET_DUMPABLE(2) is EINVAL;
+     * /proc/<pid> belongs to root; relative core_pattern refuses dump; absolute core_pattern dumps
+     * root-owned 0600 core with %d=2 and refuses to overwrite an existing file. */
+    write_str_file("/proc/sys/fs/suid_dumpable", "2\n");
+    int kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+    CHECK(kmsg >= 0 && lseek(kmsg, 0, SEEK_END) >= 0, "open kmsg");
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+        CHECK(setrlimit(RLIMIT_CORE, &rl) == 0, "setrlimit");
+        CHECK(setresuid(1000, 1000, 1000) == 0, "setresuid");
+        CHECK(prctl(PR_GET_DUMPABLE) == 2, "suid_dumpable=2 get");
+        CHECK_ERR(prctl(PR_SET_DUMPABLE, 2), EINVAL, "PR_SET_DUMPABLE(2) must fail EINVAL");
+        struct stat psb;
+        CHECK(stat("/proc/self", &psb) == 0 && psb.st_uid == 0,
+              "/proc/self uid=%u expected 0 under suid_dumpable=2", psb.st_uid);
+        *(volatile int *)0 = 1;
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && !WCOREDUMP(st),
+          "suid=2 relative pattern must not dump");
+    char kbuf[2048];
+    int saw_warn = 0;
+    for (;;) {
+        ssize_t n = read(kmsg, kbuf, sizeof(kbuf) - 1);
+        if (n <= 0)
+            break;
+        kbuf[n] = 0;
+        if (strstr(kbuf, "Unsafe core_pattern used with fs.suid_dumpable=2"))
+            saw_warn = 1;
+    }
+    CHECK(saw_warn, "expected klog warning for relative core_pattern with suid_dumpable=2");
+    close(kmsg);
+
+    write_str_file("/proc/sys/kernel/core_pattern", "/tmp/coredump-reg/suid.%p.%d\n");
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+        CHECK(setrlimit(RLIMIT_CORE, &rl) == 0, "setrlimit");
+        CHECK(setresuid(1000, 1000, 1000) == 0, "setresuid");
+        *(volatile int *)0 = 1;
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && WCOREDUMP(st),
+          "suid=2 absolute pattern must dump");
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/coredump-reg/suid.%d.2", pid);
+    CHECK(stat(path, &sb) == 0 && sb.st_uid == 0 && (sb.st_mode & 0777) == 0600,
+          "suid=2 core %s uid=%u mode=%04o", path, sb.st_uid, sb.st_mode & 0777);
+    unlink(path);
+
+    /* Existing file at fixed absolute path must NOT be unlinked/overwritten under suid_dumpable=2. */
+    write_str_file("/proc/sys/kernel/core_pattern", "/tmp/coredump-reg/existing\n");
+    int efd = open("/tmp/coredump-reg/existing", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    CHECK(efd >= 0 && write(efd, "keep", 4) == 4, "create existing");
+    close(efd);
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+        CHECK(setrlimit(RLIMIT_CORE, &rl) == 0, "setrlimit");
+        CHECK(setresuid(1000, 1000, 1000) == 0, "setresuid");
+        *(volatile int *)0 = 1;
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && !WCOREDUMP(st),
+          "suid=2 must not overwrite existing");
+    efd = open("/tmp/coredump-reg/existing", O_RDONLY);
+    char keep[8] = {0};
+    CHECK(efd >= 0 && read(efd, keep, sizeof(keep)) == 4 && memcmp(keep, "keep", 4) == 0,
+          "existing file preserved");
+    close(efd);
+    unlink("/tmp/coredump-reg/existing");
+
+    write_str_file("/proc/sys/kernel/core_pattern", "core\n");
+    write_str_file("/proc/sys/fs/suid_dumpable", "0\n");
+    CHECK(chdir(old_cwd) == 0, "restore cwd");
+}
+
+static int find_kmsg_audit(int kmsg, const char *needle1, const char *needle2)
+{
+    char buf[2048];
+    int found = 0;
+    for (;;) {
+        ssize_t n = read(kmsg, buf, sizeof(buf) - 1);
+        if (n < 0 && errno == EAGAIN)
+            break;
+        CHECK(n > 0, "read kmsg");
+        buf[n] = 0;
+        if (strstr(buf, "audit: type=1326 ") && strstr(buf, needle1) && strstr(buf, needle2)) {
+            CHECK((atoi(buf) & 7) == 5, "expected KERN_NOTICE (5), got %d: %s", atoi(buf) & 7, buf);
+            found++;
+        }
+    }
+    return found;
+}
+
+/*
+ * 3. Seccomp logged actions emit Linux-style audit: type=1326 records to guest klog, including
+ * SECCOMP_RET_USER_NOTIF when SECCOMP_FILTER_FLAG_LOG is set, and honor actions_logged.
+ */
+static void test_seccomp_klog_and_user_notif_log(void)
+{
+    int kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+    CHECK(kmsg >= 0 && lseek(kmsg, 0, SEEK_END) >= 0, "open kmsg");
+
+    char nr_needle[32];
+    snprintf(nr_needle, sizeof(nr_needle), "syscall=%d ", SYS_getppid);
+
+    /* A. SECCOMP_RET_LOG always logs to klog. */
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0, "nnp");
+        struct sc_sock_filter f[] = {
+            SC_STMT(SC_BPF_LD | SC_BPF_W | SC_BPF_ABS, offsetof(struct sc_seccomp_data, nr)),
+            SC_JUMP(SC_BPF_JMP | SC_BPF_JEQ | SC_BPF_K, SYS_getppid, 0, 1),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_LOG),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ALLOW),
+        };
+        struct sc_sock_fprog p = {4, f};
+        CHECK(syscall(SYS_seccomp, 1, 0, &p) == 0, "seccomp RET_LOG");
+        (void)syscall(SYS_getppid);
+        _exit(0);
+    }
+    wait_exit(pid, 0);
+    CHECK(find_kmsg_audit(kmsg, nr_needle, "code=0x7ffc0000") == 1, "RET_LOG kmsg");
+
+    /* B. SECCOMP_RET_ERRNO without FLAG_LOG does NOT log; with FLAG_LOG DOES log. */
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0, "nnp");
+        struct sc_sock_filter f[] = {
+            SC_STMT(SC_BPF_LD | SC_BPF_W | SC_BPF_ABS, offsetof(struct sc_seccomp_data, nr)),
+            SC_JUMP(SC_BPF_JMP | SC_BPF_JEQ | SC_BPF_K, SYS_getppid, 0, 1),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ERRNO | EPERM),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ALLOW),
+        };
+        struct sc_sock_fprog p = {4, f};
+        CHECK(syscall(SYS_seccomp, 1, 0, &p) == 0, "seccomp ERRNO no-log");
+        CHECK_ERR(syscall(SYS_getppid), EPERM, "ERRNO no-log");
+        _exit(0);
+    }
+    wait_exit(pid, 0);
+    CHECK(find_kmsg_audit(kmsg, nr_needle, "code=0x50000") == 0, "ERRNO without FLAG_LOG");
+
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0, "nnp");
+        struct sc_sock_filter f[] = {
+            SC_STMT(SC_BPF_LD | SC_BPF_W | SC_BPF_ABS, offsetof(struct sc_seccomp_data, nr)),
+            SC_JUMP(SC_BPF_JMP | SC_BPF_JEQ | SC_BPF_K, SYS_getppid, 0, 1),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ERRNO | EPERM),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ALLOW),
+        };
+        struct sc_sock_fprog p = {4, f};
+        CHECK(syscall(SYS_seccomp, 1, SC_FLAG_LOG, &p) == 0, "seccomp ERRNO FLAG_LOG");
+        CHECK_ERR(syscall(SYS_getppid), EPERM, "ERRNO FLAG_LOG");
+        _exit(0);
+    }
+    wait_exit(pid, 0);
+    CHECK(find_kmsg_audit(kmsg, nr_needle, "code=0x50000") == 1, "ERRNO with FLAG_LOG");
+
+    /* C. SECCOMP_RET_USER_NOTIF with FLAG_LOG logs to klog. */
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        close(sv[0]);
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0, "nnp");
+        struct sc_sock_filter f[] = {
+            SC_STMT(SC_BPF_LD | SC_BPF_W | SC_BPF_ABS, offsetof(struct sc_seccomp_data, nr)),
+            SC_JUMP(SC_BPF_JMP | SC_BPF_JEQ | SC_BPF_K, SYS_getppid, 0, 1),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_USER_NOTIF),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ALLOW),
+        };
+        struct sc_sock_fprog p = {4, f};
+        int l = (int)syscall(SYS_seccomp, 1, SC_FLAG_NEW_LISTENER | SC_FLAG_LOG, &p);
+        CHECK(l >= 0, "seccomp USER_NOTIF FLAG_LOG");
+        send_fd_over_unix(sv[1], l);
+        close(l);
+        close(sv[1]);
+        CHECK(syscall(SYS_getppid) == 55, "USER_NOTIF reply");
+        _exit(0);
+    }
+    close(sv[1]);
+    int lfd = recv_fd_over_unix(sv[0]);
+    close(sv[0]);
+    struct sc_notif n = {0};
+    CHECK(ioctl(lfd, SC_NOTIF_RECV, &n) == 0, "notif recv");
+    struct sc_notif_resp resp = {n.id, 55, 0, 0};
+    CHECK(ioctl(lfd, SC_NOTIF_SEND, &resp) == 0, "notif send");
+    close(lfd);
+    wait_exit(pid, 0);
+    CHECK(find_kmsg_audit(kmsg, nr_needle, "code=0x7fc00000") == 1, "USER_NOTIF with FLAG_LOG");
+
+    /* D. actions_logged suppresses disabled actions. */
+    write_str_file("/proc/sys/kernel/seccomp/actions_logged", "kill_process kill_thread\n");
+    pid = fork();
+    CHECK(pid >= 0, "fork");
+    if (pid == 0) {
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0, "nnp");
+        struct sc_sock_filter f[] = {
+            SC_STMT(SC_BPF_LD | SC_BPF_W | SC_BPF_ABS, offsetof(struct sc_seccomp_data, nr)),
+            SC_JUMP(SC_BPF_JMP | SC_BPF_JEQ | SC_BPF_K, SYS_getppid, 0, 1),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_LOG),
+            SC_STMT(SC_BPF_RET | SC_BPF_K, SC_RET_ALLOW),
+        };
+        struct sc_sock_fprog p = {4, f};
+        CHECK(syscall(SYS_seccomp, 1, 0, &p) == 0, "seccomp RET_LOG suppressed");
+        (void)syscall(SYS_getppid);
+        _exit(0);
+    }
+    wait_exit(pid, 0);
+    CHECK(find_kmsg_audit(kmsg, nr_needle, "code=0x7ffc0000") == 0, "RET_LOG suppressed");
+    write_str_file("/proc/sys/kernel/seccomp/actions_logged",
+                   "kill_process kill_thread trap errno user_notif trace log\n");
+    close(kmsg);
+}
+
+/*
+ * 4. MRS of unallocated CRm=0 and CRm=1 ID registers delivers SIGILL in both Tier 0 and Tier 1,
+ * while MIDR_EL1, MPIDR_EL1, and REVIDR_EL1 succeed.
+ */
+static void test_mrs_unallocated_id_regs_sigill(void)
+{
+    uint64_t midr = 0, mpidr = 0, revidr = 0x1234;
+    __asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    __asm__ volatile("mrs %0, s3_0_c0_c0_6" : "=r"(revidr)); /* REVIDR_EL1 */
+    (void)midr;
+    CHECK(mpidr == (1ULL << 31), "mpidr %#lx", (unsigned long)mpidr);
+    CHECK(revidr == 0, "revidr %#lx", (unsigned long)revidr);
+
+    const uint32_t bad_insns[] = {
+        0xd5380020U, /* mrs x0, s3_0_c0_c0_1 */
+        0xd53800e0U, /* mrs x0, s3_0_c0_c0_7 */
+        0xd5380100U, /* mrs x0, s3_0_c0_c1_0 */
+        0xd53801e0U, /* mrs x0, s3_0_c0_c1_7 */
+    };
+    for (size_t i = 0; i < sizeof(bad_insns) / sizeof(bad_insns[0]); i++) {
+        pid_t pid = fork();
+        CHECK(pid >= 0, "fork");
+        if (pid == 0) {
+            uint32_t *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            CHECK(code != MAP_FAILED, "mmap");
+            code[0] = bad_insns[i];
+            code[1] = 0xd65f03c0U; /* ret */
+            __builtin___clear_cache((char *)code, (char *)code + 8);
+            ((void (*)(void))code)();
+            _exit(0);
+        }
+        int st = 0;
+        CHECK(waitpid(pid, &st, 0) == pid, "waitpid");
+        CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGILL,
+              "insn %#x expected SIGILL, got status %#x", bad_insns[i], st);
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "--exec-helper") == 0) {
@@ -1432,6 +2022,10 @@ int main(int argc, char **argv)
     test_tty_job_control_ioctls();
     test_tty_output_clamp();
     test_zombie_leader_cpu_clock();
+    test_skipped_syscall_no_restart();
+    test_coredump_umask_fsize_suid_dumpable();
+    test_seccomp_klog_and_user_notif_log();
+    test_mrs_unallocated_id_regs_sigill();
 
     puts("all ok");
     return 0;

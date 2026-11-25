@@ -138,10 +138,15 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     }
     // seccomp: checked after the entry stop, as on arm64 Linux, including calls the tracer wants
     // skipped (-1). For calls not executed, x0 is already the return value (crate::seccomp)
+    let mut restart_syscall = false;
     if filtered {
         match crate::seccomp::check(cx, cpu, nr) {
             crate::seccomp::Verdict::Run(n) => nr = n,
             crate::seccomp::Verdict::Skip => nr = NO_SYSCALL,
+            crate::seccomp::Verdict::Restart => {
+                nr = NO_SYSCALL;
+                restart_syscall = true;
+            }
             crate::seccomp::Verdict::Exit => return Flow::Exit,
         }
     }
@@ -157,7 +162,13 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             return Flow::Exit;
         }
         crate::ptrace::syscall_stepped(cx);
-        return signal::deliver(cx, cpu, true);
+        // On arm64 Linux, `in_syscall(regs)` is false for `NO_SYSCALL` so a tracer or seccomp
+        // setting x0 to `-512..-516` must not rewind pc; only a signal-interrupted USER_NOTIF
+        // (`Verdict::Restart`) still applies syscall restart rules.
+        if !restart_syscall {
+            cx.task.sync.entry.forget_syscall(cpu.state());
+        }
+        return signal::deliver(cx, cpu, restart_syscall);
     }
     let mut a: [u64; 6] = cpu.state().x[..6].try_into().unwrap();
     // In a new pid namespace: pids in the arguments are translated to global numbers, and pids

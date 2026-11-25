@@ -4718,3 +4718,27 @@ fn concurrent_instances_update_spare_stats_independently() {
         w.join().unwrap();
     }
 }
+
+#[test]
+fn unallocated_id_registers_fault_in_tier1() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::new();
+        // REVIDR_EL1 (CRm=0, op2=6) reads 0 and proceeds to SVC.
+        g.cpu.state_mut().x[0] = 0xbeef;
+        g.code(CODE, &[0xd538_00c0, SVC]);
+        assert_eq!(g.run(&mut dbt), 0, "{regs:?}");
+
+        // Unallocated CRm=0 (op2=1) and CRm=1 (op2=0) must exit Undefined in Tier 1.
+        for insn in [0xd538_0020u32, 0xd538_0100u32] {
+            let mut g = Guest::new();
+            g.code(CODE, &[insn, SVC]);
+            g.cpu.state_mut().pc = CODE;
+            let exit = dbt.run(&mut g.cpu);
+            assert_eq!(exit, Exit::Undefined { insn }, "{regs:?} {insn:#x}");
+            assert_eq!(g.cpu.state().pc, CODE, "{regs:?} {insn:#x}");
+        }
+    }
+}

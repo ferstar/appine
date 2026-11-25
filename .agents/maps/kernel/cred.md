@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `capset` masks bits above `CAP_LAST_CAP`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: seccomp logs `audit: type=1326` records to guest `klog` including `USER_NOTIF` under `SECCOMP_FILTER_FLAG_LOG`; `dumpable` tracks `fs.suid_dumpable` 0/1/2)
 
 ## Responsibilities
 
@@ -44,7 +44,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   program, converted length, `allow` bitmap, original bytes, log and wait-killable flags, `prev`,
   user count, optional `Notif`); `Chain` (a thread's handle on its newest filter); `Notif`/
   `Knotif` (notification queue; states Init, Sent, Replied); `Listener` (the notify fd's object);
-  `Verdict` (`Run(nr)`, `Skip`, `Exit`). `Task::seccomp_on` and `seccomp_allow` are lock-free copies
+  `Verdict` (`Run(nr)`, `Skip`, `Restart`, `Exit`). `Task::seccomp_on` and `seccomp_allow` are lock-free copies
   for the fast path.
 
 ## Public entry points
@@ -85,13 +85,17 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   file's process info.
 - Set syscalls map guest ids through the caller's user namespace (`-1` means unchanged; unmapped
   `EINVAL`), apply Linux 6.1's rules with `capable_here` (`CAP_SETUID`/`CAP_SETGID` in the caller's
-  own namespace), and commit through `update`, which — like `commit_creds` — clears the process's
-  dumpable flag and the calling thread's pdeathsig when effective or filesystem ids change or
+  own namespace), and commit through `update`, which — like `commit_creds` — sets the process's
+  dumpable mode to `/proc/sys/fs/suid_dumpable` (0/1/2) and clears the calling thread's pdeathsig
+  when effective or filesystem ids change or
   permitted grows. The capability prctls commit without these side effects, as Linux's do not
   trigger them. `unshare(CLONE_NEWUSER)` (single-threaded only) replaces the credential without
-  them (as in Linux); `setns` into a user namespace clears `dumpable` and `pdeathsig` when the new
+  them (as in Linux); `setns` into a user namespace sets `dumpable` to `fs.suid_dumpable` and
+  clears `pdeathsig` when the new
   credentials' capabilities are not a subset of the old ones (`!new.caps_subset_of(&old)`, i.e.
-  entering a foreign user namespace, matching Linux's `commit_creds`).
+  entering a foreign user namespace, matching Linux's `commit_creds`). Both `0` (`SUID_DUMP_DISABLE`)
+  and `2` (`SUID_DUMP_ROOT`) leave `ThreadGroup.dumpable = false` so procfs ownership and ptrace
+  checks treat them as non-user-dumpable.
 - Capability fixups on uid changes (`cap_emulate_setxuid`, root meaning uid 0 of the credential's
   namespace): leaving root on all three uids clears permitted and effective unless `KEEP_CAPS`
   and always clears ambient; euid root → non-root clears effective, non-root → root sets
@@ -139,8 +143,9 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   ambient; `KEEP_CAPS` is cleared; secureexec = setid or (non-root real uid and (file effective or
   permitted ⊄ ambient)).
 - After the transition: secureexec sets `AT_SECURE` and caps the stack rlimit at 8 MB; dumpable is
-  cleared when ids differ or permitted grew, else set from whether the caller can read the program
-  file and its interpreter; pdeathsig is cleared in those cases. The address space's user namespace
+  set to `fs.suid_dumpable` when ids differ, permitted grew, or the caller cannot read the program
+  file or its interpreter, else set to `1` (`SUID_DUMP_USER`); pdeathsig is cleared on id/cap
+  changes or secureexec. The address space's user namespace
   (`ThreadGroup::mm_user_ns`, Linux's `mm->user_ns`, kept by fork) is the caller's, raised for a
   file it cannot read to the nearest ancestor where that file's owner and group are mapped
   (`UserNs::holding`, `would_dump`). A setuid or setgid program, or one whose file capabilities
@@ -201,8 +206,10 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   most severe action wins (ties: the newer filter). Actions: ERRNO (capped at 4095), TRAP (`SIGSYS`
   with syscall/arch/address), TRACE (`PTRACE_EVENT_SECCOMP` stop and re-check, or `ENOSYS` without
   a tracer), USER_NOTIF, LOG, ALLOW, KILL_THREAD (or KILL_PROCESS when it is the last live
-  thread), KILL_PROCESS and unknown actions (fatal `SIGSYS` with core dump). Logged actions go to
-  Appine's debug log only (stderr with `APPINE_LOG`); USER_NOTIF is never logged.
+  thread), KILL_PROCESS and unknown actions (fatal `SIGSYS` with core dump). Logged actions
+  (including `USER_NOTIF` and `TRACE` when `SECCOMP_FILTER_FLAG_LOG` is set, filtered by
+  `actions_logged`) emit Linux-style `audit: type=1326` records at `KERN_NOTICE` to the guest
+  kernel log (`klog`) in addition to Appine's host debug stderr (`APPINE_LOG`).
 - User notifications: the waiting thread is woken by replies, ends on fatal signals, and returns
   `ERESTARTSYS` on other signals (unless `WAIT_KILLABLE_RECV` and already received, where a signal
   costs one spurious wakeup before blocking again). RECV (zeroed struct, blocks even when
@@ -231,7 +238,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 - User namespaces and id maps (`kernel/ns`); `Stat` and modes (`kernel/store`); ptrace stops (`kernel/ptrace`),
   `signal::force`/`force_fatal` (`kernel/signal`); the vDSO stub check (`kernel/vdso`); fd tables; the kernel's
-  waits and wake objects; `appine_hal::fill_random` (notification ids); the debug log.
+  waits and wake objects; `appine_hal::fill_random` (notification ids); the guest kernel log (`klog`) and host debug log.
 
 ## Invariants and gotchas
 
@@ -248,9 +255,6 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ## Confirmed bugs / technical debt
 
-- **seccomp logging is incomplete.** Logged actions reach only Appine's debug stderr (not the guest
-  kernel log, where Linux's audit records appear without auditd), and USER_NOTIF is never logged
-  although `SECCOMP_FILTER_FLAG_LOG` asks for it.
 - **Errno order differences.** setgroups reports `EINVAL`/`EFAULT` before the permission check's
   `EPERM`; `PR_CAPBSET_DROP` beyond 40 is `EINVAL` before `EPERM`.
 

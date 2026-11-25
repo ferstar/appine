@@ -407,10 +407,11 @@ fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
         let old = cx.cred();
         let mut cred = old.clone();
         cred.enter_user_ns(ns);
-        // Linux's commit_creds clears dumpable and pdeathsig when entering a user namespace not
-        // owned by the caller's euid (!cred_cap_issubset(old, new))
+        // Linux's commit_creds sets dumpable to fs.suid_dumpable and clears pdeathsig when
+        // entering a user namespace not owned by the caller's euid (!cred_cap_issubset(old, new))
         if !cred.caps_subset_of(&old) {
-            cx.t.group.borrow_mut().dumpable = false;
+            let mode = crate::coredump::suid_dumpable(cx.kr());
+            cx.t.group.borrow_mut().set_dumpable_mode(mode);
             cx.task.pdeathsig.set(0);
         }
         cx.set_cred(cred);
