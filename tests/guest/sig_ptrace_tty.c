@@ -18,12 +18,15 @@
  * - TIOCSPGRP returns ESRCH for unknown pgid, checks EFAULT/EINVAL before ENOTTY, and returns
  *   ENOTTY (not EIO) for orphaned background callers;
  * - PTY slave writes clamp ONLCR and XTABS expansion to the 64 KiB output buffer limit;
+ * - opening /dev/tty (5:0) and /dev/console (5:1) preserves their device identity while routing
+ *   terminal operations to the controlling terminal;
  * - an exited (zombie) main thread's CPU clock remains readable and stopped until reaped.
  */
 #define _GNU_SOURCE
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
@@ -39,7 +42,9 @@
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -893,6 +898,199 @@ static int open_pty_pair(int *master_out, int *slave_out, int slave_flags)
     return 0;
 }
 
+static void check_fd_link(int fd, const char *expected)
+{
+    char proc_path[64], link_buf[128];
+    snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(proc_path, link_buf, sizeof(link_buf) - 1);
+    CHECK(n > 0, "readlink %s", proc_path);
+    link_buf[n] = '\0';
+    CHECK(strcmp(link_buf, expected) == 0, "readlink %s expected '%s', got '%s'", proc_path,
+          expected, link_buf);
+}
+
+static void check_ctty_identity(int fd, const char *path, unsigned int want_minor,
+                                const struct stat *path_st, const struct stat *pts_st)
+{
+    struct stat st;
+    CHECK(fstat(fd, &st) == 0, "fstat %s", path);
+    CHECK(S_ISCHR(st.st_mode), "%s fstat is char dev", path);
+    CHECK(major(st.st_rdev) == 5 && minor(st.st_rdev) == want_minor, "%s rdev is 5:%u (got %u:%u)",
+          path, want_minor, major(st.st_rdev), minor(st.st_rdev));
+    CHECK(st.st_dev == path_st->st_dev && st.st_dev != pts_st->st_dev, "%s st_dev matches /dev",
+          path);
+    CHECK(st.st_ino == path_st->st_ino && st.st_ino != pts_st->st_ino, "%s st_ino matches %s", path,
+          path);
+    CHECK(st.st_mode == path_st->st_mode, "%s st_mode matches", path);
+    CHECK(st.st_uid == path_st->st_uid && st.st_gid == path_st->st_gid, "%s owner matches", path);
+    check_fd_link(fd, path);
+    char *tn = ttyname(fd);
+    CHECK(tn && strcmp(tn, path) == 0, "ttyname %s (got %s)", path, tn ? tn : "(null)");
+    CHECK(isatty(fd) == 1, "isatty %s", path);
+}
+
+static void test_tty_device_identity(void)
+{
+    pid_t child = fork();
+    CHECK(child >= 0, "fork tty device identity");
+    if (child == 0) {
+        CHECK(setsid() > 0, "setsid");
+        /* Without a controlling terminal, opening /dev/tty or /dev/console fails with ENXIO. */
+        CHECK_ERR(open("/dev/tty", O_RDWR), ENXIO, "open /dev/tty without ctty");
+        CHECK_ERR(open("/dev/console", O_RDWR), ENXIO, "open /dev/console without ctty");
+
+        int m = -1, s = -1;
+        CHECK(open_pty_pair(&m, &s, O_RDWR) == 0, "open controlling tty");
+
+        unsigned int ptn = 9999;
+        CHECK(ioctl(m, TIOCGPTN, &ptn) == 0, "TIOCGPTN on master");
+        char pts_path[64];
+        snprintf(pts_path, sizeof(pts_path), "/dev/pts/%u", ptn);
+
+        struct stat pts_st, tty_path_st, con_path_st;
+        CHECK(fstat(s, &pts_st) == 0, "fstat pts slave");
+        CHECK(S_ISCHR(pts_st.st_mode), "pts slave is char dev");
+        CHECK(major(pts_st.st_rdev) == 136 && minor(pts_st.st_rdev) == ptn,
+              "pts slave rdev 136:%u", ptn);
+        CHECK(stat("/dev/tty", &tty_path_st) == 0, "stat /dev/tty");
+        CHECK(stat("/dev/console", &con_path_st) == 0, "stat /dev/console");
+
+        /* Opening /dev/tty preserves /dev/tty's device identity (5:0). */
+        int tty_fd = open("/dev/tty", O_RDWR);
+        CHECK(tty_fd >= 0, "open /dev/tty");
+        check_ctty_identity(tty_fd, "/dev/tty", 0, &tty_path_st, &pts_st);
+
+        /* statx(AT_EMPTY_PATH) agrees with fstat on /dev/tty. */
+        unsigned char stx[256];
+        memset(stx, 0, sizeof(stx));
+        CHECK(syscall(SYS_statx, tty_fd, "", AT_EMPTY_PATH, 0x7ffU, stx) == 0,
+              "statx /dev/tty");
+        uint64_t stx_ino;
+        uint32_t stx_rdev_maj, stx_rdev_min, stx_dev_maj, stx_dev_min;
+        memcpy(&stx_ino, stx + 32, sizeof(stx_ino));
+        memcpy(&stx_rdev_maj, stx + 128, sizeof(stx_rdev_maj));
+        memcpy(&stx_rdev_min, stx + 132, sizeof(stx_rdev_min));
+        memcpy(&stx_dev_maj, stx + 136, sizeof(stx_dev_maj));
+        memcpy(&stx_dev_min, stx + 140, sizeof(stx_dev_min));
+        CHECK(stx_ino == tty_path_st.st_ino && stx_rdev_maj == 5 && stx_rdev_min == 0 &&
+                  stx_dev_maj == major(tty_path_st.st_dev) &&
+                  stx_dev_min == minor(tty_path_st.st_dev),
+              "statx /dev/tty matches /dev/tty");
+
+        /* fstatfs and fdinfo on /dev/tty. */
+        struct statfs dev_sfs, tty_sfs;
+        CHECK(statfs("/dev/tty", &dev_sfs) == 0 && fstatfs(tty_fd, &tty_sfs) == 0 &&
+                  tty_sfs.f_type == dev_sfs.f_type,
+              "fstatfs /dev/tty matches /dev");
+
+        char proc_path[64];
+        snprintf(proc_path, sizeof(proc_path), "/proc/self/fdinfo/%d", tty_fd);
+        int fi = open(proc_path, O_RDONLY);
+        CHECK(fi >= 0, "open fdinfo for /dev/tty");
+        char fibuf[512];
+        ssize_t fn = read(fi, fibuf, sizeof(fibuf) - 1);
+        close(fi);
+        CHECK(fn > 0, "read fdinfo for /dev/tty");
+        fibuf[fn] = '\0';
+        char expected_ino[64];
+        snprintf(expected_ino, sizeof(expected_ino), "ino:\t%lu\n",
+                 (unsigned long)tty_path_st.st_ino);
+        CHECK(strstr(fibuf, expected_ino) != NULL, "fdinfo reports /dev/tty ino");
+
+        /* Master-only ioctl stays ENOTTY; job control and I/O route to the ctty. */
+        unsigned int dummy_ptn = 0;
+        CHECK_ERR(ioctl(tty_fd, TIOCGPTN, &dummy_ptn), ENOTTY, "TIOCGPTN on /dev/tty");
+        pid_t pg = 0, sid = 0;
+        CHECK(ioctl(tty_fd, TIOCGPGRP, &pg) == 0 && pg == getpgrp(), "TIOCGPGRP on /dev/tty");
+        CHECK(ioctl(tty_fd, TIOCGSID, &sid) == 0 && sid == getsid(0), "TIOCGSID on /dev/tty");
+
+        CHECK(write(m, "hi\n", 3) == 3, "master write to /dev/tty");
+        struct pollfd pf = {.fd = tty_fd, .events = POLLIN};
+        CHECK(poll(&pf, 1, 1000) == 1 && (pf.revents & POLLIN) != 0, "poll /dev/tty POLLIN");
+        char buf[32] = {0};
+        CHECK(read(tty_fd, buf, sizeof(buf)) == 3 && memcmp(buf, "hi\n", 3) == 0,
+              "read from /dev/tty");
+        CHECK(write(tty_fd, "yo", 2) == 2, "write to /dev/tty");
+        /* Drain echo ("hi\r\n") + "yo" from master. */
+        char mbuf[32] = {0};
+        size_t got = 0;
+        while (got < 6) {
+            ssize_t r = read(m, mbuf + got, sizeof(mbuf) - got);
+            CHECK(r > 0, "master read from /dev/tty");
+            got += (size_t)r;
+        }
+        CHECK(got == 6 && memcmp(mbuf + 4, "yo", 2) == 0, "master saw /dev/tty write");
+
+        /* fchmod on /dev/tty acts on /dev/tty, not /dev/pts/N. */
+        CHECK(fchmod(tty_fd, 0660) == 0, "fchmod /dev/tty");
+        struct stat after_tty, after_pts;
+        CHECK(stat("/dev/tty", &after_tty) == 0 && (after_tty.st_mode & 07777) == 0660,
+              "/dev/tty mode changed");
+        CHECK(stat(pts_path, &after_pts) == 0 && (after_pts.st_mode & 07777) == 0620,
+              "/dev/pts/N mode unchanged");
+        CHECK(fchmod(tty_fd, 0666) == 0, "restore /dev/tty mode");
+
+        /* Opening /dev/console preserves /dev/console's device identity (5:1). */
+        int con_fd = open("/dev/console", O_RDWR);
+        CHECK(con_fd >= 0, "open /dev/console");
+        check_ctty_identity(con_fd, "/dev/console", 1, &con_path_st, &pts_st);
+        CHECK(write(m, "ok\n", 3) == 3, "master write to /dev/console");
+        CHECK(read(con_fd, buf, sizeof(buf)) == 3 && memcmp(buf, "ok\n", 3) == 0,
+              "read from /dev/console");
+
+        /* Custom mknod 5:0 device node on rootfs keeps its identity across rename and unlink. */
+        CHECK(mkdir("/tmp", 0777) == 0 || errno == EEXIST, "mkdir /tmp");
+        const char *custom = "/tmp/custom_ctty";
+        const char *custom2 = "/tmp/custom_ctty2";
+        (void)unlink(custom);
+        (void)unlink(custom2);
+        CHECK(mknod(custom, S_IFCHR | 0640, makedev(5, 0)) == 0, "mknod custom 5:0");
+        struct stat custom_path_st;
+        CHECK(stat(custom, &custom_path_st) == 0, "stat custom 5:0");
+        int custom_fd = open(custom, O_RDWR);
+        CHECK(custom_fd >= 0, "open custom 5:0");
+        struct stat custom_st;
+        CHECK(fstat(custom_fd, &custom_st) == 0 && custom_st.st_ino == custom_path_st.st_ino &&
+                  custom_st.st_dev == custom_path_st.st_dev &&
+                  custom_st.st_dev != tty_path_st.st_dev &&
+                  major(custom_st.st_rdev) == 5 && minor(custom_st.st_rdev) == 0 &&
+                  (custom_st.st_mode & 07777) == 0640,
+              "fstat custom 5:0");
+        char *tn = ttyname(custom_fd);
+        CHECK(tn && strcmp(tn, custom) == 0, "ttyname custom 5:0");
+        CHECK(rename(custom, custom2) == 0, "rename custom 5:0");
+        check_fd_link(custom_fd, custom2);
+        CHECK(unlink(custom2) == 0, "unlink custom 5:0");
+        CHECK(fstat(custom_fd, &custom_st) == 0 && custom_st.st_nlink == 0 &&
+                  major(custom_st.st_rdev) == 5 && minor(custom_st.st_rdev) == 0,
+              "fstat unlinked custom 5:0");
+        check_fd_link(custom_fd, "/tmp/custom_ctty2 (deleted)");
+        close(custom_fd);
+
+        /* Direct /dev/pts/N slave still reports 136:N and /dev/pts/N. */
+        tn = ttyname(s);
+        CHECK(tn && strcmp(tn, pts_path) == 0, "ttyname pts slave (got %s)", tn ? tn : "(null)");
+        CHECK(fstat(s, &pts_st) == 0 && major(pts_st.st_rdev) == 136 &&
+                  minor(pts_st.st_rdev) == ptn,
+              "fstat pts slave still 136:%u", ptn);
+
+        /* After master close (hangup), /dev/tty reads EOF and still stats as 5:0. */
+        CHECK(signal(SIGHUP, SIG_IGN) != SIG_ERR, "ignore SIGHUP before hangup");
+        close(m);
+        CHECK(read(tty_fd, buf, sizeof(buf)) == 0, "hung /dev/tty reads EOF");
+        struct stat tty_st;
+        CHECK(fstat(tty_fd, &tty_st) == 0 && major(tty_st.st_rdev) == 5 &&
+                  minor(tty_st.st_rdev) == 0 && tty_st.st_ino == tty_path_st.st_ino,
+              "hung /dev/tty keeps 5:0 fstat");
+
+        close(con_fd);
+        close(tty_fd);
+        close(s);
+        _exit(0);
+    }
+    wait_exit(child, 0);
+}
+
 static void test_tty_exclusive(void)
 {
     pid_t child = fork();
@@ -1229,6 +1427,7 @@ int main(int argc, char **argv)
     test_ptrace_event_exit_on_exit_group();
     test_ptrace_event_exit_on_nonleader_execve(self);
     test_process_vm_zero_remote();
+    test_tty_device_identity();
     test_tty_exclusive();
     test_tty_job_control_ioctls();
     test_tty_output_clamp();

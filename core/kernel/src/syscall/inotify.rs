@@ -849,7 +849,7 @@ fn file_key(f: &OpenFile) -> Option<(Ino, u32)> {
         FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
             Some((f.ovl.map_or(*ino, overlay::key), 0))
         }
-        FileKind::Pipe(_) => Some((key_of(&f.node()?)?, 0)),
+        FileKind::Pipe(_) | FileKind::Pty(_) => Some((key_of(&f.node()?)?, 0)),
         FileKind::Directory { node, .. } => Some((key_of(node)?, IN_ISDIR)),
         FileKind::Fuse(h) => Some((crate::vfs::fuse::key(h.id), 0)),
         _ => None,

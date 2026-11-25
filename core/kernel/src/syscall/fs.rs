@@ -671,11 +671,12 @@ fn open_path_with(
             Node::Fuse(mnt, f) => super::fuse::open(cx, &cred, &vfs, (mnt, f), flags)?,
         }
     };
-    // A device node like /dev/tty opens a specific slave: its path is the one in devpts (fd links
-    // are computed by the mount reached through); the master, and slaves opened through devpts,
-    // keep the opened path as usual
+    // A 136:N device node outside devpts opens a specific slave: its path is the one in devpts
+    // (fd links are computed by the mount reached through); /dev/tty and /dev/console (5:0 and
+    // 5:1), the master, and slaves opened through devpts keep the opened path as usual
     if let FileKind::Pty(end) = &kind
         && !end.master
+        && end.dev_ino.is_none()
         && !via_devpts
     {
         display = None;
@@ -686,6 +687,7 @@ fn open_path_with(
                 kind,
                 FileKind::Regular { .. } | FileKind::Device { .. } | FileKind::Pipe(_)
             )
+            || matches!(&kind, FileKind::Pty(end) if end.dev_ino.is_some())
     });
     let file = OpenFile::with_path(kind, flags & kept(flags) | largefile(flags), display);
     {
@@ -1444,7 +1446,7 @@ fn open_store_with(
         }
         mode::S_IFCHR => match st.rdev {
             // /dev/tty, /dev/console: the caller's controlling terminal
-            r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx)?,
+            r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx, ino)?,
             PTMX_RDEV => {
                 let (fs, m) = devpts_beside(vfs, beside)?;
                 tty::open_ptmx(cx.k(), (fs, m, false), (cred.fsuid, cred.fsgid))?
@@ -6711,7 +6713,7 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
             let q = q.borrow();
             Ok(encode_stat(&q.stat(), cx.vfs()?.mq_dev(q.ns)))
         }
-        FileKind::Pty(end) => {
+        FileKind::Pty(end) if end.dev_ino.is_none() => {
             let t = end.tty.borrow();
             let st = Stat {
                 ino: pseudo::ino_of(&PseudoNode::Pts(t.fs, t.index)),
@@ -6833,8 +6835,8 @@ pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
         (_, Some(Node::Store(_, ino))) => (ROOT_DEV, ino),
         (FileKind::Pipe(end), None) => (PIPE_DEV, end.pipe.borrow().ino),
         (FileKind::Socket(s), _) => (SOCK_DEV, pseudo::socket_ino(s)),
-        (FileKind::Pty(end), _) if end.master => (ROOT_DEV, 2),
-        (FileKind::Pty(end), _) => {
+        (FileKind::Pty(end), None) if end.master => (ROOT_DEV, 2),
+        (FileKind::Pty(end), None) => {
             let t = end.tty.borrow();
             (t.fs, pseudo::ino_of(&PseudoNode::Pts(t.fs, t.index)))
         }
@@ -8004,7 +8006,9 @@ impl Attrs {
         let file = cx.fds().get(fd)?;
         let f = file.borrow();
         match &f.kind {
-            FileKind::Pty(end) if !end.master && f.flags & oflags::O_PATH == 0 => {
+            FileKind::Pty(end)
+                if !end.master && end.dev_ino.is_none() && f.flags & oflags::O_PATH == 0 =>
+            {
                 return Ok(Attrs::Pts(end.tty.clone()));
             }
             FileKind::Socket(_) => return Ok(Attrs::Anon),

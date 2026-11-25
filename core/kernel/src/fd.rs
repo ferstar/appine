@@ -427,15 +427,16 @@ impl OpenFile {
             .is_some_and(crate::syscall::Opened::is_unlinked)
     }
 
-    /// The corresponding filesystem node (host fds, anonymous pipes and PTYs have none).
+    /// The corresponding filesystem node (host fds, anonymous pipes and devpts/master PTYs have
+    /// none; `/dev/tty` and `/dev/console` keep their device node).
     pub fn node(&self) -> Option<Node> {
         if let Some(o) = self.ovl {
             return Some(Node::Overlay(self.mnt, o));
         }
         match &self.kind {
             FileKind::Pipe(end) => end.pipe.borrow().fifo.map(|ino| Node::Store(self.mnt, ino)),
+            FileKind::Pty(end) => end.dev_ino.map(|ino| Node::Store(self.mnt, ino)),
             FileKind::Host(_)
-            | FileKind::Pty(_)
             | FileKind::Socket(_)
             | FileKind::Epoll(_)
             | FileKind::EventFd(_)

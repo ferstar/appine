@@ -182,11 +182,12 @@ pub(crate) fn open_peer(
     Ok(cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)? as u64)
 }
 
-/// Opens `/dev/tty`: the caller's controlling terminal.
-pub(crate) fn open_ctty(cx: &mut Cx<'_>) -> Result<FileKind, Errno> {
+/// Opens `/dev/tty` (5:0) or `/dev/console` (5:1): the caller's controlling terminal, keeping the
+/// opened device node `ino` for metadata and procfs identity.
+pub(crate) fn open_ctty(cx: &mut Cx<'_>, ino: crate::vfs::store::Ino) -> Result<FileKind, Errno> {
     let tty = cx.t.group.borrow().ctty.clone().ok_or(Errno::ENXIO)?;
     check_reopen(cx, &tty.borrow())?;
-    Ok(FileKind::Pty(PtyEnd::new(tty, false)))
+    Ok(FileKind::Pty(PtyEnd::new(tty, false).with_device(ino)))
 }
 
 fn check_reopen(cx: &Cx<'_>, tty: &Tty) -> Result<(), Errno> {

@@ -1606,6 +1606,10 @@ impl Tty {
 /// One end of a PTY, held by an open file; opening and closing maintain the counts of both ends.
 pub struct PtyEnd {
     pub tty: Rc<RefCell<Tty>>,
+    /// The opened device node's store inode when opened through `/dev/tty` (5:0) or
+    /// `/dev/console` (5:1): `fstat`, attribute syscalls, `fstatfs`, `/proc/<pid>/fd` and
+    /// `fdinfo` see that device node instead of the underlying devpts slave.
+    pub(crate) dev_ino: Option<crate::vfs::store::Ino>,
     /// The opened device node's lock key. Direct devpts opens use the instance and inode instead.
     pub(crate) lock_ino: Option<crate::vfs::store::Ino>,
     /// Whether this is the master.
@@ -1637,12 +1641,20 @@ impl PtyEnd {
         };
         PtyEnd {
             tty,
+            dev_ino: None,
             master,
             mnt: crate::vfs::PTS_MOUNT,
             pin: false,
             lock_ino: None,
             born,
         }
+    }
+
+    /// Opened through a controlling-terminal device node (`/dev/tty` or `/dev/console`) in the
+    /// store (or behind an overlay node).
+    pub fn with_device(mut self, ino: crate::vfs::store::Ino) -> PtyEnd {
+        self.dev_ino = Some(ino);
+        self
     }
 
     /// Opened through devpts mount `mnt`; with `pin`, the open file is in that mount.

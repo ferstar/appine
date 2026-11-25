@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: enforce per-end exclusivity on slave reopens and support path-only peer opens)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: preserve `/dev/tty` and `/dev/console` device identity on controlling-terminal opens)
 
 ## Responsibilities
 
@@ -45,7 +45,10 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - `Echo` — one echo operation of Linux's echo buffer: a character through output processing, a
   `^X` pair, backspaces over an erased tab, setting the line's start column, one column back.
 - `PtyEnd` — one open end: the `Tty`, master flag, mount, `pin` (keeps the devpts mount busy),
-  the optional store or overlay device-node lock key, and `born` (the side's vhangup generation at open). Opening and dropping it maintain the counts (and
+  the optional controlling-terminal store device inode (`dev_ino`, set for `/dev/tty` 5:0 and
+  `/dev/console` 5:1 so metadata, `fstatfs`, `/proc/<pid>/fd` and `fdinfo` see the opened device
+  node rather than the devpts slave), the optional store or overlay device-node lock key, and
+  `born` (the side's vhangup generation at open). Opening and dropping it maintain the counts (and
   opening a slave re-arms the slave side's vhangup); dropping the last master queues the terminal
   on `CLOSED`, and every drop wakes the terminal's waiters.
 - `Termios` — kernel termios2 layout (four flag words, line, 19 control characters, input and
@@ -90,9 +93,12 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   `EBUSY`; locked or no master gives `EIO`; without `O_NOCTTY` a session
   leader without a controlling terminal acquires an unowned terminal when the open has read
   access (Job control below).
-- `/dev/tty` and `/dev/console` both open the caller's controlling terminal as a slave end through
-  the boot devpts mount (`ENXIO` without one), with the same exclusivity check. They skip the lock and
-  master checks and never acquire one.
+- `/dev/tty` and `/dev/console` both open the caller's controlling terminal as a slave end
+  (`ENXIO` without one), with the same exclusivity check, keeping the opened store (or overlay)
+  device node (`dev_ino`, plus `OpenFile::mnt`/`ovl`/`path`) so `fstat`/`statx`,
+  `fchmod`/`fchown`/`futimens`, `fstatfs`, `/proc/<pid>/fd` and `fdinfo` report the opened 5:0 or
+  5:1 device node rather than `/dev/pts/N` (and keep its mount busy, not devpts). They skip the
+  lock and master checks and never acquire one.
 
 ### Input (master writes, host console feed)
 
@@ -358,10 +364,6 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 ## Confirmed bugs / technical debt
 
-- **`/dev/tty` cannot be told apart from the slave it opens:** the descriptor is a plain slave end,
-  so fstat reports the pts device (136:N, with the devpts inode and owner) instead of 5:0 (5:1 for
-  `/dev/console`); programs that recognise the controlling-terminal device by its number see a
-  different device than on Linux.
 - **Fidelity gaps:** `IMAXBEL`, break handling, `HUPCL` and `VDISCARD` are not implemented;
   `TIOCGETD` is always 0 and `TIOCGDEV` is `ENOTTY`;
   `FIONREAD` and `TIOCOUTQ` on the master count the whole output queue; flow-control characters
@@ -371,8 +373,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 ## Open questions
 
 - Is mapping `/dev/console` to the caller's controlling terminal (rather than a system console)
-  intended, and should an fd opened through `/dev/tty` for a terminal of another devpts instance
-  carry the boot mount?
+  intended?
 - Should a console's end of session be its leader's exit rather than its last slave closing (a
   background job holding the terminal keeps a tab open)?
 
