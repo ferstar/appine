@@ -883,14 +883,10 @@ impl FdTable {
             .ok_or(Errno::EMFILE)
     }
 
-    /// Takes the lowest free fd in `range` for a file to be made later (accept4 before it
-    /// waits), until [`fill`](Self::fill) or [`unreserve`](Self::unreserve).
-    pub fn reserve(&mut self, range: Range<usize>) -> Result<i32, Errno> {
-        self.reserve_capped(range, MAX_FDS)
-    }
-
-    /// Reserves the lowest free fd in `range`, respecting `nr_open` when expanding the table.
-    pub fn reserve_capped(&mut self, range: Range<usize>, nr_open: usize) -> Result<i32, Errno> {
+    /// Takes the lowest free fd in `range` for a file to be made later (accept4 before it waits,
+    /// or AF_UNIX `SCM_RIGHTS` delivery), respecting `nr_open` when expanding the table, until
+    /// [`fill`](Self::fill) or [`unreserve`](Self::unreserve).
+    pub fn reserve(&mut self, range: Range<usize>, nr_open: usize) -> Result<i32, Errno> {
         let fd = self.free_slot(range)?;
         self.grow_for(fd as usize, nr_open)?;
         if self.slots.len() <= fd as usize {
@@ -1145,7 +1141,7 @@ mod tests {
         parent
             .install_at(100, file.clone(), false, DEFAULT_NOFILE.0)
             .unwrap();
-        parent.reserve(200..DEFAULT_NOFILE.0).unwrap();
+        parent.reserve(200..DEFAULT_NOFILE.0, MAX_FDS).unwrap();
         let child = parent.clone();
         assert_eq!(child.capacity(), 256);
         assert_eq!(child.free_slot(200..DEFAULT_NOFILE.0), Ok(200));
@@ -1170,7 +1166,7 @@ mod tests {
     fn reserved_fds() {
         let mut t = FdTable::with_host_stdio();
         let f = OpenFile::new(FileKind::Host(1), oflags::O_WRONLY);
-        assert_eq!(t.reserve(0..DEFAULT_NOFILE.0), Ok(3));
+        assert_eq!(t.reserve(0..DEFAULT_NOFILE.0, MAX_FDS), Ok(3));
         assert_eq!(t.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(4));
         assert_eq!(t.get(3).err(), Some(Errno::EBADF));
         assert_eq!(t.close(3).err(), Some(Errno::EBADF));
@@ -1183,7 +1179,7 @@ mod tests {
         assert_eq!(child.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(3));
         t.fill(3, f.clone(), true);
         assert_eq!(t.cloexec(3), Ok(true));
-        assert_eq!(t.reserve(0..DEFAULT_NOFILE.0), Ok(5));
+        assert_eq!(t.reserve(0..DEFAULT_NOFILE.0, MAX_FDS), Ok(5));
         t.unreserve(5);
         assert_eq!(t.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(5));
     }
@@ -1210,7 +1206,14 @@ mod tests {
             t.install_capped(f.clone(), false, 192..4096, 192),
             Err(Errno::EMFILE)
         );
-        assert_eq!(t.reserve_capped(192..4096, 192), Err(Errno::EMFILE));
+        assert_eq!(t.reserve(192..4096, 192), Err(Errno::EMFILE));
+        // Reserve itself also caps expansion at nr_open and leaves no reservation on EMFILE.
+        let mut r = FdTable::with_host_stdio();
+        assert_eq!(r.reserve(150..4096, 192), Ok(150));
+        assert_eq!(r.capacity(), 192);
+        assert_eq!(r.reserve(192..4096, 192), Err(Errno::EMFILE));
+        assert_eq!(r.capacity(), 192);
+        assert_eq!(r.free_slot(192..4096), Ok(192));
         // Slot 191 still fits within the already-expanded capacity (192).
         assert_eq!(t.install_capped(f.clone(), false, 191..4096, 192), Ok(191));
         assert_eq!(t.capacity(), 192);

@@ -1365,6 +1365,11 @@ impl<'a> Cx<'a> {
             .install_capped(file, cloexec, 0..self.nofile(), self.kr().nr_open)
     }
 
+    /// Reserves a new descriptor for the calling process.
+    pub fn reserve_fd(&self) -> Result<i32, Errno> {
+        self.fds_mut().reserve(0..self.nofile(), self.kr().nr_open)
+    }
+
     /// fd table.
     pub fn fds(&self) -> Ref<'_, FdTable> {
         self.t.fds.borrow()

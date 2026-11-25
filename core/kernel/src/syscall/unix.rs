@@ -946,7 +946,7 @@ fn deliver(
         let mut files = r.fds.into_iter();
         let mut dropped = Vec::new();
         for file in files.by_ref().take(fit) {
-            let Ok(fd) = cx.fds_mut().reserve(0..cx.nofile()) else {
+            let Ok(fd) = cx.reserve_fd() else {
                 dropped.push(file);
                 break;
             };
@@ -1198,4 +1198,213 @@ fn block(
         });
     }
     cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(on)])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::fd::{FdTable, FileKind, OpenFile, oflags};
+    use crate::kernel::{Kernel, Shared};
+    use crate::mm::Mm;
+    use crate::process::{RLIMIT_NOFILE, ThreadGroup, Tier};
+    use crate::signal::SigHandlers;
+    use crate::task::{FsContext, Task, TaskState};
+    use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+    #[test]
+    fn accept4_and_scm_rights_respect_lowered_nr_open() {
+        let shared = Arc::new(Shared::new(Kernel::new(Tier::Interpreter)));
+        let _cpu = {
+            let mut k = shared.lock();
+            let group = Rc::new(RefCell::new(ThreadGroup::new(
+                10,
+                1,
+                Rc::new(RefCell::new(SigHandlers::default())),
+            )));
+            group.borrow_mut().rlimits[RLIMIT_NOFILE as usize] = (4096, 4096);
+            let mm = Mm::new().into_shared();
+            let fds = Rc::new(RefCell::new(FdTable::with_host_stdio()));
+            let fs = Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: Rc::new(MntNs {
+                    id: INIT_MNT_NS,
+                    owner: crate::cred::UserNs::init(),
+                    anon: false,
+                }),
+            }));
+            let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+            let sem_undo = Rc::new(crate::ipc::SemUndo::new());
+            let make_state = || TaskState {
+                mm: mm.clone(),
+                fds: fds.clone(),
+                fs: fs.clone(),
+                group: group.clone(),
+                vfs: None,
+                altstack: Default::default(),
+                clear_child_tid: 0,
+                vfork_done: None,
+                restart: None,
+                fast_sleep: None,
+                sem_undo: sem_undo.clone(),
+            };
+            let task =
+                Task::new(10, 10, &cpu, make_state(), k.init_ns.clone(), 0, [0; 16]).unwrap();
+            group.borrow_mut().threads.push(10);
+            k.groups.insert(10, group.clone());
+            k.tasks.insert(10, task.clone());
+
+            let mut t = make_state();
+            let mut cx = Cx::new(&shared, k, &task, &mut t);
+
+            // Set up a listening AF_UNIX stream socket with two pending client connections.
+            let srv: SocketRef = Rc::new(RefCell::new(socket(SOCK_STREAM, 0).unwrap()));
+            let mut addr = (AF_UNIX as u16).to_le_bytes().to_vec();
+            addr.extend_from_slice(b"\0nr-open-reserve-test");
+            bind(&mut cx, &srv, &addr).unwrap();
+            with(&srv, |u| listen(u, 4, cx.ucred())).unwrap();
+            let srv_fd = cx
+                .install_fd(OpenFile::new(FileKind::Socket(srv), oflags::O_RDWR), true)
+                .unwrap();
+
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let cli: SocketRef = Rc::new(RefCell::new(socket(SOCK_STREAM, 0).unwrap()));
+                connect(&mut cx, &cli, true, &addr).unwrap();
+                clients.push(cli);
+            }
+
+            // Lower nr_open to 64 while RLIMIT_NOFILE stays 4096, and occupy all slots 0..64.
+            cx.k().nr_open = 64;
+            let filler = cx.fds().get(1).unwrap();
+            let mut spare = -1;
+            for fd in 0..64 {
+                if cx.fds().get(fd).is_err() {
+                    let installed = cx.install_fd(filler.clone(), true).unwrap();
+                    assert_eq!(installed, fd);
+                    spare = fd;
+                }
+            }
+            assert!(spare >= 0);
+            assert_eq!(cx.fds().capacity(), 64);
+
+            // accept4 must fail with EMFILE and keep table capacity at 64.
+            assert_eq!(
+                super::super::net::accept4(
+                    &mut cx,
+                    srv_fd,
+                    0,
+                    0,
+                    oflags::O_NONBLOCK | oflags::O_CLOEXEC
+                ),
+                Err(Errno::EMFILE)
+            );
+            assert_eq!(cx.fds().capacity(), 64);
+
+            // SCM_RIGHTS with 0 free slots < 64 sets MSG_CTRUNC and delivers no descriptors.
+            let msg = deliver(
+                &mut cx,
+                Received {
+                    data: vec![b'x'],
+                    len: 1,
+                    fds: vec![filler.clone(), filler.clone()],
+                    cred: Ucred::UNSTAMPED,
+                    from: Vec::new(),
+                },
+                false,
+                false,
+                64,
+            );
+            assert_ne!(msg.flags & MSG_CTRUNC, 0);
+            assert!(msg.control.is_empty());
+            assert!(msg.rights.is_none());
+            assert_eq!(cx.fds().capacity(), 64);
+
+            // Free one slot below 64: SCM_RIGHTS reserves that slot and truncates the second fd.
+            cx.fds_mut().close(spare).unwrap();
+            let msg = deliver(
+                &mut cx,
+                Received {
+                    data: vec![b'y'],
+                    len: 1,
+                    fds: vec![filler.clone(), filler.clone()],
+                    cred: Ucred::UNSTAMPED,
+                    from: Vec::new(),
+                },
+                false,
+                false,
+                64,
+            );
+            assert_ne!(msg.flags & MSG_CTRUNC, 0);
+            assert_eq!(msg.control.len(), CMSG_HDR + 4 + 4); // 16-byte header + 1 fd + 4-byte align
+            assert_eq!(
+                i32::from_le_bytes(msg.control[CMSG_HDR..CMSG_HDR + 4].try_into().unwrap()),
+                spare
+            );
+            assert_eq!(cx.fds().capacity(), 64);
+            // Dropping PendingRights unreserves `spare` cleanly.
+            drop(msg.rights);
+            assert_eq!(cx.fds().get(64).err(), Some(Errno::EBADF));
+
+            // Now accept4 succeeds in `spare` without expanding past 64.
+            assert_eq!(
+                super::super::net::accept4(
+                    &mut cx,
+                    srv_fd,
+                    0,
+                    0,
+                    oflags::O_NONBLOCK | oflags::O_CLOEXEC
+                ),
+                Ok(spare as u64)
+            );
+            assert_eq!(cx.fds().capacity(), 64);
+
+            // Expanding across 128 with nr_open = 192 caps capacity at 192 (not 256) for both
+            // accept4 and SCM_RIGHTS.
+            cx.k().nr_open = 192;
+            for fd in 64..128 {
+                assert_eq!(cx.install_fd(filler.clone(), true), Ok(fd));
+            }
+            assert_eq!(cx.fds().capacity(), 128);
+            assert_eq!(
+                super::super::net::accept4(
+                    &mut cx,
+                    srv_fd,
+                    0,
+                    0,
+                    oflags::O_NONBLOCK | oflags::O_CLOEXEC
+                ),
+                Ok(128)
+            );
+            assert_eq!(cx.fds().capacity(), 192);
+
+            for fd in 129..192 {
+                assert_eq!(cx.install_fd(filler.clone(), true), Ok(fd));
+            }
+            let msg = deliver(
+                &mut cx,
+                Received {
+                    data: vec![b'z'],
+                    len: 1,
+                    fds: vec![filler.clone()],
+                    cred: Ucred::UNSTAMPED,
+                    from: Vec::new(),
+                },
+                false,
+                false,
+                64,
+            );
+            assert_ne!(msg.flags & MSG_CTRUNC, 0);
+            assert!(msg.control.is_empty());
+            assert!(msg.rights.is_none());
+            assert_eq!(cx.fds().capacity(), 192);
+
+            drop(clients);
+            drop(cx);
+            cpu
+        };
+    }
 }

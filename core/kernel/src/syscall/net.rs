@@ -819,7 +819,7 @@ pub(super) fn accept4(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, flags: 
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
     }
-    let newfd = cx.fds_mut().reserve(0..cx.nofile())?;
+    let newfd = cx.reserve_fd()?;
     let accepted = (|| {
         let (_file, sock, nonblock) = socket_of(cx, fd)?;
         let (new, peer) = if is_unix(&sock) {

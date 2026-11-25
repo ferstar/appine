@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: check `sb_permission` (`EROFS`) before DAC permission on read-only instances and cap fd-table growth at `nr_open`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cap `FdTable::reserve` (`accept4` and `SCM_RIGHTS`) against `nr_open` alongside `install_capped`/`install_at_capped`)
 
 ## Responsibilities
 
