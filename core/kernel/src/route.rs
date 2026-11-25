@@ -54,10 +54,13 @@ const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 const RTA_PRIORITY: u16 = 6;
 const RTA_PREFSRC: u16 = 7;
+const RTA_FLOW: u16 = 11;
 const RTA_CACHEINFO: u16 = 12;
 const RTA_TABLE: u16 = 15;
+const RTA_MARK: u16 = 16;
 const RTA_PREF: u16 = 20;
 const RTA_UID: u16 = 25;
+const RTA_SPORT: u16 = 30;
 /// rtm_flags: `ip route get`'s answer is an entry in the route cache; the matched route itself is
 /// what is asked for.
 const RTM_F_CLONED: u32 = 0x200;
@@ -363,27 +366,55 @@ pub(crate) fn get(
     host_ok: bool,
     ip_forward: impl Fn(u32) -> bool,
     route_localnet: impl Fn(u32) -> bool,
-) -> Result<Vec<u8>, i32> {
+) -> Result<Vec<u8>, (i32, Option<&'static str>)> {
     const EINVAL: i32 = 22;
+    const ERANGE: i32 = 34;
     const EOPNOTSUPP: i32 = 95;
     const ENETUNREACH: i32 = 101;
-    let family = *req.get(16).ok_or(EINVAL)? as i32;
-    let flags = u32::from_le_bytes(req.get(24..28).ok_or(EINVAL)?.try_into().unwrap());
+    const BAD_ATTR: (i32, Option<&'static str>) =
+        (ERANGE, Some("Attribute failed policy validation"));
+    let family = *req.get(16).ok_or((EINVAL, None))? as i32;
     let len = match family {
         AF_INET => 4,
         AF_INET6 => 16,
-        _ => return Err(EOPNOTSUPP),
+        _ => return Err((EOPNOTSUPP, None)),
+    };
+    let flags_bytes = req.get(24..28).ok_or((
+        EINVAL,
+        Some(if family == AF_INET {
+            "ipv4: Invalid header for route get request"
+        } else {
+            "ipv6: Invalid header for route get request"
+        }),
+    ))?;
+    let flags = u32::from_le_bytes(flags_bytes.try_into().unwrap());
+    let addr_err = if family == AF_INET {
+        BAD_ATTR
+    } else {
+        (EINVAL, None)
     };
     let (mut dst, mut src, mut iif) = (vec![0u8; len], None, None);
+    // Mirror Linux's rtm_ipv4_policy / rtm_ipv6_policy (leading bytes accepted on oversized
+    // RTA_DST/RTA_SRC; IPv4 short attrs and u32s return ERANGE, IPv6 short DST/SRC return EINVAL).
     for (ty, data) in attrs(&req[28..]) {
-        match ty {
-            RTA_DST if data.len() == len => dst = data.to_vec(),
-            RTA_SRC if data.len() == len => src = Some(data.to_vec()),
-            RTA_IIF if data.len() == 4 => {
-                let idx = i32::from_le_bytes(data.try_into().unwrap());
+        match (family, ty) {
+            (_, RTA_DST) => dst = data.get(..len).ok_or(addr_err)?.to_vec(),
+            (_, RTA_SRC) => src = Some(data.get(..len).ok_or(addr_err)?.to_vec()),
+            (_, RTA_IIF) => {
+                let b = data.get(..4).ok_or(BAD_ATTR)?;
+                let idx = i32::from_le_bytes(b.try_into().unwrap());
                 if idx != 0 {
                     iif = Some(idx);
                 }
+            }
+            (_, RTA_OIF | RTA_PRIORITY | RTA_TABLE | RTA_MARK | RTA_UID) | (AF_INET, RTA_FLOW)
+                if data.len() < 4 =>
+            {
+                return Err(BAD_ATTR);
+            }
+            (_, RTA_GATEWAY | RTA_PREFSRC) if data.len() < len => return Err(BAD_ATTR),
+            (_, RTA_SPORT) if data.len() != 2 => {
+                return Err((EINVAL, Some("invalid attribute length")));
             }
             _ => {}
         }
@@ -405,7 +436,8 @@ pub(crate) fn get(
             lo,
             ip_forward,
             route_localnet,
-        );
+        )
+        .map_err(|e| (e, None));
     }
     // The matched route, output interface, source address, and the cache entry's rt_flags
     let (route, oif, saddr, rt_flags) = match local_hit {
@@ -435,7 +467,7 @@ pub(crate) fn get(
                 .is_some_and(|e| !e.host) =>
         {
             let route = longest_match(of_family().filter(|e| e.table == RT_TABLE_MAIN), &dst)
-                .ok_or(ENETUNREACH)?
+                .ok_or((ENETUNREACH, None))?
                 .clone();
             let saddr = match &src {
                 Some(s) => s.clone(),
@@ -443,7 +475,7 @@ pub(crate) fn get(
                     .prefsrc
                     .clone()
                     .or_else(|| select_source(ifaces, &route, &dst))
-                    .ok_or(ENETUNREACH)?,
+                    .ok_or((ENETUNREACH, None))?,
             };
             let index = route.index;
             (route, index, Some(saddr), 0)
@@ -451,7 +483,7 @@ pub(crate) fn get(
         _ => {
             let saddr = match &src {
                 Some(s) => s.clone(),
-                None => appine_hal::net::source_for(&dst)?,
+                None => appine_hal::net::source_for(&dst).map_err(|e| (e, None))?,
             };
             let out = owner(ifaces, &saddr);
             let matched = longest_match(
@@ -485,7 +517,7 @@ pub(crate) fn get(
                     flags: 0,
                     host: true,
                 },
-                (None, None) => return Err(ENETUNREACH),
+                (None, None) => return Err((ENETUNREACH, None)),
             };
             // Multicast: this machine is always in the all-hosts group (224.0.0.1); for other
             // groups whether it joined cannot be told
@@ -716,8 +748,11 @@ fn get_input(
     Ok(p)
 }
 
+/// One parsed netlink attribute: `(type, payload)`.
+pub(crate) type Attr<'a> = (u16, &'a [u8]);
+
 /// The attributes in a message: (type, payload).
-pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
+pub(crate) fn attrs(mut b: &[u8]) -> Vec<Attr<'_>> {
     let mut out = Vec::new();
     while b.len() >= 4 {
         let len = u16::from_le_bytes([b[0], b[1]]) as usize;
@@ -728,6 +763,25 @@ pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
         b = &b[len.next_multiple_of(4).min(b.len())..];
     }
     out
+}
+
+/// Strictly parses netlink attributes (Linux's `nla_parse_deprecated_strict`): rejects malformed
+/// lengths and leftover trailing bytes with `EINVAL`.
+pub(crate) fn attrs_strict(mut b: &[u8]) -> Result<Vec<Attr<'_>>, (i32, &'static str)> {
+    const LEFTOVER: (i32, &str) = (22, "bytes leftover after parsing attributes");
+    let mut out = Vec::new();
+    while b.len() >= 4 {
+        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+        if len < 4 || len > b.len() {
+            return Err(LEFTOVER);
+        }
+        out.push((u16::from_le_bytes([b[2], b[3]]) & 0x3fff, &b[4..len]));
+        b = &b[len.next_multiple_of(4).min(b.len())..];
+    }
+    if !b.is_empty() {
+        return Err(LEFTOVER);
+    }
+    Ok(out)
 }
 
 /// The route in `entries` with the longest prefix containing `ip`; among equally long ones the
@@ -1307,7 +1361,8 @@ mod tests {
                 true,
                 yes,
                 no,
-            ),
+            )
+            .map_err(|(e, _)| e),
             Err(19)
         );
         // IPv4 iif without RTA_SRC -> EINVAL
@@ -1320,7 +1375,8 @@ mod tests {
                 true,
                 yes,
                 no,
-            ),
+            )
+            .map_err(|(e, _)| e),
             Err(22)
         );
         // IPv4 iif loopback without route_localnet -> EINVAL
@@ -1333,7 +1389,8 @@ mod tests {
                 true,
                 yes,
                 no,
-            ),
+            )
+            .map_err(|(e, _)| e),
             Err(22)
         );
         // IPv4 iif local destination succeeds even with ip_forward = 0, emits RTA_IIF without
@@ -1358,7 +1415,10 @@ mod tests {
         assert!(attrs(&r[12..]).contains(&(RTA_OIF, &1u32.to_le_bytes()[..])));
         // IPv4 iif forwarding: EHOSTUNREACH when ip_forward=0, unicast with gateway when 1
         let fwd_req = iif_req(AF_INET, &[1, 1, 1, 1], Some(&[172, 17, 0, 5]), 2, 0);
-        assert_eq!(get(&fwd_req, &t, &ifaces, 0, true, no, no), Err(113));
+        assert_eq!(
+            get(&fwd_req, &t, &ifaces, 0, true, no, no).map_err(|(e, _)| e),
+            Err(113)
+        );
         let r = get(&fwd_req, &t, &ifaces, 0, true, yes, no).unwrap();
         assert_eq!(r[7], RTN_UNICAST);
         let a = attrs(&r[12..]);
@@ -1375,7 +1435,8 @@ mod tests {
                 true,
                 no,
                 no,
-            ),
+            )
+            .map_err(|(e, _)| e),
             Err(101)
         );
         let r = get(

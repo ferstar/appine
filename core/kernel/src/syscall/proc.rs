@@ -2166,7 +2166,7 @@ mod tests {
         let owner = crate::cred::UserNs::init();
         let _cpu = {
             let mut k = shared.lock();
-            for n in 1..=u16::MAX {
+            for n in crate::netns::FIRST_BLOCK..=u16::MAX {
                 let bytes = n.to_be_bytes();
                 if bytes[0] == crate::netns::INIT_BLOCK || bytes[0] == crate::forward::OUTSIDE_BLOCK
                 {

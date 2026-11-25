@@ -1041,6 +1041,26 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 verdict.0,
                 crate::nft::Outcome::Accept | crate::nft::Outcome::Dnat(..)
             );
+            if m.isolated {
+                if s.ty == SOCK_STREAM {
+                    return Err(Errno::ECONNREFUSED);
+                }
+                if nat_proto(s) == Some(IPPROTO_UDP as u8) {
+                    disconnect_host_keep_port(s.fd);
+                    ensure_bound(s, None)?;
+                    s.guest_peer = Some(connected_peer(&w, &me, s, &addr));
+                    s.peer = Some(addr.clone());
+                    s.any = false;
+                    s.vconn = None;
+                    s.peer_map = None;
+                    let t = s.track_mut();
+                    t.nat_back.clear();
+                    t.udp_target = None;
+                    t.blocked = Some(0);
+                    return Ok(0);
+                }
+                return Err(Errno::ENETUNREACH);
+            }
             if blocked && s.ty == SOCK_STREAM {
                 if let crate::nft::Outcome::Reject(e) = verdict.0 {
                     return Err(Errno(e));
@@ -1123,21 +1143,8 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 // (InetSocket::vconn); a previous host-side connection is undone first
                 let was = s.vconn.take();
                 if s.wide && s.ty == SOCK_DGRAM && m.target.is_some() {
-                    // Disconnect only when really connected on the host; disconnecting releases
-                    // the port the kernel assigned (when bound to port 0, udp_disconnect), so bind
-                    // the original one back, keeping getsockname and the registered port unchanged
-                    if was.is_none() && appine_hal::net::sockname(s.fd, true).is_ok() {
-                        let old = appine_hal::net::sockname(s.fd, false).ok();
-                        let _ = appine_hal::net::connect(s.fd, &[0u8; 16]);
-                        if let Some(o) = old
-                            && appine_hal::net::sockname(s.fd, false)
-                                .ok()
-                                .as_deref()
-                                .and_then(port_of)
-                                != port_of(&o)
-                        {
-                            let _ = appine_hal::net::bind(s.fd, &o);
-                        }
+                    if was.is_none() {
+                        disconnect_host_keep_port(s.fd);
                     }
                     s.vconn = Some(host_addr);
                     s.peer = Some(addr.clone());
@@ -1478,18 +1485,46 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
             peer: Some(p),
             ..
         }) if peer => p.clone(),
-        // The peer is recorded (InetSocket::vconn): the host socket is not connected
+        // The peer is recorded (InetSocket::vconn, or a connected UDP socket isolated from a
+        // container loopback block): the host socket is not connected
         Socket::Inet(InetSocket {
             vconn: Some(_),
             guest_peer: Some(p),
             ..
         }) if peer => p.clone(),
+        Socket::Inet(InetSocket {
+            ty,
+            peer: Some(p),
+            guest_peer,
+            track: Some(t),
+            ..
+        }) if peer && *ty != SOCK_STREAM && t.blocked.is_some() => {
+            guest_peer.as_ref().unwrap_or(p).clone()
+        }
         Socket::Inet(s) => inet_name(cx, s, peer)?,
         Socket::Netlink(s) if peer => s.peer_sockaddr(),
         Socket::Netlink(s) => s.sockaddr(),
         Socket::Unix(u) => unix::sockname(u, peer)?,
     };
     write_addr_to(cx, addr, addrlen, &value).map(|()| 0)
+}
+
+/// Disconnects a host UDP socket if currently connected, rebinding its previous local address when
+/// `udp_disconnect` releases an ephemeral port so `getsockname` and the registered port stay intact.
+fn disconnect_host_keep_port(fd: i32) {
+    if appine_hal::net::sockname(fd, true).is_ok() {
+        let old = appine_hal::net::sockname(fd, false).ok();
+        let _ = appine_hal::net::connect(fd, &[0u8; 16]);
+        if let Some(o) = old
+            && appine_hal::net::sockname(fd, false)
+                .ok()
+                .as_deref()
+                .and_then(port_of)
+                != port_of(&o)
+        {
+            let _ = appine_hal::net::bind(fd, &o);
+        }
+    }
 }
 
 /// The bound IPv4 address of `s` as the guest sees it, when explicitly bound to a non-wildcard
@@ -3206,6 +3241,16 @@ pub(crate) fn send(
                     (_, true) => return Err(Errno::EPERM),
                     (_, false) => return Ok(data.len()),
                 }
+                // Initial-namespace socket targeting an allocated container loopback block:
+                // silently drop UDP (matching native Linux when nothing listens in init-ns) and
+                // fail raw/other datagram sockets with ENETUNREACH.
+                if m.isolated {
+                    if nat_proto(s) == Some(IPPROTO_UDP as u8) {
+                        ensure_bound(s, None)?;
+                        return Ok(data.len());
+                    }
+                    return Err(Errno::ENETUNREACH);
+                }
                 // Sending to a new network namespace: resolve the matching UDP listener's host
                 // endpoint (drop silently when none matches, so a wildcard UDP socket outside
                 // cannot capture it).
@@ -3290,6 +3335,15 @@ pub(crate) fn send(
     let addr = if ty == SOCK_STREAM && flags & MSG_FASTOPEN == 0 {
         &[][..]
     } else {
+        if ty == SOCK_STREAM
+            && !addr.is_empty()
+            && let Socket::Inet(s) = &*sock.borrow()
+        {
+            let me = s.net.as_deref().unwrap_or(&init);
+            if crate::netns::is_foreign_loopback(&w, me, addr) {
+                return Err(Errno::ECONNREFUSED);
+            }
+        }
         addr
     };
     // Sending to a mapped low port in the initial namespace: switch to the host's (crate::portmap)
@@ -5288,6 +5342,9 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
     })?;
     let w = k.world();
     let m = crate::netns::to_host(&w, init, &dst, crate::netns::Use::Reach, false).ok()?;
+    if m.isolated {
+        return None;
+    }
     // Not forwarded when dropped or rejected by filter chains (FORWARD and so on)
     if !crate::netns::external_filter(init, m.target.as_deref(), proto as u8, &original, &dst) {
         return None;

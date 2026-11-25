@@ -37,6 +37,12 @@ pub(crate) struct World {
     pub all: Vec<Rc<NetNs>>,
 }
 
+/// First `u16` block index (`[a, b]` in `127.a.b.0/24`) allocated to new network namespaces:
+/// `0` (`127.0.0.0/24`) is standard loopback (`127.0.0.1`, DNS stub `127.0.0.53`) and `1`
+/// (`127.0.1.0/24`) is reserved for initial-namespace loopback (including Debian's `127.0.1.1`
+/// hostname convention), so container blocks start at `127.0.2.0/24`.
+pub(crate) const FIRST_BLOCK: u16 = 2;
+
 /// Host loopback block for the virtual addresses of the initial namespace: 127.255.0.0/16 (the
 /// blocks 127.a.b.0/24 of new namespaces never use 255 for a).
 pub(crate) const INIT_BLOCK: u8 = 255;
@@ -98,6 +104,10 @@ pub(crate) struct Mapped {
     /// Bound to a virtual address in a new namespace (127.a.b.1 on the host; getsockname reports
     /// the virtual address).
     pub vaddr: Option<[u8; 4]>,
+    /// True when an initial-namespace guest tried to reach a host loopback address (`127.a.b.x`)
+    /// currently allocated to another network namespace: must be refused/dropped at the socket
+    /// layer instead of reaching the host socket directly.
+    pub isolated: bool,
 }
 
 impl Mapped {
@@ -107,8 +117,16 @@ impl Mapped {
             target: None,
             source: None,
             vaddr: None,
+            isolated: false,
         }
     }
+}
+
+/// Whether `addr` in `me` is a direct initial-namespace attempt to access a host loopback block
+/// (`127.a.b.x`, including IPv4-mapped IPv6) currently allocated to another network namespace.
+pub(crate) fn is_foreign_loopback(w: &World, me: &NetNs, addr: &[u8]) -> bool {
+    me.host_net.is_none()
+        && ipv4_of(addr).is_some_and(|ip| ip[0] == 127 && w.by_block(ip[1], ip[2]).is_some())
 }
 
 /// Translates an address given by the guest to the host's (bind, connect, sendto). Addresses
@@ -155,6 +173,7 @@ pub(crate) fn to_host(
         target: Some(target.clone()),
         source: src(),
         vaddr,
+        isolated: false,
     };
     match family(addr) {
         Some(AF_INET6) if addr.len() >= 24 && icmp6 => {
@@ -243,15 +262,26 @@ pub(crate) fn to_host(
 
 /// [`to_host`] in the initial namespace.
 fn init_to_host(w: &World, me: &Rc<NetNs>, addr: &[u8], usage: Use) -> Result<Mapped, Errno> {
-    let Some(ip) = ipv4_of(addr).filter(|ip| ip[0] != 127 && *ip != [0; 4]) else {
+    let Some(ip) = ipv4_of(addr).filter(|ip| *ip != [0; 4]) else {
         return Ok(Mapped::plain(addr));
     };
+    if ip[0] == 127 {
+        return match (w.by_block(ip[1], ip[2]).is_some(), usage) {
+            (true, Use::Bind) => Err(Errno::EADDRNOTAVAIL),
+            (true, Use::Reach) => Ok(Mapped {
+                isolated: true,
+                ..Mapped::plain(addr)
+            }),
+            (false, _) => Ok(Mapped::plain(addr)),
+        };
+    }
     if crate::netdev::local_v4(me).iter().any(|(x, _)| *x == ip) {
         return Ok(Mapped {
             addr: with_ipv4(addr, init_host(me, ip)?),
             target: Some(me.clone()),
             source: None,
             vaddr: None,
+            isolated: false,
         });
     }
     if usage == Use::Bind {
@@ -271,6 +301,7 @@ fn init_to_host(w: &World, me: &Rc<NetNs>, addr: &[u8], usage: Use) -> Result<Ma
                 target: Some(m.clone()),
                 source: src,
                 vaddr: None,
+                isolated: false,
             })
         }
         None if route.gateway.is_none() => Err(Errno::EHOSTUNREACH),
@@ -3203,5 +3234,75 @@ mod tests {
             .addr;
         assert_eq!(&reused[4..8], &first_host);
         assert_eq!(init_guest(&init, first_host), Some(extra));
+    }
+
+    /// Initial-namespace isolation of allocated container `127.a.b.x` blocks: container blocks start
+    /// at `127.0.2.0/24` (preserving `127.0.0.1` and Debian's `127.0.1.1`), direct initial-ns
+    /// access to an active container's `127.a.b.x` (IPv4 or IPv4-mapped IPv6) is isolated/refused,
+    /// while unallocated loopback and routed container virtual IPs continue to work.
+    #[test]
+    fn initial_netns_isolates_allocated_container_loopback_blocks() {
+        let mut k = crate::kernel::Kernel::new(crate::process::Tier::Interpreter);
+        let init = k.init_ns.net.clone();
+        let owner = crate::cred::UserNs::init();
+        let c1 = k.new_net_ns(owner.clone()).unwrap();
+        let c2 = k.new_net_ns(owner).unwrap();
+        // First container starts at 127.0.2.0/24 so 127.0.1.1 stays free for init-ns.
+        assert_eq!(c1.host_net, Some([0, 2]));
+        assert_eq!(c2.host_net, Some([0, 3]));
+        crate::netdev::test_dev(&init, "br0", [10, 75, 0, 1], 24, None);
+        crate::netdev::test_dev(&c1, "eth0", [10, 75, 0, 2], 24, Some([10, 75, 0, 1]));
+
+        let w = k.world();
+        let v4_mapped = |ip: [u8; 4], port: u16| {
+            let mut a = [0u8; 16];
+            a[10..12].copy_from_slice(&[0xff, 0xff]);
+            a[12..16].copy_from_slice(&ip);
+            v6(a, port)
+        };
+
+        // Standard loopback (127.0.0.1), Debian 127.0.1.1, and unallocated 127.0.99.1 stay open.
+        for ip in [[127, 0, 0, 1], [127, 0, 1, 1], [127, 0, 99, 1]] {
+            for addr in [v4(ip, 8080), v4_mapped(ip, 8080)] {
+                assert!(!is_foreign_loopback(&w, &init, &addr));
+                for usage in [Use::Bind, Use::Reach] {
+                    assert!(!to_host(&w, &init, &addr, usage, false).unwrap().isolated);
+                }
+            }
+        }
+
+        // Allocated container blocks (127.0.2.x, 127.0.3.x) are isolated from initial-ns guests
+        // for both IPv4 and IPv4-mapped IPv6, and cannot be bound by initial-ns guests.
+        for ip in [[127, 0, 2, 1], [127, 0, 2, 42], [127, 0, 3, 1]] {
+            for addr in [v4(ip, 8080), v4_mapped(ip, 8080)] {
+                assert!(is_foreign_loopback(&w, &init, &addr));
+                assert_eq!(
+                    to_host(&w, &init, &addr, Use::Bind, false).err(),
+                    Some(Errno::EADDRNOTAVAIL)
+                );
+                assert!(
+                    to_host(&w, &init, &addr, Use::Reach, false)
+                        .unwrap()
+                        .isolated
+                );
+            }
+        }
+
+        // Reaching c1 via its virtual IP still translates to 127.0.2.1 with isolated == false.
+        let routed = to_host(&w, &init, &v4([10, 75, 0, 2], 8080), Use::Reach, false).unwrap();
+        assert!(!routed.isolated);
+        assert_eq!(&routed.addr[4..8], &[127, 0, 2, 1]);
+        assert!(Rc::ptr_eq(routed.target.as_ref().unwrap(), &c1));
+
+        // Dropping c2 frees 127.0.3.0/24 so initial-ns can use it as normal unallocated loopback.
+        drop(w);
+        drop(c2);
+        let w2 = k.world();
+        assert!(!is_foreign_loopback(&w2, &init, &v4([127, 0, 3, 1], 8080)));
+        assert!(
+            !to_host(&w2, &init, &v4([127, 0, 3, 1], 8080), Use::Reach, false)
+                .unwrap()
+                .isolated
+        );
     }
 }

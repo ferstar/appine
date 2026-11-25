@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: Linux-aligned nat-chain drop/reject semantics, bound-device binding separation, and UDP relay preservation across forwarder rule updates)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: initial-netns guest-side isolation of allocated container `127.a.b.x` blocks and container blocks starting at `127.0.2.0/24` to preserve `127.0.1.1`)
 
 ## Responsibilities
 
@@ -36,7 +36,8 @@ sockets (`hal`).
   MTU, `self_udp`), `devs` (`Devices`), `nft` (`Nft`), `listeners` (`Bindings`).
 - `World` — every live namespace (initial first), built per call; `Use` (`Bind` → `EADDRNOTAVAIL`,
   `Reach` → `ENETUNREACH`); `Mapped` (host address, target namespace, implicit-bind source,
-  virtual address); `Role` (`Peer` or `Local`).
+  virtual address, `isolated` flag for initial-ns attempts to reach an allocated container
+  `127.a.b.x` block); `Role` (`Peer` or `Local`).
 - `Bindings` / `Binding` / `NewBinding` / `BindAddr` / `BindReq` — per-namespace registry of bound TCP/UDP sockets
   (id, protocol, guest port, normalized guest `BindAddr`: `AnyV4`/`AnyV6`/`V4`/`V6`, `v6only`,
   `bound_dev_if`, live `SO_REUSEADDR`/`SO_REUSEPORT`, `euid`, `listening`, `accepted`, host
@@ -57,9 +58,10 @@ sockets (`hal`).
 
 ## Public entry points
 
-- Namespaces: `Kernel::new_net_ns`, `Kernel::world`; translation `to_host`, `init_to_host`,
-  `from_host`, `from_host_peer`, `from_self`, `toward_self`, `implicit_bind`, `local_toward`,
-  `entering`, `owner_of_host`, `host_ipv4`, `with_host_endpoint`; bindings & listeners
+- Namespaces: `Kernel::new_net_ns`, `Kernel::world`, `FIRST_BLOCK`; translation `to_host`,
+  `init_to_host`, `is_foreign_loopback`, `from_host`, `from_host_peer`, `from_self`, `toward_self`,
+  `implicit_bind`, `local_toward`, `entering`, `owner_of_host`, `host_ipv4`, `with_host_endpoint`;
+  bindings & listeners
   `bind_conflict`, `listen_conflict`, `shared_host_port`, `add_binding`, `add_ephemeral`,
   `remove_binding`, `set_listening`, `set_reuse`, `set_bound_dev`, `resolve_target`, `lookup_host`.
 - Devices: `netdev::request` (rtnetlink changes), `link_message`, `addr_messages`, `nsid`,
@@ -76,11 +78,13 @@ sockets (`hal`).
 ### Namespaces
 
 - Created by clone/unshare with `CLONE_NEWNET` (`CAP_SYS_ADMIN` in the new credentials' user
-  namespace). The block is the first n in 1..=65535 whose bytes [a, b] are free and not 255
-  (reserved for the initial namespace's virtual addresses) or 254 (outside clients); the first
-  namespace gets 127.0.1.0/24; no free block is `ENOMEM`; a block is reused once its namespace is
-  dropped. lo starts down without addresses; IPv4 sysctls are copied from the initial namespace,
-  IPv6 ones start at defaults.
+  namespace). The block is the first n in `FIRST_BLOCK..=65535` (`2..=65535`, reserving
+  `127.0.0.0/24` and `127.0.1.0/24` for initial-ns loopback including `127.0.0.1`, `127.0.0.53`,
+  and Debian's `127.0.1.1`) whose bytes [a, b] are free and not 255 (reserved for the initial
+  namespace's virtual addresses) or 254 (outside clients); the first namespace gets 127.0.2.0/24;
+  no free block is `ENOMEM`; a block is reused once its namespace is dropped. lo starts down
+  without addresses; IPv4 sysctls are copied from the initial namespace, IPv6 ones start at
+  defaults.
 - The kernel holds weak references; threads' nsproxies, sockets (inet, netlink, unix) and
   namespace files keep a namespace alive. A socket keeps the namespace it was created in, even
   after setns. Dropping a namespace drops its devices; a veth whose peer died is pruned lazily.
@@ -107,8 +111,14 @@ sockets (`hal`).
 - The initial namespace: its virtual addresses map to 127.255.x.y entries in `HostMap` (allocated
   on demand in O(1), reclaimed when deleted from all virtual devices or when a device is deleted,
   moved out or pruned, and recycled FIFO; all 65,534 slots full returns `EADDRNOTAVAIL`);
-  destinations in other namespaces map to their 127.c.d.1; 127.x and everything else pass through
-  unchanged.
+  destinations in other namespaces (via virtual-device routes) map to their 127.c.d.1; direct
+  initial-ns guest attempts on any `127.a.b.x` (including IPv4-mapped `::ffff:127.a.b.x`) whose
+  `[a, b]` block is currently allocated to another namespace are rejected on `bind`
+  (`EADDRNOTAVAIL`) and marked `Mapped::isolated` on `Reach` (TCP `connect`/`MSG_FASTOPEN` return
+  `ECONNREFUSED`, UDP `sendto` drops silently and UDP `connect` records a blocked peer without
+  touching the host, raw/other sockets return `ENETUNREACH`, and `forward_target` refuses isolated
+  DNAT targets); `127.0.0.1`, `127.0.1.1`, unallocated loopback addresses and everything else pass
+  through unchanged.
 - Back to the guest (`from_host` / `from_host_peer`, by who is looking): wildcard for `any`
   sockets; 127.254.x.y → the real outside client; for peers in a new namespace, `from_host_peer`
   first checks `lookup_host` so bindings on a specific virtual or loopback IPv4 address sharing
@@ -292,8 +302,9 @@ sockets (`hal`).
 
 ## Invariants and gotchas
 
-- Isolation exists only on the guest side: host loopback sockets of every namespace are
-  reachable by the initial namespace (which passes 127.x through) and by other apps on the device.
+- Isolation is guest-side only: initial-namespace guests cannot directly bind, connect, or send
+  to any container's allocated `127.a.b.x` block (`init_to_host` / `is_foreign_loopback`), but
+  other apps on the host device can still reach host loopback sockets directly.
 - Namespace translation depends on who is looking; every address leaving the kernel layer must be
   translated for the viewing socket's namespace.
 - Wildcard, 127.0.0.1, `::1` and the namespace's virtual addresses share host IP 127.a.b.1, but
@@ -309,9 +320,9 @@ sockets (`hal`).
   device to), so pasta and slirp4netns cannot start: rootless podman's default network, its port
   publishing and `--network slirp4netns` fail, and rootless containers work only with
   `--network host` (the Android app makes that rootless podman's default, `android/setup`).
-- **Namespace isolation is guest-side only:** the initial namespace passes 127.x through, so its
-  guests (and other apps on the device) reach a container's host sockets directly, including
-  services bound only to the container's 127.0.0.1.
+- **Namespace isolation is guest-side only:** although initial-namespace guests are blocked from
+  directly accessing allocated container `127.a.b.x` blocks, other apps on the host device can
+  still reach a container's host loopback sockets directly.
 - **Smaller deviations:** only 127.0.0.0/24 works as loopback in a namespace (Linux: 127/8); IPv6 on
   virtual devices is unusable and on-link IPv6 is handed to the host; PREROUTING filter chains see
   the post-DNAT destination at every priority. `kernel/nft` records the unsupported POSTROUTING,
@@ -324,8 +335,6 @@ sockets (`hal`).
 
 ## Open questions
 
-- Is reaching a namespace's 127.a.b.x sockets directly from the initial namespace acceptable?
-- Is the first block 127.0.1.0/24 (Debian's `127.0.1.1` hostname convention) deliberate?
 - Should forwarded connections be torn down when the DNAT rule disappears?
 
 ## To verify

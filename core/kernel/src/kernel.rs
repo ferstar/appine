@@ -578,10 +578,11 @@ impl Kernel {
             .iter()
             .filter_map(|w| w.upgrade().and_then(|n| n.host_net))
             .collect();
-        // 127.255.0.0/16 is reserved for virtual addresses in the boot-time namespace
-        // (crate::netns::INIT_BLOCK), 127.254.0.0/16 for connections forwarded in from outside
-        // (crate::forward::OUTSIDE_BLOCK)
-        let net = (1..=u16::MAX)
+        // 127.0.0.0/24 and 127.0.1.0/24 stay reserved for initial-namespace loopback (127.0.0.1,
+        // DNS stub 127.0.0.53, Debian's 127.0.1.1); 127.255.0.0/16 is reserved for virtual
+        // addresses in the boot-time namespace (crate::netns::INIT_BLOCK), and 127.254.0.0/16 for
+        // connections forwarded in from outside (crate::forward::OUTSIDE_BLOCK).
+        let net = (crate::netns::FIRST_BLOCK..=u16::MAX)
             .map(u16::to_be_bytes)
             .find(|n| {
                 n[0] != crate::netns::INIT_BLOCK
