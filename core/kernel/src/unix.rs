@@ -778,6 +778,7 @@ impl Channel {
             .map(Packet::sender_addr)
             .unwrap_or_default();
         let mut i = 0;
+        let mut popped = false;
         while let Some(p) = self.packets.get_mut(i) {
             if passcred && cred.is_some_and(|c| c != p.cred) {
                 break;
@@ -796,15 +797,16 @@ impl Channel {
                 self.bytes -= n;
                 fds.append(&mut p.fds);
                 if p.remaining() == 0 {
-                    let popped = self.packets.pop_front().unwrap();
-                    self.truesize -= popped.truesize();
+                    let pkt = self.packets.pop_front().unwrap();
+                    self.truesize -= pkt.truesize();
+                    popped = true;
                 }
             }
             if had_fds || data.len() >= max {
                 break;
             }
         }
-        if !peek && !data.is_empty() {
+        if !peek && (!data.is_empty() || popped) {
             if self.writable() {
                 self.taken += 1;
             }
@@ -1610,6 +1612,48 @@ mod tests {
         assert_eq!(da.readiness() & POLLOUT, 0);
         drop(db);
         assert_eq!(da.outq(), 0);
+    }
+
+    #[test]
+    fn draining_zero_byte_stream_scm_rights_updates_writable_and_taken() {
+        let (sa, sb) = UnixSocket::pair(SOCK_STREAM, Ucred::of(1, 0, 0));
+        let Link::Stream { tx, .. } = &sa.link else {
+            unreachable!()
+        };
+        let Link::Stream { rx, .. } = &sb.link else {
+            unreachable!()
+        };
+        let dummy = OpenFile::new(FileKind::Host(1), oflags::O_RDONLY);
+        let mut queued = 0;
+        while tx.borrow().has_packet_room() {
+            let mut p = packet(b"", 1);
+            p.fds.push(dummy.clone());
+            sa.outq.outq.set(sa.outq.outq.get() + p.truesize());
+            p.outq = Some(sa.outq.clone());
+            tx.borrow_mut().push(p);
+            queued += 1;
+        }
+        assert_eq!(queued, 278);
+        assert!(!tx.borrow().has_packet_room());
+        assert_eq!(sa.readiness() & POLLOUT, 0);
+        assert_eq!(tx.borrow().taken, 0);
+
+        // Draining one zero-byte packet restores has_packet_room() even before writable() flips.
+        let first = rx.borrow_mut().read_stream(16, false, false);
+        assert!(first.data.is_empty() && first.fds.len() == 1);
+        assert!(tx.borrow().has_packet_room());
+        assert_eq!(sa.outq(), 277 * 768);
+
+        // Draining past the half-capacity threshold restores POLLOUT and advances `taken`.
+        let mut drained = 1;
+        while sa.readiness() & POLLOUT == 0 {
+            let r = rx.borrow_mut().read_stream(16, false, false);
+            assert!(r.data.is_empty() && r.fds.len() == 1);
+            drained += 1;
+        }
+        assert!(drained > 1 && drained < queued);
+        assert!(tx.borrow().writable());
+        assert!(tx.borrow().taken > 0);
     }
 
     #[test]
