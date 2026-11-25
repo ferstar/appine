@@ -3263,10 +3263,6 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Resu
     let g = g.borrow();
     let task = ps.task(proc, tid);
     let (state, state_name) = state_of(ps, &g, proc, tid);
-    // The size only: the resident pages are measured below, split by kind
-    let vsize = task
-        .as_ref()
-        .map_or(0, |t| t.res.borrow().mm.borrow().size());
     let (sigign, sigcgt) = sig_dispositions(&g);
     let (umask, fdsize) = task.as_ref().map_or((0o022, 0), |t| {
         let res = t.res.borrow();
@@ -3344,17 +3340,21 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Resu
         col(g.sid)
     )
     .unwrap();
-    if task.is_some() {
-        let kb = vsize / 1024;
+    if let Some(t) = task.as_deref() {
+        let res = t.res.borrow();
+        let mm = res.mm.borrow();
+        let layout = vm_layout(&mm);
+        let kb = layout.size / 1024;
         writeln!(s, "VmPeak:\t{kb:>8} kB\nVmSize:\t{kb:>8} kB").unwrap();
-        let locked = task
-            .as_ref()
-            .map_or(0, |t| t.res.borrow().mm.borrow().locked_bytes());
-        writeln!(s, "VmLck:\t{:>8} kB\nVmPin:\t{:>8} kB", locked / 1024, 0).unwrap();
+        writeln!(
+            s,
+            "VmLck:\t{:>8} kB\nVmPin:\t{:>8} kB",
+            mm.locked_bytes() / 1024,
+            0
+        )
+        .unwrap();
         // VmRSS is the sum of the three kinds, as on Linux
-        let (anon, file, shmem) = task
-            .as_ref()
-            .map_or((0, 0, 0), |t| t.res.borrow().mm.borrow().resident_split());
+        let (anon, file, shmem) = mm.resident_split();
         let rss = anon + file + shmem;
         let hwm = g.maxrss_kb.max(rss * 4);
         writeln!(s, "VmHWM:\t{hwm:>8} kB\nVmRSS:\t{:>8} kB", rss * 4).unwrap();
@@ -3368,26 +3368,19 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Resu
         .unwrap();
         // Linux 6.1's task_mem: VmData (private writable non-stack), VmStk (grows-down),
         // VmExe (code span capped by exec_vm), VmLib (remaining exec_vm); no swap or PTE count.
-        let layout = task.as_ref().map_or(VmLayout::default(), |t| {
-            vm_layout(&t.res.borrow().mm.borrow())
-        });
         let exe = layout.code_span.min(layout.exec);
         let lib = layout.exec.saturating_sub(exe);
         writeln!(
             s,
-            "VmData:\t{:>8} kB\nVmStk:\t{:>8} kB",
+            "VmData:\t{:>8} kB\nVmStk:\t{:>8} kB\nVmExe:\t{:>8} kB\nVmLib:\t{:>8} kB\nVmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB",
             layout.data / 1024,
             layout.stack / 1024,
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "VmExe:\t{:>8} kB\nVmLib:\t{:>8} kB",
             exe / 1024,
             lib / 1024,
+            0,
+            0,
         )
         .unwrap();
-        writeln!(s, "VmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB", 0, 0).unwrap();
     }
     writeln!(s, "Threads:\t{}", thread_count(&g).max(1)).unwrap();
     let limit = g.rlimits[crate::process::RLIMIT_SIGPENDING as usize].0;
@@ -3495,7 +3488,6 @@ fn comm_of(g: &ThreadGroup, task: Option<&Task>, pid: Tid, tid: Option<Tid>) -> 
 /// (in bytes): total size, `data_vm` (private writable non-stack), `stack_vm` (grows-down),
 /// `exec_vm` (executable non-writable non-stack), and the page-aligned code span (`[start_code,
 /// end_code)`).
-#[derive(Default)]
 struct VmLayout {
     size: u64,
     data: u64,
@@ -3512,8 +3504,7 @@ fn vm_layout(mm: &crate::mm::Mm) -> VmLayout {
     let mut exec = 0u64;
     for r in mm.regions() {
         let len = r.end.saturating_sub(r.start);
-        let is_main_stack = r.name.as_deref() == Some(b"[stack]");
-        if is_main_stack {
+        if r.name.as_deref() == Some(b"[stack]") {
             main_stack = main_stack.saturating_add(len);
         } else if r.prot & 4 != 0 && r.prot & 2 == 0 {
             exec = exec.saturating_add(len);
@@ -6005,12 +5996,8 @@ mod tests {
     #[test]
     fn sockets_report_creator_uid_even_when_inflight() {
         let mut k = Kernel::new(crate::process::Tier::Interpreter);
-        let (mut a, mut b) =
+        let (_a, b) =
             crate::unix::UnixSocket::pair(crate::net::SOCK_DGRAM, crate::unix::Ucred::of(1, 0, 0));
-        a.uid = 1000;
-        b.uid = 1000;
-        let sa = Rc::new(RefCell::new(crate::net::Socket::Unix(a)));
-        let sb = Rc::new(RefCell::new(crate::net::Socket::Unix(b)));
 
         // Send a socket created by UID 2000 over SCM_RIGHTS so it is only in-flight (not in any
         // task's fd table).
@@ -6019,11 +6006,7 @@ mod tests {
         let payload_sock = Rc::new(RefCell::new(crate::net::Socket::Unix(payload)));
         let payload_file = OpenFile::new(FileKind::Socket(payload_sock.clone()), oflags::O_RDWR);
 
-        let rx = match &*sb.borrow() {
-            crate::net::Socket::Unix(u) => u.rx.clone(),
-            _ => unreachable!(),
-        };
-        rx.borrow_mut().push(crate::unix::Packet {
+        b.rx.borrow_mut().push(crate::unix::Packet {
             data: b"hi".to_vec(),
             off: 0,
             fds: vec![payload_file],
@@ -6031,8 +6014,7 @@ mod tests {
             from: Vec::new(),
             outq: None,
         });
-        k.unix_inflight.push(Rc::downgrade(&rx));
-        drop(sa);
+        k.unix_inflight.push(Rc::downgrade(&b.rx));
 
         // `sockets(&k)` must not borrow any socket RefCell (e.g. while a netlink socket is
         // mutably borrowed during `forward_all`).
@@ -6043,7 +6025,6 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert!(Rc::ptr_eq(&listed[0], &payload_sock));
         assert_eq!(listed[0].borrow().uid(), 2000);
-        drop(sb);
     }
 
     #[test]
@@ -6052,46 +6033,17 @@ mod tests {
         use appine_engine::prot;
 
         let mut mm = Mm::new();
-        // Private writable data mapping (16 KiB)
-        let data = mm
-            .mmap(
-                0,
-                4 * PAGE_SIZE,
-                prot::READ | prot::WRITE,
-                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
-                None,
-            )
-            .unwrap();
-        // Executable non-writable code mapping (8 KiB)
-        let code = mm
-            .mmap(
-                0,
-                2 * PAGE_SIZE,
-                prot::READ | prot::EXEC,
-                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
-                None,
-            )
-            .unwrap();
+        let mut map = |pages, p, f| {
+            mm.mmap(0, pages * PAGE_SIZE, p, f | flags::MAP_ANONYMOUS, None)
+                .unwrap()
+        };
+        // Private writable data (16 KiB), executable non-writable code (8 KiB),
+        // shared writable (12 KiB, excluded from VmData), grows-down stack (8 KiB, in VmStk).
+        let data = map(4, prot::READ | prot::WRITE, flags::MAP_PRIVATE);
+        let code = map(2, prot::READ | prot::EXEC, flags::MAP_PRIVATE);
+        map(3, prot::READ | prot::WRITE, flags::MAP_SHARED);
+        let stack = map(2, prot::READ | prot::WRITE, flags::MAP_PRIVATE);
         mm.code = (code, code + PAGE_SIZE);
-        // Shared writable mapping (12 KiB) — excluded from VmData
-        mm.mmap(
-            0,
-            3 * PAGE_SIZE,
-            prot::READ | prot::WRITE,
-            flags::MAP_SHARED | flags::MAP_ANONYMOUS,
-            None,
-        )
-        .unwrap();
-        // Grows-down stack mapping (8 KiB) — counted in VmStk, not VmData
-        let stack = mm
-            .mmap(
-                0,
-                2 * PAGE_SIZE,
-                prot::READ | prot::WRITE,
-                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
-                None,
-            )
-            .unwrap();
         mm.set_growsdown(stack);
         assert_ne!(data, 0);
         assert_ne!(stack, 0);

@@ -4,7 +4,7 @@
 # lock fdinfo + F_SETLKW waiters in /proc/locks.
 set -eu
 python3 - <<'PY'
-import ctypes, fcntl, os, re, signal, socket, struct, subprocess, sys, time
+import ctypes, fcntl, mmap, os, re, select, signal, socket, struct, subprocess, sys, time
 
 libc = ctypes.CDLL(None, use_errno=True)
 
@@ -62,8 +62,6 @@ subprocess.check_call(["mount", "-t", "proc", "proc", "/tmp/proc2"])
 p2_path = "/tmp/proc2/self/mounts"
 p2_st = os.stat(p2_path)
 p2_wd = libc.inotify_add_watch(ifd, p2_path.encode(), 0xfff)
-ep = os.epoll() if hasattr(os, "epoll") else None
-import select
 ep = select.epoll()
 p2_fd = os.open(p2_path, os.O_RDONLY)
 ep.register(p2_fd, select.EPOLLIN)
@@ -105,7 +103,6 @@ def read_vm():
                 st[k] = int(line.split()[1])
     return statm, st
 
-import mmap
 m_priv = mmap.mmap(-1, 64 * 1024, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
 m_shr = mmap.mmap(-1, 64 * 1024, flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)
 statm, st = read_vm()

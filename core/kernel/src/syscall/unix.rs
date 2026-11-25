@@ -1237,11 +1237,10 @@ mod tests {
                 }),
             }));
             let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
-            let sem_undo = Rc::new(crate::ipc::SemUndo::new());
-            let make_state = || TaskState {
-                mm: mm.clone(),
-                fds: fds.clone(),
-                fs: fs.clone(),
+            let state = TaskState {
+                mm,
+                fds,
+                fs,
                 group: group.clone(),
                 vfs: None,
                 altstack: Default::default(),
@@ -1249,15 +1248,14 @@ mod tests {
                 vfork_done: None,
                 restart: None,
                 fast_sleep: None,
-                sem_undo: sem_undo.clone(),
+                sem_undo: Rc::new(crate::ipc::SemUndo::new()),
             };
-            let task =
-                Task::new(10, 10, &cpu, make_state(), k.init_ns.clone(), 0, [0; 16]).unwrap();
+            let task = Task::new(10, 10, &cpu, state, k.init_ns.clone(), 0, [0; 16]).unwrap();
             group.borrow_mut().threads.push(10);
-            k.groups.insert(10, group.clone());
+            k.groups.insert(10, group);
             k.tasks.insert(10, task.clone());
 
-            let mut t = make_state();
+            let mut t = task.state.borrow_mut();
             let mut cx = Cx::new(&shared, k, &task, &mut t);
 
             // Set up a listening AF_UNIX stream socket with two pending client connections.
@@ -1283,41 +1281,38 @@ mod tests {
             let mut spare = -1;
             for fd in 0..64 {
                 if cx.fds().get(fd).is_err() {
-                    let installed = cx.install_fd(filler.clone(), true).unwrap();
-                    assert_eq!(installed, fd);
+                    assert_eq!(cx.install_fd(filler.clone(), true), Ok(fd));
                     spare = fd;
                 }
             }
             assert!(spare >= 0);
             assert_eq!(cx.fds().capacity(), 64);
 
+            let accept = |cx: &mut Cx<'_>| {
+                super::super::net::accept4(cx, srv_fd, 0, 0, oflags::O_NONBLOCK | oflags::O_CLOEXEC)
+            };
+            let recv = |cx: &mut Cx<'_>, byte: u8, fds: Vec<FileRef>| {
+                deliver(
+                    cx,
+                    Received {
+                        data: vec![byte],
+                        len: 1,
+                        fds,
+                        cred: Ucred::UNSTAMPED,
+                        from: Vec::new(),
+                    },
+                    false,
+                    false,
+                    64,
+                )
+            };
+
             // accept4 must fail with EMFILE and keep table capacity at 64.
-            assert_eq!(
-                super::super::net::accept4(
-                    &mut cx,
-                    srv_fd,
-                    0,
-                    0,
-                    oflags::O_NONBLOCK | oflags::O_CLOEXEC
-                ),
-                Err(Errno::EMFILE)
-            );
+            assert_eq!(accept(&mut cx), Err(Errno::EMFILE));
             assert_eq!(cx.fds().capacity(), 64);
 
             // SCM_RIGHTS with 0 free slots < 64 sets MSG_CTRUNC and delivers no descriptors.
-            let msg = deliver(
-                &mut cx,
-                Received {
-                    data: vec![b'x'],
-                    len: 1,
-                    fds: vec![filler.clone(), filler.clone()],
-                    cred: Ucred::UNSTAMPED,
-                    from: Vec::new(),
-                },
-                false,
-                false,
-                64,
-            );
+            let msg = recv(&mut cx, b'x', vec![filler.clone(), filler.clone()]);
             assert_ne!(msg.flags & MSG_CTRUNC, 0);
             assert!(msg.control.is_empty());
             assert!(msg.rights.is_none());
@@ -1325,19 +1320,7 @@ mod tests {
 
             // Free one slot below 64: SCM_RIGHTS reserves that slot and truncates the second fd.
             cx.fds_mut().close(spare).unwrap();
-            let msg = deliver(
-                &mut cx,
-                Received {
-                    data: vec![b'y'],
-                    len: 1,
-                    fds: vec![filler.clone(), filler.clone()],
-                    cred: Ucred::UNSTAMPED,
-                    from: Vec::new(),
-                },
-                false,
-                false,
-                64,
-            );
+            let msg = recv(&mut cx, b'y', vec![filler.clone(), filler.clone()]);
             assert_ne!(msg.flags & MSG_CTRUNC, 0);
             assert_eq!(msg.control.len(), CMSG_HDR + 4 + 4); // 16-byte header + 1 fd + 4-byte align
             assert_eq!(
@@ -1350,16 +1333,7 @@ mod tests {
             assert_eq!(cx.fds().get(64).err(), Some(Errno::EBADF));
 
             // Now accept4 succeeds in `spare` without expanding past 64.
-            assert_eq!(
-                super::super::net::accept4(
-                    &mut cx,
-                    srv_fd,
-                    0,
-                    0,
-                    oflags::O_NONBLOCK | oflags::O_CLOEXEC
-                ),
-                Ok(spare as u64)
-            );
+            assert_eq!(accept(&mut cx), Ok(spare as u64));
             assert_eq!(cx.fds().capacity(), 64);
 
             // Expanding across 128 with nr_open = 192 caps capacity at 192 (not 256) for both
@@ -1369,34 +1343,13 @@ mod tests {
                 assert_eq!(cx.install_fd(filler.clone(), true), Ok(fd));
             }
             assert_eq!(cx.fds().capacity(), 128);
-            assert_eq!(
-                super::super::net::accept4(
-                    &mut cx,
-                    srv_fd,
-                    0,
-                    0,
-                    oflags::O_NONBLOCK | oflags::O_CLOEXEC
-                ),
-                Ok(128)
-            );
+            assert_eq!(accept(&mut cx), Ok(128));
             assert_eq!(cx.fds().capacity(), 192);
 
             for fd in 129..192 {
                 assert_eq!(cx.install_fd(filler.clone(), true), Ok(fd));
             }
-            let msg = deliver(
-                &mut cx,
-                Received {
-                    data: vec![b'z'],
-                    len: 1,
-                    fds: vec![filler.clone()],
-                    cred: Ucred::UNSTAMPED,
-                    from: Vec::new(),
-                },
-                false,
-                false,
-                64,
-            );
+            let msg = recv(&mut cx, b'z', vec![filler.clone()]);
             assert_ne!(msg.flags & MSG_CTRUNC, 0);
             assert!(msg.control.is_empty());
             assert!(msg.rights.is_none());

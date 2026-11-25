@@ -2519,46 +2519,55 @@ impl Nft {
         })
     }
 
-    /// Runs the nat chains on hook `p.hook` (`nf_nat_inet_fn`): one by one by priority, stopping
-    /// at the first that DNATs or drops. Address families: IPv4 packets look at ip and inet
-    /// tables, IPv6 ones at ip6 and inet tables.
-    pub(crate) fn nat(&self, p: &Packet<'_>) -> Outcome {
-        let fam = if p.dst.len() == 4 { 2 } else { 10 };
-        let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
+    fn base_chains(&self, fam: u8, hook: u32, nat: bool) -> Vec<(&Table, &Chain, i32)> {
+        let mut chains = Vec::new();
         for t in &self.tables {
             if (t.family != fam && t.family != 1) || t.flags & 1 != 0 {
                 continue;
             }
             for c in &t.chains {
                 if let Some(b) = &c.base
-                    && b.hooknum == p.hook
-                    && b.ty == b"nat"
+                    && b.hooknum == hook
+                    && (b.ty == b"nat") == nat
                 {
                     chains.push((t, c, b.priority));
                 }
             }
         }
+        chains.sort_by_key(|(_, _, prio)| *prio);
+        chains
+    }
+
+    fn eval<'a>(&'a self, p: &'a Packet<'a>, nh: &[u8], th: &[u8], mark: u32) -> Eval<'a> {
+        Eval {
+            recent: &self.recent,
+            p,
+            nh: nh.to_vec(),
+            th: th.to_vec(),
+            regs: [0; 80],
+            verdict: NFT_CONTINUE,
+            chain: None,
+            mark,
+            dnat: None,
+            reject: None,
+            rates: None,
+            at: 0,
+        }
+    }
+
+    /// Runs the nat chains on hook `p.hook` (`nf_nat_inet_fn`): one by one by priority, stopping
+    /// at the first that DNATs or drops. Address families: IPv4 packets look at ip and inet
+    /// tables, IPv6 ones at ip6 and inet tables.
+    pub(crate) fn nat(&self, p: &Packet<'_>) -> Outcome {
+        let fam = if p.dst.len() == 4 { 2 } else { 10 };
+        let chains = self.base_chains(fam, p.hook, true);
         if chains.is_empty() {
             return Outcome::Accept;
         }
-        chains.sort_by_key(|(_, _, prio)| *prio);
         let (nh, th) = headers(p);
         let mut mark = p.mark;
         for (t, c, _) in chains {
-            let mut e = Eval {
-                recent: &self.recent,
-                p,
-                nh: nh.clone(),
-                th: th.clone(),
-                regs: [0; 80],
-                verdict: NFT_CONTINUE,
-                chain: None,
-                mark,
-                dnat: None,
-                reject: None,
-                rates: None,
-                at: 0,
-            };
+            let mut e = self.eval(p, &nh, &th, mark);
             let v = run_chain(&mut e, t, c);
             mark = e.mark;
             if v == NF_DROP {
@@ -2582,46 +2591,7 @@ impl Nft {
     /// Like [`Self::filter`], also returning the resulting packet mark so the next hook in the
     /// same namespace observes `meta mark set`.
     pub(crate) fn filter_with_mark(&self, p: &Packet<'_>) -> (Outcome, u32) {
-        let fam = if p.dst.len() == 4 { 2 } else { 10 };
-        let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
-        for t in &self.tables {
-            if (t.family != fam && t.family != 1) || t.flags & 1 != 0 {
-                continue;
-            }
-            for c in &t.chains {
-                if let Some(b) = &c.base
-                    && b.hooknum == p.hook
-                    && b.ty != b"nat"
-                {
-                    chains.push((t, c, b.priority));
-                }
-            }
-        }
-        chains.sort_by_key(|(_, _, prio)| *prio);
-        let (nh, th) = headers(p);
-        let mut mark = p.mark;
-        for (t, c, _) in chains {
-            let mut e = Eval {
-                recent: &self.recent,
-                p,
-                nh: nh.clone(),
-                th: th.clone(),
-                regs: [0; 80],
-                verdict: NFT_CONTINUE,
-                chain: None,
-                mark,
-                dnat: None,
-                reject: None,
-                rates: None,
-                at: 0,
-            };
-            let v = run_chain(&mut e, t, c);
-            mark = e.mark;
-            if v == NF_DROP {
-                return (e.reject.map_or(Outcome::Drop, Outcome::Reject), mark);
-            }
-        }
-        (Outcome::Accept, mark)
+        self.run_filter(p.hook, p, None, p.mark)
     }
 
     /// Runs the filter- and route-type chains on `HOOK_PRE_ROUTING` in priority order: on Linux,
@@ -2635,49 +2605,29 @@ impl Nft {
         post: &Packet<'_>,
         dnated: bool,
     ) -> (Outcome, u32) {
+        self.run_filter(HOOK_PRE_ROUTING, post, dnated.then_some(pre), pre.mark)
+    }
+
+    fn run_filter(
+        &self,
+        hook: u32,
+        post: &Packet<'_>,
+        pre: Option<&Packet<'_>>,
+        mut mark: u32,
+    ) -> (Outcome, u32) {
         let fam = if post.dst.len() == 4 { 2 } else { 10 };
-        let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
-        for t in &self.tables {
-            if (t.family != fam && t.family != 1) || t.flags & 1 != 0 {
-                continue;
-            }
-            for c in &t.chains {
-                if let Some(b) = &c.base
-                    && b.hooknum == HOOK_PRE_ROUTING
-                    && b.ty != b"nat"
-                {
-                    chains.push((t, c, b.priority));
-                }
-            }
-        }
+        let chains = self.base_chains(fam, hook, false);
         if chains.is_empty() {
-            return (Outcome::Accept, pre.mark);
+            return (Outcome::Accept, mark);
         }
-        chains.sort_by_key(|(_, _, prio)| *prio);
         let (post_nh, post_th) = headers(post);
-        let pre_hdrs = dnated.then(|| headers(pre));
-        let mut mark = pre.mark;
+        let pre_hdrs = pre.map(headers);
         for (t, c, prio) in chains {
-            let (p, nh, th) = if dnated && prio < PRI_NAT_DST {
-                let (pre_nh, pre_th) = pre_hdrs.as_ref().unwrap();
-                (pre, pre_nh, pre_th)
-            } else {
-                (post, &post_nh, &post_th)
+            let (p, nh, th) = match (pre, &pre_hdrs) {
+                (Some(pre), Some((pre_nh, pre_th))) if prio < PRI_NAT_DST => (pre, pre_nh, pre_th),
+                _ => (post, &post_nh, &post_th),
             };
-            let mut e = Eval {
-                recent: &self.recent,
-                p,
-                nh: nh.clone(),
-                th: th.clone(),
-                regs: [0; 80],
-                verdict: NFT_CONTINUE,
-                chain: None,
-                mark,
-                dnat: None,
-                reject: None,
-                rates: None,
-                at: 0,
-            };
+            let mut e = self.eval(p, nh, th, mark);
             let v = run_chain(&mut e, t, c);
             mark = e.mark;
             if v == NF_DROP {
@@ -3903,7 +3853,7 @@ fn data_value(d: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cell::RefCell;
 
@@ -3921,7 +3871,7 @@ mod tests {
         }
     }
 
-    fn peer() -> Peer<'static> {
+    pub(crate) fn peer() -> Peer<'static> {
         Peer {
             pid: 77,
             ext_ack: false,
@@ -3986,6 +3936,44 @@ mod tests {
         )
     }
 
+    pub(crate) fn daddr(ip: [u8; 4]) -> [Vec<u8>; 2] {
+        [payload(1, 16, 4), cmp_eq(&ip)]
+    }
+
+    pub(crate) fn dport(p: u16) -> [Vec<u8>; 2] {
+        [payload(2, 2, 2), cmp_eq(&p.to_be_bytes())]
+    }
+
+    pub(crate) fn drop_expr() -> Vec<u8> {
+        expr(
+            "immediate",
+            &[(1, be32(0).to_vec()), (2, verdict(NF_DROP, None))],
+        )
+    }
+
+    pub(crate) fn reject_rst() -> Vec<u8> {
+        expr("reject", &[(1, be32(1).to_vec())])
+    }
+
+    pub(crate) fn dnat_to(ip: [u8; 4], port: u16) -> [Vec<u8>; 3] {
+        [
+            expr("immediate", &[(1, be32(1).to_vec()), (2, value(&ip))]),
+            expr(
+                "immediate",
+                &[(1, be32(2).to_vec()), (2, value(&port.to_be_bytes()))],
+            ),
+            expr(
+                "nat",
+                &[
+                    (1, be32(1).to_vec()), // NFT_NAT_DNAT
+                    (2, be32(2).to_vec()), // NFPROTO_IPV4
+                    (3, be32(1).to_vec()),
+                    (5, be32(2).to_vec()),
+                ],
+            ),
+        ]
+    }
+
     fn jump(chain: &[u8]) -> Vec<u8> {
         expr(
             "immediate",
@@ -3997,13 +3985,13 @@ mod tests {
         nfmsg(nft_type(ty), flags | NLM_F_REQUEST, 1, 0, family, 0, attrs)
     }
 
-    fn table_msg(family: u8, name: &[u8]) -> Vec<u8> {
+    pub(crate) fn table_msg(family: u8, name: &[u8]) -> Vec<u8> {
         let mut p = Vec::new();
         a(&mut p, TABLE_NAME, &cstr(name));
         msg(NEWTABLE, NLM_F_CREATE, family, &p)
     }
 
-    fn chain_msg(
+    pub(crate) fn chain_msg(
         family: u8,
         table: &[u8],
         name: &[u8],
@@ -4023,7 +4011,7 @@ mod tests {
         msg(NEWCHAIN, NLM_F_CREATE, family, &p)
     }
 
-    fn rule_msg(family: u8, table: &[u8], chain: &[u8], exprs: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn rule_msg(family: u8, table: &[u8], chain: &[u8], exprs: &[Vec<u8>]) -> Vec<u8> {
         let mut p = Vec::new();
         a(&mut p, RULE_TABLE, &cstr(table));
         a(&mut p, RULE_CHAIN, &cstr(chain));
@@ -4031,7 +4019,7 @@ mod tests {
         msg(NEWRULE, NLM_F_CREATE | NLM_F_APPEND, family, &p)
     }
 
-    fn batch(msgs: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn batch(msgs: &[Vec<u8>]) -> Vec<u8> {
         let mut b = message(NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, 0, 0, &[0, 0, 0, 10]);
         for m in msgs {
             b.extend_from_slice(m);
@@ -5109,9 +5097,6 @@ mod tests {
     fn prerouting_filter_priority_splits_around_dnat() {
         let root = Cred::root();
         let reg = |r: u32| be32(r).to_vec();
-        let daddr = |ip: [u8; 4]| [payload(1, 16, 4), cmp_eq(&ip)];
-        let dport = |p: u16| [payload(2, 2, 2), cmp_eq(&p.to_be_bytes())];
-        let verdict_expr = |code: i32| expr("immediate", &[(1, reg(0)), (2, verdict(code, None))]);
         let set_mark = |m: u32| {
             [
                 expr("immediate", &[(1, reg(1)), (2, value(&m.to_ne_bytes()))]),
@@ -5124,42 +5109,15 @@ mod tests {
                 cmp_eq(&m.to_ne_bytes()),
             ]
         };
-        let dnat_to = |ip: [u8; 4], port: u16| {
-            [
-                expr("immediate", &[(1, reg(1)), (2, value(&ip))]),
-                expr("immediate", &[(1, reg(2)), (2, value(&port.to_be_bytes()))]),
-                expr(
-                    "nat",
-                    &[
-                        (1, be32(1).to_vec()), // NFT_NAT_DNAT
-                        (2, be32(2).to_vec()), // NFPROTO_IPV4
-                        (3, reg(1)),
-                        (5, reg(2)),
-                    ],
-                ),
-            ]
-        };
 
         let pre_ip = [10, 80, 0, 1];
         let post_ip = [10, 81, 0, 3];
         let addr_type = |a: &[u8]| if a == pre_ip { RTN_LOCAL } else { RTN_UNICAST };
+        let nat_rule = [&daddr(pre_ip)[..], &dport(8080), &dnat_to(post_ip, 80)].concat();
 
         // 1. Default dstnat (-100): raw (-300) sees pre-DNAT, filter (0) sees post-DNAT, and
-        //    mark set at -150 carries into priority 0 and out of filter_prerouting.
+        //    mark set at -300 carries into priority 0 and out of filter_prerouting.
         let ns1 = ns();
-        let mut raw_rule = daddr(pre_ip).to_vec();
-        raw_rule.extend(dport(8080));
-        raw_rule.extend(set_mark(0x42));
-        let mut post_drop_pre_port = dport(8080).to_vec();
-        post_drop_pre_port.push(verdict_expr(NF_DROP));
-        let mut post_reject_marked_post = match_mark(0x42).to_vec();
-        post_reject_marked_post.extend(daddr(post_ip));
-        post_reject_marked_post.extend(dport(80));
-        post_reject_marked_post.push(expr("reject", &[(1, be32(1).to_vec())]));
-        let mut nat_rule = daddr(pre_ip).to_vec();
-        nat_rule.extend(dport(8080));
-        nat_rule.extend(dnat_to(post_ip, 80));
-
         let r = handle(
             &ns1,
             &root,
@@ -5168,10 +5126,31 @@ mod tests {
                 chain_msg(2, b"t", b"raw", Some((HOOK_PRE_ROUTING, -300, b"filter"))),
                 chain_msg(2, b"t", b"nat", Some((HOOK_PRE_ROUTING, -100, b"nat"))),
                 chain_msg(2, b"t", b"post", Some((HOOK_PRE_ROUTING, 0, b"filter"))),
-                rule_msg(2, b"t", b"raw", &raw_rule),
+                rule_msg(
+                    2,
+                    b"t",
+                    b"raw",
+                    &[&daddr(pre_ip)[..], &dport(8080), &set_mark(0x42)].concat(),
+                ),
                 rule_msg(2, b"t", b"nat", &nat_rule),
-                rule_msg(2, b"t", b"post", &post_drop_pre_port),
-                rule_msg(2, b"t", b"post", &post_reject_marked_post),
+                rule_msg(
+                    2,
+                    b"t",
+                    b"post",
+                    &[&dport(8080)[..], &[drop_expr()]].concat(),
+                ),
+                rule_msg(
+                    2,
+                    b"t",
+                    b"post",
+                    &[
+                        &match_mark(0x42)[..],
+                        &daddr(post_ip),
+                        &dport(80),
+                        &[reject_rst()],
+                    ]
+                    .concat(),
+                ),
             ]),
             &peer(),
         );
@@ -5195,13 +5174,6 @@ mod tests {
         // 2. Boundary around NF_IP_PRI_NAT_DST (-100): -101 sees pre-DNAT (8080) while -100 sees
         //    post-DNAT (80), matching Linux regardless of the nat chain's declared priority.
         let ns2 = ns();
-        let mut pre_drop_80 = dport(80).to_vec();
-        pre_drop_80.push(verdict_expr(NF_DROP));
-        let mut pre_mark_8080 = dport(8080).to_vec();
-        pre_mark_8080.extend(set_mark(7));
-        let mut at_m100_drop_80 = match_mark(7).to_vec();
-        at_m100_drop_80.extend(dport(80));
-        at_m100_drop_80.push(verdict_expr(NF_DROP));
         let r = handle(
             &ns2,
             &root,
@@ -5220,9 +5192,24 @@ mod tests {
                     Some((HOOK_PRE_ROUTING, -100, b"filter")),
                 ),
                 chain_msg(2, b"t", b"n50", Some((HOOK_PRE_ROUTING, 50, b"nat"))),
-                rule_msg(2, b"t", b"f_m101", &pre_drop_80),
-                rule_msg(2, b"t", b"f_m101", &pre_mark_8080),
-                rule_msg(2, b"t", b"f_m100", &at_m100_drop_80),
+                rule_msg(
+                    2,
+                    b"t",
+                    b"f_m101",
+                    &[&dport(80)[..], &[drop_expr()]].concat(),
+                ),
+                rule_msg(
+                    2,
+                    b"t",
+                    b"f_m101",
+                    &[&dport(8080)[..], &set_mark(7)].concat(),
+                ),
+                rule_msg(
+                    2,
+                    b"t",
+                    b"f_m100",
+                    &[&match_mark(7)[..], &dport(80), &[drop_expr()]].concat(),
+                ),
                 rule_msg(2, b"t", b"n50", &nat_rule),
             ]),
             &peer(),
