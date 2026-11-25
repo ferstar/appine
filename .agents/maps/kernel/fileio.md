@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: gather vectored writes for all writable `/proc/sys` sysctls, including string and bitmap sysctls)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: align `fallocate` socket `ENODEV` and check order, `pread`/`pwrite` offset-before-fd order, and `sync_file_range` on loop devices and `O_PATH`)
 
 ## Responsibilities
 
@@ -154,10 +154,12 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 
 ### Size changes, cache hints and syncing
 
-- `fallocate` checks offset, length and `EFBIG` before the fd, then `prepare_write`, writability
-  (`EBADF`), directories `EISDIR`, pipes and sockets `ESPIPE`, other non-regular files `ENODEV`,
-  then the mode (0, `KEEP_SIZE`, `PUNCH_HOLE` with `KEEP_SIZE`, and `ZERO_RANGE` outside tmpfs),
-  then `RLIMIT_FSIZE`, seals and tmpfs room. Tmpfs records the reserved range against guest quota
+- `fallocate` looks up the fd first (`EBADF` on closed/`O_PATH` fds), then validates offset/len
+  (`EINVAL`), generic mode flags (`EOPNOTSUPP`), writability (`EBADF`), file type (pipes `ESPIPE`,
+  directories `EISDIR`, sockets and other non-regular files `ENODEV`), and `EFBIG` (`offset + len`
+  overflow), then calls `prepare_write`, filesystem-specific mode checks (0, `KEEP_SIZE`,
+  `PUNCH_HOLE` with `KEEP_SIZE`, and `ZERO_RANGE` outside tmpfs), `RLIMIT_FSIZE`, seals and tmpfs
+  room. Tmpfs records the reserved range against guest quota
   and extends the file when needed. Leaving host holes sparse keeps untouched reservations out of
   `SEEK_DATA` and overlay copy-up. A later write can still exhaust the host disk. Hole punching
   revokes tmpfs mappings' translations before releasing the backing pages. Other allocations,
@@ -172,8 +174,10 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   regular (`EBADF` on `O_PATH`), `RLIMIT_FSIZE` and seals, with no `ETXTBSY` check.
 - Cache hints and syncing: fadvise64 rejects `O_PATH` fds with `EBADF` (via `io_file`) before
   returning `ESPIPE` on pipes and sockets and `EINVAL` for a negative length or unknown advice,
-  else a no-op; sync_file_range passes regular files with flags to the
-  host, directories succeed, other files are `ESPIPE`; readahead accepts readable regular files;
+  else a no-op; sync_file_range rejects `O_PATH` fds with `EBADF` before validating flags/range,
+  passes regular files and bound writable loop devices with flags to the host (clamped to the loop
+  device's size and offset), directories and unbound/read-only loop devices succeed, other files
+  are `ESPIPE`; readahead accepts readable regular files;
   cachestat asks the host for regular files and reports zeros for others. fsync and fdatasync
   (regular files, directories, host fds, FUSE files and loop devices, else `EINVAL`) sync the host
   object with the BKL released (FUSE through the daemon, loop devices their backing file, host fds
@@ -276,11 +280,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - **Fidelity gaps**, one per line:
   - a memfd uses an unlinked store object. Extending it to `INT64_MAX` with `ftruncate`
     returns `EFBIG` on the development store, while native Linux accepts that length
-    (gVisor's `Pread64Test.Overflow`);
-  - sync_file_range on a loop device is `ESPIPE`.
-- **Error order in I/O calls:** pread and pwrite look up the fd before refusing a
-  negative offset; fallocate checks its arguments before the fd, its mode after the fd's type, and
-  on a socket is `ESPIPE` where 6.1 says `ENODEV`.
+    (gVisor's `Pread64Test.Overflow`).
 - **Clone fidelity:** FICLONE and FICLONERANGE work on a store that reports ext4's magic (ext4
   says `EOPNOTSUPP`); partial ranges are copied, not shared; `FIDEDUPERANGE` is `EOPNOTSUPP`.
 

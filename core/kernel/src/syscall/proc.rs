@@ -333,7 +333,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let fds = if flags & CLONE_FILES != 0 {
         cx.t.fds.clone()
     } else {
-        Rc::new(RefCell::new(cx.fds().clone()))
+        Rc::new(RefCell::new(cx.fds().clone_capped(cx.kr().nr_open)))
     };
     let fs = if flags & CLONE_FS != 0 {
         cx.t.fs.clone()
@@ -1007,7 +1007,7 @@ fn exec(
     // other threads are gone. A copy is a new owner, so the POSIX record locks this process holds
     // would be lost (crate::locks)
     if Rc::strong_count(&cx.t.fds) > 2 {
-        let copy = cx.fds().clone();
+        let copy = cx.fds().clone_capped(cx.kr().nr_open);
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }
     let closed = cx.fds_mut().close_on_exec();
@@ -1960,7 +1960,7 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     };
     // All fallible checks and allocations succeeded; commit everything now
     if copy_fds {
-        let copy = cx.fds().clone();
+        let copy = cx.fds().clone_capped(cx.kr().nr_open);
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }
     if flags & CLONE_FS != 0 && others(Rc::strong_count(&cx.t.fs)) {

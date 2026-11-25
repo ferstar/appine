@@ -1361,7 +1361,8 @@ impl<'a> Cx<'a> {
 
     /// Installs a new descriptor for the calling process.
     pub fn install_fd(&self, file: FileRef, cloexec: bool) -> Result<i32, Errno> {
-        self.fds_mut().install(file, cloexec, 0..self.nofile())
+        self.fds_mut()
+            .install_capped(file, cloexec, 0..self.nofile(), self.kr().nr_open)
     }
 
     /// fd table.

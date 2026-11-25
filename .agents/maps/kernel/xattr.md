@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: ACL access checks, mode synchronization and default inheritance)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: match Linux 6.1 synthetic-node `getxattr` (`EOPNOTSUPP` on procfs/devpts/nsfs/mqueue after `xattr_permission`, `ENODATA` on kernfs sysfs/cgroup2, `EOPNOTSUPP` for `system.*`))
 
 ## Responsibilities
 
@@ -73,8 +73,11 @@ checks and `FileCaps` (`kernel/cred`); path resolution (`kernel/vfs`); fd lookup
   the reader's namespace (or an ancestor's) a v2, any other `EOVERFLOW`. A non-empty value neither
   v2 nor v3 is `EINVAL` at write; an empty one is stored unchecked and reads as `EINVAL` (6.1
   skips the conversion for size 0).
-- Synthetic nodes: get `ENODATA`, set/remove `EOPNOTSUPP` (`EROFS` first on ro), empty list;
-  pipes and sockets `EOPNOTSUPP`.
+- Synthetic nodes: `getxattr` rejects `system.*` with `EOPNOTSUPP`, checks `xattr_permission`
+  (so unprivileged `trusted.*` and `user.*` on character devices such as `/dev/pts/ptmx` return
+  `ENODATA`), then returns `ENODATA` on kernfs nodes (sysfs, cgroup2) and `EOPNOTSUPP` on procfs,
+  devpts, nsfs and mqueue; set/remove `EOPNOTSUPP` (`EROFS` first on ro), empty list (0, matching
+  Linux's `security_inode_listsecurity` fallback); pipes and sockets `EOPNOTSUPP`.
 - Overlay nodes are copied up before a change and read through their topmost inode, and the
   overlay's own attributes are refused (`kernel/overlay`); FUSE files ask the daemon
   (`kernel/fuse`). A successful change reports `IN_ATTRIB` (`attrib`).
@@ -103,8 +106,7 @@ None recorded.
 
 ## Open questions
 
-- Is xattr `ENODATA` on every synthetic node intended? Linux's procfs and devpts have no xattr
-  handlers and answer `EOPNOTSUPP`.
+None recorded.
 
 ## To verify
 

@@ -1395,10 +1395,15 @@ fn open_store_with(
     // the host
     let st = store.attrs(ino)?;
     if check {
-        let mnt_flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
+        let node = Node::Store(mnt, ino);
+        let mnt_flags = vfs.mount_flags(&node).unwrap_or(0);
         // Read-only means the mount's flag or its instance's (mnt_want_write checks both), so a
-        // bind keeping rw flags over an instance remounted read-only cannot write either
-        let readonly = !memfd && vfs.readonly(&Node::Store(mnt, ino));
+        // bind keeping rw flags over an instance remounted read-only cannot write either. A
+        // read-only filesystem instance (sb_rdonly) returns EROFS before DAC permission
+        // (Linux 6.1's sb_permission in inode_permission), while a read-only bind over a writable
+        // instance checks DAC permission first except for O_TRUNC.
+        let readonly = !memfd && vfs.readonly(&node);
+        let sb_readonly = !memfd && vfs.sb_readonly_node(&node);
         let mut mask = open_mask(flags);
         match st.kind() {
             mode::S_IFLNK => return Err(Errno::ELOOP),
@@ -1416,6 +1421,9 @@ fn open_store_with(
                     return Err(Errno::EROFS);
                 }
                 mask |= MAY_WRITE;
+            }
+            mode::S_IFREG if accmode != oflags::O_RDONLY && sb_readonly => {
+                return Err(Errno::EROFS);
             }
             // Device nodes in a nodev mount cannot be opened (may_open_dev)
             mode::S_IFCHR | mode::S_IFBLK if mnt_flags & ms::NODEV != 0 => {
@@ -1819,7 +1827,9 @@ pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult
         return Err(Errno::EINVAL);
     }
     let file = cx.fds().get(old)?;
-    let replaced = cx.fds_mut().install_at(new, file, flags != 0, cx.nofile());
+    let replaced =
+        cx.fds_mut()
+            .install_at_capped(new, file, flags != 0, cx.nofile(), cx.kr().nr_open);
     let fds = cx.t.fds.clone();
     let replaced: Vec<_> = replaced?.into_iter().collect();
     locks::closed(cx.k(), &fds, &replaced);
@@ -1956,7 +1966,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
                 .filter(|&m| m < limit)
                 .ok_or(Errno::EINVAL)?;
             cx.fds_mut()
-                .install(file, cmd == F_DUPFD_CLOEXEC, min..limit)
+                .install_capped(file, cmd == F_DUPFD_CLOEXEC, min..limit, cx.kr().nr_open)
                 .map(|fd| fd as u64)
         }
         F_GETFD => Ok(cx.fds().cloexec(fd)? as u64),
@@ -2712,8 +2722,9 @@ pub(super) fn write(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize) -> SysResult
 }
 
 pub(super) fn pread(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64) -> SysResult {
+    let offset = checked_offset(offset)?;
     let file = cx.fds().get(fd)?;
-    read_file(cx, &file, buf, len, checked_offset(offset)?)
+    read_file(cx, &file, buf, len, offset)
 }
 
 /// Per-request I/O flags (`RWF_NOWAIT`, `RWF_APPEND`) that override `OpenFile::flags` for a
@@ -2725,8 +2736,9 @@ pub(super) struct IoFlags {
 }
 
 pub(super) fn pwrite(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64) -> SysResult {
+    let offset = checked_offset(offset)?;
     let file = cx.fds().get(fd)?;
-    let offset = append_offset(&file, checked_offset(offset)?, false)?;
+    let offset = append_offset(&file, offset, false)?;
     write_file(cx, &file, buf, len, offset)
 }
 
@@ -2832,10 +2844,25 @@ pub(super) fn splice(
     }
     let input = cx.fds().get(fd_in)?;
     let output = cx.fds().get(fd_out)?;
-    if !input.borrow().readable() || !output.borrow().writable() {
+    if input.borrow().flags & oflags::O_PATH != 0 || output.borrow().flags & oflags::O_PATH != 0 {
         return Err(Errno::EBADF);
     }
     let (in_pipe, out_pipe) = (pipe_of(&input), pipe_of(&output));
+    // Linux 6.1 __do_splice rejects offsets on pipe ends (ESPIPE) and copies user offsets
+    // (EFAULT) before do_splice checks access modes (EBADF), spliceability, and seekability.
+    if in_pipe.is_some() && off_in != 0 || out_pipe.is_some() && off_out != 0 {
+        return Err(Errno::ESPIPE);
+    }
+    let read_off = |cx: &Cx<'_>, addr: u64| -> Result<Option<i64>, Errno> {
+        match addr {
+            0 => Ok(None),
+            a => Ok(Some(i64::from_le_bytes(get(cx, a)?))),
+        }
+    };
+    let (raw_src, raw_dst) = (read_off(cx, off_in)?, read_off(cx, off_out)?);
+    if !input.borrow().readable() || !output.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
     if in_pipe.is_none() && out_pipe.is_none()
         || output.borrow().flags & oflags::O_APPEND != 0
         || !splice_reads(&input.borrow())
@@ -2843,21 +2870,16 @@ pub(super) fn splice(
     {
         return Err(Errno::EINVAL);
     }
-    if in_pipe.is_some() && off_in != 0 || out_pipe.is_some() && off_out != 0 {
-        return Err(Errno::ESPIPE);
-    }
-    let read_off = |cx: &Cx<'_>, addr: u64| -> Result<Option<u64>, Errno> {
-        match addr {
-            0 => Ok(None),
-            a => Ok(Some(
-                u64::try_from(i64::from_le_bytes(get(cx, a)?)).map_err(|_| Errno::EINVAL)?,
-            )),
+    let check_off = |file: &FileRef, raw: Option<i64>| -> Result<Option<u64>, Errno> {
+        let Some(off) = raw else {
+            return Ok(None);
+        };
+        if !seekable(&file.borrow()) {
+            return Err(Errno::EINVAL);
         }
+        u64::try_from(off).map(Some).map_err(|_| Errno::EINVAL)
     };
-    let (src, dst) = (read_off(cx, off_in)?, read_off(cx, off_out)?);
-    if src.is_some() && matches!(input.borrow().kind, FileKind::Socket(_)) {
-        return Err(Errno::EINVAL);
-    }
+    let (src, dst) = (check_off(&input, raw_src)?, check_off(&output, raw_dst)?);
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
     let wrote = match (in_pipe, out_pipe) {
         (Some((from, _)), Some((to, _))) => {
@@ -6240,6 +6262,9 @@ pub(super) fn cache_hint(
     let f = file.borrow();
     match kind {
         0 => {
+            if matches!(f.kind, FileKind::Path(_)) {
+                return Err(Errno::EBADF);
+            }
             if flags & !7 != 0 || offset < 0 || len < 0 || offset.checked_add(len).is_none() {
                 return Err(Errno::EINVAL);
             }
@@ -6254,8 +6279,22 @@ pub(super) fn cache_hint(
                         .map(|()| 0)
                         .map_err(Errno)
                 }
-                FileKind::Regular { .. } | FileKind::Directory { .. } => Ok(0),
-                FileKind::Path(_) => Err(Errno::EBADF),
+                FileKind::Device {
+                    block: Some(open), ..
+                } if flags != 0 => {
+                    let target = super::loopdev::sync_range(&open.dev, offset, len);
+                    drop(f);
+                    match target {
+                        Some((_keep, fd, off, n)) => cx
+                            .unlocked(|| appine_hal::sync_file_range(fd, off, n, flags))
+                            .map(|()| 0)
+                            .map_err(Errno),
+                        None => Ok(0),
+                    }
+                }
+                FileKind::Regular { .. }
+                | FileKind::Directory { .. }
+                | FileKind::Device { block: Some(_), .. } => Ok(0),
                 _ => Err(Errno::ESPIPE),
             }
         }
@@ -7158,15 +7197,14 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
 
 /// mkdir in a cgroup directory: creates a child cgroup ([`crate::cgroup::Cgroups::mkdir`]) with
 /// the permission bits `perm` gives after the umask (vfs_mkdir's `S_IRWXUGO|S_ISVTX`, which kernfs
-/// keeps). The order follows Linux: `.`, `..` and existing names are EEXIST, a read-only mount
-/// EROFS, no write permission on the directory EACCES.
+/// keeps). The order follows Linux: search permission on the parent (`EACCES`), `.`, `..` and
+/// existing names (`EEXIST`), read-only mount (`EROFS`), then write permission on the parent
+/// (`EACCES`).
 fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], perm: u32) -> Option<Result<(), Errno>> {
     let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
     Some((|| {
-        let vfs = cx.vfs()?;
-        if vfs.readonly(&dir) {
-            return Err(Errno::EROFS);
-        }
+        let cred = cx.cred();
+        cred.permission(&st, MAY_EXEC)?;
         let cgroups = &cx.kr().cgroups;
         let exists = cgroups
             .get(id)
@@ -7175,7 +7213,10 @@ fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], perm: u32) -> Option<R
         if name == b"." || name == b".." || exists {
             return Err(Errno::EEXIST);
         }
-        let cred = cx.cred();
+        let vfs = cx.vfs()?;
+        if vfs.readonly(&dir) {
+            return Err(Errno::EROFS);
+        }
         cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
         let mode = perm & 0o1777 & !cx.umask();
         cx.k().cgroups.mkdir(id, name, &cred, mode).map(|_| ())
@@ -9023,38 +9064,69 @@ fn truncate_regular(
 pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i64) -> SysResult {
     const FALLOC_FL_KEEP_SIZE: u32 = 0x1;
     const FALLOC_FL_PUNCH_HOLE: u32 = 0x2;
+    const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x8;
     const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+    const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+    const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;
+    // Linux 6.1 ksys_fallocate calls fdget(fd) first (rejecting closed and O_PATH fds with EBADF).
+    let file = cx.fds().get(fd)?;
+    if file.borrow().flags & oflags::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    // vfs_fallocate checks offset/len (EINVAL), then generic mode validity (EOPNOTSUPP), then
+    // FMODE_WRITE (EBADF), then inode type (FIFO ESPIPE, dir EISDIR, other non-reg ENODEV), then
+    // offset + len overflow / s_maxbytes (EFBIG).
     let (Ok(offset), Ok(len)) = (u64::try_from(offset), u64::try_from(len)) else {
         return Err(Errno::EINVAL);
     };
     if len == 0 {
         return Err(Errno::EINVAL);
     }
+    let valid_mode = matches!(
+        mode,
+        0 | FALLOC_FL_KEEP_SIZE
+            | FALLOC_FL_COLLAPSE_RANGE
+            | FALLOC_FL_INSERT_RANGE
+            | FALLOC_FL_ZERO_RANGE
+            | FALLOC_FL_UNSHARE_RANGE
+    ) || mode == FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
+        || mode == FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE
+        || mode == FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE;
+    if !valid_mode {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if !file.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
+    if let Some(io) = super::fuse::file_io(&file) {
+        offset
+            .checked_add(len)
+            .filter(|&e| e <= i64::MAX as u64)
+            .ok_or(Errno::EFBIG)?;
+        super::fuse::fallocate(cx, &io, mode, offset, len)?;
+        inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+        return Ok(0);
+    }
+    match &file.borrow().kind {
+        FileKind::Regular { .. } => {}
+        FileKind::Pipe(_) => return Err(Errno::ESPIPE),
+        FileKind::Directory { .. } => return Err(Errno::EISDIR),
+        _ => return Err(Errno::ENODEV),
+    }
     // Beyond the largest file length (i64::MAX)
     let end = offset
         .checked_add(len)
         .filter(|&e| e <= i64::MAX as u64)
         .ok_or(Errno::EFBIG)?;
-    let file = cx.fds().get(fd)?;
-    if let Some(io) = super::fuse::file_io(&file) {
-        if !file.borrow().writable() {
-            return Err(Errno::EBADF);
-        }
-        super::fuse::fallocate(cx, &io, mode, offset, len)?;
-        inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
-        return Ok(0);
-    }
     prepare_write(cx, &file, None)?;
     let f = file.borrow();
-    if !f.writable() {
-        return Err(Errno::EBADF);
-    }
-    let (ino, host) = match &f.kind {
-        FileKind::Regular { ino, file, .. } => (*ino, file),
-        FileKind::Directory { .. } => return Err(Errno::EISDIR),
-        FileKind::Pipe(_) | FileKind::Socket(_) => return Err(Errno::ESPIPE),
-        _ => return Err(Errno::ENODEV),
+    let FileKind::Regular {
+        ino, file: host, ..
+    } = &f.kind
+    else {
+        unreachable!("checked Regular above");
     };
+    let ino = *ino;
     let size = host.metadata().map_err(host_errno)?.len();
     let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
     let vfs = cx.vfs()?;

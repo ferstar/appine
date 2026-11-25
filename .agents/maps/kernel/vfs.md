@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `protected_regular`/`protected_fifos` sticky-directory open protection and open PTY `fstat` `st_blksize` 1024)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: check search permission and `EEXIST` before `EROFS` in cgroup `mkdir`, and expose `Vfs::sb_readonly_node` for `sb_permission`)
 
 ## Responsibilities
 
@@ -178,8 +178,9 @@ capabilities (`kernel/cred`).
   in creation after search and `EEXIST`, before directory write permission; in unlink and rmdir
   after the `.`/`..` checks, before lookup; in rename after `EXDEV` and the `.`/`..` checks; in
   attribute changes before permission; in truncate after the type checks; in write opens of
-  regular files after permission and `O_NOATIME` (`O_TRUNC` before permission; overlay opens before
-  permission). noexec: exec `EACCES` after the execute check, `access`/`faccessat(X_OK)` on a
+  regular files before permission for read-only instances (`sb_readonly_node`, `O_TRUNC` and
+  overlay opens), and after permission and `O_NOATIME` for read-only bind mounts on writable
+  instances. noexec: exec `EACCES` after the execute check, `access`/`faccessat(X_OK)` on a
   regular non-memfd file `EACCES`, `PROT_EXEC` mmap `EPERM` (a memfd checked against the root
   mount), and such a mapping cannot gain `PROT_EXEC` through mprotect (`EACCES`); exec never treats
   memfds as noexec. nosuid: exec ignores set-id bits and file caps
@@ -390,7 +391,6 @@ capabilities (`kernel/cred`).
   append-only, immutable, nodump and noatime (LTP unlink09, copy_file_range02).
 - **Fidelity gaps**, one per line:
   - statx: no btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`;
-  - cgroup mkdir reports `EROFS` before `EEXIST`;
   - the store's rename errors come after permission.
 - **Scoped openat2 never returns `EAGAIN`:** the walk is atomic under the BKL, so a `..` walked
   while another thread mounts or renames never asks the caller to retry. Safe.

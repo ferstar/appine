@@ -3489,8 +3489,13 @@ impl Vfs {
 
     /// `node` is in a read-only mount or filesystem: changing it is EROFS.
     pub(crate) fn readonly(&self, node: &Node) -> bool {
-        self.mount_flags(node).is_some_and(|f| f & ms::RDONLY != 0)
-            || self.with_mount(node.mnt(), |m| self.sb_readonly(m)) == Some(true)
+        self.mount_flags(node).is_some_and(|f| f & ms::RDONLY != 0) || self.sb_readonly_node(node)
+    }
+
+    /// `node`'s filesystem instance itself is read-only (Linux's `sb_rdonly`), regardless of the
+    /// mount's own flags.
+    pub(crate) fn sb_readonly_node(&self, node: &Node) -> bool {
+        self.with_mount(node.mnt(), |m| self.sb_readonly(m)) == Some(true)
     }
 
     /// Mount `m`'s filesystem itself is read-only (Linux's `sb_rdonly`), whatever the mount's

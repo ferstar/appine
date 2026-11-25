@@ -111,6 +111,19 @@ pub(super) fn getxattr(
             Ok(v) => reply(cx, value, size, &v),
         };
     }
+    if let Node::Pseudo(_, pseudo) = node {
+        let vfs = cx.vfs()?;
+        let st = crate::pseudo::stat(&cx.view(&vfs), &pseudo)?;
+        if name.starts_with(b"system.") {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        permission(cx, &st, &name, false)?;
+        return Err(if pseudo_has_xattr(&pseudo) {
+            Errno::ENODATA
+        } else {
+            Errno::EOPNOTSUPP
+        });
+    }
     let ino = readable_ino(cx, node, &name)?;
     let vfs = cx.vfs()?;
     let st = vfs.store().attrs(ino)?;
@@ -396,9 +409,27 @@ fn store_ino(node: Node, pseudo: Errno) -> Result<Ino, Errno> {
     node.ino().ok_or(pseudo)
 }
 
+/// Whether synthetic node `node` belongs to a filesystem with xattr handlers in Linux 6.1:
+/// kernfs-backed filesystems (sysfs, cgroup2) have xattr handlers and answer `ENODATA` for
+/// missing attributes, whereas procfs, devpts, nsfs and mqueue have no xattr handlers and answer
+/// `EOPNOTSUPP`.
+fn pseudo_has_xattr(node: &crate::pseudo::PseudoNode) -> bool {
+    use crate::pseudo::PseudoNode;
+    matches!(
+        node,
+        PseudoNode::SysRoot
+            | PseudoNode::Sys(..)
+            | PseudoNode::SysCpu(..)
+            | PseudoNode::SysNet(..)
+            | PseudoNode::SysBrif(..)
+            | PseudoNode::SysBlock(..)
+            | PseudoNode::Cgroup(..)
+    )
+}
+
 /// The inode whose attribute `name` is read: a store node's own, or the one behind an overlay
 /// node, whose overlay keeps the attributes with its private prefix to itself (EOPNOTSUPP, as
-/// 6.1's `ovl_own_xattr_get`); ENODATA for nodes of synthetic filesystems.
+/// 6.1's `ovl_own_xattr_get`).
 fn readable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
     match node {
         Node::Overlay(_, o) => {
@@ -409,7 +440,7 @@ fn readable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
             }
             Ok(ovl.node(o).real())
         }
-        node => store_ino(node, Errno::ENODATA),
+        node => store_ino(node, Errno::EOPNOTSUPP),
     }
 }
 

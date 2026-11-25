@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: reject `splice` on procfs nodes lacking `splice_read`/`splice_write` and per-page faulting-buffer semantics in `pipe_write_user`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: align `splice` pipe-offset (`ESPIPE`) before access-mode (`EBADF`) order and validate unseekable input/output offsets (`EINVAL`) before waiting)
 
 ## Responsibilities
 
@@ -71,10 +71,11 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
   (read, readv, vmsplice, another splice out) waits whatever `O_NONBLOCK` says, as for Linux's pipe
   lock; writers do not wait. Unknown flags `EINVAL`; a zero length returns 0 first in splice,
   after the flags in tee, and in vmsplice after the flags, access mode and iovecs (a non-pipe fd
-  is `EBADF` only after that). splice checks access modes (`EBADF`), then its `EINVAL` cases (no
-  pipe, an `O_APPEND` output including FIFOs, an end that cannot splice that way), then offsets on
-  a pipe (`ESPIPE`). An explicit socket input offset gives `EINVAL` before waiting for room or
-  consuming data. Other unseekable inputs can return `ESPIPE` after the wait for room. `/dev/fuse` splices
+  is `EBADF` only after that). splice rejects `O_PATH` fds (`EBADF`), checks offsets on a pipe
+  (`ESPIPE`) and reads user offsets (`EFAULT`) before checking access modes (`EBADF`), then its
+  `EINVAL` cases (no pipe, an `O_APPEND` output including FIFOs, an end that cannot splice that
+  way), then rejects explicit offsets on any unseekable end or negative offsets (`EINVAL`) before
+  waiting for pipe room or data. `/dev/fuse` splices
   one whole request into a pipe (waiting as the device's own `O_NONBLOCK` says, `EIO` without
   room) and takes a reply of exactly the length asked, setting its header length to it (libfuse
   fixes the length in user memory after vmsplicing the header, which a copying vmsplice does not
@@ -129,9 +130,6 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 
 ## Confirmed bugs / technical debt
 
-- **splice's checks differ:** access modes (`EBADF`) come before a pipe given an offset
-  (`ESPIPE`), where 6.1 returns `ESPIPE` first; some unseekable non-socket inputs return `ESPIPE`
-  after waiting for room where Linux returns `EINVAL`.
 - **Fidelity gaps**, one per line:
   - `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues);
   - vmsplice copies at the call, so later changes to the buffer are not seen by the reader.

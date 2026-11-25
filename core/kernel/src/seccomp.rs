@@ -548,7 +548,8 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     match fd {
         Some(fd) => {
             let file = OpenFile::new(FileKind::SeccompNotify(Listener(filter)), oflags::O_RDWR);
-            cx.fds_mut().install_at(fd, file, true, cx.nofile())?;
+            cx.fds_mut()
+                .install_at_capped(fd, file, true, cx.nofile(), cx.kr().nr_open)?;
             Ok(fd as u64)
         }
         None => Ok(0),
@@ -1141,10 +1142,11 @@ fn addfd(cx: &mut Cx<'_>, f: &Filter, arg: u64, size: usize) -> Result<u64, Errn
     let fds = task.res.borrow().fds.clone();
     let limit = cx.kr().groups[&task.tgid].borrow().nofile();
     let cloexec = newfd_flags & oflags::O_CLOEXEC != 0;
+    let nr_open = cx.kr().nr_open;
     let installed = if flags & ADDFD_FLAG_SETFD != 0 {
-        let replaced = fds
-            .borrow_mut()
-            .install_at(newfd as i32, file, cloexec, limit);
+        let replaced =
+            fds.borrow_mut()
+                .install_at_capped(newfd as i32, file, cloexec, limit, nr_open);
         match replaced {
             Ok(old) => {
                 let old: Vec<_> = old.into_iter().collect();
@@ -1154,7 +1156,8 @@ fn addfd(cx: &mut Cx<'_>, f: &Filter, arg: u64, size: usize) -> Result<u64, Errn
             Err(e) => Err(e),
         }
     } else {
-        fds.borrow_mut().install(file, cloexec, 0..limit)
+        fds.borrow_mut()
+            .install_capped(file, cloexec, 0..limit, nr_open)
     };
     let fd = installed?;
     if flags & ADDFD_FLAG_SEND != 0 {

@@ -775,10 +775,16 @@ struct Slot {
     cloexec: bool,
 }
 
+/// Initial logical descriptor-table capacity (Linux's `NR_OPEN_DEFAULT = BITS_PER_LONG`).
+const MIN_CAPACITY: usize = 64;
+
 /// A process's fd table.
-#[derive(Default)]
 pub struct FdTable {
     slots: Vec<Option<Slot>>,
+    /// Logical table capacity (`fdt->max_fds`): starts at 64 and grows in powers of two, capped
+    /// at the kernel's `nr_open` rounded up to 64 when expanding. Closing a file clears its slot
+    /// without shrinking the table.
+    capacity: usize,
     /// fds taken by [`reserve`](Self::reserve) for a file not made yet (Linux's
     /// `get_unused_fd_flags`: an open_fds bit with no file): new fds skip them, dup2 onto one is
     /// EBUSY, and every other call sees them closed.
@@ -787,16 +793,42 @@ pub struct FdTable {
     pub holds_locks: bool,
 }
 
+impl Default for FdTable {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            capacity: MIN_CAPACITY,
+            reserved: Vec::new(),
+            holds_locks: false,
+        }
+    }
+}
+
 impl FdTable {
     /// An empty table.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Linux starts with 64 descriptors and grows in powers of two. Closing a file clears
-    /// its slot without shrinking the allocated table.
+    /// Logical capacity of the descriptor table (`fdt->max_fds`).
     pub fn capacity(&self) -> usize {
-        self.slots.len().max(64).next_power_of_two()
+        self.capacity
+    }
+
+    /// Expands the table's logical capacity to hold descriptor `fd` (Linux's `expand_files` and
+    /// `alloc_fdtable`): when `fd` already fits, no expansion occurs; otherwise refuses `fd >=
+    /// nr_open` with `EMFILE` and grows by powers of two capped at `nr_open` rounded up to 64.
+    fn grow_for(&mut self, fd: usize, nr_open: usize) -> Result<(), Errno> {
+        if fd < self.capacity {
+            return Ok(());
+        }
+        if fd >= nr_open {
+            return Err(Errno::EMFILE);
+        }
+        let pow2 = (fd + 1).max(MIN_CAPACITY).next_power_of_two();
+        let cap = nr_open.next_multiple_of(MIN_CAPACITY).max(MIN_CAPACITY);
+        self.capacity = pow2.min(cap).max(self.capacity);
+        Ok(())
     }
 
     /// 0/1/2 are the host's stdin/stdout/stderr respectively.
@@ -826,7 +858,19 @@ impl FdTable {
         cloexec: bool,
         range: Range<usize>,
     ) -> Result<i32, Errno> {
+        self.install_capped(file, cloexec, range, MAX_FDS)
+    }
+
+    /// Installs at the lowest free fd in `range`, respecting `nr_open` when expanding the table.
+    pub fn install_capped(
+        &mut self,
+        file: FileRef,
+        cloexec: bool,
+        range: Range<usize>,
+        nr_open: usize,
+    ) -> Result<i32, Errno> {
         let fd = self.free_slot(range)?;
+        self.grow_for(fd as usize, nr_open)?;
         self.replace_slot(fd as usize, Slot { file, cloexec });
         Ok(fd)
     }
@@ -842,7 +886,13 @@ impl FdTable {
     /// Takes the lowest free fd in `range` for a file to be made later (accept4 before it
     /// waits), until [`fill`](Self::fill) or [`unreserve`](Self::unreserve).
     pub fn reserve(&mut self, range: Range<usize>) -> Result<i32, Errno> {
+        self.reserve_capped(range, MAX_FDS)
+    }
+
+    /// Reserves the lowest free fd in `range`, respecting `nr_open` when expanding the table.
+    pub fn reserve_capped(&mut self, range: Range<usize>, nr_open: usize) -> Result<i32, Errno> {
         let fd = self.free_slot(range)?;
+        self.grow_for(fd as usize, nr_open)?;
         if self.slots.len() <= fd as usize {
             self.slots.resize(fd as usize + 1, None);
         }
@@ -871,6 +921,19 @@ impl FdTable {
         cloexec: bool,
         limit: usize,
     ) -> Result<Option<FileRef>, Errno> {
+        self.install_at_capped(fd, file, cloexec, limit, MAX_FDS)
+    }
+
+    /// Installs at `fd`, respecting `nr_open` when expanding (returning `EBADF`, as Linux's
+    /// `do_dup2` / `replace_fd` maps `expand_files`'s `EMFILE` to `EBADF`).
+    pub fn install_at_capped(
+        &mut self,
+        fd: i32,
+        file: FileRef,
+        cloexec: bool,
+        limit: usize,
+        nr_open: usize,
+    ) -> Result<Option<FileRef>, Errno> {
         let i = usize::try_from(fd)
             .ok()
             .filter(|&i| i < limit)
@@ -878,6 +941,9 @@ impl FdTable {
         // An fd reserved for a file still being made (do_dup2)
         if self.reserved.contains(&i) {
             return Err(Errno::EBUSY);
+        }
+        if self.grow_for(i, nr_open).is_err() {
+            return Err(Errno::EBADF);
         }
         Ok(self.replace_slot(i, Slot { file, cloexec }))
     }
@@ -971,12 +1037,22 @@ impl FdTable {
         file.map(|(i, _)| i).max(reserved).map_or(0, |i| i + 1)
     }
 
-    fn copy_slots(&self, len: usize) -> Self {
+    fn copy_slots(&self, len: usize, nr_open: usize) -> Self {
+        let min_cap = len.next_multiple_of(MIN_CAPACITY).max(MIN_CAPACITY);
+        let pow2 = len.max(MIN_CAPACITY).next_power_of_two();
+        let cap = nr_open.next_multiple_of(MIN_CAPACITY).max(min_cap);
         Self {
             slots: self.slots[..len].to_vec(),
+            capacity: pow2.min(cap),
             reserved: Vec::new(),
             holds_locks: false,
         }
+    }
+
+    /// Clones the table, sizing its logical capacity for the surviving descriptors capped by
+    /// `nr_open` rounded up to 64 (Linux's `dup_fd`).
+    pub fn clone_capped(&self, nr_open: usize) -> Self {
+        self.copy_slots(self.copy_len(|_| true), nr_open)
     }
 
     /// Applies close_range while unsharing. Size the new table for the surviving bitmap
@@ -992,7 +1068,7 @@ impl FdTable {
         if len.next_multiple_of(64) > nr_open {
             return Err(Errno::EMFILE);
         }
-        let mut copy = self.copy_slots(len);
+        let mut copy = self.copy_slots(len, nr_open);
         let mut closed = copy.close_range(first, last, cloexec);
         closed.extend(self.slots[len..].iter().flatten().map(|s| s.file.clone()));
         Ok((copy, closed))
@@ -1018,7 +1094,7 @@ impl Clone for FdTable {
     /// fork, clone without `CLONE_FILES`, unshare: POSIX locks belong to the original fd table
     /// and are not copied with it, nor are reserved fds (dup_fd clears their bits).
     fn clone(&self) -> Self {
-        self.copy_slots(self.copy_len(|_| true))
+        self.clone_capped(MAX_FDS)
     }
 }
 
@@ -1110,5 +1186,55 @@ mod tests {
         assert_eq!(t.reserve(0..DEFAULT_NOFILE.0), Ok(5));
         t.unreserve(5);
         assert_eq!(t.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(5));
+    }
+
+    #[test]
+    fn table_growth_respects_nr_open_cap() {
+        let mut t = FdTable::with_host_stdio();
+        let f = t.get(1).unwrap();
+        assert_eq!(t.capacity(), 64);
+
+        // Lowered nr_open (192) caps expansion instead of rounding up to 256.
+        assert!(
+            t.install_at_capped(150, f.clone(), false, 4096, 192)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(t.capacity(), 192);
+        // Expanding past nr_open fails with EBADF for dup3/install_at and EMFILE for alloc/reserve.
+        assert_eq!(
+            t.install_at_capped(192, f.clone(), false, 4096, 192).err(),
+            Some(Errno::EBADF)
+        );
+        assert_eq!(
+            t.install_capped(f.clone(), false, 192..4096, 192),
+            Err(Errno::EMFILE)
+        );
+        assert_eq!(t.reserve_capped(192..4096, 192), Err(Errno::EMFILE));
+        // Slot 191 still fits within the already-expanded capacity (192).
+        assert_eq!(t.install_capped(f.clone(), false, 191..4096, 192), Ok(191));
+        assert_eq!(t.capacity(), 192);
+
+        // Lowering nr_open further does not shrink existing capacity; fds within existing capacity
+        // still succeed, while fds requiring expansion past nr_open fail.
+        assert!(
+            t.install_at_capped(180, f.clone(), false, 4096, 128)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(t.capacity(), 192);
+        assert_eq!(
+            t.install_capped(f.clone(), false, 192..4096, 128),
+            Err(Errno::EMFILE)
+        );
+
+        // Cloning with nr_open=192 also keeps capacity capped at 192.
+        let copy = t.clone_capped(192);
+        assert_eq!(copy.capacity(), 192);
+
+        // Unsharing with close_range caps the new table at nr_open as well.
+        let (unshared, closed) = t.unshare_close_range(180, 191, false, 192).unwrap();
+        assert_eq!(unshared.capacity(), 192);
+        assert_eq!(closed.len(), 2);
     }
 }

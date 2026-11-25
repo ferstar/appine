@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: enforce store/tmpfs superblock boundary in `open_by_handle_at`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: check `sb_permission` (`EROFS`) before DAC permission on read-only instances and cap fd-table growth at `nr_open`)
 
 ## Responsibilities
 
@@ -82,8 +82,9 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   New fds skip a reserved slot until `fill` or `unreserve` ends the reservation. While reserved,
   dup3 and seccomp's `SECCOMP_ADDFD_FLAG_SETFD` report `EBUSY`, other lookups see it closed and
   fork does not copy it. Installing or reserving a descriptor grows the table's logical capacity
-  (at least 64, rounded up to a power of two). Closing or cancelling a reservation retains this
-  capacity for `pselect6`. arm64 has no dup2.
+  (at least 64, rounded up to a power of two, capped at `nr_open` rounded up to 64; expanding to
+  `fd >= nr_open` fails with `EMFILE`, or `EBADF` for `dup3`). Closing or cancelling a reservation
+  retains this capacity for `pselect6`. arm64 has no dup2.
 - dup and fork share one `OpenFile` (offset and status flags shared). Clone without `CLONE_FILES`
   sizes the copy from the highest open or reserved fd, copies open slots, and resets
   `holds_locks`. Every thread holds two references to its
@@ -149,9 +150,10 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   A direct `mq_open` marks its descriptor `pseudo` for the internal mqueue instance.
 - Store nodes (`open_store`), unless just created: symlink `ELOOP`; a directory with write access,
   `O_CREAT` or `O_TRUNC` `EISDIR`; a regular file with `O_TRUNC` `EROFS` on ro, else it adds
-  `MAY_WRITE`; devices on nodev `EACCES`; permission; the cgroup BPF device filter (not for device
-  number 0); `O_NOATIME` by a non-owner without `CAP_FOWNER` `EPERM`; a regular file opened for
-  writing on ro `EROFS`. Then always: the `O_DIRECT` rule; `EISDIR` for directories and `ENOTDIR`
+  `MAY_WRITE`; a regular file opened for writing on a read-only instance (`sb_rdonly`) `EROFS`
+  before DAC permission (`sb_permission`); devices on nodev `EACCES`; permission; the cgroup BPF
+  device filter (not for device number 0); `O_NOATIME` by a non-owner without `CAP_FOWNER`
+  `EPERM`; a regular file opened for writing on a read-only bind mount `EROFS`. Then always: the `O_DIRECT` rule; `EISDIR` for directories and `ENOTDIR`
   for `O_DIRECTORY` (after the checks above, where `do_open` checks before `may_open`); unless
   just created, writing an executing file `ETXTBSY` and lease breaks; `O_TRUNC` removes set-id bits
   and truncates (`kernel/fileio`), with `O_RDONLY` too (through a writable handle of its own), a
@@ -283,10 +285,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 ## Confirmed bugs / technical debt
 
 - **Fidelity gaps**, one per line:
-  - no `O_TMPFILE`;
-  - a write open on a read-only instance is `EROFS` only after permission (6.1's `sb_permission`
-    comes first; overlay opens already do);
-  - table growth uses power-of-two capacity even when a lowered `nr_open` would cap Linux’s allocation.
+  - no `O_TMPFILE`.
 
 ## Open questions
 
