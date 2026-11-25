@@ -1485,6 +1485,635 @@ static void test_dualstack_dnat_and_close_wait_peer(int filtered)
     ok("dualstack_dnat_and_close_wait_peer");
 }
 
+/* ---- 11. kernel/netlink: rtnetlink notification seq/port/flags and NLM_F_ECHO ---- */
+
+static void test_rtnl_notify_echo_child(void)
+{
+    enum {
+        SOL_NETLINK_ = 270,
+        NETLINK_PKTINFO_ = 3,
+        NLM_F_ECHO_ = 0x08,
+        RTM_DELADDR_ = 21,
+        RTM_DELROUTE_ = 25,
+        RTMGRP_LINK_ = 0x1,
+        RTMGRP_IPV4_IFADDR_ = 0x10,
+        RTMGRP_IPV4_ROUTE_ = 0x40,
+        RTMGRP_IPV6_ROUTE_ = 0x400,
+    };
+    struct nl_pktinfo_ {
+        uint32_t group;
+    };
+
+    CHECK(unshare(CLONE_NEWNET) == 0, "unshare net");
+    int setup = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    CHECK(setup >= 0, "setup rtnl");
+    set_link_up(setup, 1);
+    create_dummy(setup, "d0");
+    int d0 = (int)if_nametoindex("d0");
+    CHECK(d0 > 1, "d0 index");
+    set_link_up(setup, d0);
+    close(setup);
+
+    uint32_t all_groups = RTMGRP_LINK_ | RTMGRP_IPV4_IFADDR_ | RTMGRP_IPV4_ROUTE_ | RTMGRP_IPV6_ROUTE_;
+    int mon = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    int tx = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    int txs = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    CHECK(mon >= 0 && tx >= 0 && txs >= 0, "nl sockets");
+    struct sockaddr_nl sa_mon = {.nl_family = AF_NETLINK, .nl_groups = all_groups};
+    struct sockaddr_nl sa_tx = {.nl_family = AF_NETLINK, .nl_groups = 0};
+    struct sockaddr_nl sa_txs = {.nl_family = AF_NETLINK, .nl_groups = all_groups};
+    CHECK(bind(mon, (struct sockaddr *)&sa_mon, sizeof sa_mon) == 0, "bind mon");
+    CHECK(bind(tx, (struct sockaddr *)&sa_tx, sizeof sa_tx) == 0, "bind tx");
+    CHECK(bind(txs, (struct sockaddr *)&sa_txs, sizeof sa_txs) == 0, "bind txs");
+    int one = 1;
+    CHECK(setsockopt(tx, SOL_NETLINK_, NETLINK_PKTINFO_, &one, sizeof one) == 0, "pktinfo tx");
+    CHECK(setsockopt(txs, SOL_NETLINK_, NETLINK_PKTINFO_, &one, sizeof one) == 0, "pktinfo txs");
+    CHECK(setsockopt(mon, SOL_NETLINK_, NETLINK_PKTINFO_, &one, sizeof one) == 0, "pktinfo mon");
+
+    socklen_t sl = sizeof sa_tx;
+    CHECK(getsockname(tx, (struct sockaddr *)&sa_tx, &sl) == 0, "getsockname tx");
+    CHECK(getsockname(txs, (struct sockaddr *)&sa_txs, &sl) == 0, "getsockname txs");
+    uint32_t tx_pid = sa_tx.nl_pid;
+    uint32_t txs_pid = sa_txs.nl_pid;
+    CHECK(tx_pid != 0 && txs_pid != 0 && tx_pid != txs_pid, "distinct pids");
+
+    /* Helper macro to read one message header + pktinfo group */
+#define RECV_ONE(fd_, hdr_, grp_)                                                                  \
+    do {                                                                                           \
+        uint8_t _buf[4096], _ctl[64];                                                              \
+        struct sockaddr_nl _from = {0};                                                            \
+        struct iovec _v = {_buf, sizeof _buf};                                                     \
+        struct msghdr _m = {.msg_name = &_from,                                                    \
+                            .msg_namelen = sizeof _from,                                           \
+                            .msg_iov = &_v,                                                        \
+                            .msg_iovlen = 1,                                                       \
+                            .msg_control = _ctl,                                                   \
+                            .msg_controllen = sizeof _ctl};                                        \
+        ssize_t _n = recvmsg((fd_), &_m, MSG_DONTWAIT);                                            \
+        CHECK(_n >= (ssize_t)sizeof(struct nlmsghdr), "recvmsg %zd", _n);                          \
+        memcpy(&(hdr_), _buf, sizeof(hdr_));                                                       \
+        (grp_) = 0;                                                                                \
+        for (struct cmsghdr *_c = CMSG_FIRSTHDR(&_m); _c; _c = CMSG_NXTHDR(&_m, _c))               \
+            if (_c->cmsg_level == SOL_NETLINK_ && _c->cmsg_type == NETLINK_PKTINFO_)               \
+                (grp_) = ((struct nl_pktinfo_ *)CMSG_DATA(_c))->group;                             \
+    } while (0)
+
+    /* 1. IPv4 RTM_NEWADDR with NLM_F_ECHO|NLM_F_ACK on unsubscribed tx:
+     *    tx gets echoed RTM_NEWADDR before ACK with seq/pid/group=5;
+     *    mon gets RTM_NEWADDR with seq/pid plus auto-routes with CREATE|EXCL and seq/pid=0. */
+    struct in_addr ip;
+    CHECK(inet_pton(AF_INET, "10.66.0.1", &ip) == 1, "pton");
+    struct nlbuf b;
+    nl_init(&b, RTM_NEWADDR, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK | NLM_F_ECHO_, 501);
+    struct ifaddrmsg ifa = {.ifa_family = AF_INET, .ifa_prefixlen = 24, .ifa_index = (uint32_t)d0};
+    nl_put_raw(&b, &ifa, sizeof ifa);
+    nl_attr(&b, IFA_LOCAL, &ip, 4);
+    nl_attr(&b, IFA_ADDRESS, &ip, 4);
+    nl_finish(&b);
+    CHECK(send(tx, b.data, b.len, 0) == (ssize_t)b.len, "send NEWADDR");
+
+    struct nlmsghdr h;
+    uint32_t grp;
+    RECV_ONE(tx, h, grp);
+    CHECK(h.nlmsg_type == RTM_NEWADDR && h.nlmsg_flags == 0 && h.nlmsg_seq == 501 &&
+              h.nlmsg_pid == tx_pid && grp == 5,
+          "tx echo NEWADDR got ty=%u fl=%#x seq=%u pid=%u grp=%u", h.nlmsg_type, h.nlmsg_flags,
+          h.nlmsg_seq, h.nlmsg_pid, grp);
+    RECV_ONE(tx, h, grp);
+    CHECK(h.nlmsg_type == NLMSG_ERROR && h.nlmsg_seq == 501 && grp == 0, "tx ACK after echo");
+
+    int saw_addr = 0, saw_auto_rt = 0;
+    for (;;) {
+        uint8_t tmp[4096];
+        ssize_t n = recv(mon, tmp, sizeof tmp, MSG_DONTWAIT);
+        if (n < 0 && errno == EAGAIN)
+            break;
+        CHECK(n >= (ssize_t)sizeof h, "mon recv");
+        memcpy(&h, tmp, sizeof h);
+        if (h.nlmsg_type == RTM_NEWADDR) {
+            CHECK(h.nlmsg_seq == 501 && h.nlmsg_pid == tx_pid && h.nlmsg_flags == 0,
+                  "mon NEWADDR seq=%u pid=%u fl=%#x", h.nlmsg_seq, h.nlmsg_pid, h.nlmsg_flags);
+            saw_addr = 1;
+        } else if (h.nlmsg_type == RTM_NEWROUTE) {
+            CHECK(h.nlmsg_seq == 0 && h.nlmsg_pid == 0 &&
+                      h.nlmsg_flags == (NLM_F_CREATE | NLM_F_EXCL),
+                  "mon auto NEWROUTE seq=%u pid=%u fl=%#x", h.nlmsg_seq, h.nlmsg_pid, h.nlmsg_flags);
+            saw_auto_rt = 1;
+        }
+    }
+    CHECK(saw_addr && saw_auto_rt, "mon saw addr=%d rt=%d", saw_addr, saw_auto_rt);
+    /* Drain txs from step 1 */
+    while (recv(txs, b.data, sizeof b.data, MSG_DONTWAIT) > 0)
+        ;
+
+    /* 2. IPv4 RTM_NEWROUTE CREATE|ACK|ECHO (even without EXCL -> notifies CREATE|EXCL) */
+    struct in_addr dst;
+    CHECK(inet_pton(AF_INET, "10.67.0.0", &dst) == 1, "pton");
+    nl_init(&b, RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK | NLM_F_ECHO_, 502);
+    struct rtmsg rtm = {.rtm_family = AF_INET,
+                        .rtm_dst_len = 24,
+                        .rtm_table = RT_TABLE_MAIN,
+                        .rtm_protocol = RTPROT_BOOT,
+                        .rtm_scope = RT_SCOPE_LINK,
+                        .rtm_type = RTN_UNICAST};
+    nl_put_raw(&b, &rtm, sizeof rtm);
+    nl_attr(&b, RTA_DST, &dst, 4);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)d0);
+    nl_finish(&b);
+    CHECK(send(tx, b.data, b.len, 0) == (ssize_t)b.len, "send NEWROUTE");
+
+    RECV_ONE(tx, h, grp);
+    CHECK(h.nlmsg_type == RTM_NEWROUTE && h.nlmsg_flags == (NLM_F_CREATE | NLM_F_EXCL) &&
+              h.nlmsg_seq == 502 && h.nlmsg_pid == tx_pid && grp == 7,
+          "tx echo NEWROUTE ty=%u fl=%#x seq=%u pid=%u grp=%u", h.nlmsg_type, h.nlmsg_flags,
+          h.nlmsg_seq, h.nlmsg_pid, grp);
+    RECV_ONE(tx, h, grp);
+    CHECK(h.nlmsg_type == NLMSG_ERROR && h.nlmsg_seq == 502, "tx ACK NEWROUTE");
+    RECV_ONE(mon, h, grp);
+    CHECK(h.nlmsg_type == RTM_NEWROUTE && h.nlmsg_flags == (NLM_F_CREATE | NLM_F_EXCL) &&
+              h.nlmsg_seq == 502 && h.nlmsg_pid == tx_pid && grp == 7,
+          "mon NEWROUTE");
+    while (recv(txs, b.data, sizeof b.data, MSG_DONTWAIT) > 0)
+        ;
+
+    /* 3. Subscribed sender txs sends RTM_NEWROUTE REPLACE|CREATE|ACK|ECHO:
+     *    must receive ONLY ONE RTM_NEWROUTE (before ACK, no duplicate!), with NLM_F_REPLACE. */
+    nl_init(&b, RTM_NEWROUTE,
+            NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK | NLM_F_ECHO_, 503);
+    rtm.rtm_protocol = 4; /* RTPROT_STATIC */
+    nl_put_raw(&b, &rtm, sizeof rtm);
+    nl_attr(&b, RTA_DST, &dst, 4);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)d0);
+    nl_finish(&b);
+    CHECK(send(txs, b.data, b.len, 0) == (ssize_t)b.len, "send replace");
+
+    RECV_ONE(txs, h, grp);
+    CHECK(h.nlmsg_type == RTM_NEWROUTE && h.nlmsg_flags == NLM_F_REPLACE && h.nlmsg_seq == 503 &&
+              h.nlmsg_pid == txs_pid && grp == 7,
+          "txs echo REPLACE ty=%u fl=%#x seq=%u pid=%u grp=%u", h.nlmsg_type, h.nlmsg_flags,
+          h.nlmsg_seq, h.nlmsg_pid, grp);
+    RECV_ONE(txs, h, grp);
+    CHECK(h.nlmsg_type == NLMSG_ERROR && h.nlmsg_seq == 503, "txs ACK REPLACE");
+    errno = 0;
+    CHECK(recv(txs, b.data, sizeof b.data, MSG_DONTWAIT) == -1 && errno == EAGAIN,
+          "subscribed sender with NLM_F_ECHO must not get duplicate");
+    RECV_ONE(mon, h, grp);
+    CHECK(h.nlmsg_type == RTM_NEWROUTE && h.nlmsg_flags == NLM_F_REPLACE && h.nlmsg_seq == 503 &&
+              h.nlmsg_pid == txs_pid,
+          "mon REPLACE");
+
+    /* 4. DELROUTE with ECHO|ACK */
+    nl_init(&b, RTM_DELROUTE_, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO_, 504);
+    nl_put_raw(&b, &rtm, sizeof rtm);
+    nl_attr(&b, RTA_DST, &dst, 4);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)d0);
+    nl_finish(&b);
+    CHECK(send(tx, b.data, b.len, 0) == (ssize_t)b.len, "send DELROUTE");
+    RECV_ONE(tx, h, grp);
+    CHECK(h.nlmsg_type == RTM_DELROUTE_ && h.nlmsg_flags == 0 && h.nlmsg_seq == 504 &&
+              h.nlmsg_pid == tx_pid && grp == 7,
+          "tx echo DELROUTE");
+    RECV_ONE(tx, h, grp);
+    CHECK(h.nlmsg_type == NLMSG_ERROR && h.nlmsg_seq == 504, "tx ACK DELROUTE");
+
+    /* 5. DELADDR with ECHO|ACK */
+    nl_init(&b, RTM_DELADDR_, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO_, 505);
+    nl_put_raw(&b, &ifa, sizeof ifa);
+    nl_attr(&b, IFA_LOCAL, &ip, 4);
+    nl_attr(&b, IFA_ADDRESS, &ip, 4);
+    nl_finish(&b);
+    CHECK(send(tx, b.data, b.len, 0) == (ssize_t)b.len, "send DELADDR");
+    RECV_ONE(tx, h, grp);
+    CHECK(h.nlmsg_type == RTM_DELADDR_ && h.nlmsg_flags == 0 && h.nlmsg_seq == 505 &&
+              h.nlmsg_pid == tx_pid && grp == 5,
+          "tx echo DELADDR");
+    RECV_ONE(tx, h, grp);
+    CHECK(h.nlmsg_type == NLMSG_ERROR && h.nlmsg_seq == 505, "tx ACK DELADDR");
+
+#undef RECV_ONE
+    close(mon);
+    close(tx);
+    close(txs);
+}
+
+static void test_rtnl_notify_echo(void)
+{
+    CHECK(run_in_child(test_rtnl_notify_echo_child) == 0, "rtnl notify & echo");
+    ok("rtnl_notify_echo");
+}
+
+/* ---- 12. kernel/route: ip route get with RTA_IIF ---- */
+
+static void test_route_get_iif_child(void)
+{
+    enum {
+        RTM_GETROUTE_ = 26,
+        RTA_SRC_ = 2,
+        RTA_IIF_ = 3,
+        RTA_PREFSRC_ = 7,
+        RTA_UID_ = 25,
+        RTN_LOCAL_ = 2,
+    };
+    CHECK(unshare(CLONE_NEWNET) == 0, "unshare net");
+    int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    CHECK(rtnl >= 0, "rtnl");
+    set_link_up(rtnl, 1);
+    create_dummy(rtnl, "d0");
+    create_dummy(rtnl, "d1");
+    create_dummy(rtnl, "d2");
+    int d0 = (int)if_nametoindex("d0");
+    int d1 = (int)if_nametoindex("d1");
+    int d2 = (int)if_nametoindex("d2");
+    set_link_up(rtnl, d0);
+    set_link_up(rtnl, d1);
+    /* d2 stays down */
+    add_v4_addr(rtnl, d0, "10.1.0.1", 24);
+    add_v4_addr(rtnl, d1, "10.2.0.1", 24);
+
+    /* Add route 10.9.0.0/16 dev d1 */
+    struct in_addr dst9;
+    CHECK(inet_pton(AF_INET, "10.9.0.0", &dst9) == 1, "pton");
+    struct nlbuf b;
+    nl_init(&b, RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK, 10);
+    struct rtmsg rtm = {.rtm_family = AF_INET,
+                        .rtm_dst_len = 16,
+                        .rtm_table = RT_TABLE_MAIN,
+                        .rtm_protocol = RTPROT_BOOT,
+                        .rtm_scope = RT_SCOPE_LINK,
+                        .rtm_type = RTN_UNICAST};
+    nl_put_raw(&b, &rtm, sizeof rtm);
+    nl_attr(&b, RTA_DST, &dst9, 4);
+    nl_attr_u32(&b, RTA_OIF, (uint32_t)d1);
+    CHECK(nl_send_ack(rtnl, &b) == 0, "add 10.9.0.0/16");
+
+    /* When procfs is mounted, toggle ip_forward explicitly; otherwise accept whichever default
+     * forwarding state the new netns inherited from the initial namespace. */
+    int has_proc = access("/proc/sys/net/ipv4/ip_forward", W_OK) == 0;
+    if (has_proc) {
+        int fd = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY);
+        CHECK(fd >= 0 && write(fd, "0\n", 2) == 2, "ip_forward=0");
+        close(fd);
+    }
+
+    uint8_t resp[4096];
+    struct in_addr ip_dst, ip_src;
+
+    /* Helper: send RTM_GETROUTE with iif and optional src */
+#define GET_RT_V4(dst_s_, src_s_, iif_)                                                            \
+    ({                                                                                             \
+        nl_init(&b, RTM_GETROUTE_, NLM_F_REQUEST, 20);                                             \
+        struct rtmsg _r = {.rtm_family = AF_INET, .rtm_dst_len = 32};                              \
+        nl_put_raw(&b, &_r, sizeof _r);                                                            \
+        CHECK(inet_pton(AF_INET, (dst_s_), &ip_dst) == 1, "pton dst");                             \
+        nl_attr(&b, RTA_DST, &ip_dst, 4);                                                          \
+        if ((src_s_) != NULL) {                                                                    \
+            CHECK(inet_pton(AF_INET, (src_s_), &ip_src) == 1, "pton src");                         \
+            nl_attr(&b, RTA_SRC_, &ip_src, 4);                                                     \
+        }                                                                                          \
+        int32_t _iif = (iif_);                                                                     \
+        nl_attr(&b, RTA_IIF_, &_iif, 4);                                                           \
+        nl_finish(&b);                                                                             \
+        CHECK(send(rtnl, b.data, b.len, 0) == (ssize_t)b.len, "send getroute");                    \
+        ssize_t _n = recv(rtnl, resp, sizeof resp, 0);                                             \
+        CHECK(_n >= 20, "recv getroute");                                                          \
+        struct nlmsghdr _h;                                                                        \
+        memcpy(&_h, resp, sizeof _h);                                                              \
+        int _rc = 0;                                                                               \
+        if (_h.nlmsg_type == NLMSG_ERROR) {                                                        \
+            int32_t _e;                                                                            \
+            memcpy(&_e, resp + 16, 4);                                                             \
+            _rc = -_e;                                                                             \
+        } else {                                                                                   \
+            CHECK(_h.nlmsg_type == RTM_NEWROUTE, "got ty=%u", _h.nlmsg_type);                      \
+            _rc = 0;                                                                               \
+        }                                                                                          \
+        _rc;                                                                                       \
+    })
+
+    CHECK(GET_RT_V4("10.1.0.1", "10.1.0.5", 999) == ENODEV, "bad iif ENODEV");
+    CHECK(GET_RT_V4("10.1.0.1", NULL, d0) == EINVAL, "no src EINVAL");
+    CHECK(GET_RT_V4("10.1.0.1", "10.1.0.5", d2) == EXDEV, "down iif EXDEV");
+    if (has_proc)
+        CHECK(GET_RT_V4("10.9.0.5", "10.1.0.5", d0) == EHOSTUNREACH, "fwd disabled EHOSTUNREACH");
+
+    /* Local input route succeeds with ip_forward=0 and carries RTA_IIF without RTA_PREFSRC/UID */
+    CHECK(GET_RT_V4("10.1.0.1", "10.1.0.5", d0) == 0, "local iif ok");
+    struct rtmsg got_rt;
+    memcpy(&got_rt, resp + 16, sizeof got_rt);
+    CHECK(got_rt.rtm_type == RTN_LOCAL_, "local type");
+    int saw_iif = 0, saw_oif = 0;
+    struct nlmsghdr rh;
+    memcpy(&rh, resp, sizeof rh);
+    for (size_t off = 16 + sizeof got_rt; off + 4 <= rh.nlmsg_len;) {
+        struct nlattr a;
+        memcpy(&a, resp + off, 4);
+        if (a.nla_len < 4 || off + a.nla_len > rh.nlmsg_len)
+            break;
+        uint16_t t = a.nla_type & NLA_TYPE_MASK;
+        CHECK(t != RTA_PREFSRC_ && t != RTA_UID_, "no prefsrc/uid on iif reply");
+        if (t == RTA_IIF_) {
+            int32_t v;
+            memcpy(&v, resp + off + 4, 4);
+            CHECK(v == d0, "iif=%d", v);
+            saw_iif = 1;
+        }
+        if (t == RTA_OIF) {
+            int32_t v;
+            memcpy(&v, resp + off + 4, 4);
+            CHECK(v == 1, "local oif=%d", v);
+            saw_oif = 1;
+        }
+        off += (a.nla_len + 3) & ~3u;
+    }
+    CHECK(saw_iif && saw_oif, "local iif/oif attrs");
+
+    /* Forwarding lookup: enable ip_forward=1 when procfs is mounted, else check valid result */
+    if (has_proc) {
+        int fd = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY);
+        CHECK(fd >= 0 && write(fd, "1\n", 2) == 2, "ip_forward=1");
+        close(fd);
+        CHECK(GET_RT_V4("10.9.0.5", "10.1.0.5", d0) == 0, "fwd enabled ok");
+        memcpy(&got_rt, resp + 16, sizeof got_rt);
+        CHECK(got_rt.rtm_type == RTN_UNICAST, "fwd type unicast");
+    } else {
+        int frc = GET_RT_V4("10.9.0.5", "10.1.0.5", d0);
+        CHECK(frc == 0 || frc == EHOSTUNREACH, "fwd iif got %d", frc);
+        if (frc == 0) {
+            memcpy(&got_rt, resp + 16, sizeof got_rt);
+            CHECK(got_rt.rtm_type == RTN_UNICAST, "fwd type unicast");
+        }
+    }
+
+#undef GET_RT_V4
+    close(rtnl);
+}
+
+static void test_route_get_iif(void)
+{
+    CHECK(run_in_child(test_route_get_iif_child) == 0, "route get iif");
+    ok("route_get_iif");
+}
+
+/* ---- 13. kernel/net: SO_BINDTODEVICE / SO_BINDTOIFINDEX against guest netns devices ---- */
+
+static void test_so_bindtodevice_unpriv_child(void)
+{
+    CHECK(setresgid(65534, 65534, 65534) == 0 && setresuid(65534, 65534, 65534) == 0, "drop privs");
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(s >= 0, "udp");
+    CHECK(setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "d1", 3) == 0, "unpriv initial bind d1");
+    /* Nonexistent device still returns ENODEV before EPERM */
+    errno = 0;
+    CHECK(setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "nosuch", 7) == -1 && errno == ENODEV,
+          "unpriv rebind nosuch -> ENODEV");
+    /* Rebinding or unbinding an already-bound socket without CAP_NET_RAW -> EPERM */
+    errno = 0;
+    CHECK(setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3) == -1 && errno == EPERM,
+          "unpriv rebind lo -> EPERM");
+    errno = 0;
+    CHECK(setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "", 0) == -1 && errno == EPERM,
+          "unpriv unbind -> EPERM");
+    close(s);
+}
+
+static void test_so_bindtodevice_netns_child(void)
+{
+    enum { SO_BINDTOIFINDEX_ = 62 };
+    CHECK(unshare(CLONE_NEWNET) == 0, "unshare net");
+    int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    CHECK(rtnl >= 0, "rtnl");
+    set_link_up(rtnl, 1);
+    create_dummy(rtnl, "d0");
+    create_dummy(rtnl, "d1");
+    int i0 = (int)if_nametoindex("d0");
+    int i1 = (int)if_nametoindex("d1");
+    CHECK(i0 > 1 && i1 > i0, "dummy indices");
+    set_link_up(rtnl, i0);
+    set_link_up(rtnl, i1);
+    add_v4_addr(rtnl, i0, "10.31.0.1", 24);
+    add_v4_addr(rtnl, i1, "10.32.0.1", 24);
+
+    /* Host-only interface name (not present in this new netns) must return ENODEV */
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(s >= 0, "udp");
+    errno = 0;
+    CHECK(setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "eth0", 5) == -1 && errno == ENODEV,
+          "absent host iface in new netns must be ENODEV");
+
+    /* Bind to virtual device d0 by name; verify getsockopt len rules and SO_BINDTOIFINDEX */
+    CHECK(setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "d0", 3) == 0, "bind d0");
+    char buf[32];
+    socklen_t blen = 3;
+    errno = 0;
+    CHECK(getsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, buf, &blen) == -1 && errno == EINVAL,
+          "getsockopt SO_BINDTODEVICE with len < 16 must be EINVAL");
+    blen = sizeof buf;
+    CHECK(getsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, buf, &blen) == 0 && blen == 3 &&
+              strcmp(buf, "d0") == 0,
+          "getsockopt SO_BINDTODEVICE -> d0");
+    int idx = -1;
+    socklen_t ilen = sizeof idx;
+    CHECK(getsockopt(s, SOL_SOCKET, SO_BINDTOIFINDEX_, &idx, &ilen) == 0 && idx == i0,
+          "getsockopt SO_BINDTOIFINDEX -> %d", idx);
+
+    /* Unbind with empty string */
+    CHECK(setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "", 0) == 0, "unbind");
+    blen = 4;
+    CHECK(getsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, buf, &blen) == 0 && blen == 0,
+          "unbound getsockopt len=0");
+    close(s);
+
+    /* Two TCP listeners on 0.0.0.0:19200 bound to d0 and d1 coexist and route by device;
+     * accepted socket inherits SO_BINDTODEVICE. */
+    int l0 = socket(AF_INET, SOCK_STREAM, 0);
+    int l1 = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(setsockopt(l0, SOL_SOCKET, SO_BINDTODEVICE, "d0", 3) == 0, "l0 bind dev d0");
+    CHECK(setsockopt(l1, SOL_SOCKET, SO_BINDTODEVICE, "d1", 3) == 0, "l1 bind dev d1");
+    struct sockaddr_in any = {
+        .sin_family = AF_INET, .sin_port = htons(19200), .sin_addr.s_addr = htonl(INADDR_ANY)};
+    CHECK(bind(l0, (struct sockaddr *)&any, sizeof any) == 0, "bind l0");
+    CHECK(bind(l1, (struct sockaddr *)&any, sizeof any) == 0, "bind l1 (distinct dev)");
+    CHECK(listen(l0, 4) == 0 && listen(l1, 4) == 0, "listen l0/l1");
+
+    int c0 = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in dst0 = {.sin_family = AF_INET, .sin_port = htons(19200)};
+    CHECK(inet_pton(AF_INET, "10.31.0.1", &dst0.sin_addr) == 1, "pton");
+    CHECK(connect(c0, (struct sockaddr *)&dst0, sizeof dst0) == 0, "connect 10.31.0.1");
+    int a0 = accept(l0, NULL, NULL);
+    CHECK(a0 >= 0, "accept on l0");
+    blen = sizeof buf;
+    CHECK(getsockopt(a0, SOL_SOCKET, SO_BINDTODEVICE, buf, &blen) == 0 && strcmp(buf, "d0") == 0,
+          "accepted socket inherits SO_BINDTODEVICE");
+    close(a0);
+    close(c0);
+
+    int c1 = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in dst1 = {.sin_family = AF_INET, .sin_port = htons(19200)};
+    CHECK(inet_pton(AF_INET, "10.32.0.1", &dst1.sin_addr) == 1, "pton");
+    CHECK(connect(c1, (struct sockaddr *)&dst1, sizeof dst1) == 0, "connect 10.32.0.1");
+    int a1 = accept(l1, NULL, NULL);
+    CHECK(a1 >= 0, "accept on l1");
+    close(a1);
+    close(c1);
+    close(l1);
+
+    /* Delete d0 while l0 is bound -> SO_BINDTODEVICE returns ENODEV, SO_BINDTOIFINDEX keeps i0 */
+    struct nlbuf db;
+    nl_init(&db, RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK, 30);
+    struct ifinfomsg dfi = {.ifi_index = i0};
+    nl_put_raw(&db, &dfi, sizeof dfi);
+    CHECK(nl_send_ack(rtnl, &db) == 0, "delete d0");
+    blen = sizeof buf;
+    errno = 0;
+    CHECK(getsockopt(l0, SOL_SOCKET, SO_BINDTODEVICE, buf, &blen) == -1 && errno == ENODEV,
+          "deleted bound dev -> ENODEV");
+    ilen = sizeof idx;
+    CHECK(getsockopt(l0, SOL_SOCKET, SO_BINDTOIFINDEX_, &idx, &ilen) == 0 && idx == i0,
+          "deleted bound dev keeps ifindex");
+    close(l0);
+    close(rtnl);
+
+    CHECK(run_in_child(test_so_bindtodevice_unpriv_child) == 0, "unpriv SO_BINDTODEVICE");
+}
+
+static void test_so_bindtodevice_netns(void)
+{
+    CHECK(run_in_child(test_so_bindtodevice_netns_child) == 0, "SO_BINDTODEVICE netns");
+    ok("so_bindtodevice_netns");
+}
+
+/* ---- 14. kernel/netns: nat-chain drop/reject semantics ---- */
+
+static void test_nat_drop_reject_child(void)
+{
+    CHECK(unshare(CLONE_NEWNET) == 0, "unshare net");
+    int rtnl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    CHECK(rtnl >= 0, "rtnl");
+    set_link_up(rtnl, 1);
+    close(rtnl);
+
+    /* Start TCP and UDP servers on 127.0.0.1:19301 (dropped) and 19302 (rejected) */
+    int st1 = socket(AF_INET, SOCK_STREAM, 0), st2 = socket(AF_INET, SOCK_STREAM, 0);
+    int su1 = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    int one = 1;
+    setsockopt(st1, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(st2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a1 = {
+        .sin_family = AF_INET, .sin_port = htons(19301), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    struct sockaddr_in a2 = {
+        .sin_family = AF_INET, .sin_port = htons(19302), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    CHECK(bind(st1, (struct sockaddr *)&a1, sizeof a1) == 0 && listen(st1, 4) == 0, "st1");
+    CHECK(bind(st2, (struct sockaddr *)&a2, sizeof a2) == 0 && listen(st2, 4) == 0, "st2");
+    CHECK(bind(su1, (struct sockaddr *)&a1, sizeof a1) == 0, "su1");
+
+    /* Install OUTPUT nat chain: dport 19301 -> drop, dport 19302 -> reject (ICMP port unreach) */
+    int nf = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
+    CHECK(nf >= 0, "nf");
+    struct nlbuf m[4];
+    nft_table_msg(&m[0], NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_ACK, 1, "natdrop");
+    nft_base_chain_msg(&m[1], 2, "natdrop", "out", NF_INET_LOCAL_OUT, -100, NF_ACCEPT, "nat");
+
+    /* Rule 1: th dport 19301 drop */
+    nft_rule_msg(&m[2], NLM_F_CREATE | NLM_F_ACK, 3, "natdrop", "out");
+    size_t exs = nl_attr_start(&m[2], NFTA_RULE_EXPRESSIONS | NLA_F_NESTED);
+    struct nlbuf ed;
+    ed.len = 0;
+    nl_attr_be32(&ed, 1 /* DREG */, 1);
+    nl_attr_be32(&ed, 2 /* BASE=TH */, 2);
+    nl_attr_be32(&ed, 3 /* OFFSET */, 2);
+    nl_attr_be32(&ed, 4 /* LEN */, 2);
+    nft_put_expr(&m[2], "payload", ed.data, ed.len);
+    ed.len = 0;
+    nl_attr_be32(&ed, 1, 1);
+    nl_attr_be32(&ed, 2, 0);
+    nft_put_data_val(&ed, 3, &a1.sin_port, 2);
+    nft_put_expr(&m[2], "cmp", ed.data, ed.len);
+    ed.len = 0;
+    nl_attr_be32(&ed, 1 /* DREG=VERDICT */, 0);
+    size_t dv = nl_attr_start(&ed, 2 /* DATA */ | NLA_F_NESTED);
+    size_t vr = nl_attr_start(&ed, NFTA_DATA_VERDICT | NLA_F_NESTED);
+    nl_attr_be32(&ed, NFTA_VERDICT_CODE, NF_DROP);
+    nl_attr_end(&ed, vr);
+    nl_attr_end(&ed, dv);
+    nft_put_expr(&m[2], "immediate", ed.data, ed.len);
+    nl_attr_end(&m[2], exs);
+
+    /* Rule 2: th dport 19302 reject (ICMP port unreachable -> ECONNREFUSED) */
+    nft_rule_msg(&m[3], NLM_F_CREATE | NLM_F_ACK, 4, "natdrop", "out");
+    exs = nl_attr_start(&m[3], NFTA_RULE_EXPRESSIONS | NLA_F_NESTED);
+    ed.len = 0;
+    nl_attr_be32(&ed, 1, 1);
+    nl_attr_be32(&ed, 2, 2);
+    nl_attr_be32(&ed, 3, 2);
+    nl_attr_be32(&ed, 4, 2);
+    nft_put_expr(&m[3], "payload", ed.data, ed.len);
+    ed.len = 0;
+    nl_attr_be32(&ed, 1, 1);
+    nl_attr_be32(&ed, 2, 0);
+    nft_put_data_val(&ed, 3, &a2.sin_port, 2);
+    nft_put_expr(&m[3], "cmp", ed.data, ed.len);
+    ed.len = 0;
+    nl_attr_be32(&ed, 1 /* TYPE=ICMP_UNREACH */, 0);
+    uint8_t code = 3; /* ICMP_PORT_UNREACH */
+    nl_attr(&ed, 2 /* CODE */, &code, 1);
+    nft_put_expr(&m[3], "reject", ed.data, ed.len);
+    nl_attr_end(&m[3], exs);
+
+    int errs[4] = {-1, -1, -1, -1};
+    nft_batch_send(nf, m, 4, errs, 4);
+    CHECK(errs[0] == 0 && errs[1] == 0 && errs[2] == 0 && errs[3] == 0,
+          "install nat drop/reject %d %d %d %d", errs[0], errs[1], errs[2], errs[3]);
+
+    /* 1. TCP connect to nat-dropped port must NOT return EPERM: blocking times out (SO_SNDTIMEO
+     *    -> EINPROGRESS), nonblocking stays in progress. */
+    int ct1 = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
+    CHECK(setsockopt(ct1, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) == 0, "SO_SNDTIMEO");
+    errno = 0;
+    CHECK(connect(ct1, (struct sockaddr *)&a1, sizeof a1) == -1 && errno == EINPROGRESS,
+          "TCP nat drop must time out (EINPROGRESS), not EPERM (got %d)", errno);
+    close(ct1);
+
+    /* 2. TCP connect to nat-rejected port returns ECONNREFUSED immediately (not EPERM). */
+    int ct2 = socket(AF_INET, SOCK_STREAM, 0);
+    errno = 0;
+    CHECK(connect(ct2, (struct sockaddr *)&a2, sizeof a2) == -1 && errno == ECONNREFUSED,
+          "TCP nat reject must return ECONNREFUSED (got %d)", errno);
+    close(ct2);
+
+    /* 3. UDP connect to nat-dropped port MUST succeed (not EPERM), and subsequent OUTPUT send
+     *    returns EPERM without delivering to server. */
+    int cu1 = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(connect(cu1, (struct sockaddr *)&a1, sizeof a1) == 0,
+          "UDP connect must not be filtered by nat-chain drop");
+    errno = 0;
+    CHECK(send(cu1, "blocked", 7, 0) == -1 && errno == EPERM,
+          "UDP connected send on OUTPUT nat drop must be EPERM");
+    char tmp[16];
+    errno = 0;
+    CHECK(recv(su1, tmp, sizeof tmp, MSG_DONTWAIT) == -1 && errno == EAGAIN,
+          "dropped UDP datagram must not arrive");
+    close(cu1);
+
+    /* 4. Unconnected UDP sendto on OUTPUT nat drop returns EPERM. */
+    int cu2 = socket(AF_INET, SOCK_DGRAM, 0);
+    errno = 0;
+    CHECK(sendto(cu2, "blocked", 7, 0, (struct sockaddr *)&a1, sizeof a1) == -1 && errno == EPERM,
+          "UDP sendto on OUTPUT nat drop must be EPERM");
+    close(cu2);
+
+    close(nf);
+    close(su1);
+    close(st2);
+    close(st1);
+}
+
+static void test_nat_drop_reject(void)
+{
+    CHECK(run_in_child(test_nat_drop_reject_child) == 0, "nat drop/reject");
+    ok("nat_drop_reject");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "filtered-dnat") == 0) {
@@ -1502,6 +2131,10 @@ int main(int argc, char **argv)
     test_rawicmp_shut_rd();
     test_nft_control_plane();
     test_dualstack_dnat_and_close_wait_peer(0);
+    test_rtnl_notify_echo();
+    test_route_get_iif();
+    test_so_bindtodevice_netns();
+    test_nat_drop_reject();
     printf("all ok\n");
     return 0;
 }

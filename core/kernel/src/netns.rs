@@ -660,6 +660,7 @@ pub(crate) struct BindReq {
     pub reuseaddr: bool,
     pub reuseport: bool,
     pub euid: u32,
+    pub bound_dev_if: i32,
 }
 
 /// Parameters for registering a bound TCP or UDP socket in a new network namespace
@@ -678,6 +679,8 @@ pub(crate) struct NewBinding {
     pub reuseport: bool,
     /// Socket owner's effective UID (`sock_i_uid`, for `SO_REUSEPORT` matching).
     pub euid: u32,
+    /// Bound device interface index (`SO_BINDTODEVICE` / `SO_BINDTOIFINDEX`, 0 if unbound).
+    pub bound_dev_if: i32,
     /// Actively receiving inbound traffic: TCP `TCP_LISTEN`, or any bound UDP socket.
     pub listening: bool,
     /// Accepted TCP child socket (bound to the listener's port, not accepting new SYNs).
@@ -703,6 +706,7 @@ pub(crate) struct Binding {
     reuseaddr: bool,
     reuseport: bool,
     euid: u32,
+    bound_dev_if: i32,
     listening: bool,
     accepted: bool,
     host_ip: [u8; 4],
@@ -734,6 +738,11 @@ pub(crate) fn bind_conflict(me: &NetNs, req: &BindReq, skip_id: Option<u64>) -> 
         if Some(b.id) == skip_id || b.proto != req.proto || b.guest_port != req.guest_port {
             return false;
         }
+        // Sockets bound to two distinct devices never conflict (Linux's inet_csk_bind_conflict /
+        // udp_lib_lport_inuse).
+        if req.bound_dev_if != 0 && b.bound_dev_if != 0 && req.bound_dev_if != b.bound_dev_if {
+            return false;
+        }
         if !addrs_overlap(req.addr, req.v6only, b.addr, b.v6only) {
             return false;
         }
@@ -760,6 +769,7 @@ pub(crate) fn listen_conflict(me: &NetNs, id: std::num::NonZeroU64) -> bool {
                 reuseaddr: e.reuseaddr,
                 reuseport: e.reuseport,
                 euid: e.euid,
+                bound_dev_if: e.bound_dev_if,
             })
     };
     req.is_some_and(|r| bind_conflict(me, &r, Some(id.get())))
@@ -776,6 +786,7 @@ pub(crate) fn shared_host_port(me: &NetNs, req: &BindReq, host_ip: [u8; 4]) -> O
             || b.guest_port != req.guest_port
             || b.addr != req.addr
             || b.v6only != req.v6only
+            || b.bound_dev_if != req.bound_dev_if
             || b.host_ip != host_ip
             || b.wide
             || b.accepted
@@ -801,6 +812,7 @@ pub(crate) fn add_binding(me: &NetNs, guest_port: u16, entry: NewBinding) -> std
         reuseaddr: entry.reuseaddr,
         reuseport: entry.reuseport,
         euid: entry.euid,
+        bound_dev_if: entry.bound_dev_if,
         listening: entry.listening,
         accepted: entry.accepted,
         host_ip: entry.host_ip,
@@ -905,10 +917,24 @@ pub(crate) fn set_reuse(me: &NetNs, id: std::num::NonZeroU64, reuseport: bool, o
     }
 }
 
+/// Updates the `SO_BINDTODEVICE` / `SO_BINDTOIFINDEX` index on binding `id`.
+pub(crate) fn set_bound_dev(me: &NetNs, id: std::num::NonZeroU64, bound_dev_if: i32) {
+    if let Some(e) = me
+        .listeners
+        .borrow_mut()
+        .entries
+        .iter_mut()
+        .find(|e| e.id == id.get())
+    {
+        e.bound_dev_if = bound_dev_if;
+    }
+}
+
 /// Resolves guest destination `dst` (as seen in new network namespace `t`) for `proto`
 /// (`IPPROTO_TCP` or `IPPROTO_UDP`) to the host `(host_ip, host_port)` of the best matching
-/// active listener (TCP `TCP_LISTEN`, or any bound UDP socket). Exact address matches win over
-/// wildcard matches. Returns `None` when no matching listener exists.
+/// active listener (TCP `TCP_LISTEN`, or any bound UDP socket). Exact address matches and
+/// device-bound listeners matching `dst`'s owning interface take priority over wildcards.
+/// Returns `None` when no matching listener exists.
 pub(crate) fn resolve_target(t: &NetNs, proto: i32, dst: &[u8]) -> Option<([u8; 4], u16)> {
     let [a, b] = t.host_net?;
     let port = dst.get(2..4).map(|p| u16::from_be_bytes([p[0], p[1]]))?;
@@ -921,54 +947,69 @@ pub(crate) fn resolve_target(t: &NetNs, proto: i32, dst: &[u8]) -> Option<([u8; 
     if want_v4.is_none() && want_v6.is_none() {
         return None;
     }
+    let has_dev_bound =
+        t.listeners.borrow().entries.iter().any(|e| {
+            e.proto == proto && e.guest_port == port && e.listening && e.bound_dev_if != 0
+        });
+    let dst_if: Option<i32> = if !has_dev_bound {
+        None
+    } else if want_v4.is_some_and(|ip| ip[0] == 127)
+        || want_v6 == Some(std::net::Ipv6Addr::LOCALHOST.octets())
+    {
+        Some(LO_INDEX as i32)
+    } else {
+        let want: &[u8] = want_v4
+            .as_ref()
+            .map_or_else(|| want_v6.as_ref().unwrap().as_slice(), |ip| ip.as_slice());
+        crate::netdev::interfaces(t)
+            .into_iter()
+            .find(|i| i.addrs.iter().any(|(_, addr, _)| addr.as_slice() == want))
+            .map(|i| i.index as i32)
+    };
+    let dev_ok =
+        |e: &Binding| e.bound_dev_if == 0 || dst_if.is_none_or(|idx| e.bound_dev_if == idx);
     let bindings = t.listeners.borrow();
     let endpoint = |e: &Binding| {
         let ip = if e.wide { [127, a, b, 1] } else { e.host_ip };
         (ip, e.host_port)
     };
-    // Pass 1: exact address match takes priority over wildcard (Linux __inet_lookup_listener)
-    if let Some(e) = bindings.entries.iter().rev().find(|e| {
-        e.proto == proto
-            && e.guest_port == port
-            && e.listening
-            && match (want_v4, want_v6, e.addr) {
-                (Some(ip), _, BindAddr::V4(bound)) => ip == bound,
-                (_, Some(ip), BindAddr::V6(bound)) => ip == bound,
-                _ => false,
+    // Prefer device-bound matches over unbound matches within each address-specificity tier.
+    let pick = |pred: &dyn Fn(&Binding) -> bool| -> Option<&Binding> {
+        let mut best: Option<&Binding> = None;
+        for e in bindings.entries.iter().rev() {
+            if e.proto != proto || e.guest_port != port || !e.listening || !dev_ok(e) || !pred(e) {
+                continue;
             }
+            if dst_if.is_some_and(|idx| e.bound_dev_if == idx) {
+                return Some(e);
+            }
+            if best.is_none() {
+                best = Some(e);
+            }
+        }
+        best
+    };
+    // Pass 1: exact address match takes priority over wildcard (Linux __inet_lookup_listener)
+    if let Some(e) = pick(&|e| match (want_v4, want_v6, e.addr) {
+        (Some(ip), _, BindAddr::V4(bound)) => ip == bound,
+        (_, Some(ip), BindAddr::V6(bound)) => ip == bound,
+        _ => false,
     }) {
         return Some(endpoint(e));
     }
     // Pass 2: wildcard match
     if want_v4.is_some() {
-        return bindings.entries.iter().rev().find_map(|e| {
-            let matches = e.proto == proto
-                && e.guest_port == port
-                && e.listening
-                && matches!(
-                    (e.addr, e.v6only),
-                    (BindAddr::AnyV4, _) | (BindAddr::AnyV6, false)
-                );
-            matches.then(|| endpoint(e))
-        });
+        return pick(&|e| {
+            matches!(
+                (e.addr, e.v6only),
+                (BindAddr::AnyV4, _) | (BindAddr::AnyV6, false)
+            )
+        })
+        .map(endpoint);
     }
     // Pure IPv6 destination: prefer IPv6-only wildcard before dual-stack wildcard
-    bindings
-        .entries
-        .iter()
-        .rev()
-        .find(|e| {
-            e.proto == proto
-                && e.guest_port == port
-                && e.listening
-                && e.addr == BindAddr::AnyV6
-                && e.v6only
-        })
-        .or_else(|| {
-            bindings.entries.iter().rev().find(|e| {
-                e.proto == proto && e.guest_port == port && e.listening && e.addr == BindAddr::AnyV6
-            })
-        })
+    pick(&|e| e.addr == BindAddr::AnyV6 && e.v6only)
+        .or_else(|| pick(&|e| e.addr == BindAddr::AnyV6))
         .map(endpoint)
 }
 
@@ -1072,11 +1113,22 @@ pub(crate) fn from_self(me: &NetNs, host: &[u8]) -> Option<Vec<u8>> {
 
 // ---- OUTPUT and PREROUTING nat ----
 
+/// Result of evaluating a nat hook (`output_nat`, `prerouting_nat`).
+pub(crate) enum NatResult {
+    /// Accepted without address translation.
+    Pass,
+    /// Destination rewritten to this guest sockaddr.
+    Dnat(Vec<u8>),
+    /// Dropped or rejected by a nat chain; handled with Linux's verdict rules (TCP times out on
+    /// drop or fails immediately on reject; UDP connect is unaffected while sends fail on OUTPUT
+    /// or drop silently on PREROUTING).
+    Block(crate::nft::Outcome),
+}
+
 /// nftables OUTPUT nat ([`crate::nft::Nft::nat`]): a connection or datagram in `me` with protocol
-/// `proto` (TCP, UDP) to guest address `dst` (a sockaddr). Returns the new destination when
-/// DNATed, and EPERM when a rule drops it. `vaddr` is the virtual address the socket is bound to
-/// (the source; chosen by route when absent), `sport` is the local port, and `mark` is the
-/// socket's `SO_MARK`.
+/// `proto` (TCP, UDP) to guest address `dst` (a sockaddr). `vaddr` is the virtual address the
+/// socket is bound to (the source; chosen by route when absent), `sport` is the local port, and
+/// `mark` is the socket's `SO_MARK`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn output_nat(
     me: &NetNs,
@@ -1087,12 +1139,12 @@ pub(crate) fn output_nat(
     uid: u32,
     gid: u32,
     mark: u32,
-) -> Result<Option<Vec<u8>>, Errno> {
+) -> Result<NatResult, Errno> {
     if !me.nft.borrow().has_nat(crate::nft::HOOK_LOCAL_OUT) {
-        return Ok(None);
+        return Ok(NatResult::Pass);
     }
     let Some((ip, _)) = nat_ip(dst) else {
-        return Ok(None);
+        return Ok(NatResult::Pass);
     };
     let src = match vaddr {
         Some(v) if ip.len() == 4 => v.to_vec(),
@@ -1188,12 +1240,12 @@ pub(crate) fn prerouting_nat(
     sport: u16,
     dst: &[u8],
     ingress: Option<&crate::nft::Iif>,
-) -> Result<Option<Vec<u8>>, Errno> {
+) -> Result<NatResult, Errno> {
     if !t.nft.borrow().has_nat(crate::nft::HOOK_PRE_ROUTING) {
-        return Ok(None);
+        return Ok(NatResult::Pass);
     }
     let Some((ip, true)) = nat_ip(dst) else {
-        return Ok(None);
+        return Ok(NatResult::Pass);
     };
     let src = source(from, ip[..4].try_into().unwrap()).unwrap_or_default();
     let iif = ingress.cloned().unwrap_or_else(|| iif_facing(t, src));
@@ -1458,7 +1510,9 @@ pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<(Vec<u
         original_dst: None,
         mark: 0,
     };
-    let translated = hook_nat(init, &packet, &dst).ok()??;
+    let NatResult::Dnat(translated) = hook_nat(init, &packet, &dst).ok()? else {
+        return None;
+    };
     Some((dst, translated))
 }
 
@@ -1555,15 +1609,15 @@ struct NatPacket {
 }
 
 /// nat on hook `p.hook` of `ns` ([`crate::nft::Nft::nat`]): for a packet to guest address `dst`,
-/// returns the new destination when DNATed (keeping the port when it is not changed), and EPERM
-/// when a rule drops it.
-fn hook_nat(ns: &NetNs, p: &NatPacket, dst: &[u8]) -> Result<Option<Vec<u8>>, Errno> {
+/// returns the new destination when DNATed (keeping the port when it is not changed), or the
+/// drop/reject verdict when blocked.
+fn hook_nat(ns: &NetNs, p: &NatPacket, dst: &[u8]) -> Result<NatResult, Errno> {
     let Some((_, v4)) = nat_ip(dst) else {
-        return Ok(None);
+        return Ok(NatResult::Pass);
     };
     match hook_eval(ns, p, dst, None, false) {
-        crate::nft::Outcome::Accept => Ok(None),
-        crate::nft::Outcome::Drop | crate::nft::Outcome::Reject(_) => Err(Errno::EPERM),
+        crate::nft::Outcome::Accept => Ok(NatResult::Pass),
+        o @ (crate::nft::Outcome::Drop | crate::nft::Outcome::Reject(_)) => Ok(NatResult::Block(o)),
         crate::nft::Outcome::Dnat(a, port) => {
             let mut out = if v4 {
                 with_ipv4(dst, a[..4].try_into().map_err(|_| Errno::EINVAL)?)
@@ -1575,7 +1629,7 @@ fn hook_nat(ns: &NetNs, p: &NatPacket, dst: &[u8]) -> Result<Option<Vec<u8>>, Er
             if let Some(port) = port {
                 out[2..4].copy_from_slice(&port.to_be_bytes());
             }
-            Ok(Some(out))
+            Ok(NatResult::Dnat(out))
         }
     }
 }
@@ -2121,6 +2175,7 @@ mod tests {
                     reuseaddr: false,
                     reuseport: false,
                     euid: 0,
+                    bound_dev_if: 0,
                     listening: true,
                     accepted: false,
                     host_ip,
@@ -2303,6 +2358,7 @@ mod tests {
             reuseaddr,
             reuseport,
             euid,
+            bound_dev_if: 0,
         };
         let insert = |r: BindReq, listening, host_ip, host_port| {
             add_binding(
@@ -2315,6 +2371,7 @@ mod tests {
                     reuseaddr: r.reuseaddr,
                     reuseport: r.reuseport,
                     euid: r.euid,
+                    bound_dev_if: r.bound_dev_if,
                     listening,
                     accepted: false,
                     host_ip,
@@ -2481,6 +2538,7 @@ mod tests {
                 reuseaddr: false,
                 reuseport: false,
                 euid: 0,
+                bound_dev_if: 0,
                 listening: true,
                 accepted: false,
                 host_ip: [127, 1, 2, 1],
@@ -2497,6 +2555,7 @@ mod tests {
                 reuseaddr: false,
                 reuseport: false,
                 euid: 0,
+                bound_dev_if: 0,
                 listening: false,
                 accepted: false,
                 host_ip: [127, 1, 2, 1],
@@ -2521,6 +2580,7 @@ mod tests {
                 reuseaddr: false,
                 reuseport: false,
                 euid: 0,
+                bound_dev_if: 0,
             },
             None
         ));
@@ -2535,6 +2595,7 @@ mod tests {
                 reuseaddr: false,
                 reuseport: false,
                 euid: 0,
+                bound_dev_if: 0,
             },
             None
         ));
@@ -2551,6 +2612,7 @@ mod tests {
                 reuseaddr: false,
                 reuseport: false,
                 euid: 0,
+                bound_dev_if: 0,
                 listening: true,
                 accepted: false,
                 host_ip: [127, 1, 2, 1],
@@ -2568,6 +2630,7 @@ mod tests {
                 reuseaddr: false,
                 reuseport: false,
                 euid: 0,
+                bound_dev_if: 0,
                 listening: true,
                 accepted: false,
                 host_ip: [127, 1, 2, 1],

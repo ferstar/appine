@@ -154,6 +154,9 @@ pub(crate) struct InetSocket {
     pub filter: Option<Vec<u8>>,
     /// Guest listen under a host-refused RET 0. The guest fd stays bound until detach.
     pub deferred: Option<Box<DeferredListen>>,
+    /// Interface index bound via `SO_BINDTODEVICE` / `SO_BINDTOIFINDEX` (0 when unbound),
+    /// resolved against this socket's network namespace.
+    pub bound_dev_if: i32,
 }
 
 pub(crate) struct DeferredListen {
@@ -220,6 +223,7 @@ impl InetSocket {
             peer_map: None,
             filter: None,
             deferred: None,
+            bound_dev_if: 0,
         }
     }
 }
@@ -437,7 +441,12 @@ const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
+const NLM_F_ECHO: u16 = 8;
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_DUMP: u16 = 0x300;
+const NLM_F_CREATE: u16 = 0x400;
+const NLM_F_APPEND: u16 = 0x800;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
@@ -898,8 +907,8 @@ impl NetlinkSocket {
         let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
         let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
         let dump = flags & NLM_F_DUMP != 0;
-        if let Some(r) = host.configure(req) {
-            return match r {
+        if let Some(ConfigureResult { result, echoed }) = host.configure(req, self.pid) {
+            return match result {
                 Err(f) => vec![NetlinkItem::reply(ack_ext(
                     req,
                     f.errno,
@@ -907,8 +916,16 @@ impl NetlinkSocket {
                     f.msg.filter(|_| self.ext_ack),
                     self.cap_ack,
                 ))],
-                Ok(()) if flags & NLM_F_ACK != 0 => vec![NetlinkItem::reply(ack(req, 0, self.pid))],
-                Ok(()) => Vec::new(),
+                Ok(()) => {
+                    let mut out: Vec<NetlinkItem> = echoed
+                        .into_iter()
+                        .map(|(group, msg)| NetlinkItem::Datagram(msg, group))
+                        .collect();
+                    if flags & NLM_F_ACK != 0 {
+                        out.push(NetlinkItem::reply(ack(req, 0, self.pid)));
+                    }
+                    out
+                }
             };
         }
         let one = |l: &Link| match l {
@@ -1023,7 +1040,15 @@ impl NetlinkSocket {
             RTM_GETROUTE => {
                 let ifaces = host.all_interfaces();
                 let entries = host.tables();
-                match crate::route::get(req, &entries, &ifaces, host.uid(), host.init_net()) {
+                match crate::route::get(
+                    req,
+                    &entries,
+                    &ifaces,
+                    host.uid(),
+                    host.init_net(),
+                    |iif| host.ip_forward(iif),
+                    |iif| host.route_localnet(iif),
+                ) {
                     Ok(p) => {
                         let mut out = vec![NetlinkItem::reply(reply(RTM_NEWROUTE, 0, &p))];
                         if flags & NLM_F_ACK != 0 {
@@ -1183,6 +1208,13 @@ fn sockaddr_nl(pid: u32, groups: u32) -> Vec<u8> {
     b
 }
 
+/// Result of an rtnetlink configuration request ([`Host::configure`]).
+pub(crate) struct ConfigureResult {
+    pub result: Result<(), crate::netdev::Fail>,
+    /// `NLM_F_ECHO` notifications `(group, msg)` to queue on the sender before its ack.
+    pub echoed: Vec<(u32, Vec<u8>)>,
+}
+
 /// Host information that netlink answers need (replaced with fixed values in tests).
 pub(crate) trait Host {
     /// The host's network interfaces.
@@ -1197,9 +1229,18 @@ pub(crate) trait Host {
     /// The user ID of the requesting process (RTA_UID in the `ip route get` answer).
     fn uid(&self) -> u32;
     /// Requests that change interfaces, addresses or routes ([`crate::netdev::request`]): None
-    /// means not handled, Some holds the result.
-    fn configure(&self, _req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
+    /// means not handled; Some holds the result and any `NLM_F_ECHO` notifications to queue on
+    /// the requesting socket before its ack.
+    fn configure(&self, _req: &[u8], _port: u32) -> Option<ConfigureResult> {
         None
+    }
+    /// Whether IPv4 forwarding is enabled on input interface `iif` (`ip route get iif`).
+    fn ip_forward(&self, _iif: u32) -> bool {
+        false
+    }
+    /// Whether `route_localnet` is enabled on input interface `iif` (`ip route get iif`).
+    fn route_localnet(&self, _iif: u32) -> bool {
+        false
     }
     /// The network namespace RTM_GETNSID looks for: `attr` is [`NETNSA_PID`] (a process) or
     /// [`NETNSA_FD`] (a namespace file), and `value` its value. When found, the number this
@@ -1497,6 +1538,48 @@ const RTNL_NOTIFIED: u64 = 1 << (RTNLGRP_LINK - 1)
     | 1 << (RTNLGRP_IPV6_IFADDR - 1)
     | 1 << (RTNLGRP_IPV6_ROUTE - 1);
 
+/// Request metadata carried into rtnetlink notifications (`Snapshot::changes`).
+/// All zeros for non-netlink changes (socket ioctls).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct NotifyCause {
+    pub ty: u16,
+    pub flags: u16,
+    pub seq: u32,
+    pub port: u32,
+}
+
+impl NotifyCause {
+    /// Extracts header metadata from an rtnetlink request message.
+    pub(crate) fn from_req(req: &[u8], port: u32) -> Self {
+        Self {
+            ty: req
+                .get(4..6)
+                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
+            flags: req
+                .get(6..8)
+                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
+            seq: req
+                .get(8..12)
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())),
+            port,
+        }
+    }
+
+    pub(crate) fn wants_echo(self) -> bool {
+        self.flags & NLM_F_ECHO != 0
+    }
+}
+
+/// One rtnetlink notification produced by [`Snapshot::changes`].
+pub(crate) struct RtnlNote {
+    pub group: u32,
+    pub msg: Vec<u8>,
+    /// True when the triggering request asked for `NLM_F_ECHO` and this notification directly
+    /// corresponds to that request: it is queued unicast onto the sender before its ack, and the
+    /// multicast broadcast excludes the sender so a subscribed sender receives it only once.
+    pub echo: bool,
+}
+
 /// A namespace's links, addresses and routes as rtnetlink dumps encode them (message bodies, in
 /// dump order). Taken before and after a change request, the difference is what Linux notifies
 /// as it makes each change ([`Snapshot::changes`]).
@@ -1539,73 +1622,142 @@ impl Snapshot {
         }
     }
 
-    /// The notifications (group, message) for the change from `before` to this one, in the order
-    /// Linux makes them: links that appeared or changed (`RTM_NEWLINK`, statistics aside),
-    /// addresses that went and came, routes that went and came, links that went
-    /// (`RTM_DELLINK`). An address or route that changed in place ([`addr_identity`], [`route_identity`]) is only notified
-    /// as new. They carry no sequence number, port or flags.
-    pub(crate) fn changes(&self, before: &Snapshot) -> Vec<(u32, Vec<u8>)> {
-        let index = |m: &[u8]| {
+    /// The notifications for the change from `before` to this one, in the order Linux makes them:
+    /// links that appeared or changed (`RTM_NEWLINK`, statistics aside), addresses that went and
+    /// came, routes that went and came, links that went (`RTM_DELLINK`). An address or route that
+    /// changed in place ([`addr_identity`], [`route_identity`]) is only notified as new.
+    ///
+    /// Matches Linux 6.1 header fields:
+    /// - IPv4 `RTM_NEWADDR`/`RTM_DELADDR`, IPv4/IPv6 `RTM_NEWROUTE`/`RTM_DELROUTE`, and netlink
+    ///   link create (`RTM_NEWLINK` for a new link) / delete (`RTM_DELLINK`) copy the triggering
+    ///   request's `seq` and `port` and honour `NLM_F_ECHO`; IPv6 address notifications, link
+    ///   modifications and kernel-induced side effects (e.g. routes added/removed by an address
+    ///   change) carry `seq = 0, port = 0`.
+    /// - `RTM_NEWROUTE` carries `NLM_F_REPLACE` when replacing an existing route via
+    ///   `NLM_F_REPLACE`, `NLM_F_CREATE | NLM_F_APPEND` when appending, and
+    ///   `NLM_F_CREATE | NLM_F_EXCL` otherwise (including kernel-added routes).
+    pub(crate) fn changes(&self, before: &Snapshot, cause: NotifyCause) -> Vec<RtnlNote> {
+        fn link_index(m: &[u8]) -> Option<i32> {
             m.get(4..8)
                 .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        }
+        fn find_link(set: &[Vec<u8>], i: Option<i32>) -> Option<&[u8]> {
+            set.iter().find(|m| link_index(m) == i).map(Vec::as_slice)
+        }
+        let is_v4 = |m: &[u8]| m.first().map(|&f| f as i32) == Some(AF_INET);
+        let echo_req = cause.wants_echo();
+        let note = |group, ty, flags, body: &[u8], direct: bool| {
+            let (seq, port) = if direct {
+                (cause.seq, cause.port)
+            } else {
+                (0, 0)
+            };
+            RtnlNote {
+                group,
+                msg: message(ty, flags, seq, port, body),
+                echo: direct && echo_req,
+            }
         };
-        let find = |set: &[Vec<u8>], i| set.iter().find(|m| index(m) == i).cloned();
-        let note = |group, ty, body: &[u8]| (group, message(ty, 0, 0, 0, body));
         let mut out = Vec::new();
         for m in &self.links {
-            if find(&before.links, index(m))
-                .is_none_or(|old| without_stats(&old) != without_stats(m))
-            {
-                out.push(note(RTNLGRP_LINK, RTM_NEWLINK, m));
+            match find_link(&before.links, link_index(m)) {
+                None => out.push(note(
+                    RTNLGRP_LINK,
+                    RTM_NEWLINK,
+                    0,
+                    m,
+                    cause.ty == RTM_NEWLINK,
+                )),
+                Some(old) if without_stats(old) != without_stats(m) => {
+                    out.push(note(RTNLGRP_LINK, RTM_NEWLINK, 0, m, false));
+                }
+                Some(_) => {}
             }
         }
-        let groups = [
-            (
-                &before.addrs,
-                &self.addrs,
-                addr_identity as Identity,
-                RTM_DELADDR,
-                RTM_NEWADDR,
-                RTNLGRP_IPV4_IFADDR,
-                RTNLGRP_IPV6_IFADDR,
-            ),
-            (
-                &before.routes,
-                &self.routes,
-                route_identity,
-                RTM_DELROUTE,
-                RTM_NEWROUTE,
-                RTNLGRP_IPV4_ROUTE,
-                RTNLGRP_IPV6_ROUTE,
-            ),
-        ];
-        for (old, new, identity, del, add, v4, v6) in groups {
-            let group = |m: &[u8]| match m.first().map(|&f| f as i32) {
-                Some(AF_INET) => v4,
-                _ => v6,
+        // Addresses (hashed: a namespace can hold thousands of addresses and routes)
+        {
+            let group = |m: &[u8]| {
+                if is_v4(m) {
+                    RTNLGRP_IPV4_IFADDR
+                } else {
+                    RTNLGRP_IPV6_IFADDR
+                }
             };
-            // Hashed: a namespace can hold thousands of addresses and routes
-            let kept: HashSet<_> = new.iter().map(|m| identity(m)).collect();
-            let was: HashSet<&Vec<u8>> = old.iter().collect();
-            let gone = |m: &&Vec<u8>| !kept.contains(&identity(m));
-            out.extend(old.iter().filter(gone).map(|m| note(group(m), del, m)));
-            out.extend(
-                new.iter()
-                    .filter(|m| !was.contains(m))
-                    .map(|m| note(group(m), add, m)),
-            );
+            let kept: HashSet<_> = self.addrs.iter().map(|m| addr_identity(m)).collect();
+            let was: HashSet<&Vec<u8>> = before.addrs.iter().collect();
+            for m in before
+                .addrs
+                .iter()
+                .filter(|m| !kept.contains(&addr_identity(m)))
+            {
+                out.push(note(
+                    group(m),
+                    RTM_DELADDR,
+                    0,
+                    m,
+                    is_v4(m) && cause.ty == RTM_DELADDR,
+                ));
+            }
+            for m in self.addrs.iter().filter(|m| !was.contains(m)) {
+                out.push(note(
+                    group(m),
+                    RTM_NEWADDR,
+                    0,
+                    m,
+                    is_v4(m) && cause.ty == RTM_NEWADDR,
+                ));
+            }
+        }
+        // Routes
+        {
+            let group = |m: &[u8]| {
+                if is_v4(m) {
+                    RTNLGRP_IPV4_ROUTE
+                } else {
+                    RTNLGRP_IPV6_ROUTE
+                }
+            };
+            let kept: HashSet<_> = self.routes.iter().map(|m| route_identity(m)).collect();
+            let was: HashSet<&Vec<u8>> = before.routes.iter().collect();
+            for m in before
+                .routes
+                .iter()
+                .filter(|m| !kept.contains(&route_identity(m)))
+            {
+                out.push(note(group(m), RTM_DELROUTE, 0, m, cause.ty == RTM_DELROUTE));
+            }
+            let direct_new = cause.ty == RTM_NEWROUTE;
+            let replace_req = direct_new && cause.flags & NLM_F_REPLACE != 0;
+            let old_ids: HashSet<_> = if replace_req {
+                before.routes.iter().map(|m| route_identity(m)).collect()
+            } else {
+                HashSet::new()
+            };
+            for m in self.routes.iter().filter(|m| !was.contains(m)) {
+                let rt_flags = if replace_req && old_ids.contains(&route_identity(m)) {
+                    NLM_F_REPLACE
+                } else if direct_new && cause.flags & NLM_F_APPEND != 0 {
+                    NLM_F_CREATE | NLM_F_APPEND
+                } else {
+                    NLM_F_CREATE | NLM_F_EXCL
+                };
+                out.push(note(group(m), RTM_NEWROUTE, rt_flags, m, direct_new));
+            }
         }
         for m in &before.links {
-            if find(&self.links, index(m)).is_none() {
-                out.push(note(RTNLGRP_LINK, RTM_DELLINK, m));
+            if find_link(&self.links, link_index(m)).is_none() {
+                out.push(note(
+                    RTNLGRP_LINK,
+                    RTM_DELLINK,
+                    0,
+                    m,
+                    cause.ty == RTM_DELLINK,
+                ));
             }
         }
         out
     }
 }
-
-/// The identity of an address or route message (header bytes, attributes).
-type Identity = for<'a> fn(&'a [u8]) -> (Vec<u8>, Vec<(u16, &'a [u8])>);
 
 /// What identifies an address: family, prefix length, interface (`struct ifaddrmsg` without
 /// flags and scope), address and local address.
@@ -2392,9 +2544,15 @@ mod tests {
             routes: vec![route(1, 4)],
         };
         let got: Vec<_> = after
-            .changes(&before)
+            .changes(&before, NotifyCause::default())
             .into_iter()
-            .map(|(g, m)| (g, u16::from_le_bytes([m[4], m[5]]), m[16..].to_vec()))
+            .map(|n| {
+                (
+                    n.group,
+                    u16::from_le_bytes([n.msg[4], n.msg[5]]),
+                    n.msg[16..].to_vec(),
+                )
+            })
             .collect();
         assert_eq!(
             got,
@@ -3189,6 +3347,150 @@ mod tests {
         assert_eq!(parse(&gd[0])[0].0, GENL_ID_CTRL);
         assert_eq!(parse(&gd[1])[0].0, NLMSG_DONE);
         assert_eq!(g.queued_bytes, 0);
+    }
+
+    #[test]
+    fn snapshot_changes_sets_seq_port_route_flags_and_echo() {
+        let lo_if = lo();
+        let mut eth = Interface {
+            name: "d0".into(),
+            index: 2,
+            flags: IFF_UP | IFF_RUNNING | IFF_BROADCAST,
+            mtu: 1500,
+            mac: Some([2, 0, 0, 0, 0, 1]),
+            addrs: vec![(AF_INET, vec![10, 1, 0, 1], 24)],
+        };
+        let rt = |dst: [u8; 4], proto: u8| crate::route::Entry {
+            family: AF_INET,
+            table: 254,
+            ty: 1,
+            proto,
+            scope: 253,
+            dst: dst.to_vec(),
+            prefix: 24,
+            prefsrc: None,
+            gateway: None,
+            iface: "d0".into(),
+            index: 2,
+            metric: 0,
+            flags: 0,
+            host: false,
+        };
+        let snap = |ifaces: &[Interface], routes: &[crate::route::Entry]| Snapshot {
+            links: ifaces
+                .iter()
+                .map(|i| link_message(i, IfStats::default(), Some(1000)))
+                .collect(),
+            addrs: ifaces.iter().flat_map(|i| addr_messages(i, 0)).collect(),
+            routes: routes.iter().map(crate::route::route_message).collect(),
+        };
+        let hdr = |m: &[u8]| {
+            (
+                u16::from_le_bytes([m[4], m[5]]),
+                u16::from_le_bytes([m[6], m[7]]),
+                u32::from_le_bytes(m[8..12].try_into().unwrap()),
+                u32::from_le_bytes(m[12..16].try_into().unwrap()),
+            )
+        };
+
+        // 1. Adding an IPv4 address copies seq/port into RTM_NEWADDR (and echoes on NLM_F_ECHO),
+        //    while kernel-added routes carry NLM_F_CREATE|NLM_F_EXCL and seq/port 0 without echo.
+        let before = snap(std::slice::from_ref(&lo_if), &[]);
+        let after = snap(&[lo_if.clone(), eth.clone()], &[rt([10, 1, 0, 0], 2)]);
+        let notes = after.changes(
+            &before,
+            NotifyCause {
+                ty: RTM_NEWADDR,
+                flags: NLM_F_CREATE | NLM_F_EXCL | NLM_F_ECHO,
+                seq: 101,
+                port: 777,
+            },
+        );
+        let addr_note = notes
+            .iter()
+            .find(|n| hdr(&n.msg).0 == RTM_NEWADDR)
+            .expect("RTM_NEWADDR");
+        assert_eq!(hdr(&addr_note.msg), (RTM_NEWADDR, 0, 101, 777));
+        assert!(addr_note.echo);
+        let rt_note = notes
+            .iter()
+            .find(|n| hdr(&n.msg).0 == RTM_NEWROUTE)
+            .expect("RTM_NEWROUTE");
+        assert_eq!(
+            hdr(&rt_note.msg),
+            (RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, 0, 0)
+        );
+        assert!(!rt_note.echo);
+
+        // 2. New route via RTM_NEWROUTE copies seq/port, carries NLM_F_CREATE|NLM_F_EXCL, and echoes.
+        let before_rt = snap(&[lo_if.clone(), eth.clone()], &[rt([10, 1, 0, 0], 2)]);
+        let after_rt = snap(
+            &[lo_if.clone(), eth.clone()],
+            &[rt([10, 1, 0, 0], 2), rt([10, 9, 0, 0], 3)],
+        );
+        let notes = after_rt.changes(
+            &before_rt,
+            NotifyCause {
+                ty: RTM_NEWROUTE,
+                flags: NLM_F_CREATE | NLM_F_ECHO,
+                seq: 202,
+                port: 888,
+            },
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            hdr(&notes[0].msg),
+            (RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, 202, 888)
+        );
+        assert!(notes[0].echo);
+
+        // 3. Replacing an existing route carries NLM_F_REPLACE (not CREATE|EXCL).
+        let after_rep = snap(
+            &[lo_if.clone(), eth.clone()],
+            &[rt([10, 1, 0, 0], 2), rt([10, 9, 0, 0], 4)],
+        );
+        let notes = after_rep.changes(
+            &after_rt,
+            NotifyCause {
+                ty: RTM_NEWROUTE,
+                flags: NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ECHO,
+                seq: 203,
+                port: 888,
+            },
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(hdr(&notes[0].msg), (RTM_NEWROUTE, NLM_F_REPLACE, 203, 888));
+        assert!(notes[0].echo);
+
+        // 4. Deleting a route carries flags 0, copies seq/port, and echoes.
+        let notes = before_rt.changes(
+            &after_rep,
+            NotifyCause {
+                ty: RTM_DELROUTE,
+                flags: NLM_F_ECHO,
+                seq: 204,
+                port: 888,
+            },
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(hdr(&notes[0].msg), (RTM_DELROUTE, 0, 204, 888));
+        assert!(notes[0].echo);
+
+        // 5. Link modification carries seq/port 0 and does not echo, even with NLM_F_ECHO.
+        eth.mtu = 1400;
+        let after_mtu = snap(&[lo_if, eth], &[rt([10, 1, 0, 0], 2)]);
+        let notes = after_mtu.changes(
+            &before_rt,
+            NotifyCause {
+                ty: RTM_NEWLINK,
+                flags: NLM_F_ECHO,
+                seq: 205,
+                port: 888,
+            },
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(hdr(&notes[0].msg), (RTM_NEWLINK, 0, 0, 0));
+        assert!(!notes[0].echo);
     }
 }
 

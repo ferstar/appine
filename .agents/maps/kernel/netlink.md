@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: resumable on-demand netlink dumps sized to each receive buffer)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: rtnetlink notification seq/port/route flags and `NLM_F_ECHO`)
 
 ## Responsibilities
 
@@ -43,11 +43,13 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   `SOL_NETLINK` flags (bit n for option n), `passcred`, `SockOpts`. `Kernel::rtnl_sockets` holds
   every netlink socket weakly (for unique `nl_pid` checks and peer delivery across protocols, as
   well as `NETLINK_ROUTE` notifications).
-- `Host` trait (interfaces, stats, routes, `tx_queue_len`, uid; with defaults configure,
-  `peer_net`, links, tables, `all_interfaces`, `init_net`, `net_admin`, netfilter), implemented by
-  `KernelHost` (kernel, credentials, namespace, pid namespace, fds, the namespaces `watched` for
-  notifications and the `notes` a request caused); `Link` (host interface or virtual device);
-  `Snapshot` (a namespace's link, address and route message bodies).
+- `Host` trait (interfaces, stats, routes, `tx_queue_len`, `ip_forward`, `route_localnet`, uid;
+  with defaults configure, `peer_net`, links, tables, `all_interfaces`, `init_net`, `net_admin`,
+  netfilter), implemented by `KernelHost` (kernel, credentials, namespace, pid namespace, fds, the
+  namespaces `watched` for notifications and the `notes` a request caused); `Link` (host interface
+  or virtual device); `Snapshot` (a namespace's link, address and route message bodies);
+  `NotifyCause`, `RtnlNote` and `ConfigureResult` (carrying per-request seq/port/flags and
+  `NLM_F_ECHO` messages).
 
 ## Public entry points
 
@@ -124,7 +126,8 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   `NETLINK_ROUTE` first collects the namespaces that have a socket in the link, IPv4/IPv6 address
   or IPv4/IPv6 route groups (1, 5, 7, 9, 11), the sender included; for a change request
   (`RTM_NEW`/`DEL`/`SETLINK`, `NEW`/`DELADDR`, `NEW`/`DELROUTE`) `KernelHost::configure`
-  snapshots each of them before and after the device layer runs it, even when it fails (a request
+  snapshots each watched namespace (plus the caller's own namespace when `NLM_F_ECHO` is set)
+  before and after the device layer runs it, even when it fails (a request
   can change another namespace: moving a link, a veth's peer); a socket ioctl that may change an
   interface, address or route (`SIOCSIF*`, `SIOCDIFADDR`, `SIOCADDRT`/`SIOCDELRT`) is wrapped the
   same way.
@@ -132,9 +135,17 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   statistics ignored), addresses gone and new, routes gone and new (an address with the same
   family, prefix length, interface and addresses, or a route with the same family, destination
   length, TOS, table, destination and priority, that changed in place is only new, as `ip route
-  replace` is), links gone. After the sender's borrow ends they are queued on every registered
-  socket of that namespace that joined the group, with seq, port and flags 0, and each such socket
-  is woken.
+  replace` is), links gone. `Snapshot::changes` attaches Linux 6.1 header metadata from
+  `NotifyCause`: IPv4 `RTM_NEWADDR`/`RTM_DELADDR`, IPv4+IPv6 `RTM_NEWROUTE`/`RTM_DELROUTE`, and
+  newly created/deleted links directly caused by the netlink request copy `(req.seq, sender.pid)`
+  and honour `NLM_F_ECHO`, whereas side-effect kernel notifications (e.g. routes added by
+  `RTM_NEWADDR`), link modifications and IPv6 address notifications keep `seq=0, port=0` and are
+  not echoed. `RTM_NEWROUTE` carries `NLM_F_REPLACE` on an in-place replace with `NLM_F_REPLACE`,
+  `NLM_F_CREATE|NLM_F_APPEND` on append, and `NLM_F_CREATE|NLM_F_EXCL` otherwise (including
+  kernel-added routes). Echoed `(msg, group)` datagrams are queued on the sender before the
+  `NLMSG_ERROR` ACK; after the sender's borrow ends, `rtnl_notify` broadcasts each notification to
+  every registered socket of that namespace that joined the group (skipping the sender for already
+  echoed notifications so subscribed senders do not receive duplicates) and wakes them.
 - All queued messages (rtnetlink notifications, query answers, nftables replies, peer unicast
   deliveries and mq_notify cookies) are charged `len + 256` bytes against `SO_RCVBUF` (an empty
   queue still accepts one message); overflow drops the message and, unless `NETLINK_NO_ENOBUFS` is
@@ -218,9 +229,7 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 - **Only rtnetlink link, address and route changes are notified:** groups other than rtnetlink's
   link, address and route ones (neighbours, rules, netconf, nsid, other protocols) never receive
   anything; changes made through sysctls (`disable_ipv6`) or to the host's own interfaces (boot
-  namespace) are not notified; notifications carry seq, port and flags 0 (Linux copies the
-  request's seq and port into address and route ones, and new routes carry
-  `NLM_F_CREATE`/`EXCL`), and `NLM_F_ECHO` is not honoured.
+  namespace) are not notified.
 - **`NETLINK_CAP_ACK`/`EXT_ACK` are incomplete:** `NETLINK_CAP_ACK`/`EXT_ACK` are ignored for query
   and generic-netlink errors.
 - **Netlink requests are not validated as Linux validates them:** `NETLINK_GET_STRICT_CHK` is

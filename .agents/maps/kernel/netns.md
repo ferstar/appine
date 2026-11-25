@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: guest-address bind/listen conflict checks and per-address host ports in `Bindings`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: Linux-aligned nat-chain drop/reject semantics, bound-device binding separation, and UDP relay preservation across forwarder rule updates)
 
 ## Responsibilities
 
@@ -38,8 +38,9 @@ sockets (`hal`).
   `Reach` → `ENETUNREACH`); `Mapped` (host address, target namespace, implicit-bind source,
   virtual address); `Role` (`Peer` or `Local`).
 - `Bindings` / `Binding` / `NewBinding` / `BindAddr` / `BindReq` — per-namespace registry of bound TCP/UDP sockets
-  (id, protocol, guest port, normalized guest `BindAddr`: `AnyV4`/`AnyV6`/`V4`/`V6`, `v6only`, live
-  `SO_REUSEADDR`/`SO_REUSEPORT`, `euid`, `listening`, `accepted`, host IP/port, `wide`) plus a 10 s
+  (id, protocol, guest port, normalized guest `BindAddr`: `AnyV4`/`AnyV6`/`V4`/`V6`, `v6only`,
+  `bound_dev_if`, live `SO_REUSEADDR`/`SO_REUSEPORT`, `euid`, `listening`, `accepted`, host
+  IP/port, `wide`) plus a 10 s
   `LINGER` reverse table `(proto, host_ip, host_port) → (guest_port, BindAddr)`.
 - `Devices` — devices, index counter, routes through virtual devices (`Rt`), `NetConf`, nsids,
   `hostmap` (`HostMap`: initial namespace bidirectional virtual IPv4 ↔ 127.255.0.1..=127.255.255.254
@@ -49,9 +50,10 @@ sockets (`hal`).
 - `NetConf` / `Conf` — interface and namespace sysctls (`all`, `default`, per device; host
   interfaces and lo keyed by index).
 - `forward::Forwarder` (per kernel; one host thread), `Shared`, `Target` (protocol, host
-  destination, source address), `Handle` (in `InetSocket::fwd`), `Conn`, `Relay`, the global
+  destination, source address), `Handle` (in `InetSocket::fwd`, supporting in-place `update(Option<Target>)`),
+  `PortEntry`, `Conn`, `Relay`, the global
   `OUTSIDE` registry (127.254.x.y → real client address and port).
-- `netns::NatPacket`, `Flow`, `Step` — synthetic packet construction and hook routing into `kernel/nft`.
+- `netns::NatPacket`, `NatResult` (`Pass`, `Dnat`, `Block`), `Flow`, `Step` — synthetic packet construction and hook routing into `kernel/nft`.
 
 ## Public entry points
 
@@ -59,7 +61,7 @@ sockets (`hal`).
   `from_host`, `from_host_peer`, `from_self`, `toward_self`, `implicit_bind`, `local_toward`,
   `entering`, `owner_of_host`, `host_ipv4`, `with_host_endpoint`; bindings & listeners
   `bind_conflict`, `listen_conflict`, `shared_host_port`, `add_binding`, `add_ephemeral`,
-  `remove_binding`, `set_listening`, `set_reuse`, `resolve_target`, `lookup_host`.
+  `remove_binding`, `set_listening`, `set_reuse`, `set_bound_dev`, `resolve_target`, `lookup_host`.
 - Devices: `netdev::request` (rtnetlink changes), `link_message`, `addr_messages`, `nsid`,
   `nsid_alloc`, `ioctl`, `ifconf`, readers (`views`, `interfaces`, `base`, `tables`, `entries`,
   `local_v4`, `route_v4`, `routes_v6`, `first_v4`), sysctls (`conf_dirs`, `conf_read`,
@@ -126,13 +128,16 @@ sockets (`hal`).
   `(host_ip, host_port, wide)`.
 - Guest-level conflict checks run BEFORE host `bind()` (`bind_conflict`) and BEFORE TCP `listen()`
   (`listen_conflict`), matching Linux 6.1's `inet_csk_bind_conflict` and `udp_lib_lport_inuse`:
-  two bindings overlap iff their covered IPv4 or IPv6 sets intersect (`addrs_overlap`: `0.0.0.0`
-  and IPv6-only `[::]` are disjoint, `127.0.0.1` and `<vaddr>` or `[::1]` are disjoint, while
+  two bindings overlap iff their covered IPv4 or IPv6 sets intersect and their `bound_dev_if`
+  constraints are compatible (`addrs_overlap`: `0.0.0.0`
+  and IPv6-only `[::]` are disjoint, `127.0.0.1` and `<vaddr>` or `[::1]` are disjoint, bindings
+  pinned to distinct devices are disjoint, while
   `0.0.0.0` + `127.0.0.2` and IPv6-only `[::]` + dual-stack `[::]` overlap); overlapping binds
   return `EADDRINUSE` unless both set `SO_REUSEADDR` (for UDP, or for TCP when the existing socket
   is not `TCP_LISTEN`) or both set `SO_REUSEPORT` with the same `euid`. `IPV6_V6ONLY` refuses
   IPv4-mapped binds and post-bind changes with `EINVAL`; `setsockopt(SO_REUSEADDR|SO_REUSEPORT)`
-  updates the live `Binding`, and `shutdown(SHUT_RD|SHUT_RDWR)` clears `listening` without
+  updates the live `Binding`, `SO_BINDTODEVICE`/`SO_BINDTOIFINDEX` updates `bound_dev_if` via
+  `set_bound_dev`, and `shutdown(SHUT_RD|SHUT_RDWR)` clears `listening` without
   releasing the port.
 - Host-port separation: explicit nonzero binds get a host-assigned port (`bind(..., 0)`) per
   distinct guest bind target `(proto, guest_port, addr, v6only, host_ip)`, so `127.0.0.1:P`,
@@ -215,12 +220,13 @@ sockets (`hal`).
      cleared outside the sender.
   POSTROUTING (nat and filter), INPUT-hook nat and arp/bridge/netdev tables are never evaluated.
   (Inbound forwarding's probe can evaluate IPv6 PREROUTING nat.)
-- Effects: a nat drop or reject is `EPERM` at connect/sendto (also for drops in a remote
-  namespace's PREROUTING); a TCP filter reject returns its errno at once (RST →
-  `ECONNREFUSED`, ICMP codes mapped), a TCP filter drop connects to a blackhole listener so it
-  times out like Linux's retransmissions; a UDP drop or reject is `EPERM` on OUTPUT and silent
-  elsewhere; DNAT rewrites the destination (and may move it to another namespace); `meta mark set`
-  updates the mark.
+- Effects: nat-chain drops and rejects flow into the same verdict handling as filter chains
+  (`NatResult::Block` → `Routed::verdict`, with `on_output` set for OUTPUT and false for
+  PREROUTING): a TCP reject returns its errno at once (RST → `ECONNREFUSED`, ICMP codes mapped), a
+  TCP drop connects to a blackhole listener so it times out like Linux's retransmissions, UDP
+  `connect` succeeds (recording the blocked verdict) and UDP sends fail with `EPERM` on OUTPUT or
+  drop silently on PREROUTING/INPUT/FORWARD; DNAT rewrites the destination (and may move it to
+  another namespace); `meta mark set` updates the mark.
 - `tracks()` (any conntrack-using table) decides whether `SO_ORIGINAL_DST` answers.
 - Expression and control-plane details are in `kernel/nft`; initial-namespace commits
   trigger the socket layer's forwarding refresh.
@@ -256,10 +262,14 @@ sockets (`hal`).
   gateway. The global record is removed when the forwarded connection closes, while accepted guest
   sockets cache the resolved real client address in `track.outside_peer` so getpeername and
   `/proc/net/tcp` preserve it across `CLOSE_WAIT` until the guest socket closes.
-- Closing the socket or a rule change drops the handle; established forwarded TCP connections stay,
-  UDP relays of that port are closed at once. Ordinary listeners share the accept queue with the
-  guest. For a host-refused RET 0, the socket layer supplies a separate listener for DNAT and
-  shuts it down on withdrawal. The port stays bound on the deferred guest fd.
+- On rule changes, non-deferred handles are updated in place via `Handle::update(Option<Target>)`:
+  established forwarded TCP connections stay, and existing UDP relays of that port stay alive to
+  deliver in-flight replies until idle expiry (120 s), hard socket error, or guest socket close;
+  pausing a UDP handle (`None`) stops polling `port_fd` for `POLLIN` so new datagrams go to the
+  guest, while closing the guest socket (`Handle::drop`) tears down its UDP relays. Ordinary
+  listeners share the accept queue with the guest. For a host-refused RET 0, the socket layer
+  supplies a separate listener for DNAT and shuts it down on withdrawal. The port stays bound on
+  the deferred guest fd.
 
 ## Dependencies (inbound / outbound)
 
@@ -302,10 +312,6 @@ sockets (`hal`).
 - **Namespace isolation is guest-side only:** the initial namespace passes 127.x through, so its
   guests (and other apps on the device) reach a container's host sockets directly, including
   services bound only to the container's 127.0.0.1.
-- **nat-chain drops become `EPERM`:** a drop or reject in a nat chain (even a remote namespace's
-  PREROUTING) fails connect/sendto with `EPERM`; Linux times TCP out and never filters UDP connect.
-- **Forwarder rule-change behavior:** UDP relays are cut when the rule changes (while established
-  TCP connections stay).
 - **Smaller deviations:** only 127.0.0.0/24 works as loopback in a namespace (Linux: 127/8); IPv6 on
   virtual devices is unusable and on-link IPv6 is handed to the host; PREROUTING filter chains see
   the post-DNAT destination at every priority. `kernel/nft` records the unsupported POSTROUTING,

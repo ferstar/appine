@@ -2513,6 +2513,20 @@ pub(crate) fn ip_forward(ns: &NetNs) -> i64 {
     ns.devs.borrow().conf.all4.get(false, "forwarding")
 }
 
+/// Per-device IPv4 `forwarding` setting (falling back to `all/forwarding`), for `ip route get iif`.
+pub(crate) fn forwarding_v4(ns: &NetNs, index: u32) -> bool {
+    conf_of(ns, false, ConfDir::Dev(index))
+        .map(|(c, _)| c.get(false, "forwarding") != 0)
+        .unwrap_or_else(|_| ip_forward(ns) != 0)
+}
+
+/// Per-device IPv4 `route_localnet` setting, for `ip route get iif`.
+pub(crate) fn route_localnet_v4(ns: &NetNs, index: u32) -> bool {
+    conf_of(ns, false, ConfDir::Dev(index))
+        .map(|(c, _)| c.get(false, "route_localnet") != 0)
+        .unwrap_or(false)
+}
+
 /// For tests: creates an up dummy device in `ns` with address `addr`/`prefix`, and when a gateway
 /// is given, also a default route through it.
 #[cfg(test)]

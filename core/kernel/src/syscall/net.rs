@@ -387,6 +387,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                         reuseaddr,
                         reuseport,
                         euid: s.euid,
+                        bound_dev_if: s.bound_dev_if,
                     };
                     if crate::netns::bind_conflict(&net, &req, None) {
                         return Err(Errno::EADDRINUSE);
@@ -415,6 +416,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                             reuseaddr,
                             reuseport,
                             euid: s.euid,
+                            bound_dev_if: s.bound_dev_if,
                             listening: proto == IPPROTO_UDP,
                             accepted: false,
                             host_ip,
@@ -854,7 +856,7 @@ fn accept_host(
                 s.net.clone(),
                 s.local_map,
                 s.vaddr,
-                (s.mark(), s.v6only, s.euid),
+                (s.mark(), s.v6only, s.euid, s.bound_dev_if),
             ),
             Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
             Socket::Unix(_) => unreachable!("handled by accept4"),
@@ -874,13 +876,14 @@ fn accept_host(
                 // The listener's timeouts and the filter kept in Appine carry over (sk_clone_lock
                 // copies the whole sock and shares sk_filter)
                 (new.rcvtimeo, new.sndtimeo) = (timeout, sndtimeo);
-                let (mark, v6only, euid) = &inherited;
+                let (mark, v6only, euid, bound_dev_if) = &inherited;
                 if let Socket::Inet(s) = &*sock.borrow() {
                     new.filter = s.filter.clone();
                 }
-                // IPV6_V6ONLY, recorded in a new namespace (sk_clone_lock copies sk_ipv6only)
+                // IPV6_V6ONLY and SO_BINDTODEVICE carry over (sk_clone_lock)
                 new.v6only = *v6only;
                 new.euid = *euid;
+                new.bound_dev_if = *bound_dev_if;
                 new.local_map = local_map;
                 new.net = net.clone();
                 // The accepted connection inherits the listener's SO_MARK (ir_mark in
@@ -949,6 +952,7 @@ fn accept_host(
                                 reuseaddr: guest_reuseaddr(&new),
                                 reuseport: guest_reuseport(&new),
                                 euid: new.euid,
+                                bound_dev_if: new.bound_dev_if,
                                 listening: false,
                                 accepted: true,
                                 host_ip: crate::netns::host_ipv4(&local),
@@ -1393,6 +1397,7 @@ fn claim_ephemeral(s: &mut InetSocket, addr: Option<&[u8]>) {
             reuseaddr: guest_reuseaddr(s),
             reuseport: guest_reuseport(s),
             euid: s.euid,
+            bound_dev_if: s.bound_dev_if,
             listening: proto == IPPROTO_UDP,
             accepted: false,
             host_ip,
@@ -1788,6 +1793,9 @@ fn set_inet_option(
         {
             return Err(Errno::EOPNOTSUPP);
         }
+        (SOL_SOCKET, SO_BINDTODEVICE | SO_BINDTOIFINDEX) => {
+            set_bind_device(cx, s, name == SO_BINDTOIFINDEX, v)?;
+        }
         (SOL_SOCKET, SO_REUSEPORT) if s.filter.as_deref() == Some(DROP_TCP) => {
             let arg = v.get(..4).ok_or(Errno::EINVAL)?;
             if arg != [0; 4] {
@@ -1817,6 +1825,74 @@ fn set_inet_option(
         }
     }
     Ok(0)
+}
+
+/// `SO_BINDTODEVICE` / `SO_BINDTOIFINDEX` (Linux 6.1's `sock_setbindtodevice` /
+/// `sock_bindtoindex_locked`): resolves interface names and indices against the socket's own
+/// network namespace (including virtual devices) rather than blindly against host interfaces.
+/// Unprivileged callers may bind an unbound socket; changing or clearing an existing binding
+/// requires `CAP_NET_RAW` over the namespace owner (`EPERM`, checked after device lookup).
+fn set_bind_device(cx: &Cx<'_>, s: &mut InetSocket, by_index: bool, v: &[u8]) -> Result<(), Errno> {
+    const IFNAMSIZ: usize = 16;
+    let ns = net_of(cx, s);
+    let target = if by_index {
+        let raw = v.get(..4).ok_or(Errno::EINVAL)?;
+        let idx = i32::from_le_bytes(raw.try_into().unwrap());
+        if idx < 0 {
+            return Err(Errno::EINVAL);
+        }
+        if idx == 0 {
+            None
+        } else {
+            let iface = crate::netdev::interfaces(&ns)
+                .into_iter()
+                .find(|i| i.index as i32 == idx)
+                .ok_or(Errno::ENODEV)?;
+            Some((idx, iface.name))
+        }
+    } else {
+        // Linux truncates to IFNAMSIZ - 1 bytes and NUL-terminates before lookup.
+        let capped = &v[..v.len().min(IFNAMSIZ - 1)];
+        let name = capped.split(|&c| c == 0).next().unwrap_or_default();
+        if name.is_empty() {
+            None
+        } else {
+            let iface = crate::netdev::interfaces(&ns)
+                .into_iter()
+                .find(|i| i.name.as_bytes() == name)
+                .ok_or(Errno::ENODEV)?;
+            Some((iface.index as i32, iface.name))
+        }
+    };
+    let cap_raw = cx.cred().ns_capable(&ns.owner, crate::cred::cap::NET_RAW);
+    if s.bound_dev_if != 0 && !cap_raw {
+        return Err(Errno::EPERM);
+    }
+    let new_idx = target.as_ref().map_or(0, |(i, _)| *i);
+    // In the initial namespace, forward real host interface bindings to the host socket so host
+    // routing uses them; virtual devices and new-namespace sockets stay purely in process.
+    if s.net.is_none() {
+        if let Some((idx, name)) = &target
+            && crate::netdev::base(&ns)
+                .iter()
+                .any(|b| b.index as i32 == *idx)
+        {
+            let mut z = name.as_bytes().to_vec();
+            z.push(0);
+            match appine_hal::net::setsockopt(s.fd, SOL_SOCKET, SO_BINDTODEVICE, &z) {
+                Ok(()) => {}
+                Err(e) if e == Errno::EPERM.0 && cap_raw => {}
+                Err(e) => return Err(Errno(e)),
+            }
+        } else if s.bound_dev_if != 0 {
+            let _ = appine_hal::net::setsockopt(s.fd, SOL_SOCKET, SO_BINDTODEVICE, b"");
+        }
+    }
+    s.bound_dev_if = new_idx;
+    if let (Some(net), Some(id)) = (&s.net, s.listener) {
+        crate::netns::set_bound_dev(net, id, new_idx);
+    }
+    Ok(())
 }
 
 /// `SO_RCVTIMEO_NEW` and `SO_SNDTIMEO_NEW` are the old options on a 64-bit kernel: the same
@@ -2273,6 +2349,25 @@ pub(super) fn getsockopt(
                 (SOL_SOCKET, SO_SNDTIMEO) => encode_tv(s.sndtimeo),
                 // SO_MARK: the recorded one (the one on the host is set by Android's netd)
                 (SOL_SOCKET, SO_MARK) => s.mark().to_le_bytes().to_vec(),
+                // SO_BINDTODEVICE / SO_BINDTOIFINDEX: resolved against the socket's own namespace
+                (SOL_SOCKET, SO_BINDTOIFINDEX) => s.bound_dev_if.to_le_bytes().to_vec(),
+                (SOL_SOCKET, SO_BINDTODEVICE) => {
+                    if s.bound_dev_if == 0 {
+                        Vec::new()
+                    } else {
+                        if room < 16 {
+                            return Err(Errno::EINVAL);
+                        }
+                        let ns = net_of(cx, s);
+                        let iface = crate::netdev::interfaces(&ns)
+                            .into_iter()
+                            .find(|i| i.index as i32 == s.bound_dev_if)
+                            .ok_or(Errno::ENODEV)?;
+                        let mut b = iface.name.into_bytes();
+                        b.push(0);
+                        b
+                    }
+                }
                 // Raw ICMP is a ping socket on the host
                 (SOL_SOCKET, SO_TYPE) if s.raw => SOCK_RAW.to_le_bytes().to_vec(),
                 _ => {
@@ -3971,7 +4066,7 @@ fn netlink_send(
     match delivery {
         Delivery::Kernel(notes) => {
             request_wake_object(wake::of(sock));
-            rtnl_notify(cx.k(), notes);
+            rtnl_notify(cx.k(), notes, Some(sock));
         }
         Delivery::Peer(peer) => {
             if let Socket::Netlink(p) = &mut *peer.borrow_mut() {
@@ -4019,21 +4114,26 @@ const CHANGING_IOCTLS: [u32; 15] = [
 ];
 
 /// Queues the notifications of a change request on the sockets of each namespace that joined
-/// their groups, and wakes them.
-fn rtnl_notify(k: &mut crate::kernel::Kernel, notes: Vec<RtnlNotes>) {
+/// their groups, and wakes them. Notifications already echoed to `sender` via `NLM_F_ECHO` skip
+/// `sender` during multicast broadcast so a subscribed sender does not receive a duplicate.
+fn rtnl_notify(k: &mut crate::kernel::Kernel, notes: Vec<RtnlNotes>, sender: Option<&SocketRef>) {
     if notes.is_empty() {
         return;
     }
     k.rtnl_sockets.retain(|w| w.strong_count() > 0);
     for sock in k.rtnl_sockets.iter().filter_map(|w| w.upgrade()) {
+        let is_sender = sender.is_some_and(|s| Rc::ptr_eq(&sock, s));
         let Socket::Netlink(s) = &mut *sock.borrow_mut() else {
             continue;
         };
         let ns = s.net.clone().unwrap_or_else(|| k.init_ns.net.clone());
         let mut any = false;
         for (_, changes) in notes.iter().filter(|(n, _)| Rc::ptr_eq(n, &ns)) {
-            for (group, msg) in changes {
-                any |= s.notify(*group, msg);
+            for note in changes {
+                if note.echo && is_sender {
+                    continue;
+                }
+                any |= s.notify(note.group, &note.msg);
             }
         }
         if any {
@@ -4042,8 +4142,8 @@ fn rtnl_notify(k: &mut crate::kernel::Kernel, notes: Vec<RtnlNotes>) {
     }
 }
 
-/// A namespace and the notifications (group, message) for what a request changed in it.
-type RtnlNotes = (Rc<crate::nsproxy::NetNs>, Vec<(u32, Vec<u8>)>);
+/// A namespace and the notifications for what a request changed in it.
+type RtnlNotes = (Rc<crate::nsproxy::NetNs>, Vec<crate::net::RtnlNote>);
 
 /// Host information for netlink answers: interfaces come from the host, traffic counters and the
 /// routes the host handed over come from the kernel. In a new network namespace there is only its
@@ -4096,13 +4196,14 @@ impl<'a> KernelHost<'a> {
         &self,
         watched: &[Rc<crate::nsproxy::NetNs>],
         before: Vec<crate::net::Snapshot>,
+        cause: crate::net::NotifyCause,
     ) -> Vec<RtnlNotes> {
         let after = self.snapshots(watched);
         watched
             .iter()
             .zip(before)
             .zip(after)
-            .map(|((ns, before), after)| (ns.clone(), after.changes(&before)))
+            .map(|((ns, before), after)| (ns.clone(), after.changes(&before, cause)))
             .filter(|(_, changes)| !changes.is_empty())
             .collect()
     }
@@ -4221,24 +4322,54 @@ impl crate::net::Host for KernelHost<'_> {
         self.cred.ruid
     }
 
-    fn configure(&self, req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
+    fn configure(&self, req: &[u8], port: u32) -> Option<crate::net::ConfigureResult> {
         // IFLA_NET_NS_PID (19) is a process, IFLA_NET_NS_FD (28) a namespace file
         let resolve = |attr: u16, value: u32| self.net_of(attr == 19, value);
         // What the namespaces being watched look like before and after a change request
         // (RTM_NEW, DEL and SETLINK, NEW and DELADDR, NEW and DELROUTE): it can change another
-        // namespace too (moving a link, a veth's peer)
-        let ty = req
-            .get(4..6)
-            .map_or(0, |t| u16::from_le_bytes([t[0], t[1]]));
-        let watched = match ty {
-            16 | 17 | 19 | 20 | 21 | 24 | 25 => &self.watched[..],
-            _ => &[],
+        // namespace too (moving a link, a veth's peer). When NLM_F_ECHO is set, also snapshot
+        // the sender's namespace even if no multicast listener is subscribed.
+        let cause = crate::net::NotifyCause::from_req(req, port);
+        let is_change = matches!(cause.ty, 16 | 17 | 19 | 20 | 21 | 24 | 25);
+        let echo = is_change && cause.wants_echo();
+        let ns = self.ns();
+        let mut extra_watched = Vec::new();
+        let watched: &[Rc<crate::nsproxy::NetNs>] = if !is_change {
+            &[]
+        } else if echo && !self.watched.iter().any(|w| Rc::ptr_eq(w, &ns)) {
+            extra_watched.extend(self.watched.iter().cloned());
+            extra_watched.push(ns.clone());
+            &extra_watched
+        } else {
+            &self.watched
         };
         let before = self.snapshots(watched);
-        let done = crate::netdev::request(&self.ns(), &self.cred, req, &resolve);
-        let notes = self.changed_since(watched, before);
+        let done = crate::netdev::request(&ns, &self.cred, req, &resolve);
+        let notes = self.changed_since(watched, before, cause);
+        let echoed: Vec<(u32, Vec<u8>)> = if echo {
+            notes
+                .iter()
+                .filter(|(n, _)| Rc::ptr_eq(n, &ns))
+                .flat_map(|(_, changes)| {
+                    changes
+                        .iter()
+                        .filter(|n| n.echo)
+                        .map(|n| (n.group, n.msg.clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.notes.borrow_mut().extend(notes);
-        done
+        done.map(|result| crate::net::ConfigureResult { result, echoed })
+    }
+
+    fn ip_forward(&self, iif: u32) -> bool {
+        crate::netdev::forwarding_v4(&self.ns(), iif)
+    }
+
+    fn route_localnet(&self, iif: u32) -> bool {
+        crate::netdev::route_localnet_v4(&self.ns(), iif)
     }
 
     fn peer_net(&self, attr: u16, value: u32) -> Result<Option<i32>, i32> {
@@ -4274,8 +4405,12 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
     }
     let before = KernelHost::of(cx, None).snapshots(&watched);
     let r = socket_ioctl(cx, sock, request, arg);
-    let notes = KernelHost::of(cx, None).changed_since(&watched, before);
-    rtnl_notify(cx.k(), notes);
+    let notes = KernelHost::of(cx, None).changed_since(
+        &watched,
+        before,
+        crate::net::NotifyCause::default(),
+    );
+    rtnl_notify(cx.k(), notes, None);
     r
 }
 
@@ -4874,7 +5009,11 @@ fn route(
     addr: &[u8],
     cred: &crate::cred::Cred,
 ) -> Result<Routed, Errno> {
-    let nat = nat_dest(s, me, addr, cred)?;
+    let (nat, out_block) = match nat_dest(s, me, addr, cred)? {
+        crate::netns::NatResult::Pass => (None, None),
+        crate::netns::NatResult::Dnat(d) => (Some(d), None),
+        crate::netns::NatResult::Block(o) => (None, Some(o)),
+    };
     let mut origs = Vec::new();
     if nat.is_some() {
         origs.push((me.id, addr.to_vec()));
@@ -4889,12 +5028,19 @@ fn route(
         verdict: (crate::nft::Outcome::Accept, false),
         origs,
     };
+    if let Some(o) = out_block {
+        route.verdict = (o, true);
+        return Ok(route);
+    }
     let Some(proto) = nat_proto(s) else {
         return Ok(route);
     };
     let mut bridge = crate::netns::bridge_hop(me, &route.m, &route.dst);
     let entered = if let Some(b) = &mut bridge {
-        route.preroute(w, me, s, proto, &b.ns, Some(&b.iif))?;
+        if let Some(o) = route.preroute(w, me, s, proto, &b.ns, Some(&b.iif))? {
+            route.verdict = (o, false);
+            return Ok(route);
+        }
         b.dst.clone_from(&route.there);
         route
             .m
@@ -4905,8 +5051,11 @@ fn route(
     } else {
         crate::netns::entering(w, me, &route.m, &route.dst)
     };
-    if let Some(t) = entered {
-        route.preroute(w, me, s, proto, &t, None)?;
+    if let Some(t) = entered
+        && let Some(o) = route.preroute(w, me, s, proto, &t, None)?
+    {
+        route.verdict = (o, false);
+        return Ok(route);
     }
     let flow = crate::netns::Flow {
         proto,
@@ -4937,12 +5086,14 @@ impl Routed {
         proto: u8,
         ns: &Rc<crate::nsproxy::NetNs>,
         ingress: Option<&crate::nft::Iif>,
-    ) -> Result<(), Errno> {
-        let Some(dst) =
-            crate::netns::prerouting_nat(me, ns, proto, local_port(s), &self.there, ingress)?
-        else {
-            return Ok(());
-        };
+    ) -> Result<Option<crate::nft::Outcome>, Errno> {
+        let dst =
+            match crate::netns::prerouting_nat(me, ns, proto, local_port(s), &self.there, ingress)?
+            {
+                crate::netns::NatResult::Pass => return Ok(None),
+                crate::netns::NatResult::Block(o) => return Ok(Some(o)),
+                crate::netns::NatResult::Dnat(dst) => dst,
+            };
         // A port-only bridge DNAT keeps the original L2 path, even on an unnumbered bridge.
         let via = if ingress.is_some() && ip_of(&self.there) == ip_of(&dst) {
             me
@@ -4965,7 +5116,7 @@ impl Routed {
         }
         self.m.addr = mapped.addr;
         self.m.target = mapped.target;
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -4976,9 +5127,9 @@ fn nat_dest(
     me: &crate::nsproxy::NetNs,
     dst: &[u8],
     cred: &crate::cred::Cred,
-) -> Result<Option<Vec<u8>>, Errno> {
+) -> Result<crate::netns::NatResult, Errno> {
     let Some(proto) = nat_proto(s) else {
-        return Ok(None);
+        return Ok(crate::netns::NatResult::Pass);
     };
     crate::netns::output_nat(
         me,
@@ -5030,7 +5181,18 @@ fn same_endpoint(a: &[u8], b: &[u8]) -> bool {
 /// Decides by the current rules whether `s` is forwarded and where to ([`crate::forward`]).
 fn forward_socket(k: &crate::kernel::Kernel, s: &mut InetSocket) {
     let want = forward_target(k, s);
-    if want.as_ref() == s.fwd.as_ref().map(|h| &h.target) {
+    if want.as_ref() == s.fwd.as_ref().and_then(|h| h.target.as_ref()) {
+        return;
+    }
+    // Non-deferred sockets with an existing handle update in place rather than dropping and
+    // recreating the handle: for UDP this preserves active relays across rule updates and pauses
+    // intake (`None`) when the rule disappears while letting in-flight replies drain until idle
+    // expiry or socket close.
+    if s.deferred.is_none()
+        && let Some(h) = &mut s.fwd
+        && (want.is_some() || s.ty == SOCK_DGRAM)
+    {
+        h.update(want);
         return;
     }
     // A held guest listener keeps its own accept queue empty. Only a matching target gets

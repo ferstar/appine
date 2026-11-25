@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: delegate new-namespace bind conflicts and host-port mapping to `kernel/netns::Bindings`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: guest-netns resolution for `SO_BINDTODEVICE`/`SO_BINDTOIFINDEX`)
 
 ## Responsibilities
 
@@ -47,7 +47,7 @@ listen notifications (`android/service`).
   `rd_shut` (the guest shut it down for reading); `pending_err` (a host socket error consumed after
   a partial `MSG_WAITALL` read, kept for the next read or `SO_ERROR`); namespace state owned by
   `kernel/netns` (`net`, `bound`, `any`, `vaddr`, `wide`, `vconn`, `listener` — the `netns::Binding`
-  id —, `euid`, `self_port`, `v6only`) and the forwarder handle `fwd`; `track` (nat state, seen
+  id —, `euid`, `self_port`, `v6only`, `bound_dev_if`) and the forwarder handle `fwd`; `track` (nat state, seen
   peers, a blocked verdict, connected UDP target listener, preserved real outside peer, the claimed
   original destination, `SO_MARK`); raw ICMP and tap state used with `kernel/rawicmp` (`icmp`,
   `ttl_set`, `guest_recverr`, `udp_tap`, `icmp_err`); port-map `lease`, `local_map`, `peer_map`;
@@ -163,8 +163,8 @@ listen notifications (`android/service`).
   `ENOTSOCK`; host accept with waits bounded by the listener's `SO_RCVTIMEO` (`EAGAIN` on
   timeout; a signal `ERESTARTSYS`, or `EINTR` when there is a timeout, as AF_UNIX); the new socket
   inherits protocol, local port map (not the lease), namespace and its address, mark, the claimed
-  original destination, the listener's `SO_RCVTIMEO`/`SO_SNDTIMEO`, recorded `IPV6_V6ONLY` and a
-  filter kept in Appine (the host's own filter is inherited on the host); the peer address is
+  original destination, the listener's `SO_RCVTIMEO`/`SO_SNDTIMEO`, recorded `IPV6_V6ONLY`,
+  `bound_dev_if` and a filter kept in Appine (the host's own filter is inherited on the host); the peer address is
   unmapped, translated and written back before the fd is filled (a non-NULL address with a NULL
   length `EFAULT`, as recvfrom's), so a fault drops the connection and gives the fd back.
 - shutdown: inet goes to the host, and `SHUT_RD`/`SHUT_RDWR` set `rd_shut`, also when the host
@@ -255,16 +255,22 @@ listen notifications (`android/service`).
   6.1's `sock_set_timeout`: a short buffer `EINVAL`, microseconds outside `[0, 1000000)` `EDOM`, a
   negative time zero (no waiting, `EAGAIN` at once), 0 or at least `KTIME_MAX` no timeout, read
   back as 0 like Linux's `MAX_SCHEDULE_TIMEOUT`; AF_UNIX sockets parse them the same way);
-  `IPV6_V6ONLY` in new namespaces (recorded). getsockopt answers `SO_ORIGINAL_DST`, `SO_ERROR`
+  `IPV6_V6ONLY` in new namespaces (recorded); `SO_BINDTODEVICE`/`SO_BINDTOIFINDEX` (resolved
+  against `netdev::interfaces` in the socket's namespace: `SO_BINDTODEVICE` truncated at
+  `IFNAMSIZ - 1`, `ENODEV` checked before the `CAP_NET_RAW` check over the namespace owner for
+  rebind/unbind while unprivileged initial binds succeed; real host interfaces in the initial
+  namespace also forward to the host fd, while virtual devices and new-namespace sockets stay in
+  process and update `netns::Bindings`). getsockopt answers `SO_ORIGINAL_DST`, `SO_ERROR`
   (pending ICMP errors first via `kernel/rawicmp`), the timeouts, `SO_MARK`, `SO_TYPE` (`SOCK_RAW`
-  for raw sockets) and recorded `IPV6_V6ONLY` itself, and `SO_GET_FILTER` the way Linux's
+  for raw sockets), `SO_BINDTODEVICE` (`optlen=0` when unbound, `EINVAL` for `room < 16`, `ENODEV`
+  if the bound device was deleted, else `name\0`), `SO_BINDTOIFINDEX` (the stored index),
+  recorded `IPV6_V6ONLY` itself, and `SO_GET_FILTER` the way Linux's
   `sk_get_filter` reads it, from a kept program or else by asking the host: optlen is a count of
   8-byte instructions (passed to the host capped at `BPF_MAXINSNS`, 4096, which no attached program
   exceeds), 0 asks only for the count, fewer than the program has is `EINVAL`, and optlen comes
   back as the program's count.
 - Everything else (including `SO_DETACH_FILTER` without a kept program, `SO_LOCK_FILTER`,
-  `SO_PEERCRED`, `SO_BINDTODEVICE` — resolved against host interface names —, `SO_PRIORITY`,
-  `IP_TRANSPARENT`, `TCP_*`) goes to the host and is
+  `SO_PEERCRED`, `SO_PRIORITY`, `IP_TRANSPARENT`, `TCP_*`) goes to the host and is
   checked against the app's host credentials. Netlink (`kernel/netlink`) and AF_UNIX sockets keep
   their options in process (`SockOpts`).
 - ioctls: `FIONREAD`/`SIOCINQ` (stub answers emulated) and `SIOCATMARK` pass
@@ -428,8 +434,7 @@ listen notifications (`android/service`).
 ## Confirmed bugs / technical debt
 
 - **Option passthrough uses host semantics:** privileged options (`SO_PRIORITY` above 6,
-  `IP_TRANSPARENT`) are judged by the app's host credentials (a privileged guest gets `EPERM`);
-  `SO_BINDTODEVICE` names are resolved against host interfaces.
+  `IP_TRANSPARENT`) are judged by the app's host credentials (a privileged guest gets `EPERM`).
 - **Host-refused TCP filters:** a held RET 0 can give connecting peers immediate refusal
   instead of Linux's silent drop and retransmission. A conflicting socket already bound with
   `SO_REUSEADDR` can defer a port conflict until activation. General packet-dependent filters,

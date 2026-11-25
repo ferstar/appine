@@ -120,7 +120,13 @@ impl Forwarder {
         let mut st = self.shared.state.lock().unwrap();
         st.next += 1;
         let id = st.next;
-        st.ports.insert(id, (dup, target.clone()));
+        st.ports.insert(
+            id,
+            PortEntry {
+                fd: dup,
+                target: Some(target.clone()),
+            },
+        );
         if !st.running {
             let shared = self.shared.clone();
             let spawned = std::thread::Builder::new()
@@ -138,7 +144,7 @@ impl Forwarder {
         Ok(Handle {
             shared: self.shared.clone(),
             id,
-            target,
+            target: Some(target),
         })
     }
 }
@@ -150,6 +156,15 @@ impl Drop for Forwarder {
             e.signal();
         }
     }
+}
+
+#[derive(Clone)]
+struct PortEntry {
+    fd: i32,
+    /// `None` when the port's forwarding rule was withdrawn while the guest socket stays open:
+    /// no new traffic is read from `fd`, while active UDP relays still deliver in-flight replies
+    /// back through `fd` until idle expiry or socket close.
+    target: Option<Target>,
 }
 
 #[derive(Default)]
@@ -166,8 +181,8 @@ struct Shared {
 #[derive(Default)]
 struct State {
     next: u64,
-    /// Ports to forward: the duplicated listening fd and the destination.
-    ports: HashMap<u64, (i32, Target)>,
+    /// Ports to forward: the duplicated listening fd and its current destination.
+    ports: HashMap<u64, PortEntry>,
     /// Duplicated fds of ports no longer forwarded: the thread closes them (it may be polling
     /// them).
     closing: Vec<i32>,
@@ -181,7 +196,27 @@ struct State {
 pub(crate) struct Handle {
     shared: Arc<Shared>,
     id: u64,
-    pub target: Target,
+    pub target: Option<Target>,
+}
+
+impl Handle {
+    /// Updates this port's forwarding target in place without replacing the handle or cutting
+    /// active UDP relays. Passing `None` stops reading new datagrams/connections from the port
+    /// while letting active UDP relays continue delivering replies until idle expiry or drop.
+    pub(crate) fn update(&mut self, target: Option<Target>) {
+        if self.target == target {
+            return;
+        }
+        self.target = target.clone();
+        let mut st = self.shared.state.lock().unwrap();
+        if let Some(entry) = st.ports.get_mut(&self.id) {
+            entry.target = target;
+        }
+        drop(st);
+        if let Some(e) = self.shared.event.get() {
+            e.signal();
+        }
+    }
 }
 
 impl std::fmt::Debug for Handle {
@@ -196,8 +231,8 @@ impl std::fmt::Debug for Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         let mut st = self.shared.state.lock().unwrap();
-        if let Some((fd, _)) = st.ports.remove(&self.id) {
-            st.closing.push(fd);
+        if let Some(entry) = st.ports.remove(&self.id) {
+            st.closing.push(entry.fd);
         }
         drop(st);
         if let Some(e) = self.shared.event.get() {
@@ -254,25 +289,25 @@ fn run(shared: &Shared) {
     let _ = shared.tid.set(appine_hal::gettid());
     let limits = shared.limits;
     let event = shared.event.get().expect("event before thread");
-    let mut ports: HashMap<u64, (i32, Target)> = HashMap::new();
+    let mut ports: HashMap<u64, PortEntry> = HashMap::new();
     let mut conns: Vec<Conn> = Vec::new();
     let mut relays: Vec<Relay> = Vec::new();
     // Ports whose accept failed while they polled readable, and until when they are left out
     let mut stalled: HashMap<u64, Instant> = HashMap::new();
     loop {
-        // Take the ports handed over; close those no longer forwarded, and their UDP
+        // Take the ports handed over; close those whose handle was dropped, and their UDP
         // forwarding sockets too
         {
             event.clear();
             let mut st = shared.state.lock().unwrap();
             for fd in st.closing.drain(..) {
-                ports.retain(|_, (f, _)| *f != fd);
+                ports.retain(|_, e| e.fd != fd);
                 appine_hal::net::close(fd);
             }
             ports = st.ports.clone();
             if st.stop {
-                for (fd, _) in st.ports.values() {
-                    appine_hal::net::close(*fd);
+                for entry in st.ports.values() {
+                    appine_hal::net::close(entry.fd);
                 }
                 st.ports.clear();
                 st.running = false;
@@ -303,16 +338,19 @@ fn run(shared: &Shared) {
             }
             keep
         });
-        stalled.retain(|id, until| ports.contains_key(id) && *until > now);
-        // What to wait for: the event, every port (omitting stalled ones, and omitting TCP
-        // listeners while at the connection cap so the accept socket does not busy-loop), both
-        // sides of every connection, every UDP forwarding socket
+        stalled
+            .retain(|id, until| ports.get(id).is_some_and(|e| e.target.is_some()) && *until > now);
+        // What to wait for: the event, every active port (omitting paused/stalled ones, and
+        // omitting TCP listeners while at the connection cap so the accept socket does not
+        // busy-loop), both sides of every connection, every UDP forwarding socket
         let at_conn_cap = conns.len() >= limits.max_conns;
         let mut fds: Vec<(i32, i16, i16)> = vec![(event.fd(), POLLIN, 0)];
         let order: Vec<(u64, i32, bool)> = ports
             .iter()
-            .filter(|(id, (_, t))| !stalled.contains_key(id) && (t.udp || !at_conn_cap))
-            .map(|(id, (fd, t))| (*id, *fd, t.udp))
+            .filter_map(|(id, e)| {
+                let t = e.target.as_ref()?;
+                (!stalled.contains_key(id) && (t.udp || !at_conn_cap)).then_some((*id, e.fd, t.udp))
+            })
             .collect();
         fds.extend(order.iter().map(|&(_, fd, _)| (fd, POLLIN, 0)));
         for c in &conns {
@@ -340,8 +378,8 @@ fn run(shared: &Shared) {
             fds.push((c.upstream, ue, 0));
         }
         fds.extend(relays.iter().map(|r| (r.fd, POLLIN, 0)));
-        // Connections accepted and forwarding sockets opened below are not in this round
-        let (polled_conns, polled_relays) = (conns.len(), relays.len());
+        // Connections accepted below are not in this round
+        let polled_conns = conns.len();
         let idle = (!relays.is_empty()).then(|| limits.udp_idle.min(Duration::from_secs(5)));
         let resume = stalled
             .values()
@@ -365,6 +403,10 @@ fn run(shared: &Shared) {
                 continue;
             }
         }
+        // Send polled UDP replies back to the source before datagrams() can mutate `relays`
+        // (via swap_remove on send error or push on a new client).
+        let relays_at = 1 + order.len() + 2 * polled_conns;
+        relay_replies(&mut relays, &fds[relays_at..], &ports);
         let mut at = 1;
         // Ports: accept connections, receive datagrams
         for &(id, fd, udp) in &order {
@@ -373,7 +415,9 @@ fn run(shared: &Shared) {
             if !ready {
                 continue;
             }
-            let target = &ports[&id].1;
+            let Some(target) = ports[&id].target.as_ref() else {
+                continue;
+            };
             if udp {
                 datagrams(id, fd, target, &mut relays, limits.max_relays);
                 continue;
@@ -420,7 +464,6 @@ fn run(shared: &Shared) {
             let r = step(c, cr, ur);
             broken[k] = r.is_err() || c.done();
         }
-        at += 2 * polled_conns;
         let mut i = 0;
         conns.retain(|c| {
             let gone = broken[i];
@@ -430,26 +473,6 @@ fn run(shared: &Shared) {
             }
             !gone
         });
-        // Send UDP replies back to the source
-        for (k, r) in relays.iter_mut().enumerate().take(polled_relays) {
-            if fds[at + k].2 == 0 {
-                continue;
-            }
-            let Some((port_fd, _)) = ports.get(&r.port) else {
-                continue;
-            };
-            let mut buf = vec![0u8; 65536];
-            while let Ok(m) = appine_hal::net::recvmsg(r.fd, &mut buf, 0, 0) {
-                let _ = appine_hal::net::sendmsg(
-                    *port_fd,
-                    &buf[..m.len.min(buf.len())],
-                    &r.client,
-                    &[],
-                    0,
-                );
-                r.last = Instant::now();
-            }
-        }
     }
 }
 
@@ -544,33 +567,80 @@ fn datagrams(id: u64, fd: i32, target: &Target, relays: &mut Vec<Relay>, max_rel
             break;
         };
         let data = &buf[..m.len.min(buf.len())];
-        let r = match relays
+        if let Some(i) = relays
             .iter()
             .position(|r| r.port == id && r.client == m.addr)
         {
-            Some(i) => &mut relays[i],
-            None => {
-                if relays.len() >= max_relays {
-                    continue;
+            relays[i].last = Instant::now();
+            match appine_hal::net::sendmsg(relays[i].fd, data, &[], &[], 0) {
+                Ok(_) | Err(EAGAIN) => continue,
+                Err(_) => {
+                    // The old upstream stopped listening (e.g. ICMP port unreachable after a
+                    // rule/container change): close the dead relay and open a fresh one to the
+                    // current target.
+                    let dead = relays.swap_remove(i);
+                    appine_hal::net::close(dead.fd);
                 }
-                // UDP still binds the gateway's address: datagrams the container sends back to
-                // the real address must go back through the forwarding socket, and the address
-                // mapping has no entry for that direction
-                let Ok((rfd, _, _)) = open(target, None) else {
-                    continue;
-                };
-                relays.push(Relay {
-                    fd: rfd,
-                    port: id,
-                    client: m.addr.clone(),
-                    last: Instant::now(),
-                });
-                relays.last_mut().unwrap()
             }
+        }
+        if relays.len() >= max_relays {
+            continue;
+        }
+        // UDP still binds the gateway's address: datagrams the container sends back to
+        // the real address must go back through the forwarding socket, and the address
+        // mapping has no entry for that direction
+        let Ok((rfd, _, _)) = open(target, None) else {
+            continue;
         };
-        r.last = Instant::now();
-        let _ = appine_hal::net::sendmsg(r.fd, data, &[], &[], 0);
+        let _ = appine_hal::net::sendmsg(rfd, data, &[], &[], 0);
+        relays.push(Relay {
+            fd: rfd,
+            port: id,
+            client: m.addr,
+            last: Instant::now(),
+        });
     }
+}
+
+/// Forwards polled UDP upstream replies back to their original clients, dropping any relay whose
+/// upstream socket reports a hard error (e.g. ECONNREFUSED after the target stopped listening).
+fn relay_replies(
+    relays: &mut Vec<Relay>,
+    polled: &[(i32, i16, i16)],
+    ports: &HashMap<u64, PortEntry>,
+) {
+    let mut k = 0;
+    let mut buf: Option<Vec<u8>> = None;
+    relays.retain_mut(|r| {
+        let revents = polled[k].2;
+        k += 1;
+        if revents == 0 {
+            return true;
+        }
+        let Some(entry) = ports.get(&r.port) else {
+            return true;
+        };
+        let buf = buf.get_or_insert_with(|| vec![0u8; 65536]);
+        loop {
+            match appine_hal::net::recvmsg(r.fd, buf, 0, 0) {
+                Ok(m) => {
+                    let _ = appine_hal::net::sendmsg(
+                        entry.fd,
+                        &buf[..m.len.min(buf.len())],
+                        &r.client,
+                        &[],
+                        0,
+                    );
+                    r.last = Instant::now();
+                }
+                Err(EAGAIN) => return true,
+                Err(_) => {
+                    appine_hal::net::close(r.fd);
+                    return false;
+                }
+            }
+        }
+    });
 }
 
 /// Creates a host socket connecting to `t` (nonblocking; the connection may still be in
@@ -940,6 +1010,80 @@ mod tests {
         // The reply comes from the port the client sent to
         assert_eq!(r.addr[2..8], loopback(port(held))[2..8]);
         for fd in [server, held, c] {
+            appine_hal::net::close(fd);
+        }
+    }
+
+    /// Updating a forwarded UDP port's target in place (rule change or pause/resume) preserves
+    /// active UDP relays so in-flight replies still reach the client, while new clients follow
+    /// the updated target and pausing stops stealing new datagrams from the guest socket.
+    #[test]
+    fn udp_relays_survive_rule_updates_and_pause() {
+        let srv1 = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        appine_hal::net::bind(srv1, &loopback(0)).unwrap();
+        let srv2 = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        appine_hal::net::bind(srv2, &loopback(0)).unwrap();
+        let held = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        appine_hal::net::bind(held, &loopback(0)).unwrap();
+        let f = Forwarder::default();
+        let mut h = f
+            .add(
+                held,
+                Target {
+                    udp: true,
+                    addr: loopback(port(srv1)),
+                    source: None,
+                },
+            )
+            .unwrap();
+        let c1 = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        let c2 = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        let dst = loopback(port(held));
+        let mut buf = [0u8; 64];
+
+        // c1 starts a UDP relay to srv1, then the rule changes to srv2 before srv1 replies.
+        appine_hal::net::sendmsg(c1, b"q1", &dst, &[], 0).unwrap();
+        wait(srv1, POLLIN);
+        let m1 = appine_hal::net::recvmsg(srv1, &mut buf, 0, 0).unwrap();
+        assert_eq!(&buf[..m1.len], b"q1");
+
+        h.update(Some(Target {
+            udp: true,
+            addr: loopback(port(srv2)),
+            source: None,
+        }));
+        std::thread::sleep(Duration::from_millis(50));
+
+        // srv1's reply to c1 still flows back through the preserved relay.
+        appine_hal::net::sendmsg(srv1, b"a1", &m1.addr, &[], 0).unwrap();
+        wait(c1, POLLIN);
+        let r1 = appine_hal::net::recvmsg(c1, &mut buf, 0, 0).unwrap();
+        assert_eq!(&buf[..r1.len], b"a1");
+
+        // A new client c2 routes to the updated target srv2.
+        appine_hal::net::sendmsg(c2, b"q2", &dst, &[], 0).unwrap();
+        wait(srv2, POLLIN);
+        let m2 = appine_hal::net::recvmsg(srv2, &mut buf, 0, 0).unwrap();
+        assert_eq!(&buf[..m2.len], b"q2");
+
+        // Pausing (rule removed while socket stays open) lets in-flight reply from srv2 reach c2,
+        // while new datagrams on `held` are NOT stolen by the forwarder and stay readable on `held`.
+        h.update(None);
+        std::thread::sleep(Duration::from_millis(50));
+        appine_hal::net::sendmsg(srv2, b"a2", &m2.addr, &[], 0).unwrap();
+        wait(c2, POLLIN);
+        let r2 = appine_hal::net::recvmsg(c2, &mut buf, 0, 0).unwrap();
+        assert_eq!(&buf[..r2.len], b"a2");
+
+        appine_hal::net::sendmsg(c2, b"direct", &dst, &[], 0).unwrap();
+        wait(held, POLLIN);
+        let direct = appine_hal::net::recvmsg(held, &mut buf, 0, 0).unwrap();
+        assert_eq!(&buf[..direct.len], b"direct");
+
+        // Dropping the handle (socket closed) tears down all relays cleanly.
+        drop(h);
+        std::thread::sleep(Duration::from_millis(50));
+        for fd in [srv1, srv2, held, c1, c2] {
             appine_hal::net::close(fd);
         }
     }
