@@ -22,7 +22,7 @@ use crate::vfs::acl::{
     self, ACL_ACCESS, ACL_DEFAULT, ACL_GROUP, ACL_USER, AclEntry, acl_encode, acl_entries,
     acl_valid,
 };
-use crate::vfs::store::{Ino, Stat, mode};
+use crate::vfs::store::{Ino, Stat, inode_flags, mode};
 
 const XATTR_CREATE: u32 = 1;
 const XATTR_REPLACE: u32 = 2;
@@ -67,21 +67,21 @@ pub(super) fn setxattr(
     let ino = writable_ino(cx, node, &name)?;
     let vfs = cx.vfs()?;
     let store = vfs.store();
+    let st = store.attrs(ino)?;
+    permission(cx, &st, &name, true)?;
     // Program file capabilities: only v2 and v3 are accepted, CAP_SETFCAP is needed over the file
     // (in the writer's namespace, with its owner and group mapped there), and the value is stored
-    // with the root of the writer's namespace (cap_convert_nscap, before the other checks; Linux
-    // does not check when the length is 0)
+    // with the root of the writer's namespace (cap_convert_nscap). Linux skips empty values.
     if name == XATTR_NAME_CAPS && size > 0 {
         if !FileCaps::valid_xattr(&v) {
             return Err(Errno::EINVAL);
         }
         let cred = cx.cred();
-        if !cred.capable_wrt(&store.attrs(ino)?, cap::SETFCAP) {
+        if !cred.capable_wrt(&st, cap::SETFCAP) {
             return Err(Errno::EPERM);
         }
         v = FileCaps::xattr_to_store(&v, &cred)?;
     }
-    permission(cx, &store.attrs(ino)?, &name, true)?;
     store.set_xattr(
         ino,
         &name,
@@ -201,23 +201,22 @@ pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResu
     }
     let ino = writable_ino(cx, node, &name)?;
     let vfs = cx.vfs()?;
-    permission(cx, &vfs.store().attrs(ino)?, &name, true)?;
+    let store = vfs.store();
+    let st = store.attrs(ino)?;
+    permission(cx, &st, &name, true)?;
     // Removing program file capabilities needs CAP_SETFCAP over the file (cap_inode_removexattr)
-    if name == XATTR_NAME_CAPS
-        && !cx
-            .cred()
-            .capable_wrt(&vfs.store().attrs(ino)?, cap::SETFCAP)
-    {
+    if name == XATTR_NAME_CAPS && !cx.cred().capable_wrt(&st, cap::SETFCAP) {
         return Err(Errno::EPERM);
     }
-    vfs.store().remove_xattr(ino, &name)?;
+    store.remove_xattr(ino, &name)?;
     attrib(cx, target, ino);
     Ok(0)
 }
 
 /// setxattr (`value` Some) or removexattr of a `system.*` attribute on a store or overlay node, as
-/// 6.1's `posix_acl_xattr_set` and `set_posix_acl` do on ext4 and tmpfs: EROFS on a read-only
-/// mount; names other than the two ACL attributes EOPNOTSUPP; a malformed ACL or one naming an ID
+/// 6.1's `posix_acl_xattr_set` and `set_posix_acl` do on ext4 and tmpfs. A read-only mount gives
+/// EROFS, then immutable and append-only inodes give EPERM. For the remaining checks:
+/// names other than the two ACL attributes EOPNOTSUPP; a malformed ACL or one naming an ID
 /// unmapped in the caller's namespace EINVAL (`posix_acl_from_xattr`, an empty one counting as a
 /// removal); a symlink EOPNOTSUPP; a default ACL on anything but a directory EACCES (its removal
 /// succeeds); not being the owner or capable over it (`CAP_FOWNER`) EPERM; an invalid ACL
@@ -237,6 +236,17 @@ fn change_acl(
     if vfs.readonly(&node) {
         return Err(Errno::EROFS);
     }
+    let shown = match node {
+        Node::Store(_, ino) => Some(vfs.store().attrs(ino)?),
+        Node::Overlay(_, o) => Some(vfs.store().attrs(vfs.overlay().node(o).real())?),
+        Node::Pseudo(..) | Node::Fuse(..) => None,
+    };
+    if shown
+        .as_ref()
+        .is_some_and(|st| st.flags & inode_flags::PROTECTED != 0)
+    {
+        return Err(Errno::EPERM);
+    }
     if !is_acl(name) {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -245,11 +255,7 @@ fn change_acl(
         Some(v) => acl_from_user(v, &cred)?,
         None => None,
     };
-    let shown = match node {
-        Node::Store(_, ino) => vfs.store().attrs(ino)?,
-        Node::Overlay(_, o) => vfs.store().attrs(vfs.overlay().node(o).real())?,
-        Node::Pseudo(..) | Node::Fuse(..) => return Err(Errno::EOPNOTSUPP),
-    };
+    let shown = shown.ok_or(Errno::EOPNOTSUPP)?;
     if shown.kind() == mode::S_IFLNK {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -444,6 +450,9 @@ fn readable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
 /// - `system.*` (the ACLs) needs the owner or `CAP_FOWNER` to write ([`change_acl`] checks it
 ///   first), reads are unrestricted.
 fn permission(cx: &Cx<'_>, st: &Stat, name: &[u8], write: bool) -> Result<(), Errno> {
+    if write && st.flags & inode_flags::PROTECTED != 0 {
+        return Err(Errno::EPERM);
+    }
     let cred = cx.cred();
     let hidden = if write { Errno::EPERM } else { Errno::ENODATA };
     if name.starts_with(b"trusted.") {

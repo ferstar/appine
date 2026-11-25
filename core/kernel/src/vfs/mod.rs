@@ -584,18 +584,10 @@ impl AnonTarget {
             ),
             Self::Socket(s) => {
                 let sock = s.borrow();
-                let uid = sock.uid();
-                let gid = if uid == cred.fsuid {
-                    cred.fsgid
-                } else if let crate::net::Socket::Unix(u) = &*sock {
-                    u.peer_cred.filter(|c| c.uid == uid).map_or(0, |c| c.gid)
-                } else {
-                    0
-                };
                 (
                     mode::S_IFSOCK | 0o777,
-                    uid,
-                    gid,
+                    sock.uid(),
+                    sock.gid(),
                     0,
                     AnonWeak::Socket(Rc::downgrade(s)),
                 )

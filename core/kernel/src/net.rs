@@ -47,13 +47,28 @@ pub(crate) enum Socket {
 }
 
 impl Socket {
-    /// Creator's filesystem UID recorded at socket creation (`sock_i_uid`), reported in
-    /// `/proc/net/*`.
+    /// Socket inode UID (`sock_i_uid`), reported in `/proc/net/*`.
     pub(crate) fn uid(&self) -> u32 {
         match self {
             Socket::Inet(s) => s.uid,
             Socket::Netlink(s) => s.uid,
             Socket::Unix(s) => s.uid,
+        }
+    }
+
+    pub(crate) fn gid(&self) -> u32 {
+        match self {
+            Socket::Inet(s) => s.gid,
+            Socket::Netlink(s) => s.gid,
+            Socket::Unix(s) => s.gid,
+        }
+    }
+
+    pub(crate) fn set_owner(&mut self, uid: u32, gid: u32) {
+        match self {
+            Socket::Inet(s) => (s.uid, s.gid) = (uid, gid),
+            Socket::Netlink(s) => (s.uid, s.gid) = (uid, gid),
+            Socket::Unix(s) => (s.uid, s.gid) = (uid, gid),
         }
     }
 }
@@ -135,6 +150,8 @@ pub(crate) struct InetSocket {
     pub euid: u32,
     /// Creator's filesystem UID (`sock_i_uid`), reported in `/proc/net/*`.
     pub uid: u32,
+    /// Socket inode group, initialized from the creator's filesystem GID.
+    pub gid: u32,
     /// UDP: bound on the host to 127.a.b.254 (for datagrams sent to its own virtual address), with
     /// the port registered in the namespace's [`crate::nsproxy::Loopback::self_udp`], removed on
     /// close.
@@ -225,6 +242,7 @@ impl InetSocket {
             listener: None,
             euid: 0,
             uid: 0,
+            gid: 0,
             self_port: None,
             v6only: false,
             icmp: None,
@@ -749,6 +767,8 @@ pub(crate) struct NetlinkSocket {
     pub opts: SockOpts,
     /// Creator's filesystem UID (`sock_i_uid`).
     pub uid: u32,
+    /// Socket inode group, initialized from the creator's filesystem GID.
+    pub gid: u32,
 }
 
 impl NetlinkSocket {
@@ -775,6 +795,7 @@ impl NetlinkSocket {
             sndtimeo: None,
             opts: SockOpts::default(),
             uid: 0,
+            gid: 0,
             overrun: Default::default(),
         }
     }

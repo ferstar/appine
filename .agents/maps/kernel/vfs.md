@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: anonymous inode metadata, PTY master identity, persistent inode flags and store rename error ordering)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: enforce inode flags in xattr/ACL and `MAP_SHARED` paths, and record socket creation gid alongside uid)
 
 ## Responsibilities
 
@@ -263,7 +263,8 @@ capabilities (`kernel/cred`).
 - Immutable inodes reject write access, including writable opens and `faccessat(W_OK)`.
   Append-only directories accept new names. Removing a name or replacing it checks both the
   directory and the victim for immutable and append-only. Hard links check the source too.
-  Immutable and append-only files reject truncation, chmod, chown and explicit timestamp changes.
+  Immutable and append-only files reject truncation, chmod, chown, explicit timestamp changes,
+  xattr and POSIX ACL mutations (`kernel/xattr`), and writable shared mappings (`kernel/mm`).
   Both timestamps may be set to now on an append-only inode with the usual permissions.
   Descriptor writes check current flags, including after a writable open. Append-only forces
   writes to EOF and prevents toggling `O_APPEND`. Range copies check the destination before
@@ -298,10 +299,10 @@ capabilities (`kernel/cred`).
   empty paths with `AT_EMPTY_PATH`; Linux 6.1's `fchmodat` has no flags argument.
 - An anonymous pipe starts at mode 0600 with the creator's fsuid/fsgid and the creation time.
   Successful ordinary reads update atime and writes update mtime and ctime. A socket starts at
-  mode 0777 with its recorded uid and zero timestamps. On first lookup, a matching fsuid
-  supplies the caller's fsgid. Otherwise a Unix socket can use a peer gid if the peer uid
-  matches its owner; the fallback gid is zero. Once initialized, chmod, chown and utimens share
-  the stored attributes. Socket chown also updates the uid used by procfs. Weak object references
+  mode 0777 with its creation/accept-time fsuid and fsgid recorded on the socket and zero
+  timestamps. Once initialized, chmod, chown and utimens share
+  the stored attributes. Socket chown also updates the uid and gid recorded on the socket (used by
+  procfs and standalone guests). Weak object references
   preserve identity until dead entries are pruned as the table grows.
 - mknodat, after resolution and the `.`/`..` `EEXIST`: regular, char, block, FIFO, socket
   (directory `EPERM`, other types `EINVAL`); devices need `CAP_MKNOD` in the initial namespace and
@@ -421,13 +422,10 @@ capabilities (`kernel/cred`).
 
 ## Confirmed bugs / technical debt
 
-- Guest xattr setters and writable shared mappings still need inode-flag checks in their
-  respective syscall paths. The store's raw xattr operations also serve internal copy-up and ACL work.
 - statx has no btime or `STATX_DIOALIGN`.
 - **Scoped openat2 never returns `EAGAIN`:** the walk is atomic under the BKL, so a `..` walked
   while another thread mounts or renames never asks the caller to retry. Safe.
 - Standalone guests running without a VFS lack the shared anonymous attribute table.
-  Socket gid is also inferred at first lookup because socket creation records only the uid.
 
 ## Open questions
 

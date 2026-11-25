@@ -136,14 +136,15 @@ pub(super) fn mmap(
             prot |= prot::EXEC;
         }
         // Check access before asking the daemon for attributes.
-        let refused =
-            kind == flags::MAP_SHARED && prot & prot::WRITE != 0 && !file.borrow().writable()
-                || on_noexec(cx, &file.borrow()) && prot & prot::EXEC != 0;
-        fuse_fill = super::fuse::map_fill(cx, &file, kind == flags::MAP_SHARED, refused)?;
+        let shared = kind == flags::MAP_SHARED;
+        let shared_write = shared && prot & prot::WRITE != 0;
+        let refused = shared_write && !file.borrow().writable()
+            || on_noexec(cx, &file.borrow()) && prot & prot::EXEC != 0;
+        fuse_fill = super::fuse::map_fill(cx, &file, shared, refused)?;
         let mut f = file.borrow();
-        let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
         match &f.kind {
             FileKind::Regular { .. } => {
+                use crate::vfs::store::inode_flags;
                 if !f.readable() {
                     return Err(Errno::EACCES);
                 }
@@ -175,23 +176,28 @@ pub(super) fn mmap(
                 if !f.pseudo {
                     file_mnt = Some(f.mnt);
                 }
+                let inode_flags = super::fs::file_inode_flags(cx, &f)?;
+                if shared && f.writable() && inode_flags & inode_flags::APPEND != 0 {
+                    return Err(Errno::EACCES);
+                }
                 // A memfd sealed against writes cannot have a writable shared mapping, now or later
                 let sealed = cx
                     .kr()
                     .seals
                     .get(ino)
                     .is_some_and(|s| s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0);
-                if sealed && shared_write {
+                if shared_write && (sealed || inode_flags & inode_flags::IMMUTABLE != 0) {
                     return Err(Errno::EPERM);
                 }
-                let may_write = f.writable() && !(sealed && kind == flags::MAP_SHARED);
+                let protected = inode_flags & inode_flags::PROTECTED != 0;
+                let may_write = f.writable() && !(shared && (sealed || protected));
                 let mut fd = host.as_raw_fd();
                 let vfs = cx.vfs()?;
                 let ino = *ino;
                 let tmpfs_dev = f.node().and_then(|n| vfs.mapped_tmpfs_dev(&n, ino));
                 if !f.pseudo {
                     drop(f);
-                    let writable = kind == flags::MAP_SHARED && may_write;
+                    let writable = shared && may_write;
                     mapping_object = loop {
                         match vfs.store().mapping_object(ino, writable) {
                             Err(Errno::EAGAIN) => super::fs::make_private(cx, ino, None)?,
@@ -221,7 +227,7 @@ pub(super) fn mmap(
                 if !f.readable() || (shared_write && !f.writable()) {
                     return Err(Errno::EACCES);
                 }
-                if kind != flags::MAP_SHARED || prot & prot::EXEC != 0 || growsdown {
+                if !shared || prot & prot::EXEC != 0 || growsdown {
                     return Err(Errno::EINVAL);
                 }
                 gpu_mapping = Some(file.mapping(offset, len)?);
@@ -240,7 +246,7 @@ pub(super) fn mmap(
                 if !f.readable() {
                     return Err(Errno::EACCES);
                 }
-                if kind == flags::MAP_SHARED && !f.writable() {
+                if shared && !f.writable() {
                     if prot & prot::WRITE != 0 {
                         return Err(Errno::EACCES);
                     }

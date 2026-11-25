@@ -110,7 +110,8 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
     let net = cx.task.ns.borrow().net.clone();
     let owner = net.owner.clone();
     let net = net.host_net.is_some().then_some(net);
-    let sock = match domain {
+    let cred = cx.cred();
+    let mut sock = match domain {
         AF_INET | AF_INET6 => {
             // A raw socket needs CAP_NET_RAW over the network namespace's owner (Linux's
             // inet_create: a wrong protocol number is reported first, left to the host). The raw
@@ -128,7 +129,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             // ICMP socket would not match up (on EPERM they fall back to ping sockets)
             if base == SOCK_RAW
                 && (1..256).contains(&protocol)
-                && (!icmp || !cx.cred().ns_capable(&owner, crate::cred::cap::NET_RAW))
+                && (!icmp || !cred.ns_capable(&owner, crate::cred::cap::NET_RAW))
             {
                 return Err(Errno::EPERM);
             }
@@ -159,9 +160,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
                 s.proto = protocol;
             }
             s.net = net;
-            let cred = cx.cred();
             s.euid = cred.euid;
-            s.uid = cred.fsuid;
             Socket::Inet(s)
         }
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
@@ -185,7 +184,6 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             }
             let mut s = NetlinkSocket::new(protocol, base);
             s.net = net;
-            s.uid = cx.cred().fsuid;
             Socket::Netlink(s)
         }
         AF_NETLINK => return Err(Errno::ESOCKTNOSUPPORT),
@@ -193,13 +191,13 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             let mut s = unix::socket(base, protocol)?;
             if let Socket::Unix(u) = &mut s {
                 u.net = net;
-                u.uid = cx.cred().fsuid;
                 u.set_max_qlen(unix::max_dgram_qlen(cx));
             }
             s
         }
         _ => return Err(Errno::EAFNOSUPPORT),
     };
+    sock.set_owner(cred.fsuid, cred.fsgid);
     let sock = Rc::new(RefCell::new(sock));
     if matches!(&*sock.borrow(), Socket::Netlink(_)) {
         let all = &mut cx.k().rtnl_sockets;
@@ -1065,10 +1063,12 @@ fn accept_host(
                     new.filter = s.filter.clone();
                 }
                 // IPV6_V6ONLY and SO_BINDTODEVICE carry over (sk_clone_lock); the accepted
-                // socket's inode UID belongs to the accepting task (do_accept -> sock_alloc).
+                // socket's inode ownership comes from the accepting task (do_accept -> sock_alloc).
                 new.v6only = *v6only;
                 new.euid = *euid;
-                new.uid = cx.cred().fsuid;
+                let cred = cx.cred();
+                new.uid = cred.fsuid;
+                new.gid = cred.fsgid;
                 new.bound_dev_if = *bound_dev_if;
                 new.local_map = local_map;
                 new.net = net.clone();

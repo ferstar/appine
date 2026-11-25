@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification of anonymous write faults, VMA boundaries, fork accounting, mremap growth and DONTUNMAP remnants)
+> Maintained: 2026-11-26 (targeted verification of anonymous write faults, VMA boundaries, fork accounting, mremap growth, DONTUNMAP remnants, and regular-file `MAP_SHARED` `FS_IMMUTABLE_FL`/`FS_APPEND_FL` checks)
 
 ## Responsibilities
 
@@ -130,8 +130,11 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `EOPNOTSUPP`), `MAP_SHARED | MAP_ANONYMOUS | MAP_GROWSDOWN` (`EINVAL`), a fixed address below
   `vm.mmap_min_addr` without `CAP_SYS_RAWIO` (`EPERM`; for an anonymous mapping only with a
   non-zero length; for a file after its `EBADF` and zero-length `EINVAL`), then the file's own
-  rules (a FUSE mapping gets its `Fill`; regular store mappings check access, noexec and seals
-  before unsharing and pinning the store object), and `MAP_LOCKED` (`EPERM` when `RLIMIT_MEMLOCK` is
+  rules (a FUSE mapping gets its `Fill`; regular store mappings check access, noexec, inode flags
+  — rejecting `MAP_SHARED` on a writable fd of an `FS_APPEND_FL` inode with `EACCES`, rejecting
+  `MAP_SHARED | PROT_WRITE` on an `FS_IMMUTABLE_FL` inode with `EPERM`, and clearing `may_write` on
+  read-only `MAP_SHARED` mappings of protected inodes so later `mprotect(PROT_WRITE)` returns
+  `EACCES` — and seals before unsharing and pinning the store object), and `MAP_LOCKED` (`EPERM` when `RLIMIT_MEMLOCK` is
   0 without `CAP_IPC_LOCK`, `EAGAIN` above limit) or `mlockall(MCL_FUTURE)` (`EAGAIN` above limit).
   Private anonymous mappings record grows-down and lock flags at creation. After the mapping:
   `reap_shm` for `MAP_FIXED`, the label, write and exec denials, locking, and population

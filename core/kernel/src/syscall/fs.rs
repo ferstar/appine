@@ -2512,7 +2512,7 @@ fn real_inode(vfs: &Vfs, node: &Node) -> Option<Ino> {
     }
 }
 
-fn file_inode_flags(cx: &Cx<'_>, f: &OpenFile) -> Result<u32, Errno> {
+pub(super) fn file_inode_flags(cx: &Cx<'_>, f: &OpenFile) -> Result<u32, Errno> {
     if matches!(
         f.kind,
         FileKind::Regular { .. } | FileKind::Directory { .. }
@@ -9234,13 +9234,11 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> Result<bool, Er
                     a.ctime_ns = crate::tty::wall_ns();
                 });
             }
-            if let (Some(uid), AnonTarget::Socket(s)) = (uid, target) {
-                use crate::net::Socket;
-                match &mut *s.borrow_mut() {
-                    Socket::Inet(s) => s.uid = uid,
-                    Socket::Netlink(s) => s.uid = uid,
-                    Socket::Unix(s) => s.uid = uid,
-                }
+            if let AnonTarget::Socket(s) = target
+                && (uid.is_some() || gid.is_some())
+            {
+                s.borrow_mut()
+                    .set_owner(uid.unwrap_or(st.uid), gid.unwrap_or(st.gid));
             }
         }
         Attrs::Cgroup(id, name) => {
@@ -11514,6 +11512,76 @@ mod tests {
     }
 
     #[test]
+    fn socket_owner_survives_credential_changes_before_first_stat() {
+        use super::super::net;
+        use crate::net::{AF_INET, AF_NETLINK, AF_UNIX, SOCK_DGRAM, SOCK_STREAM};
+        for (uid, gid) in [(1000, 3000), (4000, 5000)] {
+            with_guest(1000, |cx, addr, _| {
+                // Queue both connections under the listener's credentials before accepting.
+                let mut listeners = Vec::new();
+                for family in [AF_UNIX, AF_INET] {
+                    let listener = net::socket(cx, family, SOCK_STREAM as u32, 0).unwrap() as i32;
+                    let client = net::socket(cx, family, SOCK_STREAM as u32, 0).unwrap() as i32;
+                    let len = if family == AF_UNIX {
+                        put(cx, addr, [1, 0, 0, b's']).unwrap();
+                        4
+                    } else {
+                        put(cx, addr, [2, 0, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+                        16
+                    };
+                    net::bind(cx, listener, addr, len).unwrap();
+                    net::listen(cx, listener, 1).unwrap();
+                    put(cx, addr + 32, len.to_le_bytes()).unwrap();
+                    net::getsockname(cx, listener, addr, addr + 32).unwrap();
+                    net::connect(cx, client, addr, len).unwrap();
+                    listeners.push(listener);
+                }
+                let mut cred = cx.cred();
+                cred.fsgid = 2000;
+                cx.set_cred(cred.clone());
+                let mut sockets = Vec::new();
+                for listener in listeners {
+                    sockets.push(net::accept4(cx, listener, 0, 0, 0).unwrap() as i32);
+                }
+                for family in [AF_UNIX, AF_INET, AF_NETLINK] {
+                    sockets.push(net::socket(cx, family, SOCK_DGRAM as u32, 0).unwrap() as i32);
+                }
+                net::socketpair(cx, AF_UNIX, SOCK_STREAM as u32, 0, addr).unwrap();
+                for off in [0, 4] {
+                    sockets.push(i32::from_le_bytes(get(cx, addr + off).unwrap()));
+                }
+
+                cred.fsuid = uid;
+                cred.fsgid = gid;
+                cx.set_cred(cred);
+                let stat_owner = |cx: &mut Cx<'_>, fd| {
+                    fstat(cx, fd, addr).unwrap();
+                    (
+                        u32::from_le_bytes(get(cx, addr + 24).unwrap()),
+                        u32::from_le_bytes(get(cx, addr + 28).unwrap()),
+                    )
+                };
+                for &fd in &sockets {
+                    assert_eq!(stat_owner(cx, fd), (1000, 2000));
+                }
+                cx.set_cred(Cred::root());
+                for &fd in &sockets {
+                    fchown(cx, fd, u32::MAX, 6000).unwrap();
+                    assert_eq!(stat_owner(cx, fd), (1000, 6000));
+                }
+
+                // Standalone guests read and change ownership directly on the socket.
+                cx.k().vfs = None;
+                cx.t.vfs = None;
+                for fd in sockets {
+                    fchown(cx, fd, 7000, u32::MAX).unwrap();
+                    assert_eq!(stat_owner(cx, fd), (7000, 6000));
+                }
+            });
+        }
+    }
+
+    #[test]
     fn ptmx_master_reports_the_opened_device() {
         with_guest(0, |cx, addr, _| {
             let vfs = cx.vfs().unwrap();
@@ -11645,6 +11713,224 @@ mod tests {
                 let sub = openat(cx, dirfd, addr, O_DIRECTORY, 0).unwrap() as i32;
                 set_inode_flags(cx, sub, arg, IMMUTABLE).unwrap();
                 assert_eq!(unlinkat(cx, dirfd, addr, AT_REMOVEDIR), denied);
+            }
+        });
+    }
+
+    fn set_test_xattr(cx: &mut Cx<'_>, addr: u64, fd: i32, name: &[u8], value: &[u8]) -> SysResult {
+        use super::super::xattr::{Target, setxattr};
+        write_cstr(cx, addr, name);
+        cx.mm()
+            .write(UserSlice::new(addr + 128, value.len()), value)?;
+        setxattr(cx, Target::Fd(fd), addr, addr + 128, value.len(), 0)
+    }
+
+    fn test_access_acl(named: bool) -> Vec<u8> {
+        use crate::vfs::acl::{ACL_USER, acl_encode};
+        let id = u32::MAX;
+        let mut entries = vec![(0x01, 7, id), (0x04, 4, id), (0x20, 0, id)];
+        if named {
+            entries.insert(1, (ACL_USER, 5, 1234));
+            entries.insert(3, (0x10, 5, id));
+        }
+        acl_encode(&entries)
+    }
+
+    #[test]
+    fn protected_inode_xattrs_preserve_values_and_mode() {
+        use super::super::xattr::{Target, getxattr, listxattr, removexattr};
+        use crate::vfs::acl::{ACL_ACCESS, ACL_DEFAULT};
+        with_guest(0, |cx, addr, _| {
+            mount_tmpfs(&cx.vfs().unwrap(), 32);
+            bind_tmp(&cx.vfs().unwrap(), b"ro", ms::RDONLY);
+            let acl = test_access_acl(true);
+            let mode_acl = test_access_acl(false);
+            let extra: [(&[u8], &[u8]); 4] = [
+                (ACL_ACCESS, &mode_acl),
+                (ACL_ACCESS, &[0]),
+                (ACL_DEFAULT, &acl),
+                (b"system.unknown", &[]),
+            ];
+            let mut caps = [0u8; 20];
+            caps[3] = 2; // VFS_CAP_REVISION_2
+            for dir in ["/tmp", "/mnt"] {
+                let file = open(
+                    cx,
+                    addr,
+                    format!("{dir}/file").as_bytes(),
+                    oflags::O_RDWR | oflags::O_CREAT,
+                    0o644,
+                )
+                .unwrap();
+                let directory = open(cx, addr, dir.as_bytes(), oflags::O_DIRECTORY, 0).unwrap();
+                for fd in [file, directory] {
+                    let target = Target::Fd(fd);
+                    let mut attrs = vec![
+                        (b"user.test".as_slice(), b"original".as_slice()),
+                        (b"trusted.test", b"trusted"),
+                        (b"security.test", b"security"),
+                        (ACL_ACCESS, acl.as_slice()),
+                    ];
+                    if fd == file {
+                        attrs.push((crate::cred::XATTR_NAME_CAPS, &caps));
+                    } else {
+                        attrs.push((ACL_DEFAULT, &acl));
+                    }
+                    for &(name, value) in &attrs {
+                        set_test_xattr(cx, addr, fd, name, value).unwrap();
+                    }
+                    fstat(cx, fd, addr).unwrap();
+                    let mode = get::<4>(cx, addr + 16).unwrap();
+                    for flag in [inode_flags::IMMUTABLE, inode_flags::APPEND] {
+                        set_inode_flags(cx, fd, addr, flag).unwrap();
+                        for &(name, value) in attrs.iter().chain(&extra) {
+                            assert_eq!(
+                                set_test_xattr(cx, addr, fd, name, value),
+                                Err(Errno::EPERM)
+                            );
+                            assert_eq!(removexattr(cx, target, addr), Err(Errno::EPERM));
+                        }
+                        let len = listxattr(cx, target, addr, 512).unwrap() as usize;
+                        let mut names = vec![0; len];
+                        cx.mm().read(UserSlice::new(addr, len), &mut names).unwrap();
+                        for &(name, value) in &attrs {
+                            assert!(names.split(|b| *b == 0).any(|n| n == name));
+                            write_cstr(cx, addr, name);
+                            assert_eq!(
+                                getxattr(cx, target, addr, addr + 128, 128),
+                                Ok(value.len() as u64)
+                            );
+                            let mut read = vec![0; value.len()];
+                            cx.mm()
+                                .read(UserSlice::new(addr + 128, read.len()), &mut read)
+                                .unwrap();
+                            assert_eq!(read, value);
+                        }
+                        fstat(cx, fd, addr).unwrap();
+                        assert_eq!(get::<4>(cx, addr + 16).unwrap(), mode);
+                        if dir == "/tmp" && fd == file {
+                            let ro = open(cx, addr, b"/ro/file", oflags::O_RDONLY, 0).unwrap();
+                            assert_eq!(
+                                set_test_xattr(cx, addr, ro, ACL_ACCESS, &[0]),
+                                Err(Errno::EROFS)
+                            );
+                        }
+                    }
+                    set_inode_flags(cx, fd, addr, 0).unwrap();
+                }
+            }
+        });
+    }
+
+    fn mount_test_overlay(vfs: &Vfs) -> (Ino, Ino) {
+        let root = crate::vfs::store::ROOT;
+        let lower = vfs.store().mkdir(root, b"lower", 0o755, 0, 0).unwrap();
+        let upper = vfs.store().mkdir(root, b"upper", 0o755, 0, 0).unwrap();
+        vfs.new_overlay(
+            mountpoint(vfs, b"merged"),
+            0,
+            b"overlay".to_vec(),
+            ((Some(upper), vec![lower]), (0, 0), Vec::new()),
+            overlay::Options::default(),
+        );
+        (lower, upper)
+    }
+
+    #[test]
+    fn protected_overlay_xattrs_check_the_lower_before_copy_up() {
+        use super::super::xattr::{Target, removexattr};
+        use crate::vfs::acl::{ACL_ACCESS, ACL_DEFAULT};
+        with_guest(0, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            let (lower, upper) = mount_test_overlay(&vfs);
+            let store = vfs.store();
+            let (ino, _) = store.create_file(lower, b"file", 0o750, 0, 0).unwrap();
+            let acl = test_access_acl(true);
+            store
+                .set_xattr(ino, b"user.lower", b"value", false, false)
+                .unwrap();
+            store
+                .set_xattr(ino, ACL_ACCESS, &acl, false, false)
+                .unwrap();
+            let fd = open(cx, addr, b"/merged/file", oflags::O_RDONLY, 0).unwrap();
+            for flag in [inode_flags::IMMUTABLE, inode_flags::APPEND] {
+                store.set_flags(ino, flag).unwrap();
+                for name in [b"user.lower".as_slice(), ACL_ACCESS, ACL_DEFAULT] {
+                    assert_eq!(set_test_xattr(cx, addr, fd, name, &acl), Err(Errno::EPERM));
+                    assert_eq!(removexattr(cx, Target::Fd(fd), addr), Err(Errno::EPERM));
+                }
+                assert_eq!(store.lookup(upper, b"file").unwrap(), None);
+            }
+            store.set_flags(ino, 0).unwrap();
+            set_test_xattr(cx, addr, fd, b"user.upper", b"new").unwrap();
+            let copied = store.lookup(upper, b"file").unwrap().unwrap();
+            assert_eq!(store.get_xattr(copied, b"user.lower").unwrap(), b"value");
+            assert_eq!(store.get_xattr(copied, ACL_ACCESS).unwrap(), acl);
+        });
+    }
+
+    fn check_protected_mappings(
+        cx: &mut Cx<'_>,
+        fd: i32,
+        shared_error: Option<Errno>,
+        write_error: Errno,
+    ) {
+        use super::super::mem::{mmap, mprotect, munmap};
+        use crate::mm::flags::{MAP_PRIVATE, MAP_SHARED};
+        use appine_engine::{PAGE_SIZE, prot};
+        let rw = prot::READ | prot::WRITE;
+        for shared in [MAP_SHARED, 3 /* MAP_SHARED_VALIDATE */] {
+            assert_eq!(mmap(cx, 0, PAGE_SIZE, rw, shared, fd, 0), Err(write_error));
+            let read = mmap(cx, 0, PAGE_SIZE, prot::READ, shared, fd, 0);
+            if let Some(error) = shared_error {
+                assert_eq!(read, Err(error));
+            } else {
+                let va = read.unwrap();
+                assert_eq!(mprotect(cx, va, PAGE_SIZE, rw), Err(Errno::EACCES));
+                munmap(cx, va, PAGE_SIZE).unwrap();
+            }
+        }
+        let va = mmap(cx, 0, PAGE_SIZE, rw, MAP_PRIVATE, fd, 0).unwrap();
+        munmap(cx, va, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn protected_inode_flags_control_shared_mappings() {
+        use oflags::*;
+        with_guest(0, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            mount_tmpfs(&vfs, 32);
+            let (lower, upper) = mount_test_overlay(&vfs);
+            let (ino, _) = vfs
+                .store()
+                .create_file(lower, b"file", 0o644, 0, 0)
+                .unwrap();
+            let lower_fd = open(cx, addr, b"/merged/file", O_RDONLY, 0).unwrap();
+            for flag in [inode_flags::IMMUTABLE, inode_flags::APPEND] {
+                vfs.store().set_flags(ino, flag).unwrap();
+                check_protected_mappings(cx, lower_fd, None, Errno::EACCES);
+                assert_eq!(vfs.store().lookup(upper, b"file").unwrap(), None);
+            }
+            vfs.store().set_flags(ino, 0).unwrap();
+            write_cstr(cx, addr, b"mapped");
+            let memfd = memfd_create(cx, addr, 0).unwrap() as i32;
+            let mem_path = format!("/proc/self/fd/{memfd}");
+            for path in ["/tmp/file", "/mnt/file", "/merged/file", &mem_path] {
+                let fd = if path == mem_path {
+                    memfd
+                } else {
+                    open(cx, addr, path.as_bytes(), O_CREAT | O_RDWR, 0o644).unwrap()
+                };
+                ftruncate(cx, fd, appine_engine::PAGE_SIZE as i64).unwrap();
+                set_inode_flags(cx, fd, addr, inode_flags::IMMUTABLE).unwrap();
+                check_protected_mappings(cx, fd, None, Errno::EPERM);
+                set_inode_flags(cx, fd, addr, inode_flags::APPEND).unwrap();
+                let append = open(cx, addr, path.as_bytes(), O_RDWR | O_APPEND, 0).unwrap();
+                for writable in [fd, append] {
+                    check_protected_mappings(cx, writable, Some(Errno::EACCES), Errno::EACCES);
+                }
+                let ro = open(cx, addr, path.as_bytes(), O_RDONLY, 0).unwrap();
+                check_protected_mappings(cx, ro, None, Errno::EACCES);
             }
         });
     }

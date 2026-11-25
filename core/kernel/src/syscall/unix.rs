@@ -62,11 +62,12 @@ pub(super) fn socket(ty: i32, protocol: i32) -> Result<Socket, Errno> {
 pub(super) fn pair(cx: &Cx<'_>, ty: i32, protocol: i32) -> Result<(Socket, Socket), Errno> {
     let (mut a, mut b) = UnixSocket::pair(socket_type(ty, protocol)?, cx.ucred());
     let qlen = max_dgram_qlen(cx);
-    a.set_max_qlen(qlen);
-    b.set_max_qlen(qlen);
-    let uid = cx.cred().fsuid;
-    a.uid = uid;
-    b.uid = uid;
+    let cred = cx.cred();
+    for s in [&mut a, &mut b] {
+        s.set_max_qlen(qlen);
+        s.uid = cred.fsuid;
+        s.gid = cred.fsgid;
+    }
     let net = cx.task.ns.borrow().net.clone();
     if net.host_net.is_some() {
         a.net = Some(net.clone());
@@ -240,10 +241,11 @@ pub(super) fn accept(
         })?;
         if let Some(new) = new {
             let passcred = with(sock, |u| u.receive_queue().borrow().passcred);
-            let uid = cx.cred().fsuid;
+            let cred = cx.cred();
             with(&new, |u| {
                 u.embryo = false;
-                u.uid = uid;
+                u.uid = cred.fsuid;
+                u.gid = cred.fsgid;
                 u.receive_queue().borrow_mut().passcred = passcred;
             });
             cx.k().unix.remove_embryo(&new);

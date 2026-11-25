@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: match Linux 6.1 synthetic-node `getxattr` (`EOPNOTSUPP` on procfs/devpts/nsfs/mqueue after `xattr_permission`, `ENODATA` on kernfs sysfs/cgroup2, `EOPNOTSUPP` for `system.*`))
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: reject xattr and POSIX ACL mutations on `FS_IMMUTABLE_FL`/`FS_APPEND_FL` inodes with `EPERM`, including lower-only overlays before copy-up)
 
 ## Responsibilities
 
@@ -41,14 +41,19 @@ checks and `FileCaps` (`kernel/cred`); path resolution (`kernel/vfs`); fd lookup
 ### Extended attributes
 
 - Names need a `security.`, `system.`, `trusted.` or `user.` prefix (`EOPNOTSUPP`); bad name
-  lengths `ERANGE`; values over 64 KiB `E2BIG`. Unprivileged `trusted.*` reads `ENODATA`, writes
+  lengths `ERANGE`; values over 64 KiB `E2BIG`. After the read-only mount check (`EROFS`), writes
+  and removals reject inodes with `FS_IMMUTABLE_FL` or `FS_APPEND_FL` (`EPERM`, matching Linux
+  6.1's `xattr_permission` — including lower-only overlay inodes before copy-up), while reads and
+  listings remain allowed and internal store xattr operations for copy-up/ACL inheritance are
+  unaffected. Unprivileged `trusted.*` reads `ENODATA`, writes
   `EPERM` and is hidden from listings. `user.*` is for regular files and directories only
   (elsewhere reads `ENODATA`, writes `EPERM`), needs read or write permission, and on a sticky
   directory only its owner may write it (`xattr_permission`); writing `security.*` other than the
   capability needs `CAP_SYS_ADMIN`.
 - `system.*` holds only `system.posix_acl_access` and `system.posix_acl_default` (any other
   `EOPNOTSUPP`). Setting or removing follows `posix_acl_xattr_set` and `set_posix_acl`: `EROFS`,
-  then a malformed value `EINVAL` (short header, a length not header plus 8-byte entries, an
+  then `EPERM` on `FS_IMMUTABLE_FL`/`FS_APPEND_FL` store or overlay inodes (before copy-up or mode
+  changes), then a malformed value `EINVAL` (short header, a length not header plus 8-byte entries, an
   unknown tag, a named user or group unmapped in the caller's namespace) or `EOPNOTSUPP` (version
   other than 2), a symlink `EOPNOTSUPP`, a default ACL on a non-directory `EACCES` (removing it
   succeeds), not owner nor `CAP_FOWNER` `EPERM`, an ACL out of `posix_acl_valid`'s order or with

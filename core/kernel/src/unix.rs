@@ -176,6 +176,8 @@ pub(crate) struct UnixSocket {
     pub outq: Rc<SenderState>,
     /// Creator's filesystem UID (`sock_i_uid`).
     pub uid: u32,
+    /// Socket inode group, initialized from the creator's filesystem GID.
+    pub gid: u32,
 }
 
 impl UnixSocket {
@@ -205,6 +207,7 @@ impl UnixSocket {
             opts: crate::net::SockOpts::default(),
             outq,
             uid: 0,
+            gid: 0,
         }
     }
 
