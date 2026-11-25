@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: align `fallocate` socket `ENODEV` and check order, `pread`/`pwrite` offset-before-fd order, and `sync_file_range` on loop devices and `O_PATH`)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: logical memfd lengths, sparse reads and copies, read range checks and final-reference cleanup)
 
 ## Responsibilities
 
@@ -70,6 +70,11 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   for regular files, synthetic files other than `/proc/kmsg`, `/dev/zero`, `/dev/full`, random
   and loop devices; pipes, terminals, host fds and FUSE files return after one piece. write and
   pwrite check mode first, then copy and write a piece at a time, stopping at a short write.
+- A regular-file read checks the signed offset plus the full scalar count (before `MAX_RW_COUNT`)
+  or imported iovec total before copying any bytes. Overflow gives `EINVAL`, including at EOF.
+  A memfd with a logical length reads its host prefix followed by zeros through logical EOF.
+  Stat, `FIONREAD`, seals and `SEEK_END` use the greater of host and logical size. Beyond host
+  EOF, `SEEK_HOLE` returns the requested offset within the file and `SEEK_DATA` gives `ENXIO`.
 - `/dev/zero`, `/dev/full` and the random devices fill the whole buffer per read; randomness comes
   from the host's `getrandom(2)` with no flags; writes to the random devices are discarded, to
   `/dev/full` `ENOSPC`.
@@ -88,7 +93,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   truncation call `remove_privs` (`CAP_FSETID` checked via `capable_wrt`), which clears setgid with group exec or
   when the caller is not in the file's group and lacks `CAP_FSETID` (Linux 6.2+, aligned with
   chown).
-- `O_APPEND` writes run under the BKL at the current host length; `pwrite` on an `O_APPEND` file
+- `O_APPEND` writes run under the BKL at the effective file length; `pwrite` on an `O_APPEND` file
   appends too unless `RWF_NOAPPEND` (6.9's flag, honoured only with an explicit offset; FUSE files
   ignore it). `preadv2`/`pwritev2` support `RWF_HIPRI`, `RWF_DSYNC`, `RWF_SYNC`, `RWF_NOWAIT`,
   `RWF_APPEND` and `RWF_NOAPPEND` (per-request via `IoFlags`, without mutating the open file's
@@ -141,7 +146,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   host's sendfile without the BKL (`copy_regular`, capped at `MAX_RW_COUNT`), falling back to
   chunked copies for an `O_APPEND` output, the same inode, a file without a host handle (devices;
   FUSE files, which copy_file_range takes as regular and copies block by block, as 6.1 falls back
-  without `FUSE_COPY_FILE_RANGE`), a sealed or tmpfs output, or host
+  without `FUSE_COPY_FILE_RANGE`), a memfd input with a logical length, a sealed or tmpfs output, or host
   `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV`. The fallbacks move the input position back over what was
   not written, never further than the read moved it (devices keep their positions), and an error
   after some bytes were copied returns those bytes. A pipe destination for sendfile uses the same
@@ -172,6 +177,10 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   host handle when the store has no object (a memfd's), a memfd never read-only; ftruncate breaks
   leases for a writable regular file, then `prepare_write`, then `EINVAL` unless writable and
   regular (`EBADF` on `O_PATH`), `RLIMIT_FSIZE` and seals, with no `ETXTBSY` check.
+- If host truncation returns `EFBIG` for a memfd, the VFS records the requested length through
+  `i64::MAX` and requests a host timestamp update. An ordinary successful truncation clears
+  the override. The unlinked-inode sweep releases it after the last open description, mapping or
+  executable reference goes away. Hole punches in the logical tail need no data allocation.
 - Cache hints and syncing: fadvise64 rejects `O_PATH` fds with `EBADF` (via `io_file`) before
   returning `ESPIPE` on pipes and sockets and `EINVAL` for a negative length or unknown advice,
   else a no-op; sync_file_range rejects `O_PATH` fds with `EBADF` before validating flags/range,
@@ -277,10 +286,8 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 
 ## Confirmed bugs / technical debt
 
-- **Fidelity gaps**, one per line:
-  - a memfd uses an unlinked store object. Extending it to `INT64_MAX` with `ftruncate`
-    returns `EFBIG` on the development store, while native Linux accepts that length
-    (gVisor's `Pread64Test.Overflow`).
+- Memfd writes and file-backed mappings still require host-representable backing at the target
+  offset. The logical-size fallback supplies sparse data to descriptor reads and copies.
 - **Clone fidelity:** FICLONE and FICLONERANGE work on a store that reports ext4's magic (ext4
   says `EOPNOTSUPP`); partial ranges are copied, not shared; `FIDEDUPERANGE` is `EOPNOTSUPP`.
 

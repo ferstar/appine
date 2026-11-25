@@ -536,6 +536,8 @@ pub(crate) mod resolve {
 /// A virtual filesystem instance.
 pub struct Vfs {
     store: Store,
+    /// Sparse lengths that the store filesystem could not represent for a memfd.
+    memfd_sizes: RefCell<HashMap<Ino, u64>>,
     tmpfs_file_ranges: RefCell<HashMap<Ino, TmpfsFileRanges>>,
     /// The mount table: the boot ones and those mount(2) mounted later, in mount order.
     mounts: RefCell<Mounts>,
@@ -1557,6 +1559,7 @@ impl Vfs {
             )])),
             expiring: std::cell::Cell::new(0),
             removed_dirs: RefCell::default(),
+            memfd_sizes: RefCell::default(),
             tmpfs_file_ranges: RefCell::default(),
         })
     }
@@ -3148,6 +3151,27 @@ impl Vfs {
                 },
             );
         }
+    }
+
+    pub(crate) fn memfd_size(&self, ino: Ino) -> Option<u64> {
+        self.memfd_sizes.borrow().get(&ino).copied()
+    }
+
+    pub(crate) fn set_memfd_size(&self, ino: Ino, len: u64) {
+        self.memfd_sizes.borrow_mut().insert(ino, len);
+    }
+
+    pub(crate) fn clear_memfd_size(&self, ino: Ino) {
+        self.memfd_sizes.borrow_mut().remove(&ino);
+    }
+
+    pub(crate) fn closed_memfd_sizes(&self, closed: impl Fn(&Ino) -> bool) -> Vec<Ino> {
+        self.memfd_sizes
+            .borrow()
+            .keys()
+            .copied()
+            .filter(closed)
+            .collect()
     }
 
     /// SEEK_DATA and SEEK_HOLE see the union of host data and pages instantiated by a
@@ -4804,6 +4828,21 @@ fn ensure_resolv_conf(store: &Store) -> Result<(), Errno> {
     )
 }
 
+fn validate_host_path(path: &[u8]) -> Result<(), Errno> {
+    if !path.starts_with(b"/") || path.contains(&0) {
+        return Err(Errno::EINVAL);
+    }
+    for name in path.split(|&b| b == b'/') {
+        if name == b".." {
+            return Err(Errno::EINVAL);
+        }
+        if name.len() > NAME_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+    }
+    Ok(())
+}
+
 /// Writes a regular file in the store (for the host to prepare configuration files): missing
 /// parent directories are created too (0755, owned by root), and symlinks in the path are not
 /// followed. When the file already exists, it is left alone if `overwrite` is false, otherwise its
@@ -4830,6 +4869,7 @@ pub fn write_file_owned(
     gid: u32,
 ) -> Result<(), Errno> {
     use std::io::Write;
+    validate_host_path(path)?;
     let comps: Vec<Vec<u8>> = split(path).collect();
     let (name, dirs) = comps.split_last().ok_or(Errno::EINVAL)?;
     let mut dir = ROOT;
@@ -4858,6 +4898,15 @@ pub fn write_file_owned(
 /// [`write_file`]); a missing file is `ENOENT`, and one that is not a regular file `EINVAL`.
 pub fn read_file(store: &Store, path: &[u8]) -> Result<Vec<u8>, Errno> {
     use std::io::Read;
+    let mut data = Vec::new();
+    open_config_file(store, path)?
+        .read_to_end(&mut data)
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    Ok(data)
+}
+
+fn open_config_file(store: &Store, path: &[u8]) -> Result<std::fs::File, Errno> {
+    validate_host_path(path)?;
     let mut ino = ROOT;
     for c in split(path) {
         if store.kind(ino)? != mode::S_IFDIR {
@@ -4868,12 +4917,7 @@ pub fn read_file(store: &Store, path: &[u8]) -> Result<Vec<u8>, Errno> {
     if store.kind(ino)? != mode::S_IFREG {
         return Err(Errno::EINVAL);
     }
-    let mut data = Vec::new();
-    store
-        .open_object(ino, false)?
-        .read_to_end(&mut data)
-        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
-    Ok(data)
+    store.open_object(ino, false)
 }
 
 enum Step {
@@ -5427,6 +5471,32 @@ mod tests {
         s.symlink(ROOT, b"slash", b"bin/busybox/", 0, 0).unwrap();
         drop(s);
         (Vfs::open(&dir).unwrap(), dir)
+    }
+
+    #[test]
+    fn host_configuration_paths_are_validated_before_creation() {
+        let (vfs, dir) = sample("config-paths");
+        let store = vfs.store();
+        let write = |path: &[u8]| write_file_owned(store, path, b"dns", 0o644, true, 123, 456);
+        for path in [
+            b"etc/resolv.conf".as_slice(),
+            b"/new/name\0",
+            b"/new/../name",
+        ] {
+            assert_eq!(write(path), Err(Errno::EINVAL));
+            assert_eq!(read_file(store, path), Err(Errno::EINVAL));
+        }
+        let mut path = b"/new/".to_vec();
+        path.extend([b'x'; NAME_MAX + 1]);
+        assert_eq!(write(&path), Err(Errno::ENAMETOOLONG));
+        assert_eq!(read_file(store, &path), Err(Errno::ENAMETOOLONG));
+        assert_eq!(store.lookup(ROOT, b"new"), Ok(None));
+        path.pop();
+        write(&path).unwrap();
+        write(b"/etc/resolv.conf").unwrap();
+        assert_eq!(read_file(store, b"/etc/resolv.conf").unwrap(), b"dns");
+        drop(vfs);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

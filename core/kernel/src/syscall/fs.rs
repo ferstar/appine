@@ -2277,7 +2277,7 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
             SEEK_SET => 0,
             SEEK_CUR => f.pos,
             SEEK_END => match &f.kind {
-                FileKind::Regular { file, .. } => file.metadata().map_err(host_errno)?.len(),
+                FileKind::Regular { ino, file, .. } => regular_size(&*cx.vfs()?, *ino, file)?,
                 _ => 0,
             },
             _ => return Err(Errno::EINVAL),
@@ -2829,6 +2829,7 @@ enum IoPath {
 }
 
 const SPLICE_F_NONBLOCK: u32 = 2;
+const RWF_NOAPPEND: u32 = 0x20;
 
 pub(super) fn read(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize) -> SysResult {
     let file = cx.fds().get(fd)?;
@@ -2887,7 +2888,6 @@ pub(super) fn pvectored(
     // flags are EOPNOTSUPP.
     const RWF_NOWAIT: u32 = 0x8;
     const RWF_APPEND: u32 = 0x10;
-    const RWF_NOAPPEND: u32 = 0x20;
     const RWF_SUPPORTED: u32 = 0x7 | RWF_NOWAIT | RWF_APPEND | RWF_NOAPPEND;
     let mut offset = match flags {
         Some(f) if f & !RWF_SUPPORTED != 0 => return Err(Errno::EOPNOTSUPP),
@@ -2911,11 +2911,8 @@ fn checked_offset(offset: i64) -> Result<Option<u64>, Errno> {
     u64::try_from(offset).map(Some).map_err(|_| Errno::EINVAL)
 }
 
-/// A write with an offset on an `O_APPEND` regular file (or with per-request `append`, e.g.
-/// `RWF_APPEND`) still writes at the end, leaving the file position unchanged (Linux's
-/// generic_write_checks, the BUGS section of pwrite(2)); only pwritev2's `RWF_NOAPPEND` writes at
-/// the given offset. Such writes are done with the BKL held ([`write_bytes_with`]), so they never
-/// write at the same place as other appends.
+/// Positioned appends to host stdio use its host length. Store objects select their
+/// logical EOF inside the shared scalar and vectored write paths.
 pub(super) fn append_offset(
     file: &FileRef,
     offset: Option<u64>,
@@ -2923,11 +2920,6 @@ pub(super) fn append_offset(
 ) -> Result<Option<u64>, Errno> {
     let f = file.borrow();
     match &f.kind {
-        FileKind::Regular { file, .. }
-            if offset.is_some() && (append || f.flags & oflags::O_APPEND != 0) =>
-        {
-            Ok(Some(file.metadata().map_err(host_errno)?.len()))
-        }
         FileKind::Host(fd)
             if offset.is_some()
                 && host_regular(*fd)
@@ -2937,6 +2929,21 @@ pub(super) fn append_offset(
         }
         _ => Ok(offset),
     }
+}
+
+fn regular_append_offset(
+    cx: &Cx<'_>,
+    file: &OpenFile,
+    offset: Option<u64>,
+    append: bool,
+) -> Result<Option<u64>, Errno> {
+    if offset.is_some()
+        && (append || file.flags & oflags::O_APPEND != 0)
+        && let FileKind::Regular { ino, file, .. } = &file.kind
+    {
+        return Ok(Some(regular_size(&*cx.vfs()?, *ino, file)?));
+    }
+    Ok(offset)
 }
 
 /// splice: moves data between a pipe and another file (or two pipes). Copies through a host
@@ -3507,6 +3514,11 @@ fn vectored_inner(
     rwf: u32,
 ) -> SysResult {
     let file = cx.fds().get(fd)?;
+    let offset = if write && (io.append || rwf & RWF_NOAPPEND == 0) {
+        regular_append_offset(cx, &file.borrow(), offset, io.append)?
+    } else {
+        offset
+    };
     // /dev/kmsg's write_iter: the whole writev is one record (systemd logs this way)
     if write && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
         let vecs = iovecs(cx, iov, count)?;
@@ -3552,6 +3564,9 @@ fn vectored_inner(
     // thread's I/O or lseek cannot interleave between iovecs
     let _pos = PosGuard::lock_positioned(cx, &file, offset.is_none(), io.nowait)?;
     let pos_held = _pos.is_some();
+    if !write {
+        verify_read_range(&file.borrow(), offset, vecs.iter().map(|v| v.1).sum())?;
+    }
     // A writev checks RLIMIT_FSIZE once for all its iovecs (generic_write_checks), so one that
     // ends at the limit only shortens it
     let room = match write {
@@ -3882,6 +3897,7 @@ pub(super) fn sendfile(
         0 => None,
         addr => Some(u64::try_from(i64::from_le_bytes(get(cx, addr)?)).map_err(|_| Errno::EINVAL)?),
     };
+    verify_read_range(&input.borrow(), off, count)?;
     let count = count.min(MAX_COPY);
     if let Some((pipe, _)) = pipe_of(&output) {
         if count == 0 {
@@ -4143,9 +4159,7 @@ fn whole_copy(
     let vfs = cx.vfs()?;
     let size = |f: &FileRef| -> Result<Option<u64>, Errno> {
         match &f.borrow().kind {
-            FileKind::Regular { ino, file, .. } => {
-                Ok(Some(vfs.store().stat_open(*ino, file)?.size))
-            }
+            FileKind::Regular { ino, file, .. } => Ok(Some(regular_size(&vfs, *ino, file)?)),
             _ => Ok(None),
         }
     };
@@ -4267,14 +4281,14 @@ fn copy_range_checks(
         return Err(Errno::EOVERFLOW);
     }
     let size_in = match &i.kind {
-        FileKind::Regular { ino, file, .. } => vfs.store().stat_open(*ino, file)?.size as i64,
+        FileKind::Regular { ino, file, .. } => regular_size(&vfs, *ino, file)? as i64,
         FileKind::Fuse(h) => crate::vfs::fuse::cached_attr_fh(&vfs, h.id, h.fh())?.size as i64,
         _ => return Err(Errno::EINVAL),
     };
     count = if pos_in >= size_in {
         0
     } else {
-        count.min((size_in - pos_in) as u64)
+        count.min(size_in.saturating_sub(pos_in) as u64)
     };
     // generic_write_check_limits
     let limit = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0;
@@ -4366,6 +4380,16 @@ fn copy_regular(
             return Some(Err(e));
         }
     }
+    if let Some(ino) = input.borrow().data_ino()
+        && cx
+            .t
+            .vfs
+            .as_ref()
+            .and_then(|vfs| vfs.memfd_size(ino))
+            .is_some()
+    {
+        return None;
+    }
     let from = src.unwrap_or_else(|| input.borrow().pos);
     let to = dst.unwrap_or_else(|| output.borrow().pos);
     if src.is_none() {
@@ -4404,6 +4428,19 @@ fn copy_regular(
     }
 }
 
+// Linux rw_verify_area checks the whole read before clipping to MAX_RW_COUNT or EOF.
+fn verify_read_range(file: &OpenFile, offset: Option<u64>, count: usize) -> Result<(), Errno> {
+    if matches!(file.kind, FileKind::Regular { .. }) {
+        if !file.readable() {
+            return Err(Errno::EBADF);
+        }
+        if offset.unwrap_or(file.pos).saturating_add(count as u64) > i64::MAX as u64 {
+            return Err(Errno::EINVAL);
+        }
+    }
+    Ok(())
+}
+
 /// Reads from an open file into a guest buffer (read, pread, readv).
 pub(super) fn read_file(
     cx: &mut Cx<'_>,
@@ -4437,6 +4474,7 @@ fn read_file_inner(
     pos_held: bool,
     mut touch_atime: bool,
 ) -> SysResult {
+    let requested = len;
     let len = len.min(MAX_COPY);
     // A socket receives one message of up to the whole length (super::net::rw). The borrow must
     // end before: receiving may wait with the BKL released
@@ -4463,6 +4501,7 @@ fn read_file_inner(
     }
     let _pos = PosGuard::lock_positioned(cx, file, !pos_held && offset.is_none(), io.nowait)?;
     let held = pos_held || _pos.is_some();
+    verify_read_range(&file.borrow(), offset, requested)?;
     // Each read of a terminal or pipe returns only data already ready and must not block again
     // to fill the buffer; /dev/zero and /dev/urandom fill it in one read as on Linux
     // (`dd bs=256M` reads whole blocks)
@@ -4570,6 +4609,7 @@ pub(super) fn write_file_with(
     offset: Option<u64>,
     io: IoFlags,
 ) -> SysResult {
+    let offset = regular_append_offset(cx, &file.borrow(), offset, io.append)?;
     write_file_inner(cx, file, buf, len, offset, io, false, false)
 }
 
@@ -4797,9 +4837,15 @@ fn read_bytes_inner(
             let regular = regular_fd(&file.borrow());
             let n = match regular {
                 Some(fd) => {
-                    let n = unlocked_io(cx, file, fd, (offset, pos_held), |fd, pos| {
-                        appine_hal::pread(fd, buf, pos)
-                    })?;
+                    let logical = file
+                        .borrow()
+                        .data_ino()
+                        .and_then(|ino| cx.t.vfs.as_ref()?.memfd_size(ino));
+                    let n =
+                        unlocked_io(cx, file, fd, (offset, pos_held), |fd, pos| match logical {
+                            Some(len) => read_sparse_memfd(fd, buf, pos, len),
+                            None => appine_hal::pread(fd, buf, pos),
+                        })?;
                     if touch_atime {
                         file_accessed(cx, &file.borrow());
                     }
@@ -5269,7 +5315,7 @@ fn write_local(
         Some(fd) => unlocked_io(cx, file, fd, (offset, held), |fd, pos| {
             appine_hal::pwrite(fd, data, pos)
         })?,
-        None => local_write(&mut file.borrow_mut(), data, offset, append)?,
+        None => local_write(cx, &mut file.borrow_mut(), data, offset, append)?,
     };
     if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind) {
         tmpfs_resized(&*cx.vfs()?, Some(t), host);
@@ -5571,7 +5617,7 @@ fn fsize_allowed(
     len: usize,
     append: bool,
 ) -> Result<usize, Errno> {
-    let FileKind::Regular { file, .. } = &f.kind else {
+    let FileKind::Regular { file, ino, .. } = &f.kind else {
         return Ok(len);
     };
     let limit = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0;
@@ -5580,9 +5626,7 @@ fn fsize_allowed(
     }
     let pos = match offset {
         Some(off) => off,
-        None if append || f.flags & oflags::O_APPEND != 0 => {
-            file.metadata().map_err(host_errno)?.len()
-        }
+        None if append || f.flags & oflags::O_APPEND != 0 => regular_size(&*cx.vfs()?, *ino, file)?,
         None => f.pos,
     };
     if pos >= limit {
@@ -5592,17 +5636,18 @@ fn fsize_allowed(
 }
 
 fn local_write(
+    cx: &Cx<'_>,
     f: &mut OpenFile,
     data: &[u8],
     offset: Option<u64>,
     append: bool,
 ) -> Result<usize, Errno> {
     match &f.kind {
-        FileKind::Regular { file, .. } => {
+        FileKind::Regular { file, ino, .. } => {
             let pos = match offset {
                 Some(off) => off,
                 None if append || f.flags & oflags::O_APPEND != 0 => {
-                    file.metadata().map_err(host_errno)?.len()
+                    regular_size(&*cx.vfs()?, *ino, file)?
                 }
                 None => f.pos,
             };
@@ -6017,6 +6062,31 @@ fn opens_of(k: &crate::kernel::Kernel, ino: Ino) -> Vec<FileRef> {
     out
 }
 
+/// The host stores the prefix. Bytes between host EOF and logical EOF are holes.
+fn read_sparse_memfd(fd: i32, buf: &mut [u8], pos: u64, logical: u64) -> Result<usize, i32> {
+    let physical = appine_hal::fstat(fd)?.st_size as u64;
+    let want = buf
+        .len()
+        .min(physical.max(logical).saturating_sub(pos) as usize);
+    let prefix = want.min(physical.saturating_sub(pos) as usize);
+    if prefix != 0 {
+        let n = appine_hal::pread(fd, &mut buf[..prefix], pos)?;
+        if n < prefix {
+            return Ok(n);
+        }
+    }
+    buf[prefix..want].fill(0);
+    Ok(want)
+}
+
+fn regular_size(vfs: &Vfs, ino: Ino, host: &std::fs::File) -> Result<u64, Errno> {
+    Ok(host
+        .metadata()
+        .map_err(host_errno)?
+        .len()
+        .max(vfs.memfd_size(ino).unwrap_or(0)))
+}
+
 fn regular_fd(f: &OpenFile) -> Option<i32> {
     match &f.kind {
         FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
@@ -6400,7 +6470,9 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
             return Ok(new as u64);
         }
         FileKind::Regular { ino, file, .. } => {
-            let size = file.metadata().map_err(host_errno)?.len() as i64;
+            let host_size = file.metadata().map_err(host_errno)?.len() as i64;
+            let vfs = cx.vfs()?;
+            let size = host_size.max(vfs.memfd_size(*ino).unwrap_or(0) as i64);
             match whence {
                 SEEK_SET => 0,
                 SEEK_CUR => *pos as i64,
@@ -6408,13 +6480,18 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
                 SEEK_DATA | SEEK_HOLE if offset < 0 || offset >= size => {
                     return Err(Errno::ENXIO);
                 }
+                SEEK_DATA if offset >= host_size => return Err(Errno::ENXIO),
+                SEEK_HOLE if offset >= host_size => {
+                    *pos = offset as u64;
+                    return Ok(*pos);
+                }
                 SEEK_DATA | SEEK_HOLE => {
                     let fd = std::os::fd::AsRawFd::as_raw_fd(file);
-                    *pos = cx.vfs()?.seek_data_or_hole(
+                    *pos = vfs.seek_data_or_hole(
                         *ino,
                         fd,
                         offset as u64,
-                        size as u64,
+                        host_size as u64,
                         whence as i32,
                     )?;
                     return Ok(*pos);
@@ -7108,6 +7185,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<([u8; 128], MountId), Errno> {
     let stat = match node {
         Node::Store(_, ino) => {
             let mut st = vfs.store().stat(*ino)?;
+            st.size = st.size.max(vfs.memfd_size(*ino).unwrap_or(0));
             vfs.tmpfs_stat_blocks(*ino, None, &mut st)?;
             encode_stat(&st, vfs.dev_of(node))
         }
@@ -7131,6 +7209,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<([u8; 128], MountId), Errno> {
             let exe = exe_file(cx, *proc)?;
             let (node, ino, host) = exe.backing(&vfs)?;
             let mut st = vfs.store().stat_open(ino, host)?;
+            st.size = st.size.max(vfs.memfd_size(ino).unwrap_or(0));
             vfs.tmpfs_stat_blocks(ino, Some(host), &mut st)?;
             if let Node::Overlay(_, o) = node {
                 st.ino = vfs.overlay().shown_ino(o);
@@ -7161,6 +7240,7 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
         let vfs = cx.vfs()?;
         let dev = vfs.dev_of(&Node::Store(f.mnt, ino));
         let mut st = vfs.store().stat_open(ino, file)?;
+        st.size = st.size.max(vfs.memfd_size(ino).unwrap_or(0));
         vfs.tmpfs_stat_blocks(ino, Some(file), &mut st)?;
         // Through an overlay: the inode number stat shows for its node
         if let Some(o) = f.ovl {
@@ -9358,7 +9438,18 @@ fn truncate_regular(
     tmpfs: Option<TmpfsFile>,
 ) -> Result<(), Errno> {
     truncating(cx, host, len);
-    host.set_len(len).map_err(host_errno)?;
+    match host.set_len(len).map_err(host_errno) {
+        Ok(()) => vfs.clear_memfd_size(ino),
+        Err(Errno::EFBIG) if len <= i64::MAX as u64 && cx.kr().seals.contains_key(&ino) => {
+            vfs.set_memfd_size(ino, len);
+            let _ = appine_hal::set_times_fd(
+                std::os::fd::AsRawFd::as_raw_fd(host),
+                None,
+                Some(appine_hal::TIME_NOW),
+            );
+        }
+        Err(e) => return Err(e),
+    }
     vfs.store().object_modified(ino);
     if let Some(t) = tmpfs
         && len <= t.size
@@ -9432,8 +9523,10 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         unreachable!("checked Regular above");
     };
     let ino = *ino;
-    let size = host.metadata().map_err(host_errno)?.len();
+    let host_size = host.metadata().map_err(host_errno)?.len();
     let vfs = cx.vfs()?;
+    let logical = vfs.memfd_size(ino);
+    let size = host_size.max(logical.unwrap_or(0));
     let tmpfs = open_tmpfs_size(&vfs, &f, ino, host)?;
     // Store files stand in for ext4's, which can also zero a range; tmpfs only reserves and
     // punches (shmem_fallocate)
@@ -9471,7 +9564,15 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         punch_tmpfs_maps(cx, ino, offset, end);
     }
     let fd = std::os::fd::AsRawFd::as_raw_fd(host);
-    let result = if tmpfs.is_some() && !zero {
+    // Only the part of a punched range before host EOF can contain backing pages.
+    let len = if mode & FALLOC_FL_PUNCH_HOLE != 0 && logical.is_some() {
+        len.min(host_size.saturating_sub(offset))
+    } else {
+        len
+    };
+    let result = if len == 0 {
+        appine_hal::set_times_fd(fd, None, Some(appine_hal::TIME_NOW))
+    } else if tmpfs.is_some() && !zero {
         // Reserve guest quota while leaving host holes sparse. On ext4, readahead into an
         // unwritten extent can make SEEK_DATA and overlay copy-up see an untouched page.
         if !keep && end > size {
@@ -9487,8 +9588,8 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
             if zero {
                 let zeros = vec![0u8; IO_CHUNK];
                 let mut pos = offset;
-                while pos < end.min(size) {
-                    let n = (end.min(size) - pos).min(IO_CHUNK as u64) as usize;
+                while pos < end.min(host_size) {
+                    let n = (end.min(host_size) - pos).min(IO_CHUNK as u64) as usize;
                     host.write_all_at(&zeros[..n], pos).map_err(host_errno)?;
                     pos += n as u64;
                 }
@@ -10444,12 +10545,24 @@ pub(crate) fn evict_unlinked_tmpfs(k: &crate::kernel::Kernel, vfs: &Vfs) {
     let store = vfs.store();
     let has_shared = store.has_pending_release();
     let has_tmpfiles = store.has_linkable_tmpfiles();
-    if !has_tmpfs && !has_shared && !has_tmpfiles {
+    // An open record also pins descriptions held by a syscall after a concurrent close.
+    // Scan mappings and executables only after the last such description is gone.
+    let closed_memfds = vfs.closed_memfd_sizes(|ino| {
+        k.inotify
+            .try_borrow()
+            .is_ok_and(|registry| !registry.has_open(*ino))
+    });
+    if !has_tmpfs && !has_shared && !has_tmpfiles && closed_memfds.is_empty() {
         return;
     }
     let Some(live) = live_store_inodes(k, vfs) else {
         return;
     };
+    for ino in closed_memfds {
+        if !live.contains(&ino) {
+            vfs.clear_memfd_size(ino);
+        }
+    }
     if has_tmpfs {
         vfs.evict_tmpfs(&live);
     }
@@ -10552,7 +10665,7 @@ fn seals_permit(
     if write && seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
         return Err(Errno::EPERM);
     }
-    let size = host.metadata().map_err(host_errno)?.len();
+    let size = regular_size(&*cx.vfs()?, ino, host)?;
     let new = grow_to(size);
     if (new > size && seals & F_SEAL_GROW != 0) || (new < size && seals & F_SEAL_SHRINK != 0) {
         return Err(Errno::EPERM);
@@ -10766,6 +10879,167 @@ mod tests {
         drop(cpu);
         drop(shared);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn memfd_max_length_reads_seeks_and_shrinks() {
+        with_guest(0, |cx, addr, _| {
+            write_cstr(cx, addr, b"sparse");
+            let fd = memfd_create(cx, addr, 2).unwrap() as i32;
+            assert_eq!(write(cx, fd, addr, 6), Ok(6));
+            let file = cx.fds().get(fd).unwrap();
+            {
+                let f = file.borrow();
+                let (ino, host, _) = f.regular_backing().unwrap();
+                cx.vfs()
+                    .unwrap()
+                    .store()
+                    .set_times_open(ino, host, None, Some(FileTime::At(0)))
+                    .unwrap();
+            }
+            let max = i64::MAX;
+            assert_eq!(ftruncate(cx, fd, max), Ok(0));
+            fstat(cx, fd, addr + 128).unwrap();
+            assert_eq!(i64::from_le_bytes(get(cx, addr + 128 + 48).unwrap()), max);
+            assert!(i64::from_le_bytes(get(cx, addr + 128 + 88).unwrap()) > 0);
+            let ino = file.borrow().data_ino().unwrap();
+            assert_eq!(pread(cx, fd, addr, 16, max - 8), Err(Errno::EINVAL));
+            assert_eq!(pread(cx, fd, addr, 10, max), Err(Errno::EINVAL));
+            assert_eq!(pread(cx, fd, addr, 1, max), Err(Errno::EINVAL));
+            assert_eq!(pread(cx, fd, addr, 1, -1), Err(Errno::EINVAL));
+            assert_eq!(pread(cx, fd, addr, 4, max - 4), Ok(4));
+            assert_eq!(get::<4>(cx, addr).unwrap(), [0; 4]);
+            assert_eq!(pread(cx, fd, addr, 8, 2), Ok(8));
+            assert_eq!(&get::<8>(cx, addr).unwrap(), b"arse\0\0\0\0");
+            assert_eq!(lseek(cx, fd, 0, SEEK_END), Ok(max as u64));
+            assert_eq!(lseek(cx, fd, max, SEEK_HOLE), Err(Errno::ENXIO));
+            assert_eq!(lseek(cx, fd, max - 1, SEEK_DATA), Err(Errno::ENXIO));
+            assert_eq!(lseek(cx, fd, max - 1, SEEK_HOLE), Ok(max as u64 - 1));
+            assert_eq!(read(cx, fd, addr, 1), Ok(1));
+            assert_eq!(file.borrow().pos, max as u64);
+            let link = format!("/proc/self/fd/{fd}");
+            write_cstr(cx, addr, link.as_bytes());
+            newfstatat(cx, AT_FDCWD, addr, addr + 128, 0).unwrap();
+            assert_eq!(i64::from_le_bytes(get(cx, addr + 128 + 48).unwrap()), max);
+            assert_eq!(truncate(cx, addr, max - 4096), Ok(0));
+            assert_eq!(lseek(cx, fd, 0, SEEK_END), Ok(max as u64 - 4096));
+            assert_eq!(read(cx, fd, addr, 1), Ok(0));
+            assert_eq!(ftruncate(cx, fd, 4096), Ok(0));
+            assert_eq!(lseek(cx, fd, 0, SEEK_END), Ok(4096));
+            assert_eq!(cx.vfs().unwrap().memfd_size(ino), None);
+            assert_eq!(ftruncate(cx, fd, max), Ok(0));
+            assert_eq!(fcntl(cx, fd, F_ADD_SEALS, F_SEAL_SHRINK.into()), Ok(0));
+            assert_eq!(ftruncate(cx, fd, 4096), Err(Errno::EPERM));
+        });
+    }
+
+    #[test]
+    fn sparse_memfd_vectored_io_copies_and_seals() {
+        with_guest(0, |cx, addr, _| {
+            let dst = open(
+                cx,
+                addr,
+                b"/tmp/copy",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o600,
+            )
+            .unwrap();
+            write_cstr(cx, addr, b"data");
+            let fd = memfd_create(cx, addr, 2).unwrap() as i32;
+            assert_eq!(write(cx, fd, addr, 4), Ok(4));
+            let end = i64::MAX - 4096;
+            assert_eq!(ftruncate(cx, fd, end), Ok(0));
+            assert_eq!(fcntl(cx, fd, F_ADD_SEALS, F_SEAL_GROW.into()), Ok(0));
+            assert_eq!(ftruncate(cx, fd, end + 1), Err(Errno::EPERM));
+            assert_eq!(pwrite(cx, fd, addr, 4, 4), Ok(4));
+            assert_eq!(fallocate(cx, fd, 3, end - 4096, 4096), Ok(0));
+            assert_eq!(fallocate(cx, fd, 3, i64::MAX - 1, 2), Err(Errno::EFBIG));
+
+            let offset = addr + 128;
+            let buf = addr + 256;
+            put(cx, offset, 4_i64.to_le_bytes()).unwrap();
+            assert_eq!(sendfile(cx, dst, fd, offset, 8), Ok(8));
+            assert_eq!(i64::from_le_bytes(get(cx, offset).unwrap()), 12);
+            put(cx, offset, (end - 3).to_le_bytes()).unwrap();
+            assert_eq!(copy_file_range(cx, fd, offset, dst, 0, 8, 0), Ok(3));
+            assert_eq!(pread(cx, dst, buf, 11, 0), Ok(11));
+            assert_eq!(&get::<11>(cx, buf).unwrap(), b"data\0\0\0\0\0\0\0");
+
+            // Check the complete iovec length before returning any of the first iovec.
+            put(cx, offset, buf.to_le_bytes()).unwrap();
+            put(cx, offset + 8, 2_u64.to_le_bytes()).unwrap();
+            put(cx, offset + 16, (buf + 4).to_le_bytes()).unwrap();
+            put(cx, offset + 24, 2_u64.to_le_bytes()).unwrap();
+            assert_eq!(
+                pvectored(cx, fd, offset, 2, i64::MAX - 2, Some(0), false),
+                Err(Errno::EINVAL)
+            );
+            put(cx, buf, [0xff; 8]).unwrap();
+            assert_eq!(lseek(cx, fd, end - 3, SEEK_SET), Ok((end - 3) as u64));
+            assert_eq!(ioctl(cx, fd, FIONREAD, addr), Ok(0));
+            assert_eq!(i32::from_le_bytes(get(cx, addr).unwrap()), 3);
+            assert_eq!(readv(cx, fd, offset, 2), Ok(3));
+            assert_eq!(
+                get::<8>(cx, buf).unwrap(),
+                [0, 0, 255, 255, 0, 255, 255, 255]
+            );
+            assert_eq!(fcntl(cx, fd, F_SETFL, oflags::O_APPEND.into()), Ok(0));
+            assert_eq!(write(cx, fd, buf, 1), Err(Errno::EPERM));
+            assert_eq!(pwrite(cx, fd, buf, 1, 0), Err(Errno::EPERM));
+            assert_eq!(
+                pvectored(cx, fd, offset, 2, 0, Some(RWF_NOAPPEND), true),
+                Ok(4)
+            );
+        });
+    }
+
+    #[test]
+    fn large_file_fallback_is_scoped_to_live_memfds() {
+        with_guest(0, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            let fd = open(
+                cx,
+                addr,
+                b"/tmp/ordinary",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o600,
+            )
+            .unwrap();
+            let file = cx.fds().get(fd).unwrap();
+            let ino = file.borrow().data_ino().unwrap();
+            let expected = vfs
+                .store()
+                .open_object(ino, true)
+                .unwrap()
+                .set_len(i64::MAX as u64)
+                .map_err(host_errno);
+            assert_eq!(ftruncate(cx, fd, i64::MAX), expected.map(|()| 0));
+            assert_eq!(vfs.memfd_size(ino), None);
+            write_cstr(cx, addr, b"anonymous");
+            let mem = memfd_create(cx, addr, 0).unwrap() as i32;
+            let held = cx.fds().get(mem).unwrap();
+            let ino = held.borrow().data_ino().unwrap();
+            assert_eq!(ftruncate(cx, mem, i64::MAX), Ok(0));
+            let before = vfs.memfd_size(ino);
+            let physical = held
+                .borrow()
+                .regular_backing()
+                .unwrap()
+                .1
+                .metadata()
+                .unwrap()
+                .len();
+            assert_eq!(
+                before,
+                (physical < i64::MAX as u64).then_some(i64::MAX as u64)
+            );
+            close(cx, mem).unwrap();
+            evict_unlinked_tmpfs(cx.kr(), &vfs);
+            assert_eq!(vfs.memfd_size(ino), before);
+            drop(held);
+            evict_unlinked_tmpfs(cx.kr(), &vfs);
+            assert_eq!(vfs.memfd_size(ino), None);
+        });
     }
 
     fn mountpoint(vfs: &Vfs, name: &[u8]) -> (Node, Option<Dentry>) {

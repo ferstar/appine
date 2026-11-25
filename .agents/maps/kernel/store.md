@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/store.md` for the paired decision history.
 >
-> Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
->
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: preserve PAX `SCHILY.xattr.*` xattrs and file capabilities during rootfs import and add `Store::tree_root`)
+> Verified: 2026-11-26 (namespace and cache, object sharing and lifetimes, transaction and recovery ordering, import and provider authorization checked against the store and its callers)
 
 ## Responsibilities
 
@@ -38,8 +36,9 @@ provider and rootfs installation UI (`android`).
   flag, `doomed` objects to delete after commit, `replaced` files to flush before commit, `created`
   objects to unlink on savepoint rollback, the waker, the read-snapshot state, the owning kernel
   id, changed directories, cached `store_id` (`objects/` dev/ino), `writable_maps` (inodes
-  excluded from `relatime` caching because they may be mutated via writable shared mappings), and
-  `pending_release` (deleted held regular files awaiting release once closed/unmapped).
+  excluded from `relatime` caching because they may be mutated via writable shared mappings),
+  `pending_release` (deleted held regular files awaiting release once closed/unmapped),
+  and linkable tmpfile state with its transaction undo log.
 - `Meta` — state shared with readers and the reaper thread: the cache behind an `RwLock`, the
   commit counter, the reaper queue, the WAL path and durability watermark.
 - `Stat` includes the store inode’s access and default ACLs; `DirEntry`, `FileTime` (`Now` or `At(ns)`), the `mode` constants; `Ino = u64`, `ROOT = 1`.
@@ -73,7 +72,7 @@ provider and rootfs installation UI (`android`).
 - **Shared objects**: `share`, `held`, `unshare` with `finish_unshare` or `abandon_unshare` (the
   copy in between is the caller's, so the kernel can release the BKL), `make_private` (all three
   in one, the BKL held), `release`.
-- **Changes**: `mkdir`, `create_file`, `create_anonymous`, `symlink`, `mknod`, `link`, `unlink`,
+- **Changes**: `mkdir`, `create_file`, `create_anonymous`, `create_tmpfile`, `release_tmpfile`, `symlink`, `mknod`, `link`, `unlink`,
   `rmdir`, `rename` (no-replace, exchange), `create_detached_dir`/`remove_detached_dir`,
   `set_mode`, `set_owner`, `set_owner_mode`, `remove_privs`, xattr writes, `set_mtime`,
   `set_times`, `set_times_open`, `accessed`, `object_modified`; `transaction`.
@@ -89,8 +88,9 @@ provider and rootfs installation UI (`android`).
 - A store directory holds `meta.db` (SQLite, WAL mode), `objects/` and `lock`.
 - Tables: `inodes` (mode, owner, nlink, `..` parent for directories, rdev, mtime/ctime, symlink
   targets), `dentries`, `xattrs`, `detached_roots` (tmpfs roots and file-import staging directories),
-  `shared` (regular files whose data is not plainly their own object: the object's number and a saved timestamp marking it held). Only
-  primary keys are indexed, and `shared` by object. Tables are created with `IF NOT EXISTS`, so
+  `shared` (regular files whose data is not plainly their own object: the object's number and a saved timestamp marking it held),
+  and `document_generations` (retired document names with a unique parent/name index).
+  The `shared` table also has an index on object. Tables are created with `IF NOT EXISTS`, so
   older stores gain `shared` when opened.
 - Pragmas: `journal_mode = WAL`, `synchronous = NORMAL`, `journal_size_limit = 8 MB`, a 10 s busy
   timeout, a statement cache.
@@ -154,8 +154,9 @@ provider and rootfs installation UI (`android`).
 ### Namespace operations
 
 - Every operation is atomic. Hardlinks are several dentries for one inode (directories cannot be
-  linked, `EPERM`; an inode with link count 0 cannot get a name again, `ENOENT`, as its object is
-  doomed).
+  linked, `EPERM`). A zero-link inode gives `ENOENT` except for the first link of an
+  `O_TMPFILE` created without `O_EXCL`. Its object survives until that link or its final reference.
+  Rolling back the operation or commit also restores linkability.
 - Errors: `EEXIST` (name taken, no-replace rename, `XATTR_CREATE`), `ENOTDIR`, `ENOENT` (missing name,
   creating inside a deleted directory), `EISDIR` (unlink of a directory), `EBUSY` (rmdir of root),
   `ENOTEMPTY`, `EINVAL` (moving a directory under itself), `ENODATA` (missing xattr); SQLite errors
@@ -205,8 +206,8 @@ provider and rootfs installation UI (`android`).
     flushed before the commit containing the rename (`sync_file_range` + `fdatasync` per file, or
     one `syncfs` beyond 16 files), done inside the commit with the BKL held; errors are only logged
     and the first `fdatasync` error skips the remaining files.
-  - The reaper syncs the WAL before deleting an object, so an object is never deleted before the
-    commit that removed its last link is on disk.
+  - The reaper requests a WAL sync before deleting an object. If that sync fails, deletion
+    proceeds in both the background and inline paths.
   - A held file's private copy is flushed before the commit that points it there, through the same
     `replaced` list as a rename-over.
 - New regular files' objects exist immediately; the `lock` header records the uncommitted inode
@@ -243,12 +244,12 @@ provider and rootfs installation UI (`android`).
 
 - Caches dentries (including names that do not exist), database rows (with the `shared` row
   joined in), symlink targets, `..` parents, names, directory listings, the file-capability set, and
-  `relatime_fresh` (with a 1-entry `last_relatime` fast slot); xattr values, emptiness checks
+  `relatime_fresh` (with a 1-entry `last_relatime` fast slot). The row caches decoded POSIX ACLs. Other xattr values, emptiness checks
   and regular-file sizes and mtime/ctime are not cached.
 - `relatime_fresh` records an inode's `atime_ns` only when `atime > mtime && atime > ctime`, no
   other connection is open (`active_users <= 1`), no Files app writer is open on this store
-  (`HOST_WRITERS`), and the inode has no writable shared mapping (`mapping_object(_, true)` or
-  `create_anonymous`). Inode mutations (`touch_ino`), direct host-object modifications
+  (`HOST_WRITERS`), and the inode has no `writable_maps` mark. Writable mapping opens, memfds,
+  and exclusive tmpfiles set that mark. Inode mutations (`touch_ino`), direct host-object modifications
   (`object_modified` from writes, truncates, fallocate, copies, and mtime-only `set_times`),
   foreign commits, or any other connection joining the store (via the open epoch packed into word 1
   of `lock`) invalidate cached `relatime` entries.
@@ -273,7 +274,8 @@ provider and rootfs installation UI (`android`).
   its own connection. An Android import opens this connection for local publication after staging provider data. While multiple
   connections are open, every operation commits immediately. A count leaked by a crash can only persist while another process holds the shared lock (e.g. several
   `appine-run` processes on one store), so on Android the next open is exclusive and resets it.
-- Changes made by host calls are replayed to running kernels of the same store in this process
+- Changes recorded by `browse_changing`, including changes completed before an error, are replayed
+  to running kernels of the same store in this process
   (found in the machine's registry), under their BKL, as inotify events. Directories the guest
   changes are recorded (up to 256 per poll, starting from the first poll) and handed to the
   provider through `Machine::take_changed_dirs`, which maps them to paths (deleted and tmpfs
@@ -286,12 +288,12 @@ provider and rootfs installation UI (`android`).
   failure in either rolls back the whole import and unlinks created objects): paths are normalised
   (`..` is `EINVAL`), missing parents created as 0755 root, directories' attributes applied (also
   onto an existing non-directory of that name) and their mtimes set last; files, symlinks,
-  hardlinks (to earlier entries), device nodes and FIFOs are created with their mode bits (setuid
+  hardlinks (to earlier entries, retaining their metadata), device nodes and FIFOs are created with their mode bits (setuid
   included), numeric owner and whole-second mtime; a non-directory entry whose name already exists
   aborts with `EEXIST`; PAX `SCHILY.xattr.*` extended attributes in supported namespaces
   (`security.*` including validated v2/v3 `security.capability`, `trusted.*`, `user.*` on regular
   files and directories, and validated POSIX ACLs under `system.*`) are preserved, while
-  unsupported/invalid xattrs, other PAX metadata and whiteouts are skipped. Afterwards the host
+  unsupported/invalid xattrs and other PAX metadata are skipped. Whiteout names follow their tar entry type. Afterwards the host
   calls `sync_store` (host `syncfs`). The Android caller imports into
   a temporary store directory that is discarded before a retry.
 
@@ -299,12 +301,20 @@ provider and rootfs installation UI (`android`).
 
 - Paths resolve like `realpath` inside the guest tree (links followed, at most 40). Only directories
   and regular files are visible; mounts are not.
-- Reads (stat, list, open read-only, text sniffing on the first 4 KB of up to 1000 files, search with
-  a 50,000-entry budget) accept any guest path. Writes (create with ` (n)` name variants, remove,
-  rename and move without overwriting, open for writing with a read-write or append fd) are confined
-  to a caller-supplied `top` directory compared by real path (`EACCES` outside, and for a `top`
-  whose real path is the root directory, which would cover everything; `top` itself cannot be
-  removed). Tree removal is one transaction. Provider writes skip guest permission checks and
+- Reads accept any guest path. Text sniffing reads the first 4 KB. The Android caller limits each batch to
+  1000 files and caps search at 50,000 entries.
+- Provider writes require an absolute, NUL-free `top`. The kernel resolves symlinks and accepts
+  directories at or below `/root` or `/home/<user>`. A regular `/etc/passwd` can also authorize
+  a directory at or below a resolved, absolute home for UID 1000 or higher. Empty shells,
+  `/sbin/nologin`, `/usr/sbin/nologin`, and `false` under `/bin`, `/usr/bin` or `/sbin` do
+  not qualify. The filesystem root, `/home` itself, and trees under `bin`, `sbin`, `usr`, `lib`,
+  `lib64`, `etc`, `proc`, `sys`, `dev`, `run`, `boot`, `var`, `tmp`, `opt`, `srv`, `mnt`,
+  `media` and `lost+found` are denied even if an account names them. Denial is `EACCES`.
+  A missing path returns `ENOENT` and a non-directory returns `ENOTDIR`.
+- Create, import, remove, rename, move and writable open check the real target or its parent
+  against the authorized top within the mutation transaction. Removal and moves preserve the
+  top itself. Create numbers name collisions and moves refuse to overwrite an existing entry.
+  Tree removal is atomic. Provider writes skip guest permission checks and
   preserve setuid/setgid. A writable open clears file capabilities in the transaction that pins
   the object, before truncation or fd handoff. Subsequent host writes use the returned description directly.
 - Removing or moving a source entry retires its document IDs atomically with the namespace change.
@@ -317,7 +327,10 @@ provider and rootfs installation UI (`android`).
   directory in one transaction. Only a committed import reports `Created`, `Opened` and `Written`.
   Errors clean up the staging tree, and boot reclaims one abandoned by process death.
 - A provider write reports `Opened`, writes the object directly, and reports `Written` on close if
-  the path still resolves (`IN_MODIFY`, `IN_CLOSE_WRITE` in the guest).
+  the path still resolves within the authorized tree (`IN_MODIFY`, `IN_CLOSE_WRITE` in the guest).
+  Close clears the host-writer record before revalidating the path.
+- Host configuration reads and writes accept absolute, NUL-free paths without `..` components.
+  Components over 255 bytes return `ENAMETOOLONG`. Validation precedes directory creation.
 
 ## Dependencies (inbound / outbound)
 
@@ -347,7 +360,7 @@ provider and rootfs installation UI (`android`).
 - Only the thread holding the owning kernel's BKL may use a kernel's `Store` (checked in debug and
   `borrow-check` builds).
 - Objects are always addressed by inode number, never by guest path.
-- Inode numbers are reused only after boot cleanup has deleted their rows. Boot cleanup therefore
+- Committed inode numbers are reused only after boot cleanup has deleted their rows. Boot cleanup therefore
   deletes those objects itself and must hand none of their numbers to the reaper, which unlinks
   `objects/<ino>` without checking whose it is.
 - A number some `shared` row uses as its object keeps its inode row (live, deleted, or one that only
@@ -365,13 +378,14 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
+- A failed WAL sync can leave an earlier durable namespace pointing to a reaped object after power loss.
 - **Whole-file sharing:** the first change to a file sharing its object copies all of it, where
   btrfs and XFS copy only the extents written.
 
 
 ## Open questions
 
-- Should `top` for provider writes be validated in the kernel, or is the JNI caller fully trusted?
+- None.
 
 ## To verify
 

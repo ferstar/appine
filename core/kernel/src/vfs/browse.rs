@@ -237,13 +237,16 @@ pub fn create(
     changes: &mut Vec<Change>,
 ) -> Result<Vec<u8>, Errno> {
     check_name(name)?;
-    let dir = dir_in(store, top, dir)?;
-    let name = with_available_name(name, directory, |candidate| {
-        if directory {
-            store.mkdir(dir, candidate, 0o755, uid, gid).map(drop)
-        } else {
-            store.create_file(dir, candidate, 0o644, uid, gid).map(drop)
-        }
+    let (dir, name) = store.transaction(|s| {
+        let dir = dir_in(s, top, dir)?;
+        let name = with_available_name(name, directory, |candidate| {
+            if directory {
+                s.mkdir(dir, candidate, 0o755, uid, gid).map(drop)
+            } else {
+                s.create_file(dir, candidate, 0o644, uid, gid).map(drop)
+            }
+        })?;
+        Ok((dir, name))
     })?;
     changes.push(Change::Created {
         dir,
@@ -397,11 +400,15 @@ pub fn rename(
     changes: &mut Vec<Change>,
 ) -> Result<(), Errno> {
     check_name(new_name)?;
-    let (dir, name) = entry_in(store, top, path)?;
-    if name == new_name {
-        return Ok(());
-    }
-    moved(store, (dir, &name), (dir, new_name), changes)
+    let change = store.transaction(|s| {
+        let (dir, name) = entry_in(s, top, path)?;
+        if name == new_name {
+            return Ok(None);
+        }
+        moved(s, (dir, &name), (dir, new_name)).map(Some)
+    })?;
+    changes.extend(change);
+    Ok(())
 }
 
 /// Moves to another directory `to` inside `top`, keeping the name; EEXIST if it is already there,
@@ -413,9 +420,13 @@ pub fn move_to(
     to: &[u8],
     changes: &mut Vec<Change>,
 ) -> Result<(), Errno> {
-    let (dir, name) = entry_in(store, top, path)?;
-    let to = dir_in(store, top, to)?;
-    moved(store, (dir, &name), (to, &name), changes)
+    let change = store.transaction(|s| {
+        let (dir, name) = entry_in(s, top, path)?;
+        let to = dir_in(s, top, to)?;
+        moved(s, (dir, &name), (to, &name))
+    })?;
+    changes.push(change);
+    Ok(())
 }
 
 /// A new name: not empty, `.` or `..`, no `/` or NUL, at most 255 bytes.
@@ -460,28 +471,19 @@ fn dir_in(store: &Store, top: &[u8], dir: &[u8]) -> Result<Ino, Errno> {
 }
 
 /// Moves `ino` from `from` to `to` (without overwriting) and records it.
-fn moved(
-    store: &Store,
-    from: (Ino, &[u8]),
-    to: (Ino, &[u8]),
-    changes: &mut Vec<Change>,
-) -> Result<(), Errno> {
+fn moved(store: &Store, from: (Ino, &[u8]), to: (Ino, &[u8])) -> Result<Change, Errno> {
     let ino = store.lookup(from.0, from.1)?.ok_or(Errno::ENOENT)?;
     let is_dir = store.kind(ino)? == mode::S_IFDIR;
-    store.transaction(|s| {
-        s.rename(from.0, from.1, to.0, to.1, true, false)?;
-        if from != to {
-            s.retire_document(from.0, from.1)?;
-        }
-        Ok(())
-    })?;
-    changes.push(Change::Moved {
+    store.rename(from.0, from.1, to.0, to.1, true, false)?;
+    if from != to {
+        store.retire_document(from.0, from.1)?;
+    }
+    Ok(Change::Moved {
         from: (from.0, from.1.to_vec()),
         to: (to.0, to.1.to_vec()),
         ino,
         is_dir,
-    });
-    Ok(())
+    })
 }
 
 /// Opens a regular file inside `top` for reading and writing (following symlinks; the file pointed
@@ -496,8 +498,11 @@ pub fn open_write(
     append: bool,
     changes: &mut Vec<Change>,
 ) -> Result<File, Errno> {
-    let (ino, parent) = writable_file(store, top, path)?;
-    let (file, unshared) = store.open_provider_object(ino, truncate, append)?;
+    let (ino, parent, file, unshared) = store.transaction(|s| {
+        let (ino, parent) = writable_file(s, top, path)?;
+        let (file, unshared) = s.open_provider_object(ino, truncate, append)?;
+        Ok((ino, parent, file, unshared))
+    })?;
     let finish = || {
         if truncate {
             store.truncate_host_object(&file)?;
@@ -529,7 +534,7 @@ pub fn written(
     changes: &mut Vec<Change>,
 ) -> Result<(), Errno> {
     store.host_closed(path);
-    let (ino, parent) = writable_file(store, top, path)?;
+    let (ino, parent) = store.snapshot(|s| writable_file(s, top, path))?;
     changes.push(Change::Written { ino, parent });
     Ok(())
 }
@@ -552,17 +557,82 @@ fn writable_file(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, (Ino, V
     Ok((ino, (dir, name)))
 }
 
-/// The inode and real path of `top`; it must be a directory other than the root directory
-/// (EACCES): an account whose home is `/`, or a link to it, would make the whole system writable.
+/// Resolves the provider's write boundary to a directory in a login home tree.
 fn top_of(store: &Store, top: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
+    if !top.starts_with(b"/") || top.contains(&0) {
+        return Err(Errno::EACCES);
+    }
     let (ino, real) = walk(store, top)?;
     if store.kind(ino)? != mode::S_IFDIR {
         return Err(Errno::ENOTDIR);
     }
-    if real.is_empty() {
-        return Err(Errno::EACCES);
+    let allowed = match real.first().map(Vec::as_slice) {
+        Some(b"root") => true,
+        Some(b"home") => real.len() >= 2,
+        None
+        | Some(
+            b"bin" | b"sbin" | b"usr" | b"lib" | b"lib64" | b"etc" | b"proc" | b"sys" | b"dev"
+            | b"run" | b"boot" | b"var" | b"tmp" | b"opt" | b"srv" | b"mnt" | b"media"
+            | b"lost+found",
+        ) => false,
+        Some(_) => custom_home(store, &real)?,
+    };
+    if allowed {
+        Ok((ino, real))
+    } else {
+        Err(Errno::EACCES)
     }
-    Ok((ino, real))
+}
+
+// The caller has already excluded protected first components. A nonempty canonical
+// home that prefixes this path therefore cannot authorize a protected tree.
+fn custom_home(store: &Store, real: &[Vec<u8>]) -> Result<bool, Errno> {
+    use std::io::{BufRead, BufReader};
+    let passwd = match super::open_config_file(store, b"/etc/passwd") {
+        Ok(file) => file,
+        Err(Errno::ENOENT | Errno::ENOTDIR | Errno::EINVAL) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for line in BufReader::new(passwd).split(b'\n') {
+        let line = line.map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+        if let Some(home) = login_home(&line)
+            && let Ok((_, home)) = walk(store, home)
+            && !home.is_empty()
+            && real.starts_with(&home)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn login_home(line: &[u8]) -> Option<&[u8]> {
+    let mut fields = line
+        .strip_suffix(b"\r")
+        .unwrap_or(line)
+        .split(|&b| b == b':');
+    let name = fields.next()?;
+    let uid = fields.nth(1)?;
+    let home = fields.nth(2)?;
+    let shell = fields.next()?;
+    if name.is_empty()
+        || line.contains(&0)
+        || fields.next().is_some()
+        || !home.starts_with(b"/")
+        || !uid.iter().all(u8::is_ascii_digit)
+        || std::str::from_utf8(uid).ok()?.parse::<u32>().ok()? < 1000
+        || matches!(
+            shell,
+            b"" | b"/sbin/nologin"
+                | b"/usr/sbin/nologin"
+                | b"/bin/false"
+                | b"/usr/bin/false"
+                | b"/sbin/false"
+        )
+    {
+        return None;
+    }
+    Some(home)
 }
 
 // ---- Paths for the host ----
@@ -776,6 +846,116 @@ mod tests {
         s.mknod(alice, b"fifo", mode::S_IFIFO | 0o644, 0, 1000, 1000)
             .unwrap();
         (s, dir)
+    }
+
+    #[test]
+    fn provider_tops_are_resolved_home_directories() {
+        let (s, dir) = sample("tops");
+        let mkdir = |parent, name: &[u8]| s.mkdir(parent, name, 0o755, 0, 0).unwrap();
+        let root = mkdir(ROOT, b"root");
+        mkdir(root, b"100% home");
+        let users = mkdir(ROOT, b"users");
+        let bob = mkdir(users, b"bob");
+        mkdir(bob, b"sub");
+        mkdir(users, b"svc");
+        mkdir(users, b"daemon");
+        mkdir(users, b"bob2");
+        let etc = resolve(&s, b"/etc").unwrap();
+        mkdir(etc, b"custom");
+        for name in [b"usr".as_slice(), b"bin", b"sbin", b"var", b"tmp"] {
+            mkdir(ROOT, name);
+        }
+        for (name, target) in [
+            (b"system".as_slice(), b"/etc".as_slice()),
+            (b"all", b"/"),
+            (b"homes", b"/home"),
+            (b"bob-home", b"/users/bob"),
+        ] {
+            s.symlink(ROOT, name, target, 0, 0).unwrap();
+        }
+        assert_eq!(top_of(&s, b"/users/bob"), Err(Errno::EACCES));
+        super::super::write_file(
+            &s,
+            b"/etc/passwd",
+            b"bob:x:1000:1::/bob-home:/bin/sh\n\
+            daemon:x:2:2::/sbin:/bin/sh\nsystem:x:2:2::/users/daemon:/bin/sh\n\
+            nobody:x:65534:1::/:/bin/sh\nsvc:x:1000:1::/users/svc:/sbin/nologin\n\
+            admin:x:1000:1::/system/custom:/bin/sh\n",
+            0o644,
+            true,
+        )
+        .unwrap();
+        for top in [
+            b"/root".as_slice(),
+            b"/root/100% home",
+            b"/home/alice",
+            b"/home/alice/Docs",
+            b"/users/bob",
+            b"/users/bob/sub",
+        ] {
+            assert!(top_of(&s, top).is_ok(), "{top:?}");
+        }
+        for top in [
+            b"".as_slice(),
+            b"/",
+            b"/home",
+            b"/etc",
+            b"/usr",
+            b"/bin",
+            b"/sbin",
+            b"/var",
+            b"/tmp",
+            b"home/alice",
+            b"/home/alice\0",
+            b"/system",
+            b"/all",
+            b"/homes",
+            b"/users/svc",
+            b"/users/daemon",
+            b"/users/bob2",
+            b"/etc/custom",
+        ] {
+            assert_eq!(top_of(&s, top), Err(Errno::EACCES), "{top:?}");
+        }
+        assert_eq!(top_of(&s, b"/missing"), Err(Errno::ENOENT));
+        assert_eq!(top_of(&s, b"/etc/motd"), Err(Errno::ENOTDIR));
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn provider_revalidates_custom_home_on_publication_and_writer_close() {
+        let (s, dir) = sample("custom-home-changes");
+        let users = s.mkdir(ROOT, b"users", 0o755, 0, 0).unwrap();
+        let bob = s.mkdir(users, b"bob", 0o700, 1000, 1000).unwrap();
+        let top = b"/users/bob";
+        let path = b"/users/bob/data";
+        let ino = s.create_file(bob, b"data", 0o644, 1000, 1000).unwrap().0;
+        let passwd = |data: &[u8]| super::super::write_file(&s, b"/etc/passwd", data, 0o644, true);
+        passwd(b"bob:x:1000:1000::/users/bob:/bin/sh\n").unwrap();
+        let mut changes = Vec::new();
+        let file = open_write(&s, top, path, false, false, &mut changes).unwrap();
+        assert!(s.host_writing(ino).unwrap());
+        changes.clear();
+        assert_eq!(
+            import_file(
+                &s,
+                top,
+                b"pending",
+                (1000, 1000),
+                |_| passwd(b""),
+                &mut changes
+            ),
+            Err(Errno::EACCES)
+        );
+        assert!(changes.is_empty());
+        assert_eq!(s.lookup(bob, b"pending"), Ok(None));
+        drop(file);
+        assert_eq!(written(&s, top, path, &mut changes), Err(Errno::EACCES));
+        assert!(!s.host_writing(ino).unwrap());
+        assert!(changes.is_empty());
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
