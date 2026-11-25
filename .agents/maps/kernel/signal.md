@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 16 claims checked by 3 independent verifiers — 12 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: preserve `SI_TIMER` `SigInfo` on `RLIMIT_SIGPENDING` overflow and align RT signal overflow rules with Linux 6.1)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: page-fault ESRs reflect populated page-table entries)
 
 ## Responsibilities
 
@@ -174,10 +174,14 @@ construction (`kernel/vdso`).
   / stack-growth checks): `Exit::Undefined` -> `SIGILL`/`ILL_ILLOPC` (no ESR);
   `Exit::Breakpoint` -> `SIGTRAP`/`TRAP_BRKPT` (no ESR); `Watchpoint`/`HwBreakpoint` ->
   `SIGTRAP`/`TRAP_HWBKPT` (no ESR); `Alignment`/`StackAlignment` -> `SIGBUS`/`BUS_ADRALN` (EC 0x24
-  FSC 0x21 + WnR, EC 0x22, or EC 0x26); past-EOF/unreadable FUSE -> `SIGBUS`/`BUS_ADRERR` (level-3
-  FSC 0x07); unrecoverable page fault -> `SIGSEGV` (`SEGV_ACCERR` FSC 0x0f if mapped, else
-  `SEGV_MAPERR` FSC 0x07). `force` resets blocked/ignored handler to default, marks non-traced
-  default killable, unblocks, and queues on `task.pending`.
+  FSC 0x21 + WnR, EC 0x22, or EC 0x26). Past-EOF and failed backing-page fills raise
+  `SIGBUS`/`BUS_ADRERR` with a translation FSC. Other unrecoverable page faults raise `SIGSEGV`
+  with `SEGV_ACCERR` inside a VMA or `SEGV_MAPERR` outside. A denied access to a populated leaf
+  with permissions gives FSC 0x0f. An absent or `PROT_NONE` leaf gives a translation FSC
+  (0x04–0x07) based on the deepest table shared with a populated entry. A fault address outside
+  the 48-bit range after the engine handles data tags gives FSC 0x04. Instruction aborts use
+  EC 0x20 and data aborts EC 0x24 with WnR set on writes. `force` resets blocked/ignored
+  handlers to default, marks non-traced default killable, unblocks, and queues on `task.pending`.
 - `show_unhandled` (`arm64_show_signal`): runs before `force` when `debug.exception-trace` is
   non-zero (default 0; 1 under `MachineOptions::exception_trace`), handler is default/ignored and
   thread is untraced, rate-limited to 10 per 5 s kernel-wide (`Kernel::unhandled_rs`, logging
@@ -330,9 +334,9 @@ construction (`kernel/vdso`).
 
 ## Confirmed bugs / technical debt
 
-- **Synthesized abort ESRs differ from Linux's:** every translation fault reports level-3 FSC `0x07`
-  and every fault inside a mapping reports level-3 permission FSC `0x0f`, rather than the real
-  table walk level or translation-fault-on-unpopulated-page semantics.
+- Translation FSCs reflect the soft-MMU's population. Small mappings can already have entries
+  before their first access. `next_present` counts leaves whose permissions were cleared but
+  cannot distinguish an empty intermediate table retained after unmap from an absent table.
 
 ## Open questions
 

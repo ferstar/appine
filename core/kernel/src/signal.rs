@@ -1029,8 +1029,7 @@ fn class_name(esr: u64) -> &'static str {
     }
 }
 
-/// The name arm64 Linux's `fault_info` gives an abort's fault status code, for the codes Appine
-/// synthesizes (crate::task) and the other translation and permission levels.
+/// The name arm64 Linux's `fault_info` gives an abort's fault status code.
 pub(crate) fn abort_name(esr: u64) -> &'static str {
     match esr & 0x3f {
         0x04 => "level 0 translation fault",

@@ -856,10 +856,8 @@ const EC_IABT_LOW: u64 = 0x20;
 const EC_PC_ALIGN: u64 = 0x22;
 const EC_DABT_LOW: u64 = 0x24;
 const EC_SP_ALIGN: u64 = 0x26;
-/// Level 3 translation fault (page not mapped).
-const FSC_TRANSLATION: u64 = 0x07;
-/// Level 3 permission fault.
-const FSC_PERMISSION: u64 = 0x0f;
+const FSC_TRANSLATION_L0: u64 = 0x04;
+const FSC_PERMISSION_L3: u64 = 0x0f;
 /// Alignment fault.
 const FSC_ALIGNMENT: u64 = 0x21;
 
@@ -956,11 +954,6 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             if fault == Ok(true) {
                 return signal::deliver(cx, cpu, false);
             }
-            let (ec, wnr) = match access {
-                Access::Exec => (EC_IABT_LOW, 0),
-                Access::Read => (EC_DABT_LOW, 0),
-                Access::Write => (EC_DABT_LOW, ESR_WNR),
-            };
             // A FUSE file's mapping reads its pages as they are touched (crate::mm::Fill): read
             // this one with the BKL released and re-execute. A signal arriving before the daemon
             // took the read is delivered first, and the access faults again after it; a page that
@@ -982,27 +975,13 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 // The file of a shared mapping grew and the new contents are mapped in: re-execute
                 return signal::deliver(cx, cpu, false);
             }
-            if past_eof == Some(true) {
-                let esr = ec << 26 | ESR_IL | wnr | FSC_TRANSLATION;
-                let info = SigInfo::fault(code::BUS_ADRERR, addr, esr);
-                signal::show_unhandled(cx, cpu, Signal::BUS, esr, signal::abort_name(esr));
-                signal::force(cx, Signal::BUS, info);
+            // A grows-down mapping can recover a missing page, but cannot fix a file read error.
+            let backing_error = past_eof == Some(true);
+            if !backing_error && cx.grow_stack(addr) {
                 return signal::deliver(cx, cpu, false);
             }
-            // A grows-down mapping (the main thread's stack, MAP_GROWSDOWN) grows to here:
-            // re-execute
-            if cx.grow_stack(addr) {
-                return signal::deliver(cx, cpu, false);
-            }
-            let mapped = cx.mm().is_mapped(addr);
-            let (code, fsc) = if mapped {
-                (code::SEGV_ACCERR, FSC_PERMISSION)
-            } else {
-                (code::SEGV_MAPERR, FSC_TRANSLATION)
-            };
-            let esr = ec << 26 | ESR_IL | wnr | fsc;
-            let info = SigInfo::fault(code, addr, esr);
-            (Signal::SEGV, info, esr, signal::abort_name(esr))
+            let (sig, info) = page_fault_signal(&cx.mm(), addr, access, backing_error);
+            (sig, info, info.esr, signal::abort_name(info.esr))
         }
         Exit::Fault {
             addr,
@@ -1050,6 +1029,48 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     signal::show_unhandled(cx, cpu, sig, esr, what);
     signal::force(cx, sig, info);
     signal::deliver(cx, cpu, false)
+}
+
+/// Classifies an unrecoverable page fault. For SIGSEGV, VMA coverage determines si_code
+/// and the page table determines the ESR.
+fn page_fault_signal(mm: &Mm, addr: u64, access: Access, backing_error: bool) -> (Signal, SigInfo) {
+    let (sig, code) = if backing_error {
+        (Signal::BUS, code::BUS_ADRERR)
+    } else if mm.is_mapped(addr) {
+        (Signal::SEGV, code::SEGV_ACCERR)
+    } else {
+        (Signal::SEGV, code::SEGV_MAPERR)
+    };
+    let fsc = if !backing_error && mm.mmu().translate(addr, 0).is_some() {
+        FSC_PERMISSION_L3
+    } else {
+        translation_fsc(mm.mmu(), addr)
+    };
+    let (ec, wnr) = match access {
+        Access::Exec => (EC_IABT_LOW, 0),
+        Access::Read => (EC_DABT_LOW, 0),
+        Access::Write => (EC_DABT_LOW, ESR_WNR),
+    };
+    (
+        sig,
+        SigInfo::fault(code, addr, ec << 26 | ESR_IL | wnr | fsc),
+    )
+}
+
+/// A populated entry (including PROT_NONE) establishes the tables shared with the faulting
+/// address. The guest walk treats intermediate tables emptied by unmap as absent.
+fn translation_fsc(mmu: &appine_engine::Mmu, addr: u64) -> u64 {
+    if addr < 1 << appine_engine::VA_BITS {
+        for (shift, level) in [(21, 3), (30, 2), (39, 1)] {
+            let span = 1u64 << shift;
+            let lo = addr & !(span - 1);
+            let end = lo + span;
+            if mmu.next_present(lo, end) != end {
+                return FSC_TRANSLATION_L0 + level;
+            }
+        }
+    }
+    FSC_TRANSLATION_L0
 }
 
 /// Invalidates the translations of each page in `pages`, and lets the other threads sharing the
@@ -1337,4 +1358,89 @@ pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
         crate::kernel::signal_later(&parent);
     }
     st.mm.borrow_mut().remove_user(&task.sync);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmapped_page_reports_the_missing_translation_level() {
+        let mut mm = Mm::new();
+        let limit = 1 << appine_engine::VA_BITS;
+        // A single populated page in the last slot at every level also exercises end == limit.
+        mm.map_anonymous(limit - PAGE_SIZE, PAGE_SIZE, prot::READ)
+            .unwrap();
+        for (addr, fsc) in [
+            (0, 0x04),
+            (limit, 0x04),
+            (u64::MAX, 0x04),
+            (limit - (1 << 39), 0x05),
+            (limit - (1 << 30), 0x06),
+            (limit - (1 << 21), 0x07),
+        ] {
+            assert_eq!(
+                page_fault_signal(&mm, addr, Access::Read, false),
+                (
+                    Signal::SEGV,
+                    SigInfo::fault(code::SEGV_MAPERR, addr, 0x9200_0000 | fsc)
+                ),
+                "address {addr:#x}",
+            );
+        }
+    }
+
+    #[test]
+    fn access_error_esr_follows_leaf_permissions() {
+        let mut mm = Mm::new();
+        let addr = 1 << 30;
+        let denied = |mm: &Mm, access, esr| {
+            assert_eq!(
+                page_fault_signal(mm, addr, access, false),
+                (Signal::SEGV, SigInfo::fault(code::SEGV_ACCERR, addr, esr)),
+            );
+        };
+        // Fresh PROT_NONE, then a mapping large enough to stay unpopulated until its first read.
+        mm.map_anonymous(addr, 2 << 20, 0).unwrap();
+        denied(&mm, Access::Read, 0x9200_0004);
+        mm.mprotect(addr, 2 << 20, prot::READ).unwrap();
+        assert_eq!(mm.try_fault_in(addr, prot::WRITE), Ok(false));
+        denied(&mm, Access::Write, 0x9200_0044);
+        assert_eq!(mm.try_fault_in(addr, prot::READ), Ok(true));
+        denied(&mm, Access::Write, 0x9200_004f);
+
+        mm.mprotect(addr, PAGE_SIZE, prot::READ | prot::WRITE)
+            .unwrap();
+        denied(&mm, Access::Exec, 0x8200_000f);
+        mm.mprotect(addr, 2 << 20, 0).unwrap();
+        denied(&mm, Access::Read, 0x9200_0007);
+    }
+
+    #[test]
+    fn past_eof_reports_the_translation_level_in_siginfo_and_the_log() {
+        use crate::mm::flags;
+        use std::os::fd::AsRawFd;
+
+        let mut mm = Mm::new();
+        let file = appine_hal::memfd(c"past-eof").unwrap();
+        let addr = mm
+            .mmap(
+                0,
+                PAGE_SIZE,
+                prot::READ,
+                flags::MAP_PRIVATE,
+                Some((file.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        assert_eq!(mm.fault_past_eof(addr, prot::READ), Some(true));
+        let (sig, info) = page_fault_signal(&mm, addr, Access::Read, true);
+        assert_eq!(
+            (sig, info),
+            (
+                Signal::BUS,
+                SigInfo::fault(code::BUS_ADRERR, addr, 0x9200_0004)
+            )
+        );
+        assert_eq!(signal::abort_name(info.esr), "level 0 translation fault");
+    }
 }
