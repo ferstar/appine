@@ -29,14 +29,13 @@ pub const PIPE_BUF: usize = 4096;
 /// Device number anonymous pipes report (pipefs).
 pub(crate) const PIPE_DEV: u64 = 0xd;
 
-/// A vmsplice source page. The generation guards against host address reuse after a shootdown.
+/// A vmsplice source page. Its token expires even if a remap reuses the same host address.
 #[derive(Clone)]
 struct VmSource {
     mm: Weak<RefCell<Mm>>,
     // Slot::start supplies the current offset, including after a partial read or transfer.
     page: u64,
-    host_page: usize,
-    generation: u64,
+    mapping: appine_engine::PageWatch,
 }
 
 impl VmSource {
@@ -48,13 +47,9 @@ impl VmSource {
             return false;
         };
         let addr = self.page + offset as u64;
-        // Check the current translation too: a mapping can be replaced before the next shootdown.
         // A missing PTE uses the snapshot without faulting or queuing a FUSE fill on the reader.
-        mm.generations().tlb.load(Ordering::Relaxed) == self.generation
-            && mm
-                .mmu()
-                .translate(addr, prot::READ)
-                .is_some_and(|host| host.as_ptr() as usize == self.host_page + offset)
+        self.mapping.is_current()
+            && mm.mmu().translate(addr, prot::READ).is_some()
             && mm.read(UserSlice::new(addr, out.len()), out).is_ok()
     }
 }
@@ -156,15 +151,12 @@ impl Pipe {
     /// Keeps a live source for each guest page alongside its vmsplice-time snapshot.
     pub fn push_vmsplice(&mut self, data: &[u8], offset: usize, mm: &Rc<RefCell<Mm>>, addr: u64) {
         let source = mm.borrow();
-        let generation = source.generations().tlb.load(Ordering::Relaxed);
         self.push_slots(data, offset, false, |done| {
             let page = (addr + done as u64) & !(PIPE_BUF as u64 - 1);
-            let host = source.mmu().translate(page, prot::READ)?;
             Some(VmSource {
                 mm: Rc::downgrade(mm),
                 page,
-                host_page: host.as_ptr() as usize,
-                generation,
+                mapping: source.mmu().watch_readable_page(page)?,
             })
         });
     }
@@ -369,6 +361,34 @@ pub(crate) fn object(pipe: &Rc<RefCell<Pipe>>) -> crate::kernel::wake::Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vmsplice_keeps_the_live_page_across_an_unrelated_unmap() {
+        let mm = Mm::new().into_shared();
+        let page = PIPE_BUF as u64;
+        let base = 0x10000;
+        let src = UserSlice::new(base, 3);
+        mm.borrow_mut()
+            .map_anonymous(base, 2 * page, prot::READ | prot::WRITE)
+            .unwrap();
+        mm.borrow().write(src, b"old").unwrap();
+        let pipe = Pipe::fifo(1, PIPE_CAPACITY);
+        let mut pipe = pipe.borrow_mut();
+        pipe.push_vmsplice(b"old", 0, &mm, base);
+        mm.borrow_mut().munmap(base + page, page).unwrap();
+        mm.borrow_mut().sync_except(None);
+        mm.borrow().write(src, b"new").unwrap();
+        assert_eq!(pipe.snapshot(3), b"new");
+
+        mm.borrow_mut().munmap(base, page).unwrap();
+        mm.borrow_mut().sync_except(None);
+        mm.borrow_mut()
+            .map_anonymous(base, page, prot::READ | prot::WRITE)
+            .unwrap();
+        mm.borrow().write(src, b"bad").unwrap();
+        pipe.push_vmsplice(b"bad", 0, &mm, base);
+        assert_eq!(pipe.snapshot(6), b"oldbad");
+    }
 
     #[test]
     fn vmsplice_snapshot_survives_a_borrowed_or_dropped_address_space() {

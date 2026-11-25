@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: untouched private anonymous mappings prefill without write permission until first write fault, and executable unmaps/growth/rollbacks record `exec_changed` and `code_ranges`)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: readable page watches and their invalidation on page-table edits)
 
 ## Responsibilities
 
@@ -120,6 +120,11 @@ fast path and refill (`engine/dbt`).
   their first store) and fills the rest under the eager rule above, otherwise on demand.
 - Execute-only mappings (`PROT_EXEC` without `PROT_READ`) do not gain read permission: data loads
   and kernel reads fault, instruction fetch works.
+- `Mmu::watch_readable_page` issues a `PageWatch` for one readable guest page. Replacing,
+  unmapping or moving entries expires watches in the requested ranges, including both ends of
+  a move and ranges that may have been partially edited on allocation failure. Empty-slot fills
+  and permission changes preserve watches. A consumer checks current permissions before reading.
+  Watches on one page share a token. New registrations periodically reclaim unobserved tokens.
 
 ### The TLB
 
@@ -212,6 +217,7 @@ fast path and refill (`engine/dbt`).
   ivau`), the dispatcher (`sync` after BKL syscalls), membarrier (`quiesce`), users at thread start
   and exit.
 - The fast path reads entries through the CPU's `translate`.
+- `kernel/pipe` watches vmsplice source pages so an unrelated shootdown preserves live reads.
 
 ### Outbound
 

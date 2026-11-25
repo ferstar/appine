@@ -12,6 +12,33 @@ const RW: u32 = prot::READ | prot::WRITE;
 const LEAF: u64 = PAGE_SIZE << 9;
 
 #[test]
+fn page_watch_expires_on_replacement_even_if_the_host_address_is_reused() {
+    let mut mem = pages(2);
+    let mut mmu = Mmu::new();
+    let src = LEAF;
+    let dst = src + PAGE_SIZE;
+    let backing = host(&mut mem, 0);
+    unsafe { mmu.map(src, backing, 2 * PAGE_SIZE, RW).unwrap() };
+    let original = mmu.watch_readable_page(src).unwrap();
+    let destination = mmu.watch_readable_page(dst).unwrap();
+    mmu.protect(src, PAGE_SIZE, 0).unwrap();
+    assert!(mmu.watch_readable_page(src).is_none());
+    mmu.protect(src, PAGE_SIZE, RW).unwrap();
+    unsafe { mmu.fill_shared(src, backing, PAGE_SIZE, RW).unwrap() };
+    assert!(original.is_current());
+
+    unsafe { mmu.map_shared(src, backing, PAGE_SIZE, RW).unwrap() };
+    let replacement = mmu.watch_readable_page(src).unwrap();
+    assert!(!original.is_current());
+    assert!(destination.is_current());
+    assert!(mmu.move_entries(src, src, PAGE_SIZE).is_err());
+    assert!(replacement.is_current());
+    mmu.move_entries(src, dst, PAGE_SIZE).unwrap();
+    assert!(!replacement.is_current());
+    assert!(!destination.is_current());
+}
+
+#[test]
 fn fill_only_adds_missing_entries() {
     let mut mem = pages(4);
     let mmu = Mmu::new();

@@ -4,6 +4,8 @@
 //! maps). The kernel layer drives execution with [`Cpu::run`] and then handles syscalls,
 //! exceptions and other events according to the returned [`Exit`].
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::{c_int, c_uint, c_void};
 use std::fmt;
 use std::mem::offset_of;
@@ -274,6 +276,51 @@ impl std::error::Error for MapError {}
 /// The software page table of one guest address space (the kernel/mmu map).
 pub struct Mmu {
     raw: NonNull<RawMmu>,
+    watched: RefCell<WatchedPages>,
+}
+
+#[derive(Default)]
+struct WatchedPages {
+    pages: BTreeMap<u64, Arc<()>>,
+    next_sweep: usize,
+}
+
+impl WatchedPages {
+    fn watch(&mut self, page: u64) -> PageWatch {
+        // A pipe can release its last slot without an MMU mutation. Sweep on growth
+        // so registering another watch on the same page stays cheap.
+        if self.pages.len() >= self.next_sweep && !self.pages.contains_key(&page) {
+            self.pages.retain(|_, token| Arc::weak_count(token) != 0);
+            self.next_sweep = (self.pages.len() * 2).max(16);
+        }
+        let token = self.pages.entry(page).or_default();
+        PageWatch(Arc::downgrade(token))
+    }
+
+    fn finish_edit(&mut self, rc: c_int, starts: &[u64], len: u64) -> Result<(), MapError> {
+        let result = map_result(rc);
+        // Invalid arguments leave the table untouched. ENOMEM can follow a partial edit.
+        if result != Err(MapError::InvalidArgument) {
+            for &start in starts {
+                let end = start + len;
+                while let Some((&page, _)) = self.pages.range(start..end).next() {
+                    self.pages.remove(&page);
+                }
+            }
+        }
+        result
+    }
+}
+
+/// A page-table entry observed by a caller that keeps a fallback copy of its bytes.
+#[derive(Clone)]
+pub struct PageWatch(std::sync::Weak<()>);
+
+impl PageWatch {
+    /// Whether the original entry can still be used, subject to its current permissions.
+    pub fn is_current(&self) -> bool {
+        self.0.strong_count() != 0
+    }
 }
 
 impl Mmu {
@@ -282,7 +329,16 @@ impl Mmu {
         let raw = unsafe { appine_mmu_new() };
         Mmu {
             raw: NonNull::new(raw).expect("appine_mmu_new: out of memory"),
+            watched: RefCell::default(),
         }
+    }
+
+    /// Observes a readable page without pinning its backing. The weak token expires when
+    /// the entry is removed, moved or overwritten. Check read permission again on use.
+    pub fn watch_readable_page(&self, addr: u64) -> Option<PageWatch> {
+        self.translate(addr, prot::READ)?;
+        let page = addr & !(PAGE_SIZE - 1);
+        Some(self.watched.borrow_mut().watch(page))
     }
 
     /// Maps guest `[gva, gva + len)` to host `[host, host + len)`, replacing existing mappings.
@@ -298,14 +354,13 @@ impl Mmu {
         len: u64,
         prot: u32,
     ) -> Result<(), MapError> {
-        map_result(unsafe {
-            appine_mmu_map(self.raw.as_ptr(), gva, host.as_ptr().cast(), len, prot)
-        })
+        unsafe { self.map_shared(gva, host, len, prot) }
     }
 
     /// Unmaps `[gva, gva + len)`.
     pub fn unmap(&mut self, gva: u64, len: u64) -> Result<(), MapError> {
-        map_result(unsafe { appine_mmu_unmap(self.raw.as_ptr(), gva, len) })
+        let rc = unsafe { appine_mmu_unmap(self.raw.as_ptr(), gva, len) };
+        self.watched.get_mut().finish_edit(rc, &[gva], len)
     }
 
     /// Changes the permissions of existing entries, possibly to 0 (the host page is kept but
@@ -317,7 +372,8 @@ impl Mmu {
     /// Moves the existing entries in `[from, from + len)` unchanged to the same positions starting
     /// at `to`, clearing the originals; the two ranges must not overlap.
     pub fn move_entries(&mut self, from: u64, to: u64, len: u64) -> Result<(), MapError> {
-        map_result(unsafe { appine_mmu_move(self.raw.as_ptr(), from, to, len) })
+        let rc = unsafe { appine_mmu_move(self.raw.as_ptr(), from, to, len) };
+        self.watched.get_mut().finish_edit(rc, &[from, to], len)
     }
 
     /// Same as [`Mmu::map_shared`], but pages with existing entries (including ones with
@@ -361,9 +417,8 @@ impl Mmu {
         len: u64,
         prot: u32,
     ) -> Result<(), MapError> {
-        map_result(unsafe {
-            appine_mmu_map(self.raw.as_ptr(), gva, host.as_ptr().cast(), len, prot)
-        })
+        let rc = unsafe { appine_mmu_map(self.raw.as_ptr(), gva, host.as_ptr().cast(), len, prot) };
+        self.watched.borrow_mut().finish_edit(rc, &[gva], len)
     }
 
     /// Same as [`Mmu::protect`], but needs only `&self` (see [`Mmu::map_shared`]).

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: live vmsplice reads, snapshot fallback on pipe transfers, and validation of spliced FUSE replies)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: vmsplice source-page lifetime across mapping changes)
 
 ## Responsibilities
 
@@ -99,9 +99,11 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
   pipe's `O_NONBLOCK`. Regular-file splice and sendfile split at file page boundaries, vmsplice
   at each iovec's guest page boundaries. Each fragment occupies a separate slot. A whole slot moved between
   pipes keeps its merge flag; tee and partial moves create nonmergeable destination slots.
-- A vmspliced slot keeps a weak reference to the source address space and a snapshot of the bytes.
-  Reads and splice sample the live page at the slot's current offset. Tee and pipe-to-pipe splice
-  carry the same source and capture the transferred bytes as the destination's fallback snapshot.
+- A vmspliced slot keeps a weak reference to the source address space, a watch on its readable
+  page-table entry, and a snapshot of the bytes. Reads and splice sample the live page at the
+  slot's current offset while the watch is current and the page is readable. Unmapping another
+  page leaves the watch intact. Tee and pipe-to-pipe splice carry the same source and capture
+  the transferred bytes as the destination's fallback snapshot.
 - vmsplice's write side reads guest memory directly; every other copy to or from a guest buffer
   first grows a grows-down mapping below it (`kernel/fileio`).
 
@@ -119,7 +121,8 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 - `kernel/fileio` (the read and write paths of the other end, file checks, `RLIMIT_FSIZE`),
   `kernel/files` (fd tables and `FileKind::Pipe`),
   `kernel/process` (waits and wake objects), `kernel/signal` (`SIGPIPE`), `kernel/sysctl`
-  (`pipe-max-size`), `kernel/cred` (`CAP_SYS_RESOURCE`), `kernel/mm` (readable guest page translations and TLB shootdown generations).
+  (`pipe-max-size`), `kernel/cred` (`CAP_SYS_RESOURCE`), `kernel/mm` (guest memory reads) and
+  `kernel/mmu` (page watches and readable translations).
 
 ## Invariants and gotchas
 
@@ -134,8 +137,8 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 
 - `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues).
 - vmsplice does not pin guest pages. If the address space is gone or mutably borrowed, the
-  translation is missing or replaced, or the address space has had a TLB shootdown, the reader
-  gets the slot's snapshot. This can omit later writes even when a shootdown affected another page.
+  page is unreadable, or the MMU has invalidated its watch, the reader gets the slot's snapshot
+  and can miss subsequent writes to the original backing.
 
 ## Open questions
 
