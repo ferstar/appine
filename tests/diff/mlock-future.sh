@@ -134,7 +134,7 @@ static void case_mcl_future_brk(void)
 static void case_mcl_future_mremap(void)
 {
     void *unlk = mmap(NULL, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    char *slot = mmap(NULL, 3 * pg, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *dst = mmap(NULL, 3 * pg, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     drop_ipc_lock_and_limit(3 * pg);
     mlockall(MCL_FUTURE);
     void *lk = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -144,15 +144,18 @@ static void case_mcl_future_mremap(void)
     errno = 0;
     void *r2 = mremap(unlk, pg, 4 * pg, MREMAP_MAYMOVE);
     printf("grow_unlocked=%s ", map_status(r2));
-    munmap(slot, 3 * pg);
-    void *sh = mmap(slot, pg, PROT_READ | PROT_WRITE,
-                    MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    void *sh = mmap(NULL, pg, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     errno = 0;
     void *r3 = mremap(sh, 0, pg, MREMAP_MAYMOVE);
     printf("dup_locked=%s ", map_status(r3));
+    /* MREMAP_FIXED over a locked target is omitted: Linux 6.1/6.8 unmaps the target before
+     * checking RLIMIT_MEMLOCK in vma_to_resize (OK; covered by kernel/mm unit tests), while
+     * 6.17+/7.x checks mlock_future_ok in check_prep_vma first (EAGAIN). Over an unlocked
+     * target both kernels agree on EAGAIN. */
     errno = 0;
-    void *r4 = mremap(lk, 2 * pg, 3 * pg, MREMAP_MAYMOVE | MREMAP_FIXED, sh);
-    printf("fixed_over_locked=%s\n", map_status(r4));
+    void *r4 = mremap(lk, 2 * pg, 3 * pg, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+    printf("fixed_over_unlocked=%s\n", map_status(r4));
 }
 
 static void case_mcl_future_stack(void)
