@@ -47,7 +47,7 @@ pub(crate) use mqueue::{
     Limits as MqLimits, MessageQueue, MqDir, MqUsage, closed as mqueue_closed, find as mqueue_find,
 };
 pub(crate) use net::{SocketRef, deliver_dns, unmap_addr};
-pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};
+pub(crate) use poll::{Epoll, EpollWatches, ExGate, Fasync, check_exclusive, check_fasync};
 pub(crate) use proc::{interp_label, label_image};
 pub(crate) use ptrace::encode_regset;
 pub(crate) use sched::host_started;

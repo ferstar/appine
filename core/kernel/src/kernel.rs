@@ -295,6 +295,8 @@ pub(crate) struct Kernel {
     /// Threads waiting on files watched with `EPOLLEXCLUSIVE` (the exclusive gates of
     /// `syscall::poll`), checked by the timer thread.
     pub ex_gates: Vec<crate::syscall::ExGate>,
+    /// Object-to-epoll subscriptions for event-driven epoll readiness tracking (`syscall::poll`).
+    pub epoll_watches: Rc<RefCell<crate::syscall::EpollWatches>>,
     /// Open files with `O_ASYNC` set (the fasync of `syscall::poll`).
     pub fasync: Vec<crate::syscall::Fasync>,
     /// AIO contexts with a pending poll that signals an eventfd, completed by the timer thread
@@ -438,6 +440,7 @@ impl Kernel {
             waiters: Vec::new(),
             edge_waiters: Vec::new(),
             ex_gates: Vec::new(),
+            epoll_watches: Rc::default(),
             fasync: Vec::new(),
             aio_polls: Vec::new(),
             icmp_taps: Vec::new(),
@@ -736,6 +739,9 @@ impl Kernel {
         let (channels, objects) = PENDING.with_borrow_mut(std::mem::take);
         if channels == 0 {
             return;
+        }
+        if !objects.is_empty() {
+            self.epoll_watches.borrow_mut().notify_objects(&objects);
         }
         for (event, interest, wanted) in &self.waiters {
             let hit = interest & channels & wake::ALL != 0

@@ -1124,6 +1124,80 @@ impl Watch {
     }
 }
 
+/// A host epoll instance used by guest epolls to monitor host-backed descriptors in O(ready)
+/// instead of scanning every idle host descriptor with `ppoll`.
+pub struct HostEpoll {
+    epfd: std::os::fd::OwnedFd,
+}
+
+impl HostEpoll {
+    pub fn new() -> Result<HostEpoll, i32> {
+        use std::os::fd::FromRawFd;
+        let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if raw < 0 {
+            return Err(last_errno());
+        }
+        Ok(HostEpoll {
+            epfd: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) },
+        })
+    }
+
+    pub fn add(&self, fd: i32, events: u32, data: u64) -> Result<(), i32> {
+        let mut ev = libc::epoll_event { events, u64: data };
+        if unsafe { libc::epoll_ctl(self.fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) } < 0 {
+            return Err(last_errno());
+        }
+        Ok(())
+    }
+
+    pub fn modify(&self, fd: i32, events: u32, data: u64) -> Result<(), i32> {
+        let mut ev = libc::epoll_event { events, u64: data };
+        if unsafe { libc::epoll_ctl(self.fd(), libc::EPOLL_CTL_MOD, fd, &mut ev) } < 0 {
+            return Err(last_errno());
+        }
+        Ok(())
+    }
+
+    pub fn remove(&self, fd: i32) -> Result<(), i32> {
+        if unsafe { libc::epoll_ctl(self.fd(), libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) } < 0
+        {
+            return Err(last_errno());
+        }
+        Ok(())
+    }
+
+    /// Non-blocking `epoll_wait(..., 0)`, writing up to `out.len()` `(data, events)` pairs.
+    pub fn wait_now(&self, out: &mut [(u64, u32)]) -> Result<usize, i32> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let n = out.len().min(i32::MAX as usize);
+        let mut stack = [libc::epoll_event { events: 0, u64: 0 }; 64];
+        let mut heap;
+        let raw = if n <= stack.len() {
+            &mut stack[..n]
+        } else {
+            heap = vec![libc::epoll_event { events: 0, u64: 0 }; n];
+            &mut heap[..]
+        };
+        let rc = unsafe { libc::epoll_wait(self.fd(), raw.as_mut_ptr(), n as i32, 0) };
+        if rc < 0 {
+            return Err(last_errno());
+        }
+        let count = rc as usize;
+        for (dst, src) in out[..count].iter_mut().zip(&raw[..count]) {
+            *dst = (src.u64, src.events);
+        }
+        Ok(count)
+    }
+
+    /// The fd of the host epoll itself: readable (`POLLIN`) whenever any registered fd is ready.
+    pub fn fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.epfd.as_raw_fd()
+    }
+}
+
 /// Waits for events on host fds: each item of `fds` is (fd, events, revents), and a `timeout` of
 /// None waits forever. Returns the number of ready fds; returns `EINTR` when interrupted by a host
 /// signal.

@@ -390,8 +390,6 @@ capabilities (`kernel/cred`).
   append-only, immutable, nodump and noatime (LTP unlink09, copy_file_range02).
 - **Fidelity gaps**, one per line:
   - statx: no btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`;
-  - epoll's fdinfo shows the root filesystem's device for tmpfs files and an anonymous one for
-    overlay and FUSE files;
   - cgroup mkdir reports `EROFS` before `EEXIST`;
   - the store's rename errors come after permission.
 - **Scoped openat2 never returns `EAGAIN`:** the walk is atomic under the BKL, so a `..` walked

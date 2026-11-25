@@ -1077,6 +1077,11 @@ fn ipc_poll_unix_regressions() {
 }
 
 #[test]
+fn poll_opt_regressions() {
+    run_guest_in_empty_rootfs("poll_opt");
+}
+
+#[test]
 fn sig_ptrace_tty_regressions() {
     run_guest_in_empty_rootfs("sig_ptrace_tty");
 }
