@@ -182,6 +182,18 @@ pub mod mode {
     pub const S_ISVTX: u32 = 0o1000;
 }
 
+/// Linux inode flags supported by the store and shmem.
+pub(crate) mod inode_flags {
+    pub const IMMUTABLE: u32 = 0x10;
+    pub const APPEND: u32 = 0x20;
+    pub const NODUMP: u32 = 0x40;
+    pub const NOATIME: u32 = 0x80;
+    pub const PROTECTED: u32 = IMMUTABLE | APPEND;
+    pub const STATX: u32 = PROTECTED | NODUMP;
+    pub const INHERITED: u32 = NODUMP | NOATIME;
+    pub const SUPPORTED: u32 = STATX | NOATIME;
+}
+
 /// The metadata of an inode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stat {
@@ -189,6 +201,8 @@ pub struct Stat {
     pub ino: Ino,
     /// Type and permission bits.
     pub mode: u32,
+    /// Linux inode flags, independent of mount and open flags.
+    pub flags: u32,
     /// Number of hard links.
     pub nlink: u32,
     /// Owner.
@@ -269,6 +283,7 @@ const SCHEMA: &str = "
         parent   INTEGER NOT NULL DEFAULT 0, -- a directory's parent directory (..)
         mtime_ns INTEGER NOT NULL DEFAULT 0, -- used only by inodes without an object
         ctime_ns INTEGER NOT NULL DEFAULT 0,
+        flags INTEGER NOT NULL DEFAULT 0,
         atime_ns INTEGER,                    -- NULL uses the original object's or row's time
         target   BLOB                        -- the symlink's target
     );
@@ -450,25 +465,29 @@ impl Store {
         db.set_prepared_statement_cache_capacity(64);
         db.execute_batch(SCHEMA).map_err(db_err)?;
         // Serialize the upgrade if two processes open an older store together.
-        let has_atime = |db: &Connection| {
+        let has_column = |db: &Connection, name: &str| {
             db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('inodes') WHERE name = 'atime_ns')",
-                [],
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('inodes') WHERE name = ?1)",
+                [name],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(db_err)
         };
-        if !has_atime(&db)? {
+        if !has_column(&db, "atime_ns")? || !has_column(&db, "flags")? {
             let tx = db
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(db_err)?;
-            if !has_atime(&tx)? {
+            if !has_column(&tx, "atime_ns")? {
                 tx.execute_batch(
                     "ALTER TABLE inodes ADD COLUMN atime_ns INTEGER;
                      UPDATE inodes SET atime_ns = shared.atime_ns FROM shared
                      WHERE inodes.ino = shared.ino AND shared.atime_ns IS NOT NULL;",
                 )
                 .map_err(db_err)?;
+            }
+            if !has_column(&tx, "flags")? {
+                tx.execute_batch("ALTER TABLE inodes ADD COLUMN flags INTEGER NOT NULL DEFAULT 0")
+                    .map_err(db_err)?;
             }
             tx.commit().map_err(db_err)?;
         }
@@ -939,6 +958,11 @@ impl Store {
         self.with_row(ino, |(st, _)| st.kind())
     }
 
+    /// Inode flags without cloning cached ACLs on every I/O permission check.
+    pub(crate) fn flags(&self, ino: Ino) -> Result<u32, Errno> {
+        self.with_row(ino, |(st, _)| st.flags)
+    }
+
     /// Metadata in the database (a regular file's size and mtime are not filled in yet).
     fn stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
         self.with_row(ino, |(st, _)| st.clone())
@@ -979,7 +1003,7 @@ impl Store {
             .db()
             .prepare_cached(
                 "SELECT i.mode, i.nlink, i.uid, i.gid, i.rdev, i.mtime_ns, i.ctime_ns,
-                        length(i.target), s.object, s.atime_ns, i.atime_ns, a.value, d.value
+                        length(i.target), s.object, s.atime_ns, i.atime_ns, a.value, d.value, i.flags
                  FROM inodes i LEFT JOIN shared s ON s.ino = i.ino
                  LEFT JOIN xattrs a ON a.ino = i.ino AND a.name = ?2
                  LEFT JOIN xattrs d ON d.ino = i.ino AND d.name = ?3
@@ -994,6 +1018,7 @@ impl Store {
                             r.get::<_, u32>(2)?,
                             r.get::<_, u32>(3)?,
                             r.get::<_, u64>(4)?,
+                            r.get::<_, u32>(13)?,
                         ),
                         (
                             r.get::<_, i64>(5)?,
@@ -1016,7 +1041,7 @@ impl Store {
             .map_err(db_err)?
             .ok_or(Errno::ENOENT)?;
         let (
-            (mode, nlink, uid, gid, rdev),
+            (mode, nlink, uid, gid, rdev, flags),
             (mtime_ns, ctime_ns, target_len),
             data,
             (access, default),
@@ -1034,6 +1059,7 @@ impl Store {
                 .unwrap_or_default()
         };
         let st = Stat {
+            flags,
             ino,
             mode,
             nlink,
@@ -1210,7 +1236,7 @@ impl Store {
             if s.lookup(parent, name)?.is_some() {
                 return Err(Errno::EEXIST);
             }
-            let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 1, 0)?;
+            let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 1, parent)?;
             s.add_dentry(parent, name, ino)?;
             // Create the object last: on failure the whole operation rolls back, leaving no inode
             // without an object
@@ -1311,7 +1337,7 @@ impl Store {
             if s.lookup(parent, name)?.is_some() {
                 return Err(Errno::EEXIST);
             }
-            let ino = s.new_inode(mode::S_IFLNK | 0o777, uid, gid, 1, 0)?;
+            let ino = s.new_inode(mode::S_IFLNK | 0o777, uid, gid, 1, parent)?;
             s.db()
                 .prepare_cached("UPDATE inodes SET target = ?1 WHERE ino = ?2")
                 .and_then(|mut st| st.execute(params![target, ino]))
@@ -1336,7 +1362,7 @@ impl Store {
             if s.lookup(parent, name)?.is_some() {
                 return Err(Errno::EEXIST);
             }
-            let ino = s.new_inode(mode, uid, gid, 1, 0)?;
+            let ino = s.new_inode(mode, uid, gid, 1, parent)?;
             s.db()
                 .prepare_cached("UPDATE inodes SET rdev = ?1 WHERE ino = ?2")
                 .and_then(|mut st| st.execute(params![rdev, ino]))
@@ -1386,18 +1412,30 @@ impl Store {
         nlink: u32,
         parent: Ino,
     ) -> Result<Ino, Errno> {
+        let flags = if parent == 0 {
+            0
+        } else {
+            self.flags(parent)? & inode_flags::INHERITED
+        };
+        // Only directories have a persistent .. entry.
+        let parent = if mode & mode::S_IFMT == mode::S_IFDIR {
+            parent
+        } else {
+            0
+        };
         let now = now_ns();
         self.db()
             .prepare_cached(
-                "INSERT INTO inodes (mode, uid, gid, nlink, parent, atime_ns, mtime_ns, ctime_ns)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)",
+                "INSERT INTO inodes (mode, uid, gid, nlink, parent, atime_ns, mtime_ns, ctime_ns, flags)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, ?7)",
             )
-            .and_then(|mut st| st.execute(params![mode, uid, gid, nlink, parent, now]))
+            .and_then(|mut st| st.execute(params![mode, uid, gid, nlink, parent, now, flags]))
             .map_err(db_err)?;
         let ino = self.db().last_insert_rowid() as Ino;
         self.touch_ino(ino);
         self.fill(Fill::Row(Stat {
             ino,
+            flags,
             mode,
             nlink,
             uid,
@@ -1450,6 +1488,37 @@ impl Store {
         // Start all regular-file timestamps on the same filesystem clock for relatime.
         self.write_atime(ino, open_atime(&file)?)?;
         Ok(file)
+    }
+
+    /// Changes the inode flags and ctime in the same transaction.
+    pub fn set_flags(&self, ino: Ino, flags: u32) -> Result<(), Errno> {
+        self.set_flags_open(ino, flags, None)
+    }
+
+    /// An unlinked private object can only update host ctime through its open handle.
+    pub(crate) fn set_flags_open(
+        &self,
+        ino: Ino,
+        flags: u32,
+        file: Option<&File>,
+    ) -> Result<(), Errno> {
+        self.transaction(|s| {
+            let changed = s
+                .db()
+                .prepare_cached("UPDATE inodes SET flags = ?2 WHERE ino = ?1")
+                .and_then(|mut stmt| stmt.execute(params![ino, flags]))
+                .map_err(db_err)?;
+            if changed == 0 {
+                return Err(Errno::ENOENT);
+            }
+            s.touch_ctime(ino)?;
+            if let Some(file) = file {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(OBJECT_MODE))
+                    .map_err(io_err)?;
+            }
+            Ok(())
+        })
     }
 
     /// Changes the permission bits (keeping the type bits).
@@ -1679,7 +1748,7 @@ impl Store {
 
     /// Whether `ancestor` is `dir` itself or one of its ancestor directories. The parent of the
     /// root directory and of directories not under the root directory is itself.
-    fn is_ancestor(&self, ancestor: Ino, mut dir: Ino) -> Result<bool, Errno> {
+    pub(crate) fn is_ancestor(&self, ancestor: Ino, mut dir: Ino) -> Result<bool, Errno> {
         loop {
             if dir == ancestor {
                 return Ok(true);
@@ -2017,6 +2086,9 @@ impl Store {
         if relatime && self.relatime_is_fresh(ino, now, DAY_NS) {
             return Ok(());
         }
+        if self.flags(ino)? & inode_flags::NOATIME != 0 {
+            return Ok(());
+        }
         let before_users = self.meta.commits.users_state();
         // Avoid a write transaction for most reads. When due, check again under the write lock.
         if relatime {
@@ -2027,6 +2099,9 @@ impl Store {
             }
         }
         let fresh = self.statement(|s| {
+            if s.flags(ino)? & inode_flags::NOATIME != 0 {
+                return Ok(None);
+            }
             let now = if file.is_some() {
                 s.filesystem_now()?
             } else {
@@ -3818,6 +3893,38 @@ mod tests {
         // regardless of how fast the machine is
         s.delay = Duration::from_secs(3600);
         (s, dir)
+    }
+
+    #[test]
+    fn inode_flags_migrate_persist_and_suppress_access_time() {
+        let (s, dir) = temp_store("flags-migration");
+        let (ino, _) = s.create_file(ROOT, b"file", 0o644, 0, 0).unwrap();
+        s.commit().unwrap();
+        drop(s);
+        Connection::open(dir.join("meta.db"))
+            .unwrap()
+            .execute_batch("ALTER TABLE inodes DROP COLUMN flags")
+            .unwrap();
+        let s = Store::open(&dir, &[]).unwrap();
+        assert_eq!(s.attrs(ino).unwrap().flags, 0);
+        let bits = inode_flags::SUPPORTED;
+        s.set_flags(ino, bits).unwrap();
+        assert_eq!(s.attrs(ino).unwrap().flags, bits);
+        s.commit().unwrap();
+        drop(s);
+        let s = Store::open(&dir, &[]).unwrap();
+        let host = s.open_object(ino, false).unwrap();
+        assert_eq!(s.stat_open(ino, &host).unwrap().flags, bits);
+        s.set_times(ino, Some(FileTime::At(1)), None).unwrap();
+        for relatime in [false, true] {
+            s.accessed(ino, Some(&host), relatime).unwrap();
+            assert_eq!(s.stat(ino).unwrap().atime_ns, 1);
+        }
+        s.set_flags(ino, 0).unwrap();
+        s.accessed(ino, Some(&host), true).unwrap();
+        assert!(s.stat(ino).unwrap().atime_ns > 1);
+        drop(s);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

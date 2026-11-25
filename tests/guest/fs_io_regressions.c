@@ -2200,12 +2200,28 @@ static void test_protected_regular_fifos_and_pty_blksize(void)
     snprintf(spath, sizeof spath, "/dev/pts/%d", ptyno);
     int s = open(spath, O_RDWR | O_NOCTTY);
     CHECK(s >= 0, "open %s", spath);
-    struct stat st_path, st_slave, st_master;
-    CHECK(stat(spath, &st_path) == 0 && fstat(s, &st_slave) == 0 && fstat(m, &st_master) == 0,
+    struct stat st_path, st_slave, st_master, st_ptmx, st_pts_ptmx, st_pts_master;
+    CHECK(stat(spath, &st_path) == 0 && fstat(s, &st_slave) == 0 && fstat(m, &st_master) == 0
+              && stat("/dev/ptmx", &st_ptmx) == 0,
           "stat/fstat PTY");
     CHECK(st_path.st_blksize == 1024, "stat slave st_blksize=%ld", (long)st_path.st_blksize);
     CHECK(st_slave.st_blksize == 1024, "fstat slave st_blksize=%ld", (long)st_slave.st_blksize);
-    CHECK(st_master.st_blksize == 1024, "fstat master st_blksize=%ld", (long)st_master.st_blksize);
+    CHECK(st_master.st_dev == st_ptmx.st_dev && st_master.st_ino == st_ptmx.st_ino
+              && st_master.st_blksize == st_ptmx.st_blksize,
+          "fstat /dev/ptmx matches stat (dev=%lu/%lu ino=%lu/%lu blksize=%ld/%ld)",
+          (unsigned long)st_master.st_dev, (unsigned long)st_ptmx.st_dev,
+          (unsigned long)st_master.st_ino, (unsigned long)st_ptmx.st_ino,
+          (long)st_master.st_blksize, (long)st_ptmx.st_blksize);
+    int m2 = open("/dev/pts/ptmx", O_RDWR | O_NOCTTY);
+    if (m2 >= 0) {
+        CHECK(stat("/dev/pts/ptmx", &st_pts_ptmx) == 0 && fstat(m2, &st_pts_master) == 0,
+              "stat/fstat /dev/pts/ptmx");
+        CHECK(st_pts_ptmx.st_blksize == 1024 && st_pts_master.st_blksize == 1024
+                  && st_pts_master.st_dev == st_pts_ptmx.st_dev
+                  && st_pts_master.st_ino == st_pts_ptmx.st_ino,
+              "fstat /dev/pts/ptmx matches devpts stat");
+        close(m2);
+    }
     close(s);
     close(m);
 

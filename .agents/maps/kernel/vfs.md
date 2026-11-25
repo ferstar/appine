@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: populate `stx_mnt_id` and `STATX_MNT_ID` in `statx` across both slow and fast paths, and support `O_TMPFILE` linking and tmpfs unlinked-to-linked transitions)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: anonymous inode metadata, PTY master identity, persistent inode flags and store rename error ordering)
 
 ## Responsibilities
 
@@ -55,7 +55,7 @@ capabilities (`kernel/cred`).
 - `resolve` — openat2's `RESOLVE_*` bits; `SCOPED = BENEATH | IN_ROOT`.
 - `Vfs` — the store handle, the mount table (`kernel/mount`'s `Mount`, `Mounts`, `Fs`, `MntNs`,
   `Index`, `GroupAlloc`), the no-BKL resolver state, the executable cache, the namespaces, the
-  overlay and FUSE tables and the mount event counter.
+  overlay and FUSE tables, the anonymous pipe and socket inode attributes, and the mount event counter.
 - `TmpfsParams` / `Tmpfs` — options, usage in pages and inodes (`None` until first counted) with a
   changed mark, and `unlinked: HashMap<Ino, u64>` tracking the last known page count of unlinked
   regular files still open, mapped or executing.
@@ -165,7 +165,7 @@ capabilities (`kernel/cred`).
   miss, over 64 pending components, a store inode that is a mount point (the store root after
   `pivot_root` too), a host stat error and a trailing link in a sticky world-writable directory of
   another owner; it never enters synthetic filesystems or overlays, makes no search check, and
-  otherwise mirrors `walk_in`. Mount table changes call `mounts_changed` (also bumping the mount
+  falls back for store inodes with statx-visible inode flags. It otherwise mirrors `walk_in`. Mount table changes call `mounts_changed` (also bumping the mount
   event counter mounts and mountinfo poll); chdir, fchdir, chroot, setns, credential and fs-context
   changes and the mount syscalls call `fast_changed`, and threads take a new snapshot after a BKL
   entry when the epoch moved.
@@ -187,7 +187,7 @@ capabilities (`kernel/cred`).
   (always for FUSE programs). nodev: device opens `EACCES` (store, overlay, FUSE and devpts
   nodes); mknod is unaffected. nosymfollow: `ELOOP`, and on the root filesystem it turns off
   `Cached`. Store file reads and mappings and store directory listings honor the description's
-  `O_NOATIME` and current mount flags. Read-only and noatime suppress updates, nodiratime
+  `O_NOATIME` and current mount flags. Read-only mounts, mount noatime and inode `FS_NOATIME_FL` suppress updates, nodiratime
   suppresses directory updates, and relatime compares atime to mtime, ctime and a 24-hour age.
   The sync, dirsync, mand and lazytime flags are recorded and reported (mountinfo, statfs).
 - Removing or renaming a mount point in the caller's namespace is `EBUSY` (rename: either name);
@@ -237,10 +237,12 @@ capabilities (`kernel/cred`).
 
 - Stat: asm-generic `struct stat`, uid/gid mapped into the caller's user namespace; `st_dev` from
   the mount for store, overlay and synthetic nodes, nsfs's own for namespace files, fixed
-  anonymous devices for pipes, sockets and anonymous inodes (owned by root), the queue
+  anonymous devices for pipes, sockets and anonymous inodes, the queue
   filesystem's for message queues, the devpts instance's for an open PTY slave, and the root
   filesystem's on the fast path (which resolves only there); `st_blksize` 4096 (1024 for procfs
-  and devpts nodes, including `fstat` of open PTY masters and slaves); ordinary files and host fds report the host’s `st_blocks`. Tracked
+  and devpts nodes, including devpts PTY masters and slaves). A store or overlay ptmx master
+  reports the opened device node, including its inode, block size, ownership and timestamps.
+  A master without an opened node keeps the synthetic ptmx identity. Ordinary files and host fds report the host’s `st_blocks`. Tracked
   tmpfs files count host extents and logical guest pages together. Other nodes use size (sysfs
   files 0; symlinks under 60 bytes on the
   root filesystem or 128 elsewhere live in the inode); directories report size 4096 on the root
@@ -248,7 +250,24 @@ capabilities (`kernel/cred`).
   `AT_NO_AUTOMOUNT` and the `AT_STATX_*` sync flags. newfstatat accepts both sync bits together.
   statx rejects that combination with `EINVAL` and reports `STATX_BASIC_STATS | STATX_MNT_ID` with
   `stx_mnt_id` set from the resolved node's or fd's `MountId` (`ROOT_MOUNT` on the fast path,
-  `ANON_MOUNT` for node-less fds, matching mountinfo and fdinfo).
+  `ANON_MOUNT` for node-less fds, matching mountinfo and fdinfo). Store and overlay stats
+  advertise immutable, append-only and nodump in `stx_attributes_mask` and report the set bits
+  in `stx_attributes`.
+- `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS` operate on a four-byte value for store, tmpfs,
+  memfd and overlay regular files and directories. The store persists immutable, append-only,
+  nodump and noatime in its inode row. Legacy stores start with zero flags. New named inodes
+  and unnamed temporary files inherit nodump and noatime from the creating directory.
+  An overlay reads the topmost inode and writes the upper inode after copy-up.
+  Changing flags requires ownership or `CAP_FOWNER`; toggling immutable or append-only also
+  requires `CAP_LINUX_IMMUTABLE` in the initial user namespace. A successful set updates ctime.
+- Immutable inodes reject write access, including writable opens and `faccessat(W_OK)`.
+  Append-only directories accept new names. Removing a name or replacing it checks both the
+  directory and the victim for immutable and append-only. Hard links check the source too.
+  Immutable and append-only files reject truncation, chmod, chown and explicit timestamp changes.
+  Both timestamps may be set to now on an append-only inode with the usual permissions.
+  Descriptor writes check current flags, including after a writable open. Append-only forces
+  writes to EOF and prevents toggling `O_APPEND`. Range copies check the destination before
+  transferring data.
 - statfs: the store reports ext4's magic with the host's `statvfs` of the objects directory, tmpfs
   its magic and limits (recounted), an overlay overlayfs's magic with the store's capacity, FUSE
   what the daemon answers, synthetic nodes the magic of their kind with zero sizes; `f_flags` from
@@ -274,8 +293,16 @@ capabilities (`kernel/cred`).
   fields succeed after resolution. Explicit times and mixed NOW/OMIT require the owner or
   `CAP_FOWNER` where the kernel checks permissions. On synthetic nodes other than devpts terminals,
   message queues, the mqueue root and cgroup2, chmod, chown and utimensat are `EROFS` on a read-only mount and `EACCES` otherwise by path,
-  `EBADF` by fd before any `EROFS`; sockets and anonymous pipes accept
-  them by fd and change nothing, other anonymous fds are `EBADF`.
+  `EBADF` by fd before any `EROFS`. Anonymous pipes and sockets share their VFS attributes
+  across descriptors, including followed proc fd links. `fchownat` and `utimensat` accept
+  empty paths with `AT_EMPTY_PATH`; Linux 6.1's `fchmodat` has no flags argument.
+- An anonymous pipe starts at mode 0600 with the creator's fsuid/fsgid and the creation time.
+  Successful ordinary reads update atime and writes update mtime and ctime. A socket starts at
+  mode 0777 with its recorded uid and zero timestamps. On first lookup, a matching fsuid
+  supplies the caller's fsgid. Otherwise a Unix socket can use a peer gid if the peer uid
+  matches its owner; the fallback gid is zero. Once initialized, chmod, chown and utimens share
+  the stored attributes. Socket chown also updates the uid used by procfs. Weak object references
+  preserve identity until dead entries are pruned as the table grows.
 - mknodat, after resolution and the `.`/`..` `EEXIST`: regular, char, block, FIFO, socket
   (directory `EPERM`, other types `EINVAL`); devices need `CAP_MKNOD` in the initial namespace and
   pass the device filter (whiteouts exempt; a whiteout on an overlay `EPERM`). unlinkat tries the
@@ -283,8 +310,11 @@ capabilities (`kernel/cred`).
   `EROFS`/`EACCES` before the `.`/`..` and `ENOENT` checks. renameat2 takes `RENAME_NOREPLACE` and
   `RENAME_EXCHANGE` (`RENAME_WHITEOUT` `EINVAL`); `EXDEV` comes before the `.`/`..` checks (a
   source `.`/`..` `EBUSY`; a destination one `EEXIST` with `RENAME_NOREPLACE`, else `EBUSY`); the
-  store decides `EEXIST`, a missing exchange target, a move into its own subtree and a same-inode
-  no-op only after the permission and `EBUSY` checks. In synthetic filesystems (`vfs_rename`
+  store checks mount writability before looking up the source. It then checks `NOREPLACE`,
+  a missing exchange target, trailing slashes and ancestor moves before the same-inode no-op.
+  Moving into the source subtree is `EINVAL`. Replacing an ancestor is `ENOTEMPTY` or, for an
+  exchange, `EINVAL`. Directory write, sticky and inode flag checks follow the no-op. The target
+  type check precedes reparenting permission and mount-point checks. In synthetic filesystems (`vfs_rename`
   order): read-only mount `EROFS`, missing source `ENOENT` (in procfs a missing destination too),
   `RENAME_NOREPLACE` onto an existing name `EEXIST`, a name onto itself 0; otherwise the mqueue
   root and cgroup2 `EPERM`, others `EACCES` without write and search permission on the source
@@ -391,16 +421,16 @@ capabilities (`kernel/cred`).
 
 ## Confirmed bugs / technical debt
 
-- **No inode flags:** `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` are unsupported, while 6.1's tmpfs has
-  append-only, immutable, nodump and noatime (LTP unlink09, copy_file_range02).
-- **Fidelity gaps**, one per line:
-  - statx: no btime, attributes or `STATX_DIOALIGN`;
-  - the store's rename errors come after permission.
+- Recursive overlay copy-up copies xattrs and times but can lose lower inode flags. SETFLAGS
+  writes the requested flags on its target; copying up an ancestor in that operation can still
+  lose the ancestor's flags.
+- Guest xattr setters and writable shared mappings still need inode-flag checks in their
+  respective syscall paths. The store's raw xattr operations also serve internal copy-up and ACL work.
+- statx has no btime or `STATX_DIOALIGN`.
 - **Scoped openat2 never returns `EAGAIN`:** the walk is atomic under the BKL, so a `..` walked
   while another thread mounts or renames never asks the caller to retry. Safe.
-- **Anonymous pipes and sockets have no owner:** fstat shows root (mapped into the caller's
-  namespace); fchmod, fchown and futimens are checked as if the caller owned them and change
-  nothing.
+- Standalone guests running without a VFS lack the shared anonymous attribute table.
+  Socket gid is also inferred at first lookup because socket creation records only the uid.
 
 ## Open questions
 

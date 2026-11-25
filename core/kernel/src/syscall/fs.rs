@@ -29,8 +29,8 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::overlay::{self, CopyUp, OvlId};
-use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, mode};
-use crate::vfs::{Dentry, Fs, MountId, Node, Pseudo, TMPFS_PAGE, Vfs, ms, normalize};
+use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, inode_flags, mode};
+use crate::vfs::{AnonTarget, Dentry, Fs, MountId, Node, Pseudo, TMPFS_PAGE, Vfs, ms, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
 pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -201,6 +201,8 @@ const FIOGETOWN: u32 = 0x8903;
 const SIOCGPGRP: u32 = 0x8904;
 const FIONCLEX: u32 = 0x5450;
 const FIOCLEX: u32 = 0x5451;
+const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
 const FICLONE: u32 = 0x4004_9409;
 const FICLONERANGE: u32 = 0x4020_940d;
 const FIDEDUPERANGE: u32 = 0xc018_9436;
@@ -748,7 +750,9 @@ fn open_tmpfile(
         Node::Store(mnt, d) => (*mnt, *d),
         Node::Overlay(_, o) => {
             let real = vfs.overlay().node(*o).real();
-            cred.permission(&vfs.store().stat(real)?, MAY_WRITE | MAY_EXEC)?;
+            let st = vfs.store().attrs(real)?;
+            reject_flags(st.flags, inode_flags::IMMUTABLE)?;
+            cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
             return Err(Errno::EOPNOTSUPP);
         }
         Node::Fuse(_, d) => {
@@ -761,6 +765,7 @@ fn open_tmpfile(
         }
     };
     let dir_st = vfs.store().stat(d)?;
+    reject_flags(dir_st.flags, inode_flags::IMMUTABLE)?;
     cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
     // tmpfs does not support O_DIRECT (do_dentry_open's direct_IO check).
     if flags & oflags::O_DIRECT != 0 && vfs.fs_of(dir) == Fs::Tmpfs {
@@ -772,6 +777,10 @@ fn open_tmpfile(
     let (ino, host, tracked) = vfs.store().transaction(|store| {
         let (ino, host) =
             store.create_tmpfile(mode, uid, gid, linkable, dir_st.default_acl.as_deref())?;
+        let inherited = dir_st.flags & inode_flags::INHERITED;
+        if inherited != 0 {
+            store.set_flags(ino, inherited)?;
+        }
         let tracked = tmpfs
             .map(|dev| host.try_clone().map(|file| (dev, file)))
             .transpose()
@@ -1199,6 +1208,9 @@ fn reopen(
         let how = StoreOpen::Reopened(new, memfd);
         return open_store_with(cx, cred, vfs, (mnt, ino), flags, how, key);
     }
+    if let Some(Attrs::Anon(target)) = Attrs::anonymous(&f) {
+        cred.permission(&target.stat(Some(vfs), cred), open_mask(flags))?;
+    }
     match &f.kind {
         FileKind::Pipe(end) => Ok(FileKind::Pipe(PipeEnd::open(
             &end.pipe,
@@ -1525,7 +1537,7 @@ fn open_store_with(
             }
             _ => {}
         }
-        cred.permission(&st, mask)?;
+        open_permission(cred, &st, mask, flags)?;
         // Device nodes then go through the cgroup device filter (Linux's
         // devcgroup_inode_permission)
         if matches!(st.kind(), mode::S_IFCHR | mode::S_IFBLK) && st.rdev != 0 {
@@ -1654,6 +1666,9 @@ fn open_store_with(
     };
     if let FileKind::Pty(end) = &mut kind {
         end.lock_ino = Some(lock_ino);
+        if end.master {
+            end.dev_ino = Some(ino);
+        }
     }
     Ok(kind)
 }
@@ -1730,7 +1745,7 @@ fn check_overlay_write(
     }
     let truncate = flags & oflags::O_TRUNC != 0;
     let mask = open_mask(flags) | if truncate { MAY_WRITE } else { 0 };
-    cred.permission(st, mask)?;
+    open_permission(cred, st, mask, flags)?;
     if flags & oflags::O_NOATIME != 0 && !cred.owns(st) {
         return Err(Errno::EPERM);
     }
@@ -1739,6 +1754,19 @@ fn check_overlay_write(
     }
     if executing_overlay(cx, o, st.ino) {
         return Err(Errno::ETXTBSY);
+    }
+    Ok(())
+}
+
+fn open_permission(cred: &Cred, st: &Stat, mask: u32, flags: u32) -> Result<(), Errno> {
+    if mask & MAY_WRITE != 0 {
+        reject_flags(st.flags, inode_flags::IMMUTABLE)?;
+    }
+    cred.permission(st, mask)?;
+    if flags & oflags::O_TRUNC != 0
+        || (flags & oflags::O_ACCMODE != oflags::O_RDONLY && flags & oflags::O_APPEND == 0)
+    {
+        reject_flags(st.flags, inode_flags::APPEND)?;
     }
     Ok(())
 }
@@ -1772,11 +1800,15 @@ fn devpts_beside(vfs: &Vfs, dir: Option<&Node>) -> Result<(u64, MountId), Errno>
     let Some(dir) = dir else {
         return Ok((crate::tty::BOOT_PTS, crate::vfs::PTS_MOUNT));
     };
-    let Node::Store(mnt, ino) = dir else {
-        return Err(Errno::ENODEV);
+    let sibling = match dir {
+        Node::Store(mnt, ino) => {
+            let pts = vfs.store().lookup(*ino, b"pts")?.ok_or(Errno::ENOENT)?;
+            Node::Store(*mnt, pts)
+        }
+        Node::Overlay(mnt, o) => vfs.overlay_child((*mnt, *o), b"pts")?,
+        _ => return Err(Errno::ENODEV),
     };
-    let pts = vfs.store().lookup(*ino, b"pts")?.ok_or(Errno::ENOENT)?;
-    match vfs.mounted(Node::Store(*mnt, pts)) {
+    match vfs.mounted(sibling) {
         Node::Pseudo(m, PseudoNode::PtsRoot(fs)) => Ok((fs, m)),
         _ => Err(Errno::ENODEV),
     }
@@ -1960,6 +1992,9 @@ pub(super) fn pipe2(cx: &mut Cx<'_>, fds: u64, flags: u32) -> SysResult {
     let cloexec = flags & oflags::O_CLOEXEC != 0;
     let status = flags & oflags::O_NONBLOCK;
     let (r, w) = PipeEnd::pair(pipe_capacity(cx));
+    if let Some(vfs) = &cx.kr().vfs {
+        vfs.anon_attrs(&AnonTarget::Pipe(r.pipe.clone()), &cx.cred(), |_| ());
+    }
     let r = OpenFile::new(FileKind::Pipe(r), oflags::O_RDONLY | status);
     let w = OpenFile::new(FileKind::Pipe(w), oflags::O_WRONLY | status);
     let rfd = cx.install_fd(r, cloexec)?;
@@ -2072,6 +2107,9 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
         F_SETFL => {
             let async_on = {
                 let mut f = file.borrow_mut();
+                if (arg as u32 ^ f.flags) & oflags::O_APPEND != 0 {
+                    reject_flags(file_inode_flags(cx, &f)?, inode_flags::APPEND)?;
+                }
                 if arg as u32 & oflags::O_NOATIME != 0 && f.flags & oflags::O_NOATIME == 0 {
                     let owner = match f.node() {
                         Some(Node::Store(_, ino)) => Some(cx.vfs()?.store().attrs(ino)?),
@@ -2464,6 +2502,84 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     }
 }
 
+fn real_inode(vfs: &Vfs, node: &Node) -> Option<Ino> {
+    match node {
+        Node::Store(_, ino) => Some(*ino),
+        Node::Overlay(_, o) => Some(vfs.overlay().node(*o).real()),
+        _ => None,
+    }
+}
+
+fn file_inode_flags(cx: &Cx<'_>, f: &OpenFile) -> Result<u32, Errno> {
+    if matches!(
+        f.kind,
+        FileKind::Regular { .. } | FileKind::Directory { .. }
+    ) {
+        let vfs = cx.vfs()?;
+        if let Some(ino) = f.node().and_then(|n| real_inode(&vfs, &n)) {
+            return vfs.store().flags(ino);
+        }
+    }
+    Ok(0)
+}
+
+fn reject_flags(flags: u32, forbidden: u32) -> Result<(), Errno> {
+    if flags & forbidden != 0 {
+        Err(Errno::EPERM)
+    } else {
+        Ok(())
+    }
+}
+
+fn fileattr_ioctl(cx: &Cx<'_>, file: &FileRef, request: u32, arg: u64) -> SysResult {
+    let (node, memfd) = {
+        let f = file.borrow();
+        if !matches!(
+            f.kind,
+            FileKind::Regular { .. } | FileKind::Directory { .. }
+        ) {
+            return Err(Errno::ENOTTY);
+        }
+        (f.node().ok_or(Errno::ENOTTY)?, f.pseudo)
+    };
+    let vfs = cx.vfs()?;
+    let ino = real_inode(&vfs, &node).ok_or(Errno::ENOTTY)?;
+    if request == FS_IOC_GETFLAGS {
+        let flags = vfs.store().flags(ino)? & inode_flags::SUPPORTED;
+        return put(cx, arg, flags.to_le_bytes()).map(|()| 0);
+    }
+    // The request encodes sizeof(long), but Linux reads and writes an int.
+    let flags = u32::from_le_bytes(get(cx, arg)?);
+    if !memfd && vfs.readonly(&node) {
+        return Err(Errno::EROFS);
+    }
+    let cred = cx.cred();
+    let st = vfs.store().attrs(ino)?;
+    if !cred.owns(&st)
+        || ((flags ^ st.flags) & inode_flags::PROTECTED != 0 && !cred.capable(cap::LINUX_IMMUTABLE))
+    {
+        return Err(Errno::EPERM);
+    }
+    if flags & !inode_flags::SUPPORTED != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let upper = match node {
+        Node::Overlay(_, o) => copy_up(cx, &vfs, o, CopyUp::All)?,
+        _ => ino,
+    };
+    let f = file.borrow();
+    let unlinked = f
+        .regular_backing()
+        .filter(|(ino, _, _)| *ino == upper && st.nlink == 0);
+    let host = if unlinked.is_some() && !vfs.store().held(upper)? {
+        unlinked.map(|(_, host, _)| host)
+    } else {
+        None
+    };
+    vfs.store().set_flags_open(upper, flags, host)?;
+    Ok(0)
+}
+
 pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResult {
     let file = io_file(cx, fd)?;
     if request >> 8 & 0xff == b'd' as u32 {
@@ -2476,6 +2592,7 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         }
     }
     match request {
+        FS_IOC_GETFLAGS | FS_IOC_SETFLAGS => return fileattr_ioctl(cx, &file, request, arg),
         FIOCLEX | FIONCLEX => {
             return cx.fds_mut().set_cloexec(fd, request == FIOCLEX).map(|()| 0);
         }
@@ -2712,6 +2829,7 @@ fn clone_range(
         if !i.readable() || !o.writable() || o.flags & oflags::O_APPEND != 0 {
             return Err(Errno::EBADF);
         }
+        reject_flags(file_inode_flags(cx, &o)?, inode_flags::PROTECTED)?;
         let tmpfs = |f: &OpenFile| {
             f.data_ino()
                 .is_some_and(|ino| vfs.tmpfs_dev(&Node::Store(f.mnt, ino)).is_some())
@@ -3352,6 +3470,9 @@ fn pipe_arrival(cx: &mut Cx<'_>, pipe: &mut Pipe, written: usize) {
     } else {
         super::poll::arrived(cx);
     }
+    if let Some(vfs) = &cx.kr().vfs {
+        vfs.pipe_io_time(pipe, true);
+    }
     pipe.writes += 1;
 }
 
@@ -3893,6 +4014,10 @@ pub(super) fn sendfile(
             return Err(Errno::EINVAL);
         }
     }
+    reject_flags(
+        file_inode_flags(cx, &output.borrow())?,
+        inode_flags::PROTECTED,
+    )?;
     let mut off = match offset {
         0 => None,
         addr => Some(u64::try_from(i64::from_le_bytes(get(cx, addr)?)).map_err(|_| Errno::EINVAL)?),
@@ -4273,6 +4398,7 @@ fn copy_range_checks(
     if dev(&i) != dev(&o) {
         return Err(Errno::EXDEV);
     }
+    reject_flags(file_inode_flags(cx, &o)?, inode_flags::PROTECTED)?;
     let pos_in = src.unwrap_or(i.pos as i64);
     let pos_out = dst.unwrap_or(o.pos as i64);
     let mut count = len as u64;
@@ -4575,6 +4701,11 @@ fn io_chunk(f: &OpenFile) -> usize {
 /// thread checks (`check_fasync`), so it is only woken.
 fn note_read(cx: &Cx<'_>, file: &FileRef, k: usize) {
     if k > 0 {
+        if let FileKind::Pipe(end) = &file.borrow().kind
+            && let Some(vfs) = &cx.kr().vfs
+        {
+            vfs.pipe_io_time(&end.pipe.borrow(), false);
+        }
         file.borrow_mut().reads += 1;
         if file.borrow().flags & oflags::O_ASYNC != 0 {
             crate::kernel::signal_later(&cx.shared.timers);
@@ -4787,7 +4918,15 @@ fn read_bytes_inner(
                 cx.unlocked(|| appine_hal::read(fd, buf)).map_err(Errno)
             }
         },
-        IoPath::Pipe(pipe) => pipe_read(cx, &pipe, nonblock, buf),
+        IoPath::Pipe(pipe) => {
+            let n = pipe_read(cx, &pipe, nonblock, buf)?;
+            if n != 0
+                && let Some(vfs) = &cx.kr().vfs
+            {
+                vfs.pipe_io_time(&pipe.borrow(), false);
+            }
+            Ok(n)
+        }
         IoPath::Pty(t, side) => tty::read(cx, &t, side, nonblock, buf),
         IoPath::Socket(s) => {
             let m = super::net::recv(cx, &s, nonblock, buf.len(), 0, 0)?;
@@ -5276,6 +5415,16 @@ fn write_local(
     data: &[u8],
     (offset, held, append): (Option<u64>, bool, bool),
 ) -> Result<usize, Errno> {
+    let flags = file_inode_flags(cx, &file.borrow())?;
+    reject_flags(flags, inode_flags::IMMUTABLE)?;
+    let append = append || flags & inode_flags::APPEND != 0;
+    let offset = if offset.is_some() && flags & inode_flags::APPEND != 0 {
+        let f = file.borrow();
+        let (ino, host, _) = f.regular_backing().ok_or(Errno::EBADF)?;
+        Some(regular_size(&*cx.vfs()?, ino, host)?)
+    } else {
+        offset
+    };
     let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len(), append)?];
     let (n, mut tmpfs) = tmpfs_write_room(cx, &file.borrow(), offset, data.len(), append)?;
     let data = &data[..n];
@@ -5620,11 +5769,14 @@ fn fsize_allowed(
     let FileKind::Regular { file, ino, .. } = &f.kind else {
         return Ok(len);
     };
+    let flags = file_inode_flags(cx, f)?;
+    reject_flags(flags, inode_flags::IMMUTABLE)?;
     let limit = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0;
     if limit == u64::MAX || len == 0 {
         return Ok(len);
     }
     let pos = match offset {
+        _ if flags & inode_flags::APPEND != 0 => regular_size(&*cx.vfs()?, *ino, file)?,
         Some(off) => off,
         None if append || f.flags & oflags::O_APPEND != 0 => regular_size(&*cx.vfs()?, *ino, file)?,
         None => f.pos,
@@ -6746,7 +6898,8 @@ pub(super) fn faccessat(
     if amode == 0 {
         return Ok(0);
     }
-    let (b, _) = node_stat(cx, &node)?;
+    let mut flags = None;
+    let (b, _) = node_stat(cx, &node, &mut flags)?;
     let word = |off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
     let st = Stat {
         mode: word(16),
@@ -6759,6 +6912,9 @@ pub(super) fn faccessat(
     let is_memfd = matches!(node, Node::Store(_, ino) if cx.kr().seals.contains_key(&ino));
     if !is_memfd && access_noexec(&*cx.vfs()?, &node, amode, st.mode & mode::S_IFMT) {
         return Err(Errno::EACCES);
+    }
+    if amode & MAY_WRITE != 0 {
+        reject_flags(flags.unwrap_or(0), inode_flags::IMMUTABLE)?;
     }
     // R_OK, W_OK, X_OK have the same values as MAY_READ, MAY_WRITE, MAY_EXEC
     cred.permission(&st, amode)?;
@@ -6905,7 +7061,7 @@ pub(super) fn newfstatat(
 ) -> SysResult {
     newfstatat_flags(flags)?;
     let path = read_path(cx, path)?;
-    let (st, _) = stat_at(cx, dirfd, &path, flags)?;
+    let (st, _) = stat_at(cx, dirfd, &path, flags, &mut None)?;
     put(cx, buf, st).map(|()| 0)
 }
 
@@ -6928,8 +7084,9 @@ pub(super) fn statx(
 ) -> SysResult {
     let flags = statx_flags(flags, mask)?;
     let path = read_path(cx, path)?;
-    let (st, mnt_id) = stat_at(cx, dirfd, &path, flags)?;
-    put(cx, buf, encode_statx(&st, mnt_id)).map(|()| 0)
+    let mut attrs = None;
+    let (st, mnt_id) = stat_at(cx, dirfd, &path, flags, &mut attrs)?;
+    put(cx, buf, encode_statx_attrs(&st, mnt_id, attrs)).map(|()| 0)
 }
 
 /// The `flags` and `mask` checks of statx; returns the flags for [`stat_at`].
@@ -6946,6 +7103,11 @@ pub(super) fn statx_flags(flags: u32, mask: u32) -> Result<u32, Errno> {
 /// (`STATX_BASIC_STATS`) and `STATX_MNT_ID` and `stx_mnt_id`
 /// (Linux 6.1's `vfs_statx`), with no creation time.
 pub(super) fn encode_statx(st: &[u8; 128], mnt_id: MountId) -> [u8; 256] {
+    // The cached walker only resolves store nodes and falls back for visible inode flags.
+    encode_statx_attrs(st, mnt_id, Some(0))
+}
+
+fn encode_statx_attrs(st: &[u8; 128], mnt_id: MountId, attrs: Option<u32>) -> [u8; 256] {
     const STATX_BASIC_STATS: u32 = 0x7ff;
     const STATX_MNT_ID: u32 = 0x1000;
     let u32_at = |o: usize| u32::from_le_bytes(st[o..o + 4].try_into().unwrap());
@@ -6957,6 +7119,10 @@ pub(super) fn encode_statx(st: &[u8; 128], mnt_id: MountId) -> [u8; 256] {
     let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
     let mask = STATX_BASIC_STATS | STATX_MNT_ID;
     put(0, &mask.to_le_bytes());
+    if let Some(flags) = attrs {
+        put(8, &u64::from(flags & inode_flags::STATX).to_le_bytes());
+        put(56, &u64::from(inode_flags::STATX).to_le_bytes());
+    }
     put(4, &u32_at(56).to_le_bytes()); // blksize
     put(16, &u32_at(20).to_le_bytes()); // nlink
     put(20, &u32_at(24).to_le_bytes()); // uid
@@ -6985,10 +7151,11 @@ fn stat_at(
     dirfd: i32,
     path: &[u8],
     flags: u32,
+    inode_flags: &mut Option<u32>,
 ) -> Result<([u8; 128], MountId), Errno> {
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         let file = cx.fds().get(dirfd)?;
-        let st = file_stat(cx, &file)?;
+        let st = file_stat_attrs(cx, &file, inode_flags)?;
         Ok((owner_out(cx, st), file.borrow().mnt_id()))
     } else {
         // Resolution and fetching the attributes share one read transaction (which really starts
@@ -7004,7 +7171,7 @@ fn stat_at(
                 flags,
                 flags & AT_SYMLINK_NOFOLLOW == 0,
             )?;
-            let (st, mnt) = node_stat(cx, &node)?;
+            let (st, mnt) = node_stat(cx, &node, inode_flags)?;
             Ok((owner_out(cx, st), mnt))
         })
     }
@@ -7179,7 +7346,11 @@ fn statfs_flags(flags: u64) -> u64 {
 // ---- stat ----
 
 /// Metadata of a filesystem node.
-fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<([u8; 128], MountId), Errno> {
+fn node_stat(
+    cx: &Cx<'_>,
+    node: &Node,
+    inode_flags: &mut Option<u32>,
+) -> Result<([u8; 128], MountId), Errno> {
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
     let stat = match node {
@@ -7187,11 +7358,13 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<([u8; 128], MountId), Errno> {
             let mut st = vfs.store().stat(*ino)?;
             st.size = st.size.max(vfs.memfd_size(*ino).unwrap_or(0));
             vfs.tmpfs_stat_blocks(*ino, None, &mut st)?;
+            *inode_flags = Some(st.flags);
             encode_stat(&st, vfs.dev_of(node))
         }
         Node::Overlay(_, o) => {
             let mut st = vfs.overlay_stat(*o)?;
             vfs.tmpfs_stat_blocks(vfs.overlay().node(*o).real(), None, &mut st)?;
+            *inode_flags = Some(st.flags);
             encode_stat(&st, vfs.dev_of(node))
         }
         Node::Fuse(..) => super::fuse::stat(&vfs, &cx.cred(), node)?,
@@ -7202,7 +7375,10 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<([u8; 128], MountId), Errno> {
         // The open file a magic link points at: report that file itself
         Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
             let file = view.open_file(*proc, *tid, *fd).ok_or(Errno::ENOENT)?;
-            return Ok((file_stat(cx, &file)?, file.borrow().mnt_id()));
+            return Ok((
+                file_stat_attrs(cx, &file, inode_flags)?,
+                file.borrow().mnt_id(),
+            ));
         }
         // A deleted program file
         Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
@@ -7214,6 +7390,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<([u8; 128], MountId), Errno> {
             if let Node::Overlay(_, o) = node {
                 st.ino = vfs.overlay().shown_ino(o);
             }
+            *inode_flags = Some(st.flags);
             return Ok((encode_stat(&st, vfs.dev_of(&node)), node.mnt()));
         }
         Node::Pseudo(_, p) => {
@@ -7230,6 +7407,14 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<([u8; 128], MountId), Errno> {
 }
 
 pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
+    file_stat_attrs(cx, file, &mut None)
+}
+
+fn file_stat_attrs(
+    cx: &Cx<'_>,
+    file: &FileRef,
+    inode_flags: &mut Option<u32>,
+) -> Result<[u8; 128], Errno> {
     follow_copy_up(cx, file)?;
     let f = file.borrow();
     if let Some(q) = &f.mq_path {
@@ -7246,6 +7431,7 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
         if let Some(o) = f.ovl {
             st.ino = vfs.overlay().shown_ino(o);
         }
+        *inode_flags = Some(st.flags);
         return Ok(encode_stat(&st, dev));
     }
     let anon = |ino: u64, mode: u32, rdev: u64, dev: u64| {
@@ -7267,32 +7453,40 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
     };
     match &f.kind {
         FileKind::Host(fd) => host_stat(*fd),
-        FileKind::Pipe(end) => match (f.ovl, end.pipe.borrow().fifo) {
-            (Some(o), Some(_)) => {
-                let vfs = cx.vfs()?;
-                let node = Node::Overlay(f.mnt, o);
-                Ok(encode_stat(&vfs.overlay_stat(o)?, vfs.dev_of(&node)))
+        FileKind::Pipe(end) => match end.pipe.borrow().fifo {
+            Some(_) => {
+                let node = f.node().ok_or(Errno::EBADF)?;
+                node_stat(cx, &node, inode_flags).map(|(st, _)| st)
             }
-            (None, Some(ino)) => {
-                let vfs = cx.vfs()?;
-                let dev = vfs.dev_of(&Node::Store(f.mnt, ino));
-                Ok(encode_stat(&vfs.store().stat(ino)?, dev))
-            }
-            (_, None) => Ok(anon(
+            None if cx.kr().vfs.is_none() => Ok(anon(
                 end.pipe.borrow().ino,
                 mode::S_IFIFO | 0o600,
                 0,
                 PIPE_DEV,
             )),
+            None => Ok(encode_stat(
+                &AnonTarget::Pipe(end.pipe.clone()).stat(cx.kr().vfs.as_deref(), &cx.cred()),
+                PIPE_DEV,
+            )),
         },
-        FileKind::Pty(end) if end.master => Ok(with_blksize(
-            anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV),
-            1024,
-        )),
-        FileKind::Socket(s) => Ok(anon(
-            pseudo::socket_ino(s),
-            mode::S_IFSOCK | 0o777,
-            0,
+        FileKind::Pty(end) if end.master => {
+            if end.pin {
+                let vfs = cx.vfs()?;
+                let fs = end.tty.borrow().fs;
+                let st = pseudo::stat(&cx.view(&vfs), &PseudoNode::PtsPtmx(fs))?;
+                Ok(with_blksize(encode_stat(&st, fs), 1024))
+            } else if let Some(node) = f.node() {
+                drop(f);
+                node_stat(cx, &node, inode_flags).map(|(st, _)| st)
+            } else {
+                Ok(with_blksize(
+                    anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV),
+                    1024,
+                ))
+            }
+        }
+        FileKind::Socket(s) => Ok(encode_stat(
+            &AnonTarget::Socket(s.clone()).stat(cx.kr().vfs.as_deref(), &cx.cred()),
             SOCK_DEV,
         )),
         // anon_inode: no file type bits
@@ -7337,11 +7531,12 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
                 if let Node::Overlay(_, o) = node {
                     st.ino = vfs.overlay().shown_ino(*o);
                 }
+                *inode_flags = Some(st.flags);
                 Ok(encode_stat(&st, vfs.dev_of(node)))
             } else {
                 let node = node.clone();
                 drop(f);
-                node_stat(cx, &node).map(|(st, _)| st)
+                node_stat(cx, &node, inode_flags).map(|(st, _)| st)
             }
         }
         FileKind::Fuse(h) => {
@@ -7353,7 +7548,7 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
         _ => {
             let node = f.node().ok_or(Errno::EBADF)?;
             drop(f);
-            node_stat(cx, &node).map(|(st, _)| st)
+            node_stat(cx, &node, inode_flags).map(|(st, _)| st)
         }
     }
 }
@@ -7444,6 +7639,7 @@ pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
         (_, Some(Node::Store(_, ino))) => (ROOT_DEV, ino),
         (FileKind::Pipe(end), None) => (PIPE_DEV, end.pipe.borrow().ino),
         (FileKind::Socket(s), _) => (SOCK_DEV, pseudo::socket_ino(s)),
+        (FileKind::Pty(end), None) if end.master && end.pin => (end.tty.borrow().fs, 2),
         (FileKind::Pty(end), None) if end.master => (ROOT_DEV, 2),
         (FileKind::Pty(end), None) => {
             let t = end.tty.borrow();
@@ -7733,7 +7929,7 @@ fn unlink_overlay(
         }
         let dir_st = vfs.store().attrs(vfs.overlay().node(d).real())?;
         cred.permission(&dir_st, MAY_EXEC)?;
-        cred.may_delete(&dir_st, &st)?;
+        may_delete_attrs(&cred, &dir_st, &st)?;
         match (rmdir, st.is_dir()) {
             (true, false) => return Err(Errno::ENOTDIR),
             (false, true) => return Err(Errno::EISDIR),
@@ -8051,7 +8247,9 @@ pub(super) fn linkat(
             return Err(Errno::EPERM);
         }
     }
+    reject_flags(dir_st.flags, inode_flags::IMMUTABLE)?;
     cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+    reject_flags(st.flags, inode_flags::PROTECTED)?;
     // The first link of a tmpfile moves its existing charge from the unlinked table.
     // Store::link checks whether a nameless inode can be linked before we change any charge.
     let tmpfs = backing_tmpfs_dev(&vfs, &Node::Store(mnt, dir));
@@ -8112,7 +8310,9 @@ fn link_overlay(
             return Err(Errno::EPERM);
         }
     }
+    reject_flags(dir_st.flags, inode_flags::IMMUTABLE)?;
     cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+    reject_flags(st.flags, inode_flags::PROTECTED)?;
     if st.is_dir() {
         return Err(Errno::EPERM);
     }
@@ -8157,7 +8357,13 @@ pub(super) fn renameat2(
     let parent = |dirfd, path| -> Result<(Node, &[u8]), Errno> {
         let start = start_dir(cx, dirfd, path)?;
         let vfs = cx.vfs()?;
-        vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)
+        let view = cx.view(&vfs);
+        let cred = cx.cred();
+        let (dir, name) = vfs.resolve_parent(&view, &cred, &cx.root(), &start, path)?;
+        if let Node::Store(_, ino) = dir {
+            cred.permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
+        }
+        Ok((dir, name))
     };
     let (old_parent, old_name) = parent(olddirfd, &oldpath)?;
     let (new_parent, new_name) = parent(newdirfd, &newpath)?;
@@ -8199,60 +8405,69 @@ pub(super) fn renameat2(
     let (old_mnt, old_dir) = store_dir(&vfs, &old_parent)?;
     let (new_mnt, new_dir) = store_dir(&vfs, &new_parent)?;
     writable_dir(&vfs, (old_mnt, old_dir))?;
-    // If either side ends in /, what is moved must be a directory
-    if (oldpath.ends_with(b"/") || newpath.ends_with(b"/"))
-        && let Some(src) = vfs.store().lookup(old_dir, old_name)?
-        && !vfs.store().attrs(src)?.is_dir()
-    {
-        return Err(Errno::ENOTDIR);
-    }
     let exchange = flags & RENAME_EXCHANGE != 0;
-    may_rename(
-        vfs.store(),
-        &cx.cred(),
-        (old_dir, old_name),
-        (new_dir, new_name),
-        exchange,
-    )?;
-    not_mount_point(cx, &vfs, old_dir, old_name)?;
-    let overwritten = not_mount_point(cx, &vfs, new_dir, new_name)?;
-    // With inotify watches, note both sides' inodes and whether they are directories first
-    let entry = |dir, name| -> Result<Option<(Ino, u32)>, Errno> {
-        match vfs.store().lookup(dir, name)? {
-            Some(ino) if vfs.store().attrs(ino)?.is_dir() => Ok(Some((ino, inotify::IN_ISDIR))),
-            Some(ino) => Ok(Some((ino, 0))),
-            None => Ok(None),
+    let noreplace = flags & RENAME_NOREPLACE != 0;
+    let change = vfs.store().transaction(|store| {
+        let src = store.attrs(store.lookup(old_dir, old_name)?.ok_or(Errno::ENOENT)?)?;
+        let dst = store
+            .lookup(new_dir, new_name)?
+            .map(|ino| store.attrs(ino))
+            .transpose()?;
+        if noreplace && dst.is_some() {
+            return Err(Errno::EEXIST);
         }
-    };
-    let (src, dst) = if inotify::active(cx.kr()) {
-        (entry(old_dir, old_name)?, entry(new_dir, new_name)?)
-    } else {
-        (None, None)
-    };
-    // An overwritten name is freed in tmpfs (renaming to another hard link of itself does
-    // nothing)
-    let replaced = match exchange {
-        false
-            if vfs.store().lookup(old_dir, old_name)?
-                != vfs.store().lookup(new_dir, new_name)? =>
+        if exchange && dst.is_none() {
+            return Err(Errno::ENOENT);
+        }
+        let new_slash_ok = if exchange {
+            dst.as_ref().is_some_and(Stat::is_dir)
+        } else {
+            src.is_dir()
+        };
+        if (oldpath.ends_with(b"/") && !src.is_dir()) || (newpath.ends_with(b"/") && !new_slash_ok)
         {
-            tmpfs_victim(&vfs, (new_mnt, new_dir), new_name)?
+            return Err(Errno::ENOTDIR);
         }
-        _ => None,
-    };
-    let moving = vfs.store().lookup(old_dir, old_name)?;
-    let held = overwritten.filter(|&ino| vfs.store().held(ino).unwrap_or(false));
-    vfs.store().rename(
-        old_dir,
-        old_name,
-        new_dir,
-        new_name,
-        flags & RENAME_NOREPLACE != 0,
-        exchange,
-    )?;
-    if moving == overwritten {
+        if old_dir != new_dir {
+            if src.is_dir() && store.is_ancestor(src.ino, new_dir)? {
+                return Err(Errno::EINVAL);
+            }
+            if let Some(d) = dst.as_ref().filter(|d| d.is_dir())
+                && store.is_ancestor(d.ino, old_dir)?
+            {
+                return Err(if exchange {
+                    Errno::EINVAL
+                } else {
+                    Errno::ENOTEMPTY
+                });
+            }
+        }
+        if dst.as_ref().is_some_and(|d| d.ino == src.ino) {
+            return Ok(None);
+        }
+        may_rename(
+            store,
+            &cx.cred(),
+            (old_dir, &src),
+            (new_dir, dst.as_ref()),
+            exchange,
+        )?;
+        not_mount_point(cx, &vfs, old_dir, old_name)?;
+        let overwritten = not_mount_point(cx, &vfs, new_dir, new_name)?;
+        let held = overwritten.filter(|&ino| store.held(ino).unwrap_or(false));
+        let replaced = if !exchange && overwritten.is_some() {
+            tmpfs_victim(&vfs, (new_mnt, new_dir), new_name)?
+        } else {
+            None
+        };
+        store.rename(old_dir, old_name, new_dir, new_name, noreplace, exchange)?;
+        let entry = |st: &Stat| (st.ino, if st.is_dir() { inotify::IN_ISDIR } else { 0 });
+        Ok(Some((entry(&src), dst.as_ref().map(entry), held, replaced)))
+    })?;
+    let Some((src, dst, held, replaced)) = change else {
         return Ok(0);
-    }
+    };
+    let overwritten = dst.map(|d| d.0);
     tmpfs_removed(cx, &vfs, replaced);
     // Detach the mounts of other namespaces on the overwritten target
     let k = cx.kr();
@@ -8286,7 +8501,7 @@ pub(super) fn renameat2(
         inotify::dir_event(k, from.0, from.1, inotify::IN_MOVED_FROM | isdir, cookie);
         inotify::dir_event(k, to.0, to.1, inotify::IN_MOVED_TO | isdir, cookie);
     };
-    if let Some(src) = src {
+    if inotify::active(k) {
         moved(src.1, (old_dir, old_name), (new_dir, new_name));
         match dst {
             Some(dst) if exchange => {
@@ -8336,16 +8551,17 @@ fn rename_overlay(
     if slashes && !src_st.is_dir() {
         return Err(Errno::ENOTDIR);
     }
-    cred.may_delete(&od_st, &src_st)?;
+    may_delete_attrs(&cred, &od_st, &src_st)?;
     let nd_st = attrs(nd)?;
     let dst = match vfs.overlay_child((m, nd), new_name) {
         Ok(Node::Overlay(_, d)) => {
             let st = attrs(d)?;
             cred.permission(&nd_st, MAY_EXEC)?;
-            cred.may_delete(&nd_st, &st)?;
+            may_delete_attrs(&cred, &nd_st, &st)?;
             Some((d, st))
         }
         _ => {
+            reject_flags(nd_st.flags, inode_flags::IMMUTABLE)?;
             cred.permission(&nd_st, MAY_WRITE | MAY_EXEC)?;
             None
         }
@@ -8508,21 +8724,31 @@ fn rename_overlay(
 fn may_rename(
     store: &Store,
     cred: &Cred,
-    (old_dir, old_name): (Ino, &[u8]),
-    (new_dir, new_name): (Ino, &[u8]),
+    (old_dir, src): (Ino, &Stat),
+    (new_dir, dst): (Ino, Option<&Stat>),
     exchange: bool,
 ) -> Result<(), Errno> {
-    let src = may_delete(store, cred, old_dir, old_name)?;
-    let dst = match store.lookup(new_dir, new_name)? {
-        Some(_) => Some(may_delete(store, cred, new_dir, new_name)?),
-        None => {
-            cred.permission(&store.stat(new_dir)?, MAY_WRITE | MAY_EXEC)?;
-            None
+    may_delete_attrs(cred, &store.attrs(old_dir)?, src)?;
+    let parent = store.attrs(new_dir)?;
+    if let Some(d) = dst {
+        may_delete_attrs(cred, &parent, d)?;
+        if !exchange && src.is_dir() != d.is_dir() {
+            return Err(if src.is_dir() {
+                Errno::ENOTDIR
+            } else {
+                Errno::EISDIR
+            });
         }
-    };
+    } else {
+        reject_flags(parent.flags, inode_flags::IMMUTABLE)?;
+        cred.permission(&parent, MAY_WRITE | MAY_EXEC)?;
+    }
     if old_dir != new_dir {
-        let moved = [Some(src), dst.filter(|_| exchange)];
-        for st in moved.iter().flatten().filter(|st| st.is_dir()) {
+        for st in [Some(src), dst.filter(|_| exchange)]
+            .into_iter()
+            .flatten()
+            .filter(|st| st.is_dir())
+        {
             cred.permission(st, MAY_WRITE)?;
         }
     }
@@ -8641,11 +8867,7 @@ enum Attrs {
     /// after a copy-up (6.1's `ovl_setattr`).
     Overlay(crate::vfs::overlay::OvlId),
     Pts(Rc<RefCell<Tty>>),
-    /// An fd of a socket or anonymous pipe: on Linux this changes their own inode in sockfs or
-    /// pipefs, owned by the process that created it (libuv's `uv_pipe_chmod` fchmods the
-    /// socket's fd first). Here it is treated as the caller's, the change is not recorded, and
-    /// the owner and permissions fstat reports stay synthetic.
-    Anon,
+    Anon(AnonTarget),
     /// A POSIX message queue: a file in the mqueue filesystem, or an fd from mq_open.
     Mq(Rc<RefCell<super::MessageQueue>>),
     /// The root directory of the mqueue filesystem of an IPC namespace (its id).
@@ -8657,8 +8879,43 @@ enum Attrs {
 }
 
 impl Attrs {
+    fn anonymous(file: &OpenFile) -> Option<Attrs> {
+        match &file.kind {
+            FileKind::Socket(s) => Some(Self::Anon(AnonTarget::Socket(s.clone()))),
+            FileKind::Pipe(end) if end.pipe.borrow().fifo.is_none() => {
+                Some(Self::Anon(AnonTarget::Pipe(end.pipe.clone())))
+            }
+            _ => None,
+        }
+    }
+
+    fn at(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32, follow: bool) -> Result<Self, Errno> {
+        if path.is_empty()
+            && flags & AT_EMPTY_PATH != 0
+            && dirfd != AT_FDCWD
+            && let Some(a) = Self::anonymous(&cx.fds().get(dirfd)?.borrow())
+        {
+            return Ok(a);
+        }
+        Self::of(
+            cx,
+            &lookup_at_or_fd(cx, &cx.cred(), dirfd, path, flags, follow)?,
+        )
+    }
+
     fn of(cx: &Cx<'_>, node: &Node) -> Result<Attrs, Errno> {
         match node {
+            Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
+                let vfs = cx.vfs()?;
+                let file = cx
+                    .view(&vfs)
+                    .open_file(*proc, *tid, *fd)
+                    .ok_or(Errno::ENOENT)?;
+                if let Some(target) = Self::anonymous(&file.borrow()) {
+                    return Ok(target);
+                }
+                store_ino(cx, node).map(Self::Store)
+            }
             Node::Pseudo(_, PseudoNode::Pts(..)) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
             Node::Pseudo(_, PseudoNode::Pts(fs, n)) => pseudo::pty(cx.kr(), *fs, *n)
                 .map(Attrs::Pts)
@@ -8687,14 +8944,16 @@ impl Attrs {
     fn of_fd(cx: &Cx<'_>, fd: i32) -> Result<Attrs, Errno> {
         let file = cx.fds().get(fd)?;
         let f = file.borrow();
+        if let Some(target) = Self::anonymous(&f) {
+            return Ok(target);
+        }
         match &f.kind {
             FileKind::Pty(end)
                 if !end.master && end.dev_ino.is_none() && f.flags & oflags::O_PATH == 0 =>
             {
                 return Ok(Attrs::Pts(end.tty.clone()));
             }
-            FileKind::Socket(_) => return Ok(Attrs::Anon),
-            FileKind::Pipe(end) if end.pipe.borrow().fifo.is_none() => return Ok(Attrs::Anon),
+
             FileKind::MessageQueue(q) => return Ok(Attrs::Mq(q.clone())),
             _ => {}
         }
@@ -8748,14 +9007,7 @@ impl Attrs {
                     ..Stat::default()
                 })
             }
-            Attrs::Anon => {
-                let cred = cx.cred();
-                Ok(Stat {
-                    uid: cred.fsuid,
-                    gid: cred.fsgid,
-                    ..Stat::default()
-                })
-            }
+            Attrs::Anon(target) => Ok(target.stat(cx.kr().vfs.as_deref(), &cx.cred())),
             Attrs::Cgroup(id, name) => cx.kr().cgroups.get(*id).ok_or(Errno::ENOENT)?.attrs(name),
             Attrs::Mq(q) => Ok(q.borrow().stat()),
             Attrs::MqDir(ns) => {
@@ -8806,6 +9058,7 @@ fn chmod(cx: &mut Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
     if target.checked(cx)? {
         let st = target.stat(cx)?;
         let cred = cx.cred();
+        reject_flags(st.flags, inode_flags::PROTECTED)?;
         if !cred.owns(&st) {
             return Err(Errno::EPERM);
         }
@@ -8832,7 +9085,14 @@ fn chmod(cx: &mut Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
             t.mode = perm;
             t.changed();
         }
-        Attrs::Anon => {}
+        Attrs::Anon(target) => {
+            if let Some(vfs) = &cx.kr().vfs {
+                vfs.anon_attrs(target, &cx.cred(), |a| {
+                    a.mode = (a.mode & mode::S_IFMT) | perm;
+                    a.ctime_ns = crate::tty::wall_ns();
+                });
+            }
+        }
         Attrs::Cgroup(id, name) => {
             let st = cx.k().cgroups.attrs_mut(*id, name)?;
             st.mode = st.kind() | perm;
@@ -8869,8 +9129,7 @@ pub(super) fn fchownat(
     }
     let path = read_path(cx, path)?;
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-    let node = lookup_at_or_fd(cx, &cx.cred(), dirfd, &path, flags, follow)?;
-    let target = Attrs::of(cx, &node)?;
+    let target = Attrs::at(cx, dirfd, &path, flags, follow)?;
     if chown(cx, &target, uid, gid)? {
         if path.is_empty() {
             attrib_fd(cx, dirfd);
@@ -8924,6 +9183,7 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> Result<bool, Er
         return Ok(true);
     }
     let st = target.stat(cx)?;
+    reject_flags(st.flags, inode_flags::PROTECTED)?;
     let owner = cred.fsuid == st.uid;
     let uid_ok = uid.is_none_or(|u| owner && u == st.uid);
     let gid_ok = gid.is_none_or(|g| owner && (g == st.gid || cred.in_group(g)));
@@ -8941,7 +9201,7 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> Result<bool, Er
             || st.mode & mode::S_ISGID != 0 && (st.mode & 0o010 != 0 || !keep_sgid));
     if matches!(
         target,
-        Attrs::Store(_) | Attrs::Overlay(_) | Attrs::Cgroup(..)
+        Attrs::Store(_) | Attrs::Overlay(_) | Attrs::Cgroup(..) | Attrs::Anon(_)
     ) && clears_setid
         && !cred.owns(&st)
     {
@@ -8973,7 +9233,27 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> Result<bool, Er
             t.owner = (uid.unwrap_or(t.owner.0), gid.unwrap_or(t.owner.1));
             t.changed();
         }
-        Attrs::Anon => {}
+        Attrs::Anon(target) => {
+            if let Some(vfs) = &cx.kr().vfs {
+                vfs.anon_attrs(target, &cred, |a| {
+                    a.uid = uid.unwrap_or(a.uid);
+                    a.gid = gid.unwrap_or(a.gid);
+                    a.mode &= !mode::S_ISUID;
+                    if a.mode & 0o010 != 0 || !keep_sgid {
+                        a.mode &= !mode::S_ISGID;
+                    }
+                    a.ctime_ns = crate::tty::wall_ns();
+                });
+            }
+            if let (Some(uid), AnonTarget::Socket(s)) = (uid, target) {
+                use crate::net::Socket;
+                match &mut *s.borrow_mut() {
+                    Socket::Inet(s) => s.uid = uid,
+                    Socket::Netlink(s) => s.uid = uid,
+                    Socket::Unix(s) => s.uid = uid,
+                }
+            }
+        }
         Attrs::Cgroup(id, name) => {
             let st = cx.k().cgroups.attrs_mut(*id, name)?;
             st.uid = uid.unwrap_or(st.uid);
@@ -9018,11 +9298,13 @@ pub(super) fn utimensat(
         if dirfd == AT_FDCWD {
             return Err(Errno::EFAULT);
         }
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
         (Attrs::of_fd(cx, dirfd)?, Vec::new())
     } else {
         let path = read_path(cx, path)?;
-        let node = lookup_at_or_fd(cx, &cx.cred(), dirfd, &path, flags, follow)?;
-        (Attrs::of(cx, &node)?, path)
+        (Attrs::at(cx, dirfd, &path, flags, follow)?, path)
     };
     // times[0] is atime and times[1] is mtime. The current time is taken by the store (for
     // regular files it is left to the host)
@@ -9043,7 +9325,12 @@ pub(super) fn utimensat(
         let time = |sec: i64, nsec: i64| match nsec {
             UTIME_OMIT => None,
             UTIME_NOW => Some(FileTime::Now),
-            nsec => Some(FileTime::At(sec * 1_000_000_000 + nsec)),
+            nsec => {
+                let ns = i128::from(sec) * 1_000_000_000 + i128::from(nsec);
+                Some(FileTime::At(
+                    ns.clamp(i64::MIN.into(), i64::MAX.into()) as i64
+                ))
+            }
         };
         (time(word(0), word(1)), time(word(2), word(3)), needs_owner)
     };
@@ -9051,6 +9338,14 @@ pub(super) fn utimensat(
     if target.checked(cx)? {
         let st = target.stat(cx)?;
         let cred = cx.cred();
+        reject_flags(
+            st.flags,
+            if needs_owner {
+                inode_flags::PROTECTED
+            } else {
+                inode_flags::IMMUTABLE
+            },
+        )?;
         if !cred.owns(&st) {
             if needs_owner {
                 return Err(Errno::EPERM);
@@ -9102,7 +9397,17 @@ pub(super) fn utimensat(
             );
             return Ok(0);
         }
-        Attrs::Anon => return Ok(0),
+        Attrs::Anon(target) => {
+            let (at, mt, now) = local_times();
+            if let Some(vfs) = &cx.kr().vfs {
+                vfs.anon_attrs(&target, &cx.cred(), |a| {
+                    a.atime_ns = at.unwrap_or(a.atime_ns);
+                    a.mtime_ns = mt.unwrap_or(a.mtime_ns);
+                    a.ctime_ns = now;
+                });
+            }
+            return Ok(0);
+        }
         // Times of message queues and the mqueue root directory are kept in the kernel layer
         Attrs::Mq(q) => {
             let (atime_ns, mtime_ns, _) = local_times();
@@ -9338,7 +9643,9 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             if vfs.readonly(&Node::Overlay(mnt, o)) {
                 return Err(Errno::EROFS);
             }
+            reject_flags(st.flags, inode_flags::IMMUTABLE)?;
             cx.cred().permission(&st, MAY_WRITE)?;
+            reject_flags(st.flags, inode_flags::APPEND)?;
             if executing_overlay(cx, o, real) {
                 return Err(Errno::ETXTBSY);
             }
@@ -9361,7 +9668,9 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             if !memfd && vfs.readonly(&node) {
                 return Err(Errno::EROFS);
             }
+            reject_flags(st.flags, inode_flags::IMMUTABLE)?;
             cx.cred().permission(&st, MAY_WRITE)?;
+            reject_flags(st.flags, inode_flags::APPEND)?;
             if executing(cx, ino) {
                 return Err(Errno::ETXTBSY);
             }
@@ -9403,6 +9712,7 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
     let leased = {
         let f = file.borrow();
         if f.writable() {
+            reject_flags(file_inode_flags(cx, &f)?, inode_flags::PROTECTED)?;
             super::lease::key_of(&f)
         } else {
             None
@@ -9415,6 +9725,7 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
     let f = file.borrow();
     match &f.kind {
         FileKind::Regular { ino, file, .. } if f.writable() => {
+            reject_flags(file_inode_flags(cx, &f)?, inode_flags::PROTECTED)?;
             check_fsize(cx, len)?;
             check_seals(cx, &f, false, |_| len)?;
             remove_privs(cx, *ino)?;
@@ -9494,6 +9805,12 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     if !file.borrow().writable() {
         return Err(Errno::EBADF);
     }
+    let forbidden = if mode & !FALLOC_FL_KEEP_SIZE == 0 {
+        inode_flags::IMMUTABLE
+    } else {
+        inode_flags::PROTECTED
+    };
+    reject_flags(file_inode_flags(cx, &file.borrow())?, forbidden)?;
     // Beyond the largest file length (i64::MAX)
     let end_of = || {
         offset
@@ -9928,6 +10245,7 @@ fn may_create_overlay(
     if vfs.readonly(&dir) {
         return Err(Errno::EROFS);
     }
+    reject_flags(st.flags, inode_flags::IMMUTABLE)?;
     cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
     Ok(st)
 }
@@ -9949,6 +10267,7 @@ pub(super) fn may_create(
     name: &[u8],
 ) -> Result<Stat, Errno> {
     let st = may_create_name(vfs, cred, dir, name)?;
+    reject_flags(st.flags, inode_flags::IMMUTABLE)?;
     cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
     Ok(st)
 }
@@ -10049,13 +10368,19 @@ pub(super) fn create_in<T>(
     })
 }
 
+fn may_delete_attrs(cred: &Cred, dir: &Stat, victim: &Stat) -> Result<(), Errno> {
+    reject_flags(dir.flags, inode_flags::IMMUTABLE)?;
+    cred.may_delete(dir, victim)?;
+    reject_flags(dir.flags | victim.flags, inode_flags::PROTECTED)
+}
+
 /// Checks before deleting `name` in directory `dir` or moving it away (`may_delete`); returns its
 /// metadata.
 fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat, Errno> {
     let dir_st = store.stat(dir)?;
     cred.permission(&dir_st, MAY_EXEC)?;
     let victim = store.stat(store.lookup(dir, name)?.ok_or(Errno::ENOENT)?)?;
-    cred.may_delete(&dir_st, &victim)?;
+    may_delete_attrs(cred, &dir_st, &victim)?;
     Ok(victim)
 }
 
@@ -11135,6 +11460,348 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_inode_metadata_is_shared_and_uses_the_creator() {
+        with_guest(1000, |cx, addr, _| {
+            let mut creator = cx.cred();
+            creator.fsgid = 2000;
+            cx.set_cred(creator.clone());
+            pipe2(cx, addr, 0).unwrap();
+            let (r, w) = (
+                i32::from_le_bytes(get(cx, addr).unwrap()),
+                i32::from_le_bytes(get(cx, addr + 4).unwrap()),
+            );
+            let sock = super::super::net::socket(cx, crate::net::AF_UNIX, 1, 0).unwrap() as i32;
+            let read_stat = |cx: &Cx<'_>, fd| file_stat(cx, &cx.fds().get(fd).unwrap()).unwrap();
+            let word = |s: &[u8; 128], i| u32::from_le_bytes(s[i..i + 4].try_into().unwrap());
+            let seconds = |s: &[u8; 128], i| i64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+            for (fd, other, kind, initial) in [
+                (r, w, mode::S_IFIFO, 0o600),
+                (sock, sock, mode::S_IFSOCK, 0o777),
+            ] {
+                let st = read_stat(cx, fd);
+                assert_eq!(
+                    (word(&st, 16), word(&st, 24), word(&st, 28)),
+                    (kind | initial, 1000, 2000)
+                );
+                assert_eq!(st, read_stat(cx, other));
+                for off in [72, 88, 104] {
+                    assert_eq!(seconds(&st, off) > 0, fd == r);
+                }
+                write_cstr(cx, addr, format!("/proc/self/fd/{fd}").as_bytes());
+                assert_eq!(fchmodat(cx, AT_FDCWD, addr, 0o6750), Ok(0));
+                assert_eq!(word(&read_stat(cx, other), 16), kind | 0o6750);
+                put(cx, addr, [0; 32]).unwrap();
+                put(cx, addr, 42i64.to_le_bytes()).unwrap();
+                put(cx, addr + 16, 43i64.to_le_bytes()).unwrap();
+                write_cstr(cx, addr + 64, b"");
+                utimensat(cx, fd, addr + 64, addr, AT_EMPTY_PATH).unwrap();
+                assert_eq!(seconds(&read_stat(cx, other), 72), 42);
+                assert_eq!(seconds(&read_stat(cx, other), 88), 43);
+                cx.set_cred(Cred::root());
+                fchownat(cx, fd, addr + 64, 3000, 4000, AT_EMPTY_PATH).unwrap();
+                let st = read_stat(cx, other);
+                assert_eq!(
+                    (word(&st, 16), word(&st, 24), word(&st, 28)),
+                    (kind | 0o750, 3000, 4000)
+                );
+                if let FileKind::Socket(s) = &cx.fds().get(fd).unwrap().borrow().kind {
+                    assert_eq!(s.borrow().uid(), 3000);
+                }
+                cx.set_cred(creator.clone());
+                assert_eq!(fchmod(cx, fd, 0o777), Err(Errno::EPERM));
+                assert_eq!(fchown(cx, fd, 1000, 2000), Err(Errno::EPERM));
+                assert_eq!(utimensat(cx, fd, 0, addr, 0), Err(Errno::EPERM));
+                assert_eq!(utimensat(cx, fd, 0, 0, 0), Err(Errno::EACCES));
+            }
+            assert_eq!(write(cx, w, addr, 1), Ok(1));
+            assert!(seconds(&read_stat(cx, r), 88) > 43);
+            assert_eq!(read(cx, r, addr, 1), Ok(1));
+            assert!(seconds(&read_stat(cx, w), 72) > 42);
+        });
+    }
+
+    #[test]
+    fn ptmx_master_reports_the_opened_device() {
+        with_guest(0, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            let store = vfs.store();
+            let lower = store
+                .mkdir(crate::vfs::store::ROOT, b"lower", 0o755, 0, 0)
+                .unwrap();
+            store.mkdir(lower, b"pts", 0o755, 0, 0).unwrap();
+            store
+                .mknod(lower, b"ptmx", mode::S_IFCHR | 0o620, PTMX_RDEV, 123, 456)
+                .unwrap();
+            let upper = store
+                .mkdir(crate::vfs::store::ROOT, b"upper", 0o755, 0, 0)
+                .unwrap();
+            vfs.new_overlay(
+                mountpoint(&vfs, b"merged"),
+                0,
+                b"overlay".to_vec(),
+                ((Some(upper), vec![lower]), (0, 0), Vec::new()),
+                overlay::Options::default(),
+            );
+            let pts = lookup_at(cx, AT_FDCWD, b"/merged/pts", true).unwrap();
+            vfs.add_mount(
+                Fs::Pts,
+                Fs::Pts.root(),
+                (pts, None),
+                0,
+                b"devpts".to_vec(),
+                Some(crate::tty::BOOT_PTS),
+            );
+            for path in [b"/dev/ptmx".as_slice(), b"/dev/pts/ptmx", b"/merged/ptmx"] {
+                let fd = open(cx, addr, path, oflags::O_RDWR, 0).unwrap();
+                newfstatat(cx, AT_FDCWD, addr, addr + 256, 0).unwrap();
+                fstat(cx, fd, addr + 512).unwrap();
+                let path_stat = get::<128>(cx, addr + 256).unwrap();
+                let fd_stat = get::<128>(cx, addr + 512).unwrap();
+                // devpts synthesizes its ptmx timestamps at each stat.
+                if path == b"/dev/pts/ptmx" {
+                    assert_eq!(path_stat[..72], fd_stat[..72]);
+                } else {
+                    assert_eq!(path_stat, fd_stat);
+                }
+            }
+        });
+    }
+
+    fn set_inode_flags(cx: &mut Cx<'_>, fd: i32, addr: u64, flags: u32) -> SysResult {
+        put(cx, addr, flags.to_le_bytes())?;
+        ioctl(cx, fd, FS_IOC_SETFLAGS, addr)
+    }
+
+    #[test]
+    fn inode_flags_control_open_fds_and_namespace_changes() {
+        use inode_flags::*;
+        use oflags::*;
+        with_guest(0, |cx, addr, _| {
+            let arg = addr + 512;
+            mount_tmpfs(&cx.vfs().unwrap(), 32);
+            for dir in [b"/tmp".as_slice(), b"/mnt"] {
+                let dirfd = open(cx, addr, dir, O_DIRECTORY, 0).unwrap();
+                write_cstr(cx, addr, b"src");
+                let src = openat(cx, dirfd, addr, O_CREAT | O_RDWR, 0o666).unwrap() as i32;
+                write_cstr(cx, addr, b"dst");
+                let dst = openat(cx, dirfd, addr, O_CREAT | O_RDWR, 0o666).unwrap() as i32;
+                write(cx, src, addr, 3).unwrap();
+                put(cx, arg, [0xac; 8]).unwrap();
+                set_inode_flags(cx, dst, arg, IMMUTABLE | NODUMP | NOATIME).unwrap();
+                ioctl(cx, dst, FS_IOC_GETFLAGS, arg).unwrap();
+                assert_eq!(
+                    get::<8>(cx, arg).unwrap(),
+                    [0xd0, 0, 0, 0, 0xac, 0xac, 0xac, 0xac]
+                );
+                statx(cx, dirfd, addr, 0, 0, arg).unwrap();
+                assert_eq!(
+                    u64::from_le_bytes(get(cx, arg + 8).unwrap()),
+                    u64::from(IMMUTABLE | NODUMP)
+                );
+                assert_eq!(
+                    u64::from_le_bytes(get(cx, arg + 56).unwrap()),
+                    u64::from(STATX)
+                );
+                let denied = Err(Errno::EPERM);
+                write_cstr(cx, addr + 64, b"other");
+                assert_eq!(openat(cx, dirfd, addr, O_WRONLY, 0), denied);
+                assert_eq!(faccessat(cx, dirfd, addr, MAY_WRITE, 0), denied);
+                assert_eq!(unlinkat(cx, dirfd, addr, 0), denied);
+                assert_eq!(renameat2(cx, dirfd, addr, dirfd, addr + 64, 0), denied);
+                assert_eq!(linkat(cx, dirfd, addr, dirfd, addr + 64, 0), denied);
+                assert_eq!(fchmod(cx, dst, 0o600), denied);
+                assert_eq!(fchown(cx, dst, 0, 0), denied);
+                assert_eq!(utimensat(cx, dst, 0, 0, 0), denied);
+                assert_eq!(ftruncate(cx, dst, 12), denied);
+                write_cstr(cx, addr + 128, &[dir, b"/dst"].concat());
+                assert_eq!(truncate(cx, addr + 128, 12), denied);
+                assert_eq!(fallocate(cx, dst, 0, 0, 32), denied);
+                assert_eq!(write(cx, dst, addr, 1), denied);
+                assert_eq!(copy_file_range(cx, src, 0, dst, 0, 1, 0), denied);
+                assert_eq!(sendfile(cx, dst, src, 0, 1), denied);
+                assert_eq!(ioctl(cx, dst, FICLONE, src as u64), denied);
+                set_inode_flags(cx, dst, arg, APPEND).unwrap();
+                assert_eq!(openat(cx, dirfd, addr, O_WRONLY, 0), denied);
+                assert_eq!(openat(cx, dirfd, addr, O_RDONLY | O_TRUNC, 0), denied);
+                let append = openat(cx, dirfd, addr, O_RDWR | O_APPEND, 0).unwrap() as i32;
+                assert_eq!(fcntl(cx, append, F_SETFL, 0), denied);
+                assert_eq!(
+                    copy_file_range(cx, src, 0, append, 0, 1, 0),
+                    Err(Errno::EBADF)
+                );
+                assert_eq!(copy_file_range(cx, src, 0, dst, 0, 1, 0), denied);
+                assert_eq!(fallocate(cx, dst, 3, 0, 32), denied);
+                assert_eq!(utimensat(cx, dst, 0, 0, 0), Ok(0));
+                assert_eq!(pwrite(cx, dst, addr, 1, 0), Ok(1));
+                assert_eq!(pwrite(cx, dst, addr + 1, 1, 0), Ok(1));
+                assert_eq!(pread(cx, dst, arg, 2, 0), Ok(2));
+                assert_eq!(&get::<2>(cx, arg).unwrap(), b"ds");
+                assert_eq!(cx.fds().get(dst).unwrap().borrow().pos, 0);
+                set_inode_flags(cx, dst, arg, 0).unwrap();
+                set_inode_flags(cx, dirfd, arg, APPEND).unwrap();
+                write_cstr(cx, addr, b"sub");
+                mkdirat(cx, dirfd, addr, 0o755).unwrap();
+                assert_eq!(unlinkat(cx, dirfd, addr, AT_REMOVEDIR), denied);
+                set_inode_flags(cx, dirfd, arg, IMMUTABLE).unwrap();
+                assert_eq!(mkdirat(cx, dirfd, addr + 64, 0o777), denied);
+                assert_eq!(
+                    openat(cx, dirfd, addr + 64, O_CREAT | O_RDWR, 0o600),
+                    denied
+                );
+                set_inode_flags(cx, dirfd, arg, 0).unwrap();
+                let sub = openat(cx, dirfd, addr, O_DIRECTORY, 0).unwrap() as i32;
+                set_inode_flags(cx, sub, arg, IMMUTABLE).unwrap();
+                assert_eq!(unlinkat(cx, dirfd, addr, AT_REMOVEDIR), denied);
+            }
+        });
+    }
+
+    #[test]
+    fn overlay_flag_ioctl_reads_the_lower_and_changes_only_the_upper() {
+        with_guest(0, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            let store = vfs.store();
+            let root = crate::vfs::store::ROOT;
+            let lower = store.mkdir(root, b"lower", 0o755, 0, 0).unwrap();
+            let upper = store.mkdir(root, b"upper", 0o755, 0, 0).unwrap();
+            let (ino, _) = store.create_file(lower, b"file", 0o644, 0, 0).unwrap();
+            store.set_flags(ino, inode_flags::NODUMP).unwrap();
+            let point = mountpoint(&vfs, b"merged");
+            vfs.new_overlay(
+                point,
+                0,
+                b"overlay".to_vec(),
+                ((Some(upper), vec![lower]), (0, 0), Vec::new()),
+                overlay::Options::default(),
+            );
+            let fd = open(cx, addr, b"/merged/file", oflags::O_RDONLY, 0).unwrap();
+            ioctl(cx, fd, FS_IOC_GETFLAGS, addr).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(get(cx, addr).unwrap()),
+                inode_flags::NODUMP
+            );
+            assert_eq!(store.lookup(upper, b"file").unwrap(), None);
+            set_inode_flags(cx, fd, addr, inode_flags::IMMUTABLE).unwrap();
+            assert_eq!(store.attrs(ino).unwrap().flags, inode_flags::NODUMP);
+            let up = store.lookup(upper, b"file").unwrap().unwrap();
+            assert_eq!(store.attrs(up).unwrap().flags, inode_flags::IMMUTABLE);
+            assert_eq!(
+                open(cx, addr, b"/merged/file", oflags::O_RDWR, 0),
+                Err(Errno::EPERM)
+            );
+            write_cstr(cx, addr, b"");
+            statx(cx, fd, addr, AT_EMPTY_PATH, 0, addr + 256).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(get(cx, addr + 264).unwrap()),
+                u64::from(inode_flags::IMMUTABLE)
+            );
+        });
+    }
+
+    #[test]
+    fn inode_flag_ioctl_checks_owner_capability_mount_and_file_type() {
+        use inode_flags::*;
+        with_guest(0, |cx, addr, _| {
+            let fd = open(
+                cx,
+                addr,
+                b"/tmp/file",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o666,
+            )
+            .unwrap();
+            let root = cx.cred();
+            let mut cred = root.clone();
+            cred.cap_effective &= !(1 << cap::LINUX_IMMUTABLE);
+            cx.set_cred(cred.clone());
+            assert_eq!(set_inode_flags(cx, fd, addr, IMMUTABLE), Err(Errno::EPERM));
+            set_inode_flags(cx, fd, addr, NODUMP).unwrap();
+            cred.fsuid = 123;
+            cred.cap_effective = 0;
+            cx.set_cred(cred.clone());
+            assert_eq!(set_inode_flags(cx, fd, addr, NOATIME), Err(Errno::EPERM));
+            cred.cap_effective = 1 << cap::FOWNER;
+            cx.set_cred(cred);
+            set_inode_flags(cx, fd, addr, NOATIME).unwrap();
+            cx.set_cred(root);
+            assert_eq!(
+                set_inode_flags(cx, fd, addr, 0x1000),
+                Err(Errno::EOPNOTSUPP)
+            );
+            bind_tmp(&cx.vfs().unwrap(), b"ro", ms::RDONLY);
+            let ro = open(cx, addr, b"/ro/file", oflags::O_RDONLY, 0).unwrap();
+            assert_eq!(set_inode_flags(cx, ro, addr, 0), Err(Errno::EROFS));
+            pipe2(cx, addr, 0).unwrap();
+            let pipe = i32::from_le_bytes(get(cx, addr).unwrap());
+            assert_eq!(ioctl(cx, pipe, FS_IOC_GETFLAGS, addr), Err(Errno::ENOTTY));
+            write_cstr(cx, addr, b"mem");
+            let mem = memfd_create(cx, addr, 0).unwrap() as i32;
+            set_inode_flags(cx, mem, addr, IMMUTABLE).unwrap();
+            assert_eq!(write(cx, mem, addr, 1), Err(Errno::EPERM));
+        });
+    }
+
+    #[test]
+    fn store_rename_preflight_precedes_write_permission() {
+        with_guest(1000, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            let store = vfs.store();
+            let root = crate::vfs::store::ROOT;
+            let dir = store.mkdir(root, b"locked", 0o555, 0, 0).unwrap();
+            let child = store.mkdir(dir, b"sub", 0o555, 0, 0).unwrap();
+            let (file, _) = store.create_file(dir, b"file", 0o644, 0, 0).unwrap();
+            store.link(dir, b"alias", file).unwrap();
+            store.create_file(child, b"file", 0o644, 0, 0).unwrap();
+            let mut rename = |old: &[u8], new: &[u8], flags| {
+                write_cstr(cx, addr, old);
+                write_cstr(cx, addr + 128, new);
+                renameat2(cx, AT_FDCWD, addr, AT_FDCWD, addr + 128, flags)
+            };
+            assert_eq!(
+                rename(b"/locked/missing", b"/locked/file", RENAME_NOREPLACE),
+                Err(Errno::ENOENT)
+            );
+            assert_eq!(
+                rename(b"/locked/file/", b"/locked/sub", RENAME_NOREPLACE),
+                Err(Errno::EEXIST)
+            );
+            assert_eq!(
+                rename(b"/locked/file", b"/locked/miss", RENAME_EXCHANGE),
+                Err(Errno::ENOENT)
+            );
+            assert_eq!(
+                rename(b"/locked/sub", b"/locked/sub/new", 0),
+                Err(Errno::EINVAL)
+            );
+            assert_eq!(
+                rename(b"/locked/sub/file", b"/locked/sub", 0),
+                Err(Errno::ENOTEMPTY)
+            );
+            assert_eq!(
+                rename(b"/locked/sub/file", b"/locked/sub", RENAME_EXCHANGE),
+                Err(Errno::EINVAL)
+            );
+            assert_eq!(rename(b"/locked/file", b"/locked/alias", 0), Ok(0));
+            assert_eq!(
+                rename(b"/locked/file", b"/locked/alias", RENAME_EXCHANGE),
+                Ok(0)
+            );
+            assert_eq!(
+                rename(b"/locked/file", b"/locked/alias/", 0),
+                Err(Errno::ENOTDIR)
+            );
+            assert_eq!(
+                rename(b"/locked/file", b"/locked/miss", 0),
+                Err(Errno::EACCES)
+            );
+            bind_tmp(&vfs, b"ro", ms::RDONLY);
+            let tmp = store.lookup(root, b"tmp").unwrap().unwrap();
+            store.create_file(tmp, b"x", 0o644, 0, 0).unwrap();
+            assert_eq!(rename(b"/ro/x", b"/ro/x", 0), Err(Errno::EROFS));
+        });
+    }
+
+    #[test]
     fn cached_statx_agrees_with_the_slow_path() {
         with_guest(0, |cx, addr, cpu| {
             let buf = addr + 512;
@@ -11148,6 +11815,22 @@ mod tests {
             assert!(fast.syscall(cx.shared, cx.task, cpu));
             assert_eq!(cpu.state().x[0], 0);
             assert_eq!(get::<256>(cx, buf).unwrap(), slow);
+            let tmp = lookup_at(cx, AT_FDCWD, b"/tmp", true)
+                .unwrap()
+                .ino()
+                .unwrap();
+            cx.vfs()
+                .unwrap()
+                .store()
+                .set_flags(tmp, inode_flags::NODUMP)
+                .unwrap();
+            cpu.state_mut().x[0] = AT_FDCWD as u64;
+            assert!(!fast.syscall(cx.shared, cx.task, cpu));
+            statx(cx, AT_FDCWD, addr, 0, 0x17ff, buf).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(get(cx, buf + 8).unwrap()),
+                u64::from(inode_flags::NODUMP)
+            );
         });
     }
 

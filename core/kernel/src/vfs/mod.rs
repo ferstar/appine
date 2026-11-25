@@ -23,6 +23,7 @@ pub mod store;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use crate::cell::RefCell;
@@ -533,8 +534,112 @@ pub(crate) mod resolve {
     pub const SCOPED: u64 = BENEATH | IN_ROOT;
 }
 
+#[derive(Hash, Eq, PartialEq)]
+enum AnonKey {
+    Pipe(u64),
+    Socket(u64),
+}
+
+pub(crate) enum AnonTarget {
+    Pipe(Rc<RefCell<crate::pipe::Pipe>>),
+    Socket(Rc<RefCell<crate::net::Socket>>),
+}
+
+enum AnonWeak {
+    Pipe(Weak<RefCell<crate::pipe::Pipe>>),
+    Socket(Weak<RefCell<crate::net::Socket>>),
+}
+
+struct AnonEntry {
+    attrs: AnonAttrs,
+    object: AnonWeak,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AnonAttrs {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub atime_ns: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+}
+
+impl AnonTarget {
+    fn key(&self) -> AnonKey {
+        match self {
+            Self::Pipe(p) => AnonKey::Pipe(p.borrow().ino),
+            Self::Socket(s) => AnonKey::Socket(crate::pseudo::socket_ino(s)),
+        }
+    }
+
+    fn entry(&self, cred: &Cred) -> AnonEntry {
+        let (mode, uid, gid, now, object) = match self {
+            Self::Pipe(p) => (
+                mode::S_IFIFO | 0o600,
+                cred.fsuid,
+                cred.fsgid,
+                crate::tty::wall_ns(),
+                AnonWeak::Pipe(Rc::downgrade(p)),
+            ),
+            Self::Socket(s) => {
+                let sock = s.borrow();
+                let uid = sock.uid();
+                let gid = if uid == cred.fsuid {
+                    cred.fsgid
+                } else if let crate::net::Socket::Unix(u) = &*sock {
+                    u.peer_cred.filter(|c| c.uid == uid).map_or(0, |c| c.gid)
+                } else {
+                    0
+                };
+                (
+                    mode::S_IFSOCK | 0o777,
+                    uid,
+                    gid,
+                    0,
+                    AnonWeak::Socket(Rc::downgrade(s)),
+                )
+            }
+        };
+        AnonEntry {
+            object,
+            attrs: AnonAttrs {
+                mode,
+                uid,
+                gid,
+                atime_ns: now,
+                mtime_ns: now,
+                ctime_ns: now,
+            },
+        }
+    }
+
+    pub(crate) fn stat(&self, vfs: Option<&Vfs>, cred: &Cred) -> Stat {
+        let attrs = match vfs {
+            Some(vfs) => vfs.anon_attrs(self, cred, |a| *a),
+            None => self.entry(cred).attrs,
+        };
+        let ino = match self.key() {
+            AnonKey::Pipe(i) | AnonKey::Socket(i) => i,
+        };
+        Stat {
+            ino,
+            nlink: 1,
+            mode: attrs.mode,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            atime_ns: attrs.atime_ns,
+            mtime_ns: attrs.mtime_ns,
+            ctime_ns: attrs.ctime_ns,
+            ..Stat::default()
+        }
+    }
+}
+
 /// A virtual filesystem instance.
 pub struct Vfs {
+    anon: RefCell<HashMap<AnonKey, AnonEntry>>,
+    anon_prune_at: std::cell::Cell<usize>,
     store: Store,
     /// Sparse lengths that the store filesystem could not represent for a memfd.
     memfd_sizes: RefCell<HashMap<Ino, u64>>,
@@ -1250,7 +1355,12 @@ impl Cached {
     ) -> Option<Result<Stat, Errno>> {
         let r = self.meta.reader()?;
         match self.walk(&r, root, cwd, path, follow)? {
-            Ok(ino) => r.stat(ino).map(Ok),
+            // The no-BKL statx encoder takes only the basic stat bytes. Let the syscall
+            // carry the inode flags through resolution when any statx attribute is set.
+            Ok(ino) => r
+                .stat(ino)
+                .filter(|st| st.flags & store::inode_flags::STATX == 0)
+                .map(Ok),
             Err(e) => Some(Err(e)),
         }
     }
@@ -1383,6 +1493,46 @@ impl<'p> Pending<'p> {
 }
 
 impl Vfs {
+    pub(crate) fn anon_attrs<R>(
+        &self,
+        target: &AnonTarget,
+        cred: &Cred,
+        f: impl FnOnce(&mut AnonAttrs) -> R,
+    ) -> R {
+        let mut table = self.anon.borrow_mut();
+        let key = target.key();
+        if let Some(entry) = table.get_mut(&key) {
+            return f(&mut entry.attrs);
+        }
+        // A weak socket reference reserves its allocation (and therefore its inode number).
+        // Base the next sweep on live entries, amortizing the scan across insertions.
+        if table.len() >= self.anon_prune_at.get() {
+            table.retain(|_, e| match &e.object {
+                AnonWeak::Pipe(p) => p.strong_count() != 0,
+                AnonWeak::Socket(s) => s.strong_count() != 0,
+            });
+            self.anon_prune_at
+                .set(256.max(table.len().saturating_mul(2)));
+        }
+        f(&mut table.entry(key).or_insert_with(|| target.entry(cred)).attrs)
+    }
+
+    pub(crate) fn pipe_io_time(&self, pipe: &crate::pipe::Pipe, write: bool) {
+        // A named FIFO uses a store inode number, which can equal an anonymous pipe number.
+        if pipe.fifo.is_some() {
+            return;
+        }
+        if let Some(entry) = self.anon.borrow_mut().get_mut(&AnonKey::Pipe(pipe.ino)) {
+            let now = crate::tty::wall_ns();
+            if write {
+                entry.attrs.mtime_ns = now;
+                entry.attrs.ctime_ns = now;
+            } else {
+                entry.attrs.atime_ns = now;
+            }
+        }
+    }
+
     /// Opens the inode store in `dir` as the root filesystem, adds the standard device nodes,
     /// and mounts the boot filesystems (the same as systemd and container runtimes mount):
     /// procfs; a tmpfs on `/dev` (the standard device nodes are created in it,
@@ -1558,6 +1708,8 @@ impl Vfs {
                 std::rc::Rc::new(std::cell::Cell::new(1)),
             )])),
             expiring: std::cell::Cell::new(0),
+            anon: RefCell::default(),
+            anon_prune_at: std::cell::Cell::new(256),
             removed_dirs: RefCell::default(),
             memfd_sizes: RefCell::default(),
             tmpfs_file_ranges: RefCell::default(),
@@ -5471,6 +5623,26 @@ mod tests {
         s.symlink(ROOT, b"slash", b"bin/busybox/", 0, 0).unwrap();
         drop(s);
         (Vfs::open(&dir).unwrap(), dir)
+    }
+
+    #[test]
+    fn anonymous_metadata_prunes_dead_objects_and_ignores_named_fifos() {
+        use crate::pipe::{PIPE_BUF, Pipe, PipeEnd};
+        let (vfs, dir) = sample("anonymous-inodes");
+        let (r, _w) = PipeEnd::pair(PIPE_BUF);
+        let fifo = Pipe::fifo(r.pipe.borrow().ino, PIPE_BUF);
+        let live = AnonTarget::Pipe(r.pipe.clone());
+        let cred = Cred::root();
+        vfs.anon_attrs(&live, &cred, |a| a.atime_ns = 1);
+        vfs.pipe_io_time(&fifo.borrow(), false);
+        for _ in 0..512 {
+            let (r, _) = PipeEnd::pair(PIPE_BUF);
+            vfs.anon_attrs(&AnonTarget::Pipe(r.pipe.clone()), &cred, |_| ());
+        }
+        assert!(vfs.anon.borrow().len() <= 256);
+        assert_eq!(live.stat(Some(&vfs), &cred).atime_ns, 1);
+        drop(vfs);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
