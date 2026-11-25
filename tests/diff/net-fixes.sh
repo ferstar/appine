@@ -89,7 +89,6 @@ echo 0 > /proc/sys/net/ipv6/conf/default/accept_dad
 ip link set lo up
 ip link add d0 type dummy; ip link set d0 up
 ip link add d1 type dummy; ip link set d1 up
-ip link add d2 type dummy
 ip addr add 10.1.0.1/24 dev d0
 ip addr add 10.2.0.1/24 dev d1
 ip -6 addr add fd00::1/64 dev d0 nodad
@@ -98,13 +97,14 @@ ip route add default via 10.2.0.254 dev d1
 ip route add 10.9.0.0/16 dev d1
 ip -6 route add fd09::/64 via fd01::9 dev d1
 echo 0 > /proc/sys/net/ipv4/ip_forward
+# Down/unaddressed iif (EXDEV on Linux 6.1/6.8, collapsed to EINVAL on newer kernels after
+# ip_route_input_rcu switched to skb_drop_reason) is covered in tests/guest/net_regressions.c.
 for cmd in \
   "ip route get 10.1.0.1 from 10.1.0.5 iif d0" \
   "ip route get 10.1.0.1 iif d0" \
   "ip route get 10.9.0.5 from 10.1.0.5 iif d0" \
   "ip route get 10.1.0.255 from 10.1.0.5 iif d0" \
   "ip route get 127.0.0.1 from 10.1.0.5 iif d0" \
-  "ip route get 10.1.0.1 from 10.1.0.5 iif d2" \
   "ip -6 route get fd00::1 from fd00::5 iif d0" \
   "ip -6 route get fd09::5 from fd00::5 iif d0" \
   "ip -6 route get fd09::5 iif d0" \

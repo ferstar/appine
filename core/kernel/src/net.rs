@@ -450,6 +450,7 @@ const NLM_F_APPEND: u16 = 0x800;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
+const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_GETADDR: u16 = 22;
@@ -1565,8 +1566,28 @@ impl NotifyCause {
         }
     }
 
+    /// Whether `ty` is an rtnetlink change request whose effects may emit notifications.
+    pub(crate) fn is_change(self) -> bool {
+        matches!(
+            self.ty,
+            RTM_NEWLINK
+                | RTM_DELLINK
+                | RTM_SETLINK
+                | RTM_NEWADDR
+                | RTM_DELADDR
+                | RTM_NEWROUTE
+                | RTM_DELROUTE
+        )
+    }
+
+    /// Whether this request can produce `NLM_F_ECHO` replies (address and route changes only;
+    /// Linux 6.1's `rtmsg_ifinfo` passes `nlh = NULL` and never echoes link notifications).
     pub(crate) fn wants_echo(self) -> bool {
         self.flags & NLM_F_ECHO != 0
+            && matches!(
+                self.ty,
+                RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE
+            )
     }
 }
 
@@ -1628,11 +1649,11 @@ impl Snapshot {
     /// changed in place ([`addr_identity`], [`route_identity`]) is only notified as new.
     ///
     /// Matches Linux 6.1 header fields:
-    /// - IPv4 `RTM_NEWADDR`/`RTM_DELADDR`, IPv4/IPv6 `RTM_NEWROUTE`/`RTM_DELROUTE`, and netlink
-    ///   link create (`RTM_NEWLINK` for a new link) / delete (`RTM_DELLINK`) copy the triggering
-    ///   request's `seq` and `port` and honour `NLM_F_ECHO`; IPv6 address notifications, link
-    ///   modifications and kernel-induced side effects (e.g. routes added/removed by an address
-    ///   change) carry `seq = 0, port = 0`.
+    /// - IPv4 `RTM_NEWADDR`/`RTM_DELADDR` and IPv4/IPv6 `RTM_NEWROUTE`/`RTM_DELROUTE` directly
+    ///   caused by the request copy `seq` and `port` and honour `NLM_F_ECHO`; link notifications
+    ///   (`RTM_NEWLINK`/`RTM_DELLINK`, emitted by Linux's `rtmsg_ifinfo` with `pid=0, seq=0` and
+    ///   no `nlh`), IPv6 address notifications, and kernel-induced side effects (e.g. routes
+    ///   added/removed by an address change) carry `seq = 0, port = 0` and are not echoed.
     /// - `RTM_NEWROUTE` carries `NLM_F_REPLACE` when replacing an existing route via
     ///   `NLM_F_REPLACE`, `NLM_F_CREATE | NLM_F_APPEND` when appending, and
     ///   `NLM_F_CREATE | NLM_F_EXCL` otherwise (including kernel-added routes).
@@ -1660,18 +1681,10 @@ impl Snapshot {
         };
         let mut out = Vec::new();
         for m in &self.links {
-            match find_link(&before.links, link_index(m)) {
-                None => out.push(note(
-                    RTNLGRP_LINK,
-                    RTM_NEWLINK,
-                    0,
-                    m,
-                    cause.ty == RTM_NEWLINK,
-                )),
-                Some(old) if without_stats(old) != without_stats(m) => {
-                    out.push(note(RTNLGRP_LINK, RTM_NEWLINK, 0, m, false));
-                }
-                Some(_) => {}
+            if find_link(&before.links, link_index(m))
+                .is_none_or(|old| without_stats(old) != without_stats(m))
+            {
+                out.push(note(RTNLGRP_LINK, RTM_NEWLINK, 0, m, false));
             }
         }
         // Addresses (hashed: a namespace can hold thousands of addresses and routes)
@@ -1746,13 +1759,7 @@ impl Snapshot {
         }
         for m in &before.links {
             if find_link(&self.links, link_index(m)).is_none() {
-                out.push(note(
-                    RTNLGRP_LINK,
-                    RTM_DELLINK,
-                    0,
-                    m,
-                    cause.ty == RTM_DELLINK,
-                ));
+                out.push(note(RTNLGRP_LINK, RTM_DELLINK, 0, m, false));
             }
         }
         out
@@ -3476,7 +3483,40 @@ mod tests {
         assert_eq!(hdr(&notes[0].msg), (RTM_DELROUTE, 0, 204, 888));
         assert!(notes[0].echo);
 
-        // 5. Link modification carries seq/port 0 and does not echo, even with NLM_F_ECHO.
+        // 5. Link create/move, modification, and deletion all carry seq/port 0 and do not echo
+        //    (matching Linux 6.1's rtmsg_ifinfo_build_skb / rtmsg_ifinfo_send).
+        let new_link_cause = NotifyCause {
+            ty: RTM_NEWLINK,
+            flags: NLM_F_CREATE | NLM_F_ECHO,
+            seq: 205,
+            port: 888,
+        };
+        assert!(new_link_cause.is_change() && !new_link_cause.wants_echo());
+        let just_lo = snap(std::slice::from_ref(&lo_if), &[]);
+        let with_eth = snap(&[lo_if.clone(), eth.clone()], &[]);
+        let notes = with_eth.changes(&just_lo, new_link_cause);
+        let new_link = notes
+            .iter()
+            .find(|n| hdr(&n.msg).0 == RTM_NEWLINK)
+            .expect("RTM_NEWLINK");
+        assert_eq!(hdr(&new_link.msg), (RTM_NEWLINK, 0, 0, 0));
+        assert!(!new_link.echo);
+
+        let del_link_cause = NotifyCause {
+            ty: RTM_DELLINK,
+            flags: NLM_F_ECHO,
+            seq: 206,
+            port: 888,
+        };
+        assert!(del_link_cause.is_change() && !del_link_cause.wants_echo());
+        let notes = just_lo.changes(&with_eth, del_link_cause);
+        let del_link = notes
+            .iter()
+            .find(|n| hdr(&n.msg).0 == RTM_DELLINK)
+            .expect("RTM_DELLINK");
+        assert_eq!(hdr(&del_link.msg), (RTM_DELLINK, 0, 0, 0));
+        assert!(!del_link.echo);
+
         eth.mtu = 1400;
         let after_mtu = snap(&[lo_if, eth], &[rt([10, 1, 0, 0], 2)]);
         let notes = after_mtu.changes(
@@ -3484,7 +3524,7 @@ mod tests {
             NotifyCause {
                 ty: RTM_NEWLINK,
                 flags: NLM_F_ECHO,
-                seq: 205,
+                seq: 207,
                 port: 888,
             },
         );

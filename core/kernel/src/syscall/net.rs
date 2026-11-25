@@ -4327,14 +4327,13 @@ impl crate::net::Host for KernelHost<'_> {
         let resolve = |attr: u16, value: u32| self.net_of(attr == 19, value);
         // What the namespaces being watched look like before and after a change request
         // (RTM_NEW, DEL and SETLINK, NEW and DELADDR, NEW and DELROUTE): it can change another
-        // namespace too (moving a link, a veth's peer). When NLM_F_ECHO is set, also snapshot
-        // the sender's namespace even if no multicast listener is subscribed.
+        // namespace too (moving a link, a veth's peer). When an echoable request sets NLM_F_ECHO,
+        // also snapshot the sender's namespace even if no multicast listener is subscribed.
         let cause = crate::net::NotifyCause::from_req(req, port);
-        let is_change = matches!(cause.ty, 16 | 17 | 19 | 20 | 21 | 24 | 25);
-        let echo = is_change && cause.wants_echo();
+        let echo = cause.wants_echo();
         let ns = self.ns();
         let mut extra_watched = Vec::new();
-        let watched: &[Rc<crate::nsproxy::NetNs>] = if !is_change {
+        let watched: &[Rc<crate::nsproxy::NetNs>] = if !cause.is_change() {
             &[]
         } else if echo && !self.watched.iter().any(|w| Rc::ptr_eq(w, &ns)) {
             extra_watched.extend(self.watched.iter().cloned());
