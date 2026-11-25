@@ -139,7 +139,7 @@ syscalls	proc_net_unix_test	9	*	-
 syscalls	proc_pid_coredump_test	5	*	-
 syscalls	proc_pid_oomscore_test	4	*	-
 syscalls	proc_pid_smaps_test	2	ProcPidSmapsTest.PrivateAnon:ProcPidSmapsTest.SharedAnon	-
-# EntryValues fails on the hosted arm64 runner. mm_mount_pseudo.c compares both auxv copies on Appine.
+# arm64 musl rewrites the stack's AT_HWCAP3 to AT_IGNORE on the hosted kernel. mm_mount_pseudo.c checks Appine.
 syscalls	proc_test	15	ProcPidCmdline.*:ProcSelfAuxv.*:ProcSelfCwd.Absolute:ProcSelfExe.Absolute:ProcSelfFd.NoncanonicalNames:ProcSelfFd.OpenFd:ProcSelfFdInfo.CorrectFds:ProcSelfFdInfo.Flags:ProcTest.NotFoundInRoot:ProcTest.RootInodeNumber:ProcThreadSelfTest.*	ProcSelfAuxv.EntryValues
 syscalls	pselect_test	9	*	PselectTest.Signal*
 syscalls	pwrite64_test	10	*	Pwrite64.AppendOnly

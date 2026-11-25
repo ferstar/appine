@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the split; latest change: directory locking across concurrent runs and legacy PID-lock recovery)
+> Maintained: 2026-11-26 (targeted verification only since the split; latest change: arm64 musl startup and the hosted ProcSelfAuxv.EntryValues exclusion)
 
 ## Responsibilities
 
@@ -192,6 +192,20 @@ benchmarks, surveys and crash testing remain `harness`.
   of 1 MiB, `fs.suid_dumpable` 2, docker's stack limit). Cases print only what both kernels give
   (relations instead of such values, explicit mount options), the suite cases skip the rest, and
   6.1's answers that newer kernels changed are checked by `tests/guest` programs instead.
+- `ProcSelfAuxv.EntryValues` stays excluded from the shared selection. On the hosted arm64
+  kernel, Linux supplies `AT_HWCAP3` (29) in both auxv copies. During startup, musl 1.2.6's
+  `__set_thread_area` rewrites that stack entry to `(AT_IGNORE, 0)`. Procfs retains the
+  kernel's original. gVisor reads procfs into a map, checks key uniqueness, then walks the
+  stack after `environ`. The membership check fails for `AT_IGNORE`. The value lookup inserts
+  that key with value zero, so its value matches but the final size check fails. Running the
+  shipped binary on the runner's `7.0.0-1017-azure` kernel under QEMU Neoverse-N2 gave 23
+  stack entries and 24 map keys. Musl also masks some `AT_HWCAP` and `AT_HWCAP2` bits, so the
+  value check can fail on CPUs advertising those bits. The archived hosted runs retained only
+  per-test results. `EntryPresence` and `Platform` passed on both sides.
+- Appine's Linux 6.1 auxv uses `AT_HWCAP` and `AT_HWCAP2` with guest feature bits that musl
+  preserves. The loader saves the same words it writes to the initial stack, and procfs exports
+  those saved words. The guest test in `mm_mount_pseudo.c` checks both copies in order through
+  `AT_NULL` and checks for EOF immediately after it.
 - The native side of a case using loop devices (`loop`) shares the host's devices: it takes
   whatever loop-control hands out, makes its own node for it (a new device has no node in the
   container's `/dev`), prints no device numbers, and waits for an autoclear device to be unbound
@@ -223,9 +237,6 @@ None recorded.
 
 ## Open questions
 
-- Which auxv assertion in gVisor's `ProcSelfAuxv.EntryValues` failed on the hosted arm64 runner?
-  The test is excluded from the shared selection. The guest suite checks the initial stack
-  against `/proc/self/auxv` on both Appine tiers.
 - Should difftest pass `APPINE_ON_BUG` and `APPINE_LOG` through, as it does `APPINE_DBT_REGS`?
 
 ## To verify
