@@ -38,12 +38,14 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -544,6 +546,13 @@ static void test_overlay_fifo_fstat(void)
           fst2.st_mode, st2.st_mode);
     CHECK((fst2.st_mode & 0777) == 0600, "fifo fstat reflects updated mode");
 
+    /* Overlay FIFO fstatfs must report OVERLAYFS_SUPER_MAGIC, not PIPEFS_MAGIC */
+    struct statfs sf_ovl;
+    CHECK(fstatfs(fd, &sf_ovl) == 0, "fstatfs overlay fifo");
+    CHECK((unsigned long)sf_ovl.f_type == 0x794c7630UL,
+          "overlay fifo fstatfs must report OVERLAYFS_SUPER_MAGIC (got 0x%lx)",
+          (unsigned long)sf_ovl.f_type);
+
     close(fd);
     test_fifo_last_close("/tmp/ovl_f/merged", "/tmp/ovl_f/merged/watch-fifo");
     CHECK(umount2("/tmp/ovl_f/merged", 0) == 0, "umount ovl_f");
@@ -882,7 +891,9 @@ enum {
     OP_GETATTR = 3,
     OP_SETATTR = 4,
     OP_MKNOD = 8,
+    OP_MKDIR = 9,
     OP_UNLINK = 10,
+    OP_RMDIR = 11,
     OP_OPEN = 14,
     OP_WRITE = 16,
     OP_RELEASE = 18,
@@ -891,6 +902,8 @@ enum {
     OP_REMOVEXATTR = 24,
     OP_FLUSH = 25,
     OP_INIT = 26,
+    OP_OPENDIR = 27,
+    OP_RELEASEDIR = 29,
     OP_CREATE = 35,
 
     FATTR_MODE = 1U << 0,
@@ -1032,7 +1045,8 @@ static void *fuse_reg_daemon(void *arg)
             reply_body(out, hdr, &e, sizeof(e));
             break;
         }
-        case OP_OPEN: {
+        case OP_OPEN:
+        case OP_OPENDIR: {
             struct fuse_open_out o = {.fh = in.nodeid};
             reply_body(out, hdr, &o, sizeof(o));
             break;
@@ -1068,7 +1082,20 @@ static void *fuse_reg_daemon(void *arg)
             reply_body(out, hdr, &a, sizeof(a));
             break;
         }
-        case OP_UNLINK: {
+        case OP_MKDIR: {
+            struct fuse_file *slot =
+                fuse_alloc_file(c, (const char *)(buf + sizeof(in) + 8), S_IFDIR | 0755);
+            if (!slot) {
+                hdr->error = -ENOSPC;
+                break;
+            }
+            struct fuse_entry_out e;
+            fill_entry_out(&e, slot);
+            reply_body(out, hdr, &e, sizeof(e));
+            break;
+        }
+        case OP_UNLINK:
+        case OP_RMDIR: {
             struct fuse_file *f = fuse_find_name(c, (const char *)(buf + sizeof(in)));
             if (!f)
                 hdr->error = -ENOENT;
@@ -1082,6 +1109,7 @@ static void *fuse_reg_daemon(void *arg)
         case OP_SETXATTR:
         case OP_REMOVEXATTR:
         case OP_RELEASE:
+        case OP_RELEASEDIR:
         case OP_FLUSH:
             break;
         default:
@@ -1091,6 +1119,24 @@ static void *fuse_reg_daemon(void *arg)
         (void)write(c->devfd, out, hdr->len);
     }
     return NULL;
+}
+
+static void check_cwd_link(const char *expected)
+{
+    char buf[256];
+    ssize_t n = readlink("/proc/self/cwd", buf, sizeof(buf) - 1);
+    CHECK(n > 0, "readlink /proc/self/cwd");
+    buf[n] = '\0';
+    CHECK(strcmp(buf, expected) == 0, "/proc/self/cwd expected '%s', got '%s'", expected, buf);
+}
+
+static void check_removed_cwd(const char *expected)
+{
+    char buf[256];
+    errno = 0;
+    CHECK(getcwd(buf, sizeof(buf)) == NULL && errno == ENOENT,
+          "getcwd for '%s' must fail with ENOENT", expected);
+    check_cwd_link(expected);
 }
 
 static void test_fuse_inotify_and_sync(void)
@@ -1193,7 +1239,49 @@ static void test_fuse_inotify_and_sync(void)
     CHECK(ctx.fsync_ops > prev_fsync, "splice into O_SYNC FUSE file must call FUSE_FSYNC");
     close(sp[0]);
     close(sp[1]);
+
+    /* FIONREAD on FUSE regular file: size - pos (including stale-attr FUSE_RETRY and past-EOF) */
+    int avail = -999;
+    CHECK(ioctl(sfd, FIONREAD, &avail) == 0 && avail == 0,
+          "FIONREAD at EOF on FUSE file (got %d)", avail);
+    CHECK(lseek(sfd, 0, SEEK_SET) == 0, "seek FUSE file to 0");
+    CHECK(ioctl(sfd, FIONREAD, &avail) == 0 && avail == 8,
+          "FIONREAD at offset 0 on 8-byte FUSE file (got %d)", avail);
+    CHECK(lseek(sfd, 3, SEEK_SET) == 3, "seek FUSE file to 3");
+    CHECK(ioctl(sfd, FIONREAD, &avail) == 0 && avail == 5,
+          "FIONREAD at offset 3 on 8-byte FUSE file (got %d)", avail);
+    CHECK(lseek(sfd, 12, SEEK_SET) == 12, "seek FUSE file past EOF");
+    CHECK(ioctl(sfd, FIONREAD, &avail) == 0 && avail == -4,
+          "FIONREAD past EOF on FUSE file must be negative (got %d)", avail);
+    CHECK(ftruncate(sfd, 2) == 0, "ftruncate FUSE file to 2");
+    CHECK(ioctl(sfd, FIONREAD, &avail) == 0 && avail == -10,
+          "FIONREAD after ftruncate on FUSE file (got %d)", avail);
+    CHECK(lseek(sfd, 0, SEEK_SET) == 0, "seek FUSE file back to 0");
+    CHECK(ioctl(sfd, FIONREAD, &avail) == 0 && avail == 2,
+          "FIONREAD at 0 after ftruncate on FUSE file (got %d)", avail);
+
+    /* FIONREAD on FUSE directory stays ENOTTY, and O_PATH on FUSE file stays EBADF */
+    int fdir = open("/tmp/fuse_ino", O_RDONLY | O_DIRECTORY);
+    CHECK(fdir >= 0, "open fuse dir");
+    errno = 0;
+    CHECK(ioctl(fdir, FIONREAD, &avail) < 0 && errno == ENOTTY,
+          "FIONREAD on FUSE dir must return ENOTTY");
+    close(fdir);
+
+    int fpath = open("/tmp/fuse_ino/syncf", O_PATH);
+    CHECK(fpath >= 0, "open fuse syncf O_PATH");
+    errno = 0;
+    CHECK(ioctl(fpath, FIONREAD, &avail) < 0 && errno == EBADF,
+          "FIONREAD on O_PATH FUSE file must return EBADF");
+    close(fpath);
     close(sfd);
+
+    /* Removed cwd on FUSE: getcwd is ENOENT, readlink("/proc/self/cwd") appends " (deleted)" */
+    CHECK(mkdir("/tmp/fuse_ino/sub", 0755) == 0, "mkdir fuse sub");
+    CHECK(chdir("/tmp/fuse_ino/sub") == 0, "chdir fuse sub");
+    CHECK(rmdir("/tmp/fuse_ino/sub") == 0, "rmdir fuse sub");
+    check_removed_cwd("/tmp/fuse_ino/sub (deleted)");
+    CHECK(chdir("/") == 0, "chdir / after fuse cwd test");
 
     CHECK(umount2("/tmp/fuse_ino", 0) == 0, "umount fuse_ino");
     pthread_join(th, NULL);
@@ -1810,6 +1898,144 @@ static void rm_rf(const char *path)
     }
 }
 
+static void test_fs_io_compat_fixes(void)
+{
+    const unsigned long PIPEFS_MAGIC = 0x50495045UL;
+    const unsigned long TMPFS_MAGIC = 0x01021994UL;
+
+    /* 1. fstatfs of named FIFO vs anonymous pipe */
+    int pp[2];
+    CHECK(pipe(pp) == 0, "pipe for fstatfs");
+    struct statfs sf_pipe;
+    CHECK(fstatfs(pp[0], &sf_pipe) == 0, "fstatfs anonymous pipe");
+    CHECK((unsigned long)sf_pipe.f_type == PIPEFS_MAGIC,
+          "anonymous pipe fstatfs must report PIPEFS_MAGIC (got 0x%lx)",
+          (unsigned long)sf_pipe.f_type);
+    close(pp[0]);
+    close(pp[1]);
+
+    CHECK(mkdir("/tmp/compat", 0755) == 0, "mkdir /tmp/compat");
+    CHECK(mkfifo("/tmp/compat/fifo", 0644) == 0, "mkfifo /tmp/compat/fifo");
+    int ffd = open("/tmp/compat/fifo", O_RDWR);
+    CHECK(ffd >= 0, "open store fifo O_RDWR");
+    struct statfs sf_path, sf_fd;
+    CHECK(statfs("/tmp/compat/fifo", &sf_path) == 0, "statfs store fifo");
+    CHECK(fstatfs(ffd, &sf_fd) == 0, "fstatfs store fifo");
+    CHECK((unsigned long)sf_fd.f_type != PIPEFS_MAGIC && sf_fd.f_type == sf_path.f_type,
+          "store fifo fstatfs must match statfs (got 0x%lx vs 0x%lx)",
+          (unsigned long)sf_fd.f_type, (unsigned long)sf_path.f_type);
+    CHECK(unlink("/tmp/compat/fifo") == 0, "unlink store fifo");
+    CHECK(fstatfs(ffd, &sf_fd) == 0 && sf_fd.f_type == sf_path.f_type,
+          "unlinked store fifo fstatfs must keep underlying fs magic");
+    close(ffd);
+
+    CHECK(mkdir("/tmp/compat/tmnt", 0755) == 0, "mkdir tmpfs mountpoint");
+    CHECK(mount("tmpfs", "/tmp/compat/tmnt", "tmpfs", MS_NOSUID | MS_NODEV, "size=1m") == 0,
+          "mount tmpfs for fifo fstatfs");
+    CHECK(mkfifo("/tmp/compat/tmnt/tfifo", 0644) == 0, "mkfifo tmpfs fifo");
+    int tfd = open("/tmp/compat/tmnt/tfifo", O_RDWR);
+    CHECK(tfd >= 0, "open tmpfs fifo");
+    CHECK(fstatfs(tfd, &sf_fd) == 0, "fstatfs tmpfs fifo");
+    CHECK((unsigned long)sf_fd.f_type == TMPFS_MAGIC,
+          "tmpfs fifo fstatfs must report TMPFS_MAGIC (got 0x%lx)", (unsigned long)sf_fd.f_type);
+    close(tfd);
+
+    /* 2. fadvise64 on O_PATH fds must fail with EBADF (before ESPIPE/EINVAL) */
+    int rfd = open("/tmp/compat/reg", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(rfd >= 0, "create /tmp/compat/reg");
+    CHECK(syscall(SYS_fadvise64, rfd, (off_t)0, (off_t)0, POSIX_FADV_NORMAL) == 0,
+          "fadvise64 on regular fd must succeed");
+    errno = 0;
+    CHECK(syscall(SYS_fadvise64, rfd, (off_t)0, (off_t)-1, POSIX_FADV_NORMAL) < 0 &&
+              errno == EINVAL,
+          "fadvise64 negative len must return EINVAL");
+    errno = 0;
+    CHECK(syscall(SYS_fadvise64, rfd, (off_t)0, (off_t)0, 99) < 0 && errno == EINVAL,
+          "fadvise64 bad advice must return EINVAL");
+    close(rfd);
+
+    int opath_reg = open("/tmp/compat/reg", O_PATH);
+    CHECK(opath_reg >= 0, "open reg O_PATH");
+    errno = 0;
+    CHECK(syscall(SYS_fadvise64, opath_reg, (off_t)0, (off_t)0, POSIX_FADV_NORMAL) < 0 &&
+              errno == EBADF,
+          "fadvise64 on O_PATH regular fd must return EBADF");
+    errno = 0;
+    CHECK(syscall(SYS_fadvise64, opath_reg, (off_t)0, (off_t)-1, 99) < 0 && errno == EBADF,
+          "fadvise64 on O_PATH fd must check EBADF before EINVAL");
+    close(opath_reg);
+
+    int opath_fifo = open("/tmp/compat/tmnt/tfifo", O_PATH);
+    CHECK(opath_fifo >= 0, "open fifo O_PATH");
+    errno = 0;
+    CHECK(syscall(SYS_fadvise64, opath_fifo, (off_t)0, (off_t)0, POSIX_FADV_NORMAL) < 0 &&
+              errno == EBADF,
+          "fadvise64 on O_PATH fifo fd must return EBADF before ESPIPE");
+    close(opath_fifo);
+
+    int rw_fifo = open("/tmp/compat/tmnt/tfifo", O_RDWR);
+    CHECK(rw_fifo >= 0, "open fifo O_RDWR for fadvise64");
+    errno = 0;
+    CHECK(syscall(SYS_fadvise64, rw_fifo, (off_t)0, (off_t)0, POSIX_FADV_NORMAL) < 0 &&
+              errno == ESPIPE,
+          "fadvise64 on open fifo must return ESPIPE");
+    close(rw_fifo);
+
+    /* 3. Removed cwd: getcwd is ENOENT while readlink("/proc/self/cwd") appends " (deleted)" */
+    CHECK(mkdir("/tmp/compat/a", 0755) == 0, "mkdir /tmp/compat/a");
+    CHECK(mkdir("/tmp/compat/a/b", 0755) == 0, "mkdir /tmp/compat/a/b");
+    CHECK(chdir("/tmp/compat/a/b") == 0, "chdir /tmp/compat/a/b");
+    check_cwd_link("/tmp/compat/a/b");
+
+    CHECK(rmdir("/tmp/compat/a/b") == 0, "rmdir /tmp/compat/a/b");
+    check_removed_cwd("/tmp/compat/a/b (deleted)");
+
+    /* Parent renamed after child removal */
+    CHECK(rename("/tmp/compat/a", "/tmp/compat/a2") == 0, "rename /tmp/compat/a -> a2");
+    check_removed_cwd("/tmp/compat/a2/b (deleted)");
+
+    /* Parent removed too (nested removal) */
+    CHECK(rmdir("/tmp/compat/a2") == 0, "rmdir /tmp/compat/a2");
+    check_removed_cwd("/tmp/compat/a2/b (deleted)");
+
+    /* fchdir into an already-removed directory */
+    CHECK(chdir("/") == 0, "chdir /");
+    CHECK(mkdir("/tmp/compat/fch", 0755) == 0, "mkdir /tmp/compat/fch");
+    int dfd = open("/tmp/compat/fch", O_RDONLY | O_DIRECTORY);
+    CHECK(dfd >= 0, "open /tmp/compat/fch");
+    CHECK(rmdir("/tmp/compat/fch") == 0, "rmdir /tmp/compat/fch while open");
+    CHECK(fchdir(dfd) == 0, "fchdir into removed dir");
+    close(dfd);
+    check_removed_cwd("/tmp/compat/fch (deleted)");
+
+    /* Empty cwd overwritten by rename */
+    CHECK(chdir("/") == 0, "chdir /");
+    CHECK(mkdir("/tmp/compat/r1", 0755) == 0 && mkdir("/tmp/compat/r2", 0755) == 0,
+          "mkdir r1 r2");
+    CHECK(chdir("/tmp/compat/r2") == 0, "chdir r2");
+    CHECK(rename("/tmp/compat/r1", "/tmp/compat/r2") == 0, "rename r1 over empty cwd r2");
+    check_removed_cwd("/tmp/compat/r2 (deleted)");
+
+    /* Tmpfs removed cwd */
+    CHECK(chdir("/") == 0, "chdir /");
+    CHECK(mkdir("/tmp/compat/tmnt/sub", 0755) == 0, "mkdir tmpfs sub");
+    CHECK(chdir("/tmp/compat/tmnt/sub") == 0, "chdir tmpfs sub");
+    CHECK(rmdir("/tmp/compat/tmnt/sub") == 0, "rmdir tmpfs sub");
+    check_removed_cwd("/tmp/compat/tmnt/sub (deleted)");
+    CHECK(chdir("/") == 0, "chdir /");
+    CHECK(umount2("/tmp/compat/tmnt", 0) == 0, "umount tmpfs");
+
+    /* Overlayfs removed cwd */
+    setup_overlay_dirs("/tmp/ovl_cwd");
+    mount_overlay("/tmp/ovl_cwd");
+    CHECK(mkdir("/tmp/ovl_cwd/merged/sub", 0755) == 0, "mkdir overlay sub");
+    CHECK(chdir("/tmp/ovl_cwd/merged/sub") == 0, "chdir overlay sub");
+    CHECK(rmdir("/tmp/ovl_cwd/merged/sub") == 0, "rmdir overlay sub");
+    check_removed_cwd("/tmp/ovl_cwd/merged/sub (deleted)");
+    CHECK(chdir("/") == 0, "chdir /");
+    CHECK(umount2("/tmp/ovl_cwd/merged", 0) == 0, "umount ovl_cwd");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "deleted-overlay-exe") == 0) {
@@ -1824,6 +2050,7 @@ int main(int argc, char **argv)
     static const char *const dirs[] = {
         "/tmp/ovl_l", "/tmp/ovl_t",    "/tmp/ovl_p", "/tmp/ovl_f",
         "/tmp/ino_core", "/tmp/fuse_ino", "/tmp/fio", "/tmp/ovl_exe",
+        "/tmp/compat", "/tmp/ovl_cwd",
     };
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
         rm_rf(dirs[i]);
@@ -1844,6 +2071,7 @@ int main(int argc, char **argv)
     test_anonymous_locks();
     test_splice_socket_offset();
     test_pipe_regressions();
+    test_fs_io_compat_fixes();
 
     printf("all ok\n");
     return 0;

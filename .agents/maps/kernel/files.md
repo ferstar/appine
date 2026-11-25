@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: O_PATH pins for deleted executable and fd magic links)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `FIONREAD` on FUSE regular files)
 
 ## Responsibilities
 
@@ -128,13 +128,13 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   slave description on all three.
 - ioctl: `O_PATH` is `EBADF`; then render-node DRM requests (`'d'`, `syscall/gpu.rs`),
   `FIOCLEX`/`FIONCLEX`/`FIONBIO`/`FIOASYNC`, the clone and dedupe requests (`kernel/fileio`),
-  socket owners and `FIONREAD` on regular inodes (store, tmpfs, procfs, sysfs and nsfs
+  socket owners and `FIONREAD` on regular inodes (store, tmpfs, procfs, sysfs, nsfs, FUSE
   files and message queues whose stat is a regular file: the size less the position, as an int,
-  negative past the end; not FUSE files) come before dispatch by kind (nsfs, `/dev/fuse`, seccomp
+  negative past the end) come before dispatch by kind (nsfs, `/dev/fuse`, seccomp
   listeners, terminals, sockets, loop devices, pipe and inotify `FIONREAD`, the random device);
   host fds pass only 15 termios, termios2, window-size and `FIONREAD` requests to the host.
   Anything else is `ENOTTY`, counted as an unimplemented path unless Linux refuses it there too
-  (terminal requests on other files, FUSE `FIONREAD` included).
+  (terminal requests on other files).
 
 ### Opening
 
@@ -286,8 +286,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
     comes first; overlay opens already do);
   - open_by_handle_at and memfds report no `IN_OPEN`, and cgroup2 files no `IN_CLOSE_*`; handles
     open a store inode through any store mount;
-  - table growth uses power-of-two capacity even when a lowered `nr_open` would cap Linux’s allocation;
-  - FIONREAD on a FUSE regular file is `ENOTTY`.
+  - table growth uses power-of-two capacity even when a lowered `nr_open` would cap Linux’s allocation.
 
 ## Open questions
 

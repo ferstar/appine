@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: proc memory transfers serialize shared file positions across page fills)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `fadvise64` rejects `O_PATH` descriptors with `EBADF`)
 
 ## Responsibilities
 
@@ -163,8 +163,9 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   host handle when the store has no object (a memfd's), a memfd never read-only; ftruncate breaks
   leases for a writable regular file, then `prepare_write`, then `EINVAL` unless writable and
   regular (`EBADF` on `O_PATH`), `RLIMIT_FSIZE` and seals, with no `ETXTBSY` check.
-- Cache hints and syncing: fadvise64 is `ESPIPE` on pipes and sockets and `EINVAL` for a negative
-  length or unknown advice, else a no-op; sync_file_range passes regular files with flags to the
+- Cache hints and syncing: fadvise64 rejects `O_PATH` fds with `EBADF` (via `io_file`) before
+  returning `ESPIPE` on pipes and sockets and `EINVAL` for a negative length or unknown advice,
+  else a no-op; sync_file_range passes regular files with flags to the
   host, directories succeed, other files are `ESPIPE`; readahead accepts readable regular files;
   cachestat asks the host for regular files and reports zeros for others. fsync and fdatasync
   (regular files, directories, host fds, FUSE files and loop devices, else `EINVAL`) sync the host
@@ -272,7 +273,7 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   - read, write, their vector forms and the chunked copies are not capped at `MAX_RW_COUNT`;
   - host stdio: positional I/O is `ESPIPE` on a regular host file, and a blocked write cannot be
     interrupted;
-  - fadvise64 on an `O_PATH` fd succeeds, and sync_file_range on a loop device is `ESPIPE`.
+  - sync_file_range on a loop device is `ESPIPE`.
 - **Error order in I/O calls:** pread and pwrite look up the fd before refusing a
   negative offset; fallocate checks its arguments before the fd, its mode after the fd's type, and
   on a socket is `ESPIPE` where 6.1 says `ENODEV`.

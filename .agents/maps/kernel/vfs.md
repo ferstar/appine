@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: cgroup2 attributes by path and descriptor)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: named FIFO `fstatfs` reports underlying filesystem and removed-cwd `/proc/<pid>/cwd` readlink appends ` (deleted)`)
 
 ## Responsibilities
 
@@ -147,8 +147,11 @@ capabilities (`kernel/cred`).
 - Back to paths: `reach` climbs through mount points (or the recorded dentry for mounts on files)
   and stops as unreachable at a namespace-tree root, detached root, tmpfs root, the store root
   inside a bind, a parentless synthetic node, another mount's overlay or FUSE root, or a forgotten
-  FUSE node; a deleted directory (a store one keeps its row without a name, an overlay one once
-  its name is removed) is `ENOENT` for getcwd and `/proc/<pid>/cwd`. mountinfo's `mounts_from`
+  FUSE node; a deleted directory (a store one keeps its row without a name while
+  `Vfs::removed_dirs` tracks its former name as long as a task's cwd, root or open directory/path
+  fd references it, an overlay one once its name is removed, and a FUSE one once `unlinked` is
+  set) is `ENOENT` for getcwd (`reach`), while `path_of` (`/proc/<pid>/{cwd,root}`) reconstructs
+  the path and appends ` (deleted)`. mountinfo's `mounts_from`
   does the same for every mount through an index built once and skips unreachable mounts. `getcwd`
   prefixes `(unreachable)`; `/proc/<pid>/{cwd,root}` are computed live against the reader's root;
   `/proc/<pid>/fd/N` follows renames of the opened name through its current dentry, relative to
@@ -246,9 +249,9 @@ capabilities (`kernel/cred`).
 - statfs: the store reports ext4's magic with the host's `statvfs` of the objects directory, tmpfs
   its magic and limits (recounted), an overlay overlayfs's magic with the store's capacity, FUSE
   what the daemon answers, synthetic nodes the magic of their kind with zero sizes; `f_flags` from
-  the mount plus the filesystem's read-only, sync and mand (nsfs only `ST_VALID`). fstatfs of any
-  pipe (FIFOs too) reports pipefs, of a message queue mqueue, of other node-less fds the root
-  filesystem's figures.
+  the mount plus the filesystem's read-only, sync and mand (nsfs only `ST_VALID`). fstatfs of an
+  anonymous pipe reports pipefs, of a named FIFO its underlying filesystem, of a message queue
+  mqueue, of other node-less fds the root filesystem's figures.
 - access/faccessat: real IDs unless `AT_EACCESS` (capabilities only when the real uid is root in
   the caller's namespace); FUSE nodes ask `kernel/fuse` even for `F_OK`; otherwise `F_OK` returns
   right after the lookup; `EACCES` for `X_OK` on regular files (excluding memfds) in a `noexec`
@@ -386,11 +389,9 @@ capabilities (`kernel/cred`).
 - **Fidelity gaps**, one per line:
   - statx: no btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`;
   - no `protected_regular` or `protected_fifos`;
-  - fstat of an open PTY reports `st_blksize` 4096 (stat by path 1024), epoll's fdinfo shows the
-    root filesystem's device for tmpfs files and an anonymous one for overlay and FUSE files, and
-    fstatfs of a FIFO reports pipefs;
+  - fstat of an open PTY reports `st_blksize` 4096 (stat by path 1024), and epoll's fdinfo shows the
+    root filesystem's device for tmpfs files and an anonymous one for overlay and FUSE files;
   - cgroup mkdir reports `EROFS` before `EEXIST`;
-  - readlink of `/proc/<pid>/cwd` for a removed cwd is `ENOENT` (Linux appends ` (deleted)`);
   - the store's rename errors come after permission.
 - **Scoped openat2 never returns `EAGAIN`:** the walk is atomic under the BKL, so a `..` walked
   while another thread mounts or renames never asks the caller to retry. Safe.

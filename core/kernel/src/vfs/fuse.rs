@@ -1469,6 +1469,8 @@ pub(crate) struct Node {
     nlookup: u64,
     /// Shared by O_PATH descriptions, which have no daemon file handle.
     path_pin: Weak<()>,
+    /// True once `unlink`, `rmdir`, or an overwriting `rename` removed the node's last link.
+    pub unlinked: bool,
     /// When it was last entered ([`Fuses::clock`]): the oldest go first.
     seen: u64,
 }
@@ -1532,6 +1534,7 @@ impl Fuses {
                 retry_writeback: None,
                 nlookup: 0,
                 path_pin: Weak::new(),
+                unlinked: false,
                 seen: 0,
             },
         );
@@ -1660,6 +1663,7 @@ impl Fuses {
                         retry_writeback: None,
                         nlookup: 1,
                         path_pin: Weak::new(),
+                        unlinked: false,
                         seen: 0,
                     },
                 );
@@ -1677,6 +1681,7 @@ impl Fuses {
         };
         let n = self.nodes.get_mut(&id).unwrap();
         n.seen = self.clock;
+        n.unlinked = false;
         // The root keeps itself as its parent
         if n.nodeid != ROOT_ID {
             n.parent = dir;
@@ -1892,6 +1897,7 @@ impl Fuses {
             n.attr.nlink.saturating_sub(1)
         };
         if last && n.nodeid != ROOT_ID {
+            n.unlinked = true;
             let (dev, nodeid) = (n.dev, n.nodeid);
             if let Some(c) = self.conns.get(&dev)
                 && let Ok(mut c) = c.try_borrow_mut()

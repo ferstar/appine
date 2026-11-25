@@ -558,6 +558,10 @@ pub struct Vfs {
     /// Number of attached mounts currently carrying an `MNT_EXPIRE` mark; avoids borrowing the
     /// mount table on path lookups when none are marked.
     expiring: std::cell::Cell<usize>,
+    /// Former names of removed store directories still referenced by a task's cwd, root or open
+    /// directory/path descriptor (or an ancestor of one), so `d_path` ([`Vfs::path_of`]) can
+    /// reconstruct `<path> (deleted)` after `rmdir` or an overwriting `rename`.
+    removed_dirs: RefCell<HashMap<Ino, Vec<u8>>>,
 }
 
 /// Position of a live mount in [`Mounts::list`] or [`Mounts::detached`].
@@ -1543,6 +1547,7 @@ impl Vfs {
             fuse: Default::default(),
             mount_events: std::rc::Rc::new(std::cell::Cell::new(1)),
             expiring: std::cell::Cell::new(0),
+            removed_dirs: RefCell::default(),
             tmpfs_file_ranges: RefCell::default(),
         })
     }
@@ -2009,11 +2014,16 @@ impl Vfs {
     ) -> Result<Vec<u8>, Errno> {
         match found {
             Some((dir, name)) => {
-                let mut p = self.path_of(ps, root, dir)?;
+                let mounts = self.mounts.borrow();
+                let (mut p, _, deleted) =
+                    self.reach_in(ps, root, dir, |id| mounts.get(id), true)?;
                 if p != b"/" {
                     p.push(b'/');
                 }
                 p.extend_from_slice(name);
+                if deleted {
+                    p.extend_from_slice(b" (deleted)");
+                }
                 Ok(p)
             }
             None if self.is_dir(ps, node)? => self.path_of(ps, root, node),
@@ -2022,21 +2032,28 @@ impl Vfs {
     }
 
     /// The absolute path of a directory relative to root `root` (Linux's `d_path`:
-    /// `/proc/<pid>/cwd`, the path recorded for open files). A directory not under `root` gets
-    /// no mark, as on Linux, and the path counts from the store's root; in a detached mount it
-    /// counts from that mount's root. Use [`reach`](Self::reach) to know whether it is
-    /// reachable.
+    /// `/proc/<pid>/cwd`, `/proc/<pid>/root`, the path recorded for open files). A directory not
+    /// under `root` gets no mark, as on Linux, and the path counts from the store's root; in a
+    /// detached mount it counts from that mount's root. A removed directory gets ` (deleted)`
+    /// appended instead of failing with ENOENT. Use [`reach`](Self::reach) when a removed
+    /// directory must fail with ENOENT (getcwd) or to know whether it is reachable.
     pub(crate) fn path_of(
         &self,
         ps: &dyn Pseudo,
         root: &Node,
         dir: &Node,
     ) -> Result<Vec<u8>, Errno> {
-        self.reach(ps, root, dir).map(|(path, _)| path)
+        let mounts = self.mounts.borrow();
+        let (mut path, _, deleted) = self.reach_in(ps, root, dir, |id| mounts.get(id), true)?;
+        if deleted {
+            path.extend_from_slice(b" (deleted)");
+        }
+        Ok(path)
     }
 
-    /// [`path_of`](Self::path_of), also returning whether it is reachable from `root`: when it
-    /// is not, getcwd starts with `(unreachable)` and mountinfo does not list it.
+    /// [`path_of`](Self::path_of) for live directories, also returning whether it is reachable
+    /// from `root`: when it is not, getcwd starts with `(unreachable)` and mountinfo does not
+    /// list it; a removed directory returns ENOENT.
     pub(crate) fn reach(
         &self,
         ps: &dyn Pseudo,
@@ -2044,7 +2061,45 @@ impl Vfs {
         dir: &Node,
     ) -> Result<(Vec<u8>, bool), Errno> {
         let mounts = self.mounts.borrow();
-        self.reach_in(ps, root, dir, |id| mounts.get(id))
+        let (path, reached, _) = self.reach_in(ps, root, dir, |id| mounts.get(id), false)?;
+        Ok((path, reached))
+    }
+
+    /// Records the former name of a removed store directory while referenced.
+    pub(crate) fn record_removed_dir(&self, ino: Ino, name: &[u8]) {
+        self.removed_dirs.borrow_mut().insert(ino, name.to_vec());
+    }
+
+    /// Whether any removed store directory names are currently tracked.
+    pub(crate) fn has_removed_dirs(&self) -> bool {
+        !self.removed_dirs.borrow().is_empty()
+    }
+
+    /// Whether `ino` is the parent of a currently tracked removed store directory.
+    pub(crate) fn is_removed_dir_parent(&self, ino: Ino) -> bool {
+        self.removed_dirs
+            .borrow()
+            .keys()
+            .any(|&child| self.store.parent(child).ok() == Some(ino))
+    }
+
+    /// Drops removed-directory names that are no longer referenced by `kept` or their ancestors.
+    pub(crate) fn prune_removed_dirs(&self, kept: &std::collections::HashSet<Ino>) {
+        if self.removed_dirs.borrow().is_empty() {
+            return;
+        }
+        let mut removed = self.removed_dirs.borrow_mut();
+        let mut live = std::collections::HashSet::new();
+        for &ino in kept {
+            let mut cur = ino;
+            while removed.contains_key(&cur) && live.insert(cur) {
+                match self.store.parent(cur) {
+                    Ok(parent) if parent != cur => cur = parent,
+                    _ => break,
+                }
+            }
+        }
+        removed.retain(|ino, _| live.contains(ino));
     }
 
     /// Attached mounts in mount namespace `ns`, in mount order, each with its mount point's path
@@ -2063,8 +2118,8 @@ impl Vfs {
             .iter()
             .filter(|m| m.ns == ns)
             .map(|m| {
-                let path = match self.reach_in(ps, root, &m.root, |id| mounts.get(id)) {
-                    Ok((path, true)) => Some(path),
+                let path = match self.reach_in(ps, root, &m.root, |id| mounts.get(id), false) {
+                    Ok((path, true, _)) => Some(path),
                     _ => None,
                 };
                 (m.clone(), path)
@@ -2072,17 +2127,49 @@ impl Vfs {
             .collect()
     }
 
+    /// Whether directory `node` itself has been unlinked (for the `cur == *root` case where the
+    /// climb loop exits immediately).
+    fn is_dir_deleted(&self, node: &Node) -> bool {
+        match node {
+            Node::Store(_, ino) => {
+                *ino != ROOT
+                    && self.store.parent(*ino).ok().is_some_and(|p| p != *ino)
+                    && self.store.attrs(*ino).is_ok_and(|st| st.nlink == 0)
+            }
+            Node::Overlay(_, o) => {
+                let ovl = self.overlays.borrow();
+                ovl.parent(*o) != *o && !ovl.linked(*o)
+            }
+            Node::Fuse(_, f) => self
+                .fuse
+                .borrow()
+                .get(*f)
+                .is_some_and(|n| n.parent != *f && n.unlinked),
+            Node::Pseudo(..) => false,
+        }
+    }
+
     /// [`reach`](Self::reach), looking mounts (attached or detached) up by id through `find`.
+    /// When `allow_deleted` is true, removed directories are reconstructed from their former names
+    /// and flagged via the third tuple element; when false, a removed directory returns ENOENT.
     fn reach_in<'m>(
         &self,
         ps: &dyn Pseudo,
         root: &Node,
         dir: &Node,
         find: impl Fn(MountId) -> Option<&'m Mount>,
-    ) -> Result<(Vec<u8>, bool), Errno> {
+        allow_deleted: bool,
+    ) -> Result<(Vec<u8>, bool, bool), Errno> {
         let mut names = Vec::new();
         let mut cur = dir.clone();
         let mut reached = true;
+        let mut deleted = false;
+        if cur == *root && self.is_dir_deleted(&cur) {
+            if !allow_deleted {
+                return Err(Errno::ENOENT);
+            }
+            deleted = true;
+        }
         loop {
             if cur == *root {
                 break;
@@ -2119,8 +2206,22 @@ impl Vfs {
                         reached = false;
                         break;
                     }
-                    // A deleted directory has no name to find; ENOENT as on Linux
-                    names.push(self.store.name_of(parent, ino)?.ok_or(Errno::ENOENT)?);
+                    match self.store.name_of(parent, ino)? {
+                        Some(name) => names.push(name),
+                        None => {
+                            if !allow_deleted {
+                                return Err(Errno::ENOENT);
+                            }
+                            let name = self
+                                .removed_dirs
+                                .borrow()
+                                .get(&ino)
+                                .cloned()
+                                .ok_or(Errno::ENOENT)?;
+                            deleted = true;
+                            names.push(name);
+                        }
+                    }
                     cur = Node::Store(id, parent);
                 }
                 Node::Pseudo(id, p) => match ps.parent(&p) {
@@ -2144,7 +2245,10 @@ impl Vfs {
                     }
                     // A removed directory, as in the store
                     if !ovl.linked(o) {
-                        return Err(Errno::ENOENT);
+                        if !allow_deleted {
+                            return Err(Errno::ENOENT);
+                        }
+                        deleted = true;
                     }
                     names.push(ovl.node(o).name.clone());
                     cur = Node::Overlay(id, up);
@@ -2160,6 +2264,12 @@ impl Vfs {
                         reached = false;
                         break;
                     }
+                    if n.unlinked {
+                        if !allow_deleted {
+                            return Err(Errno::ENOENT);
+                        }
+                        deleted = true;
+                    }
                     names.push(n.name.clone());
                     cur = Node::Fuse(id, n.parent);
                 }
@@ -2173,7 +2283,7 @@ impl Vfs {
             out.push(b'/');
             out.extend_from_slice(name);
         }
-        Ok((out, reached))
+        Ok((out, reached, deleted))
     }
 
     /// Whether it is a directory.
@@ -6578,6 +6688,56 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "800-mount operations took {elapsed:?}, expected well below stall threshold"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removed_dir_path_of_vs_reach() {
+        let (vfs, dir) = sample("rmcwd");
+        let ps = &Empty;
+        let a = vfs.store().mkdir(ROOT, b"a", 0o755, 0, 0).unwrap();
+        let b = vfs.store().mkdir(a, b"b", 0o755, 0, 0).unwrap();
+        let node_b = Node::Store(ROOT_MOUNT, b);
+        assert_eq!(vfs.path_of(ps, &Node::ROOT, &node_b).unwrap(), b"/a/b");
+
+        // Remove b: reach (getcwd) returns ENOENT while path_of (/proc/<pid>/cwd) appends " (deleted)".
+        vfs.store().rmdir(a, b"b").unwrap();
+        vfs.record_removed_dir(b, b"b");
+        assert_eq!(vfs.reach(ps, &Node::ROOT, &node_b), Err(Errno::ENOENT));
+        assert_eq!(
+            vfs.path_of(ps, &Node::ROOT, &node_b).unwrap(),
+            b"/a/b (deleted)"
+        );
+
+        // Renaming the surviving parent updates the reconstructed path dynamically.
+        vfs.store()
+            .rename(ROOT, b"a", ROOT, b"a2", false, false)
+            .unwrap();
+        assert_eq!(
+            vfs.path_of(ps, &Node::ROOT, &node_b).unwrap(),
+            b"/a2/b (deleted)"
+        );
+
+        // Removing the parent too preserves the full nested path.
+        assert!(vfs.is_removed_dir_parent(a));
+        vfs.store().rmdir(ROOT, b"a2").unwrap();
+        vfs.record_removed_dir(a, b"a2");
+        assert_eq!(vfs.reach(ps, &Node::ROOT, &node_b), Err(Errno::ENOENT));
+        assert_eq!(
+            vfs.path_of(ps, &Node::ROOT, &node_b).unwrap(),
+            b"/a2/b (deleted)"
+        );
+
+        // Chroot equal to the deleted directory itself: reach is ENOENT, path_of is "/ (deleted)".
+        assert_eq!(vfs.reach(ps, &node_b, &node_b), Err(Errno::ENOENT));
+        assert_eq!(vfs.path_of(ps, &node_b, &node_b).unwrap(), b"/ (deleted)");
+
+        // Pruning drops entries once nothing references them.
+        vfs.prune_removed_dirs(&std::collections::HashSet::from([b]));
+        assert!(vfs.has_removed_dirs());
+        vfs.prune_removed_dirs(&std::collections::HashSet::new());
+        assert!(!vfs.has_removed_dirs());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

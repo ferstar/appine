@@ -2352,11 +2352,14 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             return put(cx, arg, pid.to_le_bytes()).map(|()| 0);
         }
         // Before the file's own ioctls, as in Linux's do_vfs_ioctl: every regular inode answers,
-        // in the store and tmpfs, procfs, sysfs and nsfs, and message queues
+        // in the store and tmpfs, procfs, sysfs and nsfs, FUSE files, and message queues
         FIONREAD
             if matches!(
                 file.borrow().kind,
-                FileKind::Regular { .. } | FileKind::Proc { .. } | FileKind::MessageQueue(_)
+                FileKind::Regular { .. }
+                    | FileKind::Proc { .. }
+                    | FileKind::MessageQueue(_)
+                    | FileKind::Fuse(_)
             ) =>
         {
             if let Some(n) = unread(cx, &file)? {
@@ -5942,8 +5945,10 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
 // ---- Cache hints and syncing ----
 
 /// posix_fadvise: affects only performance; ignored after the arguments are checked.
+/// Matches Linux's `ksys_fadvise64_64` (`fdget`): `O_PATH` descriptors fail with EBADF before
+/// pipe/socket or argument checks.
 pub(super) fn fadvise64(cx: &mut Cx<'_>, fd: i32, len: i64, advice: i32) -> SysResult {
-    let file = cx.fds().get(fd)?;
+    let file = io_file(cx, fd)?;
     if matches!(file.borrow().kind, FileKind::Pipe(_) | FileKind::Socket(_)) {
         return Err(Errno::ESPIPE);
     }
@@ -6211,6 +6216,9 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
         super::fuse::may_chdir(cx, &vfs, &cred, f)?;
     }
     cx.t.fs.borrow_mut().set_cwd(node);
+    if vfs.has_removed_dirs() {
+        vfs.prune_removed_dirs(&used_store_dirs(cx));
+    }
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -6248,6 +6256,9 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
         return Err(Errno::EPERM);
     }
     cx.t.fs.borrow_mut().set_root(node);
+    if vfs.has_removed_dirs() {
+        vfs.prune_removed_dirs(&used_store_dirs(cx));
+    }
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -6450,7 +6461,10 @@ pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
         return put(cx, buf, encode_statfs(MQUEUE_MAGIC, &empty, 0)).map(|()| 0);
     }
     let b = match (pipe, node) {
-        (true, _) => encode_statfs(
+        // Named FIFOs belong to the filesystem that holds their inode; only anonymous pipes live
+        // in pipefs.
+        (_, Some(node)) => statfs_of(cx, &node)?,
+        (true, None) => encode_statfs(
             PIPEFS_MAGIC,
             &appine_hal::FsStats {
                 block_size: 4096,
@@ -6458,7 +6472,6 @@ pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
             },
             0,
         ),
-        (false, Some(node)) => statfs_of(cx, &node)?,
         (false, None) => statfs_of(cx, &Node::ROOT)?,
     };
     put(cx, buf, b).map(|()| 0)
@@ -7864,13 +7877,63 @@ fn release_if_closed(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>) {
 
 /// `name` in directory `dir` (formerly `ino`) has been deleted: the mounts on it in other
 /// namespaces are detached (`detach_mounts` in Linux's vfs_rmdir, vfs_unlink and vfs_rename),
-/// and mounts of it show it as deleted.
+/// and mounts of it show it as deleted. Removed store directories still referenced by any task's
+/// cwd, root or open directory/path descriptor keep their former name for `/proc/<pid>/cwd`.
 fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>, (dir, name): (Ino, &[u8])) {
     if let Some(ino) = ino {
+        if vfs
+            .store()
+            .attrs(ino)
+            .is_ok_and(|st| st.is_dir() && st.nlink == 0)
+        {
+            record_removed_dir(cx, vfs, ino, name);
+        }
         vfs.detach_store_point((ino, dir, name));
         vfs.roots_removed((ino, dir, name));
         cx.shared.fast_changed();
     }
+}
+
+/// Records the former name of removed store directory `ino` if any task's cwd, root or open
+/// directory/path descriptor (or an already-tracked removed child) references it, pruning stale
+/// entries first.
+fn record_removed_dir(cx: &Cx<'_>, vfs: &Vfs, ino: Ino, name: &[u8]) {
+    let used = used_store_dirs(cx);
+    if vfs.has_removed_dirs() {
+        vfs.prune_removed_dirs(&used);
+    }
+    if used.contains(&ino) || vfs.is_removed_dir_parent(ino) {
+        vfs.record_removed_dir(ino, name);
+    }
+}
+
+/// Store directory inodes referenced by any task's cwd, root or open directory/path descriptor.
+fn used_store_dirs(cx: &Cx<'_>) -> std::collections::HashSet<Ino> {
+    let mut used = std::collections::HashSet::new();
+    let mut add = |node: &Node| {
+        if let Node::Store(_, ino) = node {
+            used.insert(*ino);
+        }
+    };
+    for task in cx.kr().tasks.values() {
+        let Ok(res) = task.res.try_borrow() else {
+            continue;
+        };
+        if let Ok(fs) = res.fs.try_borrow() {
+            add(&fs.cwd);
+            add(&fs.root);
+        }
+        if let Ok(fds) = res.fds.try_borrow() {
+            for file in fds.files() {
+                if let Ok(f) = file.try_borrow()
+                    && let FileKind::Directory { node, .. } | FileKind::Path(node) = &f.kind
+                {
+                    add(node);
+                }
+            }
+        }
+    }
+    used
 }
 
 /// Link `name` of file `ino` was unlinked: the link count changed (IN_ATTRIB), and
@@ -9271,7 +9334,7 @@ fn display_path(
     let full = if path.first() == Some(&b'/') {
         path.to_vec()
     } else {
-        let mut p = vfs.path_of(&cx.view(vfs), &cx.root(), start).ok()?;
+        let mut p = vfs.reach(&cx.view(vfs), &cx.root(), start).ok()?.0;
         p.push(b'/');
         p.extend_from_slice(path);
         p
