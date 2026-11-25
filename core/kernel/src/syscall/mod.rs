@@ -683,6 +683,8 @@ fn post_syscall_sweeps(cx: &mut Cx<'_>) {
     if let Ok(vfs) = cx.vfs() {
         mount::collect_released(cx.kr(), &vfs);
     }
+    // IPC namespaces whose last nsfs file, pinned sysctl or mount went away
+    cx.k().collect_ipc();
     // Removed overlay nodes nothing uses any more
     mount::sweep_overlays(cx);
     // Changes to watched cgroup files (crate::cgroup::notify_changes)

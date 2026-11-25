@@ -2021,7 +2021,6 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
             super::ns::count(cx.k(), Counted::Ipc, owner, euid, ns.ipc.clone());
         }
         *cx.task.ns.borrow_mut() = ns;
-        cx.k().collect_ipc();
     }
     Ok(0)
 }

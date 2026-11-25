@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: local result copies after dequeuing SysV and POSIX messages)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: reap dead IPC namespaces via Drop-flagged collect_ipc in post-syscall sweeps, task exit, and BKL release)
 
 ## Responsibilities
 
@@ -93,9 +93,13 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   one (default limits, empty tables, a root directory owned by the creator's fsuid and fsgid).
   clone with both `CLONE_NEWIPC` and `CLONE_SYSVSEM` is `EINVAL`.
 - Every syscall uses the calling task's namespace. An `Ipc` is dropped once its `IpcNs` has no
-  strong reference (tasks, mqueue mounts and nsfs files hold one), but `collect_ipc` runs only
-  after a thread exits, after setns and after unshare. Shm mappings keep their host memory, and
-  open queue fds their queue, after the namespace is gone.
+  strong reference (tasks, mqueue mounts, nsfs files and bind mounts, and pinned IPC sysctl nodes
+  hold one): `Drop for IpcNs` sets a per-kernel `ipc_dead` flag, and `Kernel::collect_ipc` (an O(1)
+  no-op unless a namespace dropped) runs in end-of-syscall sweeps (after AF_UNIX GC and mount
+  collection), `task::exit` (after mount collection), and `Bkl::drop` before deferred host unmaps
+  are released. Shm mappings keep their host memory, and open queue fds their queue, after the
+  namespace is gone; named queues without open fds drop with the namespace and release their
+  `RLIMIT_MSGQUEUE` (`Kernel::mq_usage`) charge immediately.
 
 ### Ids and permissions
 
@@ -293,7 +297,6 @@ None recorded.
 ## Open questions
 
 - Is the `wake::ALL` broadcast for SysV waits meant to stay?
-- Should `collect_ipc` also run when the last nsfs file or mount holding an IPC namespace goes?
 
 ## To verify
 

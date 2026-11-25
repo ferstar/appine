@@ -1255,14 +1255,16 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     {
         failed(&k, "collecting unix sockets");
     }
-    // The last thread using an IPC namespace exited: drop the objects in it
-    k.collect_ipc();
     // The last thread using a mount namespace exited: take down its mounts (the tmpfs in them
     // are deleted with them); detached mounts whose last use was its files or directories go too
     if let Some(vfs) = &vfs
         && crate::bug::catch(|| crate::syscall::collect_unused(&k, vfs)).is_none()
     {
         failed(&k, "collecting mount namespaces");
+    }
+    // Any IPC namespace whose last task, fd, or mount (including mounts torn down above) went away
+    if crate::bug::catch(|| k.collect_ipc()).is_none() {
+        failed(&k, "collecting IPC namespaces");
     }
     // A cgroup may have lost its last process (cgroup.events' populated)
     if crate::bug::catch(|| crate::cgroup::notify_changes(&mut k)).is_none() {

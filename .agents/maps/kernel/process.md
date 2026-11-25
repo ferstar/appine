@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: post-syscall sweeps and `Mm::sync` on successful execve/execveat)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: reap dead IPC namespaces in post-syscall sweeps, after exit mount collection, and on BKL release)
 
 ## Responsibilities
 
@@ -171,8 +171,9 @@ and `kernel/oom`.
   sweep can tell which syscalls began before a removal.
 - After the handler: released FUSE files are flushed, deferred AF_UNIX cycle collection runs
   (`unix::collect_deferred`), removed FUSE mappings complete writeback and the node cache may be swept
-  (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall let go of are collected
-  and removed overlay nodes swept (`kernel/overlay`), and pending cgroup2 file changes checked
+  (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall let go of are collected,
+  dead IPC namespaces are reaped (`Kernel::collect_ipc`), removed overlay nodes are swept
+  (`kernel/overlay`), and pending cgroup2 file changes checked
   (`cgroup::notify_changes`, also run at thread exit, freezer stops and by the timer thread); then
   results are translated out (invisible pids become 0), edge-triggered readiness is re-armed after
   reads, x0 is set, `Mm::sync` runs, then the exit stop and signal delivery. A successful `execve`
@@ -195,7 +196,8 @@ and `kernel/oom`.
   SysV shm reap (`kernel/ipc`), non-last thread `sem_undo` release (if last holder) and child
   handoff (`pdeathsig`) + signal retargeting or last-thread `finish_group`, mqueue notification
   flush, namespace reset/drop under BKL, FUSE flush, unix-GC (when `last || fds_gone ||
-  unix::take_deferred()`) + IPC/mount collection, cgroup change checks, and `EXITED` wake; CPU
+  unix::take_deferred()`), mount collection (`collect_unused`), IPC collection (`collect_ipc`),
+  cgroup change checks, and `EXITED` wake; CPU
   state frees after BKL release.
 - `finish_group`, each step contained: release AIO; reparent children to the nearest
   `PR_SET_CHILD_SUBREAPER` ancestor in the same pid-namespace level that still has live threads
@@ -255,7 +257,8 @@ and `kernel/oom`.
   reading only the `held` flag; the rest sleep on the mutex (a poisoned one is accepted). The new
   holder sets `held`, updates `Hold` (`kernel/bug`, relaxed same-cache-line stores, no clock read),
   marks BKL ownership and defers host unmaps (`kernel/hostmem`).
-- Release (`Drop for Bkl`), in order: hang up closed terminals (contained), match pending wake
+- Release (`Drop for Bkl`), in order: hang up closed terminals (contained), reap any dead IPC
+  namespaces (`collect_ipc`, contained), match pending wake
   requests against waiters (inside `bug::catch`; on panic, wakes all waiters directly so the BKL is
   always unlocked), clear `held`, unlock, clear the thread's held marker, notify pooled
   host threads, signal the matched events, release deferred host memory and refill fork spares

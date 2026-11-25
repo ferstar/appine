@@ -444,16 +444,15 @@ fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
         if let Some(ns) = set.uts {
             p.uts = ns;
         }
+        if let Some(ns) = set.ipc {
+            p.ipc = ns;
+        }
         if let Some(ns) = set.cgroup {
             p.cgroup = ns;
         }
         if let Some(ns) = set.net {
             p.net = ns;
         }
-    }
-    if let Some(ns) = set.ipc {
-        cx.task.ns.borrow_mut().ipc = ns;
-        cx.k().collect_ipc();
     }
     if let Some(ns) = set.pid {
         *cx.task.pid_ns_children.borrow_mut() = Some(ns);

@@ -5,8 +5,8 @@
 //!
 //! A UTS namespace has its own host name and NIS domain name. An IPC namespace has its own System
 //! V IPC objects, POSIX message queues and their limits; the contents are stored by number in
-//! [`crate::kernel::Kernel::ipcs`] and dropped once no thread uses the namespace and no namespace
-//! file keeps it ([`NsRef`]). For network namespaces see [`NetNs`].
+//! [`crate::kernel::Kernel::ipcs`] and dropped once no thread, mount, namespace file ([`NsRef`]),
+//! or pinned IPC sysctl holds it. For network namespaces see [`NetNs`].
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -119,6 +119,15 @@ pub(crate) struct IpcNs {
     pub id: u64,
     /// The user namespace it was created in (for permission checks).
     pub owner: Rc<UserNs>,
+    /// Shared with [`crate::kernel::Kernel::ipc_dead`]; set on drop so the kernel reaps its
+    /// [`crate::ipc::Ipc`] entry regardless of which holder dropped the last reference.
+    pub dead: Rc<Cell<bool>>,
+}
+
+impl Drop for IpcNs {
+    fn drop(&mut self) {
+        self.dead.set(true);
+    }
 }
 
 /// A cgroup namespace: paths in `/proc/<pid>/cgroup` and the root of cgroup2 mounted inside are
@@ -248,6 +257,7 @@ impl NsProxy {
             ipc: Rc::new(IpcNs {
                 id: INIT_IPC_NS,
                 owner: UserNs::init(),
+                dead: Rc::new(Cell::new(false)),
             }),
             net: Rc::new(NetNs {
                 id: INIT_NET_NS,

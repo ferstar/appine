@@ -515,9 +515,20 @@ pub(crate) fn new_queue(
         limits.msg_default.min(limits.msg_max),
         limits.msgsize_default.min(limits.msgsize_max),
     ));
-    let now = crate::tty::wall_ns();
     let limit = cx.t.group.borrow().rlimits[crate::process::RLIMIT_MSGQUEUE as usize].0;
-    let charge = QueueCharge::reserve(&cx.kr().mq_usage, cred, limit, maxmsg, msgsize)?;
+    create_queue(&cx.kr().mq_usage, ns, cred, limit, perm, (maxmsg, msgsize))
+}
+
+fn create_queue(
+    usage: &MqUsage,
+    ns: u64,
+    cred: &Cred,
+    limit: u64,
+    perm: u32,
+    (maxmsg, msgsize): (u64, u64),
+) -> Result<Rc<RefCell<MessageQueue>>, Errno> {
+    let now = crate::tty::wall_ns();
+    let charge = QueueCharge::reserve(usage, cred, limit, maxmsg, msgsize)?;
     Ok(Rc::new(RefCell::new(MessageQueue {
         _charge: charge,
         ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
@@ -948,5 +959,38 @@ mod tests {
         assert_eq!(usage.borrow().len(), 2);
         drop(second);
         assert!(usage.borrow().is_empty());
+    }
+
+    /// Reaping a dead IPC namespace when its last nsfs fd closes also drops its named POSIX
+    /// message queues and releases their `RLIMIT_MSGQUEUE` (`Kernel::mq_usage`) quota immediately.
+    #[test]
+    fn reaping_pinned_ipc_namespace_releases_mqueue_quota() {
+        let shared = crate::kernel::Shared::new(crate::kernel::Kernel::new(
+            crate::process::Tier::Interpreter,
+        ));
+        let ns_id = {
+            let mut k = shared.lock();
+            let cred = Cred::root();
+            let ns = k.new_ipc_ns(cred.user_ns.clone(), (0, 0));
+            let ns_id = ns.id;
+            let q = create_queue(&k.mq_usage, ns_id, &cred, 819200, 0o600, (10, 8192)).unwrap();
+            let weak_q = Rc::downgrade(&q);
+            insert_queue(k.ipc_mut(ns_id), b"q1".to_vec(), q);
+            assert!(!k.mq_usage.borrow().is_empty());
+
+            let nsfs = crate::kernel::tests::nsfs_ipc_file(ns);
+            k.collect_ipc();
+            assert!(weak_q.upgrade().is_some());
+            assert!(!k.mq_usage.borrow().is_empty());
+
+            drop(nsfs);
+            k.collect_ipc();
+            assert!(weak_q.upgrade().is_none());
+            assert!(k.mq_usage.borrow().is_empty());
+            ns_id
+        };
+        let k = shared.lock();
+        assert!(!k.ipcs.contains_key(&ns_id));
+        assert!(k.mq_usage.borrow().is_empty());
     }
 }

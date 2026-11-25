@@ -25,6 +25,7 @@
 //! on locks and condition variables; they wait with [`Cx::wait_alone`] and are notified directly,
 //! only by FUTEX_WAKE, signals and the ending of the thread group.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
@@ -191,8 +192,11 @@ pub(crate) struct Kernel {
     /// Queue capacity by user, including unlinked queues held open.
     pub mq_usage: crate::syscall::MqUsage,
     /// The System V IPC objects and POSIX message queues of each IPC namespace, by namespace id;
-    /// namespaces that no thread uses any more are dropped ([`Kernel::collect_ipc`]).
+    /// namespaces with no remaining holders are dropped ([`Kernel::collect_ipc`]).
     pub ipcs: BTreeMap<u64, (Weak<crate::nsproxy::IpcNs>, crate::ipc::Ipc)>,
+    /// Shared with every [`crate::nsproxy::IpcNs`] of this kernel; set by `Drop for IpcNs` so
+    /// [`Kernel::collect_ipc`] skips scanning `ipcs` when nothing dropped.
+    ipc_dead: Rc<Cell<bool>>,
     /// The cgroup tree ([`crate::cgroup`]).
     pub cgroups: crate::cgroup::Cgroups,
     /// Ids of loaded eBPF programs ([`crate::bpf`]).
@@ -386,6 +390,7 @@ impl Kernel {
                 init_ns.ipc.id,
                 (Rc::downgrade(&init_ns.ipc), crate::ipc::Ipc::default()),
             )]),
+            ipc_dead: init_ns.ipc.dead.clone(),
             unix: Default::default(),
             unix_inflight: Vec::new(),
             unix_sending: Vec::new(),
@@ -522,6 +527,7 @@ impl Kernel {
         let ns = Rc::new(crate::nsproxy::IpcNs {
             id: crate::vfs::new_ns_id(),
             owner,
+            dead: self.ipc_dead.clone(),
         });
         let ipc = crate::ipc::Ipc {
             mq_dir: crate::cell::RefCell::new(crate::syscall::MqDir::new(creator.0, creator.1)),
@@ -588,10 +594,14 @@ impl Kernel {
         &mut self.ipcs.get_mut(&id).expect("IPC namespace in use").1
     }
 
-    /// IPC namespaces that no thread uses any more: drops the objects in them (Linux's
-    /// `free_ipc_ns`; for shared memory segments still mapped, the mappings keep the memory).
+    /// Drops the objects of IPC namespaces with no remaining references (Linux's `free_ipc_ns`;
+    /// for shared memory segments still mapped, the mappings keep the memory). Returns immediately
+    /// unless an [`crate::nsproxy::IpcNs`] dropped since the last sweep.
     pub fn collect_ipc(&mut self) {
-        self.ipcs.retain(|_, (ns, _)| ns.strong_count() > 0);
+        while self.ipc_dead.get() {
+            self.ipc_dead.set(false);
+            self.ipcs.retain(|_, (ns, _)| ns.strong_count() > 0);
+        }
     }
 
     /// New thread or process `tid` is in pid namespace `ns`: allocates its number at each level
@@ -922,6 +932,11 @@ impl Drop for Bkl<'_> {
         let k: &mut Kernel = &mut self.0;
         if crate::bug::catch(|| crate::syscall::hang_up_closed(k)).is_none() {
             crate::bug::report(format_args!("kernel panic while hanging up terminals"));
+        }
+        // Any IPC namespace whose last holder (task, nsfs file, pinned sysctl, or mount) dropped
+        // while the BKL was held is reaped here so its SharedMemory unmaps flush below
+        if k.ipc_dead.get() && crate::bug::catch(|| k.collect_ipc()).is_none() {
+            crate::bug::report(format_args!("kernel panic while collecting IPC namespaces"));
         }
         // Contain wake-up matching so a panic can never skip releasing the BKL; on failure, wake
         // all waiters directly so none remain parked forever
@@ -1672,7 +1687,7 @@ pub(crate) fn signal_later(event: &Arc<Event>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::process::Tier;
 
@@ -1713,5 +1728,296 @@ mod tests {
         assert!(!event.is_signaled());
         drop(k);
         assert!(event.is_signaled());
+    }
+
+    fn populated_ipc_ns(k: &mut Kernel) -> Rc<crate::nsproxy::IpcNs> {
+        use crate::cred::Cred;
+        use crate::ipc::{IPC_CREAT, Msg, MsgQueue, SemSet, ShmSeg};
+        use crate::mm::SharedMemory;
+        let ns = k.new_ipc_ns(k.init_ns.ipc.owner.clone(), (0, 0));
+        let root = Cred::root();
+        let owner = (&root, root.user_ns.as_ref());
+        let ipc = k.ipc_mut(ns.id);
+        let msg_id = ipc
+            .msg
+            .get_or_create(
+                10,
+                IPC_CREAT | 0o600,
+                owner,
+                16,
+                |_| Ok(()),
+                || Ok(MsgQueue::new(16384)),
+            )
+            .unwrap();
+        ipc.msg.get_mut(msg_id).unwrap().1.msgs.push_back(Msg {
+            mtype: 1,
+            text: vec![0xaa; 64],
+        });
+        ipc.sem
+            .get_or_create(
+                20,
+                IPC_CREAT | 0o600,
+                owner,
+                16,
+                |_| Ok(()),
+                || SemSet::new(2),
+            )
+            .unwrap();
+        ipc.shm
+            .get_or_create(
+                30,
+                IPC_CREAT | 0o600,
+                owner,
+                16,
+                |_| Ok(()),
+                || {
+                    Ok(ShmSeg {
+                        mem: SharedMemory::new(4096)?,
+                        size: 4096,
+                        atime: 0,
+                        dtime: 0,
+                        ctime: 0,
+                        cpid: 1,
+                        lpid: 1,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!((ipc.msg.len(), ipc.sem.len(), ipc.shm.len()), (1, 1, 1));
+        ns
+    }
+
+    pub(crate) fn nsfs_ipc_file(ns: Rc<crate::nsproxy::IpcNs>) -> FileRef {
+        use crate::cred::Cred;
+        use crate::fd::{FileKind, OpenFile, oflags};
+        use crate::nsproxy::NsRef;
+        use crate::pseudo::{NsKind, PseudoNode};
+        let id = ns.id;
+        OpenFile::new(
+            FileKind::Proc {
+                mnt: crate::vfs::PROC_MOUNT,
+                node: PseudoNode::NsFile(NsKind::Ipc, id),
+                data: Vec::new(),
+                fresh: false,
+                mm: None,
+                ns: Some(NsRef::Ipc(ns)),
+                klog: None,
+                opener: Rc::new(Cred::root()),
+                event: None,
+            },
+            oflags::O_RDONLY,
+        )
+    }
+
+    /// Closing the last `/proc/<pid>/ns/ipc` fd pinning an IPC namespace whose processes have
+    /// already exited reaps its `Kernel::ipcs` entry and SysV objects without waiting for any
+    /// unrelated process to exit.
+    #[test]
+    fn closing_last_nsfs_fd_reaps_ipc_namespace() {
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        let (init_id, ns_id) = {
+            let mut k = shared.lock();
+            let init_id = k.init_ns.ipc.id;
+            let ns = populated_ipc_ns(&mut k);
+            let ns_id = ns.id;
+
+            let mut fds = FdTable::new();
+            let fd = fds.install(nsfs_ipc_file(ns), false, 0..64).unwrap();
+            // All processes in the namespace exited, leaving only the open nsfs fd
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns_id));
+
+            // Closing the last nsfs fd drops the last IpcNs reference; releasing the BKL reaps it
+            drop(fds.close(fd).unwrap());
+            (init_id, ns_id)
+        };
+        let k = shared.lock();
+        assert!(!k.ipcs.contains_key(&ns_id));
+        assert!(k.ipcs.contains_key(&init_id));
+    }
+
+    /// Unmounting the last nsfs bind mount (or tearing down a mount namespace holding an mqueue or
+    /// nsfs mount) pinning an IPC namespace immediately frees its `Kernel::ipcs` entry.
+    #[test]
+    fn unmounting_last_pinned_mount_reaps_ipc_namespace() {
+        use crate::nsproxy::NsRef;
+        use crate::pseudo::{NsKind, PseudoNode};
+        use crate::vfs::{Fs, INIT_MNT_NS, Node, PROC_MOUNT, ROOT_MOUNT, store::ROOT};
+        use std::collections::HashSet;
+
+        let dir = std::env::temp_dir().join(format!(
+            "appine-ipc-reap-mnt-{}-{}",
+            std::process::id(),
+            crate::vfs::new_ns_id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::vfs::store::Store::create(&dir).unwrap());
+        let vfs = Vfs::open(&dir).unwrap();
+        let (pin_ino, _) = vfs
+            .store()
+            .create_file(ROOT, b"ipc-pin", 0o444, 0, 0)
+            .unwrap();
+        let point = (
+            Node::Store(ROOT_MOUNT, pin_ino),
+            Some((Node::ROOT, b"ipc-pin".to_vec())),
+        );
+
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        let (ns1_id, ns2_id) = {
+            let mut k = shared.lock();
+
+            // Case 1: bind-mounted nsfs file in the boot mount namespace
+            let ns1 = populated_ipc_ns(&mut k);
+            let ns1_id = ns1.id;
+            let mnt_id = vfs.add_mount(
+                Fs::Nsfs,
+                Node::Pseudo(PROC_MOUNT, PseudoNode::NsFile(NsKind::Ipc, ns1_id)),
+                point,
+                0,
+                b"nsfs".to_vec(),
+                Some(Fs::Nsfs.dev()),
+            );
+            vfs.update_mount(mnt_id, |m| m.pin = Some(NsRef::Ipc(ns1)));
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns1_id));
+
+            // Unmounting and collecting drops the mount and its pin; collect_ipc reaps it
+            vfs.umount_tree(mnt_id);
+            vfs.collect(&HashSet::new());
+            k.collect_ipc();
+            assert!(!k.ipcs.contains_key(&ns1_id));
+
+            // Case 2: mqueue mount inside a non-initial mount namespace torn down on collect
+            let (child_mnt_ns, remapped) = vfs.copy_ns(INIT_MNT_NS, k.init_ns.ipc.owner.clone());
+            let child_root_mnt = remapped[&ROOT_MOUNT];
+            let mq_dir = vfs.store().mkdir(ROOT, b"mq", 0o755, 0, 0).unwrap();
+            let mq_point = (
+                Node::Store(child_root_mnt, mq_dir),
+                Some((Node::Store(child_root_mnt, ROOT), b"mq".to_vec())),
+            );
+            let ns2 = populated_ipc_ns(&mut k);
+            let ns2_id = ns2.id;
+            let mq_mnt = vfs.add_mount(
+                Fs::Mqueue,
+                Node::Pseudo(0, PseudoNode::MqRoot(ns2_id)),
+                mq_point,
+                0,
+                b"mqueue".to_vec(),
+                Some(vfs.mq_dev(ns2_id)),
+            );
+            vfs.update_mount(mq_mnt, |m| m.pin = Some(NsRef::Ipc(ns2)));
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns2_id));
+
+            // Dropping the last reference to the mount namespace tears down its mounts on collect;
+            // Bkl::drop reaps ns2 as at the end of a syscall or exit
+            drop(child_mnt_ns);
+            vfs.collect(&HashSet::new());
+            (ns1_id, ns2_id)
+        };
+        let k = shared.lock();
+        assert!(!k.ipcs.contains_key(&ns1_id));
+        assert!(!k.ipcs.contains_key(&ns2_id));
+        drop(k);
+        drop(vfs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing the last `O_PATH` or open fd on a pinned IPC sysctl (`/proc/sys/kernel/shmmax`)
+    /// reaps the IPC namespace once no other holder remains.
+    #[test]
+    fn dropping_last_ipc_sysctl_fd_reaps_ipc_namespace() {
+        use crate::fd::{FileKind, OpenFile, oflags};
+        use crate::pseudo::{PinnedIpc, PseudoNode};
+
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        let ns_id = {
+            let mut k = shared.lock();
+            let ns = populated_ipc_ns(&mut k);
+            let ns_id = ns.id;
+            let file = OpenFile::new(
+                FileKind::Path(Node::Pseudo(
+                    crate::vfs::PROC_MOUNT,
+                    PseudoNode::IpcSysctl(b"sys/kernel/shmmax", PinnedIpc(ns)),
+                )),
+                oflags::O_PATH,
+            );
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns_id));
+            drop(file);
+            ns_id
+        };
+        assert!(!shared.lock().ipcs.contains_key(&ns_id));
+    }
+
+    /// Breaking an `AF_UNIX` `SCM_RIGHTS` cycle carrying the last IPC nsfs fd reaps the IPC
+    /// namespace.
+    #[test]
+    fn scm_rights_gc_reaps_pinned_ipc_namespace() {
+        use crate::fd::{FileKind, OpenFile, oflags};
+        use crate::net::Socket;
+        use crate::unix::{Link, Packet, SendingRights, Ucred, UnixSocket};
+
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        let ns_id = {
+            let mut k = shared.lock();
+            let ns = populated_ipc_ns(&mut k);
+            let ns_id = ns.id;
+            let nsfs = nsfs_ipc_file(ns);
+
+            let (a, b) = UnixSocket::pair(1, Ucred::of(1, 0, 0));
+            let to_b = match &a.link {
+                Link::Stream { tx, .. } => tx.clone(),
+                _ => unreachable!(),
+            };
+            let sock = |s| {
+                OpenFile::new(
+                    FileKind::Socket(Rc::new(RefCell::new(Socket::Unix(s)))),
+                    oflags::O_RDWR,
+                )
+            };
+            let (a_file, b_file) = (sock(a), sock(b));
+            let fds = SendingRights::track(&mut k, vec![b_file.clone(), nsfs])
+                .unwrap()
+                .into_packet(&mut k, &to_b);
+            to_b.borrow_mut().push(Packet {
+                data: b"x".to_vec(),
+                off: 0,
+                fds,
+                cred: Ucred::of(1, 0, 0),
+                from: Vec::new(),
+            });
+            drop((a_file, b_file, to_b));
+
+            // Still pinned inside the cyclic SCM_RIGHTS packet
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns_id));
+
+            crate::unix::collect(&mut k);
+            ns_id
+        };
+        assert!(!shared.lock().ipcs.contains_key(&ns_id));
+    }
+
+    /// `ipc_dead` is per-kernel: another kernel releasing its BKL cannot steal the flag for a dead
+    /// IPC namespace belonging to this kernel.
+    #[test]
+    fn ipc_reap_stays_with_its_kernel() {
+        let a = Shared::new(Kernel::new(Tier::Interpreter));
+        let b = Shared::new(Kernel::new(Tier::Interpreter));
+        let ns_id = {
+            let mut ka = a.lock();
+            let owner = ka.init_ns.ipc.owner.clone();
+            let ns = ka.new_ipc_ns(owner, (0, 0));
+            let ns_id = ns.id;
+            drop(ns);
+            // Another kernel takes and drops its BKL while `a` still holds its own
+            std::thread::scope(|s| {
+                s.spawn(|| drop(b.lock())).join().unwrap();
+            });
+            assert!(ka.ipcs.contains_key(&ns_id));
+            ns_id
+        };
+        assert!(!a.lock().ipcs.contains_key(&ns_id));
     }
 }
