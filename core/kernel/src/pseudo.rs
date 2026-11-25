@@ -2777,8 +2777,16 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             let reader = ps.reader();
             let socks: Vec<(SocketRef, u32)> = sockets(ps.k)
                 .into_iter()
-                .filter(|(s, _)| socket_net(&s.borrow()) == id)
-                .map(|(s, uid)| (s, reader.uid_out(uid)))
+                .filter_map(|s| {
+                    let uid = {
+                        let b = s.borrow();
+                        if socket_net(&b) != id {
+                            return None;
+                        }
+                        reader.uid_out(b.uid())
+                    };
+                    Some((s, uid))
+                })
                 .collect();
             let ifaces = crate::netdev::interfaces(&full);
             let world = ps.k.world();
@@ -4359,10 +4367,12 @@ pub(crate) fn format_uuid(b: &[u8; 16]) -> String {
 
 // ---- /proc/<pid>/net ----
 
-/// All open sockets (each counted once), sorted by inode, with the creator's fsuid recorded at
-/// socket creation (`sock_i_uid`), including sockets that are only in SCM_RIGHTS messages.
-/// Sockets waiting to be accepted do not count.
-pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
+/// All open sockets (each counted once), sorted by inode, including sockets that are only in
+/// SCM_RIGHTS messages. Sockets waiting to be accepted do not count.
+///
+/// Does not borrow any socket `RefCell`, so callers such as netlink/nftables updates may walk the
+/// list while holding a mutable borrow on a socket.
+pub(crate) fn sockets(k: &Kernel) -> Vec<SocketRef> {
     let mut tables = HashSet::new();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -4376,19 +4386,17 @@ pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
             if let FileKind::Socket(s) = &file.borrow().kind
                 && seen.insert(Rc::as_ptr(s))
             {
-                let uid = s.borrow().uid();
-                out.push((s.clone(), uid));
+                out.push(s.clone());
             }
         }
     }
     // Those only in SCM_RIGHTS messages
     for s in crate::unix::inflight_sockets(k) {
         if seen.insert(Rc::as_ptr(&s)) {
-            let uid = s.borrow().uid();
-            out.push((s, uid));
+            out.push(s);
         }
     }
-    out.sort_by_key(|(s, _)| socket_ino(s));
+    out.sort_by_key(socket_ino);
     out
 }
 
@@ -6026,10 +6034,15 @@ mod tests {
         k.unix_inflight.push(Rc::downgrade(&rx));
         drop(sa);
 
-        let listed = sockets(&k);
+        // `sockets(&k)` must not borrow any socket RefCell (e.g. while a netlink socket is
+        // mutably borrowed during `forward_all`).
+        let listed = {
+            let _held = payload_sock.borrow_mut();
+            sockets(&k)
+        };
         assert_eq!(listed.len(), 1);
-        assert!(Rc::ptr_eq(&listed[0].0, &payload_sock));
-        assert_eq!(listed[0].1, 2000);
+        assert!(Rc::ptr_eq(&listed[0], &payload_sock));
+        assert_eq!(listed[0].borrow().uid(), 2000);
         drop(sb);
     }
 

@@ -896,9 +896,14 @@ impl Drop for PendingRights {
     }
 }
 
-/// In-flight sockets (those only in `SCM_RIGHTS` messages): `/proc/net/unix` lists them too.
+/// In-flight sockets (those only in `SCM_RIGHTS` messages): `/proc/net/*` lists them too.
+/// Does not borrow any socket `RefCell`.
 pub(crate) fn inflight_sockets(k: &Kernel) -> Vec<Rc<RefCell<Socket>>> {
-    collect_inflight(k, unix_socket).expect("in-flight AF_UNIX channels are available")
+    collect_inflight(k, |f| match &f.borrow().kind {
+        FileKind::Socket(s) => Some(s.clone()),
+        _ => None,
+    })
+    .expect("in-flight AF_UNIX channels are available")
 }
 
 /// The open files carried by messages in flight (each as many times as it is carried).

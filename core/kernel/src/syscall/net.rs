@@ -5377,7 +5377,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
 
 /// After the nftables ruleset of the boot namespace changes, looks at all sockets again.
 fn forward_all(k: &crate::kernel::Kernel) {
-    for (sock, _) in crate::pseudo::sockets(k) {
+    for sock in crate::pseudo::sockets(k) {
         if let Ok(mut b) = sock.try_borrow_mut()
             && let Socket::Inet(s) = &mut *b
             && s.net.is_none()
