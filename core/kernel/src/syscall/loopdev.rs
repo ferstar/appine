@@ -680,6 +680,17 @@ impl Loops {
             .collect()
     }
 
+    /// Non-panicking [`Loops::backing_files`] for mount-usage and collection scans.
+    pub fn try_backing_files(&self) -> Option<Vec<FileRef>> {
+        let mut out = Vec::new();
+        for l in self.devices.values() {
+            if let Some(f) = &l.try_borrow().ok()?.backing {
+                out.push(f.clone());
+            }
+        }
+        Some(out)
+    }
+
     /// The devices that exist from boot, `loop0` to `loop7`.
     pub(crate) fn new() -> Loops {
         let mut loops = Loops {

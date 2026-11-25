@@ -1443,6 +1443,25 @@ impl Mm {
         }
     }
 
+    /// Inserts `(mount, inode)` for non-FUSE file-backed VMAs and the pinned backing open file for
+    /// FUSE VMAs (both `MAP_PRIVATE` and `MAP_SHARED`), used by `sb_busy` when turning a
+    /// filesystem instance read-only.
+    pub fn mapped_file_inos(
+        &self,
+        store_out: &mut Vec<(crate::vfs::MountId, u64)>,
+        fuse_out: &mut Vec<crate::fd::FileRef>,
+    ) {
+        for v in self.vmas.values() {
+            if let Some(fill) = &v.fill {
+                fuse_out.push(fill.source.clone());
+            } else if let Some(m) = &v.mnt
+                && v.ino != 0
+            {
+                store_out.push((m.0, v.ino));
+            }
+        }
+    }
+
     /// Whether any non-FUSE file-backed VMA in this address space maps store inode `ino`.
     pub fn maps_ino(&self, ino: u64) -> bool {
         ino != 0 && self.vmas.values().any(|v| v.ino == ino && v.fill.is_none())

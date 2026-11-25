@@ -552,9 +552,10 @@ pub struct Vfs {
     overlays: RefCell<overlay::Overlays>,
     /// FUSE connections and their nodes.
     fuse: RefCell<fuse::Fuses>,
-    /// Bumped at each change of the mount table (Linux's `touch_mnt_namespace`), for the poll of
-    /// mounts and mountinfo ([`crate::fd::ProcEvent`]).
-    mount_events: std::rc::Rc<std::cell::Cell<u64>>,
+    /// Per-mount-namespace change counters (Linux's `mnt_ns->event` / `touch_mnt_namespace`),
+    /// keyed by namespace id, for polling `/proc/<pid>/mounts` and `mountinfo`
+    /// ([`crate::fd::ProcEvent`]). Pruned in [`Vfs::collect`] once a namespace dies.
+    ns_events: RefCell<HashMap<u64, std::rc::Rc<std::cell::Cell<u64>>>>,
     /// Number of attached mounts currently carrying an `MNT_EXPIRE` mark; avoids borrowing the
     /// mount table on path lookups when none are marked.
     expiring: std::cell::Cell<usize>,
@@ -1550,7 +1551,10 @@ impl Vfs {
             namespaces: Default::default(),
             overlays: Default::default(),
             fuse: Default::default(),
-            mount_events: std::rc::Rc::new(std::cell::Cell::new(1)),
+            ns_events: RefCell::new(HashMap::from([(
+                INIT_MNT_NS,
+                std::rc::Rc::new(std::cell::Cell::new(1)),
+            )])),
             expiring: std::cell::Cell::new(0),
             removed_dirs: RefCell::default(),
             tmpfs_file_ranges: RefCell::default(),
@@ -2630,7 +2634,7 @@ impl Vfs {
         self.namespaces
             .borrow_mut()
             .push(std::rc::Rc::downgrade(&ns));
-        self.mounts_changed();
+        self.rebuild_cached();
         (ns, map)
     }
 
@@ -2679,7 +2683,7 @@ impl Vfs {
             ..m
         });
         drop(mounts);
-        self.mounts_changed();
+        self.rebuild_cached();
         Ok(id)
     }
 
@@ -2713,7 +2717,7 @@ impl Vfs {
             owner: None,
         });
         drop(mounts);
-        self.mounts_changed();
+        self.rebuild_cached();
         id
     }
 
@@ -2730,7 +2734,7 @@ impl Vfs {
             mounts.set_point(root, Some(point), at);
         }
         drop(mounts);
-        self.mounts_changed();
+        self.mounts_changed_ns([to]);
     }
 
     /// Mount `id` and the mounts below it (level by level downwards, mount_setattr's
@@ -2850,10 +2854,56 @@ impl Vfs {
                 gone.extend(mounts.attached_subtree(id));
             }
         }
+        let affected: std::collections::HashSet<u64> = mounts
+            .list
+            .iter()
+            .filter(|m| gone.contains(&m.id))
+            .map(|m| m.ns)
+            .collect();
         detach(&mut mounts, |m| gone.contains(&m.id));
         mounts.collect_pending = true;
         drop(mounts);
-        self.mounts_changed();
+        self.mounts_changed_ns(affected);
+    }
+
+    /// Overlay node `id` was deleted (rmdir, unlink, overwritten by rename): all mounts on it in
+    /// other namespaces are detached (Linux's `detach_mounts`), scheduled for collection at the
+    /// end of the syscall, and any mount rooted at `id` is marked gone (`//deleted`).
+    fn detach_overlay_point(&self, id: overlay::OvlId) {
+        let mut mounts = self.mounts.borrow_mut();
+        {
+            let Mounts { list, detached, .. } = &mut *mounts;
+            for m in list.iter_mut().chain(detached.iter_mut()) {
+                if matches!(m.root, Node::Overlay(_, o) if o == id) {
+                    m.root_gone = true;
+                }
+            }
+        }
+        let roots: Vec<MountId> = mounts
+            .list
+            .iter()
+            .filter(|m| matches!(m.point, Some(Node::Overlay(_, o)) if o == id))
+            .map(|m| m.id)
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        let mut gone = std::collections::HashSet::new();
+        for root in roots {
+            if !gone.contains(&root) {
+                gone.extend(mounts.attached_subtree(root));
+            }
+        }
+        let affected: std::collections::HashSet<u64> = mounts
+            .list
+            .iter()
+            .filter(|m| gone.contains(&m.id))
+            .map(|m| m.ns)
+            .collect();
+        detach(&mut mounts, |m| gone.contains(&m.id));
+        mounts.collect_pending = true;
+        drop(mounts);
+        self.mounts_changed_ns(affected);
     }
 
     /// `name` (inode `ino`) in store directory `dir` was deleted: the mounts, in any namespace or
@@ -3547,7 +3597,6 @@ impl Vfs {
             .borrow_mut()
             .add_instance(dev, layers, (mounter, pins), options);
         self.update_mount(id, |m| m.root = Node::Overlay(id, root));
-        self.mounts_changed();
         id
     }
 
@@ -3582,7 +3631,6 @@ impl Vfs {
         let conn = std::rc::Rc::new(RefCell::new(conn(dev)));
         let root = self.fuse.borrow_mut().add(conn.clone());
         self.update_mount(id, |m| m.root = Node::Fuse(id, root));
-        self.mounts_changed();
         (id, conn)
     }
 
@@ -3598,7 +3646,6 @@ impl Vfs {
         let root = self.fuse.borrow().root_of(dev).ok_or(Errno::ENOTCONN)?;
         let id = self.add_mount(Fs::Fuse, Node::ROOT, point, flags, source, Some(dev));
         self.update_mount(id, |m| m.root = Node::Fuse(id, root));
-        self.mounts_changed();
         Ok(id)
     }
 
@@ -3625,28 +3672,38 @@ impl Vfs {
         self.overlays.borrow_mut().upper_of(&self.store, o, what)
     }
 
-    /// Removes `name` from overlay directory `dir` ([`overlay::Overlays::remove`]).
+    /// Removes `name` from overlay directory `dir` ([`overlay::Overlays::remove`]) and detaches
+    /// any mounts in other namespaces on the removed overlay node.
     pub(crate) fn overlay_remove(
         &self,
         dir: overlay::OvlId,
         name: &[u8],
         rmdir: bool,
     ) -> Result<(), Errno> {
-        self.overlays
+        let gone = self
+            .overlays
             .borrow_mut()
-            .remove(&self.store, dir, name, rmdir)
+            .remove(&self.store, dir, name, rmdir)?;
+        self.detach_overlay_point(gone);
+        Ok(())
     }
 
-    /// Renames within one overlay ([`overlay::Overlays::rename`]).
+    /// Renames within one overlay ([`overlay::Overlays::rename`]) and detaches any mounts in
+    /// other namespaces on an overwritten destination overlay node.
     pub(crate) fn overlay_rename(
         &self,
         old: (overlay::OvlId, &[u8]),
         new: (overlay::OvlId, &[u8]),
         flags: (bool, bool),
     ) -> Result<(), Errno> {
-        self.overlays
+        if let Some(replaced) = self
+            .overlays
             .borrow_mut()
-            .rename(&self.store, old, new, flags)
+            .rename(&self.store, old, new, flags)?
+        {
+            self.detach_overlay_point(replaced);
+        }
+        Ok(())
     }
 
     /// The node named `name` in overlay directory `dir` reached through mount `mnt` (not lifted
@@ -3668,13 +3725,16 @@ impl Vfs {
         Some(ovl.instance(dev)?.options.private_prefix())
     }
 
-    /// Some mount of namespace `ns` is on `node` (Linux's `is_local_mountpoint`).
+    /// Some mount of namespace `ns` is on `node` (Linux's `is_local_mountpoint`). For overlay
+    /// nodes, matches by overlay dentry across any bind mount of that overlay in `ns`.
     pub(crate) fn is_point_in(&self, node: &Node, ns: u64) -> bool {
-        self.mounts
-            .borrow()
-            .list
-            .iter()
-            .any(|m| m.ns == ns && m.point.as_ref() == Some(node))
+        self.mounts.borrow().list.iter().any(|m| {
+            m.ns == ns
+                && match (node, &m.point) {
+                    (Node::Overlay(_, a), Some(Node::Overlay(_, b))) => a == b,
+                    (_, p) => p.as_ref() == Some(node),
+                }
+        })
     }
 
     /// The entries of overlay directory `o` ([`overlay::Overlays::readdir`]).
@@ -3764,7 +3824,7 @@ impl Vfs {
         });
         drop(mounts);
         if attach {
-            self.mounts_changed();
+            self.mounts_changed_ns([ns]);
         }
         id
     }
@@ -3832,7 +3892,7 @@ impl Vfs {
             ids.push(id);
         }
         drop(mounts);
-        self.mounts_changed();
+        self.mounts_changed_ns([ns]);
     }
 
     /// Device number of the mqueue instance of IPC namespace `ns` (reported by nodes in the
@@ -3894,11 +3954,12 @@ impl Vfs {
     #[cfg(test)]
     fn remove_mount(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
+        let ns = mounts.get_attached(id).map(|m| m.ns);
         let gone: std::collections::HashSet<MountId> =
             mounts.attached_subtree(id).into_iter().collect();
         detach(&mut mounts, |m| gone.contains(&m.id));
         drop(mounts);
-        self.mounts_changed();
+        self.mounts_changed_ns(ns);
     }
 
     /// Marks that detached mounts need collection on the next pass (used when a collection found
@@ -3943,6 +4004,9 @@ impl Vfs {
             .map(|ns| ns.id)
             .chain([INIT_MNT_NS])
             .collect();
+        self.ns_events
+            .borrow_mut()
+            .retain(|id, _| live.contains(id));
         if self
             .mounts
             .borrow()
@@ -3953,7 +4017,7 @@ impl Vfs {
             let mut mounts = self.mounts.borrow_mut();
             detach(&mut mounts, |m| !live.contains(&m.ns));
             drop(mounts);
-            self.mounts_changed();
+            self.rebuild_cached();
         }
         let gone: Vec<Ino> = {
             let mut mounts = self.mounts.borrow_mut();
@@ -4042,7 +4106,8 @@ impl Vfs {
     /// of the mount tree.
     pub(crate) fn move_mount(&self, id: MountId, point: Option<(Node, Option<Dentry>)>) {
         let mut mounts = self.mounts.borrow_mut();
-        if matches!(mounts.by_id.get(&id), Some(MountLoc::Attached(_))) {
+        let ns = mounts.get_attached(id).map(|m| m.ns);
+        if ns.is_some() {
             let (point, at) = match point {
                 Some((p, at)) => {
                     let at = at.filter(|_| matches!(p, Node::Store(..)));
@@ -4053,7 +4118,7 @@ impl Vfs {
             mounts.set_point(id, point, at);
         }
         drop(mounts);
-        self.mounts_changed();
+        self.mounts_changed_ns(ns);
     }
 
     /// Records in which directory and under which name a bind-mounted file was found
@@ -4064,7 +4129,8 @@ impl Vfs {
 
     /// Changes the propagation type of mount `id` (attached or detached), and with `recursive` of
     /// the mounts below it (Linux's `do_change_type`; for `Shared` every mount first gets a peer
-    /// group of its own, `invent_group_ids`).
+    /// group of its own, `invent_group_ids`). Propagation-only changes do not bump mount
+    /// namespace event counters (Linux's `do_change_type` does not call `touch_mnt_namespace`).
     pub(crate) fn set_propagation(&self, id: MountId, kind: PropagationType, recursive: bool) {
         let mut mounts = self.mounts.borrow_mut();
         let ids = if recursive {
@@ -4073,8 +4139,14 @@ impl Vfs {
             vec![id]
         };
         mounts.change_propagations(&ids, kind);
-        drop(mounts);
-        self.mounts_changed();
+    }
+
+    /// Copies propagation group/master onto attached mount `id` (`move_mount(MOVE_MOUNT_SET_GROUP)`).
+    /// Propagation-only, so it does not bump mount namespace event counters.
+    pub(crate) fn set_mount_prop(&self, id: MountId, prop: Propagation) {
+        if let Some(m) = self.mounts.borrow_mut().get_attached_mut(id) {
+            m.prop = prop;
+        }
     }
 
     /// Mount `id` was just attached (a new mount, a bind, a move): under a shared parent it and
@@ -4322,8 +4394,9 @@ impl Vfs {
                 mounts.set_point(q_id, Some(root), None);
             }
         }
+        let affected: std::collections::HashSet<u64> = targets.iter().map(|t| t.ns).collect();
         drop(mounts);
-        self.mounts_changed();
+        self.mounts_changed_ns(affected);
     }
 
     /// Whether unmounting mount `id` without `MNT_DETACH` would take down a mount in use
@@ -4470,9 +4543,15 @@ impl Vfs {
         for (k, (point, at)) in moves {
             (mounts.list[k].point, mounts.list[k].at) = (point, at);
         }
+        let affected: std::collections::HashSet<u64> = mounts
+            .list
+            .iter()
+            .filter(|m| out.contains(&m.id))
+            .map(|m| m.ns)
+            .collect();
         detach(&mut mounts, |m| out.contains(&m.id));
         drop(mounts);
-        self.mounts_changed();
+        self.mounts_changed_ns(affected);
     }
 
     /// The mount whose root `node` is, attached or detached.
@@ -4513,21 +4592,24 @@ impl Vfs {
     /// like), keeping only per-mount flags, and reports a mount change. Must not alter `id` or
     /// `point` (use [`Vfs::move_mount`] for mount-point changes).
     pub(crate) fn update_mount(&self, id: MountId, f: impl FnOnce(&mut Mount)) {
-        if let Some(m) = self.mounts.borrow_mut().get_attached_mut(id) {
+        let ns = if let Some(m) = self.mounts.borrow_mut().get_attached_mut(id) {
             let old_parent = m.parent();
             f(m);
             debug_assert_eq!(m.id, id);
             debug_assert_eq!(m.parent(), old_parent);
             m.flags &= ms::PER_MOUNT;
-        }
-        self.mounts_changed();
+            Some(m.ns)
+        } else {
+            None
+        };
+        self.mounts_changed_ns(ns);
     }
 
     /// Applies `mount_setattr(2)` to attached mount `id` (and the attached mounts below it when
     /// `recursive` is set): validates locked flags (`EPERM`) and writers for mounts turning
     /// read-only (`EBUSY`, computed lazily via `open_writers`) before mutating anything, updates
     /// flags and optional propagation in one pass, and rebuilds the fast path's mount points once
-    /// at the end.
+    /// at the end. Propagation-only calls do not bump mount namespace event counters.
     pub(crate) fn set_mount_attrs(
         &self,
         id: MountId,
@@ -4565,16 +4647,25 @@ impl Vfs {
             }
         }
         let mut mounts = self.mounts.borrow_mut();
+        let mut flags_changed = false;
+        let mut ns = None;
         for &t in &targets {
             if let Some(m) = mounts.get_attached_mut(t) {
-                m.flags = changed(m) & ms::PER_MOUNT;
+                ns = Some(m.ns);
+                let next = changed(m) & ms::PER_MOUNT;
+                if next != m.flags {
+                    m.flags = next;
+                    flags_changed = true;
+                }
             }
         }
         if let Some(kind) = propagation {
             mounts.change_propagations(&targets, kind);
         }
         drop(mounts);
-        self.mounts_changed();
+        if flags_changed {
+            self.mounts_changed_ns(ns);
+        }
         Ok(())
     }
 
@@ -4583,10 +4674,9 @@ impl Vfs {
         self.mounts.borrow().get(id).map(f)
     }
 
-    /// The mount table changed: the mount points used by no-BKL path resolution are replaced to
-    /// match (the caller separately makes each thread fetch them again,
-    /// [`Shared::fast_changed`](crate::kernel::Shared::fast_changed)).
-    fn mounts_changed(&self) {
+    /// Rebuilds the mount-point cache used by no-BKL path resolution without bumping any
+    /// namespace's poll event counter.
+    fn rebuild_cached(&self) {
         let (points, usable, expiring) = {
             let mounts = self.mounts.borrow();
             (
@@ -4599,14 +4689,31 @@ impl Vfs {
         let mut cached = self.cached.borrow_mut();
         cached.mounts = points;
         cached.usable = usable;
-        // Readers polling mounts and mountinfo see POLLPRI; one counter serves every namespace
-        self.mount_events.set(self.mount_events.get() + 1);
-        crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*self.mount_events));
     }
 
-    /// The counter of mount table changes ([`Vfs::mounts_changed`]).
-    pub(crate) fn mount_events(&self) -> std::rc::Rc<std::cell::Cell<u64>> {
-        self.mount_events.clone()
+    /// The mount table changed in namespaces `nss`: rebuilds the no-BKL path cache (the caller
+    /// separately calls [`Shared::fast_changed`](crate::kernel::Shared::fast_changed)) and bumps
+    /// each affected namespace's event counter (Linux's `touch_mnt_namespace`) so readers polling
+    /// its mounts/mountinfo wake with `POLLPRI|POLLERR`.
+    fn mounts_changed_ns(&self, nss: impl IntoIterator<Item = u64>) {
+        self.rebuild_cached();
+        let mut seen = std::collections::HashSet::new();
+        for ns_id in nss {
+            if seen.insert(ns_id) && self.find_ns(ns_id).is_some_and(|ns| !ns.anon) {
+                let counter = self.mount_events_of(ns_id);
+                counter.set(counter.get() + 1);
+                crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*counter));
+            }
+        }
+    }
+
+    /// The change counter for mount namespace `ns` (Linux's `mnt_ns->event`).
+    pub(crate) fn mount_events_of(&self, ns: u64) -> std::rc::Rc<std::cell::Cell<u64>> {
+        self.ns_events
+            .borrow_mut()
+            .entry(ns)
+            .or_insert_with(|| std::rc::Rc::new(std::cell::Cell::new(1)))
+            .clone()
     }
 }
 
@@ -6457,7 +6564,7 @@ mod tests {
         // Verify set_mount_attrs checks locks (EPERM) and writers (EBUSY) atomically before
         // mutating anything, and bumps mount_events only once on success.
         vfs.update_mount(child_c, |m| m.locks |= lock::NOEXEC);
-        let before_events = vfs.mount_events().get();
+        let before_events = vfs.mount_events_of(INIT_MNT_NS).get();
         let mut writers_called = false;
         assert_eq!(
             vfs.set_mount_attrs(
@@ -6474,12 +6581,12 @@ mod tests {
             Err(Errno::EPERM)
         );
         assert!(!writers_called, "EPERM must short-circuit before writers");
-        assert_eq!(vfs.mount_events().get(), before_events);
+        assert_eq!(vfs.mount_events_of(INIT_MNT_NS).get(), before_events);
         assert_eq!(vfs.mount(root_a).unwrap().flags & ms::RDONLY, 0);
 
         // Clear lock and fail with EBUSY due to an open writer on child_c
         vfs.update_mount(child_c, |m| m.locks &= !lock::NOEXEC);
-        let before_events = vfs.mount_events().get();
+        let before_events = vfs.mount_events_of(INIT_MNT_NS).get();
         assert_eq!(
             vfs.set_mount_attrs(
                 root_a,
@@ -6491,10 +6598,10 @@ mod tests {
             ),
             Err(Errno::EBUSY)
         );
-        assert_eq!(vfs.mount_events().get(), before_events);
+        assert_eq!(vfs.mount_events_of(INIT_MNT_NS).get(), before_events);
         assert_eq!(vfs.mount(root_a).unwrap().flags & ms::RDONLY, 0);
 
-        // Succeed: every mount in subtree updated, propagation applied, single mounts_changed()
+        // Succeed: every mount in subtree updated, propagation applied, single mounts_changed_ns()
         assert_eq!(
             vfs.set_mount_attrs(
                 root_a,
@@ -6507,7 +6614,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            vfs.mount_events().get(),
+            vfs.mount_events_of(INIT_MNT_NS).get(),
             before_events + 1,
             "recursive mount_setattr must rebuild fast-path mount points only once"
         );
@@ -6673,7 +6780,7 @@ mod tests {
         vfs.set_propagation(last, PropagationType::Private, false);
 
         // 4. mount_setattr(AT_RECURSIVE) with flags + propagation in one pass and one rebuild
-        let events_before = vfs.mount_events().get();
+        let events_before = vfs.mount_events_of(INIT_MNT_NS).get();
         vfs.set_mount_attrs(
             tree_root,
             true,
@@ -6683,7 +6790,7 @@ mod tests {
             Some(PropagationType::Shared),
         )
         .unwrap();
-        assert_eq!(vfs.mount_events().get(), events_before + 1);
+        assert_eq!(vfs.mount_events_of(INIT_MNT_NS).get(), events_before + 1);
         assert_eq!(
             vfs.mount(last).unwrap().flags & (ms::RDONLY | ms::NOSUID),
             ms::RDONLY | ms::NOSUID
@@ -6897,6 +7004,183 @@ mod tests {
         vfs.collect(&std::collections::HashSet::new());
         assert!(vfs.find_ns(ns2_id).is_none());
         assert!(vfs.pinned_ns(ns2_id).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlay_remove_and_rename_detach_other_ns_mounts() {
+        let (vfs, dir) = sample("overlay-detach");
+        let store = vfs.store();
+        let lower = store.mkdir(ROOT, b"l", 0o755, 0, 0).unwrap();
+        let l_rm = store.mkdir(lower, b"l_rm", 0o755, 0, 0).unwrap();
+        let _ = l_rm;
+        let upper = store.mkdir(ROOT, b"u", 0o755, 0, 0).unwrap();
+        let work = store.mkdir(ROOT, b"w", 0o755, 0, 0).unwrap();
+        let mp = store.mkdir(ROOT, b"m", 0o755, 0, 0).unwrap();
+
+        let ovl_mnt = vfs.new_overlay(
+            (Node::Store(ROOT_MOUNT, mp), None),
+            0,
+            b"overlay".to_vec(),
+            ((Some(upper), vec![lower]), (0, 0), Vec::new()),
+            overlay::Options::default(),
+        );
+        let Node::Overlay(_, ovl_root) = vfs.mount(ovl_mnt).unwrap().root else {
+            panic!("expected overlay root");
+        };
+        store.mkdir(upper, b"u_rm", 0o755, 0, 0).unwrap();
+        store.mkdir(upper, b"u_src", 0o755, 0, 0).unwrap();
+        store.mkdir(upper, b"u_dst", 0o755, 0, 0).unwrap();
+
+        let (ns2, map) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
+        let ovl_mnt2 = map[&ovl_mnt];
+        let u_rm2 = vfs.overlay_child((ovl_mnt2, ovl_root), b"u_rm").unwrap();
+        let l_rm2 = vfs.overlay_child((ovl_mnt2, ovl_root), b"l_rm").unwrap();
+        let u_src2 = vfs.overlay_child((ovl_mnt2, ovl_root), b"u_src").unwrap();
+        let u_dst2 = vfs.overlay_child((ovl_mnt2, ovl_root), b"u_dst").unwrap();
+
+        let m_urm = vfs
+            .new_tmpfs(
+                (u_rm2.clone(), None),
+                0,
+                b"t".to_vec(),
+                TmpfsParams::boot(0o755),
+            )
+            .unwrap();
+        let m_lrm = vfs
+            .new_tmpfs(
+                (l_rm2.clone(), None),
+                0,
+                b"t".to_vec(),
+                TmpfsParams::boot(0o755),
+            )
+            .unwrap();
+        let m_usrc = vfs
+            .new_tmpfs(
+                (u_src2.clone(), None),
+                0,
+                b"t".to_vec(),
+                TmpfsParams::boot(0o755),
+            )
+            .unwrap();
+        let m_udst = vfs
+            .new_tmpfs(
+                (u_dst2.clone(), None),
+                0,
+                b"t".to_vec(),
+                TmpfsParams::boot(0o755),
+            )
+            .unwrap();
+
+        // is_point_in reports busy only in ns2 (including across a bind mount in ns2), not init ns
+        let u_rm1 = vfs.overlay_child((ovl_mnt, ovl_root), b"u_rm").unwrap();
+        assert!(!vfs.is_point_in(&u_rm1, INIT_MNT_NS));
+        assert!(vfs.is_point_in(&u_rm2, ns2.id));
+        assert!(vfs.is_point_in(&u_rm1, ns2.id));
+
+        let init_ev = vfs.mount_events_of(INIT_MNT_NS).get();
+        let ns2_ev = vfs.mount_events_of(ns2.id).get();
+
+        // Removing upper and lower overlay dirs detaches ns2's mounts on them and notifies only ns2
+        vfs.overlay_remove(ovl_root, b"u_rm", true).unwrap();
+        vfs.overlay_remove(ovl_root, b"l_rm", true).unwrap();
+        assert!(vfs.mount(m_urm).is_none());
+        assert!(vfs.mount(m_lrm).is_none());
+        assert_eq!(vfs.mount_events_of(INIT_MNT_NS).get(), init_ev);
+        assert!(vfs.mount_events_of(ns2.id).get() > ns2_ev);
+        assert!(vfs.released_detached());
+
+        // Overwriting rename detaches ns2's mount on old u_dst while keeping the mount on u_src
+        let ns2_ev2 = vfs.mount_events_of(ns2.id).get();
+        vfs.overlay_rename((ovl_root, b"u_src"), (ovl_root, b"u_dst"), (false, false))
+            .unwrap();
+        assert!(vfs.mount(m_udst).is_none());
+        assert!(vfs.mount(m_usrc).is_some());
+        assert_eq!(vfs.mount_events_of(INIT_MNT_NS).get(), init_ev);
+        assert!(vfs.mount_events_of(ns2.id).get() > ns2_ev2);
+
+        let _ = work;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mount_events_are_per_namespace_and_ignore_propagation_only_changes() {
+        let (vfs, dir) = sample("mnt-events-ns");
+        let store = vfs.store();
+        let a = store.mkdir(ROOT, b"a", 0o755, 0, 0).unwrap();
+        let b = store.mkdir(ROOT, b"b", 0o755, 0, 0).unwrap();
+
+        let (ns2, map) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
+        let root2 = map[&ROOT_MOUNT];
+
+        let init_ev = vfs.mount_events_of(INIT_MNT_NS);
+        let ns2_ev = vfs.mount_events_of(ns2.id);
+
+        // Mounting in ns2 bumps only ns2, not init_ns
+        let i0 = init_ev.get();
+        let n0 = ns2_ev.get();
+        let m2 = vfs
+            .new_tmpfs(
+                (Node::Store(root2, a), None),
+                0,
+                b"t".to_vec(),
+                TmpfsParams::boot(0o755),
+            )
+            .unwrap();
+        assert_eq!(init_ev.get(), i0);
+        assert_eq!(ns2_ev.get(), n0 + 1);
+
+        // Mounting in init_ns bumps only init_ns, not ns2
+        let m1 = vfs
+            .new_tmpfs(
+                (Node::Store(ROOT_MOUNT, b), None),
+                0,
+                b"t".to_vec(),
+                TmpfsParams::boot(0o755),
+            )
+            .unwrap();
+        assert_eq!(init_ev.get(), i0 + 1);
+        assert_eq!(ns2_ev.get(), n0 + 1);
+
+        // Propagation-only changes (set_propagation, set_mount_prop, propagation-only
+        // set_mount_attrs) do not bump either namespace's counter
+        let i1 = init_ev.get();
+        let n1 = ns2_ev.get();
+        vfs.set_propagation(m1, PropagationType::Shared, false);
+        vfs.set_propagation(m1, PropagationType::Slave, false);
+        vfs.set_propagation(m1, PropagationType::Unbindable, false);
+        vfs.set_propagation(m1, PropagationType::Private, false);
+        vfs.set_mount_prop(m2, Propagation::default());
+        vfs.set_mount_attrs(
+            m1,
+            false,
+            |m| m.flags,
+            false,
+            std::collections::HashSet::new,
+            Some(PropagationType::Shared),
+        )
+        .unwrap();
+        assert_eq!(init_ev.get(), i1);
+        assert_eq!(ns2_ev.get(), n1);
+
+        // Flag-changing set_mount_attrs bumps only that mount's namespace
+        vfs.set_mount_attrs(
+            m1,
+            false,
+            |m| m.flags | ms::NOEXEC,
+            false,
+            std::collections::HashSet::new,
+            None,
+        )
+        .unwrap();
+        assert_eq!(init_ev.get(), i1 + 1);
+        assert_eq!(ns2_ev.get(), n1);
+
+        // Unmounting m2 bumps only ns2
+        vfs.umount_tree(m2);
+        assert_eq!(init_ev.get(), i1 + 1);
+        assert_eq!(ns2_ev.get(), n1 + 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

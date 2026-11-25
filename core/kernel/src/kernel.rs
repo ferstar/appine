@@ -59,6 +59,12 @@ pub(crate) const INIT: Tid = 1;
 /// The largest tid, the same as the upper bound of `pid_max` on 64-bit Linux.
 pub(crate) const PID_MAX: Tid = 4 << 20;
 
+/// Lowest value `/proc/sys/kernel/pid_max` accepts (Linux 6.1's `pid_max_min`:
+/// `max(RESERVED_PIDS + 1, num_possible_cpus() * PIDS_PER_CPU_MIN)`).
+pub(crate) fn pid_max_min() -> Tid {
+    (crate::pidns::RESERVED_PIDS + 1).max(appine_hal::host_cpus().len() as Tid * 8)
+}
+
 /// Maximum length of the host name and domain name (`__NEW_UTS_LEN`).
 pub(crate) const UTS_LEN: usize = 64;
 
@@ -262,6 +268,9 @@ pub(crate) struct Kernel {
     /// `/proc/sys/kernel/threads-max`: the upper bound on the number of threads existing at once;
     /// it applies to root too.
     pub threads_max: usize,
+    /// `/proc/sys/kernel/pid_max`: exclusive upper bound on allocated tids/pids across all pid
+    /// namespaces (default [`PID_MAX`], minimum [`pid_max_min`]).
+    pub pid_max: Tid,
     /// The app's memory limit and the OOM killer ([`crate::oom`]).
     pub oom: crate::oom::Oom,
     /// Guest processes the kernel layer ended (kernel bugs, host faults in the engine, the OOM
@@ -420,6 +429,7 @@ impl Kernel {
             nr_open: crate::fd::MAX_FDS,
             mount_max: 100_000,
             threads_max: crate::process::default_threads_max(),
+            pid_max: PID_MAX,
             oom: Default::default(),
             code_groups: Default::default(),
             load: crate::loadavg::LoadAvg::new(Instant::now()),
@@ -474,7 +484,9 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         for (n, &tid) in levels.iter().rev().zip(set_tid) {
-            if !(1..PID_MAX).contains(&tid) || tid != 1 && n.level > 0 && n.reaper.get().is_none() {
+            if !(1..self.pid_max).contains(&tid)
+                || tid != 1 && n.level > 0 && n.reaper.get().is_none()
+            {
                 return Err(Errno::EINVAL);
             }
             if !cred.ns_capable(&n.owner, cap::SYS_ADMIN)
@@ -498,12 +510,23 @@ impl Kernel {
     }
 
     /// Allocates a tid not taken by a thread or a thread group (zombies included): the numbers
-    /// after the last one below `PID_MAX`, then from 300 again (Linux's `RESERVED_PIDS` in
+    /// after the last one below `pid_max`, then from 300 again (Linux's `RESERVED_PIDS` in
     /// `alloc_pid`).
     pub fn alloc_tid(&mut self) -> Result<Tid, Errno> {
-        for _ in 0..PID_MAX {
-            let tid = if self.next_tid >= PID_MAX {
-                crate::pidns::RESERVED_PIDS
+        let max = self.pid_max;
+        let min = if max <= crate::pidns::RESERVED_PIDS {
+            INIT + 1
+        } else {
+            crate::pidns::RESERVED_PIDS
+        };
+        let steps = if self.next_tid >= max {
+            max - min
+        } else {
+            (max - self.next_tid) + self.next_tid.saturating_sub(min)
+        };
+        for _ in 0..steps {
+            let tid = if self.next_tid >= max {
+                min
             } else {
                 self.next_tid
             };
@@ -615,7 +638,7 @@ impl Kernel {
         if ns.level == 0 {
             return Ok(());
         }
-        crate::pidns::PidNs::register(ns, tid, set_tid)?;
+        crate::pidns::PidNs::register_with_max(ns, tid, set_tid, self.pid_max)?;
         self.pid_nss.insert(tid, ns.clone());
         Ok(())
     }
@@ -683,7 +706,7 @@ impl Kernel {
     /// Writes `ns_last_pid`: allocation then starts from `pid + 1` (skipping those taken), or
     /// from 300 after the largest number.
     pub fn set_last_pid(&mut self, pid: Tid) {
-        self.next_tid = (pid.saturating_add(1)).clamp(INIT + 1, PID_MAX);
+        self.next_tid = (pid.saturating_add(1)).clamp(INIT + 1, self.pid_max);
     }
 
     /// The open files in all fd tables. An open file in several fd tables appears that many times.
@@ -1704,6 +1727,18 @@ pub(crate) mod tests {
         // Nothing took 300 (no task was created): after the largest number it is free again
         k.set_last_pid(PID_MAX);
         assert_eq!(k.alloc_tid(), Ok(crate::pidns::RESERVED_PIDS));
+
+        // Lowering pid_max wraps allocation below the new bound and rejects set_tid >= pid_max
+        k.pid_max = 303;
+        k.set_last_pid(301);
+        assert_eq!(k.alloc_tid(), Ok(302));
+        assert_eq!(k.alloc_tid(), Ok(300));
+        assert_eq!(k.alloc_tid(), Ok(301));
+        assert_eq!(k.alloc_tid(), Ok(302));
+        let pid_ns = crate::pidns::PidNs::init();
+        let cred = crate::cred::Cred::root();
+        assert_eq!(k.choose_pid(&pid_ns, &cred, &[303]), Err(Errno::EINVAL));
+        assert_eq!(k.choose_pid(&pid_ns, &cred, &[302]), Ok(302));
     }
 
     /// Two kernels in one host process: wake-ups requested while A holds its lock are not taken by

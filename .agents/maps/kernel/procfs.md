@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: writable /proc/<pid>/comm and Cpus_allowed mask line in status)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: per-mount-namespace mounts/mountinfo notifications without propagation-only triggers, and uid_map/gid_map position-advancing writes returning EINVAL on second write)
 
 ## Responsibilities
 
@@ -70,7 +70,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - `Pseudo for View`: `lookup`, `missing`, `parent`, `name`, `kind`, `readlink`, `follow`,
   `follow_dentry`, `magic`, `protected_symlinks`, `searched`.
 - `pseudo::stat`, `node_ino`, `ino_of`, `fs_of`, `readdir`, `content`, `writable`, `unwritable_error`,
-  `open_unwritable`, `unreadable`, `pollable`, `has_iter`, `write`, `read_pagemap`,
+  `open_unwritable`, `unreadable`, `pollable`, `poll_event`, `has_iter`, `write`, `read_pagemap`,
   `access_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `group_of_id`,
   `gone`, `comm_str`, `mark_deleted`, `uptime_ns`. (`sysctl_kind`/`recorded_value`/`RECORDED`
   belong to `kernel/sysctl`; `CGROUP_POINT` belongs to `kernel/sysfs`.)
@@ -166,15 +166,20 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   (`EINVAL`), nor can write-only files.
 - Writes pass each chunk or iovec (one gathered input for numeric sysctls) to `pseudo::write` with the
   writer's credentials and namespaces (the id maps, `setgroups`, `timens_offsets` and cgroup
-  migration also check the opener's), apply at the current position for `mem` and numeric sysctls, and
-  mark the snapshot stale. Per-process numbers use `proc_number`/`kstrto` (first 12
+  migration also check the opener's), apply at the current position for `mem`, `uid_map`/`gid_map`
+  (Linux's `map_write`: requires offset 0 and `< 4096` bytes, else `EINVAL`, advancing the open
+  position by `count`, while offset-0 rewrites after the map is set return `EPERM`), and numeric
+  sysctls, and mark the snapshot stale. Per-process numbers use `proc_number`/`kstrto` (first 12
   bytes, base 0, `EINVAL`/`ERANGE`).
-- Change notifications (`fd::ProcEvent`): epoll accepts the files with a Linux poll operation
-  (`pseudo::pollable`: global procfs files, `/proc/sys`, `/proc/sysvipc`, `/proc/<pid>/net`,
-  mounts, mountinfo, every sysfs and cgroup2 file; other per-process files and nsfs are `EPERM`).
-  mounts and mountinfo poll as `POLLIN|POLLRDNORM`, plus `POLLERR|POLLPRI` once the mount table
-  has changed since the open or since the last change a poll or epoll reported (reading does not
-  take it in); one counter (`Vfs::mount_events`) serves every mount namespace. sysfs (`kernel/sysfs`)
+- Change notifications (`fd::ProcEvent`, built by `pseudo::poll_event`): epoll accepts the files
+  with a Linux poll operation (`pseudo::pollable`: global procfs files, `/proc/sys`,
+  `/proc/sysvipc`, `/proc/<pid>/net`, mounts, mountinfo, every sysfs and cgroup2 file; other
+  per-process files and nsfs are `EPERM`).
+  mounts and mountinfo poll as `POLLIN|POLLRDNORM`, plus `POLLERR|POLLPRI` once the target
+  thread's mount namespace (`Vfs::mount_events_of`, scoped per mount namespace and untouched by
+  propagation-only changes) has changed since the open or since the last change a poll or epoll
+  reported (reading does not take it in). `/proc/sys/kernel/{hostname,domainname}` similarly wake
+  pollers with `POLLERR|POLLPRI` on per-name UTS changes (`kernel/sysctl`). sysfs (`kernel/sysfs`)
   and cgroup2 files poll as always readable and writable, plus `POLLERR|POLLPRI` before their first
   read from the start. Cgroup change observation, the four notifying files and their inotify keys
   belong to `kernel/cgroup`; the shared open/read path consumes its counters. Other synthetic files
@@ -374,10 +379,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 ## Confirmed bugs / technical debt
 
-- **Change notifications are partial:** a mount change in any namespace marks every mounts and
-  mountinfo reader (Linux counts per namespace), as do propagation-type changes (Linux does not
-  touch the namespace for them); synthetic files outside mounts/mountinfo/cgroup2 report no inotify
-  events (opens, reads, writes).
+- **Inotify on synthetic files is partial:** synthetic files outside cgroup2's four notifying files
+  report no inotify events (opens, reads, writes).
 - **Fidelity gaps:** modes and owners differ (`environ` 0444, `fd/` and `ns/` 0555,
   `fdinfo/<n>` and `ns/*` owned by root, devpts root 0555, a master's fstat fixed);
   procfs mount options are ignored; many standard files are absent.
@@ -390,8 +393,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   and symbol lookups (perf, bpftrace) find nothing.
 - **Per-thread values that are the process's:** `task/<tid>/stat`'s start time is the process's
   (Appine keeps none per thread).
-- **Non-sysctl synthetic writes other than `mem` leave the position unchanged:** Linux refuses a second
-  id-map write with `EINVAL`. Appine returns `EPERM` once the map has been set.
+- **Non-sysctl synthetic writes other than `mem`, `uid_map`, and `gid_map` leave the position
+  unchanged.**
 
 ## Open questions
 

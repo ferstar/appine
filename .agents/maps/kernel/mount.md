@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: stop lifting no-lookup paths in walk_at, lift move_tree target per lock_mount, and clone nsfs mounts with mnt_ns_loop checks in open_tree/move_mount)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: sb_busy tracks deleted mapped/FUSE files, loop backing files keep mounts busy for umount2, and mount events are per-namespace without propagation-only triggers)
 
 ## Responsibilities
 
@@ -85,11 +85,11 @@ Outside the module:
   `pinned_ns`/`init_ns`, `copy_ns`, `anon_ns`, `mount`/`mount_root`/`any_mount_root`/`children`/
   `subtree`/`subtree_has_unbindable`, `mount_ns`, `is_point_in`, `mount_nodes` (every attached and
   detached mount's root, point, and `at`/`root_at` parent directories, which the FUSE and overlay
-  node sweeps keep), `mount_events`
-  (the counter polled through mounts and mountinfo).
+  node sweeps keep), `mount_events_of`
+  (the per-namespace counter polled through mounts and mountinfo).
 - **Changes**: `clone_mount`, `clone_ns_mount`, `attach_tree`, `add_mount`/`add_mount_unattached`, `add_copies`,
   `move_mount`, `set_root_at`, `umount_tree`, `propagation_targets`, `propagate`,
-  `propagated_busy`, `set_propagation`, `attached`, `propagation`, `update_mount`,
+  `propagated_busy`, `set_propagation`, `set_mount_prop`, `attached`, `propagation`, `update_mount`,
   `set_mount_attrs`, `set_expiring`, `resolve_mountpoint`.
 - **Instances**: `sb_flags`/`set_sb_flags`, `sb_readonly`, `readonly`, `mount_flags` (read by
   `kernel/vfs`'s checks), `dev_of`, `mount_dev` (None for a mount that is gone), `fs_of`,
@@ -130,11 +130,13 @@ Outside the module:
   boot device and is rooted at the caller's cgroup-namespace root. Superblock flags
   and mqueue device entries of dead instances are never pruned (device numbers only grow, so they
   are never reused).
-- Every change calls `mounts_changed`, which bumps the mount event counter polled through mounts
-  and mountinfo (`kernel/procfs`; one counter for all namespaces) and makes `kernel/vfs`'s no-BKL
-  resolver rebuild its mount points; the fast path's own epoch (`fast_changed`) is bumped by the
-  callers. Marking a bound root's name removed (`roots_removed`, mountinfo's `//deleted`) does not
-  bump the counter.
+- Structural and flag changes call `mounts_changed_ns`, which rebuilds `kernel/vfs`'s no-BKL
+  mount-point cache (`rebuild_cached`) and bumps only the affected non-anonymous mount namespaces'
+  event counters (`Vfs::ns_events`, pruned in `collect`, matching Linux's `touch_mnt_namespace`)
+  polled through mounts and mountinfo (`kernel/procfs`); the fast path's own epoch (`fast_changed`)
+  is bumped by the callers. Propagation-only changes (`set_propagation`, `set_mount_prop`,
+  propagation-only `set_mount_attrs`) and marking a bound root's name removed (`roots_removed`,
+  mountinfo's `//deleted`) do not bump any namespace's counter.
 
 ### mount(2) and the new mount API
 
@@ -183,15 +185,16 @@ Outside the module:
   `may_mount`. Flags change on this mount (atime bits are kept if none are given), and without
   `MS_BIND` the instance's superblock flags too, for every bind and namespace copy of it
   (read-only, sync, mand and lazytime as given, dirsync kept: Linux's `MS_RMT_MASK`); going
-  read-only while regular or synthetic files are open for writing (in fd tables, or backing a loop
-  device; memfds, which Linux keeps on an internal tmpfs, are not writers of the root's) is
+  read-only while regular, FUSE or synthetic files are open for writing (in fd tables, or backing a
+  loop device; memfds, which Linux keeps on an internal tmpfs, are not writers of the root's) is
   `EBUSY`: through this mount with `MS_BIND` or `mount_setattr` (`mnt_make_readonly`), through any
   mount of the instance, attached or detached and in any namespace, when the instance turns
   read-only without it (`sb_busy`, 6.1's `sb_prepare_remount_readonly`), which is also `EBUSY`
   while a file of the instance whose last name was removed is still in use (Linux's
-  `s_remove_count`): a store file with no links or an unlinked overlay node, open (fd tables,
-  AF_UNIX messages in flight, loop devices), a task's root or cwd, or a running program; memfds
-  do not count. A tmpfs remount without `MS_BIND` reconfigures the shared
+  `s_remove_count`): a store file with no links, an unlinked overlay node, or an unlinked FUSE
+  node (`fuse::Node::unlinked`), held open (fd tables, AF_UNIX messages in flight, loop devices),
+  mapped in an address space (`Mm::mapped_file_inos`, covering store/tmpfs/overlay and both private
+  and shared FUSE mappings), a task's root or cwd, or a running program; memfds do not count. A tmpfs remount without `MS_BIND` reconfigures the shared
   instance (`size=`/`nr_inodes=`/`inode32|64` per `shmem_reconfigure`); other filesystems ignore
   the remount data. Remounting an overlay without an upper layer read-write without `MS_BIND` is
   `EROFS` (6.1's `ovl_remount`).
@@ -271,9 +274,10 @@ Outside the module:
   the initial user namespace (`EPERM`, 6.1's `can_umount`). After validating the flags and mount,
   it aborts a FUSE mount's connection before checking whether the mount is busy.
   Without `MNT_DETACH`, the caller's root or a busy mount gives `EBUSY` (busy means submounts, task
-  roots/cwds, mount-bearing open files in fd tables or SCM_RIGHTS transfers, mappings via
+  roots/cwds, mount-bearing open files in fd tables, loop device backing files via
+  `Loops::try_backing_files`, or SCM_RIGHTS transfers, mappings via
   `Vma::mnt`, and running executables via `ExeFile::mnt`). Files opened through an mqueue mount
-  and pinned PTYs count. Internal `mq_open` fds, sockets and loop backing files are excluded. `MNT_DETACH` moves the subtree to the detached list, where nodes
+  and pinned PTYs count. Internal `mq_open` fds and sockets are excluded. `MNT_DETACH` moves the subtree to the detached list, where nodes
   keep working: the mount root and every unlocked mount below it lose their mount point, while a
   mount locked in place stays on its detached parent (6.1's `disconnect_mount`), so an fd kept in
   the detached tree still finds what hides a path.
@@ -328,10 +332,10 @@ Outside the module:
     `roots_removed`);
   - `FsContext` reporting released mounts;
   - statfs's flags.
-- `kernel/files`: open files reporting released mounts; the mount event counter (`mount_events`)
-  attached to an opened mounts or mountinfo file for poll.
+- `kernel/files`: open files reporting released mounts.
 - `kernel/procfs`:
-  - mountinfo and mounts (`mounts_from`, `sb_options`, `type_of`, `root_path`, `sb_flags`);
+  - mountinfo and mounts (`mounts_from`, `sb_options`, `type_of`, `root_path`, `sb_flags`), and
+    per-namespace mount event counters (`mount_events_of`, attached by `pseudo::poll_event`);
   - procfs instances' pid namespaces.
 - `kernel/sysctl`: the `fs.mount-max` sysctl (`Kernel::mount_max`).
 - `kernel/tty`: devpts instance options.
@@ -414,14 +418,10 @@ Outside the module:
 
 ## Confirmed bugs / technical debt
 
-- **Mount fidelity gaps:**
-  - turning an instance read-only (`sb_busy`) still ignores deleted files that are only mapped and
-    deleted FUSE files, which 6.1's `s_remove_count` counts until the inode is evicted.
+- None recorded.
 
 ## Open questions
 
-- Should loop devices' backing files make a mount busy for `umount2`, as they already do for
-  remount's writer check?
 - Should cgroup2 mounted in different cgroup namespaces count as different instances for the
   same-instance `EBUSY`?
 

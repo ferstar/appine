@@ -99,6 +99,11 @@ pub(crate) struct UtsNs {
     /// [`crate::kernel::UTS_LEN`] bytes.
     pub hostname: RefCell<Vec<u8>>,
     pub domainname: RefCell<Vec<u8>>,
+    /// Per-name change counters bumped by sysctl writes and `sethostname`/`setdomainname` so
+    /// pollers on `/proc/sys/kernel/{hostname,domainname}` wake with `POLLPRI|POLLERR` (Linux's
+    /// `uts_proc_notify`).
+    pub hostname_event: Rc<Cell<u64>>,
+    pub domainname_event: Rc<Cell<u64>>,
 }
 
 impl UtsNs {
@@ -109,7 +114,23 @@ impl UtsNs {
             owner,
             hostname: RefCell::new(self.hostname.borrow().clone()),
             domainname: RefCell::new(self.domainname.borrow().clone()),
+            hostname_event: Rc::new(Cell::new(1)),
+            domainname_event: Rc::new(Cell::new(1)),
         })
+    }
+
+    /// Updates `hostname` and wakes pollers on `/proc/sys/kernel/hostname`.
+    pub fn set_hostname(&self, value: Vec<u8>) {
+        *self.hostname.borrow_mut() = value;
+        self.hostname_event.set(self.hostname_event.get() + 1);
+        crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*self.hostname_event));
+    }
+
+    /// Updates `domainname` and wakes pollers on `/proc/sys/kernel/domainname`.
+    pub fn set_domainname(&self, value: Vec<u8>) {
+        *self.domainname.borrow_mut() = value;
+        self.domainname_event.set(self.domainname_event.get() + 1);
+        crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*self.domainname_event));
     }
 }
 
@@ -253,6 +274,8 @@ impl NsProxy {
                 owner: UserNs::init(),
                 hostname: RefCell::new(b"localhost".to_vec()),
                 domainname: RefCell::new(b"(none)".to_vec()),
+                hostname_event: Rc::new(Cell::new(1)),
+                domainname_event: Rc::new(Cell::new(1)),
             }),
             ipc: Rc::new(IpcNs {
                 id: INIT_IPC_NS,

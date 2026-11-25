@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: bounded live overlay node cache eviction and mmap following copy-up)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: detach other namespaces' mounts on removed or overwritten overlay names)
 
 ## Responsibilities
 
@@ -162,11 +162,14 @@ holding its node (`kernel/exec`).
   there) and AF_UNIX bind (connect finds the upper inode). mknod of a whiteout through an overlay
   is `EPERM` (`ovl_mknod`).
 - Removing (`unlink_overlay`, `Overlays::remove`; do_unlinkat's and do_rmdir's order, `may_delete`
-  on what the overlay shows, a mount of the caller's namespace on it `EBUSY`, rmdir of a directory
+  on what the overlay shows, a mount of the caller's namespace on it — including on a bind mount of
+  the same overlay via `Vfs::is_point_in` — `EBUSY`, rmdir of a directory
   not shown empty `ENOTEMPTY`): upper-layer tmpfs room for parent copy-up and any new whiteout is
   checked before removal and charged/refunded afterwards (keeping unlinked-open regular files
-  charged until close); the upper inode goes with the whiteouts left in a directory, and a whiteout
-  owned by the mounter replaces it when a lower layer has the name.
+  charged until close); the upper inode goes with the whiteouts left in a directory, a whiteout
+  owned by the mounter replaces it when a lower layer has the name, and `Vfs::overlay_remove`
+  detaches other namespaces' mounts on the removed node (`Vfs::detach_overlay_point`, also marking
+  mounts rooted at it `root_gone`).
 - Renaming (`rename_overlay`, `Overlays::rename`; may_rename's checks on what the overlay shows,
   mount points `EBUSY`, then `ENOENT`, `EEXIST`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY` on the merged
   view): a directory with lower layers (merged or lower only) is `EXDEV` (6.1 without
@@ -174,8 +177,9 @@ holding its node (`kernel/exec`).
   otherwise both sides are copied up and renamed in the upper layer (with upper-layer tmpfs
   accounting for parent copy-ups, replaced entries and whiteouts), a whiteout at the new name or
   left in a replaced directory is removed first, a whiteout is left at the old name when a lower
-  layer has it, and a directory moved into a merged one becomes opaque (with exchange, the other
-  too).
+  layer has it, a directory moved into a merged one becomes opaque (with exchange, the other
+  too), and `Vfs::overlay_rename` detaches other namespaces' mounts on an overwritten destination
+  (`Vfs::detach_overlay_point`) while mounts on the renamed source follow its moved node.
 
 ### Opening
 
@@ -241,7 +245,6 @@ holding its node (`kernel/exec`).
   - the no-BKL stat never serves overlay paths;
   - no persistent `trusted.overlay.origin`, `impure` or shared whiteout inode: a copied-up file's
     inode number changes at the next mount;
-  - other namespaces' mounts on a removed or renamed overlay name are not detached;
   - a lower layer's `trusted.overlay.redirect` is not followed, though sysfs shows
     `redirect_always_follow` as Y (nothing Appine runs writes one).
 

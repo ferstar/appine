@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose loop-device claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint /sys/block references to kernel/sysfs)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: loop backing files keep their mount busy for umount2 and detached-mount collection)
 
 ## Responsibilities
 
@@ -47,7 +47,8 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
   `control_ioctl` (`LOOP_CTL_*` on
   `/dev/loop-control`). From `kernel/fileio`: `read`, `write`, `seek`, `flush_target` (fsync).
 - `Loops::numbers`, `sysfs_exists`, `sysfs_read` (`kernel/sysfs`'s `/sys/block` view);
-  `Loops::backing_files` (remount's writer check, `kernel/fileio`'s `opens_of`).
+  `Loops::backing_files` / `try_backing_files` (`kernel/mount`'s remount writer check, `umount2`
+  busy check, and detached-mount collection, plus `kernel/fileio`'s `opens_of`).
 
 ## Data flow / lifecycle
 
@@ -114,7 +115,8 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
   `rehome` and
   `opens_of` over backing files.
 - `kernel/sysfs`: `/sys/block/loop<N>/`.
-- `kernel/mount`: `backing_files` for the read-only remount's writer check.
+- `kernel/mount`: `backing_files` / `try_backing_files` for read-only remount's writer check,
+  `umount2`'s busy check, and detached-mount collection.
 
 ### Outbound
 

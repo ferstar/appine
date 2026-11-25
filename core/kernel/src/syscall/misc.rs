@@ -1192,11 +1192,11 @@ pub(super) fn set_uts_name(cx: &mut Cx<'_>, name: u64, len: i64, domain: bool) -
         .ok_or(Errno::EINVAL)?;
     let mut value = vec![0u8; len];
     cx.mm().read(UserSlice::new(name, len), &mut value)?;
-    *if domain {
-        uts.domainname.borrow_mut()
+    if domain {
+        uts.set_domainname(value);
     } else {
-        uts.hostname.borrow_mut()
-    } = value;
+        uts.set_hostname(value);
+    }
     Ok(0)
 }
 

@@ -5,14 +5,14 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: pin UTS, pid and user-namespace sysctls to lookup/open namespace)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: enforce kernel/pid_max writes, wake hostname/domainname pollers with POLLPRI, and add protected_fifos/protected_regular)
 
 ## Responsibilities
 
 `kernel/sysctl` implements the `/proc/sys` sysctl hierarchy, its permission model, namespace
 scoping, recorded sysctls and write handlers:
 
-- the static `/proc/sys` tree, the 40 recorded sysctls (`RECORDED`) and per-interface/per-namespace
+- the static `/proc/sys` tree, the 42 recorded sysctls (`RECORDED`) and per-interface/per-namespace
   network sysctls (`NetConf`, `NetSysctl`);
 - `proc_sys_permission`/`test_perm` open checks, namespace ownership (`net_ctl_set_ownership`) and
   capability gates on writes;
@@ -49,7 +49,7 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
   `kernel/netns`) pinned to their lookup `Rc<NetNs>`.
 - `PseudoNode::NetSysctl(path, PinnedNet)` — 145 per-network-namespace sysctls backed by
   `netconf::SYSCTLS` (`kernel/netns`), pinned to their lookup `Rc<NetNs>`.
-- `RECORDED` — 40 kernel-wide sysctls with Linux 6.1 modes, defaults and accepted ranges, stored in
+- `RECORDED` — 42 kernel-wide sysctls with Linux 6.1 modes, defaults and accepted ranges, stored in
   `Kernel::sysctls`.
 
 ## Public entry points
@@ -89,9 +89,12 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
     offset-0 rereads and writes through an open descriptor keep targeting the lookup namespace;
   - `hostname`/`domainname` per UTS namespace, pinned at lookup time (`UtsSysctl`) so offset-0
     rereads and writes keep targeting the lookup namespace (one trailing newline stripped, over 64
-    bytes `EINVAL`);
+    bytes `EINVAL`); writes via sysctl or `sethostname`/`setdomainname` (`UtsNs::set_hostname`/
+    `set_domainname`) bump per-name `UtsNs` event counters and wake pollers with `POLLPRI|POLLERR`
+    (consumed by poll, not cleared by read);
   - `ns_last_pid` per pid namespace (the process's, not the mount's), pinned at lookup time
-    (`PidSysctl`) so offset-0 rereads and writes keep targeting the lookup namespace;
+    (`PidSysctl`) so offset-0 rereads and writes keep targeting the lookup namespace (bounded by
+    `0..=Kernel::pid_max`);
   - `net.*` per network namespace, pinned at lookup time (`NetStatic`, `NetConf`, `NetSysctl`) so
     offset-0 rereads and writes keep targeting the lookup namespace (`ip_forward` aliases
     `conf/all/forwarding`; `NetConf` directories per interface; entries flagged init-only exist
@@ -102,9 +105,11 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
     offset-0 rereads (`ps.reader().user_ns`) and writes (`opener.user_ns`: the limits of
     `kernel/ns`'s namespace counts, `INT_MAX` by default in a new one, 0 to `INT_MAX`);
   - everything else kernel-wide (`max_map_count`, `mmap_min_addr`, inotify limits, `aio-max-nr`,
-    `lease-break-time`, `nr_open`, `threads-max`, `mount-max` (1 to `INT_MAX`; the mount limit of
+    `lease-break-time`, `nr_open`, `threads-max`, `pid_max` (`pid_max_min()` to `4194304`, default
+    `4194304`; enforced by `Kernel::alloc_tid`, `Kernel::choose_pid`, `PidNs::register_with_max`,
+    and `ns_last_pid`), `mount-max` (1 to `INT_MAX`; the mount limit of
     `kernel/mount`), `pipe-max-size`, `core_pattern`, `core_uses_pid`,
-    `protected_symlinks`/`hardlinks`, `printk*`, `panic`).
+    `protected_symlinks`/`hardlinks`/`fifos`/`regular`, `printk*`, `panic`).
 - Capability checks on writes (all in the initial user namespace via `Cred::capable`, so container
   root never passes): `dmesg_restrict`, `kernel.tainted`, `kptr_restrict`,
   `unprivileged_bpf_disabled` and seccomp `actions_logged` need `CAP_SYS_ADMIN`; `mmap_min_addr`
@@ -121,9 +126,10 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
   `ping_group_range`, `somaxconn`, `ip_local_port_range`; of the port sysctls only
   `ip_unprivileged_port_start` is used, by bind); `ping_group_range` keeps kernel group IDs, shown
   in the reader's user namespace (65534 when unmapped) and written from the writer's (an unmapped
-  one is `EINVAL`); `kernel/pid_max` accepts writes and ignores them.
-- The `RECORDED` table adds 40 more with Linux 6.1's modes, defaults and accepted ranges
-  (`overflowuid`/`gid`, `vm.dirty_*`, `drop_caches`, `swappiness`, `overcommit_ratio`,
+  one is `EINVAL`).
+- The `RECORDED` table adds 42 more with Linux 6.1's modes, defaults and accepted ranges
+  (`overflowuid`/`gid`, `protected_fifos` default 1, `protected_regular` default 2, `vm.dirty_*`,
+  `drop_caches`, `swappiness`, `overcommit_ratio`,
   `page-cluster`, `watermark_scale_factor`, `mmap_rnd_*bits`, `kernel.sysrq`, `randomize_va_space`
   (default 0: nothing is randomized), `kptr_restrict`, `perf_*`, `hung_task_*`, `sched_rt_*`,
   `sched_schedstats`, `panic_on_oops`, `core_pipe_limit`, `modules_disabled` (only 1 can be
@@ -137,9 +143,9 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
     nodes at the end of the syscall (the host keeps the page cache).
 - `kernel.modprobe` keeps a string, `kernel.tainted` only gains flags (of the 19 defined), and
   `vm.overcommit_memory` (0 to 2) is used: 1 turns off fork's commit check (`kernel/cow`).
-- Constants: `file-max`, `cap_last_cap` 40, `ngroups_max`, `pid_max` 4194304, `osrelease`
+- Constants: `file-max`, `cap_last_cap` 40, `ngroups_max`, `osrelease`
   `6.1.0-appine`; `random/uuid` is fresh per read, `boot_id` fixed per boot, the entropy values 256.
-- Absent: `sys/fs/file-nr`, `protected_regular`/`protected_fifos`, Yama.
+- Absent: `sys/fs/file-nr`, Yama.
 
 ## Dependencies (inbound / outbound)
 
@@ -177,10 +183,7 @@ dispatch (`kernel/files`) and read/write dispatch (`kernel/fileio`); backing `ne
 
 ## Confirmed bugs / technical debt
 
-- **Sysctl poll never reports `POLLPRI`:** `hostname` and `domainname` never wake pollers on
-  change.
 - String and bitmap sysctls still process successive writes independently of the file position.
-- **`kernel/pid_max` writes are ignored.**
 
 ## Open questions
 

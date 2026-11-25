@@ -973,25 +973,9 @@ fn open_pseudo(
         }
         _ => None,
     };
-    // Change notifications: the mount table for mounts and mountinfo, a cgroup file's changes
-    // for the files cgroup2 notifies, none (but kernfs's first-read rule) for other sysfs and
-    // cgroup2 files
-    let event = match node {
-        PseudoNode::Entry(_, _, pseudo::Entry::Mounts | pseudo::Entry::MountInfo) => {
-            Some(crate::fd::ProcEvent::mounts(vfs.mount_events()))
-        }
-        PseudoNode::Cgroup(id, name, _) if !name.is_empty() => Some(crate::fd::ProcEvent::kernfs(
-            crate::cgroup::observe(cx.k(), id, name)
-                .unwrap_or_else(|| Rc::new(std::cell::Cell::new(1))),
-        )),
-        PseudoNode::Sys(_)
-        | PseudoNode::SysCpu(..)
-        | PseudoNode::SysNet(..)
-        | PseudoNode::SysBlock(..) => Some(crate::fd::ProcEvent::kernfs(Rc::new(
-            std::cell::Cell::new(1),
-        ))),
-        _ => None,
-    };
+    // Change notifications: per-namespace mount events for mounts/mountinfo, per-name UTS events
+    // for hostname/domainname, cgroup2 observers, and kernfs first-read counters for sysfs.
+    let event = pseudo::poll_event(cx.k(), vfs, &node);
     Ok(FileKind::Proc {
         mnt,
         node,

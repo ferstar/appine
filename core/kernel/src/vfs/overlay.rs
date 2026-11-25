@@ -928,14 +928,15 @@ impl Overlays {
     /// Removes `name` from directory `dir` (6.1's `ovl_do_remove`), once the caller has checked
     /// that it can go (with `rmdir`, an empty directory): the upper inode goes, with the
     /// whiteouts left in a directory, and a whiteout takes its place when a lower layer has the
-    /// name.
+    /// name. Returns the orphaned overlay node id so callers can detach mounts on it in other
+    /// mount namespaces.
     pub(crate) fn remove(
         &mut self,
         store: &Store,
         dir: OvlId,
         name: &[u8],
         rmdir: bool,
-    ) -> Result<(), Errno> {
+    ) -> Result<OvlId, Errno> {
         let child = self.lookup(store, dir, name)?;
         let lower = self.lower_has(store, dir, name)?;
         let up = self.upper_of(store, dir, CopyUp::All)?;
@@ -964,7 +965,7 @@ impl Overlays {
         }
         self.node_mut(dir).children.remove(name);
         self.orphan(child);
-        Ok(())
+        Ok(child)
     }
 
     /// Renames `old_name` in directory `old` to `new_name` in directory `new` (6.1's
@@ -972,14 +973,15 @@ impl Overlays {
     /// (ENOENT, EEXIST with `noreplace`, ENOTDIR, EISDIR, ENOTEMPTY), then EXDEV for a
     /// directory with lower layers, then everything involved is copied up and renamed in the
     /// upper layer, a whiteout left at the old name when a lower layer has it, and a directory
-    /// moved into a merged one made opaque so it does not merge there.
+    /// moved into a merged one made opaque so it does not merge there. Returns the orphaned
+    /// destination node id when an existing entry was overwritten without `RENAME_EXCHANGE`.
     pub(crate) fn rename(
         &mut self,
         store: &Store,
         (old, old_name): (OvlId, &[u8]),
         (new, new_name): (OvlId, &[u8]),
         (noreplace, exchange): (bool, bool),
-    ) -> Result<(), Errno> {
+    ) -> Result<Option<OvlId>, Errno> {
         let src = self.lookup(store, old, old_name)?;
         let dst = match self.lookup(store, new, new_name) {
             Ok(d) => Some(d),
@@ -987,7 +989,7 @@ impl Overlays {
             Err(e) => return Err(e),
         };
         if dst == Some(src) {
-            return Ok(());
+            return Ok(None);
         }
         let is_dir = |o: &Self, id| -> Result<bool, Errno> {
             Ok(store.kind(o.node(id).real())? == mode::S_IFDIR)
@@ -1074,7 +1076,7 @@ impl Overlays {
         let new_dir = self.node_mut(new);
         new_dir.seen = seen;
         new_dir.children.insert(new_name.to_vec(), src);
-        match replaced {
+        let orphaned = match replaced {
             Some(d) if exchange => {
                 let n = self.node_mut(d);
                 n.parent = old;
@@ -1083,11 +1085,15 @@ impl Overlays {
                 let old_dir = self.node_mut(old);
                 old_dir.seen = seen;
                 old_dir.children.insert(old_name.to_vec(), d);
+                None
             }
-            Some(d) => self.orphan(d),
-            None => {}
-        }
-        Ok(())
+            Some(d) => {
+                self.orphan(d);
+                Some(d)
+            }
+            None => None,
+        };
+        Ok(orphaned)
     }
 
     /// The node's parent directory (the root's is itself).

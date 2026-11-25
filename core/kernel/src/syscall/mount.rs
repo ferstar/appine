@@ -1146,7 +1146,7 @@ fn set_group(cx: &mut Cx<'_>, src: &Node, target: &Node) -> SysResult {
     } else {
         from.prop.of_slave_copy()
     };
-    vfs.update_mount(to.id, |m| m.prop = prop);
+    vfs.set_mount_prop(to.id, prop);
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -1587,6 +1587,9 @@ fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
     for file in crate::unix::try_inflight_files(k)? {
         note_file_mount(&file, &mut used)?;
     }
+    for file in k.loops.try_backing_files()? {
+        note_file_mount(&file, &mut used)?;
+    }
     for group in k.groups.values() {
         let g = group.try_borrow().ok()?;
         if !g.threads.is_empty()
@@ -1614,16 +1617,16 @@ fn note_file_mount(file: &crate::fd::FileRef, used: &mut HashSet<MountId>) -> Op
     Some(())
 }
 
-/// The mounts with files open for writing through them (Linux's `mnt_get_writers`): regular and
-/// synthetic files opened with write access in some process's fd table, or backing a loop device
-/// opened writable; devices, FIFOs and sockets do not count (`special_file`), nor do memfds,
-/// which Linux keeps on an internal tmpfs (here they have the store's root mount).
+/// The mounts with files open for writing through them (Linux's `mnt_get_writers`): regular,
+/// FUSE and synthetic files opened with write access in some process's fd table, or backing a loop
+/// device opened writable; devices, FIFOs and sockets do not count (`special_file`), nor do
+/// memfds, which Linux keeps on an internal tmpfs (here they have the store's root mount).
 fn writers(k: &crate::kernel::Kernel) -> HashSet<MountId> {
     let writes = |f: &crate::fd::OpenFile| {
         f.writable()
             && match &f.kind {
                 FileKind::Regular { ino, .. } => !k.seals.contains_key(ino),
-                FileKind::Proc { .. } => true,
+                FileKind::Proc { .. } | FileKind::Fuse(_) => true,
                 _ => false,
             }
     };
@@ -1655,9 +1658,8 @@ fn writers(k: &crate::kernel::Kernel) -> HashSet<MountId> {
 /// file of it is open for writing through any of its mounts, attached or detached ([`writers`]), or
 /// a file of it whose last name was removed is still in use (Linux's `s_remove_count`, inodes
 /// with no links not yet evicted): open (in an fd table, in flight in an AF_UNIX message, or
-/// backing a loop device), a task's root or cwd, or a running program. memfds do not count (as
-/// in [`writers`]); neither do files that are only mapped, whose mappings do not record their
-/// mount, nor FUSE files.
+/// backing a loop device), mapped in an address space (store, tmpfs, overlay, or FUSE), a task's
+/// root or cwd, or a running program. memfds do not count (as in [`writers`]).
 fn sb_busy(k: &crate::kernel::Kernel, vfs: &Vfs, dev: u64) -> bool {
     let of_dev = |mnt: MountId| vfs.mount_dev(mnt) == Some(dev);
     if writers(k).into_iter().any(of_dev) {
@@ -1669,36 +1671,60 @@ fn sb_busy(k: &crate::kernel::Kernel, vfs: &Vfs, dev: u64) -> bool {
                 !k.seals.contains_key(ino) && vfs.store().attrs(*ino).is_ok_and(|st| st.nlink == 0)
             }
             Node::Overlay(_, o) => !vfs.overlay().linked(*o),
-            Node::Pseudo(..) | Node::Fuse(..) => false,
+            Node::Fuse(_, f) => vfs.fuse().get(*f).is_some_and(|n| n.unlinked),
+            Node::Pseudo(..) => false,
         };
         gone && of_dev(node.mnt())
+    };
+    let file_removed = |file: &crate::fd::FileRef| {
+        file.try_borrow()
+            .is_ok_and(|f| f.node().is_some_and(|n| removed(&n)))
     };
     let mut files = k.open_files();
     files.extend(crate::unix::inflight_files(k));
     files.extend(k.loops.backing_files());
-    if files.iter().any(|f| {
-        f.try_borrow()
-            .is_ok_and(|f| f.node().is_some_and(|n| removed(&n)))
-    }) {
+    if files.iter().any(file_removed) {
         return true;
     }
-    k.tasks.values().any(|task| {
+    let mut seen_mm = HashSet::new();
+    let mut mapped = Vec::new();
+    let mut mapped_fuse = Vec::new();
+    for task in k.tasks.values() {
         let res = task.res.borrow();
-        let fs = res.fs.borrow();
+        {
+            let fs = res.fs.borrow();
+            if removed(&fs.root) || removed(&fs.cwd) {
+                return true;
+            }
+        }
+        if seen_mm.insert(Rc::as_ptr(&res.mm) as usize) {
+            let mm = res.mm.borrow();
+            mapped.clear();
+            mapped_fuse.clear();
+            mm.mapped_file_inos(&mut mapped, &mut mapped_fuse);
+            if mapped
+                .iter()
+                .any(|&(mnt, ino)| removed(&Node::Store(mnt, ino)))
+                || mapped_fuse.iter().any(file_removed)
+            {
+                return true;
+            }
+        }
         let exe = k
             .groups
             .get(&task.tgid)
             .and_then(|g| g.borrow().exe.clone());
-        removed(&fs.root)
-            || removed(&fs.cwd)
-            || exe.is_some_and(|e| {
-                e.node
-                    .is_some_and(|(mnt, ino)| removed(&Node::Store(mnt, ino)))
-                    || e.ovl
-                        .as_ref()
-                        .is_some_and(|(mnt, o, _)| removed(&Node::Overlay(*mnt, *o)))
-            })
-    })
+        if exe.is_some_and(|e| {
+            e.node
+                .is_some_and(|(mnt, ino)| removed(&Node::Store(mnt, ino)))
+                || e.ovl
+                    .as_ref()
+                    .is_some_and(|(mnt, o, _)| removed(&Node::Overlay(*mnt, *o)))
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 // ---- Shared helpers ----

@@ -306,7 +306,7 @@ const SYS_GPU: &[&[u8]] = &[
 /// `/proc`, directories ending in `/`). Those under `sys/net` follow the reader's network namespace
 /// (as on Linux), and the directories under `ipv4/conf` and `ipv6/conf` are
 /// [`PseudoNode::NetConf`].
-const STATIC: [&[u8]; 131] = [
+const STATIC: [&[u8]; 133] = [
     b"sys/",
     b"sys/debug/",
     b"sys/debug/exception-trace",
@@ -332,7 +332,9 @@ const STATIC: [&[u8]; 131] = [
     b"sys/fs/pipe-max-size",
     b"sys/fs/pipe-user-pages-hard",
     b"sys/fs/pipe-user-pages-soft",
+    PROTECTED_FIFOS,
     b"sys/fs/protected_hardlinks",
+    PROTECTED_REGULAR,
     b"sys/fs/protected_symlinks",
     b"sys/fs/suid_dumpable",
     b"sys/kernel/",
@@ -440,14 +442,19 @@ const STATIC: [&[u8]; 131] = [
     b"sysvipc/shm",
 ];
 
+/// `/proc/sys/fs/protected_{fifos,regular}` paths shared with `syscall::fs::may_create_in_sticky`.
+pub(crate) const PROTECTED_FIFOS: &[u8] = b"sys/fs/protected_fifos";
+pub(crate) const PROTECTED_REGULAR: &[u8] = b"sys/fs/protected_regular";
+
 /// The sysctls procfs only records, so that `sysctl -p` setups, benchmark scripts and checkers find
 /// them: (path relative to `/proc`, mode, default, lowest and highest value accepted), the range
 /// being that of Linux 6.1's handler (any int for `proc_dointvec`). A write keeps the value in
-/// `Kernel::sysctls` and changes nothing else, except `debug.exception-trace`, which
-/// crate::signal reads ([`recorded_value`]); `kernel.randomize_va_space` starts at 0 because
-/// Appine places mappings at fixed addresses, and `debug.exception-trace` at arm64's 0
+/// `Kernel::sysctls` and changes nothing else, except those read via [`recorded_value`]
+/// (`debug.exception-trace`, `fs.suid_dumpable`, `fs.protected_fifos`, `fs.protected_regular`,
+/// `vm.dirty_writeback_centisecs`); `kernel.randomize_va_space` starts at 0 because Appine places
+/// mappings at fixed addresses, and `debug.exception-trace` at arm64's 0
 /// (`show_unhandled_signals`; x86 starts at 1).
-pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 40] = {
+pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 42] = {
     const INT_MIN: i64 = i32::MIN as i64;
     const INT_MAX: i64 = i32::MAX as i64;
     // LONG_MAX / HZ for the hung-task times (HZ 250, as on distribution arm64 kernels)
@@ -456,6 +463,8 @@ pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 40] = {
         (b"sys/debug/exception-trace", 0o644, 0, INT_MIN, INT_MAX),
         (b"sys/fs/overflowgid", 0o644, 65534, 0, 65535),
         (b"sys/fs/overflowuid", 0o644, 65534, 0, 65535),
+        (PROTECTED_FIFOS, 0o644, 1, 0, 2),
+        (PROTECTED_REGULAR, 0o644, 2, 0, 2),
         (b"sys/fs/suid_dumpable", 0o644, 0, 0, 2),
         (b"sys/kernel/core_pipe_limit", 0o644, 0, INT_MIN, INT_MAX),
         (b"sys/kernel/hung_task_all_cpu_backtrace", 0o644, 0, 0, 1),
@@ -2603,6 +2612,53 @@ pub(crate) fn pollable(node: &PseudoNode) -> bool {
     )
 }
 
+/// Change-notification state attached to an open synthetic file (`open_pseudo`):
+/// - `/proc/<pid>/mounts` and `mountinfo`: the target thread's mount namespace's event counter
+///   (Linux's `mounts_open_common` -> `mnt_ns->event`),
+/// - `/proc/sys/kernel/{hostname,domainname}`: the pinned UTS namespace's per-name counter
+///   (Linux's `proc_uts_poll`),
+/// - cgroup2 files: the cgroup file's observation counter (kernfs first-read rule),
+/// - sysfs files: a constant kernfs counter (kernfs first-read rule).
+pub(crate) fn poll_event(
+    k: &mut Kernel,
+    vfs: &Vfs,
+    node: &PseudoNode,
+) -> Option<crate::fd::ProcEvent> {
+    match node {
+        PseudoNode::Entry(proc, entry_tid, Entry::Mounts | Entry::MountInfo) => {
+            let ns_id = group_of_id(k, *proc)
+                .and_then(|g| {
+                    let tgid = g.borrow().tgid;
+                    let tid = entry_tid.unwrap_or(proc.pid);
+                    k.tasks.get(&tid).filter(|t| t.tgid == tgid)
+                })
+                .map_or(crate::vfs::INIT_MNT_NS, |t| {
+                    t.res.borrow().fs.borrow().mnt_ns.id
+                });
+            Some(crate::fd::ProcEvent::mounts(vfs.mount_events_of(ns_id)))
+        }
+        PseudoNode::UtsSysctl(path, uts) => {
+            let counter = if *path == b"sys/kernel/hostname" {
+                uts.0.hostname_event.clone()
+            } else {
+                uts.0.domainname_event.clone()
+            };
+            Some(crate::fd::ProcEvent::mounts(counter))
+        }
+        PseudoNode::Cgroup(id, name, _) if !name.is_empty() => Some(crate::fd::ProcEvent::kernfs(
+            crate::cgroup::observe(k, *id, name)
+                .unwrap_or_else(|| Rc::new(std::cell::Cell::new(1))),
+        )),
+        PseudoNode::Sys(_)
+        | PseudoNode::SysCpu(..)
+        | PseudoNode::SysNet(..)
+        | PseudoNode::SysBlock(..) => Some(crate::fd::ProcEvent::kernfs(Rc::new(
+            std::cell::Cell::new(1),
+        ))),
+        _ => None,
+    }
+}
+
 /// Whether Linux 6.1 gives synthetic file `node` a `read_iter` (or, with `write`, a `write_iter`)
 /// operation, required by native AIO (`io_submit` returns `EINVAL` without). Sysfs, cgroup2 and
 /// `/proc/sys` (`kernfs_file_fops`, `proc_sys_file_operations`) implement both; procfs `seq_file`
@@ -2862,7 +2918,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             b"sys/kernel/seccomp/actions_logged" => crate::seccomp::actions_logged(ps.k),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
-            b"sys/kernel/pid_max" => "4194304\n".to_owned(),
+            b"sys/kernel/pid_max" => format!("{}\n", ps.k.pid_max),
             b"sys/kernel/dmesg_restrict" => format!("{}\n", ps.k.dmesg_restrict as u8),
             b"sys/kernel/panic" => format!("{}\n", ps.k.panic),
             b"sys/kernel/unprivileged_bpf_disabled" => {
@@ -4714,10 +4770,9 @@ pub(crate) fn is_numeric_sysctl(node: &PseudoNode) -> bool {
 
 /// Writes a synthetic file: cgroup files go to [`crate::cgroup::write`], the id maps,
 /// `setgroups` and `timens_offsets` to their own writers, and the other writable files check the
-/// value and record it (namespaced sysctls in the writer's namespaces); some recorded values have
-/// no effect, and `kernel/pid_max` accepts writes and ignores them. `cred`, `ns` and `pid_ns` are
-/// the writer's, `opener` the credentials the file was opened with. Returns the bytes consumed
-/// and the resulting position.
+/// value and record it (namespaced sysctls in the pinned lookup namespace); some recorded values
+/// have no effect. `cred`, `ns` and `pid_ns` are the writer's, `opener` the credentials the file
+/// was opened with. Returns the bytes consumed and the resulting position.
 pub(crate) fn write(
     k: &mut Kernel,
     (tid, cred, opener): (Tid, &Cred, &Cred),
@@ -4745,13 +4800,18 @@ pub(crate) fn write(
     }
     let numeric = numeric_write(node);
     if numeric.is_none() || (pos == 0 && !data.is_empty()) {
-        write_value(k, (tid, cred, opener), (ns, pid_ns), node, data)?;
+        write_value(k, (tid, cred, opener), (ns, pid_ns), node, data, pos)?;
     }
     // Per-process numbers consume at most the 12 bytes parsed by proc_number.
+    // ID map writes advance the file position (Linux's map_write: `*ppos += count`), so a second
+    // write on the same descriptor without rewinding sees a nonzero offset and fails with EINVAL.
     let result = match numeric {
         Some(NumericWrite::Ipv6Fixup) => (count.min(1), pos),
         Some(NumericWrite::Unsigned) if pos == 0 => (count, pos),
         Some(_) => (count, pos + count as u64),
+        None if matches!(node, PseudoNode::Entry(_, _, Entry::UidMap | Entry::GidMap)) => {
+            (count, pos + count as u64)
+        }
         None if matches!(
             node,
             PseudoNode::Entry(_, _, Entry::OomScoreAdj | Entry::CoredumpFilter)
@@ -4770,6 +4830,7 @@ fn write_value(
     (ns, pid_ns): (&crate::nsproxy::NsProxy, &PidNs),
     node: &PseudoNode,
     data: &[u8],
+    pos: u64,
 ) -> Result<(), Errno> {
     match node {
         PseudoNode::Cgroup(id, name, _) => {
@@ -4789,7 +4850,7 @@ fn write_value(
             return write_comm(k, tid, *proc, *entry_tid, data);
         }
         PseudoNode::Entry(proc, _, e @ (Entry::UidMap | Entry::GidMap)) => {
-            return write_id_map(k, (cred, opener), *proc, *e == Entry::GidMap, data);
+            return write_id_map(k, (cred, opener), *proc, *e == Entry::GidMap, data, pos);
         }
         PseudoNode::Entry(proc, _, Entry::Setgroups) => {
             return write_setgroups(k, opener, *proc, data);
@@ -4861,18 +4922,17 @@ fn write_value(
             }
             return Err(Errno::EINVAL);
         }
-        // UTS namespace sysctls: the pinned lookup namespace
+        // UTS namespace sysctls: the pinned lookup namespace; wakes pollers with POLLPRI
         PseudoNode::UtsSysctl(path, uts) => {
             let name = data.strip_suffix(b"\n").unwrap_or(data);
             if name.len() > crate::kernel::UTS_LEN {
                 return Err(Errno::EINVAL);
             }
-            let mut slot = if *path == b"sys/kernel/hostname" {
-                uts.0.hostname.borrow_mut()
+            if *path == b"sys/kernel/hostname" {
+                uts.0.set_hostname(name.to_vec());
             } else {
-                uts.0.domainname.borrow_mut()
-            };
-            *slot = name.to_vec();
+                uts.0.set_domainname(name.to_vec());
+            }
             return Ok(());
         }
         // Between 0 and pid_max, as on Linux (checkpoint/restore uses it to give a new process a
@@ -4881,7 +4941,7 @@ fn write_value(
             let pid: i32 = std::str::from_utf8(data)
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
-                .filter(|&n| (0..=crate::kernel::PID_MAX).contains(&n))
+                .filter(|&n| (0..=k.pid_max).contains(&n))
                 .ok_or(Errno::EINVAL)?;
             if pid_ns.0.level == 0 {
                 k.set_last_pid(pid);
@@ -5043,6 +5103,10 @@ fn write_value(
             .ok_or(Errno::EINVAL)
     };
     match node {
+        PseudoNode::Static(b"sys/kernel/pid_max") => {
+            k.pid_max =
+                int_in(crate::kernel::pid_max_min() as i64..=crate::kernel::PID_MAX as i64)? as Tid;
+        }
         PseudoNode::Static(b"sys/kernel/panic") => {
             k.panic = int_in(i32::MIN as i64..=i32::MAX as i64)? as i32;
         }
@@ -5197,7 +5261,13 @@ fn write_id_map(
     proc: ProcId,
     gid: bool,
     data: &[u8],
+    pos: u64,
 ) -> Result<(), Errno> {
+    // Linux's map_write: only allows < PAGE_SIZE writes starting at offset 0 (so a second write
+    // on the same fd without rewinding fails with EINVAL rather than EPERM).
+    if pos != 0 || data.len() >= 4096 {
+        return Err(Errno::EINVAL);
+    }
     let g = group_of_id(k, proc).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
     let parent = ns.parent.clone().ok_or(Errno::EPERM)?;
@@ -5596,5 +5666,10 @@ mod tests {
         let proc = ProcId { pid: 1, serial: 1 };
         assert!(writable(&PseudoNode::Entry(proc, None, Entry::Comm)));
         assert!(writable(&PseudoNode::Entry(proc, Some(2), Entry::Comm)));
+        assert!(STATIC.contains(&PROTECTED_FIFOS));
+        assert!(STATIC.contains(&PROTECTED_REGULAR));
+        let k = Kernel::new(crate::process::Tier::Interpreter);
+        assert_eq!(recorded_value(&k, PROTECTED_FIFOS), 1);
+        assert_eq!(recorded_value(&k, PROTECTED_REGULAR), 2);
     }
 }
