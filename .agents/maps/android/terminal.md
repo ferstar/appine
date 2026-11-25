@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: confirm keyboard closure of busy tabs)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: route extra keys to the focused search bar so they never leak to the terminal)
 
 ## Responsibilities
 
@@ -56,8 +56,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   `startViewer`; keeps the activity and its toast callback, with no service or session state.
 - `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
   without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
-  shows the count it is given (`setCount`) and sends text changes, steps and closing to a
-  `Target` (`search`, `step`, `close`).
+  shows the count it is given (`setCount`), exposes `hasInputFocus`, handles extra-key actions
+  (`extraKey`, `extraText`, backed by pure `SearchExtraKeys`) while focused, and sends text
+  changes, steps and closing to a `Target` (`search`, `step`, `close`).
 - `Ui.kt` — what the screens and views share (`VtView` too): `LINE_DP` and `line()` (how thick
   the indicators and the progress line are: 1 dp, at least a pixel), `dp`, `themeColor`
   (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
@@ -196,9 +197,12 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ### Extra-key integration
 
-- `android/keys` supplies `ExtraKeysView` and modifier state. `MainActivity.Keys` closes the
-  tab list and forwards keys/text to `VtView`; `Host` exposes `ctrl`, `alt`, `shift` and
-  `modifiersUsed`. Search focus does not redirect extra keys into the search field.
+- `android/keys` supplies `ExtraKeysView` and modifier state. `MainActivity.Keys` checks
+  `Privacy.locked`, closes the tab list and routes via `SearchExtraKeys`: while `SearchBarView`
+  has input focus (`hasInputFocus`), extra keys go to `SearchBarView.extraKey`/`extraText` (and
+  consume one-shot modifiers) so nothing leaks to the terminal; otherwise they go to `VtView`.
+  Opening or closing search cancels active extra-key repeats (`ExtraKeysView.cancelPresses`).
+  `Host` exposes `ctrl`, `alt`, `shift` and `modifiersUsed`.
 - `TerminalLayout` owns insets and IME translation; the key view chooses its own row layout.
 
 ### File-import integration
@@ -252,8 +256,11 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   key while searching, or the same one again when the activity comes back, see Binding and choosing a tab) or
   a restart closes it too, as a search belongs to the tab it was opened in.
 - Tapping the terminal (or pressing a mouse on it) while the bar is open gives the keyboard back to
-  the terminal and leaves the bar and its marks; the extra keys always go to the terminal, the
-  bar's text focused or not.
+  the terminal and leaves the bar and its marks, at which point extra keys resume targeting the
+  terminal. While the search bar has focus, extra keys act on it instead (Esc closes, `↑`/`↓` step
+  matches, `←`/`→`/Home/End move or Shift-extend the selection, symbols replace any selection or
+  insert at the cursor, and Ctrl/Alt combos or terminal-only keys like Tab/F1–F12/PgUp/PgDn are
+  consumed without reaching the terminal).
 - The search bar's `↑`, `↓` and `×` click listeners request the same `KEYBOARD_TAP` feedback
   as the tab bar and extra keys; Enter, Escape and the IME's Search action bypass those listeners.
 
@@ -383,8 +390,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   empty clipboard, and should the question offer to remember the answer for the tab (Ghostty asks
   every time)?
 - Should typing in the search bar select the newest match at once, as Chrome's find bar does,
-  rather than wait for a step, as Ghostty does? And should the extra keys act on the search text
-  while it has the keyboard, rather than on the terminal?
+  rather than wait for a step, as Ghostty does?
 
 ## To verify
 

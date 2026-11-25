@@ -633,6 +633,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     private fun openSearch() {
         if (current == null) return
         closeTabList()
+        layout.keys.cancelPresses()
         layout.tabBar.isVisible = false
         layout.searchBar.open()
         closeSearchOnBack.isEnabled = true
@@ -641,6 +642,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     /** Ends the search and brings the tab bar back; the terminal takes the keyboard again. */
     private fun closeSearch() {
         if (!layout.searchBar.isVisible) return
+        layout.keys.cancelPresses()
         layout.searchBar.isVisible = false
         layout.tabBar.isVisible = true
         layout.screen.endSearch()
@@ -850,16 +852,34 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         override fun close() = closeSearch()
     }
 
-    /** The extra keys go to the view, which reads the one-shot modifiers through [Host]. */
+    /**
+     * The extra keys go to the search bar while its input has focus (never leaking to the
+     * terminal), and otherwise to the terminal view, which reads the one-shot modifiers through
+     * [Host].
+     */
     private inner class Keys : ExtraKeysView.Target {
         override fun key(keyCode: Int) {
-            closeTabList()
-            layout.screen.press(keyCode)
+            SearchExtraKeys.routeKey(
+                keyCode = keyCode,
+                locked = Privacy.locked(this@MainActivity),
+                searchFocused = layout.searchBar.hasInputFocus,
+                onBeforeDispatch = ::closeTabList,
+                onSearchKey = { layout.searchBar.extraKey(it, layout.keys.ctrl, layout.keys.alt, layout.keys.shift) },
+                onTerminalKey = layout.screen::press,
+                onSearchModifiersUsed = layout.keys::modifiersUsed,
+            )
         }
 
         override fun text(text: String) {
-            closeTabList()
-            layout.screen.type(text)
+            SearchExtraKeys.routeText(
+                text = text,
+                locked = Privacy.locked(this@MainActivity),
+                searchFocused = layout.searchBar.hasInputFocus,
+                onBeforeDispatch = ::closeTabList,
+                onSearchText = { layout.searchBar.extraText(it, layout.keys.ctrl, layout.keys.alt) },
+                onTerminalText = layout.screen::type,
+                onSearchModifiersUsed = layout.keys::modifiersUsed,
+            )
         }
 
         override fun notice(text: String) = showToast(text)

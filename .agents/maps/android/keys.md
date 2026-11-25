@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: shared terminal control colours with stronger state contrast)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: added `cancelPresses` for search focus transitions and resolved search-focus routing in `android/terminal`)
 
 ## Responsibilities
 
@@ -37,7 +37,7 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
 
 ## Public entry points
 
-- `Target.key`, `text`, `notice`; `ctrl`, `alt`, `shift`, `modifiersUsed`.
+- `Target.key`, `text`, `notice`; `ctrl`, `alt`, `shift`, `modifiersUsed`, `cancelPresses`.
 - Shared `FADE_DP`, `indicatorPaint`, `drawIndicator`, `indicatorBounds` serve `android/tabbar`.
 
 ## Data flow / lifecycle
@@ -149,12 +149,13 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   extra keys' labels) scrolls far sideways to centre its text, which also draws a foreground
   drawable it is given off the label.
 - Shared indicator/fade helpers also serve `android/tabbar`; changes require checking both maps.
-- MainActivity owns final privacy checks and routing; modifier state is consumed only after
-  VtView reports use, not when the extra-key callback fires.
+- MainActivity owns final privacy checks and routing (including directing extra keys to the focused
+  search bar instead of the terminal); modifier state is consumed only after the receiving sink
+  (VtView or SearchBarView) handles the input, not when the extra-key touch starts.
 
 ## Open questions
 
-- Search focus still sends extra keys to the terminal; the policy question is in `android/terminal`.
+None.
 
 ## To verify
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: added junit4 testImplementation dependency for JVM unit tests)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `scripts/release-sources` resolves Alpine aports across `main/` and `community/` and documents workspace vendoring accurately)
 
 ## Responsibilities
 
@@ -163,7 +163,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 - `scripts/release-sources` refuses to run with tracked changes in the work tree and writes, under
   the short `HEAD` revision: `appine-<rev>.tar.gz` (`git archive HEAD`), `appine-<rev>-vendor.tar.gz`
-  (`cargo vendor --locked` of the whole workspace), `virglrenderer-1.3.0.tar.gz`, `libghostty-vt-<version>.tar.gz` and
+  (`cargo vendor --locked` of the locked Cargo workspace, required for offline `--locked` builds of
+  the shipped workspace archive), `virglrenderer-1.3.0.tar.gz`, `libghostty-vt-<version>.tar.gz` and
   `libghostty-vt-<version>-deps.tar.gz` (the release and its Zig packages, copied as
   `fetch-ghostty` checked them; together about 10 MB), and
   `alpine-<version>-gpl-sources.tar` (uncompressed, with a README listing the packages).
@@ -172,7 +173,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   package's `.PKGINFO`) contains `GPL` (LGPL included; so bash, readline, procps-ng/libproc2 and
   libintl, bubblewrap, libcap2 and bridge, not doas, ncurses, utmps-libs or skalibs-libs),
   downloads each origin's
-  aports directory at its commit (GitLab archive of `main/<origin>`), and for every file in the
+  aports directory at its commit (GitLab archive, trying `main/<origin>` then `community/<origin>`
+  until an `APKBUILD` is present), and for every file in the
   APKBUILD's `sha512sums` hashes the copy in that directory or fetches it from Alpine's distfiles
   mirror (the branch's directory, then `edge`); any miss or mismatch stops the script. APKBUILDs
   are never executed.
@@ -227,8 +229,6 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 - `scripts/fetch-ghostty` checks only the pinned sha256s; the release's minisign signatures are to
   be checked by hand once when upgrading, before pinning the new sha256s.
-- `scripts/release-sources` fixes the aports path to `main/` and vendors the whole workspace although its header speaks
-  of the crates linked into the app.
 
 ## Open questions
 
