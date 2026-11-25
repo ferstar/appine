@@ -149,7 +149,9 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
                 s.proto = protocol;
             }
             s.net = net;
-            s.euid = cx.cred().euid;
+            let cred = cx.cred();
+            s.euid = cred.euid;
+            s.uid = cred.fsuid;
             Socket::Inet(s)
         }
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
@@ -173,6 +175,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             }
             let mut s = NetlinkSocket::new(protocol, base);
             s.net = net;
+            s.uid = cx.cred().fsuid;
             Socket::Netlink(s)
         }
         AF_NETLINK => return Err(Errno::ESOCKTNOSUPPORT),
@@ -180,6 +183,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             let mut s = unix::socket(base, protocol)?;
             if let Socket::Unix(u) = &mut s {
                 u.net = net;
+                u.uid = cx.cred().fsuid;
                 u.set_max_qlen(unix::max_dgram_qlen(cx));
             }
             s
@@ -880,9 +884,11 @@ fn accept_host(
                 if let Socket::Inet(s) = &*sock.borrow() {
                     new.filter = s.filter.clone();
                 }
-                // IPV6_V6ONLY and SO_BINDTODEVICE carry over (sk_clone_lock)
+                // IPV6_V6ONLY and SO_BINDTODEVICE carry over (sk_clone_lock); the accepted
+                // socket's inode UID belongs to the accepting task (do_accept -> sock_alloc).
                 new.v6only = *v6only;
                 new.euid = *euid;
+                new.uid = cx.cred().fsuid;
                 new.bound_dev_if = *bound_dev_if;
                 new.local_map = local_map;
                 new.net = net.clone();

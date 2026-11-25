@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: show FUSE locks in `/proc/locks` and fdinfo, and omit unshown entries without advancing line numbers)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: track taking `OpenFile` for POSIX lock fdinfo, list `F_SETLKW`/`F_OFD_SETLKW` waiters (`->` lines) and newest-first order in `/proc/locks`, and clear waiters on interrupted waits)
 
 ## Responsibilities
 
@@ -27,9 +27,9 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
 
 ## Key types
 
-- `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, ranges, taker's pid, waiters),
-  `FlockHolder`, `Lease` (with its setter's pid); leases are registered by inode in
-  `Kernel::leases`.
+- `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, taking `file: Weak<OpenFile>`,
+  ranges, taker's pid, acquisition `seq`, per-thread `Waiter`s keyed by `tid`), `FlockHolder`
+  (with `seq`), `Lease` (with its setter's pid); leases are registered by inode in `Kernel::leases`.
 - `Flocks` and the record-lock table use the same `LockKey` for filesystem nodes, pipes, sockets and devpts inodes.
 - `FdTable::holds_locks`, and lock ownership in `OpenFile` (`kernel/files`).
 
@@ -79,17 +79,20 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
 
 ### Listings
 
-- Listing (6.1's `lock_get_status`): every flock, POSIX and OFD lock and lease, in that order and
-  by inode, as `FLOCK  ADVISORY  `, `POSIX  ADVISORY  `, `OFDLCK ADVISORY  ` or
+- Listing (6.1's `lock_get_status`): `/proc/locks` lists every flock, POSIX and OFD lock and lease
+  newest first (by acquisition sequence; leases sort after flocks/record locks) as
+  `FLOCK  ADVISORY  `, `POSIX  ADVISORY  `, `OFDLCK ADVISORY  ` or
   `LEASE  ACTIVE    `/`LEASE  BREAKING  `, the type (a lease being broken shows its target type),
   the taker's pid (the caller's tgid at flock, F_SETLK or F_SETLEASE; -1 for OFD locks), the device
   and inode fstat shows through the holding open file (the shown inode on overlayfs, the cached
   inode on FUSE, the pipefs inode for an anonymous pipe, sockfs or PTY fstat identity for those
-  files), and the range with an inclusive end (`EOF` from `OFFSET_MAX`) or `0 EOF`. `/proc/locks`
-  numbers lines by position, omitting entries without a shown identity without advancing the count
-  and leaving out (numbers included) locks whose pid the reader's procfs cannot see; fdinfo
-  numbers from 1 the locks held through that open file, a POSIX lock through the open file of its
-  table's lowest fd on the file.
+  files), and the range with an inclusive end (`EOF` from `OFFSET_MAX`) or `0 EOF`, with blocked
+  `F_SETLKW` / `F_OFD_SETLKW` waiters immediately below the lock that blocks them (`<pos>: -> ...`,
+  omitted when either the blocking lock or the waiter is invisible in the reader's pid namespace).
+  `/proc/locks` numbers lines by position, omitting entries without a shown identity without
+  advancing the count and leaving out (numbers included) locks whose pid the reader's procfs cannot
+  see; fdinfo numbers from 1 (in per-inode order: flock, POSIX/OFD, lease) the held locks taken
+  through that open file (`fl_file`, matching Linux's `show_fd_locks`).
 
 ## Dependencies (inbound / outbound)
 
@@ -116,10 +119,8 @@ Outside the module: closing fds and open files, which call `locks::closed`, and 
 
 ## Confirmed bugs / technical debt
 
-- **Lock listings differ:** `/proc/locks` goes by kind and inode where Linux lists newest first
-  (lslocks prints another order) and leaves out `F_SETLKW` waiters (Linux's `->` lines); a POSIX
-  lock shows in the fdinfo of its table's lowest fd on the file, not of the open file that took
-  it.
+- **Remaining `/proc/locks` gaps:** blocked `flock(2)` waiters are not tracked as `->` lines, and
+  leases do not record an acquisition sequence number so they appear after flocks and record locks.
 
 ## Open questions
 

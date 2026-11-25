@@ -46,6 +46,18 @@ pub(crate) enum Socket {
     Unix(crate::unix::UnixSocket),
 }
 
+impl Socket {
+    /// Creator's filesystem UID recorded at socket creation (`sock_i_uid`), reported in
+    /// `/proc/net/*`.
+    pub(crate) fn uid(&self) -> u32 {
+        match self {
+            Socket::Inet(s) => s.uid,
+            Socket::Netlink(s) => s.uid,
+            Socket::Unix(s) => s.uid,
+        }
+    }
+}
+
 /// TCP, UDP and ping sockets implemented with host sockets.
 pub(crate) struct InetSocket {
     /// The host fd (nonblocking), closed together with this object.
@@ -119,8 +131,10 @@ pub(crate) struct InetSocket {
     /// The number under which a bound socket in a new network namespace is registered in the
     /// namespace ([`crate::netns::Binding`]), removed on close.
     pub listener: Option<std::num::NonZeroU64>,
-    /// Effective UID of the socket owner at creation (`sock_i_uid`, for `SO_REUSEPORT` matching).
+    /// Effective UID of the socket owner at creation (`SO_REUSEPORT` matching).
     pub euid: u32,
+    /// Creator's filesystem UID (`sock_i_uid`), reported in `/proc/net/*`.
+    pub uid: u32,
     /// UDP: bound on the host to 127.a.b.254 (for datagrams sent to its own virtual address), with
     /// the port registered in the namespace's [`crate::nsproxy::Loopback::self_udp`], removed on
     /// close.
@@ -210,6 +224,7 @@ impl InetSocket {
             rd_shut: false,
             listener: None,
             euid: 0,
+            uid: 0,
             self_port: None,
             v6only: false,
             icmp: None,
@@ -732,6 +747,8 @@ pub(crate) struct NetlinkSocket {
     pub sndtimeo: Option<Duration>,
     /// The generic `SOL_SOCKET` options it only records.
     pub opts: SockOpts,
+    /// Creator's filesystem UID (`sock_i_uid`).
+    pub uid: u32,
 }
 
 impl NetlinkSocket {
@@ -757,6 +774,7 @@ impl NetlinkSocket {
             passcred: false,
             sndtimeo: None,
             opts: SockOpts::default(),
+            uid: 0,
             overrun: Default::default(),
         }
     }

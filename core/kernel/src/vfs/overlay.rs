@@ -988,7 +988,9 @@ impl Overlays {
             Err(Errno::ENOENT) if !exchange => None,
             Err(e) => return Err(e),
         };
-        if dst == Some(src) {
+        if dst == Some(src)
+            || (!exchange && dst.is_some_and(|d| self.node(d).real() == self.node(src).real()))
+        {
             return Ok(None);
         }
         let is_dir = |o: &Self, id| -> Result<bool, Errno> {
@@ -1241,6 +1243,21 @@ mod tests {
         let f = o.lookup(&s, top, b"f").unwrap();
         let g = o.lookup(&s, top, b"g").unwrap();
         assert!(o.linked(f) && o.linked(g));
+        // Renaming a file onto another hard link of the same inode is a no-op.
+        let f_up = o.upper_of(&s, f, CopyUp::All).unwrap();
+        let top_up = o.upper_of(&s, top, CopyUp::All).unwrap();
+        s.link(top_up, b"f_hard", f_up).unwrap();
+        let f_hard = o.lookup(&s, top, b"f_hard").unwrap();
+        assert_ne!(f_hard, f);
+        assert_eq!(
+            o.rename(&s, (top, b"f"), (top, b"f_hard"), (false, false))
+                .unwrap(),
+            None
+        );
+        assert!(o.linked(f) && o.linked(f_hard));
+        o.remove(&s, top, b"f_hard", false).unwrap();
+        assert!(!o.linked(f_hard) && o.linked(f));
+        assert_eq!(s.attrs(f_up).unwrap().nlink, 1);
         o.rename(&s, (top, b"f"), (top, b"f2"), (false, false))
             .unwrap();
         assert!(o.linked(f));

@@ -2471,6 +2471,10 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
     if let PseudoNode::Mq(_, ino) = node {
         return *ino;
     }
+    // A namespace file's inode number is its namespace id (consistent with stat and node_ino).
+    if let PseudoNode::NsFile(_, id) = node {
+        return *id;
+    }
     let mut h = std::hash::DefaultHasher::new();
     node.hash(&mut h);
     h.finish() | 1
@@ -2968,8 +2972,22 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 self::Entry::Stat => return pid_stat(ps, &ns, *proc, *tid),
                 self::Entry::Status => return pid_status(ps, &ns, *proc, *tid),
                 self::Entry::Statm => {
-                    let (vsize, rss) = mem_of(task.as_deref());
-                    format!("{} {rss} 0 0 0 {rss} 0\n", vsize / 4096)
+                    if let Some(t) = task.as_deref() {
+                        let res = t.res.borrow();
+                        let mm = res.mm.borrow();
+                        let (anon, file, shmem) = mm.resident_split();
+                        let shared = file + shmem;
+                        let rss = anon + shared;
+                        let layout = vm_layout(&mm);
+                        let data_pages = (layout.data + layout.stack) / 4096;
+                        format!(
+                            "{} {rss} {shared} {} 0 {data_pages} 0\n",
+                            layout.size / 4096,
+                            layout.code_span / 4096,
+                        )
+                    } else {
+                        "0 0 0 0 0 0 0\n".to_owned()
+                    }
                 }
                 self::Entry::Comm => {
                     let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
@@ -3340,13 +3358,27 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Resu
             shmem * 4
         )
         .unwrap();
-        // Grows-down mappings are the stack (Linux's stack_vm); data and code are not told
-        // apart; no swap
-        let stack = task
-            .as_ref()
-            .map_or(0, |t| t.res.borrow().mm.borrow().stack_bytes());
-        writeln!(s, "VmData:\t{kb:>8} kB\nVmStk:\t{:>8} kB", stack / 1024).unwrap();
-        writeln!(s, "VmExe:\t{:>8} kB\nVmLib:\t{:>8} kB", 0, 0).unwrap();
+        // Linux 6.1's task_mem: VmData (private writable non-stack), VmStk (grows-down),
+        // VmExe (code span capped by exec_vm), VmLib (remaining exec_vm); no swap or PTE count.
+        let layout = task.as_ref().map_or(VmLayout::default(), |t| {
+            vm_layout(&t.res.borrow().mm.borrow())
+        });
+        let exe = layout.code_span.min(layout.exec);
+        let lib = layout.exec.saturating_sub(exe);
+        writeln!(
+            s,
+            "VmData:\t{:>8} kB\nVmStk:\t{:>8} kB",
+            layout.data / 1024,
+            layout.stack / 1024,
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "VmExe:\t{:>8} kB\nVmLib:\t{:>8} kB",
+            exe / 1024,
+            lib / 1024,
+        )
+        .unwrap();
         writeln!(s, "VmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB", 0, 0).unwrap();
     }
     writeln!(s, "Threads:\t{}", thread_count(&g).max(1)).unwrap();
@@ -3449,6 +3481,54 @@ fn comm_of(g: &ThreadGroup, task: Option<&Task>, pid: Tid, tid: Option<Tid>) -> 
     };
     let n = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     comm[..n].to_vec()
+}
+
+/// Virtual-memory breakdown matching Linux 6.1's `vm_stat_account` / `task_mem` / `task_statm`
+/// (in bytes): total size, `data_vm` (private writable non-stack), `stack_vm` (grows-down),
+/// `exec_vm` (executable non-writable non-stack), and the page-aligned code span (`[start_code,
+/// end_code)`).
+#[derive(Default)]
+struct VmLayout {
+    size: u64,
+    data: u64,
+    stack: u64,
+    exec: u64,
+    code_span: u64,
+}
+
+fn vm_layout(mm: &crate::mm::Mm) -> VmLayout {
+    let size = mm.size();
+    let stack = mm.stack_bytes();
+    let mut main_stack = 0u64;
+    let mut raw_data = 0u64;
+    let mut exec = 0u64;
+    for r in mm.regions() {
+        let len = r.end.saturating_sub(r.start);
+        let is_main_stack = r.name.as_deref() == Some(b"[stack]");
+        if is_main_stack {
+            main_stack = main_stack.saturating_add(len);
+        } else if r.prot & 4 != 0 && r.prot & 2 == 0 {
+            exec = exec.saturating_add(len);
+        } else if r.prot & 2 != 0 && !r.shared {
+            raw_data = raw_data.saturating_add(len);
+        }
+    }
+    // Exclude any additional MAP_GROWSDOWN mappings already counted in `stack_bytes`.
+    let extra_stack = stack.saturating_sub(main_stack);
+    let data = raw_data.saturating_sub(extra_stack);
+    let (code_start, code_end) = mm.code;
+    let code_span = if code_end > code_start {
+        (code_end.saturating_add(4095) & !4095u64).saturating_sub(code_start & !4095u64)
+    } else {
+        0
+    };
+    VmLayout {
+        size,
+        data,
+        stack,
+        exec,
+        code_span,
+    }
 }
 
 /// An address space's (total size, resident pages).
@@ -4033,11 +4113,21 @@ fn fdinfo(
     };
     let f = file.borrow();
     let mnt_id = f.node().map_or(crate::vfs::ANON_MOUNT, |n| n.mnt());
+    let ino = match &f.kind {
+        FileKind::Host(hfd) => appine_hal::fstat(*hfd).map_or(0, |st| st.st_ino),
+        FileKind::MessageQueue(q) => q.borrow().stat().ino,
+        _ => match f.node() {
+            Some(Node::Store(_, ino)) => ino,
+            Some(Node::Overlay(_, o)) => ps.vfs.overlay().shown_ino(o),
+            Some(Node::Fuse(_, id)) => ps.vfs.fuse().get(id).map_or(0, |n| n.attr.ino),
+            Some(Node::Pseudo(_, p)) => node_ino(&p),
+            None => crate::syscall::dev_ino(&f).1,
+        },
+    };
     let mut s = format!(
-        "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{mnt_id}\nino:\t{}\n",
+        "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{mnt_id}\nino:\t{ino}\n",
         f.pos,
         f.flags | cloexec,
-        f.ino().unwrap_or(0)
     );
     // Only files and tables that have taken locks can hold any (most fds have none)
     if f.holds_locks || fds.holds_locks {
@@ -4269,9 +4359,9 @@ pub(crate) fn format_uuid(b: &[u8; 16]) -> String {
 
 // ---- /proc/<pid>/net ----
 
-/// All open sockets (each counted once), sorted by inode, with the fsuid of the first thread
-/// found holding each in its fd table (Linux shows the creator's), or 0 for sockets that are only
-/// in SCM_RIGHTS messages. Sockets waiting to be accepted do not count.
+/// All open sockets (each counted once), sorted by inode, with the creator's fsuid recorded at
+/// socket creation (`sock_i_uid`), including sockets that are only in SCM_RIGHTS messages.
+/// Sockets waiting to be accepted do not count.
 pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
     let mut tables = HashSet::new();
     let mut seen = HashSet::new();
@@ -4281,12 +4371,12 @@ pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
         if !tables.insert(Rc::as_ptr(&fds)) {
             continue;
         }
-        let uid = task.cred.borrow().fsuid;
         let fds = fds.borrow();
         for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
             if let FileKind::Socket(s) = &file.borrow().kind
                 && seen.insert(Rc::as_ptr(s))
             {
+                let uid = s.borrow().uid();
                 out.push((s.clone(), uid));
             }
         }
@@ -4294,7 +4384,8 @@ pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
     // Those only in SCM_RIGHTS messages
     for s in crate::unix::inflight_sockets(k) {
         if seen.insert(Rc::as_ptr(&s)) {
-            out.push((s, 0));
+            let uid = s.borrow().uid();
+            out.push((s, uid));
         }
     }
     out.sort_by_key(|(s, _)| socket_ino(s));
@@ -5876,5 +5967,134 @@ mod tests {
         assert_eq!((n, pos), (3, 3));
         let (n, pos) = do_write(&cg, b"20\n", pos).unwrap();
         assert_eq!((n, pos), (3, 6));
+    }
+
+    #[test]
+    fn nsfs_ino_of_and_dev_ino_match_stat() {
+        let ns_node = PseudoNode::NsFile(NsKind::Net, 4_026_531_992);
+        assert_eq!(node_ino(&ns_node), 4_026_531_992);
+        assert_eq!(ino_of(&ns_node), 4_026_531_992);
+        let file = OpenFile::new(
+            FileKind::Proc {
+                mnt: crate::vfs::PROC_MOUNT,
+                node: ns_node,
+                data: Vec::new(),
+                fresh: false,
+                mm: None,
+                ns: None,
+                klog: None,
+                opener: Rc::new(Cred::root()),
+                event: None,
+            },
+            oflags::O_RDONLY,
+        );
+        assert_eq!(
+            crate::syscall::dev_ino(&file.borrow()),
+            (Fs::Nsfs.dev(), 4_026_531_992)
+        );
+    }
+
+    #[test]
+    fn sockets_report_creator_uid_even_when_inflight() {
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let (mut a, mut b) =
+            crate::unix::UnixSocket::pair(crate::net::SOCK_DGRAM, crate::unix::Ucred::of(1, 0, 0));
+        a.uid = 1000;
+        b.uid = 1000;
+        let sa = Rc::new(RefCell::new(crate::net::Socket::Unix(a)));
+        let sb = Rc::new(RefCell::new(crate::net::Socket::Unix(b)));
+
+        // Send a socket created by UID 2000 over SCM_RIGHTS so it is only in-flight (not in any
+        // task's fd table).
+        let mut payload = crate::unix::UnixSocket::new(crate::net::SOCK_STREAM);
+        payload.uid = 2000;
+        let payload_sock = Rc::new(RefCell::new(crate::net::Socket::Unix(payload)));
+        let payload_file = OpenFile::new(FileKind::Socket(payload_sock.clone()), oflags::O_RDWR);
+
+        let rx = match &*sb.borrow() {
+            crate::net::Socket::Unix(u) => u.rx.clone(),
+            _ => unreachable!(),
+        };
+        rx.borrow_mut().push(crate::unix::Packet {
+            data: b"hi".to_vec(),
+            off: 0,
+            fds: vec![payload_file],
+            cred: crate::unix::Ucred::of(1, 0, 0),
+            from: Vec::new(),
+            outq: None,
+        });
+        k.unix_inflight.push(Rc::downgrade(&rx));
+        drop(sa);
+
+        let listed = sockets(&k);
+        assert_eq!(listed.len(), 1);
+        assert!(Rc::ptr_eq(&listed[0].0, &payload_sock));
+        assert_eq!(listed[0].1, 2000);
+        drop(sb);
+    }
+
+    #[test]
+    fn vm_layout_matches_linux_status_and_statm_semantics() {
+        use crate::mm::{Mm, flags};
+        use appine_engine::prot;
+
+        let mut mm = Mm::new();
+        // Private writable data mapping (16 KiB)
+        let data = mm
+            .mmap(
+                0,
+                4 * PAGE_SIZE,
+                prot::READ | prot::WRITE,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        // Executable non-writable code mapping (8 KiB)
+        let code = mm
+            .mmap(
+                0,
+                2 * PAGE_SIZE,
+                prot::READ | prot::EXEC,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        mm.code = (code, code + PAGE_SIZE);
+        // Shared writable mapping (12 KiB) — excluded from VmData
+        mm.mmap(
+            0,
+            3 * PAGE_SIZE,
+            prot::READ | prot::WRITE,
+            flags::MAP_SHARED | flags::MAP_ANONYMOUS,
+            None,
+        )
+        .unwrap();
+        // Grows-down stack mapping (8 KiB) — counted in VmStk, not VmData
+        let stack = mm
+            .mmap(
+                0,
+                2 * PAGE_SIZE,
+                prot::READ | prot::WRITE,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        mm.set_growsdown(stack);
+        assert_ne!(data, 0);
+        assert_ne!(stack, 0);
+
+        let layout = vm_layout(&mm);
+        assert_eq!(layout.size, 11 * PAGE_SIZE);
+        assert_eq!(layout.data, 4 * PAGE_SIZE);
+        assert_eq!(layout.stack, 2 * PAGE_SIZE);
+        assert_eq!(layout.exec, 2 * PAGE_SIZE);
+        assert_eq!(layout.code_span, PAGE_SIZE);
+        // status VmExe = min(code_span, exec) = 4 KiB, VmLib = exec - VmExe = 4 KiB
+        let exe = layout.code_span.min(layout.exec);
+        let lib = layout.exec.saturating_sub(exe);
+        assert_eq!(exe, PAGE_SIZE);
+        assert_eq!(lib, PAGE_SIZE);
+        // statm data field = (VmData + VmStk) in pages = 6
+        assert_eq!((layout.data + layout.stack) / PAGE_SIZE, 6);
     }
 }

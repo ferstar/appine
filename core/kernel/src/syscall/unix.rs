@@ -64,6 +64,9 @@ pub(super) fn pair(cx: &Cx<'_>, ty: i32, protocol: i32) -> Result<(Socket, Socke
     let qlen = max_dgram_qlen(cx);
     a.set_max_qlen(qlen);
     b.set_max_qlen(qlen);
+    let uid = cx.cred().fsuid;
+    a.uid = uid;
+    b.uid = uid;
     let net = cx.task.ns.borrow().net.clone();
     if net.host_net.is_some() {
         a.net = Some(net.clone());
@@ -237,8 +240,10 @@ pub(super) fn accept(
         })?;
         if let Some(new) = new {
             let passcred = with(sock, |u| u.receive_queue().borrow().passcred);
+            let uid = cx.cred().fsuid;
             with(&new, |u| {
                 u.embryo = false;
+                u.uid = uid;
                 u.receive_queue().borrow_mut().passcred = passcred;
             });
             // Connects waiting for room in the backlog can go on now

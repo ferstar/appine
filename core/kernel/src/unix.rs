@@ -129,6 +129,8 @@ pub(crate) struct UnixSocket {
     pub opts: crate::net::SockOpts,
     /// Unread payload bytes currently queued in peers from this socket (`SIOCOUTQ`).
     pub outq: Rc<std::cell::Cell<usize>>,
+    /// Creator's filesystem UID (`sock_i_uid`).
+    pub uid: u32,
 }
 
 impl UnixSocket {
@@ -153,6 +155,7 @@ impl UnixSocket {
             net: None,
             opts: crate::net::SockOpts::default(),
             outq: Rc::new(std::cell::Cell::new(0)),
+            uid: 0,
         }
     }
 

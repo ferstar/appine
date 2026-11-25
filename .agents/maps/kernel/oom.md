@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: OOM victim reaping via Mm::release and Tier 1 DBT pool trimming under root memory pressure)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: align `statm` and `status` `VmData`/`VmExe`/`VmLib` with Linux 6.1 in `kernel/procfs`)
 
 ## Responsibilities
 
@@ -229,7 +229,6 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 
 ## Open questions
 
-- `statm` reports data = rss while `status` reports VmData = VmSize; is the mismatch intentional?
 - Root memory pressure now trims unused Tier 1 translations kept in the pool (`trim_dbt_pool`)
   before killing a guest process, but active translations shared through `CodeGroups` stay until
   all live sharers exit; is that acceptable when active shared translations dominate root usage?

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: tmpfs fdinfo device numbers, cgroup2 `IN_CLOSE_*`, and `open_by_handle_at`/memfd watch and open/close events)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: report nsfs inode IDs via `node_ino`, check post-removal upper link count before overlay `IN_DELETE_SELF`, and forward overlay copy-up, hardlink, removal, rename and attribute events to upper-layer watches)
 
 ## Responsibilities
 
@@ -134,10 +134,16 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   inodes and dentries: the node and its overlay directory with its name (an open file's events
   through the node it was opened through, whose upper inode copying up changes; path-based
   attribute changes and truncation find the node by resolving the path again), not the layers'
-  inodes behind them, so changes made in a layer directly do not reach them. Removal deletes the
-  node when it was a directory or had one link. Creations through an overlay (open with `O_CREAT`,
-  mkdir, mknod, symlink, link, AF_UNIX bind) also report `IN_CREATE` to the upper directory first,
-  where Linux's overlay makes them through the VFS.
+  inodes behind them, so changes made in a layer directly do not reach them. Removal checks the
+  post-removal upper link count (or `st.nlink <= 1` for a lower-only entry) before emitting
+  `IN_DELETE_SELF`, so unlinking one hard link while another remains never emits `IN_DELETE_SELF`.
+  Operations through an overlay also report to upper-layer watches first: creations (`IN_CREATE`),
+  copy-ups (`IN_CREATE` in the upper directory, including parent directories copied up by `copy_up`,
+  `unlink_overlay` and `rename_overlay`), hardlinks (`IN_ATTRIB` on the upper inode and `IN_CREATE`
+  on the upper directory), removals (`IN_ATTRIB`/`IN_DELETE_SELF`/`IN_DELETE` on the upper entry
+  and `IN_CREATE` for any created whiteout), renames (`IN_MOVED_FROM`/`IN_MOVED_TO`/`IN_MOVE_SELF`
+  plus `IN_CREATE` for any whiteout), and path/fd attribute changes (`chmod`, `chown`, `utimensat`,
+  `setxattr`/`removexattr`).
 - Files app changes (`host_change`, under the target kernel's BKL) map `Created`, `Removed`,
   `Moved`, `Opened` (write opens) and `Written` to the same event sequences; the provider reports
   no access, close-nowrite, read-open or attribute events. An `Opened` that gave a held file an
@@ -189,11 +195,16 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
 - **Namespace-file watch lifetime:** repeated watches on `/proc/self/ns/mnt` reuse the descriptor
   by namespace ID. Native Linux 6.8 returned a new descriptor on each lookup when no fd pinned
   the nsfs inode, and reused it while an fd was open.
-- **Overlay layers see little:** watches on a layer's own directories and files see, of what is
-  done through the overlay, only creations (Linux's overlay changes the upper layer through the
-  VFS, which reports copy-ups, removals, renames and attribute changes there too); a hard link
-  made through the overlay and then removed leaves the file's watch reporting its deletion with
-  its last name, where Linux's overlay keeps the link counted and never does.
+- **Overlay upper-layer event gaps (intentionally left out):** overlay file I/O and open/close
+  events (`IN_OPEN`, `IN_ACCESS`, `IN_MODIFY`, `IN_CLOSE_*`) are not duplicated to upper-layer
+  watches (each `OpenFile` carries one `Opened` record keyed to the overlay node), copy-ups emit
+  `IN_CREATE` directly in the upper directory rather than a workdir-to-upper `IN_MOVED_TO`, and
+  parent directory copy-ups inside `create_dir` creations (`open(O_CREAT)`/`mkdir`/`mknod`/
+  `symlink`/`bind`) are not separately reported. For hard links created through an overlay and
+  later all removed, Appine checks the real post-removal upper link count and emits
+  `IN_DELETE_SELF` on the last remaining link (where Linux 6.1 with `index=off` drops the new
+  link's dentry on `ovl_link` so the original overlay inode's `i_nlink` stays elevated and never
+  emits `IN_DELETE_SELF`).
 
 ## To verify
 

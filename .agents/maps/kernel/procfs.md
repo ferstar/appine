@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: align non-sysctl synthetic write positions and return counts with Linux 6.1)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: record socket creator fsuid (`sock_i_uid`) for `/proc/net/*`, align `ino_of`/`fdinfo`/epoll/inotify with `stat`, and align `statm` and `status` `VmData`/`VmExe`/`VmLib` with Linux 6.1)
 
 ## Responsibilities
 
@@ -100,7 +100,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - Inode numbers hash the node (low bit set); roots are 1 (except the mqueue root); devpts `ptmx`
   is 2 and terminal n is n+3; nodes under a pid carry `ProcId { pid, serial }`, so both `node_ino`
   and `ino_of` mix in the thread group's serial and a reused pid gets new inodes; nsfs files use
-  the namespace id in `node_ino`. Inodes are stable within one run.
+  the namespace id in both `node_ino` and `ino_of`. Inodes are stable within one run.
 - Because process-scoped nodes carry `ProcId { pid, serial }`, a held `/proc/<pid>` dirfd, `O_PATH`
   fd or open process file never resolves to a new process reusing that pid: once the pinned thread
   group is reaped, lookups and directory listings under it fail with `ENOENT` and offset-0 reads of
@@ -221,12 +221,16 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   user namespace (the reading thread's credentials, or the opener's when regenerated),
   `NStgid`/`NSpid`/`NSpgid`/`NSsid` from the instance's namespace down, capabilities,
   the thread's `NoNewPrivs` (saved when the leader exits), `Seccomp`, signal masks (`SigPnd` the thread's, `ShdPnd` the group's); memory
-  lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, `VmRSS` the sum of
-  `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmStk` the grows-down mappings,
-  exe/lib/PTE/swap 0; omitted with no live task); `FDSize` the open fds rounded up to 64;
+  lines follow Linux 6.1's `vm_stat_account` / `task_mem` (`VmPeak` = `VmSize`, `VmHWM` from max RSS, `VmRSS` the sum of
+  `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmData` the private writable non-stack
+  mappings, `VmStk` the grows-down mappings, `VmExe` the page-aligned code span capped by executable
+  non-writable mappings, `VmLib` the remaining executable non-writable mappings, PTE/swap 0; omitted
+  with no live task); `FDSize` the open fds rounded up to 64;
   `Cpus_allowed` and `Cpus_allowed_list` show the thread's affinity (the main thread's in the
   process's `status`) within the online CPUs as a hex mask (`cpu_mask_of`) and CPU list. `statm` is
-  `size rss 0 0 0 rss 0`.
+  `size resident shared text 0 data 0` (matching Linux 6.1's `task_statm`: `resident` = `RssAnon +
+  RssFile + RssShmem`, `shared` = `RssFile + RssShmem`, `text` = page-aligned code span, `data` =
+  `VmData + VmStk` in pages).
 - `maps` and `smaps` escape a newline in a mapped file's path as `\012` (Linux's
   `seq_file_path`); file mappings show device `08:01`; smaps counts anonymous resident pages as
   dirty, file pages as clean, and copy-on-write-shared pages as shared with a divided Pss.
@@ -304,7 +308,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   target task's network namespace (falling back to `ThreadGroup::leader_net` or a live thread's
   network namespace when the main thread has exited as a zombie leader, before the initial
   namespace): sockets from every fd table plus in-flight AF_UNIX sockets,
-  filtered by namespace, uids mapped for the reader; host interface counters and routes only in
+  filtered by namespace, with each socket's creation-time `fsuid` (`sock_i_uid`, or the accepting
+  task's `fsuid` for accepted sockets) mapped for the reader; host interface counters and routes only in
   the initial namespace (new namespaces show zeros); `snmp` reflects the namespace's IPv4
   `ip_forward` (`1` enabled, `2` disabled); `arp` is a header line.
 
@@ -371,8 +376,9 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   file visibility and opener-credential checks; policy changes belong in that module.
 - Synthetic nodes have no store inode, so store-only operations (chown/chmod outside devpts, cgroup2 and
   mqueue, xattrs, links) fail on them.
-- `dev_ino` (epoll fdinfo) and inotify use `ino_of`, which omits the mount's device and nsfs's
-  namespace id, so they can disagree with stat for later procfs instances and nsfs files.
+- `fdinfo`'s `ino:`, epoll `tfd:` `ino`/`sdev`, and inotify watch `ino`/`sdev` all resolve mount
+  devices via `Vfs::dev_of` (and `Fs::Nsfs.dev()` for nsfs files) and inode numbers via
+  `node_ino`/`ino_of`, matching `stat` across later procfs instances and nsfs files.
 - The kernel-entry record behind `syscall` is published with atomics and no sequence lock: a
   thread entering and leaving the kernel while another reads it could mix two entries, which only a
   thread shown as `running` can do.
@@ -387,10 +393,6 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - **Fidelity gaps:** modes and owners differ (`environ` 0444, `fd/` and `ns/` 0555,
   `fdinfo/<n>` and `ns/*` owned by root, devpts root 0555, a master's fstat fixed);
   procfs mount options are ignored; many standard files are absent.
-- **Socket owners in `/proc/net/*` can differ from Linux:** the uid column is the fsuid of the
-  first process (lowest tid) holding the socket in its fd table, where Linux shows the creator's
-  (`sock_i_uid`); sockets passed on, or whose creator closed its copy, show another uid, and
-  sockets only in `SCM_RIGHTS` messages show 0.
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
   and symbol lookups (perf, bpftrace) find nothing.

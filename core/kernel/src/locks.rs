@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cell::RefCell;
 use crate::fd::{FdTable, FileKind, FileRef, OpenFile};
@@ -17,6 +18,13 @@ use crate::pidns::PidNs;
 use crate::pseudo::{self, PseudoNode};
 use crate::vfs::store::Ino;
 use crate::vfs::{Node, Vfs};
+
+/// Monotonic sequence number for lock acquisition order (`/proc/locks` lists newest first).
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_seq() -> u64 {
+    NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Filesystem, pipefs, sockfs and devpts inodes have independent number spaces.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -61,6 +69,8 @@ struct FlockHolder {
     exclusive: bool,
     /// The process that took the lock, as reported in /proc/locks.
     pid: Tid,
+    /// Acquisition order for `/proc/locks` (newest first).
+    seq: u64,
 }
 
 #[derive(Default)]
@@ -108,6 +118,7 @@ impl Flocks {
             file: owner,
             exclusive,
             pid,
+            seq: next_seq(),
         });
         file.borrow_mut().holds_locks = true;
         true
@@ -158,12 +169,16 @@ impl Owner {
 #[derive(Clone)]
 pub(crate) struct Lock {
     pub owner: Owner,
+    /// The open file through which the lock was taken (Linux's `fl_file`).
+    pub file: Weak<RefCell<OpenFile>>,
     /// The process that took the lock (the `l_pid` F_GETLK reports); -1 for OFD locks.
     pub pid: Tid,
     pub start: u64,
     pub end: u64,
     /// Write lock (exclusive); otherwise a read lock (shared).
     pub write: bool,
+    /// Acquisition order for `/proc/locks` (newest first).
+    pub seq: u64,
 }
 
 impl Lock {
@@ -179,8 +194,10 @@ impl Lock {
     }
 }
 
-/// What a lock request is waiting for (for deadlock detection).
+/// What a lock request is waiting for (for deadlock detection and `/proc/locks` `->` lines).
 pub(crate) struct Waiter {
+    /// The thread waiting in `F_SETLKW` / `F_OFD_SETLKW`.
+    pub tid: Tid,
     pub key: LockKey,
     pub req: Lock,
 }
@@ -190,7 +207,7 @@ pub(crate) struct Waiter {
 pub(crate) struct Locks {
     by_key: BTreeMap<LockKey, Vec<Lock>>,
     sweep_at: usize,
-    /// POSIX lock requests waiting in F_SETLKW.
+    /// Record-lock requests waiting in `F_SETLKW` / `F_OFD_SETLKW`.
     waiters: Vec<Waiter>,
 }
 
@@ -210,6 +227,8 @@ impl Locks {
         });
         let locks = self.by_key.entry(key).or_default();
         let (mut start, mut end) = (req.start, req.end);
+        let mut merged_file: Option<Weak<RefCell<OpenFile>>> = None;
+        let mut merged_seq: Option<u64> = None;
         let mut kept = Vec::with_capacity(locks.len() + 2);
         for l in locks.drain(..).filter(|l| l.owner.alive()) {
             if !l.owner.same(&req.owner) {
@@ -220,6 +239,10 @@ impl Locks {
             if !unlock && l.write == req.write && l.start <= end && start <= l.end {
                 start = start.min(l.start);
                 end = end.max(l.end);
+                if merged_file.is_none() {
+                    merged_file = Some(l.file);
+                    merged_seq = Some(l.seq);
+                }
                 continue;
             }
             if !l.overlaps(req.start, req.end) {
@@ -241,7 +264,15 @@ impl Locks {
             }
         }
         if !unlock {
-            kept.push(Lock { start, end, ..req });
+            let file = merged_file.unwrap_or(req.file);
+            let seq = merged_seq.unwrap_or_else(|| if req.seq != 0 { req.seq } else { next_seq() });
+            kept.push(Lock {
+                start,
+                end,
+                file,
+                seq,
+                ..req
+            });
         }
         kept.sort_by_key(|l| l.start);
         if kept.is_empty() {
@@ -259,30 +290,37 @@ impl Locks {
         let Owner::Posix(_) = req.owner else {
             return false;
         };
-        let mut blocker = match self.conflict(key, req) {
-            Some(l) => l.owner,
-            None => return false,
-        };
-        for _ in 0..self.waiters.len() + 1 {
+        let mut stack = Vec::new();
+        let mut visited: Vec<Owner> = Vec::new();
+        if let Some(l) = self.conflict(key, req) {
+            stack.push(l.owner);
+        }
+        while let Some(blocker) = stack.pop() {
             if blocker.same(&req.owner) {
                 return true;
             }
-            let Some(w) = self.waiters.iter().find(|w| w.req.owner.same(&blocker)) else {
-                return false;
-            };
-            let (key, request) = (w.key, w.req.clone());
-            match self.conflict(key, &request) {
-                Some(l) => blocker = l.owner,
-                None => return false,
+            if visited.iter().any(|v| v.same(&blocker)) {
+                continue;
+            }
+            visited.push(blocker.clone());
+            let waiting: Vec<(LockKey, Lock)> = self
+                .waiters
+                .iter()
+                .filter(|w| w.req.owner.same(&blocker) && w.req.owner.alive())
+                .map(|w| (w.key, w.req.clone()))
+                .collect();
+            for (wkey, wreq) in waiting {
+                if let Some(l) = self.conflict(wkey, &wreq) {
+                    stack.push(l.owner);
+                }
             }
         }
         false
     }
 
-    /// Records (`Some`) or clears an owner's wait in F_SETLKW.
-    pub fn set_waiting(&mut self, owner: &Owner, wait: Option<Waiter>) {
-        self.waiters
-            .retain(|w| !w.req.owner.same(owner) && w.req.owner.alive());
+    /// Records (`Some`) or clears thread `tid`'s wait in `F_SETLKW` / `F_OFD_SETLKW`.
+    pub fn set_waiting(&mut self, tid: Tid, wait: Option<Waiter>) {
+        self.waiters.retain(|w| w.tid != tid && w.req.owner.alive());
         if let Some(w) = wait {
             self.waiters.push(w);
         }
@@ -319,29 +357,36 @@ pub(crate) fn closed(k: &mut Kernel, fds: &Rc<RefCell<FdTable>>, files: &[FileRe
 // ---- /proc/locks ----
 
 /// `/proc/locks` (Linux 6.1's `locks_show` and `lock_get_status`): a line for every flock lock,
-/// POSIX and OFD lock and lease, numbered by position, giving the process that took it as the
-/// reader's pid namespace `ns` sees it (-1 for OFD locks; the locks of processes `ns` cannot see
-/// are left out, their numbers skipped), the device and inode numbers stat shows for the file and,
-/// for record locks, the byte range. Entries whose file has no shown device/inode identity are
-/// omitted without advancing the line number. Linux lists them newest first and the requests
-/// waiting for each below it (`->` lines); here they come by kind and inode, and waiting requests
-/// are not listed.
+/// POSIX and OFD lock and lease, listed newest first and numbered by position, with blocked
+/// `F_SETLKW` / `F_OFD_SETLKW` waiters immediately below the lock that blocks them (`->` lines),
+/// giving the process that took it as the reader's pid namespace `ns` sees it (-1 for OFD locks;
+/// the locks of processes `ns` cannot see are left out, their numbers skipped), the device and
+/// inode numbers stat shows for the file and, for record locks, the byte range. Entries whose file
+/// has no shown device/inode identity are omitted without advancing the line number.
 pub(crate) fn proc_locks(k: &Kernel, vfs: &Vfs, ns: &PidNs) -> String {
     let mut out = String::new();
     let mut pos = 0;
-    for s in shown(k, None) {
+    let mut entries = shown(k, None);
+    entries.sort_by(|a, b| b.seq.cmp(&a.seq));
+    let translate = |pid: Tid| match pid {
+        -1 => Some(-1),
+        // As Linux's locks_translate_pid: the initial namespace shows the number as recorded
+        p if ns.level == 0 => Some(p),
+        p => ns.vnr(p).filter(|&p| p != 0),
+    };
+    for s in entries {
         let Some(id) = shown_id(vfs, &s.file.borrow()) else {
             continue;
         };
         pos += 1;
-        let pid = match s.pid {
-            -1 => Some(-1),
-            // As Linux's locks_translate_pid: the initial namespace shows the number as recorded
-            p if ns.level == 0 => Some(p),
-            p => ns.vnr(p).filter(|&p| p != 0),
-        };
-        if let Some(pid) = pid {
+        if let Some(pid) = translate(s.pid) {
             writeln!(out, "{pos}: {}", s.status(id, pid)).unwrap();
+            for w in &s.waiters {
+                if let Some(wpid) = translate(w.pid) {
+                    let wid = shown_id(vfs, &w.file.borrow()).unwrap_or(id);
+                    writeln!(out, "{pos}: -> {}", w.status(wid, wpid)).unwrap();
+                }
+            }
         }
     }
     out
@@ -349,9 +394,8 @@ pub(crate) fn proc_locks(k: &Kernel, vfs: &Vfs, ns: &PidNs) -> String {
 
 /// The `lock:` lines of `/proc/<pid>/fdinfo/<n>` (Linux's `show_fd_locks`), which lslocks reads to
 /// tell who holds an OFD lock: the flock lock, OFD locks and lease held through open file `file`
-/// and the POSIX locks of fd table `fds` held through it, numbered from 1, with the pid as `ns`
-/// sees it (0 when it cannot). A POSIX lock records its table, not the open file that took it, so
-/// it is shown with the table's first open file on the inode.
+/// and the POSIX locks of fd table `fds` taken through `file`, numbered from 1, with the pid as
+/// `ns` sees it (0 when it cannot).
 pub(crate) fn fd_locks(
     k: &Kernel,
     vfs: &Vfs,
@@ -384,6 +428,21 @@ pub(crate) fn fd_locks(
     out
 }
 
+/// One blocked `F_SETLKW` / `F_OFD_SETLKW` waiter shown under its blocking lock in `/proc/locks`.
+struct ShownWaiter {
+    kind: &'static str,
+    write: bool,
+    pid: Tid,
+    file: FileRef,
+    range: String,
+}
+
+impl ShownWaiter {
+    fn status(&self, id: (u64, u64), pid: Tid) -> String {
+        format_status(self.kind, Some(self.write), pid, id, &self.range)
+    }
+}
+
 /// One lock or lease as `/proc/locks` and fdinfo show it.
 struct Shown {
     /// The kind and mode columns, padded as `lock_get_status` pads them.
@@ -398,21 +457,44 @@ struct Shown {
     range: String,
     /// A POSIX lock's owner (`fl_owner`); the others are owned by `file`.
     table: Option<Weak<RefCell<FdTable>>>,
+    /// Acquisition order for `/proc/locks` (newest first).
+    seq: u64,
+    /// Waiters blocked by this lock (populated only for `/proc/locks`).
+    waiters: Vec<ShownWaiter>,
+}
+
+fn format_status(
+    kind: &'static str,
+    write: Option<bool>,
+    pid: Tid,
+    (dev, ino): (u64, u64),
+    range: &str,
+) -> String {
+    let ty = match write {
+        Some(true) => "WRITE",
+        Some(false) => "READ",
+        None => "UNLCK",
+    };
+    // glibc's major() and minor() of the dev_t stat reports
+    let major = (dev >> 8 & 0xfff) | (dev >> 32 & !0xfff);
+    let minor = (dev & 0xff) | (dev >> 12 & !0xff);
+    format!("{kind}{ty} {pid} {major:02x}:{minor:02x}:{ino} {range}")
+}
+
+fn format_range(start: u64, end: u64) -> String {
+    // Linux's inclusive end, OFFSET_MAX meaning to the end
+    let last = end.wrapping_sub(1);
+    if last >= i64::MAX as u64 {
+        format!("{start} EOF")
+    } else {
+        format!("{start} {last}")
+    }
 }
 
 impl Shown {
     /// The line after the number, for device/inode `(dev, ino)` and `pid` as the reader sees it.
-    fn status(&self, (dev, ino): (u64, u64), pid: Tid) -> String {
-        let ty = match self.write {
-            Some(true) => "WRITE",
-            Some(false) => "READ",
-            None => "UNLCK",
-        };
-        // glibc's major() and minor() of the dev_t stat reports
-        let major = (dev >> 8 & 0xfff) | (dev >> 32 & !0xfff);
-        let minor = (dev & 0xff) | (dev >> 12 & !0xff);
-        let (kind, range) = (self.kind, &self.range);
-        format!("{kind}{ty} {pid} {major:02x}:{minor:02x}:{ino} {range}")
+    fn status(&self, id: (u64, u64), pid: Tid) -> String {
+        format_status(self.kind, self.write, pid, id, &self.range)
     }
 }
 
@@ -434,6 +516,8 @@ fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
                     file,
                     range: "0 EOF".into(),
                     table: None,
+                    seq: holder.seq,
+                    waiters: Vec::new(),
                 });
             }
         }
@@ -442,16 +526,17 @@ fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
         if only.is_some_and(|o| o != key) {
             continue;
         }
+        let base = out.len();
+        let mut live: Vec<&Lock> = Vec::new();
         for l in locks.iter().filter(|l| l.owner.alive()) {
-            let Some(file) = l.owner.file(key) else {
+            let Some(file) = l.file.upgrade().or_else(|| {
+                // Fallback only if a lock was created without an open file reference.
+                l.file
+                    .ptr_eq(&Weak::new())
+                    .then(|| l.owner.file(key))
+                    .flatten()
+            }) else {
                 continue;
-            };
-            // Linux's inclusive end, OFFSET_MAX meaning to the end
-            let last = l.end.wrapping_sub(1);
-            let range = if last >= i64::MAX as u64 {
-                format!("{} EOF", l.start)
-            } else {
-                format!("{} {last}", l.start)
             };
             let (kind, table) = match &l.owner {
                 Owner::Posix(t) => ("POSIX  ADVISORY  ", Some(t.clone())),
@@ -462,9 +547,38 @@ fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
                 write: Some(l.write),
                 pid: l.pid,
                 file,
-                range,
+                range: format_range(l.start, l.end),
                 table,
+                seq: l.seq,
+                waiters: Vec::new(),
             });
+            live.push(l);
+        }
+        if only.is_none() && !live.is_empty() {
+            for w in k
+                .locks
+                .waiters
+                .iter()
+                .filter(|w| w.key == key && w.req.owner.alive())
+            {
+                let Some(idx) = live.iter().position(|l| l.conflicts(&w.req)) else {
+                    continue;
+                };
+                let Some(file) = w.req.file.upgrade().or_else(|| w.req.owner.file(key)) else {
+                    continue;
+                };
+                let kind = match w.req.owner {
+                    Owner::Posix(_) => "POSIX  ADVISORY  ",
+                    Owner::Ofd(_) => "OFDLCK ADVISORY  ",
+                };
+                out[base + idx].waiters.push(ShownWaiter {
+                    kind,
+                    write: w.req.write,
+                    pid: w.req.pid,
+                    file,
+                    range: format_range(w.req.start, w.req.end),
+                });
+            }
         }
     }
     // Leases are keyed by the store inode, or by an overlay node's key (same as lock_ino)
@@ -484,6 +598,8 @@ fn shown(k: &Kernel, only: Option<LockKey>) -> Vec<Shown> {
                 file,
                 range: "0 EOF".into(),
                 table: None,
+                seq: 0,
+                waiters: Vec::new(),
             });
         }
     }
@@ -538,10 +654,12 @@ mod tests {
     fn lock(o: &Owner, start: u64, end: u64, write: bool) -> Lock {
         Lock {
             owner: o.clone(),
+            file: Weak::new(),
             pid: 1,
             start,
             end,
             write,
+            seq: 0,
         }
     }
 
@@ -608,7 +726,14 @@ mod tests {
         // a is waiting for b's lock; b then waiting for a's lock is a deadlock
         let wait = lock(&oa, 10, 20, true);
         assert!(!l.deadlock(key, &wait));
-        l.set_waiting(&oa, Some(Waiter { key, req: wait }));
+        l.set_waiting(
+            1,
+            Some(Waiter {
+                tid: 1,
+                key,
+                req: wait,
+            }),
+        );
         assert!(l.deadlock(key, &lock(&ob, 0, 10, true)));
     }
 
@@ -708,10 +833,12 @@ mod tests {
             key_fuse,
             Lock {
                 owner: Owner::Ofd(Rc::downgrade(&fuse_file)),
+                file: Rc::downgrade(&fuse_file),
                 pid: -1,
                 start: 10,
                 end: 20,
                 write: true,
+                seq: 0,
             },
             false,
         );
@@ -719,10 +846,12 @@ mod tests {
             key_fuse,
             Lock {
                 owner: Owner::Posix(Rc::downgrade(&fds)),
+                file: Rc::downgrade(&fuse_file),
                 pid: 100,
                 start: 30,
                 end: u64::MAX,
                 write: false,
+                seq: 0,
             },
             false,
         );
@@ -731,24 +860,25 @@ mod tests {
         let minor = (fuse_dev & 0xff) | (fuse_dev >> 12 & !0xff);
         let fuse_dev_ino = format!("{major:02x}:{minor:02x}:4242");
 
-        // Live FUSE locks show in both /proc/locks and fdinfo with consecutive numbering
+        // Live FUSE locks show in /proc/locks newest first with consecutive numbering, and in
+        // fdinfo in per-inode order (flock, OFD, POSIX).
         let listing = proc_locks(&k, &vfs, &init_ns);
         let lines: Vec<&str> = listing.lines().collect();
         assert_eq!(lines.len(), 5, "{listing}");
-        assert!(lines[0].starts_with("1: FLOCK  ADVISORY  WRITE 100 08:01:10 0 EOF"));
-        assert!(lines[1].starts_with("2: FLOCK  ADVISORY  READ 200 08:01:20 0 EOF"));
         assert_eq!(
-            lines[2],
-            format!("3: FLOCK  ADVISORY  WRITE 100 {fuse_dev_ino} 0 EOF")
+            lines[0],
+            format!("1: POSIX  ADVISORY  READ 100 {fuse_dev_ino} 30 EOF")
         );
+        assert_eq!(
+            lines[1],
+            format!("2: OFDLCK ADVISORY  WRITE -1 {fuse_dev_ino} 10 19")
+        );
+        assert!(lines[2].starts_with("3: FLOCK  ADVISORY  READ 200 08:01:20 0 EOF"));
         assert_eq!(
             lines[3],
-            format!("4: OFDLCK ADVISORY  WRITE -1 {fuse_dev_ino} 10 19")
+            format!("4: FLOCK  ADVISORY  WRITE 100 {fuse_dev_ino} 0 EOF")
         );
-        assert_eq!(
-            lines[4],
-            format!("5: POSIX  ADVISORY  READ 100 {fuse_dev_ino} 30 EOF")
-        );
+        assert!(lines[4].starts_with("5: FLOCK  ADVISORY  WRITE 100 08:01:10 0 EOF"));
 
         let fdinfo = fd_locks(&k, &vfs, &init_ns, &fds, &fuse_file);
         let fd_lines: Vec<&str> = fdinfo.lines().collect();
@@ -768,24 +898,26 @@ mod tests {
 
         // Once the FUSE instance is gone, its locks are omitted without consuming line numbers
         vfs.fuse_mut().remove(fuse_dev);
-        // Add a store record lock ordered after the FUSE flock/record entries to verify no gap
+        // Add a store record lock (newest) to verify no numbering gap after omitted FUSE entries
         k.locks.set(
             key_a,
             Lock {
                 owner: Owner::Ofd(Rc::downgrade(&store_a)),
+                file: Rc::downgrade(&store_a),
                 pid: -1,
                 start: 0,
                 end: 10,
                 write: true,
+                seq: 0,
             },
             false,
         );
         let after_remove = proc_locks(&k, &vfs, &init_ns);
         let after_lines: Vec<&str> = after_remove.lines().collect();
         assert_eq!(after_lines.len(), 3, "{after_remove}");
-        assert!(after_lines[0].starts_with("1: FLOCK  ADVISORY  WRITE 100 08:01:10 0 EOF"));
+        assert!(after_lines[0].starts_with("1: OFDLCK ADVISORY  WRITE -1 08:01:10 0 9"));
         assert!(after_lines[1].starts_with("2: FLOCK  ADVISORY  READ 200 08:01:20 0 EOF"));
-        assert!(after_lines[2].starts_with("3: OFDLCK ADVISORY  WRITE -1 08:01:10 0 9"));
+        assert!(after_lines[2].starts_with("3: FLOCK  ADVISORY  WRITE 100 08:01:10 0 EOF"));
         assert!(fd_locks(&k, &vfs, &init_ns, &fds, &fuse_file).is_empty());
 
         // Pid-namespace filtering still skips line numbers for invisible PIDs on shown locks
@@ -794,8 +926,161 @@ mod tests {
         let child_listing = proc_locks(&k, &vfs, &child_ns);
         let child_lines: Vec<&str> = child_listing.lines().collect();
         assert_eq!(child_lines.len(), 2, "{child_listing}");
-        assert!(child_lines[0].starts_with("1: FLOCK  ADVISORY  WRITE 1 08:01:10 0 EOF"));
-        assert!(child_lines[1].starts_with("3: OFDLCK ADVISORY  WRITE -1 08:01:10 0 9"));
+        assert!(child_lines[0].starts_with("1: OFDLCK ADVISORY  WRITE -1 08:01:10 0 9"));
+        assert!(child_lines[1].starts_with("3: FLOCK  ADVISORY  WRITE 1 08:01:10 0 EOF"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn posix_fdinfo_shows_taking_file_and_proc_locks_lists_waiters() {
+        use crate::cred::Cred;
+        use crate::vfs::dev::Device;
+
+        let dir = std::env::temp_dir().join(format!(
+            "appine-locks-waiters-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::vfs::store::Store::create(&dir).unwrap());
+        let vfs = Vfs::open(&dir).unwrap();
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let init_ns = PidNs::init();
+
+        // Two distinct open files on the same inode in one fd table: taking a POSIX lock on the
+        // second (higher fd) must appear only in the second file's fdinfo, not the first's.
+        let file1 = OpenFile::new(
+            FileKind::Device {
+                ino: 42,
+                dev: Device::Null,
+                kmsg: None,
+                block: None,
+            },
+            0,
+        );
+        let file2 = OpenFile::new(
+            FileKind::Device {
+                ino: 42,
+                dev: Device::Null,
+                kmsg: None,
+                block: None,
+            },
+            0,
+        );
+        let fds_holder = Rc::new(RefCell::new(FdTable::new()));
+        fds_holder
+            .borrow_mut()
+            .install(file1.clone(), false, 0..16)
+            .unwrap();
+        fds_holder
+            .borrow_mut()
+            .install(file2.clone(), false, 0..16)
+            .unwrap();
+        let key = LockKey::of(&file2.borrow()).unwrap();
+        k.locks.set(
+            key,
+            Lock {
+                owner: Owner::Posix(Rc::downgrade(&fds_holder)),
+                file: Rc::downgrade(&file2),
+                pid: 100,
+                start: 10,
+                end: 30,
+                write: true,
+                seq: 0,
+            },
+            false,
+        );
+
+        assert!(fd_locks(&k, &vfs, &init_ns, &fds_holder, &file1).is_empty());
+        assert_eq!(
+            fd_locks(&k, &vfs, &init_ns, &fds_holder, &file2),
+            "lock:\t1: POSIX  ADVISORY  WRITE 100 08:01:42 10 29\n"
+        );
+
+        // Two blocked waiters (one POSIX, one OFD) appear as `->` lines under the blocking lock.
+        let fds_waiter = Rc::new(RefCell::new(FdTable::new()));
+        let waiter_file = OpenFile::new(
+            FileKind::Device {
+                ino: 42,
+                dev: Device::Null,
+                kmsg: None,
+                block: None,
+            },
+            0,
+        );
+        let ofd_waiter_file = OpenFile::new(
+            FileKind::Device {
+                ino: 42,
+                dev: Device::Null,
+                kmsg: None,
+                block: None,
+            },
+            0,
+        );
+        k.locks.set_waiting(
+            200,
+            Some(Waiter {
+                tid: 200,
+                key,
+                req: Lock {
+                    owner: Owner::Posix(Rc::downgrade(&fds_waiter)),
+                    file: Rc::downgrade(&waiter_file),
+                    pid: 200,
+                    start: 15,
+                    end: 45,
+                    write: true,
+                    seq: 0,
+                },
+            }),
+        );
+        k.locks.set_waiting(
+            201,
+            Some(Waiter {
+                tid: 201,
+                key,
+                req: Lock {
+                    owner: Owner::Ofd(Rc::downgrade(&ofd_waiter_file)),
+                    file: Rc::downgrade(&ofd_waiter_file),
+                    pid: -1,
+                    start: 0,
+                    end: u64::MAX,
+                    write: false,
+                    seq: 0,
+                },
+            }),
+        );
+        let listing = proc_locks(&k, &vfs, &init_ns);
+        let lines: Vec<&str> = listing.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "1: POSIX  ADVISORY  WRITE 100 08:01:42 10 29",
+                "1: -> POSIX  ADVISORY  WRITE 200 08:01:42 15 44",
+                "1: -> OFDLCK ADVISORY  READ -1 08:01:42 0 EOF",
+            ]
+        );
+        // fdinfo never lists blocked waiters.
+        assert_eq!(
+            fd_locks(&k, &vfs, &init_ns, &fds_holder, &file2),
+            "lock:\t1: POSIX  ADVISORY  WRITE 100 08:01:42 10 29\n"
+        );
+
+        // Pid-namespace filtering omits invisible waiters while preserving visible ones.
+        let child_ns = PidNs::child(&init_ns, Cred::root().user_ns.clone());
+        PidNs::register(&child_ns, 100, &[]).unwrap();
+        let child_listing = proc_locks(&k, &vfs, &child_ns);
+        let child_lines: Vec<&str> = child_listing.lines().collect();
+        assert_eq!(
+            child_lines,
+            vec![
+                "1: POSIX  ADVISORY  WRITE 1 08:01:42 10 29",
+                "1: -> OFDLCK ADVISORY  READ -1 08:01:42 0 EOF",
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

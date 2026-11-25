@@ -337,7 +337,7 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
             } else {
                 vfs.dev_of(&node)
             };
-            (crate::pseudo::ino_of(p), internal(dev))
+            (crate::pseudo::node_ino(p), internal(dev))
         }
         Node::Fuse(_, f) => {
             vfs.fuse_permission(&cx.cred(), *f, MAY_READ)?;

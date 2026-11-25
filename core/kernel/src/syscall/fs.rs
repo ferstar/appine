@@ -2232,10 +2232,12 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
     };
     let req = Lock {
         owner,
+        file: Rc::downgrade(file),
         pid: if ofd { -1 } else { cx.tgid() },
         start,
         end,
         write,
+        seq: 0,
     };
     if getlk {
         // With no conflict only l_type is changed to F_UNLCK; the other fields stay
@@ -2260,10 +2262,11 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
         }
         return put(cx, arg, b).map(|()| 0);
     }
+    let tid = cx.tid();
     loop {
         let locks = &mut cx.k().locks;
         if unlock || locks.conflict(key, &req).is_none() {
-            locks.set_waiting(&req.owner, None);
+            locks.set_waiting(tid, None);
             locks.set(key, req, unlock);
             return Ok(0);
         }
@@ -2271,22 +2274,26 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
             return Err(Errno::EAGAIN);
         }
         if locks.deadlock(key, &req) {
-            locks.set_waiting(&req.owner, None);
+            locks.set_waiting(tid, None);
             return Err(Errno::EDEADLK);
         }
         locks.set_waiting(
-            &req.owner,
+            tid,
             Some(Waiter {
+                tid,
                 key,
                 req: req.clone(),
             }),
         );
         if cx.interrupted() {
-            cx.k().locks.set_waiting(&req.owner, None);
+            cx.k().locks.set_waiting(tid, None);
             return Err(Errno::ERESTARTSYS);
         }
         // The holder requests a wakeup when it unlocks, closes the file or exits
-        cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
+        if let Err(e) = cx.wait_on(None, &mut [], crate::kernel::wake::LOCK) {
+            cx.k().locks.set_waiting(tid, None);
+            return Err(e);
+        }
     }
 }
 
@@ -5605,6 +5612,60 @@ pub(super) fn follow_copy_up(cx: &Cx<'_>, file: &FileRef) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Uncopied overlay nodes along the ancestor chain of `nodes` in top-down order (parents before
+/// children), so upper-layer inotify watches can be notified after copy-up succeeds.
+fn overlay_uncopied_chain(vfs: &Vfs, nodes: &[OvlId]) -> Vec<OvlId> {
+    let ovl = vfs.overlay();
+    let mut out = Vec::new();
+    for &start in nodes {
+        let mut chain = Vec::new();
+        let mut cur = start;
+        loop {
+            let n = ovl.node(cur);
+            if n.upper.is_some() {
+                break;
+            }
+            chain.push(cur);
+            if n.parent == cur {
+                break;
+            }
+            cur = n.parent;
+        }
+        for id in chain.into_iter().rev() {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Reports upper-layer `IN_CREATE` events for overlay nodes that were just copied up.
+fn overlay_copy_up_events(k: &Kernel, vfs: &Vfs, copied: &[OvlId]) {
+    if copied.is_empty() || !inotify::active(k) {
+        return;
+    }
+    let ovl = vfs.overlay();
+    for &id in copied {
+        let n = ovl.node(id);
+        let Some(up) = n.upper else {
+            continue;
+        };
+        if n.parent == id {
+            continue;
+        }
+        let Some(parent_up) = ovl.node(n.parent).upper else {
+            continue;
+        };
+        let isdir = if vfs.store().kind(up).is_ok_and(|k| k == mode::S_IFDIR) {
+            inotify::IN_ISDIR
+        } else {
+            0
+        };
+        inotify::dir_event(k, parent_up, &n.name, inotify::IN_CREATE | isdir, 0);
+    }
+}
+
 /// Copies overlay node `o` up ([`Vfs::overlay_upper`]) and returns its upper inode, charging the
 /// upper layer's tmpfs instance when it is on tmpfs. A regular file's copy shares the lower file's
 /// object until either is written, so nothing may still write that object in place, as for
@@ -5621,10 +5682,17 @@ pub(super) fn copy_up(cx: &Cx<'_>, vfs: &Vfs, o: OvlId, what: CopyUp) -> Result<
     if let Some(up) = upper {
         return Ok(up);
     }
-    if what != CopyUp::All || vfs.store().attrs(lower)?.kind() != mode::S_IFREG {
-        return overlay_upper_charged(vfs, o, what);
-    }
     let k = cx.kr();
+    let copied = if inotify::active(k) {
+        overlay_uncopied_chain(vfs, &[o])
+    } else {
+        Vec::new()
+    };
+    if what != CopyUp::All || vfs.store().attrs(lower)?.kind() != mode::S_IFREG {
+        let up = overlay_upper_charged(vfs, o, what)?;
+        overlay_copy_up_events(k, vfs, &copied);
+        return Ok(up);
+    }
     let host = vfs.store().open_object(lower, false)?;
     let host = host.metadata().map_err(host_errno)?;
     let mapped = k.tasks.values().any(|t| {
@@ -5635,9 +5703,12 @@ pub(super) fn copy_up(cx: &Cx<'_>, vfs: &Vfs, o: OvlId, what: CopyUp) -> Result<
             .writably_maps(host.dev(), host.ino())
     });
     if mapped || vfs.store().host_writing(lower)? {
-        return overlay_upper_charged(vfs, o, CopyUp::Copied);
+        let up = overlay_upper_charged(vfs, o, CopyUp::Copied)?;
+        overlay_copy_up_events(k, vfs, &copied);
+        return Ok(up);
     }
     let up = overlay_upper_charged(vfs, o, CopyUp::All)?;
+    overlay_copy_up_events(k, vfs, &copied);
     let writer = |f: &FileRef| {
         f.try_borrow()
             .is_ok_and(|f| f.writable() && matches!(f.kind, FileKind::Regular { cow: false, .. }))
@@ -7485,14 +7556,44 @@ fn unlink_overlay(
         } else {
             None
         };
+        let child_upper = vfs.overlay().node(c).upper;
+        let lower_has = vfs.overlay().lower_has(vfs.store(), d, name)?;
+        let copied_dirs = if inotify::active(cx.kr()) {
+            overlay_uncopied_chain(&vfs, &[d])
+        } else {
+            Vec::new()
+        };
         vfs.overlay_remove(d, name, rmdir)?;
         if let Some(op) = tmpfs {
             op.apply(cx, &vfs);
         }
+        let k = cx.kr();
+        // Report upper-layer changes first (parent dir copy-up, removed upper entry, and any
+        // whiteout created in the upper directory), then the overlay node's events.
+        overlay_copy_up_events(k, &vfs, &copied_dirs);
+        let upper_dir = vfs.overlay().node(d).upper;
+        let upper_gone = child_upper.map(|u| vfs.store().attrs(u).map_or(0, |s| s.nlink) == 0);
+        if let Some(up) = upper_dir {
+            if let Some(u) = child_upper {
+                inotify::unlinked(k, u, up, name);
+                if rmdir {
+                    inotify::deleted(k, u, up, name);
+                    inotify::dir_event(k, up, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
+                } else {
+                    inotify::path_event(k, u, None, inotify::IN_ATTRIB);
+                    if upper_gone == Some(true) {
+                        inotify::deleted(k, u, up, name);
+                    }
+                    inotify::dir_event(k, up, name, inotify::IN_DELETE, 0);
+                }
+            }
+            if lower_has {
+                inotify::dir_event(k, up, name, inotify::IN_CREATE, 0);
+            }
+        }
         // As the store's removals report: a file's link count changed, the node is deleted with
         // its last link (once the files opened through it have closed), then the directory's
         // entry goes
-        let k = cx.kr();
         let (key, dir) = (overlay::key(c), overlay::key(d));
         inotify::unlinked(k, key, dir, name);
         if rmdir {
@@ -7500,7 +7601,7 @@ fn unlink_overlay(
             inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
         } else {
             inotify::path_event(k, key, None, inotify::IN_ATTRIB);
-            if st.nlink <= 1 {
+            if upper_gone.unwrap_or(st.nlink <= 1) {
                 inotify::deleted(k, key, dir, name);
             }
             inotify::dir_event(k, dir, name, inotify::IN_DELETE, 0);
@@ -7806,9 +7907,10 @@ fn link_overlay(
         |&ino| ino,
     )?;
     tmpfs_created_name(vfs, tmpfs, 0);
-    // The new name in the upper directory, then as 6.1's `fsnotify_link` reports the link through
-    // the overlay: the file's link count changed, then the name
+    // The upper inode's link count and upper directory entry first, then as 6.1's `fsnotify_link`
+    // reports the link through the overlay: the file's link count changed, then the name
     let k = cx.kr();
+    inotify::path_event(k, file, None, inotify::IN_ATTRIB);
     inotify::dir_event(k, up, name, inotify::IN_CREATE, 0);
     inotify::path_event(k, overlay::key(so), None, inotify::IN_ATTRIB);
     inotify::dir_event(k, overlay::key(d), name, inotify::IN_CREATE, 0);
@@ -8041,8 +8143,11 @@ fn rename_overlay(
     if busy(src) || dst.as_ref().is_some_and(|d| busy(d.0)) {
         return Err(Errno::EBUSY);
     }
-    // Renaming a name to itself changes nothing
-    if dst.as_ref().is_some_and(|d| d.0 == src) {
+    // Renaming a name to itself or another hard link of the same file changes nothing
+    if dst.as_ref().is_some_and(|d| {
+        d.0 == src
+            || (!exchange && vfs.overlay().node(d.0).real() == vfs.overlay().node(src).real())
+    }) {
         return Ok(0);
     }
     // Files that move are copied up here, as copy_up copies them, before the rename finds them up
@@ -8085,6 +8190,14 @@ fn rename_overlay(
     } else {
         None
     };
+    let copied_dirs = if inotify::active(cx.kr()) {
+        overlay_uncopied_chain(&vfs, &[od, nd])
+    } else {
+        Vec::new()
+    };
+    let src_upper = vfs.overlay().node(src).upper;
+    let dst_upper = dst.as_ref().and_then(|(d, _)| vfs.overlay().node(*d).upper);
+    let old_lower = !exchange && vfs.overlay().lower_has(vfs.store(), od, old_name)?;
     vfs.overlay_rename(
         (od, old_name),
         (nd, new_name),
@@ -8093,17 +8206,7 @@ fn rename_overlay(
     if let Some(op) = tmpfs {
         op.apply(cx, &vfs);
     }
-    // As the store's rename reports, on the overlay's nodes: mark an overwritten destination
-    // unlinked first, then files open through a moved name follow it, then fsnotify_move's order
     let k = cx.kr();
-    let (old, new) = ((overlay::key(od), old_name), (overlay::key(nd), new_name));
-    if !exchange && let Some((d, _)) = &dst {
-        inotify::unlinked(k, overlay::key(*d), new.0, new.1);
-    }
-    inotify::renamed(k, old, new, || Some(overlay::key(src)));
-    if exchange && let Some(d) = dst.as_ref().map(|d| d.0) {
-        inotify::renamed(k, new, old, || Some(overlay::key(d)));
-    }
     let isdir = |st: &Stat| {
         if st.is_dir() { inotify::IN_ISDIR } else { 0 }
     };
@@ -8112,6 +8215,55 @@ fn rename_overlay(
         inotify::dir_event(k, from.0, from.1, inotify::IN_MOVED_FROM | isdir, cookie);
         inotify::dir_event(k, to.0, to.1, inotify::IN_MOVED_TO | isdir, cookie);
     };
+    // Report upper-layer copy-up and rename changes first so watches on the upper layer see them.
+    overlay_copy_up_events(k, &vfs, &copied_dirs);
+    let dst_upper_gone = dst_upper.map(|du| vfs.store().attrs(du).map_or(0, |s| s.nlink) == 0);
+    if let (Some(old_up), Some(new_up)) =
+        (vfs.overlay().node(od).upper, vfs.overlay().node(nd).upper)
+    {
+        if !exchange && let Some(du) = dst_upper {
+            inotify::unlinked(k, du, new_up, new_name);
+        }
+        if let Some(su) = src_upper {
+            inotify::renamed(k, (old_up, old_name), (new_up, new_name), || Some(su));
+        }
+        if exchange && let Some(du) = dst_upper {
+            inotify::renamed(k, (new_up, new_name), (old_up, old_name), || Some(du));
+        }
+        if inotify::active(k)
+            && let Some(su) = src_upper
+        {
+            moved(isdir(&src_st), (old_up, old_name), (new_up, new_name));
+            match (&dst, dst_upper) {
+                (Some((_, st)), Some(du)) if exchange => {
+                    inotify::path_event(k, su, None, inotify::IN_MOVE_SELF);
+                    moved(isdir(st), (new_up, new_name), (old_up, old_name));
+                    inotify::path_event(k, du, None, inotify::IN_MOVE_SELF);
+                }
+                (Some((_, st)), Some(du)) => {
+                    inotify::path_event(k, du, None, inotify::IN_ATTRIB | isdir(st));
+                    inotify::path_event(k, su, None, inotify::IN_MOVE_SELF);
+                    if st.is_dir() || dst_upper_gone == Some(true) {
+                        inotify::deleted(k, du, new_up, new_name);
+                    }
+                }
+                _ => inotify::path_event(k, su, None, inotify::IN_MOVE_SELF),
+            }
+            if old_lower {
+                inotify::dir_event(k, old_up, old_name, inotify::IN_CREATE, 0);
+            }
+        }
+    }
+    // As the store's rename reports, on the overlay's nodes: mark an overwritten destination
+    // unlinked first, then files open through a moved name follow it, then fsnotify_move's order
+    let (old, new) = ((overlay::key(od), old_name), (overlay::key(nd), new_name));
+    if !exchange && let Some((d, _)) = &dst {
+        inotify::unlinked(k, overlay::key(*d), new.0, new.1);
+    }
+    inotify::renamed(k, old, new, || Some(overlay::key(src)));
+    if exchange && let Some(d) = dst.as_ref().map(|d| d.0) {
+        inotify::renamed(k, new, old, || Some(overlay::key(d)));
+    }
     let src = overlay::key(src);
     moved(isdir(&src_st), old, new);
     match dst {
@@ -8124,7 +8276,7 @@ fn rename_overlay(
             let d = overlay::key(d);
             inotify::path_event(k, d, None, inotify::IN_ATTRIB | isdir(&st));
             inotify::path_event(k, src, None, inotify::IN_MOVE_SELF);
-            if st.is_dir() || st.nlink <= 1 {
+            if st.is_dir() || dst_upper_gone.unwrap_or(st.nlink <= 1) {
                 inotify::deleted(k, d, new.0, new.1);
             }
         }
@@ -8842,6 +8994,16 @@ fn event_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool, event:
                 _ => 0,
             }
         };
+        // For overlay attribute changes, notify the upper inode first (as Linux's overlay calls
+        // notify_change on the upper dentry), then the overlay node itself.
+        if target != ino && overlay::of_key(target).is_some() {
+            let upper_parent = parent.and_then(|(d, name)| {
+                let po = overlay::of_key(d)?;
+                let up = cx.vfs().ok()?.overlay().node(po).upper?;
+                Some((up, name))
+            });
+            inotify::path_event(cx.kr(), ino, upper_parent, event | dir);
+        }
         inotify::path_event(cx.kr(), target, parent, event | dir);
     }
 }
@@ -8864,6 +9026,22 @@ fn event_fd(cx: &Cx<'_>, fd: i32, event: u32) {
             let parent = Some((crate::cgroup::key(id, b""), name));
             inotify::path_event(cx.kr(), crate::cgroup::key(id, name), parent, event);
         } else {
+            if let Some(o) = file.ovl
+                && let Ok(vfs) = cx.vfs()
+                && let Some(up) = vfs.overlay().node(o).upper
+            {
+                let ovl = vfs.overlay();
+                let n = ovl.node(o);
+                let upper_parent = (n.parent != o)
+                    .then(|| ovl.node(n.parent).upper.map(|pu| (pu, n.name.as_slice())))
+                    .flatten();
+                let dir = if vfs.store().kind(up).is_ok_and(|k| k == mode::S_IFDIR) {
+                    inotify::IN_ISDIR
+                } else {
+                    0
+                };
+                inotify::path_event(cx.kr(), up, upper_parent, event | dir);
+            }
             inotify::file_event(cx.kr(), &file, event);
         }
     }
