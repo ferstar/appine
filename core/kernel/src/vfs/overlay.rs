@@ -133,6 +133,8 @@ impl Drop for Hold {
 pub(crate) struct Instance {
     /// The upper layer's root directory, where changes go; None for a read-only overlay.
     pub upper: Option<Ino>,
+    /// Mounted lower directories against which persistent origin handles are resolved.
+    lower_roots: Vec<Ino>,
     /// The mounter's filesystem user and group IDs (kernel IDs): whiteouts belong to them, as
     /// Linux makes them with the mounter's credentials.
     pub mounter: (u32, u32),
@@ -144,6 +146,77 @@ pub(crate) struct Instance {
     /// Copied-up upper inodes mapped to the lower inode they were copied up from, so evicting an
     /// unused copied-up node does not change its shown inode number while the mount lasts.
     origins: HashMap<Ino, Ino>,
+}
+
+// Store inode numbers are unique across layers. Check the magic and exact length before
+// resolving the inode under a mounted lower root, including after a lower directory is moved.
+const ORIGIN_V1: &[u8] = b"OVL\x01";
+
+fn private_xattr(store: &Store, ino: Ino, name: &[u8]) -> Result<Option<Vec<u8>>, Errno> {
+    match store.get_xattr(ino, name) {
+        Ok(value) => Ok(Some(value)),
+        Err(Errno::ENODATA) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+impl Instance {
+    fn origin(&self, store: &Store, upper: Ino, kind: u32) -> Result<Option<Ino>, Errno> {
+        if let Some(&origin) = self.origins.get(&upper) {
+            return Ok(Some(origin));
+        }
+        let name = [self.options.private_prefix(), b"origin"].concat();
+        let Some(handle) = private_xattr(store, upper, &name)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = handle
+            .strip_prefix(ORIGIN_V1)
+            .and_then(|b| b.try_into().ok())
+        else {
+            return Ok(None);
+        };
+        let lower = Ino::from_le_bytes(bytes);
+        // Copy-up allocates the upper after the lower. Its surviving row also prevents SQLite
+        // from reusing a deleted lower's smaller rowid after boot cleanup.
+        if lower == 0 || lower >= upper {
+            return Ok(None);
+        }
+        let st = match store.attrs(lower) {
+            Ok(st) => st,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // ovl_getattr checks the lower link count: adding an upper hard link preserves st_ino.
+        if st.kind() != kind || (!st.is_dir() && st.nlink != 1) {
+            return Ok(None);
+        }
+        let Some(mut dir) = store.linked_dir(&st)? else {
+            return Ok(None);
+        };
+        loop {
+            if self.lower_roots.contains(&dir) {
+                return Ok(Some(lower));
+            }
+            let parent = store.parent(dir)?;
+            if parent == dir {
+                return Ok(None);
+            }
+            dir = parent;
+        }
+    }
+
+    fn impure(&self, store: &Store, dir: Ino) -> Result<bool, Errno> {
+        let name = [self.options.private_prefix(), b"impure"].concat();
+        Ok(private_xattr(store, dir, &name)?.as_deref() == Some(b"y"))
+    }
+
+    fn mark_impure(&self, store: &Store, dir: Ino) -> Result<(), Errno> {
+        if !self.impure(store, dir)? {
+            let name = [self.options.private_prefix(), b"impure"].concat();
+            store.set_xattr(dir, &name, b"y", false, false)?;
+        }
+        Ok(())
+    }
 }
 
 /// An overlay node: the store inodes behind one name (Linux's `ovl_entry`).
@@ -159,9 +232,7 @@ pub(crate) struct OvlNode {
     /// Inodes in the lower layers, topmost first: for a directory every lower directory merged
     /// into it, for anything else only the topmost one, and none when the upper inode hides them.
     pub lower: Vec<Ino>,
-    /// The lower inode it was copied up from, whose number stat keeps showing (6.1's
-    /// `ovl_getattr` keeps a directory's, and a file's with one link, while the mount lasts:
-    /// Linux records it in `trusted.overlay.origin`, here it is kept in [`Instance::origins`]).
+    /// Validated copy-up origin used by stat and open-file metadata.
     origin: Option<Ino>,
     /// Nodes already looked up in it, by name.
     children: HashMap<Vec<u8>, OvlId>,
@@ -450,7 +521,7 @@ impl Overlays {
             parent: 0,
             name: Vec::new(),
             upper,
-            lower,
+            lower: lower.clone(),
             origin: None,
             children: HashMap::new(),
             seen: 0,
@@ -461,6 +532,7 @@ impl Overlays {
             dev,
             Instance {
                 upper,
+                lower_roots: lower,
                 mounter,
                 pins,
                 options,
@@ -683,14 +755,12 @@ impl Overlays {
     ) -> Result<OvlId, Errno> {
         let d = self.node(dir);
         let prefix = self.options_of(dir).private_prefix();
-        let opaque = |ino: Ino| -> Result<bool, Errno> {
-            match store.get_xattr(ino, &[prefix, b"opaque"].concat()) {
-                Ok(v) => Ok(v == b"y"),
-                Err(Errno::ENODATA) => Ok(false),
-                Err(e) => Err(e),
-            }
+        let opaque = |ino| {
+            private_xattr(store, ino, &[prefix, b"opaque"].concat())
+                .map(|value| value.as_deref() == Some(b"y"))
         };
         let mut upper = None;
+        let mut origin = None;
         let mut stop = false;
         if let Some(u) = d.upper
             && let Some(c) = store.lookup(u, name)?
@@ -699,6 +769,7 @@ impl Overlays {
             if is_whiteout(&st) {
                 return Err(Errno::ENOENT);
             }
+            origin = self.instances[&d.dev].origin(store, c, st.kind())?;
             upper = Some(c);
             stop = !st.is_dir() || opaque(c)?;
         }
@@ -728,16 +799,15 @@ impl Overlays {
             return Err(Errno::ENOENT);
         }
         let dev = d.dev;
-        let known_origin = upper.and_then(|u| self.instances[&dev].origins.get(&u).copied());
-        // The same name gives the same node again, brought up to date with the layers (keeping
-        // what it was copied up from while its upper inode stays)
-        if let Some(&id) = d.children.get(name) {
+        let child = d.children.get(name).copied();
+        if let (Some(u), Some(l)) = (upper, origin) {
+            self.instances.get_mut(&dev).unwrap().origins.insert(u, l);
+        }
+        if let Some(id) = child {
             self.clock += 1;
             let seen = self.clock;
             let n = self.node_mut(id);
-            if n.upper != upper {
-                n.origin = known_origin;
-            }
+            n.origin = origin;
             n.upper = upper;
             n.lower = lower;
             n.seen = seen;
@@ -750,7 +820,7 @@ impl Overlays {
             name: name.to_vec(),
             upper,
             lower,
-            origin: known_origin,
+            origin,
             children: HashMap::new(),
             seen: 0,
             touched: Cell::new(0),
@@ -767,7 +837,11 @@ impl Overlays {
     /// names below them, each entry's inode number the one stat shows.
     pub(crate) fn readdir(&self, store: &Store, dir: OvlId) -> Result<Vec<DirEntry>, Errno> {
         let d = self.node(dir);
-        let origins = &self.instances[&d.dev].origins;
+        let instance = &self.instances[&d.dev];
+        let impure = match d.upper {
+            Some(u) => instance.impure(store, u)?,
+            None => false,
+        };
         let layers = d.upper.iter().chain(&d.lower);
         let mut seen: std::collections::BTreeMap<Vec<u8>, Option<DirEntry>> = Default::default();
         for &layer in layers {
@@ -780,9 +854,15 @@ impl Overlays {
                 // A copied-up entry shows the number stat shows
                 if let Some(shown) = &mut shown
                     && is_upper
-                    && let Some(&origin) = origins.get(&e.ino)
                 {
-                    shown.ino = origin;
+                    // In a pure directory a previously looked-up name can also cache the absence
+                    // of an origin. On a cold listing check even entries without a parent marker.
+                    let cached = d.children.get(&e.name).map(|id| &self.nodes[id]);
+                    let origin = match cached {
+                        Some(n) if !impure && n.upper == Some(e.ino) => n.origin,
+                        _ => instance.origin(store, e.ino, e.mode & mode::S_IFMT)?,
+                    };
+                    shown.ino = origin.unwrap_or(e.ino);
                 }
                 seen.insert(e.name, shown);
             }
@@ -859,6 +939,7 @@ impl Overlays {
         let name = n.name.clone();
         let prefix = self.options_of(id).private_prefix();
         let st = store.stat(lower)?;
+        let record_origin = st.is_dir() || st.nlink == 1;
         let upper = store.transaction(|s| {
             let pst = s.stat(dir)?;
             let perm = st.mode & 0o7777;
@@ -891,6 +972,12 @@ impl Overlays {
                     s.set_xattr(ino, &x, &s.get_xattr(lower, &x)?, false, false)?;
                 }
             }
+            s.set_flags(ino, st.flags)?;
+            if record_origin {
+                let handle = [ORIGIN_V1, &lower.to_le_bytes()].concat();
+                s.set_xattr(ino, &[prefix, b"origin"].concat(), &handle, false, false)?;
+                self.instance_of(id).mark_impure(s, dir)?;
+            }
             let at = super::store::FileTime::At;
             s.set_times(ino, Some(at(st.atime_ns)), Some(at(st.mtime_ns)))?;
             s.set_times(dir, Some(at(pst.atime_ns)), Some(at(pst.mtime_ns)))?;
@@ -899,7 +986,6 @@ impl Overlays {
         let dev = self.node(id).dev;
         self.clock += 1;
         let seen = self.clock;
-        let record_origin = st.is_dir() || st.nlink == 1;
         let n = self.node_mut(id);
         n.upper = Some(upper);
         n.seen = seen;
@@ -917,6 +1003,22 @@ impl Overlays {
                 .insert(upper, lower);
         }
         Ok(upper)
+    }
+
+    /// Mark a directory receiving a name for an inode with a copy-up origin.
+    pub(crate) fn mark_origin_parent(
+        &self,
+        store: &Store,
+        id: OvlId,
+        dir: Ino,
+    ) -> Result<(), Errno> {
+        let n = self.node(id);
+        let instance = &self.instances[&n.dev];
+        let name = [instance.options.private_prefix(), b"origin"].concat();
+        if n.origin.is_some() || private_xattr(store, n.real(), &name)?.is_some() {
+            instance.mark_impure(store, dir)?;
+        }
+        Ok(())
     }
 
     /// Makes a whiteout named `name` in store directory `dir` for node `id`'s instance.
@@ -1049,6 +1151,12 @@ impl Overlays {
                 }
             }
             s.rename(old_up, old_name, new_up, new_name, false, exchange)?;
+            if old_up != new_up {
+                self.mark_origin_parent(s, src, new_up)?;
+                if exchange && let Some(d) = dst {
+                    self.mark_origin_parent(s, d, old_up)?;
+                }
+            }
             if old_lower {
                 self.whiteout(s, src, old_up, old_name)?;
             }
@@ -1219,6 +1327,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn remount_validates_origin_under_a_live_lower_root() {
+        use super::super::store::{FileTime::At, ROOT, inode_flags};
+
+        let dir = std::env::temp_dir().join(format!("appine-ovl-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::create(&dir).unwrap();
+        let layer = s.mkdir(ROOT, b"lower", 0o755, 0, 0).unwrap();
+        let sub = s.mkdir(layer, b"sub", 0o755, 0, 0).unwrap();
+        let other = s.mkdir(ROOT, b"other", 0o755, 0, 0).unwrap();
+        let upper = s.mkdir(ROOT, b"upper", 0o755, 0, 0).unwrap();
+        let (lower, _) = s.create_file(sub, b"f", 0o644, 0, 0).unwrap();
+        s.set_flags(sub, inode_flags::NOATIME).unwrap();
+        s.set_flags(lower, inode_flags::NODUMP).unwrap();
+        s.set_times(upper, Some(At(100)), Some(At(200))).unwrap();
+        let mount = |o: &mut Overlays, roots| {
+            o.add_instance(
+                1,
+                (Some(upper), roots),
+                ((0, 0), vec![]),
+                Options::default(),
+            )
+        };
+        let mut o = Overlays::default();
+        let top = mount(&mut o, vec![layer]);
+        let d = o.lookup(&s, top, b"sub").unwrap();
+        let f = o.lookup(&s, d, b"f").unwrap();
+        let copied = o.upper_of(&s, f, CopyUp::All).unwrap();
+        assert_eq!(s.flags(o.node(d).real()).unwrap(), inode_flags::NOATIME);
+        assert_eq!(s.flags(copied).unwrap(), inode_flags::NODUMP);
+        let st = s.stat(upper).unwrap();
+        assert_eq!((st.atime_ns, st.mtime_ns), (100, 200));
+        o.rename(&s, (d, b"f"), (top, b"renamed"), (false, false))
+            .unwrap();
+        drop(o);
+
+        let check = |roots, expected| {
+            let mut o = Overlays::default();
+            let top = mount(&mut o, roots);
+            let listing = o.readdir(&s, top).unwrap();
+            assert_eq!(
+                listing.iter().find(|e| e.name == b"renamed").unwrap().ino,
+                expected
+            );
+            let f = o.lookup(&s, top, b"renamed").unwrap();
+            assert_eq!(o.stat(&s, f).unwrap().ino, expected);
+            assert_eq!(o.shown_ino(f), expected);
+        };
+        check(vec![other], copied);
+        check(vec![other, sub], lower);
+        s.remove_xattr(upper, b"trusted.overlay.impure").unwrap();
+        check(vec![layer], lower);
+
+        let name = b"trusted.overlay.origin";
+        let handle = s.get_xattr(copied, name).unwrap();
+        let wrong_kind = [ORIGIN_V1, &sub.to_le_bytes()].concat();
+        for malformed in [&b"old"[..], &handle[..handle.len() - 1], &wrong_kind] {
+            s.set_xattr(copied, name, malformed, false, false).unwrap();
+            check(vec![layer], copied);
+        }
+        s.set_xattr(copied, name, &handle, false, false).unwrap();
+        s.link(sub, b"second", lower).unwrap();
+        check(vec![layer], copied);
+        s.unlink(sub, b"second").unwrap();
+        check(vec![layer], lower);
+        s.unlink(sub, b"f").unwrap();
+        check(vec![layer], copied);
+        drop(s);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A node stays linked while its directory has it: a rename moves it, removal and being
     /// replaced by a rename unlink it (inotify's `IN_EXCL_UNLINK` asks).
     #[test]
@@ -1328,11 +1507,30 @@ mod tests {
         let keep = HashSet::from([cwd]);
         assert_eq!(o.sweep(&keep, started), 0);
         assert!([d, f, cwd, g].iter().all(|n| o.nodes.contains_key(n)));
-        // Once let go and the system call is over, all of it goes
+        // A path-based truncate still holds its own node after an independent lease holder
+        // closes. The hold alone must suffice once there is no syscall age protection.
+        let truncating = Hold::new(g);
         drop(hold);
-        assert_eq!(o.sweep(&HashSet::new(), u64::MAX), 4);
+        assert_eq!(o.sweep(&HashSet::new(), u64::MAX), 3);
+        assert!(o.nodes.contains_key(&g));
+        drop(truncating);
+        assert_eq!(o.sweep(&HashSet::new(), u64::MAX), 1);
         assert!([d, f, cwd, g].iter().all(|n| !o.nodes.contains_key(n)));
         assert!(o.linked(top) && o.orphans.is_empty());
+        // A blocking open keeps its original parent even after its target moves elsewhere.
+        s.mkdir(up, b"from", 0o755, 0, 0).unwrap();
+        let from = o.lookup(&s, top, b"from").unwrap();
+        let target = create(&mut o, from, b"file");
+        let target_hold = Hold::new(target);
+        let parent_hold = Hold::new(from);
+        o.rename(&s, (from, b"file"), (top, b"moved"), (false, false))
+            .unwrap();
+        o.remove(&s, top, b"from", true).unwrap();
+        assert_eq!(o.sweep(&HashSet::new(), u64::MAX), 0);
+        drop(parent_hold);
+        assert_eq!(o.sweep(&HashSet::new(), u64::MAX), 1);
+        assert!(o.linked(target));
+        drop(target_hold);
         o.remove_instance(0x32);
         let _ = std::fs::remove_dir_all(&dir);
     }

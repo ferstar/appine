@@ -74,7 +74,7 @@ provider and rootfs installation UI (`android`).
   in one, the BKL held), `release`.
 - **Changes**: `mkdir`, `create_file`, `create_anonymous`, `create_tmpfile`, `release_tmpfile`, `symlink`, `mknod`, `link`, `unlink`,
   `rmdir`, `rename` (no-replace, exchange), `create_detached_dir`/`remove_detached_dir`,
-  `set_mode`, `set_owner`, `set_owner_mode`, `remove_privs`, xattr writes, `set_mtime`,
+  `set_mode`, `set_owner`, `set_owner_mode`, `set_flags`/`set_flags_open`, `remove_privs`, xattr writes, `set_mtime`,
   `set_times`, `set_times_open`, `accessed`, `object_modified`; `transaction`.
 - **Durability**: `commit`, `commit_due`, `set_waker`, `Meta::sync_metadata`, `Meta::sync_all`.
 - **Host-facing**: `import_rootfs`, `sync_store`, `browse` (stat, list, open, text sniffing,
@@ -86,12 +86,12 @@ provider and rootfs installation UI (`android`).
 ### On-disk layout and schema
 
 - A store directory holds `meta.db` (SQLite, WAL mode), `objects/` and `lock`.
-- Tables: `inodes` (mode, owner, nlink, `..` parent for directories, rdev, mtime/ctime, symlink
-  targets), `dentries`, `xattrs`, `detached_roots` (tmpfs roots and file-import staging directories),
+- Tables: `inodes` (mode, owner, nlink, `..` parent for directories, rdev, mtime/ctime/atime,
+  inode flags migrated on open, symlink targets), `dentries` (indexed on `ino` via `dentries_ino`), `xattrs`, `detached_roots` (tmpfs roots and file-import staging directories),
   `shared` (regular files whose data is not plainly their own object: the object's number and a saved timestamp marking it held),
   and `document_generations` (retired document names with a unique parent/name index).
-  The `shared` table also has an index on object. Tables are created with `IF NOT EXISTS`, so
-  older stores gain `shared` when opened.
+  The `shared` table also has an index on object. Tables and indexes are created with `IF NOT EXISTS`, so
+  older stores gain `shared`, `dentries_ino` and `inodes.flags` when opened.
 - Pragmas: `journal_mode = WAL`, `synchronous = NORMAL`, `journal_size_limit = 8 MB`, a 10 s busy
   timeout, a statement cache.
 - `Store::create` writes the root directory (0755, its own parent).

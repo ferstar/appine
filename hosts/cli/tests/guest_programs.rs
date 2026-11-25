@@ -1170,6 +1170,11 @@ fn oom_victim_reaping_and_vfork_safety() {
 }
 
 #[test]
+fn overlay_origin_remount() {
+    run_guest_in_empty_rootfs("overlay_origin");
+}
+
+#[test]
 fn overlay_node_eviction_and_mmap_copy_up() {
     run_guest_in_empty_rootfs("overlay_fixes");
 }

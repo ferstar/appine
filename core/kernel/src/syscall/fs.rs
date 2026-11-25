@@ -1689,6 +1689,11 @@ fn open_overlay(
 ) -> Result<FileKind, Errno> {
     // Hold the overlay node across any BKL release in break_leases or open_fifo.
     let _hold = overlay::Hold::new(o);
+    // A rename during the wait can separate the open dentry from its original parent.
+    let _parent_hold = match beside {
+        Some(Node::Overlay(_, dir)) => Some(overlay::Hold::new(*dir)),
+        _ => None,
+    };
     let mut real = vfs.overlay().node(o).real();
     let st = vfs.store().attrs(real)?;
     let lease_ino = overlay::key(o);
@@ -8325,7 +8330,11 @@ fn link_overlay(
         (mnt, up),
         name,
         None,
-        || vfs.store().link(up, name, file).map(|()| file),
+        || {
+            vfs.store().link(up, name, file)?;
+            vfs.overlay().mark_origin_parent(vfs.store(), so, up)?;
+            Ok(file)
+        },
         |&ino| ino,
     )?;
     tmpfs_created_name(vfs, tmpfs, 0);
@@ -9650,6 +9659,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
                 return Err(Errno::ETXTBSY);
             }
             check_fsize(cx, len)?;
+            let _hold = overlay::Hold::new(o);
             super::lease::break_leases(cx, overlay::key(o), true, false, None)?;
             let what = if len == 0 {
                 CopyUp::NoData

@@ -293,6 +293,7 @@ const SCHEMA: &str = "
         ino    INTEGER NOT NULL,
         PRIMARY KEY (parent, name)
     ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS dentries_ino ON dentries (ino);
     CREATE TABLE IF NOT EXISTS xattrs (
         ino   INTEGER NOT NULL,
         name  BLOB NOT NULL,
@@ -1132,24 +1133,8 @@ impl Store {
     /// root filesystem, or the detached root inode for a tmpfs/staging tree); `None` if `ino` is
     /// unlinked.
     pub fn tree_root(&self, ino: Ino) -> Result<Option<Ino>, Errno> {
-        let st = self.attrs(ino)?;
-        if st.nlink == 0 {
+        let Some(mut dir) = self.linked_dir(&self.attrs(ino)?)? else {
             return Ok(None);
-        }
-        let mut dir = if st.is_dir() {
-            ino
-        } else {
-            self.begin_read()?;
-            let Some(parent) = self
-                .db()
-                .prepare_cached("SELECT parent FROM dentries WHERE ino = ?1 LIMIT 1")
-                .and_then(|mut st| st.query_row(params![ino], |r| r.get::<_, Ino>(0)))
-                .optional()
-                .map_err(db_err)?
-            else {
-                return Ok(None);
-            };
-            parent
         };
         loop {
             let up = self.parent(dir)?;
@@ -1158,6 +1143,22 @@ impl Store {
             }
             dir = up;
         }
+    }
+
+    /// A live directory itself or one directory containing a live non-directory's name.
+    pub(super) fn linked_dir(&self, st: &Stat) -> Result<Option<Ino>, Errno> {
+        if st.nlink == 0 {
+            return Ok(None);
+        }
+        if st.is_dir() {
+            return Ok(Some(st.ino));
+        }
+        self.begin_read()?;
+        self.db()
+            .prepare_cached("SELECT parent FROM dentries WHERE ino = ?1 LIMIT 1")
+            .and_then(|mut stmt| stmt.query_row(params![st.ino], |r| r.get(0)))
+            .optional()
+            .map_err(db_err)
     }
 
     /// Lists a directory's contents, sorted by name, without `.` and `..`.

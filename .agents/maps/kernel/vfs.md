@@ -421,9 +421,6 @@ capabilities (`kernel/cred`).
 
 ## Confirmed bugs / technical debt
 
-- Recursive overlay copy-up copies xattrs and times but can lose lower inode flags. SETFLAGS
-  writes the requested flags on its target; copying up an ancestor in that operation can still
-  lose the ancestor's flags.
 - Guest xattr setters and writable shared mappings still need inode-flag checks in their
   respective syscall paths. The store's raw xattr operations also serve internal copy-up and ACL work.
 - statx has no btime or `STATX_DIOALIGN`.
