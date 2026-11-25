@@ -1429,6 +1429,11 @@ impl Mm {
         self.brk_start
     }
 
+    /// The current program break.
+    pub fn brk_current(&self) -> u64 {
+        self.brk
+    }
+
     /// The initial stack pointer (Linux's `start_stack`).
     pub fn start_stack(&self) -> u64 {
         self.start_stack
@@ -1877,7 +1882,7 @@ impl Mm {
             return (read.is_ok() && bytes == image).then_some(appine_engine::DbtSource {
                 start,
                 len: v.len,
-                id: [u64::MAX; 5],
+                id: CodeGroup::VDSO_ID,
             });
         }
         if v.backing != Backing::PrivateFile || v.written.get() {
@@ -2162,7 +2167,15 @@ impl Mm {
     /// another piece is allocated: the grown part is a new VMA whose host memory reserves room
     /// below it as large as the current stack, so the number of VMAs grows only logarithmically
     /// with the stack.
+    #[cfg(test)]
     pub fn grow_down(&mut self, addr: u64, limit: u64) -> bool {
+        self.grow_down_limited(addr, limit, u64::MAX)
+    }
+
+    /// Like [`Mm::grow_down`], also enforcing `memlock_limit` (`RLIMIT_MEMLOCK`, or `u64::MAX`
+    /// with `CAP_IPC_LOCK`) when the grows-down VMA is locked (`VM_LOCKED`, Linux's
+    /// `acct_stack_growth`).
+    pub fn grow_down_limited(&mut self, addr: u64, limit: u64, memlock_limit: u64) -> bool {
         let page = addr & !(PAGE_SIZE - 1);
         if page < mmap_min() || self.is_mapped(addr) {
             return false;
@@ -2174,6 +2187,7 @@ impl Mm {
             return false;
         }
         let prot = v.prot;
+        let locked = v.locked;
         if let Some((&s, below)) = self.vmas.range(..page).next_back()
             && !below.growsdown
             && below.prot != 0
@@ -2192,6 +2206,9 @@ impl Mm {
         }
         let (grow, size) = (above - page, end - above);
         if size + grow > limit {
+            return false;
+        }
+        if locked && !self.can_lock(grow, memlock_limit) {
             return false;
         }
         let grown = if self.spare_below(above) >= grow {
@@ -2266,6 +2283,17 @@ impl Mm {
     /// at the first unmapped page that cannot be grown into. Also refreshes file mappings
     /// whose previously inaccessible pages now contain file data.
     pub fn grow_for(&mut self, addr: u64, len: usize, limit: u64) -> bool {
+        self.grow_for_limited(addr, len, limit, u64::MAX)
+    }
+
+    /// Like [`Mm::grow_for`], passing `memlock_limit` to [`Mm::grow_down_limited`].
+    pub fn grow_for_limited(
+        &mut self,
+        addr: u64,
+        len: usize,
+        limit: u64,
+        memlock_limit: u64,
+    ) -> bool {
         let end = addr.saturating_add(len as u64);
         let (mut page, mut grew) = (addr & !(PAGE_SIZE - 1), false);
         while page < end {
@@ -2281,7 +2309,7 @@ impl Mm {
                 page = next;
                 continue;
             }
-            if !self.grow_down(page, limit) {
+            if !self.grow_down_limited(page, limit, memlock_limit) {
                 break;
             }
             grew = true;
@@ -3049,6 +3077,7 @@ impl Mm {
     /// tries to extend in place, and otherwise moves to a new address (`may_move`): moving copies
     /// no data, it only maps the same host memory at the new address. Shared anonymous mappings
     /// retain their original backing extent. File mappings continue at the next file offset.
+    #[cfg(test)]
     pub fn mremap(
         &mut self,
         old: u64,
@@ -3057,6 +3086,21 @@ impl Mm {
         may_move: bool,
         fixed: Option<u64>,
     ) -> Result<u64, Errno> {
+        self.mremap_limited(old, old_len, new_len, may_move, fixed, u64::MAX)
+    }
+
+    /// Like [`Mm::mremap`], also enforcing `memlock_limit` (`RLIMIT_MEMLOCK`, or `u64::MAX` with
+    /// `CAP_IPC_LOCK`) when growing or duplicating a locked VMA (Linux 6.1's `vma_to_resize`
+    /// returns `EAGAIN`).
+    pub fn mremap_limited(
+        &mut self,
+        old: u64,
+        old_len: u64,
+        new_len: u64,
+        may_move: bool,
+        fixed: Option<u64>,
+        memlock_limit: u64,
+    ) -> Result<u64, Errno> {
         let old_len = page_up(old_len).ok_or(Errno::EINVAL)?;
         let new_len = page_up(new_len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         let old_end = old.checked_add(old_len).ok_or(Errno::EINVAL)?;
@@ -3064,7 +3108,7 @@ impl Mm {
             return Err(Errno::EINVAL);
         }
         if old_len == 0 {
-            return self.duplicate(old, new_len, may_move, fixed);
+            return self.duplicate(old, new_len, may_move, fixed, memlock_limit);
         }
         // In Linux's order: a mapping at old (EFAULT), the target (EINVAL, then unmapped), the
         // shrunk tail unmapped, and only then the rule that the rest of the old range lies in one
@@ -3088,6 +3132,9 @@ impl Mm {
             }
             let ext = if grow > 0 {
                 let (&start, tail) = self.vmas.range(..old_end).next_back().unwrap();
+                if tail.locked && !self.can_lock(grow, memlock_limit) {
+                    return Err(Errno::EAGAIN);
+                }
                 let offset = old_end - start;
                 Some(Self::extension(tail, offset, grow, Some(dst))?)
             } else {
@@ -3112,6 +3159,9 @@ impl Mm {
         let (&start, tail) = self.vmas.range(..old_end).next_back().unwrap();
         if tail.foreign() {
             return Err(Errno::EFAULT);
+        }
+        if tail.locked && !self.can_lock(grow, memlock_limit) {
+            return Err(Errno::EAGAIN);
         }
         let offset = old_end - start;
         if offset == tail.len && old_end + grow <= self.mmap_top && self.is_free(old_end, grow) {
@@ -3164,6 +3214,7 @@ impl Mm {
         new_len: u64,
         may_move: bool,
         fixed: Option<u64>,
+        memlock_limit: u64,
     ) -> Result<u64, Errno> {
         let (s, v) = self
             .vmas
@@ -3189,6 +3240,9 @@ impl Mm {
             None if may_move => self.find_free(new_len).ok_or(Errno::ENOMEM)?,
             None => return Err(Errno::ENOMEM),
         };
+        if v.locked && !self.can_lock(new_len, memlock_limit) {
+            return Err(Errno::EAGAIN);
+        }
         let copy = Self::extension(&v, old - s, new_len, Some(dst))?;
         self.insert_vma(dst, copy)?;
         Ok(dst)
@@ -3460,7 +3514,15 @@ impl Mm {
     /// Implements brk(2): returns the new break, or the old one on failure. The heap is readable
     /// and writable, and executable too with `exec` (`READ_IMPLIES_EXEC`, Linux's
     /// `VM_DATA_DEFAULT_FLAGS`).
+    #[cfg(test)]
     pub fn brk(&mut self, new: u64, exec: bool) -> u64 {
+        self.brk_limited(new, exec, u64::MAX)
+    }
+
+    /// Like [`Mm::brk`], also enforcing `memlock_limit` (`RLIMIT_MEMLOCK`, or `u64::MAX` with
+    /// `CAP_IPC_LOCK`) when `mlockall(MCL_FUTURE)` is active (Linux 6.1's `do_brk_flags` ->
+    /// `mlock_future_check`).
+    pub fn brk_limited(&mut self, new: u64, exec: bool, memlock_limit: u64) -> u64 {
         let heap = prot::READ | prot::WRITE | if exec { prot::EXEC } else { 0 };
         if new < self.brk_start {
             return self.brk;
@@ -3470,6 +3532,9 @@ impl Mm {
         };
         if new_end > old_end {
             let grow = new_end - old_end;
+            if self.lock_future && !self.can_lock(grow, memlock_limit) {
+                return self.brk;
+            }
             if !self.is_free(old_end, grow) {
                 return self.brk;
             }
@@ -4572,6 +4637,19 @@ impl Mm {
     /// Bytes locked (VmLck in `/proc/<pid>/status`, `RLIMIT_MEMLOCK`).
     pub fn locked_bytes(&self) -> u64 {
         self.vmas.values().filter(|v| v.locked).map(|v| v.len).sum()
+    }
+
+    /// Whether locking `more` additional bytes stays within `limit` (`RLIMIT_MEMLOCK`).
+    pub fn can_lock(&self, more: u64, limit: u64) -> bool {
+        self.locked_bytes().saturating_add(more) <= limit
+    }
+
+    /// Whether the mapping containing `addr` is locked.
+    pub fn is_locked_at(&self, addr: u64) -> bool {
+        self.vmas
+            .range(..=addr)
+            .next_back()
+            .is_some_and(|(&s, v)| addr < s + v.len && v.locked)
     }
 
     /// mlock, munlock: locks or unlocks contiguous mapped VMAs in `[addr, addr + len)` (widened to
@@ -6477,8 +6555,17 @@ impl Default for Mm {
 impl Drop for Mm {
     fn drop(&mut self) {
         if let Some(group) = self.code_group.take() {
-            group.members.set(group.members.get() - 1);
+            let remaining = group.members.get() - 1;
+            group.members.set(remaining);
             group.claims.borrow_mut().retain(|c| c.0 != self.code_tag);
+            // Record the group's registered file sources only when the last member drops and the
+            // shared DbtSpace returns to the pool, so an exiting member never clobbers the space's
+            // sources for surviving members or drops ranges registered by other members.
+            if remaining == 0 {
+                group.space.set_sources(&group.file_sources());
+            }
+        } else if let Some(cs) = &self.code_space {
+            cs.space.set_sources(&self.code_sources());
         }
         self.release_cow();
         // SAFETY: self.mmu is not used afterwards
@@ -6497,12 +6584,9 @@ impl Drop for Mm {
 }
 
 impl Mm {
-    /// When the address space is destroyed: records the mappings the translations came from,
-    /// returns borrowed pages, and leaves lent pages with the borrowers.
+    /// When the address space is destroyed: returns borrowed pages and leaves lent pages with the
+    /// borrowers.
     fn release_cow(&mut self) {
-        if let Some(cs) = &self.code_space {
-            cs.space.set_sources(&self.code_sources());
-        }
         let cow = std::mem::take(self.cow.get_mut());
         // No thread uses this address space any more (exit, execve), so no TLB flush is needed
         // before returning borrowed pages
@@ -6644,6 +6728,9 @@ impl CodeGroup {
     /// The most mappings registered (python's extension modules take one each).
     const MAX_RANGES: usize = 256;
 
+    /// Sentinel [`appine_engine::DbtSource::id`] for an unmodified vDSO mapping.
+    const VDSO_ID: [u64; 5] = [u64::MAX; 5];
+
     /// All executable mappings of member `tag`: the trusted `layout` and the private `private`
     /// ([`Mm::exec_split`]). layout must agree with what is registered ([`CodeGroup::extend`])
     /// and not overlap ranges private to other members, and private must not overlap registered
@@ -6730,6 +6817,19 @@ impl CodeGroup {
         let (ri, si) = (r.id, s.id);
         (ri[0], ri[1], ri[3], ri[4]) == (si[0], si[1], si[3], si[4])
             && r.start.wrapping_sub(ri[2]) == s.start.wrapping_sub(si[2])
+    }
+
+    /// File-backed registered sources to record on `space` when the last member drops and the
+    /// translation space returns to the pool (excludes [`Self::VDSO_ID`], which
+    /// [`Mm::code_sources`] never emits).
+    fn file_sources(&self) -> Vec<appine_engine::DbtSource> {
+        self.ranges
+            .borrow()
+            .iter()
+            .filter(|r| r.id != Self::VDSO_ID)
+            .take(appine_engine::DbtSpace::SOURCES)
+            .copied()
+            .collect()
     }
 }
 
@@ -11416,5 +11516,185 @@ mod tests {
         let mut fbuf = [0u8; 4];
         mm.read(UserSlice::new(fa, 4), &mut fbuf).unwrap();
         assert_eq!(&fbuf, b"UUUU");
+    }
+
+    #[test]
+    fn code_group_drop_preserves_sources_for_surviving_and_pooled_members() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        if appine_engine::DbtSpace::new(0, appine_engine::DbtRegs::Default).is_none() {
+            return;
+        }
+        // Build two code files with valid aarch64 instructions: movz x0, #imm; svc #0.
+        let mut exe_file = appine_hal::memfd(c"cg-exe").unwrap();
+        let mut lib_file = appine_hal::memfd(c"cg-lib").unwrap();
+        let write_prog = |f: &mut std::fs::File, imm: u16| {
+            let mut page = vec![0u8; PAGE_SIZE as usize];
+            let insns = [0xd280_0000u32 | ((imm as u32) << 5), 0xd400_0001u32];
+            for (i, w) in insns.iter().enumerate() {
+                page[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+            }
+            f.write_all(&page).unwrap();
+        };
+        write_prog(&mut exe_file, 11);
+        write_prog(&mut lib_file, 42);
+
+        const EXE_ADDR: u64 = 0x4000_0000;
+        const LIB_ADDR: u64 = 0x5000_0000;
+        let rx = prot::READ | prot::EXEC;
+        let fixed = flags::MAP_PRIVATE | flags::MAP_FIXED;
+        let map_trusted = |mm: &mut Mm, addr: u64, fd: i32, ino: u64| {
+            mm.mmap(addr, PAGE_SIZE, rx, fixed, Some((fd, 0, false)))
+                .unwrap();
+            let v = mm.vmas.get_mut(&addr).unwrap();
+            v.file_id = Some((77, ino, 0));
+            v.content = Some((999, PAGE_SIZE));
+        };
+
+        // Pick a unique exe key so this test never collides with pooled instances from other tests.
+        let key = 0x5a5a_0000_0000_7701u64;
+        let groups: CodeGroups = RefCell::new(Vec::new());
+
+        // Member 1 maps both exe and lib, founds the group, and translates both blocks.
+        let mut mm1 = Mm::new();
+        mm1.exe = Some(key);
+        map_trusted(&mut mm1, EXE_ADDR, exe_file.as_raw_fd(), 101);
+        map_trusted(&mut mm1, LIB_ADDR, lib_file.as_raw_fd(), 102);
+        let cs1 = mm1.code_space(&groups).unwrap();
+        assert_eq!(mm1.code_group.as_ref().unwrap().file_sources().len(), 2);
+
+        let run_at = |mm: &Mm, cs: &CodeSpace, pc: u64| -> (u64, appine_engine::DbtStats) {
+            let mut cpu = unsafe { appine_engine::Cpu::new(mm.mmu()) };
+            cpu.state_mut().pc = pc;
+            let mut dbt = appine_engine::Dbt::attach(&cs.space, cs.tag).unwrap();
+            assert_eq!(dbt.run(&mut cpu), appine_engine::Exit::Svc { imm: 0 });
+            (cpu.state().x[0], dbt.stats())
+        };
+        assert_eq!(run_at(&mm1, &cs1, EXE_ADDR).0, 11);
+        assert_eq!(run_at(&mm1, &cs1, LIB_ADDR).0, 42);
+
+        // Member 2 joins the same group mapping only exe (not lib).
+        let mut mm2 = Mm::new();
+        mm2.exe = Some(key);
+        map_trusted(&mut mm2, EXE_ADDR, exe_file.as_raw_fd(), 101);
+        let cs2 = mm2.code_space(&groups).unwrap();
+        assert!(Arc::ptr_eq(&cs1.space, &cs2.space));
+        assert_eq!(mm2.code_group.as_ref().unwrap().members.get(), 2);
+
+        // Verify CodeGroup::file_sources excludes the vDSO sentinel.
+        mm2.code_group
+            .as_ref()
+            .unwrap()
+            .ranges
+            .borrow_mut()
+            .push(appine_engine::DbtSource {
+                start: 0x6000_0000,
+                len: PAGE_SIZE,
+                id: CodeGroup::VDSO_ID,
+            });
+        assert_eq!(mm2.code_group.as_ref().unwrap().file_sources().len(), 2);
+
+        // Drop member 1 first (surviving member 2 still owns the group), then drop member 2 last.
+        // Previously member 2's drop called set_sources(&mm2.code_sources()) which lacked lib,
+        // so pooled reuse invalidated lib's block instead of parking and reviving it.
+        drop(cs1);
+        drop(mm1);
+        assert_eq!(mm2.code_group.as_ref().unwrap().members.get(), 1);
+        drop(cs2);
+        drop(mm2);
+
+        // Member 3 starts with only exe mapped (like a freshly exec'd process before ld.so maps
+        // shared libraries): it pulls the pooled DbtSpace, trusts exe, and parks lib's block.
+        let mut mm3 = Mm::new();
+        mm3.exe = Some(key);
+        map_trusted(&mut mm3, EXE_ADDR, exe_file.as_raw_fd(), 101);
+        let cs3 = mm3.code_space(&groups).unwrap();
+        let (x0_exe, st_exe) = run_at(&mm3, &cs3, EXE_ADDR);
+        assert_eq!(x0_exe, 11);
+        assert_eq!(st_exe.blocks, 0, "exe block should be reused from pool");
+
+        // Now map lib into member 3: lib's parked block must revive without retranslation.
+        map_trusted(&mut mm3, LIB_ADDR, lib_file.as_raw_fd(), 102);
+        let (x0_lib, st_lib) = run_at(&mm3, &cs3, LIB_ADDR);
+        assert_eq!(x0_lib, 42);
+        assert_eq!(
+            st_lib.blocks, 0,
+            "lib block should revive from parked group sources instead of being clobbered on mm2 drop"
+        );
+    }
+
+    #[test]
+    fn mcl_future_and_locked_growth_respect_memlock_limit() {
+        let mut mm = Mm::new();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let shared = flags::MAP_SHARED | flags::MAP_ANONYMOUS;
+
+        // An unlocked mapping created before MCL_FUTURE stays unlocked when grown by mremap.
+        let unlk = mm.mmap(0, PAGE_SIZE, RW, anon, None).unwrap();
+        assert!(!mm.is_locked_at(unlk));
+        mm.lock_future = true;
+
+        // brk_limited enforces RLIMIT_MEMLOCK on growth, allows shrinking and same-page growth.
+        mm.set_brk(0x2000_0000);
+        let limit = 2 * PAGE_SIZE;
+        assert_eq!(
+            mm.brk_limited(0x2000_0000 + 2 * PAGE_SIZE, false, limit),
+            0x2000_0000 + 2 * PAGE_SIZE
+        );
+        assert_eq!(mm.locked_bytes(), 2 * PAGE_SIZE);
+        // Exceeding limit returns the old break unchanged.
+        assert_eq!(
+            mm.brk_limited(0x2000_0000 + 3 * PAGE_SIZE, false, limit),
+            0x2000_0000 + 2 * PAGE_SIZE
+        );
+        // Shrinking back frees locked bytes.
+        assert_eq!(mm.brk_limited(0x2000_0000, false, limit), 0x2000_0000);
+        assert_eq!(mm.locked_bytes(), 0);
+
+        // mremap_limited enforces RLIMIT_MEMLOCK on growing/duplicating locked VMAs, not unlocked.
+        let lk = mm.mmap(0, 2 * PAGE_SIZE, RW, anon, None).unwrap();
+        assert_eq!(mm.locked_bytes(), 2 * PAGE_SIZE);
+        assert_eq!(
+            mm.mremap_limited(lk, 2 * PAGE_SIZE, 4 * PAGE_SIZE, true, None, 3 * PAGE_SIZE),
+            Err(Errno::EAGAIN)
+        );
+        // Growing the unlocked VMA created before MCL_FUTURE still succeeds.
+        let unlk = mm
+            .mremap_limited(unlk, PAGE_SIZE, 4 * PAGE_SIZE, true, None, 3 * PAGE_SIZE)
+            .unwrap();
+        assert!(!mm.is_locked_at(unlk));
+        // Duplicating a locked shared VMA (old_len == 0) enforces RLIMIT_MEMLOCK.
+        let sh = mm.mmap(0, PAGE_SIZE, RW, shared, None).unwrap();
+        assert_eq!(mm.locked_bytes(), 3 * PAGE_SIZE);
+        assert_eq!(
+            mm.mremap_limited(sh, 0, PAGE_SIZE, true, None, 3 * PAGE_SIZE),
+            Err(Errno::EAGAIN)
+        );
+        // MREMAP_FIXED over `sh` (1 page locked) frees its locked page before checking growth.
+        let moved = mm
+            .mremap_limited(
+                lk,
+                2 * PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                Some(sh),
+                3 * PAGE_SIZE,
+            )
+            .unwrap();
+        assert_eq!(moved, sh);
+        assert_eq!(mm.locked_bytes(), 3 * PAGE_SIZE);
+        mm.munmap(moved, 3 * PAGE_SIZE).unwrap();
+        assert_eq!(mm.locked_bytes(), 0);
+
+        // grow_down_limited enforces RLIMIT_MEMLOCK on locked grows-down VMAs only.
+        mm.map_stack(PAGE_SIZE, 8 * PAGE_SIZE).unwrap();
+        assert_eq!(mm.locked_bytes(), PAGE_SIZE);
+        assert!(mm.grow_down_limited(STACK_TOP - 2 * PAGE_SIZE, 8 * PAGE_SIZE, 2 * PAGE_SIZE));
+        assert_eq!(mm.locked_bytes(), 2 * PAGE_SIZE);
+        assert!(!mm.grow_down_limited(STACK_TOP - 3 * PAGE_SIZE, 8 * PAGE_SIZE, 2 * PAGE_SIZE));
+        // Unlocked grows-down VMA is not restricted by RLIMIT_MEMLOCK.
+        mm.set_all_locked(false);
+        assert!(mm.grow_down_limited(STACK_TOP - 4 * PAGE_SIZE, 8 * PAGE_SIZE, PAGE_SIZE));
     }
 }

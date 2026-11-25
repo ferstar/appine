@@ -499,10 +499,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             210 => net::shutdown(cx, a[0] as i32, a[1] as i32),
             211 => net::sendmsg(cx, a[0] as i32, a[1], a[2] as u32),
             212 => net::recvmsg(cx, a[0] as i32, a[1], a[2] as u32),
-            214 => {
-                let exec = mem::read_implies_exec(cx);
-                Ok(cx.mm_mut().brk(a[0], exec))
-            }
+            214 => mem::brk(cx, a[0]),
             223 => fs::fadvise64(cx, a[0] as i32, a[2] as i64, a[3] as i32),
             213 => fs::cache_hint(cx, a[0] as i32, a[1] as i64, a[2] as i64, 0, 1),
             215 => mem::munmap(cx, a[0], a[1]),

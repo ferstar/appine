@@ -626,6 +626,9 @@ pub(super) fn shmat(cx: &mut Cx<'_>, id: i32, addr: u64, flags: i32) -> SysResul
         perm.check(&cred, &owner, want)?;
         seg.mem.clone()
     };
+    if cx.mm().lock_future {
+        super::mem::check_memlock_future(cx, mem.len())?;
+    }
     let ns = cx.task.ns.borrow().ipc.id;
     let at = cx.mm_mut().attach_shm(
         (addr != 0).then_some(addr),

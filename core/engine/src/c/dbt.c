@@ -1271,8 +1271,31 @@ static void code_changed(struct appine_dbt_thread *t, const struct appine_cpu *c
     unlock_dbt(t->d);
 }
 
+/*
+ * Whether modifying a conditional branch (B.cond, CBZ/CBNZ, TBZ/TBNZ) is safe under aarch64 CMODX:
+ * conditional branches are not among the instructions CMODX allows to be modified concurrently
+ * with execution.
+ * - Shared blocks (tag == 0, LINK_SHARED) can be executed by every thread attached to d (including
+ *   threads of other code-group members), so relinking requires being the sole attached thread on
+ *   the entire instance.
+ * - Private blocks (tag != 0, !LINK_SHARED) are only visible in d->table and linkable by threads
+ *   with the same tag, so relinking only requires being the sole attached thread of t->tag.
+ * Lock held.
+ */
+static bool can_relink_branch(const struct appine_dbt *d, const struct appine_dbt_thread *t,
+                              bool shared)
+{
+    if (shared || !t->tag)
+        return d->threads == t && !t->next;
+    for (const struct appine_dbt_thread *o = d->threads; o; o = o->next)
+        if (o != t && o->tag == t->tag)
+            return false;
+    return true;
+}
+
 /* Patch an already-translated link point; when branch_site is non-NULL the caller holds d->lock
- * as the sole attached thread, and icache sync finishes before returning */
+ * with no concurrent reader of that branch (can_relink_branch), and icache sync finishes before
+ * returning */
 static void patch_existing_link(const struct appine_dbt *d, uint32_t *site, uint32_t *branch_site,
                                 const uint32_t *target)
 {
@@ -1389,9 +1412,11 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
                 !(patch_shared && found)) {
                 *rw(d, patch_site) = enc_b((intptr_t)target - (intptr_t)patch_site);
                 /* Conditional branches are not among the instructions CMODX allows to be modified
-                 * concurrently: do not change it when there are other threads, and finish icache
-                 * sync before unlocking so no newly attached thread can fetch it concurrently */
-                bool branch = patch_branch_site && alone && dbt_relink_word(d, patch_branch_site, target);
+                 * concurrently: only relink when no other thread can execute this block, and finish
+                 * icache sync before unlocking so no newly attached thread can fetch it
+                 * concurrently */
+                bool branch = patch_branch_site && can_relink_branch(d, t, patch_shared) &&
+                              dbt_relink_word(d, patch_branch_site, target);
                 if (sync.n || branch) {
                     sync_add(&sync, patch_site, patch_site + 1);
                     if (branch)
@@ -1416,15 +1441,17 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
              * where the patch would make the entry branch to itself (hence target != patch_site)
              */
             uint32_t *target = patch_forward ? code + ENTRY_CHECK_WORDS : code;
-            if (patch_branch_site && __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1) {
+            if (patch_branch_site &&
+                ((!patch_shared && t->tag) ||
+                 __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1)) {
                 /* Conditional branches are not CMODX-safe: serialize against appine_dbt_attach
                  * under d->lock and finish icache sync before unlocking */
                 lock_dbt(d, &t->stats);
                 if (!__atomic_load_n(&d->flushing, __ATOMIC_RELAXED) &&
                     patch_generation == d->generation && target != patch_site &&
                     !(patch_shared && found)) {
-                    bool alone = d->threads == t && !t->next;
-                    patch_existing_link(d, patch_site, alone ? patch_branch_site : NULL, target);
+                    bool relink = can_relink_branch(d, t, patch_shared);
+                    patch_existing_link(d, patch_site, relink ? patch_branch_site : NULL, target);
                 }
                 unlock_dbt(d);
             } else if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&

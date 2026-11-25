@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: serialize conditional-branch relinking, deduplicate dbt_revive, validate exec_memop self-copies and per-instance spare_stats)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: scope conditional-branch relinking to same-tag threads for private code-group blocks and document CMODX requirement for shared blocks)
 
 ## Responsibilities
 
@@ -211,8 +211,13 @@ triggers (`kernel/oom`).
   single-site conditional branches relinked directly before publication); inline unconditional
   `B`/`BL`, fallthrough `R_CHAIN_FWD`, and `BL`/`BLR` landing pads link lazily on first execution.
   Runtime patching enforces matching `generation`, `target != patch_site`, and no shared->private
-  link; conditional-branch relinking always runs under `d->lock` with `alone` (`d->nthreads == 1`
-  is only a lock-free hint before taking `d->lock`) and finishes full icache sync before unlocking.
+  link; conditional-branch relinking always runs under `d->lock` with `can_relink_branch` and
+  finishes full icache sync before unlocking. Because conditional branches are not CMODX-safe on
+  ARM64, shared (`tag == 0`, `LINK_SHARED`) blocks require being the sole attached thread on the
+  entire `DbtSpace` (including threads of other code-group members, which execute the same shared
+  blocks; `d->nthreads == 1` is only a lock-free hint before taking `d->lock`), whereas private
+  tagged blocks (`tag != 0`, `!LINK_SHARED`) are unreachable from other tags and only require being
+  the sole attached thread of `t->tag`.
   Unconditional `b -> b` patching uses lazy cache maintenance unless the patching thread hits an
   already-patched site (`dbt_sync_all`).
 - Forward direct links skip the 2-word entry kick check (`code + 2`); backward/self links and
@@ -381,8 +386,6 @@ triggers (`kernel/oom`).
 
 ## Open questions
 
-- Is it intended that threads of other code-group members disable direct conditional-branch
-  patching for the whole instance?
 - Two group leaders alternating failures in the same `strikes[64]` slot are never ungrouped;
   accepted?
 - Should `trim_dbt_pool` also reclaim `pool.threads` and `MADV_DONTNEED` `templates.arena` under

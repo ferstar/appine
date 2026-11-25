@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: write faults for private files without host pagemap)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: CodeGroup Mm::drop records registered file sources only when the last member drops)
 
 ## Responsibilities
 
@@ -188,7 +188,10 @@ fast path and refill (`engine/dbt`).
   registered ranges never shrink.
 - A forked child starts outside any group with its parent's executable and may join any open
   group for it. On drop a member leaves the group (its claims released, the group neither closed
-  nor its ranges unregistered), then gives the shared space its sources (`set_sources`).
+  nor its ranges unregistered); only the last member (or a sole non-group owner) calls `set_sources`
+  on the `DbtSpace`, recording the group's registered file-backed ranges (`CodeGroup::file_sources`,
+  excluding the vDSO sentinel) so an exiting member never clobbers a live group's sources or drops
+  ranges registered by other members.
 
 ## Dependencies (inbound / outbound)
 
@@ -238,8 +241,7 @@ fast path and refill (`engine/dbt`).
 
 ## Open questions
 
-- In a code group, every member's drop calls `set_sources` on the shared `DbtSpace`; is
-  last-writer-wins intended?
+- None.
 
 ## To verify
 

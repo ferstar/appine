@@ -4742,3 +4742,106 @@ fn unallocated_id_registers_fault_in_tier1() {
         }
     }
 }
+
+#[test]
+fn code_group_private_conditional_branch_relinks_across_members() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let Some(space) = DbtSpace::new(0, DbtRegs::Default) else {
+        return;
+    };
+    let tag1 = space.new_tag().unwrap();
+    let tag2 = space.new_tag().unwrap();
+    const SHARED_CODE: u64 = CODE;
+    const PRIV_CODE: u64 = CODE + PAGE_SIZE;
+    space.share(&[DbtSource {
+        start: SHARED_CODE,
+        len: PAGE_SIZE,
+        id: [1, 2, 3, 4, 5],
+    }]);
+
+    let setup_member = |g: &mut Guest, shared_val: u16, priv_val: u16| {
+        // Shared conditional branch pair on page 0 (identical code across both members).
+        let s_src = SHARED_CODE;
+        let s_dst = SHARED_CODE + 0x40;
+        g.code(s_src, &[cbz_x0(s_src, s_dst), movz_x0(1), SVC]);
+        g.code(s_dst, &[movz_x0(shared_val), SVC]);
+
+        // Private conditional branch pairs on page 1 (member-specific results in private JIT page).
+        for i in 0..16u64 {
+            let p_src = PRIV_CODE + i * 0x20;
+            let p_dst = PRIV_CODE + 0x800 + i * 0x10;
+            g.code(p_src, &[cbz_x0(p_src, p_dst), movz_x0(1), SVC]);
+            g.code(p_dst, &[movz_x0(priv_val + i as u16), SVC]);
+        }
+    };
+
+    let run_pc = |dbt: &mut Dbt, g: &mut Guest, pc: u64, x0: u64| -> u64 {
+        let s = g.cpu.state_mut();
+        s.x[0] = x0;
+        s.pc = pc;
+        run_to_svc(dbt, &mut g.cpu);
+        g.cpu.state().x[0]
+    };
+
+    // Keep member 2 actively running shared + private code while member 1 translates and relinks
+    // its own private conditional branches (and also races a same-tag helper thread).
+    let stop = Arc::new(AtomicBool::new(false));
+    let space_m2 = space.clone();
+    let stop_m2 = stop.clone();
+    let member2 = std::thread::spawn(move || {
+        let mut g = Guest::new();
+        setup_member(&mut g, 20, 200);
+        let mut dbt = Dbt::attach(&space_m2, tag2).unwrap();
+        while !stop_m2.load(Ordering::Relaxed) {
+            assert_eq!(run_pc(&mut dbt, &mut g, SHARED_CODE, 0), 20);
+            for i in 0..16u64 {
+                assert_eq!(run_pc(&mut dbt, &mut g, PRIV_CODE + i * 0x20, 0), 200 + i);
+            }
+        }
+    });
+
+    let exercise_relinks = |dbt: &mut Dbt, g: &mut Guest| {
+        for _ in 0..16 {
+            dbt.flush();
+            for i in 0..16u64 {
+                let (p_src, p_dst) = (PRIV_CODE + i * 0x20, PRIV_CODE + 0x800 + i * 0x10);
+                assert_eq!(run_pc(dbt, g, p_src, 1), 1);
+                assert_eq!(run_pc(dbt, g, p_dst, 0), 100 + i);
+                // Already-translated private conditional branch relinks directly when solo on tag1.
+                assert_eq!(run_pc(dbt, g, p_src, 0), 100 + i);
+            }
+            assert_eq!(run_pc(dbt, g, SHARED_CODE, 0), 20);
+        }
+    };
+
+    // Member 1 runs solo for its tag while member 2 is attached on tag2: private conditional
+    // branches must execute cleanly and relink on both install and already-translated paths.
+    let mut g1 = Guest::new();
+    setup_member(&mut g1, 20, 100);
+    let mut dbt1 = Dbt::attach(&space, tag1).unwrap();
+    exercise_relinks(&mut dbt1, &mut g1);
+
+    // Also stress concurrent attach/detach on the SAME tag1 while member 1 relinks.
+    let space_same = space.clone();
+    let stop_same = Arc::new(AtomicBool::new(false));
+    let stop_same2 = stop_same.clone();
+    let peer_same_tag = std::thread::spawn(move || {
+        let mut g = Guest::new();
+        setup_member(&mut g, 20, 100);
+        while !stop_same2.load(Ordering::Relaxed) {
+            let mut dbt = Dbt::attach(&space_same, tag1).unwrap();
+            for i in 0..16u64 {
+                assert_eq!(run_pc(&mut dbt, &mut g, PRIV_CODE + i * 0x20, 0), 100 + i);
+            }
+        }
+    });
+
+    exercise_relinks(&mut dbt1, &mut g1);
+
+    stop_same.store(true, Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
+    peer_same_tag.join().unwrap();
+    member2.join().unwrap();
+}

@@ -11,7 +11,6 @@ use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile};
 use crate::kernel::Cx;
 use crate::mm::{FileSource, Fill, Mm, MsyncStep, MsyncTarget, PopulateStep, PopulateWalk, flags};
-use crate::process::RLIMIT_MEMLOCK;
 use crate::vfs::dev::Device;
 use crate::vfs::ms;
 
@@ -274,8 +273,15 @@ pub(super) fn mmap(
         }
     };
     const MAP_LOCKED: u32 = 0x2000;
-    if flags & MAP_LOCKED != 0 {
-        check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
+    if let Some(aligned) = len.checked_next_multiple_of(PAGE_SIZE).filter(|&l| l != 0) {
+        let map_locked = flags & MAP_LOCKED != 0;
+        if map_locked && cx.memlock_limit() == 0 {
+            // Linux 6.1 `do_mmap`: MAP_LOCKED checks `can_do_mlock` before `mlock_future_check`.
+            return Err(Errno::EPERM);
+        }
+        if map_locked || cx.mm().lock_future {
+            check_memlock_future(cx, aligned)?;
+        }
     }
     let start = if let Some(mapping) = gpu_mapping {
         cx.mm_mut().mmap_gpu(addr, len, prot, flags, mapping)?
@@ -379,12 +385,53 @@ pub(super) fn mremap(
         }
         return Ok(new);
     }
-    let r = cx
-        .mm_mut()
-        .mremap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed);
+    let memlock = cx.memlock_limit();
+    let r = cx.mm_mut().mremap_limited(
+        old,
+        old_len,
+        new_len,
+        flags & MREMAP_MAYMOVE != 0,
+        fixed,
+        memlock,
+    );
     // A shrunk or replaced segment attachment may have been the last one
     crate::ipc::reap_shm(cx.k());
+    if let Ok(dst) = r
+        && let (Some(ol), Some(nl)) = (
+            old_len.checked_next_multiple_of(PAGE_SIZE),
+            new_len.checked_next_multiple_of(PAGE_SIZE),
+        )
+        && nl > ol
+        && {
+            let mm = cx.mm();
+            !mm.lock_onfault && mm.is_locked_at(dst + ol)
+        }
+    {
+        let _ = populate_range(cx, dst + ol, nl - ol, false);
+    }
     r
+}
+
+pub(super) fn brk(cx: &mut Cx<'_>, new: u64) -> SysResult {
+    let exec = read_implies_exec(cx);
+    let memlock = cx.memlock_limit();
+    let (old, cur, populate) = {
+        let mut mm = cx.mm_mut();
+        let old = mm.brk_current();
+        let cur = mm.brk_limited(new, exec, memlock);
+        (old, cur, mm.lock_future && !mm.lock_onfault)
+    };
+    if populate
+        && cur > old
+        && let (Some(start), Some(end)) = (
+            old.checked_next_multiple_of(PAGE_SIZE),
+            cur.checked_next_multiple_of(PAGE_SIZE),
+        )
+        && end > start
+    {
+        let _ = populate_range(cx, start, end - start, false);
+    }
+    Ok(cur)
 }
 
 /// Reads pieces of private file mappings from their files again after `MADV_DONTNEED`
@@ -721,8 +768,8 @@ pub(super) fn mlockall(cx: &mut Cx<'_>, flags: u32) -> SysResult {
         if flags & MCL_ONFAULT == 0 {
             let _ = populate_range(cx, 0, u64::MAX, false);
         }
-    } else {
-        check_memlock(cx, 0)?;
+    } else if cx.memlock_limit() == 0 {
+        return Err(Errno::EPERM);
     }
     let mut mm = cx.mm_mut();
     mm.lock_future = flags & MCL_FUTURE != 0;
@@ -741,15 +788,22 @@ pub(super) fn munlockall(cx: &mut Cx<'_>) -> SysResult {
 /// Without `CAP_IPC_LOCK`, locked memory may not exceed `RLIMIT_MEMLOCK` (nothing can be locked
 /// when it is 0). `more` is the bytes newly locked by this call.
 fn check_memlock(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
-    if cx.cred().capable(cap::IPC_LOCK) {
-        return Ok(());
-    }
-    let limit = cx.t.group.borrow().rlimits[RLIMIT_MEMLOCK as usize].0;
+    let limit = cx.memlock_limit();
     if limit == 0 {
         return Err(Errno::EPERM);
     }
-    if cx.mm().locked_bytes() + more > limit {
+    if !cx.mm().can_lock(more, limit) {
         return Err(Errno::ENOMEM);
+    }
+    Ok(())
+}
+
+/// Linux 6.1's `mlock_future_check`: without `CAP_IPC_LOCK`, locking `more` additional bytes for
+/// future mappings (`MCL_FUTURE`, `MAP_LOCKED`, `shmat`) fails with `EAGAIN` when exceeding
+/// `RLIMIT_MEMLOCK`.
+pub(super) fn check_memlock_future(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
+    if !cx.mm().can_lock(more, cx.memlock_limit()) {
+        return Err(Errno::EAGAIN);
     }
     Ok(())
 }

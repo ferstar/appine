@@ -1258,11 +1258,12 @@ impl<'a> Cx<'a> {
     }
 
     /// Grows the grows-down mapping (the main thread's stack, `MAP_GROWSDOWN`) right above `addr`
-    /// to reach the page containing it, to a size of at most the current `RLIMIT_STACK`
-    /// ([`Mm::grow_down`]).
+    /// to reach the page containing it, to a size of at most the current `RLIMIT_STACK` and within
+    /// `RLIMIT_MEMLOCK` when locked ([`Mm::grow_down_limited`]).
     pub fn grow_stack(&self, addr: u64) -> bool {
         let limit = self.stack_limit();
-        self.mm_mut().grow_down(addr, limit)
+        let memlock = self.memlock_limit();
+        self.mm_mut().grow_down_limited(addr, limit, memlock)
     }
 
     /// Reads guest memory as the kernel does (`copy_from_user`, [`Mm::read`]); an unmapped address
@@ -1318,9 +1319,20 @@ impl<'a> Cx<'a> {
         self.t.group.borrow().rlimits[crate::process::RLIMIT_STACK as usize].0
     }
 
+    /// The current `RLIMIT_MEMLOCK` for locked-memory checks (`u64::MAX` with `CAP_IPC_LOCK`).
+    pub fn memlock_limit(&self) -> u64 {
+        if self.cred().capable(crate::cred::cap::IPC_LOCK) {
+            u64::MAX
+        } else {
+            self.t.group.borrow().rlimits[crate::process::RLIMIT_MEMLOCK as usize].0
+        }
+    }
+
     fn grow_for(&self, range: UserSlice) -> bool {
         let limit = self.stack_limit();
-        self.mm_mut().grow_for(range.addr, range.len, limit)
+        let memlock = self.memlock_limit();
+        self.mm_mut()
+            .grow_for_limited(range.addr, range.len, limit, memlock)
     }
 
     /// Syscall entry: when SP is already below the bottom of the main thread's stack (the program
@@ -1336,7 +1348,8 @@ impl<'a> Cx<'a> {
         // Other threads' stacks are in the mmap area, much farther from the main thread's stack:
         // no need to check
         if crate::loader::STACK_TOP - sp <= limit {
-            self.mm_mut().grow_down(sp, limit);
+            let memlock = self.memlock_limit();
+            self.mm_mut().grow_down_limited(sp, limit, memlock);
         }
     }
 

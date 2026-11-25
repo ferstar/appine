@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: FUSE demand-read fetching in `mlock`/`mlock2`/`mlockall` and `MADV_WILLNEED`, `FillPages::notify_store` and background writeback coordination (`bg_busy`), and FUSE syscall prefault/local-retry coverage)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: enforce `RLIMIT_MEMLOCK` for `mlockall(MCL_FUTURE)`, `MAP_LOCKED`, locked `mremap`/stack growth, and `shmat`)
 
 ## Responsibilities
 
@@ -130,8 +130,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `vm.mmap_min_addr` without `CAP_SYS_RAWIO` (`EPERM`; for an anonymous mapping only with a
   non-zero length; for a file after its `EBADF` and zero-length `EINVAL`), then the file's own
   rules (a FUSE mapping gets its `Fill`; regular store mappings check access, noexec and seals
-  before unsharing and pinning the store object), and `MAP_LOCKED` over the
-  locked-memory limit (`EAGAIN`). After the mapping: `reap_shm` for `MAP_FIXED`, grows-down for
+  before unsharing and pinning the store object), and `MAP_LOCKED` (`EPERM` when `RLIMIT_MEMLOCK` is
+  0 without `CAP_IPC_LOCK`, `EAGAIN` above limit) or `mlockall(MCL_FUTURE)` (`EAGAIN` above limit).
+  After the mapping: `reap_shm` for `MAP_FIXED`, grows-down for
   private anonymous memory, the label, write and exec denials, locking, and population
   (`MAP_POPULATE`, `MAP_LOCKED`; a FUSE mapping's pages are read then).
 - Lengths round up to a page; zero or overflow is `EINVAL`.
@@ -160,7 +161,8 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   first), else at the first heap page reserves 256 MB (`MAP_NORESERVE`) for growth of at most that,
   else falls back to a separate accounted anonymous mapping. Shrinking unmaps. brk ignores
   `mmap_top`, the guard gap and `vm.mmap_min_addr`, and there is no `RLIMIT_DATA` or `RLIMIT_AS`
-  enforcement.
+  enforcement; under `mlockall(MCL_FUTURE)`, growth enforces `RLIMIT_MEMLOCK` (returning the old
+  break on failure) and populates new pages unless `MCL_ONFAULT`.
 
 ### Mappings read on demand (`Fill`)
 
@@ -250,8 +252,10 @@ signals may still be delivered).
   `same_vma`, as Linux before 6.17). Shrinking without a target only unmaps the tail. Growing in
   place needs the old end to be a VMA end, free space above, the new end at or below `mmap_top`,
   and room for one more VMA (the grown part is a separate VMA with the same lock, dump, fork,
-  `noreserve` and `anon` flags; a `Fill` VMA's maps more of its host file, sharing the fill); a
-  locked VMA's grown part is neither charged nor populated. Shared anonymous memory and SysV
+  `noreserve` and `anon` flags; a `Fill` VMA's maps more of its host file, sharing the fill);
+  growing or duplicating (`old_len == 0`) a locked VMA enforces `RLIMIT_MEMLOCK` (`EAGAIN`, after
+  any `MREMAP_FIXED` target unmap) and populates the added pages unless `MCL_ONFAULT`. Shared
+  anonymous memory and SysV
   segments retain their backing region across shrink, growth and moves. Regrown pages alias the
   original bytes up to the region's end and fault with `SIGBUS` beyond it. A move settles CoW
   (`kernel/cow`), re-points host memory, moves PTEs, updates SysV shm attach bases (`v.shm`),
@@ -304,8 +308,10 @@ signals may still be delivered).
   RSS stays 0 and CoW stays intact, and settles CoW plus atomically write-faults writable private
   anonymous VMAs so real private host pages are resident. `mlockall(MCL_CURRENT)` checks the whole
   size (`PROT_NONE` reservations included) against the limit, locks every VMA and populates
-  (including cold FUSE `Fill` pages, ignoring errors) unless `MCL_ONFAULT`; `MCL_FUTURE` makes new
-  VMAs locked, uncharged.
+  (including cold FUSE `Fill` pages, ignoring errors) unless `MCL_ONFAULT`; `MCL_FUTURE` without
+  `MCL_CURRENT` checks only `RLIMIT_MEMLOCK != 0` (`EPERM` when 0 without `CAP_IPC_LOCK`), and new
+  mappings (`mmap`, `brk` growth, `shmat`) and growth of locked VMAs (`mremap`, `grow_down` stack
+  growth) enforce `RLIMIT_MEMLOCK`.
 - `madvise`: alignment/length/unknown advice (counted as unimplemented) `EINVAL`; length 0 succeeds.
   Walks mapped VMAs in order like Linux 6.1's `do_madvise`: unmapped gaps are skipped and reported
   as `ENOMEM` at the end, while per-VMA errors (`EINVAL` on locked/foreign/GPU VMAs for
@@ -346,8 +352,9 @@ signals may still be delivered).
 - `grow_down` refuses pages below `vm.mmap_min_addr` and addresses already mapped. It applies when
   the nearest VMA at or above the address is `growsdown`. It refuses if the single nearest VMA
   below is non-growsdown, accessible and closer than 256 pages (`stack_guard_gap`; a `PROT_NONE` or
-  growsdown neighbour is not looked past), or if the new stack size exceeds the current
-  `RLIMIT_STACK`. Otherwise it extends into the reserved room below, or maps a new chunk in a host
+  growsdown neighbour is not looked past), if the new stack size exceeds the current
+  `RLIMIT_STACK`, or if the growsdown VMA is locked and growth would exceed `RLIMIT_MEMLOCK`.
+  Otherwise it extends into the reserved room below, or maps a new chunk in a host
   allocation of `clamp(size, grow, limit − size)` bytes (exactly the growth if that fails) with the
   chunk at its top, so the VMA count grows only logarithmically; the chunk takes the flags of the
   VMA above it and needs room for one more VMA.
@@ -459,4 +466,3 @@ signals may still be delivered).
 
 - Why is `STACK_TOP` `1 << 47` while the page table covers 48 bits and `MAP_FIXED` may reach
   `1 << 48`?
-- Should mappings locked through `mlockall(MCL_FUTURE)` be charged against `RLIMIT_MEMLOCK`?
