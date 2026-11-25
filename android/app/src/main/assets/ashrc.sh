@@ -4,8 +4,12 @@
 # Every interactive busybox ash reads the file ENV names, a login shell after /etc/profile and
 # ~/.profile. ash runs nothing before a prompt, so this puts the shell integration marks (OSC 133,
 # see appine.sh) around whatever PS1 and PS2 are by then: a prompt ~/.profile set keeps its marks,
-# and a nested ash (ash, su without -l) gets them too. A PS1 set later still goes without.
+# and a nested ash (ash, su without -l, doas -s) gets them too. If PS1 is overwritten later, the
+# terminal falls back to foreground-process detection for busy state, titles and command timing.
 if [ -n "${BB_ASH_VERSION-}" ]; then
+    if [ -z "${ENV-}" ] && [ -r /etc/profile.d/appine.ashrc ]; then
+        export ENV=/etc/profile.d/appine.ashrc
+    fi
     # ash expands PS1, then BusyBox line editing interprets backslash escapes in the result.
     __appine_ash_path() {
         local p="$PWD"

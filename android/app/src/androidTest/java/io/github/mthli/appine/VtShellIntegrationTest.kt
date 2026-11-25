@@ -12,6 +12,7 @@ import org.junit.runner.RunWith
 import java.io.File
 import java.lang.reflect.Proxy
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -319,6 +320,121 @@ class VtShellIntegrationTest {
                 "Expected ash multi-line PS1 continuation mark (k=c;appine_lf=output) in:\n${ashOut.replace("\u001b", "<ESC>").replace("\u0007", "<BEL>")}",
                 ashOut.contains("\u001b]133;P;k=c;appine_lf=output\u0007# \u001b]133;B\u0007"),
             )
+        } finally {
+            Native.stop(machine)
+        }
+    }
+
+    @Test
+    fun doasPreservesAshMarksAndOverwrittenPs1FallsBackToForegroundDetection() = withAlpineStore("doas-fg-fallback") { store ->
+        // Unmodified stock 20-wheel.conf upgrades to setenv { ENV=/etc/profile.d/appine.ashrc };
+        // customized rules stay untouched.
+        Native.writeFile(store, "/etc/doas.d/20-wheel.conf", "permit persist :wheel\n".toByteArray(), 420, true)
+        Rootfs.updateProfile(context, store, Rootfs.Distro.ALPINE)
+        assertEquals(
+            "permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel\n",
+            Native.readFile(store, "/etc/doas.d/20-wheel.conf")!!.decodeToString(),
+        )
+        Native.writeFile(store, "/etc/doas.d/20-wheel.conf", "permit persist :wheel\npermit nopass root\n".toByteArray(), 420, true)
+        Rootfs.updateProfile(context, store, Rootfs.Distro.ALPINE)
+        assertEquals(
+            "permit persist :wheel\npermit nopass root\n",
+            Native.readFile(store, "/etc/doas.d/20-wheel.conf")!!.decodeToString(),
+        )
+
+        // Stage bundled doas so login.sh installs it for a regular user and switches root to ash.
+        context.assets.open("doas.apk").use {
+            Native.writeFile(store, "/var/cache/appine/doas.apk", it.readBytes(), 420, true)
+        }
+        val machine = Native.start(store, 1, false)
+        try {
+            fun runCmd(cmd: String) {
+                val pid = Native.spawn(machine, -1, "/bin/sh", arrayOf("sh", "-c", cmd), ConsolePty.ENVIRONMENT)
+                assertEquals(0, Native.waitFor(machine, pid))
+            }
+            runCmd("rm -f /etc/doas.d/20-wheel.conf && adduser -D -s /bin/sh alice && sed -i '1s|:[^:]*$|:/bin/sh|' /etc/passwd")
+
+            // 1. `doas -s` preserves ENV=/etc/profile.d/appine.ashrc so root ash emits OSC 133 marks.
+            val console = Native.openConsole(machine, 24, 80)
+            val doasOut = try {
+                val pid = Native.spawn(
+                    machine, console, "/bin/sh",
+                    ConsolePty.argv(ConsolePty.script(context), "alice"),
+                    ConsolePty.ENVIRONMENT,
+                )
+                val out = readConsole(machine, console, "doas -s\necho DOAS_ENV=\$ENV\nexit\nexit\n")
+                Native.waitFor(machine, pid)
+                out
+            } finally {
+                Native.closeConsole(machine, console)
+            }
+            assertEquals(
+                "permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel\n",
+                Native.readFile(store, "/etc/doas.d/20-wheel.conf")!!.decodeToString(),
+            )
+            assertTrue("Expected ENV=/etc/profile.d/appine.ashrc inside doas -s:\n$doasOut",
+                doasOut.contains("DOAS_ENV=/etc/profile.d/appine.ashrc"))
+            assertTrue("Expected OSC 133 prompt mark inside doas -s root ash",
+                doasOut.contains("\u001b]133;A;cl=line;appine_lf=output\u0007"))
+
+            // 2. Ash with PS1 overwritten after ENV (no OSC 133 marks) still reports idle/busy,
+            // fallback command title and completion timing via foreground-process detection.
+            val titles = LinkedBlockingQueue<String>()
+            val finished = LinkedBlockingQueue<Pair<Int?, Long>>()
+            val events = Proxy.newProxyInstance(
+                VtSession.Events::class.java.classLoader, arrayOf(VtSession.Events::class.java),
+            ) { _, method, args ->
+                when (method.name) {
+                    "onTitleChanged" -> titles.offer((args!![0] as VtSession).title.orEmpty())
+                    "onCommandFinished" -> finished.offer((args!![1] as Int?) to (args[2] as Long))
+                }
+                null
+            } as VtSession.Events
+
+            val instrumentation = InstrumentationRegistry.getInstrumentation()
+            lateinit var session: VtSession
+            instrumentation.runOnMainSync {
+                session = VtSession(
+                    2, ConsolePty(machine, "cd /tmp; exec /bin/ash -l", "root"), machine, events,
+                )
+                session.start(80, 24, 8, 16)
+            }
+            fun send(text: String) {
+                val bytes = text.toByteArray()
+                assertEquals(bytes.size, Native.write(machine, session.console, bytes, 0, bytes.size))
+            }
+            fun waitUntil(label: String, timeoutMs: Long = 10_000, cond: () -> Boolean) {
+                val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+                while (System.nanoTime() < deadline) {
+                    if (cond()) return
+                    Thread.sleep(25)
+                }
+                throw AssertionError("Timed out waiting for $label")
+            }
+            try {
+                waitUntil("initial ash prompt") { VtNative.atPrompt(session.tab) }
+                assertFalse("Idle marked ash must not be busy", session.busy)
+
+                // Overwrite PS1 so ash stops emitting OSC 133 marks.
+                send("PS1='plain> '\n")
+                waitUntil("unmarked ash prompt idle") {
+                    !VtNative.atPrompt(session.tab) && !session.busy
+                }
+                titles.clear()
+                finished.clear()
+
+                // Run a silent command: fallback must mark busy, report title and fire completion.
+                send("sleep 0.3\n")
+                waitUntil("fallback busy during sleep") { session.busy }
+                waitUntil("fallback title sleep 0.3") { session.title == "sleep 0.3" }
+                val done = finished.poll(10, TimeUnit.SECONDS)
+                assertNotNull("Expected fallback onCommandFinished", done)
+                assertNull("Fallback completion has no exit code", done!!.first)
+                assertTrue("Expected non-negative duration, got ${done.second}", done.second >= 100)
+                waitUntil("idle after sleep completes") { !session.busy }
+            } finally {
+                instrumentation.runOnMainSync { session.release() }
+            }
         } finally {
             Native.stop(machine)
         }

@@ -168,7 +168,11 @@ internal class VtSession(
      */
     private var lastTranscript: String? = null
 
-    /** The title a program set (OSC 0/2), null when none (the tab bar then shows `sh`). */
+    /**
+     * The title a program set (OSC 0/2), or the console's foreground command while one runs under
+     * busybox ash or an unmarked shell without setting a title; null when none (the tab bar then
+     * shows `sh`).
+     */
     val title: String? get() = if (tab == 0L) null else VtNative.title(tab)
 
     /**
@@ -183,11 +187,11 @@ internal class VtSession(
 
     /**
      * Closing the tab would end something the user may be waiting for: the shell runs and is not
-     * at its prompt, as its prompt marks (OSC 133, sent from `/etc/profile.d/appine.sh`) tell, so a
-     * command runs; always so for a shell without the marks. A shell not started yet (a restored
-     * tab never shown) has nothing to end.
+     * at its prompt, as OSC 133 prompt marks tell (falling back to foreground-process detection
+     * for unmarked shells and busybox ash whose PS1 lost its marks). A shell not started yet (a
+     * restored tab never shown) has nothing to end.
      */
-    val busy: Boolean get() = isRunning && tab != 0L && !VtNative.atPrompt(tab)
+    val busy: Boolean get() = isRunning && tab != 0L && VtNative.busy(tab)
 
     /**
      * The last progress report (OSC 9;4); null when there is none, it was removed, none came for

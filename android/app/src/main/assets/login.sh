@@ -75,12 +75,21 @@ if [ -f /etc/alpine-release ]; then
     group=wheel
     tool=doas
     rules=/etc/doas.d/30-appine.conf
+    wheel_conf=/etc/doas.d/20-wheel.conf
+    stock_wheel_rule='permit persist :wheel'
+    wheel_rule='permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel'
 else
     group=sudo
     tool=sudo
     rules=/etc/sudoers.d/appine
 fi
 ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -Fqx "$group"; }
+
+# Only a regular file containing the original rule alone is eligible for replacement.
+has_stock_wheel_rule() {
+    [ -f "$wheel_conf" ] && [ ! -L "$wheel_conf" ] &&
+        [ "$(cat "$wheel_conf" 2>/dev/null)" = "$stock_wheel_rule" ]
+}
 
 # Runs "$@" holding the lock that every login's installs of bundled packages share, so they run one
 # after another: whatever the command installs, it checks first whether a login that held the lock
@@ -195,6 +204,11 @@ refresh_rules() (
     umask 077
     exec 9>/run/appine-rules.lock || exit 1
     flock 9 || exit 1
+    # Upgrade an unmodified stock wheel rule so `doas -s` preserves busybox ash's ENV hook.
+    if [ "$group" = wheel ] && has_stock_wheel_rule; then
+        wt=$rules.wheel.$$
+        printf '%s\n' "$wheel_rule" >"$wt" && chmod 0644 "$wt" && mv -f "$wt" "$wheel_conf" || rm -f "$wt"
+    fi
     nopass=
     if [ -f "$admins" ]; then
         while read -r u; do
@@ -209,7 +223,7 @@ refresh_rules() (
             echo "# Written by Appine at each login and when /etc changes: administrators without a password ($admins)."
             for u in $nopass; do
                 if [ "$group" = wheel ]; then
-                    echo "permit nopass $u"
+                    echo "permit nopass setenv { ENV=/etc/profile.d/appine.ashrc } $u"
                 else
                     echo "$u ALL=(ALL:ALL) NOPASSWD: ALL"
                 fi
@@ -279,8 +293,12 @@ if ! grep -Fqsx -- "$user" "$admins"; then
     if [ "$group" = wheel ]; then
         addgroup "$user" wheel
         mkdir -p /etc/doas.d
-        grep -Fqsx 'permit persist :wheel' /etc/doas.d/20-wheel.conf ||
-            echo 'permit persist :wheel' >>/etc/doas.d/20-wheel.conf
+        if has_stock_wheel_rule; then
+            printf '%s\n' "$wheel_rule" >"$wheel_conf"
+        elif ! grep -Fqsx "$wheel_rule" "$wheel_conf" &&
+            ! grep -Fqsx "$stock_wheel_rule" "$wheel_conf"; then
+            printf '%s\n' "$wheel_rule" >>"$wheel_conf"
+        fi
     else
         usermod -aG sudo "$user"
     fi

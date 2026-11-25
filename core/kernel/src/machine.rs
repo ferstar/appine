@@ -447,15 +447,31 @@ impl Machine {
     /// wrote these bytes: a job the shell left in the background, or a process of another session.
     /// What the line discipline echoes counts as the foreground's.
     pub fn read_console_run(&self, id: u32, buf: &mut [u8]) -> Result<(usize, bool), Errno> {
+        self.read_console_run_timeout(id, buf, None)?
+            .ok_or(Errno::EAGAIN)
+    }
+
+    /// As [`Machine::read_console_run`], returning `Ok(None)` when `timeout` elapses before output
+    /// arrives or the session ends.
+    pub fn read_console_run_timeout(
+        &self,
+        id: u32,
+        buf: &mut [u8],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Option<(usize, bool)>, Errno> {
         let objects = terminal::wake_objects(&self.shared.lock(), id);
-        let (out, background) = self.wait_objects(wake::FILE, objects.as_deref(), |k| {
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
+        let Some(result) = self.wait_deadline(wake::FILE, objects.as_deref(), deadline, |k| {
             on_console(k, id, "Machine::read_console_run", |k| {
                 terminal::take_output_run(k, id, buf.len())
             })
             .transpose()
-        })?;
+        }) else {
+            return Ok(None);
+        };
+        let (out, background) = result?;
         buf[..out.len()].copy_from_slice(&out);
-        Ok((out.len(), background))
+        Ok(Some((out.len(), background)))
     }
 
     /// Writes input to the console (through the line discipline), waiting while the input queue is
@@ -511,6 +527,17 @@ impl Machine {
         let k = self.shared.lock();
         crate::bug::host_call("Machine::console_foreground", || terminal::fg_pgrp(&k, id))
             .unwrap_or(Err(Errno::EIO))
+    }
+
+    /// Snapshot of console `id`'s foreground process group (name, command line, canonical mode and
+    /// whether it looks like an interactive shell), for automatic command titles and fallback
+    /// busy/completion tracking (the android/vt and android/vtcore maps). ESRCH when none.
+    pub fn console_foreground_process(&self, id: u32) -> Result<crate::ConsoleForeground, Errno> {
+        let k = self.shared.lock();
+        crate::bug::host_call("Machine::console_foreground_process", || {
+            terminal::fg_process(&k, id)
+        })
+        .unwrap_or(Err(Errno::EIO))
     }
 
     /// The current directory of console `id`'s foreground process group (the shells of tabs the

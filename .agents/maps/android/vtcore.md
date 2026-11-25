@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: split render state/lock from terminal lock for two-phase frame capture, tracked ash background-output resumed row for prompt taps, and updated shell-integration coverage)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: added foreground-process fallback for busybox ash command titles and unmarked-shell busy/completion tracking via `VtNative.busy` and `Machine::console_foreground_process`)
 
 ## Responsibilities
 
@@ -32,14 +32,14 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 
 ## Key types
 
-- `VtNative` — 48 `@JvmStatic external` functions on the native library, plus raw libghostty-vt
+- `VtNative` — 49 `@JvmStatic external` functions on the native library, plus raw libghostty-vt
   cursor style (`CURSOR_*`), selection gesture (`GESTURE_*`) and adjustment (`ADJUST_*`) constants
   that must match libghostty-vt's headers.
 - In `vt.rs`: `Tab` (handle, kernel handle, console number, mutex-guarded `Term`, separately
   mutex-guarded `Render`, `dirty` flag) in monotonically keyed `TABS` (handles from 1, never
   reused); `TermGuard` (releases the tab's terminal lock and schedules compression when work
-  remains); `Term` (owns `AppineVt`, freed on drop); `Render` (owns `AppineVtRender`, freed on
-  drop); `RawEffects` (C-ABI mirror of `AppineVtEffects`) decoded into `Effects` (`StatusReport`
+  remains); `Term` (owns `AppineVt` and optional foreground-process `fallback_title`, freed on
+  drop); `Render` (owns `AppineVtRender`, freed on drop); `RawEffects` (C-ABI mirror of `AppineVtEffects`) decoded into `Effects` (`StatusReport`
   queue, clipboard reads, last finished command, `tmux_detached`); `COMPRESS` (`Due` per tab)
   served by `vt-compress` (`compressor`).
 - In `vt.c`: `AppineVt` — per-terminal native state holding the libghostty-vt terminal,
@@ -56,7 +56,7 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 
 ## Public entry points
 
-- `VtNative`: `create`, `restore`, `setCursor`, `print`, `pump`, `title`, `atPrompt`, `frame`,
+- `VtNative`: `create`, `restore`, `setCursor`, `print`, `pump`, `title`, `atPrompt`, `busy`, `frame`,
   `image`, `passwordInput`, `resize`, `key`, `paste`, `mouse`, `focus`, `scroll`, `jumpPrompt`,
   `gesturePress`, `gestureDrag`, `gestureEnd`, `mousePress`, `mouseDrag`, `mouseRelease`,
   `selectContext`, `selectGrab`, `selectTo`, `selectAdjust`, `selectRectangle`, `selectAll`,
@@ -282,6 +282,24 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   option, a program's full reset and the app's Reset terminal end the reading and clear
   `lf_resumed`. So a command of several rows is all input: the cursor stays at the prompt while it
   is typed, and its rows are not selected as output.
+- Foreground-process fallback (`vt.rs` + `vt.c`'s `prompt_mode` (`NONE`/`FULL`/`ASH`) and
+  `is_alternate`, querying `Machine::console_foreground_process` and bounded 15/35/75 ms
+  `read_console_run_timeout` probes only after a foreground newline while the shell still holds the
+  foreground, zero idle wakeups):
+  - For busybox ash (`APPINE_PROMPT_ASH`, which has no preexec hook) and unmarked shells
+    (`APPINE_PROMPT_NONE`), while a non-shell foreground process runs and has not emitted OSC 0/2
+    during that command, `Term`'s fallback title holds its sanitized command line (falling back to
+    `comm`, skipping Appine's `login.sh` wrapper) and notifies `onTitle`; any explicit OSC 0/2
+    title wins immediately, and returning to the prompt clears the fallback title.
+  - `VtNative.busy` checks `appine_vt_at_prompt` first, treats alternate screens and full OSC 133
+    shells (`bash`/`zsh`/`fish`/`nushell`) as busy when `!at_prompt`, and otherwise marks the tab
+    idle when `console_foreground_process` reports an interactive shell (requiring `!canonical_input`
+    for `APPINE_PROMPT_ASH` so ash canonical builtins like `read` stay busy while an overwritten
+    `PS1` in raw-mode `read_line_input` recovers idle).
+  - For unmarked shells (`APPINE_PROMPT_NONE`) and ash that lost its `PS1` marks (`!canonical_input`
+    with no OSC 133 `D`), transitioning from a tracked non-shell foreground command back to an
+    interactive shell delivers `onCommandFinished(hasExit = false, 0, millis)` without double-firing
+    when OSC 133 already reported the command.
 - Commands are timed through libghostty-vt's OSC 133 callback (`on_semantic_prompt`): a command
   starts at the output's mark (bash's PS0 and zsh's preexec hook, `C`) or, as busybox ash marks
   none, when a feed ends with the cursor no longer at the prompt where the one before left it there
@@ -326,7 +344,7 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   providing terminal state, render state with one overscan row, input/selection/search/formatter
   APIs, OSC 133 semantic prompts, progress/status callbacks, scrollback compression, snapshots with
   continuation tracking and Kitty graphics; `libjnigraphics` (used by android/vtrender);
-  `Machine::{read_console_run, write_console, resize_console, console_foreground,
+  `Machine::{read_console_run_timeout, write_console, resize_console, console_foreground_process,
   console_password_input}` (`kernel/tty`); `android/native`'s `guarded!`, handle table and string
   helpers.
 - Deliberately unused libghostty-vt C surfaces: standalone parsers/encoders superseded by terminal
@@ -405,10 +423,12 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 
 ## Confirmed bugs / technical debt
 
-- **Shell integration is partial**: the profile and rc hooks mark prompts for bash, busybox ash
-  and zsh (fish and nushell mark their own); dash, mksh, tcsh, elvish, an ash started through
-  `doas -s` (which clears `ENV`), a remote shell over ssh that sends no OSC 133 marks, and an ash
-  `PS1` set after its `ENV` file was read still go without marks.
+- **Shell integration is partial**: the profile, rc hooks and Alpine `doas.d` `setenv` rules mark
+  prompts for bash, busybox ash (including `doas -s`) and zsh (fish and nushell mark their own);
+  local unmarked shells (dash, mksh, tcsh, elvish, and ash after `PS1` is overwritten past `ENV`)
+  get foreground-process fallback for `busy`, command titles and exit-code-less completion timing,
+  while prompt jumping, Select output, prompt taps, and remote shells over ssh without OSC 133
+  marks still require OSC 133 marks.
 - **libghostty-vt features not wired**: ENQ, the title report (CSI 21 t),
   XTCHECKSUM and window resizing (CSI 8 t) are left unanswered, as Ghostty's defaults leave them
   (`enquiry-response` empty, `title-report`, `vt-xt-checksum-report` and

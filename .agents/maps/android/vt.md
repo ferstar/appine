@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 9 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: updated inherited shell-mark coverage note after Debian/nested shell integration and ash prompt-tap fixes)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: wired `VtSession.busy` to `VtNative.busy` with foreground-process fallback for unmarked shells and ash, and documented fallback command titles and completion events)
 
 ## Responsibilities
 
@@ -37,7 +37,7 @@ login script and prompt-mark producers (`android/setup`).
   `Events`, `@Volatile tab` (`0L` until created; never reset on `release`), `@Volatile view` (read
   on `vt-pump`), `console` (`pty.console`), `consoleOpen` (`pty.console >= 0 && !hungUp`),
   `isRunning` (`exit == null`, true before start as well), `busy` (`isRunning && tab != 0L &&
-  !VtNative.atPrompt`), restore staging (`restoredSnapshot`, `restoredText`, `pending`),
+  VtNative.busy(tab)`), restore staging (`restoredSnapshot`, `restoredText`, `pending`),
   `lastTranscript` (capped to `Tabs.MAX_TRANSCRIPT` = 256 K chars), worker-only `@Volatile` save
   metadata (`resolvedLogin`, `savedSnapshot`), cursor defaults (`cursorStyle`, `cursorBlink`),
   grid cache, main-thread `progress` (`Progress?`, 15 s `dropProgress` timer) and `status`
@@ -168,8 +168,9 @@ login script and prompt-mark producers (`android/setup`).
   (cancelling `dropProgress`, clearing buffered `reports`/`records`, zeroing `progress`/`status`,
   and firing `onStatusChanged` when any existed), invalidates `view`, and emits
   `events.onTitleChanged(this)`.
-- `busy` is `isRunning && tab != 0L && !VtNative.atPrompt(tab)` (unmarked shells stay busy while
-  running). `cwd()` calls `Native.consoleCwd(machine, pty.console)` only when `isRunning &&
+- `busy` is `isRunning && tab != 0L && VtNative.busy(tab)` (OSC 133 prompt state first, falling
+  back to foreground-process detection for unmarked shells and busybox ash whose `PS1` lost its
+  marks). `cwd()` calls `Native.consoleCwd(machine, pty.console)` only when `isRunning &&
   consoleOpen` (taking the kernel BKL on the caller's thread).
 
 ## Dependencies (inbound / outbound)
@@ -193,7 +194,7 @@ login script and prompt-mark producers (`android/setup`).
 ### Outbound
 
 - `android/vtcore` (`VtNative`): `create`, `restore`, `setCursor`, `print`, `pump`, `destroy`,
-  `title`, `atPrompt`, `transcript`, `snapshot`, `message`, `resize`, `clear`, `reset`.
+  `title`, `atPrompt`, `busy`, `transcript`, `snapshot`, `message`, `resize`, `clear`, `reset`.
 - `android/native` (`Native`): `openConsole`, `spawn`, `write`, `closeConsole`, `waitFor`,
   `consoleCwd`.
 - `android/service`: `VtSession.Events` and `Tabs.MAX_TRANSCRIPT`.
@@ -234,9 +235,12 @@ login script and prompt-mark producers (`android/setup`).
 
 ## Confirmed bugs / technical debt
 
-- **Shell mark coverage debt inherited from `android/vtcore`:** `busy` and command-completion
-  events still do not cover shells without OSC 133 marks (dash, mksh, tcsh, elvish, remote ssh
-  shells without marks, `doas -s` ash, or ash `PS1` set after `ENV`).
+- **Shell mark coverage limits inherited from `android/vtcore`:** local unmarked shells (dash,
+  mksh, tcsh, elvish, ash with overwritten `PS1`) now have foreground-process fallback for `busy`,
+  command titles and exit-code-less completion timing, and Alpine `doas -s` preserves ash marks;
+  remote shells over ssh without OSC 133 marks (where the local foreground process is `ssh`) and
+  in-shell builtins in unmarked shells still stay busy without prompt marks, and prompt
+  jumping/output selection/prompt taps still require OSC 133 marks.
 
 ## Open questions
 

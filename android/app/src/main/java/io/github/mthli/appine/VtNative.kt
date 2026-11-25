@@ -46,7 +46,10 @@ internal object VtNative {
      */
     @JvmStatic external fun pump(tab: Long, session: VtSession)
 
-    /** The title a program set (OSC 0/2); null when none. */
+    /**
+     * The title a program set (OSC 0/2), or the foreground-process fallback title while a command
+     * runs without setting one under busybox ash or an unmarked shell; null when none.
+     */
     @JvmStatic external fun title(tab: Long): String?
 
     /**
@@ -55,6 +58,13 @@ internal object VtNative {
      * without them and on the alternate screen.
      */
     @JvmStatic external fun atPrompt(tab: Long): Boolean
+
+    /**
+     * Whether closing the tab would interrupt a running command: false at an OSC 133 prompt, or
+     * (for unmarked shells and busybox ash whose PS1 lost its marks) when the primary screen's
+     * foreground process is an interactive shell waiting for input.
+     */
+    @JvmStatic external fun busy(tab: Long): Boolean
 
     /**
      * The rows that changed since the last frame, all of them with [full] (the frame format is in

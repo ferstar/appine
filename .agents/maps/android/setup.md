@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: protected `login.sh` non-install commands from `SIGINT` and added `Rootfs.deleteTarball` for Alpine fallback cleanup)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: preserved `ENV=/etc/profile.d/appine.ashrc` across Alpine `doas -s` rules and documented foreground-process command-title fallback for ash)
 
 ## Responsibilities
 
@@ -181,7 +181,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
   (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
-  `doas.apk` into `/var/cache/appine/`, rewritten at every start; on Alpine, `ensureBashStartup`
+  `doas.apk` into `/var/cache/appine/`, rewritten at every start, and unmodified stock
+  `/etc/doas.d/20-wheel.conf` (`permit persist :wheel`) upgraded to preserve
+  `ENV=/etc/profile.d/appine.ashrc`; on Alpine, `ensureBashStartup`
   once per store (gated by `/var/lib/appine/bash-startup-done`): writes `/etc/skel/.bash_profile`
   and `/etc/skel/.bashrc` when missing and, for root and pre-existing regular accounts (UID
   1000–65533) whose `/etc/passwd` shell is `/bin/bash` and whose non-root home directory already
@@ -217,8 +219,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 - Integrated bash, ash and zsh set OSC 2 to the full current `$PWD` at each primary prompt, with
   control characters replaced by `?`. Before execution, bash and zsh set OSC 2 to the submitted
-  command line, also sanitized, once for the whole pipeline or compound command. This is input
-  text, not tracking of the foreground executable or its children. Programs can replace it with
+  command line, also sanitized, once for the whole pipeline or compound command; for busybox ash
+  (which has no preexec hook) and unmarked shells, `android/vtcore` falls back to the console's
+  foreground process command line when a command sets no OSC 0/2 title. Programs can replace it with
   OSC 0/2 between prompts; the next primary prompt restores the directory.
   Bash sends the directory from `__appine_prompt`, zsh from precmd,
   and ash after the visible PS1 and B mark. Secondary prompts do not replace the title.
@@ -283,13 +286,16 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     right arrows, so a tap on the typed command moves the cursor there.
 - Every login shell of a tab reads the profile (root's shell `-l`, and `su <account> -c … exec "$SHELL" -l`
   for others), including login `zsh` on Debian through `/etc/appine/zsh/.zshenv`. `ENV` is
-  exported from every shell that reads the profile, so a nested interactive ash that inherits it
-  (`ash`, `sh` on Alpine, `su` without `-l`, also under bash or zsh) marks its own prompt, the
-  distro's; one started through `doas -s`, which resets the environment, does not. Nested
-  non-login `bash` (both distros) and `zsh` (once `ensureShellRcHooks` runs after `zsh` is
-  installed) also get prompt marks. Other shells get no marks from it (fish and nushell send
-  their own, android/vtcore), and shells that do not read it still have `TERM`, `LANG` and
-  `NMAP_UNPRIVILEGED` from the console's fixed login environment (android/vt), but show no motd.
+  exported from every shell that reads the profile (and from `appine.ashrc` when unset), so a
+  nested interactive ash that inherits it (`ash`, `sh` on Alpine, `su` without `-l`, also under
+  bash or zsh) marks its own prompt, the distro's; on Alpine, Appine's `doas.d` rules
+  (`20-wheel.conf` and `30-appine.conf`) pin `setenv { ENV=/etc/profile.d/appine.ashrc }` so
+  `doas -s` / `doas sh` keeps ash's prompt marks too. Nested non-login `bash` (both distros) and
+  `zsh` (once `ensureShellRcHooks` runs after `zsh` is installed) also get prompt marks. Other
+  shells get no marks from it (fish and nushell send their own, and `android/vtcore` falls back to
+  foreground-process detection for unmarked shells and overwritten ash `PS1`), and shells that do
+  not read it still have `TERM`, `LANG` and `NMAP_UNPRIVILEGED` from the console's fixed login
+  environment (android/vt), but show no motd.
 - The shared profile contains no zsh array syntax; only zsh sources `appine.zshrc`. The companion
   uses an anonymous function with `emulate -L zsh` for registration, so Alpine's sh emulation
   does not change array filtering or indexing and the caller's options are restored afterwards.
@@ -348,8 +354,10 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   - root: `cd` to the directory (else root's home, else `/`) and `exec` root's passwd shell (or
     `/bin/sh` when it is not executable) as a login shell;
   - a regular account not yet in `/var/lib/appine/admins` (matched literally): add it to wheel
-    (Alpine, with `permit persist :wheel` in `20-wheel.conf`) or sudo (Debian) and record it once
-    it really is in the group (otherwise say so and retry at the next login);
+    (Alpine, with `permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel` in
+    `20-wheel.conf`, also upgrading an unmodified stock `permit persist :wheel` file on
+    `refresh_rules` and `Rootfs.ensureLoginTools`/`updateProfile`) or sudo (Debian) and record it
+    once it really is in the group (otherwise say so and retry at the next login);
   - a regular account, while the tool's marker is missing and the tool is not on PATH (whether or
     not the account was just made an admin): install doas from the bundled package and re-add it
     by name under the install lock, or sudo from the network showing apt's progress (Ctrl-C skips
@@ -432,8 +440,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ## Confirmed bugs / technical debt
 
-- Automatic command titles cover bash and zsh only. Busybox ash has no preexec hook; it still
-  needs terminal-side or foreground-process detection to report commands that set no title.
+(None currently; busybox ash automatic command titles and unmarked-shell busy/completion fallback are now covered by foreground-process detection in `android/vtcore`, and Alpine `doas -s` preserves `ENV=/etc/profile.d/appine.ashrc`.)
 
 ## Open questions
 

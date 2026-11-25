@@ -213,6 +213,13 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 #define PROMPT_LF_OPTION "appine_lf"
 #define PROMPT_LF_OUTPUT "output"
 
+// Which kind of OSC 133 semantic prompts the terminal has seen since creation or reset:
+// none (unmarked shells such as dash/mksh/tcsh/elvish), full (bash/zsh/fish/nushell), or
+// busybox ash's line-feed mode (appine_lf=output, which has no preexec hook).
+#define APPINE_PROMPT_NONE 0
+#define APPINE_PROMPT_FULL 1
+#define APPINE_PROMPT_ASH 2
+
 // The output start (OSC 133;C) appine_vt_feed marks for such a shell
 #define OUTPUT_START "\x1b]133;C\x1b\\"
 // The marks appine_vt_feed puts after another writer's output at such a shell's prompt: when the
@@ -504,6 +511,9 @@ typedef struct AppineVt {
   // How a tap on the shell's input moves its cursor (PROMPT_CLICK_*), as the primary screen's last
   // prompt start declared it (osc_ended); a full reset forgets it, as libghostty-vt's screen does
   uint8_t prompt_click;
+  // Which OSC 133 semantic prompt mode the primary screen has seen (APPINE_PROMPT_*); cleared on
+  // full reset so vt.rs knows when foreground-process fallback applies.
+  uint8_t prompt_mode;
   // The shell's last prompt asked for its line feeds to be read (PROMPT_LF_OPTION): lf_output
   // while that shell's prompts are the last seen (rows it broke itself are one line to taps),
   // lf_armed from such a prompt until the line feed that ends its input, lf_marking while the
@@ -760,6 +770,7 @@ static void on_semantic_prompt(GhosttyTerminal t, void *userdata,
       // made at a line feed is not the shell's word that a command runs (the line feed may begin
       // a list of completions or follow Ctrl-C), so the cursor leaving the prompt decides there
       if (!vt->lf_marking) {
+        vt->prompt_mode = APPINE_PROMPT_FULL;
         vt->command_start = now_ns();
         drop_resumed(vt);
       }
@@ -777,6 +788,7 @@ static void on_semantic_prompt(GhosttyTerminal t, void *userdata,
     case GHOSTTY_SEMANTIC_PROMPT_PROMPT_START:
       // A new prompt without a command end: what ran is not known to have finished
       if (e->prompt_kind == GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY) {
+        if (vt->prompt_mode == APPINE_PROMPT_NONE) vt->prompt_mode = APPINE_PROMPT_FULL;
         expire_reports(vt);
         drop_resumed(vt);
         vt->command_start = 0;
@@ -806,14 +818,19 @@ static void on_render_hold(GhosttyTerminal t, void *userdata, bool held) {
   }
 }
 
+static void reset_prompt_state(AppineVt *vt) {
+  vt->prompt_click = PROMPT_CLICK_NONE;
+  vt->prompt_mode = APPINE_PROMPT_NONE;
+  vt->lf_output = false;
+  vt->lf_armed = false;
+  drop_resumed(vt);
+}
+
 // A program's full reset (RIS): the screen forgets how its shell's prompt moves the cursor
 static void on_reset(GhosttyTerminal t, void *userdata) {
   (void)t;
   AppineVt *vt = userdata;
-  vt->prompt_click = PROMPT_CLICK_NONE;
-  vt->lf_output = false;
-  vt->lf_armed = false;
-  drop_resumed(vt);
+  reset_prompt_state(vt);
 }
 
 // ---- PNG images (Kitty graphics) ----
@@ -1510,6 +1527,7 @@ static void prompt_line_feeds(AppineVt *vt, const uint8_t *options, size_t len, 
   const uint8_t *v = prompt_option(options, len, PROMPT_LF_OPTION, &n);
   bool asked = v != NULL && n == sizeof(PROMPT_LF_OUTPUT) - 1 && memcmp(v, PROMPT_LF_OUTPUT, n) == 0;
   if (!asked && !primary) return;
+  vt->prompt_mode = asked ? APPINE_PROMPT_ASH : APPINE_PROMPT_FULL;
   vt->lf_output = asked;
   vt->lf_armed = asked;
   drop_resumed(vt);
@@ -1592,6 +1610,10 @@ bool appine_vt_at_prompt(AppineVt *vt) {
              GHOSTTY_SUCCESS &&
          at;
 }
+
+bool appine_vt_is_alternate(AppineVt *vt) { return is_alternate(vt); }
+
+int appine_vt_prompt_mode(AppineVt *vt) { return vt->prompt_mode; }
 
 // Scrolls the viewport to the prompt delta prompts above (negative) or below its top, or as far as
 // there are prompts; nothing when there are none
@@ -3462,10 +3484,7 @@ bool appine_vt_reset(AppineVt *vt) {
   // with the screen's prompt state (on_reset hears only a program's reset)
   drop_held_state(vt);
   vt->held = false;
-  vt->prompt_click = PROMPT_CLICK_NONE;
-  vt->lf_output = false;
-  vt->lf_armed = false;
-  drop_resumed(vt);
+  reset_prompt_state(vt);
   changed(vt);
   return prompt;
 }

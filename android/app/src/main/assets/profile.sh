@@ -10,11 +10,14 @@
 # around whatever PS1 is before each prompt: bash from /etc/profile.d/appine.bashrc, which this file
 # reads (and interactive bash through /etc/bash/appine.sh on Alpine or /etc/bash.bashrc on Debian);
 # ash gets them from /etc/profile.d/appine.ashrc, which ENV names so that ash reads it again after
-# ~/.profile and in nested shells; zsh gets them from /etc/profile.d/appine.zshrc, read here (and
-# via /etc/appine/zsh/.zshenv for login zsh on Debian and /etc/zsh/zshrc for nested zsh).
+# ~/.profile and in nested shells (including doas -s on Alpine); zsh gets them from
+# /etc/profile.d/appine.zshrc, read here (and via /etc/appine/zsh/.zshenv for login zsh on Debian
+# and /etc/zsh/zshrc for nested zsh).
 # Before each primary prompt the title returns to the current directory. bash and zsh report the
-# submitted command before execution; ash has no preexec hook. A program can replace the title
-# with OSC 0/2 until the next prompt. Control characters in paths and commands are replaced by ?.
+# submitted command before execution; for ash (which has no preexec hook) and unmarked shells, the
+# terminal falls back to the console's foreground command when a program sets no title. A program
+# can replace the title with OSC 0/2 until the next prompt. Control characters in paths and
+# commands are replaced by ?.
 if [ -z "${__appine_profile_seen-}" ]; then
     __appine_profile_seen=1
     cat /etc/motd 2>/dev/null

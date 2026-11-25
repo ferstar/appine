@@ -698,6 +698,22 @@ netns = "host"
         Native.writeFile(store, path, bytes, 493 /* 0755 */, overwrite)
     }
 
+    private const val DOAS_WHEEL_PATH = "/etc/doas.d/20-wheel.conf"
+    private const val OLD_DOAS_WHEEL_RULE = "permit persist :wheel"
+    private const val DOAS_WHEEL_RULE = "permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel"
+
+    /**
+     * Upgrades an unmodified Appine `/etc/doas.d/20-wheel.conf` on Alpine so `doas -s` preserves
+     * busybox ash's `ENV` hook without touching user-customized doas rules.
+     */
+    @Throws(IOException::class)
+    private fun ensureDoasEnv(store: String) {
+        val current = runCatching { Native.readFile(store, DOAS_WHEEL_PATH) }.getOrNull() ?: return
+        if (current.decodeToString().trimEnd('\n') == OLD_DOAS_WHEEL_RULE) {
+            write(store, DOAS_WHEEL_PATH, "$DOAS_WHEEL_RULE\n")
+        }
+    }
+
     /**
      * On Alpine, puts the doas package bundled with the app into the store
      * (`/var/cache/appine/doas.apk`): the login script installs it offline when a regular user
@@ -707,8 +723,10 @@ netns = "host"
     @Throws(IOException::class)
     fun ensureLoginTools(context: Context) {
         if (installed(context) != Distro.ALPINE) return
+        val store = store(context).path
         val data = context.assets.open("doas.apk").use { it.readBytes() }
-        write(store(context).path, "/var/cache/appine/doas.apk", data)
+        write(store, "/var/cache/appine/doas.apk", data)
+        ensureDoasEnv(store)
     }
 
     /**
@@ -750,6 +768,7 @@ netns = "host"
         "3257013eafeb90230ae0d6772e73d8af87be62f8d6f74460dd4189ea56271021",
         "a8ab98eda14fd8438be521001373eb177b37c0d7229b288a2ae46298ff55b972",
         "bc9b601ec28f299ce3277bdc9187660e756b2ad47d12fa8d29dd5bda96f632c1",
+        "2d5e818130b598104b81a5265e27d3e98b2459cfc109e2c77685e7725dc26860",
     )
 
     /**
@@ -765,6 +784,7 @@ netns = "host"
         store: String = store(context).path,
         distro: Distro = installed(context) ?: Distro.ALPINE,
     ) {
+        if (distro == Distro.ALPINE) ensureDoasEnv(store)
         val path = "/etc/profile.d/appine.sh"
         val old = runCatching { Native.readFile(store, path) }.getOrNull() ?: return
         val earlier = String(old) in listOf(OLD_PROFILE, UNMARKED_PROFILE) ||
