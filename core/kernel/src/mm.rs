@@ -4374,6 +4374,15 @@ impl Mm {
                             )
                         };
                     }
+                } else if self.mmu.next_present(cursor, stop) < stop {
+                    // Zap soft-MMU entries for discarded anonymous pages (as Linux's
+                    // zap_page_range_single does on MADV_DONTNEED) so discarded pages are not
+                    // scanned in touched_windows or mistaken for swapped-out pages when pagemap is
+                    // unreadable.
+                    if let Err(e) = self.mmu.unmap(cursor, stop - cursor).map_err(map_err) {
+                        return (rereads, Err(e));
+                    }
+                    self.dirty = true;
                 }
             } else if v.backing == Backing::PrivateFile && v.written.get() {
                 // Only written pages differ from the file, and whole pages past the end of the
@@ -5779,6 +5788,115 @@ impl Mm {
     /// Total size of the mappings (bytes).
     pub fn size(&self) -> u64 {
         self.vmas.values().map(|v| v.len).sum()
+    }
+
+    /// Allocated soft-MMU page-table bytes (`VmPTE`, OOM `pgtables`, `memory.stat` `pagetables`).
+    pub fn pgtables_bytes(&self) -> u64 {
+        self.mmu.table_bytes()
+    }
+
+    /// Allocated soft-MMU page tables in 4 KiB pages (Linux's `mm_pgtables_bytes(mm) / PAGE_SIZE`).
+    pub fn pgtables_pages(&self) -> u64 {
+        self.mmu.table_pages()
+    }
+
+    /// Exact swapped 4 KiB pages in this address space from `/proc/self/pagemap` (bit 62).
+    /// Returns `None` when `/proc/self/pagemap` cannot be read (e.g. SELinux-enforced Android).
+    pub fn exact_swap_pages(&self) -> Option<u64> {
+        if !appine_hal::pagemap_readable() {
+            return None;
+        }
+        let mut total = 0u64;
+        for (&s, v) in &self.vmas {
+            let host_len = v.host_len();
+            if v.reserved() || v.foreign() || host_len == 0 {
+                continue;
+            }
+            let swappable = match v.backing {
+                Backing::Anonymous | Backing::PrivateFile => v.written.get(),
+                Backing::Shared => shmem_like(v),
+            };
+            if !swappable {
+                continue;
+            }
+            if v.backing == Backing::Anonymous {
+                let ranges = if v.len > EAGER_MAX {
+                    self.touched_windows(s)
+                } else {
+                    vec![(s, s + host_len)]
+                };
+                let cow = self.cow.borrow();
+                for (lo, hi) in ranges {
+                    let mut cur = lo;
+                    for page in cow.borrowed.range(lo..hi).map(|(&p, _)| p).chain([hi]) {
+                        if page > cur {
+                            let host = Self::own_page(s, v, cur).as_ptr();
+                            total += appine_hal::swapped_pages(host, (page - cur) as usize)? as u64;
+                        }
+                        cur = page + PAGE_SIZE;
+                    }
+                }
+            } else {
+                total += appine_hal::swapped_pages(v.host.as_ptr(), host_len as usize)? as u64;
+            }
+        }
+        for (host, len) in borrowed_host_runs(&self.cow.borrow()) {
+            total += appine_hal::swapped_pages(host, len)? as u64;
+        }
+        Some(total)
+    }
+
+    /// Private anonymous 4 KiB pages that currently have a soft-MMU entry (or are CoW-borrowed)
+    /// and that host `mincore` reports non-resident: an upper bound on how many private anonymous
+    /// pages of this address space could be swapped out when `/proc/self/pagemap` is unreadable.
+    ///
+    /// Unmapped pages, reserved VMAs, never-written anonymous VMAs, file-backed VMAs and
+    /// `MADV_DONTNEED`-discarded pages (whose soft-MMU entries are zapped by [`Mm::discard_range`])
+    /// are excluded. Untouched pages inside a 2 MiB demand-filled span or <= 1 MiB eager mapping
+    /// can still appear non-resident here, so callers must bound and scale this estimate by the
+    /// host process's aggregate `VmSwap`.
+    pub fn swappable_nonresident_pages(&self) -> u64 {
+        let mut nonresident = 0u64;
+        for (&s, v) in &self.vmas {
+            let host_len = v.host_len();
+            if v.backing != Backing::Anonymous
+                || !v.written.get()
+                || v.reserved()
+                || v.foreign()
+                || host_len == 0
+            {
+                continue;
+            }
+            let ranges = if v.len > EAGER_MAX {
+                self.touched_windows(s)
+            } else {
+                vec![(s, s + host_len)]
+            };
+            let cow = self.cow.borrow();
+            for (lo, hi) in ranges {
+                let mut cur = self.mmu.next_present(lo, hi);
+                while cur < hi {
+                    let run_start = cur;
+                    while cur < hi
+                        && !cow.borrowed.contains_key(&cur)
+                        && self.mmu.next_present(cur, cur + PAGE_SIZE) == cur
+                    {
+                        cur += PAGE_SIZE;
+                    }
+                    if cur > run_start {
+                        let host = Self::own_page(s, v, run_start).as_ptr();
+                        nonresident += nonresident_pages(host, (cur - run_start) as usize);
+                    }
+                    if cur < hi {
+                        cur = self.mmu.next_present(cur + PAGE_SIZE, hi);
+                    }
+                }
+            }
+        }
+        for (host, len) in borrowed_host_runs(&self.cow.borrow()) {
+            nonresident += nonresident_pages(host, len);
+        }
+        nonresident
     }
 
     /// Bytes in grows-down mappings: the main stack and `MAP_GROWSDOWN` ones (Linux's `stack_vm`,
@@ -7395,6 +7513,27 @@ fn shmem_like(v: &Vma) -> bool {
             || v.name
                 .as_deref()
                 .is_some_and(|n| n.starts_with(b"/memfd:") || n.ends_with(b" (deleted)")))
+}
+
+/// Contiguous owner host pages in guest page order, for per-Mm swap accounting.
+fn borrowed_host_runs(cow: &Cow) -> impl Iterator<Item = (*const u8, usize)> + '_ {
+    let mut pages = cow
+        .borrowed
+        .values()
+        .map(|b| b.host.as_ptr().cast_const())
+        .peekable();
+    std::iter::from_fn(move || {
+        let start = pages.next()?;
+        let mut len = PAGE_SIZE as usize;
+        while pages.next_if_eq(&start.wrapping_add(len)).is_some() {
+            len += PAGE_SIZE as usize;
+        }
+        Some((start, len))
+    })
+}
+
+fn nonresident_pages(host: *const u8, len: usize) -> u64 {
+    (len as u64 / PAGE_SIZE).saturating_sub(appine_hal::resident_pages(host, len) as u64)
 }
 
 /// The resident memory of several address spaces together (a child cgroup's `memory.current`):
@@ -11809,5 +11948,55 @@ mod tests {
         assert!(trusted(shared_st));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pgtables_and_swappable_nonresident_exclude_dontneed_and_unmapped() {
+        let mut mm = Mm::new();
+        let initial_pgtables = mm.pgtables_bytes();
+        assert!(initial_pgtables >= PAGE_SIZE);
+
+        let rw = prot::READ | prot::WRITE;
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let a = mm.mmap(0, 64 * PAGE_SIZE, rw, anon, None).unwrap();
+        // Eager mapping created page tables and mapped 64 private anonymous pages; untouched pages
+        // are non-resident.
+        assert!(mm.pgtables_bytes() > initial_pgtables);
+        assert_eq!(mm.swappable_nonresident_pages(), 64);
+
+        // Dirtying half the range makes those 32 pages resident, leaving 32 non-resident.
+        mm.write_kernel(a, &vec![0xab; 32 * PAGE_SIZE as usize])
+            .unwrap();
+        assert_eq!(mm.swappable_nonresident_pages(), 32);
+
+        // MADV_DONTNEED discards the pages and zaps their soft-MMU entries so they are not
+        // miscounted as swapped candidates.
+        let (_, res) = mm.discard_range(a, 64 * PAGE_SIZE, false);
+        res.unwrap();
+        assert_eq!(mm.swappable_nonresident_pages(), 0);
+        assert_eq!(mm.resident_pages(), 0);
+
+        // Never-written anonymous VMA (PROT_READ only) contributes 0 swap candidates.
+        let ro = mm.mmap(0, 16 * PAGE_SIZE, prot::READ, anon, None).unwrap();
+        assert_eq!(mm.swappable_nonresident_pages(), 0);
+        mm.munmap(ro, 16 * PAGE_SIZE).unwrap();
+        mm.munmap(a, 64 * PAGE_SIZE).unwrap();
+        assert_eq!(mm.swappable_nonresident_pages(), 0);
+    }
+
+    #[test]
+    fn swap_candidates_include_disjoint_runs_of_borrowed_pages() {
+        let parent = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let addr = parent
+            .borrow_mut()
+            .mmap(0, 5 * PAGE_SIZE, RW, anon, None)
+            .unwrap();
+        let child = parent.borrow_mut().fork().unwrap();
+        let mut child = child.borrow_mut();
+        assert_eq!(child.swappable_nonresident_pages(), 5);
+        child.munmap(addr + PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
+        assert_eq!(child.cow.borrow().borrowed.len(), 3);
+        assert_eq!(child.swappable_nonresident_pages(), 3);
     }
 }

@@ -666,7 +666,11 @@ pub(super) fn sched_setaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64
     cx.mm()
         .read(crate::uaccess::UserSlice::new(mask, n), &mut b[..n])?;
     let task = affinity_target(cx, pid)?;
-    let new = u64::from_le_bytes(b) & online_cpus();
+    let allowed = match task.as_ref() {
+        Some(t) => crate::cgroup::effective_cpus(cx.kr(), task_cgroup(cx.kr(), t)),
+        None => online_cpus(),
+    };
+    let new = u64::from_le_bytes(b) & allowed;
     if !owner_or_nice_over(&cx.cred(), &cred_of(task.as_ref())) {
         return Err(Errno::EPERM);
     }
@@ -688,9 +692,21 @@ pub(super) fn sched_getaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64
         return Err(Errno::EINVAL);
     }
     let task = affinity_target(cx, pid)?;
-    let bits = task.map_or(u64::MAX, |t| t.affinity.get()) & online_cpus();
+    let bits = match task {
+        Some(t) => {
+            let cg = task_cgroup(cx.kr(), &t);
+            crate::cgroup::clamp_affinity(cx.kr(), cg, t.affinity.get())
+        }
+        None => online_cpus(),
+    };
     put(cx, mask, bits.to_le_bytes())?;
     Ok(8)
+}
+
+fn task_cgroup(k: &crate::kernel::Kernel, t: &Task) -> u64 {
+    k.groups
+        .get(&t.tgid)
+        .map_or(crate::cgroup::ROOT, |g| g.borrow().cgroup)
 }
 
 /// The affinity target thread: as on Linux, a negative pid is a process not found (ESRCH), not
@@ -763,11 +779,15 @@ pub(super) fn inherit_ioprio(parent: &Option<Rc<Cell<u16>>>, flags: u64) -> Opti
 
 /// A host thread starts running guest thread `t`: it has inherited the priority, I/O priority and
 /// affinity of the host thread that created it (of the previous guest thread when `reused`), and
-/// switches to `t`'s own.
-pub(crate) fn host_started(t: &Task, reused: bool) {
+/// switches to `t`'s own, clamped to its cgroup's effective `cpuset.cpus`.
+pub(crate) fn host_started(k: &crate::kernel::Kernel, t: &Task, reused: bool) {
     apply_host(t);
     apply_host_ioprio(t, reused);
-    let mask = t.affinity.get() & online_cpus();
+    let cg = task_cgroup(k, t);
+    let mask = crate::cgroup::clamp_affinity(k, cg, t.affinity.get());
+    if mask != t.affinity.get() {
+        t.affinity.set(mask);
+    }
     // A host thread reused from the pool still has the previous guest thread's affinity
     if mask != online_cpus() || reused {
         appine_hal::set_thread_affinity(t.host_tid.get(), mask);

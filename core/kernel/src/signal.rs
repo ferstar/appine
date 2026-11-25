@@ -683,17 +683,20 @@ fn unkillable(group: &ThreadGroup) -> bool {
 /// Ends the whole thread group (exit_group, a fatal signal, a SIGKILL not from execve): records
 /// the exit status and makes every thread exit the next time it enters the kernel.
 pub(crate) fn group_exit(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, status: ExitStatus) {
-    let mut g = group.borrow_mut();
-    if g.exiting.is_none() {
-        g.exiting = Some(status);
-    }
-    k.cgroups.task_changed(g.cgroup);
-    for tid in &g.threads {
-        if let Some(t) = k.tasks.get(tid) {
-            t.killed.set(true);
-            wake(t);
+    let cgroup = {
+        let mut g = group.borrow_mut();
+        if g.exiting.is_none() {
+            g.exiting = Some(status);
         }
-    }
+        for tid in &g.threads {
+            if let Some(t) = k.tasks.get(tid) {
+                t.killed.set(true);
+                wake(t);
+            }
+        }
+        g.cgroup
+    };
+    crate::cgroup::task_changed(k, cgroup);
 }
 
 fn killed_by(sig: Signal) -> ExitStatus {

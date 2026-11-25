@@ -256,6 +256,48 @@ fn superpages_map_protect_unmap_demote_and_move() {
     assert!(mmu.translate(base4 + 2 * PAGE_SIZE, prot::WRITE).is_some());
 }
 
+#[test]
+fn table_bytes_tracks_allocated_tables_and_superpages() {
+    let mut mem = pages(512 + 2);
+    let mut mmu = Mmu::new();
+    // Fresh Mmu has only the L0 root table (512 * sizeof(uintptr_t) = 4 KiB on 64-bit).
+    let table_size = 512 * std::mem::size_of::<usize>() as u64;
+    assert_eq!(mmu.table_bytes(), table_size);
+    assert_eq!(mmu.table_pages(), table_size / PAGE_SIZE);
+
+    // Aligned 2 MiB superpage allocates L1 + L2, without an L3 leaf table.
+    let super_va = 0x2000_0000u64;
+    unsafe {
+        mmu.fill_shared(super_va, host(&mut mem, 0), LEAF, RW)
+            .unwrap();
+    }
+    assert_eq!(mmu.table_bytes(), 3 * table_size);
+
+    // Partial protect demotes the superpage into a newly allocated L3 table.
+    mmu.protect(super_va + PAGE_SIZE, PAGE_SIZE, prot::READ)
+        .unwrap();
+    assert_eq!(mmu.table_bytes(), 4 * table_size);
+
+    // Mapping a single 4 KiB page in a fresh 2 MiB slot under the same L2 allocates one L3 table.
+    let small_va = super_va + LEAF;
+    unsafe {
+        mmu.map(small_va, host(&mut mem, 512), PAGE_SIZE, RW)
+            .unwrap();
+    }
+    assert_eq!(mmu.table_bytes(), 5 * table_size);
+
+    // Unmapping and re-promoting retires the empty L3 (still allocated until Mmu::drop), so
+    // table_bytes stays monotonic, and a later demotion allocates a fresh L3 table.
+    mmu.unmap(small_va, PAGE_SIZE).unwrap();
+    unsafe {
+        mmu.fill_shared(small_va, host(&mut mem, 0), LEAF, RW)
+            .unwrap();
+    }
+    assert_eq!(mmu.table_bytes(), 5 * table_size);
+    mmu.unmap(small_va, PAGE_SIZE).unwrap();
+    assert_eq!(mmu.table_bytes(), 6 * table_size);
+}
+
 fn pages(n: usize) -> Box<[Page]> {
     (0..n).map(|_| Page([0; 4096])).collect()
 }

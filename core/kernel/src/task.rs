@@ -476,7 +476,7 @@ pub(crate) fn start(
         thread_main(thread_shared, tid, cpu, reused)
     }))
     .map_err(|_| Errno::EAGAIN)?;
-    {
+    let cgroup = {
         let st = task.state.borrow();
         let mut group = st.group.borrow_mut();
         group.threads.push(tid);
@@ -488,10 +488,11 @@ pub(crate) fn start(
             // SAFETY: the new thread's Cpu still exists, and the caller holds the BKL
             unsafe { task.sync.kicker.kick() };
         }
-        k.cgroups.task_changed(group.cgroup);
         st.mm.borrow_mut().add_user(task.sync.clone());
-    }
+        group.cgroup
+    };
     k.tasks.insert(tid, task);
+    crate::cgroup::task_changed(k, cgroup);
     Ok(())
 }
 
@@ -650,7 +651,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         task.host_tid.set(appine_hal::gettid());
         task.ctxt_base
             .set(appine_hal::thread_ctxt_switches_self().unwrap_or((0, 0)));
-        crate::syscall::host_started(&task, reused);
+        crate::syscall::host_started(&k, &task, reused);
         task.state.borrow().mm.borrow().generations()
     });
     let Some(mut generations) = started else {
@@ -1155,12 +1156,12 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     // Its address space's attachments no longer count: a segment marked for removal goes with
     // its last one (Linux's exit_mmap closes them)
     crate::ipc::reap_shm(&mut k);
-    let last = {
+    let (last, cgroup) = {
         let mut g = group.borrow_mut();
         g.threads.retain(|&t| t != tid);
-        k.cgroups.task_changed(g.cgroup);
-        g.threads.is_empty()
+        (g.threads.is_empty(), g.cgroup)
     };
+    crate::cgroup::task_changed(&k, cgroup);
     // The child processes this thread created go to a live thread of the process (Linux's
     // forget_original_parent); the last thread's are reparented by finish_group
     if !last {

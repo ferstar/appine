@@ -1279,13 +1279,14 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
     if others.is_empty() {
         return Ok(());
     }
-    cx.kr().cgroups.task_changed(cx.t.group.borrow().cgroup);
     for tid in &others {
         if let Some(t) = cx.kr().tasks.get(tid) {
             t.killed.set(true);
             signal::wake(t);
         }
     }
+    let cgroup = cx.t.group.borrow().cgroup;
+    crate::cgroup::task_changed(cx.kr(), cgroup);
     while cx.t.group.borrow().threads.len() > 1 {
         if cx.task.killed.get() {
             // Another thread is ending the whole process at the same time

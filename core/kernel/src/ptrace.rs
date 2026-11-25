@@ -629,10 +629,12 @@ pub(crate) fn exit(cx: &mut Cx<'_>, cpu: &mut Cpu, status: ExitStatus) {
         return;
     }
     let killed = cx.task.killed.replace(false);
-    cx.kr().cgroups.task_changed(cx.t.group.borrow().cgroup);
+    let cgroup = cx.t.group.borrow().cgroup;
+    crate::cgroup::task_changed(cx.kr(), cgroup);
     if event(cx, cpu, event::EXIT, status.wait_status() as u64) {
         cx.task.killed.set(killed);
-        cx.kr().cgroups.task_changed(cx.t.group.borrow().cgroup);
+        let cgroup = cx.t.group.borrow().cgroup;
+        crate::cgroup::task_changed(cx.kr(), cgroup);
     }
 }
 

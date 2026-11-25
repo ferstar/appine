@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: CodeGroup Mm::drop records registered file sources only when the last member drops)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: expose allocated radix page-table byte count via `appine_mmu_table_bytes` / `Mmu::table_bytes`)
 
 ## Responsibilities
 
@@ -51,9 +51,11 @@ fast path and refill (`engine/dbt`).
   leaf entry is a 4 KB-aligned host page address ORed with R/W/X bits; 0 means absent, and prot 0
   with a nonzero address means "present, no access". `Mmu` is neither `Send` nor `Sync`;
   `map`/`unmap`/`protect`/`move_entries` take `&mut`, while
-  `fill_shared`/`map_shared`/`protect_shared`/`next_present`/`translate` take `&self` so CoW can
-  edit another address space's table. Guest address spaces only fill empty slots (`fill_shared`,
-  `map_shared` for CoW); the replacing `map` serves the vDSO's own probe table.
+  `fill_shared`/`map_shared`/`protect_shared`/`next_present`/`translate`/`table_bytes`/`table_pages`
+  take `&self` so CoW and memory accounting can query or edit another address space's table
+  (`table_bytes` counts all allocated 4 KiB radix tables — root, intermediate, active and retired
+  L3 tables — monotonically until destruction). Guest address spaces only fill empty slots
+  (`fill_shared`, `map_shared` for CoW); the replacing `map` serves the vDSO's own probe table.
 - `struct appine_tlb_entry` — data TLB entry `{read tag, read addend, write tag, write addend}`,
   4096 direct-mapped 4 KB entries (`tlb`, tracked by `tlb_used`) plus 1024 direct-mapped 2 MB
   superpage entries (`stlb`, 4 KB-aligned, covering 2 GB, tracked by `stlb_used`) per thread; tag

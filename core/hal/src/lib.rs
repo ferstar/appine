@@ -322,6 +322,37 @@ pub fn touched_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
     page_flags(ptr, len, |entry| entry & (3 << 62) != 0)
 }
 
+/// The number of 4K pages in `[ptr, ptr + len)` currently in swap (bit 62 of `/proc/self/pagemap`).
+/// Measured in bounded windows so large mappings do not allocate large buffers; returns None when
+/// pagemap cannot be read (e.g. SELinux-enforced Android hosts).
+pub fn swapped_pages(ptr: *const u8, len: usize) -> Option<usize> {
+    use std::os::unix::fs::FileExt;
+    const WINDOW_PAGES: usize = 1 << 16;
+    const SWAPPED: u64 = 1 << 62;
+    if len == 0 {
+        return Some(0);
+    }
+    let pm = pagemap()?;
+    let page = page_size();
+    let start = ptr as usize & !(page - 1);
+    let span = (ptr as usize + len).next_multiple_of(page) - start;
+    let total_host_pages = span / page;
+    let mut raw = vec![0u8; total_host_pages.min(WINDOW_PAGES) * 8];
+    let mut swapped_host_pages = 0usize;
+    let mut at = start;
+    while at < start + span {
+        let n = ((start + span - at) / page).min(WINDOW_PAGES);
+        let buf = &mut raw[..n * 8];
+        pm.read_exact_at(buf, (at / page) as u64 * 8).ok()?;
+        swapped_host_pages += buf
+            .chunks_exact(8)
+            .filter(|e| u64::from_le_bytes((*e).try_into().unwrap()) & SWAPPED != 0)
+            .count();
+        at += n * page;
+    }
+    Some((swapped_host_pages * page / 4096).min(len.div_ceil(4096)))
+}
+
 /// Which 4 KiB pages are private copies in a host file mapping, including swapped-out copies.
 pub fn private_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
     page_flags(ptr, len, is_private)

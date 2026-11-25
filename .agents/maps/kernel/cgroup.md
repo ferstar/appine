@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: independent ownership and permissions for delegated nodes)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: exact mutation-point cgroup notifications, dentry-instantiated dir watches, `memory.high` events/reclaim, and `cpuset.cpus` enforcement)
 
 ## Responsibilities
 
@@ -40,9 +40,10 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 ## Public entry points
 
 - cgroup: `file`, `write`, `Cgroups::mkdir`, `rmdir`, `proc_cgroup`, `proc_cgroups`, `may_enter`,
-  `pids_charge`, `memory_limits`, `measure_memory`, `memory_event`, `oom_group`,
+  `pids_charge`, `memory_limits`, `memory_high_limits`, `note_memory_high_state`,
+  `measure_memory`, `memory_event`, `oom_group`, `effective_cpus`, `clamp_affinity`,
   `effective_device_progs`, `hierarchy_allows_attach`, `file_mode`, `observe`, `observe_all`,
-  `notify_changes`, `key`.
+  `task_changed`, `Cgroups::file_looked_up`, `notify_changes`, `key`.
 - bpf(2) (`syscall::bpf::bpf`) and `check_device`.
 
 ## Data flow / lifecycle
@@ -97,15 +98,21 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   default, `cpu.weight`, `cpuset.cpus` against the guest CPUs, and so on) and read back
   as stored; a stored value always wins over the computed default.
 - Enforced: `pids.max` (fork and thread creation; `pids.current` counts live threads plus one for
-  a zombie or an exited main thread), `memory.max` (the root shows the OOM killer's limit and measurement; a child's
-  usage is its members' resident memory with what they share counted once (`kernel/oom`'s
-  `Usage`), checked periodically by the OOM killer and immediately when a lower limit is written;
-  `memory.oom.group` widens the kill), `cgroup.freeze` (threads stop before returning to guest
-  code, waits return and restart after thaw; `cgroup.events` reports frozen once every task has
-  stopped or is a vfork parent waiting for its child, as Linux counts that wait), `cgroup.kill`
-  (SIGKILL to every live process in the subtree), `cgroup.max.depth`/`max.descendants` (at
-  mkdir), the device programs. Everything else (`memory.high`, `cpu.max`, `cpuset.cpus`, …) is
-  format-checked and stored.
+  a zombie or an exited main thread), `memory.max` (the root shows the OOM killer's limit and
+  measurement; a child's usage is its members' resident memory with what they share counted once
+  (`kernel/oom`'s `Usage`), checked periodically by the OOM killer and immediately when a lower
+  limit is written; `memory.oom.group` widens the kill), `memory.high` (checked on writes and
+  periodically by `oom::check`; exceeding it records `high` in `memory.events` and
+  `memory.events.local` and reclaims unused Tier 1 pool translations and writable code views
+  without killing processes), `cpuset.cpus` (hierarchical `cpuset.cpus.effective` intersecting
+  with parent effective CPUs and falling back to parent when empty or disjoint; enforced on
+  `sched_getaffinity`, `sched_setaffinity`, new host threads, `/proc/<pid>/status` `Cpus_allowed`,
+  migrations, and `cpuset.cpus` writes/controller disables), `cgroup.freeze` (threads stop before
+  returning to guest code, waits return and restart after thaw; `cgroup.events` reports frozen once
+  every task has stopped or is a vfork parent waiting for its child, as Linux counts that wait),
+  `cgroup.kill` (SIGKILL to every live process in the subtree), `cgroup.max.depth`/`max.descendants`
+  (at mkdir), the device programs. Everything else (`cpu.max`, `cpu.weight`, `memory.low`,
+  `memory.min`, …) is format-checked and stored.
 - `/proc/<pid>/cgroup` is `0::<path>` relative to the reader's cgroup-namespace root;
   `/proc/cgroups` reports hierarchy 0 for the v1 controller names.
 
@@ -157,17 +164,23 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   from the start and, for `cgroup.events`, `memory.events`, `memory.events.local` and
   `pids.events`, after a content change until read again. `kernel/files` attaches the counter
   returned by `observe` to `fd::ProcEvent`; `kernel/poll` consumes its readiness state.
-- A task starting, exiting, migrating or changing its freezer participation marks
-  `cgroup.events` in the affected groups and their ancestors. Freeze requests also mark
-  observed descendants. Pids and memory events mark the files whose counters they change;
-  controller disable and rmdir mark observations whose files disappear. Enabling pids or
-  memory registers the newly visible files for existing watches on the child directories.
+- A task starting, exiting, migrating or changing its freezer participation calls
+  `cgroup::task_changed` immediately after updating membership/state (outside any `ThreadGroup`
+  borrow), evaluating `cgroup.events` on observed ancestors right at the mutation point and
+  recording `Observed::changed` so transient transitions that revert before the next checkpoint
+  (e.g. `populated` or `frozen` 0 -> 1 -> 0) are never lost. `cgroup.freeze` writes, `pids_charge`,
+  and `memory_event` record transitions on their observed files immediately too; controller disable
+  and rmdir mark observations dirty so disappearing files are pruned. Enabling pids or memory
+  registers the newly visible files for existing watches on the child directories without marking
+  them instantiated.
 - A per-kernel flag lets `notify_changes` skip the observation table when clean. Otherwise it
-  compares only marked files, after BKL syscalls, thread exits,
-  freezer stops and timer-thread checks. Multiple changes to a file between checks yield at
-  most one counter increase. A change wakes pollers and reports `IN_MODIFY` to watches
-  on the file and its directory. A write to any cgroup2 file reports `IN_MODIFY` too,
-  from the file-syscall adapter.
+  flushes recorded changes at BKL syscall, thread exit, freezer stop and timer-thread checkpoints.
+  Multiple changes to a file before a checkpoint coalesce into one poll-counter bump and one
+  `IN_MODIFY` delivery. Directory watches receive `IN_MODIFY` only for child event files whose
+  dentry has been instantiated (`Cgroup::instantiated`, set on lookup in `pseudo::View::lookup`,
+  open, or direct watch, and cleared when a controller is disabled), matching native Linux
+  `kernfs_notify`. A write to any cgroup2 file reports `IN_MODIFY` too, from the file-syscall
+  adapter. Linux 6.1 does not notify `cgroup.stat`, so it stays outside `NOTIFYING`.
 - `key` gives cgroup2 files and directories inotify keys with top bits 01; store inodes, overlay
   keys (10) and FUSE keys (11) do not collide with them. Removed or no-longer-observed files
   are forgotten at the next check of that file. Until then a closed file may retain a snapshot;
@@ -221,14 +234,12 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 
 ## Confirmed bugs / technical debt
 
-- **Change notifications are partial:** a cgroup2 change is noticed when the next syscall,
-  thread exit, freezer stop or timer-thread pass looks, and changes that come and go between
-  two looks are missed; `cgroup.stat` and other files Linux notifies in later kernels are not
-  watched. A directory watch can also receive an inherited freeze notification for a child
-  event file never looked up, where the native 6.8 VM reported it only with the child dentry
-  instantiated.
-- **Controller gaps:** threaded cgroups are unavailable; limits such as `cpu.max`, `cpu.weight`, `cpuset.cpus` and
-  `memory.high` are stored without enforcement.
+- **Controller gaps:** threaded cgroups are unavailable; `cpu.max` quota throttling, `cpu.weight`,
+  `memory.low` and `memory.min` are stored without enforcement (`cpu.max` throttling on CPU-bound
+  guest loops running outside the BKL would require periodic 1 ms-class timer accounting plus
+  run-loop kick/throttle stops without host CFS privileges, risking timer/BKL churn). `memory.high`
+  records `high` events and reclaims Tier 1 pool/code-view memory, but cannot force host kernel
+  reclaim or allocation-stall throttling of guest-managed anonymous pages.
 
 ## Open questions
 

@@ -226,10 +226,12 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   lines follow Linux 6.1's `vm_stat_account` / `task_mem` (`VmPeak` = `VmSize`, `VmHWM` from max RSS, `VmRSS` the sum of
   `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmData` the private writable non-stack
   mappings, `VmStk` the grows-down mappings, `VmExe` the page-aligned code span capped by executable
-  non-writable mappings, `VmLib` the remaining executable non-writable mappings, PTE/swap 0; omitted
+  non-writable mappings, `VmLib` the remaining executable non-writable mappings, `VmPTE` allocated
+  soft-MMU page-table bytes and `VmSwap` exact pagemap swap when readable, otherwise zero; omitted
   with no live task); `FDSize` the open fds rounded up to 64;
   `Cpus_allowed` and `Cpus_allowed_list` show the thread's affinity (the main thread's in the
-  process's `status`) within the online CPUs as a hex mask (`cpu_mask_of`) and CPU list. `statm` is
+  process's `status`) clamped to the cgroup's effective cpuset as a hex mask (`cpu_mask_of`) and
+  CPU list. `statm` is
   `size resident shared text 0 data 0` (matching Linux 6.1's `task_statm`: `resident` = `RssAnon +
   RssFile + RssShmem`, `shared` = `RssFile + RssShmem`, `text` = page-aligned code span, `data` =
   `VmData + VmStk` in pages).

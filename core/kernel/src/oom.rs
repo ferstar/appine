@@ -105,13 +105,15 @@ impl Oom {
     }
 }
 
-/// The counts in `memory.events`: how often usage was measured over the limit and so a process
-/// had to be picked and ended (not counted while the one picked last time has not finished
-/// exiting), how many processes were ended, and how often a whole group was ended because of
-/// `memory.oom.group`. Recorded on the cgroup ([`crate::cgroup::memory_event`]); those for the
-/// app's limit are recorded on the root.
-#[derive(Clone, Copy, Default)]
+/// The counts in `memory.events`: how often usage exceeded `memory.high` (`high`), how often usage
+/// was measured over `memory.max` and so a process had to be picked and ended (`max`, not counted
+/// while the one picked last time has not finished exiting), how many times the OOM killer fired
+/// (`oom`), how many processes were ended (`oom_kill`), and how often a whole group was ended
+/// because of `memory.oom.group` (`oom_group_kill`). Recorded on the cgroup
+/// ([`crate::cgroup::memory_event`]); those for the app's limit are recorded on the root.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Events {
+    pub high: u64,
     pub max: u64,
     pub oom: u64,
     pub oom_kill: u64,
@@ -127,11 +129,14 @@ pub(crate) fn default_limit() -> u64 {
 }
 
 /// Called each time the timer thread wakes up: when a check is due, measures the app's memory and
-/// the memory of the cgroups with `memory.max` set, and when a limit is exceeded ends a guest
-/// process (for a cgroup, picked from inside it). Returns when the next check is due.
+/// the memory of the cgroups with `memory.max` or `memory.high` set. Exceeding `memory.high`
+/// records a `high` event and reclaims unused Tier 1 pool/code-view memory without killing;
+/// exceeding `memory.max` (or the app limit) ends a guest process (for a cgroup, picked from
+/// inside it). Returns when the next check is due.
 pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     let limits = crate::cgroup::memory_limits(k);
-    if k.oom.limit == u64::MAX && limits.is_empty() {
+    let high_limits = crate::cgroup::memory_high_limits(k);
+    if k.oom.limit == u64::MAX && limits.is_empty() && high_limits.is_empty() {
         return None;
     }
     let now = Instant::now();
@@ -161,15 +166,35 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
             }
         }
     }
+    // A cgroup with both limits uses the same usage sample for both checks.
+    let mut measured = std::collections::HashMap::new();
     for (id, max) in limits {
         if over.is_some() {
             break;
         }
         let used = crate::cgroup::measure_memory(k, id);
+        if !high_limits.is_empty() {
+            measured.insert(id, used);
+        }
         near |= used > max / 4 * 3;
         if used > max {
             over = Some((id, used, max));
         }
+    }
+    let unmapping = crate::mm::UNMAPPING.load(Ordering::Acquire) != 0;
+    let mut high_over = Vec::new();
+    for (id, high) in high_limits {
+        let used = measured
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| crate::cgroup::measure_memory(k, id));
+        near |= used > high / 4 * 3;
+        if !unmapping && crate::cgroup::note_memory_high_state(k, id, used, high) {
+            high_over.push(id);
+        }
+    }
+    for id in high_over {
+        handle_memory_high(k, id);
     }
     // Measuring cgroups holds the BKL, and takes a millisecond or two with many processes and large
     // mappings: the interval is at least MEASURE_SHARE times this check's duration, taking no more
@@ -183,12 +208,21 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     };
     // The process picked last time is still exiting: its memory will be back soon, so this does
     // not count as hitting the limit again
-    if crate::mm::UNMAPPING.load(Ordering::Acquire) != 0 || waiting_for_victim(k, now) {
+    if unmapping || waiting_for_victim(k, now) {
         return k.oom.next;
     }
     crate::cgroup::memory_event(k, domain, |e| e.max += 1);
     out_of_memory(k, (domain, used, limit));
     k.oom.next
+}
+
+/// Handles a cgroup exceeding its `memory.high` throttle/reclaim threshold: records a `high` event
+/// in `memory.events` and `memory.events.local` and reclaims unused Tier 1 pool translations and
+/// writable code-cache views without killing any process.
+pub(crate) fn handle_memory_high(k: &mut Kernel, id: u64) {
+    crate::cgroup::memory_event(k, id, |e| e.high += 1);
+    appine_engine::trim_dbt_pool();
+    appine_engine::unmap_written_code();
 }
 
 /// Measures root (whole-app) usage against `limit` and records the peak. When usage exceeds
@@ -335,17 +369,108 @@ pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u6
     }
 }
 
+/// How swap pages are attributed per guest `Mm` during OOM scoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwapContext {
+    /// `/proc/self/pagemap` is readable: count exact swapped entries per `Mm`.
+    Exact,
+    /// `/proc/self/pagemap` is unreadable, and host `VmSwap` is 0: no process has swapped pages.
+    Zero,
+    /// `/proc/self/pagemap` is unreadable (SELinux-enforced Android hosts) and host `VmSwap > 0`:
+    /// attribute `host_swap_pages` conservatively across live guest address spaces proportionally to
+    /// their non-resident mapped private anonymous pages (`total_cand`), capped by `host_swap_pages`.
+    Fallback {
+        host_swap_pages: u64,
+        total_cand: u64,
+    },
+}
+
+/// Conservative per-`Mm` swap estimate when `/proc/self/pagemap` is unreadable:
+/// - Always 0 when `host_swap_pages == 0`, `cand == 0`, or `total_cand == 0`.
+/// - Never exceeds `cand` or `host_swap_pages`, and the sum across all processes never exceeds
+///   `host_swap_pages`.
+fn estimate_swap_share(cand: u64, total_cand: u64, host_swap_pages: u64) -> u64 {
+    if host_swap_pages == 0 || cand == 0 || total_cand == 0 {
+        return 0;
+    }
+    if total_cand <= host_swap_pages {
+        cand
+    } else {
+        ((cand as u128 * host_swap_pages as u128) / total_cand as u128) as u64
+    }
+}
+
+/// Builds the swap attribution context once per scoring pass. When pagemap is unreadable and host
+/// `VmSwap > 0`, scans all unique live guest `Mm`s (including `-1000` protected processes so their
+/// swap is not misattributed to eligible processes).
+fn swap_context(k: &Kernel) -> SwapContext {
+    if appine_hal::pagemap_readable() {
+        return SwapContext::Exact;
+    }
+    let host_swap_pages = app_memory().map_or(0, |u| u.swap / PAGE_SIZE);
+    fallback_swap_context(k, host_swap_pages)
+}
+
+fn fallback_swap_context(k: &Kernel, host_swap_pages: u64) -> SwapContext {
+    if host_swap_pages == 0 {
+        return SwapContext::Zero;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut total_cand = 0u64;
+    for group in k.groups.values() {
+        let Ok(g) = group.try_borrow() else {
+            continue;
+        };
+        let Ok(Some(mm)) = group_mm(k, &g) else {
+            continue;
+        };
+        if seen.insert(Rc::as_ptr(&mm))
+            && let Ok(mm_ref) = mm.try_borrow()
+        {
+            total_cand = total_cand.saturating_add(mm_ref.swappable_nonresident_pages());
+        }
+    }
+    SwapContext::Fallback {
+        host_swap_pages,
+        total_cand,
+    }
+}
+
+fn swap_pages_for_mm(mm: &crate::mm::Mm, ctx: SwapContext) -> u64 {
+    match ctx {
+        SwapContext::Exact => mm.exact_swap_pages().unwrap_or(0),
+        SwapContext::Zero => 0,
+        SwapContext::Fallback {
+            host_swap_pages,
+            total_cand,
+        } => estimate_swap_share(
+            mm.swappable_nonresident_pages(),
+            total_cand,
+            host_swap_pages,
+        ),
+    }
+}
+
 /// Picks the process to end (skipping those in `skip`): the OOM scope is cgroup `domain` (the root
 /// being the whole app), and the pick is among the processes below it, by Linux 6.1's oom_badness:
-/// resident pages plus `oom_score_adj` times a thousandth of the limit `limit` in pages (for the
-/// root, the larger of physical memory and the limit; 1000 equals everything, so such a process is
-/// always picked first), unclamped; on equal scores the later process wins, as
-/// `oom_evaluate_task` keeps the last one not below the best. Returns the process and its resident
-/// 4K page count.
+/// resident pages plus swap pages plus page-table pages plus `oom_score_adj` times a thousandth of
+/// the limit `limit` in pages (for the root, the larger of physical memory and the limit; 1000
+/// equals everything, so such a process is always picked first), unclamped; on equal scores the
+/// later process wins, as `oom_evaluate_task` keeps the last one not below the best. Returns the
+/// process and its resident 4K page count.
 fn select(
     k: &Kernel,
     skip: &[Rc<RefCell<ThreadGroup>>],
     (domain, limit): (u64, u64),
+) -> Option<(Rc<RefCell<ThreadGroup>>, u64)> {
+    select_with(k, skip, (domain, limit), swap_context(k))
+}
+
+fn select_with(
+    k: &Kernel,
+    skip: &[Rc<RefCell<ThreadGroup>>],
+    (domain, limit): (u64, u64),
+    swap_ctx: SwapContext,
 ) -> Option<(Rc<RefCell<ThreadGroup>>, u64)> {
     let total = if domain == ROOT {
         appine_hal::memory_info().0.max(limit)
@@ -362,7 +487,7 @@ fn select(
         if !k.cgroups.is_within(g.cgroup, domain) {
             continue;
         }
-        let Some((points, rss)) = badness(k, &g, total) else {
+        let Some((points, rss)) = badness_with(k, &g, total, swap_ctx) else {
             continue;
         };
         if best.as_ref().is_none_or(|b| points >= b.1) {
@@ -372,19 +497,21 @@ fn select(
     best.map(|(g, _, rss)| (g, rss))
 }
 
-/// Linux's `oom_badness` for process `g` against `total` pages: its resident pages plus its
-/// `oom_score_adj` times a thousandth of `total`, and the resident pages; None for a process never
-/// picked (the built-in init, `oom_score_adj` -1000, no live thread, a vfork child still sharing
-/// its parent's address space).
+/// Linux's `oom_badness` for process `g` against `total` pages: its resident pages plus swap pages
+/// plus allocated soft-MMU page-table pages plus its `oom_score_adj` times a thousandth of
+/// `total`, and the resident pages; None for a process never picked (the built-in init,
+/// `oom_score_adj` -1000, no live thread, a vfork child still sharing its parent's address space).
 ///
-/// Unlike Linux, swap and page-table pages are not added:
-/// - Host `/proc/self/status`'s `VmSwap` is aggregate for the entire host process and cannot be
-///   attributed to individual guest processes; `Mm::resident_pages` uses host `mincore` (which
-///   reports swapped-out pages as absent), and `/proc/self/pagemap` is blocked by SELinux on
-///   Android hosts where zram swap matters.
-/// - `appine_engine::Mmu` uses on-demand 2 MiB superpages and exposes no allocated page-table
-///   count (matching `VmPTE: 0 kB` in `/proc/<pid>/status` and `pgtables:0kB` in OOM kill logs).
-fn badness(k: &Kernel, g: &ThreadGroup, total: i64) -> Option<(i64, u64)> {
+/// Swap attribution uses exact `/proc/self/pagemap` swap bits when readable; when pagemap is
+/// blocked by SELinux on Android hosts and host `VmSwap > 0`, it falls back to a conservative
+/// proportional estimate bounded by host `VmSwap` over non-resident mapped private anonymous pages
+/// (excluding unmapped and `MADV_DONTNEED`-discarded pages).
+fn badness_with(
+    k: &Kernel,
+    g: &ThreadGroup,
+    total: i64,
+    swap_ctx: SwapContext,
+) -> Option<(i64, u64)> {
     if g.tgid == INIT || g.oom_score_adj == OOM_SCORE_ADJ_MIN {
         return None;
     }
@@ -396,8 +523,15 @@ fn badness(k: &Kernel, g: &ThreadGroup, total: i64) -> Option<(i64, u64)> {
     if task.vfork.get() && parent.is_some_and(|p| Rc::ptr_eq(&p.res.borrow().mm, &mm)) {
         return None;
     }
-    let rss = mm.borrow().resident_pages();
-    Some((rss as i64 + g.oom_score_adj as i64 * (total / 1000), rss))
+    let mm_ref = mm.borrow();
+    let rss = mm_ref.resident_pages();
+    let swap = swap_pages_for_mm(&mm_ref, swap_ctx);
+    let pgtables = mm_ref.pgtables_pages();
+    let mem_pages = rss.saturating_add(swap).saturating_add(pgtables);
+    Some((
+        mem_pages as i64 + g.oom_score_adj as i64 * (total / 1000),
+        rss,
+    ))
 }
 
 /// `/proc/<pid>/oom_score` (Linux's `proc_oom_score`): the badness against the host's RAM plus swap,
@@ -405,7 +539,8 @@ fn badness(k: &Kernel, g: &ThreadGroup, total: i64) -> Option<(i64, u64)> {
 /// picked.
 pub(crate) fn proc_score(k: &Kernel, g: &ThreadGroup) -> u64 {
     let total = (appine_hal::ram_and_swap() / PAGE_SIZE).max(1) as i64;
-    badness(k, g, total).map_or(0, |(b, _)| {
+    let swap_ctx = swap_context(k);
+    badness_with(k, g, total, swap_ctx).map_or(0, |(b, _)| {
         ((1000 + b * 1000 / total) * 2 / 3).max(0) as u64
     })
 }
@@ -414,8 +549,8 @@ pub(crate) fn proc_score(k: &Kernel, g: &ThreadGroup) -> u64 {
 /// is the `memory.max` of the cgroup it is in, so this writes as Linux's memcg OOM does (the first
 /// line of `mem_cgroup_print_oom_meminfo`, `dump_oom_summary`, `__oom_kill_process`), and `dmesg`
 /// shows who was ended and why. The call stack, the table of processes and the like are left out.
-/// Resident pages are split by kind of mapping (counted by host memory, as smaps does), and there
-/// is no page-table count (`VmPTE` is 0 too).
+/// Resident pages are split by kind of mapping (counted by host memory, as smaps does), and
+/// `pgtables` reports the address space's allocated soft-MMU page tables.
 fn log_kill(
     k: &Kernel,
     g: &ThreadGroup,
@@ -450,15 +585,17 @@ fn log_kill(
 }
 
 /// The line about ending one process (`__oom_kill_process`). Resident pages are split by kind of
-/// mapping (counted by host memory, as smaps does), and there is no page-table count.
+/// mapping (counted by host memory, as smaps does), and `pgtables` reports allocated soft-MMU
+/// page tables.
 fn log_killed(k: &Kernel, g: &ThreadGroup, task: Option<&crate::task::Task>) {
     let comm = crate::pseudo::comm_str(task, g.tgid);
     let (pid, uid) = (g.tgid, g.cred.ruid);
-    let (mut vm, mut anon, mut file, mut shmem) = (0, 0, 0, 0);
+    let (mut vm, mut anon, mut file, mut shmem, mut pgtables) = (0, 0, 0, 0, 0);
     if let Some(t) = task {
         let res = t.res.borrow();
         let mm = res.mm.borrow();
         vm = mm.size() / 1024;
+        pgtables = mm.pgtables_bytes() / 1024;
         for r in mm.regions() {
             let pages = mm.resident_in(r.start, r.end - r.start);
             match (r.file, r.shared) {
@@ -474,7 +611,7 @@ fn log_killed(k: &Kernel, g: &ThreadGroup, task: Option<&crate::task::Task>) {
         format_args!(
             "Memory cgroup out of memory: Killed process {pid} ({comm}) total-vm:{vm}kB, \
              anon-rss:{anon}kB, file-rss:{file}kB, shmem-rss:{shmem}kB, UID:{uid} \
-             pgtables:0kB oom_score_adj:{}",
+             pgtables:{pgtables}kB oom_score_adj:{}",
             g.oom_score_adj
         ),
     );
@@ -979,5 +1116,137 @@ mod tests {
         );
         assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.oom, 0);
         assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.oom_kill, 0);
+    }
+
+    #[test]
+    fn oom_badness_includes_pgtables_and_log_reports_real_pgtables() {
+        let mut k = Kernel::new(Tier::Interpreter);
+        let mm = Mm::new().into_shared();
+        let _addr = dirty_anon(&mm, 8, 0x22);
+        let expected_pgtables_pages = mm.borrow().pgtables_pages();
+        let expected_pgtables_kb = mm.borrow().pgtables_bytes() / 1024;
+        assert!(expected_pgtables_pages >= 4);
+
+        let (victim, _task, _cpu) = add_process(&mut k, 60, INIT, ROOT, mm.clone());
+        let (points, rss) = badness_with(&k, &victim.borrow(), 100_000, SwapContext::Zero).unwrap();
+        assert_eq!(points, (rss + expected_pgtables_pages) as i64);
+
+        out_of_memory(&mut k, (ROOT, 1 << 20, 64 << 10));
+        let log = String::from_utf8(k.klog.borrow_mut().read_all(4096, false)).unwrap();
+        let needle = format!("pgtables:{expected_pgtables_kb}kB");
+        assert!(
+            log.contains(&needle),
+            "expected OOM kill log to contain {needle}, got:\n{log}"
+        );
+    }
+
+    #[test]
+    fn fallback_swap_estimation_safety_and_proportional_bounds() {
+        // 1. Pure proportional bound properties
+        assert_eq!(estimate_swap_share(100, 100, 0), 0);
+        assert_eq!(estimate_swap_share(0, 100, 50), 0);
+        assert_eq!(estimate_swap_share(30, 50, 100), 30);
+        assert_eq!(estimate_swap_share(20, 50, 100), 20);
+        // When total candidates exceed host VmSwap, shares scale proportionally and sum <= host_swap.
+        let s1 = estimate_swap_share(300, 400, 100);
+        let s2 = estimate_swap_share(100, 400, 100);
+        assert_eq!((s1, s2), (75, 25));
+        assert!(s1 + s2 <= 100);
+
+        // 2. End-to-end victim selection with fallback swap attribution:
+        //    - Process A maps 128 pages of private anon RW (eagerly mapped soft PTEs, untouched on
+        //      host so mincore reports non-resident, simulating swapped-out pages).
+        //    - Process B dirties 16 pages (resident) and calls MADV_DONTNEED on another 128 pages
+        //      (must NOT count as swapped!).
+        //    - With host_swap == 0, B beats A.
+        //    - With host_swap == 128 pages, A beats B because A gets attributed the host swap
+        //      while B's MADV_DONTNEED pages contribute 0 candidates.
+        let mut k = Kernel::new(Tier::Interpreter);
+        let rw = prot::READ | prot::WRITE;
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+
+        let mm_a = Mm::new().into_shared();
+        let _a = mm_a
+            .borrow_mut()
+            .mmap(0, 128 * PAGE_SIZE, rw, anon, None)
+            .unwrap();
+        assert_eq!(mm_a.borrow().resident_pages(), 0);
+        assert_eq!(mm_a.borrow().swappable_nonresident_pages(), 128);
+
+        let mm_b = Mm::new().into_shared();
+        let _b_res = dirty_anon(&mm_b, 16, 0x11);
+        let b_disc = dirty_anon(&mm_b, 128, 0x22);
+        let (_, res) = mm_b
+            .borrow_mut()
+            .discard_range(b_disc, 128 * PAGE_SIZE, false);
+        res.unwrap();
+        assert_eq!(mm_b.borrow().swappable_nonresident_pages(), 0);
+
+        let (proc_a, _ta, _ca) = add_process(&mut k, 70, INIT, ROOT, mm_a);
+        let (proc_b, _tb, _cb) = add_process(&mut k, 71, INIT, ROOT, mm_b);
+
+        // Host VmSwap == 0 -> fallback attributes 0 swap -> resident B wins over non-resident A.
+        let ctx_zero = fallback_swap_context(&k, 0);
+        assert_eq!(ctx_zero, SwapContext::Zero);
+        let (picked_zero, _) = select_with(&k, &[], (ROOT, 1 << 30), ctx_zero).unwrap();
+        assert!(Rc::ptr_eq(&picked_zero, &proc_b));
+
+        // Host VmSwap == 128 pages -> A receives full attribution (B's MADV_DONTNEED is 0) -> A wins.
+        let ctx_swap = fallback_swap_context(&k, 128);
+        assert_eq!(
+            ctx_swap,
+            SwapContext::Fallback {
+                host_swap_pages: 128,
+                total_cand: 128,
+            }
+        );
+        let (picked_swap, _) = select_with(&k, &[], (ROOT, 1 << 30), ctx_swap).unwrap();
+        assert!(Rc::ptr_eq(&picked_swap, &proc_a));
+    }
+
+    #[test]
+    fn memory_high_records_event_reclaims_and_does_not_kill() {
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        let mut k = shared.lock();
+        let cg = k
+            .cgroups
+            .mkdir(ROOT, b"high_cg", &crate::cred::Cred::root(), 0o755)
+            .unwrap();
+        // Enable memory controller (1 << 3) on root.
+        k.cgroups.map.get_mut(&ROOT).unwrap().subtree_control = 1 << 3;
+        k.cgroups
+            .map
+            .get_mut(&cg)
+            .unwrap()
+            .values
+            .insert(b"memory.high", (16 * PAGE_SIZE).to_string());
+
+        let mm = Mm::new().into_shared();
+        let _addr = dirty_anon(&mm, 32, 0x3c);
+        let (proc_g, _task, _cpu) = add_process(&mut k, 80, INIT, cg, mm.clone());
+
+        let next = check(&mut k, &shared);
+        assert!(next.is_some());
+        assert!(
+            proc_g.borrow().exiting.is_none(),
+            "memory.high must not OOM-kill processes"
+        );
+        assert_eq!(k.cgroups.get(cg).unwrap().mem_events.high, 1);
+        assert_eq!(k.cgroups.get(cg).unwrap().mem_events_local.high, 1);
+        assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events.high, 1);
+        assert_eq!(k.cgroups.get(ROOT).unwrap().mem_events_local.high, 0);
+        assert_eq!(k.cgroups.get(cg).unwrap().mem_events.oom, 0);
+
+        // Steady usage on the next check does not spam `high` events.
+        k.oom.recheck();
+        let _ = check(&mut k, &shared);
+        assert_eq!(k.cgroups.get(cg).unwrap().mem_events.high, 1);
+
+        // Growing further above memory.high records another `high` event.
+        let _more = dirty_anon(&mm, 16, 0x4d);
+        k.oom.recheck();
+        let _ = check(&mut k, &shared);
+        assert_eq!(k.cgroups.get(cg).unwrap().mem_events.high, 2);
+        assert!(proc_g.borrow().exiting.is_none());
     }
 }

@@ -38,7 +38,7 @@ static unsigned level_index(uint64_t gva, int level)
     return (unsigned)(gva >> level_shift(level)) & (LEVEL_ENTRIES - 1);
 }
 
-static uintptr_t *new_table(void)
+static uintptr_t *alloc_table(struct appine_mmu *mmu)
 {
     uintptr_t *p = calloc(LEVEL_ENTRIES, sizeof(uintptr_t));
     if (UNLIKELY((uintptr_t)p & (PTE_SUPER | PTE_PROT_MASK))) {
@@ -47,8 +47,10 @@ static uintptr_t *new_table(void)
         if (posix_memalign(&aligned, 16, LEVEL_ENTRIES * sizeof(uintptr_t)) != 0)
             return NULL;
         memset(aligned, 0, LEVEL_ENTRIES * sizeof(uintptr_t));
-        return (uintptr_t *)aligned;
+        p = aligned;
     }
+    if (p)
+        __atomic_fetch_add(&mmu->tables, 1, __ATOMIC_RELAXED);
     return p;
 }
 
@@ -75,24 +77,35 @@ static void free_table(uintptr_t *table, int level)
 }
 
 /*
- * Return the L2 slot covering gva (walking levels 0 and 1). If an intermediate table is missing:
- * create it when alloc is true; otherwise return NULL and set *hole_end to the end of the range
- * from gva that has no entries at all (aligned to the missing level, at most 2^48).
+ * Return the L2 slot covering gva (walking levels 0 and 1) without allocating. If an intermediate
+ * table is missing, return NULL and set *hole_end to the end of the range from gva that has no
+ * entries at all (aligned to the missing level, at most 2^48).
  */
-static uintptr_t *l2_slot_for(const struct appine_mmu *mmu, uint64_t gva, bool alloc,
-                              uint64_t *hole_end)
+static uintptr_t *l2_slot_find(const struct appine_mmu *mmu, uint64_t gva, uint64_t *hole_end)
 {
     uintptr_t *table = mmu->root;
     for (int level = 0; level < LEVELS - 2; level++) {
         uintptr_t *slot = &table[level_index(gva, level)];
         uintptr_t next = load_entry(slot);
         if (!next) {
-            if (!alloc) {
-                unsigned shift = level_shift(level);
-                *hole_end = ((gva >> shift) + 1) << shift;
-                return NULL;
-            }
-            uintptr_t *fresh = new_table();
+            unsigned shift = level_shift(level);
+            *hole_end = ((gva >> shift) + 1) << shift;
+            return NULL;
+        }
+        table = (uintptr_t *)next;
+    }
+    return &table[level_index(gva, LEVELS - 2)];
+}
+
+/* Return the L2 slot covering gva, allocating missing intermediate tables along the way. */
+static uintptr_t *l2_slot_alloc(struct appine_mmu *mmu, uint64_t gva)
+{
+    uintptr_t *table = mmu->root;
+    for (int level = 0; level < LEVELS - 2; level++) {
+        uintptr_t *slot = &table[level_index(gva, level)];
+        uintptr_t next = load_entry(slot);
+        if (!next) {
+            uintptr_t *fresh = alloc_table(mmu);
             if (!fresh)
                 return NULL;
             next = (uintptr_t)fresh;
@@ -108,9 +121,9 @@ static uintptr_t *l2_slot_for(const struct appine_mmu *mmu, uint64_t gva, bool a
  * then publish it atomically. Concurrent walkers see either the old superpage or the fully
  * populated L3 table with identical mappings.
  */
-static uintptr_t *demote_l2(uintptr_t *l2_slot, uintptr_t super)
+static uintptr_t *demote_l2(struct appine_mmu *mmu, uintptr_t *l2_slot, uintptr_t super)
 {
-    uintptr_t *l3 = new_table();
+    uintptr_t *l3 = alloc_table(mmu);
     if (!l3)
         return NULL;
     uintptr_t base = super & ~(uintptr_t)PAGE_MASK;
@@ -122,18 +135,18 @@ static uintptr_t *demote_l2(uintptr_t *l2_slot, uintptr_t super)
 }
 
 /* Return an L3 table for l2_slot, allocating one if empty or demoting if it is a superpage. */
-static uintptr_t *ensure_l3(uintptr_t *l2_slot)
+static uintptr_t *ensure_l3(struct appine_mmu *mmu, uintptr_t *l2_slot)
 {
     uintptr_t cur = load_entry(l2_slot);
     if (!cur) {
-        uintptr_t *fresh = new_table();
+        uintptr_t *fresh = alloc_table(mmu);
         if (!fresh)
             return NULL;
         store_entry(l2_slot, (uintptr_t)fresh);
         return fresh;
     }
     if (cur & PTE_SUPER)
-        return demote_l2(l2_slot, cur);
+        return demote_l2(mmu, l2_slot, cur);
     return (uintptr_t *)cur;
 }
 
@@ -155,12 +168,20 @@ struct appine_mmu *appine_mmu_new(void)
     struct appine_mmu *mmu = calloc(1, sizeof(*mmu));
     if (!mmu)
         return NULL;
-    mmu->root = new_table();
+    mmu->root = alloc_table(mmu);
     if (!mmu->root) {
         free(mmu);
         return NULL;
     }
     return mmu;
+}
+
+uint64_t appine_mmu_table_bytes(const struct appine_mmu *mmu)
+{
+    if (!mmu)
+        return 0;
+    return (uint64_t)__atomic_load_n(&mmu->tables, __ATOMIC_RELAXED) *
+           (LEVEL_ENTRIES * sizeof(uintptr_t));
 }
 
 /* Cap on retired empty L3 tables kept until appine_mmu_free (bounds memory under adversarial
@@ -216,7 +237,7 @@ static int store_range(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_
         return APPINE_EINVAL;
     uint64_t end = gva + len;
     for (uint64_t va = gva; va < end;) {
-        uintptr_t *l2_slot = l2_slot_for(mmu, va, true, NULL);
+        uintptr_t *l2_slot = l2_slot_alloc(mmu, va);
         if (!l2_slot)
             return APPINE_ENOMEM;
         uint64_t stop = leaf_end(va, end);
@@ -237,7 +258,7 @@ static int store_range(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_
             va = stop;
             continue;
         }
-        uintptr_t *table = ensure_l3(l2_slot);
+        uintptr_t *table = ensure_l3(mmu, l2_slot);
         if (!table)
             return APPINE_ENOMEM;
         for (; va < stop; va += APPINE_PAGE_SIZE) {
@@ -265,7 +286,7 @@ int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
         return APPINE_EINVAL;
     uint64_t end = gva + len;
     for (uint64_t va = gva; va < end;) {
-        uintptr_t *l2_slot = l2_slot_for(mmu, va, false, &va);
+        uintptr_t *l2_slot = l2_slot_find(mmu, va, &va);
         if (!l2_slot)
             continue;
         uint64_t stop = leaf_end(va, end);
@@ -281,7 +302,7 @@ int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
                 va = stop;
                 continue;
             }
-            table = demote_l2(l2_slot, cur);
+            table = demote_l2(mmu, l2_slot, cur);
             if (!table)
                 return APPINE_ENOMEM;
         } else {
@@ -299,7 +320,7 @@ int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint3
         return APPINE_EINVAL;
     uint64_t end = gva + len;
     for (uint64_t va = gva; va < end;) {
-        uintptr_t *l2_slot = l2_slot_for(mmu, va, false, &va);
+        uintptr_t *l2_slot = l2_slot_find(mmu, va, &va);
         if (!l2_slot)
             continue;
         uint64_t stop = leaf_end(va, end);
@@ -315,7 +336,7 @@ int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint3
                 va = stop;
                 continue;
             }
-            table = demote_l2(l2_slot, cur);
+            table = demote_l2(mmu, l2_slot, cur);
             if (!table)
                 return APPINE_ENOMEM;
         } else {
@@ -337,7 +358,7 @@ int appine_mmu_move(struct appine_mmu *mmu, uint64_t from, uint64_t to, uint64_t
         return APPINE_EINVAL;
     uint64_t end = from + len;
     for (uint64_t va = from; va < end;) {
-        uintptr_t *l2_slot = l2_slot_for(mmu, va, false, &va);
+        uintptr_t *l2_slot = l2_slot_find(mmu, va, &va);
         if (!l2_slot)
             continue;
         uint64_t stop = leaf_end(va, end);
@@ -349,7 +370,7 @@ int appine_mmu_move(struct appine_mmu *mmu, uint64_t from, uint64_t to, uint64_t
         if ((cur & PTE_SUPER) && (va & MMU_SUPER_MASK) == 0 && (stop - va) == LEAF_SPAN) {
             uint64_t dst = to + (va - from);
             if ((dst & MMU_SUPER_MASK) == 0) {
-                uintptr_t *dst_l2 = l2_slot_for(mmu, dst, true, NULL);
+                uintptr_t *dst_l2 = l2_slot_alloc(mmu, dst);
                 if (!dst_l2)
                     return APPINE_ENOMEM;
                 uintptr_t dcur = load_entry(dst_l2);
@@ -361,7 +382,7 @@ int appine_mmu_move(struct appine_mmu *mmu, uint64_t from, uint64_t to, uint64_t
                 }
             }
         }
-        uintptr_t *table = (cur & PTE_SUPER) ? demote_l2(l2_slot, cur) : (uintptr_t *)cur;
+        uintptr_t *table = (cur & PTE_SUPER) ? demote_l2(mmu, l2_slot, cur) : (uintptr_t *)cur;
         if (!table)
             return APPINE_ENOMEM;
         for (; va < stop; va += APPINE_PAGE_SIZE) {
@@ -370,10 +391,10 @@ int appine_mmu_move(struct appine_mmu *mmu, uint64_t from, uint64_t to, uint64_t
             if (!v)
                 continue;
             uint64_t dst = to + (va - from);
-            uintptr_t *dst_l2 = l2_slot_for(mmu, dst, true, NULL);
+            uintptr_t *dst_l2 = l2_slot_alloc(mmu, dst);
             if (!dst_l2)
                 return APPINE_ENOMEM;
-            uintptr_t *target = ensure_l3(dst_l2);
+            uintptr_t *target = ensure_l3(mmu, dst_l2);
             if (!target)
                 return APPINE_ENOMEM;
             store_entry(&target[level_index(dst, LEVELS - 1)], v);
@@ -389,7 +410,7 @@ uint64_t appine_mmu_next_present(const struct appine_mmu *mmu, uint64_t gva, uin
     if (end > limit)
         end = limit;
     for (uint64_t va = gva & ~(uint64_t)PAGE_MASK; va < end;) {
-        uintptr_t *l2_slot = l2_slot_for(mmu, va, false, &va);
+        uintptr_t *l2_slot = l2_slot_find(mmu, va, &va);
         if (!l2_slot)
             continue;
         uint64_t stop = leaf_end(va, end);

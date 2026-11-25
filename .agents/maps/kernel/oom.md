@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: align `statm` and `status` `VmData`/`VmExe`/`VmLib` with Linux 6.1 in `kernel/procfs`)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: page-table and swap attribution in OOM scoring, `VmPTE`/`VmSwap`/`pgtables`, and `memory.high` event/reclaim handling)
 
 ## Responsibilities
 
@@ -39,18 +39,20 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   deadline (`None`: at the next wake, at start, after a `memory.max` write, or while every task
   sleeps), the last victim and when it was picked, the victims that outlived their second
   (`stuck`), and the next code-view release.
-- `Events` — a cgroup's `memory.events` counters (`max`, `oom`, `oom_kill`, `oom_group_kill`),
-  kept hierarchical and local.
+- `Events` — a cgroup's `memory.events` counters (`high`, `max`, `oom`, `oom_kill`,
+  `oom_group_kill`), kept hierarchical and local.
 - Intervals: 20 ms, 5 ms above 3/4 of a limit, at least 20 times the measurement's own time; 1 s
   victim timeout and code-view interval.
 
 ## Public entry points
 
 - **Measures**: `resident_in`, `cow_shared`, `pagemap`, `stack_bytes`, `resident_pages`,
-  `resident_split`, `peak_resident_pages`; `Usage::add` and `pages` (child cgroups).
+  `resident_split`, `peak_resident_pages`, `pgtables_bytes`, `pgtables_pages`, `exact_swap_pages`,
+  `swappable_nonresident_pages`; `Usage::add` and `pages` (child cgroups).
 - **OOM killer**: `oom::check` and `oom::unmap_code_views` (timer thread), `out_of_memory` (also
-  from a lowered cgroup `memory.max`), `Oom::{measure, recheck}`, `default_limit`, `app_memory`;
-  `Shared::resume_checks` from the run loop; `oom::proc_score` for `/proc/<pid>/oom_score`.
+  from a lowered cgroup `memory.max`), `handle_memory_high` (when usage exceeds `memory.high`),
+  `Oom::{measure, recheck}`, `default_limit`, `app_memory`; `Shared::resume_checks` from the run
+  loop; `oom::proc_score` for `/proc/<pid>/oom_score`.
 - **process_mrelease**: the syscall, and `Mm::release` on another process's address space.
 
 ## Data flow / lifecycle
@@ -109,14 +111,17 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   its processes' address spaces, each address space once (a vfork child and its parent,
   `CLONE_VM` processes).
 - `check` runs under the BKL each time the timer thread wakes. With no root limit and no cgroup
-  limit it does nothing; otherwise it measures every 20 ms, every 5 ms once a scope is above 3/4 of
-  its limit, and never more often than 20 times the measurement's own time. The root is measured
-  first (`measure_root`): when root usage exceeds `k.oom.limit`, it trims unused Tier 1 translations
-  from the pool (`appine_engine::trim_dbt_pool`, which only briefly takes the engine's leaf
-  `pool.lock` and unmaps evicted instances outside it, never acquiring the BKL) and re-measures,
-  sparing guest processes if trimming brings root usage back within the limit. Cgroups stop at the
-  first scope over its limit, so one scope is handled per round. A `memory.max` write forces an
-  immediate round.
+  `memory.max` or `memory.high` limit it does nothing; otherwise it measures every 20 ms, every
+  5 ms once a scope is above 3/4 of its limit, and never more often than 20 times the measurement's
+  own time. The root is measured first (`measure_root`): when root usage exceeds `k.oom.limit`, it
+  trims unused Tier 1 translations from the pool (`appine_engine::trim_dbt_pool`, which only briefly
+  takes the engine's leaf `pool.lock` and unmaps evicted instances outside it, never acquiring the
+  BKL) and re-measures, sparing guest processes if trimming brings root usage back within the limit.
+  Child cgroup measurements are deduplicated across `memory.max` and `memory.high` within a round.
+  Exceeding `memory.high` (when `UNMAPPING == 0`, on new crossings or continued growth) records a
+  `high` event and runs `handle_memory_high` (`trim_dbt_pool` and `unmap_written_code`) without
+  killing any process. `memory.max` checks stop at the first scope over its limit, so one OOM
+  scope is handled per round. Writing `memory.max` or `memory.high` forces an immediate round.
 - When every task is sleeping (a thread in `Cx::unlocked` counts as sleeping), `check` stops
   through `Shared::stop_checks`: it sets `checks_idle` and then looks at the tasks again, clearing
   the flag and going on if one woke meanwhile. Every guest thread clears its `sleeping` flag and
@@ -131,11 +136,20 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   processes outside the over-limit cgroup, zombies, a vfork child whose parent thread still waits
   for it with the same address space (Linux's `in_vfork`: ending it frees nothing, and with its
   parent's memory and a higher tgid it would win), and every victim that outlived its second and
-  still has threads (kept in a list until it exits). The score (`badness`, Linux's `oom_badness`)
-  is `resident_pages + adj * (total / 1000)`, unclamped, with `total` the larger of RAM and the
-  limit for the root, the cgroup's limit otherwise; on equal scores the later (higher tgid) wins,
-  as `oom_evaluate_task` keeps the last one not below the best. With no eligible process nothing
-  is killed or logged.
+  still has threads (kept in a list until it exits). The score (`badness_with`, Linux's
+  `oom_badness`) is `resident_pages + swap_pages + pgtables_pages + adj * (total / 1000)`,
+  unclamped, with `total` the larger of RAM and the limit for the root, the cgroup's limit
+  otherwise; on equal scores the later (higher tgid) wins, as `oom_evaluate_task` keeps the last
+  one not below the best. `pgtables_pages` comes from `appine_engine::Mmu::table_pages` (also
+  reported in `/proc/<pid>/status` `VmPTE`, OOM kill log `pgtables`, and `memory.stat`
+  `pagetables`). `swap_pages` uses exact `/proc/self/pagemap` swap bits (`Mm::exact_swap_pages`,
+  also reported in `VmSwap`) when pagemap is readable; when pagemap is unreadable (SELinux-enforced
+  Android hosts), it is 0 whenever host `VmSwap == 0`, and otherwise distributes host `VmSwap`
+  proportionally across all live guest `Mm`s' `swappable_nonresident_pages` (present soft-MMU
+  entries in written private anonymous VMAs plus CoW-borrowed pages that `mincore` reports
+  non-resident, capped so total attributed swap never exceeds host `VmSwap`, and excluding
+  unmapped, never-written, file-backed, and `MADV_DONTNEED`-discarded pages whose soft PTEs are
+  zapped by `Mm::discard_range`). With no eligible process nothing is killed or logged.
 - `/proc/<pid>/oom_score` (`proc_score`, Linux's `proc_oom_score`) is the same badness with
   `total` the host's RAM plus swap, as `(1000 + badness * 1000 / total) * 2 / 3` (0 to 2000), and
   0 for the processes `select` never takes (init, -1000, no live thread, a vfork child).
@@ -219,13 +233,13 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 
 ## Confirmed bugs / technical debt
 
-- **OOM scores omit swap and page tables:** a mostly swapped-out process ranks low although the
-  root's usage counts `VmSwap` (Linux adds swap entries and page-table pages to `oom_badness`).
-  Host `/proc/self/status`'s `VmSwap` is aggregate for the whole app process and cannot be
-  attributed per guest process, `Mm::resident_pages` uses `mincore` (which excludes swapped-out
-  pages), and `/proc/self/pagemap` is unreadable on SELinux-enforced Android hosts where zram swap
-  matters; `appine_engine::Mmu` uses on-demand 2 MiB superpages and exposes no allocated page-table
-  count (`VmPTE` and OOM `pgtables` are 0).
+- **SELinux-blocked pagemap swap attribution is heuristic:** on Android hosts where SELinux blocks
+  `/proc/self/pagemap` and host `VmSwap > 0`, `mincore` cannot distinguish swapped-out private
+  anonymous pages from never-touched pages inside an eagerly-mapped (<= 1 MiB) or 2 MiB
+  demand-filled written private anonymous span. OOM scoring mitigates this by bounding and scaling
+  per-`Mm` candidates against host `VmSwap` (returning 0 when `VmSwap == 0` and excluding
+  unmapped, never-written, file, and `MADV_DONTNEED`-zapped pages), while `/proc/<pid>/status`
+  `VmSwap` reports 0 when pagemap is unreadable.
 
 ## Open questions
 

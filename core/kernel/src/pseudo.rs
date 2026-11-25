@@ -1498,11 +1498,12 @@ impl Pseudo for View<'_> {
                     .get(name)
                     .map(|&c| Cgroup(c, b"", 0))
                     .or_else(|| {
-                        self.k
-                            .cgroups
-                            .files(*id)
-                            .find(|(f, _)| *f == name)
-                            .map(|(f, generation)| Cgroup(*id, f, generation))
+                        self.k.cgroups.files(*id).find(|(f, _)| *f == name).map(
+                            |(f, generation)| {
+                                self.k.cgroups.file_looked_up(*id, f);
+                                Cgroup(*id, f, generation)
+                            },
+                        )
                     })
             }),
             SysCpu(n, path) => tree_lookup(&CPU_FILES, path, name)
@@ -3374,9 +3375,12 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Resu
         )
         .unwrap();
         // Linux 6.1's task_mem: VmData (private writable non-stack), VmStk (grows-down),
-        // VmExe (code span capped by exec_vm), VmLib (remaining exec_vm); no swap or PTE count.
+        // VmExe (code span capped by exec_vm), VmLib (remaining exec_vm), VmPTE (allocated
+        // soft-MMU page tables) and VmSwap (exact pagemap swap when readable, else 0).
         let exe = layout.code_span.min(layout.exec);
         let lib = layout.exec.saturating_sub(exe);
+        let pte_kb = mm.pgtables_bytes() / 1024;
+        let swap_kb = mm.exact_swap_pages().unwrap_or(0) * 4;
         writeln!(
             s,
             "VmData:\t{:>8} kB\nVmStk:\t{:>8} kB\nVmExe:\t{:>8} kB\nVmLib:\t{:>8} kB\nVmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB",
@@ -3384,8 +3388,8 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Resu
             layout.stack / 1024,
             exe / 1024,
             lib / 1024,
-            0,
-            0,
+            pte_kb,
+            swap_kb,
         )
         .unwrap();
     }
@@ -3419,9 +3423,12 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Resu
             .map_or(g.leader_no_new_privs, |t| t.no_new_privs.get()) as u8
     )
     .unwrap();
-    // The thread's affinity (the main thread's for the process), within the online CPUs
-    let online = u64::MAX >> (64 - cpus().clamp(1, 64));
-    let allowed = task.as_ref().map_or(u64::MAX, |t| t.affinity.get()) & online;
+    // The thread's affinity (the main thread's for the process), clamped to its cgroup's effective
+    // cpuset (within the online CPUs)
+    let allowed = match task.as_ref() {
+        Some(t) => crate::cgroup::clamp_affinity(ps.k, g.cgroup, t.affinity.get()),
+        None => crate::cgroup::effective_cpus(ps.k, g.cgroup),
+    };
     let allowed: Vec<usize> = (0..64).filter(|b| allowed >> b & 1 != 0).collect();
     write!(s, "Cpus_allowed:\t{}", cpu_mask_of(&allowed)).unwrap();
     write!(s, "Cpus_allowed_list:\t{}", cpu_list_of(&allowed)).unwrap();

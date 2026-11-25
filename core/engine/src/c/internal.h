@@ -133,6 +133,8 @@ void appine_unmap_code(uint32_t *code, size_t bytes, intptr_t rw_delta);
 
 struct appine_mmu {
     uintptr_t *root;
+    /* Total allocated 4 KiB radix tables (root, intermediate, active and retired L3 tables). */
+    size_t tables;
     /* Empty L3 tables replaced by L2 superpages; kept alive until appine_mmu_free so concurrent
      * walkers that already loaded the pointer never read freed memory. */
     uintptr_t **retired;

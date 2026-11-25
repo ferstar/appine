@@ -752,11 +752,12 @@ pub(crate) fn key_of(node: &Node) -> Option<Ino> {
     }
 }
 
-/// A notifying cgroup2 file (inotify key `key`, its directory's `dir`) changed: `IN_MODIFY` to
-/// the watches on the directory (with the name) and on the file, as `kernfs_notify` reports it.
-pub(crate) fn kernfs_modified(k: &Kernel, key: Ino, dir: Ino, name: &[u8]) {
+/// A notifying cgroup2 file (inotify key `key`, and optionally its directory's `(dir, name)` when
+/// the child file's dentry has been instantiated) changed: `IN_MODIFY` to the watches on the file
+/// and, when instantiated, on its directory, matching Linux's `kernfs_notify`.
+pub(crate) fn kernfs_modified(k: &Kernel, key: Ino, dir: Option<(Ino, &[u8])>) {
     if let Ok(mut r) = k.inotify.try_borrow_mut() {
-        r.notify(key, Some((dir, name)), IN_MODIFY, false);
+        r.notify(key, dir, IN_MODIFY, false);
     }
 }
 
@@ -1392,5 +1393,50 @@ mod tests {
             events(&i),
             vec![(d_wd, IN_ATTRIB, b"f".to_vec()), (f_wd, IN_ATTRIB, vec![]),]
         );
+    }
+
+    #[test]
+    fn cgroup_dir_watch_skips_uninstantiated_child_events_on_inherited_freeze() {
+        let shared = crate::kernel::Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let cred = crate::cred::Cred::root();
+        let pid_ns = crate::pidns::PidNs::init();
+        let writer = crate::cgroup::Writer {
+            tid: 0,
+            pid_ns: &pid_ns,
+            ns_root: crate::cgroup::ROOT,
+            opener: &cred,
+            cred: &cred,
+        };
+        let parent = k
+            .cgroups
+            .mkdir(crate::cgroup::ROOT, b"p", &cred, 0o755)
+            .unwrap();
+        let child = k.cgroups.mkdir(parent, b"c", &cred, 0o755).unwrap();
+
+        // Watch child directory without ever looking up child/cgroup.events.
+        let i = Rc::new(RefCell::new(Inotify::default()));
+        let wd = watch(
+            &mut k.inotify.borrow_mut(),
+            &i,
+            crate::cgroup::key(child, b""),
+            IN_MODIFY,
+        );
+        crate::cgroup::observe_all(&mut k, child);
+
+        // Inherited freeze from parent must NOT deliver IN_MODIFY for un-looked-up child/cgroup.events.
+        crate::cgroup::write(&mut k, &writer, (parent, b"cgroup.freeze"), b"1\n").unwrap();
+        crate::cgroup::notify_changes(&mut k);
+        assert!(
+            events(&i).is_empty(),
+            "directory watch must not receive inherited freeze event before child file is looked up"
+        );
+
+        // Once child/cgroup.events is looked up (dentry instantiated), subsequent inherited thaw
+        // delivers IN_MODIFY to the directory watch.
+        k.cgroups.file_looked_up(child, b"cgroup.events");
+        crate::cgroup::write(&mut k, &writer, (parent, b"cgroup.freeze"), b"0\n").unwrap();
+        crate::cgroup::notify_changes(&mut k);
+        assert_eq!(events(&i), vec![(wd, IN_MODIFY, b"cgroup.events".to_vec())]);
     }
 }

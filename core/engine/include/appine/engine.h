@@ -239,6 +239,8 @@ enum {
 
 struct appine_mmu *appine_mmu_new(void);
 void appine_mmu_free(struct appine_mmu *mmu);
+/* Total bytes of allocated page tables (root, intermediate, active and retired L3 tables) */
+uint64_t appine_mmu_table_bytes(const struct appine_mmu *mmu);
 
 /*
  * Maps guest [gva, gva + len) to host [host, host + len), replacing existing mappings. gva, host

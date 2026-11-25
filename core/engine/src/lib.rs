@@ -171,6 +171,7 @@ impl CpuState {
 unsafe extern "C" {
     fn appine_mmu_new() -> *mut RawMmu;
     fn appine_mmu_free(mmu: *mut RawMmu);
+    fn appine_mmu_table_bytes(mmu: *const RawMmu) -> u64;
     fn appine_mmu_map(mmu: *mut RawMmu, gva: u64, host: *mut c_void, len: u64, prot: u32) -> c_int;
     fn appine_mmu_unmap(mmu: *mut RawMmu, gva: u64, len: u64) -> c_int;
     fn appine_mmu_protect(mmu: *mut RawMmu, gva: u64, len: u64, prot: u32) -> c_int;
@@ -375,6 +376,17 @@ impl Mmu {
     /// count).
     pub fn translate(&self, gva: u64, required_prot: u32) -> Option<NonNull<u8>> {
         NonNull::new(unsafe { appine_mmu_translate(self.raw.as_ptr(), gva, required_prot) }.cast())
+    }
+
+    /// Total bytes of allocated soft-MMU page tables (root, intermediate, active and retired L3
+    /// tables; grows monotonically until the `Mmu` is dropped).
+    pub fn table_bytes(&self) -> u64 {
+        unsafe { appine_mmu_table_bytes(self.raw.as_ptr()) }
+    }
+
+    /// Allocated soft-MMU page tables in 4 KiB pages.
+    pub fn table_pages(&self) -> u64 {
+        self.table_bytes() / PAGE_SIZE
     }
 }
 
