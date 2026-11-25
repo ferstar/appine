@@ -976,12 +976,16 @@ static void test_tty_device_identity(void)
         CHECK(S_ISCHR(pts_st.st_mode), "pts slave is char dev");
         CHECK(major(pts_st.st_rdev) == 136 && minor(pts_st.st_rdev) == ptn,
               "pts slave rdev 136:%u", ptn);
+        unsigned int dev;
+        CHECK(ioctl(m, TIOCGDEV, &dev) == 0 && dev == pts_st.st_rdev, "master TIOCGDEV");
+        CHECK(ioctl(s, TIOCGDEV, &dev) == 0 && dev == pts_st.st_rdev, "slave TIOCGDEV");
         CHECK(stat("/dev/tty", &tty_path_st) == 0, "stat /dev/tty");
         CHECK(stat("/dev/console", &con_path_st) == 0, "stat /dev/console");
 
         /* Opening /dev/tty preserves /dev/tty's device identity (5:0). */
         int tty_fd = open("/dev/tty", O_RDWR);
         CHECK(tty_fd >= 0, "open /dev/tty");
+        CHECK(ioctl(tty_fd, TIOCGDEV, &dev) == 0 && dev == pts_st.st_rdev, "ctty TIOCGDEV");
         check_ctty_identity(tty_fd, "/dev/tty", 0, &tty_path_st, &pts_st);
 
         /* statx(AT_EMPTY_PATH) agrees with fstat on /dev/tty. */
@@ -1149,6 +1153,13 @@ static void test_tty_exclusive(void)
     wait_exit(child, 0);
 }
 
+static volatile sig_atomic_t break_ttou;
+
+static void on_break_ttou(int sig)
+{
+    break_ttou = sig;
+}
+
 static void test_tty_job_control_ioctls(void)
 {
     /* Test TIOCSCTTY and TIOCSPGRP in a fresh session. */
@@ -1161,6 +1172,29 @@ static void test_tty_job_control_ioctls(void)
 
         /* Session leader calling TIOCSCTTY on its own ctty succeeds. */
         CHECK(ioctl(s, TIOCSCTTY, 0) == 0, "leader TIOCSCTTY own ctty");
+
+        /* PTYs accept break requests on either end. Only the controlling slave checks
+         * the caller's foreground process group. */
+        const int breaks[] = {TIOCSBRK, TIOCCBRK, TCSBRK, TCSBRKP};
+        for (size_t i = 0; i < sizeof(breaks) / sizeof(breaks[0]); i++) {
+            CHECK(ioctl(m, breaks[i], 0) == 0 && ioctl(s, breaks[i], 0) == 0,
+                  "foreground break ioctl %#x", breaks[i]);
+        }
+        pid_t bg = fork();
+        CHECK(bg >= 0, "fork background break caller");
+        if (bg == 0) {
+            struct sigaction sa = {.sa_handler = on_break_ttou};
+            CHECK(sigaction(SIGTTOU, &sa, NULL) == 0, "catch SIGTTOU");
+            CHECK(setpgid(0, 0) == 0, "background setpgid");
+            for (size_t i = 0; i < sizeof(breaks) / sizeof(breaks[0]); i++) {
+                break_ttou = 0;
+                CHECK(ioctl(m, breaks[i], 0) == 0 && !break_ttou, "master break %#x", breaks[i]);
+                CHECK_ERR(ioctl(s, breaks[i], 0), EINTR, "background slave break %#x", breaks[i]);
+                CHECK(break_ttou == SIGTTOU, "slave break %#x sends SIGTTOU", breaks[i]);
+            }
+            _exit(0);
+        }
+        wait_exit(bg, 0);
 
         /* TIOCSPGRP with pgid=0 or nonexistent pgid returns ESRCH. */
         pid_t pg = 0;
@@ -1243,14 +1277,16 @@ static void test_tty_job_control_ioctls(void)
 
 /* ---- 12. PTY slave write clamps ONLCR and XTABS expansion to OUTPUT_MAX ---- */
 
-static void drain_fd(int fd)
+static size_t drain_fd(int fd)
 {
+    size_t total = 0;
     char tmp[4096];
     for (;;) {
         ssize_t n = read(fd, tmp, sizeof(tmp));
-        if (n <= 0) {
-            break;
-        }
+        if (n < 0 && errno == EAGAIN)
+            return total;
+        CHECK(n > 0, "drain master output");
+        total += (size_t)n;
     }
 }
 
@@ -1266,32 +1302,37 @@ static void test_tty_output_clamp(void)
     tio.c_oflag = OPOST | ONLCR | XTABS;
     CHECK(tcsetattr(s, TCSANOW, &tio) == 0, "tcsetattr");
 
+    int queued;
+    CHECK(write(m, "in\n", 3) == 3, "write canonical input");
+    CHECK(ioctl(s, FIONREAD, &queued) == 0 && queued == 3, "slave FIONREAD");
+    CHECK(ioctl(m, FIONREAD, &queued) == 0 && queued == 4, "master FIONREAD counts echo");
+    CHECK(ioctl(m, TIOCOUTQ, &queued) == 0 && queued == 0, "master TIOCOUTQ");
+    queued = -1;
+    CHECK(ioctl(s, TIOCOUTQ, &queued) == 0 && queued == 0, "slave TIOCOUTQ");
+    CHECK(drain_fd(m) == 4, "drain echoed line");
+
     /* Fill with newlines: ONLCR doubles bytes, so output queue must never exceed 65536. */
     char *nls = malloc(65536);
     CHECK(nls != NULL, "malloc");
     memset(nls, '\n', 65536);
     ssize_t w = write(s, nls, 65536);
     CHECK(w == 32768, "ONLCR write expected 32768, got %zd", w);
-    int queued = 0;
-    CHECK(ioctl(m, FIONREAD, &queued) == 0 && queued == 65536,
-          "ONLCR queued expected 65536, got %d", queued);
+    CHECK(ioctl(m, FIONREAD, &queued) == 0 && queued == 4095,
+          "master FIONREAD at capacity, got %d", queued);
 
     /* With 1 byte free, writing '\n' must return EAGAIN and not overshoot 65536. */
     char one;
     CHECK(read(m, &one, 1) == 1, "read 1 byte");
     CHECK_ERR(write(s, "\n", 1), EAGAIN, "ONLCR write with 1 byte free must return EAGAIN");
-    CHECK(ioctl(m, FIONREAD, &queued) == 0 && queued == 65535,
-          "queued must remain 65535, got %d", queued);
+    CHECK(drain_fd(m) == 65535, "remaining ONLCR output");
 
     /* Fill with tabs from column 0: XTABS expands each tab to 8 spaces -> at most 8192 tabs. */
-    drain_fd(m);
     CHECK(write(s, "\r", 1) == 1, "reset column");
-    drain_fd(m);
+    CHECK(drain_fd(m) == 1, "drain carriage return");
     memset(nls, '\t', 65536);
     w = write(s, nls, 65536);
     CHECK(w == 8192, "XTABS write expected 8192, got %zd", w);
-    CHECK(ioctl(m, FIONREAD, &queued) == 0 && queued == 65536,
-          "XTABS queued expected 65536, got %d", queued);
+    CHECK(drain_fd(m) == 65536, "expanded XTABS output");
 
     free(nls);
     close(s);

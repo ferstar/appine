@@ -44,6 +44,8 @@ const TIOCNOTTY: u32 = 0x5422;
 const TIOCSETD: u32 = 0x5423;
 const TIOCGETD: u32 = 0x5424;
 const TCSBRKP: u32 = 0x5425;
+const TIOCSBRK: u32 = 0x5427;
+const TIOCCBRK: u32 = 0x5428;
 const TIOCGSID: u32 = 0x5429;
 const TIOCVHANGUP: u32 = 0x5437;
 /// `struct termios2`: adds input and output speeds (since glibc 2.42, tcgetattr and tcsetattr use
@@ -55,6 +57,7 @@ const TCSETSF2: u32 = 0x402c_542d;
 /// Packet mode of the master: set and query ([`crate::tty::pkt`]).
 const TIOCPKT: u32 = 0x5420;
 const TIOCGPKT: u32 = 0x8004_5438;
+const TIOCGDEV: u32 = 0x8004_5432;
 const TIOCGPTN: u32 = 0x8004_5430;
 const TIOCSPTLCK: u32 = 0x4004_5431;
 const TIOCGPTLCK: u32 = 0x8004_5439;
@@ -660,7 +663,7 @@ pub(crate) fn ioctl(
             request_wake_object(wake::of(tty));
             Ok(0)
         }
-        TCSBRK | TCSBRKP | TIOCSETD => {
+        TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK | TIOCSETD => {
             if !master {
                 check_background(cx, tty, Signal::TTOU)?;
             }
@@ -678,15 +681,17 @@ pub(crate) fn ioctl(
         FIONREAD => {
             let t = tty.borrow();
             let n = if master {
-                t.output_len()
+                t.master_readable_len()
             } else {
                 t.input_len()
             };
             put(cx, arg, (n as i32).to_le_bytes()).map(|()| 0)
         }
-        TIOCOUTQ => {
-            let n = tty.borrow().output_len() as i32;
-            put(cx, arg, n.to_le_bytes()).map(|()| 0)
+        // A PTY driver has no transmit queue. Bytes already written belong to its peer.
+        TIOCOUTQ => put(cx, arg, 0i32.to_le_bytes()).map(|()| 0),
+        TIOCGDEV => {
+            let dev = crate::vfs::dev::rdev(crate::tty::PTS_MAJOR, tty.borrow().index) as u32;
+            put(cx, arg, dev.to_le_bytes()).map(|()| 0)
         }
         // Linux's tiocsti: only on the caller's controlling terminal, which a master never is, or
         // with CAP_SYS_ADMIN; otherwise anyone holding a terminal fd (inherited across setsid or
@@ -1049,4 +1054,58 @@ fn detach(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, session: Option<Tid>, fg: Opti
         signal::send_to_group(k, leader, Signal::CONT, SigInfo::kernel());
     }
     request_wake_object(wake::of(tty));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::Shared;
+    use crate::process::Tier;
+    use std::sync::Arc;
+
+    #[test]
+    fn pty_breaks_preserve_data_and_queue_ioctls_report_the_receiving_end() {
+        let mut kernel = Kernel::new(Tier::Interpreter);
+        let (_, arg, _cpu) = crate::pseudo::tests::add_task(&mut kernel, 10, 0, true, b"");
+        let shared = Arc::new(Shared::new(kernel));
+        let k = shared.lock();
+        let task = k.tasks[&10].clone();
+        let mut state = task.state.borrow_mut();
+        let mut cx = Cx::new(&shared, k, &task, &mut state);
+        let tty = Rc::new(RefCell::new(Tty::new(260)));
+        {
+            let mut t = tty.borrow_mut();
+            t.termios.lflag &= !flags::ECHO;
+            t.write_input(b"abc\n");
+            t.write_output(&[b'x'; 5000]);
+        }
+
+        for master in [true, false] {
+            let end = (master, 0);
+            const IGNBRK: u32 = 1;
+            const BRKINT: u32 = 2;
+            for break_flags in [IGNBRK, BRKINT] {
+                tty.borrow_mut().termios.iflag = break_flags;
+                for req in [TIOCSBRK, TIOCCBRK, TCSBRK, TCSBRKP] {
+                    assert_eq!(ioctl(&mut cx, &tty, end, true, req, 0), Ok(0));
+                }
+            }
+            for (req, expected) in [
+                (FIONREAD, if master { 4095 } else { 4 }),
+                (TIOCOUTQ, 0),
+                (TIOCGDEV, 0x108804),
+            ] {
+                put(&cx, arg, u32::MAX.to_le_bytes()).unwrap();
+                assert_eq!(ioctl(&mut cx, &tty, end, true, req, arg), Ok(0));
+                assert_eq!(u32::from_le_bytes(get(&cx, arg).unwrap()), expected);
+                assert_eq!(ioctl(&mut cx, &tty, end, true, req, 0), Err(Errno::EFAULT));
+            }
+        }
+        let mut t = tty.borrow_mut();
+        assert!(t.take_signals().is_empty());
+        assert_eq!(t.take_output(5001), [b'x'; 5000]);
+        let mut line = [0; 4];
+        assert_eq!(t.read(&mut line), Some(4));
+        assert_eq!(&line, b"abc\n");
+    }
 }
