@@ -409,16 +409,9 @@ fn writable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
 /// missing attributes, whereas procfs, devpts, nsfs and mqueue have no xattr handlers and answer
 /// `EOPNOTSUPP`.
 fn pseudo_has_xattr(node: &crate::pseudo::PseudoNode) -> bool {
-    use crate::pseudo::PseudoNode;
     matches!(
-        node,
-        PseudoNode::SysRoot
-            | PseudoNode::Sys(..)
-            | PseudoNode::SysCpu(..)
-            | PseudoNode::SysNet(..)
-            | PseudoNode::SysBrif(..)
-            | PseudoNode::SysBlock(..)
-            | PseudoNode::Cgroup(..)
+        crate::pseudo::fs_of(node),
+        crate::vfs::Fs::Sys | crate::vfs::Fs::Cgroup
     )
 }
 
@@ -507,4 +500,30 @@ fn reply(cx: &Cx<'_>, buf: u64, size: usize, data: &[u8]) -> SysResult {
     }
     cx.mm().write(UserSlice::new(buf, data.len()), data)?;
     Ok(data.len() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pseudo_has_xattr;
+    use crate::pseudo::{NsKind, PseudoNode};
+
+    #[test]
+    fn only_kernfs_nodes_have_xattr_handlers() {
+        for node in [
+            PseudoNode::SysDevBlock(0),
+            PseudoNode::SysBlock(0, b""),
+            PseudoNode::SysBrif(1, 2),
+            PseudoNode::Cgroup(1, b"", 1),
+        ] {
+            assert!(pseudo_has_xattr(&node), "{node:?}");
+        }
+        for node in [
+            PseudoNode::ProcRoot,
+            PseudoNode::PtsRoot(1),
+            PseudoNode::NsFile(NsKind::Net, 1),
+            PseudoNode::MqRoot(1),
+        ] {
+            assert!(!pseudo_has_xattr(&node), "{node:?}");
+        }
+    }
 }
