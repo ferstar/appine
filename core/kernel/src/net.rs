@@ -2772,7 +2772,7 @@ pub(crate) fn sockstat(sockets: &[(crate::syscall::SocketRef, u32)], v6: bool) -
             SO_PROTOCOL,
             4,
         ));
-        if inet.ty == SOCK_STREAM && proto == Some(IPPROTO_TCP) {
+        if inet.ty == SOCK_STREAM && matches!(proto, Some(IPPROTO_TCP | IPPROTO_MPTCP)) {
             alloc += 1;
             if inet.family == family && inet.tcp_state() != TCP_CLOSE {
                 tcp += 1;
@@ -2893,7 +2893,8 @@ pub(crate) fn proc_snmp(
             let Socket::Inet(inet) = &*b else {
                 return false;
             };
-            (inet.ty, inet.proto) == (SOCK_STREAM, IPPROTO_TCP)
+            inet.ty == SOCK_STREAM
+                && matches!(inet.proto, IPPROTO_TCP | IPPROTO_MPTCP)
                 && inet.tcp_state() == TCP_ESTABLISHED
         })
         .count() as u64;
@@ -4431,6 +4432,56 @@ mod tests {
             )
             .0,
             ENOENT
+        );
+    }
+
+    /// MPTCP sockets are counted in `/proc/net/snmp`'s `CurrEstab` and `/proc/net/sockstat`
+    /// alongside plain TCP sockets (skipped if the host kernel refuses `IPPROTO_MPTCP`).
+    #[test]
+    fn mptcp_sockets_count_in_snmp_and_sockstat() {
+        let Ok(lfd) = appine_hal::net::socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP) else {
+            return;
+        };
+        let lo = appine_hal::net::sockaddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+        appine_hal::net::bind(lfd, &lo).unwrap();
+        appine_hal::net::listen(lfd, 4).unwrap();
+        let addr = appine_hal::net::sockname(lfd, false).unwrap();
+        let cfd = appine_hal::net::socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP).unwrap();
+        match appine_hal::net::connect(cfd, &addr) {
+            Ok(()) | Err(115) => {} // EINPROGRESS
+            Err(e) => panic!("mptcp connect failed: {e}"),
+        }
+        let mut p = [(lfd, 1i16, 0)];
+        appine_hal::poll(&mut p, Some(Duration::from_secs(5))).unwrap();
+        let (sfd, _) = appine_hal::net::accept(lfd).unwrap();
+        let mut p2 = [(cfd, 4i16, 0)];
+        appine_hal::poll(&mut p2, Some(Duration::from_secs(5))).unwrap();
+
+        let mk = |fd| {
+            let mut s = InetSocket::new(fd, AF_INET, SOCK_STREAM);
+            s.proto = IPPROTO_MPTCP;
+            (Rc::new(crate::cell::RefCell::new(Socket::Inet(s))), 0u32)
+        };
+        let socks = vec![mk(lfd), mk(cfd), mk(sfd)];
+        let snmp = proc_snmp(&socks, &crate::traffic::Protocols::default());
+        let mut lines = snmp.lines();
+        let mut estab = None;
+        while let Some(names) = lines.next() {
+            let vals = lines.next().unwrap();
+            if names.starts_with("Tcp: ") {
+                for (n, v) in names.split_whitespace().zip(vals.split_whitespace()) {
+                    if n == "CurrEstab" {
+                        estab = Some(v.parse::<u64>().unwrap());
+                    }
+                }
+            }
+        }
+        assert_eq!(estab, Some(2), "snmp:\n{snmp}");
+
+        let stat = sockstat(&socks, false);
+        assert!(
+            stat.contains("TCP: inuse 3 orphan 0 tw 0 alloc 3 mem 0"),
+            "sockstat:\n{stat}"
         );
     }
 }

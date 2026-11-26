@@ -342,6 +342,90 @@ int main(void)
     } else {
         printf("skip icmp (errno %d)\n", errno);
     }
+    /* MPTCP sockets: counted alongside TCP in /proc/net/snmp and /proc/net/sockstat.
+     * Skipped only if the host kernel does not support IPPROTO_MPTCP. */
+    #ifndef IPPROTO_MPTCP
+    #define IPPROTO_MPTCP 262
+    #endif
+    int ml = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+    if (ml >= 0) {
+        long long m_opens = snmp("snmp", "Tcp", "ActiveOpens"),
+                  m_passive = snmp("snmp", "Tcp", "PassiveOpens"),
+                  m_estab = snmp("snmp", "Tcp", "CurrEstab"),
+                  m_in = snmp("snmp", "Tcp", "InSegs"),
+                  m_out = snmp("snmp", "Tcp", "OutSegs"),
+                  m_fails = snmp("snmp", "Tcp", "AttemptFails");
+        int inuse_before = -1, alloc_before = -1, inuse_mid = -1, alloc_mid = -1;
+        {
+            FILE *sf = fopen("/proc/net/sockstat", "r");
+            CHECK(sf, "open /proc/net/sockstat");
+            char line[256];
+            while (fgets(line, sizeof line, sf))
+                sscanf(line, "TCP: inuse %d orphan %*d tw %*d alloc %d", &inuse_before,
+                       &alloc_before);
+            fclose(sf);
+            CHECK(inuse_before >= 0 && alloc_before >= 0, "parse sockstat before");
+        }
+        addr.sin_port = 0;
+        len = sizeof addr;
+        CHECK(bind(ml, (void *)&addr, len) == 0 && listen(ml, 1) == 0 &&
+                  getsockname(ml, (void *)&addr, &len) == 0,
+              "mptcp listen");
+        int mc = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+        CHECK(mc >= 0 && connect(mc, (void *)&addr, len) == 0, "mptcp connect");
+        int ms = accept(ml, NULL, NULL);
+        CHECK(ms >= 0, "mptcp accept");
+        CHECK(snmp("snmp", "Tcp", "ActiveOpens") == m_opens + 1 &&
+                  snmp("snmp", "Tcp", "PassiveOpens") == m_passive + 1 &&
+                  snmp("snmp", "Tcp", "CurrEstab") == m_estab + 2,
+              "mptcp connections: %lld active, %lld passive, %lld established",
+              snmp("snmp", "Tcp", "ActiveOpens") - m_opens,
+              snmp("snmp", "Tcp", "PassiveOpens") - m_passive,
+              snmp("snmp", "Tcp", "CurrEstab") - m_estab);
+        {
+            FILE *sf = fopen("/proc/net/sockstat", "r");
+            CHECK(sf, "open /proc/net/sockstat mid");
+            char line[256];
+            while (fgets(line, sizeof line, sf))
+                sscanf(line, "TCP: inuse %d orphan %*d tw %*d alloc %d", &inuse_mid, &alloc_mid);
+            fclose(sf);
+            CHECK(inuse_mid >= inuse_before + 3 && alloc_mid >= alloc_before + 2,
+                  "mptcp sockstat: inuse %d -> %d, alloc %d -> %d", inuse_before, inuse_mid,
+                  alloc_before, alloc_mid);
+        }
+        CHECK(write(mc, "mptcp", 5) == 5, "mptcp write");
+        char mbuf[16];
+        CHECK(read(ms, mbuf, sizeof mbuf) == 5 && memcmp(mbuf, "mptcp", 5) == 0, "mptcp read");
+        CHECK(snmp("snmp", "Tcp", "OutSegs") >= m_out + 1 &&
+                  snmp("snmp", "Tcp", "InSegs") >= m_in + 1,
+              "mptcp segs: %lld in, %lld out", snmp("snmp", "Tcp", "InSegs") - m_in,
+              snmp("snmp", "Tcp", "OutSegs") - m_out);
+        close(mc);
+        close(ms);
+        close(ml);
+
+        /* Refused MPTCP connect counts in ActiveOpens and AttemptFails */
+        int mdead = socket(AF_INET, SOCK_STREAM, 0);
+        addr.sin_port = 0;
+        len = sizeof addr;
+        CHECK(mdead >= 0 && bind(mdead, (void *)&addr, len) == 0 &&
+                  getsockname(mdead, (void *)&addr, &len) == 0,
+              "bind dead port for mptcp");
+        int mref = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+        CHECK(mref >= 0 && connect(mref, (void *)&addr, len) < 0 && errno == ECONNREFUSED,
+              "mptcp refused connect");
+        close(mref);
+        close(mdead);
+        CHECK(snmp("snmp", "Tcp", "ActiveOpens") == m_opens + 2 &&
+                  snmp("snmp", "Tcp", "AttemptFails") == m_fails + 1,
+              "mptcp refused: %lld active, %lld failed",
+              snmp("snmp", "Tcp", "ActiveOpens") - m_opens,
+              snmp("snmp", "Tcp", "AttemptFails") - m_fails);
+        printf("ok mptcp\n");
+    } else {
+        printf("skip mptcp (errno %d)\n", errno);
+    }
+
     printf("ok snmp\n");
     printf("all ok\n");
     return 0;

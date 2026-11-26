@@ -25,7 +25,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::net::{
-    AF_INET, AF_INET6, IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP, InetSocket, SOCK_DGRAM, SOCK_STREAM,
+    AF_INET, AF_INET6, IPPROTO_ICMP, IPPROTO_MPTCP, IPPROTO_TCP, IPPROTO_UDP, InetSocket,
+    SOCK_DGRAM, SOCK_STREAM,
 };
 
 /// The counters of one interface.
@@ -162,7 +163,7 @@ impl Traffic {
             }
         }
         match (s.ty, s.proto) {
-            (SOCK_STREAM, IPPROTO_TCP) => {
+            (SOCK_STREAM, IPPROTO_TCP | IPPROTO_MPTCP) => {
                 p.tcp_in_segs += packets_in;
                 p.tcp_out_segs += packets_out;
             }
@@ -406,5 +407,26 @@ mod tests {
         let lo = t.table().lo.clone();
         let st = t.get(&lo);
         assert_eq!((st.tx_bytes, st.tx_packets), (100, 2));
+    }
+
+    /// MPTCP sockets count in TCP segment counters alongside plain TCP sockets.
+    #[test]
+    fn mptcp_traffic_counts_in_tcp_segments() {
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::IntoRawFd;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut a = InetSocket::new(client.into_raw_fd(), AF_INET, SOCK_STREAM);
+        let mut b = InetSocket::new(server.into_raw_fd(), AF_INET, SOCK_STREAM);
+        a.proto = IPPROTO_MPTCP;
+        b.proto = IPPROTO_MPTCP;
+        let mut t = Traffic::default();
+        t.account(&mut a, false, 4096, &[]);
+        t.account(&mut b, true, 4096, &[]);
+        assert_eq!(t.protocols.tcp_out_segs, 1);
+        assert_eq!(t.protocols.tcp_in_segs, 1);
+        assert_eq!(t.protocols.ip_out_packets, 1);
+        assert_eq!(t.protocols.ip_in_packets, 1);
     }
 }

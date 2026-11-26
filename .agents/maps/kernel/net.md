@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: guest-netns resolution for `SO_BINDTODEVICE`/`SO_BINDTOIFINDEX`)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: include MPTCP sockets in `/proc/net/snmp` TCP counters, `CurrEstab`, and `/proc/net/sockstat`)
 
 ## Responsibilities
 
@@ -359,8 +359,8 @@ listen notifications (`android/service`).
   skipped), per interface chosen from the socket's local address (cached until the next connect;
   wildcards resolved per call by the peer: loopback on lo, else the default interface), packets
   estimated from the MSS for streams, one per datagram; `Protocols` feed `/proc/net/snmp` and
-  `netstat` (IP/UDP/ICMP IPv4 only, ICMP for ping echoes only, TCP both families but only
-  `IPPROTO_TCP`, not MPTCP; `CurrEstab` live from `TCP_INFO`, ActiveOpens and AttemptFails from
+  `netstat` (IP/UDP/ICMP IPv4 only, ICMP for ping echoes only, TCP both families including MPTCP;
+  `CurrEstab` live from `TCP_INFO`, ActiveOpens and AttemptFails from
   connect, PassiveOpens from accept; `Forwarding` is 1 when the namespace's `ip_forward` is on
   (patched in `kernel/procfs`), else 2; error and retransmission counters
   0; `TcpExt` all 0). DNS stub and AF_UNIX traffic are not counted; `/proc/net/dev` and netlink
@@ -441,8 +441,6 @@ listen notifications (`android/service`).
   instead of Linux's silent drop and retransmission. A conflicting socket already bound with
   `SO_REUSEADDR` can defer a port conflict until activation. General packet-dependent filters,
   drop on an active TCP socket, and port sharing with `SO_REUSEPORT` are unsupported in the fallback.
-- **`/proc/net/snmp` omits MPTCP sockets:** MPTCP sockets are left out of the Tcp counters and
-  `CurrEstab`, where Linux counts their subflows.
 
 ## Open questions
 

@@ -1092,7 +1092,7 @@ fn accept_host(
                         new.track_mut().orig_dst = Some(o);
                     }
                 }
-                if proto == IPPROTO_TCP && net.is_none() {
+                if matches!(proto, IPPROTO_TCP | IPPROTO_MPTCP) && net.is_none() {
                     cx.k().traffic.protocols.tcp_passive_opens += 1;
                 }
                 let w = cx.kr().world();
@@ -1348,7 +1348,9 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 }
                 // Traffic in new network namespaces is not counted on the host's interfaces (nor
                 // in /proc/net/snmp)
-                let tcp = s.net.is_none() && s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP;
+                let tcp = s.net.is_none()
+                    && s.ty == SOCK_STREAM
+                    && matches!(s.proto, IPPROTO_TCP | IPPROTO_MPTCP);
                 let stream = s.ty == SOCK_STREAM && nat_proto(s) == Some(IPPROTO_TCP as u8);
                 (
                     host_addr,
