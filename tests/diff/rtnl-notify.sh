@@ -264,7 +264,7 @@ int main(void)
     printf("socket in no group: %d notifications\n", count(none, 0));
     close(fd);
 
-    // disable_ipv6 sysctl notifications (IPv6 addr/route groups; RMTGRP_LINK omitted because
+    // disable_ipv6 sysctl notifications (IPv6 addr/route groups; RTNLGRP_LINK omitted because
     // Appine does not emit IFLA_AF_SPEC link notifications).
     while (one(v6, 100, 0) > 0)
         ;

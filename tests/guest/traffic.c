@@ -152,6 +152,19 @@ static long long snmp(const char *file, const char *group, const char *field)
     return found;
 }
 
+static void tcp_sockstat(int *inuse, int *alloc, const char *label)
+{
+    FILE *f = fopen("/proc/net/sockstat", "r");
+    CHECK(f, "open /proc/net/sockstat (%s)", label);
+    char line[256];
+    *inuse = -1;
+    *alloc = -1;
+    while (fgets(line, sizeof line, f))
+        sscanf(line, "TCP: inuse %d orphan %*d tw %*d alloc %d", inuse, alloc);
+    fclose(f);
+    CHECK(*inuse >= 0 && *alloc >= 0, "parse sockstat (%s)", label);
+}
+
 static void read_line(const char *path, const char *want)
 {
     FILE *f = fopen(path, "r");
@@ -162,6 +175,9 @@ static void read_line(const char *path, const char *want)
     CHECK(strcmp(got, want) == 0, "%s is %s", path, got);
 }
 
+#ifndef IPPROTO_MPTCP
+#define IPPROTO_MPTCP 262
+#endif
 #define STREAM_BYTES 100000
 #define DATAGRAMS 10
 #define DATAGRAM_BYTES 100
@@ -344,9 +360,6 @@ int main(void)
     }
     /* MPTCP sockets: counted alongside TCP in /proc/net/snmp and /proc/net/sockstat.
      * Skipped only if the host kernel does not support IPPROTO_MPTCP. */
-    #ifndef IPPROTO_MPTCP
-    #define IPPROTO_MPTCP 262
-    #endif
     int ml = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
     if (ml >= 0) {
         long long m_opens = snmp("snmp", "Tcp", "ActiveOpens"),
@@ -355,17 +368,8 @@ int main(void)
                   m_in = snmp("snmp", "Tcp", "InSegs"),
                   m_out = snmp("snmp", "Tcp", "OutSegs"),
                   m_fails = snmp("snmp", "Tcp", "AttemptFails");
-        int inuse_before = -1, alloc_before = -1, inuse_mid = -1, alloc_mid = -1;
-        {
-            FILE *sf = fopen("/proc/net/sockstat", "r");
-            CHECK(sf, "open /proc/net/sockstat");
-            char line[256];
-            while (fgets(line, sizeof line, sf))
-                sscanf(line, "TCP: inuse %d orphan %*d tw %*d alloc %d", &inuse_before,
-                       &alloc_before);
-            fclose(sf);
-            CHECK(inuse_before >= 0 && alloc_before >= 0, "parse sockstat before");
-        }
+        int inuse_before, alloc_before, inuse_mid, alloc_mid;
+        tcp_sockstat(&inuse_before, &alloc_before, "before");
         addr.sin_port = 0;
         len = sizeof addr;
         CHECK(bind(ml, (void *)&addr, len) == 0 && listen(ml, 1) == 0 &&
@@ -382,17 +386,10 @@ int main(void)
               snmp("snmp", "Tcp", "ActiveOpens") - m_opens,
               snmp("snmp", "Tcp", "PassiveOpens") - m_passive,
               snmp("snmp", "Tcp", "CurrEstab") - m_estab);
-        {
-            FILE *sf = fopen("/proc/net/sockstat", "r");
-            CHECK(sf, "open /proc/net/sockstat mid");
-            char line[256];
-            while (fgets(line, sizeof line, sf))
-                sscanf(line, "TCP: inuse %d orphan %*d tw %*d alloc %d", &inuse_mid, &alloc_mid);
-            fclose(sf);
-            CHECK(inuse_mid >= inuse_before + 3 && alloc_mid >= alloc_before + 2,
-                  "mptcp sockstat: inuse %d -> %d, alloc %d -> %d", inuse_before, inuse_mid,
-                  alloc_before, alloc_mid);
-        }
+        tcp_sockstat(&inuse_mid, &alloc_mid, "mid");
+        CHECK(inuse_mid >= inuse_before + 3 && alloc_mid >= alloc_before + 2,
+              "mptcp sockstat: inuse %d -> %d, alloc %d -> %d", inuse_before, inuse_mid,
+              alloc_before, alloc_mid);
         CHECK(write(mc, "mptcp", 5) == 5, "mptcp write");
         char mbuf[16];
         CHECK(read(ms, mbuf, sizeof mbuf) == 5 && memcmp(mbuf, "mptcp", 5) == 0, "mptcp read");

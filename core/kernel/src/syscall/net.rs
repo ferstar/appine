@@ -4313,9 +4313,8 @@ fn netlink_send(
             if before.is_some_and(|g| g != init.nft.borrow().generation) {
                 forward_all(cx.kr());
             }
-            let ns = host.ns();
-            let nft_notes = host.nft_notes.into_inner();
-            let nft = (!nft_notes.is_empty()).then_some((ns, nft_notes));
+            let nft_notes = host.nft_notes.take();
+            let nft = (!nft_notes.is_empty()).then(|| (host.ns(), nft_notes));
             Delivery::Kernel(host.notes.into_inner(), nft)
         }
     };
@@ -4372,6 +4371,29 @@ const CHANGING_IOCTLS: [u32; 15] = [
     0x8936, 0x8937, 0x8943,
 ];
 
+/// Visits every live netlink socket with its namespace and whether it is `sender`, waking the
+/// socket when `deliver` queued any notification.
+fn notify_netlink(
+    k: &mut crate::kernel::Kernel,
+    sender: Option<&SocketRef>,
+    mut deliver: impl FnMut(&mut NetlinkSocket, &Rc<crate::nsproxy::NetNs>, bool) -> bool,
+) {
+    k.rtnl_sockets.retain(|w| w.strong_count() > 0);
+    for sock in k.rtnl_sockets.iter().filter_map(|w| w.upgrade()) {
+        let is_sender = sender.is_some_and(|s| Rc::ptr_eq(&sock, s));
+        let any = match &mut *sock.borrow_mut() {
+            Socket::Netlink(s) => {
+                let ns = s.net.clone().unwrap_or_else(|| k.init_ns.net.clone());
+                deliver(s, &ns, is_sender)
+            }
+            _ => false,
+        };
+        if any {
+            request_wake_object(wake::of(&sock));
+        }
+    }
+}
+
 /// Queues the notifications of a change request on the sockets of each namespace that joined
 /// their groups, and wakes them. Notifications already echoed to `sender` via `NLM_F_ECHO` skip
 /// `sender` during multicast broadcast so a subscribed sender does not receive a duplicate.
@@ -4379,26 +4401,17 @@ fn rtnl_notify(k: &mut crate::kernel::Kernel, notes: Vec<RtnlNotes>, sender: Opt
     if notes.is_empty() {
         return;
     }
-    k.rtnl_sockets.retain(|w| w.strong_count() > 0);
-    for sock in k.rtnl_sockets.iter().filter_map(|w| w.upgrade()) {
-        let is_sender = sender.is_some_and(|s| Rc::ptr_eq(&sock, s));
-        let Socket::Netlink(s) = &mut *sock.borrow_mut() else {
-            continue;
-        };
-        let ns = s.net.clone().unwrap_or_else(|| k.init_ns.net.clone());
+    notify_netlink(k, sender, |s, ns, is_sender| {
         let mut any = false;
-        for (_, changes) in notes.iter().filter(|(n, _)| Rc::ptr_eq(n, &ns)) {
+        for (_, changes) in notes.iter().filter(|(n, _)| Rc::ptr_eq(n, ns)) {
             for note in changes {
-                if note.echo && is_sender {
-                    continue;
+                if !(note.echo && is_sender) {
+                    any |= s.notify(note.group, &note.msg);
                 }
-                any |= s.notify(note.group, &note.msg);
             }
         }
-        if any {
-            request_wake_object(wake::of(&sock));
-        }
-    }
+        any
+    });
 }
 
 /// Snapshots `ns` before an out-of-band state change (such as writing `disable_ipv6`) when at
@@ -4445,30 +4458,18 @@ fn nft_notify(
     if notes.is_empty() {
         return;
     }
-    k.rtnl_sockets.retain(|w| w.strong_count() > 0);
-    for sock in k.rtnl_sockets.iter().filter_map(|w| w.upgrade()) {
-        let is_sender = sender.is_some_and(|s| Rc::ptr_eq(&sock, s));
-        let Socket::Netlink(s) = &mut *sock.borrow_mut() else {
-            continue;
-        };
-        if s.protocol != NETLINK_NETFILTER {
-            continue;
-        }
-        let sock_ns = s.net.clone().unwrap_or_else(|| k.init_ns.net.clone());
-        if !Rc::ptr_eq(&sock_ns, ns) {
-            continue;
+    notify_netlink(k, sender, |s, sock_ns, is_sender| {
+        if s.protocol != NETLINK_NETFILTER || !Rc::ptr_eq(sock_ns, ns) {
+            return false;
         }
         let mut any = false;
         for note in &notes {
-            if note.echo && is_sender {
-                continue;
+            if !(note.echo && is_sender) {
+                any |= s.notify_proto(NETLINK_NETFILTER, crate::nft::NFNLGRP_NFTABLES, &note.msg);
             }
-            any |= s.notify_proto(NETLINK_NETFILTER, crate::nft::NFNLGRP_NFTABLES, &note.msg);
         }
-        if any {
-            request_wake_object(wake::of(&sock));
-        }
-    }
+        any
+    });
 }
 
 /// A namespace and the notifications for what a request changed in it.

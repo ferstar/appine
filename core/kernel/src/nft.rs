@@ -803,9 +803,19 @@ pub(crate) struct NftNote {
 /// Result of handling one `NETLINK_NETFILTER` datagram: items queued on the sender (replies,
 /// resumable dumps, `NLM_F_ECHO` notifications, and `NLMSG_ERROR` acks) plus committed multicast
 /// notifications for `NFNLGRP_NFTABLES` listeners in the same namespace.
+#[derive(Default)]
 pub(crate) struct HandleResult {
     pub replies: Vec<NetlinkItem>,
     pub notes: Vec<NftNote>,
+}
+
+impl HandleResult {
+    fn reply(msg: Vec<u8>) -> Self {
+        Self {
+            replies: vec![NetlinkItem::reply(msg)],
+            notes: Vec::new(),
+        }
+    }
 }
 
 /// One staged notification recorded while applying a batch, finalized with the committed
@@ -817,6 +827,103 @@ struct NftEvent {
     family: u8,
     attrs: Vec<u8>,
     echo: bool,
+}
+
+/// Staged notifications for one batch.
+#[derive(Default)]
+struct Events(Vec<NftEvent>);
+
+impl Events {
+    fn push(&mut self, r: &Req<'_>, msg: u8, flags: u16, attrs: Vec<u8>) {
+        self.push_family(r, r.family, msg, flags, attrs);
+    }
+
+    fn push_family(&mut self, r: &Req<'_>, family: u8, msg: u8, flags: u16, attrs: Vec<u8>) {
+        self.0.push(NftEvent {
+            msg,
+            flags,
+            seq: r.seq,
+            family,
+            attrs,
+            echo: r.echo(),
+        });
+    }
+
+    fn push_del_rules(&mut self, r: &Req<'_>, family: u8, table: &Table, chain: &Chain) {
+        for i in 0..chain.rules.len() {
+            self.push_family(r, family, DELRULE, 0, table.rule_attrs(chain, i, false));
+        }
+    }
+
+    fn push_del_sets(&mut self, r: &Req<'_>, attrs: Vec<Vec<u8>>) {
+        for a in attrs {
+            self.push(r, DELSET, 0, a);
+        }
+    }
+
+    fn push_elem(
+        &mut self,
+        r: &Req<'_>,
+        msg: u8,
+        flags: u16,
+        table: &[u8],
+        set: &[u8],
+        wire: &[u8],
+    ) {
+        self.push(r, msg, flags, encode_elems_attrs(table, set, [wire]));
+    }
+
+    /// Finalizes staged events for a committed batch: appends trailing `NFT_MSG_NEWGEN`, encodes
+    /// every event with `res_id = generation & 0xffff`, and orders `NLM_F_ECHO` replies before
+    /// `acks`.
+    fn finish(
+        mut self,
+        generation: u32,
+        begin: &Req<'_>,
+        peer: &Peer<'_>,
+        acks: Vec<NetlinkItem>,
+    ) -> HandleResult {
+        if !self.0.is_empty() {
+            let any_echo = begin.echo() || self.0.iter().any(|e| e.echo);
+            let gen_seq = self
+                .0
+                .iter()
+                .find(|e| e.seq != 0)
+                .map_or(begin.seq, |e| e.seq);
+            let mut p = Vec::new();
+            attr(&mut p, GEN_ID, &be32(generation));
+            attr(&mut p, GEN_PROC_PID, &be32(peer.proc_pid));
+            attr(&mut p, GEN_PROC_NAME, &cstr(peer.comm));
+            self.0.push(NftEvent {
+                msg: NEWGEN,
+                flags: 0,
+                seq: gen_seq,
+                family: 0,
+                attrs: p,
+                echo: any_echo,
+            });
+        }
+        let res_id = (generation & 0xffff) as u16;
+        let mut replies = Vec::new();
+        let mut notes = Vec::new();
+        for ev in self.0 {
+            let msg = nfmsg(
+                nft_type(ev.msg),
+                ev.flags,
+                ev.seq,
+                peer.pid,
+                ev.family,
+                res_id,
+                &ev.attrs,
+            );
+            if ev.echo {
+                replies.push(NetlinkItem::reply(msg.clone()));
+            }
+            notes.push(NftNote { msg, echo: ev.echo });
+        }
+        replies.extend(acks);
+        HandleResult { replies, notes }
+    }
 }
 
 /// Where answers go: the socket's `nl_pid`, `NETLINK_EXT_ACK` and `NETLINK_CAP_ACK`, and the
@@ -845,27 +952,14 @@ pub(crate) fn handle_with_notes(
 ) -> HandleResult {
     let msgs = split(data);
     let Some(first) = msgs.first() else {
-        return HandleResult {
-            replies: Vec::new(),
-            notes: Vec::new(),
-        };
+        return HandleResult::default();
     };
     // Needs CAP_NET_ADMIN in the namespace's owner (nfnetlink_rcv: only the first message is
     // acknowledged, the rest are dropped)
     if !cred.ns_capable(&ns.owner, cap::NET_ADMIN) {
-        return HandleResult {
-            replies: vec![NetlinkItem::reply(ack(
-                first,
-                Err(fail(Errno::EPERM)),
-                peer,
-            ))],
-            notes: Vec::new(),
-        };
+        return HandleResult::reply(ack(first, Err(fail(Errno::EPERM)), peer));
     }
-    let mut out = HandleResult {
-        replies: Vec::new(),
-        notes: Vec::new(),
-    };
+    let mut out = HandleResult::default();
     let mut i = 0;
     while i < msgs.len() {
         let m = msgs[i];
@@ -914,34 +1008,24 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> HandleRes
         .get(18..20)
         .map_or(0, |r| u16::from_be_bytes([r[0], r[1]]));
     if res != NFNL_SUBSYS_NFTABLES {
-        return HandleResult {
-            replies: vec![NetlinkItem::reply(ack(
-                begin,
-                Err(fail(Errno::EOPNOTSUPP)),
-                peer,
-            ))],
-            notes: Vec::new(),
-        };
+        return HandleResult::reply(ack(begin, Err(fail(Errno::EOPNOTSUPP)), peer));
     }
     let mut st = ns.nft.borrow().clone();
     if let Some(genid) = get_be32(&b.attrs, NFNL_BATCH_GENID)
         && genid != 0
         && genid != st.generation
     {
-        return HandleResult {
-            replies: vec![NetlinkItem::reply(ack(
-                begin,
-                Err(Fail {
-                    errno: ERESTART,
-                    at: None,
-                }),
-                peer,
-            ))],
-            notes: Vec::new(),
-        };
+        return HandleResult::reply(ack(
+            begin,
+            Err(Fail {
+                errno: ERESTART,
+                at: None,
+            }),
+            peer,
+        ));
     }
     let mut acks = Vec::new();
-    let mut events = Vec::new();
+    let mut events = Events::default();
     let mut failed = false;
     let mut changed = false;
     for m in msgs {
@@ -995,43 +1079,7 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> HandleRes
     st.recent.retain(|name, _| names.contains(name.as_slice()));
     st.hashlimits.retain(|_, table| table.strong_count() != 0);
     *ns.nft.borrow_mut() = st;
-
-    if !events.is_empty() {
-        let any_echo = b.echo() || events.iter().any(|e| e.echo);
-        let gen_seq = events.iter().find(|e| e.seq != 0).map_or(b.seq, |e| e.seq);
-        let mut p = Vec::new();
-        attr(&mut p, GEN_ID, &be32(generation));
-        attr(&mut p, GEN_PROC_PID, &be32(peer.proc_pid));
-        attr(&mut p, GEN_PROC_NAME, &cstr(peer.comm));
-        events.push(NftEvent {
-            msg: NEWGEN,
-            flags: 0,
-            seq: gen_seq,
-            family: 0,
-            attrs: p,
-            echo: any_echo,
-        });
-    }
-    let res_id = (generation & 0xffff) as u16;
-    let mut replies = Vec::new();
-    let mut notes = Vec::new();
-    for ev in events {
-        let msg = nfmsg(
-            nft_type(ev.msg),
-            ev.flags,
-            ev.seq,
-            peer.pid,
-            ev.family,
-            res_id,
-            &ev.attrs,
-        );
-        if ev.echo {
-            replies.push(NetlinkItem::reply(msg.clone()));
-        }
-        notes.push(NftNote { msg, echo: ev.echo });
-    }
-    replies.extend(acks);
-    HandleResult { replies, notes }
+    events.finish(generation, &b, peer, acks)
 }
 
 /// One message outside a batch: queries, `NFT_MSG_GETGEN`, xt extension revisions, conntrack.
@@ -1154,7 +1202,7 @@ const EXPRS: [&str; 39] = [
 
 impl Nft {
     /// One change in a batch (`nf_tables_newtable` and so on), staging notifications in `events`.
-    fn apply(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) -> Result<(), Fail> {
+    fn apply(&mut self, r: &Req<'_>, events: &mut Events) -> Result<(), Fail> {
         // nf_tables_deltable: family NFPROTO_UNSPEC, or neither a name nor a handle, flushes
         // instead (`nft flush ruleset`, the first line of most nftables.conf files), for any family
         if matches!(r.msg, DELTABLE | DESTROYTABLE)
@@ -1174,10 +1222,10 @@ impl Nft {
                 attrs: r.attrs.clone(),
                 ..*r
             };
-            let before = events.len();
+            let before = events.0.len();
             return match self.apply(&del, events) {
                 Err(f) if f.errno == Errno::ENOENT.0 => {
-                    events.truncate(before);
+                    events.0.truncate(before);
                     Ok(())
                 }
                 x => x,
@@ -1212,61 +1260,30 @@ impl Nft {
 
     /// Removes table `idx` and stages cascading `DELRULE`, `DELSET`, `DELCHAIN`, and `DELTABLE`
     /// notifications in Linux's commit order.
-    fn remove_table(&mut self, idx: usize, r: &Req<'_>, events: &mut Vec<NftEvent>) {
+    fn remove_table(&mut self, idx: usize, r: &Req<'_>, events: &mut Events) {
         let mut table = self.tables.remove(idx);
         let family = table.family;
-        let echo = r.echo();
         for c in &table.chains {
-            for i in 0..c.rules.len() {
-                events.push(NftEvent {
-                    msg: DELRULE,
-                    flags: 0,
-                    seq: r.seq,
-                    family,
-                    attrs: table.rule_attrs(c, i, false),
-                    echo,
-                });
-            }
+            events.push_del_rules(r, family, &table, c);
         }
         for s in &table.sets {
-            events.push(NftEvent {
-                msg: DELSET,
-                flags: 0,
-                seq: r.seq,
-                family,
-                attrs: table.set_attrs(s),
-                echo,
-            });
+            events.push_family(r, family, DELSET, 0, table.set_attrs(s));
         }
         for c in &mut table.chains {
             c.rules.clear();
         }
         table.sets.clear();
         for c in &table.chains {
-            events.push(NftEvent {
-                msg: DELCHAIN,
-                flags: 0,
-                seq: r.seq,
-                family,
-                attrs: table.chain_attrs(c),
-                echo,
-            });
+            events.push_family(r, family, DELCHAIN, 0, table.chain_attrs(c));
         }
         table.chains.clear();
-        events.push(NftEvent {
-            msg: DELTABLE,
-            flags: 0,
-            seq: r.seq,
-            family,
-            attrs: table.table_attrs(),
-            echo,
-        });
+        events.push_family(r, family, DELTABLE, 0, table.table_attrs());
     }
 
     /// `nft_flush`: deletes every table of the request's family (of all families for
     /// NFPROTO_UNSPEC), only those with its name when it has one; a handle is ignored. Matching
     /// nothing is not an error.
-    fn flush(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) {
+    fn flush(&mut self, r: &Req<'_>, events: &mut Events) {
         let name = get_str(&r.attrs, TABLE_NAME);
         let mut i = 0;
         while i < self.tables.len() {
@@ -1280,7 +1297,7 @@ impl Nft {
         }
     }
 
-    fn new_table(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) -> Result<(), Fail> {
+    fn new_table(&mut self, r: &Req<'_>, events: &mut Events) -> Result<(), Fail> {
         let attr = get(&r.attrs, TABLE_NAME);
         let name = get_str(&r.attrs, TABLE_NAME).ok_or_else(|| fail(Errno::EINVAL))?;
         valid_name(name)?;
@@ -1300,14 +1317,7 @@ impl Nft {
             let prev = self.tables[t].flags;
             self.tables[t].flags = flags;
             if flags != prev {
-                events.push(NftEvent {
-                    msg: NEWTABLE,
-                    flags: 0,
-                    seq: r.seq,
-                    family: r.family,
-                    attrs: self.tables[t].table_attrs(),
-                    echo: r.echo(),
-                });
+                events.push(r, NEWTABLE, 0, self.tables[t].table_attrs());
             }
             return Ok(());
         }
@@ -1322,18 +1332,16 @@ impl Nft {
             chains: Vec::new(),
             sets: Vec::new(),
         });
-        events.push(NftEvent {
-            msg: NEWTABLE,
-            flags: r.flags & (NLM_F_CREATE | NLM_F_EXCL),
-            seq: r.seq,
-            family: r.family,
-            attrs: self.tables.last().unwrap().table_attrs(),
-            echo: r.echo(),
-        });
+        events.push(
+            r,
+            NEWTABLE,
+            r.flags & (NLM_F_CREATE | NLM_F_EXCL),
+            self.tables.last().unwrap().table_attrs(),
+        );
         Ok(())
     }
 
-    fn new_chain(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) -> Result<(), Fail> {
+    fn new_chain(&mut self, r: &Req<'_>, events: &mut Events) -> Result<(), Fail> {
         let t = self.table_of(r, CHAIN_TABLE, None)?;
         let table = &mut self.tables[t];
         let name = get_str(&r.attrs, CHAIN_NAME);
@@ -1406,14 +1414,7 @@ impl Nft {
                 updated = true;
             }
             if updated {
-                events.push(NftEvent {
-                    msg: NEWCHAIN,
-                    flags: 0,
-                    seq: r.seq,
-                    family: r.family,
-                    attrs: table.chain_attrs(&table.chains[ci]),
-                    echo: r.echo(),
-                });
+                events.push(r, NEWCHAIN, 0, table.chain_attrs(&table.chains[ci]));
             }
             return Ok(());
         }
@@ -1461,18 +1462,16 @@ impl Nft {
             rules: Vec::new(),
             id: get_be32(&r.attrs, CHAIN_ID),
         });
-        events.push(NftEvent {
-            msg: NEWCHAIN,
-            flags: r.flags & (NLM_F_CREATE | NLM_F_EXCL),
-            seq: r.seq,
-            family: r.family,
-            attrs: table.chain_attrs(table.chains.last().unwrap()),
-            echo: r.echo(),
-        });
+        events.push(
+            r,
+            NEWCHAIN,
+            r.flags & (NLM_F_CREATE | NLM_F_EXCL),
+            table.chain_attrs(table.chains.last().unwrap()),
+        );
         Ok(())
     }
 
-    fn del_chain(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) -> Result<(), Fail> {
+    fn del_chain(&mut self, r: &Req<'_>, events: &mut Events) -> Result<(), Fail> {
         let t = self.table_of(r, CHAIN_TABLE, None)?;
         let table = &mut self.tables[t];
         let (c, attr) = match (
@@ -1500,40 +1499,15 @@ impl Nft {
         if refs > 0 {
             return Err(bad(Errno::EBUSY, attr));
         }
-        for i in 0..table.chains[c].rules.len() {
-            events.push(NftEvent {
-                msg: DELRULE,
-                flags: 0,
-                seq: r.seq,
-                family: r.family,
-                attrs: table.rule_attrs(&table.chains[c], i, false),
-                echo: r.echo(),
-            });
-        }
+        events.push_del_rules(r, r.family, table, &table.chains[c]);
         let mut removed = table.chains.remove(c);
         removed.rules.clear();
-        for attrs in table.drop_unused_anonymous() {
-            events.push(NftEvent {
-                msg: DELSET,
-                flags: 0,
-                seq: r.seq,
-                family: r.family,
-                attrs,
-                echo: r.echo(),
-            });
-        }
-        events.push(NftEvent {
-            msg: DELCHAIN,
-            flags: 0,
-            seq: r.seq,
-            family: r.family,
-            attrs: table.chain_attrs(&removed),
-            echo: r.echo(),
-        });
+        events.push_del_sets(r, table.drop_unused_anonymous());
+        events.push(r, DELCHAIN, 0, table.chain_attrs(&removed));
         Ok(())
     }
 
-    fn new_rule(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) -> Result<(), Fail> {
+    fn new_rule(&mut self, r: &Req<'_>, events: &mut Events) -> Result<(), Fail> {
         let t = self.table_of(r, RULE_TABLE, None)?;
         let table = &mut self.tables[t];
         let c = match (
@@ -1609,32 +1583,9 @@ impl Nft {
             let new_attrs = table.rule_attrs_pos(&table.chains[c], at, pos_handle);
             // Linux's nf_tables_commit always sets NLM_F_APPEND on replace notifications so
             // nft -e prints `add rule` rather than `insert rule`.
-            events.push(NftEvent {
-                msg: DELRULE,
-                flags: NLM_F_APPEND,
-                seq: r.seq,
-                family: r.family,
-                attrs: old_attrs,
-                echo: r.echo(),
-            });
-            events.push(NftEvent {
-                msg: NEWRULE,
-                flags: NLM_F_APPEND,
-                seq: r.seq,
-                family: r.family,
-                attrs: new_attrs,
-                echo: r.echo(),
-            });
-            for attrs in table.drop_unused_anonymous() {
-                events.push(NftEvent {
-                    msg: DELSET,
-                    flags: 0,
-                    seq: r.seq,
-                    family: r.family,
-                    attrs,
-                    echo: r.echo(),
-                });
-            }
+            events.push(r, DELRULE, NLM_F_APPEND, old_attrs);
+            events.push(r, NEWRULE, NLM_F_APPEND, new_attrs);
+            events.push_del_sets(r, table.drop_unused_anonymous());
             return Ok(());
         }
         let rules = &mut table.chains[c].rules;
@@ -1646,18 +1597,16 @@ impl Nft {
         };
         rules.insert(at, rule);
         let new_attrs = table.rule_attrs_pos(&table.chains[c], at, pos_handle);
-        events.push(NftEvent {
-            msg: NEWRULE,
-            flags: r.flags & (NLM_F_CREATE | NLM_F_EXCL | NLM_F_APPEND),
-            seq: r.seq,
-            family: r.family,
-            attrs: new_attrs,
-            echo: r.echo(),
-        });
+        events.push(
+            r,
+            NEWRULE,
+            r.flags & (NLM_F_CREATE | NLM_F_EXCL | NLM_F_APPEND),
+            new_attrs,
+        );
         Ok(())
     }
 
-    fn del_rule(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) -> Result<(), Fail> {
+    fn del_rule(&mut self, r: &Req<'_>, events: &mut Events) -> Result<(), Fail> {
         let t = self.table_of(r, RULE_TABLE, None)?;
         let table = &mut self.tables[t];
         let chain = get_str(&r.attrs, RULE_CHAIN);
@@ -1680,44 +1629,19 @@ impl Nft {
                         .ok_or_else(|| bad(Errno::ENOENT, get(&r.attrs, RULE_HANDLE)))?;
                     let attrs = table.rule_attrs(&table.chains[ci], at, false);
                     table.chains[ci].rules.remove(at);
-                    events.push(NftEvent {
-                        msg: DELRULE,
-                        flags: 0,
-                        seq: r.seq,
-                        family: r.family,
-                        attrs,
-                        echo: r.echo(),
-                    });
+                    events.push(r, DELRULE, 0, attrs);
                 }
                 None => {
-                    for i in 0..table.chains[ci].rules.len() {
-                        events.push(NftEvent {
-                            msg: DELRULE,
-                            flags: 0,
-                            seq: r.seq,
-                            family: r.family,
-                            attrs: table.rule_attrs(&table.chains[ci], i, false),
-                            echo: r.echo(),
-                        });
-                    }
+                    events.push_del_rules(r, r.family, table, &table.chains[ci]);
                     table.chains[ci].rules.clear();
                 }
             }
         }
-        for attrs in table.drop_unused_anonymous() {
-            events.push(NftEvent {
-                msg: DELSET,
-                flags: 0,
-                seq: r.seq,
-                family: r.family,
-                attrs,
-                echo: r.echo(),
-            });
-        }
+        events.push_del_sets(r, table.drop_unused_anonymous());
         Ok(())
     }
 
-    fn new_set(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) -> Result<(), Fail> {
+    fn new_set(&mut self, r: &Req<'_>, events: &mut Events) -> Result<(), Fail> {
         let t = self.table_of(r, SET_TABLE, None)?;
         let table = &mut self.tables[t];
         let attr = get(&r.attrs, SET_NAME);
@@ -1771,18 +1695,16 @@ impl Nft {
             dynamic: Default::default(),
             elems: Default::default(),
         });
-        events.push(NftEvent {
-            msg: NEWSET,
-            flags: r.flags & (NLM_F_CREATE | NLM_F_EXCL),
-            seq: r.seq,
-            family: r.family,
-            attrs: table.set_attrs(table.sets.last().unwrap()),
-            echo: r.echo(),
-        });
+        events.push(
+            r,
+            NEWSET,
+            r.flags & (NLM_F_CREATE | NLM_F_EXCL),
+            table.set_attrs(table.sets.last().unwrap()),
+        );
         Ok(())
     }
 
-    fn del_set(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) -> Result<(), Fail> {
+    fn del_set(&mut self, r: &Req<'_>, events: &mut Events) -> Result<(), Fail> {
         let t = self.table_of(r, SET_TABLE, None)?;
         let table = &mut self.tables[t];
         let (s, attr) = match (get_be64(&r.attrs, SET_HANDLE), get_str(&r.attrs, SET_NAME)) {
@@ -1802,18 +1724,11 @@ impl Nft {
         }
         let attrs = table.set_attrs(&table.sets[s]);
         table.sets.remove(s);
-        events.push(NftEvent {
-            msg: DELSET,
-            flags: 0,
-            seq: r.seq,
-            family: r.family,
-            attrs,
-            echo: r.echo(),
-        });
+        events.push(r, DELSET, 0, attrs);
         Ok(())
     }
 
-    fn set_elems(&mut self, r: &Req<'_>, events: &mut Vec<NftEvent>) -> Result<(), Fail> {
+    fn set_elems(&mut self, r: &Req<'_>, events: &mut Events) -> Result<(), Fail> {
         let t = self.table_of(r, SET_ELEM_LIST_TABLE, None)?;
         let table = &mut self.tables[t];
         let s = match (
@@ -1827,49 +1742,28 @@ impl Nft {
             _ => None,
         }
         .ok_or_else(|| bad(Errno::ENOENT, get(&r.attrs, SET_ELEM_LIST_SET)))?;
-        let tname = table.name.clone();
-        let sname = table.sets[s].name.clone();
         let list = get(&r.attrs, SET_ELEM_LIST_ELEMENTS).map(crate::route::attrs);
         if r.msg == DELSETELEM && list.is_none() {
             let now = Instant::now();
-            for elem in table.sets[s].elems.get_mut().drain(..) {
-                events.push(NftEvent {
-                    msg: DELSETELEM,
-                    flags: 0,
-                    seq: r.seq,
-                    family: r.family,
-                    attrs: encode_elems_attrs(&tname, &sname, [elem.as_slice()]),
-                    echo: r.echo(),
-                });
+            let set = &mut table.sets[s];
+            for elem in set.elems.get_mut().drain(..) {
+                events.push_elem(r, DELSETELEM, 0, &table.name, &set.name, &elem);
             }
-            for (_, entry) in table.sets[s].dynamic.get_mut().drain() {
+            for (_, entry) in set.dynamic.get_mut().drain() {
                 if entry.live(now) {
-                    events.push(NftEvent {
-                        msg: DELSETELEM,
-                        flags: 0,
-                        seq: r.seq,
-                        family: r.family,
-                        attrs: encode_elems_attrs(&tname, &sname, [entry.wire.as_slice()]),
-                        echo: r.echo(),
-                    });
+                    events.push_elem(r, DELSETELEM, 0, &table.name, &set.name, &entry.wire);
                 }
             }
             return Ok(());
         }
         for (_, e) in list.unwrap_or_default() {
             let key = elem_key(e).ok_or_else(|| bad(Errno::EINVAL, Some(e)))?;
-            let dynamic = table.sets[s].dynamic.get_mut();
+            let set = &mut table.sets[s];
+            let dynamic = set.dynamic.get_mut();
             if dynamic.get(&key).is_some_and(|e| e.live(Instant::now())) {
                 if r.msg == DELSETELEM {
                     if let Some(removed) = dynamic.remove(&key) {
-                        events.push(NftEvent {
-                            msg: DELSETELEM,
-                            flags: 0,
-                            seq: r.seq,
-                            family: r.family,
-                            attrs: encode_elems_attrs(&tname, &sname, [removed.wire.as_slice()]),
-                            echo: r.echo(),
-                        });
+                        events.push_elem(r, DELSETELEM, 0, &table.name, &set.name, &removed.wire);
                     }
                 } else if r.flags & NLM_F_EXCL != 0 {
                     return Err(bad(Errno::EEXIST, Some(e)));
@@ -1877,7 +1771,7 @@ impl Nft {
                 continue;
             }
             let at =
-                table.sets[s].elems.borrow().iter().position(|x| {
+                set.elems.borrow().iter().position(|x| {
                     elem_key(x).as_ref() == Some(&key) && elem_flags(x) == elem_flags(e)
                 });
             match (r.msg, at) {
@@ -1889,26 +1783,19 @@ impl Nft {
                     let elem = table
                         .check_verdict(&unflag(e), SET_ELEM_DATA, None)
                         .map_err(|f| bad(Errno(f.errno), Some(e)))?;
-                    events.push(NftEvent {
-                        msg: NEWSETELEM,
-                        flags: r.flags & (NLM_F_CREATE | NLM_F_EXCL),
-                        seq: r.seq,
-                        family: r.family,
-                        attrs: encode_elems_attrs(&tname, &sname, [elem.as_slice()]),
-                        echo: r.echo(),
-                    });
+                    events.push_elem(
+                        r,
+                        NEWSETELEM,
+                        r.flags & (NLM_F_CREATE | NLM_F_EXCL),
+                        &table.name,
+                        &table.sets[s].name,
+                        &elem,
+                    );
                     table.sets[s].elems.get_mut().push(elem);
                 }
                 (_, Some(i)) => {
                     let removed = table.sets[s].elems.get_mut().remove(i);
-                    events.push(NftEvent {
-                        msg: DELSETELEM,
-                        flags: 0,
-                        seq: r.seq,
-                        family: r.family,
-                        attrs: encode_elems_attrs(&tname, &sname, [removed.as_slice()]),
-                        echo: r.echo(),
-                    });
+                    events.push_elem(r, DELSETELEM, 0, &table.name, &table.sets[s].name, &removed);
                 }
                 (_, None) => return Err(bad(Errno::ENOENT, Some(e))),
             }
@@ -2038,20 +1925,16 @@ impl Table {
     /// Removes the anonymous sets no rule uses any more (they go away with the rules when those
     /// are deleted) and returns each removed set's encoded attributes for `DELSET` notifications.
     fn drop_unused_anonymous(&mut self) -> Vec<Vec<u8>> {
-        let unused: Vec<Vec<u8>> = self
-            .sets
-            .iter()
-            .filter(|s| s.flags & NFT_SET_ANONYMOUS != 0 && !self.uses_set(&s.name))
-            .map(|s| s.name.clone())
-            .collect();
-        let attrs = self
-            .sets
-            .iter()
-            .filter(|s| unused.contains(&s.name))
-            .map(|s| self.set_attrs(s))
-            .collect();
-        self.sets.retain(|s| !unused.contains(&s.name));
-        attrs
+        let mut dropped = Vec::new();
+        for (i, s) in self.sets.iter().enumerate() {
+            if s.flags & NFT_SET_ANONYMOUS != 0 && !self.uses_set(&s.name) {
+                dropped.push((i, self.set_attrs(s)));
+            }
+        }
+        for &(i, _) in dropped.iter().rev() {
+            self.sets.remove(i);
+        }
+        dropped.into_iter().map(|(_, attrs)| attrs).collect()
     }
 
     /// Whether some rule uses set `name` (lookup, dynset).
@@ -5648,37 +5531,44 @@ pub(crate) mod tests {
                 .map_or(0, |b| u16::from_be_bytes([b[0], b[1]]));
             (ty, flags, seq, pid, fam, res_id)
         };
+        let attrs = |items: &[(u16, &[u8])]| {
+            let mut out = Vec::new();
+            for &(t, v) in items {
+                a(&mut out, t, v);
+            }
+            out
+        };
         let req = |op: u8, flags: u16, seq: u32, fam: u8, body: &[u8]| {
             nfmsg(nft_type(op), NLM_F_REQUEST | flags, seq, 0, fam, 0, body)
         };
-        let a = crate::net::attr;
+        let send = |msgs: &[Vec<u8>]| super::handle_with_notes(&ns, &root, &batch(msgs), &p);
+        let ops = |res: &HandleResult| res.notes.iter().map(|n| n.msg[4]).collect::<Vec<_>>();
 
         // 1. Create table + chain + rule with NLM_F_ECHO | NLM_F_ACK:
         //    echoes + NEWGEN arrive before NLMSG_ERROR acks, with res_id = generation (2).
-        let mut tp = Vec::new();
-        a(&mut tp, TABLE_NAME, &cstr(b"t"));
-        let mut cp = Vec::new();
-        a(&mut cp, CHAIN_TABLE, &cstr(b"t"));
-        a(&mut cp, CHAIN_NAME, &cstr(b"c"));
-        let mut rp = Vec::new();
-        a(&mut rp, RULE_TABLE, &cstr(b"t"));
-        a(&mut rp, RULE_CHAIN, &cstr(b"c"));
-        let res = super::handle_with_notes(
-            &ns,
-            &root,
-            &batch(&[
-                req(NEWTABLE, NLM_F_CREATE | NLM_F_ECHO | NLM_F_ACK, 10, 2, &tp),
-                req(NEWCHAIN, NLM_F_CREATE | NLM_F_ECHO | NLM_F_ACK, 11, 2, &cp),
-                req(
-                    NEWRULE,
-                    NLM_F_CREATE | NLM_F_APPEND | NLM_F_ECHO | NLM_F_ACK,
-                    12,
-                    2,
-                    &rp,
-                ),
-            ]),
-            &p,
-        );
+        let res = send(&[
+            req(
+                NEWTABLE,
+                NLM_F_CREATE | NLM_F_ECHO | NLM_F_ACK,
+                10,
+                2,
+                &attrs(&[(TABLE_NAME, &cstr(b"t"))]),
+            ),
+            req(
+                NEWCHAIN,
+                NLM_F_CREATE | NLM_F_ECHO | NLM_F_ACK,
+                11,
+                2,
+                &attrs(&[(CHAIN_TABLE, &cstr(b"t")), (CHAIN_NAME, &cstr(b"c"))]),
+            ),
+            req(
+                NEWRULE,
+                NLM_F_CREATE | NLM_F_APPEND | NLM_F_ECHO | NLM_F_ACK,
+                12,
+                2,
+                &attrs(&[(RULE_TABLE, &cstr(b"t")), (RULE_CHAIN, &cstr(b"c"))]),
+            ),
+        ]);
         let reply_dgrams = drain_items(res.replies, 4096);
         assert_eq!(reply_dgrams.len(), 7); // 3 echoes + NEWGEN + 3 acks
         assert_eq!(res.notes.len(), 4); // NEWTABLE, NEWCHAIN, NEWRULE, NEWGEN
@@ -5721,16 +5611,12 @@ pub(crate) mod tests {
 
         // 2. Replace rule emits DELRULE + NEWRULE + NEWGEN; without NLM_F_ECHO, replies stay
         //    empty while monitor notes still fire.
-        let mut rep = Vec::new();
-        a(&mut rep, RULE_TABLE, &cstr(b"t"));
-        a(&mut rep, RULE_CHAIN, &cstr(b"c"));
-        a(&mut rep, RULE_HANDLE, &be64(2));
-        let res = super::handle_with_notes(
-            &ns,
-            &root,
-            &batch(&[req(NEWRULE, NLM_F_REPLACE, 20, 2, &rep)]),
-            &p,
-        );
+        let rep = attrs(&[
+            (RULE_TABLE, &cstr(b"t")),
+            (RULE_CHAIN, &cstr(b"c")),
+            (RULE_HANDLE, &be64(2)),
+        ]);
+        let res = send(&[req(NEWRULE, NLM_F_REPLACE, 20, 2, &rep)]);
         assert!(res.replies.is_empty());
         assert_eq!(res.notes.len(), 3);
         assert!(res.notes.iter().all(|n| !n.echo));
@@ -5745,69 +5631,59 @@ pub(crate) mod tests {
         assert_eq!(hdr(&res.notes[2].msg), (nft_type(NEWGEN), 0, 20, 77, 0, 3));
 
         // 3. Set + elements + flush set + flush ruleset cascade.
-        let mut sp = Vec::new();
-        a(&mut sp, SET_TABLE, &cstr(b"t"));
-        a(&mut sp, SET_NAME, &cstr(b"s"));
-        a(&mut sp, SET_KEY_LEN, &be32(4));
-        let mut elem1 = Vec::new();
-        a(&mut elem1, SET_ELEM_KEY, &value(&[10, 0, 0, 1]));
-        let mut elem2 = Vec::new();
-        a(&mut elem2, SET_ELEM_KEY, &value(&[10, 0, 0, 2]));
-        let mut elist = Vec::new();
-        a(&mut elist, LIST_ELEM, &elem1);
-        a(&mut elist, LIST_ELEM, &elem2);
-        let mut ep = Vec::new();
-        a(&mut ep, SET_ELEM_LIST_TABLE, &cstr(b"t"));
-        a(&mut ep, SET_ELEM_LIST_SET, &cstr(b"s"));
-        a(&mut ep, SET_ELEM_LIST_ELEMENTS, &elist);
-        let res = super::handle_with_notes(
-            &ns,
-            &root,
-            &batch(&[
-                req(NEWSET, NLM_F_CREATE | NLM_F_ECHO, 30, 2, &sp),
-                req(NEWSETELEM, NLM_F_CREATE | NLM_F_ECHO, 31, 2, &ep),
-            ]),
-            &p,
-        );
-        let ops: Vec<u8> = res.notes.iter().map(|n| n.msg[4]).collect();
-        assert_eq!(ops, [NEWSET, NEWSETELEM, NEWSETELEM, NEWGEN]);
+        let sp = attrs(&[
+            (SET_TABLE, &cstr(b"t")),
+            (SET_NAME, &cstr(b"s")),
+            (SET_KEY_LEN, &be32(4)),
+        ]);
+        let elem1 = attrs(&[(SET_ELEM_KEY, &value(&[10, 0, 0, 1]))]);
+        let elem2 = attrs(&[(SET_ELEM_KEY, &value(&[10, 0, 0, 2]))]);
+        let elist = attrs(&[(LIST_ELEM, &elem1), (LIST_ELEM, &elem2)]);
+        let ep = attrs(&[
+            (SET_ELEM_LIST_TABLE, &cstr(b"t")),
+            (SET_ELEM_LIST_SET, &cstr(b"s")),
+            (SET_ELEM_LIST_ELEMENTS, &elist),
+        ]);
+        let res = send(&[
+            req(NEWSET, NLM_F_CREATE | NLM_F_ECHO, 30, 2, &sp),
+            req(NEWSETELEM, NLM_F_CREATE | NLM_F_ECHO, 31, 2, &ep),
+        ]);
+        assert_eq!(ops(&res), [NEWSET, NEWSETELEM, NEWSETELEM, NEWGEN]);
         assert_eq!(drain_items(res.replies, 4096).len(), 4);
 
         // Flush set emits one DELSETELEM per element + NEWGEN.
-        let mut fp = Vec::new();
-        a(&mut fp, SET_ELEM_LIST_TABLE, &cstr(b"t"));
-        a(&mut fp, SET_ELEM_LIST_SET, &cstr(b"s"));
-        let res =
-            super::handle_with_notes(&ns, &root, &batch(&[req(DELSETELEM, 0, 32, 2, &fp)]), &p);
-        let ops: Vec<u8> = res.notes.iter().map(|n| n.msg[4]).collect();
-        assert_eq!(ops, [DELSETELEM, DELSETELEM, NEWGEN]);
+        let fp = attrs(&[
+            (SET_ELEM_LIST_TABLE, &cstr(b"t")),
+            (SET_ELEM_LIST_SET, &cstr(b"s")),
+        ]);
+        let res = send(&[req(DELSETELEM, 0, 32, 2, &fp)]);
+        assert_eq!(ops(&res), [DELSETELEM, DELSETELEM, NEWGEN]);
 
         // 4. Failed batch emits zero echoes, zero monitor notes, and does not advance generation.
         let gen_before = generation(&ns);
-        let mut bad_chain = Vec::new();
-        a(&mut bad_chain, CHAIN_TABLE, &cstr(b"missing"));
-        a(&mut bad_chain, CHAIN_NAME, &cstr(b"x"));
-        let res = super::handle_with_notes(
-            &ns,
-            &root,
-            &batch(&[
-                req(NEWTABLE, NLM_F_CREATE | NLM_F_ECHO, 40, 2, &{
-                    let mut p = Vec::new();
-                    a(&mut p, TABLE_NAME, &cstr(b"t2"));
-                    p
-                }),
-                req(NEWCHAIN, NLM_F_CREATE | NLM_F_ECHO, 41, 2, &bad_chain),
-            ]),
-            &p,
-        );
+        let res = send(&[
+            req(
+                NEWTABLE,
+                NLM_F_CREATE | NLM_F_ECHO,
+                40,
+                2,
+                &attrs(&[(TABLE_NAME, &cstr(b"t2"))]),
+            ),
+            req(
+                NEWCHAIN,
+                NLM_F_CREATE | NLM_F_ECHO,
+                41,
+                2,
+                &attrs(&[(CHAIN_TABLE, &cstr(b"missing")), (CHAIN_NAME, &cstr(b"x"))]),
+            ),
+        ]);
         assert!(res.notes.is_empty());
         assert_eq!(errors(&drain_items(res.replies, 4096)), [Errno::ENOENT.0]);
         assert_eq!(generation(&ns), gen_before);
 
         // 5. Flush ruleset cascades DELRULE -> DELSET -> DELCHAIN -> DELTABLE -> NEWGEN.
-        let res = super::handle_with_notes(&ns, &root, &batch(&[req(DELTABLE, 0, 50, 0, &[])]), &p);
-        let ops: Vec<u8> = res.notes.iter().map(|n| n.msg[4]).collect();
-        assert_eq!(ops, [DELRULE, DELSET, DELCHAIN, DELTABLE, NEWGEN]);
+        let res = send(&[req(DELTABLE, 0, 50, 0, &[])]);
+        assert_eq!(ops(&res), [DELRULE, DELSET, DELCHAIN, DELTABLE, NEWGEN]);
 
         // 6. NetlinkSocket::notify_proto delivers NFNLGRP_NFTABLES only to subscribed
         //    NETLINK_NETFILTER sockets (not NETLINK_ROUTE).
