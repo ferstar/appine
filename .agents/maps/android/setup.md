@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/setup.md` for the paired decision history (it still holds the decisions on the Settings screen made before it was split out into `android/settings`).
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across package verification, store publication, per-start setup, OpenRC, account selection and shell integration)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: serialized first-login admin setup, rules deduplication, and world-registration gating for bash and doas in login.sh)
 
 ## Responsibilities
 
@@ -325,7 +327,8 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   - every login, root's included: rewrite the NOPASSWD rules for recorded admins still in the
     group that have no password: a shadow field that, after any leading `!`s, is empty or `*`
     (`adduser -D` writes `!`); `passwd -l`'s `!` before a hash still counts as a password, and so
-    do a missing shadow entry and an unreadable `/etc/shadow`. The file is written beside it,
+    do a missing shadow entry and an unreadable `/etc/shadow`. Duplicate or blank rows in
+    `/var/lib/appine/admins` are skipped defensively. The file is written beside it,
     made 0440 and renamed into place; with nobody qualifying, or without the rules' directory
     (on Debian, until sudo is installed), it is deleted;
   - the first service poll for each machine runs `--refresh-rules` as root without a console.
@@ -339,30 +342,37 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     re-add each by name for upgrades, and delete its cache under the lock only on success. Failure
     leaves the cache for the next login and still opens a shell; later user removal is respected.
     This works with any login shell; `--refresh-rules` returns before installing;
-  - every login whose account's passwd shell is `/bin/bash` while bash is missing and
-    `/var/cache/appine/bash` exists: install those packages offline, then add `bash` once more by
-    name (so world records it and `apk upgrade` upgrades it), under the install lock (below), and
-    delete the directory once bash is there, so bash removed later is not installed again; if it
-    is still missing (Ctrl-C while the install waited, below), say so and use `/bin/sh` this time,
-    and the next login tries again;
+  - every login whose account's passwd shell is `/bin/bash` while `/var/cache/appine/bash` exists:
+    under the install lock, recheck the bundle, install its packages offline if `bash` is absent
+    (`! apk info -e bash` or `[ ! -x /bin/bash ]`), add `bash` by name (so world records it and
+    `apk upgrade` upgrades it), and delete the bundle only after that succeeds, so bash removed
+    later is not reinstalled. If registration fails after the local packages installed, the session
+    still execs `/bin/bash` and retries on the next login; if `/bin/bash` is missing, it falls back
+    to `/bin/sh` and retries next login;
   - root: `cd` to the directory (else root's home, else `/`) and `exec` root's passwd shell (or
     `/bin/sh` when it is not executable) as a login shell;
-  - any selected account whose name is not `root` and is absent from `/var/lib/appine/admins` (matched literally): add it to wheel
-    (Alpine, with `permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel` in
-    `20-wheel.conf`, also upgrading an unmodified stock `permit persist :wheel` file on
-    `refresh_rules` and `Rootfs.ensureLoginTools`/`updateProfile`) or sudo (Debian) and record it
-    once it really is in the group (otherwise say so and retry at the next login);
-  - a selected non-root account, while the tool's marker is missing and the tool is not on PATH (whether or
-    not the account was just made an admin): install doas from the bundled package and re-add it
-    by name under the install lock, or sudo from the network showing apt's progress (Ctrl-C skips
-    until the next login; no install lock is taken: `apt_update` retries `apt-get update` every 2 s
-    while another apt holds the package lists' lock, saying so once and showing apt's other errors
-    and warnings after it ends, and `apt-get install` waits up to an hour for dpkg's lock through
-    `DPkg::Lock::Timeout`, which apt shows on the terminal), and touch the marker once the tool is
-    there;
+  - any selected account other than `root` absent from `/var/lib/appine/admins` (matched literally):
+    under `/run/appine-rules.lock`, recheck `admins`, add it to wheel (Alpine, atomically writing
+    `permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel` to `20-wheel.conf` when
+    absent or still the unmodified stock `permit persist :wheel`, or appending it once to a custom
+    file lacking both; `refresh_rules` and `Rootfs.ensureLoginTools`/`updateProfile` also upgrade
+    the unmodified stock file) or sudo (Debian), and append it to `admins` once it really is in the
+    group (else warn and retry at the next login);
+  - a selected non-root account (whether or not just made an admin) while its marker is missing:
+    on Alpine (`/var/lib/appine/doas-installed`), under the install lock, recheck the marker,
+    install `/var/cache/appine/doas.apk` if `doas` is not on PATH, run `apk_add doas` if just
+    installed or apk-managed (`apk info -e doas`, leaving a custom non-apk `doas` alone), and
+    create the marker only after that succeeds (retrying partial installs while respecting later
+    user removal); on Debian (`/var/lib/appine/sudo-installed`), if `sudo` is not on PATH, install
+    it from the network showing apt's progress (Ctrl-C skips until the next login; no install lock:
+    `apt_update` retries `apt-get update` every 2 s while another apt holds the package lists' lock,
+    saying so once and showing other errors and warnings afterward, and `apt-get install` waits up
+    to an hour for dpkg's lock via `DPkg::Lock::Timeout`), then touch the marker once `sudo` is on
+    PATH;
   - the install lock: a `flock` on `/run/appine-install.lock` held around each install of a bundled
-    package (`locked` runs `flock 9 && "$@"` so commands never run if acquiring the lock fails), so concurrent logins install bash, doas, procps-ng and bubblewrap one after another, each first
-    checking whether an earlier holder installed it already; each `apk add` (`apk_add`) that fails
+    package (`locked` runs `cancellable flock 9 && "$@"` so commands never run if acquiring the lock
+    fails), so concurrent logins install bash, doas, procps-ng and bubblewrap one after another,
+    each first rechecking completion state under the lock; each `apk add` (`apk_add`) that fails
     on apk's own lock, held by an apk the user runs, prints that another apk is running and is
     retried with `--wait 3600`, so the login waits until that apk ends; Ctrl-C stops the wait and
     skips the install until the next login;
@@ -423,8 +433,12 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   fresh `scripts/fetch-rootfs` fail until it is pinned anew.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
   rows on a resize; `android/vtcore`): bash, busybox ash and zsh do.
-- The writer of the generated NOPASSWD rules holds the root-only lock from reading the
-  accounts through publication or removal. A failed publication attempts to remove stale grants.
+- First-login admin setup (`ensure_admin`) and the writer of the generated NOPASSWD rules
+  (`refresh_rules`) share the root-only `/run/appine-rules.lock` (never nested with
+  `/run/appine-install.lock`; both lockfiles are created under `umask 077`, with `ensure_admin` and
+  `locked` restoring the caller's umask before modifying files or running commands). `refresh_rules`
+  holds the lock from reading the accounts through publication or removal, and deduplicates repeated
+  rows in `/var/lib/appine/admins`. A failed publication attempts to remove stale grants.
   Reading account files and publishing in the rules subdirectory do not change the sampled
   inputs. The service polls every 2 s independently of the Files app's directory notifications.
 - `login.sh` runs without job control (its children share its process group), so `SIGINT` stays
@@ -434,12 +448,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ## Confirmed bugs / technical debt
 
-- Two simultaneous first logins for the same account can both append its name to
-  `/var/lib/appine/admins`. The membership check and append happen outside the generated-rules
-  lock. Duplicate rows can produce duplicate rules.
-- Bash and doas can be installed from a local APK even if the subsequent add-by-name step
-  fails. Bash's executable permits cache removal, and finding doas on PATH sets its marker.
-  Later logins can therefore skip the step that records the package by name for upgrades.
+None.
 
 ## Open questions
 
