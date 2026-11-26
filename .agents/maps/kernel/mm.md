@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across VMA layout, page faults, permission changes, file invalidation and dump selection)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: allocation-free superpage-clear fallback on file truncation and FUSE invalidation demotion OOM)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: MREMAP_DONTUNMAP whole-vs-partial anon_vma unlinking, retained anon_pgoff, whole-VMA unlock and reserved dump_page guard)
 
 ## Responsibilities
 
@@ -298,16 +298,18 @@ Otherwise the populated page-table levels determine the translation-fault level.
 - `MREMAP_DONTUNMAP` follows 6.1's order: no mapping at the old address `EFAULT`, the target
   `EINVAL`, the margin `ENOMEM`, the target unmapped, the one-VMA rule `EFAULT`; it splits nothing
   before these, then checks room for the endpoint splits and the actual remnant count.
-  At the old address one empty anonymous VMA starts with the old address's page offset
-  and no anon_vma. A partial remnant has a boundary with faulted source fragments until
-  a later merge. A private FUSE remnant remaps the same memfd, retaining its fill
-  and zero `file_len`. Ordinary private files produce one `Refill` per compatible run of
-  retained descriptors, mount pins, tmpfs mappings and interpreter opens. The syscall
-  maps those descriptors even after unlink. Shared aliases coalesce over contiguous spans
-  in the same host region and attachment with compatible pins and one accessible prefix.
-  All remnants keep their source permissions, commit charge and non-lock flags. The syscall calls
-  `reap_shm`. `shmat` also refuses non-zero fixed addresses below `vm.mmap_min_addr` without
-  `CAP_SYS_RAWIO` (`EPERM`).
+  At the old address an empty anonymous remnant retains the source `anon_pgoff`, unlinks
+  `anon_vma` and fork identity only on a whole-VMA move (leaving partial remnants joined with
+  remaining source siblings and not merging whole-VMA remnants with faulted neighbours until a
+  later merge), and clears `VM_LOCKED` across the entire old VMA while the moved range stays
+  locked. Private file remnants likewise clear fork `anon` only on a whole-VMA move: a private
+  FUSE remnant remaps the same memfd, retaining its fill and zero `file_len`, and ordinary
+  private files produce one `Refill` per compatible run of retained descriptors, mount pins,
+  tmpfs mappings and interpreter opens (mapped even after unlink). Shared aliases coalesce over
+  contiguous spans in the same host region and attachment with compatible pins and one
+  accessible prefix. All remnants keep their source permissions, commit charge and non-lock
+  flags. The syscall calls `reap_shm`. `shmat` also refuses non-zero fixed addresses below
+  `vm.mmap_min_addr` without `CAP_SYS_RAWIO` (`EPERM`).
 - `mremap` with an old length of 0 duplicates (6.1's "duplicate shm area"): the VMA holding the
   address (`EFAULT` if none) must be shared (`EINVAL`; a `MREMAP_FIXED` target is validated and
   unmapped before this check), and without `MREMAP_MAYMOVE` it is `ENOMEM`; no margin is asked. A
@@ -505,9 +507,6 @@ Otherwise the populated page-table levels determine the translation-fault level.
   host advice or pending graveyard release can keep the region shared. Moving the host allocation
   would invalidate live guest translations or loans. Shared-file DONTUNMAP aliases spanning
   distinct host regions retain one remnant per compatible region.
-- Appine creates a fresh anonymous remnant even on a partial DONTUNMAP or a move of a previously
-  relocated mapping. Linux 6.1 unlinks the old anon_vma only on a whole-VMA move and retains the
-  old page offset.
 
 ## Open questions
 

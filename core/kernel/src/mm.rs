@@ -1149,8 +1149,8 @@ impl Vma {
 /// `PROT_GROWSDOWN`. Pieces of one shared anonymous mapping have contiguous offsets in the
 /// same host region.
 fn same_vma(a: &Vma, b: &Vma) -> bool {
-    // A fresh DONTUNMAP remnant can keep its original linear offset alongside a
-    // faulted source fragment. It has its own lifetime until a later VMA merge.
+    // A whole-VMA DONTUNMAP unlinks the old anon_vma without merging it back into a
+    // faulted neighbour until a later VMA merge.
     a.has_anon_vma.get() == b.has_anon_vma.get() && can_merge(a, b)
 }
 
@@ -3145,6 +3145,9 @@ impl Mm {
         };
         // Count the retained backing runs before splitting either endpoint.
         let (&first, mut prev) = self.vmas.range(..=old).next_back().unwrap();
+        let vma_start = self.vma_start(first);
+        let vma_end = self.vma_end(first);
+        let whole_vma = old == vma_start && end == vma_end;
         let mut bounds = vec![old];
         for (&s, v) in self.vmas.range(first + 1..end) {
             if !Self::same_remnant(prev, v) {
@@ -3172,10 +3175,13 @@ impl Mm {
                         v.prot & prot::WRITE != 0 && !v.noreserve,
                     )?;
                     remnant.file_len = len;
-                    remnant.anon = 0;
-                    remnant.anon_pgoff = s / PAGE_SIZE;
                     remnant.written.set(false);
-                    remnant.has_anon_vma.set(false);
+                    // Linux 6.1's `move_vma` unlinks `anon_vma` only on a whole-VMA move and
+                    // retains the old `vm_pgoff`.
+                    if whole_vma {
+                        remnant.anon = 0;
+                        remnant.has_anon_vma.set(false);
+                    }
                 }
                 Backing::Shared => {
                     remnant.file_len = self.vmas.range(s..stop).map(|(_, v)| v.file_len).sum();
@@ -3184,8 +3190,15 @@ impl Mm {
                     (remnant.region, remnant.host) = Self::fill_host(v, v.offset(), len)?;
                     remnant.cow = false;
                     remnant.written.set(v.prot & prot::WRITE != 0);
+                    if whole_vma {
+                        remnant.anon = 0;
+                    }
                 }
                 Backing::PrivateFile => {
+                    let mut flags = VmaFlags::of(v);
+                    if whole_vma {
+                        flags.anon = 0;
+                    }
                     refill.push(Refill {
                         start: s,
                         len,
@@ -3194,7 +3207,7 @@ impl Mm {
                         offset: v.offset(),
                         name: v.name.clone(),
                         mnt: v.mnt.as_ref().map(|m| m.0),
-                        flags: VmaFlags::of(v),
+                        flags,
                         file: v.file.as_ref().map(|(fd, _)| fd.clone()),
                         tmpfs: v.tmpfs().cloned(),
                         interp_open: v.interp_open.clone(),
@@ -3205,9 +3218,18 @@ impl Mm {
             remnants.push((s, remnant));
         }
         self.move_range(old, len, dst)?;
+        if !whole_vma {
+            // Linux 6.1's `move_vma` clears VM_LOCKED across the entire old VMA.
+            for (_, v) in self.vmas.range_mut(vma_start..old) {
+                v.locked = false;
+            }
+            for (_, v) in self.vmas.range_mut(end..vma_end) {
+                v.locked = false;
+            }
+        }
         for (s, v) in remnants {
-            // The preflight reserved these slots. A fresh anonymous remnant starts
-            // without the source identity, including on a move of just part of a VMA.
+            // The preflight reserved these slots. `move_vma` does not merge the old VMA with
+            // adjacent neighbours outside the source VMA.
             self.install_vma(s, v)?;
         }
         Ok((dst, refill))
@@ -5981,6 +6003,19 @@ impl Mm {
         low
     }
 
+    /// The end of the Linux VMA ([`same_vma`]) holding piece `start`.
+    fn vma_end(&self, start: u64) -> u64 {
+        let v = &self.vmas[&start];
+        let (mut high, mut below) = (start + v.len, v);
+        for (&s, v) in self.vmas.range(high..) {
+            if s != high || !same_vma(below, v) {
+                break;
+            }
+            (high, below) = (s + v.len, v);
+        }
+        high
+    }
+
     /// The range labelled `[stack]` in `/proc/<pid>/maps`: as on Linux, the mapping containing
     /// the initial stack pointer, plus the grows-down VMAs with the same permissions directly
     /// below it (the parts the stack grew by when host memory was not contiguous).
@@ -6502,7 +6537,7 @@ impl Mm {
             .vmas
             .range(..=addr)
             .next_back()
-            .filter(|&(&s, v)| addr < s + v.contents_len().min(v.len))
+            .filter(|&(&s, v)| !v.reserved() && addr < s + v.contents_len().min(v.len))
         else {
             return false;
         };
@@ -10358,23 +10393,201 @@ mod tests {
     }
 
     #[test]
-    fn partial_dontunmap_keeps_a_fresh_anonymous_remnant() {
-        let (a, dst) = (0x400000, 0x600000);
+    fn partial_dontunmap_retains_anon_vma_and_clears_lock() {
+        let (a, dst, dst2) = (0x400000, 0x600000, 0x700000);
         let p = PAGE_SIZE;
         let mut mm = Mm::new();
         mm.map_anonymous(a, 3 * p, RW).unwrap();
-        mm.write_kernel(a + p, b"x").unwrap();
+        mm.write_kernel(a, b"A").unwrap();
+        mm.write_kernel(a + p, b"B").unwrap();
+        mm.write_kernel(a + 2 * p, b"C").unwrap();
+        mm.set_locked(a, 3 * p, true).unwrap();
+
         mm.mremap_dontunmap(a + p, p, Some(dst)).unwrap();
-        assert!(!mm.in_one_vma(a, a + 3 * p));
-        assert!(!mm.vmas[&(a + p)].has_anon_vma.get());
-        assert_eq!(
-            mm.mremap(a, 3 * p, 3 * p, true, Some(dst + 4 * p)),
-            Err(Errno::EFAULT)
+
+        // Data moved out; the remnant is zeroed while siblings keep their contents.
+        let mut buf = [0u8; 4];
+        mm.read(UserSlice::new(a, 1), &mut buf[0..1]).unwrap();
+        mm.read(UserSlice::new(a + p, 1), &mut buf[1..2]).unwrap();
+        mm.read(UserSlice::new(a + 2 * p, 1), &mut buf[2..3])
+            .unwrap();
+        mm.read(UserSlice::new(dst, 1), &mut buf[3..4]).unwrap();
+        assert_eq!(&buf, b"A\0CB");
+
+        // Partial move retains the source anon_vma and anon_pgoff, clears VM_LOCKED across the
+        // entire old VMA (while the destination stays locked), and keeps [a, a + 3p) one VMA.
+        assert!(mm.in_one_vma(a, a + 3 * p));
+        assert!(
+            mm.regions()
+                .iter()
+                .any(|r| r.start == a && r.end == a + 3 * p && !r.locked)
         );
+        assert!(mm.vmas[&dst].locked);
+        for off in [0, p, 2 * p] {
+            let v = &mm.vmas[&(a + off)];
+            assert!(!v.locked);
+            assert!(v.has_anon_vma.get());
+            assert_eq!(v.anon_pgoff, (a + off) / p);
+        }
+        assert!(!mm.vmas[&(a + p)].written.get());
+
+        // Core dump ANON_PRIVATE still selects the entire logical VMA (including the remnant).
+        let dumped: u64 = mm
+            .dump_regions(dump_filter::ANON_PRIVATE)
+            .into_iter()
+            .filter(|r| r.start >= a && r.end <= a + 3 * p)
+            .map(|r| r.size)
+            .sum();
+        assert_eq!(dumped, 3 * p);
+
+        // Fork assigns one shared child anon identity across all 3 pieces, lending only the
+        // written siblings (not the zeroed remnant).
+        let parent = mm.into_shared();
+        let child = parent.borrow_mut().fork().unwrap();
+        {
+            let mut c = child.borrow_mut();
+            let cid = c.vmas[&a].anon;
+            assert_ne!(cid, 0);
+            assert_eq!(c.vmas[&(a + p)].anon, cid);
+            assert_eq!(c.vmas[&(a + 2 * p)].anon, cid);
+            assert!(c.in_one_vma(a, a + 3 * p));
+            assert!(!c.cow.borrow().borrowed.contains_key(&(a + p)));
+            assert!(c.cow.borrow().borrowed.contains_key(&a));
+            assert!(c.cow.borrow().borrowed.contains_key(&(a + 2 * p)));
+            // Fresh neighbour does not merge with the forked child VMA.
+            c.map_anonymous(a + 3 * p, p, RW).unwrap();
+            assert!(!c.in_one_vma(a, a + 4 * p));
+
+            // Partial DONTUNMAP inside the forked child also retains its child anon identity.
+            c.mremap_dontunmap(a, p, Some(dst2)).unwrap();
+            assert_eq!(c.vmas[&a].anon, cid);
+            assert!(c.vmas[&a].has_anon_vma.get());
+            assert!(c.in_one_vma(a, a + 3 * p));
+            assert!(!c.in_one_vma(a, a + 4 * p));
+        }
+
+        // Moving the partial remnant preserves its old anon_pgoff and does not merge with a
+        // fresh neighbour, while mremap over the whole [a, a + 3p) succeeds as one VMA.
+        let mut mm = parent.borrow_mut();
+        mm.map_anonymous(dst2 + p, p, RW).unwrap();
+        mm.mremap(a + p, p, p, true, Some(dst2)).unwrap();
+        assert_eq!(mm.vmas[&dst2].anon_pgoff, a / p + 1);
+        assert!(!mm.in_one_vma(dst2, dst2 + 2 * p));
+        // Move it back so [a, a + 3p) is contiguous again, then mremap all 3 pages together.
+        mm.mremap(dst2, p, p, true, Some(a + p)).unwrap();
+        assert!(mm.in_one_vma(a, a + 3 * p));
+        assert_eq!(
+            mm.mremap(a, 3 * p, 3 * p, true, Some(dst2 + 4 * p)),
+            Ok(dst2 + 4 * p)
+        );
+
+        // PROT_NONE partial DONTUNMAP leaves a reserved remnant with has_anon_vma == true;
+        // dump_page must treat it as absent rather than dereferencing RESERVED_HOST.
+        let prot_none = dst2 + 4 * p;
+        mm.mprotect(prot_none, 3 * p, 0).unwrap();
+        mm.mremap_dontunmap(prot_none + p, p, Some(a)).unwrap();
+        assert!(mm.vmas[&(prot_none + p)].reserved());
+        assert!(mm.vmas[&(prot_none + p)].has_anon_vma.get());
+        let mut page = vec![0u8; p as usize];
+        assert!(!mm.dump_page(prot_none + p, &mut page));
+    }
+
+    #[test]
+    fn whole_and_partial_dontunmap_of_relocated_mapping_preserve_pgoff() {
+        let p = PAGE_SIZE;
+        let (a, b, c, d) = (0x200000, 0x400000, 0x600000, 0x800000);
+        let mut mm = Mm::new();
+
+        // Map [a, a + 2p), write to attach anon_vma, then relocate to b (anon_pgoff stays a/p).
+        mm.map_anonymous(a, 2 * p, RW).unwrap();
+        mm.write_kernel(a, b"1").unwrap();
+        assert_eq!(mm.mremap(a, 2 * p, 2 * p, true, Some(b)), Ok(b));
+        assert_eq!(mm.vmas[&b].anon_pgoff, a / p);
+        assert!(mm.vmas[&b].has_anon_vma.get());
+
+        // Whole-VMA DONTUNMAP of relocated [b, b + 2p) -> c unlinks anon_vma and keeps anon_pgoff.
+        mm.mremap_dontunmap(b, 2 * p, Some(c)).unwrap();
+        let rem = &mm.vmas[&b];
+        assert!(!rem.has_anon_vma.get());
+        assert!(!rem.written.get());
+        assert_eq!(rem.anon, 0);
+        assert_eq!(rem.anon_pgoff, a / p);
+
+        // Excluded from ANON_PRIVATE core dumps because anon_vma was unlinked.
+        let rem_dump: u64 = mm
+            .dump_regions(dump_filter::ANON_PRIVATE)
+            .into_iter()
+            .filter(|r| r.start == b)
+            .map(|r| r.size)
+            .sum();
+        assert_eq!(rem_dump, 0);
+
+        // Fresh mapping at b + 2p has linear anon_pgoff (b + 2p)/p != a/p + 2, so it does not
+        // join even after mprotect.
+        mm.map_anonymous(b + 2 * p, p, RW).unwrap();
+        assert!(!mm.in_one_vma(b, b + 3 * p));
+        mm.mprotect(b, 3 * p, prot::READ).unwrap();
+        mm.mprotect(b, 3 * p, RW).unwrap();
+        assert!(!mm.in_one_vma(b, b + 3 * p));
+        mm.munmap(b + 2 * p, p).unwrap();
+
+        // Fork preserves the unlinked state and old anon_pgoff; moving the unlinked remnant in the
+        // child resets anon_pgoff to the destination and merges with a fresh neighbour.
         let child = mm.fork().unwrap();
-        assert_eq!(child.borrow().vmas[&(a + p)].anon, 0);
-        mm.mremap(a + p, p, p, true, Some(dst + 4 * p)).unwrap();
-        assert_eq!(mm.vmas[&(dst + 4 * p)].anon_pgoff, dst / p + 4);
+        {
+            let mut ch = child.borrow_mut();
+            assert_eq!(ch.vmas[&b].anon, 0);
+            assert!(!ch.vmas[&b].has_anon_vma.get());
+            assert_eq!(ch.vmas[&b].anon_pgoff, a / p);
+            ch.map_anonymous(d + 2 * p, p, RW).unwrap();
+            ch.mremap(b, 2 * p, 2 * p, true, Some(d)).unwrap();
+            assert_eq!(ch.vmas[&d].anon_pgoff, d / p);
+            assert!(ch.in_one_vma(d, d + 3 * p));
+        }
+
+        // Writing to the unlinked relocated remnant re-attaches anon_vma while keeping anon_pgoff
+        // = a/p: moving back to `a` joins a fresh neighbour at a + 2p, while moving to `d` does not.
+        mm.write(UserSlice::new(b, 1), b"W").unwrap();
+        assert!(mm.vmas[&b].has_anon_vma.get());
+        assert_eq!(mm.vmas[&b].anon_pgoff, a / p);
+        mm.mremap(b, 2 * p, 2 * p, true, Some(d)).unwrap();
+        mm.map_anonymous(d + 2 * p, p, RW).unwrap();
+        assert!(!mm.in_one_vma(d, d + 3 * p));
+        mm.munmap(d + 2 * p, p).unwrap();
+        mm.mremap(d, 2 * p, 2 * p, true, Some(a)).unwrap();
+        mm.map_anonymous(a + 2 * p, p, RW).unwrap();
+        assert!(mm.in_one_vma(a, a + 3 * p));
+        mm.munmap(a, 3 * p).unwrap();
+        mm.munmap(c, 2 * p).unwrap();
+
+        // Partial DONTUNMAP of a previously relocated mapping [b, b + 3p) keeps has_anon_vma and
+        // anon_pgoff across the whole VMA.
+        mm.map_anonymous(a, 3 * p, RW).unwrap();
+        mm.write_kernel(a, b"x").unwrap();
+        mm.mremap(a, 3 * p, 3 * p, true, Some(b)).unwrap();
+        mm.mremap_dontunmap(b + p, p, Some(c)).unwrap();
+        assert!(mm.in_one_vma(b, b + 3 * p));
+        assert!(mm.vmas[&(b + p)].has_anon_vma.get());
+        assert_eq!(mm.vmas[&(b + p)].anon_pgoff, a / p + 1);
+        mm.munmap(b, 3 * p).unwrap();
+        mm.munmap(c, p).unwrap();
+
+        // Multi-piece logical VMA: partial DONTUNMAP of one piece retains anon_vma, while
+        // whole-VMA DONTUNMAP spanning both pieces unlinks it; MREMAP_FIXED unmapping the sibling
+        // turns the remaining slice into a whole-VMA move.
+        mm.map_anonymous(a, p, RW).unwrap();
+        mm.map_anonymous(a + p, p, RW).unwrap();
+        mm.write_kernel(a, b"m").unwrap();
+        assert!(mm.in_one_vma(a, a + 2 * p));
+        mm.mremap_dontunmap(a, p, Some(c)).unwrap();
+        assert!(mm.vmas[&a].has_anon_vma.get());
+        assert!(mm.in_one_vma(a, a + 2 * p));
+        mm.munmap(c, p).unwrap();
+        // Fixed target unmaps [a + p, a + 2p), leaving [a, a + p) as the entire source VMA.
+        mm.mremap_dontunmap(a, p, Some(a + p)).unwrap();
+        assert!(!mm.vmas[&a].has_anon_vma.get());
+        assert_eq!(mm.vmas[&a].anon, 0);
+        assert!(mm.vmas[&(a + p)].has_anon_vma.get());
     }
 
     #[test]
