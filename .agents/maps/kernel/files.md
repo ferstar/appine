@@ -165,7 +165,9 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 - FUSE nodes are opened and created by `kernel/fuse` (the daemon's open and create); a file
   created that way is not checked again.
 - Pseudo nodes: nsfs writes `EPERM` first; permission from the synthetic stat, except `/proc/sys`
-  (`kernel/sysctl`'s `test_perm` and `net.*`/`user.max_*` rules); `O_TRUNC` asks
+  (`kernel/sysctl`'s `test_perm` and `net.*`/`user.max_*` rules) and a thread group's own live
+  `fd/`/`fdinfo/` directories for non-write opens (`pseudo::is_own_fd_dir`, matching Linux's
+  `proc_fd_permission` when non-dumpable); `O_TRUNC` asks
   for write; the ptrace read check for `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup`
   and `pagemap` (the process found through `pseudo::group_of_id` matching the pinned `ProcId`, so
   `/proc/<tid>` works and a reused pid does not match; `mem` and `pagemap` of a gone thread `ESRCH`,

@@ -986,7 +986,11 @@ fn open_pseudo(
             return Err(Errno::EACCES);
         }
     } else if !matches!(node, PseudoNode::OpenFd(..) | PseudoNode::OpenExe(_)) {
-        cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, mask)?;
+        let allow_own_fd =
+            mask & MAY_WRITE == 0 && pseudo::is_own_fd_dir(cx.kr(), cx.task.tgid, &node);
+        if !allow_own_fd {
+            cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, mask)?;
+        }
     }
     // /proc/<pid>/mem requires being able to trace that process, as ptrace does
     // (PTRACE_MODE_ATTACH); auxv, environ, maps, smaps and pagemap require being able to trace it
@@ -6914,8 +6918,18 @@ pub(super) fn faccessat(
     if amode & MAY_WRITE != 0 {
         reject_flags(flags.unwrap_or(0), inode_flags::IMMUTABLE)?;
     }
-    // R_OK, W_OK, X_OK have the same values as MAY_READ, MAY_WRITE, MAY_EXEC
-    cred.permission(&st, amode)?;
+    // R_OK, W_OK, X_OK have the same values as MAY_READ, MAY_WRITE, MAY_EXEC.
+    // Match Linux's proc_fd_permission (and non-dumpable self ns/ search) for own directories.
+    let allow_own_proc = match &node {
+        Node::Pseudo(_, p) => {
+            (amode & MAY_WRITE == 0 && pseudo::is_own_fd_dir(cx.kr(), cx.task.tgid, p))
+                || (amode == MAY_EXEC && pseudo::is_own_ns_dir(cx.kr(), cx.task.tgid, p))
+        }
+        _ => false,
+    };
+    if !allow_own_proc {
+        cred.permission(&st, amode)?;
+    }
     // Asking whether a regular file, directory or symlink in a read-only mount can be written is
     // EROFS (after the permission check)
     let special = !matches!(
@@ -12435,6 +12449,208 @@ mod tests {
                 Ok(0)
             );
             close(cx, fd).unwrap();
+        });
+    }
+
+    #[test]
+    fn mqueue_root_enforces_search_permission_after_chmod() {
+        with_guest(1000, |cx, p1, _| {
+            let vfs = cx.vfs().unwrap();
+            let ipc_ns = cx.ns().ipc.id;
+            let point = mountpoint(&vfs, b"mqueue");
+            vfs.add_mount(
+                Fs::Mqueue,
+                Node::Pseudo(0, PseudoNode::MqRoot(ipc_ns)),
+                point,
+                0,
+                b"mqueue".to_vec(),
+                Some(vfs.mq_dev(ipc_ns)),
+            );
+
+            // Create a queue while /mqueue is world-accessible (01777).
+            let qfd = open(
+                cx,
+                p1,
+                b"/mqueue/q",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o644,
+            )
+            .unwrap();
+            close(cx, qfd).unwrap();
+
+            // Restrict /mqueue to root-only (0700, owned by 0:0).
+            cx.kr().ipc(ipc_ns).mq_dir.borrow_mut().mode = 0o700;
+
+            assert_eq!(
+                open(cx, p1, b"/mqueue/q", oflags::O_RDONLY, 0),
+                Err(Errno::EACCES)
+            );
+            assert_eq!(
+                lookup_at(cx, AT_FDCWD, b"/mqueue/q", true),
+                Err(Errno::EACCES)
+            );
+            write_cstr(cx, p1, b"/mqueue");
+            assert_eq!(chdir(cx, p1), Err(Errno::EACCES));
+            assert_eq!(faccessat(cx, AT_FDCWD, p1, MAY_EXEC, 0), Err(Errno::EACCES));
+
+            // O_PATH opens the directory without search, but fchdir and relative lookup fail.
+            let pfd = open(cx, p1, b"/mqueue", oflags::O_PATH | oflags::O_DIRECTORY, 0).unwrap();
+            assert_eq!(fchdir(cx, pfd), Err(Errno::EACCES));
+            assert_eq!(lookup_at(cx, pfd, b"q", true), Err(Errno::EACCES));
+            close(cx, pfd).unwrap();
+
+            // Restoring search permission (0711) allows traversal, open, and chdir again.
+            cx.kr().ipc(ipc_ns).mq_dir.borrow_mut().mode = 0o711;
+            let qfd = open(cx, p1, b"/mqueue/q", oflags::O_RDONLY, 0).unwrap();
+            close(cx, qfd).unwrap();
+            write_cstr(cx, p1, b"/mqueue");
+            assert_eq!(faccessat(cx, AT_FDCWD, p1, MAY_EXEC, 0), Ok(0));
+            assert_eq!(chdir(cx, p1), Ok(0));
+        });
+    }
+
+    #[test]
+    fn proc_fd_fdinfo_and_ns_enforce_search_and_own_nondumpable_access() {
+        with_guest(1000, |cx, p1, _| {
+            let (root_proc, _, _root_cpu) = pseudo::tests::add_task(cx.k(), 10, 0, true, b"");
+            let (other_nondump, _, _other_cpu) =
+                pseudo::tests::add_task(cx.k(), 21, 1000, false, b"");
+            let self_fd = open(
+                cx,
+                p1,
+                b"/tmp/self-file",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o600,
+            )
+            .unwrap();
+
+            // Another user's fd/, fdinfo/, and ns/ deny chdir, fchdir, traversal, and X_OK.
+            for dir in ["/proc/10/fd", "/proc/10/fdinfo", "/proc/10/ns"] {
+                write_cstr(cx, p1, dir.as_bytes());
+                assert_eq!(chdir(cx, p1), Err(Errno::EACCES), "chdir {dir}");
+                assert_eq!(
+                    faccessat(cx, AT_FDCWD, p1, MAY_EXEC, 0),
+                    Err(Errno::EACCES),
+                    "X_OK {dir}"
+                );
+                let pfd = open(
+                    cx,
+                    p1,
+                    dir.as_bytes(),
+                    oflags::O_PATH | oflags::O_DIRECTORY,
+                    0,
+                )
+                .unwrap();
+                assert_eq!(fchdir(cx, pfd), Err(Errno::EACCES), "fchdir {dir}");
+                close(cx, pfd).unwrap();
+
+                for suffix in ["/", "/.", "/.."] {
+                    let path = format!("{dir}{suffix}");
+                    assert_eq!(
+                        lookup_at(cx, AT_FDCWD, path.as_bytes(), false),
+                        Err(Errno::EACCES),
+                        "lookup {path}"
+                    );
+                }
+            }
+            assert_eq!(
+                lookup_at(cx, AT_FDCWD, b"/proc/10/ns/net", false),
+                Err(Errno::EACCES)
+            );
+            assert_eq!(
+                open(
+                    cx,
+                    p1,
+                    b"/proc/10/ns/net",
+                    oflags::O_PATH | oflags::O_NOFOLLOW,
+                    0
+                ),
+                Err(Errno::EACCES)
+            );
+
+            // Same-user non-dumpable peer (owned by root) is also denied.
+            assert_eq!(other_nondump.pid, 21);
+            for dir in ["/proc/21/fd", "/proc/21/fdinfo", "/proc/21/ns"] {
+                write_cstr(cx, p1, dir.as_bytes());
+                assert_eq!(chdir(cx, p1), Err(Errno::EACCES), "peer chdir {dir}");
+            }
+            assert_eq!(
+                lookup_at(cx, AT_FDCWD, b"/proc/21/ns/net", false),
+                Err(Errno::EACCES)
+            );
+
+            // Non-dumpable self keeps access to its own fd/ and fdinfo/ (proc_fd_permission)
+            // and can search its own ns/ directory without gaining write or ns/ read access.
+            cx.t.group.borrow_mut().dumpable = false;
+            for dir in ["/proc/self/fd", "/proc/self/fdinfo"] {
+                write_cstr(cx, p1, dir.as_bytes());
+                assert_eq!(chdir(cx, p1), Ok(0), "self chdir {dir}");
+                assert_eq!(
+                    faccessat(cx, AT_FDCWD, p1, MAY_READ | MAY_EXEC, 0),
+                    Ok(0),
+                    "self R|X {dir}"
+                );
+                assert_eq!(
+                    faccessat(cx, AT_FDCWD, p1, MAY_WRITE, 0),
+                    Err(Errno::EACCES),
+                    "self W_OK {dir}"
+                );
+                let dfd = open(
+                    cx,
+                    p1,
+                    dir.as_bytes(),
+                    oflags::O_RDONLY | oflags::O_DIRECTORY,
+                    0,
+                )
+                .unwrap();
+                close(cx, dfd).unwrap();
+            }
+            let fd_link = format!("/proc/self/fd/{self_fd}");
+            assert!(lookup_at(cx, AT_FDCWD, fd_link.as_bytes(), false).is_ok());
+            let fdinfo_path = format!("/proc/self/fdinfo/{self_fd}");
+            let ifd = open(cx, p1, fdinfo_path.as_bytes(), oflags::O_RDONLY, 0).unwrap();
+            close(cx, ifd).unwrap();
+
+            write_cstr(cx, p1, b"/proc/self/ns");
+            assert_eq!(chdir(cx, p1), Ok(0));
+            assert_eq!(faccessat(cx, AT_FDCWD, p1, MAY_EXEC, 0), Ok(0));
+            assert_eq!(faccessat(cx, AT_FDCWD, p1, MAY_READ, 0), Err(Errno::EACCES));
+            assert_eq!(
+                open(
+                    cx,
+                    p1,
+                    b"/proc/self/ns",
+                    oflags::O_RDONLY | oflags::O_DIRECTORY,
+                    0
+                ),
+                Err(Errno::EACCES)
+            );
+            assert!(lookup_at(cx, AT_FDCWD, b"/proc/self/ns/net", false).is_ok());
+            let nsfd = open(cx, p1, b"/proc/self/ns/net", oflags::O_RDONLY, 0).unwrap();
+            close(cx, nsfd).unwrap();
+
+            // A held dirfd on a reaped process's fd/, fdinfo/, or ns/ returns ENOENT, not EACCES.
+            let held: Vec<i32> = ["/proc/10/fd", "/proc/10/fdinfo", "/proc/10/ns"]
+                .into_iter()
+                .map(|p| {
+                    open(
+                        cx,
+                        p1,
+                        p.as_bytes(),
+                        oflags::O_PATH | oflags::O_DIRECTORY,
+                        0,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            cx.k().tasks.remove(&root_proc.pid);
+            cx.k().groups.remove(&root_proc.pid);
+            for (fd, name) in held.into_iter().zip([b"0".as_slice(), b"0", b"net"]) {
+                assert_eq!(lookup_at(cx, fd, name, false), Err(Errno::ENOENT));
+                close(cx, fd).unwrap();
+            }
+
+            close(cx, self_fd).unwrap();
         });
     }
 }

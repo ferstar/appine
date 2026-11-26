@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: enforce inode flags in xattr/ACL and `MAP_SHARED` paths, and record socket creation gid alongside uid)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: enforce search permission on mqueue root and procfs `fd`/`fdinfo`/`ns` synthetic directories)
 
 ## Responsibilities
 
@@ -50,7 +50,7 @@ capabilities (`kernel/cred`).
   was last found.
 - `Pseudo` trait — what a synthetic filesystem offers the walker: lookup, parent, name, kind,
   readlink, `follow`/`follow_dentry` (magic-link jumps), `magic`, `protected_symlinks`, `missing`
-  (told of each name not found), `searched` (cgroup directories' search check); procfs's `View`
+  (told of each name not found), `searched` (cgroup, mqueue root, and per-process `fd`/`fdinfo`/`ns` directories' search check); procfs's `View`
   implements it, and `Offline` (empty synthetic roots) before the kernel starts.
 - `resolve` — openat2's `RESOLVE_*` bits; `SCOPED = BENEATH | IN_ROOT`.
 - `Vfs` — the store handle, the mount table (`kernel/mount`'s `Mount`, `Mounts`, `Fs`, `MntNs`,
@@ -99,7 +99,8 @@ capabilities (`kernel/cred`).
 - Per component, in order: over 255 bytes `ENAMETOOLONG`; not a directory `ENOTDIR`; search
   permission, also for `.` and `..`: on store directories and the store directory behind an overlay
   one unless the credentials have `CAP_DAC_READ_SEARCH` or `CAP_DAC_OVERRIDE` in the initial user
-  namespace, on cgroup directories (`Pseudo::searched`; other synthetic directories never), and on
+  namespace, on synthetic directories that are not world-searchable (`Pseudo::searched`: cgroup,
+  mqueue root, and live other-group procfs `fd`/`fdinfo`/`ns` directories), and on
   FUSE directories through `fuse_permission` (allow_other first, for everyone); `.` is skipped; `..`
   (`dotdot`) stays at the process root without lifting, climbs stacked mount points at a mount root,
   takes the parent within the mount (a namespace-tree or detached root stays put; a parent outside
@@ -333,7 +334,8 @@ capabilities (`kernel/cred`).
   store directory `ENOENT`; while entries remain, a count above `INT_MAX` or a buffer too small for
   the next entry `EINVAL`; an unwritable buffer returns the whole entries before it (`EFAULT` when
   none). Seeking a directory is `kernel/fileio`'s lseek.
-- chdir/fchdir/chroot check search on store, overlay, FUSE and cgroup directories; chroot then
+- chdir/fchdir/chroot check search on store, overlay, FUSE and non-world-searchable synthetic
+  directories (`Pseudo::searched`: cgroup, mqueue root, and live other-group procfs `fd`/`fdinfo`/`ns`); chroot then
   needs `CAP_SYS_CHROOT` in the caller's user namespace. umask lives in the fs context.
 - `protected_symlinks`, `protected_hardlinks` and `protected_fifos` default to 1, and
   `protected_regular` defaults to 2 (`may_create_in_sticky` on `O_CREAT` opens of existing regular
@@ -401,8 +403,9 @@ capabilities (`kernel/cred`).
   lookups or `..`).
 - `Cached` trusts its list of store mount points: every path that adds a mount point or changes
   the root mount's attachment or nosymfollow must call `fast_changed`.
-- Synthetic directories are searchable by everyone except cgroup directories (their mkdir mode);
-  procfs gates per-process data in readlink/follow.
+- Synthetic directories are world-searchable (0555/0755) except cgroup directories (their mkdir/chmod mode),
+  mqueue roots (mutable via chmod/chown) and live other-group procfs `fd`/`fdinfo`/`ns` directories (0500; same-thread-group traversal stays allowed even when non-dumpable);
+  procfs additionally gates per-process data in lookup/readdir/readlink/follow.
 - Every file operation keeps `kernel/overlay`'s rules for overlay nodes: no `Node::Store` is ever
   kept for an overlay file's store inode (changes go through a copy-up), every open file naming an
   overlay node holds it, and a syscall that waits while keeping a looked-up node stays out of
@@ -429,8 +432,7 @@ capabilities (`kernel/cred`).
 
 ## Open questions
 
-- Is skipping search permission on synthetic directories other than cgroup ones intended (only
-  `/proc/<pid>/fd` and `fdinfo` gate access, by the ptrace-read check)?
+- None.
 
 ## To verify
 

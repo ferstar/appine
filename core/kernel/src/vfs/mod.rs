@@ -1978,8 +1978,8 @@ impl Vfs {
     }
 
     /// Whether a process with credentials `cred` can look up in directory `dir`. Directories of
-    /// synthetic filesystems can unless their view says otherwise ([`Pseudo::searched`]: cgroup
-    /// directories).
+    /// synthetic filesystems can unless their view says otherwise ([`Pseudo::searched`]: cgroup,
+    /// mqueue root, and per-process `fd`/`fdinfo`/`ns` directories).
     fn may_search(&self, ps: &dyn Pseudo, cred: &Cred, dir: &Node) -> Result<(), Errno> {
         match dir {
             Node::Pseudo(_, p) if !cred.searches_all() => match ps.searched(p) {
