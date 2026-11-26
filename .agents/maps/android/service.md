@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-26 (targeted verification of foreground OSC 52 delivery and cleanup on session removal or service teardown)
+> Maintained: 2026-11-26 (targeted verification of per-start configuration degradation on existing stores via `prepareStartBridge` and nullable `StartedKernel.browser`)
 
 ## Responsibilities
 
@@ -133,10 +133,16 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 - `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
   notification and listeners and `Rootfs::probeMirrors` for import-time source selection, android/setup),
-  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBashStartup`,
-  `ensureGpuCommand` (only when `gpu` is enabled), `ensureBrowser`, `updateProfile`, then
-  `Native.start(store, tier, gpu)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
-  all builds, defaulting to 1; `gpu` defaults to false) and `Native.hasGpu(handle)` recorded as `gpuAvailable`. On Alpine, `Rootfs.ensureOpenRc` checks the store and installs a missing OpenRC
+  then `startKernel(tier, gpu, importing = distro != null)`: `prepareStartBridge` opens `BrowserBridge`
+  and runs `Rootfs.prepareStart` (`ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
+  `ensureBashStartup`, `ensureGpuCommand` when `gpu` is enabled, `ensureBrowser`, `updateProfile`).
+  On fresh imports (`importing = true`), any configuration I/O error closes `BrowserBridge` and aborts
+  startup; on existing stores (`importing = false`), each per-start step degrades independently via
+  `Log.w` and `Diagnostics.record` (quiet in UI so intentional customizations do not trigger recurring
+  dialogs), closing `BrowserBridge` (`StartedKernel.browser = null`) if opening it or writing
+  `/etc/appine/browser` fails. `startKernel` then opens `Native.start(store, tier, gpu)` under
+  `Rootfs.access`'s write lock (`tier` is the saved setting in all builds, defaulting to 1; `gpu`
+  defaults to false) and records `Native.hasGpu(handle)` as `gpuAvailable`. On Alpine, `Rootfs.ensureOpenRc` checks the store and installs a missing OpenRC
   before publishing the kernel handle. If it installs or resumes, it runs inittab on this thread.
   A setup I/O failure during import stops the private kernel. On an existing store the service
   presents the error and allows a terminal for repairs. The boot thread runs inittab only if

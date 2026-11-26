@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across package verification, store publication, per-start setup, OpenRC, account selection and shell integration)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: serialized first-login admin setup, rules deduplication, and world-registration gating for bash and doas in login.sh)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: independent per-start configuration write degradation on existing stores via `Rootfs.prepareStart`, marker read hardening, and sub-step isolation)
 
 ## Responsibilities
 
@@ -81,9 +81,10 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
   `fetch`, `tarball`, `deleteTarball`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
-- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
-  `ensureBashStartup`, `ensureGpuCommand`, `ensureBrowser`, `updateProfile`; around boot:
-  `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
+- Before every start: `prepareStart` (running `ensureNetworkConfig`, `ensureContainersConfig`,
+  `ensureLoginTools`, `ensureBashStartup`, `ensureGpuCommand`, `ensureBrowser` and `updateProfile`
+  in order, fatal on fresh imports and degrading each step independently on existing stores);
+  around boot: `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
 - Mirrors: the service supplies `probeMirrors` to `prepare`. The default imports offline with official sources when the tarball is local.
 - Accounts: `loginAccount`, `regularAccounts`, `LoginRules.poll` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
@@ -177,9 +178,19 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   reads neither profile nor shim needs its own browser configuration.
   Each invocation rereads the configuration and sends one HTTP(S) URL without using a TTY or
   inherited tab token; success acknowledges Android intent acceptance, not page loading or login.
-- After import, the start thread prepares network configuration, container defaults, login tools
-  and bash startup files, then the GPU launcher when enabled. `startKernel` prepares the browser
-  endpoint and updates the profile before opening the kernel under the provider write lock.
+- After import, `TerminalService.startKernel` calls `Rootfs.prepareStart` before opening the kernel
+  under the provider write lock: network configuration, container defaults, login tools, bash
+  startup files, GPU launcher (when enabled), browser endpoint/launcher and profile/rc-hook updates.
+  On fresh imports (`importing = true`), the first I/O failure aborts startup. On existing stores
+  (`importing = false`), each helper and independent sub-step (e.g., `doas.apk` vs `20-wheel.conf`,
+  `/etc/skel` vs per-user bash homes, `appine-open-url`/`browser`/`xdg-open`, profile companion
+  writes, Debian bash vs zsh rc hooks) catches `IOException`, reports it to the caller's `onFailure`
+  callback and continues so a symlinked directory, custom file or full disk cannot lock the user
+  out of a repair terminal. `ensureBrowser` returns whether `/etc/appine/browser` was written so
+  `TerminalService` can close an unconfigured `BrowserBridge`. Unreadable one-time markers
+  (`bash-startup-done`, `debian-bashrc-hook-done`, `zsh-rc-hook-done`) report to `onFailure` and
+  skip their one-time migration rather than aborting startup or re-seeding user-deleted files;
+  `ensureBashStartup` writes `bash-startup-done` only when every seeding write succeeded.
   The network file defaults to loopback only. The rootless Podman fragment selects host networking
   because pasta and slirp4netns require a TUN device. Both defaults preserve an existing file.
 - Alpine refreshes the bundled doas APK and upgrades the stock wheel rule to preserve ash's
@@ -190,7 +201,8 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - `updateProfile` upgrades known stock profile contents. It writes the companion scripts
   before the profile, preserving a user's edited version. A readable edited profile still gets
   the independent one-time interactive rc hooks. An unreadable or missing profile skips those
-  hooks. On Alpine the stock doas-rule migration runs before the profile check.
+  hooks. Direct callers of `updateProfile` run Alpine's stock doas-rule migration first;
+  `prepareStart` skips the duplicate check because `ensureLoginTools` already ran it.
 - Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
   snapshotter run on the kernel's overlayfs, rootful and rootless. A `storage.conf` choosing vfs or
   a `daemon.json` choosing native that an earlier build wrote stays until the user removes it.
@@ -452,8 +464,7 @@ None.
 
 ## Open questions
 
-- Which per-start configuration writes should allow startup to continue after a write failure?
-  Today an exception from the network, container, login-tool or profile write aborts startup.
+None.
 
 ## To verify
 

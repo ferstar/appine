@@ -28,12 +28,48 @@ import android.widget.Toast
 import io.github.mthli.appine.TerminalService.Companion.POLL_MS
 import io.github.mthli.appine.TerminalService.Companion.SAVE_MS
 import io.github.mthli.appine.TerminalService.Companion.TRIM_DELAY_MS
+import java.io.Closeable
+import java.io.IOException
 import java.text.DateFormat
 import java.text.DecimalFormat
 import java.util.Date
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 import kotlin.concurrent.write
+
+/**
+ * Runs per-start guest configuration around a browser endpoint: fresh imports abort on the first
+ * I/O error and close the endpoint, while existing stores report each failure independently and
+ * close the endpoint whenever its guest configuration could not be written.
+ */
+internal fun <B : Closeable> prepareStartBridge(
+    importing: Boolean,
+    onFailure: (String, IOException) -> Unit,
+    openBridge: () -> B,
+    configure: (B?, (String, IOException) -> Unit) -> Boolean,
+): B? {
+    val handleFailure: (String, IOException) -> Unit = { step, e ->
+        if (importing) throw e
+        onFailure(step, e)
+    }
+    var bridge: B? = try {
+        openBridge()
+    } catch (e: IOException) {
+        handleFailure(BrowserBridge.CONFIG_PATH, e)
+        null
+    }
+    try {
+        val ready = configure(bridge, handleFailure)
+        if (!ready) {
+            bridge?.close()
+            bridge = null
+        }
+        return bridge
+    } catch (e: Throwable) {
+        bridge?.close()
+        throw e
+    }
+}
 
 /** Guest CPU samples only: app rendering and the service's own polling must not keep it awake. */
 internal class GuestActivity {
@@ -678,32 +714,51 @@ class TerminalService : Service() {
     private fun startOrImport() = start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
 
     private class StartedKernel(
-        val handle: Long, val browser: BrowserBridge, val booted: Boolean, val gpuAvailable: Boolean,
+        val handle: Long, val browser: BrowserBridge?, val booted: Boolean, val gpuAvailable: Boolean,
         val setupError: String?,
     )
 
     /** Owns the new handle and browser endpoint until both can be handed to the main thread. */
     private fun startKernel(tier: Int, gpu: Boolean, importing: Boolean): StartedKernel {
-        val browser = BrowserBridge { url ->
-            machine != 0L && !destroyed && listeners.any { it.onOpenUrl(url) }
-        }
+        val store = Rootfs.store(this).path
+        val distro = Rootfs.installed(this) ?: Rootfs.Distro.ALPINE
+        val browser = prepareStartBridge(
+            importing = importing,
+            onFailure = { step, e ->
+                Log.w(TAG, "cannot prepare $step; continuing startup", e)
+                Diagnostics.record("Per-start configuration skipped ($step):\n${Log.getStackTraceString(e)}")
+            },
+            openBridge = {
+                BrowserBridge { url ->
+                    machine != 0L && !destroyed && listeners.any { it.onOpenUrl(url) }
+                }
+            },
+            configure = { bridge, onFailure ->
+                Rootfs.prepareStart(
+                    context = this,
+                    store = store,
+                    distro = distro,
+                    gpu = gpu,
+                    browserConfiguration = bridge?.configuration,
+                    importing = importing,
+                    onFailure = onFailure,
+                )
+            },
+        )
         var handle = 0L
         try {
-            Rootfs.ensureBrowser(this, browser.configuration)
-            Rootfs.updateProfile(this)
-            val store = Rootfs.store(this).path
             // Exclude DocumentsProvider opens while the kernel opens the store.
             handle = Rootfs.access.write { Native.start(store, tier, gpu) }
             val gpuAvailable = gpu && Native.hasGpu(handle)
             var setupError: String? = null
-            val booted = Rootfs.installed(this) == Rootfs.Distro.ALPINE && Rootfs.ensureOpenRc(this, handle, store) { e ->
+            val booted = distro == Rootfs.Distro.ALPINE && Rootfs.ensureOpenRc(this, handle, store) { e ->
                 if (importing) throw e
                 Log.w(TAG, "OpenRC setup will retry at the next start", e)
                 setupError = e.message ?: e.toString()
             }
             return StartedKernel(handle, browser, booted, gpuAvailable, setupError)
         } catch (e: Throwable) {
-            browser.close()
+            browser?.close()
             if (handle != 0L) Native.stop(handle)
             throw e
         }
@@ -728,18 +783,13 @@ class TerminalService : Service() {
                         main.post { preparing(text) }
                     })
                 }
-                Rootfs.ensureNetworkConfig(this)
-                Rootfs.ensureContainersConfig(this)
-                Rootfs.ensureLoginTools(this)
-                Rootfs.ensureBashStartup(this)
-                if (gpu) Rootfs.ensureGpuCommand(this)
                 startKernel(tier, gpu, importing = distro != null)
             }
             main.post {
                 starting = false
                 if (destroyed) {
                     result.onSuccess { kernel ->
-                        kernel.browser.close()
+                        kernel.browser?.close()
                         thread(name = "appine-stop") { Native.shutdown(kernel.handle) }
                     }
                     return@post
