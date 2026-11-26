@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/cred.md` for the paired decision history.
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across credential updates, capability and access checks, exec, filter publication and listener lifetime)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: seccomp `NEW_LISTENER` now reserves and grows the fd table before publishing the filter chain)
 
 ## Responsibilities
 
@@ -194,13 +196,14 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 - Filter installation rejects invalid flag combinations and lengths outside 1–4096 instructions
   with `EINVAL`. Without `no_new_privs` or `CAP_SYS_ADMIN` in the caller's namespace it returns
   `EACCES`. The classic BPF and seccomp checkers enforce aligned `seccomp_data` loads and
-  forward jumps and reject packet loads and MOD. A listener request selects a free fd below the soft
-  limit before checking the current mode. The mode must be disabled or filter; a second listener
+  forward jumps and reject packet loads and MOD. A listener request reserves a free fd below the
+  soft limit and grows the fd table (respecting `nr_open`, failing with `EMFILE`) before checking
+  the current mode; any later failure releases the reservation. The mode must be disabled or filter; a second listener
   `EBUSY`; total converted length plus 4 per filter over 32768 `ENOMEM`; TSYNC requires every other
   thread to be disabled or on an ancestor chain (else that thread's tid in the caller's pid
   namespace, or `ESRCH` with `TSYNC_ESRCH` or when the caller cannot see it). The always-allow bitmap is built (ANDed with the previous filter's) and the filter
   pushed. Successful TSYNC copies the chain to other threads and sets their no_new_privs if
-  the caller has it. The listener fd is close-on-exec.
+  the caller has it. The listener fd is then installed infallibly as close-on-exec.
 - Filters belong to threads, are copied by clone/fork and kept across execve; an exiting leader's
   chain is held until the group is reaped.
 - At syscall entry (after a `PTRACE_SYSCALL` entry stop): disabled, `PTRACE_O_SUSPEND_SECCOMP` and
@@ -262,10 +265,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ## Confirmed bugs / technical debt
 
-- Installing a seccomp notification listener can leave an active filter after the syscall
-  reports failure. The installer chooses an fd before publishing the chain but grows the fd
-  table afterward. If the growth fails, the caller and any synchronized peers retain the chain
-  without the requested listener. User notifications on that filter then return `ENOSYS`.
+None.
 
 ## Open questions
 

@@ -39,7 +39,7 @@ use appine_hal::Event;
 
 use crate::cell::RefCell;
 use crate::errno::Errno;
-use crate::fd::{FileKind, OpenFile, oflags};
+use crate::fd::{FdTable, FileKind, FileRef, OpenFile, oflags};
 use crate::kernel::{Cx, Kernel, Tid, request_wake_object, signal_later, wake};
 use crate::process::{ExitStatus, Signal};
 use crate::signal::{self, InfoFields, SigInfo};
@@ -395,6 +395,37 @@ fn set_strict(cx: &mut Cx<'_>) -> Result<u64, Errno> {
     Ok(0)
 }
 
+/// A reserved notification fd slot: unreserves on drop unless installed with [`ReservedFd::fill`]
+/// (Linux's `get_unused_fd_flags` / `put_unused_fd` / `fd_install`).
+struct ReservedFd {
+    fds: Rc<RefCell<FdTable>>,
+    fd: Option<i32>,
+}
+
+impl ReservedFd {
+    fn reserve(cx: &Cx<'_>) -> Result<Self, Errno> {
+        let fd = cx.reserve_fd()?;
+        Ok(Self {
+            fds: cx.t.fds.clone(),
+            fd: Some(fd),
+        })
+    }
+
+    fn fill(mut self, file: FileRef, cloexec: bool) -> i32 {
+        let fd = self.fd.take().expect("reserved fd filled once");
+        self.fds.borrow_mut().fill(fd, file, cloexec);
+        fd
+    }
+}
+
+impl Drop for ReservedFd {
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            self.fds.borrow_mut().unreserve(fd);
+        }
+    }
+}
+
 /// Installs a filter (Linux's `seccomp_set_mode_filter`): checks the flags and the program, and
 /// requires `no_new_privs` or `CAP_SYS_ADMIN`; with `NEW_LISTENER` returns the notification fd,
 /// EBUSY when the chain already has one; with `TSYNC` the other threads of the thread group must
@@ -439,14 +470,10 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     check_classic(&prog)?;
     check_seccomp(&mut prog)?;
 
-    // Find the notification fd's slot first: nothing can fail once the filter is installed (Linux
-    // does get_unused_fd_flags first)
+    // Reserve the notification fd (and grow the table) first so nothing can fail once the filter
+    // is published
     let listener = flags & flag::NEW_LISTENER != 0;
-    let fd = if listener {
-        Some(cx.fds().free_slot(0..cx.nofile())?)
-    } else {
-        None
-    };
+    let reserved = listener.then(|| ReservedFd::reserve(cx)).transpose()?;
     let (mode, prev) = {
         let s = cx.task.seccomp.borrow();
         (s.mode, s.chain.as_ref().map(|c| c.filter().clone()))
@@ -545,12 +572,10 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
         s.chain = Some(chain);
     }
     publish(cx.task);
-    match fd {
-        Some(fd) => {
+    match reserved {
+        Some(reserved) => {
             let file = OpenFile::new(FileKind::SeccompNotify(Listener(filter)), oflags::O_RDWR);
-            cx.fds_mut()
-                .install_at_capped(fd, file, true, cx.nofile(), cx.kr().nr_open)?;
-            Ok(fd as u64)
+            Ok(reserved.fill(file, true) as u64)
         }
         None => Ok(0),
     }
@@ -1826,5 +1851,270 @@ mod tests {
         assert_eq!(audit_string(b"a b"), "612062");
         assert_eq!(audit_string(b"a\"b"), "612262");
         assert_eq!(audit_string(b"x\n"), "780A");
+    }
+
+    fn write_fprog(cx: &mut Cx<'_>, prog: &[Insn]) -> u64 {
+        let mut bytes = Vec::with_capacity(prog.len() * 8);
+        for &i in prog {
+            bytes.extend_from_slice(&i.code.to_le_bytes());
+            bytes.extend_from_slice(&[i.jt, i.jf]);
+            bytes.extend_from_slice(&i.k.to_le_bytes());
+        }
+        let mut mm = cx.mm_mut();
+        let total = (16 + bytes.len() as u64).next_multiple_of(appine_engine::PAGE_SIZE);
+        let base = mm
+            .mmap(
+                0,
+                total,
+                appine_engine::prot::READ | appine_engine::prot::WRITE,
+                crate::mm::flags::MAP_PRIVATE | crate::mm::flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        let mut fprog = [0u8; 16];
+        fprog[..2].copy_from_slice(&(prog.len() as u16).to_le_bytes());
+        fprog[8..16].copy_from_slice(&(base + 16).to_le_bytes());
+        mm.write(UserSlice::new(base, 16), &fprog).unwrap();
+        mm.write(UserSlice::new(base + 16, bytes.len()), &bytes)
+            .unwrap();
+        base
+    }
+
+    fn with_seccomp_group(extra_threads: &[Tid], body: impl FnOnce(&mut Cx<'_>, &[Rc<Task>])) {
+        use crate::kernel::Shared;
+        use crate::mm::Mm;
+        use crate::process::{ThreadGroup, Tier};
+        use crate::signal::SigHandlers;
+        use crate::task::{FsContext, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+        let shared = Arc::new(Shared::new(Kernel::new(Tier::Interpreter)));
+        let _cpus = {
+            let mut k = shared.lock();
+            let group = Rc::new(RefCell::new(ThreadGroup::new(
+                10,
+                1,
+                Rc::new(RefCell::new(SigHandlers::default())),
+            )));
+            let mm = Mm::new().into_shared();
+            let fds = Rc::new(RefCell::new(FdTable::with_host_stdio()));
+            let fs = Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: Rc::new(MntNs {
+                    id: INIT_MNT_NS,
+                    owner: crate::cred::UserNs::init(),
+                    anon: false,
+                }),
+            }));
+            let make_state = || TaskState {
+                mm: mm.clone(),
+                fds: fds.clone(),
+                fs: fs.clone(),
+                group: group.clone(),
+                vfs: None,
+                altstack: Default::default(),
+                clear_child_tid: 0,
+                vfork_done: None,
+                restart: None,
+                fast_sleep: None,
+                sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+            };
+            let mut cpus = Vec::new();
+            let mut tasks = Vec::new();
+            for tid in std::iter::once(10).chain(extra_threads.iter().copied()) {
+                let cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
+                let task =
+                    Task::new(tid, 10, &cpu, make_state(), k.init_ns.clone(), 0, [0; 16]).unwrap();
+                cpus.push(cpu);
+                group.borrow_mut().threads.push(tid);
+                k.tasks.insert(tid, task.clone());
+                tasks.push(task);
+            }
+            k.groups.insert(10, group);
+
+            let mut t = tasks[0].state.borrow_mut();
+            let mut cx = Cx::new(&shared, k, &tasks[0], &mut t);
+            body(&mut cx, &tasks[1..]);
+            drop(cx);
+            cpus
+        };
+    }
+
+    fn occupy_fds_up_to(cx: &Cx<'_>, end: i32) {
+        let filler = cx.fds().get(1).unwrap();
+        for fd in 3..end {
+            assert_eq!(cx.install_fd(filler.clone(), true), Ok(fd));
+        }
+    }
+
+    fn assert_seccomp_state(task: &Task, expected_mode: u32, filters: usize) {
+        let s = task.seccomp.borrow();
+        assert_eq!(s.mode, expected_mode);
+        assert_eq!(s.filters(), filters);
+        assert_eq!(
+            task.seccomp_on.load(Ordering::Relaxed),
+            expected_mode != mode::DISABLED
+        );
+    }
+
+    #[test]
+    fn new_listener_nr_open_failure_is_atomic_single_thread() {
+        use bpf::*;
+
+        with_seccomp_group(&[], |cx, _| {
+            let fprog = write_fprog(cx, &[insn(RET | K, 0, 0, ret::USER_NOTIF)]);
+
+            // Lower nr_open to 64 while RLIMIT_NOFILE stays above it, and occupy 0..64
+            cx.k().nr_open = 64;
+            occupy_fds_up_to(cx, 64);
+            assert_eq!(cx.fds().capacity(), 64);
+
+            // Growing past nr_open must fail with EMFILE and leave no filter active
+            assert_eq!(
+                seccomp(cx, SET_MODE_FILTER, flag::NEW_LISTENER, fprog),
+                Err(Errno::EMFILE)
+            );
+            assert_eq!(cx.fds().capacity(), 64);
+            assert_seccomp_state(cx.task, mode::DISABLED, 0);
+
+            // RLIMIT_NOFILE exhaustion also fails with EMFILE and leaves no filter active
+            cx.k().nr_open = crate::fd::MAX_FDS;
+            cx.t.group.borrow_mut().rlimits[crate::process::RLIMIT_NOFILE as usize] = (64, 64);
+            assert_eq!(
+                seccomp(cx, SET_MODE_FILTER, flag::NEW_LISTENER, fprog),
+                Err(Errno::EMFILE)
+            );
+            assert_seccomp_state(cx.task, mode::DISABLED, 0);
+
+            // Raising RLIMIT_NOFILE and capping nr_open at 128 lets NEW_LISTENER succeed at fd 64
+            cx.t.group.borrow_mut().rlimits[crate::process::RLIMIT_NOFILE as usize] = (1024, 4096);
+            cx.k().nr_open = 128;
+            let fd = seccomp(cx, SET_MODE_FILTER, flag::NEW_LISTENER, fprog).unwrap() as i32;
+            assert_eq!(fd, 64);
+            assert_eq!(cx.fds().capacity(), 128);
+            assert_eq!(cx.fds().cloexec(fd), Ok(true));
+            assert!(matches!(
+                cx.fds().get(fd).unwrap().borrow().kind,
+                FileKind::SeccompNotify(_)
+            ));
+            assert_seccomp_state(cx.task, mode::FILTER, 1);
+        });
+    }
+
+    #[test]
+    fn new_listener_tsync_nr_open_failure_is_atomic_across_threads() {
+        use bpf::*;
+
+        with_seccomp_group(&[11], |cx, peers| {
+            let peer = &peers[0];
+            cx.task.no_new_privs.set(true);
+            assert!(!peer.no_new_privs.get());
+
+            let fprog = write_fprog(cx, &[insn(RET | K, 0, 0, ret::USER_NOTIF)]);
+            cx.k().nr_open = 64;
+            occupy_fds_up_to(cx, 64);
+
+            // Failing on nr_open must leave neither thread with a filter or propagated no_new_privs
+            let flags = flag::NEW_LISTENER | flag::TSYNC | flag::TSYNC_ESRCH;
+            assert_eq!(
+                seccomp(cx, SET_MODE_FILTER, flags, fprog),
+                Err(Errno::EMFILE)
+            );
+            assert_eq!(cx.fds().capacity(), 64);
+            assert_seccomp_state(cx.task, mode::DISABLED, 0);
+            assert_seccomp_state(peer, mode::DISABLED, 0);
+            assert!(!peer.no_new_privs.get());
+
+            // Raising nr_open lets TSYNC + NEW_LISTENER succeed and sync both threads
+            cx.k().nr_open = 128;
+            let fd = seccomp(cx, SET_MODE_FILTER, flags, fprog).unwrap() as i32;
+            assert_eq!(fd, 64);
+            assert_eq!(cx.fds().capacity(), 128);
+            assert_eq!(cx.fds().cloexec(fd), Ok(true));
+            assert_seccomp_state(cx.task, mode::FILTER, 1);
+            assert_seccomp_state(peer, mode::FILTER, 1);
+            assert!(peer.no_new_privs.get());
+        });
+    }
+
+    #[test]
+    fn new_listener_early_errors_unreserve_fd_slot() {
+        use bpf::*;
+
+        let assert_slot_unreserved = |cx: &Cx<'_>, fd: i32| {
+            let limit = cx.nofile();
+            assert_eq!(cx.fds().free_slot(0..limit), Ok(fd));
+            // install_at returns EBUSY if the slot is still reserved
+            let filler = cx.fds().get(1).unwrap();
+            assert!(cx.fds_mut().install_at(fd, filler, true, limit).is_ok());
+            cx.fds_mut().close(fd).unwrap();
+        };
+
+        // EBUSY: a second listener on the same chain releases its reserved fd
+        with_seccomp_group(&[], |cx, _| {
+            let fprog = write_fprog(cx, &[insn(RET | K, 0, 0, ret::ALLOW)]);
+            assert_eq!(
+                seccomp(cx, SET_MODE_FILTER, flag::NEW_LISTENER, fprog),
+                Ok(3)
+            );
+            assert_eq!(
+                seccomp(cx, SET_MODE_FILTER, flag::NEW_LISTENER, fprog),
+                Err(Errno::EBUSY)
+            );
+            assert_slot_unreserved(cx, 4);
+            assert_seccomp_state(cx.task, mode::FILTER, 1);
+        });
+
+        // ESRCH: an unsyncable TSYNC sibling releases the reserved fd
+        with_seccomp_group(&[11], |cx, peers| {
+            let fprog = write_fprog(cx, &[insn(RET | K, 0, 0, ret::ALLOW)]);
+            // Move an installed filter onto the sibling so its chain is not an ancestor of caller
+            assert_eq!(seccomp(cx, SET_MODE_FILTER, 0, fprog), Ok(0));
+            *peers[0].seccomp.borrow_mut() = std::mem::take(&mut *cx.task.seccomp.borrow_mut());
+            publish(cx.task);
+            publish(&peers[0]);
+
+            assert_eq!(
+                seccomp(
+                    cx,
+                    SET_MODE_FILTER,
+                    flag::NEW_LISTENER | flag::TSYNC | flag::TSYNC_ESRCH,
+                    fprog,
+                ),
+                Err(Errno::ESRCH)
+            );
+            assert_slot_unreserved(cx, 3);
+            assert_seccomp_state(cx.task, mode::DISABLED, 0);
+        });
+
+        // EINVAL: strict mode cannot install a filter and releases the reserved fd
+        with_seccomp_group(&[], |cx, _| {
+            let fprog = write_fprog(cx, &[insn(RET | K, 0, 0, ret::ALLOW)]);
+            assert_eq!(set_strict(cx), Ok(0));
+            assert_eq!(
+                seccomp(cx, SET_MODE_FILTER, flag::NEW_LISTENER, fprog),
+                Err(Errno::EINVAL)
+            );
+            assert_slot_unreserved(cx, 3);
+            assert_seccomp_state(cx.task, mode::STRICT, 0);
+        });
+
+        // ENOMEM: exceeding MAX_INSNS_PER_PATH releases the reserved fd
+        with_seccomp_group(&[], |cx, _| {
+            let mut big = vec![insn(LD | IMM, 0, 0, 0); MAX_INSNS - 1];
+            big.push(insn(RET | K, 0, 0, ret::ALLOW));
+            let fprog = write_fprog(cx, &big);
+            for _ in 0..7 {
+                assert_eq!(seccomp(cx, SET_MODE_FILTER, 0, fprog), Ok(0));
+            }
+            assert_eq!(
+                seccomp(cx, SET_MODE_FILTER, flag::NEW_LISTENER, fprog),
+                Err(Errno::ENOMEM)
+            );
+            assert_slot_unreserved(cx, 3);
+            assert_seccomp_state(cx.task, mode::FILTER, 7);
+        });
     }
 }
