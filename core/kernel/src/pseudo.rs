@@ -1776,25 +1776,19 @@ impl Pseudo for View<'_> {
         self.k.protected_symlinks
     }
 
-    /// Search attributes for directories that are not world-searchable (`Cgroup`, `MqRoot`, and a
-    /// live process's `fd`, `fdinfo` and `ns` directories). Same-thread-group traversal of its own
-    /// `fd`, `fdinfo` or `ns` directory is always allowed even when non-dumpable (matching Linux's
-    /// `proc_fd_permission` and `ns`'s search bits).
+    /// A thread group can search its own `fd`, `fdinfo` and `ns` even when non-dumpable.
+    /// Skip the mode check for a reaped task so lookup can report `ENOENT`.
     fn searched(&self, node: &PseudoNode) -> Option<Stat> {
         match node {
-            PseudoNode::Cgroup(_, b"", 0) | PseudoNode::MqRoot(_) => stat(self, node).ok(),
+            PseudoNode::Cgroup(_, b"", 0) | PseudoNode::MqRoot(_) => {}
             PseudoNode::Entry(proc, tid, Entry::Fd | Entry::FdInfo | Entry::Ns) => {
-                if !self.pid_exists(*proc, *tid)
-                    || self
-                        .group(*proc)
-                        .is_some_and(|g| g.borrow().tgid == self.tgid)
-                {
+                if live_proc_tgid(self.k, *proc, *tid)? == self.tgid {
                     return None;
                 }
-                stat(self, node).ok()
             }
-            _ => None,
+            _ => return None,
         }
+        stat(self, node).ok()
     }
 
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {
@@ -2070,26 +2064,27 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
 
 // ---- stat and readdir ----
 
-/// Linux's `proc_fd_permission`: a process may always read and search its own live `fd/` and
-/// `fdinfo/` directories even when non-dumpable (owned by root).
-pub(crate) fn is_own_fd_dir(k: &Kernel, tgid: Tid, node: &PseudoNode) -> bool {
-    matches!(
-        node,
-        PseudoNode::Entry(proc, tid, Entry::Fd | Entry::FdInfo)
-            if pid_exists_in(k, *proc, *tid)
-                && group_of_id(k, *proc).is_some_and(|g| g.borrow().tgid == tgid)
-    )
+/// A non-dumpable thread group can still read and search its own `fd/` and `fdinfo/`
+/// (Linux's `proc_fd_permission`). Its `ns/` directory allows search alone.
+pub(crate) fn allows_own_proc_dir(k: &Kernel, tgid: Tid, node: &PseudoNode, mask: u32) -> bool {
+    use crate::cred::{MAY_EXEC, MAY_WRITE};
+
+    let PseudoNode::Entry(proc, tid, entry) = node else {
+        return false;
+    };
+    let allowed = match entry {
+        Entry::Fd | Entry::FdInfo => mask & MAY_WRITE == 0,
+        Entry::Ns => mask == MAY_EXEC,
+        _ => false,
+    };
+    allowed && live_proc_tgid(k, *proc, *tid) == Some(tgid)
 }
 
-/// Whether `node` is the caller thread group's live `ns/` directory (searchable by the same
-/// thread group even when non-dumpable, matching Linux's search bits).
-pub(crate) fn is_own_ns_dir(k: &Kernel, tgid: Tid, node: &PseudoNode) -> bool {
-    matches!(
-        node,
-        PseudoNode::Entry(proc, tid, Entry::Ns)
-            if pid_exists_in(k, *proc, *tid)
-                && group_of_id(k, *proc).is_some_and(|g| g.borrow().tgid == tgid)
-    )
+fn live_proc_tgid(k: &Kernel, proc: ProcId, tid: Option<Tid>) -> Option<Tid> {
+    if !pid_exists_in(k, proc, tid) {
+        return None;
+    }
+    Some(group_of_id(k, proc)?.borrow().tgid)
 }
 
 /// The metadata of a synthetic node.

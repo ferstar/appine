@@ -69,7 +69,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 - `Pseudo for View`: `lookup`, `missing`, `parent`, `name`, `kind`, `readlink`, `follow`,
   `follow_dentry`, `magic`, `protected_symlinks`, `searched`.
-- `pseudo::stat`, `is_own_fd_dir`, `is_own_ns_dir`, `node_ino`, `ino_of`, `fs_of`, `readdir`, `content`, `writable`, `unwritable_error`,
+- `pseudo::stat`, `allows_own_proc_dir`, `node_ino`, `ino_of`, `fs_of`, `readdir`, `content`, `writable`, `unwritable_error`,
   `open_unwritable`, `unreadable`, `pollable`, `poll_event`, `has_iter`, `write`, `read_pagemap`,
   `access_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `group_of_id`,
   `gone`, `comm_str`, `mark_deleted`, `uptime_ns`. (`sysctl_kind`/`recorded_value`/`RECORDED`
@@ -134,7 +134,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   files refuse any write intent (`EPERM`, before DAC); `/proc/sys` uses `kernel/sysctl`'s
   permission rules instead of DAC; other nodes check DAC against the synthetic stat, except a
   thread group's own live `fd/` and `fdinfo/` directories remain readable without write intent
-  even when non-dumpable (`proc_fd_permission`, `pseudo::is_own_fd_dir`). Then: for
+  even when non-dumpable (`proc_fd_permission`, `pseudo::allows_own_proc_dir`). Then: for
   `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup` and `pagemap`, the process must exist
   (found through `group_of_id` matching the pinned `ProcId`, else `ESRCH`) and the named thread pass one
   ptrace check with filesystem credentials and no read/attach distinction (`EACCES`, as Linux's
