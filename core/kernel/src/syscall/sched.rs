@@ -599,25 +599,22 @@ fn set_policy(
     if !cred.capable(cap::SYS_NICE) {
         let (cur, cur_prio) = task.map_or((SCHED_OTHER, 0), |t| t.sched.get());
         let cur_base = cur & !SCHED_RESET_ON_FORK;
+        let rlimit = |res: u32, default: u64| {
+            task.and_then(|t| cx.kr().groups.get(&t.tgid))
+                .map_or(default, |g| g.borrow().rlimits[res as usize].0)
+        };
         if rt {
-            let rlim_rtprio = task
-                .and_then(|t| cx.kr().groups.get(&t.tgid))
-                .map_or(0, |g| g.borrow().rlimits[RLIMIT_RTPRIO as usize].0);
-            if base != cur_base && rlim_rtprio == 0
-                || priority > cur_prio && (priority as u64) > rlim_rtprio
+            let rlim_rtprio = rlimit(RLIMIT_RTPRIO, 0);
+            if (base != cur_base && rlim_rtprio == 0)
+                || (priority > cur_prio && (priority as u64) > rlim_rtprio)
             {
                 return Err(Errno::EPERM);
             }
         }
         if let Some(t) = task {
-            let rlimit_nice = cx
-                .kr()
-                .groups
-                .get(&t.tgid)
-                .map_or(u64::MAX, |g| g.borrow().rlimits[RLIMIT_NICE as usize].0);
             if cur_base == SCHED_IDLE
                 && base != SCHED_IDLE
-                && (20 - t.nice.get()) as u64 > rlimit_nice
+                && (20 - t.nice.get()) as u64 > rlimit(RLIMIT_NICE, u64::MAX)
             {
                 return Err(Errno::EPERM);
             }

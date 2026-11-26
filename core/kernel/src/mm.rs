@@ -3339,16 +3339,7 @@ impl Mm {
             return Err(Errno::EAGAIN);
         }
         let offset = old_end - start;
-        let can_grow_in_place = old_end.checked_add(grow).is_some_and(|new_end| {
-            new_end <= 1 << VA_BITS
-                && self.is_free(old_end, grow)
-                && self
-                    .vmas
-                    .range(new_end..)
-                    .next()
-                    .is_none_or(|(&s, v)| !v.growsdown || s - new_end >= STACK_GUARD_GAP)
-        });
-        if offset == tail.len && can_grow_in_place {
+        if offset == tail.len && self.range_fits(old_end, grow, 1 << VA_BITS) {
             if self.grow_tail(start, grow)? {
                 return Ok(old);
             }
@@ -6593,18 +6584,24 @@ impl Mm {
             .is_none_or(|(&s, v)| s + v.len <= start)
     }
 
-    /// Whether an mmap hint can be used as it is: the range is free, below the top of the mmap area,
-    /// and clear of the guard gap below a grows-down mapping above it (Linux's `vm_start_gap`).
-    fn hint_fits(&self, hint: u64, len: u64) -> bool {
-        let Some(end) = hint.checked_add(len).filter(|&e| e <= self.mmap_top) else {
+    /// Whether `[start, start + len)` fits at or below `limit`, is free, and stays clear of the
+    /// guard gap below any grows-down mapping above it (Linux's `vm_start_gap` / `vma_expandable`).
+    fn range_fits(&self, start: u64, len: u64, limit: u64) -> bool {
+        let Some(end) = start.checked_add(len).filter(|&e| e <= limit) else {
             return false;
         };
-        self.is_free(hint, len)
+        self.is_free(start, len)
             && self
                 .vmas
                 .range(end..)
                 .next()
                 .is_none_or(|(&s, v)| !v.growsdown || s - end >= STACK_GUARD_GAP)
+    }
+
+    /// Whether an mmap hint can be used as it is: free below the top of the mmap area and clear of
+    /// the guard gap below any grows-down mapping above it.
+    fn hint_fits(&self, hint: u64, len: u64) -> bool {
+        self.range_fits(hint, len, self.mmap_top)
     }
 
     /// Finds a free range of length `len`, top down, leaving the guard gap below grows-down
