@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/service.md` for the paired decision history (it still holds the decisions on notifications, fault reports and diagnostics made before they were split out into `android/reports`).
 >
 > Verified: 2026-11-26 (full refresh: 17 adversarial claims checked independently — 14 confirmed and 3 partial corrected, plus 5 confirmed bugs/debt items recorded below)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: kernel handoffs, exit completion and wake-lock release after service destruction)
 
 ## Responsibilities
 
@@ -16,7 +18,8 @@ The module comprises `TerminalService.kt`, `BrowserBridge.kt`, `Settings.kt` and
 | Type | Role |
 | --- | --- |
 | `TerminalService.LocalBinder`, `Listener` | Same-process service reference and main-thread UI callbacks. A Settings listener counts for visibility and idle exit. Foreground tab routing requires a terminal activity. |
-| `StartedKernel` | Private handoff of `handle`, nullable `browser`, `booted`, `gpuAvailable` and optional `setupError`. `machine == 0L` means there is no published kernel. |
+| `ServiceLifecycle` | Main-thread lifecycle flags, wake-lock decision and completion of start, replacement, restart and exit. |
+| `StartedKernel` | Startup handoff of `handle`, nullable `browser`, `booted`, `gpuAvailable` and optional `setupError`. `machine == 0L` means there is no published kernel. |
 | `Switch` | Distro and volatile byte counts/cancellation flag. `switching` tracks the visible download, `downloader` its unfinished thread, `pendingReplace` a completed choice awaiting a start result. |
 | `ConsoleTracker` | Per-kernel monitor and epoch pairing console lifetimes with kill batches. |
 | `GuestActivity`, `RunPolicy` | CPU sample and activity time for the BUSY grace period, and the persisted SLEEP/BUSY/ALWAYS choice. |
@@ -24,7 +27,7 @@ The module comprises `TerminalService.kt`, `BrowserBridge.kt`, `Settings.kt` and
 | `BrowserBridge` | One kernel's listening socket, credential, active client and main-thread dispatch callback. |
 | `Settings`, `Tabs` | Private `settings` preferences and `files/tabs/` recovery store. `Tab` holds login, cwd, transcript and snapshot name. `Saved` adds layout, selection and time. `Killed` pairs a PID with a nullable layout. |
 
-Main owns the session list and lifecycle flags. `starting` covers import/private setup, `transitioning` the restart/replacement gap, `booting` the published kernel's outstanding boot check, and `exiting` the shutdown. `destroyed` guards late start results and notification updates. The single `appine-worker` orders poll batches, route updates, saves, trims, stop/shutdown and store reset. Start, boot, download and browser I/O have separate threads.
+Main owns the session list and lifecycle flags. `starting` covers import/private setup, `transitioning` the restart/replacement gap, `booting` the published kernel's outstanding boot check, and `exiting` the shutdown. After `destroyed` is set, `start`, `replace`, `restart` and `exitAll` return at entry, and main drops late import progress and notification updates. The single `appine-worker` orders poll batches, route updates, saves, trims, stop/shutdown and store reset. Start, boot, download and browser I/O have separate threads.
 
 ## Public entry points
 
@@ -60,7 +63,7 @@ For a positive PID, `lastExit` asks for the most recent matching `ApplicationExi
 
 ### Private startup and kernel publication
 
-`start` clears `startError`, sets `starting`, updates the lock and captures tier/GPU. Given a distro, `appine-start` calls `Rootfs.prepare` with progress posted to main and `Rootfs::probeMirrors` for import-time sources. Setup records the distro, configures a temporary store and publishes it by rename. `startKernel` still treats this attempt as an import after the store is in place.
+`start` clears `startError`, sets `starting`, updates the lock and captures tier/GPU. Given a distro, `appine-start` calls `Rootfs.prepare` with progress delivered on main while the service is alive and `Rootfs::probeMirrors` for import-time sources. Setup records the distro, configures a temporary store and publishes it by rename. `startKernel` still treats this attempt as an import after the store is in place.
 
 `prepareStartBridge` opens `BrowserBridge` before `Native.start`. `Rootfs.prepareStart` receives the optional endpoint configuration and processes network/container settings, login tools, Alpine bash startup, the GPU command if enabled, browser files if configured, and the profile. Its boolean reports whether it wrote the capability to `/etc/appine/browser`.
 
@@ -74,7 +77,7 @@ For a positive PID, `lastExit` asks for the most recent matching `ApplicationExi
 
 OpenRC setup I/O failure aborts an import and stops the private kernel. On an existing store the callback logs it and sets `setupError` for a visible notice, allowing a repair terminal. `Rootfs.boot` runs the guest `PREFER_OSCLOCK` shell command without a console, preserving existing clock-service choices. It ignores exit status, logs exceptions, then calls `Native.boot` for inittab.
 
-Main clears `starting` and handles destruction first. A successful late result closes its endpoint and queues `Native.shutdown` on a separate `appine-stop` thread. On a pending exit instead, it closes the returned endpoint and calls `finishExit` with the actual boot flag, or zero handle on failure.
+Main clears `starting`. After destruction it updates the wake lock for either result. On success it also closes the endpoint and runs `Native.shutdown` on an `appine-stop` thread. If the service is alive with an exit pending, it closes the returned endpoint and calls `finishExit` with the actual boot flag, or zero handle on failure.
 
 `started` installs the bridge, console tracker, login rules and auto-roots watcher, publishes `machine` and GPU availability, sets `booting`, resets guest activity, clears progress and refreshes roots. Tabs can now use the kernel. A `pendingReplace` is consumed here **before** setup notices, marker, tab restore, boot thread, network callback or poll.
 
@@ -102,7 +105,7 @@ The default-network callback queues `Native.setRoutes` on the worker. `routes` s
 
 ### Running policy and notification
 
-`updateWakeLock` acquires or releases a non-reference-counted `PARTIAL_WAKE_LOCK` tagged `appine:keep-awake`. Transitions are `starting`, `transitioning`, `booting` and `exiting`.
+`updateWakeLock` acquires or releases a non-reference-counted `PARTIAL_WAKE_LOCK` tagged `appine:keep-awake`. After destruction, every policy releases any held lock. While the service is alive, transitions are `starting`, `transitioning`, `booting` and `exiting`.
 
 | Policy | When to hold |
 | --- | --- |
@@ -174,10 +177,10 @@ The last listener leaving saves at once and arms a separate 60-second `trimWhenH
 
 `detach` closes the bridge and unregisters network callbacks. It clears `machine`, `gpuAvailable` and `booting` before releasing tabs so the UI sees the departing kernel. It updates the lock, cancels poll and minute save, releases sessions, drops per-machine trackers/watchers and calls `sessionsChanged`, which cancels `saveSoon`. `releaseSessions` releases each VT, cancels its notification and clears `sessions`, `unshown`, `current` and image tracking. The caller receives the old handle.
 
-- `exitAll` marks exiting once, cancels any switch, clears `pendingReplace`, calls `onExitAll`, then clears UI listeners before detach. A start or transition in progress finishes the exit. Otherwise `finishExit` queues graceful `Native.shutdown` for a published kernel. A start result explicitly marked unbooted uses `Native.stop`. Main clears `exiting`, updates the lock and clears saved tabs unless `restore` still holds a killed layout. A newly attached listener triggers `startOrImport`, otherwise `stopSelf`.
-- `restart` needs a published machine. It sets `transitioning`, detaches, calls `onRestarting` and queues shutdown. On return it clears `transitioning` and calls `finishExit(0)` if exiting, otherwise `start(null)`.
+- `exitAll` marks exiting once, cancels any switch, clears `pendingReplace`, calls `onExitAll`, then clears UI listeners before detach. A start or transition in progress finishes the exit. Otherwise `finishExit` queues graceful `Native.shutdown` for a published kernel. A start result explicitly marked unbooted uses `Native.stop`. Main clears `exiting` and updates the lock. After destruction the completion ends there. Otherwise it clears saved tabs unless a killed layout awaits restore, then calls `startOrImport` for a newly attached listener or `stopSelf` otherwise. If `finishExit` is entered after destruction, it clears `exiting`, releases any lock and uses `appine-stop` for a nonzero handle, honoring its boot flag.
+- `restart` needs a published machine. It sets `transitioning`, detaches, calls `onRestarting` and queues shutdown. On return it clears `transitioning`. After destruction it only updates the lock. A live service calls `finishExit(0)` if exiting, otherwise `start(null)`.
 - `canSwitch` requires neither a visible switch nor an unfinished downloader, plus a machine or `startError`. `switchTo` sets both download references. `appine-download` calls `Rootfs.download` while the current guest stays available. `cancelSwitch` marks the download cancelled, clears `switching`, updates lock/UI and checks `stopIfFailed`. The `downloader` slot stays occupied until completion. Only a still-current switch may use its result. A download failure other than cancellation leaves a notice.
-- A completed download replaces immediately if a machine or `startError` exists. Otherwise, during `starting` or `transitioning`, it sets `pendingReplace`. `replace` clears login, revokes document grants and refreshes roots, sets `transitioning`, detaches and clears `startError`. The worker hard-stops any old kernel, resets the store, revokes grants and refreshes roots again. Main clears `transitioning` and starts the selected distro even if exit arrived during reset (that start hands its result to the pending exit). If deletion leaves the old `meta.db` in place, startup can reopen the previous distro.
+- A completed download replaces immediately if a machine or `startError` exists. Otherwise, during `starting` or `transitioning`, it sets `pendingReplace`. `replace` clears login, revokes document grants and refreshes roots, sets `transitioning`, detaches and clears `startError`. The worker hard-stops any old kernel, resets the store, revokes grants and refreshes roots again. Main clears `transitioning`. After destruction it only updates the lock. A live service starts the selected distro even if exit arrived during reset, then hands the start result to the pending exit. If deletion leaves the old `meta.db` in place, startup can reopen the previous distro.
 - `onDestroy` removes the privacy listener, sets `destroyed`, closes the bridge, cancels any switch and removes trim, poll and save callbacks. It clears `Tabs` unless a killed layout awaits restore, unregisters network monitoring, clears the handle and GPU availability, releases sessions and drops watchers. A remaining handle gets best-effort shutdown on the worker before executor shutdown and wake-lock release. The explicit UI-listener clear belongs to `exitAll`. A private start finishing after destruction uses `appine-stop`.
 
 ## Dependencies (inbound / outbound)
@@ -211,7 +214,6 @@ The last listener leaving saves at once and arms a separate 60-second `trimWhenH
 - An `auto` tab's first save resolves the account independently of `login.sh` starting its shell. If account selection changes between those events, `resolvedLogin` can persist a different user and restore the tab under that account.
 - `saveTabs` captures live sessions and transcripts on main and then queries `Native.consoleCwd` by console number on the worker without checking console epochs, so a reused console number can pair an older tab's transcript with a newer tab's working directory.
 - `Rootfs.reset` logs failed deletion without aborting `replace`; if the old `meta.db` survives, `Rootfs.prepare` returns early and startup can reopen the previous distro instead of importing the selected one.
-- Neither `replace`'s nor `restart`'s `main.post` continuation checks `destroyed`. If `onDestroy` already ran, calling `start` reacquires the BUSY/ALWAYS wake lock without the destroyed-start branch releasing it, and a `restart` continuation seeing `exiting` submits `finishExit(0)` to the already-shut-down `worker` executor.
 
 ## Open questions
 

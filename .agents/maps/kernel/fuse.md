@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/fuse.md` for the paired decision history.
 >
 > Verified: 2026-11-26 (full mapping: source-verified rewrite; 18 adversarial claims checked by independent verifier — 13 confirmed, 5 partial, 0 refuted; all partial findings and audit corrections patched below)
+>
+> Maintained: 2026-11-26 (targeted verification of device read, readv and splice delivery)
 
 ## Responsibilities
 
@@ -90,7 +92,7 @@ must abandon a sent or forced request marks it background and returns `EINTR`.
 
 | Device operation | Contract |
 | --- | --- |
-| Read | Require `max(8192, 80 + max_write)` bytes before the abort check. Deliver live interrupts, eligible forgets, then the oldest pending request (now Sent). Empty reads give `EAGAIN` when nonblocking or `ERESTARTSYS` when interrupted while blocking. |
+| Read | Require `max(8192, 80 + max_write)` bytes before the abort check. Deliver live interrupts, eligible forgets, then the oldest pending request. Empty reads give `EAGAIN` when nonblocking or `ERESTARTSYS` when interrupted while blocking. |
 | Forget | With no pending requests, drain forgets. With both queues continuously populated, 16 forget messages alternate with eight ordinary requests. One entry or minor below 16 uses `FUSE_FORGET`. Otherwise `FUSE_BATCH_FORGET` packs as many (node ID, nlookup) pairs as fit. Each message gets a unique and no reply slot. |
 | Oversized request | Skip and continue reading. Foreground SETXATTR completes with `E2BIG`, other foreground requests with `EIO`. Oversized background requests are dropped. |
 | Write | A full 16-byte output header and exact total length are mandatory (`EINVAL`). After the abort check, unique zero dispatches a notification. Error replies are header-only with errno from −511 to −1. Replies require a sent request (`ENOENT` otherwise). A header-only interrupt reply can disable generation (`ENOSYS`) or requeue (`EAGAIN`). The original remains sent. |
@@ -99,11 +101,17 @@ must abandon a sent or forced request marks it background and returns `EINTR`.
 
 Scalar and vectored device I/O use an 8 MiB per-chunk staging limit (large scalar or vectored writes can
 dispatch multiple independently validated chunks), and a zero-length scalar write or zero-total-length
-`readv` returns 0 before attachment or framing checks. Device-to-pipe splice uses the device's O_NONBLOCK
-and takes the whole message before checking free pipe slots (`EIO` if insufficient, leaving an ordinary
-request `Sent`). Pipe-to-device splice reserves the pipe, snapshots available bytes up to the requested
-length including live vmsplice contents, then writes. A header-length mismatch returns `EINVAL` before
-consumption.
+`readv` returns 0 before attachment or framing checks.
+
+Scalar and vectored reads commit delivery after copying the entire message to daemon memory.
+Device-to-pipe splice uses the device's O_NONBLOCK and commits after inserting the whole message into
+free pipe slots. At commit, an ordinary request becomes `Sent` and queues its interrupt if needed.
+An interrupt or forget leaves its queue, and a forget message consumes one unique. A user-copy fault
+returns `EFAULT` even if a prefix was copied. Insufficient pipe room returns `EIO`. Both errors preserve
+queue order and the forget interleaving counter.
+
+Pipe-to-device splice reserves the pipe, snapshots available bytes up to the requested length including
+live vmsplice contents, then writes. A header-length mismatch returns `EINVAL` before consumption.
 
 ### Notifications
 
@@ -453,9 +461,6 @@ get ENOTCONN, sufficiently large device reads ENODEV, well-framed writes ENOENT 
   IOCTL, POLL, COPY_FILE_RANGE, TMPFILE, READDIRPLUS and notify RETRIEVE.
 - First getdents64 reads the complete directory before returning entries. Memory and initial latency grow
   with the listing.
-- `dev_read` marks an ordinary request `Sent` before copying staged bytes to daemon memory (scalar/vectored
-  reads) or checking pipe capacity (device-to-pipe splice); a failed or partial copy (`EFAULT`/short count)
-  or insufficient pipe room (`EIO`) can leave the foreground caller waiting until teardown.
 - READDIR parsing silently ignores an incomplete trailing header (<24 bytes), leaves the next offset
   unchanged on a nonempty reply with no complete record, and advances by padded record length without
   verifying trailing padding bytes exist.

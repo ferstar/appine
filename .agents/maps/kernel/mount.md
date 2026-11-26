@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/mount.md` for the paired decision history (decisions from before the split are D2, D4, D6–D8, D10, D30, D32, D35, D48, D52 and D53 in `.agents/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-26 (full mapping: 18 adversarial claims checked by independent verifier — 13 confirmed, 5 partial corrected below, 0 refuted; 4 recorded debt bullets verified and 5 audit refinements/bugs folded in)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: reserved filesystem device numbers)
 
 ## Responsibilities
 
@@ -75,7 +77,8 @@ entries. All use relatime.
 Missing point directories skip the corresponding mounts. Ordinary startup falls back to the store /dev
 directory if tmpfs creation or population fails. GPU startup requires a populated /dev tmpfs and
 successful GPU node creation. /tmp stays in the store. ID 5 is the fdinfo fallback for node-less
-descriptions. New mount IDs start at 11. Device allocation starts at `0x30`, including boot tmpfs.
+descriptions. New mount IDs start at 11. Device allocation, including boot tmpfs, starts at `0x30`
+and skips both the reserved values below `0x30` and the store's `ROOT_DEV` (`0x801`).
 
 ### Legacy mount dispatch and instance creation
 
@@ -420,9 +423,7 @@ notify affected namespaces.
 - Ordinary bind roots drop instance owner and pin metadata (`owner`, `pin`, `ns_pin`). A full remount
   through such a bind can require initial-user-namespace authority for an instance owned elsewhere, and an
   ordinary mqueue bind lacks the source mount's IPC reference.
-- The incremental device allocator can reach the fixed store device `ROOT_DEV` (`0x801`). Device-keyed
-  superblock flags and busy checks can then conflate distinct instances. Collection also leaves the
-  superblock-flag and mqueue device maps populated after instance or namespace turnover.
+- Collection leaves the superblock-flag and mqueue device maps populated after instance or namespace turnover.
 - Read-only accounting has holder gaps: `writers` omits writable descriptions held solely in Unix
   transfers or by a FUSE `Fill` mapping; `sb_busy` omits the FUSE executable record, tests a
   mapping-only overlay holder by backing-store link count (which can disagree with overlay visibility),

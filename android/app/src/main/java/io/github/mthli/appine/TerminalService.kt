@@ -33,6 +33,7 @@ import java.io.IOException
 import java.text.DateFormat
 import java.text.DecimalFormat
 import java.util.Date
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 import kotlin.concurrent.write
@@ -65,6 +66,93 @@ internal fun <B : Closeable> prepareStartBridge(
     } catch (e: Throwable) {
         bridge?.close()
         throw e
+    }
+}
+
+internal class StartedKernel(
+    val handle: Long, val browser: Closeable?, val booted: Boolean, val gpuAvailable: Boolean,
+    val setupError: String?,
+)
+
+/** Main-thread state shared by kernel handoffs and the wake-lock policy. */
+internal class ServiceLifecycle(private val updateWakeLock: () -> Unit) {
+    var destroyed = false
+
+    /** Import or private kernel setup is in progress. */
+    var starting = false
+
+    /** Restart or replacement has detached the old kernel. Its completion owns any pending exit. */
+    var transitioning = false
+    var booting = false
+    var exiting = false
+
+    fun wantsWakeLock(policy: RunPolicy, machine: Long, switching: Boolean, isBusy: () -> Boolean): Boolean {
+        if (destroyed) return false
+        val transition = exiting || starting || transitioning || booting
+        return when (policy) {
+            RunPolicy.SLEEP -> false
+            RunPolicy.ALWAYS -> machine != 0L || transition
+            RunPolicy.BUSY -> transition || switching || (machine != 0L && isBusy())
+        }
+    }
+
+    fun completeStart(
+        result: Result<StartedKernel>,
+        shutdown: (Long) -> Unit,
+        started: (StartedKernel) -> Unit,
+        failed: (Throwable) -> Unit,
+        exit: (StartedKernel?) -> Unit,
+    ) {
+        starting = false
+        if (destroyed) {
+            updateWakeLock()
+            result.onSuccess { kernel ->
+                kernel.browser?.close()
+                thread(name = "appine-stop") { shutdown(kernel.handle) }
+            }
+        } else if (exiting) {
+            val kernel = result.getOrNull()
+            kernel?.browser?.close()
+            exit(kernel)
+        } else {
+            result.onSuccess(started).onFailure(failed)
+        }
+    }
+
+    fun completeTransition(distro: Rootfs.Distro?, start: (Rootfs.Distro?) -> Unit, finishExit: (Long) -> Unit) {
+        transitioning = false
+        if (destroyed) {
+            updateWakeLock()
+        } else if (distro == null && exiting) {
+            finishExit(0)
+        } else {
+            // After replacement the store is gone, so even a pending exit must finish the import.
+            start(distro)
+        }
+    }
+
+    fun finishExit(handle: Long, worker: Executor, stop: (Long) -> Unit, onStopped: () -> Unit) {
+        if (destroyed) {
+            exiting = false
+            updateWakeLock()
+            if (handle != 0L) thread(name = "appine-stop") { stop(handle) }
+            return
+        }
+        worker.execute {
+            if (handle != 0L) stop(handle)
+            onStopped()
+        }
+    }
+
+    fun completeExit(
+        hasRestore: Boolean, hasListeners: Boolean,
+        clearTabs: () -> Unit, startOrImport: () -> Unit, stopSelf: () -> Unit,
+    ) {
+        exiting = false
+        updateWakeLock()
+        if (destroyed) return
+        if (!hasRestore) clearTabs()
+        if (hasListeners) startOrImport() else stopSelf()
     }
 }
 
@@ -390,31 +478,15 @@ class TerminalService : Service() {
         }
     }
 
-    /** Shutting down to exit ([exitAll]). */
-    private var exiting = false
+    private val lifecycle = ServiceLifecycle(::updateWakeLock)
 
     /** The browser endpoint for the current kernel, independent of terminal sessions. */
-    private var browserBridge: BrowserBridge? = null
+    private var browserBridge: Closeable? = null
 
     /** Console-lifetime epoch tracker for the current kernel's kill reports. */
     private var consoleTracker: ConsoleTracker? = null
     private var loginRules: Rootfs.LoginRules? = null
     private var autoRoots: Documents.AutoRootsWatcher? = null
-
-    /**
-     * [onDestroy] has run: a thread that outlives the service (a download) must not
-     * post the ongoing notification again, which would then have no service behind it.
-     */
-    private var destroyed = false
-
-    /** A [start] is running: the rootfs is being prepared or the kernel is starting. */
-    private var starting = false
-
-    /**
-     * [restart] or [replace] has let go of the old kernel and not yet called [start]: the wake lock
-     * stays held, and an [exitAll] meanwhile is finished by them.
-     */
-    private var transitioning = false
 
     /**
      * A distro switch whose download finished while the kernel was restarting (a guest reboot):
@@ -468,7 +540,6 @@ class TerminalService : Service() {
     /** The `PARTIAL_WAKE_LOCK` held while keeping running with the screen off. */
     private var wakeLock: PowerManager.WakeLock? = null
     private val guestActivity = GuestActivity()
-    private var booting = false
 
     /** The tabs. */
     internal val sessions = mutableListOf<VtSession>()
@@ -632,9 +703,9 @@ class TerminalService : Service() {
         // Tabs whose shell has ended stay open but are not running
         val n = sessions.count { it.isRunning }
         val sw = switching
-        val error = startError.takeIf { !exiting && machine == 0L && progress == null }
+        val error = startError.takeIf { !lifecycle.exiting && machine == 0L && progress == null }
         val state = when {
-            exiting -> getString(R.string.stopping)
+            lifecycle.exiting -> getString(R.string.stopping)
             machine == 0L && progress != null -> progress
             error != null -> getString(R.string.start_failed_title)
             n == 0 && machine != 0L -> getString(R.string.background_running)
@@ -661,7 +732,7 @@ class TerminalService : Service() {
             }
             builder.addAction(Notification.Action.Builder(null, getString(R.string.cancel_download), cancel).build())
         }
-        if (!exiting) {
+        if (!lifecycle.exiting) {
             val toggle = Notifications.serviceAction(this, 3, ACTION_TOGGLE_KEEP_AWAKE)
             val label = getString(Settings.nextRunPolicy(this).label)
             builder.addAction(Notification.Action.Builder(null, label, toggle).build())
@@ -670,7 +741,7 @@ class TerminalService : Service() {
     }
 
     private fun updateNotification() {
-        if (destroyed) return
+        if (lifecycle.destroyed) return
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
     }
 
@@ -710,11 +781,6 @@ class TerminalService : Service() {
      */
     private fun startOrImport() = start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
 
-    private class StartedKernel(
-        val handle: Long, val browser: BrowserBridge?, val booted: Boolean, val gpuAvailable: Boolean,
-        val setupError: String?,
-    )
-
     /** Owns the new handle and browser endpoint until both can be handed to the main thread. */
     private fun startKernel(tier: Int, gpu: Boolean, importing: Boolean): StartedKernel {
         val store = Rootfs.store(this).path
@@ -727,7 +793,7 @@ class TerminalService : Service() {
             },
             openBridge = {
                 BrowserBridge { url ->
-                    machine != 0L && !destroyed && listeners.any { it.onOpenUrl(url) }
+                    machine != 0L && !lifecycle.destroyed && listeners.any { it.onOpenUrl(url) }
                 }
             },
             configure = { bridge, onFailure ->
@@ -766,8 +832,9 @@ class TerminalService : Service() {
      * already be deleted).
      */
     private fun start(distro: Rootfs.Distro?) {
+        if (lifecycle.destroyed) return
         startError = null
-        starting = true
+        lifecycle.starting = true
         updateWakeLock()
         if (distro != null) preparing(getString(R.string.preparing, distro.label))
         val tier = tier
@@ -777,29 +844,22 @@ class TerminalService : Service() {
                 if (distro != null) {
                     Rootfs.prepare(this, distro, startMirrorProbes = Rootfs::probeMirrors, progress = { done, total ->
                         val text = getString(R.string.downloading, distro.label, done shr 20, total shr 20)
-                        main.post { preparing(text) }
+                        main.post { if (!lifecycle.destroyed) preparing(text) }
                     })
                 }
                 startKernel(tier, gpu, importing = distro != null)
             }
             main.post {
-                starting = false
-                if (destroyed) {
-                    result.onSuccess { kernel ->
-                        kernel.browser?.close()
-                        thread(name = "appine-stop") { Native.shutdown(kernel.handle) }
-                    }
-                    return@post
-                }
-                if (exiting) {
-                    // OpenRC setup may already have booted this kernel.
-                    progress = null
-                    val kernel = result.getOrNull()
-                    kernel?.browser?.close()
-                    finishExit(kernel?.handle ?: 0L, booted = kernel?.booted == true)
-                    return@post
-                }
-                result.onSuccess(::started).onFailure { startFailed(distro, it) }
+                lifecycle.completeStart(
+                    result,
+                    shutdown = Native::shutdown,
+                    started = ::started,
+                    failed = { startFailed(distro, it) },
+                    exit = { kernel ->
+                        progress = null
+                        finishExit(kernel?.handle ?: 0L, booted = kernel?.booted == true)
+                    },
+                )
             }
         }
     }
@@ -824,7 +884,7 @@ class TerminalService : Service() {
         autoRoots = Documents.AutoRootsWatcher(m)
         machine = m
         gpuAvailable = kernel.gpuAvailable
-        booting = true
+        lifecycle.booting = true
         guestActivity.reset(SystemClock.elapsedRealtime())
         progress = null
         // The store may have just been imported (first run, distro switch)
@@ -852,7 +912,7 @@ class TerminalService : Service() {
             val failed = Rootfs.failedServices(this)
             main.post {
                 if (machine != m) return@post
-                booting = false
+                lifecycle.booting = false
                 guestActivity.reset(SystemClock.elapsedRealtime())
                 updateWakeLock()
                 if (failed.isNotEmpty()) notifications.bootFailures(failed)
@@ -908,12 +968,8 @@ class TerminalService : Service() {
     // User-selected policy; BUSY releases through the poll, ALWAYS has no fixed duration.
     @SuppressLint("WakelockTimeout", "Wakelock")
     private fun updateWakeLock() {
-        val transition = exiting || starting || transitioning || booting
-        val want = when (runPolicy) {
-            RunPolicy.SLEEP -> false
-            RunPolicy.ALWAYS -> machine != 0L || transition
-            RunPolicy.BUSY -> transition || switching != null ||
-                (machine != 0L && guestActivity.isBusy(SystemClock.elapsedRealtime()))
+        val want = lifecycle.wantsWakeLock(runPolicy, machine, switching != null) {
+            guestActivity.isBusy(SystemClock.elapsedRealtime())
         }
         val held = wakeLock
         if (want && held == null) {
@@ -996,8 +1052,8 @@ class TerminalService : Service() {
      * progress and cancel action are in the notification) until it ends one way or the other.
      */
     private fun stopIfFailed() {
-        if (machine == 0L && startError != null && !starting && !transitioning && !exiting &&
-            switching == null && listeners.isEmpty()
+        if (machine == 0L && startError != null && switching == null && listeners.isEmpty() &&
+            !lifecycle.starting && !lifecycle.transitioning && !lifecycle.exiting
         ) {
             stopSelf()
         }
@@ -1364,7 +1420,7 @@ class TerminalService : Service() {
                     when {
                         machine != 0L || startError != null -> replace(distro)
                         // The kernel is restarting (a guest reboot): replace once it is up
-                        starting || transitioning -> pendingReplace = distro
+                        lifecycle.starting || lifecycle.transitioning -> pendingReplace = distro
                     }
                 }.onFailure {
                     if (it !is Rootfs.Cancelled) {
@@ -1396,11 +1452,12 @@ class TerminalService : Service() {
      * are done on [worker].
      */
     private fun replace(distro: Rootfs.Distro) {
+        if (lifecycle.destroyed) return
         // The old accounts and path-based document grants belong to the store being removed.
         Settings.clearLogin(this)
         Documents.revokeAccess(this)
         Documents.rootsChanged(this)
-        transitioning = true
+        lifecycle.transitioning = true
         val m = detach()
         startError = null
         preparing(getString(R.string.preparing, distro.label))
@@ -1410,12 +1467,7 @@ class TerminalService : Service() {
             // Revoke again after deletion in case a grant was issued while stopping the old kernel.
             Documents.revokeAccess(this)
             Documents.rootsChanged(this)
-            main.post {
-                transitioning = false
-                // Also after "Exit all" meanwhile: the store is gone, so import the chosen distro
-                // (the start then stops it again) rather than leave the next start to import Alpine
-                start(distro)
-            }
+            main.post { lifecycle.completeTransition(distro, ::start, ::finishExit) }
         }
     }
 
@@ -1424,17 +1476,13 @@ class TerminalService : Service() {
      * shut down, then start a new kernel (after which the Activity opens new sessions).
      */
     private fun restart() {
-        if (machine == 0L) return
-        transitioning = true
+        if (lifecycle.destroyed || machine == 0L) return
+        lifecycle.transitioning = true
         val m = detach()
         each { it.onRestarting() }
         worker.execute {
             Native.shutdown(m)
-            main.post {
-                transitioning = false
-                // "Exit all" meanwhile left the rest to here
-                if (exiting) finishExit(0) else start(null)
-            }
+            main.post { lifecycle.completeTransition(null, ::start, ::finishExit) }
         }
     }
 
@@ -1446,8 +1494,8 @@ class TerminalService : Service() {
      * killed as a cached process.
      */
     fun exitAll() {
-        if (exiting) return
-        exiting = true
+        if (lifecycle.destroyed || lifecycle.exiting) return
+        lifecycle.exiting = true
         // Activities release only in onStop, and the shutdown may be faster than that: treat them
         // as already gone, and a UI present after the shutdown means the user opened the app again
         switching?.cancelled = true
@@ -1460,7 +1508,7 @@ class TerminalService : Service() {
         // A start, restart or replacement in progress finishes exiting itself once its kernel is up
         // (or has failed): there is nothing to shut down yet, and stopping the service now would
         // leave that kernel running
-        if (starting || transitioning) return
+        if (lifecycle.starting || lifecycle.transitioning) return
         finishExit(m)
     }
 
@@ -1469,20 +1517,14 @@ class TerminalService : Service() {
      * stops the service.
      */
     private fun finishExit(m: Long, booted: Boolean = true) {
-        worker.execute {
-            if (m != 0L) {
-                if (booted) Native.shutdown(m) else Native.stop(m)
-            }
+        lifecycle.finishExit(m, worker, stop = { handle ->
+            if (booted) Native.shutdown(handle) else Native.stop(handle)
+        }) {
             main.post {
-                exiting = false
-                updateWakeLock()
-                // Normal exit: do not restore the tabs next time. Tabs of a killed run that have not
-                // been restored yet (the start never succeeded) are kept for the next start
-                if (restore == null) Tabs.clear(this)
-                // The user opened the app again during the shutdown: start again (importing again
-                // when an import the exit came during failed), otherwise the UI stays at
-                // "Starting…" forever
-                if (listeners.isNotEmpty()) startOrImport() else stopSelf()
+                lifecycle.completeExit(
+                    hasRestore = restore != null, hasListeners = listeners.isNotEmpty(),
+                    clearTabs = { Tabs.clear(this) }, startOrImport = ::startOrImport, stopSelf = ::stopSelf,
+                )
             }
         }
     }
@@ -1502,7 +1544,7 @@ class TerminalService : Service() {
         }
         machine = 0
         gpuAvailable = false
-        booting = false
+        lifecycle.booting = false
         updateWakeLock()
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
@@ -1529,7 +1571,7 @@ class TerminalService : Service() {
 
     override fun onDestroy() {
         Privacy.removeListener(privacyChanged)
-        destroyed = true
+        lifecycle.destroyed = true
         browserBridge?.close()
         browserBridge = null
         // A download still under way has nothing left to replace
@@ -1556,8 +1598,7 @@ class TerminalService : Service() {
         // guest threads to exit, so not on the main thread
         if (m != 0L) worker.execute { Native.shutdown(m) }
         worker.shutdown()
-        wakeLock?.release()
-        wakeLock = null
+        updateWakeLock()
         super.onDestroy()
     }
 

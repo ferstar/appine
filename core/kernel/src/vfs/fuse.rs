@@ -739,12 +739,11 @@ impl Conn {
     /// The next forget message for a read of `len` bytes (6.1's `fuse_read_forget`): one
     /// `FUSE_FORGET`, or a `FUSE_BATCH_FORGET` of as many as fit when several are queued and the
     /// daemon speaks 7.16 or later. Neither is answered.
-    fn read_forget(&mut self, len: usize) -> Vec<u8> {
+    fn peek_forget(&self, len: usize) -> (Vec<u8>, usize) {
         let unique = self.next_unique;
-        self.next_unique += 2;
         if self.minor < 16 || self.forgets.len() == 1 {
-            let (nodeid, nlookup) = self.forgets.pop_front().unwrap();
-            return Args::default()
+            let (nodeid, nlookup) = self.forgets[0];
+            let message = Args::default()
                 .u32((IN_HEADER + 8) as u32)
                 .u32(op::FORGET)
                 .u64(unique)
@@ -753,6 +752,7 @@ impl Conn {
                 .u64(0)
                 .u64(nlookup)
                 .0;
+            return (message, 1);
         }
         let n = self.forgets.len().min((len - IN_HEADER - 8) / 16);
         let mut message = Args::default()
@@ -764,10 +764,110 @@ impl Conn {
             .u64(0)
             .u32(n as u32)
             .u32(0);
-        for (nodeid, nlookup) in self.forgets.drain(..n) {
+        for &(nodeid, nlookup) in self.forgets.iter().take(n) {
             message = message.u64(nodeid).u64(nlookup);
         }
-        message.0
+        (message.0, n)
+    }
+
+    /// Selects a message without consuming it. Stale interrupts are discarded. Oversized
+    /// requests are completed here, and `ended` records whether a foreground waiter needs waking.
+    fn stage_read(&mut self, len: usize, ended: &mut bool) -> Option<(Delivery, Vec<u8>)> {
+        while let Some(&unique) = self.interrupts.front() {
+            if matches!(
+                self.requests.get(&unique).map(|r| &r.state),
+                Some(ReqState::Sent)
+            ) {
+                let message = Args::default()
+                    .u32((IN_HEADER + 8) as u32)
+                    .u32(op::INTERRUPT)
+                    .u64(unique | INT_REQ_BIT)
+                    .u64(0)
+                    .u64(0)
+                    .u64(0)
+                    .u64(unique)
+                    .0;
+                return Some((Delivery::Interrupt(unique), message));
+            }
+            self.interrupts.pop_front();
+        }
+        loop {
+            // With both queues active, count only delivered messages toward the 16 forgets
+            // followed by 8 ordinary requests (6.1's fuse_dev_do_read).
+            let mut forget_batch = None;
+            if !self.forgets.is_empty() {
+                let batch = self.forget_batch - 1;
+                if self.pending.is_empty() || batch >= 0 {
+                    let (msg, count) = self.peek_forget(len);
+                    let item = Delivery::Forget {
+                        count,
+                        forget_batch: (!self.pending.is_empty()).then_some(batch),
+                    };
+                    return Some((item, msg));
+                }
+                forget_batch = Some(if batch <= -8 { 16 } else { batch });
+            }
+            let &unique = self.pending.front()?;
+            let r = self.requests.get_mut(&unique).expect("pending request");
+            if r.message.len() <= len {
+                return Some((
+                    Delivery::Request {
+                        unique,
+                        forget_batch,
+                    },
+                    r.message.clone(),
+                ));
+            }
+            self.pending.pop_front();
+            if r.background {
+                let r = self.requests.remove(&unique).unwrap();
+                self.note_request_done(&r.message);
+            } else {
+                let e = if r.message[4..8] == op::SETXATTR.to_le_bytes() {
+                    Errno::E2BIG
+                } else {
+                    Errno::EIO
+                };
+                r.state = ReqState::Done(Err(e));
+                *ended = true;
+            }
+        }
+    }
+
+    /// Commits a message returned by [`Self::stage_read`] once delivery succeeded. Returns whether
+    /// an interrupt was queued and readers need waking.
+    fn commit_read(&mut self, item: Delivery) -> bool {
+        match item {
+            Delivery::Interrupt(unique) => remove_queued(&mut self.interrupts, unique),
+            Delivery::Forget {
+                count,
+                forget_batch,
+            } => {
+                self.next_unique += 2;
+                let count = count.min(self.forgets.len());
+                self.forgets.drain(..count);
+                if let Some(batch) = forget_batch {
+                    self.forget_batch = batch;
+                }
+            }
+            Delivery::Request {
+                unique,
+                forget_batch,
+            } => {
+                remove_queued(&mut self.pending, unique);
+                if let Some(batch) = forget_batch {
+                    self.forget_batch = batch;
+                }
+                if let Some(r) = self.requests.get_mut(&unique) {
+                    r.state = ReqState::Sent;
+                    if r.interrupted && self.no & no::INTERRUPT == 0 {
+                        self.interrupts.push_back(unique);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// The node ids requests still unanswered are about: the node of each, and the other
@@ -1149,17 +1249,47 @@ fn dev_conn(file: &crate::fd::FileRef) -> Result<Rc<RefCell<Conn>>, Errno> {
     }
 }
 
-/// read(2) on the device (6.1's `fuse_dev_do_read`): takes the next interrupt or request, waiting
-/// for one unless nonblocking. The buffer must hold at least 8 KiB and a whole write request
-/// (EINVAL); a request that does not fit ends with EIO (E2BIG for SETXATTR) and the next one is
-/// taken. A request whose caller was interrupted before it was read is followed by its
-/// interrupt. An aborted connection is ENODEV.
+enum Delivery {
+    Interrupt(u64),
+    Forget {
+        count: usize,
+        forget_batch: Option<i32>,
+    },
+    Request {
+        unique: u64,
+        forget_batch: Option<i32>,
+    },
+}
+
+fn remove_queued(queue: &mut VecDeque<u64>, unique: u64) {
+    if queue.front() == Some(&unique) {
+        queue.pop_front();
+    } else {
+        queue.retain(|&u| u != unique);
+    }
+}
+
+/// Reads the next whole device message into a kernel buffer.
 pub(crate) fn dev_read(
     cx: &mut Cx<'_>,
     file: &crate::fd::FileRef,
     len: usize,
     nonblock: bool,
 ) -> Result<Vec<u8>, Errno> {
+    dev_read_with(cx, file, len, nonblock, |_, msg| Ok(msg))
+}
+
+/// Reads one whole message (6.1's `fuse_dev_do_read`). The buffer must hold at least 8 KiB
+/// and a full write request. Oversized requests end with EIO (E2BIG for SETXATTR).
+/// The delivery callback runs under the BKL with the connection unborrowed. It must retain
+/// the BKL so another reader cannot take the same message before delivery commits.
+pub(crate) fn dev_read_with<T>(
+    cx: &mut Cx<'_>,
+    file: &crate::fd::FileRef,
+    len: usize,
+    nonblock: bool,
+    deliver: impl FnOnce(&mut Cx<'_>, Vec<u8>) -> Result<T, Errno>,
+) -> Result<T, Errno> {
     let conn = dev_conn(file)?;
     {
         let c = conn.borrow();
@@ -1169,82 +1299,26 @@ pub(crate) fn dev_read(
         }
     }
     loop {
-        {
-            let mut guard = conn.borrow_mut();
-            let c = &mut *guard;
+        let mut ended = false;
+        let staged = {
+            let mut c = conn.borrow_mut();
             if c.aborted {
                 return Err(Errno::ENODEV);
             }
-            while let Some(unique) = c.interrupts.pop_front() {
-                // Only for a request still held by the daemon
-                if matches!(
-                    c.requests.get(&unique).map(|r| &r.state),
-                    Some(ReqState::Sent)
-                ) {
-                    let message = Args::default()
-                        .u32((IN_HEADER + 8) as u32)
-                        .u32(op::INTERRUPT)
-                        .u64(unique | INT_REQ_BIT)
-                        .u64(0)
-                        .u64(0)
-                        .u64(0)
-                        .u64(unique)
-                        .0;
-                    return Ok(message);
-                }
+            c.stage_read(len, &mut ended)
+        };
+        if ended {
+            request_wake_object(answers(&conn));
+        }
+        if let Some((item, message)) = staged {
+            let out = deliver(cx, message)?;
+            if conn.borrow_mut().commit_read(item) {
+                request_wake_object(readers(&conn));
             }
-            // Forgets go first while nothing is pending, else up to 16 between requests and then
-            // 8 requests in a row (6.1's fuse_dev_do_read)
-            if !c.forgets.is_empty() {
-                if c.pending.is_empty() || {
-                    c.forget_batch -= 1;
-                    c.forget_batch >= 0
-                } {
-                    return Ok(c.read_forget(len));
-                }
-                if c.forget_batch <= -8 {
-                    c.forget_batch = 16;
-                }
-            }
-            let mut ended = false;
-            while let Some(unique) = c.pending.pop_front() {
-                let r = c.requests.get_mut(&unique).expect("pending request");
-                // A request the buffer cannot hold ends with EIO (E2BIG for a SETXATTR, whose
-                // value may be too large), and the read goes on with the next one
-                if r.message.len() > len {
-                    if r.background {
-                        if let Some(r) = c.requests.remove(&unique) {
-                            c.note_request_done(&r.message);
-                        }
-                        continue;
-                    }
-                    let opcode = u32::from_le_bytes(r.message[4..8].try_into().unwrap());
-                    let e = if opcode == op::SETXATTR {
-                        Errno::E2BIG
-                    } else {
-                        Errno::EIO
-                    };
-                    r.state = ReqState::Done(Err(e));
-                    ended = true;
-                    continue;
-                }
-                r.state = ReqState::Sent;
-                let message = r.message.clone();
-                // Its caller was interrupted while it waited to be read: the interrupt follows it
-                if r.interrupted && c.no & no::INTERRUPT == 0 {
-                    c.interrupts.push_back(unique);
-                }
-                if ended {
-                    drop(guard);
-                    request_wake_object(answers(&conn));
-                }
-                return Ok(message);
-            }
-            if ended {
-                drop(guard);
-                request_wake_object(answers(&conn));
-                continue;
-            }
+            return Ok(out);
+        }
+        if ended {
+            continue;
         }
         if nonblock {
             return Err(Errno::EAGAIN);
@@ -2053,7 +2127,7 @@ impl Fuses {
     }
 
     /// Forgets the nodes nothing uses (Linux evicting unused inodes), giving their lookups back to
-    /// their daemons (`FUSE_FORGET`, [`Conn::read_forget`]); returns how many went. Kept are
+    /// their daemons (`FUSE_FORGET`, [`Conn::peek_forget`]); returns how many went. Kept are
     /// those in `keep` (what processes' roots, cwds and open files, mounts, inotify watches and
     /// running programs are), roots, nodes with an O_PATH pin, an open handle or a request in
     /// flight, and the directories any of these or any remaining node lies in. Doomed nodes
@@ -3268,6 +3342,174 @@ pub(crate) mod tests {
         Conn::new(0x30, opts, &Cred::root(), crate::pidns::PidNs::init())
     }
 
+    fn device(c: &Rc<RefCell<Conn>>) -> crate::fd::FileRef {
+        use crate::fd::{FileKind, OpenFile, oflags};
+        let mut dev = DevFile::new(&Cred::root(), 1);
+        dev.attach(c);
+        OpenFile::new(FileKind::FuseDev(dev), oflags::O_RDWR | oflags::O_NONBLOCK)
+    }
+
+    fn test_device() -> (Rc<RefCell<Conn>>, crate::fd::FileRef) {
+        let c = Rc::new(RefCell::new(conn(Options::default())));
+        let file = device(&c);
+        (c, file)
+    }
+
+    fn with_read_cx<T>(run: impl FnOnce(&mut Cx<'_>) -> T) -> T {
+        use crate::kernel::{Kernel, Shared};
+        let mut kernel = Kernel::new(crate::process::Tier::Interpreter);
+        let (proc, _, _cpu) = crate::pseudo::tests::add_task(&mut kernel, 20, 0, true, b"");
+        let shared = std::sync::Arc::new(Shared::new(kernel));
+        let k = shared.lock();
+        let task = k.tasks[&proc.pid].clone();
+        let mut state = task.state.borrow_mut();
+        run(&mut Cx::new(&shared, k, &task, &mut state))
+    }
+
+    /// One interrupted foreground write, with a forget due after the next ordinary request.
+    pub(crate) fn read_device_fixture() -> (crate::fd::FileRef, Vec<u8>) {
+        let (c, file) = test_device();
+        let mut c = c.borrow_mut();
+        let mut args = vec![0; 40];
+        args[16..20].copy_from_slice(&PAGE.to_le_bytes());
+        args.extend((0..PAGE).map(|i| i as u8));
+        let unique = c.queue(op::WRITE, 3, None, &args, (false, false));
+        c.forgets.push_back((7, 1));
+        c.forget_batch = 0;
+        let req = c.requests.get_mut(&unique).unwrap();
+        req.interrupted = true;
+        (file, req.message.clone())
+    }
+
+    /// Captures the staged bytes so the retry can check the complete wire message.
+    fn reject_read(cx: &mut Cx<'_>, file: &crate::fd::FileRef) -> Vec<u8> {
+        let mut staged = Vec::new();
+        let result = dev_read_with(cx, file, MIN_READ_BUFFER, true, |_, msg| {
+            staged = msg;
+            Err::<(), _>(Errno::EFAULT)
+        });
+        assert_eq!(result, Err(Errno::EFAULT));
+        staged
+    }
+
+    #[test]
+    fn failed_device_reads_keep_requests_and_live_interrupts_in_order() {
+        with_read_cx(|cx| {
+            let (c, file) = test_device();
+            let first = c
+                .borrow_mut()
+                .queue(op::GETATTR, 3, None, &[], (false, false));
+            let second = c
+                .borrow_mut()
+                .queue(op::GETATTR, 4, None, &[], (false, false));
+            c.borrow_mut()
+                .requests
+                .get_mut(&second)
+                .unwrap()
+                .interrupted = true;
+            for unique in [first, second] {
+                let msg = reject_read(cx, &file);
+                {
+                    let c = c.borrow();
+                    assert_eq!(c.pending.front(), Some(&unique));
+                    assert!(matches!(c.requests[&unique].state, ReqState::Pending));
+                    assert!(c.interrupts.is_empty());
+                    assert_eq!(msg, c.requests[&unique].message);
+                }
+                assert_eq!(dev_read(cx, &file, MIN_READ_BUFFER, true), Ok(msg));
+                assert!(matches!(c.borrow().requests[&unique].state, ReqState::Sent));
+            }
+            assert!(c.borrow().pending.is_empty());
+            assert_eq!(c.borrow().interrupts, [second]);
+            // A stale interrupt is discarded even when the following live one faults.
+            c.borrow_mut().interrupts.push_front(0);
+            let interrupt = reject_read(cx, &file);
+            assert_eq!(c.borrow().interrupts, [second]);
+            assert_eq!(&interrupt[4..8], &op::INTERRUPT.to_le_bytes());
+            assert_eq!(&interrupt[8..16], &(second | INT_REQ_BIT).to_le_bytes());
+            assert_eq!(&interrupt[40..], &second.to_le_bytes());
+            assert_eq!(dev_read(cx, &file, MIN_READ_BUFFER, true), Ok(interrupt));
+            assert!(c.borrow().interrupts.is_empty());
+        });
+    }
+
+    #[test]
+    fn failed_device_reads_preserve_forget_counts_uniques_and_interleaving() {
+        with_read_cx(|cx| {
+            let (c, file) = test_device();
+            let count = (MIN_READ_BUFFER - IN_HEADER - 8) / 16;
+            let mut pending = Vec::new();
+            {
+                let mut c = c.borrow_mut();
+                c.minor = 37;
+                c.forgets.extend((1..=count as u64 + 1).map(|id| (id, 2)));
+                c.forget_batch = 1;
+                for _ in 0..8 {
+                    pending.push(c.queue(op::GETATTR, 3, None, &[], (false, false)));
+                }
+            }
+            let forgets = c.borrow().forgets.clone();
+            let unique = c.borrow().next_unique;
+            let batch = reject_read(cx, &file);
+            assert_eq!(c.borrow().forgets, forgets);
+            assert_eq!(c.borrow().next_unique, unique);
+            assert_eq!(c.borrow().forget_batch, 1);
+            assert_eq!(&batch[4..8], &op::BATCH_FORGET.to_le_bytes());
+            assert_eq!(&batch[8..16], &unique.to_le_bytes());
+            assert_eq!(&batch[40..44], &(count as u32).to_le_bytes());
+            assert_eq!(dev_read(cx, &file, MIN_READ_BUFFER, true), Ok(batch));
+            assert_eq!(c.borrow().forgets, [(count as u64 + 1, 2)]);
+            assert_eq!(c.borrow().next_unique, unique + 2);
+            assert_eq!(c.borrow().forget_batch, 0);
+
+            for (i, id) in pending.into_iter().enumerate() {
+                let msg = reject_read(cx, &file);
+                assert_eq!(c.borrow().forget_batch, -(i as i32));
+                assert_eq!(c.borrow().pending.front(), Some(&id));
+                assert_eq!(&msg[8..16], &id.to_le_bytes());
+                assert_eq!(dev_read(cx, &file, MIN_READ_BUFFER, true), Ok(msg));
+            }
+            assert_eq!(c.borrow().forget_batch, 16);
+            let single = reject_read(cx, &file);
+            assert_eq!(c.borrow().next_unique, unique + 2);
+            assert_eq!(c.borrow().forgets, [(count as u64 + 1, 2)]);
+            assert_eq!(c.borrow().forget_batch, 16);
+            assert_eq!(&single[4..8], &op::FORGET.to_le_bytes());
+            assert_eq!(&single[8..16], &(unique + 2).to_le_bytes());
+            assert_eq!(&single[16..24], &(count as u64 + 1).to_le_bytes());
+            assert_eq!(dev_read(cx, &file, MIN_READ_BUFFER, true), Ok(single));
+            assert!(c.borrow().forgets.is_empty());
+            assert_eq!(c.borrow().next_unique, unique + 4);
+            assert_eq!(c.borrow().forget_batch, 16);
+        });
+    }
+
+    #[test]
+    fn oversized_requests_end_even_if_delivery_of_the_next_request_fails() {
+        with_read_cx(|cx| {
+            let (c, file) = test_device();
+            let large = vec![0; MIN_READ_BUFFER];
+            let attr = c
+                .borrow_mut()
+                .queue(op::SETXATTR, 3, None, &large, (false, false));
+            let write = c
+                .borrow_mut()
+                .queue(op::WRITE, 3, None, &large, (false, false));
+            let background = c
+                .borrow_mut()
+                .queue(op::WRITE, 3, None, &large, (true, false));
+            let next = c
+                .borrow_mut()
+                .queue(op::GETATTR, 4, None, &[], (false, false));
+            let msg = reject_read(cx, &file);
+            assert_eq!(c.borrow().pending, [next]);
+            assert!(!c.borrow().requests.contains_key(&background));
+            assert_eq!(wait_answer(cx, &c, attr), Err(Errno::E2BIG));
+            assert_eq!(wait_answer(cx, &c, write), Err(Errno::EIO));
+            assert_eq!(dev_read(cx, &file, MIN_READ_BUFFER, true), Ok(msg));
+        });
+    }
+
     /// A `struct fuse_attr` with mode `mode` and owner `uid`.
     fn attr_bytes(mode: u32, uid: u32, nsec: u32) -> Vec<u8> {
         Args::default()
@@ -3526,7 +3768,8 @@ pub(crate) mod tests {
         forgets.sort_unstable();
         assert_eq!(forgets, [(2, 1), (3, 2), (4, 1), (5, 1)]);
         // Several go in one FUSE_BATCH_FORGET, one alone in a FUSE_FORGET
-        let m = c.borrow_mut().read_forget(8192);
+        let file = device(&c);
+        let m = with_read_cx(|cx| dev_read(cx, &file, 8192, true)).unwrap();
         assert_eq!(
             &m[..8],
             &[48 + 64, 0, 0, 0, op::BATCH_FORGET as u8, 0, 0, 0]
@@ -3536,7 +3779,7 @@ pub(crate) mod tests {
         let x2 = f.enter(root, b"y", &entry(3, mode::S_IFREG)).unwrap();
         assert_ne!(x2, x);
         f.evict(&HashSet::new(), true);
-        let m = c.borrow_mut().read_forget(8192);
+        let m = with_read_cx(|cx| dev_read(cx, &file, 8192, true)).unwrap();
         assert_eq!(&m[..8], &[48, 0, 0, 0, op::FORGET as u8, 0, 0, 0]);
         assert_eq!(&m[16..24], &3u64.to_le_bytes());
         assert_eq!(&m[40..48], &1u64.to_le_bytes());
@@ -3744,7 +3987,7 @@ pub(crate) mod tests {
         );
         // Queued forgets make /dev/fuse readable for poll/epoll-based daemons.
         assert_ne!(dev.readiness() & 1, 0);
-        let _ = c.borrow_mut().read_forget(8192);
+        with_read_cx(|cx| dev_read(cx, &device(&c), 8192, true)).unwrap();
         assert_eq!(dev.readiness() & 1, 0);
 
         // Hard-linked file (nlink == 2): unlinking the first link decrements nlink and keeps it,

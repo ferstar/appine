@@ -1978,3 +1978,44 @@ fn check_mnt(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> Result<(), Errno> {
         _ => Err(Errno::EINVAL),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fd::{OpenFile, oflags};
+    use crate::kernel::Kernel;
+    use crate::process::Tier;
+    use crate::vfs::{ROOT_DEV, ROOT_MOUNT, tests::tmpfs_at_root_dev_boundary};
+
+    #[test]
+    fn sb_busy_counts_writers_only_on_their_own_device() {
+        let (vfs, tmpfs, dir) = tmpfs_at_root_dev_boundary("tmpfs-sb-busy");
+        let mut k = Kernel::new(Tier::Interpreter);
+        let (proc, _, _cpu) = crate::pseudo::tests::add_task(&mut k, 20, 0, true, b"");
+        let fds = k.tasks[&proc.pid].res.borrow().fds.clone();
+        for (mount, other_dev) in [
+            (vfs.mount(ROOT_MOUNT).unwrap(), tmpfs.dev),
+            (tmpfs, ROOT_DEV),
+        ] {
+            let (ino, file) = vfs
+                .store()
+                .create_file(mount.root.ino().unwrap(), b"writer", 0o644, 0, 0)
+                .unwrap();
+            let writer = OpenFile::new(
+                FileKind::Regular {
+                    ino,
+                    file,
+                    cow: false,
+                },
+                oflags::O_WRONLY,
+            );
+            writer.borrow_mut().mnt = mount.id;
+            let fd = fds.borrow_mut().install(writer, false, 0..1).unwrap();
+            assert!(sb_busy(&k, &vfs, mount.dev));
+            assert!(!sb_busy(&k, &vfs, other_dev));
+            fds.borrow_mut().close(fd).unwrap();
+        }
+        drop(vfs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

@@ -340,6 +340,8 @@ pub(crate) mod lock {
 pub(crate) const ROOT_FLAGS: u64 = ms::RELATIME;
 /// Device number the root filesystem (the inode store) reports (8:1).
 pub(crate) const ROOT_DEV: u64 = 0x801;
+/// First dynamic instance device number. All fixed devices except the store are below it.
+const FIRST_ALLOC_DEV: u64 = 0x30;
 
 /// A mount (Linux's `struct mount`): `root` in filesystem `fs` appears at `point`.
 #[derive(Debug, Clone)]
@@ -691,8 +693,7 @@ struct Mounts {
     /// current directories after the detach keep the old id, which must not count toward a new
     /// mount.
     next: MountId,
-    /// Device number of the next new instance (from 0:48, avoiding [`Fs::dev`] and those pipes,
-    /// sockets and so on use).
+    /// Device number for the next new filesystem instance.
     next_dev: u64,
     /// tmpfs instances, by device number (bind mounts share their source's device number).
     tmpfs: std::collections::HashMap<u64, Tmpfs>,
@@ -720,6 +721,16 @@ struct Mounts {
 }
 
 impl Mounts {
+    fn alloc_dev(&mut self) -> u64 {
+        let allocatable = |dev: u64| match dev {
+            ROOT_DEV => ROOT_DEV + 1,
+            _ => dev.max(FIRST_ALLOC_DEV),
+        };
+        let dev = allocatable(self.next_dev);
+        self.next_dev = allocatable(dev.wrapping_add(1));
+        dev
+    }
+
     fn get(&self, id: MountId) -> Option<&Mount> {
         match self.by_id.get(&id).copied()? {
             MountLoc::Attached(i) => self.list.get(i),
@@ -898,8 +909,7 @@ impl Mounts {
         params: TmpfsParams,
     ) -> Result<Ino, Errno> {
         let root = store.create_detached_dir(params.perm, params.uid, params.gid)?;
-        let dev = self.next_dev;
-        self.next_dev += 1;
+        let dev = self.alloc_dev();
         let fs = (Fs::Tmpfs, Node::Store(id, root), dev);
         self.boot(id, fs, Some(point), flags, source);
         // Usage is counted when needed ([`dev::populate`] created nodes in it)
@@ -1574,7 +1584,7 @@ impl Vfs {
             by_id: HashMap::from([(ROOT_MOUNT, MountLoc::Attached(0))]),
             children: HashMap::new(),
             next: RUN_MOUNT + 1,
-            next_dev: 0x30,
+            next_dev: FIRST_ALLOC_DEV,
             tmpfs: Default::default(),
             proc_ns: Default::default(),
             sys_ns: Default::default(),
@@ -4026,10 +4036,7 @@ impl Vfs {
         let mut mounts = self.mounts.borrow_mut();
         let id = mounts.next;
         mounts.next += 1;
-        let dev = dev.unwrap_or_else(|| {
-            mounts.next_dev += 1;
-            mounts.next_dev - 1
-        });
+        let dev = dev.unwrap_or_else(|| mounts.alloc_dev());
         let at = at.filter(|_| matches!(point, Node::Store(..)));
         // The new mount belongs to the namespace of the mount its mount point is in, and is
         // private unless mounted under a shared mount (no children exist yet for a brand-new id)
@@ -4149,8 +4156,7 @@ impl Vfs {
         if let Some(&dev) = mounts.mq_dev.get(&ns) {
             return dev;
         }
-        mounts.next_dev += 1;
-        let dev = mounts.next_dev - 1;
+        let dev = mounts.alloc_dev();
         mounts.mq_dev.insert(ns, dev);
         dev
     }
@@ -4174,8 +4180,7 @@ impl Vfs {
         if let Some((&dev, _)) = mounts.sys_ns.iter().find(|(_, n)| n.id == net.id) {
             return dev;
         }
-        mounts.next_dev += 1;
-        let dev = mounts.next_dev - 1;
+        let dev = mounts.alloc_dev();
         mounts.sys_ns.insert(dev, net.clone());
         dev
     }
@@ -5562,7 +5567,7 @@ pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The synthetic filesystems all have only an empty root directory; procfs also has the two
@@ -5621,6 +5626,96 @@ mod tests {
         s.symlink(ROOT, b"slash", b"bin/busybox/", 0, 0).unwrap();
         drop(s);
         (Vfs::open(&dir).unwrap(), dir)
+    }
+
+    pub(crate) fn tmpfs_at_root_dev_boundary(name: &str) -> (Vfs, Mount, std::path::PathBuf) {
+        let (vfs, dir) = sample(name);
+        let point = vfs.store().mkdir(ROOT, b"mnt", 0o755, 0, 0).unwrap();
+        vfs.mounts.borrow_mut().next_dev = ROOT_DEV;
+        let id = vfs
+            .new_tmpfs(
+                (Node::Store(ROOT_MOUNT, point), None),
+                0,
+                Vec::new(),
+                TmpfsParams::boot(0o755),
+            )
+            .unwrap();
+        let tmpfs = vfs.mount(id).unwrap();
+        (vfs, tmpfs, dir)
+    }
+
+    #[test]
+    fn alloc_dev_skips_reserved_numbers_at_boundaries() {
+        let (vfs, dir) = sample("alloc-dev");
+        let mut mounts = vfs.mounts.borrow_mut();
+        mounts.next_dev = ROOT_DEV - 1;
+        assert_eq!(mounts.alloc_dev(), ROOT_DEV - 1);
+        assert_eq!(mounts.alloc_dev(), ROOT_DEV + 1);
+        assert_eq!(mounts.alloc_dev(), ROOT_DEV + 2);
+
+        mounts.next_dev = u64::MAX;
+        assert_eq!(mounts.alloc_dev(), u64::MAX);
+        assert_eq!(mounts.alloc_dev(), FIRST_ALLOC_DEV);
+        assert_eq!(mounts.alloc_dev(), FIRST_ALLOC_DEV + 1);
+        for reserved in 0..FIRST_ALLOC_DEV {
+            mounts.next_dev = reserved;
+            assert_eq!(mounts.alloc_dev(), FIRST_ALLOC_DEV);
+        }
+        drop(mounts);
+        drop(vfs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn boot_tmpfs_skips_the_store_device() {
+        let (vfs, dir) = sample("boot-tmpfs-dev");
+        let mut mounts = vfs.mounts.borrow_mut();
+        let id = mounts.next;
+        mounts.next_dev = ROOT_DEV;
+        mounts
+            .boot_tmpfs(
+                vfs.store(),
+                id,
+                Node::ROOT,
+                0,
+                b"tmpfs",
+                TmpfsParams::boot(0o755),
+            )
+            .unwrap();
+        assert_eq!(mounts.get(id).unwrap().dev, ROOT_DEV + 1);
+        drop(mounts);
+        drop(vfs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mqueue_skips_the_store_device() {
+        let (vfs, dir) = sample("mqueue-dev");
+        vfs.mounts.borrow_mut().next_dev = ROOT_DEV;
+        assert_eq!(vfs.mq_dev(crate::nsproxy::INIT_IPC_NS), MQUEUE_DEV);
+        let ns = new_ns_id();
+        assert_eq!(vfs.mq_dev(ns), ROOT_DEV + 1);
+        assert_eq!(vfs.mq_dev(ns), ROOT_DEV + 1);
+        assert_eq!(vfs.mq_dev(new_ns_id()), ROOT_DEV + 2);
+        drop(vfs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tmpfs_and_store_have_independent_superblock_flags() {
+        let (vfs, tmpfs, dir) = tmpfs_at_root_dev_boundary("tmpfs-sb-flags");
+        let root = vfs.mount(ROOT_MOUNT).unwrap();
+        vfs.set_sb_flags(tmpfs.dev, ms::RDONLY);
+        assert!(vfs.sb_readonly(&tmpfs));
+        assert!(!vfs.sb_readonly(&root));
+
+        vfs.set_sb_flags(tmpfs.dev, 0);
+        vfs.set_sb_flags(ROOT_DEV, ms::RDONLY);
+        assert!(vfs.sb_readonly(&root));
+        assert!(!vfs.sb_readonly(&tmpfs));
+        assert_eq!(tmpfs.dev, ROOT_DEV + 1);
+        drop(vfs);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -6337,6 +6432,7 @@ mod tests {
     #[test]
     fn sysfs_net_ns_tagged_per_mount_and_pruned_on_collect() {
         let (vfs, dir) = sample("sysfs-net");
+        vfs.mounts.borrow_mut().next_dev = ROOT_DEV;
         let init_net = crate::nsproxy::NsProxy::init().net;
         assert_eq!(vfs.sys_dev(&init_net), Fs::Sys.dev());
         assert!(vfs.sys_net_ns(SYS_MOUNT).is_none());
@@ -6351,7 +6447,7 @@ mod tests {
             listeners: Default::default(),
         });
         let dev_b = vfs.sys_dev(&net_b);
-        assert_ne!(dev_b, Fs::Sys.dev());
+        assert_eq!(dev_b, ROOT_DEV + 1);
         // A second lookup for the same network namespace reuses the device number.
         assert_eq!(vfs.sys_dev(&net_b), dev_b);
 

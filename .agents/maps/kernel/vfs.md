@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/vfs.md` for the paired decision history (it still holds the decisions on mounts, inotify, AIO, loop devices, timerfd, overlayfs, locks, pipes, xattrs, open files and file I/O made before they were split out; the last two are listed in `kernel/files`'s and `kernel/fileio`'s maps).
 >
 > Verified: 2026-11-26 (full refresh; 18 claims verified — 13 confirmed, 5 partial, 0 refuted; all fixes applied)
+>
+> Maintained: 2026-11-26 (targeted verification of final access ACL checks and GPU fence fd stat identity)
 
 ## Responsibilities
 
@@ -246,7 +248,7 @@ descriptor. Owner IDs are mapped into the caller's namespace (overflow 65534).
   and statx sync flags. `newfstatat` permits both sync bits together. `statx` rejects that combination or a reserved
   mask bit with `EINVAL` before pathname copy. It reports `STATX_BASIC_STATS | STATX_MNT_ID` regardless
   of requested fields. `stx_mnt_id` comes from the node or fd (successful empty-path `statx` on a
-  node-less fd reports `ANON_MOUNT`, matching fdinfo; GPU fence fds return `EBADF`). Store/overlay
+  node-less fd reports `ANON_MOUNT`, matching fdinfo). Store/overlay
   advertise immutable, append and nodump even when clear; `stx_attributes` reports set bits and
   noatime is outside `stx_attributes_mask`.
 - `statfs_of` returns ext4 magic and host object-directory capacity for store, tmpfs limits
@@ -263,8 +265,9 @@ descriptor. Owner IDs are mapped into the caller's namespace (overflow 65534).
 real IDs. Unless `SECBIT_NO_SETUID_FIXUP` is set it uses permitted caps for namespace root and
 clears effective caps otherwise. FUSE uses its access handler even for `F_OK`, which otherwise
 succeeds after lookup. For non-FUSE targets, regular-file noexec (`EACCES`) and immutable for
-`W_OK` (`EPERM`) precede final DAC. Write access to a regular file, directory or symlink checks
-read-only (`EROFS`) after permission.
+`W_OK` (`EPERM`) precede final DAC. Store and overlay targets use the backing inode's extended
+access ACL, including through proc fd and exe links. Write access to a regular file, directory
+or symlink checks read-only (`EROFS`) after permission.
 
 `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` transfer four bytes for store/overlay regular or directory
 descriptions, including tmpfs and memfds. GET reads supported flags on the visible inode.
@@ -459,15 +462,11 @@ overwrite off, existing entries stay untouched; overwrite and `read_file` requir
 
 ## Confirmed bugs / technical debt
 
-- Final non-FUSE `faccessat` rebuilds `Stat` with only mode, uid and gid, discarding extended
-  access ACLs; a non-owner can therefore see a different result than opening the same store/overlay file.
 - `Attrs::of_fd` selects a node-less devpts slave or message queue directly before checking mount
   writability, so `fchmod` can succeed where pathname `chmod` returns `EROFS`.
 - `file_in_use` and `live_store_inodes` omit files held solely by pending AIO polls
   (`PendingPoll`), and unlink-time `file_in_use` skips unborrowable descriptions, so a live
   unlinked tmpfs regular file can lose its quota charge early.
-- GPU fence fds have no node or dedicated fd-stat arm, so `file_stat_attrs` (including empty-path
-  `statx`) returns `EBADF` instead of reporting `ANON_MOUNT`.
 - `RESOLVE_CACHED` can perform store I/O or request a FUSE lookup; `statx` lacks birth time and
   `STATX_DIOALIGN`.
 - File-mount traversal matches a node (so same-mount hard links enter it), while busy checks can

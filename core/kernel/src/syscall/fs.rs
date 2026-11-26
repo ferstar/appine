@@ -3303,14 +3303,15 @@ pub(super) fn splice(
         // for is EIO
         (None, Some((pipe, _))) if matches!(input.borrow().kind, FileKind::FuseDev(_)) => {
             let nonblock = input.borrow().nonblocking();
-            let message = crate::vfs::fuse::dev_read(cx, &input, len, nonblock)?;
-            let mut p = pipe.borrow_mut();
-            if message.len().div_ceil(PIPE_BUF) > p.free_slots() {
-                return Err(Errno::EIO);
-            }
-            p.push_pages(&message, 0, false);
-            pipe_arrival(cx, &mut p, message.len());
-            message.len()
+            crate::vfs::fuse::dev_read_with(cx, &input, len, nonblock, |cx, message| {
+                let mut p = pipe.borrow_mut();
+                if message.len().div_ceil(PIPE_BUF) > p.free_slots() {
+                    return Err(Errno::EIO);
+                }
+                p.push_pages(&message, 0, false);
+                pipe_arrival(cx, &mut p, message.len());
+                Ok(message.len())
+            })?
         }
         (None, Some((pipe, _))) => {
             let nonblock = nonblock || output.borrow().nonblocking();
@@ -3953,9 +3954,34 @@ fn host_regular(fd: i32) -> bool {
     appine_hal::fstat(fd).is_ok_and(|st| st.st_mode & mode::S_IFMT == mode::S_IFREG)
 }
 
-/// readv on a pipe, terminal, eventfd or `/dev/fuse`: one read of up to `step` bytes, scattered
-/// over the iovecs in order. As on Linux, when copying out faults after data was taken, the part
-/// copied is returned (the rest is lost).
+/// Copies one complete device message across the daemon's buffers before committing the read.
+fn fuse_dev_read_user(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    nonblock: bool,
+    vecs: &[(u64, usize)],
+) -> SysResult {
+    let total = vecs.iter().map(|v| v.1).sum::<usize>().min(FUSE_CHUNK);
+    let n = crate::vfs::fuse::dev_read_with(cx, file, total, nonblock, |cx, message| {
+        let mut done = 0;
+        for &(base, len) in vecs {
+            if done == message.len() {
+                break;
+            }
+            if len == 0 {
+                continue;
+            }
+            let n = len.min(message.len() - done);
+            cx.write_user(UserSlice::new(base, n), &message[done..done + n])?;
+            done += n;
+        }
+        Ok(done)
+    })?;
+    note_read(cx, file, n);
+    Ok(n as u64)
+}
+
+/// readv on a pipe, terminal, eventfd or `/dev/fuse` scatters one read over the iovecs.
 fn read_scattered(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -3973,6 +3999,10 @@ fn read_scattered(
     if let Some((pipe, _)) = pipe_of(file) {
         let nonblock = file.borrow().nonblocking() || io.nowait;
         return pipe_read_user(cx, file, &pipe, nonblock, vecs);
+    }
+    if matches!(file.borrow().kind, FileKind::FuseDev(_)) {
+        let nonblock = file.borrow().nonblocking() || io.nowait;
+        return fuse_dev_read_user(cx, file, nonblock, vecs);
     }
     let mut buf = vec![0u8; total.min(step)];
     let k = read_bytes_with(cx, file, &mut buf, None, io)?;
@@ -4724,6 +4754,17 @@ fn read_file_inner(
         positional(&file.borrow(), offset)?;
         let nonblock = file.borrow().nonblocking() || io.nowait;
         return super::net::rw(cx, &s, nonblock, &[(buf, len)], false);
+    }
+    if matches!(file.borrow().kind, FileKind::FuseDev(_)) {
+        let nonblock = {
+            let f = file.borrow();
+            positional(&f, offset)?;
+            if !f.readable() {
+                return Err(Errno::EBADF);
+            }
+            f.nonblocking() || io.nowait
+        };
+        return fuse_dev_read_user(cx, file, nonblock, &[(buf, len)]);
     }
     if len == 0 {
         return read_bytes_inner(cx, file, &mut [], offset, io, pos_held, false).map(|n| n as u64);
@@ -7041,15 +7082,7 @@ pub(super) fn faccessat(
     if amode == 0 {
         return Ok(0);
     }
-    let mut flags = None;
-    let (b, _) = node_stat(cx, &node, &mut flags)?;
-    let word = |off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
-    let st = Stat {
-        mode: word(16),
-        uid: word(24),
-        gid: word(28),
-        ..Stat::default()
-    };
+    let st = access_attrs(cx, &node)?;
     // Asking whether a regular file on a noexec mount can be executed is EACCES (Linux's
     // do_faccessat path_noexec check; memfds live on an internal tmpfs and ignore noexec)
     let is_memfd = matches!(node, Node::Store(_, ino) if cx.kr().seals.contains_key(&ino));
@@ -7057,7 +7090,7 @@ pub(super) fn faccessat(
         return Err(Errno::EACCES);
     }
     if amode & MAY_WRITE != 0 {
-        reject_flags(flags.unwrap_or(0), inode_flags::IMMUTABLE)?;
+        reject_flags(st.flags, inode_flags::IMMUTABLE)?;
     }
     // R_OK, W_OK, X_OK have the same values as MAY_READ, MAY_WRITE, MAY_EXEC.
     let allow_own_proc = matches!(&node, Node::Pseudo(_, p)
@@ -7075,6 +7108,56 @@ pub(super) fn faccessat(
         return Err(Errno::EROFS);
     }
     Ok(0)
+}
+
+/// Access checks need the backing inode's ACL, which the guest stat ABI does not encode.
+fn access_attrs(cx: &Cx<'_>, node: &Node) -> Result<Stat, Errno> {
+    let vfs = cx.vfs()?;
+    let mut flags = None;
+    let encoded = match node {
+        Node::Store(_, ino) => return vfs.store().attrs(*ino),
+        Node::Overlay(_, o) => return vfs.store().attrs(vfs.overlay().node(*o).real()),
+        Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
+            let file = cx
+                .view(&vfs)
+                .open_file(*proc, *tid, *fd)
+                .ok_or(Errno::ENOENT)?;
+            follow_copy_up(cx, &file)?;
+            let f = file.borrow();
+            if f.mq_path.is_none()
+                && let Some(ino) = f
+                    .regular_backing()
+                    .map(|(ino, ..)| ino)
+                    .or_else(|| f.node().and_then(|n| real_inode(&vfs, &n)))
+            {
+                let attrs = vfs.store().attrs(ino);
+                if matches!(attrs, Err(Errno::ENOENT)) && matches!(f.kind, FileKind::Path(_)) {
+                    return vfs.unlinked_tmpfs_stat(ino).unwrap_or(attrs);
+                }
+                return attrs;
+            }
+            drop(f);
+            file_stat_attrs(cx, &file, &mut flags)?
+        }
+        Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
+            let exe = exe_file(cx, *proc)?;
+            if exe.fuse.is_none() {
+                let (_, ino, _) = exe.backing(&vfs)?;
+                return vfs.store().attrs(ino);
+            }
+            node_stat(cx, node, &mut flags)?.0
+        }
+        Node::Pseudo(_, p) => return pseudo::stat(&cx.view(&vfs), p),
+        Node::Fuse(..) => unreachable!("FUSE handles access separately"),
+    };
+    let word = |off: usize| u32::from_le_bytes(encoded[off..off + 4].try_into().unwrap());
+    Ok(Stat {
+        mode: word(16),
+        uid: word(24),
+        gid: word(28),
+        flags: flags.unwrap_or(0),
+        ..Stat::default()
+    })
 }
 
 pub(super) fn chdir(cx: &mut Cx<'_>, path: u64) -> SysResult {
@@ -7659,6 +7742,7 @@ fn file_stat_attrs(
         | FileKind::Inotify(_)
         | FileKind::Pidfd(_)
         | FileKind::SeccompNotify(_)
+        | FileKind::GpuFence(_)
         | FileKind::Bpf(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
         // The device number is that of the mqueue filesystem of the queue's IPC namespace
         FileKind::MessageQueue(q) => {
@@ -11561,6 +11645,138 @@ mod tests {
         });
     }
 
+    struct FuseDevFixture {
+        vfs: Rc<Vfs>,
+        file: FileRef,
+        fd: i32,
+        message: Vec<u8>,
+        reply: Vec<u8>,
+    }
+
+    impl FuseDevFixture {
+        fn new(cx: &mut Cx<'_>) -> Self {
+            let (file, message) = crate::vfs::fuse::tests::read_device_fixture();
+            let fd = cx.install_fd(file.clone(), false).unwrap();
+            let reply = crate::vfs::fuse::Args::default()
+                .u32(24)
+                .u32(0)
+                .bytes(&message[8..16])
+                .u32(4096)
+                .u32(0)
+                .0;
+            let vfs = cx.vfs().unwrap();
+            Self {
+                vfs,
+                file,
+                fd,
+                message,
+                reply,
+            }
+        }
+
+        fn write_reply(&self, cx: &mut Cx<'_>) -> Result<usize, Errno> {
+            crate::vfs::fuse::dev_write(cx, &self.vfs, &self.file, &self.reply)
+        }
+    }
+
+    fn read_guest(cx: &Cx<'_>, addr: u64, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        cx.read_user(UserSlice::new(addr, len), &mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn fuse_dev_empty_scalar_and_vectored_reads_keep_their_validation_order() {
+        with_guest(0, |cx, addr, _| {
+            let unattached = open(cx, addr, b"/dev/fuse", oflags::O_RDWR, 0).unwrap();
+            let (file, _) = crate::vfs::fuse::tests::read_device_fixture();
+            let attached = cx.install_fd(file, false).unwrap();
+            assert_eq!(read(cx, unattached, 0, 0), Err(Errno::EPERM));
+            assert_eq!(read(cx, attached, 0, 0), Err(Errno::EINVAL));
+            put(cx, addr, [0; 16]).unwrap();
+            assert_eq!(readv(cx, unattached, addr, 1), Ok(0));
+            assert_eq!(readv(cx, attached, addr, 1), Ok(0));
+        });
+    }
+
+    #[test]
+    fn fuse_dev_scalar_read_retries_the_whole_message_after_a_copy_fault() {
+        with_guest(0, |cx, addr, _| {
+            let f = FuseDevFixture::new(cx);
+            // The guest has two writable pages at addr. Only the second attempt can
+            // copy a page before reaching the end of the mapping.
+            for dst in [addr + 8192, addr + 4096] {
+                assert_eq!(read(cx, f.fd, dst, 8192), Err(Errno::EFAULT));
+                assert_eq!(f.write_reply(cx), Err(Errno::ENOENT));
+            }
+            assert_eq!(read(cx, f.fd, addr, 8192), Ok(f.message.len() as u64));
+            assert_eq!(read_guest(cx, addr, f.message.len()), f.message);
+            assert_eq!(f.write_reply(cx), Ok(f.reply.len()));
+        });
+    }
+
+    #[test]
+    fn fuse_dev_readv_retries_after_a_later_iovec_faults() {
+        with_guest(0, |cx, addr, _| {
+            let f = FuseDevFixture::new(cx);
+            let iov = addr + 7000;
+            let header = addr + 8192 - 40;
+            let set_iov = |index: u64, base: u64, len: u64| {
+                put(cx, iov + index * 16, base.to_le_bytes()).unwrap();
+                put(cx, iov + index * 16 + 8, len.to_le_bytes()).unwrap();
+            };
+            set_iov(0, header, 40);
+            set_iov(1, 0, 0);
+            set_iov(2, addr + 8192, 8192 - 40);
+            assert_eq!(readv(cx, f.fd, iov, 3), Err(Errno::EFAULT));
+            assert_eq!(&get::<40>(cx, header).unwrap(), &f.message[..40]);
+            assert_eq!(f.write_reply(cx), Err(Errno::ENOENT));
+
+            put(cx, header, [0xff; 40]).unwrap();
+            put(cx, iov + 32, addr.to_le_bytes()).unwrap();
+            assert_eq!(readv(cx, f.fd, iov, 3), Ok(f.message.len() as u64));
+            let mut bytes = get::<40>(cx, header).unwrap().to_vec();
+            bytes.extend(read_guest(cx, addr, f.message.len() - 40));
+            assert_eq!(bytes, f.message);
+            assert_eq!(f.write_reply(cx), Ok(f.reply.len()));
+        });
+    }
+
+    #[test]
+    fn fuse_dev_splice_preserves_order_when_pipe_slots_run_short() {
+        use crate::vfs::fuse::op;
+        with_guest(0, |cx, addr, _| {
+            let f = FuseDevFixture::new(cx);
+            pipe2(cx, addr, oflags::O_NONBLOCK).unwrap();
+            let reader = i32::from_le_bytes(get(cx, addr).unwrap());
+            let writer = i32::from_le_bytes(get(cx, addr + 4).unwrap());
+            assert_eq!(fcntl(cx, writer, F_SETPIPE_SZ, 8192), Ok(8192));
+            assert_eq!(write(cx, writer, addr, 8192), Ok(8192));
+
+            // The write needs two slots. First neither is free, then only one is.
+            for _ in 0..2 {
+                assert_eq!(splice(cx, f.fd, 0, writer, 0, 8192, 0), Err(Errno::EIO));
+                assert_eq!(f.write_reply(cx), Err(Errno::ENOENT));
+                assert_eq!(read(cx, reader, addr, 4096), Ok(4096));
+            }
+            assert_eq!(
+                splice(cx, f.fd, 0, writer, 0, 8192, 0),
+                Ok(f.message.len() as u64)
+            );
+            // The interrupt also stays queued while the write occupies both slots.
+            assert_eq!(splice(cx, f.fd, 0, writer, 0, 8192, 0), Err(Errno::EIO));
+            assert_eq!(read(cx, reader, addr, 8192), Ok(f.message.len() as u64));
+            assert_eq!(read_guest(cx, addr, f.message.len()), f.message);
+            for opcode in [op::INTERRUPT, op::FORGET] {
+                assert_eq!(splice(cx, f.fd, 0, writer, 0, 8192, 0), Ok(48));
+                assert_eq!(read(cx, reader, addr, 8192), Ok(48));
+                assert_eq!(get::<4>(cx, addr + 4).unwrap(), opcode.to_le_bytes());
+            }
+            assert_eq!(f.write_reply(cx), Ok(f.reply.len()));
+            assert_eq!(splice(cx, f.fd, 0, writer, 0, 8192, 0), Err(Errno::EAGAIN));
+        });
+    }
+
     fn mountpoint(vfs: &Vfs, name: &[u8]) -> (Node, Option<Dentry>) {
         let ino = vfs
             .store()
@@ -12039,6 +12255,95 @@ mod tests {
         (lower, upper)
     }
 
+    fn named_user_acl(perm: u16, other: u16) -> Vec<u8> {
+        use crate::vfs::acl::{ACL_USER, acl_encode};
+        let id = u32::MAX;
+        acl_encode(&[
+            (0x01, 7, id),
+            (ACL_USER, perm, 1000),
+            (0x04, 5, id),
+            (0x10, 5, id),
+            (0x20, other, id),
+        ])
+    }
+
+    #[test]
+    fn faccessat_and_open_agree_on_store_and_overlay_acls() {
+        use crate::vfs::acl::ACL_ACCESS;
+        with_guest(1000, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            let (lower, upper) = mount_test_overlay(&vfs);
+            let store = vfs.store();
+            for (name, perm, other, read) in
+                [("grant", 6, 0, Ok(0)), ("deny", 0, 4, Err(Errno::EACCES))]
+            {
+                let (ino, _) = store
+                    .create_file(lower, name.as_bytes(), 0o750 | u32::from(other), 0, 0)
+                    .unwrap();
+                store
+                    .set_xattr(ino, ACL_ACCESS, &named_user_acl(perm, other), false, false)
+                    .unwrap();
+                for dir in ["lower", "merged"] {
+                    let path = format!("/{dir}/{name}");
+                    let fd = open(cx, addr, path.as_bytes(), oflags::O_PATH, 0).unwrap();
+                    for (mask, flags, expected) in [
+                        (MAY_READ, oflags::O_RDONLY, read),
+                        (MAY_WRITE, oflags::O_WRONLY, Err(Errno::EACCES)),
+                    ] {
+                        write_cstr(cx, addr, path.as_bytes());
+                        assert_eq!(faccessat(cx, AT_FDCWD, addr, mask, 0), expected, "{path}");
+                        assert_eq!(openat(cx, AT_FDCWD, addr, flags, 0).map(|_| 0), expected);
+                        write_cstr(cx, addr, b"");
+                        assert_eq!(faccessat(cx, fd, addr, mask, AT_EMPTY_PATH), expected);
+                    }
+                }
+                assert_eq!(store.lookup(upper, name.as_bytes()).unwrap(), None);
+            }
+            let mut cred = cx.cred();
+            cred.ruid = 1001;
+            cx.set_cred(cred);
+            write_cstr(cx, addr, b"/merged/grant");
+            assert_eq!(
+                faccessat(cx, AT_FDCWD, addr, MAY_READ, 0),
+                Err(Errno::EACCES)
+            );
+            assert_eq!(faccessat(cx, AT_FDCWD, addr, MAY_READ, AT_EACCESS), Ok(0));
+        });
+    }
+
+    #[test]
+    fn faccessat_uses_unlinked_inode_acl_and_flags_through_proc() {
+        use crate::vfs::{ROOT_MOUNT, acl::ACL_ACCESS, store::ROOT};
+        with_guest(1000, |cx, addr, _| {
+            let vfs = cx.vfs().unwrap();
+            let store = vfs.store();
+            let (ino, host) = store.create_file(ROOT, b"exe", 0o750, 0, 0).unwrap();
+            store
+                .set_xattr(ino, ACL_ACCESS, &named_user_acl(6, 0), false, false)
+                .unwrap();
+            let fd = open(cx, addr, b"/exe", oflags::O_RDONLY, 0).unwrap();
+            cx.t.group.borrow_mut().exe = Some(Rc::new(crate::process::ExeFile {
+                path: Rc::from(b"/exe".as_slice()),
+                node: Some((ROOT_MOUNT, ino)),
+                dentry: None,
+                host: Some(std::sync::Arc::new(host)),
+                ovl: None,
+                fuse: None,
+            }));
+            store.unlink(ROOT, b"exe").unwrap();
+            store.set_flags(ino, inode_flags::IMMUTABLE).unwrap();
+            let fd_path = format!("/proc/self/fd/{fd}");
+            for path in [fd_path.as_bytes(), b"/proc/self/exe"] {
+                write_cstr(cx, addr, path);
+                assert_eq!(faccessat(cx, AT_FDCWD, addr, MAY_READ, 0), Ok(0));
+                assert_eq!(
+                    faccessat(cx, AT_FDCWD, addr, MAY_WRITE, 0),
+                    Err(Errno::EPERM)
+                );
+            }
+        });
+    }
+
     #[test]
     fn protected_overlay_xattrs_check_the_lower_before_copy_up() {
         use super::super::xattr::{Target, removexattr};
@@ -12313,6 +12618,41 @@ mod tests {
                 u64::from_le_bytes(get(cx, buf + 8).unwrap()),
                 u64::from(inode_flags::NODUMP)
             );
+        });
+    }
+
+    #[test]
+    fn gpu_fence_stat_reports_anonymous_inode_and_mount() {
+        with_guest(1000, |cx, addr, _| {
+            let host = std::fs::File::open("/dev/null").unwrap();
+            let fence = OpenFile::new(FileKind::GpuFence(host.into()), oflags::O_RDONLY);
+            let fd = cx.install_fd(fence, false).unwrap();
+            let buf = addr + 512;
+            fstat(cx, fd, buf).unwrap();
+            assert_eq!(u64::from_le_bytes(get(cx, buf).unwrap()), ANON_DEV);
+            assert_eq!(u64::from_le_bytes(get(cx, buf + 8).unwrap()), 1);
+            assert_eq!(u32::from_le_bytes(get(cx, buf + 16).unwrap()), 0o600);
+            let stat = get::<128>(cx, buf).unwrap();
+
+            let link = format!("/proc/self/fd/{fd}");
+            for (dirfd, path, flags) in [
+                (fd, b"".as_slice(), AT_EMPTY_PATH),
+                (AT_FDCWD, link.as_bytes(), 0),
+            ] {
+                write_cstr(cx, addr, path);
+                newfstatat(cx, dirfd, addr, buf + 256, flags).unwrap();
+                assert_eq!(get::<128>(cx, buf + 256).unwrap(), stat);
+                statx(cx, dirfd, addr, flags, 0x17ff, buf).unwrap();
+                assert_eq!(u16::from_le_bytes(get(cx, buf + 28).unwrap()), 0o600);
+                assert_eq!(u64::from_le_bytes(get(cx, buf + 32).unwrap()), 1);
+                let major = u32::from_le_bytes(get(cx, buf + 136).unwrap());
+                let minor = u32::from_le_bytes(get(cx, buf + 140).unwrap());
+                assert_eq!((major, minor), dev::split_rdev(ANON_DEV));
+                assert_eq!(
+                    u64::from_le_bytes(get(cx, buf + 144).unwrap()),
+                    u64::from(crate::vfs::ANON_MOUNT)
+                );
+            }
         });
     }
 
