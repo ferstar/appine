@@ -13,9 +13,10 @@ SKIP="$SKIP:FutexTest.LockPiRealtimeWaiterBoostsOwnerPriorityInProcStat"
 SKIP="$SKIP:ZombieProcTest.Attr*:ZombieProcTest.ClearRefs:ZombieProcTest.Io:ZombieProcTest.OomAdj"
 SKIP="$SKIP:ZombieProcTest.Sched:ZombieProcTest.Schedstat"
 SKIP="$SKIP:ZombieProcTest.TimerslackNs:ZombieProcTest.Wchan"
-# Cannot be compared: the native kernel fails reading a zombie leader's auxv and environ, where the
-# test (and Appine) expect them empty
-SKIP="$SKIP:ZombieProcTest.Auxv:ZombieProcTest.Environ"
+# Cannot be compared: the native 6.8+/7.x kernel fails reading a zombie leader's auxv and environ
+# and fails opening mem and pagemap with ESRCH (mm_access), where the test and Appine (Linux 6.1)
+# expect them empty; guest tests cover Linux 6.1 zombie mem/pagemap directly
+SKIP="$SKIP:ZombieProcTest.Auxv:ZombieProcTest.Environ:ZombieProcTest.Mem:ZombieProcTest.PageMap"
 # Hang on both sides (killed after 60 s, so only the timeout would be compared): a thread ending
 # through the raw exit syscall never marks itself exited, which musl's pthread_join waits for
 # (glibc waits for the kernel's tid clearing); the robust futex test execs
