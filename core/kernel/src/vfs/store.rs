@@ -428,12 +428,13 @@ impl Store {
     /// directory `dir`.
     pub fn create(dir: &Path) -> Result<Store, Errno> {
         fs::create_dir_all(dir.join("objects")).map_err(io_err)?;
+        let lock = Self::open_lock(dir)?;
+        let fd = lock.as_raw_fd();
+        appine_hal::flock(fd, true, true).map_err(Errno)?;
         if dir.join("meta.db").exists() {
             return Err(Errno::EEXIST);
         }
-        let mut store = Self::connect(dir, COMMIT_DELAY)?;
-        let fd = store.lock.as_raw_fd();
-        appine_hal::flock(fd, true, true).map_err(Errno)?;
+        let mut store = Self::connect_with_lock(dir, COMMIT_DELAY, lock)?;
         let now = now_ns();
         store
             .db()
@@ -549,7 +550,22 @@ impl Store {
         users
     }
 
+    fn open_lock(dir: &Path) -> Result<File, Errno> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("lock"))
+            .map_err(io_err)
+    }
+
     fn connect(dir: &Path, delay: Duration) -> Result<Store, Errno> {
+        let lock = Self::open_lock(dir)?;
+        Self::connect_with_lock(dir, delay, lock)
+    }
+
+    fn connect_with_lock(dir: &Path, delay: Duration, lock: File) -> Result<Store, Errno> {
         let mut db = Connection::open(dir.join("meta.db")).map_err(db_err)?;
         db.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;
@@ -590,14 +606,10 @@ impl Store {
             }
             tx.commit().map_err(db_err)?;
         }
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("lock"))
-            .map_err(io_err)?;
-        let commits = Commits::open(&lock)?;
+        // Map the shared header through its own open file description so a surviving Meta
+        // VMA cannot retain Store::lock's flock on Linux filesystems after Store drops.
+        let header = Self::open_lock(dir)?;
+        let commits = Commits::open(&header)?;
         let objects_dir = appine_hal::open_dir(&dir.join("objects")).map_err(Errno)?;
         let objects_st = appine_hal::fstat(objects_dir.as_raw_fd()).map_err(Errno)?;
         let store_id = (objects_st.st_dev, objects_st.st_ino);
@@ -3242,6 +3254,7 @@ impl Drop for Store {
         if self.joined {
             self.meta.commits.leave();
         }
+        let _ = unlock_file(self.lock.as_raw_fd());
     }
 }
 

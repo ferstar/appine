@@ -238,10 +238,10 @@ provider and rootfs installation UI (`android`).
 
 ### Opening and boot cleanup
 
-- Creation takes a blocking exclusive `flock` on `lock` before inserting the root inode.
-  An opener first tries a nonblocking exclusive lock. On success it resets `users`, reconciles
-  objects when the boot token is missing or different, then removes objects in the recorded
-  uncommitted range that have no row.
+- Creation takes a blocking exclusive `flock` on `lock` before checking for `meta.db` or opening
+  the database, then inserts the root inode. An opener first tries a nonblocking exclusive lock.
+  On success it resets `users`, reconciles objects when the boot token is missing or different,
+  then removes objects in the recorded uncommitted range that have no row.
 - One transaction empties the volatile directories (the kernel passes `/dev/shm` and `/run`,
   host-side openers pass none), removes detached trees, drops deleted files' `shared` rows and
   deletes zero-link inode rows whose numbers no surviving share uses. It collects the regular
@@ -387,7 +387,8 @@ provider and rootfs installation UI (`android`).
   in place. The matching boot token permits skipping the directory scan only.
 - A shared lock with zero users can follow a failed cleanup. Joining before the exclusive
   downgrade and retrying on zero prevent concurrent openers from bypassing recovery and WAL sync.
-  The store owns the flock so a surviving `Meta` cannot hold it after the connection leaves.
+  The store explicitly unlocks `lock` on drop and keeps `Commits`'s mapping and `Meta`'s `syncfs`
+  descriptor on separate open file descriptions so a surviving `Meta` cannot retain the flock.
 - A number some `shared` row uses as its object keeps its inode row (live, deleted, or one that only
   numbers a copy) at boot, so no new file gets it while the object lives.
 - When two or more rows use one object, every one of them is held, and nothing may write that
