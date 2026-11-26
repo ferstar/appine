@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/mm.md` for the paired decision history (it still holds the decisions on the soft-MMU, the OOM killer, fork/copy-on-write and host backing made before they were split out into `kernel/mmu`, `kernel/oom`, `kernel/cow` and `kernel/hostmem`).
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across VMA layout, page faults, permission changes, file invalidation and dump selection)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: allocation-free superpage-clear fallback on file truncation and FUSE invalidation demotion OOM)
 
 ## Responsibilities
 
@@ -412,9 +414,9 @@ Otherwise the populated page-table levels determine the translation-fault level.
   caching or mprotect, only the previously inaccessible tail gets a fresh private host mapping.
 - Before a host shrink, truncate, ftruncate and `O_TRUNC` clip the file's accessible extent
   in each address space they can borrow, queue executable invalidation, mark it dirty and sync
-  it. A successful clip removes translations after EOF so later guest access faults. If page-table
-  demotion fails, clipping still expires page watches but a translation can survive. A later
-  host truncate error can instead leave the logical EOF shorter than the host file.
+  it. Clipping removes translations after EOF (clearing enclosing 2 MiB superpages without
+  allocation on demotion OOM) so later guest access faults. A later host truncate error can
+  instead leave the logical EOF shorter than the host file.
 - Private and shared mmap of a named store file first give the inode its own backing object, including
   on read-only opens. The VMA retains a duplicate of its locked open description. Splits, fork
   and mremap keep the pin. Cached host views use a separate open description. Clones and overlay
@@ -490,6 +492,11 @@ Otherwise the populated page-table levels determine the translation-fault level.
 - Guest pages are always 4 KB (`AT_PAGESZ` 4096) whatever the host page size.
 - Host `mincore` reports pages swapped to zram as absent; RSS (`kernel/oom`), mincore(2), pagemap
   and core-dump holes still use mincore.
+- `clip_file_mappings` and `invalidate_fill` use `unmap_or_clear_superpages`: when partial 2 MiB
+  superpage demotion hits OOM, `Mmu::unmap_noalloc` clears only partially covered L2 superpages
+  whole (leaving L3 tables narrowed to the exact range so adjacent anonymous VMAs in the same
+  2 MiB slot are never touched) and expires `PageWatch`es across the widened range; still-valid
+  file or FUSE pages fault back in on next access with intact contents and baselines.
 
 ## Confirmed bugs / technical debt
 
@@ -501,10 +508,6 @@ Otherwise the populated page-table levels determine the translation-fault level.
 - Appine creates a fresh anonymous remnant even on a partial DONTUNMAP or a move of a previously
   relocated mapping. Linux 6.1 unlinks the old anon_vma only on a whole-VMA move and retains the
   old page offset.
-- `clip_file_mappings` and `invalidate_fill` ignore unmap errors (expiring `PageWatch`es
-  explicitly so pipe readers still fall back to their snapshots). If a partial superpage
-  demotion runs out of memory, truncation can leave a translation beyond the new EOF and FUSE
-  invalidation can leave a translation for a page marked stale.
 
 ## Open questions
 

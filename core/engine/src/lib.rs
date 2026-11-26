@@ -178,6 +178,13 @@ unsafe extern "C" {
     fn appine_mmu_map(mmu: *mut RawMmu, gva: u64, host: *mut c_void, len: u64, prot: u32) -> c_int;
     fn appine_mmu_prepare_unmap(mmu: *mut RawMmu, gva: u64, len: u64) -> c_int;
     fn appine_mmu_unmap(mmu: *mut RawMmu, gva: u64, len: u64) -> c_int;
+    fn appine_mmu_unmap_noalloc(
+        mmu: *mut RawMmu,
+        gva: u64,
+        len: u64,
+        out_start: *mut u64,
+        out_end: *mut u64,
+    ) -> c_int;
     fn appine_mmu_protect(mmu: *mut RawMmu, gva: u64, len: u64, prot: u32) -> c_int;
     fn appine_mmu_fill(mmu: *mut RawMmu, gva: u64, host: *mut c_void, len: u64, prot: u32)
     -> c_int;
@@ -379,6 +386,20 @@ impl Mmu {
         map_result(unsafe { appine_mmu_unmap(self.raw.as_ptr(), gva, len) })?;
         self.watched.get_mut().invalidate(gva..gva + len);
         Ok(())
+    }
+
+    /// Unmaps `[gva, gva + len)` without allocating page tables. Any partially covered 2 MiB
+    /// superpage is cleared whole instead of demoted. Returns the guest range actually unmapped
+    /// (widened to 2 MiB boundaries only where a superpage was cleared whole) and expires page
+    /// watches across that range.
+    pub fn unmap_noalloc(&mut self, gva: u64, len: u64) -> Result<Range<u64>, MapError> {
+        let mut start = gva;
+        let mut end = gva;
+        map_result(unsafe {
+            appine_mmu_unmap_noalloc(self.raw.as_ptr(), gva, len, &mut start, &mut end)
+        })?;
+        self.watched.get_mut().invalidate(start..end);
+        Ok(start..end)
     }
 
     /// Changes the permissions of existing entries, possibly to 0 (the host page is kept but

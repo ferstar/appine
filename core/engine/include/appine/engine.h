@@ -254,6 +254,13 @@ int appine_mmu_fill(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t l
 /* Demote partially covered superpages without changing any translations. */
 int appine_mmu_prepare_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len);
 int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len);
+/*
+ * Unmaps [gva, gva + len) without allocating page tables: partially covered 2 MiB superpages are
+ * cleared whole instead of demoted. If non-NULL, out_start/out_end receive the range actually
+ * cleared (widened only where a superpage was cleared whole). Never returns APPINE_ENOMEM.
+ */
+int appine_mmu_unmap_noalloc(struct appine_mmu *mmu, uint64_t gva, uint64_t len,
+                             uint64_t *out_start, uint64_t *out_end);
 /* Changes only the permissions of existing entries (possibly to 0: the host page is kept but
  * cannot be accessed); pages without entries stay unchanged */
 int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint32_t prot);

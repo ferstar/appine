@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification of unmap boundary demotion, page-watch lifetime on allocation failure, and eager fills during private-file unshare)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: allocation-free `unmap_noalloc` superpage-clearing fallback and widened watch invalidation)
 
 ## Responsibilities
 
@@ -49,10 +49,13 @@ fast path and refill (`engine/dbt`).
   destruction for concurrent walkers) become superpages; partial `unmap`/`protect`/`map`/`move`
   demote an L2 superpage atomically into a populated 512-entry L3 table before modifying it.
   `prepare_unmap` demotes only partially covered boundary superpages. `unmap` runs this preparation
-  before clearing any entry, so allocation failure preserves translations across the whole range. A 4 KB
+  before clearing any entry, so allocation failure preserves translations across the whole range.
+  `unmap_noalloc` clears `[gva, gva + len)` without allocating page tables, clearing any partially
+  covered L2 superpage whole while leaving L3 tables narrowed to the exact range, and returns the
+  actually unmapped range. A 4 KB
   leaf entry is a 4 KB-aligned host page address ORed with R/W/X bits; 0 means absent, and prot 0
   with a nonzero address means "present, no access". `Mmu` is neither `Send` nor `Sync`;
-  `map`/`prepare_unmap`/`unmap`/`protect`/`move_entries` take `&mut`, while
+  `map`/`prepare_unmap`/`unmap`/`unmap_noalloc`/`protect`/`move_entries` take `&mut`, while
   `fill_shared`/`map_shared`/`protect_shared`/`next_present`/`translate`/`table_bytes`/`table_pages`
   take `&self` so CoW and memory accounting can query or edit another address space's table
   (`table_bytes` counts all allocated 4 KiB radix tables — root, intermediate, active and retired
@@ -124,11 +127,12 @@ fast path and refill (`engine/dbt`).
   and kernel reads fault, instruction fetch works.
 - `Mmu::watch_readable_page` issues a `PageWatch` for one readable guest page. `unmap` expires
   watches in its range only on success because preparation prevents a partial unmap on allocation
-  failure. Replacing or moving entries expires watches in the requested ranges, including both
-  ends of a move and ranges that may have been partially edited on allocation failure. Empty-slot fills
-  and permission changes preserve watches. `Mm::release`, `Mm::clip_file_mappings` and
-  `Mm::invalidate_fill` also expire watches with `Mmu::invalidate_page_watches` when backing is
-  discarded, truncated or invalidated while entries remain. A consumer checks current
+  failure. `unmap_noalloc` expires watches across the actually unmapped range, including any
+  partially covered 2 MiB superpage cleared whole. Replacing or moving entries expires watches in
+  the requested ranges, including both ends of a move and ranges that may have been partially
+  edited on allocation failure. Empty-slot fills and permission changes preserve watches.
+  `Mm::release` also expires watches with `Mmu::invalidate_page_watches` when backing is
+  discarded in place while entries remain. A consumer checks current
   permissions before reading. Watches on one page share a token. New registrations periodically
   reclaim unobserved tokens.
 

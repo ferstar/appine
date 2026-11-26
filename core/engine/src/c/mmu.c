@@ -312,7 +312,18 @@ int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
     int rc = appine_mmu_prepare_unmap(mmu, gva, len);
     if (rc != APPINE_OK)
         return rc;
+    /* Partial boundary superpages are already demoted, so every remaining PTE_SUPER is full. */
+    return appine_mmu_unmap_noalloc(mmu, gva, len, NULL, NULL);
+}
+
+int appine_mmu_unmap_noalloc(struct appine_mmu *mmu, uint64_t gva, uint64_t len,
+                             uint64_t *out_start, uint64_t *out_end)
+{
+    if (!range_ok(gva, len))
+        return APPINE_EINVAL;
     uint64_t end = gva + len;
+    uint64_t unmapped_start = gva;
+    uint64_t unmapped_end = end;
     for (uint64_t va = gva; va < end;) {
         uintptr_t *l2_slot = l2_slot_find(mmu, va, &va);
         if (!l2_slot)
@@ -323,22 +334,25 @@ int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
             va = stop;
             continue;
         }
-        uintptr_t *table;
         if (cur & PTE_SUPER) {
-            if ((va & MMU_SUPER_MASK) == 0 && (stop - va) == LEAF_SPAN) {
-                store_entry(l2_slot, 0);
-                va = stop;
-                continue;
-            }
-            table = demote_l2(mmu, l2_slot, cur);
-            if (!table)
-                return APPINE_ENOMEM;
-        } else {
-            table = (uintptr_t *)cur;
+            store_entry(l2_slot, 0);
+            uint64_t leaf_start = va & ~(uint64_t)MMU_SUPER_MASK;
+            uint64_t leaf_stop = leaf_start + LEAF_SPAN;
+            if (leaf_start < unmapped_start)
+                unmapped_start = leaf_start;
+            if (leaf_stop > unmapped_end)
+                unmapped_end = leaf_stop;
+            va = stop;
+            continue;
         }
+        uintptr_t *table = (uintptr_t *)cur;
         for (; va < stop; va += APPINE_PAGE_SIZE)
             store_entry(&table[level_index(va, LEVELS - 1)], 0);
     }
+    if (out_start)
+        *out_start = unmapped_start;
+    if (out_end)
+        *out_end = unmapped_end;
     return APPINE_OK;
 }
 

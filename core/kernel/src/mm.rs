@@ -4649,11 +4649,15 @@ fn mmu_unmap(mmu: &mut Mmu, gva: u64, len: u64) -> Result<(), MapError> {
     mmu.unmap(gva, len)
 }
 
-/// Truncation and FUSE invalidation change the backing even on unmap failure.
-/// Expire page watches so pipe readers fall back to their snapshots.
-fn unmap_or_expire_watches(mmu: &mut Mmu, gva: u64, len: u64) {
-    if mmu_unmap(mmu, gva, len).is_err() {
-        mmu.invalidate_page_watches(gva..gva + len);
+/// Unmaps `[gva, gva + len)` for non-rollbackable backing changes (truncation and FUSE
+/// invalidation). On partial-superpage demotion OOM, falls back to clearing whole enclosing
+/// 2 MiB superpages without allocation and expiring watches across the widened range;
+/// still-valid pages in a cleared superpage fault back in on next access.
+fn unmap_or_clear_superpages(mmu: &mut Mmu, gva: u64, len: u64) {
+    if let Err(err) = mmu_unmap(mmu, gva, len) {
+        debug_assert_eq!(err, MapError::OutOfMemory);
+        mmu.unmap_noalloc(gva, len)
+            .expect("valid page-aligned range for allocation-free unmap");
     }
 }
 
@@ -5817,7 +5821,7 @@ impl Mm {
             for (a, b) in pages.runs(from, to) {
                 let addr = start + (a - first) * PAGE_SIZE;
                 let len = (b - a) * PAGE_SIZE;
-                unmap_or_expire_watches(&mut self.mmu, addr, len);
+                unmap_or_clear_superpages(&mut self.mmu, addr, len);
                 if v.prot & prot::EXEC != 0 {
                     self.code_ranges.push((addr, len));
                 }
@@ -5879,9 +5883,10 @@ impl Mm {
             if extent >= old {
                 continue;
             }
-            unmap_or_expire_watches(&mut self.mmu, start + extent, old - extent);
+            let (addr, len) = (start + extent, old - extent);
+            unmap_or_clear_superpages(&mut self.mmu, addr, len);
             if v.prot & prot::EXEC != 0 {
-                self.code_ranges.push((start + extent, old - extent));
+                self.code_ranges.push((addr, len));
             }
             if let Some(t) = &v.pages {
                 t.copied.borrow_mut().retain(|at| *at < offset + extent);
@@ -11081,6 +11086,8 @@ mod tests {
         }));
         assert_eq!(mm.vmas[&shared].file_len, PAGE_SIZE);
         assert!(mm.dirty);
+        assert!(mm.mmu.translate(shared, prot::READ).is_some());
+        assert!(mm.mmu.translate(shared + PAGE_SIZE, 0).is_none());
         assert!(kept_file_watch.is_current());
         assert!(!tail_file_watch.is_current());
 
@@ -11106,8 +11113,227 @@ mod tests {
             mm.invalidate_fill(&fill.pages, 1, 2)
         }));
         assert!(mm.dirty);
+        assert!(mm.mmu.translate(fa, prot::READ).is_some());
+        assert!(mm.mmu.translate(fa + PAGE_SIZE, 0).is_none());
         assert!(kept_fill_watch.is_current());
         assert!(!stale_fill_watch.is_current());
+    }
+
+    fn read4(mm: &Mm, addr: u64) -> [u8; 4] {
+        let mut buf = [0u8; 4];
+        mm.read(UserSlice::new(addr, 4), &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn file_truncated_superpage_oom_clears_enclosing_superpage_and_refaults_valid_pages() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        fn memfd_with(len: u64, writes: &[(u64, &[u8])]) -> (std::fs::File, u64, u64) {
+            let file = appine_hal::memfd(c"truncate-oom").unwrap();
+            file.set_len(len).unwrap();
+            for &(off, data) in writes {
+                file.write_all_at(data, off).unwrap();
+            }
+            let meta = file.metadata().unwrap();
+            (file, meta.dev(), meta.ino())
+        }
+
+        let p = PAGE_SIZE;
+        let rwx = RW | prot::EXEC;
+        let mut mm = Mm::new();
+
+        // 1. Shared executable file spanning two 2 MiB superpages; truncate into the second on OOM.
+        let (shared_file, dev, ino) = memfd_with(
+            2 * LEAF_SPAN,
+            &[(0, b"SP0!"), (LEAF_SPAN, b"SP1!"), (LEAF_SPAN + p, b"TAIL")],
+        );
+        let base = LEAF_SPAN;
+        mm.mmap(
+            base,
+            2 * LEAF_SPAN,
+            rwx,
+            flags::MAP_FIXED | flags::MAP_SHARED,
+            Some((shared_file.as_raw_fd(), 0, true)),
+        )
+        .unwrap();
+        assert!(mm.mmu.translate(base, rwx).is_some());
+        assert!(mm.mmu.translate(base + LEAF_SPAN + p, rwx).is_some());
+        let watch_sp0 = mm.mmu.watch_readable_page(base).unwrap();
+        let watch_valid = mm.mmu.watch_readable_page(base + LEAF_SPAN).unwrap();
+        let watch_tail = mm.mmu.watch_readable_page(base + LEAF_SPAN + p).unwrap();
+        mm.dirty = false;
+        mm.code_ranges.clear();
+        let before = mm.mmu.table_bytes();
+
+        assert!(with_unmap_prepare_failure(1, || {
+            mm.file_truncated(dev, ino, LEAF_SPAN + p)
+        }));
+        shared_file.set_len(LEAF_SPAN + p).unwrap();
+
+        assert_eq!(mm.mmu.table_bytes(), before);
+        assert!(mm.dirty);
+        assert_eq!(mm.code_ranges, [(base + LEAF_SPAN + p, LEAF_SPAN - p)]);
+        assert_eq!(mm.vmas[&base].file_len, LEAF_SPAN + p);
+        assert!(mm.mmu.translate(base, rwx).is_some());
+        assert!(watch_sp0.is_current());
+        assert_eq!(
+            mm.mmu.next_present(base + LEAF_SPAN, base + 2 * LEAF_SPAN),
+            base + 2 * LEAF_SPAN
+        );
+        assert!(!watch_valid.is_current() && !watch_tail.is_current());
+
+        // Valid page in the cleared superpage faults back in; truncated tail gives guest SIGBUS.
+        assert!(mm.fault_in(base + LEAF_SPAN, prot::READ));
+        assert!(mm.mmu.translate(base + LEAF_SPAN, rwx).is_some());
+        assert_eq!(&read4(&mm, base + LEAF_SPAN), b"SP1!");
+        assert!(!mm.fault_in(base + LEAF_SPAN + p, prot::READ));
+        assert_eq!(
+            mm.fault_past_eof(base + LEAF_SPAN + p, prot::READ),
+            Some(true)
+        );
+        assert_eq!(
+            mm.mmu
+                .next_present(base + LEAF_SPAN + p, base + 2 * LEAF_SPAN),
+            base + 2 * LEAF_SPAN
+        );
+
+        // 2. Private file mapping as a 2 MiB superpage with a private CoW write in page 0.
+        let (priv_file, dev, ino) = memfd_with(LEAF_SPAN, &[(0, b"ORIG"), (p, b"GONE")]);
+        let priv_base = 4 * LEAF_SPAN;
+        mm.mmap(
+            priv_base,
+            LEAF_SPAN,
+            RW,
+            flags::MAP_FIXED | flags::MAP_PRIVATE,
+            Some((priv_file.as_raw_fd(), 0, false)),
+        )
+        .unwrap();
+        // Force normal pagemap-backed superpage path so writing page 0 keeps the L2 superpage.
+        mm.vmas.get_mut(&priv_base).unwrap().pages = None;
+        let tables_before_fault = mm.mmu.table_bytes();
+        assert!(mm.fault_in(priv_base, prot::WRITE));
+        assert_eq!(mm.mmu.table_bytes(), tables_before_fault);
+        mm.write(UserSlice::new(priv_base, 4), b"COW!").unwrap();
+        let priv_watch_kept = mm.mmu.watch_readable_page(priv_base).unwrap();
+        let priv_watch_tail = mm.mmu.watch_readable_page(priv_base + p).unwrap();
+        let before = mm.mmu.table_bytes();
+
+        assert!(with_unmap_prepare_failure(1, || mm.file_truncated(dev, ino, p)));
+        priv_file.set_len(p).unwrap();
+
+        assert_eq!(mm.mmu.table_bytes(), before);
+        assert_eq!(
+            mm.mmu.next_present(priv_base, priv_base + LEAF_SPAN),
+            priv_base + LEAF_SPAN
+        );
+        assert!(!priv_watch_kept.is_current() && !priv_watch_tail.is_current());
+
+        assert!(mm.fault_in(priv_base, prot::WRITE));
+        assert!(mm.mmu.translate(priv_base, RW).is_some());
+        assert_eq!(&read4(&mm, priv_base), b"COW!");
+        assert!(!mm.fault_in(priv_base + p, prot::READ));
+        assert_eq!(mm.fault_past_eof(priv_base + p, prot::READ), Some(true));
+
+        // 3. Adjacent private anonymous VMA in the same 2 MiB L3 table is untouched by OOM fallback.
+        let l3_base = 6 * LEAF_SPAN;
+        let (small_file, dev, ino) = memfd_with(2 * p, &[]);
+        mm.mmap(
+            l3_base,
+            2 * p,
+            RW,
+            flags::MAP_FIXED | flags::MAP_SHARED,
+            Some((small_file.as_raw_fd(), 0, true)),
+        )
+        .unwrap();
+        let anon = l3_base + 2 * p;
+        mm.map_anonymous(anon, p, RW).unwrap();
+        mm.write(UserSlice::new(anon, 4), b"ANON").unwrap();
+        let anon_watch = mm.mmu.watch_readable_page(anon).unwrap();
+        let anon_host = mm.mmu.translate(anon, RW).unwrap();
+        assert!(with_unmap_prepare_failure(1, || mm.file_truncated(dev, ino, p)));
+        assert!(mm.mmu.translate(l3_base + p, 0).is_none());
+        assert_eq!(mm.mmu.translate(anon, RW), Some(anon_host));
+        assert!(anon_watch.is_current());
+        assert_eq!(&read4(&mm, anon), b"ANON");
+    }
+
+    #[test]
+    fn invalidate_fill_superpage_oom_clears_enclosing_superpage_and_refaults_valid_pages() {
+        let p = PAGE_SIZE;
+        let mut mm = Mm::new();
+
+        let mut data = vec![b'F'; LEAF_SPAN as usize];
+        data[..4].copy_from_slice(b"PG00");
+        data[p as usize..p as usize + 4].copy_from_slice(b"PG01");
+        data[(2 * p) as usize..(2 * p) as usize + 4].copy_from_slice(b"PG02");
+
+        for (shared, base, mapping_prot, fault_prot, written) in [
+            (false, LEAF_SPAN, RW | prot::EXEC, prot::READ, *b"MINE"),
+            (true, 3 * LEAF_SPAN, RW, prot::WRITE, *b"DIRT"),
+        ] {
+            let host = appine_hal::memfd(c"fuse-superpage-oom").unwrap();
+            host.set_len(LEAF_SPAN).unwrap();
+            let oflags = if shared { crate::fd::oflags::O_RDWR } else { 0 };
+            let source = crate::fd::OpenFile::new(crate::fd::FileKind::Host(-1), oflags);
+            let fill = Rc::new(Fill {
+                shared,
+                source,
+                pages: FillPages::new(host, LEAF_SPAN),
+            });
+            fill.store((0, LEAF_SPAN), &data, false).unwrap();
+            let map_flags = flags::MAP_FIXED
+                | if shared {
+                    flags::MAP_SHARED
+                } else {
+                    flags::MAP_PRIVATE
+                };
+            mm.mmap_fill(base, LEAF_SPAN, mapping_prot, map_flags, (fill.clone(), 0))
+                .unwrap();
+            assert!(mm.fault_in(base, fault_prot));
+            assert!(mm.mmu.translate(base + 511 * p, mapping_prot).is_some());
+            mm.write(UserSlice::new(base, 4), &written).unwrap();
+            let watches = [0, 1, 2].map(|i| mm.mmu.watch_readable_page(base + i * p).unwrap());
+            mm.dirty = false;
+            mm.code_ranges.clear();
+            let before = mm.mmu.table_bytes();
+
+            assert!(with_unmap_prepare_failure(1, || {
+                mm.invalidate_fill(&fill.pages, 1, 2)
+            }));
+            fill.pages.invalidate(1, 2);
+
+            assert_eq!(mm.mmu.table_bytes(), before);
+            assert!(mm.dirty);
+            let expected_code = if mapping_prot & prot::EXEC != 0 {
+                vec![(base + p, p)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(mm.code_ranges, expected_code);
+            assert_eq!(
+                mm.mmu.next_present(base, base + LEAF_SPAN),
+                base + LEAF_SPAN
+            );
+            assert!(watches.iter().all(|w| !w.is_current()));
+
+            // Invalidated page 1 requests a daemon fill; valid pages 0 and 2 fault back in intact.
+            assert!(!mm.fault_in(base + p, prot::READ));
+            assert!(mm.fill_wanted(base + p, prot::READ).is_some());
+            assert!(mm.fault_in(base, fault_prot));
+            assert!(mm.mmu.translate(base, mapping_prot).is_some());
+            assert!(mm.mmu.translate(base + p, 0).is_none());
+            assert!(mm.mmu.translate(base + 2 * p, mapping_prot).is_some());
+            assert_eq!(read4(&mm, base), written);
+            assert_eq!(&read4(&mm, base + 2 * p), b"PG02");
+            if shared {
+                assert_eq!(
+                    fill.pages.dirty_runs(0).unwrap(),
+                    vec![(0, written.to_vec())]
+                );
+            }
+        }
     }
 
     fn with_cow_map_failure<T>(nth: usize, f: impl FnOnce() -> T) -> T {

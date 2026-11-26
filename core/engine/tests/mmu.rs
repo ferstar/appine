@@ -340,12 +340,69 @@ fn prepare_unmap_validates_the_whole_range_before_demotion() {
     ] {
         assert_eq!(mmu.prepare_unmap(addr, len), Err(MapError::InvalidArgument));
         assert_eq!(mmu.unmap(addr, len), Err(MapError::InvalidArgument));
+        assert_eq!(mmu.unmap_noalloc(addr, len), Err(MapError::InvalidArgument));
     }
     mmu.prepare_unmap(PAGE_SIZE, 0).unwrap();
     mmu.prepare_unmap(limit, 0).unwrap();
+    assert_eq!(mmu.unmap_noalloc(PAGE_SIZE, 0), Ok(PAGE_SIZE..PAGE_SIZE));
+    assert_eq!(mmu.unmap_noalloc(limit, 0), Ok(limit..limit));
     assert_eq!(mmu.table_bytes(), before);
     assert!(watch.is_current());
     assert_eq!(mmu.translate(PAGE_SIZE, RW), Some(host(&mut mem, 1)));
+}
+
+#[test]
+fn unmap_noalloc_widens_only_partial_superpages_without_allocating() {
+    let p = PAGE_SIZE;
+    let mut mem = pages(3 * 512);
+    let mut mmu = Mmu::new();
+    let base = LEAF;
+    unsafe { mmu.map(base, host(&mut mem, 0), 3 * LEAF, RW).unwrap() };
+
+    // Demote only the first superpage into an L3 table; superpages 1 and 2 remain L2 superpages.
+    mmu.prepare_unmap(base, p).unwrap();
+    let before = mmu.table_bytes();
+
+    let kept_l3 = mmu.watch_readable_page(base).unwrap();
+    let dropped_l3 = mmu.watch_readable_page(base + LEAF - p).unwrap();
+    let mid_super = mmu.watch_readable_page(base + LEAF).unwrap();
+    let tail_super_dropped = mmu.watch_readable_page(base + 2 * LEAF).unwrap();
+    let tail_super_widened = mmu.watch_readable_page(base + 3 * LEAF - p).unwrap();
+
+    // Unmap [base + LEAF - p, base + 2 * LEAF + p):
+    // - first boundary is an L3 table -> must NOT widen below base + LEAF - p
+    // - middle slot is a full L2 superpage -> cleared whole
+    // - last boundary is a partial L2 superpage -> cleared whole, widening end to base + 3 * LEAF
+    let actual = mmu.unmap_noalloc(base + LEAF - p, LEAF + 2 * p).unwrap();
+    assert_eq!(actual, (base + LEAF - p)..(base + 3 * LEAF));
+    assert_eq!(mmu.table_bytes(), before);
+
+    assert!(kept_l3.is_current());
+    assert_eq!(mmu.translate(base, RW), Some(host(&mut mem, 0)));
+    assert_eq!(
+        mmu.translate(base + LEAF - 2 * p, RW),
+        Some(host(&mut mem, 510))
+    );
+    assert!(!dropped_l3.is_current());
+    assert!(!mid_super.is_current());
+    assert!(!tail_super_dropped.is_current());
+    assert!(!tail_super_widened.is_current());
+    assert_eq!(
+        mmu.next_present(base + LEAF - p, base + 3 * LEAF),
+        base + 3 * LEAF
+    );
+
+    // An interior slice of a superpage widens both boundaries without allocating.
+    unsafe { mmu.map(base + LEAF, host(&mut mem, 0), LEAF, RW).unwrap() };
+    assert_eq!(
+        mmu.unmap_noalloc(base + LEAF + p, p),
+        Ok((base + LEAF)..(base + 2 * LEAF))
+    );
+    assert_eq!(mmu.table_bytes(), before);
+    assert_eq!(
+        mmu.next_present(base + LEAF, base + 2 * LEAF),
+        base + 2 * LEAF
+    );
 }
 
 #[test]
