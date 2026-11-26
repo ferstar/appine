@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/procfs.md` for the paired decision history (it still holds the decisions on cgroups/device BPF, `/proc/sys` sysctls and sysfs made before they were split out into `kernel/cgroup`, `kernel/sysctl` and `kernel/sysfs`).
 >
-> Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
->
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: enforce `searched` on mqueue root and per-process `fd`/`fdinfo`/`ns` directories with same-thread-group exemption when non-dumpable)
+> Verified: 2026-11-26 (full mapping, 15 claims independently checked across node identity, snapshots, task and network views, pseudo devices and Linux 6.1 procfs contracts)
 
 ## Responsibilities
 
@@ -145,27 +143,28 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   needs `CAP_SYS_ADMIN` in the process's user namespace (`EACCES`, `proc_setgroups_open`); devpts
   nodes on nodev mounts `EACCES`, then the cgroup device filter; `O_DIRECT` `EINVAL`; directories
   open read-only (`EISDIR` for a write mode); write modes on ro mounts `EROFS`.
-- A node that is not writable still opens for writing when DAC passes (root) if it is a procfs
-  file outside `/proc/sys`, and each write then fails: `EIO` for the files of proc entries (global
-  files such as `cpuinfo` and `kmsg`, `/proc/sysvipc/*`, the single-record `netstat`, `snmp`,
-  `sockstat` and `sockstat6` of `/proc/<pid>/net`; `proc_reg_write`), `EINVAL` for per-process and
-  `fdinfo` files (no write operation). `/proc/sys` (`kernel/sysctl`) refuses it (`EACCES`,
-  `O_TRUNC` included); sysfs (`kernel/sysfs`) and the other `/proc/<pid>/net` files (`seq_open_net`)
-  refuse only a write access mode, so `O_TRUNC` alone opens them; cgroup files are checked by DAC
-  only (a read-only one opens for root, and the write is `EINVAL`); creating names `EACCES`.
+- After DAC permits a write-mode open, writes to read-only global proc entries such as `cpuinfo`,
+  `kmsg` and `/proc/sysvipc/*` return `EIO`. Read-only per-process and fdinfo entries return
+  `EINVAL`. Appine also returns `EIO` for the four single-record network statistics files.
+  Other `seq_open_net` entries and sysfs reject a write access mode at open, allowing
+  `O_RDONLY|O_TRUNC` through that check. Proc sysctls reject write intent including `O_TRUNC`.
+  DAC can admit a write open on a read-only cgroup file, whose write then returns `EINVAL`.
 - The content is generated at open with the opener's credentials and marked `fresh`, except
   write-only files (`kernel/sysctl`, empty), a `NetConf` file whose generation fails (empty, the
   error reported by the first read) and `/proc/<pid>/syscall` (empty: it shows the thread when
   read, so `/proc/self/syscall` shows the read). Only a read or pread at offset 0 can regenerate:
   the first one keeps a fresh snapshot unless its change counter moved or the pinned process has
-  been reaped (`pseudo::gone`, yielding `ESRCH`), later ones regenerate with
+  been reaped. `pseudo::gone` also detects a cgroup file generation that disappeared even if
+  the same name has since been recreated. Later offset-zero reads regenerate with
   the opener's credentials and the current reader's namespaces, root and cgroup root; reads
   elsewhere use the current snapshot while the pinned address space for `environ` is live.
+  If that weak reference expires, even a nonzero-offset read clears the environment snapshot.
   A first read at a non-zero offset leaves the snapshot fresh (only a write marks it stale). The opener's credentials include their user namespace, which
   translates the ids shown; pid numbers follow the mount's pid namespace. lseek
   (`SEEK_SET`/`CUR`/`END` against the snapshot length) never regenerates. `pagemap`, `mem` and
   `/proc/kmsg` are computed at read time (`mem` and `pagemap` from the address space held weakly
-  since open, returning empty/EOF once freed or replaced by execve). Memory transfers fill missing
+  since open. Once the referenced address space expires, `mem` reads EOF. `pagemap` validates
+  count and offset alignment before returning EOF). Memory transfers fill missing
   FUSE pages one at a time, retaining the byte count across fills. Nsfs files cannot be read
   (`EINVAL`), nor can write-only files.
 - Writes pass each chunk or iovec (one gathered input for `/proc/sys` sysctls, `kernel/sysctl`) to
@@ -188,9 +187,9 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   reported (reading does not take it in). `/proc/sys/kernel/{hostname,domainname}` similarly wake
   pollers with `POLLERR|POLLPRI` on per-name UTS changes (`kernel/sysctl`). sysfs (`kernel/sysfs`)
   and cgroup2 files poll as always readable and writable, plus `POLLERR|POLLPRI` before their first
-  read from the start. Cgroup change observation, the four notifying files and their inotify keys
-  belong to `kernel/cgroup`; the shared open/read path consumes its counters. Other synthetic files
-  never report inotify events.
+  read from the start. The four asynchronously notifying cgroup files have change counters supplied by
+  `kernel/cgroup`. Keyed cgroup descriptions also report ordinary filesystem activity
+  through `kernel/inotify`.
 
 ### Per-process files
 
@@ -258,11 +257,15 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   An original `O_TMPFILE` fd keeps its `#<ino> (deleted)` name after linking.
   Reopening a deleted regular store file via `fd/N` with `O_PATH` pins its backing object.
   Stat and subsequent reopens keep the original inode across source-fd close and reuse.
+  Ordinary reopens run store open checks on the original mount, plus overlay checks for a
+  write through an overlay. An anonymous pipe reopen checks the pipe inode's current permissions
+  before opening another end.
   Synthetic descriptors and unreachable paths use their recorded description; `fdinfo/N` has `pos`, `flags` (octal, with
   `O_CLOEXEC`), `mnt_id`, `ino`, the `lock:` lines of the locks held through that open file
   (`kernel/locks`'s `fd_locks`; only for files or fd tables that have taken locks) and per-kind
   lines (eventfd count, inotify watches, epoll `tfd:` lines, timerfd clock and times, signalfd
-  mask, pidfd pids).
+  mask, pidfd pids). Timerfd reports the upstream five fields in order: clock id, ticks,
+  octal settime flags, remaining time and interval.
 - `exe` reads as the program's path recorded at execve, with ` (deleted)` once the file's last
   link is gone or, for a program found through an overlay, once that name is removed; following
   it reaches the program itself even after a rename (an overlay program through its overlay node)
@@ -283,8 +286,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - Zombies keep their group without tasks: stat/status work (state Z), cmdline/environ/auxv are
   empty, `fd/` is empty, `cwd`/`root`/`exe`/`ns` are `ENOENT`, `mounts`/`mountinfo` are `EINVAL`
   to open and `mem`/`pagemap` `ESRCH` (they use the address space of the thread named, which has
-  none; native 6.8 answers the same). A main thread that has exited while other threads run is
-  shown the same way, as Linux's zombie leader: `task/` still lists it (first), `task/<pid>` and
+  none). A main thread that has exited while other threads run remains visible: `task/` still lists it (first), `task/<pid>` and
   the process directory report Z with its name (kept in the group) and its own CPU time for
   `task/<pid>/stat`, and `Threads`/`num_threads` and `task/`'s link count include it; the process
   directory no longer falls back to another thread.
@@ -332,9 +334,10 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   option's uid/gid or the opener's fsuid/fsgid, its mode the option's mode; chmod, chown and
   utimensat are stored on the terminal (on the root and `ptmx` they are `EACCES`). Nodes exist
   while the terminal does; readdir lists `ptmx` and every live terminal. Devices 136:n and 5:2;
-  the root is 0755. fstat on a master fd always reports inode 2, mode 0666, rdev 5:2
-  on the root filesystem's device, uid/gid 0 and zero times, whatever the instance and
-  `ptmxmode`; a slave fd reports its terminal.
+  the root is 0755. A master that pins a devpts instance reports that instance's ptmx stat and
+  device. A master opened on another backing node reports the node's stat. Only a master with
+  neither uses the synthetic root-device inode 2, mode 0666 and rdev 5:2. A slave fd reports
+  its terminal.
 - nsfs: following `/proc/<pid>/ns/*` (after the ptrace-read check; `ENOENT` when the namespace has
   no id yet, as `pid_for_children` before its reaper) yields a regular 0444 file whose inode is
   the namespace id, device 0:4, statfs `NSFS_MAGIC`; opening finds the namespace among live ones,
@@ -397,8 +400,20 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 ## Confirmed bugs / technical debt
 
-- **Inotify on synthetic files is partial:** synthetic files outside cgroup2's four notifying files
-  report no inotify events (opens, reads, writes).
+- Ordinary procfs entries lack filesystem activity notifications. Keyed cgroup nodes do support
+  open, I/O, attribute and close hooks. Independently, four cgroup event files can report
+  asynchronous changes through kernfs observation.
+- Per-thread directories omit `pagemap`, which upstream Linux 6.1 exposes when
+  `CONFIG_PROC_PAGE_MONITOR` is enabled.
+- For an exited, unreaped leader with no address space, Appine rejects a new `mem` or
+  `pagemap` open with `ESRCH`. Upstream Linux 6.1 can open both and return EOF. Appine can
+  still generate network listings from a retained namespace or a fallback, whereas upstream
+  lookup of network children needs the named task's live namespace.
+- Writes to `netstat`, `snmp`, `sockstat` and `sockstat6` after a permitted write-mode
+  open return `EIO`. The Linux 6.1 single-record network handler returns `EACCES`.
+- Eventfd fdinfo emits the counter but omits Linux 6.1's `eventfd-id`. In process status,
+  `FDSize` rounds the open descriptor count up to 64. Linux reports allocated table capacity,
+  so sparse tables and tables that have retained capacity after close can show different values.
 - **Fidelity gaps:** Procfs ignores mount options and omits many standard files.
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
@@ -409,13 +424,3 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - Should procfs honour `hidepid`/`subset` (containers sometimes mount with `hidepid=2`)?
 - Should `meminfo`/`sysinfo` be clamped to cgroup `memory.max` (LXCFS style), or is following
   docker deliberate?
-- Should `task/<tid>` have `pagemap`, as Linux's tid_base_stuff is believed to?
-
-## To verify
-
-- Whether reopening a deleted file through `/proc/<pid>/fd/N` (the open-file node) checks
-  permission (pipes do not).
-- Field-by-field fdinfo layouts against Linux (eventfd ids, timerfd formatting).
-- The Linux 6.1 behaviour behind the items found by Starnix's syscall tests (a zombie leader's
-  files, write opens of read-only proc files) was observed on a native 6.8 kernel and attributed
-  to 6.1 from knowledge of the kernel; so was which write each kind of read-only file fails with.

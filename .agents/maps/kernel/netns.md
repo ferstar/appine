@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/netns.md` for the paired decision history, including pre-split decisions for kernel/nft.
 >
-> Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
->
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: full `127.0.0.0/8` loopback range in non-init namespaces and Linux 6.1 `RTA_DST`/`RTA_GATEWAY`/`RTA_PREFSRC` length handling in `RTM_NEWROUTE`/`RTM_DELROUTE`)
+> Verified: 2026-11-26 (full mapping, 15 claims independently checked across namespace lifetime, address and port translation, device configuration, filtering and forwarding)
 
 ## Responsibilities
 
@@ -80,11 +78,12 @@ sockets (`hal`).
 - Created by clone/unshare with `CLONE_NEWNET` (`CAP_SYS_ADMIN` in the new credentials' user
   namespace). The block is the first n in `FIRST_BLOCK..=65535` (`2..=65535`, reserving
   `127.0.0.0/24` and `127.0.1.0/24` for initial-ns loopback including `127.0.0.1`, `127.0.0.53`,
-  and Debian's `127.0.1.1`) whose bytes [a, b] are free and not 255 (reserved for the initial
-  namespace's virtual addresses) or 254 (outside clients); the first namespace gets 127.0.2.0/24;
+  and Debian's `127.0.1.1`) whose block [a, b] is free and whose first byte a is neither 255 (reserved for the initial
+  namespace's virtual addresses) nor 254 (outside clients); the first namespace gets 127.0.2.0/24;
   no free block is `ENOMEM`; a block is reused once its namespace is dropped. lo starts down
-  without addresses; IPv4 sysctls are copied from the initial namespace, IPv6 ones start at
-  defaults.
+  without addresses. Only the IPv4 interface `all` and `default` settings inherit from the
+  initial namespace. IPv6 settings and other namespace values start at their defaults. The new
+  namespace starts with the disabled ping group range `1 0`.
 - The kernel holds weak references; threads' nsproxies, sockets (inet, netlink, unix) and
   namespace files keep a namespace alive. A socket keeps the namespace it was created in, even
   after setns. Dropping a namespace drops its devices; a veth whose peer died is pruned lazily.
@@ -96,7 +95,9 @@ sockets (`hal`).
   `127.0.1.1`, `127.1.2.3`, and `127.0.0.254` so it does not collide with `SELF_VIA_VADDR`) →
   `127.a.b.1` with `vaddr` recording the exact guest IP (`Bindings` separates host ports per guest
   address); the namespace's own virtual IPv4 address → 127.a.b.1 (recording `vaddr`); anything else
-  `EADDRNOTAVAIL`. IPv6 `::1`/`::` become `::ffff:127.a.b.1` (host sockets stay dual-stack). A
+  `EADDRNOTAVAIL`. Ordinary IPv6 sockets translate `::1` and the
+  wildcard `::` to `::ffff:127.a.b.1`. Binding `::1` requires lo up with IPv6 configured.
+  The ICMPv6 path keeps native `::1` and applies the same loopback check. A
   wildcard UDP bind to port 0 gets a real host wildcard bind (`wide`) so it can also reach outside.
 - Reaching from a new namespace: any `127.0.0.0/8` address needs lo up and a covering address
   (`127.0.0.1..=253` → `127.a.b.1..=253`, others → `127.a.b.1` and resolved to the matching
@@ -154,20 +155,20 @@ sockets (`hal`).
   `set_bound_dev`, and `shutdown(SHUT_RD|SHUT_RDWR)` clears `listening` without
   releasing the port.
 - Host-port separation: explicit nonzero binds get a host-assigned port (`bind(..., 0)`) per
-  distinct guest bind target `(proto, guest_port, addr, v6only, host_ip)`, so `127.0.0.1:P`,
+  distinct guest bind target `(proto, guest_port, addr, v6only, bound_dev_if, host_ip)`, so `127.0.0.1:P`,
   `<vaddr>:P`, multiple virtual IPs, `[::1]:P`, `0.0.0.0:P`, and `[::]:P` never collide on
   `127.a.b.1`; only sockets joining the exact same non-`wide`, non-`accepted` target via
   `SO_REUSEPORT` (same `euid`) or UDP `SO_REUSEADDR` share a host port (`shared_host_port`).
-  `bind(0)`, implicit binds, and host autobinds register through `add_ephemeral`, which remaps the
-  guest port away from any active bound guest port for `proto` in the namespace (within
-  `ip_local_port_range`) and blocks conflicting explicit binds. Accepted TCP child sockets register
-  as non-listening `accepted` bindings. Removed bindings linger 10 s (`LINGER`) for reverse
-  `(proto, host_ip, host_port)` translation (`lookup_host`).
-- `resolve_target` routes TCP connects, UDP sends, and `forward_target` DNAT probes into a new
-  namespace to the best matching active listener's `(host_ip, host_port)` (exact guest address
-  beats wildcard; pure IPv6 prefers `v6only` wildcard; `wide` sockets route via `127.a.b.1`). A
-  TCP connect with no match returns `ECONNREFUSED` before the host is asked; a UDP sendto with no
-  match is dropped silently (reporting success). Targets in the initial namespace are not checked.
+  For ephemeral binds, `add_ephemeral` first tries the host port even outside the configured
+  range. On collision it searches `ip_local_port_range`, then the remaining ports starting at
+  1024 and finally below 1024. Exhaustion falls back to the host port. Accepted TCP children
+  register as non-listening bindings. Removing the last binding for a host endpoint retains its
+  reverse translation for 10 seconds. A live matching binding takes precedence.
+- `resolve_target` prefers exact guest addresses over wildcards and matching device bindings
+  within the applicable tier. Pure IPv6 prefers a v6-only wildcard. A wide socket is reached
+  through the namespace's host loopback endpoint. A guest TCP connect with no listener in a
+  target child namespace gets `ECONNREFUSED`. An unconnected UDP send with no receiver there
+  can report success while dropping the datagram. External DNAT publication has its own fallback.
 - Connected UDP sockets record their filter verdict and target namespace listener at connect — both
   host-wide sockets (`vconn`, which discard foreign sources on receive) and namespace-bound sockets
   — and address-less sends re-resolve the target listener's `(host_ip, host_port)` (updating
@@ -214,9 +215,12 @@ sockets (`hal`).
   or lo routes.
 - Sysctls: 33 IPv4 and 58 IPv6 settings per device plus `all`/`default`; effective are
   `disable_ipv6`, `addr_gen_mode` (only "none"), `keep_addr_on_down` and IPv4 `default`
-  propagation; IPv6 `mtu` and `stable_secret` are checked and stored only; `forwarding`/
-  `ip_forward` are stored only (traffic through a gateway always flows as if routing and NAT were
-  on).
+  propagation to interfaces without an explicit override. Changing IPv4 `all/forwarding`
+  updates the default and interfaces. Forwarding and `route_localnet` affect route queries
+  with an input interface. Outbound socket transport through a gateway still uses the host.
+  IPv6 `mtu` and `stable_secret` are checked and stored. Separate namespace-wide entries in
+  `netconf::SYSCTLS` describe typed values, defaults (some derived from memory size) and
+  initial-namespace-only visibility. `kernel/sysctl` presents these through procfs.
 - ioctls: get/set flags, MTU, name, hardware address, txqlen, and the address getters; address
   setters `EPERM`. Statistics of virtual devices are zero.
 
@@ -260,14 +264,15 @@ sockets (`hal`).
   nat; a DNAT result is translated to the target's host address and gateway source, filtered
   through the initial namespace's PREROUTING (split around DNAT priority) and FORWARD/INPUT and
   the target's PREROUTING/INPUT chains (a drop or reject means no
-  forwarding), and target endpoints in new namespaces are resolved via `resolve_target` (or
-  initial-namespace low ports via `portmap`). Re-evaluated on listen (both initial and new
+  forwarding when the translated destination yields an IPv4 address). For a target in a new namespace a listener
+  match substitutes its host endpoint. On a miss the forwarder retains the translated host IP
+  and DNAT destination port. Initial-namespace low ports go through `portmap`. Re-evaluated on listen (both initial and new
   namespaces), UDP bind, initial-namespace nft commits and explicit-port binds in namespaces (when
   PREROUTING nat exists) — not on interface address changes or container-namespace filter changes. A dual-stack
   AF_INET6 wildcard listener (`!IPV6_V6ONLY`) falls back to probing IPv4 PREROUTING nat when the
   IPv6 probe does not match, so IPv4 DNAT rules forward it.
 - One host thread (`forward`, no BKL) owns dups of the selected host sockets: it accepts up to 64
-  connections per round up to `MAX_CONNS` (256) concurrent forwarded TCP connections (omitting TCP
+  connections per ready listener per round up to `MAX_CONNS` (256) concurrent forwarded TCP connections (omitting TCP
   listeners from `poll` while at cap so accept sockets do not busy-loop), opens a nonblocking
   connection to the target with a `CONNECT_TIMEOUT` (10 s; client input is not polled until the
   outbound connect completes, while client `POLLERR`/`POLLHUP` aborts early), and copies both ways
@@ -275,13 +280,15 @@ sockets (`hal`).
   side that reports an error or hangs up after its end of file before it was shut for writing (a
   reset half-closed side). A listener that polls readable while its first accept fails with anything
   but `EAGAIN` (out of fds, shut down) is left out of the poll for 1 s; a failing poll waits 100 ms.
-  UDP uses one relay socket per client address (120 s idle), capped at `MAX_UDP_RELAYS` (256;
+  UDP uses one relay per published port and client socket address (120 s idle), capped at
+  `MAX_UDP_RELAYS` (256 across all ports;
   datagrams from new clients while at cap are drained and dropped without opening fds, while
   existing relays stay active), replies sent from the held port.
-- Real client address: for IPv4, non-loopback TCP clients and IPv4 targets the relay binds a
-  127.254.x.y address with the client's port and records it, so accept, getpeername and
-  `/proc/net` in the container report the real client; loopback, IPv6 and UDP clients see the
-  gateway. The global record is removed when the forwarded connection closes, while accepted guest
+- Real client address: for IPv4, non-loopback TCP clients and IPv4 targets the relay tries to bind a
+  127.254.x.y address, preferring the client's port, and records the actual endpoint, so accept, getpeername and
+  `/proc/net` in the container report the real client; a busy source port retries with a host-selected port on the same
+  synthetic address. Failure to allocate or bind that address ends the attempt. Clients
+  ineligible for this mapping use the target's source address, if specified. The global record is removed when the forwarded connection closes, while accepted guest
   sockets cache the resolved real client address in `track.outside_peer` so getpeername and
   `/proc/net/tcp` preserve it across `CLOSE_WAIT` until the guest socket closes.
 - On rule changes, non-deferred handles are updated in place via `Handle::update(Option<Target>)`:
@@ -344,5 +351,5 @@ sockets (`hal`).
 
 ## To verify
 
-- How docker (with and without docker-proxy) and podman listeners interact with the dual-stack
-  forwarding gap on a real device.
+- Docker listeners with and without docker-proxy, and Podman listeners, on a real Android
+  device with IPv4 DNAT and a dual-stack wildcard listener.

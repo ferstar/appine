@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/mm.md` for the paired decision history (it still holds the decisions on the soft-MMU, the OOM killer, fork/copy-on-write and host backing made before they were split out into `kernel/mmu`, `kernel/oom`, `kernel/cow` and `kernel/hostmem`).
 >
-> Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
->
-> Maintained: 2026-11-26 (targeted verification of superpage preparation in munmap and discard, CoW and VMA teardown ordering, and private-file unshare)
+> Verified: 2026-11-26 (full mapping, 15 claims independently checked across VMA layout, page faults, permission changes, file invalidation and dump selection)
 
 ## Responsibilities
 
@@ -39,6 +37,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   `vfs::released`), SysV `shm`, optional `Fill`, and Linux VMA flags (locked, sticky `written`,
   growsdown, dump/fork/noreserve, sticky commit charge `accounted`, anonymous page offset
   `anon_pgoff`, logical `has_anon_vma` and fork identity `anon`).
+- `FileSource` identifies the mapping contract at file mmap. A store mapping retains a duplicate of its
+  pinned host file descriptor. Tmpfs supplies allocation and quota tracking for touched pages.
+  FUSE supplies the open-specific `Fill` and shared per-inode page state.
 - `Fill` pins the mapping's FUSE open. All its VMA pieces share that handle. Mappings of one
   FUSE inode share `FillPages`, including its sparse memfd, current size, filled runs and
   read-ahead state. It tracks previously filled pages, shared-write baselines and writable opens.
@@ -93,8 +94,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   the loader fills it with the BKL released, and after the point of no return it is shared and
   installed.
 - `set_layout` sets `mmap_top` from the `RLIMIT_STACK` at execve (capped at 8 MB for a secure
-  exec): `STACK_TOP` minus the limit plus the stack guard gap, clamped between 1 GB + 8 MB and 5/6
-  of the address space. An unlimited stack still gives a top-down layout with the largest gap.
+  exec). It adds the guard gap to the limit with saturation, clamps the sum between
+  1 GiB + 8 MiB and 5/6 of the address space, then subtracts that gap from `STACK_TOP` and
+  page-aligns the result. An unlimited stack still gives a top-down layout with the largest gap.
 - `STACK_TOP` is `1 << 47`. A position-independent main program loads at `0x5555_5555_0000`.
   Non-fixed `mmap` allocates top-down from `mmap_top` (`find_free`), 2 MB-aligning mappings ≥
   `LEAF_SPAN` (2 MB) when VA space permits (falling back to page alignment) to form `kernel/mmu` L2
@@ -148,8 +150,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   part becomes a VMA of its own.
 - `MAP_FIXED` / `MAP_FIXED_NOREPLACE`: the address must be aligned and the end at most `1 << 48`
   (`EINVAL`, after the syscall's `EPERM`). `NOREPLACE` on an occupied range is `EEXIST`; otherwise
-  the old range is unmapped first, before host allocation, the permission check, the fd copy and
-  the map-count check, so a later failure leaves a hole.
+  the syscall checks the request and its fd permissions before delegating placement to `Mm`.
+  Fixed replacement removes the old range before all backing and insertion work has succeeded,
+  so a later error can leave a hole.
 - A hint is rounded down to a page and raised to `vm.mmap_min_addr` (Linux's `round_hint_to_min`),
   and used if it ends at or below `mmap_top`, is free, and stays clear of the guard gap below a
   grows-down VMA above it.
@@ -228,7 +231,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 7. Otherwise `SIGSEGV`: `SEGV_ACCERR` if the address is mapped, else `SEGV_MAPERR`.
 
 "Re-execute" forces no signal and leaves the PC on the faulting instruction (already-pending
-signals may still be delivered).
+signals may still be delivered). For an unhandled page fault the task also records an arm64
+abort syndrome. A non-backing access error with a present leaf gives a level-3 permission fault.
+Otherwise the populated page-table levels determine the translation-fault level.
 
 ### munmap, mprotect, mremap
 
@@ -399,19 +404,17 @@ signals may still be delivered).
 
 ### Files: EOF and truncation
 
-- Whole pages past EOF have no entries. Ordinary shared and private mappings keep the file open
+- Ordinarily whole pages past EOF have no entries. Ordinary shared and private mappings keep the file open
   across descriptor close, VMA splits, fork and mremap. Private mappings share a retained descriptor
   per host inode across a fork family. A store pin takes precedence over an unpinned descriptor from
   the ELF loader. Guest instruction faults and kernel copies retried through
   `grow_for` check the current extent. If a private mapping has anonymous or shared read-only backing after fork,
   caching or mprotect, only the previously inaccessible tail gets a fresh private host mapping.
-- truncate, ftruncate and `O_TRUNC` that shorten a file first call `file_truncated` on every
-  address space (entries past the new end are removed, executable ranges are queued for
-  invalidation, `dirty` is set; a `Fill` uses its old logical extent) and sync each one that changed, the
-  current one included (one that cannot be borrowed is skipped), and only then shorten the host
-  file: no thread can reach the dropped tail through a stale translation, so an access there faults
-  into the kernel and gets the guest's `SIGBUS` once the BKL is free. A host truncation that then
-  fails leaves the mappings' EOF at the requested length.
+- Before a host shrink, truncate, ftruncate and `O_TRUNC` clip the file's accessible extent
+  in each address space they can borrow, queue executable invalidation, mark it dirty and sync
+  it. A successful clip removes translations after EOF so later guest access faults. If page-table
+  demotion fails, clipping still expires page watches but a translation can survive. A later
+  host truncate error can instead leave the logical EOF shorter than the host file.
 - Private and shared mmap of a named store file first give the inode its own backing object, including
   on read-only opens. The VMA retains a duplicate of its locked open description. Splits, fork
   and mremap keep the pin. Cached host views use a separate open description. Clones and overlay
@@ -429,11 +432,12 @@ signals may still be delivered).
   contiguous same-prot growsdown VMAs below it, else `[vdso]`, else `[vvar]` for the foreign VMA,
   else `[heap]` inside `[brk_start, brk)`) and joins adjacent pieces of one Linux VMA (`same_vma`,
   plus the same label). procfs escapes a newline in a file name as `\012`.
-- `dump_regions` applies `coredump_filter` and `MADV_DONTDUMP` (the vDSO is dumped whole anyway; a
-  written private file VMA follows `ANON_PRIVATE`; ELF headers' first pages follow their own bit)
-  and writes nothing of `[vvar]`; the core-dump writer leaves holes where `residency` reports pages
-  absent in sparse regions. For private anonymous memory, `ANON_PRIVATE` selects every piece
-  of a logical VMA with an anon_vma. FUSE mappings fetch missing pages before ELF checks and segment writes.
+- `dump_regions` includes the VMA starting at the recorded vDSO address before consulting
+  dump flags. Other foreign or `MADV_DONTDUMP` pieces have zero payload. `ANON_PRIVATE`
+  selects private anonymous pieces with an anon_vma and private file pieces that have been
+  written or currently allow writes. File and ELF-header filters cover further cases. The
+  writer leaves holes for absent pages in sparse regions and fetches missing FUSE pages before
+  inspecting headers or copying segments.
 - `Mm` drop leaves its code group (`kernel/mmu`), releases CoW (`kernel/cow`), defers the page
   table (`kernel/hostmem`), then drops VMAs and graveyard. RSS measures live in `kernel/oom`.
 
@@ -473,7 +477,8 @@ signals may still be delivered).
   `PROT_NONE` keeps prot-0 entries (`kernel/cow` lending and `kernel/oom` RSS rely on this).
 - `Mm` (`Rc<RefCell>`) is BKL-only (checking builds assert no borrow across BKL release);
   `shared_maps` is shared across threads for the fast futex path. `install_vma`, `grow_tail` and `move_range`
-  publish writable shared ranges in `shared_maps` before installing or moving PTEs (rolling back if
+  publish write-eligible shared ranges in `shared_maps` before installing or moving PTEs,
+  including ranges with write permission currently disabled (rolling back if
   `map_pages` fails), and `munmap`, `move_range`, and `deny_write` prune removed/non-writable
   ranges after old PTEs are gone.
 - The host's `vm.max_map_count` is shared by the whole app process, so the guest limit is enforced

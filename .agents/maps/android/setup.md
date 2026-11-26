@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/android/setup.md` for the paired decision history (it still holds the decisions on the Settings screen made before it was split out into `android/settings`).
 >
-> Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
->
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: preserved `ENV=/etc/profile.d/appine.ashrc` across Alpine `doas -s` rules and documented foreground-process command-title fallback for ash)
+> Verified: 2026-11-26 (full mapping, 15 claims independently checked across package verification, store publication, per-start setup, OpenRC, account selection and shell integration)
 
 ## Responsibilities
 
@@ -102,7 +100,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   the ncurses dependencies; also bubblewrap and libcap2, openrc, openrc-user, ifupdown-ng and bridge; apk checks signatures at install) and, unless a copy with the
   pinned sha256 is already there, the minirootfs: its GPG signature is
   checked when both gpg and gpgv are installed (a failed signature download counts as bad; without
-  gpg a warning), then its pinned sha256. Gradle verifies the inputs named by `--assets` and bundles
+  gpg a warning), then its pinned sha256. `--assets` lists bundle inputs offline. Gradle verifies those inputs and bundles
   them as `rootfs.tgz`, `doas.apk` and `{bash,procps,bubblewrap,openrc}/<file name>`.
   `BuildConfig.ALPINE_BRANCH` comes from the pinned tarball name. `prepare` copies the tarball asset to the cache.
 - Debian (`download`): a cached `cacheDir/<distro>.tar.gz` with the pinned length and sha256 is
@@ -172,30 +170,25 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   The shim execs that client; `ConsolePty` sets `BROWSER` to the shim (android/vt).
   The login profile also exports that default when `BROWSER` is unset or empty and the shim is
   executable, restoring browser discovery after `su -` clears the inherited environment.
-  Nonempty custom values are preserved. This requires a shell that reads `/etc/profile`;
-  shells such as fish and Debian's zsh need their own login configuration.
+  Nonempty custom values are preserved. When Appine starts zsh with its `ZDOTDIR` shim, an
+  interactive Debian login also sources the Appine profile. A separately launched shell that
+  reads neither profile nor shim needs its own browser configuration.
   Each invocation rereads the configuration and sends one HTTP(S) URL without using a TTY or
   inherited tab token; success acknowledges Android intent acceptance, not page loading or login.
-- On the start thread, after any import, in
-  this order, before the kernel starts under the write lock: a loopback-only `/etc/network/interfaces` when absent;
-  `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
-  (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
-  reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
-  `doas.apk` into `/var/cache/appine/`, rewritten at every start, and unmodified stock
-  `/etc/doas.d/20-wheel.conf` (`permit persist :wheel`) upgraded to preserve
-  `ENV=/etc/profile.d/appine.ashrc`; on Alpine, `ensureBashStartup`
-  once per store (gated by `/var/lib/appine/bash-startup-done`): writes `/etc/skel/.bash_profile`
-  and `/etc/skel/.bashrc` when missing and, for root and pre-existing regular accounts (UID
-  1000–65533) whose `/etc/passwd` shell is `/bin/bash` and whose non-root home directory already
-  exists, writes `.bash_profile` only if none of `.bash_profile`, `.bash_login` or `.profile`
-  (including symlinks) exists and writes `.bashrc` when missing, owned by each account (`uid:gid`,
-  0644), then writes the marker so later user deletions persist (missing or symlinked homes are
-  skipped without creating directories); a profile left exactly as an
-  earlier version wrote it (with `cd "$HOME"`, without prompt marks, or with marks that do not
-  declare `cl=line`, or with ash's, bash's or zsh's marks in itself) replaced by the current one, with
-  the mark files written before it (`/etc/bash/appine.sh` on Alpine stores, bash installed or
-  not); an edited one is kept and a missing one not recreated, and then the mark files are not
-  written either. The first two apply to every distro. A failed write in any of them fails the start.
+- After import, the start thread prepares network configuration, container defaults, login tools
+  and bash startup files, then the GPU launcher when enabled. `startKernel` prepares the browser
+  endpoint and updates the profile before opening the kernel under the provider write lock.
+  The network file defaults to loopback only. The rootless Podman fragment selects host networking
+  because pasta and slirp4netns require a TUN device. Both defaults preserve an existing file.
+- Alpine refreshes the bundled doas APK and upgrades the stock wheel rule to preserve ash's
+  `ENV`. Once per store, `ensureBashStartup` seeds missing startup files in `/etc/skel` and in
+  existing absolute homes for root and UID 1000–65533 bash accounts with valid ownership.
+  Existing `.bash_profile`, `.bash_login` or `.profile` takes precedence. The marker lets a
+  later user deletion persist.
+- `updateProfile` upgrades known stock profile contents. It writes the companion scripts
+  before the profile, preserving a user's edited version. A readable edited profile still gets
+  the independent one-time interactive rc hooks. An unreadable or missing profile skips those
+  hooks. On Alpine the stock doas-rule migration runs before the profile check.
 - Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
   snapshotter run on the kernel's overlayfs, rootful and rootless. A `storage.conf` choosing vfs or
   a `daemon.json` choosing native that an earlier build wrote stays until the user removes it.
@@ -209,6 +202,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   Setup runs inittab before tabs open, verifies the lock directory and default runlevel, removes the
   cache and installer and writes the marker. Later removal persists. A failed migration on an
   existing store reports the error and allows a login for repairs. The next start retries.
+  Failure during a new import propagates to startup.
 - Both first and subsequent boots run `PREFER_OSCLOCK` without a console. It adds osclock to the boot runlevel when
   `rc-update` and the osclock service exist and no runlevel has hwclock, osclock or swclock (a
   dangling link counts); the thread waits for it, ignores its exit status and only logs an
@@ -338,8 +332,8 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     Later polls compare the inode, size, mtime and ctime of `/etc`, `/etc/passwd`, `/etc/group`,
     `/etc/shadow` and `/var/lib/appine/admins`. A changed or unavailable sample triggers
     another refresh. The worker starts the process and a separate thread waits for its exit.
-    Only a successful exit acknowledges the sample. Changes during a refresh are checked at
-    the next poll after it finishes;
+    While the waiter is alive, polling starts no second refresh. A successful exit stores the
+    sample taken before spawn. The next poll samples again. A missing sample always retries;
   - before choosing the account: install procps-ng, then bubblewrap offline when their cache directories
     exist, under the install lock, testing `apk info -e <package>` (BusyBox already provides ps/top/free),
     re-add each by name for upgrades, and delete its cache under the lock only on success. Failure
@@ -353,12 +347,12 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     and the next login tries again;
   - root: `cd` to the directory (else root's home, else `/`) and `exec` root's passwd shell (or
     `/bin/sh` when it is not executable) as a login shell;
-  - a regular account not yet in `/var/lib/appine/admins` (matched literally): add it to wheel
+  - any selected account whose name is not `root` and is absent from `/var/lib/appine/admins` (matched literally): add it to wheel
     (Alpine, with `permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel` in
     `20-wheel.conf`, also upgrading an unmodified stock `permit persist :wheel` file on
     `refresh_rules` and `Rootfs.ensureLoginTools`/`updateProfile`) or sudo (Debian) and record it
     once it really is in the group (otherwise say so and retry at the next login);
-  - a regular account, while the tool's marker is missing and the tool is not on PATH (whether or
+  - a selected non-root account, while the tool's marker is missing and the tool is not on PATH (whether or
     not the account was just made an admin): install doas from the bundled package and re-add it
     by name under the install lock, or sudo from the network showing apt's progress (Ctrl-C skips
     until the next login; no install lock is taken: `apt_update` retries `apt-get update` every 2 s
@@ -409,9 +403,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   again with the usual progress; if that fails and the service falls back to Alpine,
   `Rootfs.deleteTarball` deletes the abandoned cached tarball (and any `.part` file) before
   starting the Alpine fallback import.
-- The distro record is committed before the import starts, so an existing store always has it;
-  only the app's own store writes it, but an import into another store (only the
-  instrumentation tests make one) still overwrites (Alpine) and deletes the shared cached tarball.
+- Current imports into the default app store commit the distro record before importing.
+  Legacy stores without the preference default to Alpine. An import into a separate test store
+  leaves the preference alone but still uses and deletes the shared cached tarball.
 - `writeFile` while the kernel runs is seen at once (the store's commit counter invalidates kernel
   caches).
 - `updateProfile` replaces only the versions it knows, compared whole (`OLD_PROFILE` and
@@ -429,8 +423,8 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   fresh `scripts/fetch-rootfs` fail until it is pinned anew.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
   rows on a resize; `android/vtcore`): bash, busybox ash and zsh do.
-- Every rule writer takes the root-only rules lock before reading the accounts and holds it
-  through publication or removal. A failed publication attempts to remove stale grants.
+- The writer of the generated NOPASSWD rules holds the root-only lock from reading the
+  accounts through publication or removal. A failed publication attempts to remove stale grants.
   Reading account files and publishing in the rules subdirectory do not change the sampled
   inputs. The service polls every 2 s independently of the Files app's directory notifications.
 - `login.sh` runs without job control (its children share its process group), so `SIGINT` stays
@@ -440,13 +434,17 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ## Confirmed bugs / technical debt
 
-(None currently; busybox ash automatic command titles and unmarked-shell busy/completion fallback are now covered by foreground-process detection in `android/vtcore`, and Alpine `doas -s` preserves `ENV=/etc/profile.d/appine.ashrc`.)
+- Two simultaneous first logins for the same account can both append its name to
+  `/var/lib/appine/admins`. The membership check and append happen outside the generated-rules
+  lock. Duplicate rows can produce duplicate rules.
+- Bash and doas can be installed from a local APK even if the subsequent add-by-name step
+  fails. Bash's executable permits cache removal, and finding doas on PATH sets its marker.
+  Later logins can therefore skip the step that records the package by name for upgrades.
 
 ## Open questions
 
-- Should a failed optional per-start write (the network, containers, doas package or profile file,
-  for example through a directory the user replaced with a symlink, which `writeFile` refuses) fail
-  the whole start rather than be logged?
+- Which per-start configuration writes should allow startup to continue after a write failure?
+  Today an exception from the network, container, login-tool or profile write aborts startup.
 
 ## To verify
 

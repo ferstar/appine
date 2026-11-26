@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/engine.md` for the paired decision history (it still holds the decisions on the Tier 1 dynamic binary translator made before it was split out into `engine/dbt`).
 >
-> Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
->
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: clear the local exclusive monitor on exceptions, signal delivery, signal return and debug stops)
+> Verified: 2026-11-26 (full mapping, 15 claims independently checked across CPU layout, Tier 0 dispatch, atomics, features, native code and fault recovery)
 
 ## Responsibilities
 
@@ -41,8 +39,9 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 - `struct appine_cpu` / `CpuState` — one per guest thread: X0–X30, SP, PC, NZCV, FPCR, FPSR,
   TPIDR_EL0, exit and fault information, the `pending` kick flag, the bound page table, the
   exclusive monitor (`excl_addr`, `excl_value`, `excl_size`; size 0 means none), Tier 1 scratch and
-  group slots (`dbt_groups[8]`), `ivau_page`, the data TLB (4096) and ITLB (512), V0–V31,
-  `tlb_used`, DIT, and 16 hardware breakpoint and 16 watchpoint slots. Fields before the TLB are
+  group slots (`dbt_groups[8]`), `ivau_page`, 4096 data TLB entries for 4 KiB pages, 512 instruction TLB entries,
+  and 1024 superpage TLB entries for 2 MiB mappings. Each data TLB has a used-entry bitmap.
+  The state also holds V0–V31, DIT and 16 slots each for breakpoints and watchpoints. Fields before the TLB are
   addressed by `engine/dbt` with immediate offsets.
 - `Cpu` — owns one state (pooled: up to 8 spares); `Send`, not `Sync`.
 - `Kicker` — raw handle whose only operation, `kick`, sets `pending`; the one thread-safe call.
@@ -66,20 +65,24 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 ### Tier selection (decided by the kernel run loop)
 
-- Tier 1 (`engine/dbt`) runs when the address space has a `DbtSpace`; Tier 0 (`Cpu::run`) runs when
-  there is no instance, when hardware breakpoints are set, and when the instance is poisoned;
-  `Cpu::step` is used for single-stepping.
+- A single-step request takes precedence. The pending extra stop after a stepped syscall consumes
+  no instruction. Otherwise the kernel calls `Cpu::step` and handles the resulting exit. In the
+  ordinary loop it calls the installed DBT instance when no hardware breakpoint is active and
+  `Cpu::run` otherwise.
 - `engine/dbt` itself executes any instruction it does not translate by calling Tier 0 for that one
   instruction.
 
 ### CPU state and exits
 
-- `Cpu::new` takes a pooled state or maps a new one and zeroes everything before the TLB, the
-  V registers and the debug slots, flushing only used TLB entries.
+- `Cpu::new` takes a pooled state or maps a new one. Initialization clears the prefix before
+  the first TLB and the vector registers, resets DIT and both debug slot counts, and binds the
+  page table. A flush clears used entries in both data TLBs and the entire instruction TLB.
+  Changing active watch ranges or types flushes translations. A breakpoint-only update keeps them.
 - `run` syncs host PSTATE.DIT with the guest's, arms the fault guard, and loops; each iteration
   consumes `pending` (a kick ends the run with `Kick`) and executes one instruction.
 - The C exit code is decoded from the state's exit and fault fields; `HostFault` reads the
-  thread's last recorded host fault. Exit code 0 or an unknown code panics.
+  thread's last recorded host fault. A zero result means ordinary completion for `step` and
+  `exec_insn`. The run loop requires an exit. An unknown code panics.
 - The kernel collects `ivau_page` on every exit and turns `Undefined` into `SIGILL`/`ILL_ILLOPC`.
 
 ### Tier 0 execution
@@ -119,9 +122,10 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
   decides whether the encoding is whitelisted, translates the address and moves registers, and a
   generated stub executes the same instruction on the host with general-register fields remapped to
   host temporaries (address fields replaced by a translated host pointer).
-- The stub cache is one process-global 2 MB code region (W^X double mapping) with a 4096-slot
-  table; it is flushed entirely when half full or out of space. Stubs run under a read lock
-  (registered with the fault guard); generating a stub takes the write lock.
+- The stub cache is one process-global 2 MiB code region and a 4096-slot table. Allocation first
+  tries separate writable and executable aliases, then one RWX mapping. Insertion flushes the
+  cache at half table occupancy or when the largest stub would exceed the remaining space. A
+  reader holds the lock during execution. A writer rechecks a miss before generating a stub.
 - Vector ADD/SUB and the three-register bitwise instructions use caller-saved V0–V2 for their
   operands. BSL, BIT and BIF also load the old destination. Each writes back the full destination
   vector, including the cleared upper half for 64-bit forms.
@@ -130,8 +134,8 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 - SIMD and FP loads and stores are implemented in C through the soft-MMU, checking every page first.
   Multiple-structure LD1/ST1 copy one 8- or 16-byte register at a time after checking the whole
   range for page faults and watchpoints. Interleaved LD2–LD4/ST2–ST4 copy one element at a time.
-- If native stubs are unavailable, those instructions are undefined and no SIMD or FP feature is
-  advertised.
+- A native-dispatched opcode is undefined when the stub cache is unavailable. The FP and
+  SIMD feature bits also require working native stubs. Memory transfers use the C helpers.
 
 ### Exclusives and atomics (Tier 0)
 
@@ -214,10 +218,12 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
   whitelist decoder that `engine/dbt` relies on. Encodings outside the whitelist are undefined in
   both tiers.
 - Fields before the TLB in `struct appine_cpu` must stay within immediate reach of `engine/dbt`'s
-  loads, and the TLB must be 16-byte aligned; the Rust mirror is checked by `layout_matches` (size
-  plus eight field offsets, in a unit test).
-- Watched pages never enter the TLB (read half absent for load watchpoints, write half for any),
-  and hardware breakpoints are checked only in Tier 0.
+  loads. The first data TLB is 16-byte aligned and the superpage TLB is 4096-byte aligned.
+  The `layout_matches` unit test checks the C/Rust state size and nine offsets, including the
+  superpage TLB. Other fields have indirect coverage.
+- A watched 4 KiB page has no cached write translation. A load watchpoint also suppresses the
+  cached read translation. Any active watchpoint prevents new superpage data TLB entries.
+  Instruction fetch remains cacheable. Tier 0 checks hardware breakpoints.
 - `Kicker::kick` is the only operation allowed from other threads; it is safe only while the `Cpu`
   is alive. The kernel guarantees this by kicking only under the BKL, only tasks it still lists or
   registered users of an address space, and by removing a thread from both before its `Cpu` is
@@ -233,16 +239,10 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 ## Confirmed bugs / technical debt
 
-None.
+- Both tiers preserve the top byte of register branch targets and fetch through the raw PC.
+  The upstream Linux 6.1 arm64 boot configuration enables TBI0 for TTBR0 addresses. A tagged
+  instruction pointer can therefore fault in Appine where the upstream configuration ignores its tag.
 
 ## Open questions
 
 None.
-
-## To verify
-
-- Tagged branch targets fault in both tiers (the PC is never untagged). Whether this diverges from
-  Linux 6.1 depends on whether it leaves TBID0 clear for EL0 (instruction addresses then also
-  ignore the top byte); needs the Linux source.
-- `layout_matches` checks only the size and eight field offsets and runs only in a unit test; other
-  mirrored fields are covered only indirectly.

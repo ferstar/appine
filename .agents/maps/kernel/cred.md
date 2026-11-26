@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/cred.md` for the paired decision history.
 >
-> Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
->
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `setgroups` and `PR_CAPBSET_DROP` check permissions (`EPERM`) before argument validation (`EINVAL`/`EFAULT`), matching Linux 6.1)
+> Verified: 2026-11-26 (full mapping, 15 claims independently checked across credential updates, capability and access checks, exec, filter publication and listener lifetime)
 
 ## Responsibilities
 
@@ -97,8 +95,9 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   and `2` (`SUID_DUMP_ROOT`) leave `ThreadGroup.dumpable = false` so procfs ownership and ptrace
   checks treat them as non-user-dumpable.
 - Capability fixups on uid changes (`cap_emulate_setxuid`, root meaning uid 0 of the credential's
-  namespace): leaving root on all three uids clears permitted and effective unless `KEEP_CAPS`
-  and always clears ambient; euid root → non-root clears effective, non-root → root sets
+  namespace): losing the last root real, effective or saved uid clears ambient.
+  Without `KEEP_CAPS` it also clears permitted and effective. Losing a root euid separately
+  clears effective even with `KEEP_CAPS`. Gaining a root euid sets
   effective = permitted; `setfsuid` drops or raises the filesystem capabilities;
   `SECBIT_NO_SETUID_FIXUP` disables all of it.
 - `setfsuid`/`setfsgid` never fail: bad values are ignored and the old value is returned.
@@ -112,9 +111,11 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 - Scopes: `capable` only in the initial user namespace; `capable_here` in the caller's own;
   `ns_capable` in a given namespace (including the parent-owner rule); `capable_wrt` additionally
   requires the inode's uid and gid to be mapped in the caller's namespace.
-- `capset`: v1 (one word) or v2/v3 (two); unknown versions write v3 back and fail `EINVAL`; null
-  data is a probe; another pid `EPERM`; bits above `cap::LAST` (`CAP_FULL`) are masked and ignored
-  before checking; new permitted ⊆ old permitted, effective ⊆ new permitted,
+- Both capability syscalls read a versioned header (one word per set for v1, two for v2/v3).
+  Only `capget` with null data probes the version. It ignores the pid and succeeds after writing
+  v3 for an unknown version, provided the header is accessible. With data, an unknown version
+  returns `EINVAL`. `capset` requires pid zero or the calling thread and reads the requested
+  sets. It masks bits above `cap::LAST` before applying the following rules: new permitted ⊆ old permitted, effective ⊆ new permitted,
   inheritable ⊆ old inheritable ∪ (`CAP_SETPCAP` ? all : old permitted) and ⊆ old inheritable ∪
   bounding; ambient is then masked to permitted ∩ inheritable.
 - prctl: bounding drop checks `CAP_SETPCAP` (`EPERM`) before capability range `<= 40` (`EINVAL`);
@@ -162,14 +163,16 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   without one the owning group or other class applies; if the class allows everything requested, allow; otherwise directories
   allow with `CAP_DAC_READ_SEARCH` (no write) or `CAP_DAC_OVERRIDE`, non-directories allow with
   `CAP_DAC_READ_SEARCH` (read only) or `CAP_DAC_OVERRIDE` (no exec, or some exec bit set), all via
-  `capable_wrt`; else `EACCES`. Immutable and append flags are unsupported.
+  `capable_wrt`; else `EACCES`. File open, mmap and xattr callers apply immutable and append-only inode
+  flags separately from this DAC helper.
 - `owns`: fsuid is the owner, or `CAP_FOWNER` in the caller's namespace with the owner mapped there
   (Linux's `inode_owner_or_capable`; the group need not be mapped). `may_delete`: write and search
   on the directory, then for sticky directories the owner of file or directory or `CAP_FOWNER`
   (`EPERM`). `new_owner` (Linux 6.1's `vfs_prepare_mode` and `inode_init_owner`) takes the mode
   and the umask: uid fsuid; gid the directory's when it is setgid, else fsgid; in a setgid
-  directory a non-member without `CAP_FSETID` loses `S_ISGID` on a group-executable file before
-  the umask applies when the parent has no default ACL; a directory keeps only its permissions and the sticky bit and inherits the
+  directory a non-member without `CAP_FSETID` loses `S_ISGID` on a group-executable
+  non-directory, including when the parent has a default ACL. The umask applies only in the
+  absence of a default ACL; a directory keeps only its permissions and the sticky bit and inherits the
   setgid bit of a setgid parent. `for_access`: filesystem ids set to the real ids; unless
   `SECBIT_NO_SETUID_FIXUP` is set, effective capabilities become permitted when the real uid is
   root in the namespace and 0 otherwise (Linux's `access_override_creds`). `searches_all`: `CAP_DAC_READ_SEARCH`
@@ -188,10 +191,11 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ### seccomp
 
-- Installing (`seccomp(2)`/prctl, Linux order): flag combinations `EINVAL`; length 0 or over 4096
-  `EINVAL`; without the caller's no_new_privs or `CAP_SYS_ADMIN` in the caller's
-  namespace `EACCES`; the classic and seccomp checkers (aligned loads of `seccomp_data`, forward
-  jumps, packet loads and MOD rejected); mode must be disabled or filter; a second listener
+- Filter installation rejects invalid flag combinations and lengths outside 1–4096 instructions
+  with `EINVAL`. Without `no_new_privs` or `CAP_SYS_ADMIN` in the caller's namespace it returns
+  `EACCES`. The classic BPF and seccomp checkers enforce aligned `seccomp_data` loads and
+  forward jumps and reject packet loads and MOD. A listener request selects a free fd below the soft
+  limit before checking the current mode. The mode must be disabled or filter; a second listener
   `EBUSY`; total converted length plus 4 per filter over 32768 `ENOMEM`; TSYNC requires every other
   thread to be disabled or on an ancestor chain (else that thread's tid in the caller's pid
   namespace, or `ESRCH` with `TSYNC_ESRCH` or when the caller cannot see it). The always-allow bitmap is built (ANDed with the previous filter's) and the filter
@@ -207,7 +211,8 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   (newest first) on `seccomp_data` (nr, `AUDIT_ARCH_AARCH64`, pc, original x0 and x1..x5) and the
   most severe action wins (ties: the newer filter). Actions: ERRNO (capped at 4095), TRAP (`SIGSYS`
   with syscall/arch/address), TRACE (`PTRACE_EVENT_SECCOMP` stop and re-check, or `ENOSYS` without
-  a tracer), USER_NOTIF, LOG, ALLOW, KILL_THREAD (or KILL_PROCESS when it is the last live
+  `PTRACE_O_TRACESECCOMP` enabled). The recheck uses the captured chain and changed registers, and a second TRACE
+  continues without repeating the ptrace stop. Other actions include USER_NOTIF, LOG, ALLOW, KILL_THREAD (or KILL_PROCESS when it is the last live
   thread), KILL_PROCESS and unknown actions (fatal `SIGSYS` with core dump). Logged actions
   (including `USER_NOTIF` and `TRACE` when `SECCOMP_FILTER_FLAG_LOG` is set, filtered by
   `actions_logged`) emit Linux-style `audit: type=1326` records at `KERN_NOTICE` to the guest
@@ -257,14 +262,11 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ## Confirmed bugs / technical debt
 
-None.
+- Installing a seccomp notification listener can leave an active filter after the syscall
+  reports failure. The installer chooses an fd before publishing the chain but grows the fd
+  table afterward. If the growth fails, the caller and any synchronized peers retain the chain
+  without the requested listener. User notifications on that filter then return `ENOSYS`.
 
 ## Open questions
 
 None.
-
-## To verify
-
-- The Linux 6.1 comparisons above (`access_override_creds`, `cap_ptrace_access_check`,
-  `inode_owner_or_capable`, `vfs_prepare_mode`, `ptracer_capable`) come from the
-  verifiers' knowledge of the kernel source, not from a side-by-side reading or a differential test.

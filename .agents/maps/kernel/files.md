@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/files.md` for the paired decision history (it still holds the decisions on file data I/O, clones/unsharing, size changes and syncing made before they were split out into `kernel/fileio`; pre-split decisions from `kernel/vfs` are D5, D17, D26, D27, D34, D41, D44, D55, the owner half of D25, the `open_pseudo` half of D19 and the open-check parts of D36 in `.agents/decisions/kernel/vfs.md`).
 >
-> Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
->
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: implement Linux 6.1 `O_TMPFILE` support for store and tmpfs directories, and pin weak `Mm` on `/proc/<pid>/environ`)
+> Verified: 2026-11-26 (full mapping, 15 claims independently checked across fd allocation and close, path and handle opens, inode flags, render submission and fences)
 
 ## Responsibilities
 
@@ -13,7 +11,7 @@
 
 - fd tables and open file descriptions, open flags, `fcntl` and the generic ioctls;
 - opening a path (the checks and the file each node kind gives), magic-link reopens, file handles
-  and `memfd_create`, and each open file's inotify `Opened` record;
+  and `memfd_create`, and the dentry records used for inotify;
 - opening character devices by device number, random ioctls, and render-node DRM ioctls (`gpu.rs`,
   `syscall/gpu.rs`).
 
@@ -46,7 +44,7 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   `Kernel::seals`), `ovl` and `ovl_holds` (the overlay
   node behind a file opened through an overlay, and its `Hold`s), and old host handles kept until
   close: `ovl_lower` (after a copy-up) and `retired` (after `rehome`).
-- `FileKind` — Host, Regular, Directory, Path, Pipe, Device, Render, Pty, Socket, Epoll, EventFd,
+- `FileKind` — Host, Regular, Directory, Path, Pipe, Device, Render, GpuFence, Pty, Socket, Epoll, EventFd,
   TimerFd, SignalFd, Inotify, Pidfd, MessageQueue, SeccompNotify, Bpf, Proc, Fuse and FuseDev (a
   FUSE directory is a Directory with the daemon's handle). Regular carries `cow`: writable, but the
   handle only reads because the file shares its object, so its first change gives the file an
@@ -108,7 +106,9 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   `O_PATH|O_DIRECTORY|O_NOFOLLOW`), and every other open adds `O_LARGEFILE`. An `O_PATH` fd
   takes only `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD` and `F_GETFL` (else `EBADF`), and
   flock on it is `EBADF`. `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME`
-  (fasync registration on `O_ASYNC`, ownership check when enabling `O_NOATIME` on store or overlay files, no `O_DIRECT` check). Access mode 3 needs read and write permission but
+  (append-only inodes forbid changing `O_APPEND`, fasync registration follows `O_ASYNC`,
+  and enabling `O_NOATIME` checks ownership on store and overlay files). This call accepts
+  `O_DIRECT` without the open-time check. Access mode 3 needs read and write permission but
   makes the file neither readable nor writable (`OPEN_FMODE`). Unknown fcntl commands are `EINVAL`,
   counted as unimplemented paths.
 - Owners: `F_SETOWN`/`F_GETOWN` (translated by the dispatcher's `pid_args` in a non-initial pid
@@ -137,6 +137,11 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   Anything else is `ENOTTY`, counted as an unimplemented path unless Linux refuses it there too
   (terminal requests on other files).
 
+- `FS_IOC_GETFLAGS` reads supported inode flags on store-backed regular files and directories,
+  including overlay nodes. `FS_IOC_SETFLAGS` checks read-only state and ownership, requires
+  initial-namespace `CAP_LINUX_IMMUTABLE` to change protected flags, and rejects unsupported
+  bits. A successful change on an overlay operates on the upper inode after copy-up.
+
 ### Opening
 
 - `open_path_with` (openat, openat2, `create_exclusive`): resolve through `kernel/vfs` (openat2's
@@ -151,7 +156,8 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 - Store nodes (`open_store`), unless just created: symlink `ELOOP`; a directory with write access,
   `O_CREAT` or `O_TRUNC` `EISDIR`; a regular file with `O_TRUNC` `EROFS` on ro, else it adds
   `MAY_WRITE`; a regular file opened for writing on a read-only instance (`sb_rdonly`) `EROFS`
-  before DAC permission (`sb_permission`); devices on nodev `EACCES`; permission; the cgroup BPF
+  before DAC permission (`sb_permission`); devices on nodev `EACCES`; write permission on an immutable inode fails before DAC. After DAC,
+  append-only inodes reject truncation and writes opened without `O_APPEND`. Next comes the cgroup BPF
   device filter (not for device number 0); `O_NOATIME` by a non-owner without `CAP_FOWNER`
   `EPERM`; a regular file opened for writing on a read-only bind mount `EROFS`. Then always: the `O_DIRECT` rule; `EISDIR` for directories and `ENOTDIR`
   for `O_DIRECTORY` (after the checks above, where `do_open` checks before `may_open`); unless
@@ -183,39 +189,51 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   go to `reopen`/`reopen_exe`: a regular file checks seals (`kernel/fileio`) for `O_TRUNC` with a
   write mode, then gets `open_store`'s checks on the mount it was opened or run through
   (`StoreOpen::Reopened`, through a duplicate of its host handle, or a writable one opened through
-  the host's `/proc/self/fd`); pipes reopen a new end and host fds the same fd, with no check. The
+  the host's `/proc/self/fd`). Overlay write reopens also check the overlay mount and inode.
+  An anonymous pipe checks current inode permissions before creating its new end. A queue checks
+  its current permissions and rejects `O_DIRECTORY`. A host descriptor reuses its host fd. The
   new description takes the original's mount and display path (`/memfd:<name> (deleted)`,
-  `pipe:[<n>]`) and records an `Opened`; unlike the memfd it reopens it is not `pseudo`, so it
-  counts as a writer (exec `ETXTBSY`) as on Linux. Linked targets resolve to store or overlay
+  `pipe:[<n>]`) and records an `Opened` when the target has an inotify key. A writable reopen of a memfd lacks the original
+  `pseudo` flag and counts as a writer (exec `ETXTBSY`) as on Linux. Linked targets resolve to store or overlay
   nodes and get the normal checks. Named FIFO opens and reopens each retain a last-close record.
 - File handles: `name_to_handle_at` (`AT_SYMLINK_FOLLOW`, `AT_EMPTY_PATH`, and 6.5's
   `AT_HANDLE_FID` ignored) encodes store nodes only (else `EOPNOTSUPP`) as 8 bytes of type 1 holding
   the inode number, and returns the mount id; over 128 bytes is `EINVAL`, too small `EOVERFLOW`.
   `open_by_handle_at` needs `CAP_DAC_READ_SEARCH` in the initial user namespace (`EPERM`), a size
-  of 1 to 128 (`EINVAL`) and a mount fd on a store node; a wrong handle, a missing or unlinked
+  of 1 to 128 (`EINVAL`) and a store node from the mount fd or the cwd (`AT_FDCWD`); a wrong handle, a missing or unlinked
   inode, or an inode belonging to a different store/tmpfs superblock (`Vfs::store_sb_root` vs
   `Store::tree_root`) is `ESTALE`. It opens the inode on that mount through `open_store` with every
-  check, or as an `O_PATH` fd, emitting `IN_OPEN` (and `IN_MODIFY` on `O_TRUNC`) and attaching an
-  inotify `Opened` record, without a display path or validation of other open flags.
-- Opens through a path of a regular file, device, directory (store, overlay, FUSE, cgroup2), FUSE
-  file or cgroup2 file, as well as `open_by_handle_at`, `O_TMPFILE` and `memfd_create`, record an inotify
-  `Opened` (`kernel/inotify`), watches or not. `O_TMPFILE` (`open_tmpfile`, Linux 6.1's `do_tmpfile`/
+  check. An ordinary handle open reports `IN_OPEN` and truncation reports `IN_MODIFY` first.
+  An `O_PATH` handle open checks `O_DIRECTORY` and tracks the inode with a zero close mask.
+  Neither path sets a display path. For fdinfo and empty-path statx, `mnt_id` is the node’s
+  mount when there is a node and `ANON_MOUNT` otherwise.
+- File descriptions with an inotify file key retain a dentry record even when no watch exists.
+  This includes store and overlay regular files, named pipes or PTYs, supported devices and
+  directories, FUSE files and cgroup2 entries. A render description has a backing node but
+  no normal file-I/O watch key. A keyed `O_PATH` description retains a record with zero close
+  mask.
+- `O_TMPFILE` (`open_tmpfile`, Linux 6.1's `do_tmpfile`/
   `vfs_tmpfile`) is supported on store and tmpfs directories (invalid flag combinations `EINVAL`,
   non-directories `ENOTDIR`, read-only mounts `EROFS`, missing `MAY_WRITE|MAY_EXEC` `EACCES`,
   unsupported filesystems `EOPNOTSUPP`, `O_DIRECT` on tmpfs `EINVAL`); it creates an unlinked
-  `nlink == 0` regular file inheriting ownership/umask/default ACLs, tracks tmpfs quota in
+  `nlink == 0` regular file with caller fsuid and the requested permissions. Parent setgid affects group
+  ownership. Default ACL or umask shapes permissions, and inheritable inode flags are copied.
+  It tracks tmpfs quota in
   `Tmpfs::unlinked`, allows linking once via `linkat` (`AT_EMPTY_PATH` with `CAP_DAC_READ_SEARCH`,
   or `/proc/self/fd/N` with `AT_SYMLINK_FOLLOW`) unless `O_EXCL` was set, and reaps unlinked
   host objects via `Store::release_tmpfile` when the last reference closes. `O_DIRECT` (6.1's `direct_IO` check, before
-  the file's own open) passes regular files on mounts other than tmpfs, block devices and sockets;
-  directories, tmpfs files, character devices, FIFOs and synthetic files are `EINVAL`.
+  the file's own open) accepts regular files on mounts other than tmpfs, block devices and sockets;
+  opening a store socket still returns `ENXIO`. Directories, tmpfs files, character devices,
+  FIFOs and synthetic files are `EINVAL` for direct I/O.
 
 ### Character devices
 
 - `syscall/gpu.rs` handles render node 226:128. Each open file description owns its context,
   ring count and GEM handle table. Dup and fork share them. DRM version and capset queries precede
   context initialization. Blob creation provides an opaque mmap offset, execbuffer captures the
-  command and referenced mappings before unlocking, and GEM close removes the guest handle.
+  command and referenced mappings before unlocking for host submission. A requested output
+  fence gets a read-only, close-on-exec, pollable `GpuFence` descriptor. Failure to copy the
+  result back closes that descriptor. GEM close removes the guest handle.
   Host operations use the `Renderer`, `Context` and `Mapping` interfaces in `gpu.rs`.
 - Opening dispatches by device number for store and overlay nodes anywhere and handle opens (device
   nodes in FUSE filesystems are `ENXIO`), after nodev (`EACCES`), permission and the cgroup BPF
@@ -279,8 +297,9 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   kept for an overlay file's store inode (changes go through a copy-up), every open file naming an
   overlay node holds it, and a syscall that waits while keeping a looked-up node stays out of
   `waits_on_files_only`.
-- Every open records an `Opened` (`kernel/inotify`), and file operations added here call its hooks
-  where Linux's fsnotify does, passing an overlay node's key (`key_of`).
+- Eligible keyed descriptions retain an `Opened` even with no active watch. Its dentry follows
+  renames and its key identifies the overlay when the open came through one. A host stdio fd or
+  GPU fence has no such record.
 - `kernel/aio`'s `has_iter` and `has_fsync` must follow new `FileKind`s and devices.
 - `open_store` skips its checks only for a file this open created (`StoreOpen::Created`); reopens
   through `/proc/<pid>/fd` and `exe` get them, so a check added there must also hold for a nameless
@@ -289,10 +308,6 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   rules and `kernel/vfs`'s tmpfs hooks; no code may hold an `OpenFile` borrow across a BKL release
   or wait (`kernel/fileio`'s `rehome` skips borrowed descriptions), and handles retired by `rehome`
   or `follow_copy_up` stay on `OpenFile` until close.
-
-## Confirmed bugs / technical debt
-
-- None.
 
 ## Open questions
 

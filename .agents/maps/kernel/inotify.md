@@ -3,21 +3,19 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/inotify.md` for the paired decision history (decisions from before the split are D13, D46 and D51 in `.agents/decisions/kernel/vfs.md`).
 >
-> Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
->
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: report nsfs inode IDs via `node_ino`, check post-removal upper link count before overlay `IN_DELETE_SELF`, and forward overlay copy-up, hardlink, removal, rename and attribute events to upper-layer watches)
+> Verified: 2026-11-26 (full mapping, 12 claims independently checked across watch identity and limits, queue delivery, open and exec lifetimes, overlay and host events)
 
 ## Responsibilities
 
-`kernel/inotify` is inotify(7) inside the kernel layer. Every filesystem change passes through the
-kernel, so no host notification is used. It provides:
+`kernel/inotify` records guest filesystem events in memory. Syscalls report operations directly.
+The Android Files provider supplies a separate stream of store changes. The module owns:
 
 - instances (`inotify_init1`), their watches and event queues, the per-user limits and the reads;
 - the per-kernel registry of watches, keyed by store inode number or by the key of an overlay,
   FUSE or cgroup2 node;
 - the hooks the file syscalls call at Linux's fsnotify call sites, and the event sequences each
   reports;
-- the `Opened` record each open file carries, which gives fd-based events their directory and
+- the `Opened` record retained by eligible open file descriptions, which gives fd-based events their directory and
   name and reports `IN_CLOSE_*`;
 - replaying the Android Files app's changes as events (`host_change`), and cgroup2 file changes
   (`kernfs_modified`).
@@ -46,6 +44,8 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   mapping. It holds the file key, opening directory and name, close mask and unlinked flag
   (`IN_EXCL_UNLINK`). Its last reference reports `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE`.
   The registry indexes these records weakly by inode and record address.
+- `ExecOpens` — logical opens and header-read counts retained while a FUSE lookup suspends exec.
+  A retry reuses the matching prefix and closes the suffix when the key or dentry changes.
 - Keys: store inode numbers stay below 2^62; overlay nodes take top bits 10 (`overlay::key`, also
   the lock tables' key), FUSE nodes 11 (`fuse::key`), cgroup2 files and directories 01
   (`cgroup::key`).
@@ -59,7 +59,7 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   `unlinked`, `renamed`, `deleted`, `watched_at`, `key_of`.
 - `host_change` (the Files app's changes, from the machine's `store_changed`), `kernfs_modified`
   (cgroup2 file changes).
-- `Registry::watched` (the overlay sweep and FUSE's `in_use`), `Registry::watches` (cgroup observation);
+- `Registry::has_open` (store inode cleanup), `Registry::watched` (the overlay sweep and FUSE's `in_use`), `Registry::watches` (cgroup observation);
   `Inotify::ready`, `queued`, `pending` and `fdinfo` (`kernel/poll`, `kernel/procfs`).
 
 ## Data flow / lifecycle
@@ -71,7 +71,8 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   instances, 2^20 watches, 16384 queued events).
 - Watches are keyed by store inode number, an overlay node's key, a FUSE node's key or a cgroup2
   node's key, whose changes `kernel/cgroup` reports as `IN_MODIFY`; watches on other synthetic
-  nodes are accepted, counted and never report. `inotify_add_watch` unwraps `/proc/<pid>/fd/*`
+  nodes are accepted and counted. They receive no filesystem activity events. Explicit removal
+  still queues `IN_IGNORED`. `inotify_add_watch` unwraps `/proc/<pid>/fd/*`
   (`OpenFd`) and `/proc/<pid>/exe` (`OpenExe`) magic links to watch the underlying store/overlay/
   FUSE inode (including memfds and unlinked files, checking `MAY_READ` against `store.attrs`), and
   records store-node `sdev` from `vfs.dev_of(&node)` so tmpfs watches show their tmpfs device in
@@ -82,16 +83,18 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   existing watch replaces its mask, merges it with `IN_MASK_ADD`, or fails with `EEXIST` for
   `IN_MASK_CREATE`. Other flags include `IN_ONLYDIR`, `IN_DONT_FOLLOW`, `IN_EXCL_UNLINK` and
   `IN_ONESHOT`.
-- read returns whole events (`EINVAL` if the first does not fit) and blocks unless nonblocking;
+- read returns whole events (`EINVAL` if the first does not fit) and waits on the instance when empty. An empty nonblocking
+  read returns `EAGAIN` and an interrupted wait returns `ERESTARTSYS`;
   `FIONREAD`, poll readiness and fdinfo read the instance. No fanotify (`ENOSYS`), no dnotify.
 
 ### Reporting
 
-- With no watches every hook costs one emptiness check. An event goes first to the parent
+- Delivery skips the watch lookup when no keyed watch exists. A path event goes first to the parent
   directory's watches with the name (not for `*_SELF`), then to the inode's own. A full queue
   drops events and queues one `IN_Q_OVERFLOW` before checking duplicate tail merges; otherwise
-  identical consecutive events merge. `IN_IGNORED` follows removal, `IN_DELETE_SELF` and a matching
-  `IN_ONESHOT`. Directory events carry `IN_ISDIR`, `IN_DELETE_SELF` and `IN_MOVE_SELF` never do.
+  matching consecutive events can merge. Removal queues `IN_IGNORED` even when the watch
+  omitted `IN_DELETE_SELF`. A matching one-shot event also removes the watch. The ignored
+  record goes through the same capacity check as other queued records. Directory events carry `IN_ISDIR`, `IN_DELETE_SELF` and `IN_MOVE_SELF` never do.
 - Hooks follow the fsnotify call sites: open (`IN_CREATE`, or `IN_MODIFY` for any truncating open
   including `O_RDONLY|O_TRUNC`, then `IN_OPEN`), mkdir, mknod, symlink and AF_UNIX bind, link
   (`IN_ATTRIB` on the source, then `IN_CREATE`), unlink (`IN_ATTRIB`, delete-self, `IN_DELETE`),
@@ -113,7 +116,7 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   exist (`watched_at`, falling back to a FUSE node's recorded parent/name if cached attrs staled).
   fd-based events (I/O, truncation, close) go to the directory and name the open went through,
   recorded in `Opened` (the dentry a Linux open file references): every non-`O_PATH` open of a
-  regular file, named FIFO, device or directory (store, overlay, FUSE, cgroup2), FUSE file or
+  regular file, named FIFO, node-backed PTY, `FileKind::Device` or keyed directory, FUSE file or
   cgroup2 file — as well as `open_by_handle_at` and `memfd_create` — records one, whether or not
   watches exist. Store, overlay and FUSE `O_PATH` fds track the dentry with a zero close mask and
   emit no open or close event. A reopened FIFO gets its own record at the original dentry; memfds
@@ -126,7 +129,8 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   through. Header reads report access even on an executable cache hit. An empty file or a file
   rejected with `ETXTBSY` reports open and close without access. The address space retains
   the main open and the interpreter's non-overlay file mappings retain theirs. Watches added after exec
-  can therefore receive the last close.
+  can therefore receive the last close. A suspended exec reuses logical opens and their read
+  counts on retry, so repeating the same prefix does not replay its notifications.
 - `IN_DELETE_SELF` waits until the last open file of the removed name closes (`deleted`); removing
   the last watch on a key (`inotify_rm_watch`, instance drop, or one-shot/`IN_DELETE_SELF`
   delivery) removes any pending `doomed` entry.
@@ -173,13 +177,14 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
 - `kernel/vfs`: `Node`, path resolution (`read_path`, `watched_at`'s second walk), overlay and
   FUSE keys; `kernel/files`: `OpenFile`; `kernel/fileio`: `host_unshared`.
 - `kernel/store`: the `Change` records of the browse API.
-- Credentials: `MAY_READ` permission on the watched node.
+- Credentials supply the final `MAY_READ` check on store, overlay and FUSE targets.
 - The kernel's wake objects (`request_wake_object`).
 
 ## Invariants and gotchas
 
-- Keep the no-watch cost at one emptiness check per event: hooks that need extra lookups (the
-  second walk, the directory of an open) must test `active` first.
+- Skip a second notification-only path walk when `active` is false. Open-record bookkeeping,
+  rename and unlink tracking, inode retention and provider rehoming also serve later watches or
+  other kernel consumers and continue with an empty watch registry.
 - A hook given the store inode behind something reached through an overlay reports to the layer,
   where no overlay watch sees it, so overlay paths must pass the node's key (`key_of`,
   `file_key`).
@@ -205,6 +210,10 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   `IN_DELETE_SELF` on the last remaining link (where Linux 6.1 with `index=off` drops the new
   link's dentry on `ovl_link` so the original overlay inode's `i_nlink` stays elevated and never
   emits `IN_DELETE_SELF`).
+
+## Open questions
+
+None.
 
 ## To verify
 
