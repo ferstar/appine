@@ -246,6 +246,8 @@ pub struct OpenFile {
     pub(crate) mq_path: Option<Rc<RefCell<crate::syscall::MessageQueue>>>,
     /// Keeps an O_PATH node in the FUSE cache for the lifetime of the description.
     fuse_path: Option<Rc<()>>,
+    /// Keeps a namespace file's stashed nsfs dentry/inode alive while open (`ns->stashed`).
+    ns_pin: Option<crate::syscall::NsPin>,
     /// The kind.
     pub kind: FileKind,
     /// Access mode and status flags (without `O_CLOEXEC`).
@@ -342,6 +344,7 @@ impl OpenFile {
             path_object: None,
             mq_path: None,
             fuse_path: None,
+            ns_pin: None,
             kind,
             flags: flags & !oflags::O_CLOEXEC,
             pos: 0,
@@ -374,6 +377,17 @@ impl OpenFile {
             self.fuse_path = Some(node.pin_path());
         }
         Ok(())
+    }
+
+    pub(crate) fn pin_ns(&mut self, k: &crate::kernel::Kernel) {
+        if let FileKind::Proc {
+            node: PseudoNode::NsFile(_, id),
+            ..
+        }
+        | FileKind::Path(Node::Pseudo(_, PseudoNode::NsFile(_, id))) = self.kind
+        {
+            self.ns_pin = Some(crate::syscall::pin_ns(k, id));
+        }
     }
 
     /// Whether it is readable.

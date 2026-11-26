@@ -541,6 +541,7 @@ pub(super) fn ioctl(
         crate::fd::oflags::O_RDONLY,
         Some(Rc::from(name.into_bytes())),
     );
+    file.borrow_mut().pin_ns(cx.kr());
     cx.install_fd(file, true).map(|fd| fd as u64)
 }
 

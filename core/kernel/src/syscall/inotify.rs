@@ -86,20 +86,72 @@ struct Watch {
     ino: Ino,
     /// The filesystem device in the kernel's internal encoding.
     sdev: u64,
+    /// For nsfs watches, the stashed nsfs inode instance at watch creation time (0 for non-nsfs).
+    /// Linux's `fs/nsfs.c` drops an nsfs dentry as soon as no open fd or mount pins it, so a later
+    /// lookup allocates a fresh inode and gets a new watch descriptor while earlier watches stay
+    /// alive on their own inodes.
+    ns_instance: u64,
 }
 
 impl Watch {
     /// Bind mounts share a watch. Store, overlay and FUSE node IDs are unique across
     /// instances, while the same synthetic node can occur on separate superblocks.
+    /// Namespace files share a watch only when both lookups hit the same pinned nsfs inode
+    /// instance (including `pid` and `pid_for_children`, or `time` and `time_for_children`,
+    /// pointing at the same namespace).
     fn same_inode(&self, other: &Watch) -> bool {
         match (&self.node, &other.node) {
             (Node::Store(_, a), Node::Store(_, b))
             | (Node::Overlay(_, a), Node::Overlay(_, b))
             | (Node::Fuse(_, a), Node::Fuse(_, b)) => a == b,
+            (
+                Node::Pseudo(_, crate::pseudo::PseudoNode::NsFile(_, a)),
+                Node::Pseudo(_, crate::pseudo::PseudoNode::NsFile(_, b)),
+            ) => a == b && self.sdev == other.sdev && self.ns_instance == other.ns_instance,
             (Node::Pseudo(_, a), Node::Pseudo(_, b)) => a == b && self.sdev == other.sdev,
             _ => false,
         }
     }
+}
+
+/// Keeps an nsfs dentry/inode instance stashed in [`Registry::ns_stashed`] while an open file
+/// description or nsfs mount references it (Linux's `ns->stashed`). Dropping the last pin clears
+/// the stashed entry without invalidating existing watches on that inode.
+#[derive(Clone)]
+pub(crate) struct NsPin(Rc<NsPinInner>);
+
+struct NsPinInner {
+    registry: Weak<RefCell<Registry>>,
+    ns_id: u64,
+    instance: u64,
+}
+
+impl std::fmt::Debug for NsPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NsPin")
+            .field("ns_id", &self.0.ns_id)
+            .field("instance", &self.0.instance)
+            .finish()
+    }
+}
+
+impl Drop for NsPinInner {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade()
+            && let Ok(mut r) = registry.try_borrow_mut()
+            && r.ns_stashed
+                .get(&self.ns_id)
+                .is_some_and(|w| w.strong_count() == 0)
+        {
+            r.ns_stashed.remove(&self.ns_id);
+        }
+    }
+}
+
+/// Pins the stashed nsfs dentry/inode for namespace `ns_id` (reusing the active instance if one is
+/// already pinned by another open fd or nsfs mount, otherwise creating a fresh one).
+pub(crate) fn pin_ns(k: &Kernel, ns_id: u64) -> NsPin {
+    Registry::pin_ns(&k.inotify, ns_id)
 }
 
 #[derive(PartialEq)]
@@ -355,11 +407,18 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
         }
         _ => {}
     }
+    let ns_instance = match &node {
+        Node::Pseudo(_, crate::pseudo::PseudoNode::NsFile(_, id)) => {
+            cx.kr().inotify.borrow_mut().ns_instance(*id)
+        }
+        _ => 0,
+    };
     let watch = Watch {
         node,
         mask: mask & (IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT),
         ino,
         sdev,
+        ns_instance,
     };
     let mut i = inotify.borrow_mut();
     // The same object already has a watch: change its mask (merged with IN_MASK_ADD)
@@ -490,6 +549,10 @@ pub struct Registry {
     doomed: HashMap<Ino, Vec<Weak<OpenRecord>>>,
     /// Live file descriptions, including files held by exec rather than in an fd table.
     opened: BTreeMap<(Ino, usize), Weak<OpenRecord>>,
+    /// Currently stashed nsfs dentry/inode instance per namespace id (Linux's `ns->stashed`).
+    ns_stashed: HashMap<u64, Weak<NsPinInner>>,
+    /// Monotonic identifier assigned to each newly instantiated nsfs inode.
+    next_ns_instance: u64,
 }
 
 impl Default for Registry {
@@ -503,11 +566,37 @@ impl Default for Registry {
             max_watches: MAX_WATCHES,
             doomed: HashMap::new(),
             opened: BTreeMap::new(),
+            ns_stashed: HashMap::new(),
+            next_ns_instance: 0,
         }
     }
 }
 
 impl Registry {
+    fn pin_ns(registry: &Rc<RefCell<Registry>>, ns_id: u64) -> NsPin {
+        let mut r = registry.borrow_mut();
+        if let Some(existing) = r.ns_stashed.get(&ns_id).and_then(Weak::upgrade) {
+            return NsPin(existing);
+        }
+        r.next_ns_instance += 1;
+        let instance = r.next_ns_instance;
+        let inner = Rc::new(NsPinInner {
+            registry: Rc::downgrade(registry),
+            ns_id,
+            instance,
+        });
+        r.ns_stashed.insert(ns_id, Rc::downgrade(&inner));
+        NsPin(inner)
+    }
+
+    fn ns_instance(&mut self, ns_id: u64) -> u64 {
+        if let Some(existing) = self.ns_stashed.get(&ns_id).and_then(Weak::upgrade) {
+            existing.instance
+        } else {
+            self.next_ns_instance += 1;
+            self.next_ns_instance
+        }
+    }
     fn opens_of(&self, ino: Ino) -> impl Iterator<Item = Rc<OpenRecord>> + '_ {
         self.opened
             .range((ino, 0)..=(ino, usize::MAX))
@@ -1161,6 +1250,7 @@ mod tests {
                 mask,
                 ino,
                 sdev: 0x80_0001,
+                ns_instance: 0,
             },
         );
         r.by_ino
@@ -1438,5 +1528,63 @@ mod tests {
         crate::cgroup::write(&mut k, &writer, (parent, b"cgroup.freeze"), b"0\n").unwrap();
         crate::cgroup::notify_changes(&mut k);
         assert_eq!(events(&i), vec![(wd, IN_MODIFY, b"cgroup.events".to_vec())]);
+    }
+
+    #[test]
+    fn nsfs_watch_identity_follows_stashed_pin_lifetime() {
+        use crate::pseudo::{NsKind, PseudoNode};
+
+        let registry = Rc::new(RefCell::new(Registry::default()));
+        let make_watch = |kind: NsKind, ns_id: u64| Watch {
+            node: Node::Pseudo(crate::vfs::PROC_MOUNT, PseudoNode::NsFile(kind, ns_id)),
+            mask: IN_ALL_EVENTS,
+            ino: ns_id,
+            sdev: crate::vfs::Fs::Nsfs.dev(),
+            ns_instance: registry.borrow_mut().ns_instance(ns_id),
+        };
+
+        // Unpinned: each lookup allocates a distinct nsfs inode instance and does not stash.
+        let ns_id = 4_026_531_840;
+        let w1 = make_watch(NsKind::Mnt, ns_id);
+        let w2 = make_watch(NsKind::Mnt, ns_id);
+        assert!(!w1.same_inode(&w2));
+        assert!(registry.borrow().ns_stashed.is_empty());
+
+        // Pinning stashes one instance; lookups while pinned match it (and not prior unpinned
+        // watches). Dropping one of two pins keeps the stashed instance alive.
+        let pin1 = Registry::pin_ns(&registry, ns_id);
+        let pin2 = Registry::pin_ns(&registry, ns_id);
+        let w3 = make_watch(NsKind::Mnt, ns_id);
+        let w4 = make_watch(NsKind::Mnt, ns_id);
+        assert!(!w1.same_inode(&w3));
+        assert!(w3.same_inode(&w4));
+
+        // Same namespace reached via pid vs pid_for_children shares the stashed inode.
+        let pid_ns_id = 4_026_531_836;
+        let pid_pin = Registry::pin_ns(&registry, pid_ns_id);
+        let wp1 = make_watch(NsKind::Pid, pid_ns_id);
+        let wp2 = make_watch(NsKind::PidForChildren, pid_ns_id);
+        assert!(wp1.same_inode(&wp2));
+        drop(pid_pin);
+        assert!(!registry.borrow().ns_stashed.contains_key(&pid_ns_id));
+
+        drop(pin1);
+        let w5 = make_watch(NsKind::Mnt, ns_id);
+        assert!(w3.same_inode(&w5));
+
+        // Dropping the last pin clears ns_stashed; later unpinned and re-pinned lookups get fresh
+        // instances that do not match w3.
+        drop(pin2);
+        assert!(registry.borrow().ns_stashed.is_empty());
+        let w6 = make_watch(NsKind::Mnt, ns_id);
+        assert!(!w3.same_inode(&w6));
+
+        let pin3 = Registry::pin_ns(&registry, ns_id);
+        let w7 = make_watch(NsKind::Mnt, ns_id);
+        let w8 = make_watch(NsKind::Mnt, ns_id);
+        assert!(!w3.same_inode(&w7));
+        assert!(w7.same_inode(&w8));
+        drop(pin3);
+        assert!(registry.borrow().ns_stashed.is_empty());
     }
 }

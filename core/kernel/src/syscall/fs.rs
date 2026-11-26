@@ -705,6 +705,7 @@ fn open_path_with(
         f.path_object = path_object;
         f.mq_path = mq_path;
         f.pin_fuse_path(&vfs)?;
+        f.pin_ns(cx.kr());
         if let Some(mnt) = opened_mnt {
             f.mnt = mnt;
         }

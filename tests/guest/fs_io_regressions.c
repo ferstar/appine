@@ -2473,6 +2473,151 @@ static void test_inotify_handle_memfd_cgroup_tmpfs(void)
     unlink(tfile);
 }
 
+#ifndef NS_GET_USERNS
+#define NS_GET_USERNS _IO(0xb7, 0x1)
+#endif
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 1
+#endif
+#ifndef OPEN_TREE_CLOEXEC
+#define OPEN_TREE_CLOEXEC O_CLOEXEC
+#endif
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+
+/* kernel/inotify: nsfs watch lifetime follows Linux's ns->stashed dentry/inode lifecycle. */
+static void test_inotify_nsfs_watch_lifetime(void)
+{
+    struct ino_ev evs[16];
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    CHECK(ifd >= 0, "inotify_init1 nsfs");
+
+    /* 1. Unpinned: repeated watches on /proc/self/ns/mnt yield distinct wds, no IN_IGNORED,
+     * IN_MASK_CREATE succeeds, and each watch stays removable with IN_IGNORED. */
+    int wd1 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS);
+    int wd2 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS);
+    int wd3 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS | IN_MASK_CREATE);
+    CHECK(wd1 >= 0 && wd2 >= 0 && wd3 >= 0, "unpinned nsfs add_watch");
+    CHECK(wd1 != wd2 && wd2 != wd3 && wd1 != wd3,
+          "unpinned nsfs watches must get distinct wds: %d %d %d", wd1, wd2, wd3);
+    CHECK(read_inotify_events(ifd, evs, 16) == 0, "unpinned nsfs add_watch must not emit events");
+
+    /* Verify all three watches appear in fdinfo before removal. */
+    char fipath[64], fibuf[2048];
+    snprintf(fipath, sizeof fipath, "/proc/self/fdinfo/%d", ifd);
+    read_proc_str(fipath, fibuf, sizeof fibuf);
+    char want1[32], want2[32], want3[32];
+    snprintf(want1, sizeof want1, "inotify wd:%x ", wd1);
+    snprintf(want2, sizeof want2, "inotify wd:%x ", wd2);
+    snprintf(want3, sizeof want3, "inotify wd:%x ", wd3);
+    CHECK(strstr(fibuf, want1) && strstr(fibuf, want2) && strstr(fibuf, want3),
+          "fdinfo missing unpinned nsfs wds:\n%s", fibuf);
+
+    CHECK(inotify_rm_watch(ifd, wd1) == 0, "rm unpinned wd1");
+    size_t n = read_inotify_events(ifd, evs, 16);
+    CHECK(n == 1 && evs[0].wd == wd1 && evs[0].mask == IN_IGNORED,
+          "rm wd1 IN_IGNORED (n=%zu wd=%d mask=0x%x)", n, evs[0].wd, evs[0].mask);
+    CHECK(inotify_rm_watch(ifd, wd2) == 0, "rm unpinned wd2");
+    CHECK(inotify_rm_watch(ifd, wd3) == 0, "rm unpinned wd3");
+    (void)read_inotify_events(ifd, evs, 16);
+
+    /* 2. Open fd pins the stashed nsfs inode: repeated watches (and /proc/self/fd/<n>) reuse the
+     * wd and IN_MASK_CREATE returns EEXIST; closing does not emit IN_IGNORED, and subsequent
+     * lookups get a fresh wd (both unpinned and after reopening). */
+    int w_before = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS);
+    int nsfd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+    CHECK(w_before >= 0 && nsfd >= 0, "open /proc/self/ns/mnt");
+    int wp1 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS);
+    int wp2 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS);
+    CHECK(wp1 >= 0 && wp1 != w_before && wp2 == wp1,
+          "fd-pinned nsfs watch: before=%d wp1=%d wp2=%d", w_before, wp1, wp2);
+    CHECK_ERRNO(inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS | IN_MASK_CREATE),
+                EEXIST, "fd-pinned nsfs IN_MASK_CREATE must fail with EEXIST");
+    char fdpath[64];
+    snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", nsfd);
+    int wp_fd = inotify_add_watch(ifd, fdpath, IN_ALL_EVENTS);
+    CHECK(wp_fd == wp1, "fd-pinned via /proc/self/fd must reuse wd: %d vs %d", wp_fd, wp1);
+    close(nsfd);
+    CHECK(read_inotify_events(ifd, evs, 16) == 0,
+          "closing pinning nsfs fd must not emit IN_IGNORED");
+    int wp3 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS);
+    CHECK(wp3 >= 0 && wp3 != wp1, "after close, nsfs watch must get new wd: %d vs %d", wp3, wp1);
+    CHECK(inotify_rm_watch(ifd, wp1) == 0, "old pinned wd1 must still be removable after close");
+    n = read_inotify_events(ifd, evs, 16);
+    CHECK(n == 1 && evs[0].wd == wp1 && evs[0].mask == IN_IGNORED, "rm old pinned wd1 IN_IGNORED");
+
+    /* Reopen after close creates a fresh stashed inode distinct from earlier watches. */
+    int nsfd2 = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+    CHECK(nsfd2 >= 0, "reopen /proc/self/ns/mnt");
+    int wr1 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS);
+    int wr2 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS);
+    CHECK(wr1 >= 0 && wr1 != wp3 && wr2 == wr1,
+          "reopened fd-pinned nsfs watch: wp3=%d wr1=%d wr2=%d", wp3, wr1, wr2);
+    close(nsfd2);
+
+    /* 3. O_PATH fd and pid/pid_for_children alias pinning. */
+    int pfd = open("/proc/self/ns/pid", O_PATH | O_CLOEXEC);
+    CHECK(pfd >= 0, "open O_PATH /proc/self/ns/pid");
+    int pid_w1 = inotify_add_watch(ifd, "/proc/self/ns/pid", IN_ALL_EVENTS);
+    int pid_w2 = inotify_add_watch(ifd, "/proc/self/ns/pid_for_children", IN_ALL_EVENTS);
+    CHECK(pid_w1 >= 0 && pid_w2 == pid_w1,
+          "O_PATH pid & pid_for_children must share wd: %d vs %d", pid_w1, pid_w2);
+    close(pfd);
+    int pid_w3 = inotify_add_watch(ifd, "/proc/self/ns/pid", IN_ALL_EVENTS);
+    CHECK(pid_w3 >= 0 && pid_w3 != pid_w1, "after O_PATH close, pid watch must get new wd");
+
+    /* 4. NS_GET_USERNS pins /proc/self/ns/user while open. */
+    int mfd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+    CHECK(mfd >= 0, "open mnt for NS_GET_USERNS");
+    int ufd = ioctl(mfd, NS_GET_USERNS);
+    CHECK(ufd >= 0, "ioctl NS_GET_USERNS");
+    int uw1 = inotify_add_watch(ifd, "/proc/self/ns/user", IN_ALL_EVENTS);
+    int uw2 = inotify_add_watch(ifd, "/proc/self/ns/user", IN_ALL_EVENTS);
+    CHECK(uw1 >= 0 && uw2 == uw1, "NS_GET_USERNS must pin user nsfs watch: %d vs %d", uw1, uw2);
+    close(ufd);
+    close(mfd);
+    int uw3 = inotify_add_watch(ifd, "/proc/self/ns/user", IN_ALL_EVENTS);
+    CHECK(uw3 >= 0 && uw3 != uw1, "after closing NS_GET_USERNS fd, user watch gets new wd");
+
+    /* 5. Bind-mount pinning (and hand-off from open fd to bind mount until umount). */
+    const char *bind_path = "/tmp/ino_nsfs_bind_uts";
+    write_file_bytes(bind_path, "", 0, 0644);
+    int uts_fd = open("/proc/self/ns/uts", O_RDONLY | O_CLOEXEC);
+    CHECK(uts_fd >= 0, "open /proc/self/ns/uts");
+    CHECK(mount("/proc/self/ns/uts", bind_path, NULL, MS_BIND, NULL) == 0, "bind mount uts ns");
+    int bw1 = inotify_add_watch(ifd, "/proc/self/ns/uts", IN_ALL_EVENTS);
+    int bw2 = inotify_add_watch(ifd, bind_path, IN_ALL_EVENTS);
+    CHECK(bw1 >= 0 && bw2 == bw1, "bind-mounted nsfs must share wd: %d vs %d", bw1, bw2);
+    close(uts_fd);
+    int bw3 = inotify_add_watch(ifd, "/proc/self/ns/uts", IN_ALL_EVENTS);
+    CHECK(bw3 == bw1, "bind mount must keep nsfs pinned after fd close: %d vs %d", bw3, bw1);
+    CHECK(umount(bind_path) == 0, "umount uts ns bind");
+    CHECK(read_inotify_events(ifd, evs, 16) == 0, "umount nsfs bind must not emit IN_IGNORED");
+    int bw4 = inotify_add_watch(ifd, "/proc/self/ns/uts", IN_ALL_EVENTS);
+    CHECK(bw4 >= 0 && bw4 != bw1, "after umount, uts watch must get new wd: %d vs %d", bw4, bw1);
+    unlink(bind_path);
+
+    /* 6. open_tree(OPEN_TREE_CLONE) pins nsfs until closed; IN_DONT_FOLLOW watches the procfs
+     * symlink itself and always reuses its wd. */
+    int tfd = (int)syscall(SYS_open_tree, AT_FDCWD, "/proc/self/ns/ipc",
+                           OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+    CHECK(tfd >= 0, "open_tree(OPEN_TREE_CLONE) on /proc/self/ns/ipc");
+    int tw1 = inotify_add_watch(ifd, "/proc/self/ns/ipc", IN_ALL_EVENTS);
+    int tw2 = inotify_add_watch(ifd, "/proc/self/ns/ipc", IN_ALL_EVENTS);
+    CHECK(tw1 >= 0 && tw2 == tw1, "open_tree(CLONE) must pin ipc nsfs: %d vs %d", tw1, tw2);
+    close(tfd);
+    int tw3 = inotify_add_watch(ifd, "/proc/self/ns/ipc", IN_ALL_EVENTS);
+    CHECK(tw3 >= 0 && tw3 != tw1, "after closing open_tree fd, ipc watch gets new wd");
+
+    int df1 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS | IN_DONT_FOLLOW);
+    int df2 = inotify_add_watch(ifd, "/proc/self/ns/mnt", IN_ALL_EVENTS | IN_DONT_FOLLOW);
+    CHECK(df1 >= 0 && df2 == df1,
+          "IN_DONT_FOLLOW watches procfs symlink and must reuse wd: %d vs %d", df1, df2);
+
+    close(ifd);
+}
+
 /* kernel/pipe: splice ESPIPE before EBADF, O_PATH EBADF, and unseekable offsets EINVAL before
  * waiting for pipe room or data. */
 static void test_splice_order_and_unseekable_offsets(void)
@@ -2888,6 +3033,7 @@ int main(int argc, char **argv)
     test_splice_procfs_and_pipe_fault_writes();
     test_protected_regular_fifos_and_pty_blksize();
     test_inotify_handle_memfd_cgroup_tmpfs();
+    test_inotify_nsfs_watch_lifetime();
     test_splice_order_and_unseekable_offsets();
     test_ro_mount_vs_sb_open_order();
     test_nr_open_fd_table_growth();

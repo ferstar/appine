@@ -376,6 +376,8 @@ pub(crate) struct Mount {
     pub expiring: bool,
     /// A namespace file bind-mounted elsewhere ([`Fs::Nsfs`]): it keeps that namespace alive.
     pub pin: Option<crate::nsproxy::NsRef>,
+    /// Keeps a bind-mounted or cloned nsfs file's stashed dentry/inode alive (`ns->stashed`).
+    pub ns_pin: Option<crate::syscall::NsPin>,
     /// Bits from [`lock`].
     pub locks: u64,
     /// Its propagation type: shared (in a peer group), a slave, unbindable ([`Propagation`]).
@@ -877,6 +879,7 @@ impl Mounts {
             source: source.to_vec(),
             expiring: false,
             pin: None,
+            ns_pin: None,
             locks: 0,
             prop: Propagation::default(),
             owner: None,
@@ -1562,6 +1565,7 @@ impl Vfs {
                 source: b"appine".to_vec(),
                 expiring: false,
                 pin: None,
+                ns_pin: None,
                 locks: 0,
                 prop: Propagation::default(),
                 owner: None,
@@ -2900,6 +2904,7 @@ impl Vfs {
             source: b"nsfs".to_vec(),
             expiring: false,
             pin: Some(pin),
+            ns_pin: None,
             locks: 0,
             prop: Propagation::default(),
             owner: None,
@@ -4054,6 +4059,7 @@ impl Vfs {
             source,
             expiring: false,
             pin: None,
+            ns_pin: None,
             locks: 0,
             prop,
             owner: None,
@@ -4121,6 +4127,7 @@ impl Vfs {
                 source: c.source.clone(),
                 expiring: false,
                 pin: c.pin.clone(),
+                ns_pin: c.ns_pin.clone(),
                 locks: c.locks,
                 prop: c.prop.of_bind(),
                 owner: c.owner.clone(),
@@ -7163,6 +7170,7 @@ mod tests {
                     source: Vec::new(),
                     expiring: false,
                     pin: None,
+                    ns_pin: None,
                     locks: 0,
                     prop: Propagation {
                         group: peer_group,

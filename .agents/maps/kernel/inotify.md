@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/inotify.md` for the paired decision history (decisions from before the split are D13, D46 and D51 in `.agents/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-26 (full mapping, 12 claims independently checked across watch identity and limits, queue delivery, open and exec lifetimes, overlay and host events)
+>
+> Maintained: 2026-11-26 (targeted refresh: nsfs watch lifetime via `NsPin` and `ns_stashed` matching Linux `fs/nsfs.c`)
 
 ## Responsibilities
 
@@ -38,8 +40,13 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
 - `Event` — descriptor, mask, cookie and name (padded to 16 bytes).
 - `Registry` (`Kernel::inotify`, one per kernel) — the (instance, descriptor) pairs on each key,
   the last rename cookie, instance and watch counts per user, the three limits under
-  `/proc/sys/fs/inotify/`, and the removed inodes whose `IN_DELETE_SELF` waits for files still open
-  through the removed name (cleaned up when all watches on the key disappear).
+  `/proc/sys/fs/inotify/`, the removed inodes whose `IN_DELETE_SELF` waits for files still open
+  through the removed name (cleaned up when all watches on the key disappear), and the weakly
+  tracked stashed nsfs inode instances (`ns_stashed`) with their monotonic instance counter.
+- `NsPin` — a shared pin held by open nsfs file descriptions (`OpenFile::ns_pin`, including
+  `O_PATH`, `open_tree` and `NS_GET_USERNS`/`NS_GET_PARENT` fds) and nsfs mounts (`Mount::ns_pin`,
+  bind mounts and `open_tree(OPEN_TREE_CLONE)` mounts), mirroring Linux's `ns->stashed`. Dropping
+  the last pin clears `ns_stashed` without removing existing watches.
 - `Opened` — a shared open record on a file description, an executed image or an ELF interpreter
   mapping. It holds the file key, opening directory and name, close mask and unlinked flag
   (`IN_EXCL_UNLINK`). Its last reference reports `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE`.
@@ -58,7 +65,7 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   `path_event_unlinked`, `file_event`, `file_io_event`, `dir_event`, `cookie`, `opened`,
   `unlinked`, `renamed`, `deleted`, `watched_at`, `key_of`.
 - `host_change` (the Files app's changes, from the machine's `store_changed`), `kernfs_modified`
-  (cgroup2 file changes).
+  (cgroup2 file changes), `pin_ns` (nsfs dentry/inode pinning from open nsfs files and nsfs mounts).
 - `Registry::has_open` (store inode cleanup), `Registry::watched` (the overlay sweep and FUSE's `in_use`), `Registry::watches` (cgroup observation);
   `Inotify::ready`, `queued`, `pending` and `fdinfo` (`kernel/poll`, `kernel/procfs`).
 
@@ -79,7 +86,12 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   fdinfo. Adding a watch needs read permission on what the store or the overlay shows (a FUSE node
   `fuse_permission`'s; synthetic nodes are not checked);
   bind aliases of a node share one descriptor per instance. Store, overlay and FUSE use their
-  respective node IDs; synthetic nodes are compared within their filesystem device. Adding an
+  respective node IDs; synthetic nodes are compared within their filesystem device. Namespace
+  files (`PseudoNode::NsFile`) additionally compare the live stashed nsfs inode instance
+  (`ns_instance`, keyed by namespace ID across aliases such as `pid`/`pid_for_children`): lookups
+  while an open fd or nsfs mount holds an `NsPin` share one descriptor, whereas unpinned lookups
+  (or lookups after the last pin drops) allocate a fresh instance and receive a new descriptor
+  while leaving earlier watches active and removable. Adding an
   existing watch replaces its mask, merges it with `IN_MASK_ADD`, or fails with `EEXIST` for
   `IN_MASK_CREATE`. Other flags include `IN_ONLYDIR`, `IN_DONT_FOLLOW`, `IN_EXCL_UNLINK` and
   `IN_ONESHOT`.
@@ -197,9 +209,6 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
 
 ## Confirmed bugs / technical debt
 
-- **Namespace-file watch lifetime:** repeated watches on `/proc/self/ns/mnt` reuse the descriptor
-  by namespace ID. Native Linux 6.8 returned a new descriptor on each lookup when no fd pinned
-  the nsfs inode, and reused it while an fd was open.
 - **Overlay upper-layer event gaps (intentionally left out):** overlay file I/O and open/close
   events (`IN_OPEN`, `IN_ACCESS`, `IN_MODIFY`, `IN_CLOSE_*`) are not duplicated to upper-layer
   watches (each `OpenFile` carries one `Opened` record keyed to the overlay node), copy-ups emit

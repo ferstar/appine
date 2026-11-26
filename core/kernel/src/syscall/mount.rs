@@ -680,9 +680,13 @@ fn bind_ns(
         return Err(Errno::ENOTDIR);
     }
     let targets = plan_attach(cx, vfs, (&target, at.as_ref()), 1, 1)?;
+    let ns_pin = super::inotify::pin_ns(cx.kr(), id);
     let fs = Fs::Nsfs;
     let id = vfs.add_mount(fs, src, (target, at), 0, b"nsfs".to_vec(), Some(fs.dev()));
-    vfs.update_mount(id, |m| m.pin = Some(ns));
+    vfs.update_mount(id, |m| {
+        m.pin = Some(ns);
+        m.ns_pin = Some(ns_pin);
+    });
     propagate(cx, vfs, id, &targets);
     Ok(0)
 }
@@ -1028,7 +1032,9 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
             // mount pinning the namespace. `mnt_ns_loop` is checked on attach in `move_tree`.
             let pinned = super::ns::find(cx.kr(), Some(&vfs), kind, ns_id).ok_or(Errno::ENOENT)?;
             let ns = alloc_anon_ns(cx, &vfs)?;
+            let ns_pin = super::inotify::pin_ns(cx.kr(), ns_id);
             let id = vfs.clone_ns_mount(&node, pinned, ns.id);
+            vfs.update_mount(id, |m| m.ns_pin = Some(ns_pin));
             (ns, id)
         } else {
             if vfs.propagation(node.mnt()).unbindable {
@@ -1072,6 +1078,7 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
         crate::fd::OpenFile::with_path(crate::fd::FileKind::Path(node), o_path, path)
     };
     file.borrow_mut().pin_fuse_path(&vfs)?;
+    file.borrow_mut().pin_ns(cx.kr());
     let cloexec = flags & OPEN_TREE_CLOEXEC != 0;
     Ok(cx.install_fd(file, cloexec)? as u64)
 }
