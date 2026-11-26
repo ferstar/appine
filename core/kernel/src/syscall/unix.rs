@@ -17,8 +17,8 @@ use crate::fd::FileRef;
 use crate::kernel::{Cx, Kernel, request_wake_object, wake};
 use crate::net::{AF_UNIX, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, Socket};
 use crate::unix::{
-    ChannelRef, DGRAM_MAX_LEN, Link, Name, Packet, Received, SOCK_SEQPACKET, SOCKADDR_UN_LEN,
-    SenderState, SendingRights, Ucred, UnixSocket, packet_truesize, unnamed,
+    ChannelRef, Link, Name, Packet, Received, SOCK_SEQPACKET, SOCKADDR_UN_LEN, SenderState,
+    SendingRights, Ucred, UnixSocket, dgram_max_len, stream_chunk_limit, unnamed,
 };
 use crate::vfs::Node;
 use crate::vfs::store::mode;
@@ -26,12 +26,14 @@ use crate::vfs::store::mode;
 const SOL_SOCKET: i32 = 1;
 const SO_TYPE: i32 = 3;
 const SO_ERROR: i32 = 4;
+const SO_SNDBUF: i32 = 7;
 const SO_PASSCRED: i32 = 16;
 const SO_PEERCRED: i32 = 17;
 const SO_SNDLOWAT: i32 = 19;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const SO_ACCEPTCONN: i32 = 30;
+const SO_SNDBUFFORCE: i32 = 32;
 const SO_PROTOCOL: i32 = 38;
 const SO_DOMAIN: i32 = 39;
 
@@ -391,6 +393,7 @@ pub(super) fn send(
             Link::Stream { rx, tx, .. } => Ok((tx.clone(), rx.borrow().passcred)),
             _ => Err(Errno::ENOTCONN),
         })?;
+        let sndbuf = outq.sndbuf();
         {
             let mut c = tx.borrow_mut();
             if c.eof || c.closed {
@@ -407,10 +410,10 @@ pub(super) fn send(
             }
             let cred = packet_cred(cx, declared, passcred || c.passcred);
             if ty == SOCK_SEQPACKET {
-                if data.len() > DGRAM_MAX_LEN {
+                if data.len() > dgram_max_len(sndbuf) {
                     return Err(Errno::EMSGSIZE);
                 }
-                if c.has_packet_room() {
+                if outq.has_room() {
                     c.push(packet(cx.k(), &tx, data, files, cred, &outq));
                     return Ok(data.len());
                 }
@@ -418,12 +421,16 @@ pub(super) fn send(
                 if data.is_empty() && files.is_none() {
                     return Ok(0);
                 }
-                // A stream socket may queue only part of it; open files go with the first part.
-                // Even a zero-byte send carrying SCM_RIGHTS must wait when the channel is full.
-                let n = c.space().min(data.len() - done);
-                if n > 0
-                    || (data.is_empty() && c.space() > 0 && (c.bytes > 0 || c.has_packet_room()))
-                {
+                // Linux's unix_stream_sendmsg checks sk_wmem_alloc < sk_sndbuf before allocating
+                // each chunk of up to min((sk_sndbuf >> 1) - 64, STREAM_MAX_CHUNK) bytes, charging
+                // its skb truesize to the sender. Open files go with the first chunk; zero-byte
+                // sends carrying SCM_RIGHTS still wait when the send buffer is full.
+                if outq.has_room() {
+                    let n = if data.is_empty() {
+                        0
+                    } else {
+                        (data.len() - done).min(stream_chunk_limit(sndbuf))
+                    };
                     c.push(packet(
                         cx.k(),
                         &tx,
@@ -440,7 +447,7 @@ pub(super) fn send(
                 }
             }
         }
-        if let Err(e) = block(cx, nonblock, deadline, &tx) {
+        if let Err(e) = block_on(cx, nonblock, deadline, &[wake::of(&tx), outq.wake_object()]) {
             return if done > 0 { Ok(done) } else { Err(e) };
         }
     }
@@ -573,7 +580,7 @@ fn send_dgram(
         }
         p.rx.clone()
     };
-    if data.len() > DGRAM_MAX_LEN {
+    if data.len() > dgram_max_len(outq.sndbuf()) {
         return Err(Errno::EMSGSIZE);
     }
     loop {
@@ -592,15 +599,15 @@ fn send_dgram(
             if c.eof {
                 return Err(Errno::EPIPE);
             }
-            // Room in the peer's queue (truesize budget) and, unless the receiver is connected
-            // back to this socket, below max_dgram_qlen (unix_dgram_sendmsg's unix_recvq_full wait)
-            if c.has_packet_room() && !c.holds_back(&own_rx) {
+            // Room in the sender's send buffer (sk_wmem_alloc < sk_sndbuf) and, unless the
+            // receiver is connected back to this socket, below max_dgram_qlen (unix_recvq_full).
+            if outq.has_room() && !c.holds_back(&own_rx) {
                 let cred = packet_cred(cx, declared, passcred || c.passcred);
                 c.push(packet(cx.k(), &rx, data, files, cred, &outq));
                 return Ok(data.len());
             }
         }
-        block(cx, nonblock, deadline, &rx)?;
+        block_on(cx, nonblock, deadline, &[wake::of(&rx), outq.wake_object()])?;
     }
 }
 
@@ -647,7 +654,7 @@ fn packet(
             .unwrap_or_default(),
         cred,
         from: Vec::new(),
-        outq: Some(sender.charge(packet_truesize(data.len()))),
+        outq: Some(sender.charge(sender.truesize(data.len()))),
     }
 }
 
@@ -744,8 +751,17 @@ fn recv_stream(
     control_len: usize,
     flags: u32,
 ) -> Result<(usize, Message), Errno> {
-    let wait_all = flags & MSG_WAITALL != 0 && !peek;
-    // Bytes and ancillary data already read under MSG_WAITALL.
+    // Linux's sock_rcvlowat(sk, flags & MSG_WAITALL, size): non-peek reads wait for at least
+    // min(SO_RCVLOWAT, max) bytes (or max under MSG_WAITALL) unless EOF, reset, rights, cred
+    // change, nonblocking/timeout or a signal ends the wait early.
+    let target = if peek {
+        0
+    } else if flags & MSG_WAITALL != 0 {
+        max
+    } else {
+        with(sock, |u| u.opts.rcvlowat()).min(max)
+    };
+    // Bytes and ancillary data already read while filling up to `target`.
     let mut part: Option<Received> = None;
     // Once this read takes credentials, their boundary survives a wait and any later option change.
     let mut checked_cred = None;
@@ -822,7 +838,7 @@ fn recv_stream(
                 None => taken,
             };
             r.cred = checked_cred.unwrap_or(Ucred::UNSTAMPED);
-            if short_fault || !wait_all || r.len >= max || !r.fds.is_empty() {
+            if short_fault || peek || r.len >= target || !r.fds.is_empty() {
                 return finish(cx, r);
             }
             part = Some(r);
@@ -1007,11 +1023,14 @@ pub(super) fn setsockopt(
             value.get(..4).ok_or(Errno::EINVAL)?;
             return Err(Errno::ENOPROTOOPT);
         }
-        // Buffer sizes, lingering and the like are only recorded; other options are accepted
-        // without effect
+        // Generic SOL_SOCKET options; SO_SNDBUF / SO_SNDBUFFORCE also update live sender capacity
+        // and wake blocked writers / POLLOUT waiters.
         _ => {
             if let Some(r) = u.opts.set(name, value, admin, net_admin) {
                 r?;
+                if matches!(name, SO_SNDBUF | SO_SNDBUFFORCE) {
+                    u.outq.set_sndbuf(u.opts.sndbuf());
+                }
             }
         }
     }
@@ -1189,6 +1208,15 @@ fn block(
     deadline: Option<Instant>,
     on: &ChannelRef,
 ) -> Result<(), Errno> {
+    block_on(cx, nonblock, deadline, &[wake::of(on)])
+}
+
+fn block_on(
+    cx: &mut Cx<'_>,
+    nonblock: bool,
+    deadline: Option<Instant>,
+    objects: &[wake::Object],
+) -> Result<(), Errno> {
     if nonblock || deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Errno::EAGAIN);
     }
@@ -1199,7 +1227,7 @@ fn block(
             Errno::ERESTARTSYS
         });
     }
-    cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(on)])
+    cx.wait_objects(deadline, &mut [], wake::FILE, objects)
 }
 
 #[cfg(test)]
@@ -1401,5 +1429,233 @@ mod tests {
             Err(Errno::EPIPE)
         );
         assert_ne!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
+    }
+
+    #[test]
+    fn sndbuf_enforces_stream_truesize_dgram_max_len_and_sender_isolation() {
+        const SO_RCVBUF: i32 = 8;
+
+        let mut k = Kernel::new(Tier::Interpreter);
+        let (_, _, _cpu) = crate::pseudo::tests::add_task(&mut k, 10, 0, true, b"");
+        let shared = Arc::new(Shared::new(k));
+        let k = shared.lock();
+        let task = k.tasks[&10].clone();
+        let mut state = task.state.borrow_mut();
+        let mut cx = Cx::new(&shared, k, &task, &mut state);
+
+        // Stream: SO_SNDBUF=4096 (doubled to 8192) chunks at 4032 B and fills at 8064 B / 9728 outq.
+        let (sa, sb) = pair(&cx, SOCK_STREAM, 0).unwrap();
+        let a = Rc::new(RefCell::new(sa));
+        let b = Rc::new(RefCell::new(sb));
+        with(&a, |u| {
+            setsockopt(
+                u,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &4096i32.to_le_bytes(),
+                (false, false),
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            with(&a, |u| getsockopt(
+                u,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &cx.pid_ns(),
+                &cx.cred()
+            )
+            .unwrap()),
+            8192i32.to_le_bytes()
+        );
+        let big = vec![0x41u8; 65536];
+        assert_eq!(send(&mut cx, &a, true, &big, &[], &[], 0), Ok(8064));
+        assert_eq!(with(&a, |u| u.outq()), 9728);
+        assert_eq!(with(&b, |u| u.unread()), Some(8064));
+        assert_eq!(
+            send(&mut cx, &a, true, b"x", &[], &[], 0),
+            Err(Errno::EAGAIN)
+        );
+        // Raising SO_SNDBUF immediately restores send room and POLLOUT.
+        with(&a, |u| {
+            setsockopt(
+                u,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &65536i32.to_le_bytes(),
+                (false, false),
+            )
+            .unwrap()
+        });
+        assert_eq!(send(&mut cx, &a, true, b"y", &[], &[], 0), Ok(1));
+
+        // Stream 1-byte writes at default SO_SNDBUF cap at 278 packets by truesize (213504 >= 212992)
+        // while FIONREAD reports exact payload bytes (278).
+        let (sa2, sb2) = pair(&cx, SOCK_STREAM, 0).unwrap();
+        let a2 = Rc::new(RefCell::new(sa2));
+        let b2 = Rc::new(RefCell::new(sb2));
+        // Shrinking receiver SO_RCVBUF has no effect on AF_UNIX queueing.
+        with(&b2, |u| {
+            setsockopt(
+                u,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                &1i32.to_le_bytes(),
+                (false, false),
+            )
+            .unwrap()
+        });
+        let mut ones = 0;
+        while send(&mut cx, &a2, true, b"x", &[], &[], 0) == Ok(1) {
+            ones += 1;
+        }
+        assert_eq!(ones, 278);
+        assert_eq!(with(&a2, |u| u.outq()), 278 * 768);
+        assert_eq!(with(&b2, |u| u.unread()), Some(278));
+
+        // Default stream send(524288) queues 6 * 36544 = 219264 bytes (outq = 222720).
+        let (sa3, sb3) = pair(&cx, SOCK_STREAM, 0).unwrap();
+        let a3 = Rc::new(RefCell::new(sa3));
+        let _b3 = Rc::new(RefCell::new(sb3));
+        let huge = vec![0x42u8; 524_288];
+        assert_eq!(send(&mut cx, &a3, true, &huge, &[], &[], 0), Ok(219_264));
+        assert_eq!(with(&a3, |u| u.outq()), 222_720);
+
+        // Datagram & seqpacket: dynamic dgram_max_len = sk_sndbuf - 32.
+        for ty in [SOCK_DGRAM, SOCK_SEQPACKET] {
+            let (pa, pb) = pair(&cx, ty, 0).unwrap();
+            let a = Rc::new(RefCell::new(pa));
+            let b = Rc::new(RefCell::new(pb));
+            with(&a, |u| {
+                setsockopt(
+                    u,
+                    SOL_SOCKET,
+                    SO_SNDBUF,
+                    &1i32.to_le_bytes(),
+                    (false, false),
+                )
+                .unwrap()
+            });
+            assert_eq!(
+                send(&mut cx, &a, true, &vec![0u8; 4577], &[], &[], 0),
+                Err(Errno::EMSGSIZE)
+            );
+            assert_eq!(
+                send(&mut cx, &a, true, &vec![0u8; 4576], &[], &[], 0),
+                Ok(4576)
+            );
+            let _ = recv(&mut cx, &b, true, 8192, 0, 0).unwrap();
+        }
+
+        // Datagram multi-sender & multi-receiver per-sender accounting.
+        let srv1: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
+        let srv2: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
+        let mut a_srv1 = unnamed();
+        a_srv1.extend_from_slice(b"\0sndbuf-ms-1");
+        let mut a_srv2 = unnamed();
+        a_srv2.extend_from_slice(b"\0sndbuf-ms-2");
+        bind(&mut cx, &srv1, &a_srv1).unwrap();
+        bind(&mut cx, &srv2, &a_srv2).unwrap();
+
+        let c1: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
+        let c2: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
+        with(&c1, |u| {
+            setsockopt(
+                u,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &1i32.to_le_bytes(),
+                (false, false),
+            )
+            .unwrap()
+        });
+        let blk = [0u8; 1024];
+        assert_eq!(send(&mut cx, &c1, true, &blk, &a_srv1, &[], 0), Ok(1024));
+        assert_eq!(send(&mut cx, &c1, true, &blk, &a_srv1, &[], 0), Ok(1024));
+        assert_eq!(
+            send(&mut cx, &c1, true, &blk, &a_srv1, &[], 0),
+            Err(Errno::EAGAIN)
+        );
+        // Same sender cannot send to a second receiver while its own outq is full.
+        assert_eq!(
+            send(&mut cx, &c1, true, &blk, &a_srv2, &[], 0),
+            Err(Errno::EAGAIN)
+        );
+        // A second sender with default SO_SNDBUF can still send to srv1.
+        assert_eq!(send(&mut cx, &c2, true, &blk, &a_srv1, &[], 0), Ok(1024));
+    }
+
+    #[test]
+    fn rcvlowat_stream_nonblock_peek_eof_and_dgram_ignored() {
+        const SO_RCVLOWAT: i32 = 18;
+
+        let mut k = Kernel::new(Tier::Interpreter);
+        let (_, _, _cpu) = crate::pseudo::tests::add_task(&mut k, 10, 0, true, b"");
+        let shared = Arc::new(Shared::new(k));
+        let k = shared.lock();
+        let task = k.tasks[&10].clone();
+        let mut state = task.state.borrow_mut();
+        let mut cx = Cx::new(&shared, k, &task, &mut state);
+
+        let (sa, sb) = pair(&cx, SOCK_STREAM, 0).unwrap();
+        let a = Rc::new(RefCell::new(sa));
+        let b = Rc::new(RefCell::new(sb));
+        with(&b, |u| {
+            setsockopt(
+                u,
+                SOL_SOCKET,
+                SO_RCVLOWAT,
+                &10i32.to_le_bytes(),
+                (false, false),
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            with(&b, |u| getsockopt(
+                u,
+                SOL_SOCKET,
+                SO_RCVLOWAT,
+                &cx.pid_ns(),
+                &cx.cred()
+            )
+            .unwrap()),
+            10i32.to_le_bytes()
+        );
+        send(&mut cx, &a, true, b"12345", &[], &[], 0).unwrap();
+        // Linux AF_UNIX unix_poll reports POLLIN regardless of SO_RCVLOWAT.
+        assert_ne!(with(&b, |u| u.readiness()) & 0x001, 0);
+        // MSG_PEEK returns queued bytes immediately without waiting for SO_RCVLOWAT.
+        assert_eq!(
+            recv(&mut cx, &b, false, 20, 0, MSG_PEEK).unwrap().data,
+            b"12345"
+        );
+        // Nonblocking recv returns queued bytes immediately even when below SO_RCVLOWAT.
+        assert_eq!(recv(&mut cx, &b, true, 20, 0, 0).unwrap().data, b"12345");
+        // Blocking recv with max <= queued returns immediately (target = min(lowat, max)).
+        send(&mut cx, &a, true, b"abcde", &[], &[], 0).unwrap();
+        assert_eq!(recv(&mut cx, &b, false, 4, 0, 0).unwrap().data, b"abcd");
+        // EOF finishes blocking recv below SO_RCVLOWAT.
+        with(&a, |u| shutdown(u, 1).unwrap());
+        assert_eq!(recv(&mut cx, &b, false, 20, 0, 0).unwrap().data, b"e");
+        assert_eq!(recv(&mut cx, &b, false, 20, 0, 0).unwrap().data, b"");
+
+        // Datagram and seqpacket ignore SO_RCVLOWAT.
+        for ty in [SOCK_DGRAM, SOCK_SEQPACKET] {
+            let (pa, pb) = pair(&cx, ty, 0).unwrap();
+            let a = Rc::new(RefCell::new(pa));
+            let b = Rc::new(RefCell::new(pb));
+            with(&b, |u| {
+                setsockopt(
+                    u,
+                    SOL_SOCKET,
+                    SO_RCVLOWAT,
+                    &10i32.to_le_bytes(),
+                    (false, false),
+                )
+                .unwrap()
+            });
+            send(&mut cx, &a, true, b"hello", &[], &[], 0).unwrap();
+            assert_eq!(recv(&mut cx, &b, false, 20, 0, 0).unwrap().data, b"hello");
+        }
     }
 }

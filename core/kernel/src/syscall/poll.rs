@@ -3310,10 +3310,10 @@ mod tests {
         let mut waits = Waits::default();
         waits.add_epoll(&outer, 0);
         // The nested epoll itself (epoll_ctl) and the files it watches, the AF_UNIX socket's
-        // receive queue and both directions of the connection
+        // receive queue, sender state and both directions of the connection
         let mut want = vec![wake::of(&inner), wake::of(&e1), wake::of(&e2)];
         want.extend(&unix_objects);
-        assert_eq!(unix_objects.len(), 3);
+        assert_eq!(unix_objects.len(), 4);
         for o in want {
             assert!(waits.objects.contains(&o));
         }

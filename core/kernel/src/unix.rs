@@ -22,28 +22,69 @@ use std::time::Duration;
 use crate::cell::RefCell;
 use crate::fd::{FdTable, FileKind, FileRef, OpenFile};
 use crate::kernel::{Kernel, request_wake_object, wake};
-use crate::net::{AF_UNIX, SOCK_DGRAM, Socket};
+use crate::net::{AF_UNIX, SOCK_DGRAM, SOCK_STREAM, Socket};
 use crate::vfs::store::Ino;
 
 pub const SOCK_SEQPACKET: i32 = 5;
 
-/// The most bytes buffered per direction, the same as Linux's default `SO_SNDBUF` (208 KiB).
+/// Default `SO_SNDBUF` (208 KiB, Linux's `net.core.wmem_default`).
 pub const CAPACITY: usize = 212_992;
 
-/// Maximum payload of a single datagram or seqpacket message (Linux's `sk_sndbuf - 32`).
-pub(crate) const DGRAM_MAX_LEN: usize = CAPACITY - 32;
+/// Linux 64-bit `sizeof(struct sk_buff)` + `sizeof(struct skb_shared_info)` overhead constants
+/// matching arm64 Linux 6.1/6.8 slab and page allocations.
+const SKB_HEAD_OVERHEAD: usize = 256;
+const SKB_SHINFO_OVERHEAD: usize = 320;
+const SKB_PAGE_SIZE: usize = 4096;
+/// Maximum linear head fitting in one 4 KiB page (`SKB_MAX_HEAD(0)` = 3776 B).
+const SKB_MAX_HEAD: usize = SKB_PAGE_SIZE - SKB_SHINFO_OVERHEAD;
+/// Maximum linear kmalloc payload for datagram/seqpacket skbs (`16 KiB - sizeof(skb_shared_info)`).
+const SKB_MAX_LINEAR_DGRAM: usize = 16_384 - SKB_SHINFO_OVERHEAD;
+/// Maximum payload per `SOCK_STREAM` chunk (`SKB_MAX_HEAD(0) + 8 * PAGE_SIZE` = 36,544 B,
+/// matching arm64 Linux's `unix_stream_sendmsg` paged chunking).
+pub(crate) const STREAM_MAX_CHUNK: usize = SKB_MAX_HEAD + 8 * SKB_PAGE_SIZE;
 
-/// Approximate Linux 64-bit `skb->truesize` for a queued AF_UNIX packet: every queued packet
-/// (including zero-length datagrams/seqpackets) charges at least 768 bytes, matching Linux's
-/// `sk_wmem_alloc` / `SIOCOUTQ` and preventing unbounded zero-byte floods.
+fn linear_truesize(head_len: usize) -> usize {
+    let alloc = (head_len + SKB_SHINFO_OVERHEAD)
+        .next_power_of_two()
+        .max(512);
+    SKB_HEAD_OVERHEAD + alloc
+}
+
+/// Linux 64-bit `skb->truesize` for a queued `SOCK_DGRAM` / `SOCK_SEQPACKET` packet (and zero-byte
+/// packets): linear kmalloc buckets up to 16 KiB (`SKB_MAX_LINEAR_DGRAM`), then a 4 KiB linear
+/// head (4352 B) plus 4 KiB paged fragments.
 pub(crate) fn packet_truesize(len: usize) -> usize {
-    if len <= 128 {
-        768
-    } else if len <= 4096 {
-        256 + (len + 320).next_power_of_two()
+    if len <= SKB_MAX_LINEAR_DGRAM {
+        linear_truesize(len)
     } else {
-        len.next_multiple_of(4096).saturating_add(768)
+        linear_truesize(SKB_MAX_HEAD)
+            .saturating_add((len - SKB_MAX_HEAD).next_multiple_of(SKB_PAGE_SIZE))
     }
+}
+
+/// Linux 64-bit `skb->truesize` for one `SOCK_STREAM` chunk allocated by `unix_stream_sendmsg`:
+/// payloads up to `SKB_MAX_HEAD` (3776 B) use a linear kmalloc bucket; larger chunks spill
+/// `min(len, PAGE_ALIGN(len - SKB_MAX_HEAD))` into 4 KiB paged fragments and keep the remainder
+/// in a linear head.
+pub(crate) fn stream_truesize(len: usize) -> usize {
+    let data_len = len
+        .saturating_sub(SKB_MAX_HEAD)
+        .next_multiple_of(SKB_PAGE_SIZE)
+        .min(len);
+    let head_len = len - data_len;
+    linear_truesize(head_len).saturating_add(data_len.next_multiple_of(SKB_PAGE_SIZE))
+}
+
+/// Maximum payload per `SOCK_STREAM` chunk for a sender with send buffer `sndbuf`
+/// (Linux's `min((sk_sndbuf >> 1) - 64, STREAM_MAX_CHUNK)`).
+pub(crate) fn stream_chunk_limit(sndbuf: usize) -> usize {
+    (sndbuf >> 1).saturating_sub(64).clamp(1, STREAM_MAX_CHUNK)
+}
+
+/// Maximum single datagram or seqpacket payload for a sender with send buffer `sndbuf`
+/// (Linux's `sk_sndbuf - 32`).
+pub(crate) fn dgram_max_len(sndbuf: usize) -> usize {
+    sndbuf.saturating_sub(32)
 }
 
 /// Shared cell holding a socket's bound `sockaddr_un` bytes (empty while unbound) so packets and
@@ -51,26 +92,81 @@ pub(crate) fn packet_truesize(len: usize) -> usize {
 /// the sending `UnixSocket`.
 pub(crate) type AddrRef = Rc<RefCell<Vec<u8>>>;
 
-/// Shared sender state carried by queued packets: live bound address cell and `SIOCOUTQ`
-/// `truesize` counter, so packets resolve the sender's address at receive time and uncharge
-/// `SIOCOUTQ` on drop without retaining the sending `UnixSocket`.
+/// Shared sender state carried by queued packets: live bound address cell, `sk_wmem_alloc`
+/// (`outq`) / `sk_sndbuf` (`sndbuf`) accounting, and write-space arrival counter (`taken`).
+/// Packets resolve the sender's address at receive time and uncharge `outq` (waking blocked
+/// senders and `POLLOUT` waiters) on drop without retaining the sending `UnixSocket`.
 pub(crate) struct SenderState {
     pub addr: AddrRef,
+    pub stream: bool,
     pub outq: std::cell::Cell<usize>,
+    pub sndbuf: std::cell::Cell<usize>,
+    pub taken: std::cell::Cell<u64>,
 }
 
 impl SenderState {
-    fn new(addr: AddrRef) -> Rc<Self> {
+    fn new(addr: AddrRef, stream: bool) -> Rc<Self> {
         Rc::new(Self {
             addr,
+            stream,
             outq: std::cell::Cell::new(0),
+            sndbuf: std::cell::Cell::new(CAPACITY),
+            taken: std::cell::Cell::new(0),
         })
+    }
+
+    pub(crate) fn wake_object(&self) -> wake::Object {
+        wake::of_value(self)
+    }
+
+    pub(crate) fn sndbuf(&self) -> usize {
+        self.sndbuf.get()
+    }
+
+    /// Updates `SO_SNDBUF` and wakes any blocked senders or `POLLOUT` waiters when capacity grows.
+    pub(crate) fn set_sndbuf(&self, sndbuf: usize) {
+        let old = self.sndbuf.replace(sndbuf);
+        if sndbuf > old {
+            if self.writable() {
+                self.taken.set(self.taken.get().wrapping_add(1));
+            }
+            request_wake_object(self.wake_object());
+        }
+    }
+
+    /// Computes `skb->truesize` for a packet of `len` payload bytes sent by this socket.
+    pub(crate) fn truesize(&self, len: usize) -> usize {
+        if self.stream {
+            stream_truesize(len)
+        } else {
+            packet_truesize(len)
+        }
+    }
+
+    /// Whether the sender has room to allocate another packet (Linux's `sk_wmem_alloc < sk_sndbuf`).
+    pub(crate) fn has_room(&self) -> bool {
+        self.outq.get() < self.sndbuf.get()
+    }
+
+    /// Linux's `unix_writable(sk)`: `(sk_wmem_alloc << 2) <= sk_sndbuf`, where `sk_wmem_alloc`
+    /// starts at 1 (so `(outq + 1) * 4 <= sndbuf`).
+    pub(crate) fn writable(&self) -> bool {
+        self.outq.get().saturating_add(1).saturating_mul(4) <= self.sndbuf.get()
     }
 
     /// Charges one packet and gives it a sender reference to release on dequeue or drop.
     pub(crate) fn charge(self: &Rc<Self>, truesize: usize) -> Rc<Self> {
-        self.outq.set(self.outq.get() + truesize);
+        self.outq.set(self.outq.get().saturating_add(truesize));
         self.clone()
+    }
+
+    /// Uncharges a consumed or dropped packet and wakes any waiting sender or `POLLOUT` waiter.
+    pub(crate) fn uncharge(&self, truesize: usize) {
+        self.outq.set(self.outq.get().saturating_sub(truesize));
+        if self.writable() {
+            self.taken.set(self.taken.get().wrapping_add(1));
+        }
+        request_wake_object(self.wake_object());
     }
 }
 
@@ -169,10 +265,11 @@ pub(crate) struct UnixSocket {
     /// The new network namespace it was created in, if any (abstract addresses are kept apart by
     /// it, and interface ioctls look at its lo).
     pub net: Option<Rc<crate::nsproxy::NetNs>>,
-    /// The generic `SOL_SOCKET` options it only records (buffer sizes among them: the capacity
-    /// stays [`CAPACITY`]).
+    /// The generic `SOL_SOCKET` options (`SO_SNDBUF` and `SO_RCVLOWAT` are enforced; `SO_RCVBUF`
+    /// and the remaining options are recorded only, matching Linux AF_UNIX).
     pub opts: crate::net::SockOpts,
-    /// Shared sender state carried by outgoing packets (bound address cell + `SIOCOUTQ` counter).
+    /// Shared sender state carried by outgoing packets (bound address cell, `SIOCOUTQ` /
+    /// `sk_wmem_alloc` counter, `SO_SNDBUF` cap, and write-space wake object).
     pub outq: Rc<SenderState>,
     /// Creator's filesystem UID (`sock_i_uid`).
     pub uid: u32,
@@ -186,12 +283,10 @@ impl UnixSocket {
     pub fn new(ty: i32) -> UnixSocket {
         let rx = ChannelRef::default();
         if ty == SOCK_DGRAM {
-            let mut r = rx.borrow_mut();
-            r.max_qlen = Some(MAX_DGRAM_QLEN);
-            r.packet_budget = true;
+            rx.borrow_mut().max_qlen = Some(MAX_DGRAM_QLEN);
         }
         let addr = Rc::new(RefCell::new(Vec::new()));
-        let outq = SenderState::new(addr.clone());
+        let outq = SenderState::new(addr.clone(), ty == SOCK_STREAM);
         UnixSocket {
             ty,
             addr,
@@ -305,8 +400,8 @@ impl UnixSocket {
                 peer_addr: a_addr,
             });
         } else {
-            let ab = Channel::connected(ty, false);
-            let ba = Channel::connected(ty, false);
+            let ab = Channel::connected(false);
+            let ba = Channel::connected(false);
             a.link = Link::Stream {
                 rx: ba.clone(),
                 tx: ab.clone(),
@@ -331,9 +426,9 @@ impl UnixSocket {
         server_cred: Ucred,
         cred: Ucred,
     ) -> UnixSocket {
-        let down = Channel::connected(self.ty, self.rx.borrow().passcred);
+        let down = Channel::connected(self.rx.borrow().passcred);
         // Linux records credentials for an unaccepted peer. accept installs the listener's setting.
-        let up = Channel::connected(self.ty, true);
+        let up = Channel::connected(true);
         let mut server = UnixSocket::new(self.ty);
         // As in Linux's unix_stream_connect, the new end is created in the connecting side's
         // network namespace
@@ -401,8 +496,9 @@ impl UnixSocket {
                         ev |= POLLHUP;
                     }
                 }
-                // Report writable also when the peer has closed, so the writer can get EPIPE
-                if t.writable() || t.closed {
+                // Linux's unix_poll: writable when sender's sk_wmem_alloc is within sk_sndbuf/4.
+                // On peer close, the peer discards its receive queue so outq drops to 0.
+                if self.outq.writable() {
                     ev |= POLLOUT | POLLWRNORM;
                 }
                 ev
@@ -424,16 +520,16 @@ impl UnixSocket {
                         ev |= POLLHUP;
                     }
                 }
-                // unix_dgram_poll: also not writable while a peer that is not connected back to
-                // this socket holds more datagrams than its limit
-                let peer_full = match &self.link {
-                    Link::Dgram { tx, .. } => tx.upgrade().is_some_and(|c| {
-                        let c = c.borrow();
-                        !c.writable() || c.holds_back(&Rc::downgrade(&self.rx))
-                    }),
-                    _ => false,
-                };
-                if !peer_full {
+                // unix_dgram_poll: check sender's unix_writable(sk), and when connected to a peer
+                // not connected back to this socket, also unix_recvq_full(other).
+                let writable = self.outq.writable()
+                    && match &self.link {
+                        Link::Dgram { tx, .. } => tx
+                            .upgrade()
+                            .is_none_or(|c| !c.borrow().holds_back(&Rc::downgrade(&self.rx))),
+                        _ => true,
+                    };
+                if writable {
                     ev |= POLLOUT | POLLWRNORM;
                 }
                 ev
@@ -443,10 +539,12 @@ impl UnixSocket {
 
     /// The wake objects poll and epoll register when waiting on it: its own receive queue
     /// (messages of a datagram socket; while listening, an incoming connection and accept taking
-    /// one also request a wake of it), both directions of a stream connection, and for a connected
-    /// datagram socket the peer's receive queue (whether it has room).
+    /// one also request a wake of it), its own sender state (write-space drains and `SO_SNDBUF`
+    /// increases), both directions of a stream connection, and for a connected datagram socket the
+    /// peer's receive queue (`max_dgram_qlen`).
     pub fn wake_objects(&self, out: &mut Vec<wake::Object>) {
         out.push(wake::of(&self.rx));
+        out.push(self.outq.wake_object());
         match &self.link {
             Link::Stream { rx, tx, .. } => {
                 out.push(wake::of(rx));
@@ -464,14 +562,15 @@ impl UnixSocket {
     /// How many events have arrived in each of the read and write directions (`syscall::poll`'s
     /// data generations).
     pub fn arrivals(&self) -> [u64; 2] {
+        let out = self.outq.taken.get();
         match &self.link {
             Link::Listening { .. } => [self.connections, 0],
-            Link::Stream { rx, tx, .. } => [rx.borrow().arrivals, tx.borrow().taken],
+            Link::Stream { rx, .. } => [rx.borrow().arrivals, out],
             Link::Dgram { tx, .. } => [
                 self.rx.borrow().arrivals,
-                tx.upgrade().map_or(0, |c| c.borrow().taken),
+                out.wrapping_add(tx.upgrade().map_or(0, |c| c.borrow().taken)),
             ],
-            Link::None => [self.rx.borrow().arrivals, 0],
+            Link::None => [self.rx.borrow().arrivals, out],
         }
     }
 
@@ -661,7 +760,10 @@ impl Packet {
     }
 
     fn truesize(&self) -> usize {
-        packet_truesize(self.data.len())
+        self.outq.as_ref().map_or_else(
+            || packet_truesize(self.data.len()),
+            |s| s.truesize(self.data.len()),
+        )
     }
 
     fn sender_addr(&self) -> Vec<u8> {
@@ -672,14 +774,15 @@ impl Packet {
 
     fn uncharge(&mut self, n: usize) {
         if let Some(s) = self.outq.take() {
-            s.outq.set(s.outq.get().saturating_sub(n));
+            s.uncharge(n);
         }
     }
 }
 
 impl Drop for Packet {
     fn drop(&mut self) {
-        self.uncharge(self.truesize());
+        let ts = self.truesize();
+        self.uncharge(ts);
     }
 }
 
@@ -701,11 +804,6 @@ pub(crate) struct Channel {
     pub packets: VecDeque<Packet>,
     /// Payload bytes not yet read (`FIONREAD`).
     pub bytes: usize,
-    /// Total `truesize` of packets currently queued (`sk_wmem_alloc` equivalent for packet room).
-    pub truesize: usize,
-    /// True for datagram and seqpacket channels (whose queue capacity and writability budget by
-    /// `truesize` rather than stream payload `bytes`).
-    pub packet_budget: bool,
     /// No new data will come (the sender closed or did `SHUT_WR`, or the receiver did `SHUT_RD`):
     /// EOF once everything is read.
     pub eof: bool,
@@ -714,8 +812,8 @@ pub(crate) struct Channel {
     /// The number of messages put in: as on Linux, every arrival triggers the receiver's `EPOLLET`
     /// once more.
     pub arrivals: u64,
-    /// The number of times it was still writable after the receiver took data: Linux wakes the
-    /// sender on every read (`unix_write_space`), and the sender's `EPOLLET` triggers once more.
+    /// Datagram receive-queue drain counter for `EPOLLET` `POLLOUT` on peers held back by
+    /// `max_qlen` (`SenderState::taken` tracks per-sender `sk_wmem_alloc` drains).
     pub taken: u64,
     /// A datagram socket's receive queue: the messages it holds before senders wait (Linux's
     /// `sk_max_ack_backlog`, from `net.unix.max_dgram_qlen` when the socket was created), except
@@ -739,23 +837,11 @@ pub(crate) type ChannelRef = Rc<RefCell<Channel>>;
 
 impl Channel {
     /// One direction of a stream or seqpacket connection.
-    fn connected(ty: i32, passcred: bool) -> ChannelRef {
+    fn connected(passcred: bool) -> ChannelRef {
         Rc::new(RefCell::new(Self {
-            packet_budget: ty == SOCK_SEQPACKET,
             passcred,
             ..Self::default()
         }))
-    }
-
-    /// The payload bytes that still fit for a stream write.
-    pub fn space(&self) -> usize {
-        CAPACITY.saturating_sub(self.bytes)
-    }
-
-    /// Whether another datagram, seqpacket, or zero-byte SCM_RIGHTS packet fits (Linux's
-    /// `sk_wmem_alloc < sk_sndbuf` check).
-    pub fn has_packet_room(&self) -> bool {
-        self.truesize < CAPACITY
     }
 
     /// Reports the pending `ECONNRESET` once (Linux's `sock_error`).
@@ -765,7 +851,6 @@ impl Channel {
 
     pub fn push(&mut self, p: Packet) {
         self.bytes += p.remaining();
-        self.truesize += p.truesize();
         self.packets.push_back(p);
         self.arrivals += 1;
         request_wake_object(wake::of_value(self));
@@ -802,8 +887,8 @@ impl Channel {
                 self.bytes -= n;
                 fds.append(&mut p.fds);
                 if p.remaining() == 0 {
-                    let pkt = self.packets.pop_front().unwrap();
-                    self.truesize -= pkt.truesize();
+                    // Dropping `pkt` uncharges the sender's `SenderState` and wakes writers.
+                    let _pkt = self.packets.pop_front().unwrap();
                     popped = true;
                 }
             }
@@ -812,9 +897,6 @@ impl Channel {
             }
         }
         if !peek && (!data.is_empty() || popped) {
-            if self.writable() {
-                self.taken += 1;
-            }
             request_wake_object(wake::of_value(self));
         }
         Received {
@@ -844,15 +926,14 @@ impl Channel {
             let ts = p.truesize();
             let from = p.sender_addr();
             self.bytes -= len;
-            self.truesize -= ts;
             // Taking the payload changes truesize. Release the original charge before the move.
             p.uncharge(ts);
             let mut data = std::mem::take(&mut p.data);
             data.truncate(max);
             let fds = std::mem::take(&mut p.fds);
             let cred = p.cred;
-            if self.writable() {
-                self.taken += 1;
+            if self.max_qlen.is_some() {
+                self.taken = self.taken.wrapping_add(1);
             }
             request_wake_object(wake::of_value(self));
             (data, len, fds, cred, from)
@@ -864,17 +945,6 @@ impl Channel {
             cred,
             from,
         })
-    }
-
-    /// Writable when datagram/seqpacket queued truesize is at most half of capacity (Linux's
-    /// `unix_writable`), or for streams when buffered payload is at most a quarter of capacity
-    /// (also guarding zero-byte SCM_RIGHTS floods).
-    pub fn writable(&self) -> bool {
-        if self.packet_budget {
-            self.truesize * 2 <= CAPACITY
-        } else {
-            self.bytes * 4 <= CAPACITY && (self.bytes > 0 || self.truesize * 2 <= CAPACITY)
-        }
     }
 
     /// Whether a datagram from the socket receiving into `sender` is allowed by `unix_may_send`:
@@ -897,9 +967,8 @@ impl Channel {
         let stale = std::mem::take(&mut self.packets);
         if !stale.is_empty() {
             self.bytes = 0;
-            self.truesize = 0;
-            if self.writable() {
-                self.taken += 1;
+            if self.max_qlen.is_some() {
+                self.taken = self.taken.wrapping_add(1);
             }
             request_wake_object(wake::of_value(self));
         }
@@ -912,7 +981,6 @@ impl Channel {
     fn discard(&mut self) -> VecDeque<Packet> {
         self.closed = true;
         self.bytes = 0;
-        self.truesize = 0;
         std::mem::take(&mut self.packets)
     }
 }
@@ -1250,7 +1318,6 @@ fn collect_once(k: &mut Kernel) -> bool {
             for c in inboxes(u) {
                 let mut c = c.borrow_mut();
                 c.bytes = 0;
-                c.truesize = 0;
                 garbage.extend(std::mem::take(&mut c.packets));
             }
         }
@@ -1546,7 +1613,6 @@ mod tests {
         });
         assert_eq!(dropped.len(), 1);
         assert_eq!(b.rx.borrow().bytes, 0);
-        assert_eq!(b.rx.borrow().truesize, 0);
         assert_eq!(a.outq(), 0);
         assert!(a.rx.borrow().established);
         assert!(b.rx.borrow().established && c.rx.borrow().established);
@@ -1568,7 +1634,6 @@ mod tests {
         s.rx.borrow_mut().push(packet(b"self", 1));
         assert!(s.set_dgram_link(Link::None).is_empty());
         assert_eq!(s.rx.borrow().bytes, 0);
-        assert_eq!(s.rx.borrow().truesize, 0);
         assert!(!s.rx.borrow().reset && !s.rx.borrow().established);
     }
 
@@ -1579,7 +1644,7 @@ mod tests {
             unreachable!()
         };
         let mut p = packet(b"abcdef", 1);
-        let ts = p.truesize();
+        let ts = a.outq.truesize(p.data.len());
         assert_eq!(ts, 768);
         p.outq = Some(a.outq.charge(ts));
         tx.borrow_mut().push(p);
@@ -1602,9 +1667,9 @@ mod tests {
         // Zero-byte datagrams charge truesize and cap a mutual socketpair at 278 packets.
         let (da, db) = UnixSocket::pair(SOCK_DGRAM, Ucred::of(1, 0, 0));
         let mut queued = 0;
-        while db.rx.borrow().has_packet_room() {
+        while da.outq.has_room() {
             let mut zp = packet(b"", 1);
-            zp.outq = Some(da.outq.charge(zp.truesize()));
+            zp.outq = Some(da.outq.charge(da.outq.truesize(0)));
             db.rx.borrow_mut().push(zp);
             queued += 1;
         }
@@ -1629,25 +1694,25 @@ mod tests {
         };
         let dummy = OpenFile::new(FileKind::Host(1), oflags::O_RDONLY);
         let mut queued = 0;
-        while tx.borrow().has_packet_room() {
+        while sa.outq.has_room() {
             let mut p = packet(b"", 1);
             p.fds.push(dummy.clone());
-            p.outq = Some(sa.outq.charge(p.truesize()));
+            p.outq = Some(sa.outq.charge(sa.outq.truesize(0)));
             tx.borrow_mut().push(p);
             queued += 1;
         }
         assert_eq!(queued, 278);
-        assert!(!tx.borrow().has_packet_room());
+        assert!(!sa.outq.has_room());
         assert_eq!(sa.readiness() & POLLOUT, 0);
-        assert_eq!(tx.borrow().taken, 0);
+        assert_eq!(sa.outq.taken.get(), 0);
 
-        // Draining one zero-byte packet restores has_packet_room() even before writable() flips.
+        // Draining one zero-byte packet restores has_room() even before writable() flips.
         let first = rx.borrow_mut().read_stream(16, false, false);
         assert!(first.data.is_empty() && first.fds.len() == 1);
-        assert!(tx.borrow().has_packet_room());
+        assert!(sa.outq.has_room());
         assert_eq!(sa.outq(), 277 * 768);
 
-        // Draining past the half-capacity threshold restores POLLOUT and advances `taken`.
+        // Draining past the quarter-capacity threshold restores POLLOUT and advances `taken`.
         let mut drained = 1;
         while sa.readiness() & POLLOUT == 0 {
             let r = rx.borrow_mut().read_stream(16, false, false);
@@ -1655,8 +1720,8 @@ mod tests {
             drained += 1;
         }
         assert!(drained > 1 && drained < queued);
-        assert!(tx.borrow().writable());
-        assert!(tx.borrow().taken > 0);
+        assert!(sa.outq.writable());
+        assert!(sa.arrivals()[1] > 0);
     }
 
     #[test]
@@ -1736,5 +1801,101 @@ mod tests {
         assert!(!after_accept.contains("00000000 0001 02     0"));
         assert!(after_accept.contains("00000000 0001 03"));
         assert!(after_accept.contains("/tmp/cross-ns.sock"));
+    }
+
+    #[test]
+    fn truesize_and_chunk_limits_match_linux_arm64() {
+        // Datagram/seqpacket slab buckets up to 16 KiB, then 4352 B head + 4 KiB paged frags.
+        for (len, want) in [
+            (0, 768),
+            (1, 768),
+            (192, 768),
+            (193, 1280),
+            (704, 1280),
+            (705, 2304),
+            (1728, 2304),
+            (1729, 4352),
+            (3776, 4352),
+            (3777, 8448),
+            (7872, 8448),
+            (7873, 16640),
+            (16064, 16640),
+            (16384, 20736),
+            (32768, 37120),
+            (65536, 69888),
+            (131072, 135424),
+            (200000, 200960),
+        ] {
+            assert_eq!(packet_truesize(len), want, "packet_truesize({len})");
+        }
+
+        // Stream chunks spill above SKB_MAX_HEAD (3776) into 4 KiB pages.
+        for (len, want) in [
+            (0, 768),
+            (1, 768),
+            (192, 768),
+            (704, 1280),
+            (1728, 2304),
+            (3776, 4352),
+            (3777, 4864),
+            (4032, 4864),
+            (4096, 4864),
+            (4097, 4864),
+            (8192, 8960),
+            (13680, 14592),
+            (16320, 17152),
+            (32704, 33536),
+            (36544, 37120),
+        ] {
+            assert_eq!(stream_truesize(len), want, "stream_truesize({len})");
+        }
+
+        assert_eq!(stream_chunk_limit(4608), 2240);
+        assert_eq!(stream_chunk_limit(8192), 4032);
+        assert_eq!(stream_chunk_limit(32768), 16320);
+        assert_eq!(stream_chunk_limit(65536), 32704);
+        assert_eq!(stream_chunk_limit(212992), 36544);
+        assert_eq!(dgram_max_len(4608), 4576);
+        assert_eq!(dgram_max_len(212992), 212960);
+    }
+
+    #[test]
+    fn sndbuf_writable_boundary_and_unconnected_dgram_pollout() {
+        // Exact Linux unix_writable boundary: (outq + 1) * 4 <= sndbuf.
+        let (a, b) = UnixSocket::pair(SOCK_STREAM, Ucred::of(1, 0, 0));
+        let Link::Stream { tx, .. } = &a.link else {
+            unreachable!()
+        };
+        a.outq.set_sndbuf(6144);
+        let mut p1 = packet(b"a", 1);
+        p1.outq = Some(a.outq.charge(a.outq.truesize(1)));
+        tx.borrow_mut().push(p1);
+        assert_ne!(a.readiness() & POLLOUT, 0);
+
+        let mut p2 = packet(b"b", 1);
+        p2.outq = Some(a.outq.charge(a.outq.truesize(1)));
+        tx.borrow_mut().push(p2);
+        assert_eq!(a.outq(), 1536);
+        assert_eq!(a.readiness() & POLLOUT, 0);
+
+        // Raising sndbuf by 4 bytes flips POLLOUT on and bumps write arrival counter.
+        let before = a.arrivals()[1];
+        a.outq.set_sndbuf(6148);
+        assert_ne!(a.readiness() & POLLOUT, 0);
+        assert!(a.arrivals()[1] > before);
+        drop(b);
+
+        // Unconnected datagram socket clears POLLOUT when its own outq exceeds sndbuf / 4.
+        let cli = UnixSocket::new(SOCK_DGRAM);
+        let srv = UnixSocket::new(SOCK_DGRAM);
+        cli.outq.set_sndbuf(4608);
+        assert_ne!(cli.readiness() & POLLOUT, 0);
+        let mut dp = packet(&[0u8; 1024], 1);
+        dp.outq = Some(cli.outq.charge(cli.outq.truesize(1024)));
+        srv.rx.borrow_mut().push(dp);
+        assert_eq!(cli.outq(), 2304);
+        assert_eq!(cli.readiness() & POLLOUT, 0);
+        srv.rx.borrow_mut().read_packet(1024, false).unwrap();
+        assert_ne!(cli.readiness() & POLLOUT, 0);
     }
 }

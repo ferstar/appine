@@ -4445,10 +4445,11 @@ const BUF_DEFAULT: i32 = 212992;
 const MIN_SNDBUF: i32 = 4608;
 const MIN_RCVBUF: i32 = 2304;
 
-/// The `SOL_SOCKET` options every Linux socket keeps (`sk_setsockopt`, `sk_getsockopt`) that
-/// netlink and AF_UNIX sockets only record: they are set and read back as Linux does, without
-/// effect (buffer sizes do not limit what is queued in process; lingering, keepalives, routing
-/// and priorities mean nothing there).
+/// The `SOL_SOCKET` options every Linux socket keeps (`sk_setsockopt`, `sk_getsockopt`) for
+/// in-process netlink and AF_UNIX sockets: they are set and read back as Linux does. Netlink
+/// enforces `SO_RCVBUF`; AF_UNIX enforces `SO_SNDBUF` and `SO_RCVLOWAT` (`SO_RCVBUF` is recorded
+/// only on AF_UNIX, matching Linux). Lingering, keepalives, routing and priorities are recorded
+/// only.
 #[derive(Clone, Debug)]
 pub(crate) struct SockOpts {
     debug: bool,
@@ -4489,9 +4490,19 @@ impl Default for SockOpts {
 }
 
 impl SockOpts {
+    /// Current `SO_SNDBUF` byte limit.
+    pub fn sndbuf(&self) -> usize {
+        self.sndbuf.max(0) as usize
+    }
+
     /// Current `SO_RCVBUF` byte limit.
     pub fn rcvbuf(&self) -> usize {
         self.rcvbuf.max(0) as usize
+    }
+
+    /// Current `SO_RCVLOWAT` byte threshold.
+    pub fn rcvlowat(&self) -> usize {
+        self.rcvlowat.max(1) as usize
     }
 
     const DEBUG: i32 = 1;

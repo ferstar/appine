@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 10 confirmed and 2 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: receive-time sender addresses, cross-netns pending embryos in `/proc/net/unix`, `truesize` accounting for `SIOCOUTQ`/datagrams/seqpacket, and Linux-verified `SOCK_SEQPACKET` `EPIPE` without `SIGPIPE`)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: per-sender `SO_SNDBUF`/`SO_SNDBUFFORCE` capacity and `unix_writable` readiness, Linux-exact `packet_truesize`/`stream_truesize` and `SOCK_STREAM` chunking/write-room accounting, and `SO_RCVLOWAT` stream receive threshold)
 
 ## Responsibilities
 
@@ -35,23 +35,26 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 - `UnixSocket` — socket type (`ty`), shared bound address cell `addr: AddrRef` (`Rc<RefCell<Vec<u8>>>`), `link: Link`, datagram/listener-wait
   channel `rx: ChannelRef`, `peer_cred: Option<Ucred>`, `rcvtimeo`/`sndtimeo`,
   `shut_wr`, `connections` arrival counter, `embryo` flag (unaccepted server end), `net:
-  Option<Rc<NetNs>>` (`Some` only for non-initial netns), recorded generic `SockOpts`
-  (`kernel/net`), and `outq: Rc<SenderState>` (sharing the live `addr: AddrRef` and `SIOCOUTQ`
-  `truesize` counter with outgoing packets).
+  Option<Rc<NetNs>>` (`Some` only for non-initial netns), generic `SockOpts`
+  (`kernel/net`; `SO_SNDBUF`/`SO_RCVLOWAT` enforced, `SO_RCVBUF` and others recorded only as on
+  Linux), and `outq: Rc<SenderState>` (sharing the live `addr: AddrRef`, `stream` flag,
+  `SIOCOUTQ`/`sk_wmem_alloc` `outq` counter, live `sndbuf` limit, write-space `taken` generation,
+  and wake object with outgoing packets).
 - `Link` — `None`, `Listening { backlog, pending, cred }`, `Stream { rx, tx, peer_addr }`,
   `Dgram { tx: Weak<RefCell<Channel>>, peer_addr }`, where `peer_addr: AddrRef` shares the peer's
   address cell so post-connect `bind()` is visible to `accept()` and `getpeername()`.
 - `Channel` (`ChannelRef = Rc<RefCell<Channel>>`) — one direction: `packets: VecDeque<Packet>`,
-  the receiving socket's `passcred`, `bytes` (payload bytes for `FIONREAD` and stream `CAPACITY =
-  212_992`), `truesize` (queued packet `truesize` sum for `has_packet_room()` and `writable()`),
-  `eof`, `closed`, `arrivals`/`taken`, `max_qlen`
+  the receiving socket's `passcred`, `bytes` (payload bytes for `FIONREAD`),
+  `eof`, `closed`, `arrivals`/`taken` (`taken` counts datagram receive-queue drains for peers held
+  back by `max_qlen`), `max_qlen`
   (datagram queue cap, default `10`), `peer: Option<Weak<RefCell<Channel>>>` (set by
   `set_dgram_link`; `None` unconnected, `Some` connected so `may_receive_from` distinguishes
   unconnected from connected to a dead third socket), `established` (Linux's datagram
   `TCP_ESTABLISHED` state for `/proc/net/unix`), and `reset` (one-shot pending `ECONNRESET`).
   `Packet` holds `data`, `off`, `fds: Vec<FileRef>`, `cred: Ucred`, fallback `from: Vec<u8>`, and
-  `outq: Option<Rc<SenderState>>` (resolving `addr` at receive time and uncharging
-  `packet_truesize(data.len())` (>= 768 B) when popped/dropped).
+  `outq: Option<Rc<SenderState>>` (resolving `addr` at receive time and uncharging exact Linux
+  64-bit `stream_truesize(data.len())` or `packet_truesize(data.len())` (>= 768 B) and waking the
+  sender when popped/dropped).
   `Received` holds `data`, untruncated `len`, `fds`, `cred` and `from`.
 - `Ucred` — kernel-space `(pid, uid, gid)` (global tgid, kuid, kgid) with 12-byte LE encoding.
 - `Name` — `Path(Ino)` or `Abstract(net_id, ty, bytes)`; `Names` (`Kernel::unix`) maps `Name` to
@@ -165,29 +168,34 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 - Send paths (each packet shares the sender's `AddrRef`, so `recvfrom`/`recvmsg` read the
   sender's current bound address at receive time even if bound after send or closed before receive):
   - `SOCK_STREAM`: destination address -> `EISCONN` (connected) or `EOPNOTSUPP` (unconnected);
-    peer gone -> `epipe` (`EPIPE` + `SIGPIPE` unless `MSG_NOSIGNAL`) or partial count; loops pushing
-    available space (files attached to first chunk; a zero-byte send carrying files requires
-    `c.space() > 0` and, when `c.bytes == 0`, `c.has_packet_room()`, waiting or returning `EAGAIN`
-    when full) and blocking on `tx`.
+    peer gone -> `epipe` (`EPIPE` + `SIGPIPE` unless `MSG_NOSIGNAL`) or partial count; loops while
+    `outq.has_room()` (`outq < sndbuf`), pushing chunks up to `min((sndbuf >> 1) - 64,
+    STREAM_MAX_CHUNK = 36_544)` bytes and charging `stream_truesize` to the sender's `SenderState`
+    (files attached to first chunk; a zero-byte send carrying files also checks `outq.has_room()`),
+    and blocking on `[tx, outq]`.
   - `SOCK_SEQPACKET` (never raises `SIGPIPE`, matching Linux's `unix_seqpacket_sendmsg` ->
     `unix_dgram_sendmsg`): ignores destination address; peer gone / `SHUT_WR` -> `EPIPE` without
-    `SIGPIPE`; `len > DGRAM_MAX_LEN (212_960)` -> `EMSGSIZE`; waits until `c.has_packet_room()`
-    (`c.truesize < CAPACITY`).
+    `SIGPIPE`; `len > dgram_max_len(sndbuf)` (`sndbuf - 32`) -> `EMSGSIZE`; waits on `[tx, outq]`
+    until `outq.has_room()`.
   - `SOCK_DGRAM` (never raises `SIGPIPE`): local `shut_wr` -> `EPIPE`; dead connected peer
     disconnects (`ECONNREFUSED`, then `ENOTCONN`); both addressed and connected unaddressed sends
     check `unix_may_send` (`c.may_receive_from(&own_rx)`, `EPERM`);
-    target `c.eof` (`SHUT_RD`) -> `EPIPE`; `len > DGRAM_MAX_LEN (212_960)` -> `EMSGSIZE`; waits
-    until `c.has_packet_room()` (`c.truesize < CAPACITY`) and `!c.holds_back(&own_rx)` (holding
-    more than `max_qlen` packets unless target is connected back to sender, so `max_qlen + 1` queue
-    and the next waits).
+    target `c.eof` (`SHUT_RD`) -> `EPIPE`; `len > dgram_max_len(sndbuf)` (`sndbuf - 32`) ->
+    `EMSGSIZE`; waits on `[rx, outq]` until the sender's `outq.has_room()` (`sk_wmem_alloc <
+    sk_sndbuf`, shared across all destinations of this sender and independent of other senders)
+    and `!c.holds_back(&own_rx)` (holding more than `max_qlen` packets unless target is connected
+    back to sender, so `max_qlen + 1` queue and the next waits).
 - Receive paths:
   - `SOCK_STREAM` (`unix::recv_into`, used by `recvmsg`, `recvfrom`, `read` and `readv`): peeks from
     `Channel` and copies into guest iovecs via `net::scatter_partial` *before* consuming, consuming
     only the copied byte count on partial copy fault (leaving unread bytes intact) or `EFAULT` when
     nothing was copied. `MSG_TRUNC` is ignored on `SOCK_STREAM` (matching Linux's
-    `unix_stream_read_generic`, unlike TCP). `MSG_WAITALL` loops until full (capped at 1 MiB), receipt of files,
-    a credential change once the read has taken credentials, reset (left pending on a partial read),
-    EOF or error/timeout. A waiting read can start taking credentials when the option is enabled.
+    `unix_stream_read_generic`, unlike TCP). Non-peek reads compute `target = max` under
+    `MSG_WAITALL` (capped at 1 MiB) or `min(SO_RCVLOWAT, max)` otherwise (Linux's `sock_rcvlowat`),
+    looping until `copied >= target`, receipt of files, a credential change once the read has taken
+    credentials, reset (left pending on a partial read), EOF, short copy fault, or
+    nonblocking/timeout/signal. `MSG_PEEK`, `SOCK_DGRAM` and `SOCK_SEQPACKET` do not wait for
+    `SO_RCVLOWAT`. A waiting read can start taking credentials when the option is enabled.
     Once taken, they delimit the rest of that read even if the option is then disabled.
   - `Channel::read_stream` merges packets in order, taking `from` from the first packet, stopping
     after a packet with `fds`. When the receiver has `SO_PASSCRED` enabled, it also stops before
@@ -222,25 +230,30 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
   `socketpair`/`connect_stream` and never cleared or updated by `connect_dgram`, translated into
   caller namespaces; `(0, -1, -1)` when `None`, such as unconnected or `connect_dgram`-connected
   `socket()`-created datagrams, while `socketpair(SOCK_DGRAM)` sockets keep their original creds
-  across `AF_UNSPEC` disconnect or reconnection), and recorded generic `SockOpts` (buffer sizes,
-  `SO_RCVLOWAT`, linger, keepalive, priority, etc., with no runtime effect). `setsockopt` rejects
+  across `AF_UNSPEC` disconnect or reconnection), and generic `SockOpts`: `SO_SNDBUF`/
+  `SO_SNDBUFFORCE` update live `SenderState::sndbuf` (doubled and clamped to `[4608, 2 * 212_992]`
+  without `FORCE`, waking blocked writers and `POLLOUT` waiters on growth), `SO_RCVLOWAT` controls
+  blocking `SOCK_STREAM` receives, and `SO_RCVBUF`/`SO_RCVBUFFORCE`, linger, keepalive, priority,
+  etc. are recorded only (matching Linux AF_UNIX, where `SO_RCVBUF` does not bound queues).
+  `setsockopt` rejects
   read-only `SO_SNDLOWAT`, `SO_ACCEPTCONN` and `SO_PEERCRED` (as well as `SO_TYPE`, `SO_ERROR`,
   `SO_PROTOCOL`, `SO_DOMAIN` via `SockOpts`) with `EINVAL` for `< 4` bytes and `ENOPROTOOPT`
   otherwise; other unknown `SOL_SOCKET` names are silently ignored by `setsockopt` and return
   `ENOPROTOOPT` from `getsockopt`. `getsockname`/`getpeername` return `u.name()`/`peer_name()`
   (reading the live shared `AddrRef`; `ENOTCONN` if unconnected/listening).
-- Readiness: `POLLIN|POLLRDNORM` on queued data, EOF or pending accepts; `POLLOUT|POLLWRNORM` when
-  `truesize * 2 <= CAPACITY` for datagram/seqpacket (`packet_budget`) or `bytes * 4 <= CAPACITY`
-  (plus `truesize * 2 <= CAPACITY` when `bytes == 0`) for stream (or `tx.closed`, or unconnected
-  stream with `POLLHUP`), and for connected datagrams when peer is neither full nor `holds_back`
-  (ignoring peer `SHUT_RD`, matching Linux's `unix_dgram_poll`); `POLLRDHUP`/`POLLHUP` from shutdown
-  state;
+- Readiness: `POLLIN|POLLRDNORM` on queued data (regardless of `SO_RCVLOWAT`, matching Linux's
+  `unix_poll`), EOF or pending accepts; `POLLOUT|POLLWRNORM` when `outq.writable()` (`(outq + 1) *
+  4 <= sndbuf`, Linux's `unix_writable` for stream, seqpacket and both connected and unconnected
+  datagrams — peer close discards its receive queue so `outq` drops to 0, while peer `SHUT_RD`
+  leaves `outq` intact — and for connected datagrams additionally `!peer.holds_back`), or
+  unconnected stream with `POLLHUP`; `POLLRDHUP`/`POLLHUP` from shutdown state;
   `POLLERR` while `rx.reset` is set (on stream, seqpacket and datagram sockets). `wake_objects`
-  registers `self.rx` plus `Stream`'s `rx`/`tx` or live `Dgram` `tx`; `arrivals` exposes
-  `[connections, 0]` for listeners and `[rx.arrivals, tx.taken]` for channels. `FIONREAD` uses
-  `unread()` (`rx.bytes` payload bytes for stream/seqpacket, head packet length for datagram,
-  `EINVAL` for listener); `SIOCOUTQ` (`TIOCOUTQ`) uses `outq()` (queued packet `truesize` bytes
-  sent by this socket still in peer buffers, >= 768 B per packet; 0 on listeners).
+  registers `self.rx`, `self.outq` plus `Stream`'s `rx`/`tx` or live `Dgram` `tx`; `arrivals`
+  exposes `[connections, 0]` for listeners, `[rx.arrivals, outq.taken]` for streams and
+  unconnected sockets, and `[rx.arrivals, outq.taken + tx.taken]` for connected datagrams.
+  `FIONREAD` uses `unread()` (`rx.bytes` payload bytes for stream/seqpacket, head packet length for
+  datagram, `EINVAL` for listener); `SIOCOUTQ` (`TIOCOUTQ`) uses `outq()` (queued packet `truesize`
+  bytes sent by this socket still in peer buffers, >= 768 B per packet; 0 on listeners).
 - `/proc/net/unix`: collects sockets from all tasks' fd tables plus `unix::inflight_sockets` (which
   includes both `SCM_RIGHTS` in-flight sockets and tracked pending server embryos from
   `Names::embryos`), filtered by target task's netns, sorted by `socket_ino`. State 1 for
@@ -315,10 +328,7 @@ dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel
 
 ## Confirmed bugs / technical debt
 
-- **Smaller Linux divergences:** `SO_SNDBUF`/`SO_RCVBUF` and `SO_RCVLOWAT` are recorded only (the
-  channel capacity stays `CAPACITY = 212_992`); `packet_truesize` approximates Linux's slab/page
-  buckets rather than exact kernel `sk_buff` allocations for payloads above 4 KiB, and `SOCK_STREAM`
-  write room still caps by payload `CAPACITY` rather than `truesize`.
+None currently recorded.
 
 ## Open questions
 
@@ -326,6 +336,7 @@ None currently recorded.
 
 ## To verify
 
-- Linux 6.1 comparisons above for receive-time sender addresses, `SOCK_SEQPACKET` `SIGPIPE`,
-  `SIOCOUTQ`/`truesize` and `DGRAM_MAX_LEN` were verified empirically against Linux; differential
-  tests cover common paths natively.
+- Linux 6.1/6.8 comparisons above for receive-time sender addresses, `SOCK_SEQPACKET` `SIGPIPE`,
+  `SIOCOUTQ`/`truesize` (`packet_truesize`, `stream_truesize`, `stream_chunk_limit`),
+  `SO_SNDBUF`/`SO_RCVBUF`/`SO_RCVLOWAT`, `unix_writable` and dynamic `dgram_max_len` were verified
+  empirically against native Linux; differential tests cover common paths natively.

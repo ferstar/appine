@@ -10,6 +10,7 @@ cat > unix_fixes.c <<'C'
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -483,6 +484,80 @@ int main(void)
             if (c != 0)
                 close(sv[1]);
         }
+    }
+
+    /* 8. SO_SNDBUF/SO_RCVBUF/SO_RCVLOWAT and SOCK_STREAM truesize write room */
+    printf("-- sndbuf/rcvbuf/rcvlowat & stream truesize\n");
+    {
+        int sv[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        int v = 4096, got = 0;
+        socklen_t gl = sizeof got;
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+        getsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &got, &gl);
+        int rmin = 1, rgot = 0;
+        setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &rmin, sizeof rmin);
+        getsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &rgot, &gl);
+        char *big = calloc(1, 65536);
+        ssize_t n = send(sv[0], big, 65536, MSG_DONTWAIT);
+        int oq = -1, iq = -1;
+        ioctl(sv[0], SIOCOUTQ, &oq);
+        ioctl(sv[1], FIONREAD, &iq);
+        printf("stream sb=%d rb=%d send=%zd outq=%d inq=%d pollout=%d\n",
+               got, rgot, n, oq, iq, !!(poll_ev(sv[0]) & POLLOUT));
+        v = 65536;
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+        printf("stream raised pollout=%d\n", !!(poll_ev(sv[0]) & POLLOUT));
+        close(sv[0]);
+        close(sv[1]);
+
+        /* Stream 1B truesize cap and writable boundary */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        v = 3072; /* doubled -> 6144, sb/4 = 1536 */
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+        send(sv[0], "a", 1, MSG_DONTWAIT);
+        int p1 = !!(poll_ev(sv[0]) & POLLOUT);
+        send(sv[0], "b", 1, MSG_DONTWAIT);
+        int p2 = !!(poll_ev(sv[0]) & POLLOUT);
+        v = 3074; /* doubled -> 6148 */
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+        int p3 = !!(poll_ev(sv[0]) & POLLOUT);
+        printf("writable boundary: p1=%d p2=%d p3=%d\n", p1, p2, p3);
+        close(sv[0]);
+        close(sv[1]);
+
+        /* DGRAM dynamic max_len = sk_sndbuf - 32 */
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+        v = 1; /* clamped -> 4608 */
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+        errno = 0;
+        ssize_t d1 = send(sv[0], big, 4576, MSG_DONTWAIT);
+        int e1 = d1 < 0 ? errno : 0;
+        recv(sv[1], big, 8192, MSG_DONTWAIT);
+        errno = 0;
+        ssize_t d2 = send(sv[0], big, 4577, MSG_DONTWAIT);
+        int e2 = d2 < 0 ? errno : 0;
+        printf("dgram max_len: 4576=(%zd,%d) 4577=(%zd,%d)\n", d1, e1, d2, e2);
+        close(sv[0]);
+        close(sv[1]);
+
+        /* SO_RCVLOWAT on stream */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        v = 10;
+        setsockopt(sv[1], SOL_SOCKET, SO_RCVLOWAT, &v, sizeof v);
+        send(sv[0], "12345", 5, 0);
+        int lp = !!(poll_ev(sv[1]) & POLLIN);
+        ssize_t rpeek = recv(sv[1], buf, 20, MSG_PEEK);
+        ssize_t rnb = recv(sv[1], buf, 20, MSG_DONTWAIT);
+        send(sv[0], "abcde", 5, 0);
+        ssize_t rsmall = recv(sv[1], buf, 4, 0);
+        shutdown(sv[0], SHUT_WR);
+        ssize_t reof = recv(sv[1], buf, 20, 0);
+        printf("rcvlowat stream: pollin=%d peek=%zd nb=%zd small=%zd eof=%zd\n",
+               lp, rpeek, rnb, rsmall, reof);
+        close(sv[0]);
+        close(sv[1]);
+        free(big);
     }
     return 0;
 }

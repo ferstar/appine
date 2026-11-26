@@ -306,9 +306,8 @@ static void test_tracked_epoll_semantics(void)
         socklen_t blen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + 16);
         CHECK(bind(ub, (void *)&baddr, blen) == 0, "bind ub");
         CHECK(connect(ua, (void *)&baddr, blen) == 0, "connect ua -> ub");
-        /* Fill ub's receive queue until EAGAIN */
-        char chunk[4096];
-        memset(chunk, 'x', sizeof(chunk));
+        /* Fill ub's max_dgram_qlen without exhausting ua's own SO_SNDBUF/4 writable budget */
+        char chunk[1] = {'x'};
         while (send(ua, chunk, sizeof(chunk), 0) > 0)
             ;
         CHECK(errno == EAGAIN, "expected EAGAIN filling unix dgram");

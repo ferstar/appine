@@ -65,9 +65,11 @@ listen notifications (`android/service`).
   held as `Kernel::orig_dst`.
 - DNS: `Kernel::dns_queries` (query number → weak socket), `Shared::dns_answers` (answers waiting
   for the timer thread).
-- `SockOpts` — the generic `SOL_SOCKET` options netlink (`kernel/netlink`) and AF_UNIX sockets only
-  record (debug, reuse, dontroute, broadcast, keepalive, oobinline, no_check, buffer sizes,
-  priority, rcvlowat, linger), set and read back by Linux's `sk_setsockopt`/`sk_getsockopt` rules:
+- `SockOpts` — the generic `SOL_SOCKET` options for in-process netlink (`kernel/netlink`, enforcing
+  `SO_RCVBUF`) and AF_UNIX (`kernel/unix`, enforcing `SO_SNDBUF` and `SO_RCVLOWAT` while recording
+  `SO_RCVBUF` as on Linux) sockets (debug, reuse, dontroute, broadcast, keepalive, oobinline,
+  no_check, buffer sizes, priority, rcvlowat, linger), set and read back by Linux's
+  `sk_setsockopt`/`sk_getsockopt` rules:
   an int needed (`EINVAL`), buffer sizes capped at 212992 unless the `FORCE` form (`CAP_NET_ADMIN`),
   then doubled with Linux's minimums, `SO_DEBUG` on needs `CAP_NET_ADMIN` (`EACCES`), priorities
   outside 0..6 `CAP_NET_RAW` or `CAP_NET_ADMIN` over the namespace owner, the read-only ones

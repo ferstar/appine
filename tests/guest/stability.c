@@ -163,9 +163,9 @@ static void test_unix_partial_send_no_sigpipe(void)
 
     int sv[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
-    static char buf[32768];
+    static char buf[65536];
     memset(buf, 'a', sizeof(buf));
-    /* Fill channel completely, then drain 4096 bytes so blocking send writes 4096 then waits. */
+    /* Fill channel completely, then drain 4096 bytes so blocking send writes one chunk then waits. */
     while (send(sv[0], buf, 4096, MSG_DONTWAIT) > 0) {
     }
     CHECK(errno == EAGAIN, "fill expected EAGAIN");
@@ -176,7 +176,8 @@ static void test_unix_partial_send_no_sigpipe(void)
     CHECK(pthread_create(&th, NULL, close_fd_later, &peer) == 0, "pthread_create");
     ssize_t n = send(sv[0], buf, sizeof(buf), 0);
     pthread_join(th, NULL);
-    CHECK(n == 4096, "partial stream send expected 4096, got %zd", n);
+    CHECK(n > 0 && n < (ssize_t)sizeof(buf), "partial stream send expected partial count, got %zd",
+          n);
     CHECK(got_sigpipe == 0, "partial stream send must not raise SIGPIPE (got %d)", got_sigpipe);
 
     /* Next send writes 0 bytes and must fail with EPIPE and raise SIGPIPE. */

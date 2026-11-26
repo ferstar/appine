@@ -40,6 +40,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ipc.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/select.h>
@@ -1170,6 +1171,180 @@ static void test_select_closed_high_fd(void)
     wait_ok(child, "select after fork");
 }
 
+struct unix_delayed_arg {
+    int fd;
+    int action; /* 0 = send "67890", 1 = raise SO_SNDBUF, 2 = SHUT_WR, 3 = drain 1 dgram */
+};
+
+static void *unix_delayed_thread(void *arg)
+{
+    struct unix_delayed_arg *a = arg;
+    sleep_ms(30);
+    if (a->action == 0) {
+        CHECK(send(a->fd, "67890", 5, 0) == 5, "delayed send 67890");
+    } else if (a->action == 1) {
+        int big = 65536;
+        CHECK(setsockopt(a->fd, SOL_SOCKET, SO_SNDBUF, &big, sizeof(big)) == 0,
+              "delayed raise SO_SNDBUF");
+    } else if (a->action == 2) {
+        CHECK(shutdown(a->fd, SHUT_WR) == 0, "delayed SHUT_WR");
+    } else if (a->action == 3) {
+        char buf[1024];
+        CHECK(recv(a->fd, buf, sizeof(buf), 0) == 1024, "delayed drain dgram");
+    }
+    return NULL;
+}
+
+static void test_unix_buf_sizing_and_rcvlowat(void)
+{
+    /* 1. Stream SO_SNDBUF chunking, truesize backpressure, SIOCOUTQ, FIONREAD, POLLOUT */
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0, "socketpair stream buf");
+    int sb_set = 4096;
+    CHECK(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sb_set, sizeof(sb_set)) == 0, "set SO_SNDBUF");
+    int sb = 0;
+    socklen_t sl = sizeof(sb);
+    CHECK(getsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sb, &sl) == 0 && sb == 8192,
+          "SO_SNDBUF doubled to 8192 (got %d)", sb);
+
+    /* Shrinking receiver SO_RCVBUF does not affect AF_UNIX queueing */
+    int rb_set = 1;
+    CHECK(setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &rb_set, sizeof(rb_set)) == 0, "set SO_RCVBUF");
+    int rb = 0;
+    sl = sizeof(rb);
+    CHECK(getsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &rb, &sl) == 0 && rb == 2304,
+          "SO_RCVBUF clamped to 2304 (got %d)", rb);
+
+    char *big = calloc(1, 65536);
+    CHECK(big != NULL, "calloc big");
+    ssize_t n = send(sv[0], big, 65536, MSG_DONTWAIT);
+    CHECK(n == 8064, "stream send with sb=8192 got %zd (expected 8064)", n);
+    int outq = 0, inq = 0;
+    CHECK(ioctl(sv[0], TIOCOUTQ, &outq) == 0 && outq == 9728, "SIOCOUTQ=%d", outq);
+    CHECK(ioctl(sv[1], FIONREAD, &inq) == 0 && inq == 8064, "FIONREAD=%d", inq);
+    struct pollfd p = {.fd = sv[0], .events = POLLOUT};
+    CHECK(poll(&p, 1, 0) == 0, "full stream must not poll POLLOUT");
+
+    /* Raising SO_SNDBUF from another thread wakes blocked epoll_wait(EPOLLOUT|EPOLLET) */
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    CHECK(ep >= 0, "epoll_create1");
+    struct epoll_event ev = {.events = EPOLLOUT | EPOLLET, .data.u64 = 77};
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &ev) == 0, "epoll add sv[0]");
+    CHECK(epoll_wait(ep, &ev, 1, 0) == 0, "epoll must not fire while full");
+    struct unix_delayed_arg a_raise = {.fd = sv[0], .action = 1};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, unix_delayed_thread, &a_raise) == 0, "spawn raise epoll");
+    CHECK(epoll_wait(ep, &ev, 1, 2000) == 1 && (ev.events & EPOLLOUT) && ev.data.u64 == 77,
+          "raising SO_SNDBUF must wake epoll_wait(EPOLLOUT|EPOLLET)");
+    CHECK(pthread_join(th, NULL) == 0, "join raise epoll");
+    close(ep);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* 2. Raising SO_SNDBUF wakes a blocked send() */
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0, "socketpair unblock");
+    CHECK(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sb_set, sizeof(sb_set)) == 0, "set sb");
+    while (send(sv[0], "x", 1, MSG_DONTWAIT) == 1)
+        ;
+    CHECK(errno == EAGAIN, "fill with 1B writes");
+    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+    CHECK(setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0, "set SO_SNDTIMEO");
+    struct unix_delayed_arg a_unblock = {.fd = sv[0], .action = 1};
+    CHECK(pthread_create(&th, NULL, unix_delayed_thread, &a_unblock) == 0, "spawn raise send");
+    CHECK(send(sv[0], "z", 1, 0) == 1, "blocked send must unblock when SO_SNDBUF grows");
+    CHECK(pthread_join(th, NULL) == 0, "join raise send");
+    close(sv[0]);
+    close(sv[1]);
+
+    /* 3. SO_SNDBUFFORCE (privileged) raises past 2 * wmem_max */
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0, "socketpair force");
+    int force_val = 300000;
+    CHECK(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUFFORCE, &force_val, sizeof(force_val)) == 0,
+          "SO_SNDBUFFORCE as root");
+    sl = sizeof(sb);
+    CHECK(getsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sb, &sl) == 0 && sb == 600000,
+          "SO_SNDBUFFORCE got %d", sb);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* 4. SO_RCVLOWAT on SOCK_STREAM: blocking wait, timeout, EOF, SCM_RIGHTS, poll */
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0, "socketpair lowat");
+    int lowat = 10;
+    CHECK(setsockopt(sv[1], SOL_SOCKET, SO_RCVLOWAT, &lowat, sizeof(lowat)) == 0, "set lowat=10");
+    CHECK(send(sv[0], "12345", 5, 0) == 5, "send 5B");
+    /* poll(POLLIN) still fires immediately on AF_UNIX regardless of SO_RCVLOWAT */
+    p.fd = sv[1];
+    p.events = POLLIN;
+    CHECK(poll(&p, 1, 0) == 1 && (p.revents & POLLIN), "poll POLLIN with 5B < lowat");
+    /* Blocking recv(20, 0) waits until 5 more bytes arrive */
+    struct unix_delayed_arg a_send = {.fd = sv[0], .action = 0};
+    CHECK(pthread_create(&th, NULL, unix_delayed_thread, &a_send) == 0, "spawn lowat sender");
+    char rbuf[32] = {0};
+    n = recv(sv[1], rbuf, 20, 0);
+    CHECK(pthread_join(th, NULL) == 0, "join lowat sender");
+    CHECK(n == 10 && memcmp(rbuf, "1234567890", 10) == 0,
+          "blocking recv with lowat=10 got %zd '%.*s'", n, (int)(n > 0 ? n : 0), rbuf);
+
+    /* Blocking recv(20, 0) with 5B + SO_RCVTIMEO returns partial 5B on timeout */
+    CHECK(send(sv[0], "abcde", 5, 0) == 5, "send abcde");
+    tv.tv_sec = 0;
+    tv.tv_usec = 50000;
+    CHECK(setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0, "set SO_RCVTIMEO");
+    n = recv(sv[1], rbuf, 20, 0);
+    CHECK(n == 5 && memcmp(rbuf, "abcde", 5) == 0, "lowat timeout got %zd", n);
+
+    /* Blocking recv(20, 0) with 2B + SCM_RIGHTS returns immediately */
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    CHECK(setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0, "reset SO_RCVTIMEO");
+    CHECK(send_fd(sv[0], sv[0], "xy", 2, 0) == 2, "send 2B+fd");
+    n = recv(sv[1], rbuf, 20, 0);
+    CHECK(n == 2 && memcmp(rbuf, "xy", 2) == 0, "lowat SCM_RIGHTS got %zd", n);
+
+    /* Blocking recv(20, 0) with 5B queued returns 5B once peer shuts down */
+    CHECK(send(sv[0], "hello", 5, 0) == 5, "send hello");
+    struct unix_delayed_arg a_eof = {.fd = sv[0], .action = 2};
+    CHECK(pthread_create(&th, NULL, unix_delayed_thread, &a_eof) == 0, "spawn lowat eof");
+    n = recv(sv[1], rbuf, 20, 0);
+    CHECK(pthread_join(th, NULL) == 0, "join lowat eof");
+    CHECK(n == 5 && memcmp(rbuf, "hello", 5) == 0, "lowat EOF got %zd", n);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* 5. Datagram per-sender SO_SNDBUF across two receivers wakes sender when receiver 1 drains */
+    int s1 = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int s2 = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int cli = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    CHECK(s1 >= 0 && s2 >= 0 && cli >= 0, "dgram multi-rx sockets");
+    struct sockaddr_un a1, a2;
+    socklen_t l1, l2;
+    make_abstract(&a1, &l1, "pkg2_sndbuf_s1");
+    make_abstract(&a2, &l2, "pkg2_sndbuf_s2");
+    CHECK(bind(s1, (struct sockaddr *)&a1, l1) == 0, "bind s1");
+    CHECK(bind(s2, (struct sockaddr *)&a2, l2) == 0, "bind s2");
+    int min_sb = 1;
+    CHECK(setsockopt(cli, SOL_SOCKET, SO_SNDBUF, &min_sb, sizeof(min_sb)) == 0, "cli min sb");
+    CHECK(sendto(cli, big, 1024, MSG_DONTWAIT, (struct sockaddr *)&a1, l1) == 1024, "dgram 1");
+    CHECK(sendto(cli, big, 1024, MSG_DONTWAIT, (struct sockaddr *)&a1, l1) == 1024, "dgram 2");
+    errno = 0;
+    CHECK(sendto(cli, big, 1024, MSG_DONTWAIT, (struct sockaddr *)&a2, l2) == -1 && errno == EAGAIN,
+          "dgram to s2 blocked by sender outq");
+    p.fd = cli;
+    p.events = POLLOUT;
+    CHECK(poll(&p, 1, 0) == 0, "unconnected dgram full must not poll POLLOUT");
+    /* Blocking sendto(s2) wakes when s1 drains one packet from cli */
+    CHECK(setsockopt(cli, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0, "cli SO_SNDTIMEO");
+    struct unix_delayed_arg a_drain = {.fd = s1, .action = 3};
+    CHECK(pthread_create(&th, NULL, unix_delayed_thread, &a_drain) == 0, "spawn drain s1");
+    CHECK(sendto(cli, big, 1024, 0, (struct sockaddr *)&a2, l2) == 1024,
+          "blocked sendto(s2) must unblock when s1 drains sender's packet");
+    CHECK(pthread_join(th, NULL) == 0, "join drain s1");
+    close(cli);
+    close(s1);
+    close(s2);
+    free(big);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--exit-ok") == 0)
@@ -1186,6 +1361,7 @@ int main(int argc, char **argv)
     test_passcred_autobind();
     test_unix_dgram_may_send_and_paths();
     test_unix_stream_dgram_faults_and_zero_byte_scm();
+    test_unix_buf_sizing_and_rcvlowat();
     test_unix_gc_non_close_paths();
     test_sysv_sem_undo_and_limits();
     test_mqueue_root_perms_and_sticky();
