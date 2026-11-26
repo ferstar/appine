@@ -7,6 +7,7 @@
  * - AF_UNIX recvmsg EFAULT on msg_name or read-only msghdr drops installed SCM_RIGHTS fds;
  * - AF_UNIX blocked syscall keeps FileRef alive across concurrent close and unix::collect;
  * - sched_setattr failing RLIMIT_NICE leaves policy and RESET_ON_FORK unchanged;
+ * - sched_setscheduler/sched_setparam/sched_setattr enforce target RLIMIT_RTPRIO without CAP_SYS_NICE;
  * - pidfd_send_signal from a child pid namespace translates si_pid into the target namespace.
  */
 #define _GNU_SOURCE
@@ -58,8 +59,14 @@ struct sched_attr {
 #ifndef SCHED_BATCH
 #define SCHED_BATCH 3
 #endif
+#ifndef SCHED_IDLE
+#define SCHED_IDLE 5
+#endif
 #ifndef SCHED_FLAG_RESET_ON_FORK
 #define SCHED_FLAG_RESET_ON_FORK 1
+#endif
+#ifndef RLIMIT_RTPRIO
+#define RLIMIT_RTPRIO 14
 #endif
 
 static volatile sig_atomic_t got_sigpipe = 0;
@@ -376,6 +383,257 @@ static void test_sched_setattr_atomic(void)
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "sched_setattr child failed: %d", status);
 }
 
+static void run_child(const char *name, void (*fn)(void))
+{
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork for %s", name);
+    if (pid == 0) {
+        fn();
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid, "waitpid %s", name);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "%s child failed: %d", name, status);
+}
+
+static void rtprio_zero_and_bounded(void)
+{
+    /* Default RLIMIT_RTPRIO is 0: unprivileged RT transitions fail with EPERM. */
+    struct rlimit rl = {.rlim_cur = 0, .rlim_max = 0};
+    CHECK(setrlimit(RLIMIT_RTPRIO, &rl) == 0, "setrlimit RTPRIO=0");
+    CHECK(setuid(65534) == 0, "setuid(65534)");
+
+    struct sched_param sp = {.sched_priority = 1};
+    errno = 0;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp) == -1 && errno == EPERM,
+          "RTPRIO=0 FIFO must EPERM");
+    errno = 0;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_RR, &sp) == -1 && errno == EPERM,
+          "RTPRIO=0 RR must EPERM");
+    struct sched_attr attr = {0};
+    attr.size = sizeof(attr);
+    attr.sched_policy = SCHED_FIFO;
+    attr.sched_priority = 1;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setattr, 0, &attr, 0) == -1 && errno == EPERM,
+          "RTPRIO=0 sched_setattr FIFO must EPERM");
+}
+
+static void rtprio_from_sched_idle_denied(void)
+{
+    /* Leaving SCHED_IDLE into SCHED_FIFO still requires RLIMIT_NICE for task_nice(p) on Linux 6.1. */
+    struct rlimit nice_rl = {.rlim_cur = 0, .rlim_max = 0};
+    struct rlimit rt_rl = {.rlim_cur = 10, .rlim_max = 10};
+    CHECK(setrlimit(RLIMIT_NICE, &nice_rl) == 0, "setrlimit NICE=0");
+    CHECK(setrlimit(RLIMIT_RTPRIO, &rt_rl) == 0, "setrlimit RTPRIO=10");
+    struct sched_param sp = {.sched_priority = 0};
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_IDLE, &sp) == 0, "enter SCHED_IDLE");
+    CHECK(setuid(65534) == 0, "setuid(65534)");
+
+    sp.sched_priority = 10;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp) == -1 && errno == EPERM,
+          "SCHED_IDLE->FIFO with RLIMIT_NICE=0 must EPERM");
+    CHECK(syscall(SYS_sched_getscheduler, 0) == SCHED_IDLE, "policy remains SCHED_IDLE");
+}
+
+static void rtprio_within_limit(void)
+{
+    struct rlimit nice_rl = {.rlim_cur = 20, .rlim_max = 20};
+    struct rlimit rt_rl = {.rlim_cur = 10, .rlim_max = 10};
+    CHECK(setrlimit(RLIMIT_NICE, &nice_rl) == 0, "setrlimit NICE=20");
+    CHECK(setrlimit(RLIMIT_RTPRIO, &rt_rl) == 0, "setrlimit RTPRIO=10");
+    /* Enter SCHED_IDLE before dropping privileges so we also cover SCHED_IDLE -> SCHED_FIFO. */
+    struct sched_param sp = {.sched_priority = 0};
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_IDLE, &sp) == 0, "enter SCHED_IDLE");
+    CHECK(setuid(65534) == 0, "setuid(65534)");
+
+    /* Leaving SCHED_IDLE into SCHED_FIFO succeeds when both RLIMIT_NICE and RLIMIT_RTPRIO permit. */
+    sp.sched_priority = 10;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp) == 0, "SCHED_IDLE->FIFO prio 10");
+    CHECK(syscall(SYS_sched_getscheduler, 0) == SCHED_FIFO, "getscheduler FIFO");
+    struct sched_param got = {0};
+    CHECK(syscall(SYS_sched_getparam, 0, &got) == 0 && got.sched_priority == 10, "getparam 10");
+
+    /* Raising above RLIMIT_RTPRIO via sched_setparam fails with EPERM. */
+    sp.sched_priority = 11;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setparam, 0, &sp) == -1 && errno == EPERM, "setparam 11 must EPERM");
+
+    /* Switching to SCHED_RR within limit succeeds. */
+    sp.sched_priority = 5;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_RR, &sp) == 0, "FIFO->RR prio 5");
+    CHECK(syscall(SYS_sched_getscheduler, 0) == SCHED_RR, "getscheduler RR");
+
+    /* sched_setattr within limit succeeds; above limit fails without mutating policy/prio. */
+    struct sched_attr attr = {0};
+    attr.size = sizeof(attr);
+    attr.sched_policy = SCHED_FIFO;
+    attr.sched_priority = 8;
+    CHECK(syscall(SYS_sched_setattr, 0, &attr, 0) == 0, "sched_setattr FIFO 8");
+    attr.sched_policy = SCHED_RR;
+    attr.sched_priority = 11;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setattr, 0, &attr, 0) == -1 && errno == EPERM,
+          "sched_setattr RR 11 must EPERM");
+    struct sched_attr after = {0};
+    CHECK(syscall(SYS_sched_getattr, 0, &after, sizeof(after), 0) == 0, "sched_getattr");
+    CHECK(after.sched_policy == SCHED_FIFO && after.sched_priority == 8,
+          "failed sched_setattr mutated policy=%u prio=%u", after.sched_policy,
+          after.sched_priority);
+
+    /* SCHED_DEADLINE always requires CAP_SYS_NICE regardless of RLIMIT_RTPRIO. */
+    struct sched_attr dl = {0};
+    dl.size = sizeof(dl);
+    dl.sched_policy = 6; /* SCHED_DEADLINE */
+    dl.sched_runtime = 10000;
+    dl.sched_deadline = 20000;
+    dl.sched_period = 20000;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setattr, 0, &dl, 0) == -1 && errno == EPERM,
+          "SCHED_DEADLINE without CAP_SYS_NICE must EPERM");
+}
+
+static void rtprio_lowering_and_keep_flags(void)
+{
+    /* Start as SCHED_FIFO prio 20 while privileged, then drop privileges with RLIMIT_RTPRIO=0. */
+    struct sched_param sp = {.sched_priority = 20};
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp) == 0, "root FIFO 20");
+    struct rlimit rl = {.rlim_cur = 0, .rlim_max = 0};
+    CHECK(setrlimit(RLIMIT_RTPRIO, &rl) == 0, "setrlimit RTPRIO=0");
+    CHECK(setuid(65534) == 0, "setuid(65534)");
+
+    /* Lowering priority under the same policy is allowed even with RLIMIT_RTPRIO=0. */
+    sp.sched_priority = 15;
+    CHECK(syscall(SYS_sched_setparam, 0, &sp) == 0, "setparam lower 20->15");
+    sp.sched_priority = 10;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp) == 0, "setscheduler lower 15->10");
+
+    /* Raising priority above current (and above 0) fails with EPERM. */
+    sp.sched_priority = 12;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setparam, 0, &sp) == -1 && errno == EPERM,
+          "setparam raise 10->12 with RTPRIO=0 must EPERM");
+
+    /* Changing RT policy (FIFO->RR) with RLIMIT_RTPRIO=0 fails with EPERM even when lowering. */
+    sp.sched_priority = 5;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_RR, &sp) == -1 && errno == EPERM,
+          "FIFO->RR with RTPRIO=0 must EPERM");
+
+    /* sched_setattr KEEP_POLICY|KEEP_PARAMS updating uclamp succeeds on an existing RT task. */
+    struct sched_attr keep = {0};
+    keep.size = sizeof(keep);
+    keep.sched_flags = 0x08 | 0x10 | 0x20; /* KEEP_POLICY | KEEP_PARAMS | UTIL_CLAMP_MIN */
+    keep.sched_util_min = 256;
+    CHECK(syscall(SYS_sched_setattr, 0, &keep, 0) == 0,
+          "sched_setattr KEEP_POLICY|KEEP_PARAMS on RT task with RTPRIO=0");
+    struct sched_attr got = {0};
+    CHECK(syscall(SYS_sched_getattr, 0, &got, sizeof(got), 0) == 0, "sched_getattr after keep");
+    CHECK(got.sched_policy == SCHED_FIFO && got.sched_priority == 10 && got.sched_util_min == 256,
+          "unexpected state after keep: policy=%u prio=%u util_min=%u", got.sched_policy,
+          got.sched_priority, got.sched_util_min);
+
+    /* sched_setattr KEEP_PARAMS with same policy adding RESET_ON_FORK also succeeds. */
+    struct sched_attr reset = {0};
+    reset.size = sizeof(reset);
+    reset.sched_policy = SCHED_FIFO;
+    reset.sched_flags = 0x10 | SCHED_FLAG_RESET_ON_FORK;
+    CHECK(syscall(SYS_sched_setattr, 0, &reset, 0) == 0,
+          "sched_setattr KEEP_PARAMS|RESET_ON_FORK on RT task with RTPRIO=0");
+    memset(&got, 0, sizeof(got));
+    CHECK(syscall(SYS_sched_getattr, 0, &got, sizeof(got), 0) == 0, "sched_getattr after reset");
+    CHECK(got.sched_policy == SCHED_FIFO && got.sched_priority == 10 &&
+              (got.sched_flags & SCHED_FLAG_RESET_ON_FORK) != 0,
+          "unexpected state after reset: policy=%u prio=%u flags=%llu", got.sched_policy,
+          got.sched_priority, (unsigned long long)got.sched_flags);
+}
+
+static void rtprio_policy_switch_and_infinity(void)
+{
+    /* Start as SCHED_FIFO prio 20 with RLIMIT_RTPRIO=5, then drop privileges. */
+    struct sched_param sp = {.sched_priority = 20};
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp) == 0, "root FIFO 20");
+    struct rlimit rl = {.rlim_cur = 5, .rlim_max = 5};
+    CHECK(setrlimit(RLIMIT_RTPRIO, &rl) == 0, "setrlimit RTPRIO=5");
+    CHECK(setuid(65534) == 0, "setuid(65534)");
+
+    /* With RTPRIO=5 (>0), switching FIFO->RR while lowering 20->15 is allowed on Linux 6.1. */
+    sp.sched_priority = 15;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_RR, &sp) == 0, "FIFO->RR lower 20->15");
+    sp.sched_priority = 16;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setparam, 0, &sp) == -1 && errno == EPERM,
+          "raise 15->16 above RTPRIO=5 must EPERM");
+    sp.sched_priority = 4;
+    CHECK(syscall(SYS_sched_setparam, 0, &sp) == 0, "lower 15->4");
+    sp.sched_priority = 5;
+    CHECK(syscall(SYS_sched_setparam, 0, &sp) == 0, "raise 4->5 within RTPRIO=5");
+}
+
+static void rtprio_infinity_and_cross_process(void)
+{
+    /* RLIM_INFINITY allows up to priority 99, while SCHED_DEADLINE still fails with EPERM. */
+    struct rlimit inf = {.rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY};
+    CHECK(setrlimit(RLIMIT_RTPRIO, &inf) == 0, "setrlimit RTPRIO=INF");
+    CHECK(setuid(65534) == 0, "setuid(65534)");
+    struct sched_param sp = {.sched_priority = 99};
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp) == 0, "RTPRIO=INF FIFO 99");
+    struct sched_attr dl = {0};
+    dl.size = sizeof(dl);
+    dl.sched_policy = 6; /* SCHED_DEADLINE */
+    dl.sched_runtime = 10000;
+    dl.sched_deadline = 20000;
+    dl.sched_period = 20000;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setattr, 0, &dl, 0) == -1 && errno == EPERM,
+          "RTPRIO=INF SCHED_DEADLINE must still EPERM");
+
+    /* Cross-process check uses the target's RLIMIT_RTPRIO, not the caller's. */
+    int pfd[2];
+    CHECK(pipe(pfd) == 0, "pipe");
+    pid_t target = fork();
+    CHECK(target >= 0, "fork target");
+    if (target == 0) {
+        close(pfd[0]);
+        struct rlimit trl = {.rlim_cur = 7, .rlim_max = 7};
+        CHECK(setrlimit(RLIMIT_RTPRIO, &trl) == 0, "target setrlimit RTPRIO=7");
+        sp.sched_priority = 0;
+        CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &sp) == 0, "target SCHED_OTHER");
+        char ready = 'R';
+        CHECK(write(pfd[1], &ready, 1) == 1, "signal ready");
+        pause();
+        _exit(0);
+    }
+    close(pfd[1]);
+    char ready = 0;
+    CHECK(read(pfd[0], &ready, 1) == 1 && ready == 'R', "wait target ready");
+    close(pfd[0]);
+
+    /* Lower caller's own RLIMIT_RTPRIO to 0; target still has 7. */
+    struct rlimit zero = {.rlim_cur = 0, .rlim_max = 0};
+    CHECK(setrlimit(RLIMIT_RTPRIO, &zero) == 0, "caller setrlimit RTPRIO=0");
+    sp.sched_priority = 7;
+    CHECK(syscall(SYS_sched_setscheduler, target, SCHED_FIFO, &sp) == 0,
+          "cross-process FIFO 7 within target RTPRIO=7");
+    sp.sched_priority = 8;
+    errno = 0;
+    CHECK(syscall(SYS_sched_setscheduler, target, SCHED_FIFO, &sp) == -1 && errno == EPERM,
+          "cross-process FIFO 8 above target RTPRIO=7 must EPERM");
+    kill(target, SIGKILL);
+    waitpid(target, NULL, 0);
+}
+
+static void test_sched_rlimit_rtprio(void)
+{
+    run_child("rtprio_zero", rtprio_zero_and_bounded);
+    run_child("rtprio_from_sched_idle_denied", rtprio_from_sched_idle_denied);
+    run_child("rtprio_within_limit", rtprio_within_limit);
+    run_child("rtprio_lowering_and_keep_flags", rtprio_lowering_and_keep_flags);
+    run_child("rtprio_policy_switch", rtprio_policy_switch_and_infinity);
+    run_child("rtprio_infinity_and_cross_process", rtprio_infinity_and_cross_process);
+}
+
 static int pidns_child(void *arg)
 {
     int pfd = *(int *)arg;
@@ -437,6 +695,9 @@ int main(int argc, char **argv)
     fflush(stdout);
     test_sched_setattr_atomic();
     puts("ok sched_setattr_atomic");
+    fflush(stdout);
+    test_sched_rlimit_rtprio();
+    puts("ok sched_rlimit_rtprio");
     fflush(stdout);
     test_cross_pidns_si_pid();
     puts("ok cross_pidns_si_pid");

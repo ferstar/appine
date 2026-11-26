@@ -285,8 +285,8 @@ pub(crate) const RLIMIT_SIGPENDING: u32 = 11;
 pub(crate) const RLIMIT_MSGQUEUE: u32 = 12;
 /// `RLIMIT_NICE`: the lowest nice value reachable without `CAP_SYS_NICE`, recorded as 20 - nice.
 pub(crate) const RLIMIT_NICE: u32 = 13;
-/// `RLIMIT_RTPRIO`.
-const RLIMIT_RTPRIO: u32 = 14;
+/// `RLIMIT_RTPRIO`: the highest real-time priority reachable without `CAP_SYS_NICE`.
+pub(crate) const RLIMIT_RTPRIO: u32 = 14;
 /// The number of resource kinds (`RLIM_NLIMITS`).
 pub(crate) const RLIM_NLIMITS: usize = 16;
 

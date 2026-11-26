@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: reap dead IPC namespaces in post-syscall sweeps, after exit mount collection, and on BKL release)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: enforce RLIMIT_RTPRIO in sched_setscheduler, sched_setparam and sched_setattr)
 
 ## Responsibilities
 
@@ -331,9 +331,11 @@ and `kernel/oom`.
 
 - nice, CPU affinity and I/O priority are per thread (I/O priority shared under `CLONE_IO`) and
   applied to the host thread; raising priority floors at host nice -4 (never above Android's
-  display threads); `SCHED_IDLE` maps to host nice 19; real-time policies are only recorded and
-  always need `CAP_SYS_NICE` in the initial namespace (`RLIMIT_RTPRIO` is not consulted),
-  `SCHED_DEADLINE` also the same owner; a real-time I/O class (needing `CAP_SYS_ADMIN` or
+  display threads); `SCHED_IDLE` maps to host nice 19; real-time policies (`SCHED_FIFO`/`SCHED_RR`)
+  are only recorded and need `CAP_SYS_NICE` in the initial namespace or the target's `RLIMIT_RTPRIO`
+  (switching RT policy needs a non-zero limit, raising RT priority needs it within the limit, and
+  lowering an existing RT priority is allowed), while `SCHED_DEADLINE` always needs `CAP_SYS_NICE`
+  and the same owner; a real-time I/O class (needing `CAP_SYS_ADMIN` or
   `CAP_SYS_NICE`) becomes best-effort on the host. Reset-on-fork turns a real-time child into
   `SCHED_OTHER` with nice 0 and clamps others' nice to at least 0.
 - `sched_setattr` reads structures of 48 to 4096 bytes (0 meaning 48; a larger one with non-zero
@@ -421,8 +423,7 @@ and `kernel/oom`.
 
 ## Open questions
 
-- Is counting `RLIMIT_NPROC` by kernel uid across user namespaces, and never consulting
-  `RLIMIT_RTPRIO`, intended?
+- Is counting `RLIMIT_NPROC` by kernel uid across user namespaces intended?
 
 ## To verify
 

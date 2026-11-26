@@ -7,9 +7,10 @@
 //! ([`appine_hal::host_cpus`]). Real-time policies and real-time priorities are only recorded
 //! (visible in procfs and through the matching get calls). Permissions are checked by Linux's
 //! rules: changing another's settings needs the same effective user ID, raising priority needs
-//! `RLIMIT_NICE` to allow it or `CAP_SYS_NICE`, and real-time policies need `CAP_SYS_NICE`.
-//! `SCHED_DEADLINE` parameters are checked by Linux's rules and recorded, with no bandwidth
-//! admission control.
+//! `RLIMIT_NICE` to allow it or `CAP_SYS_NICE`, real-time policies (`SCHED_FIFO`/`SCHED_RR`) are
+//! gated by the target's `RLIMIT_RTPRIO` or `CAP_SYS_NICE`, and `SCHED_DEADLINE` needs
+//! `CAP_SYS_NICE`. `SCHED_DEADLINE` parameters are checked by Linux's rules and recorded, with no
+//! bandwidth admission control.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -19,7 +20,7 @@ use crate::cell::RefCell;
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
 use crate::kernel::{Cx, INIT};
-use crate::process::{RLIMIT_NICE, ThreadGroup};
+use crate::process::{RLIMIT_NICE, RLIMIT_RTPRIO, ThreadGroup};
 use crate::task::Task;
 
 const PRIO_PROCESS: i32 = 0;
@@ -587,29 +588,42 @@ fn set_policy(
         return Err(Errno::EINVAL);
     }
     let cred = cx.cred();
-    if !same_owner(&cred, &cred_of(task)) || rt && !cred.capable(cap::SYS_NICE) {
+    if !same_owner(&cred, &cred_of(task)) {
         return Err(Errno::EPERM);
     }
-    // Without CAP_SYS_NICE (__sched_setscheduler): SCHED_IDLE counts as nice 20, so leaving it
-    // needs the RLIMIT_NICE that would allow the current nice value; and reset-on-fork, once set,
-    // cannot be cleared
-    if let Some(t) = task
-        && !cred.capable(cap::SYS_NICE)
-    {
-        let cur = t.sched.get().0;
-        let rlimit_nice = cx
-            .kr()
-            .groups
-            .get(&t.tgid)
-            .map_or(u64::MAX, |g| g.borrow().rlimits[RLIMIT_NICE as usize].0);
-        if cur & !SCHED_RESET_ON_FORK == SCHED_IDLE
-            && base != SCHED_IDLE
-            && (20 - t.nice.get()) as u64 > rlimit_nice
-        {
-            return Err(Errno::EPERM);
+    // Without CAP_SYS_NICE (__sched_setscheduler): RT policies are gated by the target's
+    // RLIMIT_RTPRIO (changing RT policy needs a non-zero limit, raising RT priority needs it within
+    // the limit, and lowering an existing RT priority is allowed); SCHED_IDLE counts as nice 20, so
+    // leaving it (even for an RT policy) needs the RLIMIT_NICE that would allow the current nice
+    // value; and reset-on-fork, once set, cannot be cleared.
+    if !cred.capable(cap::SYS_NICE) {
+        let (cur, cur_prio) = task.map_or((SCHED_OTHER, 0), |t| t.sched.get());
+        let cur_base = cur & !SCHED_RESET_ON_FORK;
+        if rt {
+            let rlim_rtprio = task
+                .and_then(|t| cx.kr().groups.get(&t.tgid))
+                .map_or(0, |g| g.borrow().rlimits[RLIMIT_RTPRIO as usize].0);
+            if base != cur_base && rlim_rtprio == 0
+                || priority > cur_prio && (priority as u64) > rlim_rtprio
+            {
+                return Err(Errno::EPERM);
+            }
         }
-        if cur & SCHED_RESET_ON_FORK != 0 && policy & SCHED_RESET_ON_FORK == 0 {
-            return Err(Errno::EPERM);
+        if let Some(t) = task {
+            let rlimit_nice = cx
+                .kr()
+                .groups
+                .get(&t.tgid)
+                .map_or(u64::MAX, |g| g.borrow().rlimits[RLIMIT_NICE as usize].0);
+            if cur_base == SCHED_IDLE
+                && base != SCHED_IDLE
+                && (20 - t.nice.get()) as u64 > rlimit_nice
+            {
+                return Err(Errno::EPERM);
+            }
+            if cur & SCHED_RESET_ON_FORK != 0 && policy & SCHED_RESET_ON_FORK == 0 {
+                return Err(Errno::EPERM);
+            }
         }
     }
     if let Some(t) = task.filter(|_| apply) {
