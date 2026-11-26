@@ -408,12 +408,12 @@ pub(super) fn send(
                     Err(epipe(cx, flags))
                 };
             }
-            let cred = packet_cred(cx, declared, passcred || c.passcred);
             if ty == SOCK_SEQPACKET {
                 if data.len() > dgram_max_len(sndbuf) {
                     return Err(Errno::EMSGSIZE);
                 }
                 if outq.has_room() {
+                    let cred = packet_cred(cx, declared, passcred || c.passcred);
                     c.push(packet(cx.k(), &tx, data, files, cred, &outq));
                     return Ok(data.len());
                 }
@@ -426,11 +426,8 @@ pub(super) fn send(
                 // its skb truesize to the sender. Open files go with the first chunk; zero-byte
                 // sends carrying SCM_RIGHTS still wait when the send buffer is full.
                 if outq.has_room() {
-                    let n = if data.is_empty() {
-                        0
-                    } else {
-                        (data.len() - done).min(stream_chunk_limit(sndbuf))
-                    };
+                    let n = (data.len() - done).min(stream_chunk_limit(sndbuf));
+                    let cred = packet_cred(cx, declared, passcred || c.passcred);
                     c.push(packet(
                         cx.k(),
                         &tx,
@@ -654,7 +651,7 @@ fn packet(
             .unwrap_or_default(),
         cred,
         from: Vec::new(),
-        outq: Some(sender.charge(sender.truesize(data.len()))),
+        outq: Some(sender.charge(data.len())),
     }
 }
 
@@ -785,8 +782,8 @@ fn recv_stream(
                 Some(c.read_stream(room, true, passcred))
                     .filter(|r| !r.data.is_empty() || !r.fds.is_empty() || (room == 0 && queued))
             };
-            // Keep a pending ECONNRESET intact when returning partial MSG_WAITALL data so the
-            // next read reports it instead of seeing EOF
+            // Keep a pending ECONNRESET intact when returning partial data so the next read
+            // reports it instead of seeing EOF
             let reset = preview.is_none()
                 && !cred_break
                 && if part.is_some() {
@@ -1391,10 +1388,7 @@ mod tests {
         };
     }
 
-    #[test]
-    fn seqpacket_epipe_omits_sigpipe_while_stream_raises_it() {
-        use crate::process::Signal;
-
+    fn with_test_cx(f: impl FnOnce(&mut Cx<'_>, &Rc<Task>)) {
         let mut k = Kernel::new(Tier::Interpreter);
         let (_, _, _cpu) = crate::pseudo::tests::add_task(&mut k, 10, 0, true, b"");
         let shared = Arc::new(Shared::new(k));
@@ -1402,260 +1396,166 @@ mod tests {
         let task = k.tasks[&10].clone();
         let mut state = task.state.borrow_mut();
         let mut cx = Cx::new(&shared, k, &task, &mut state);
+        f(&mut cx, &task);
+    }
 
-        // SOCK_SEQPACKET: EPIPE without SIGPIPE on peer close, peer SHUT_RD, and local SHUT_WR.
-        for mode in 0..3 {
-            let (sa, sb) = pair(&cx, SOCK_SEQPACKET, 0).unwrap();
-            let a = Rc::new(RefCell::new(sa));
-            let b = Rc::new(RefCell::new(sb));
-            match mode {
-                0 => drop(b),
-                1 => with(&b, |u| shutdown(u, 0).unwrap()),
-                _ => with(&a, |u| shutdown(u, 1).unwrap()),
+    fn pair_refs(cx: &Cx<'_>, ty: i32) -> (SocketRef, SocketRef) {
+        let (a, b) = pair(cx, ty, 0).unwrap();
+        (Rc::new(RefCell::new(a)), Rc::new(RefCell::new(b)))
+    }
+
+    fn set_int_opt(sock: &SocketRef, name: i32, val: i32) {
+        with(sock, |u| {
+            setsockopt(u, SOL_SOCKET, name, &val.to_le_bytes(), (false, false)).unwrap();
+        });
+    }
+
+    fn get_int_opt(cx: &Cx<'_>, sock: &SocketRef, name: i32) -> i32 {
+        let raw = with(sock, |u| {
+            getsockopt(u, SOL_SOCKET, name, &cx.pid_ns(), &cx.cred()).unwrap()
+        });
+        i32::from_le_bytes(raw.try_into().unwrap())
+    }
+
+    fn abs_addr(name: &[u8]) -> Vec<u8> {
+        let mut addr = unnamed();
+        addr.push(0);
+        addr.extend_from_slice(name);
+        addr
+    }
+
+    #[test]
+    fn seqpacket_epipe_omits_sigpipe_while_stream_raises_it() {
+        use crate::process::Signal;
+
+        with_test_cx(|cx, task| {
+            // SOCK_SEQPACKET: EPIPE without SIGPIPE on peer close, peer SHUT_RD, and local SHUT_WR.
+            for mode in 0..3 {
+                let (a, b) = pair_refs(cx, SOCK_SEQPACKET);
+                match mode {
+                    0 => drop(b),
+                    1 => with(&b, |u| shutdown(u, 0).unwrap()),
+                    _ => with(&a, |u| shutdown(u, 1).unwrap()),
+                }
+                assert_eq!(send(cx, &a, true, b"x", &[], &[], 0), Err(Errno::EPIPE));
+                assert_eq!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
             }
-            assert_eq!(
-                send(&mut cx, &a, true, b"x", &[], &[], 0),
-                Err(Errno::EPIPE)
-            );
-            assert_eq!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
-        }
 
-        // SOCK_STREAM: EPIPE raises SIGPIPE when MSG_NOSIGNAL is not set.
-        let (sa, sb) = pair(&cx, SOCK_STREAM, 0).unwrap();
-        let a = Rc::new(RefCell::new(sa));
-        drop(sb);
-        assert_eq!(
-            send(&mut cx, &a, true, b"x", &[], &[], 0),
-            Err(Errno::EPIPE)
-        );
-        assert_ne!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
+            // SOCK_STREAM: EPIPE raises SIGPIPE when MSG_NOSIGNAL is not set.
+            let (a, b) = pair_refs(cx, SOCK_STREAM);
+            drop(b);
+            assert_eq!(send(cx, &a, true, b"x", &[], &[], 0), Err(Errno::EPIPE));
+            assert_ne!(task.pending.borrow().set() & Signal::PIPE.bit(), 0);
+        });
     }
 
     #[test]
     fn sndbuf_enforces_stream_truesize_dgram_max_len_and_sender_isolation() {
         const SO_RCVBUF: i32 = 8;
 
-        let mut k = Kernel::new(Tier::Interpreter);
-        let (_, _, _cpu) = crate::pseudo::tests::add_task(&mut k, 10, 0, true, b"");
-        let shared = Arc::new(Shared::new(k));
-        let k = shared.lock();
-        let task = k.tasks[&10].clone();
-        let mut state = task.state.borrow_mut();
-        let mut cx = Cx::new(&shared, k, &task, &mut state);
+        with_test_cx(|cx, _| {
+            // Stream: SO_SNDBUF=4096 (doubled to 8192) chunks at 4032 B and fills at 8064 B / 9728 outq.
+            let (a, b) = pair_refs(cx, SOCK_STREAM);
+            set_int_opt(&a, SO_SNDBUF, 4096);
+            assert_eq!(get_int_opt(cx, &a, SO_SNDBUF), 8192);
+            let big = vec![0x41u8; 65536];
+            assert_eq!(send(cx, &a, true, &big, &[], &[], 0), Ok(8064));
+            assert_eq!(with(&a, |u| u.outq()), 9728);
+            assert_eq!(with(&b, |u| u.unread()), Some(8064));
+            assert_eq!(send(cx, &a, true, b"x", &[], &[], 0), Err(Errno::EAGAIN));
+            // Raising SO_SNDBUF immediately restores send room and POLLOUT.
+            set_int_opt(&a, SO_SNDBUF, 65536);
+            assert_eq!(send(cx, &a, true, b"y", &[], &[], 0), Ok(1));
 
-        // Stream: SO_SNDBUF=4096 (doubled to 8192) chunks at 4032 B and fills at 8064 B / 9728 outq.
-        let (sa, sb) = pair(&cx, SOCK_STREAM, 0).unwrap();
-        let a = Rc::new(RefCell::new(sa));
-        let b = Rc::new(RefCell::new(sb));
-        with(&a, |u| {
-            setsockopt(
-                u,
-                SOL_SOCKET,
-                SO_SNDBUF,
-                &4096i32.to_le_bytes(),
-                (false, false),
-            )
-            .unwrap()
-        });
-        assert_eq!(
-            with(&a, |u| getsockopt(
-                u,
-                SOL_SOCKET,
-                SO_SNDBUF,
-                &cx.pid_ns(),
-                &cx.cred()
-            )
-            .unwrap()),
-            8192i32.to_le_bytes()
-        );
-        let big = vec![0x41u8; 65536];
-        assert_eq!(send(&mut cx, &a, true, &big, &[], &[], 0), Ok(8064));
-        assert_eq!(with(&a, |u| u.outq()), 9728);
-        assert_eq!(with(&b, |u| u.unread()), Some(8064));
-        assert_eq!(
-            send(&mut cx, &a, true, b"x", &[], &[], 0),
-            Err(Errno::EAGAIN)
-        );
-        // Raising SO_SNDBUF immediately restores send room and POLLOUT.
-        with(&a, |u| {
-            setsockopt(
-                u,
-                SOL_SOCKET,
-                SO_SNDBUF,
-                &65536i32.to_le_bytes(),
-                (false, false),
-            )
-            .unwrap()
-        });
-        assert_eq!(send(&mut cx, &a, true, b"y", &[], &[], 0), Ok(1));
+            // Stream 1-byte writes at default SO_SNDBUF cap at 278 packets by truesize (213504 >= 212992)
+            // while FIONREAD reports exact payload bytes (278).
+            let (a2, b2) = pair_refs(cx, SOCK_STREAM);
+            // Shrinking receiver SO_RCVBUF has no effect on AF_UNIX queueing.
+            set_int_opt(&b2, SO_RCVBUF, 1);
+            let mut ones = 0;
+            while send(cx, &a2, true, b"x", &[], &[], 0) == Ok(1) {
+                ones += 1;
+            }
+            assert_eq!(ones, 278);
+            assert_eq!(with(&a2, |u| u.outq()), 278 * 768);
+            assert_eq!(with(&b2, |u| u.unread()), Some(278));
 
-        // Stream 1-byte writes at default SO_SNDBUF cap at 278 packets by truesize (213504 >= 212992)
-        // while FIONREAD reports exact payload bytes (278).
-        let (sa2, sb2) = pair(&cx, SOCK_STREAM, 0).unwrap();
-        let a2 = Rc::new(RefCell::new(sa2));
-        let b2 = Rc::new(RefCell::new(sb2));
-        // Shrinking receiver SO_RCVBUF has no effect on AF_UNIX queueing.
-        with(&b2, |u| {
-            setsockopt(
-                u,
-                SOL_SOCKET,
-                SO_RCVBUF,
-                &1i32.to_le_bytes(),
-                (false, false),
-            )
-            .unwrap()
-        });
-        let mut ones = 0;
-        while send(&mut cx, &a2, true, b"x", &[], &[], 0) == Ok(1) {
-            ones += 1;
-        }
-        assert_eq!(ones, 278);
-        assert_eq!(with(&a2, |u| u.outq()), 278 * 768);
-        assert_eq!(with(&b2, |u| u.unread()), Some(278));
+            // Default stream send(524288) queues 6 * 36544 = 219264 bytes (outq = 222720).
+            let (a3, _b3) = pair_refs(cx, SOCK_STREAM);
+            let huge = vec![0x42u8; 524_288];
+            assert_eq!(send(cx, &a3, true, &huge, &[], &[], 0), Ok(219_264));
+            assert_eq!(with(&a3, |u| u.outq()), 222_720);
 
-        // Default stream send(524288) queues 6 * 36544 = 219264 bytes (outq = 222720).
-        let (sa3, sb3) = pair(&cx, SOCK_STREAM, 0).unwrap();
-        let a3 = Rc::new(RefCell::new(sa3));
-        let _b3 = Rc::new(RefCell::new(sb3));
-        let huge = vec![0x42u8; 524_288];
-        assert_eq!(send(&mut cx, &a3, true, &huge, &[], &[], 0), Ok(219_264));
-        assert_eq!(with(&a3, |u| u.outq()), 222_720);
+            // Datagram & seqpacket: dynamic dgram_max_len = sk_sndbuf - 32.
+            for ty in [SOCK_DGRAM, SOCK_SEQPACKET] {
+                let (a, b) = pair_refs(cx, ty);
+                set_int_opt(&a, SO_SNDBUF, 1);
+                assert_eq!(
+                    send(cx, &a, true, &vec![0u8; 4577], &[], &[], 0),
+                    Err(Errno::EMSGSIZE)
+                );
+                assert_eq!(send(cx, &a, true, &vec![0u8; 4576], &[], &[], 0), Ok(4576));
+                let _ = recv(cx, &b, true, 8192, 0, 0).unwrap();
+            }
 
-        // Datagram & seqpacket: dynamic dgram_max_len = sk_sndbuf - 32.
-        for ty in [SOCK_DGRAM, SOCK_SEQPACKET] {
-            let (pa, pb) = pair(&cx, ty, 0).unwrap();
-            let a = Rc::new(RefCell::new(pa));
-            let b = Rc::new(RefCell::new(pb));
-            with(&a, |u| {
-                setsockopt(
-                    u,
-                    SOL_SOCKET,
-                    SO_SNDBUF,
-                    &1i32.to_le_bytes(),
-                    (false, false),
-                )
-                .unwrap()
-            });
+            // Datagram multi-sender & multi-receiver per-sender accounting.
+            let srv1: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
+            let srv2: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
+            let a_srv1 = abs_addr(b"sndbuf-ms-1");
+            let a_srv2 = abs_addr(b"sndbuf-ms-2");
+            bind(cx, &srv1, &a_srv1).unwrap();
+            bind(cx, &srv2, &a_srv2).unwrap();
+
+            let c1: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
+            let c2: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
+            set_int_opt(&c1, SO_SNDBUF, 1);
+            let blk = [0u8; 1024];
+            assert_eq!(send(cx, &c1, true, &blk, &a_srv1, &[], 0), Ok(1024));
+            assert_eq!(send(cx, &c1, true, &blk, &a_srv1, &[], 0), Ok(1024));
             assert_eq!(
-                send(&mut cx, &a, true, &vec![0u8; 4577], &[], &[], 0),
-                Err(Errno::EMSGSIZE)
+                send(cx, &c1, true, &blk, &a_srv1, &[], 0),
+                Err(Errno::EAGAIN)
             );
+            // Same sender cannot send to a second receiver while its own outq is full.
             assert_eq!(
-                send(&mut cx, &a, true, &vec![0u8; 4576], &[], &[], 0),
-                Ok(4576)
+                send(cx, &c1, true, &blk, &a_srv2, &[], 0),
+                Err(Errno::EAGAIN)
             );
-            let _ = recv(&mut cx, &b, true, 8192, 0, 0).unwrap();
-        }
-
-        // Datagram multi-sender & multi-receiver per-sender accounting.
-        let srv1: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
-        let srv2: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
-        let mut a_srv1 = unnamed();
-        a_srv1.extend_from_slice(b"\0sndbuf-ms-1");
-        let mut a_srv2 = unnamed();
-        a_srv2.extend_from_slice(b"\0sndbuf-ms-2");
-        bind(&mut cx, &srv1, &a_srv1).unwrap();
-        bind(&mut cx, &srv2, &a_srv2).unwrap();
-
-        let c1: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
-        let c2: SocketRef = Rc::new(RefCell::new(socket(SOCK_DGRAM, 0).unwrap()));
-        with(&c1, |u| {
-            setsockopt(
-                u,
-                SOL_SOCKET,
-                SO_SNDBUF,
-                &1i32.to_le_bytes(),
-                (false, false),
-            )
-            .unwrap()
+            // A second sender with default SO_SNDBUF can still send to srv1.
+            assert_eq!(send(cx, &c2, true, &blk, &a_srv1, &[], 0), Ok(1024));
         });
-        let blk = [0u8; 1024];
-        assert_eq!(send(&mut cx, &c1, true, &blk, &a_srv1, &[], 0), Ok(1024));
-        assert_eq!(send(&mut cx, &c1, true, &blk, &a_srv1, &[], 0), Ok(1024));
-        assert_eq!(
-            send(&mut cx, &c1, true, &blk, &a_srv1, &[], 0),
-            Err(Errno::EAGAIN)
-        );
-        // Same sender cannot send to a second receiver while its own outq is full.
-        assert_eq!(
-            send(&mut cx, &c1, true, &blk, &a_srv2, &[], 0),
-            Err(Errno::EAGAIN)
-        );
-        // A second sender with default SO_SNDBUF can still send to srv1.
-        assert_eq!(send(&mut cx, &c2, true, &blk, &a_srv1, &[], 0), Ok(1024));
     }
 
     #[test]
     fn rcvlowat_stream_nonblock_peek_eof_and_dgram_ignored() {
         const SO_RCVLOWAT: i32 = 18;
 
-        let mut k = Kernel::new(Tier::Interpreter);
-        let (_, _, _cpu) = crate::pseudo::tests::add_task(&mut k, 10, 0, true, b"");
-        let shared = Arc::new(Shared::new(k));
-        let k = shared.lock();
-        let task = k.tasks[&10].clone();
-        let mut state = task.state.borrow_mut();
-        let mut cx = Cx::new(&shared, k, &task, &mut state);
+        with_test_cx(|cx, _| {
+            let (a, b) = pair_refs(cx, SOCK_STREAM);
+            set_int_opt(&b, SO_RCVLOWAT, 10);
+            assert_eq!(get_int_opt(cx, &b, SO_RCVLOWAT), 10);
+            send(cx, &a, true, b"12345", &[], &[], 0).unwrap();
+            // Linux AF_UNIX unix_poll reports POLLIN regardless of SO_RCVLOWAT.
+            assert_ne!(with(&b, |u| u.readiness()) & 0x001, 0);
+            // MSG_PEEK returns queued bytes immediately without waiting for SO_RCVLOWAT.
+            assert_eq!(recv(cx, &b, false, 20, 0, MSG_PEEK).unwrap().data, b"12345");
+            // Nonblocking recv returns queued bytes immediately even when below SO_RCVLOWAT.
+            assert_eq!(recv(cx, &b, true, 20, 0, 0).unwrap().data, b"12345");
+            // Blocking recv with max <= queued returns immediately (target = min(lowat, max)).
+            send(cx, &a, true, b"abcde", &[], &[], 0).unwrap();
+            assert_eq!(recv(cx, &b, false, 4, 0, 0).unwrap().data, b"abcd");
+            // EOF finishes blocking recv below SO_RCVLOWAT.
+            with(&a, |u| shutdown(u, 1).unwrap());
+            assert_eq!(recv(cx, &b, false, 20, 0, 0).unwrap().data, b"e");
+            assert_eq!(recv(cx, &b, false, 20, 0, 0).unwrap().data, b"");
 
-        let (sa, sb) = pair(&cx, SOCK_STREAM, 0).unwrap();
-        let a = Rc::new(RefCell::new(sa));
-        let b = Rc::new(RefCell::new(sb));
-        with(&b, |u| {
-            setsockopt(
-                u,
-                SOL_SOCKET,
-                SO_RCVLOWAT,
-                &10i32.to_le_bytes(),
-                (false, false),
-            )
-            .unwrap()
+            // Datagram and seqpacket ignore SO_RCVLOWAT.
+            for ty in [SOCK_DGRAM, SOCK_SEQPACKET] {
+                let (a, b) = pair_refs(cx, ty);
+                set_int_opt(&b, SO_RCVLOWAT, 10);
+                send(cx, &a, true, b"hello", &[], &[], 0).unwrap();
+                assert_eq!(recv(cx, &b, false, 20, 0, 0).unwrap().data, b"hello");
+            }
         });
-        assert_eq!(
-            with(&b, |u| getsockopt(
-                u,
-                SOL_SOCKET,
-                SO_RCVLOWAT,
-                &cx.pid_ns(),
-                &cx.cred()
-            )
-            .unwrap()),
-            10i32.to_le_bytes()
-        );
-        send(&mut cx, &a, true, b"12345", &[], &[], 0).unwrap();
-        // Linux AF_UNIX unix_poll reports POLLIN regardless of SO_RCVLOWAT.
-        assert_ne!(with(&b, |u| u.readiness()) & 0x001, 0);
-        // MSG_PEEK returns queued bytes immediately without waiting for SO_RCVLOWAT.
-        assert_eq!(
-            recv(&mut cx, &b, false, 20, 0, MSG_PEEK).unwrap().data,
-            b"12345"
-        );
-        // Nonblocking recv returns queued bytes immediately even when below SO_RCVLOWAT.
-        assert_eq!(recv(&mut cx, &b, true, 20, 0, 0).unwrap().data, b"12345");
-        // Blocking recv with max <= queued returns immediately (target = min(lowat, max)).
-        send(&mut cx, &a, true, b"abcde", &[], &[], 0).unwrap();
-        assert_eq!(recv(&mut cx, &b, false, 4, 0, 0).unwrap().data, b"abcd");
-        // EOF finishes blocking recv below SO_RCVLOWAT.
-        with(&a, |u| shutdown(u, 1).unwrap());
-        assert_eq!(recv(&mut cx, &b, false, 20, 0, 0).unwrap().data, b"e");
-        assert_eq!(recv(&mut cx, &b, false, 20, 0, 0).unwrap().data, b"");
-
-        // Datagram and seqpacket ignore SO_RCVLOWAT.
-        for ty in [SOCK_DGRAM, SOCK_SEQPACKET] {
-            let (pa, pb) = pair(&cx, ty, 0).unwrap();
-            let a = Rc::new(RefCell::new(pa));
-            let b = Rc::new(RefCell::new(pb));
-            with(&b, |u| {
-                setsockopt(
-                    u,
-                    SOL_SOCKET,
-                    SO_RCVLOWAT,
-                    &10i32.to_le_bytes(),
-                    (false, false),
-                )
-                .unwrap()
-            });
-            send(&mut cx, &a, true, b"hello", &[], &[], 0).unwrap();
-            assert_eq!(recv(&mut cx, &b, false, 20, 0, 0).unwrap().data, b"hello");
-        }
     }
 }

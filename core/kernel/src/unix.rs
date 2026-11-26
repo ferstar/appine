@@ -41,12 +41,14 @@ const SKB_MAX_HEAD: usize = SKB_PAGE_SIZE - SKB_SHINFO_OVERHEAD;
 const SKB_MAX_LINEAR_DGRAM: usize = 16_384 - SKB_SHINFO_OVERHEAD;
 /// Maximum payload per `SOCK_STREAM` chunk (`SKB_MAX_HEAD(0) + 8 * PAGE_SIZE` = 36,544 B,
 /// matching arm64 Linux's `unix_stream_sendmsg` paged chunking).
-pub(crate) const STREAM_MAX_CHUNK: usize = SKB_MAX_HEAD + 8 * SKB_PAGE_SIZE;
+const STREAM_MAX_CHUNK: usize = SKB_MAX_HEAD + 8 * SKB_PAGE_SIZE;
 
+/// Linear skb truesize for arm64 kmalloc slab buckets (`kmalloc-512`..`kmalloc-16k`):
+/// `sizeof(sk_buff)` (256 B) + power-of-two slab holding `head_len + sizeof(skb_shared_info)` (320 B).
 fn linear_truesize(head_len: usize) -> usize {
-    let alloc = (head_len + SKB_SHINFO_OVERHEAD)
-        .next_power_of_two()
-        .max(512);
+    let alloc = head_len
+        .saturating_add(SKB_SHINFO_OVERHEAD)
+        .next_power_of_two();
     SKB_HEAD_OVERHEAD + alloc
 }
 
@@ -64,15 +66,14 @@ pub(crate) fn packet_truesize(len: usize) -> usize {
 
 /// Linux 64-bit `skb->truesize` for one `SOCK_STREAM` chunk allocated by `unix_stream_sendmsg`:
 /// payloads up to `SKB_MAX_HEAD` (3776 B) use a linear kmalloc bucket; larger chunks spill
-/// `min(len, PAGE_ALIGN(len - SKB_MAX_HEAD))` into 4 KiB paged fragments and keep the remainder
-/// in a linear head.
+/// `PAGE_ALIGN(len - SKB_MAX_HEAD)` into 4 KiB paged fragments and keep any remainder in a linear
+/// head (0 B head for `3777..=4096`).
 pub(crate) fn stream_truesize(len: usize) -> usize {
-    let data_len = len
+    let paged = len
         .saturating_sub(SKB_MAX_HEAD)
-        .next_multiple_of(SKB_PAGE_SIZE)
-        .min(len);
-    let head_len = len - data_len;
-    linear_truesize(head_len).saturating_add(data_len.next_multiple_of(SKB_PAGE_SIZE))
+        .next_multiple_of(SKB_PAGE_SIZE);
+    let head_len = len.saturating_sub(paged);
+    linear_truesize(head_len).saturating_add(paged)
 }
 
 /// Maximum payload per `SOCK_STREAM` chunk for a sender with send buffer `sndbuf`
@@ -127,10 +128,7 @@ impl SenderState {
     pub(crate) fn set_sndbuf(&self, sndbuf: usize) {
         let old = self.sndbuf.replace(sndbuf);
         if sndbuf > old {
-            if self.writable() {
-                self.taken.set(self.taken.get().wrapping_add(1));
-            }
-            request_wake_object(self.wake_object());
+            self.notify_write_space();
         }
     }
 
@@ -154,15 +152,22 @@ impl SenderState {
         self.outq.get().saturating_add(1).saturating_mul(4) <= self.sndbuf.get()
     }
 
-    /// Charges one packet and gives it a sender reference to release on dequeue or drop.
-    pub(crate) fn charge(self: &Rc<Self>, truesize: usize) -> Rc<Self> {
-        self.outq.set(self.outq.get().saturating_add(truesize));
+    /// Charges one packet of `len` payload bytes and returns a sender reference to release on
+    /// dequeue or drop.
+    pub(crate) fn charge(self: &Rc<Self>, len: usize) -> Rc<Self> {
+        self.outq
+            .set(self.outq.get().saturating_add(self.truesize(len)));
         self.clone()
     }
 
-    /// Uncharges a consumed or dropped packet and wakes any waiting sender or `POLLOUT` waiter.
-    pub(crate) fn uncharge(&self, truesize: usize) {
-        self.outq.set(self.outq.get().saturating_sub(truesize));
+    /// Uncharges a consumed or dropped packet of `len` payload bytes and wakes waiting senders.
+    fn uncharge(&self, len: usize) {
+        self.outq
+            .set(self.outq.get().saturating_sub(self.truesize(len)));
+        self.notify_write_space();
+    }
+
+    fn notify_write_space(&self) {
         if self.writable() {
             self.taken.set(self.taken.get().wrapping_add(1));
         }
@@ -481,21 +486,8 @@ impl UnixSocket {
                 }
             }
             Link::Stream { rx, tx, .. } => {
-                let (r, t) = (rx.borrow(), tx.borrow());
-                let mut ev = 0;
-                if !r.packets.is_empty() {
-                    ev |= POLLIN | POLLRDNORM;
-                }
-                // The peer closed with data it had not read (unix_poll's sk_err)
-                if r.reset {
-                    ev |= POLLERR;
-                }
-                if r.eof {
-                    ev |= POLLIN | POLLRDNORM | POLLRDHUP;
-                    if t.eof || t.closed {
-                        ev |= POLLHUP;
-                    }
-                }
+                let t = tx.borrow();
+                let mut ev = rx.borrow().readiness(t.eof || t.closed);
                 // Linux's unix_poll: writable when sender's sk_wmem_alloc is within sk_sndbuf/4.
                 // On peer close, the peer discards its receive queue so outq drops to 0.
                 if self.outq.writable() {
@@ -505,21 +497,7 @@ impl UnixSocket {
             }
             Link::None if self.ty != SOCK_DGRAM => POLLOUT | POLLWRNORM | POLLHUP,
             Link::None | Link::Dgram { .. } => {
-                let r = self.rx.borrow();
-                let mut ev = 0;
-                if !r.packets.is_empty() {
-                    ev |= POLLIN | POLLRDNORM;
-                }
-                if r.reset {
-                    ev |= POLLERR;
-                }
-                if r.eof {
-                    ev |= POLLIN | POLLRDNORM | POLLRDHUP;
-                    // Both directions shut down (unix_dgram_poll's SHUTDOWN_MASK)
-                    if self.shut_wr {
-                        ev |= POLLHUP;
-                    }
-                }
+                let mut ev = self.rx.borrow().readiness(self.shut_wr);
                 // unix_dgram_poll: check sender's unix_writable(sk), and when connected to a peer
                 // not connected back to this socket, also unix_recvq_full(other).
                 let writable = self.outq.writable()
@@ -759,30 +737,22 @@ impl Packet {
         self.data.len() - self.off
     }
 
-    fn truesize(&self) -> usize {
-        self.outq.as_ref().map_or_else(
-            || packet_truesize(self.data.len()),
-            |s| s.truesize(self.data.len()),
-        )
-    }
-
     fn sender_addr(&self) -> Vec<u8> {
         self.outq
             .as_ref()
             .map_or_else(|| self.from.clone(), |s| s.addr.borrow().clone())
     }
 
-    fn uncharge(&mut self, n: usize) {
+    fn uncharge(&mut self) {
         if let Some(s) = self.outq.take() {
-            s.uncharge(n);
+            s.uncharge(self.data.len());
         }
     }
 }
 
 impl Drop for Packet {
     fn drop(&mut self) {
-        let ts = self.truesize();
-        self.uncharge(ts);
+        self.uncharge();
     }
 }
 
@@ -847,6 +817,26 @@ impl Channel {
     /// Reports the pending `ECONNRESET` once (Linux's `sock_error`).
     pub fn take_reset(&mut self) -> bool {
         std::mem::take(&mut self.reset)
+    }
+
+    /// Receive-side poll flags shared by stream and datagram sockets (`unix_poll` /
+    /// `unix_dgram_poll`), adding `POLLHUP` when both directions are shut down.
+    fn readiness(&self, wr_shut: bool) -> i16 {
+        let mut ev = 0;
+        if !self.packets.is_empty() {
+            ev |= POLLIN | POLLRDNORM;
+        }
+        // Pending peer reset (`sk_err`)
+        if self.reset {
+            ev |= POLLERR;
+        }
+        if self.eof {
+            ev |= POLLIN | POLLRDNORM | POLLRDHUP;
+            if wr_shut {
+                ev |= POLLHUP;
+            }
+        }
+        ev
     }
 
     pub fn push(&mut self, p: Packet) {
@@ -923,11 +913,10 @@ impl Channel {
         } else {
             let mut p = self.packets.pop_front()?;
             let len = p.data.len();
-            let ts = p.truesize();
             let from = p.sender_addr();
             self.bytes -= len;
-            // Taking the payload changes truesize. Release the original charge before the move.
-            p.uncharge(ts);
+            // Release the charge before moving `p.data` out (taking it zeroes `p.data.len()`).
+            p.uncharge();
             let mut data = std::mem::take(&mut p.data);
             data.truncate(max);
             let fds = std::mem::take(&mut p.fds);
@@ -1374,6 +1363,16 @@ mod tests {
         }
     }
 
+    fn charged_packet(sender: &UnixSocket, data: &[u8]) -> Packet {
+        let mut p = packet(data, 1);
+        p.outq = Some(sender.outq.charge(data.len()));
+        p
+    }
+
+    fn push_charged(sender: &UnixSocket, dst: &ChannelRef, data: &[u8]) {
+        dst.borrow_mut().push(charged_packet(sender, data));
+    }
+
     /// The open files of a pair of connected stream sockets, and the channel from `a` to `b`.
     fn pair() -> (FileRef, FileRef, ChannelRef) {
         let (a, b) = UnixSocket::pair(SOCK_STREAM, Ucred::of(1, 0, 0));
@@ -1588,10 +1587,9 @@ mod tests {
             })
             .is_empty()
         );
-        let mut p = packet(b"hello", 1);
+        let mut p = charged_packet(&a, b"hello");
         let f = OpenFile::new(FileKind::Host(1), oflags::O_RDONLY);
         p.fds.push(f.clone());
-        p.outq = Some(a.outq.charge(p.truesize()));
         b.rx.borrow_mut().push(p);
         assert_eq!(a.outq(), packet_truesize(5));
 
@@ -1643,11 +1641,9 @@ mod tests {
         let Link::Stream { tx, .. } = &a.link else {
             unreachable!()
         };
-        let mut p = packet(b"abcdef", 1);
-        let ts = a.outq.truesize(p.data.len());
+        let ts = a.outq.truesize(6);
         assert_eq!(ts, 768);
-        p.outq = Some(a.outq.charge(ts));
-        tx.borrow_mut().push(p);
+        push_charged(&a, tx, b"abcdef");
         assert_eq!(a.outq(), ts);
         // Peek and partial stream reads retain packet truesize until the packet is fully consumed
         // or dropped (matching Linux's sk_wmem_alloc), while FIONREAD reports exact payload bytes.
@@ -1668,9 +1664,7 @@ mod tests {
         let (da, db) = UnixSocket::pair(SOCK_DGRAM, Ucred::of(1, 0, 0));
         let mut queued = 0;
         while da.outq.has_room() {
-            let mut zp = packet(b"", 1);
-            zp.outq = Some(da.outq.charge(da.outq.truesize(0)));
-            db.rx.borrow_mut().push(zp);
+            push_charged(&da, &db.rx, b"");
             queued += 1;
         }
         assert_eq!(queued, 278);
@@ -1695,9 +1689,8 @@ mod tests {
         let dummy = OpenFile::new(FileKind::Host(1), oflags::O_RDONLY);
         let mut queued = 0;
         while sa.outq.has_room() {
-            let mut p = packet(b"", 1);
+            let mut p = charged_packet(&sa, b"");
             p.fds.push(dummy.clone());
-            p.outq = Some(sa.outq.charge(sa.outq.truesize(0)));
             tx.borrow_mut().push(p);
             queued += 1;
         }
@@ -1727,9 +1720,7 @@ mod tests {
     #[test]
     fn sender_addr_updates_at_receive_and_peer_query_time() {
         let (a, b) = UnixSocket::pair(SOCK_DGRAM, Ucred::of(1, 0, 0));
-        let mut p = packet(b"hi", 1);
-        p.outq = Some(a.outq.charge(p.truesize()));
-        b.rx.borrow_mut().push(p);
+        push_charged(&a, &b.rx, b"hi");
         assert_eq!(b.peer_name(), Some(unnamed()));
 
         // Binding after send updates both getpeername and the queued packet's receive-time addr.
@@ -1841,6 +1832,10 @@ mod tests {
             (4032, 4864),
             (4096, 4864),
             (4097, 4864),
+            (4288, 4864),
+            (4289, 5376),
+            (7872, 8448),
+            (7873, 8960),
             (8192, 8960),
             (13680, 14592),
             (16320, 17152),
@@ -1867,14 +1862,10 @@ mod tests {
             unreachable!()
         };
         a.outq.set_sndbuf(6144);
-        let mut p1 = packet(b"a", 1);
-        p1.outq = Some(a.outq.charge(a.outq.truesize(1)));
-        tx.borrow_mut().push(p1);
+        push_charged(&a, tx, b"a");
         assert_ne!(a.readiness() & POLLOUT, 0);
 
-        let mut p2 = packet(b"b", 1);
-        p2.outq = Some(a.outq.charge(a.outq.truesize(1)));
-        tx.borrow_mut().push(p2);
+        push_charged(&a, tx, b"b");
         assert_eq!(a.outq(), 1536);
         assert_eq!(a.readiness() & POLLOUT, 0);
 
@@ -1890,9 +1881,7 @@ mod tests {
         let srv = UnixSocket::new(SOCK_DGRAM);
         cli.outq.set_sndbuf(4608);
         assert_ne!(cli.readiness() & POLLOUT, 0);
-        let mut dp = packet(&[0u8; 1024], 1);
-        dp.outq = Some(cli.outq.charge(cli.outq.truesize(1024)));
-        srv.rx.borrow_mut().push(dp);
+        push_charged(&cli, &srv.rx, &[0u8; 1024]);
         assert_eq!(cli.outq(), 2304);
         assert_eq!(cli.readiness() & POLLOUT, 0);
         srv.rx.borrow_mut().read_packet(1024, false).unwrap();
