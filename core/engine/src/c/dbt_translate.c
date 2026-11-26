@@ -1004,11 +1004,13 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     }
     uint32_t reg_branch = insn & 0xfffffc1f;
     if (reg_branch == 0xd61f0000 || reg_branch == 0xd63f0000 || reg_branch == 0xd65f0000) {
-        /* BR/BLR/RET: put the target in T0 first, then look up the jump cache */
+        /* BR/BLR/RET: put the target in T0 first, apply TBI0 untagging, then look up the jump
+         * cache */
         unsigned rn = FIELD(insn, 9, 5);
         if (reg_branch == 0xd65f0000 && rn == 30)
             emit_predicted_return(x);
         emit_xreg_to_t0(x, rn);
+        emit_untag_pc(x, T0);
         if (reg_branch == 0xd63f0000)
             emit_call(x, pc);
         emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));

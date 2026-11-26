@@ -924,10 +924,11 @@ void dbt_emit_routines(struct appine_dbt *d)
     d->refill[1] = emit_refill(x, true);
     d->lookup = emit_lookup(x, d);
 
-    /* Landing pad of empty shadow return stack entries: look up by guest x30, as for an indirect
-     * branch that misses the jump cache */
+    /* Landing pad of empty shadow return stack entries (and memop_ret misses): look up by guest
+     * x30 (TBI0-untagged), as for an indirect branch that misses the jump cache */
     d->rs_miss = here(x);
     emit(x, enc_mov(T0, 30));
+    emit_untag_pc(x, T0);
     emit(x, enc_b((intptr_t)d->lookup - (intptr_t)here(x)));
 
     d->memop_ret = emit_memop_ret(x, d);

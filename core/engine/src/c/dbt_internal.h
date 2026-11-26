@@ -761,6 +761,18 @@ static inline void patch_local(struct xlate *x, uint32_t *site, const uint32_t *
         patch_branch(x->wdelta, site, target);
 }
 
+/*
+ * Clear bits 63:56 of a branch target register when bit 55 == 0, matching ARMv8-A BranchAddr
+ * under Linux 6.1's TBI0 configuration (TBI0 = 1, TBID0 = 0, TBI1 = 0). Preserves NZCV.
+ */
+static inline void emit_untag_pc(struct xlate *x, unsigned reg)
+{
+    uint32_t *skip = here(x);
+    emit(x, enc_tbnz(reg, DATA_TAG_SHIFT - 1));
+    emit(x, enc_and_low(reg, reg, DATA_TAG_SHIFT));
+    patch_local(x, skip, here(x));
+}
+
 /* ---- Shared instruction-decoder and cache data structures ---- */
 
 struct operands {

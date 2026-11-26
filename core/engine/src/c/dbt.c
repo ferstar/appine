@@ -1327,6 +1327,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
     bool patch_forward = false, patch_shared = false;
     bool fill_jump_cache = false;
 
+    /* Model ERET -> BranchAddr(ELR_EL1) on entry to guest code (TBI0). */
+    c->pc = untag_pc(c->pc);
     if (UNLIKELY(d->stale)) {
         lock_dbt(d, &t->stats);
         if (d->stale)
@@ -1503,15 +1505,16 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             if ((reason & REASON_MASK) == R_INTERP && (!t->tag || in_shared(d, c->pc))) {
                 uint32_t kind = find_memop(d, c->pc);
                 if (kind && exec_memop(c, kind)) {
-                    /* Pop the caller's predicted return if it matches X30, keeping the shadow
-                     * return stack aligned after bypassing the guest RET. */
+                    /* Pop the caller's predicted return if it matches X30 (TBI0-untagged),
+                     * keeping the shadow return stack aligned after bypassing the guest RET. */
+                    uint64_t ret_pc = untag_pc(c->x[30]);
                     uint64_t *top = (uint64_t *)c->dbt_rs;
-                    if (top && top[0] == c->x[30]) {
+                    if (top && top[0] == ret_pc) {
                         uintptr_t p = (uintptr_t)top;
                         uintptr_t mask = (1u << RS_SHIFT) - 1;
                         c->dbt_rs = (void *)((p & ~mask) | ((p - 16) & mask));
                     }
-                    c->pc = c->x[30];
+                    c->pc = ret_pc;
                     break;
                 }
             }

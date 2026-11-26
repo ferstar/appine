@@ -160,6 +160,16 @@ static inline uint64_t untag(uint64_t va)
     return va & ((UINT64_C(1) << DATA_TAG_SHIFT) - 1);
 }
 
+/*
+ * Linux 6.1 enables TCR_EL1.TBI0 (with TBID0 = 0, TBI1 = 0): instruction addresses in the TTBR0
+ * range (bit 55 == 0) clear bits 63:56 when written to PC by register branches or exception return
+ * (ARMv8-A BranchAddr). Addresses with bit 55 == 1 keep their top byte intact.
+ */
+static inline uint64_t untag_pc(uint64_t va)
+{
+    return (va & (UINT64_C(1) << (DATA_TAG_SHIFT - 1))) ? va : untag(va);
+}
+
 /* Compute the candidate address alongside the tag check so the host can load tag and addend
  * together. Only a hit makes *host usable. */
 static inline bool tlb_probe(const struct appine_cpu *cpu, uint64_t va, uint32_t access, void **host)

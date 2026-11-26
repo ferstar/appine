@@ -4,6 +4,8 @@
 > See `.agents/decisions/engine.md` for the paired decision history (it still holds the decisions on the Tier 1 dynamic binary translator made before it was split out into `engine/dbt`).
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across CPU layout, Tier 0 dispatch, atomics, features, native code and fault recovery)
+>
+> Maintained: 2026-11-26 (targeted update for arm64 TBI0 instruction-pointer untagging)
 
 ## Responsibilities
 
@@ -100,7 +102,12 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
   to register 31.
 - A failing or undefined instruction leaves PC and registers untouched; only `svc` and `ic ivau`
   exits advance PC.
-- Data addresses have the top byte ignored (TBI); PC and branch targets are not untagged.
+- Data addresses have the top byte ignored (TBI). Instruction addresses follow Linux 6.1's TBI0
+  configuration (`TCR_EL1.TBI0 = 1`, `TBID0 = 0`, `TBI1 = 0`): `untag_pc` clears bits 63:56 of
+  TTBR0 targets (bit 55 == 0) on register branches (`BR`, `BLR`, `RET`) and on entry to guest
+  execution (`run`, `step`, modeling `ERET` -> `BranchAddr`), while preserving bits 63:56 when
+  bit 55 == 1. Alignment checks, hardware breakpoint matching, instruction fetch and PC-relative
+  operations all observe the untagged TTBR0 PC.
 - Memory accesses check every page touched before copying anything, so faults cause no
   partial writes or register writeback. SP-based accesses require 16-byte SP alignment, and every access checks watchpoints.
 - Ordinary single-register integer loads and stores use fixed-width copies on same-page data TLB hits
@@ -239,9 +246,7 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 ## Confirmed bugs / technical debt
 
-- Both tiers preserve the top byte of register branch targets and fetch through the raw PC.
-  The upstream Linux 6.1 arm64 boot configuration enables TBI0 for TTBR0 addresses. A tagged
-  instruction pointer can therefore fault in Appine where the upstream configuration ignores its tag.
+None.
 
 ## Open questions
 

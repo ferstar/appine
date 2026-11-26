@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: reclaim pooled instances, detached threads and template arena pages under memory pressure)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: arm64 TBI0 untagging on indirect branches, `rs_miss`, `exec_memop` returns and `dbt_run` entry)
 
 ## Responsibilities
 
@@ -225,14 +225,17 @@ triggers (`kernel/oom`).
   already-patched site (`dbt_sync_all`).
 - Forward direct links skip the 2-word entry kick check (`code + 2`); backward/self links and
   indirect jumps land at `code + 0`, so every loop checks `pending`.
-- Indirect branches (`BR`/`BLR`/`RET`) probe the thread's 4096-entry direct-mapped jump cache
-  (`t->jc`); misses branch to in-cache `d->lookup`, which brackets a lock-free `d->table` probe
-  with odd/even `stlr` increments of `cpu->dbt_lookup_seq` (excluding misaligned, `>= 2^48`, and
-  `pc == 0`), fills `t->jc` and jumps directly on hit, or exits `R_LOOKUP`.
+- Indirect branches (`BR`/`BLR`/`RET`) apply TBI0 (`emit_untag_pc`: NZCV-free `tbnz #55` + `and`
+  clearing bits 63:56 when bit 55 == 0) before probing the thread's 4096-entry direct-mapped jump
+  cache (`t->jc`); misses branch to in-cache `d->lookup`, which brackets a lock-free `d->table`
+  probe with odd/even `stlr` increments of `cpu->dbt_lookup_seq` (excluding misaligned, `>= 2^48`,
+  and `pc == 0`), fills `t->jc` and jumps directly on hit, or exits `R_LOOKUP`.
 - Shadow return stack: `BL`/`BLR` emit a host `BL` over an `R_CHAIN` landing pad and push
   `(pc + 4, landing_pad)` onto the 1 KB-aligned 64-entry ring `t->rs` (wrapping via `BFXIL`);
   `RET X30` compares the top against `x30`, pops and executes host `RET T2` on hit, or falls back
-  to the jump cache. Empty slots point at `d->rs_miss` -> `d->lookup`.
+  to `emit_untag_pc` and the jump cache. Empty slots (and `memop_ret` misses) point at `d->rs_miss`,
+  which applies `emit_untag_pc` to `x30` before branching to `d->lookup`. Out-of-line `exec_memop`
+  returns and `dbt_run` entry likewise apply `untag_pc`.
 
 ### Dispatcher and libc memops
 

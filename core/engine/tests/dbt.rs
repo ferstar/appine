@@ -5158,3 +5158,256 @@ fn code_group_private_conditional_branch_relinks_across_members() {
     peer_same_tag.join().unwrap();
     member2.join().unwrap();
 }
+
+#[test]
+fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
+    const TAG: u64 = 0x5a << 56;
+    const KERNEL_BIT: u64 = 1 << 55;
+    const NZCV_INIT: u64 = 0xa000_0000; // N=1, Z=0, C=1, V=0
+
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(space) = DbtSpace::new(0, regs) else {
+            return;
+        };
+        let mut dbt = Dbt::attach(&space, 0).unwrap();
+        let stolen = match regs {
+            DbtRegs::Default => 16u32,
+            DbtRegs::Go => 21u32,
+        };
+
+        // 1. Tagged BR (non-stolen x1 and stolen reg), BLR (x1, stolen, and x30), RET (x30 and
+        //    non-x30): untag TTBR0 targets, preserve source register and NZCV, and produce
+        //    untagged ADR/ADRP/LDR-literal/BL-LR results matching Tier 0.
+        let mut g = Guest::with_data();
+        let br_x1 = CODE;
+        let br_stolen = CODE + 0x10;
+        let blr_x1 = CODE + 0x20;
+        let blr_x30 = CODE + 0x30;
+        let ret_x30 = CODE + 0x40;
+        let ret_stolen = CODE + 0x50;
+        let target = CODE + 0x100;
+        let callee = CODE + 0x140;
+
+        g.code(br_x1, &[0xd61f_0020]); // br x1
+        g.code(br_stolen, &[0xd61f_0000 | (stolen << 5)]); // br x_stolen
+        g.code(blr_x1, &[0xd63f_0020, SVC]); // blr x1; svc #0
+        g.code(blr_x30, &[0xd63f_03c0, SVC]); // blr x30; svc #0
+        g.code(ret_x30, &[RET]); // ret
+        g.code(ret_stolen, &[0xd65f_0000 | (stolen << 5)]); // ret x_stolen
+        g.code(
+            target,
+            &[
+                0x1000_0000, // target + 0:  adr x0, .
+                0x9000_0002, // target + 4:  adrp x2, .
+                0x5800_0083, // target + 8:  ldr x3, .+16 (target + 24)
+                0x9400_0001, // target + 12: bl .+4
+                0xaa1e_03e4, // target + 16: mov x4, x30
+                SVC,         // target + 20: svc #0
+                0xdead_beef, // target + 24
+                0x1234_5678, // target + 28
+            ],
+        );
+        // Callee tags its own return address before RET to exercise predicted-return miss + TBI0.
+        g.code(
+            callee,
+            &[
+                0x1000_0000, // adr x0, .
+                0xaa1e_03e5, // mov x5, x30 (untagged return pc written by blr)
+                0xaa09_03de, // orr x30, x30, x9 (tag x30)
+                RET,
+            ],
+        );
+
+        let lit_expected = u64::from(0xdead_beefu32) | (u64::from(0x1234_5678u32) << 32);
+
+        // Repeat twice to cover both cold jump-cache miss (d->lookup) and warm jump-cache hit.
+        for round in 0..2 {
+            for (entry, reg, use_entry_tag) in [
+                (br_x1, 1usize, false),
+                (br_stolen, stolen as usize, false),
+                (ret_x30, 30usize, false),
+                (ret_stolen, stolen as usize, false),
+                (target, 0usize, true),
+            ] {
+                let mut g0 = Guest::with_data();
+                g0.pages[0].0.copy_from_slice(&g.pages[0].0);
+                for (tier, run_t1) in [("T0", false), ("T1", true)] {
+                    let cur = if run_t1 { &mut g } else { &mut g0 };
+                    let s = cur.cpu.state_mut();
+                    s.x = [0; 31];
+                    s.nzcv = NZCV_INIT;
+                    if !use_entry_tag {
+                        s.x[reg] = TAG | target;
+                    }
+                    s.pc = if use_entry_tag { TAG | entry } else { entry };
+                    let exit = if run_t1 {
+                        dbt.run(&mut cur.cpu)
+                    } else {
+                        cur.cpu.run()
+                    };
+                    assert_eq!(
+                        exit,
+                        Exit::Svc { imm: 0 },
+                        "{regs:?} {tier} round={round} entry={entry:#x}"
+                    );
+                    let st = cur.cpu.state();
+                    assert_eq!(st.x[0], target, "{regs:?} {tier} adr");
+                    assert_eq!(st.x[2], target & !0xfff, "{regs:?} {tier} adrp");
+                    assert_eq!(st.x[3], lit_expected, "{regs:?} {tier} ldr literal");
+                    assert_eq!(st.x[4], target + 16, "{regs:?} {tier} bl lr");
+                    assert_eq!(st.nzcv, NZCV_INIT, "{regs:?} {tier} nzcv preserved");
+                    assert_eq!(st.pc, target + 24, "{regs:?} {tier} final pc");
+                    if !use_entry_tag && reg != 0 && reg != 2 && reg != 3 && reg != 4 {
+                        let expected_reg = if reg == 30 { target + 16 } else { TAG | target };
+                        assert_eq!(st.x[reg], expected_reg, "{regs:?} {tier} source reg");
+                    }
+                }
+            }
+
+            // Tagged BLR (x1 and x30) returning via tagged X30.
+            for (entry, reg) in [(blr_x1, 1usize), (blr_x30, 30usize)] {
+                let mut g0 = Guest::with_data();
+                g0.pages[0].0.copy_from_slice(&g.pages[0].0);
+                for (tier, run_t1) in [("T0", false), ("T1", true)] {
+                    let cur = if run_t1 { &mut g } else { &mut g0 };
+                    let s = cur.cpu.state_mut();
+                    s.x = [0; 31];
+                    s.nzcv = NZCV_INIT;
+                    s.x[reg] = TAG | callee;
+                    s.x[9] = TAG;
+                    s.pc = entry;
+                    let exit = if run_t1 {
+                        dbt.run(&mut cur.cpu)
+                    } else {
+                        cur.cpu.run()
+                    };
+                    assert_eq!(
+                        exit,
+                        Exit::Svc { imm: 0 },
+                        "{regs:?} {tier} blr round={round} entry={entry:#x}"
+                    );
+                    let st = cur.cpu.state();
+                    assert_eq!(st.x[0], callee, "{regs:?} {tier} callee adr");
+                    assert_eq!(st.x[5], entry + 4, "{regs:?} {tier} untagged link");
+                    assert_eq!(st.x[30], TAG | (entry + 4), "{regs:?} {tier} tagged lr");
+                    assert_eq!(st.nzcv, NZCV_INIT, "{regs:?} {tier} nzcv preserved");
+                    assert_eq!(st.pc, entry + 8, "{regs:?} {tier} resumed after blr");
+                }
+            }
+        }
+
+        // 2. Registered libc memop called with tagged X30: run n = 256 first (out-of-line
+        //    exec_memop return, which also warms DATA's write TLB), then n = 64 on the same page
+        //    (in-cache memop_memset -> d->memop_ret -> d->rs_miss -> d->lookup with zero R_INTERP).
+        let f_memset = CODE + 0x200;
+        let ret_pad = CODE + 0x240;
+        // Fallback guest body (must not run when memop handles both sizes).
+        g.code(f_memset, &[RET]);
+        g.code(ret_pad, &[0x1000_0004, SVC]); // adr x4, .; svc #0
+        space.set_memops(&[DbtMemop {
+            pc: f_memset,
+            kind: MEMOP_MEMSET,
+            reserved: 0,
+        }]);
+        for (i, len, expect_in_cache) in [(0u64, 256u64, false), (1, 64, true)] {
+            let dst = DATA + i * 512;
+            let fill = (0x33 + i) as u8;
+            let interp_before = dbt.stats().exits_interp;
+            let s = g.cpu.state_mut();
+            s.x = [0; 31];
+            s.x[0] = dst;
+            s.x[1] = u64::from(fill);
+            s.x[2] = len;
+            s.x[30] = TAG | ret_pad;
+            s.nzcv = NZCV_INIT;
+            s.pc = f_memset;
+            assert_eq!(
+                dbt.run(&mut g.cpu),
+                Exit::Svc { imm: 0 },
+                "{regs:?} memop len={len}"
+            );
+            if expect_in_cache {
+                assert_eq!(
+                    dbt.stats().exits_interp,
+                    interp_before,
+                    "{regs:?} len={len} should stay in-cache through memop_ret -> rs_miss"
+                );
+            }
+            let st = g.cpu.state();
+            assert_eq!(st.x[4], ret_pad, "{regs:?} memop return adr len={len}");
+            assert_eq!(st.x[30], TAG | ret_pad, "{regs:?} memop x30 preserved");
+            assert_eq!(st.nzcv, NZCV_INIT, "{regs:?} memop nzcv preserved");
+            assert_eq!(st.pc, ret_pad + 8);
+            let off = (i * 512) as usize;
+            assert!(
+                g.pages[3].0[off..off + len as usize]
+                    .iter()
+                    .all(|&b| b == fill),
+                "{regs:?} memop wrote bytes len={len}"
+            );
+        }
+
+        // 3. Fault parity between Tier 0 and Tier 1 for tagged TTBR0 faults and bit-55=1 faults
+        //    (via BR, RET, and direct entry pc).
+        let cases = [
+            (TAG | (target + 2), target + 2, FaultKind::Alignment),
+            (TAG | 0x1234_0000, 0x1234_0000, FaultKind::Page),
+            (TAG | DATA, DATA, FaultKind::Page),
+            (
+                TAG | (1u64 << 48) | target,
+                (1u64 << 48) | target,
+                FaultKind::Page,
+            ),
+            (
+                TAG | KERNEL_BIT | target,
+                TAG | KERNEL_BIT | target,
+                FaultKind::Page,
+            ),
+            (
+                (0xffu64 << 56) | KERNEL_BIT | target,
+                (0xffu64 << 56) | KERNEL_BIT | target,
+                FaultKind::Page,
+            ),
+            (
+                TAG | KERNEL_BIT | (target + 2),
+                TAG | KERNEL_BIT | (target + 2),
+                FaultKind::Alignment,
+            ),
+        ];
+        for (raw, expected, kind) in cases {
+            let want = Exit::Fault {
+                addr: expected,
+                access: Access::Exec,
+                kind,
+            };
+            for (mode, entry, reg) in [
+                ("br", br_x1, Some(1usize)),
+                ("ret", ret_x30, Some(30usize)),
+                ("entry", raw, None),
+            ] {
+                let mut g0 = Guest::with_data();
+                g0.pages[0].0.copy_from_slice(&g.pages[0].0);
+                for (tier, run_t1) in [("T0", false), ("T1", true)] {
+                    let cur = if run_t1 { &mut g } else { &mut g0 };
+                    let s = cur.cpu.state_mut();
+                    s.x = [0; 31];
+                    if let Some(r) = reg {
+                        s.x[r] = raw;
+                    }
+                    s.pc = entry;
+                    let exit = if run_t1 {
+                        dbt.run(&mut cur.cpu)
+                    } else {
+                        cur.cpu.run()
+                    };
+                    assert_eq!(exit, want, "{regs:?} {tier} {mode} raw={raw:#x}");
+                    assert_eq!(
+                        cur.cpu.state().pc,
+                        expected,
+                        "{regs:?} {tier} {mode} pc raw={raw:#x}"
+                    );
+                }
+            }
+        }
+    }
+}

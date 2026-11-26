@@ -1221,6 +1221,162 @@ fn run_stops_at_a_breakpoint_on_the_current_page() {
     assert_eq!(g.pc(), CODE + 4);
 }
 
+#[test]
+fn register_branches_and_entry_apply_tbi0() {
+    const TAG: u64 = 0x5a << 56;
+    const KERNEL_BIT: u64 = 1 << 55;
+    let put_code = |g: &mut Guest, addr: u64, insns: &[u32]| {
+        for (i, insn) in insns.iter().enumerate() {
+            g.bytes(addr + 4 * i as u64)[..4].copy_from_slice(&insn.to_le_bytes());
+        }
+    };
+
+    // Single-instruction BR, BLR (including BLR X30) and RET clear bits 63:56 when bit 55 == 0
+    // and leave the source register untouched (except BLR writing untagged pc + 4 to X30).
+    let mut g = Guest::new();
+    let target = CODE + 0x40;
+    g.set_x(1, TAG | target);
+    assert_eq!(g.cpu.exec_insn(0xd61f_0020), None); // br x1
+    assert_eq!((g.pc(), g.x(1)), (target, TAG | target));
+
+    g.cpu.state_mut().pc = CODE;
+    g.set_x(1, TAG | target);
+    assert_eq!(g.cpu.exec_insn(0xd63f_0020), None); // blr x1
+    assert_eq!((g.pc(), g.x(30), g.x(1)), (target, CODE + 4, TAG | target));
+
+    g.cpu.state_mut().pc = CODE + 8;
+    g.set_x(30, TAG | target);
+    assert_eq!(g.cpu.exec_insn(0xd63f_03c0), None); // blr x30
+    assert_eq!((g.pc(), g.x(30)), (target, CODE + 12));
+
+    g.cpu.state_mut().pc = CODE;
+    g.set_x(30, TAG | target);
+    assert_eq!(g.cpu.exec_insn(0xd65f_03c0), None); // ret
+    assert_eq!((g.pc(), g.x(30)), (target, TAG | target));
+
+    g.cpu.state_mut().pc = CODE;
+    g.set_x(9, TAG | target);
+    assert_eq!(g.cpu.exec_insn(0xd65f_0120), None); // ret x9
+    assert_eq!((g.pc(), g.x(9)), (target, TAG | target));
+
+    // Running through tagged BR/BLR/RET observes untagged PC in ADR, ADRP and LDR literal.
+    put_code(
+        &mut g,
+        CODE,
+        &[
+            0xd61f_0020, // br x1
+        ],
+    );
+    put_code(
+        &mut g,
+        target,
+        &[
+            0x1000_0000, // adr x0, .
+            0x9000_0001, // adrp x1, .
+            0x5800_0042, // ldr x2, .+8
+            0xd400_0001, // svc #0
+        ],
+    );
+    g.put_u64(target + 16, 0x1122_3344_5566_7788);
+    g.cpu.state_mut().pc = CODE;
+    g.set_x(1, TAG | target);
+    assert_eq!(g.cpu.run(), Exit::Svc { imm: 0 });
+    assert_eq!(g.x(0), target);
+    assert_eq!(g.x(1), target & !0xfff);
+    assert_eq!(g.x(2), 0x1122_3344_5566_7788);
+    assert_eq!(g.pc(), target + 16);
+
+    // Tagged entry PCs (modeling ERET from sigreturn/sigaction/ptrace) untag on run() and step()
+    // before hardware breakpoint checks and fetch.
+    g.cpu.state_mut().pc = TAG | target;
+    assert_eq!(g.cpu.step(), None); // adr x0, .
+    assert_eq!((g.x(0), g.pc()), (target, target + 4));
+
+    g.cpu.state_mut().set_hw_debug(&[target], &[]);
+    g.cpu.state_mut().pc = TAG | target;
+    assert_eq!(
+        g.cpu.run(),
+        Exit::Fault {
+            addr: target,
+            access: Access::Exec,
+            kind: FaultKind::HwBreakpoint,
+        }
+    );
+    assert_eq!(g.pc(), target);
+    g.cpu.state_mut().set_hw_debug(&[], &[]);
+
+    // Faulting TTBR0 targets (bit 55 == 0) clear bits 63:56 before alignment or page faults.
+    let ttbr0_faults = [
+        (TAG | (target + 2), target + 2, FaultKind::Alignment),
+        (TAG | 0x1234_0000, 0x1234_0000, FaultKind::Page),
+        (TAG | RODATA, RODATA, FaultKind::Page),
+        (
+            TAG | (1u64 << 48) | target,
+            (1u64 << 48) | target,
+            FaultKind::Page,
+        ),
+    ];
+    for (raw, expected, kind) in ttbr0_faults {
+        g.cpu.state_mut().pc = CODE;
+        g.set_x(1, raw);
+        assert_eq!(
+            g.cpu.run(),
+            Exit::Fault {
+                addr: expected,
+                access: Access::Exec,
+                kind,
+            },
+            "BR raw={raw:#x}"
+        );
+        assert_eq!(g.pc(), expected, "BR raw={raw:#x}");
+
+        g.cpu.state_mut().pc = raw;
+        assert_eq!(
+            g.cpu.step(),
+            Some(Exit::Fault {
+                addr: expected,
+                access: Access::Exec,
+                kind,
+            }),
+            "step raw={raw:#x}"
+        );
+        assert_eq!(g.pc(), expected, "step raw={raw:#x}");
+    }
+
+    // Addresses with bit 55 == 1 are outside TTBR0/TBI0: preserve bits 63:56 and fault with raw pc.
+    let ttbr1_faults = [
+        (TAG | KERNEL_BIT | target, FaultKind::Page),
+        ((0xffu64 << 56) | KERNEL_BIT | target, FaultKind::Page),
+        (TAG | KERNEL_BIT | (target + 2), FaultKind::Alignment),
+    ];
+    for (raw, kind) in ttbr1_faults {
+        g.cpu.state_mut().pc = CODE;
+        g.set_x(1, raw);
+        assert_eq!(
+            g.cpu.run(),
+            Exit::Fault {
+                addr: raw,
+                access: Access::Exec,
+                kind,
+            },
+            "BR bit55=1 raw={raw:#x}"
+        );
+        assert_eq!(g.pc(), raw, "BR bit55=1 raw={raw:#x}");
+
+        g.cpu.state_mut().pc = raw;
+        assert_eq!(
+            g.cpu.step(),
+            Some(Exit::Fault {
+                addr: raw,
+                access: Access::Exec,
+                kind,
+            }),
+            "step bit55=1 raw={raw:#x}"
+        );
+        assert_eq!(g.pc(), raw, "step bit55=1 raw={raw:#x}");
+    }
+}
+
 /// SIMD&FP and native stubs are available only on aarch64 Linux hosts (HWCAP reflects this
 /// faithfully; see the engine map).
 fn has_simd() -> bool {

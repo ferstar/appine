@@ -835,7 +835,7 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
 
     uint32_t reg_branch = insn & 0xfffffc1f;
     if (reg_branch == 0xd61f0000 || reg_branch == 0xd63f0000 || reg_branch == 0xd65f0000) {
-        uint64_t target = rx(c, FIELD(insn, 9, 5)); /* BR / BLR / RET */
+        uint64_t target = untag_pc(rx(c, FIELD(insn, 9, 5))); /* BR / BLR / RET */
         if (reg_branch == 0xd63f0000)
             c->x[30] = c->pc + 4;
         c->pc = target;

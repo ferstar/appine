@@ -167,6 +167,8 @@ static inline enum appine_exit exec_at(struct appine_cpu *cpu, const void *host)
 static enum appine_exit cpu_run(void *ctx, struct appine_cpu *cpu)
 {
     (void)ctx;
+    /* Model ERET -> BranchAddr(ELR_EL1) on entry to guest code (TBI0). */
+    cpu->pc = untag_pc(cpu->pc);
     /* A kick ends this run before the kernel can reclaim the page. Recheck execute permission
      * on the next run, even if it starts at the same PC. */
     uint64_t last_page = UINT64_MAX, addend = 0;
@@ -242,7 +244,8 @@ static bool brk_hit(const struct appine_cpu *cpu, uint64_t pc)
 
 enum appine_exit appine_interp_step(struct appine_cpu *cpu)
 {
-    uint64_t pc = cpu->pc;
+    uint64_t pc = untag_pc(cpu->pc);
+    cpu->pc = pc;
     if (UNLIKELY(pc & 3))
         return fetch_fault(cpu, pc, APPINE_FAULT_ALIGN);
     /* As on hardware, before executing this instruction */
