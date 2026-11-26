@@ -1364,7 +1364,11 @@ impl Mm {
     /// Creates a zeroed anonymous mapping at a fixed address (used by the loader); the range must
     /// be free.
     pub fn map_anonymous(&mut self, start: u64, len: u64, prot: u32) -> Result<(), Errno> {
-        if !start.is_multiple_of(PAGE_SIZE) || len == 0 || !len.is_multiple_of(PAGE_SIZE) {
+        if !start.is_multiple_of(PAGE_SIZE)
+            || len == 0
+            || !len.is_multiple_of(PAGE_SIZE)
+            || start.checked_add(len).is_none_or(|e| e > 1 << VA_BITS)
+        {
             return Err(Errno::EINVAL);
         }
         if !self.is_free(start, len) {
@@ -3335,10 +3339,16 @@ impl Mm {
             return Err(Errno::EAGAIN);
         }
         let offset = old_end - start;
-        if offset == tail.len
-            && grow <= self.mmap_top.saturating_sub(old_end)
-            && self.is_free(old_end, grow)
-        {
+        let can_grow_in_place = old_end.checked_add(grow).is_some_and(|new_end| {
+            new_end <= 1 << VA_BITS
+                && self.is_free(old_end, grow)
+                && self
+                    .vmas
+                    .range(new_end..)
+                    .next()
+                    .is_none_or(|(&s, v)| !v.growsdown || s - new_end >= STACK_GUARD_GAP)
+        });
+        if offset == tail.len && can_grow_in_place {
             if self.grow_tail(start, grow)? {
                 return Ok(old);
             }
@@ -3821,6 +3831,9 @@ impl Mm {
         let (Some(old_end), Some(new_end)) = (page_up(self.brk), page_up(new)) else {
             return self.brk;
         };
+        if new_end > 1 << VA_BITS {
+            return self.brk;
+        }
         if new_end > old_end {
             let grow = new_end - old_end;
             if self.lock_future && !self.can_lock(grow, memlock_limit) {
@@ -13576,8 +13589,9 @@ mod tests {
             .mremap_limited(unlk, PAGE_SIZE, 4 * PAGE_SIZE, true, None, 3 * PAGE_SIZE)
             .unwrap();
         assert!(!mm.is_locked_at(unlk));
-        // Duplicating a locked shared VMA (old_len == 0) enforces RLIMIT_MEMLOCK.
-        let sh = mm.mmap(0, PAGE_SIZE, RW, shared, None).unwrap();
+        // Duplicating a locked shared VMA (old_len == 0) enforces RLIMIT_MEMLOCK. Place `sh` at a
+        // disjoint hint so the 3-page MREMAP_FIXED below cannot overlap `lk`.
+        let sh = mm.mmap(0x3000_0000, PAGE_SIZE, RW, shared, None).unwrap();
         assert_eq!(mm.locked_bytes(), 3 * PAGE_SIZE);
         assert_eq!(
             mm.mremap_limited(sh, 0, PAGE_SIZE, true, None, 3 * PAGE_SIZE),
@@ -13736,5 +13750,122 @@ mod tests {
         child.munmap(addr + PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
         assert_eq!(child.cow.borrow().borrowed.len(), 3);
         assert_eq!(child.swappable_nonresident_pages(), 3);
+    }
+
+    #[test]
+    fn brk_limited_rejects_growth_past_va_bits() {
+        let limit = 1u64 << VA_BITS;
+
+        // Small growth right up to 1 << VA_BITS succeeds; one page past fails without mapping.
+        let mut mm = Mm::new();
+        let base = limit - 2 * PAGE_SIZE;
+        mm.set_brk(base);
+        assert_eq!(mm.brk(limit, false), limit);
+        assert_eq!(mm.brk(limit + PAGE_SIZE, false), limit);
+        assert!(!mm.is_mapped(limit));
+
+        // Large (> 1 MiB, lazy PTEs) growth past 1 << VA_BITS must also fail instead of inserting
+        // an untranslatable VMA above VA_BITS.
+        let mut mm = Mm::new();
+        let base = limit - (2 << 20);
+        mm.set_brk(base);
+        assert_eq!(mm.brk(limit + (4 << 20), false), base);
+        assert!(mm.vmas.is_empty());
+        assert_eq!(mm.brk(u64::MAX, false), base);
+        assert!(mm.vmas.is_empty());
+        assert_eq!(
+            mm.map_anonymous(limit - PAGE_SIZE, 2 * PAGE_SIZE, RW),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn mremap_in_place_growth_respects_va_bits_and_guard_gap() {
+        let limit = 1u64 << VA_BITS;
+        let anon_fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let mut mm = Mm::new();
+
+        // A MAP_FIXED mapping above STACK_TOP (and mmap_top) can grow in place when space is free.
+        let high = STACK_TOP + 0x1000_0000;
+        assert_eq!(
+            mm.mmap(high, PAGE_SIZE, RW, anon_fixed, None).unwrap(),
+            high
+        );
+        mm.write_kernel(high, b"hi").unwrap();
+        assert_eq!(
+            mm.mremap(high, PAGE_SIZE, 3 * PAGE_SIZE, false, None)
+                .unwrap(),
+            high
+        );
+        let mut buf = [0u8; 2];
+        mm.read(UserSlice::new(high, 2), &mut buf).unwrap();
+        assert_eq!(&buf, b"hi");
+
+        // An adjacent mapping above high prevents in-place growth.
+        let blocker = high + 3 * PAGE_SIZE;
+        mm.mmap(blocker, PAGE_SIZE, RW, anon_fixed, None).unwrap();
+        assert_eq!(
+            mm.mremap(high, 3 * PAGE_SIZE, 4 * PAGE_SIZE, false, None),
+            Err(Errno::ENOMEM)
+        );
+        mm.munmap(blocker, PAGE_SIZE).unwrap();
+        mm.munmap(high, 3 * PAGE_SIZE).unwrap();
+
+        // A MAP_FIXED mapping near 1 << VA_BITS grows in place up to 1 << VA_BITS, not past it.
+        let top = limit - 2 * PAGE_SIZE;
+        mm.mmap(top, PAGE_SIZE, RW, anon_fixed, None).unwrap();
+        assert_eq!(
+            mm.mremap(top, PAGE_SIZE, 2 * PAGE_SIZE, false, None)
+                .unwrap(),
+            top
+        );
+        assert_eq!(
+            mm.mremap(top, 2 * PAGE_SIZE, 3 * PAGE_SIZE, false, None),
+            Err(Errno::ENOMEM)
+        );
+        // Overflowing new_len must also fail cleanly without panicking.
+        assert_eq!(
+            mm.mremap(top, 2 * PAGE_SIZE, u64::MAX - PAGE_SIZE + 1, false, None),
+            Err(Errno::ENOMEM)
+        );
+        assert_eq!(
+            mm.mremap(top, 2 * PAGE_SIZE, u64::MAX - PAGE_SIZE + 1, true, None),
+            Err(Errno::ENOMEM)
+        );
+        // With MREMAP_MAYMOVE, a valid growth past 1 << VA_BITS relocates below mmap_top.
+        let moved = mm
+            .mremap(top, 2 * PAGE_SIZE, 3 * PAGE_SIZE, true, None)
+            .unwrap();
+        assert!(moved + 3 * PAGE_SIZE <= mm.mmap_top);
+        mm.munmap(moved, 3 * PAGE_SIZE).unwrap();
+
+        // In-place growth respects STACK_GUARD_GAP below a grows-down VMA above it (including above
+        // mmap_top).
+        let grows = STACK_TOP + 0x2000_0000;
+        mm.mmap(
+            grows,
+            PAGE_SIZE,
+            RW,
+            anon_fixed | flags::MAP_GROWSDOWN,
+            None,
+        )
+        .unwrap();
+        let below = grows - STACK_GUARD_GAP - 2 * PAGE_SIZE;
+        mm.mmap(below, PAGE_SIZE, RW, anon_fixed, None).unwrap();
+        // Growing up to the exact guard boundary succeeds in place.
+        assert_eq!(
+            mm.mremap(below, PAGE_SIZE, 2 * PAGE_SIZE, false, None)
+                .unwrap(),
+            below
+        );
+        // Crossing into STACK_GUARD_GAP fails without MREMAP_MAYMOVE and moves with MREMAP_MAYMOVE.
+        assert_eq!(
+            mm.mremap(below, 2 * PAGE_SIZE, 3 * PAGE_SIZE, false, None),
+            Err(Errno::ENOMEM)
+        );
+        let relocated = mm
+            .mremap(below, 2 * PAGE_SIZE, 3 * PAGE_SIZE, true, None)
+            .unwrap();
+        assert!(relocated + 3 * PAGE_SIZE <= mm.mmap_top);
     }
 }

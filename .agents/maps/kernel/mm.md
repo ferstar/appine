@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across VMA layout, page faults, permission changes, file invalidation and dump selection)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: MREMAP_DONTUNMAP whole-vs-partial anon_vma unlinking, retained anon_pgoff, whole-VMA unlock and reserved dump_page guard)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: bound brk and in-place mremap growth by 1 << VA_BITS and document the 47-bit default map window)
 
 ## Responsibilities
 
@@ -99,7 +99,11 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   exec). It adds the guard gap to the limit with saturation, clamps the sum between
   1 GiB + 8 MiB and 5/6 of the address space, then subtracts that gap from `STACK_TOP` and
   page-aligns the result. An unlimited stack still gives a top-down layout with the largest gap.
-- `STACK_TOP` is `1 << 47`. A position-independent main program loads at `0x5555_5555_0000`.
+- `STACK_TOP` is `1 << 47`, serving as a deliberate 47-bit default map window inside the 48-bit
+  `TASK_SIZE` (`1 << VA_BITS`): keeping the main stack and non-fixed `mmap` allocations below
+  `1 << 47` preserves compatibility with 47-bit NaN-boxing/pointer-tagging runtimes while fixed
+  mappings (`MAP_FIXED`, `MREMAP_FIXED`, `shmat`), `brk` and in-place `mremap` can still reach
+  `1 << 48`. A position-independent main program loads at `0x5555_5555_0000` (2/3 of `STACK_TOP`).
   Non-fixed `mmap` allocates top-down from `mmap_top` (`find_free`), 2 MB-aligning mappings ≥
   `LEAF_SPAN` (2 MB) when VA space permits (falling back to page alignment) to form `kernel/mmu` L2
   superpages, skipping `stack_guard_gap` (256 pages) below grows-down VMAs, floored at
@@ -170,10 +174,10 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   place inside the heap's host region when the last part is anonymous, unnamed, with the heap's
   permissions, charge and VMA flags and no other VMA on that host range (discarding the host range
   first), else at the first heap page reserves 256 MB (`MAP_NORESERVE`) for growth of at most that,
-  else falls back to a separate accounted anonymous mapping. Shrinking unmaps. brk ignores
-  `mmap_top`, the guard gap and `vm.mmap_min_addr`, and there is no `RLIMIT_DATA` or `RLIMIT_AS`
-  enforcement; under `mlockall(MCL_FUTURE)`, growth enforces `RLIMIT_MEMLOCK` (returning the old
-  break on failure) and populates new pages unless `MCL_ONFAULT`.
+  else falls back to a separate accounted anonymous mapping. Shrinking unmaps. brk caps at
+  `1 << VA_BITS`, ignores `mmap_top`, the guard gap and `vm.mmap_min_addr`, and has no `RLIMIT_DATA`
+  or `RLIMIT_AS` enforcement; under `mlockall(MCL_FUTURE)`, growth enforces `RLIMIT_MEMLOCK`
+  (returning the old break on failure) and populates new pages unless `MCL_ONFAULT`.
 
 ### Mappings read on demand (`Fill`)
 
@@ -272,7 +276,8 @@ Otherwise the populated page-table levels determine the translation-fault level.
   at the old address is `EFAULT`; a `MREMAP_FIXED` target is validated (`EINVAL`) and unmapped and
   a shrunk tail unmapped; then the rest of the old range must lie in one Linux VMA (`EFAULT`,
   `same_vma`, as Linux before 6.17). Shrinking without a target only unmaps the tail. Growing in
-  place needs the old end to be a VMA end, free space above and a new end at or below `mmap_top`.
+  place needs the old end to be a VMA end, free space above clear of `stack_guard_gap` below any
+  grows-down VMA above it, and a new end at or below `1 << VA_BITS`.
   Reservations grow without host memory. Shared anonymous and SysV mappings extend the same
   VMA, with contents capped at the original backing extent. A backed private anonymous tail
   can reuse spare bytes when its host region has a single strong reference. It discards those
@@ -510,5 +515,4 @@ Otherwise the populated page-table levels determine the translation-fault level.
 
 ## Open questions
 
-- Why is `STACK_TOP` `1 << 47` while the page table covers 48 bits and `MAP_FIXED` may reach
-  `1 << 48`?
+- None.

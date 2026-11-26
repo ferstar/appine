@@ -64,7 +64,11 @@ const AT_EXECFN: u64 = 31;
 const AT_SYSINFO_EHDR: u64 = 33;
 const AT_MINSIGSTKSZ: u64 = 51;
 
-/// The initial stack top (exclusive), that is the upper bound of the 47-bit address space.
+/// The initial stack top (exclusive) and ceiling of the 47-bit default map window inside the
+/// 48-bit `TASK_SIZE` (`1 << VA_BITS`): keeping the main stack and non-fixed `mmap` allocations
+/// below `1 << 47` preserves compatibility with 47-bit NaN-boxing / pointer-tagging runtimes
+/// (such as LuaJIT GC64, SpiderMonkey and JavaScriptCore), analogous to arm64 Linux's
+/// `DEFAULT_MAP_WINDOW_64` vs `TASK_SIZE_64` split, while fixed mappings can still use `[0, 1 << 48)`.
 pub const STACK_TOP: u64 = 1 << 47;
 /// The default stack size limit (the default soft limit of `RLIMIT_STACK`, Linux's `_STK_LIM`),
 /// which is also the most host memory reserved below the stack at load time.
@@ -75,8 +79,8 @@ const STACK_EXPAND: u64 = 128 << 10;
 /// However small the stack size limit, the arguments may take at least this much (Linux's
 /// `ARG_MAX`, 32 pages).
 const ARG_MAX: u64 = 32 * PAGE_SIZE;
-/// Load base of a position-independent main program: 2/3 of the address space, chosen the same
-/// way as arm64 Linux's `ELF_ET_DYN_BASE`.
+/// Load base of a position-independent main program: 2/3 of the 47-bit default map window
+/// (`STACK_TOP`).
 const ET_DYN_BASE: u64 = 0x5555_5555_0000;
 /// The maximum length of the interpreter path (`PATH_MAX`).
 const MAX_INTERP_PATH: u64 = 4096;
