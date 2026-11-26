@@ -1313,7 +1313,6 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
             g.leader_exit = None;
             g.leader_serial = None;
             g.leader_tracer = None;
-            g.leader_net = None;
             g.children.clone()
         };
         // Children created by other threads were handed to this thread when they exited, and

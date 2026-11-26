@@ -710,7 +710,30 @@ impl TimerFd {
     }
 }
 
+/// Lowest-free non-negative ID allocator for eventfd instances (Linux's `eventfd_ida`).
+#[derive(Default)]
+pub struct EventFdIds {
+    next: i32,
+    free: std::collections::BTreeSet<i32>,
+}
+
+impl EventFdIds {
+    fn alloc(&mut self) -> Result<i32, Errno> {
+        if let Some(id) = self.free.pop_first() {
+            return Ok(id);
+        }
+        let id = self.next;
+        self.next = id.checked_add(1).ok_or(Errno::ENOSPC)?;
+        Ok(id)
+    }
+
+    fn release(&mut self, id: i32) {
+        self.free.insert(id);
+    }
+}
+
 /// eventfd state.
+#[derive(Default)]
 pub struct EventFd {
     /// The counter.
     pub count: u64,
@@ -721,6 +744,32 @@ pub struct EventFd {
     /// makes the writing side's fire again.
     pub writes: u64,
     pub reads: u64,
+    /// Per-instance ID shown as `eventfd-id` in `/proc/<pid>/fdinfo` (Linux's `eventfd_ida`).
+    pub id: i32,
+    ids: Option<std::rc::Weak<RefCell<EventFdIds>>>,
+}
+
+impl EventFd {
+    /// Creates an eventfd with a unique ID from `ids`, returned to `ids` when dropped.
+    pub fn new(count: u64, semaphore: bool, ids: &Rc<RefCell<EventFdIds>>) -> Result<Self, Errno> {
+        let id = ids.borrow_mut().alloc()?;
+        Ok(Self {
+            count,
+            semaphore,
+            writes: 0,
+            reads: 0,
+            id,
+            ids: Some(Rc::downgrade(ids)),
+        })
+    }
+}
+
+impl Drop for EventFd {
+    fn drop(&mut self) {
+        if let Some(ids) = self.ids.as_ref().and_then(std::rc::Weak::upgrade) {
+            ids.borrow_mut().release(self.id);
+        }
+    }
 }
 
 /// Accumulated counts of newly arrived events on a host fd ([`appine_hal::Edges`]).

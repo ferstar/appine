@@ -3070,12 +3070,11 @@ pub(super) fn eventfd2(cx: &mut Cx<'_>, initval: u32, flags: u32) -> SysResult {
     if flags & !(EFD_SEMAPHORE | oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
         return Err(Errno::EINVAL);
     }
-    let efd = EventFd {
-        count: initval as u64,
-        semaphore: flags & EFD_SEMAPHORE != 0,
-        writes: 0,
-        reads: 0,
-    };
+    let efd = EventFd::new(
+        initval as u64,
+        flags & EFD_SEMAPHORE != 0,
+        &cx.kr().eventfd_ids,
+    )?;
     let file = OpenFile::new(
         FileKind::EventFd(Rc::new(RefCell::new(efd))),
         oflags::O_RDWR | (flags & oflags::O_NONBLOCK),
@@ -3173,13 +3172,11 @@ mod tests {
 
         let (socket, peer) = UnixStream::pair().unwrap();
         let host = OpenFile::new(FileKind::Host(socket.as_raw_fd()), oflags::O_RDWR);
+        let mut efd = EventFd::default();
+        efd.count = 1;
+        efd.writes = 1;
         let event = OpenFile::new(
-            FileKind::EventFd(Rc::new(RefCell::new(EventFd {
-                count: 1,
-                semaphore: false,
-                writes: 1,
-                reads: 0,
-            }))),
+            FileKind::EventFd(Rc::new(RefCell::new(efd))),
             oflags::O_RDWR,
         );
         let mut ep = Epoll::default();
@@ -3214,12 +3211,7 @@ mod tests {
 
     #[test]
     fn edge_triggered_interests_fire_on_new_readiness() {
-        let efd = Rc::new(RefCell::new(EventFd {
-            count: 0,
-            semaphore: false,
-            writes: 0,
-            reads: 0,
-        }));
+        let efd = Rc::new(RefCell::new(EventFd::default()));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         let both = (POLLIN | POLLOUT) as u32;
         let mut ep = Epoll::default();
@@ -3262,12 +3254,7 @@ mod tests {
 
     #[test]
     fn edge_triggered_interests_fire_on_every_arrival() {
-        let efd = Rc::new(RefCell::new(EventFd {
-            count: 0,
-            semaphore: false,
-            writes: 0,
-            reads: 0,
-        }));
+        let efd = Rc::new(RefCell::new(EventFd::default()));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         let mut ep = Epoll::default();
         push_test_interest(&mut ep, 3, &file, POLLIN as u32 | EPOLLET, 0);
@@ -3298,12 +3285,7 @@ mod tests {
     #[test]
     fn waits_register_the_objects_of_watched_files() {
         let eventfd = || {
-            let e = Rc::new(RefCell::new(EventFd {
-                count: 0,
-                semaphore: false,
-                writes: 0,
-                reads: 0,
-            }));
+            let e = Rc::new(RefCell::new(EventFd::default()));
             (
                 OpenFile::new(FileKind::EventFd(e.clone()), oflags::O_RDWR),
                 e,
@@ -3340,12 +3322,7 @@ mod tests {
 
     #[test]
     fn nested_epolls_fire_on_every_inner_event() {
-        let efd = Rc::new(RefCell::new(EventFd {
-            count: 0,
-            semaphore: false,
-            writes: 0,
-            reads: 0,
-        }));
+        let efd = Rc::new(RefCell::new(EventFd::default()));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         // The inner epoll watches an eventfd level-triggered, the outer one watches the inner
         // edge-triggered
@@ -3380,12 +3357,7 @@ mod tests {
 
     #[test]
     fn exclusive_interests_report_each_edge_to_one_epoll() {
-        let efd = Rc::new(RefCell::new(EventFd {
-            count: 0,
-            semaphore: false,
-            writes: 0,
-            reads: 0,
-        }));
+        let efd = Rc::new(RefCell::new(EventFd::default()));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         let new = || {
             let mut ep = Epoll::default();
@@ -3428,12 +3400,7 @@ mod tests {
 
     #[test]
     fn exclusive_gates_pick_one_waiter_per_edge() {
-        let efd = Rc::new(RefCell::new(EventFd {
-            count: 0,
-            semaphore: false,
-            writes: 0,
-            reads: 0,
-        }));
+        let efd = Rc::new(RefCell::new(EventFd::default()));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         let sleepers: Vec<_> = (0..3)
             .map(|_| Arc::new(appine_hal::Event::new().unwrap()))
@@ -3478,12 +3445,7 @@ mod tests {
 
     #[test]
     fn exclusive_gates_match_direction_and_wanted_mask() {
-        let efd = Rc::new(RefCell::new(EventFd {
-            count: 0,
-            semaphore: false,
-            writes: 0,
-            reads: 0,
-        }));
+        let efd = Rc::new(RefCell::new(EventFd::default()));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         let out_waiter = Arc::new(appine_hal::Event::new().unwrap());
         let in_waiter = Arc::new(appine_hal::Event::new().unwrap());
@@ -3528,12 +3490,7 @@ mod tests {
 
     #[test]
     fn exclusive_gates_preserve_stable_waiter_order() {
-        let efd = Rc::new(RefCell::new(EventFd {
-            count: 0,
-            semaphore: false,
-            writes: 0,
-            reads: 0,
-        }));
+        let efd = Rc::new(RefCell::new(EventFd::default()));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         let w0 = Arc::new(appine_hal::Event::new().unwrap());
         let w1 = Arc::new(appine_hal::Event::new().unwrap());
@@ -3589,12 +3546,7 @@ mod tests {
         let mut files = Vec::new();
         let mut efds = Vec::new();
         for i in 0..64 {
-            let e = Rc::new(RefCell::new(EventFd {
-                count: 0,
-                semaphore: false,
-                writes: 0,
-                reads: 0,
-            }));
+            let e = Rc::new(RefCell::new(EventFd::default()));
             let f = OpenFile::new(FileKind::EventFd(e.clone()), oflags::O_RDWR);
             let mut ep_mut = ep.borrow_mut();
             let slot =
@@ -3780,12 +3732,7 @@ mod tests {
 
     #[test]
     fn eventfd_readiness_and_epoll_oneshot() {
-        let efd = Rc::new(RefCell::new(EventFd {
-            count: 0,
-            semaphore: false,
-            writes: 0,
-            reads: 0,
-        }));
+        let efd = Rc::new(RefCell::new(EventFd::default()));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         assert_eq!(poll_now(&file.borrow(), POLLIN | POLLOUT, 0), POLLOUT);
         let mut ep = Epoll::default();

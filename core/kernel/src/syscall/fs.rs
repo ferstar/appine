@@ -1009,17 +1009,19 @@ fn open_pseudo(
     ) = node
     {
         // proc.pid may name any thread (/proc/<tid>, pseudo::group_of_id): the check is on that
-        // thread
-        pseudo::group_of_id(cx.kr(), proc).ok_or(Errno::ESRCH)?;
+        // thread. Reaped processes and exited non-leader threads fail with ESRCH, whereas an
+        // exited, unreaped leader (zombie) still exists with no mm.
+        if !pseudo::pid_exists_in(cx.kr(), proc, tid) {
+            return Err(Errno::ESRCH);
+        }
         let thread = tid.unwrap_or(proc.pid);
         if !super::proc::may_ptrace_fs(cx, thread) {
             return Err(Errno::EACCES);
         }
-        // mem and pagemap pin the named thread's address space at open (Linux's proc_mem_open /
-        // pagemap_open): one that has exited (a zombie, a main thread whose process lives on) has
-        // none, ESRCH at open as on Linux. environ also pins the address space at open
-        // (proc_environ_operations / __mem_open), staying None (EOF on read) for a zombie so an
-        // open fd cannot later read a new address space after execve.
+        // mem, pagemap and environ pin the named thread's address space at open (Linux 6.1's
+        // proc_mem_open / __mem_open / pagemap_open): an exited, unreaped leader has no address
+        // space, leaving `mm` as None so open succeeds and reads/writes return EOF (and an open
+        // fd never later reads a new address space after execve).
         if matches!(
             e,
             pseudo::Entry::Mem | pseudo::Entry::Pagemap | pseudo::Entry::Environ
@@ -1029,9 +1031,6 @@ fn open_pseudo(
                 .tasks
                 .get(&thread)
                 .map(|t| Rc::downgrade(&t.res.borrow().mm));
-            if mm.is_none() && e != pseudo::Entry::Environ {
-                return Err(Errno::ESRCH);
-            }
         }
     }
     // Writing setgroups needs CAP_SYS_ADMIN in the process's user namespace, checked at open

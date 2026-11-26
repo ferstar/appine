@@ -1119,7 +1119,6 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
             let mut g = group.borrow_mut();
             g.leader_exit = Some((task.comm.get(), cpu));
             g.leader_serial = Some(task.serial);
-            g.leader_net = Some(Rc::downgrade(&task.ns.borrow().net));
         }
         let mut st = task.state.borrow_mut();
         // The process's last thread: sample the peak resident memory once before exiting

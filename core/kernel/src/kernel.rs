@@ -355,6 +355,9 @@ pub(crate) struct Kernel {
     /// All inotify watches. Open files must report `IN_CLOSE_*` when destroyed, so it is shared
     /// through Rc.
     pub inotify: Rc<RefCell<crate::syscall::Registry>>,
+    /// Per-instance eventfd ID allocator (`eventfd-id` in `/proc/<pid>/fdinfo`). Shared through
+    /// `Rc` so dropping an `EventFd` returns its ID.
+    pub eventfd_ids: Rc<RefCell<crate::fd::EventFdIds>>,
     /// Read-only file mappings shared by all address spaces ([`crate::mm::FileMaps`]).
     pub file_maps: crate::mm::FileMaps,
 }
@@ -464,6 +467,7 @@ impl Kernel {
             tainted: 0,
             unhandled_rs: Default::default(),
             inotify: Rc::default(),
+            eventfd_ids: Rc::default(),
             file_maps: Default::default(),
         }
     }

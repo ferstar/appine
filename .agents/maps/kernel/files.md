@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/files.md` for the paired decision history (it still holds the decisions on file data I/O, clones/unsharing, size changes and syncing made before they were split out into `kernel/fileio`; pre-split decisions from `kernel/vfs` are D5, D17, D26, D27, D34, D41, D44, D55, the owner half of D25, the `open_pseudo` half of D19 and the open-check parts of D36 in `.agents/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across fd allocation and close, path and handle opens, inode flags, render submission and fences)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: EventFdIds allocator and Linux 6.1 zombie leader mem/pagemap open)
 
 ## Responsibilities
 
@@ -175,10 +177,10 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   `fd/`/`fdinfo/` directories for non-write opens (`pseudo::allows_own_proc_dir`, matching Linux's
   `proc_fd_permission` when non-dumpable); `O_TRUNC` asks
   for write; the ptrace read check for `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup`
-  and `pagemap` (the process found through `pseudo::group_of_id` matching the pinned `ProcId`, so
-  `/proc/<tid>` works and a reused pid does not match; `mem` and `pagemap` of a gone thread `ESRCH`,
-  both pinning a weak `Mm` at open; `environ` also pins a weak `Mm` when live and reads EOF for a
-  zombie or once the `Mm` is freed or replaced by `execve`); `setgroups` writes also need `CAP_SYS_ADMIN` over the
+  and `pagemap` (requiring `pseudo::pid_exists_in` matching the pinned `ProcId`, so `/proc/<tid>`
+  works, a reused pid or exited non-leader thread is `ESRCH`, and `mem`, `pagemap` and `environ`
+  all pin a weak `Mm` when live while leaving `None` for an unreaped zombie leader so open succeeds
+  and reads/writes return EOF, matching Linux 6.1); `setgroups` writes also need `CAP_SYS_ADMIN` over the
   target's user namespace; nodev and the device filter for PTYs; `O_DIRECT` `EINVAL`;
   `EISDIR`/`ENOTDIR`/`EROFS`; `EACCES` for writes the filesystem does not allow except read-only
   procfs files outside `/proc/sys`, which root opens and whose writes fail (`kernel/procfs`).

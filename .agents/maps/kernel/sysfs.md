@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: loop-device number links under `/sys/dev/block/` and block `uevent` attributes)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: rootfs backing block device sda/sda1 and /sys/dev/block/8:0 and 8:1 symlinks)
 
 ## Responsibilities
 
@@ -13,14 +13,16 @@
 
 - CPU topology and host-copied `cache/` and `cpufreq/` attributes under `/sys/devices/system/cpu/`;
 - `/sys/class/net/<if>/` network interface, bridge (`bridge/`, `brif/`) and port (`brport/`) views;
-- `/sys/block/loop<n>/` loop-device attributes and their device-number links under `/sys/dev/block/`;
+- `/sys/block/loop<n>/` loop-device attributes, `/sys/block/sda/` (`sda1/`) rootfs backing block
+  attributes, and their device-number links under `/sys/dev/block/`;
 - `/sys/module/overlay/parameters/` defaults, the `/sys/fs/cgroup/` mount point, and the
   conditional platform DRM render-node discovery hierarchy (`SYS_GPU`).
 
-Root: in `core/kernel/src/pseudo.rs`, `SYS_GPU`, `SYS_STATIC`, `SYS_NET_DIR`, `SYS_BLOCK_DIR`, `SYS_DEV_BLOCK_DIR`,
+Root: in `core/kernel/src/pseudo.rs`, `SYS_GPU`, `SYS_STATIC`, `ROOT_BLOCK_DEV`, `ROOT_PART_START`,
+`SYS_NET_DIR`, `SYS_BLOCK_DIR`, `SYS_DEV_BLOCK_DIR`,
 `BLOCK_FILES`, `NET_FILES`, `BRIDGE_FILES`, `PORT_FILES`, `SYS_CPU_DIR`, `CPU_FILES`,
 `HOST_CPU_FILES`, `CGROUP_POINT`, `PseudoNode::{SysRoot, Sys, SysCpu, SysNet, SysBrif, SysBlock, SysDevBlock}`,
-the `sysfs` section (`net_file`, `cpu_file`, `cpu_list`, `cpu_mask`, `host_cpu_file`,
+the `sysfs` section (`root_block_file`, `net_file`, `cpu_file`, `cpu_list`, `cpu_mask`, `host_cpu_file`,
 `parse_cpu_list`, `parse_cpu_mask`, `cpu_list_of`, `cpu_mask_of`, `host_cpu_has`, `host_cpu`), and
 the sysfs arms of `View`, `stat`, `fs_of`, `readdir`, `node_ino`, `ino_of`, `open_unwritable`,
 `pollable` and `content`.
@@ -34,8 +36,8 @@ CPU and `tx_queue_len` helpers (`hal`).
 ## Key types
 
 - `PseudoNode` variants: `SysRoot`, `Sys(path)`, `SysCpu(cpu, path)`, `SysNet(ifindex, path)`,
-  `SysBrif(bridge, port)`, `SysBlock(loop_n, path)`, `SysDevBlock(loop_n)` and `CGROUP_POINT` (`Sys(b"fs/cgroup/")`).
-- Tables: `SYS_STATIC` (25 fixed paths), `SYS_GPU` (conditional platform DRM render-node paths),
+  `SysBrif(bridge, port)`, `SysBlock(loop_n, path)`, `SysDevBlock(major, minor)` and `CGROUP_POINT` (`Sys(b"fs/cgroup/")`).
+- Tables: `SYS_STATIC` (49 fixed paths, including `block/sda/` and `block/sda/sda1/`), `SYS_GPU` (conditional platform DRM render-node paths),
   `BLOCK_FILES` (23), `NET_FILES` (36), `BRIDGE_FILES` (10), `PORT_FILES` (4), `CPU_FILES` (19) and
   `HOST_CPU_FILES` (68).
 
@@ -99,6 +101,13 @@ CPU and `tx_queue_len` helpers (`hal`).
 - `/sys/dev/block/7:<n>` links to `../../block/loop<n>` for each existing loop device, bound or
   unbound. Both paths reach the same `uevent` file. Its four lines give `MAJOR=7`, `MINOR=<n>`,
   `DEVNAME=loop<n>` and `DEVTYPE=disk`. Lookup, readlink and uevent generation check device existence.
+- The root filesystem's reported device (`ROOT_DEV`, `8:1`) is exposed as synthetic partition
+  `/sys/block/sda/sda1/` (`dev` `8:1`, `partition` `1`, `ro` `0`, `start` `2048`, `size` in
+  512-byte sectors from `Store::fs_stats`, and `uevent` with `MAJOR=8`, `MINOR=1`, `DEVNAME=sda1`,
+  `DEVTYPE=partition`, `PARTN=1`) under whole disk `/sys/block/sda/` (`dev` `8:0`, `removable` `0`,
+  `ro` `0`, `size` partition sectors plus 2048, `uevent` with `DEVNAME=sda` and `DEVTYPE=disk`, and
+  `queue/` attributes). `/sys/dev/block/8:0` links to `../../block/sda` and `/sys/dev/block/8:1`
+  links to `../../block/sda/sda1`.
 
 ## Dependencies (inbound / outbound)
 
@@ -122,15 +131,13 @@ CPU and `tx_queue_len` helpers (`hal`).
 - The guest CPU count (`cpus()`) must stay consistent with `/proc/cpuinfo`, `/proc/stat`, `status`,
   `sched_getaffinity` and cgroup `cpuset`.
 - Device numbers advertised by `SYS_GPU` (`226:128`) must match `/dev/dri/renderD128` (`kernel/vfs`
-  and `kernel/files`).
+  and `kernel/files`); `8:1` (`ROOT_BLOCK_DEV`) is derived from `ROOT_DEV` (`kernel/vfs`).
 - `SYS_STATIC` supplies the shared `dev/` parent. `SYS_GPU` adds `dev/char/` when a renderer is present.
 - Dynamic sysfs directories (`brif/`, interfaces, loop devices, `dev/block/`, `cpu<n>`) must stay excluded in
   `missing_path` (`kernel/procfs`), or each absent entry becomes a counted unimplemented path.
 
 ## Confirmed bugs / technical debt
 
-- **Root filesystem backing device:** the inode store reports device `8:1` but has no backing
-  block device. Probes for `/sys/dev/block/8:1` return `ENOENT`.
 - **Fidelity gaps:** interfaces and loop devices are directories rather than symlinks into
   `/sys/devices`; `kernel/`, other modules, `firmware/`, `power/` and NUMA nodes are absent.
 

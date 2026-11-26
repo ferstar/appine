@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/procfs.md` for the paired decision history (it still holds the decisions on cgroups/device BPF, `/proc/sys` sysctls and sysfs made before they were split out into `kernel/cgroup`, `kernel/sysctl` and `kernel/sysfs`).
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across node identity, snapshots, task and network views, pseudo devices and Linux 6.1 procfs contracts)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: per-thread pagemap, zombie mem/pagemap/net semantics, single-record net EACCES writes, eventfd-id and FDSize table capacity)
 
 ## Responsibilities
 
@@ -49,7 +51,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   the directory), and mqueue (`MqRoot`, `Mq`). Process-scoped variants carry `ProcId { pid, serial }`,
   pinning each handle to one thread-group instance even if the pid is later reused; nodes remain plain
   values resolved on each call.
-- Tables: `GLOBALS` (15 top-level files), `ENTRIES` (34 per-process names), `TASK_ENTRIES` (the 30
+- Tables: `GLOBALS` (15 top-level files), `ENTRIES` (34 per-process names), `TASK_ENTRIES` (the 31
   allowed under `task/<tid>`), `NsKind::ALL` (10), `PROC_NET` (18), and the `sysvipc/` entries of
   `STATIC`.
 - `View` — a read-only view of the kernel for one reading thread (`tid`, `tgid`), taken under the
@@ -69,7 +71,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `follow_dentry`, `magic`, `protected_symlinks`, `searched`.
 - `pseudo::stat`, `allows_own_proc_dir`, `node_ino`, `ino_of`, `fs_of`, `readdir`, `content`, `writable`, `unwritable_error`,
   `open_unwritable`, `unreadable`, `pollable`, `poll_event`, `has_iter`, `write`, `read_pagemap`,
-  `access_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `group_of_id`,
+  `access_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `group_of_id`, `pid_exists_in`,
   `gone`, `comm_str`, `mark_deleted`, `uptime_ns`. (`sysctl_kind`/`recorded_value`/`RECORDED`
   belong to `kernel/sysctl`; `CGROUP_POINT` belongs to `kernel/sysfs`.)
 
@@ -92,7 +94,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   Numeric names (pids, fds, terminals) are decimal digits only, at most 10 without a leading zero
   and at most `i32::MAX` (Linux's `name_to_int`).
 - `/proc/<pid>` has every `ENTRIES` name except `children`; `task/<tid>` has the `TASK_ENTRIES`
-  (no `task`, `pagemap`, `coredump_filter` or `timens_offsets`, plus `children`); both list in
+  (no `task`, `coredump_filter` or `timens_offsets`, plus `children` and `pagemap`); both list in
   `ENTRIES` order. `task/<n>` resolves for a live thread of the group or an exited main thread
   (`leader_exit`).
 - Inode numbers hash the node (low bit set); roots are 1 (except the mqueue root); devpts `ptmx`
@@ -133,19 +135,21 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   permission rules instead of DAC; other nodes check DAC against the synthetic stat, except a
   thread group's own live `fd/` and `fdinfo/` directories remain readable without write intent
   even when non-dumpable (`proc_fd_permission`, `pseudo::allows_own_proc_dir`). Then: for
-  `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup` and `pagemap`, the process must exist
-  (found through `group_of_id` matching the pinned `ProcId`, else `ESRCH`) and the named thread pass one
+  `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup` and `pagemap`, the named process/thread must exist
+  (`pid_exists_in` matching the pinned `ProcId`, else `ESRCH` for reaped processes or exited non-leader threads) and the named thread pass one
   ptrace check with filesystem credentials and no read/attach distinction (`EACCES`, as Linux's
-  `proc_mem_open`); `mem` and `pagemap` also need a live thread (`ESRCH`) and pin a weak reference
-  to its address space (`Mm`) at open, while `environ` pins a weak `Mm` when live (leaving `None`
-  for a zombie so open succeeds and reads EOF). Once the old address space is freed after exit or
+  `proc_mem_open`); `mem`, `pagemap` and `environ` pin a weak reference
+  to the named thread's address space (`Mm`) when live, leaving `None` for an exited, unreaped
+  zombie leader so open succeeds and reads/writes return EOF (`pagemap` validates 8-byte count and
+  offset alignment first). Once the old address space is freed after exit or
   `execve`, an open `environ` fd returns EOF at every offset. Writing `setgroups`
   needs `CAP_SYS_ADMIN` in the process's user namespace (`EACCES`, `proc_setgroups_open`); devpts
   nodes on nodev mounts `EACCES`, then the cgroup device filter; `O_DIRECT` `EINVAL`; directories
   open read-only (`EISDIR` for a write mode); write modes on ro mounts `EROFS`.
 - After DAC permits a write-mode open, writes to read-only global proc entries such as `cpuinfo`,
   `kmsg` and `/proc/sysvipc/*` return `EIO`. Read-only per-process and fdinfo entries return
-  `EINVAL`. Appine also returns `EIO` for the four single-record network statistics files.
+  `EINVAL`. Writes to the four single-record network statistics files (`netstat`, `snmp`, `sockstat`,
+  `sockstat6`) return `EACCES`, matching Linux 6.1's `proc_create_net_single` / `proc_simple_write`.
   Other `seq_open_net` entries and sysfs reject a write access mode at open, allowing
   `O_RDONLY|O_TRUNC` through that check. Proc sysctls reject write intent including `O_TRUNC`.
   DAC can admit a write open on a read-only cgroup file, whose write then returns `EINVAL`.
@@ -229,7 +233,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   mappings, `VmStk` the grows-down mappings, `VmExe` the page-aligned code span capped by executable
   non-writable mappings, `VmLib` the remaining executable non-writable mappings, `VmPTE` allocated
   soft-MMU page-table bytes and `VmSwap` exact pagemap swap when readable, otherwise zero; omitted
-  with no live task); `FDSize` the open fds rounded up to 64;
+  with no live task); `FDSize` reports the allocated fd table capacity (`FdTable::capacity`, 0 with no live task);
   `Cpus_allowed` and `Cpus_allowed_list` show the thread's affinity (the main thread's in the
   process's `status`) clamped to the cgroup's effective cpuset as a hex mask (`cpu_mask_of`) and
   CPU list. `statm` is
@@ -263,7 +267,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   Synthetic descriptors and unreachable paths use their recorded description; `fdinfo/N` has `pos`, `flags` (octal, with
   `O_CLOEXEC`), `mnt_id`, `ino`, the `lock:` lines of the locks held through that open file
   (`kernel/locks`'s `fd_locks`; only for files or fd tables that have taken locks) and per-kind
-  lines (eventfd count, inotify watches, epoll `tfd:` lines, timerfd clock and times, signalfd
+  lines (eventfd `eventfd-count` and `eventfd-id`, inotify watches, epoll `tfd:` lines, timerfd clock and times, signalfd
   mask, pidfd pids). Timerfd reports the upstream five fields in order: clock id, ticks,
   octal settime flags, remaining time and interval.
 - `exe` reads as the program's path recorded at execve, with ` (deleted)` once the file's last
@@ -284,9 +288,9 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   privileged write sets the new minimum), `coredump_filter` (masked to 0x1ff), `mem`, the id maps,
   `setgroups`, `timens_offsets`.
 - Zombies keep their group without tasks: stat/status work (state Z), cmdline/environ/auxv are
-  empty, `fd/` is empty, `cwd`/`root`/`exe`/`ns` are `ENOENT`, `mounts`/`mountinfo` are `EINVAL`
-  to open and `mem`/`pagemap` `ESRCH` (they use the address space of the thread named, which has
-  none). A main thread that has exited while other threads run remains visible: `task/` still lists it (first), `task/<pid>` and
+  empty, `fd/` and `net/` are empty (`net/*` child lookup returns `ENOENT`), `cwd`/`root`/`exe`/`ns` are `ENOENT`, `mounts`/`mountinfo` are `EINVAL`
+  to open and `mem`/`pagemap` open with no address space and return EOF (`pagemap` validates 8-byte
+  alignment first). A main thread that has exited while other threads run remains visible: `task/` still lists it (first), `task/<pid>` and
   the process directory report Z with its name (kept in the group) and its own CPU time for
   `task/<pid>/stat`, and `Threads`/`num_threads` and `task/`'s link count include it; the process
   directory no longer falls back to another thread.
@@ -313,10 +317,10 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - Absent: `partitions`, `devices`, `diskstats`, `interrupts`, `modules`, `slabinfo`, `buddyinfo`,
   `sysrq-trigger`, `zoneinfo`, `pressure/*`, `kallsyms`.
 - `/proc/<pid>/net/*` (`arp`, `dev`, `icmp`, `icmp6`, `if_inet6`, `ipv6_route`, `netstat`, `raw`,
-  `raw6`, `route`, `snmp`, `sockstat`, `sockstat6`, `tcp`, `tcp6`, `udp`, `udp6`, `unix`) uses the
-  target task's network namespace (falling back to `ThreadGroup::leader_net` or a live thread's
-  network namespace when the main thread has exited as a zombie leader, before the initial
-  namespace): sockets from every fd table plus in-flight AF_UNIX sockets,
+  `raw6`, `route`, `snmp`, `sockstat`, `sockstat6`, `tcp`, `tcp6`, `udp`, `udp6`, `unix`) pins the
+  named live task's network namespace at lookup (returning an empty listing and `ENOENT` on child
+  lookup for a zombie leader, while already-opened descriptors stay pinned to their lookup
+  namespace and live worker threads resolve through `task/<tid>/net/*`): sockets from every fd table plus in-flight AF_UNIX sockets,
   filtered by namespace, with each socket's creation-time `fsuid` (`sock_i_uid`, or the accepting
   task's `fsuid` for accepted sockets) mapped for the reader; host interface counters and routes only in
   the initial namespace (new namespaces show zeros); `snmp` reflects the namespace's IPv4
@@ -403,17 +407,6 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - Ordinary procfs entries lack filesystem activity notifications. Keyed cgroup nodes do support
   open, I/O, attribute and close hooks. Independently, four cgroup event files can report
   asynchronous changes through kernfs observation.
-- Per-thread directories omit `pagemap`, which upstream Linux 6.1 exposes when
-  `CONFIG_PROC_PAGE_MONITOR` is enabled.
-- For an exited, unreaped leader with no address space, Appine rejects a new `mem` or
-  `pagemap` open with `ESRCH`. Upstream Linux 6.1 can open both and return EOF. Appine can
-  still generate network listings from a retained namespace or a fallback, whereas upstream
-  lookup of network children needs the named task's live namespace.
-- Writes to `netstat`, `snmp`, `sockstat` and `sockstat6` after a permitted write-mode
-  open return `EIO`. The Linux 6.1 single-record network handler returns `EACCES`.
-- Eventfd fdinfo emits the counter but omits Linux 6.1's `eventfd-id`. In process status,
-  `FDSize` rounds the open descriptor count up to 64. Linux reports allocated table capacity,
-  so sparse tables and tables that have retained capacity after close can show different values.
 - **Fidelity gaps:** Procfs ignores mount options and omits many standard files.
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers

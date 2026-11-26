@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-17 (full mapping: 3 research concerns, 14 claims checked by 2 independent verifiers)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: fall back to `SIGIO` with `SI_KERNEL` when an `F_SETSIG` RT signal fails on `RLIMIT_SIGPENDING` overflow)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: per-instance EventFd ID allocation via EventFdIds for procfs fdinfo)
 
 ## Responsibilities
 
@@ -54,7 +54,8 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   bits, and stable registration `order`) plus the last generation seen (`Kernel::ex_gates`).
 - `Fasync` — one `O_ASYNC` file: weak open file, fd, last events, counter snapshots
   (`Kernel::fasync`).
-- `EventFd` (in `fd.rs`) — counter, semaphore flag, `writes`/`reads` generations.
+- `EventFd` (in `fd.rs`) — counter, semaphore flag, `writes`/`reads` generations, and lowest-free
+  non-negative `id` allocated from `Kernel::eventfd_ids` (`EventFdIds`, released on drop).
 - `TimerFd` (in `fd.rs`) — clock, the next expiration (`itimer::Expiry` on the clock's base; None
   when not armed), interval, unread expirations, `fired` (the edge generation, incremented once
   per due update and once per newly observed cancellation), the `TFD_TIMER_CANCEL_ON_SET` state

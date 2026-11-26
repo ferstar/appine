@@ -600,12 +600,7 @@ mod tests {
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let mut k = Kernel::new(Tier::Interpreter);
-        let efd = Rc::new(RefCell::new(EventFd {
-            count: 0,
-            semaphore: false,
-            writes: 0,
-            reads: 0,
-        }));
+        let efd = Rc::new(RefCell::new(EventFd::default()));
         let c = Rc::new(RefCell::new(AioContext {
             max: 4,
             events: VecDeque::new(),

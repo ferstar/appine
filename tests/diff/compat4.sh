@@ -637,8 +637,9 @@ int main(void) {
 }
 C
 gcc -O1 -o acceptorder acceptorder.c && ./acceptorder
-# A main thread that has exited while another runs has no address space or namespaces: pagemap
-# and mem are ESRCH to open, mounts and mountinfo EINVAL
+# A main thread that has exited while another runs has no namespaces left: mounts and mountinfo
+# fail with EINVAL at open. (mem and pagemap open and return EOF on Linux 6.1, whereas newer
+# native 6.8 kernels return ESRCH from mm_access, so only mounts/mountinfo are compared here.)
 cat > zombiefiles.c <<'C'
 #include <errno.h>
 #include <fcntl.h>
@@ -653,8 +654,8 @@ int main(void) {
     if (pid == 0) { pthread_t t; pthread_create(&t, NULL, sleeper, NULL); pthread_exit(NULL); }
     usleep(300000);
     char path[64]; char buf[64];
-    const char *files[] = {"pagemap", "mounts", "mountinfo", "mem"};
-    for (int i = 0; i < 4; i++) {
+    const char *files[] = {"mounts", "mountinfo"};
+    for (int i = 0; i < 2; i++) {
         snprintf(path, sizeof path, "/proc/%d/%s", pid, files[i]);
         int fd = open(path, O_RDONLY);
         if (fd < 0) { printf("%s: open %s\n", files[i], strerror(errno)); continue; }

@@ -519,7 +519,8 @@ mod tests {
     #[test]
     fn only_kernfs_nodes_have_xattr_handlers() {
         for node in [
-            PseudoNode::SysDevBlock(0),
+            PseudoNode::SysDevBlock(7, 0),
+            PseudoNode::SysDevBlock(8, 1),
             PseudoNode::SysBlock(0, b""),
             PseudoNode::SysBrif(1, 2),
             PseudoNode::Cgroup(1, b"", 1),

@@ -348,10 +348,6 @@ pub(crate) struct ThreadGroup {
     /// `leader_exit` so that CPU-clock reads and POSIX timers on the zombie leader's thread clock
     /// stay valid (stopped) until the process is reaped or a non-leader execve replaces it.
     pub leader_serial: Option<u64>,
-    /// Weak reference to the main thread's network namespace captured when it exits, so
-    /// `/proc/<pid>/net/*` keeps resolving to the process's network namespace while other threads
-    /// run or while that namespace lives.
-    pub leader_net: Option<std::rc::Weak<crate::nsproxy::NetNs>>,
     /// The signal sent to the parent on exit (the low 8 bits of clone, usually SIGCHLD), 0 meaning
     /// none.
     pub exit_signal: i32,
@@ -489,7 +485,6 @@ impl ThreadGroup {
             zombie: None,
             leader_exit: None,
             leader_serial: None,
-            leader_net: None,
             exit_signal: Signal::CHLD.number(),
             ctty: None,
             tty_old_pgrp: None,

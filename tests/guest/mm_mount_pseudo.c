@@ -25,6 +25,7 @@
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -39,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -431,18 +433,20 @@ static void test_move_mount_set_group(void)
     rmdir("/tmp/sg_src");
 }
 
-/* 5. /proc/<pid>/net entries with exited (zombie) main thread use process's netns */
+/* 5. /proc/<pid>/net, mem, pagemap with an exited (zombie) main thread (Linux 6.1 ABI) */
 struct zombie_net_args {
     int ready_fd;
     int done_fd;
     int sock_fd;
+    int go_fd;
 };
 
 static void *zombie_net_worker(void *arg)
 {
     struct zombie_net_args *a = arg;
-    char c = '1';
-    CHECK(write(a->ready_fd, &c, 1) == 1, "worker ready");
+    pid_t wtid = (pid_t)syscall(SYS_gettid);
+    CHECK(write(a->ready_fd, &wtid, sizeof(wtid)) == (ssize_t)sizeof(wtid), "worker ready");
+    char c;
     CHECK(read(a->done_fd, &c, 1) == 1, "worker wait done");
     close(a->sock_fd);
     return NULL;
@@ -450,13 +454,14 @@ static void *zombie_net_worker(void *arg)
 
 static void test_proc_pid_net_zombie_leader(void)
 {
-    int ready[2], done[2];
-    CHECK(pipe(ready) == 0 && pipe(done) == 0, "pipe");
+    int ready[2], go[2], done[2];
+    CHECK(pipe(ready) == 0 && pipe(go) == 0 && pipe(done) == 0, "pipe");
 
     pid_t pid = fork();
     CHECK(pid >= 0, "fork zombie netns");
     if (pid == 0) {
         close(ready[0]);
+        close(go[1]);
         close(done[1]);
         CHECK(unshare(CLONE_NEWNET) == 0, "unshare CLONE_NEWNET");
         write_str("/proc/sys/net/ipv4/ip_forward", "1\n");
@@ -474,36 +479,114 @@ static void test_proc_pid_net_zombie_leader(void)
         args.ready_fd = ready[1];
         args.done_fd = done[0];
         args.sock_fd = s;
+        args.go_fd = go[0];
         pthread_t th;
         CHECK(pthread_create(&th, NULL, zombie_net_worker, &args) == 0, "pthread_create");
         pthread_detach(th);
+        /* Wait until parent opens /proc/<pid>/net/udp while leader is alive */
+        char c;
+        CHECK(read(go[0], &c, 1) == 1, "leader wait go");
         /* Exit ONLY the main thread so it becomes a zombie leader while worker stays alive */
         syscall(SYS_exit, 0);
         _exit(99);
     }
     close(ready[1]);
+    close(go[0]);
     close(done[0]);
-    char c;
-    CHECK(read(ready[0], &c, 1) == 1, "wait worker ready");
+    pid_t wtid = 0;
+    CHECK(read(ready[0], &wtid, sizeof(wtid)) == (ssize_t)sizeof(wtid), "wait worker ready");
     close(ready[0]);
 
+    char path[128], buf[4096];
+    /* Pre-open /proc/<pid>/net/udp while leader is alive: stays pinned to child netns */
+    snprintf(path, sizeof(path), "/proc/%d/net/udp", pid);
+    int pre_udp = open(path, O_RDONLY);
+    CHECK(pre_udp >= 0, "pre-open /proc/<pid>/net/udp");
+
+    CHECK(write(go[1], "g", 1) == 1, "signal leader exit");
+    close(go[1]);
     wait_leader_zombie(pid);
 
-    char udp_path[64], snmp_path[64], buf[4096];
-    snprintf(udp_path, sizeof(udp_path), "/proc/%d/net/udp", pid);
-    snprintf(snmp_path, sizeof(snmp_path), "/proc/%d/net/snmp", pid);
+    /* Zombie leader: /proc/<pid>/net exists as empty dir, child lookups return ENOENT */
+    snprintf(path, sizeof(path), "/proc/%d/net", pid);
+    DIR *d = opendir(path);
+    CHECK(d != NULL, "opendir zombie leader /proc/<pid>/net");
+    int count = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0)
+            count++;
+    }
+    closedir(d);
+    CHECK(count == 0, "zombie leader /proc/<pid>/net must be empty, got %d entries", count);
 
-    read_str(udp_path, buf, sizeof(buf));
+    snprintf(path, sizeof(path), "/proc/%d/net/udp", pid);
+    CHECK_ERR(open(path, O_RDONLY), ENOENT, "zombie leader /proc/<pid>/net/udp must be ENOENT");
+    snprintf(path, sizeof(path), "/proc/%d/net/snmp", pid);
+    CHECK_ERR(open(path, O_RDONLY), ENOENT, "zombie leader /proc/<pid>/net/snmp must be ENOENT");
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/net/udp", pid, pid);
+    CHECK_ERR(open(path, O_RDONLY), ENOENT, "zombie leader task/<pid>/net/udp must be ENOENT");
+
+    /* Pre-opened fd stays pinned to the child's netns after leader exit */
+    pread_str(pre_udp, buf, sizeof(buf));
     CHECK(strstr(buf, ":A8D3 ") != NULL,
-          "/proc/<pid>/net/udp with zombie leader missed child netns socket: %s", buf);
+          "pre-opened /proc/<pid>/net/udp lost child netns after leader exit: %s", buf);
+    close(pre_udp);
 
-    read_str(snmp_path, buf, sizeof(buf));
+    /* Live worker's /proc/<pid>/task/<wtid>/net entries resolve the child's netns */
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/net/udp", pid, wtid);
+    read_str(path, buf, sizeof(buf));
+    CHECK(strstr(buf, ":A8D3 ") != NULL,
+          "/proc/<pid>/task/<wtid>/net/udp missed child netns socket: %s", buf);
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/net/snmp", pid, wtid);
+    read_str(path, buf, sizeof(buf));
     CHECK(strstr(buf, "\nIp: 1 ") != NULL,
-          "/proc/<pid>/net/snmp with zombie leader fell back to init netns: %s", buf);
+          "/proc/<pid>/task/<wtid>/net/snmp missed child netns ip_forward: %s", buf);
+
+    /* Linux 6.1: zombie leader mem and pagemap open cleanly and read EOF */
+    snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+    int mfd = open(path, O_RDWR);
+    CHECK(mfd >= 0, "open zombie leader /proc/<pid>/mem");
+    CHECK(read(mfd, buf, 16) == 0, "read zombie leader mem must return EOF");
+    CHECK(write(mfd, "x", 1) == 0, "write zombie leader mem must return 0");
+    close(mfd);
+
+    snprintf(path, sizeof(path), "/proc/%d/pagemap", pid);
+    int pfd = open(path, O_RDONLY);
+    CHECK(pfd >= 0, "open zombie leader /proc/<pid>/pagemap");
+    CHECK(read(pfd, buf, 16) == 0, "read zombie leader pagemap must return EOF");
+    CHECK_ERR(read(pfd, buf, 1), EINVAL, "unaligned read on zombie leader pagemap must be EINVAL");
+    close(pfd);
+
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/pagemap", pid, pid);
+    pfd = open(path, O_RDONLY);
+    CHECK(pfd >= 0, "open zombie leader task/<pid>/pagemap");
+    CHECK(read(pfd, buf, 8) == 0, "read zombie leader task/<pid>/pagemap must return EOF");
+    close(pfd);
 
     CHECK(write(done[1], "x", 1) == 1, "release worker");
     close(done[1]);
     wait_ok(pid, "zombie leader netns child");
+
+    /* Single-thread unreaped zombie also opens mem/pagemap -> EOF, and net/udp -> ENOENT */
+    pid_t z = fork();
+    CHECK(z >= 0, "fork single zombie");
+    if (z == 0)
+        _exit(0);
+    wait_leader_zombie(z);
+    snprintf(path, sizeof(path), "/proc/%d/mem", z);
+    mfd = open(path, O_RDONLY);
+    CHECK(mfd >= 0, "open single-thread zombie mem");
+    CHECK(read(mfd, buf, 8) == 0, "read single-thread zombie mem EOF");
+    close(mfd);
+    snprintf(path, sizeof(path), "/proc/%d/pagemap", z);
+    pfd = open(path, O_RDONLY);
+    CHECK(pfd >= 0, "open single-thread zombie pagemap");
+    CHECK(read(pfd, buf, 8) == 0, "read single-thread zombie pagemap EOF");
+    close(pfd);
+    snprintf(path, sizeof(path), "/proc/%d/net/udp", z);
+    CHECK_ERR(open(path, O_RDONLY), ENOENT, "single-thread zombie net/udp must be ENOENT");
+    wait_ok(z, "single-thread zombie");
 }
 
 /* 6. /proc/net/snmp reflects ipv4 ip_forward (1 enabled, 2 disabled) */
@@ -1645,6 +1728,140 @@ static void test_proc_self_auxv(char **envp)
     fclose(proc);
 }
 
+static int parse_status_fdsize(void)
+{
+    char buf[4096];
+    read_str("/proc/self/status", buf, sizeof(buf));
+    char *p = strstr(buf, "FDSize:\t");
+    CHECK(p != NULL, "missing FDSize in /proc/self/status");
+    return (int)strtol(p + 8, NULL, 10);
+}
+
+static int parse_eventfd_id(int efd, uint64_t *count_out)
+{
+    char path[64], buf[1024];
+    snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", efd);
+    read_str(path, buf, sizeof(buf));
+    char *cp = strstr(buf, "eventfd-count:");
+    CHECK(cp != NULL, "missing eventfd-count in %s: %s", path, buf);
+    if (count_out)
+        *count_out = strtoull(cp + 14, NULL, 16);
+    char *ip = strstr(buf, "eventfd-id: ");
+    CHECK(ip != NULL, "missing eventfd-id in %s: %s", path, buf);
+    return (int)strtol(ip + 12, NULL, 10);
+}
+
+/* 16. Linux 6.1 procfs & sysfs ABI: task/<tid>/pagemap, net single-record EACCES writes,
+ *     eventfd-id in fdinfo, FDSize table capacity, and /sys/dev/block/8:1 rootfs block device */
+static void test_procfs_sysfs_abi_fixes(void)
+{
+    /* a) /proc/<pid>/task/<tid>/pagemap exists with 0400 and reads valid entry */
+    char path[128], buf[4096];
+    pid_t pid = getpid(), tid = (pid_t)syscall(SYS_gettid);
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/pagemap", pid, tid);
+    struct stat st;
+    CHECK(stat(path, &st) == 0, "stat %s", path);
+    CHECK((st.st_mode & 0777) == 0400, "task/<tid>/pagemap mode expected 0400, got 0%o",
+          st.st_mode & 0777);
+    void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(page != MAP_FAILED, "mmap page");
+    *(volatile char *)page = 42;
+    int pmfd = open(path, O_RDONLY);
+    CHECK(pmfd >= 0, "open %s", path);
+    uint64_t entry = 0;
+    off_t off = (off_t)(((uintptr_t)page / 4096) * 8);
+    CHECK(pread(pmfd, &entry, sizeof(entry), off) == sizeof(entry), "pread task pagemap");
+    CHECK((entry & (1ULL << 63)) != 0, "mapped page should be present in task/<tid>/pagemap");
+    close(pmfd);
+    munmap(page, 4096);
+
+    /* b) Single-record /proc/self/net/{netstat,snmp,sockstat,sockstat6} writes return EACCES */
+    const char *single_net[] = {"netstat", "snmp", "sockstat", "sockstat6"};
+    for (size_t i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "/proc/self/net/%s", single_net[i]);
+        int fd = open(path, O_WRONLY);
+        CHECK(fd >= 0, "root open(O_WRONLY) %s", path);
+        CHECK_ERR(write(fd, "1\n", 2), EACCES, "write %s must be EACCES", path);
+        close(fd);
+    }
+    CHECK_ERR(open("/proc/self/net/dev", O_WRONLY), EACCES, "open(O_WRONLY) net/dev must be EACCES");
+    int cfd = open("/proc/cpuinfo", O_WRONLY);
+    CHECK(cfd >= 0, "root open(O_WRONLY) /proc/cpuinfo");
+    CHECK_ERR(write(cfd, "1\n", 2), EIO, "write /proc/cpuinfo must remain EIO");
+    close(cfd);
+
+    /* c) Eventfd fdinfo includes eventfd-count and eventfd-id (unique and reused on close) */
+    int e1 = eventfd(0x123, 0);
+    int e2 = eventfd(0, EFD_SEMAPHORE);
+    CHECK(e1 >= 0 && e2 >= 0, "eventfd");
+    uint64_t cnt1 = 0, cnt2 = 99;
+    int id1 = parse_eventfd_id(e1, &cnt1);
+    int id2 = parse_eventfd_id(e2, &cnt2);
+    CHECK(cnt1 == 0x123 && cnt2 == 0, "eventfd-count mismatch: %llx %llx",
+          (unsigned long long)cnt1, (unsigned long long)cnt2);
+    CHECK(id1 >= 0 && id2 >= 0 && id1 != id2, "eventfd-id must be distinct non-negative: %d %d",
+          id1, id2);
+    close(e1);
+    int e3 = eventfd(0, 0);
+    CHECK(e3 >= 0, "eventfd3");
+    int id3 = parse_eventfd_id(e3, NULL);
+    CHECK(id3 == id1, "closed eventfd-id must be reused: expected %d, got %d", id1, id3);
+    close(e2);
+    close(e3);
+
+    /* d) /proc/self/status FDSize reports allocated fd-table capacity */
+    pid_t fp = fork();
+    CHECK(fp >= 0, "fork FDSize");
+    if (fp == 0) {
+        CHECK(parse_status_fdsize() == 64, "initial FDSize must be 64, got %d",
+              parse_status_fdsize());
+        CHECK(dup2(1, 70) == 70, "dup2(1, 70)");
+        CHECK(parse_status_fdsize() == 128, "FDSize after dup2(70) must be 128, got %d",
+              parse_status_fdsize());
+        close(70);
+        CHECK(parse_status_fdsize() == 128, "FDSize must retain 128 after close(70), got %d",
+              parse_status_fdsize());
+        pid_t gc = fork();
+        CHECK(gc >= 0, "fork FDSize grandchild");
+        if (gc == 0) {
+            CHECK(parse_status_fdsize() == 64, "child FDSize after fork must shrink to 64, got %d",
+                  parse_status_fdsize());
+            _exit(0);
+        }
+        wait_ok(gc, "FDSize grandchild");
+        _exit(0);
+    }
+    wait_ok(fp, "FDSize child");
+
+    /* e) Rootfs backing device /sys/dev/block/8:1 (sda1) and 8:0 (sda) */
+    CHECK(stat("/", &st) == 0, "stat /");
+    unsigned maj = (unsigned)((st.st_dev >> 8) & 0xfff);
+    unsigned min = (unsigned)((st.st_dev & 0xff) | ((st.st_dev >> 12) & 0xfff00));
+    CHECK(maj == 8 && min == 1, "expected rootfs dev 8:1, got %u:%u", maj, min);
+    char link[128];
+    ssize_t ln = readlink("/sys/dev/block/8:1", link, sizeof(link) - 1);
+    CHECK(ln > 0, "readlink /sys/dev/block/8:1");
+    link[ln] = '\0';
+    CHECK(strcmp(link, "../../block/sda/sda1") == 0, "unexpected 8:1 link: %s", link);
+    ln = readlink("/sys/dev/block/8:0", link, sizeof(link) - 1);
+    CHECK(ln > 0, "readlink /sys/dev/block/8:0");
+    link[ln] = '\0';
+    CHECK(strcmp(link, "../../block/sda") == 0, "unexpected 8:0 link: %s", link);
+
+    read_str("/sys/dev/block/8:1/uevent", buf, sizeof(buf));
+    CHECK(strcmp(buf, "MAJOR=8\nMINOR=1\nDEVNAME=sda1\nDEVTYPE=partition\nPARTN=1\n") == 0,
+          "unexpected 8:1 uevent: %s", buf);
+    read_str("/sys/dev/block/8:0/uevent", buf, sizeof(buf));
+    CHECK(strcmp(buf, "MAJOR=8\nMINOR=0\nDEVNAME=sda\nDEVTYPE=disk\n") == 0,
+          "unexpected 8:0 uevent: %s", buf);
+    read_str("/sys/dev/block/8:1/dev", buf, sizeof(buf));
+    CHECK(strcmp(buf, "8:1\n") == 0, "unexpected 8:1 dev: %s", buf);
+    read_str("/sys/dev/block/8:1/partition", buf, sizeof(buf));
+    CHECK(strcmp(buf, "1\n") == 0, "unexpected 8:1 partition: %s", buf);
+    read_str("/sys/dev/block/8:1/../queue/logical_block_size", buf, sizeof(buf));
+    CHECK(strcmp(buf, "512\n") == 0, "unexpected sda logical_block_size: %s", buf);
+}
+
 int main(int argc, char **argv, char **envp)
 {
     test_proc_self_auxv(envp);
@@ -1682,6 +1899,7 @@ int main(int argc, char **argv, char **envp)
     test_madv_dontneed_cow_private_file();
     test_process_mrelease();
     test_secure_exec_arg_limit(argv[0]);
+    test_procfs_sysfs_abi_fixes();
 
     printf("all ok\n");
     return 0;
