@@ -1,444 +1,217 @@
 # android/terminal Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtcore`, `android/vtview`, `android/vtgestures`, `android/vtrender`, `android/licenses`, `android/tabbar`, `android/keys` and `android/file-import`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
+> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtcore`, `android/vtview`, `android/vtgestures`, `android/vtrender`, `android/privacy`, `android/licenses`, `android/tabbar`, `android/keys` and `android/file-import`).
 >
-> Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
->
-> Maintained: 2026-11-26 (targeted verification of deferred OSC 52 reads and clipboard dialog lifecycle)
+> Verified: 2026-11-26 (full refresh: 18 adversarial claims checked independently — 17 confirmed and 1 partial corrected, plus 5 confirmed bugs/debt items recorded below)
 
 ## Responsibilities
 
-`android/terminal` coordinates the terminal screen around sessions (`android/vt`), native
-terminals (`android/vtcore`), view lifecycle/input/search (`android/vtview`), gestures/selection/
-links (`android/vtgestures`) and rendering (`android/vtrender`).
-It owns activity lifecycle, choosing/closing tabs, shortcuts, search UI, link routing, clipboard
-questions, insets and IME animation, plus shared UI helpers, strings and themes.
+`android/terminal` owns the Android UI around the foreground service's sessions. It selects and closes tabs, connects the terminal and controls, and handles search, clipboard questions, links, imports, menu actions, insets and the IME.
 
-Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `NotificationPermission.kt`, `BatteryOptimization.kt`, `SearchBarView.kt` and `Ui.kt`
-in `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/` except
-android/privacy's `layout/privacy_shield.xml`, `drawable/privacy_emblem.xml` and `drawable/ic_lock.xml`,
-and android/licenses' `layout/list_item.xml` and `values/ids.xml`.
-
-Controls are `android/tabbar` and `android/keys`; retained file-copy work is `android/file-import`.
-All MainActivity adapters, picker/dialog handling, shared strings and themes remain here.
-`Theme.Appine` is Material 3 DayNight; `Theme.Appine.Terminal` is always dark with black window
-and system bars. Shared resources include `Widget.Appine.MorePopup`,
-`ThemeOverlay.Appine.CheckPopup` (framework checkbox without its own ripple), `page.xml`
-and `preference_switch.xml` (MaterialSwitch at AndroidX's `switchWidget` ID). Settings uses
-AndroidX category/row layouts.
-
-Session ownership, saving and event routing are `android/service`; notifications, fault reports and
-diagnostics are `android/reports`; the Settings screen is `android/settings`; build and notice
-assets are `android/build`; authentication is `android/privacy`, notice UI `android/licenses`.
+Under `android/app/src/main/java/io/github/mthli/appine/` it owns `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `NotificationPermission.kt`, `BatteryOptimization.kt`, `SearchBarView.kt` and `Ui.kt`. It also owns `android/app/src/main/res/` except for `android/privacy`'s `layout/privacy_shield.xml`, `drawable/privacy_emblem.xml` and `drawable/ic_lock.xml`, and `android/licenses`' `layout/list_item.xml` and `values/ids.xml`. The manifest that consumes these resources belongs to `android/build`.
 
 ## Key types
 
-- `MainActivity` — a `TerminalService.Listener` with a `TerminalLayout` and `TerminalLinks`;
-  adapters `Host : VtView.Host`,
-  `Bar : TabBarView.Target`, `Tabs : TabListView.Target`, `Find : SearchBarView.Target` and `Keys : ExtraKeysView.Target`; the
-  current session and its index, from which its successor is taken; a tab requested by a
-  notification (`EXTRA_TAB`); AndroidX Back's callback while the search bar is open (`closeSearchOnBack`);
-  the open question whether a
-  program may read the clipboard (`clipboardQuestion`).
-- `TerminalLayout` — builds the views with the activity's adapters after dynamic colours are
-  applied: a black column of one bar's place (`TabBarView`, or `SearchBarView` while searching),
-  a shared overlay frame containing a column of optional permission banners (notifications, then battery usage),
-  the terminal body (`VtView`, status text and `ProgressLine` along its top) and `ExtraKeysView`,
-  with `TabListView` above that column;
-  exposes the root and interactive views, keeps the status view private behind `showStatus` and
-  `showTerminal`, and owns the IME animation callback `keysFollowIme`.
-- `NotificationPermission` — shared notification availability, request history and system-settings
-  navigation for MainActivity and SettingsFragment; callers own their result launchers and visibility.
-- `BatteryOptimization` — checks the package’s Doze exemption, requests it from the terminal
-  and opens system app details from Settings.
-- `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
-  `startViewer`; keeps the activity and its toast callback, with no service or session state.
-- `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
-  without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
-  shows the count it is given (`setCount`), exposes `hasInputFocus`, handles extra-key actions
-  (`extraKey`, `extraText`, backed by pure `SearchExtraKeys`) while focused, and sends text
-  changes, steps and closing to a `Target` (`search`, `step`, `close`).
-- `Ui.kt` — what the screens and views share (`VtView` too): `LINE_DP` and `line()` (how thick
-  the indicators and the progress line are: 1 dp, at least a pixel), `dp`, `themeColor`
-  (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
-  `selectableItemBackground`); `showPrivate` registers dialog security with android/privacy before showing it.
-  `terminalControlColor` separates states on black: ordinary labels blend on-surface-variant
-  with 40% black, selected labels and indicators blend primary with 25% white. Tab controls
-  and extra keys share it; progress/status marks keep their own theme colours.
-  `monospaceMessage` substitutes a styled value into a localized `^1` template with TextUtils,
-  leaving the explanation in the dialog's normal font.
+| Type | Role |
+| --- | --- |
+| `MainActivity` | A `FragmentActivity`, `TerminalService.Listener` and `Privacy.Listener`. Holds the binding, local selection and index, requested tab ID, Back callbacks, dialogs and latest toast. |
+| `Host` | Implements `VtView.Host` for grid, input, addressed focus events, zoom, modifiers, links and search counts. |
+| `Bar` / `Tabs` | Activity adapters for numbered-bar actions and title-list actions on a specific session. |
+| `Find` / `Keys` | Connect search actions to `VtView` and extra keys to the focused input. |
+| `TerminalLayout` | Owns the view tree, status display, insets and IME animation. |
+| `SearchBarView` | Owns query, count and search controls. Its `Target` accepts `search(needle)`, `step(older)` and `close()`. |
+| `SearchExtraKeys` | Routes extra-key input and maps a `SearchEditState` to a `SearchExtraKeyResult` (close, step, edit or consume). The view applies edits to the field. |
+| `TerminalLinks` | Routes URIs for one activity and shares its toast callback. |
+| `NotificationPermission` / `BatteryOptimization` | Supply availability checks and system navigation to the terminal and Settings. |
+| `Ui.kt` extensions | Shared sizes, colors, drawables, package intents and dialog helpers. |
 
 ## Public entry points
 
-- Launcher activity `MainActivity` (`singleTask`, `adjustResize`, `Theme.Appine.Terminal`, handles
-  most configuration changes itself, the dark mode included, but not density, locale or font
-  scale, which recreate it), started with
-  `EXTRA_TAB` (a `VtSession.id`) by a tab's notification; listener callbacks `onProgress`,
-  `onMachineReady`, `onSessionsChanged`, `onBell`, `onClipboardRead`, `onTabStatus`,
-  `onSettingsChanged`,
-  `onNotice`, `onRestarting`, `onExitAll`, `onOpenUrl`; `onPrivacyUnlocked` from the privacy gate,
-  and the `OpenMultipleDocuments` activity-result callback for import.
+- The exported `MainActivity` is the `MAIN` / `LAUNCHER` target, with `singleTask`, `adjustResize` and `Theme.Appine.Terminal`. A tab notification supplies `MainActivity.EXTRA_TAB` (key `tab`, integer `VtSession.id`). Existing activities receive `onNewIntent`.
+- The service calls `onProgress`, `onMachineReady`, `onSessionsChanged`, `onTabStatus`, `onBell`, `onClipboardRead`, `onOpenUrl`, `onSettingsChanged`, `onNotice`, `onRestarting` and `onExitAll` on the main thread. Clipboard and URL callbacks report acceptance.
+- `onPrivacyUnlocked` retries import delivery, notices and clipboard reads. Activity-result callbacks accept picked URIs or refresh notification permission state. View targets, `dispatchKeyEvent` and the two AndroidX Back callbacks handle input.
 
 ## Data flow / lifecycle
 
-### Binding and choosing a tab
+### Launch, configuration and binding
 
-- `res/xml/locale_config.xml` lists English (`en`, default strings), Simplified Chinese
-  (`zh-CN`, `values-zh-rCN`), Traditional Chinese (`zh-Hant`, `values-b+zh+Hant`), Korean
-  (`ko`, `values-ko`) and Japanese (`ja`, `values-ja`) for the manifest's Android 13+ system
-  language picker. Traditional Chinese uses Taiwan terminology with a script-wide qualifier.
-  All translated string files follow the default file's sections and resource order, omit
-  non-translatable resources and use only `other` for plurals. There is no in-app picker;
-  Android 11–12 keep following the system language. Locale changes use
-  normal activity recreation and the existing service-current tab fallback below.
-- `attachBaseContext` applies an override containing only `UI_MODE_NIGHT_YES`, before the window,
-  dynamic colours or views read resources. The terminal's night-qualified resources therefore
-  match its fixed dark theme; other configuration fields and other activities remain independent.
-- `onCreate` applies dynamic colours, reads `EXTRA_TAB` (only when the activity is not being
-  recreated and was not opened from Recents: such an activity still has the intent that first
-  started it), reads the font size (kept in dp as `font_size_dp`, so it scales with a display size
-  change; a pixel size an earlier version kept as `font_size` is converted at the current density
-  and removed), applies the saved Keep screen on choice (off by default), builds `TerminalLayout`
-  (the status line says "Starting…", insets and IME animation are wired there), installs its root
-  edge-to-edge and updates the permission banners without opening system dialogs. `onStart` applies the wide-cell
-  and tab-list visibility settings through `onSettingsChanged`, starts and binds the service; `onServiceConnected` registers the listener and replays
-  the start's result or progress and pending notices; `onStop` unregisters and unbinds.
-- When the kernel is ready the tab shown is, in order: one a notification asked for (`EXTRA_TAB`,
-  from `onCreate` or `onNewIntent`; a tab closed meanwhile is skipped), the activity's own current
-  tab, the service's `current` (the tab the last activity showed, for a new one: recreated, or
-  opened again after Back finished the last on Android 11), the service's `focus` (the restored
-  current tab), each if it still exists, else the last tab; with no
-  sessions a new one opens. A failed start hides the terminal and shows "Cannot start: …";
-  `onRestarting` detaches and shows "Restarting…". `onServiceConnected` calls `onMachineReady` on
-  every bind (each `onStart`) when the kernel runs or failed to start (while it starts, the
-  progress, and `onMachineReady` later from the service), so coming back to the activity (from
-  Settings, a link's app, the background) shows the current tab again, which closes the search
-  bar.
-- Showing a tab sets it as the service's `current` (which takes its notification away), attaches
-  it to the view (`VtView.attach`) and renders the bar; `onRestarting` and `onDestroy` detach it,
-  so sessions never keep a destroyed Activity's view.
-- Closing a tab hangs it up at once; when it was the current one, the tab after it, now in its
-  place, is shown (the one before when it was the last). Closing the last tab while the kernel runs
-  finishes the activity (the service stays).
+`attachBaseContext` calls its superclass and applies a `Configuration` containing only `UI_MODE_NIGHT_YES`, before the window or dynamic colors access resources. Framework selection menus then see night resources. The manifest handles orientation, screen size, smallest screen size, screen layout, keyboard, keyboard visibility, navigation and UI mode in place. Locale, density and font scale use normal recreation. Settings and license pages follow system day/night changes.
 
-### Tab controls and activity policy
+`onCreate` applies dynamic colors when available before calling the superclass. It installs Back callbacks, initializes notification request history and restores Keep screen on. `savedFontSize` migrates an integer pixel value in `font_size` to float `font_size_dp` at current density, removing the old key. It passes the saved size (default 12 dp) to the view in pixels.
 
-- `android/tabbar` owns bar/list rendering, animations and progress marks. `MainActivity`
-  implements their targets, validates session identity and privacy, opens/closes the list,
-  coordinates focus, Back and accessibility, and performs session/menu actions.
-- Numbered-tab titles use native tooltips owned by `TabBarView`; the activity's shared toast
-  helper remains for extra-key notices, link failures and file-import feedback.
-- The list closes on tab switching, search, other bar actions, extra-key input, pause and restart;
-  list close buttons retain it while using the existing busy confirmation.
-- The list starts directly below the top bar and overlays both permission banners, terminal
-  and extra keys; its rows may cover the keys in short viewports. Taps outside its rows dismiss
-  and are consumed, including over the keys. The whole content column is hidden
-  from accessibility while the list is open, and restored when it closes.
+Only a fresh creation with no saved state and no `FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY` reads the tab ID. Recreation or Recents can reuse the original notification intent. `onNewIntent` calls `setIntent`, replaces `requestedTab` (default −1) and tries to show it immediately.
 
-- Ctrl+Shift+W, the list’s close buttons, `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
-  they close is busy (its shell has ended, has not started, as in a restored tab never shown, or
-  waits at its prompt as the prompt marks tell, `VtSession.busy`, android/vt's Shell integration),
-  else after a confirmation dialog ("Close this tab?" for one tab, else "Close N tabs?", counting
-  all of them); a shell without prompt marks always counts as busy. Several tabs are closed with the
-  current one last, so no other tab is shown (and its shell started) on the way, and closing all
-  ends like closing the last tab. In an ended tab any input with a line break (Enter) closes it.
-- The close dialog's button closes only the tabs still open, and dismissing it or the clipboard
-  question gives the terminal the focus.
-- Its dialogs (close, notices, the clipboard question, the paste confirmation) and its menu (⋮, a
-  `PopupMenu` placed like a
-  toolbar's overflow menu) are Material 3 in the theme's dark colours, from the wallpaper on
-  Android 12 and later (`DynamicColors`). The tab bar, the extra keys and what lies under the
-  system bars are black like the terminal; tab/list controls and extra keys use
-  `terminalControlColor` for stronger state contrast while preserving wallpaper hues.
-  Status text, permission banners and search controls retain their original theme colours.
-- "Keep screen on" is available even without a current tab and applies to the whole terminal
-  window. Its right-side checkbox reflects the activity's choice, persisted as `keep_screen_on`
-  in the activity's private preferences, so recreating or reopening the activity keeps it.
-  The choice sets or clears `FLAG_KEEP_SCREEN_ON`: only the visible terminal window keeps the
-  screen lit; opening Settings or leaving the app allows the system's normal screen timeout.
-  It is independent of the service's screen-off run policy and partial wake lock. The popup's
-  context uses `ThemeOverlay.Appine.CheckPopup`, removing the checkbox's own background while
-  retaining the menu row's press feedback and the overflow menu's placement.
+The activity assigns `TerminalLayout`, updates the banners and initial bar, disables decor fitting, installs the root and observes the import model. Status initially reads “Starting…”. Each `onStart` applies `Settings.fillWide` and `Settings.showTabList`, starts the foreground service and binds with `BIND_AUTO_CREATE`. A live settings change applies the same display preferences.
 
-### Permission banners
+On connection it takes the service from `LocalBinder` and registers the listener. A nonzero machine or recorded start error replays `onMachineReady`, otherwise available progress replays `onProgress`. It then tries `onNotice`. Progress and start failure hide the terminal view and display status. Success reveals the terminal and selects a session. An unlocked activity takes a queued notice and shows a protected dialog.
 
-- The notification and battery banners share a 32 dp row design below the top bar, including
-  during search. Each localized 14 dp message is start-aligned with
-  10 dp horizontal padding and fallback line spacing disabled. It ellipsizes in narrow windows
-  and fills the clickable space before a separate 32 dp close button.
-  Both buttons use background touch feedback with tint cleared over the container's surface colour,
-  muted text and tap haptics. The close button has a localized accessibility description.
-- The notification banner appears while notifications are disabled. Closing it persists `dismissed_notification_prompt` in MainActivity preferences;
-  recreating or relaunching the activity does not show it again. Closing does not request
-  permission or alter authorization history. The tab list hides both buttons from accessibility
-  while covering the banner through the existing container-level policy.
-- `NotificationPermission` shares the authorization flow between the banner and Settings' Android
-  notification action (android/setup). It retains `requested_notifications` in the original
-  `MainActivity` preference file, so requests from either page and prior versions share history.
-  Startup and privacy unlock never request permission. Tapping either entry checks the privacy gate.
-  On Android 13+, a first request uses the caller's activity-result launcher; a prior attempt
-  or the system's denial rationale state routes to app notification settings. Android 11–12 use
-  settings when notifications are off. An updated installation without request history is treated
-  as already requested, preserving older versions' possible permanent denial. A dismissed
-  permission dialog also counts as an attempt; only another tap opens settings.
-- Navigation uses `ACTION_APP_NOTIFICATION_SETTINGS` with `EXTRA_APP_PACKAGE`, falling back to
-  `ACTION_APPLICATION_DETAILS_SETTINGS` if the first activity is missing. Permission results and
-  `onResume` refresh each entry's visibility. Granting removes both entries; revoking restores the
-  Settings entry and restores the banner only if it was never dismissed. Individual disabled
-  channels do not show either entry.
-- The battery banner appears while `PowerManager.isIgnoringBatteryOptimizations` is false and
-  disappears on dismissal or grant. Its separate `dismissed_battery_prompt` preference leaves
-  the notification banner and Settings action available under their own visibility rules.
-  A tap requests the exemption with `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` and the package
-  URI. If that activity is missing, it opens app details, the same destination as the Settings
-  action. Both paths check privacy and the live exemption before launch. Resume rereads the
-  system state. The guest screen-off policy remains a separate preference.
+Resume refreshes both banners and posts a clipboard retry so the lifecycle can reach `RESUMED`. Pause closes the title list. A privacy-mode pause also cancels the activity toast and denies an open clipboard question. Stop denies an open clipboard question, unregisters, unbinds and clears the service reference. Local selection and attachment survive stop. Destroy dismisses the import dialog with its dismiss listener removed and calls `layout.screen.attach(null)`.
 
-### Extra-key integration
+### Selecting and showing a session
 
-- `android/keys` supplies `ExtraKeysView` and modifier state. `MainActivity.Keys` checks
-  `Privacy.locked`, closes the tab list and routes via `SearchExtraKeys`: while `SearchBarView`
-  has input focus (`hasInputFocus`), extra keys go to `SearchBarView.extraKey`/`extraText` (and
-  consume one-shot modifiers) so nothing leaks to the terminal; otherwise they go to `VtView`.
-  Opening or closing search cancels active extra-key repeats (`ExtraKeysView.cancelPresses`).
-  `Host` exposes `ctrl`, `alt`, `shift` and `modifiersUsed`.
-- `TerminalLayout` owns insets and IME translation; the key view chooses its own row layout.
+`showRequestedTab` retains a nonnegative request until a bound service has a nonzero machine. It then looks up the ID and consumes the request even on a miss. On successful readiness it chooses the first available candidate.
 
-### File-import integration
+1. The live session named by the request.
+2. This activity's `current`, if still in the service's sessions.
+3. The service's `current`, if still present (including after activity recreation).
+4. The service's `focus` from restored tabs, if still present.
+5. The last session. With an empty list, create a tab.
 
-- `android/file-import` owns retained selection, copying and results. The activity launches
-  `OpenMultipleDocuments`, enables Import from `occupied`, resumes copies only when unlocked,
-  routes the tab bar stop button to the active copy, and presents/copies paths through a protected dialog. Recreation must not consume a result.
+`newSession` requires a running machine. It passes `current?.cwd()` (the console foreground group's working directory when available) to `createSession`. A null directory selects the login home. `Host.onGrid` starts the current shell once the view has a grid.
 
-### Hardware-keyboard shortcuts
+`show` normally closes the list and always closes visible search, including on reselection after a rebind. It assigns local `current`, jumps the progress line to that session, sets service `current` (canceling its notification), attaches and focuses the view, renders the controls and retries clipboard delivery. Changing the local session identity first settles its open clipboard question.
 
-- Taken by the activity (`dispatchKeyEvent`) before the terminal sees them, together with the
-  matching key release, when the key event (from a hardware keyboard, or an IME sending key events)
-  has Ctrl without Alt or Meta: Ctrl+Shift+T opens a tab, Ctrl+Shift+W asks to close a busy tab and closes an idle one immediately,
-  Ctrl+Shift+F opens the search bar (these once per press; repeats are swallowed), Ctrl+Tab and
-  Ctrl+Shift+Tab show the next and the previous one, going round and repeating while held (and
-  swallowed when there is nothing to switch to), and Ctrl+Shift+↑ and ↓ scroll to the previous and
-  the next prompt, repeating while held (Ghostty's `jump_to_prompt` keys on Linux; on the alternate
-  screen, which has no prompts, and without a terminal they reach the program). They also work with
-  the search bar's text focused, and are listed in the system's keyboard shortcuts screen (Meta+/;
-  the tab ones under Tabs, Find and the two prompt jumps under Terminal). The extra keys' modifiers
-  do not make shortcuts: with them these keys reach the program.
+`renderTabs` snapshots live sessions, records the shown session's index, updates the bar and an open list, and refreshes the import button. `onTabStatus` refreshes status marks and updates the current progress line without a jump. Foreground bells go to `VtView.bell`. Restart closes list and search, clears current and progress, detaches the view and shows “Restarting…”. `onExitAll` finishes the activity.
 
-### The volume keys
+### Closing tabs and choosing the successor
 
-- While Settings has them switch tabs (`Settings.volumeKeysSwitchTabs`, on by default, read at
-  each press), the activity (`dispatchKeyEvent`) takes a volume key's press when there is another
-  tab to show: volume up shows the previous tab and volume down the next, going round as Ctrl+Tab
-  does, once per press; the key's repeats and release are swallowed with it, so holding it neither
-  switches again nor changes the volume. With a single tab (or none, as while the kernel starts) or
-  the setting off, the press, its repeats and its release go to the system, which changes the
-  volume; programs never get the volume keys either way (`VtView` leaves system keys alone). Open
-  dialogs and the ⋮ menu are windows of their own, where the volume keys change the volume.
-- A successful volume-key switch requests `KEYBOARD_TAP` feedback through the terminal view,
-  matching the bars. Repeats, releases and presses left to system volume control do not request it.
+The bar's ×, row close, Ctrl+Shift+W and close-other/all menu actions use `confirmClose`. No busy target means immediate removal. Any busy target prompts once for the full set, with a singular title or localized quantity. Confirmation filters out sessions removed while the dialog was open. Dismissal requests terminal focus.
 
-### Finding text
+`VtSession.busy` is false for an ended shell or a session without a native terminal. The native predicate recognizes prompt marks and, on the primary screen under its fallback conditions, an idle foreground interactive shell even without marks.
 
-- "Find" (⋮) or Ctrl+Shift+F, with a current tab, puts the search bar in the tab bar's place
-  (the tab bar is gone, the place keeps its 32 dp, so the terminal keeps its rows) and brings the
-  keyboard up on its text, which is kept from the last search and selected, so typing replaces it;
-  that text is searched for again at once. Every change of the text searches anew in the tab shown
-  (`VtView.search`; query, steps and scroll-bar marks are android/vtview's Search, frame progress
-  and cell highlights android/vtrender's). Empty text searches for nothing and clears the count.
-- No match is selected until a step: `↑`, Enter or the keyboard's Search key selects the next match
-  above (towards older output; the first step selects the newest), `↓` or Shift+Enter the one
-  below, going round at either end (`VtView.searchStep`). The count reads "selected/total" as the
-  view reports it (`Host.onSearchCount`), the selected one counted from the newest, 0 before a step; text that is not found reads "0/0".
-- `×`, Esc in the text, or Back (after Back has hidden the keyboard) closes the bar: the search
-  ends and its marks go (`VtView.endSearch`), the tab bar comes back, the terminal takes the focus
-  and the viewport stays where the search left it. Showing a tab (another one, Ctrl+Tab or a volume
-  key while searching, or the same one again when the activity comes back, see Binding and choosing a tab) or
-  a restart closes it too, as a search belongs to the tab it was opened in.
-- Tapping the terminal (or pressing a mouse on it) while the bar is open gives the keyboard back to
-  the terminal and leaves the bar and its marks, at which point extra keys resume targeting the
-  terminal. While the search bar has focus, extra keys act on it instead (Esc closes, `↑`/`↓` step
-  matches, `←`/`→`/Home/End move or Shift-extend the selection, symbols replace any selection or
-  insert at the cursor, and Ctrl/Alt combos or terminal-only keys like Tab/F1–F12/PgUp/PgDn are
-  consumed without reaching the terminal).
-- The search bar's `↑`, `↓` and `×` click listeners request the same `KEYBOARD_TAP` feedback
-  as the tab bar and extra keys; Enter, Escape and the IME's Search action bypass those listeners.
+Bulk close removes current last. Each `removeSession` releases the session and can synchronously trigger `onSessionsChanged`. This ordering avoids attaching and starting another tab just to close it. If current disappears, its last rendered index clamped to the new last index selects the following tab or the preceding last tab. This replacement can preserve an open list. An empty list with a nonzero machine finishes the activity. The service manages its own shutdown.
 
-### Insets and the IME
+### Tab list, overflow menu and Back
 
-- The content is edge-to-edge with the root padded by system-bar, display-cutout and IME insets
-  (from Android 15 the window reaches into the cutout, which in landscape is at a side). As the IME
-  shows or hides, the root is laid out for the end at once (the terminal regrids once, at the
-  start) and the extra keys are drawn moving from their old place to the new one along the IME
-  animation's curve (`TerminalLayout.keysFollowIme`), rising through the IME's room or sinking over the
-  terminal's new rows; an animation that interrupts another starts from where the keys are drawn.
+Opening the title list requires an unlocked activity and a nonempty session snapshot. `TabListView.open` reveals the current row and preserves terminal input focus. The rows occupy at most ten row heights within the viewport. Taps outside the rows dismiss the overlay, including taps over the keys. Row select/close rechecks the bound session's live membership and the privacy gate. Row close can leave the list open during confirmation and successor selection.
 
-### Links and the clipboard question
+`updateTabListControls` sets the covered column to `IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS` and updates the tab bar's list-open state. Opening enables `closeTabListOnBack`. Closing clears the list's row/session references, restores `IMPORTANT_FOR_ACCESSIBILITY_AUTO`, resets the bar state and disables the callback. List dismissal requests terminal focus only if the list held it.
 
-- `onOpenUrl` receives a validated guest web URL from the service's kernel-wide browser bridge.
-  With window focus it calls `TerminalLinks.openBrowser`; otherwise it returns false. Its Boolean
-  acknowledges Android accepting the intent; the guest receives a failure when it is refused.
-- The view reports a link to open (`Host.onLink`: a tap or Ctrl+click on one, or the menu's Open
-  link; which links count and which schemes open are `android/vtgestures`'s). The activity delegates to
-  `TerminalLinks.open`, which opens HTTP and HTTPS links with AndroidX Custom Tabs, without binding
-  a browser package or session, and other
-  non-file schemes (such as mail) with plain `ACTION_VIEW`; both carry `CATEGORY_BROWSABLE`.
-  `startViewer` passes the Custom Tabs launch options and returns false with a toast if no app handles the link.
-  A `file:` link (`ls --hyperlink`) is looked up off
-  the main thread through the Files app's provider (`Documents.fileLink`) and opened as its
-  document, typed by it and with read access granted: a directory in the Files app, a file in the
-  app the system picks. A link from another host, to an existing file while file access is off,
-  or to nothing in the store gets a toast instead, as does a link no app takes. The disabled-file
-  hint names the localized "Allow other apps to access files" setting in all five locales,
-  matching Settings' consent dialog.
-  The lookup result returns on the UI thread and is ignored if its activity is destroyed or locked.
-- The service offers a tab's first OSC 52 read to the activity. Pending reads belong to the
-  session (`android/vt`). The activity retries after showing the tab, resuming, gaining window
-  focus, unlocking privacy or dismissing a clipboard question. Only the current service tab in
-  a resumed, focused, unlocked activity may read the first clipboard item's text.
-- Empty or non-text content receives an empty answer immediately. For text, one `showPrivate`
-  dialog previews up to 300 characters and asks Allow or Deny for that session's batch.
-  Returning text requires Allow while resumed and unlocked. Switching tabs, stopping, or
-  pausing with privacy mode enabled denies an open question. A deferred dismissal callback
-  checks the dialog's identity before answering.
+Back, Escape, the list toggle and an outside tap dismiss the list. Normal tab selection, search, the menu, bar close/import, extra-key dispatch, pause, restart and disabling the list control can also close it. Escape's matching release is consumed.
+
+The overflow uses an end-aligned AppCompat `PopupMenu` styled with `Widget.Appine.MorePopup`. Find requires a current tab. Reset requires a native terminal, and Clear screen additionally requires the primary screen. Close other/all tabs capture the respective session sets when the menu opens. Settings opens `android/settings`' `SettingsActivity`.
+
+Keep screen on is checkable even without a tab. `ThemeOverlay.Appine.CheckPopup` makes the checkbox background transparent, leaving press feedback to the row. Tapping updates the check, sets or clears `FLAG_KEEP_SCREEN_ON` and stores `keep_screen_on` in activity-private preferences (default off). Only the visible terminal window requests this behavior. The service's screen-off policy and wake lock are independent.
+
+### Permission banners and Settings actions
+
+Each banner is a 32 dp row with a weighted, start-aligned action and a square × with a localized description. The 14 dp message has 10 dp horizontal padding and end ellipsis. Both buttons request `KEYBOARD_TAP`. The rows can remain visible during search. An unlocked dismissal persists its own flag, `dismissed_notification_prompt` or `dismissed_battery_prompt`. Settings rows follow live system state independently.
+
+#### Notifications
+
+The banner appears when `NotificationManager.areNotificationsEnabled()` is false and its dismissal flag is clear. Individual disabled channels do not trigger it. Both callers initialize `requested_notifications` in the named `MainActivity` preference file. If absent, it starts true on an updated installation (`lastUpdateTime > firstInstallTime`) and false otherwise.
+
+Only an explicit tap calls `NotificationPermission.enable`. It returns if locked or already enabled. On Android 13+ it requests `POST_NOTIFICATIONS` only when permission is missing, no attempt is recorded and Android reports no rationale. It records the attempt before launch, so dismissing the system dialog counts. Other disabled cases, including Android 11–12, open `ACTION_APP_NOTIFICATION_SETTINGS` with `EXTRA_APP_PACKAGE`. A missing handler opens package details instead. Permission results and resume refresh visibility. Banner dismissal leaves the request history intact.
+
+#### Battery usage
+
+The battery banner requires a clear dismissal flag and a false result from `PowerManager.isIgnoringBatteryOptimizations(packageName)`. An unlocked tap rechecks exemption, then opens `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` for the package URI. A missing handler falls back to `ACTION_APPLICATION_DETAILS_SETTINGS`, the Settings row's direct destination. Both battery routes guard against lock or an existing exemption. Resume rereads the system state.
+
+### Search and extra-key focus
+
+Find or Ctrl+Shift+F with a current session calls `openSearch`. It closes the list, cancels held extra-key presses, hides the tab bar and opens the equal-height search bar, preserving terminal rows. The single-line field takes focus, selects its retained query, posts an IME show request and searches again. It disables suggestions, extract UI and fullscreen IME editing.
+
+Each edit calls `Find.search` and `VtView.search`. Frames report counts through `Host.onSearchCount(total, selected)`. An empty query hides the count. Otherwise it reads “selected/total”, counting from the newest (1), or 0 before selection. No matches reads “0/0”. The on-screen and extra-key arrows step older or newer, selecting the newest on the first older step. In the field, hardware Enter and numpad Enter step older, Shift reverses their direction, and IME Search steps older. Steps wrap and reveal the match. Up, down and × clicks request tap haptics. Hardware and IME actions invoke the target directly.
+
+`Keys.key` and `Keys.text` route through `SearchExtraKeys`. A locked event returns before dispatch. Otherwise routing closes the tab list. If `SearchBarView.hasInputFocus` (visible and focused), the bar handles the event and the router calls the panel's `modifiersUsed` even for ignored keys. This clears eligible one-shots and preserves locked modifiers. When the terminal regains focus with search still open, extra keys resume calling `VtView.press` / `type`. The view reads modifiers through `Host`.
+
+In the focused bar, extra Escape closes even with Ctrl or Alt. Other Ctrl/Alt combinations and terminal-only keys are consumed. Up/down step matches. Left/right collapse or move the selection, Home/End move to the ends and Shift extends from the anchor. The edit rules support backward deletion. Extra text drops CR/LF and replaces the selection or inserts at the caret.
+
+×, Escape in the field and the enabled `closeSearchOnBack` callback call `closeSearch`. Back reaches the activity when the IME yields it. Closing cancels extra-key repeats, ends search and its marks, restores the tab bar and terminal focus, and disables the callback. Showing any tab or restarting also closes search. The field retains its text for the next search in this activity.
+
+### Hardware shortcuts and volume keys
+
+`dispatchKeyEvent` consumes events while locked. Otherwise it handles list Escape, then checks key downs for a shortcut or volume switch. A taken down records its key code in `shortcutKey`. An up whose key code equals `shortcutKey` clears the slot and is swallowed before the view can encode a release; because `shortcutKey` uses `0` as its empty sentinel, an `ACTION_UP` with `KEYCODE_UNKNOWN` is also swallowed when no shortcut down is active. Unhandled events go to superclass dispatch, including events directed to the focused search field. Shortcuts use the event's actual modifier bits.
+
+| Key down | Activity behavior |
+| --- | --- |
+| Ctrl+Shift+T / W / F | Open a tab, run current-tab close confirmation, or open Find on the first down. Repeats are consumed. |
+| Ctrl+Tab / Ctrl+Shift+Tab | Select next / previous with wraparound. Holding the keys repeats. The chord is consumed even when there is no other tab. |
+| Ctrl+Shift+Up / Down | Ask `VtView.jumpToPrompt` to move backward / forward, including repeats. It consumes the jump on a primary native terminal even with no prompt mark. On the alternate screen or with no native terminal it returns false and normal dispatch continues. |
+| Volume up / down | Select previous / next with wraparound if the setting is enabled and there is another tab. A successful first down requests `KEYBOARD_TAP` on the terminal view. |
+
+The Ctrl shortcuts reject Alt and Meta. `Settings.volumeKeysSwitchTabs` defaults on and is read on each initial volume-key press. `switchBy` requires the current session to be in a list of at least two sessions. Volume repeats are consumed only for the remembered key and never switch again. With the setting off or no eligible switch, the initial press falls through for normal system volume handling. The system shortcut list includes the tab actions, Find and the two prompt jumps.
+
+### Window layout and IME animation
+
+The black vertical root holds a top frame for the tab and search bars, then a weighted overlay frame. Its first child stacks the notification banner, battery banner, weighted terminal body and extra keys in that order. The body layers `VtView`, centered status text and a top-aligned `ProgressLine` of height `line()`. The overlay's second child is the full-size `TabListView`. List rows thus cover banners, terminal and keys.
+
+With decor fitting disabled, a root insets listener obtains the combined system-bar, display-cutout and IME insets, pads all four sides and consumes the insets. Side padding matters for a landscape cutout. `clipToPadding = false` lets keys draw into the root's bottom padding. Both the overlay frame and the content column set `clipChildren = false` so the keys can cross their bottom edges during animation.
+
+`keysFollowIme` tracks the particular IME animation. In `onPrepare` it records the drawn bottom, `keys.bottom + keys.translationY`. After layout takes the end insets, `onStart` sets translation to the difference between that recorded position and the new bottom. `onProgress` multiplies the difference by the remaining interpolated fraction. Only the followed animation's `onEnd` clears the translation. An interruption therefore starts from where the keys are drawn and a late end from the old animation cannot snap them back. The effect moves the keys across the terminal's end layout without resizing it on each animation frame.
+
+### Input, focus and the clipboard
+
+`Host.onInput` checks privacy at the final write, including delayed IME or paste input. It writes to the current running session. For an ended session any buffer containing CR or LF closes the tab directly. `Host.onFocus(session, data)` instead takes its recipient from `VtView.sendFocus`. Mode-1004 focus-out can reach the outgoing session after the activity has selected its successor. The host writes only when unlocked and that supplied session is running. `Host.onZoom` saves the new pixel size divided by density.
+
+OSC 52 reads wait in a session's `ClipboardReads`. On the first waiting read the service offers the batch to listeners if the session is service-current, a terminal activity is registered and privacy is unlocked. An unclaimed batch can wait 60 seconds. Up to 64 targets share it, with overflow answered empty.
+
+1. `onClipboardRead(sessionId)` requires both the local current ID and identity with service `current`. An existing dialog returns the session's `promptActive` without rereading. Otherwise `beginPrompt` claims a pending batch only with no active prompt, a resumed activity, window focus and an unlocked gate. Claiming cancels the waiting deadline.
+2. The activity reads only the first item with `coerceToText(this)`. No clip, no items or an empty coerced value gets an immediate `answerClipboardRead("")`. A non-text item that coerces to nonempty text goes to the question. There is no MIME filter.
+3. One `showPrivate` dialog previews the captured value, truncating beyond 300 Kotlin `Char` units and appending an ellipsis. Allow checks resumed and unlocked at the tap. On dismissal, only `clipboardQuestion === dialog` may clear the field and answer. If Allow succeeded and both checks still pass, the session gets the full captured text. Denial, cancellation or a failed check returns null, encoded as an empty reply. A matching dismissal refocuses the terminal and retries delivery.
+4. On a change of current identity, stop or privacy-mode pause, `dismissClipboardQuestion` calls the old session's `clipboardReads.denyPrompt()` only for an open question. The claim's dismiss closure clears the activity field before dismissing the window, so its queued listener cannot answer a replacement. Session reset, exit or release can clear the batch and close its preview without answering.
+5. `deliverClipboardRead` retries after showing a session, posted resume, window focus gain, privacy unlock and matching dialog dismissal. Switching away leaves an unclaimed batch subject to its session deadline.
+
+### Terminal links and guest browser requests
+
+`Host.onLink` hands a URI from the terminal's link gestures or selection menu to `TerminalLinks.open`. Scheme comparisons for HTTP, HTTPS and file ignore case. Web links use an unpinned AndroidX Custom Tab with the URL as its data, `CATEGORY_BROWSABLE` and its start animation bundle. Other non-file schemes use a browsable `ACTION_VIEW`. Both call `startViewer`, which checks privacy immediately before launch. It returns true on accepted `startActivity`, or shows the missing-app toast and returns false on `ActivityNotFoundException`.
+
+A `file:` link starts an `appine-link` thread for `Documents.fileLink`. The provider resolves the host, document and visibility. On the UI thread the activity drops the result if destroyed or locked. A found document opens via `ACTION_VIEW` with the provider URI, MIME type and read grant. Remote host and missing file each get a short toast. A hidden file gets a longer hint about the file-access setting.
+
+A guest browser request arrives separately through `TerminalService.Listener.onOpenUrl` after `BrowserBridge` validates the web URL. The activity requires both window focus and an unlocked gate and returns the result of `openBrowser` to the service. Success acknowledges Android accepting the launch.
+
+### File picker, cancellation and results
+
+`MainActivity` observes `TerminalFiles` from `ViewModelProvider`. `updateImport` first calls `tabBar.setImportState`. A new import requires a nonzero machine and `!occupied`. The model is occupied while selecting, holding picked URIs, copying or retaining a result. During copying, the button stays enabled, changes from @ to ■ and announces cancellation.
+
+`Bar.importFiles` closes the list. The handler checks privacy, then cancels an active batch before checking machine readiness. Otherwise it captures `Settings.login` with `begin` and launches `OpenMultipleDocuments` for all MIME types. A missing picker clears selection with an empty list and shows a long toast. Picker results go to `selected`. Files go to the resolved login home regardless of the current tab's working directory.
+
+After updating the button, `updateImport` requires a resumed, unlocked activity to call `importSelected` or show a result. Starting a copy shows a toast. Model changes, rendering tabs and privacy unlock can trigger delivery. One protected dialog displays successful paths in monospace on separate lines, then any failures. Copy paths appears only for successes and rechecks privacy before writing `TerminalFiles.clipboardPaths` to the clipboard as space-separated, shell-escaped arguments without a trailing newline.
+
+Ordinary dismissal clears the retained result and refocuses the terminal. Destroy removes the dismiss listener before closing the dialog, allowing the replacement activity to present the result after recreation.
+
+### Shared UI and resources
+
+- `LINE_DP` is 1. `Context.dp` multiplies by display density and truncates to integer pixels. `line()` applies a minimum of one pixel for indicators and progress. The `View` versions delegate to the context. `themeColor` falls back to white, `themeDrawable` returns a nullable drawable and recycles its attribute array, and `touchFeedback` reads the framework `selectableItemBackground`.
+- `terminalControlColor(true)` blends primary with 25% white. The ordinary color blends on-surface-variant with 40% black. Tab controls and extra keys use these colors against black. Search controls, banners and status text read their own theme attributes.
+- `openPackageSettings` builds a settings intent with a `package:` URI. `showPrivate` creates a dialog, registers it with `Privacy.protect` and then shows it. `monospaceMessage` applies a `TypefaceSpan` only to the supplied value and expands a localized `^1` template with `TextUtils.expandTemplate`. Import results and unsafe-paste previews use it.
+- `values/themes.xml` defines Material 3 `Theme.Appine` (DayNight, surface window background) and `Theme.Appine.Terminal` (Dark, black window and system bars, fallback line spacing disabled). Both have no action bar. `Widget.Appine.MorePopup` offsets the overflow horizontally by −3.5 dp and vertically by 4 dp. `ThemeOverlay.Appine.CheckPopup` supplies the transparent control background and framework checkbox style.
+- `layout/page.xml` supplies Settings and the two license pages with a coordinator root, app bar, toolbar with Up affordance and scrolling content frame. `layout/preference_switch.xml` exposes a `MaterialSwitch` at the standard `switchWidget` ID. Its background is null and it leaves click and focus handling to the preference row.
+- The adaptive launcher icon references separate background, foreground and monochrome drawables. `values/colors.xml` supplies the foreground stroke color. `ic_notification` is the shared small notification icon. `xml/diagnostic_paths.xml` exposes the `diagnostic-exports/` cache subdirectory through the manifest's diagnostic provider. `xml/data_extraction_rules.xml` excludes root, files, database, shared preferences and external data for cloud backup and device transfer. The application also declares backup and full backup disabled.
+- `xml/locale_config.xml` advertises English, Simplified Chinese, Traditional Chinese, Korean and Japanese to Android's per-app language picker on Android 13+. Their tags are `en`, `zh-CN`, `zh-Hant`, `ko` and `ja`. English lives in `values`, with translations in `values-zh-rCN`, `values-b+zh+Hant`, `values-ko` and `values-ja`. Older supported releases follow the system language. The strings files follow the same feature order across terminal controls, clipboard, links, import, Settings, privacy, licensing, notifications, restoration and reports. Translations omit non-translatable names/templates and use the `other` plural form.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `TerminalService`: listener callbacks (`onProgress`, `onMachineReady`, `onSessionsChanged`,
-  `onBell`, `onClipboardRead`, `onTabStatus`, `onSettingsChanged`, `onNotice`, `onRestarting`,
-  `onExitAll`) and the notification intent with `EXTRA_TAB`.
-- android/vtview and android/vtgestures: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra
-  keys' `ctrl`, `alt`, `shift` and `modifiersUsed`, `onLink`, `onSearchCount`).
-- android/settings and android/licenses use the shared page frame, themes and view helpers;
-  Settings also uses the preference switch widget, NotificationPermission and BatteryOptimization. android/privacy uses the shared theme and helpers.
-- android/privacy: `onPrivacyUnlocked` resumes deferred terminal UI work.
+- `android/build` declares the activity, theme and XML configuration. `android/reports` supplies the tab notification intent. The service's foreground notification opens the activity without a requested tab.
+- `android/service` calls the listener. `android/privacy` signals unlock on a resumed page. `android/vtview` calls the host, including links from `android/vtgestures`. `android/tabbar` and `android/keys` call the activity's adapters.
+- `android/settings` uses the permission helpers, preference switch, page frame and dialog helpers. `android/licenses` shares the page frame.
 
 ### Outbound
 
-- android/vtview: `VtView` (`attach`, `setFontSize`, `setFillWide`, `press` and `type` from the
-  extra keys, `search`, `searchStep`, `endSearch`, `jumpToPrompt`, `bell`, `altScreen`).
-- android/vt: `VtSession` (`busy`, `cwd()`, `title`, `progress`, `status`, `describe`, `clear`,
-  `reset`, `answerClipboardRead`); `ProgressLine` draws the tab's `Progress`.
-- `TerminalService` (`createSession`, with the current tab's directory for a new tab,
-  `removeSession`, `current`, `focus`, `sessions`), `Settings.fillWide`,
-  `volumeKeysSwitchTabs` and `showTabList`; `Documents.fileLink`
-  (android/documents).
-- `android/file-import`: retained `TerminalFiles` request/copy/result and shell-escaped paths.
-- `android/tabbar`: tab bar/list and `ProgressLine`; `android/keys`: extra keys and modifiers.
-- android/privacy: `Privacy.locked` guards input, clipboard, imports, browser launches and
-  toasts; `Ui.showPrivate` delegates dialog-window security to `Privacy.protect`.
-- Material Components 1.14.0 with AppCompat and androidx.activity (the shared themes and page
-  layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation compat;
-  androidx.browser's Custom Tabs for web links; the app the system picks for a link.
+- `android/service` owns the machine, sessions, current/restored focus, settings and notices. `android/vt` supplies session state, working directory, grid startup, writes, busy status, progress, clear/reset and clipboard batches.
+- `android/vtview` owns attachment, encoding, IME and paste, search, prompt jumps and bell feedback. Link detection belongs to `android/vtgestures`, native terminal state to `android/vtcore`, and frame data and cell highlights to `android/vtrender`.
+- `android/tabbar` renders tabs, list, import/stop button and progress. `android/keys` owns key rows, repeats and modifier lifetimes. `android/file-import` owns requests, copying, results and path escaping. `android/documents` resolves guest files.
+- `android/privacy` guards UI operations and protects dialog windows. `android/settings` supplies the Settings destination. AndroidX, Material and platform services supply Back, activity results, lifecycle, insets, dialogs, Custom Tabs, clipboard, IME and intent dispatch.
 
 ## Invariants and gotchas
 
-- Programs never receive Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Shift+F, Ctrl+Tab or Ctrl+Shift+Tab
-  typed on a hardware keyboard with Ctrl held but neither Alt nor Meta (the tab shortcuts), nor
-  Ctrl+Shift+↑ and ↓ on the primary screen
-  (the prompt jumps, taken even when there are no prompts); the release of the shortcut's key is
-  swallowed too, so the Kitty protocol sees no release without a press. Other releases are never
-  matched to presses: Ctrl+Shift+C/V's, a Shift+arrow's (or Page Up or Down, Home or End) that
-  moved a selection, or Esc's when the IME took the press, reach the program alone.
-- A taken shortcut or volume key is remembered (`shortcutKey`) until its release, which is
-  swallowed; a volume key's repeats are taken only while it is the remembered key, so a press
-  left to the system keeps its repeats and release there and the volume changes as usual.
-- Android honours at most 200 dp of back-gesture exclusion on each edge of a window; the tab
-  bar's 32 dp, the scrolling extra keys' 32 or 64 dp and a selection handle at the edge leave room
-  under it.
-- `MainActivity` is a `FragmentActivity` on a Material theme: Material dialogs and AppCompat's
-  `PopupMenu` take the theme, but the views it builds or inflates from XML are the framework's (no
-  AppCompat inflater), so AppCompat view attributes such as `app:tint` do nothing there. The text
-  selection handles `VtView` draws read framework attributes, which AppCompat forwards to the
-  Material 3 colours (the handles are the primary colour). The system floating text menu has its
-  own theme and resources: on S23 Android 16 its surface/text follow configuration night mode
-  while its ripple follows the theme. A fixed dark theme alone does not force `uiMode` to night;
-  MainActivity's early configuration override aligns them and survives configuration updates.
-  Keep the override limited to night mode so locale, font scale, density and window size still update.
-  Theme.Material3 does not set the system bars' colours, which Android applies up to version 14,
-  so `Theme.Appine.Terminal` sets them black, as the framework theme had them.
-- `TerminalLayout` must be built after dynamic colours are applied and assigned before attaching
-  its root to the window: its view adapters access the activity's layout once input, grid and
-  search callbacks begin. The activity still detaches the session on restart and destruction.
-- The system lays the window out with the IME's end insets as its animation starts, when it hides
-  as well as when it shows, so without a `WindowInsetsAnimation` callback the extra keys jump
-  there at once. The keys rising with the IME are drawn inside the root's bottom padding, which
-  already holds the IME's room, so the root must not clip to its padding (`clipToPadding` off) or
-  they stay hidden until they reach the terminal. The content column and shared overlay frame
-  also disable `clipChildren` so translated keys can pass their bottom edges; the tab list is
-  drawn after the column and stays above the keys wherever they overlap.
-- No activity handles `density`: every view is sized in dp when built. Settings and the license
-  pages also recreate for dark mode (android/setup and android/licenses).
-- The privacy gate is android/privacy's. Keep checks at the final input and clipboard sinks,
-  including delayed IME/paste callbacks; pausing with privacy mode enabled cancels activity toasts and denies the open clipboard
-  question. Dialogs use `showPrivate`, and deferred import results require a resumed unlocked page.
-- An activity the system recreates (a configuration change it does not handle, or after killing
-  the app) or that is opened from Recents gets the intent that first started it, so `EXTRA_TAB`
-  is read in `onCreate` only without a saved state and without
-  `FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY`; otherwise a notification's tab would come back to the
-  front. A recreated `MainActivity` drops ordinary dialogs, the search bar and the extra keys'
-  modifiers/page; a retained import result is shown again after the page resumes unlocked.
-- Back uses `OnBackPressedDispatcher` with `closeSearchOnBack` enabled only during search and
-  `closeTabListOnBack` only while the tab list is open. List callbacks carry the session, never
-  a position; the activity checks it still exists before selecting or confirming its close. Dismissing
-  the list clears its data and recycled rows so it does not retain sessions closed through other controls.
+- Apply dynamic colors before building views and assign the layout before attaching its root. Grid, input and search callbacks use the activity's layout.
+- Tab IDs cross intents, while live list actions and focus bytes carry session objects. The cached index is for finding a successor after removal.
+- Window focus gates a clipboard claim. An open preview can hold focus itself. Settling its batch depends on dialog identity and authorization at dismissal.
+- Dialog-window protection and operation authorization are separate checks. Keep the privacy check at the final input, clipboard, import and intent operations. New activity toasts replace the previous one and are suppressed while locked.
+- Resume and unlock gate queued import startup and presentation. An active worker belongs to the retained model. A completed file-link lookup checks activity destruction and lock state regardless of which tab now has focus.
+
+## Confirmed bugs / technical debt
+
+- `MainActivity.confirmClose` has a stale comment claiming every running shell without prompt marks is busy. The native busy predicate can identify an idle foreground interactive shell.
+- `shortcutKey` stores only the last intercepted key code and uses `0` (`KeyEvent.KEYCODE_UNKNOWN`) as its empty sentinel: two overlapping, different intercepted downs can overwrite the first code before its up arrives (letting the earlier release through normal dispatch), and an `ACTION_UP` with `KEYCODE_UNKNOWN` is swallowed even when no shortcut down is active.
+- Hardware `KEYCODE_ESCAPE` in `SearchBarView.key` closes search on `ACTION_DOWN` and returns focus to `VtView` without recording `shortcutKey`, so the matching `ACTION_UP` dispatches to `VtView` and can emit an unmatched Escape release when keyboard release reporting is enabled.
+- Focused search's extra-key Left/Right editing uses single UTF-16 units. It can place the caret between the halves of a supplementary character, where inserting a symbol breaks the pair. The backward-delete rule also removes a single unit for an empty selection.
+- The OSC 52 clipboard-read preview slices the first 300 UTF-16 units before appending an ellipsis, which can split a supplementary character in the preview (Allow still sends the full captured text).
 
 ## Open questions
 
-- Should "Close other tabs" name the tab when only one other tab is open?
-- Should the clipboard question offer to remember the answer for the tab (Ghostty asks every time)?
-- Should typing in the search bar select the newest match at once, as Chrome's find bar does,
-  rather than wait for a step, as Ghostty does?
+- Should a single-target “Close other tabs” confirmation identify the affected tab?
+- Should a clipboard answer ever be remembered for a session?
+- Should entering a search query select its newest match before the first step?
 
 ## To verify
 
-- Control contrast passes debug assembly and lint. Device checks remain for wallpaper palettes,
-  small-label readability and selected/ordinary/locked states; indicator geometry is unchanged.
-
-- System per-app language selection: verify all five languages and returning to the system
-  default on Android 13+, including retaining the current terminal tab across recreation.
-  Resource compilation, lint and translation key/placeholder checks passed for the three added
-  locales. Native-speaker review, device layout checks, language switching and vendor settings
-  UI remain unverified.
-
-- Tab-list coverage of the notification banner passed API 34 checks with notifications disabled
-  and enabled: the first row stays flush below the top bar, taps over the banner select a row
-  without opening settings, and dismissal restores the banner's action and accessibility node.
-  The covered banner is excluded from the compressed accessibility tree; TalkBack speech remains
-  unverified. Debug assembly and lint passed.
-
-- Notification permission and the dismissible banner: debug assembly and lint passed.
-  API 34 covered start-aligned layout, separate accessible close action, persisted dismissal
-  after relaunch/revocation, Settings first request and denial, system-settings grants and return,
-  shared banner routing, direct dialog grants and tab-list suppression of both banner actions
-  in the compressed accessibility tree. Held-touch screenshots confirmed feedback on each button.
-  Vendor settings screens, the missing-handler fallback, Android 11–12 and TalkBack remain
-  unverified for this flow.
-
-- Tab-list coverage and hit routing over the extra keys passed API 34 checks in a short viewport;
-  a tap on exposed keys below a shorter list dismisses without activating the key. Opening the
-  list with the IME visible and then hiding the IME retained the terminal input connection.
-  Debug assembly and lint passed; frame-by-frame IME animation clipping and TalkBack traversal
-  after the hierarchy change remain unverified.
-
-- Bar/list clicks and volume-key tab switches use the extra keys' feedback constant; their physical
-  feel and device touch-feedback settings still need real-device verification.
-
-- The terminal's night override compiles and passes lint; the system selection menu's surface,
-  text and ripple on S23, including after switching system dark mode while the activity is alive,
-  still need device verification. Settings and licenses should continue following the system.
-- Guest launcher → Chrome CustomTabActivity → Back, plus background refusal with exit 1, were
-  checked on API 34; a complete Codex OAuth login and its callback remain unverified.
-- Everything here was tried only on emulators (a Pixel 4a API 34, and the outer display of a Pixel
-  10 Pro Fold API 37 for the cutout and the IME), with Gboard in English and input from adb; not on
-  real phones, tablets or foldables. Unverified beyond that:
-  - App Links, browsers without Custom Tabs and missing
-    handlers; links with other mail apps, viewers and file managers, and `mailto` at all;
-  - the cutout insets and the keys following the IME with other IMEs;
-  - the search bar's Back callback on Android 16;
-  - the volume keys as real buttons (tried with adb key events: presses, a long press, the
-    setting off and on, with three tabs; not with a single tab) and under vendor volume handling;
-  - Back finishing the activity on Android 11 (a new activity's tab was tried after removing the
-    task, a font scale change and a display size change on API 34).
+- On physical devices, check interrupted IME animations and side cutouts, Back with the search field active, and tab-list TalkBack traversal before and after dismissal.
+- Check hardware chord and volume-key delivery, held presses and haptics with vendor keyboards and system feedback settings.
+- Check vendor notification/Doze settings and fallback handlers, external link viewers and end-to-end browser callback navigation.
+- Check clipboard focus timing and import-result delivery across multi-window focus changes, privacy unlock and activity recreation.
+- Check language switching and current-tab restoration, translated labels at larger display sizes, and control/selection-menu contrast under device wallpaper palettes.

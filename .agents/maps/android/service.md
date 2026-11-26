@@ -3,430 +3,215 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/android/service.md` for the paired decision history (it still holds the decisions on notifications, fault reports and diagnostics made before they were split out into `android/reports`).
 >
-> Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
->
-> Maintained: 2026-11-26 (targeted verification of per-start configuration degradation on existing stores via `prepareStartBridge` and nullable `StartedKernel.browser`)
+> Verified: 2026-11-26 (full refresh: 17 adversarial claims checked independently — 14 confirmed and 3 partial corrected, plus 5 confirmed bugs/debt items recorded below)
 
 ## Responsibilities
 
-`android/service` is the app's foreground service, `TerminalService`, which owns everything that
-outlives an Activity:
+`TerminalService` owns the guest kernel, its browser endpoint and all terminal sessions across activity stops and recreation. It coordinates import, boot, shutdown, reboot and distro replacement. It decides when guest activity needs a wake lock, when tabs need saving or trimming, and where kernel events and program requests should go. It builds foreground notification **id 1**.
 
-- the kernel handle (`machine`), starting, booting (inittab), shutting down, rebooting and
-  replacing the kernel and its store;
-- all terminal sessions (`VtSession`s, `android/vt`), and restoring tabs after the process
-  was killed (`Tabs`);
-- the ongoing foreground notification (id 1) and its actions, the wake lock, memory trimming;
-- a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
-  directories, too-long holds of the BKL), checks login rule inputs and decides whether they become in-tab messages,
-  lifecycle actions or notifications delegated to `android/reports`, and the routing of what
-  programs ask of the app (bells, notifications, program statuses, clipboard writes and reads,
-  browser URL opens via `BrowserBridge`) and of commands the shells' prompt marks see finish;
-- the settings state that activities only display and forward (tier and Vulkan GPU in all builds,
-  screen-off running policy, login account, file access, CJK characters filling two cells, the
-  cursor's shape and blinking, whether the volume keys switch tabs, tab-list button visibility,
-  distro switch), the preferences kept in `Settings`.
-
-Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Settings.kt`,
-`Tabs.kt`, `BrowserBridge.kt`.
-
-Outside the module: non-ongoing notifications, channels, copyable fault reports and diagnostic
-retention/export (`android/reports`); rootfs import, downloads, mirrors and `login.sh`
-(`android/setup`); the Settings screen (`android/settings`); the terminal screen
-(`android/terminal`) and its tab bar (`android/tabbar`); the view (`android/vtview`), gestures
-and selection (`android/vtgestures`) and rendering (`android/vtrender`); sessions' internals and the console adapter (`android/vt`), native terminals
-and compression (`android/vtcore`); the Files app provider (`android/documents`); JNI and the
-kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
+The module comprises `TerminalService.kt`, `BrowserBridge.kt`, `Settings.kt` and `Tabs.kt` under `android/app/src/main/java/io/github/mthli/appine/`. `android/setup` supplies the store and guest setup. `android/reports` owns channels, non-ongoing notifications, fault reports and diagnostics.
 
 ## Key types
 
-- `TerminalService` — a same-process service; `onBind` returns a `LocalBinder` whose `service` is
-  the service itself.
-- `Listener` — UI callbacks with no-op defaults, always on the main thread: `onProgress`,
-  `onMachineReady(error)`, `onSessionsChanged`, `onBell` (haptics for a bell or program notification
-  in the tab in front), `onClipboardRead(sessionId)`
-  (a program in the tab in front, the current one, asks to read the clipboard), `onTabStatus` (a
-  tab's progress or program status changed), `onSettingsChanged`,
-  `onOpenUrl` (guest browser request; true acknowledges Android accepted it), `onNotice`, `onRestarting`, `onExitAll` (sessions redraw their view themselves). Activities
-  register in `onServiceConnected` and leave in `onStop`; "UI visible" means at least one listener
-  (the Settings fragment included).
-- `worker` — a single-thread executor (`appine-worker`) for the calls that take a kernel handle
-  and the BKL in the background (the poll's fetches, `setRoutes`, `consoleCwd`, `trimMemory` with
-  the tabs' scrollback compression after it, `shutdown`, `stop`), together with what must stay
-  ordered with them: saving tabs (their terminals' snapshots included), resolving an `auto` login, changed directories,
-  and a replacement's store reset.
-- Session state (internal): `sessions` (every tab, ended ones included), `unshown` (restored tabs
-  whose terminal does not exist yet, with their saved copy), `restore` (saved tabs from a killed
-  run, kept until a start restores them), `ended` (why that run ended), `focus` (set only by the
-  restore), `current` (written by `MainActivity` and cleared by `removeSession`/`releaseSessions`;
-  setting it takes the tab's notification and bell throttle away, marks the tab's statuses seen
-  with the terminal Activity listening, and notifies `backgroundImages` to protect the shown tab
-  and schedule the previous started tab for background image trimming),
-  `nextSessionId` (counting up from the clock, never wrapped); `sessionEvents` (title changed,
-  bell, clipboard write, notification, clipboard read, progress or status changed, a command
-  finished, tmux's control mode detached, the shell finished).
-- `BackgroundImageTrim` — pure-Kotlin LRU and dwell-time tracker for background tabs' Kitty image
-  caches: protects `current`, keeps at most `MAX_RETAINED` (2) most recently left started tabs
-  untrimmed for `DELAY_MS` (60 s), evicts older background tabs immediately, and keeps trimmed tab
-  IDs for periodic re-trim while they remain unseen.
-- Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
-  (restart or replace, between letting go of the old kernel and starting the new one),
-  `booting` (boot work is outstanding), `destroyed` (late completions cannot restart the service),
-  `pendingReplace` (a distro download that finished during a start or restart), `startError`,
-  `progress`.
-- `GuestActivity` — the last guest CPU sample and activity timestamp used by
-  the BUSY running policy; `RunPolicy` in `Settings` defines SLEEP, BUSY and ALWAYS.
-- `ConsoleTracker` — per-kernel monitor serializing console opens/closes with `Native.takeKills`
-  under a monotonic epoch so each console lifetime owns a disjoint `[openedEpoch, closedEpoch]`
-  interval; `close` drains remaining kills before advancing the epoch past the closed console.
-- `BrowserBridge` — per-kernel random-port IPv4 loopback listener with a UUID capability that
-  relays guest HTTP(S) open requests to the focused UI.
-- `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
-  tier (default 1 in all builds), Vulkan GPU (`gpu`, default off), login, running policy and its remembered non-always choice,
-  privacy mode (`privacy_mode`, default off), file access (`file_access`, default off and refused during privacy; old `system_documents` ignored), wide cells, the
-  cursor's shape (stored as Ghostty's names) and blinking, and whether the volume keys switch tabs
-  (on by default), and tab-list button visibility (`show_tab_list`, on by default);
-  `clearLogin` for a replaced store.
-- `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`): `switching` is
-  the active one, `downloader` the one whose thread has not ended yet.
-- `Tabs` — the `files/tabs/` store: `running` marker (the pid of the run that left it),
-  `index.json` (recording the libghostty-vt version, `VtNative.version`, its snapshots were written
-  with), transcripts named by content (`t-<128-bit SHA-256 prefix>.txt`; earlier versions wrote
-  `t<i>.txt`, still read), terminal snapshots named by content and deflated
-  (`s-<128-bit SHA-256 prefix of the snapshot>.snap`); `Tab(login, cwd, transcript, snapshot)`
-  (the snapshot's file name, null for none), `Saved(tabs, current, time)`, `Killed(pid, saved)`;
-  transcripts capped at 256 K chars, snapshots read back at most 16 MiB.
-- Constants: poll 2 s, trim delay 60 s (`TRIM_DELAY_MS = BackgroundImageTrim.DELAY_MS`),
-  background-tab image retention budget 2 (`BackgroundImageTrim.MAX_RETAINED`), periodic save 60 s,
-  save-soon 2 s, commands notifying from 10 s.
+| Type | Role |
+| --- | --- |
+| `TerminalService.LocalBinder`, `Listener` | Same-process service reference and main-thread UI callbacks. A Settings listener counts for visibility and idle exit. Foreground tab routing requires a terminal activity. |
+| `StartedKernel` | Private handoff of `handle`, nullable `browser`, `booted`, `gpuAvailable` and optional `setupError`. `machine == 0L` means there is no published kernel. |
+| `Switch` | Distro and volatile byte counts/cancellation flag. `switching` tracks the visible download, `downloader` its unfinished thread, `pendingReplace` a completed choice awaiting a start result. |
+| `ConsoleTracker` | Per-kernel monitor and epoch pairing console lifetimes with kill batches. |
+| `GuestActivity`, `RunPolicy` | CPU sample and activity time for the BUSY grace period, and the persisted SLEEP/BUSY/ALWAYS choice. |
+| `BackgroundImageTrim` | Ordered pending tab IDs with departure times, plus unseen IDs already trimmed and eligible for another pass. |
+| `BrowserBridge` | One kernel's listening socket, credential, active client and main-thread dispatch callback. |
+| `Settings`, `Tabs` | Private `settings` preferences and `files/tabs/` recovery store. `Tab` holds login, cwd, transcript and snapshot name. `Saved` adds layout, selection and time. `Killed` pairs a PID with a nullable layout. |
+
+Main owns the session list and lifecycle flags. `starting` covers import/private setup, `transitioning` the restart/replacement gap, `booting` the published kernel's outstanding boot check, and `exiting` the shutdown. `destroyed` guards late start results and notification updates. The single `appine-worker` orders poll batches, route updates, saves, trims, stop/shutdown and store reset. Start, boot, download and browser I/O have separate threads.
 
 ## Public entry points
 
-- Lifecycle: `onCreate`, `onStartCommand` (EXIT_ALL, CANCEL_SWITCH, TOGGLE_KEEP_AWAKE, legacy
-  COPY_REPORT forwarded to `Notifications.copyReport`; `START_NOT_STICKY`), `onBind`,
-  `onTrimMemory`, `onConfigurationChanged`, `onDestroy`.
-- Called by activities: `addListener`/`removeListener`, `createSession(account = login setting,
-  cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier`, `setGpu`,
-  `setRunPolicy`, `switchTo`/`cancelSwitch`/`canSwitch`,
-  `setLogin`, `setFileAccess`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
-  `setVolumeKeysSwitchTabs`, `setShowTabList`, `takeNotice`; state read by them: `machine`, `gpuAvailable`, `startError`,
-  `progress`, `switching`, `sessions`, `focus`, the settings.
-- Settings read without the service: `Settings.login` and `fileAccess` by `Documents`,
-  `Settings.fillWide` and `Settings.showTabList` by `MainActivity` (in `onStart` and `onSettingsChanged`) and
-  `Settings.volumeKeysSwitchTabs` by it at each volume key press; the service's getters read
-  `Settings` too, and its setters write it and act on the change (`setVolumeKeysSwitchTabs` and `setShowTabList` only
-  tell the listeners).
-- `setFileAccess` saves the gate, revokes all provider URI grants when disabling via
-  `Documents.revokeAccess`, refreshes roots and tells listeners. Settings confirms before enabling.
+### Android and UI
+
+- The manifest declares a non-exported `specialUse` service. `onCreate` enters the foreground. `onBind` returns the local binder. `onStartCommand` handles `EXIT_ALL`, `CANCEL_SWITCH`, `TOGGLE_KEEP_AWAKE` and legacy report-copy intents, and returns `START_NOT_STICKY`. Android also calls `onConfigurationChanged`, `onTrimMemory` and `onDestroy`.
+- `MainActivity` and `SettingsFragment` start and bind, call `addListener` on connection and `removeListener` on stop. Listeners receive `onProgress`, `onMachineReady(error)`, `onSessionsChanged`, `onTabStatus`, `onSettingsChanged`, `onNotice`, `onRestarting`, `onExitAll` and the program callbacks below. `takeNotice()` consumes the single pending message.
+- The activity opens and closes tabs with `createSession(account = login, cwd = null)` (passing `current?.cwd()` for new tabs) and `removeSession`, assigns `current`, and reads `sessions` and restore `focus`. Clients can inspect `machine`, `gpuAvailable`, `startError`, `progress` and `switching`, invoke `exitAll`, call `switchTo` when `canSwitch`, or cancel an active download with `cancelSwitch`.
+
+### Settings and side effects
+
+| Preference | Default and service behavior |
+| --- | --- |
+| `tier`, `gpu` | Tier 1 and GPU off in all builds. Changed values in `setTier`/`setGpu` persist and request a restart of a published kernel. Unchanged values return. `gpuAvailable` is the live result and clears on detach/destruction. |
+| `login` | `auto`, also accepts `root` or a named account. `setLogin` changes new tabs, refreshes Files roots and tells listeners. `clearLogin` removes the key on replacement. |
+| `run_policy`, `idle_policy`, `keep_awake` | Valid strings are `sleep`, `busy`, `always`. An absent or unknown policy falls back to legacy true for ALWAYS, false/missing for SLEEP. A policy write removes `keep_awake`. Non-ALWAYS writes remember the idle choice. Only `busy` in `idle_policy` selects BUSY, otherwise SLEEP. |
+| `privacy_mode`, `file_access` | Both off. Access requires the saved opt-in and privacy off. The old `system_documents` key is ignored. Enabling privacy clears `file_access` in the same edit. `Privacy.changeMode` revokes grants and clears existing detail notifications on enable, refreshes roots, then signals listeners. Disabling privacy leaves access off. |
+| `fill_wide` | Off. `setFillWide` writes the CJK two-cell preference and calls `settingsChanged` for the activity to apply it. |
+| `cursor_style`, `cursor_blink` | Block, blinking on. Shapes persist as `block`, `bar` or `underline`, with block as fallback. `setCursorStyle`/`setCursorBlink` apply both defaults to every session. Unstarted sessions retain them until creation. A program can select its own cursor. |
+| `volume_keys_switch_tabs`, `show_tab_list` | Both on. `setVolumeKeysSwitchTabs`/`setShowTabList` persist the choice and call `settingsChanged`. The activity reads the former on each volume-key press and the latter on UI refresh. |
+
+`setFileAccess(true)` returns during privacy mode. Otherwise it writes the choice, revokes provider read/write grants on disable, refreshes roots and calls `settingsChanged`. Settings confirms before enabling. `settingsChanged` updates id 1 and the UI listeners. The service privacy listener calls this same method. Direct preference writes bypass service-setter effects.
 
 ## Data flow / lifecycle
 
-### Start and boot
+### Service creation and the previous run
 
-- `onCreate` creates the four channels via `Notifications`, starts foreground (type `specialUse` on
-  API 34+) and takes a killed run (`Tabs.takeKilled`; with no marker it deletes `files/tabs/` and
-  there is none): its saved tabs, and how its process ended, looked up by the marker's pid in
-  Android's exit records (`ApplicationExitInfo`); a crash or ANR of Appine posts a notification
-  through `Notifications` at once. Then it calls `start(Rootfs.importing())` when no rootfs is
-  ready (Alpine on the first run, else the distro an import was last started for), else
-  `start(null)`.
-- `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
-  `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
-  notification and listeners and `Rootfs::probeMirrors` for import-time source selection, android/setup),
-  then `startKernel(tier, gpu, importing = distro != null)`: `prepareStartBridge` opens `BrowserBridge`
-  and runs `Rootfs.prepareStart` (`ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
-  `ensureBashStartup`, `ensureGpuCommand` when `gpu` is enabled, `ensureBrowser`, `updateProfile`).
-  On fresh imports (`importing = true`), any configuration I/O error closes `BrowserBridge` and aborts
-  startup; on existing stores (`importing = false`), each per-start step degrades independently via
-  `Log.w` and `Diagnostics.record` (quiet in UI so intentional customizations do not trigger recurring
-  dialogs), closing `BrowserBridge` (`StartedKernel.browser = null`) if opening it or writing
-  `/etc/appine/browser` fails. `startKernel` then opens `Native.start(store, tier, gpu)` under
-  `Rootfs.access`'s write lock (`tier` is the saved setting in all builds, defaulting to 1; `gpu`
-  defaults to false) and records `Native.hasGpu(handle)` as `gpuAvailable`. On Alpine, `Rootfs.ensureOpenRc` checks the store and installs a missing OpenRC
-  before publishing the kernel handle. If it installs or resumes, it runs inittab on this thread.
-  A setup I/O failure during import stops the private kernel. On an existing store the service
-  presents the error and allows a terminal for repairs. The boot thread runs inittab only if
-  setup has not already run it, including when runlevel verification failed.
-- Back on the main thread it clears `starting`; if "exit all" came meanwhile it finishes the exit
-  with the new kernel (shutdown if setup booted it, stop if still unbooted). On success: set `machine`, clear `progress`,
-  refresh Files roots; a `pendingReplace` replaces the store at once; otherwise update the wake
-  lock, write the running marker, restore the killed run's tabs (once), schedule periodic saves,
-  start the boot thread, register a default-network callback (routes), post the poll, update the
-  notification, `onMachineReady(null)`.
-- On failure: a failed import of a downloaded distro (not Alpine, store not ready) deletes the
-  abandoned cached tarball via `Rootfs.deleteTarball` and falls back to Alpine with a notice; with
-  a `pendingReplace` the store is replaced; any other failure records
-  the exception in `Diagnostics`, sets `startError`, updates the wake lock and notification
-  ("Cannot start" with the error in its body, unless privacy mode hides it), reports it to the
-  listeners, and stops the service as soon as no UI is left and no distro switch is downloading
-  (there is no kernel, so no poll would end it; opening the app tries again).
-- Which start: when no store is ready (`startOrImport`, at creation and when an exit finishes with
-  a UI back) the distro the last import was started for is imported first, otherwise the store
-  starts as it is.
-- Boot (`appine-boot` thread): unless the start thread already booted the kernel, run the osclock script without a console (exceptions logged, exit status ignored),
-  `Native.boot` (blocks until inittab's boot entries finish), then notify OpenRC services that
-  failed to start through `Notifications`, if the kernel is still the same.
+`onCreate` registers the privacy listener, creates the four channels through `Notifications`, and calls `startForeground` with id 1 (explicit `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` on API 34+). It calls `Tabs.takeKilled` before starting a kernel. Without a `files/tabs/running` marker, `Tabs.clear` deletes the directory and resets the layout cache. With a marker, the files stay in place. An empty legacy marker or an unparsable PID gives zero. A failed layout read is logged and leaves `Killed.saved` null.
 
-### Poll (every 2 s)
+For a positive PID, `lastExit` asks for the most recent matching `ApplicationExitInfo` for this package. The seven outcomes from `endedText` are low memory, excessive resource use, user-requested/stopped, package updated (API 34+), Java/native crash, ANR, or generic Android stop. The last covers unknown PID, absent record, lookup failure and other reasons. A crash or ANR goes to `Notifications.crash` immediately, even without a readable layout.
 
-- On the main thread, while a kernel runs: first `bklStall` (it takes no BKL, and the worker
-  would wait behind a hold that does not end) reports a too-long hold of the BKL to
-  `Notifications`; then the worker fetches `takeListens`, `takeKills`, `takePower`, `processes`
-  and `takeChangedDirs`, checks the login rule inputs, then fetches `guestCpuTime`. The poll
-  reschedules itself without waiting for the fetch.
-- The worker passes changed directories to `Documents.dirsChanged` and polls each kernel's
-  `Documents.AutoRootsWatcher` (refreshing Files roots when `login` is `"auto"` and `/etc/passwd`
-  or the auto home's parent changes the resolved home). Each machine also has its own
-  `Rootfs.LoginRules` captured when its poll is queued. The worker starts a needed refresh in
-  order with shutdown. A separate thread waits for completion (android/setup).
-- The rest is applied on the main thread only if the kernel is still the same: listens (to
-  `Notifications`), kills (taken with their `ConsoleTracker` epoch by the poll or drained on
-  console close, routed via `sessionForKill` -> `VtSession.ownedConsoleAt` to the unique tab whose
-  `[openedEpoch, closedEpoch]` interval held that console, shown as an in-tab `[appine]` message
-  in yellow above the cursor line and skipped on the alternate screen; then `Notifications` unless
-  shown in the tab in front, and always for an Appine bug), then power. Reboot → `restart()`;
-  halt/poweroff → `exitAll()`; no running sessions (tabs whose shell ended do not count; restored
-  tabs not shown yet do), no listeners and no guest processes (init and zombies excluded) →
-  `exitAll()`.
+`startOrImport` calls `start(null)` when `Rootfs.isReady` finds the store's `meta.db`. Otherwise `Rootfs.importing` selects the last distro for which import began, defaulting to bundled Alpine. A UI returning during shutdown uses the same decision.
 
-### Stopping, restarting, replacing
+### Private startup and kernel publication
 
-- `exitAll` (once): mark exiting, cancel a switch and a `pendingReplace`, `onExitAll`, clear
-  listeners immediately, `detach`, show "Stopping services…". While `starting` or `transitioning`
-  it stops there and the start or restart finishes the exit once its kernel is up or has failed;
-  otherwise `finishExit`: `Native.shutdown` on the worker (inittab shutdown, 30 s; `Native.stop`
-  for a kernel that was never booted), then clear `exiting`, release the wake lock and clear saved
-  tabs unless tabs of a killed run are still waiting to be restored; start the kernel again
-  (importing when no store is ready, as after a failed import the exit came during) if a listener
-  came back meanwhile, else `stopSelf`.
-- `detach`: unregister the network callback, clear `machine` (before sessions end, so the UI does
-  not treat it as the last tab closing), update the wake lock, cancel the poll and saves, release
-  (hang up and free) every session and take its notification away, clear `sessions` and
-  `unshown`; it runs before the kernel is shut down or stopped.
-- `setTier` and `setGpu` ignore unchanged values; otherwise they save the choice and call `restart` in all
-  builds. `restart` (guest reboot, tier or GPU change; nothing without a kernel):
-  `transitioning`, `detach` (which also clears `gpuAvailable`), `onRestarting`, shutdown on the worker, then `start(null)` (or, after
-  "exit all" meanwhile, finish the exit); the UI opens a new tab when the new kernel is ready and
-  no sessions exist.
-- Distro switch/reset (`switchTo`, allowed while no switch or download is under way and either a
-  kernel runs or the start failed): download on an `appine-download` thread (progress in Settings
-  and the notification, both cancellable; a failure other than a cancel shows a notice); when it
-  finishes, `replace` if a kernel runs or the start failed, else record it in `pendingReplace`
-  while a start or restart is under way (in any other state it is dropped). After a failed start
-  the switch keeps the service running without a UI; its failure or cancel then stops it as a
-  failed start does. `replace`: reset the login setting, revoke provider URI grants
-  (`Documents.revokeAccess`) and refresh roots (`Documents.rootsChanged`), `transitioning`,
-  `detach`, then on the worker `Native.stop` (kill all, no inittab shutdown), delete the
-  store, and revoke grants and refresh roots again before `start(distro)` — also
-  after "exit all" meanwhile, so the chosen distro is imported (and then stopped) rather than the
-  next start importing Alpine.
-- `onDestroy` marks the service destroyed (from then on nothing posts the ongoing notification,
-  which a thread outliving it, the download's, would otherwise post again),
-  cancels a distro switch still downloading, removes the pending callbacks, clears saved tabs
-  unless tabs of a killed run are still waiting to be restored, unregisters the network callback,
-  releases the sessions, shuts a remaining kernel down on the worker (best effort), shuts the
-  worker down and releases the wake lock. A start completing after destruction closes its browser
-  bridge and shuts its returned kernel handle down on a separate `appine-stop` thread.
+`start` clears `startError`, sets `starting`, updates the lock and captures tier/GPU. Given a distro, `appine-start` calls `Rootfs.prepare` with progress posted to main and `Rootfs::probeMirrors` for import-time sources. Setup records the distro, configures a temporary store and publishes it by rename. `startKernel` still treats this attempt as an import after the store is in place.
 
-### Wake lock and ongoing notification
+`prepareStartBridge` opens `BrowserBridge` before `Native.start`. `Rootfs.prepareStart` receives the optional endpoint configuration and processes network/container settings, login tools, Alpine bash startup, the GPU command if enabled, browser files if configured, and the profile. Its boolean reports whether it wrote the capability to `/etc/appine/browser`.
 
-- `RunPolicy`: SLEEP (default) allows sleep; ALWAYS holds `PARTIAL_WAKE_LOCK` throughout start,
-  import, boot, running, restart, replacement and shutdown; BUSY protects those transitions and
-  distro downloads, but releases during normal running after 30 s without observed guest CPU activity.
-  Locks are not reference-counted. Legacy `keep_awake` false/true reads as SLEEP/ALWAYS until a
-  policy write saves `run_policy` and removes it; non-ALWAYS writes also save `idle_policy`.
-- `GuestActivity` compares live-plus-exited guest CPU samples from the worker's 2 s poll, excluding
-  host UI and timer CPU. Changed or failed samples renew grace; pre-reset samples are ignored,
-  delivery delayed by 2 s renews grace, and a new kernel, completed boot or policy change resets it.
-  Release/reacquisition happens on a completed poll; polling cannot wake a suspended device.
-  CPU inactivity can include network waits and scheduled work, which need ALWAYS for continuity.
-- The ongoing notification (id 1) title shows, by precedence: "Stopping services…" while exiting; the
-  import or download progress while no kernel runs; "Cannot start" after a failed start;
-  "Running in the background" while a kernel runs and no tab does; else the count of running
-  sessions ("0 sessions running" while a start is under way, except that a start after an exit,
-  because a listener came back, keeps "Stopping services…" until it ends under SLEEP,
-  as nothing refreshes the notification). A switch adds its progress, subtext
-  and a cancel action. The body shows the error reason when the title is "Cannot start", otherwise
-  the selected policy without the instantaneous wake-lock state; expanded body text wraps.
-  Privacy mode uses "Privacy mode" as the title and the selected policy in the body, hiding
-  both the state and error details, including in the expanded body.
-  The single toggle names its target: ALWAYS from either non-always policy,
-  otherwise the saved `idle_policy` (SLEEP until chosen). Settings and notification stay in sync.
-  The toggle is hidden while exiting, and "Exit all" is always there.
-- Exit all, cancel download and running-policy actions always target `TerminalService`, including
-  while locked. The `Privacy` mode-change listener clears old non-ongoing notifications via
-  `Notifications` and refreshes the ongoing notification and UI listeners. `Privacy` owns
-  authenticated mode changes without requiring a service binding: enabling clears file access,
-  revokes grants and refreshes roots; disabling restores neither access nor grants. The service
-  also refuses enabling file access while privacy is on.
+| Startup path | Failure behavior |
+| --- | --- |
+| Fresh import | An `IOException` opening the endpoint or reported by a setup step aborts the attempt. Any acquired bridge closes. |
+| Existing store | Each reported setup failure goes to `Log.w` and `Diagnostics.record` without a UI notice. Failure to open the bridge leaves it null. Failure to write the capability closes it and makes `StartedKernel.browser` null. Other failed helpers can coexist with a configured endpoint. |
+| Escaping error | An exception escaping configuration closes the bridge. Failure during subsequent private kernel setup closes it and calls `Native.stop` if a handle was acquired. |
 
-### Memory
+`Rootfs.access.write` excludes provider opens during `Native.start(store, tier, gpu)`. Availability is `gpu && Native.hasGpu(handle)`. Before publication, Alpine runs `Rootfs.ensureOpenRc` on the start thread. It checks the setup marker and installed package, and installs or resumes staged setup when needed. That path calls `Rootfs.boot`, records that inittab ran, verifies the default runlevel and marks setup complete. A post-boot verification failure retains `booted = true`.
 
-- The last listener leaving saves tabs at once and starts a 60 s timer (`trimWhenHidden`) that runs
-  `trimMemory()` on the worker: `Native.trimMemory` (the kernel's rebuildable caches),
-  `VtNative.dropImages` on every started tab other than `current` (cutting each screen's Kitty
-  images down to 4 MiB, deleting the oldest, android/vtcore), and `VtNative.compressAll` (every
-  tab's cold scrollback at once); a returning listener cancels it. `onTrimMemory` at `RUNNING_LOW`
-  and above (except `UI_HIDDEN`) runs `trimMemory()` and `saveTabs()` immediately (for Android
-  11–13 or any cached-background trim Android delivers).
-- While the UI stays visible (important on Android 14+, where foreground services do not receive
-  `RUNNING_*` or cached-background `onTrimMemory` callbacks), `BackgroundImageTrim` trims inactive
-  background tabs' Kitty image caches on tab switches: `current` is never trimmed; up to 2 most
-  recently left started tabs keep their full image cache for 60 s so quick switching back and forth
-  loses nothing; leaving a tab when more than 2 background tabs are pending immediately trims the
-  oldest pending tab on the worker; and any remaining pending background tab is trimmed once 60 s
-  elapse unseen (`trimBackgroundImages`). Already-trimmed tabs stay recorded in `backgroundImages`
-  so the 60 s `periodicSave` re-trims them before saving if a background program emitted new images
-  while unseen. Tabs also compress their own scrollback within seconds of their output, so the trim
-  mostly finds what the last few seconds left.
+OpenRC setup I/O failure aborts an import and stops the private kernel. On an existing store the callback logs it and sets `setupError` for a visible notice, allowing a repair terminal. `Rootfs.boot` runs the guest `PREFER_OSCLOCK` shell command without a console, preserving existing clock-service choices. It ignores exit status, logs exceptions, then calls `Native.boot` for inittab.
 
-### Sessions, saving and restore
+Main clears `starting` and handles destruction first. A successful late result closes its endpoint and queues `Native.shutdown` on a separate `appine-stop` thread. On a pending exit instead, it closes the returned endpoint and calls `finishExit` with the actual boot flag, or zero handle on failure.
 
-- `createSession` builds a `ConsolePty` and a `VtSession` with the next id and gives it the
-  cursor settings (`VtSession.setCursor`: the shape, a `GhosttyCursorStyle`, recorded as Ghostty's
-  `cursor-style` name, and blinking); changing either in Settings gives every tab, restored ones
-  not shown yet included, the new values at once. The shell starts when a view first knows its
-  size. A title change only calls the listeners' `onSessionsChanged`; a
-  shell's end, and opening or closing a tab, go through `sessionsChanged` (the notification's
-  count, the listeners, a save 2 s later while a kernel runs). `removeSession` releases the session
-  and takes its notification away, as `detach` and `onDestroy` do for every tab.
-- Saving (`saveTabs`, while a kernel runs): for running tabs only, the login setting and the
-  transcript (plain text, last 256 K chars; `VtSession.transcriptText`) on the main thread, and on
-  the worker the foreground group's cwd (`consoleCwd` of the tab's console, when it has one; null
-  once the shell has ended) and, for a tab whose shell started, its terminal's snapshot
-  (`VtSession.takeSnapshot`: written with `Tabs.writeSnapshot` when it changed since the last save,
-  else the file saved last, `VtSession.savedSnapshot`; none when none can be taken), with an `auto`
-  login saved as the account it resolves to
-  (`Rootfs.loginAccount`, kept in `VtSession.resolvedLogin` from the tab's first save) so a
-  restored tab logs in as the same user. Restored tabs not shown yet keep their saved transcript,
-  snapshot and cwd; the saved current tab is an index among the running tabs (0 when none is current).
-- `Tabs.save` writes temp-then-rename, as `writeSnapshot` did before it; a transcript's or
-  snapshot's name is its content digest, so unchanged ones are not rewritten; the index (with the
-  time) is skipped when its exact serialized layout (`"$current:$entries"`) matches
-  `writtenLayout`, so the saved time is that of the last save that found a change or was its
-  process's first; transcripts and snapshots no index names any more (and their leftover temporary
-  files) are deleted only after the index step (a kill at any point leaves a consistent set). A
-  `name` key in an index from versions that could rename tabs is ignored. Triggers: every 60 s, 2 s
-  after a tab opens, closes or its shell ends, when the last listener leaves, on memory trim.
-- The `running` marker, holding the process's pid, is written after each successful start and
-  removed (with saved tabs) on a normal exit; `takeKilled` loads the tabs when it is present at
-  service creation and leaves the marker and files alone, so a second kill (or a failed start)
-  before the kernel is up keeps them, and the marker still names the run they belong to. A marker
-  from an earlier version is empty (pid 0).
-- Restore, at the first successful start without a pending replacement (a failed start or a
-  replacement keeps `restore` for the next one): each saved tab reopens with its saved login
-  setting and cwd, below its terminal as saved (its snapshot, read and inflated when the tab is
-  first shown, when the index's version is this build's and it decodes; else its transcript) and a
-  yellow `[appine]` notice saying why the run ended and when the tabs were saved; the saved current tab becomes `focus`. Seven reasons are told
-  apart: low memory, too many resources in the background, force-stopped (user requested or
-  stopped), the app updated (from Android 14), a crash (Java or native) and an ANR of Appine;
-  anything else, no record or no pid gives "Android stopped the app".
+`started` installs the bridge, console tracker, login rules and auto-roots watcher, publishes `machine` and GPU availability, sets `booting`, resets guest activity, clears progress and refreshes roots. Tabs can now use the kernel. A `pendingReplace` is consumed here **before** setup notices, marker, tab restore, boot thread, network callback or poll.
 
-### What programs ask of the app
+Otherwise main updates the lock, delivers `setupError` via `tell`, calls `markRunning`, restores pending tabs once and arms the minute save. `appine-boot` calls `Rootfs.boot` only if setup did not already boot, then reads failed services either way. Its main completion checks the handle before clearing `booting`, resetting activity, updating the lock and reporting failures. Main registers the default-network callback, posts the first poll, refreshes id 1 and calls `onMachineReady(null)` without waiting for boot completion.
 
-- With privacy mode enabled, `Privacy.locked` excludes the current tab from `inFront` and drops
-  clipboard writes while locked or with no resumed page. Clipboard reads stay queued in their
-  sessions until eligible for delivery or their wait expires. The terminal independently
-  guards browser requests and input. Guest programs continue running.
-- `BrowserBridge` owns a random-port IPv4 loopback listener and per-kernel UUID capability.
-  Start creates it before `ensureBrowser` writes the guest configuration; failed/abandoned starts,
-  detach and service destruction close it. Closed endpoints cannot dispatch queued UI work.
-  Initial-netns guest AF_INET reaches Android loopback; isolated netns remap it and cannot reach
-  this endpoint. Guest AF_UNIX stays emulated (kernel/netns, kernel/unix).
-- Its single daemon worker reads two UTF-8 lines (token, URL), bounded to 64/8192 bytes and a
-  2 s total read deadline. Only authenticated HTTP(S) URLs with a host and no controls or spaces
-  reach the main thread. The callback has a 2 s wait; expired queued work is cancelled, but a
-  callback already executing is not interrupted.
-  `onOpenUrl` succeeds only with a live kernel and a listener accepting it; MainActivity requires
-  window focus and reports Android intent acceptance. The reply is `OK` or an ASCII `ERROR`.
-  This is kernel-wide, with no originating-tab identity: any guest process may ask while the
-  terminal is focused, including detached multiplexers. Background-app requests fail, not queue.
-- A bell in the tab in front (`inFront`: it is `current` and `MainActivity` is a listener, so not
-  another tab and not Settings in front) goes to the listeners' `onBell`; elsewhere it becomes the
-  tab's notification via `Notifications` (`android/reports`). An OSC 9 or OSC 777 notification
-  uses the same `onBell` haptic feedback in the tab in front, sharing the view's 100 ms bell
-  throttle and system touch-feedback setting; elsewhere it becomes the tab's notification. A
-  change of a tab's progress or program status goes to the listeners' `onTabStatus`; a program
-  status that is blocked, done or failed (`Notifications.status`) becomes the tab's notification,
-  once per status (the same record again posts nothing), unless the tab is in front, where done
-  and error count as seen at once (`VtSession.statusSeen`). A status that goes without the user
-  (the program was killed or stopped waiting) takes its notification away, unless a bell or a
-  program's notification has replaced it since. A clipboard write sets the clipboard from any tab
-  (labelled Appine), or clears it; before Android 13, which shows copies itself, a toast says a
-  program copied text. For an OSC 52 read from the tab in front, the service tries listeners
-  until one accepts `onClipboardRead(sessionId)`. Other tabs and unclaimed reads wait in
-  `VtSession`. Its 60 s timeout answers empty while waiting. Removing a tab, detaching the
-  machine and destroying the service release the affected sessions and cancel their timers.
-- tmux's control mode (tmux -CC), which the terminal detaches as it starts (android/vtcore),
-  ending (`onTmuxDetached`) is told in that tab as a yellow `[appine]` line
-  (`VtSession.showMessage`): it cannot be shown, its session goes on, and `tmux attach` brings it
-  back.
-- A command the shell's prompt marks (OSC 133) saw finish (`onCommandFinished`, timed by the
-  terminal, android/vtcore) after at least 10 s, in a tab not in front (another tab shown, or
-  the terminal Activity not listening), becomes the tab's notification via `Notifications`, as
-  Ghostty's `notify-on-command-finish = unfocused` (Ghostty's default is `never` and its threshold
-  5 s); shorter ones and those in the tab in front post nothing.
+### Failed start and distro recovery
+
+`startFailed` logs and records the exception before choosing recovery. A failed non-Alpine import with **no ready store** takes precedence. `Rootfs.deleteTarball` attempts to remove only that distro's tarball and `.part`. The service leaves a fallback notice and starts Alpine with any `pendingReplace` still pending. A startup failure after store publication does not qualify.
+
+Otherwise it consumes `pendingReplace` if present. With none, it clears progress, sets `startError`, updates lock and notification, calls `onMachineReady(error)` and checks `stopIfFailed`. That check stops a kernel-less failed service only once listeners and `switching` are absent and no start/transition/exit is active. Listener removal and a failed or cancelled download recheck it. A visible Settings UI can initiate replacement to recover.
+
+### Polling, console ownership and routes
+
+Every two seconds the main-thread `poll` captures the live handle and its tracker, login rules and auto-roots watcher. It calls `Native.bklStall` on main before queuing the batch. This read avoids the big kernel lock (BKL) and sends any watchdog record to `Notifications.stall` while the worker can be blocked. The handler schedules the next tick without waiting for delivery.
+
+The worker reads `takeListens`, an epoch-tagged `takeKills`, `takePower`, `processes` and `takeChangedDirs`. A non-null directory array goes to `Documents.dirsChanged`. `Documents.AutoRootsWatcher.poll` also runs when the array is null. With a ready store, file access and `auto` login, it baselines the resolved home, checks passwd metadata and the home's parent, and refreshes roots on a changed home. `Rootfs.LoginRules.poll` samples its own inputs, avoids overlapping refreshes, spawns any needed guest refresh on the worker and acknowledges the inputs after a separate waiter sees success. Last come `guestCpuTime` and an elapsed-realtime timestamp.
+
+Main discards its posted batch if the handle changed. Document and login-rule work has already run. Otherwise main samples CPU, updates the lock, dispatches listens and kills, then handles power. Reboot calls `restart`, halt/off call `exitAll`. In the default branch, idle exit requires zero running sessions, zero listeners and zero sampled guest processes (init and zombies excluded). A restored tab still waiting to start counts as running. An ended tab may remain listed.
+
+`ConsoleTracker.open` increments its epoch before opening. `take` drains `Native.takeKills` with the current epoch under the same monitor. `close` closes the console, drains the entire kill queue, records the inclusive closing epoch, then advances it before unlocking. It forwards the drain outside the monitor. Main checks the original handle. Poll has an epoch-zero fallback if no tracker exists.
+
+`reportKill` requires seven tab-separated fields and numeric console and PID. `sessionForKill` matches a still-listed session through `ownedConsoleAt`. The console number must match and be nonnegative. The observation must fall at or after its positive opening epoch and at or before its closing epoch (zero while open). Reuses of a number have disjoint intervals. An ended tab can own an earlier report. Only successful insertion of the yellow `[appine]` line into the tab in front suppresses an ordinary notification. An alternate screen can refuse it. `bug` records always go to `Notifications.kill` with the report fields.
+
+The default-network callback queues `Native.setRoutes` on the worker. `routes` serializes hex destination/prefix, hex gateway or `-`, and interface with link-property fallback. It skips missing interfaces and, from API 33, non-unicast routes. Network loss sends an empty array.
+
+### Running policy and notification
+
+`updateWakeLock` acquires or releases a non-reference-counted `PARTIAL_WAKE_LOCK` tagged `appine:keep-awake`. Transitions are `starting`, `transitioning`, `booting` and `exiting`.
+
+| Policy | When to hold |
+| --- | --- |
+| SLEEP | Never. |
+| ALWAYS | A published kernel or any transition. |
+| BUSY | Any transition, active `switching` download, or a published kernel within guest activity grace. |
+
+`GuestActivity` compares guest CPU nanoseconds including exited threads. A first or changed value (in either direction) renews activity. An unchanged valid sample preserves it. A negative value renews grace and clears the baseline. Samples older than `activeAt` are ignored first. Delivery at least two seconds late resets grace at receipt and discards the sample. Publication, same-machine boot completion and a policy change also reset it. At 30 seconds idle `isBusy` becomes false. A completed poll can release or reacquire the lock while Android is awake. Polling cannot wake a suspended device.
+
+Notification 1 opens `MainActivity`. Its ordinary title uses the first matching row.
+
+| Condition | Title |
+| --- | --- |
+| Exiting | “Stopping services…” |
+| No machine and non-null `progress` | Preparation or import progress text |
+| No machine, no progress and `startError` | “Cannot start” |
+| Live machine and zero running sessions | “Running in the background” |
+| Otherwise | Running-session count, including zero during startup |
+
+The “Cannot start” body shows the error reason. Every other state shows the selected policy label. Expanded `BigTextStyle` uses exactly the same text. Privacy mode always uses “Privacy mode” for the title and the policy label for both bodies, even when unlocked. A switch adds Cancel and, outside privacy, download subtext and determinate progress for a positive total. A download alongside a live kernel keeps the machine's state title.
+
+Exit all is always available. Unless exiting, one action offers ALWAYS from SLEEP/BUSY, or the remembered idle policy from ALWAYS. `setRunPolicy` writes a changed choice, resets activity, updates the lock and calls `settingsChanged`. `updateNotification` returns if destroyed. On configuration change the service reposts id 1 only when `Notifications.createChannels` detects changed locales and refreshes channel names.
+
+### Sessions and guest requests
+
+`createSession` pairs a `ConsolePty` (machine, login, cwd and tracker) with a `VtSession` (next ID and `sessionEvents`) and applies cursor defaults. The first view size starts the shell. Opening, closing or finishing a shell refreshes the count and debounces a save. Title changes only notify listeners. `removeSession` releases the tab, removes its unshown/trim state, clears `current` if necessary and cancels its notification.
+
+`inFront(session)` requires identity with `current`, a registered `MainActivity` and `!Privacy.locked(this)`. With privacy enabled, an app still locked, an unavailable device or the absence of a resumed protected page closes that gate. Assigning `current` cancels the selected tab's notification and bell/status bookkeeping, and marks done/error records seen when in front.
+
+| Event | Routing |
+| --- | --- |
+| Bell or OSC 9/777 notification | In front, call listeners' `onBell` for haptics. Else delegate to `Notifications.bell` or `program`. Background bells are throttled to one per second per tab. |
+| Progress or OSC 7501 status | Notify listeners via `onTabStatus`, then call `Notifications.status`. Changed blocked/done/error records can post the tab notification. In front, done/error count as seen. When an eligible status disappears, withdraw only the notification it still owns. A posted bell, program notice or qualifying finished command clears that ownership. |
+| OSC 133 command finish | `onCommandFinished` forwards the exit code and duration when the tab is outside the foreground. `Notifications.commandFinished` posts at **10 seconds or longer**. Unknown, zero and nonzero codes select finished, succeeded and failed respectively. |
+| OSC 52 write | Any tab can write unless `Privacy.locked`. Null clears the primary clip. Text sets an app-labelled plain-text clip. Only copies on API levels below 33 add an app toast. |
+| OSC 52 read | The session queues the read. In front, the service offers `onClipboardRead(sessionId)` until a listener accepts. Unclaimed reads wait until the owning tab can claim them or the first read's 60-second deadline answers empty. On selection/resume/focus the activity can retry. It checks both current-session references, resume, focus and privacy before claiming and reading. Claim cancels the timer. Empty text is answered directly, other text gets a prompt. Release clears the queue and timer. |
+| tmux control detach | `onTmuxDetached` attempts `showMessage` in that tab (the alternate screen can suppress it). The `[appine]` notice explains that the session continues and `tmux attach` reattaches. No notification fallback. |
+
+### Guest browser endpoint
+
+`BrowserBridge` listens on `127.0.0.1` with an OS-selected port and backlog four. Its configuration is the port and random UUID token on separate LF-terminated lines. A single `appine-browser` daemon handles one client at a time. Requests carry no tab ID. Programs in a multiplexer can use the guest launcher independently of terminal output.
+
+`serve` reads two strict UTF-8 lines sharing one two-second deadline. The credential limit is **64 bytes**, the URL limit **8192**, excluding LF. Only an authenticated, parseable lower-case `http` or `https` URI with a host, no whitespace or ISO controls, and port absent or 0–65535 reaches dispatch. A normal reply is `OK` or a single `ERROR` line. A disconnected or timed-out socket can end without a reply.
+
+`launch` posts a `FutureTask` and waits up to **another two seconds**. The task checks closure. The service requires a live machine, `!destroyed` and a listener accepting `onOpenUrl`. `MainActivity` checks privacy, window focus and browser intent acceptance. The worker removes the callback and uses `cancel(false)` after the wait. Already executing UI work may finish. `close` marks the endpoint closed once and closes the server and active socket, interrupting socket I/O and gating queued dispatch.
+
+### Saving and restoring tabs
+
+`saveTabs` captures live tabs and transcripts on main. The selected index is relative to running tabs, default zero. A restored tab without a terminal uses `unshown` for its old transcript, cwd and snapshot. On the worker, a nonnegative console supplies `Native.consoleCwd` and `snapshotOf`. A null `takeSnapshot` reuses `savedSnapshot`, empty clears it, and new bytes go to `Tabs.writeSnapshot`. For `auto`, the first save caches `Rootfs.loginAccount`'s resolved name in `VtSession.resolvedLogin`.
+
+| File in `files/tabs/` | Contract |
+| --- | --- |
+| `running` | `markRunning` writes this process's PID before restoring tabs or replacing the old index. |
+| `t-<hash>.txt` | Last 256 × 1024 Kotlin characters. The hex digest is the first 128 bits of SHA-256 over their UTF-8 bytes. Load follows the indexed name, including legacy `t<i>.txt`. Missing file gives empty text. |
+| `s-<hash>.snap` | Same digest convention over raw snapshot bytes, then DEFLATE at `BEST_SPEED`. Read errors and results over **16 MiB inflated** log a warning and return null. |
+| `index.json` | `vt` is `VtNative.version().orEmpty()`. `time`, `current` and ordered `tabs` describe the layout. Entries contain login, cwd (empty for absent), transcript filename and optional snapshot filename. A legacy `name` key is ignored. |
+
+Snapshot and layout writers synchronize on `Tabs`, reuse existing blobs, and rename new temporary files into place. `Tabs.save` writes transcripts before the index, compares the exact serialized `"$current:$entries"` to `writtenLayout` and rewrites the index if different or absent. A match leaves the previous save time. Only after the index step does it prune unreferenced transcripts, snapshots and their matching temporary files. A kill before index replacement can leave extra blobs while the old index still names its own files.
+
+Saves run every minute, two seconds after the last tab open/close/shell end, on last-listener removal and on qualifying memory pressure. Restore creates a fresh session for each saved login and cwd. Matching VT version and file existence qualify a snapshot for lazy inflation on first show. Failed reads or decode fall through to a new terminal with the normalized transcript. A yellow notice gives the previous exit reason and save time before new shell output. `focus` uses the saved index, falling back to the last tab. Guest processes from the previous run are lost.
+
+### Memory trimming
+
+When `current` changes, `BackgroundImageTrim` removes the selected ID from both sets and records the previous tab if still open and started. `MAX_RETAINED` (two) caps recently left, started tabs awaiting the 60-second (`DELAY_MS`) trim deadline; overflow evicts the oldest pending ID and queues it for immediate trim. `trimBackgroundImages` drains due IDs and schedules the next deadline. Revisiting a pending tab cancels its deadline. `periodicSave` re-trims already-trimmed, still-unseen IDs before each minute save since background output can add images.
+
+The last listener leaving saves at once and arms a separate 60-second `trimWhenHidden` timer. A returning listener cancels it. `onTrimMemory` at or above `TRIM_MEMORY_RUNNING_LOW`, except `TRIM_MEMORY_UI_HIDDEN`, calls `trimMemory()` and `saveTabs()` immediately. With a live kernel the full trim selects started VT handles other than `current`, marks their IDs trimmed and cancels the background deadline. The worker runs `Native.trimMemory`, `VtNative.dropImages` for the selected handles, then `VtNative.compressAll` for cold scrollback. Each image trim temporarily reduces Kitty storage to 4 MiB per screen. Selection and hide timers operate without a system pressure callback.
+
+### Exit, restart, replacement and destruction
+
+`detach` closes the bridge and unregisters network callbacks. It clears `machine`, `gpuAvailable` and `booting` before releasing tabs so the UI sees the departing kernel. It updates the lock, cancels poll and minute save, releases sessions, drops per-machine trackers/watchers and calls `sessionsChanged`, which cancels `saveSoon`. `releaseSessions` releases each VT, cancels its notification and clears `sessions`, `unshown`, `current` and image tracking. The caller receives the old handle.
+
+- `exitAll` marks exiting once, cancels any switch, clears `pendingReplace`, calls `onExitAll`, then clears UI listeners before detach. A start or transition in progress finishes the exit. Otherwise `finishExit` queues graceful `Native.shutdown` for a published kernel. A start result explicitly marked unbooted uses `Native.stop`. Main clears `exiting`, updates the lock and clears saved tabs unless `restore` still holds a killed layout. A newly attached listener triggers `startOrImport`, otherwise `stopSelf`.
+- `restart` needs a published machine. It sets `transitioning`, detaches, calls `onRestarting` and queues shutdown. On return it clears `transitioning` and calls `finishExit(0)` if exiting, otherwise `start(null)`.
+- `canSwitch` requires neither a visible switch nor an unfinished downloader, plus a machine or `startError`. `switchTo` sets both download references. `appine-download` calls `Rootfs.download` while the current guest stays available. `cancelSwitch` marks the download cancelled, clears `switching`, updates lock/UI and checks `stopIfFailed`. The `downloader` slot stays occupied until completion. Only a still-current switch may use its result. A download failure other than cancellation leaves a notice.
+- A completed download replaces immediately if a machine or `startError` exists. Otherwise, during `starting` or `transitioning`, it sets `pendingReplace`. `replace` clears login, revokes document grants and refreshes roots, sets `transitioning`, detaches and clears `startError`. The worker hard-stops any old kernel, resets the store, revokes grants and refreshes roots again. Main clears `transitioning` and starts the selected distro even if exit arrived during reset (that start hands its result to the pending exit). If deletion leaves the old `meta.db` in place, startup can reopen the previous distro.
+- `onDestroy` removes the privacy listener, sets `destroyed`, closes the bridge, cancels any switch and removes trim, poll and save callbacks. It clears `Tabs` unless a killed layout awaits restore, unregisters network monitoring, clears the handle and GPU availability, releases sessions and drops watchers. A remaining handle gets best-effort shutdown on the worker before executor shutdown and wake-lock release. The explicit UI-listener clear belongs to `exitAll`. A private start finishing after destruction uses `appine-stop`.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `MainActivity` (`android/terminal`), `SettingsFragment` (`android/settings`: start and bind,
-  listeners, setters, state); `VtSession` (`android/vt`: `Events`); ongoing notification
-  `PendingIntent`s; `ConnectivityManager`; system trim callbacks; `Documents` (`android/documents`),
-  `MainActivity`, `Notifications` and `Diagnostics` (`android/reports`), and `Privacy`
-  (`android/privacy`) reading `Settings`.
+- Android lifecycle and network callbacks, notification actions, and the service declaration in `android/build`.
+- `MainActivity` (`android/terminal`) and `SettingsFragment` (`android/settings`) bind and listen. The activity connects tabs and preferences to UI controls.
+- `VtSession.Events` and `ConsolePty` (`android/vt`) deliver program events and console transitions, and `android/vt` reads `Tabs.MAX_TRANSCRIPT`. `android/setup` uses `BrowserBridge.CONFIG_PATH`, and the guest browser client in `android/native` connects using that launcher configuration.
+- `android/documents`, `android/privacy`, `android/terminal`, `android/settings` (`Settings.privacyMode`) and `android/reports` read `Settings`. `Privacy` also writes the mode.
 
 ### Outbound
 
-- `Notifications` and `Diagnostics` (`android/reports`: channels, non-ongoing notifications,
-  copy-report forwarding, fault retention).
-- `Native` (`android/native`: start, boot, spawn, waitFor, shutdown, stop, trim, the poll's calls,
-  `bklStall`, routes, `consoleCwd`); `VtNative.compressAll` and `dropImages`, and `VtNative.version`
-  through `Tabs` (`android/vtcore`); `Rootfs` (`android/setup`: readiness, importing, prepare,
-  download, mirrors, ensure-files, profile, access lock, store, reset, failed services, rules
-  refresh, login accounts); `Tabs`; `VtSession` and `ConsolePty` (`android/vt`); `Documents`
-  (`android/documents`: `rootsChanged`, `dirsChanged`, `revokeAccess`); `Privacy`
-  (`android/privacy`).
-- Android: `ActivityManager` (exit records), `PowerManager`, `NotificationManager`,
-  `ConnectivityManager`, `ClipboardManager`, the `settings` preferences, `BuildConfig`.
+- `android/native` exposes kernel JNI through `Native`. `android/setup` owns store locking, import, boot helpers, distro/cache operations, account resolution and login-rule refresh.
+- `android/documents` supplies directory/root notifications, the auto-roots watcher and grant revocation. `android/privacy` supplies lock state and mode-change callbacks.
+- `android/vt` owns sessions, PTYs and clipboard queues. `android/vtcore` supplies VT version, snapshots, compression and image trimming. Tab controls, extra keys, file import, view, gestures and rendering belong to their respective UI modules.
+- `android/reports` supplies channels, event notifications, legacy report copying and diagnostics. Android supplies exit records, foreground notifications, wake locks, network routes, clipboard and preferences.
 
 ## Invariants and gotchas
 
-- Debug and release builds share the saved tier preference; a Tier 0 choice from an earlier
-  debug install is also honoured by a release build when that preference is retained.
-- Normal background kernel work goes through the single worker, so polls and saves are
-  ordered before stop and shutdown; `Native.start` runs on `appine-start`, the boot for OpenRC installation on
-  that same thread and ordinary boots on `appine-boot`, a tab's console opening on the main thread. If destruction races a start,
-  its abandoned handle is shut down on `appine-stop`. A stale kernel handle is harmless
-  (the JNI table no longer finds it). A call that must answer while the BKL is stuck (`bklStall`)
-  must not take it and runs on the main thread.
-- Poll results posted to the main thread are dropped if the kernel changed meanwhile
-  (reports fetched just before a restart are lost). While a hold of the BKL lasts, the poll keeps
-  queueing fetches behind it on the worker, which run back to back once it ends.
-- Android names low-memory kills only where `isLowMemoryKillReportSupported`; elsewhere they are
-  plain signals, as is a `SIGKILL` from anyone, and get the general notice. Exit records are kept
-  for a limited number of processes per app, so a run killed long ago may have none.
-- `exitAll` clears listeners at once so that a quick shutdown is not mistaken for the user
-  returning.
-- An `exitAll` during a start, restart or replace leaves the rest of the exit to them: every path
-  that ends `starting` or `transitioning` must check `exiting` (a replacement does so through the
-  start it ends with), or the service stops with a kernel still running (or never stops).
-- A download thread that outlives the service posts to the
-  main thread after `onDestroy`: it reaches notification 1 only through `updateNotification`, which does nothing once
-  destroyed, so a new way of posting it must go through that too. Ongoing notification id 1 must
-  not collide with `android/reports`'s notification id ranges.
-- `removeSession` and `releaseSessions` clear `current` when it refers to a removed session and
-  update `backgroundImages` / cancel `trimBackgroundImages`; `trimMemory` and `dropImagesForIds`
-  also verify `it !== active` and `it.tab != 0L` before dispatching `VtNative.dropImages` to the
-  worker, so `current` is never trimmed and closed or unstarted tabs are never passed to native.
-- The marker is rewritten at a start before the first save replaces the old run's index, so a kill
-  in between restores the old tabs again; tabs of a killed run kept through a replacement are
-  restored into the new distro, where their directories may not exist.
+- Poll ticks can accumulate behind a held BKL and run back to back. Console epochs distinguish reused numbers within a kernel. Handle checks distinguish different kernels.
+- A listener added after `exitAll` clears the list represents a returning UI, even if the original activity has yet to reach `onStop`.
+- A pending replacement preserves the killed run's layout. Restore can request a login or directory absent from the replacement distro.
+- A kill between `markRunning` and the first new index can pair the new PID with the previous layout. An unchanged layout retains the time of its last index write.
+- Under SLEEP a ready-store restart after Exit all can leave “Stopping services…” posted until the next notification refresh. Clearing `exiting` and starting without import progress need not change the wake lock or repost id 1.
+- Direct `onDestroy` calls `Tabs.clear` before `worker.shutdown()`, so an already-queued save can recreate an unmarked index and blobs; the next `takeKilled` clears them because no `running` marker is written.
 
 ## Confirmed bugs / technical debt
 
-None.
+- The image-trim paths exclude `current` when selecting VT handles on main. If the worker is backed up and the user returns to one of those tabs after selection, the queued `dropImages` can trim images in the now-visible tab. It does not recheck selection at execution.
+- An `auto` tab's first save resolves the account independently of `login.sh` starting its shell. If account selection changes between those events, `resolvedLogin` can persist a different user and restore the tab under that account.
+- `saveTabs` captures live sessions and transcripts on main and then queries `Native.consoleCwd` by console number on the worker without checking console epochs, so a reused console number can pair an older tab's transcript with a newer tab's working directory.
+- `Rootfs.reset` logs failed deletion without aborting `replace`; if the old `meta.db` survives, `Rootfs.prepare` returns early and startup can reopen the previous distro instead of importing the selected one.
+- Neither `replace`'s nor `restart`'s `main.post` continuation checks `destroyed`. If `onDestroy` already ran, calling `start` reacquires the BUSY/ALWAYS wake lock without the destroyed-start branch releasing it, and a `restart` continuation seeing `exiting` submits `finishExit(0)` to the already-shut-down `worker` executor.
 
 ## Open questions
 
@@ -434,8 +219,5 @@ None.
 
 ## To verify
 
-- The ongoing notification's state title, error or running-policy body and expanded text have not
-  been checked on a device, including long startup errors and privacy mode.
-- Foreground program-notification haptics on physical devices, including touch feedback disabled.
-- Screen-off power consumption and reacquisition on physical devices; busy/idle lock transitions
-  and notification toggling were exercised on an API 34 emulator, not across real device suspend.
+- Check id 1 on a device for a long startup error in collapsed and expanded layouts, privacy redaction during a download, and a locale change while the service is running.
+- Check BUSY lock release and reacquisition across physical device suspend, and foreground bell/program haptics with system touch feedback enabled and disabled.

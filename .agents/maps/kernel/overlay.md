@@ -3,267 +3,351 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/overlay.md` for the paired decision history (decisions from before the split are D39, D40 and D49 in `.agents/decisions/kernel/vfs.md`, and D45 and D46 in `.agents/decisions/kernel/process.md`).
 >
-> Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
->
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: persistent copy-up origins, impure directories, inode flags and scoped node holds)
+> Verified: 2026-11-26 (full refresh; 15 adversarial claims independently verified — 12 confirmed, 3 partial, 0 refuted; all partial statements, audit findings and confirmed bugs applied)
 
 ## Responsibilities
 
-`kernel/overlay` is overlayfs (6.1's `fs/overlayfs`), a third kind of VFS node beside store and
-synthetic nodes:
-
-- mount(2) of type `overlay`: options, layers and their checks, the work directory, read-only
-  instances without an upper layer, and the superblock options mountinfo shows;
-- lookup through the layers (whiteouts, opaque directories), node identity and lifetime, and the
-  sweep of removed nodes;
-- readdir merging, stat, statfs and the overlay's own xattrs;
-- copy-up, and creating, removing and renaming through an overlay;
-- opening files through an overlay and following a file to its copy.
-
-Root: `core/kernel/src/vfs/overlay.rs`; the overlay methods of `Vfs` in `vfs/mod.rs` (`new_overlay`
-to `overlay_readdir`, `sweep_overlays`); in `syscall/fs.rs` `open_overlay`, `follow_copy_up`,
-`copy_up`, `unlink_overlay`, `link_overlay` and `rename_overlay`; in `syscall/mount.rs` the overlay
-options (`overlay_layers`, `overlay_dir`) and the node sweep at syscall end.
-
-Outside the module: the walk, attribute and namespace syscalls that branch into this module, and
-the rules every file operation keeps for overlay nodes (`kernel/vfs`); opens (`kernel/files`) and
-truncations (`kernel/fileio`) that branch into it; store transactions,
-objects shared by copy-up and whiteout inodes (`kernel/store`); the mount table, `collect` and
-mountinfo (`kernel/mount`); inotify on overlay nodes (`kernel/inotify`); locks keyed on overlay
-nodes (`kernel/locks`); syscall numbering for the sweep (`kernel/process`); a program's `exe_file`
-holding its node (`kernel/exec`).
+The overlay presents an ordered set of store directories as one filesystem. Reads resolve a visible
+name through its layers. Namespace and metadata changes go to an optional upper directory. The
+module owns the layer options, merged lookup and listing, copy-up, whiteouts, overlay identity,
+and reclamation of cached names. Its root is `core/kernel/src/vfs/overlay.rs`. The VFS and syscall
+adapters connect these operations to mounts, open files, permissions, tmpfs quotas and watches.
 
 ## Key types
 
-- `Overlays` (`vfs/overlay.rs`) — `Instance`s by device number (upper and lower roots, the mounter's IDs, the
-  tmpfs instances its layers are in, `Options`, and `origins` mapping copied-up upper inodes to
-  validated lower origins for this mount) and `OvlNode`s by `OvlId` (Linux's
-  overlay dentry: parent and name, upper inode, lower inodes — every merged lower directory for a
-  directory, the topmost otherwise — `origin`, children looked up, LRU `seen` clock, and `touched`
-  syscall stamp), plus orphans stamped with the syscall count and the orphan/live sweep thresholds
-  (`ORPHANS_MIN` = 1024, `NODES_MAX` = 16384, `NODES_TARGET` = 12288). Ids are per kernel, never
-  reused.
-- `overlay::Hold` — an open file's or running program's claim on an overlay node, in one static
-  table for every kernel in the process (a hold in another kernel can only delay a sweep).
-- `Node::Overlay(MountId, OvlId)` (`kernel/vfs`); `OpenFile::ovl`, `ovl_holds` and `ovl_lower`;
-  `fs::Attrs::Overlay`.
+- `Node::Overlay(MountId, OvlId)` identifies a cached name and the mount through which it was
+  reached. `Overlays` allocates increasing IDs across instances in one VFS. Bind mounts share the
+  instance and its node IDs.
+- `Instance`, indexed by overlay device number, holds the upper root, ordered lower roots, mounter
+  filesystem IDs, pinned tmpfs devices, `Options` and an upper-to-lower inode cache (`origins`).
+- `OvlNode` holds the parent ID, name, instance device, upper and participating lower inodes,
+  validated origin, cached children, recency clock (`seen`) and syscall stamp (`touched`). The
+  instance root is its own parent. `real()` selects the upper or first lower inode.
+- `CopyUp::{All, Copied, NoData}` select share-if-possible, immediate data copy, or metadata with an
+  empty regular-file object. `Attrs::Overlay` carries the overlay ID through attribute changes.
+- `Hold` increments a process-wide reference count by overlay ID and decrements it on drop.
+  `OpenFile::ovl` records overlay identity for supported backing-file kinds, `ovl_holds` owns
+  references to named nodes, and `ovl_lower` keeps a replaced host handle alive. `ExeFile::ovl`
+  includes a hold on the executed overlay node.
 
 ## Public entry points
 
-- **Instances and nodes**: `Vfs::new_overlay`, `overlay`, `overlay_stat`, `overlay_readdir`,
-  `overlay_upper`, `overlay_remove`, `overlay_rename`, `overlay_child`, `overlay_prefix`,
-  `sweep_overlays`; `Overlays::upper_of` (copy-up), `remove`, `rename`.
-- **Syscall paths**: mount(2) of type `overlay`; `open_overlay`, `follow_copy_up`, `copy_up`,
-  `unlink_overlay`, `link_overlay`, `rename_overlay`; overlay branches of creation, attribute
-  changes and readdir in `kernel/vfs`, of opening in `kernel/files`, of truncate in
-  `kernel/fileio`, of `mmap` in `kernel/mm` (`syscall/mem.rs`), and of xattr calls in
-  `kernel/xattr`.
+- Mounts and traversal use `overlay_layers`, `overlay_dir`, `Vfs::new_overlay`, `overlay`,
+  `overlay_child`, `overlay_stat`, `overlay_readdir` and `overlay_prefix`. `overlay_child` returns the
+  overlay child before crossing any mount on it.
+- File and namespace syscalls use `open_overlay`, `follow_copy_up`, `copy_up`, `unlink_overlay`,
+  `link_overlay` and `rename_overlay` in `syscall/fs.rs`. `Vfs::overlay_upper`, `overlay_remove` and
+  `overlay_rename` delegate to `Overlays::upper_of`, `remove` and `rename`.
+- `syscall::mount::sweep_overlays` gathers external references and calls `Vfs::sweep_overlays`.
+  `Overlays::remove_instance` handles whole-instance teardown during mount collection.
 
 ## Data flow / lifecycle
 
-### Mounting
+### Mount creation and visibility
 
-- mount(2) of type `overlay` follows 6.1's `ovl_parse_opt` and `ovl_fill_super`: options split at
-  unescaped commas, empty ones skipped, unknown ones or missing values `EINVAL`, the last of a
-  repeated one wins; `workdir`, `index` and `volatile` without `upperdir` ignored; conflicting
-  `metacopy`, `nfs_export`, `index`, `redirect_dir` and `userxattr` `EINVAL`, the accepted ones
-  changing nothing else. `lowerdir` is split first at unescaped colons (missing, an empty
-  component or over 500 `EINVAL`). Then upper layer and work directory: both or neither, non-empty,
-  upper not on a read-only mount, both on one mount, neither inside the other (`EINVAL`); without
-  an upper layer at least two lower layers (`EINVAL`); each lower layer then resolves, none inside
-  the upper layer or work directory (`ELOOP`). Each layer resolves from the caller's root and cwd,
-  following links, and must be a store directory on a mount of the caller's namespace with no
-  locked mount under it (`EINVAL`, also for synthetic or overlay directories;
-  `clone_private_mount`'s checks). The work directory gets an empty `work` (mode 0, the
-  mounter's; an old one removed) that nothing uses: copy-up builds in place in one store
-  transaction. An instance keeps the tmpfs instances its layers are in from being collected.
-- Without an upper layer it is read-only as a filesystem (`sb_readonly`): `ro` in mountinfo's
-  superblock options (the mount's own flags as given), read-only in `/proc/<pid>/mounts` and
-  statfs; every change is `EROFS` after creation's `EEXIST`, also through a bind remounted
-  read-write, and remounting it read-write is `EROFS`. Superblock options are `lowerdir`,
-  `upperdir`, `workdir` as given, then what differs from 6.1's defaults (`ovl_show_options`;
-  `xino` parsed, never shown), escaped as `seq_show_option` does.
+`Options::parse` splits on unescaped commas, skips empty options, and uses the last supplied
+value for a repeated key. Unknown keys, malformed switches and invalid enum values yield
+`EINVAL`. With no upper, parsing discards workdir, index and volatile before checking conflicts.
+`metacopy=on` conflicts with explicit redirect off or nofollow. `nfs_export=on` conflicts with
+explicit index off or metacopy on. `userxattr` conflicts with index on, metacopy on or redirect on.
 
-### Lookup and node lifetime
+After mount resolves and checks the target and parses options, `overlay_layers` checks lower-path
+syntax first. It splits on unescaped colons and unescapes each component. A missing or empty
+component or more than 500 lower paths gives `EINVAL`. An upper requires nonempty upper and work
+paths. It resolves the upper and checks writability before resolving work. Both must use the same
+mount ID and neither directory may equal or contain the other. Without an upper, at least two lower
+paths are required. Each path resolves from the caller's root and cwd, following symlinks. A layer
+must be a store directory in the caller's mount namespace with no locked child mount under it.
+Path-resolution errors propagate.
 
-- Lookup (`ovl_lookup`): the upper inode, then each lower directory merged into the parent; a
-  whiteout (char 0:0) is `ENOENT`; a non-directory ends the search and hides what is below a
-  directory; an opaque directory (`trusted.overlay.opaque` = `y`, or `user.overlay.opaque` with
-  `userxattr`, in any layer) ends it after itself. One directory and name give one node, its
-  inodes refreshed on each lookup. An upper origin handle encodes `OVL`, version 1 and a little-endian
-  lower store inode. On a cache miss the inode must be older than the upper, live, of the same type
-  and under a mounted lower root. A non-directory must have one lower link. Invalid handles are ignored.
-  Mounts inside a layer are not seen through the overlay.
-- Node lifetime: active nodes stay cached while referenced; unused live nodes and removed nodes are
-  reclaimed by `sweep_overlays` at the end of a syscall. A removed name (unlink, rmdir, a replacing
-  rename) makes it an orphan no lookup finds; once 1024 orphans gather (then twice as many as the
-  last sweep left), or once total cached nodes exceed `NODES_MAX` (16384; backing off with at least
-  25% / `NODES_HEADROOM` above remaining live nodes when the pinned working set exceeds
-  `NODES_MAX`), `sweep_overlays` runs:
-  - an orphan goes, with every node below it, unless it or a node below is held (`Hold`), is a
-    process's root or cwd, a mount's root, point or recorded file-mount directory (`Mount::at`,
-    `Mount::root_at`, detached ones too via `Vfs::mount_nodes`), watched by inotify, or was
-    removed at or after another thread's syscall began — unless that syscall waits only on files it
-    holds (`waits_on_files_only`: I/O, polls, child and signal waits, sleeps, futexes, locks,
-    receives and accepts, fcntl, ioctl, fsync, copy_file_range, IPC, AIO events), as
-    `kernel/process` numbers syscalls;
-  - when total cached nodes still exceed `NODES_MAX`, unused live leaf nodes are evicted
-    least-recently-used down to `NODES_TARGET` (12288) and detached from their parent's `children`,
-    keeping instance roots, all kept/held/orphan nodes, any node touched at or after `oldest`
-    (every `Overlays::node`/`node_mut`/`add_node` stamps `touched`; `open_overlay` also holds a
-    scoped `Hold` on the node and its original overlay parent across lease breaks and FIFO opens),
-    all ancestors of pinned nodes and surviving orphan subtrees; `Instance::origins` preserves copied-up upper-to-lower inode numbers
-    across eviction for both `stat` and `readdir` while mounted.
-  A sweep gives up for the round when a task's resources or the inotify registry are borrowed. An
-  instance and its nodes go in `kernel/mount`'s `collect` once it has no mount. After an
-  executable's name is removed, opening its procfs exe link reads the pinned host file and keeps
-  the overlay node for metadata and locks. Write opens and truncation still check the mount and
-  executable.
+After resolving **all** lowers, the overlap check returns `ELOOP` for a lower equal to or beneath
+upper or work. Mount setup replaces any existing `work/work` tree in a store transaction with an
+empty directory of mode zero owned by the mounter's fsuid/fsgid. This precedes `plan_attach`, so a
+later attachment-planning failure can leave the reset visible. Copy-up subsequently creates objects
+directly in the upper. `new_overlay` installs the instance root on its new mount device. The
+instance records tmpfs pins while resolving upper, work and lower paths in that order.
 
-### readdir, stat and xattrs
+A lower-only instance contributes `RDONLY` to its superblock flags across all binds. A read-write
+filesystem remount returns `EROFS`. A bind remount can change per-mount flags while effective
+access stays read-only. Mountinfo displays the mount and superblock flags separately. The mounts
+listing and statfs include effective read-only status. `Options::show` emits the supplied layer
+paths with mount-option escaping, then selected nondefault options. It omits `xino`.
 
-- readdir merges the layers' entries sorted by name (even from one layer), the highest layer's
-  entry per name, whiteouts hiding names below, each inode number the one stat shows. Stat is the
-  topmost inode's with the overlay's device number and the inode number of the lower inode a
-  directory, or a file with one lower link, was copied up from. In impure upper directories, including
-  merged ones, readdir resolves upper entries from cached or persisted origins. A cold listing also
-  checks entries in an unmarked directory. Additional upper hard links retain the same number. A merged directory
-  reports one link. Reads, readlink, exec, search permission and xattr reads use the topmost
-  inode; the overlay's own attributes (`trusted.overlay.*`, `user.overlay.*` with `userxattr`) are
-  `EOPNOTSUPP` to get or set (`ovl_own_xattr_get`/`_set`) and hidden from listings. statfs reports
-  overlayfs's magic with the store's capacity, even with the upper layer on a tmpfs.
+### Lookup, origin and directory listing
 
-### Copy-up
+Lookup probes the upper child, then the parent's lower directories from highest to lowest. A
+character device with zero device number is a whiteout. An upper whiteout makes the name absent.
+A lower whiteout stops the scan while preserving any already found higher directory. A
+non-directory wins only as the first visible entry and stops the scan. A looked-up child directory
+contributes to the merge through the first directory marked `opaque=y`, inclusive; instance
+construction installs all supplied lowers on the root without checking root opacity, and root
+`readdir` iterates all of them. Marker names use the instance's private prefix, `trusted.overlay.`
+by default or `user.overlay.` with `userxattr`. Layer traversal uses store lookups, so submounts
+inside those directories are invisible. Directory search, readlink and executable loading use the
+topmost real inode.
 
-- Copy-up (`Overlays::upper_of`, `ovl_copy_up`): parents first, then the node as its topmost lower
-  inode is (directory; regular file sharing the lower object, as 6.1 clones with reflink; symlink;
-  special file), with mode (set-id bits too), owner, inode flags, non-overlay attributes and times in one store
-  transaction. For a directory or a singly linked lower file it also writes `trusted.overlay.origin`
-  on the upper and `trusted.overlay.impure=y` on the parent before restoring its times. Both use
-  `user.overlay.*` with `userxattr`. Sharing marks both inodes held, so a later write
-  open of either first gives it an object of its own. The syscalls copy up through
-  `syscall::fs::copy_up`, which, as `try_share` does, copies a regular file's data instead
-  (`CopyUp::Copied`) when a writable shared mapping or the Files app could write the lower object in
-  place. A tmpfs upper also copies a lower inode with tracked tmpfs pages. It carries over
-  instantiated pages within EOF and leaves unused reservations in the lower layer. The store also falls
-  back to copying if either object carries a store mapping pin,
-  including a read-only mapping in another kernel. After sharing it rehomes the lower file's descriptions open for writing (`cow`); a rename
-  copies up the files it moves that way first. A non-directory then forgets its lower inodes; a
-  copied-up directory keeps them and stays merged (one link, rename `EXDEV`). A file opened with
-  `O_TRUNC` or truncated to 0 is copied without data. chmod, chown, utimensat (`Attrs::Overlay`),
-  setxattr, removexattr, truncate and write opens check `EROFS` and permission on what the overlay
-  shows (the last two also check `ETXTBSY` against the backing inode and the running overlay node across copy-up), copy up only then, and
-  change the upper inode. utimensat by fd goes by number, never through the open (possibly lower)
-  object.
+A successful lookup refreshes a cached child under the same parent/name or allocates a fresh
+node. For an upper child, `Instance::origin` first consults the instance cache. On a miss it reads
+the private origin xattr. Its exact encoding is `OVL`, version byte 1, then one little-endian
+store inode number. The candidate must be a linked inode of matching type with a positive inode
+number smaller than the upper's, at or beneath a mounted lower root. Non-directories must have
+exactly one lower link. Missing, malformed or stale handles give no origin. Other store errors
+propagate. Lookup caches successful resolutions. A cache hit skips the on-disk validation for that
+instance.
 
-### Creating, removing and renaming
+`stat` uses the real inode's metadata, the overlay device and the origin inode number when
+available. A directory with more than one participating layer reports one link. Path stat uses the
+real backing inode for tmpfs block counts and inode flags. `readdir` keeps the first entry for each
+name, suppresses whiteouts and emits entries in byte-name order. For upper entries in an impure
+directory it calls the origin resolver. In a pure directory it can reuse a matching cached child's
+origin, including a cached absence. A cold listing still calls the origin resolver even if the
+parent has no impure marker. `getdents64` adds dot entries and caches the resulting list on the
+directory description. `statfs_of` reports overlay magic and store capacity even when writes draw
+on a quota-limited tmpfs upper.
 
-- Creating (`may_create_overlay`, `check_overlay_create_tmpfs`, `create_dir`, `create_in`):
-  permissions, `EEXIST`, trailing slash, whiteout/`CAP_MKNOD` and upper-layer tmpfs room are
-  checked before copying up parent directories, so refused creations leave parents uncopied. Then
-  the directory is copied up (charging upper-layer tmpfs when applicable via
-  `overlay_upper_charged`), a whiteout of the name does not count as existing and is replaced in
-  the same transaction (net zero tmpfs inodes), and a directory made in its place is opaque
-  (`ovl_create_over_whiteout`); this covers open with `O_CREAT` (the new file is the overlay's
-  node, so it locks with later opens), mkdir, mknod, symlink, link (the file copied up and linked
-  there) and AF_UNIX bind (connect finds the upper inode). mknod of a whiteout through an overlay
-  is `EPERM` (`ovl_mknod`).
-- Removing (`unlink_overlay`, `Overlays::remove`; do_unlinkat's and do_rmdir's order, `may_delete`
-  on what the overlay shows, a mount of the caller's namespace on it — including on a bind mount of
-  the same overlay via `Vfs::is_point_in` — `EBUSY`, rmdir of a directory
-  not shown empty `ENOTEMPTY`): upper-layer tmpfs room for parent copy-up and any new whiteout is
-  checked before removal and charged/refunded afterwards (keeping unlinked-open regular files
-  charged until close); the upper inode goes with the whiteouts left in a directory, a whiteout
-  owned by the mounter replaces it when a lower layer has the name, and `Vfs::overlay_remove`
-  detaches other namespaces' mounts on the removed node (`Vfs::detach_overlay_point`, also marking
-  mounts rooted at it `root_gone`).
-- Renaming (`rename_overlay`, `Overlays::rename`; may_rename's checks on what the overlay shows,
-  mount points `EBUSY`, then `ENOENT`, `EEXIST`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY` on the merged
-  view): a directory with lower layers (merged or lower only) is `EXDEV` (6.1 without
-  `redirect_dir`; with `RENAME_EXCHANGE` the destination too), so tools fall back to copying;
-  otherwise both sides are copied up and renamed in the upper layer (with upper-layer tmpfs
-  accounting for parent copy-ups, replaced entries and whiteouts), a whiteout at the new name or
-  left in a replaced directory is removed first, a whiteout is left at the old name when a lower
-  layer has it, a directory moved into a merged one becomes opaque (with exchange, the other
-  too). Link and cross-directory rename mark the receiving upper directory impure in the namespace
-  transaction when the incoming inode has an origin, including the reverse move in an exchange.
-  `Vfs::overlay_rename` detaches other namespaces' mounts on an overwritten destination
-  (`Vfs::detach_overlay_point`) while mounts on the renamed source follow its moved node.
+### Copy-up and isolation
 
-### Opening
+`copy_up` returns an existing upper immediately. For a full regular-file copy-up (`All`), it checks
+for a shared mapping of the host object's device/inode in any of the kernel's tasks that can
+acquire write permission, or a registered host writer on that object. Either selects `Copied`. On
+the sharing path, `Store::try_share` probes **both** backing objects under the store write
+transaction. A conflicting mapping pin, including a read-only pin in another kernel, makes the
+caller copy bytes. Successful sharing points both store inodes at one held object. When the share
+candidate has a non-COW lower writer, `copy_up` calls `rehome`, which updates each matching
+description only if it can borrow it and reopen its host object (skipping it on either failure).
+Writable descriptions of a held object reopen read-only and carry the COW flag. `prepare_write`
+splits held data before mutation.
 
-- Opening goes through `open_store_with` on the topmost inode; a directory stays an overlay node
-  for getdents, fchdir and `*at` calls. Regular files, devices, FIFOs and `O_PATH`
-  descriptors with a pinned backing file record the node in
-  `OpenFile::ovl`, so `OpenFile::node`, fchmod-like calls and `/proc/<pid>/fd` give the overlay
-  node; fstat of a regular file shows the node's inode number, and of a device or FIFO shows the
-  overlay node's stat and device (`overlay_stat` and `dev_of`, consistent with `stat` across
-  copy-up). `O_DIRECT` is decided by the mount's filesystem, so overlay files pass it even with
-  the upper layer on a tmpfs. A file opened before its copy-up switches to the upper object on its
-  next read, fstat, lseek, copy out or `mmap` (`follow_copy_up`, matching 6.1's `ovl_real_fdget`
-  and `ovl_mmap` calling `ovl_realfile`; a writable one marked `cow` while the upper file is held),
-  keeping the lower object open until close (`OpenFile::ovl_lower`); `mmap` also unshares a
-  copied-up upper object through `mapping_object` / `make_private` before mapping, while a mapping
-  already created before copy-up keeps the lower object isolated (its store mapping pin forces
-  copy-up to copy instead of sharing). Both locks (`lock_ino`) and leases (`lease::key_of`) key on
-  the overlay node (`overlay::key`), with write opens and truncations breaking leases before
-  copy-up. Writes, truncations, fallocate and copy-ups whose upper layer is on tmpfs
-  (`backing_tmpfs_dev`) are checked and charged against that tmpfs instance.
+`upper_of` recursively copies missing parents first. Each missing ancestor completes its own
+copy-up store operation before its child's operation starts (each releases its savepoint, though
+SQLite may defer the enclosing database commit); a later child failure can therefore leave a copied
+parent. The operation recreates the directory, regular file, symlink target or special node with
+the lower owner, permission bits for directories/files/special nodes, and device number where
+applicable. It copies all xattrs outside the active private prefix and sets the lower inode flags
+on the upper. For a directory or singly linked non-directory it writes the origin handle and marks
+the receiving upper directory `impure=y` in the same operation. It restores the copied inode's
+atime/mtime and the upper parent's prior atime/mtime. After success the node gains an upper, and
+a recorded origin enters the instance cache. A non-directory clears its lower vector. A directory
+retains its lower directories. An uncopied regular file truncated to zero uses `NoData`.
+
+### Tmpfs accounting
+
+`backing_tmpfs_dev` identifies the device for namespace and data changes. For an overlay,
+`overlay_upper_tmpfs_dev` follows the upper's parents to its store root. A detached store root
+identifies a tmpfs upper, whose device is the first layer pin. A tmpfs lower alone does not make
+upper writes chargeable to it. For mappings, `Vfs::mapped_tmpfs_dev` instead identifies the
+layer supplying the actual inode through its parent/name, with an unlinked-inode fallback.
+
+`overlay_upper_charged` counts distinct uncopied nodes through the target and its ancestors.
+It checks room for those inodes and the data pages before copying, then charges after success.
+A regular `NoData` copy needs zero pages. With tracked lower tmpfs ranges, a full copy uses
+`Copied` and counts data pages within EOF, including instantiated mapping pages. Only data ranges
+transfer to the upper's tracking. Unused reservations stay on the lower. Otherwise the helper
+uses `tmpfs_pages`, including the charge for a long symlink. Regular writes, truncate and
+fallocate use upper-device accounting for page changes.
+
+### Open files, mappings and metadata
+
+`open_overlay` takes scoped holds on the target and its supplied overlay parent before a lease
+break or FIFO open can release the big kernel lock (BKL). A rename during the wait can move the
+target away from its original parent. For an existing regular file, write access **or**
+`O_TRUNC` runs the read-only, permission and inode-flag checks, the `O_NOATIME` owner and
+`O_DIRECTORY` checks, then executable write denial. `executing_overlay` checks both the backing
+inode and the overlay ID held by a running group. Only then does it break overlay-keyed leases
+and copy up. A nonblocking lease refusal therefore leaves the lower file uncopied.
+`open_store_with` opens the chosen real inode. Regular-file `O_DIRECT` is decided by the mount
+type, so an overlay can accept it with a tmpfs upper.
+
+Directory and ordinary `O_PATH` kinds carry the overlay node directly. Regular files, device
+and pipe kinds, PTYs with a device inode, and `O_PATH` reopens carrying a pinned regular backing
+can record `OpenFile::ovl`. `OpenFile::node` gives that ID precedence. Regular fstat uses open
+backing metadata with the displayed overlay inode number. Named FIFOs and device-node stat paths
+use their node. Procfs reopens of a deleted overlay executable use the recorded host file,
+the current real inode and the held overlay identity for metadata, leases and write checks.
+
+A regular description opened on the lower can follow later copy-up for reads, fstat, lseek,
+regular copy-out and new mmap. `follow_copy_up` compares backing inode numbers, swaps the host
+handle, sets COW for a writable description of a held object, and retains the old handle in
+`ovl_lower` for in-flight I/O. For mmap, `mapping_object` returns `EAGAIN` if the chosen object is
+held; the caller runs `make_private` (settling a sole remaining store-inode user in place rather
+than copying) and retries before pinning it. An earlier mapping keeps its backing object across
+subsequent copy-up.
+
+Path truncate checks file type, read-only state, immutable flag, write access, append-only flag,
+executing identity and size limit before breaking the lease. It holds the target through the
+overlay lease break and copy-up. Chmod, chown and utimensat resolve `Attrs::Overlay`, check the
+shown metadata and copy up for the change. Timestamp updates via an overlay fd address the
+resulting inode by number. `FS_IOC_GETFLAGS` on regular files and directories reads the supported
+flags from the current real inode. `FS_IOC_SETFLAGS` checks read-only state, ownership,
+`CAP_LINUX_IMMUTABLE` for protected-bit changes, then unsupported bits before copying up. Supported
+flags are immutable, append-only, nodump and noatime.
+
+Xattr reads use the real inode. Listing removes the selected private prefix before normal
+namespace filtering. The overlay xattr handlers return `EOPNOTSUPP` for that prefix. Writes
+check read-only state and generic visible-inode permissions before copying up; `security.capability`
+value validation and `CAP_SETFCAP` checks run afterward on the copied upper inode. ACL changes also
+check the shown protected flags and ACL rules. Removing a missing lower-only ACL can fail before
+copy-up.
+
+### Creating and linking names
+
+`may_create_overlay` checks parent search permission, visible existence (`EEXIST`), read-only
+state (`EROFS`), then the parent flags and write/search permission. Non-directory creation has
+a separate trailing-slash check. Mknod checks device capability/filtering where required and
+rejects an explicit whiteout with `EPERM` before parent copy-up. `check_overlay_create_tmpfs`
+checks the missing parent chain and new name together. Replacing an upper whiteout needs zero
+additional name inodes. `create_dir` obtains the charged upper parent. `create_in` removes the
+whiteout, creates the entry, applies any supplied default ACL, and marks a replacement directory
+opaque in one transaction. Named file creation relooks up the overlay child for the returned fd.
+
+`link_overlay` checks destination existence and trailing slash, search, read-only state, mount
+identity and link permissions before copying the source. It copies the source and destination
+parent as needed, reserves the destination name, and links in the upper. The receiving directory
+gets an impure marker in the link transaction if the node has an origin **or the private origin
+xattr exists**. This marking step needs no handle validation. AF_UNIX pathname bind creates a
+socket inode through the upper parent. Connect resolves the visible real inode for the socket
+registry and checks write permission and socket type.
+
+### Removing, renaming and detaching mounts
+
+For unlink/rmdir, special dot names precede read-only state and lookup. Trailing slash,
+parent search, deletion permissions, protected flags and victim type precede the local
+mount-point check. `EBUSY` precedes rmdir's merged-view `ENOTEMPTY`. `lower_has` uses the first
+lower occurrence of the name, including a whiteout there. Removal copies the parent as needed,
+removes the upper entry and residual whiteouts in an empty directory, and installs a
+mounter-owned whiteout if the name would reappear from below. It unhooks the cached child and
+records it as an orphan. Parent copy-up, whiteouts and removed upper entries enter the tmpfs
+calculation. A last-link regular victim still open or mapped retains its charge.
+
+Rename rejects different mount IDs before its dot-name checks. Within one overlay it checks
+trailing slashes (ORing source and destination trailing-slash flags and testing only the source
+type), the visible source and destination permissions (including write access on directories moved
+across parents), then local mount points. The same node, or two names of the same real inode
+outside exchange, returns success here, even with `RENAME_NOREPLACE`. Moving non-directories are
+copied up **before** the remaining tmpfs check and `Overlays::rename`. That method checks
+destination lookup (required for exchange), no-replace, incompatible types and merged emptiness
+before returning `EXDEV` for a moving directory with lower layers, including the reverse side of an
+exchange. An ordinary overwrite only needs the destination's existing upper, if any.
+
+The upper rename transaction removes a hidden destination whiteout or residual whiteouts in a
+replaced directory. An ordinary move leaves a whiteout at the old name if a lower would show
+through. A moved directory becomes opaque when its new parent has lower directories. Exchange
+applies opacity in both directions as needed and leaves no source whiteout. Cross-parent moves
+mark the receiving directory impure by the same origin-presence rule as link, in both directions
+for exchange. The source ID follows its new name. Exchange moves both IDs. Ordinary overwrite
+orphans the displaced ID. Unlink and overwrite drop a cached upper origin on loss of its last
+link. A surviving hard link can still report the same displayed number.
+
+`Vfs::is_point_in` compares overlay IDs across bind aliases within the caller's namespace.
+After removal or ordinary replacement, `detach_overlay_point` marks attached **and detached**
+mounts rooted at the lost ID `root_gone`. When any attached mount point matches that ID, it also
+detaches those mount subtrees, schedules collection and notifies affected namespaces (matching only
+mount roots marks `root_gone` and returns without scheduling collection or notifying namespaces). A
+source mount in another namespace follows the moved ID. With active watches, `copy_up` reports new
+upper entries in parent-first order only after a successful copy-up (`link_overlay` copying a
+separate destination parent via `create_dir` omits `IN_CREATE` for that parent). Removal, link and
+rename report upper changes before overlay events.
+
+### Node reclamation and instance teardown
+
+`InSyscall` records a start counter and syscall number. `post_syscall_sweeps` calls the overlay
+sweep after detached-mount collection and before clearing that stamp. A pass is due at
+`max(1024, sweep_at)` orphans or **above** `max(16384, nodes_sweep_at)` total nodes.
+`syscall::mount::sweep_overlays` gathers every task's root/cwd, attached and detached mount
+roots and points, the recorded parent directories in `Mount::at` and `root_at`, and overlay
+inotify watch keys. If a task's resources, filesystem context or the watch registry cannot be
+borrowed, it defers the whole pass.
+
+`oldest` is the earliest active start stamp among *other* tasks outside the explicit
+`waits_on_files_only` syscall-number list, or `u64::MAX` if there are none. Listed calls include
+read/write, polling, futex and child waits. An unlisted path syscall can retain a walked ID
+while the BKL is released. `Overlays::sweep` snapshots the holds before examining the cache.
+
+- For orphans it traverses normal children and separately indexed orphan children. It keeps a
+  candidate subtree if the traversal encounters an external reference, a hold, or an orphan
+  **removed** at or after `oldest`. It sets `sweep_at` to twice the remaining orphan count.
+- If more than 16,384 nodes remain, live eviction pins roots, external references, holds,
+  surviving orphans and nodes **touched** at or after `oldest`. It walks ancestors of the pins
+  and walks children under surviving orphans (skipping descent past any already-pinned intermediate
+  child). It evicts batches of unpinned leaves in `(seen, id)` order, removing matching entries
+  from their parents, until 12,288 nodes remain or no eligible leaf exists. The next size trigger
+  is strictly above `max(16384, remaining + max(4096, remaining / 4))`. Calls to `node` and
+  `node_mut` update the syscall stamp independently of the lookup-recency clock.
+
+An evicted live name can receive a new ID at its next lookup. The instance origin cache survives
+eviction, and persisted origin handles can restore displayed identity after remount. `Vfs::collect`
+drops an instance and all its nodes only after its device disappears from both attached and
+retained detached overlay mounts. It includes the remaining instances' layer pins when collecting
+tmpfs devices.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/vfs`: the walk, creation, attribute changes, readdir, stat and statfs on overlay nodes;
-  `kernel/files`: opening them; `kernel/fileio`: truncating them; `kernel/xattr`: xattr calls on overlay nodes.
-- `kernel/mount`: mount(2) of type `overlay`, `collect`, mountinfo's superblock options.
-- The syscall dispatcher (the sweep at syscall end; `Task::syscall` numbering, `kernel/process`),
-  `kernel/exec` (`ExeFile` holding a program's node), `kernel/inotify` (overlay keys),
-  `kernel/locks` (`lock_ino`), `kernel/unix` (bind and connect through an overlay).
+- `kernel/mount` creates and collects instances and exposes their superblock options.
+  `kernel/process` dispatches the syscall-end sweep.
+- `kernel/vfs`, `kernel/files`, `kernel/fileio` and `kernel/xattr` route node operations here.
+  `kernel/mm` follows the current real file for new mappings. `kernel/unix` routes pathname
+  socket bind and connect through the merged namespace.
+- `kernel/locks` and `kernel/inotify` consume overlay keys. Exec, open descriptions and procfs
+  carry overlay identity across execution, fd transfer, unlink and magic-link reopen.
 
 ### Outbound
 
-- `kernel/store`: lookups in each layer, one transaction per copy-up, shared objects, whiteouts,
-  xattrs.
-- `kernel/files`: `open_store`; `kernel/fileio`: `prepare_write`; `kernel/vfs`: the tmpfs instances its layers are
-  in.
-- `kernel/mount` (layer checks, `clone_private_mount`'s rules, `mount_nodes`), `kernel/cred` (permission and
-  ownership on what the overlay shows), every task's root and cwd and the inotify registry for the
-  sweep.
+- `kernel/store` supplies inode and dentry queries, transactions, xattrs, flags, host objects,
+  sharing and mapping pins. `kernel/vfs` supplies tmpfs page ranges, capacity checks and charges.
+- Mount tables supply namespace membership, mount references and detachment. Credentials and
+  file helpers check access, open backing objects, break leases and prepare COW writes.
+- The sweep reads task syscall stamps, filesystem contexts, mount records, holds and watch keys.
+  Copy-up and namespace operations issue inotify events to the relevant upper and overlay keys.
 
 ## Invariants and gotchas
 
-- An overlay node's store inodes may be in lower layers that must never change, so `Node::ino` is
-  None for it and nothing may turn an overlay file's store inode back into a `Node::Store`: an
-  open file reaches its node through `OpenFile::ovl`, and every change goes through a copy-up
-  (`create_dir`, `Attrs::Overlay`, the overlay's removal and rename); `store_dir` refuses overlay
-  directories (`EXDEV`). A `Node::Store` of an overlay mount and its upper inode is built only
-  inside one call (`create_parent_at`'s result, the tmpfs accounting helpers, `file_stat`,
-  truncate, `may_create`), for mount flags and accounting, and never stored.
-- Overlay nodes live while their names do, and a removed one while anything may use it: every
-  open file naming one must hold it (`OpenFile::hold`, or the kind's node at creation), as
-  `ExeFile` holds a program's, and every other long-lived holder must be in the sweep's scan.
-  Path-based truncate holds its node from the lease break through copy-up. A syscall that carries an
-  unheld overlay node across a BKL release must stay outside `waits_on_files_only`.
+- `Node::ino()` yields no store inode for an overlay. Use `real()` for backing data and
+  `shown_ino` for displayed identity. Keep `Node::Overlay` for permissions, copy-up, watches
+  and mount lifetime. `store_dir` returns `EXDEV` for overlay directories. Creation obtains the
+  upper via `create_dir`.
+- `overlay::key` tags a cached node ID for inode-keyed tables. Copy-up preserves that ID.
+  Distinct hard-link names can share a displayed inode while receiving different regular-file
+  lock, lease and watch keys. The directory/name cache, instance origin cache and open host
+  handle each have different lifetimes.
+- A raw ID held across a BKL release needs a scoped hold, a swept external reference, or the
+  syscall age guard. In particular, exec retains a walked node through unlocked ELF loading
+  and waits before installing the `ExeFile` hold. A relative FUSE create can retain an overlay
+  start directory for `display_path`. Neither path qualifies for a blanket file-only exemption.
+  Cross-kernel collisions in the process-wide hold table can delay reclamation.
 
 ## Confirmed bugs / technical debt
 
-- **Overlay gaps**, one per line:
-  - an overlay cannot be a layer (Linux accepts one as a lower layer);
-  - removed nodes can outlive their last holder while another path syscall runs. The age guard
-    protects `syscall::proc::exec`'s walked node through unlocked ELF loading, sibling-thread waits
-    and close-on-exec FUSE flushes until `ExeFile::new` installs its hold. A relative FUSE create in
-    `open_path_with` can also retain an overlay start directory for the later `display_path` fallback.
-  - the no-BKL stat never serves overlay paths;
-  - each whiteout has its own SQLite character-device inode (0:0) with no host object; Linux can share one.
-  - a lower layer's `trusted.overlay.redirect` is not followed (sysfs reports
-    `redirect_always_follow` as N; nothing Appine runs writes one).
+- Overlay and synthetic directories cannot supply layers. Directory redirect xattrs are never
+  followed, even when the option parser accepts a redirect setting. Sysfs reports
+  `redirect_always_follow` as N. Overlay directories also reject `O_TMPFILE` with
+  `EOPNOTSUPP` after read-only and creation-permission checks.
+- The no-BKL cached stat walk falls back at mount crossings and cannot serve overlay paths.
+  Each whiteout uses a separate database character-device inode. Long-running unlisted syscalls
+  can keep removed nodes after the last explicit holder drops them.
+- Ordinary overlay rename between aliases of one real inode succeeds even with `RENAME_NOREPLACE`,
+  and a distinct existing destination can return `EEXIST` after copying up and charging a lower
+  regular source. Overlay rename also ORs source and destination trailing-slash flags and checks
+  only the source type, which can misfire on cross-type `RENAME_EXCHANGE`.
+- Copy-up leaves side effects on partial failure: a child copy-up failure can leave a copied parent
+  uncharged (since `overlay_upper_charged` posts the chain's charge only after success) and without
+  an inotify event; `security.capability` value validation and `CAP_SETFCAP` run after copy-up so
+  a rejected set/remove can leave a copied, charged upper; `link_overlay` copying a separate
+  destination parent via `create_dir` omits `IN_CREATE` for that parent.
+- Two regular-file hard-link names can report the same `st_ino` while locks, leases and inotify
+  watches use distinct keys derived from their per-(parent, name) overlay node.
+- `getdents64`'s removed-directory `ENOENT` check covers only direct store nodes, so an open
+  removed overlay directory can still serve cached entries.
+- Surviving orphan subtree pinning during live eviction only pushes a child when newly inserting it
+  into the pinned set, so an already-pinned intermediate child stops descent and leaves deeper
+  unpinned leaves eligible for eviction.
+- AF_UNIX bind uses the generic one-inode tmpfs reservation and charge after its whiteout-aware
+  parent check. Replacing an upper whiteout with a socket can return `ENOSPC` at the inode limit
+  or count one extra inode on success.
+- Mount setup recreates `work/work` through raw store operations outside tmpfs quota accounting.
+  A later attach-planning failure can leave the work directory reset.
 
 ## Open questions
 
-- None recorded.
-
-## To verify
-
-- The original full mapping used kernel knowledge for its Linux 6.1 comparisons. The lower-link
-  condition in `ovl_getattr` and stale-origin handling in `ovl_check_origin` have since been checked against source.
+None recorded.
