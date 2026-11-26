@@ -627,11 +627,11 @@ fn open_path_with(
         }
         Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
             let exe = exe_file(cx, *proc)?;
+            display = Some(exe.path.clone());
+            unlinked_name = true;
             if let Some(f) = &exe.fuse {
                 opened_mnt = Some(f.mnt);
                 opened_ino = Some(crate::vfs::fuse::key(f.id));
-                display = Some(exe.path.clone());
-                unlinked_name = true;
                 if path_only {
                     node = Node::Fuse(f.mnt, f.id);
                 }
@@ -640,8 +640,6 @@ fn open_path_with(
                 overlay = exe.ovl.as_ref().map(|(mnt, o, _)| (*mnt, *o));
                 opened_mnt = Some(target.mnt());
                 opened_ino = inotify::key_of(&target);
-                display = Some(exe.path.clone());
-                unlinked_name = true;
                 if path_only {
                     path_object = Some((ino, host.try_clone().map_err(host_errno)?, false));
                     node = target;
@@ -1231,10 +1229,15 @@ fn reopen(
             accmode != oflags::O_RDONLY,
         ))),
         FileKind::FuseSnapshot(s) => {
-            let (mnt, id, stat, blksize) = (f.mnt, s.id, s.stat.clone(), s.blksize);
-            let host = s.file.try_clone().map_err(host_errno)?;
+            let mnt = f.mnt;
+            let snap = crate::fd::FuseSnapshot {
+                id: s.id,
+                file: s.file.try_clone().map_err(host_errno)?,
+                stat: s.stat.clone(),
+                blksize: s.blksize,
+            };
             drop(f);
-            open_fuse_snapshot(cx, cred, vfs, mnt, id, stat, blksize, host, flags)
+            open_fuse_snapshot(cx, cred, vfs, mnt, snap, flags)
         }
         FileKind::Host(fd) => Ok(FileKind::Host(*fd)),
         _ => Err(Errno::ENXIO),
@@ -1243,18 +1246,15 @@ fn reopen(
 
 /// Checks mount, permission and `ETXTBSY` rules when reopening a deleted FUSE executable snapshot
 /// through `/proc/<pid>/exe` or `/proc/<pid>/fd/<n>`.
-#[allow(clippy::too_many_arguments)]
 fn open_fuse_snapshot(
     cx: &Cx<'_>,
     cred: &Cred,
     vfs: &Vfs,
     mnt: MountId,
-    id: crate::vfs::fuse::FuseId,
-    snap: Stat,
-    blksize: u32,
-    host: std::fs::File,
+    mut snap: crate::fd::FuseSnapshot,
     flags: u32,
 ) -> Result<FileKind, Errno> {
+    let id = snap.id;
     let node = Node::Fuse(mnt, id);
     let accmode = flags & oflags::O_ACCMODE;
     let readonly = vfs.readonly(&node);
@@ -1265,23 +1265,23 @@ fn open_fuse_snapshot(
         }
         mask |= MAY_WRITE;
     }
-    let (mut stat, blksize) = match vfs.fuse().get(id) {
-        Some(n) => (n.attr.stat(), n.attr.blksize),
-        None => (snap, blksize),
-    };
-    stat.nlink = 0;
+    if let Some(n) = vfs.fuse().get(id) {
+        snap.stat = n.attr.stat();
+        snap.blksize = n.attr.blksize;
+    }
+    snap.stat.nlink = 0;
     if let Ok(conn) = vfs.fuse().conn_of(id) {
         let c = conn.borrow();
         if !c.allows(cred) {
             return Err(Errno::EACCES);
         }
         if c.opts.default_permissions {
-            cred.permission(&stat, mask)?;
+            cred.permission(&snap.stat, mask)?;
         }
     } else {
-        cred.permission(&stat, mask)?;
+        cred.permission(&snap.stat, mask)?;
     }
-    if flags & oflags::O_NOATIME != 0 && !cred.owns(&stat) {
+    if flags & oflags::O_NOATIME != 0 && !cred.owns(&snap.stat) {
         return Err(Errno::EPERM);
     }
     if readonly && accmode != oflags::O_RDONLY {
@@ -1296,12 +1296,7 @@ fn open_fuse_snapshot(
         }
         return Err(Errno::ENOENT);
     }
-    Ok(FileKind::FuseSnapshot(Box::new(crate::fd::FuseSnapshot {
-        id,
-        file: host,
-        stat,
-        blksize,
-    })))
+    Ok(FileKind::FuseSnapshot(Box::new(snap)))
 }
 
 /// Opens a deleted program file through `/proc/<pid>/exe` ([`PseudoNode::OpenExe`]): duplicates
@@ -1316,23 +1311,19 @@ fn reopen_exe(
 ) -> Result<FileKind, Errno> {
     let exe = exe_file(cx, proc)?;
     if let Some(f) = &exe.fuse {
-        let host = exe
+        let file = exe
             .host
             .as_deref()
             .ok_or(Errno::ENOENT)?
             .try_clone()
             .map_err(host_errno)?;
-        return open_fuse_snapshot(
-            cx,
-            cred,
-            vfs,
-            f.mnt,
-            f.id,
-            f.stat.clone(),
-            f.blksize,
-            host,
-            flags,
-        );
+        let snap = crate::fd::FuseSnapshot {
+            id: f.id,
+            file,
+            stat: f.stat.clone(),
+            blksize: f.blksize,
+        };
+        return open_fuse_snapshot(cx, cred, vfs, f.mnt, snap, flags);
     }
     let (node, ino, host) = exe.backing(vfs)?;
     let accmode = flags & oflags::O_ACCMODE;
@@ -1720,7 +1711,7 @@ fn open_store_with(
             FileKind::Regular { ino, file, cow }
         }
         mode::S_IFCHR => {
-            return open_char_device(cx, cred, vfs, ino, st.rdev, flags, beside, lock_ino);
+            return open_char_device(cx, cred, vfs, (ino, st.rdev), flags, beside, lock_ino);
         }
         mode::S_IFBLK => super::loopdev::open(cx, ino, st.rdev, flags)?,
         mode::S_IFIFO => open_fifo(cx, ino, flags)?,
@@ -1731,13 +1722,11 @@ fn open_store_with(
 }
 
 /// Opens a character device node by `rdev` (shared by store, overlay and FUSE `S_IFCHR` opens).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn open_char_device(
     cx: &mut Cx<'_>,
     cred: &Cred,
     vfs: &Vfs,
-    ino: Ino,
-    dev_num: u64,
+    (ino, dev_num): (Ino, u64),
     flags: u32,
     beside: Option<&Node>,
     lock_ino: Ino,
@@ -7532,22 +7521,19 @@ fn node_stat(
         Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
             let exe = exe_file(cx, *proc)?;
             if let Some(f) = &exe.fuse {
-                let target = Node::Fuse(f.mnt, f.id);
                 if let Ok(conn) = vfs.fuse().conn_of(f.id)
                     && !conn.borrow().allows(&cx.cred())
                 {
                     return Err(Errno::EACCES);
                 }
-                let (mut st, blksize) = match vfs.fuse().get(f.id) {
+                let (st, blksize) = match vfs.fuse().get(f.id) {
                     Some(n) => (n.attr.stat(), n.attr.blksize),
                     None => (f.stat.clone(), f.blksize),
                 };
-                st.nlink = 0;
-                let mut b = encode_stat(&st, vfs.dev_of(&target));
-                if blksize != 0 {
-                    b[56..60].copy_from_slice(&blksize.to_le_bytes());
-                }
-                return Ok((b, f.mnt));
+                return Ok((
+                    encode_fuse_snapshot_stat(&vfs, f.mnt, f.id, st, blksize),
+                    f.mnt,
+                ));
             }
             let (node, ino, host) = exe.backing(&vfs)?;
             let mut st = vfs.store().stat_open(ino, host)?;
@@ -7713,14 +7699,13 @@ fn file_stat_attrs(
         }
         FileKind::FuseSnapshot(s) => {
             let vfs = cx.vfs()?;
-            let target = Node::Fuse(f.mnt, s.id);
-            let mut st = s.stat.clone();
-            st.nlink = 0;
-            let mut b = encode_stat(&st, vfs.dev_of(&target));
-            if s.blksize != 0 {
-                b[56..60].copy_from_slice(&s.blksize.to_le_bytes());
-            }
-            Ok(b)
+            Ok(encode_fuse_snapshot_stat(
+                &vfs,
+                f.mnt,
+                s.id,
+                s.stat.clone(),
+                s.blksize,
+            ))
         }
         _ => {
             let node = f.node().ok_or(Errno::EBADF)?;
@@ -7799,6 +7784,24 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
 fn with_blksize(mut b: [u8; 128], blksize: u32) -> [u8; 128] {
     b[56..60].copy_from_slice(&blksize.to_le_bytes());
     b
+}
+
+/// Encodes `struct stat` for an unlinked FUSE executable snapshot (`nlink = 0` and daemon block
+/// size when reported).
+fn encode_fuse_snapshot_stat(
+    vfs: &Vfs,
+    mnt: MountId,
+    id: crate::vfs::fuse::FuseId,
+    mut st: Stat,
+    blksize: u32,
+) -> [u8; 128] {
+    st.nlink = 0;
+    let b = encode_stat(&st, vfs.dev_of(&Node::Fuse(mnt, id)));
+    if blksize != 0 {
+        with_blksize(b, blksize)
+    } else {
+        b
+    }
 }
 
 fn split_ns(ns: i64) -> (u64, u64) {

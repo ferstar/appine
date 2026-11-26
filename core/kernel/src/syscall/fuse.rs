@@ -158,14 +158,7 @@ pub(super) fn open(
             } else {
                 let h = fuse::open(cx, vfs, id, flags, false)?;
                 if truncate {
-                    let mode = cleared_setid_mode(vfs, cred, id, false)?;
-                    let set = SetAttr {
-                        mode,
-                        size: Some(0),
-                        ..SetAttr::default()
-                    };
-                    setattr(cx, vfs, id, &set, h.fh())?;
-                    remove_file_caps(cx, vfs, id)?;
+                    truncate_with_killpriv(cx, vfs, cred, id, 0, h.fh())?;
                 }
                 h
             };
@@ -174,22 +167,18 @@ pub(super) fn open(
             }
             Ok(FileKind::Fuse(Box::new(h)))
         }
-        mode::S_IFIFO => {
-            let _pin = vfs
-                .fuse_mut()
-                .get_mut(id)
-                .ok_or(Errno::ENOTCONN)?
-                .pin_path();
-            super::fs::open_fifo(cx, fuse::key(id), flags)
-        }
-        mode::S_IFCHR => {
+        mode::S_IFIFO | mode::S_IFCHR => {
             let _pin = vfs
                 .fuse_mut()
                 .get_mut(id)
                 .ok_or(Errno::ENOTCONN)?
                 .pin_path();
             let key = fuse::key(id);
-            super::fs::open_char_device(cx, cred, vfs, key, rdev, flags, beside, key)
+            if kind == mode::S_IFIFO {
+                super::fs::open_fifo(cx, key, flags)
+            } else {
+                super::fs::open_char_device(cx, cred, vfs, (key, rdev), flags, beside, key)
+            }
         }
         mode::S_IFBLK => super::loopdev::open(cx, fuse::key(id), rdev, flags),
         _ => Err(Errno::ENXIO),
@@ -437,13 +426,13 @@ pub(super) fn remove(
 /// Renames `old` in FUSE directory `from` to `new` in `to` (`FUSE_RENAME`, or `FUSE_RENAME2`
 /// with flags; a daemon without it makes flags EINVAL, as 6.1's `fuse_rename2`), with both
 /// directories' locks already held: both names leave the cache, both directories' attributes go
-/// stale, and a directory moved keeps its new place for `..` and getcwd.
+/// stale, and the moved node keeps its new place for `..`, `getcwd` and `/proc/<pid>/exe`.
 fn rename_locked(
     cx: &mut Cx<'_>,
     vfs: &Vfs,
     (from, old): (FuseId, &[u8]),
     (to, new): (FuseId, &[u8]),
-    moved: Option<FuseId>,
+    moved: FuseId,
     flags: u32,
 ) -> Result<(), Errno> {
     let (conn, nodeid) = fuse::target(vfs, from)?;
@@ -471,10 +460,8 @@ fn rename_locked(
     f.forget_child(to, new);
     f.stale(from);
     f.stale(to);
-    if let Some(m) = moved {
-        f.stale(m);
-        f.moved(m, to, new);
-    }
+    f.stale(moved);
+    f.moved(moved, to, new);
     Ok(())
 }
 
@@ -1648,7 +1635,7 @@ pub(super) fn rename_at(
     let dir_move = src_dir || (exchange && dst_seen.is_some_and(|(_, d)| d));
     let dst_seen = with_dir_locks(cx, &vfs, from, to, dir_move, |cx| {
         check_loop()?;
-        rename_locked(cx, &vfs, (from, old), (to, new), Some(src), flags)?;
+        rename_locked(cx, &vfs, (from, old), (to, new), src, flags)?;
         Ok(dst_seen.map(|(d, dir)| {
             let mut f = vfs.fuse_mut();
             f.stale(d);
@@ -1721,10 +1708,7 @@ pub(super) fn cleared_setid_mode(
     if fuse::handle_killpriv(&conn.borrow()) {
         return Ok(None);
     }
-    let st = match vfs.fuse().get(id) {
-        Some(n) => n.attr.stat(),
-        None => return Err(Errno::ENOTCONN),
-    };
+    let st = vfs.fuse().get(id).ok_or(Errno::ENOTCONN)?.attr.stat();
     if st.is_dir() {
         return Ok(None);
     }
@@ -1773,23 +1757,36 @@ pub(super) fn remove_file_caps(cx: &mut Cx<'_>, vfs: &Vfs, id: FuseId) -> Result
         }
     }
     match fuse::getxattr(cx, vfs, id, Some(crate::cred::XATTR_NAME_CAPS), 0) {
-        Ok(_) => {
-            match set_xattr(cx, vfs, id, crate::cred::XATTR_NAME_CAPS, None) {
-                Ok(()) | Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
-                Err(e) => return Err(e),
-            }
-            if let Some(n) = vfs.fuse_mut().get_mut(id) {
-                n.no_sec = true;
-            }
-        }
-        Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {
-            if let Some(n) = vfs.fuse_mut().get_mut(id) {
-                n.no_sec = true;
-            }
-        }
+        Ok(_) => match set_xattr(cx, vfs, id, crate::cred::XATTR_NAME_CAPS, None) {
+            Ok(()) | Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
+            Err(e) => return Err(e),
+        },
+        Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
         Err(e) => return Err(e),
     }
+    if let Some(n) = vfs.fuse_mut().get_mut(id) {
+        n.no_sec = true;
+    }
     Ok(())
+}
+
+/// Sets a FUSE file's size via `FUSE_SETATTR` while stripping set-id bits and
+/// `security.capability` when the daemon did not negotiate `FUSE_HANDLE_KILLPRIV`.
+fn truncate_with_killpriv(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    cred: &Cred,
+    id: FuseId,
+    len: u64,
+    fh: Option<u64>,
+) -> Result<(), Errno> {
+    let set = SetAttr {
+        mode: cleared_setid_mode(vfs, cred, id, false)?,
+        size: Some(len),
+        ..SetAttr::default()
+    };
+    setattr(cx, vfs, id, &set, fh)?;
+    remove_file_caps(cx, vfs, id)
 }
 
 /// truncate(2) of FUSE node `id` (6.1's `vfs_truncate`): the type, a read-only mount, write
@@ -1810,26 +1807,14 @@ pub(super) fn truncate(cx: &mut Cx<'_>, node: &Node, len: u64) -> Result<(), Err
     let cred = cx.cred();
     vfs.fuse_permission(&cred, id, MAY_WRITE)?;
     super::fs::check_fsize(cx, len)?;
-    let set = SetAttr {
-        mode: cleared_setid_mode(&vfs, &cred, id, false)?,
-        size: Some(len),
-        ..SetAttr::default()
-    };
-    setattr(cx, &vfs, id, &set, None)?;
-    remove_file_caps(cx, &vfs, id)
+    truncate_with_killpriv(cx, &vfs, &cred, id, len, None)
 }
 
 /// ftruncate of an open FUSE file: `FUSE_SETATTR` with the size through its handle.
 pub(super) fn ftruncate(cx: &mut Cx<'_>, io: &Io, len: u64) -> Result<(), Errno> {
     let vfs = cx.vfs()?;
     let cred = cx.cred();
-    let set = SetAttr {
-        mode: cleared_setid_mode(&vfs, &cred, io.id, false)?,
-        size: Some(len),
-        ..SetAttr::default()
-    };
-    setattr(cx, &vfs, io.id, &set, io.fh())?;
-    remove_file_caps(cx, &vfs, io.id)
+    truncate_with_killpriv(cx, &vfs, &cred, io.id, len, io.fh())
 }
 
 /// The open FUSE regular file of descriptor `file`.
@@ -2383,41 +2368,108 @@ mod tests {
         }
     }
 
-    fn attr_bytes(ino: u64, mode: u32, size: u64, nlink: u32) -> Vec<u8> {
-        attr_bytes_mtime(ino, mode, size, nlink, 0)
+    struct TestAttr {
+        ino: u64,
+        mode: u32,
+        size: u64,
+        nlink: u32,
+        gid: u32,
+        rdev: u32,
+        mtime: u64,
+        valid: u64,
     }
 
-    fn attr_bytes_mtime(ino: u64, mode: u32, size: u64, nlink: u32, mtime: u64) -> Vec<u8> {
-        let mut a = Args::default()
-            .u64(ino)
-            .u64(size)
-            .u64(0)
-            .u64(0)
-            .u64(mtime)
-            .u64(mtime);
-        for _ in 0..3 {
-            a = a.u32(0);
+    impl TestAttr {
+        fn new(ino: u64, mode: u32, size: u64) -> Self {
+            Self {
+                ino,
+                mode,
+                size,
+                nlink: if mode & mode::S_IFMT == mode::S_IFDIR {
+                    2
+                } else {
+                    1
+                },
+                gid: 0,
+                rdev: 0,
+                mtime: 0,
+                valid: 60,
+            }
         }
-        a.u32(mode)
-            .u32(nlink)
-            .u32(0)
-            .u32(0)
-            .u32(0)
-            .u32(4096)
-            .u32(0)
-            .0
+
+        fn nlink(mut self, nlink: u32) -> Self {
+            self.nlink = nlink;
+            self
+        }
+
+        fn gid(mut self, gid: u32) -> Self {
+            self.gid = gid;
+            self
+        }
+
+        fn rdev(mut self, rdev: u32) -> Self {
+            self.rdev = rdev;
+            self
+        }
+
+        fn mtime(mut self, mtime: u64) -> Self {
+            self.mtime = mtime;
+            self
+        }
+
+        fn valid(mut self, valid: u64) -> Self {
+            self.valid = valid;
+            self
+        }
+
+        fn raw(&self) -> Vec<u8> {
+            Args::default()
+                .u64(self.ino)
+                .u64(self.size)
+                .u64(0)
+                .u64(0)
+                .u64(self.mtime)
+                .u64(self.mtime)
+                .u32(0)
+                .u32(0)
+                .u32(0)
+                .u32(self.mode)
+                .u32(self.nlink)
+                .u32(0)
+                .u32(self.gid)
+                .u32(self.rdev)
+                .u32(4096)
+                .u32(0)
+                .0
+        }
+
+        fn entry(&self) -> Vec<u8> {
+            Args::default()
+                .u64(self.ino)
+                .u64(0)
+                .u64(self.valid)
+                .u64(self.valid)
+                .u32(0)
+                .u32(0)
+                .bytes(&self.raw())
+                .0
+        }
+
+        fn attr(&self) -> Vec<u8> {
+            Args::default()
+                .u64(self.valid)
+                .u32(0)
+                .u32(0)
+                .bytes(&self.raw())
+                .0
+        }
     }
 
     fn entry_out(nodeid: u64, mode: u32, size: u64, nlink: u32, valid_secs: u64) -> Vec<u8> {
-        Args::default()
-            .u64(nodeid)
-            .u64(0)
-            .u64(valid_secs)
-            .u64(valid_secs)
-            .u32(0)
-            .u32(0)
-            .bytes(&attr_bytes(nodeid, mode, size, nlink))
-            .0
+        TestAttr::new(nodeid, mode, size)
+            .nlink(nlink)
+            .valid(valid_secs)
+            .entry()
     }
 
     fn attr_out_bytes(ino: u64, mode: u32, size: u64, nlink: u32, valid_secs: u64) -> Vec<u8> {
@@ -2432,12 +2484,11 @@ mod tests {
         mtime: u64,
         valid_secs: u64,
     ) -> Vec<u8> {
-        Args::default()
-            .u64(valid_secs)
-            .u32(0)
-            .u32(0)
-            .bytes(&attr_bytes_mtime(ino, mode, size, nlink, mtime))
-            .0
+        TestAttr::new(ino, mode, size)
+            .nlink(nlink)
+            .mtime(mtime)
+            .valid(valid_secs)
+            .attr()
     }
 
     fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> Vec<u8> {
@@ -2560,6 +2611,67 @@ mod tests {
 
         fn reply_ok(&self, unique: u64, body: &[u8]) {
             self.reply(unique, 0, body);
+        }
+
+        fn for_dev(&self, dev_fd: i32) -> Self {
+            Self {
+                shared: self.shared.clone(),
+                mnt: self.mnt,
+                root: self.root,
+                dev_fd,
+                daemon_tid: self.daemon_tid,
+            }
+        }
+
+        fn complete_init(&self, init_flags: u32) {
+            let (opcode, unique, _, _) = self.read_req(true).unwrap();
+            assert_eq!(opcode, op::INIT);
+            let init_body = Args::default()
+                .u32(7)
+                .u32(37)
+                .u32(0)
+                .u32(init_flags)
+                .u32(0)
+                .u32(65536)
+                .u32(1)
+                .u32(0)
+                .0;
+            self.reply_ok(unique, &init_body);
+        }
+
+        fn serve_until(&self, stop: &AtomicBool, mut handle: impl FnMut(u32, u64, u64, &[u8])) {
+            while !stop.load(Ordering::Relaxed) {
+                let (opcode, unique, nodeid, msg) = match self.read_req(true) {
+                    Ok(r) => r,
+                    Err(Errno::EAGAIN) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(e) => panic!("dev_read failed: {e:?}"),
+                };
+                handle(opcode, unique, nodeid, &msg);
+            }
+        }
+
+        fn set_default_permissions(&self, enabled: bool) {
+            let k = self.shared.lock();
+            k.vfs
+                .as_ref()
+                .unwrap()
+                .fuse()
+                .conn_of(self.root)
+                .unwrap()
+                .borrow_mut()
+                .opts
+                .default_permissions = enabled;
+        }
+
+        fn add_mount_flags(&self, flags: u64) {
+            let k = self.shared.lock();
+            k.vfs
+                .as_ref()
+                .unwrap()
+                .update_mount(self.mnt, |m| m.flags |= flags);
         }
 
         fn seed_dir(
@@ -2770,19 +2882,7 @@ mod tests {
             daemon_tid,
         };
         // Complete FUSE_INIT handshake.
-        let (opcode, unique, _, _) = h.read_req(true).unwrap();
-        assert_eq!(opcode, op::INIT);
-        let init_body = Args::default()
-            .u32(7)
-            .u32(37)
-            .u32(0)
-            .u32(init_flags)
-            .u32(0)
-            .u32(65536)
-            .u32(1)
-            .u32(0)
-            .0;
-        h.reply_ok(unique, &init_body);
+        h.complete_init(init_flags);
         TestRig {
             h,
             dir,
@@ -4098,74 +4198,23 @@ mod tests {
         });
     }
 
-    fn attr_bytes_full(
-        ino: u64,
-        mode: u32,
-        size: u64,
-        nlink: u32,
-        uid: u32,
-        gid: u32,
-        rdev: u32,
-    ) -> Vec<u8> {
-        Args::default()
-            .u64(ino)
-            .u64(size)
-            .u64(0)
-            .u64(0)
-            .u64(0)
-            .u64(0)
-            .u32(0)
-            .u32(0)
-            .u32(0)
-            .u32(mode)
-            .u32(nlink)
-            .u32(uid)
-            .u32(gid)
-            .u32(rdev)
-            .u32(4096)
-            .u32(0)
-            .0
+    fn fuse_cstr(bytes: &[u8]) -> &[u8] {
+        bytes.split(|&b| b == 0).next().unwrap()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn entry_out_full(
-        nodeid: u64,
-        mode: u32,
-        size: u64,
-        nlink: u32,
-        uid: u32,
-        gid: u32,
-        rdev: u32,
-        valid_secs: u64,
-    ) -> Vec<u8> {
-        Args::default()
-            .u64(nodeid)
-            .u64(0)
-            .u64(valid_secs)
-            .u64(valid_secs)
-            .u32(0)
-            .u32(0)
-            .bytes(&attr_bytes_full(nodeid, mode, size, nlink, uid, gid, rdev))
-            .0
+    fn fuse_read_slice<'a>(msg: &[u8], data: &'a [u8]) -> &'a [u8] {
+        let off = u64::from_le_bytes(msg[48..56].try_into().unwrap()) as usize;
+        let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap()) as usize;
+        let end = (off + sz).min(data.len());
+        if off < data.len() {
+            &data[off..end]
+        } else {
+            &[]
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn attr_out_full(
-        ino: u64,
-        mode: u32,
-        size: u64,
-        nlink: u32,
-        uid: u32,
-        gid: u32,
-        rdev: u32,
-        valid_secs: u64,
-    ) -> Vec<u8> {
-        Args::default()
-            .u64(valid_secs)
-            .u32(0)
-            .u32(0)
-            .bytes(&attr_bytes_full(ino, mode, size, nlink, uid, gid, rdev))
-            .0
+    fn open_reply(fh: u64) -> Vec<u8> {
+        Args::default().u64(fh).u32(0).u32(0).0
     }
 
     /// Minimal valid static AArch64 ELF64 binary with an embedded marker payload.
@@ -4222,22 +4271,40 @@ mod tests {
         addr
     }
 
+    fn write_guest_cstr(cx: &mut Cx<'_>, base: u64, bytes: &[u8]) -> u64 {
+        let mut nul = bytes.to_vec();
+        nul.push(0);
+        cx.write_user(crate::uaccess::UserSlice::new(base, nul.len()), &nul)
+            .unwrap();
+        base
+    }
+
+    fn guest_openat(cx: &mut Cx<'_>, scratch: u64, path: &[u8], flags: u32) -> Result<i32, Errno> {
+        let addr = write_guest_cstr(cx, scratch, path);
+        run_with_retries(cx, |cx| {
+            super::super::fs::openat(cx, super::super::fs::AT_FDCWD, addr, flags, 0)
+        })
+        .map(|fd| fd as i32)
+    }
+
+    fn read_guest_array<const N: usize>(cx: &mut Cx<'_>, addr: u64) -> [u8; N] {
+        let mut buf = [0u8; N];
+        cx.read_user(crate::uaccess::UserSlice::new(addr, N), &mut buf)
+            .unwrap();
+        buf
+    }
+
     fn guest_execve(
         cx: &mut Cx<'_>,
         cpu: &mut appine_engine::Cpu,
         path: &[u8],
     ) -> Result<bool, Errno> {
         let scratch = map_scratch(cx, 0x2000_0000);
-        let path_addr = scratch;
+        let path_addr = write_guest_cstr(cx, scratch, path);
         let argv_addr = scratch + 256;
         let envp_addr = scratch + 320;
-        let mut nul = path.to_vec();
-        nul.push(0);
-        cx.write_user(crate::uaccess::UserSlice::new(path_addr, nul.len()), &nul)
-            .unwrap();
-        let argv_ptrs: [u64; 2] = [path_addr, 0];
         let mut argv_raw = [0u8; 16];
-        argv_raw[..8].copy_from_slice(&argv_ptrs[0].to_le_bytes());
+        argv_raw[..8].copy_from_slice(&path_addr.to_le_bytes());
         cx.write_user(crate::uaccess::UserSlice::new(argv_addr, 16), &argv_raw)
             .unwrap();
         cx.write_user(crate::uaccess::UserSlice::new(envp_addr, 8), &[0u8; 8])
@@ -4260,12 +4327,14 @@ mod tests {
         }
     }
 
-    fn write_guest_cstr(cx: &mut Cx<'_>, base: u64, bytes: &[u8]) -> u64 {
-        let mut nul = bytes.to_vec();
-        nul.push(0);
-        cx.write_user(crate::uaccess::UserSlice::new(base, nul.len()), &nul)
-            .unwrap();
-        base
+    fn cred_in_ns(user_ns: Rc<crate::cred::UserNs>, uid: u32, gid: u32, caps: u64) -> Cred {
+        let mut c = Cred::root();
+        c.user_ns = user_ns;
+        (c.ruid, c.euid, c.suid, c.fsuid) = (uid, uid, uid, uid);
+        (c.rgid, c.egid, c.sgid, c.fsgid) = (gid, gid, gid, gid);
+        c.cap_effective = caps;
+        c.cap_permitted = caps;
+        c
     }
 
     fn set_unpriv_cred(h: &Harness, tid: Tid, uid: u32, gid: u32) {
@@ -4282,16 +4351,7 @@ mod tests {
         let mut rig = new_rig("exec-privs", &[90, 91, 92, 93, 94]);
         let h = &rig.h;
         // Enable default_permissions so DAC and ownership behave as on a standard mount.
-        {
-            let k = h.shared.lock();
-            let vfs = k.vfs.as_ref().unwrap();
-            vfs.fuse()
-                .conn_of(h.root)
-                .unwrap()
-                .borrow_mut()
-                .opts
-                .default_permissions = true;
-        }
+        h.set_default_permissions(true);
         let elf = minimal_elf(b"SETID_CAPS_TEST");
         let elf_len = elf.len() as u64;
         let bind_cap = 1u64 << crate::cred::cap::NET_BIND_SERVICE;
@@ -4308,165 +4368,83 @@ mod tests {
 
         std::thread::scope(|s| {
             let daemon = s.spawn(|| {
-                while !stop.load(Ordering::Relaxed) {
-                    let (opcode, unique, nodeid, msg) = match h.read_req(true) {
-                        Ok(r) => r,
-                        Err(Errno::EAGAIN) => {
-                            std::thread::sleep(Duration::from_millis(1));
-                            continue;
+                let node_attr = |nodeid: u64| match nodeid {
+                    1 => Some(TestAttr::new(1, mode::S_IFDIR | 0o755, 0)),
+                    20 => Some(
+                        TestAttr::new(20, suid_mode.load(Ordering::Relaxed), elf_len)
+                            .gid(42)
+                            .valid(0),
+                    ),
+                    21 => Some(TestAttr::new(21, mode::S_IFREG | 0o755, elf_len).valid(0)),
+                    22 => Some(
+                        TestAttr::new(22, mode::S_IFREG | mode::S_ISUID | 0o777, elf_len).valid(0),
+                    ),
+                    _ => None,
+                };
+                h.serve_until(&stop, |opcode, unique, nodeid, msg| match opcode {
+                    op::LOOKUP => {
+                        let id = match fuse_cstr(&msg[40..]) {
+                            b"suid" => Some(20),
+                            b"fcaps" => Some(21),
+                            b"killpriv" => Some(22),
+                            _ => None,
+                        };
+                        match id.and_then(node_attr) {
+                            Some(a) => h.reply_ok(unique, &a.entry()),
+                            None => h.reply(unique, Errno::ENOENT.0, &[]),
                         }
-                        Err(e) => panic!("dev_read failed: {e:?}"),
-                    };
-                    match opcode {
-                        op::LOOKUP => {
-                            let name = msg[40..].split(|&b| b == 0).next().unwrap();
-                            match name {
-                                b"suid" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        20,
-                                        suid_mode.load(Ordering::Relaxed),
-                                        elf_len,
-                                        1,
-                                        0,
-                                        42,
-                                        0,
-                                        0,
-                                    ),
-                                ),
-                                b"fcaps" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        21,
-                                        mode::S_IFREG | 0o755,
-                                        elf_len,
-                                        1,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                    ),
-                                ),
-                                b"killpriv" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        22,
-                                        mode::S_IFREG | mode::S_ISUID | 0o777,
-                                        elf_len,
-                                        1,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                    ),
-                                ),
-                                _ => h.reply(unique, Errno::ENOENT.0, &[]),
-                            }
-                        }
-                        op::GETATTR => match nodeid {
-                            1 => h.reply_ok(
-                                unique,
-                                &attr_out_full(1, mode::S_IFDIR | 0o755, 0, 2, 0, 0, 0, 60),
-                            ),
-                            20 => h.reply_ok(
-                                unique,
-                                &attr_out_full(
-                                    20,
-                                    suid_mode.load(Ordering::Relaxed),
-                                    elf_len,
-                                    1,
-                                    0,
-                                    42,
-                                    0,
-                                    0,
-                                ),
-                            ),
-                            21 => h.reply_ok(
-                                unique,
-                                &attr_out_full(21, mode::S_IFREG | 0o755, elf_len, 1, 0, 0, 0, 0),
-                            ),
-                            22 => h.reply_ok(
-                                unique,
-                                &attr_out_full(
-                                    22,
-                                    mode::S_IFREG | mode::S_ISUID | 0o777,
-                                    elf_len,
-                                    1,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                ),
-                            ),
-                            _ => h.reply(unique, Errno::ENOENT.0, &[]),
-                        },
-                        op::OPEN => {
-                            let body = Args::default().u64(nodeid + 100).u32(0).u32(0).0;
-                            h.reply_ok(unique, &body);
-                        }
-                        op::READ => {
-                            let off = u64::from_le_bytes(msg[48..56].try_into().unwrap()) as usize;
-                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap()) as usize;
-                            let end = (off + sz).min(elf.len());
-                            let slice = if off < elf.len() { &elf[off..end] } else { &[] };
-                            h.reply_ok(unique, slice);
-                        }
-                        op::GETXATTR => {
-                            getxattr_count.fetch_add(1, Ordering::Relaxed);
-                            let sz = u32::from_le_bytes(msg[40..44].try_into().unwrap()) as usize;
-                            let name = msg[48..].split(|&b| b == 0).next().unwrap();
-                            if name == crate::cred::XATTR_NAME_CAPS
-                                && (nodeid == 21
-                                    || (nodeid == 22 && has_cap_xattr.load(Ordering::Relaxed)))
-                            {
-                                if sz == 0 {
-                                    h.reply_ok(
-                                        unique,
-                                        &Args::default().u32(caps_v2.len() as u32).u32(0).0,
-                                    );
-                                } else {
-                                    h.reply_ok(unique, &caps_v2);
-                                }
-                            } else {
-                                h.reply(unique, Errno::ENODATA.0, &[]);
-                            }
-                        }
-                        op::SETATTR => {
-                            let valid = u32::from_le_bytes(msg[40..44].try_into().unwrap());
-                            let new_mode = u32::from_le_bytes(msg[108..112].try_into().unwrap());
-                            if valid & fuse::fattr::MODE != 0 {
-                                setattr_modes.lock().unwrap().push(new_mode);
-                            }
-                            h.reply_ok(
-                                unique,
-                                &attr_out_full(
-                                    nodeid,
-                                    mode::S_IFREG | (new_mode & 0o7777),
-                                    elf_len,
-                                    1,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                ),
-                            );
-                        }
-                        op::REMOVEXATTR => {
-                            let name = msg[40..].split(|&b| b == 0).next().unwrap().to_vec();
-                            if name == crate::cred::XATTR_NAME_CAPS {
-                                has_cap_xattr.store(false, Ordering::Relaxed);
-                            }
-                            removed_xattrs.lock().unwrap().push(name);
-                            h.reply_ok(unique, &[]);
-                        }
-                        op::WRITE => {
-                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap());
-                            h.reply_ok(unique, &Args::default().u32(sz).u32(0).0);
-                        }
-                        op::FLUSH => h.reply_ok(unique, &[]),
-                        other => panic!("unexpected opcode {other}"),
                     }
-                }
+                    op::GETATTR => match node_attr(nodeid) {
+                        Some(a) => h.reply_ok(unique, &a.attr()),
+                        None => h.reply(unique, Errno::ENOENT.0, &[]),
+                    },
+                    op::OPEN => h.reply_ok(unique, &open_reply(nodeid + 100)),
+                    op::READ => h.reply_ok(unique, fuse_read_slice(msg, &elf)),
+                    op::GETXATTR => {
+                        getxattr_count.fetch_add(1, Ordering::Relaxed);
+                        let sz = u32::from_le_bytes(msg[40..44].try_into().unwrap()) as usize;
+                        let name = fuse_cstr(&msg[48..]);
+                        if name == crate::cred::XATTR_NAME_CAPS
+                            && (nodeid == 21
+                                || (nodeid == 22 && has_cap_xattr.load(Ordering::Relaxed)))
+                        {
+                            if sz == 0 {
+                                h.reply_ok(
+                                    unique,
+                                    &Args::default().u32(caps_v2.len() as u32).u32(0).0,
+                                );
+                            } else {
+                                h.reply_ok(unique, &caps_v2);
+                            }
+                        } else {
+                            h.reply(unique, Errno::ENODATA.0, &[]);
+                        }
+                    }
+                    op::SETATTR => {
+                        let valid = u32::from_le_bytes(msg[40..44].try_into().unwrap());
+                        let new_mode = u32::from_le_bytes(msg[108..112].try_into().unwrap());
+                        if valid & fuse::fattr::MODE != 0 {
+                            setattr_modes.lock().unwrap().push(new_mode);
+                        }
+                        let a = TestAttr::new(nodeid, mode::S_IFREG | (new_mode & 0o7777), elf_len)
+                            .valid(0);
+                        h.reply_ok(unique, &a.attr());
+                    }
+                    op::REMOVEXATTR => {
+                        let name = fuse_cstr(&msg[40..]).to_vec();
+                        if name == crate::cred::XATTR_NAME_CAPS {
+                            has_cap_xattr.store(false, Ordering::Relaxed);
+                        }
+                        removed_xattrs.lock().unwrap().push(name);
+                        h.reply_ok(unique, &[]);
+                    }
+                    op::WRITE => {
+                        let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap());
+                        h.reply_ok(unique, &Args::default().u32(sz).u32(0).0);
+                    }
+                    op::FLUSH => h.reply_ok(unique, &[]),
+                    other => panic!("unexpected opcode {other}"),
+                });
             });
             let _stop_guard = StopOnDrop(&stop);
 
@@ -4526,13 +4504,7 @@ mod tests {
             );
 
             // 5. Mount WITH MS_NOSUID ignores set-id and skips FUSE_GETXATTR for file caps.
-            {
-                let k = h.shared.lock();
-                k.vfs
-                    .as_ref()
-                    .unwrap()
-                    .update_mount(h.mnt, |m| m.flags |= ms::NOSUID);
-            }
+            h.add_mount_flags(ms::NOSUID);
             let getxattr_before = getxattr_count.load(Ordering::Relaxed);
             set_unpriv_cred(h, 93, 1000, 1000);
             h.cx(93, |cx| {
@@ -4574,93 +4546,30 @@ mod tests {
 
         std::thread::scope(|s| {
             let daemon = s.spawn(|| {
-                while !stop.load(Ordering::Relaxed) {
-                    let (opcode, unique, nodeid, msg) = match h.read_req(true) {
-                        Ok(r) => r,
-                        Err(Errno::EAGAIN) => {
-                            std::thread::sleep(Duration::from_millis(1));
-                            continue;
-                        }
-                        Err(e) => panic!("dev_read failed: {e:?}"),
-                    };
+                let prog_attr =
+                    |id: u64, len: usize| TestAttr::new(id, mode::S_IFREG | 0o755, len as u64);
+                h.serve_until(&stop, |opcode, unique, nodeid, msg| {
                     let st = *state.lock().unwrap();
                     match opcode {
-                        op::LOOKUP => {
-                            let name = msg[40..].split(|&b| b == 0).next().unwrap();
-                            match (st, name) {
-                                (State::Initial, b"prog") => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        30,
-                                        mode::S_IFREG | 0o755,
-                                        orig_elf.len() as u64,
-                                        1,
-                                        0,
-                                        0,
-                                        0,
-                                        60,
-                                    ),
-                                ),
-                                (State::RenamedAndReplaced, b"prog") => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        31,
-                                        mode::S_IFREG | 0o755,
-                                        repl_elf.len() as u64,
-                                        1,
-                                        0,
-                                        0,
-                                        0,
-                                        60,
-                                    ),
-                                ),
-                                (State::RenamedAndReplaced, b"prog_moved") => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        30,
-                                        mode::S_IFREG | 0o755,
-                                        orig_elf.len() as u64,
-                                        1,
-                                        0,
-                                        0,
-                                        0,
-                                        60,
-                                    ),
-                                ),
-                                _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                        op::LOOKUP => match (st, fuse_cstr(&msg[40..])) {
+                            (State::Initial, b"prog")
+                            | (State::RenamedAndReplaced, b"prog_moved") => {
+                                h.reply_ok(unique, &prog_attr(30, orig_elf.len()).entry())
                             }
-                        }
+                            (State::RenamedAndReplaced, b"prog") => {
+                                h.reply_ok(unique, &prog_attr(31, repl_elf.len()).entry())
+                            }
+                            _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                        },
                         op::GETATTR => match nodeid {
                             1 => h.reply_ok(
                                 unique,
-                                &attr_out_full(1, mode::S_IFDIR | 0o755, 0, 2, 0, 0, 0, 60),
+                                &TestAttr::new(1, mode::S_IFDIR | 0o755, 0).attr(),
                             ),
-                            30 if st != State::Unlinked => h.reply_ok(
-                                unique,
-                                &attr_out_full(
-                                    30,
-                                    mode::S_IFREG | 0o755,
-                                    orig_elf.len() as u64,
-                                    1,
-                                    0,
-                                    0,
-                                    0,
-                                    60,
-                                ),
-                            ),
-                            31 => h.reply_ok(
-                                unique,
-                                &attr_out_full(
-                                    31,
-                                    mode::S_IFREG | 0o755,
-                                    repl_elf.len() as u64,
-                                    1,
-                                    0,
-                                    0,
-                                    0,
-                                    60,
-                                ),
-                            ),
+                            30 if st != State::Unlinked => {
+                                h.reply_ok(unique, &prog_attr(30, orig_elf.len()).attr())
+                            }
+                            31 => h.reply_ok(unique, &prog_attr(31, repl_elf.len()).attr()),
                             _ => h.reply(unique, Errno::ENOENT.0, &[]),
                         },
                         op::OPEN => {
@@ -4668,23 +4577,12 @@ mod tests {
                             if nodeid == 30 && st == State::Unlinked {
                                 h.reply(unique, Errno::ENOENT.0, &[]);
                             } else {
-                                let body = Args::default().u64(nodeid + 200).u32(0).u32(0).0;
-                                h.reply_ok(unique, &body);
+                                h.reply_ok(unique, &open_reply(nodeid + 200));
                             }
                         }
                         op::READ => {
-                            let off = u64::from_le_bytes(msg[48..56].try_into().unwrap()) as usize;
-                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap()) as usize;
                             let data = if nodeid == 31 { &repl_elf } else { &orig_elf };
-                            let end = (off + sz).min(data.len());
-                            h.reply_ok(
-                                unique,
-                                if off < data.len() {
-                                    &data[off..end]
-                                } else {
-                                    &[]
-                                },
-                            );
+                            h.reply_ok(unique, fuse_read_slice(msg, data));
                         }
                         op::GETXATTR => h.reply(unique, Errno::ENODATA.0, &[]),
                         op::RENAME => {
@@ -4698,7 +4596,7 @@ mod tests {
                         op::FLUSH => h.reply_ok(unique, &[]),
                         other => panic!("unexpected opcode {other}"),
                     }
-                }
+                });
             });
             let _stop_guard = StopOnDrop(&stop);
 
@@ -4766,36 +4664,18 @@ mod tests {
                     super::super::fs::newfstatat(cx, super::super::fs::AT_FDCWD, exe_p, stat_buf, 0)
                 })
                 .unwrap();
-                let mut raw_stat = [0u8; 128];
-                cx.read_user(crate::uaccess::UserSlice::new(stat_buf, 128), &mut raw_stat)
-                    .unwrap();
+                let raw_stat = read_guest_array::<128>(cx, stat_buf);
                 assert_eq!(u64::from_le_bytes(raw_stat[8..16].try_into().unwrap()), 30);
 
                 // open(/proc/self/exe, O_WRONLY) returns ETXTBSY.
                 assert_eq!(
-                    run_with_retries(cx, |cx| {
-                        super::super::fs::openat(
-                            cx,
-                            super::super::fs::AT_FDCWD,
-                            exe_p,
-                            oflags::O_WRONLY,
-                            0,
-                        )
-                    }),
+                    guest_openat(cx, scratch + 192, b"/proc/self/exe", oflags::O_WRONLY),
                     Err(Errno::ETXTBSY)
                 );
 
                 // open(/proc/self/exe, O_RDONLY) opens original nodeid 30 and reads ORIG_FUSE_EXE.
-                let fd = run_with_retries(cx, |cx| {
-                    super::super::fs::openat(
-                        cx,
-                        super::super::fs::AT_FDCWD,
-                        exe_p,
-                        oflags::O_RDONLY,
-                        0,
-                    )
-                })
-                .unwrap() as i32;
+                let fd =
+                    guest_openat(cx, scratch + 192, b"/proc/self/exe", oflags::O_RDONLY).unwrap();
                 let n = super::super::fs::read(cx, fd, read_buf, orig_elf.len()).unwrap() as usize;
                 let mut got = vec![0u8; n];
                 cx.read_user(crate::uaccess::UserSlice::new(read_buf, n), &mut got)
@@ -4821,37 +4701,20 @@ mod tests {
                     super::super::fs::newfstatat(cx, super::super::fs::AT_FDCWD, exe_p, stat_buf, 0)
                 })
                 .unwrap();
-                cx.read_user(crate::uaccess::UserSlice::new(stat_buf, 128), &mut raw_stat)
-                    .unwrap();
+                let raw_stat = read_guest_array::<128>(cx, stat_buf);
                 assert_eq!(u64::from_le_bytes(raw_stat[8..16].try_into().unwrap()), 30);
                 assert_eq!(u32::from_le_bytes(raw_stat[20..24].try_into().unwrap()), 0);
 
                 // open(/proc/self/exe, O_WRONLY) still returns ETXTBSY.
                 assert_eq!(
-                    run_with_retries(cx, |cx| {
-                        super::super::fs::openat(
-                            cx,
-                            super::super::fs::AT_FDCWD,
-                            exe_p,
-                            oflags::O_WRONLY,
-                            0,
-                        )
-                    }),
+                    guest_openat(cx, scratch + 192, b"/proc/self/exe", oflags::O_WRONLY),
                     Err(Errno::ETXTBSY)
                 );
 
                 // open(/proc/self/exe, O_RDONLY) succeeds via pinned snapshot without daemon OPEN.
                 let opens_before = opened_nodeids.lock().unwrap().len();
-                let fd = run_with_retries(cx, |cx| {
-                    super::super::fs::openat(
-                        cx,
-                        super::super::fs::AT_FDCWD,
-                        exe_p,
-                        oflags::O_RDONLY,
-                        0,
-                    )
-                })
-                .unwrap() as i32;
+                let fd =
+                    guest_openat(cx, scratch + 192, b"/proc/self/exe", oflags::O_RDONLY).unwrap();
                 assert_eq!(opened_nodeids.lock().unwrap().len(), opens_before);
                 let n = super::super::fs::read(cx, fd, read_buf, orig_elf.len()).unwrap() as usize;
                 let mut got = vec![0u8; n];
@@ -4882,16 +4745,7 @@ mod tests {
         let rig = new_rig("special-nodes", &[96, 97]);
         let h = &rig.h;
         // Enable default_permissions so mode checks on special files are tested too.
-        {
-            let k = h.shared.lock();
-            let vfs = k.vfs.as_ref().unwrap();
-            vfs.fuse()
-                .conn_of(h.root)
-                .unwrap()
-                .borrow_mut()
-                .opts
-                .default_permissions = true;
-        }
+        h.set_default_permissions(true);
         let null_rdev = crate::vfs::dev::rdev(1, 3) as u32;
         let zero_rdev = crate::vfs::dev::rdev(1, 5) as u32;
         let bad_rdev = crate::vfs::dev::rdev(250, 1) as u32;
@@ -4901,155 +4755,68 @@ mod tests {
         let stop = AtomicBool::new(false);
         std::thread::scope(|s| {
             let daemon = s.spawn(|| {
-                while !stop.load(Ordering::Relaxed) {
-                    let (opcode, unique, nodeid, msg) = match h.read_req(true) {
-                        Ok(r) => r,
-                        Err(Errno::EAGAIN) => {
-                            std::thread::sleep(Duration::from_millis(1));
-                            continue;
+                let node_attr = |id: u64| match id {
+                    1 => Some(TestAttr::new(1, mode::S_IFDIR | 0o755, 0)),
+                    40 => Some(TestAttr::new(40, mode::S_IFIFO | 0o666, 0)),
+                    41 => Some(TestAttr::new(41, mode::S_IFCHR | 0o666, 0).rdev(null_rdev)),
+                    42 => Some(TestAttr::new(42, mode::S_IFCHR | 0o666, 0).rdev(zero_rdev)),
+                    43 => Some(TestAttr::new(43, mode::S_IFCHR | 0o666, 0).rdev(bad_rdev)),
+                    44 => Some(TestAttr::new(44, mode::S_IFBLK | 0o660, 0).rdev(loop0_rdev)),
+                    45 => Some(TestAttr::new(45, mode::S_IFSOCK | 0o755, 0)),
+                    46 => Some(TestAttr::new(46, mode::S_IFCHR | 0o600, 0).rdev(null_rdev)),
+                    _ => None,
+                };
+                h.serve_until(&stop, |opcode, unique, nodeid, msg| match opcode {
+                    op::LOOKUP => {
+                        let id = match fuse_cstr(&msg[40..]) {
+                            b"fifo" => Some(40),
+                            b"null" => Some(41),
+                            b"zero" => Some(42),
+                            b"badchr" => Some(43),
+                            b"loop0" => Some(44),
+                            b"sock" => Some(45),
+                            b"rootnull" => Some(46),
+                            _ => None,
+                        };
+                        match id.and_then(node_attr) {
+                            Some(a) => h.reply_ok(unique, &a.entry()),
+                            None => h.reply(unique, Errno::ENOENT.0, &[]),
                         }
-                        Err(e) => panic!("dev_read failed: {e:?}"),
-                    };
-                    match opcode {
-                        op::LOOKUP => {
-                            let name = msg[40..].split(|&b| b == 0).next().unwrap();
-                            match name {
-                                b"fifo" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(40, mode::S_IFIFO | 0o666, 0, 1, 0, 0, 0, 60),
-                                ),
-                                b"null" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        41,
-                                        mode::S_IFCHR | 0o666,
-                                        0,
-                                        1,
-                                        0,
-                                        0,
-                                        null_rdev,
-                                        60,
-                                    ),
-                                ),
-                                b"zero" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        42,
-                                        mode::S_IFCHR | 0o666,
-                                        0,
-                                        1,
-                                        0,
-                                        0,
-                                        zero_rdev,
-                                        60,
-                                    ),
-                                ),
-                                b"badchr" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        43,
-                                        mode::S_IFCHR | 0o666,
-                                        0,
-                                        1,
-                                        0,
-                                        0,
-                                        bad_rdev,
-                                        60,
-                                    ),
-                                ),
-                                b"loop0" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        44,
-                                        mode::S_IFBLK | 0o660,
-                                        0,
-                                        1,
-                                        0,
-                                        0,
-                                        loop0_rdev,
-                                        60,
-                                    ),
-                                ),
-                                b"sock" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(45, mode::S_IFSOCK | 0o755, 0, 1, 0, 0, 0, 60),
-                                ),
-                                b"rootnull" => h.reply_ok(
-                                    unique,
-                                    &entry_out_full(
-                                        46,
-                                        mode::S_IFCHR | 0o600,
-                                        0,
-                                        1,
-                                        0,
-                                        0,
-                                        null_rdev,
-                                        60,
-                                    ),
-                                ),
-                                _ => h.reply(unique, Errno::ENOENT.0, &[]),
-                            }
-                        }
-                        op::GETATTR => match nodeid {
-                            1 => h.reply_ok(
-                                unique,
-                                &attr_out_full(1, mode::S_IFDIR | 0o755, 0, 2, 0, 0, 0, 60),
-                            ),
-                            40 => h.reply_ok(
-                                unique,
-                                &attr_out_full(40, mode::S_IFIFO | 0o666, 0, 1, 0, 0, 0, 60),
-                            ),
-                            41 => h.reply_ok(
-                                unique,
-                                &attr_out_full(
-                                    41,
-                                    mode::S_IFCHR | 0o666,
-                                    0,
-                                    1,
-                                    0,
-                                    0,
-                                    null_rdev,
-                                    60,
-                                ),
-                            ),
-                            _ => h.reply(unique, Errno::ENOENT.0, &[]),
-                        },
-                        op::STATFS => {
-                            let body = Args::default()
-                                .u64(100)
-                                .u64(50)
-                                .u64(50)
-                                .u64(100)
-                                .u64(50)
-                                .u32(4096)
-                                .u32(255)
-                                .u32(4096)
-                                .u32(0)
-                                .u64(0)
-                                .u64(0)
-                                .u64(0)
-                                .0;
-                            h.reply_ok(unique, &body);
-                        }
-                        op::OPEN | op::OPENDIR | op::FLUSH => {
-                            daemon_opens.fetch_add(1, Ordering::Relaxed);
-                            h.reply(unique, Errno::EIO.0, &[]);
-                        }
-                        other => panic!("unexpected opcode {other}"),
                     }
-                }
+                    op::GETATTR => match node_attr(nodeid) {
+                        Some(a) if matches!(nodeid, 1 | 40 | 41) => h.reply_ok(unique, &a.attr()),
+                        _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                    },
+                    op::STATFS => {
+                        let body = Args::default()
+                            .u64(100)
+                            .u64(50)
+                            .u64(50)
+                            .u64(100)
+                            .u64(50)
+                            .u32(4096)
+                            .u32(255)
+                            .u32(4096)
+                            .u32(0)
+                            .u64(0)
+                            .u64(0)
+                            .u64(0)
+                            .0;
+                        h.reply_ok(unique, &body);
+                    }
+                    op::OPEN | op::OPENDIR | op::FLUSH => {
+                        daemon_opens.fetch_add(1, Ordering::Relaxed);
+                        h.reply(unique, Errno::EIO.0, &[]);
+                    }
+                    other => panic!("unexpected opcode {other}"),
+                });
             });
             let _stop_guard = StopOnDrop(&stop);
 
             h.cx(96, |cx| {
                 let scratch = map_scratch(cx, 0x2200_0000);
-                let open_path = |cx: &mut Cx<'_>, p: &[u8], flags: u32| -> Result<i32, Errno> {
-                    let addr = write_guest_cstr(cx, scratch, p);
-                    run_with_retries(cx, |cx| {
-                        super::super::fs::openat(cx, super::super::fs::AT_FDCWD, addr, flags, 0)
-                    })
-                    .map(|fd| fd as i32)
-                };
+                let open_path =
+                    |cx: &mut Cx<'_>, p: &[u8], flags: u32| guest_openat(cx, scratch, p, flags);
 
                 // 1. FIFO: O_WRONLY|O_NONBLOCK without reader -> ENXIO; O_DIRECT -> EINVAL.
                 assert_eq!(
@@ -5077,32 +4844,19 @@ mod tests {
                 .unwrap();
                 assert_eq!(super::super::fs::write(cx, wfd, msg_addr, 15).unwrap(), 15);
                 assert_eq!(super::super::fs::read(cx, rfd, buf_addr, 15).unwrap(), 15);
-                let mut got = [0u8; 15];
-                cx.read_user(crate::uaccess::UserSlice::new(buf_addr, 15), &mut got)
-                    .unwrap();
-                assert_eq!(&got, b"hello fuse fifo");
+                assert_eq!(&read_guest_array::<15>(cx, buf_addr), b"hello fuse fifo");
 
                 // fstat & fstatfs on the FUSE FIFO report FUSE metadata and FUSE_SUPER_MAGIC.
                 let stat_addr = scratch + 512;
                 run_with_retries(cx, |cx| super::super::fs::fstat(cx, rfd, stat_addr)).unwrap();
-                let mut raw_stat = [0u8; 128];
-                cx.read_user(
-                    crate::uaccess::UserSlice::new(stat_addr, 128),
-                    &mut raw_stat,
-                )
-                .unwrap();
+                let raw_stat = read_guest_array::<128>(cx, stat_addr);
                 assert_eq!(u64::from_le_bytes(raw_stat[8..16].try_into().unwrap()), 40);
                 assert_eq!(
                     u32::from_le_bytes(raw_stat[16..20].try_into().unwrap()) & mode::S_IFMT,
                     mode::S_IFIFO
                 );
                 run_with_retries(cx, |cx| super::super::fs::fstatfs(cx, rfd, stat_addr)).unwrap();
-                let mut raw_statfs = [0u8; 120];
-                cx.read_user(
-                    crate::uaccess::UserSlice::new(stat_addr, 120),
-                    &mut raw_statfs,
-                )
-                .unwrap();
+                let raw_statfs = read_guest_array::<120>(cx, stat_addr);
                 assert_eq!(
                     u64::from_le_bytes(raw_statfs[0..8].try_into().unwrap()),
                     fuse::SUPER_MAGIC
@@ -5115,11 +4869,7 @@ mod tests {
                 assert_eq!(super::super::fs::write(cx, nfd, msg_addr, 15).unwrap(), 15);
                 assert_eq!(super::super::fs::read(cx, nfd, buf_addr, 15).unwrap(), 0);
                 run_with_retries(cx, |cx| super::super::fs::fstat(cx, nfd, stat_addr)).unwrap();
-                cx.read_user(
-                    crate::uaccess::UserSlice::new(stat_addr, 128),
-                    &mut raw_stat,
-                )
-                .unwrap();
+                let raw_stat = read_guest_array::<128>(cx, stat_addr);
                 assert_eq!(u64::from_le_bytes(raw_stat[8..16].try_into().unwrap()), 41);
                 assert_eq!(
                     u64::from_le_bytes(raw_stat[32..40].try_into().unwrap()),
@@ -5131,10 +4881,7 @@ mod tests {
                 cx.write_user(crate::uaccess::UserSlice::new(buf_addr, 8), &[0xff; 8])
                     .unwrap();
                 assert_eq!(super::super::fs::read(cx, zfd, buf_addr, 8).unwrap(), 8);
-                let mut zgot = [0xffu8; 8];
-                cx.read_user(crate::uaccess::UserSlice::new(buf_addr, 8), &mut zgot)
-                    .unwrap();
-                assert_eq!(zgot, [0u8; 8]);
+                assert_eq!(read_guest_array::<8>(cx, buf_addr), [0u8; 8]);
                 super::super::fs::close(cx, zfd).unwrap();
 
                 assert_eq!(
@@ -5168,57 +4915,23 @@ mod tests {
             set_unpriv_cred(h, 97, 1000, 1000);
             h.cx(97, |cx| {
                 let scratch = map_scratch(cx, 0x2300_0000);
-                let addr = write_guest_cstr(cx, scratch, b"/mnt/rootnull");
                 assert_eq!(
-                    run_with_retries(cx, |cx| {
-                        super::super::fs::openat(
-                            cx,
-                            super::super::fs::AT_FDCWD,
-                            addr,
-                            oflags::O_RDONLY,
-                            0,
-                        )
-                    }),
+                    guest_openat(cx, scratch, b"/mnt/rootnull", oflags::O_RDONLY),
                     Err(Errno::EACCES)
                 );
             });
 
             // 6. MS_NODEV blocks character and block devices (EACCES) while FIFOs still open.
-            {
-                let k = h.shared.lock();
-                k.vfs
-                    .as_ref()
-                    .unwrap()
-                    .update_mount(h.mnt, |m| m.flags |= ms::NODEV);
-            }
+            h.add_mount_flags(ms::NODEV);
             h.cx(96, |cx| {
                 let scratch = 0x2200_0000u64;
                 for dev_path in [&b"/mnt/null"[..], b"/mnt/loop0"] {
-                    let addr = write_guest_cstr(cx, scratch, dev_path);
                     assert_eq!(
-                        run_with_retries(cx, |cx| {
-                            super::super::fs::openat(
-                                cx,
-                                super::super::fs::AT_FDCWD,
-                                addr,
-                                oflags::O_RDONLY,
-                                0,
-                            )
-                        }),
+                        guest_openat(cx, scratch, dev_path, oflags::O_RDONLY),
                         Err(Errno::EACCES)
                     );
                 }
-                let fifo_addr = write_guest_cstr(cx, scratch, b"/mnt/fifo");
-                let fd = run_with_retries(cx, |cx| {
-                    super::super::fs::openat(
-                        cx,
-                        super::super::fs::AT_FDCWD,
-                        fifo_addr,
-                        oflags::O_RDWR,
-                        0,
-                    )
-                })
-                .unwrap() as i32;
+                let fd = guest_openat(cx, scratch, b"/mnt/fifo", oflags::O_RDWR).unwrap();
                 super::super::fs::close(cx, fd).unwrap();
             });
 
@@ -5234,7 +4947,7 @@ mod tests {
     fn fuse_child_userns_enforces_mnt_may_suid_and_sb_i_nodev() {
         let mut rig = new_rig("child-userns", &[98, 99]);
         let h = &rig.h;
-        // Replace the FUSE connection with one owned by a child user namespace (0 -> 1000, 1 -> 1001).
+        // Mount a second FUSE connection owned by a child user namespace (0 -> 1000, 1 -> 1001).
         let child_ns = {
             let k = h.shared.lock();
             let init_ns = k.tasks[&h.daemon_tid].cred.borrow().user_ns.clone();
@@ -5246,16 +4959,7 @@ mod tests {
         let child_dev_fd = {
             let k = h.shared.lock();
             let vfs = k.vfs.as_ref().unwrap();
-            let mut mounter = Cred::root();
-            mounter.user_ns = child_ns.clone();
-            mounter.ruid = 1000;
-            mounter.euid = 1000;
-            mounter.suid = 1000;
-            mounter.fsuid = 1000;
-            mounter.rgid = 1000;
-            mounter.egid = 1000;
-            mounter.sgid = 1000;
-            mounter.fsgid = 1000;
+            let mounter = cred_in_ns(child_ns.clone(), 1000, 1000, crate::cred::CAP_FULL);
             let dev = 0x9au64;
             let opts = Options {
                 rootmode: Some(mode::S_IFDIR | 0o755),
@@ -5297,53 +5001,8 @@ mod tests {
                 )
                 .unwrap()
         };
-        // Complete FUSE_INIT on the child-userns connection.
-        let read_child_req = || -> Result<(u32, u64, u64, Vec<u8>), Errno> {
-            loop {
-                let msg = h.cx(h.daemon_tid, |cx| {
-                    let file = cx.fds().get(child_dev_fd).unwrap();
-                    fuse::dev_read(cx, &file, 131072, true)
-                })?;
-                let (opcode, unique, nodeid) = parse_header(&msg);
-                if matches!(opcode, op::FORGET | op::BATCH_FORGET) {
-                    continue;
-                }
-                if matches!(opcode, op::RELEASE | op::RELEASEDIR) {
-                    let raw = fuse_reply(unique, 0, &[]);
-                    h.cx(h.daemon_tid, |cx| {
-                        let file = cx.fds().get(child_dev_fd).unwrap();
-                        let vfs = cx.vfs().unwrap();
-                        fuse::dev_write(cx, &vfs, &file, &raw).unwrap();
-                    });
-                    continue;
-                }
-                return Ok((opcode, unique, nodeid, msg));
-            }
-        };
-        let reply_child = |unique: u64, err: i32, body: &[u8]| {
-            let raw = fuse_reply(unique, err, body);
-            h.cx(h.daemon_tid, |cx| {
-                let file = cx.fds().get(child_dev_fd).unwrap();
-                let vfs = cx.vfs().unwrap();
-                fuse::dev_write(cx, &vfs, &file, &raw).unwrap();
-            });
-        };
-        let (opcode, unique, _, _) = read_child_req().unwrap();
-        assert_eq!(opcode, op::INIT);
-        reply_child(
-            unique,
-            0,
-            &Args::default()
-                .u32(7)
-                .u32(37)
-                .u32(0)
-                .u32(0)
-                .u32(0)
-                .u32(65536)
-                .u32(1)
-                .u32(0)
-                .0,
-        );
+        let child_h = h.for_dev(child_dev_fd);
+        child_h.complete_init(0);
 
         let elf = minimal_elf(b"CHILD_USERNS");
         let null_rdev = crate::vfs::dev::rdev(1, 3) as u32;
@@ -5353,127 +5012,46 @@ mod tests {
 
         std::thread::scope(|s| {
             let daemon = s.spawn(|| {
-                while !stop.load(Ordering::Relaxed) {
-                    let (opcode, unique, nodeid, msg) = match read_child_req() {
-                        Ok(r) => r,
-                        Err(Errno::EAGAIN) => {
-                            std::thread::sleep(Duration::from_millis(1));
-                            continue;
-                        }
-                        Err(e) => panic!("dev_read failed: {e:?}"),
-                    };
-                    match opcode {
-                        op::LOOKUP => {
-                            let name = msg[40..].split(|&b| b == 0).next().unwrap();
-                            match name {
-                                b"null" => reply_child(
-                                    unique,
-                                    0,
-                                    &entry_out_full(
-                                        50,
-                                        mode::S_IFCHR | 0o666,
-                                        0,
-                                        1,
-                                        0,
-                                        0,
-                                        null_rdev,
-                                        60,
-                                    ),
-                                ),
-                                b"fifo" => reply_child(
-                                    unique,
-                                    0,
-                                    &entry_out_full(51, mode::S_IFIFO | 0o666, 0, 1, 0, 0, 0, 60),
-                                ),
-                                b"suid" => reply_child(
-                                    unique,
-                                    0,
-                                    &entry_out_full(
-                                        52,
-                                        mode::S_IFREG | mode::S_ISUID | 0o755,
-                                        elf.len() as u64,
-                                        1,
-                                        0,
-                                        0,
-                                        0,
-                                        60,
-                                    ),
-                                ),
-                                _ => reply_child(unique, Errno::ENOENT.0, &[]),
-                            }
-                        }
-                        op::GETATTR => match nodeid {
-                            1 => reply_child(
-                                unique,
-                                0,
-                                &attr_out_full(1, mode::S_IFDIR | 0o755, 0, 2, 0, 0, 0, 60),
-                            ),
-                            52 => reply_child(
-                                unique,
-                                0,
-                                &attr_out_full(
-                                    52,
-                                    mode::S_IFREG | mode::S_ISUID | 0o755,
-                                    elf.len() as u64,
-                                    1,
-                                    0,
-                                    0,
-                                    0,
-                                    60,
-                                ),
-                            ),
-                            _ => reply_child(unique, Errno::ENOENT.0, &[]),
-                        },
-                        op::OPEN => {
-                            reply_child(unique, 0, &Args::default().u64(500).u32(0).u32(0).0);
-                        }
-                        op::READ => {
-                            let off = u64::from_le_bytes(msg[48..56].try_into().unwrap()) as usize;
-                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap()) as usize;
-                            let end = (off + sz).min(elf.len());
-                            reply_child(
-                                unique,
-                                0,
-                                if off < elf.len() { &elf[off..end] } else { &[] },
-                            );
-                        }
-                        op::GETXATTR => reply_child(unique, 0, &caps_v2),
-                        other => panic!("unexpected opcode {other}"),
-                    }
-                }
+                let suid_attr =
+                    TestAttr::new(52, mode::S_IFREG | mode::S_ISUID | 0o755, elf.len() as u64);
+                child_h.serve_until(&stop, |opcode, unique, nodeid, msg| match opcode {
+                    op::LOOKUP => match fuse_cstr(&msg[40..]) {
+                        b"null" => child_h.reply_ok(
+                            unique,
+                            &TestAttr::new(50, mode::S_IFCHR | 0o666, 0)
+                                .rdev(null_rdev)
+                                .entry(),
+                        ),
+                        b"fifo" => child_h
+                            .reply_ok(unique, &TestAttr::new(51, mode::S_IFIFO | 0o666, 0).entry()),
+                        b"suid" => child_h.reply_ok(unique, &suid_attr.entry()),
+                        _ => child_h.reply(unique, Errno::ENOENT.0, &[]),
+                    },
+                    op::GETATTR => match nodeid {
+                        1 => child_h
+                            .reply_ok(unique, &TestAttr::new(1, mode::S_IFDIR | 0o755, 0).attr()),
+                        52 => child_h.reply_ok(unique, &suid_attr.attr()),
+                        _ => child_h.reply(unique, Errno::ENOENT.0, &[]),
+                    },
+                    op::OPEN => child_h.reply_ok(unique, &open_reply(500)),
+                    op::READ => child_h.reply_ok(unique, fuse_read_slice(msg, &elf)),
+                    op::GETXATTR => child_h.reply_ok(unique, &caps_v2),
+                    other => panic!("unexpected opcode {other}"),
+                });
             });
             let _stop_guard = StopOnDrop(&stop);
 
             // Caller 98 is in init_user_ns with uid/gid 1000 (allowed by user_id/group_id match):
             // SB_I_NODEV blocks /umnt/null (EACCES), /umnt/fifo succeeds, and mnt_may_suid blocks
-            // setuid/file caps on /umnt/suid because init_user_ns is not inside child_ns!
+            // setuid/file caps on /umnt/suid because init_user_ns is not inside child_ns.
             set_unpriv_cred(h, 98, 1000, 1000);
             h.cx(98, |cx| {
                 let scratch = map_scratch(cx, 0x2400_0000);
-                let null_p = write_guest_cstr(cx, scratch, b"/umnt/null");
                 assert_eq!(
-                    run_with_retries(cx, |cx| {
-                        super::super::fs::openat(
-                            cx,
-                            super::super::fs::AT_FDCWD,
-                            null_p,
-                            oflags::O_RDONLY,
-                            0,
-                        )
-                    }),
+                    guest_openat(cx, scratch, b"/umnt/null", oflags::O_RDONLY),
                     Err(Errno::EACCES)
                 );
-                let fifo_p = write_guest_cstr(cx, scratch + 64, b"/umnt/fifo");
-                let fd = run_with_retries(cx, |cx| {
-                    super::super::fs::openat(
-                        cx,
-                        super::super::fs::AT_FDCWD,
-                        fifo_p,
-                        oflags::O_RDWR,
-                        0,
-                    )
-                })
-                .unwrap() as i32;
+                let fd = guest_openat(cx, scratch + 64, b"/umnt/fifo", oflags::O_RDWR).unwrap();
                 super::super::fs::close(cx, fd).unwrap();
 
                 guest_execve(cx, &mut rig._cpus[1], b"/umnt/suid").unwrap();
@@ -5482,7 +5060,7 @@ mod tests {
             });
 
             // Caller 99 is inside child_ns (uid 1 -> kernel 1001, unprivileged) with allow_other:
-            // mnt_may_suid allows setuid-to-child-root (uid 0 -> kernel 1000) and v2 file caps!
+            // mnt_may_suid allows setuid-to-child-root (uid 0 -> kernel 1000) and v2 file caps.
             {
                 let k = h.shared.lock();
                 k.vfs
@@ -5494,18 +5072,7 @@ mod tests {
                     .borrow_mut()
                     .opts
                     .allow_other = true;
-                let mut c = Cred::root();
-                c.user_ns = child_ns.clone();
-                c.ruid = 1001;
-                c.euid = 1001;
-                c.suid = 1001;
-                c.fsuid = 1001;
-                c.rgid = 1001;
-                c.egid = 1001;
-                c.sgid = 1001;
-                c.fsgid = 1001;
-                c.cap_effective = 0;
-                c.cap_permitted = 0;
+                let c = cred_in_ns(child_ns.clone(), 1001, 1001, 0);
                 *k.tasks[&99].cred.borrow_mut() = c.clone();
                 k.groups[&99].borrow_mut().cred = c;
             }
