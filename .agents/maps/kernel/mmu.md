@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: explicit page-watch invalidation for backing discarded in place)
+> Maintained: 2026-11-26 (targeted verification of unmap boundary demotion, page-watch lifetime on allocation failure, and eager fills during private-file unshare)
 
 ## Responsibilities
 
@@ -47,10 +47,12 @@ fast path and refill (`engine/dbt`).
   16-byte aligned so bits 3..0 are 0). Whole 2 MB spans written to empty L2 slots, existing
   superpages, or all-zero L3 tables (up to 256 retired L3 tables kept alive per `appine_mmu` until
   destruction for concurrent walkers) become superpages; partial `unmap`/`protect`/`map`/`move`
-  demote an L2 superpage atomically into a populated 512-entry L3 table before modifying it. A 4 KB
+  demote an L2 superpage atomically into a populated 512-entry L3 table before modifying it.
+  `prepare_unmap` demotes only partially covered boundary superpages. `unmap` runs this preparation
+  before clearing any entry, so allocation failure preserves translations across the whole range. A 4 KB
   leaf entry is a 4 KB-aligned host page address ORed with R/W/X bits; 0 means absent, and prot 0
   with a nonzero address means "present, no access". `Mmu` is neither `Send` nor `Sync`;
-  `map`/`unmap`/`protect`/`move_entries` take `&mut`, while
+  `map`/`prepare_unmap`/`unmap`/`protect`/`move_entries` take `&mut`, while
   `fill_shared`/`map_shared`/`protect_shared`/`next_present`/`translate`/`table_bytes`/`table_pages`
   take `&self` so CoW and memory accounting can query or edit another address space's table
   (`table_bytes` counts all allocated 4 KiB radix tables — root, intermediate, active and retired
@@ -98,8 +100,8 @@ fast path and refill (`engine/dbt`).
   most 1 MB, or when the mapping is executable and not private anonymous (file mappings, shared
   anonymous, SysV shm), using `Vma::prefill_prot` (which strips `PROT_WRITE` on unwritten private
   anonymous pieces and software-tracked file mappings so the first store traps). Tmpfs file mappings wait for per-page quota admission. `PROT_NONE` mappings get none. If building them fails it removes every
-  entry of the range. For existing or already-moved VMAs (`mprotect` out of `PROT_NONE`, `mremap`
-  moves), `prefill_pages` performs the same eager `fill_shared` as best-effort without unmapping
+  entry of the range. For existing VMAs (`mprotect` out of `PROT_NONE`, `mremap` moves and
+  private-file unshare), `prefill_pages` performs the same eager `fill_shared` as best-effort without unmapping
   on failure, leaving existing entries intact so any unfilled pages fault in on demand.
 - Larger mappings are filled on demand by `fault_in` (`try_fault_in`). It fails if no VMA covers the page, the page
   is at or past EOF, the VMA prot (with write implying read) lacks the access, or the page already
@@ -120,9 +122,10 @@ fast path and refill (`engine/dbt`).
   their first store) and fills the rest under the eager rule above, otherwise on demand.
 - Execute-only mappings (`PROT_EXEC` without `PROT_READ`) do not gain read permission: data loads
   and kernel reads fault, instruction fetch works.
-- `Mmu::watch_readable_page` issues a `PageWatch` for one readable guest page. Replacing,
-  unmapping or moving entries expires watches in the requested ranges, including both ends of
-  a move and ranges that may have been partially edited on allocation failure. Empty-slot fills
+- `Mmu::watch_readable_page` issues a `PageWatch` for one readable guest page. `unmap` expires
+  watches in its range only on success because preparation prevents a partial unmap on allocation
+  failure. Replacing or moving entries expires watches in the requested ranges, including both
+  ends of a move and ranges that may have been partially edited on allocation failure. Empty-slot fills
   and permission changes preserve watches. `Mm::release` also expires watches in discarded ranges
   with `Mmu::invalidate_page_watches` while retaining their entries. A consumer checks current
   permissions before reading. Watches on one page share a token. New registrations periodically

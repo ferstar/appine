@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification of regular-file `MAP_SHARED` `FS_IMMUTABLE_FL`/`FS_APPEND_FL` checks, and anonymous fault fills, mprotect ordering and munmap errors for fork CoW pages)
+> Maintained: 2026-11-26 (targeted verification of superpage preparation in munmap and discard, CoW and VMA teardown ordering, and private-file unshare)
 
 ## Responsibilities
 
@@ -235,9 +235,12 @@ signals may still be delivered).
 - VMAs are only ever split (`split_at` advances file or anonymous page offsets and host pointers), never merged;
   `same_vma` tells which pieces Linux would have as one VMA.
 - `munmap`: an unaligned address, zero or overflowing length or an end past 2^48 is `EINVAL`;
-  `ENOMEM` can result from a three-way VMA split at `vm.max_map_count`, a failed CoW recall or
-  a page-table allocation during superpage demotion. It moves removed host
-  regions to the `graveyard`, clears `vdso` when overlapping it, sets `dirty`, records executable
+  a three-way VMA split at `vm.max_map_count` returns `ENOMEM`. It coalesces contiguous mapped
+  spans and pre-demotes their partial boundary superpages before recalling or taking CoW loans
+  or splitting VMAs. A demotion `ENOMEM` preserves VMAs, guest translations, backing regions and
+  loans. CoW recall can also return `ENOMEM` before the endpoint splits. On success, munmap
+  splits at the endpoints, unmaps each prepared span and moves removed VMAs' backing regions
+  to the `graveyard`. It clears `vdso` when overlapping it, sets `dirty`, records executable
   ranges in `code_ranges`, returns borrowed pages (`kernel/cow`), and the syscall reaps SysV
   segments left without attachments.
 - `mprotect` (`protect`, Linux's `do_mprotect_pkey`): unknown prot bits (`PROT_SEM` included) or
@@ -361,8 +364,10 @@ signals may still be delivered).
   missing soft PTEs, and stop with `EFAULT` at the first page past EOF.
 - `MADV_DONTNEED` / `MADV_DONTNEED_LOCKED` (`discard_range`): `MADV_DONTNEED_LOCKED` allows
   `mlock`'d VMAs without unlocking them; both refuse foreign (`[vvar]`) and GPU VMAs (`EINVAL`).
-  Private anon returns to host and zeroes (CoW settled via `kernel/cow`); written private file
-  pages before EOF unshare first if marked `cow` (so reverting never corrupts a fork peer), then
+  Private anonymous pages read as zero after discard. Except for the vDSO, which keeps its
+  entries, discard pre-demotes partial superpages before settling CoW and discarding host bytes.
+  Tracked private file pages lose their entries before discard clears their private-copy records.
+  Written private file pages before EOF unshare first if marked `cow` (so reverting never corrupts a fork peer), then
   revert via `kernel/hostmem`'s `discard_file_host` (whole host pages) and `Reread`s read from the
   store (`fill_private`, zeros past EOF or open failure; `Fill` partial host pages reread from its
   memfd so entries stay). Executable ranges queue code invalidation; shared/unwritten VMAs
@@ -491,9 +496,9 @@ signals may still be delivered).
 - Appine creates a fresh anonymous remnant even on a partial DONTUNMAP or a move of a previously
   relocated mapping. Linux 6.1 unlinks the old anon_vma only on a whole-VMA move and retains the
   old page offset.
-- A failure in `Mmu::unmap` can interrupt munmap after it has taken borrowed records
-  and removed the current VMA. A failed superpage demotion can leave surviving PTEs without
-  their backing records.
+- `clip_file_mappings` and `invalidate_fill` ignore unmap errors. If a partial superpage
+  demotion runs out of memory, truncation can leave a translation beyond the new EOF and FUSE
+  invalidation can leave a translation for a page marked stale.
 
 ## Open questions
 

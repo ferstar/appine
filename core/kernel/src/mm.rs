@@ -4620,7 +4620,23 @@ impl Mm {
         }
         Ok(PopulateStep::Done)
     }
+}
 
+#[cfg(test)]
+thread_local! {
+    static UNMAP_PREPARE_FAIL: Cell<usize> = const { Cell::new(0) };
+}
+
+#[inline]
+fn mmu_prepare_unmap(mmu: &mut Mmu, gva: u64, len: u64) -> Result<(), MapError> {
+    #[cfg(test)]
+    if UNMAP_PREPARE_FAIL.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
+        return Err(MapError::OutOfMemory);
+    }
+    mmu.prepare_unmap(gva, len)
+}
+
+impl Mm {
     /// Test helper wrapping [`Mm::discard_range`] for callers that expect no gap/error.
     #[cfg(test)]
     fn discard(&mut self, addr: u64, len: u64) -> Result<Vec<Reread>, Errno> {
@@ -4668,13 +4684,18 @@ impl Mm {
             let stop = end.min(s + v.len);
             if v.backing == Backing::Anonymous && !v.reserved() {
                 let (exec, host) = (v.prot & prot::EXEC != 0, v.host);
-                if exec {
-                    self.code_ranges.push((cursor, stop - cursor));
+                if s != self.vdso
+                    && let Err(e) = mmu_prepare_unmap(&mut self.mmu, cursor, stop - cursor)
+                {
+                    return (rereads, Err(map_err(e)));
                 }
                 // Borrowers still need lent pages, and borrowed pages are replaced by our own
                 // (reading zero afterwards)
                 if let Err(e) = self.cow_settle(cursor, stop) {
                     return (rereads, Err(e));
+                }
+                if exec {
+                    self.code_ranges.push((cursor, stop - cursor));
                 }
                 // SAFETY: [cursor, stop) is inside this VMA, and its host memory is the VMA's
                 // private anonymous memory
@@ -4702,9 +4723,9 @@ impl Mm {
                     // zap_page_range_single does on MADV_DONTNEED) so discarded pages are not
                     // scanned in touched_windows or mistaken for swapped-out pages when pagemap is
                     // unreadable.
-                    if let Err(e) = self.mmu.unmap(cursor, stop - cursor).map_err(map_err) {
-                        return (rereads, Err(e));
-                    }
+                    self.mmu
+                        .unmap(cursor, stop - cursor)
+                        .expect("pre-demoted discard range");
                     self.dirty = true;
                 }
             } else if v.backing == Backing::PrivateFile && v.written.get() {
@@ -4720,6 +4741,24 @@ impl Mm {
                         return (rereads, Err(e));
                     }
                     let v = &self.vmas[&s];
+                    if v.fill.is_none()
+                        && let Some(t) = &v.pages
+                    {
+                        let len = in_file - cursor;
+                        if let Err(e) = mmu_prepare_unmap(&mut self.mmu, cursor, len) {
+                            return (rereads, Err(map_err(e)));
+                        }
+                        self.mmu
+                            .unmap(cursor, len)
+                            .expect("pre-demoted discard range");
+                        let lo = v.offset() + cursor - s;
+                        let hi = v.offset() + in_file - s;
+                        let grain = t.page_size();
+                        t.copied
+                            .borrow_mut()
+                            .retain(|off| *off < lo || *off + grain > hi);
+                        self.dirty = true;
+                    }
                     if v.prot & prot::EXEC != 0 {
                         self.code_ranges.push((cursor, in_file - cursor));
                     }
@@ -4749,18 +4788,6 @@ impl Mm {
                         }
                         cursor = stop;
                         continue;
-                    }
-                    if let Some(t) = &v.pages {
-                        let lo = v.offset() + cursor - s;
-                        let hi = v.offset() + in_file - s;
-                        let grain = t.page_size();
-                        t.copied
-                            .borrow_mut()
-                            .retain(|off| *off < lo || *off + grain > hi);
-                        if let Err(e) = self.mmu.unmap(cursor, in_file - cursor).map_err(map_err) {
-                            return (rereads, Err(e));
-                        }
-                        self.dirty = true;
                     }
                     let base = v.file_id.map_or(0, |f| f.2) + (cursor - s);
                     let reread = |a: u64, l: u64| Reread {
@@ -5270,20 +5297,42 @@ impl Mm {
         {
             self.room_for(1)?;
         }
+        // Adjacent VMA pieces can share an L2 superpage. Only the boundaries of a
+        // contiguous mapped span can require demotion, regardless of the VMA splits.
+        let mut unmap_ranges: Vec<(u64, u64)> = Vec::new();
+        for (&s, v) in inside(addr).into_iter().chain(self.vmas.range(addr..end)) {
+            let lo = addr.max(s);
+            let hi = end.min(s + v.len);
+            if let Some((_, prev_end)) = unmap_ranges.last_mut()
+                && *prev_end == lo
+            {
+                *prev_end = hi;
+            } else {
+                unmap_ranges.push((lo, hi));
+            }
+        }
+        if unmap_ranges.is_empty() {
+            return Ok(());
+        }
+        for &(lo, hi) in &unmap_ranges {
+            mmu_prepare_unmap(&mut self.mmu, lo, hi - lo).map_err(map_err)?;
+        }
+        let borrowed = self.cow_unmap(addr, end)?;
         self.split_at(addr);
         self.split_at(end);
-        let borrowed = self.cow_unmap(addr, end)?;
-        // The page table unmaps page by page, so only VMAs that actually exist are handled: a guest
-        // passing a length that covers the whole address space is still fast
         let doomed: Vec<(u64, u64)> = self
             .vmas
             .range(addr..end)
             .map(|(&s, v)| (s, v.len))
             .collect();
+        for (lo, hi) in unmap_ranges {
+            self.mmu
+                .unmap(lo, hi - lo)
+                .expect("pre-demoted munmap range");
+        }
         let mut removed_shared = false;
         for (s, len) in doomed {
             let vma = self.vmas.remove(&s).unwrap();
-            self.mmu.unmap(s, len).map_err(map_err)?;
             removed_shared |= vma.backing == Backing::Shared && vma.may_write;
             if vma.prot & prot::EXEC != 0 {
                 self.exec_changed = true;
@@ -5816,7 +5865,6 @@ impl Mm {
             if extent >= old {
                 continue;
             }
-            // unmap fails only on invalid arguments, and this range comes from a VMA
             let _ = self.mmu.unmap(start + extent, old - extent);
             if v.prot & prot::EXEC != 0 {
                 self.code_ranges.push((start + extent, old - extent));
@@ -6633,12 +6681,11 @@ impl Mm {
     fn unshare(&mut self, start: u64) -> Result<(), Errno> {
         let v = &self.vmas[&start];
         let (region, host) = Self::copy_private_file(v)?;
-        // The old entries point at the shared piece, so remove them first (map_pages leaves
-        // existing entries alone); pages past the end of the file still stay out of the page
-        // table
+        // Remove entries for the shared piece before filling from the private copy. A partial
+        // eager fill is usable once the VMA owns the copy. Missing entries fault in normally.
         let (eager, p) = (v.eager_len(), v.prefill_prot());
         self.mmu.unmap(start, v.len).map_err(map_err)?;
-        Self::map_pages(&mut self.mmu, start, host, eager, p, true)?;
+        Self::prefill_pages(&mut self.mmu, start, host, eager, p, true);
         let v = self.vmas.get_mut(&start).unwrap();
         let old = std::mem::replace(&mut v.region, region);
         v.pages = v.pages.as_ref().map(|p| p.detached(v.offset(), v.len));
@@ -9036,6 +9083,53 @@ mod tests {
     }
 
     #[test]
+    fn munmap_demotes_only_partial_superpages_across_vma_splits() {
+        let p = PAGE_SIZE;
+        let leaf = LEAF_SPAN;
+        let base = leaf;
+        for (span, lo, hi, tables) in [
+            (leaf, 0, p, 1),
+            (leaf, leaf - p, leaf, 1),
+            (leaf, p, 3 * p, 1),
+            (3 * leaf, p, 3 * leaf - p, 2),
+            (leaf, 0, leaf, 0),
+        ] {
+            let mut mm = Mm::new();
+            mm.map_anonymous(base, span, RW).unwrap();
+            for offset in (0..span).step_by(leaf as usize) {
+                assert!(mm.fault_in(base + offset, prot::WRITE));
+            }
+            let host = mm.vmas[&base].host;
+            let before = mm.mmu.table_bytes();
+            if lo == 0 && hi == leaf {
+                mm.set_dontdump(base + p, p, true).unwrap();
+                assert_eq!(mm.vmas.len(), 3);
+            }
+            mm.munmap(base + lo, hi - lo).unwrap();
+            assert_eq!(mm.mmu.table_bytes(), before + tables * p);
+            let kept: Vec<_> = [(base, lo), (base + hi, span - hi)]
+                .into_iter()
+                .filter(|&(_, len)| len != 0)
+                .collect();
+            assert_eq!(
+                mm.vmas.iter().map(|(&s, v)| (s, v.len)).collect::<Vec<_>>(),
+                kept
+            );
+            for offset in (0..span).step_by(p as usize) {
+                let va = base + offset;
+                if (lo..hi).contains(&offset) {
+                    assert_eq!(mm.mmu.next_present(va, va + p), va + p);
+                } else {
+                    assert_eq!(
+                        mm.mmu.translate(va, RW),
+                        Some(unsafe { host.add(offset as usize) })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn only_executable_changes_invalidate_translations() {
         let mut mm = Mm::new();
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
@@ -10756,6 +10850,191 @@ mod tests {
 
     fn writable(mm: &Rc<RefCell<Mm>>, addr: u64) -> bool {
         mm.borrow().mmu().translate(addr, prot::WRITE).is_some()
+    }
+
+    fn with_unmap_prepare_failure<T>(nth: usize, f: impl FnOnce() -> T) -> T {
+        struct Reset(usize);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                UNMAP_PREPARE_FAIL.set(self.0);
+            }
+        }
+        assert!(nth > 0);
+        let _guard = Reset(UNMAP_PREPARE_FAIL.replace(nth));
+        let result = f();
+        assert_eq!(
+            UNMAP_PREPARE_FAIL.get(),
+            0,
+            "unmap preparation failpoint was not reached"
+        );
+        result
+    }
+
+    #[test]
+    fn munmap_prepare_failure_preserves_mappings_and_loans_until_retry() {
+        fn page_state(mm: &Mm, va: u64) -> ([Option<NonNull<u8>>; 3], u8) {
+            let translations =
+                [prot::READ, prot::WRITE, prot::EXEC].map(|p| mm.mmu.translate(va, p));
+            assert!(translations[0].is_some());
+            let mut byte = [0];
+            mm.read(UserSlice::new(va, 1), &mut byte).unwrap();
+            (translations, byte[0])
+        }
+        let p = PAGE_SIZE;
+        let first = LEAF_SPAN;
+        let last = 3 * LEAF_SPAN;
+        let loan = last - 2 * p;
+        let lo = first + p;
+        let hi = last + p;
+        for nth in [1, 2] {
+            let parent = Mm::new().into_shared();
+            parent.borrow_mut().map_anonymous(loan, 2 * p, RW).unwrap();
+            poke(&parent, loan, b'A');
+            poke(&parent, loan + p, b'B');
+            let child = parent.borrow_mut().fork().unwrap();
+            let mut mm = child.borrow_mut();
+            let shared = flags::MAP_FIXED | flags::MAP_SHARED | flags::MAP_ANONYMOUS;
+            mm.mmap(first, LEAF_SPAN, RW | prot::EXEC, shared, None)
+                .unwrap();
+            mm.map_anonymous(last, LEAF_SPAN, RW).unwrap();
+            mm.write(UserSlice::new(lo, 1), b"S").unwrap();
+            mm.write(UserSlice::new(last, 1), b"T").unwrap();
+            mm.vdso = loan;
+            mm.sync_except(None);
+
+            let layout = |mm: &Mm| {
+                mm.vmas
+                    .iter()
+                    .map(|(&s, v)| (s, v.len, v.host, Arc::as_ptr(&v.region)))
+                    .collect::<Vec<_>>()
+            };
+            let original = layout(&mm);
+            let mut entries = Vec::new();
+            for (&s, v) in &mm.vmas {
+                for va in (s..s + v.len).step_by(p as usize) {
+                    let watch = mm.mmu.watch_readable_page(va).unwrap();
+                    entries.push((va, page_state(&mm, va), watch));
+                }
+            }
+            let before = mm.mmu.table_bytes();
+            assert_eq!(
+                with_unmap_prepare_failure(nth, || mm.munmap(lo, hi - lo)),
+                Err(Errno::ENOMEM)
+            );
+            assert_eq!(mm.mmu.table_bytes(), before + (nth as u64 - 1) * p);
+            assert_eq!(layout(&mm), original);
+            assert!(mm.graveyard.is_empty() && !mm.dirty);
+            assert!(mm.code_ranges.is_empty() && !mm.exec_changed);
+            assert_eq!(
+                *mm.shared_maps.read().unwrap(),
+                [(first, first + LEAF_SPAN)]
+            );
+            assert_eq!(mm.vdso, loan);
+            for (va, state, watch) in &entries {
+                assert_eq!(page_state(&mm, *va), *state);
+                assert!(watch.is_current());
+            }
+            for va in [loan, loan + p] {
+                let owner = parent.borrow();
+                let host = owner.mmu.translate(va, prot::READ).unwrap();
+                assert_eq!(mm.cow.borrow().borrowed[&va].host, host);
+                assert!(owner.cow.borrow().lent.contains(&va));
+                assert_eq!(owner.loans.borrow()[&(host.as_ptr() as usize)].users(), 2);
+            }
+            drop(mm);
+            poke(&child, loan, b'C');
+            assert_eq!((byte(&child, loan), byte(&parent, loan)), (b'C', b'A'));
+            assert!(!writable(&parent, loan + p));
+
+            let mut mm = child.borrow_mut();
+            mm.munmap(lo, hi - lo).unwrap();
+            assert_eq!(mm.mmu.next_present(lo, hi), hi);
+            assert_eq!(mm.graveyard.len(), 3);
+            assert!(mm.dirty);
+            assert!(mm.exec_changed);
+            assert_eq!(mm.code_ranges, [(lo, LEAF_SPAN - p)]);
+            assert_eq!(*mm.shared_maps.read().unwrap(), [(first, lo)]);
+            assert_eq!(mm.vdso, 0);
+            assert!(mm.cow.borrow().borrowed.is_empty());
+            assert!(parent.borrow().cow.borrow().lent.is_empty());
+            assert!(parent.borrow().loans.borrow().is_empty());
+            assert!(writable(&parent, loan + p));
+            for (va, _, watch) in entries {
+                assert_eq!(watch.is_current(), !(lo..hi).contains(&va));
+            }
+        }
+    }
+
+    #[test]
+    fn discard_prepare_failure_preserves_anonymous_contents_and_translations() {
+        let mut mm = Mm::new();
+        let base = LEAF_SPAN;
+        let addr = base + PAGE_SIZE;
+        let rwx = RW | prot::EXEC;
+        mm.map_anonymous(base, LEAF_SPAN, rwx).unwrap();
+        mm.write(UserSlice::new(addr, 1), b"D").unwrap();
+        mm.sync_except(None);
+        let host = mm.mmu.translate(addr, rwx).unwrap();
+        let watch = mm.mmu.watch_readable_page(addr).unwrap();
+        let before = mm.mmu.table_bytes();
+        let (rereads, res) =
+            with_unmap_prepare_failure(1, || mm.discard_range(addr, PAGE_SIZE, false));
+        assert_eq!(res, Err(Errno::ENOMEM));
+        assert!(rereads.is_empty() && mm.code_ranges.is_empty() && !mm.dirty);
+        assert_eq!(mm.mmu.translate(addr, rwx), Some(host));
+        assert!(watch.is_current());
+        let mut byte = [0];
+        mm.read(UserSlice::new(addr, 1), &mut byte).unwrap();
+        assert_eq!(byte, *b"D");
+        assert_eq!(mm.discard_range(addr, PAGE_SIZE, false).1, Ok(()));
+        assert_eq!(mm.mmu.table_bytes(), before + PAGE_SIZE);
+        assert_eq!(
+            mm.mmu.next_present(addr, addr + PAGE_SIZE),
+            addr + PAGE_SIZE
+        );
+        assert!(!watch.is_current());
+        mm.read(UserSlice::new(addr, 1), &mut byte).unwrap();
+        assert_eq!(byte, [0]);
+    }
+
+    #[test]
+    fn discard_prepare_failure_preserves_private_file_copies() {
+        use std::os::fd::AsRawFd;
+
+        let mut mm = Mm::new();
+        let file = appine_hal::memfd(c"discard-private-copy").unwrap();
+        let len = appine_hal::page_size() as u64;
+        file.set_len(len).unwrap();
+        let addr = mm
+            .mmap(
+                0,
+                len,
+                prot::READ,
+                flags::MAP_PRIVATE,
+                Some((file.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        // Exercise the software tracking path even on hosts with readable pagemap.
+        let pages = FilePages::new(None, BTreeSet::new());
+        mm.vmas.get_mut(&addr).unwrap().pages = Some(pages.clone());
+        mm.mprotect(addr, len, RW).unwrap();
+        mm.write(UserSlice::new(addr, 1), b"F").unwrap();
+        let host = mm.mmu.translate(addr, RW).unwrap();
+        let watch = mm.mmu.watch_readable_page(addr).unwrap();
+        assert!(pages.copied.borrow().contains(&0));
+        assert_eq!(
+            with_unmap_prepare_failure(1, || mm.discard_range(addr, len, false)).1,
+            Err(Errno::ENOMEM)
+        );
+        assert!(pages.copied.borrow().contains(&0));
+        assert_eq!(mm.mmu.translate(addr, RW), Some(host));
+        assert!(watch.is_current());
+        let mut byte = [0];
+        mm.read(UserSlice::new(addr, 1), &mut byte).unwrap();
+        assert_eq!(byte, *b"F");
+        assert_eq!(mm.discard_range(addr, len, false).1, Ok(()));
+        assert!(pages.copied.borrow().is_empty());
+        assert!(!watch.is_current());
     }
 
     /// Fail exactly the nth CoW map on this thread, restoring the hook even on unwind.

@@ -176,6 +176,7 @@ unsafe extern "C" {
     fn appine_mmu_free(mmu: *mut RawMmu);
     fn appine_mmu_table_bytes(mmu: *const RawMmu) -> u64;
     fn appine_mmu_map(mmu: *mut RawMmu, gva: u64, host: *mut c_void, len: u64, prot: u32) -> c_int;
+    fn appine_mmu_prepare_unmap(mmu: *mut RawMmu, gva: u64, len: u64) -> c_int;
     fn appine_mmu_unmap(mmu: *mut RawMmu, gva: u64, len: u64) -> c_int;
     fn appine_mmu_protect(mmu: *mut RawMmu, gva: u64, len: u64, prot: u32) -> c_int;
     fn appine_mmu_fill(mmu: *mut RawMmu, gva: u64, host: *mut c_void, len: u64, prot: u32)
@@ -366,10 +367,18 @@ impl Mmu {
         unsafe { self.map_shared(gva, host, len, prot) }
     }
 
-    /// Unmaps `[gva, gva + len)`.
+    /// Demotes superpages partially covered by the page-aligned range `[gva, gva + len)`.
+    /// Translations, permissions and page watches survive even if allocation fails. After
+    /// success, unmapping this range needs no allocation unless a boundary is promoted again.
+    pub fn prepare_unmap(&mut self, gva: u64, len: u64) -> Result<(), MapError> {
+        map_result(unsafe { appine_mmu_prepare_unmap(self.raw.as_ptr(), gva, len) })
+    }
+
+    /// Unmaps `[gva, gva + len)`. On error all translations and page watches survive.
     pub fn unmap(&mut self, gva: u64, len: u64) -> Result<(), MapError> {
-        let rc = unsafe { appine_mmu_unmap(self.raw.as_ptr(), gva, len) };
-        self.watched.get_mut().finish_edit(rc, &[gva], len)
+        map_result(unsafe { appine_mmu_unmap(self.raw.as_ptr(), gva, len) })?;
+        self.watched.get_mut().invalidate(gva..gva + len);
+        Ok(())
     }
 
     /// Changes the permissions of existing entries, possibly to 0 (the host page is kept but

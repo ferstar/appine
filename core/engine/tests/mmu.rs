@@ -2,7 +2,7 @@
 
 use std::ptr::NonNull;
 
-use appine_engine::{Mmu, PAGE_SIZE, prot};
+use appine_engine::{MapError, Mmu, PAGE_SIZE, VA_BITS, prot};
 
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
@@ -281,6 +281,71 @@ fn superpages_map_protect_unmap_demote_and_move() {
     assert!(mmu.translate(base4, prot::WRITE).is_some());
     assert!(mmu.translate(base4 + PAGE_SIZE, prot::WRITE).is_none());
     assert!(mmu.translate(base4 + 2 * PAGE_SIZE, prot::WRITE).is_some());
+}
+
+#[test]
+fn prepare_unmap_demotes_only_partial_boundaries_and_preserves_watches() {
+    let p = PAGE_SIZE;
+    for (span, lo, hi, tables) in [
+        (LEAF, 0, LEAF, 0),
+        (LEAF, 0, p, 1),
+        (LEAF, LEAF - p, LEAF, 1),
+        (LEAF, p, 3 * p, 1),
+        (3 * LEAF, p, 3 * LEAF - p, 2),
+        (2 * LEAF, 0, LEAF + p, 1),
+    ] {
+        let mut mem = pages((span / p) as usize);
+        let mut mmu = Mmu::new();
+        let base = LEAF;
+        unsafe { mmu.map(base, host(&mut mem, 0), span, RW).unwrap() };
+        let before = mmu.table_bytes();
+        let watches: Vec<_> = (0..mem.len())
+            .map(|i| mmu.watch_readable_page(base + i as u64 * p).unwrap())
+            .collect();
+        mmu.prepare_unmap(base + lo, hi - lo).unwrap();
+        assert_eq!(mmu.table_bytes(), before + tables * p);
+        for (i, watch) in watches.iter().enumerate() {
+            let va = base + i as u64 * p;
+            assert!(watch.is_current());
+            assert_eq!(mmu.translate(va, RW), Some(host(&mut mem, i)));
+            assert!(mmu.translate(va, prot::EXEC).is_none());
+        }
+        mmu.unmap(base + lo, hi - lo).unwrap();
+        assert_eq!(mmu.table_bytes(), before + tables * p);
+        for (i, watch) in watches.iter().enumerate() {
+            let offset = i as u64 * p;
+            let va = base + offset;
+            let kept = !(lo..hi).contains(&offset);
+            assert_eq!(watch.is_current(), kept);
+            assert_eq!(mmu.next_present(va, va + p) == va, kept);
+            assert_eq!(mmu.translate(va, RW), kept.then(|| host(&mut mem, i)));
+        }
+    }
+}
+
+#[test]
+fn prepare_unmap_validates_the_whole_range_before_demotion() {
+    let mut mem = pages(512);
+    let mut mmu = Mmu::new();
+    unsafe { mmu.map(0, host(&mut mem, 0), LEAF, RW).unwrap() };
+    let watch = mmu.watch_readable_page(PAGE_SIZE).unwrap();
+    let before = mmu.table_bytes();
+    let limit = 1 << VA_BITS;
+    for (addr, len) in [
+        (1, PAGE_SIZE),
+        (0, LEAF - 1),
+        (PAGE_SIZE, limit),
+        (limit + PAGE_SIZE, 0),
+        (PAGE_SIZE, u64::MAX - PAGE_SIZE + 1),
+    ] {
+        assert_eq!(mmu.prepare_unmap(addr, len), Err(MapError::InvalidArgument));
+        assert_eq!(mmu.unmap(addr, len), Err(MapError::InvalidArgument));
+    }
+    mmu.prepare_unmap(PAGE_SIZE, 0).unwrap();
+    mmu.prepare_unmap(limit, 0).unwrap();
+    assert_eq!(mmu.table_bytes(), before);
+    assert!(watch.is_current());
+    assert_eq!(mmu.translate(PAGE_SIZE, RW), Some(host(&mut mem, 1)));
 }
 
 #[test]

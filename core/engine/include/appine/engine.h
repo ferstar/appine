@@ -251,6 +251,8 @@ int appine_mmu_map(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t le
 /* Same as appine_mmu_map, but pages with existing entries (including ones with permission 0) stay
  * unchanged: on-demand filling */
 int appine_mmu_fill(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t len, uint32_t prot);
+/* Demote partially covered superpages without changing any translations. */
+int appine_mmu_prepare_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len);
 int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len);
 /* Changes only the permissions of existing entries (possibly to 0: the host page is kept but
  * cannot be accessed); pages without entries stay unchanged */

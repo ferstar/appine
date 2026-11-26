@@ -280,10 +280,38 @@ int appine_mmu_fill(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t l
     return store_range(mmu, gva, host, len, prot, true);
 }
 
-int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
+static int prepare_unmap_boundary(struct appine_mmu *mmu, uint64_t va)
+{
+    uintptr_t *slot = l2_slot_find(mmu, va, &va);
+    uintptr_t cur = slot ? load_entry(slot) : 0;
+    if ((cur & PTE_SUPER) && !demote_l2(mmu, slot, cur))
+        return APPINE_ENOMEM;
+    return APPINE_OK;
+}
+
+int appine_mmu_prepare_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
 {
     if (!range_ok(gva, len))
         return APPINE_EINVAL;
+    if (len == 0)
+        return APPINE_OK;
+    uint64_t end = gva + len;
+    if ((gva & MMU_SUPER_MASK) || leaf_end(gva, end) - gva != LEAF_SPAN) {
+        int rc = prepare_unmap_boundary(mmu, gva);
+        if (rc != APPINE_OK)
+            return rc;
+    }
+    uint64_t last_leaf = (end - 1) & ~(uint64_t)MMU_SUPER_MASK;
+    if (last_leaf != (gva & ~(uint64_t)MMU_SUPER_MASK) && (end & MMU_SUPER_MASK))
+        return prepare_unmap_boundary(mmu, last_leaf);
+    return APPINE_OK;
+}
+
+int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
+{
+    int rc = appine_mmu_prepare_unmap(mmu, gva, len);
+    if (rc != APPINE_OK)
+        return rc;
     uint64_t end = gva + len;
     for (uint64_t va = gva; va < end;) {
         uintptr_t *l2_slot = l2_slot_find(mmu, va, &va);
