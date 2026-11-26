@@ -402,9 +402,23 @@ pub struct Store {
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum CleanupStep {
+    WaitingForShared,
     BeforeCommit,
     BeforeSync,
     Unlinked(Ino),
+}
+
+fn unlock_file(fd: std::os::fd::RawFd) -> Result<(), Errno> {
+    loop {
+        // SAFETY: flock takes a file descriptor and no pointers.
+        if unsafe { libc::flock(fd, libc::LOCK_UN) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(io_err(err));
+        }
+    }
 }
 
 impl Store {
@@ -418,6 +432,8 @@ impl Store {
             return Err(Errno::EEXIST);
         }
         let mut store = Self::connect(dir, COMMIT_DELAY)?;
+        let fd = store.lock.as_raw_fd();
+        appine_hal::flock(fd, true, true).map_err(Errno)?;
         let now = now_ns();
         store
             .db()
@@ -428,6 +444,7 @@ impl Store {
             )
             .map_err(db_err)?;
         store.join();
+        appine_hal::flock(fd, false, true).map_err(Errno)?;
         Ok(store)
     }
 
@@ -455,51 +472,74 @@ impl Store {
         #[cfg(test)] mut on_cleanup: impl FnMut(&Store, CleanupStep) -> Result<(), Errno>,
     ) -> Result<Store, Errno> {
         let fd = self.lock.as_raw_fd();
-        if appine_hal::flock(fd, true, false).is_ok() {
-            self.meta.commits.reset_users();
-            let token = Self::boot_token();
-            self.recover_objects(token)?;
-            self.remove_lost_objects()?;
-            let to_unlink = self.transaction(|s| {
-                for path in volatile {
-                    s.empty_dir(path)?;
+        let mut backoff = Duration::ZERO;
+        loop {
+            match appine_hal::flock(fd, true, false) {
+                Ok(()) => break,
+                Err(libc::EWOULDBLOCK) => {}
+                Err(e) => return Err(Errno(e)),
+            }
+            #[cfg(test)]
+            on_cleanup(&self, CleanupStep::WaitingForShared)?;
+            appine_hal::flock(fd, false, true).map_err(Errno)?;
+            if self.meta.commits.active_users() > 0 {
+                // Joining ends write deferral. Wait for any earlier deferred transaction.
+                if self.join() > 0 {
+                    self.exec("BEGIN IMMEDIATE")?;
+                    self.exec("COMMIT")?;
                 }
-                s.remove_detached_dirs()?;
-                let to_unlink = s.remove_orphans()?;
-                if !to_unlink.is_empty() {
-                    // An overdue operation can commit as soon as this closure returns. Leave
-                    // the token absent until every post-commit unlink has finished.
-                    s.lock.set_len(32).map_err(io_err)?;
-                }
-                #[cfg(test)]
-                on_cleanup(s, CleanupStep::BeforeCommit)?;
-                Ok(to_unlink)
-            })?;
-            self.commit()?;
-            self.pending_release.borrow_mut().clear();
-            if !to_unlink.is_empty() {
-                #[cfg(test)]
-                on_cleanup(&self, CleanupStep::BeforeSync)?;
-                self.meta.sync_metadata()?;
-                // Keep exclusive use until a new file can safely reuse any freed number.
-                for ino in to_unlink {
-                    self.remove_object(ino)?;
-                    #[cfg(test)]
-                    on_cleanup(&self, CleanupStep::Unlinked(ino))?;
-                }
-                if let Some(token) = token {
-                    self.lock.write_all_at(token, 32).map_err(io_err)?;
-                }
+                return Ok(self);
+            }
+
+            // The exclusive opener failed or the last user left. Let a waiter take LOCK_EX.
+            unlock_file(fd)?;
+            if backoff.is_zero() {
+                std::thread::yield_now();
+                backoff = Duration::from_micros(100);
+            } else {
+                std::thread::sleep(backoff);
+                backoff = (2 * backoff).min(Duration::from_millis(2));
             }
         }
-        appine_hal::flock(fd, false, true).map_err(Errno)?;
-        // Another process is also using the store: wait for it to commit its deferred write
-        // transaction (after seeing this count it no longer defers); only then are its changes
-        // visible
-        if self.join() > 0 {
-            self.exec("BEGIN IMMEDIATE")?;
-            self.exec("COMMIT")?;
+
+        self.meta.commits.reset_users();
+        let token = Self::boot_token();
+        self.recover_objects(token)?;
+        self.remove_lost_objects()?;
+        let to_unlink = self.transaction(|s| {
+            for path in volatile {
+                s.empty_dir(path)?;
+            }
+            s.remove_detached_dirs()?;
+            let to_unlink = s.remove_orphans()?;
+            if !to_unlink.is_empty() {
+                // An overdue operation can commit as soon as this closure returns. Leave
+                // the token absent until every post-commit unlink has finished.
+                s.lock.set_len(32).map_err(io_err)?;
+            }
+            #[cfg(test)]
+            on_cleanup(s, CleanupStep::BeforeCommit)?;
+            Ok(to_unlink)
+        })?;
+        self.commit()?;
+        self.pending_release.borrow_mut().clear();
+        // Even an empty cleanup may follow a prior run's unsynced change of shared object.
+        #[cfg(test)]
+        on_cleanup(&self, CleanupStep::BeforeSync)?;
+        self.meta.sync_metadata()?;
+        if !to_unlink.is_empty() {
+            // Keep exclusive use until a new file can safely reuse any freed number.
+            for ino in to_unlink {
+                self.remove_object(ino)?;
+                #[cfg(test)]
+                on_cleanup(&self, CleanupStep::Unlinked(ino))?;
+            }
+            if let Some(token) = token {
+                self.lock.write_all_at(token, 32).map_err(io_err)?;
+            }
         }
+        self.join();
+        appine_hal::flock(fd, false, true).map_err(Errno)?;
         Ok(self)
     }
 
@@ -557,7 +597,6 @@ impl Store {
             .truncate(false)
             .open(dir.join("lock"))
             .map_err(io_err)?;
-        appine_hal::flock(lock.as_raw_fd(), false, true).map_err(Errno)?;
         let commits = Commits::open(&lock)?;
         let objects_dir = appine_hal::open_dir(&dir.join("objects")).map_err(Errno)?;
         let objects_st = appine_hal::fstat(objects_dir.as_raw_fd()).map_err(Errno)?;
@@ -571,7 +610,8 @@ impl Store {
             commits,
             objects_dir,
             reaper: Reaper::default(),
-            fs: lock.try_clone().map_err(io_err)?,
+            // Meta can outlive Store. Its syncfs descriptor must not retain the store's flock.
+            fs: File::open(dir.join("lock")).map_err(io_err)?,
             wal: dir.join("meta.db-wal"),
             durable: AtomicU64::new(0),
             #[cfg(test)]
@@ -4744,6 +4784,14 @@ mod tests {
             }
         }
 
+        fn assert_recovered(&self) {
+            self.assert_objects(false);
+            assert_eq!(
+                &fs::read(self.dir.join("lock")).unwrap()[32..],
+                Store::boot_token().unwrap()
+            );
+        }
+
         fn assert_contents(&self, s: &Store, parent: Ino, name: &[u8], expected: &[u8]) {
             use std::io::Read;
             let ino = s.lookup(parent, name).unwrap().unwrap();
@@ -4799,8 +4847,9 @@ mod tests {
         fn check_reconciliation(&self) {
             self.assert_committed();
             let s = self.reopen();
-            assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
-            self.assert_objects(false);
+            // One sync before deleting stray objects, one after the cleanup transaction.
+            assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 2);
+            self.assert_recovered();
         }
     }
 
@@ -4869,6 +4918,9 @@ mod tests {
             });
             assert_eq!(result.err(), Some(Errno::EIO));
             assert_eq!(meta.sync_failures.load(Ordering::Relaxed), 1);
+            let lock = File::open(f.dir.join("lock")).unwrap();
+            appine_hal::flock(lock.as_raw_fd(), true, false).unwrap();
+            drop(lock);
             drop(meta);
             f.assert_interrupted();
             f.assert_objects(true);
@@ -4919,6 +4971,7 @@ mod tests {
         let s = s
             .finish_open(&[b"run"], |s, step| {
                 match step {
+                    CleanupStep::WaitingForShared => panic!("expected an exclusive opener"),
                     CleanupStep::BeforeCommit => {
                         assert!(s.doomed.borrow().is_empty());
                         assert!(s.has_pending_release());
@@ -4947,24 +5000,171 @@ mod tests {
         assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
         assert_eq!(s.meta.reaper.state.lock().unwrap().handed, 0);
         assert!(!s.has_pending_release());
-        f.assert_objects(false);
-        assert_eq!(
-            &fs::read(f.dir.join("lock")).unwrap()[32..],
-            Store::boot_token().unwrap()
-        );
+        f.assert_recovered();
 
         let (ino, mut new) = s.create_file(ROOT, b"reused", 0o600, 0, 0).unwrap();
         assert!(f.objects.contains(&ino));
         new.write_all(b"new").unwrap();
         drop((s, new));
-        // A matching token skips both the directory scan and the WAL flush on an idle open.
+        // A matching token skips the directory scan even though the opener syncs metadata.
         let stray = f.object(99999);
         fs::write(&stray, []).unwrap();
         let s = f.reopen();
-        assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 0);
+        assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
         assert!(stray.exists());
         f.assert_contents(&s, ROOT, b"reused", b"new");
         drop(s);
+        fs::remove_dir_all(f.dir).unwrap();
+    }
+
+    #[test]
+    fn idle_open_syncs_prior_share_before_an_in_place_write() {
+        let (s, dir) = temp_store("idle-share");
+        drop(s);
+        let s = Store::open(&dir, &[]).unwrap();
+        let (a, mut fa) = s.create_file(ROOT, b"a", 0o600, 0, 0).unwrap();
+        let (b, _) = s.create_file(ROOT, b"b", 0o600, 0, 0).unwrap();
+        let (c, mut fc) = s.create_file(ROOT, b"c", 0o600, 0, 0).unwrap();
+        fa.write_all(b"a").unwrap();
+        fc.write_all(b"c").unwrap();
+        s.share(a, b).unwrap();
+        s.commit().unwrap();
+        s.meta.sync_metadata().unwrap();
+        s.reaped();
+
+        // Pin the earlier SQLite snapshot so closing the store cannot checkpoint the new share.
+        let reader = Connection::open(dir.join("meta.db")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT ino FROM shared")
+            .unwrap();
+        s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+        s.share(c, b).unwrap();
+        s.commit().unwrap();
+        drop(s);
+        assert!(dir.join("meta.db-wal").metadata().unwrap().len() > 0);
+
+        let s = Store::connect(&dir, Duration::ZERO).unwrap();
+        let result = s.finish_open(&[], |s, step| {
+            if step == CleanupStep::BeforeSync {
+                s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        assert_eq!(result.err(), Some(Errno::EIO));
+        let s = Store::open(&dir, &[]).unwrap();
+        assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
+        assert!(s.unshare(a, None).unwrap().is_none());
+        s.open_object(a, true)
+            .unwrap()
+            .write_all_at(b"A", 0)
+            .unwrap();
+        let mut byte = [0];
+        s.open_object(b, false)
+            .unwrap()
+            .read_exact_at(&mut byte, 0)
+            .unwrap();
+        assert_eq!(&byte, b"c");
+        drop((s, reader));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_openers_recover_before_reusing_an_inode() {
+        let f = BootCleanup::new("boot-race");
+        let reader = Connection::open(f.dir.join("meta.db")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT ino FROM inodes")
+            .unwrap();
+        let s = Store::connect(&f.dir, Duration::ZERO).unwrap();
+        let result = s.finish_open(&[b"run"], |s, step| {
+            if step == CleanupStep::BeforeSync {
+                s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        assert_eq!(result.err(), Some(Errno::EIO));
+        f.assert_interrupted();
+        f.assert_objects(true);
+        f.assert_committed();
+
+        let start = std::sync::Barrier::new(4);
+        let open = || {
+            let s = Store::connect(&f.dir, Duration::ZERO);
+            start.wait();
+            let s = s.unwrap().finish_open(&[], |_, _| Ok(())).unwrap();
+            f.assert_recovered();
+            s
+        };
+        let s = std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| drop(open()));
+            }
+            open()
+        });
+        let (ino, mut file) = s.create_anonymous(0o600, 0, 0).unwrap();
+        assert!(f.objects.contains(&ino));
+        file.write_all(b"reused").unwrap();
+        assert!(!f.object(ino).exists());
+        drop((s, reader));
+        fs::remove_dir_all(f.dir).unwrap();
+    }
+
+    #[test]
+    fn waiting_openers_retry_after_exclusive_sync_failure() {
+        let f = BootCleanup::new("boot-waiters");
+        let (exclusive, before_sync) = std::sync::mpsc::channel();
+        let (waiting, waiters) = std::sync::mpsc::channel();
+        let timeout = Duration::from_secs(5);
+        let retried = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let fixture = &f;
+            scope.spawn(move || {
+                let s = Store::connect(&fixture.dir, Duration::ZERO).unwrap();
+                let result = s.finish_open(&[b"run"], |s, step| {
+                    if step == CleanupStep::BeforeSync {
+                        fixture.assert_committed();
+                        fixture.assert_objects(true);
+                        fixture.assert_interrupted();
+                        exclusive.send(()).unwrap();
+                        // Fail only after every peer has lost its exclusive try.
+                        for _ in 0..3 {
+                            waiters.recv_timeout(timeout).unwrap();
+                        }
+                        s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+                    }
+                    Ok(())
+                });
+                assert_eq!(result.err(), Some(Errno::EIO));
+            });
+
+            before_sync.recv_timeout(timeout).unwrap();
+            for _ in 0..3 {
+                let retried = &retried;
+                let mut waiting = Some(waiting.clone());
+                scope.spawn(move || {
+                    let s = Store::connect(&fixture.dir, Duration::ZERO).unwrap();
+                    let _store = s
+                        .finish_open(&[], |_, step| {
+                            match step {
+                                CleanupStep::WaitingForShared => {
+                                    if let Some(tx) = waiting.take() {
+                                        tx.send(()).unwrap();
+                                    }
+                                }
+                                CleanupStep::BeforeSync => {
+                                    assert!(waiting.is_none());
+                                    retried.store(true, Ordering::SeqCst);
+                                }
+                                _ => {}
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                    fixture.assert_recovered();
+                    assert!(retried.load(Ordering::SeqCst));
+                });
+            }
+        });
         fs::remove_dir_all(f.dir).unwrap();
     }
 

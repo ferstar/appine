@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (namespace and cache, object sharing and lifetimes, transaction and recovery ordering, import and provider authorization checked against the store and its callers)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: durable boot-cleanup unlinks, same-boot recovery, and active-user accounting on failed opens)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: durable boot-cleanup unlinks, unconditional exclusive-open WAL sync, and concurrent lock serialization)
 
 ## Responsibilities
 
@@ -238,22 +238,27 @@ provider and rootfs installation UI (`android`).
 
 ### Opening and boot cleanup
 
-- Every connection takes a shared `flock` on `lock`. If it obtains exclusive use, it resets
-  `users`, reconciles objects when the boot token is missing or different, then removes objects
-  in the recorded uncommitted range that have no row.
+- Creation takes a blocking exclusive `flock` on `lock` before inserting the root inode.
+  An opener first tries a nonblocking exclusive lock. On success it resets `users`, reconciles
+  objects when the boot token is missing or different, then removes objects in the recorded
+  uncommitted range that have no row.
 - One transaction empties the volatile directories (the kernel passes `/dev/shm` and `/run`,
   host-side openers pass none), removes detached trees, drops deleted files' `shared` rows and
   deletes zero-link inode rows whose numbers no surviving share uses. It collects the regular
   orphans' and unused shared objects' numbers and drains `doomed` into the same set. For a
   settled file using another inode's old object, only `doomed` may still name that object.
 - When the set is nonempty, cleanup clears the boot token inside the transaction, before even an
-  overdue commit can run. After commit it clears `pending_release`, syncs the WAL, unlinks the
-  collected objects under the exclusive lock, and restores the token. An interruption leaves the
-  next exclusive opener to reconcile against SQLite, even on the same host boot. An idle open
-  with a matching token skips the object scan and WAL sync.
-- After cleanup the connection downgrades to a shared lock and increments `users`. If others
-  are open it waits (`BEGIN IMMEDIATE; COMMIT`) for their deferred transaction. A connection
-  decrements `users` on drop only if it joined.
+  overdue commit can run. Every exclusive open clears `pending_release` and calls
+  `sync_metadata()` after commit to make both prior-run WAL frames and the cleanup commit durable.
+  If `meta.db-wal` is absent, the durability watermark advances without a host `fdatasync`.
+  Cleanup then unlinks any collected objects under the exclusive lock and restores the token it
+  cleared. An interrupted cleanup forces reconciliation even on the same boot. An idle open with
+  a matching token skips the `objects/` scan.
+- The creator or exclusive opener calls `join()` before downgrading to a shared lock. A contending
+  opener waits for a shared lock and checks `users`. With active users it joins and waits for any
+  existing user's deferred transaction (`BEGIN IMMEDIATE; COMMIT`). With zero users it unlocks,
+  yields or briefly backs off, and retries exclusive acquisition. Only a joined connection
+  decrements `users` on drop.
 
 ### Metadata cache
 
@@ -378,6 +383,11 @@ provider and rootfs installation UI (`android`).
 - Boot cleanup can free inode numbers for immediate reuse. It drains all doomed objects before
   commit and unlinks them itself only after the commit is durable, while it still holds the
   exclusive lock. The reaper unlinks by number and could otherwise delete a reused object.
+- An empty cleanup still syncs metadata before a writer can settle a previously shared object
+  in place. The matching boot token permits skipping the directory scan only.
+- A shared lock with zero users can follow a failed cleanup. Joining before the exclusive
+  downgrade and retrying on zero prevent concurrent openers from bypassing recovery and WAL sync.
+  The store owns the flock so a surviving `Meta` cannot hold it after the connection leaves.
 - A number some `shared` row uses as its object keeps its inode row (live, deleted, or one that only
   numbers a copy) at boot, so no new file gets it while the object lives.
 - When two or more rows use one object, every one of them is held, and nothing may write that
