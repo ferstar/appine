@@ -16,9 +16,6 @@ SKIP="$SKIP:${L}Basic:${L}Noop:${L}Enobufs:${L}UserToUserSend:${L}NoSelfBroadcas
 SKIP="$SKIP:$R.AddAndRemoveRoute/*:$R.AddAndRemoveRule/*"
 SKIP="$SKIP:$R.AddressMulticastGroup/*:$R.AddressPrefixRouteMulticastGroup/*"
 SKIP="$SKIP:$R.RouteMulticastGroup/*:$R.RouteMulticastGroupSameDestination/*"
-# kernel/netlink: netlink requests are not validated as Linux validates them (wrong-size attributes
-# of ip route get are skipped)
-SKIP="$SKIP:NetlinkRouteTest.GetRouteOversizedDestination:NetlinkRouteTest.GetRouteFamilyMismatch"
 # kernel/netns: only unicast routes are supported. Route requests require exact address sizes,
 # lo cannot be a next hop, and next-hop checks miss Linux's special cases. IPv6 over virtual
 # devices is unusable.

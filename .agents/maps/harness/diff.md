@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the split; latest change: arm64 musl startup and the hosted ProcSelfAuxv.EntryValues exclusion)
+> Maintained: 2026-11-26 (targeted verification only since the split; latest change: tmpfs placement and capability requirements for restored upstream tests)
 
 ## Responsibilities
 
@@ -126,11 +126,13 @@ benchmarks, surveys and crash testing remain `harness`.
 - Each builder does nothing while its tarball's name exists, so a local change to `tests/starnix`
   or `tests/gvisor` takes effect only after the tarball is deleted (CI keys its caches on them).
 - Seven Starnix cases cover 66 of its built programs by subsystem (`starnix-mm`, `-process`,
-  `-signal`, `-fs`, `-proc`, `-io`, and `-overlay`, which runs overlayfs_test and fs_test's
-  `OverlayFs` tests with `TEST_TMPDIR` on a tmpfs, since Linux refuses docker's overlay root as an
-  upper layer), and the six original gVisor cases cover 53 programs (`gvisor-process`, `-fs`, `-net`,
-  `-unix`, `-mm` for cross-process transfers and memory management, and `-io` for copy_file_range,
-  preadv2 and pwritev2). Each of these cases calls the shipped
+  `-signal`, `-fs`, `-proc`, `-io` and `-overlay`). The overlay case mounts tmpfs at `/tmp` for
+  the overlay layers and for the `O_TMPFILE` link and procfs fd-name checks that open `/tmp`
+  directly. It enters the shipped files directory before mounting and detaches the mount after
+  the run.
+- The six original gVisor cases cover 53 programs (`gvisor-process`, `-fs`, `-net`, `-unix`,
+  `-mm` for cross-process transfers and memory management, and `-io` for copy_file_range,
+  preadv2 and pwritev2). Each legacy gVisor and Starnix case calls the shipped
   `tests/diff/gtest/run.sh` once (difftest reads the suite from
   that one call) with the suite, its skip filter and its program list, and optionally `ONLY`, a
   gtest filter of the only tests to run; the runner lists each program's tests (minus disabled
@@ -151,9 +153,10 @@ benchmarks, surveys and crash testing remain `harness`.
 - Nine further gVisor cases select program-specific `ONLY` and `SKIP` filters from
   `gvisor.filters`. Each group sets its measured native Docker options. The seven regular groups
   and two slow groups run through `selected.sh`, which prints each program name and checks its
-  expected pass count. A row can set `TEST_TMPDIR` for its program. `memfd_test` uses
-  `/dev/shm` so its ordinary tmpfs seal test runs. For a failed assertion it also prints the
-  first 30 lines of the captured GoogleTest output. The pass-count check excludes these diagnostic
+  expected pass count. A row can set `TEST_TMPDIR` for its program. The ordinary tmpfs
+  seal and directory link-count checks use `/dev/shm`. The bind-mount ID, trusted xattr and
+  abstract socket cross-namespace checks run in the sys-admin group. For a failed assertion the runner
+  prints the first 30 lines of the captured GoogleTest output. The pass-count check excludes these diagnostic
   lines. An empty group, missing binary, skip or failure makes the selection fail even when native Linux and Appine
   print identical output. The program list across all fifteen
   gVisor groups determines the selected tarball.
@@ -233,7 +236,10 @@ benchmarks, surveys and crash testing remain `harness`.
 
 ## Confirmed bugs / technical debt
 
-None recorded.
+- Three existing starnix-overlay cases fail on both sides before they exercise execution from
+  an overlay. `DropUncachedDirEntryDuringExecPassesLockDep` and `ExecutableAccessChecks` lack
+  their exit-zero executable, and `SuidAndSgidExecOnOverlay` lacks its credentials executable.
+  The Starnix tarball includes the test programs without these helpers.
 
 ## Open questions
 

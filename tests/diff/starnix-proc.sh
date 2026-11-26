@@ -8,9 +8,7 @@
 # timerslack_ns is absent; Yama is absent; no tracefs
 SKIP="ProcfsTest.ZoneInfo:PressureTest/*:ProcKallsymsTest.*:ProcTaskDirTest.TimerslackNs*"
 SKIP="$SKIP:SysctlTest/SysctlNodeTest.*/kernel_yama_ptrace_scope:TracefsTest.BufferSizeKbReadWrite"
-# kernel/procfs: /proc/<pid>/fd and fdinfo are open to everyone
-SKIP="$SKIP:ProcfsAccessTest/ProcfsAccessTest.AccessDeniedToNonOwner/fd"
-SKIP="$SKIP:ProcfsAccessTest/ProcfsAccessTest.AccessDeniedToNonOwner/fdinfo"
+# kernel/procfs: opening fdinfo can succeed for a non-owner without CAP_SYS_PTRACE
 SKIP="$SKIP:ProcfsAccessTest/ProcfsAccessTest.AccessDeniedToNonOwnerWithoutCapPtrace/fdinfo"
 # kernel/procfs fidelity gaps: /proc/<pid>/attr is absent (the test stats it); procfs mount
 # options are ignored
@@ -29,8 +27,7 @@ SKIP="$SKIP:SysctlTest/SysctlTestReadBack.ReadBack/core_wmem_max_*"
 # Cannot be compared: pid 2 is kthreadd only on a whole system; docker's pid namespace has no pid 2
 # and Appine gives it to an ordinary process
 SKIP="$SKIP:ProcTaskDirTest.Kthread*"
-# kernel/vfs: no O_TMPFILE (EISDIR; docker's overlay root on 6.8 refuses it too, CI's newer kernel
-# supports it)
+# The O_TMPFILE tests use a tmpfs at /tmp in starnix-overlay.
 SKIP="$SKIP:ProcSelfFdTest.TmpFileFdName:ProcSelfFdTest.TmpFileLinkIntoAfterFdName"
 # Cannot be compared on CI: the test fails natively on CI's CPU, which has SVE
 SKIP="$SKIP:CpuinfoTest.SveFunctionMultiVersioning"

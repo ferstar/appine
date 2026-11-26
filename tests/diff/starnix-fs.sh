@@ -7,24 +7,18 @@
 # are skipped, with the reason above them.
 # kernel/vfs: AIO contexts belong to the thread group, not the address space
 SKIP="AioWriteTest.WriteCompletesAfterSubmittingProcessExits"
-# kernel/vfs: F_SETFL takes O_NOATIME with no ownership check; no inode flags (FS_IOC_SETFLAGS is
-# ENOTTY)
-SKIP="$SKIP:FcntlTest.NoatimePermission"
-SKIP="$SKIP:TmpfsTest.CasefoldDisabledByDefault"
 # kernel/sysfs: /sys/block/loop<n> entries are directories, not links into /sys/devices
 SKIP="$SKIP:LoopTest.SysfsDeviceDirectoryRemovalAndReplacement"
 # kernel/procfs: procfs mount options (hidepid, gid) are ignored
 SKIP="$SKIP:ProcMountsTest.FilesystemMountOptions"
 # kernel/pipe: O_NOTIFICATION_PIPE is EINVAL; pipe I/O with faulting buffers ignores Linux's
-# per-buffer rules; splice-family argument checks differ; vmsplice copies the data at the call
+# per-buffer rules; splice-family argument checks differ; vmsplice does not pin source pages
 SKIP="$SKIP:PipeTest.NotificationPipeUnsupported:PipeTest.PartialEfaultRollbackAndShortCounts"
 SKIP="$SKIP:PipeTest.SpliceValidationAndRlimitFsize"
-SKIP="$SKIP:VmspliceTest.FileInPipe:VmspliceTest.ForkWithBufferInPipe:VmspliceTest.ModifyBufferInPipe"
-SKIP="$SKIP:VmspliceTest.RemapSharedBufferInPipeThenModify:VmspliceTest.UnmapBufferInPipe"
+SKIP="$SKIP:VmspliceTest.FileInPipe:VmspliceTest.ForkWithBufferInPipe"
+SKIP="$SKIP:VmspliceTest.UnmapBufferInPipe"
 SKIP="$SKIP:VmspliceTest.UnmapBufferInPipeThenMapInPlace"
 SKIP="$SKIP:VmspliceTest/VmspliceUnmapBufferAfterVmsplicingRemappedBufferTest.*"
-# kernel/poll: pipe POLLOUT counts bytes, not buffers
-SKIP="$SKIP:PipeTest.PolloutFragmentation"
 # fs_test's tests on an overlay run in the starnix-overlay case (natively they need a tmpfs)
 SKIP="$SKIP:OverlayFs/*"
 # Fail on the native side, which runs in docker: its pid namespace turns a dead lock owner's pid
@@ -33,8 +27,7 @@ SKIP="$SKIP:OverlayFs/*"
 SKIP="$SKIP:FcntlLockTest.CloneFiles:MknodTest.MknodChrZeroDoesNotRequireCapMknod"
 SKIP="$SKIP:DetachedMountTest.BindFails:DetachedMountTest.MoveFails:DetachedMountTest.PivotRootFails"
 SKIP="$SKIP:DetachedMountTest.SubmountFails:DetachedMountTest.UnsharePreservesDetachedState"
-# kernel/vfs: no O_TMPFILE (EISDIR; docker's overlay root on 6.8 refuses it too, CI's newer kernel
-# supports it)
+# The O_TMPFILE tests use a tmpfs at /tmp in starnix-overlay.
 SKIP="$SKIP:OtmpfileTest.TmpFileLinkIntoAfter:OtmpfileTest.TmpFileWithOExclShouldFailLinkInto"
 # Cannot be compared on CI's newer kernel: tmpfs casefolding (6.13) runs there and skips itself on
 # 6.8 and Appine; the newer kernel refuses changing a detached mount's propagation; musl's pwrite

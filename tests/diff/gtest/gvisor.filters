@@ -14,8 +14,7 @@ devices	mount_fd_test	8	MoveMountTest.MoveMountAttachedFileOntoFile:MoveMountTes
 devices	mq_test	18	*	MqTest.OpenInvalidArgs
 devices	open_create_test	16	*	-
 devices	ping_socket_test	6	PingSocket.Receive*	-
-# OverlayLower ACL ctime failed repeated Tier 1 checks (kernel/xattr).
-devices	posix_acl_test	83	*	*.RemoveACLClearsSGID/*:*.SetACLClearsSGID/*:*.SetACLEmpty/*:All/PosixACLTest.Access*:All/PosixACLTest.CopyUpDirectoryDoesNotInheritDefaultACL/OverlayUpper:All/PosixACLTest.CopyUpDirectoryDoesNotInheritDefaultACL/Tmpfs:All/PosixACLTest.DeviceFileModeUnaffectedByPostCopyUpParentDefaultACL/OverlayUpper:All/PosixACLTest.DeviceFileModeUnaffectedByPostCopyUpParentDefaultACL/Tmpfs:All/PosixACLTest.GetACLThrough*:All/PosixACLTest.RemoveACLOn*:All/PosixACLTest.SetACLThrough*:All/PosixACLTest.User*
+devices	posix_acl_test	96	*	*.SetACLEmpty/*:All/PosixACLTest.CopyUpDirectoryDoesNotInheritDefaultACL/OverlayUpper:All/PosixACLTest.CopyUpDirectoryDoesNotInheritDefaultACL/Tmpfs:All/PosixACLTest.DeviceFileModeUnaffectedByPostCopyUpParentDefaultACL/OverlayUpper:All/PosixACLTest.DeviceFileModeUnaffectedByPostCopyUpParentDefaultACL/Tmpfs:All/PosixACLTest.GetACLThrough*:All/PosixACLTest.RemoveACLOnFileNotCopiedUp/Tmpfs:All/PosixACLTest.RemoveACLOnFileNotCopiedUp/OverlayUpper:All/PosixACLTest.SetACLThrough*
 devices	prctl_setuid_test	6	*	-
 devices	priority_test	18	*	SetpriorityTest.OtherUidRequiresCapSysNice
 devices	proc_pid_uid_gid_map_test	8	*	*.IdentityMapOwnID/*:*.MapOtherID/*:*.NonIdentityMapOwnID/*:*.TrailingNewlineAndNULIgnored/*:All/ProcPidUidGidMapTest.*:ProcSelfSetgroupsTest.Setgroups*
@@ -93,6 +92,9 @@ sys-admin	socket_inet_loopback_isolated_test	14	*	*.TCPFinWait2Test/*:*.TCPLinge
 sys-admin	socket_netdevice_test	4	NetdeviceTest.Interface*	-
 sys-admin	socket_netlink_netfilter_test	3	NetlinkNetfilterTest.CanCreateSocket:NetlinkNetfilterTest.ErrRetrieveNonexistentTable:NetlinkNetfilterTest.GetDumpTables	-
 sys-admin	socket_netlink_uevent_test	2	*	NetlinkUeventTest.DetachNoFilter
+sys-admin	socket_unix_unbound_abstract_test	6	*.BindConnectInSubNamespace/*	-
+sys-admin	stat_test	1	StatTest.StatxMntIdBindMount	-
+sys-admin	xattr_test	1	XattrTest.TrustedNamespaceWithCapSysAdmin	-
 
 syscalls	affinity_test	13	*	AffinityTest.SetAffinityOtherUidRequiresCapSysNice
 syscalls	aio_test	7	AIOTest.BadWrite:AIOTest.ExitWithPendingIo:AIOTest.Timeout:BadOffset/*	-
@@ -107,8 +109,8 @@ syscalls	deleted_test	5	*	-
 syscalls	dup_test	10	DupTest.*	-
 syscalls	eventfd_test	8	*	EventfdTest.BigWriteFails:EventfdTest.IllegalSeek:EventfdTest.SpliceReturnsEINVAL
 syscalls	exceptions_test	1	*	-
-syscalls	fadvise64_test	3	*	FAdvise64Test.FAdvise64WithOpath
-syscalls	fallocate_test	10	*	AllocateTest.FallocateOtherFDs
+syscalls	fadvise64_test	4	*	-
+syscalls	fallocate_test	11	*	-
 syscalls	fchdir_test	5	*	-
 syscalls	fifo_test	6	*	-
 syscalls	fpsig_fork_test	1	*	-
@@ -130,7 +132,7 @@ syscalls	partial_bad_buffer_test	20	*	-
 syscalls	personality_test	9	*	PersonalityTest.UnsupportedPersonalityBitsAreRejected
 syscalls	ppoll_test	7	*	PpollTest.Signal*
 syscalls	prctl_test	9	*	PrctlTest.InvalidPrSetMM:PrctlTest.NoNewPrivsPreservedAcrossCloneForkAndExecve:PrctlTest.OrphansReparentedToSubreaper:PrctlTest.TaggedAddrCtrl
-syscalls	pread64_test	11	*	Pread64Test.Overflow
+syscalls	pread64_test	12	*	-
 syscalls	preadv_test	2	*	-
 syscalls	proc_isolated_test	3	*	-
 syscalls	proc_net_tcp_test	10	*	-
@@ -146,16 +148,18 @@ syscalls	pwrite64_test	10	*	Pwrite64.AppendOnly
 syscalls	read_test	8	*	-
 syscalls	readahead_test	6	*	ReadaheadTest.InvalidOffset:ReadaheadTest.InvalidSize
 syscalls	readv_test	30	*	ReadvTest.IovecOutsideTaskAddressRangeInNonemptyArray:ReadvTestNoFixture.TruncatedAtMax
+syscalls	rename_test	1	RenameTest.DirectoryOverwritesDirectoryLinkCount	-	/dev/shm
 syscalls	sched_test	6	SchedAttrTest.*	-
 syscalls	sched_yield_test	1	*	-
 syscalls	select_test	8	*	SelectTest.NullFds
 syscalls	sendfile_socket_test	6	*	-
-syscalls	sendfile_test	18	*	SendFileTest.DoNotSendANegativeNumberOfBytes:SendFileTest.SendFileToSelf:SendFileTest.SendPipeWouldBlock:SendFileTest.SendToFullPipeReturnsEAGAIN
+syscalls	sendfile_test	19	*	SendFileTest.SendFileToSelf:SendFileTest.SendPipeWouldBlock:SendFileTest.SendToFullPipeReturnsEAGAIN
 syscalls	shm_test	25	*	ShmTest.MprotectWriteOnReadonlySegmentFails:ShmTest.ShmStat
 syscalls	sigreturn_test	1	*	-
 syscalls	splice_test	29	*	-
-syscalls	stat_test	34	*	All/*:StatTest.LinkCountsWithDirChild:StatTest.Nlinks:StatTest.StatxMnt*:StatTest.StatxMount*
-syscalls	stat_times_test	7	*	StatTimesTest.DirCreate*:StatTimesTest.DirList:StatTimesTest.DirRemoveFile:StatTimesTest.FileUtimes
+syscalls	stat_test	35	*	All/*:StatTest.LinkCountsWithDirChild:StatTest.Nlinks:StatTest.StatxMntIdBindMount:StatTest.StatxMount*
+syscalls	stat_test	2	StatTest.LinkCountsWithDirChild:StatTest.Nlinks	-	/dev/shm
+syscalls	stat_times_test	11	*	StatTimesTest.FileUtimes
 syscalls	sticky_test	5	*	-
 syscalls	symlink_test	32	*	SymlinkTest.FollowUpdatesATime
 syscalls	sync_file_range_test	4	*	-
@@ -166,7 +170,7 @@ syscalls	timerfd_test	25	*	*.IllegalSeek/*:TimerfdClockRealtimeTest.ClockAbsolut
 syscalls	timers_test	12	*	IntervalTimerTest.AlreadyPendingSignal:IntervalTimerTest.RelativeClockRealtimeMeasuresMonotonicTime:TimerTest.RlimitCpuInheritedAcrossFork
 syscalls	tkill_test	3	*	-
 syscalls	truncate_test	11	*	-
-syscalls	uidgid_test	23	*	UidGidRootTest.SetfsuidNewFileOwner:UidGidRootTest.Setgroups:UidGidRootTest.SetresuidNoopKeepsFilesystemIDs
+syscalls	uidgid_test	24	*	UidGidRootTest.Setgroups:UidGidRootTest.SetresuidNoopKeepsFilesystemIDs
 syscalls	uname_test	2	*	UnameTest.SetNames:UnameTest.UnshareUTS
 syscalls	unlink_test	21	*	UnlinkTest.CannotRemoveRoot*
 syscalls	unshare_test	3	UnshareCapTest/UnshareCapTest.CaplessSyscallFailsDespiteUnshareNewUser/PivotRoot:UnshareTest.*	-
@@ -187,16 +191,16 @@ unix-pairs	socket_non_stream_blocking_local_test	25	*	-
 unix-pairs	socket_stream_blocking_local_test	30	*	-
 unix-pairs	socket_stream_local_test	84	*	-
 unix-pairs	socket_stream_nonblock_local_test	6	*	-
-unix-pairs	socket_unix_dgram_local_test	504	*	*.IncreasedSocketSendBufUnblocksWrites/*:*.PollAfterFullShutdown/*:*.ReadShutdownWakesRdHupOnlyPoller/*:*.ShutdownWakesHangupOnlyPoller/*:DgramUnixSockets/UnixNonStreamSocketPairTest.Fragmented*
+unix-pairs	socket_unix_dgram_local_test	528	*	*.PollAfterFullShutdown/*:*.ReadShutdownWakesRdHupOnlyPoller/*:*.ShutdownWakesHangupOnlyPoller/*:DgramUnixSockets/UnixNonStreamSocketPairTest.Fragmented*
 unix-pairs	socket_unix_dgram_non_blocking_test	6	*	-
 unix-pairs	socket_unix_pair_test	736	*.BadFDPass/*:*.BasicCredPass/*:*.CredAndFDPass/*:*.CredPassDifferentPIDUnprivileged/*:*.CredPassNoMsgCtrunc/*:*.CredPassNoSpaceMsgCtrunc/*:*.EpollEdgeTrigger/*:*.FDPassInterspersed1/*:*.FDPassInterspersed2/*:*.FDPassPeek/*:*.GetPeerCred/*:*.InheritPasscred/*:*.MsgCtruncInputIsNoop/*:*.NetdeviceIoctlsSucceed/*:*.NoDataCredPass/*:*.NoPassCred/*:*.RecvmmsgTimeoutAfterRecv/*:*.SendFromMmapBeyondEof/*:*.SendNullCredsBeforeSoPassCredRecvEndAfterSendEnd/*:*.SendNullCredsBeforeSoPassCredSendEnd/*:*.ShortCmsg/*:*.SoPassCred/*:*.SocketReopenFromProcfs/*:*.WriteBeforeSoPassCredRecvEndAfterSendEnd/*:*.WriteBeforeSoPassCredSendEnd/*:*.ZeroFDPass/*:*.ZeroLengthRecvReceivesFD/*:AllUnixDomainSockets/UnixSocketPairCmsgTest.BasicFDPass*:AllUnixDomainSockets/UnixSocketPairCmsgTest.BasicThree*:AllUnixDomainSockets/UnixSocketPairCmsgTest.BasicTwo*:AllUnixDomainSockets/UnixSocketPairCmsgTest.Cloexec*:AllUnixDomainSockets/UnixSocketPairCmsgTest.CredPassTruncated*:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassAfter*:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassNo*:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassPeekEFAULTNoControl/10:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassPeekEFAULTNoControl/11:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassPeekEFAULTNoControl/2:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassPeekEFAULTNoControl/3:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassPeekEFAULTNoControl/4:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassPeekEFAULTNoControl/5:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassPeekEFAULTNoControl/8:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassPeekEFAULTNoControl/9:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassRecvEFAULT/10:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassRecvEFAULT/11:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassRecvEFAULT/2:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassRecvEFAULT/3:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassRecvEFAULT/4:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassRecvEFAULT/5:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassRecvEFAULT/8:AllUnixDomainSockets/UnixSocketPairCmsgTest.FDPassRecvEFAULT/9:AllUnixDomainSockets/UnixSocketPairCmsgTest.SendNullCredsAfter*:AllUnixDomainSockets/UnixSocketPairCmsgTest.WriteAfter*:AllUnixDomainSockets/UnixSocketPairCmsgTest.ZeroFDPassCoalesceData/0:AllUnixDomainSockets/UnixSocketPairCmsgTest.ZeroFDPassCoalesceData/6:AllUnixDomainSockets/UnixSocketPairTest.Bind*:AllUnixDomainSockets/UnixSocketPairTest.Invalid*:AllUnixDomainSockets/UnixSocketPairTest.Shutdown*:AllUnixDomainSockets/UnixSocketPeerCredTest.AfterConnectClientPeerCred/0:AllUnixDomainSockets/UnixSocketPeerCredTest.AfterConnectClientPeerCred/6:AllUnixDomainSockets/UnixSocketPeerCredTest.AfterConnectServerPeerCred/0:AllUnixDomainSockets/UnixSocketPeerCredTest.AfterConnectServerPeerCred/6:AllUnixDomainSockets/UnixSocketPeerCredTest.PeerCredAfterListen/0:AllUnixDomainSockets/UnixSocketPeerCredTest.PeerCredAfterListen/6:AllUnixDomainSockets/UnixSocketPeerCredTest.PeerCredBeforeListen/0:AllUnixDomainSockets/UnixSocketPeerCredTest.PeerCredBeforeListen/6:AllUnixDomainSockets/UnixSocketPeerCredTest.PeerCredSurvivesPeerExit/0:AllUnixDomainSockets/UnixSocketPeerCredTest.PeerCredSurvivesPeerExit/6	-
-unix-pairs	socket_unix_seqpacket_local_test	264	*	*.IncreasedSocketSendBufUnblocksWrites/*:*.PollAfterFullShutdown/*:*.ReadShutdownWakesRdHupOnlyPoller/*:*.ShutdownWakesHangupOnlyPoller/*:SeqpacketUnixSockets/UnixNonStreamSocketPairTest.Fragmented*
+unix-pairs	socket_unix_seqpacket_local_test	276	*	*.PollAfterFullShutdown/*:*.ReadShutdownWakesRdHupOnlyPoller/*:*.ShutdownWakesHangupOnlyPoller/*:SeqpacketUnixSockets/UnixNonStreamSocketPairTest.Fragmented*
 unix-pairs	socket_unix_stream_listener_close_test	2	*	-
 unix-pairs	socket_unix_unbound_abstract_test	52	*	*.BindConnectInSubNamespace/*:AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.ListenZeroBacklog/4:AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.ListenZeroBacklog/5
 unix-pairs	socket_unix_unbound_dgram_test	48	*	*.Accept/*
 unix-pairs	socket_unix_unbound_filesystem_test	18	*	-
 unix-pairs	socket_unix_unbound_seqpacket_test	16	*	-
-unix-pairs	socket_unix_unbound_stream_test	124	*	*.CoalescedCreds1/*:*.SinglePeek/*:*.ZeroLengthMessageFDDiscarded/*:AllUnixDomainSockets/UnixStreamSocketPairTest.Creds*:AllUnixDomainSockets/UnixStreamSocketPairTest.NonCoalesced*
+unix-pairs	socket_unix_unbound_stream_test	184	*	*.SinglePeek/*:*.ZeroLengthMessageFDDiscarded/*
 
 # Check ephemeral binds in a fresh network namespace before any passive-close TIME_WAIT cases.
 inet-ports	socket_inet_loopback_isolated_test	6	AllFamilies/*.V*EphemeralPortReservedReuseAddr/*	-

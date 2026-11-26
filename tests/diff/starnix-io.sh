@@ -4,16 +4,12 @@
 # timerfd, getrandom, ioctls on sockets and terminals, PTYs, rtnetlink. Run by
 # tests/diff/gtest/run.sh, one process per test. Tests that differ for a reason recorded in a
 # map, or that cannot be compared, are skipped, with the reason above them.
-# kernel/tty: /dev/tty cannot be told apart from the slave it opens
-SKIP="Pty.OpenDevTTY"
 # kernel/net: host interfaces cannot be changed (interface setters are EPERM, before the name is
 # looked up), so the multicast-group test cannot change lo's address
-SKIP="$SKIP:IoctlTest.SIOCSIFFLAGS_Success:IoctlInvalidTest/IoctlInvalidTest.InvalidRequest/9"
+SKIP="IoctlTest.SIOCSIFFLAGS_Success:IoctlInvalidTest/IoctlInvalidTest.InvalidRequest/9"
 SKIP="$SKIP:RouteNetlinkSocket.AddDropMulticastGroup"
-# kernel/netlink: validation of malformed rtnetlink requests differs from Linux
-SKIP="$SKIP:NetlinkRouteTest.IflaCacheInfoMissingBody:NetlinkRouteTest.IncompleteRouteFlow"
-SKIP="$SKIP:NetlinkRouteTest.MalformedMessageCausesErrorReturn"
-SKIP="$SKIP:RouteNetlinkSocket/RouteNetlinkSocketStrictOpt.MalformedDumpRequest/strict"
+# kernel/netlink: a missing IFLA_CACHEINFO body returns EINVAL where Linux returns ERANGE
+SKIP="$SKIP:NetlinkRouteTest.IflaCacheInfoMissingBody"
 # No tun device (kernel/net D1), which these suites create their interface with
 SKIP="$SKIP:RouteNetlinkSocket/RouteNetlinkSocketNewAddr.AddSubnetRoute/*"
 SKIP="$SKIP:RouteNetlinkSocketTestWithInterface.*"

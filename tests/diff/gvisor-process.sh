@@ -13,8 +13,6 @@ SKIP="$SKIP:$P.PrctlSetPtracerDoesNotPersistPastTracerThreadExit"
 SKIP="$SKIP:$P.PrctlSetPtracerRespectsTracerThreadID:$P.PrctlClearPtracerDoesNotAffectCurrentTracer"
 SKIP="$SKIP:$P.PrctlNotInherited:$P.TraceParentNotAllowed:$P.TraceNonDescendantNotAllowed"
 SKIP="$SKIP:$P.ExecvePtraceLockStress"
-# kernel/cred D2: no ACLs
-SKIP="$SKIP:ExecTest.ACLExecuteOnlyBinary"
 # Cannot be compared: PIDFD_THREAD came in 6.9, so these skip themselves on 6.8 and Appine and run
 # on CI's newer kernel; the set-id execs fail natively on CI's runner (not investigated); the
 # non-consuming wait fails on both sides on 6.8 and hangs natively on CI until the 60 s timeout
