@@ -496,7 +496,8 @@ signals may still be delivered).
 - Appine creates a fresh anonymous remnant even on a partial DONTUNMAP or a move of a previously
   relocated mapping. Linux 6.1 unlinks the old anon_vma only on a whole-VMA move and retains the
   old page offset.
-- `clip_file_mappings` and `invalidate_fill` ignore unmap errors. If a partial superpage
+- `clip_file_mappings` and `invalidate_fill` ignore unmap errors (expiring `PageWatch`es
+  explicitly so pipe readers still fall back to their snapshots). If a partial superpage
   demotion runs out of memory, truncation can leave a translation beyond the new EOF and FUSE
   invalidation can leave a translation for a page marked stale.
 

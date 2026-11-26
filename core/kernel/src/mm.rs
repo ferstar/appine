@@ -4636,6 +4636,16 @@ fn mmu_prepare_unmap(mmu: &mut Mmu, gva: u64, len: u64) -> Result<(), MapError> 
     mmu.prepare_unmap(gva, len)
 }
 
+/// Best-effort unmap for paths that still clip or invalidate backing on allocation failure:
+/// expire page watches even on `ENOMEM` so pipe readers fall back to their snapshot.
+fn unmap_or_expire_watches(mmu: &mut Mmu, gva: u64, len: u64) {
+    if mmu_prepare_unmap(mmu, gva, len).is_ok() {
+        mmu.unmap(gva, len).expect("pre-demoted unmap range");
+    } else {
+        mmu.invalidate_page_watches(gva..gva + len);
+    }
+}
+
 impl Mm {
     /// Test helper wrapping [`Mm::discard_range`] for callers that expect no gap/error.
     #[cfg(test)]
@@ -5803,7 +5813,7 @@ impl Mm {
             for (a, b) in pages.runs(from, to) {
                 let addr = start + (a - first) * PAGE_SIZE;
                 let len = (b - a) * PAGE_SIZE;
-                let _ = self.mmu.unmap(addr, len);
+                unmap_or_expire_watches(&mut self.mmu, addr, len);
                 if v.prot & prot::EXEC != 0 {
                     self.code_ranges.push((addr, len));
                 }
@@ -5865,7 +5875,7 @@ impl Mm {
             if extent >= old {
                 continue;
             }
-            let _ = self.mmu.unmap(start + extent, old - extent);
+            unmap_or_expire_watches(&mut self.mmu, start + extent, old - extent);
             if v.prot & prot::EXEC != 0 {
                 self.code_ranges.push((start + extent, old - extent));
             }
@@ -11035,6 +11045,60 @@ mod tests {
         assert_eq!(mm.discard_range(addr, len, false).1, Ok(()));
         assert!(pages.copied.borrow().is_empty());
         assert!(!watch.is_current());
+    }
+
+    #[test]
+    fn truncate_and_fill_invalidation_expire_watches_on_prepare_failure() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let mut mm = Mm::new();
+        let file = appine_hal::memfd(c"truncate-watch-oom").unwrap();
+        file.set_len(2 * PAGE_SIZE).unwrap();
+        let meta = file.metadata().unwrap();
+        let shared = mm
+            .mmap(
+                0,
+                2 * PAGE_SIZE,
+                RW,
+                flags::MAP_SHARED,
+                Some((file.as_raw_fd(), 0, true)),
+            )
+            .unwrap();
+        let kept_file_watch = mm.mmu.watch_readable_page(shared).unwrap();
+        let tail_file_watch = mm.mmu.watch_readable_page(shared + PAGE_SIZE).unwrap();
+        assert!(with_unmap_prepare_failure(1, || {
+            mm.file_truncated(meta.dev(), meta.ino(), PAGE_SIZE)
+        }));
+        assert_eq!(mm.vmas[&shared].file_len, PAGE_SIZE);
+        assert!(mm.dirty);
+        assert!(kept_file_watch.is_current());
+        assert!(!tail_file_watch.is_current());
+
+        let host = appine_hal::memfd(c"fill-invalidate-watch-oom").unwrap();
+        host.set_len(2 * PAGE_SIZE).unwrap();
+        let source = crate::fd::OpenFile::new(crate::fd::FileKind::Host(-1), 0);
+        let fill = Fill::new(host, 2 * PAGE_SIZE, source);
+        fill.store(
+            (0, 2 * PAGE_SIZE),
+            &vec![b'Z'; 2 * PAGE_SIZE as usize],
+            false,
+        )
+        .unwrap();
+        let fa = mm
+            .mmap_fill(0, 2 * PAGE_SIZE, RW, flags::MAP_PRIVATE, (fill.clone(), 0))
+            .unwrap();
+        assert!(mm.fault_in(fa, prot::READ));
+        assert!(mm.mmu.translate(fa + PAGE_SIZE, prot::READ).is_some());
+        let kept_fill_watch = mm.mmu.watch_readable_page(fa).unwrap();
+        let stale_fill_watch = mm.mmu.watch_readable_page(fa + PAGE_SIZE).unwrap();
+        mm.dirty = false;
+        assert!(with_unmap_prepare_failure(1, || {
+            mm.invalidate_fill(&fill.pages, 1, 2)
+        }));
+        assert!(mm.dirty);
+        assert!(kept_fill_watch.is_current());
+        assert!(!stale_fill_watch.is_current());
     }
 
     /// Fail exactly the nth CoW map on this thread, restoring the hook even on unwind.

@@ -126,8 +126,9 @@ fast path and refill (`engine/dbt`).
   watches in its range only on success because preparation prevents a partial unmap on allocation
   failure. Replacing or moving entries expires watches in the requested ranges, including both
   ends of a move and ranges that may have been partially edited on allocation failure. Empty-slot fills
-  and permission changes preserve watches. `Mm::release` also expires watches in discarded ranges
-  with `Mmu::invalidate_page_watches` while retaining their entries. A consumer checks current
+  and permission changes preserve watches. `Mm::release`, `Mm::clip_file_mappings` and
+  `Mm::invalidate_fill` also expire watches with `Mmu::invalidate_page_watches` when backing is
+  discarded, truncated or invalidated while entries remain. A consumer checks current
   permissions before reading. Watches on one page share a token. New registrations periodically
   reclaim unobserved tokens.
 
