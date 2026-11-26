@@ -1,7 +1,7 @@
 # docker-run-options: --privileged
 # Network namespace sysctls (docs/rounds/177-net-sysctls.md): in a new network namespace, the
 # permissions and default values of the commonly used entries under /proc/sys/net, writes (writing
-# k integers changes the first k, too many or non-numbers are EINVAL, the congestion control
+# k integers changes the first k, surplus integers are ignored, the congestion control
 # algorithm must be one that exists, read-only ones cannot be written), and that each namespace
 # has its own copy. The `sysctls:` of docker and compose write these inside the container (Appine
 # used to lack these files, so the containers would not start). The listing of the whole directory
@@ -19,13 +19,14 @@ for f in core/somaxconn core/optmem_max ipv4/tcp_keepalive_time ipv4/tcp_keepali
     printf "%s %s: %s\n" "$f" "$(stat -c %a $f)" "$(cat $f | tr "\t" " ")"
 done
 w() {
-    printf "%s" "$2" > "$1" 2>/tmp/err
+    printf "%s" "$2" 2>/tmp/err > "$1"
     echo "write $1 <- $2: $? $(sed "s/.*: //" /tmp/err) -> $(cat $1 | tr "\t" " ")"
 }
 w ipv4/tcp_keepalive_time 600
 w ipv4/tcp_rmem 8192
-w ipv4/tcp_rmem "1 2 3"
-w ipv4/tcp_rmem "1 2 3 4"
+# Newer kernels require every tcp_rmem component to be at least 4096.
+w ipv4/tcp_rmem "4096 8192 16384"
+w ipv4/tcp_rmem "8192 16384 32768 65536"
 w ipv4/tcp_fin_timeout abc
 w ipv4/tcp_congestion_control reno
 w ipv4/tcp_congestion_control nosuchcc

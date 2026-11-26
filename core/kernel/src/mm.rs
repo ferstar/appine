@@ -41,6 +41,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::mem::ManuallyDrop;
+use std::ops::Range;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
@@ -4837,20 +4838,22 @@ impl Mm {
     /// among them), the latter hold nothing.
     pub fn release(&mut self) {
         let kept = |v: &Vma| v.prot & prot::EXEC != 0 || v.reserved();
-        let remapped: Vec<u64> = self
-            .cow
-            .borrow()
-            .borrowed
-            .keys()
-            .filter_map(|&page| {
-                let (s, v) = self.anon_vma(page).filter(|(_, v)| !kept(v))?;
-                let own = Self::own_page(s, v, page);
-                // SAFETY: the VMA retains its own page, which will be discarded below.
-                unsafe { cow_map_shared(&self.mmu, page, own, PAGE_SIZE, mmu_prot(v.prot)) }
-                    .ok()?;
-                Some(page)
-            })
-            .collect();
+        let mut retained = self.cow.borrow().lent.clone();
+        let mut remapped = Vec::new();
+        for &page in self.cow.borrow().borrowed.keys() {
+            let Some((s, v)) = self.anon_vma(page).filter(|(_, v)| !kept(v)) else {
+                continue;
+            };
+            let own = Self::own_page(s, v, page);
+            // SAFETY: the VMA retains its own page throughout release.
+            if unsafe { cow_map_shared(&self.mmu, page, own, PAGE_SIZE, mmu_prot(v.prot)) }.is_ok()
+            {
+                remapped.push(page);
+            } else {
+                // The entry still points at the lender. Keep it out of the discard pass.
+                retained.insert(page);
+            }
+        }
         let borrowed = &mut self.cow.get_mut().borrowed;
         let returned = remapped
             .into_iter()
@@ -4858,26 +4861,28 @@ impl Mm {
             .collect();
         // Threads still running guest code flush before the owners get their pages back
         self.give_back(returned);
-        let lent = self.cow.borrow().lent.clone();
         for (&s, v) in self
             .vmas
             .iter()
             .filter(|(_, v)| !kept(v) && v.written.get())
         {
             match v.backing {
-                Backing::Anonymous => Self::discard_unlent_in(s, v, &lent),
+                Backing::Anonymous => self.discard_unlent_in(s, v, &retained),
                 // Only written pages differ from the file (a `cow` mapping never is), and whole
                 // pages past its end have no entries
                 Backing::PrivateFile if !v.cow => {
                     let len = page_up(v.contents_len()).unwrap_or(v.len).min(v.len) as usize;
-                    // SAFETY: [host, host + len) is this VMA's own private host memory
-                    unsafe {
-                        if v.region.anonymous.is_none() {
-                            let _ = discard_file_host(v.host, len);
-                        } else {
-                            discard_host(v.host, len);
-                        }
-                    }
+                    let discarded = if v.region.anonymous.is_none() {
+                        // SAFETY: [host, host + len) is this VMA's own private file mapping.
+                        unsafe { discard_whole_host_pages(v.host, len) }
+                    } else {
+                        // SAFETY: [host, host + len) is this VMA's own anonymous memory.
+                        unsafe { discard_host(v.host, len) };
+                        0..len
+                    };
+                    self.mmu.invalidate_page_watches(
+                        s + discarded.start as u64..s + discarded.end as u64,
+                    );
                 }
                 _ => {}
             }
@@ -7604,7 +7609,7 @@ impl Mm {
     /// Fill only unshared anonymous runs. A single empty leaf can still become a superpage.
     fn fill_anon_non_cow(&self, s: u64, v: &Vma, lo: u64, hi: u64) -> Result<(), MapError> {
         let pages = Self::cow_pages(&self.cow.borrow(), lo, hi);
-        for (from, len) in Self::non_cow_runs(lo, hi, &pages) {
+        for (from, len) in Self::non_cow_runs(lo, hi, pages) {
             let host = Self::own_page(s, v, from);
             // SAFETY: the VMA holds the whole run and every page uses its own backing.
             unsafe { self.mmu.fill_shared(from, host, len, v.prefill_prot()) }?;
@@ -7641,14 +7646,19 @@ impl Mm {
         pages: &[u64],
         prot: u32,
     ) -> Result<(), Errno> {
-        for (from, len) in Self::non_cow_runs(s, s + len, pages) {
+        for (from, len) in Self::non_cow_runs(s, s + len, pages.iter().copied()) {
             mmu.protect(from, len, prot).map_err(map_err)?;
         }
         Ok(())
     }
 
-    fn non_cow_runs(mut from: u64, end: u64, pages: &[u64]) -> impl Iterator<Item = (u64, u64)> {
-        pages.iter().copied().chain([end]).filter_map(move |page| {
+    /// Yields (start, length) for the gaps between the sorted CoW pages in `[from, end)`.
+    fn non_cow_runs(
+        mut from: u64,
+        end: u64,
+        pages: impl IntoIterator<Item = u64>,
+    ) -> impl Iterator<Item = (u64, u64)> {
+        pages.into_iter().chain([end]).filter_map(move |page| {
             let start = from;
             from = page + PAGE_SIZE;
             (start < page).then(|| (start, page - start))
@@ -7666,21 +7676,18 @@ impl Mm {
             .iter()
             .filter(|(_, v)| v.backing == Backing::Anonymous && v.written.get())
         {
-            Self::discard_unlent_in(s, v, lent);
+            self.discard_unlent_in(s, v, lent);
         }
     }
 
-    /// The pages of private anonymous VMA `v` (at `s`) that are not in `lent` go back to the host.
-    fn discard_unlent_in(s: u64, v: &Vma, lent: &BTreeSet<u64>) {
+    /// Returns private anonymous pages to the host around any outstanding loans.
+    fn discard_unlent_in(&self, s: u64, v: &Vma, retained: &BTreeSet<u64>) {
         let end = s + v.len;
-        let mut cursor = s;
-        for page in lent.range(s..end).copied().chain([end]) {
-            if page > cursor {
-                // SAFETY: [cursor, page) is inside this private anonymous VMA, whose contents
-                // nobody needs any more
-                unsafe { discard_host(Self::own_page(s, v, cursor), (page - cursor) as usize) };
-            }
-            cursor = page + PAGE_SIZE;
+        for (start, len) in Self::non_cow_runs(s, end, retained.range(s..end).copied()) {
+            // The PTE stays readable after the host page starts returning zeros.
+            self.mmu.invalidate_page_watches(start..start + len);
+            // SAFETY: this run is private anonymous memory with no outstanding loans.
+            unsafe { discard_host(Self::own_page(s, v, start), len as usize) };
         }
     }
 
@@ -8725,19 +8732,29 @@ unsafe fn discard_host(ptr: NonNull<u8>, len: usize) {
 ///
 /// `[ptr, ptr + len)` is private host memory (anonymous or a private file mapping) held by an
 /// [`Mm`].
-unsafe fn discard_file_host(ptr: NonNull<u8>, len: usize) -> Vec<(usize, usize)> {
+unsafe fn discard_file_host(ptr: NonNull<u8>, len: usize) -> impl Iterator<Item = (usize, usize)> {
+    // SAFETY: the caller supplies a live private host mapping.
+    let discarded = unsafe { discard_whole_host_pages(ptr, len) };
+    [(0, discarded.start), (discarded.end, len - discarded.end)]
+        .into_iter()
+        .filter(|&(_, size)| size != 0)
+}
+
+/// Returns the byte offsets of the whole host pages successfully discarded within the mapping.
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` must be a live private host mapping.
+unsafe fn discard_whole_host_pages(ptr: NonNull<u8>, len: usize) -> Range<usize> {
     let page = appine_hal::page_size();
     let addr = ptr.as_ptr() as usize;
     let head = (addr.next_multiple_of(page) - addr).min(len);
     let tail = ((addr + len) & !(page - 1)).max(addr + head) - addr;
     // SAFETY: all offsets are in [0, len]; [head, tail) is aligned to host pages
     if head < tail && unsafe { appine_hal::discard(ptr.add(head), tail - head) }.is_ok() {
-        [(0, head), (tail, len - tail)]
-            .into_iter()
-            .filter(|&(_, l)| l > 0)
-            .collect()
+        head..tail
     } else {
-        vec![(0, len)]
+        0..0
     }
 }
 
@@ -11158,7 +11175,15 @@ mod tests {
         // pages it had copied for itself read zero
         let child = parent.borrow_mut().fork().unwrap();
         poke(&parent, a, b'q');
+        let discarded = parent.borrow().mmu.watch_readable_page(a).unwrap();
+        let lent = parent
+            .borrow()
+            .mmu
+            .watch_readable_page(a + PAGE_SIZE)
+            .unwrap();
         parent.borrow_mut().release();
+        assert!(!discarded.is_current());
+        assert!(lent.is_current());
         assert_eq!((byte(&parent, a), byte(&child, a)), (0, b'p'));
         assert_eq!(byte(&child, a + PAGE_SIZE), b'p');
         assert_eq!(byte(&parent, a + PAGE_SIZE), b'p');

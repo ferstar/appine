@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: root pressure reclaims idle DBT caches and writable aliases while retaining live code-group translations)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: page-watch lifetime during private memory release)
 
 ## Responsibilities
 
@@ -194,8 +194,10 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   returned without copying (one shootdown, the owners getting write permission back); lent pages
   stay for their borrowers; the other pages of written private anonymous VMAs go back to the host
   (reading zero); written private file VMAs go back to the file in whole host pages of a host file
-  mapping (partial host pages kept) or, copied into anonymous memory, to zeros. A thread of the
-  process still running reads what is left; on Linux any fault there is `SIGBUS` (`MMF_UNSTABLE`).
+  mapping (partial host pages kept) or, copied into anonymous memory, to zeros. Release expires
+  vmsplice page watches over discarded spans, including when their PTEs remain readable.
+  A failed borrowed-page remap keeps the loan and skips that page during backing discard.
+  A thread still running reads what is left. On Linux any fault there is `SIGBUS` (`MMF_UNSTABLE`).
 
 ## Dependencies (inbound / outbound)
 

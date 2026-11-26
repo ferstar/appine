@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: readable page watches and their invalidation on page-table edits)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: explicit page-watch invalidation for backing discarded in place)
 
 ## Responsibilities
 
@@ -123,8 +123,10 @@ fast path and refill (`engine/dbt`).
 - `Mmu::watch_readable_page` issues a `PageWatch` for one readable guest page. Replacing,
   unmapping or moving entries expires watches in the requested ranges, including both ends of
   a move and ranges that may have been partially edited on allocation failure. Empty-slot fills
-  and permission changes preserve watches. A consumer checks current permissions before reading.
-  Watches on one page share a token. New registrations periodically reclaim unobserved tokens.
+  and permission changes preserve watches. `Mm::release` also expires watches in discarded ranges
+  with `Mmu::invalidate_page_watches` while retaining their entries. A consumer checks current
+  permissions before reading. Watches on one page share a token. New registrations periodically
+  reclaim unobserved tokens.
 
 ### The TLB
 

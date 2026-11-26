@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::ffi::{c_int, c_uint, c_void};
 use std::fmt;
 use std::mem::offset_of;
+use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -297,15 +298,18 @@ impl WatchedPages {
         PageWatch(Arc::downgrade(token))
     }
 
+    fn invalidate(&mut self, pages: Range<u64>) {
+        while let Some((&page, _)) = self.pages.range(pages.clone()).next() {
+            self.pages.remove(&page);
+        }
+    }
+
     fn finish_edit(&mut self, rc: c_int, starts: &[u64], len: u64) -> Result<(), MapError> {
         let result = map_result(rc);
         // Invalid arguments leave the table untouched. ENOMEM can follow a partial edit.
         if result != Err(MapError::InvalidArgument) {
             for &start in starts {
-                let end = start + len;
-                while let Some((&page, _)) = self.pages.range(start..end).next() {
-                    self.pages.remove(&page);
-                }
+                self.invalidate(start..start + len);
             }
         }
         result
@@ -339,6 +343,11 @@ impl Mmu {
         self.translate(addr, prot::READ)?;
         let page = addr & !(PAGE_SIZE - 1);
         Some(self.watched.borrow_mut().watch(page))
+    }
+
+    /// Expires watches in a page-aligned guest range whose backing is discarded in place.
+    pub fn invalidate_page_watches(&self, pages: Range<u64>) {
+        self.watched.borrow_mut().invalidate(pages);
     }
 
     /// Maps guest `[gva, gva + len)` to host `[host, host + len)`, replacing existing mappings.

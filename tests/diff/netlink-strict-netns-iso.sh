@@ -96,6 +96,13 @@ def rtm(fam, dst_len=0, table=0, scope=0, flags=0):
 def genl(cmd):
     return struct.pack("BBH", cmd, 2, 0)
 
+def dump_policy_mapping(cmd):
+    nested = 0x8000
+    family_id = attr(1, struct.pack("H", 16))  # GENL_ID_CTRL
+    dump_index = attr(2, struct.pack("I", 0))
+    op_policy = attr(nested | 9, attr(nested | cmd, dump_index))
+    return genl(10) + family_id + op_policy
+
 print("-- CAP_ACK / EXT_ACK and query validation")
 show_err("GETLINK bad idx (cap+ext)", NETLINK_ROUTE, nl_req(18, NLM_F_REQUEST, ifi(9999)))
 show_err("GETLINK short 2B (cap+ext)", NETLINK_ROUTE, nl_req(18, NLM_F_REQUEST, b"\0\0"))
@@ -186,8 +193,13 @@ for label, body in [
     ("GETPOLICY op=10", genl(10) + attr(1, struct.pack("H", 16)) + attr(10, struct.pack("I", 10))),
 ]:
     res = ask(NETLINK_GENERIC, nl_req(16, NLM_F_REQUEST|NLM_F_DUMP, body))
-    payloads = [m[2].hex() for m in res if m[0] not in ("ERR", "DONE")]
-    print(f"  {label}: n={len(payloads)} done={res[-1]} first={payloads[0] if payloads else None} last={payloads[-1] if payloads else None}")
+    payloads = [m[2] for m in res if m[0] not in ("ERR", "DONE")]
+    # Linux 261e8a37ec uses the dump-only command ID where older kernels returned zero.
+    if label == "GETPOLICY op=10" and payloads and payloads[0] == dump_policy_mapping(0):
+        payloads[0] = dump_policy_mapping(10)
+    first = payloads[0].hex() if payloads else None
+    last = payloads[-1].hex() if payloads else None
+    print(f"  {label}: n={len(payloads)} done={res[-1]} first={first} last={last}")
 PY
 
 echo "== 2. Initial-netns isolation of container 127.a.b.x loopback blocks"

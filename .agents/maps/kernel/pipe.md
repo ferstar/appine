@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: vmsplice source-page lifetime across mapping changes)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: vmsplice snapshot fallback during private memory release)
 
 ## Responsibilities
 
@@ -102,8 +102,9 @@ that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel
 - A vmspliced slot keeps a weak reference to the source address space, a watch on its readable
   page-table entry, and a snapshot of the bytes. Reads and splice sample the live page at the
   slot's current offset while the watch is current and the page is readable. Unmapping another
-  page leaves the watch intact. Tee and pipe-to-pipe splice carry the same source and capture
-  the transferred bytes as the destination's fallback snapshot.
+  page leaves the watch intact. When `process_mrelease` or OOM reclaim discards the source page
+  in place, the reader uses the snapshot. Tee and pipe-to-pipe splice carry the same source
+  and capture the transferred bytes as the destination's fallback snapshot.
 - vmsplice's write side reads guest memory directly; every other copy to or from a guest buffer
   first grows a grows-down mapping below it (`kernel/fileio`).
 
