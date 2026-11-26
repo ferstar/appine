@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: logical memfd lengths, sparse reads and copies, read range checks and final-reference cleanup)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: conditional open-description reconciliation on store mmap)
 
 ## Responsibilities
 
@@ -201,8 +201,9 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
   abandons it on failure and retries if the original object changed. Replaced handles remain
   open until description close for I/O in flight. A Files app unshare rehomes descriptions
   during change replay. Settling a held inode restores atime and mtime on the host object and can
-  advance ctime, even for a read-only mapping. Before exposing a store mapping, the kernel reconciles
-  open descriptions with its pinned host object.
+  advance ctime, even for a read-only mapping. Before exposing a store mapping, when
+  `Store::mapping_object` sets `reconcile` (local backing changes, dropped history, or another store
+  connection since open), the kernel reconciles open descriptions with its pinned host object.
 - Clones: copy_file_range from offset 0 to offset 0 of a whole non-empty input into an output no
   longer than it, and FICLONE or FICLONERANGE doing the same, share the input's object
   (`try_share`) unless either is not a regular store file, a memfd, opened through an overlay or on

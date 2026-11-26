@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across namespace lifetime, address and port translation, device configuration, filtering and forwarding)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: closed the DNAT-removal connection teardown open question with Linux 6.1 conntrack rationale)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: indexed `Bindings` by id and guest/host port with FIFO linger expiry, per-UDP-port host-IP uniqueness and endpoint helpers)
 
 ## Responsibilities
 
@@ -39,10 +39,12 @@ sockets (`hal`).
   virtual address, `isolated` flag for initial-ns attempts to reach an allocated container
   `127.a.b.x` block); `Role` (`Peer` or `Local`).
 - `Bindings` / `Binding` / `NewBinding` / `BindAddr` / `BindReq` — per-namespace registry of bound TCP/UDP sockets
+  indexed by id and insertion-ordered `(proto, guest_port)` / `(proto, host_port)` port maps
   (id, protocol, guest port, normalized guest `BindAddr`: `AnyV4`/`AnyV6`/`V4`/`V6`, `v6only`,
   `bound_dev_if`, live `SO_REUSEADDR`/`SO_REUSEPORT`, `euid`, `listening`, `accepted`, host
-  IP/port, `wide`) plus a 10 s
-  `LINGER` reverse table `(proto, host_ip, host_port) → (guest_port, BindAddr)`.
+  IP/port, `wide`), plus per-UDP-port effective host-IP uniqueness (`udp_host_ips`) and a 10 s
+  `LINGER` reverse table `(proto, host_ip, host_port) → (guest_port, BindAddr)` expired via a
+  FIFO `released` queue.
 - `Devices` — devices, index counter, routes through virtual devices (`Rt`), `NetConf`, nsids,
   `hostmap` (`HostMap`: initial namespace bidirectional virtual IPv4 ↔ 127.255.0.1..=127.255.255.254
   with O(1) lookup, FIFO slot recycling, and `EADDRNOTAVAIL` on exhaustion); `Dev` (index, name, kind,
@@ -60,10 +62,12 @@ sockets (`hal`).
 
 - Namespaces: `Kernel::new_net_ns`, `Kernel::world`, `FIRST_BLOCK`; translation `to_host`,
   `init_to_host`, `is_foreign_loopback`, `from_host`, `from_host_peer`, `from_self`, `toward_self`,
-  `implicit_bind`, `local_toward`, `entering`, `owner_of_host`, `host_ipv4`, `with_host_endpoint`;
+  `implicit_bind`, `local_toward`, `entering`, `owner_of_host`, `host_ipv4`, `with_host_endpoint`,
+  `set_host_endpoint`, `matches_host_endpoint`;
   bindings & listeners
   `bind_conflict`, `listen_conflict`, `shared_host_port`, `add_binding`, `add_ephemeral`,
-  `remove_binding`, `set_listening`, `set_reuse`, `set_bound_dev`, `resolve_target`, `lookup_host`.
+  `remove_binding`, `set_listening`, `set_reuse`, `set_bound_dev`, `resolve_target`, `lookup_host`,
+  `Bindings::unique_udp_host_ip`.
 - Devices: `netdev::request` (rtnetlink changes), `link_message`, `addr_messages`, `nsid`,
   `nsid_alloc`, `ioctl`, `ifconf`, readers (`views`, `interfaces`, `base`, `tables`, `entries`,
   `local_v4`, `route_v4`, `routes_v6`, `first_v4`), sysctls (`conf_dirs`, `conf_read`,
@@ -174,7 +178,9 @@ sockets (`hal`).
 - Connected UDP sockets record their filter verdict and target namespace listener at connect — both
   host-wide sockets (`vconn`, which discard foreign sources on receive) and namespace-bound sockets
   — and address-less sends re-resolve the target listener's `(host_ip, host_port)` (updating
-  `vconn` or reconnecting the host socket across connect-before-bind and server close/rebind).
+  `vconn` in place, skipping host peer verification when `peer_map` matches, TTL is unset and
+  `unique_udp_host_ip` holds, or reconnecting the host socket across connect-before-bind and
+  server close/rebind, propagating any host reconnect error).
 - Accepted sockets inherit `local_map`, `vaddr`, `euid`, `v6only`, and namespace; their peer is
   translated via `from_host_peer`; getsockname reports the wildcard until a connect, then the
   facing address.

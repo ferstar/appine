@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across VMA layout, page faults, permission changes, file invalidation and dump selection)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: bound brk and in-place mremap growth by 1 << VA_BITS and document the 47-bit default map window)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: eager anonymous write probing, batched tmpfs faults, in-place tracked-file mprotect, and pagemap-aware MADV_DONTNEED)
 
 ## Responsibilities
 
@@ -38,7 +38,9 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
   mapped-file fd, display `name`/`ino`, optional `MountPin` `mnt` whose drop reports to
   `vfs::released`), SysV `shm`, optional `Fill`, and Linux VMA flags (locked, sticky `written`,
   growsdown, dump/fork/noreserve, sticky commit charge `accounted`, anonymous page offset
-  `anon_pgoff`, logical `has_anon_vma` and fork identity `anon`).
+  `anon_pgoff`, `present_run` (known-present anonymous PTE span hint for fallback swap walks),
+  `probe_writes` (lazy pagemap write-probing flag for eager writable anonymous VMAs), logical
+  `has_anon_vma`, fork identity `anon`, and optional `ForkFileView` (`fork_view`)).
 - `FileSource` identifies the mapping contract at file mmap. A store mapping retains a duplicate of its
   pinned host file descriptor. Tmpfs supplies allocation and quota tracking for touched pages.
   FUSE supplies the open-specific `Fill` and shared per-inode page state.
@@ -168,8 +170,14 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 - `new_vma` initializes `locked` from `mlockall(MCL_FUTURE)`. Once the mapping has its file
   and page-tracking state, `insert_vma` enforces `vm.max_map_count` (default 65530, writable
   through procfs) and builds the initial page-table entries (`kernel/mmu`). A new private
-  anonymous mapping starts with `anon_pgoff = start / PAGE_SIZE`. Until its first write,
-  reads can translate through write-protected entries and leave its anonymous RSS at zero.
+  anonymous mapping starts with `anon_pgoff = start / PAGE_SIZE`. Until its first write, reads
+  normally translate through write-protected entries and leave its anonymous RSS at zero; however,
+  when host `/proc/self/pagemap` is readable, a non-growsdown writable eager mapping (`<= 1 MiB`)
+  that either inherits `has_anon_vma` from a mergeable neighbour or has no mergeable neighbours
+  starts with writable entries (`probe_writes`) and lazily detects stores (including zero stores)
+  via pagemap (`was_written`). Any split, move, permission change, join of two untouched mergeable
+  neighbours, discard, heap growth or fork freezes probing (`finish_write_probe`: downgrades
+  unwritten entries to read-only, shoots down, and re-samples pagemap).
 - `brk`: below `brk_start` returns the current break; growth needs the range free; it grows in
   place inside the heap's host region when the last part is anonymous, unnamed, with the heap's
   permissions, charge and VMA flags and no other VMA on that host range (discarding the host range
@@ -184,10 +192,15 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 - Page-table entries build eagerly for small/executable mappings and lazily otherwise (`kernel/mmu`);
   `PROT_NONE` gets none. FUSE and tmpfs mappings have their own fault paths. Without host pagemap,
   ordinary private file mappings prefill reads and record private host pages on first write.
-- A file backed by tmpfs pins its mapped object. Each fault admits one guest page against the
-  backing mount’s quota before installing a translation. A read fault installs a read-only entry.
-  The first shared write publishes the backing file's mtime and ctime. Private mappings track written pages
-  independently of the file. Hole punching and `MADV_REMOVE` revoke aliases before freeing pages.
+- A file backed by tmpfs pins its mapped object. Each fault (`fault_range` → `FilePages::admit` →
+  `TmpfsMapping::fault_range`) admits its demanded span against the backing mount's quota (one
+  guest page on guest page faults, or the requested span up to a 2 MiB leaf window on kernel
+  `access`/`write_kernel`; shrinking to the prefix that fits before `ENOSPC`) and maps ahead over
+  already-populated contiguous data in the 2 MiB leaf window without speculatively instantiating
+  holes. A read fault installs read-only entries. The first shared write publishes the backing
+  file's mtime and ctime. Private mappings still break host CoW and record written pages one page
+  at a time independently of the file. Hole punching (`punch_tmpfs`) and `MADV_REMOVE` revoke
+  aliases before freeing pages.
 - A `Fill` VMA keeps `file_len` 0, so `map_pages` and every other path sizing by `file_len`
   (mprotect, mremap, fork, populate, truncation) build none of its entries, even when executable;
   only `fault_in` does, for a page already read, and then for the runs read within its 2 MB leaf
@@ -266,8 +279,11 @@ Otherwise the populated page-table levels determine the translation-fault level.
   it changed after reading them and drops its entries) before it becomes writable, and a
   `reserved` region gets real host memory (`back_reserved`) before it becomes accessible.
   Adding private write permission sets the commit charge unless the mapping has `MAP_NORESERVE`.
-  The charge survives later permission changes. Tracked file pages revoke their entries on a protection change.
-  For other mappings, a successful permission downgrade sets `dirty`. Before granting access to a private anonymous VMA
+  The charge survives later permission changes. Tracked file pages (`v.pages`) prepare range
+  boundaries and restrict existing entries in place to `new & !prot::WRITE` (preserving readable
+  page watches, prefilling read-only when leaving `PROT_NONE`, and letting detached pages regain
+  write access on demand) rather than unmapping. A successful permission downgrade sets `dirty`.
+  Before granting access to a private anonymous VMA
   with fork CoW pages, mprotect installs their owner-backed entries under the old non-writable
   permissions. It then changes the range permissions and grants write only outside the CoW pages.
   A failed permission change preserves the VMA prot and queues any needed rollback invalidation.
@@ -378,8 +394,11 @@ Otherwise the populated page-table levels determine the translation-fault level.
   missing soft PTEs, and stop with `EFAULT` at the first page past EOF.
 - `MADV_DONTNEED` / `MADV_DONTNEED_LOCKED` (`discard_range`): `MADV_DONTNEED_LOCKED` allows
   `mlock`'d VMAs without unlocking them; both refuse foreign (`[vvar]`) and GPU VMAs (`EINVAL`).
-  Private anonymous pages read as zero after discard. Except for the vDSO, which keeps its
-  entries, discard pre-demotes partial superpages before settling CoW and discarding host bytes.
+  Private anonymous pages read as zero after discard. After freezing write probing, non-vDSO
+  private anonymous discard (`discard_with_pagemap`) keeps soft-MMU entries and expires
+  `PageWatch`es when `/proc/self/pagemap` is readable; only when pagemap is unreadable and the
+  range has present entries or CoW loans does it pre-demote partial superpages before settling CoW,
+  discarding host bytes, clearing `present_run`, zapping soft PTEs and setting `dirty`.
   Tracked private file pages lose their entries before discard clears their private-copy records.
   Written private file pages before EOF unshare first if marked `cow` (so reverting never corrupts a fork peer), then
   revert via `kernel/hostmem`'s `discard_file_host` (whole host pages) and `Reread`s read from the
@@ -443,8 +462,9 @@ Otherwise the populated page-table levels determine the translation-fault level.
   plus the same label). procfs escapes a newline in a file name as `\012`.
 - `dump_regions` includes the VMA starting at the recorded vDSO address before consulting
   dump flags. Other foreign or `MADV_DONTDUMP` pieces have zero payload. `ANON_PRIVATE`
-  selects private anonymous pieces with an anon_vma and private file pieces that have been
-  written or currently allow writes. File and ELF-header filters cover further cases. The
+  selects private anonymous pieces with an anon_vma (or detected via `was_written`) and private file
+  pieces that have been written or currently allow writes. File and ELF-header filters cover
+  further cases. The
   writer leaves holes for absent pages in sparse regions and fetches missing FUSE pages before
   inspecting headers or copying segments.
 - `Mm` drop leaves its code group (`kernel/mmu`), releases CoW (`kernel/cow`), defers the page
@@ -499,7 +519,7 @@ Otherwise the populated page-table levels determine the translation-fault level.
 - Guest pages are always 4 KB (`AT_PAGESZ` 4096) whatever the host page size.
 - Host `mincore` reports pages swapped to zram as absent; RSS (`kernel/oom`), mincore(2), pagemap
   and core-dump holes still use mincore.
-- `clip_file_mappings` and `invalidate_fill` use `unmap_or_clear_superpages`: when partial 2 MiB
+- `clip_file_mappings`, `punch_tmpfs` and `invalidate_fill` use `unmap_or_clear_superpages`: when partial 2 MiB
   superpage demotion hits OOM, `Mmu::unmap_noalloc` clears only partially covered L2 superpages
   whole (leaving L3 tables narrowed to the exact range so adjacent anonymous VMAs in the same
   2 MiB slot are never touched) and expires `PageWatch`es across the widened range; still-valid

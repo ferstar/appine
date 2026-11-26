@@ -28,6 +28,7 @@
 //! ended, together with that group under `memory.oom.group`.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -362,7 +363,7 @@ pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u6
 }
 
 /// How swap pages are attributed per guest `Mm` during OOM scoring.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum SwapContext {
     /// `/proc/self/pagemap` is readable: count exact swapped entries per `Mm`.
     Exact,
@@ -374,6 +375,7 @@ enum SwapContext {
     Fallback {
         host_swap_pages: u64,
         total_cand: u64,
+        candidates: HashMap<*const crate::mm::Mm, u64>,
     },
 }
 
@@ -407,7 +409,7 @@ fn fallback_swap_context(k: &Kernel, host_swap_pages: u64) -> SwapContext {
     if host_swap_pages == 0 {
         return SwapContext::Zero;
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut candidates = HashMap::new();
     let mut total_cand = 0u64;
     for group in k.groups.values() {
         let Ok(g) = group.try_borrow() else {
@@ -416,29 +418,37 @@ fn fallback_swap_context(k: &Kernel, host_swap_pages: u64) -> SwapContext {
         let Ok(Some(mm)) = group_mm(k, &g) else {
             continue;
         };
-        if seen.insert(Rc::as_ptr(&mm))
-            && let Ok(mm_ref) = mm.try_borrow()
+        if let Ok(mm) = mm.try_borrow()
+            && let std::collections::hash_map::Entry::Vacant(entry) =
+                candidates.entry(std::ptr::from_ref(&*mm))
         {
-            total_cand = total_cand.saturating_add(mm_ref.swappable_nonresident_pages());
+            let count = mm.swappable_nonresident_pages();
+            entry.insert(count);
+            total_cand = total_cand.saturating_add(count);
         }
     }
     SwapContext::Fallback {
         host_swap_pages,
         total_cand,
+        candidates,
     }
 }
 
-fn swap_pages_for_mm(mm: &crate::mm::Mm, ctx: SwapContext) -> u64 {
+fn swap_pages_for_mm(mm: &crate::mm::Mm, ctx: &SwapContext) -> u64 {
     match ctx {
         SwapContext::Exact => mm.exact_swap_pages().unwrap_or(0),
         SwapContext::Zero => 0,
         SwapContext::Fallback {
             host_swap_pages,
             total_cand,
+            candidates,
         } => estimate_swap_share(
-            mm.swappable_nonresident_pages(),
-            total_cand,
-            host_swap_pages,
+            candidates
+                .get(&std::ptr::from_ref(mm))
+                .copied()
+                .unwrap_or_else(|| mm.swappable_nonresident_pages()),
+            *total_cand,
+            *host_swap_pages,
         ),
     }
 }
@@ -471,15 +481,21 @@ fn select_with(
     };
     let total = (total / PAGE_SIZE) as i64;
     let mut best: Option<(Rc<RefCell<ThreadGroup>>, i64, u64)> = None;
+    let skipped: HashSet<_> = skip.iter().map(Rc::as_ptr).collect();
+    let mut measured = HashMap::new();
     for group in k.groups.values() {
-        if skip.iter().any(|s| Rc::ptr_eq(s, group)) {
+        if skipped.contains(&Rc::as_ptr(group)) {
             continue;
         }
         let g = group.borrow();
         if !k.cgroups.is_within(g.cgroup, domain) {
             continue;
         }
-        let Some((points, rss)) = badness_with(k, &g, total, swap_ctx) else {
+        let Some((points, rss)) = badness_with(k, &g, total, |mm| {
+            *measured
+                .entry(std::ptr::from_ref(mm))
+                .or_insert_with(|| score_pages(mm, &swap_ctx))
+        }) else {
             continue;
         };
         if best.as_ref().is_none_or(|b| points >= b.1) {
@@ -502,8 +518,18 @@ fn badness_with(
     k: &Kernel,
     g: &ThreadGroup,
     total: i64,
-    swap_ctx: SwapContext,
+    measure: impl FnOnce(&crate::mm::Mm) -> (u64, u64),
 ) -> Option<(i64, u64)> {
+    let mm = eligible_mm(k, g)?;
+    let (mem_pages, rss) = measure(&mm.borrow());
+    Some((badness_points(g, mem_pages, total), rss))
+}
+
+fn badness_points(g: &ThreadGroup, mem_pages: u64, total: i64) -> i64 {
+    mem_pages as i64 + g.oom_score_adj as i64 * (total / 1000)
+}
+
+fn eligible_mm(k: &Kernel, g: &ThreadGroup) -> Option<Rc<RefCell<crate::mm::Mm>>> {
     if g.tgid == INIT || g.oom_score_adj == OOM_SCORE_ADJ_MIN {
         return None;
     }
@@ -515,26 +541,44 @@ fn badness_with(
     if task.vfork.get() && parent.is_some_and(|p| Rc::ptr_eq(&p.res.borrow().mm, &mm)) {
         return None;
     }
-    let mm_ref = mm.borrow();
-    let rss = mm_ref.resident_pages();
-    let swap = swap_pages_for_mm(&mm_ref, swap_ctx);
-    let pgtables = mm_ref.pgtables_pages();
-    let mem_pages = rss.saturating_add(swap).saturating_add(pgtables);
-    Some((
-        mem_pages as i64 + g.oom_score_adj as i64 * (total / 1000),
+    Some(mm)
+}
+
+fn score_pages(mm: &crate::mm::Mm, ctx: &SwapContext) -> (u64, u64) {
+    let rss = mm.resident_pages();
+    (
+        rss.saturating_add(swap_pages_for_mm(mm, ctx))
+            .saturating_add(mm.pgtables_pages()),
         rss,
-    ))
+    )
 }
 
 /// `/proc/<pid>/oom_score` (Linux's `proc_oom_score`): the badness against the host's RAM plus swap,
 /// scaled into 0 to 2000 (1000 + badness × 1000 / total, times 2/3), and 0 for a process never
 /// picked.
 pub(crate) fn proc_score(k: &Kernel, g: &ThreadGroup) -> u64 {
+    let Some(mm) = eligible_mm(k, g) else {
+        return 0;
+    };
+    let mm = mm.borrow();
     let total = (appine_hal::ram_and_swap() / PAGE_SIZE).max(1) as i64;
-    let swap_ctx = swap_context(k);
-    badness_with(k, g, total, swap_ctx).map_or(0, |(b, _)| {
-        ((1000 + b * 1000 / total) * 2 / 3).max(0) as u64
-    })
+    let rss_tables = mm.resident_pages().saturating_add(mm.pgtables_pages());
+    let scaled = |swap| {
+        let points = badness_points(g, rss_tables.saturating_add(swap), total);
+        ((1000 + points * 1000 / total) * 2 / 3).max(0) as u64
+    };
+    if appine_hal::pagemap_readable() {
+        return scaled(mm.exact_swap_pages().unwrap_or(0));
+    }
+    let host_swap = app_memory().map_or(0, |u| u.swap / PAGE_SIZE);
+    // An individual proc read has no pass to share with other readers. Both the
+    // host swap total and this mm's candidates bound its share. If either bound
+    // rounds to the same integer score as zero, the denominator cannot matter.
+    let low = scaled(0);
+    if scaled(host_swap) == low || scaled(mm.swappable_nonresident_pages().min(host_swap)) == low {
+        return low;
+    }
+    scaled(swap_pages_for_mm(&mm, &fallback_swap_context(k, host_swap)))
 }
 
 /// Writes to the kernel log when ending a process ([`crate::klog`]): to the guest, the app's limit
@@ -1229,7 +1273,10 @@ mod tests {
         assert!(expected_pgtables_pages >= 4);
 
         let (victim, _task, _cpu) = add_process(&mut k, 60, INIT, ROOT, mm.clone());
-        let (points, rss) = badness_with(&k, &victim.borrow(), 100_000, SwapContext::Zero).unwrap();
+        let (points, rss) = badness_with(&k, &victim.borrow(), 100_000, |mm| {
+            score_pages(mm, &SwapContext::Zero)
+        })
+        .unwrap();
         assert_eq!(points, (rss + expected_pgtables_pages) as i64);
 
         out_of_memory(&mut k, (ROOT, 1 << 20, 64 << 10));
@@ -1280,9 +1327,9 @@ mod tests {
         let mm_b = Mm::new().into_shared();
         let _b_res = dirty_anon(&mm_b, 16, 0x11);
         let b_disc = dirty_anon(&mm_b, 128, 0x22);
-        let (_, res) = mm_b
-            .borrow_mut()
-            .discard_range(b_disc, 128 * PAGE_SIZE, false);
+        let (_, res) =
+            mm_b.borrow_mut()
+                .discard_with_pagemap(b_disc, 128 * PAGE_SIZE, false, false);
         res.unwrap();
         assert_eq!(mm_b.borrow().swappable_nonresident_pages(), 0);
 
@@ -1297,15 +1344,55 @@ mod tests {
 
         // Host VmSwap == 128 pages -> A receives full attribution (B's MADV_DONTNEED is 0) -> A wins.
         let ctx_swap = fallback_swap_context(&k, 128);
-        assert_eq!(
-            ctx_swap,
-            SwapContext::Fallback {
-                host_swap_pages: 128,
-                total_cand: 128,
-            }
-        );
+        assert!(matches!(&ctx_swap, SwapContext::Fallback {
+            host_swap_pages: 128, total_cand: 128, candidates
+        } if candidates.values().filter(|&&n| n == 128).count() == 1));
         let (picked_swap, _) = select_with(&k, &[], (ROOT, 1 << 30), ctx_swap).unwrap();
         assert!(Rc::ptr_eq(&picked_swap, &proc_a));
+    }
+
+    #[test]
+    fn scoring_counts_shared_mm_once_and_keeps_per_process_adjustments() {
+        fn mm_with_faulted_page() -> Rc<RefCell<Mm>> {
+            let mm = Mm::new().into_shared();
+            let addr = mm
+                .borrow_mut()
+                .mmap(
+                    0,
+                    PAGE_SIZE,
+                    prot::READ | prot::WRITE,
+                    flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                    None,
+                )
+                .unwrap();
+            assert!(mm.borrow().fault_in(addr, prot::WRITE));
+            mm
+        }
+
+        let mut k = Kernel::new(Tier::Interpreter);
+        let mm = mm_with_faulted_page();
+        let (a, _ta, _ca) = add_process(&mut k, 70, INIT, ROOT, mm.clone());
+        let (b, _tb, _cb) = add_process(&mut k, 71, INIT, ROOT, mm);
+        let protected = mm_with_faulted_page();
+        let (immune, _ti, _ci) = add_process(&mut k, 72, INIT, ROOT, protected);
+        immune.borrow_mut().oom_score_adj = OOM_SCORE_ADJ_MIN;
+        let ctx = fallback_swap_context(&k, 1);
+        assert!(
+            matches!(&ctx, SwapContext::Fallback {total_cand: 2, candidates, ..} if candidates.len() == 2)
+        );
+        assert!(Rc::ptr_eq(
+            &select_with(&k, &[], (ROOT, 1 << 30), ctx).unwrap().0,
+            &b
+        ));
+        a.borrow_mut().oom_score_adj = 10;
+        assert!(Rc::ptr_eq(
+            &select_with(&k, &[], (ROOT, 1 << 30), SwapContext::Zero)
+                .unwrap()
+                .0,
+            &a
+        ));
+        assert!(proc_score(&k, &a.borrow()) > proc_score(&k, &b.borrow()));
+        assert_eq!(proc_score(&k, &immune.borrow()), 0);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification: `WRITABLY_SHARED` cleanup via `forget_writably_shared` on host object unlink and `st_nlink == 0` rejection in `content::version`)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: ForkFileView reuse on HostRegion drop and TRACKED/FAST_UNLINKS fast unlink for WRITABLY_SHARED)
 
 ## Responsibilities
 
@@ -18,16 +18,17 @@ host process:
   (`content::version`, `WRITABLY_SHARED`);
 - host commit-accounting rules, 16 KB host-page alignment for file mappings and `SharedMemory`
   segments;
-- process-wide anonymous range recycling (`recycled`) and pre-mapped `fork` pools (`spare`,
-  `Carved`);
-- BKL-deferred host unmapping and page-table freeing (`Unmapped`, `UNMAPPED`, `UNMAPPING`,
-  `defer_unmaps`, `release_unmapped`);
+- process-wide anonymous range recycling (`recycled`), per-VMA small private-file fork view reuse
+  (`ForkFileView`), and pre-mapped `fork` pools (`spare`, `Carved`);
+- BKL-deferred host unmapping, fork-view return and page-table freeing (`Unmapped`, `UNMAPPED`,
+  `UNMAPPING`, `defer_unmaps`, `release_unmapped`, `return_fork_file_view`);
 - host-page-aware discard, hole-punching and non-zero copy primitives (`discard_host`,
   `discard_file_host`, `remove_host`, `copy_nonzero_pages`).
 
-Root: in `core/kernel/src/mm.rs`, the `Host backing` section (`RESERVED_HOST`, `HostRegion`,
-`SharedMemory`, `FileMaps`, `FileMap`, `content_version`, `content`/`WRITABLY_SHARED`, `Carved`,
-`spare`, `Unmapped`/`UNMAPPED`/`UNMAPPING`, `defer_unmaps`, `release_unmapped`, `recycled`,
+Root: in `core/kernel/src/mm.rs`, the `Host backing` section (`RESERVED_HOST`, `ForkFileView`,
+`HostRegion`, `SharedMemory`, `FileMaps`, `FileMap`, `content_version`, `try_enter_fast_unlink`,
+`content`/`WRITABLY_SHARED`, `Carved`, `spare`, `return_fork_file_view`,
+`Unmapped`/`UNMAPPED`/`UNMAPPING`, `defer_unmaps`, `release_unmapped`, `recycled`,
 `discard_host`, `discard_file_host`, `remove_host`, `copy_nonzero_pages`) plus `Mm::mmap_gpu`'s
 host-mapping retention contract.
 
@@ -39,7 +40,9 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 
 ## Key types
 
-- `HostRegion` — owns one host range (`base`, `len`). `anonymous: Some(reserve)` marks a private
+- `HostRegion` — owns one host range (`base`, `len`). `return_to: Option<Weak<ForkFileView>>`
+  marks a small (`<= 64 KiB`) fork child's `MAP_PRIVATE` file view that returns to its parent
+  VMA's idle slot on drop after discarding private pages. `anonymous: Some(reserve)` marks a private
   anonymous range that is recycled on drop; `used_start`/`used_end` (`AtomicUsize`) track the
   monotonic byte-offset hull of slices exposed to any VMA (full `0..len` by default, empty
   `len..0` for oversized stack/heap reservations via `new_anonymous_reserved` /
@@ -54,11 +57,18 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
   commit-accounted).
 - `FileMaps` — kernel-wide LRU cache (at most 128 `FileMap` entries) of read-only private file
   mappings, shared by all address spaces, keyed by `(device, inode, offset, length, ctime, size)`.
+- `ForkFileView` — single-slot reusable `MAP_PRIVATE` file view (`offset`, `len`,
+  `idle: Mutex<Option<Arc<HostRegion>>>`) attached to a small (`<= 64 KiB`) parent private-file VMA
+  so sequential forks reuse one host mapping after `return_fork_file_view` discards private pages.
 - `content` / `WRITABLY_SHARED` — process-wide set of linked host `(dev, ino)` pairs that have had
-  a writable shared mapping, re-checking `fstat(fd).st_nlink` under the lock against concurrent
-  unlinks and cleared by `forget_writably_shared` when `kernel/store`'s `remove_object` unlinks the
-  host object; `content_version` rejects `st_nlink == 0` (memfds and deleted objects), recent
-  ctimes, and tracked `(dev, ino)` entries.
+  a writable shared mapping, paired with `SeqCst` counters `TRACKED` (registered entries plus
+  in-progress registrations) and `FAST_UNLINKS` (active unpinned unlinks). When `TRACKED == 0`,
+  `try_enter_fast_unlink` lets `kernel/store`'s `remove_object` unlink without an `O_PATH` pin or
+  `fstat`, and `forget`/`content::version` skip locking; `writably_shared` increments `TRACKED` and
+  waits for `FAST_UNLINKS == 0` before re-checking `fstat(fd).st_nlink > 0` under the lock, while
+  `forget_writably_shared` removes the entry and decrements `TRACKED` after a pinned unlink.
+  `content_version` rejects `st_nlink == 0` (memfds and deleted objects), recent ctimes, and
+  tracked `(dev, ino)` entries.
 - `recycled` — process-wide reuse pool of private anonymous host ranges keyed by `(len, reserve)`:
   at most 256 MB in total and 32 ranges per key; on return (`recycled::put`), discards only the
   host-page-aligned `[used_start, used_end)` sub-range (skipping `MADV_DONTNEED` if nothing was
@@ -69,9 +79,10 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
   `recycled` and then a host mmap.
 - `Carved` — map of small child VMA starts to `(Arc<HostRegion>, host)` pieces carved from one
   `spare` region at fork.
-- `Unmapped` / `UNMAPPED` / `UNMAPPING` — thread-local list of host ranges, anonymous ranges and
-  page tables (`Mmu`) whose release is deferred while the BKL is held, and a global atomic byte
-  count of what is still pending (page tables not counted).
+- `Unmapped` / `UNMAPPED` / `UNMAPPING` — thread-local list of host ranges, anonymous ranges,
+  released fork file views (`file_views`) and page tables (`Mmu`) whose release is deferred while
+  the BKL is held, and a global atomic byte count of what is still pending (page tables not
+  counted).
 
 ## Public entry points
 
@@ -80,7 +91,8 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 - **Machine** (`kernel/boot`, `android/service`): `FileMaps::clear` from `Machine::trim_memory`.
 - **SysV shm** (`kernel/ipc`): `SharedMemory::new`, `SharedMemory::len`.
 - **Code groups and files** (`kernel/mm`, `kernel/mmu`, `kernel/store`): `content_version`,
-  `forget_writably_shared`, `FileMaps::get`/`insert`, `UNMAPPING` (read by `kernel/oom`).
+  `try_enter_fast_unlink`, `forget_writably_shared`, `FileMaps::get`/`insert`, `UNMAPPING` (read by
+  `kernel/oom`).
 - **Internal mm / cow primitives**: `HostRegion::reserved`, `spare::anonymous` /
   `spare::anonymous_reserved`, `recycled::take`/`put`, `discard_host`, `discard_file_host`,
   `remove_host`, `copy_nonzero_pages`, `Mm::mmap_gpu`.
@@ -110,8 +122,9 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 - A file has no trusted content version when unlinked (`st_nlink == 0`, including memfds and
   deleted store objects), while its ctime is within the last 2 s, or once a linked host object has
   been mapped shared from a writably opened descriptor (`WRITABLY_SHARED`, recorded after VMA
-  insertion succeeds and cleared by `forget_writably_shared` while `kernel/store` holds an `O_PATH`
-  pin across a successful `unlink_at`; sealed memfds count as not writable).
+  insertion succeeds; `kernel/store`'s `remove_object` uses `try_enter_fast_unlink` to bypass
+  pinning when `TRACKED == 0`, and otherwise holds an `O_PATH` pin across `unlink_at` +
+  `forget_writably_shared`; sealed memfds count as not writable).
 - Shared file mappings map the same host object file with host `MAP_SHARED`, so they stay coherent
   with `read`/`write`, which go to that file through the host page cache.
 - On a 16 KB-page host, a file mapping covers the 16 KB-aligned host range around the target and
@@ -134,14 +147,19 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 
 - Regions stay in `Mm::graveyard` (`kernel/mm`) until `kernel/mmu`'s `sync` has quiesced the other
   threads, so guest data races never touch memory already returned to the host.
-- A `HostRegion` dropped while the BKL is held is queued in `UNMAPPED` and counted in `UNMAPPING`
-  (`reserved`, `foreign` and `gpu` regions return immediately without unmapping or recycling).
+- A `HostRegion` dropped while the BKL is held is queued in `UNMAPPED` (in `anonymous`,
+  `file_views` when `return_to` upgrades, or `regions`) and counted in `UNMAPPING` (`reserved`,
+  `foreign` and `gpu` regions return immediately without unmapping or recycling); outside the BKL a
+  region with `return_to` tries `return_fork_file_view` inline before unmapping.
 - When the BKL is released (`release_unmapped`), deferred page tables (`Mmu`) are freed first,
   anonymous ranges go back to `recycled::put` one at a time (discarding only their host-aligned
   `[used_start, used_end)` sub-range with host `MADV_DONTNEED` and keeping them when that discard
-  is strictly below 2 MB and within the 256 MB / 32-per-key caps, otherwise unmapping), file ranges
-  are sorted and unmapped in coalesced contiguous runs, `UNMAPPING` is decremented with `Release`
-  ordering, and then `spare::refill` tops the fork pool back up.
+  is strictly below 2 MB and within the 256 MB / 32-per-key caps, otherwise unmapping), released
+  fork file views run `return_fork_file_view` (discarding private pages via host `MADV_DONTNEED`
+  and caching in `ForkFileView::idle` when empty, or appending to the unmap list otherwise), file
+  ranges are sorted and unmapped in coalesced contiguous runs, `UNMAPPING` is decremented with
+  `Release` ordering after each reclaimed batch, and then `spare::refill` tops the fork pool back
+  up.
 - Under the BKL, `kernel/cow`'s `fork` still calls host mmap when a needed length is missing from
   both `spare` and `recycled` (and for private mappings over 1 MB or growsdown VMAs without
   reserved room when `recycled` has no match), and `spare::anonymous` still unmaps inline the
@@ -162,7 +180,8 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 - `kernel/ipc`: `SharedMemory::new` / `len`.
 - `kernel/boot` / `Machine`: initial `FileMaps`, `FileMaps::clear` in `Machine::trim_memory`.
 - `kernel/mmu`: `Mmu` dropped via `Unmapped::mmus` when `Mm` drops under the BKL.
-- `kernel/store`: calls `forget_writably_shared` from `remove_object` after unlinking a host object.
+- `kernel/store`: calls `try_enter_fast_unlink` and `forget_writably_shared` from `remove_object`
+  when unlinking a host object.
 
 ### Outbound
 

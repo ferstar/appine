@@ -388,6 +388,9 @@ pub struct Store {
     /// object's mtime/ctime can advance via dirty-page writeback without a syscall into the store.
     /// Kept outside [`Cache`] because a mapping outlives cache clears.
     writable_maps: RefCell<HashSet<Ino>>,
+    /// Inodes whose backing or held state changed on this connection. Rollback or the
+    /// size cap can discard this history (`None`), forcing reconciliation on every pin.
+    changed_backings: RefCell<Option<HashSet<Ino>>>,
     /// Deleted regular files whose `shared` row was kept at unlink/rename because they might still
     /// be open or mapped: released once nothing in the kernel references them (`Store::release`).
     pending_release: RefCell<HashSet<Ino>>,
@@ -397,6 +400,12 @@ pub struct Store {
     linkable_tmpfiles: RefCell<HashSet<Ino>>,
     /// Previous linkability at each change in the pending transaction, in operation order.
     tmpfile_undo: RefCell<Vec<(Ino, bool)>>,
+}
+
+pub(crate) struct MappingObject {
+    pub file: File,
+    /// An earlier open description may still refer to a different backing object.
+    pub reconcile: bool,
 }
 
 #[cfg(test)]
@@ -692,6 +701,7 @@ impl Store {
             waker: RefCell::new(None),
             fills: RefCell::default(),
             writable_maps: RefCell::default(),
+            changed_backings: RefCell::new(Some(HashSet::new())),
             pending_release: RefCell::default(),
             linkable_tmpfiles: RefCell::default(),
             tmpfile_undo: RefCell::default(),
@@ -1512,6 +1522,9 @@ impl Store {
             if tmpfile && !s.is_linkable_tmpfile(ino) {
                 return Err(Errno::ENOENT);
             }
+            if s.lookup(parent, name)?.is_some() {
+                return Err(Errno::EEXIST);
+            }
             s.add_dentry(parent, name, ino)?;
             let now = s.inode_now(ino)?;
             s.db()
@@ -1579,10 +1592,8 @@ impl Store {
         Ok(ino)
     }
 
+    /// Inserts a name checked absent in the current write transaction.
     fn add_dentry(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
-        if self.lookup(parent, name)?.is_some() {
-            return Err(Errno::EEXIST);
-        }
         let dir = self.stat_row(parent)?;
         if !dir.is_dir() {
             return Err(Errno::ENOTDIR);
@@ -1765,23 +1776,46 @@ impl Store {
 
     /// unlink(2): removes a dentry of a non-directory.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> Result<(), Errno> {
-        let ino = self.lookup(parent, name)?.ok_or(Errno::ENOENT)?;
-        if self.stat_row(ino)?.is_dir() {
-            return Err(Errno::EISDIR);
-        }
-        self.transaction(|s| s.remove_link(parent, name, ino))
+        self.remove_checked(parent, name, false, |_| Ok(()))
     }
 
     /// rmdir(2): removes an empty directory.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> Result<(), Errno> {
-        let ino = self.lookup(parent, name)?.ok_or(Errno::ENOENT)?;
-        if !self.stat_row(ino)?.is_dir() {
-            return Err(Errno::ENOTDIR);
-        }
-        if ino == ROOT {
-            return Err(Errno::EBUSY);
-        }
-        self.transaction(|s| s.remove_dir(parent, name, ino))
+        self.remove_checked(parent, name, true, |_| Ok(()))
+    }
+
+    /// Runs the caller's permission and mount checks on the same dentry that is removed.
+    /// A missing name still goes through the caller's directory search permission check.
+    pub(crate) fn remove_checked<T>(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        rmdir: bool,
+        check: impl FnOnce(Result<Option<Ino>, Errno>) -> Result<T, Errno>,
+    ) -> Result<T, Errno> {
+        self.transaction(|s| {
+            // With the writer lock held the database is stable, but a peer may still be
+            // publishing its cache generation after COMMIT. Discard just the affected entries.
+            let shared = !s.defers();
+            if shared {
+                s.touch_ino(parent);
+                s.touch_name(parent, name);
+            }
+            let victim = s.lookup(parent, name);
+            if shared && let Ok(Some(ino)) = victim {
+                s.touch_ino(ino);
+            }
+            let result = check(victim)?;
+            let ino = victim?.ok_or(Errno::ENOENT)?;
+            match (rmdir, s.kind(ino)? == mode::S_IFDIR) {
+                (true, false) => return Err(Errno::ENOTDIR),
+                (false, true) => return Err(Errno::EISDIR),
+                (true, true) if ino == ROOT => return Err(Errno::EBUSY),
+                (true, true) => s.remove_dir(parent, name, ino)?,
+                (false, false) => s.remove_link(parent, name, ino)?,
+            }
+            Ok(result)
+        })
     }
 
     /// rename(2)/renameat2(2): `noreplace` is `RENAME_NOREPLACE`, `exchange` is
@@ -1887,20 +1921,33 @@ impl Store {
     /// Removes a dentry pointing at a non-directory; when the last link goes, a regular file's
     /// object is deleted along with it.
     fn remove_link(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
+        let (kind, data) = if self.defers() {
+            self.with_row(ino, |(st, data)| (st.kind(), *data))?
+        } else {
+            // A peer may have committed a new backing before publishing its cache generation.
+            let (st, data) = self.query_row(ino)?;
+            (st.kind(), data)
+        };
+        let now = if data.held.is_some() {
+            self.filesystem_now()?
+        } else {
+            now_ns()
+        };
         self.db()
             .prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
             .and_then(|mut st| st.execute(params![parent, name]))
             .map_err(db_err)?;
-        let now = self.inode_now(ino)?;
-        self.db()
-            .prepare_cached("UPDATE inodes SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![ino, now]))
+        let nlink: u32 = self
+            .db()
+            .prepare_cached(
+                "UPDATE inodes SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1 RETURNING nlink",
+            )
+            .and_then(|mut st| st.query_row(params![ino, now], |r| r.get(0)))
             .map_err(db_err)?;
         self.touch_name(parent, name);
         self.touch_ino(ino);
         self.dir_changed(parent)?;
-        let (st, data) = self.row(ino)?;
-        if st.nlink == 0 && st.kind() == mode::S_IFREG {
+        if nlink == 0 && kind == mode::S_IFREG {
             // Deleted after the commit: if the app is killed before the commit, the dentry is
             // still there, so the object must be too. A held file keeps sharing its object while
             // it may still be open: its descriptors still hold the shared object, and a write
@@ -1910,8 +1957,8 @@ impl Store {
             } else {
                 self.pending_release.borrow_mut().insert(ino);
             }
-        } else {
-            self.object_changed(ino);
+        } else if kind == mode::S_IFREG && data.held.is_none() {
+            self.touch_object_ctime(data.object);
         }
         Ok(())
     }
@@ -2186,11 +2233,24 @@ impl Store {
     }
 
     fn write_atime(&self, ino: Ino, time: i64) -> Result<(), Errno> {
+        let mut fills = self.fills.borrow_mut();
+        let row = fills.iter_mut().find_map(|fill| match fill {
+            Fill::Row(st) if st.ino == ino => Some(st),
+            _ => None,
+        });
+        if row.as_ref().is_some_and(|st| st.atime_ns == time) {
+            return Ok(());
+        }
         self.db()
             .prepare_cached("UPDATE inodes SET atime_ns = ?2 WHERE ino = ?1")
             .and_then(|mut st| st.execute(params![ino, time]))
             .map_err(db_err)?;
-        self.touch_ino(ino);
+        if let Some(st) = row {
+            st.atime_ns = time;
+        } else {
+            drop(fills);
+            self.touch_ino(ino);
+        }
         Ok(())
     }
 
@@ -2511,6 +2571,7 @@ impl Store {
                 let _ = self.exec("ROLLBACK");
             }
             self.update(|c| c.clear(c.generation));
+            *self.changed_backings.borrow_mut() = None;
             self.rollback_tmpfiles(0);
             let _ = self.remove_lost_objects();
             return r;
@@ -2760,32 +2821,75 @@ impl Store {
         self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
     }
 
-    /// Acquire a store mapping's backing and pin it against object sharing. The mmap code
-    /// duplicates this open description, keeping the host flock through VMA splits and fork.
-    /// Serialize the pin with share across store connections. EAGAIN asks the caller to split
-    /// a held object first. An anonymous or deleted plain file can use its existing descriptor.
-    pub(crate) fn mapping_object(&self, ino: Ino, writable: bool) -> Result<Option<File>, Errno> {
-        self.transaction(|s| {
-            let (st, data) = s.query_row(ino)?;
+    /// Select and pin the backing for a private or shared VMA. EAGAIN asks the caller to
+    /// split a held file. An unlinked object without a name uses its existing descriptor.
+    pub(crate) fn mapping_object(
+        &self,
+        ino: Ino,
+        writable: bool,
+    ) -> Result<Option<MappingObject>, Errno> {
+        let pin = self.pin_mapping(ino, writable)?;
+        if writable {
+            self.writable_maps.borrow_mut().insert(ino);
+            self.object_modified(ino);
+        }
+        Ok(pin)
+    }
+
+    fn pin_mapping(&self, ino: Ino, writable: bool) -> Result<Option<MappingObject>, Errno> {
+        let pin = |nlink, data: Data, reconcile| {
             if data.held.is_some() {
                 return Err(Errno::EAGAIN);
-            }
-            if writable {
-                s.writable_maps.borrow_mut().insert(ino);
-                s.object_modified(ino);
             }
             let access = if writable {
                 libc::O_RDWR
             } else {
                 libc::O_RDONLY
             };
-            let file = match s.open_number(data.object, access) {
-                Err(Errno::ENOENT) if st.nlink == 0 => return Ok(None),
+            let file = match self.open_number(data.object, access) {
+                Err(Errno::ENOENT) if nlink == 0 => return Ok(None),
                 result => result?,
             };
             appine_hal::flock(file.as_raw_fd(), false, true).map_err(Errno)?;
-            Ok(Some(file))
+            Ok(Some(MappingObject { file, reconcile }))
+        };
+
+        // A peer must join before probing either clone endpoint. Check the join epoch
+        // again after locking the object, including when the cached lookup or open failed.
+        let commits = &self.meta.commits;
+        let users = commits.users_state();
+        if self.joined && users as u32 == 1 && self.snapshot_at.get().is_none() {
+            // Earlier open descriptions can still be stale after a local change or after
+            // a provider closes its connection without having replayed its notification.
+            let unchanged = users == Commits::FIRST_USER
+                && self
+                    .changed_backings
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|changed| !changed.contains(&ino));
+            let result = self
+                .with_row(ino, |(st, data)| (st.nlink, *data))
+                .and_then(|(nlink, data)| pin(nlink, data, !unchanged));
+            if commits.users_state() == users {
+                return result;
+            }
+        }
+        // The shared counter advances after SQLite commits. Read SQLite directly under
+        // its write lock when another connection may have probed sharing before our pin.
+        self.transaction(|s| {
+            let (st, data) = s.query_row(ino)?;
+            pin(st.nlink, data, true)
         })
+    }
+
+    fn backing_changed(&self, ino: Ino) {
+        let mut history = self.changed_backings.borrow_mut();
+        if let Some(changed) = history.as_mut() {
+            changed.insert(ino);
+            if changed.len() >= Cache::MAX_ENTRIES {
+                *history = None;
+            }
+        }
     }
 
     /// Opens a regular file's object for reading and writing, with `O_APPEND` under `append` (for
@@ -2880,10 +2984,14 @@ impl Store {
             && st.kind() == mode::S_IFREG
             && data.held.is_none()
         {
-            let mut name = [0u8; 21];
-            let dir = self.meta.objects_dir.as_raw_fd();
-            let _ = appine_hal::chmod_at(dir, object_name(data.object, &mut name), OBJECT_MODE);
+            self.touch_object_ctime(data.object);
         }
+    }
+
+    fn touch_object_ctime(&self, object: Ino) {
+        let mut name = [0u8; 21];
+        let dir = self.meta.objects_dir.as_raw_fd();
+        let _ = appine_hal::chmod_at(dir, object_name(object, &mut name), OBJECT_MODE);
     }
 
     /// Makes regular file `dst`'s data the same object as `src`'s (FICLONE, a whole-file
@@ -2915,8 +3023,8 @@ impl Store {
             if sst.nlink == 0 {
                 return Err(Errno::ENOENT);
             }
-            // A store mapping in any kernel pins its backing. Both probes and mapping_object
-            // are serialized by the store write transaction. A pinned side requires a copy.
+            // A mapping in any kernel pins its backing. Concurrent connections serialize
+            // pin selection and both probes with the write transaction.
             for object in [sdata.object, ddata.object] {
                 let file = match s.open_number(object, libc::O_RDONLY) {
                     Err(Errno::ENOENT) if object == ddata.object && dst_st.nlink == 0 => {
@@ -3130,6 +3238,7 @@ impl Store {
             )
             .and_then(|mut st| st.execute(params![ino, object, atime]))
             .map_err(db_err)?;
+        self.backing_changed(ino);
         self.touch_ino(ino);
         Ok(())
     }
@@ -3156,6 +3265,7 @@ impl Store {
                 .and_then(|mut st| st.execute(params![ino, object]))
         };
         r.map_err(db_err)?;
+        self.backing_changed(ino);
         self.touch_ino(ino);
         Ok(())
     }
@@ -3170,6 +3280,7 @@ impl Store {
                 .prepare_cached("DELETE FROM shared WHERE ino = ?1")
                 .and_then(|mut st| st.execute(params![ino]))
                 .map_err(db_err)?;
+            self.backing_changed(ino);
             self.touch_ino(ino);
             if self.object_used(data.object)? {
                 return Ok(());
@@ -3305,6 +3416,7 @@ impl Drop for Op<'_> {
                 s.replaced.borrow_mut().truncate(self.replaced);
                 s.rollback_tmpfiles(self.tmpfile_undo);
                 for ino in created {
+                    s.backing_changed(ino);
                     let _ = s.unlink_new_object(ino);
                 }
             }
@@ -3651,6 +3763,8 @@ struct Commits {
 }
 
 impl Commits {
+    const FIRST_USER: u64 = (1u64 << 32) | 1;
+
     fn open(lock: &File) -> Result<Commits, Errno> {
         if lock.metadata().map_err(io_err)?.len() < 32 {
             lock.set_len(32).map_err(io_err)?;
@@ -3692,7 +3806,7 @@ impl Commits {
     /// Registers a new open connection, bumping both the open epoch and active count; returns the
     /// active count before joining.
     fn join(&self) -> u32 {
-        self.word(1).fetch_add((1u64 << 32) | 1, Ordering::SeqCst) as u32
+        self.word(1).fetch_add(Self::FIRST_USER, Ordering::SeqCst) as u32
     }
 
     /// Unregisters a closing connection, decrementing only the active count.
@@ -3913,30 +4027,27 @@ fn unlink_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
 /// Deletes an object in the `objects` directory and forgets any `WRITABLY_SHARED` tracking for
 /// its host inode; not an error if it is already gone.
 fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
+    if let Some(_guard) = crate::mm::try_enter_fast_unlink() {
+        return unlink_object(objects_dir, ino);
+    }
     let mut name = [0u8; 21];
     // Keep an O_PATH handle open across unlink_at + forget_writably_shared so the host filesystem
     // cannot recycle (st_dev, st_ino) for a new object before the old tracking entry is removed.
-    let pinned = appine_hal::open_at(
+    let pinned = match appine_hal::open_at(
         objects_dir.as_raw_fd(),
         object_name(ino, &mut name),
         libc::O_PATH | libc::O_NOFOLLOW,
         0,
-    )
-    .ok();
-    let host_id = pinned.as_ref().and_then(|f| {
-        appine_hal::fstat(f.as_raw_fd()).ok().map(|st| {
-            #[allow(clippy::unnecessary_cast)]
-            (st.st_dev as u64, st.st_ino as u64)
-        })
-    });
-    let res = unlink_object(objects_dir, ino);
-    if res.is_ok()
-        && let Some((dev, host_ino)) = host_id
-    {
-        crate::mm::forget_writably_shared(dev, host_ino);
-    }
-    drop(pinned);
-    res
+    ) {
+        Ok(file) => file,
+        Err(libc::ENOENT) => return Ok(()),
+        Err(e) => return Err(object_err(ino, e)),
+    };
+    let st = appine_hal::fstat(pinned.as_raw_fd()).map_err(|e| object_err(ino, e))?;
+    unlink_object(objects_dir, ino)?;
+    #[allow(clippy::unnecessary_cast)]
+    crate::mm::forget_writably_shared(st.st_dev as u64, st.st_ino as u64);
+    Ok(())
 }
 
 /// A PASSIVE checkpoint: waits for no readers and blocks no writers; frames that cannot be written
@@ -4114,6 +4225,60 @@ mod tests {
         // regardless of how fast the machine is
         s.delay = Duration::from_secs(3600);
         (s, dir)
+    }
+
+    #[test]
+    fn new_file_caches_the_host_atime_and_pins_without_a_transaction() {
+        let (s, dir) = temp_store("new-file-pin");
+        let (ino, host) = s.create_file(ROOT, b"file", 0o600, 0, 0).unwrap();
+        let atime = open_atime(&host).unwrap();
+        s.cached(|c| {
+            let (st, data) = &c.rows[&ino];
+            assert_eq!((st.atime_ns, data.atime), (atime, Some(atime)));
+        });
+        s.commit().unwrap();
+        assert_eq!(s.query_row(ino).unwrap().1.atime, Some(atime));
+        let pin = s.mapping_object(ino, false).unwrap().unwrap();
+        assert!(!pin.reconcile);
+        assert!(s.db().is_autocommit());
+        let peer = Store::open(&dir, &[]).unwrap();
+        let (other, _) = peer.create_file(ROOT, b"other", 0o600, 0, 0).unwrap();
+        assert!(!peer.try_share(ino, other).unwrap());
+        assert!(!peer.try_share(other, ino).unwrap());
+        drop(pin);
+        peer.share(ino, other).unwrap();
+        drop(peer);
+        assert!(matches!(s.mapping_object(ino, true), Err(Errno::EAGAIN)));
+        s.make_private(ino, None).unwrap();
+        assert!(s.mapping_object(ino, true).unwrap().unwrap().reconcile);
+        assert!(s.writable_maps.borrow().contains(&ino));
+        let (anon, _host) = s.create_anonymous(0o600, 0, 0).unwrap();
+        assert!(s.mapping_object(anon, false).unwrap().is_none());
+        drop(s);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Leave the peer between SQLite COMMIT and publication of the new cache generation.
+    fn commit_before_generation_bump(peer: &Store, change: impl FnOnce()) {
+        peer.exec("BEGIN IMMEDIATE").unwrap();
+        change();
+        peer.exec("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn mapping_sees_a_peer_commit_before_the_counter_advances() {
+        let (s, dir) = temp_store("pin-after-commit");
+        let (src, _) = s.create_file(ROOT, b"src", 0o600, 0, 0).unwrap();
+        let (dst, _) = s.create_file(ROOT, b"dst", 0o600, 0, 0).unwrap();
+        s.commit().unwrap();
+        let peer = Store::open(&dir, &[]).unwrap();
+        assert!(!s.held(dst).unwrap());
+        commit_before_generation_bump(&peer, || peer.share(src, dst).unwrap());
+        assert!(!s.held(dst).unwrap());
+        assert!(matches!(s.mapping_object(dst, false), Err(Errno::EAGAIN)));
+        peer.meta.commits.bump();
+        drop((peer, s));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -4311,6 +4476,49 @@ mod tests {
         let s = Store::open(&dir, &[]).unwrap();
         assert_eq!(s.lookup(bin, b"busybox").unwrap(), Some(busybox));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unlink_keeps_an_object_shared_by_a_just_committed_peer() {
+        let (s, dir) = temp_store("unlink-peer-share");
+        let (src, host) = s.create_file(ROOT, b"src", 0o600, 0, 0).unwrap();
+        let (dst, _) = s.create_file(ROOT, b"dst", 0o600, 0, 0).unwrap();
+        s.commit().unwrap();
+        let peer = Store::open(&dir, &[]).unwrap();
+        assert!(!s.held(src).unwrap());
+        commit_before_generation_bump(&peer, || peer.share(src, dst).unwrap());
+        s.unlink(ROOT, b"src").unwrap();
+        s.reaped();
+        assert!(s.pending_release.borrow().contains(&src));
+        assert_eq!(appine_hal::fstat(host.as_raw_fd()).unwrap().st_nlink, 1);
+        assert!(s.open_object(dst, false).is_ok());
+        peer.meta.commits.bump();
+        drop((peer, s));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checked_removal_sees_replacement_before_peer_publishes_generation() {
+        let (s, dir) = temp_store("unlink-peer-rename");
+        let (old, _) = s.create_file(ROOT, b"name", 0o600, 0, 0).unwrap();
+        let (new, _) = s.create_file(ROOT, b"new", 0o600, 0, 0).unwrap();
+        s.commit().unwrap();
+        let peer = Store::open(&dir, &[]).unwrap();
+        assert_eq!(s.lookup(ROOT, b"name").unwrap(), Some(old));
+        commit_before_generation_bump(&peer, || {
+            peer.rename(ROOT, b"new", ROOT, b"name", false, false)
+                .unwrap();
+        });
+        s.remove_checked(ROOT, b"name", false, |victim| {
+            assert_eq!(victim?, Some(new));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.query_row(new).unwrap().0.nlink, 0);
+        assert_eq!(s.query_row(old).unwrap().0.nlink, 0);
+        peer.meta.commits.bump();
+        drop((peer, s));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5531,7 +5739,8 @@ mod tests {
         // A second connection cannot make either side of a live mapping change backing.
         // A VMA retains a duplicate of the flocked description even after mmap returns.
         let pin = s.mapping_object(b, false).unwrap().unwrap();
-        let retained = pin.try_clone().unwrap();
+        assert!(pin.reconcile);
+        let retained = pin.file.try_clone().unwrap();
         drop(pin);
         s.commit().unwrap();
         let peer = Store::open(&dir, &[]).unwrap();

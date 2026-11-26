@@ -699,12 +699,6 @@ static bool translate_exclusive(struct xlate *x, uint32_t insn, uint64_t pc)
     return true;
 }
 
-bool dbt_is_atomic(uint32_t insn)
-{
-    return (insn & 0x3f000000) == 0x08000000 || ((insn & 0x3f200c00) == 0x38200000 && !BIT(insn, 26)) ||
-           (insn & 0x3f200c00) == 0x19000000;
-}
-
 /* The encoding has been confirmed valid by tier0_defined; when false is returned, no instruction
  * has been emitted yet */
 static bool translate_atomic(struct xlate *x, uint32_t insn, uint64_t pc)
@@ -1004,13 +998,11 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     }
     uint32_t reg_branch = insn & 0xfffffc1f;
     if (reg_branch == 0xd61f0000 || reg_branch == 0xd63f0000 || reg_branch == 0xd65f0000) {
-        /* BR/BLR/RET: put the target in T0 first, apply TBI0 untagging, then look up the jump
-         * cache */
+        /* Capture the raw target before BLR writes X30. Tagged targets miss the jump cache. */
         unsigned rn = FIELD(insn, 9, 5);
         if (reg_branch == 0xd65f0000 && rn == 30)
             emit_predicted_return(x);
         emit_xreg_to_t0(x, rn);
-        emit_untag_pc(x, T0);
         if (reg_branch == 0xd63f0000)
             emit_call(x, pc);
         emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
@@ -1025,23 +1017,14 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     return fallback(x, pc);
 }
 
-/*
- * Ask Tier 0 whether it recognizes this instruction (the two tiers' whitelists must agree, see
- * the engine and engine/dbt maps). The answer depends only on the instruction word and is cached by it in `cache`
- * (direct-mapped, each entry is 1 << 40 | instruction word << 1 | answer): Tier 0 has to execute
- * the instruction to find out, and asking once for every instruction translated at java startup
- * took two percentage points.
- */
-
-bool dbt_tier0_defined(struct appine_cpu *probe, uint64_t *cache, uint32_t insn, uint64_t pc)
+/* On a cache miss, run the instruction on the probe CPU so both tiers agree on its validity.
+ * Running the probe for every translated instruction cost two percentage points at Java startup. */
+bool dbt_tier0_defined_slow(struct appine_cpu *probe, uint64_t *entry, uint32_t insn, uint64_t pc)
 {
-    uint64_t *e = &cache[(insn * UINT32_C(0x9e3779b1)) >> 20];
-    if ((*e >> 1) == ((uint64_t)1 << 39 | insn))
-        return *e & 1;
     probe->pc = pc;
     probe->sp = 0;
     bool ok = appine_interp_exec(probe, insn) != APPINE_EXIT_UNDEF;
-    *e = (uint64_t)1 << 40 | (uint64_t)insn << 1 | ok;
+    *entry = (uint64_t)1 << 40 | (uint64_t)insn << 1 | ok;
     return ok;
 }
 

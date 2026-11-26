@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full refresh; 18 claims verified — 13 confirmed, 5 partial, 0 refuted; all fixes applied)
 >
-> Maintained: 2026-11-26 (targeted verification of final access ACL checks and GPU fence fd stat identity)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: range-aware tmpfs mapping faults, single-walk unlink dispatch with transactional store removal, and removal of parent_at)
 
 ## Responsibilities
 
@@ -35,7 +35,7 @@ locks, pipes, loops, mounts, overlay and FUSE are separate modules.
 
 - Resolution: `Vfs::resolve`, `walk`, `walk_resolve`, `resolve_mountpoint`, `resolve_parent`,
   `resolve_parent_with`, `found_path`, `reach`, `path_of`, `mounts_from`, `Cached::stat`,
-  `start_dir`, `lookup_at`, `parent_at`, `create_parent_at`, `may_create`, `display_path`.
+  `start_dir`, `lookup_at`, `create_parent_at`, `may_create`, `display_path`.
 - Syscalls: `newfstatat`, `fstat`, `statx`, `statfs`/`fstatfs`, `faccessat`/`faccessat2`,
   chmod/chown variants, `utimensat`, `getdents64`, `readlinkat`, `getcwd`, `chdir`/`fchdir`,
   `chroot`, `umask`, `mkdirat`, `mknodat`, `symlinkat`, `linkat`, `unlinkat`, `renameat2`.
@@ -208,9 +208,15 @@ nosuid,nodev, `/run` 0755 nosuid,nodev (20% RAM, `800 << 10` inodes).
   Final room check, write and charge hold the BKL. Fallocate needs the entire missing range.
   Before refusal or shortening, changed usage triggers one fresh count. `tmpfs_resized`
   charges the measured delta and updates unlinked records. Sparse truncate growth costs no
-  pages. Shrink/punch forget whole guest pages. An in-file hole fault can instantiate a page
-  even for a private read, without double-charging a reservation. Read/private faults preserve
-  backing mtime/ctime. Shared write faults publish mtime before granting write.
+  pages. Shrink/punch forget whole guest pages. `TmpfsMapping::fault_range` admits in-file faults:
+  when existing host data covers the faulting page it maps ahead up to the fault window (clamped to
+  EOF and the next host hole) with zero charge; in a hole it admits only the demanded range plus any
+  contiguous already-instantiated guest data without speculatively faulting ahead into uninstantiated
+  holes, instantiating pages even for a private read without double-charging reservations, shrinking
+  multi-page hole ranges to the fitting quota prefix via `fit_fault_range` (recounting once before
+  shortening or returning `ENOSPC`), and reserving host blocks on shared writes with single-page
+  fallback if a multi-page `fallocate` fails. Read/private faults preserve backing mtime/ctime.
+  Shared write faults publish mtime before granting write.
 - `tmpfs_victim` captures pages and the last-linked regular file's object before removal or
   replacement. `tmpfs_removed` refunds the name and any last-link pages, or puts a regular file
   found by `file_in_use` in `Tmpfs::unlinked` with **one inode and its pages still charged**. Its
@@ -343,13 +349,15 @@ cannot gain write later.
   gives `EPERM` and other types `EINVAL`. Device creation needs initial-namespace `CAP_MKNOD`
   and device BPF permission after admission. A char whiteout (device zero) skips both checks
   and is refused on overlay. `symlinkat` rejects an empty target before reading the new path.
-- `unlinkat` accepts only `AT_REMOVEDIR`. It tries mqueue, cgroup, overlay, then FUSE.
+- `unlinkat` accepts only `AT_REMOVEDIR`. It resolves the parent once before dispatching to mqueue,
+  cgroup, overlay, FUSE, or store.
   Other synthetic parents give `EROFS`/`EACCES` before dot/victim checks. Store unlink of
   either dot gives `EISDIR`, rmdir of `.` gives `EINVAL` and of `..` gives `ENOTEMPTY`. Otherwise
   writability precedes normal lookup. Plain unlink with trailing slash gives `ENOENT` if
-  missing, `EISDIR` for a directory, `ENOTDIR` otherwise, ahead of delete permission. Delete
-  checks search, victim lookup, immutable parent, write/search and sticky policy, then protected
-  flags on parent and victim.
+  missing, `EISDIR` for a directory, `ENOTDIR` otherwise, ahead of delete permission. Store delete
+  runs `may_delete` (search, victim lookup, immutable parent, write/search and sticky policy, then
+  protected flags on parent and victim), mount-point `EBUSY` and tmpfs victim inspection inside
+  `Store::remove_checked`'s removal write transaction.
 - `linkat` validates flags, then requires initial-namespace `CAP_DAC_READ_SEARCH` whenever
   `AT_EMPTY_PATH` is set (`ENOENT` before reading paths). It resolves source before destination.
   Existing pseudo destination gives `EEXIST`. Overlay pairs and FUSE destinations get separate

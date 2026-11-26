@@ -1202,6 +1202,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
             if stub_capable(s) {
                 s.stub_peer = is_stub(&addr);
                 if s.stub_peer {
+                    s.peer_map = None;
                     let _ = appine_hal::net::connect(s.fd, &addr);
                     return Ok(0);
                 }
@@ -1232,13 +1233,13 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                     return Err(Errno::ECONNREFUSED);
                 }
                 if nat_proto(s) == Some(IPPROTO_UDP as u8) {
+                    s.peer_map = None;
                     disconnect_host_keep_port(s.fd);
                     ensure_bound(s, None)?;
                     s.guest_peer = Some(connected_peer(&w, &me, s, &addr));
                     s.peer = Some(addr.clone());
                     s.any = false;
                     s.vconn = None;
-                    s.peer_map = None;
                     let t = s.track_mut();
                     t.nat_back.clear();
                     t.udp_target = None;
@@ -1554,12 +1555,12 @@ fn ensure_bound(s: &mut InetSocket, source: Option<&[u8]>) -> Result<(), Errno> 
 /// namespace's binding table ([`crate::netns::add_ephemeral`]) so it cannot alias an explicitly
 /// bound guest port and so later explicit binds check conflicts against it.
 fn claim_ephemeral(s: &mut InetSocket, addr: Option<&[u8]>) {
-    let Some(net) = s.net.clone() else {
-        return;
-    };
     if !mappable(s) || s.listener.is_some() {
         return;
     }
+    let Some(net) = s.net.as_ref() else {
+        return;
+    };
     let Ok(local) = appine_hal::net::sockname(s.fd, false) else {
         return;
     };
@@ -1584,7 +1585,7 @@ fn claim_ephemeral(s: &mut InetSocket, addr: Option<&[u8]>) {
     let (lo, hi) = net.devs.borrow().conf.port_range;
     let range = (lo.clamp(1, 65535) as u16, hi.clamp(1, 65535) as u16);
     let (guest, id) = crate::netns::add_ephemeral(
-        &net,
+        net,
         crate::netns::NewBinding {
             proto,
             addr: baddr,
@@ -3050,30 +3051,26 @@ fn scatter_received(
     })
 }
 
-/// Writes `data` over `iovecs` starting at byte offset `off`, returning how many bytes were
-/// written before any fault (`Ok(n)` with `n < data.len()` on a partial copy, or `Err(e)` when
+/// Writes `data` at the current iovec cursor and advances it for the next packet. Returns the
+/// prefix written before any fault (`Ok(n)` with `n < data.len()` on a partial copy, or `Err(e)` when
 /// nothing could be written at all, preserving `EFAULT` and `FUSE_RETRY`).
 pub(super) fn scatter_partial(
     cx: &mut Cx<'_>,
-    iovecs: &[(u64, usize)],
-    off: usize,
+    iovecs: &mut &[(u64, usize)],
+    off: &mut usize,
     data: &[u8],
 ) -> Result<usize, Errno> {
-    if data.is_empty() {
-        return Ok(0);
-    }
-    let mut skip = off;
     let mut done = 0;
-    for &(base, len) in iovecs {
-        if skip >= len {
-            skip -= len;
+    while done < data.len()
+        && let Some(&(base, len)) = iovecs.first()
+    {
+        if *off == len {
+            *iovecs = &iovecs[1..];
+            *off = 0;
             continue;
         }
-        let n = (len - skip).min(data.len() - done);
-        if n == 0 {
-            break;
-        }
-        let dst = base.wrapping_add(skip as u64);
+        let n = (len - *off).min(data.len() - done);
+        let dst = base.wrapping_add(*off as u64);
         let slice = &data[done..done + n];
         if cx.write_user(UserSlice::new(dst, n), slice).is_err() {
             let mut part = 0;
@@ -3087,16 +3084,15 @@ pub(super) fn scatter_partial(
                 {
                     Ok(()) => part += step,
                     Err(e) => {
+                        *off += part;
                         done += part;
                         return if done > 0 { Ok(done) } else { Err(e) };
                     }
                 }
             }
-            done += part;
-        } else {
-            done += n;
         }
-        skip = 0;
+        done += n;
+        *off += n;
     }
     Ok(done)
 }
@@ -3357,9 +3353,6 @@ pub(crate) fn send(
     // Translate the destination address to the host's (crate::netns: ENETUNREACH when
     // unreachable), binding first if unbound; record the namespace the destination is in (low
     // port mapping follows it)
-    let w = cx.kr().world();
-    let init = cx.kr().init_ns.net.clone();
-    let cred = cx.cred();
     let mut target_in_new_ns = false;
     // A socket bound to the host's wildcard address sending to a mapped destination: specify the
     // source address (Socket::wide)
@@ -3381,46 +3374,36 @@ pub(crate) fn send(
         if nat_proto(s) == Some(IPPROTO_UDP as u8)
             && let Some((target, there)) = s.track.as_ref().and_then(|k| k.udp_target.as_ref())
         {
-            let Some((ip, h)) = target
-                .upgrade()
-                .and_then(|t| crate::netns::resolve_target(&t, IPPROTO_UDP, there))
-            else {
+            let Some(target) = target.upgrade() else {
+                return Ok(data.len());
+            };
+            let Some((ip, h)) = crate::netns::resolve_target(&target, IPPROTO_UDP, there) else {
                 return Ok(data.len());
             };
             let gport = port_of(there).unwrap_or(0);
-            if let Some(v) = &mut s.vconn {
-                let desired = crate::netns::with_host_endpoint(v, ip, h);
-                if !same_endpoint(v, &desired) {
-                    *v = desired;
-                }
-            } else {
-                let current = appine_hal::net::sockname(s.fd, true).ok();
-                let desired = match &current {
-                    Some(cur) => crate::netns::with_host_endpoint(cur, ip, h),
-                    None => crate::netns::with_host_endpoint(&crate::netns::any_like(there), ip, h),
-                };
-                if current
-                    .as_deref()
-                    .is_none_or(|cur| !same_endpoint(cur, &desired))
-                {
-                    let _ = appine_hal::net::connect(s.fd, &desired);
-                }
-            }
-            s.peer_map = Some((gport, h));
+            update_udp_peer(s, &target, gport, ip, h)?;
         }
     }
+    let mut virtual_peer = [0; SOCKADDR_MAX];
+    let mut virtual_addr = None;
     let host_addr = match &mut *sock.borrow_mut() {
         Socket::Inet(s) if ty != SOCK_STREAM && (s.net.is_some() || !addr.is_empty()) => {
-            let me = s.net.clone().unwrap_or_else(|| init.clone());
-            if let (true, Some(v)) = (addr.is_empty(), &s.vconn) {
-                pktinfo = crate::netns::implicit_bind(&me, s.family, false);
-                target_in_new_ns = true;
-                Some(v.clone())
-            } else if addr.is_empty() {
-                let src = crate::netns::implicit_bind(&me, s.family, s.icmp6());
-                ensure_bound(s, src.as_deref())?;
-                Some(Vec::new())
+            if addr.is_empty() {
+                let me = s.net.as_ref().unwrap();
+                if let Some(v) = &s.vconn {
+                    pktinfo = crate::netns::implicit_bind(me, s.family, false);
+                    target_in_new_ns = true;
+                    // Keep the destination selected for this send across a blocking host retry.
+                    virtual_peer[..v.len()].copy_from_slice(v);
+                    virtual_addr = Some(&virtual_peer[..v.len()]);
+                } else if !s.bound {
+                    let src = crate::netns::implicit_bind(me, s.family, s.icmp6());
+                    ensure_bound(s, src.as_deref())?;
+                }
+                None
             } else {
+                let w = cx.kr().world();
+                let me = net_of(cx, s);
                 // nftables nat rewrote the destination: record it, so the source of datagrams
                 // coming back is translated back
                 let Routed {
@@ -3430,7 +3413,7 @@ pub(crate) fn send(
                     actual,
                     verdict,
                     ..
-                } = route(&w, s, &me, addr, &cred)?;
+                } = route(&w, s, &me, addr, &cx.cred())?;
                 // Dropped or rejected by a filter chain: EPERM on OUTPUT (Linux's ip_local_out),
                 // silently dropped elsewhere
                 match verdict {
@@ -3525,7 +3508,7 @@ pub(crate) fn send(
         }
         _ => None,
     };
-    let addr = host_addr.as_deref().unwrap_or(addr);
+    let addr = virtual_addr.or(host_addr.as_deref()).unwrap_or(addr);
     // TCP ignores the given address (except with MSG_FASTOPEN, Linux's tcp_sendmsg_locked), so
     // it is not passed to the host here either: the host's LSM may check it by address family
     // (Ubuntu 24.04's AppArmor rejects AF_UNSPEC with EAFNOSUPPORT)
@@ -3536,8 +3519,8 @@ pub(crate) fn send(
             && !addr.is_empty()
             && let Socket::Inet(s) = &*sock.borrow()
         {
-            let me = s.net.as_deref().unwrap_or(&init);
-            if crate::netns::is_foreign_loopback(&w, me, addr) {
+            let me = s.net.as_deref().unwrap_or(&cx.kr().init_ns.net);
+            if crate::netns::is_foreign_loopback(&cx.kr().world(), me, addr) {
                 return Err(Errno::ECONNREFUSED);
             }
         }
@@ -3647,6 +3630,46 @@ pub(crate) fn send(
         claim_ephemeral(s, None);
     }
     r
+}
+
+/// Applies a freshly resolved namespace listener to an already connected UDP socket.
+fn update_udp_peer(
+    s: &mut InetSocket,
+    target: &crate::nsproxy::NetNs,
+    guest_port: u16,
+    ip: [u8; 4],
+    host_port: u16,
+) -> Result<(), Errno> {
+    let ports = Some((guest_port, host_port));
+    if let Some(v) = &mut s.vconn {
+        if !crate::netns::matches_host_endpoint(v, ip, host_port) {
+            crate::netns::set_host_endpoint(v, ip, host_port);
+        }
+    } else {
+        if s.peer_map == ports {
+            // Setting TTL makes the socket eligible for a traceroute tap. Even after untap,
+            // an addressed probe may have left the host connected to a different endpoint.
+            if !s.ttl_set && target.listeners.borrow().unique_udp_host_ip(guest_port) {
+                return Ok(());
+            }
+            if appine_hal::net::sockname(s.fd, true)
+                .is_ok_and(|cur| crate::netns::matches_host_endpoint(&cur, ip, host_port))
+            {
+                return Ok(());
+            }
+        }
+        let mut storage = [0; 28];
+        let len = if s.family == AF_INET6 { 28 } else { 16 };
+        let addr = &mut storage[..len];
+        addr[..2].copy_from_slice(&(s.family as u16).to_le_bytes());
+        crate::netns::set_host_endpoint(addr, ip, host_port);
+        if let Err(e) = appine_hal::net::connect(s.fd, addr) {
+            s.peer_map = None;
+            return Err(Errno(e));
+        }
+    }
+    s.peer_map = ports;
+    Ok(())
 }
 
 /// Validates a guest destination address for `sendto`/`sendmsg` on an inet socket as Linux 6.1
@@ -5853,6 +5876,88 @@ mod tests {
         a[2..4].copy_from_slice(&port.to_be_bytes());
         a[4..8].copy_from_slice(&ip);
         a
+    }
+
+    #[test]
+    fn connected_udp_rechecks_same_port_ip_changes_and_traceroute_probes() {
+        let mut kernel = crate::kernel::Kernel::new(crate::process::Tier::Interpreter);
+        let target = kernel.new_net_ns(kernel.init_ns.net.owner.clone()).unwrap();
+        let [a, b] = target.host_net.unwrap();
+        let first = [127, a, b, 2];
+        let second = [127, a, b, 1];
+        let port = 41000;
+        let guest = 7000;
+        let bind = |ip, wide| {
+            crate::netns::add_binding(
+                &target,
+                guest,
+                crate::netns::NewBinding {
+                    proto: IPPROTO_UDP,
+                    addr: if wide {
+                        crate::netns::BindAddr::AnyV4
+                    } else {
+                        crate::netns::BindAddr::V4([127, 0, 0, 2])
+                    },
+                    v6only: false,
+                    reuseaddr: true,
+                    reuseport: false,
+                    euid: 0,
+                    bound_dev_if: 0,
+                    listening: true,
+                    accepted: false,
+                    host_ip: ip,
+                    host_port: port,
+                    wide,
+                },
+            )
+        };
+
+        let id = bind(first, false);
+        let udp = |family| {
+            InetSocket::new(
+                appine_hal::net::socket(family, SOCK_DGRAM, IPPROTO_UDP).unwrap(),
+                family,
+                SOCK_DGRAM,
+            )
+        };
+        let mut clients = [udp(AF_INET), udp(AF_INET6)];
+        for s in &mut clients {
+            update_udp_peer(s, &target, guest, first, port).unwrap();
+            assert_eq!(s.peer_map, Some((guest, port)));
+            let cur = appine_hal::net::sockname(s.fd, true).unwrap();
+            assert!(crate::netns::matches_host_endpoint(&cur, first, port));
+            assert_eq!(u16::from_le_bytes([cur[0], cur[1]]) as i32, s.family);
+
+            // An addressed traceroute send can change the native peer but leave the guest
+            // mapping intact. The tap can already be gone when the next send runs.
+            s.ttl_set = true;
+            let probe = crate::netns::with_host_endpoint(&cur, second, port + 1);
+            appine_hal::net::connect(s.fd, &probe).unwrap();
+            update_udp_peer(s, &target, guest, first, port).unwrap();
+            assert_eq!(appine_hal::net::sockname(s.fd, true).unwrap(), cur);
+            s.ttl_set = false;
+        }
+        crate::netns::remove_binding(&target, id);
+        bind([0; 4], true);
+        for s in &mut clients {
+            update_udp_peer(s, &target, guest, second, port).unwrap();
+            let cur = appine_hal::net::sockname(s.fd, true).unwrap();
+            assert!(crate::netns::matches_host_endpoint(&cur, second, port));
+        }
+
+        let mut virtual_client = InetSocket::new(-1, AF_INET, SOCK_DGRAM);
+        let v = sockaddr_in(first, port);
+        let storage = v.as_ptr();
+        virtual_client.vconn = Some(v);
+        update_udp_peer(&mut virtual_client, &target, guest, second, port).unwrap();
+        let v = virtual_client.vconn.take().unwrap();
+        assert_eq!(v.as_ptr(), storage);
+        assert!(crate::netns::matches_host_endpoint(&v, second, port));
+        assert_eq!(
+            update_udp_peer(&mut virtual_client, &target, guest, first, port + 1),
+            Err(Errno::EBADF)
+        );
+        assert_eq!(virtual_client.peer_map, None);
     }
 
     #[test]

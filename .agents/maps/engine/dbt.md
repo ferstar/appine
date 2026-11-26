@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: arm64 TBI0 untagging on indirect branches, `rs_miss`, `exec_memop` returns and `dbt_run` entry)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: batched conditional-branch relinking with retire_gen/sole_tag, entry-stub CAS, and TBI0 untagging in lookup)
 
 ## Responsibilities
 
@@ -47,12 +47,13 @@ triggers (`kernel/oom`).
   table, block log (`struct block`), saved guest words, per-page block buckets and parked counts,
   `cross_page_blocks`, stale-reuse `sources`/`trusted`/`parkable` lists (up to 64 each), immutable
   sorted `shared_ranges` and `memop_table` (with `older` chains), ungroup `strikes[64]` ring
-  (`strikes_next`) and `nogroup[64]` ring, register set, lock/flush/generation/poisoned state, and
-  `pool.all` links.
+  (`strikes_next`) and `nogroup[64]` ring, register set, lock/flush/generation/`retire_gen`/
+  poisoned state, and `pool.all` links.
 - `Dbt` (`struct appine_dbt_thread`, `Send`) — one thread's attachment: `Arc<DbtSpace>`, code-group
-  tag, atomic active `cpu`, 4096-entry direct-mapped jump cache (`jc`), 1 KB-aligned 64-entry
-  shadow return stack (`rs`), statistics (`DbtStats`), and lock-free translation workspace
-  (`xlate`, `scratch`, `probe` CPU, 4096-entry `defined` cache, `prep`).
+  tag, atomic active `cpu` and `sole_tag`, 4096-entry direct-mapped jump cache (`jc`), 1 KB-aligned
+  64-entry shadow return stack (`rs`), pending conditional-relink queue (`pending_relinks[29]`,
+  `pending_retire_gen`), statistics (`DbtStats`), and lock-free translation workspace (`xlate`,
+  `scratch`, `probe` CPU, 4096-entry `defined` cache, `prep`).
 - `struct block` (32 bytes) — guest `pc`, entry `code` (NULL when dead), page-bucket chain index,
   `words` offset, 11-bit `nguest`, 1-bit `parked`, 16-bit `tag`, and saved `first` word for revival.
 - `struct table` / `struct slot` — open-addressed hash table (`2^12..2^19` slots) keyed by
@@ -214,28 +215,36 @@ triggers (`kernel/oom`).
   single-site conditional branches relinked directly before publication); inline unconditional
   `B`/`BL`, fallthrough `R_CHAIN_FWD`, and `BL`/`BLR` landing pads link lazily on first execution.
   Runtime patching enforces matching `generation`, `target != patch_site`, and no shared->private
-  link; conditional-branch relinking always runs under `d->lock` with `can_relink_branch` and
+  link; `patch_stub` uses CAS against the unlinked `b +4` on `LINK_AT_ENTRY` stubs at
+  `code[ENTRY_CHECK_WORDS]` so concurrent block retirement's forwarding branch is never overwritten.
+  Conditional-branch relinking always runs under `d->lock`, requires matching `retire_gen`,
+  `can_relink_branch`, and `dbt_relink_word` confirming a conditional branch instruction, and
   finishes full icache sync before unlocking. Because conditional branches are not CMODX-safe on
   ARM64, shared (`tag == 0`, `LINK_SHARED`) blocks require being the sole attached thread on the
-  entire `DbtSpace` (including threads of other code-group members, which execute the same shared
-  blocks; `d->nthreads == 1` is only a lock-free hint before taking `d->lock`), whereas private
-  tagged blocks (`tag != 0`, `!LINK_SHARED`) are unreachable from other tags and only require being
-  the sole attached thread of `t->tag`.
-  Unconditional `b -> b` patching uses lazy cache maintenance unless the patching thread hits an
-  already-patched site (`dbt_sync_all`).
+  entire `DbtSpace` (`d->nthreads == 1`, including threads of other code-group members, which
+  execute the same shared blocks), whereas private tagged blocks (`tag != 0`, `!LINK_SHARED`) are
+  unreachable from other tags and only require being the sole attached thread of `t->tag`
+  (`t->sole_tag`, maintained under `d->lock` at attach/detach). When linking to an
+  already-translated target, the unconditional `b -> b` stub is patched lock-free (lazy cache
+  maintenance, or `dbt_sync_range` if the thread hit an already-patched site), and eligible
+  conditional relinks are queued in `t->pending_relinks` (up to `PENDING_RELINK_CAP` = 29, kept
+  across syscalls) to be drained and synced under `d->lock` with the next block install (or once
+  the batch fills); flush catch-up, `retire_gen` changes, and detach discard queued relinks.
 - Forward direct links skip the 2-word entry kick check (`code + 2`); backward/self links and
   indirect jumps land at `code + 0`, so every loop checks `pending`.
-- Indirect branches (`BR`/`BLR`/`RET`) apply TBI0 (`emit_untag_pc`: NZCV-free `tbnz #55` + `and`
-  clearing bits 63:56 when bit 55 == 0) before probing the thread's 4096-entry direct-mapped jump
-  cache (`t->jc`); misses branch to in-cache `d->lookup`, which brackets a lock-free `d->table`
-  probe with odd/even `stlr` increments of `cpu->dbt_lookup_seq` (excluding misaligned, `>= 2^48`,
-  and `pc == 0`), fills `t->jc` and jumps directly on hit, or exits `R_LOOKUP`.
+- Indirect branches (`BR`/`BLR`/`RET`) probe the thread's 4096-entry direct-mapped jump cache
+  (`t->jc`) with the raw target first (tagged targets miss because jump-cache entries store aligned
+  48-bit PCs); misses branch to in-cache `d->lookup`, which applies TBI0 (`emit_untag_pc`:
+  NZCV-free `tbnz #55` + `and` clearing bits 63:56 when bit 55 == 0) before bracketing a lock-free
+  `d->table` probe with odd/even `stlr` increments of `cpu->dbt_lookup_seq` (excluding misaligned,
+  `>= 2^48`, and `pc == 0`), fills `t->jc` and jumps directly on hit, or exits `R_LOOKUP` with the
+  untagged PC.
 - Shadow return stack: `BL`/`BLR` emit a host `BL` over an `R_CHAIN` landing pad and push
   `(pc + 4, landing_pad)` onto the 1 KB-aligned 64-entry ring `t->rs` (wrapping via `BFXIL`);
   `RET X30` compares the top against `x30`, pops and executes host `RET T2` on hit, or falls back
-  to `emit_untag_pc` and the jump cache. Empty slots (and `memop_ret` misses) point at `d->rs_miss`,
-  which applies `emit_untag_pc` to `x30` before branching to `d->lookup`. Out-of-line `exec_memop`
-  returns and `dbt_run` entry likewise apply `untag_pc`.
+  to the raw jump-cache probe. Empty slots (and `memop_ret` misses) point at `d->rs_miss`, which
+  moves `x30` into `T0` and branches to `d->lookup` (applying `emit_untag_pc` there). Out-of-line
+  `exec_memop` returns and `dbt_run` entry likewise apply `untag_pc`.
 
 ### Dispatcher and libc memops
 
@@ -244,7 +253,8 @@ triggers (`kernel/oom`).
   `APPINE_EXIT_HOST_FAULT`, sets `d->poisoned = true`, wakes parked flush waiters and clears the
   global template arena (`dbt_template_clear(false)`).
 - Each `dbt_run` iteration: join (`park`) or perform (`flush_world`) a pending flush; catch up
-  generation (reset `rs`, clear dirty `jc`); on consuming `c->pending`, clear `excl_size` and return
+  generation (reset `rs`, drop pending relinks, clear dirty `jc`); on consuming `c->pending`, clear
+  `excl_size` and return
   `APPINE_EXIT_KICK`. Otherwise, try lock-free `dbt_table_lookup`. On a miss with non-zero
   `page_parked`, lock and call `dbt_revive`; else lock-free
   `prepare` + locked `install` (re-verifying guest words and `memop_kind`), or `appine_interp_step`
@@ -291,10 +301,11 @@ triggers (`kernel/oom`).
   rebuilds in place if tombstones >= half of occupied or at max size). Block-log compaction runs at
   limit when `>= 1/8` of records are dead.
 - Retiring blocks (`dbt_retire_add`/`dbt_retire_flush`, batched up to 32) emits 16-word forwarding
-  stubs (`R_CHAIN` + `LINK_SHARED` for tag 0), syncs them, patches `code[0]` and `code[2]` to jump
-  to the stub, syncs entries, and writes tombstones (`JC_EMPTY`). Full flush (`flush_world`) kicks
-  other active threads, waits until all leave `dbt_run` or `park()`, clears touched slots/buckets,
-  resets `used_words = routine_words`, bumps `generation`, and broadcasts `d->flushed`.
+  stubs (`R_CHAIN` + `LINK_SHARED` for tag 0), syncs them, patches `code[0]` and atomically
+  patches `code[2]` to jump to the stub, syncs entries, writes tombstones (`JC_EMPTY`), and
+  increments `d->retire_gen` (`RELEASE`). Full flush (`flush_world`) kicks other active threads,
+  waits until all leave `dbt_run` or `park()`, clears touched slots/buckets, resets
+  `used_words = routine_words`, bumps `retire_gen` and `generation`, and broadcasts `d->flushed`.
 - Templates: 32 MB anonymous arena (`65,536` buckets, 64 shard locks, `arena_lock`, max 4 versions
   per `pc`), keyed by `(pc, nogroup_key, regs, shared, guest words)`; cross-page templates validate
   page 1 on fetch. A full arena triggers `dbt_template_clear(true)`, which rewinds the allocator

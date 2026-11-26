@@ -205,8 +205,10 @@ pub(super) fn mmap(
                         }
                     };
                     if let Some(object) = &mapping_object {
-                        super::fs::reconcile_mapping(cx.kr(), ino, object)?;
-                        fd = object.as_raw_fd();
+                        if object.reconcile {
+                            super::fs::reconcile_mapping(cx.kr(), ino, &object.file)?;
+                        }
+                        fd = object.file.as_raw_fd();
                         file_source = Some(FileSource::PinnedStore);
                     } else {
                         f = file.borrow();

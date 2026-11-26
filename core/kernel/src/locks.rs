@@ -365,6 +365,9 @@ impl Locks {
 
     /// These files in fd table `fds` were closed: release this fd table's POSIX locks on them.
     pub fn closed(&mut self, fds: &Rc<RefCell<FdTable>>, files: &[FileRef]) {
+        if self.by_key.is_empty() {
+            return;
+        }
         let owner = Owner::Posix(Rc::downgrade(fds));
         for file in files {
             let Some(key) = LockKey::of(&file.borrow()) else {
@@ -378,6 +381,9 @@ impl Locks {
                 }
                 if locks.is_empty() {
                     self.by_key.remove(&key);
+                    if self.by_key.is_empty() {
+                        break;
+                    }
                 }
             }
         }
@@ -747,6 +753,22 @@ mod tests {
         l.set(LockKey::Node(7), lock(&owner(&a), 0, 10, true), false);
         l.closed(&a, &[file]);
         assert!(ranges(&l, 7).is_empty());
+    }
+
+    #[test]
+    fn close_skips_remaining_files_when_the_lock_table_is_empty() {
+        let table = Rc::new(RefCell::new(FdTable::new()));
+        let mut locks = Locks::default();
+        let file = OpenFile::new(
+            FileKind::Path(crate::vfs::Node::Store(crate::vfs::ROOT_MOUNT, 7)),
+            0,
+        );
+        let other = OpenFile::new(FileKind::Host(1), 0);
+        let _borrowed = other.borrow_mut();
+        locks.closed(&table, std::slice::from_ref(&other));
+        locks.set(LockKey::Node(7), lock(&owner(&table), 0, 10, true), false);
+        locks.closed(&table, &[file, other.clone()]);
+        assert!(locks.by_key.is_empty());
     }
 
     #[test]

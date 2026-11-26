@@ -1191,29 +1191,77 @@ impl TmpfsMapping {
         Ok(())
     }
 
-    pub(crate) fn fault(&self, offset: u64, shared_write: bool) -> Result<(), Errno> {
+    /// Admit the demanded pages. Map ahead only through existing data, since a speculative
+    /// fault in a hole would change statfs, SEEK_DATA and the next quota failure.
+    pub(crate) fn fault_range(
+        &self,
+        offset: u64,
+        demand: u64,
+        window: u64,
+        shared_write: bool,
+    ) -> Result<u64, Errno> {
         use std::os::fd::AsRawFd;
         let fd = self.file.as_raw_fd();
         let size = self.file.metadata().map_err(mapping_errno)?.len();
         if offset >= size {
             return Err(Errno::EFAULT);
         }
-        let end = offset + TMPFS_PAGE;
+        let limit = (offset + window).min(size.next_multiple_of(TMPFS_PAGE));
+        let first_end = offset + TMPFS_PAGE;
         let data = appine_hal::lseek(fd, offset as i64, libc::SEEK_DATA);
-        let has_data = data.is_ok_and(|d| d < end);
-        let missing = !has_data
-            && self
-                .vfs
-                .tmpfs_missing(self.ino, &self.file, size, offset, end, 0)
-                .is_err();
-        if missing {
-            self.vfs.tmpfs_check(self.dev, 1, 0)?;
-        }
+        let has_data = data.is_ok_and(|d| d < first_end);
+        let mut reservations = None;
+        let (end, missing) = if has_data {
+            let stop = if first_end < limit {
+                appine_hal::lseek(fd, offset as i64, libc::SEEK_HOLE).map_or(first_end, |hole| {
+                    hole.next_multiple_of(TMPFS_PAGE).clamp(first_end, limit)
+                })
+            } else {
+                first_end
+            };
+            (stop, 0)
+        } else {
+            // Previously faulted sparse pages may still be holes in the host object.
+            let files = self.vfs.tmpfs_file_ranges.borrow();
+            let ranges = files.get(&self.ino);
+            let guest_data_end = ranges
+                .and_then(|r| r.data.next(offset))
+                .filter(|r| r.contains(&offset))
+                .map_or(offset, |r| r.end);
+            let end = (offset + demand).max(guest_data_end).min(limit);
+            let allocated = ranges
+                .and_then(|r| r.allocated.next(offset))
+                .is_some_and(|r| r.contains(&offset) && r.end >= end);
+            drop(files);
+            if allocated {
+                (end, 0)
+            } else if end == first_end {
+                // FIEMAP detects unwritten reservations and tells the shared-write path
+                // whether to reserve host storage. Reuse SEEK_DATA when FIEMAP is unavailable.
+                let extents = fiemap_holes(&self.file, offset, end, 0);
+                reservations = Some(extents.is_some());
+                let hole = extents.map_or_else(
+                    || matches!(data, Ok(_) | Err(libc::ENXIO)),
+                    |holes| holes.is_err(),
+                );
+                if hole {
+                    self.vfs.tmpfs_check(self.dev, 1, 0)?;
+                }
+                (end, u64::from(hole))
+            } else {
+                self.fit_fault_range(size, offset, end)?
+            }
+        };
         if shared_write {
-            if !has_data && tmpfs_host_reservations(&self.file, offset) {
+            if !has_data
+                && reservations.unwrap_or_else(|| tmpfs_host_reservations(&self.file, offset))
+            {
                 // Reserve storage without overwriting bytes another guest CPU could be writing.
-                match appine_hal::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, offset, TMPFS_PAGE) {
+                match appine_hal::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, offset, end - offset) {
                     Ok(()) | Err(libc::EOPNOTSUPP) => {}
+                    Err(_) if end > first_end => {
+                        return self.fault_range(offset, TMPFS_PAGE, TMPFS_PAGE, true);
+                    }
                     Err(e) => return Err(Errno(e)),
                 }
             }
@@ -1222,21 +1270,37 @@ impl TmpfsMapping {
             appine_hal::set_times_fd(fd, None, Some(appine_hal::TIME_NOW)).map_err(Errno)?;
         }
         if has_data {
-            return Ok(());
+            return Ok(end - offset);
         }
         // A shmem fault instantiates this page for subsequent stats and seeks, including
         // private reads. Pure reads and private stores leave the backing file's times alone.
         self.vfs
             .tmpfs_record_pages(self.dev, self.ino, offset, end, true);
-        if missing {
-            self.vfs.tmpfs_charge(self.dev, 1, 0);
+        if missing != 0 {
+            self.vfs.tmpfs_charge(self.dev, missing as i64, 0);
             if let Some(t) = self.vfs.mounts.borrow_mut().tmpfs.get_mut(&self.dev)
                 && let Some(file) = t.unlinked.get_mut(&self.ino)
             {
-                file.pages += 1;
+                file.pages += missing;
             }
         }
-        Ok(())
+        Ok(end - offset)
+    }
+
+    /// Return the end and missing-page count for the prefix that fits the tmpfs quota.
+    fn fit_fault_range(&self, size: u64, offset: u64, mut end: u64) -> Result<(u64, u64), Errno> {
+        loop {
+            let budget = self.vfs.tmpfs_room(self.dev, 0)?.unwrap_or(u64::MAX);
+            match self
+                .vfs
+                .tmpfs_missing(self.ino, &self.file, size, offset, end, budget)
+            {
+                Ok(missing) => return Ok((end, missing)),
+                Err(_) if self.vfs.tmpfs_recount(self.dev)? => continue,
+                Err(at) if at > offset => end = at,
+                Err(_) => return Err(Errno::ENOSPC),
+            }
+        }
     }
 }
 
@@ -3115,7 +3179,8 @@ impl Vfs {
     /// recorded without one (a directory, which has a single name) once the inode has no links
     /// left.
     pub(crate) fn roots_removed(&self, (ino, dir, name): (Ino, Ino, &[u8])) {
-        let unlinked = self.store.stat(ino).map_or(true, |st| st.nlink == 0);
+        let unlinked =
+            std::cell::LazyCell::new(|| self.store.attrs(ino).map_or(true, |st| st.nlink == 0));
         let mut mounts = self.mounts.borrow_mut();
         let Mounts { list, detached, .. } = &mut *mounts;
         for m in list.iter_mut().chain(detached.iter_mut()) {
@@ -3127,7 +3192,7 @@ impl Vfs {
             }
             match &m.root_at {
                 Some((d, n)) => m.root_gone = d.ino() == Some(dir) && n.as_slice() == name,
-                None if unlinked => {
+                None if *unlinked => {
                     m.root_at = Some((Node::Store(mnt, dir), name.to_vec()));
                     m.root_gone = true;
                 }
@@ -7302,6 +7367,54 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removed_mount_roots_follow_the_bound_name_or_last_link() {
+        let (vfs, dir) = sample("removed-mount-roots");
+        let store = vfs.store();
+        let (file, _) = store.create_file(ROOT, b"first", 0o600, 0, 0).unwrap();
+        store.link(ROOT, b"second", file).unwrap();
+        let bind = |ino, name: Option<&[u8]>| {
+            vfs.clone_mount(
+                &Node::Store(ROOT_MOUNT, ino),
+                name.map(|n| (Node::ROOT, n.to_vec())),
+                INIT_MNT_NS,
+            )
+            .unwrap()
+        };
+        let first = bind(file, Some(b"first"));
+        let unnamed = bind(file, None);
+        vfs.umount_tree(unnamed);
+
+        store.unlink(ROOT, b"first").unwrap();
+        vfs.roots_removed((file, ROOT, b"first"));
+        assert!(vfs.mount(first).unwrap().root_gone);
+        assert_eq!(vfs.with_mount(unnamed, |m| m.root_gone), Some(false));
+        store.unlink(ROOT, b"second").unwrap();
+        vfs.roots_removed((file, ROOT, b"second"));
+        let m = vfs.with_mount(unnamed, Clone::clone).unwrap();
+        assert!(m.root_gone);
+        assert_eq!(
+            m.root_at,
+            Some((Node::Store(unnamed, ROOT), b"second".to_vec()))
+        );
+
+        let old = store.mkdir(ROOT, b"old", 0o755, 0, 0).unwrap();
+        let new = store.mkdir(ROOT, b"new", 0o755, 0, 0).unwrap();
+        let moved = bind(old, None);
+        let replaced = bind(new, None);
+        store
+            .rename(ROOT, b"old", ROOT, b"new", false, false)
+            .unwrap();
+        vfs.roots_removed((new, ROOT, b"new"));
+        assert!(vfs.mount(replaced).unwrap().root_gone);
+        assert!(!vfs.mount(moved).unwrap().root_gone);
+        store.rmdir(ROOT, b"new").unwrap();
+        vfs.roots_removed((old, ROOT, b"new"));
+        assert!(vfs.mount(moved).unwrap().root_gone);
+        drop(vfs);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

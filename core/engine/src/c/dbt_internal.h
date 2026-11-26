@@ -119,6 +119,9 @@ _Static_assert(MAX_BLOCK_WORDS < 1u << (31 - REFILL_RESUME_SHIFT), "the access's
 #define REASON_BITS 3
 #define REASON_MASK ((1u << REASON_BITS) - 1)
 #define BRANCH_MASK (MAX_BLOCK_WORDS - 1)
+/* The kick check and the stub itself leave every branch-to-stub distance below BRANCH_MASK.
+ * Reserve that value for a B stub at code[ENTRY_CHECK_WORDS], which retirement can overwrite. */
+#define LINK_AT_ENTRY BRANCH_MASK
 #define LINK_SHARED (1u << 15)
 _Static_assert(R_UNGROUP <= REASON_MASK, "the exit reason goes in the low 3 bits");
 _Static_assert((MAX_BLOCK_WORDS & BRANCH_MASK) == 0 && MAX_BLOCK_WORDS << REASON_BITS <= LINK_SHARED,
@@ -327,6 +330,7 @@ struct appine_dbt {
     /* Incremented on every flush: invalidates links not yet patched, and threads use it to clear
      * their own jump cache and shadow return stack */
     uint64_t generation;
+    uint64_t retire_gen; /* invalidates pending conditional relinks on retirement or flush */
     size_t high_words; /* the most code-cache words ever used */
 
     pthread_mutex_t lock;
@@ -377,6 +381,14 @@ static inline bool in_shared(const struct appine_dbt *d, uint64_t pc)
 }
 
 
+#define PENDING_RELINK_CAP 29
+
+struct pending_relink {
+    uint32_t *branch;
+    const uint32_t *target;
+    bool shared;
+};
+
 /* The part a thread uses to run in an address space: jump cache, shadow return stack and
  * statistics */
 struct appine_dbt_thread {
@@ -384,6 +396,7 @@ struct appine_dbt_thread {
     unsigned tag; /* the group tag of the thread's address space, 0 if not in a group (TAG_SHIFT) */
     struct appine_dbt_thread *next; /* d->threads list, read and written holding d->lock */
     struct appine_cpu *cpu; /* cpu running in dbt_run or NULL (atomic): a full flush kicks it */
+    bool sole_tag;          /* sole attachment for this nonzero tag (atomic, written under d->lock) */
     bool parked;            /* stopped in park for a full flush (accessed holding d->lock) */
     uint64_t generation;    /* the d->generation that jc and rs correspond to */
     struct slot *jc;        /* jump cache for indirect branches, direct-mapped */
@@ -397,6 +410,10 @@ struct appine_dbt_thread {
     struct appine_cpu *probe;
     uint64_t *defined; /* results of tier0_defined, per instruction word (DEFINED_CACHE entries) */
     struct prep *prep;
+    /* Owned by this thread, including across syscalls. catch_up discards entries on a full flush. */
+    uint64_t pending_retire_gen;
+    unsigned npending_relinks;
+    struct pending_relink pending_relinks[PENDING_RELINK_CAP];
 };
 
 /* ---- Emitter ---- */
@@ -567,7 +584,8 @@ struct written {
 
 /* Pieces of code collected to be synced together (sync_code_ranges) */
 struct syncs {
-    void *start[3], *end[3];
+    /* A new block, its incoming stub and conditional branch, and one pending batch. */
+    void *start[PENDING_RELINK_CAP + 3], *end[PENDING_RELINK_CAP + 3];
     unsigned n;
 };
 
@@ -699,11 +717,15 @@ static inline void emit_link_stub(struct xlate *x, unsigned reason, uint64_t pc,
         emit_to_routine(x, TO_LOOKUP);
         return;
     }
-    if (reason == R_CHAIN || reason == R_CHAIN_FWD)
+    bool chain = reason == R_CHAIN || reason == R_CHAIN_FWD;
+    if (chain) {
+        if (x->n == ENTRY_CHECK_WORDS)
+            delta = LINK_AT_ENTRY;
         emit(x, enc_b(4));
+    }
     emit(x, enc_adr_self(T1));
     uint64_t code = reason | delta << REASON_BITS;
-    if ((reason == R_CHAIN || reason == R_CHAIN_FWD) && x->shared)
+    if (chain && x->shared)
         code |= LINK_SHARED;
     if (pc >> PACKED_PC_BITS == 0) {
         emit_to_routine(x, TO_EXIT);
@@ -759,18 +781,6 @@ static inline void patch_local(struct xlate *x, uint32_t *site, const uint32_t *
 {
     if (site < x->buf + MAX_BLOCK_WORDS)
         patch_branch(x->wdelta, site, target);
-}
-
-/*
- * Clear bits 63:56 of a branch target register when bit 55 == 0, matching ARMv8-A BranchAddr
- * under Linux 6.1's TBI0 configuration (TBI0 = 1, TBID0 = 0, TBI1 = 0). Preserves NZCV.
- */
-static inline void emit_untag_pc(struct xlate *x, unsigned reg)
-{
-    uint32_t *skip = here(x);
-    emit(x, enc_tbnz(reg, DATA_TAG_SHIFT - 1));
-    emit(x, enc_and_low(reg, reg, DATA_TAG_SHIFT));
-    patch_local(x, skip, here(x));
 }
 
 /* ---- Shared instruction-decoder and cache data structures ---- */
@@ -864,6 +874,87 @@ struct prep {
     unsigned nlinks;
 };
 
+/* Index of a key: a tagged key is hashed by its pc, in the same probe sequence as the shared block
+ * of the same pc (TAG_SHIFT) */
+static inline size_t table_index(const struct table *t, uint64_t key)
+{
+    return (size_t)((((key & PC_MASK) >> 2) * GOLDEN) >> t->shift);
+}
+
+static inline size_t table_mask(const struct table *t)
+{
+    return (size_t)t->mask;
+}
+
+/*
+ * Find in t the block executed at pc by the member with tag `tag` (0 when not in a group): a
+ * shared one or one private to it (TAG_SHIFT), with `*found` set to the found block's tag; when
+ * both exist (private blocks translated before the registered range grew), either is correct.
+ * Called directly while holding the lock; without the lock, through table_lookup. Misaligned pcs
+ * and pcs beyond 48 bits have no blocks (Tier 0 reports the fault), and must not be compared with
+ * the tombstones' JC_EMPTY or other members' keys either
+ */
+static inline uint32_t *dbt_table_find_for(const struct table *t, uint64_t pc, unsigned tag,
+                                           unsigned *found)
+{
+    *found = 0;
+    if (pc & (3 | ~PC_MASK))
+        return NULL;
+    uint64_t mine = tagged(pc, tag);
+    for (size_t i = table_index(t, pc);; i = (i + 1) & table_mask(t)) {
+        /* Insertion writes the key before code: once code reads non-NULL, the key is the matching
+         * one */
+        uint32_t *code = __atomic_load_n(&t->slots[i].code, __ATOMIC_ACQUIRE);
+        if (!code)
+            return NULL;
+        uint64_t key = __atomic_load_n(&t->slots[i].pc, __ATOMIC_RELAXED);
+        if (key == pc || key == mine) {
+            *found = key == pc ? 0 : tag;
+            return code;
+        }
+    }
+}
+
+/*
+ * The dispatcher and the lookup routine (emit_lookup) look up the table without the lock: while
+ * the cpu's dbt_lookup_seq is odd, a replaced old table is not freed (table_publish)
+ */
+static inline uint32_t *dbt_table_lookup(struct appine_dbt *d, struct appine_cpu *c, uint64_t pc,
+                                         unsigned *found)
+{
+    __atomic_store_n(&c->dbt_lookup_seq, c->dbt_lookup_seq + 1, __ATOMIC_SEQ_CST);
+    struct table *table = __atomic_load_n(&d->table, __ATOMIC_SEQ_CST);
+    uint32_t *code = dbt_table_find_for(table, pc, c->dbt_tag, found);
+    __atomic_store_n(&c->dbt_lookup_seq, c->dbt_lookup_seq + 1, __ATOMIC_RELEASE);
+    return code;
+}
+
+static inline bool dbt_is_atomic(uint32_t insn)
+{
+    return (insn & 0x3f000000) == 0x08000000 ||
+           ((insn & 0x3f200c00) == 0x38200000 && !BIT(insn, 26)) ||
+           (insn & 0x3f200c00) == 0x19000000;
+}
+
+bool dbt_tier0_defined_slow(struct appine_cpu *probe, uint64_t *entry, uint32_t insn, uint64_t pc);
+/* Each direct-mapped entry holds a valid bit at bit 40, the instruction in bits 32:1,
+ * and the Tier 0 result in bit 0. */
+static inline bool dbt_tier0_defined(struct appine_cpu *probe, uint64_t *cache, uint32_t insn, uint64_t pc)
+{
+    uint64_t *entry = &cache[(insn * UINT32_C(0x9e3779b1)) >> 20];
+    if (LIKELY((*entry >> 1) == ((uint64_t)1 << 39 | insn)))
+        return *entry & 1;
+    return dbt_tier0_defined_slow(probe, entry, insn, pc);
+}
+
+void dbt_thread_catch_up_slow(struct appine_dbt_thread *t, uint64_t generation);
+static inline void dbt_thread_catch_up(struct appine_dbt_thread *t)
+{
+    uint64_t generation = __atomic_load_n(&t->d->generation, __ATOMIC_ACQUIRE);
+    if (UNLIKELY(t->generation != generation))
+        dbt_thread_catch_up_slow(t, generation);
+}
+
 /* ---- Cross-unit internal entry points ---- */
 
 /* dbt_translate.c */
@@ -878,8 +969,6 @@ bool dbt_known_address(const struct xlate *x, unsigned rn, int64_t imm, unsigned
 bool dbt_emit_address_imm(struct xlate *x, unsigned base, int64_t imm, unsigned bytes, bool in_granule);
 void dbt_emit_sp_check(struct xlate *x, uint64_t pc);
 void dbt_sp_moved(struct xlate *x, int64_t delta);
-bool dbt_is_atomic(uint32_t insn);
-bool dbt_tier0_defined(struct appine_cpu *probe, uint64_t *cache, uint32_t insn, uint64_t pc);
 bool dbt_translate_insn(struct xlate *x, uint32_t insn, uint64_t pc);
 
 /* dbt_group.c */
@@ -904,8 +993,6 @@ void *dbt_zalloc(size_t bytes);
 void dbt_release_pages(void *p, size_t bytes);
 void dbt_zfree(void *p, size_t bytes);
 struct table *dbt_table_new(unsigned bits);
-uint32_t *dbt_table_find_for(const struct table *t, uint64_t pc, unsigned tag, unsigned *found);
-uint32_t *dbt_table_lookup(struct appine_dbt *d, struct appine_cpu *c, uint64_t pc, unsigned *found);
 bool dbt_table_resize(struct appine_dbt *d, unsigned bits);
 void dbt_table_insert(struct appine_dbt *d, uint64_t pc, unsigned tag, uint32_t *code,
                       const uint32_t *guest, uint32_t nguest);
@@ -914,7 +1001,6 @@ void dbt_link_block(const struct appine_dbt *d, uint32_t *code, uint64_t pc, uns
                     const struct link *links, unsigned n);
 void dbt_clear_jump_cache(struct appine_dbt_thread *t);
 void dbt_rs_reset(struct appine_dbt_thread *t);
-void dbt_thread_catch_up(struct appine_dbt_thread *t);
 bool dbt_compact_blocks(struct appine_dbt *d);
 void dbt_flush_locked(struct appine_dbt *d);
 void dbt_retire_flush(struct appine_dbt *d, struct retire_batch *r);

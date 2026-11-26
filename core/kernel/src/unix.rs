@@ -20,6 +20,7 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use crate::cell::RefCell;
+use crate::errno::Errno;
 use crate::fd::{FdTable, FileKind, FileRef, OpenFile};
 use crate::kernel::{Kernel, request_wake_object, wake};
 use crate::net::{AF_UNIX, SOCK_DGRAM, SOCK_STREAM, Socket};
@@ -850,6 +851,25 @@ impl Channel {
     /// carrying open files is read. With SO_PASSCRED, a change of credentials also ends the read.
     pub fn read_stream(&mut self, max: usize, peek: bool, passcred: bool) -> Received {
         let mut data = Vec::new();
+        let (mut r, _) = self
+            .read_stream_to(max, peek, passcred, |bytes| {
+                data.extend_from_slice(bytes);
+                Ok(bytes.len())
+            })
+            .expect("buffered stream copy is infallible");
+        r.data = data;
+        r
+    }
+
+    /// Copies directly from each packet. The synchronous writer returns a copied prefix or an
+    /// error before progress. A short copy ends the receive even below its low-water mark.
+    pub fn read_stream_to(
+        &mut self,
+        max: usize,
+        peek: bool,
+        passcred: bool,
+        mut write: impl FnMut(&[u8]) -> Result<usize, Errno>,
+    ) -> Result<(Received, bool), Errno> {
         let mut fds = Vec::new();
         let mut cred = None;
         let from = self
@@ -857,45 +877,68 @@ impl Channel {
             .front()
             .map(Packet::sender_addr)
             .unwrap_or_default();
+        let mut len = 0;
+        let mut room = max;
         let mut i = 0;
         let mut popped = false;
+        let mut short = false;
         while let Some(p) = self.packets.get_mut(i) {
             if passcred && cred.is_some_and(|c| c != p.cred) {
                 break;
             }
-            // Even a zero-length receive takes the first packet's files and leaves its data.
-            let room = max - data.len();
-            cred = Some(p.cred);
             let n = room.min(p.remaining());
-            data.extend_from_slice(&p.data[p.off..p.off + n]);
-            let had_fds = !p.fds.is_empty();
+            let copied = if short {
+                // A short peek still observes the ancillary data of the previewed message.
+                0
+            } else {
+                match write(&p.data[p.off..p.off + n]) {
+                    Ok(copied) => copied,
+                    Err(e) if len == 0 => return Err(e),
+                    Err(_) => 0,
+                }
+            };
+            short |= copied < n;
+            if !peek && copied == 0 && short {
+                break;
+            }
+            cred = Some(p.cred);
+            len += copied;
+            room -= n;
+            // The first packet carrying rights ends the read, even on a zero-length receive.
+            if !p.fds.is_empty() {
+                fds = if peek {
+                    p.fds.clone()
+                } else {
+                    std::mem::take(&mut p.fds)
+                };
+            }
             if peek {
-                fds.extend(p.fds.iter().cloned());
                 i += 1;
             } else {
-                p.off += n;
-                self.bytes -= n;
-                fds.append(&mut p.fds);
+                p.off += copied;
+                self.bytes -= copied;
                 if p.remaining() == 0 {
-                    // Dropping `pkt` uncharges the sender's `SenderState` and wakes writers.
-                    let _pkt = self.packets.pop_front().unwrap();
+                    self.packets.pop_front();
                     popped = true;
                 }
             }
-            if had_fds || data.len() >= max {
+            if !fds.is_empty() || room == 0 || (short && !peek) {
                 break;
             }
         }
-        if !peek && (!data.is_empty() || popped) {
+        if !peek && (len != 0 || popped) {
             request_wake_object(wake::of_value(self));
         }
-        Received {
-            len: data.len(),
-            data,
-            fds,
-            cred: cred.unwrap_or(Ucred::UNSTAMPED),
-            from,
-        }
+        Ok((
+            Received {
+                len,
+                data: Vec::new(),
+                fds,
+                cred: cred.unwrap_or(Ucred::UNSTAMPED),
+                from,
+            },
+            short,
+        ))
     }
 
     /// Takes one whole message (datagram, `SOCK_SEQPACKET`), dropping what exceeds `max`.
@@ -917,8 +960,11 @@ impl Channel {
             self.bytes -= len;
             // Release the charge before moving `p.data` out (taking it zeroes `p.data.len()`).
             p.uncharge();
-            let mut data = std::mem::take(&mut p.data);
-            data.truncate(max);
+            let mut data = Vec::new();
+            if max != 0 {
+                data = std::mem::take(&mut p.data);
+                data.truncate(max);
+            }
             let fds = std::mem::take(&mut p.fds);
             let cred = p.cred;
             if self.max_qlen.is_some() {
@@ -1466,6 +1512,59 @@ mod tests {
         let r = c.read_stream(100, false, true);
         assert_eq!((r.data.as_slice(), r.cred.pid), (&b"gh"[..], 2));
         assert_eq!(c.bytes, 0);
+    }
+
+    #[test]
+    fn stream_scatter_uses_queued_slices_and_commits_only_copied_rights() {
+        let sender = UnixSocket::new(SOCK_STREAM);
+        let mut c = Channel::default();
+        let small = charged_packet(&sender, &[1; 64]);
+        let first = small.data.as_ptr();
+        c.push(small);
+        let mut large = charged_packet(&sender, &[2; 8192]);
+        let second = large.data.as_ptr();
+        large
+            .fds
+            .push(OpenFile::new(FileKind::Host(-1), oflags::O_RDONLY));
+        c.push(large);
+
+        // A fault at the boundary must leave the second packet's rights and charge intact.
+        let (r, short) = c
+            .read_stream_to(8256, false, true, |bytes| {
+                if bytes.as_ptr() == first {
+                    assert_eq!(bytes, &[1; 64]);
+                    return Ok(64);
+                }
+                assert_eq!(bytes.as_ptr(), second);
+                Err(Errno::EFAULT)
+            })
+            .unwrap();
+        assert!(short && r.fds.is_empty());
+        assert_eq!((r.len, r.data.capacity(), c.bytes), (64, 0, 8192));
+        let charge = sender.outq.truesize(8192);
+        assert_eq!(sender.outq(), charge);
+
+        for peek in [true, false] {
+            let (r, short) = c
+                .read_stream_to(0, peek, true, |bytes| {
+                    assert!(bytes.is_empty());
+                    Ok(0)
+                })
+                .unwrap();
+            assert!(!short);
+            assert_eq!((r.len, r.fds.len(), c.bytes), (0, 1, 8192));
+            assert_eq!(c.packets[0].fds.len(), usize::from(peek));
+            assert_eq!(sender.outq(), charge);
+        }
+        let (r, short) = c
+            .read_stream_to(8192, false, false, |bytes| {
+                assert_eq!(bytes.as_ptr(), second);
+                assert_eq!(bytes.len(), 8192);
+                Ok(bytes.len())
+            })
+            .unwrap();
+        assert!(!short);
+        assert_eq!((r.len, r.data.capacity(), sender.outq()), (8192, 0, 0));
     }
 
     #[test]

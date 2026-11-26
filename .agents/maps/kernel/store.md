@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (namespace and cache, object sharing and lifetimes, transaction and recovery ordering, import and provider authorization checked against the store and its callers)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: durable boot-cleanup unlinks, unconditional exclusive-open WAL sync, and concurrent lock serialization)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: sole-user mapping pin fast path and reconcile tracking, transactional remove_checked, and fast object unlinks)
 
 ## Responsibilities
 
@@ -39,8 +39,11 @@ provider and rootfs installation UI (`android`).
   objects to unlink on savepoint rollback, the waker, the read-snapshot state, the owning kernel
   id, changed directories, cached `store_id` (`objects/` dev/ino), `writable_maps` (inodes
   excluded from `relatime` caching because they may be mutated via writable shared mappings),
+  `changed_backings` (inodes whose backing or held state changed on this connection, cleared to
+  `None` on commit rollback or size cap to force mapping reconciliation),
   `pending_release` (deleted held regular files awaiting release once closed/unmapped),
   and linkable tmpfile state with its transaction undo log.
+- `MappingObject` — pinned host `File` and `reconcile` flag returned by `mapping_object`.
 - `Meta` — state shared with readers and the reaper thread: the cache behind an `RwLock`, the
   commit counter, the reaper queue, the WAL path and durability watermark.
 - `Stat` includes the store inode’s access and default ACLs; `DirEntry`, `FileTime` (`Now` or `At(ns)`), the `mode` constants; `Ino = u64`, `ROOT = 1`.
@@ -75,7 +78,7 @@ provider and rootfs installation UI (`android`).
   copy in between is the caller's, so the kernel can release the BKL), `make_private` (all three
   in one, the BKL held), `release`.
 - **Changes**: `mkdir`, `create_file`, `create_anonymous`, `create_tmpfile`, `release_tmpfile`, `symlink`, `mknod`, `link`, `unlink`,
-  `rmdir`, `rename` (no-replace, exchange), `create_detached_dir`/`remove_detached_dir`,
+  `rmdir`, `remove_checked`, `rename` (no-replace, exchange), `create_detached_dir`/`remove_detached_dir`,
   `set_mode`, `set_owner`, `set_owner_mode`, `set_flags`/`set_flags_open`, `remove_privs`, xattr writes, `set_mtime`,
   `set_times`, `set_times_open`, `accessed`, `object_modified`; `transaction`.
 - **Durability**: `commit`, `commit_due`, `set_waker`, `Meta::sync_metadata`, `Meta::sync_all`.
@@ -144,8 +147,12 @@ provider and rootfs installation UI (`android`).
   callers (the browse API, `write_file`) never write a shared object. When a Files app open
   unshares the file, its change replay (also on failure after publication) refreshes the file's open
   descriptions to its current object. Private and shared store mmaps hold a flock on their backing descriptor.
-  `mapping_object` acquires it under the store write transaction, and `try_share` probes both
-  objects in that transaction, falling back to a byte copy when a pin exists. Provider write
+  When this connection is the sole joined user outside a snapshot, `mapping_object` reads cached metadata
+  and acquires that flock without a SQLite write transaction, re-checking `Commits`'s connection state
+  afterward; otherwise it falls back to a store write transaction (`query_row`) serialized with
+  `try_share`, which probes both objects in that transaction and falls back to a byte copy when a pin
+  exists. `MappingObject::reconcile` is cleared only on the sole-first-user fast path when
+  `changed_backings` is intact and excludes the inode. Provider write
   opens also pin their descriptor. Provider truncation clips live guest mappings before shrink.
 - Objects the provider handed out for writing are recorded process-wide (`HOST_WRITERS`: the
   store's identity, the object, the path it was opened by) from `open_write` until `written`
@@ -166,7 +173,11 @@ provider and rootfs installation UI (`android`).
 - Inode numbers are allocated by SQLite (`max(rowid) + 1`, no AUTOINCREMENT); a leftover object
   under a reused number is truncated and reused.
 - Removing a regular file's last link leaves the row with nlink 0 and queues the object for deletion
-  after commit when no other row uses it (open host fds keep working); a held file instead keeps
+  after commit when no other row uses it (open host fds keep working); `unlink` and `rmdir` delegate
+  to `remove_checked`, which runs caller permission and mount checks inside the removal write
+  transaction on the same dentry, invalidating affected cache entries and reading SQLite directly in
+  `remove_link` when another connection is open so peer commits racing the commit-counter bump are
+  observed; a held file instead keeps
   its row in `shared` and records its inode in `pending_release` until `release` (called by the
   kernel on unlink/rename when already closed, on post-syscall/thread-exit/`execve` sweeps once
   its last open fd, mapping or executable reference closes, and before `make_private`) or the next
@@ -227,8 +238,9 @@ provider and rootfs installation UI (`android`).
   A failed WAL sync leaves the objects queued. The retry delay doubles from 50 ms to 1 s.
   A successful external `Meta::sync_metadata` or `Meta::sync_all` wakes a pending retry immediately.
   On shutdown the reaper bypasses the delay and exits if the final sync fails. When unlinking an
-  object it pins the host inode with `O_PATH` across `unlink_at` and clears any `kernel/hostmem`
-  `WRITABLY_SHARED` tracking after a successful unlink.
+  object it takes `kernel/hostmem`'s `try_enter_fast_unlink` guard to unlink directly when no
+  `WRITABLY_SHARED` host inode is tracked; otherwise it pins the host inode with `O_PATH` across
+  `unlink_at` and clears any `kernel/hostmem` `WRITABLY_SHARED` tracking after a successful unlink.
 - Checkpoints continue during backoff. The reaper lazily opens a separate connection for PASSIVE
   checkpoints when the WAL grows 1000 pages since the last request, or after 100 ms without commits
   if at least 1000 pages remain in the WAL and some frames still need backfilling. At 10,000 pages
@@ -369,7 +381,7 @@ provider and rootfs installation UI (`android`).
 - rusqlite with bundled SQLite (WAL hook, checkpoints); `appine_hal` (`open_at`, `stat_at`,
   `chmod_at`, `unlink_at`, times, `flock`, `map_file`, `fsync`, `syncfs`, `sync_file_range`,
   `statvfs`); the `tar` and `flate2` crates; `kernel::bkl_holder`; `bug::catch` (`kernel/bug`);
-  `mm::forget_writably_shared` (`kernel/hostmem`).
+  `mm::{forget_writably_shared, try_enter_fast_unlink}` (`kernel/hostmem`).
 
 ## Invariants and gotchas
 

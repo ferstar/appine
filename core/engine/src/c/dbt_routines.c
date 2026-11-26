@@ -295,6 +295,18 @@ static void emit_seq_step(struct xlate *x)
 }
 
 /*
+ * Clear bits 63:56 of a branch target register when bit 55 == 0, matching ARMv8-A BranchAddr
+ * under Linux 6.1's TBI0 configuration (TBI0 = 1, TBID0 = 0, TBI1 = 0). Preserves NZCV.
+ */
+static void emit_untag_pc(struct xlate *x, unsigned reg)
+{
+    uint32_t *skip = here(x);
+    emit(x, enc_tbnz(reg, DATA_TAG_SHIFT - 1));
+    emit(x, enc_and_low(reg, reg, DATA_TAG_SHIFT));
+    patch_local(x, skip, here(x));
+}
+
+/*
  * Lookup routine for jump-cache misses: T0 = guest pc. Like table_lookup it looks up this address
  * space's shared translation table without the lock; if found, it fills the thread's jump cache
  * and jumps there, and only if not found does it exit to the dispatcher to translate (R_LOOKUP).
@@ -306,6 +318,9 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
 {
     size_t x0 = offsetof(struct appine_cpu, x);
     uint32_t *entry = here(x);
+    /* Both jump-cache fills use aligned 48-bit PCs. A tagged target always misses the raw
+     * comparison. Apply TBI0 here for both the table probe and the R_LOOKUP exit. */
+    emit_untag_pc(x, T0);
     emit(x, enc_stp_x(0, 1, CTX, (int)x0));
     emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
     /* Read the table only after the sequence number has become odd: an stlr and a later ldar are
@@ -925,10 +940,9 @@ void dbt_emit_routines(struct appine_dbt *d)
     d->lookup = emit_lookup(x, d);
 
     /* Landing pad of empty shadow return stack entries (and memop_ret misses): look up by guest
-     * x30 (TBI0-untagged), as for an indirect branch that misses the jump cache */
+     * x30 through the same TBI0 lookup as a jump-cache miss */
     d->rs_miss = here(x);
     emit(x, enc_mov(T0, 30));
-    emit_untag_pc(x, T0);
     emit(x, enc_b((intptr_t)d->lookup - (intptr_t)here(x)));
 
     d->memop_ret = emit_memop_ret(x, d);

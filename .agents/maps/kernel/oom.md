@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: page-watch lifetime during private memory release)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: per-Mm OOM scoring and swap-candidate caching, proc_score bound short-circuit, and present_run/was_written measures)
 
 ## Responsibilities
 
@@ -72,13 +72,15 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   private file mappings as anonymous (all of a written file mapping, where Linux counts only its
   copied pages), shared anonymous memory, SysV shm, memfds and deleted files as shmem
   (`shmem_like`, also used by core dumps' `ANON_SHARED`), other file mappings as file.
-- `resident_pages` (statm, stat, OOM victim choice) skips `[vvar]` and private anonymous VMAs never
-  writable nor written by the kernel, measures private anonymous VMAs over 1 MB only over windows
-  with entries, and uses the 1 s file-residency cache for unwritten private file mappings and all
-  shared mappings with a file identity (so they can lag by a second). `resident_in` (smaps, OOM
-  kill log) uses the same windows, skips never-written private anonymous VMAs, excludes
-  `cow.borrowed` pages from the VMA's own host mincore pass so borrowed pages are never
-  double-counted, and uses no cache.
+- `resident_pages` (statm, stat, OOM victim choice) skips `[vvar]` and unwritten private anonymous
+  VMAs (`!v.was_written()`, probing host pagemap for eager write-probed VMAs), measures private
+  anonymous VMAs over 1 MB only over windows with entries, and uses the 1 s file-residency cache
+  for unwritten private file mappings and all shared mappings with a file identity (so they can lag
+  by a second). `resident_in` (smaps, OOM kill log) uses the same windows, skips unwritten
+  (`!v.was_written()`) private anonymous VMAs, excludes `cow.borrowed` pages from the VMA's own
+  host mincore pass so borrowed pages are never double-counted, and uses no cache. `resident_split`,
+  `exact_swap_pages`, `swappable_nonresident_pages`, `Usage` and `Mm::release` likewise check
+  `v.was_written()`.
 - `Usage` (child cgroups' usage) measures address spaces as `resident_pages` does, but together:
   each file piece measured from the page cache counts once (device, inode, offset and length, so
   overlapping but different pieces of one file count separately), and the other spans, with every
@@ -140,20 +142,27 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   still has threads (kept in a list until it exits). The score (`badness_with`, Linux's
   `oom_badness`) is `resident_pages + swap_pages + pgtables_pages + adj * (total / 1000)`,
   unclamped, with `total` the larger of RAM and the limit for the root, the cgroup's limit
-  otherwise; on equal scores the later (higher tgid) wins, as `oom_evaluate_task` keeps the last
-  one not below the best. `pgtables_pages` comes from `appine_engine::Mmu::table_pages` (also
-  reported in `/proc/<pid>/status` `VmPTE`, OOM kill log `pgtables`, and `memory.stat`
-  `pagetables`). `swap_pages` uses exact `/proc/self/pagemap` swap bits (`Mm::exact_swap_pages`,
-  also reported in `VmSwap`) when pagemap is readable; when pagemap is unreadable (SELinux-enforced
-  Android hosts), it is 0 whenever host `VmSwap == 0`, and otherwise distributes host `VmSwap`
-  proportionally across all live guest `Mm`s' `swappable_nonresident_pages` (present soft-MMU
-  entries in written private anonymous VMAs plus CoW-borrowed pages that `mincore` reports
-  non-resident, capped so total attributed swap never exceeds host `VmSwap`, and excluding
-  unmapped, never-written, file-backed, and `MADV_DONTNEED`-discarded pages whose soft PTEs are
-  zapped by `Mm::discard_range`). With no eligible process nothing is killed or logged.
-- `/proc/<pid>/oom_score` (`proc_score`, Linux's `proc_oom_score`) is the same badness with
-  `total` the host's RAM plus swap, as `(1000 + badness * 1000 / total) * 2 / 3` (0 to 2000), and
-  0 for the processes `select` never takes (init, -1000, no live thread, a vfork child).
+  otherwise; `select_with` caches `(mem_pages, rss)` per distinct `Mm` so `CLONE_VM` sharers are
+  measured once per selection pass while keeping per-process `oom_score_adj`, and on equal scores
+  the later (higher tgid) wins, as `oom_evaluate_task` keeps the last one not below the best.
+  `pgtables_pages` comes from `appine_engine::Mmu::table_pages` (also reported in
+  `/proc/<pid>/status` `VmPTE`, OOM kill log `pgtables`, and `memory.stat` `pagetables`).
+  `swap_pages` uses exact `/proc/self/pagemap` swap bits (`Mm::exact_swap_pages`, also reported in
+  `VmSwap`) when pagemap is readable; when pagemap is unreadable (SELinux-enforced Android hosts),
+  it is 0 whenever host `VmSwap == 0`, and otherwise distributes host `VmSwap` proportionally across
+  all live guest `Mm`s' `swappable_nonresident_pages` (present soft-MMU entries in written private
+  anonymous VMAs—skipping per-page `next_present` probes across `Vma::present_run` within non-CoW
+  runs—plus CoW-borrowed pages that `mincore` reports non-resident, cached per `Mm` in
+  `SwapContext::Fallback`, capped so total attributed swap never exceeds host `VmSwap`, and
+  excluding unmapped, never-written, file-backed, and `MADV_DONTNEED`-discarded pages whose soft
+  PTEs are zapped by `Mm::discard_range` when pagemap is unreadable). With no eligible process
+  nothing is killed or logged.
+- `/proc/<pid>/oom_score` (`proc_score`, Linux's `proc_oom_score`) checks eligibility first (0 for
+  processes `select` never takes: init, -1000, no live thread, a vfork child) and computes the same
+  badness with `total` the host's RAM plus swap, as `(1000 + badness * 1000 / total) * 2 / 3` (0 to
+  2000); when pagemap is unreadable, it skips the whole-kernel `fallback_swap_context` scan
+  whenever `host_swap` or `mm.swappable_nonresident_pages().min(host_swap)` rounds to the same
+  integer score as zero.
 - The kill records `oom` on the domain and its ancestors; a victim already exiting is reaped when
   eligible and waited for. Otherwise the group gets `SIGKILL` (`group_exit`), its cgroup and
   ancestors count `oom_kill`, host stderr gets a line, the kernel log gets Linux's memcg lines

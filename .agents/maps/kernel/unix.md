@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/unix.md` for the paired decision history.
 >
 > Verified: 2026-11-26 (full mapping: 15 adversarial claims checked by independent verifier — 15 confirmed, 0 partial, 0 refuted; 6 audit refinements and confirmed debt items folded in)
+>
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: direct single-pass scatter in Unix stream and record receives via `read_stream_to` and in-place head scatter)
 
 ## Responsibilities
 
@@ -208,7 +210,7 @@ pipe nonblocking condition. Generic stream writes can iterate over 1 MiB pieces.
 A non-peek receive targets the full capped request under `MSG_WAITALL`, otherwise
 `min(SO_RCVLOWAT, request)`. A peek can return immediately on available data below either
 threshold. On an empty queue it still observes reset, EOF and ordinary blocking rules.
-`read_stream` merges packets in order, uses the first packet's source and stops after
+`read_stream_to` (wrapped by buffered `read_stream`) merges packets in order, uses the first packet's source and stops after
 encountering files, including when only part of that packet's payload fits. With credential
 checking active it also stops before a different stamp. A waiting read can begin checking
 when passcred turns on. Once it has taken a stamp it preserves that boundary across waits
@@ -217,12 +219,16 @@ the credential cmsg is emitted.
 
 #### Copy and consume
 
-Stream receive previews the data and files, then `scatter_partial`
-writes to the guest. The consuming pass uses the copied prefix on a short copy. A copy
-error before progress returns the error and leaves the data queued. A short copy, rights,
-a credential boundary, reset, EOF or interrupted/unsatisfied wait can finish a read below
-its target. A partial result leaves a pending reset for a later read. Once queued stream
-data is exhausted, reset precedes EOF. Stream `MSG_TRUNC` adds no discarded length.
+For iovec receives, `read_stream_to` copies directly from queued packet slices through
+`scatter_partial` with a shared iovec cursor while borrowing the receive channel (under the
+BKL; `FUSE_RETRY` unwinds the borrow before any page fill runs), advancing offsets and
+popping emptied packets in one pass without a preview buffer. A copy error before progress
+returns the error and leaves the data queued. A fault at a later packet boundary stops a
+consuming read without detaching that packet's rights or charge, while a short peek still
+scans the previewed span for ancillary files. A short copy, rights, a credential boundary,
+reset, EOF or interrupted/unsatisfied wait can finish a read below its target. A partial
+result leaves a pending reset for a later read. Once queued stream data is exhausted, reset
+precedes EOF. Stream `MSG_TRUNC` adds no discarded length.
 
 #### Zero length and peek
 
@@ -235,7 +241,9 @@ and zero-total-length readv return before Unix receive and leave head files atta
 #### Records
 
 Datagram and seqpacket receive check and consume reset before looking at the
-head. Otherwise they preview one record, including an empty one. A successful short receive
+head. For iovec receives they scatter directly from the head record (including an empty one)
+while borrowing the channel, then call `read_packet(0, peek)` to pop or peek metadata without
+buffering a payload copy; buffered callers use `read_packet(max, peek)`. A successful short receive
 sets output `MSG_TRUNC` and consumes the whole record unless peeking. Input `MSG_TRUNC`
 selects its original length as the syscall return value. A non-peek guest payload-copy fault
 drops that record and releases its files, except that `FUSE_RETRY` leaves it queued. A

@@ -5159,6 +5159,258 @@ fn code_group_private_conditional_branch_relinks_across_members() {
     member2.join().unwrap();
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+mod deferred_relinks {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+
+    // Inspect the actual host branch. Both the stub and the direct branch produce identical
+    // guest results and exit counts. The existing perf map gives the RX address of each block.
+    struct CodeMap {
+        path: std::path::PathBuf,
+        mem: std::fs::File,
+    }
+
+    impl CodeMap {
+        fn first_body_word(&self, pc: u64) -> u64 {
+            let name = format!("g_{pc:x}");
+            let map = std::fs::read_to_string(&self.path).unwrap();
+            let address = map
+                .lines()
+                .rev()
+                .find_map(|line| {
+                    let mut words = line.split_whitespace();
+                    let address = words.next()?;
+                    (words.nth(1)? == name).then(|| u64::from_str_radix(address, 16).unwrap())
+                })
+                .unwrap();
+            address + 8 // Skip the two-word kick check.
+        }
+
+        fn word(&self, site: u64) -> u32 {
+            let mut bytes = [0; 4];
+            self.mem.read_exact_at(&mut bytes, site).unwrap();
+            u32::from_ne_bytes(bytes)
+        }
+    }
+
+    #[test]
+    fn conditional_branch_batches() {
+        // Perf-map recording is process-wide and is configured at the first install.
+        if std::env::var_os("APPINE_TEST_RELINK_MAP").is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "deferred_relinks::conditional_branch_batches"])
+                .env("APPINE_PERF_MAP", "1")
+                .env("APPINE_TEST_RELINK_MAP", "1")
+                .spawn()
+                .unwrap();
+            let status = child.wait().unwrap();
+            let removed = std::fs::remove_file(format!("/tmp/perf-{}.map", child.id()));
+            assert!(status.success());
+            removed.unwrap();
+            return;
+        }
+        let map = CodeMap {
+            path: format!("/tmp/perf-{}.map", std::process::id()).into(),
+            mem: std::fs::File::open("/proc/self/mem").unwrap(),
+        };
+        batch_and_piggyback(&map);
+        retired_entry(&map);
+        full_flush(&map);
+        peer_attach(&map, false);
+        peer_attach(&map, true);
+        detach(&map);
+    }
+
+    // Install the source before the destination, leaving its conditional side exit unlinked.
+    fn prepare_relink(
+        g: &mut Guest,
+        dbt: &mut Dbt,
+        src: u64,
+        dst: u64,
+        branch: fn(u64, u64) -> u32,
+    ) {
+        g.code(src, &[branch(src, dst), SVC]);
+        g.code(dst, &[movz_x0(2), SVC]);
+        g.cpu.state_mut().x[0] = 1;
+        g.cpu.state_mut().nzcv = 0;
+        assert_eq!(g.run_at(dbt, src), 1);
+        assert_eq!(g.run_at(dbt, dst), 2);
+    }
+
+    fn take_relink(g: &mut Guest, dbt: &mut Dbt, src: u64) {
+        g.cpu.state_mut().x[0] = 0;
+        g.cpu.state_mut().nzcv = 1 << 30; // Z
+        assert_eq!(g.run_at(dbt, src), 2);
+    }
+
+    // Installing a fresh block also drains pending conditional relinks.
+    fn install_svc(g: &mut Guest, dbt: &mut Dbt, pc: u64) {
+        g.code(pc, &[SVC]);
+        g.run_at(dbt, pc);
+    }
+
+    fn batch_and_piggyback(map: &CodeMap) {
+        let branches: [fn(u64, u64) -> u32; 3] = [
+            cbz_x0,
+            |from, to| b_cond(from, to, 0), // B.EQ
+            |from, to| 0x3600_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x3fff) << 5), // TBZ W0, #0
+        ];
+        for private in [false, true] {
+            let space = DbtSpace::new(0, DbtRegs::Default).unwrap();
+            let tag = if private { space.new_tag().unwrap() } else { 0 };
+            let _other_member =
+                private.then(|| Dbt::attach(&space, space.new_tag().unwrap()).unwrap());
+            let mut dbt = Dbt::attach(&space, tag).unwrap();
+            let mut g = Guest::new();
+            let src = |i| CODE + 16 * i;
+            let mut expected = Vec::new();
+            for i in 0..40 {
+                let dst = CODE + 0x800 + 8 * i;
+                let branch = branches[i as usize % branches.len()];
+                prepare_relink(&mut g, &mut dbt, src(i), dst, branch);
+                let site = map.first_body_word(src(i));
+                expected.push((site, branch(site, map.first_body_word(dst))));
+            }
+            let count_direct = || {
+                expected
+                    .iter()
+                    .filter(|&&(site, direct)| map.word(site) == direct)
+                    .count()
+            };
+            take_relink(&mut g, &mut dbt, src(0));
+            assert_eq!(count_direct(), 0);
+            for i in 1..40 {
+                take_relink(&mut g, &mut dbt, src(i));
+            }
+            // All targets existed, so only a bounded batch drain could have patched branches.
+            assert!((1..40).contains(&count_direct()));
+            install_svc(&mut g, &mut dbt, CODE + PAGE_SIZE);
+            assert_eq!(count_direct(), 40);
+            let exits = dbt.stats().exits_chain;
+            for i in 0..40 {
+                take_relink(&mut g, &mut dbt, src(i));
+            }
+            assert_eq!(dbt.stats().exits_chain, exits);
+        }
+    }
+
+    fn retired_entry(map: &CodeMap) {
+        let mut dbt = Dbt::new().unwrap();
+        let mut g = Guest::new();
+        let src = CODE + 0x80;
+        let dst = CODE + 0x100;
+        prepare_relink(&mut g, &mut dbt, src, dst, cbz_x0);
+        // This live source retains a conditional opcode throughout the retirement. Its queued
+        // rewrite must also be discarded when the retirement epoch changes.
+        let other = src + 16;
+        prepare_relink(&mut g, &mut dbt, other, dst + 16, cbz_x0);
+        let other_site = map.first_body_word(other);
+        let other_original = map.word(other_site);
+        // A forward B skips the kick check and enters exactly at the CBZ in code[2].
+        g.code(CODE, &[b(CODE, src)]);
+        g.cpu.state_mut().x[0] = 1;
+        assert_eq!(g.run(&mut dbt), 1);
+        take_relink(&mut g, &mut dbt, src);
+        take_relink(&mut g, &mut dbt, other);
+        g.code(src, &[movz_x0(7), SVC]);
+        let entry = map.first_body_word(src);
+        assert_eq!(map.word(entry) & 0xff00_001f, 0xb400_0000); // CBZ X0
+        dbt.invalidate(&g.cpu, src, 4);
+        let forward = map.word(entry);
+        assert_eq!(forward, 0x17ff_fffe); // B back two words to the retired entry
+        assert_eq!(dbt.stats().invalidated, 1);
+        install_svc(&mut g, &mut dbt, CODE + PAGE_SIZE);
+        assert_eq!(map.word(entry), forward);
+        assert_eq!(map.word(other_site), other_original);
+        assert_eq!(g.run(&mut dbt), 7);
+    }
+
+    fn full_flush(map: &CodeMap) {
+        let mut dbt = Dbt::new().unwrap();
+        let mut g = Guest::new();
+        let dst = CODE + 0x100;
+        prepare_relink(&mut g, &mut dbt, CODE, dst, cbz_x0);
+        take_relink(&mut g, &mut dbt, CODE);
+        let old_entry = map.first_body_word(CODE);
+        let before_flush = map.word(old_entry);
+        dbt.flush();
+        // Reuse the old source's cache position with a conditional targeting different code.
+        let new_src = CODE + PAGE_SIZE;
+        let new_dst = new_src + 0x200;
+        prepare_relink(&mut g, &mut dbt, new_src, new_dst, cbz_x0);
+        assert_eq!(dbt.stats().flushes, 1);
+        let entry = map.first_body_word(new_src);
+        assert_eq!(entry, old_entry);
+        let original = map.word(entry);
+        assert_eq!(original, before_flush);
+        take_relink(&mut g, &mut dbt, new_src);
+        install_svc(&mut g, &mut dbt, dst);
+        assert_ne!(map.word(entry), original);
+    }
+
+    fn peer_attach(map: &CodeMap, shared: bool) {
+        use std::sync::mpsc;
+
+        let space = DbtSpace::new(0, DbtRegs::Default).unwrap();
+        let tag = space.new_tag().unwrap();
+        let peer_tag = if shared {
+            space.share(&[DbtSource {
+                start: CODE,
+                len: PAGE_SIZE,
+                id: [0; 5],
+            }]);
+            space.new_tag().unwrap()
+        } else {
+            tag
+        };
+        let mut dbt = Dbt::attach(&space, tag).unwrap();
+        let mut g = Guest::new();
+        for i in 0..3 {
+            prepare_relink(&mut g, &mut dbt, CODE + 16 * i, CODE + 0x80 + 8 * i, cbz_x0);
+        }
+        take_relink(&mut g, &mut dbt, CODE);
+        let sites = [0, 16, 32].map(|off| map.first_body_word(CODE + off));
+        let original = sites.map(|site| map.word(site));
+        std::thread::scope(|scope| {
+            let (attached, ready) = mpsc::sync_channel(0);
+            let (release, hold) = mpsc::channel::<()>();
+            let space = &space;
+            scope.spawn(move || {
+                let _peer = Dbt::attach(space, peer_tag).unwrap();
+                attached.send(()).unwrap();
+                let _ = hold.recv();
+            });
+            ready.recv().unwrap();
+            // Drain an edge queued before attach, then take an edge while its code has two owners.
+            install_svc(&mut g, &mut dbt, CODE + PAGE_SIZE);
+            take_relink(&mut g, &mut dbt, CODE + 16);
+            drop(release);
+        });
+        take_relink(&mut g, &mut dbt, CODE + 32);
+        install_svc(&mut g, &mut dbt, CODE + PAGE_SIZE + 16);
+        assert_eq!(map.word(sites[0]), original[0]);
+        assert_eq!(map.word(sites[1]), original[1]);
+        assert_ne!(map.word(sites[2]), original[2]);
+    }
+
+    fn detach(map: &CodeMap) {
+        let space = DbtSpace::new(0, DbtRegs::Default).unwrap();
+        let mut dbt = Dbt::attach(&space, 0).unwrap();
+        let mut g = Guest::new();
+        prepare_relink(&mut g, &mut dbt, CODE, CODE + 0x100, cbz_x0);
+        let site = map.first_body_word(CODE);
+        let original = map.word(site);
+        take_relink(&mut g, &mut dbt, CODE);
+        drop(dbt);
+        // Reuse the pooled attachment in the same live space and generation.
+        let mut next = Dbt::attach(&space, 0).unwrap();
+        install_svc(&mut g, &mut next, CODE + PAGE_SIZE);
+        assert_eq!(map.word(site), original);
+        take_relink(&mut g, &mut next, CODE);
+    }
+}
+
 #[test]
 fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
     const TAG: u64 = 0x5a << 56;
@@ -5243,7 +5495,8 @@ fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
         let mut g0 = Guest::with_data();
         g0.pages[0].0.copy_from_slice(&g.pages[0].0);
 
-        // Repeat twice to cover both cold jump-cache miss (d->lookup) and warm jump-cache hit.
+        // The first tagged branch needs a translation. Repeat with a warm canonical cache entry:
+        // tagged branches still miss the raw probe, and untagged branches can hit it directly.
         for round in 0..2 {
             for (entry, reg, use_entry_tag) in [
                 (br_x1, 1usize, false),
@@ -5252,6 +5505,11 @@ fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
                 (ret_stolen, stolen as usize, false),
                 (target, 0usize, true),
             ] {
+                let raw_target = if round == 1 && entry == br_x1 {
+                    target
+                } else {
+                    TAG | target
+                };
                 run_both(
                     &mut g0,
                     &mut g,
@@ -5259,7 +5517,7 @@ fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
                     |s| {
                         s.nzcv = NZCV_INIT;
                         if !use_entry_tag {
-                            s.x[reg] = TAG | target;
+                            s.x[reg] = raw_target;
                         }
                         s.pc = if use_entry_tag { TAG | entry } else { entry };
                     },
@@ -5276,7 +5534,7 @@ fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
                         assert_eq!(st.nzcv, NZCV_INIT, "{regs:?} {tier} nzcv preserved");
                         assert_eq!(st.pc, target + 24, "{regs:?} {tier} final pc");
                         if !use_entry_tag && reg != 0 && reg != 2 && reg != 3 && reg != 4 {
-                            let expected_reg = if reg == 30 { target + 16 } else { TAG | target };
+                            let expected_reg = if reg == 30 { target + 16 } else { raw_target };
                             assert_eq!(st.x[reg], expected_reg, "{regs:?} {tier} source reg");
                         }
                     },

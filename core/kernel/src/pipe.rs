@@ -238,7 +238,7 @@ impl Pipe {
     /// carries its merge flag. The caller consumes the transferred bytes on a move.
     pub fn transfer(&self, dst: &mut Pipe, len: usize, take: bool) -> usize {
         let mut done = 0;
-        let mut page = [0; PIPE_BUF];
+        let mut page = std::cell::LazyCell::new(|| [0; PIPE_BUF]);
         for slot in self.slots.iter().take(dst.free_slots()) {
             if done == len {
                 break;
@@ -250,7 +250,9 @@ impl Pipe {
                 mergeable: take && slot.mergeable && slot.start + n == slot.end,
                 vm: slot.vm.clone(),
             });
-            if slot.read_live(&mut page[..n]) {
+            if let Some(vm) = &slot.vm
+                && vm.read(slot.start, &mut page[..n])
+            {
                 dst.buf.extend(&page[..n]);
             } else {
                 dst.buf.extend(self.buf.range(done..done + n));
@@ -388,6 +390,33 @@ mod tests {
         mm.borrow().write(src, b"bad").unwrap();
         pipe.push_vmsplice(b"bad", 0, &mm, base);
         assert_eq!(pipe.snapshot(6), b"oldbad");
+    }
+
+    #[test]
+    fn transfer_preserves_ordinary_slots_and_vmsplice_fallback() {
+        let mm = Mm::new().into_shared();
+        let base = 0x10000;
+        let src = UserSlice::new(base + 2, 3);
+        mm.borrow_mut()
+            .map_anonymous(base, PIPE_BUF as u64, prot::READ | prot::WRITE)
+            .unwrap();
+        mm.borrow().write(src, b"old").unwrap();
+        let from = Pipe::fifo(1, PIPE_CAPACITY);
+        let to = Pipe::fifo(2, PIPE_CAPACITY);
+        let (mut from, mut to) = (from.borrow_mut(), to.borrow_mut());
+        from.write(b"abc", true);
+        from.push_vmsplice(b"old", 2, &mm, src.addr);
+        mm.borrow().write(src, b"new").unwrap();
+        assert_eq!(from.transfer(&mut to, 5, false), 5);
+        assert_eq!(to.snapshot(5), b"abcne");
+        assert!(!to.slots[0].mergeable);
+        mm.borrow().write(src, b"xyz").unwrap();
+        assert_eq!(to.snapshot(5), b"abcxy");
+        drop(mm);
+        assert_eq!(to.snapshot(5), b"abcne");
+        assert_eq!(from.transfer(&mut to, 6, true), 6);
+        assert!(to.slots[2].mergeable);
+        assert_eq!(to.snapshot(11), b"abcneabcold");
     }
 
     #[test]

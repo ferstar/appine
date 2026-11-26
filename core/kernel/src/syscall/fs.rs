@@ -3577,18 +3577,23 @@ fn wait_room(cx: &mut Cx<'_>, pipe: &Rc<RefCell<Pipe>>, nonblock: bool) -> Resul
 /// Wake readers for a new arrival. An edge-triggered reader also observes writes to a
 /// nonempty pipe through the write counter.
 fn pipe_arrival(cx: &mut Cx<'_>, pipe: &mut Pipe, written: usize) {
-    if written == 0 {
-        return;
+    if written != 0 {
+        pipe_arrivals(cx, pipe, written, 1);
     }
-    if pipe.bytes().len() == written {
+}
+
+fn pipe_arrivals(cx: &mut Cx<'_>, pipe: &mut Pipe, written: usize, writes: u64) {
+    let was_empty = pipe.bytes().len() == written;
+    if was_empty {
         request_wake_object(wake::of_value(pipe));
-    } else {
+    }
+    if !was_empty || writes > 1 {
         super::poll::arrived(cx);
     }
     if let Some(vfs) = &cx.kr().vfs {
         vfs.pipe_io_time(pipe, true);
     }
-    pipe.writes += 1;
+    pipe.writes += writes;
 }
 
 /// vmsplice (Linux 6.1): an fd open for writing (checked first, so a FIFO opened read-write is
@@ -4939,7 +4944,8 @@ fn write_file_inner(
     let held = pos_held || _pos.is_some();
     // RLIMIT_FSIZE is checked once for the whole write, as generic_write_checks does: a piece
     // that ends at the limit only shortens it, without SIGXFSZ for the next
-    let len = fsize_allowed(cx, &file.borrow(), offset, len, io.append)?;
+    let (len, mut prechecked_flags) =
+        fsize_allowed_flags(cx, &file.borrow(), offset, len, io.append)?;
     let step = io_chunk(&file.borrow());
     let mut chunk = vec![0u8; len.min(step)];
     let mut done = 0;
@@ -4950,13 +4956,15 @@ fn write_file_inner(
             &mut chunk[..n],
         );
         let step = copied.and_then(|()| {
-            write_bytes_inner(
+            write_bytes_with_flags(
                 cx,
                 file,
                 &chunk[..n],
                 offset.map(|o| o + done as u64),
                 io,
                 held,
+                // Later chunks can follow a write that released the BKL.
+                prechecked_flags.take(),
             )
         });
         match step {
@@ -5510,6 +5518,18 @@ fn write_bytes_inner(
     io: IoFlags,
     pos_held: bool,
 ) -> Result<usize, Errno> {
+    write_bytes_with_flags(cx, file, data, offset, io, pos_held, None)
+}
+
+fn write_bytes_with_flags(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    data: &[u8],
+    offset: Option<u64>,
+    io: IoFlags,
+    pos_held: bool,
+    prechecked_flags: Option<u32>,
+) -> Result<usize, Errno> {
     let (path, nonblock) = {
         let f = file.borrow();
         let path = positional(&f, offset)?;
@@ -5562,7 +5582,7 @@ fn write_bytes_inner(
             let need = !pos_held && offset.is_none() && regular_fd(&file.borrow()).is_some();
             let _pos = PosGuard::lock_if_with(cx, file, need, io.nowait)?;
             let held = pos_held || _pos.is_some();
-            write_local(cx, file, data, (offset, held, append))
+            write_local(cx, file, data, offset, held, append, prechecked_flags)
         }
     }
 }
@@ -5573,10 +5593,15 @@ fn write_local(
     cx: &mut Cx<'_>,
     file: &FileRef,
     data: &[u8],
-    (offset, held, append): (Option<u64>, bool, bool),
+    offset: Option<u64>,
+    held: bool,
+    append: bool,
+    prechecked_flags: Option<u32>,
 ) -> Result<usize, Errno> {
-    let flags = file_inode_flags(cx, &file.borrow())?;
-    reject_flags(flags, inode_flags::IMMUTABLE)?;
+    let flags = match prechecked_flags {
+        Some(flags) => flags,
+        None => checked_write_flags(cx, &file.borrow())?,
+    };
     let append = append || flags & inode_flags::APPEND != 0;
     let offset = if offset.is_some() && flags & inode_flags::APPEND != 0 {
         let f = file.borrow();
@@ -5585,7 +5610,8 @@ fn write_local(
     } else {
         offset
     };
-    let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len(), append)?];
+    let data =
+        &data[..fsize_room_for_write(cx, &file.borrow(), offset, data.len(), append, flags)?];
     let (n, mut tmpfs) = tmpfs_write_room(cx, &file.borrow(), offset, data.len(), append)?;
     let data = &data[..n];
     check_seals(cx, &file.borrow(), true, |size| {
@@ -5801,54 +5827,49 @@ fn pipe_write_user(
         return Ok(0);
     }
     let mut done = 0;
-    let mut page = [0u8; PIPE_BUF];
-
-    let tail = {
-        let p = pipe.borrow();
-        if p.readers == 0 {
-            drop(p);
-            return Err(broken_pipe(cx));
-        }
-        p.merge_len(total)
+    let page: &mut [u8] = if total <= 256 {
+        &mut [0; 256]
+    } else {
+        &mut [0; PIPE_BUF]
     };
-    if tail != 0 {
-        iter.copy_exact(cx, &mut page[..tail])?;
+    let mut tail = pipe.borrow().merge_len(total);
+    loop {
         let mut p = pipe.borrow_mut();
         if p.readers == 0 {
             drop(p);
-            return Err(broken_pipe(cx));
+            let e = broken_pipe(cx);
+            return if done > 0 { Ok(done as u64) } else { Err(e) };
         }
-        p.write(&page[..tail], true);
-        pipe_arrival(cx, &mut p, tail);
-        done += tail;
+
+        // Guest copies, including stack growth, hold the BKL. Publish everything copied
+        // in this batch before a fault return or a wait that lets readers run.
+        let before = done;
+        let mut writes = 0;
+        let mut fault = None;
+        while iter.left != 0 && (tail != 0 || p.free_slots() > 0) {
+            let n = if tail != 0 {
+                tail
+            } else {
+                iter.left.min(PIPE_BUF)
+            };
+            if let Err(e) = iter.copy_exact(cx, &mut page[..n]) {
+                fault = Some(e);
+                break;
+            }
+            p.write(&page[..n], tail != 0);
+            tail = 0;
+            done += n;
+            writes += 1;
+        }
+        if writes != 0 {
+            pipe_arrivals(cx, &mut p, done - before, writes);
+        }
+        drop(p);
+        if let Some(e) = fault {
+            return if done > 0 { Ok(done as u64) } else { Err(e) };
+        }
         if iter.left == 0 {
             return Ok(done as u64);
-        }
-    }
-
-    loop {
-        let can_write = {
-            let p = pipe.borrow();
-            if p.readers == 0 {
-                drop(p);
-                let e = broken_pipe(cx);
-                return if done > 0 { Ok(done as u64) } else { Err(e) };
-            }
-            p.free_slots() > 0
-        };
-        if can_write {
-            let want = iter.left.min(PIPE_BUF);
-            if let Err(e) = iter.copy_exact(cx, &mut page[..want]) {
-                return if done > 0 { Ok(done as u64) } else { Err(e) };
-            }
-            let mut p = pipe.borrow_mut();
-            p.write(&page[..want], false);
-            pipe_arrival(cx, &mut p, want);
-            done += want;
-            if iter.left == 0 {
-                return Ok(done as u64);
-            }
-            continue;
         }
         if nonblock || cx.interrupted() {
             let e = if nonblock {
@@ -5936,11 +5957,43 @@ fn fsize_allowed(
     len: usize,
     append: bool,
 ) -> Result<usize, Errno> {
+    fsize_allowed_flags(cx, f, offset, len, append).map(|(n, _)| n)
+}
+
+fn fsize_allowed_flags(
+    cx: &Cx<'_>,
+    f: &OpenFile,
+    offset: Option<u64>,
+    len: usize,
+    append: bool,
+) -> Result<(usize, Option<u32>), Errno> {
+    if !matches!(f.kind, FileKind::Regular { .. }) {
+        return Ok((len, None));
+    }
+    let flags = checked_write_flags(cx, f)?;
+    Ok((
+        fsize_room_for_write(cx, f, offset, len, append, flags)?,
+        Some(flags),
+    ))
+}
+
+fn checked_write_flags(cx: &Cx<'_>, f: &OpenFile) -> Result<u32, Errno> {
+    let flags = file_inode_flags(cx, f)?;
+    reject_flags(flags, inode_flags::IMMUTABLE)?;
+    Ok(flags)
+}
+
+fn fsize_room_for_write(
+    cx: &Cx<'_>,
+    f: &OpenFile,
+    offset: Option<u64>,
+    len: usize,
+    append: bool,
+    flags: u32,
+) -> Result<usize, Errno> {
     let FileKind::Regular { file, ino, .. } = &f.kind else {
         return Ok(len);
     };
-    let flags = file_inode_flags(cx, f)?;
-    reject_flags(flags, inode_flags::IMMUTABLE)?;
     let limit = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0;
     if limit == u64::MAX || len == 0 {
         return Ok(len);
@@ -6369,18 +6422,19 @@ pub(crate) fn host_unshared(k: &Kernel, ino: Ino) {
 /// messages in flight and behind loop devices, each once. Those borrowed at this moment (by the
 /// caller) are left out.
 fn opens_of(k: &crate::kernel::Kernel, ino: Ino) -> Vec<FileRef> {
-    let mut all = k.open_files();
-    all.extend(crate::unix::inflight_files(k));
-    all.extend(k.loops.backing_files());
-    let mut out: Vec<FileRef> = Vec::new();
-    for f in all {
-        let ours = f
-            .try_borrow()
-            .is_ok_and(|f| f.regular_backing().is_some_and(|(i, ..)| i == ino));
-        if ours && !out.iter().any(|o| Rc::ptr_eq(o, &f)) {
-            out.push(f);
-        }
-    }
+    let mut seen = std::collections::HashSet::new();
+    let mut matches = |file: &FileRef| {
+        file.try_borrow()
+            .is_ok_and(|f| f.regular_backing().is_some_and(|(i, ..)| i == ino))
+            && seen.insert(Rc::as_ptr(file))
+    };
+    let mut out = k.open_files_matching(&mut matches);
+    out.extend(
+        crate::unix::inflight_files(k)
+            .into_iter()
+            .filter(&mut matches),
+    );
+    out.extend(k.loops.backing_files().into_iter().filter(matches));
     out
 }
 
@@ -8077,268 +8131,229 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
 }
 
 fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), Errno> {
-    if let Some(r) = unlink_mq(cx, dirfd, &path, flags) {
-        return r;
-    }
-    if let Some(r) = cgroup_unlink(cx, dirfd, &path, flags) {
-        return r;
-    }
-    if let Some(r) = unlink_overlay(cx, dirfd, &path, flags) {
-        return r;
-    }
-    if let Some((mnt, dir, name)) = super::fuse::parent(cx, dirfd, &path)? {
-        let rmdir = flags & AT_REMOVEDIR != 0;
-        let slash = path.ends_with(b"/");
-        return super::fuse::unlink(cx, (mnt, dir), name, rmdir, slash);
-    }
-    let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
-    let store_vfs = cx.vfs()?;
-    let store = store_vfs.store();
+    let start = start_dir(cx, dirfd, &path)?;
+    let vfs = cx.vfs()?;
     let cred = cx.cred();
-    // With inotify watches, note the inode to delete first
-    let victim = match name {
-        b"." | b".." => None,
-        _ if inotify::active(cx.kr()) => store.lookup(dir, name)?,
-        _ => None,
-    };
-    if flags & AT_REMOVEDIR != 0 {
-        match name {
-            b"." => return Err(Errno::EINVAL),
-            b".." => return Err(Errno::ENOTEMPTY),
-            _ => {
-                writable_dir(&store_vfs, (mnt, dir))?;
-                may_delete(store, &cred, dir, name)?;
-                let gone = not_mount_point(cx, &store_vfs, dir, name)?;
-                let tmpfs = tmpfs_victim(&store_vfs, (mnt, dir), name)?;
-                store.rmdir(dir, name)?;
-                tmpfs_removed(cx, &store_vfs, tmpfs);
-                detach_points(cx, &store_vfs, gone, (dir, name));
-                if let Some(ino) = gone {
-                    inotify::unlinked(cx.kr(), ino, dir, name);
-                }
+    let (parent, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, &path)?;
+    let rmdir = flags & AT_REMOVEDIR != 0;
+    let slash = path.ends_with(b"/");
+    match parent {
+        Node::Pseudo(mnt, PseudoNode::MqRoot(ns)) => {
+            return unlink_mq(cx, &vfs, (mnt, ns), name, rmdir, slash);
+        }
+        Node::Pseudo(_, ref p @ PseudoNode::Cgroup(id, b"", 0)) => {
+            if let Ok(st) = pseudo::stat(&cx.view(&vfs), p) {
+                return cgroup_unlink(cx, &vfs, &parent, (id, st), name, rmdir);
             }
         }
-        if let Some(ino) = victim {
-            let k = cx.kr();
+        Node::Overlay(mnt, d) => return unlink_overlay(cx, &vfs, (mnt, d), name, rmdir, slash),
+        Node::Fuse(mnt, d) => return super::fuse::unlink(cx, (mnt, d), name, rmdir, slash),
+        _ => {}
+    }
+
+    let (mnt, dir) = store_dir(&vfs, &parent)?;
+    check_unlink_name(name, rmdir)?;
+    writable_dir(&vfs, (mnt, dir))?;
+    let store = vfs.store();
+    if !rmdir && slash {
+        let ino = store.lookup(dir, name)?.ok_or(Errno::ENOENT)?;
+        return Err(if store.attrs(ino)?.is_dir() {
+            Errno::EISDIR
+        } else {
+            Errno::ENOTDIR
+        });
+    }
+    // Keep permission checks, mount checks and deletion on the same dentry if another
+    // connection renames over it. Publish events and change tmpfs usage only after success.
+    let (ino, tmpfs, held) = store.remove_checked(dir, name, rmdir, |victim| {
+        let ino = may_delete(store, &cred, dir, victim)?.ino;
+        if vfs.is_store_point((ino, dir, name), cx.mnt_ns()) {
+            return Err(Errno::EBUSY);
+        }
+        let tmpfs = if let Some(dev) = backing_tmpfs_dev(&vfs, &parent) {
+            tmpfs_victim_ino(&vfs, dev, ino)?
+        } else {
+            None
+        };
+        let held = !rmdir && store.held(ino).unwrap_or(false);
+        Ok((ino, tmpfs, held))
+    })?;
+    tmpfs_removed(cx, &vfs, tmpfs);
+    release_if_closed(cx, &vfs, held.then_some(ino));
+    detach_points(cx, &vfs, ino, (dir, name), rmdir);
+    inotify::unlinked(cx.kr(), ino, dir, name);
+    if inotify::active(cx.kr()) {
+        let k = cx.kr();
+        if rmdir {
             inotify::deleted(k, ino, dir, name);
             inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
-        }
-    } else {
-        if name == b"." || name == b".." {
-            return Err(Errno::EISDIR);
-        }
-        writable_dir(&store_vfs, (mnt, dir))?;
-        // A name ending in / can only be a directory: EISDIR when it is a directory, otherwise
-        // ENOTDIR
-        if path.ends_with(b"/") {
-            let ino = store.lookup(dir, name)?.ok_or(Errno::ENOENT)?;
-            return Err(if store.stat(ino)?.is_dir() {
-                Errno::EISDIR
-            } else {
-                Errno::ENOTDIR
-            });
-        }
-        may_delete(store, &cred, dir, name)?;
-        let gone = not_mount_point(cx, &store_vfs, dir, name)?;
-        let tmpfs = tmpfs_victim(&store_vfs, (mnt, dir), name)?;
-        let held = gone.filter(|&ino| store.held(ino).unwrap_or(false));
-        store.unlink(dir, name)?;
-        tmpfs_removed(cx, &store_vfs, tmpfs);
-        release_if_closed(cx, &store_vfs, held);
-        detach_points(cx, &store_vfs, gone, (dir, name));
-        if let Some(ino) = gone {
-            inotify::unlinked(cx.kr(), ino, dir, name);
-        }
-        if let Some(ino) = victim {
+        } else {
             unlinked_events(cx, store, ino, (dir, name));
-            inotify::dir_event(cx.kr(), dir, name, inotify::IN_DELETE, 0);
+            inotify::dir_event(k, dir, name, inotify::IN_DELETE, 0);
         }
     }
     Ok(())
 }
 
-/// unlink and rmdir in an overlay directory: returns Some when the parent is an overlay
-/// directory. Linux's do_unlinkat and do_rmdir order: `.` and `..`, the read-only filesystem,
-/// not found, a name ending in `/` on something that is not a directory, then `may_delete` on
-/// what the overlay shows (search, then write permission and the sticky bit, then the type),
-/// a mount point (EBUSY), a directory that the overlay does not show empty (ENOTEMPTY); then the
-/// overlay's own removal ([`crate::vfs::overlay::Overlays::remove`]).
-fn unlink_overlay(
-    cx: &mut Cx<'_>,
-    dirfd: i32,
-    path: &[u8],
-    flags: u32,
-) -> Option<Result<(), Errno>> {
-    let start = start_dir(cx, dirfd, path).ok()?;
-    let vfs = cx.vfs().ok()?;
-    let cred = cx.cred();
-    let (dir, name) = vfs
-        .resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, path)
-        .ok()?;
-    let Node::Overlay(mnt, d) = dir else {
-        return None;
-    };
-    let rmdir = flags & AT_REMOVEDIR != 0;
-    Some((|| {
-        match name {
-            b"." if rmdir => return Err(Errno::EINVAL),
-            b".." if rmdir => return Err(Errno::ENOTEMPTY),
-            b"." | b".." => return Err(Errno::EISDIR),
-            _ => {}
-        }
-        if vfs.readonly(&dir) {
-            return Err(Errno::EROFS);
-        }
-        let child = vfs.overlay_child((mnt, d), name)?;
-        let Node::Overlay(_, c) = child else {
-            return Err(Errno::EIO);
-        };
-        let st = vfs.overlay_stat(c)?;
-        if !rmdir && path.ends_with(b"/") {
-            return Err(if st.is_dir() {
-                Errno::EISDIR
-            } else {
-                Errno::ENOTDIR
-            });
-        }
-        let dir_st = vfs.store().attrs(vfs.overlay().node(d).real())?;
-        cred.permission(&dir_st, MAY_EXEC)?;
-        may_delete_attrs(&cred, &dir_st, &st)?;
-        match (rmdir, st.is_dir()) {
-            (true, false) => return Err(Errno::ENOTDIR),
-            (false, true) => return Err(Errno::EISDIR),
-            _ => {}
-        }
-        if vfs.is_point_in(&child, cx.mnt_ns()) {
-            return Err(Errno::EBUSY);
-        }
-        if rmdir && !vfs.overlay_readdir(c)?.is_empty() {
-            return Err(Errno::ENOTEMPTY);
-        }
-        // Account upper-layer tmpfs changes: parent dir copy-up, removed upper entry (and
-        // whiteouts inside a removed upper dir), plus a new whiteout when a lower layer has it.
-        let tmpfs = if let Some(dev) = overlay_upper_tmpfs_dev(&vfs, vfs.dev_of(&dir)) {
-            let dir_inodes = overlay_uncopied_dirs(&vfs, &[d]);
-            let lower = vfs.overlay().lower_has(vfs.store(), d, name)?;
-            let child_upper = vfs.overlay().node(c).upper;
-            let mut inodes = dir_inodes as i64 + i64::from(lower);
-            let mut victim = None;
-            if let Some(u) = child_upper {
-                if rmdir {
-                    inodes -= 1 + vfs.store().readdir(u)?.len() as i64;
-                } else {
-                    victim = tmpfs_victim_ino(&vfs, dev, u)?;
-                }
-            }
-            let keeps_upper = child_upper.is_none()
-                || victim
-                    .as_ref()
-                    .is_some_and(|v| v.object.is_some() && file_in_use(cx.kr(), &vfs, v.ino));
-            let need_inodes = dir_inodes + u64::from(lower && keeps_upper);
-            vfs.tmpfs_check(dev, 0, need_inodes)?;
-            Some(OverlayTmpfsOp {
-                dev,
-                inodes,
-                victim,
-            })
-        } else {
-            None
-        };
-        let child_upper = vfs.overlay().node(c).upper;
-        let lower_has = vfs.overlay().lower_has(vfs.store(), d, name)?;
-        let copied_dirs = if inotify::active(cx.kr()) {
-            overlay_uncopied_chain(&vfs, &[d])
-        } else {
-            Vec::new()
-        };
-        vfs.overlay_remove(d, name, rmdir)?;
-        if let Some(op) = tmpfs {
-            op.apply(cx, &vfs);
-        }
-        let k = cx.kr();
-        // Report upper-layer changes first (parent dir copy-up, removed upper entry, and any
-        // whiteout created in the upper directory), then the overlay node's events.
-        overlay_copy_up_events(k, &vfs, &copied_dirs);
-        let upper_gone = child_upper.map(|u| vfs.store().attrs(u).map_or(0, |s| s.nlink) == 0);
-        let notify_removed = |target: Ino, dir: Ino, gone: bool| {
-            inotify::unlinked(k, target, dir, name);
-            if rmdir {
-                inotify::deleted(k, target, dir, name);
-                inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
-            } else {
-                inotify::path_event(k, target, None, inotify::IN_ATTRIB);
-                if gone {
-                    inotify::deleted(k, target, dir, name);
-                }
-                inotify::dir_event(k, dir, name, inotify::IN_DELETE, 0);
-            }
-        };
-        if let Some(up) = vfs.overlay().node(d).upper {
-            if let Some(u) = child_upper {
-                notify_removed(u, up, upper_gone == Some(true));
-            }
-            if lower_has {
-                inotify::dir_event(k, up, name, inotify::IN_CREATE, 0);
-            }
-        }
-        notify_removed(
-            overlay::key(c),
-            overlay::key(d),
-            upper_gone.unwrap_or(st.nlink <= 1),
-        );
-        Ok(())
-    })())
+fn check_unlink_name(name: &[u8], rmdir: bool) -> Result<(), Errno> {
+    match name {
+        b"." if rmdir => Err(Errno::EINVAL),
+        b".." if rmdir => Err(Errno::ENOTEMPTY),
+        b"." | b".." => Err(Errno::EISDIR),
+        _ => Ok(()),
+    }
 }
 
-/// Deletes a queue in the mqueue filesystem (as mq_unlink does): returns Some when the parent
-/// directory is the mqueue root directory. The order follows Linux's do_unlinkat and do_rmdir:
-/// `.` and `..`, the read-only mount, not found, unlink of a name ending in `/`, write permission
-/// on the directory, the sticky bit (EPERM), rmdir's ENOTDIR.
-fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Result<(), Errno>> {
-    let start = start_dir(cx, dirfd, path).ok()?;
-    let vfs = cx.vfs().ok()?;
+/// Apply Linux's unlink and rmdir checks to the visible overlay entry. Check mount
+/// points and merged-directory emptiness before removing anything in the upper layer.
+fn unlink_overlay(
+    cx: &Cx<'_>,
+    vfs: &Vfs,
+    (mnt, d): (MountId, OvlId),
+    name: &[u8],
+    rmdir: bool,
+    slash: bool,
+) -> Result<(), Errno> {
+    let dir = Node::Overlay(mnt, d);
     let cred = cx.cred();
-    let (dir, name) = vfs
-        .resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, path)
-        .ok()?;
-    let Node::Pseudo(_, PseudoNode::MqRoot(ns)) = dir else {
-        return None;
+    check_unlink_name(name, rmdir)?;
+    if vfs.readonly(&dir) {
+        return Err(Errno::EROFS);
+    }
+    let child = vfs.overlay_child((mnt, d), name)?;
+    let Node::Overlay(_, c) = child else {
+        return Err(Errno::EIO);
     };
-    let rmdir = flags & AT_REMOVEDIR != 0;
-    Some((|| {
-        match name {
-            b"." if rmdir => return Err(Errno::EINVAL),
-            b".." if rmdir => return Err(Errno::ENOTEMPTY),
-            b"." | b".." => return Err(Errno::EISDIR),
-            _ => {}
-        }
-        if vfs.readonly(&dir) {
-            return Err(Errno::EROFS);
-        }
-        let ipc = cx.kr().ipc(ns);
-        if !ipc.mqueues.contains_key(name) {
-            return Err(Errno::ENOENT);
-        }
-        // unlink of a name ending in / is ENOTDIR before may_delete
-        if !rmdir && path.ends_with(b"/") {
-            return Err(Errno::ENOTDIR);
-        }
-        let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
-        cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
-        if rmdir {
-            // rmdir checks the sticky bit first (may_delete); a queue is not a directory
-            let q = ipc.mqueues[name].borrow().stat();
-            if dir_st.mode & mode::S_ISVTX != 0
-                && cred.fsuid != q.uid
-                && cred.fsuid != dir_st.uid
-                && !cred.capable_wrt(&q, cap::FOWNER)
-            {
-                return Err(Errno::EPERM);
+    let st = vfs.overlay_stat(c)?;
+    if !rmdir && slash {
+        return Err(if st.is_dir() {
+            Errno::EISDIR
+        } else {
+            Errno::ENOTDIR
+        });
+    }
+    let dir_st = vfs.store().attrs(vfs.overlay().node(d).real())?;
+    cred.permission(&dir_st, MAY_EXEC)?;
+    may_delete_attrs(&cred, &dir_st, &st)?;
+    match (rmdir, st.is_dir()) {
+        (true, false) => return Err(Errno::ENOTDIR),
+        (false, true) => return Err(Errno::EISDIR),
+        _ => {}
+    }
+    if vfs.is_point_in(&child, cx.mnt_ns()) {
+        return Err(Errno::EBUSY);
+    }
+    if rmdir && !vfs.overlay_readdir(c)?.is_empty() {
+        return Err(Errno::ENOTEMPTY);
+    }
+    // Account upper-layer tmpfs changes: parent dir copy-up, removed upper entry (and
+    // whiteouts inside a removed upper dir), plus a new whiteout when a lower layer has it.
+    let tmpfs = if let Some(dev) = overlay_upper_tmpfs_dev(vfs, vfs.dev_of(&dir)) {
+        let dir_inodes = overlay_uncopied_dirs(vfs, &[d]);
+        let lower = vfs.overlay().lower_has(vfs.store(), d, name)?;
+        let child_upper = vfs.overlay().node(c).upper;
+        let mut inodes = dir_inodes as i64 + i64::from(lower);
+        let mut victim = None;
+        if let Some(u) = child_upper {
+            if rmdir {
+                inodes -= 1 + vfs.store().readdir(u)?.len() as i64;
+            } else {
+                victim = tmpfs_victim_ino(vfs, dev, u)?;
             }
-            return Err(Errno::ENOTDIR);
         }
-        super::mqueue::remove_queue(cx.k().ipc_mut(ns), &cred, name)
-    })())
+        let keeps_upper = child_upper.is_none()
+            || victim
+                .as_ref()
+                .is_some_and(|v| v.object.is_some() && file_in_use(cx.kr(), vfs, v.ino));
+        let need_inodes = dir_inodes + u64::from(lower && keeps_upper);
+        vfs.tmpfs_check(dev, 0, need_inodes)?;
+        Some(OverlayTmpfsOp {
+            dev,
+            inodes,
+            victim,
+        })
+    } else {
+        None
+    };
+    let child_upper = vfs.overlay().node(c).upper;
+    let lower_has = vfs.overlay().lower_has(vfs.store(), d, name)?;
+    let copied_dirs = if inotify::active(cx.kr()) {
+        overlay_uncopied_chain(vfs, &[d])
+    } else {
+        Vec::new()
+    };
+    vfs.overlay_remove(d, name, rmdir)?;
+    if let Some(op) = tmpfs {
+        op.apply(cx, vfs);
+    }
+    let k = cx.kr();
+    // Report upper-layer changes first (parent dir copy-up, removed upper entry, and any
+    // whiteout created in the upper directory), then the overlay node's events.
+    overlay_copy_up_events(k, vfs, &copied_dirs);
+    let upper_gone = child_upper.map(|u| vfs.store().attrs(u).map_or(0, |s| s.nlink) == 0);
+    let notify_removed = |target: Ino, dir: Ino, gone: bool| {
+        inotify::unlinked(k, target, dir, name);
+        if rmdir {
+            inotify::deleted(k, target, dir, name);
+            inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
+        } else {
+            inotify::path_event(k, target, None, inotify::IN_ATTRIB);
+            if gone {
+                inotify::deleted(k, target, dir, name);
+            }
+            inotify::dir_event(k, dir, name, inotify::IN_DELETE, 0);
+        }
+    };
+    if let Some(up) = vfs.overlay().node(d).upper {
+        if let Some(u) = child_upper {
+            notify_removed(u, up, upper_gone == Some(true));
+        }
+        if lower_has {
+            inotify::dir_event(k, up, name, inotify::IN_CREATE, 0);
+        }
+    }
+    notify_removed(
+        overlay::key(c),
+        overlay::key(d),
+        upper_gone.unwrap_or(st.nlink <= 1),
+    );
+    Ok(())
+}
+
+/// Remove a queue by name. On rmdir the sticky-bit check precedes the queue's type check.
+fn unlink_mq(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    (mnt, ns): (MountId, u64),
+    name: &[u8],
+    rmdir: bool,
+    slash: bool,
+) -> Result<(), Errno> {
+    let dir = Node::Pseudo(mnt, PseudoNode::MqRoot(ns));
+    let cred = cx.cred();
+    check_unlink_name(name, rmdir)?;
+    if vfs.readonly(&dir) {
+        return Err(Errno::EROFS);
+    }
+    let ipc = cx.kr().ipc(ns);
+    let queue = ipc.mqueues.get(name).ok_or(Errno::ENOENT)?;
+    if !rmdir && slash {
+        return Err(Errno::ENOTDIR);
+    }
+    let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
+    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+    if rmdir {
+        let q = queue.borrow().stat();
+        if dir_st.mode & mode::S_ISVTX != 0
+            && cred.fsuid != q.uid
+            && cred.fsuid != dir_st.uid
+            && !cred.capable_wrt(&q, cap::FOWNER)
+        {
+            return Err(Errno::EPERM);
+        }
+        return Err(Errno::ENOTDIR);
+    }
+    super::mqueue::remove_queue(cx.k().ipc_mut(ns), &cred, name)
 }
 
 /// unlink and rmdir in a cgroup directory: rmdir removes a child cgroup
@@ -8346,37 +8361,29 @@ fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Res
 /// unlink).
 fn cgroup_unlink(
     cx: &mut Cx<'_>,
-    dirfd: i32,
-    path: &[u8],
-    flags: u32,
-) -> Option<Result<(), Errno>> {
-    let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
-    let rmdir = flags & AT_REMOVEDIR != 0;
-    Some((|| {
-        match name {
-            b"." if rmdir => return Err(Errno::EINVAL),
-            b".." if rmdir => return Err(Errno::ENOTEMPTY),
-            b"." | b".." => return Err(Errno::EISDIR),
-            _ => {}
-        }
-        let vfs = cx.vfs()?;
-        if vfs.readonly(&dir) {
-            return Err(Errno::EROFS);
-        }
-        let cgroups = &cx.kr().cgroups;
-        let child = cgroups.get(id).and_then(|g| g.children.get(name).copied());
-        let file = cgroups.has_file(id, name);
-        if child.is_none() && !file {
-            return Err(Errno::ENOENT);
-        }
-        cx.cred().permission(&st, MAY_WRITE | MAY_EXEC)?;
-        match (rmdir, child) {
-            (true, Some(c)) => crate::cgroup::rmdir(cx.k(), c),
-            (true, None) => Err(Errno::ENOTDIR),
-            (false, Some(_)) => Err(Errno::EISDIR),
-            (false, None) => Err(Errno::EPERM),
-        }
-    })())
+    vfs: &Vfs,
+    dir: &Node,
+    (id, st): (u64, Stat),
+    name: &[u8],
+    rmdir: bool,
+) -> Result<(), Errno> {
+    check_unlink_name(name, rmdir)?;
+    if vfs.readonly(dir) {
+        return Err(Errno::EROFS);
+    }
+    let cgroups = &cx.kr().cgroups;
+    let child = cgroups.get(id).and_then(|g| g.children.get(name).copied());
+    let file = cgroups.has_file(id, name);
+    if child.is_none() && !file {
+        return Err(Errno::ENOENT);
+    }
+    cx.cred().permission(&st, MAY_WRITE | MAY_EXEC)?;
+    match (rmdir, child) {
+        (true, Some(c)) => crate::cgroup::rmdir(cx.k(), c),
+        (true, None) => Err(Errno::ENOTDIR),
+        (false, Some(_)) => Err(Errno::EISDIR),
+        (false, None) => Err(Errno::EPERM),
+    }
 }
 
 /// When the parent directory is a cgroup directory: `name` is that cgroup's id, its metadata
@@ -8734,14 +8741,19 @@ pub(super) fn renameat2(
     let Some((src, dst, held, replaced)) = change else {
         return Ok(0);
     };
-    let overwritten = dst.map(|d| d.0);
     tmpfs_removed(cx, &vfs, replaced);
     // Detach the mounts of other namespaces on the overwritten target
     let k = cx.kr();
     if !exchange {
         release_if_closed(cx, &vfs, held);
-        detach_points(cx, &vfs, overwritten, (new_dir, new_name));
-        if let Some(ino) = overwritten {
+        if let Some((ino, mask)) = dst {
+            detach_points(
+                cx,
+                &vfs,
+                ino,
+                (new_dir, new_name),
+                mask & inotify::IN_ISDIR != 0,
+            );
             inotify::unlinked(k, ino, new_dir, new_name);
         }
     }
@@ -9053,19 +9065,13 @@ fn release_if_closed(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>) {
 /// namespaces are detached (`detach_mounts` in Linux's vfs_rmdir, vfs_unlink and vfs_rename),
 /// and mounts of it show it as deleted. Removed store directories still referenced by any task's
 /// cwd, root or open directory/path descriptor keep their former name for `/proc/<pid>/cwd`.
-fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>, (dir, name): (Ino, &[u8])) {
-    if let Some(ino) = ino {
-        if vfs
-            .store()
-            .attrs(ino)
-            .is_ok_and(|st| st.is_dir() && st.nlink == 0)
-        {
-            record_removed_dir(cx, vfs, ino, name);
-        }
-        vfs.detach_store_point((ino, dir, name));
-        vfs.roots_removed((ino, dir, name));
-        cx.shared.fast_changed();
+fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Ino, (dir, name): (Ino, &[u8]), removed_dir: bool) {
+    if removed_dir {
+        record_removed_dir(cx, vfs, ino, name);
     }
+    vfs.detach_store_point((ino, dir, name));
+    vfs.roots_removed((ino, dir, name));
+    cx.shared.fast_changed();
 }
 
 /// Records the former name of removed store directory `ino` if any task's cwd, root or open
@@ -9116,7 +9122,7 @@ fn used_store_dirs(cx: &Cx<'_>) -> std::collections::HashSet<Ino> {
 fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino, (dir, name): (Ino, &[u8])) {
     let k = cx.kr();
     inotify::path_event(k, ino, None, inotify::IN_ATTRIB);
-    if store.stat(ino).map_or(0, |st| st.nlink) == 0 {
+    if store.attrs(ino).map_or(0, |st| st.nlink) == 0 {
         inotify::deleted(k, ino, dir, name);
     }
 }
@@ -10271,21 +10277,6 @@ fn resolve_at(
     vfs.resolve(&cx.view(&vfs), cred, &cx.root(), &start, path, follow)
 }
 
-/// Resolves a path to create or delete: returns the mount the parent directory was reached
-/// through, the parent directory and the last component. Only directories in the store can be
-/// modified; whether the mount is read-only is checked by the caller in Linux's order.
-pub(super) fn parent_at<'p>(
-    cx: &Cx<'_>,
-    dirfd: i32,
-    path: &'p [u8],
-) -> Result<(MountId, Ino, &'p [u8]), Errno> {
-    let start = start_dir(cx, dirfd, path)?;
-    let vfs = cx.vfs()?;
-    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
-    let (mnt, dir) = store_dir(&vfs, &dir)?;
-    Ok((mnt, dir, name))
-}
-
 /// renameat2 in a synthetic filesystem (Linux's `do_renameat2` and `vfs_rename`, after the mount
 /// and `.`/`..` checks): a read-only mount is EROFS, a missing source ENOENT (and in procfs a
 /// missing destination too: its lookups fail rather than give a negative dentry), an existing
@@ -10404,7 +10395,7 @@ fn prepare_create_dir(
     }
 }
 
-/// The parent directory of a non-directory name to create ([`parent_at`], used by `unix::bind`):
+/// The parent directory of a non-directory name to create (used by `unix::bind`):
 /// in a directory of a synthetic filesystem an existing name is EEXIST, ahead of the error that
 /// the directory cannot be modified. In an overlay, permissions, trailing slash and tmpfs room are
 /// checked before copying up parent directories.
@@ -10652,12 +10643,16 @@ fn may_delete_attrs(cred: &Cred, dir: &Stat, victim: &Stat) -> Result<(), Errno>
     reject_flags(dir.flags | victim.flags, inode_flags::PROTECTED)
 }
 
-/// Checks before deleting `name` in directory `dir` or moving it away (`may_delete`); returns its
-/// metadata.
-fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat, Errno> {
-    let dir_st = store.stat(dir)?;
+/// Checks directory search permission before a missing name, then deletion permissions.
+fn may_delete(
+    store: &Store,
+    cred: &Cred,
+    dir: Ino,
+    victim: Result<Option<Ino>, Errno>,
+) -> Result<Stat, Errno> {
+    let dir_st = store.attrs(dir)?;
     cred.permission(&dir_st, MAY_EXEC)?;
-    let victim = store.stat(store.lookup(dir, name)?.ok_or(Errno::ENOENT)?)?;
+    let victim = store.attrs(victim?.ok_or(Errno::ENOENT)?)?;
     may_delete_attrs(cred, &dir_st, &victim)?;
     Ok(victim)
 }
@@ -11454,6 +11449,13 @@ mod tests {
     }
 
     fn with_guest(uid: u32, run: impl FnOnce(&mut Cx<'_>, u64, &mut appine_engine::Cpu)) {
+        with_guest_dir(uid, |cx, addr, cpu, _| run(cx, addr, cpu));
+    }
+
+    fn with_guest_dir(
+        uid: u32,
+        run: impl FnOnce(&mut Cx<'_>, u64, &mut appine_engine::Cpu, &std::path::Path),
+    ) {
         use crate::kernel::Shared;
         let dir = std::env::temp_dir().join(format!(
             "appine-fs-{}-{}-{}",
@@ -11477,11 +11479,112 @@ mod tests {
             let k = shared.lock();
             let task = k.tasks[&proc.pid].clone();
             let mut state = task.state.borrow_mut();
-            run(&mut Cx::new(&shared, k, &task, &mut state), buf, &mut cpu);
+            run(
+                &mut Cx::new(&shared, k, &task, &mut state),
+                buf,
+                &mut cpu,
+                &dir,
+            );
         }
         drop(cpu);
         drop(shared);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn map_private_page(cx: &mut Cx<'_>, fd: i32) -> u64 {
+        use crate::mm::flags::MAP_PRIVATE;
+        use appine_engine::{PAGE_SIZE, prot};
+        crate::syscall::mem::mmap(cx, 0, PAGE_SIZE, prot::READ, MAP_PRIVATE, fd, 0).unwrap()
+    }
+
+    #[test]
+    fn mmap_reconciles_other_descriptions_after_a_provider_split() {
+        with_guest_dir(0, |cx, addr, _, dir| {
+            let vfs = cx.vfs().unwrap();
+            let s = vfs.store();
+            let root = crate::vfs::store::ROOT;
+            let (a, host) = s.create_file(root, b"source", 0o600, 0, 0).unwrap();
+            host.write_all_at(b"original", 0).unwrap();
+            let (b, _) = s.create_file(root, b"clone", 0o600, 0, 0).unwrap();
+            s.commit().unwrap();
+            let peer = Store::open(dir, &[]).unwrap();
+            peer.share(a, b).unwrap();
+            let rd = open(cx, addr, b"/clone", oflags::O_RDONLY, 0).unwrap();
+            let wr = open(cx, addr, b"/clone", oflags::O_RDWR, 0).unwrap();
+            let (writer, split) = peer.open_provider_object(b, false, false).unwrap();
+            assert!(split);
+            writer.write_all_at(b"provider", 0).unwrap();
+            drop(peer);
+
+            // The mmap caller already has the current object. The two older descriptions
+            // must move even though the provider has closed without replaying its change.
+            let fresh = open(cx, addr, b"/clone", oflags::O_RDONLY, 0).unwrap();
+            let map = map_private_page(cx, fresh);
+            assert_eq!(&get::<8>(cx, map).unwrap(), b"provider");
+            assert_eq!(pread(cx, rd, addr, 8, 0), Ok(8));
+            assert_eq!(&get::<8>(cx, addr).unwrap(), b"provider");
+            put(cx, addr, *b"from-app").unwrap();
+            assert_eq!(pwrite(cx, wr, addr, 8, 0), Ok(8));
+            assert_eq!(&get::<8>(cx, map).unwrap(), b"from-app");
+            let mut original = [0; 8];
+            host.read_exact_at(&mut original, 0).unwrap();
+            assert_eq!(&original, b"original");
+        });
+    }
+
+    #[test]
+    fn mmap_reads_an_unlinked_tmpfile_after_close() {
+        with_guest(0, |cx, addr, _| {
+            let fd = open(
+                cx,
+                addr,
+                b"/tmp",
+                oflags::O_TMPFILE | oflags::O_EXCL | oflags::O_RDWR,
+                0o600,
+            )
+            .unwrap();
+            put(cx, addr, *b"unlinked").unwrap();
+            assert_eq!(pwrite(cx, fd, addr, 8, 0), Ok(8));
+            let map = map_private_page(cx, fd);
+            close(cx, fd).unwrap();
+            assert_eq!(&get::<8>(cx, map).unwrap(), b"unlinked");
+        });
+    }
+
+    #[test]
+    fn pipe_write_commits_whole_pages_before_fault_or_full_pipe() {
+        with_guest(0, |cx, addr, _| {
+            let page = [42; PIPE_BUF];
+            cx.write_user(UserSlice::new(addr, page.len()), &page)
+                .unwrap();
+            let (reader, _writer) = PipeEnd::pair(2 * PIPE_BUF);
+            let pipe = &reader.pipe;
+            assert_eq!(pipe_write_user(cx, pipe, true, &[(addr, 1)]), Ok(1));
+            assert_eq!(
+                pipe_write_user(cx, pipe, true, &[(addr, 5), (0, 1)]),
+                Err(Errno::EFAULT)
+            );
+            assert_eq!(pipe.borrow().snapshot(8), [42]);
+            // Merge a byte into the tail, publish one full page, then hit capacity.
+            assert_eq!(
+                pipe_write_user(
+                    cx,
+                    pipe,
+                    true,
+                    &[(addr, 1), (addr, PIPE_BUF), (addr, PIPE_BUF)]
+                ),
+                Ok(1 + PIPE_BUF as u64)
+            );
+            assert_eq!(pipe.borrow().writes, 3);
+            assert_eq!(pipe.borrow().snapshot(2 * PIPE_BUF), vec![42; PIPE_BUF + 2]);
+            pipe.borrow_mut().consume(PIPE_BUF + 2, false);
+            assert_eq!(
+                pipe_write_user(cx, pipe, true, &[(addr, PIPE_BUF), (addr, 4), (0, 1)]),
+                Ok(PIPE_BUF as u64)
+            );
+            assert_eq!(pipe.borrow().snapshot(2 * PIPE_BUF), page);
+            assert_eq!(pipe.borrow().writes, 4);
+        });
     }
 
     #[test]

@@ -744,7 +744,7 @@ fn recv_stream(
     sock: &SocketRef,
     (nonblock, peek, deadline): (bool, bool, Option<Instant>),
     max: usize,
-    iovecs: Option<&[(u64, usize)]>,
+    mut iovecs: Option<&[(u64, usize)]>,
     control_len: usize,
     flags: u32,
 ) -> Result<(usize, Message), Errno> {
@@ -762,66 +762,43 @@ fn recv_stream(
     let mut part: Option<Received> = None;
     // Once this read takes credentials, their boundary survives a wait and any later option change.
     let mut checked_cred = None;
+    let mut iov_offset = 0;
     let rx = rx_channel(sock)?;
     let finish = |cx: &mut Cx<'_>, r: Received| {
         let passcred = rx.borrow().passcred;
         Ok((r.len, deliver(cx, r, false, passcred, control_len)))
     };
     loop {
-        let passcred = checked_cred.is_some() || rx.borrow().passcred;
         let copied = part.as_ref().map_or(0, |r| r.len);
         let room = max - copied;
-        let (preview, cred_break, eof, reset) = {
-            let mut c = rx.borrow_mut();
-            let queued = !c.packets.is_empty();
-            let cred_break =
-                checked_cred.is_some_and(|cred| c.packets.front().is_some_and(|h| h.cred != cred));
-            let preview = if cred_break {
-                None
-            } else {
-                Some(c.read_stream(room, true, passcred))
-                    .filter(|r| !r.data.is_empty() || !r.fds.is_empty() || (room == 0 && queued))
-            };
-            // Keep a pending ECONNRESET intact when returning partial data so the next read
-            // reports it instead of seeing EOF
-            let reset = preview.is_none()
-                && !cred_break
-                && if part.is_some() {
-                    c.reset
-                } else {
-                    c.take_reset()
-                };
-            (preview, cred_break, c.eof, reset)
-        };
-        if cred_break {
+        let mut c = rx.borrow_mut();
+        let passcred = checked_cred.is_some() || c.passcred;
+        let queued = !c.packets.is_empty();
+        if checked_cred.is_some_and(|cred| c.packets.front().is_some_and(|h| h.cred != cred)) {
+            drop(c);
             return finish(cx, part.unwrap());
         }
-        if let Some(pre) = preview {
-            let n = if let Some(vecs) = iovecs {
-                match super::net::scatter_partial(cx, vecs, copied, &pre.data) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        return match part {
-                            Some(r) => finish(cx, r),
-                            None => Err(e),
-                        };
-                    }
+        let (mut taken, short_fault) = if let Some(vecs) = &mut iovecs {
+            // Guest writes (including stack growth) run under the BKL. A FUSE miss returns
+            // FUSE_RETRY here. The page fill runs after the channel borrow is released.
+            match c.read_stream_to(room, peek, passcred, |bytes| {
+                super::net::scatter_partial(cx, vecs, &mut iov_offset, bytes)
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    drop(c);
+                    return match part {
+                        Some(r) => finish(cx, r),
+                        None => Err(e),
+                    };
                 }
-            } else {
-                pre.len
-            };
-            let short_fault = n < pre.len;
-            let mut taken = if peek {
-                pre
-            } else {
-                drop(pre);
-                let take_max = if short_fault { n } else { room };
-                rx.borrow_mut().read_stream(take_max, false, passcred)
-            };
-            if iovecs.is_some() {
-                taken.data.clear();
             }
-            taken.len = copied + n;
+        } else {
+            (c.read_stream(room, peek, passcred), false)
+        };
+        if taken.len != 0 || !taken.fds.is_empty() || (room == 0 && queued) {
+            drop(c);
+            taken.len += copied;
             if passcred {
                 checked_cred = Some(taken.cred);
             }
@@ -841,6 +818,14 @@ fn recv_stream(
             part = Some(r);
             continue;
         }
+        // A partial result leaves ECONNRESET pending for the next read.
+        let reset = if part.is_some() {
+            c.reset
+        } else {
+            c.take_reset()
+        };
+        let eof = c.eof;
+        drop(c);
         if reset {
             return match part.take() {
                 Some(r) => finish(cx, r),
@@ -872,47 +857,37 @@ fn recv_packet(
 ) -> Result<(usize, Message), Errno> {
     loop {
         let rx = rx_channel(sock)?;
-        let (preview, eof) = {
-            let mut c = rx.borrow_mut();
-            // A connection reset by the peer (Linux's sk_err): datagram and seqpacket sockets
-            // report it before what is queued (__skb_try_recv_datagram)
-            if c.take_reset() {
-                return Err(Errno::ECONNRESET);
-            }
-            let preview = c.read_packet(max, true);
-            (preview, c.eof)
-        };
-        if let Some(pre) = preview {
-            if let Some(vecs) = iovecs
-                && let Err(e) =
-                    super::net::scatter(vecs, 0, &pre.data, |dst, bytes| cx.mm().write(dst, bytes))
-            {
-                if e == Errno::FUSE_RETRY {
-                    return Err(Errno::FUSE_RETRY);
+        let mut c = rx.borrow_mut();
+        if c.take_reset() {
+            return Err(Errno::ECONNRESET);
+        }
+        if let Some(head) = c.packets.front() {
+            let n = head.data.len().min(max);
+            let buffered = if let Some(vecs) = iovecs {
+                if let Err(e) = super::net::scatter(vecs, 0, &head.data[..n], |dst, bytes| {
+                    cx.mm().write(dst, bytes)
+                }) {
+                    if !peek && e != Errno::FUSE_RETRY {
+                        let dropped = c.read_packet(0, false).unwrap();
+                        drop(c);
+                        if !dropped.fds.is_empty() {
+                            crate::unix::released(cx.k(), dropped.fds);
+                        }
+                    }
+                    return Err(e);
                 }
-                drop(pre);
-                if !peek
-                    && let Some(dropped) = rx.borrow_mut().read_packet(0, false)
-                    && !dropped.fds.is_empty()
-                {
-                    crate::unix::released(cx.k(), dropped.fds);
-                }
-                return Err(e);
-            }
-            let mut r = if peek {
-                pre
+                0
             } else {
-                drop(pre);
-                rx.borrow_mut().read_packet(max, false).unwrap()
+                max
             };
-            let n = r.data.len();
-            let truncated = r.len > n;
-            if iovecs.is_some() {
-                r.data.clear();
-            }
-            let passcred = rx.borrow().passcred;
+            let passcred = c.passcred;
+            let r = c.read_packet(buffered, peek).unwrap();
+            let truncated = n < r.len;
+            drop(c);
             return Ok((n, deliver(cx, r, truncated, passcred, control_len)));
         }
+        let eof = c.eof;
+        drop(c);
         if eof {
             return Ok((0, empty_message()));
         }
@@ -1388,6 +1363,8 @@ mod tests {
         };
     }
 
+    const SO_RCVLOWAT: i32 = 18;
+
     fn with_test_cx(f: impl FnOnce(&mut Cx<'_>, &Rc<Task>)) {
         let mut k = Kernel::new(Tier::Interpreter);
         let (_, _, _cpu) = crate::pseudo::tests::add_task(&mut k, 10, 0, true, b"");
@@ -1527,9 +1504,118 @@ mod tests {
     }
 
     #[test]
-    fn rcvlowat_stream_nonblock_peek_eof_and_dgram_ignored() {
-        const SO_RCVLOWAT: i32 = 18;
+    fn stream_scatter_keeps_iovec_progress_and_pending_reset() {
+        with_test_cx(|cx, _| {
+            let (a, b) = pair_refs(cx, SOCK_STREAM);
+            let page = appine_engine::PAGE_SIZE;
+            let base = 0x4000_0000;
+            cx.mm_mut().map_anonymous(base, 2 * page, 3).unwrap();
+            let head = [1; 64];
+            let body = [2; 8192];
+            send(cx, &a, true, &head, &[], &[], 0).unwrap();
+            send(cx, &a, true, &body, &[], &[], 0).unwrap();
+            let rx = rx_channel(&b).unwrap();
+            rx.borrow_mut().reset = true;
+            set_int_opt(&b, SO_RCVLOWAT, 8192);
+            let vecs = [(0, 0), (base, 17), (base + 17, 8241)];
+            let valid = (2 * page) as usize;
+            for flags in [MSG_PEEK, MSG_WAITALL] {
+                let (n, r) = recv_into(cx, &b, true, &vecs, 0, flags).unwrap();
+                assert_eq!((n, r.len, r.data.capacity()), (valid, valid, 0));
+                let mut data = vec![0; valid];
+                cx.mm()
+                    .read(crate::uaccess::UserSlice::new(base, valid), &mut data)
+                    .unwrap();
+                assert_eq!(&data[..64], &head);
+                assert_eq!(&data[64..], &body[..valid - 64]);
+                assert!(rx.borrow().reset);
+            }
+            let (n, _) = recv_into(cx, &b, true, &[(base, 128)], 0, MSG_WAITALL).unwrap();
+            assert_eq!(n, 8256 - valid);
+            assert_eq!(
+                recv_into(cx, &b, true, &[(base, 1)], 0, 0).err(),
+                Some(Errno::ECONNRESET)
+            );
+            assert!(!rx.borrow().reset);
+        });
+    }
 
+    #[test]
+    fn unix_payload_faults_preserve_retry_and_drop_only_consuming_records() {
+        use crate::mm::{Fill, FillPages, flags};
+        with_test_cx(|cx, _| {
+            let page = appine_engine::PAGE_SIZE;
+            let host = appine_hal::memfd(c"unix-recv-test").unwrap();
+            host.set_len(page).unwrap();
+            let fill = Rc::new(Fill {
+                shared: false,
+                source: OpenFile::new(FileKind::Host(-1), oflags::O_RDWR),
+                pages: FillPages::new(host, page),
+            });
+            let cold = cx
+                .mm_mut()
+                .mmap_fill(0, page, 3, flags::MAP_PRIVATE, (fill, 0))
+                .unwrap();
+            for ty in [SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET] {
+                let (a, b) = pair_refs(cx, ty);
+                send(cx, &a, true, b"queued", &[], &[], 0).unwrap();
+                let rx = rx_channel(&b).unwrap();
+                // The received right is the last external reference to a socket in its own
+                // inbox. Merely dropping the record's file vector would leak that cycle.
+                let (tx, cyclic) = pair_refs(cx, SOCK_STREAM);
+                send(cx, &tx, true, b"x", &[], &[], 0).unwrap();
+                let inbox = rx_channel(&cyclic).unwrap();
+                let file = OpenFile::new(FileKind::Socket(cyclic), oflags::O_RDWR);
+                let weak = Rc::downgrade(&file);
+                for channel in [&inbox, &rx] {
+                    let rights = SendingRights::track(cx.k(), vec![file.clone()]).unwrap();
+                    let files = rights.into_packet(cx.k(), channel);
+                    channel.borrow_mut().packets[0].fds = files;
+                }
+                drop((file, tx, inbox));
+                let charge = with(&a, |u| u.outq());
+                for (addr, flags, error) in [
+                    (cold, MSG_PEEK, Errno::FUSE_RETRY),
+                    (cold, 0, Errno::FUSE_RETRY),
+                    (0, MSG_PEEK, Errno::EFAULT),
+                ] {
+                    assert_eq!(
+                        recv_into(cx, &b, true, &[(addr, 6)], 0, flags).err(),
+                        Some(error)
+                    );
+                    assert_eq!(with(&a, |u| u.outq()), charge);
+                    let c = rx.borrow();
+                    assert_eq!((c.bytes, c.arrivals, c.taken), (6, 1, 0));
+                    assert_eq!(c.packets[0].fds.len(), 1);
+                }
+                assert_eq!(
+                    recv_into(cx, &b, true, &[(0, 6)], 0, 0).err(),
+                    Some(Errno::EFAULT)
+                );
+                if ty == SOCK_STREAM {
+                    assert_eq!(rx.borrow().bytes, 6);
+                    assert!(weak.upgrade().is_some());
+                    assert_eq!(recv(cx, &b, true, 6, 0, 0).unwrap().data, b"queued");
+                } else {
+                    assert!(rx.borrow().packets.is_empty());
+                    assert_eq!(rx.borrow().taken, u64::from(ty == SOCK_DGRAM));
+                    send(cx, &a, true, b"", &[], &[], 0).unwrap();
+                    assert_eq!(recv_into(cx, &b, true, &[], 0, 0).unwrap().0, 0);
+                    send(cx, &a, true, b"hello", &[], &[], 0).unwrap();
+                    for flags in [MSG_PEEK, 0] {
+                        let (n, r) = recv_into(cx, &b, true, &[], 0, flags | MSG_TRUNC).unwrap();
+                        assert_eq!((n, r.len, r.flags & MSG_TRUNC), (0, 5, MSG_TRUNC));
+                    }
+                }
+                assert!(weak.upgrade().is_none());
+                assert_eq!(with(&a, |u| u.outq()), 0);
+            }
+            assert!(crate::mm::take_wanted().is_some());
+        });
+    }
+
+    #[test]
+    fn rcvlowat_stream_nonblock_peek_eof_and_dgram_ignored() {
         with_test_cx(|cx, _| {
             let (a, b) = pair_refs(cx, SOCK_STREAM);
             set_int_opt(&b, SO_RCVLOWAT, 10);

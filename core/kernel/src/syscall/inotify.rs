@@ -290,20 +290,13 @@ impl Drop for Inotify {
         let Ok(mut r) = registry.try_borrow_mut() else {
             return;
         };
-        let user = r.users.entry(self.uid).or_default();
+        let user = r.watches.users.entry(self.uid).or_default();
         user.0 = user.0.saturating_sub(1);
         user.1 = user.1.saturating_sub(self.watches.len());
         for w in self.watches.values() {
-            if let Some(ino) = key_of(&w.node)
-                && let Some(list) = r.by_ino.get_mut(&ino)
-            {
-                // An instance being dropped has no strong references left, so all weak
-                // references to it are dead
-                list.retain(|(weak, _)| weak.strong_count() > 0);
-                if list.is_empty() {
-                    r.by_ino.remove(&ino);
-                    r.doomed.remove(&ino);
-                }
+            if let Some(ino) = key_of(&w.node) {
+                r.watches
+                    .retain_watchers(ino, |(weak, _)| weak.strong_count() > 0);
             }
         }
     }
@@ -316,10 +309,10 @@ pub(super) fn inotify_init1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
     let uid = cx.cred().euid;
     let registry = cx.kr().inotify.clone();
     let mut r = registry.borrow_mut();
-    if r.users.get(&uid).map_or(0, |u| u.0) >= r.max_instances {
+    if r.watches.users.get(&uid).map_or(0, |u| u.0) >= r.max_instances {
         return Err(Errno::EMFILE);
     }
-    r.users.entry(uid).or_default().0 += 1;
+    r.watches.users.entry(uid).or_default().0 += 1;
     let mut inotify = Inotify::default();
     inotify.max_queued = r.max_queued;
     inotify.uid = uid;
@@ -439,15 +432,16 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     }
     let registry = cx.kr().inotify.clone();
     let mut r = registry.borrow_mut();
-    let user = r.users.get(&i.uid).map_or(0, |u| u.1);
+    let user = r.watches.users.get(&i.uid).map_or(0, |u| u.1);
     if user >= r.max_watches {
         return Err(Errno::ENOSPC);
     }
     i.last_wd = i.last_wd.checked_add(1).ok_or(Errno::ENOSPC)?;
-    r.users.entry(i.uid).or_default().1 += 1;
+    r.watches.users.entry(i.uid).or_default().1 += 1;
     let wd = i.last_wd;
     if let Some(ino) = key_of(&watch.node) {
-        r.by_ino
+        r.watches
+            .by_ino
             .entry(ino)
             .or_default()
             .push((Rc::downgrade(&inotify), wd));
@@ -462,15 +456,11 @@ pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
     let w = i.watches.remove(&wd).ok_or(Errno::EINVAL)?;
     i.push(wd, IN_IGNORED, 0, b"");
     let mut r = cx.kr().inotify.borrow_mut();
-    r.uncharge(i.uid);
-    if let Some(ino) = key_of(&w.node)
-        && let Some(list) = r.by_ino.get_mut(&ino)
-    {
-        list.retain(|(weak, w)| !(*w == wd && weak.ptr_eq(&Rc::downgrade(&inotify))));
-        if list.is_empty() {
-            r.by_ino.remove(&ino);
-            r.doomed.remove(&ino);
-        }
+    r.watches.uncharge(i.uid);
+    if let Some(ino) = key_of(&w.node) {
+        r.watches.retain_watchers(ino, |(weak, w)| {
+            *w != wd || weak.as_ptr() != Rc::as_ptr(&inotify)
+        });
     }
     Ok(0)
 }
@@ -535,24 +525,52 @@ pub(super) fn read(
 /// An instance and wd watching some inode.
 type Watcher = (Weak<RefCell<Inotify>>, i32);
 
-/// All watches, by watched inode.
-pub struct Registry {
-    /// The (instance, wd) pairs on each inode: a store inode number, or an overlay, FUSE or
-    /// cgroup2 node key. The weak references die once the instance is closed and are cleared the
-    /// next time they are come across.
+// Store inodes and synthetic node keys are single u64s. Mix their high tag bits into
+// the hash table fingerprint as well as spreading consecutive inode numbers.
+#[derive(Default)]
+struct InodeHasher(u64);
+
+impl std::hash::Hasher for InodeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_u64(&mut self, ino: u64) {
+        self.0 = ino.wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(self.0.rotate_left(5) ^ u64::from(byte));
+        }
+    }
+}
+
+type InodeMap<V> = HashMap<Ino, V, std::hash::BuildHasherDefault<InodeHasher>>;
+
+#[derive(Default)]
+struct Watches {
+    /// The (instance, wd) pairs on each inode or synthetic node key.
     by_ino: HashMap<Ino, Vec<Watcher>>,
-    last_cookie: u32,
-    /// Instance and watch counts per user (effective uid).
+    /// Instance and watch counts per effective uid.
     users: HashMap<u32, (usize, usize)>,
+    /// Open records delaying IN_DELETE_SELF on the last removed link.
+    doomed: InodeMap<Vec<u32>>,
+}
+
+/// All watches and open file descriptions in one kernel.
+pub struct Registry {
+    watches: Watches,
+    last_cookie: u32,
     /// The three limits under `/proc/sys/fs/inotify/`.
     pub max_queued: usize,
     pub max_instances: usize,
     pub max_watches: usize,
-    /// Inodes whose last link has been removed but that still have files open through that name:
-    /// `IN_DELETE_SELF` is reported once those files have all closed.
-    doomed: HashMap<Ino, Vec<Weak<OpenRecord>>>,
-    /// Live file descriptions, including files held by exec rather than in an fd table.
-    opened: BTreeMap<(Ino, usize), Weak<OpenRecord>>,
+    /// Head of each inode's open-record list, including exec and interpreter opens.
+    opened: InodeMap<u32>,
+    records: Vec<OpenRecord>,
+    /// Vacant records form a free list through their next field.
+    free: u32,
     /// Currently stashed nsfs dentry/inode instance per namespace id (Linux's `ns->stashed`).
     ns_stashed: HashMap<u64, Weak<NsPinInner>>,
     /// Monotonic identifier assigned to each newly instantiated nsfs inode.
@@ -562,14 +580,14 @@ pub struct Registry {
 impl Default for Registry {
     fn default() -> Registry {
         Registry {
-            by_ino: HashMap::new(),
+            watches: Watches::default(),
             last_cookie: 0,
-            users: HashMap::new(),
             max_queued: MAX_QUEUED,
             max_instances: MAX_INSTANCES,
             max_watches: MAX_WATCHES,
-            doomed: HashMap::new(),
-            opened: BTreeMap::new(),
+            opened: InodeMap::default(),
+            records: Vec::new(),
+            free: NO_SLOT,
             ns_stashed: HashMap::new(),
             next_ns_instance: 0,
         }
@@ -604,25 +622,48 @@ impl Registry {
             .map_or_else(|| self.alloc_ns_instance(), |existing| existing.instance)
     }
 
-    fn opens_of(&self, ino: Ino) -> impl Iterator<Item = Rc<OpenRecord>> + '_ {
-        self.opened
-            .range((ino, 0)..=(ino, usize::MAX))
-            .filter_map(|(_, f)| f.upgrade())
+    fn for_each_open(&mut self, ino: Ino, mut visit: impl FnMut(u32, &mut OpenRecord)) {
+        let mut slot = self.opened.get(&ino).copied().unwrap_or(NO_SLOT);
+        while slot != NO_SLOT {
+            let record = &mut self.records[slot as usize];
+            visit(slot, record);
+            slot = record.next;
+        }
     }
 
     pub(crate) fn has_open(&self, ino: Ino) -> bool {
-        self.opened
-            .range((ino, 0)..=(ino, usize::MAX))
-            .any(|(_, f)| f.strong_count() > 0)
+        self.opened.contains_key(&ino)
     }
 
     pub(crate) fn watches(&self, ino: Ino) -> bool {
-        self.by_ino.contains_key(&ino)
+        self.watches.by_ino.contains_key(&ino)
     }
 
     /// The inodes (and node keys) with watches on them.
     pub(crate) fn watched(&self) -> impl Iterator<Item = Ino> + '_ {
-        self.by_ino.keys().copied()
+        self.watches.by_ino.keys().copied()
+    }
+
+    fn notify_open(&mut self, slot: u32, mask: u32, exclude_unlinked: bool) {
+        let file = &self.records[slot as usize];
+        self.watches.notify(
+            file.ino,
+            file.dentry(),
+            mask,
+            exclude_unlinked && file.unlinked,
+        );
+    }
+}
+
+impl Watches {
+    fn retain_watchers(&mut self, ino: Ino, keep: impl FnMut(&Watcher) -> bool) {
+        if let Some(list) = self.by_ino.get_mut(&ino) {
+            list.retain(keep);
+            if list.is_empty() {
+                self.by_ino.remove(&ino);
+                self.doomed.remove(&ino);
+            }
+        }
     }
 
     /// An event of `ino` itself: reported first to the watches of its directory `parent` (with
@@ -692,12 +733,11 @@ impl Registry {
 
     /// An open file was closed: if it was the last file opened through a deleted name, report
     /// `IN_DELETE_SELF`.
-    fn closed(&mut self, ino: Ino) {
+    fn closed(&mut self, ino: Ino, slot: u32) {
         let Some(list) = self.doomed.get_mut(&ino) else {
             return;
         };
-        // An open file being dropped has no strong references left
-        list.retain(|f| f.strong_count() > 0);
+        list.retain(|&open| open != slot);
         if list.is_empty() {
             self.doomed.remove(&ino);
             self.notify(ino, None, IN_DELETE_SELF, false);
@@ -708,15 +748,35 @@ impl Registry {
 /// Carried by an open store, overlay or FUSE file: fd-based events are reported to its directory
 /// through it, `unlinked` tracks whether its dentry was unlinked (`IN_EXCL_UNLINK`), and
 /// `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` is reported when the last reference is released.
-#[derive(Clone)]
-pub struct Opened(Rc<OpenRecord>);
-
-struct OpenRecord {
+pub struct Opened {
     registry: Weak<RefCell<Registry>>,
+    slot: u32,
+}
+
+const NO_SLOT: u32 = u32::MAX;
+
+#[derive(Default)]
+struct OpenRecord {
     ino: Ino,
-    parent: RefCell<Option<(Ino, Vec<u8>)>>,
+    parent: Option<Ino>,
+    // Keep the buffer with the slot. Renaming all opens to a longer component must
+    // not allocate while walking the inode's list.
+    name: Vec<u8>,
     close: u32,
-    unlinked: std::cell::Cell<bool>,
+    unlinked: bool,
+    refs: u32,
+    prev: u32,
+    next: u32,
+}
+
+impl OpenRecord {
+    fn dentry(&self) -> Option<(Ino, &[u8])> {
+        self.parent.map(|dir| (dir, self.name.as_slice()))
+    }
+
+    fn at(&self, dir: Ino, name: &[u8]) -> bool {
+        self.parent == Some(dir) && self.name == name
+    }
 }
 
 impl Opened {
@@ -727,43 +787,75 @@ impl Opened {
         close: u32,
         unlinked: bool,
     ) -> Self {
-        let record = Rc::new(OpenRecord {
-            registry: Rc::downgrade(registry),
-            ino,
-            parent: RefCell::new(parent),
-            close,
-            unlinked: unlinked.into(),
-        });
-        let weak = Rc::downgrade(&record);
         let mut r = registry.borrow_mut();
-        if let Some(doomed) = r.doomed.get_mut(&ino) {
-            doomed.push(weak.clone());
+        let slot = if r.free == NO_SLOT {
+            let index = r.records.len();
+            assert!(index < NO_SLOT as usize, "too many open records");
+            r.records.push(OpenRecord::default());
+            index as u32
+        } else {
+            let slot = r.free;
+            r.free = r.records[slot as usize].next;
+            slot
+        };
+        let next = r.opened.insert(ino, slot).unwrap_or(NO_SLOT);
+        if next != NO_SLOT {
+            r.records[next as usize].prev = slot;
         }
-        r.opened.insert((ino, Rc::as_ptr(&record).addr()), weak);
-        Self(record)
+        let record = &mut r.records[slot as usize];
+        record.ino = ino;
+        record.close = close;
+        record.unlinked = unlinked;
+        record.refs = 1;
+        record.prev = NO_SLOT;
+        record.next = next;
+        record.parent = parent.map(|(dir, name)| {
+            let max_name = if crate::vfs::fuse::id_of(ino).is_some() {
+                crate::vfs::fuse::NAME_MAX
+            } else {
+                libc::NAME_MAX as usize
+            };
+            // Final close clears the length, retaining capacity for the next open.
+            record.name.reserve_exact(max_name.max(name.len()));
+            record.name.extend_from_slice(&name);
+            dir
+        });
+        if !r.watches.doomed.is_empty()
+            && let Some(files) = r.watches.doomed.get_mut(&ino)
+        {
+            files.push(slot);
+        }
+        Self {
+            registry: Rc::downgrade(registry),
+            slot,
+        }
     }
 
     pub(crate) fn is_unlinked(&self) -> bool {
-        self.0.unlinked.get()
+        self.registry
+            .upgrade()
+            .is_some_and(|r| r.borrow().records[self.slot as usize].unlinked)
     }
 
     /// The current parent and name in the mount through which this file was opened.
     pub(crate) fn dentry(&self, original: &Node) -> Option<crate::vfs::Dentry> {
-        let parent = self.0.parent.borrow();
-        let (key, name) = parent.as_ref()?;
+        let registry = self.registry.upgrade()?;
+        let r = registry.borrow();
+        let record = &r.records[self.slot as usize];
+        let key = record.parent?;
         let mnt = original.mnt();
         let dir = match original {
-            Node::Store(..) => Node::Store(mnt, *key),
-            Node::Fuse(..) => Node::Fuse(mnt, crate::vfs::fuse::id_of(*key)?),
-            Node::Overlay(..) => Node::Overlay(mnt, overlay::of_key(*key)?),
+            Node::Store(..) => Node::Store(mnt, key),
+            Node::Fuse(..) => Node::Fuse(mnt, crate::vfs::fuse::id_of(key)?),
+            Node::Overlay(..) => Node::Overlay(mnt, overlay::of_key(key)?),
             Node::Pseudo(..) => return None,
         };
-        Some((dir, name.clone()))
+        Some((dir, record.name.clone()))
     }
 
     /// A magic-link reopen has its own last close at the original dentry, even after unlink.
     pub(super) fn reopen(&self, k: &Kernel, writable: bool) -> Self {
-        let (ino, parent, unlinked) = self.location();
+        let (ino, parent, unlinked) = self.location(k);
         Self::open(k, ino, parent, close_mask(writable), unlinked)
     }
 
@@ -776,54 +868,72 @@ impl Opened {
     ) -> Self {
         let open = Self::new(&k.inotify, ino, parent, close, unlinked);
         if active(k) {
-            open.0
-                .notify(&mut k.inotify.borrow_mut(), IN_OPEN, unlinked);
+            k.inotify.borrow_mut().notify_open(open.slot, IN_OPEN, true);
         }
         open
     }
 
-    fn location(&self) -> (Ino, Option<(Ino, Vec<u8>)>, bool) {
+    fn location(&self, k: &Kernel) -> (Ino, Option<(Ino, Vec<u8>)>, bool) {
+        let r = k.inotify.borrow();
+        let file = &r.records[self.slot as usize];
         (
-            self.0.ino,
-            self.0.parent.borrow().clone(),
-            self.is_unlinked(),
+            file.ino,
+            file.parent.map(|dir| (dir, file.name.clone())),
+            file.unlinked,
         )
     }
 }
 
-impl OpenRecord {
-    fn at(&self, dir: Ino, name: &[u8]) -> bool {
-        self.parent
-            .borrow()
-            .as_ref()
-            .is_some_and(|(d, n)| *d == dir && n == name)
-    }
-
-    fn notify(&self, r: &mut Registry, mask: u32, unlinked: bool) {
-        let parent = self.parent.borrow();
-        r.notify(
-            self.ino,
-            parent.as_ref().map(|(d, n)| (*d, n.as_slice())),
-            mask,
-            unlinked,
-        );
+impl Clone for Opened {
+    fn clone(&self) -> Self {
+        if let Some(registry) = self.registry.upgrade() {
+            let mut r = registry.borrow_mut();
+            let refs = &mut r.records[self.slot as usize].refs;
+            *refs = refs
+                .checked_add(1)
+                .expect("open record reference count overflow");
+        }
+        Self {
+            registry: self.registry.clone(),
+            slot: self.slot,
+        }
     }
 }
 
-impl Drop for OpenRecord {
+impl Drop for Opened {
     fn drop(&mut self) {
-        if let Some(registry) = self.registry.upgrade()
-            && let Ok(mut r) = registry.try_borrow_mut()
-        {
-            r.opened
-                .remove(&(self.ino, std::ptr::from_ref(self).addr()));
-            if self.close != 0 && !r.by_ino.is_empty() {
-                self.notify(&mut r, self.close, self.unlinked.get());
-            }
-            if !r.doomed.is_empty() {
-                r.closed(self.ino);
-            }
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut r = registry.borrow_mut();
+        let slot = self.slot;
+        let record = &mut r.records[slot as usize];
+        record.refs -= 1;
+        if record.refs != 0 {
+            return;
         }
+        let (ino, prev, next, close) = (record.ino, record.prev, record.next, record.close);
+        if prev != NO_SLOT {
+            r.records[prev as usize].next = next;
+        } else if next == NO_SLOT {
+            r.opened.remove(&ino);
+        } else {
+            *r.opened.get_mut(&ino).unwrap() = next;
+        }
+        if next != NO_SLOT {
+            r.records[next as usize].prev = prev;
+        }
+        if close != 0 && !r.watches.by_ino.is_empty() {
+            r.notify_open(slot, close, true);
+        }
+        if !r.watches.doomed.is_empty() {
+            r.watches.closed(ino, slot);
+        }
+        let free = r.free;
+        let record = &mut r.records[slot as usize];
+        record.name.clear();
+        record.next = free;
+        r.free = slot;
     }
 }
 
@@ -851,7 +961,7 @@ pub(crate) fn key_of(node: &Node) -> Option<Ino> {
 /// and, when instantiated, on its directory, matching Linux's `kernfs_notify`.
 pub(crate) fn kernfs_modified(k: &Kernel, key: Ino, dir: Option<(Ino, &[u8])>) {
     if let Ok(mut r) = k.inotify.try_borrow_mut() {
-        r.notify(key, dir, IN_MODIFY, false);
+        r.watches.notify(key, dir, IN_MODIFY, false);
     }
 }
 
@@ -911,7 +1021,10 @@ pub(crate) fn path_event_unlinked(
     unlinked: bool,
 ) {
     if !idle(k) {
-        k.inotify.borrow_mut().notify(ino, parent, mask, unlinked);
+        k.inotify
+            .borrow_mut()
+            .watches
+            .notify(ino, parent, mask, unlinked);
     }
 }
 
@@ -926,11 +1039,10 @@ pub(crate) fn file_event(k: &Kernel, f: &OpenFile, mask: u32) {
 /// `fsnotify_access`/`fsnotify_modify` pass the open file's dentry, so watches with
 /// `IN_EXCL_UNLINK` (both directory and file watches) skip events on an unlinked name.
 pub(crate) fn file_io_event(k: &Kernel, f: &OpenFile, mask: u32) {
-    let unlinked = f.dentry_unlinked();
-    file_event_inner(k, f, mask, unlinked);
+    file_event_inner(k, f, mask, true);
 }
 
-fn file_event_inner(k: &Kernel, f: &OpenFile, mask: u32, unlinked: bool) {
+fn file_event_inner(k: &Kernel, f: &OpenFile, mask: u32, exclude_unlinked: bool) {
     if idle(k) {
         return;
     }
@@ -940,9 +1052,9 @@ fn file_event_inner(k: &Kernel, f: &OpenFile, mask: u32, unlinked: bool) {
     let mask = mask | dir;
     let mut registry = k.inotify.borrow_mut();
     if let Some(open) = &f.watch {
-        open.0.notify(&mut registry, mask, unlinked);
+        registry.notify_open(open.slot, mask, exclude_unlinked);
     } else {
-        registry.notify(ino, None, mask, unlinked);
+        registry.watches.notify(ino, None, mask, false);
     }
 }
 
@@ -951,6 +1063,7 @@ pub(crate) fn dir_event(k: &Kernel, dir: Ino, name: &[u8], mask: u32, cookie: u3
     if !idle(k) {
         k.inotify
             .borrow_mut()
+            .watches
             .deliver(dir, mask, cookie, name, false);
     }
 }
@@ -1047,7 +1160,7 @@ impl ExecOpens {
         unlinked: bool,
         source: Option<&Opened>,
     ) {
-        let (ino, parent, unlinked) = source.map(Opened::location).unwrap_or_else(|| {
+        let (ino, parent, unlinked) = source.map(|f| f.location(k)).unwrap_or_else(|| {
             (
                 ino,
                 dentry.and_then(|(dir, name)| Some((key_of(&dir)?, name))),
@@ -1055,7 +1168,11 @@ impl ExecOpens {
             )
         });
         let same = self.files.get(self.next).is_some_and(|(f, _)| {
-            f.0.ino == ino && f.is_unlinked() == unlinked && *f.0.parent.borrow() == parent
+            let r = k.inotify.borrow();
+            let record = &r.records[f.slot as usize];
+            record.ino == ino
+                && record.unlinked == unlinked
+                && record.dentry() == parent.as_ref().map(|(dir, name)| (*dir, name.as_slice()))
         });
         if !same {
             self.close_after(self.next);
@@ -1072,7 +1189,7 @@ impl ExecOpens {
             if active(k) {
                 let mut r = k.inotify.borrow_mut();
                 for _ in *seen..count {
-                    file.0.notify(&mut r, IN_ACCESS, file.is_unlinked());
+                    r.notify_open(file.slot, IN_ACCESS, true);
                 }
             }
             *seen = count;
@@ -1101,8 +1218,13 @@ impl ExecOpens {
 /// file opened through that name as unlinked (`d_unlinked`) so `IN_EXCL_UNLINK` filters its
 /// open/access/modify/close events even when another hard link remains or watches are added later.
 pub(crate) fn unlinked(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
-    for file in k.inotify.borrow().opens_of(ino).filter(|f| f.at(dir, name)) {
-        file.unlinked.set(true);
+    let mut r = k.inotify.borrow_mut();
+    if !r.opened.is_empty() {
+        r.for_each_open(ino, |_, file| {
+            if file.at(dir, name) {
+                file.unlinked = true;
+            }
+        });
     }
 }
 
@@ -1119,30 +1241,32 @@ pub(crate) fn renamed(
         return;
     }
     if let Some(ino) = moved() {
-        for file in k.inotify.borrow().opens_of(ino) {
-            if !file.unlinked.get() && file.at(from.0, from.1) {
-                *file.parent.borrow_mut() = Some((to.0, to.1.to_vec()));
+        k.inotify.borrow_mut().for_each_open(ino, |_, file| {
+            if !file.unlinked && file.at(from.0, from.1) {
+                file.parent = Some(to.0);
+                to.1.clone_into(&mut file.name);
             }
-        }
+        });
     }
 }
 
 /// The last link `name` of `ino` in directory `dir` was removed: report `IN_DELETE_SELF`. While
 /// files opened through this name are still open, it is reported after they have all closed.
 pub(crate) fn deleted(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
-    if !k.inotify.borrow().by_ino.contains_key(&ino) {
+    let mut registry = k.inotify.borrow_mut();
+    if !registry.watches(ino) {
         return;
     }
-    let mut registry = k.inotify.borrow_mut();
-    let open: Vec<_> = registry
-        .opens_of(ino)
-        .filter(|f| f.at(dir, name))
-        .map(|f| Rc::downgrade(&f))
-        .collect();
+    let mut open = Vec::new();
+    registry.for_each_open(ino, |slot, f| {
+        if f.at(dir, name) {
+            open.push(slot);
+        }
+    });
     if open.is_empty() {
-        registry.notify(ino, None, IN_DELETE_SELF, false);
+        registry.watches.notify(ino, None, IN_DELETE_SELF, false);
     } else {
-        registry.doomed.entry(ino).or_default().extend(open);
+        registry.watches.doomed.entry(ino).or_default().extend(open);
     }
 }
 
@@ -1238,7 +1362,7 @@ pub(crate) fn host_change(k: &Kernel, c: &Change) {
 
 /// Whether there are any watches (with none, nothing needs doing for events).
 fn idle(k: &Kernel) -> bool {
-    k.inotify.borrow().by_ino.is_empty()
+    k.inotify.borrow().watches.by_ino.is_empty()
 }
 
 #[cfg(test)]
@@ -1259,7 +1383,8 @@ mod tests {
                 ns_instance: 0,
             },
         );
-        r.by_ino
+        r.watches
+            .by_ino
             .entry(ino)
             .or_default()
             .push((Rc::downgrade(i), wd));
@@ -1278,11 +1403,11 @@ mod tests {
         let i = Rc::new(RefCell::new(Inotify::default()));
         let dir = watch(&mut r, &i, 1, IN_MODIFY | IN_CREATE);
         let file = watch(&mut r, &i, 2, IN_MODIFY | IN_DELETE_SELF);
-        r.notify(2, Some((1, b"f")), IN_MODIFY, false);
+        r.watches.notify(2, Some((1, b"f")), IN_MODIFY, false);
         // Compared only with the event at the tail: only identical ones merge
-        r.notify(2, None, IN_MODIFY, false);
-        r.notify(2, Some((1, b"f")), IN_ATTRIB, false);
-        r.notify(2, Some((1, b"f")), IN_DELETE_SELF, false);
+        r.watches.notify(2, None, IN_MODIFY, false);
+        r.watches.notify(2, Some((1, b"f")), IN_ATTRIB, false);
+        r.watches.notify(2, Some((1, b"f")), IN_DELETE_SELF, false);
         assert_eq!(
             events(&i),
             vec![
@@ -1293,8 +1418,8 @@ mod tests {
             ]
         );
         // The file's watch goes away with IN_DELETE_SELF; the directory's stays
-        assert!(!r.by_ino.contains_key(&2));
-        assert!(r.deliver(1, IN_CREATE | IN_ISDIR, 0, b"d", false));
+        assert!(!r.watches.by_ino.contains_key(&2));
+        assert!(r.watches.deliver(1, IN_CREATE | IN_ISDIR, 0, b"d", false));
         assert_eq!(events(&i), vec![(dir, IN_CREATE | IN_ISDIR, b"d".to_vec())]);
     }
 
@@ -1303,27 +1428,28 @@ mod tests {
         let mut r = Registry::default();
         let i = Rc::new(RefCell::new(Inotify::default()));
         let wd = watch(&mut r, &i, 5, IN_OPEN | IN_ONESHOT);
-        r.notify(5, None, IN_OPEN, false);
-        r.notify(5, None, IN_OPEN | IN_ISDIR, false);
+        r.watches.notify(5, None, IN_OPEN, false);
+        r.watches.notify(5, None, IN_OPEN | IN_ISDIR, false);
         assert_eq!(
             events(&i),
             vec![(wd, IN_OPEN, vec![]), (wd, IN_IGNORED, vec![])]
         );
-        assert!(r.by_ino.is_empty());
+        assert!(r.watches.by_ino.is_empty());
         watch(&mut r, &i, 6, IN_OPEN);
         drop(i);
-        assert!(!r.deliver(6, IN_OPEN, 0, b"", false));
-        assert!(r.by_ino.is_empty());
+        assert!(!r.watches.deliver(6, IN_OPEN, 0, b"", false));
+        assert!(r.watches.by_ino.is_empty());
     }
 
     #[test]
     fn delete_self_waits_for_the_last_close() {
-        let registry = Rc::new(RefCell::new(Registry::default()));
+        let k = Kernel::new(crate::process::Tier::Interpreter);
+        let registry = &k.inotify;
         let i = Rc::new(RefCell::new(Inotify::default()));
         let wd = watch(&mut registry.borrow_mut(), &i, 7, IN_ALL_EVENTS);
         let open = || {
             Opened::new(
-                &registry,
+                registry,
                 7,
                 Some((1, b"f".to_vec())),
                 IN_CLOSE_NOWRITE,
@@ -1331,16 +1457,17 @@ mod tests {
             )
         };
         let (a, b) = (open(), open());
-        registry
-            .borrow_mut()
-            .doomed
-            .insert(7, vec![Rc::downgrade(&a.0), Rc::downgrade(&b.0)]);
+        let other_name = Opened::new(registry, 7, Some((1, b"alias".to_vec())), 0, false);
+        unlinked(&k, 7, 1, b"f");
+        deleted(&k, 7, 1, b"f");
         // An exec through a still-open fd gets a new open after unlink.
         let exe = open();
         drop(a);
         assert_eq!(events(&i), vec![(wd, IN_CLOSE_NOWRITE, vec![])]);
         drop(b);
         assert_eq!(events(&i), vec![(wd, IN_CLOSE_NOWRITE, vec![])]);
+        // Reuse a released slot before the final doomed file closes.
+        let unrelated = Opened::new(registry, 8, None, 0, false);
         drop(exe);
         assert_eq!(
             events(&i),
@@ -1350,7 +1477,81 @@ mod tests {
                 (wd, IN_IGNORED, vec![]),
             ]
         );
-        assert!(registry.borrow().doomed.is_empty());
+        assert!(registry.borrow().watches.doomed.is_empty());
+        assert!(registry.borrow().has_open(7));
+        drop((unrelated, other_name));
+        assert!(!registry.borrow().has_open(7));
+    }
+
+    #[test]
+    fn open_slots_reuse_head_middle_and_tail_without_losing_other_opens() {
+        let registry = Rc::new(RefCell::new(Registry::default()));
+        let open = |ino| Opened::new(&registry, ino, None, 0, false);
+        let tail = open(7);
+        let middle = open(7);
+        let head = open(7);
+        let check = |expected: &[u32]| {
+            let mut slots = Vec::new();
+            registry
+                .borrow_mut()
+                .for_each_open(7, |slot, _| slots.push(slot));
+            assert_eq!(slots, expected);
+        };
+        drop(middle);
+        check(&[head.slot, tail.slot]);
+        let other = open(8);
+        drop(tail);
+        check(&[head.slot]);
+        let new_head = open(7);
+        drop(new_head);
+        check(&[head.slot]);
+        drop(head);
+        assert!(!registry.borrow().has_open(7));
+        for _ in 0..100 {
+            drop(open(7));
+        }
+        assert_eq!(registry.borrow().records.len(), 3);
+        assert!(registry.borrow().has_open(8));
+        drop(registry);
+        drop(other.clone());
+    }
+
+    #[test]
+    fn cloned_opens_follow_unwatched_renames_and_unlinks_until_last_close() {
+        let k = Kernel::new(crate::process::Tier::Interpreter);
+        let node = Node::Store(crate::vfs::ROOT_MOUNT, 7);
+        let file = Opened::new(
+            &k.inotify,
+            7,
+            Some((1, b"old".to_vec())),
+            IN_CLOSE_WRITE,
+            false,
+        );
+        let alias = file.clone();
+        let buffer = k.inotify.borrow().records[file.slot as usize].name.as_ptr();
+        renamed(&k, (1, b"old"), (2, b"longer-name"), || Some(7));
+        assert_eq!(
+            k.inotify.borrow().records[file.slot as usize].name.as_ptr(),
+            buffer
+        );
+        assert_eq!(
+            alias.dentry(&node),
+            Some((Node::Store(node.mnt(), 2), b"longer-name".to_vec()))
+        );
+        unlinked(&k, 7, 2, b"longer-name");
+        renamed(&k, (2, b"longer-name"), (3, b"other"), || Some(7));
+        assert!(file.is_unlinked() && alias.is_unlinked());
+        let i = Rc::new(RefCell::new(Inotify::default()));
+        let wd = watch(&mut k.inotify.borrow_mut(), &i, 2, IN_CLOSE_WRITE);
+        drop(file);
+        assert!(events(&i).is_empty());
+        assert!(k.inotify.borrow().has_open(7));
+        drop(alias);
+        assert_eq!(
+            events(&i),
+            vec![(wd, IN_CLOSE_WRITE, b"longer-name".to_vec())]
+        );
+        assert!(!k.inotify.borrow().has_open(7));
     }
 
     #[test]
@@ -1412,19 +1613,21 @@ mod tests {
         );
         registry
             .borrow_mut()
+            .watches
             .doomed
-            .insert(9, vec![Rc::downgrade(&file.0)]);
+            .insert(9, vec![file.slot]);
         // Dropping the inotify instance removes the last watch on inode 9 and cleans doomed
         drop(i);
-        assert!(registry.borrow().by_ino.is_empty());
-        assert!(registry.borrow().doomed.is_empty());
+        assert!(registry.borrow().watches.by_ino.is_empty());
+        assert!(registry.borrow().watches.doomed.is_empty());
         // Even if a doomed entry remained with no watches left, dropping the last open file clears it
         registry
             .borrow_mut()
+            .watches
             .doomed
-            .insert(9, vec![Rc::downgrade(&file.0)]);
+            .insert(9, vec![file.slot]);
         drop(file);
-        assert!(registry.borrow().doomed.is_empty());
+        assert!(registry.borrow().watches.doomed.is_empty());
     }
 
     #[test]
@@ -1475,16 +1678,20 @@ mod tests {
             IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_EXCL_UNLINK,
         );
         // Linked FUSE child: events are delivered to both directory and file watches
-        r.notify(fuse_file, Some((fuse_dir, b"f")), IN_MODIFY, false);
+        r.watches
+            .notify(fuse_file, Some((fuse_dir, b"f")), IN_MODIFY, false);
         assert_eq!(
             events(&i),
             vec![(d_wd, IN_MODIFY, b"f".to_vec()), (f_wd, IN_MODIFY, vec![]),]
         );
         // Unlinked name: I/O and close are excluded on both watches, while metadata (unlinked=false) is kept
-        r.notify(fuse_file, Some((fuse_dir, b"f")), IN_MODIFY, true);
-        r.notify(fuse_file, Some((fuse_dir, b"f")), IN_CLOSE_WRITE, true);
+        r.watches
+            .notify(fuse_file, Some((fuse_dir, b"f")), IN_MODIFY, true);
+        r.watches
+            .notify(fuse_file, Some((fuse_dir, b"f")), IN_CLOSE_WRITE, true);
         assert!(events(&i).is_empty());
-        r.notify(fuse_file, Some((fuse_dir, b"f")), IN_ATTRIB, false);
+        r.watches
+            .notify(fuse_file, Some((fuse_dir, b"f")), IN_ATTRIB, false);
         assert_eq!(
             events(&i),
             vec![(d_wd, IN_ATTRIB, b"f".to_vec()), (f_wd, IN_ATTRIB, vec![]),]

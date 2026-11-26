@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 12 claims independently checked across watch identity and limits, queue delivery, open and exec lifetimes, overlay and host events)
 >
-> Maintained: 2026-11-26 (targeted refresh: nsfs watch lifetime via `NsPin` and `ns_stashed` matching Linux `fs/nsfs.c`)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: slab-backed open records with intrusive per-key lists and reusable name buffers)
 
 ## Responsibilities
 
@@ -38,19 +38,24 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   limit taken at creation, the creator's effective uid (charged for instances and watches) and a
   weak reference to the `Registry`, from which closing it removes its watches.
 - `Event` — descriptor, mask, cookie and name (padded to 16 bytes).
-- `Registry` (`Kernel::inotify`, one per kernel) — the (instance, descriptor) pairs on each key,
-  the last rename cookie, instance and watch counts per user, the three limits under
-  `/proc/sys/fs/inotify/`, the removed inodes whose `IN_DELETE_SELF` waits for files still open
-  through the removed name (cleaned up when all watches on the key disappear), and the weakly
-  tracked stashed nsfs inode instances (`ns_stashed`) with their monotonic instance counter.
+- `Registry` (`Kernel::inotify`, one per kernel) — watch state in `Watches` (the (instance,
+  descriptor) pairs on each key, per-user instance and watch counts, and `doomed` slot indices for
+  removed inodes whose `IN_DELETE_SELF` waits for files still open through the removed name, cleaned
+  up when all watches on the key disappear), the last rename cookie, the three limits under
+  `/proc/sys/fs/inotify/`, the flat `records` slab with its intrusive `free` list and per-key head
+  index `opened` (hashed with multiplicative `InodeHasher`), and the weakly tracked stashed nsfs
+  inode instances (`ns_stashed`) with their monotonic instance counter.
 - `NsPin` — a shared pin held by open nsfs file descriptions (`OpenFile::ns_pin`, including
   `O_PATH`, `open_tree` and `NS_GET_USERNS`/`NS_GET_PARENT` fds) and nsfs mounts (`Mount::ns_pin`,
   bind mounts and `open_tree(OPEN_TREE_CLONE)` mounts), mirroring Linux's `ns->stashed`. Dropping
   the last pin clears `ns_stashed` without removing existing watches.
-- `Opened` — a shared open record on a file description, an executed image or an ELF interpreter
-  mapping. It holds the file key, opening directory and name, close mask and unlinked flag
-  (`IN_EXCL_UNLINK`). Its last reference reports `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE`.
-  The registry indexes these records weakly by inode and record address.
+- `Opened` — a lightweight `(Weak<RefCell<Registry>>, slot)` handle on a file description, an
+  executed image or an ELF interpreter mapping, ref-counted via `OpenRecord::refs` in the registry
+  slab. Each `OpenRecord` holds the file key, opening directory and pre-reserved `name` buffer
+  (reused across renames and across slot reuse after close), close mask, unlinked flag
+  (`IN_EXCL_UNLINK`), and intrusive doubly-linked list links indexed by `Registry::opened`. Dropping
+  the last reference unlinks the slot, reports `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` (and advances
+  `doomed`), clears `name`, and pushes the slot onto `free`.
 - `ExecOpens` — logical opens and header-read counts retained while a FUSE lookup suspends exec.
   A retry reuses the matching prefix and closes the suffix when the key or dentry changes.
 - Keys: store inode numbers stay below 2^62; overlay nodes take top bits 10 (`overlay::key`, also
@@ -118,7 +123,7 @@ opens in `kernel/files`, executable loading in `kernel/exec`, file I/O in `kerne
   writes, truncation and fallocate (`IN_MODIFY`), reads and getdents (`IN_ACCESS`), the last close
   of an open file (`IN_CLOSE_*`).
 - `IN_EXCL_UNLINK` filters path-based open/access/modify/close events (`path_event_unlinked`,
-  `file_io_event`, `OpenRecord::drop`) on both directory and file watches when the dentry is
+  `file_io_event`, `Opened::drop`) on both directory and file watches when the dentry is
   marked unlinked (by `unlinked` on unlink, rmdir, overwriting rename, or host removal across store,
   overlay and FUSE, or when reopened from an unlinked fd); metadata and truncation calls
   (`file_event`: fchmod, fchown, futimens, ftruncate, fsetxattr/fremovexattr) are not filtered.

@@ -64,6 +64,8 @@ static uint32_t find_memop(const struct appine_dbt *d, uint64_t pc)
 
 static void sync_add(struct syncs *s, const uint32_t *start, const uint32_t *end)
 {
+    if (UNLIKELY(s->n >= sizeof(s->start) / sizeof(s->start[0])))
+        appine_guard_fail();
     s->start[s->n] = (void *)start;
     s->end[s->n] = (void *)end;
     s->n++;
@@ -753,6 +755,14 @@ void appine_dbt_share(struct appine_dbt *d, const struct appine_dbt_source *s, s
     pthread_mutex_unlock(&d->lock);
 }
 
+/* Find the next attachment of this code-group member. Lock held. */
+static struct appine_dbt_thread *find_tag(struct appine_dbt_thread *t, unsigned tag)
+{
+    while (t && t->tag != tag)
+        t = t->next;
+    return t;
+}
+
 struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d, unsigned tag)
 {
     pthread_mutex_lock(&pool.lock);
@@ -786,6 +796,12 @@ struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d, unsigned tag)
     lock_dbt(d, &t->stats);
     t->generation = d->generation;
     dbt_rs_reset(t);
+    if (tag) {
+        struct appine_dbt_thread *peer = find_tag(d->threads, tag);
+        if (peer)
+            __atomic_store_n(&peer->sole_tag, false, __ATOMIC_RELAXED);
+        __atomic_store_n(&t->sole_tag, !peer, __ATOMIC_RELAXED);
+    }
     t->next = d->threads;
     d->threads = t;
     __atomic_store_n(&d->nthreads, d->nthreads + 1, __ATOMIC_RELAXED);
@@ -802,6 +818,12 @@ void appine_dbt_detach(struct appine_dbt_thread *t)
     for (struct appine_dbt_thread **p = &d->threads; *p; p = &(*p)->next) {
         if (*p == t) {
             *p = t->next;
+            if (t->tag && !t->sole_tag) {
+                struct appine_dbt_thread *peer = find_tag(d->threads, t->tag);
+                if (peer && !find_tag(peer->next, t->tag))
+                    __atomic_store_n(&peer->sole_tag, true, __ATOMIC_RELAXED);
+            }
+            t->npending_relinks = 0;
             __atomic_store_n(&d->nthreads, d->nthreads - 1, __ATOMIC_RELAXED);
             break;
         }
@@ -1279,40 +1301,75 @@ static void code_changed(struct appine_dbt_thread *t, const struct appine_cpu *c
  *   the entire instance.
  * - Private blocks (tag != 0, !LINK_SHARED) are only visible in d->table and linkable by threads
  *   with the same tag, so relinking only requires being the sole attached thread of t->tag.
- * Lock held.
+ * A lock-free check is a hint to queue a relink. Recheck under d->lock and complete icache
+ * sync before unlocking, while the set of attachments is stable.
  */
 static bool can_relink_branch(const struct appine_dbt *d, const struct appine_dbt_thread *t,
                               bool shared)
 {
     if (shared || !t->tag)
-        return d->threads == t && !t->next;
-    for (const struct appine_dbt_thread *o = d->threads; o; o = o->next)
-        if (o != t && o->tag == t->tag)
-            return false;
-    return true;
+        return __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1;
+    return __atomic_load_n(&t->sole_tag, __ATOMIC_RELAXED);
 }
 
-/* Patch an already-translated link point; when branch_site is non-NULL the caller holds d->lock
- * with no concurrent reader of that branch (can_relink_branch), and icache sync finishes before
- * returning */
-static void patch_existing_link(const struct appine_dbt *d, uint32_t *site, uint32_t *branch_site,
-                                const uint32_t *target)
+/* Retirement also patches code[ENTRY_CHECK_WORDS]. At that site the CAS replaces only
+ * the original unlinked B, preserving any forwarding branch installed by retirement. */
+static void patch_stub(const struct appine_dbt *d, uint32_t *site, uint32_t b, bool at_entry)
+{
+    if (at_entry) {
+        uint32_t unlinked = enc_b(4);
+        __atomic_compare_exchange_n(rw(d, site), &unlinked, b, false,
+                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    } else {
+        __atomic_store_n(rw(d, site), b, __ATOMIC_RELAXED);
+    }
+}
+
+/* Only B -> B is published lazily. If this thread still executed an already-patched stub,
+ * complete cache maintenance so the old instruction cannot keep causing dispatcher exits. */
+static void patch_existing_link(const struct appine_dbt *d, uint32_t *site, const uint32_t *target,
+                                bool at_entry)
 {
     uint32_t b = enc_b((intptr_t)target - (intptr_t)site);
-    /* Read through the execution address; see relink_word */
-    bool again = __atomic_load_n(site, __ATOMIC_RELAXED) == b;
-    __atomic_store_n(rw(d, site), b, __ATOMIC_RELAXED);
-    bool branch = branch_site && dbt_relink_word(d, branch_site, target);
-    if (again || branch) {
-        /* Already changed (yet this thread still executed the old instruction), or a non-CMODX
-         * conditional branch was rewritten: do one full sync */
-        struct syncs sync = {.n = 0};
-        sync_add(&sync, site, site + 1);
-        if (branch)
-            sync_add(&sync, branch_site, branch_site + 1);
-        dbt_sync_all(d, &sync);
+    if (__atomic_load_n(site, __ATOMIC_RELAXED) == b) {
+        dbt_sync_range(d, site, site + 1);
     } else {
+        patch_stub(d, site, b, at_entry);
         dbt_publish_link(d, site);
+    }
+}
+
+/* Lock held. The caller syncs every rewritten instruction before unlocking. */
+static void drain_relinks(struct appine_dbt_thread *t, struct syncs *sync)
+{
+    struct appine_dbt *d = t->d;
+    if (t->generation == d->generation && t->pending_retire_gen == d->retire_gen) {
+        for (unsigned i = 0; i < t->npending_relinks; i++) {
+            const struct pending_relink *r = &t->pending_relinks[i];
+            if (can_relink_branch(d, t, r->shared) && dbt_relink_word(d, r->branch, r->target))
+                sync_add(sync, r->branch, r->branch + 1);
+        }
+    }
+    t->npending_relinks = 0;
+}
+
+/* The stub already reaches target. Keep conditional shortcuts across syscalls until an install
+ * can sync them with new code, or bound the wait and storage by syncing one full batch. */
+static void queue_relink(struct appine_dbt_thread *t, uint32_t *branch, const uint32_t *target,
+                         bool shared, uint64_t retire_gen)
+{
+    if (t->pending_retire_gen != retire_gen) {
+        t->npending_relinks = 0;
+        t->pending_retire_gen = retire_gen;
+    }
+    t->pending_relinks[t->npending_relinks++] = (struct pending_relink){branch, target, shared};
+    if (t->npending_relinks == PENDING_RELINK_CAP) {
+        struct syncs sync;
+        sync.n = 0;
+        lock_dbt(t->d, &t->stats);
+        drain_relinks(t, &sync);
+        dbt_sync_all(t->d, &sync);
+        unlock_dbt(t->d);
     }
 }
 
@@ -1323,8 +1380,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
     uint64_t (*enter)(struct appine_cpu *, uint32_t *) =
         (uint64_t(*)(struct appine_cpu *, uint32_t *))(uintptr_t)d->enter;
     uint32_t *patch_site = NULL, *patch_branch_site = NULL;
-    uint64_t patch_generation = 0;
-    bool patch_forward = false, patch_shared = false;
+    uint64_t patch_generation = 0, patch_retire_gen = 0;
+    bool patch_forward = false, patch_shared = false, patch_at_entry = false;
     bool fill_jump_cache = false;
 
     /* Model ERET -> BranchAddr(ELR_EL1) on entry to guest code (TBI0). */
@@ -1359,8 +1416,10 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             return APPINE_EXIT_KICK;
         }
 
-        /* Tag of the found block: shared blocks do not link to private blocks (LINK_SHARED) */
-        unsigned found;
+        /* Sample before lookup and execution: a block may be retired while still running,
+         * before its old conditional side exit reaches the dispatcher. */
+        uint64_t retire_gen = __atomic_load_n(&d->retire_gen, __ATOMIC_ACQUIRE);
+        unsigned found; /* shared blocks cannot link to private blocks (LINK_SHARED) */
         uint32_t *code = dbt_table_lookup(d, c, c->pc, &found);
         if (!code && __atomic_load_n(&d->page_parked[page_bucket(c->pc >> APPINE_PAGE_SHIFT)],
                                      __ATOMIC_RELAXED)) {
@@ -1382,7 +1441,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
                 unlock_dbt(d);
                 continue;
             }
-            struct syncs sync = {.n = 0};
+            struct syncs sync;
+            sync.n = 0;
             struct fresh f = {.code = NULL};
             /* When this is the only thread, sync the new block and the link point together once;
              * otherwise sync the new block first and put it in the table, only after which other
@@ -1403,6 +1463,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
                     unlock_dbt(d);
                     continue;
                 }
+                if (t->npending_relinks)
+                    drain_relinks(t, &sync);
                 if (!alone) {
                     dbt_sync_all(d, &sync);
                     dbt_table_insert(d, f.pc, f.tag, f.code, f.guest, f.nguest);
@@ -1413,12 +1475,13 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             uint32_t *target = code && patch_forward ? code + ENTRY_CHECK_WORDS : code;
             if (code && patch_site && patch_generation == d->generation && target != patch_site &&
                 !(patch_shared && found)) {
-                *rw(d, patch_site) = enc_b((intptr_t)target - (intptr_t)patch_site);
+                patch_stub(d, patch_site, enc_b((intptr_t)target - (intptr_t)patch_site), patch_at_entry);
                 /* Conditional branches are not among the instructions CMODX allows to be modified
                  * concurrently: only relink when no other thread can execute this block, and finish
                  * icache sync before unlocking so no newly attached thread can fetch it
                  * concurrently */
-                bool branch = patch_branch_site && can_relink_branch(d, t, patch_shared) &&
+                bool branch = patch_branch_site && patch_retire_gen == d->retire_gen &&
+                              can_relink_branch(d, t, patch_shared) &&
                               dbt_relink_word(d, patch_branch_site, target);
                 if (sync.n || branch) {
                     sync_add(&sync, patch_site, patch_site + 1);
@@ -1444,22 +1507,11 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
              * where the patch would make the entry branch to itself (hence target != patch_site)
              */
             uint32_t *target = patch_forward ? code + ENTRY_CHECK_WORDS : code;
-            if (patch_branch_site &&
-                ((!patch_shared && t->tag) ||
-                 __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1)) {
-                /* Conditional branches are not CMODX-safe: serialize against appine_dbt_attach
-                 * under d->lock and finish icache sync before unlocking */
-                lock_dbt(d, &t->stats);
-                if (!__atomic_load_n(&d->flushing, __ATOMIC_RELAXED) &&
-                    patch_generation == d->generation && target != patch_site &&
-                    !(patch_shared && found)) {
-                    bool relink = can_relink_branch(d, t, patch_shared);
-                    patch_existing_link(d, patch_site, relink ? patch_branch_site : NULL, target);
-                }
-                unlock_dbt(d);
-            } else if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&
-                       target != patch_site && !(patch_shared && found)) {
-                patch_existing_link(d, patch_site, NULL, target);
+            if (patch_generation == t->generation && target != patch_site && !(patch_shared && found)) {
+                patch_existing_link(d, patch_site, target, patch_at_entry);
+                if (patch_branch_site && patch_retire_gen == retire_gen &&
+                    can_relink_branch(d, t, patch_shared))
+                    queue_relink(t, patch_branch_site, target, patch_shared, retire_gen);
             }
             patch_site = NULL;
         }
@@ -1478,16 +1530,18 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         uint64_t reason = enter(c, code);
         switch (reason & REASON_MASK) {
         case R_CHAIN:
-        case R_CHAIN_FWD:
+        case R_CHAIN_FWD: {
             t->stats.exits_chain++;
             patch_site = (uint32_t *)(uintptr_t)c->dbt_site;
-            patch_branch_site = reason >> REASON_BITS & BRANCH_MASK
-                                    ? patch_site - (reason >> REASON_BITS & BRANCH_MASK)
-                                    : NULL;
+            unsigned delta = (reason >> REASON_BITS) & BRANCH_MASK;
+            patch_at_entry = delta == LINK_AT_ENTRY;
+            patch_branch_site = delta && !patch_at_entry ? patch_site - delta : NULL;
             patch_shared = reason & LINK_SHARED;
-            patch_generation = __atomic_load_n(&d->generation, __ATOMIC_RELAXED);
+            patch_generation = t->generation;
+            patch_retire_gen = retire_gen;
             patch_forward = (reason & REASON_MASK) == R_CHAIN_FWD;
             break;
+        }
         case R_LOOKUP:
             t->stats.exits_lookup++;
             fill_jump_cache = true;

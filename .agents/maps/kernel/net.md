@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/net.md` for the paired decision history; it still holds the decisions on netlink sockets (`kernel/netlink`), raw ICMP (`kernel/rawicmp`) and the routing table (`kernel/route`) from before their splits.
 >
 > Verified: 2026-11-26 (full refresh: 5 research concerns; 18 claims checked by an independent verifier — 18 confirmed, 0 partial, 0 refuted, plus 6 map-audit refinements and 4 additional confirmed bugs folded in)
+>
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: connected UDP peer updates via `update_udp_peer` with fast-path checks, reconnect error propagation and `peer_map` clearing)
 
 ## Responsibilities
 
@@ -175,7 +177,10 @@ Remaining IPv6 sends need 24 bytes and AF_INET6, with a raw AF_UNSPEC rewrite. F
 0 gives `EOPNOTSUPP`.
 
 Address-less UDP honors its saved verdict and re-resolves any namespace target. A missing listener drops
-the send with success. A changed endpoint updates `vconn` or attempts host reconnect. For addressed
+the send with success. `update_udp_peer` updates `vconn` in place, or for host-connected sockets skips
+peer verification when `peer_map` matches, `ttl_set` is false and the target namespace reports
+`unique_udp_host_ip`, otherwise verifies the host peer and reconnects on mismatch (clearing `peer_map`
+and returning any host reconnect error). For addressed
 datagrams blocked OUTPUT gives `EPERM`, later drops/rejects return the byte count. Isolated UDP and
 missing namespace listeners drop silently. Reverse DNAT history holds 16 pairs. Wide/initial wildcard
 sources can append IP_PKTINFO/IPV6_PKTINFO unless supplied. Raw and tapped UDP call `before_io`, drain tap
@@ -311,7 +316,7 @@ exists and lacks a resolv.conf entry. Failure only logs. Android Debian import w
 entry.
 
 `stub_capable` requires initial-namespace SOCK_DGRAM, UDP, no raw flag or ICMP state. `is_stub` recognizes
-127.0.0.53:53 and its IPv4-mapped form. Connect sets `stub_peer` and attempts host connect for local
+127.0.0.53:53 and its IPv4-mapped form. Connect sets `stub_peer`, clears `peer_map` and attempts host connect for local
 address/port. Send to the endpoint or address-less send on a stub peer attempts wildcard autobind if
 needed, then bypasses host payload I/O, nft and traffic counters.
 

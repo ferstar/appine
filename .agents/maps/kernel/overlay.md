@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/overlay.md` for the paired decision history (decisions from before the split are D39, D40 and D49 in `.agents/decisions/kernel/vfs.md`, and D45 and D46 in `.agents/decisions/kernel/process.md`).
 >
 > Verified: 2026-11-26 (full refresh; 15 adversarial claims independently verified — 12 confirmed, 3 partial, 0 refuted; all partial statements, audit findings and confirmed bugs applied)
+>
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: per-instance origin, impure and opaque xattr caches with rollback-safe updates and upper-removal eviction)
 
 ## Responsibilities
 
@@ -19,7 +21,8 @@ adapters connect these operations to mounts, open files, permissions, tmpfs quot
   reached. `Overlays` allocates increasing IDs across instances in one VFS. Bind mounts share the
   instance and its node IDs.
 - `Instance`, indexed by overlay device number, holds the upper root, ordered lower roots, mounter
-  filesystem IDs, pinned tmpfs devices, `Options` and an upper-to-lower inode cache (`origins`).
+  filesystem IDs, pinned tmpfs devices, `Options` and per-instance private xattr caches (`origins`
+  storing `Absent`/`Invalid`/`Valid(Ino)`, `impure` booleans, and `opaque` booleans).
 - `OvlNode` holds the parent ID, name, instance device, upper and participating lower inodes,
   validated origin, cached children, recency clock (`seen`) and syscall stamp (`touched`). The
   instance root is its own parent. `real()` selects the upper or first lower inode.
@@ -92,8 +95,10 @@ the private origin xattr. Its exact encoding is `OVL`, version byte 1, then one 
 store inode number. The candidate must be a linked inode of matching type with a positive inode
 number smaller than the upper's, at or beneath a mounted lower root. Non-directories must have
 exactly one lower link. Missing, malformed or stale handles give no origin. Other store errors
-propagate. Lookup caches successful resolutions. A cache hit skips the on-disk validation for that
-instance.
+propagate. `Instance::origin` caches all three outcomes (`Absent`, `Invalid`, `Valid(Ino)`), and
+`lookup`/`readdir` also cache `opaque` (upper and lower directories) and `impure` (upper
+directories) per instance; cache hits skip on-disk xattr reads and validation for that instance.
+`has_origin_xattr` consults `origins` and caches absence on a miss.
 
 `stat` uses the real inode's metadata, the overlay device and the origin inode number when
 available. A directory with more than one participating layer reports one link. Path stat uses the
@@ -125,10 +130,13 @@ parent. The operation recreates the directory, regular file, symlink target or s
 the lower owner, permission bits for directories/files/special nodes, and device number where
 applicable. It copies all xattrs outside the active private prefix and sets the lower inode flags
 on the upper. For a directory or singly linked non-directory it writes the origin handle and marks
-the receiving upper directory `impure=y` in the same operation. It restores the copied inode's
+the receiving upper directory `impure=y` in the same operation (`mark_impure` evicts `dir` from the
+`impure` cache during the transaction so rollback cannot poison it). It restores the copied inode's
 atime/mtime and the upper parent's prior atime/mtime. After success the node gains an upper, and
-a recorded origin enters the instance cache. A non-directory clears its lower vector. A directory
-retains its lower directories. An uncopied regular file truncated to zero uses `NoData`.
+the instance caches `origins` (`Valid(lower)` or `Absent`), `impure: true` on the upper parent when
+an origin was recorded, and `opaque: false` for a copied-up directory. A non-directory clears its
+lower vector. A directory retains its lower directories. An uncopied regular file truncated to zero
+uses `NoData`.
 
 ### Tmpfs accounting
 
@@ -234,9 +242,11 @@ replaced directory. An ordinary move leaves a whiteout at the old name if a lowe
 through. A moved directory becomes opaque when its new parent has lower directories. Exchange
 applies opacity in both directions as needed and leaves no source whiteout. Cross-parent moves
 mark the receiving directory impure by the same origin-presence rule as link, in both directions
-for exchange. The source ID follows its new name. Exchange moves both IDs. Ordinary overwrite
-orphans the displaced ID. Unlink and overwrite drop a cached upper origin on loss of its last
-link. A surviving hard link can still report the same displayed number.
+for exchange. Committed `rename` publishes the newly marked `impure` and `opaque` entries into the
+instance caches. The source ID follows its new name. Exchange moves both IDs. Ordinary overwrite
+orphans the displaced ID. Unlink, rmdir and overwrite drop cached `origins`, `impure` and `opaque`
+entries (`forget_upper`) on directory removal or loss of an upper inode's last link. A surviving
+hard link can still report the same displayed number.
 
 `Vfs::is_point_in` compares overlay IDs across bind aliases within the caller's namespace.
 After removal or ordinary replacement, `detach_overlay_point` marks attached **and detached**
@@ -274,8 +284,9 @@ while the BKL is released. `Overlays::sweep` snapshots the holds before examinin
   is strictly above `max(16384, remaining + max(4096, remaining / 4))`. Calls to `node` and
   `node_mut` update the syscall stamp independently of the lookup-recency clock.
 
-An evicted live name can receive a new ID at its next lookup. The instance origin cache survives
-eviction, and persisted origin handles can restore displayed identity after remount. `Vfs::collect`
+An evicted live name can receive a new ID at its next lookup. The instance private xattr caches
+(`origins`, `impure`, `opaque`) survive eviction, and persisted origin handles can restore displayed
+identity after remount. `Vfs::collect`
 drops an instance and all its nodes only after its device disappears from both attached and
 retained detached overlay mounts. It includes the remaining instances' layer pins when collecting
 tmpfs devices.

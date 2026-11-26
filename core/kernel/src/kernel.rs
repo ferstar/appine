@@ -26,7 +26,7 @@
 //! only by FUTEX_WAKE, signals and the ending of the thread group.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak};
@@ -719,23 +719,20 @@ impl Kernel {
 
     /// The open files in all fd tables. An open file in several fd tables appears that many times.
     pub(crate) fn open_files(&self) -> Vec<FileRef> {
-        let mut tables: Vec<Rc<RefCell<FdTable>>> = Vec::new();
+        self.open_files_matching(|_| true)
+    }
+
+    pub(crate) fn open_files_matching(
+        &self,
+        mut matches: impl FnMut(&FileRef) -> bool,
+    ) -> Vec<FileRef> {
+        let mut tables = HashSet::new();
         let mut files = Vec::new();
-        for t in self.tasks.values() {
-            let fds = t.res.borrow().fds.clone();
-            if tables.iter().any(|p| Rc::ptr_eq(p, &fds)) {
-                continue;
+        for task in self.tasks.values() {
+            let res = task.res.borrow();
+            if tables.insert(Rc::as_ptr(&res.fds)) {
+                files.extend(res.fds.borrow().files().filter(|f| matches(f)).cloned());
             }
-            {
-                let table = fds.borrow();
-                files.extend(
-                    table
-                        .open_fds()
-                        .into_iter()
-                        .filter_map(|fd| table.get(fd).ok()),
-                );
-            }
-            tables.push(fds);
         }
         files
     }

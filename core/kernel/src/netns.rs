@@ -16,7 +16,9 @@
 //! `RTM_NEWLINK`) and interface ioctls, which is how bubblewrap brings lo up.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
@@ -750,6 +752,17 @@ pub(crate) struct Binding {
     wide: bool,
 }
 
+impl Binding {
+    fn endpoint(&self, [a, b]: [u8; 2]) -> ([u8; 4], u16) {
+        let ip = if self.wide {
+            [127, a, b, 1]
+        } else {
+            self.host_ip
+        };
+        (ip, self.host_port)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Lingered {
     guest_port: u16,
@@ -760,9 +773,47 @@ struct Lingered {
 /// Per-namespace table of bound TCP/UDP sockets and host-port mappings in a new network namespace.
 #[derive(Debug, Default)]
 pub(crate) struct Bindings {
-    entries: Vec<Binding>,
+    entries: HashMap<u64, Binding>,
+    by_guest_port: PortIndex,
+    by_host_port: PortIndex,
+    /// First effective host IP per UDP guest port, or None once the port has used several.
+    /// Outlives the bindings because a connected client can outlive its listener.
+    udp_host_ips: HashMap<u16, Option<[u8; 4]>>,
+    released: VecDeque<(Instant, HostEndpoint)>,
     /// Recently released `(proto, host_ip, host_port)` entries kept for [`LINGER`].
-    linger: std::collections::HashMap<(i32, [u8; 4], u16), Lingered>,
+    linger: HashMap<HostEndpoint, Lingered>,
+}
+
+type HostEndpoint = (i32, [u8; 4], u16);
+
+/// Binding IDs stay in registration order so lookups can prefer the newest match.
+type PortIndex = HashMap<(i32, u16), Vec<u64>>;
+
+impl Bindings {
+    fn on_port<'a>(
+        &'a self,
+        index: &'a PortIndex,
+        proto: i32,
+        port: u16,
+    ) -> impl DoubleEndedIterator<Item = &'a Binding> + Clone {
+        index
+            .get(&(proto, port))
+            .into_iter()
+            .flatten()
+            .map(|id| &self.entries[id])
+    }
+
+    pub fn unique_udp_host_ip(&self, port: u16) -> bool {
+        matches!(self.udp_host_ips.get(&port), Some(Some(_)))
+    }
+}
+
+fn remove_from_port(index: &mut PortIndex, key: (i32, u16), id: u64) {
+    let ids = index.get_mut(&key).expect("registered port");
+    ids.retain(|&other| other != id);
+    if ids.is_empty() {
+        index.remove(&key);
+    }
 }
 
 /// Whether `req` conflicts with any existing binding in `me` (excluding `skip_id`, used when a
@@ -770,22 +821,25 @@ pub(crate) struct Bindings {
 /// `udp_lib_lport_inuse` (UDP).
 pub(crate) fn bind_conflict(me: &NetNs, req: &BindReq, skip_id: Option<u64>) -> bool {
     let is_tcp = req.proto == crate::net::IPPROTO_TCP;
-    me.listeners.borrow().entries.iter().any(|b| {
-        if Some(b.id) == skip_id || b.proto != req.proto || b.guest_port != req.guest_port {
-            return false;
-        }
-        // Sockets bound to two distinct devices never conflict (Linux's inet_csk_bind_conflict /
-        // udp_lib_lport_inuse).
-        if req.bound_dev_if != 0 && b.bound_dev_if != 0 && req.bound_dev_if != b.bound_dev_if {
-            return false;
-        }
-        if !addrs_overlap(req.addr, req.v6only, b.addr, b.v6only) {
-            return false;
-        }
-        let reuse_ok = req.reuseaddr && b.reuseaddr && !(is_tcp && b.listening);
-        let rport_ok = req.reuseport && b.reuseport && req.euid == b.euid;
-        !reuse_ok && !rport_ok
-    })
+    let bindings = me.listeners.borrow();
+    bindings
+        .on_port(&bindings.by_guest_port, req.proto, req.guest_port)
+        .any(|b| {
+            if Some(b.id) == skip_id {
+                return false;
+            }
+            // Sockets bound to two distinct devices never conflict (Linux's inet_csk_bind_conflict /
+            // udp_lib_lport_inuse).
+            if req.bound_dev_if != 0 && b.bound_dev_if != 0 && req.bound_dev_if != b.bound_dev_if {
+                return false;
+            }
+            if !addrs_overlap(req.addr, req.v6only, b.addr, b.v6only) {
+                return false;
+            }
+            let reuse_ok = req.reuseaddr && b.reuseaddr && !(is_tcp && b.listening);
+            let rport_ok = req.reuseport && b.reuseport && req.euid == b.euid;
+            !reuse_ok && !rport_ok
+        })
 }
 
 /// Checks whether the already-registered TCP binding `id` conflicts with any other binding in `me`
@@ -794,19 +848,16 @@ pub(crate) fn bind_conflict(me: &NetNs, req: &BindReq, skip_id: Option<u64>) -> 
 pub(crate) fn listen_conflict(me: &NetNs, id: std::num::NonZeroU64) -> bool {
     let req = {
         let b = me.listeners.borrow();
-        b.entries
-            .iter()
-            .find(|e| e.id == id.get())
-            .map(|e| BindReq {
-                proto: e.proto,
-                guest_port: e.guest_port,
-                addr: e.addr,
-                v6only: e.v6only,
-                reuseaddr: e.reuseaddr,
-                reuseport: e.reuseport,
-                euid: e.euid,
-                bound_dev_if: e.bound_dev_if,
-            })
+        b.entries.get(&id.get()).map(|e| BindReq {
+            proto: e.proto,
+            guest_port: e.guest_port,
+            addr: e.addr,
+            v6only: e.v6only,
+            reuseaddr: e.reuseaddr,
+            reuseport: e.reuseport,
+            euid: e.euid,
+            bound_dev_if: e.bound_dev_if,
+        })
     };
     req.is_some_and(|r| bind_conflict(me, &r, Some(id.get())))
 }
@@ -817,22 +868,24 @@ pub(crate) fn listen_conflict(me: &NetNs, id: std::num::NonZeroU64) -> bool {
 /// distinct host ports so they never collide on `127.a.b.1`.
 pub(crate) fn shared_host_port(me: &NetNs, req: &BindReq, host_ip: [u8; 4]) -> Option<u16> {
     let is_udp = req.proto == crate::net::IPPROTO_UDP;
-    me.listeners.borrow().entries.iter().rev().find_map(|b| {
-        if b.proto != req.proto
-            || b.guest_port != req.guest_port
-            || b.addr != req.addr
-            || b.v6only != req.v6only
-            || b.bound_dev_if != req.bound_dev_if
-            || b.host_ip != host_ip
-            || b.wide
-            || b.accepted
-        {
-            return None;
-        }
-        let share = (req.reuseport && b.reuseport && req.euid == b.euid)
-            || (is_udp && req.reuseaddr && b.reuseaddr);
-        share.then_some(b.host_port)
-    })
+    let bindings = me.listeners.borrow();
+    bindings
+        .on_port(&bindings.by_guest_port, req.proto, req.guest_port)
+        .rev()
+        .find_map(|b| {
+            if b.addr != req.addr
+                || b.v6only != req.v6only
+                || b.bound_dev_if != req.bound_dev_if
+                || b.host_ip != host_ip
+                || b.wide
+                || b.accepted
+            {
+                return None;
+            }
+            let share = (req.reuseport && b.reuseport && req.euid == b.euid)
+                || (is_udp && req.reuseaddr && b.reuseaddr);
+            share.then_some(b.host_port)
+        })
 }
 
 /// Registers a bound socket in `me` at `guest_port` and returns its unique binding ID.
@@ -858,7 +911,24 @@ pub(crate) fn add_binding(me: &NetNs, guest_port: u16, entry: NewBinding) -> std
     let mut b = me.listeners.borrow_mut();
     b.linger
         .remove(&(binding.proto, binding.host_ip, binding.host_port));
-    b.entries.push(binding);
+    if binding.proto == crate::net::IPPROTO_UDP
+        && let Some(block) = me.host_net
+    {
+        let ip = binding.endpoint(block).0;
+        let unique = b.udp_host_ips.entry(guest_port).or_insert(Some(ip));
+        if *unique != Some(ip) {
+            *unique = None;
+        }
+    }
+    b.by_guest_port
+        .entry((binding.proto, guest_port))
+        .or_default()
+        .push(id);
+    b.by_host_port
+        .entry((binding.proto, binding.host_port))
+        .or_default()
+        .push(id);
+    b.entries.insert(id, binding);
     std::num::NonZeroU64::new(id).expect("starts at 1")
 }
 
@@ -872,11 +942,7 @@ pub(crate) fn add_ephemeral(
 ) -> (u16, std::num::NonZeroU64) {
     let guest_port = {
         let b = me.listeners.borrow();
-        let in_use = |p: u16| {
-            b.entries
-                .iter()
-                .any(|e| e.proto == entry.proto && e.guest_port == p)
-        };
+        let in_use = |p| b.by_guest_port.contains_key(&(entry.proto, p));
         if !in_use(entry.host_port) {
             entry.host_port
         } else {
@@ -900,19 +966,38 @@ pub(crate) fn remove_binding(me: &NetNs, id: std::num::NonZeroU64) {
     let Ok(mut b) = me.listeners.try_borrow_mut() else {
         return;
     };
-    let Some(pos) = b.entries.iter().position(|e| e.id == id.get()) else {
+    let Some(removed) = b.entries.remove(&id.get()) else {
         return;
     };
-    let removed = b.entries.swap_remove(pos);
-    let still_live = b.entries.iter().any(|e| {
-        e.proto == removed.proto && e.host_ip == removed.host_ip && e.host_port == removed.host_port
-    });
+    remove_from_port(
+        &mut b.by_guest_port,
+        (removed.proto, removed.guest_port),
+        removed.id,
+    );
+    remove_from_port(
+        &mut b.by_host_port,
+        (removed.proto, removed.host_port),
+        removed.id,
+    );
+    let still_live = b
+        .on_port(&b.by_host_port, removed.proto, removed.host_port)
+        .any(|e| e.host_ip == removed.host_ip);
     if !still_live {
-        let now = std::time::Instant::now();
-        b.linger
-            .retain(|_, v| now.duration_since(v.released) < LINGER);
+        let now = Instant::now();
+        while let Some(&(released, key)) = b.released.front() {
+            if now.duration_since(released) < LINGER {
+                break;
+            }
+            b.released.pop_front();
+            // The endpoint may have been rebound and released again since this entry.
+            if b.linger.get(&key).is_some_and(|l| l.released == released) {
+                b.linger.remove(&key);
+            }
+        }
+        let key = (removed.proto, removed.host_ip, removed.host_port);
+        b.released.push_back((now, key));
         b.linger.insert(
-            (removed.proto, removed.host_ip, removed.host_port),
+            key,
             Lingered {
                 guest_port: removed.guest_port,
                 addr: removed.addr,
@@ -924,13 +1009,7 @@ pub(crate) fn remove_binding(me: &NetNs, id: std::num::NonZeroU64) {
 
 /// Updates the `listening` state of binding `id` (TCP `listen()` / `shutdown()`).
 pub(crate) fn set_listening(me: &NetNs, id: std::num::NonZeroU64, listening: bool) {
-    if let Some(e) = me
-        .listeners
-        .borrow_mut()
-        .entries
-        .iter_mut()
-        .find(|e| e.id == id.get())
-    {
+    if let Some(e) = me.listeners.borrow_mut().entries.get_mut(&id.get()) {
         e.listening = listening;
     }
 }
@@ -938,13 +1017,7 @@ pub(crate) fn set_listening(me: &NetNs, id: std::num::NonZeroU64, listening: boo
 /// Updates `SO_REUSEADDR` (`reuseport == false`) or `SO_REUSEPORT` (`reuseport == true`) on
 /// binding `id`.
 pub(crate) fn set_reuse(me: &NetNs, id: std::num::NonZeroU64, reuseport: bool, on: bool) {
-    if let Some(e) = me
-        .listeners
-        .borrow_mut()
-        .entries
-        .iter_mut()
-        .find(|e| e.id == id.get())
-    {
+    if let Some(e) = me.listeners.borrow_mut().entries.get_mut(&id.get()) {
         if reuseport {
             e.reuseport = on;
         } else {
@@ -955,13 +1028,7 @@ pub(crate) fn set_reuse(me: &NetNs, id: std::num::NonZeroU64, reuseport: bool, o
 
 /// Updates the `SO_BINDTODEVICE` / `SO_BINDTOIFINDEX` index on binding `id`.
 pub(crate) fn set_bound_dev(me: &NetNs, id: std::num::NonZeroU64, bound_dev_if: i32) {
-    if let Some(e) = me
-        .listeners
-        .borrow_mut()
-        .entries
-        .iter_mut()
-        .find(|e| e.id == id.get())
-    {
+    if let Some(e) = me.listeners.borrow_mut().entries.get_mut(&id.get()) {
         e.bound_dev_if = bound_dev_if;
     }
 }
@@ -983,10 +1050,9 @@ pub(crate) fn resolve_target(t: &NetNs, proto: i32, dst: &[u8]) -> Option<([u8; 
     if want_v4.is_none() && want_v6.is_none() {
         return None;
     }
-    let has_dev_bound =
-        t.listeners.borrow().entries.iter().any(|e| {
-            e.proto == proto && e.guest_port == port && e.listening && e.bound_dev_if != 0
-        });
+    let bindings = t.listeners.borrow();
+    let on_port = bindings.on_port(&bindings.by_guest_port, proto, port);
+    let has_dev_bound = on_port.clone().any(|e| e.listening && e.bound_dev_if != 0);
     let dst_if: Option<i32> = if !has_dev_bound {
         None
     } else if want_v4.is_some_and(|ip| ip[0] == 127)
@@ -1004,16 +1070,12 @@ pub(crate) fn resolve_target(t: &NetNs, proto: i32, dst: &[u8]) -> Option<([u8; 
     };
     let dev_ok =
         |e: &Binding| e.bound_dev_if == 0 || dst_if.is_none_or(|idx| e.bound_dev_if == idx);
-    let bindings = t.listeners.borrow();
-    let endpoint = |e: &Binding| {
-        let ip = if e.wide { [127, a, b, 1] } else { e.host_ip };
-        (ip, e.host_port)
-    };
+    let endpoint = |e: &Binding| e.endpoint([a, b]);
     // Prefer device-bound matches over unbound matches within each address-specificity tier.
     let pick = |pred: &dyn Fn(&Binding) -> bool| -> Option<&Binding> {
         let mut best: Option<&Binding> = None;
-        for e in bindings.entries.iter().rev() {
-            if e.proto != proto || e.guest_port != port || !e.listening || !dev_ok(e) || !pred(e) {
+        for e in on_port.clone().rev() {
+            if !e.listening || !dev_ok(e) || !pred(e) {
                 continue;
             }
             if dst_if.is_some_and(|idx| e.bound_dev_if == idx) {
@@ -1073,17 +1135,11 @@ pub(crate) fn lookup_host(
     host_port: u16,
 ) -> Option<(u16, BindAddr)> {
     let b = owner.listeners.borrow();
-    if let Some(e) = b
-        .entries
-        .iter()
-        .rev()
-        .find(|e| e.proto == proto && e.host_port == host_port && e.host_ip == host_ip)
-        .or_else(|| {
-            b.entries
-                .iter()
-                .rev()
-                .find(|e| e.proto == proto && e.host_port == host_port && e.wide)
-        })
+    let mut live = b.on_port(&b.by_host_port, proto, host_port).rev();
+    if let Some(e) = live
+        .clone()
+        .find(|e| e.host_ip == host_ip)
+        .or_else(|| live.find(|e| e.wide))
     {
         return Some((e.guest_port, e.addr));
     }
@@ -1103,11 +1159,18 @@ pub(crate) fn host_ipv4(addr: &[u8]) -> [u8; 4] {
 
 /// Rewrites `addr`'s IPv4 (or IPv4-mapped IPv6) address to `ip` and its port to `port`.
 pub(crate) fn with_host_endpoint(addr: &[u8], ip: [u8; 4], port: u16) -> Vec<u8> {
-    let mut out = with_ipv4(addr, ip);
-    if out.len() >= 4 {
-        out[2..4].copy_from_slice(&port.to_be_bytes());
-    }
+    let mut out = addr.to_vec();
+    set_host_endpoint(&mut out, ip, port);
     out
+}
+
+pub(crate) fn set_host_endpoint(addr: &mut [u8], ip: [u8; 4], port: u16) {
+    set_ipv4(addr, ip);
+    addr[2..4].copy_from_slice(&port.to_be_bytes());
+}
+
+pub(crate) fn matches_host_endpoint(addr: &[u8], ip: [u8; 4], port: u16) -> bool {
+    ipv4_of(addr) == Some(ip) && addr[2..4] == port.to_be_bytes()
 }
 
 // ---- Sending to its own virtual address ----
@@ -1954,7 +2017,12 @@ fn ipv4_of(addr: &[u8]) -> Option<[u8; 4]> {
 /// scope id cleared).
 fn with_ipv4(addr: &[u8], ip: [u8; 4]) -> Vec<u8> {
     let mut out = addr.to_vec();
-    if family(addr) == Some(AF_INET) {
+    set_ipv4(&mut out, ip);
+    out
+}
+
+fn set_ipv4(out: &mut [u8], ip: [u8; 4]) {
+    if family(out) == Some(AF_INET) {
         out[4..8].copy_from_slice(&ip);
     } else {
         out[8..18].fill(0);
@@ -1964,7 +2032,6 @@ fn with_ipv4(addr: &[u8], ip: [u8; 4]) -> Vec<u8> {
             s.fill(0);
         }
     }
-    out
 }
 
 fn family(addr: &[u8]) -> Option<i32> {
@@ -2656,6 +2723,121 @@ mod tests {
             None
         ));
         remove_binding(&n, id_u);
+    }
+
+    #[test]
+    fn port_indexes_keep_insertion_order_and_device_priority_after_removal() {
+        let n = ns();
+        let ip = [127, 1, 2, 1];
+        let dst = v4([127, 0, 0, 1], 7000);
+        for (proto, reuseport) in [
+            (crate::net::IPPROTO_TCP, true),
+            (crate::net::IPPROTO_UDP, false),
+        ] {
+            let bind =
+                |guest, host| bind_listener(&n, proto, guest, BindAddr::AnyV4, false, ip, host);
+            let unrelated = bind(6999, 40999);
+            let older = bind(7000, 41000);
+            let newer = bind(7000, 41001);
+            remove_binding(&n, unrelated);
+            for id in [older, newer] {
+                set_reuse(&n, id, reuseport, true);
+            }
+            let req = BindReq {
+                proto,
+                guest_port: 7000,
+                addr: BindAddr::AnyV4,
+                v6only: false,
+                reuseport,
+                reuseaddr: !reuseport,
+                euid: 0,
+                bound_dev_if: 0,
+            };
+            assert_eq!(shared_host_port(&n, &req, ip), Some(41001));
+            assert_eq!(resolve_target(&n, proto, &dst), Some((ip, 41001)));
+            set_bound_dev(&n, older, LO_INDEX as i32);
+            assert_eq!(resolve_target(&n, proto, &dst), Some((ip, 41000)));
+            remove_binding(&n, older);
+            assert_eq!(resolve_target(&n, proto, &dst), Some((ip, 41001)));
+            remove_binding(&n, newer);
+            let b = n.listeners.borrow();
+            assert!(
+                b.by_guest_port.is_empty() && b.by_host_port.is_empty() && b.entries.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_lookup_prefers_live_exact_and_expires_linger_between_prunes() {
+        let n = ns();
+        let udp = crate::net::IPPROTO_UDP;
+        let ip = [127, 1, 2, 2];
+        let addr = BindAddr::V4([127, 0, 0, 2]);
+        let key = (udp, ip, 41000);
+        let older = bind_listener(&n, udp, 7000, addr, false, ip, 41000);
+        let newer = bind_listener(&n, udp, 7001, addr, false, ip, 41000);
+        assert!(n.listeners.borrow().unique_udp_host_ip(7000));
+        let wide = add_binding(
+            &n,
+            7000,
+            NewBinding {
+                proto: udp,
+                addr: BindAddr::AnyV4,
+                v6only: false,
+                reuseaddr: true,
+                reuseport: false,
+                euid: 0,
+                bound_dev_if: 0,
+                listening: true,
+                accepted: false,
+                host_ip: [0; 4],
+                host_port: 41000,
+                wide: true,
+            },
+        );
+        assert!(!n.listeners.borrow().unique_udp_host_ip(7000));
+        assert_eq!(lookup_host(&n, udp, ip, 41000), Some((7001, addr)));
+        remove_binding(&n, newer);
+        assert!(!n.listeners.borrow().linger.contains_key(&key));
+        assert_eq!(lookup_host(&n, udp, ip, 41000), Some((7000, addr)));
+        remove_binding(&n, older);
+        assert_eq!(
+            lookup_host(&n, udp, ip, 41000),
+            Some((7000, BindAddr::AnyV4))
+        );
+        remove_binding(&n, wide);
+        assert_eq!(lookup_host(&n, udp, ip, 41000), Some((7000, addr)));
+
+        {
+            let mut b = n.listeners.borrow_mut();
+            let first = b.released.front_mut().unwrap();
+            assert_eq!(first.1, key);
+            first.0 -= LINGER;
+            let expired = first.0;
+            b.linger.get_mut(&key).unwrap().released = expired;
+        }
+        assert_eq!(lookup_host(&n, udp, ip, 41000), None);
+        let other = bind_listener(&n, udp, 7002, addr, false, ip, 41002);
+        remove_binding(&n, other);
+        assert!(!n.listeners.borrow().linger.contains_key(&key));
+        assert_eq!(
+            lookup_host(&n, udp, ip, 41000),
+            Some((7000, BindAddr::AnyV4))
+        );
+
+        // An expired FIFO entry for a reused endpoint must not remove its new reverse mapping.
+        let rebound = bind_listener(&n, udp, 7000, addr, false, ip, 41002);
+        assert!(!n.listeners.borrow().unique_udp_host_ip(7000));
+        remove_binding(&n, rebound);
+        {
+            let mut b = n.listeners.borrow_mut();
+            for (time, _) in b.released.iter_mut().take(2) {
+                *time -= LINGER;
+            }
+        }
+        let last = bind_listener(&n, udp, 7003, addr, false, ip, 41003);
+        remove_binding(&n, last);
+        assert_eq!(lookup_host(&n, udp, ip, 41002), Some((7000, addr)));
     }
 
     /// Ephemeral binds avoid aliasing explicit guest ports, block conflicting explicit binds until

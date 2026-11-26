@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification of fork rollback, CoW fault and mprotect permissions, and loan retention on page-table allocation failure)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: eager anonymous write-probe freeze on fork, ForkFileView reuse, and single-pass small private-file pagemap sampling)
 
 ## Responsibilities
 
@@ -68,10 +68,14 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 - Private writable mmap or mprotect sets `accounted` unless the mapping has `MAP_NORESERVE`.
   Removing write permission preserves the charge. Forced kernel writes alone do not charge it.
   Splits, moves, extensions, DONTUNMAP remnants and fork preserve the charge.
-- Private anonymous entries prefill without write permission until a guest write fault, kernel
-  write or write-population. That transition marks the host piece written and propagates
-  `has_anon_vma` across the logical VMA. Compatible pieces joining it inherit that identity.
-  Read faults, read-population and permission grants do not create it. DONTNEED retains it.
+- Private anonymous entries normally prefill without write permission until a guest write fault,
+  kernel write or write-population; when `/proc/self/pagemap` is readable, small (`<= 1 MiB`)
+  non-growsdown writable pieces that inherit `has_anon_vma` or have no mergeable neighbours can
+  prefill writable (`probe_writes`) and detect first stores lazily via pagemap (`was_written`).
+  Fork freezes probing (`finish_write_probe`) before computing identities and lending. First writes
+  mark the host piece written and propagate `has_anon_vma` across the logical VMA. Compatible pieces
+  joining it inherit that identity. Read faults, read-population and permission grants do not create
+  it. DONTNEED retains it.
 - Fork gives each faulted logical VMA a fresh child `anon` shared across its pieces; the
   parent's identity stays unchanged. Untouched anonymous VMAs and wiped child VMAs start with
   zero identity. Private files retain the host private-page test (present without the file bit,
@@ -90,8 +94,13 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   - private anonymous VMAs that were ever written are lent, except `MADV_WIPEONFORK` ones, where
     the child keeps its own all-zero memory; never-written ones need nothing;
   - ordinary writable private file VMAs remap their pinned file and inherit only private pages,
-    including same-value writes. Host pagemap identifies these pages where readable. Otherwise
-    guest write faults record detached host pages across VMA splits. The verified musl snapshot keeps its own contents.
+    including same-value writes. For small (`<= 64 KiB`, `FORK_FILE_VIEW_MAX`) ordinary VMAs
+    (excluding `Fill`, tmpfs and musl snapshots), the parent VMA keeps a single-slot `ForkFileView`
+    (`kernel/hostmem`) to reuse a released child's discarded `MAP_PRIVATE` view instead of calling
+    `map_file`, and regions `<= 64 KiB` without `v.pages` sample `appine_hal::private_pages` once
+    during the `anon_vma_fork` pass and reuse that bitmap in `copy_private_file`. Larger regions
+    use host pagemap where readable; otherwise guest write faults record detached host pages across
+    VMA splits. The verified musl snapshot keeps its own contents.
     A `Fill` VMA maps its host file privately again and copies the
     pages read that differ from it, keeping the same fill (pages either side reads later reach
     both), and is never carved.
@@ -137,8 +146,8 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   fall back to the BKL path on failure.
 - Owner destruction (`Drop for Mm`, exit/exec): borrowed pages are returned. If it has lent pages,
   their loans become orphans held by the borrowers' `Arc<HostRegion>`, and every non-lent page of
-  its written private anonymous VMAs is discarded (`discard_unlent`). Lent or borrowed pages are
-  never written in place, even by a sole orphan borrower.
+  its written (`was_written`) private anonymous VMAs is discarded (`discard_unlent`). Lent or
+  borrowed pages are never written in place, even by a sole orphan borrower.
 
 ## Dependencies (inbound / outbound)
 
@@ -158,7 +167,7 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 
 - `kernel/mm`: `Mm` fields (`vmas`, `me`, `dirty`, `shared_maps`, layout/exec fields), `same_vma`,
   `insert_vma`, `copy_private_file`, `note_shared_maps`, `OVERCOMMIT_MEMORY`.
-- `kernel/hostmem`: `HostRegion`, `spare::anonymous`, `Carved`, `Mm::new_anonymous`,
+- `kernel/hostmem`: `HostRegion`, `ForkFileView`, `spare::anonymous`, `Carved`, `Mm::new_anonymous`,
   `discard_host`, `copy_nonzero_pages`.
 - `kernel/mmu`: `Mmu::map_shared`, `Mmu::protect`, `Mmu::protect_shared`, `shootdown`,
   `touched_windows` (relying on page-table entries for non-zero pages).

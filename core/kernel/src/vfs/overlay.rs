@@ -19,7 +19,7 @@
 //! one was removed is opaque, and a directory with lower layers cannot be renamed (EXDEV, Linux
 //! without `redirect_dir`).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, PoisonError};
@@ -143,16 +143,38 @@ pub(crate) struct Instance {
     pub pins: Vec<u64>,
     /// Options as given.
     pub options: Options,
-    /// Copied-up upper inodes mapped to the lower inode they were copied up from, so evicting an
-    /// unused copied-up node does not change its shown inode number while the mount lasts.
-    origins: HashMap<Ino, Ino>,
+    origins: RefCell<HashMap<Ino, CachedOrigin>>,
+    impure: RefCell<HashMap<Ino, bool>>,
+    opaque: RefCell<HashMap<Ino, bool>>,
+}
+
+// A malformed or stale handle still marks a receiving directory impure on link or rename.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedOrigin {
+    Absent,
+    Invalid,
+    Valid(Ino),
+}
+
+#[derive(Clone, Copy)]
+enum PrivateXattr {
+    Origin,
+    Impure,
+    Opaque,
 }
 
 // Store inode numbers are unique across layers. Check the magic and exact length before
 // resolving the inode under a mounted lower root, including after a lower directory is moved.
 const ORIGIN_V1: &[u8] = b"OVL\x01";
 
+#[cfg(test)]
+thread_local! {
+    static PRIVATE_XATTR_READS: Cell<usize> = const { Cell::new(0) };
+}
+
 fn private_xattr(store: &Store, ino: Ino, name: &[u8]) -> Result<Option<Vec<u8>>, Errno> {
+    #[cfg(test)]
+    PRIVATE_XATTR_READS.set(PRIVATE_XATTR_READS.get() + 1);
     match store.get_xattr(ino, name) {
         Ok(value) => Ok(Some(value)),
         Err(Errno::ENODATA) => Ok(None),
@@ -160,19 +182,50 @@ fn private_xattr(store: &Store, ino: Ino, name: &[u8]) -> Result<Option<Vec<u8>>
     }
 }
 
-fn has_marker(store: &Store, ino: Ino, name: &[u8]) -> Result<bool, Errno> {
-    Ok(private_xattr(store, ino, name)?.as_deref() == Some(b"y"))
-}
-
 impl Instance {
     fn origin(&self, store: &Store, upper: Ino, kind: u32) -> Result<Option<Ino>, Errno> {
-        if let Some(&origin) = self.origins.get(&upper) {
-            return Ok(Some(origin));
-        }
-        let name = self.options.private_name(b"origin");
-        let Some(handle) = private_xattr(store, upper, &name)? else {
-            return Ok(None);
+        let cached = self.origins.borrow().get(&upper).copied();
+        let origin = match cached {
+            Some(value) => value,
+            None => {
+                let name = self.options.private_name(PrivateXattr::Origin);
+                let value = match private_xattr(store, upper, name)? {
+                    None => CachedOrigin::Absent,
+                    Some(handle) => self
+                        .validate_origin(store, upper, kind, &handle)?
+                        .map_or(CachedOrigin::Invalid, CachedOrigin::Valid),
+                };
+                self.origins.borrow_mut().insert(upper, value);
+                value
+            }
         };
+        Ok(match origin {
+            CachedOrigin::Valid(lower) => Some(lower),
+            CachedOrigin::Absent | CachedOrigin::Invalid => None,
+        })
+    }
+
+    fn has_origin_xattr(&self, store: &Store, upper: Ino) -> Result<bool, Errno> {
+        if let Some(&value) = self.origins.borrow().get(&upper) {
+            return Ok(value != CachedOrigin::Absent);
+        }
+        let name = self.options.private_name(PrivateXattr::Origin);
+        let present = private_xattr(store, upper, name)?.is_some();
+        if !present {
+            self.origins
+                .borrow_mut()
+                .insert(upper, CachedOrigin::Absent);
+        }
+        Ok(present)
+    }
+
+    fn validate_origin(
+        &self,
+        store: &Store,
+        upper: Ino,
+        kind: u32,
+        handle: &[u8],
+    ) -> Result<Option<Ino>, Errno> {
         let Some(bytes) = handle
             .strip_prefix(ORIGIN_V1)
             .and_then(|b| b.try_into().ok())
@@ -209,12 +262,41 @@ impl Instance {
         }
     }
 
+    fn has_marker(
+        &self,
+        store: &Store,
+        ino: Ino,
+        marker: PrivateXattr,
+        cache: &RefCell<HashMap<Ino, bool>>,
+    ) -> Result<bool, Errno> {
+        if let Some(&value) = cache.borrow().get(&ino) {
+            return Ok(value);
+        }
+        let name = self.options.private_name(marker);
+        let marked = private_xattr(store, ino, name)?.as_deref() == Some(b"y");
+        cache.borrow_mut().insert(ino, marked);
+        Ok(marked)
+    }
+
     fn mark_impure(&self, store: &Store, dir: Ino) -> Result<(), Errno> {
-        let name = self.options.private_name(b"impure");
-        if !has_marker(store, dir, &name)? {
-            store.set_xattr(dir, &name, b"y", false, false)?;
+        let name = self.options.private_name(PrivateXattr::Impure);
+        let marked = match self.impure.borrow().get(&dir) {
+            Some(&marked) => marked,
+            None => private_xattr(store, dir, name)?.as_deref() == Some(b"y"),
+        };
+        if !marked {
+            store.set_xattr(dir, name, b"y", false, false)?;
+            // A link's enclosing transaction can still roll back. Only its caller
+            // can publish a positive cache entry after commit.
+            self.impure.borrow_mut().remove(&dir);
         }
         Ok(())
+    }
+
+    fn forget_upper(&self, ino: Ino) {
+        self.origins.borrow_mut().remove(&ino);
+        self.impure.borrow_mut().remove(&ino);
+        self.opaque.borrow_mut().remove(&ino);
     }
 }
 
@@ -425,8 +507,15 @@ impl Options {
         }
     }
 
-    fn private_name(&self, suffix: &[u8]) -> Vec<u8> {
-        [self.private_prefix(), suffix].concat()
+    fn private_name(&self, attr: PrivateXattr) -> &'static [u8] {
+        match (self.userxattr, attr) {
+            (true, PrivateXattr::Origin) => b"user.overlay.origin",
+            (true, PrivateXattr::Impure) => b"user.overlay.impure",
+            (true, PrivateXattr::Opaque) => b"user.overlay.opaque",
+            (false, PrivateXattr::Origin) => b"trusted.overlay.origin",
+            (false, PrivateXattr::Impure) => b"trusted.overlay.impure",
+            (false, PrivateXattr::Opaque) => b"trusted.overlay.opaque",
+        }
     }
 }
 
@@ -539,7 +628,9 @@ impl Overlays {
                 mounter,
                 pins,
                 options,
-                origins: HashMap::new(),
+                origins: RefCell::default(),
+                impure: RefCell::default(),
+                opaque: RefCell::default(),
             },
         );
         root
@@ -757,8 +848,8 @@ impl Overlays {
         name: &[u8],
     ) -> Result<OvlId, Errno> {
         let d = self.node(dir);
-        let options = self.options_of(dir);
-        let opaque = |ino| has_marker(store, ino, &options.private_name(b"opaque"));
+        let instance = &self.instances[&d.dev];
+        let opaque = |ino| instance.has_marker(store, ino, PrivateXattr::Opaque, &instance.opaque);
         let mut upper = None;
         let mut origin = None;
         let mut stop = false;
@@ -769,7 +860,7 @@ impl Overlays {
             if is_whiteout(&st) {
                 return Err(Errno::ENOENT);
             }
-            origin = self.instances[&d.dev].origin(store, c, st.kind())?;
+            origin = instance.origin(store, c, st.kind())?;
             upper = Some(c);
             stop = !st.is_dir() || opaque(c)?;
         }
@@ -800,9 +891,6 @@ impl Overlays {
         }
         let dev = d.dev;
         let child = d.children.get(name).copied();
-        if let (Some(u), Some(l)) = (upper, origin) {
-            self.instances.get_mut(&dev).unwrap().origins.insert(u, l);
-        }
         if let Some(id) = child {
             self.clock += 1;
             let seen = self.clock;
@@ -839,7 +927,7 @@ impl Overlays {
         let d = self.node(dir);
         let instance = &self.instances[&d.dev];
         let impure = match d.upper {
-            Some(u) => has_marker(store, u, &instance.options.private_name(b"impure"))?,
+            Some(u) => instance.has_marker(store, u, PrivateXattr::Impure, &instance.impure)?,
             None => false,
         };
         let layers = d.upper.iter().chain(&d.lower);
@@ -975,7 +1063,13 @@ impl Overlays {
             s.set_flags(ino, st.flags)?;
             if record_origin {
                 let handle = [ORIGIN_V1, &lower.to_le_bytes()].concat();
-                s.set_xattr(ino, &options.private_name(b"origin"), &handle, false, false)?;
+                s.set_xattr(
+                    ino,
+                    options.private_name(PrivateXattr::Origin),
+                    &handle,
+                    false,
+                    false,
+                )?;
                 self.instance_of(id).mark_impure(s, dir)?;
             }
             let at = super::store::FileTime::At;
@@ -995,31 +1089,35 @@ impl Overlays {
         if !st.is_dir() {
             n.lower.clear();
         }
-        if record_origin {
-            self.instances
-                .get_mut(&dev)
-                .unwrap()
-                .origins
-                .insert(upper, lower);
+        let instance = self.instances.get_mut(&dev).unwrap();
+        let origin = if record_origin {
+            instance.impure.get_mut().insert(dir, true);
+            CachedOrigin::Valid(lower)
+        } else {
+            CachedOrigin::Absent
+        };
+        instance.origins.get_mut().insert(upper, origin);
+        if st.is_dir() {
+            instance.opaque.get_mut().insert(upper, false);
         }
         Ok(upper)
     }
 
-    /// Mark a directory receiving a name for an inode with a copy-up origin.
+    /// Mark the receiving directory impure if the inode has an origin xattr.
+    /// A true result can be cached once the caller's transaction succeeds.
     pub(crate) fn mark_origin_parent(
         &self,
         store: &Store,
         id: OvlId,
         dir: Ino,
-    ) -> Result<(), Errno> {
+    ) -> Result<bool, Errno> {
         let n = self.node(id);
         let instance = &self.instances[&n.dev];
-        if n.origin.is_some()
-            || private_xattr(store, n.real(), &instance.options.private_name(b"origin"))?.is_some()
-        {
+        let mark = n.origin.is_some() || instance.has_origin_xattr(store, n.real())?;
+        if mark {
             instance.mark_impure(store, dir)?;
         }
-        Ok(())
+        Ok(mark)
     }
 
     /// Makes a whiteout named `name` in store directory `dir` for node `id`'s instance.
@@ -1063,8 +1161,7 @@ impl Overlays {
         if let Some(u) = child_upper
             && (rmdir || !store.attrs(u).is_ok_and(|st| st.nlink > 0))
         {
-            let dev = self.node(dir).dev;
-            self.instances.get_mut(&dev).unwrap().origins.remove(&u);
+            self.instance_of(dir).forget_upper(u);
         }
         self.node_mut(dir).children.remove(name);
         self.orphan(child);
@@ -1133,12 +1230,12 @@ impl Overlays {
         let old_lower = !exchange && self.lower_has(store, old, old_name)?;
         // A directory moving into a merged one would merge with what the lower layers have under
         // its new name
-        let opaque = self.options_of(src).private_name(b"opaque");
+        let opaque = self.options_of(src).private_name(PrivateXattr::Opaque);
         let merged = |o: &Self, id: OvlId| !o.node(id).lower.is_empty();
         let src_opaque = src_dir && merged(self, new);
         let dst_opaque =
             exchange && dst.is_some_and(|d| is_dir(self, d).unwrap_or(false)) && merged(self, old);
-        store.transaction(|s| {
+        let (new_impure, old_impure) = store.transaction(|s| {
             if dst.is_none() && whiteout_at(s, new_up, new_name)? {
                 s.unlink(new_up, new_name)?;
             }
@@ -1152,29 +1249,38 @@ impl Overlays {
                 }
             }
             s.rename(old_up, old_name, new_up, new_name, false, exchange)?;
-            if old_up != new_up {
-                self.mark_origin_parent(s, src, new_up)?;
-                if exchange && let Some(d) = dst {
-                    self.mark_origin_parent(s, d, old_up)?;
-                }
-            }
+            let new_impure = old_up != new_up && self.mark_origin_parent(s, src, new_up)?;
+            let old_impure =
+                old_up != new_up && exchange && self.mark_origin_parent(s, dst.unwrap(), old_up)?;
             if old_lower {
                 self.whiteout(s, src, old_up, old_name)?;
             }
             if src_opaque {
-                s.set_xattr(src_up, &opaque, b"y", false, false)?;
+                s.set_xattr(src_up, opaque, b"y", false, false)?;
             }
             if dst_opaque && let Some(du) = dst_up {
-                s.set_xattr(du, &opaque, b"y", false, false)?;
+                s.set_xattr(du, opaque, b"y", false, false)?;
             }
-            Ok(())
+            Ok((new_impure, old_impure))
         })?;
+        let instance = self.instance_of(src);
+        if new_impure {
+            instance.impure.borrow_mut().insert(new_up, true);
+        }
+        if old_impure {
+            instance.impure.borrow_mut().insert(old_up, true);
+        }
+        if src_opaque {
+            instance.opaque.borrow_mut().insert(src_up, true);
+        }
+        if dst_opaque && let Some(du) = dst_up {
+            instance.opaque.borrow_mut().insert(du, true);
+        }
         if !exchange
             && let Some(du) = dst_up
             && !store.attrs(du).is_ok_and(|st| st.nlink > 0)
         {
-            let dev = self.node(new).dev;
-            self.instances.get_mut(&dev).unwrap().origins.remove(&du);
+            instance.forget_upper(du);
         }
         self.clock += 1;
         let seen = self.clock;
@@ -1356,6 +1462,13 @@ mod tests {
         let d = o.lookup(&s, top, b"sub").unwrap();
         let f = o.lookup(&s, d, b"f").unwrap();
         let copied = o.upper_of(&s, f, CopyUp::All).unwrap();
+        let instance = o.instance_of(d);
+        assert_eq!(
+            instance.origins.borrow()[&copied],
+            CachedOrigin::Valid(lower)
+        );
+        assert!(instance.impure.borrow()[&o.node(d).real()]);
+        assert!(!instance.opaque.borrow()[&o.node(d).real()]);
         assert_eq!(s.flags(o.node(d).real()).unwrap(), inode_flags::NOATIME);
         assert_eq!(s.flags(copied).unwrap(), inode_flags::NODUMP);
         let st = s.stat(upper).unwrap();
@@ -1397,6 +1510,160 @@ mod tests {
         check(vec![layer], copied);
         drop(s);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn writable_layers(tag: &str) -> (Store, std::path::PathBuf, Ino, Ino) {
+        use super::super::store::ROOT;
+        let path = std::env::temp_dir().join(format!("appine-ovl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let s = Store::create(&path).unwrap();
+        let lower = s.mkdir(ROOT, b"lower", 0o755, 0, 0).unwrap();
+        let upper = s.mkdir(ROOT, b"upper", 0o755, 0, 0).unwrap();
+        (s, path, lower, upper)
+    }
+
+    #[test]
+    fn warm_lookup_and_readdir_reuse_private_xattrs_until_remount() {
+        let (s, path, lower, upper) = writable_layers("cache");
+        let ld = s.mkdir(lower, b"d", 0o755, 0, 0).unwrap();
+        let ud = s.mkdir(upper, b"d", 0o755, 0, 0).unwrap();
+        let (original, _) = s.create_file(lower, b"lower-file", 0o644, 0, 0).unwrap();
+        let (file, _) = s.create_file(upper, b"file", 0o644, 0, 0).unwrap();
+        let mount = |o: &mut Overlays| {
+            o.add_instance(
+                1,
+                (Some(upper), vec![lower]),
+                ((0, 0), vec![]),
+                Options {
+                    userxattr: true,
+                    ..Options::default()
+                },
+            )
+        };
+        let mut o = Overlays::default();
+        let top = mount(&mut o);
+        let reads = PRIVATE_XATTR_READS.get();
+        // A cold listing must fill origins even for names without a cached child.
+        let list = |o: &Overlays, root| {
+            o.readdir(&s, root)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.ino))
+                .collect::<Vec<_>>()
+        };
+        let first = list(&o, top);
+        assert!(PRIVATE_XATTR_READS.get() > reads);
+        let d = o.lookup(&s, top, b"d").unwrap();
+        assert_eq!(o.node(d).lower, [ld]);
+        let warm = PRIVATE_XATTR_READS.get();
+        let f = o.lookup(&s, top, b"file").unwrap();
+        assert_eq!(o.shown_ino(f), file);
+        assert_eq!(o.lookup(&s, top, b"d").unwrap(), d);
+        assert_eq!(list(&o, top), first);
+        assert_eq!(PRIVATE_XATTR_READS.get(), warm);
+        let instance = o.instance_of(top);
+        assert_eq!(instance.origins.borrow()[&file], CachedOrigin::Absent);
+        assert!(!instance.impure.borrow()[&upper]);
+        assert!(!instance.opaque.borrow()[&ud]);
+        assert!(!instance.opaque.borrow()[&ld]);
+
+        o.remove_instance(1);
+        s.set_xattr(ud, b"user.overlay.opaque", b"y", false, false)
+            .unwrap();
+        let handle = [ORIGIN_V1, &original.to_le_bytes()].concat();
+        s.set_xattr(file, b"user.overlay.origin", &handle, false, false)
+            .unwrap();
+        let top = mount(&mut o);
+        let cold = list(&o, top);
+        assert!(cold.contains(&(b"file".to_vec(), original)));
+        let d = o.lookup(&s, top, b"d").unwrap();
+        assert!(o.node(d).lower.is_empty());
+        drop(s);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn link_rollback_and_directory_exchange_update_marker_caches() {
+        let (s, path, lower, upper) = writable_layers("markers");
+        let mut o = Overlays::default();
+        let root = o.add_instance(
+            1,
+            (Some(upper), vec![lower]),
+            ((0, 0), vec![]),
+            Options::default(),
+        );
+        let mut side = |parent: &[u8], name: &[u8]| {
+            s.mkdir(lower, parent, 0o755, 0, 0).unwrap();
+            let up = s.mkdir(upper, parent, 0o755, 0, 0).unwrap();
+            let child = s.mkdir(up, name, 0o755, 0, 0).unwrap();
+            s.set_xattr(child, b"trusted.overlay.origin", b"bad", false, false)
+                .unwrap();
+            let dir = o.lookup(&s, root, parent).unwrap();
+            o.readdir(&s, dir).unwrap();
+            let id = o.lookup(&s, dir, name).unwrap();
+            let instance = o.instance_of(id);
+            assert_eq!(instance.origins.borrow()[&child], CachedOrigin::Invalid);
+            assert!(!instance.impure.borrow()[&up]);
+            assert!(!instance.opaque.borrow()[&child]);
+            (dir, up, child)
+        };
+        let (left, left_up, a) = side(b"left", b"a");
+        let (right, right_up, b) = side(b"right", b"b");
+        let (regular, _) = s.create_file(left_up, b"file", 0o644, 0, 0).unwrap();
+        s.set_xattr(regular, b"trusted.overlay.origin", b"bad", false, false)
+            .unwrap();
+        let file = o.lookup(&s, left, b"file").unwrap();
+        let link = |rollback| {
+            s.transaction(|s| {
+                s.link(right_up, b"link", regular)?;
+                o.mark_origin_parent(s, file, right_up)?;
+                if rollback { Err(Errno::EIO) } else { Ok(()) }
+            })
+        };
+        assert_eq!(link(true), Err(Errno::EIO));
+        o.readdir(&s, right).unwrap();
+        assert!(!o.instance_of(right).impure.borrow()[&right_up]);
+        link(false).unwrap();
+        o.readdir(&s, right).unwrap();
+        assert!(o.instance_of(right).impure.borrow()[&right_up]);
+        o.remove(&s, right, b"link", false).unwrap();
+        assert_eq!(
+            o.instance_of(left).origins.borrow()[&regular],
+            CachedOrigin::Invalid
+        );
+        o.remove(&s, left, b"file", false).unwrap();
+        assert!(!o.instance_of(left).origins.borrow().contains_key(&regular));
+
+        o.rename(&s, (left, b"a"), (right, b"b"), (false, true))
+            .unwrap();
+        let instance = o.instance_of(root);
+        for parent in [left_up, right_up] {
+            assert!(instance.impure.borrow()[&parent]);
+            assert_eq!(
+                s.get_xattr(parent, b"trusted.overlay.impure").unwrap(),
+                b"y"
+            );
+        }
+        for child in [a, b] {
+            assert!(instance.opaque.borrow()[&child]);
+            assert_eq!(s.get_xattr(child, b"trusted.overlay.opaque").unwrap(), b"y");
+        }
+        // Populate the directories' own impure entries before replacement and rmdir.
+        for (dir, name) in [(left, b"a"), (right, b"b")] {
+            let id = o.lookup(&s, dir, name).unwrap();
+            o.readdir(&s, id).unwrap();
+        }
+        o.rename(&s, (left, b"a"), (right, b"b"), (false, false))
+            .unwrap();
+        o.remove(&s, right, b"b", true).unwrap();
+        let instance = o.instance_of(root);
+        for child in [a, b] {
+            assert!(!instance.origins.borrow().contains_key(&child));
+            assert!(!instance.impure.borrow().contains_key(&child));
+            assert!(!instance.opaque.borrow().contains_key(&child));
+        }
+        drop(s);
+        let _ = std::fs::remove_dir_all(path);
     }
 
     /// A node stays linked while its directory has it: a rename moves it, removal and being

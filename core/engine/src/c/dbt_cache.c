@@ -119,6 +119,9 @@ bool dbt_relink_word(const struct appine_dbt *d, uint32_t *site, const uint32_t 
      * map a dozen or so nearby pages (fault-around), which are not recorded in struct written */
     uint32_t insn = *site;
     bool test = (insn & 0x7e000000) == 0x36000000; /* TBZ/TBNZ: 14-bit offset, others 19 bits */
+    /* A retired entry at code[ENTRY_CHECK_WORDS] can have been replaced by a forwarding B. */
+    if (!test && (insn & 0x7e000000) != 0x34000000 && (insn & 0xff000010) != 0x54000000)
+        return false;
     intptr_t off = target - site, limit = (intptr_t)1 << (test ? 13 : 18);
     if (off < -limit || off >= limit)
         return false;
@@ -155,18 +158,6 @@ void dbt_zfree(void *p, size_t bytes)
 }
 
 
-/* Index of a key: a tagged key is hashed by its pc, in the same probe sequence as the shared block
- * of the same pc (TAG_SHIFT) */
-static size_t table_index(const struct table *t, uint64_t key)
-{
-    return (size_t)((((key & PC_MASK) >> 2) * GOLDEN) >> t->shift);
-}
-
-static size_t table_mask(const struct table *t)
-{
-    return (size_t)t->mask;
-}
-
 /* Allocate an empty table of 2^bits entries */
 struct table *dbt_table_new(unsigned bits)
 {
@@ -177,46 +168,6 @@ struct table *dbt_table_new(unsigned bits)
         t->mask = (UINT64_C(1) << bits) - 1;
     }
     return t;
-}
-
-/*
- * Find in t the block executed at pc by the member with tag `tag` (0 when not in a group): a
- * shared one or one private to it (TAG_SHIFT), with `*found` set to the found block's tag; when
- * both exist (private blocks translated before the registered range grew), either is correct.
- * Called directly while holding the lock; without the lock, through table_lookup. Misaligned pcs
- * and pcs beyond 48 bits have no blocks (Tier 0 reports the fault), and must not be compared with
- * the tombstones' JC_EMPTY or other members' keys either
- */
-uint32_t *dbt_table_find_for(const struct table *t, uint64_t pc, unsigned tag, unsigned *found)
-{
-    *found = 0;
-    if (pc & (3 | ~PC_MASK))
-        return NULL;
-    uint64_t mine = tagged(pc, tag);
-    for (size_t i = table_index(t, pc);; i = (i + 1) & table_mask(t)) {
-        /* Insertion writes the key before code: once code reads non-NULL, the key is the matching
-         * one */
-        uint32_t *code = __atomic_load_n(&t->slots[i].code, __ATOMIC_ACQUIRE);
-        if (!code)
-            return NULL;
-        uint64_t key = __atomic_load_n(&t->slots[i].pc, __ATOMIC_RELAXED);
-        if (key == pc || key == mine) {
-            *found = key == pc ? 0 : tag;
-            return code;
-        }
-    }
-}
-
-/*
- * The dispatcher and the lookup routine (emit_lookup) look up the table without the lock: while
- * the cpu's dbt_lookup_seq is odd, a replaced old table is not freed (table_publish)
- */
-uint32_t *dbt_table_lookup(struct appine_dbt *d, struct appine_cpu *c, uint64_t pc, unsigned *found)
-{
-    __atomic_store_n(&c->dbt_lookup_seq, c->dbt_lookup_seq + 1, __ATOMIC_SEQ_CST);
-    uint32_t *code = dbt_table_find_for(__atomic_load_n(&d->table, __ATOMIC_SEQ_CST), pc, c->dbt_tag, found);
-    __atomic_store_n(&c->dbt_lookup_seq, c->dbt_lookup_seq + 1, __ATOMIC_RELEASE);
-    return code;
 }
 
 /* Install the new table, and free the old one once the threads looking it up have finished. Lock
@@ -379,15 +330,13 @@ void dbt_rs_reset(struct appine_dbt_thread *t)
 
 /* The code cache has been fully flushed (generation changed): the thread's own jump cache and
  * shadow return stack point to old code */
-void dbt_thread_catch_up(struct appine_dbt_thread *t)
+void dbt_thread_catch_up_slow(struct appine_dbt_thread *t, uint64_t generation)
 {
-    uint64_t g = __atomic_load_n(&t->d->generation, __ATOMIC_ACQUIRE);
-    if (t->generation != g) {
-        t->generation = g;
-        dbt_rs_reset(t);
-        if (t->jc_dirty)
-            dbt_clear_jump_cache(t);
-    }
+    t->generation = generation;
+    t->npending_relinks = 0;
+    dbt_rs_reset(t);
+    if (t->jc_dirty)
+        dbt_clear_jump_cache(t);
 }
 
 /*
@@ -449,6 +398,7 @@ void dbt_flush_locked(struct appine_dbt *d)
     d->nsources = d->ntrusted = d->nparkable = 0;
     d->flush_wanted = false;
     d->used_words = d->routine_words;
+    __atomic_store_n(&d->retire_gen, d->retire_gen + 1, __ATOMIC_RELEASE);
     __atomic_store_n(&d->generation, d->generation + 1, __ATOMIC_RELEASE);
     d->st->flushes++;
 }
@@ -482,7 +432,7 @@ void dbt_retire_flush(struct appine_dbt *d, struct retire_batch *r)
         if (r->park[i])
             r->blocks[i]->first = code[ENTRY_CHECK_WORDS];
         *rw(d, code) = enc_b((intptr_t)fwd - (intptr_t)code);
-        *rw(d, code + ENTRY_CHECK_WORDS) = enc_b(-ENTRY_CHECK_WORDS * 4);
+        __atomic_store_n(rw(d, code + ENTRY_CHECK_WORDS), enc_b(-ENTRY_CHECK_WORDS * 4), __ATOMIC_RELAXED);
         start[i] = code;
         end[i] = code + ENTRY_CHECK_WORDS + 1;
         fwd += 16;
@@ -501,6 +451,8 @@ void dbt_retire_flush(struct appine_dbt *d, struct retire_batch *r)
         d->blocks_dead++;
         d->st->invalidated++;
     }
+    /* Readers observing this epoch must also see the forwarding entries and table removals. */
+    __atomic_store_n(&d->retire_gen, d->retire_gen + 1, __ATOMIC_RELEASE);
     r->n = 0;
 }
 
