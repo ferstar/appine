@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/netns full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `filter_with_mark`, `filter_prerouting` and `PRI_NAT_DST` (`-100`) split PREROUTING filter chains around Linux's `NF_IP_PRI_NAT_DST` hook priority)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: `NLM_F_ECHO` replies, `NFNLGRP_NFTABLES` monitor notifications, and trailing `NFT_MSG_NEWGEN` on committed batches)
 
 ## Responsibilities
 
@@ -23,7 +23,8 @@ and netlink transport in `kernel/netlink`.
 
 ## Public entry points
 
-- `nft::handle` handles one netfilter datagram.
+- `nft::handle` and `nft::handle_with_notes` (returning `HandleResult` with sender replies/echoes
+  and `NFNLGRP_NFTABLES` multicast `NftNote`s) handle one netfilter datagram.
 - `Nft::nat`, `Nft::filter_with_mark`, `Nft::filter_prerouting`, `PRI_NAT_DST`, `has_nat`,
   `has_filter` and `tracks` serve namespace and socket callers.
 
@@ -56,8 +57,12 @@ and netlink transport in `kernel/netlink`.
   demand to the caller's receive buffer; `GETSETELEM` (`SetElemDump`) splits elements across
   bounded multipart `NFT_MSG_NEWSETELEM` messages (at most `min(max, 3776)` bytes per chunk)
   followed by the trailing empty `NFT_MSG_NEWSETELEM` and `NLMSG_DONE`; `nft_compat` revision
-  queries; empty ctnetlink dumps. No `NLM_F_ECHO`, no monitor notifications. Base-chain counters
-  are 0.
+  queries; empty ctnetlink dumps. Committed batches stage `NLM_F_ECHO` unicast replies (emitted
+  before `NLMSG_ERROR` acks) and `NFNLGRP_NFTABLES` (group 7) multicast notifications for every
+  created, updated, replaced, deleted or flushed object (cascading `DELRULE` → `DELSET` →
+  `DELCHAIN` → `DELTABLE` and anonymous set drops), followed by a trailing `NFT_MSG_NEWGEN` with
+  `res_id = generation & 0xffff`; failed batches emit no echoes or notifications. Base-chain
+  counters are 0.
 - An initial-namespace commit re-evaluates port forwarding.
 
 ### Expression evaluation
@@ -114,7 +119,6 @@ and netlink transport in `kernel/netlink`.
 ## Confirmed bugs / technical debt
 
 - Byte limits and quotas count headers only.
-- **nft control-plane gaps:** no `NLM_F_ECHO` and no monitor notifications.
 - POSTROUTING, SNAT and MASQUERADE have no effect; unsupported expression effects are listed above.
 
 ## Open questions

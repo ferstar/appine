@@ -209,3 +209,37 @@ echo "== without CAP_NET_ADMIN"
 python3 -c "import os; os.setgid(65534); os.setuid(65534); os.execvp(\"nft\", [\"nft\", \"list\", \"ruleset\"])"; echo "[$?]"
 python3 -c "import os; os.setgid(65534); os.setuid(65534); os.execvp(\"iptables\", [\"iptables\", \"-t\", \"nat\", \"-S\"])"; echo "[$?]"
 '
+
+unshare -n sh -c '
+# Normalize table handles (kernel-global counter) and new-generation pids/numbers
+norm_ev() { sed -E "s/^(add|delete) table (.*) # handle [0-9]+$/\1 table \2/; s/^# new generation [0-9]+ by process [0-9]+/# new generation N by process PID/"; }
+echo "== nft -a -e and -j -e (NLM_F_ECHO)"
+nft -a -e add table ip ec | norm_ev
+nft -a -e add chain ip ec c { type filter hook output priority 0 \; } | norm_ev
+nft -a -e add rule ip ec c tcp dport 80 accept | norm_ev
+nft -a -e insert rule ip ec c tcp dport 22 accept | norm_ev
+nft -a -e replace rule ip ec c handle 2 tcp dport 81 accept | norm_ev
+nft -a -e add rule ip ec c tcp dport { 80, 443 } accept | norm_ev
+nft -j -e add rule ip ec c tcp dport 8080 accept
+nft -a -e add set ip ec s { type ipv4_addr \; } | norm_ev
+nft -a -e add element ip ec s { 10.0.0.1, 10.0.0.2 } | norm_ev
+nft flush ruleset
+echo "== nft monitor (NFNLGRP_NFTABLES)"
+nft monitor > /tmp/nftmon.out 2>&1 &
+mpid=$!
+sleep 0.3
+nft add table ip mon
+nft add chain ip mon c
+nft add rule ip mon c tcp dport 80 accept
+nft add set ip mon s { type ipv4_addr \; }
+nft add element ip mon s { 10.0.0.1 }
+nft delete element ip mon s { 10.0.0.1 }
+nft delete set ip mon s
+nft delete rule ip mon c handle 2
+nft delete chain ip mon c
+nft delete table ip mon
+sleep 0.3
+kill $mpid 2>/dev/null || true
+wait $mpid 2>/dev/null || true
+norm_ev < /tmp/nftmon.out
+'

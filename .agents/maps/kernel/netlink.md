@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: emit rtnetlink IPv6 address and route notifications on `disable_ipv6` sysctl writes)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: broadcast committed nftables notifications to `NFNLGRP_NFTABLES` subscribers via `NetlinkSocket::notify_proto` and `nft_notify`, alongside `disable_ipv6` rtnetlink notifications)
 
 ## Responsibilities
 
@@ -58,10 +58,12 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   `setsockopt`/`getsockopt` (`netlink_setsockopt`/`netlink_getsockopt`), send (`netlink_send`),
   recv, `FIONREAD` and readiness.
 - `NetlinkSocket::handle` (`route_request`, `generic_request`, `sock_diag_request`,
-  `Host::netfilter`); `NetlinkSocket::{subscribed, notify, ngroups, sockaddr}`.
+  `Host::netfilter`); `NetlinkSocket::{subscribed, notify, notify_proto, ngroups, sockaddr}`.
 - Notifications: `rtnl_watched` and `rtnl_notify` (around rtnetlink sends and the changing
   socket ioctls), `rtnl_snapshot_ns` and `rtnl_notify_ns` (around `disable_ipv6` sysctl writes in
-  `write_proc`), `KernelHost::{snapshots, changed_since, configure}`, `Snapshot::{take,
+  `write_proc`), `nft_notify` (broadcasting committed `NFNLGRP_NFTABLES` events to subscribed
+  `NETLINK_NETFILTER` sockets in the same namespace, skipping already-echoed senders),
+  `KernelHost::{snapshots, changed_since, configure}`, `Snapshot::{take,
   changes}`.
 - Helpers other modules use: `configure_host_link` (`kernel/netns`'s device layer), `message`
   and `attr` (the device layer, namespace routes and `kernel/route`).
@@ -254,10 +256,10 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 
 ## Confirmed bugs / technical debt
 
-- **Only rtnetlink link, address and route changes are notified:** groups other than rtnetlink's
-  link, address and route ones (neighbours, rules, netconf, nsid, other protocols) never receive
-  anything; changes to the host's own interfaces (boot namespace) or netconf-only sysctls are not
-  notified.
+- **Only rtnetlink link/address/route and `NFNLGRP_NFTABLES` changes are notified:** other
+  rtnetlink and netfilter groups (neighbours, rules, netconf, nsid, conntrack, uevent) never
+  receive anything; changes to the host's own interfaces (boot namespace) or netconf-only sysctls
+  are not notified.
 
 ## Open questions
 

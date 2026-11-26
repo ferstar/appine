@@ -873,11 +873,22 @@ impl NetlinkSocket {
         self.protocol == NETLINK_ROUTE && self.groups.is_some_and(|g| g & RTNL_NOTIFIED != 0)
     }
 
-    /// Queues notification `msg` of multicast group `group` when the socket joined it; when the
-    /// queue is full (`SO_RCVBUF`) it is dropped, and unless `NETLINK_NO_ENOBUFS` the next receive
-    /// reports the overrun. Returns whether it concerned the socket.
+    /// Queues notification `msg` of multicast group `group` when the socket is an rtnetlink socket
+    /// that joined it; when the queue is full (`SO_RCVBUF`) it is dropped, and unless
+    /// `NETLINK_NO_ENOBUFS` the next receive reports the overrun. Returns whether it concerned the
+    /// socket.
     pub fn notify(&mut self, group: u32, msg: &[u8]) -> bool {
-        if self.protocol != NETLINK_ROUTE || self.groups.is_none_or(|g| g & (1 << (group - 1)) == 0)
+        self.notify_proto(NETLINK_ROUTE, group, msg)
+    }
+
+    /// Queues notification `msg` of multicast group `group` when this socket uses `protocol` and
+    /// joined `group` (1-based). Enforces `SO_RCVBUF` and sets `overrun` unless
+    /// `NETLINK_NO_ENOBUFS` is enabled.
+    pub fn notify_proto(&mut self, protocol: i32, group: u32, msg: &[u8]) -> bool {
+        if self.protocol != protocol
+            || group == 0
+            || group > self.ngroups()
+            || self.groups.is_none_or(|g| g & (1u64 << (group - 1)) == 0)
         {
             return false;
         }

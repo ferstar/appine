@@ -4270,7 +4270,10 @@ fn netlink_send(
     addr: &[u8],
 ) -> Result<usize, Errno> {
     enum Delivery {
-        Kernel(Vec<RtnlNotes>),
+        Kernel(
+            Vec<RtnlNotes>,
+            Option<(Rc<crate::nsproxy::NetNs>, Vec<crate::nft::NftNote>)>,
+        ),
         Peer(SocketRef),
         Drop,
     }
@@ -4290,7 +4293,7 @@ fn netlink_send(
         } else if dst_pid != 0 {
             if dst_pid == s.pid {
                 s.enqueue(data.to_vec(), 0);
-                Delivery::Kernel(Vec::new())
+                Delivery::Kernel(Vec::new(), None)
             } else {
                 let peer = netlink_find_peer(cx.kr(), sock, &s.net, s.protocol, dst_pid)
                     .ok_or(Errno::ECONNREFUSED)?;
@@ -4310,13 +4313,19 @@ fn netlink_send(
             if before.is_some_and(|g| g != init.nft.borrow().generation) {
                 forward_all(cx.kr());
             }
-            Delivery::Kernel(host.notes.into_inner())
+            let ns = host.ns();
+            let nft_notes = host.nft_notes.into_inner();
+            let nft = (!nft_notes.is_empty()).then_some((ns, nft_notes));
+            Delivery::Kernel(host.notes.into_inner(), nft)
         }
     };
     match delivery {
-        Delivery::Kernel(notes) => {
+        Delivery::Kernel(notes, nft) => {
             request_wake_object(wake::of(sock));
             rtnl_notify(cx.k(), notes, Some(sock));
+            if let Some((ns, nft_notes)) = nft {
+                nft_notify(cx.k(), &ns, nft_notes, Some(sock));
+            }
         }
         Delivery::Peer(peer) => {
             if let Socket::Netlink(p) = &mut *peer.borrow_mut() {
@@ -4425,6 +4434,43 @@ pub(super) fn rtnl_notify_ns(
     }
 }
 
+/// Broadcasts committed nftables notifications to every `NETLINK_NETFILTER` socket in `ns` that
+/// joined `NFNLGRP_NFTABLES` (skipping `sender` for notifications already echoed via `NLM_F_ECHO`).
+fn nft_notify(
+    k: &mut crate::kernel::Kernel,
+    ns: &Rc<crate::nsproxy::NetNs>,
+    notes: Vec<crate::nft::NftNote>,
+    sender: Option<&SocketRef>,
+) {
+    if notes.is_empty() {
+        return;
+    }
+    k.rtnl_sockets.retain(|w| w.strong_count() > 0);
+    for sock in k.rtnl_sockets.iter().filter_map(|w| w.upgrade()) {
+        let is_sender = sender.is_some_and(|s| Rc::ptr_eq(&sock, s));
+        let Socket::Netlink(s) = &mut *sock.borrow_mut() else {
+            continue;
+        };
+        if s.protocol != NETLINK_NETFILTER {
+            continue;
+        }
+        let sock_ns = s.net.clone().unwrap_or_else(|| k.init_ns.net.clone());
+        if !Rc::ptr_eq(&sock_ns, ns) {
+            continue;
+        }
+        let mut any = false;
+        for note in &notes {
+            if note.echo && is_sender {
+                continue;
+            }
+            any |= s.notify_proto(NETLINK_NETFILTER, crate::nft::NFNLGRP_NFTABLES, &note.msg);
+        }
+        if any {
+            request_wake_object(wake::of(&sock));
+        }
+    }
+}
+
 /// A namespace and the notifications for what a request changed in it.
 type RtnlNotes = (Rc<crate::nsproxy::NetNs>, Vec<crate::net::RtnlNote>);
 
@@ -4447,6 +4493,8 @@ struct KernelHost<'a> {
     /// ([`rtnl_watched`]), and the notifications for what this request changed in them.
     watched: Vec<Rc<crate::nsproxy::NetNs>>,
     notes: std::cell::RefCell<Vec<RtnlNotes>>,
+    /// Committed nftables notifications to broadcast on `NFNLGRP_NFTABLES`.
+    nft_notes: std::cell::RefCell<Vec<crate::nft::NftNote>>,
 }
 
 impl<'a> KernelHost<'a> {
@@ -4463,6 +4511,7 @@ impl<'a> KernelHost<'a> {
             comm: cx.task.comm.get(),
             watched: Vec::new(),
             notes: Default::default(),
+            nft_notes: Default::default(),
         }
     }
 
@@ -4503,6 +4552,7 @@ impl<'a> KernelHost<'a> {
             comm: self.comm,
             watched: Vec::new(),
             notes: Default::default(),
+            nft_notes: Default::default(),
         }
     }
 
@@ -4668,7 +4718,9 @@ impl crate::net::Host for KernelHost<'_> {
             comm,
             ..*peer
         };
-        crate::nft::handle(&self.ns(), &self.cred, data, &peer)
+        let res = crate::nft::handle_with_notes(&self.ns(), &self.cred, data, &peer);
+        self.nft_notes.borrow_mut().extend(res.notes);
+        res.replies
     }
 }
 
