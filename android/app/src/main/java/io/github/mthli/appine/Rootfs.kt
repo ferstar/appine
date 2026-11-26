@@ -343,28 +343,14 @@ internal object Rootfs {
         context: Context,
         store: String,
         distro: Distro,
-        onFailure: (String, IOException) -> Unit = { _, e -> throw e },
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) {
-        runSetupStep("/etc/profile.d/appine.ashrc", onFailure) {
-            write(store, "/etc/profile.d/appine.ashrc", asset(context, "ashrc.sh"))
-        }
-        runSetupStep("/etc/profile.d/appine.bashrc", onFailure) {
-            write(store, "/etc/profile.d/appine.bashrc", asset(context, "bashrc.sh"))
-        }
-        runSetupStep("/etc/profile.d/appine.zshrc", onFailure) {
-            write(store, "/etc/profile.d/appine.zshrc", asset(context, "zshrc.sh"))
-        }
-        runSetupStep("/etc/appine/zsh/.zshenv", onFailure) {
-            write(store, "/etc/appine/zsh/.zshenv", ZSHENV)
-        }
-        if (distro == Distro.ALPINE) {
-            runSetupStep("/etc/bash/appine.sh", onFailure) {
-                write(store, "/etc/bash/appine.sh", BASH_HOOK)
-            }
-        }
-        runSetupStep("/etc/profile.d/appine.sh", onFailure) {
-            write(store, "/etc/profile.d/appine.sh", asset(context, "profile.sh"))
-        }
+        writeStep(store, "/etc/profile.d/appine.ashrc", onFailure) { asset(context, "ashrc.sh") }
+        writeStep(store, "/etc/profile.d/appine.bashrc", onFailure) { asset(context, "bashrc.sh") }
+        writeStep(store, "/etc/profile.d/appine.zshrc", onFailure) { asset(context, "zshrc.sh") }
+        writeStep(store, "/etc/appine/zsh/.zshenv", onFailure) { ZSHENV }
+        if (distro == Distro.ALPINE) writeStep(store, "/etc/bash/appine.sh", onFailure) { BASH_HOOK }
+        writeStep(store, "/etc/profile.d/appine.sh", onFailure) { asset(context, "profile.sh") }
         ensureShellRcHooks(store, distro, onFailure)
     }
 
@@ -445,7 +431,7 @@ if [[ -o interactive ]] && [[ -r /etc/profile.d/appine.zshrc ]]; then . /etc/pro
     private fun ensureShellRcHooks(
         store: String,
         distro: Distro,
-        onFailure: (String, IOException) -> Unit = { _, e -> throw e },
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) {
         if (distro == Distro.DEBIAN && readMarker(store, DEBIAN_BASHRC_HOOK_DONE, onFailure) == false) {
             runSetupStep("/etc/bash.bashrc", onFailure) {
@@ -501,7 +487,7 @@ esac
     @Throws(IOException::class)
     fun ensureBashStartup(
         context: Context,
-        onFailure: (String, IOException) -> Unit = { _, e -> throw e },
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) {
         if (installed(context) != Distro.ALPINE) return
         ensureBashStartup(store(context).path, onFailure)
@@ -511,33 +497,19 @@ esac
     @Throws(IOException::class)
     fun ensureBashStartup(
         store: String,
-        onFailure: (String, IOException) -> Unit = { _, e -> throw e },
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) {
         if (readMarker(store, BASH_STARTUP_DONE, onFailure) != false) return
         var complete = true
-        if (!runSetupStep("/etc/skel/.bash_profile", onFailure) {
-                write(store, "/etc/skel/.bash_profile", BASH_PROFILE, overwrite = false)
-            }
-        ) {
-            complete = false
-        }
-        if (!runSetupStep("/etc/skel/.bashrc", onFailure) {
-                write(store, "/etc/skel/.bashrc", BASHRC, overwrite = false)
-            }
-        ) {
-            complete = false
-        }
+        if (!writeStep(store, "/etc/skel/.bash_profile", onFailure, overwrite = false) { BASH_PROFILE }) complete = false
+        if (!writeStep(store, "/etc/skel/.bashrc", onFailure, overwrite = false) { BASHRC }) complete = false
         for ((account, shell) in accounts(store)) {
             if (shell != "/bin/bash" || account.gid < 0) continue
             if (account.name == ConsolePty.LOGIN_ROOT || account.uid in 1000..65533) {
                 if (!seedBashHome(store, account, onFailure)) complete = false
             }
         }
-        if (complete) {
-            runSetupStep(BASH_STARTUP_DONE, onFailure) {
-                write(store, BASH_STARTUP_DONE, "")
-            }
-        }
+        if (complete) writeStep(store, BASH_STARTUP_DONE, onFailure) { "" }
     }
 
     private fun seedBashHome(
@@ -552,25 +524,32 @@ esac
         var complete = true
         val hasLoginFile = listOf(".bash_profile", ".bash_login", ".profile")
             .any { exists(store, "$home/$it") }
-        if (!hasLoginFile) {
-            val path = "$home/.bash_profile"
-            if (!runSetupStep(path, onFailure) {
-                    write(store, path, BASH_PROFILE, overwrite = false, uid = account.uid, gid = account.gid)
-                }
-            ) {
-                complete = false
-            }
+        if (!hasLoginFile &&
+            !writeStep(store, "$home/.bash_profile", onFailure, overwrite = false, uid = account.uid, gid = account.gid) { BASH_PROFILE }
+        ) {
+            complete = false
         }
         val bashrc = "$home/.bashrc"
-        if (!exists(store, bashrc)) {
-            if (!runSetupStep(bashrc, onFailure) {
-                    write(store, bashrc, BASHRC, overwrite = false, uid = account.uid, gid = account.gid)
-                }
-            ) {
-                complete = false
-            }
+        if (!exists(store, bashrc) &&
+            !writeStep(store, bashrc, onFailure, overwrite = false, uid = account.uid, gid = account.gid) { BASHRC }
+        ) {
+            complete = false
         }
         return complete
+    }
+
+    private val FAIL_FAST: (String, IOException) -> Unit = { _, e -> throw e }
+
+    private fun writeStep(
+        store: String,
+        path: String,
+        onFailure: (String, IOException) -> Unit,
+        overwrite: Boolean = true,
+        uid: Int = 0,
+        gid: Int = 0,
+        content: () -> String,
+    ): Boolean = runSetupStep(path, onFailure) {
+        write(store, path, content(), overwrite, uid, gid)
     }
 
     internal fun runSetupStep(
@@ -726,6 +705,10 @@ esac
         }
     }.getOrNull()
 
+    private const val NETWORK_CONFIG_PATH = "/etc/network/interfaces"
+    private const val ROOTLESS_CONTAINERS_PATH = "/etc/containers/containers.rootless.conf.d/appine.conf"
+    private const val GPU_COMMAND_PATH = "/usr/local/bin/appine-gpu"
+
     /**
      * Refreshes the per-start guest configuration files in [store] before starting the kernel.
      * Fresh imports (`importing = true`) propagate the first I/O failure; existing stores run each
@@ -741,28 +724,14 @@ esac
         gpu: Boolean = false,
         browserConfiguration: String? = null,
         importing: Boolean = false,
-        onFailure: (String, IOException) -> Unit = { _, e -> throw e },
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ): Boolean {
-        val handleFailure: (String, IOException) -> Unit = if (importing) {
-            { _, e -> throw e }
-        } else {
-            onFailure
-        }
-        runSetupStep("/etc/network/interfaces", handleFailure) {
-            ensureNetworkConfig(context, store)
-        }
-        runSetupStep("/etc/containers/containers.rootless.conf.d/appine.conf", handleFailure) {
-            ensureContainersConfig(context, store)
-        }
+        val handleFailure = if (importing) FAIL_FAST else onFailure
+        runSetupStep(NETWORK_CONFIG_PATH, handleFailure) { ensureNetworkConfig(context, store) }
+        runSetupStep(ROOTLESS_CONTAINERS_PATH, handleFailure) { ensureContainersConfig(context, store) }
         ensureLoginTools(context, store, distro, handleFailure)
-        if (distro == Distro.ALPINE) {
-            ensureBashStartup(store, handleFailure)
-        }
-        if (gpu) {
-            runSetupStep("/usr/local/bin/appine-gpu", handleFailure) {
-                ensureGpuCommand(context, store)
-            }
-        }
+        if (distro == Distro.ALPINE) ensureBashStartup(store, handleFailure)
+        if (gpu) runSetupStep(GPU_COMMAND_PATH, handleFailure) { ensureGpuCommand(context, store) }
         val browserReady = browserConfiguration != null &&
             ensureBrowser(context, browserConfiguration, store, handleFailure)
         updateProfile(context, store, distro, upgradeDoas = false, onFailure = handleFailure)
@@ -780,7 +749,7 @@ esac
      */
     @Throws(IOException::class)
     fun ensureNetworkConfig(context: Context, store: String = store(context).path) = write(
-        store, "/etc/network/interfaces",
+        store, NETWORK_CONFIG_PATH,
         "auto lo\niface lo inet loopback\n",
         overwrite = false,
     )
@@ -797,7 +766,7 @@ esac
      */
     @Throws(IOException::class)
     fun ensureContainersConfig(context: Context, store: String = store(context).path) {
-        write(store, "/etc/containers/containers.rootless.conf.d/appine.conf", ROOTLESS_CONTAINERS, overwrite = false)
+        write(store, ROOTLESS_CONTAINERS_PATH, ROOTLESS_CONTAINERS, overwrite = false)
     }
 
     private const val ROOTLESS_CONTAINERS = """# Written by Appine when missing: Appine has no TUN device, so pasta and slirp4netns (the
@@ -814,7 +783,7 @@ netns = "host"
     /** Installs the per-command Venus launcher on new and existing stores. */
     @Throws(IOException::class)
     fun ensureGpuCommand(context: Context, store: String = store(context).path) =
-        installExecutable(context, store, "appine-gpu.sh", "/usr/local/bin/appine-gpu", overwrite = false)
+        installExecutable(context, store, "appine-gpu.sh", GPU_COMMAND_PATH, overwrite = false)
 
     /**
      * Refreshes the bridge before kernel start, preserving user-provided local launchers.
@@ -825,21 +794,20 @@ netns = "host"
         context: Context,
         configuration: String,
         store: String = store(context).path,
-        onFailure: (String, IOException) -> Unit = { _, e -> throw e },
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ): Boolean {
-        runSetupStep("/usr/local/libexec/appine-open-url", onFailure) {
-            installExecutable(context, store, "appine-open-url", "/usr/local/libexec/appine-open-url", overwrite = true)
+        val openUrl = "/usr/local/libexec/appine-open-url"
+        runSetupStep(openUrl, onFailure) {
+            installExecutable(context, store, "appine-open-url", openUrl, overwrite = true)
         }
-        val configured = runSetupStep(BrowserBridge.CONFIG_PATH, onFailure) {
-            Native.writeFile(store, BrowserBridge.CONFIG_PATH, configuration.toByteArray(), 420 /* 0644 */, true)
-        }
-        runSetupStep("/usr/local/bin/xdg-open", onFailure) {
-            val path = "/usr/local/bin/xdg-open"
-            val old = try { Native.readFile(store, path) } catch (_: IOException) { null }
+        val configured = writeStep(store, BrowserBridge.CONFIG_PATH, onFailure) { configuration }
+        val xdgOpen = "/usr/local/bin/xdg-open"
+        runSetupStep(xdgOpen, onFailure) {
+            val old = try { Native.readFile(store, xdgOpen) } catch (_: IOException) { null }
             // Replace the previous Appine OSC helper, but leave a user's own launcher alone.
             val replace = old != null && hex(MessageDigest.getInstance("SHA-256").digest(old)) ==
                 "abaf8d811e48df794b931f2fd5876e255c2c430464081e0d9fe880b80a3a1d76"
-            installExecutable(context, store, "xdg-open.sh", path, overwrite = replace)
+            installExecutable(context, store, "xdg-open.sh", xdgOpen, overwrite = replace)
         }
         return configured
     }
@@ -876,16 +844,11 @@ netns = "host"
         context: Context,
         store: String = store(context).path,
         distro: Distro? = installed(context),
-        onFailure: (String, IOException) -> Unit = { _, e -> throw e },
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) {
         if (distro != Distro.ALPINE) return
-        runSetupStep("/var/cache/appine/doas.apk", onFailure) {
-            val data = context.assets.open("doas.apk").use { it.readBytes() }
-            write(store, "/var/cache/appine/doas.apk", data)
-        }
-        runSetupStep(DOAS_WHEEL_PATH, onFailure) {
-            ensureDoasEnv(store)
-        }
+        runSetupStep("/var/cache/appine/doas.apk", onFailure) { cachePackage(context, store, "doas.apk") }
+        runSetupStep(DOAS_WHEEL_PATH, onFailure) { ensureDoasEnv(store) }
     }
 
     /**
@@ -942,7 +905,7 @@ netns = "host"
         context: Context,
         store: String = store(context).path,
         distro: Distro = installed(context) ?: Distro.ALPINE,
-        onFailure: (String, IOException) -> Unit = { _, e -> throw e },
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) = updateProfile(context, store, distro, upgradeDoas = true, onFailure = onFailure)
 
     @Throws(IOException::class)

@@ -614,6 +614,21 @@ class MachineTest {
      */
     @Test
     fun degradedPerStartConfigAllowsExistingStoreToBoot() = withAlpineStore("store-degraded-start") { store ->
+        fun read(path: String) = Native.readFile(store, path)
+        fun readText(path: String) = read(path)?.decodeToString()
+        fun prepare(
+            importing: Boolean,
+            onFailure: (String, IOException) -> Unit = { _, e -> throw e },
+        ) = Rootfs.prepareStart(
+            context = context,
+            store = store,
+            distro = Rootfs.Distro.ALPINE,
+            gpu = true,
+            browserConfiguration = "12345\ntoken\n",
+            importing = importing,
+            onFailure = onFailure,
+        )
+
         withMachine(store) { machine ->
             checkedShell(
                 machine,
@@ -640,27 +655,18 @@ class MachineTest {
         """.trimIndent()
         Native.writeFile(store, "/etc/profile.d/appine.sh", oldProfile.toByteArray(), 420, true)
 
-        assertThrows(IOException::class.java) {
-            Rootfs.prepareStart(
-                context = context,
-                store = store,
-                distro = Rootfs.Distro.ALPINE,
-                gpu = true,
-                browserConfiguration = "12345\ntoken\n",
-                importing = true,
-            )
-        }
+        assertThrows(IOException::class.java) { prepare(importing = true) }
         // Fresh import stopped at the first failure (/etc/containers) before running later steps.
-        assertEquals("permit persist :wheel\n", String(Native.readFile(store, "/etc/doas.d/20-wheel.conf")!!))
-        assertNull(Native.readFile(store, "/root/.bash_profile"))
-        assertNull(Native.readFile(store, "/usr/local/bin/appine-gpu"))
-        assertNull(Native.readFile(store, "/usr/local/libexec/appine-open-url"))
-        assertEquals(oldProfile, String(Native.readFile(store, "/etc/profile.d/appine.sh")!!))
+        assertEquals("permit persist :wheel\n", readText("/etc/doas.d/20-wheel.conf"))
+        assertNull(read("/root/.bash_profile"))
+        assertNull(read("/usr/local/bin/appine-gpu"))
+        assertNull(read("/usr/local/libexec/appine-open-url"))
+        assertEquals(oldProfile, readText("/etc/profile.d/appine.sh"))
 
         // Remove /etc/network/interfaces written before the importing=true abort so the degraded
         // run below genuinely proves ensureNetworkConfig ran.
         withMachine(store) { machine -> checkedShell(machine, "rm -f /etc/network/interfaces") }
-        assertNull(Native.readFile(store, "/etc/network/interfaces"))
+        assertNull(read("/etc/network/interfaces"))
 
         val failedSteps = mutableListOf<String>()
         var bridgeClosed = false
@@ -668,37 +674,30 @@ class MachineTest {
             importing = false,
             onFailure = { step, _ -> failedSteps.add(step) },
             openBridge = { Closeable { bridgeClosed = true } },
-            configure = { _, onFailure ->
-                Rootfs.prepareStart(
-                    context = context,
-                    store = store,
-                    distro = Rootfs.Distro.ALPINE,
-                    gpu = true,
-                    browserConfiguration = "12345\ntoken\n",
-                    importing = false,
-                    onFailure = onFailure,
-                )
-            },
+            configure = { _, onFailure -> prepare(importing = false, onFailure = onFailure) },
         )
         assertNull(bridge)
         assertTrue("browser bridge must close when /etc/appine/browser cannot be written", bridgeClosed)
-        assertTrue(failedSteps.toString(), "/etc/containers/containers.rootless.conf.d/appine.conf" in failedSteps)
-        assertTrue(failedSteps.toString(), "/var/cache/appine/doas.apk" in failedSteps)
-        assertTrue(failedSteps.toString(), "/etc/skel/.bash_profile" in failedSteps)
-        assertTrue(failedSteps.toString(), "/etc/skel/.bashrc" in failedSteps)
-        assertTrue(failedSteps.toString(), BrowserBridge.CONFIG_PATH in failedSteps)
-        assertTrue(failedSteps.toString(), "/var/lib/appine/zsh-rc-hook-done" in failedSteps)
+        val expectedFailures = listOf(
+            "/etc/containers/containers.rootless.conf.d/appine.conf",
+            "/var/cache/appine/doas.apk",
+            "/etc/skel/.bash_profile",
+            "/etc/skel/.bashrc",
+            BrowserBridge.CONFIG_PATH,
+            "/var/lib/appine/zsh-rc-hook-done",
+        )
+        assertTrue(failedSteps.toString(), failedSteps.containsAll(expectedFailures))
 
         // Unaffected helpers and sibling sub-steps still applied cleanly.
-        assertTrue(String(Native.readFile(store, "/etc/network/interfaces")!!).contains("iface lo inet loopback"))
-        assertTrue(String(Native.readFile(store, "/etc/doas.d/20-wheel.conf")!!).contains("ENV=/etc/profile.d/appine.ashrc"))
-        assertNotNull(Native.readFile(store, "/root/.bash_profile"))
-        assertNotNull(Native.readFile(store, "/root/.bashrc"))
-        assertNull(Native.readFile(store, "/var/lib/appine/bash-startup-done"))
-        assertNotNull(Native.readFile(store, "/usr/local/bin/appine-gpu"))
-        assertNotNull(Native.readFile(store, "/usr/local/libexec/appine-open-url"))
-        assertNotNull(Native.readFile(store, "/usr/local/bin/xdg-open"))
-        assertTrue(String(Native.readFile(store, "/etc/profile.d/appine.sh")!!).contains("appine.bashrc"))
+        assertTrue(readText("/etc/network/interfaces")!!.contains("iface lo inet loopback"))
+        assertTrue(readText("/etc/doas.d/20-wheel.conf")!!.contains("ENV=/etc/profile.d/appine.ashrc"))
+        assertNotNull(read("/root/.bash_profile"))
+        assertNotNull(read("/root/.bashrc"))
+        assertNull(read("/var/lib/appine/bash-startup-done"))
+        assertNotNull(read("/usr/local/bin/appine-gpu"))
+        assertNotNull(read("/usr/local/libexec/appine-open-url"))
+        assertNotNull(read("/usr/local/bin/xdg-open"))
+        assertTrue(readText("/etc/profile.d/appine.sh")!!.contains("appine.bashrc"))
 
         // The degraded store still boots a working repair shell, and an obstructed marker does not
         // re-seed deleted dotfiles or abort startup.
@@ -712,7 +711,7 @@ class MachineTest {
         val markerFailures = mutableListOf<String>()
         Rootfs.ensureBashStartup(store) { step, _ -> markerFailures.add(step) }
         assertEquals(listOf("/var/lib/appine/bash-startup-done"), markerFailures)
-        assertNull(Native.readFile(store, "/root/.bashrc"))
+        assertNull(read("/root/.bashrc"))
     }
 
     /** Offline procps-ng install is independent of bash, retries failures, and respects removal. */

@@ -52,19 +52,16 @@ internal fun <B : Closeable> prepareStartBridge(
         if (importing) throw e
         onFailure(step, e)
     }
-    var bridge: B? = try {
+    val bridge: B? = try {
         openBridge()
     } catch (e: IOException) {
         handleFailure(BrowserBridge.CONFIG_PATH, e)
         null
     }
     try {
-        val ready = configure(bridge, handleFailure)
-        if (!ready) {
-            bridge?.close()
-            bridge = null
-        }
-        return bridge
+        if (configure(bridge, handleFailure)) return bridge
+        bridge?.close()
+        return null
     } catch (e: Throwable) {
         bridge?.close()
         throw e
