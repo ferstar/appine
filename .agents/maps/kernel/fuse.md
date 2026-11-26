@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: program and interpreter inodes in maps and smaps, interpreter cache pinning, and spliced reply length validation)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: FUSE exec set-id/file capabilities, pinned `/proc/<pid>/exe`, and in-process FIFO/device node opens)
 
 ## Responsibilities
 
@@ -70,7 +70,8 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   against eviction, and a pinned writable mapping if teardown writeback needs a retry.
 - `Entry` — a `fuse_entry_out`: node id (0 for a missing name), attributes, both validities.
 - `Query` — what a walk lacked: `Lookup`, `LookupWalk` (batching consecutive uncached plain
-  components in one retry), `Getattr` (with optional open file handle), `Readlink`, `Program`.
+  components in one retry), `Getattr` (with optional open file handle), `Readlink`, `Program`,
+  `FileCaps` (fetching `security.capability` for non-nosuid execve).
 - `Handle` (`FileKind::Fuse`, or a FUSE `Directory`'s `fuse`) — Linux's `fuse_file`: connection,
   node, node id, the daemon's file handle, the `FOPEN_*` flags, the open flags sent,
   directory or not, and `no_release` when no open was made. Every handle is counted in its
@@ -87,11 +88,11 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 
 - Connection and device (`vfs::fuse`): `Options::parse`/`show`, `Conn::new`/`allows`/`abort`,
   `send_init`, `call`, `call_as`, `background`, `dev_read`, `dev_write`, `DevFile` (`new`,
-  `attach`, `readiness`, `object`), `atomic_o_trunc`, `dont_mask`.
+  `attach`, `readiness`, `object`), `atomic_o_trunc`, `dont_mask`, `handle_killpriv`.
 - Cache and retries: `Fuses` (`add`, `remove`, `root_of`, `conn`, `conn_of`, `get`, `node`,
   `cached_child`, `enter`, `enter_negative`, `forget_child`, `moved`, `is_within`, `set_attr`,
   `stale`, `link`, `set_link`, `evict`, `unlinked`, `pin_socket`, `track_mapped`), `token`,
-  `new_syscall`, `need`, `serve`, `program`, `lookup`, `getattr`, `getattr_no_inval`,
+  `new_syscall`, `need`, `serve`, `program`, `file_caps`, `lookup`, `getattr`, `getattr_no_inval`,
   `cached_attr`, `cached_attr_fh`, `target`, `key`, `id_of`, `drop_caches`, `flush_dirty`.
 - Request helpers: `open`, `read`, `write`, `readdir`, `statfs`, `access`, `getxattr`,
   `lock_owner`, `snapshot`.
@@ -99,8 +100,9 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   `setattr`, `read`, `write`, `lseek`, `fill_dir`, `fsync`, `fallocate`, `flush`, `flush_all`,
   `flush_at_exit`, `stat`, `stat_fh`, `statfs`, `access`, `may_chdir`, `xattr_permission`,
   `set_xattr`, `parent`, `mkdir`, `mknod`, `bind_socket`, `symlink`, `link`, `unlink`, `truncate`,
-  `ftruncate`, `file_io`, `io_of`, `map_fill`, `fill`, `prefault`, `prefault_range`,
-  `prefault_iov`, `sweep`, `dev_ioctl`, `seekable`, `checks_permissions`.
+  `ftruncate`, `cleared_setid_mode`, `remove_file_caps`, `file_io`, `io_of`, `map_fill`, `fill`,
+  `prefault`, `prefault_range`, `prefault_iov`, `sweep`, `dev_ioctl`, `seekable`,
+  `checks_permissions`.
 - VFS hooks this module relies on: `Vfs::new_fuse`, `add_fuse_mount`, `fuse`/`fuse_mut`,
   `fuse_child`, `fuse_permission`, `type_of`, `mount_nodes`.
 
@@ -271,15 +273,20 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
 
 ### Opening and creating
 
-- Open (6.1's `may_open`, `fuse_open_common`): a symlink ELOOP; a directory with write access,
-  `O_CREAT` or `O_TRUNC` EISDIR; `O_TRUNC` on a read-only mount or instance (`readonly`) EROFS; a
-  device on a nodev mount EACCES; permission; `O_NOATIME` by a non-owner EPERM; a write open of a
-  regular file on a read-only mount or instance EROFS;
-  writing a program being run ETXTBSY; `O_DIRECTORY` on a non-directory ENOTDIR. Then
-  `FUSE_OPENDIR` or `FUSE_OPEN` with the open flags less `O_CREAT`, `O_EXCL`, `O_NOCTTY` (and
-  `O_TRUNC` without `ATOMIC_O_TRUNC`, which then is a SETATTR after the open). An ENOSYS answer
-  means no open is needed, now and later (cached pages retained, no handle or release). Device nodes, FIFOs and
-  sockets in a FUSE filesystem cannot be opened (ENXIO).
+- Open (6.1's `may_open`, `fuse_init_inode`, `fuse_open_common`): a symlink ELOOP; a directory
+  with write access, `O_CREAT` or `O_TRUNC` EISDIR; `O_TRUNC` on a read-only mount or instance
+  (`readonly`) EROFS; a device on a `nodev` mount or a FUSE superblock owned by a non-initial user
+  namespace (`SB_I_NODEV`) EACCES; permission; the cgroup device BPF filter for `S_IFCHR`/`S_IFBLK`;
+  `O_NOATIME` by a non-owner EPERM; a write open of a regular file on a read-only mount or instance
+  EROFS; writing or truncating a program being run ETXTBSY; `O_DIRECTORY` on a non-directory
+  ENOTDIR; `O_DIRECT` on `S_IFCHR`/`S_IFIFO` EINVAL. Regular files and directories send `FUSE_OPEN`
+  or `FUSE_OPENDIR` with the open flags less `O_CREAT`, `O_EXCL`, `O_NOCTTY` (and `O_TRUNC` without
+  `ATOMIC_O_TRUNC`, which then is a `FUSE_SETATTR` after the open). An ENOSYS answer means no open
+  is needed, now and later (cached pages retained, no handle or release). Special files follow
+  `init_special_inode` without sending `FUSE_OPEN` to the daemon: FIFOs (`S_IFIFO`) open through
+  the kernel's FIFO table keyed by `fuse::key(id)`, character devices (`S_IFCHR`) via
+  `open_char_device` by `rdev`, and block devices (`S_IFBLK`) via `loopdev::open`, pinning the node
+  across blocking opens and through `OpenFile::fuse_path`; sockets (`S_IFSOCK`) return ENXIO.
 - Create (`O_CREAT` of a missing name, 6.1's `fuse_create_open`): EROFS, the directory's write and
   search permission, then `FUSE_CREATE` (mode with the umask applied unless `DONT_MASK`, which
   sends it beside), or from a daemon without it `FUSE_MKNOD` and an open. Without `O_EXCL`, an
@@ -401,10 +408,19 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   (`S_IFSOCK | (0o777 & !umask)`), maps `EEXIST` and trailing slashes to `EADDRINUSE`, and pins the
   node via `Node::sock_pin` so `connect` finds the bound socket by `key(id)` across cache eviction.
 - execve of a FUSE program (or interpreter) reads it whole into a memfd through a retry
-  (`Query::Program`, one copy per file per syscall), runs it as from a nosuid mount, and gives it
-  its node's key as the internal image inode. The main program's key enforces ETXTBSY.
-  Procfs resolves image keys to daemon inodes for maps and smaps and skips the store's
-  deleted-file lookup for FUSE paths. Ordinary FUSE mappings already carry the daemon inode.
+  (`Query::Program`, one copy per file per syscall) and gives it its node's key as the internal
+  image inode. Under Linux 6.1's `mnt_may_suid` (no `MS_NOSUID` and caller inside the connection's
+  user namespace), set-id bits apply and `security.capability` is fetched via `Query::FileCaps`
+  (`FUSE_GETXATTR`, mapped through the connection's user namespace). When the daemon did not
+  negotiate `FUSE_HANDLE_KILLPRIV`, writes, truncations (`O_TRUNC`, `truncate`, `ftruncate`) and
+  non-directory `chown` clear set-id bits (without `CAP_FSETID`) via `FUSE_SETATTR` and strip
+  `security.capability` via `FUSE_REMOVEXATTR` (using `Node::no_sec` as Linux's `S_NOSEC` cache).
+  `ExeFile::fuse` pins the FUSE node, mount, stat snapshot and memfd copy so `/proc/<pid>/exe`
+  follows the executed node directly across renames (updated via `Fuses::moved`) and replacements,
+  shows ` (deleted)` after unlink, and reopens/re-execs deleted programs via `OpenExe` and
+  `FileKind::FuseSnapshot`. The main program's key enforces ETXTBSY. Procfs resolves image keys to
+  daemon inodes for maps and smaps and skips the store's deleted-file lookup for FUSE paths.
+  Ordinary FUSE mappings already carry the daemon inode.
 
 ### inotify
 
@@ -487,9 +503,7 @@ the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/proc
   kernel; the daemon never sees them.
 - **Missing pieces:** no `fuseblk` (ntfs-3g), no fusectl (`/sys/fs/fuse/connections` and its
   `abort`), no `FUSE_IOCTL`, `FUSE_POLL`, `FUSE_COPY_FILE_RANGE`, `FUSE_TMPFILE` or notify
-  retrieve; device nodes and FIFOs on FUSE cannot be opened (ENXIO).
-- **Programs:** set-id bits and file capabilities of FUSE programs never apply (even on a mount
-  without nosuid), and `/proc/<pid>/exe` is followed by path.
+  retrieve.
 
 ## Open questions
 

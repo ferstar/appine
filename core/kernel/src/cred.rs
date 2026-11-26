@@ -841,6 +841,22 @@ impl FileCaps {
     /// caller's user namespace ([`Cred::root_owns`]) give none. Bits beyond [`CAP_FULL`] are
     /// dropped.
     pub fn parse(v: &[u8], cred: &Cred) -> Result<Option<FileCaps>, Errno> {
+        let (magic, words, root) = Self::header(v)?;
+        Self::from_parts(v, magic, words, root, cred)
+    }
+
+    /// Like [`FileCaps::parse`], for a filesystem mounted in `fs_ns` (`sb->s_user_ns`): v1/v2
+    /// map uid 0 in `fs_ns` and v3 maps `rootid` in `fs_ns` to a kernel user ID before checking
+    /// [`Cred::root_owns`] (Linux 6.1's `get_vfs_caps_from_disk`).
+    pub fn parse_in(v: &[u8], fs_ns: &UserNs, cred: &Cred) -> Result<Option<FileCaps>, Errno> {
+        let (magic, words, raw_root) = Self::header(v)?;
+        let Some(root) = fs_ns.uid_map.borrow().down(raw_root) else {
+            return Ok(None);
+        };
+        Self::from_parts(v, magic, words, root, cred)
+    }
+
+    fn header(v: &[u8]) -> Result<(u32, usize, u32), Errno> {
         if v.len() < 4 {
             return Err(Errno::EINVAL);
         }
@@ -851,6 +867,16 @@ impl FileCaps {
             (VFS_CAP_REVISION_3, XATTR_CAPS_SZ_3) => (2, le32(v, 20)),
             _ => return Err(Errno::EINVAL),
         };
+        Ok((magic, words, root))
+    }
+
+    fn from_parts(
+        v: &[u8],
+        magic: u32,
+        words: usize,
+        root: u32,
+        cred: &Cred,
+    ) -> Result<Option<FileCaps>, Errno> {
         if !cred.root_owns(root) {
             return Ok(None);
         }

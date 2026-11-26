@@ -67,17 +67,19 @@ pub(super) fn seekable(h: &Handle) -> bool {
 
 // ---- Opening and creating ----
 
-/// Opens existing FUSE node `id` reached through mount `mnt` (6.1's `may_open` and
-/// `fuse_open_common`): the checks open makes on a store file, with permission as
-/// [`Vfs::fuse_permission`] decides, then `FUSE_OPEN` or `FUSE_OPENDIR`. Without
-/// `FUSE_ATOMIC_O_TRUNC`, `O_TRUNC` is a `FUSE_SETATTR` after the open. Device nodes, FIFOs and
-/// sockets in a FUSE filesystem cannot be opened (ENXIO).
+/// Opens existing FUSE node `id` reached through mount `mnt` (6.1's `may_open`,
+/// `fuse_init_inode` and `fuse_open_common`): the checks open makes on a store file, with
+/// permission as [`Vfs::fuse_permission`] decides, then `FUSE_OPEN` or `FUSE_OPENDIR` for regular
+/// files and directories. Special files (FIFOs, character and block devices) follow Linux's
+/// `init_special_inode` and open in-process without sending `FUSE_OPEN` to the daemon; sockets
+/// return `ENXIO`. Without `FUSE_ATOMIC_O_TRUNC`, `O_TRUNC` is a `FUSE_SETATTR` after the open.
 pub(super) fn open(
     cx: &mut Cx<'_>,
     cred: &Cred,
     vfs: &Vfs,
     (mnt, id): (MountId, FuseId),
     flags: u32,
+    beside: Option<&Node>,
 ) -> Result<FileKind, Errno> {
     let node = Node::Fuse(mnt, id);
     let accmode = flags & oflags::O_ACCMODE;
@@ -98,27 +100,44 @@ pub(super) fn open(
             }
             mask |= MAY_WRITE;
         }
-        mode::S_IFCHR | mode::S_IFBLK if mnt_flags & ms::NODEV != 0 => {
+        // Device nodes cannot be opened on a nodev mount or a superblock mounted in a non-initial
+        // user namespace (Linux 6.1's `MNT_NODEV` and `SB_I_NODEV` in `may_open_dev`).
+        mode::S_IFCHR | mode::S_IFBLK
+            if mnt_flags & ms::NODEV != 0
+                || vfs.fuse().conn_of(id)?.borrow().user_ns().level > 0 =>
+        {
             return Err(Errno::EACCES);
         }
         _ => {}
     }
     vfs.fuse_permission(cred, id, mask)?;
+    let rdev = if matches!(kind, mode::S_IFCHR | mode::S_IFBLK) {
+        let r = fuse::cached_attr(vfs, id)?.rdev;
+        if r != 0 {
+            super::bpf::check_device(cx, kind, r, super::fs::device_access(mask))?;
+        }
+        r
+    } else {
+        0
+    };
     if flags & oflags::O_NOATIME != 0 && !cred.owns(&fuse::cached_attr(vfs, id)?.stat()) {
         return Err(Errno::EPERM);
     }
     if readonly && kind == mode::S_IFREG && accmode != oflags::O_RDONLY {
         return Err(Errno::EROFS);
     }
-    // A program being run cannot be opened for writing (deny_write_access)
+    // A program being run cannot be opened for writing or truncation (deny_write_access)
     if kind == mode::S_IFREG
-        && accmode != oflags::O_RDONLY
+        && (accmode != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0)
         && super::fs::executing(cx, fuse::key(id))
     {
         return Err(Errno::ETXTBSY);
     }
     if kind != mode::S_IFDIR && flags & oflags::O_DIRECTORY != 0 {
         return Err(Errno::ENOTDIR);
+    }
+    if flags & oflags::O_DIRECT != 0 && matches!(kind, mode::S_IFCHR | mode::S_IFIFO) {
+        return Err(Errno::EINVAL);
     }
     match kind {
         mode::S_IFDIR => Ok(FileKind::Directory {
@@ -139,11 +158,14 @@ pub(super) fn open(
             } else {
                 let h = fuse::open(cx, vfs, id, flags, false)?;
                 if truncate {
+                    let mode = cleared_setid_mode(vfs, cred, id, false)?;
                     let set = SetAttr {
+                        mode,
                         size: Some(0),
                         ..SetAttr::default()
                     };
                     setattr(cx, vfs, id, &set, h.fh())?;
+                    remove_file_caps(cx, vfs, id)?;
                 }
                 h
             };
@@ -152,6 +174,24 @@ pub(super) fn open(
             }
             Ok(FileKind::Fuse(Box::new(h)))
         }
+        mode::S_IFIFO => {
+            let _pin = vfs
+                .fuse_mut()
+                .get_mut(id)
+                .ok_or(Errno::ENOTCONN)?
+                .pin_path();
+            super::fs::open_fifo(cx, fuse::key(id), flags)
+        }
+        mode::S_IFCHR => {
+            let _pin = vfs
+                .fuse_mut()
+                .get_mut(id)
+                .ok_or(Errno::ENOTCONN)?
+                .pin_path();
+            let key = fuse::key(id);
+            super::fs::open_char_device(cx, cred, vfs, key, rdev, flags, beside, key)
+        }
+        mode::S_IFBLK => super::loopdev::open(cx, fuse::key(id), rdev, flags),
         _ => Err(Errno::ENXIO),
     }
 }
@@ -585,6 +625,19 @@ pub(super) fn write(
     let _pos = super::fs::PosGuard::lock_if(cx, file, offset.is_none() && !pos_held)?;
     let start = offset.unwrap_or_else(|| file.borrow().pos);
     let vfs = cx.vfs()?;
+    // When the daemon did not negotiate `FUSE_HANDLE_KILLPRIV`, clear set-id bits and
+    // `security.capability` before writing (Linux 6.1's `file_remove_privs`).
+    if !data.is_empty() {
+        let cred = cx.cred();
+        if let Some(mode) = cleared_setid_mode(&vfs, &cred, io.id, false)? {
+            let set = SetAttr {
+                mode: Some(mode),
+                ..SetAttr::default()
+            };
+            setattr(cx, &vfs, io.id, &set, io.fh())?;
+        }
+        remove_file_caps(cx, &vfs, io.id)?;
+    }
     // Appends to one node go one at a time from asking for the size to writing there
     let (n, at) = with_io(cx, &vfs, io.id, false, |cx| {
         let at = if append {
@@ -1198,7 +1251,13 @@ pub(super) fn set_xattr(
         Err(Errno::ENOSYS) => Err(Errno::EOPNOTSUPP),
         r => {
             r?;
-            vfs.fuse_mut().stale(id);
+            let mut fuse = vfs.fuse_mut();
+            fuse.stale(id);
+            if name == crate::cred::XATTR_NAME_CAPS
+                && let Some(n) = fuse.get_mut(id)
+            {
+                n.no_sec = value.is_none();
+            }
             Ok(())
         }
     }
@@ -1589,21 +1648,12 @@ pub(super) fn rename_at(
     let dir_move = src_dir || (exchange && dst_seen.is_some_and(|(_, d)| d));
     let dst_seen = with_dir_locks(cx, &vfs, from, to, dir_move, |cx| {
         check_loop()?;
-        rename_locked(
-            cx,
-            &vfs,
-            (from, old),
-            (to, new),
-            src_dir.then_some(src),
-            flags,
-        )?;
+        rename_locked(cx, &vfs, (from, old), (to, new), Some(src), flags)?;
         Ok(dst_seen.map(|(d, dir)| {
             let mut f = vfs.fuse_mut();
             f.stale(d);
             let last = if exchange {
-                if dir {
-                    f.moved(d, from, old);
-                }
+                f.moved(d, from, old);
                 false
             } else {
                 f.unlinked(d, dir)
@@ -1658,6 +1708,90 @@ pub(super) fn checks_permissions(vfs: &Vfs, id: FuseId) -> Result<bool, Errno> {
     Ok(vfs.fuse().conn_of(id)?.borrow().opts.default_permissions)
 }
 
+/// Computes the cleared mode bits when a non-directory FUSE file should drop setuid/setgid on
+/// write, truncate (`for_chown == false`) or chown (`for_chown == true`) and the daemon did not
+/// negotiate `FUSE_HANDLE_KILLPRIV`. Returns `Ok(None)` when nothing needs clearing.
+pub(super) fn cleared_setid_mode(
+    vfs: &Vfs,
+    cred: &Cred,
+    id: FuseId,
+    for_chown: bool,
+) -> Result<Option<u32>, Errno> {
+    let conn = vfs.fuse().conn_of(id)?;
+    if fuse::handle_killpriv(&conn.borrow()) {
+        return Ok(None);
+    }
+    let st = match vfs.fuse().get(id) {
+        Some(n) => n.attr.stat(),
+        None => return Err(Errno::ENOTCONN),
+    };
+    if st.is_dir() {
+        return Ok(None);
+    }
+    let has_suid = st.mode & mode::S_ISUID != 0;
+    let has_sgid = st.mode & mode::S_ISGID != 0;
+    if !has_suid && !has_sgid {
+        return Ok(None);
+    }
+    let fsetid = cred.capable_wrt(&st, crate::cred::cap::FSETID);
+    let drop_suid = has_suid && (for_chown || !fsetid);
+    let drop_sgid = has_sgid
+        && if for_chown {
+            st.mode & 0o010 != 0 || !(cred.in_group(st.gid) || fsetid)
+        } else {
+            st.mode & 0o010 != 0 && !fsetid
+        };
+    if !drop_suid && !drop_sgid {
+        return Ok(None);
+    }
+    let mut perm = st.mode & 0o7777;
+    if drop_suid {
+        perm &= !mode::S_ISUID;
+    }
+    if drop_sgid {
+        perm &= !mode::S_ISGID;
+    }
+    Ok(Some(perm))
+}
+
+/// Removes `security.capability` on a FUSE regular file before write, truncate or chown when the
+/// daemon did not negotiate `FUSE_HANDLE_KILLPRIV` (Linux 6.1's `security_inode_killpriv`).
+/// Uses `Node::no_sec` (`S_NOSEC`) to avoid probing again once confirmed absent.
+pub(super) fn remove_file_caps(cx: &mut Cx<'_>, vfs: &Vfs, id: FuseId) -> Result<(), Errno> {
+    {
+        let f = vfs.fuse();
+        let Some(n) = f.get(id) else {
+            return Err(Errno::ENOTCONN);
+        };
+        if n.kind() != mode::S_IFREG || n.no_sec {
+            return Ok(());
+        }
+        let conn = f.conn_of(id)?;
+        let c = conn.borrow();
+        if fuse::handle_killpriv(&c) || c.no & (fuse::no::GETXATTR | fuse::no::REMOVEXATTR) != 0 {
+            return Ok(());
+        }
+    }
+    match fuse::getxattr(cx, vfs, id, Some(crate::cred::XATTR_NAME_CAPS), 0) {
+        Ok(_) => {
+            match set_xattr(cx, vfs, id, crate::cred::XATTR_NAME_CAPS, None) {
+                Ok(()) | Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
+                Err(e) => return Err(e),
+            }
+            if let Some(n) = vfs.fuse_mut().get_mut(id) {
+                n.no_sec = true;
+            }
+        }
+        Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {
+            if let Some(n) = vfs.fuse_mut().get_mut(id) {
+                n.no_sec = true;
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// truncate(2) of FUSE node `id` (6.1's `vfs_truncate`): the type, a read-only mount, write
 /// permission, then `FUSE_SETATTR` with the size.
 pub(super) fn truncate(cx: &mut Cx<'_>, node: &Node, len: u64) -> Result<(), Errno> {
@@ -1673,23 +1807,29 @@ pub(super) fn truncate(cx: &mut Cx<'_>, node: &Node, len: u64) -> Result<(), Err
     if vfs.readonly(node) {
         return Err(Errno::EROFS);
     }
-    vfs.fuse_permission(&cx.cred(), id, MAY_WRITE)?;
+    let cred = cx.cred();
+    vfs.fuse_permission(&cred, id, MAY_WRITE)?;
     super::fs::check_fsize(cx, len)?;
     let set = SetAttr {
+        mode: cleared_setid_mode(&vfs, &cred, id, false)?,
         size: Some(len),
         ..SetAttr::default()
     };
-    setattr(cx, &vfs, id, &set, None)
+    setattr(cx, &vfs, id, &set, None)?;
+    remove_file_caps(cx, &vfs, id)
 }
 
 /// ftruncate of an open FUSE file: `FUSE_SETATTR` with the size through its handle.
 pub(super) fn ftruncate(cx: &mut Cx<'_>, io: &Io, len: u64) -> Result<(), Errno> {
     let vfs = cx.vfs()?;
+    let cred = cx.cred();
     let set = SetAttr {
+        mode: cleared_setid_mode(&vfs, &cred, io.id, false)?,
         size: Some(len),
         ..SetAttr::default()
     };
-    setattr(cx, &vfs, io.id, &set, io.fh())
+    setattr(cx, &vfs, io.id, &set, io.fh())?;
+    remove_file_caps(cx, &vfs, io.id)
 }
 
 /// The open FUSE regular file of descriptor `file`.
@@ -2162,6 +2302,15 @@ fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<HashSet<FuseId>> {
     }
     for n in vfs.mount_nodes() {
         add(n);
+    }
+    for group in k.groups.values() {
+        let g = group.try_borrow().ok()?;
+        if !g.threads.is_empty()
+            && let Some(exe) = &g.exe
+            && let Some(f) = &exe.fuse
+        {
+            used.insert(f.id);
+        }
     }
     used.extend(inodes.into_iter().filter_map(fuse::id_of));
     let inotify = k.inotify.try_borrow().ok()?;
@@ -2766,7 +2915,7 @@ mod tests {
             assert!(!cx.mm().maps_ino(ino));
             assert!(super::super::fs::executing(cx, fuse::key(prog)));
             assert!(matches!(
-                open(cx, &cred, &vfs, (h.mnt, prog), oflags::O_WRONLY),
+                open(cx, &cred, &vfs, (h.mnt, prog), oflags::O_WRONLY, None),
                 Err(Errno::ETXTBSY)
             ));
             let used = in_use(cx.kr(), &vfs).unwrap();
@@ -3943,6 +4092,1432 @@ mod tests {
                 assert_eq!(&b, b"Z");
             });
             assert!(reads.load(Ordering::Relaxed) > reads_before);
+
+            stop.store(true, Ordering::Relaxed);
+            daemon.join().unwrap();
+        });
+    }
+
+    fn attr_bytes_full(
+        ino: u64,
+        mode: u32,
+        size: u64,
+        nlink: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+    ) -> Vec<u8> {
+        Args::default()
+            .u64(ino)
+            .u64(size)
+            .u64(0)
+            .u64(0)
+            .u64(0)
+            .u64(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(mode)
+            .u32(nlink)
+            .u32(uid)
+            .u32(gid)
+            .u32(rdev)
+            .u32(4096)
+            .u32(0)
+            .0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn entry_out_full(
+        nodeid: u64,
+        mode: u32,
+        size: u64,
+        nlink: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+        valid_secs: u64,
+    ) -> Vec<u8> {
+        Args::default()
+            .u64(nodeid)
+            .u64(0)
+            .u64(valid_secs)
+            .u64(valid_secs)
+            .u32(0)
+            .u32(0)
+            .bytes(&attr_bytes_full(nodeid, mode, size, nlink, uid, gid, rdev))
+            .0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attr_out_full(
+        ino: u64,
+        mode: u32,
+        size: u64,
+        nlink: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+        valid_secs: u64,
+    ) -> Vec<u8> {
+        Args::default()
+            .u64(valid_secs)
+            .u32(0)
+            .u32(0)
+            .bytes(&attr_bytes_full(ino, mode, size, nlink, uid, gid, rdev))
+            .0
+    }
+
+    /// Minimal valid static AArch64 ELF64 binary with an embedded marker payload.
+    fn minimal_elf(marker: &[u8]) -> Vec<u8> {
+        let total = 0x90 + marker.len();
+        let mut elf = vec![0u8; total];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+        elf[24..32].copy_from_slice(&0x40_0080u64.to_le_bytes()); // e_entry
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        // Single PT_LOAD segment mapping the file at 0x40_0000
+        let ph = &mut elf[64..120];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        ph[8..16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+        ph[16..24].copy_from_slice(&0x40_0000u64.to_le_bytes()); // p_vaddr
+        ph[24..32].copy_from_slice(&0x40_0000u64.to_le_bytes()); // p_paddr
+        ph[32..40].copy_from_slice(&(total as u64).to_le_bytes()); // p_filesz
+        ph[40..48].copy_from_slice(&(total as u64).to_le_bytes()); // p_memsz
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        // `ret` at 0x80 and marker at 0x90
+        elf[0x80..0x84].copy_from_slice(&0xd65f_03c0u32.to_le_bytes());
+        elf[0x90..0x90 + marker.len()].copy_from_slice(marker);
+        elf
+    }
+
+    fn cap_xattr_v2(permitted: u64, inheritable: u64, effective: bool) -> Vec<u8> {
+        let magic = 0x0200_0000u32 | u32::from(effective);
+        Args::default()
+            .u32(magic)
+            .u32(permitted as u32)
+            .u32(inheritable as u32)
+            .u32((permitted >> 32) as u32)
+            .u32((inheritable >> 32) as u32)
+            .0
+    }
+
+    fn map_scratch(cx: &mut Cx<'_>, addr: u64) -> u64 {
+        cx.mm_mut()
+            .map_anonymous(
+                addr,
+                PAGE_SIZE,
+                appine_engine::prot::READ | appine_engine::prot::WRITE,
+            )
+            .unwrap();
+        addr
+    }
+
+    fn guest_execve(
+        cx: &mut Cx<'_>,
+        cpu: &mut appine_engine::Cpu,
+        path: &[u8],
+    ) -> Result<bool, Errno> {
+        let scratch = map_scratch(cx, 0x2000_0000);
+        let path_addr = scratch;
+        let argv_addr = scratch + 256;
+        let envp_addr = scratch + 320;
+        let mut nul = path.to_vec();
+        nul.push(0);
+        cx.write_user(crate::uaccess::UserSlice::new(path_addr, nul.len()), &nul)
+            .unwrap();
+        let argv_ptrs: [u64; 2] = [path_addr, 0];
+        let mut argv_raw = [0u8; 16];
+        argv_raw[..8].copy_from_slice(&argv_ptrs[0].to_le_bytes());
+        cx.write_user(crate::uaccess::UserSlice::new(argv_addr, 16), &argv_raw)
+            .unwrap();
+        cx.write_user(crate::uaccess::UserSlice::new(envp_addr, 8), &[0u8; 8])
+            .unwrap();
+        fuse::new_syscall();
+        let mut opens = inotify::ExecOpens::default();
+        loop {
+            match super::super::proc::execve(cx, cpu, path_addr, argv_addr, envp_addr, &mut opens) {
+                Err(Errno::FUSE_RETRY) => {
+                    fuse::serve(cx, |k, id| opens.fuse_opened(k, fuse::key(id)))?;
+                    opens.retry();
+                }
+                r => {
+                    if r.is_err() {
+                        opens.close();
+                    }
+                    return r;
+                }
+            }
+        }
+    }
+
+    fn write_guest_cstr(cx: &mut Cx<'_>, base: u64, bytes: &[u8]) -> u64 {
+        let mut nul = bytes.to_vec();
+        nul.push(0);
+        cx.write_user(crate::uaccess::UserSlice::new(base, nul.len()), &nul)
+            .unwrap();
+        base
+    }
+
+    fn set_unpriv_cred(h: &Harness, tid: Tid, uid: u32, gid: u32) {
+        let k = h.shared.lock();
+        let mut c = k.tasks[&tid].cred.borrow().clone();
+        c.setresgid(Some(gid), Some(gid), Some(gid)).unwrap();
+        c.setresuid(Some(uid), Some(uid), Some(uid)).unwrap();
+        *k.tasks[&tid].cred.borrow_mut() = c.clone();
+        k.groups[&tid].borrow_mut().cred = c;
+    }
+
+    #[test]
+    fn fuse_exec_applies_setid_and_file_caps_and_honors_nosuid_and_killpriv() {
+        let mut rig = new_rig("exec-privs", &[90, 91, 92, 93, 94]);
+        let h = &rig.h;
+        // Enable default_permissions so DAC and ownership behave as on a standard mount.
+        {
+            let k = h.shared.lock();
+            let vfs = k.vfs.as_ref().unwrap();
+            vfs.fuse()
+                .conn_of(h.root)
+                .unwrap()
+                .borrow_mut()
+                .opts
+                .default_permissions = true;
+        }
+        let elf = minimal_elf(b"SETID_CAPS_TEST");
+        let elf_len = elf.len() as u64;
+        let bind_cap = 1u64 << crate::cred::cap::NET_BIND_SERVICE;
+        let caps_v2 = cap_xattr_v2(bind_cap, 0, true);
+
+        let getxattr_count = AtomicUsize::new(0);
+        let setattr_modes = std::sync::Mutex::new(Vec::<u32>::new());
+        let removed_xattrs = std::sync::Mutex::new(Vec::<Vec<u8>>::new());
+        let suid_mode = std::sync::atomic::AtomicU32::new(
+            mode::S_IFREG | mode::S_ISUID | mode::S_ISGID | 0o755,
+        );
+        let has_cap_xattr = AtomicBool::new(true);
+        let stop = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let daemon = s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let (opcode, unique, nodeid, msg) = match h.read_req(true) {
+                        Ok(r) => r,
+                        Err(Errno::EAGAIN) => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("dev_read failed: {e:?}"),
+                    };
+                    match opcode {
+                        op::LOOKUP => {
+                            let name = msg[40..].split(|&b| b == 0).next().unwrap();
+                            match name {
+                                b"suid" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        20,
+                                        suid_mode.load(Ordering::Relaxed),
+                                        elf_len,
+                                        1,
+                                        0,
+                                        42,
+                                        0,
+                                        0,
+                                    ),
+                                ),
+                                b"fcaps" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        21,
+                                        mode::S_IFREG | 0o755,
+                                        elf_len,
+                                        1,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                    ),
+                                ),
+                                b"killpriv" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        22,
+                                        mode::S_IFREG | mode::S_ISUID | 0o777,
+                                        elf_len,
+                                        1,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                    ),
+                                ),
+                                _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                            }
+                        }
+                        op::GETATTR => match nodeid {
+                            1 => h.reply_ok(
+                                unique,
+                                &attr_out_full(1, mode::S_IFDIR | 0o755, 0, 2, 0, 0, 0, 60),
+                            ),
+                            20 => h.reply_ok(
+                                unique,
+                                &attr_out_full(
+                                    20,
+                                    suid_mode.load(Ordering::Relaxed),
+                                    elf_len,
+                                    1,
+                                    0,
+                                    42,
+                                    0,
+                                    0,
+                                ),
+                            ),
+                            21 => h.reply_ok(
+                                unique,
+                                &attr_out_full(21, mode::S_IFREG | 0o755, elf_len, 1, 0, 0, 0, 0),
+                            ),
+                            22 => h.reply_ok(
+                                unique,
+                                &attr_out_full(
+                                    22,
+                                    mode::S_IFREG | mode::S_ISUID | 0o777,
+                                    elf_len,
+                                    1,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                ),
+                            ),
+                            _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                        },
+                        op::OPEN => {
+                            let body = Args::default().u64(nodeid + 100).u32(0).u32(0).0;
+                            h.reply_ok(unique, &body);
+                        }
+                        op::READ => {
+                            let off = u64::from_le_bytes(msg[48..56].try_into().unwrap()) as usize;
+                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap()) as usize;
+                            let end = (off + sz).min(elf.len());
+                            let slice = if off < elf.len() { &elf[off..end] } else { &[] };
+                            h.reply_ok(unique, slice);
+                        }
+                        op::GETXATTR => {
+                            getxattr_count.fetch_add(1, Ordering::Relaxed);
+                            let sz = u32::from_le_bytes(msg[40..44].try_into().unwrap()) as usize;
+                            let name = msg[48..].split(|&b| b == 0).next().unwrap();
+                            if name == crate::cred::XATTR_NAME_CAPS
+                                && (nodeid == 21
+                                    || (nodeid == 22 && has_cap_xattr.load(Ordering::Relaxed)))
+                            {
+                                if sz == 0 {
+                                    h.reply_ok(
+                                        unique,
+                                        &Args::default().u32(caps_v2.len() as u32).u32(0).0,
+                                    );
+                                } else {
+                                    h.reply_ok(unique, &caps_v2);
+                                }
+                            } else {
+                                h.reply(unique, Errno::ENODATA.0, &[]);
+                            }
+                        }
+                        op::SETATTR => {
+                            let valid = u32::from_le_bytes(msg[40..44].try_into().unwrap());
+                            let new_mode = u32::from_le_bytes(msg[108..112].try_into().unwrap());
+                            if valid & fuse::fattr::MODE != 0 {
+                                setattr_modes.lock().unwrap().push(new_mode);
+                            }
+                            h.reply_ok(
+                                unique,
+                                &attr_out_full(
+                                    nodeid,
+                                    mode::S_IFREG | (new_mode & 0o7777),
+                                    elf_len,
+                                    1,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                ),
+                            );
+                        }
+                        op::REMOVEXATTR => {
+                            let name = msg[40..].split(|&b| b == 0).next().unwrap().to_vec();
+                            if name == crate::cred::XATTR_NAME_CAPS {
+                                has_cap_xattr.store(false, Ordering::Relaxed);
+                            }
+                            removed_xattrs.lock().unwrap().push(name);
+                            h.reply_ok(unique, &[]);
+                        }
+                        op::WRITE => {
+                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap());
+                            h.reply_ok(unique, &Args::default().u32(sz).u32(0).0);
+                        }
+                        op::FLUSH => h.reply_ok(unique, &[]),
+                        other => panic!("unexpected opcode {other}"),
+                    }
+                }
+            });
+            let _stop_guard = StopOnDrop(&stop);
+
+            // 1. Setuid + setgid binary on mount WITHOUT MS_NOSUID.
+            set_unpriv_cred(h, 90, 1000, 1000);
+            h.cx(90, |cx| {
+                guest_execve(cx, &mut rig._cpus[1], b"/mnt/suid").unwrap();
+                let c = cx.cred();
+                assert_eq!((c.ruid, c.euid, c.suid, c.fsuid), (1000, 0, 0, 0));
+                assert_eq!((c.rgid, c.egid, c.sgid, c.fsgid), (1000, 42, 42, 42));
+                assert_eq!(c.cap_effective, crate::cred::CAP_FULL);
+                assert_eq!(c.cap_permitted, crate::cred::CAP_FULL);
+            });
+
+            // 2. File capabilities binary on mount WITHOUT MS_NOSUID.
+            set_unpriv_cred(h, 91, 1000, 1000);
+            h.cx(91, |cx| {
+                guest_execve(cx, &mut rig._cpus[2], b"/mnt/fcaps").unwrap();
+                let c = cx.cred();
+                assert_eq!((c.ruid, c.euid), (1000, 1000));
+                assert_eq!(c.cap_permitted, bind_cap);
+                assert_eq!(c.cap_effective, bind_cap);
+            });
+
+            // 3. no_new_privs suppresses both set-id and file capabilities even without MS_NOSUID.
+            set_unpriv_cred(h, 92, 1000, 1000);
+            h.shared.lock().tasks[&92].no_new_privs.set(true);
+            h.cx(92, |cx| {
+                guest_execve(cx, &mut rig._cpus[3], b"/mnt/suid").unwrap();
+                let c = cx.cred();
+                assert_eq!(
+                    (c.euid, c.egid, c.cap_permitted, c.cap_effective),
+                    (1000, 1000, 0, 0)
+                );
+            });
+
+            // 4. Write to setuid + file-caps file without HANDLE_KILLPRIV strips setuid and caps.
+            set_unpriv_cred(h, 94, 1000, 1000);
+            h.cx(94, |cx| {
+                let vfs = cx.vfs().unwrap();
+                let cred = cx.cred();
+                let root = cx.root();
+                let node = run_with_retries(cx, |cx| {
+                    vfs.resolve(&cx.view(&vfs), &cred, &root, &root, b"/mnt/killpriv", true)
+                })
+                .unwrap();
+                let Node::Fuse(m, id) = node else { panic!() };
+                let kind = open(cx, &cred, &vfs, (m, id), oflags::O_WRONLY, None).unwrap();
+                let file = OpenFile::new(kind, oflags::O_WRONLY);
+                let io = file_io(&file).unwrap();
+                write(cx, &file, &io, b"x", Some(0), false, false).unwrap();
+            });
+            assert_eq!(*setattr_modes.lock().unwrap(), vec![0o777]);
+            assert_eq!(
+                *removed_xattrs.lock().unwrap(),
+                vec![crate::cred::XATTR_NAME_CAPS.to_vec()]
+            );
+
+            // 5. Mount WITH MS_NOSUID ignores set-id and skips FUSE_GETXATTR for file caps.
+            {
+                let k = h.shared.lock();
+                k.vfs
+                    .as_ref()
+                    .unwrap()
+                    .update_mount(h.mnt, |m| m.flags |= ms::NOSUID);
+            }
+            let getxattr_before = getxattr_count.load(Ordering::Relaxed);
+            set_unpriv_cred(h, 93, 1000, 1000);
+            h.cx(93, |cx| {
+                guest_execve(cx, &mut rig._cpus[4], b"/mnt/suid").unwrap();
+                let c = cx.cred();
+                assert_eq!(
+                    (c.euid, c.egid, c.cap_permitted, c.cap_effective),
+                    (1000, 1000, 0, 0)
+                );
+            });
+            h.cx(93, |cx| {
+                guest_execve(cx, &mut rig._cpus[4], b"/mnt/fcaps").unwrap();
+                let c = cx.cred();
+                assert_eq!((c.euid, c.cap_permitted, c.cap_effective), (1000, 0, 0));
+            });
+            assert_eq!(getxattr_count.load(Ordering::Relaxed), getxattr_before);
+
+            stop.store(true, Ordering::Relaxed);
+            daemon.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn fuse_proc_exe_follows_node_across_rename_replace_and_unlink() {
+        let mut rig = new_rig("proc-exe", &[95]);
+        let h = &rig.h;
+        let orig_elf = minimal_elf(b"ORIG_FUSE_EXE");
+        let repl_elf = minimal_elf(b"REPL_FUSE_EXE");
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum State {
+            Initial,
+            RenamedAndReplaced,
+            Unlinked,
+        }
+        let state = std::sync::Mutex::new(State::Initial);
+        let opened_nodeids = std::sync::Mutex::new(Vec::<u64>::new());
+        let stop = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let daemon = s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let (opcode, unique, nodeid, msg) = match h.read_req(true) {
+                        Ok(r) => r,
+                        Err(Errno::EAGAIN) => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("dev_read failed: {e:?}"),
+                    };
+                    let st = *state.lock().unwrap();
+                    match opcode {
+                        op::LOOKUP => {
+                            let name = msg[40..].split(|&b| b == 0).next().unwrap();
+                            match (st, name) {
+                                (State::Initial, b"prog") => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        30,
+                                        mode::S_IFREG | 0o755,
+                                        orig_elf.len() as u64,
+                                        1,
+                                        0,
+                                        0,
+                                        0,
+                                        60,
+                                    ),
+                                ),
+                                (State::RenamedAndReplaced, b"prog") => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        31,
+                                        mode::S_IFREG | 0o755,
+                                        repl_elf.len() as u64,
+                                        1,
+                                        0,
+                                        0,
+                                        0,
+                                        60,
+                                    ),
+                                ),
+                                (State::RenamedAndReplaced, b"prog_moved") => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        30,
+                                        mode::S_IFREG | 0o755,
+                                        orig_elf.len() as u64,
+                                        1,
+                                        0,
+                                        0,
+                                        0,
+                                        60,
+                                    ),
+                                ),
+                                _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                            }
+                        }
+                        op::GETATTR => match nodeid {
+                            1 => h.reply_ok(
+                                unique,
+                                &attr_out_full(1, mode::S_IFDIR | 0o755, 0, 2, 0, 0, 0, 60),
+                            ),
+                            30 if st != State::Unlinked => h.reply_ok(
+                                unique,
+                                &attr_out_full(
+                                    30,
+                                    mode::S_IFREG | 0o755,
+                                    orig_elf.len() as u64,
+                                    1,
+                                    0,
+                                    0,
+                                    0,
+                                    60,
+                                ),
+                            ),
+                            31 => h.reply_ok(
+                                unique,
+                                &attr_out_full(
+                                    31,
+                                    mode::S_IFREG | 0o755,
+                                    repl_elf.len() as u64,
+                                    1,
+                                    0,
+                                    0,
+                                    0,
+                                    60,
+                                ),
+                            ),
+                            _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                        },
+                        op::OPEN => {
+                            opened_nodeids.lock().unwrap().push(nodeid);
+                            if nodeid == 30 && st == State::Unlinked {
+                                h.reply(unique, Errno::ENOENT.0, &[]);
+                            } else {
+                                let body = Args::default().u64(nodeid + 200).u32(0).u32(0).0;
+                                h.reply_ok(unique, &body);
+                            }
+                        }
+                        op::READ => {
+                            let off = u64::from_le_bytes(msg[48..56].try_into().unwrap()) as usize;
+                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap()) as usize;
+                            let data = if nodeid == 31 { &repl_elf } else { &orig_elf };
+                            let end = (off + sz).min(data.len());
+                            h.reply_ok(
+                                unique,
+                                if off < data.len() {
+                                    &data[off..end]
+                                } else {
+                                    &[]
+                                },
+                            );
+                        }
+                        op::GETXATTR => h.reply(unique, Errno::ENODATA.0, &[]),
+                        op::RENAME => {
+                            *state.lock().unwrap() = State::RenamedAndReplaced;
+                            h.reply_ok(unique, &[]);
+                        }
+                        op::UNLINK => {
+                            *state.lock().unwrap() = State::Unlinked;
+                            h.reply_ok(unique, &[]);
+                        }
+                        op::FLUSH => h.reply_ok(unique, &[]),
+                        other => panic!("unexpected opcode {other}"),
+                    }
+                }
+            });
+            let _stop_guard = StopOnDrop(&stop);
+
+            // 1. Exec /mnt/prog.
+            h.cx(95, |cx| {
+                guest_execve(cx, &mut rig._cpus[1], b"/mnt/prog").unwrap();
+                let vfs = cx.vfs().unwrap();
+                let link = run_with_retries(cx, |cx| {
+                    vfs.readlink(
+                        &cx.view(&vfs),
+                        &vfs.resolve(
+                            &cx.view(&vfs),
+                            &cx.cred(),
+                            &cx.root(),
+                            &cx.root(),
+                            b"/proc/self/exe",
+                            false,
+                        )?,
+                    )
+                })
+                .unwrap();
+                assert_eq!(link, b"/mnt/prog");
+            });
+
+            // 2. Rename /mnt/prog -> /mnt/prog_moved (daemon exposes a different file at /mnt/prog).
+            h.cx(95, |cx| {
+                let scratch = map_scratch(cx, 0x2100_0000);
+                let old_p = write_guest_cstr(cx, scratch, b"/mnt/prog");
+                let new_p = write_guest_cstr(cx, scratch + 64, b"/mnt/prog_moved");
+                let exe_p = write_guest_cstr(cx, scratch + 128, b"/proc/self/exe");
+                let stat_buf = scratch + 256;
+                let read_buf = scratch + 512;
+
+                run_with_retries(cx, |cx| {
+                    super::super::fs::renameat2(
+                        cx,
+                        super::super::fs::AT_FDCWD,
+                        old_p,
+                        super::super::fs::AT_FDCWD,
+                        new_p,
+                        0,
+                    )
+                })
+                .unwrap();
+
+                // readlink now reflects the renamed path (not deleted).
+                let vfs = cx.vfs().unwrap();
+                let exe_node = vfs
+                    .resolve(
+                        &cx.view(&vfs),
+                        &cx.cred(),
+                        &cx.root(),
+                        &cx.root(),
+                        b"/proc/self/exe",
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    vfs.readlink(&cx.view(&vfs), &exe_node).unwrap(),
+                    b"/mnt/prog_moved"
+                );
+
+                // stat(/proc/self/exe) returns the original daemon ino (30), not replacement (31).
+                run_with_retries(cx, |cx| {
+                    super::super::fs::newfstatat(cx, super::super::fs::AT_FDCWD, exe_p, stat_buf, 0)
+                })
+                .unwrap();
+                let mut raw_stat = [0u8; 128];
+                cx.read_user(crate::uaccess::UserSlice::new(stat_buf, 128), &mut raw_stat)
+                    .unwrap();
+                assert_eq!(u64::from_le_bytes(raw_stat[8..16].try_into().unwrap()), 30);
+
+                // open(/proc/self/exe, O_WRONLY) returns ETXTBSY.
+                assert_eq!(
+                    run_with_retries(cx, |cx| {
+                        super::super::fs::openat(
+                            cx,
+                            super::super::fs::AT_FDCWD,
+                            exe_p,
+                            oflags::O_WRONLY,
+                            0,
+                        )
+                    }),
+                    Err(Errno::ETXTBSY)
+                );
+
+                // open(/proc/self/exe, O_RDONLY) opens original nodeid 30 and reads ORIG_FUSE_EXE.
+                let fd = run_with_retries(cx, |cx| {
+                    super::super::fs::openat(
+                        cx,
+                        super::super::fs::AT_FDCWD,
+                        exe_p,
+                        oflags::O_RDONLY,
+                        0,
+                    )
+                })
+                .unwrap() as i32;
+                let n = super::super::fs::read(cx, fd, read_buf, orig_elf.len()).unwrap() as usize;
+                let mut got = vec![0u8; n];
+                cx.read_user(crate::uaccess::UserSlice::new(read_buf, n), &mut got)
+                    .unwrap();
+                assert_eq!(got, orig_elf);
+                super::super::fs::close(cx, fd).unwrap();
+                assert_eq!(*opened_nodeids.lock().unwrap().last().unwrap(), 30);
+
+                // 3. Unlink /mnt/prog_moved.
+                run_with_retries(cx, |cx| {
+                    super::super::fs::unlinkat(cx, super::super::fs::AT_FDCWD, new_p, 0)
+                })
+                .unwrap();
+
+                // readlink now shows " (deleted)".
+                assert_eq!(
+                    vfs.readlink(&cx.view(&vfs), &exe_node).unwrap(),
+                    b"/mnt/prog_moved (deleted)"
+                );
+
+                // stat(/proc/self/exe) still succeeds with original daemon ino 30 and nlink 0.
+                run_with_retries(cx, |cx| {
+                    super::super::fs::newfstatat(cx, super::super::fs::AT_FDCWD, exe_p, stat_buf, 0)
+                })
+                .unwrap();
+                cx.read_user(crate::uaccess::UserSlice::new(stat_buf, 128), &mut raw_stat)
+                    .unwrap();
+                assert_eq!(u64::from_le_bytes(raw_stat[8..16].try_into().unwrap()), 30);
+                assert_eq!(u32::from_le_bytes(raw_stat[20..24].try_into().unwrap()), 0);
+
+                // open(/proc/self/exe, O_WRONLY) still returns ETXTBSY.
+                assert_eq!(
+                    run_with_retries(cx, |cx| {
+                        super::super::fs::openat(
+                            cx,
+                            super::super::fs::AT_FDCWD,
+                            exe_p,
+                            oflags::O_WRONLY,
+                            0,
+                        )
+                    }),
+                    Err(Errno::ETXTBSY)
+                );
+
+                // open(/proc/self/exe, O_RDONLY) succeeds via pinned snapshot without daemon OPEN.
+                let opens_before = opened_nodeids.lock().unwrap().len();
+                let fd = run_with_retries(cx, |cx| {
+                    super::super::fs::openat(
+                        cx,
+                        super::super::fs::AT_FDCWD,
+                        exe_p,
+                        oflags::O_RDONLY,
+                        0,
+                    )
+                })
+                .unwrap() as i32;
+                assert_eq!(opened_nodeids.lock().unwrap().len(), opens_before);
+                let n = super::super::fs::read(cx, fd, read_buf, orig_elf.len()).unwrap() as usize;
+                let mut got = vec![0u8; n];
+                cx.read_user(crate::uaccess::UserSlice::new(read_buf, n), &mut got)
+                    .unwrap();
+                assert_eq!(got, orig_elf);
+                assert_eq!(
+                    super::super::fs::lseek(cx, fd, 0, 2 /* SEEK_END */).unwrap(),
+                    orig_elf.len() as u64
+                );
+                super::super::fs::close(cx, fd).unwrap();
+
+                // Re-execing through /proc/self/exe after unlink succeeds and stays deleted.
+                guest_execve(cx, &mut rig._cpus[1], b"/proc/self/exe").unwrap();
+                assert_eq!(
+                    vfs.readlink(&cx.view(&vfs), &exe_node).unwrap(),
+                    b"/mnt/prog_moved (deleted)"
+                );
+            });
+
+            stop.store(true, Ordering::Relaxed);
+            daemon.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn fuse_opens_fifos_and_devices_in_process_and_rejects_sockets() {
+        let rig = new_rig("special-nodes", &[96, 97]);
+        let h = &rig.h;
+        // Enable default_permissions so mode checks on special files are tested too.
+        {
+            let k = h.shared.lock();
+            let vfs = k.vfs.as_ref().unwrap();
+            vfs.fuse()
+                .conn_of(h.root)
+                .unwrap()
+                .borrow_mut()
+                .opts
+                .default_permissions = true;
+        }
+        let null_rdev = crate::vfs::dev::rdev(1, 3) as u32;
+        let zero_rdev = crate::vfs::dev::rdev(1, 5) as u32;
+        let bad_rdev = crate::vfs::dev::rdev(250, 1) as u32;
+        let loop0_rdev = crate::vfs::dev::rdev(crate::vfs::dev::LOOP_MAJOR, 0) as u32;
+
+        let daemon_opens = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let daemon = s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let (opcode, unique, nodeid, msg) = match h.read_req(true) {
+                        Ok(r) => r,
+                        Err(Errno::EAGAIN) => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("dev_read failed: {e:?}"),
+                    };
+                    match opcode {
+                        op::LOOKUP => {
+                            let name = msg[40..].split(|&b| b == 0).next().unwrap();
+                            match name {
+                                b"fifo" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(40, mode::S_IFIFO | 0o666, 0, 1, 0, 0, 0, 60),
+                                ),
+                                b"null" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        41,
+                                        mode::S_IFCHR | 0o666,
+                                        0,
+                                        1,
+                                        0,
+                                        0,
+                                        null_rdev,
+                                        60,
+                                    ),
+                                ),
+                                b"zero" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        42,
+                                        mode::S_IFCHR | 0o666,
+                                        0,
+                                        1,
+                                        0,
+                                        0,
+                                        zero_rdev,
+                                        60,
+                                    ),
+                                ),
+                                b"badchr" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        43,
+                                        mode::S_IFCHR | 0o666,
+                                        0,
+                                        1,
+                                        0,
+                                        0,
+                                        bad_rdev,
+                                        60,
+                                    ),
+                                ),
+                                b"loop0" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        44,
+                                        mode::S_IFBLK | 0o660,
+                                        0,
+                                        1,
+                                        0,
+                                        0,
+                                        loop0_rdev,
+                                        60,
+                                    ),
+                                ),
+                                b"sock" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(45, mode::S_IFSOCK | 0o755, 0, 1, 0, 0, 0, 60),
+                                ),
+                                b"rootnull" => h.reply_ok(
+                                    unique,
+                                    &entry_out_full(
+                                        46,
+                                        mode::S_IFCHR | 0o600,
+                                        0,
+                                        1,
+                                        0,
+                                        0,
+                                        null_rdev,
+                                        60,
+                                    ),
+                                ),
+                                _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                            }
+                        }
+                        op::GETATTR => match nodeid {
+                            1 => h.reply_ok(
+                                unique,
+                                &attr_out_full(1, mode::S_IFDIR | 0o755, 0, 2, 0, 0, 0, 60),
+                            ),
+                            40 => h.reply_ok(
+                                unique,
+                                &attr_out_full(40, mode::S_IFIFO | 0o666, 0, 1, 0, 0, 0, 60),
+                            ),
+                            41 => h.reply_ok(
+                                unique,
+                                &attr_out_full(
+                                    41,
+                                    mode::S_IFCHR | 0o666,
+                                    0,
+                                    1,
+                                    0,
+                                    0,
+                                    null_rdev,
+                                    60,
+                                ),
+                            ),
+                            _ => h.reply(unique, Errno::ENOENT.0, &[]),
+                        },
+                        op::STATFS => {
+                            let body = Args::default()
+                                .u64(100)
+                                .u64(50)
+                                .u64(50)
+                                .u64(100)
+                                .u64(50)
+                                .u32(4096)
+                                .u32(255)
+                                .u32(4096)
+                                .u32(0)
+                                .u64(0)
+                                .u64(0)
+                                .u64(0)
+                                .0;
+                            h.reply_ok(unique, &body);
+                        }
+                        op::OPEN | op::OPENDIR | op::FLUSH => {
+                            daemon_opens.fetch_add(1, Ordering::Relaxed);
+                            h.reply(unique, Errno::EIO.0, &[]);
+                        }
+                        other => panic!("unexpected opcode {other}"),
+                    }
+                }
+            });
+            let _stop_guard = StopOnDrop(&stop);
+
+            h.cx(96, |cx| {
+                let scratch = map_scratch(cx, 0x2200_0000);
+                let open_path = |cx: &mut Cx<'_>, p: &[u8], flags: u32| -> Result<i32, Errno> {
+                    let addr = write_guest_cstr(cx, scratch, p);
+                    run_with_retries(cx, |cx| {
+                        super::super::fs::openat(cx, super::super::fs::AT_FDCWD, addr, flags, 0)
+                    })
+                    .map(|fd| fd as i32)
+                };
+
+                // 1. FIFO: O_WRONLY|O_NONBLOCK without reader -> ENXIO; O_DIRECT -> EINVAL.
+                assert_eq!(
+                    open_path(cx, b"/mnt/fifo", oflags::O_WRONLY | oflags::O_NONBLOCK),
+                    Err(Errno::ENXIO)
+                );
+                assert_eq!(
+                    open_path(
+                        cx,
+                        b"/mnt/fifo",
+                        oflags::O_RDONLY | oflags::O_NONBLOCK | oflags::O_DIRECT
+                    ),
+                    Err(Errno::EINVAL)
+                );
+                let rfd =
+                    open_path(cx, b"/mnt/fifo", oflags::O_RDONLY | oflags::O_NONBLOCK).unwrap();
+                let wfd =
+                    open_path(cx, b"/mnt/fifo", oflags::O_WRONLY | oflags::O_NONBLOCK).unwrap();
+                let msg_addr = scratch + 256;
+                let buf_addr = scratch + 320;
+                cx.write_user(
+                    crate::uaccess::UserSlice::new(msg_addr, 15),
+                    b"hello fuse fifo",
+                )
+                .unwrap();
+                assert_eq!(super::super::fs::write(cx, wfd, msg_addr, 15).unwrap(), 15);
+                assert_eq!(super::super::fs::read(cx, rfd, buf_addr, 15).unwrap(), 15);
+                let mut got = [0u8; 15];
+                cx.read_user(crate::uaccess::UserSlice::new(buf_addr, 15), &mut got)
+                    .unwrap();
+                assert_eq!(&got, b"hello fuse fifo");
+
+                // fstat & fstatfs on the FUSE FIFO report FUSE metadata and FUSE_SUPER_MAGIC.
+                let stat_addr = scratch + 512;
+                run_with_retries(cx, |cx| super::super::fs::fstat(cx, rfd, stat_addr)).unwrap();
+                let mut raw_stat = [0u8; 128];
+                cx.read_user(
+                    crate::uaccess::UserSlice::new(stat_addr, 128),
+                    &mut raw_stat,
+                )
+                .unwrap();
+                assert_eq!(u64::from_le_bytes(raw_stat[8..16].try_into().unwrap()), 40);
+                assert_eq!(
+                    u32::from_le_bytes(raw_stat[16..20].try_into().unwrap()) & mode::S_IFMT,
+                    mode::S_IFIFO
+                );
+                run_with_retries(cx, |cx| super::super::fs::fstatfs(cx, rfd, stat_addr)).unwrap();
+                let mut raw_statfs = [0u8; 120];
+                cx.read_user(
+                    crate::uaccess::UserSlice::new(stat_addr, 120),
+                    &mut raw_statfs,
+                )
+                .unwrap();
+                assert_eq!(
+                    u64::from_le_bytes(raw_statfs[0..8].try_into().unwrap()),
+                    fuse::SUPER_MAGIC
+                );
+                super::super::fs::close(cx, rfd).unwrap();
+                super::super::fs::close(cx, wfd).unwrap();
+
+                // 2. Character devices: /mnt/null, /mnt/zero, O_DIRECT -> EINVAL, unknown -> ENXIO.
+                let nfd = open_path(cx, b"/mnt/null", oflags::O_RDWR).unwrap();
+                assert_eq!(super::super::fs::write(cx, nfd, msg_addr, 15).unwrap(), 15);
+                assert_eq!(super::super::fs::read(cx, nfd, buf_addr, 15).unwrap(), 0);
+                run_with_retries(cx, |cx| super::super::fs::fstat(cx, nfd, stat_addr)).unwrap();
+                cx.read_user(
+                    crate::uaccess::UserSlice::new(stat_addr, 128),
+                    &mut raw_stat,
+                )
+                .unwrap();
+                assert_eq!(u64::from_le_bytes(raw_stat[8..16].try_into().unwrap()), 41);
+                assert_eq!(
+                    u64::from_le_bytes(raw_stat[32..40].try_into().unwrap()),
+                    u64::from(null_rdev)
+                );
+                super::super::fs::close(cx, nfd).unwrap();
+
+                let zfd = open_path(cx, b"/mnt/zero", oflags::O_RDONLY).unwrap();
+                cx.write_user(crate::uaccess::UserSlice::new(buf_addr, 8), &[0xff; 8])
+                    .unwrap();
+                assert_eq!(super::super::fs::read(cx, zfd, buf_addr, 8).unwrap(), 8);
+                let mut zgot = [0xffu8; 8];
+                cx.read_user(crate::uaccess::UserSlice::new(buf_addr, 8), &mut zgot)
+                    .unwrap();
+                assert_eq!(zgot, [0u8; 8]);
+                super::super::fs::close(cx, zfd).unwrap();
+
+                assert_eq!(
+                    open_path(cx, b"/mnt/null", oflags::O_RDONLY | oflags::O_DIRECT),
+                    Err(Errno::EINVAL)
+                );
+                assert_eq!(
+                    open_path(cx, b"/mnt/badchr", oflags::O_RDONLY),
+                    Err(Errno::ENXIO)
+                );
+
+                // 3. Block device (loop0) opens via loopdev.
+                let lfd = open_path(cx, b"/mnt/loop0", oflags::O_RDONLY).unwrap();
+                assert!(matches!(
+                    cx.fds().get(lfd).unwrap().borrow().kind,
+                    FileKind::Device {
+                        dev: crate::vfs::dev::Device::Loop,
+                        ..
+                    }
+                ));
+                super::super::fs::close(cx, lfd).unwrap();
+
+                // 4. Socket still returns ENXIO on open(2).
+                assert_eq!(
+                    open_path(cx, b"/mnt/sock", oflags::O_RDONLY),
+                    Err(Errno::ENXIO)
+                );
+            });
+
+            // 5. Permissions checked with default_permissions (unprivileged user denied 0600 device).
+            set_unpriv_cred(h, 97, 1000, 1000);
+            h.cx(97, |cx| {
+                let scratch = map_scratch(cx, 0x2300_0000);
+                let addr = write_guest_cstr(cx, scratch, b"/mnt/rootnull");
+                assert_eq!(
+                    run_with_retries(cx, |cx| {
+                        super::super::fs::openat(
+                            cx,
+                            super::super::fs::AT_FDCWD,
+                            addr,
+                            oflags::O_RDONLY,
+                            0,
+                        )
+                    }),
+                    Err(Errno::EACCES)
+                );
+            });
+
+            // 6. MS_NODEV blocks character and block devices (EACCES) while FIFOs still open.
+            {
+                let k = h.shared.lock();
+                k.vfs
+                    .as_ref()
+                    .unwrap()
+                    .update_mount(h.mnt, |m| m.flags |= ms::NODEV);
+            }
+            h.cx(96, |cx| {
+                let scratch = 0x2200_0000u64;
+                for dev_path in [&b"/mnt/null"[..], b"/mnt/loop0"] {
+                    let addr = write_guest_cstr(cx, scratch, dev_path);
+                    assert_eq!(
+                        run_with_retries(cx, |cx| {
+                            super::super::fs::openat(
+                                cx,
+                                super::super::fs::AT_FDCWD,
+                                addr,
+                                oflags::O_RDONLY,
+                                0,
+                            )
+                        }),
+                        Err(Errno::EACCES)
+                    );
+                }
+                let fifo_addr = write_guest_cstr(cx, scratch, b"/mnt/fifo");
+                let fd = run_with_retries(cx, |cx| {
+                    super::super::fs::openat(
+                        cx,
+                        super::super::fs::AT_FDCWD,
+                        fifo_addr,
+                        oflags::O_RDWR,
+                        0,
+                    )
+                })
+                .unwrap() as i32;
+                super::super::fs::close(cx, fd).unwrap();
+            });
+
+            // Zero FUSE_OPEN/OPENDIR/FLUSH requests were ever sent for FIFOs or devices.
+            assert_eq!(daemon_opens.load(Ordering::Relaxed), 0);
+
+            stop.store(true, Ordering::Relaxed);
+            daemon.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn fuse_child_userns_enforces_mnt_may_suid_and_sb_i_nodev() {
+        let mut rig = new_rig("child-userns", &[98, 99]);
+        let h = &rig.h;
+        // Replace the FUSE connection with one owned by a child user namespace (0 -> 1000, 1 -> 1001).
+        let child_ns = {
+            let k = h.shared.lock();
+            let init_ns = k.tasks[&h.daemon_tid].cred.borrow().user_ns.clone();
+            let ns = crate::cred::UserNs::child(&init_ns, 1000, true);
+            *ns.uid_map.borrow_mut() = crate::cred::IdMap::parse(b"0 1000 2\n").unwrap();
+            *ns.gid_map.borrow_mut() = crate::cred::IdMap::parse(b"0 1000 2\n").unwrap();
+            ns
+        };
+        let child_dev_fd = {
+            let k = h.shared.lock();
+            let vfs = k.vfs.as_ref().unwrap();
+            let mut mounter = Cred::root();
+            mounter.user_ns = child_ns.clone();
+            mounter.ruid = 1000;
+            mounter.euid = 1000;
+            mounter.suid = 1000;
+            mounter.fsuid = 1000;
+            mounter.rgid = 1000;
+            mounter.egid = 1000;
+            mounter.sgid = 1000;
+            mounter.fsgid = 1000;
+            let dev = 0x9au64;
+            let opts = Options {
+                rootmode: Some(mode::S_IFDIR | 0o755),
+                user_id: Some(1000),
+                group_id: Some(1000),
+                allow_other: false,
+                default_permissions: true,
+                max_read: u32::MAX,
+                ..Options::default()
+            };
+            let conn = Rc::new(RefCell::new(Conn::new(
+                dev,
+                opts,
+                &mounter,
+                crate::pidns::PidNs::init(),
+            )));
+            vfs.fuse_mut().add(conn.clone());
+            let mut devfile = DevFile::new(&mounter, 1);
+            devfile.attach(&conn);
+            fuse::send_init(&conn);
+            vfs.store().mkdir(ROOT, b"umnt", 0o755, 0, 0).unwrap();
+            let mnt_ino = vfs.store().lookup(ROOT, b"umnt").unwrap().unwrap();
+            vfs.add_fuse_mount(
+                (Node::Store(crate::vfs::ROOT_MOUNT, mnt_ino), None),
+                0,
+                b"userfuse".to_vec(),
+                dev,
+            )
+            .unwrap();
+            k.tasks[&h.daemon_tid]
+                .res
+                .borrow()
+                .fds
+                .borrow_mut()
+                .install(
+                    OpenFile::new(FileKind::FuseDev(devfile), oflags::O_RDWR),
+                    false,
+                    0..64,
+                )
+                .unwrap()
+        };
+        // Complete FUSE_INIT on the child-userns connection.
+        let read_child_req = || -> Result<(u32, u64, u64, Vec<u8>), Errno> {
+            loop {
+                let msg = h.cx(h.daemon_tid, |cx| {
+                    let file = cx.fds().get(child_dev_fd).unwrap();
+                    fuse::dev_read(cx, &file, 131072, true)
+                })?;
+                let (opcode, unique, nodeid) = parse_header(&msg);
+                if matches!(opcode, op::FORGET | op::BATCH_FORGET) {
+                    continue;
+                }
+                if matches!(opcode, op::RELEASE | op::RELEASEDIR) {
+                    let raw = fuse_reply(unique, 0, &[]);
+                    h.cx(h.daemon_tid, |cx| {
+                        let file = cx.fds().get(child_dev_fd).unwrap();
+                        let vfs = cx.vfs().unwrap();
+                        fuse::dev_write(cx, &vfs, &file, &raw).unwrap();
+                    });
+                    continue;
+                }
+                return Ok((opcode, unique, nodeid, msg));
+            }
+        };
+        let reply_child = |unique: u64, err: i32, body: &[u8]| {
+            let raw = fuse_reply(unique, err, body);
+            h.cx(h.daemon_tid, |cx| {
+                let file = cx.fds().get(child_dev_fd).unwrap();
+                let vfs = cx.vfs().unwrap();
+                fuse::dev_write(cx, &vfs, &file, &raw).unwrap();
+            });
+        };
+        let (opcode, unique, _, _) = read_child_req().unwrap();
+        assert_eq!(opcode, op::INIT);
+        reply_child(
+            unique,
+            0,
+            &Args::default()
+                .u32(7)
+                .u32(37)
+                .u32(0)
+                .u32(0)
+                .u32(0)
+                .u32(65536)
+                .u32(1)
+                .u32(0)
+                .0,
+        );
+
+        let elf = minimal_elf(b"CHILD_USERNS");
+        let null_rdev = crate::vfs::dev::rdev(1, 3) as u32;
+        let bind_cap = 1u64 << crate::cred::cap::NET_BIND_SERVICE;
+        let caps_v2 = cap_xattr_v2(bind_cap, 0, true);
+        let stop = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let daemon = s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let (opcode, unique, nodeid, msg) = match read_child_req() {
+                        Ok(r) => r,
+                        Err(Errno::EAGAIN) => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("dev_read failed: {e:?}"),
+                    };
+                    match opcode {
+                        op::LOOKUP => {
+                            let name = msg[40..].split(|&b| b == 0).next().unwrap();
+                            match name {
+                                b"null" => reply_child(
+                                    unique,
+                                    0,
+                                    &entry_out_full(
+                                        50,
+                                        mode::S_IFCHR | 0o666,
+                                        0,
+                                        1,
+                                        0,
+                                        0,
+                                        null_rdev,
+                                        60,
+                                    ),
+                                ),
+                                b"fifo" => reply_child(
+                                    unique,
+                                    0,
+                                    &entry_out_full(51, mode::S_IFIFO | 0o666, 0, 1, 0, 0, 0, 60),
+                                ),
+                                b"suid" => reply_child(
+                                    unique,
+                                    0,
+                                    &entry_out_full(
+                                        52,
+                                        mode::S_IFREG | mode::S_ISUID | 0o755,
+                                        elf.len() as u64,
+                                        1,
+                                        0,
+                                        0,
+                                        0,
+                                        60,
+                                    ),
+                                ),
+                                _ => reply_child(unique, Errno::ENOENT.0, &[]),
+                            }
+                        }
+                        op::GETATTR => match nodeid {
+                            1 => reply_child(
+                                unique,
+                                0,
+                                &attr_out_full(1, mode::S_IFDIR | 0o755, 0, 2, 0, 0, 0, 60),
+                            ),
+                            52 => reply_child(
+                                unique,
+                                0,
+                                &attr_out_full(
+                                    52,
+                                    mode::S_IFREG | mode::S_ISUID | 0o755,
+                                    elf.len() as u64,
+                                    1,
+                                    0,
+                                    0,
+                                    0,
+                                    60,
+                                ),
+                            ),
+                            _ => reply_child(unique, Errno::ENOENT.0, &[]),
+                        },
+                        op::OPEN => {
+                            reply_child(unique, 0, &Args::default().u64(500).u32(0).u32(0).0);
+                        }
+                        op::READ => {
+                            let off = u64::from_le_bytes(msg[48..56].try_into().unwrap()) as usize;
+                            let sz = u32::from_le_bytes(msg[56..60].try_into().unwrap()) as usize;
+                            let end = (off + sz).min(elf.len());
+                            reply_child(
+                                unique,
+                                0,
+                                if off < elf.len() { &elf[off..end] } else { &[] },
+                            );
+                        }
+                        op::GETXATTR => reply_child(unique, 0, &caps_v2),
+                        other => panic!("unexpected opcode {other}"),
+                    }
+                }
+            });
+            let _stop_guard = StopOnDrop(&stop);
+
+            // Caller 98 is in init_user_ns with uid/gid 1000 (allowed by user_id/group_id match):
+            // SB_I_NODEV blocks /umnt/null (EACCES), /umnt/fifo succeeds, and mnt_may_suid blocks
+            // setuid/file caps on /umnt/suid because init_user_ns is not inside child_ns!
+            set_unpriv_cred(h, 98, 1000, 1000);
+            h.cx(98, |cx| {
+                let scratch = map_scratch(cx, 0x2400_0000);
+                let null_p = write_guest_cstr(cx, scratch, b"/umnt/null");
+                assert_eq!(
+                    run_with_retries(cx, |cx| {
+                        super::super::fs::openat(
+                            cx,
+                            super::super::fs::AT_FDCWD,
+                            null_p,
+                            oflags::O_RDONLY,
+                            0,
+                        )
+                    }),
+                    Err(Errno::EACCES)
+                );
+                let fifo_p = write_guest_cstr(cx, scratch + 64, b"/umnt/fifo");
+                let fd = run_with_retries(cx, |cx| {
+                    super::super::fs::openat(
+                        cx,
+                        super::super::fs::AT_FDCWD,
+                        fifo_p,
+                        oflags::O_RDWR,
+                        0,
+                    )
+                })
+                .unwrap() as i32;
+                super::super::fs::close(cx, fd).unwrap();
+
+                guest_execve(cx, &mut rig._cpus[1], b"/umnt/suid").unwrap();
+                let c = cx.cred();
+                assert_eq!((c.euid, c.cap_permitted, c.cap_effective), (1000, 0, 0));
+            });
+
+            // Caller 99 is inside child_ns (uid 1 -> kernel 1001, unprivileged) with allow_other:
+            // mnt_may_suid allows setuid-to-child-root (uid 0 -> kernel 1000) and v2 file caps!
+            {
+                let k = h.shared.lock();
+                k.vfs
+                    .as_ref()
+                    .unwrap()
+                    .fuse()
+                    .conn(0x9a)
+                    .unwrap()
+                    .borrow_mut()
+                    .opts
+                    .allow_other = true;
+                let mut c = Cred::root();
+                c.user_ns = child_ns.clone();
+                c.ruid = 1001;
+                c.euid = 1001;
+                c.suid = 1001;
+                c.fsuid = 1001;
+                c.rgid = 1001;
+                c.egid = 1001;
+                c.sgid = 1001;
+                c.fsgid = 1001;
+                c.cap_effective = 0;
+                c.cap_permitted = 0;
+                *k.tasks[&99].cred.borrow_mut() = c.clone();
+                k.groups[&99].borrow_mut().cred = c;
+            }
+            h.cx(99, |cx| {
+                guest_execve(cx, &mut rig._cpus[2], b"/umnt/suid").unwrap();
+                let c = cx.cred();
+                // File has S_ISUID (owned by uid 0 -> kernel 1000) AND v2 file cap (bind_cap):
+                // non-root running setuid-root with file caps gets euid=1000 and bind_cap.
+                assert_eq!((c.ruid, c.euid), (1001, 1000));
+                assert_eq!(c.cap_permitted, bind_cap);
+                assert_eq!(c.cap_effective, bind_cap);
+            });
 
             stop.store(true, Ordering::Relaxed);
             daemon.join().unwrap();

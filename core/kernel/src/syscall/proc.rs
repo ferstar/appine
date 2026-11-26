@@ -710,7 +710,9 @@ fn exec(
                 comm.clone_from(&exe_at.1);
             }
             let node = f.node().ok_or(Errno::EACCES)?;
-            if f.regular_backing().is_some() {
+            if f.regular_backing().is_some()
+                || matches!(f.kind, crate::fd::FileKind::FuseSnapshot(_))
+            {
                 by_file = Some(file.clone());
             }
             (node, f.dentry.clone())
@@ -728,7 +730,9 @@ fn exec(
                 let node = f.node().ok_or(Errno::EACCES)?;
                 let shown = f.path.as_deref().unwrap_or_default();
                 exe_at.1 = shown.strip_suffix(b" (deleted)").unwrap_or(shown).to_vec();
-                if f.regular_backing().is_some() {
+                if f.regular_backing().is_some()
+                    || matches!(f.kind, crate::fd::FileKind::FuseSnapshot(_))
+                {
                     by_file = Some(file.clone());
                 }
                 (node, f.dentry.clone())
@@ -871,10 +875,10 @@ fn exec(
     let mapped = cred.user_ns.uid_map.borrow().up(st.uid).is_some()
         && cred.user_ns.gid_map.borrow().up(st.gid).is_some();
     let setid = |bit: u32| st.mode & bit == bit && !no_new_privs && !nosuid && mapped;
-    let fcaps = if nosuid {
-        None
+    let (fcaps, fcaps_raw) = if nosuid {
+        (None, None)
     } else {
-        file_caps(&vfs, st.ino, &cred)?
+        file_caps(&vfs, st.ino, &cred, from.as_deref())?
     };
     let ptraced = {
         let t = cx.task.trace.borrow();
@@ -1041,6 +1045,31 @@ fn exec(
                     Some((*m, *o))
                 })
         };
+        let fuse_exe = {
+            let fuse_of = |n: &Node| match *n {
+                Node::Fuse(m, id) if crate::vfs::fuse::key(id) == st.ino => Some((m, id)),
+                _ => None,
+            };
+            let target = walked
+                .as_ref()
+                .and_then(|(n, _)| fuse_of(n))
+                .or_else(|| fuse_of(&node).filter(|_| !script));
+            if let Some((mnt, id)) = target {
+                let mut fuse = vfs.fuse_mut();
+                fuse.get_mut(id).map(|n| process::FuseExe {
+                    mnt,
+                    id,
+                    _pin: n.pin_path(),
+                    stat: n.attr.stat(),
+                    blksize: n.attr.blksize,
+                    caps: fcaps_raw.clone(),
+                })
+            } else {
+                from.as_deref()
+                    .filter(|_| !script)
+                    .and_then(|e| e.fuse.clone())
+            }
+        };
         g.exe = Some(Rc::new(process::ExeFile::new(
             exe.clone(),
             walked,
@@ -1049,6 +1078,7 @@ fn exec(
             Some(st.ino),
             &file,
             ovl,
+            fuse_exe,
         )));
         // As with Linux's commit_creds and begin_new_exec, changing the effective IDs or gaining
         // new capabilities sets dumpable to fs.suid_dumpable and clears pdeathsig; a privileged
@@ -1191,17 +1221,41 @@ fn parse_shebang(file: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     Some((interp.to_vec(), (!rest.is_empty()).then(|| rest.to_vec())))
 }
 
-/// The program file's capabilities (`security.capability`) for `cred`; None when absent or
-/// belonging to a root that does not own `cred`'s namespace, and execve fails (EINVAL) when
-/// malformed.
-fn file_caps(vfs: &Vfs, ino: Ino, cred: &Cred) -> Result<Option<FileCaps>, Errno> {
+/// The program file's capabilities (`security.capability`) for `cred`, plus the raw xattr bytes
+/// for FUSE programs (saved on [`process::FuseExe`] in case a deleted program is re-exec'd);
+/// None when absent or belonging to a root that does not own `cred`'s namespace, and execve fails
+/// (EINVAL) when malformed.
+fn file_caps(
+    vfs: &Vfs,
+    ino: Ino,
+    cred: &Cred,
+    from: Option<&process::ExeFile>,
+) -> Result<(Option<FileCaps>, Option<Vec<u8>>), Errno> {
+    if let Some(id) = crate::vfs::fuse::id_of(ino) {
+        let fallback = from
+            .and_then(|e| e.fuse.as_ref())
+            .filter(|f| f.id == id)
+            .and_then(|f| f.caps.as_ref());
+        let raw = match crate::vfs::fuse::file_caps(vfs, id) {
+            Ok(v) => v,
+            Err(Errno::ENOTCONN | Errno::ENOENT | Errno::ESTALE) if fallback.is_some() => {
+                fallback.cloned()
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(v) = raw else {
+            return Ok((None, None));
+        };
+        let fs_ns = vfs.fuse().conn_of(id)?.borrow().user_ns().clone();
+        return Ok((FileCaps::parse_in(&v, &fs_ns, cred)?, Some(v)));
+    }
     let store = vfs.store();
     if !store.has_file_caps(ino)? {
-        return Ok(None);
+        return Ok((None, None));
     }
     match store.get_xattr(ino, XATTR_NAME_CAPS) {
-        Ok(v) => FileCaps::parse(&v, cred),
-        Err(Errno::ENODATA) => Ok(None),
+        Ok(v) => Ok((FileCaps::parse(&v, cred)?, None)),
+        Err(Errno::ENODATA) => Ok((None, None)),
         Err(e) => Err(e),
     }
 }

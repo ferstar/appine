@@ -223,6 +223,20 @@ pub(super) fn mmap(
                 accessed = Some(file.clone());
                 Some((fd, offset, may_write))
             }
+            FileKind::FuseSnapshot(s) => {
+                if !f.readable() || shared_write {
+                    return Err(Errno::EACCES);
+                }
+                if on_noexec(cx, &f) {
+                    if prot & prot::EXEC != 0 {
+                        return Err(Errno::EPERM);
+                    }
+                    deny_exec = true;
+                }
+                label = Some((f.path.clone(), crate::vfs::fuse::key(s.id)));
+                file_mnt = Some(f.mnt);
+                Some((s.file.as_raw_fd(), offset, false))
+            }
             FileKind::Render { ino, file } => {
                 if !f.readable() || (shared_write && !f.writable()) {
                     return Err(Errno::EACCES);

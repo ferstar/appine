@@ -627,15 +627,25 @@ fn open_path_with(
         }
         Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
             let exe = exe_file(cx, *proc)?;
-            let (target, ino, host) = exe.backing(&vfs)?;
-            overlay = exe.ovl.as_ref().map(|(mnt, o, _)| (*mnt, *o));
-            opened_mnt = Some(target.mnt());
-            opened_ino = inotify::key_of(&target);
-            display = Some(exe.path.clone());
-            unlinked_name = true;
-            if path_only {
-                path_object = Some((ino, host.try_clone().map_err(host_errno)?, false));
-                node = target;
+            if let Some(f) = &exe.fuse {
+                opened_mnt = Some(f.mnt);
+                opened_ino = Some(crate::vfs::fuse::key(f.id));
+                display = Some(exe.path.clone());
+                unlinked_name = true;
+                if path_only {
+                    node = Node::Fuse(f.mnt, f.id);
+                }
+            } else {
+                let (target, ino, host) = exe.backing(&vfs)?;
+                overlay = exe.ovl.as_ref().map(|(mnt, o, _)| (*mnt, *o));
+                opened_mnt = Some(target.mnt());
+                opened_ino = inotify::key_of(&target);
+                display = Some(exe.path.clone());
+                unlinked_name = true;
+                if path_only {
+                    path_object = Some((ino, host.try_clone().map_err(host_errno)?, false));
+                    node = target;
+                }
             }
         }
         _ => {}
@@ -678,7 +688,10 @@ fn open_path_with(
                 open_overlay(cx, &cred, &vfs, (mnt, o), flags, (created, beside))?
             }
             Node::Fuse(..) if fuse_created.is_some() => fuse_created.take().unwrap(),
-            Node::Fuse(mnt, f) => super::fuse::open(cx, &cred, &vfs, (mnt, f), flags)?,
+            Node::Fuse(mnt, f) => {
+                let beside = parent.as_ref().map(|(dir, _)| dir);
+                super::fuse::open(cx, &cred, &vfs, (mnt, f), flags, beside)?
+            }
         }
     };
     // A 136:N device node outside devpts opens a specific slave: its path is the one in devpts
@@ -1217,9 +1230,78 @@ fn reopen(
             accmode != oflags::O_WRONLY,
             accmode != oflags::O_RDONLY,
         ))),
+        FileKind::FuseSnapshot(s) => {
+            let (mnt, id, stat, blksize) = (f.mnt, s.id, s.stat.clone(), s.blksize);
+            let host = s.file.try_clone().map_err(host_errno)?;
+            drop(f);
+            open_fuse_snapshot(cx, cred, vfs, mnt, id, stat, blksize, host, flags)
+        }
         FileKind::Host(fd) => Ok(FileKind::Host(*fd)),
         _ => Err(Errno::ENXIO),
     }
+}
+
+/// Checks mount, permission and `ETXTBSY` rules when reopening a deleted FUSE executable snapshot
+/// through `/proc/<pid>/exe` or `/proc/<pid>/fd/<n>`.
+#[allow(clippy::too_many_arguments)]
+fn open_fuse_snapshot(
+    cx: &Cx<'_>,
+    cred: &Cred,
+    vfs: &Vfs,
+    mnt: MountId,
+    id: crate::vfs::fuse::FuseId,
+    snap: Stat,
+    blksize: u32,
+    host: std::fs::File,
+    flags: u32,
+) -> Result<FileKind, Errno> {
+    let node = Node::Fuse(mnt, id);
+    let accmode = flags & oflags::O_ACCMODE;
+    let readonly = vfs.readonly(&node);
+    let mut mask = open_mask(flags);
+    if flags & oflags::O_TRUNC != 0 {
+        if readonly {
+            return Err(Errno::EROFS);
+        }
+        mask |= MAY_WRITE;
+    }
+    let (mut stat, blksize) = match vfs.fuse().get(id) {
+        Some(n) => (n.attr.stat(), n.attr.blksize),
+        None => (snap, blksize),
+    };
+    stat.nlink = 0;
+    if let Ok(conn) = vfs.fuse().conn_of(id) {
+        let c = conn.borrow();
+        if !c.allows(cred) {
+            return Err(Errno::EACCES);
+        }
+        if c.opts.default_permissions {
+            cred.permission(&stat, mask)?;
+        }
+    } else {
+        cred.permission(&stat, mask)?;
+    }
+    if flags & oflags::O_NOATIME != 0 && !cred.owns(&stat) {
+        return Err(Errno::EPERM);
+    }
+    if readonly && accmode != oflags::O_RDONLY {
+        return Err(Errno::EROFS);
+    }
+    if flags & oflags::O_DIRECTORY != 0 {
+        return Err(Errno::ENOTDIR);
+    }
+    if writes_on_open(flags) {
+        if executing(cx, crate::vfs::fuse::key(id)) {
+            return Err(Errno::ETXTBSY);
+        }
+        return Err(Errno::ENOENT);
+    }
+    Ok(FileKind::FuseSnapshot(Box::new(crate::fd::FuseSnapshot {
+        id,
+        file: host,
+        stat,
+        blksize,
+    })))
 }
 
 /// Opens a deleted program file through `/proc/<pid>/exe` ([`PseudoNode::OpenExe`]): duplicates
@@ -1233,6 +1315,25 @@ fn reopen_exe(
     flags: u32,
 ) -> Result<FileKind, Errno> {
     let exe = exe_file(cx, proc)?;
+    if let Some(f) = &exe.fuse {
+        let host = exe
+            .host
+            .as_deref()
+            .ok_or(Errno::ENOENT)?
+            .try_clone()
+            .map_err(host_errno)?;
+        return open_fuse_snapshot(
+            cx,
+            cred,
+            vfs,
+            f.mnt,
+            f.id,
+            f.stat.clone(),
+            f.blksize,
+            host,
+            flags,
+        );
+    }
     let (node, ino, host) = exe.backing(vfs)?;
     let accmode = flags & oflags::O_ACCMODE;
     if let Node::Overlay(mnt, o) = node
@@ -1564,7 +1665,7 @@ fn open_store_with(
     if flags & oflags::O_DIRECT != 0 && !direct_io() && !direct_open_is_eisdir(&st, flags) {
         return Err(Errno::EINVAL);
     }
-    let mut kind = match st.kind() {
+    let kind = match st.kind() {
         mode::S_IFLNK => return Err(Errno::ELOOP),
         mode::S_IFDIR => {
             if accmode != oflags::O_RDONLY || flags & (oflags::O_CREAT | oflags::O_TRUNC) != 0 {
@@ -1618,51 +1719,68 @@ fn open_store_with(
             }
             FileKind::Regular { ino, file, cow }
         }
-        mode::S_IFCHR => match st.rdev {
-            // /dev/tty, /dev/console: the caller's controlling terminal
-            r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx, ino)?,
-            PTMX_RDEV => {
-                let (fs, m) = devpts_beside(vfs, beside)?;
-                tty::open_ptmx(cx.k(), (fs, m, false), (cred.fsuid, cred.fsgid))?
-            }
-            r if r == rdev(226, 128) => FileKind::Render {
-                ino,
-                file: super::gpu::open(cx)?,
-            },
-            crate::vfs::fuse::DEV_RDEV => {
-                FileKind::FuseDev(crate::vfs::fuse::DevFile::new(cred, ino))
-            }
-            // Terminal device nodes outside devpts: those in the boot instance
-            r => match pts_index(r) {
-                Some(index) => {
-                    let at = (crate::tty::BOOT_PTS, index, crate::vfs::PTS_MOUNT, false);
-                    tty::open_slave(cx, at, flags)?
-                }
-                None => {
-                    // A character device without a driver (Linux's `chrdev_open`)
-                    let dev = dev::open(store, ino).inspect_err(|&e| {
-                        if e == Errno::ENXIO {
-                            let (major, minor) = dev::split_rdev(r);
-                            crate::stub::hit(cx, crate::stub::Stub::Device(false, major, minor));
-                        }
-                    })?;
-                    let kmsg = match dev {
-                        Device::Kmsg => Some(open_kmsg(cx, accmode)?),
-                        _ => None,
-                    };
-                    FileKind::Device {
-                        ino,
-                        dev,
-                        kmsg,
-                        block: None,
-                    }
-                }
-            },
-        },
+        mode::S_IFCHR => {
+            return open_char_device(cx, cred, vfs, ino, st.rdev, flags, beside, lock_ino);
+        }
         mode::S_IFBLK => super::loopdev::open(cx, ino, st.rdev, flags)?,
         mode::S_IFIFO => open_fifo(cx, ino, flags)?,
         // Socket files cannot be opened (they use connect)
         _ => return Err(Errno::ENXIO),
+    };
+    Ok(kind)
+}
+
+/// Opens a character device node by `rdev` (shared by store, overlay and FUSE `S_IFCHR` opens).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn open_char_device(
+    cx: &mut Cx<'_>,
+    cred: &Cred,
+    vfs: &Vfs,
+    ino: Ino,
+    dev_num: u64,
+    flags: u32,
+    beside: Option<&Node>,
+    lock_ino: Ino,
+) -> Result<FileKind, Errno> {
+    let accmode = flags & oflags::O_ACCMODE;
+    let mut kind = match dev_num {
+        // /dev/tty, /dev/console: the caller's controlling terminal
+        r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx, ino)?,
+        PTMX_RDEV => {
+            let (fs, m) = devpts_beside(vfs, beside)?;
+            tty::open_ptmx(cx.k(), (fs, m, false), (cred.fsuid, cred.fsgid))?
+        }
+        r if r == rdev(226, 128) => FileKind::Render {
+            ino,
+            file: super::gpu::open(cx)?,
+        },
+        crate::vfs::fuse::DEV_RDEV => FileKind::FuseDev(crate::vfs::fuse::DevFile::new(cred, ino)),
+        // Terminal device nodes outside devpts: those in the boot instance
+        r => match pts_index(r) {
+            Some(index) => {
+                let at = (crate::tty::BOOT_PTS, index, crate::vfs::PTS_MOUNT, false);
+                tty::open_slave(cx, at, flags)?
+            }
+            None => {
+                // A character device without a driver (Linux's `chrdev_open`)
+                let dev = Device::from_rdev(r).inspect_err(|&e| {
+                    if e == Errno::ENXIO {
+                        let (major, minor) = dev::split_rdev(r);
+                        crate::stub::hit(cx, crate::stub::Stub::Device(false, major, minor));
+                    }
+                })?;
+                let kmsg = match dev {
+                    Device::Kmsg => Some(open_kmsg(cx, accmode)?),
+                    _ => None,
+                };
+                FileKind::Device {
+                    ino,
+                    dev,
+                    kmsg,
+                    block: None,
+                }
+            }
+        },
     };
     if let FileKind::Pty(end) = &mut kind {
         end.lock_ino = Some(lock_ino);
@@ -1786,7 +1904,7 @@ pub(super) fn open_mask(flags: u32) -> u32 {
 }
 
 /// Turns access permissions (`MAY_*`) into device-filter access (`BPF_DEVCG_ACC_*`).
-fn device_access(mask: u32) -> u32 {
+pub(super) fn device_access(mask: u32) -> u32 {
     let mut access = 0;
     if mask & MAY_WRITE != 0 {
         access |= crate::bpf::ACC_WRITE;
@@ -1811,6 +1929,7 @@ fn devpts_beside(vfs: &Vfs, dir: Option<&Node>) -> Result<(u64, MountId), Errno>
             Node::Store(*mnt, pts)
         }
         Node::Overlay(mnt, o) => vfs.overlay_child((*mnt, *o), b"pts")?,
+        Node::Fuse(mnt, d) => Node::Fuse(*mnt, vfs.fuse_child(*d, b"pts")?),
         _ => return Err(Errno::ENODEV),
     };
     match vfs.mounted(sibling) {
@@ -1844,7 +1963,7 @@ fn open_kmsg(cx: &mut Cx<'_>, accmode: u32) -> Result<Box<crate::klog::KmsgFile>
 /// Opens a named pipe (FIFO): all opens of one inode share one pipe. As on Linux, a read-only
 /// open waits until there is a writer, a write-only open waits until there is a reader (with
 /// `O_NONBLOCK` it returns ENXIO when there is no reader), and a read-write open does not wait.
-fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
+pub(super) fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
     let nonblock = flags & oflags::O_NONBLOCK != 0;
     let (read, write) = match accmode {
@@ -2673,6 +2792,7 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
                     | FileKind::Proc { .. }
                     | FileKind::MessageQueue(_)
                     | FileKind::Fuse(_)
+                    | FileKind::FuseSnapshot(_)
             ) =>
         {
             if let Some(n) = unread(cx, &file)? {
@@ -3271,6 +3391,7 @@ fn splice_kind(kind: &FileKind) -> bool {
             | FileKind::Pty(_)
             | FileKind::Host(_)
             | FileKind::Fuse(_)
+            | FileKind::FuseSnapshot(_)
             | FileKind::FuseDev(_)
     )
 }
@@ -4000,7 +4121,7 @@ pub(super) fn sendfile(
     {
         let f = input.borrow();
         let seekable = match &f.kind {
-            FileKind::Regular { .. } | FileKind::Device { .. } => true,
+            FileKind::Regular { .. } | FileKind::FuseSnapshot(_) | FileKind::Device { .. } => true,
             FileKind::Fuse(h) => super::fuse::seekable(h),
             _ => false,
         };
@@ -4389,7 +4510,7 @@ fn copy_range_checks(
         match f.kind {
             // A FUSE file copies through reads and writes (6.1's fuse_copy_file_range falls back
             // to generic_copy_file_range when the daemon has no FUSE_COPY_FILE_RANGE)
-            FileKind::Regular { .. } | FileKind::Fuse(_) => {}
+            FileKind::Regular { .. } | FileKind::Fuse(_) | FileKind::FuseSnapshot(_) => {}
             FileKind::Directory { .. } => return Err(Errno::EISDIR),
             _ => return Err(Errno::EINVAL),
         }
@@ -4413,6 +4534,7 @@ fn copy_range_checks(
     let size_in = match &i.kind {
         FileKind::Regular { ino, file, .. } => regular_size(&vfs, *ino, file)? as i64,
         FileKind::Fuse(h) => crate::vfs::fuse::cached_attr_fh(&vfs, h.id, h.fh())?.size as i64,
+        FileKind::FuseSnapshot(s) => s.file.metadata().map_err(host_errno)?.len() as i64,
         _ => return Err(Errno::EINVAL),
     };
     count = if pos_in >= size_in {
@@ -5275,6 +5397,7 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
     let pos = offset.unwrap_or(f.pos);
     let n = match &f.kind {
         FileKind::Regular { file, .. } => file.read_at(buf, pos).map_err(host_errno)?,
+        FileKind::FuseSnapshot(s) => s.file.read_at(buf, pos).map_err(host_errno)?,
         FileKind::Device { dev, .. } => match dev {
             Device::Null => 0,
             Device::Zero | Device::Full => {
@@ -5317,7 +5440,10 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
     };
     let positioned = matches!(
         f.kind,
-        FileKind::Regular { .. } | FileKind::Proc { .. } | FileKind::MessageQueue(_)
+        FileKind::Regular { .. }
+            | FileKind::FuseSnapshot(_)
+            | FileKind::Proc { .. }
+            | FileKind::MessageQueue(_)
     );
     if offset.is_none() && positioned {
         f.pos = pos + n as u64;
@@ -6626,6 +6752,24 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
             *pos = new as u64;
             return Ok(new as u64);
         }
+        FileKind::FuseSnapshot(s) => {
+            let size = s.file.metadata().map_err(host_errno)?.len() as i64;
+            match whence {
+                SEEK_SET => 0,
+                SEEK_CUR => *pos as i64,
+                SEEK_END => size,
+                SEEK_DATA | SEEK_HOLE if offset < 0 || offset >= size => return Err(Errno::ENXIO),
+                SEEK_DATA => {
+                    *pos = offset as u64;
+                    return Ok(*pos);
+                }
+                SEEK_HOLE => {
+                    *pos = size as u64;
+                    return Ok(*pos);
+                }
+                _ => return Err(Errno::EINVAL),
+            }
+        }
         FileKind::Regular { ino, file, .. } => {
             let host_size = file.metadata().map_err(host_errno)?.len();
             let vfs = cx.vfs()?;
@@ -7387,6 +7531,24 @@ fn node_stat(
         // A deleted program file
         Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
             let exe = exe_file(cx, *proc)?;
+            if let Some(f) = &exe.fuse {
+                let target = Node::Fuse(f.mnt, f.id);
+                if let Ok(conn) = vfs.fuse().conn_of(f.id)
+                    && !conn.borrow().allows(&cx.cred())
+                {
+                    return Err(Errno::EACCES);
+                }
+                let (mut st, blksize) = match vfs.fuse().get(f.id) {
+                    Some(n) => (n.attr.stat(), n.attr.blksize),
+                    None => (f.stat.clone(), f.blksize),
+                };
+                st.nlink = 0;
+                let mut b = encode_stat(&st, vfs.dev_of(&target));
+                if blksize != 0 {
+                    b[56..60].copy_from_slice(&blksize.to_le_bytes());
+                }
+                return Ok((b, f.mnt));
+            }
             let (node, ino, host) = exe.backing(&vfs)?;
             let mut st = vfs.store().stat_open(ino, host)?;
             st.size = logical_size(&vfs, ino, st.size);
@@ -7548,6 +7710,17 @@ fn file_stat_attrs(
             let fh = h.fh();
             drop(f);
             super::fuse::stat_fh(&*cx.vfs()?, &cx.cred(), &node, fh)
+        }
+        FileKind::FuseSnapshot(s) => {
+            let vfs = cx.vfs()?;
+            let target = Node::Fuse(f.mnt, s.id);
+            let mut st = s.stat.clone();
+            st.nlink = 0;
+            let mut b = encode_stat(&st, vfs.dev_of(&target));
+            if s.blksize != 0 {
+                b[56..60].copy_from_slice(&s.blksize.to_le_bytes());
+            }
+            Ok(b)
         }
         _ => {
             let node = f.node().ok_or(Errno::EBADF)?;
@@ -9157,6 +9330,7 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> Result<bool, Er
         .transpose()?;
     if let Attrs::Fuse(id, fh) = target {
         let checked = target.checked(cx)?;
+        let vfs = cx.vfs()?;
         if checked {
             let st = target.stat(cx)?;
             let owner = cred.fsuid == st.uid;
@@ -9166,15 +9340,25 @@ fn chown(cx: &mut Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> Result<bool, Er
                 return Err(Errno::EPERM);
             }
         }
-        if uid.is_none() && gid.is_none() {
+        let mode = super::fuse::cleared_setid_mode(&vfs, &cred, *id, true)?;
+        if checked && mode.is_some() {
+            let st = target.stat(cx)?;
+            if !cred.owns(&st) {
+                return Err(Errno::EPERM);
+            }
+        }
+        if uid.is_none() && gid.is_none() && mode.is_none() {
+            super::fuse::remove_file_caps(cx, &vfs, *id)?;
             return Ok(false);
         }
         let set = super::fuse::SetAttr {
+            mode,
             uid,
             gid,
             ..Default::default()
         };
-        super::fuse::setattr(cx, &*cx.vfs()?, *id, &set, *fh)?;
+        super::fuse::setattr(cx, &vfs, *id, &set, *fh)?;
+        super::fuse::remove_file_caps(cx, &vfs, *id)?;
         return Ok(true);
     }
     let st = target.stat(cx)?;
@@ -12163,6 +12347,7 @@ mod tests {
                 dentry: None,
                 host: Some(std::sync::Arc::new(host)),
                 ovl: None,
+                fuse: None,
             }));
             check_statx_mount(cx, addr, AT_FDCWD, b"/proc/self/exe", 0, ROOT_MOUNT);
 

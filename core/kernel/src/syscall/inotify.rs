@@ -358,7 +358,12 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
             }
         }
         Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(proc)) => {
-            super::fs::exe_file(cx, *proc)?.backing(&vfs)?.0
+            let exe = super::fs::exe_file(cx, *proc)?;
+            if let Some(f) = &exe.fuse {
+                Node::Fuse(f.mnt, f.id)
+            } else {
+                exe.backing(&vfs)?.0
+            }
         }
         _ => node,
     };
@@ -968,6 +973,7 @@ fn file_key(f: &OpenFile) -> Option<(Ino, u32)> {
         FileKind::Pipe(_) | FileKind::Pty(_) => Some((key_of(&f.node()?)?, 0)),
         FileKind::Directory { node, .. } => Some((key_of(node)?, IN_ISDIR)),
         FileKind::Fuse(h) => Some((crate::vfs::fuse::key(h.id), 0)),
+        FileKind::FuseSnapshot(s) => Some((crate::vfs::fuse::key(s.id), 0)),
         FileKind::Proc {
             node: crate::pseudo::PseudoNode::Cgroup(id, name, _),
             ..

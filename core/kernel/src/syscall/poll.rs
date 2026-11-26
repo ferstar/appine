@@ -1679,6 +1679,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     ) || matches!(
         file.borrow().kind,
         FileKind::Regular { .. }
+            | FileKind::FuseSnapshot(_)
             | FileKind::Directory { .. }
             | FileKind::Device {
                 dev: Device::Null

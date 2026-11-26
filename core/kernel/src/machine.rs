@@ -339,6 +339,7 @@ impl Machine {
             mm.exe,
             &file,
             None,
+            None,
         )));
         // Whether the console had a session before this one, for giving it back on failure
         let mut console = None;

@@ -682,6 +682,22 @@ impl Rusage {
 
 // ---- execve ----
 
+/// Pinned FUSE program identity kept on [`ExeFile`] so `/proc/<pid>/exe` follows the executed
+/// node across renames, replacements, and unlinks instead of re-resolving by path.
+#[derive(Clone)]
+pub(crate) struct FuseExe {
+    pub mnt: MountId,
+    pub id: crate::vfs::fuse::FuseId,
+    /// Pins the FUSE cache node against eviction while this `ExeFile` lives.
+    pub _pin: Rc<()>,
+    /// Daemon attributes captured at exec time (used if unlinked or after connection teardown).
+    pub stat: Stat,
+    pub blksize: u32,
+    /// Raw `security.capability` bytes seen at exec time, used as fallback when re-execing a
+    /// deleted FUSE program whose daemon refuses `FUSE_GETXATTR` on unlinked nodes.
+    pub caps: Option<Vec<u8>>,
+}
+
 /// The program file a process is executing (Linux's `mm->exe_file`): reading `/proc/<pid>/exe`
 /// gives its path, and following it leads straight to this file without resolving the path
 /// again. After the program file is renamed, deleted or replaced (dpkg upgrades replace running
@@ -698,23 +714,28 @@ pub struct ExeFile {
     /// The last directory passed through and the name: the path of a program executed through exe
     /// is computed from it ([`Pseudo::follow_dentry`]).
     pub dentry: Option<Dentry>,
-    /// The open host file (the object in the store): after the program file is deleted the object
-    /// is deleted too, and reopening or executing relies on it ([`open_exe_file`]).
+    /// The open host file (the object in the store, or the FUSE memfd snapshot): after the program
+    /// file is deleted the object is deleted too, and reopening or executing relies on it
+    /// ([`open_exe_file`]).
     pub host: Option<Arc<File>>,
     /// A program found through an overlay (its `node` is then None, as an overlay file's store
     /// inode must not be reached directly): the mount and the overlay node, kept while recorded,
     /// so the link leads to the node and shows ` (deleted)` once its name is removed.
     pub ovl: Option<(MountId, OvlId, Hold)>,
+    /// A program found on a FUSE mount ([`FuseExe`]).
+    pub(crate) fuse: Option<FuseExe>,
 }
 
 impl ExeFile {
-    /// The just-executed program `file` (inode `ino` in the store). `walked` is the node and the
-    /// last directory entry obtained by walking the path at execution again ([`Vfs::walk`]); when
-    /// that fails (executing a deleted file through an fd), the opened node `opened` is used
-    /// (absent when a script was executed: the program is the interpreter). When a deleted program
-    /// is executed through another process's exe ([`crate::pseudo::PseudoNode::OpenExe`]), the
-    /// mount and inode are taken over from that process's `from`. `ovl` is the overlay node the
-    /// program was found as ([`ExeFile::ovl`]).
+    /// The just-executed program `file` (inode `ino` in the store, or FUSE key). `walked` is the
+    /// node and the last directory entry obtained by walking the path at execution again
+    /// ([`Vfs::walk`]); when that fails (executing a deleted file through an fd), the opened node
+    /// `opened` is used (absent when a script was executed: the program is the interpreter). When
+    /// a deleted program is executed through another process's exe
+    /// ([`crate::pseudo::PseudoNode::OpenExe`]), the mount and inode are taken over from that
+    /// process's `from`. `ovl` is the overlay node the program was found as ([`ExeFile::ovl`]),
+    /// and `fuse` is the FUSE program record ([`ExeFile::fuse`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         path: Rc<[u8]>,
         walked: Option<(Node, Option<Dentry>)>,
@@ -723,9 +744,13 @@ impl ExeFile {
         ino: Option<Ino>,
         file: &Executable,
         ovl: Option<(MountId, OvlId)>,
+        fuse: Option<FuseExe>,
     ) -> ExeFile {
         let (node, dentry) = match (walked, opened, from) {
             (Some((Node::Store(mnt, i), found)), ..) if Some(i) == ino => (Some((mnt, i)), found),
+            (Some((Node::Fuse(_, id), found)), ..) if Some(crate::vfs::fuse::key(id)) == ino => {
+                (None, found)
+            }
             (Some((Node::Pseudo(..), found)), _, Some(from)) => (from.node, found),
             (_, Some(&Node::Store(mnt, i)), _) if Some(i) == ino => (Some((mnt, i)), None),
             (_, Some(Node::Pseudo(..)), Some(from)) => (from.node, from.dentry.clone()),
@@ -737,6 +762,7 @@ impl ExeFile {
             dentry,
             host: file.host(),
             ovl: ovl.map(|(mnt, o)| (mnt, o, Hold::new(o))),
+            fuse,
         }
     }
 
@@ -752,11 +778,12 @@ impl ExeFile {
         }
     }
 
-    /// The mount the program file was executed through (store or overlay), when known.
+    /// The mount the program file was executed through (store, overlay or FUSE), when known.
     pub(crate) fn mnt(&self) -> Option<MountId> {
         self.node
             .map(|(mnt, _)| mnt)
             .or_else(|| self.ovl.as_ref().map(|(mnt, _, _)| *mnt))
+            .or_else(|| self.fuse.as_ref().map(|f| f.mnt))
     }
 }
 
@@ -768,15 +795,69 @@ impl Drop for ExeFile {
     }
 }
 
+/// Checks FUSE execute permission, `MS_NOEXEC` and `mnt_may_suid` for a deleted FUSE program
+/// snapshot (`OpenExe` or `FileKind::FuseSnapshot`).
+fn open_fuse_snapshot(
+    vfs: &Vfs,
+    cred: &Cred,
+    mnt: MountId,
+    id: crate::vfs::fuse::FuseId,
+    snap: &Stat,
+    host: &File,
+) -> Result<(Executable, Stat, bool), Errno> {
+    use crate::vfs::fuse;
+    let node = Node::Fuse(mnt, id);
+    let conn = vfs.fuse().conn_of(id).ok();
+    let mut st = vfs
+        .fuse()
+        .get(id)
+        .map(|n| n.attr.stat())
+        .unwrap_or_else(|| snap.clone());
+    if st.kind() != mode::S_IFREG {
+        return Err(Errno::EACCES);
+    }
+    if let Some(c) = &conn {
+        let c = c.borrow();
+        if !c.allows(cred) {
+            return Err(Errno::EACCES);
+        }
+        if c.opts.default_permissions {
+            cred.permission(&st, MAY_EXEC)?;
+        } else if st.mode & 0o111 == 0 {
+            return Err(Errno::EACCES);
+        }
+    } else if st.mode & 0o111 == 0 {
+        return Err(Errno::EACCES);
+    }
+    let flags = vfs.mount_flags(&node).unwrap_or(0);
+    if flags & crate::vfs::ms::NOEXEC != 0 {
+        return Err(Errno::EACCES);
+    }
+    let nosuid = flags & crate::vfs::ms::NOSUID != 0
+        || conn
+            .as_ref()
+            .is_none_or(|c| !c.borrow().user_ns().is_ancestor_of(&cred.user_ns));
+    st.ino = fuse::key(id);
+    st.nlink = 0;
+    let file = host
+        .try_clone()
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    Ok((Executable::open(file)?, st, nosuid))
+}
+
 /// A deleted program file ([`crate::pseudo::PseudoNode::OpenExe`], obtained by following
 /// `/proc/<pid>/exe`): opened through the recorded host file, with the same checks as
-/// [`open_node`]. A program from an overlay whose name was removed is run the same way, from the
-/// store inode behind its overlay node and with its overlay mount's flags.
+/// [`open_node`]. A program from an overlay or FUSE mount whose name was removed is run the same
+/// way, with its mount's flags.
 pub(crate) fn open_exe_file(
     vfs: &Vfs,
     cred: &Cred,
     exe: &ExeFile,
 ) -> Result<(Executable, Stat, bool), Errno> {
+    if let Some(f) = &exe.fuse {
+        let host = exe.host.as_deref().ok_or(Errno::ENOENT)?;
+        return open_fuse_snapshot(vfs, cred, f.mnt, f.id, &f.stat, host);
+    }
     let (node, ino, host) = exe.backing(vfs)?;
     let st = vfs.store().stat_open(ino, host)?;
     if st.kind() != mode::S_IFREG {
@@ -804,6 +885,9 @@ pub(crate) fn open_open_file(
     cred: &Cred,
     f: &crate::fd::OpenFile,
 ) -> Result<(Executable, Stat, bool), Errno> {
+    if let crate::fd::FileKind::FuseSnapshot(s) = &f.kind {
+        return open_fuse_snapshot(vfs, cred, f.mnt, s.id, &s.stat, &s.file);
+    }
     let Some((ino, file, _)) = f.regular_backing() else {
         return Err(Errno::EACCES);
     };
@@ -887,8 +971,9 @@ pub(crate) fn open_node(
 /// A program in a FUSE filesystem: the checks [`open_node`] makes, with execute permission as
 /// [`Vfs::fuse_permission`] decides, then a copy of the file read in this syscall (a retry reads
 /// it, [`crate::vfs::fuse::Query::Program`]). Its inode number is the node's key, which no store
-/// file has (the checks for programs open for writing and being executed compare them), and set-id
-/// bits and file capabilities never take effect, as on the nosuid mounts fusermount makes.
+/// file has (the checks for programs open for writing and being executed compare them). Set-id
+/// bits and file capabilities follow Linux 6.1's `mnt_may_suid`: allowed unless the mount has
+/// `MS_NOSUID` or the caller is not inside the FUSE connection's user namespace (`s_user_ns`).
 fn open_fuse(
     vfs: &Vfs,
     cred: &Cred,
@@ -902,13 +987,16 @@ fn open_fuse(
         _ => return Err(Errno::EACCES),
     }
     vfs.fuse_permission(cred, id, MAY_EXEC)?;
-    if vfs.mount_flags(node).unwrap_or(0) & crate::vfs::ms::NOEXEC != 0 {
+    let flags = vfs.mount_flags(node).unwrap_or(0);
+    if flags & crate::vfs::ms::NOEXEC != 0 {
         return Err(Errno::EACCES);
     }
+    let conn_ns = vfs.fuse().conn_of(id)?.borrow().user_ns().clone();
+    let nosuid = flags & crate::vfs::ms::NOSUID != 0 || !conn_ns.is_ancestor_of(&cred.user_ns);
     let mut st = fuse::cached_attr(vfs, id)?.stat();
     st.ino = fuse::key(id);
     let file = fuse::program(id).ok_or_else(|| fuse::need(fuse::Query::Program(id)))?;
-    Ok((Executable::open(file)?, st, true))
+    Ok((Executable::open(file)?, st, nosuid))
 }
 
 /// The last component of a program path, truncated to 15 bytes (`comm`).

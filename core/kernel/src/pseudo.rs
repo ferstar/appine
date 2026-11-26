@@ -1722,6 +1722,15 @@ impl Pseudo for View<'_> {
                 }
                 let exe = g.borrow().exe.clone().ok_or(Errno::ENOENT)?;
                 let path = exe.path.to_vec();
+                if let Some(f) = &exe.fuse {
+                    return Ok(if self.vfs.fuse().get(f.id).is_some() {
+                        self.vfs
+                            .path_of(self, &self.root(), &Node::Fuse(f.mnt, f.id))
+                            .unwrap_or_else(|_| with_deleted(path))
+                    } else {
+                        with_deleted(path)
+                    });
+                }
                 Ok(match (exe.node, &exe.ovl) {
                     (Some((_, ino)), _) => mark_deleted(self.vfs.store(), ino, path),
                     // An overlay program whose name was removed
@@ -1888,6 +1897,15 @@ impl Pseudo for View<'_> {
                         Err(Errno::ENOENT)
                     });
                 }
+                if let Some(f) = &exe.fuse {
+                    return Some(if self.vfs.fuse().get(f.id).is_some_and(|n| !n.unlinked) {
+                        Ok(Node::Fuse(f.mnt, f.id))
+                    } else if exe.host.is_some() {
+                        Ok(Node::Pseudo(mnt, PseudoNode::OpenExe(*proc)))
+                    } else {
+                        Err(Errno::ENOENT)
+                    });
+                }
                 let (m, ino) = exe.node?;
                 let deleted = self.vfs.store().attrs(ino).map_or(true, |st| st.nlink == 0);
                 return Some(Ok(if deleted && exe.host.is_some() {
@@ -2041,9 +2059,8 @@ impl View<'_> {
             return Some(Node::Pseudo(mnt, PseudoNode::OpenFd(*proc, *tid, *fd)));
         }
         Some(match &f.kind {
-            FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
-                Node::Store(f.mnt, *ino)
-            }
+            FileKind::Regular { ino, .. } => Node::Store(f.mnt, *ino),
+            FileKind::Device { ino, .. } => f.node().unwrap_or(Node::Store(f.mnt, *ino)),
             FileKind::Directory { node, .. } | FileKind::Path(node) => node.clone(),
             FileKind::Proc { mnt, node, .. } => Node::Pseudo(*mnt, node.clone()),
             // A slave device: its path in the devpts mount it was opened through (or the opened

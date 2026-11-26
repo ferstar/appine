@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: post-syscall sweeps and `Mm::sync` on successful execve/execveat)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: FUSE exec set-id/file capabilities and pinned FUSE `ExeFile`)
 
 ## Responsibilities
 
@@ -37,9 +37,9 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 
 - `loader::Executable`, `ExeCache` (32 opened executables, least recently used dropped), `Args`,
   `Prepared` (the hand-off between the locked and unlocked exec phases), `Image` (with `doomed`);
-  `process::ExeFile` (the process's `exe_file`: path, store mount and inode, dentry, host file, and
-  for a program found through an overlay its overlay node, held while recorded; its `Drop` reports
-  its mount to `vfs::released`).
+  `process::ExeFile` (the process's `exe_file`: path, store mount and inode, dentry, host file,
+  for an overlay program its overlay node, and for a FUSE program its `FuseExe` node/mount/pin/stat
+  record; its `Drop` reports its mount to `vfs::released`).
 - `loader::LoadError` — why loading failed, turned into an errno by `load_error`.
 
 ## Public entry points
@@ -60,8 +60,10 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 - Target: by path, by fd (`AT_EMPTY_PATH`), through `/proc/<pid>/fd/<n>` (the open file) or
   `/proc/<pid>/exe`. It must be a regular executable file (`EACCES`), not on a noexec mount;
   nosuid is noted (memfds ignore both). A program (or interpreter) on a FUSE mount is read whole
-  into a host copy by a retry before anything changes (`kernel/fuse`), runs as if from a nosuid
-  mount, and carries its FUSE key as inode number.
+  into a host copy by a retry before anything changes (`kernel/fuse`), carries its FUSE key as
+  inode number, applies set-id bits and `security.capability` (`Query::FileCaps`) unless `MS_NOSUID`
+  or outside the FUSE connection's user namespace (`mnt_may_suid`), and pins its FUSE node in
+  `ExeFile::fuse` so `/proc/<pid>/exe` follows the executed node across renames and unlinks.
 - `#!` scripts: the interpreter line is parsed (up to 256 bytes) and the interpreter resolved
   relative to the cwd; five nested scripts run, a sixth is `ELOOP` (Linux 6.1's `exec_binprm`); a
   script run by fd through a close-on-exec directory is `ENOENT`.

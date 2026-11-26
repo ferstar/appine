@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across fd allocation and close, path and handle opens, inode flags, render submission and fences)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: EventFdIds allocator and Linux 6.1 zombie leader mem/pagemap open)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest changes: `EventFdIds` allocator, Linux 6.1 zombie leader mem/pagemap open, `FileKind::FuseSnapshot` for deleted FUSE `/proc/<pid>/exe` reopens, and FUSE FIFO/device node opens)
 
 ## Responsibilities
 
@@ -47,8 +47,9 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   node behind a file opened through an overlay, and its `Hold`s), and old host handles kept until
   close: `ovl_lower` (after a copy-up) and `retired` (after `rehome`).
 - `FileKind` — Host, Regular, Directory, Path, Pipe, Device, Render, GpuFence, Pty, Socket, Epoll, EventFd,
-  TimerFd, SignalFd, Inotify, Pidfd, MessageQueue, SeccompNotify, Bpf, Proc, Fuse and FuseDev (a
-  FUSE directory is a Directory with the daemon's handle). Regular carries `cow`: writable, but the
+  TimerFd, SignalFd, Inotify, Pidfd, MessageQueue, SeccompNotify, Bpf, Proc, Fuse, FuseSnapshot
+  and FuseDev (a FUSE directory is a Directory with the daemon's handle; `FuseSnapshot` is a
+  read-only host snapshot of a deleted FUSE executable reopened through `/proc/<pid>/exe`). Regular carries `cow`: writable, but the
   handle only reads because the file shares its object, so its first change gives the file an
   object of its own (`kernel/fileio`); set at open, by `rehome` and by `follow_copy_up`, cleared by
   `rehome`.
@@ -237,8 +238,9 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
   fence gets a read-only, close-on-exec, pollable `GpuFence` descriptor. Failure to copy the
   result back closes that descriptor. GEM close removes the guest handle.
   Host operations use the `Renderer`, `Context` and `Mapping` interfaces in `gpu.rs`.
-- Opening dispatches by device number for store and overlay nodes anywhere and handle opens (device
-  nodes in FUSE filesystems are `ENXIO`), after nodev (`EACCES`), permission and the cgroup BPF
+- Opening dispatches by device number for store, overlay and FUSE nodes anywhere and handle opens,
+  after nodev (`EACCES`, including `SB_I_NODEV` on non-initial-userns FUSE mounts), permission and
+  the cgroup BPF
   device filter: 5:0 and 5:1 the controlling terminal, 5:2 the ptmx of the devpts beside the node
   (`ENOENT` without a `pts` there, `ENODEV` when it is not devpts or the node's directory is not a
   store directory; the boot devpts when no directory was recorded), major 136 a boot devpts slave,

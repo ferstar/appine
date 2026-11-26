@@ -114,7 +114,7 @@ fn linux_refuses(request: u32, on: &str) -> bool {
 pub(crate) fn file_kind(kind: &FileKind) -> &'static str {
     match kind {
         FileKind::Host(_) => "host file",
-        FileKind::Regular { .. } | FileKind::Fuse(_) => REGULAR,
+        FileKind::Regular { .. } | FileKind::Fuse(_) | FileKind::FuseSnapshot(_) => REGULAR,
         FileKind::FuseDev(_) => "/dev/fuse",
         FileKind::Render { .. } => "virtio_gpu",
         FileKind::GpuFence(_) => "GPU fence",

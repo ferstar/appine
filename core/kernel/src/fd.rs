@@ -76,6 +76,14 @@ pub mod oflags {
     pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK | O_ASYNC | O_DIRECT | O_NOATIME;
 }
 
+/// A read-only host snapshot of a deleted FUSE executable reopened through `/proc/<pid>/exe`.
+pub(crate) struct FuseSnapshot {
+    pub id: crate::vfs::fuse::FuseId,
+    pub file: File,
+    pub stat: crate::vfs::store::Stat,
+    pub blksize: u32,
+}
+
 /// The kind of an open file.
 pub enum FileKind {
     /// A host fd: `appine-run` hands the host's stdin/stdout/stderr to the guest as they are.
@@ -152,6 +160,8 @@ pub enum FileKind {
     /// A file in a FUSE filesystem other than a directory, read and written through its daemon
     /// (in mount [`OpenFile::mnt`]).
     Fuse(Box<crate::vfs::fuse::Handle>),
+    /// A read-only host snapshot of a deleted FUSE executable reopened through `/proc/<pid>/exe`.
+    FuseSnapshot(Box<FuseSnapshot>),
     /// `/dev/fuse`: a FUSE daemon reads requests from it and writes replies.
     FuseDev(crate::vfs::fuse::DevFile),
     /// A procfs, sysfs or cgroup2 file: content generated at open, regenerated when read again
@@ -371,10 +381,20 @@ impl OpenFile {
     }
 
     pub(crate) fn pin_fuse_path(&mut self, vfs: &crate::vfs::Vfs) -> Result<(), Errno> {
-        if let FileKind::Path(Node::Fuse(_, id)) = self.kind {
-            let mut fuse = vfs.fuse_mut();
-            let node = fuse.get_mut(id).ok_or(Errno::ENOTCONN)?;
-            self.fuse_path = Some(node.pin_path());
+        let Some(Node::Fuse(_, id)) = self.node() else {
+            return Ok(());
+        };
+        if matches!(
+            self.kind,
+            FileKind::Fuse(_) | FileKind::Directory { fuse: Some(_), .. }
+        ) {
+            return Ok(());
+        }
+        let mut fuse = vfs.fuse_mut();
+        match fuse.get_mut(id) {
+            Some(node) => self.fuse_path = Some(node.pin_path()),
+            None if matches!(self.kind, FileKind::FuseSnapshot(_)) => {}
+            None => return Err(Errno::ENOTCONN),
         }
         Ok(())
     }
@@ -451,9 +471,13 @@ impl OpenFile {
         if let Some(o) = self.ovl {
             return Some(Node::Overlay(self.mnt, o));
         }
+        let node_of = |ino: Ino| match crate::vfs::fuse::id_of(ino) {
+            Some(id) => Node::Fuse(self.mnt, id),
+            None => Node::Store(self.mnt, ino),
+        };
         match &self.kind {
-            FileKind::Pipe(end) => end.pipe.borrow().fifo.map(|ino| Node::Store(self.mnt, ino)),
-            FileKind::Pty(end) => end.dev_ino.map(|ino| Node::Store(self.mnt, ino)),
+            FileKind::Pipe(end) => end.pipe.borrow().fifo.map(node_of),
+            FileKind::Pty(end) => end.dev_ino.map(node_of),
             FileKind::Host(_)
             | FileKind::Socket(_)
             | FileKind::Epoll(_)
@@ -465,13 +489,13 @@ impl OpenFile {
             | FileKind::SeccompNotify(_)
             | FileKind::Bpf(_)
             | FileKind::MessageQueue(_) => None,
-            FileKind::Render { ino, .. } => Some(Node::Store(self.mnt, *ino)),
+            FileKind::Render { ino, .. } => Some(node_of(*ino)),
             FileKind::GpuFence(_) => None,
-            FileKind::FuseDev(d) => d.ino.map(|ino| Node::Store(self.mnt, ino)),
+            FileKind::FuseDev(d) => d.ino.map(node_of),
             FileKind::Fuse(h) => Some(Node::Fuse(self.mnt, h.id)),
-            FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
-                Some(Node::Store(self.mnt, *ino))
-            }
+            FileKind::FuseSnapshot(s) => Some(Node::Fuse(self.mnt, s.id)),
+            FileKind::Regular { ino, .. } => Some(Node::Store(self.mnt, *ino)),
+            FileKind::Device { ino, .. } => Some(node_of(*ino)),
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
             FileKind::Proc { mnt, node, .. } => Some(Node::Pseudo(*mnt, node.clone())),
         }

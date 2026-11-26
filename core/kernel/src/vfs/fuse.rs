@@ -904,6 +904,12 @@ pub(crate) fn dont_mask(c: &Conn) -> bool {
     c.flags & init::DONT_MASK != 0
 }
 
+/// Whether the daemon clears set-id bits and file capabilities itself on writes, truncation and
+/// ownership changes (`FUSE_HANDLE_KILLPRIV`).
+pub(crate) fn handle_killpriv(c: &Conn) -> bool {
+    c.flags & init::HANDLE_KILLPRIV != 0
+}
+
 // ---- Making requests ----
 
 /// Makes request `opcode` on node id `nodeid` with arguments `args` and waits for its reply,
@@ -1776,6 +1782,9 @@ pub(crate) struct Node {
     sock_pin: Weak<RefCell<crate::net::Socket>>,
     /// True once `unlink`, `rmdir`, or an overwriting `rename` removed the node's last link.
     pub unlinked: bool,
+    /// Linux's `S_NOSEC`: confirmed to carry no `security.capability` xattr until `setxattr`
+    /// installs one, avoiding repeated `FUSE_GETXATTR` probes on writes when `!HANDLE_KILLPRIV`.
+    pub no_sec: bool,
     /// When it was last entered ([`Fuses::clock`]): the oldest go first.
     seen: u64,
 }
@@ -1849,6 +1858,7 @@ impl Fuses {
                 path_pin: Weak::new(),
                 sock_pin: Weak::new(),
                 unlinked: false,
+                no_sec: false,
                 seen: 0,
             },
         );
@@ -2004,6 +2014,7 @@ impl Fuses {
                         path_pin: Weak::new(),
                         sock_pin: Weak::new(),
                         unlinked: false,
+                        no_sec: false,
                         seen: 0,
                     },
                 );
@@ -2428,7 +2439,11 @@ pub(crate) enum Query {
     Readlink(FuseId),
     /// A program to execute, read whole ([`program`]).
     Program(FuseId),
+    /// `security.capability` xattr of a program being executed ([`file_caps`]).
+    FileCaps(FuseId),
 }
+
+type CachedFileCaps = (FuseId, Result<Option<Vec<u8>>, Errno>);
 
 thread_local! {
     /// The syscall this thread is in ([`token`]).
@@ -2447,6 +2462,11 @@ thread_local! {
     /// dropped when the next syscall starts.
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static PROGRAMS: std::cell::RefCell<Vec<(FuseId, std::fs::File)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// `security.capability` xattrs fetched during execve in this syscall: dropped when the next
+    /// syscall starts.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static FILE_CAPS: std::cell::RefCell<Vec<CachedFileCaps>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -2486,6 +2506,21 @@ pub(crate) fn program(id: FuseId) -> Option<std::fs::File> {
     })
 }
 
+/// The raw `security.capability` xattr of FUSE node `id` for execve, when this syscall has read
+/// it ([`Query::FileCaps`]). Returns `Ok(None)` immediately when the daemon does not support
+/// `FUSE_GETXATTR`.
+pub(crate) fn file_caps(vfs: &super::Vfs, id: FuseId) -> Result<Option<Vec<u8>>, Errno> {
+    if vfs.fuse().conn_of(id)?.borrow().no & no::GETXATTR != 0 {
+        return Ok(None);
+    }
+    if let Some(res) =
+        FILE_CAPS.with_borrow(|c| c.iter().find(|(i, _)| *i == id).map(|(_, r)| r.clone()))
+    {
+        return res;
+    }
+    Err(need(Query::FileCaps(id)))
+}
+
 /// The number of the syscall this thread is handling: what a request brings back during it is
 /// usable until it ends, whatever its validity.
 pub(crate) fn token() -> u64 {
@@ -2502,6 +2537,9 @@ pub(crate) fn new_syscall() {
     }
     if PROGRAMS.with_borrow(|p| !p.is_empty()) {
         PROGRAMS.with_borrow_mut(Vec::clear);
+    }
+    if FILE_CAPS.with_borrow(|c| !c.is_empty()) {
+        FILE_CAPS.with_borrow_mut(Vec::clear);
     }
 }
 
@@ -2619,6 +2657,23 @@ pub(crate) fn serve(
             let copy = snapshot(cx, (&h.conn, h.nodeid, h.fh, h.flags), 0, size)?;
             drop(h);
             PROGRAMS.with_borrow_mut(|p| p.push((id, copy)));
+            Ok(())
+        }
+        Query::FileCaps(id) => {
+            let res = match getxattr(cx, &vfs, id, Some(crate::cred::XATTR_NAME_CAPS), 64) {
+                Ok(Ok(v)) => Ok(Some(v)),
+                Ok(Err(_)) => Err(Errno::EINVAL),
+                Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {
+                    if let Some(n) = vfs.fuse_mut().get_mut(id) {
+                        n.no_sec = true;
+                    }
+                    Ok(None)
+                }
+                Err(Errno::ERANGE) => Err(Errno::EINVAL),
+                Err(Errno::EINTR) => return Err(Errno::EINTR),
+                Err(e) => Err(e),
+            };
+            FILE_CAPS.with_borrow_mut(|c| c.push((id, res)));
             Ok(())
         }
         Query::Readlink(id) => {
