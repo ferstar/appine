@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification of `TIOCSETD` argument validation and slave-side job control)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: document intentional /dev/console controlling-terminal routing and close open question)
 
 ## Responsibilities
 
@@ -94,12 +94,14 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   `EBUSY`; locked or no master gives `EIO`; without `O_NOCTTY` a session
   leader without a controlling terminal acquires an unowned terminal when the open has read
   access (Job control below).
-- `/dev/tty` and `/dev/console` both open the caller's controlling terminal as a slave end
-  (`ENXIO` without one), with the same exclusivity check, keeping the opened store (or overlay)
+- `/dev/tty` (5:0) and `/dev/console` (5:1) both open the caller's controlling terminal as a slave
+  end (`ENXIO` without one), with the same exclusivity check, keeping the opened store (or overlay)
   device node (`dev_ino`, plus `OpenFile::mnt`/`ovl`/`path`) so `fstat`/`statx`,
   `fchmod`/`fchown`/`futimens`, `fstatfs`, `/proc/<pid>/fd` and `fdinfo` report the opened 5:0 or
   5:1 device node rather than `/dev/pts/N` (and keep its mount busy, not devpts). They skip the
-  lock and master checks and never acquire one.
+  lock and master checks and never acquire one. Routing `/dev/console` to the controlling terminal
+  is intentional in Appine's console-less design: boot/inittab output goes to `/var/log/boot.log`
+  and host consoles are independent per-tab PTYs with no single system console.
 
 ### Input (master writes, host console feed)
 
@@ -392,8 +394,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 ## Open questions
 
-- Is mapping `/dev/console` to the caller's controlling terminal (rather than a system console)
-  intended?
+- None.
 
 ## To verify
 
