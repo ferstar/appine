@@ -609,19 +609,15 @@ fn peeksiginfo(cx: &mut Cx<'_>, task: &Task, addr: u64, data: u64) -> SysResult 
             break;
         };
         let raw = info.encode(sig);
-        let Some(dst) = copied
+        let step = copied
             .checked_mul(128)
             .and_then(|bytes| data.checked_add(bytes))
-        else {
-            return if copied > 0 {
-                Ok(copied)
-            } else {
-                Err(Errno::EFAULT)
-            };
-        };
-        let step = super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| {
-            cx.write_user(UserSlice::new(dst, 128), &raw)
-        });
+            .ok_or(Errno::EFAULT)
+            .and_then(|dst| {
+                super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| {
+                    cx.write_user(UserSlice::new(dst, 128), &raw)
+                })
+            });
         if let Err(e) = step {
             return if copied > 0 { Ok(copied) } else { Err(e) };
         }

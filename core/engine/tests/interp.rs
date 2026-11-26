@@ -1305,8 +1305,9 @@ fn register_branches_and_entry_apply_tbi0() {
     assert_eq!(g.pc(), target);
     g.cpu.state_mut().set_hw_debug(&[], &[]);
 
-    // Faulting TTBR0 targets (bit 55 == 0) clear bits 63:56 before alignment or page faults.
-    let ttbr0_faults = [
+    // Faulting TTBR0 targets (bit 55 == 0) clear bits 63:56 before alignment or page faults;
+    // addresses with bit 55 == 1 are outside TTBR0/TBI0 and fault with raw pc preserved.
+    let faults = [
         (TAG | (target + 2), target + 2, FaultKind::Alignment),
         (TAG | 0x1234_0000, 0x1234_0000, FaultKind::Page),
         (TAG | RODATA, RODATA, FaultKind::Page),
@@ -1315,65 +1316,36 @@ fn register_branches_and_entry_apply_tbi0() {
             (1u64 << 48) | target,
             FaultKind::Page,
         ),
+        (
+            TAG | KERNEL_BIT | target,
+            TAG | KERNEL_BIT | target,
+            FaultKind::Page,
+        ),
+        (
+            (0xffu64 << 56) | KERNEL_BIT | target,
+            (0xffu64 << 56) | KERNEL_BIT | target,
+            FaultKind::Page,
+        ),
+        (
+            TAG | KERNEL_BIT | (target + 2),
+            TAG | KERNEL_BIT | (target + 2),
+            FaultKind::Alignment,
+        ),
     ];
-    for (raw, expected, kind) in ttbr0_faults {
+    for (raw, expected, kind) in faults {
+        let want = Exit::Fault {
+            addr: expected,
+            access: Access::Exec,
+            kind,
+        };
         g.cpu.state_mut().pc = CODE;
         g.set_x(1, raw);
-        assert_eq!(
-            g.cpu.run(),
-            Exit::Fault {
-                addr: expected,
-                access: Access::Exec,
-                kind,
-            },
-            "BR raw={raw:#x}"
-        );
+        assert_eq!(g.cpu.run(), want, "BR raw={raw:#x}");
         assert_eq!(g.pc(), expected, "BR raw={raw:#x}");
 
         g.cpu.state_mut().pc = raw;
-        assert_eq!(
-            g.cpu.step(),
-            Some(Exit::Fault {
-                addr: expected,
-                access: Access::Exec,
-                kind,
-            }),
-            "step raw={raw:#x}"
-        );
+        assert_eq!(g.cpu.step(), Some(want), "step raw={raw:#x}");
         assert_eq!(g.pc(), expected, "step raw={raw:#x}");
-    }
-
-    // Addresses with bit 55 == 1 are outside TTBR0/TBI0: preserve bits 63:56 and fault with raw pc.
-    let ttbr1_faults = [
-        (TAG | KERNEL_BIT | target, FaultKind::Page),
-        ((0xffu64 << 56) | KERNEL_BIT | target, FaultKind::Page),
-        (TAG | KERNEL_BIT | (target + 2), FaultKind::Alignment),
-    ];
-    for (raw, kind) in ttbr1_faults {
-        g.cpu.state_mut().pc = CODE;
-        g.set_x(1, raw);
-        assert_eq!(
-            g.cpu.run(),
-            Exit::Fault {
-                addr: raw,
-                access: Access::Exec,
-                kind,
-            },
-            "BR bit55=1 raw={raw:#x}"
-        );
-        assert_eq!(g.pc(), raw, "BR bit55=1 raw={raw:#x}");
-
-        g.cpu.state_mut().pc = raw;
-        assert_eq!(
-            g.cpu.step(),
-            Some(Exit::Fault {
-                addr: raw,
-                access: Access::Exec,
-                kind,
-            }),
-            "step bit55=1 raw={raw:#x}"
-        );
-        assert_eq!(g.pc(), raw, "step bit55=1 raw={raw:#x}");
     }
 }
 

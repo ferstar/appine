@@ -5218,7 +5218,30 @@ fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
             ],
         );
 
+        fn run_both(
+            g0: &mut Guest,
+            g1: &mut Guest,
+            dbt: &mut Dbt,
+            mut setup: impl FnMut(&mut appine_engine::CpuState),
+            mut check: impl FnMut(&str, Exit, &appine_engine::CpuState),
+        ) {
+            for (tier, run_t1) in [("T0", false), ("T1", true)] {
+                let cur = if run_t1 { &mut *g1 } else { &mut *g0 };
+                let s = cur.cpu.state_mut();
+                s.x = [0; 31];
+                setup(s);
+                let exit = if run_t1 {
+                    dbt.run(&mut cur.cpu)
+                } else {
+                    cur.cpu.run()
+                };
+                check(tier, exit, cur.cpu.state());
+            }
+        }
+
         let lit_expected = u64::from(0xdead_beefu32) | (u64::from(0x1234_5678u32) << 32);
+        let mut g0 = Guest::with_data();
+        g0.pages[0].0.copy_from_slice(&g.pages[0].0);
 
         // Repeat twice to cover both cold jump-cache miss (d->lookup) and warm jump-cache hit.
         for round in 0..2 {
@@ -5229,70 +5252,62 @@ fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
                 (ret_stolen, stolen as usize, false),
                 (target, 0usize, true),
             ] {
-                let mut g0 = Guest::with_data();
-                g0.pages[0].0.copy_from_slice(&g.pages[0].0);
-                for (tier, run_t1) in [("T0", false), ("T1", true)] {
-                    let cur = if run_t1 { &mut g } else { &mut g0 };
-                    let s = cur.cpu.state_mut();
-                    s.x = [0; 31];
-                    s.nzcv = NZCV_INIT;
-                    if !use_entry_tag {
-                        s.x[reg] = TAG | target;
-                    }
-                    s.pc = if use_entry_tag { TAG | entry } else { entry };
-                    let exit = if run_t1 {
-                        dbt.run(&mut cur.cpu)
-                    } else {
-                        cur.cpu.run()
-                    };
-                    assert_eq!(
-                        exit,
-                        Exit::Svc { imm: 0 },
-                        "{regs:?} {tier} round={round} entry={entry:#x}"
-                    );
-                    let st = cur.cpu.state();
-                    assert_eq!(st.x[0], target, "{regs:?} {tier} adr");
-                    assert_eq!(st.x[2], target & !0xfff, "{regs:?} {tier} adrp");
-                    assert_eq!(st.x[3], lit_expected, "{regs:?} {tier} ldr literal");
-                    assert_eq!(st.x[4], target + 16, "{regs:?} {tier} bl lr");
-                    assert_eq!(st.nzcv, NZCV_INIT, "{regs:?} {tier} nzcv preserved");
-                    assert_eq!(st.pc, target + 24, "{regs:?} {tier} final pc");
-                    if !use_entry_tag && reg != 0 && reg != 2 && reg != 3 && reg != 4 {
-                        let expected_reg = if reg == 30 { target + 16 } else { TAG | target };
-                        assert_eq!(st.x[reg], expected_reg, "{regs:?} {tier} source reg");
-                    }
-                }
+                run_both(
+                    &mut g0,
+                    &mut g,
+                    &mut dbt,
+                    |s| {
+                        s.nzcv = NZCV_INIT;
+                        if !use_entry_tag {
+                            s.x[reg] = TAG | target;
+                        }
+                        s.pc = if use_entry_tag { TAG | entry } else { entry };
+                    },
+                    |tier, exit, st| {
+                        assert_eq!(
+                            exit,
+                            Exit::Svc { imm: 0 },
+                            "{regs:?} {tier} round={round} entry={entry:#x}"
+                        );
+                        assert_eq!(st.x[0], target, "{regs:?} {tier} adr");
+                        assert_eq!(st.x[2], target & !0xfff, "{regs:?} {tier} adrp");
+                        assert_eq!(st.x[3], lit_expected, "{regs:?} {tier} ldr literal");
+                        assert_eq!(st.x[4], target + 16, "{regs:?} {tier} bl lr");
+                        assert_eq!(st.nzcv, NZCV_INIT, "{regs:?} {tier} nzcv preserved");
+                        assert_eq!(st.pc, target + 24, "{regs:?} {tier} final pc");
+                        if !use_entry_tag && reg != 0 && reg != 2 && reg != 3 && reg != 4 {
+                            let expected_reg = if reg == 30 { target + 16 } else { TAG | target };
+                            assert_eq!(st.x[reg], expected_reg, "{regs:?} {tier} source reg");
+                        }
+                    },
+                );
             }
 
             // Tagged BLR (x1 and x30) returning via tagged X30.
             for (entry, reg) in [(blr_x1, 1usize), (blr_x30, 30usize)] {
-                let mut g0 = Guest::with_data();
-                g0.pages[0].0.copy_from_slice(&g.pages[0].0);
-                for (tier, run_t1) in [("T0", false), ("T1", true)] {
-                    let cur = if run_t1 { &mut g } else { &mut g0 };
-                    let s = cur.cpu.state_mut();
-                    s.x = [0; 31];
-                    s.nzcv = NZCV_INIT;
-                    s.x[reg] = TAG | callee;
-                    s.x[9] = TAG;
-                    s.pc = entry;
-                    let exit = if run_t1 {
-                        dbt.run(&mut cur.cpu)
-                    } else {
-                        cur.cpu.run()
-                    };
-                    assert_eq!(
-                        exit,
-                        Exit::Svc { imm: 0 },
-                        "{regs:?} {tier} blr round={round} entry={entry:#x}"
-                    );
-                    let st = cur.cpu.state();
-                    assert_eq!(st.x[0], callee, "{regs:?} {tier} callee adr");
-                    assert_eq!(st.x[5], entry + 4, "{regs:?} {tier} untagged link");
-                    assert_eq!(st.x[30], TAG | (entry + 4), "{regs:?} {tier} tagged lr");
-                    assert_eq!(st.nzcv, NZCV_INIT, "{regs:?} {tier} nzcv preserved");
-                    assert_eq!(st.pc, entry + 8, "{regs:?} {tier} resumed after blr");
-                }
+                run_both(
+                    &mut g0,
+                    &mut g,
+                    &mut dbt,
+                    |s| {
+                        s.nzcv = NZCV_INIT;
+                        s.x[reg] = TAG | callee;
+                        s.x[9] = TAG;
+                        s.pc = entry;
+                    },
+                    |tier, exit, st| {
+                        assert_eq!(
+                            exit,
+                            Exit::Svc { imm: 0 },
+                            "{regs:?} {tier} blr round={round} entry={entry:#x}"
+                        );
+                        assert_eq!(st.x[0], callee, "{regs:?} {tier} callee adr");
+                        assert_eq!(st.x[5], entry + 4, "{regs:?} {tier} untagged link");
+                        assert_eq!(st.x[30], TAG | (entry + 4), "{regs:?} {tier} tagged lr");
+                        assert_eq!(st.nzcv, NZCV_INIT, "{regs:?} {tier} nzcv preserved");
+                        assert_eq!(st.pc, entry + 8, "{regs:?} {tier} resumed after blr");
+                    },
+                );
             }
         }
 
@@ -5385,28 +5400,21 @@ fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
                 ("ret", ret_x30, Some(30usize)),
                 ("entry", raw, None),
             ] {
-                let mut g0 = Guest::with_data();
-                g0.pages[0].0.copy_from_slice(&g.pages[0].0);
-                for (tier, run_t1) in [("T0", false), ("T1", true)] {
-                    let cur = if run_t1 { &mut g } else { &mut g0 };
-                    let s = cur.cpu.state_mut();
-                    s.x = [0; 31];
-                    if let Some(r) = reg {
-                        s.x[r] = raw;
-                    }
-                    s.pc = entry;
-                    let exit = if run_t1 {
-                        dbt.run(&mut cur.cpu)
-                    } else {
-                        cur.cpu.run()
-                    };
-                    assert_eq!(exit, want, "{regs:?} {tier} {mode} raw={raw:#x}");
-                    assert_eq!(
-                        cur.cpu.state().pc,
-                        expected,
-                        "{regs:?} {tier} {mode} pc raw={raw:#x}"
-                    );
-                }
+                run_both(
+                    &mut g0,
+                    &mut g,
+                    &mut dbt,
+                    |s| {
+                        if let Some(r) = reg {
+                            s.x[r] = raw;
+                        }
+                        s.pc = entry;
+                    },
+                    |tier, exit, st| {
+                        assert_eq!(exit, want, "{regs:?} {tier} {mode} raw={raw:#x}");
+                        assert_eq!(st.pc, expected, "{regs:?} {tier} {mode} pc raw={raw:#x}");
+                    },
+                );
             }
         }
     }

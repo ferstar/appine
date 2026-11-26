@@ -3167,6 +3167,12 @@ impl Mm {
             let mut remnant = v.clone();
             remnant.len = len;
             remnant.locked = false;
+            // Linux 6.1's `move_vma` unlinks `anon_vma` only on a whole-VMA move and retains the
+            // old `vm_pgoff`.
+            if whole_vma {
+                remnant.anon = 0;
+                remnant.has_anon_vma.set(false);
+            }
             match v.backing {
                 Backing::Anonymous => {
                     (remnant.region, remnant.host) = Self::private_anonymous(
@@ -3176,12 +3182,6 @@ impl Mm {
                     )?;
                     remnant.file_len = len;
                     remnant.written.set(false);
-                    // Linux 6.1's `move_vma` unlinks `anon_vma` only on a whole-VMA move and
-                    // retains the old `vm_pgoff`.
-                    if whole_vma {
-                        remnant.anon = 0;
-                        remnant.has_anon_vma.set(false);
-                    }
                 }
                 Backing::Shared => {
                     remnant.file_len = self.vmas.range(s..stop).map(|(_, v)| v.file_len).sum();
@@ -3190,15 +3190,8 @@ impl Mm {
                     (remnant.region, remnant.host) = Self::fill_host(v, v.offset(), len)?;
                     remnant.cow = false;
                     remnant.written.set(v.prot & prot::WRITE != 0);
-                    if whole_vma {
-                        remnant.anon = 0;
-                    }
                 }
                 Backing::PrivateFile => {
-                    let mut flags = VmaFlags::of(v);
-                    if whole_vma {
-                        flags.anon = 0;
-                    }
                     refill.push(Refill {
                         start: s,
                         len,
@@ -3207,7 +3200,7 @@ impl Mm {
                         offset: v.offset(),
                         name: v.name.clone(),
                         mnt: v.mnt.as_ref().map(|m| m.0),
-                        flags,
+                        flags: VmaFlags::of(&remnant),
                         file: v.file.as_ref().map(|(fd, _)| fd.clone()),
                         tmpfs: v.tmpfs().cloned(),
                         interp_open: v.interp_open.clone(),
@@ -3220,10 +3213,8 @@ impl Mm {
         self.move_range(old, len, dst)?;
         if !whole_vma {
             // Linux 6.1's `move_vma` clears VM_LOCKED across the entire old VMA.
-            for (_, v) in self.vmas.range_mut(vma_start..old) {
-                v.locked = false;
-            }
-            for (_, v) in self.vmas.range_mut(end..vma_end) {
+            // `[old, end)` has moved to `dst`, which is disjoint from `[vma_start, vma_end)`.
+            for (_, v) in self.vmas.range_mut(vma_start..vma_end) {
                 v.locked = false;
             }
         }

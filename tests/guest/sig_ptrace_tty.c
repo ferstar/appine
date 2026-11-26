@@ -88,9 +88,6 @@
 #ifndef PTRACE_SEIZE
 #define PTRACE_SEIZE 0x4206
 #endif
-#ifndef PTRACE_INTERRUPT
-#define PTRACE_INTERRUPT 0x4207
-#endif
 #ifndef PTRACE_LISTEN
 #define PTRACE_LISTEN 0x4208
 #endif
@@ -2319,6 +2316,12 @@ static long do_peeksiginfo(pid_t pid, const void *args, void *buf)
     return ptrace(PTRACE_PEEKSIGINFO, pid, args, buf);
 }
 
+static long peek_siginfo(pid_t pid, uint64_t off, uint32_t flags, int32_t nr, void *buf)
+{
+    struct peeksiginfo_args_uapi a = {.off = off, .flags = flags, .nr = nr};
+    return do_peeksiginfo(pid, &a, buf);
+}
+
 struct peek_worker_ctx {
     _Atomic pid_t tid;
     int gate_rd;
@@ -2398,36 +2401,29 @@ static void test_ptrace_peeksiginfo(void)
     wait_stop(pid, SIGSTOP);
 
     siginfo_t buf[16];
-    struct peeksiginfo_args_uapi a;
 
     /* 2. Bad addr -> EFAULT. */
     CHECK_ERR(do_peeksiginfo(pid, (void *)0x10, buf), EFAULT, "bad addr -> EFAULT");
 
     /* 3. Unknown flags -> EINVAL (checked before nr and off). */
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 2, .nr = 0};
-    CHECK_ERR(do_peeksiginfo(pid, &a, buf), EINVAL, "unknown flag 2 + nr=0 -> EINVAL");
-    a = (struct peeksiginfo_args_uapi){.off = UINT64_MAX, .flags = 0xffffffffU, .nr = -1};
-    CHECK_ERR(do_peeksiginfo(pid, &a, buf), EINVAL, "unknown flags + huge off -> EINVAL");
+    CHECK_ERR(peek_siginfo(pid, 0, 2, 0, buf), EINVAL, "unknown flag 2 + nr=0 -> EINVAL");
+    CHECK_ERR(peek_siginfo(pid, UINT64_MAX, 0xffffffffU, -1, buf), EINVAL,
+              "unknown flags + huge off -> EINVAL");
 
     /* 4. Negative nr -> EINVAL (checked before off > INT32_MAX). */
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = -1};
-    CHECK_ERR(do_peeksiginfo(pid, &a, buf), EINVAL, "nr=-1 -> EINVAL");
-    a = (struct peeksiginfo_args_uapi){.off = (uint64_t)INT32_MAX + 1, .flags = 0, .nr = -1};
-    CHECK_ERR(do_peeksiginfo(pid, &a, buf), EINVAL, "huge off + nr=-1 -> EINVAL");
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = INT32_MIN};
-    CHECK_ERR(do_peeksiginfo(pid, &a, buf), EINVAL, "nr=INT32_MIN -> EINVAL");
+    CHECK_ERR(peek_siginfo(pid, 0, 0, -1, buf), EINVAL, "nr=-1 -> EINVAL");
+    CHECK_ERR(peek_siginfo(pid, (uint64_t)INT32_MAX + 1, 0, -1, buf), EINVAL,
+              "huge off + nr=-1 -> EINVAL");
+    CHECK_ERR(peek_siginfo(pid, 0, 0, INT32_MIN, buf), EINVAL, "nr=INT32_MIN -> EINVAL");
 
     /* 5. nr == 0, off > INT32_MAX, off == INT32_MAX, and empty queue never touch data. */
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = 0};
-    CHECK(do_peeksiginfo(pid, &a, (void *)0x10) == 0, "nr=0 + bad data -> 0");
-    a = (struct peeksiginfo_args_uapi){.off = (uint64_t)INT32_MAX + 1, .flags = 0, .nr = 1};
-    CHECK(do_peeksiginfo(pid, &a, (void *)0x10) == 0, "off=INT32_MAX+1 + bad data -> 0");
-    a = (struct peeksiginfo_args_uapi){.off = UINT64_MAX, .flags = PTRACE_PEEKSIGINFO_SHARED, .nr = 1};
-    CHECK(do_peeksiginfo(pid, &a, (void *)0x10) == 0, "off=UINT64_MAX + bad data -> 0");
-    a = (struct peeksiginfo_args_uapi){.off = INT32_MAX, .flags = 0, .nr = 2};
-    CHECK(do_peeksiginfo(pid, &a, (void *)0x10) == 0, "off=INT32_MAX -> 0");
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = 4};
-    CHECK(do_peeksiginfo(pid, &a, (void *)0x10) == 0, "empty queue + bad data -> 0");
+    CHECK(peek_siginfo(pid, 0, 0, 0, (void *)0x10) == 0, "nr=0 + bad data -> 0");
+    CHECK(peek_siginfo(pid, (uint64_t)INT32_MAX + 1, 0, 1, (void *)0x10) == 0,
+          "off=INT32_MAX+1 + bad data -> 0");
+    CHECK(peek_siginfo(pid, UINT64_MAX, PTRACE_PEEKSIGINFO_SHARED, 1, (void *)0x10) == 0,
+          "off=UINT64_MAX + bad data -> 0");
+    CHECK(peek_siginfo(pid, INT32_MAX, 0, 2, (void *)0x10) == 0, "off=INT32_MAX -> 0");
+    CHECK(peek_siginfo(pid, 0, 0, 4, (void *)0x10) == 0, "empty queue + bad data -> 0");
 
     /* 6. Queue mixed standard + RT signals to leader's private queue in known order. */
     siginfo_t uinfo;
@@ -2454,9 +2450,8 @@ static void test_ptrace_peeksiginfo(void)
 
     /* Peek whole private queue twice (non-destructive) and verify exact FIFO order & fields. */
     for (int pass = 0; pass < 2; pass++) {
-        a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = 10};
         memset(buf, 0xcc, sizeof(buf));
-        long n = do_peeksiginfo(pid, &a, buf);
+        long n = peek_siginfo(pid, 0, 0, 10, buf);
         CHECK(n == 5, "pass %d expected 5 private signals, got %ld", pass, n);
         CHECK(buf[0].si_signo == SIGUSR2 && buf[0].si_code == SI_TKILL &&
                   buf[0].si_pid == my_pid && buf[0].si_uid == my_uid,
@@ -2476,21 +2471,18 @@ static void test_ptrace_peeksiginfo(void)
     }
 
     /* Offsets, truncation, nr = INT32_MAX, and shared queue isolation. */
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = 2};
     memset(buf, 0, sizeof(buf));
-    CHECK(do_peeksiginfo(pid, &a, buf) == 2 && buf[0].si_signo == SIGUSR2 && buf[1].si_signo == rt0,
+    CHECK(peek_siginfo(pid, 0, 0, 2, buf) == 2 && buf[0].si_signo == SIGUSR2 &&
+              buf[1].si_signo == rt0,
           "off=0 nr=2");
-    a = (struct peeksiginfo_args_uapi){.off = 2, .flags = 0, .nr = 2};
     memset(buf, 0, sizeof(buf));
-    CHECK(do_peeksiginfo(pid, &a, buf) == 2 && buf[0].si_signo == SIGUSR1 &&
+    CHECK(peek_siginfo(pid, 2, 0, 2, buf) == 2 && buf[0].si_signo == SIGUSR1 &&
               buf[1].si_signo == rt0 && buf[1].si_value.sival_int == 102,
           "off=2 nr=2");
-    a = (struct peeksiginfo_args_uapi){.off = 5, .flags = 0, .nr = 2};
-    CHECK(do_peeksiginfo(pid, &a, (void *)0x10) == 0, "off=len + bad data -> 0");
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = INT32_MAX};
-    CHECK(do_peeksiginfo(pid, &a, buf) == 5, "nr=INT32_MAX -> 5");
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = PTRACE_PEEKSIGINFO_SHARED, .nr = 10};
-    CHECK(do_peeksiginfo(pid, &a, buf) == 0, "shared queue still empty");
+    CHECK(peek_siginfo(pid, 5, 0, 2, (void *)0x10) == 0, "off=len + bad data -> 0");
+    CHECK(peek_siginfo(pid, 0, 0, INT32_MAX, buf) == 5, "nr=INT32_MAX -> 5");
+    CHECK(peek_siginfo(pid, 0, PTRACE_PEEKSIGINFO_SHARED, 10, buf) == 0,
+          "shared queue still empty");
 
     /* 7. data EFAULT and partial-copy fault behavior. */
     char *guard = mmap(NULL, 2 * pgsz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -2499,23 +2491,22 @@ static void test_ptrace_peeksiginfo(void)
     char *ro = mmap(NULL, pgsz, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     CHECK(ro != MAP_FAILED, "mmap ro");
 
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = 2};
-    CHECK_ERR(do_peeksiginfo(pid, &a, NULL), EFAULT, "data=NULL -> EFAULT");
-    CHECK_ERR(do_peeksiginfo(pid, &a, ro), EFAULT, "data=PROT_READ -> EFAULT");
-    CHECK_ERR(do_peeksiginfo(pid, &a, guard + pgsz), EFAULT, "data=PROT_NONE -> EFAULT");
-    CHECK_ERR(do_peeksiginfo(pid, &a, guard + pgsz - 64), EFAULT, "1st straddles PROT_NONE -> EFAULT");
+    CHECK_ERR(peek_siginfo(pid, 0, 0, 2, NULL), EFAULT, "data=NULL -> EFAULT");
+    CHECK_ERR(peek_siginfo(pid, 0, 0, 2, ro), EFAULT, "data=PROT_READ -> EFAULT");
+    CHECK_ERR(peek_siginfo(pid, 0, 0, 2, guard + pgsz), EFAULT, "data=PROT_NONE -> EFAULT");
+    CHECK_ERR(peek_siginfo(pid, 0, 0, 2, guard + pgsz - 64), EFAULT,
+              "1st straddles PROT_NONE -> EFAULT");
 
     /* 1st fits, 2nd faults -> returns 1 (not EFAULT). */
     memset(guard + pgsz - 128, 0, 128);
-    CHECK(do_peeksiginfo(pid, &a, guard + pgsz - 128) == 1, "fault on 2nd -> 1");
+    CHECK(peek_siginfo(pid, 0, 0, 2, guard + pgsz - 128) == 1, "fault on 2nd -> 1");
     siginfo_t got;
     memcpy(&got, guard + pgsz - 128, sizeof(got));
     CHECK(got.si_signo == SIGUSR2 && got.si_code == SI_TKILL, "1st partial copy content");
 
     /* 1st & 2nd fit, 3rd faults -> returns 2. */
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = 4};
     memset(guard + pgsz - 256, 0, 256);
-    CHECK(do_peeksiginfo(pid, &a, guard + pgsz - 256) == 2, "fault on 3rd -> 2");
+    CHECK(peek_siginfo(pid, 0, 0, 4, guard + pgsz - 256) == 2, "fault on 3rd -> 2");
     memcpy(&got, guard + pgsz - 128, sizeof(got));
     CHECK(got.si_signo == rt0 && got.si_value.sival_int == 101, "2nd partial copy content");
 
@@ -2545,19 +2536,17 @@ static void test_ptrace_peeksiginfo(void)
     CHECK(syscall(SYS_rt_tgsigqueueinfo, pid, worker, rt1, &uinfo) == 0, "rt_tgsigqueueinfo worker");
 
     /* Leader private queue still has its 5 signals; worker private queue has its 2. */
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = 10};
-    CHECK(do_peeksiginfo(pid, &a, buf) == 5, "leader private still 5");
+    CHECK(peek_siginfo(pid, 0, 0, 10, buf) == 5, "leader private still 5");
     memset(buf, 0, sizeof(buf));
-    CHECK(do_peeksiginfo(worker, &a, buf) == 2 && buf[0].si_signo == SIGUSR2 &&
+    CHECK(peek_siginfo(worker, 0, 0, 10, buf) == 2 && buf[0].si_signo == SIGUSR2 &&
               buf[1].si_signo == rt1 && buf[1].si_value.sival_int == 401,
           "worker private queue mismatch");
 
     /* Both leader and non-leader worker see the exact same shared queue with SHARED flag. */
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = PTRACE_PEEKSIGINFO_SHARED, .nr = 10};
     for (int which = 0; which < 2; which++) {
         pid_t target = which == 0 ? pid : worker;
         memset(buf, 0, sizeof(buf));
-        long n = do_peeksiginfo(target, &a, buf);
+        long n = peek_siginfo(target, 0, PTRACE_PEEKSIGINFO_SHARED, 10, buf);
         CHECK(n == 2, "shared peek on target %d expected 2, got %ld", target, n);
         CHECK(buf[0].si_signo == SIGUSR1 && buf[0].si_code == SI_USER && buf[0].si_pid == my_pid,
               "shared[0] mismatch");
@@ -2596,8 +2585,7 @@ static void test_ptrace_peeksiginfo(void)
     CHECK(waitpid(pid, &st, __WALL) == pid && WIFSTOPPED(st) && (st >> 16) == PTRACE_EVENT_STOP,
           "expected PTRACE_EVENT_STOP, got 0x%x", st);
     CHECK(ptrace(PTRACE_LISTEN, pid, 0, 0) == 0, "PTRACE_LISTEN");
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = 0, .nr = 1};
-    CHECK_ERR(do_peeksiginfo(pid, &a, buf), ESRCH, "PTRACE_LISTEN tracee -> ESRCH");
+    CHECK_ERR(peek_siginfo(pid, 0, 0, 1, buf), ESRCH, "PTRACE_LISTEN tracee -> ESRCH");
     CHECK(ptrace(PTRACE_KILL, pid, 0, 0) == 0, "PTRACE_KILL");
     CHECK(waitpid(pid, &st, __WALL) == pid, "reap listen child");
     close(lgo[1]);
@@ -2619,10 +2607,9 @@ static void test_ptrace_peeksiginfo(void)
     wait_stop(pid, SIGSTOP);
     CHECK(kill(pid, SIGUSR1) == 0, "kill SIGUSR1 under rlimit=0");
     CHECK(kill(pid, rt0) == 0, "kill rt0 under rlimit=0");
-    a = (struct peeksiginfo_args_uapi){.off = 0, .flags = PTRACE_PEEKSIGINFO_SHARED, .nr = 10};
     memset(buf, 0, sizeof(buf));
-    CHECK(do_peeksiginfo(pid, &a, buf) == 1 && buf[0].si_signo == SIGUSR1 &&
-              buf[0].si_code == SI_USER,
+    CHECK(peek_siginfo(pid, 0, PTRACE_PEEKSIGINFO_SHARED, 10, buf) == 1 &&
+              buf[0].si_signo == SIGUSR1 && buf[0].si_code == SI_USER,
           "rlimit=0 shared peek should return only standard SIGUSR1");
     CHECK(ptrace(PTRACE_KILL, pid, 0, 0) == 0, "PTRACE_KILL rlimit=0");
     CHECK(waitpid(pid, &st, 0) == pid, "reap rlimit=0");

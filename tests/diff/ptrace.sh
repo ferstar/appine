@@ -1613,6 +1613,18 @@ static void print_sig(const siginfo_t *si, int rtmin)
         printf("STD%d(code=%d)", si->si_signo, si->si_code);
 }
 
+static void print_peek(pid_t pid, const char *label, struct psi_args a, int rtmin)
+{
+    siginfo_t buf[8];
+    long r = peek(pid, &a, buf);
+    printf("%s %ld:", label, r);
+    for (long i = 0; i < r; i++) {
+        printf(" ");
+        print_sig(&buf[i], rtmin);
+    }
+    printf("\n");
+}
+
 int main(void)
 {
     int rt0 = SIGRTMIN, rt1 = SIGRTMIN + 1;
@@ -1683,32 +1695,9 @@ int main(void)
     ui.si_value.sival_int = 44;
     syscall(SYS_rt_sigqueueinfo, pid, rt0, &ui);
 
-    a = (struct psi_args){0, 0, 8};
-    r = peek(pid, &a, buf);
-    printf("private %ld:", r);
-    for (long i = 0; i < r; i++) {
-        printf(" ");
-        print_sig(&buf[i], rt0);
-    }
-    printf("\n");
-
-    a = (struct psi_args){2, 0, 2};
-    r = peek(pid, &a, buf);
-    printf("offset %ld:", r);
-    for (long i = 0; i < r; i++) {
-        printf(" ");
-        print_sig(&buf[i], rt0);
-    }
-    printf("\n");
-
-    a = (struct psi_args){0, PTRACE_PEEKSIGINFO_SHARED, 8};
-    r = peek(pid, &a, buf);
-    printf("shared %ld:", r);
-    for (long i = 0; i < r; i++) {
-        printf(" ");
-        print_sig(&buf[i], rt0);
-    }
-    printf("\n");
+    print_peek(pid, "private", (struct psi_args){0, 0, 8}, rt0);
+    print_peek(pid, "offset", (struct psi_args){2, 0, 2}, rt0);
+    print_peek(pid, "shared", (struct psi_args){0, PTRACE_PEEKSIGINFO_SHARED, 8}, rt0);
 
     size_t pgsz = sysconf(_SC_PAGESIZE);
     char *m = mmap(NULL, 2 * pgsz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
