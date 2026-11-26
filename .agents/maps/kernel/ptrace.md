@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the kernel/signal full mapping of 2026-11-03; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `process_vm_readv`/`writev` validates local iovecs and returns 0 on zero local bytes before checking remote iovec count or pointers, matching Linux 6.1)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: implemented PTRACE_PEEKSIGINFO for private and shared pending queues)
 
 ## Responsibilities
 
@@ -50,7 +50,12 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
   written back on resume (masking `fpcr` with `appine_engine::fpcr_write_mask`). Stopping notifies the tracer (`CLD_STOPPED` or `CLD_TRAPPED`, `SIGCHLD`
   unless suppressed) and waits until resumed, detached or killed.
 - Signal-delivery stops: resuming with 0 suppresses the signal, another number replaces it (as
-  `SI_USER` unless `SETSIGINFO` was used); blocked replacements are re-queued.
+  `SI_USER` unless `SETSIGINFO` was used); blocked replacements are re-queued. `PTRACE_PEEKSIGINFO`
+  reads `ptrace_peeksiginfo_args` from `addr` (`EFAULT`), validates `flags`
+  (`PTRACE_PEEKSIGINFO_SHARED` only) and `nr >= 0` (`EINVAL`), returns 0 on `nr == 0` or
+  `off > INT_MAX`, and copies up to `nr` `siginfo_t` entries in insertion order from the tracee's
+  private or thread group's shared `Pending` queue without dequeuing them (retrying cold FUSE
+  pages via `retry_user_pages`, returning the partial count if a later copy faults, else `EFAULT`).
 - Group stops: non-seized tracees report `Group` (no siginfo); seized ones report `EVENT_STOP`;
   `LISTEN` and `INTERRUPT` need `SEIZE`.
 - Syscall stops (`PTRACE_SYSCALL`): x7 is 0 at entry and 1 at exit (restored afterwards); the
@@ -122,7 +127,7 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 
 ## Confirmed bugs / technical debt
 
-- `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
+None.
 
 ## Open questions
 

@@ -404,14 +404,15 @@ impl SigInfo {
 /// Pending signals (Linux's `struct sigpending`). A standard signal is pending at most once per
 /// kind, and later instances are dropped, so it keeps the first one's siginfo (`legacy_queue`);
 /// every instance of a real-time signal is queued and delivered in the order generated, each with
-/// its own siginfo.
+/// its own siginfo. Standard and real-time siginfos share `queue` in insertion order (like Linux's
+/// `pending->list`) so `PTRACE_PEEKSIGINFO` observes them in generation order without dequeuing.
 #[derive(Default)]
 pub(crate) struct Pending {
     set: u64,
-    /// The siginfo of the standard signals (1–31).
-    info: [SigInfo; 31],
-    /// Queued real-time signals.
+    /// Queued pending signals (standard and real-time) in insertion order.
     queue: VecDeque<(Signal, SigInfo)>,
+    /// Number of queued real-time signals (charged against `RLIMIT_SIGPENDING` / `SigQ`).
+    rt_queued: usize,
     /// How many times signals became pending (a standard signal generated again while already
     /// pending does not count): as with Linux's signalfd_notify, each one makes a signalfd's
     /// `EPOLLET` fire again.
@@ -429,10 +430,11 @@ impl Pending {
         }
         if !sig.is_realtime() {
             if new {
-                self.info[sig.index()] = info;
+                self.queue.push_back((sig, info));
             }
         } else if room {
             self.queue.push_back((sig, info));
+            self.rt_queued += 1;
         }
         self.set |= sig.bit();
     }
@@ -441,10 +443,6 @@ impl Pending {
     /// stays pending while more of the same kind are queued; for one that was never queued, the
     /// siginfo is empty (si_code SI_USER), as on Linux.
     pub fn take(&mut self, sig: Signal) -> SigInfo {
-        if !sig.is_realtime() {
-            self.set &= !sig.bit();
-            return self.info[sig.index()];
-        }
         let mut same = self
             .queue
             .iter()
@@ -456,28 +454,44 @@ impl Pending {
         }
         first
             .and_then(|i| self.queue.remove(i))
-            .map_or_else(SigInfo::default, |(_, info)| info)
+            .map_or_else(SigInfo::default, |(s, info)| {
+                if s.is_realtime() {
+                    self.rt_queued -= 1;
+                }
+                info
+            })
     }
 
     /// Discards the signals in `mask`, including queued ones.
     pub fn discard(&mut self, mask: u64) {
-        self.set &= !mask;
-        self.queue.retain(|(s, _)| mask & s.bit() == 0);
+        let Pending {
+            set,
+            queue,
+            rt_queued,
+            ..
+        } = self;
+        *set &= !mask;
+        queue.retain(|(s, _)| {
+            let keep = mask & s.bit() == 0;
+            if !keep && s.is_realtime() {
+                *rt_queued -= 1;
+            }
+            keep
+        });
     }
 
     /// The siginfo of a pending `sig` (a timer adds its overrun count to the signal it sent last).
     pub fn infos_mut(&mut self, sig: Signal) -> impl Iterator<Item = &mut SigInfo> {
-        let Pending {
-            set, info, queue, ..
-        } = self;
-        let standard =
-            (!sig.is_realtime() && *set & sig.bit() != 0).then(|| &mut info[sig.index()]);
-        standard.into_iter().chain(
-            queue
-                .iter_mut()
-                .filter(move |(s, _)| *s == sig)
-                .map(|(_, info)| info),
-        )
+        self.queue
+            .iter_mut()
+            .filter(move |(s, _)| *s == sig)
+            .map(|(_, info)| info)
+    }
+
+    /// Returns the `index`-th queued pending signal and its siginfo without removing it (for
+    /// `PTRACE_PEEKSIGINFO`).
+    pub fn peek(&self, index: usize) -> Option<(Signal, SigInfo)> {
+        self.queue.get(index).copied()
     }
 
     /// The set of pending signals.
@@ -492,7 +506,7 @@ impl Pending {
 
     /// The number of queued real-time signals.
     pub fn queued(&self) -> usize {
-        self.queue.len()
+        self.rt_queued
     }
 }
 
@@ -2332,5 +2346,74 @@ mod tests {
         restore_frame(&mut cx, &mut cpu).unwrap();
         assert_eq!(cpu.state().fpcr, appine_engine::fpcr_write_mask());
         assert_eq!(cpu.state().fpsr, 0x1f);
+    }
+
+    #[test]
+    fn pending_unified_queue_preserves_insertion_order_and_rt_count() {
+        let mut p = Pending::default();
+        let rt0 = Signal::new(34).unwrap();
+        let rt1 = Signal::new(35).unwrap();
+        let usr2_first = SigInfo::kill(code::SI_TKILL, 10, 1000);
+        let usr2_dup = SigInfo::kill(code::SI_USER, 99, 2000);
+        let rt0_a = SigInfo {
+            code: -1,
+            fields: InfoFields::Queue {
+                pid: 10,
+                uid: 1000,
+                value: 1,
+            },
+            ..SigInfo::default()
+        };
+        let usr1_info = SigInfo::kill(code::SI_TKILL, 11, 1000);
+        let rt0_b = SigInfo {
+            code: -1,
+            fields: InfoFields::Queue {
+                pid: 10,
+                uid: 1000,
+                value: 2,
+            },
+            ..SigInfo::default()
+        };
+
+        p.add(Signal::USR2, usr2_first, false);
+        p.add(rt0, rt0_a, true);
+        p.add(Signal::USR1, usr1_info, false);
+        p.add(rt0, rt0_b, true);
+        // Duplicate standard signal coalesces: keeps first siginfo and position.
+        p.add(Signal::USR2, usr2_dup, false);
+        // Overflowed RT signal sets pending bit without adding a queue entry.
+        p.add(rt1, SigInfo::kill(code::SI_USER, 12, 1000), false);
+
+        assert_eq!(p.queued(), 2);
+        assert_eq!(p.arrivals(), 5);
+        assert_eq!(p.peek(0), Some((Signal::USR2, usr2_first)));
+        assert_eq!(p.peek(1), Some((rt0, rt0_a)));
+        assert_eq!(p.peek(2), Some((Signal::USR1, usr1_info)));
+        assert_eq!(p.peek(3), Some((rt0, rt0_b)));
+        assert_eq!(p.peek(4), None);
+        assert_ne!(p.set() & rt1.bit(), 0);
+
+        // infos_mut updates standard and RT entries in place.
+        assert_eq!(p.infos_mut(Signal::USR1).count(), 1);
+        assert_eq!(p.infos_mut(rt0).count(), 2);
+
+        // Taking removes only the selected signal and updates rt_queued / set.
+        assert_eq!(p.take(rt0), rt0_a);
+        assert_eq!(p.queued(), 1);
+        assert_ne!(p.set() & rt0.bit(), 0);
+        assert_eq!(p.take(Signal::USR2), usr2_first);
+        assert_eq!(p.set() & Signal::USR2.bit(), 0);
+        assert_eq!(p.queued(), 1);
+        assert_eq!(p.peek(0), Some((Signal::USR1, usr1_info)));
+        assert_eq!(p.peek(1), Some((rt0, rt0_b)));
+        assert_eq!(p.peek(2), None);
+
+        // Discarding clears set bits and drops matching queued entries + rt_queued.
+        p.discard(rt0.bit() | Signal::USR1.bit());
+        assert_eq!(p.queued(), 0);
+        assert_eq!(p.peek(0), None);
+        assert_eq!(p.set(), rt1.bit());
+        assert_eq!(p.take(rt1), SigInfo::default());
+        assert_eq!(p.set(), 0);
     }
 }

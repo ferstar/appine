@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 16 claims checked by 3 independent verifiers — 12 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: page-fault ESRs reflect populated page-table entries)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: unified Pending queue for standard and RT siginfos with peek() for PTRACE_PEEKSIGINFO)
 
 ## Responsibilities
 
@@ -42,9 +42,11 @@ construction (`kernel/vdso`).
 - `SigInfo` — `code`, `fields: InfoFields` (`None`, `Kill`, `Child`, `Queue`, `Timer`, `Fault`,
   `Poll`, `Sys`, `Raw`, `User`), synthesized `esr`, `sender` tid, `uid_ns`/`kuid`; encodes 128-byte
   Linux `siginfo_t`.
-- `Pending` — 64-bit `set`, 31 standard `SigInfo` slots (first-sender coalescing), FIFO `queue` for
-  RT signals (32–64), and monotonic `arrivals` counter for signalfd `EPOLLET`; per thread and per
-  thread group.
+- `Pending` — 64-bit `set`, unified FIFO `queue` of `(Signal, SigInfo)` entries in insertion order
+  (standard signals 1–31 coalesce to keep first-sender info and position; RT signals 32–64 queue
+  multiple instances and are counted in `rt_queued` for `RLIMIT_SIGPENDING`/`SigQ`), non-destructive
+  `peek(index)` for `PTRACE_PEEKSIGINFO`, and monotonic `arrivals` counter for signalfd `EPOLLET`;
+  per thread and per thread group.
 - `AltStack` — per-thread `{ sp, size, flags }` (`SS_DISABLE`, `SS_AUTODISARM`; `SS_ONSTACK`
   computed dynamically); `MINSIGSTKSZ = 5120`, `MIN_SIGSTKSZ = 4720` (`AT_MINSIGSTKSZ`).
 - `SignalFd` (`fd.rs`) — `mask` (excluding unblockable signals) and `Weak<RefCell<ThreadGroup>>`.

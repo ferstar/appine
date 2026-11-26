@@ -1569,3 +1569,163 @@ int main(void)
 }
 C
 gcc -O1 -o detachentry detachentry.c && ./detachentry
+
+# PTRACE_PEEKSIGINFO: private & shared pending queues, mixed standard + RT FIFO ordering, offsets,
+# non-destructive reads, argument/error precedence, and partial copy faults
+cat > peeksiginfo.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#ifndef PTRACE_PEEKSIGINFO
+#define PTRACE_PEEKSIGINFO 0x4209
+#endif
+#ifndef PTRACE_PEEKSIGINFO_SHARED
+#define PTRACE_PEEKSIGINFO_SHARED (1U << 0)
+#endif
+
+struct psi_args {
+    uint64_t off;
+    uint32_t flags;
+    int32_t nr;
+};
+
+static long peek(pid_t pid, const void *a, void *b)
+{
+    errno = 0;
+    return ptrace(PTRACE_PEEKSIGINFO, pid, a, b);
+}
+
+static void print_sig(const siginfo_t *si, int rtmin)
+{
+    if (si->si_signo >= rtmin)
+        printf("RT+%d(code=%d,val=%d)", si->si_signo - rtmin, si->si_code, si->si_value.sival_int);
+    else
+        printf("STD%d(code=%d)", si->si_signo, si->si_code);
+}
+
+int main(void)
+{
+    int rt0 = SIGRTMIN, rt1 = SIGRTMIN + 1;
+    int go[2];
+    pipe(go);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(go[1]);
+        sigset_t s;
+        sigemptyset(&s);
+        sigaddset(&s, SIGUSR1);
+        sigaddset(&s, SIGUSR2);
+        sigaddset(&s, rt0);
+        sigaddset(&s, rt1);
+        sigprocmask(SIG_BLOCK, &s, NULL);
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        char c;
+        read(go[0], &c, 1);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    close(go[0]);
+
+    long r = peek(pid, (void *)0x10, (void *)0x10);
+    printf("unstopped: %ld %s\n", r, strerror(errno));
+
+    write(go[1], "x", 1);
+    int st = 0;
+    waitpid(pid, &st, 0);
+
+    siginfo_t buf[8];
+    struct psi_args a;
+    r = peek(pid, (void *)0x10, buf);
+    printf("bad addr: %ld %s\n", r, strerror(errno));
+    a = (struct psi_args){0, 2, 0};
+    r = peek(pid, &a, buf);
+    printf("bad flags: %ld %s\n", r, strerror(errno));
+    a = (struct psi_args){(uint64_t)INT_MAX + 1, 0, -1};
+    r = peek(pid, &a, buf);
+    printf("neg nr: %ld %s\n", r, strerror(errno));
+    a = (struct psi_args){0, 0, 0};
+    r = peek(pid, &a, (void *)0x10);
+    printf("nr=0: %ld %d\n", r, errno);
+    a = (struct psi_args){(uint64_t)INT_MAX + 1, 0, 1};
+    r = peek(pid, &a, (void *)0x10);
+    printf("huge off: %ld %d\n", r, errno);
+    a = (struct psi_args){0, 0, 1};
+    r = peek(pid, &a, (void *)0x10);
+    printf("empty: %ld %d\n", r, errno);
+
+    siginfo_t ui;
+    memset(&ui, 0, sizeof ui);
+    ui.si_code = SI_QUEUE;
+    ui.si_pid = getpid();
+    ui.si_uid = getuid();
+
+    syscall(SYS_tgkill, pid, pid, SIGUSR2);
+    ui.si_value.sival_int = 11;
+    syscall(SYS_rt_tgsigqueueinfo, pid, pid, rt0, &ui);
+    syscall(SYS_tgkill, pid, pid, SIGUSR1);
+    ui.si_value.sival_int = 22;
+    syscall(SYS_rt_tgsigqueueinfo, pid, pid, rt0, &ui);
+    syscall(SYS_tgkill, pid, pid, SIGUSR2);
+    ui.si_value.sival_int = 33;
+    syscall(SYS_rt_tgsigqueueinfo, pid, pid, rt1, &ui);
+
+    kill(pid, SIGUSR1);
+    ui.si_value.sival_int = 44;
+    syscall(SYS_rt_sigqueueinfo, pid, rt0, &ui);
+
+    a = (struct psi_args){0, 0, 8};
+    r = peek(pid, &a, buf);
+    printf("private %ld:", r);
+    for (long i = 0; i < r; i++) {
+        printf(" ");
+        print_sig(&buf[i], rt0);
+    }
+    printf("\n");
+
+    a = (struct psi_args){2, 0, 2};
+    r = peek(pid, &a, buf);
+    printf("offset %ld:", r);
+    for (long i = 0; i < r; i++) {
+        printf(" ");
+        print_sig(&buf[i], rt0);
+    }
+    printf("\n");
+
+    a = (struct psi_args){0, PTRACE_PEEKSIGINFO_SHARED, 8};
+    r = peek(pid, &a, buf);
+    printf("shared %ld:", r);
+    for (long i = 0; i < r; i++) {
+        printf(" ");
+        print_sig(&buf[i], rt0);
+    }
+    printf("\n");
+
+    size_t pgsz = sysconf(_SC_PAGESIZE);
+    char *m = mmap(NULL, 2 * pgsz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mprotect(m + pgsz, pgsz, PROT_NONE);
+    a = (struct psi_args){0, 0, 3};
+    r = peek(pid, &a, m + pgsz - 64);
+    printf("fault1: %ld %s\n", r, strerror(errno));
+    r = peek(pid, &a, m + pgsz - 128);
+    printf("fault2: %ld %d\n", r, errno);
+    r = peek(pid, &a, m + pgsz - 256);
+    printf("fault3: %ld %d\n", r, errno);
+    munmap(m, 2 * pgsz);
+
+    ptrace(PTRACE_KILL, pid, 0, 0);
+    waitpid(pid, &st, 0);
+    close(go[1]);
+    return 0;
+}
+C
+gcc -O1 -o peeksiginfo peeksiginfo.c && ./peeksiginfo

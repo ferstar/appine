@@ -42,6 +42,7 @@ const SETREGSET: i64 = 0x4205;
 const SEIZE: i64 = 0x4206;
 const INTERRUPT: i64 = 0x4207;
 const LISTEN: i64 = 0x4208;
+const PEEKSIGINFO: i64 = 0x4209;
 const GETSIGMASK: i64 = 0x420a;
 const SETSIGMASK: i64 = 0x420b;
 const SECCOMP_GET_FILTER: i64 = 0x420c;
@@ -56,6 +57,8 @@ const NT_ARM_HW_BREAK: u64 = 0x402;
 const NT_ARM_HW_WATCH: u64 = 0x403;
 const NT_ARM_SYSTEM_CALL: u64 = 0x404;
 
+/// `PTRACE_PEEKSIGINFO_SHARED`: read signals from the thread group's shared pending queue.
+const PEEKSIGINFO_SHARED: u32 = 1 << 0;
 /// `AUDIT_ARCH_AARCH64` (the arch of PTRACE_GET_SYSCALL_INFO).
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 /// The debug architecture (`ID_AA64DFR0_EL1.DebugVer`) is ARMv8.
@@ -153,6 +156,7 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
             crate::kernel::signal_later(&task.event);
             Ok(0)
         }
+        PEEKSIGINFO => peeksiginfo(cx, &task, addr, data),
         GETSIGMASK | SETSIGMASK => {
             if addr != 8 {
                 return Err(Errno::EINVAL);
@@ -565,6 +569,65 @@ fn hw_slot(watch: bool, addr: u64, ctrl: u32) -> Result<(u64, u32), Errno> {
         }
         Ok((start & !3, 0xf << 5 | EL0 | 1))
     }
+}
+
+/// PTRACE_PEEKSIGINFO: reads up to `nr` pending `siginfo_t` entries starting at `off` from the
+/// tracee's private queue (or the thread group's shared queue when `PTRACE_PEEKSIGINFO_SHARED` is
+/// set) without dequeuing them, matching Linux 6.1's `ptrace_peek_siginfo`.
+fn peeksiginfo(cx: &mut Cx<'_>, task: &Task, addr: u64, data: u64) -> SysResult {
+    let arg: [u8; 16] = get(cx, addr)?;
+    let off = u64::from_le_bytes(arg[..8].try_into().unwrap());
+    let flags = u32::from_le_bytes(arg[8..12].try_into().unwrap());
+    let nr = i32::from_le_bytes(arg[12..16].try_into().unwrap());
+    if flags & !PEEKSIGINFO_SHARED != 0 || nr < 0 {
+        return Err(Errno::EINVAL);
+    }
+    if nr == 0 || off > i32::MAX as u64 {
+        return Ok(0);
+    }
+    let shared = if flags & PEEKSIGINFO_SHARED != 0 {
+        Some(
+            cx.kr()
+                .groups
+                .get(&task.tgid)
+                .cloned()
+                .ok_or(Errno::ESRCH)?,
+        )
+    } else {
+        None
+    };
+    let mut copied = 0u64;
+    while copied < nr as u64 {
+        let Some(idx) = (off as usize).checked_add(copied as usize) else {
+            break;
+        };
+        let entry = match &shared {
+            Some(group) => group.borrow().pending.peek(idx),
+            None => task.pending.borrow().peek(idx),
+        };
+        let Some((sig, info)) = entry else {
+            break;
+        };
+        let raw = info.encode(sig);
+        let Some(dst) = copied
+            .checked_mul(128)
+            .and_then(|bytes| data.checked_add(bytes))
+        else {
+            return if copied > 0 {
+                Ok(copied)
+            } else {
+                Err(Errno::EFAULT)
+            };
+        };
+        let step = super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| {
+            cx.write_user(UserSlice::new(dst, 128), &raw)
+        });
+        if let Err(e) = step {
+            return if copied > 0 { Ok(copied) } else { Err(e) };
+        }
+        copied += 1;
+    }
+    Ok(copied)
 }
 
 /// PTRACE_GET_SYSCALL_INFO: `size` is the buffer length. Syscall entry and exit (which need
