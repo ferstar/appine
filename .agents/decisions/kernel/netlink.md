@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/netlink"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on netlink sockets made before kernel/netlink was split from kernel/net keep their `kernel/net` tags and live in `.agents/decisions/kernel/net.md`: D3, D24, D26 and the netlink halves of D19 and D23.
 
@@ -46,6 +46,22 @@
 - **Tradeoffs**: Single GETNEIGH retains a documented short-message difference.
 - **Watch out**: GETPOLICY resolves a supplied family ID before its family name.
 - **Source**: d11379f7
+
+### D6: `disable_ipv6` sysctl toggles emit single-namespace rtnetlink snapshot diffs
+
+- **What**: `rtnl_snapshot_ns` and `rtnl_notify_ns` snapshot the pinned namespace only when a subscribed `NETLINK_ROUTE` listener exists and broadcast resulting address and route diffs with `seq = 0` and `port = 0` after the write.
+- **Why**: Toggling `/proc/sys/net/ipv6/conf/*/disable_ipv6` previously tore down or restored IPv6 addresses and routes without notifying `ip monitor` or network managers.
+- **Tradeoffs**: Unlistened namespaces pay no snapshot cost and reuse `Snapshot::changes`, while `RTNLGRP_*_NETCONF` and `IFLA_AF_SPEC` link notifications remain unmodeled.
+- **Watch out**: Future sysctls that add or remove snapshot-visible links, addresses or routes must be wired into the same `write_proc` hook.
+- **Source**: 8bd3fa4c
+
+### D7: Protocol-scoped netlink multicast broadcasts committed `NFNLGRP_NFTABLES` notifications
+
+- **What**: `NetlinkSocket::notify_proto` generalizes multicast delivery across netlink protocols, while `nft_notify` and `rtnl_notify` share `notify_netlink` over `Kernel::rtnl_sockets` to broadcast stashed `NftNote`s in the same namespace after releasing the sender borrow and skipping echoed senders.
+- **Why**: `NetlinkSocket::notify` hardcoded `NETLINK_ROUTE` with no broadcast path for committed `NETLINK_NETFILTER` events, and both broadcasters duplicated socket pruning, filtering and wakeups.
+- **Tradeoffs**: Reusing `Kernel::rtnl_sockets` avoids an extra registry and keeps `SO_RCVBUF`/`ENOBUFS` and echo-suppression semantics consistent while adding a small closure-taking `notify_netlink` helper.
+- **Watch out**: Broadcasts walk all live netlink sockets in `Kernel::rtnl_sockets`, so socket borrows must always drop before calling `request_wake_object`.
+- **Source**: e399082a, b15971ac
 
 ## Superseded
 

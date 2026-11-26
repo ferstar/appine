@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mmu"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Soft-MMU decisions made before kernel/mmu was split from kernel/mm keep their `kernel/mm` tags and live in `.agents/decisions/kernel/mm.md`: D1, D13, D16, D39 and the page-table half of D4.
 
@@ -94,3 +94,11 @@
 - **Tradeoffs**: Demotion can allocate before an unmap commits.
 - **Watch out**: A failed preparation preserves translations and watches.
 - **Source**: 6eb822d7, bb31dbda, d7a28ce2, 33e95609
+
+### D12: Allocation-free `unmap_noalloc` widens only partially covered L2 superpages
+
+- **What**: `appine_mmu_unmap_noalloc` (also reused by `appine_mmu_unmap` after `appine_mmu_prepare_unmap`) and `Mmu::unmap_noalloc` clear partially covered L2 `PTE_SUPER` slots whole while clearing exact L3 entries elsewhere, returning the widened cleared range and expiring `PageWatch`es across it without allocating page tables.
+- **Why**: Non-rollbackable unmap callers (`clip_file_mappings` and `invalidate_fill`) need an infallible fallback when superpage demotion hits `ENOMEM` without disturbing unrelated mappings sharing an L3 table in the same 2 MiB slot.
+- **Tradeoffs**: Adds one C/Rust MMU entry point and slightly widens `PageWatch` expiration and demand re-faulting across a cleared 2 MiB superpage on demotion OOM.
+- **Watch out**: Never use `unmap_noalloc` to widen over private anonymous VMAs that rely on `touched_windows` or PTE presence instead of demand re-faulting from file or FUSE backing.
+- **Source**: e9761fd4

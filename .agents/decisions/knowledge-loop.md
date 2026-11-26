@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: knowledge-loop"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 
 ## Active
 
@@ -21,11 +21,11 @@
 - **Source**: 8349911, 4b0adb9, e868881, bfb1e44, 260512d, a536142, c87fd21, 599804a, 5d18308; 67d40c70; 20137e4c; d053be24; 39e55b4b
 
 ### D3: A map's Maintained line is one sentence
-- **What**: A map's Maintained line names in one sentence the areas changed since its full mapping, the latest change last, and says what the full mapping predates; map-module asks for this on every targeted refresh. A full map refresh resets the Verified baseline after fresh research and independent verification.
-- **Why**: The terminal map's line had grown to 2626 characters over 22 targeted refreshes, a changelog repeating commit subjects and naming features later removed.
-- **Tradeoffs**: The map no longer lists each refresh; its git log holds them.
-- **Watch out**: None outstanding: android/terminal was fully refreshed on 2026-11-10 (d9e1f0c) and every map now uses the current wording.
-- **Source**: a75981b (applied to the service map in c2f4912 and to five more maps in 3f3db11), f7f79a2a
+- **What**: A map's Maintained line names in one sentence the areas changed since its full mapping, the latest change last, and says what the full mapping predates; map-module asks for this on every targeted refresh, while full refreshes reset the Verified baseline after fresh source research and independent claim verification for maps at or near the post-baseline drift threshold.
+- **Why**: The terminal map's line had grown to 2626 characters over 22 targeted refreshes, a changelog repeating commit subjects and naming features later removed, and heavily drifted baselines need periodic full re-verification against current source.
+- **Tradeoffs**: Maps no longer list every targeted refresh (git log holds them), and source-only full refreshes still leave device-dependent behavior and exhaustive runtime event ordering to runtime checks.
+- **Watch out**: None outstanding for the Maintained-line format (every map now uses the current wording), while implementation bugs surfaced during full refreshes stay recorded in each map until fixed in follow-up commits.
+- **Source**: a75981b (applied to the service map in c2f4912 and to five more maps in 3f3db11), f7f79a2a, 48f338d6
 
 ### D4: Files with no module are registered when found
 - **What**: A kernel file without a module gets a registry line in the module that owns its behaviour (`syscall/posix_timer.rs`, `syscall/mod.rs`, `bug.rs` and `syscall/misc.rs` outside kernel/signal's handlers in kernel/process, `errno.rs` and `debug.rs` in kernel/signal, native AIO in kernel/vfs (since kernel/aio), `oom.rs` (since kernel/oom) and `uaccess.rs` in kernel/mm, SysV IPC and message queues in a new kernel/ipc), its module doc comment names that map, and maps written before later splits are repointed at the current owners.

@@ -2,16 +2,15 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
 ## Constraint index (compressed active decisions)
 
-> Full text of D13, D17: `git show ec9ad94b862479935821fbfad2affa7bbdba355e:.agents/decisions/android/service.md`
+> Full text of D13: `git show ec9ad94b862479935821fbfad2affa7bbdba355e:.agents/decisions/android/service.md`
 
 - **D13** — Preference writes use the androidx.core edit extension with asynchronous apply, as required by the lint build. (4c1a3ce)
-- **D17** — Before every kernel start, including existing stores, call Rootfs.ensureContainersConfig after ensureNetworkConfig, write only a missing configuration, and fail startup if the store write fails. (0eb9e19)
 
 > Full text of D10, D15, D16, D22, D30: `git show c4db5db249c93e2e122d88ef60153f67c94a1f62:.agents/decisions/android/service.md`
 
@@ -21,20 +20,20 @@
 - **D22** — `cursor_style` and `cursor_blink` live in `settings` preferences; `setCursorStyle` and `setCursorBlink` update every live session under its lock on the main thread and notify listeners, while unstarted sessions store values until started (77d7f36)
 - **D30** — `show_tab_list` defaults to true in `Settings` and notifies activity listeners through service setters, so direct `Settings` writes bypass listener notification (5c49c5a7; 39e55b4b)
 
+> Full text of D1, D2, D6, D11, D12, D14, D18, D24, D29, D31: `git show 1ea0c1ef9d686d7126bec2029fc928d4f6fdfc6b:.agents/decisions/android/service.md`
+
+- **D1** — `TerminalService` runs as a `specialUse` foreground service owning the kernel handle and every session across Activity recreation, and watches UI visibility to trim memory (D4) because Android 14+ omits `onTrimMemory` (rounds 07 (`07-m5`), 187 (`187-app-init`))
+- **D2** — Closing the last tab only finishes the Activity while the 2 s poll stops the service when no sessions, UI or guest processes remain, running inittab shutdown on `exitAll`/poweroff/halt and clearing listeners immediately in `exitAll` so a fast shutdown cannot restart the kernel (round 187 (`187-app-init`); design doc §11.2)
+- **D6** — Kill reports go to their controlling console tab as yellow lines (or to a notification when away, full-screen or tabless), while Appine bugs and failed OpenRC boot services always notify with copyable reports subject to D28 privacy checks; the unimplemented-paths field remains untested on devices (rounds 195 (`195-kill-reports`), 205 (`205-copy-bug-report`), 207 (`207-report-kernel-log`); 99b4216; f61072f3; d053be24; 39e55b4b)
+- **D11** — `Settings` keeps `fill_wide` default-off and `volume_keys_switch_tabs` default-on (preserving saved true values) with service setters notifying listeners; `MainActivity` rereads `fill_wide` on start and volume behavior on each press, and writes bypassing the service skip listeners (0478dd5; 0553229 (read through `Settings`); 61df6915; 75123eef; 20137e4c; d053be24; 39e55b4b)
+- **D12** — `TerminalService` orders types/state, creation/start, commands/binding, sessions/saving, reports/routes, memory/settings, replacement and shutdown while keeping Kotlin initializer order safe and running `started`/`startFailed` only after start's main-thread post clears `starting` and checks `exiting` (a546fea; 4de8aacd; e35f9f7c; 20137e4c; d053be24; 39e55b4b)
+- **D14** — `markRunning` writes the pid so restored tabs explain kills via `getHistoricalProcessExitReasons` (seven reasons) and crashes/ANRs post notification 3 with a copyable report (retained evidence lives in D29); low-memory kills require `isLowMemoryKillReportSupported`, and low-memory/background/ANR paths and Chinese strings remain untested (a1f47cc; c7309c0c; d053be24; 39e55b4b)
+- **D18** — The 2 s poll calls lock-free `Native.bklStall` directly on the main thread (never taking the BKL) to post notification 4 ("is stuck" then silently "was stuck" with total and kernel log if undismissed, with live seconds updates left open) (64a6107 (with kernel/process D38))
+- **D24** — Shared builders create non-ongoing notifications, ICU formats failed-service lists, and changed locales rename channels and repost the ongoing notification while bug reports stay English and posted notifications keep their language; the locale-change path remains untested on devices (aed99afb; 20137e4c; d053be24; 39e55b4b)
+- **D29** — `Diagnostics` retains own-PID logs and fault reports for the current and previous runs within 2 MiB and exports metadata, exit records and bounded traces independently of the kernel worker, isolating pending saves from the three-archive share cache; sudden death can lose final logcat lines and retained messages can contain names and paths (c7309c0c; d053be24; 39e55b4b)
+- **D31** — The ongoing notification shows the current state title and running-policy body, except non-private startup failures show "Cannot start" with the error in both body layouts (privacy mode always shows privacy title and policy); exit/progress precedence and vendor layouts remain unverified on devices (c7e338a5, c97b00bf)
+
 ## Active (full detail)
-
-### D1: The kernel and all sessions live in a `specialUse` foreground service
-- **What**: `TerminalService` owns the kernel handle and every terminal session; activities bind, register listeners and forward user actions; session events go to whichever listeners are present.
-- **Why**: Destroying or recreating an Activity must not affect sessions or guest processes, and the foreground service keeps the app process from being treated as a cached process while the kernel runs.
-- **Tradeoffs**: With a foreground service, Android 14 and later deliver no `onTrimMemory` callbacks, so memory release has to watch the UI itself (D4).
-- **Source**: rounds 07 (`07-m5`), 187 (`187-app-init`)
-
-### D2: The service outlives the last tab and stops only after an inittab shutdown
-- **What**: Closing the last tab only finishes the Activity; the 2 s poll ends the service when there are no sessions, no UI and no guest processes; "exit all", guest `poweroff` and `halt` run the inittab shutdown before `stopSelf`; guest `reboot` starts a new kernel; boot runs on its own thread without blocking tabs.
-- **Why**: Services started by OpenRC and `nohup` jobs should keep running without a tab, and exiting used to SIGKILL every process instead of letting them shut down.
-- **Tradeoffs**: Nothing is shut down cleanly when the system kills the app; there is no autostart at Android boot, only on app cold start.
-- **Watch out**: `exitAll` must clear the listeners immediately: a shutdown that finished before the Activity's `onStop` once looked like the user returning and restarted the kernel.
-- **Source**: round 187 (`187-app-init`); design doc §11.2
 
 ### D3: Screen-off behavior is SLEEP, BUSY or ALWAYS independently of battery exemption
 - **What**: Persist SLEEP, BUSY or ALWAYS with legacy false/true mapping and a remembered non-ALWAYS notification toggle; BUSY compares guest CPU every 2 s, releases after 30 s idle, protects transitions/downloads and renews grace for unavailable or delayed samples.
@@ -57,13 +56,6 @@
 - **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index; the first save of each "auto" tab reads `/etc/passwd` through the store; an index naming a snapshot deleted by other means falls back to the transcript silently (logged); the Tabs lock protects the last serialized layout.
 - **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183; 3beb038; 600700b; 807e9ba1; 20137e4c; d053be24; 39e55b4b, 6f2776f3, 6560af61
 
-### D6: Kernel kills are explained in the tab or a notification; Appine bugs always notify with a copyable report
-- **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; Appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records, and the unimplemented paths the killed process reached); OpenRC services that failed at boot are notified too, with notification detail and report copying subject to D28 privacy checks.
-- **Why**: Tabs used to show only "Killed" or "Segmentation fault", which does not tell an OOM kill from an Appine bug; after release the copied report is what a user can bring to the developer.
-- **Tradeoffs**: Reports are polled, so they arrive after the shell's prompt (hence the insertion above the cursor, `android/terminal` D2), and only kernel-bug reports can list unimplemented paths, since a killed run's crash and ANR reports have no kernel left to ask.
-- **Watch out**: The unimplemented-paths section, read from the kill line's last field (android/native D17), was not exercised on a device or emulator.
-- **Source**: rounds 195 (`195-kill-reports`), 205 (`205-copy-bug-report`), 207 (`207-report-kernel-log`); 99b4216; f61072f3; d053be24; 39e55b4b
-
 ### D7: The service is a module of its own, split from the app by responsibility
 - **What**: android/service holds `TerminalService.kt`, `BrowserBridge.kt`, `Settings.kt` and `Tabs.kt` (keeping ongoing foreground notification id 1 and routing decisions), while `Notifications.kt` and `Diagnostics.kt` belong to `android/reports` and the remaining app areas stay in their responsibility-based modules.
 - **Why**: `android/service.md` reached 41,395 B (89.8% of one read) while mixing foreground-service lifecycle with notification rendering and independent diagnostic retention.
@@ -85,33 +77,12 @@
 - **Watch out**: Every new path that ends `starting` or `transitioning` must check `exiting` (a map invariant), every new way of posting notification 1 must go through `updateNotification`, and kill notification ids from a new service instance can still collide with old ones after wrapping.
 - **Source**: 89ad551; 6560af6 (a switch's completion crashing a destroyed service, recorded in d9e1f0c)
 
-### D11: Display settings the terminal needs before binding live in the service's `settings` file
-- **What**: `Settings` keeps `fill_wide` defaulting off and `volume_keys_switch_tabs` defaulting on, preserves saved values, and exposes plain reads while service setters save and notify listeners; MainActivity rereads fill_wide on start and volume behavior on each press.
-- **Why**: Settings rows display and forward state the service keeps, and the terminal's activity needs the value before it binds the service.
-- **Tradeoffs**: The service owns display preferences it does not use, unsaved CJK enlargement now defaults off, and each volume press reads an in-memory preference.
-- **Watch out**: MainActivity must reread fill_wide after returning from Settings, and writes bypassing the service skip listeners; existing explicitly saved true values still enlarge wide glyphs.
-- **Source**: 0478dd5; 0553229 (read through `Settings`); 61df6915; 75123eef; 20137e4c; d053be24; 39e55b4b
-
-### D12: `TerminalService` reads in the order a service runs
-- **What**: The service orders types/state, creation and start helpers, commands/binding/listeners, sessions/saving, reports/routes, memory/settings, distro replacement and shutdown; start dispatches guarded main-thread outcomes to `started` or `startFailed`, while Tabs retains its lifecycle order.
-- **Why**: Lifecycle helpers had drifted from callers and nested start outcomes obscured the start/exit guard.
-- **Tradeoffs**: Callback objects stay among properties, and helpers can remain far from secondary callers.
-- **Watch out**: Kotlin initializers must keep safe textual order, and `started`/`startFailed` must run only after start’s main-thread post clears `starting` and checks `exiting`.
-- **Source**: a546fea; 4de8aacd; e35f9f7c; 20137e4c; d053be24; 39e55b4b
-
-### D14: A restored run says why it ended, from Android's exit record
-- **What**: `markRunning` writes the pid into the marker and `takeKilled` returns it with the saved tabs; the service looks up `getHistoricalProcessExitReasons(package, pid, 1)` and opens the restored notice with one of seven reasons (low memory, background resources, force-stopped, updated, crash, ANR, general); a crash or ANR also posts notification 3 on the problems channel with "Copy report" (D6's header plus the pid, the kind, the UTC time and Android's ANR description), even when no tabs could be read.
-- **Why**: Every killed run was explained as "Android stopped the app", so an Appine crash looked like the system's doing and produced no report.
-- **Tradeoffs**: The pid ties the record to the run, since the newest package record could be a provider-only process started later; a marker without a pid or a record Android no longer keeps falls back to the general text; the report holds only what the exit record holds (no Java stack trace or native tombstone); updates are named only from Android 14.
-- **Watch out**: Low-memory kills are told apart only where `isLowMemoryKillReportSupported`; low memory, background resources and ANR were not triggered in testing, and the Chinese strings were not seen on a device; retained diagnostic evidence is now collected separately under D29.
-- **Source**: a1f47cc; c7309c0c; d053be24; 39e55b4b
-
-### D18: A long BKL hold is reported in a notification while it lasts
-- **What**: The 2 s poll first calls `Native.bklStall` (android/native D18) on the main thread; a new stall of the current kernel posts notification 4, "Appine's kernel is stuck", with its seconds and "Copy report", and once it has ended a notification still showing becomes "was stuck" with the total and the kernel log record in its report, without alerting again, while a dismissed one stays dismissed.
-- **Why**: A stuck kernel left the user with frozen tabs and no explanation or report to send.
-- **Tradeoffs**: A later stall replaces an earlier notification, and a stall that ended before any poll saw it is still reported once.
-- **Watch out**: `bklStall` is an exception to the map's rule that every BKL-taking native call goes through the worker, so it must never start taking the BKL; whether the notification should update its seconds during a stall is open in the map.
-- **Source**: 64a6107 (with kernel/process D38)
+### D17: The containers configuration is written before every start
+- **What**: Startup invokes `Rootfs.ensureContainersConfig` after `ensureNetworkConfig` (android/setup D18) via `Rootfs.prepareStart`, so stores imported by earlier versions receive it too.
+- **Why**: The containers configuration must exist before the guest starts, like the network configuration.
+- **Tradeoffs**: Adds a store check, and a write when the file is missing, on every start.
+- **Watch out**: Store write errors abort fresh imports but degrade quietly on existing stores under D37.
+- **Source**: 0eb9e19, 12ac97cf
 
 ### D19: Bells and OSC 9/777 notifications reach the user per tab; clipboard writes go through the service
 - **What**: A bell from the tab in front (`current` with the terminal Activity listening) goes to the listeners' `onBell`; otherwise bells, at most one per second per tab, and OSC 9/777 notifications become one notification per tab on a new `terminal` channel (ids from 200000 plus the tab's id), titled by OSC 777's title or the program's title with "Tab N" as subtext, opening that tab and removed when it is shown or closed; OSC 9/777 from the tab in front invokes onBell with its 100 ms throttle and touch-feedback setting, while new terminal channels enable vibration and both terminal and problems channels request high importance under their existing IDs; clipboard writes from any tab that passes the privacy gate set or clear the clipboard, with a toast only before Android 13, and clipboard reads from the tab in front go to the listeners' `onClipboardRead` while unclaimed reads wait for the owning tab until expiry.
@@ -133,14 +104,6 @@
 - **Tradeoffs**: A notification change can need both files (the decision in the service, the text in Notifications), and settings have two entry points: `Settings` for reading anywhere and the service for changes with effects.
 - **Watch out**: Notification ids are split between the service (the ongoing 1) and Notifications' companion, so a new id must be checked against both, and writing a setting through `Settings` instead of the service skips its effects (wake lock, Files roots, cursor to every tab, restart).
 - **Source**: 0553229; d0ddf170; d053be24; 39e55b4b
-
-### D24: Notification localization follows configuration changes
-
-- **What**: Shared builders create non-ongoing notifications, ICU formats failed-service lists, and changed channel locales trigger channel renaming and reposting the ongoing notification while bug reports stay English.
-- **Why**: Repeated builders and English separators drifted, and running services kept old notification/channel languages.
-- **Tradeoffs**: Already posted notifications retain their old language, and Notifications remembers channel locales.
-- **Watch out**: The service must see updated resources in onConfigurationChanged; the locale-change path was not exercised on a device.
-- **Source**: aed99afb; 20137e4c; d053be24; 39e55b4b
 
 ### D25: Mirror selection finishes before the new rootfs is published
 
@@ -174,22 +137,6 @@
 - **Watch out**: Keep legacy delivery checks aligned; receiver clipboard delivery and report-specific authentication still need device-variant coverage.
 - **Source**: f61072f3; d053be24; 39e55b4b; c7e338a5, c97b00bf
 
-### D29: Diagnostics retain bounded evidence and export independently of the kernel worker
-
-- **What**: Diagnostics keeps own-PID logs and fault reports for the current and previous runs within 2 MiB, exporting metadata, exit records and bounded traces while isolating pending saves from the three-archive share cache.
-- **Why**: Troubleshooting evidence must survive failure and notification dismissal.
-- **Tradeoffs**: Continuous capture adds bounded I/O and storage, and older records or oversized traces are discarded.
-- **Watch out**: Process death can lose final logcat messages, vendor traces vary, and retained messages can contain names and paths.
-- **Source**: c7309c0c; d053be24; 39e55b4b
-
-### D31: The ongoing notification puts a startup failure reason in the body
-
-- **What**: Ordinarily the title names the current state and the body names the running policy, but a non-private startup failure shows Cannot start above the error in both body layouts.
-- **Why**: State titles avoid repeating the app name and the expanded body gives long errors room.
-- **Tradeoffs**: A public startup error displaces the policy text, while privacy mode shows the privacy title and policy even on failure.
-- **Watch out**: Preserve exit and progress precedence and check long text and vendor layouts on devices.
-- **Source**: c7e338a5, c97b00bf
-
 ### D32: Vulkan GPU mode is persisted default-off and controls per-start launcher setup and diagnostics
 
 - **What**: `Settings` stores `gpu` (default false), `TerminalService` exposes `gpu`, `gpuAvailable` and `setGpu`, calls `Rootfs.ensureGpuCommand` only when `gpu` is true, clears `gpuAvailable` in `detach` and `onDestroy`, and appends `, Vulkan GPU` to `Diagnostics.environment` (reused by `Notifications.bugReport`).
@@ -208,11 +155,11 @@
 
 ### D34: Startup invokes one-time Alpine bash startup seeding before `Native.start`
 
-- **What**: `TerminalService.start` calls `Rootfs.ensureBashStartup(this)` alongside the other per-start rootfs helpers before starting the kernel, relying on its per-store marker for fast no-ops on subsequent starts and Debian.
+- **What**: `TerminalService.startKernel` runs `Rootfs.ensureBashStartup` via `Rootfs.prepareStart` alongside the other per-start rootfs helpers before starting the kernel, relying on its per-store marker for fast no-ops on subsequent starts and Debian.
 - **Why**: Existing Alpine stores imported before bash startup seeding need one-time `.bash_profile`/`.bashrc` creation without resetting the rootfs.
-- **Tradeoffs**: Adds one store marker check on Alpine startup and treats seeding I/O errors as startup failures like adjacent `ensure*` helpers.
-- **Watch out**: An unexpected I/O failure writing `/etc/skel` or `/var/lib/appine/bash-startup-done` on a modified store can block startup until repaired.
-- **Source**: 9f3e93ed
+- **Tradeoffs**: Adds one store marker check on Alpine startup, failing fresh imports on seeding I/O errors while degrading quietly on existing stores under D37.
+- **Watch out**: Obstructed paths on an existing store keep retrying and logging on each start until repaired, while fresh-import seeding failures still abort startup.
+- **Source**: 9f3e93ed, 12ac97cf
 
 ### D20: Each machine polls its own login rules and document roots
 
@@ -238,6 +185,14 @@
 - **Watch out**: Normal termination and retry paths must preserve their tarballs.
 - **Source**: 9b179de1
 
+### D37: Existing-store per-start configuration failures degrade quietly while fresh imports fail fast
+
+- **What**: `TerminalService.startKernel` uses `prepareStartBridge` (with an immutable `val bridge` and nullable `StartedKernel.browser`) to run `Rootfs.prepareStart`, aborting and closing `BrowserBridge` on fresh-import I/O errors while quietly logging and recording (`Log.w` and `Diagnostics.record`) skipped steps on existing stores and closing `BrowserBridge` if opening it or writing `/etc/appine/browser` fails before calling `Native.start`.
+- **Why**: Existing stores need the same repair-terminal guarantee as OpenRC setup without leaking an unconfigured `BrowserBridge` or nagging users who intentionally customized guest paths.
+- **Tradeoffs**: Users whose `/etc/appine/browser` write failed see browser-launch errors in guest tools rather than a startup dialog and must inspect diagnostic logs.
+- **Watch out**: Non-`IOException` errors still close `BrowserBridge` and abort startup, and `Native.start` remains the fatal integrity check for a corrupt or unopenable store.
+- **Source**: 12ac97cf, f7d164db
+
 ## Superseded
 
 - ~~A `Session` interface in the service, with `createSession` building a `TermuxSession` or a `VtSession` by `VtNative.available` (6ffb912)~~ → narrowed to `VtSession` only by android/terminal **D8** in b38d29c (2026-11-04)
@@ -260,3 +215,4 @@
 - ~~Using one directory-change list as the sole input to login-rule and document refresh~~ → replaced by **D20** in d5b808e8 (2026-11-24)
 - ~~Starting a post-import mirror thread and joining it on replacement~~ → replaced by **D25** in 568b6a48 (2026-11-24)
 - ~~Reducing background Kitty image storage only under memory pressure~~ → replaced by **D4** in 19e8be6f (2026-11-25)
+- ~~Fail startup on per-start container or bash-startup store write errors (D17 in 0eb9e19, D34 in 9f3e93ed)~~ → replaced by **D37** in 12ac97cf (2026-11-26)

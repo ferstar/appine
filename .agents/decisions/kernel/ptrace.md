@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/ptrace"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on kernel/ptrace made before it was split from kernel/signal keep their `kernel/signal` tags and live in `.agents/decisions/kernel/signal.md`: D5, D6, D12, the ptrace half of D14, D17, D20 and D26.
 
@@ -39,3 +39,11 @@
 - **Tradeoffs**: Returned state can differ from the submitted register image.
 - **Watch out**: Use the same mask as execution and sigreturn.
 - **Source**: 9163f493
+
+### D5: `PTRACE_PEEKSIGINFO` peeks pending siginfos per entry with unified partial-copy error handling
+
+- **What**: `peeksiginfo` validates `ptrace_peeksiginfo_args` in Linux 6.1 order, peeks one `(Signal, SigInfo)` at a time from `task.pending` or `group.pending` (`PTRACE_PEEKSIGINFO_SHARED`), and chains checked destination arithmetic with `retry_user_pages` around each 128-byte `write_user` so later faults or overflows return `Ok(copied)` when at least one entry succeeded.
+- **Why**: Returning `EIO` for `PTRACE_PEEKSIGINFO` blocked debuggers and checkpoint tools from inspecting pending queues without dequeuing them, and separate overflow/copy error paths duplicated partial-copy returns.
+- **Tradeoffs**: Releasing the BKL for a cold FUSE page fill inside `retry_user_pages` can expose concurrent queue updates on subsequent entries, matching Linux dropping `siglock` around `copy_siginfo_to_user`.
+- **Watch out**: Keep checked arithmetic on `data + copied * 128` and keep `SigInfo::encode` and `ptrace_check_attach` stop checks (`t.stopped()`) synchronized with `peeksiginfo`.
+- **Source**: 5872f977, 8a839900

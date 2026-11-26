@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -21,7 +21,7 @@
 - **D13** — pseudo.rs, cgroup.rs, bpf.rs and syscall/bpf.rs read in the order their code runs, code appended at a file's end drifts from that order, and syscall/mqueue.rs is now kernel/ipc's (a63a7b4; registry since 4140c75)
 - **D14** — Loop devices appear as plain directories under `/sys/block/` with dev, removable, ro, size, `queue/*` and, while bound, `loop/*` from `Loops::sysfs_read`, with no `/sys/dev/block` or uevents, so ioctl_loop05 and udev-style lookups still fail (a26c8b4)
 - **D15** — `/proc/sys/vm/mmap_min_addr` is a global sysctl written with `CAP_SYS_RAWIO`, VmStk comes from grows-down VMAs, mapped file names print newlines as `\012`, and `/proc/<pid>/mem` grows stacks within the accessor's `RLIMIT_STACK`, while VmData, VmExe and VmLib stay approximate (e03c0cc)
-- **D17** — An exited main thread shows as Z through `ThreadGroup::leader_exit` (kernel/process D21) until the process is reaped, with exe `ENOENT`, mounts and mountinfo `EINVAL`, mem and pagemap `ESRCH` at open and task-needing entries behaving as for a zombie, so nothing may reach a live thread's state through the process directory after its leader exits (79a60cf, 70c1bc6, 5d23297)
+- **D17** — An exited main thread shows as Z through `ThreadGroup::leader_exit` (kernel/process D21) until the process is reaped, with exe `ENOENT`, mounts and mountinfo `EINVAL`, mem and pagemap opening as EOF (D48) and task-needing entries behaving as for a zombie, so nothing may reach a live thread's state through the process directory after its leader exits (79a60cf, 70c1bc6, 5d23297)
 - **D18** — `/proc/vmstat` copies the host's file through hal (D13 there), or a 16-line fallback with zero event counters, which phones are likely to show since Android may refuse the file to apps (60921b2)
 - **D19** — `comm_of` returns bytes, and comm, stat and status are built as byte vectors with status escaping the name as Linux does, while log lines elsewhere still show names lossily (6591eb6)
 - **D20** — status prints RssAnon, RssFile and RssShmem from kernel/mm's `resident_split` (D26 there) with VmRSS as their sum, while statm and stat use `resident_pages` and can differ slightly (566da95)
@@ -179,9 +179,9 @@
 
 ### D43: Proc nodes resolve by process identity and namespace lifetime
 
-- **What**: Record pid and serial in process nodes, preserve an exited leader's network-namespace reference, and recheck dynamic cgroup file visibility.
+- **What**: Record pid and serial in process nodes, reflect `ip_forward` in `/proc/net/snmp`, and recheck dynamic cgroup file visibility (zombie-leader `net/*` fallback superseded by D48).
 - **Why**: PID reuse or a vanished controller must not retarget an existing node.
-- **Tradeoffs**: Namespace lookup may fall back through remaining threads.
+- **Tradeoffs**: Process-scoped nodes carry a `u64` serial, and `/proc/net/snmp` forwarding rewrites the rendered line inside `pseudo.rs`.
 - **Watch out**: Host sampling of an unsupported synthetic child returns EOPNOTSUPP.
 - **Source**: b51818cf, 2609ab43, 3a90a0ef, d5b808e8
 
@@ -217,6 +217,14 @@
 - **Watch out**: Own-group fd directories allow nonwrite access, while the ns exemption is search-only.
 - **Source**: 65e10e36, 36005e07, 3ad68857
 
+### D48: Procfs aligns task `pagemap`, zombie `net/*`, single-record net errors, `eventfd-id`, and `FDSize` with Linux 6.1
+
+- **What**: Expose `Entry::Pagemap` in `TASK_ENTRIES`, pin `PinnedNet` onto `PseudoNode::Net` from a live named task (returning empty `readdir` and `ENOENT` on zombie leaders while keeping pre-opened `net/*` fds readable), return `EACCES` on writes to `netstat`/`snmp`/`sockstat`/`sockstat6`, emit `eventfd-id` in `fdinfo`, and report `FdTable::capacity()` for `status` `FDSize`.
+- **Why**: Five confirmed Linux 6.1 ABI mismatches remained across per-thread `pagemap`, zombie leader `mem`/`pagemap`/`net`, single-record net write errors, eventfd `fdinfo`, and `FDSize`.
+- **Tradeoffs**: Differential tests on native Linux 6.8+ skip zombie `mem`/`pagemap` comparisons in `compat4.sh` because 6.8+ `mm_access` returns `ESRCH`, relying on guest tests for Linux 6.1 EOF semantics.
+- **Watch out**: Callers relying on the old zombie-leader `/proc/<pid>/net/*` fallback now receive `ENOENT` and must inspect a live worker thread or pre-open the file before leader exit.
+- **Source**: b9497c7e
+
 ## Superseded
 
 - ~~Regenerated content uses the current reader's credentials, not the opener's (D1 in part, §8.2)~~ → replaced by **D25** in f6a82cc (2026-11-08)
@@ -229,3 +237,5 @@
 - ~~Comparing every observed cgroup file at every checkpoint under D38~~ → replaced by **kernel/cgroup D2** in 0f5c5132 (2026-11-17), preserving poll and inotify delivery.
 - ~~D9 combined ownership of /proc/sys sysctls and sysfs in kernel/procfs (cf029f9a)~~ → replaced by **D9**, kernel/sysctl **D1** and kernel/sysfs **D1** in e0719858 (2026-11-22).
 - ~~Returning ENOENT when reopening an unlinked overlay executable~~ → replaced by **D36** in f985c1f8 (2026-11-25)
+- ~~Preserving `ThreadGroup::leader_net` and falling back through live threads or `init_ns` for zombie leader `/proc/<pid>/net/*` lookups (D43 in part, 2609ab43)~~ → replaced by **D48** in b9497c7e (2026-11-26)
+- ~~Zombie leader `mem` and `pagemap` opens failing with `ESRCH` (D17 in part, 79a60cf)~~ → replaced by **D48** in b9497c7e (2026-11-26, no SUPERSEDES declared)

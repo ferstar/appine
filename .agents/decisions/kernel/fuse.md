@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/fuse"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > The VFS side of FUSE (the `Node::Fuse` kind, `/dev/fuse` as a file kind, key bits and the sweep's view of mounts) is kernel/vfs's D47 and D51; FUSE becoming a module of its own is knowledge-loop D7.
 
@@ -12,7 +12,7 @@
 
 - **What**: Connections in `vfs/fuse.rs` follow Linux's queue, interrupt and abort rules; walks read names, attributes and links from a node cache (`Fuses`) and return `FUSE_RETRY` when they need the daemon, after which `serve()` answers one query and the syscall runs again with a per-syscall token keeping what the retries fetched; file syscalls in `syscall/fuse.rs` send change requests with the BKL released after all of a handler's walks; programs are read into memfds; INIT offers ATOMIC_O_TRUNC, EXPORT_SUPPORT, BIG_WRITES, DONT_MASK, NO_OPEN(DIR)_SUPPORT, PARALLEL_DIROPS, HANDLE_KILLPRIV and MAX_PAGES but not ASYNC_READ; FLUSH is forced; one `O_APPEND` write per node runs at a time; and parents are kept free of loops (`ELOOP`). Convert daemon metadata through the synthetic Stat defaults.
 - **Why**: sshfs, rclone mount and other FUSE daemons could not run, and Starnix's FUSE depends on Zircon, so Linux 6.1's `fs/fuse` is the model.
-- **Tradeoffs**: Locks stay local, regular FUSE programs ignore set-ID bits, and fuseblk, fusectl, readdirplus and writeback cache remain outside the negotiated interface.
+- **Tradeoffs**: Locks stay local, and fuseblk, fusectl, readdirplus and writeback cache remain outside the negotiated interface.
 - **Watch out**: Retryable walks must precede state changes, and directory operations that release the BKL must use the directory and rename guards.
 - **Source**: c008749, 68b70897, b421eac0, 9e45d0f3, b3b7ee74
 
@@ -96,6 +96,14 @@
 - **Watch out**: FUSE paths must bypass store deletion marking.
 - **Source**: 4905fcba, ab417943
 
+### D12: FUSE honors exec privileges, pinned `/proc/<pid>/exe`, and in-process FIFO/device opens
+
+- **What**: Apply `mnt_may_suid`, `Query::FileCaps` (`FUSE_GETXATTR` mapped through `conn.user_ns()`), and `!HANDLE_KILLPRIV` stripping (shared via `truncate_with_killpriv`), pin `FuseExe` on `ExeFile` so linked `/proc/<pid>/exe` follows `Node::Fuse` while unlinked executables reopen via `FileKind::FuseSnapshot`, and dispatch `S_IFIFO`/`S_IFCHR`/`S_IFBLK` in-process with `MS_NODEV`/`SB_I_NODEV` and cgroup BPF checks without sending `FUSE_OPEN`.
+- **Why**: FUSE executables previously acted as `nosuid` and lost `/proc/<pid>/exe` identity across rename or unlink, while special files on FUSE failed with `ENXIO` instead of matching Linux `init_special_inode`.
+- **Tradeoffs**: Non-nosuid FUSE execs perform one extra `FUSE_GETXATTR` retry when xattrs are supported, unlinked exe reopens serve the exec-time memfd snapshot instead of re-opening on the daemon, and `syscall/fuse.rs` keeps small shared truncation/pinning and unit-test harness helpers.
+- **Watch out**: Future `FileKind` or `OpenFile::node()` consumers must handle `fuse::id_of` keys and `FileKind::FuseSnapshot`.
+- **Source**: 7b505898, 263e23bc
+
 ## Superseded
 
 - ~~Mappings are copied whole into memfds, so mmap reads the whole mapped range at once, and nodes are never forgotten (D1's tradeoffs, c008749)~~ → replaced by **D2** in 3957a03 (2026-11-09, no SUPERSEDES declared)
@@ -104,3 +112,4 @@
 - ~~Isolating each mapped backing and refusing shared writable FUSE mappings~~ → replaced by **D8** in b421eac0 (2026-11-24)
 - ~~Rescanning every new cache entry above the threshold and deferring forget after last unlink~~ → replaced by **D2** in 00550dc9 (2026-11-25)
 - ~~Letting conflicting FUSE namespace changes proceed concurrently within a directory~~ → replaced by **D9** and **D10** in 9e45d0f3 (2026-11-25)
+- ~~Regular FUSE programs ignore set-ID bits (D1's tradeoffs, c008749)~~ → replaced by **D12** in 7b505898 (2026-11-26, no SUPERSEDES declared)

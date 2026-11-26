@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/inotify"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > inotify decisions made before kernel/inotify was split from kernel/vfs keep their `kernel/vfs` tags and live in `.agents/decisions/kernel/vfs.md`: D13, D46 and D51.
 
@@ -30,6 +30,14 @@
 - **Tradeoffs**: O_PATH descriptions carry identity with a zero close mask.
 - **Watch out**: Named pipes, memfds and proc reopens must retain the correct node identity and last-close behavior.
 - **Source**: ab694aab, 523ae8a9, 45035024, f495f2cc, 93a9b204, 11816722, 30e5002e, d96f5d63
+
+### D4: nsfs inotify watches follow stashed-inode pin lifetime
+
+- **What**: Keep a weak `NsPinInner` per namespace ID with a monotonic `ns_instance` in `Registry::ns_stashed` held strongly by `OpenFile::ns_pin` and `Mount::ns_pin`, comparing `(ns_id, sdev, ns_instance)` for `PseudoNode::NsFile` watches.
+- **Why**: Matching nsfs watches by namespace ID alone reused one watch descriptor across unpinned `/proc/self/ns/*` calls, diverging from Linux `fs/nsfs.c`.
+- **Tradeoffs**: Adds an `Option<NsPin>` field to `OpenFile` and `Mount` (propagated across mount copies and clones) rather than confining all state to `inotify.rs`.
+- **Watch out**: Every future path that opens an nsfs file description or creates an nsfs mount must call `pin_ns` or clone an existing `Mount::ns_pin`.
+- **Source**: b98eb140
 
 ## Superseded
 

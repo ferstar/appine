@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness/cli"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on harness/cli made before it was split from harness keep their `harness` tags and live in `.agents/decisions/harness.md`: D5, D6, D9, D11, D15, D20, D21, D25, D28, D32, D35 and the guest-test portions of D36, D40 and D41.
 
@@ -50,11 +50,11 @@
 
 ### D6: C guest regression suites share `run_c_guest` and focused C setup and assertion helpers
 
-- **What**: `hosts/cli/tests/guest_programs.rs` shares `run_c_guest` for rootfs-free C suites (`threads`, `net`, `net_regressions`), while the new C regression suites share focused assertion and protocol/setup helpers (`CHECK_ERR`, overlay/FUSE/netlink/nft/ptrace builders) and pass thread fd arguments by value. The shared guest_programs runner now rejects internal-error stderr for every fixture and imports a fresh empty-rootfs store per tier.
-- **Why**: Repeated build/run checks in `guest_programs.rs`, verbose syscall-error and protocol boilerplate, and stack-lifetime thread arguments obscured test intent and risked lifetime bugs.
+- **What**: `hosts/cli/tests/guest_programs.rs` shares `run_c_guest` for rootfs-free C suites (`threads`, `net`, `net_regressions`), rejects internal-error stderr for every fixture and imports a fresh empty-rootfs store per tier, while C regression suites pass thread fd arguments by value and share focused assertion, setup and query helpers (`CHECK_ERR`, overlay/FUSE/netlink/nft/ptrace builders, `peek_siginfo`, `set_rlimit`, `check_deadline_eperm`, `tcp_sockstat`) alongside named UAPI fallback constants (`SCHED_DEADLINE`, `SCHED_FLAG_*`, `IPPROTO_MPTCP`).
+- **Why**: Repeated build/run checks in `guest_programs.rs`, verbose syscall-error, parsing and protocol boilerplate, stale helper names and stack-lifetime thread arguments obscured test intent and risked lifetime bugs.
 - **Tradeoffs**: Individual test cases read through small shared helper wrappers instead of raw inline syscalls.
 - **Watch out**: Helper failure macros must continue reporting line numbers and `errno` clearly so regressions stay easy to diagnose.
-- **Source**: 3a90a0ef, 300b7146
+- **Source**: 3a90a0ef, 300b7146, 8a839900, ee941aed, b15971ac
 
 ### D7: Interactive CLI mode reads raw stdin and follows the output terminal's size
 

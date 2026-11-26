@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/unix"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D3 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D3 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -113,3 +113,11 @@
 - **Tradeoffs**: Queued packets retain accounting state and namespace listings include weak embryos.
 - **Watch out**: Uncharge exactly once on consumption or drop and avoid reference cycles.
 - **Source**: f985c1f8, 94ac4cd1, d6138dab, ab417943
+
+### D16: AF_UNIX enforces sender-side `SO_SNDBUF`, Linux-exact truesize and stream `SO_RCVLOWAT`
+
+- **What**: `SenderState` owns per-sender `outq`, `sndbuf`, `stream`, write-space `taken` generation and `wake_object`, using arm64 Linux 6.1/6.8 `packet_truesize`, `stream_truesize`, `stream_chunk_limit`, `dgram_max_len` and `unix_writable` (`(outq + 1) * 4 <= sndbuf`), while `recv_stream` alone enforces `SO_RCVLOWAT`.
+- **Why**: `SO_SNDBUF` and `SO_RCVLOWAT` were previously recorded only, stream write room and datagram/seqpacket budgeting disagreed with Linux's per-sender truesize accounting, and multi-sender datagrams shared receiver capacity.
+- **Tradeoffs**: Connected streams expose a fourth wake object (`SenderState`) in `UnixSocket::wake_objects`, and single `SOCK_STREAM` writes exceeding `stream_chunk_limit` split into multiple skb-sized `Packet`s.
+- **Watch out**: Programs assuming payload-only `SOCK_STREAM` caps or receiver-side `SO_RCVBUF` throttling now observe Linux's truesize and sender-side `SO_SNDBUF` limits.
+- **Source**: bedd532e

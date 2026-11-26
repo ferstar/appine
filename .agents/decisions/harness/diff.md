@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness/diff"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on harness/diff made before it was split from harness keep their `harness` tags and live in `.agents/decisions/harness.md`: D1–D3, D5, D9, D11–D14, D17–D20, D23, D27, D29, D31, D33, D34 and D36–D41.
 
@@ -42,11 +42,11 @@
 
 ### D5: Legacy Starnix and gVisor skip filters narrow only after verifying individual gtest outcomes
 
-- **What**: Legacy Starnix and gVisor case scripts narrow broad skip filters by restoring verified passing tests, listing remaining multicast exclusions individually, and running `uio_test` in `starnix-mm`. Restore cases after native and both tiers agree, enforce per-group counts, run memfd on /dev/shm, and retain the hosted musl auxv exclusion with Appine's own stack-versus-proc check.
-- **Why**: Overly broad skip filters masked regressions in kernel behaviors that Appine now implements.
-- **Tradeoffs**: Named exclusions add more filter entries and admit newly added multicast tests into the suite by default.
-- **Watch out**: Group-level output matching can hide identical failures on both sides, so verify individual gtest outcomes whenever revisiting other skips.
-- **Source**: b5673c4c, fc3d5c51, f6a8240a, aeaffd4b, 74584914, 68b70897, 93a9b204, 37051c60, 865d24c1, ced93039, 231480cb
+- **What**: Starnix and gVisor case scripts and `gvisor.filters` restore verified passing tests after native Linux and both Appine tiers agree, enforcing per-group pass counts, listing remaining multicast exclusions individually, running `uio_test` in `starnix-mm`, placing memfd, link-count and `O_TMPFILE` checks on tmpfs, routing bind-mount ID, trusted xattr and cross-namespace abstract-socket checks through the sys-admin group, and retaining the hosted musl auxv exclusion with Appine's own stack-versus-proc check.
+- **Why**: Stale or overly broad skip filters masked regressions in working syscall behavior, while some restored checks require tmpfs or elevated capabilities to run on native Linux.
+- **Tradeoffs**: Named exclusions add filter entries, newly added multicast tests enter by default, and some programs now run across multiple groups with distinct filters and expected pass counts.
+- **Watch out**: Group-level output matching can hide identical failures on both sides, hosted CI uses a different native kernel, and three existing Starnix overlay execution cases still fail on both sides because the tarball lacks their helper binaries.
+- **Source**: b5673c4c, fc3d5c51, f6a8240a, aeaffd4b, 74584914, 68b70897, 93a9b204, 37051c60, 865d24c1, ced93039, 231480cb, e8ac8ebf
 
 ### D6: Legacy gVisor coverage adds `gvisor-mm` and `gvisor-io` after native and Appine trials
 
@@ -82,11 +82,19 @@
 
 ### D10: Native-version differences use portable assertions and dedicated guest checks
 
-- **What**: Retain host-independent TCP filter and namespace checks, move down-iif coverage to the guest suite, and compare fixed mremap growth over an unlocked target.
-- **Why**: Host kernel versions disagree with Linux 6.1 in these edge cases.
-- **Tradeoffs**: The differential suite omits the host-dependent variants.
-- **Watch out**: Guest coverage must preserve the intended Linux 6.1 behavior.
-- **Source**: f7ddba97, 06fc2277, 298da10e
+- **What**: Retain host-independent TCP filter and namespace checks, move down-iif coverage to the guest suite, compare fixed mremap growth over an unlocked target, and skip `ZombieProcTest.Mem` and `ZombieProcTest.PageMap` in `starnix-process` where native 6.8+/7.x `mm_access` diverges from Linux 6.1 EOF behavior.
+- **Why**: Host kernel versions disagree with Linux 6.1 in these edge cases, causing differential comparisons to fail even when Appine matches Linux 6.1.
+- **Tradeoffs**: The differential suite omits the host-dependent variants and relies on `tests/guest/mm_mount_pseudo.c` and kernel unit tests for zombie `mem`/`pagemap` regression coverage.
+- **Watch out**: Guest coverage must preserve the intended Linux 6.1 behavior, and conservative skips stay excluded until revisited if native kernels or upstream tests change.
+- **Source**: f7ddba97, 06fc2277, 298da10e, 14caa5c4
+
+### D11: Differential test harnesses deduplicate repeated check loops with local helpers
+
+- **What**: `peeksiginfo.c` embedded in `tests/diff/ptrace.sh` extracts a `print_peek` helper for its private, offset and shared queue checks without changing any output bytes.
+- **Why**: Repeating the same peek-and-print loop three times added boilerplate to the differential test case.
+- **Tradeoffs**: Individual queue checks read through a small local helper instead of inline loops.
+- **Watch out**: Helper extractions in differential cases must preserve exact output bytes across native Linux and Appine.
+- **Source**: 8a839900
 
 ## Superseded
 

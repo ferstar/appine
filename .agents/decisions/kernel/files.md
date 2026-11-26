@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/files"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on open files made before kernel/files was split from kernel/vfs keep their `kernel/vfs` tags and live in `.agents/decisions/kernel/vfs.md`: D5, D11, D17, D22, D24, D26, D27, D29, D33, D34, D41, D44, D45, the owner half of D25, the `open_pseudo` half of D19 and the file I/O halves of D36 and D37; the pre-split fd reservation decision is D55.
 
@@ -135,6 +135,22 @@
 - **Tradeoffs**: The open mask distinguishes reading these directories from searching ns.
 - **Watch out**: If a future non-path open uses only MAY_EXEC, revisit the namespace-directory exemption.
 - **Source**: 36005e07, 3ad68857
+
+### D17: `open_pseudo` permits zombie-leader memory opens and `EventFd` tracks reusable per-instance IDs
+
+- **What**: Gate ptrace-checked procfs opens on `pseudo::pid_exists_in` while allowing `Mem`, `Pagemap`, and `Environ` to open on unreaped zombie leaders with `mm = None` (EOF on I/O), and allocate lowest-free `EventFd::id` values from `Kernel::eventfd_ids` released in `Drop`.
+- **Why**: Linux 6.1 allows opening zombie-leader `mem`/`pagemap` descriptors as EOF while rejecting exited non-leader threads, and procfs `fdinfo` requires reusable per-instance `eventfd-id` numbers.
+- **Tradeoffs**: Implementing `Drop` on `EventFd` prevents struct update syntax in unit tests, which construct defaults through `EventFd::default()`.
+- **Watch out**: Dropping an `EventFd` after `Kernel` teardown skips ID release safely via `Weak::upgrade`.
+- **Source**: b9497c7e
+
+### D18: Open-file helpers share FUSE special-file opens and `FileKind::FuseSnapshot` handling
+
+- **What**: Share `open_char_device` and `open_fifo` across store/overlay and FUSE opens, resolve FUSE keys to `Node::Fuse` in `OpenFile::node()`, pin non-handle FUSE opens via `OpenFile::pin_fuse_path()`, and pass `FuseSnapshot` through `open_fuse_snapshot` and `encode_fuse_snapshot_stat` to serve deleted FUSE `/proc/<pid>/exe` files across I/O, stat, mmap, poll and inotify.
+- **Why**: Opening FIFOs and devices on FUSE and reopening deleted FUSE executables require unified open-file dispatch and FUSE node-key identity without duplicating device or stat plumbing.
+- **Tradeoffs**: `OpenFile::node()` checks `fuse::id_of(ino)` across pipe, device, PTY, render and `FuseDev` kinds, and `open_fuse_snapshot` callers construct `FuseSnapshot` before permission checks.
+- **Watch out**: Store inode numbers must stay below `2^62` so they never collide with `fuse::key(id)`.
+- **Source**: 7b505898, 263e23bc
 
 ## Superseded
 

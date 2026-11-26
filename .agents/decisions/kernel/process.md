@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -60,6 +60,25 @@
 - **D51** — At the arm64 exec point of no return, clear READ_IMPLIES_EXEC for every program before privileged personality cleanup, and read the brk flag before borrowing the address space (5760479)
 - **D56** — Kernel-wide test hook 14 forces TCP filter refusal until the test explicitly disables it, and builds without test hooks always report ordinary host behavior (52dcc177; 20137e4c; d053be24; 39e55b4b)
 
+> Full text of D18, D19, D23, D47, D49, D52–D55, D57–D63: `git show 1ea0c1ef9d686d7126bec2029fc928d4f6fdfc6b:.agents/decisions/kernel/process.md`
+
+- **D18** — Process files read in the order their code runs (global state/BKL/context before waits in `kernel.rs`, lifecycle order in `syscall/proc.rs` and `impl Machine`, dispatch before argument helpers in `syscall/mod.rs`, helpers after callers elsewhere), so new code goes where it runs rather than at file ends (0758e3c; d2b1dc3)
+- **D19** — `itimer::Expiry` keeps deadlines as monotonic instants or host wall-clock times (re-derived on every wait pass, never cached across waits), and the timer thread watches the host for clock jumps (hal D11) and wakes all tasks, timerfds (kernel/vfs D23) and message queues (kernel/ipc D3) (63b9e59)
+- **D23** — `sched_setattr` resolves keep flags before validation in `sys_sched_setattr` order, records/inherits `uclamp_req` without host effect (`EINVAL` with short structs), and reads short versioned structs into a zeroed full-size buffer (bc44b65, e43c40c)
+- **D47** — `cgroup::notify_changes` runs after BKL syscall sweeps, at `task::exit` end, before freezer waits and after timer-thread OOM checks (returning immediately when no observations exist), so membership and freezer changes must be marked before those checkpoints (kernel/procfs D38, kernel/cgroup D2) (affb1e2; 0f5c5132)
+- **D49** — `sched_yield` runs on the fast path (D6) by clearing `in_guest` and calling `std::thread::yield_now` (never touching guest memory afterwards) and falls back to yielding inside `Cx::unlocked` on the BKL path (78b3284)
+- **D52** — A signal-woken no-BKL timed wait hands its validated deadline to the BKL handler in `TaskState::fast_sleep` (consumed before reading time args and cleared after `dispatch` in `Exit::Svc`), so any new no-BKL wait must record it and hand-overs outliving one dispatch need a separate field (9593bae, 27609fe)
+- **D53** — `Machine::spawn` creates the task and starts its host thread before inserting the thread group, init's child and watched slot (detaching the console on failure per kernel/tty D21), and test hook 13 arms `Trap::ThreadStart` (`EAGAIN`) (143bb86)
+- **D54** — `Clock::Process` and `Clock::Thread` carry `Task::serial` from a global counter so timers vanish when their target thread exits or process is reaped (zombie clocks stay readable without firing), and all CPU clock decoders must translate pids via `Cx::pid_in`/`Fast::ns_tid` (82433e6)
+- **D55** — `TaskSync::KernelEntry` records the syscall number (`u64::MAX` for non-svc), x0–x5, sp and pc on every exit from guest code before the fast path and clears on re-entry for `/proc/<pid>/syscall` (kernel/procfs D40, forgotten on delivery per kernel/signal D27) (f1212d8)
+- **D57** — `Machine::cpu_time_ns` saturating-adds exited-thread CPU totals and all live threads' CPU time under the BKL; consumers must compare deltas rather than assume monotonicity because exit-stage panics can skip credit (1e5de64e; 20137e4c; d053be24; 39e55b4b)
+- **D58** — The borrow-check guard updates its thread-local count in one TLS access and allows inlining its destructor to reduce overhead when borrow counting is enabled (b65799c8)
+- **D59** — `add_stats` in `task.rs` sums `DbtStats::fast_loops` alongside the other Tier 1 counters on thread exit and must be updated whenever new fields are added to `DbtStats` (49585f4e)
+- **D60** — `.agents/maps/kernel/process.md` is condensed in place under one read rather than extracting `kernel/sched`, leaving `kernel/sched` as the cleanest next split candidate if scheduling or lifecycle semantics grow back toward 80% (4fcd3e13)
+- **D61** — `sched_setattr` validates policy and permissions with `set_policy(..., false)` before running `setpriority`, committing `t.sched` (and `apply_host` when `!keep_params`) only after both succeed, so `setpriority` must stay independent of uncommitted `t.sched` (849bf98a)
+- **D62** — `invalidate_code` in `task.rs` accepts guest page 0 directly (restricting the `ivau != 0` sentinel check to the `ivau_page` side-channel merge), so callers must never pass `0` expecting a no-op (0e02d7cd)
+- **D63** — `Bkl::drop` wraps `k.flush_wakeups()` in `bug::catch` (waking every waiter directly on panic before unlocking) and `note_wake` ignores unlocked calls instead of writing a process-global fallback, so every production `request_wake*` caller must hold the BKL (15347732)
+
 ## Active (full detail)
 
 ### D6: A few hot syscalls run without the BKL
@@ -90,131 +109,12 @@
 - **Watch out**: BKL acquisition and task entry/exit paths must keep updating `Hold` and calling `kernel::doing`/`done` and `bug::catch` as `kernel/bug` requires, alongside preserving `fast_sleep` handover, BKL charging and vfork freezer accounting.
 - **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53, D54, D61 and D63); cf029f9a, 8a17e4a9; d053be24; 60790c14; 39e55b4b; e4d7bbe5
 
-### D18: Process files read in the order their code runs
-- **What**: kernel.rs runs global state, the BKL and the syscall context before waiting and waking; syscall/proc.rs follows the module docs from clone and execve through exit and reaping to pidfds, unshare and sessions; `impl Machine` follows a machine's life; syscall/mod.rs puts dispatch first and the shared argument helpers last; the other files move single helpers after their callers, bug.rs and debug.rs included (the registry now puts debug.rs in kernel/signal).
-- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; kernel.rs opened with the wake-request helpers and syscall/proc.rs with exit.
-- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `store_changed` sits at the end of machine.rs, away from `RUNNING`, which describes it.
-- **Watch out**: Code appended at the end of a file drifts from this order.
-- **Source**: 0758e3c; d2b1dc3 (registry)
-
-### D19: Wall-clock deadlines stay on their own clocks
-- **What**: `itimer::Expiry` keeps a deadline as a monotonic instant or as a time on its host clock, mapping clocks as Linux's `__hrtimer_init` does (absolute realtime and TAI on the realtime clock, boottime on the boottime clock, relative realtime on monotonic); waits re-derive their instant on every pass, and the timer thread watches the host for clock jumps (hal D11) and wakes every task when one happens, for timerfds (kernel/vfs D23) and message queues (kernel/ipc D3) too.
-- **Why**: Absolute realtime and boottime deadlines were turned into monotonic instants when set, so they fired late after the device slept or the wall clock was stepped.
-- **Tradeoffs**: A clock jump wakes every thread once, and alarm clocks still cannot wake a sleeping device.
-- **Watch out**: An instant cached across a wait comes back late, and without the host watch (non-Linux hosts, a seccomp policy refusing timerfds) jumps go unnoticed until something else wakes the waiter.
-- **Source**: 63b9e59
-
-### D23: sched_setattr accepts the keep and clamp flags and short structures
-- **What**: The keep flags are resolved before validation in `sys_sched_setattr`'s order, utilization clamps are recorded on the task and inherited like Linux's `uclamp_req`, and a structure shorter than the current version is read into a zeroed full-size buffer.
-- **Why**: Linux 6.1 accepts these flags (with uclamp built in, as on Android) and refusing them broke tools that only meant to set a hint; the first fix then read past the 48-byte first version and killed the caller.
-- **Tradeoffs**: The clamps change nothing on the host, and clamp flags with the short structure are still `EINVAL`.
-- **Watch out**: Other syscalls taking versioned structures may read past a short copy the same way (LTP's clone3, openat2 and mount_setattr tests would show it).
-- **Source**: bc44b65, e43c40c
-
 ### D38: A watchdog thread reports long BKL holds without waiting for the BKL
 - **What**: Every BKL acquisition records its holder (count, host tid, guest tid, tgid, comm, `Doing` and pc) in the cache-line `Hold`; a `bkl-watchdog` thread samples it every fifth of the threshold (10 s by default, `APPINE_BKL_WATCHDOG` in seconds, 0 off), reports a hold unchanged that long on stderr and in `Shared::stall` (which `Machine::stall` reads without the BKL), and queues end-of-hold lines in `Mutex<PendingLog>` for at most one on-demand `bkl-watchdog-log` drainer thread that acquires the BKL, writes all queued KERN_ERR records to `klog::printk` in FIFO order under `bug::catch`, and exits when empty; nothing is killed.
 - **Why**: A hold that never ended froze everything without saying where, taking the BKL inside `ended` blocked the watcher, and spawning a separate logger thread per ended stall let consecutive loggers race for the BKL and write kernel log records out of order.
 - **Tradeoffs**: Each acquisition pays a few relaxed stores and each entry a 40-byte thread-local write, durations are accurate only to one look (2 s by default), release-and-retake loops are not caught, and a failed drainer spawn clears and drops queued kernel-log records (while stderr and `Machine::stall` still carry the line).
 - **Watch out**: Anything added to `Hold` must stay on its cache line as a plain store, a drainer blocked on an unreleased BKL holds `Arc<Shared>` until freed, a stall storm queues lines in memory while the BKL is contended, and an unending hold still blocks `Machine`'s drop.
 - **Source**: 64a6107, d20fd3c (the blocking `ended` recorded in d9e1f0c), 1e6c63a9
-
-### D49: sched_yield runs without the BKL and yields the host thread
-- **What**: The fast path (D6) handles sched_yield by clearing `in_guest` and calling `std::thread::yield_now`, and when the fast path is off (tracing, a seccomp filter that does not always allow it) the BKL path yields inside `Cx::unlocked`.
-- **Why**: sched_yield took the BKL just to return 0, so spinning threads (parking_lot and crossbeam backoff, Go's osyield, HotSpot's GC termination) slowed every other thread's syscalls up to 8.6 times and kept their CPU, and eight threads passing a turn ran 230 times slower than natively.
-- **Tradeoffs**: A call costs 296 ns instead of 173 (a host syscall), a thread yielding on the BKL path reads as sleeping in /proc, and real workloads gain nothing measurable.
-- **Watch out**: A fast-path call that stops counting as running guest code must not touch guest memory afterwards, and the host scheduler (CFS or Android's EAS) decides how long a yielder waits.
-- **Source**: 78b3284
-
-### D52: A fast-path wait woken early hands its deadline to the BKL handler for one dispatch
-- **What**: When a signal wakes a no-BKL timed wait (futex relative and absolute, nanosleep, clock_nanosleep relative and absolute), the fast path records its deadline in `TaskState::fast_sleep`, the futex, nanosleep and clock_nanosleep handlers take it before checking or reading the time argument, and the run loop's `Exit::Svc` arm clears it after `dispatch` whatever the dispatch did.
-- **Why**: The handler redid the wait from the syscall's arguments, so time memory unmapped meanwhile turned EINTR into EFAULT where Linux's restart never rereads it, and a deadline whose handler did not run or failed first (the call skipped by seccomp or a tracer) ended the thread's next BKL-path wait early.
-- **Tradeoffs**: One store per BKL-path syscall, and a handed-over deadline is trusted as validated by the fast path, so a tracer rewriting the arguments at the entry stop cannot change a wait already begun (as on Linux).
-- **Watch out**: A new no-BKL wait that records no deadline, or a handler that reads its time before taking `fast_sleep`, brings the EFAULT back, and a hand-over meant to outlive one dispatch (through restart_syscall, say) needs a field of its own.
-- **Source**: 9593bae, 27609fe
-
-### D53: A host spawn registers its process only once its thread has started
-- **What**: `Machine::spawn` creates the task and starts its host thread before inserting the thread group, init's child and the watched slot, and a failure of `Task::new` or `task::start` detaches the console it attached (kernel/tty D21) and returns the error; test hook 13 arms `Trap::ThreadStart`, which `task::start` checks through `bug::fails` and answers with EAGAIN.
-- **Why**: A spawn whose task or thread could not be created left a process without threads registered with init and the watched table, never to finish, and its console EBUSY for later spawns.
-- **Tradeoffs**: A panic inside spawn after the console was attached still leaves its session set (`host_call` turns it into an error), and hook 13 fails whichever thread start comes next, a guest clone included.
-- **Watch out**: Code expecting the group in `k.groups` before `task::start` returns would break (none today, since the thread runs only after the BKL is released).
-- **Source**: 143bb86
-
-### D54: CPU-clock timers name their target by serial and are gone with it
-- **What**: `Clock::Process { tgid, serial }` and `Clock::Thread { tid, serial }` carry `Task::serial` from a global counter, so a timer whose thread left the task table or whose process was reaped is gone (disarmed at the timer thread's next look, zeros from timer_gettime, `ESRCH` from timer_settime, still deletable), a zombie process's timers read its stopped clock without firing or ticking, and CPU clock ids are decoded through `Cx::pid_in` (the fast path compares its own-clock ids with `Fast::ns_tid`).
-- **Why**: Timers named their target by number only, so they outlived it (ticking the timer thread every 10 ms) and followed a reused number, and clock ids built inside a pid namespace were decoded as global pids.
-- **Tradeoffs**: An exited main thread's clock is gone at once where Linux keeps the zombie leader's until reap, a timer on the main thread's clock made before a non-leader's execve is gone afterwards, and every task is eight bytes larger.
-- **Watch out**: Code making a `Clock` must take the serial of the same table entry it checked, and a new CPU clock decoder must translate the pid as the three existing ones do.
-- **Source**: 82433e6
-
-### D55: Each thread publishes its last kernel entry for `/proc/<pid>/syscall`
-- **What**: `KernelEntry` on `TaskSync` holds the syscall number (`u64::MAX` for an exit that is not an svc), x0 to x5, sp and pc in atomics with an `inside` flag, recorded by the run loop right after every exit from guest code, before the no-BKL fast path, and cleared when the thread is marked back in guest code (storing only when the flag is set); procfs reads it (kernel/procfs D40) and signal delivery forgets the syscall (kernel/signal D27).
-- **Why**: Nothing outside a thread could tell which syscall it was blocked in, which a dump of a hung test needs (harness D39), and `Task::state` is a `RefCell` the running thread owns, entered without the BKL on the fast path.
-- **Tradeoffs**: Nine relaxed stores and one release store per kernel entry, and with no sequence lock a reader can mix two entries of a thread that leaves and re-enters while it reads (procfs shows such a running thread as `running` anyway).
-- **Watch out**: A new path out of guest code that skips the record leaves a stale entry visible until the next exit.
-- **Source**: f1212d8
-
-### D57: Guest CPU samples combine live and exited threads
-
-- **What**: `Machine::cpu_time_ns` saturating-adds exited-thread CPU totals and every live thread’s CPU time under the BKL.
-- **Why**: The screen-off policy needs guest activity without counting the UI or host polling.
-- **Tradeoffs**: Each sample takes the BKL and visits the live threads.
-- **Watch out**: An exit-stage panic can skip CPU credit, so consumers must compare changes rather than assume monotonicity.
-- **Source**: 1e5de64e; 20137e4c; d053be24; 39e55b4b
-
-### D47: Watched cgroup2 files are compared where cgroups change
-- **What**: `cgroup::notify_changes` runs after each BKL syscall's sweeps, at the end of `task::exit`, before a thread waits in the freezer and in the timer thread after the OOM check, returning immediately unless an observation is pending (kernel/procfs D38).
-- **Why**: cgroup2 changes happen in syscalls, thread exits, freezer stops and the OOM killer, and the comparison that wakes pollers and inotify watches must run after them.
-- **Tradeoffs**: Start, exit, vfork waits and sibling kills during exec can walk the cgroup ancestor chain while observations exist.
-- **Watch out**: Mark membership and freezer changes before a checkpoint so dirty observations reach poll and inotify (kernel/cgroup D2).
-- **Source**: affb1e2; 0f5c5132
-
-### D58: Borrow accounting updates its thread-local count in one access
-
-- **What**: The borrow guard updates the count within one TLS access and its destructor may inline.
-- **Why**: Profiling found measurable TLS overhead even with no cgroup observers.
-- **Tradeoffs**: Only builds that count borrows benefit.
-- **Watch out**: The measured saving depends on compiler code generation.
-- **Source**: b65799c8
-
-### D59: Thread-exit DBT stat aggregation sums `DbtStats::fast_loops`
-
-- **What**: `add_stats` in `core/kernel/src/task.rs` sums `DbtStats::fast_loops` alongside the other Tier 1 counters when a thread exits.
-- **Why**: Process-wide Tier 1 statistics must include strip-mined fast loops compiled on exiting threads.
-- **Tradeoffs**: None beyond one addition per exiting thread.
-- **Watch out**: Keep `add_stats` updated whenever new fields are added to `DbtStats`.
-- **Source**: 49585f4e
-
-### D60: Condense the `kernel/process` map in place rather than splitting scheduling
-
-- **What**: `.agents/maps/kernel/process.md` is tightened in place to stay comfortably under one read instead of extracting another small child module for scheduling or fast-path syscalls.
-- **Why**: The map reached 80.0% of one read despite six prior child splits, and condensing verbose descriptions preserved all verified facts without multiplying module boundaries.
-- **Tradeoffs**: Scheduling syscalls stay documented inside `kernel/process` rather than in a standalone module.
-- **Watch out**: Further growth in clone, exit or scheduling semantics could push the map back toward 80%, making `kernel/sched` the cleanest next extraction candidate.
-- **Source**: 4fcd3e13
-
-### D61: `sched_setattr` validates policy before nice and commits only after both succeed
-
-- **What**: `sched_setattr` validates policy and permissions with `set_policy(..., false)` before running `setpriority`, committing `t.sched` (and `apply_host` when `!keep_params`) only after `setpriority` succeeds.
-- **Why**: Applying `set_policy` before `setpriority` left policy and `SCHED_RESET_ON_FORK` mutated whenever `RLIMIT_NICE` rejected the requested nice value.
-- **Tradeoffs**: None, because `setpriority` does not depend on `t.sched`.
-- **Watch out**: Keep `setpriority` independent of uncommitted `t.sched` changes so validation remains atomic on error.
-- **Source**: 849bf98a
-
-### D62: `invalidate_code` allows explicit guest page-0 invalidation
-
-- **What**: `invalidate_code` in `core/kernel/src/task.rs` no longer filters out address `0`, restricting the `ivau != 0` sentinel check to the site that merges the `ivau_page` side-channel with an explicit `Exit::InvalidateCode`.
-- **Why**: Filtering `0` inside `invalidate_code` dropped pure Tier 0 `Exit::InvalidateCode { addr: 0 }` invalidations on guest page 0 (such as single-stepped `ic ivau` with `mmap_min_addr = 0`).
-- **Tradeoffs**: `struct appine_cpu::ivau_page` still uses `0` as "none", which only affects Tier 1 `ic ivau` (where Tier 1 invalidates page 0 directly).
-- **Watch out**: Callers of `invalidate_code` must never pass `0` expecting a no-op sentinel.
-- **Source**: 0e02d7cd
-
-### D63: `Bkl::drop` contains wake-up matching and drops the unlocked global wake fallback
-
-- **What**: `Bkl::drop` wraps `k.flush_wakeups()` in `bug::catch` (waking every waiter in `k.waiters` directly on panic before unlocking) and `note_wake` returns early when `HELD == 0` instead of writing to process-global `WAKE`/`WAKE_OBJECTS`.
-- **Why**: A panic in `flush_wakeups` skipped unlocking the BKL, and unlocked wake requests fed a process-global fallback that could leak into another kernel instance.
-- **Tradeoffs**: Any non-test code calling `request_wake*` without holding the BKL is silently ignored instead of waking later.
-- **Watch out**: Every production caller of `request_wake*` must hold the BKL.
-- **Source**: 15347732
 
 ### D64: Task and group lifecycle hooks coordinate group stops, sibling ptrace exits, syscall stepping and zombie-leader clocks
 
@@ -287,6 +187,14 @@
 - **Tradeoffs**: The check sits outside the low-level step primitive.
 - **Watch out**: Keep direct CPU stepping behavior intact.
 - **Source**: d1fc9715
+
+### D73: RT scheduling syscalls enforce the target thread group's `RLIMIT_RTPRIO`
+
+- **What**: `set_policy` enforces the target thread group's soft `RLIMIT_RTPRIO` (requiring `rlim > 0` for RT policy changes and `priority <= rlim` to raise priority while allowing lowering, via a shared target-group `rlimit` closure), keeps `SCHED_DEADLINE` gated by `CAP_SYS_NICE`, keeps the `SCHED_IDLE` exit `RLIMIT_NICE` check unconditional for all transitions, and keeps RT policies recorded-only on host threads (D10).
+- **Why**: Unconditionally requiring `CAP_SYS_NICE` for `SCHED_FIFO` and `SCHED_RR` rejected valid unprivileged RT priority changes permitted by `RLIMIT_RTPRIO` under Linux 6.1's `__sched_setscheduler`.
+- **Tradeoffs**: Unprivileged threads granted RT policies still run at normal host priority to protect Android UI threads, and unprivileged `SCHED_IDLE` tasks cannot jump to RT policies without `RLIMIT_NICE` allowing their nice value.
+- **Watch out**: Preserve atomic validation before committing `t.sched` (D61) and always consult the target thread group's limits rather than the caller's.
+- **Source**: 0ddd8d50, ee941aed
 
 ## Superseded
 

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/poll"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D6 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 >
@@ -143,6 +143,13 @@
 - **Tradeoffs**: Each outstanding output fence consumes host and guest file descriptors.
 - **Watch out**: Early close and worker teardown must preserve completion and hangup semantics.
 - **Source**: 87c7d9db
+
+### D20: `eventfd2` allocates reusable lowest-free `eventfd-id` values
+- **What**: Construct each `EventFd` in `eventfd2` through `EventFd::new(..., &cx.kr().eventfd_ids)` so concurrent instances receive distinct non-negative IDs starting at 0 and recycle freed IDs on close.
+- **Why**: Linux procfs `fdinfo` expects each eventfd instance to expose a lowest-free non-negative `eventfd-id`.
+- **Tradeoffs**: `eventfd2` returns `ENOSPC` if `i32::MAX` eventfd instances are live at once.
+- **Watch out**: None known; existing readiness and epoll semantics remain unchanged.
+- **Source**: b9497c7e
 
 ## Superseded
 

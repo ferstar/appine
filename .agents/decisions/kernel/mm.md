@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D17 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D17 were seeded by hand from the retired design
 > doc §5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -212,11 +212,27 @@
 
 ### D59: Unmap prepares fallible demotion before changing CoW or host state
 
-- **What**: Prepare all mapped spans before two-phase teardown, use one unmap for single-step paths and expire page watches when a nonrollbackable clip or FUSE invalidation fails.
-- **Why**: A boundary-superpage allocation failure could otherwise leave half a teardown committed.
-- **Tradeoffs**: Preparation adds a boundary walk for two-phase callers.
-- **Watch out**: An ordinary failed munmap must preserve valid watches.
-- **Source**: d7a28ce2, f2d15cfd, 33e95609
+- **What**: Prepare all mapped spans before two-phase teardown, use one unmap for single-step paths, and route truncation clipping and FUSE invalidation through `unmap_or_clear_superpages` to fall back to `Mmu::unmap_noalloc` on superpage-demotion OOM.
+- **Why**: A boundary-superpage allocation failure could otherwise leave half a teardown committed or leave live PTEs past truncated EOF (risking host `SIGBUS`) or for invalidated FUSE pages.
+- **Tradeoffs**: Preparation adds a boundary walk for two-phase callers, and demotion OOM on file or FUSE unmaps incurs a demand fault and expires `PageWatch`es across the cleared 2 MiB superpage.
+- **Watch out**: An ordinary failed `munmap` must preserve valid watches, and any future VMA kind placed inside a file or FUSE 2 MiB superpage must remain demand-refaultable from its backing without losing state.
+- **Source**: d7a28ce2, f2d15cfd, 33e95609, e9761fd4
+
+### D60: `MREMAP_DONTUNMAP` remnants preserve `anon_pgoff` and unlink `anon_vma` only on whole-VMA moves
+
+- **What**: After fixed-target unmapping, `Mm::mremap_dontunmap` computes the logical `[vma_start, vma_end)` via `vma_start`/`vma_end`, retains `anon_pgoff` on anonymous remnants, resets `anon` and `has_anon_vma` once only when the whole logical VMA moved, clears `locked` across `[vma_start, vma_end)` in one scan after `move_range`, and guards `Mm::dump_page` against `v.reserved()`.
+- **Why**: Unconditionally resetting anonymous remnants and unlocking only the moved slice split partial `MREMAP_DONTUNMAP` VMAs, dropped non-linear page offsets, and duplicated per-backing reset logic.
+- **Tradeoffs**: Preserving `anon_pgoff` on whole-VMA moves matches Linux 6.1 rather than newer kernels that reset unfaulted `vm_pgoff`, and the single unlock scan relies on `[dst, dst + len)` staying disjoint from `[vma_start, vma_end)`.
+- **Watch out**: Consumers of `has_anon_vma` must still check `written` and `reserved()` because partial remnants can retain `has_anon_vma` without host backing, and `vma_start`/`vma_end` must stay computed after fixed-target `munmap`.
+- **Source**: d747205b, 8a839900
+
+### D61: `brk`, `map_anonymous`, and in-place `mremap` growth are bounded by `1 << VA_BITS` inside a 47-bit default map window
+
+- **What**: Keep `STACK_TOP = 1 << 47` as the default map window (`mmap_top`), reject `brk_limited` and `map_anonymous` ranges ending past `1 << VA_BITS`, and share `Mm::range_fits(start, len, limit)` across `hint_fits` (`mmap_top`) and `mremap_limited` in-place growth (`1 << VA_BITS`, after checking `offset == tail.len`) for overflow, free-space, and `STACK_GUARD_GAP` clearance.
+- **Why**: `brk_limited` could insert lazy VMAs past the 48-bit `TASK_SIZE` while `mremap_limited` rejected valid in-place growth of `MAP_FIXED` mappings in `[mmap_top, 1 << 48)` and duplicated `hint_fits`'s clearance checks.
+- **Tradeoffs**: Non-fixed `mmap` hints above `mmap_top` still fall back below it while mappings right below `mmap_top` can now grow in place above it when unblocked (matching Linux 6.1's `vma_expandable`), and `Mm` carries one private clearance helper.
+- **Watch out**: Every future VMA insertion path must enforce `end <= 1 << VA_BITS` so no untranslatable VMA enters the 48-bit soft-MMU.
+- **Source**: 7e2143cf, ee941aed
 
 ## Superseded
 
@@ -236,3 +252,5 @@
 - ~~Allowing a private store mapping to rely on stale backing after a split~~ → replaced by **D37** in 68130f74 (2026-11-24)
 - ~~Implementing MADV_POPULATE_READ as an advisory WILLNEED request~~ → replaced by **D49** in 20631a25 (2026-11-25)
 - ~~Approximating anonymous VMA joining without anonymous page offsets~~ → replaced by **D22** in 9d0ad1b6 (2026-11-26)
+- ~~Expiring page watches alone when truncation or FUSE invalidation unmap fails (D59 in part, f2d15cfd)~~ → replaced by **D59** in e9761fd4 (2026-11-26)
+- ~~Always creating a fresh anonymous remnant on `MREMAP_DONTUNMAP` (D22 in part, 9d0ad1b6)~~ → replaced by **D60** in d747205b (2026-11-26)

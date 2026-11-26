@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/nft"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on kernel/nft made before it was split from kernel/netns keep their `kernel/netns` tags and live in `.agents/decisions/kernel/netns.md`: D4, D5, D8–D11 and the nftables half of D13.
 
@@ -47,3 +47,11 @@
 - **Tradeoffs**: Receiving the full dump can require repeated reads.
 - **Watch out**: Emit the final completion record after the last element.
 - **Source**: 9fc6d332
+
+### D6: Committed nftables batches stage `NLM_F_ECHO` replies and `NFNLGRP_NFTABLES` events
+
+- **What**: Batch mutation handlers stage `NftEvent` records through a private `Events` helper (with `HandleResult::reply`), emitting `NLM_F_ECHO` replies before `NLMSG_ERROR` acks, broadcasting committed monitor notifications followed by `NFT_MSG_NEWGEN` (`res_id = generation & 0xffff`), and discarding all staged events on batch failure.
+- **Why**: `nft -a`/`nft -e`/`nft -j -e` depend on `NLM_F_ECHO` for kernel-assigned handles and `nft monitor` expects `NFNLGRP_NFTABLES` broadcasts plus `NFT_MSG_NEWGEN`, without duplicating event-staging boilerplate across handlers.
+- **Tradeoffs**: Staging events in each mutation handler through `Events` preserves exact Linux 6.1/6.8 replace, element and flush-cascade ordering without post-commit diffing heuristics.
+- **Watch out**: Future nftables mutation types such as stateful objects or flowtables must stage matching `NftEvent` records while preserving event order, `NLM_F_*` flags, use-count clearing order and rollback truncation.
+- **Source**: e399082a, b15971ac

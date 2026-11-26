@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/exec"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on execve and the ELF loader made before kernel/exec was split from kernel/process keep their `kernel/process` tags and live in `.agents/decisions/kernel/process.md`: D7, D17, D31, D41, D43, D46 and D51.
 
@@ -70,6 +70,22 @@
 - **Tradeoffs**: Successful and doomed exec paths share dispatch cleanup.
 - **Watch out**: Preserve the old task identity across non-leader takeover.
 - **Source**: b421eac0, e1fbd2ae
+
+### D9: FUSE `execve` fetches `security.capability` lazily on `!nosuid` mounts and pins `FuseExe` on `ExeFile`
+
+- **What**: `file_caps` lazily fetches FUSE `security.capability` via `Query::FileCaps` only on `!nosuid` non-script execs, maps roots through `conn.user_ns()` with `FileCaps::parse_in`, and records `FuseExe` on `ExeFile`.
+- **Why**: `execve` previously ignored FUSE mount `nosuid` state, queried only the SQLite store for file capabilities, and left `ExeFile` without FUSE node identity.
+- **Tradeoffs**: Non-nosuid FUSE execs incur one additional `FUSE_RETRY` round-trip before caching in thread-local `FILE_CAPS` for the syscall.
+- **Watch out**: `ExecOpens` must keep deduplicating open and read notifications across the `Query::FileCaps` retry.
+- **Source**: 7b505898
+
+### D10: `STACK_TOP` and `ET_DYN_BASE` keep a 47-bit default map window inside 48-bit `TASK_SIZE`
+
+- **What**: `loader.rs` keeps and documents `STACK_TOP = 1 << 47` and `ET_DYN_BASE = 0x5555_5555_0000` as Appine's 47-bit default map window inside the 48-bit `TASK_SIZE`, mirroring arm64 Linux's `DEFAULT_MAP_WINDOW_64` vs `TASK_SIZE_64` split.
+- **Why**: Restricting default stack, PIE, and non-fixed placement to 47 bits preserves compatibility with 47-bit NaN-boxing and pointer-tagging runtimes such as LuaJIT GC64, SpiderMonkey, and JavaScriptCore.
+- **Tradeoffs**: Processes receive a 128 TiB default window instead of 256 TiB for initial stack placement and non-fixed mappings.
+- **Watch out**: Keep `STACK_TOP` and ELF segment upper-bound checks aligned with `kernel/mm`'s `mmap_top` and `1 << VA_BITS` bounds.
+- **Source**: 7e2143cf
 
 ## Superseded
 

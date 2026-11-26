@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D8 were seeded by hand from the retired design doc
 > §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
 > entries cite commits.
 
@@ -35,6 +35,19 @@
 - **D26** — Screen-off policy uses a nonpersistent `ListPreference` and shared Material choice dialog for SLEEP, BUSY and ALWAYS synced with notification toggles, with vendor presentation and accessibility unverified (a3f7507e, 1e5de64e; 20137e4c; d053be24; 39e55b4b)
 - **D35** — Settings exposes tab-list visibility as a service-backed nonpersistent `SwitchPreferenceCompat` before volume-key switching, with device layout and accessibility unverified (5c49c5a7; 39e55b4b)
 
+> Full text of D8, D12, D28, D31, D32, D33, D36, D38, D39, D41: `git show 1ea0c1ef9d686d7126bec2029fc928d4f6fdfc6b:.agents/decisions/android/setup.md`
+
+- **D8** — Only one rootfs is installed at a time with packages upgraded by the user (`apk`/`apt`), while Appine refreshes per-start integration files (D20, D30), switching discards old files, and rootfs export/import is planned for v1.x (round 99 (`99-choose-rootfs`); design doc §11.4; 8e211142; d053be24; 39e55b4b)
+- **D12** — Settings uses nonpersistent service-driven AndroidX Preferences in a Material page (`liftOnScrollTargetViewId` on the preference RecyclerView, stale account loads discarded, scroll restored after insets and state), with deprecated target-fragment choice dialogs and device/TalkBack behavior unverified (55be399; f8822b8b; dd200589; 20137e4c; d053be24; 39e55b4b)
+- **D28** — About works without service binding, listing Telegram, Project website and Privacy policy with URL summaries and unpinned Custom Tabs plus Version (`name (code)`) opening `PLAY_STORE_URL` (`io.github.mthli.appine`) via `com.android.vending` then HTTPS fallback with the missing-handler toast, while device/store routing remains unverified (d0a74e94, 0b3c5d8a; d053be24; 39e55b4b; 5f950434, 13675d1d, 5b213f09; 1afcffbc)
+- **D31** — External file access renders service state, requires a Material confirmation on every enable (discarded on recreation), disables immediately, and is disabled by privacy mode (D32), with physical-device and accessibility behavior unverified (d0ddf170; d053be24; 39e55b4b)
+- **D32** — The nonpersistent privacy switch confirms enabling before authentication, authenticates disabling without restoring file access, leaves the preference unchanged on cancel or unavailable auth, replays deferred notices, and protects Settings dialogs with secure-window helpers (f61072f3, 9c6c51a7; d053be24; 39e55b4b)
+- **D33** — Save to file and Share prepare one authorized ZIP before the save picker, held single-use in a fragment ViewModel and deleted on cancellation, abandonment or completion, while process death discards authorization, provider failures may leave partial files, and cloud/slow transfers remain untested (c7309c0c, 9c6c51a7; d053be24; 39e55b4b)
+- **D36** — Enable notifications appears first in Android only while app notifications are disabled, using the shared helper without service binding and refreshing on creation, permission results and resume, while Android 11–12, vendor navigation and TalkBack remain unverified (ce38e763; 39e55b4b)
+- **D38** — App battery usage sits below notifications with separate summaries, refreshes visibility on resume and opens package details on tap, though vendors may move or rename those controls (7a931d97)
+- **D39** — `appine-gpu` sets `VK_DRIVER_FILES` to the packaged Venus manifest and execs the opt-in command, requiring launcher updates if a distribution renames its Venus manifest (9cafc90b)
+- **D41** — Debugging exposes a nonpersistent Vulkan GPU switch between Execution mode and Export diagnostic logs, enabled only while a kernel runs without a distro switch, confirming enable and disable with `showPrivate` restart dialogs and showing "Unavailable on this device" without a probed renderer, with non-English/Chinese layout and TalkBack unverified (b605a0a3)
+
 ## Active (full detail)
 
 ### D2: Tarballs are trusted by pinned digests, whatever the source
@@ -58,25 +71,12 @@
 - **Tradeoffs**: Only tabs opened by the app run the setup (`su -` and ssh logins do not); "no password" is judged from the shadow field alone.
 - **Source**: rounds 193 (`193-login-account`), 206 (`206-debian-sudo-progress`); design doc §11.1
 
-### D8: One rootfs at a time, upgraded by the user
-- **What**: App updates do not upgrade installed distribution packages; Appine-owned per-start integration files may be refreshed (D20, D30); upgrades within a branch are the user's `apk upgrade`/`apt upgrade`, across branches by editing the sources; switching distro discards the old files; rootfs export and import are planned for v1.x.
-- **Why**: The design doc states the rule without a recorded reason.
-- **Tradeoffs**: Two distros cannot be used side by side or share files (that would need mounts across stores).
-- **Source**: round 99 (`99-choose-rootfs`); design doc §11.4; 8e211142; d053be24; 39e55b4b
-
 ### D9: Distributions, first boot, logins and guest shell integration form android/setup
 - **What**: android/setup covers `Rootfs.kt`, guest login/OpenRC/shell-integration/browser-launcher/GPU-launcher assets and `scripts/fetch-rootfs`, with `To verify` kept to unverified residuals, while `SettingsActivity.kt` belongs to `android/settings` and service lifecycle stays in `android/service`.
 - **Why**: `android/setup.md` reached 49,174 B (106.7% of one read) while mixing guest rootfs/shell setup with the Settings UI.
 - **Tradeoffs**: Changes spanning both rootfs/account logic and the Settings UI touch both `android/setup` and `android/settings`, pre-split Settings decisions remain here, and sibling concerns stay in `android/privacy`, `android/licenses`, `android/terminal`, `android/vtcore`, `android/vt` and `android/build`.
 - **Watch out**: Changes to `Distro` metadata or `regularAccounts` must check `android/settings` consumers, while in-place shadow edits can still delay NOPASSWD refresh and shell-hook/device checks remain open.
 - **Source**: 12c4afa (bug list since updated by 237d663, d03c9b6); 5d506bfb; a1367531; 7aa817af; f8822b8b; 20137e4c; 8e211142; 9c6c51a7; 81f60bef; d053be24; 60790c14; 39e55b4b; e4d7bbe5
-
-### D12: Settings uses service-driven AndroidX Preferences in a Material page
-- **What**: SettingsActivity supplies the frame and targets the preference RecyclerView for app-bar lift, while SettingsFragment builds stable-key nonpersistent categories, switches and lists driven by service setters, discards stale account loads and restores scrolling only after state and insets are ready.
-- **Why**: Standard preferences replace custom row/accessibility code, and an explicit scrolling target prevents preference updates from resetting app-bar lift.
-- **Tradeoffs**: Service rendering and destructive confirmations stay explicit, standard preference spacing replaces custom rows, and Material list dialogs retain AndroidX selection/recreation behavior.
-- **Watch out**: Choice dialogs use AndroidX’s deprecated target-fragment contract, lift depends on its RecyclerView ID, restoration must await bottom padding and service state, and real-device/TalkBack behavior remains unverified.
-- **Source**: 55be399; f8822b8b; dd200589; 20137e4c; d053be24; 39e55b4b
 
 ### D13: Login rules, admin setup, mirror choice and downloads fail closed
 - **What**: NOPASSWD rules are refreshed at every login, root's included, and granted only when the account's shadow field after any leading `!` is empty or `*`; an admin is matched with `grep -F` and recorded only once `id -nG` shows the group (else retried at the next login); an import-only mirror write leaves edited sources alone (D4); and a download fails as soon as a source sends more than the pinned length.
@@ -130,14 +130,6 @@
 - **Watch out**: Failed bundles must survive for retry, later user removal must stay respected, and disappearing upstream packages require refreshed pins.
 - **Source**: 410ef192; 20137e4c; d053be24; 39e55b4b
 
-### D28: About actions work independently of service binding
-
-- **What**: About lists Telegram, Project website and Privacy policy in that order with URL summaries and shared unpinned Custom Tabs handling, and shows the version name and code with a Play link pinned to `PLAY_STORE_URL` (`io.github.mthli.appine`) trying `com.android.vending` before HTTPS fallback.
-- **Why**: Users need discoverable project and installed-version links without a running service, and debug builds (`.debug` suffix) must still open the published Play Store listing.
-- **Tradeoffs**: Routing depends on installed handlers, and any future rename of the published Play Store application ID must update `PLAY_STORE_URL` alongside `build.gradle.kts`.
-- **Watch out**: Keep the missing-handler toast for web and Play links; device navigation, fallback routing, store-link routing and return to Settings remain unverified.
-- **Source**: d0a74e94, 0b3c5d8a; d053be24; 39e55b4b; 5f950434, 13675d1d, 5b213f09; 1afcffbc
-
 ### D29: New Alpine imports stage an independent bubblewrap bundle
 
 - **What**: Imports cache SHA-256-pinned bubblewrap 0.12.0-r0 and libcap2 2.78-r0, install before account selection under the shared lock, check apk state, re-add bubblewrap by name and delete the cache only on success.
@@ -154,30 +146,6 @@
 - **Watch out**: Migration needs a kernel restart and preserves edited profiles, shells bypassing the profile need their own setup, and Android authorization remains unverified.
 - **Source**: 8e211142; d053be24; 39e55b4b; b560bc31
 
-### D31: Enabling external file access always asks for confirmation
-
-- **What**: The file-access switch renders service state, saves true only from a Material confirmation on every enable and disables immediately.
-- **Why**: Users need an explicit explanation before home and system files become available to other apps.
-- **Tradeoffs**: Every enable needs another tap and recreation discards an unaccepted confirmation.
-- **Watch out**: Physical-device and accessibility behavior remain unverified; privacy mode disables this row (D32).
-- **Source**: d0ddf170; d053be24; 39e55b4b
-
-### D32: Privacy changes require authentication and protected dialogs
-
-- **What**: A nonpersistent privacy switch confirms enabling before authentication, authenticates disabling, protects Settings dialogs and replays deferred notices after unlock.
-- **Why**: Users need an explicit control that cannot silently remove authentication or conflict with external file access.
-- **Tradeoffs**: Both transitions require device authentication and disabling privacy does not restore file access.
-- **Watch out**: Cancellation or unavailable authentication must leave the preference unchanged, and new dialogs must use the secure-window helpers.
-- **Source**: f61072f3, 9c6c51a7; d053be24; 39e55b4b
-
-### D33: Log export prepares one authorized archive before the save picker
-
-- **What**: Save to file and Share generate a ZIP after authorization, with a single-use pending save held in a fragment ViewModel and deleted on cancellation, abandonment or completion.
-- **Why**: Users need direct log export without moving authentication after destination selection.
-- **Tradeoffs**: A prepared ZIP stays in private cache during the picker, and process death discards authorization instead of resuming it.
-- **Watch out**: Provider failures may leave partial destination files; cloud providers and slow transfers remain untested.
-- **Source**: c7309c0c, 9c6c51a7; d053be24; 39e55b4b
-
 ### D34: Prompt and execution hooks report sanitized shell titles
 
 - **What**: bash, ash and zsh restore sanitized PWD through OSC 2 at primary prompts, while bash PS0 and deduplicated zsh preexec report command text with bash history used only when its counter advances.
@@ -185,14 +153,6 @@
 - **Tradeoffs**: Command titles describe submitted lines rather than live processes, history-excluded bash commands use bash, and ash has no command-title hook.
 - **Watch out**: Existing shells need reloading, custom profiles may not migrate, prompt/history frameworks can interfere, and ash must restore its sanitized title after its visible prompt.
 - **Source**: b04ebd4e, 9f9ba8d7; 39e55b4b
-
-### D36: Notification authorization remains available after banner dismissal
-
-- **What**: Enable notifications appears first in the Android group only while app notifications are disabled and uses the shared helper without service binding, refreshing on creation, permission results and resume.
-- **Why**: Dismissing the terminal banner must leave an explicit authorization path.
-- **Tradeoffs**: The row disappears after authorization and does not diagnose individual disabled channels.
-- **Watch out**: Preserve result registration and recreation refresh; Android 11–12, vendor navigation and TalkBack remain unverified.
-- **Source**: ce38e763; 39e55b4b
 
 ### D37: New systems receive a concise package and Codex welcome guide
 
@@ -202,22 +162,6 @@
 - **Watch out**: Package availability and Codex requirements can change and the example was not run on either distribution; git was added in 0f0cceab and removed from the example in d565c954, both without a MODULE Decision.
 - **Source**: 39ba9e3a, 0f0cceab; 39e55b4b; d565c954
 
-### D38: App battery usage remains accessible through Settings
-
-- **What**: Place App battery usage below the notification preference, use separate summaries and refresh visibility on resume before routing to package details on tap.
-- **Why**: Dismissing the terminal exemption prompt should leave another route to battery settings.
-- **Tradeoffs**: Package details can require an extra tap to reach the battery controls.
-- **Watch out**: Vendors may move or rename those controls.
-- **Source**: 7a931d97
-
-### D39: `appine-gpu` selects the packaged Venus Vulkan driver per command
-
-- **What**: `appine-gpu` sets `VK_DRIVER_FILES` to the packaged Venus manifest and execs the supplied command and arguments.
-- **Why**: Loading extra Vulkan drivers such as llvmpipe adds startup overhead to short commands that need hardware compute.
-- **Tradeoffs**: Callers must opt in by prefixing their command with `appine-gpu`.
-- **Watch out**: A distribution that renames its Venus manifest requires updating the launcher script.
-- **Source**: 9cafc90b
-
 ### D40: Alpine stores run one-time offline OpenRC setup on both new imports and upgrades
 
 - **What**: Offline OpenRC setup checks `apk`, resumes any staged installer or sources missing packages from the APK, adds `openrc` to world by name, removes the installer and cache and records per-store completion only after verifying the default runlevel and service lock directory (marking preinstalled OpenRC complete immediately).
@@ -226,21 +170,13 @@
 - **Watch out**: Preserve the staged installer across interrupted setup for retry; custom `inittab` entries or existing package constraints can prevent completion.
 - **Source**: d0ff9a31, 7e85e8dc
 
-### D41: Vulkan GPU acceleration is an explicit Debugging switch with restart confirmation
-
-- **What**: Settings places a nonpersistent Vulkan GPU `SwitchPreferenceCompat` between Execution mode and Export diagnostic logs, enabled only while the kernel runs without a distro switch, confirming enable and disable with `showPrivate` restart dialogs and showing "Unavailable on this device" when enabled without a probed renderer.
-- **Why**: Users need a clear opt-in under Debugging with plain-language summaries and explicit confirmation before restarting active sessions.
-- **Tradeoffs**: Toggling ends all active sessions and restarts the kernel.
-- **Watch out**: Device layout and TalkBack across all five locales remain unverified outside English/Chinese checks on Galaxy S23.
-- **Source**: b605a0a3
-
 ### D42: Alpine stores seed bash startup files once for `/etc/skel`, root and existing regular users
 
 - **What**: `Rootfs.ensureBashStartup` runs on new Alpine imports and once per existing Alpine store via `/var/lib/appine/bash-startup-done`, writing `/etc/skel/.bash_profile` and `.bashrc` (`overwrite = false`) and seeding missing `.bash_profile` (unless `.bash_profile`, `.bash_login` or `.profile` exists) and `.bashrc` owned by `uid:gid` for `root` and existing regular `/bin/bash` accounts (UID 1000–65533, non-negative GID) whose home already exists as a non-regular entry.
 - **Why**: Alpine login tabs run `bash -l`, which skips `~/.bashrc` without a login file, and neither Alpine's minirootfs nor its `bash` package ships `/etc/skel` or user bash startup files.
 - **Tradeoffs**: Missing or symlinked regular-user homes are skipped rather than created or dereferenced, intentional dotfile deletions are respected after the marker is written, and stores that wrote the marker before `125f3d00` are not re-run.
-- **Watch out**: A non-directory replacing `/etc/skel` fails startup before boot, non-directory home entries rely on `exists` failing with `ENOTDIR`, and live `TerminalService` upgrade cold starts and 16 KB-page devices remain unverified.
-- **Source**: 9f3e93ed, 125f3d00
+- **Watch out**: A non-directory replacing `/etc/skel` fails fresh-import or direct-caller startup before boot (existing stores degrade under D47), non-directory home entries rely on `exists` failing with `ENOTDIR`, and live `TerminalService` upgrade cold starts and 16 KB-page devices remain unverified.
+- **Source**: 9f3e93ed, 125f3d00; 12ac97cf
 
 ### D43: Login setup gates locked commands and restores SIGINT before exec
 
@@ -266,6 +202,22 @@
 - **Watch out**: The generation check and publication need the same lock.
 - **Source**: f495f2cc
 
+### D46: Login admin setup serializes under `/run/appine-rules.lock` and gates `bash`/`doas` completion on world registration
+
+- **What**: First-login admin setup and atomic `20-wheel.conf` updates share root-only `/run/appine-rules.lock` with defensive `admins` deduplication in `refresh_rules`, while `install_bash` and `install_doas` create root-only `/run/appine-install.lock` under `umask 077` and remove the `bash` bundle or create `doas-installed` only after `apk_add <name>` succeeds (preserving `/bin/bash` launch on partial failure, custom non-apk `doas`, user removals, and Debian `sudo`).
+- **Why**: Concurrent first logins could race to duplicate `/var/lib/appine/admins` rows or corrupt `20-wheel.conf`, and partial local-APK installs could drop the `bash` bundle or mark `doas` installed before apk world registration succeeded.
+- **Tradeoffs**: A partial `apk_add <name>` failure triggers one extra fast offline registration check on the next login, and first-login admin setup briefly contends with `--refresh-rules` on `/run/appine-rules.lock`.
+- **Watch out**: On-device `MachineTest` verification remains pending, and `install_doas` assumes any apk-managed `doas` can be re-added offline by name with `/dev/null` repositories.
+- **Source**: 5cff644e
+
+### D47: Per-start rootfs configuration isolates sub-steps and degrades on existing stores while failing fast on fresh imports
+
+- **What**: `Rootfs.prepareStart` runs all seven per-start helpers and their independent sub-steps through `runSetupStep`, `writeStep`, `readMarker`, shared path constants, and `cachePackage` reuse, returning whether `/etc/appine/browser` was written, leaving `bash-startup-done` unwritten until all seeding writes succeed, throwing via `FAIL_FAST` on fresh imports, and reporting `IOException`s to `onFailure` on existing stores.
+- **Why**: Obstructed paths, symlinked directories, unreadable markers, or full-disk errors in optional per-start writes previously aborted startup on existing stores and locked users out of a repair shell.
+- **Tradeoffs**: Permanently obstructed paths on an existing store (such as a symlinked `/etc/skel` before `bash-startup-done` exists) are retried and reported on every start until repaired.
+- **Watch out**: Direct callers of individual `ensure*` helpers still fail fast unless they pass `onFailure`, and unreadable one-time markers skip their migration instead of re-seeding user-deleted files.
+- **Source**: 12ac97cf, f7d164db
+
 ## Superseded
 
 - ~~The execution tier is chosen in Settings in every build (5c34951, round 190)~~ → replaced by **D10** in 62a8c07 (2026-11-04)
@@ -289,3 +241,4 @@
 - ~~Replacing a stock mirror configuration after rootfs publication~~ → replaced by **D4** in 568b6a48 (2026-11-24)
 - ~~Leaving login or nested zsh and nested Debian bash without Appine hooks~~ → replaced by **D20** in acc5a7a0 (2026-11-25)
 - ~~Losing the ash ENV hook under stock doas -s~~ → replaced by **D20** in 6e0c0f16 (2026-11-26)
+- ~~Failing startup before boot on existing-store per-start configuration write errors (including a non-directory `/etc/skel` in D42)~~ → replaced by **D47** in 12ac97cf (2026-11-26, implicit refinement)

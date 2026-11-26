@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -184,6 +184,14 @@
 - **Tradeoffs**: Direct devpts and device-node opens require distinct stat handling.
 - **Watch out**: Honor the capability and O_PATH exceptions.
 - **Source**: d10f2973, 68130f74, 11167386
+
+### D26: `/dev/console` intentionally routes through the caller's controlling terminal
+
+- **What**: Keep `/dev/console` (5:1) routed through `open_ctty` while preserving 5:1 device identity per D25 instead of adding a dedicated system console.
+- **Why**: Appine has no single system console (`inittab` logs to `/var/log/boot.log` and tabs own independent PTYs), and tested OpenRC and container workloads do not fail on `ENXIO` without a controlling terminal.
+- **Tradeoffs**: Processes without a controlling terminal receive `ENXIO` on `/dev/console`, and processes with a controlling terminal alias their own PTY when opening it.
+- **Watch out**: Revisit (for example with a `ttynull`-style sink) only if a concrete guest daemon or init workload fails from `ENXIO` on `/dev/console`.
+- **Source**: 8e6c5df1
 
 ## Superseded
 

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine/dbt"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on engine/dbt made before it was split from engine keep their `engine` tags and live in `.agents/decisions/engine.md`: D6–D10, D13–D16, D18, D23, D25, D27–D29, and the Tier 1 halves of D2, D5, D17, D20, D22 and D24.
 
@@ -67,7 +67,7 @@
 ### D8: Tier 1 C sources are split into flat sibling `dbt*.{c,h}` translation units
 
 - **What**: `core/engine/src/c/dbt.c` is split into flat sibling files (`dbt_internal.h`, `dbt_translate.c`, `dbt_group.c`, `dbt_loop.c`, `dbt_routines.c`, `dbt_cache.c` and `dbt.c`) using `dbt_`-prefixed cross-unit symbols, `static inline` hot emitter primitives in `dbt_internal.h` and `#ifdef DBT_SUPPORTED` guards on helper units.
-- **Why**: Recent Tier 1 optimizations grew `dbt.c` to 8,207 lines, making navigation and maintenance disproportionate to sibling files in `core/engine/src/c/`.
+- **Why**: Recent Tier 1 optimizations grew `dbt.c` to 8,207 lines, making navigation and maintenance disproportionate to sibling files in `core/engine/src/`.
 - **Tradeoffs**: Cross-unit calls are no longer eligible for single-TU static inlining without LTO, and `dbt_internal.h` must stay synchronized across all six C files.
 - **Watch out**: Keep cross-TU helpers `dbt_`-prefixed and `#ifdef DBT_SUPPORTED`-guarded so unprefixed symbols do not leak and non-ARM64 host builds keep compiling under `-Wall -Wextra -Werror`.
 - **Source**: cc72b093
@@ -103,6 +103,14 @@
 - **Tradeoffs**: Reclaimed translations may need rebuilding.
 - **Watch out**: Acquire template shards in ascending order before the arena lock.
 - **Source**: 567ff786, ab417943
+
+### D13: Tier 1 applies arm64 TBI0 on indirect branches, `rs_miss`, `exec_memop` returns and `dbt_run` entry
+
+- **What**: `emit_untag_pc` (`tbnz #55` + `and`) untags TTBR0 targets in `translate_branch_sys` (`BR`/`BLR`/`RET`, after predicted-return checks) and `d->rs_miss`, while `dbt.c` applies `untag_pc` at `dbt_run` entry and out-of-line `exec_memop` returns, checked against Tier 0 with a shared per-register-set `Guest` helper.
+- **Why**: Tier 1 indirect branches, shadow-stack misses, memop returns and run entry must match Tier 0's Linux 6.1 TBI0 `BranchAddr` semantics without clobbering guest NZCV or slowing predicted `RET X30` hits.
+- **Tradeoffs**: Adds two NZCV-free host instructions per unpredicted indirect branch using zero scratch registers and zero cost on predicted returns, and shares read-only Tier 0 `Guest` state across sub-cases in the regression test.
+- **Watch out**: Tagged `X30` returns miss the shadow return stack and go through the jump cache while preserving `X30`, and `exec_memop` must pop matching shadow-stack entries using `untag_pc(c->x[30])`.
+- **Source**: 6a979929, 8a839900
 
 ## Superseded
 

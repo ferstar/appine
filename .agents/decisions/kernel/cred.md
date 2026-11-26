@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D6 were seeded by hand from the retired design doc
 > §11.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -121,6 +121,14 @@
 - **Tradeoffs**: Multiple matching groups may need examination.
 - **Watch out**: Check both the entry and the group-class mask.
 - **Source**: 68b70897
+
+### D17: Seccomp `NEW_LISTENER` reserves its notification fd before publishing the filter chain
+
+- **What**: `set_filter` wraps `Cx::reserve_fd()` in an RAII `ReservedFd` guard that reserves the slot and grows the fd table (`EMFILE` on `RLIMIT_NOFILE`/`nr_open` exhaustion) before mode, `EBUSY`, `ENOMEM`, and TSYNC checks, auto-unreserving on early return and installing `SeccompNotify` infallibly via `FdTable::fill()` after publish.
+- **Why**: Choosing a free slot before publish and calling `install_at_capped()` afterward let `nr_open` growth failure leave the filter active without a listener on the caller and TSYNC peers while returning `EBADF` instead of `EMFILE`.
+- **Tradeoffs**: Logical fd-table capacity expansion during reservation persists if a later validation check fails (matching Linux's `get_unused_fd_flags` + `put_unused_fd`), while the reserved slot itself is freed.
+- **Watch out**: No code between `reserve` and `fill` in `set_filter` may hold an active borrow on `cx.t.fds` across an early return because `ReservedFd::drop` borrows it mutably.
+- **Source**: 658fbf94
 
 ## Superseded
 

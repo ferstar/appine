@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/netns"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -121,6 +121,14 @@
 - **Tradeoffs**: Handling differs for IPv4 and IPv6.
 - **Watch out**: Keep destination, gateway and preferred-source checks consistent with the routing ABI.
 - **Source**: 11cb85a0
+
+### D17: Established forwarded connections survive DNAT rule removal
+
+- **What**: Dropping a DNAT forwarder `Handle` stops new intake while keeping established forwarded TCP connections and in-flight UDP relays alive, matching Linux 6.1 conntrack NAT and pinned by `tcp_connection_survives_handle_drop`.
+- **Why**: Resolving `kernel/netns.md`'s open teardown question aligned firewall reloads with Linux 6.1 conntrack semantics instead of forcibly resetting active sessions.
+- **Tradeoffs**: Terminating an already-forwarded session still requires endpoint close or reset rather than DNAT rule removal alone.
+- **Watch out**: Per-segment filter re-evaluation remains absent on established forwarded connections.
+- **Source**: 8bd3fa4c
 
 ## Superseded
 - ~~D9 combined ownership of the newly extracted child modules~~ → replaced by **D9** in 60790c14 (2026-11-15; scope only, inherited implementation decisions remain here)

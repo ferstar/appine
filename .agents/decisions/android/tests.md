@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/tests"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on android/tests made before it was split from android/native keep their `android/native` tags and live in `.agents/decisions/android/native.md`: D5, D8, the test portions of D9, D12–D14, D16, D19 and D23–D32.
 
@@ -103,3 +103,11 @@
 - **Tradeoffs**: Provider and service cases exercise framework state.
 - **Watch out**: A remapping must preserve the distinct notification keys.
 - **Source**: ae1e05e0
+
+### D13: Per-start configuration degradation is verified in JVM unit and isolated-store instrumentation tests
+
+- **What**: `StartConfigTest` (using a file-private `Harness`) tests `prepareStartBridge` and `Rootfs.runSetupStep` for fresh-import abort, independent step degradation, bridge closure on open or config failure and non-`IOException` propagation, while `MachineTest.degradedPerStartConfigAllowsExistingStoreToBoot` exercises symlink-obstructed paths, marker reads, bridge closure and shell boot in an isolated Alpine store with concise local helpers.
+- **Why**: Degraded per-start behavior, bridge cleanup, marker obstruction and fresh-import fail-fast semantics need automated verification across both pure-Kotlin orchestration and real rootfs stores.
+- **Tradeoffs**: Instrumentation execution requires a device or emulator with pre-fetched `target/` assets while JVM tests cover only pure-Kotlin orchestration, with minor indirection through local test helpers.
+- **Watch out**: `MachineTest.degradedPerStartConfigAllowsExistingStoreToBoot` has been compile- and lint-checked only and still needs on-device execution.
+- **Source**: 12ac97cf, f7d164db

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/fileio"`
 >
-> Last distilled: 2026-11-26 (HEAD = 3ad68857)
+> Last distilled: 2026-11-26 (HEAD = e8ac8ebf)
 >
 > Decisions on file data I/O made before kernel/fileio was split from kernel/files (and before kernel/files was split from kernel/vfs) keep their parent tags and live in `.agents/decisions/kernel/files.md` (D3, D4 and the truncate-through-fd-link half of D2) and `.agents/decisions/kernel/vfs.md` (D11, D22, D24, D29, D33, D45, the `write_sync` half of D17, the write-path half of D41 and the file I/O halves of D36 and D37).
 
@@ -135,6 +135,14 @@
 - **Tradeoffs**: Filesystem-specific checks run after write preparation.
 - **Watch out**: A range beyond the loop device can succeed without host I/O.
 - **Source**: e6495409
+
+### D17: `write_proc` wraps `disable_ipv6` sysctl writes with rtnetlink notifications
+
+- **What**: Snapshot and emit rtnetlink diffs around `pseudo::write` in `write_proc` for `PseudoNode::NetConf(true, _, b"disable_ipv6", _)` nodes, mirroring the existing `memory.max` hook.
+- **Why**: `write_proc` is the single syscall boundary holding `Cx` for `/proc/sys` writes, keeping `pseudo::write` decoupled from netlink sockets.
+- **Tradeoffs**: Adds a targeted match arm in `write_proc` alongside `memory.max`.
+- **Watch out**: Any future direct call to `netdev::conf_write` outside `write_proc` would bypass rtnetlink notifications.
+- **Source**: 8bd3fa4c
 
 ## Superseded
 
