@@ -849,6 +849,64 @@ mod tests {
         }
     }
 
+    /// Dropping a TCP forwarding handle (DNAT rule removed) stops accepting new connections while
+    /// preserving already-established forwarded connections until they close naturally (matching
+    /// Linux 6.1 conntrack NAT semantics).
+    #[test]
+    fn tcp_connection_survives_handle_drop() {
+        let server = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(server, &loopback(0)).unwrap();
+        appine_hal::net::listen(server, 8).unwrap();
+        let held = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(held, &loopback(0)).unwrap();
+        appine_hal::net::listen(held, 8).unwrap();
+        let f = Forwarder::default();
+        let h = f
+            .add(
+                held,
+                Target {
+                    udp: false,
+                    addr: loopback(port(server)),
+                    source: None,
+                },
+            )
+            .unwrap();
+        let c = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        let _ = appine_hal::net::connect(c, &loopback(port(held)));
+        wait(server, POLLIN);
+        let (s, _) = appine_hal::net::accept(server).unwrap();
+        wait(c, POLLOUT);
+
+        // Withdraw forwarding while the TCP connection is established.
+        drop(h);
+        std::thread::sleep(Duration::from_millis(50));
+
+        // The existing connection keeps relaying in both directions.
+        appine_hal::net::sendmsg(c, b"still-alive", &[], &[], 0).unwrap();
+        wait(s, POLLIN);
+        let mut buf = [0u8; 32];
+        assert_eq!(appine_hal::read(s, &mut buf), Ok(11));
+        assert_eq!(&buf[..11], b"still-alive");
+        appine_hal::net::sendmsg(s, b"reply", &[], &[], 0).unwrap();
+        appine_hal::net::close(s);
+        wait(c, POLLIN);
+        assert_eq!(appine_hal::read(c, &mut buf), Ok(5));
+        assert_eq!(&buf[..5], b"reply");
+        wait(c, POLLIN);
+        assert_eq!(appine_hal::read(c, &mut buf), Ok(0));
+
+        // New connections are no longer forwarded.
+        let c2 = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        let _ = appine_hal::net::connect(c2, &loopback(port(held)));
+        let mut p = [(server, POLLIN, 0)];
+        appine_hal::poll(&mut p, Some(Duration::from_millis(200))).unwrap();
+        assert_eq!(p[0].2, 0);
+
+        for fd in [server, held, c, c2] {
+            appine_hal::net::close(fd);
+        }
+    }
+
     /// An outside client (not a loopback address): the forwarded connection binds a 127.254.x.y
     /// address and the client's port and records the client's real address; the record is
     /// removed when the connection ends.

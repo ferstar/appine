@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `NETLINK_GET_STRICT_CHK` header checks and dump filtering, query/attribute validation, `NETLINK_CAP_ACK`/`EXT_ACK` on query/genl errors, single IPv6 `RTM_GETADDR`, and `nlctrl` `GETPOLICY` dumps)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: emit rtnetlink IPv6 address and route notifications on `disable_ipv6` sysctl writes)
 
 ## Responsibilities
 
@@ -60,7 +60,8 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 - `NetlinkSocket::handle` (`route_request`, `generic_request`, `sock_diag_request`,
   `Host::netfilter`); `NetlinkSocket::{subscribed, notify, ngroups, sockaddr}`.
 - Notifications: `rtnl_watched` and `rtnl_notify` (around rtnetlink sends and the changing
-  socket ioctls), `KernelHost::{snapshots, changed_since, configure}`, `Snapshot::{take,
+  socket ioctls), `rtnl_snapshot_ns` and `rtnl_notify_ns` (around `disable_ipv6` sysctl writes in
+  `write_proc`), `KernelHost::{snapshots, changed_since, configure}`, `Snapshot::{take,
   changes}`.
 - Helpers other modules use: `configure_host_link` (`kernel/netns`'s device layer), `message`
   and `attr` (the device layer, namespace routes and `kernel/route`).
@@ -133,7 +134,9 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   before and after the device layer runs it, even when it fails (a request
   can change another namespace: moving a link, a veth's peer); a socket ioctl that may change an
   interface, address or route (`SIOCSIF*`, `SIOCDIFADDR`, `SIOCADDRT`/`SIOCDELRT`) is wrapped the
-  same way.
+  same way, and writes to `/proc/sys/net/ipv6/conf/*/disable_ipv6` wrap `pseudo::write` with
+  `rtnl_snapshot_ns`/`rtnl_notify_ns` on the pinned namespace (emitting `seq=0, port=0` IPv6
+  address and route notifications when subscribed).
 - The difference becomes messages in Linux's order: new or changed links (`RTM_NEWLINK`,
   statistics ignored), addresses gone and new, routes gone and new (an address with the same
   family, prefix length, interface and addresses, or a route with the same family, destination
@@ -221,6 +224,8 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 - `kernel/net`: the socket syscalls dispatch netlink sockets here (creation, names, options,
   send, recv, readiness), and its ioctl path runs the changing ioctls between `rtnl_watched` and
   `rtnl_notify`.
+- `kernel/fileio`: `write_proc` wraps `disable_ipv6` sysctl writes between `rtnl_snapshot_ns` and
+  `rtnl_notify_ns`.
 - `kernel/netns`: the device layer calls `configure_host_link` and builds netlink messages with
   `message` and `attr`; `kernel/nft` uses the same encoding for ruleset replies.
 - `kernel/route`: `route.rs` encodes route messages with `message` and `attr`.
@@ -251,8 +256,8 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 
 - **Only rtnetlink link, address and route changes are notified:** groups other than rtnetlink's
   link, address and route ones (neighbours, rules, netconf, nsid, other protocols) never receive
-  anything; changes made through sysctls (`disable_ipv6`) or to the host's own interfaces (boot
-  namespace) are not notified.
+  anything; changes to the host's own interfaces (boot namespace) or netconf-only sysctls are not
+  notified.
 
 ## Open questions
 

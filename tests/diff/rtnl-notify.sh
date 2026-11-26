@@ -237,9 +237,10 @@ int main(void)
     }
     // A device that is up, set up before listening (linkwatch, and IPv6 without DAD)
     system("echo 0 > /proc/sys/net/ipv6/conf/default/accept_dad; ip link set lo up; "
-           "ip link add d0 type dummy; ip link set d0 up");
+           "ip link add d0 type dummy; ip link set d0 address 02:00:00:00:00:10; ip link set d0 up");
     sleep(1);
     int fd = sub(ALL);
+    int v6 = sub(RTMGRP_IPV6_IFADDR | RTMGRP_IPV6_ROUTE);
     int links = sub(RTMGRP_LINK);
     int none = sub(0);
     step(fd, "ip addr add 10.9.0.1/24 dev d0");
@@ -262,6 +263,19 @@ int main(void)
     printf("socket in the link group: %d others\n", count(links, 1));
     printf("socket in no group: %d notifications\n", count(none, 0));
     close(fd);
+
+    // disable_ipv6 sysctl notifications (IPv6 addr/route groups; RMTGRP_LINK omitted because
+    // Appine does not emit IFLA_AF_SPEC link notifications).
+    while (one(v6, 100, 0) > 0)
+        ;
+    step(v6, "ip -6 addr add fd02::1/64 dev d0");
+    step(v6, "echo 1 > /proc/sys/net/ipv6/conf/d0/disable_ipv6");
+    step(v6, "echo 0 > /proc/sys/net/ipv6/conf/d0/disable_ipv6");
+    step(v6, "echo 1 > /proc/sys/net/ipv6/conf/lo/disable_ipv6");
+    step(v6, "echo 0 > /proc/sys/net/ipv6/conf/lo/disable_ipv6");
+    step(v6, "echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6");
+    step(v6, "echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6");
+    close(v6);
 
     // Overflow: 1100 addresses (one RTM_NEWADDR each) without reading
     int lossy = sub(RTMGRP_IPV4_IFADDR), quiet = sub(RTMGRP_IPV4_IFADDR), one_ = 1;

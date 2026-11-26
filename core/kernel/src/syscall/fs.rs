@@ -5613,15 +5613,25 @@ fn write_proc(
         };
         (node.clone(), opener.clone(), offset.unwrap_or(f.pos))
     };
+    let rtnl_before = match &node {
+        PseudoNode::NetConf(true, _, b"disable_ipv6", net) => {
+            super::net::rtnl_snapshot_ns(cx, &net.0).map(|snap| (net.0.clone(), snap))
+        }
+        _ => None,
+    };
     let (tid, cred, ns, pid_ns) = (cx.tid(), cx.cred(), cx.ns(), cx.pid_ns());
-    let (written, next) = pseudo::write(
+    let res = pseudo::write(
         cx.k(),
         (tid, &cred, &opener),
         (&ns, &pid_ns),
         &node,
         data,
         (pos, count),
-    )?;
+    );
+    if let Some((net_ns, before)) = rtnl_before {
+        super::net::rtnl_notify_ns(cx, net_ns, before);
+    }
+    let (written, next) = res?;
     {
         let mut f = file.borrow_mut();
         if offset.is_none() {

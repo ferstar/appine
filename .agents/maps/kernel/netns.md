@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/netns.md` for the paired decision history, including pre-split decisions for kernel/nft.
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across namespace lifetime, address and port translation, device configuration, filtering and forwarding)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: closed the DNAT-removal connection teardown open question with Linux 6.1 conntrack rationale)
 
 ## Responsibilities
 
@@ -292,7 +294,9 @@ sockets (`hal`).
   sockets cache the resolved real client address in `track.outside_peer` so getpeername and
   `/proc/net/tcp` preserve it across `CLOSE_WAIT` until the guest socket closes.
 - On rule changes, non-deferred handles are updated in place via `Handle::update(Option<Target>)`:
-  established forwarded TCP connections stay, and existing UDP relays of that port stay alive to
+  established forwarded TCP connections survive DNAT rule removal (matching Linux 6.1 conntrack,
+  where `PREROUTING` NAT runs only on `IP_CT_NEW`, so firewall reloads do not reset active
+  sessions), and existing UDP relays of that port stay alive to
   deliver in-flight replies until idle expiry (120 s), hard socket error, or guest socket close;
   pausing a UDP handle (`None`) stops polling `port_fd` for `POLLIN` so new datagrams go to the
   guest, while closing the guest socket (`Handle::drop`) tears down its UDP relays. Ordinary
@@ -347,7 +351,7 @@ sockets (`hal`).
 
 ## Open questions
 
-- Should forwarded connections be torn down when the DNAT rule disappears?
+None.
 
 ## To verify
 

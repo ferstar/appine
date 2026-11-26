@@ -4392,6 +4392,39 @@ fn rtnl_notify(k: &mut crate::kernel::Kernel, notes: Vec<RtnlNotes>, sender: Opt
     }
 }
 
+/// Snapshots `ns` before an out-of-band state change (such as writing `disable_ipv6`) when at
+/// least one `NETLINK_ROUTE` socket in `ns` is subscribed to rtnetlink notifications.
+pub(super) fn rtnl_snapshot_ns(
+    cx: &Cx<'_>,
+    ns: &Rc<crate::nsproxy::NetNs>,
+) -> Option<crate::net::Snapshot> {
+    if !rtnl_watched(cx.kr(), None)
+        .iter()
+        .any(|w| Rc::ptr_eq(w, ns))
+    {
+        return None;
+    }
+    let host = KernelHost::of(cx, None);
+    Some(crate::net::Snapshot::take(&host.at(ns)))
+}
+
+/// Emits rtnetlink notifications (`seq = 0, port = 0`) for link, address and route changes in `ns`
+/// since `before`.
+pub(super) fn rtnl_notify_ns(
+    cx: &mut Cx<'_>,
+    ns: Rc<crate::nsproxy::NetNs>,
+    before: crate::net::Snapshot,
+) {
+    let changes = {
+        let host = KernelHost::of(cx, None);
+        let after = crate::net::Snapshot::take(&host.at(&ns));
+        after.changes(&before, crate::net::NotifyCause::default())
+    };
+    if !changes.is_empty() {
+        rtnl_notify(cx.k(), vec![(ns, changes)], None);
+    }
+}
+
 /// A namespace and the notifications for what a request changed in it.
 type RtnlNotes = (Rc<crate::nsproxy::NetNs>, Vec<crate::net::RtnlNote>);
 
