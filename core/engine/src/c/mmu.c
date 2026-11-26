@@ -296,13 +296,13 @@ int appine_mmu_prepare_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
     if (len == 0)
         return APPINE_OK;
     uint64_t end = gva + len;
-    if ((gva & MMU_SUPER_MASK) || leaf_end(gva, end) - gva != LEAF_SPAN) {
+    if ((gva & MMU_SUPER_MASK) || len < LEAF_SPAN) {
         int rc = prepare_unmap_boundary(mmu, gva);
         if (rc != APPINE_OK)
             return rc;
     }
     uint64_t last_leaf = (end - 1) & ~(uint64_t)MMU_SUPER_MASK;
-    if (last_leaf != (gva & ~(uint64_t)MMU_SUPER_MASK) && (end & MMU_SUPER_MASK))
+    if (last_leaf > gva && (end & MMU_SUPER_MASK))
         return prepare_unmap_boundary(mmu, last_leaf);
     return APPINE_OK;
 }

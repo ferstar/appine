@@ -4627,21 +4627,32 @@ thread_local! {
     static UNMAP_PREPARE_FAIL: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(test)]
+fn check_map_failpoint(countdown: &Cell<usize>) -> Result<(), MapError> {
+    if countdown.replace(countdown.get().saturating_sub(1)) == 1 {
+        return Err(MapError::OutOfMemory);
+    }
+    Ok(())
+}
+
 #[inline]
 fn mmu_prepare_unmap(mmu: &mut Mmu, gva: u64, len: u64) -> Result<(), MapError> {
     #[cfg(test)]
-    if UNMAP_PREPARE_FAIL.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
-        return Err(MapError::OutOfMemory);
-    }
+    UNMAP_PREPARE_FAIL.with(check_map_failpoint)?;
     mmu.prepare_unmap(gva, len)
 }
 
-/// Best-effort unmap for paths that still clip or invalidate backing on allocation failure:
-/// expire page watches even on `ENOMEM` so pipe readers fall back to their snapshot.
+#[inline]
+fn mmu_unmap(mmu: &mut Mmu, gva: u64, len: u64) -> Result<(), MapError> {
+    #[cfg(test)]
+    UNMAP_PREPARE_FAIL.with(check_map_failpoint)?;
+    mmu.unmap(gva, len)
+}
+
+/// Truncation and FUSE invalidation change the backing even on unmap failure.
+/// Expire page watches so pipe readers fall back to their snapshots.
 fn unmap_or_expire_watches(mmu: &mut Mmu, gva: u64, len: u64) {
-    if mmu_prepare_unmap(mmu, gva, len).is_ok() {
-        mmu.unmap(gva, len).expect("pre-demoted unmap range");
-    } else {
+    if mmu_unmap(mmu, gva, len).is_err() {
         mmu.invalidate_page_watches(gva..gva + len);
     }
 }
@@ -4754,13 +4765,9 @@ impl Mm {
                     if v.fill.is_none()
                         && let Some(t) = &v.pages
                     {
-                        let len = in_file - cursor;
-                        if let Err(e) = mmu_prepare_unmap(&mut self.mmu, cursor, len) {
+                        if let Err(e) = mmu_unmap(&mut self.mmu, cursor, in_file - cursor) {
                             return (rereads, Err(map_err(e)));
                         }
-                        self.mmu
-                            .unmap(cursor, len)
-                            .expect("pre-demoted discard range");
                         let lo = v.offset() + cursor - s;
                         let hi = v.offset() + in_file - s;
                         let grain = t.page_size();
@@ -5296,21 +5303,18 @@ impl Mm {
         }
         let end = addr + len;
         // As on Linux, max_map_count applies only when one VMA is split into three
-        let inside = |a: u64| {
-            self.vmas
-                .range(..a)
-                .next_back()
-                .filter(|(s, v)| **s + v.len > a)
-        };
-        if let (Some((s1, _)), Some((s2, _))) = (inside(addr), inside(end))
-            && s1 == s2
-        {
+        let head = self
+            .vmas
+            .range(..addr)
+            .next_back()
+            .filter(|(s, v)| **s + v.len > addr);
+        if head.is_some_and(|(&s, v)| end < s + v.len) {
             self.room_for(1)?;
         }
         // Adjacent VMA pieces can share an L2 superpage. Only the boundaries of a
         // contiguous mapped span can require demotion, regardless of the VMA splits.
         let mut unmap_ranges: Vec<(u64, u64)> = Vec::new();
-        for (&s, v) in inside(addr).into_iter().chain(self.vmas.range(addr..end)) {
+        for (&s, v) in head.into_iter().chain(self.vmas.range(addr..end)) {
             let lo = addr.max(s);
             let hi = end.min(s + v.len);
             if let Some((_, prev_end)) = unmap_ranges.last_mut()
@@ -7490,9 +7494,7 @@ unsafe fn cow_map_shared(
     prot: u32,
 ) -> Result<(), MapError> {
     #[cfg(test)]
-    if COW_MAP_FAIL.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
-        return Err(MapError::OutOfMemory);
-    }
+    COW_MAP_FAIL.with(check_map_failpoint)?;
     unsafe { mmu.map_shared(gva, host, len, prot) }
 }
 
@@ -10862,22 +10864,29 @@ mod tests {
         mm.borrow().mmu().translate(addr, prot::WRITE).is_some()
     }
 
-    fn with_unmap_prepare_failure<T>(nth: usize, f: impl FnOnce() -> T) -> T {
-        struct Reset(usize);
-        impl Drop for Reset {
+    /// Fail the nth operation and restore the previous countdown even on unwind.
+    fn with_failpoint<T>(countdown: &Cell<usize>, nth: usize, f: impl FnOnce() -> T) -> T {
+        struct Reset<'a> {
+            countdown: &'a Cell<usize>,
+            previous: usize,
+        }
+        impl Drop for Reset<'_> {
             fn drop(&mut self) {
-                UNMAP_PREPARE_FAIL.set(self.0);
+                self.countdown.set(self.previous);
             }
         }
         assert!(nth > 0);
-        let _guard = Reset(UNMAP_PREPARE_FAIL.replace(nth));
+        let _guard = Reset {
+            countdown,
+            previous: countdown.replace(nth),
+        };
         let result = f();
-        assert_eq!(
-            UNMAP_PREPARE_FAIL.get(),
-            0,
-            "unmap preparation failpoint was not reached"
-        );
+        assert_eq!(countdown.get(), 0, "failpoint was not reached");
         result
+    }
+
+    fn with_unmap_prepare_failure<T>(nth: usize, f: impl FnOnce() -> T) -> T {
+        UNMAP_PREPARE_FAIL.with(|countdown| with_failpoint(countdown, nth, f))
     }
 
     #[test]
@@ -11101,19 +11110,8 @@ mod tests {
         assert!(!stale_fill_watch.is_current());
     }
 
-    /// Fail exactly the nth CoW map on this thread, restoring the hook even on unwind.
     fn with_cow_map_failure<T>(nth: usize, f: impl FnOnce() -> T) -> T {
-        struct Reset(usize);
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                COW_MAP_FAIL.set(self.0);
-            }
-        }
-        assert!(nth > 0);
-        let _guard = Reset(COW_MAP_FAIL.replace(nth));
-        let result = f();
-        assert_eq!(COW_MAP_FAIL.get(), 0, "CoW map failpoint was not reached");
-        result
+        COW_MAP_FAIL.with(|countdown| with_failpoint(countdown, nth, f))
     }
 
     #[test]
