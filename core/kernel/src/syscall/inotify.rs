@@ -41,6 +41,7 @@ use crate::cred::MAY_READ;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Kernel, request_wake_object, wake};
+use crate::pseudo::PseudoNode;
 use crate::vfs::browse::Change;
 use crate::vfs::store::Ino;
 use crate::vfs::{Node, overlay};
@@ -105,8 +106,8 @@ impl Watch {
             | (Node::Overlay(_, a), Node::Overlay(_, b))
             | (Node::Fuse(_, a), Node::Fuse(_, b)) => a == b,
             (
-                Node::Pseudo(_, crate::pseudo::PseudoNode::NsFile(_, a)),
-                Node::Pseudo(_, crate::pseudo::PseudoNode::NsFile(_, b)),
+                Node::Pseudo(_, PseudoNode::NsFile(_, a)),
+                Node::Pseudo(_, PseudoNode::NsFile(_, b)),
             ) => a == b && self.sdev == other.sdev && self.ns_instance == other.ns_instance,
             (Node::Pseudo(_, a), Node::Pseudo(_, b)) => a == b && self.sdev == other.sdev,
             _ => false,
@@ -346,7 +347,7 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     // Magic links to unlinked regular files, memfds, or deleted executables resolve to the
     // underlying inode so watches on `/proc/<pid>/fd/<n>` or `/proc/<pid>/exe` receive events.
     let node = match &node {
-        Node::Pseudo(_, crate::pseudo::PseudoNode::OpenFd(proc, tid, fd)) => {
+        Node::Pseudo(_, PseudoNode::OpenFd(proc, tid, fd)) => {
             let source = view.open_file(*proc, *tid, *fd).ok_or(Errno::ENOENT)?;
             let source = source.borrow();
             if let Some(o) = source.ovl {
@@ -357,7 +358,7 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
                 source.node().unwrap_or(node)
             }
         }
-        Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(proc)) => {
+        Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
             let exe = super::fs::exe_file(cx, *proc)?;
             if let Some(f) = &exe.fuse {
                 Node::Fuse(f.mnt, f.id)
@@ -389,7 +390,7 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
         }
         Node::Pseudo(_, p) => {
             // A namespace file belongs to nsfs even when reached through procfs.
-            let dev = if matches!(p, crate::pseudo::PseudoNode::NsFile(..)) {
+            let dev = if matches!(p, PseudoNode::NsFile(..)) {
                 crate::vfs::Fs::Nsfs.dev()
             } else {
                 vfs.dev_of(&node)
@@ -404,18 +405,16 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     };
     // A cgroup2 file, or a cgroup's directory, starts being looked at for changes
     match &node {
-        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b"", 0)) => {
+        Node::Pseudo(_, PseudoNode::Cgroup(id, b"", 0)) => {
             crate::cgroup::observe_all(cx.k(), *id);
         }
-        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, name, _)) => {
+        Node::Pseudo(_, PseudoNode::Cgroup(id, name, _)) => {
             crate::cgroup::observe(cx.k(), *id, name);
         }
         _ => {}
     }
     let ns_instance = match &node {
-        Node::Pseudo(_, crate::pseudo::PseudoNode::NsFile(_, id)) => {
-            cx.kr().inotify.borrow_mut().ns_instance(*id)
-        }
+        Node::Pseudo(_, PseudoNode::NsFile(_, id)) => cx.kr().inotify.borrow_mut().ns_instance(*id),
         _ => 0,
     };
     let watch = Watch {
@@ -578,13 +577,17 @@ impl Default for Registry {
 }
 
 impl Registry {
+    fn alloc_ns_instance(&mut self) -> u64 {
+        self.next_ns_instance += 1;
+        self.next_ns_instance
+    }
+
     fn pin_ns(registry: &Rc<RefCell<Registry>>, ns_id: u64) -> NsPin {
         let mut r = registry.borrow_mut();
         if let Some(existing) = r.ns_stashed.get(&ns_id).and_then(Weak::upgrade) {
             return NsPin(existing);
         }
-        r.next_ns_instance += 1;
-        let instance = r.next_ns_instance;
+        let instance = r.alloc_ns_instance();
         let inner = Rc::new(NsPinInner {
             registry: Rc::downgrade(registry),
             ns_id,
@@ -595,13 +598,12 @@ impl Registry {
     }
 
     fn ns_instance(&mut self, ns_id: u64) -> u64 {
-        if let Some(existing) = self.ns_stashed.get(&ns_id).and_then(Weak::upgrade) {
-            existing.instance
-        } else {
-            self.next_ns_instance += 1;
-            self.next_ns_instance
-        }
+        self.ns_stashed
+            .get(&ns_id)
+            .and_then(Weak::upgrade)
+            .map_or_else(|| self.alloc_ns_instance(), |existing| existing.instance)
     }
+
     fn opens_of(&self, ino: Ino) -> impl Iterator<Item = Rc<OpenRecord>> + '_ {
         self.opened
             .range((ino, 0)..=(ino, usize::MAX))
@@ -839,9 +841,7 @@ pub(crate) fn key_of(node: &Node) -> Option<Ino> {
         Node::Overlay(_, o) => Some(overlay::key(*o)),
         Node::Fuse(_, f) => Some(crate::vfs::fuse::key(*f)),
         // cgroup2 files report the changes Linux notifies (crate::cgroup::notify_changes)
-        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, name, _)) => {
-            Some(crate::cgroup::key(*id, name))
-        }
+        Node::Pseudo(_, PseudoNode::Cgroup(id, name, _)) => Some(crate::cgroup::key(*id, name)),
         Node::Pseudo(..) => None,
     }
 }
@@ -975,7 +975,7 @@ fn file_key(f: &OpenFile) -> Option<(Ino, u32)> {
         FileKind::Fuse(h) => Some((crate::vfs::fuse::key(h.id), 0)),
         FileKind::FuseSnapshot(s) => Some((crate::vfs::fuse::key(s.id), 0)),
         FileKind::Proc {
-            node: crate::pseudo::PseudoNode::Cgroup(id, name, _),
+            node: PseudoNode::Cgroup(id, name, _),
             ..
         } if !name.is_empty() => Some((crate::cgroup::key(*id, name), 0)),
         _ => None,
@@ -1004,7 +1004,7 @@ pub(crate) fn opened(
     let (ino, dir) = file_key(f)?;
     let parent = parent.or_else(|| match &f.kind {
         FileKind::Proc {
-            node: crate::pseudo::PseudoNode::Cgroup(id, name, _),
+            node: PseudoNode::Cgroup(id, name, _),
             ..
         } if !name.is_empty() => Some((crate::cgroup::key(*id, b""), name.to_vec())),
         _ => None,
@@ -1538,7 +1538,7 @@ mod tests {
 
     #[test]
     fn nsfs_watch_identity_follows_stashed_pin_lifetime() {
-        use crate::pseudo::{NsKind, PseudoNode};
+        use crate::pseudo::NsKind;
 
         let registry = Rc::new(RefCell::new(Registry::default()));
         let make_watch = |kind: NsKind, ns_id: u64| Watch {

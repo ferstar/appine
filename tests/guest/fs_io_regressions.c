@@ -2507,12 +2507,13 @@ static void test_inotify_nsfs_watch_lifetime(void)
     char fipath[64], fibuf[2048];
     snprintf(fipath, sizeof fipath, "/proc/self/fdinfo/%d", ifd);
     read_proc_str(fipath, fibuf, sizeof fibuf);
-    char want1[32], want2[32], want3[32];
-    snprintf(want1, sizeof want1, "inotify wd:%x ", wd1);
-    snprintf(want2, sizeof want2, "inotify wd:%x ", wd2);
-    snprintf(want3, sizeof want3, "inotify wd:%x ", wd3);
-    CHECK(strstr(fibuf, want1) && strstr(fibuf, want2) && strstr(fibuf, want3),
-          "fdinfo missing unpinned nsfs wds:\n%s", fibuf);
+    int wds[3] = {wd1, wd2, wd3};
+    for (int i = 0; i < 3; i++) {
+        char want[32];
+        snprintf(want, sizeof want, "inotify wd:%x ", wds[i]);
+        CHECK(strstr(fibuf, want) != NULL, "fdinfo missing unpinned nsfs wd %d:\n%s", wds[i],
+              fibuf);
+    }
 
     CHECK(inotify_rm_watch(ifd, wd1) == 0, "rm unpinned wd1");
     size_t n = read_inotify_events(ifd, evs, 16);

@@ -438,7 +438,6 @@ struct zombie_net_args {
     int ready_fd;
     int done_fd;
     int sock_fd;
-    int go_fd;
 };
 
 static void *zombie_net_worker(void *arg)
@@ -479,7 +478,6 @@ static void test_proc_pid_net_zombie_leader(void)
         args.ready_fd = ready[1];
         args.done_fd = done[0];
         args.sock_fd = s;
-        args.go_fd = go[0];
         pthread_t th;
         CHECK(pthread_create(&th, NULL, zombie_net_worker, &args) == 0, "pthread_create");
         pthread_detach(th);
@@ -1838,28 +1836,37 @@ static void test_procfs_sysfs_abi_fixes(void)
     unsigned maj = (unsigned)((st.st_dev >> 8) & 0xfff);
     unsigned min = (unsigned)((st.st_dev & 0xff) | ((st.st_dev >> 12) & 0xfff00));
     CHECK(maj == 8 && min == 1, "expected rootfs dev 8:1, got %u:%u", maj, min);
+    static const struct {
+        const char *path;
+        const char *want;
+    } sys_links[] = {
+        {"/sys/dev/block/8:1", "../../block/sda/sda1"},
+        {"/sys/dev/block/8:0", "../../block/sda"},
+    };
     char link[128];
-    ssize_t ln = readlink("/sys/dev/block/8:1", link, sizeof(link) - 1);
-    CHECK(ln > 0, "readlink /sys/dev/block/8:1");
-    link[ln] = '\0';
-    CHECK(strcmp(link, "../../block/sda/sda1") == 0, "unexpected 8:1 link: %s", link);
-    ln = readlink("/sys/dev/block/8:0", link, sizeof(link) - 1);
-    CHECK(ln > 0, "readlink /sys/dev/block/8:0");
-    link[ln] = '\0';
-    CHECK(strcmp(link, "../../block/sda") == 0, "unexpected 8:0 link: %s", link);
+    for (size_t i = 0; i < sizeof(sys_links) / sizeof(sys_links[0]); i++) {
+        ssize_t ln = readlink(sys_links[i].path, link, sizeof(link) - 1);
+        CHECK(ln > 0, "readlink %s", sys_links[i].path);
+        link[ln] = '\0';
+        CHECK(strcmp(link, sys_links[i].want) == 0, "unexpected %s link: %s", sys_links[i].path,
+              link);
+    }
 
-    read_str("/sys/dev/block/8:1/uevent", buf, sizeof(buf));
-    CHECK(strcmp(buf, "MAJOR=8\nMINOR=1\nDEVNAME=sda1\nDEVTYPE=partition\nPARTN=1\n") == 0,
-          "unexpected 8:1 uevent: %s", buf);
-    read_str("/sys/dev/block/8:0/uevent", buf, sizeof(buf));
-    CHECK(strcmp(buf, "MAJOR=8\nMINOR=0\nDEVNAME=sda\nDEVTYPE=disk\n") == 0,
-          "unexpected 8:0 uevent: %s", buf);
-    read_str("/sys/dev/block/8:1/dev", buf, sizeof(buf));
-    CHECK(strcmp(buf, "8:1\n") == 0, "unexpected 8:1 dev: %s", buf);
-    read_str("/sys/dev/block/8:1/partition", buf, sizeof(buf));
-    CHECK(strcmp(buf, "1\n") == 0, "unexpected 8:1 partition: %s", buf);
-    read_str("/sys/dev/block/8:1/../queue/logical_block_size", buf, sizeof(buf));
-    CHECK(strcmp(buf, "512\n") == 0, "unexpected sda logical_block_size: %s", buf);
+    static const struct {
+        const char *path;
+        const char *want;
+    } sys_files[] = {
+        {"/sys/dev/block/8:1/uevent",
+         "MAJOR=8\nMINOR=1\nDEVNAME=sda1\nDEVTYPE=partition\nPARTN=1\n"},
+        {"/sys/dev/block/8:0/uevent", "MAJOR=8\nMINOR=0\nDEVNAME=sda\nDEVTYPE=disk\n"},
+        {"/sys/dev/block/8:1/dev", "8:1\n"},
+        {"/sys/dev/block/8:1/partition", "1\n"},
+        {"/sys/dev/block/8:1/../queue/logical_block_size", "512\n"},
+    };
+    for (size_t i = 0; i < sizeof(sys_files) / sizeof(sys_files[0]); i++) {
+        read_str(sys_files[i].path, buf, sizeof(buf));
+        CHECK(strcmp(buf, sys_files[i].want) == 0, "unexpected %s: %s", sys_files[i].path, buf);
+    }
 }
 
 int main(int argc, char **argv, char **envp)

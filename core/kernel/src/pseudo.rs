@@ -897,9 +897,10 @@ macro_rules! pinned_ns {
 }
 
 pinned_ns!(
-    /// A network namespace pinned on a `/proc/sys/net/*` node at lookup time (Linux's
-    /// `sysctl_table_root::lookup`), so an open descriptor keeps reading and writing that namespace
-    /// even after the process changes network namespaces or passes the fd across namespaces.
+    /// A network namespace pinned on a `/proc/sys/net/*` or `/proc/<pid>/net/*` node at lookup
+    /// time (Linux's `sysctl_table_root::lookup` / `get_proc_task_net`), so an open descriptor
+    /// keeps reading and writing that namespace even after the process changes network namespaces,
+    /// exits, or passes the fd across namespaces.
     PinnedNet(crate::nsproxy::NetNs)
 );
 
@@ -996,9 +997,8 @@ pub(crate) enum PseudoNode {
     /// `/proc/<pid>/<entry>` (including those in the task subdirectories).
     Entry(ProcId, Option<Tid>, Entry),
     /// `/proc/<pid>/net/<name>` (including those in the task subdirectories), with names from
-    /// [`PROC_NET`].
-    /// A file under `/proc/<pid>/net` (names from [`PROC_NET`]), pinned to the named task's
-    /// network namespace at lookup time (Linux's `get_proc_task_net` / `seq_open_net`).
+    /// [`PROC_NET`], pinned to the named task's network namespace at lookup time (Linux's
+    /// `get_proc_task_net` / `seq_open_net`).
     Net(ProcId, Option<Tid>, &'static [u8], PinnedNet),
     /// `/proc/<pid>/fd/<n>` (or `/proc/<pid>/task/<tid>/fd/<n>`).
     Fd(ProcId, Option<Tid>, i32),
@@ -1536,8 +1536,7 @@ impl Pseudo for View<'_> {
                         let major = u32::try_from(parse_num(&name[..colon])?).ok()?;
                         let minor = u32::try_from(parse_num(&name[colon + 1..])?).ok()?;
                         let exists = (major == LOOP_MAJOR && self.k.loops.sysfs_exists(minor, b""))
-                            || (major == ROOT_BLOCK_DEV.0
-                                && (minor == 0 || minor == ROOT_BLOCK_DEV.1));
+                            || root_dev_block_target(major, minor).is_some();
                         return exists.then_some(SysDevBlock(major, minor));
                     }
                     let n = name.strip_prefix(b"cpu").and_then(parse_num)?;
@@ -1723,13 +1722,16 @@ impl Pseudo for View<'_> {
                 let exe = g.borrow().exe.clone().ok_or(Errno::ENOENT)?;
                 let path = exe.path.to_vec();
                 if let Some(f) = &exe.fuse {
-                    return Ok(if self.vfs.fuse().get(f.id).is_some() {
-                        self.vfs
-                            .path_of(self, &self.root(), &Node::Fuse(f.mnt, f.id))
-                            .unwrap_or_else(|_| with_deleted(path))
-                    } else {
-                        with_deleted(path)
-                    });
+                    return Ok(self
+                        .vfs
+                        .fuse()
+                        .get(f.id)
+                        .and_then(|_| {
+                            self.vfs
+                                .path_of(self, &self.root(), &Node::Fuse(f.mnt, f.id))
+                                .ok()
+                        })
+                        .unwrap_or_else(|| with_deleted(path)));
                 }
                 Ok(match (exe.node, &exe.ovl) {
                     (Some((_, ino)), _) => mark_deleted(self.vfs.store(), ino, path),
@@ -1775,16 +1777,15 @@ impl Pseudo for View<'_> {
             }
             SysDevBlock(major, minor) => {
                 if *major == LOOP_MAJOR {
-                    if !self.k.loops.sysfs_exists(*minor, b"") {
-                        return Err(Errno::ENOENT);
-                    }
-                    Ok(format!("../../block/loop{minor}").into_bytes())
-                } else if *major == ROOT_BLOCK_DEV.0 && *minor == 0 {
-                    Ok(b"../../block/sda".to_vec())
-                } else if *major == ROOT_BLOCK_DEV.0 && *minor == ROOT_BLOCK_DEV.1 {
-                    Ok(b"../../block/sda/sda1".to_vec())
+                    self.k
+                        .loops
+                        .sysfs_exists(*minor, b"")
+                        .then(|| format!("../../block/loop{minor}").into_bytes())
+                        .ok_or(Errno::ENOENT)
                 } else {
-                    Err(Errno::ENOENT)
+                    root_dev_block_target(*major, *minor)
+                        .map(<[u8]>::to_vec)
+                        .ok_or(Errno::ENOENT)
                 }
             }
             _ => Err(Errno::EINVAL),
@@ -1887,23 +1888,26 @@ impl Pseudo for View<'_> {
                 let Some(exe) = exe.filter(|_| self.task(*proc, *tid).is_some()) else {
                     return Some(Err(Errno::ENOENT));
                 };
-                // A deleted overlay executable keeps both its overlay identity and its host file.
+                let deleted_exe = || {
+                    exe.host
+                        .as_ref()
+                        .map(|_| Node::Pseudo(mnt, PseudoNode::OpenExe(*proc)))
+                        .ok_or(Errno::ENOENT)
+                };
+                // A deleted overlay or FUSE executable keeps its identity and falls back to its
+                // pinned host file.
                 if let Some((m, o, _)) = &exe.ovl {
                     return Some(if self.vfs.overlay().linked(*o) {
                         Ok(Node::Overlay(*m, *o))
-                    } else if exe.host.is_some() {
-                        Ok(Node::Pseudo(mnt, PseudoNode::OpenExe(*proc)))
                     } else {
-                        Err(Errno::ENOENT)
+                        deleted_exe()
                     });
                 }
                 if let Some(f) = &exe.fuse {
                     return Some(if self.vfs.fuse().get(f.id).is_some_and(|n| !n.unlinked) {
                         Ok(Node::Fuse(f.mnt, f.id))
-                    } else if exe.host.is_some() {
-                        Ok(Node::Pseudo(mnt, PseudoNode::OpenExe(*proc)))
                     } else {
-                        Err(Errno::ENOENT)
+                        deleted_exe()
                     });
                 }
                 let (m, ino) = exe.node?;
@@ -2888,10 +2892,14 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         // Those of the network namespace that process is in: the interfaces are the host's (lo in
         // a new one) plus virtual devices (crate::netdev), and only sockets created in it are
         // listed; in a new one the traffic and protocol counters are all 0 (crate::netns)
-        Net(_, _, name, net) => {
-            let full = net.0.clone();
-            let net = Some(full.clone()).filter(|n| n.host_net.is_some());
-            let id = net.as_ref().map_or(crate::nsproxy::INIT_NET_NS, |n| n.id);
+        Net(_, _, name, pinned) => {
+            let net = &pinned.0;
+            let is_init = net.host_net.is_none();
+            let id = if is_init {
+                crate::nsproxy::INIT_NET_NS
+            } else {
+                net.id
+            };
             // The uid column is translated through the reader's user namespace (Linux's
             // seq_user_ns)
             let reader = ps.reader();
@@ -2908,26 +2916,26 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     Some((s, uid))
                 })
                 .collect();
-            let ifaces = crate::netdev::interfaces(&full);
+            let ifaces = crate::netdev::interfaces(net);
             let world = ps.k.world();
             let quiet = crate::traffic::Protocols::default();
-            let protocols = if net.is_some() {
-                &quiet
-            } else {
+            let protocols = if is_init {
                 &ps.k.traffic.protocols
+            } else {
+                &quiet
             };
             let tables = || {
-                let host = net.is_none().then(|| crate::route::host_routes(ps.k)).flatten();
-                crate::netdev::tables(&full, host)
+                let host = is_init.then(|| crate::route::host_routes(ps.k)).flatten();
+                crate::netdev::tables(net, host)
             };
             match &name[..] {
                 b"arp" => crate::net::PROC_ARP.to_owned(),
-                b"dev" => net_dev(ps.k, &ifaces, net.is_none()),
+                b"dev" => net_dev(ps.k, &ifaces, is_init),
                 b"netstat" => crate::net::proc_netstat(protocols),
                 b"snmp" => {
                     let mut s = crate::net::proc_snmp(&socks, protocols);
                     // RFC 1213 ipForwarding: 1 when ip_forward is enabled in this netns, 2 when off
-                    if crate::netdev::ip_forward(&full) != 0
+                    if crate::netdev::ip_forward(net) != 0
                         && let Some(pos) = s.find("\nIp: 2 ")
                     {
                         s.replace_range(pos + 5..pos + 6, "1");
@@ -4650,9 +4658,21 @@ fn net_if_inet6(ifaces: &[appine_hal::net::Interface]) -> String {
 
 // ---- sysfs ----
 
+/// Relative `/sys/dev/block/<major>:<minor>` symlink target for the rootfs backing device.
+fn root_dev_block_target(major: u32, minor: u32) -> Option<&'static [u8]> {
+    match (major, minor) {
+        (m, 0) if m == ROOT_BLOCK_DEV.0 => Some(b"../../block/sda"),
+        d if d == ROOT_BLOCK_DEV => Some(b"../../block/sda/sda1"),
+        _ => None,
+    }
+}
+
 /// The files under `/sys/block/sda` (`8:0`) and `/sys/block/sda/sda1` (`8:1`), the synthetic
 /// backing block device corresponding to the root filesystem's device number ([`ROOT_DEV`]).
 fn root_block_file(vfs: &Vfs, path: &[u8]) -> Result<String, Errno> {
+    let Some(rel) = path.strip_prefix(b"block/sda/") else {
+        return Err(Errno::EISDIR);
+    };
     let (major, minor) = ROOT_BLOCK_DEV;
     let part_sectors = || {
         vfs.store()
@@ -4660,27 +4680,23 @@ fn root_block_file(vfs: &Vfs, path: &[u8]) -> Result<String, Errno> {
             .map(|s| s.blocks.saturating_mul(s.block_size) >> 9)
             .unwrap_or(0)
     };
-    Ok(match path {
-        b"block/sda/dev" => format!("{major}:0\n"),
-        b"block/sda/removable" | b"block/sda/ro" | b"block/sda/sda1/ro" => "0\n".to_owned(),
-        b"block/sda/size" => format!("{}\n", part_sectors().saturating_add(ROOT_PART_START)),
-        b"block/sda/uevent" => format!("MAJOR={major}\nMINOR=0\nDEVNAME=sda\nDEVTYPE=disk\n"),
-        b"block/sda/queue/logical_block_size" | b"block/sda/queue/hw_sector_size" => {
-            "512\n".to_owned()
-        }
-        b"block/sda/queue/physical_block_size" | b"block/sda/queue/minimum_io_size" => {
-            "4096\n".to_owned()
-        }
-        b"block/sda/queue/optimal_io_size" | b"block/sda/queue/rotational" => "0\n".to_owned(),
-        b"block/sda/queue/dma_alignment" => "511\n".to_owned(),
-        b"block/sda/queue/read_ahead_kb" => "128\n".to_owned(),
-        b"block/sda/queue/max_sectors_kb" => "1280\n".to_owned(),
-        b"block/sda/queue/rq_affinity" => "1\n".to_owned(),
-        b"block/sda/sda1/dev" => format!("{major}:{minor}\n"),
-        b"block/sda/sda1/partition" => format!("{minor}\n"),
-        b"block/sda/sda1/size" => format!("{}\n", part_sectors()),
-        b"block/sda/sda1/start" => format!("{ROOT_PART_START}\n"),
-        b"block/sda/sda1/uevent" => format!(
+    Ok(match rel {
+        b"dev" => format!("{major}:0\n"),
+        b"removable" | b"ro" | b"sda1/ro" => "0\n".to_owned(),
+        b"size" => format!("{}\n", part_sectors().saturating_add(ROOT_PART_START)),
+        b"uevent" => format!("MAJOR={major}\nMINOR=0\nDEVNAME=sda\nDEVTYPE=disk\n"),
+        b"queue/logical_block_size" | b"queue/hw_sector_size" => "512\n".to_owned(),
+        b"queue/physical_block_size" | b"queue/minimum_io_size" => "4096\n".to_owned(),
+        b"queue/optimal_io_size" | b"queue/rotational" => "0\n".to_owned(),
+        b"queue/dma_alignment" => "511\n".to_owned(),
+        b"queue/read_ahead_kb" => "128\n".to_owned(),
+        b"queue/max_sectors_kb" => "1280\n".to_owned(),
+        b"queue/rq_affinity" => "1\n".to_owned(),
+        b"sda1/dev" => format!("{major}:{minor}\n"),
+        b"sda1/partition" => format!("{minor}\n"),
+        b"sda1/size" => format!("{}\n", part_sectors()),
+        b"sda1/start" => format!("{ROOT_PART_START}\n"),
+        b"sda1/uevent" => format!(
             "MAJOR={major}\nMINOR={minor}\nDEVNAME=sda1\nDEVTYPE=partition\nPARTN={minor}\n"
         ),
         _ => return Err(Errno::EISDIR),
@@ -6632,78 +6648,60 @@ pub(crate) mod tests {
             );
 
             // Root filesystem backing device 8:0 (sda) and 8:1 (sda1).
-            let Node::Pseudo(_, root_disk) = resolve(b"/sys/dev/block/8:0", false).unwrap() else {
-                panic!("expected sysfs");
+            let read_sys = |path: &[u8]| {
+                let Node::Pseudo(mnt, file) = resolve(path, true).unwrap() else {
+                    panic!("expected sysfs: {path:?}");
+                };
+                content(&view, mnt, &file).unwrap()
             };
-            assert_eq!(view.parent(&root_disk).as_ref(), Some(block));
-            assert_eq!(
-                view.readlink(SYS_MOUNT, &root_disk).unwrap(),
-                b"../../block/sda"
-            );
-            let Node::Pseudo(_, root_part) = resolve(b"/sys/dev/block/8:1", false).unwrap() else {
-                panic!("expected sysfs");
-            };
-            assert_eq!(view.parent(&root_part).as_ref(), Some(block));
-            assert_eq!(
-                view.readlink(SYS_MOUNT, &root_part).unwrap(),
-                b"../../block/sda/sda1"
-            );
+            for (path, want_target) in [
+                (
+                    b"/sys/dev/block/8:0".as_slice(),
+                    b"../../block/sda".as_slice(),
+                ),
+                (b"/sys/dev/block/8:1", b"../../block/sda/sda1"),
+            ] {
+                let Node::Pseudo(_, dev_link) = resolve(path, false).unwrap() else {
+                    panic!("expected sysfs: {path:?}");
+                };
+                assert_eq!(view.parent(&dev_link).as_ref(), Some(block));
+                assert_eq!(view.readlink(SYS_MOUNT, &dev_link).unwrap(), want_target);
+            }
             let part_uevent = resolve(b"/sys/block/sda/sda1/uevent", true).unwrap();
             assert_eq!(
                 resolve(b"/sys/dev/block/8:1/uevent", true),
                 Ok(part_uevent.clone())
             );
-            let Node::Pseudo(pmnt, pfile) = part_uevent else {
+            let Node::Pseudo(_, pfile) = part_uevent else {
                 panic!("expected sysfs");
             };
-            assert_eq!(
-                content(&view, pmnt, &pfile).unwrap(),
-                b"MAJOR=8\nMINOR=1\nDEVNAME=sda1\nDEVTYPE=partition\nPARTN=1\n"
-            );
             assert!(pollable(&pfile) && has_iter(&pfile, false) && has_iter(&pfile, true));
-            let Node::Pseudo(dmnt, dfile) = resolve(b"/sys/dev/block/8:0/uevent", true).unwrap()
-            else {
-                panic!("expected sysfs");
+            for (path, want) in [
+                (
+                    b"/sys/dev/block/8:1/uevent".as_slice(),
+                    b"MAJOR=8\nMINOR=1\nDEVNAME=sda1\nDEVTYPE=partition\nPARTN=1\n".as_slice(),
+                ),
+                (
+                    b"/sys/dev/block/8:0/uevent",
+                    b"MAJOR=8\nMINOR=0\nDEVNAME=sda\nDEVTYPE=disk\n",
+                ),
+                (b"/sys/dev/block/8:1/../queue/logical_block_size", b"512\n"),
+                (b"/sys/dev/block/8:1/start", b"2048\n"),
+                (b"/sys/dev/block/8:1/partition", b"1\n"),
+            ] {
+                assert_eq!(read_sys(path), want, "{path:?}");
+            }
+            let read_sectors = |path: &[u8]| -> u64 {
+                String::from_utf8(read_sys(path))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap()
             };
             assert_eq!(
-                content(&view, dmnt, &dfile).unwrap(),
-                b"MAJOR=8\nMINOR=0\nDEVNAME=sda\nDEVTYPE=disk\n"
+                read_sectors(b"/sys/dev/block/8:0/size"),
+                read_sectors(b"/sys/dev/block/8:1/size") + ROOT_PART_START
             );
-            let Node::Pseudo(qmnt, qfile) =
-                resolve(b"/sys/dev/block/8:1/../queue/logical_block_size", true).unwrap()
-            else {
-                panic!("expected sysfs");
-            };
-            assert_eq!(content(&view, qmnt, &qfile).unwrap(), b"512\n");
-            let Node::Pseudo(smnt, sfile) = resolve(b"/sys/dev/block/8:1/start", true).unwrap()
-            else {
-                panic!("expected sysfs");
-            };
-            assert_eq!(content(&view, smnt, &sfile).unwrap(), b"2048\n");
-            let Node::Pseudo(imnt, ifile) = resolve(b"/sys/dev/block/8:1/partition", true).unwrap()
-            else {
-                panic!("expected sysfs");
-            };
-            assert_eq!(content(&view, imnt, &ifile).unwrap(), b"1\n");
-            let Node::Pseudo(psmnt, psfile) = resolve(b"/sys/dev/block/8:1/size", true).unwrap()
-            else {
-                panic!("expected sysfs");
-            };
-            let part_sectors: u64 = String::from_utf8(content(&view, psmnt, &psfile).unwrap())
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
-            let Node::Pseudo(dsmnt, dsfile) = resolve(b"/sys/dev/block/8:0/size", true).unwrap()
-            else {
-                panic!("expected sysfs");
-            };
-            let disk_sectors: u64 = String::from_utf8(content(&view, dsmnt, &dsfile).unwrap())
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
-            assert_eq!(disk_sectors, part_sectors + ROOT_PART_START);
         });
     }
 
@@ -6791,24 +6789,17 @@ pub(crate) mod tests {
                 fds.install_at(4, f1, false, 1024).unwrap();
             }
             let view = test_view(&k, vfs);
-            let info0 = String::from_utf8(
-                content(&view, PROC_MOUNT, &PseudoNode::FdInfo(proc, None, 3)).unwrap(),
-            )
-            .unwrap();
-            assert!(
-                info0.contains("eventfd-count:               1a\n"),
-                "{info0}"
-            );
-            assert!(info0.contains("eventfd-id: 0\n"), "{info0}");
-            let info1 = String::from_utf8(
-                content(&view, PROC_MOUNT, &PseudoNode::FdInfo(proc, None, 4)).unwrap(),
-            )
-            .unwrap();
-            assert!(
-                info1.contains("eventfd-count:               2b\n"),
-                "{info1}"
-            );
-            assert!(info1.contains("eventfd-id: 1\n"), "{info1}");
+            for (fd, count_hex, id) in [(3, "1a", 0), (4, "2b", 1)] {
+                let info = String::from_utf8(
+                    content(&view, PROC_MOUNT, &PseudoNode::FdInfo(proc, None, fd)).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    info.contains(&format!("eventfd-count: {count_hex:>16}\n")),
+                    "{info}"
+                );
+                assert!(info.contains(&format!("eventfd-id: {id}\n")), "{info}");
+            }
             k.tasks[&10].res.borrow().fds.borrow_mut().close(3).unwrap();
             let e2 = EventFd::new(0, false, &k.eventfd_ids).unwrap();
             assert_eq!(e2.id, 0);
