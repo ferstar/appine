@@ -429,8 +429,7 @@ impl Store {
     pub fn create(dir: &Path) -> Result<Store, Errno> {
         fs::create_dir_all(dir.join("objects")).map_err(io_err)?;
         let lock = Self::open_lock(dir)?;
-        let fd = lock.as_raw_fd();
-        appine_hal::flock(fd, true, true).map_err(Errno)?;
+        appine_hal::flock(lock.as_raw_fd(), true, true).map_err(Errno)?;
         if dir.join("meta.db").exists() {
             return Err(Errno::EEXIST);
         }
@@ -444,8 +443,7 @@ impl Store {
                 params![ROOT, mode::S_IFDIR | 0o755, now],
             )
             .map_err(db_err)?;
-        store.join();
-        appine_hal::flock(fd, false, true).map_err(Errno)?;
+        store.join_and_downgrade()?;
         Ok(store)
     }
 
@@ -503,6 +501,18 @@ impl Store {
             }
         }
 
+        self.finish_exclusive_open(
+            volatile,
+            #[cfg(test)]
+            on_cleanup,
+        )
+    }
+
+    fn finish_exclusive_open(
+        mut self,
+        volatile: &[&[u8]],
+        #[cfg(test)] mut on_cleanup: impl FnMut(&Store, CleanupStep) -> Result<(), Errno>,
+    ) -> Result<Store, Errno> {
         self.meta.commits.reset_users();
         let token = Self::boot_token();
         self.recover_objects(token)?;
@@ -539,9 +549,13 @@ impl Store {
                 self.lock.write_all_at(token, 32).map_err(io_err)?;
             }
         }
-        self.join();
-        appine_hal::flock(fd, false, true).map_err(Errno)?;
+        self.join_and_downgrade()?;
         Ok(self)
+    }
+
+    fn join_and_downgrade(&mut self) -> Result<(), Errno> {
+        self.join();
+        appine_hal::flock(self.lock.as_raw_fd(), false, true).map_err(Errno)
     }
 
     fn join(&mut self) -> u32 {
@@ -608,8 +622,7 @@ impl Store {
         }
         // Map the shared header through its own open file description so a surviving Meta
         // VMA cannot retain Store::lock's flock on Linux filesystems after Store drops.
-        let header = Self::open_lock(dir)?;
-        let commits = Commits::open(&header)?;
+        let commits = Commits::open(&Self::open_lock(dir)?)?;
         let objects_dir = appine_hal::open_dir(&dir.join("objects")).map_err(Errno)?;
         let objects_st = appine_hal::fstat(objects_dir.as_raw_fd()).map_err(Errno)?;
         let store_id = (objects_st.st_dev, objects_st.st_ino);
@@ -838,7 +851,7 @@ impl Store {
 
     /// Deletes zero-link rows and collects objects to unlink after the cleanup commit is durable.
     /// A surviving share keeps its object's inode row so the number cannot be reused.
-    fn remove_orphans(&self) -> Result<Vec<Ino>, Errno> {
+    fn remove_orphans(&self) -> Result<HashSet<Ino>, Errno> {
         let query = |sql: &str| -> Result<Vec<(Ino, u32)>, Errno> {
             let mut stmt = self.db().prepare(sql).map_err(db_err)?;
             let rows = stmt
@@ -893,7 +906,7 @@ impl Store {
         // An unlinked, settled file may have already dropped the last shared row for a
         // foreign object. Only doomed still records that number. Keep it away from the reaper.
         to_unlink.extend(self.doomed.borrow_mut().drain(..));
-        Ok(to_unlink.into_iter().collect())
+        Ok(to_unlink)
     }
 
     /// From now on this store belongs to running kernel `kernel` ([`crate::kernel::Shared::id`])
@@ -4787,6 +4800,12 @@ mod tests {
             Self { dir, run, objects }
         }
 
+        fn pin_wal(&self) -> Connection {
+            let db = Connection::open(self.dir.join("meta.db")).unwrap();
+            db.execute_batch("BEGIN; SELECT ino FROM inodes").unwrap();
+            db
+        }
+
         fn object(&self, ino: Ino) -> PathBuf {
             self.dir.join("objects").join(ino.to_string())
         }
@@ -4866,6 +4885,12 @@ mod tests {
         }
     }
 
+    impl Drop for BootCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[test]
     fn boot_cleanup_rollback_preserves_objects() {
         let f = BootCleanup::new("boot-rollback");
@@ -4878,12 +4903,11 @@ mod tests {
         f.assert_objects(true);
         f.assert_interrupted();
         f.check_rollback();
-        fs::remove_dir_all(f.dir).unwrap();
     }
 
     #[test]
     fn boot_cleanup_commit_failure_preserves_objects() {
-        // Exercise both the commit at savepoint release and the explicit commit in finish_open.
+        // Exercise both the commit at savepoint release and the explicit cleanup commit.
         for delay in [Duration::ZERO, Duration::from_secs(3600)] {
             let f = BootCleanup::new("boot-commit-error");
             let s = Store::connect(&f.dir, delay).unwrap();
@@ -4903,7 +4927,6 @@ mod tests {
             f.assert_interrupted();
             f.assert_objects(true);
             f.check_rollback();
-            fs::remove_dir_all(f.dir).unwrap();
         }
     }
 
@@ -4914,8 +4937,7 @@ mod tests {
             let s = Store::connect(&f.dir, Duration::ZERO).unwrap();
             // Keep SQLite's WAL open across the failed open. Save all three metadata files
             // before the cleanup so we can also model losing just the new WAL frames.
-            let db = Connection::open(f.dir.join("meta.db")).unwrap();
-            db.execute_batch("BEGIN; SELECT ino FROM inodes").unwrap();
+            let db = f.pin_wal();
             let snapshot = ["meta.db", "meta.db-wal", "meta.db-shm"].map(|name| {
                 let path = f.dir.join(name);
                 let bytes = fs::read(&path).unwrap();
@@ -4947,7 +4969,6 @@ mod tests {
                 f.check_reconciliation();
                 drop(db);
             }
-            fs::remove_dir_all(f.dir).unwrap();
         }
     }
 
@@ -4972,7 +4993,6 @@ mod tests {
         }
         f.assert_interrupted();
         f.check_reconciliation();
-        fs::remove_dir_all(f.dir).unwrap();
     }
 
     #[test]
@@ -5027,7 +5047,17 @@ mod tests {
         assert!(stray.exists());
         f.assert_contents(&s, ROOT, b"reused", b"new");
         drop(s);
-        fs::remove_dir_all(f.dir).unwrap();
+    }
+
+    fn assert_open_sync_fails(dir: &Path, volatile: &[&[u8]]) {
+        let s = Store::connect(dir, Duration::ZERO).unwrap();
+        let result = s.finish_open(volatile, |s, step| {
+            if step == CleanupStep::BeforeSync {
+                s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        assert_eq!(result.err(), Some(Errno::EIO));
     }
 
     #[test]
@@ -5056,14 +5086,7 @@ mod tests {
         drop(s);
         assert!(dir.join("meta.db-wal").metadata().unwrap().len() > 0);
 
-        let s = Store::connect(&dir, Duration::ZERO).unwrap();
-        let result = s.finish_open(&[], |s, step| {
-            if step == CleanupStep::BeforeSync {
-                s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
-            }
-            Ok(())
-        });
-        assert_eq!(result.err(), Some(Errno::EIO));
+        assert_open_sync_fails(&dir, &[]);
         let s = Store::open(&dir, &[]).unwrap();
         assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
         assert!(s.unshare(a, None).unwrap().is_none());
@@ -5084,18 +5107,8 @@ mod tests {
     #[test]
     fn concurrent_openers_recover_before_reusing_an_inode() {
         let f = BootCleanup::new("boot-race");
-        let reader = Connection::open(f.dir.join("meta.db")).unwrap();
-        reader
-            .execute_batch("BEGIN; SELECT ino FROM inodes")
-            .unwrap();
-        let s = Store::connect(&f.dir, Duration::ZERO).unwrap();
-        let result = s.finish_open(&[b"run"], |s, step| {
-            if step == CleanupStep::BeforeSync {
-                s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
-            }
-            Ok(())
-        });
-        assert_eq!(result.err(), Some(Errno::EIO));
+        let reader = f.pin_wal();
+        assert_open_sync_fails(&f.dir, &[b"run"]);
         f.assert_interrupted();
         f.assert_objects(true);
         f.assert_committed();
@@ -5119,7 +5132,6 @@ mod tests {
         file.write_all(b"reused").unwrap();
         assert!(!f.object(ino).exists());
         drop((s, reader));
-        fs::remove_dir_all(f.dir).unwrap();
     }
 
     #[test]
@@ -5178,7 +5190,6 @@ mod tests {
                 });
             }
         });
-        fs::remove_dir_all(f.dir).unwrap();
     }
 
     #[test]
