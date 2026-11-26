@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/unix"`
 >
-> Last distilled: 2026-11-10 (HEAD = 27609fe). D1–D3 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D3 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -16,18 +16,18 @@
 - **Source**: design review 2026-10-24 (§10), round 06 (`06-m4`)
 
 ### D2: Path names are socket nodes in the store; abstract names live in the kernel
-- **What**: Binding a path creates an `S_IFSOCK` node in the store (`EADDRINUSE` if it exists) and records its inode; abstract names and autobind names are only in the kernel's name table and disappear with the socket.
+- **What**: Binding a path creates an `S_IFSOCK` node in the store (`EADDRINUSE` if it exists) and records its inode; abstract names and autobind names are only in the kernel's name table and disappear with the socket. Pathname socket creation inherits the parent's default ACL.
 - **Why**: Pathname sockets must be visible and permission-checked like files (logging through `/dev/log` was among M4's tests); abstract names need no file.
 - **Tradeoffs**: Path names are global across network namespaces (only abstract names are scoped per namespace).
 - **Watch out**: Look path sockets up by inode, not by path string.
-- **Source**: round 06 (`06-m4`)
+- **Source**: round 06 (`06-m4`), 68b70897
 
 ### D3: Cycles through in-flight messages are collected like Linux's `unix_gc`
-- **What**: When a unix socket is closed (close, close_range, dup2 over it, execve) or a process exits, sockets referenced only by in-flight messages and unreachable from outside have their receive queues emptied.
+- **What**: When a unix socket is closed (close, close_range, dup2 over it, execve) or a process exits, sockets referenced only by in-flight messages and unreachable from outside have their receive queues emptied. Track rights through blocked send, queued packet and receive copyout, install only after header writes, and release bounded reservations and weak in-flight references on failure.
 - **Why**: Sockets passed through themselves formed `Rc` cycles (open file → socket → queue → message → open file) that were never freed.
 - **Tradeoffs**: The collector is conservative (any temporary extra reference keeps a socket) and runs synchronously on unix socket closes; Linux 6.8 runs it asynchronously, so it cannot be compared natively and is covered by unit tests.
 - **Watch out**: Only unix-socket files can be candidates.
-- **Source**: round 19 (`19-deferred`)
+- **Source**: round 19 (`19-deferred`), 4309ef58, 515ecd7f, 661d5f01
 
 ### D4: AF_UNIX is a small module of its own
 - **What**: kernel/unix covers `unix.rs` and `syscall/unix.rs`, separate from kernel/net.
@@ -58,18 +58,18 @@
 - **Source**: 2b72eeb
 
 ### D8: Accepted sockets inherit the listener's `SO_PASSCRED`
-- **What**: accept turns `SO_PASSCRED` on for the new socket when the listener has it, as `unix_sock_inherit_flags` does.
+- **What**: accept turns `SO_PASSCRED` on for the new socket when the listener has it, as `unix_sock_inherit_flags` does. Capture credentials at send when explicitly supplied or required by either endpoint or a pending accept, and apply the receiver's current option when reading queued data.
 - **Why**: Accepted sockets did not inherit the option.
 - **Tradeoffs**: None.
 - **Watch out**: None known.
-- **Source**: 5d23297
+- **Source**: 5d23297, 576501d3
 
 ### D9: Sends and datagram poll follow `unix_stream_sendmsg`, `unix_dgram_sendmsg` and `unix_dgram_poll`
-- **What**: A `SOCK_STREAM` send with an address is `EISCONN` when connected and `EOPNOTSUPP` otherwise (seqpacket ignores the address), a datagram send after `SHUT_WR` or to a receiver with `RCV_SHUTDOWN` is `EPIPE` without `SIGPIPE`, and a datagram socket shut both ways polls `POLLHUP`.
+- **What**: A `SOCK_STREAM` send with an address is `EISCONN` when connected and `EOPNOTSUPP` otherwise (seqpacket ignores the address), a datagram send after `SHUT_WR` or to a receiver with `RCV_SHUTDOWN` is `EPIPE` without `SIGPIPE`, and a datagram socket shut both ways polls `POLLHUP`. After partial progress return the byte count without raising SIGPIPE, and copy stream or packet data before committing receive-side state.
 - **Why**: A stream sendto with an address went to the peer, datagram sends ignored the receiver's read shutdown and raised `SIGPIPE` after `SHUT_WR`, and a datagram socket shut both ways never polled `POLLHUP`.
 - **Tradeoffs**: None.
 - **Watch out**: A program that relied on the address being ignored on a connected stream socket now gets `EISCONN`, as on Linux.
-- **Source**: dcacfb6
+- **Source**: dcacfb6, 849bf98a, 15347732
 
 ### D10: Dead peers, listener credentials, generic options and recvmsg faults answer as Linux does
 - **What**: A datagram socket whose connected peer died is disconnected (`ECONNREFUSED`, then `ENOTCONN`); datagram connect checks `unix_may_send`; listen records credentials each time and wakes connectors when the backlog grows; `SO_PEERCRED` answers for listeners and gives -1 without a peer; generic options go through `SockOpts`; `FIONREAD` sums stream and seqpacket queues and is `EINVAL` on listeners; recvmsg checks the iovec prefix the queued data would fill before taking it, treats a NULL control buffer as empty and closes the passed fds when the control buffer cannot be written; delivery truncates control messages as `put_cmsg` does.
@@ -105,3 +105,11 @@
 - **Tradeoffs**: Programs with `SA_RESTART` handlers now see EINTR from timed AF_UNIX calls, as on Linux.
 - **Watch out**: A future wait in this module bounded by something other than the socket timeouts must choose its own interrupt errno instead of passing its deadline to `block()`.
 - **Source**: 1a59520
+
+### D15: Unix packets retain sender identity and charge queued output exactly once
+
+- **What**: Use shared sender state to resolve the sender address at receive time and charge outstanding payload across socket types, including sendto and pending cross-namespace connections.
+- **Why**: Connections, names and descriptor ownership can change before a packet is read.
+- **Tradeoffs**: Queued packets retain accounting state and namespace listings include weak embryos.
+- **Watch out**: Uncharge exactly once on consumption or drop and avoid reference cycles.
+- **Source**: f985c1f8, 94ac4cd1, d6138dab, ab417943

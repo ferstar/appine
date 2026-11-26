@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/terminal"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D3 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D3 were seeded by hand from the retired design
 > doc §11.5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -10,14 +10,13 @@
 
 > Full text of D51–D52: `git show 410ef192ce13aa39fc4661c0cfa032f917066801:.agents/decisions/android/terminal.md`
 
-> Full text of D2, D6, D9, D11, D12, D16–D17, D22 and D23: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/android/terminal.md`
+> Full text of D2, D6, D9, D12, D16–D17, D22 and D23: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/android/terminal.md`
 
 > Full text of D19, D21, D24, D26–D29, D33–D35 and D37: `git show c1a37da58eada92fc78df580db7b870071cab435:.claude/decisions/android/terminal.md`
 
 - **D2** — Appine's messages (`VtSession.showMessage`, `appine_vt_message`) are inserted above the cursor line with the cursor saved and restored, skipped on the alternate screen, overwriting the guest's saved-cursor slot (round 195; 6ffb912)
 - **D6** — vt.rs's `Tab` holds the kernel handle rather than an `Arc<Machine>` and looks the kernel up per console read, so the service must release tabs before shutting the kernel down or a restart can open the new store before the pump's read returns (ff9e2f9)
 - **D9** — A wide cell's glyph is scaled evenly by two cells over the measured advance of "水" (1.2 with JetBrains Mono and Noto Sans CJK), centred and still shrunk when wider, switched by `VtView.setFillWide` from the setting, and a CJK fallback that is not one em wide fills differently (0478dd5)
-- **D11** — Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab and Ctrl+Shift+Tab open, close and cycle tabs (listed by `onProvideKeyboardShortcuts`) and never reach programs, and Ctrl+Shift+W closes a running tab without ×'s confirmation (2af55e2)
 - **D16** — Terminal Kotlin files read in execution order (types first, callbacks as they fire, each helper after its first caller, companion last) and vt.rs follows VtNative.kt's order, and reorders must keep initialised properties in their textual order, which is the order Kotlin initialises them in (a546fea, 3511da5)
 - **D17** — Drawing and preference writes use androidx.core's KTX helpers (`edit { }`, `createBitmap`, `Canvas.withClip`, `withScale`) because lint's UseKtx warnings fail the build (android/native D10) (4c1a3ce)
 - **D21** — The tab row and the extra keys scroll under their fixed buttons with an end padding as wide as them and `clipToPadding` off, fading over `ExtraKeysView.FADE_DP` (32 dp) up to a blank strip, so `ExtraKeysView.scrolls` must compare the grid with the room between the paddings and an OEM font or label change can put the fade over a glyph (a75981b, db4f809)
@@ -131,16 +130,16 @@
 ### D32: Kitty graphics are drawn from direct transmissions; the Glyph Protocol stays off
 - **What**: Each screen stores up to 32 MiB of Kitty images sent by direct transmission (file, temporary-file and shared-memory media answer `EINVAL`, since they would name the host's files), PNG is decoded with the Wuffs libghostty-vt.a contains, frames carry a 64-byte image header and 56-byte placements sorted as Ghostty sorts them with a virtual placement's rows joined, and `VtView` keeps one Bitmap per shown image by generation, painting the three layers into each row with bilinear filtering; the Glyph Protocol stays off, and the libghostty-vt features still unwired (OSC 7, the two-phase render update) are listed in the map.
 - **Why**: Programs that show images (chafa, yazi, timg, `kitten icat`) fell back to text though libghostty-vt stores Kitty images and its render state says where to draw them, while registered glyphs cannot be drawn through the C API, so advertising the Glyph Protocol would bring glyphs that never appear.
-- **Tradeoffs**: The shown tab's images take memory twice (the library's and the Bitmaps; the view drops its copies while hidden, android/vtview D2, and background tabs lose theirs only under memory pressure, android/vt D3); any image change repaints every row; placeholder rows partly in the viewport keep the rounding of their first visible source row; chafa's own detection still picks symbols.
+- **Tradeoffs**: The shown tab's images take memory twice (the library's and the Bitmaps; the view drops its copies while hidden, android/vtview D2, and background tabs can also lose theirs after the service grace period, android/vt D3); any image change repaints every row; placeholder rows partly in the viewport keep the rounding of their first visible source row; chafa's own detection still picks symbols.
 - **Watch out**: Decoding a large PNG holds the tab's lock on the pump thread; the frame format, vt.rs's FFI and `VtFrame` must change together; tried only on a 4 KB-page API 34 emulator and macOS, not with yazi, timg, `kitten icat`, tmux placeholders, real devices or a full 32 MiB store.
 - **Source**: fcf4c93, c510bee; d89b5fa; 8811c32; 49e8b08 (read by `VtFrame`)
 
 ### D36: Bells, OSC 52 clipboard writes and reads, OSC 9/777 notifications and cursor blinking are wired
-- **What**: vt.c records effects during `feed` (a bell count, the last clipboard write as text/plain up to 256 KiB or a clear, the last notification's title and body up to 4 KiB, and OSC 52 reads, found by stopping at OSC boundaries), the pump takes them after each read (`appine_vt_take_effects`) and calls `VtSession.onBell`, `onClipboard`, `onNotification` and the clipboard-read path (routed by android/service D19), a read from the tab in front is asked about in `MainActivity` and answered through the tab's writer in Ghostty's form (empty when denied), `VtView.bell` vibrates with the REJECT haptic at most every 100 ms, the cursor blinks every 500 ms while the terminal's cursor blinks (D47) and the view and window have focus, and `MainActivity` shows the tab a notification names (`EXTRA_TAB`) once bound.
+- **What**: vt.c records effects during `feed` (a bell count, the last clipboard write as text/plain up to 256 KiB or a clear, the last notification's title and body up to 4 KiB, and OSC 52 reads, found by stopping at OSC boundaries), the pump takes them after each read (`appine_vt_take_effects`) and calls `VtSession.onBell`, `onClipboard`, `onNotification` and the clipboard-read path (routed by android/service D19), a read from the tab in front is asked about in `MainActivity` and answered through the tab's writer in Ghostty's form (empty when denied), `VtView.bell` vibrates with the REJECT haptic at most every 100 ms, the cursor blinks every 500 ms while the terminal's cursor blinks (D47) and the view and window have focus, and `MainActivity` shows the tab a notification names (`EXTRA_TAB`) once bound. A resumed, focused and unlocked activity claims one session batch before reading a clipboard preview, rechecks authorization on acceptance and resolves a dismissed active prompt with an empty reply.
 - **Why**: Programs' bells, OSC 52 writes and reads, OSC 9/777 notifications and blinking cursors were ignored though libghostty-vt reports them and Ghostty asks before a read, so copying from tmux or neovim and noticing a CLI waiting for input in another tab were impossible.
-- **Tradeoffs**: Several notifications in one read keep only the last; only text clipboard contents are supported, and a write over 256 KiB is denied rather than cut; a read from a tab not in front gets an empty clipboard, and OSC 5522 reads and Kitty paste events stay refused; bells and notifications pass through the main thread's queue.
+- **Tradeoffs**: Several notifications in one read keep only the last; only text clipboard contents are supported, and a write over 256 KiB is denied rather than cut; an unclaimed background read can wait up to the session deadline, and OSC 5522 reads and Kitty paste events stay refused; bells and notifications pass through the main thread's queue.
 - **Watch out**: The effects struct is shared by vt.c and vt.rs and must change on both sides; any app write that can end a program's string must clear vt.c's `osc_open`; the vibration depends on the system's touch-feedback setting; real devices and Android 11 and 12 were not tried.
-- **Source**: d89b5fa (with android/service D19); 90911a2, 600700b (clipboard reads)
+- **Source**: d89b5fa (with android/service D19); 90911a2, 600700b (clipboard reads), d10f2973, f3d226d5, ab417943
 
 ### D39: Programs' progress and status reports show on the tabs until their program gives the terminal back
 - **What**: vt.c keeps the last OSC 9;4 report and queues every OSC 7501 report, `VtSession` keeps the 7501 records as the specification says (one per id, at most 64) and the one most in need of the user, and the pump notes the console's foreground group after a report (kernel/tty D22), dropping progress and the working, blocked and idle records once another group has the terminal while done and error go when the tab is seen; `ProgressLine` draws the current tab's progress with the shared `Ui.line()` thickness (1 dp, at least one pixel), a sweep without a percentage and a 15 s duration, the other tabs get a bar in the indicator's place and a status dot read by TalkBack, background statuses notify (android/service D21), and XTGETTCAP TN answers xterm-256color, the console's TERM; switching to an equal non-null report takes the immediate jump path instead of retaining the previous animation.
@@ -157,11 +156,11 @@
 - **Source**: ddbfb9b, 5256ae2, 600700b, 48982fe
 
 ### D41: The scrollback is searched from a bar in the tab bar's place, with matches marked in the cells and on the scroll bar
-- **What**: `SearchBarView` stands in for `TabBarView` (Find in ⋮ or Ctrl+Shift+F; Enter or ↑ for older, Shift+Enter or ↓ for newer, nothing selected until a step; AndroidX Back, ×, Esc or another tab closing it, the last text kept); vt.c drives one `GhosttySearch` from `appine_vt_frame` for at most 4 ms per frame, marks the viewport's matches in cell attribute bits 14–15 with the count in the header and steps back to the selected match's place after a resize, and `appine_vt_search_rows` gives the matches' rows for 2 dp marks under the scroll bar's thumb, taken again when the count or the selected match changes or every 500 ms while frames change.
+- **What**: `SearchBarView` stands in for `TabBarView` (Find in ⋮ or Ctrl+Shift+F; Enter or ↑ for older, Shift+Enter or ↓ for newer, nothing selected until a step; AndroidX Back, ×, Esc or another tab closing it, the last text kept); vt.c drives one `GhosttySearch` from `appine_vt_frame` for at most 4 ms per frame, marks the viewport's matches in cell attribute bits 14–15 with the count in the header and steps back to the selected match's place after a resize, and `appine_vt_search_rows` gives the matches' rows for 2 dp marks under the scroll bar's thumb, taken again when the count or the selected match changes or every 500 ms while frames change. Focused search consumes extra-key editing and navigation locally, with Escape closing search, arrows stepping matches or moving the selection, and the privacy gate checked first.
 - **Why**: There was no way to find text in the scrollback, though libghostty-vt searches the screen and scrollback and lists every match.
-- **Tradeoffs**: The tab bar is hidden while searching, so Ctrl+Tab or enabled volume-key switching ends the search; the extra keys still type into the terminal; a resize with a match selected blocks on finishing the search; vt.c keeps a copy of all matches (about 64 bytes each) while searching, and marks may lag a pruned scrollback by up to 500 ms.
+- **Tradeoffs**: The tab bar is hidden while searching, so Ctrl+Tab or enabled volume-key switching ends the search; the focused search field consumes extra keys; a resize with a match selected blocks on finishing the search; vt.c keeps a copy of all matches (about 64 bytes each) while searching, and marks may lag a pruned scrollback by up to 500 ms.
 - **Watch out**: The frame format changes in vt.c and `VtFrame` together; reselecting by place could pick another match if a resize changed which exist; libghostty-vt's search (case-insensitive for ASCII only) may change with an upgrade; the Android 16 Back path is untried on a device; native tooltips, permission banners and the search field inherit disabled fallback line spacing from the terminal theme, and the count uses 14 dp labels, risking tall-glyph clipping and less input width on narrow screens.
-- **Source**: ddbfb9b, 48982fe; 49e8b08 (read by `VtFrame`); 61df6915; dfbf8eab; 5e1f851d; 20137e4c; f61072f3; d053be24; 39e55b4b; b5303dd3
+- **Source**: ddbfb9b, 48982fe; 49e8b08 (read by `VtFrame`); 61df6915; dfbf8eab; 5e1f851d; 20137e4c; f61072f3; d053be24; 39e55b4b; b5303dd3, 5fed6c24
 
 ### D43: Prompt marks let tabs close at the prompt, jump between commands, select output and time commands
 - **What**: vt.c reads libghostty-vt's prompt state only: `appine_vt_at_prompt` makes `VtSession.busy` false so closing does not ask (D18), `appine_vt_jump_prompt` serves Ctrl+Shift+Up/Down on the primary screen (passed to the program on the alternate one), `appine_vt_output_at` backs the menu's Select output, new tabs start in the current tab's foreground-group directory (`consoleCwd`), and `on_semantic_prompt` times a command from the C mark (for busybox ash, from the cursor leaving the prompt) to the next D for `VtSession.onCommandFinished` (android/service D21); OSC 7 stays unwired.
@@ -203,11 +202,11 @@
 
 ### D62: The file button imports copies into the resolved login home
 
-- **What**: The @ action uses OpenMultipleDocuments to copy into the native login home with ownership, sanitized names and numbered collisions, retains work/results in an AndroidViewModel, gates initiation/presentation on privacy and explicitly copies shell-escaped paths without a newline.
+- **What**: The @ action uses OpenMultipleDocuments to copy into the native login home with ownership, sanitized names and numbered collisions, retains work/results in an AndroidViewModel, gates initiation/presentation on privacy and explicitly copies shell-escaped paths without a newline. During a copy the file action controls the retained import batch.
 - **Why**: CLI users need a direct file picker and usable paths to the imported copies.
 - **Tradeoffs**: The target ignores the tab cwd and effective user, a batch holds the rootfs read lock, and import has neither cancellation nor process-death recovery.
 - **Watch out**: Slow providers delay replacement, interruption or cleanup failure can leave partial files, and cloud/vendor pickers remain unverified; displayed paths use monospace after a blank line.
-- **Source**: 165b5f99; d053be24; 39e55b4b
+- **Source**: 165b5f99; d053be24; 39e55b4b, f495f2cc
 
 ### D63: A title list overlays the complete terminal content column
 
@@ -280,6 +279,21 @@
 - **Watch out**: Non-English/Chinese translations have not been reviewed by native speakers on device.
 - **Source**: b605a0a3
 
+### D11: Desktop shortcuts open, close and cycle tabs
+- **What**: Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab and Ctrl+Shift+Tab open, close and cycle tabs, listed by `onProvideKeyboardShortcuts`. Ctrl+Shift+W and single-tab close controls now share the running-tab confirmation.
+- **Why**: Hardware-keyboard users had no keys for tabs.
+- **Tradeoffs**: Programs no longer receive those four key combinations.
+- **Watch out**: The shortcuts are untested with real keyboards and with IMEs that take Ctrl combinations.
+- **Source**: 2af55e2 (its swipe and renaming removed in 1eac62e), 71790fde
+
+### D72: Focus events target the session that generated the change
+
+- **What**: Write the mode-1004 event to the supplied running session after checking the privacy gate.
+- **Why**: Switching tabs can change the current session before focus-out is sent.
+- **Tradeoffs**: The host callback carries session identity.
+- **Watch out**: A locked activity must suppress focus bytes.
+- **Source**: ae1e05e0
+
 ## Superseded
 
 - ~~D1: Termux's terminal libraries are vendored, with `TerminalSession` rewritten around a PTY interface~~ → replaced by **D8** in b38d29c (2026-11-04)
@@ -331,3 +345,5 @@
 - ~~English/Simplified-Chinese-only locale coverage in e406fc21~~ → replaced by **D67** in 5bd37526 (2026-11-16; system picker and recreation behavior retained)
 - ~~Direct theme colors for terminal controls in D13 and primary-color selection under D20 and D63~~ → replaced by **D13, android/keys D3 and android/tabbar D4** in 71e94b55 (2026-11-17).
 - ~~The search field sets fallback line spacing itself under D41~~ → replaced by the terminal-theme setting in **D41** in b5303dd3 (2026-11-16).
+- ~~Closing a running tab immediately with Ctrl+Shift+W~~ → replaced by **D11** in 71790fde (2026-11-24)
+- ~~Passing extra keys to the terminal while search has input focus~~ → replaced by **D41** in 5fed6c24 (2026-11-26)

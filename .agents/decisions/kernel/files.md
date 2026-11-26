@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/files"`
 >
-> Last distilled: 2026-11-24 (HEAD = 231480cb)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on open files made before kernel/files was split from kernel/vfs keep their `kernel/vfs` tags and live in `.agents/decisions/kernel/vfs.md`: D5, D11, D17, D22, D24, D26, D27, D29, D33, D34, D41, D44, D45, the owner half of D25, the `open_pseudo` half of D19 and the file I/O halves of D36 and D37; the pre-split fd reservation decision is D55.
 
@@ -18,11 +18,11 @@
 
 ### D2: Reopens retain their mount and normal open checks
 
-- **What**: `StoreOpen` routes reopens through open checks on their original mount with the path and IN_OPEN event, keeps reopened memfds as writers, and lets truncate through fd links use the open handle for deleted files and memfds.
+- **What**: `StoreOpen` routes reopens through open checks on their original mount with the path and IN_OPEN event, keeps reopened memfds as writers, and lets truncate through fd links use the open handle for deleted files and memfds. Path descriptions also retain mqueue and FUSE pins, PTY backing identity, FIFO watches and the regular backing of deleted proc-fd targets through stat and reopen. Executable write-denial also counts writable opens held alive by FUSE mappings.
 - **Why**: Procfs reopens bypassed mount and open restrictions, while truncating deleted files or memfds through fd links did nothing.
 - **Tradeoffs**: Reopens now expose normal EROFS, O_NOATIME, ETXTBSY and lease errors, and writable memfd reopens block execution.
 - **Watch out**: Container runtimes reopening through `/proc/self/fd` can now receive errors they previously bypassed.
-- **Source**: 01bfd882; 20137e4c; d053be24; 39e55b4b
+- **Source**: 01bfd882; 20137e4c; d053be24; 39e55b4b, d10f2973, f495f2cc, 515ecd7f, 11816722, 30e5002e, f985c1f8, b421eac0
 
 ### D3: File I/O preserves position ownership and partial progress
 
@@ -82,20 +82,61 @@
 
 ### D10: `open_path_with` shares `resolve_create_parent` for `O_CREAT` parent resolution
 
-- **What**: `open_path_with` routes `O_CREAT` parent-directory resolution and trailing-slash/overlay setup through the shared `resolve_create_parent` helper in `syscall/fs.rs`.
+- **What**: `open_path_with` routes `O_CREAT` parent-directory resolution and trailing-slash/overlay setup through the shared `resolve_create_parent` helper in `syscall/fs.rs`. For a read-only superblock, store opens check filesystem writability before DAC, while a read-only bind over a writable instance retains its distinct check order.
 - **Why**: Inline creation-parent resolution duplicated logic already shared with namespace-creation syscalls.
 - **Tradeoffs**: `open_path_with` creation setup is coupled to `resolve_create_parent`'s error ordering.
 - **Watch out**: Changes to `resolve_create_parent` error ordering affect `openat`/`openat2` `O_CREAT` paths alongside `mkdirat`, `mknodat` and `symlinkat`.
-- **Source**: 3a90a0ef
+- **Source**: 3a90a0ef, e6495409
 
-### D11: Document `F_GET_SEALS` `EINVAL` gap on ordinary tmpfs files
+### D11: Ordinary tmpfs files report F_SEAL_SEAL
 
-- **What**: `.agents/maps/kernel/files.md` records that `F_GET_SEALS` returns `EINVAL` on ordinary tmpfs files where Linux returns `F_SEAL_SEAL`.
-- **Why**: `MemfdTest.TmpfsFilesHaveSealSeal` skips on the default test directory and exposed the tmpfs difference on both tiers.
-- **Tradeoffs**: The gVisor `memfd` program remains outside the regular differential suite.
-- **Watch out**: Testing a future fix requires a tmpfs test directory.
-- **Source**: 48f1c17e
+- **What**: Look up recorded memfd seals first and otherwise return F_SEAL_SEAL for regular tmpfs files.
+- **Why**: Linux treats these files as permanently closed to new seals.
+- **Tradeoffs**: The query needs to distinguish tmpfs from other regular files.
+- **Watch out**: Attempts to add valid seals return EPERM.
+- **Source**: 48f1c17e, f6a8240a
+
+### D12: Store and tmpfs implement unnamed file creation
+
+- **What**: Open O_TMPFILE with normal parent permission, owner and ACL checks, track its unlinked quota, and permit later linking only when the file was created linkable.
+- **Why**: Applications need a file that can be populated before publication.
+- **Tradeoffs**: Overlay and FUSE directories return EOPNOTSUPP.
+- **Watch out**: Retain the deleted proc-fd display name and release unused objects and quota on last close.
+- **Source**: 68b70897, 65e10e36, ab417943
+
+### D13: Fd-table growth and reservations respect the active limits
+
+- **What**: Bound installation, duplication and reservations by the owning process and nr_open, remember allocated capacity on close, and size copied tables from surviving slots.
+- **Why**: A shared table can serve callers with different limits and procfs exposes its capacity.
+- **Tradeoffs**: Allocated capacity rounds to fd-table granularity.
+- **Watch out**: Accept and SCM_RIGHTS reservations must use the same cap as ordinary installs.
+- **Source**: 4309ef58, 576501d3, e6495409, 661d5f01
+
+### D14: Final descriptor processing uses table order
+
+- **What**: Visit files in descriptor order and clone only handles retained across exit flushing.
+- **Why**: Exit needs ordered close semantics without copying the whole table.
+- **Tradeoffs**: The borrowed iterator cannot outlive the table borrow.
+- **Watch out**: Duplicated descriptions still receive per-descriptor close processing.
+- **Source**: 865d24c1
+
+### D15: open_by_handle_at verifies superblock identity
+
+- **What**: Compare the mount's store root with the handle inode's tree root and reject stale or unlinked targets.
+- **Why**: A valid inode number can belong to a different filesystem instance.
+- **Tradeoffs**: Resolution requires a root lookup.
+- **Watch out**: Mismatches return ESTALE.
+- **Source**: 6fcaff37
+
+### D16: A thread group can reopen its own proc fd directories for reading
+
+- **What**: Use the shared live-group permission helper for nonwrite opens of fd and fdinfo.
+- **Why**: A nondumpable task must retain access to its own descriptors.
+- **Tradeoffs**: The open mask distinguishes reading these directories from searching ns.
+- **Watch out**: If a future non-path open uses only MAY_EXEC, revisit the namespace-directory exemption.
+- **Source**: 36005e07, 3ad68857
 
 ## Superseded
 
 - ~~`kernel/files` combined open descriptions, opening, data I/O, lseek, syncing, truncation, fallocate and shared helpers (D1, ce193253)~~ → replaced by **D1** in 4fcd3e13 (2026-11-23)
+- ~~Reporting EINVAL when querying seals on an ordinary tmpfs file~~ → replaced by **D11** in f6a8240a (2026-11-24)

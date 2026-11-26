@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/locks"`
 >
-> Last distilled: 2026-11-11 (HEAD = c1a37da)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Lock and lease decisions made before kernel/locks was split from kernel/vfs keep their `kernel/vfs` tags and live in `.agents/decisions/kernel/vfs.md`: D12, D43 and the lock-range half of D25.
 
@@ -14,3 +14,19 @@
 - **Tradeoffs**: Close paths and lease breaks are called from kernel/vfs, and lock keys of overlay and FUSE nodes come from there.
 - **Watch out**: Bugs open in the map are leases lost across a copy-up, no-op locks on inode-less files and the listing order.
 - **Source**: 5f327de
+
+### D2: Overlay leases use the overlay node identity
+
+- **What**: Use the same overlay key across set, get, breaks and copy-up while consulting the backing inode for metadata.
+- **Why**: Copy-up replaces the layer inode beneath an existing lease.
+- **Tradeoffs**: Lease lookup and attribute lookup use different identities.
+- **Watch out**: Open and truncate must break leases before copy-up.
+- **Source**: ab694aab
+
+### D3: Lock conflicts and proc listings use stable file identities and ordered waiters
+
+- **What**: Key locks by filesystem or anonymous object, track blocked flock requests and lease acquisition order, and resolve displayed device and inode from the live object.
+- **Why**: Aliases, dup and conversion must agree in flock, record locks, fdinfo and proc locks.
+- **Tradeoffs**: A conversion drops the previous mode before attempting the new one.
+- **Watch out**: Remove wait records on every exit and report the daemon inode for FUSE.
+- **Source**: 021c7fc2, d10f2973, ef8afe48, fcf3989d, ab417943

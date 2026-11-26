@@ -2,17 +2,16 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
 ## Constraint index (compressed active decisions)
 
-> Full text of D13, D17, D20: `git show ec9ad94b862479935821fbfad2affa7bbdba355e:.agents/decisions/android/service.md`
+> Full text of D13, D17: `git show ec9ad94b862479935821fbfad2affa7bbdba355e:.agents/decisions/android/service.md`
 
 - **D13** — Preference writes use the androidx.core edit extension with asynchronous apply, as required by the lint build. (4c1a3ce)
 - **D17** — Before every kernel start, including existing stores, call Rootfs.ensureContainersConfig after ensureNetworkConfig, write only a missing configuration, and fail startup if the store write fails. (0eb9e19)
-- **D20** — The poll worker passes the same changed directories to Documents and Rootfs, ignores refresh failures and can delay the NOPASSWD refresh by a poll while the refresh process counts toward the service exit check. (d03c9b6)
 
 > Full text of D10, D15, D16, D22, D30: `git show c4db5db249c93e2e122d88ef60153f67c94a1f62:.agents/decisions/android/service.md`
 
@@ -44,19 +43,19 @@
 - **Watch out**: Reject pre-reset samples and treat CPU changes rather than monotonic growth as activity; real-device suspend and power savings remain unverified, and repeated sampling delays prolong wakefulness.
 - **Source**: round 191 (`191-keep-awake`); a3f7507e; 1e5de64e; 20137e4c; d053be24; 39e55b4b; 7a931d97
 
-### D4: Memory is trimmed a minute after the UI disappears, and background tabs' images only under pressure
-- **What**: When the last listener leaves, a 60 s timer runs `Machine::trim_memory` and then `VtNative.compressAll` (every tab's cold scrollback, android/terminal D42) in one worker task, and returning cancels it; `RUNNING_LOW` and above (except `UI_HIDDEN`) trim at once with `pressure = true`, which first has `VtNative.dropImages` cut the Kitty images of every started tab other than `current` (android/vt D3).
-- **Why**: Android 14 and later send nothing a foreground-service process can act on; the delay avoids retranslating node or python after a brief look away; a tab whose output never pauses escapes idle compression; and losing images is acceptable only when memory is really short and not for the tab the user sees or comes back to.
-- **Tradeoffs**: The full compression holds each tab's lock for its length and waits behind other worker tasks; on Android 14 and later the image cut never runs, so images stay until their tab closes; with the app in the background every tab but the last one shown loses its images.
-- **Watch out**: Trimming and stopping share one single-thread executor, so a trim never runs on a released kernel; a `current` left pointing at a closed tab protects nothing, so every open tab is cut.
-- **Source**: round 37 (`37-trim-memory`); 3f45ad0, c1a37da
+### D4: Hidden and pressured sessions trim memory and background images
+- **What**: After 60 seconds without the UI, trim kernel memory and compress scrollback on the worker, and trim noncurrent Kitty images on pressure or after the background-tab grace period.
+- **Why**: A grace period avoids unnecessary retranslations and image loss during a brief switch while still reclaiming memory on Android versions that omit pressure callbacks.
+- **Tradeoffs**: The two most recently left tabs keep their images for up to 60 seconds and older tabs can be reduced immediately to 4 MiB per screen.
+- **Watch out**: Clear current when a tab closes and keep periodic re-trims cheap when storage is already below the limit.
+- **Source**: round 37 (`37-trim-memory`); 3f45ad0, c1a37da, 19e8be6f
 
 ### D5: After a kill, tabs come back on their saved screens without their processes
-- **What**: A `running` marker detects an abnormal end; each running tab's login (an "auto" tab as the account `Rootfs.loginAccount` resolves at its first save, kept in `VtSession.resolvedLogin`), foreground cwd, plain-text scrollback (last 256 K, in transcripts named by their content) and, when its terminal changed, a deflated libghostty-vt snapshot (`s-*.snap`, named by content, android/terminal D44) are saved on the worker every minute, when the UI hides, on memory pressure and after tabs open, close or end, with `VtNative.version` in the index; on restart each tab gets a new shell in its directory below its restored screen (the snapshot, read at the tab's first show, else the transcript) and a notice, snapshots from another version are dropped, and saved tabs are kept until a killed run's tabs have been restored; a `name` key in an index from an earlier version is ignored.
+- **What**: A `running` marker detects an abnormal end; each running tab's login (an "auto" tab as the account `Rootfs.loginAccount` resolves at its first save, kept in `VtSession.resolvedLogin`), foreground cwd, plain-text scrollback (last 256 K, in transcripts named by their content) and, when its terminal changed, a deflated libghostty-vt snapshot (`s-*.snap`, named by content, android/terminal D44) are saved on the worker every minute, when the UI hides, on memory pressure and after tabs open, close or end, with `VtNative.version` in the index; on restart each tab gets a new shell in its directory below its restored screen (the snapshot, read at the tab's first show, else the transcript) and a notice, snapshots from another version are dropped, and saved tabs are kept until a killed run's tabs have been restored; a `name` key in an index from an earlier version is ignored. Tab layout saves compare the complete serialized layout, eliminating hash collisions.
 - **Why**: v1 restores the layout, directories and screens but not programs, and says so; plain transcripts lost colours, images and layout; kills mostly happen in the background, hence the save on hide; unchanged files are not rewritten so the minute timer does not wear the flash; an "auto" tab resolved again at restore could become another user after accounts changed.
 - **Tradeoffs**: Programs are not restored; each save may write both a transcript and a snapshot; a libghostty-vt upgrade sends tabs back to their transcripts once; tabs never shown since the restore keep their old files; names saved by earlier versions are lost at the next restore; an account added between a tab's opening and its first save (up to a minute) can still be the one recorded.
-- **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index; the first save of each "auto" tab reads `/etc/passwd` through the store; an index naming a snapshot deleted by other means falls back to the transcript silently (logged); the sole index hash is `writtenLayout`, a nullable Int cleared under the Tabs lock.
-- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183; 3beb038; 600700b; 807e9ba1; 20137e4c; d053be24; 39e55b4b
+- **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index; the first save of each "auto" tab reads `/etc/passwd` through the store; an index naming a snapshot deleted by other means falls back to the transcript silently (logged); the Tabs lock protects the last serialized layout.
+- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183; 3beb038; 600700b; 807e9ba1; 20137e4c; d053be24; 39e55b4b, 6f2776f3, 6560af61
 
 ### D6: Kernel kills are explained in the tab or a notification; Appine bugs always notify with a copyable report
 - **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; Appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records, and the unimplemented paths the killed process reached); OpenRC services that failed at boot are notified too, with notification detail and report copying subject to D28 privacy checks.
@@ -73,11 +72,11 @@
 - **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038, d9e1f0c, 6560af6); 0553229 (files, D23); 8e211142; 9015b244; c7309c0c, 8a17e4a9, 81f60bef; d053be24; 60790c14; 39e55b4b; e4d7bbe5
 
 ### D8: The service holds `VtSession`s and releases them before the kernel stops
-- **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports go to the tab whose console with that number is still open (`VtSession.consoleOpen`, android/terminal D8), else the newest tab that had it; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`; `releaseSessions` centralizes detach/onDestroy release, notification removal and clearing `sessions` and `unshown`.
+- **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`; `releaseSessions` centralizes detach/onDestroy release, notification removal and clearing `sessions` and `unshown`. ConsoleTracker drains kill reports on close and matches reused console numbers to session ownership epochs under a tracker-before-BKL lock order.
 - **Why**: The service held Termux `TerminalSession`s directly with a separate session → `ConsolePty` map, so the libghostty-vt terminal could not be one of its tabs (android/terminal D8).
-- **Tradeoffs**: Listeners get no per-text-change callback; tabs redraw their view directly; a kill of a tab's own shell goes to a tab that took its console number before the next poll.
-- **Watch out**: `ConsolePty.console` keeps its number after close, so routing must check `consoleOpen`; ended tabs keeping the service alive, saved tabs lost or paired with other tabs' transcripts and colliding kill notification ids were fixed in 89ad551 (D9).
-- **Source**: 6ffb912; 89ad551; 6560af6 (reports to ended tabs, recorded in d9e1f0c); e35f9f7c
+- **Tradeoffs**: Listeners get no per-text-change callback; tabs redraw their view directly, and closing a console drains pending kills.
+- **Watch out**: `ConsolePty.console` keeps its number after close, so routing must check the ownership epoch; ended tabs keeping the service alive, saved tabs lost or paired with other tabs' transcripts and colliding kill notification ids were fixed in 89ad551 (D9).
+- **Source**: 6ffb912; 89ad551; 6560af6 (reports to ended tabs, recorded in d9e1f0c); e35f9f7c, 6f2776f3, 807e9ba1
 
 ### D9: Exit all, restart and replace finish around an ongoing start instead of racing it
 - **What**: While `starting` or `transitioning` is set, Exit all only marks and detaches and the start, restart or replace finishes the exit; the wake lock is held throughout, a download finished during a restart waits in `pendingReplace` until the new kernel is up or has failed, a failed start says so in the notification and stops the service once no UI is left and no switch is downloading (checked again when a download fails or is cancelled), `onDestroy` cancels a switch and sets `destroyed`, after which `updateNotification` posts nothing, and kill notifications take ids counting up from 100000.
@@ -115,11 +114,11 @@
 - **Source**: 64a6107 (with kernel/process D38)
 
 ### D19: Bells and OSC 9/777 notifications reach the user per tab; clipboard writes go through the service
-- **What**: A bell from the tab in front (`current` with the terminal Activity listening) goes to the listeners' `onBell`; otherwise bells, at most one per second per tab, and OSC 9/777 notifications become one notification per tab on a new `terminal` channel (ids from 200000 plus the tab's id), titled by OSC 777's title or the program's title with "Tab N" as subtext, opening that tab and removed when it is shown or closed; OSC 9/777 from the tab in front invokes onBell with its 100 ms throttle and touch-feedback setting, while new terminal channels enable vibration and both terminal and problems channels request high importance under their existing IDs; clipboard writes from any tab that passes the privacy gate set or clear the clipboard, with a toast only before Android 13, and clipboard reads from the tab in front go to the listeners' `onClipboardRead` while reads from other tabs are answered empty.
+- **What**: A bell from the tab in front (`current` with the terminal Activity listening) goes to the listeners' `onBell`; otherwise bells, at most one per second per tab, and OSC 9/777 notifications become one notification per tab on a new `terminal` channel (ids from 200000 plus the tab's id), titled by OSC 777's title or the program's title with "Tab N" as subtext, opening that tab and removed when it is shown or closed; OSC 9/777 from the tab in front invokes onBell with its 100 ms throttle and touch-feedback setting, while new terminal channels enable vibration and both terminal and problems channels request high importance under their existing IDs; clipboard writes from any tab that passes the privacy gate set or clear the clipboard, with a toast only before Android 13, and clipboard reads from the tab in front go to the listeners' `onClipboardRead` while unclaimed reads wait for the owning tab until expiry.
 - **Why**: Bells and notifications matter most when the user is not looking at the tab, which only the service knows, and the clipboard needs a context that outlives the Activity.
-- **Tradeoffs**: Foreground feedback uses the bell REJECT pattern and existing channels retain their settings; the system may bundle tab notifications with the ongoing one, so the first tap expands the bundle; on Android 13 and later, background tabs allowed by the privacy gate can overwrite the clipboard with only the system's own confirmation, and a background tab reading the clipboard gets nothing.
+- **Tradeoffs**: Foreground feedback uses the bell REJECT pattern and existing channels retain their settings; the system may bundle tab notifications with the ongoing one, so the first tap expands the bundle; on Android 13 and later, background tabs allowed by the privacy gate can overwrite the clipboard with only the system's own confirmation, and a read from a background tab can remain pending.
 - **Watch out**: Existing channels keep user settings and heads-up alerts depend on Do Not Disturb and vendor behavior. Physical feedback depends on device settings and remains unverified, a bell flood still posts to the main thread, and per-tab notification limits allow several tabs to notify independently.
-- **Source**: d89b5fa (with android/terminal D36); 600700b (clipboard reads); f61072f3; d053be24; 2ff6f22c; 39e55b4b; a13a8b98
+- **Source**: d89b5fa (with android/terminal D36); 600700b (clipboard reads); f61072f3; d053be24; 2ff6f22c; 39e55b4b; a13a8b98, f3d226d5
 
 ### D21: Program statuses and finished commands notify through the tab's notification
 - **What**: `notifyStatus` posts the tab's notification (D19's) once per status for blocked, done and error, titled by the record's or the tab's title with the status in words and its message, and withdraws it when the status goes without the user unless a bell or OSC 9/777 replaced it (`statusNotified`); `onCommandFinished` posts it for a command of at least 10 s in a tab not in front ("Command succeeded", "Command failed" or "Command finished", the time taken in ICU's short units and a failure's exit code), replacing a status notification; in the tab in front done and error count as seen at once, and listeners hear `onTabStatus`.
@@ -143,13 +142,13 @@
 - **Watch out**: The service must see updated resources in onConfigurationChanged; the locale-change path was not exercised on a device.
 - **Source**: aed99afb; 20137e4c; d053be24; 39e55b4b
 
-### D25: Mirror probing runs only after import and is joined before replacement
+### D25: Mirror selection finishes before the new rootfs is published
 
-- **What**: The service launches a silent post-import mirror probe, removes manual mirror/measuring APIs and still joins the probe before deleting the store.
-- **Why**: Import-only mirror selection no longer needs Settings choices or progress callbacks.
-- **Tradeoffs**: Probe outcomes appear only in logs.
-- **Watch out**: The probe can still overlap the first kernel store open, with the existing possible skipped boot cleanup.
-- **Source**: a1367531; 20137e4c; d053be24; 39e55b4b
+- **What**: Pass the probe factory into rootfs preparation and use its completed measurements during import.
+- **Why**: A worker modifying a live store raced replacement.
+- **Tradeoffs**: Late results cannot improve the selected mirror.
+- **Watch out**: Probe workers must remain independent of the published store.
+- **Source**: a1367531; 20137e4c; d053be24; 39e55b4b, 568b6a48
 
 ### D26: A kernel owns an authenticated loopback browser endpoint
 
@@ -161,11 +160,11 @@
 
 ### D27: External file access requires a fresh default-off opt-in
 
-- **What**: Settings.fileAccess defaults false, ignores system_documents and is forced false during privacy mode; service changes save the gate, revoke provider grants when disabled and notify roots and listeners.
+- **What**: Settings.fileAccess defaults false, ignores system_documents and is forced false during privacy mode; service changes save the gate, revoke provider grants when disabled and notify roots and listeners. Replacement revokes provider access and refreshes roots both before reset and after reset completes.
 - **Why**: The former visibility preference cannot authorize the broader exposure of both document roots.
 - **Tradeoffs**: Users must opt in again, and enabling privacy clears the saved choice without restoring grants afterward.
 - **Watch out**: Writes bypassing the service miss revocation or notifications, and already-open descriptors and copied data remain outside revocation.
-- **Source**: d0ddf170, f61072f3 (android/documents); d053be24; 39e55b4b
+- **Source**: d0ddf170, f61072f3 (android/documents); d053be24; 39e55b4b, 6e9bd7a7
 
 ### D28: Privacy redacts notifications and authenticates report copying
 
@@ -215,6 +214,30 @@
 - **Watch out**: An unexpected I/O failure writing `/etc/skel` or `/var/lib/appine/bash-startup-done` on a modified store can block startup until repaired.
 - **Source**: 9f3e93ed
 
+### D20: Each machine polls its own login rules and document roots
+
+- **What**: Capture rule state per machine, queue rule refresh on the service worker, wait for process exit separately, and poll the auto-root watcher with changed directories.
+- **Why**: Directory notifications alone miss in-place account edits and obsolete machines can outlive queued work.
+- **Tradeoffs**: The worker and exit waiter have separate lifetimes.
+- **Watch out**: Detach and destroy must clear the watcher.
+- **Source**: d03c9b6, d5b808e8, ae1e05e0
+
+### D35: Clipboard reads wait for the owning session to reach the foreground
+
+- **What**: Offer a foreground session's read to listeners until one claims it and let the session retain unclaimed reads until expiry.
+- **Why**: A background tab can ask before the user returns.
+- **Tradeoffs**: The guest may wait for an answer.
+- **Watch out**: Removing a session must release its timer and requests.
+- **Source**: d10f2973, f3d226d5, ab417943
+
+### D36: Abandon only the failed distro's tarball during fallback
+
+- **What**: Delete the abandoned distro cache when initial store preparation fails and the service falls back to Alpine.
+- **Why**: A failed download can occupy storage after fallback.
+- **Tradeoffs**: A retry of the abandoned distro may download again.
+- **Watch out**: Normal termination and retry paths must preserve their tarballs.
+- **Source**: 9b179de1
+
 ## Superseded
 
 - ~~A `Session` interface in the service, with `createSession` building a `TermuxSession` or a `VtSession` by `VtNative.available` (6ffb912)~~ → narrowed to `VtSession` only by android/terminal **D8** in b38d29c (2026-11-04)
@@ -233,3 +256,7 @@
 - ~~Always showing the policy body for a non-private startup failure in c7e338a5~~ → replaced by **D31** in c97b00bf (2026-11-17, recovered headingless block).
 - ~~Unconditionally calling `Rootfs.ensureGpuCommand` during every per-start guest setup in 9cafc90b~~ → narrowed by **D32** in b605a0a3 (2026-11-21, implicit refinement).
 - ~~D7 combined ownership of TerminalService, Notifications.kt and Diagnostics.kt (12c4afa, 0553229, c7309c0c)~~ → replaced by **D7** and android/reports **D1** in e4d7bbe5 (2026-11-22).
+- ~~Matching saved layouts by 32-bit hash and assigning a reused console number to the open or most recently ended tab~~ → replaced by **D5** and **D8** in 6f2776f3 (2026-11-23)
+- ~~Using one directory-change list as the sole input to login-rule and document refresh~~ → replaced by **D20** in d5b808e8 (2026-11-24)
+- ~~Starting a post-import mirror thread and joining it on replacement~~ → replaced by **D25** in 568b6a48 (2026-11-24)
+- ~~Reducing background Kitty image storage only under memory pressure~~ → replaced by **D4** in 19e8be6f (2026-11-25)

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/ptrace"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on kernel/ptrace made before it was split from kernel/signal keep their `kernel/signal` tags and live in `.agents/decisions/kernel/signal.md`: D5, D6, D12, the ptrace half of D14, D17, D20 and D26.
 
@@ -18,8 +18,24 @@
 
 ### D2: Traced exits mark both changes to the killed flag
 
-- **What**: Mark cgroup freezer observations when clearing the killed flag for the exit event and when restoring it.
+- **What**: Mark cgroup freezer observations when clearing the killed flag for the exit event and when restoring it. Resume delivery after trace stops, clear deferred stepping on detach, and report sibling exits except during kernel shutdown.
 - **Why**: The temporary flag value can change whether a subtree counts as frozen.
 - **Tradeoffs**: An exit stop can trigger a content comparison even when the value stays the same.
 - **Watch out**: A checkpoint during the trace stop can observe the intermediate state.
-- **Source**: 0f5c5132
+- **Source**: 0f5c5132, 13dd5ae4
+
+### D3: Remote memory requests validate vectors in Linux order and retry cold FUSE pages locally
+
+- **What**: Check local vectors and zero totals before remote vectors or target lookup, and revalidate the stopped tracee and access after each unlocked fill.
+- **Why**: Either side of a remote access can fault or disappear during a wait.
+- **Tradeoffs**: A PEEK returns only a complete word.
+- **Watch out**: Never retain a strong tracee or Mm borrow across a FUSE wait.
+- **Source**: 54ce6b50, 25b0f2a0, 6084b8af, 3db35725
+
+### D4: Ptrace restores only writable FPCR bits
+
+- **What**: Apply the engine's write mask to restored FPCR.
+- **Why**: Hardware ignores unsupported floating-point control bits.
+- **Tradeoffs**: Returned state can differ from the submitted register image.
+- **Watch out**: Use the same mask as execution and sigreturn.
+- **Source**: 9163f493

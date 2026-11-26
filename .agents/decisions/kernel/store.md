@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/store"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D9 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D9 were seeded by hand from the retired design doc
 > §8.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -15,12 +15,13 @@
 - **Watch out**: Objects must always be addressed by inode number, never by guest path.
 - **Source**: design review 2026-10-24 (§8.1, §15)
 
-### D2: Regular files' size and times come from the host object
-- **What**: Size, mtime, atime and ctime of regular files are read from `objects/<ino>`; metadata changes chmod the object so the host bumps ctime.
-- **Why**: Data I/O goes straight to the host fd, so the host already maintains size and times. Directory and file timestamps used to go stale (breaking Python's import cache, PHP tests, Maildir, git's untracked cache); taking the later of the database and object ctime failed because the two clocks can differ (on virtiofs the object's clock was 84 ms ahead), so each file uses only the host's clock.
-- **Tradeoffs**: Non-regular inodes keep times in SQLite with atime equal to mtime.
-- **Watch out**: Changing a regular file's database metadata without touching the object leaves a stale ctime.
-- **Source**: design review 2026-10-24 (§8.1), round 73 (`73-timestamps`)
+### D2: Guest atime is stored separately from host object size and modification times
+
+- **What**: Keep guest atime in SQLite, seed it from legacy storage, and cache verified relatime freshness while using object metadata for regular-file size and modification times.
+- **Why**: Host reads and independent writers must not corrupt guest-visible access time.
+- **Tradeoffs**: Freshness caching requires a per-store epoch and writer tracking.
+- **Watch out**: Exclude writable shared mappings and memfds from the relatime cache, and touch the host object when a metadata update must advance regular-file ctime.
+- **Source**: design review 2026-10-24 (§8.1), round 73 (`73-timestamps`), aeaffd4b, 30e5002e, 7a039c93, df6ee707, 1f99a1c4
 
 ### D3: Writes are deferred up to 5 ms in one transaction with a savepoint per operation
 - **What**: A write transaction stays open up to 5 ms; each operation is a savepoint that alone is rolled back on error or panic.
@@ -64,33 +65,35 @@
 - **Watch out**: Detached trees must be cleaned up when their last mount goes away and at boot.
 - **Source**: round 117 (`117-tmpfs`)
 
-### D9: The host browse API skips guest permissions but confines writes
-- **What**: The provider resolves guest paths itself, reads anywhere and writes only below a caller-supplied directory (the login account's home), refusing with `EACCES` one whose real path is the root directory.
-- **Why**: Users copy files in and out of Appine through Android's Files app; the provider acts for the device owner, not a guest user.
-- **Tradeoffs**: Guest permission bits do not restrict the provider; confinement relies on the caller-supplied directory.
-- **Watch out**: Host writes are replayed to running kernels as inotify events so guest watchers notice them.
-- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`), 201 (`201-documents-notify`); d5dbe29
+### D9: Provider mutation validates the destination at publication
+
+- **What**: Decode only hexadecimal escapes, check the permitted home inside the mutation transaction, sync the staged file and publish without replacing a competing entry.
+- **Why**: A path or home can change during a slow copy.
+- **Tradeoffs**: Guest permission bits do not restrict the provider, but custom homes must belong to a validated interactive account outside protected roots.
+- **Watch out**: Notify guest watchers only after commit.
+- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`), 201 (`201-documents-notify`); d5dbe29, 6e9bd7a7, f6a9510b, 4afada09
 
 ### D10: The inode store is a module of its own, below the VFS
 - **What**: kernel/store covers `vfs/store.rs`, `vfs/import.rs`, `vfs/browse.rs` and the host wrappers in `lib.rs` (the namespace and objects, deferred commits and power-loss ordering, the reaper and checkpoints, boot cleanup, the metadata cache, import and the browse API), with the VFS layer above it in kernel/vfs.
 - **Why**: The retired design doc's §8.1 described the store in prose that had drifted from the code.
 - **Tradeoffs**: The rationale lives only in this decisions file, and rounds keep § references to the design doc of their time.
-- **Watch out**: Bugs confirmed at the split stay open in the map (leaked objects and misreported import errors), and so do four debts of sharing (D17): shared mappings left on the old object by a Files app write, a deleted held file keeping its share until boot, reads never updating a held file's access time, and whole-file copies on the first change.
-- **Source**: c5236a1 (bug list since updated by 907b82b, c108be0, df6ee70 and 1f99a1c)
+- **Watch out**: Current object-pinning, relatime and last-reference cleanup contracts are recorded in D2 and D17, and a clone can still require a whole-file copy.
+- **Source**: c5236a1 (bug list since updated by 907b82b, c108be0, df6ee70 and 1f99a1c), 68130f74, 30e5002e, d96f5d63
 
-### D11: Boot cleanup keeps the numbers it removed away from the reaper
-- **What**: `remove_orphans` drops the inode numbers it just deleted from the doomed list, so the boot commit hands none of them to the reaper.
-- **Why**: Boot cleanup's unlinks queued objects that `remove_orphans` then deleted directly, and the reaper, still given those numbers, could delete a new file's object.
-- **Tradeoffs**: It relies on `remove_orphans` running in the same transaction as the emptying, which boot cleanup always does, and the reaper itself stays blind to identity.
-- **Watch out**: A boot-time step that unlinks files after `remove_orphans` would queue numbers for the reaper again (a map invariant).
-- **Source**: b8bf44c
+### D11: Exclusive boot cleanup makes metadata durable before unlinking objects
+
+- **What**: Lock before create or recovery, clean in one transaction, clear the boot token, commit and sync the WAL unconditionally before unlinking orphans, then join before downgrading.
+- **Why**: A crash or failed sync can leave recoverable SQLite references to objects queued for deletion.
+- **Tradeoffs**: Exclusive opens incur a sync even when the unlink set is empty and the reaper may back off.
+- **Watch out**: Use independent mapping and store lock descriptors, retain doomed objects on sync failure and restore recovery state on error.
+- **Source**: b8bf44c, 68b70897, 11c74fa5, 5772f924, be442caa, 2173fed5, 66bcd1b0, e3e6cb18
 
 ### D12: chown's setgid clearing is decided by the syscall layer
-- **What**: `set_owner` takes `keep_sgid` from its caller and clears setgid when it is false as well as when the file is group-executable, while setuid is still cleared for every caller.
+- **What**: `set_owner` takes `keep_sgid` from its caller and clears setgid when it is false as well as when the file is group-executable, while setuid is still cleared for every caller. Writes and chown clear setgid according to group execute and the caller's authority to retain it.
 - **Why**: The store alone could not know the caller's group membership.
 - **Tradeoffs**: None.
 - **Watch out**: None known; the only other caller is a unit test.
-- **Source**: ce7d0d8
+- **Source**: ce7d0d8, ab694aab
 
 ### D13: Store files read in the order their code runs
 - **What**: store.rs runs constants and `SCHEMA`, then `struct Store` with `impl Store` right under it in sections (opening and boot cleanup, reads, changes, transactions and deferred commits, metadata cache, objects, connection) and its Drop, then operations, shared state, cache entries, the lock file's counters, reaper and checkpoints, errors and names; browse.rs ends with path resolution, import.rs starts with `import_tar_gz`, and lib.rs's host wrappers follow their JNI functions.
@@ -106,12 +109,12 @@
 - **Watch out**: None known.
 - **Source**: 907b82b
 
-### D15: An unlinked inode cannot get a new name
-- **What**: `Store::link` returns `ENOENT` for a row with link count 0, after the directory check, as Linux's `vfs_link` does (kernel/vfs D28).
+### D15: Only a linkable unnamed inode can acquire its first name after creation
+- **What**: `Store::link` returns `ENOENT` for an ordinary row with link count 0, after the directory check, as Linux's `vfs_link` does (kernel/vfs D28). O_TMPFILE creates a transactional linkable exception for an unnamed inode unless O_EXCL was requested, with bookkeeping rolled back alongside SQLite.
 - **Why**: An nlink-0 inode's object is deleted after the next commit, so a new name would dangle and boot cleanup would never remove it.
-- **Tradeoffs**: O_TMPFILE's `I_LINKABLE` exception has no counterpart, since O_TMPFILE is not implemented.
+- **Tradeoffs**: The store tracks linkable unnamed files in memory and rolls that state back with failed transactions.
 - **Watch out**: None known.
-- **Source**: c108be0
+- **Source**: c108be0, 65e10e36
 
 ### D16: st_blocks comes from the host object
 - **What**: `Stat::blocks` is an `Option<u64>` filled from the host object's st_blocks by `fill_from_host` and `fill_from_object` and `None` elsewhere, where the size stands in, and st_blocks and tmpfs accounting follow it (kernel/vfs D37).
@@ -120,12 +123,13 @@
 - **Watch out**: Hosts that report delayed allocation late would undercount tmpfs writes until the instance is recounted.
 - **Source**: 5d7b936
 
-### D17: Files share a store object until one is written
-- **What**: `share` makes a file use another's object, recorded in the `shared` table that the cached row joins, the first change to either side unshares it (`unshare`, `finish_unshare`, `abandon_unshare`, or `make_private` for all three under the BKL; in place when no other row uses the object, else into an object numbered by an nlink-0 row), boot drops the shares of deleted files and removes objects nothing uses, and `Store::host_writing` keeps an object the Files app has open for writing (`HOST_WRITERS`, kept by `browse::open_write` and `browse::written`) out of sharing, for kernel/vfs's clones and overlay copy-up (kernel/vfs D45 and D40).
-- **Why**: Copying files cost their whole data in time and flash although most copies are never changed, phones' host filesystems have no reflink, and a guest clone made while the Files app held the host object open for writing would have received the app's later writes.
-- **Tradeoffs**: Sharing is whole-file, so the first change copies everything; reads never update a held file's atime; a deleted held file that was open keeps its share until boot; a close the provider never reports keeps its object out of sharing until the process ends; an older build opening a store with shares reads the wrong objects.
-- **Watch out**: Nothing may write a held file's object in place, `drop_object` trusts without a query that no row uses a plain file's number, numbers used as objects must keep their rows at boot, browse callers must report every close through `written` with the path they opened, and a Files app write that unshares a file leaves the running kernel's shared mappings on the old object (a map bug).
-- **Source**: df6ee70, 1f99a1c
+### D17: Clone sharing and mappings use transactional object pins
+
+- **What**: Select and lock the backing in one write transaction, probe both clone endpoints, split before private mmap or provider writes and release unused held objects after the last reference.
+- **Why**: Mapped files and external writers must stay coherent without changing independent clones.
+- **Tradeoffs**: A pin can force a whole-file copy, a missing provider-close report can keep a writer registered, and older builds cannot interpret shared objects.
+- **Watch out**: The live scan must include mappings, open descriptions, unsharing and inotify holders.
+- **Source**: df6ee70, 1f99a1c, 523ae8a9, f495f2cc, 68130f74, 11816722, d96f5d63
 
 ### D18: `appine_kernel::write_file` accepts explicit new-file `uid` and `gid`
 - **What**: `appine_kernel::write_file` takes `uid: u32` and `gid: u32` parameters and delegates to `vfs::write_file_owned`.
@@ -133,3 +137,44 @@
 - **Tradeoffs**: Changes the Rust crate's `write_file` signature (currently used only by `hosts/android`).
 - **Watch out**: Any future host caller outside `hosts/android` must pass explicit ownership IDs.
 - **Source**: 125f3d00
+
+### D19: Savepoint rollback removes newly created host objects
+
+- **What**: Track new object numbers during writes and make import and device-node setup one transaction.
+- **Why**: Rolling back SQLite alone leaves object files behind.
+- **Tradeoffs**: A transaction temporarily tracks new objects.
+- **Watch out**: Clean both creation and replacement bookkeeping on rollback.
+- **Source**: 0e02d7cd
+
+### D20: Store handle lookup identifies the inode's filesystem root
+
+- **What**: Follow the inode or dentry parent chain to the fixed-point root and reject an unlinked inode.
+- **Why**: A handle opened against a different tmpfs instance must be stale.
+- **Tradeoffs**: Determining the root can require several SQLite lookups.
+- **Watch out**: The walk relies on acyclic parent links.
+- **Source**: 6fcaff37
+
+### D21: Rootfs import validates PAX extended attributes
+
+- **What**: Import supported security, trusted, user and POSIX ACL attributes after checking the file kind and encoded value.
+- **Why**: Tarballs carry permissions and capabilities outside ordinary mode bits.
+- **Tradeoffs**: Unsupported or malformed attributes are skipped.
+- **Watch out**: Validate capability versions and ACL encodings before storing them.
+- **Source**: 6fcaff37
+
+### D22: Removing a published object pins its host identity across unlink
+
+- **What**: Open the object without following symlinks, obtain device and inode from the pin and forget writable-sharing state only after successful unlink.
+- **Why**: The host can recycle an inode number immediately after its last reference closes.
+- **Tradeoffs**: Deletion of a published object takes an extra descriptor.
+- **Watch out**: Hold it until the content registry update completes.
+- **Source**: 9163f493, 4768d932, 9951951a
+
+## Superseded
+
+- ~~Leaving mapped readers on the old backing object after a provider write~~ → replaced by **D17** in 523ae8a9 (2026-11-24)
+- ~~Selecting mapped backing separately from opening and locking it~~ → replaced by **D17** in f495f2cc (2026-11-24)
+- ~~Exposing host atime directly and skipping guest atime updates on held files~~ → replaced by **D2** and **D17** in 30e5002e (2026-11-24)
+- ~~Unlinking boot-cleanup objects inside the transaction after syncing only the preceding WAL~~ → replaced by **D11** in be442caa (2026-11-26)
+- ~~Taking the shared lock first and syncing the new WAL only when objects await deletion~~ → replaced by **D11** in 2173fed5 (2026-11-26)
+- ~~Mapping the commit header through the live store lock descriptor and locking only after connecting during create~~ → replaced by **D11** in 66bcd1b0 (2026-11-26)

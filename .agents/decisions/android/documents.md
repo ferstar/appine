@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/documents"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D6 were seeded by hand from the retired design doc
 > §11.3 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -15,25 +15,27 @@
 - **Watch out**: `Rootfs.access` keeps provider calls from overlapping the kernel's exclusive boot open and store deletion.
 - **Source**: round 196 (`196-documents-read`)
 
-### D2: Document IDs are guest absolute paths
-- **What**: IDs are canonical absolute paths with `%`, control characters and non-UTF-8 bytes escaped as `%XX`; only canonical IDs inside a shown root are accepted.
-- **Why**: Paths are readable when debugging, and the escaping keeps arbitrary byte names reversible.
-- **Tradeoffs**: A file re-created at the same path is the same document to the framework.
-- **Source**: round 196 (`196-documents-read`)
+### D2: Document IDs use canonical paths and track retired names
+
+- **What**: Accept canonical absolute IDs inside a shown root, round-trip escaped path bytes, reject NUL, and validate generations against retired names along the resolved path and symlink targets.
+- **Why**: A reused path must not confer an old grant on the replacement.
+- **Tradeoffs**: Generation checks add store reads that listings can batch.
+- **Watch out**: A descriptor opened before retirement stays usable.
+- **Source**: round 196 (`196-documents-read`), 6e9bd7a7, 68b70897
 
 ### D3: Only the login account's home is writable, limited by real path, and new files belong to that account
-- **What**: When file access is enabled, the login home is writable within its real path and the system root is read-only; writes through symlinks outside home are refused, new files use login ownership and 0644/0755, collisions are numbered, renames/moves never overwrite, and a home of / provides no writable root.
+- **What**: When file access is enabled, the login home is writable within its real path and the system root is read-only; writes through symlinks outside home are refused, new files use login ownership and 0644/0755, collisions are numbered, renames/moves never overwrite, and a home of / provides no writable root. Home discovery also requires a directory and invalidates its shared cache when roots change.
 - **Why**: Copying files in and editing them with Android apps is the common use, and files must be editable by the same account in the terminal.
 - **Tradeoffs**: There is no home-only mode or guest permission enforcement, copies use create-and-write, and users whose home is / get only the read-only system root.
 - **Watch out**: A home that is a symlink to `/` passes the Kotlin check (its flags are only a hint), and only the store's check (kernel/store D9) refuses its writes.
-- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`); d5dbe29; d0ddf170; d053be24; 39e55b4b
+- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`); d5dbe29; d0ddf170; d053be24; 39e55b4b, 6e9bd7a7
 
 ### D4: Changes reach the other side in both directions
-- **What**: Provider changes are replayed under each running kernel's lock as inotify events; write fds are wrapped by `ParcelFileDescriptor.wrap` with a close listener on the documents-close thread that reports `IN_MODIFY`/`IN_CLOSE_WRITE`; directories the guest changed are polled by the service and notified to the Files app in one `notifyChange` call.
+- **What**: Provider changes are replayed under each running kernel's lock as inotify events; write fds are wrapped by `ParcelFileDescriptor.wrap` with a close listener on the documents-close thread that reports `IN_MODIFY`/`IN_CLOSE_WRITE`; directories the guest changed are polled by the service and notified to the Files app in one `notifyChange` call. Imports notify the provider after publication, resolving changed directory IDs against the store that received the file.
 - **Why**: Hot-reload tools in the guest (`vite`, `cargo watch`) must see edits made with Android editors, as they do in Termux where files are real host files; the kernel's inotify is emulated and knew nothing of the provider's separate store connection. The Files app also did not refresh after guest changes.
 - **Tradeoffs**: If `wrap` throws, the same fd number is adopted again and handed out without close events, relying on `wrap` detaching the fd before it can fail (as AOSP has since API 30); the batched notification drops the sync-to-network flag, which no sync adapter here uses.
 - **Watch out**: A platform whose `wrap` fails before detaching would make the fallback adopt an fd `wrap` already closed.
-- **Source**: round 201 (`201-documents-notify`); 88b9138
+- **Source**: round 201 (`201-documents-notify`); 88b9138, 6f2776f3, f495f2cc
 
 ### D5: Files without a known extension are recognised as text by content
 - **What**: Unknown types are sniffed in one batch: the first 4 KB without NUL and valid UTF-8 means `text/plain`; at most 1000 files per call.
@@ -90,8 +92,33 @@
 - **Watch out**: Already-open descriptors, calls past the gate and copied data can survive revocation; persisted picker-grant behavior still needs device verification.
 - **Source**: d0ddf170, f61072f3; d053be24; 39e55b4b
 
+### D13: Provider writes preserve set-ID mode bits
+
+- **What**: Host writes retain setuid and setgid bits and writable opens clear file capabilities under the store's rules.
+- **Why**: The provider uses a privileged host file descriptor.
+- **Tradeoffs**: Guest and provider writes have different privilege-bit semantics.
+- **Watch out**: Later writes on the returned descriptor bypass the open hook.
+- **Source**: 11816722
+
+### D14: Automatic login roots follow account and home changes
+
+- **What**: AutoRootsWatcher samples passwd metadata and watches the home parent before notifying the framework of changed roots.
+- **Why**: An account or home can change while the provider is active.
+- **Tradeoffs**: Polling is limited to the auto-login file-access path.
+- **Watch out**: Both account-file edits and home-directory changes can invalidate the root.
+- **Source**: ae1e05e0
+
+### D15: Provider callbacks preserve meaningful storage errors
+
+- **What**: Preserve missing-file exceptions, translate access denial to a security error, and expose other I/O failures as provider operation failures.
+- **Why**: Clients need to distinguish a missing document from a denied or failed operation.
+- **Tradeoffs**: Kotlin translates the native exception classes at the provider boundary.
+- **Watch out**: A full store must not appear to contain a missing file.
+- **Source**: 9b179de1
+
 ## Superseded
 
 - ~~Write fds reopened by their `/proc/self/fd` path to get a close callback, since `wrap` needed API 30 above minSdk 29 (D4 in part, round 201)~~ → replaced by **D4** in 88b9138 (2026-11-07)
 - ~~D8’s companion path/MIME helpers keeping their old order~~ → replaced by **D8** in 9d485e6e (2026-11-12)
 - ~~Always-visible home and an independently optional system root in D3, plus the old settings lookup in D11~~ → replaced by **D3, D11 and D12** in d0ddf170 (2026-11-14, the SUPERSEDES reference to D2 does not match its path-ID contract and remains unresolved)
+- ~~Treating removal and recreation of the same provider path as one document identity~~ → replaced by **D2** in 68b70897 (2026-11-24)

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/native"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D4 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D4 were seeded by hand from the retired design
 > doc §11 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -21,6 +21,10 @@
 - **D14** — Static Appine notices and catalog entries use capitalized `Appine` (while asset IDs/paths stay lowercase), and instrumentation asserts `Welcome to Appine` and the `Appine` component lookup (3f04bf5; bd580227; d053be24; 39e55b4b)
 - **D21** — Static catalog subtitles keep license names and qualifiers without descriptive suffixes across locales, leaving descriptions and Appine's source URL in details (d35669e1; 20137e4c; bd580227; d053be24; 39e55b4b)
 - **D22** — `androidx.preference:preference:1.2.1` is a direct non-KTX catalog dependency whose upgrades must stay compatible with Material/AppCompat and pass notice and lint checks (f8822b8b; 20137e4c; bd580227; d053be24; 39e55b4b)
+
+> Full text of D35: `git show 3ad68857ee83ca9bb227d4d55db8611416ae226b:.agents/decisions/android/native.md`
+
+- **D35** — Native.writeFile uses one JNI symbol and Kotlin zero defaults for optional uid/gid (no Java five-argument overload), and callers must reject negatives before Rust converts to u32 (125f3d00)
 
 ## Active (full detail)
 
@@ -87,10 +91,10 @@
 - **Source**: 4c1a3ce
 
 ### D12: Builds package independent offline Alpine bundles
-- **What**: Version ordering selects fetched artifacts, requiring four bash, seven procps and two bubblewrap/libcap2 assets in independent bundles, with shared ncurses payloads duplicated but attribution counted once and package metadata still driving release-source discovery.
+- **What**: The pinned input inventory selects fetched artifacts (android/build), requiring four bash, seven procps and two bubblewrap/libcap2 assets in independent bundles, with shared ncurses payloads duplicated but attribution counted once and package metadata still driving release-source discovery.
 - **Why**: Each offline login bundle needs complete dependencies independent of the selected shell or other installers.
 - **Tradeoffs**: Bash adds about 0.86 MB, procps about 0.62 MB and bubblewrap/libcap2 53,886 compressed bytes, while notices are now updated manually.
-- **Watch out**: Newest fetched artifacts can differ from release pins; preserve failure/retry, concurrent offline login, independent-install, user-removal and sandbox tests, with full source-archive and 16 KB-page validation still outstanding.
+- **Watch out**: Preserve failure/retry, concurrent offline login, independent-install, user-removal and sandbox tests, with full source-archive and 16 KB-page validation still outstanding.
 - **Source**: b014e84; 7aa817af; 410ef192; 20137e4c; bd580227, 0815b3e4; d053be24; 39e55b4b
 
 ### D15: Every JNI function catches panics
@@ -217,13 +221,37 @@
 - **Watch out**: OEM schedulers delaying `:venus` beyond 3 s will still miss the probe on that startup.
 - **Source**: b605a0a3
 
-### D35: `Native.writeFile` accepts default zero `uid` and `gid` parameters
+### D36: Start the stderr reader before redirecting fd 2
 
-- **What**: `Java_io_github_mthli_appine_Native_writeFile` and `Native.writeFile` add `uid: Int = 0, gid: Int = 0` so existing 5-argument Kotlin call sites remain source-compatible under one JNI symbol while callers can create user-owned files.
-- **Why**: `Rootfs` needs to create user-owned `.bash_profile` and `.bashrc` files in pre-existing regular users' home directories before kernel start.
-- **Tradeoffs**: Relies on Kotlin's synthetic `$default` helper rather than a Java-visible 5-argument overload.
-- **Watch out**: Negative `uid`/`gid` values convert via `as u32`, so callers must validate non-negative IDs.
-- **Source**: 125f3d00
+- **What**: Start the logging thread while the pipe writer is open, then redirect stderr only after the thread starts.
+- **Why**: A failed thread start could leave stderr connected to a pipe without a reader.
+- **Tradeoffs**: Both temporary descriptors need explicit failure handling.
+- **Watch out**: Closing the writer too early signals EOF to the reader.
+- **Source**: 6f2776f3
+
+### D37: JNI import callbacks borrow the writable fd
+
+- **What**: The native import hands Java a borrowed descriptor and preserves the original exception if its writer fails.
+- **Why**: The callback supplies contents while native code controls publication.
+- **Tradeoffs**: Descriptor ownership spans the JNI call.
+- **Watch out**: A wrapper must leave the native descriptor valid.
+- **Source**: f6a9510b
+
+### D38: JNI batches metadata and releases local references per element
+
+- **What**: Read document generations in one store snapshot, return ordered account metadata as longs, and release each temporary Java string while assembling or consuming arrays.
+- **Why**: Large directory and report batches can exhaust the JNI local-reference table.
+- **Tradeoffs**: Java and Rust share the metadata ordering contract.
+- **Watch out**: Changes to the tuple layout must reach every consumer.
+- **Source**: 68b70897, d5b808e8, ae1e05e0
+
+### D39: JNI translates browse failures by errno
+
+- **What**: Map missing paths, existing destinations and denied access to distinct Java exceptions and preserve other I/O failures as such.
+- **Why**: Provider callers act differently on absence, collision and access denial.
+- **Tradeoffs**: The bridge maintains an explicit errno mapping.
+- **Watch out**: ENOTDIR follows the missing-path mapping.
+- **Source**: 9b179de1
 
 ## Superseded
 

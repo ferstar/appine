@@ -2,14 +2,14 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
 >
-> Last distilled: 2026-11-24 (HEAD = 231480cb). D1–D17 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D17 were seeded by hand from the retired design
 > doc §5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
 ## Constraint index (compressed active decisions)
 
 > Full text of D1, D2, D4, D6–D9, D11–D17, D19–D21, D23–D26: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/kernel/mm.md`
-> Full text of D3, D5, D10, D28–D33, D36–D39, D41–D44: `git show 597290948791d48aa8074f338e2dba5f0fc6cfab:.agents/decisions/kernel/mm.md`
+> Full text of D3, D5, D10, D28–D33, D36, D38–D39, D41–D44: `git show 597290948791d48aa8074f338e2dba5f0fc6cfab:.agents/decisions/kernel/mm.md`
 
 - **D1** — Guest memory uses a software radix page table per address space and a software TLB per thread, never emulated ARM translation hardware, and the TLB layout is a contract with the Tier 1 translator, which inlines the check (design review 2026-10-24, round 23)
 - **D2** — Unmapped host memory is released only after the other threads are quiesced (the graveyard) and then after the BKL drops (a thread-local list), so any new path freeing host memory under the BKL must use the same deferral, and the OOM killer skips a round while releases are pending (rounds 04, 29, 36, 109)
@@ -42,7 +42,6 @@
 - **D32** — `Oom::stuck` skips victims that outlive a second until their last thread ends, `badness` scores unclamped as `oom_badness` (skipping vfork children whose `Task::vfork` must clear in `release_mm`, omitting swap/page tables), and `proc_score` scales against host RAM plus swap for `oom_score` (kernel/procfs D30) (b43ff37, 39ea702)
 - **D33** — `MADV_REMOVE` forwards whole host pages to host `MADV_REMOVE` and zeroes edges or refused ranges (tmpfs accounting updates only on recount), and `MADV_DONTNEED` refills the vDSO from its image (dropping debugger breakpoints) (5d7b936)
 - **D36** — madvise counts every advice value refused up front (KSM, THP, hwpoison, plus invalid test advice) as an unimplemented path (kernel/signal D24) (99b4216)
-- **D37** — When a shared store file gets its own object (kernel/store D17), `file_moving` clips and syncs all shared mappings first before `file_moved` remaps them with `MAP_FIXED` (private mappings stay on the old object; Files app writes do not move live kernel mappings) (df6ee70)
 - **D38** — `Mm::map_vvar` maps host live vvar pages below the vDSO as a read-only foreign Shared VMA (`[vvar]`, never written/unmapped/discarded, omitted from RSS/smaps/core dumps), and `Mm::vdso_syscalls` patches svc clock stubs on entering an offset time namespace (restored across discard) (kernel/signal D4, hal D18) (16364c0)
 - **D39** — Shootdowns kick threads in guest code without holding later entrants out (only `quiesce` does), so `mprotect` updates per VMA without relying on a prior shootdown: drop write, install RO CoW entries, then restore write in runs around them (f51f688, 04163e7)
 - **D41** — `Mm::code` and `Mm::data` record main-program `start_code`/`end_code`/`start_data`/`end_data` from the loader (copied at fork) alongside `brk_start` and `start_stack` for `/proc/<pid>/stat` (kernel/procfs D34) (6d9a9e8)
@@ -60,11 +59,11 @@
 - **Source**: cd53f35, 44a21b7 (scope since extended by 3f3db11 and d2b1dc3; bug list since updated by 3f3db11, 1459292, 4e64e74, 400817d, 5d23297, d9e1f0c and 5760479); 36083476; 20137e4c; cf029f9a; 8a17e4a9; d053be24; 60790c14; 39e55b4b; 610d623f; 4fcd3e13
 
 ### D22: Linux VMA boundaries are computed over unmerged pieces
-- **What**: `same_vma` decides which adjacent pieces form one Linux VMA (contents source, backing, protection, flags, grows-down and an `anon` identity that fork renews per parent VMA) for maps, mremap's one-VMA rule and `PROT_GROWSDOWN`; mprotect follows `do_mprotect_pkey`; a guard gap below grows-down VMAs and `MMAP_MIN_ADDR` (32768) bound placement; and failed kernel accesses grow stacks.
+- **What**: `same_vma` decides which adjacent pieces form one Linux VMA (contents source, backing, protection, flags, grows-down and an `anon` identity that fork renews per parent VMA) for maps, mremap's one-VMA rule and `PROT_GROWSDOWN`; mprotect follows `do_mprotect_pkey`; a guard gap below grows-down VMAs and `MMAP_MIN_ADDR` (32768) bound placement; and failed kernel accesses grow stacks. Joining also checks anonymous page offsets, lazy anon_vma state, permitted execution, noreserve and sticky accounting, preserving faulted offsets across moves.
 - **Why**: With VMAs never merged (D7), maps, mremap, `PROT_GROWSDOWN`, merging after fork, stack growth on kernel accesses, partial mprotect and mmap_min_addr all differed from Linux, as Starnix's mmap tests showed.
 - **Tradeoffs**: fork reads pagemap once per written private file mapping's host region (hal D12), `anon_vma` is still approximated, and direct `Mm::read`/`write` callers do not grow stacks.
 - **Watch out**: mremap now refuses ranges spanning differently flagged pieces with `EFAULT` (as Linux before 6.17), partial mprotect leaves earlier VMAs changed on error, and the fork pagemap read may show in fork-heavy benchmarks.
-- **Source**: 1459292, e03c0cc
+- **Source**: 1459292, e03c0cc, 9d0ad1b6, ab417943
 
 ### D27: `MADV_DONTNEED` reverts written private file mappings to the file
 - **What**: For written private file VMAs, `discard` gives the whole host pages of a host private file mapping back with the host's `MADV_DONTNEED` (`discard_file_host`, shared with the anonymous path) and returns `Reread`s for partial host pages (16 KB hosts) and VMAs copied into anonymous memory by `unshare`, which madvise reads from the store object (zeros past EOF or when it cannot be opened) and stores with `Mm::fill_private`, queueing executable ranges for invalidation.
@@ -87,12 +86,13 @@
 - **Watch out**: A dying thread still running guest code reads zeros where Linux would fault, and the release must not reuse `discard`, which makes borrowers copy lent pages and settles borrowed ones by copying.
 - **Source**: b141001, 39ea702, 983fc3d
 
-### D40: FUSE mappings read pages on demand into a per-mmap memfd
-- **What**: A FUSE file mapping gets a `Fill` at mmap, shared by all VMAs from that mmap, that holds a sparse memfd as long as the file (hal D19), the open file, the runs of pages read and read-ahead state; its VMAs keep `file_len` 0 and get entries only for pages read, guest faults read a window (32 pages, doubling up to 512 for sequential access) with the BKL released, kernel copies fail with `FUSE_RETRY` so the dispatcher reads the page and reruns the syscall (kernel/fuse D2), fork, unshare and mremap map the memfd again, `MADV_DONTNEED` returns pages to what was read, and shared writable mappings are refused with `EACCES`.
-- **Why**: FUSE files have no host object to map, and copying the whole range at mmap read a whole 1 GB file to touch a few pages and hid the file behind a store inode number that mremap and `MADV_DONTNEED` used to open unrelated store objects.
-- **Tradeoffs**: There is no page cache, so a page keeps what was read when first touched, separate mmap calls read separately, the size is fixed at mmap, a sequential scan costs one round trip per window, and mlock, `MADV_WILLNEED` and core dumps do not read pages.
-- **Watch out**: A syscall other than read, write and their vector and positional forms that touches an unread page after side effects repeats them on the retry or returns a short count, a new path sizing entries by contents rather than `file_len` would map unread pages, and a short read is taken as a whole window (a map bug).
-- **Source**: c008749, 3957a03
+### D40: FUSE mappings share per-inode sparse backing and honor range invalidation
+
+- **What**: Retain the source per mapping, share filled pages through an inode memfd, and revoke translations and stale fills across mappings when a range changes.
+- **Why**: Per-mmap storage could diverge from another mapping or a descriptor write.
+- **Tradeoffs**: Fills and dirty baselines require range tracking.
+- **Watch out**: An outstanding read must not restore an invalidated page.
+- **Source**: c008749, 3957a03, b421eac0, 576501d3
 
 ### D45: GPU mappings retain coherent renderer storage in shared VMAs
 - **What**: Guest GPU mappings keep the coherent renderer backing in a shared VMA across fork, VMA splits and TLB invalidation, so closing a GEM handle leaves live guest mappings intact.
@@ -125,11 +125,11 @@
 
 ### D49: Non-destructive `madvise` hints forward unlocked with retained host regions and prefill file PTEs
 
-- **What**: `madvise` collects coalesced host-page-aligned `AdviseRange` slices holding `Arc<HostRegion>` (skipping reserved, foreign, GPU, FUSE `Fill` and untouched anonymous VMAs, clipping to `file_len`, and restricting `MADV_NORMAL`/`RANDOM`/`SEQUENTIAL` to file-backed host mappings), prefills read-only non-FUSE file soft PTEs up to 4 GiB per call, and forwards hints via `appine_hal::advise` inside `Cx::unlocked` (mapping `MADV_POPULATE_READ` to host `MADV_WILLNEED`).
+- **What**: `madvise` collects coalesced host-page-aligned `AdviseRange` slices holding `Arc<HostRegion>` (skipping reserved, foreign, GPU, FUSE `Fill` and untouched anonymous VMAs, clipping to `file_len`, and restricting `MADV_NORMAL`/`RANDOM`/`SEQUENTIAL` to file-backed host mappings), prefills read-only non-FUSE file soft PTEs up to 4 GiB per call, and forwards hints via `appine_hal::advise` inside `Cx::unlocked`. MADV_POPULATE_READ uses an explicit population path, and mlock and WILLNEED can fetch cold FUSE pages while the kernel lock is released.
 - **Why**: Ignoring `MADV_WILLNEED`, `MADV_SEQUENTIAL`, `MADV_RANDOM` and `MADV_POPULATE_READ` blocked host page-cache readahead on large model files and left soft page tables empty until per-fault BKL entries.
-- **Tradeoffs**: `MADV_POPULATE_READ` stays advisory without synchronously faulting host pages or returning `EFAULT` on inaccessible mappings, and anonymous VMAs do not receive host `MADV_SEQUENTIAL`/`MADV_RANDOM` flags so recycled regions are not split.
+- **Tradeoffs**: Anonymous VMAs do not receive host `MADV_SEQUENTIAL`/`MADV_RANDOM` flags so recycled regions are not split.
 - **Watch out**: If another thread unmaps the last VMA while `AdviseRange` is held across `Cx::unlocked`, `HostRegion::drop` runs outside the BKL, so any future `HostRegion` kind requiring BKL-only drop must be excluded or handled.
-- **Source**: d0945a96
+- **Source**: d0945a96, 20631a25, b3b7ee74
 
 ### D50: VMA mount pins, `mremap`/`munmap` shm and vDSO updates, and short-reply FUSE `Fill` tracking
 
@@ -155,13 +155,68 @@
 - **Watch out**: Any future `Backing` variant requiring `MADV_DONTNEED` handling must be added as an explicit branch in `Mm::discard`.
 - **Source**: 3a90a0ef
 
-### D53: Track shrunken shared-anonymous `mremap` regrowth gap while keeping other gVisor cases
+### D53: Shared anonymous regrowth retains the original mapping extent
 
-- **What**: Appine tracks the shrunken shared-anonymous `mremap` regrowth mismatch in `.agents/maps/kernel/mm.md` and excludes only `SharedAnon` while retaining the other 32 gVisor mremap differential cases.
-- **Why**: Regrowing a shrunken shared anonymous mapping exposes fresh pages on Appine instead of restoring original contents up to the original extent and delivering `SIGBUS` beyond it as Linux does.
-- **Tradeoffs**: `SharedAnon` stays outside regular differential comparisons until both original-content restoration and past-extent `SIGBUS` hold.
-- **Watch out**: Restoring the old page contents alone without past-extent `SIGBUS` would leave the Linux mismatch unresolved.
-- **Source**: 54ce6b50
+- **What**: Reuse the region on growth or duplication, bound access by its backing length and preserve or update the SysV attachment base according to the move.
+- **Why**: Shrinking and growing a mapping must preserve the original backing relationship.
+- **Tradeoffs**: The VMA can extend past the accessible region.
+- **Watch out**: RSS and pagemap walks must obey the same extent.
+- **Source**: 54ce6b50, 74584914
+
+### D37: Store mappings retain the backing object they expose
+- **What**: Unshare the backed file before writable shared admission, pin private file backing as required, and use the pinned read descriptor to refill the correct object after extent changes.
+- **Why**: Shared mappings made through read-only descriptions kept showing the shared object after the file got its own, silently (LMDB's `MDB_RDONLY` readers, read-only SQLite with mmap).
+- **Tradeoffs**: An existing mapping pin can force eager copying when a clone would otherwise share storage.
+- **Watch out**: Synchronize all affected address spaces before shrinking backing and preserve the guest mapping when a provider writes.
+- **Source**: df6ee70, 523ae8a9, 568b6a48, f495f2cc, 68130f74
+
+### D54: File mappings retain the descriptor, mount and permissions used at admission
+
+- **What**: Share pinned read descriptors across a fork family, retain executing image references, and derive prefill rights and refreshed tail extents from the actual VMA.
+- **Why**: Rename, growth or backing replacement can change what later path lookup sees.
+- **Tradeoffs**: Pins outlive the original file descriptor.
+- **Watch out**: Hole removal must invalidate aliases.
+- **Source**: 68b70897, 93a9b204, 71790fde, 11816722
+
+### D55: Kernel copies resolve recorded faults and validate backed extents
+
+- **What**: Retry the affected copy on the missing FUSE page and verify the complete forced-write range against contents_len before CoW or modifying storage.
+- **Why**: A remote or syscall destination can cross cold pages or EOF.
+- **Tradeoffs**: Servicing a cold range can require multiple retries.
+- **Watch out**: Never mutate the valid prefix of an invalid forced-write range.
+- **Source**: 4309ef58, 30e5002e, f985c1f8, 865d24c1, 6084b8af
+
+### D56: Page walks distinguish reservations and file extents
+
+- **What**: Read reserved pages as zero and re-evaluate file extents after growth.
+- **Why**: Reservations need not have a physical page yet.
+- **Tradeoffs**: The walk must proceed per page.
+- **Watch out**: A cached previous EOF cannot hide newly accessible bytes.
+- **Source**: 25b0f2a0
+
+### D57: VMA walks and shared-map indexing follow committed ranges
+
+- **What**: Publish or roll back shared-map membership around page-table changes and use one next-VMA walk for range operations.
+- **Why**: Walks that skip a hole or retain stale indices give incorrect partial results.
+- **Tradeoffs**: Moves and removals update a secondary index.
+- **Watch out**: Preserve Linux's per-operation treatment of holes and earlier progress.
+- **Source**: c3514220, 3de64361
+
+### D58: Future locked mappings respect the caller's memlock allowance
+
+- **What**: Check the limit before MAP_LOCKED, future mlock and growth, returning the Linux error appropriate to the operation.
+- **Why**: A future-lock policy can otherwise exceed RLIMIT_MEMLOCK.
+- **Tradeoffs**: Admission is repeated for later growth.
+- **Watch out**: Distinguish a zero unprivileged allowance from exhausted capacity.
+- **Source**: 99b74cef
+
+### D59: Unmap prepares fallible demotion before changing CoW or host state
+
+- **What**: Prepare all mapped spans before two-phase teardown, use one unmap for single-step paths and expire page watches when a nonrollbackable clip or FUSE invalidation fails.
+- **Why**: A boundary-superpage allocation failure could otherwise leave half a teardown committed.
+- **Tradeoffs**: Preparation adds a boundary walk for two-phase callers.
+- **Watch out**: An ordinary failed munmap must preserve valid watches.
+- **Source**: d7a28ce2, f2d15cfd, 33e95609
 
 ## Superseded
 
@@ -174,3 +229,10 @@
 - ~~Bypassing `FileMaps` for `bundled_libc` mappings in 6b59a1b4~~ → replaced by **D47** in c8f01dbf (2026-11-21, cross-module predecessor tagged under kernel/mmu and kernel/exec).
 - ~~D18 ownership of fork/copy-on-write and host backing in kernel/mm (cd53f35, 44a21b7)~~ → replaced by **D18**, kernel/cow **D1** and kernel/hostmem **D1** in 610d623f (2026-11-22).
 - ~~`Mm::can_write` VMA writability pre-check before kernel writes (D34 in part, 5d7b936)~~ → replaced by **D34** in 15347732 (2026-11-23).
+- ~~Excluding Files app writes from the shared mapping coherence policy~~ → replaced by **D37** in 523ae8a9 (2026-11-24)
+- ~~Deferring restoration of shrunken shared anonymous mappings~~ → replaced by **D53** in 74584914 (2026-11-24)
+- ~~Moving a checked set of existing mappings as the normal way to admit a shared store mapping~~ → replaced by **D37** in f495f2cc (2026-11-24)
+- ~~Giving each FUSE mmap a separate memfd and refusing writable sharing~~ → replaced by **D40** in b421eac0 (2026-11-24)
+- ~~Allowing a private store mapping to rely on stale backing after a split~~ → replaced by **D37** in 68130f74 (2026-11-24)
+- ~~Implementing MADV_POPULATE_READ as an advisory WILLNEED request~~ → replaced by **D49** in 20631a25 (2026-11-25)
+- ~~Approximating anonymous VMA joining without anonymous page offsets~~ → replaced by **D22** in 9d0ad1b6 (2026-11-26)

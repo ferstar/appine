@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/netns"`
 >
-> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -23,11 +23,11 @@
 - **Source**: rounds 169 (`169-container-network-survey`), 170 (`170-netdev`)
 
 ### D3: Virtual IPv4 addresses map to host loopback addresses at the socket layer
-- **What**: Connections and datagrams to addresses on virtual devices go through the host's loopback, to the owning namespace's 127.c.d.1 (or 127.255.x.y for the initial namespace); traffic routed through a gateway to unowned addresses goes to the host network.
+- **What**: Connections and datagrams to addresses on virtual devices go through the host's loopback, to the owning namespace's 127.c.d.1 (or 127.255.x.y for the initial namespace); traffic routed through a gateway to unowned addresses goes to the host network. Recycle unused virtual addresses, reserve container loopback blocks beginning at 127.0.2.0 and preserve reported guest identities across the full 127/8 range.
 - **Why**: After devices existed, containers still could not reach each other or be reached from outside ("Network unreachable"), docker's `-p` containers failed and aardvark-dns could not bind the gateway; this reuses the namespace loopback mapping.
 - **Tradeoffs**: IPv6 virtual addresses are not mapped.
 - **Watch out**: The owner of an address is found from routes over virtual devices; directly connected misses are `EHOSTUNREACH`.
-- **Source**: round 171 (`171-netmap`)
+- **Source**: round 171 (`171-netmap`), 6feb4b9f, d11379f7, 11cb85a0
 
 ### D4: nftables is recorded like Linux and evaluated at connect and sendto
 - **What**: The ruleset arrives over `NETLINK_NETFILTER` in Linux's format (iptables-nft works); nat chains run at connect/sendto and DNAT rewrites destinations in the socket layer.
@@ -37,18 +37,18 @@
 - **Source**: round 172 (`172-nftables`)
 
 ### D5: Filter chains are evaluated along the emulated path
-- **What**: OUTPUT of the sender, PREROUTING/FORWARD/INPUT of the namespaces a connection passes through are evaluated; rejects return errors immediately and TCP drops time out like Linux.
+- **What**: OUTPUT of the sender, PREROUTING/FORWARD/INPUT of the namespaces a connection passes through are evaluated; rejects return errors immediately and TCP drops time out like Linux. Evaluate bridge and endpoint hooks in their own namespaces, retain blocking verdicts and marks, and select the original or translated destination according to PREROUTING priority.
 - **Why**: Without filtering, docker network isolation, `--internal` networks, `DOCKER-USER` rules and podman's isolate had no effect.
 - **Tradeoffs**: IPv4 only; UDP drops outside the sender are silent successes.
 - **Watch out**: The path steps must match how the address mapping routes the connection.
-- **Source**: round 175 (`175-filter`)
+- **Source**: round 175 (`175-filter`), f7ddba97, 76da8eff, 3db35725
 
 ### D6: Namespace ports are registered in the namespace, not left to the host
-- **What**: Explicit binds get separate host ports, IPv4 and IPv6-only binds of one port each their own; listeners and bound UDP sockets are registered per namespace, by family and v6only; connections without a matching listener are refused.
+- **What**: Explicit binds get separate host ports, IPv4 and IPv6-only binds of one port each their own; listeners and bound UDP sockets are registered per namespace, by family and v6only; connections without a matching listener are refused. Address-less UDP sends recheck destination listeners and preserve a blocked verdict from a prior connect. Bindings now enforce guest address overlap, reuse flags and socket-owner rules before host bind or TCP listen.
 - **Why**: A port bound on the outer wildcard made the same port `EADDRINUSE` inside containers (`-p 8080:8080` style publishes failed); connections to unused ports were captured by outer wildcard listeners, and services bound only to a container's 127.0.0.1 were reachable from other containers.
 - **Tradeoffs**: 127.0.0.1 and the virtual address share one host address, so the same port on both conflicts.
 - **Watch out**: Unregister listeners when sockets close.
-- **Source**: round 174 (`174-namespace-ports`); ea08993
+- **Source**: round 174 (`174-namespace-ports`); ea08993, a1fd0beb, 7fad509d
 
 ### D7: A host thread forwards outside connections to published ports
 - **What**: Initial-namespace sockets matched by PREROUTING DNAT are served by a forwarder thread that accepts and connects to the target; IPv4 TCP clients from outside keep their real address through a 127.254.x.y binding.
@@ -114,5 +114,14 @@
 - **Watch out**: A future test reading `shared.tid` before the forwarder handles a connection can observe `None` unless synchronized.
 - **Source**: 45495baf
 
+### D16: Route change parsing accepts Linux-valid destination attribute sizes
+
+- **What**: Validate route add and delete attributes using family-specific policy and address length rules.
+- **Why**: Requiring every attribute to equal the full address width rejected native-valid requests.
+- **Tradeoffs**: Handling differs for IPv4 and IPv6.
+- **Watch out**: Keep destination, gateway and preferred-source checks consistent with the routing ABI.
+- **Source**: 11cb85a0
+
 ## Superseded
 - ~~D9 combined ownership of the newly extracted child modules~~ → replaced by **D9** in 60790c14 (2026-11-15; scope only, inherited implementation decisions remain here)
+- ~~Keeping virtual namespace bind ownership in the initial-namespace port map (kernel/net D11)~~ → replaced by **D6** in 7fad509d (2026-11-25)

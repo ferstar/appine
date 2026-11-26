@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/tabbar"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on android/tabbar made before it was split from android/terminal keep their `android/terminal` tags and live in `.agents/decisions/android/terminal.md`: D4, D18–D24, D27, the drawing half of D39, D51, D54 and D63–D65 (D63 also retains later activity-owned integration).
 
@@ -10,11 +10,11 @@
 
 ### D1: Tab rendering and status drawing have a dedicated owner
 
-- **What**: android/tabbar owns tab rendering, progress marks and number animation, while activity integration and session ownership remain outside.
+- **What**: android/tabbar owns tab rendering, progress marks and number animation, while activity integration and session ownership remain outside. While an import is active the file action changes its glyph, tooltip and accessibility description together.
 - **Why**: The extracted subsystem needs a focused architecture reference with explicit integration boundaries.
 - **Tradeoffs**: Pre-split decisions remain in the parent snapshot and related changes may require several maps.
 - **Watch out**: The split preserves inherited verification and open issues; it is not a fresh full audit.
-- **Source**: 60790c14; 39e55b4b
+- **Source**: 60790c14; 39e55b4b, f495f2cc
 
 ### D2: The list covers the content column including keys and banner
 

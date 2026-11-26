@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cow"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on kernel/cow made before it was split from kernel/mm keep their `kernel/mm` tags and live in `.agents/decisions/kernel/mm.md`: D6, D10, D11, D19, D24, D25 and the fork/copy-on-write parts of D15, D16, D18, D20, D22, D31 and D39.
 
@@ -15,3 +15,27 @@
 - **Tradeoffs**: Pre-split decisions remain in `.agents/decisions/kernel/mm.md`, and section boundaries inside `mm.rs` live in `.agents/MODULES.md`.
 - **Watch out**: Changes to `mprotect`, `munmap`, `mremap`, `MADV_DONTNEED`, `Mm::write`, futex writes or fork carving require reading `kernel/cow` alongside `kernel/mm` or `kernel/hostmem`.
 - **Source**: 610d623f
+
+### D2: Copy-on-write lending publishes only completed page-table transitions
+
+- **What**: Prepare parent and child mappings before publishing loans, retain ownership on failure, and use ordered non-CoW runs and shared failpoints to verify rollback.
+- **Why**: A borrower must never retain a mapping to memory already returned to its owner.
+- **Tradeoffs**: Fork needs staging storage and recall can return ENOMEM.
+- **Watch out**: Drop the child MMU before releasing staged region handles.
+- **Source**: 2609ab43, 9d9c5c7f, bb31dbda, 33e95609
+
+### D3: Fork retains backing identities while copying private file pages
+
+- **What**: Inherit cached descriptors and executable pins, remap the pinned file, and copy pages marked private through rounded EOF.
+- **Why**: Children need private writes and stable executable references even after unlink or rename.
+- **Tradeoffs**: Fork inspects page state and copies private data.
+- **Watch out**: Same-value writes still count as private.
+- **Source**: 68b70897, 93a9b204, 71790fde, 11816722
+
+### D4: Fork preserves sticky private-memory accounting
+
+- **What**: Carry accounted state through fork and VMA edits once a reserving private write mapping acquires it.
+- **Why**: Removing write access does not release the original accounting contract.
+- **Tradeoffs**: VMA metadata must survive splits and moves.
+- **Watch out**: Forced kernel writes must not acquire this accounting bit.
+- **Source**: 9d0ad1b6

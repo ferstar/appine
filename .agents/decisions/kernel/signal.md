@@ -2,18 +2,18 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D11 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D11 were seeded by hand from the retired design
 > doc §7 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
 ## Active
 
 ### D1: Signal frames copy the Linux arm64 layout byte for byte
-- **What**: siginfo, ucontext, sigcontext and the `__reserved` records (fpsimd always, esr for faults) are laid out exactly as arm64 Linux writes them.
+- **What**: siginfo, ucontext, sigcontext and the `__reserved` records (fpsimd always, esr for faults) are laid out exactly as arm64 Linux writes them. Restore FPCR through the engine write mask and clear exclusive reservations at frame setup, sigreturn, group or ptrace stop and freezer transitions.
 - **Why**: Unwinders, debuggers and runtimes (Go's asynchronous preemption, V8's wasm traps) read and modify the frame directly.
 - **Tradeoffs**: No SVE/SME records, so the corresponding extensions can never be advertised without extending the frame.
 - **Watch out**: `AT_MINSIGSTKSZ` (4720) and the record sizes are pinned by a test.
-- **Source**: rounds 03 (`03-m1b`), 04 (`04-m3a`)
+- **Source**: rounds 03 (`03-m1b`), 04 (`04-m3a`), 9163f493, 9951951a, d1fc9715
 
 ### D2: Handlers return through a vDSO trampoline with fixed bytes
 - **What**: Without `SA_RESTORER`, x30 points at the vDSO's `__kernel_rt_sigreturn`, which is exactly `mov x8, #139; svc #0`.
@@ -51,11 +51,11 @@
 - **Source**: rounds 44 (`44-hw-watchpoints`), 50 (`50-watchpoints-tier1`)
 
 ### D7: Core dumps follow Linux 6.1's `do_coredump`
-- **What**: Default core-generating signals write an arm64 ELF core per `core_pattern`, `core_uses_pid` and `coredump_filter`; pipe patterns are not supported.
+- **What**: Default core-generating signals write an arm64 ELF core per `core_pattern`, `core_uses_pid` and `coredump_filter`; pipe patterns are not supported. Fault in ELF magic and PT_LOAD source pages before emitting their contents.
 - **Why**: Programs that crashed could not be analysed afterwards, and `WCOREDUMP` was always 0 (several LTP tests failed).
 - **Tradeoffs**: No pipe form (no user-mode helper), no `suid_dumpable`.
 - **Watch out**: The dumping thread waits for all other threads to exit first.
-- **Source**: round 43 (`43-coredump`)
+- **Source**: round 43 (`43-coredump`), 865d24c1
 
 ### D8: The kernel layer keeps its own printk-style log
 - **What**: A 128 KB / 4096-record ring buffer, read through `/dev/kmsg`, `syslog(2)` and `/proc/kmsg`, fed by guest writes and kernel-layer events (OOM kills, bug kills, unhandled-exception reports (D23), the BKL watchdog's record of a long hold (kernel/process D38), cgroup fork rejections, low-port remapping and permission warnings).
@@ -114,11 +114,11 @@
 - **Source**: f85963d
 
 ### D16: Process signals are retargeted to a thread that will take them
-- **What**: `retarget` wakes, per signal, the first thread that does not block it; delivery calls it for shared pending signals the thread blocks, thread exit for all of them (kernel/process D20), and group sends skip threads in a ptrace stop.
+- **What**: `retarget` wakes, per signal, the first thread that does not block it; delivery calls it for shared pending signals the thread blocks, thread exit for all of them (kernel/process D20), and group sends skip threads in a ptrace stop. Skip ptrace-stopped recipients when retargeting and notify the parent of a group stop only after all participating threads stop or exit.
 - **Why**: Linux retargets shared pending signals when a thread blocks them or exits and never picks a stopped or traced thread, while Appine left them with the chosen thread, so Ctrl-C or SIGTERM sometimes did nothing.
 - **Tradeoffs**: While such a signal stays pending, every delivery on the blocking thread kicks the other thread again, and `CLD_STOPPED` still comes early.
 - **Watch out**: A thread that blocks a signal another thread is slow to take wakes that thread repeatedly until it does.
-- **Source**: 22e2b41
+- **Source**: 22e2b41, 849bf98a, 13dd5ae4, 3a90a0ef
 
 ### D17: Detach keeps the syscall number and the hardware debug slots
 - **What**: Detach keeps `syscallno` with the stop and saved registers of a stopped thread, detach and attach carry the recorded hardware debug slots and their pending change over the reset of the trace state, and a tracer's exit detaches through the same path.
@@ -128,11 +128,11 @@
 - **Source**: b877707, 6d9a9e8
 
 ### D18: A signal frame that cannot be used forces SIGSEGV through normal delivery
-- **What**: When `setup_frame` fails, delivery puts back a swapped sigsuspend/ppoll mask, leaves the mask alone and forces `SIGSEGV` with `SI_KERNEL` (`force_fatal` when the signal was `SIGSEGV`) before continuing the delivery loop, with restart decided once by the first signal taken; rt_sigreturn with a bad frame forces `SIGSEGV` at SP (`SEGV_ACCERR` when `Mm::mapped_above`, else `SEGV_MAPERR`; kernel/mm D28) and returns before the syscall-exit stop and delivery.
+- **What**: When `setup_frame` fails, delivery puts back a swapped sigsuspend/ppoll mask, leaves the mask alone and forces `SIGSEGV` with `SI_KERNEL` (`force_fatal` when the signal was `SIGSEGV`) before continuing the delivery loop, with restart decided once by the first signal taken; rt_sigreturn with a bad frame forces `SIGSEGV` at SP (`SEGV_ACCERR` when `Mm::mapped_above`, else `SEGV_MAPERR`; kernel/mm D28) and returns before the syscall-exit stop and delivery. Commit a new alternate signal stack only after copying the old stack description to the caller.
 - **Why**: Frame-setup failures and invalid sigreturn frames called group exit directly, skipping the handlers, core dumps and ptrace stops that Linux's forced `SIGSEGV` goes through.
 - **Tradeoffs**: The frame is validated before anything changes, so after a bad sigreturn the registers are the caller's, where Linux may have restored some before failing.
 - **Watch out**: A program looping on signals over a broken stack now runs one `SIGSEGV` handler per failure instead of dying at the first.
-- **Source**: 41bd6ec
+- **Source**: 41bd6ec, 849bf98a
 
 ### D19: rt_sigqueueinfo reaches zombies, and core_pattern's `%d` prints the dumpable value
 - **What**: rt_sigqueueinfo accepts any existing thread group except pid 1, as kill does, and `%d` in `core_pattern` prints the dumpable value.
@@ -156,18 +156,18 @@
 - **Source**: dcacfb6
 
 ### D22: signalfds open read-write and poll as `POLLIN` alone
-- **What**: signalfds are opened `O_RDWR`, as on Linux, with write still `EINVAL` through the write path, and report only `POLLIN` in kernel/poll's readiness table (kernel/poll D15).
+- **What**: signalfds are opened `O_RDWR`, as on Linux, with write still `EINVAL` through the write path, and report only `POLLIN` in kernel/poll's readiness table (kernel/poll D15). Signalfd creation uses the caller's bounded fd installer.
 - **Why**: signalfds were opened `O_RDONLY` and reported `POLLRDNORM`, unlike Linux.
 - **Tradeoffs**: None known.
 - **Watch out**: None known.
-- **Source**: e6bfdf8
+- **Source**: e6bfdf8, 576501d3
 
 ### D23: Unhandled exceptions are reported in the kernel log as arm64's `arm64_show_signal` does
-- **What**: While `debug.exception-trace` is non-zero (0 by default as on arm64, kernel/procfs D16, and 1 from boot in the app, kernel/process D35), `show_unhandled` logs each synchronous exception that ends an untraced process whose handler is default or ignored (page faults, `SIGBUS` past EOF, alignment, undefined instructions, `brk`, hardware breakpoints and bad rt_sigreturn frames) with Linux 6.1's names, the faulting mapping and the registers, at most 10 per 5 s kernel-wide.
+- **What**: While `debug.exception-trace` is non-zero (0 by default as on arm64, kernel/procfs D16, and 1 from boot in the app, kernel/process D35), `show_unhandled` logs each synchronous exception that ends an untraced process whose handler is default or ignored (page faults, `SIGBUS` past EOF, alignment, undefined instructions, `brk`, hardware breakpoints and bad rt_sigreturn frames) with Linux 6.1's names, the faulting mapping and the registers, at most 10 per 5 s kernel-wide. An undefined instruction clears the saved ESR so its SIGILL frame omits an unrelated syndrome. Build arm64 abort ESR values from current page-table validity and the level of the missing translation.
 - **Why**: Guest programs killed by a fault left nothing in the kernel log beyond the shell's "Segmentation fault", and the Starnix survey listed arm64's per-fault report as a small gain.
 - **Tradeoffs**: A report takes about 16 of the log's 4096 records, synthesized ESRs name other levels and fault kinds than native, there is no Hardware name line, a bad sigreturn frame shows the caller's registers (D18), and seccomp's `SIGSYS`, unwritable frames and single-step traps go unreported, as on Linux.
 - **Watch out**: A program crashing in a loop keeps adding 10 reports per 5 s, pushing older records out of the log that bug reports carry, and a fault path added later without a `show_unhandled` call goes unreported.
-- **Source**: 7b7f73b
+- **Source**: 7b7f73b, 13dd5ae4, 2971a1a9
 
 ### D24: Unimplemented paths are counted per kernel and named in bug reports
 - **What**: `stub.rs` keeps a table of the paths Appine does not implement (syscalls, prctl options, fcntl commands, ioctl requests by kind of file, madvise advice, futex commands, missing paths and devices without a driver), each with its count and first command and at most 128 paths, whose ten most-called go into `KillReason::Bug`'s report while `APPINE_LOG` writes each path's first hit and nothing reaches the guest.
@@ -191,11 +191,11 @@
 - **Source**: 1be1142
 
 ### D27: Delivery after a syscall forgets it, as Linux's `forget_syscall`
-- **What**: `deliver`, after the restart rewind of a syscall's return, calls `KernelEntry::forget_syscall` (kernel/process D55) with the possibly rewound pc, so a thread stopped by `SIGSTOP` in a syscall shows -1 with its sp and the restart pc in `/proc/<pid>/syscall` (kernel/procfs D40).
+- **What**: `deliver`, after the restart rewind of a syscall's return, calls `KernelEntry::forget_syscall` (kernel/process D55) with the possibly rewound pc, so a thread stopped by `SIGSTOP` in a syscall shows -1 with its sp and the restart pc in `/proc/<pid>/syscall` (kernel/procfs D40). Clear abandoned restart-block state when interruption becomes EINTR.
 - **Why**: Linux's do_signal forgets the syscall before taking a signal, while Appine showed the syscall the thread had been in.
 - **Tradeoffs**: Every BKL-path syscall pays the record's stores once more, and the difference shows only while the thread waits inside `deliver` (stops, and ptrace stops after this point).
 - **Watch out**: A ptrace stop placed later in `deliver` shows -1 where Linux might still show the syscall.
-- **Source**: f1212d8
+- **Source**: f1212d8, 849bf98a
 
 ### D28: Freezer entry and group kills mark cgroup observations
 
@@ -204,6 +204,14 @@
 - **Tradeoffs**: Group exit can mark observations whose contents stay unchanged.
 - **Watch out**: Stop, thaw and kill paths must agree on which tasks contribute to freeze completion.
 - **Source**: 0f5c5132
+
+### D29: Signal queue limits and copy retries preserve siginfo semantics
+
+- **What**: Retain the selected signal across copyout retries and distinguish timer, ordinary kernel/user and other real-time sources when the pending limit is full.
+- **Why**: A failed queued delivery must not manufacture a pending record with incorrect metadata.
+- **Tradeoffs**: Some source classes retain only a pending bit and others fail.
+- **Watch out**: Timer delivery retains its siginfo and callers that can fall back need a failure result.
+- **Source**: f985c1f8, 6fcaff37
 
 ## Superseded
 

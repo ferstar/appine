@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/vtcore"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions made before android/vtcore was split from android/vt retain their `android/vt` tags in `.agents/decisions/android/vt.md`: D1, D3, D4 and the parsing side of D5–D7; earlier `android/terminal` decisions remain in `.agents/decisions/android/terminal.md`: D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49.
 
@@ -31,3 +31,39 @@
 - **Tradeoffs**: Individual `AppineVt` struct fields and unused `libghostty-vt` C API symbols are summarized by role instead of enumerated exhaustively.
 - **Watch out**: Further growth pushing the map past 80% would make extracting scrollback compression and snapshot state into a separate module necessary.
 - **Source**: e0719858
+
+### D4: Native command marks drive status expiry
+
+- **What**: Queue expiry at command completion and primary prompt start, retaining foreground sampling for unmarked shells.
+- **Why**: Status needs the same boundary in native code and the Kotlin queue.
+- **Tradeoffs**: Shells without marks depend on sampling.
+- **Watch out**: Keep expiry markers aligned with queued status events.
+- **Source**: 568b6a48
+
+### D5: Ash prompt taps follow the row where input resumed
+
+- **What**: Distinguish a same-row resume from a new row after background output and reject taps above the resumed input row.
+- **Why**: Background writes can move the cursor without creating editable prompt text.
+- **Tradeoffs**: The parser retains the resumed row.
+- **Watch out**: Clear the marker on prompt and reset transitions.
+- **Source**: acc5a7a0
+
+### D6: Foreground sampling supplies busy state for partially marked shells
+
+- **What**: Keep atPrompt tied to OSC 133 and probe the foreground process after a newline for ash and unmarked shells, giving explicit titles priority.
+- **Why**: A replaced PS1 can hide shell command boundaries.
+- **Tradeoffs**: Short commands can evade sampling and fallback completion lacks an exit code.
+- **Watch out**: Release the terminal lock before acquiring the BKL.
+- **Source**: 6e0c0f16
+
+### D7: Native terminal reset invalidates outstanding clipboard reads
+
+- **What**: Advance a generation under the terminal lock and discard buffered reads on both RIS and explicit reset.
+- **Why**: A queued response could otherwise cross a reset boundary.
+- **Tradeoffs**: JNI and Kotlin carry the native generation.
+- **Watch out**: Cancel unfinished escape sequences on explicit reset.
+- **Source**: 565f4a4e
+
+## Superseded
+
+- ~~Counting ash prompt rows above the input resumed after background output (android/vt D6)~~ → replaced by **D5** in acc5a7a0 (2026-11-25)

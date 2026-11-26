@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D8 were seeded by hand from the retired design doc
 > §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
 > entries cite commits.
 
@@ -44,12 +44,13 @@
 - **Watch out**: A non-200 reply to an unsupported Range ends the source, and only the final hash checks the 206 payload’s correctness.
 - **Source**: round 99 (`99-choose-rootfs`); design doc §11.4; 30d0fab3; 20137e4c; d053be24; 39e55b4b
 
-### D4: Mirrors are measured once after import and only an untouched template is replaced
-- **What**: The post-import throughput probe selects a mirror and rewrites sources from the import template only if the file still exactly matches that template; manual mirror settings and records are no longer used.
-- **Why**: Changing mirrors in a running system could overwrite user repositories and leave manual/measured state inconsistent.
-- **Tradeoffs**: There is no later in-app mirror choice or retry, a failed first probe leaves official sources, and app HTTP/proxy measurements may differ from guest performance.
-- **Watch out**: The compare and write are not atomic against a guest edit, old preference keys remain unread, and edited or deleted source files must remain untouched.
-- **Source**: rounds 99 (`99-choose-rootfs`), 190 (`190-settings-default-alpine`), 203 (`203-mirror-keeps-lines`); a1367531; 20137e4c; d053be24; 39e55b4b
+### D4: Mirror selection uses completed probes before publication
+
+- **What**: Choose the fastest completed probe at configuration time, breaking ties in distro order and falling back to the official mirror.
+- **Why**: A post-import worker could race store replacement.
+- **Tradeoffs**: Faster late answers are discarded.
+- **Watch out**: Slow networks can leave the official source configured.
+- **Source**: rounds 99 (`99-choose-rootfs`), 190 (`190-settings-default-alpine`), 203 (`203-mirror-keeps-lines`); a1367531; 20137e4c; d053be24; 39e55b4b, 568b6a48
 
 ### D5: Tabs log in as the first regular user by default, who is set up to become root
 - **What**: The login setting defaults to "auto" (the regular account with the lowest UID, else root); the first time a regular user becomes the login account it is added to wheel with doas (Alpine, installed offline from the bundled package) or to sudo (Debian, installed online), and NOPASSWD rules are written only while the account has no password.
@@ -98,19 +99,20 @@
 - **Watch out**: A distribution whose podman or docker package defaults to another driver, or a future default needing overlay features Appine lacks (redirects, metacopy, idmapped layers), would fail without the old fallback.
 - **Source**: 0eb9e19, 869de68
 
-### D19: A guest change to `/etc` rewrites the NOPASSWD rules without a login
-- **What**: `login.sh --refresh-rules` only rewrites the rules, written beside the file and renamed into place so a login and a refresh at once never leave a half-written file, and `Rootfs.dirsChanged` spawns it as root, without a console and without waiting, whenever `/etc` is among the changed directories the service's poll passes on (android/service D20).
-- **Why**: A password set in a running session did not stop NOPASSWD escalation until another tab logged in.
-- **Tradeoffs**: Up to one poll (2 s) of delay, and any rename in `/etc`, not only of shadow and group, runs a refresh.
-- **Watch out**: Changes that rename nothing in `/etc` (an in-place edit) or fall past the 256-directory limit between polls still wait for the next login (map debt), and changed directories are recorded only from the service's first take.
-- **Source**: d03c9b6
+### D19: Login-rule refresh tracks input metadata and retries failures
+
+- **What**: Sample the rule inputs on first poll and subsequent changes, then read accounts and publish rules under one lock, acknowledging only successful refreshes.
+- **Why**: Editing an account file in place may leave directory entries unchanged.
+- **Tradeoffs**: Failed refreshes run again.
+- **Watch out**: A failed sample must never become the acknowledged baseline.
+- **Source**: d03c9b6, d5b808e8
 
 ### D20: Profile migration installs companion prompt hooks without overwriting user edits
-- **What**: Recognized unmodified profiles migrate by text/hash, install bashrc/ashrc and zshrc companions before the profile, integrate bash through the profile and Alpine’s system bashrc, expose ash hooks through an unset ENV, and source /etc/profile.d/appine.zshrc to register precmd/preexec inside an anonymous function using emulate -L zsh, with sanitized title reporting in D34.
+- **What**: Recognized unmodified profiles migrate by text/hash, install bashrc/ashrc and zshrc companions before the profile, integrate bash through the profile and Alpine’s system bashrc, expose ash hooks through an unset ENV, and source /etc/profile.d/appine.zshrc to register precmd/preexec inside an anonymous function using emulate -L zsh, with sanitized title reporting in D34. Current hooks escape control characters and backslashes, integrate login and nested zsh and Debian bash, mark continuation prompts, and preserve ash's ENV through stock doas rules while respecting customized profiles.
 - **Why**: Prompt features need marks after user startup files and in supported nested shells, while new Alpine logins use bash.
-- **Tradeoffs**: Edited profiles and user ENV win, doas -s clears ash’s ENV, Debian nested bash and zsh remain unintegrated, and later PS1/PROMPT_COMMAND/theme changes can remove marks; fish 4 and nushell supply their own marks (android/vt D5).
-- **Watch out**: Companion-only edits do not migrate existing stores without a profile change and recorded hash; zsh percent escapes/right or multiline prompts and broader device prompt gestures remain limited or unverified.
-- **Source**: 6c5f921, 2b04a43; a7d8c9f5; a809c5a8; 7aa817af; 20137e4c; d053be24; b04ebd4e; 9f9ba8d7; 39e55b4b; 4a10bc49
+- **Tradeoffs**: Customized profiles and doas rules take precedence, and an asynchronous theme or overwritten PS1 can still remove marks.
+- **Watch out**: Record replaced profile hashes for upgrades and install nested zsh integration on a subsequent kernel start if the shell was added to a running store.
+- **Source**: 6c5f921, 2b04a43; a7d8c9f5; a809c5a8; 7aa817af; 20137e4c; d053be24; b04ebd4e; 9f9ba8d7; 39e55b4b; 4a10bc49, 4309ef58, acc5a7a0, 6e0c0f16
 
 ### D24: New Alpine imports install bundled bash with serialized package setup
 
@@ -240,6 +242,30 @@
 - **Watch out**: A non-directory replacing `/etc/skel` fails startup before boot, non-directory home entries rely on `exists` failing with `ENOTDIR`, and live `TerminalService` upgrade cold starts and 16 KB-page devices remain unverified.
 - **Source**: 9f3e93ed, 125f3d00
 
+### D43: Login setup gates locked commands and restores SIGINT before exec
+
+- **What**: Run privileged setup only after flock succeeds, accept interruptions at cancellable installation waits, and restore default SIGINT before starting the shell.
+- **Why**: Ctrl-C during bootstrap could skip required work or leak ignored signals into the session.
+- **Tradeoffs**: Short setup steps run with SIGINT ignored.
+- **Watch out**: Every shell exec path must restore SIGINT.
+- **Source**: 6f2776f3, 9b179de1
+
+### D44: The download inventory also describes generated assets
+
+- **What**: The fetch script's assets mode emits filenames, digests and APK destinations while its ordinary output keeps packages ahead of tarballs.
+- **Why**: Packaging and downloads need the same pinned inputs.
+- **Tradeoffs**: Bundle destinations are maintained with the pins.
+- **Watch out**: Shared dependencies may need multiple offline destinations.
+- **Source**: d10f2973
+
+### D45: Rootfs generations guard deferred file publication
+
+- **What**: Advance the generation under the reset write lock and recheck it when publishing an import.
+- **Why**: A completed read can belong to a store that has since been replaced.
+- **Tradeoffs**: A reset can invalidate otherwise complete work.
+- **Watch out**: The generation check and publication need the same lock.
+- **Source**: f495f2cc
+
 ## Superseded
 
 - ~~The execution tier is chosen in Settings in every build (5c34951, round 190)~~ → replaced by **D10** in 62a8c07 (2026-11-04)
@@ -259,3 +285,7 @@
 - ~~Open the HTTPS Google Play details URL for `BuildConfig.APPLICATION_ID` in About's Version action in 0b3c5d8a~~ → replaced by **D28** in 1afcffbc (2026-11-21).
 - ~~Leave pre-existing regular Alpine accounts untouched during one-time bash startup seeding in 9f3e93ed~~ → replaced by **D42** in 125f3d00 (2026-11-21).
 - ~~D9 combined ownership of Rootfs and SettingsActivity (12c4afa)~~ → replaced by **D9** and android/settings **D1** in e4d7bbe5 (2026-11-22).
+- ~~Refreshing login rules only when /etc directory entries change~~ → replaced by **D19** in d5b808e8 (2026-11-24)
+- ~~Replacing a stock mirror configuration after rootfs publication~~ → replaced by **D4** in 568b6a48 (2026-11-24)
+- ~~Leaving login or nested zsh and nested Debian bash without Appine hooks~~ → replaced by **D20** in acc5a7a0 (2026-11-25)
+- ~~Losing the ash ENV hook under stock doas -s~~ → replaced by **D20** in 6e0c0f16 (2026-11-26)

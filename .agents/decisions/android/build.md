@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/build"`
 >
-> Last distilled: 2026-11-23 (HEAD = cc72b093)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on android/build made before it was split from android/native keep their `android/native` tags and live in `.agents/decisions/android/native.md`: D2–D7, D10, D12–D14, D20–D22, D24–D26, D28 and the dependency portion of D32.
 
@@ -10,11 +10,11 @@
 
 ### D1: Android packaging is separate from runtime JNI
 
-- **What**: android/build owns build configuration, dependencies, packaged assets and release sources, while runtime JNI remains in android/native.
+- **What**: android/build owns build configuration, dependencies, packaged assets and release sources, while runtime JNI remains in android/native. Distribution signing remains unspecified in the build map.
 - **Why**: The extracted subsystem needs a focused architecture reference with explicit integration boundaries.
 - **Tradeoffs**: Pre-split decisions remain in the parent snapshot and related changes may require several maps.
 - **Watch out**: The split preserves inherited verification and open issues; it is not a fresh full audit.
-- **Source**: 60790c14; 39e55b4b
+- **Source**: 60790c14; 39e55b4b, 71790fde
 
 ### D2: The manifest explicitly exposes supported app languages
 
@@ -96,7 +96,32 @@
 - **Watch out**: Future `libghostty-vt` releases that change how `GitVersion.detect` handles `error.GitNotRepository` or require an explicit version flag will need `build.rs` updated.
 - **Source**: 166dd6ee
 
+### D12: Offline Alpine assets come from a verified inventory
+
+- **What**: Gradle derives the branch and task inputs from the pinned inventory and verifies every asset before replacing the generated bundle.
+- **Why**: A cache can hold several Alpine versions.
+- **Tradeoffs**: Inventory changes invalidate the generation task.
+- **Watch out**: Each independent bundle needs all its shared libraries.
+- **Source**: d10f2973
+
+### D13: Local Android tests use JUnit 4
+
+- **What**: Gradle provides JUnit 4.13.2 to local unit tests.
+- **Why**: Pure Kotlin policy tests can run off-device.
+- **Tradeoffs**: The dependency belongs to the test configuration.
+- **Watch out**: Adding it to the app configuration would affect packaging and notices.
+- **Source**: 19e8be6f
+
+### D14: Release sources resolve Alpine packages in main and community
+
+- **What**: The release script uses the first matching APKBUILD in main or community and vendors the complete locked Cargo workspace.
+- **Why**: Some shipped Alpine packages originate in community.
+- **Tradeoffs**: Community origins require a second lookup.
+- **Watch out**: Archive extraction depends on the upstream directory layout.
+- **Source**: 5fed6c24
+
 ## Superseded
 
 - ~~One --release Cargo profile for every APK in android/native D2~~ → replaced by **D5** in 7b3e57c5 (2026-11-17).
 - ~~Material Yellow A700 (`#FFD600`) debug icon stroke in 1afcffbc~~ → replaced by **D10** in 8ab3b92b (2026-11-21).
+- ~~Choosing APK inputs by the newest version in the cache (android/native D12)~~ → replaced by **D12** in d10f2973 (2026-11-24)

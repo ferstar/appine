@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/tests"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on android/tests made before it was split from android/native keep their `android/native` tags and live in `.agents/decisions/android/native.md`: D5, D8, the test portions of D9, D12–D14, D16, D19 and D23–D32.
 
@@ -47,3 +47,59 @@
 - **Tradeoffs**: Tests run against isolated temporary stores with bundled bash installed up front rather than driving `TerminalService` across an app upgrade, adding slight runtime.
 - **Watch out**: Verified on a 4 KB-page API 36 device (SM-S9110) only; 16 KB-page devices and live `TerminalService` upgrade cold starts remain uncovered.
 - **Source**: 9f3e93ed, 125f3d00
+
+### D6: Provider tests cover canonical IDs, root visibility and retired grants
+
+- **What**: Use isolated accounts and documents to exercise invalid homes, noncanonical paths, stale direct and alias grants, a live grant and an unaffected sibling.
+- **Why**: Path reuse and missing homes must not broaden access.
+- **Tradeoffs**: Framework grant cases require Android instrumentation.
+- **Watch out**: Keep an unaffected sibling as a control for overbroad revocation.
+- **Source**: 6e9bd7a7, 68b70897
+
+### D7: Terminal input tests synchronize on visible session state
+
+- **What**: Use shared event fixtures to check console ownership, focus, stale paste and clipboard controls, and completion of IME composition.
+- **Why**: Delayed UI callbacks can reach another session.
+- **Tradeoffs**: Activity and IME interactions need Android instrumentation.
+- **Watch out**: Assert both the preedit contents and a single final write to the terminal.
+- **Source**: 6f2776f3, 3a90a0ef, d10f2973, 1dab8c16, ae1e05e0
+
+### D8: Import tests observe visibility at stream close and reset
+
+- **What**: Close the source before checking publication, race a competing name, and verify reset and cancellation with only the completed file surviving.
+- **Why**: Final contents alone miss early publication and lock contention.
+- **Tradeoffs**: The tests coordinate stream and worker events.
+- **Watch out**: Callback exceptions retain their identity.
+- **Source**: f6a9510b, f495f2cc
+
+### D9: Setup tests cover account edits, interrupted login and fallback cleanup
+
+- **What**: Edit account files in place, retry failed rule refreshes and verify SIGINT, tarball cleanup and JNI errno translation in isolated fixtures.
+- **Why**: Successful first login alone misses retry and failure semantics.
+- **Tradeoffs**: The tests create or modify a disposable store.
+- **Watch out**: Check ordinary errors as well as missing-file behavior.
+- **Source**: d5b808e8, 9b179de1
+
+### D10: Import tests control probe completion before rootfs publication
+
+- **What**: Inject completed and pending mirror probes into isolated imports and send ordered status reports through the console pump.
+- **Why**: Real network timing cannot deterministically exercise late probe results.
+- **Tradeoffs**: Debian coverage needs its tarball and the network-test flag.
+- **Watch out**: Simulated throughput verifies selection policy only.
+- **Source**: 568b6a48
+
+### D11: Shell integration tests exercise real prompt boundaries
+
+- **What**: Use literal and symlinked directories, multiline zsh prompts, ash background output and doas or overwritten PS1 to check marks, title fallback and input positioning.
+- **Why**: Prompt protocols depend on the actual shell output.
+- **Tradeoffs**: Fixture coverage depends on shell availability.
+- **Watch out**: Check restoration after the command and frame capture across a synchronized-output hold.
+- **Source**: 4309ef58, acc5a7a0, 6e0c0f16
+
+### D12: Android service and provider tests observe their external contracts
+
+- **What**: List enough entries to exercise JNI reference lifetime, edit passwd to invalidate the auto root, and distinguish notifications with remapped host ports.
+- **Why**: Small listings and fixed account fixtures miss these regressions.
+- **Tradeoffs**: Provider and service cases exercise framework state.
+- **Watch out**: A remapping must preserve the distinct notification keys.
+- **Source**: ae1e05e0

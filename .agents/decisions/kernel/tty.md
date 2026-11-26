@@ -2,18 +2,18 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
 ## Active
 
 ### D1: PTYs and the line discipline live in the kernel layer, not on a host PTY
-- **What**: Every PTY pair, its termios and line discipline, and job control are implemented in process; the app's terminal tabs and `appine-run` talk to kernel-held masters.
+- **What**: Every PTY pair, its termios and line discipline, and job control are implemented in process; the app's terminal tabs and `appine-run` talk to kernel-held masters. TIOCGPTPEER installs its descriptor under the caller's bound.
 - **Why**: With a host PTY, the host's `ISIG` would send signals to host process groups, which know nothing about guest process groups; guest programs (tmux, screen, `script`, sshd) also need to allocate their own PTYs through `/dev/ptmx`.
 - **Tradeoffs**: Every line-discipline feature has to be reimplemented; a subset of termios flags is supported.
 - **Watch out**: The defaults must stay those of Linux's pts `init_termios`.
-- **Source**: design review 2026-10-24 (§9), round 05 (`05-m3b`)
+- **Source**: design review 2026-10-24 (§9), round 05 (`05-m3b`), 576501d3
 
 ### D2: Closing the last master hangs the terminal up, deferred to the BKL release
 - **What**: As in Linux's `pty_close` → `tty_vhangup`, the session leader gets SIGHUP and SIGCONT, the session loses its controlling terminal, and open slave ends read 0 and write `EIO`; the work runs when the closing thread releases the BKL.
@@ -51,11 +51,11 @@
 - **Source**: round 150 (`150-new-pty-state`)
 
 ### D7: Flow control and flushes follow Linux's directions
-- **What**: `TCFLSH` on the master flushes the right queue, and `TCOOFF` stops slave output so slave writes block.
+- **What**: `TCFLSH` on the master flushes the right queue, and `TCOOFF` stops slave output so slave writes block. Record whether IXON lookahead handled each input byte, preserve canonical overflow echo and model break and queue ioctls with the line discipline's actual accounting.
 - **Why**: The reversed direction and non-blocking TCOOFF made CPython's test_termios and test_ioctl hang until their 20-minute timeouts.
 - **Tradeoffs**: none
 - **Watch out**: Output stopped by `TCOOFF` cannot be restarted by `^Q`.
-- **Source**: round 75 (`75-pty-flow`); 8dc166b
+- **Source**: round 75 (`75-pty-flow`); 8dc166b, ee324af6, ab417943
 
 ### D8: The host console mimics `script` at end of input
 - **What**: Each app tab and each `appine-run` session is a console with a new session leader; when the host's input ends, the bridge waits until the program has read what was sent and then sends `VEOF` instead of hanging up.
@@ -128,11 +128,11 @@
 - **Source**: 5d23297, ae1b507
 
 ### D18: The flushing and line ioctls check for background callers, and a leader's exit sends only SIGHUP
-- **What**: TCFLSH, TCXONC, TCSBRK, TCSBRKP and TIOCSETD run the background check, and `release_ctty` at a session leader's exit sends only `SIGHUP`.
+- **What**: TCFLSH, TCXONC, TCSBRK, TCSBRKP and TIOCSETD run the background check, and `release_ctty` at a session leader's exit sends only `SIGHUP`. TIOCSETD checks background access before reading its argument, accepts N_TTY and returns EINVAL for unsupported disciplines.
 - **Why**: Background jobs were not stopped for these ioctls, and a session leader's exit with a PTY as its controlling terminal sent an extra `SIGCONT`, unlike Linux.
 - **Tradeoffs**: None.
 - **Watch out**: None known.
-- **Source**: 5d23297
+- **Source**: 5d23297, 6641af3a
 
 ### D19: Echoes respect the output limit, and held echoes go out ahead of the next slave write
 - **What**: `commit_echoes` outputs an echo only when it fits whole and keeps at most 4096 waiting (the oldest dropped), `send_xchar` drops its character on a full queue, and `slave_write` commits held echoes through `Tty::echoes_before_write` at the top of each pass, before measuring the room for its data, and wakes the master when echoes or data went out, as `n_tty_write` starts with `process_echoes` (reading the master sends none, as on Linux).
@@ -149,18 +149,18 @@
 - **Source**: 99b4216
 
 ### D21: A failed host spawn gives its console back
-- **What**: `terminal::detach` clears the console's session and foreground group when they are the failed leader's and restores whether a session was ever attached, so the console's end of session is reported as before (kernel/process D53).
+- **What**: `terminal::detach` clears the console's session and foreground group when they are the failed leader's and restores whether a session was ever attached, so the console's end of session is reported as before (kernel/process D53). Writes to an ended console return EIO, and controlling-terminal operations retain Linux's authority and background-check order.
 - **Why**: The console a failed spawn had attached kept that process as its session, so every later attach was EBUSY.
 - **Tradeoffs**: None.
 - **Watch out**: None known.
-- **Source**: 143bb86
+- **Source**: 143bb86, 13dd5ae4
 
 ### D22: The app reads a console's foreground group while a program's report lasts
-- **What**: `Machine::console_foreground` (`terminal::fg_pgrp`) returns the console's foreground group under the BKL, `ESRCH` when there is none, and a tab's pump calls it only while a progress or status report lasts (android/terminal D39).
+- **What**: `Machine::console_foreground` (`terminal::fg_pgrp`) returns the console's foreground group under the BKL, `ESRCH` when there is none, and a tab's pump calls it only while a progress or status report lasts (android/terminal D39). Foreground reporting includes the live process name, bounded argument data, canonical-input mode and interactive-shell classification for terminal fallback.
 - **Why**: The app must know when the program that reported progress or a status has given the terminal back, and prompt marks, which would tell, come only from shells that send them.
 - **Tradeoffs**: One more BKL acquisition per console read while a report lasts, and the group id is the kernel's own, not translated into any pid namespace.
 - **Watch out**: A tab streaming output while its program reports (an AI CLI at work) contends for the BKL; none was observed.
-- **Source**: 22c8ab0
+- **Source**: 22c8ab0, 6e0c0f16
 
 ### D23: The app asks whether a console reads a password by its termios
 - **What**: `terminal::password_input` (ICANON set, ECHO clear), wrapped by `Machine::console_password_input` under the BKL, tells the app when a tab's console reads a password, for the lock cursor and the IME's password mode (android/terminal D48).
@@ -176,6 +176,14 @@
 - **Tradeoffs**: Alternating writers shorten host reads and use a deque bounded by the 64 KiB output queue.
 - **Watch out**: Jobs without job control share the shell’s group, and a shell writing before reclaiming the terminal is classified as background; native interpretation belongs to android/vtcore.
 - **Source**: daab4446; 20137e4c; 81f60bef; d053be24; 39e55b4b
+
+### D25: PTY opens retain node identity and per-end exclusive state
+
+- **What**: Keep the opening filesystem key and attributes on the PTY end, report the opened ptmx or controlling node, and enforce slave exclusivity at open.
+- **Why**: Several filesystem paths can reach the same terminal but expose different node identity.
+- **Tradeoffs**: Direct devpts and device-node opens require distinct stat handling.
+- **Watch out**: Honor the capability and O_PATH exceptions.
+- **Source**: d10f2973, 68130f74, 11167386
 
 ## Superseded
 

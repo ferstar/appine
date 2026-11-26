@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -36,16 +36,16 @@
 ## Active (full detail)
 
 ### D1: Synthetic files are generated from kernel state when opened, like seq_file
-- **What**: Nothing is stored; opening a procfs, sysfs or cgroup file generates its whole content (`syscall` at its first read instead, D40), later reads use that snapshot, and a read from offset 0 generates it again.
+- **What**: Nothing is stored; opening a procfs, sysfs or cgroup file generates its whole content (`syscall` at its first read instead, D40), later reads use that snapshot, and a read from offset 0 generates it again. Initialize optional synthetic stat fields through the empty Stat default.
 - **Why**: Linux's seq_file gives the same effect for a file read in one go, and generating from live kernel structures keeps every file consistent with the kernel layer without bookkeeping.
 - **Tradeoffs**: Large files are generated in full per open; of the files that change, only mounts, mountinfo and four cgroup2 files notify pollers (D38).
 - **Watch out**: Regeneration uses the opener's credentials (D25) but the current reader's namespaces.
-- **Source**: design review 2026-10-24 (§8.2); f6a82cc, affb1e2; f1212d8 (`syscall`)
+- **Source**: design review 2026-10-24 (§8.2); f6a82cc, affb1e2; f1212d8 (`syscall`), 68b70897
 
 ### D4: The root cgroup looks like a docker container's root
 - **What**: `/proc/<pid>/cgroup` paths are relative to the reader's cgroup-namespace root, the root offers cpuset, cpu, memory and pids, and only `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable there; `memory.max`/`memory.current` at the root are the OOM killer's limit and measurement.
 - **Why**: JVMs and Node.js recognise cgroup v2 and size heaps from it ("No metrics available" before); dockerd, podman, runc, crun and systemd then needed a real hierarchy with migration, built after Linux 6.1's `kernel/cgroup/cgroup.c`.
-- **Tradeoffs**: No threaded cgroups and no chmod/chown delegation, and only four cgroup2 files report changes (D38).
+- **Tradeoffs**: Threaded cgroups remain unsupported, while the controller-generation and delegated metadata policy now lives in kernel/cgroup.
 - **Watch out**: Mounts of cgroup2 are rooted at the caller's cgroup-namespace root.
 - **Source**: rounds 58 (`58-cgroup`), 159 (`159-cgroup2-rw-mount`), 163 (`163-cgroup-tree`); b43ff37, affb1e2
 
@@ -127,11 +127,11 @@
 - **Source**: 970cf6a
 
 ### D36: An overlay program's `/proc/<pid>/exe` leads to its overlay node
-- **What**: readlink appends " (deleted)" (`with_deleted`, shared with `mark_deleted`) once the recorded overlay node is no longer linked, and following the link leads to the `Node::Overlay` while it is linked, else to `OpenExe` when a host file was recorded, else `ENOENT`, as Linux's `proc_exe_link` does.
+- **What**: readlink appends " (deleted)" (`with_deleted`, shared with `mark_deleted`) once the recorded overlay node is no longer linked, and following the link leads to the `Node::Overlay` while it is linked, else through a pinned regular backing when one survives, as Linux's `proc_exe_link` does. Deleted overlay images can be reopened through pinned OpenFd backing, while reported fd paths follow the opened dentry relative to the reader's root.
 - **Why**: An overlay program's exe showed no " (deleted)" and was followed by its path, so a renamed program could not be reached and a removed one could not be run again.
-- **Tradeoffs**: Opening a removed overlay program through exe is `ENOENT`, since reopening needs a store node, and the path shown after a rename is still the one recorded at execve, for store programs too.
+- **Tradeoffs**: Descriptions retain the regular backing of an unlinked upper object so the exe link can be opened after removal.
 - **Watch out**: Code that treats `OpenExe` as always backed by `ExeFile::node` must also handle the overlay case, and a collected overlay instance makes its programs' links read as deleted.
-- **Source**: 9590431
+- **Source**: 9590431, 30e5002e, f985c1f8
 
 ### D37: cgroup directories keep mkdir's mode and check search
 - **What**: `Cgroup::mode` comes from mkdir's mode with the umask (permission and sticky bits), stat reports it, and `View::searched` gives the walker and `searched_attrs` its attributes for search checks on lookups, chdir and chroot (kernel/vfs D50), as kernfs does.
@@ -177,6 +177,46 @@
 - **Watch out**: Other `libdrm` versions may require additional sysfs attributes, and device numbers must agree with kernel/vfs D57.
 - **Source**: 87c7d9db
 
+### D43: Proc nodes resolve by process identity and namespace lifetime
+
+- **What**: Record pid and serial in process nodes, preserve an exited leader's network-namespace reference, and recheck dynamic cgroup file visibility.
+- **Why**: PID reuse or a vanished controller must not retarget an existing node.
+- **Tradeoffs**: Namespace lookup may fall back through remaining threads.
+- **Watch out**: Host sampling of an unsupported synthetic child returns EOPNOTSUPP.
+- **Source**: b51818cf, 2609ab43, 3a90a0ef, d5b808e8
+
+### D44: Proc memory I/O forces pagewise access on a pinned address space
+
+- **What**: Read or write through one forced-access loop, releasing the Mm borrow across a FUSE fill and preserving short counts at holes.
+- **Why**: Ordinary data permissions differ from ptrace-authorized proc memory access.
+- **Tradeoffs**: A cold remote page can require an unlocked wait.
+- **Watch out**: Preserve stack growth and do not lose the completed prefix.
+- **Source**: 25b0f2a0, 865d24c1
+
+### D45: Per-thread proc metadata uses task state and the appropriate dump owner
+
+- **What**: Expose task no_new_privs, CPU mask and start ticks, allow Linux-style comm writes, and report the fdinfo, namespace and devpts directory modes and owners.
+- **Why**: Threads can differ from their group leader and nondumpable state changes visible ownership.
+- **Tradeoffs**: An exited leader needs saved fallback state.
+- **Watch out**: Keep namespace filesystem objects distinct from the proc namespace entries that point to them.
+- **Source**: 71790fde, 014c5dfd, 3e95c96a
+
+### D46: Pseudo writes publish per-file offsets and mount events
+
+- **What**: Return consumed length and resulting position separately and attach namespace-scoped mount event counters to pollable descriptions.
+- **Why**: Different proc and kernfs handlers advance offsets differently.
+- **Tradeoffs**: Some successful writes leave position unchanged.
+- **Watch out**: Respect offset-zero checks and avoid notifications for anonymous or propagation-only changes.
+- **Source**: 68130f74, 4e279fa9, 6fcaff37
+
+### D47: Procfs enforces sensitive directory search and environment access
+
+- **What**: Check live process identity and dumpability, pin environ's Mm at open, and apply mode-based search to mqueue and other groups' fd, fdinfo and ns directories.
+- **Why**: Raw synthetic traversal otherwise sidestepped restricted modes and denied some legitimate self access.
+- **Tradeoffs**: Appine retains mode 0500 on the ns directory.
+- **Watch out**: Own-group fd directories allow nonwrite access, while the ns exemption is search-only.
+- **Source**: 65e10e36, 36005e07, 3ad68857
+
 ## Superseded
 
 - ~~Regenerated content uses the current reader's credentials, not the opener's (D1 in part, §8.2)~~ → replaced by **D25** in f6a82cc (2026-11-08)
@@ -188,3 +228,4 @@
 - ~~D9 combined ownership of procfs, cgroup policy and device BPF~~ → replaced by **D9** in cf029f9a (2026-11-14)
 - ~~Comparing every observed cgroup file at every checkpoint under D38~~ → replaced by **kernel/cgroup D2** in 0f5c5132 (2026-11-17), preserving poll and inotify delivery.
 - ~~D9 combined ownership of /proc/sys sysctls and sysfs in kernel/procfs (cf029f9a)~~ → replaced by **D9**, kernel/sysctl **D1** and kernel/sysfs **D1** in e0719858 (2026-11-22).
+- ~~Returning ENOENT when reopening an unlinked overlay executable~~ → replaced by **D36** in f985c1f8 (2026-11-25)

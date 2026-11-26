@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/vt"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on the tabs' sessions made before android/vt was split from android/terminal keep their `android/terminal` tags and live in `.agents/decisions/android/terminal.md`: D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49.
 
@@ -23,7 +23,7 @@
 - **Source**: ca5f5c2
 
 ### D3: Background tabs' Kitty images are cut by lowering the storage limit
-- **What**: `appine_vt_drop_images` sets `GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT` to `KITTY_TRIMMED` (4 MiB) and back to `KITTY_STORAGE` (32 MiB) on both screens, called by `VtNative.dropImages(tab)` under the tab's lock (`Tab::term`) when the service trims under memory pressure (android/service D4), leaving the transcript and the snapshot state alone.
+- **What**: `appine_vt_drop_images` sets `GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT` to `KITTY_TRIMMED` (4 MiB) and back to `KITTY_STORAGE` (32 MiB) on both screens, called by `VtNative.dropImages(tab)` under the tab's lock (`Tab::term`) when the service trims background images (android/service D4), leaving the transcript and the snapshot state alone.
 - **Why**: A tab's Kitty images (up to 32 MiB a screen) could not be given back, and libghostty-vt's C API can neither compress, drop nor count them; only lowering its storage limit evicts.
 - **Tradeoffs**: Images are deleted outright with their placements, shown ones included, a program placing an image again by id finds it gone, and a restore from the snapshot saved before the cut brings the deleted images back.
 - **Watch out**: A libghostty-vt upgrade could change how lowering the limit evicts or what a limit change marks as mutated, and the view's frames rely on the placements generation changing.
@@ -47,11 +47,11 @@
 
 ### D6: Ash continuation parsing excludes background writer runs
 
-- **What**: With appine_lf=output, B-marked ash input treats its CR/CR/LF row breaks as continuations and other foreground line feeds as output starts; writer-tagged background runs are bracketed with output and continuation/input marks without ending input or starting command timing.
+- **What**: With appine_lf=output, B-marked ash input treats its CR/CR/LF row breaks as continuations and other foreground line feeds as output starts; writer-tagged background runs are bracketed with output and continuation/input marks without ending input or starting command timing. For shells with incomplete marks, VtSession queries native busy state and uses a foreground-process title when available.
 - **Why**: Long command rows and background job output otherwise incorrectly changed prompt state and busy/timing behavior.
-- **Tradeoffs**: Parsing depends on busybox row breaks and ONLCR, and taps above the resumed row after background output still count incorrectly.
+- **Tradeoffs**: Parsing depends on busybox row breaks and ONLCR, and native handling rejects taps above the resumed row after background output.
 - **Watch out**: OSC/DCS strings are tracked but split CSI sequences remain a risk, old edited profiles keep I marks, and no-job-control writers cannot be distinguished by process group.
-- **Source**: a809c5a8, daab4446; 20137e4c; d053be24; 39e55b4b
+- **Source**: a809c5a8, daab4446; 20137e4c; d053be24; 39e55b4b, acc5a7a0, 6e0c0f16
 
 ### D7: Bash hooks move to a companion script without changing terminal parsing
 
@@ -68,6 +68,30 @@
 - **Tradeoffs**: Programs may ignore or override BROWSER.
 - **Watch out**: A preserved custom launcher can behave differently from the Appine client.
 - **Source**: 8e211142; d053be24; 39e55b4b
+
+### D9: Hanging up invalidates queued writes and preserves console ownership intervals
+
+- **What**: Shut down the writer before closing the PTY, check hangup on submission and execution, and retain console ownership epochs for kill attribution.
+- **Why**: A recycled console can receive stale writes or kill reports.
+- **Tradeoffs**: Session teardown coordinates the writer and PTY.
+- **Watch out**: Every exit and release path must close once.
+- **Source**: 6f2776f3
+
+### D10: Terminal status expiry follows event order
+
+- **What**: Process expiry records in queue order and keep terminal success or failure visible until observed.
+- **Why**: A later expiry could otherwise erase an unseen result.
+- **Tradeoffs**: Status records may survive until the UI consumes them.
+- **Watch out**: Expiry markers must correspond to the originating command.
+- **Source**: 568b6a48
+
+### D11: Clipboard requests belong to a bounded generation of one session
+
+- **What**: Coalesce up to 64 targets under a 60-second waiting deadline and compare session and native generation tokens before accepting an answer.
+- **Why**: A reset or delayed dialog can otherwise answer an obsolete request.
+- **Tradeoffs**: Excess requests get an empty answer and opening a prompt cancels the waiting deadline.
+- **Watch out**: Observe native generation changes before accepting delayed callbacks.
+- **Source**: f3d226d5, 565f4a4e
 
 ## Superseded
 - ~~Background output at an ash prompt ending input like Enter (a809c5a8)~~ → replaced by **D6** in daab4446 (2026-11-13)

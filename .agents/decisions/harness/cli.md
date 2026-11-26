@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness/cli"`
 >
-> Last distilled: 2026-11-24 (HEAD = 231480cb)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on harness/cli made before it was split from harness keep their `harness` tags and live in `.agents/decisions/harness.md`: D5, D6, D9, D11, D15, D20, D21, D25, D28, D32, D35 and the guest-test portions of D36, D40 and D41.
 
@@ -34,27 +34,35 @@
 
 ### D4: End-to-end kernel regression suites run as static C binaries in per-test empty rootfs stores
 
-- **What**: `hosts/cli/tests/guest_programs.rs` runs standalone static C regression suites (`stability`, `isolation`, `fs_mm`, `ipc_poll_unix`, `fs_io_regressions`, `sig_ptrace_tty`) across Tier 0 and Tier 1 in per-test empty stores via `run_guest_in_empty_rootfs` (alongside host-driven `doomed_elf_fails_to_spawn` and `sig_ptrace_tty_console_write_after_end`), with `isolation.c` calling `mount()` before `pthread_create()` for its FUSE daemon.
+- **What**: `hosts/cli/tests/guest_programs.rs` runs standalone static C regression suites (`stability`, `isolation`, `fs_mm`, `ipc_poll_unix`, `fs_io_regressions`, `sig_ptrace_tty`) across Tier 0 and Tier 1 in per-test empty stores via `run_guest_in_empty_rootfs` (alongside host-driven `doomed_elf_fails_to_spawn` and `sig_ptrace_tty_console_write_after_end`), with `isolation.c` calling `mount()` before `pthread_create()` for its FUSE daemon. Two-tier fixtures also cover auxv, locks, provider-backed mappings and truncation, FUSE faults, syscall copyout, namespace and signal lifetime, mount API pins and relatime, with an optional 10,000-read timing run.
 - **Why**: Syscall, mount, VFS, FUSE, memory, signal, ptrace, tty, IPC, and Tier 0/Tier 1 boundaries need end-to-end guest verification beyond Rust unit tests, and starting `isolation.c`'s FUSE thread before `mount()` caused intermittent pre-mount `POLLERR` hangs.
 - **Tradeoffs**: Each suite invokes `tar` to build a tiny temporary store and adds roughly 0.4–1 s per suite across both tiers plus dedicated guest C test code.
-- **Watch out**: Suites depend on `/dev/fuse` and `/sys/fs/cgroup` at boot, clean `/tmp` at startup so both tiers reuse the empty store safely, and should synchronize via pipes, `waitpid`, or kernel state rather than short fixed sleeps (such as 30–40 ms waits) that can flake on loaded CI hosts.
-- **Source**: 849bf98a, b51818cf, 0e02d7cd, 15347732, ab694aab, 13dd5ae4
+- **Watch out**: Run each tier against its own store, retain the FUSE and cgroup boot fixtures, and synchronize via pipes, waitpid or kernel state so slow CI runs exercise the intended sequence.
+- **Source**: 849bf98a, b51818cf, 0e02d7cd, 15347732, ab694aab, 13dd5ae4, fc3d5c51, 021c7fc2, 523ae8a9, 68b70897, 568b6a48, d10f2973, f495f2cc, 1dab8c16, 4309ef58, f7ddba97, 68130f74, 11816722, 30e5002e, f985c1f8, 865d24c1, 6084b8af, 7a039c93, c5be5c77, 6fcaff37, 300b7146
 
 ### D5: Networking guest regressions are self-contained without rootfs or Linux UAPI headers
 
-- **What**: `tests/guest/net_regressions.c` (wired as `guest_programs::net_regressions`) exercises networking fixes across Tier 0 and Tier 1 without a rootfs or external network, embedding self-contained Linux UAPI structs so `musl-gcc` compiles cleanly.
+- **What**: `tests/guest/net_regressions.c` (wired as `guest_programs::net_regressions`) exercises networking fixes across Tier 0 and Tier 1 without a rootfs or external network, embedding self-contained Linux UAPI structs so `musl-gcc` compiles cleanly. The network suite covers full 127/8 loopback, raw ICMP rebinding and receive-buffer sizing, and routing attribute lengths.
 - **Why**: Networking fixes across `kernel/net`, `netns`, `netlink`, `rawicmp`, and `nft` need end-to-end Tier 0 and Tier 1 regression coverage without depending on the Alpine rootfs tarball or external connectivity.
 - **Tradeoffs**: Duplicating Linux UAPI constants and structs inside `tests/guest/net_regressions.c` adds local boilerplate in exchange for header-free `musl-gcc` builds.
 - **Watch out**: The dual-stack `AF_INET6` DNAT test skips gracefully when the host lacks a non-loopback IPv4 interface, whereas `scripts/dev` and CI containers provide `eth0` and run the full path.
-- **Source**: a1fd0beb
+- **Source**: a1fd0beb, 11cb85a0
 
 ### D6: C guest regression suites share `run_c_guest` and focused C setup and assertion helpers
 
-- **What**: `hosts/cli/tests/guest_programs.rs` shares `run_c_guest` for rootfs-free C suites (`threads`, `net`, `net_regressions`), while the new C regression suites share focused assertion and protocol/setup helpers (`CHECK_ERR`, overlay/FUSE/netlink/nft/ptrace builders) and pass thread fd arguments by value.
+- **What**: `hosts/cli/tests/guest_programs.rs` shares `run_c_guest` for rootfs-free C suites (`threads`, `net`, `net_regressions`), while the new C regression suites share focused assertion and protocol/setup helpers (`CHECK_ERR`, overlay/FUSE/netlink/nft/ptrace builders) and pass thread fd arguments by value. The shared guest_programs runner now rejects internal-error stderr for every fixture and imports a fresh empty-rootfs store per tier.
 - **Why**: Repeated build/run checks in `guest_programs.rs`, verbose syscall-error and protocol boilerplate, and stack-lifetime thread arguments obscured test intent and risked lifetime bugs.
 - **Tradeoffs**: Individual test cases read through small shared helper wrappers instead of raw inline syscalls.
 - **Watch out**: Helper failure macros must continue reporting line numbers and `errno` clearly so regressions stay easy to diagnose.
-- **Source**: 3a90a0ef
+- **Source**: 3a90a0ef, 300b7146
+
+### D7: Interactive CLI mode reads raw stdin and follows the output terminal's size
+
+- **What**: Set stdin raw and obtain the guest window size from stdout when possible, falling back to stdin.
+- **Why**: The input and displayed output can be different terminals.
+- **Tradeoffs**: A redirected stdout requires a fallback.
+- **Watch out**: Restore the host terminal across exit paths.
+- **Source**: aeaffd4b
 
 ## Superseded
 

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-24 (HEAD = 231480cb). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -53,6 +53,12 @@
 - **D45** — `InSyscall` stamps each BKL syscall's global number on `Task::syscall` from after the entry stop and seccomp until the end-of-syscall sweeps, cleared on every way out of dispatch before stops and signal delivery, so anything waiting inside dispatch after the sweeps must come after the guard is dropped or it holds back the overlay sweep (0d82807)
 - **D46** — `ExeFile::ovl` keeps the (mount, node, `Hold`) of a program run through an overlay, so `open_exe_file` can run a removed one from its store inode with the overlay mount's noexec and nosuid, until the overlay instance is gone (`ENOENT`) (9590431)
 - **D48** — Each thread carries its own credentials: clone sets the creating thread's, execve sets both of the main thread's copies, and the scheduling, ioprio, `PRIO_USER` and `RLIMIT_NPROC` checks use the target thread's, so code writing `Task.cred` or `ThreadGroup.cred` directly leaves the two apart (1be1142)
+
+> Full text of D50, D51, D56: `git show 3ad68857ee83ca9bb227d4d55db8611416ae226b:.agents/decisions/kernel/process.md`
+
+- **D50** — Mark the vfork parent frozen during the wait and retain the mark through ptrace or error until a still-pending freeze has thawed (b593172)
+- **D51** — At the arm64 exec point of no return, clear READ_IMPLIES_EXEC for every program before privileged personality cleanup, and read the brk flag before borrowing the address space (5760479)
+- **D56** — Kernel-wide test hook 14 forces TCP filter refusal until the test explicitly disables it, and builds without test hooks always report ordinary host behavior (52dcc177; 20137e4c; d053be24; 39e55b4b)
 
 ## Active (full detail)
 
@@ -119,20 +125,6 @@
 - **Watch out**: A fast-path call that stops counting as running guest code must not touch guest memory afterwards, and the host scheduler (CFS or Android's EAS) decides how long a yielder waits.
 - **Source**: 78b3284
 
-### D50: A parent waiting for its vfork child counts as frozen
-- **What**: The vfork wait marks the parent frozen before waiting and afterwards (or after an error) clears the mark unless its thread group is freezing, leaving the signal path's freezer stop to clear it after thaw, as Linux 6.1's `wait_for_vfork_done` does.
-- **Why**: Linux enters and leaves the frozen state around the vfork wait, and clearing the mark early would let `cgroup.events` flicker to unfrozen before the parent stops for a freeze still in progress.
-- **Tradeoffs**: A parent woken while freezing stays counted while it runs on to its freezer stop, including through a ptrace `VFORK_DONE` stop.
-- **Watch out**: A path back to guest code that skips the freezer check would leave the mark set.
-- **Source**: b593172
-
-### D51: execve clears `READ_IMPLIES_EXEC`, as arm64 does for every 64-bit program
-- **What**: execve's point of no return clears `READ_IMPLIES_EXEC` and then, when privileged, the `PER_CLEAR_ON_SETID` flags, and brk reads the flag before borrowing the address space (kernel/mm D43).
-- **Why**: personality(2)'s `READ_IMPLIES_EXEC` now takes effect, and natively a plain execve also cleared it, since arm64's `SET_PERSONALITY` drops it for every 64-bit program, which the first version kept.
-- **Tradeoffs**: `setarch -X program` has no effect on the program, as on arm64 Linux.
-- **Watch out**: None known.
-- **Source**: 5760479
-
 ### D52: A fast-path wait woken early hands its deadline to the BKL handler for one dispatch
 - **What**: When a signal wakes a no-BKL timed wait (futex relative and absolute, nanosleep, clock_nanosleep relative and absolute), the fast path records its deadline in `TaskState::fast_sleep`, the futex, nanosleep and clock_nanosleep handlers take it before checking or reading the time argument, and the run loop's `Exit::Svc` arm clears it after `dispatch` whatever the dispatch did.
 - **Why**: The handler redid the wait from the syscall's arguments, so time memory unmapped meanwhile turned EINTR into EFAULT where Linux's restart never rereads it, and a deadline whose handler did not run or failed first (the call skipped by seccomp or a tracer) ended the thread's next BKL-path wait early.
@@ -160,14 +152,6 @@
 - **Tradeoffs**: Nine relaxed stores and one release store per kernel entry, and with no sequence lock a reader can mix two entries of a thread that leaves and re-enters while it reads (procfs shows such a running thread as `running` anyway).
 - **Watch out**: A new path out of guest code that skips the record leaves a stale entry visible until the next exit.
 - **Source**: f1212d8
-
-### D56: Test hook 14 forces host refusal of TCP filters
-
-- **What**: Test hook 14 toggles `REFUSE_TCP_FILTERS` for the whole kernel, while `host_refuses_tcp_filters` is always false without test hooks.
-- **Why**: The retained TCP-filter path needs deterministic coverage on hosts that accept filters.
-- **Tradeoffs**: The hook persists until explicitly disabled.
-- **Watch out**: Tests must turn it off before later sockets in the same run.
-- **Source**: 52dcc177; 20137e4c; d053be24; 39e55b4b
 
 ### D57: Guest CPU samples combine live and exited threads
 
@@ -239,6 +223,70 @@
 - **Tradeoffs**: Slightly widens `ThreadGroup` and `Task` and couples `task::run`'s exit path to `ptrace::exit`.
 - **Watch out**: Keep `Task::exit_started` synchronized between `exit`/`exit_group` and `task::run` so a traced thread never emits `PTRACE_EVENT_EXIT` twice, and keep `leader_serial` cleared alongside `leader_exit` on leader replacement.
 - **Source**: 13dd5ae4
+
+### D65: Flock state belongs to the kernel and waiting to the syscall
+
+- **What**: Keep shared lock ownership in Kernel and handle interruption, nonblocking failure and retry in flock.
+- **Why**: Different open descriptions can contend for the same object.
+- **Tradeoffs**: The syscall must recheck on wake.
+- **Watch out**: Every interrupted wait needs cleanup.
+- **Source**: 021c7fc2
+
+### D66: Host operations coordinate with the owning kernels
+
+- **What**: Resolve store and overlay sampling under one BKL hold, preserve mount expiry, and acquire machines sharing a store in registry order for host truncation.
+- **Why**: A provider change can affect several running address spaces.
+- **Tradeoffs**: Cross-machine operations can take several locks.
+- **Watch out**: Keep a stable lock order.
+- **Source**: d5b808e8, f495f2cc
+
+### D67: Syscall completion keeps replay and writeback at the correct boundary
+
+- **What**: Replay matched executable opens and reads, leave batched receive retries local, and flush removed mappings at syscall completion and before task removal.
+- **Why**: Restarting an entire syscall can repeat events or lose final writes.
+- **Tradeoffs**: Handlers distinguish record-local from dispatcher retries.
+- **Watch out**: Close outstanding opens when exec fails.
+- **Source**: 93a9b204, 4309ef58, b421eac0
+
+### D68: Descriptor limits follow the acting thread group
+
+- **What**: Read NOFILE from the group and use Cx for bounded installation and reservation.
+- **Why**: Threads sharing an fd table may belong to groups with different limits.
+- **Tradeoffs**: Callers must identify the acting or target group.
+- **Watch out**: Reservations count toward both process and system bounds.
+- **Source**: 576501d3, 661d5f01
+
+### D69: Child handoff and wait consumption preserve one reportable event
+
+- **What**: Use exit signal, disposition and tracer relationship at reparenting and retain event data across retryable wait copies.
+- **Why**: An adopting tracer can also become the real parent.
+- **Tradeoffs**: An error after consumption returns EFAULT.
+- **Watch out**: Avoid either dropping the only waitable exit or reporting it twice.
+- **Source**: 25b0f2a0, 11816722
+
+### D70: Clone and procfs preserve per-task no_new_privs
+
+- **What**: Inherit the task's sticky flag at clone and retain the exited leader's value for procfs.
+- **Why**: Group-wide state can misrepresent a sibling.
+- **Tradeoffs**: The dead-leader record needs one more field.
+- **Watch out**: Use the live task's value when available.
+- **Source**: 71790fde
+
+### D71: Dead IPC namespaces trigger deferred collection
+
+- **What**: Share a kernel death flag with IPC namespaces and sweep at syscall completion until it stays clear.
+- **Why**: Dropping a namespace during collection can expose another dead one.
+- **Tradeoffs**: Most checkpoints need only a flag read.
+- **Watch out**: Resources retained by a namespace fd must survive process exit.
+- **Source**: 124c9c21
+
+### D72: Guest software-step completion clears its exclusive reservation
+
+- **What**: Clear the reservation in the task loop when a step produces the architectural exception.
+- **Why**: The raw CPU stepping API also serves callers without exception-return semantics.
+- **Tradeoffs**: The check sits outside the low-level step primitive.
+- **Watch out**: Keep direct CPU stepping behavior intact.
+- **Source**: d1fc9715
 
 ## Superseded
 

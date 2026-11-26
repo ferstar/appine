@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/vtview"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on the terminal view made before android/vtview was split from android/terminal keep their `android/terminal` tags and live in `.agents/decisions/android/terminal.md`: D5, D7, D9, D16, D17, D25, D30–D32, D34, D36, D37, D40, D41, D43 and D46–D48.
 
@@ -55,11 +55,11 @@
 
 ### D7: Clipboard and delayed input obey the shared privacy gate
 
-- **What**: Copy and paste reject locked access, preview dialogs use protected windows and MainActivity checks authorization again at the final input sink.
+- **What**: Copy and paste reject locked access, preview dialogs use protected windows and MainActivity checks authorization again at the final input sink. Both paste actions recheck dialog identity, session, terminal and privacy, and detach dismisses the preview.
 - **Why**: A visible shield alone cannot prevent queued IME or dialog callbacks from sending input.
 - **Tradeoffs**: Operations while locked or without a resumed page are discarded instead of replayed.
 - **Watch out**: Every new clipboard/input path and delayed callback must retain the final checks.
-- **Source**: f61072f3; d053be24; 39e55b4b
+- **Source**: f61072f3; d053be24; 39e55b4b, d10f2973
 
 ### D8: IME replacement and completed composition use the checked commit path
 
@@ -92,6 +92,14 @@
 - **Tradeoffs**: The OS still determines layout and appearance.
 - **Watch out**: Verify OEM/version differences and menu reopening after system dark-mode changes.
 - **Source**: 4c639565; 39e55b4b
+
+### D12: Attach and focus transitions target the correct terminal and IME
+
+- **What**: Reset transient composition on detach or switch, gate blinking on a live tab, and track window focus and the focused session to route paired mode-1004 events.
+- **Why**: A newly current session could receive the preceding session's focus or input state.
+- **Tradeoffs**: The view retains session-specific focus bookkeeping.
+- **Watch out**: Handle window detach as well as tab switches.
+- **Source**: 6f2776f3, 3a90a0ef, ae1e05e0
 
 ## Superseded
 - ~~D1 ownership of frame encoding, mirrors, drawing, images, glyphs and fonts~~ → replaced by **D1** in 9015b244 (2026-11-14)

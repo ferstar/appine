@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mmu"`
 >
-> Last distilled: 2026-11-23 (HEAD = cc72b093)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Soft-MMU decisions made before kernel/mmu was split from kernel/mm keep their `kernel/mm` tags and live in `.agents/decisions/kernel/mm.md`: D1, D13, D16, D39 and the page-table half of D4.
 
@@ -33,11 +33,11 @@
 
 ### D4: `CodeGroup` tracks admitted shared memops separately from per-process `Mm::memops`
 
-- **What**: `CodeGroup::memops` tracks admitted shared memops restricted to `group.ranges`, merged during `Mm::sync` and `Mm::code_space`, and marks `memops_dirty` when a sole member leaves a closed group so its `DbtSpace` switches back to `Mm::memops`.
+- **What**: `CodeGroup::memops` tracks admitted shared memops restricted to `group.ranges`, merged during `Mm::sync` and `Mm::code_space`, and marks `memops_dirty` when a sole member leaves a closed group so its `DbtSpace` switches back to `Mm::memops`. Refresh shared translation sources on final membership drop so a departing address space cannot clear another member's registrations.
 - **Why**: Pushing one member's `Mm::memops` onto a shared `DbtSpace` overwrote peers' registrations and could expose private mappings across members.
 - **Tradeoffs**: Memops in private executable mappings of a `CodeGroup` member are not accelerated until that member leaves the group.
 - **Watch out**: Like `CodeGroup::ranges`, `CodeGroup::memops` grows monotonically while shared; members remapping conflicting code at those addresses still leave the group via `check_code_group`.
-- **Source**: 9b3b6860
+- **Source**: 9b3b6860, 99b74cef
 
 ### D5: Memop entry points register only for executable mappings of the verified bundled libc snapshot
 
@@ -49,11 +49,11 @@
 
 ### D6: Soft page tables support 2 MiB L2 superpages with atomic demotion and a 1024-entry `stlb`
 
-- **What**: L2 entries encode 4 KiB-host-aligned 2 MiB superpages via `PTE_SUPER` (bit 3, with `>= 16`-byte aligned tables), `demote_l2` atomically publishes a populated 512-entry L3 table on partial mutation, `store_range` promotes empty/superpage/all-zero-L3 slots while retiring up to 256 empty L3 tables per `appine_mmu` until free, and a 1024-entry `stlb` plus `stlb_used[16]` sits at the tail of `struct appine_cpu`, flushed by `appine_cpu_tlb_flush` and bypassed when `nwatch != 0`.
+- **What**: L2 entries encode 4 KiB-host-aligned 2 MiB superpages via `PTE_SUPER` (bit 3, with `>= 16`-byte aligned tables), `demote_l2` atomically publishes a populated 512-entry L3 table on partial mutation, `store_range` promotes empty/superpage/all-zero-L3 slots while retiring up to 256 empty L3 tables per `appine_mmu` until free, and a 1024-entry `stlb` plus `stlb_used[16]` sits at the tail of `struct appine_cpu`, flushed by `appine_cpu_tlb_flush` and bypassed when `nwatch != 0`. Count real table allocations, including demotion and root tables, and expose their byte total for memory accounting.
 - **Why**: 4 KiB-only L3 leaves forced 512 walks per 2 MiB and capped fast-loop spans at 4 KiB across large contiguous model weights and scratch buffers.
 - **Tradeoffs**: Adds 16 KiB of virtual `struct appine_cpu` tail per thread (zero RSS unless touched), retains up to 256 retired L3 tables (<= 1 MiB) per address space until teardown, and allocates one L3 table on partial-mutation demotion.
 - **Watch out**: Any missed `stlb` flush on demotion/unmap/protect, unaligned table pointer colliding with `PTE_SUPER` or watchpoint entry entering `stlb` can leave stale translations or miss watchpoints.
-- **Source**: 42d49fc0
+- **Source**: 42d49fc0, e6e88b55
 
 ### D7: Read-only non-FUSE file faults fill 16 MiB soft page-table spans
 
@@ -62,3 +62,35 @@
 - **Tradeoffs**: Unaligned fixed read-only file mappings can allocate up to 8 L3 leaf tables (32 KiB) on first fault, and writable or FUSE file mappings keep 2 MiB demand granularity.
 - **Watch out**: Relies on file mappings staying outside `Mm::touched_windows`; any future RSS or fork accounting that scans soft PTEs on read-only file mappings must account for 16 MiB fault and `MADV_WILLNEED` prefill spans.
 - **Source**: d0945a96
+
+### D8: Eager page-table fills preserve faults that still need admission
+
+- **What**: Roll back failed fills for a new mapping, retain successful entries in existing VMAs and prefill unwritten anonymous pages read-only until the first admitted write.
+- **Why**: Eagerly granting write access loses first-write state.
+- **Tradeoffs**: Allocation failure can leave pages to fault in later.
+- **Watch out**: Never upgrade a CoW page through the anonymous fast path.
+- **Source**: 0e02d7cd, 71790fde, 9d0ad1b6
+
+### D9: Shootdowns and membarriers cover every participating address space
+
+- **What**: Fence quiescence, target global commands by registration, and complete revocation across affected mappings before host truncation or invalidation.
+- **Why**: Host-side replay lacks a guest caller that can be excluded.
+- **Tradeoffs**: Global commands must visit each live address space.
+- **Watch out**: Capture shared-write baselines before granting writable translations.
+- **Source**: 47231a42, 523ae8a9, f495f2cc, b421eac0
+
+### D10: Private file-page detachment survives VMA splits
+
+- **What**: Record the detached host page on its first write and share that record across split views.
+- **Why**: Fork and remap need to recognize private data after a split.
+- **Tradeoffs**: Detached-page bookkeeping follows the backing.
+- **Watch out**: Do not infer private status from changed byte values.
+- **Source**: 11816722
+
+### D11: Page watches survive permission changes and expire on backing replacement
+
+- **What**: Share weak watches per readable page, invalidate changed ranges on mapping moves, replacement or discard, and pre-demote only partially covered boundary superpages before unmap.
+- **Why**: A live pipe reference needs backing identity independent of unrelated TLB generations.
+- **Tradeoffs**: Demotion can allocate before an unmap commits.
+- **Watch out**: A failed preparation preserves translations and watches.
+- **Source**: 6eb822d7, bb31dbda, d7a28ce2, 33e95609

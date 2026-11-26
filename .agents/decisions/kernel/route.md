@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/route"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on kernel/route made before it was split from kernel/net keep their `kernel/net` tags and live in `.agents/decisions/kernel/net.md`: D4 and the routing parts of D3, D9 and D12.
 
@@ -15,3 +15,11 @@
 - **Tradeoffs**: Pre-split decisions remain in `.agents/decisions/kernel/net.md`.
 - **Watch out**: Changes to `RTM_GETROUTE`/`RTM_GETRULE` replies, virtual-device route merging or Android `LinkProperties` route updates require reading `kernel/route` together with `kernel/netlink`, `kernel/netns` or `kernel/net`.
 - **Source**: e0719858
+
+### D2: Route lookups validate input interface and family-specific attributes
+
+- **What**: Check RTM_GETROUTE header and attribute lengths, resolve input-device forwarding and localnet rules, and return strict-validation diagnostics.
+- **Why**: An invalid route request must report the same failure stage as Linux 6.1.
+- **Tradeoffs**: Input-interface lookups produce different attributes than output lookups.
+- **Watch out**: Preserve family-specific errno and extended acknowledgement details.
+- **Source**: 76da8eff, d11379f7

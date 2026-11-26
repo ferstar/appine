@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/ipc"`
 >
-> Last distilled: 2026-11-24 (HEAD = 231480cb)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 
 ## Active
 
@@ -93,6 +93,22 @@
 - **Tradeoffs**: Cookies are dropped with `ENOBUFS` when the target netlink socket's receive buffer is full, matching Linux `netlink_attachskb`.
 - **Watch out**: None known.
 - **Source**: a1fd0beb
+
+### D13: Message queues charge capacity until namespace and queue references end
+
+- **What**: Keep mode-based metadata, charge arm64 queue capacity through user-namespace ancestors, install fds under the caller's limit and uncharge at destruction.
+- **Why**: An unlinked queue or retained namespace can still consume resources.
+- **Tradeoffs**: Collection can follow the last reference indirectly.
+- **Watch out**: Destroying an IPC namespace must release outstanding charges.
+- **Source**: 68b70897, f495f2cc, 576501d3, 124c9c21
+
+### D14: Queue receive retains the selected message during copy retries
+
+- **What**: Pin the chosen SysV or POSIX message while servicing a retryable user-buffer fault.
+- **Why**: Retrying selection can consume a different message.
+- **Tradeoffs**: A pending copy keeps the original message alive.
+- **Watch out**: Completion must commit the receive exactly once.
+- **Source**: 30e5002e
 
 ## Superseded
 

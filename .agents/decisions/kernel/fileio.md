@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/fileio"`
 >
-> Last distilled: 2026-11-24 (HEAD = 231480cb)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on file data I/O made before kernel/fileio was split from kernel/files (and before kernel/files was split from kernel/vfs) keep their parent tags and live in `.agents/decisions/kernel/files.md` (D3, D4 and the truncate-through-fd-link half of D2) and `.agents/decisions/kernel/vfs.md` (D11, D22, D24, D29, D33, D45, the `write_sync` half of D17, the write-path half of D41 and the file I/O halves of D36 and D37).
 
@@ -34,11 +34,11 @@
 
 ### D4: RAII `PosGuard` and `TwoPosGuard` serialize `f_pos_lock` updates across file I/O
 
-- **What**: `PosGuard` (`lock_if`, `lock_if_with`, `lock_positioned`) and pointer-ordered `TwoPosGuard` serialize `pos_busy` across `lseek`, `read_file`, `write_file`, `writev`, `sendfile`, `copy_file_range`, `copy_data` and `splice`, keeping `take_pos`/`release_pos` private (alongside `open_tmpfs_size` for overlay-aware tmpfs size queries).
+- **What**: `PosGuard` (`lock_if`, `lock_if_with`, `lock_positioned`) and pointer-ordered `TwoPosGuard` serialize `pos_busy` across `lseek`, `read_file`, `write_file`, `writev`, `sendfile`, `copy_file_range`, `copy_data` and `splice`, keeping `take_pos`/`release_pos` private (alongside `open_tmpfs_size` for overlay-aware tmpfs size queries). Ordinary proc mem transfers and lseek also take the open description's position lock.
 - **Why**: `lseek` and other position-moving paths raced with unlocked I/O, and regular-file and FUSE paths previously duplicated raw acquire/release logic.
 - **Tradeoffs**: Holding `pos_busy` across multi-piece calls serializes concurrent position-based operations on one description, and external callers (`kernel/fuse`) acquire `f_pos_lock` exclusively through RAII `PosGuard`.
 - **Watch out**: Helpers called while a `PosGuard` is held must receive `pos_held = true` to avoid self-deadlock, and any future non-RAII unlock pattern would need an explicit `PosGuard` method.
-- **Source**: ab694aab, 3a90a0ef
+- **Source**: ab694aab, 3a90a0ef, 865d24c1
 
 ### D5: Synchronous `writev` and kernel copies flush once via `write_sync` and propagate errors
 
@@ -56,10 +56,88 @@
 - **Watch out**: Privilege-removal rules must stay aligned between `syscall/fs.rs` and `Store::remove_privs` across writes, truncation and `chown`.
 - **Source**: ab694aab
 
-### D7: Document `EFBIG` on `INT64_MAX` memfd `ftruncate` on the development store
+### D7: Memfds can represent a logical size beyond the host filesystem limit
 
-- **What**: `.agents/maps/kernel/fileio.md` records that extending a memfd to `INT64_MAX` with `ftruncate` returns `EFBIG` on the development store, whereas native Linux accepts that length.
-- **Why**: `Pread64Test.Overflow` exposed a memfd size limit during `ftruncate` because memfds use unlinked store objects.
-- **Tradeoffs**: `pread64_test` remains outside the regular gVisor differential suite.
-- **Watch out**: The maximum object size may vary with the store's backing filesystem.
-- **Source**: 48f1c17e
+- **What**: Keep a logical length only after host set_len returns EFBIG and consult it for stat, sparse reads, offsets, seals and copy operations.
+- **Why**: Linux accepts sparse memfds larger than the backing filesystem's maximum file.
+- **Tradeoffs**: Writes and mappings beyond that host limit still depend on real storage.
+- **Watch out**: Discard the override on ordinary truncation or final cleanup.
+- **Source**: 48f1c17e, 4afada09, ab417943
+
+### D8: Unsharing coordinates open descriptions and live file mappings
+
+- **What**: Prepare replacement handles before publication, reconcile descriptions against the pinned object, and synchronize affected address spaces before replacing their host regions.
+- **Why**: Provider writes must stay visible to existing mappings without modifying an independent clone.
+- **Tradeoffs**: Busy descriptions can defer unsharing.
+- **Watch out**: A mapping can appear before the provider notification arrives.
+- **Source**: 523ae8a9, 568b6a48, f495f2cc
+
+### D9: Empty reads still validate their descriptor and record format
+
+- **What**: Check access and positioning, keep fixed-record size errors, and return immediately on an empty pipe request.
+- **Why**: A zero-byte operation can still target an invalid description.
+- **Tradeoffs**: Validation depends on the file kind.
+- **Watch out**: A zero-length pipe read must never wait.
+- **Source**: 68b70897
+
+### D10: FUSE truncation revokes access before shrinking backing
+
+- **What**: Remove access to the old mapped tail before changing backing size.
+- **Why**: A concurrent access could otherwise reach truncated storage.
+- **Tradeoffs**: The address spaces must be coordinated.
+- **Watch out**: Regrowth must not expose the previous tail.
+- **Source**: b421eac0
+
+### D11: sendfile uses pipe slot reservations
+
+- **What**: Reserve through splice and carry the initial tail merge across write chunks.
+- **Why**: Byte capacity alone cannot determine whether another pipe buffer fits.
+- **Tradeoffs**: A partial transfer can consume the last available slot.
+- **Watch out**: Preserve an existing mergeable tail across chunks.
+- **Source**: 25b0f2a0
+
+### D12: Eligible tmpfs fallocate reservations are sparse and quota-backed
+
+- **What**: Serialize quota validation and charging through the write, reuse reservations, and extend the sparse backing only as needed.
+- **Why**: Guest allocation guarantees and host physical allocation have different costs.
+- **Tradeoffs**: Successful reservation need not allocate all host blocks.
+- **Watch out**: Truncation and later writes must reuse or release the same reservation.
+- **Source**: 71790fde, 7e10a55b
+
+### D13: Scalar and vectored sysctl writes validate the complete user buffer
+
+- **What**: Use one input path, retain the parser's bounded prefix, and check even the discarded suffix before committing.
+- **Why**: A fault late in an iovec must leave the setting and position unchanged.
+- **Tradeoffs**: Long writes still read data beyond the parse limit.
+- **Watch out**: Apply this check to all sysctl writes.
+- **Source**: 68130f74, 6fcaff37
+
+### D14: File reads update relatime once per syscall
+
+- **What**: Route data reads and in-kernel copies through a shared access hook and touch atime once after qualifying progress.
+- **Why**: Repeated timestamp work inflated the cost of warm reads.
+- **Tradeoffs**: A syscall can span multiple internal reads.
+- **Watch out**: Preserve zero-length behavior and error order.
+- **Source**: 30e5002e, 7a039c93
+
+### D15: Host file I/O distinguishes regular descriptors and caps each syscall
+
+- **What**: Use positional I/O for regular host files, poll nonregular outputs in PIPE_BUF-sized chunks and cap scalar, vectored and kernel copies at 0x7ffff000 bytes.
+- **Why**: Large operations need Linux transfer bounds without blocking the kernel on host pipes.
+- **Tradeoffs**: Nonregular outputs may poll once per 4 KiB.
+- **Watch out**: Another writer can fill a host pipe after readiness.
+- **Source**: d96f5d63
+
+### D16: File range operations enforce Linux validation order
+
+- **What**: Check positional offsets before fd lookup, validate fallocate in generic then filesystem stages, and forward applicable loop-device sync ranges.
+- **Why**: Several combinations of invalid arguments expose errno precedence.
+- **Tradeoffs**: Filesystem-specific checks run after write preparation.
+- **Watch out**: A range beyond the loop device can succeed without host I/O.
+- **Source**: e6495409
+
+## Superseded
+
+- ~~Replacing only open descriptors when the provider unshares a mapped file (kernel/store D17)~~ → replaced by **D8** in 523ae8a9 (2026-11-24)
+- ~~Copying first and deciding whether live mappings can move afterward~~ → replaced by **D8** in f495f2cc (2026-11-24)
+- ~~Physically allocating all backing for eligible tmpfs fallocate reservations~~ → replaced by **D12** in 7e10a55b (2026-11-24)

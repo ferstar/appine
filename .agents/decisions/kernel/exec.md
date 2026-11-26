@@ -2,18 +2,18 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/exec"`
 >
-> Last distilled: 2026-11-24 (HEAD = 231480cb)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on execve and the ELF loader made before kernel/exec was split from kernel/process keep their `kernel/process` tags and live in `.agents/decisions/kernel/process.md`: D7, D17, D31, D41, D43, D46 and D51.
 
 ## Active
 
 ### D1: kernel/exec is split out of kernel/process
-- **What**: kernel/exec owns `loader.rs` and the execve section of `syscall/proc.rs`: arguments, targets, `#!` scripts, `ETXTBSY`, the effects of set-id bits and file capabilities, the ELF loader with doomed images, the point of no return, `exe_file`, the executable cache and the names of the program's mappings.
+- **What**: kernel/exec owns `loader.rs` and the execve section of `syscall/proc.rs`: arguments, targets, `#!` scripts, `ETXTBSY`, the effects of set-id bits and file capabilities, the ELF loader with doomed images, the point of no return, `exe_file`, the executable cache and the names of the program's mappings. Exec credential computation reads the executing task's no_new_privs flag.
 - **Why**: execve and the ELF loader are a self-contained path (6.1's `fs/exec.c` and `binfmt_elf.c`) changed often on their own, and the process map could no longer be read in one Read.
 - **Tradeoffs**: Execution spans task teardown in kernel/process, host spawn in kernel/boot and timer clearing in kernel/time, alongside credentials, namespaces, memory, signals and file-related modules; tracing implementation and vDSO construction belong to kernel/ptrace and kernel/vdso.
 - **Watch out**: A step added to the point of no return without updating its ordered list in the map.
-- **Source**: b320f8e; 8a17e4a9; d053be24; 60790c14; 39e55b4b
+- **Source**: b320f8e; 8a17e4a9; d053be24; 60790c14; 39e55b4b, 71790fde
 
 ### D2: Automatic Tier 1 memop discovery is restricted to SHA-256-verified bundled Alpine musl
 
@@ -41,11 +41,11 @@
 
 ### D5: `execve` enforces `ETXTBSY` on scripts and `PT_INTERP`, pins mounts, and skips ptrace exec stops on doomed images
 
-- **What**: `execve` checks `open_for_write` on the initial target, every `#!` hop and `PT_INTERP`, propagates `image.doomed` to `exec_done` so doomed images flush hardware debug slots, skip `ptrace::exec`/`ptrace::syscall_exit` and deliver the forced `SIGSEGV` immediately, and pins executable/interpreter mounts on segment VMAs (`label_image`/`interp_label`) and `ExeFile`.
+- **What**: `execve` checks `open_for_write` on the initial target, every `#!` hop and `PT_INTERP`, propagates `image.doomed` to `exec_done` so doomed images flush hardware debug slots, skip `ptrace::exec`/`ptrace::syscall_exit` and deliver the forced `SIGSEGV` immediately, and pins executable/interpreter mounts on segment VMAs (`label_image`/`interp_label`) and `ExeFile`. Open the main executable and interpreter through shared writer and mount checks, preserve pinned regular backing across rename or unlink, and report main-image reads before opening the interpreter.
 - **Why**: `execve` missed `ETXTBSY` on nested `#!` scripts and `PT_INTERP`, reported ptrace exec/syscall-exit stops for doomed images, and left executable/interpreter mounts unpinned for `umount2`.
 - **Tradeoffs**: `execve`/`execveat` return `Result<bool, Errno>` instead of `Result<(), Errno>`, and `exec` runs `evict_unlinked_tmpfs` after `close_on_exec`.
 - **Watch out**: `LoadError::Interpreter` passes `Errno::ETXTBSY` straight through `load_error`, so future loader error wrapping must keep `ETXTBSY` intact.
-- **Source**: 0e02d7cd
+- **Source**: 0e02d7cd, 93a9b204, 30e5002e, f985c1f8
 
 ### D6: Secure `execve` computes `Args::arg_limit` before clamping the 8 MB stack limit
 
@@ -62,6 +62,14 @@
 - **Tradeoffs**: Adds two reset lines in `syscall/proc.rs` to keep `ThreadGroup` leader-exit invariants self-consistent across exec handover.
 - **Watch out**: Keep `kill_other_threads` updated if additional leader-exit fields are added to `ThreadGroup`.
 - **Source**: 13dd5ae4
+
+### D8: Exec finishes the old address space before completing image takeover
+
+- **What**: Flush shared FUSE ranges after final release_mm stores, run post-syscall sweeps, leave syscall accounting, then synchronize and complete exec.
+- **Why**: Final stores and cleanup must precede the new image becoming active.
+- **Tradeoffs**: Successful and doomed exec paths share dispatch cleanup.
+- **Watch out**: Preserve the old task identity across non-leader takeover.
+- **Source**: b421eac0, e1fbd2ae
 
 ## Superseded
 

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D8 were seeded by hand from the design doc §13.3
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D8 were seeded by hand from the design doc §13.3
 > and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Constraint index (compressed active decisions)
@@ -24,6 +24,10 @@
 - **D20** — difftest, ltp and survey choose Alpine tarballs with `sort -V` and the rootfs tests with `version_key`, as the APK build does (android/native D12), never by lexical order (b014e84)
 - **D21** — `appine-run` rejects an inline value on a flag (`--pty=0`) with exit status 2, while options that take a value still accept one inline (`--tier=0`) (c11c1db)
 
+> Full text of D28: `git show 3ad68857ee83ca9bb227d4d55db8611416ae226b:.agents/decisions/harness.md`
+
+- **D28** — Run appine-run on Linux, using scripts/dev from macOS and retaining APFS for host-side differential lanes (7c5e636)
+
 ## Active (full detail)
 
 ### D2: Test cases carry their own container and `appine-run` options
@@ -43,7 +47,7 @@
 - **What**: harness owns development containers, CI, benchmarks, LTP, surveys and crash tools; appine-run and cargo integration belong to harness/cli and differential/upstream runners to harness/diff.
 - **Why**: Separating independently maintained subsystems makes the oversized parent map practical to read and maintain.
 - **Tradeoffs**: Cross-boundary work follows child maps, while historical decisions keep their original parent tags and stable IDs.
-- **Watch out**: Recorded weaknesses stay open in the map: a forced PTY on a terminal with piped stdout is half set up, and three waiters can still pass difftest's lock together (D29); these pre-split qualifications remain discoverable through the child maps and are not resolved by the ownership split.
+- **Watch out**: The inherited PTY and competing-waiter limitations were addressed in harness/cli and harness/diff respectively.
 - **Source**: 16ac7a2 (list since updated by 1f93e3d, 1459292 and ce8a9ce; bug list by 5d23297, 7c5e636, dcacfb6, 6d9a9e8, f5c09f7, d9e1f0c, 300d384 and ca8c583); 8a17e4a9; d053be24; 60790c14; 39e55b4b
 
 ### D10: CI installs a pinned Zig and caches the libghostty-vt build tree for the Android job
@@ -89,11 +93,11 @@
 - **Source**: 248d79f
 
 ### D24: CI is split into quick checks, the Android build and nightly full tests
-- **What**: ci.yml runs fmt, clippy and cargo test on pushes/PRs outside docs, `.agents`, Markdown or `android/`; android.yml runs on Android/core/script changes or manually; full.yml runs nightly at 02:00 China time (when develop had a commit in 25 hours), on pushes to master and manually, split into `build` (builds release `appine-run` as a 7-day `overwrite: true` artifact and populates Starnix/gVisor caches), parallel `checks` (network, extended lockstep, clang engine/lockstep) and five `fail-fast: false` single-lane `difftest` matrix shards (`gvisor-process`, `gvisor`, `starnix`, `core-1`, `core-2`) running `scripts/difftest -R` (D38); quick workflows cancel superseded runs and the performance probe is dropped.
+- **What**: ci.yml runs fmt, clippy and cargo test on pushes/PRs outside docs, `.agents`, Markdown or `android/`; android.yml runs on Android/core/script changes or manually; full.yml runs nightly at 02:00 China time (when develop had a commit in 25 hours), on pushes to master and manually, split into `build` (builds release `appine-run` as a 7-day `overwrite: true` artifact and populates Starnix/gVisor caches), parallel `checks` (network, extended lockstep, clang engine/lockstep) and ten `fail-fast: false` single-lane `difftest` matrix shards running `scripts/difftest -R` (D38); quick workflows cancel superseded runs and the performance probe is dropped. The gvisor-fs-devices shard runs the filesystem and device groups.
 - **Why**: Frequent pushes waited 16–30+ minutes for rarely changing suites, and running all 97 differential groups plus checks serially in one full.yml job took ~35 minutes and forced full re-runs on a single intermittent failure.
 - **Tradeoffs**: Differential regressions surface nightly unless run locally/manually, sharding uses more total runner minutes (each shard initializes its own Alpine store in ~20 s) and passes `appine-run` via a 7-day artifact, nightly runs use master's copy of full.yml, and Tier 1's Neoverse N2 overhead is no longer logged in CI.
 - **Watch out**: Scheduled runs read `master`'s `full.yml` until merged (`workflow_dispatch --ref <branch>` uses the branch copy), `Re-run failed jobs` fails after the 7-day `appine-run` artifact expires, unbalanced `core-1`/`core-2` slices can skew shard time, CI's newer kernel differs from colima 6.8 (D36), and Android build inputs outside path filters go unbuilt.
-- **Source**: 0202f1e, 48dce39; ba6200f (D36); 4083007 (`-R` and manual runs' branch); 36083476; 20137e4c; d053be24; 39e55b4b; 2e6c1894
+- **Source**: 0202f1e, 48dce39; ba6200f (D36); 4083007 (`-R` and manual runs' branch); 36083476; 20137e4c; d053be24; 39e55b4b; 2e6c1894, 231480cb, 47231a42
 
 ### D25: Signals to appine-run go through the guest, so shutdown still runs
 - **What**: `appine-run` catches SIGINT, SIGTERM and SIGHUP with `appine_hal::stop_notifier` (hal D14) and hands them to the kernel's run through `RunOptions::stop` (kernel/process D30): the first is sent on to the program, one at least a second later ends every guest process, and the run then ends as usual.
@@ -116,26 +120,19 @@
 - **Watch out**: A case that relied on files an earlier case or run left in `/root` or `/tmp` now finds them gone.
 - **Source**: 5d23297, f6a82cc, 84ff4a7, 6d9a9e8, f5c09f7
 
-### D28: appine-run runs only on Linux hosts
-- **What**: Native macOS is not a host for `appine-run` (hal D1), so the map's open question and its macOS console-size bug (`TIOCGWINSZ`) are gone; a Mac remains a development machine through `scripts/dev` and difftest's APFS lanes.
-- **Why**: The harness map's open question whether native macOS is a supported host for `appine-run` had its answer: it is not.
-- **Tradeoffs**: `appine-run` cannot be tried on a Mac outside the container.
-- **Watch out**: None for CI, which never built macOS.
-- **Source**: 7c5e636
-
 ### D29: One difftest runs at a time, and a case whose suite is not built reports SKIP
-- **What**: The top-level run makes `target/difftest/.lock` a symbolic link naming its pid before it touches the store and a second run waits, checking the holder with `ps -p` and taking a dead lock (or an earlier version's lock directory) over by moving it aside and putting back a newer lock it moved by mistake (lanes run under their parent's lock); a case calling `run.sh <suite> "$SKIP" <programs>` is reported SKIP, counted but not failed, when `target/<suite>-tests` has no tarball, and fails when the tarball lacks a named program that SKIPPED.txt does not list as not building.
+- **What**: The host output-directory lock now covers all lanes (harness/diff), and the legacy check makes `target/difftest/.lock` a symbolic link naming its pid before it touches the store and a second run waits, checking the holder with `ps -p` and taking a dead lock (or an earlier version's lock directory) over by moving it aside and putting back a newer lock it moved by mistake (lanes run under their parent's lock); a case calling `run.sh <suite> "$SKIP" <programs>` is reported SKIP, counted but not failed, when `target/<suite>-tests` has no tarball, and fails when the tarball lacks a named program that SKIPPED.txt does not list as not building.
 - **Why**: Runs share `target/difftest` (per-case outputs, lane claims, lane clones that `-r` deletes), so a second run started during one made both report nonsense, and a case without its suite printed the same "not installed" line on both sides and passed, so verifying a fix by removing its skips proved nothing locally; the first lock, a directory made before its pid file, could not tell a killed run from one starting, let two waiters take a dead lock together and took another user's live run (`kill -0` failing with `EPERM`) for dead.
-- **Tradeoffs**: Runs are serialized, so another tier or an agent waits instead of sharing the VM; three waiters can still run together when one moves aside a lock another has just made and a third makes its own before it is put back; SKIP keeps exit status 0, so a missing suite is visible only in the output.
+- **Tradeoffs**: Runs are serialized, so another tier or an agent waits instead of sharing the VM; SKIP keeps exit status 0, so a missing suite is visible only in the output.
 - **Watch out**: A pid reused by an unrelated process after a run was killed keeps the lock held until that process ends (`rm target/difftest/.lock` frees it), the host needs `ps -p`, and a case written in another shape than `run.sh <suite> "$SKIP"` escapes the absent-program check.
 - **Source**: 3c6bf5e, 300d384
 
 ### D30: Container engines are surveyed on their native drivers with storage of their own
-- **What**: Surveys of their own (podman-rootless, podman-overlay, docker-overlay, podman-rootless-overlay, docker-rootless-overlay) give each engine its own storage root, run root, data root and socket, the overlay ones on a tmpfs natively because docker's overlay root cannot be an upper layer, and check probes, changes over image layers, diff, commit, build, volumes (`:O` included), whiteouts, `user.overlay.opaque` and start time; rootless docker runs dockerd inside RootlessKit's host network with containers on `--network none`.
+- **What**: Surveys of their own (podman-rootless, podman-overlay, docker-overlay, podman-rootless-overlay, docker-rootless-overlay) give each engine its own storage root, run root, data root and socket, the overlay ones on a tmpfs natively because docker's overlay root cannot be an upper layer, and check probes, changes over image layers, diff, commit, build, volumes (`:O` included), whiteouts, `user.overlay.opaque` and start time; rootless docker runs dockerd inside RootlessKit's host network with containers on `--network none`. The network survey exercises both bridge settings, routed rejection, published ports and consecutive bridge and endpoint DNAT.
 - **Why**: Whether the engines really use Appine's overlay, including rootless podman's own `userxattr` mounts and rootless containerd's layer extraction, needs a run of each with its native driver compared with native Linux, without disturbing the vfs surveys' images.
 - **Tradeoffs**: The surveys need the network for image pulls and are compared by reading their output, and neither rootless docker's networking nor its usual start through dockerd-rootless (which needs a TUN device Appine lacks) is tested.
 - **Watch out**: `docker build` fails on both sides under rootless docker ("driver not connecting"), so builds there stay unchecked, and engine, RootlessKit or dockerd-rootless updates can change probe output or break the manual start.
-- **Source**: 5d7b936, 450fb00, 869de68, 8089088
+- **Source**: 5d7b936, 450fb00, 869de68, 8089088, f7ddba97
 
 ### D31: Overlay gtests run on a tmpfs TEST_TMPDIR, picked by a positive filter
 - **What**: The starnix-overlay case mounts a tmpfs as `TEST_TMPDIR` and runs Starnix's overlayfs_test and fs_test's overlay tests in one `run.sh` call limited by the runner's `ONLY` gtest filter, starnix-fs skips fs_test's OverlayFs tests, gvisor-fs keeps only the sysfs overlay test skipped, and an overlay-upper case covers the upper layer.
@@ -240,6 +237,14 @@
 - **Watch out**: `actions/cache@v6` saves only on a primary-key miss when the job succeeds, so a broken cached tree persists until the fetch script changes or the cache is deleted.
 - **Source**: 87f1094f
 
+### D45: CI enables unprivileged ping sockets before workspace tests
+
+- **What**: Configure the Linux runner's ping group range before cargo test.
+- **Why**: Raw ICMP guest tests use host ping sockets.
+- **Tradeoffs**: The job modifies a runner sysctl.
+- **Watch out**: The range must cover the test user's group.
+- **Source**: e8eb1c70
+
 ## Superseded
 
 - ~~Line-discipline scenarios skipped by group until fixed (24ecd25)~~ → replaced by **D18** in 8dc166b (2026-11-07)
@@ -255,3 +260,5 @@
 - ~~D9 combined ownership of the newly extracted child modules~~ → replaced by **D9** in 60790c14 (2026-11-15; scope only, inherited implementation decisions remain here)
 - ~~Single-job serial `full.yml` execution in D24 (0202f1e, 48dce39)~~ → replaced by **D24** in 2e6c1894 (2026-11-22, implicit refinement)
 - ~~Temporary 30 s `sy-sample.log` sampler (45495baf) and `strace`/`gdb` deep probes (6e80c7a0) in `full.yml`~~ → removed under **D37** in f5220571 (2026-11-22)
+- ~~The five-shard full differential workflow~~ → replaced by **D24** in 231480cb (2026-11-24)
+- ~~The nine-shard full differential workflow~~ → replaced by **D24** in 47231a42 (2026-11-24)

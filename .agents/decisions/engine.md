@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D18 were seeded by hand from the retired design
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D18 were seeded by hand from the retired design
 > doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -37,11 +37,11 @@
 - **Source**: rounds 02 (`02-m1a`), 09 (`09-m7`); 16914003
 
 ### D5: Exclusives are emulated as value compare-and-swap in both tiers
-- **What**: LDXR records address, size and value; STXR does a compare-and-swap against the recorded value on the host address.
+- **What**: LDXR records address, size and value; STXR does a compare-and-swap against the recorded value on the host address. Clear the local exclusive reservation at guest exceptions, system calls and asynchronous kick exits.
 - **Why**: Extra memory accesses (TLB lookups) between `ldxr` and `stxr` can clear the host's exclusive monitor and livelock, and recognizing whole LL/SC sequences is unnecessary; musl hard-codes `ldaxr`/`stlxr`, so LL/SC must work even when LSE is advertised.
 - **Tradeoffs**: ABA is allowed (as in QEMU), harmless for correct LL/SC use.
 - **Watch out**: Tier 1's `ldaxr`/`stlxr` loop must keep only register operations between the two instructions.
-- **Source**: rounds 01 (`01-m2`), 02 (`02-m1a`), 09 (`09-m7`); risk R4
+- **Source**: rounds 01 (`01-m2`), 02 (`02-m1a`), 09 (`09-m7`); risk R4, d1fc9715
 
 ### D6: Translated code never touches host x18 and never changes NZCV
 - **What**: Guest X18 is always kept in the CPU state, and inserted code uses `cbnz`/`tbnz`/`eor` instead of compares.
@@ -178,11 +178,11 @@
 
 ### D25: Translated FPCR and FPSR reads use different sources
 
-- **What**: Tier 1 reads the saved guest FPCR and the live FPSR through register remapping, and keeps FPCR writes in the block when the masked value is unchanged.
+- **What**: Tier 1 reads the saved guest FPCR and the live FPSR through register remapping, and keeps FPCR writes in the block when the masked value is unchanged. Tier 0, Tier 1, sigreturn and ptrace share the engine's FPCR write mask.
 - **Why**: FPCR stays constant during a translated run, while instructions in that run can raise FPSR flags before the saved copy is refreshed.
 - **Tradeoffs**: A changed FPCR or any FPSR write still exits to Tier 0 for masking.
 - **Watch out**: Keep both FPCR masks identical and preserve NZCV, newly raised FPSR flags and reads targeting a stolen register.
-- **Source**: 16914003, 26ceb37c, 8bc0e63b
+- **Source**: 16914003, 26ceb37c, 8bc0e63b, 9163f493
 
 ### D26: Tier 0 reuses fetch translations and skips work with no architectural effect
 

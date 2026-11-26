@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
 >
-> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D7 were seeded by hand from the design doc §3 and
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D7 were seeded by hand from the design doc §3 and
 > the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -79,11 +79,11 @@
 - **Source**: 63b9e59
 
 ### D12: pagemap tells whether a private file mapping holds written pages
-- **What**: `has_private_pages` reads pagemap for pages present without the file bit or swapped, sharing one pagemap fd with `touched_pages`.
+- **What**: `has_private_pages` reads pagemap for pages present without the file bit or swapped, sharing one pagemap fd with `touched_pages`. Decode presence and private status per host page, then propagate that result to its constituent guest pages.
 - **Why**: fork needs to know whether a private file mapping has pages written since it was mapped (kernel/mm D22).
 - **Tradeoffs**: One pread per call.
 - **Watch out**: Hosts that hide pagemap fall back to "has private pages".
-- **Source**: e03c0cc
+- **Source**: e03c0cc, 11816722
 
 ### D13: The host's `/proc/vmstat` and `/proc/swaps` are read through hal
 - **What**: `host_vmstat` and `host_swaps` return the host's text, or None when it is unreadable or empty, for the guest's `/proc/vmstat` (kernel/procfs D18) and `/proc/swaps` (kernel/procfs D30).
@@ -114,11 +114,11 @@
 - **Source**: 64a6107
 
 ### D17: A shared file mapping is re-pointed with one fixed host mapping
-- **What**: `map_file_over(base, len, fd, offset, writable)` maps a host file over an existing range with `MAP_FIXED`, so threads touching the range see the old file or the new one but never a hole, for shared mappings that follow a file to its own store object (kernel/mm D37).
+- **What**: `map_file_over(base, len, fd, offset, writable)` maps a host file over an existing range with `MAP_FIXED`, so threads touching the range see the old file or the new one but never a hole, for shared mappings that follow a file to its own store object (kernel/mm D37). Provider updates preserve backing-object identity for live mappings.
 - **Why**: Re-pointing a shared file mapping at another host file in place needs a fixed mapping.
 - **Tradeoffs**: None known.
 - **Watch out**: The function is unsafe: a wrong range replaces unrelated memory.
-- **Source**: df6ee70
+- **Source**: df6ee70, f495f2cc
 
 ### D18: The host's vDSO, vvar pages and timezone are found through hal
 - **What**: `host_vdso` takes the vDSO from `AT_SYSINFO_EHDR` and its length and the contiguous `[vvar*]` mappings below it from `/proc/self/maps`, and `timezone` makes the raw gettimeofday syscall, since glibc's wrapper zeroes the timezone (kernel/signal D4, kernel/mm D38).

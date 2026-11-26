@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/keys"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on android/keys made before it was split from android/terminal keep their `android/terminal` tags and live in `.agents/decisions/android/terminal.md`: D4, D12, D14, D15 and D19–D23.
 
@@ -10,11 +10,11 @@
 
 ### D1: Extra-key views own their layouts, gestures and modifiers
 
-- **What**: android/keys owns extra-key rendering, gestures, layouts and shared indicator helpers, while activity integration remains in android/terminal.
+- **What**: android/keys owns extra-key rendering, gestures, layouts and shared indicator helpers, while activity integration remains in android/terminal. Cancelling active presses clears highlights and repeat callbacks while retaining the current page and modifier state.
 - **Why**: The extracted subsystem needs a focused architecture reference with explicit integration boundaries.
 - **Tradeoffs**: Pre-split decisions remain in the parent snapshot and related changes may require several maps.
 - **Watch out**: The split preserves inherited verification and open issues; it is not a fresh full audit.
-- **Source**: 60790c14; 39e55b4b
+- **Source**: 60790c14; 39e55b4b, 5fed6c24
 
 ### D2: The SYM page keeps percent and caret in their original positions
 

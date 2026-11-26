@@ -2,32 +2,32 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-26 (HEAD = 3ad68857). D1–D6 were seeded by hand from the retired design doc
 > §11.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
 ## Active
 
 ### D1: Each thread has its own credentials
-- **What**: `Task.cred` is per thread and changes only through `Cx::set_cred`, which also updates `ThreadGroup.cred` when the main thread calls; the caller's own checks (DAC, `SO_PEERCRED`, `SCM_CREDENTIALS`, the no-BKL resolver, seccomp, the capability prctls, setns and unshare of user namespaces) use the calling thread's, `Kernel::cred_of` gives a target thread's own (else the process's copy) for signals, ptrace access, scheduling and priority, rlimits and `RLIMIT_NPROC` counting, and `commit_creds`' side effects clear only the calling thread's pdeathsig.
+- **What**: `Task.cred` is per thread and changes only through `Cx::set_cred`, which also updates `ThreadGroup.cred` when the main thread calls; the caller's own checks (DAC, `SO_PEERCRED`, `SCM_CREDENTIALS`, the no-BKL resolver, seccomp, the capability prctls, setns and unshare of user namespaces) use the calling thread's, `Kernel::cred_of` gives a target thread's own (else the process's copy) for signals, ptrace access, scheduling and priority, rlimits and `RLIMIT_NPROC` counting, and `commit_creds`' side effects clear only the calling thread's pdeathsig. no_new_privs is sticky per thread and propagates to synchronized threads only after successful seccomp TSYNC.
 - **Why**: Credentials were kept per thread group, so raw per-thread id syscalls and `setfsuid` (which libc does not broadcast) changed every thread, unlike Linux.
-- **Tradeoffs**: The main thread has two copies kept in step by one setter, and no_new_privs and dumpable stay per thread group (no_new_privs is per thread on Linux, an open question in the map), while seccomp filters are per thread as in Linux.
+- **Tradeoffs**: The main thread has two copies kept in step by one setter, and dumpability stays with the thread group, while seccomp filters are per thread as in Linux.
 - **Watch out**: Code that writes `Task.cred` or `ThreadGroup.cred` directly leaves the copies apart, and libc's set*id broadcast now matters (musl and glibc kill or abort the process when one thread's call fails after another's succeeded).
-- **Source**: round 08 (`08-m6`); 1be1142
+- **Source**: round 08 (`08-m6`); 1be1142, 71790fde
 
 ### D2: Id changes, DAC and capability fixups follow Linux 6.1 and capabilities(7)
-- **What**: The set*id syscalls, `capset`, the capability prctls and securebits use Linux's rules; uid changes adjust capabilities as `cap_emulate_setxuid` does; changing effective or filesystem ids, or gaining capabilities, clears the process's dumpable flag and the calling thread's pdeathsig as `commit_creds` does; DAC checks follow `generic_permission`, with root bypassing through capabilities.
+- **What**: The set*id syscalls, `capset`, the capability prctls and securebits use Linux's rules; uid changes adjust capabilities as `cap_emulate_setxuid` does; changing effective or filesystem ids, or gaining capabilities, clears the process's dumpable flag and the calling thread's pdeathsig as `commit_creds` does; DAC checks follow `generic_permission`, with root bypassing through capabilities. Access checks honor NO_SETUID_FIXUP, capset masks unsupported bits before subset tests, and setgroups and bounding-set operations check authority in Linux order.
 - **Why**: M6 replaced the all-root model so that dropping to an ordinary user is enforced (a rootfs test checks DAC after `su` to `nobody`); the `commit_creds` side effects were added with user namespaces, having happened only at execve before.
 - **Tradeoffs**: No ACLs, immutable or append-only attributes; `system.*` xattrs are stored but have no effect.
 - **Watch out**: Securebits were recorded but ineffective until round 100; new paths must honour `NOROOT`, `NO_SETUID_FIXUP` and `NO_CAP_AMBIENT_RAISE`.
-- **Source**: rounds 08 (`08-m6`), 100 (`100-file-caps`), 119 (`119-user-namespaces`); 1be1142
+- **Source**: rounds 08 (`08-m6`), 100 (`100-file-caps`), 119 (`119-user-namespaces`); 1be1142, b51818cf, ef8afe48, 3db35725
 
 ### D3: Capability checks name their namespace, as in Linux
-- **What**: Three checks: `capable` (initial user namespace only), `capable_wrt` (own namespace, with the inode's owner and group mapped — DAC overrides, `CAP_FOWNER`, `CAP_CHOWN`, `CAP_FSETID`) and `ns_capable` (a given namespace — set*id, capset, mounts by the mount namespace's owner, ptrace and kill by the target's); "root" means uid 0 of the credential's own namespace.
+- **What**: Three checks: `capable` (initial user namespace only), `capable_wrt` (own namespace, with the inode's owner and group mapped — DAC overrides, `CAP_FOWNER`, `CAP_CHOWN`, `CAP_FSETID`) and `ns_capable` (a given namespace — set*id, capset, mounts by the mount namespace's owner, ptrace and kill by the target's); "root" means uid 0 of the credential's own namespace. A credential transition checks permitted capability containment in the same namespace or ownership in an ancestor user namespace.
 - **Why**: A process in a new user namespace holds a full capability set; when user namespaces were added for bubblewrap, the 74 call sites that had checked the caller's own effective set were each switched to the scope Linux uses there.
 - **Tradeoffs**: The no-BKL `stat` resolver serves only processes in the initial namespace, since an override elsewhere depends on the file.
 - **Watch out**: A new check that uses the wrong scope either grants host-level privilege inside a namespace or denies what a container needs.
-- **Source**: round 119 (`119-user-namespaces`)
+- **Source**: round 119 (`119-user-namespaces`), b51818cf
 
 ### D4: execve transforms credentials like `cap_bprm_creds_from_file`, with file capabilities
 - **What**: Setuid/setgid bits (owner and group mapped, no nosuid, no no_new_privs), file capabilities from `security.capability` (v1–v3; v3 only where its root owns the namespace, D12), ambient capabilities, root emulation and `AT_SECURE` for privileged execution; under no_new_privs, or in an unsafe execution (traced by a tracer without `CAP_SYS_PTRACE` over the tracee's namespace, kernel/signal D20, or sharing the fs context with another thread group), gains are capped at the old permitted set and set-id effective ids are kept only with `CAP_SETUID` (never under no_new_privs).
@@ -108,11 +108,19 @@
 
 ### D15: seccomp ADDFD closes replaced descriptors as the target
 
-- **What**: `addfd` uses `syscall::close_replaced` with the target fd table and tgid, including `fuse::flush_as`.
+- **What**: `addfd` uses `syscall::close_replaced` with the target fd table and tgid, including `fuse::flush_as`. Both seccomp ADDFD variants use the target's descriptor limit and listener creation uses the caller's limit.
 - **Why**: Supervisor-context close used the wrong mqueue notification and FUSE lock ownership.
 - **Tradeoffs**: The path now shares the fd-replacement helper with normal replacement operations.
 - **Watch out**: New replacement paths must also close in the target process context.
-- **Source**: 01bfd882; 20137e4c; d053be24; 39e55b4b
+- **Source**: 01bfd882; 20137e4c; d053be24; 39e55b4b, 576501d3
+
+### D16: POSIX ACL group matching applies the class mask to a whole request
+
+- **What**: Require a matching group entry to grant the complete masked permission request.
+- **Why**: Combining partial permissions from several groups grants excessive access.
+- **Tradeoffs**: Multiple matching groups may need examination.
+- **Watch out**: Check both the entry and the group-class mask.
+- **Source**: 68b70897
 
 ## Superseded
 
@@ -121,3 +129,4 @@
 - ~~The vDSO clock stubs skip seccomp filters for every clock (D5's tradeoff, round 59)~~ → replaced by **D5** in 16364c0 (2026-11-08)
 - ~~Sharing the fs context (`CLONE_FS`) does not suppress execve's privilege gains (D4's tradeoff, round 119)~~ → replaced by **D4** in 6d9a9e8 (2026-11-09, no SUPERSEDES declared)
 - ~~Credentials live in the thread group, so per-thread id syscalls and `setfsuid` change every thread (D1, round 08)~~ → replaced by **D1** in 1be1142 (2026-11-09)
+- ~~Sharing no_new_privs unconditionally across the thread group~~ → replaced by **D1** in 71790fde (2026-11-24)

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness/diff"`
 >
-> Last distilled: 2026-11-24 (HEAD = 231480cb)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on harness/diff made before it was split from harness keep their `harness` tags and live in `.agents/decisions/harness.md`: D1–D3, D5, D9, D11–D14, D17–D20, D23, D27, D29, D31, D33, D34 and D36–D41.
 
@@ -42,19 +42,19 @@
 
 ### D5: Legacy Starnix and gVisor skip filters narrow only after verifying individual gtest outcomes
 
-- **What**: Legacy Starnix and gVisor case scripts narrow broad skip filters by restoring verified passing tests, listing remaining multicast exclusions individually, and running `uio_test` in `starnix-mm`.
+- **What**: Legacy Starnix and gVisor case scripts narrow broad skip filters by restoring verified passing tests, listing remaining multicast exclusions individually, and running `uio_test` in `starnix-mm`. Restore cases after native and both tiers agree, enforce per-group counts, run memfd on /dev/shm, and retain the hosted musl auxv exclusion with Appine's own stack-versus-proc check.
 - **Why**: Overly broad skip filters masked regressions in kernel behaviors that Appine now implements.
 - **Tradeoffs**: Named exclusions add more filter entries and admit newly added multicast tests into the suite by default.
 - **Watch out**: Group-level output matching can hide identical failures on both sides, so verify individual gtest outcomes whenever revisiting other skips.
-- **Source**: b5673c4c
+- **Source**: b5673c4c, fc3d5c51, f6a8240a, aeaffd4b, 74584914, 68b70897, 93a9b204, 37051c60, 865d24c1, ced93039, 231480cb
 
 ### D6: Legacy gVisor coverage adds `gvisor-mm` and `gvisor-io` after native and Appine trials
 
-- **What**: Legacy gVisor coverage adds `gvisor-mm` (seven memory and cross-process transfer programs with two exact exclusions) and `gvisor-io` (three file I/O programs without exclusions) after native and Appine trials.
+- **What**: Legacy gVisor coverage adds `gvisor-mm` (seven memory and cross-process transfer programs with the verified SharedAnon case restored) and `gvisor-io` (three file I/O programs without exclusions) after native and Appine trials.
 - **Why**: These previously omitted gVisor programs exercise partial transfers, memory mappings, and file I/O behaviors beyond the existing differential suites.
 - **Tradeoffs**: Regular comparisons build ten additional gVisor programs and add roughly 1.5 s locally for the initial `gvisor-mm` pair.
 - **Watch out**: The CI runner executes against a different native Linux kernel than the local trial environment.
-- **Source**: 54ce6b50, 48f1c17e
+- **Source**: 54ce6b50, 48f1c17e, 74584914
 
 ### D7: Selected gVisor filter groups enforce expected pass counts and refresh stale lane clones
 
@@ -63,3 +63,33 @@
 - **Tradeoffs**: Updating upstream gVisor requires re-checking both the filter rows and their expected pass counts.
 - **Watch out**: Native kernel-version differences and socket timing can shift native test outcomes across environments.
 - **Source**: 231480cb
+
+### D8: The differential output lock survives parent exit
+
+- **What**: Acquire an output-directory lock in host Perl before the legacy PID lock and inherit its descriptor in the lanes.
+- **Why**: Several waiters could race while taking over a stale PID link.
+- **Tradeoffs**: A surviving lane can keep the output busy.
+- **Watch out**: The lock must precede legacy PID cleanup.
+- **Source**: cd5ea85d
+
+### D9: Differential cases compare externally visible syscall contracts
+
+- **What**: Extend existing groups with alias and namespace identity, shared mappings, blocked sends, fd reservations, credentials, pipe slots, wait events, copy-up, TSYNC and sysctl writes.
+- **Why**: Return values alone miss ordering and lifetime errors.
+- **Tradeoffs**: Some cases require synchronization or tightly scoped output normalization.
+- **Watch out**: Capture errors before later calls and restrict normalization to the documented legacy difference.
+- **Source**: 45035024, 515ecd7f, b421eac0, 576501d3, 25b0f2a0, 71790fde, bb31dbda
+
+### D10: Native-version differences use portable assertions and dedicated guest checks
+
+- **What**: Retain host-independent TCP filter and namespace checks, move down-iif coverage to the guest suite, and compare fixed mremap growth over an unlocked target.
+- **Why**: Host kernel versions disagree with Linux 6.1 in these edge cases.
+- **Tradeoffs**: The differential suite omits the host-dependent variants.
+- **Watch out**: Guest coverage must preserve the intended Linux 6.1 behavior.
+- **Source**: f7ddba97, 06fc2277, 298da10e
+
+## Superseded
+
+- ~~Letting waiters take over the output directory using only a PID link (harness D29)~~ → replaced by **D8** in cd5ea85d (2026-11-24)
+- ~~Excluding OverlayLower from the ACL ctime checks~~ → replaced by **D5** in aeaffd4b (2026-11-24)
+- ~~Excluding SharedAnon from the gVisor mremap group~~ → replaced by **D6** in 74584914 (2026-11-24)

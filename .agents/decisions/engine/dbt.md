@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine/dbt"`
 >
-> Last distilled: 2026-11-23 (HEAD = cc72b093)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 >
 > Decisions on engine/dbt made before it was split from engine keep their `engine` tags and live in `.agents/decisions/engine.md`: D6–D10, D13–D16, D18, D23, D25, D27–D29, and the Tier 1 halves of D2, D5, D17, D20, D22 and D24.
 
@@ -10,11 +10,11 @@
 
 ### D1: Tier 1 dynamic binary translation has a dedicated module
 
-- **What**: engine/dbt owns `dbt.c`, `emit.h`, the Tier 1 sections of `engine.h` and `core/engine/src/lib.rs`, and `core/engine/tests/dbt.rs`, while Tier 0 execution, CPU state and the fault guard stay in `engine` and the soft-MMU in `kernel/mmu`.
+- **What**: engine/dbt owns `dbt.c`, `emit.h`, the Tier 1 sections of `engine.h` and `core/engine/src/lib.rs`, and `core/engine/tests/dbt.rs`, while Tier 0 execution, CPU state and the fault guard stay in `engine` and the soft-MMU in `kernel/mmu`. Kick and SVC exits clear the local exclusive reservation, interpreter faults inherit Tier 0 clearing, and code-invalidation exits preserve it.
 - **Why**: The 5,250-line Tier 1 translator needed its own map with headroom for ongoing optimization work.
 - **Tradeoffs**: Pre-split decisions remain in `.agents/decisions/engine.md`, and shared header and Rust binding files span `engine`, `kernel/mmu` and `engine/dbt`.
 - **Watch out**: Keep `struct appine_cpu` layout, TLB entry format and guarded-run lock registration synchronized with `engine` and `kernel/mmu`.
-- **Source**: e4d7bbe5
+- **Source**: e4d7bbe5, d1fc9715
 
 ### D2: Tier 1 memop extension directions are tracked in a standalone handoff document
 
@@ -26,11 +26,11 @@
 
 ### D3: Shared in-cache routines accelerate same-page memops and `exec_memop` scans up to 64 MiB
 
-- **What**: `emit_routines` emits shared in-cache same-page helpers for `memset`, overlap-safe `memcpy`/`memmove` (`n >= 32`), 8-byte `memcmp` (`n >= 8`) and first-page SWAR `memchr` (`n >= 1`, including `SIZE_MAX`) through a predicted-return tail with 4-bit routine relocations, while `exec_memop` scans `memchr`/`strncmp` up to a 64 MiB budget instead of rejecting large `n` upfront and warms the data TLB for untagged addresses on completion.
+- **What**: `emit_routines` emits shared in-cache same-page helpers for `memset`, overlap-safe `memcpy`/`memmove` (`n >= 32`), 8-byte `memcmp` (`n >= 8`) and first-page SWAR `memchr` (`n >= 1`, including `SIZE_MAX`) through a predicted-return tail with 4-bit routine relocations, while `exec_memop` scans `memchr`/`strncmp` up to a 64 MiB budget instead of rejecting large `n` upfront and warms the data TLB for untagged addresses on completion. Even identical memop source and destination ranges require valid read and write access before the no-copy shortcut.
 - **Why**: Same-page 128 B–4 KiB musl memops paid full `V0`–`V31` exit/enter costs, 32–127 B calls and bytewise `memcmp` went unaccelerated, and `strnlen(..., SIZE_MAX)` triggered excessive `R_INTERP` exits.
 - **Tradeoffs**: Adds ~0.9 KB of per-instance startup routines, borrows `cpu->x[3..9]` scratch slots inside helpers, and remains scoped to registered bundled-musl symbols.
 - **Watch out**: Keep `emit_routines` well under `MAX_BLOCK_WORDS` and synchronize 4-bit `TO_*` tags and `X0`–`X9` scratch assumptions with `struct appine_cpu` across both Default and Go register sets.
-- **Source**: 7438389e
+- **Source**: 7438389e, 849bf98a
 
 ### D4: `llama.cpp` CPU optimizations follow a profiling-driven roadmap in `docs/llama-cpp-cpu-perf.md`
 
@@ -71,6 +71,38 @@
 - **Tradeoffs**: Cross-unit calls are no longer eligible for single-TU static inlining without LTO, and `dbt_internal.h` must stay synchronized across all six C files.
 - **Watch out**: Keep cross-TU helpers `dbt_`-prefixed and `#ifdef DBT_SUPPORTED`-guarded so unprefixed symbols do not leak and non-ARM64 host builds keep compiling under `-Wall -Wextra -Werror`.
 - **Source**: cc72b093
+
+### D9: Branch relinking checks executable ownership under the DBT lock
+
+- **What**: Recheck membership under the instance lock, permit a shared-block relink only with a sole attached thread, and synchronize patched instructions before unlocking.
+- **Why**: A lock-free thread count can change before another core executes the branch.
+- **Tradeoffs**: Private tagged blocks can use a narrower ownership test.
+- **Watch out**: Never lazily publish a conditional branch patch.
+- **Source**: 849bf98a, 99b74cef
+
+### D10: A revived DBT block cannot replace a newer translation of the same key
+
+- **What**: Retire matching parked blocks on insertion and check for a current table entry before reviving a block.
+- **Why**: A stale parked translation can otherwise outlive its replacement.
+- **Tradeoffs**: Revival consults the active table.
+- **Watch out**: Keep fallback statistics on the instance so independent translators cannot race.
+- **Source**: 849bf98a
+
+### D11: Repeated grouping failures are tracked by leader
+
+- **What**: Search the 64 strike slots by leader on the cold ungroup path, reusing vacant slots before FIFO eviction and exercising alternating leaders in one instance.
+- **Why**: Direct slot collisions lost repeated failures.
+- **Tradeoffs**: Cold-path lookup can scan the table.
+- **Watch out**: Run tests against the same live instance across strikes.
+- **Source**: 9163f493, 9951951a
+
+### D12: Memory pressure drains pooled instances and reclaims template storage
+
+- **What**: Detach free instances and thread instances under the pool lock, release them outside it, then trim templates and unused code views.
+- **Why**: Idle DBT memory can otherwise survive pressure.
+- **Tradeoffs**: Reclaimed translations may need rebuilding.
+- **Watch out**: Acquire template shards in ascending order before the arena lock.
+- **Source**: 567ff786, ab417943
 
 ## Superseded
 

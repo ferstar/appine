@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: knowledge-loop"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858)
+> Last distilled: 2026-11-26 (HEAD = 3ad68857)
 
 ## Active
 
@@ -21,11 +21,11 @@
 - **Source**: 8349911, 4b0adb9, e868881, bfb1e44, 260512d, a536142, c87fd21, 599804a, 5d18308; 67d40c70; 20137e4c; d053be24; 39e55b4b
 
 ### D3: A map's Maintained line is one sentence
-- **What**: A map's Maintained line names in one sentence the areas changed since its full mapping, the latest change last, and says what the full mapping predates; map-module asks for this on every targeted refresh.
+- **What**: A map's Maintained line names in one sentence the areas changed since its full mapping, the latest change last, and says what the full mapping predates; map-module asks for this on every targeted refresh. A full map refresh resets the Verified baseline after fresh research and independent verification.
 - **Why**: The terminal map's line had grown to 2626 characters over 22 targeted refreshes, a changelog repeating commit subjects and naming features later removed.
 - **Tradeoffs**: The map no longer lists each refresh; its git log holds them.
 - **Watch out**: None outstanding: android/terminal was fully refreshed on 2026-11-10 (d9e1f0c) and every map now uses the current wording.
-- **Source**: a75981b (applied to the service map in c2f4912 and to five more maps in 3f3db11)
+- **Source**: a75981b (applied to the service map in c2f4912 and to five more maps in 3f3db11), f7f79a2a
 
 ### D4: Files with no module are registered when found
 - **What**: A kernel file without a module gets a registry line in the module that owns its behaviour (`syscall/posix_timer.rs`, `syscall/mod.rs`, `bug.rs` and `syscall/misc.rs` outside kernel/signal's handlers in kernel/process, `errno.rs` and `debug.rs` in kernel/signal, native AIO in kernel/vfs (since kernel/aio), `oom.rs` (since kernel/oom) and `uaccess.rs` in kernel/mm, SysV IPC and message queues in a new kernel/ipc), its module doc comment names that map, and maps written before later splits are repointed at the current owners.
@@ -35,11 +35,11 @@
 - **Source**: 4140c75, 3f3db11, d2b1dc3 (owners since moved by cc160c1 and 44a21b7; corrected in 5d18308)
 
 ### D5: Survey conclusions without a diff go into one doc that points at the maps
-- **What**: The two Starnix surveys live in one English `docs/starnix.md` whose ranked ideas point at the deviations recorded in the maps, with a "Taken so far" table updated with the fixing commits and no milestones index row, since rounds are frozen.
+- **What**: The two Starnix surveys live in one English `docs/starnix.md` whose ranked ideas point at the deviations recorded in the maps, with a "Taken so far" table updated with the fixing commits and no milestones index row, since rounds are frozen. The differential selection links from the survey overview, with port order and repeated measurements recorded in milestones.
 - **Why**: The first survey's conclusions lived only outside the repository, and the second survey's ideas had no code change to carry them.
 - **Tradeoffs**: The ranked ideas and run counts are a snapshot at 8dc166b, and ideas that become work must move into maps or commits.
 - **Watch out**: The doc and the maps drift unless "Taken so far" is updated each time an idea is taken, and that update relies on exact matches of map lines.
-- **Source**: 612d238, 2d78930
+- **Source**: 612d238, 2d78930, 231480cb
 
 ### D6: Prose names the system Appine; the frozen rounds keep the lowercase name
 - **What**: Every sentence or title naming the system in `docs/design`, `docs/milestones.md`, `docs/starnix.md`, `android/README.md`, the maps, the decisions, source comments, crate descriptions and `appine-run`'s help says Appine, identifiers and labels stay lowercase (harness D23), and `docs/rounds` stays as written.
@@ -49,11 +49,11 @@
 - **Source**: 248d79f
 
 ### D7: Maps that outgrow one Read are split along subsystems with files of their own
-- **What**: Oversized maps are split along clean file or contiguous-section boundaries—or condensed in place when a file is already heavily partitioned (`android/vtcore`)—to stay below 80% of the 46,080 B single-read budget (adding `android/settings`, `android/reports`, `engine/dbt`, `kernel/bug`, `kernel/cow`, `kernel/hostmem`, `android/vtgestures` [registered in `02dfe2ec` without a `knowledge-loop` tag], `kernel/rawicmp`, `kernel/route`, `kernel/sysctl` and `kernel/sysfs` after the earlier splits), while pre-split decisions keep their parent tags and live in the parent snapshot referenced by ID on child `See` lines and snapshot preambles.
+- **What**: Oversized maps are split along clean file or contiguous-section boundaries—or condensed in place when a file is already heavily partitioned (`android/vtcore`)—to stay below 80% of the 46,080 B single-read budget (adding `android/settings`, `android/reports`, `engine/dbt`, `kernel/bug`, `kernel/cow`, `kernel/hostmem`, `android/vtgestures` [registered in `02dfe2ec` without a `knowledge-loop` tag], `kernel/rawicmp`, `kernel/route`, `kernel/sysctl` and `kernel/sysfs` after the earlier splits), while pre-split decisions keep their parent tags and live in the parent snapshot referenced by ID on child `See` lines and snapshot preambles. The fileio split leaves historical IDs with the parent, while registry boundaries and limitations follow the implemented owners.
 - **Why**: Maps near or past 46,080 B truncate on a single read (especially with line numbers), and moving pre-split decisions into child snapshots would not survive the next parent distill.
 - **Tradeoffs**: The registry has grown to 68 structural modules (plus `knowledge-loop`), boundaries run inside shared files (`vfs/mod.rs`, `syscall/fs.rs`, `syscall/mount.rs`, `syscall/proc.rs`, `syscall/misc.rs`, `syscall/fast.rs`, `syscall/mod.rs`, `syscall/net.rs`, `kernel.rs`, `machine.rs`, `mm.rs`, `pseudo.rs`, `engine.h`, `core/engine/src/lib.rs`, `VtView.kt`, `vt.c`), and cross-boundary edits consult multiple maps and parent/child snapshots.
 - **Watch out**: Inherited decision ID lists on child `See` lines and cross-module pointers need coordinated updates during future distills and refreshes, and a split preserves the parent `Verified` baseline rather than performing an independent full audit.
-- **Source**: c008749, d2b1dc3, b320f8e; 5d18308 (made the general rule); 67d40c70 (netlink split); ce193253 (open-file split); 20137e4c; 81f60bef; 9c6c51a7; 9015b244, cf029f9a, 8a17e4a9; d053be24; 60790c14; 39e55b4b; e4d7bbe5; 610d623f; e0719858
+- **Source**: c008749, d2b1dc3, b320f8e; 5d18308 (made the general rule); 67d40c70 (netlink split); ce193253 (open-file split); 20137e4c; 81f60bef; 9c6c51a7; 9015b244, cf029f9a, 8a17e4a9; d053be24; 60790c14; 39e55b4b; e4d7bbe5; 610d623f; e0719858, 4fcd3e13, 68b70897, f495f2cc
 
 ### D8: Agent guidance and module knowledge use shared repository paths
 
