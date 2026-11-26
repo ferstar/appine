@@ -346,6 +346,8 @@ pub struct Store {
     /// on it, and deleted inodes are cleaned up only under exclusive use: other processes may still
     /// have them open.
     lock: File,
+    /// Whether this connection has registered in the shared active-user count.
+    joined: bool,
     /// The metadata cache, the commit counter and the `objects` directory.
     meta: Arc<Meta>,
     /// Inside an operation ([`Store::transaction`]): what is queried may be content its rollback
@@ -397,6 +399,14 @@ pub struct Store {
     tmpfile_undo: RefCell<Vec<(Ino, bool)>>,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum CleanupStep {
+    BeforeCommit,
+    BeforeSync,
+    Unlinked(Ino),
+}
+
 impl Store {
     // ---- Opening and boot cleanup ----
 
@@ -407,7 +417,7 @@ impl Store {
         if dir.join("meta.db").exists() {
             return Err(Errno::EEXIST);
         }
-        let store = Self::connect(dir, COMMIT_DELAY)?;
+        let mut store = Self::connect(dir, COMMIT_DELAY)?;
         let now = now_ns();
         store
             .db()
@@ -417,7 +427,7 @@ impl Store {
                 params![ROOT, mode::S_IFDIR | 0o755, now],
             )
             .map_err(db_err)?;
-        store.meta.commits.join();
+        store.join();
         Ok(store)
     }
 
@@ -432,36 +442,71 @@ impl Store {
         if !dir.join("meta.db").exists() {
             return Err(Errno::ENOENT);
         }
-        let store = Self::connect(dir, delay)?;
-        let fd = store.lock.as_raw_fd();
+        Self::connect(dir, delay)?.finish_open(
+            volatile,
+            #[cfg(test)]
+            |_, _| Ok(()),
+        )
+    }
+
+    fn finish_open(
+        mut self,
+        volatile: &[&[u8]],
+        #[cfg(test)] mut on_cleanup: impl FnMut(&Store, CleanupStep) -> Result<(), Errno>,
+    ) -> Result<Store, Errno> {
+        let fd = self.lock.as_raw_fd();
         if appine_hal::flock(fd, true, false).is_ok() {
-            store.meta.commits.reset_users();
-            store.recover_objects()?;
-            store.remove_lost_objects()?;
-            // The last run may have been killed, and its last commit may still be only in the
-            // host's page cache: make it durable before deleting objects according to the
-            // database, or with power lost right afterwards the database returns to its earlier
-            // state but the objects are gone ([`reap`])
-            store.meta.sync_metadata()?;
-            // Keep doomed numbers in this operation until remove_orphans frees them for reuse.
-            store.transaction(|s| {
+            self.meta.commits.reset_users();
+            let token = Self::boot_token();
+            self.recover_objects(token)?;
+            self.remove_lost_objects()?;
+            let to_unlink = self.transaction(|s| {
                 for path in volatile {
                     s.empty_dir(path)?;
                 }
                 s.remove_detached_dirs()?;
-                s.remove_orphans()
+                let to_unlink = s.remove_orphans()?;
+                if !to_unlink.is_empty() {
+                    // An overdue operation can commit as soon as this closure returns. Leave
+                    // the token absent until every post-commit unlink has finished.
+                    s.lock.set_len(32).map_err(io_err)?;
+                }
+                #[cfg(test)]
+                on_cleanup(s, CleanupStep::BeforeCommit)?;
+                Ok(to_unlink)
             })?;
-            store.commit()?;
+            self.commit()?;
+            self.pending_release.borrow_mut().clear();
+            if !to_unlink.is_empty() {
+                #[cfg(test)]
+                on_cleanup(&self, CleanupStep::BeforeSync)?;
+                self.meta.sync_metadata()?;
+                // Keep exclusive use until a new file can safely reuse any freed number.
+                for ino in to_unlink {
+                    self.remove_object(ino)?;
+                    #[cfg(test)]
+                    on_cleanup(&self, CleanupStep::Unlinked(ino))?;
+                }
+                if let Some(token) = token {
+                    self.lock.write_all_at(token, 32).map_err(io_err)?;
+                }
+            }
         }
         appine_hal::flock(fd, false, true).map_err(Errno)?;
         // Another process is also using the store: wait for it to commit its deferred write
         // transaction (after seeing this count it no longer defers); only then are its changes
         // visible
-        if store.meta.commits.join() > 0 {
-            store.exec("BEGIN IMMEDIATE")?;
-            store.exec("COMMIT")?;
+        if self.join() > 0 {
+            self.exec("BEGIN IMMEDIATE")?;
+            self.exec("COMMIT")?;
         }
-        Ok(store)
+        Ok(self)
+    }
+
+    fn join(&mut self) -> u32 {
+        let users = self.meta.commits.join();
+        self.joined = true;
+        users
     }
 
     fn connect(dir: &Path, delay: Duration) -> Result<Store, Errno> {
@@ -567,6 +612,7 @@ impl Store {
             objects: dir.join("objects"),
             store_id,
             lock,
+            joined: false,
             meta,
             reaper,
             inline_pending: RefCell::default(),
@@ -587,14 +633,11 @@ impl Store {
         })
     }
 
-    /// Reconcile objects against SQLite on the first exclusive open after a host reboot.
-    /// A power cut can persist either the object or the cleared allocation range ahead of
-    /// its WAL commit. The range alone still handles ordinary process death between boots.
-    fn recover_objects(&self) -> Result<(), Errno> {
+    fn boot_token() -> Option<&'static [u8; 36]> {
         // Repeated DocumentsProvider opens on an idle store must not enumerate the rootfs.
         // If Android hides boot_id, a process-local token also changes across a power cut.
         static BOOT: std::sync::OnceLock<Option<[u8; 36]>> = std::sync::OnceLock::new();
-        let boot = BOOT.get_or_init(|| {
+        BOOT.get_or_init(|| {
             std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
                 .ok()
                 .and_then(|id| id.trim().as_bytes().try_into().ok())
@@ -603,7 +646,13 @@ impl Store {
                     appine_hal::fill_random(&mut token).ok()?;
                     Some(token)
                 })
-        });
+        })
+        .as_ref()
+    }
+
+    /// Reconcile after a host reboot or interrupted boot cleanup. A power cut can persist
+    /// objects or the cleared allocation range ahead of the WAL commit.
+    fn recover_objects(&self, boot: Option<&[u8; 36]>) -> Result<(), Errno> {
         // The first 32 bytes are the shared commit header.
         let mut previous = [0; 36];
         if let Some(token) = boot
@@ -735,11 +784,9 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes the inodes left with no links by the last run, and their objects. Deleted files
-    /// first stop sharing objects (none is open now); the rows whose numbers other files still use
-    /// as their objects stay, so the numbers are not given to new files, and the objects nothing
-    /// uses any more go.
-    fn remove_orphans(&self) -> Result<(), Errno> {
+    /// Deletes zero-link rows and collects objects to unlink after the cleanup commit is durable.
+    /// A surviving share keeps its object's inode row so the number cannot be reused.
+    fn remove_orphans(&self) -> Result<Vec<Ino>, Errno> {
         let query = |sql: &str| -> Result<Vec<(Ino, u32)>, Errno> {
             let mut stmt = self.db().prepare(sql).map_err(db_err)?;
             let rows = stmt
@@ -759,34 +806,27 @@ impl Store {
             "SELECT ino, mode FROM inodes
              WHERE nlink = 0 AND ino NOT IN (SELECT object FROM shared)",
         )?;
-        // Emptying the volatile directories and detached trees just before queued objects for the
-        // background thread; those deleted here are gone now, and their numbers are free for new
-        // files
-        let mut removed: HashSet<Ino> = orphans.iter().map(|&(ino, _)| ino).collect();
+        let mut to_unlink: HashSet<Ino> = orphans
+            .iter()
+            .filter(|&&(_, m)| m & mode::S_IFMT == mode::S_IFREG)
+            .map(|&(ino, _)| ino)
+            .collect();
         for &(object, _) in &released {
-            if removed.contains(&object) || self.object_used(object)? {
+            if to_unlink.contains(&object) || self.object_used(object)? {
                 continue;
             }
-            // An object no file uses any more: an orphan's goes with it below; a live file whose
-            // number it is uses an object of its own (a number becomes a shared object only along
-            // with a row for its own file, so it is never a plain file's data)
+            // A live inode's old object is garbage only if the file now uses a different
+            // object. A plain file still uses its number even without a shared row.
             let garbage = match self.query_row(object) {
                 Ok((st, d)) => st.nlink > 0 && d.listed(object),
                 Err(Errno::ENOENT) => true,
                 Err(e) => return Err(e),
             };
             if garbage {
-                self.remove_object(object)?;
-                removed.insert(object);
+                to_unlink.insert(object);
             }
         }
-        for &(ino, m) in &orphans {
-            // Not handed to the background thread: once the row is deleted, its number may be
-            // given to a newly created file, and a background thread deleting a bit later would
-            // delete the new file's object.
-            if m & mode::S_IFMT == mode::S_IFREG {
-                self.remove_object(ino)?;
-            }
+        for (ino, _) in orphans {
             self.db()
                 .prepare_cached("DELETE FROM inodes WHERE ino = ?1")
                 .and_then(|mut st| st.execute(params![ino]))
@@ -798,10 +838,10 @@ impl Store {
                 .map_err(db_err)?;
             self.touch_file_caps();
         }
-        self.doomed
-            .borrow_mut()
-            .retain(|ino| !removed.contains(ino));
-        Ok(())
+        // An unlinked, settled file may have already dropped the last shared row for a
+        // foreign object. Only doomed still records that number. Keep it away from the reaper.
+        to_unlink.extend(self.doomed.borrow_mut().drain(..));
+        Ok(to_unlink.into_iter().collect())
     }
 
     /// From now on this store belongs to running kernel `kernel` ([`crate::kernel::Shared::id`])
@@ -3159,7 +3199,9 @@ impl Drop for Store {
             // A successful transaction already tried the inline queue.
             self.reap_inline();
         }
-        self.meta.commits.leave();
+        if self.joined {
+            self.meta.commits.leave();
+        }
     }
 }
 
@@ -4644,6 +4686,286 @@ mod tests {
         }
         drop(s);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct BootCleanup {
+        dir: PathBuf,
+        run: Ino,
+        objects: Vec<Ino>,
+    }
+
+    impl BootCleanup {
+        fn new(name: &str) -> Self {
+            let (s, dir) = temp_store(name);
+            drop(s);
+            // Establish the boot token before leaving work for the next exclusive open.
+            let s = Store::open(&dir, &[]).unwrap();
+            let run = s.mkdir(ROOT, b"run", 0o755, 0, 0).unwrap();
+            let file = |parent, name: &[u8]| {
+                let (ino, mut f) = s.create_file(parent, name, 0o600, 0, 0).unwrap();
+                f.write_all(name).unwrap();
+                ino
+            };
+            file(ROOT, b"live");
+            let keep = file(ROOT, b"keep");
+            // Keep even the displaced objects of the two destinations on disk, as can happen
+            // when the previous run's reaper could not sync the WAL.
+            s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+            let mut objects = Vec::new();
+            for name in [&b"held"[..], b"settled"] {
+                let original = file(ROOT, name);
+                let (dst, _) = s.create_file(run, name, 0o600, 0, 0).unwrap();
+                s.share(original, dst).unwrap();
+                s.share(keep, original).unwrap();
+                if name == b"settled" {
+                    s.make_private(dst, None).unwrap();
+                }
+                let data = s.data(dst).unwrap();
+                assert_eq!(data.object, original);
+                assert_eq!(data.held.is_none(), name == b"settled");
+                objects.extend([original, dst]);
+            }
+            objects.push(file(run, b"plain"));
+            let detached = s.create_detached_dir(0o700, 0, 0).unwrap();
+            objects.push(file(detached, b"detached"));
+            let (orphan, _) = s.create_tmpfile(0o600, 0, 0, true, None).unwrap();
+            objects.push(orphan);
+            drop(s);
+            Self { dir, run, objects }
+        }
+
+        fn object(&self, ino: Ino) -> PathBuf {
+            self.dir.join("objects").join(ino.to_string())
+        }
+
+        fn assert_objects(&self, present: bool) {
+            for &ino in &self.objects {
+                assert_eq!(self.object(ino).exists(), present, "object {ino}");
+            }
+        }
+
+        fn assert_contents(&self, s: &Store, parent: Ino, name: &[u8], expected: &[u8]) {
+            use std::io::Read;
+            let ino = s.lookup(parent, name).unwrap().unwrap();
+            let mut bytes = Vec::new();
+            s.open_object(ino, false)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert_eq!(bytes, expected);
+        }
+
+        fn assert_interrupted(&self) {
+            let lock = File::options()
+                .read(true)
+                .write(true)
+                .open(self.dir.join("lock"))
+                .unwrap();
+            assert_eq!(lock.metadata().unwrap().len(), 32);
+            assert_eq!(Commits::open(&lock).unwrap().users_state(), 0);
+        }
+
+        fn assert_committed(&self) {
+            // A separate SQLite connection must see the cleanup before any host unlink.
+            let db = Connection::open(self.dir.join("meta.db")).unwrap();
+            let leftovers: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM dentries WHERE parent = ?1
+                               UNION ALL SELECT 1 FROM detached_roots
+                               UNION ALL SELECT 1 FROM inodes WHERE nlink = 0)",
+                    [self.run],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!leftovers);
+        }
+
+        fn reopen(&self) -> Store {
+            let s = Store::open(&self.dir, &[]).unwrap();
+            self.assert_contents(&s, ROOT, b"live", b"live");
+            for name in [&b"keep"[..], b"held", b"settled"] {
+                self.assert_contents(&s, ROOT, name, b"keep");
+            }
+            s
+        }
+
+        fn check_rollback(&self) {
+            let s = self.reopen();
+            for name in [&b"held"[..], b"settled", b"plain"] {
+                self.assert_contents(&s, self.run, name, name);
+            }
+        }
+
+        fn check_reconciliation(&self) {
+            self.assert_committed();
+            let s = self.reopen();
+            assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
+            self.assert_objects(false);
+        }
+    }
+
+    #[test]
+    fn boot_cleanup_rollback_preserves_objects() {
+        let f = BootCleanup::new("boot-rollback");
+        let s = Store::connect(&f.dir, Duration::ZERO).unwrap();
+        let result = s.finish_open(&[b"run"], |_, step| {
+            assert_eq!(step, CleanupStep::BeforeCommit);
+            Err(Errno::EIO)
+        });
+        assert_eq!(result.err(), Some(Errno::EIO));
+        f.assert_objects(true);
+        f.assert_interrupted();
+        f.check_rollback();
+        fs::remove_dir_all(f.dir).unwrap();
+    }
+
+    #[test]
+    fn boot_cleanup_commit_failure_preserves_objects() {
+        // Exercise both the commit at savepoint release and the explicit commit in finish_open.
+        for delay in [Duration::ZERO, Duration::from_secs(3600)] {
+            let f = BootCleanup::new("boot-commit-error");
+            let s = Store::connect(&f.dir, delay).unwrap();
+            s.db()
+                .execute_batch(
+                    "PRAGMA foreign_keys = ON;
+                    CREATE TEMP TABLE parent (id INTEGER PRIMARY KEY);
+                    CREATE TEMP TABLE child (id REFERENCES parent DEFERRABLE INITIALLY DEFERRED)",
+                )
+                .unwrap();
+            let result = s.finish_open(&[b"run"], |s, step| {
+                assert_eq!(step, CleanupStep::BeforeCommit);
+                s.exec("INSERT INTO child VALUES (1)").unwrap();
+                Ok(())
+            });
+            assert_eq!(result.err(), Some(Errno::EIO));
+            f.assert_interrupted();
+            f.assert_objects(true);
+            f.check_rollback();
+            fs::remove_dir_all(f.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn boot_cleanup_failed_sync_recovers_with_or_without_the_wal_commit() {
+        for lose_commit in [false, true] {
+            let f = BootCleanup::new("boot-sync-error");
+            let s = Store::connect(&f.dir, Duration::ZERO).unwrap();
+            // Keep SQLite's WAL open across the failed open. Save all three metadata files
+            // before the cleanup so we can also model losing just the new WAL frames.
+            let db = Connection::open(f.dir.join("meta.db")).unwrap();
+            db.execute_batch("BEGIN; SELECT ino FROM inodes").unwrap();
+            let snapshot = ["meta.db", "meta.db-wal", "meta.db-shm"].map(|name| {
+                let path = f.dir.join(name);
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            });
+            let meta = s.meta.clone();
+            let result = s.finish_open(&[b"run"], |s, step| {
+                if step == CleanupStep::BeforeSync {
+                    f.assert_committed();
+                    s.meta.fail_sync_metadata.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            });
+            assert_eq!(result.err(), Some(Errno::EIO));
+            assert_eq!(meta.sync_failures.load(Ordering::Relaxed), 1);
+            drop(meta);
+            f.assert_interrupted();
+            f.assert_objects(true);
+            if lose_commit {
+                drop(db);
+                for (path, bytes) in snapshot {
+                    fs::write(path, bytes).unwrap();
+                }
+                f.check_rollback();
+            } else {
+                f.check_reconciliation();
+                drop(db);
+            }
+            fs::remove_dir_all(f.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn boot_cleanup_interrupted_unlinks_resume_on_the_same_boot() {
+        let f = BootCleanup::new("boot-interrupted");
+        let s = Store::connect(&f.dir, Duration::ZERO).unwrap();
+        let mut removed = None;
+        let result = s.finish_open(&[b"run"], |s, step| {
+            if let CleanupStep::Unlinked(ino) = step {
+                assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
+                removed = Some(ino);
+                return Err(Errno::EIO);
+            }
+            Ok(())
+        });
+        assert_eq!(result.err(), Some(Errno::EIO));
+        let removed = removed.unwrap();
+        assert!(f.objects.contains(&removed));
+        for &ino in &f.objects {
+            assert_eq!(f.object(ino).exists(), ino != removed);
+        }
+        f.assert_interrupted();
+        f.check_reconciliation();
+        fs::remove_dir_all(f.dir).unwrap();
+    }
+
+    #[test]
+    fn boot_cleanup_syncs_before_unlink_and_restores_the_boot_token() {
+        let f = BootCleanup::new("boot-durable");
+        let s = Store::connect(&f.dir, Duration::ZERO).unwrap();
+        let other_lock = File::open(f.dir.join("lock")).unwrap();
+        let mut unlinked = HashSet::new();
+        let s = s
+            .finish_open(&[b"run"], |s, step| {
+                match step {
+                    CleanupStep::BeforeCommit => {
+                        assert!(s.doomed.borrow().is_empty());
+                        assert!(s.has_pending_release());
+                        assert_eq!(s.lock.metadata().unwrap().len(), 32);
+                    }
+                    CleanupStep::BeforeSync => {
+                        f.assert_committed();
+                        f.assert_objects(true);
+                        assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 0);
+                    }
+                    CleanupStep::Unlinked(ino) => {
+                        assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
+                        assert_eq!(
+                            appine_hal::flock(other_lock.as_raw_fd(), false, false),
+                            Err(libc::EWOULDBLOCK)
+                        );
+                        assert!(unlinked.insert(ino));
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        appine_hal::flock(other_lock.as_raw_fd(), false, false).unwrap();
+        drop(other_lock);
+        assert_eq!(unlinked, f.objects.iter().copied().collect());
+        assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
+        assert_eq!(s.meta.reaper.state.lock().unwrap().handed, 0);
+        assert!(!s.has_pending_release());
+        f.assert_objects(false);
+        assert_eq!(
+            &fs::read(f.dir.join("lock")).unwrap()[32..],
+            Store::boot_token().unwrap()
+        );
+
+        let (ino, mut new) = s.create_file(ROOT, b"reused", 0o600, 0, 0).unwrap();
+        assert!(f.objects.contains(&ino));
+        new.write_all(b"new").unwrap();
+        drop((s, new));
+        // A matching token skips both the directory scan and the WAL flush on an idle open.
+        let stray = f.object(99999);
+        fs::write(&stray, []).unwrap();
+        let s = f.reopen();
+        assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 0);
+        assert!(stray.exists());
+        f.assert_contents(&s, ROOT, b"reused", b"new");
+        drop(s);
+        fs::remove_dir_all(f.dir).unwrap();
     }
 
     #[test]

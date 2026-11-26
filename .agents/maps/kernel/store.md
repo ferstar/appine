@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (namespace and cache, object sharing and lifetimes, transaction and recovery ordering, import and provider authorization checked against the store and its callers)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: WAL sync and transaction ordering during exclusive boot cleanup)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: durable boot-cleanup unlinks, same-boot recovery, and active-user accounting on failed opens)
 
 ## Responsibilities
 
@@ -216,7 +216,7 @@ provider and rootfs installation UI (`android`).
     `replaced` list as a rename-over.
 - New regular files' objects exist immediately; the `lock` header records the uncommitted inode
   range so the next exclusive open can delete objects without rows. On a different host boot
-  (or first use with no boot marker), recovery compares the numbered objects with the database,
+  (or when the boot token is absent), recovery compares the numbered objects with the database,
   including shared-object references. It syncs the WAL before deleting unused objects and
   records the boot token after the scan. If the host hides its boot ID, each process uses its
   own token. The original 32-byte shared header stays at the front of the lock file.
@@ -238,16 +238,22 @@ provider and rootfs installation UI (`android`).
 
 ### Opening and boot cleanup
 
-- Every connection takes a shared `flock` on `lock`. If it can get the lock exclusively (nobody else
-  has the store open), it resets `users`, reconciles objects when the boot token changes, removes
-  objects in the recorded uncommitted range that have no row, and syncs the previous run's WAL.
-- In one transaction it empties the volatile directories (the kernel passes `/dev/shm` and `/run`,
-  host-side openers pass none), removes detached trees, then drops the `shared` rows of deleted
-  files. It removes nlink-0 rows whose numbers no remaining share uses, their objects, and any
-  formerly shared objects that no live file needs. It strips the removed numbers from the doomed
-  list before the transaction can commit, even when cleanup exceeds the commit delay.
-- After committing, it downgrades to a shared lock and increments `users`. If others are open it
-  waits (`BEGIN IMMEDIATE; COMMIT`) for their deferred transaction.
+- Every connection takes a shared `flock` on `lock`. If it obtains exclusive use, it resets
+  `users`, reconciles objects when the boot token is missing or different, then removes objects
+  in the recorded uncommitted range that have no row.
+- One transaction empties the volatile directories (the kernel passes `/dev/shm` and `/run`,
+  host-side openers pass none), removes detached trees, drops deleted files' `shared` rows and
+  deletes zero-link inode rows whose numbers no surviving share uses. It collects the regular
+  orphans' and unused shared objects' numbers and drains `doomed` into the same set. For a
+  settled file using another inode's old object, only `doomed` may still name that object.
+- When the set is nonempty, cleanup clears the boot token inside the transaction, before even an
+  overdue commit can run. After commit it clears `pending_release`, syncs the WAL, unlinks the
+  collected objects under the exclusive lock, and restores the token. An interruption leaves the
+  next exclusive opener to reconcile against SQLite, even on the same host boot. An idle open
+  with a matching token skips the object scan and WAL sync.
+- After cleanup the connection downgrades to a shared lock and increments `users`. If others
+  are open it waits (`BEGIN IMMEDIATE; COMMIT`) for their deferred transaction. A connection
+  decrements `users` on drop only if it joined.
 
 ### Metadata cache
 
@@ -369,9 +375,9 @@ provider and rootfs installation UI (`android`).
 - Only the thread holding the owning kernel's BKL may use a kernel's `Store` (checked in debug and
   `borrow-check` builds).
 - Objects are always addressed by inode number, never by guest path.
-- Committed inode numbers are reused only after boot cleanup has deleted their rows. Boot cleanup therefore
-  deletes those objects itself and must hand none of their numbers to the reaper, which unlinks
-  `objects/<ino>` without checking whose it is.
+- Boot cleanup can free inode numbers for immediate reuse. It drains all doomed objects before
+  commit and unlinks them itself only after the commit is durable, while it still holds the
+  exclusive lock. The reaper unlinks by number and could otherwise delete a reused object.
 - A number some `shared` row uses as its object keeps its inode row (live, deleted, or one that only
   numbers a copy) at boot, so no new file gets it while the object lives.
 - When two or more rows use one object, every one of them is held, and nothing may write that
@@ -387,9 +393,6 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
-- If boot cleanup rolls back or loses its commit after unlinking a host object, SQLite can restore
-  the volatile dentry that pointed to it. An opener that omits that volatile directory can then
-  see the name with its object missing.
 - **Whole-file sharing:** the first change to a file sharing its object copies all of it, where
   btrfs and XFS copy only the extents written.
 
